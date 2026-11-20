@@ -1,17 +1,17 @@
 ---
-name: Research task / 研究任务
-about: Propose a compatibility experiment, test case or independent hardware run
+name: Research task
+about: Define a compatibility question another contributor can test on a PC
 title: ""
 ---
 
-## Question / 要解决的问题
+## Question
 
-Which observable behavior or existing test is involved?
+Which behavior is unknown? Name the component or existing fixture.
 
-## Evidence and inputs / 依据与输入
+## Evidence so far
 
-Link public references or describe how to generate the fixture from source.
+Link the public reference or describe how to generate the input. Identify what was measured and which part is an inference.
 
-## Acceptance / 如何验收
+## Completion condition
 
-Specify a PC test, inputs and expected output. If seeking help, identify the part another contributor can reproduce independently.
+Give the test, expected observation and any acceptable alternatives or capability skips. If someone can take on part of the work, specify that part and the result they should bring back.

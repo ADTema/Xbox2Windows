@@ -1,17 +1,18 @@
 ---
-name: Bug report / 复现问题
-about: Report a build, runtime or test failure with a minimal example
+name: Bug report
+about: Report a reproducible build, runtime or fixture failure
 title: ""
+labels: bug
 ---
 
-## Reproduction / 如何复现
+## Reproduction
 
-Commit or branch, command, and a minimal source-built fixture.
+Give the commit, command and smallest source-built input that triggers the failure.
 
-## Expected and observed / 预期与实际
+## Expected and observed behavior
 
-Include the first failing test or diagnostic and the expected result.
+Name the first failing test. Paste the expected value and first diagnostic or mismatch. A short text excerpt is usually enough.
 
-## Environment / 环境
+## Environment
 
-Windows build, MSVC/SDK version, and for graphics tests the adapter, driver and hardware/WARP backend. Attach only shareable, sanitized logs.
+List the Windows build and MSVC/SDK versions. For graphics tests, include the adapter, driver, hardware or WARP backend and debug-layer status.
