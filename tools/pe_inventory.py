@@ -66,6 +66,41 @@ def export_keys(rows):
     return keys
 
 
+def resolve_desktop(dll, symbol, importer, contracts, system_exports):
+    """Follow System32 export forwarders without loading any DLL."""
+    chain = []
+    seen = set()
+    while True:
+        aliases = contracts.get(dll.rpartition("-")[0]) if dll.startswith(("api-", "ext-")) else None
+        host = dll if aliases is None else aliases.get(importer, aliases.get("", ""))
+        step = dict(dll=dll, provider=host or None, symbol=symbol)
+        chain.append(step)
+        if (host, symbol) in seen:
+            status = "forwarder_cycle"
+            break
+        seen.add((host, symbol))
+        table = system_exports(host)
+        if table is None:
+            status = "provider_not_found"
+            break
+        if symbol not in table:
+            status = "export_not_found"
+            break
+        target = table[symbol]
+        if target is None:
+            status = "export_present"
+            break
+        step["forwarder"] = target
+        module, separator, name = target.partition(".")
+        if name.lower().startswith("dll."):
+            name = name[4:]
+        if not separator or not module or not name:
+            status = "invalid_forwarder"
+            break
+        dll, symbol, importer = module.lower() + ".dll", name, host
+    return dict(status=status, chain=chain)
+
+
 def parse_image(path):
     with pefile.PE(str(path), fast_load=True) as pe:
         pe.parse_data_directories(directories=[0, 1, 13])
@@ -100,9 +135,16 @@ def scan(root, *, extra_image=None):
 
     @cache
     def system_exports(name):
+        if name not in system_images:
+            return None
         with pefile.PE(str(system_images[name]), fast_load=True) as pe:
             pe.parse_data_directories(directories=[0])
-            return export_keys(exports(pe))
+            table = {}
+            for row in exports(pe):
+                table[f"#{row['ordinal']}"] = row["forwarder"]
+                if row["name"] is not None:
+                    table[row["name"]] = row["forwarder"]
+            return table
 
     images = {}
     edges = []
@@ -126,24 +168,20 @@ def scan(root, *, extra_image=None):
 
     rows = []
     for image, kind, dll, symbol in sorted(set(edges)):
-        # The v6 contract key omits the final revision suffix (e.g. -0.dll).
-        aliases = contracts.get(dll.rpartition("-")[0]) if dll.startswith(("api-", "ext-")) else None
-        host = dll if aliases is None else aliases.get(Path(image).name.lower(), aliases.get("", ""))
-        if host not in system_images:
-            status = "provider_not_found"
-        elif symbol in system_exports(host):
-            status = "export_present"
-        else:
-            status = "export_not_found"
+        resolution = resolve_desktop(dll, symbol, Path(image).name.lower(), contracts, system_exports)
+        first = resolution["chain"][0]
+        # Keep desktop_export as the first-hop comparison for existing report readers.
+        status = "export_present" if "forwarder" in first else resolution["status"]
         candidate = None
         if dll == "d3d12_xs.dll" and "d3d12.dll" in system_images and symbol in system_exports("d3d12.dll"):
             candidate = "d3d12.dll"
         rows.append({
             "image": image, "kind": kind, "dll": dll, "symbol": symbol,
             "bundle_exports_in": sorted(p for p, keys in bundled[dll] if symbol in keys),
-            "desktop_provider": host or None, "desktop_export": status, "desktop_candidate": candidate,
+            "desktop_provider": first["provider"], "desktop_export": status, "desktop_candidate": candidate,
+            "desktop_resolution": resolution,
         })
-    unresolved = [r for r in rows if r["desktop_export"] != "export_present" and not r["bundle_exports_in"]]
+    unresolved = [r for r in rows if r["desktop_resolution"]["status"] != "export_present" and not r["bundle_exports_in"]]
     return {
         "schema": 1, "host_windows_build": sys.getwindowsversion().build, "pefile": pefile.__version__,
         "behavior": "Scarlett behavior unverified for every import. Static export matches include forwarders.",
@@ -156,6 +194,8 @@ def scan(root, *, extra_image=None):
             "by_ordinal": sum(r["symbol"].startswith("#") for r in rows),
             "exports": sum(len(i["exports"]) for i in images.values()),
             "desktop_results": dict(Counter(r["desktop_export"] for r in rows)),
+            "desktop_terminal_results": dict(Counter(r["desktop_resolution"]["status"] for r in rows)),
+            "desktop_forwarded_edges": sum(len(r["desktop_resolution"]["chain"]) > 1 for r in rows),
         },
         "unresolved_edges": [dict(r, desktop_experiment=EXPERIMENTS.get((r["dll"], r["symbol"])))
                              for r in unresolved],
@@ -202,7 +242,8 @@ def main():
         f.write("\n")
     Path(f.name).replace(output)
     print(f"{len(result['images'])} images | {len(result['imports'])} import edges | {output}")
-    print(dict(Counter(r["desktop_export"] for r in result["imports"])))
+    print(f"Desktop terminal results: {result['summary']['desktop_terminal_results']} | "
+          f"forwarded edges: {result['summary']['desktop_forwarded_edges']}")
 
 
 if __name__ == "__main__":

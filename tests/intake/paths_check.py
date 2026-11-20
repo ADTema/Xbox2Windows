@@ -5,6 +5,39 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from dependency_paths import FFX_EXPORTS, FFX_LOADER, trace
+from pe_inventory import resolve_desktop
+
+
+def check_desktop_forwarders():
+    tables = {
+        "front.dll": {"Begin": "api-ms-fixture-l1-1-0.#77", "Broken": "middle.Missing",
+                      "Loop": "MIDDLE.dll.Loop", "Bad": "missing_separator"},
+        "middle.dll": {"#77": "last.Value", "Loop": "front.Loop"},
+        "last.dll": {"Value": None},
+    }
+    contracts = {"api-ms-fixture-l1-1": {"": "absent.dll", "front.dll": "middle.dll"}}
+
+    def resolve(dll, name):
+        return resolve_desktop(dll, name, "entry.exe", contracts, tables.get)
+
+    valid = resolve("front.dll", "Begin")
+    assert valid["status"] == "export_present"
+    assert [(s["provider"], s["symbol"]) for s in valid["chain"]] == [
+        ("front.dll", "Begin"), ("middle.dll", "#77"), ("last.dll", "Value")]
+    assert resolve("api-ms-fixture-l1-1-0.dll", "#77")["status"] == "provider_not_found"
+    assert resolve("front.dll", "Loop")["status"] == "forwarder_cycle"
+    assert resolve("front.dll", "Bad")["status"] == "invalid_forwarder"
+    broken = resolve("front.dll", "Broken")
+    assert broken["status"] == "export_not_found" and broken["chain"][-1]["symbol"] == "Missing"
+
+    row = dict(image="entry.exe", kind="normal", dll="front.dll", symbol="Broken",
+               bundle_exports_in=[], desktop_export="export_present", desktop_resolution=broken)
+    inventory = dict(images={"entry.exe": {"sha256": "fixture", "exports": []}}, imports=[row])
+    finding, = trace(inventory, "entry.exe")["findings"]
+    assert finding["problem"] == "export_not_found"
+    assert finding["desktop_chain"][-1] == dict(dll="middle.dll", provider="middle.dll", symbol="Missing")
+    del row["desktop_resolution"]
+    assert not trace(inventory, "entry.exe")["findings"]
 
 
 def main():
@@ -33,4 +66,5 @@ def main():
 
 
 if __name__ == "__main__":
+    check_desktop_forwarders()
     main()

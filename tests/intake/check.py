@@ -63,6 +63,12 @@ def check(folder, fixture, provider):
     assert paths["reachable"][provider.name] == dict(conditional=False, path=[slot, provider.name], reasons=["normal"])
     assert any(f["dll"] == "intake_delay.dll" and f["conditional"] and f["reasons"] == ["delay"]
                for f in paths["findings"])
+    loader = "amd_fidelityfx_loader_xbox.dll"
+    normal, = [f for f in paths["findings"] if f["dll"] == loader and f["symbol"] == "ffxQuery"]
+    assert normal["path"] == [slot] and normal["reasons"] == ["normal"] and not normal["conditional"]
+    assert normal["problem"] == "provider_not_found" and normal["desktop_chain"] == [
+        dict(dll=loader, provider=loader, symbol="ffxQuery")]
+    assert not any(f["dll"] == "amd_fidelityfx_framegeneration_xbox.dll" for f in paths["findings"])
     edges = {(r["kind"], r["dll"], r["symbol"]): r for r in report["inventory"]["imports"] if r["image"] == slot}
     for symbol in ("named_value", "#77"):
         assert edges["normal", provider.name, symbol]["bundle_exports_in"] == [provider.name]
