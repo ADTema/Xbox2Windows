@@ -341,6 +341,12 @@ int main(int argc, char** argv)
             if (!check_bvh_differential(device.Get())) return 77;
         } else if (argc == 3 && operation == "--bvh-hits") {
             check_bvh_hits(device.Get());
+        } else if (argc == 3 && operation == "--dxr-update") {
+            if (!check_dxr_update(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--bvh-numeric") {
+            check_bvh_numeric(device.Get());
+        } else if (argc == 3 && operation == "--bvh-atomics") {
+            check_bvh_atomics(device.Get());
         } else if (argc == 3 && operation == "--bvh-reads") {
             check_bvh_reads(device.Get());
         } else if (argc == 3 && (operation == "--bvh-waves" || operation == "--bvh-wave64")) {

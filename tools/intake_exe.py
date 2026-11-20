@@ -30,6 +30,40 @@ def inside(root, name):
     return path
 
 
+def describe_startup(pe, locations, read_rva):
+    """Look up x64 runtime-function intervals for the recorded startup addresses."""
+    directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    table = directory[3] if len(directory) > 3 else None
+    by_rva = sorted({item["rva"] for item in locations})
+    matches = {}
+    count = 0
+    status = "absent"
+    if table and (table.VirtualAddress or table.Size):
+        try:
+            if not table.VirtualAddress or not table.Size or table.Size % 12:
+                raise ValueError("Invalid x64 exception directory extent")
+            records = read_rva(table.VirtualAddress, table.Size)
+            cursor = previous_end = 0
+            for begin, end, unwind in struct.iter_unpack("<III", records):
+                if (begin < previous_end or not begin < end <= pe.OPTIONAL_HEADER.SizeOfImage
+                        or not 0 < unwind < pe.OPTIONAL_HEADER.SizeOfImage):
+                    raise ValueError("Invalid or overlapping x64 function interval")
+                previous_end = end
+                count += 1
+                while cursor < len(by_rva) and by_rva[cursor] < end:
+                    target = by_rva[cursor]
+                    if begin <= target:
+                        matches[target] = dict(begin_rva=begin, end_rva=end, unwind_data_rva=unwind)
+                    cursor += 1
+            status = "indexed"
+        except ValueError as exc:
+            # Keep independent entry and TLS evidence for nonstandard tables.
+            return dict(exception_table="unusable", detail=str(exc), locations=locations)
+    for item in locations:
+        item["runtime_function"] = matches.get(item["rva"])
+    return dict(exception_table=status, runtime_functions=count, locations=locations)
+
+
 def inspect_executable(path):
     size = path.stat().st_size
     with pefile.PE(str(path), fast_load=True) as pe:
@@ -87,9 +121,19 @@ def inspect_executable(path):
                 tls = dict(directory_rva=d.VirtualAddress, template_start_va=start, template_end_va=end,
                            index_va=index, callback_table_va=callbacks, callbacks_rva=callback_rvas,
                            zero_fill=zero_fill, characteristics=flags)
+        def location(role, rva):
+            section = section_for(rva, 1, executable=True)
+            return dict(role=role, rva=rva, section=section.Name.rstrip(b"\0").decode("ascii", "replace"),
+                        file_offset=section.PointerToRawData + rva - section.VirtualAddress)
+
+        locations = []
+        if tls:
+            locations.extend(location("tls_callback", rva) for rva in tls["callbacks_rva"])
+        if entry:
+            locations.append(location("entry", entry))
         return dict(machine="AMD64", format="PE32+", image_base=hdr.ImageBase, entry_rva=entry,
                     entry_section=entry_section.Name.rstrip(b"\0").decode("ascii", "replace")
-                    if entry_section else None, tls=tls)
+                    if entry_section else None, tls=tls, startup=describe_startup(pe, locations, read_rva))
 
 
 def collect(root, candidate, baseline, integrity, report):

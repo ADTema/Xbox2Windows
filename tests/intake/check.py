@@ -59,6 +59,32 @@ def check(folder, fixture, provider):
     assert report["candidate"]["sha256"] == hashlib.sha256(fixture.read_bytes()).hexdigest()
     assert report["pe"]["entry_rva"] and report["pe"]["entry_section"] == ".text"
     assert report["pe"]["tls"]["callbacks_rva"] and report["pe"]["tls"]["template_start_va"]
+    startup = report["pe"]["startup"]
+    locations = startup["locations"]
+    assert [loc["role"] for loc in locations] == ["tls_callback"] * (len(locations) - 1) + ["entry"]
+    assert [loc["rva"] for loc in locations] == report["pe"]["tls"]["callbacks_rva"] + [report["pe"]["entry_rva"]]
+    with pefile.PE(str(fixture)) as pe:
+        functions = [record.struct for record in pe.DIRECTORY_ENTRY_EXCEPTION]
+        assert startup["exception_table"] == "indexed" and startup["runtime_functions"] == len(functions)
+        for loc in locations:
+            assert loc["file_offset"] == pe.get_offset_from_rva(loc["rva"])
+            match = next((f for f in functions if f.BeginAddress <= loc["rva"] < f.EndAddress), None)
+            assert loc["runtime_function"] == (dict(begin_rva=match.BeginAddress, end_rva=match.EndAddress,
+                unwind_data_rva=match.UnwindData) if match else None)
+        directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+        directory.Size -= 1
+        incomplete = folder / "incomplete-directory.exe"
+        pe.write(str(incomplete))
+        directory.VirtualAddress = directory.Size = 0
+        absent = folder / "no-directory.exe"
+        pe.write(str(absent))
+    incomplete_startup = run(0, incomplete)["pe"]["startup"]
+    assert incomplete_startup["exception_table"] == "unusable"
+    absent_startup = run(0, absent)["pe"]["startup"]
+    assert absent_startup["exception_table"] == "absent"
+    assert all(loc["runtime_function"] is None for loc in absent_startup["locations"])
+    for result in (absent_startup, incomplete_startup):
+        assert [loc["file_offset"] for loc in result["locations"]] == [loc["file_offset"] for loc in locations]
     paths = report["dependency_paths"]
     assert paths["reachable"][provider.name] == dict(conditional=False, path=[slot, provider.name], reasons=["normal"])
     assert any(f["dll"] == "intake_delay.dll" and f["conditional"] and f["reasons"] == ["delay"]

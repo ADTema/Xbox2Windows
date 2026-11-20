@@ -9,10 +9,13 @@ void check_compute(ID3D12Device* device, bool tables);
 void check_bvh_root_roundtrip(ID3D12Device* device);
 void check_buffer_ops(ID3D12Device* device);
 void check_bvh_reads(ID3D12Device* device);
+void check_bvh_atomics(ID3D12Device* device);
+void check_bvh_numeric(ID3D12Device* device);
 void check_bvh_hits(ID3D12Device* device);
 bool check_bvh_differential(ID3D12Device* device);
 bool check_bvh_waves(ID3D12Device* device, bool force64);
 bool check_ray_query(ID3D12Device* device);
+bool check_dxr_update(ID3D12Device* device);
 
 Microsoft::WRL::ComPtr<ID3D12Resource> make_buffer(ID3D12Device* device, UINT64 length, D3D12_HEAP_TYPE heap,
     D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);
