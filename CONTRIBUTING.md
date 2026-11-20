@@ -10,6 +10,8 @@ You can contribute a hardware result, a source-built failing case, a documentati
 
 ## Build and test
 
+Hardware reporters can use the [standalone package](tools/gpu-check/README.md). Paste the generated Markdown into issue #1. For a first-build report, use a clean checkout and post the three smoke-test outcomes to issue #2. Maintainers verify each incoming result, link the source report in the README coverage table, and record repeated runs on the same adapter as follow-ups. Link a feedback-driven fix to its report and ask the reporter to verify the change.
+
 Start with the [first build](README.md#first-build). Install the pinned Python dependency before configuring to include the PE tests. List the tests registered in your environment with `ctest --preset dev -N`, then run a focused test with `ctest --preset dev -R <name> -V`.
 
 | Location | What to work on |

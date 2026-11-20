@@ -38,3 +38,15 @@ jobs:
           cmake --build --preset dev
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           ctest --preset dev --no-tests=error -E '_hardware$'
+      - name: Build and smoke-test the standalone GPU check
+        shell: pwsh
+        run: .\tools\package-gpu-check.ps1
+      - name: Upload verified GPU check
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gpu-check-windows-x64
+          path: |
+            out/gpu-check/Xbox2Windows-GpuCheck-win-x64.zip
+            out/gpu-check/Xbox2Windows-GpuCheck-win-x64.zip.sha256
+          if-no-files-found: error
