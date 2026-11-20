@@ -37,7 +37,8 @@ D3D12_RAYTRACING_INSTANCE_DESC instance(UINT id, UINT mask, float translateX) {
 }
 
 std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Vertex>& vertices,
-    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances, const std::vector<Ray>& rays) {
+    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances, const std::vector<Ray>& rays,
+    const SceneUpdate* update) {
     ComPtr<ID3D12Device5> dxr;
     check(device->QueryInterface(IID_PPV_ARGS(&dxr)), "Get DXR device");
     auto vertexBuffer = bvh_fixture::upload(device, vertices);
@@ -56,6 +57,11 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
     top.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     top.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     top.Inputs.NumDescs = static_cast<UINT>(instances.size());
+    if (update) {
+        if (update->vertices.size() != vertices.size() || update->instances.size() != instances.size())
+            throw std::runtime_error("DXR update requires unchanged fixture topology");
+        bottom.Inputs.Flags = top.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+    }
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO bottom_size{}, top_size{};
     dxr->GetRaytracingAccelerationStructurePrebuildInfo(&bottom.Inputs, &bottom_size);
     dxr->GetRaytracingAccelerationStructurePrebuildInfo(&top.Inputs, &top_size);
@@ -65,7 +71,8 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
     constexpr auto as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
     auto blas = make_buffer(device, bottom_size.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
     auto tlas = make_buffer(device, top_size.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
-    auto scratch = make_buffer(device, (std::max)(bottom_size.ScratchDataSizeInBytes, top_size.ScratchDataSizeInBytes),
+    auto scratch = make_buffer(device, (std::max)({bottom_size.ScratchDataSizeInBytes, top_size.ScratchDataSizeInBytes,
+                               bottom_size.UpdateScratchDataSizeInBytes, top_size.UpdateScratchDataSizeInBytes}),
                                D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, writable);
     bottom.DestAccelerationStructureData = blas->GetGPUVirtualAddress();
     top.DestAccelerationStructureData = tlas->GetGPUVirtualAddress();
@@ -98,6 +105,22 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
     list->BuildRaytracingAccelerationStructure(&bottom, 0, nullptr);
     list->ResourceBarrier(1, &order);
     list->BuildRaytracingAccelerationStructure(&top, 0, nullptr);
+    ComPtr<ID3D12Resource> updatedVertices, updatedInstances;
+    if (update) {
+        updatedVertices = bvh_fixture::upload(device, update->vertices);
+        auto descriptors = update->instances;
+        for (auto& desc : descriptors) desc.AccelerationStructure = bottom.DestAccelerationStructureData;
+        updatedInstances = bvh_fixture::upload(device, descriptors);
+        geometry.Triangles.VertexBuffer.StartAddress = updatedVertices->GetGPUVirtualAddress();
+        top.Inputs.InstanceDescs = updatedInstances->GetGPUVirtualAddress();
+        bottom.Inputs.Flags = top.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        bottom.SourceAccelerationStructureData = bottom.DestAccelerationStructureData;
+        top.SourceAccelerationStructureData = top.DestAccelerationStructureData;
+        list->ResourceBarrier(1, &order);
+        list->BuildRaytracingAccelerationStructure(&bottom, 0, nullptr);
+        list->ResourceBarrier(1, &order);
+        list->BuildRaytracingAccelerationStructure(&top, 0, nullptr);
+    }
     order.UAV.pResource = tlas.Get();
     list->ResourceBarrier(1, &order);
     list->SetComputeRootSignature(root.Get());
@@ -135,5 +158,38 @@ bool check_ray_query(ID3D12Device* device) {
         std::printf("ray=%u hit=%u instance=%u primitive=%u distance=%g\n", i, value[0], value[1], value[2], distance);
     }
     if (mismatches) throw std::runtime_error("Ray query disagrees with triangle, distance or mask reference");
+    return true;
+}
+
+bool check_dxr_update(ID3D12Device* device) {
+    using namespace dxr_fixture;
+    if (!supported(device)) return false;
+    const std::vector<Vertex> initial{{-1,-1,1}, {1,-1,1}, {0,1,1}};
+    const std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances{instance(7,1), instance(11,2,4)};
+    const SceneUpdate update{{{-1,-1,3}, {1,-1,3}, {0,1,3}}, {instance(7,1,2), instance(11,4,-3)}};
+    std::vector<Ray> rays;
+    struct Probe { float x; UINT mask; };
+    const Probe probes[]{{0,1}, {4,2}, {2,1}, {-3,4}, {-3,2}, {2,4}};
+    for (const auto& probe : probes)
+        rays.push_back({probe.x,0,0,0.01f,0,0,1,8,probe.mask});
+    rays.push_back({2,0,0,0.01f,0,0,1,2,1});
+    const auto before = trace(device, initial, instances, rays);
+    const auto after = trace(device, initial, instances, rays, &update);
+    if (after != trace(device, update.vertices, update.instances, rays))
+        throw std::runtime_error("In-place update differs from a fresh DXR build");
+    const UINT idsBefore[]{7,11,0,0,0,0,0}, idsAfter[]{0,0,7,11,0,0,0};
+    for (UINT i = 0; i < rays.size(); ++i) {
+        for (bool updated : {false, true}) {
+            const auto& values = updated ? after : before;
+            const UINT id = updated ? idsAfter[i] : idsBefore[i];
+            const float distance = id ? (updated ? 3.f : 1.f) : 0.f;
+            UINT distanceBits;
+            std::memcpy(&distanceBits, &distance, sizeof(distanceBits));
+            const bvh_fixture::Row expected{static_cast<UINT>(id != 0), id, 0, distanceBits};
+            for (UINT field = 0; field < 4; ++field)
+                bvh_fixture::equal(values[4 * i + field], expected[field], i, field);
+        }
+    }
+    std::puts("dxr_update rays=7 changed_hits=4 in_place_matches_rebuild=1");
     return true;
 }

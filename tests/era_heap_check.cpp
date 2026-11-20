@@ -6,6 +6,7 @@
 #include <barrier>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <string_view>
 #include <thread>
 #ifdef _DEBUG
@@ -56,6 +57,52 @@ bool failure_checks()
            era_heap::allocate(512, 0xa8004000) == nullptr;        // AMD, 257 rounded up
 }
 
+bool caller_layout_checks()
+{
+    using Byte = unsigned char;
+    using Block = std::unique_ptr<void, decltype(&era_heap::release)>;
+    constexpr Byte guard = 0xec, marker = 0x51, tag = 0x34;
+    // Supply owned storage with a known origin for each possible base address residue.
+    for (std::size_t length : {1u, 31u, 32u, 33u, 255u, 256u, 257u, 4097u}) {
+        const auto total = length + 64 + 96;
+        Block block(era_heap::allocate(total, 5ull << 24), era_heap::release);
+        if (!block) return false;
+        auto* storage = static_cast<Byte*>(block.get());
+        for (unsigned residue = 0; residue < 32; ++residue) {
+            std::fill_n(storage, total, guard);
+            auto* base = storage + 32 + residue;
+            const auto address = reinterpret_cast<std::uintptr_t>(base);
+            const auto offset = static_cast<Byte>(64 - (address & 31));
+            auto* user = base + offset;
+            if ((address & 31) != residue || reinterpret_cast<std::uintptr_t>(user) % 32 ||
+                offset < 33 || user + length > base + length + 64) return false;
+            user[-2] = tag;
+            user[-1] = offset;
+            std::fill_n(user, length, marker);
+            if (user - user[-1] != base || user[-2] != tag ||
+                !std::all_of(storage, user - 2, [](Byte b) { return b == guard; }) ||
+                !std::all_of(user + length, storage + total, [](Byte b) { return b == guard; }))
+                return false;
+        }
+    }
+    // AMD rounds the size. This experiment imposes no 256-byte pointer alignment.
+    struct SizeCase { std::size_t requested, allocated; };
+    constexpr SizeCase sizes[]{{1,256}, {255,256}, {256,256}, {257,512}, {511,512},
+                               {512,512}, {513,768}, {4095,4096}, {4096,4096}, {4097,4352}};
+    for (const auto& size : sizes) {
+        const auto rounded = (size.requested + 255) & ~std::size_t{255};
+        if (rounded != size.allocated) return false;
+        Block block(era_heap::allocate(rounded, 0), era_heap::release);
+        if (!block) return false;
+        auto* data = static_cast<Byte*>(block.get());
+        std::fill_n(data, size.requested, marker);
+        if (!std::all_of(data, data + size.requested, [](Byte b) { return b == marker; }) ||
+            !std::all_of(data + size.requested, data + rounded, [](Byte b) { return b == 0; })) return false;
+    }
+    std::puts("bink_base_layouts=256 amd_size_boundaries=10");
+    return true;
+}
+
 bool concurrency_checks()
 {
     constexpr std::size_t bytes = 511;
@@ -96,6 +143,8 @@ int main(int argc, char** argv)
         passed = allocation_checks();
     } else if (scenario == "failure"sv) {
         passed = failure_checks();
+    } else if (scenario == "caller_layout"sv) {
+        passed = caller_layout_checks();
     } else if (scenario == "concurrency"sv) {
         passed = concurrency_checks();
     } else {

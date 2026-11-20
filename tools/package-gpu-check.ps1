@@ -31,8 +31,9 @@ try {
     & powershell.exe -NoProfile -File "$smoke/Run-GpuCheck.ps1" -Backend warp
     if ($LASTEXITCODE -ne 0) { throw 'The extracted package failed its WARP tests.' }
     $report = Get-Content -Raw -LiteralPath "$smoke/gpu-report-warp.md"
-    if ($report -notmatch 'bvh_waves_warp - PASS' -or $report -notmatch [regex]::Escape($revision)) {
-        throw 'The WARP smoke test must execute the waves fixture and report the source commit.'
+    if ($report -notmatch 'bvh_waves_warp - PASS' -or $report -notmatch 'bvh_atomics_warp - PASS' -or
+        $report -notmatch 'bvh_root_roundtrip_warp - PASS' -or $report -notmatch [regex]::Escape($revision)) {
+        throw 'The WARP smoke test must verify waves, atomics and root roundtrip and report the source commit.'
     }
 } finally {
     Pop-Location

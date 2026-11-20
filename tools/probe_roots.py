@@ -69,11 +69,9 @@ def validate_shader(probe, blob, program):
             symbol = call[1] or call[2]
             if symbol.startswith("xbox."):
                 calls[symbol] += 1
-                if ("with_cache" in symbol or any(k in symbol for k in
-                        ("Lane", "Swizzle", "Ballot", "MBCNT", "Uniform", "Wave", "CNDMASK"))):
-                    operands = instruction[call.end():].split(")", 1)[0]
-                    form = re.sub(r"%[\w.]+", "%value", operands)
-                    operand_forms.setdefault(symbol, Counter())[form] += 1
+                operands = instruction[call.end():].split(")", 1)[0]
+                form = re.sub(r"%[\w.]+", "%value", operands)
+                operand_forms.setdefault(symbol, Counter())[form] += 1
             elif symbol.startswith("dx.op."):
                 standard[symbol] += 1
     checks["ir"] = dict(target_triple=triple[1], xbox_call_sites=dict(sorted(calls.items())),

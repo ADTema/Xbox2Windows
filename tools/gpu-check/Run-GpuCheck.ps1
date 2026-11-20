@@ -20,10 +20,10 @@ $report.Add("Windows build: $($windows.CurrentBuildNumber).$($windows.UBR)")
 $report.Add("Backend: $Backend")
 $report.Add('')
 $failed = $false
-foreach ($test in 'waves', 'wave64', 'differential') {
+foreach ($test in 'bvh-waves', 'bvh-wave64', 'bvh-differential', 'bvh-atomics', 'bvh-numeric', 'bvh-root-roundtrip', 'dxr-update') {
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo.FileName = $binary
-    $process.StartInfo.Arguments = "$Backend --bvh-$test"
+    $process.StartInfo.Arguments = "$Backend --$test"
     $process.StartInfo.UseShellExecute = $false
     $process.StartInfo.CreateNoWindow = $true
     $process.StartInfo.RedirectStandardOutput = $true
@@ -49,7 +49,8 @@ foreach ($test in 'waves', 'wave64', 'differential') {
         $process.Dispose()
     }
     if ($status -eq 'FAIL') { $failed = $true }
-    $report.Add("### bvh_${test}_${Backend} - $status")
+    $caseName = $test.Replace('-', '_')
+    $report.Add("### ${caseName}_${Backend} - $status")
     $report.Add('')
     $report.Add('```text')
     $report.Add($details)
