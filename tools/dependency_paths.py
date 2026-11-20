@@ -1,0 +1,94 @@
+"""Trace package import paths from a chosen PE image, including verified conditional targets."""
+
+import argparse
+from collections import defaultdict
+import hashlib
+import heapq
+import json
+from pathlib import Path
+
+FFX_LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
+FFX_EXPORTS = ("ffxConfigure", "ffxCreateContext", "ffxDestroyContext", "ffxDispatch", "ffxQuery")
+
+
+def trace(report, entry):
+    images = report["images"]
+    by_name = defaultdict(list)
+    for path in sorted(images):
+        by_name[Path(path).name.casefold()].append(path)
+    imports = defaultdict(list)
+    for row in report["imports"]:
+        imports[row["image"]].append(row)
+
+    # Prefer an all-normal-import path, then the shortest explanation within that class.
+    queue = [(False, 0, (entry,), ())]
+    reached, findings, lookups = {}, [], []
+    while queue:
+        conditional, depth, path, reasons = heapq.heappop(queue)
+        image = path[-1]
+        if image in reached:
+            continue
+        reached[image] = dict(conditional=conditional, path=path, reasons=reasons)
+        targets = set()
+        for row in imports[image]:
+            dll, symbol, kind = row["dll"], row["symbol"], row["kind"]
+            providers = by_name[dll.casefold()]
+            if symbol in {"GetProcAddress", "LoadPackagedLibrary", "LoadLibraryA", "LoadLibraryW",
+                          "LoadLibraryExA", "LoadLibraryExW"}:
+                lookups.append(dict(image=image, symbol=symbol, kind=kind))
+            if len(providers) == 1:
+                targets.add((kind, providers[0]))
+                if providers[0] in row["bundle_exports_in"]:
+                    continue
+                problem = "bundled_export_missing"
+            elif len(providers) > 1:
+                problem = "ambiguous_package_basename"
+            elif row["desktop_export"] != "export_present":
+                problem = row["desktop_export"]
+            else:
+                continue
+            findings.append(dict(path=path, reasons=reasons + (kind,), conditional=conditional or kind == "delay",
+                                 dll=dll, symbol=symbol, problem=problem, candidates=providers))
+
+        if images[image]["sha256"] == FFX_LOADER:
+            for dll, condition in (
+                    ("amd_fidelityfx_upscaler_xbox.dll", "ffx:0x10000"),
+                    ("amd_fidelityfx_framegeneration_xbox.dll", "ffx:0x20000|0x30000")):
+                providers = by_name[dll]
+                if len(providers) == 1:
+                    targets.add((condition, providers[0]))
+                    names = {e["name"] for e in images[providers[0]]["exports"]}
+                    missing = sorted(set(FFX_EXPORTS) - names)
+                    if not missing:
+                        continue
+                    problem = "conditional_exports_missing"
+                else:
+                    missing = []
+                    problem = "conditional_module_absent_from_package" if not providers else "ambiguous_package_basename"
+                findings.append(dict(path=path, reasons=reasons + (condition,), conditional=True, dll=dll,
+                                     missing_exports=missing, problem=problem, candidates=providers))
+        for edge, target in sorted(targets):
+            heapq.heappush(queue, (conditional or edge != "normal", depth + 1, path + (target,), reasons + (edge,)))
+    return dict(entry=entry, reachable=reached, findings=findings, dynamic_lookup_imports=lookups,
+                unlinked_in_this_graph=sorted(set(images) - set(reached)),
+                scope="Package import paths and identified FFX routes. Host forwarders, arbitrary dynamic targets "
+                      "and actual execution order are not resolved.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("inventory", type=Path)
+    parser.add_argument("entry", nargs="?", help="Relative PE path, or omit to assess every entry independently")
+    args = parser.parse_args()
+    data = args.inventory.read_bytes()
+    inventory = json.loads(data)
+    if args.entry and args.entry not in inventory["images"]:
+        parser.error("Entry does not appear in this inventory")
+    entries = [args.entry] if args.entry else sorted(inventory["images"])
+    document = dict(inventory_sha256=hashlib.sha256(data).hexdigest(),
+                    entries={name: trace(inventory, name) for name in entries})
+    print(json.dumps(document, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

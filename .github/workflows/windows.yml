@@ -1,0 +1,40 @@
+name: Windows checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test on Windows
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install fixture dependencies
+        shell: pwsh
+        run: |
+          python -m venv out/pe-env
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          .\out\pe-env\Scripts\python.exe -m pip install -r requirements-dev.txt
+      - name: Configure, build and run PC tests
+        shell: pwsh
+        run: |
+          .\tools\dev.ps1
+          cmake --preset dev
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset dev
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --preset dev --no-tests=error -E '_hardware$'

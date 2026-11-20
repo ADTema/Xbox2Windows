@@ -1,0 +1,173 @@
+#include "desktop_gpu.h"
+#include "compute_root.h"
+#include "compute_tables.h"
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+
+using Microsoft::WRL::ComPtr;
+
+namespace {
+constexpr UINT count = 257;
+constexpr UINT capacity = 320;
+constexpr UINT bytes = capacity * sizeof(UINT);
+constexpr UINT constants_offset = 2 * bytes;
+constexpr UINT alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+static_assert(constants_offset % alignment == 0);
+constexpr UINT sentinel = 0xc5c5c5c5u;
+constexpr std::array<UINT, 16> constants{count, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 23, 29};
+}
+
+ComPtr<ID3D12Resource> make_buffer(ID3D12Device* device, UINT64 length, D3D12_HEAP_TYPE heap,
+                                   D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags)
+{
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = length;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = flags;
+    return resource(device, desc, heap, state);
+}
+
+static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
+
+static void fill_upload(ID3D12Resource* upload)
+{
+    void* mapped = nullptr;
+    const D3D12_RANGE no_reads{};
+    check(upload->Map(0, &no_reads, &mapped), "Map compute upload");
+    auto* words = static_cast<UINT*>(mapped);
+    for (UINT i = 0; i < capacity; ++i) {
+        words[i] = input_word(i);
+        words[capacity + i] = sentinel;
+    }
+    auto* cb = static_cast<unsigned char*>(mapped) + constants_offset;
+    std::memset(cb, 0, 4 * alignment);
+    std::memcpy(cb, constants.data(), sizeof(constants));
+    for (UINT i = 1; i < 4; ++i) std::memcpy(cb + i * alignment, &constants[12 + i], sizeof(UINT));
+    upload->Unmap(0, nullptr);
+}
+
+void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer,
+                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {buffer, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
+    list->ResourceBarrier(1, &barrier);
+}
+
+static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                         ID3D12Resource* input, ID3D12Resource* output)
+{
+    constexpr UINT uavs = 13, srvs = 21;
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    desc.NumDescriptors = uavs + srvs;
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap)), "Create compute descriptor heap");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(desc.Type);
+    auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = capacity;
+    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    for (UINT i = 0; i < uavs; ++i, cpu.ptr += stride)
+        device->CreateUnorderedAccessView(i == uavs - 1 ? output : nullptr, nullptr, &uav, cpu);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = capacity;
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    for (UINT i = 0; i < srvs; ++i, cpu.ptr += stride)
+        device->CreateShaderResourceView(i == srvs - 1 ? input : nullptr, &srv, cpu);
+    ID3D12DescriptorHeap* heaps[]{heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
+    list->SetComputeRootDescriptorTable(0, gpu);
+    gpu.ptr += UINT64{uavs} * stride;
+    list->SetComputeRootDescriptorTable(1, gpu);
+    for (UINT i = 0; i < 4; ++i)
+        list->SetComputeRootConstantBufferView(2 + i, input->GetGPUVirtualAddress() + constants_offset + i * alignment);
+    return heap;
+}
+
+void check_compute(ID3D12Device* device, bool tables)
+{
+    D3D12_SHADER_BYTECODE shader = tables ? D3D12_SHADER_BYTECODE{compute_tables, sizeof(compute_tables)} :
+                                            D3D12_SHADER_BYTECODE{compute_root, sizeof(compute_root)};
+    ComPtr<ID3D12RootSignature> signature;
+    check(device->CreateRootSignature(0, shader.pShaderBytecode, shader.BytecodeLength, IID_PPV_ARGS(&signature)),
+          "Create compute root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = signature.Get();
+    pso.CS = shader;
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&pipeline)), "Create compute pipeline");
+    auto input = make_buffer(device, constants_offset + 4 * alignment, D3D12_HEAP_TYPE_UPLOAD,
+                             D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto output = make_buffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    fill_upload(input.Get());
+    ComputeCommands commands(device, pipeline.Get());
+    auto& list = commands.list;
+    transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyBufferRegion(output.Get(), 0, input.Get(), bytes, bytes);
+    transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->SetComputeRootSignature(signature.Get());
+    ComPtr<ID3D12DescriptorHeap> heap;
+    if (tables) {
+        heap = bind_tables(device, list.Get(), input.Get(), output.Get());
+    } else {
+        list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
+        list->SetComputeRoot32BitConstants(2, static_cast<UINT>(constants.size()), constants.data(), 0);
+    }
+    list->Dispatch(capacity / 64, 1, 1);
+    transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+    commands.submit_and_wait(device);
+    void* mapped = nullptr;
+    const D3D12_RANGE read{0, bytes}, no_writes{};
+    check(readback->Map(0, &read, &mapped), "Map compute readback");
+    const auto* words = static_cast<const UINT*>(mapped);
+    UINT mismatches = 0;
+    constexpr UINT key = constants[13] + 3 * constants[14] + 5 * constants[15];
+    for (UINT i = 0; i < capacity; ++i) {
+        const UINT expected = i < count ? (input_word(i) * 33u) ^ (key + i * constants[1]) : sentinel;
+        if (words[i] != expected) ++mismatches;
+    }
+    readback->Unmap(0, &no_writes);
+    std::printf("layout=%s output_words=%u guard_words=%u mismatches=%u\n",
+                tables ? "tables" : "root", count, capacity - count, mismatches);
+    if (mismatches) throw std::runtime_error("Compute readback differs from CPU reference");
+}
+
+ComputeCommands::ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline)
+{
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "Create compute queue");
+    check(device->CreateCommandAllocator(desc.Type, IID_PPV_ARGS(&allocator)), "Create compute allocator");
+    check(device->CreateCommandList(0, desc.Type, allocator.Get(), pipeline, IID_PPV_ARGS(&list)),
+          "Create compute command list");
+}
+
+void ComputeCommands::submit_and_wait(ID3D12Device* device)
+{
+    check(list->Close(), "Close compute command list");
+    ComPtr<ID3D12Fence> fence;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create compute fence");
+    ID3D12CommandList* submitted[]{list.Get()};
+    queue->ExecuteCommandLists(1, submitted);
+    check(queue->Signal(fence.Get(), 1), "Signal compute fence");
+    check(fence->SetEventOnCompletion(1, nullptr), "Wait for compute");
+    check(device->GetDeviceRemovedReason(), "Compute completion");
+}

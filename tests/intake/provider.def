@@ -1,0 +1,4 @@
+LIBRARY intake_provider
+EXPORTS
+    named_value
+    ordinal_value @77 NONAME
