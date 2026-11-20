@@ -98,12 +98,11 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
     return heap;
 }
 
-void check_compute(ID3D12Device* device, bool tables)
+static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE shader,
+                        D3D12_SHADER_BYTECODE rootBytes)
 {
-    D3D12_SHADER_BYTECODE shader = tables ? D3D12_SHADER_BYTECODE{compute_tables, sizeof(compute_tables)} :
-                                            D3D12_SHADER_BYTECODE{compute_root, sizeof(compute_root)};
     ComPtr<ID3D12RootSignature> signature;
-    check(device->CreateRootSignature(0, shader.pShaderBytecode, shader.BytecodeLength, IID_PPV_ARGS(&signature)),
+    check(device->CreateRootSignature(0, rootBytes.pShaderBytecode, rootBytes.BytecodeLength, IID_PPV_ARGS(&signature)),
           "Create compute root signature");
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
     pso.pRootSignature = signature.Get();
@@ -148,6 +147,45 @@ void check_compute(ID3D12Device* device, bool tables)
     std::printf("layout=%s output_words=%u guard_words=%u mismatches=%u\n",
                 tables ? "tables" : "root", count, capacity - count, mismatches);
     if (mismatches) throw std::runtime_error("Compute readback differs from CPU reference");
+}
+
+void check_compute(ID3D12Device* device, bool tables)
+{
+    const D3D12_SHADER_BYTECODE shader = tables ? D3D12_SHADER_BYTECODE{compute_tables, sizeof(compute_tables)} :
+                                                  D3D12_SHADER_BYTECODE{compute_root, sizeof(compute_root)};
+    run_compute(device, tables, shader, shader);
+}
+
+void check_bvh_root_roundtrip(ID3D12Device* device)
+{
+    const D3D12_SHADER_BYTECODE shader{compute_root, sizeof(compute_root)};
+    ComPtr<ID3D12VersionedRootSignatureDeserializer> embedded;
+    check(D3D12CreateVersionedRootSignatureDeserializer(shader.pShaderBytecode, shader.BytecodeLength,
+          IID_PPV_ARGS(&embedded)), "Read embedded control signature");
+    auto desc = *embedded->GetUnconvertedRootSignatureDesc();
+    if (desc.Version != D3D_ROOT_SIGNATURE_VERSION_1_1) throw std::runtime_error("Expected a v1.1 control");
+    auto& flags = desc.Desc_1_1.Flags;
+    constexpr UINT tags = 0x03000000;
+    if (flags & tags) throw std::runtime_error("Control already contains the BVH flags");
+    ComPtr<ID3DBlob> control, rejected, normalized, roundtrip;
+    check(D3D12SerializeVersionedRootSignature(&desc, &control, nullptr), "Serialize control signature");
+    flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags | tags);
+    const HRESULT tagged = D3D12SerializeVersionedRootSignature(&desc, &rejected, nullptr);
+    std::printf("tagged_flags=0x%08x serialize_hr=0x%08lx\n", static_cast<UINT>(flags), tagged);
+    if (tagged != E_INVALIDARG || rejected.Get()) throw std::runtime_error("Unexpected tagged signature result");
+
+    flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags & ~tags);
+    check(D3D12SerializeVersionedRootSignature(&desc, &normalized, nullptr), "Serialize normalized signature");
+    ComPtr<ID3D12VersionedRootSignatureDeserializer> decoded;
+    check(D3D12CreateVersionedRootSignatureDeserializer(normalized->GetBufferPointer(), normalized->GetBufferSize(),
+          IID_PPV_ARGS(&decoded)), "Deserialize normalized signature");
+    check(D3D12SerializeVersionedRootSignature(decoded->GetUnconvertedRootSignatureDesc(), &roundtrip, nullptr),
+          "Reserialize normalized signature");
+    if (roundtrip->GetBufferSize() != control->GetBufferSize() ||
+        std::memcmp(roundtrip->GetBufferPointer(), control->GetBufferPointer(), control->GetBufferSize()) != 0)
+        throw std::runtime_error("Normalized signature differs from independent control serialization");
+    run_compute(device, false, shader, {roundtrip->GetBufferPointer(), roundtrip->GetBufferSize()});
+    std::puts("normalized_signature=matched_control root_creation=passed pipeline_creation=passed dispatch=passed");
 }
 
 ComputeCommands::ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline)

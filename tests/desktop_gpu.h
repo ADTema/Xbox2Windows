@@ -6,6 +6,7 @@ void check(HRESULT hr, const char* stage);
 Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc,
     D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear = nullptr);
 void check_compute(ID3D12Device* device, bool tables);
+void check_bvh_root_roundtrip(ID3D12Device* device);
 void check_buffer_ops(ID3D12Device* device);
 void check_bvh_reads(ID3D12Device* device);
 void check_bvh_hits(ID3D12Device* device);

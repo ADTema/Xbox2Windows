@@ -43,12 +43,15 @@ def trace(report, entry):
                 problem = "bundled_export_missing"
             elif len(providers) > 1:
                 problem = "ambiguous_package_basename"
-            elif row["desktop_export"] != "export_present":
-                problem = row["desktop_export"]
             else:
-                continue
-            findings.append(dict(path=path, reasons=reasons + (kind,), conditional=conditional or kind == "delay",
-                                 dll=dll, symbol=symbol, problem=problem, candidates=providers))
+                problem = row.get("desktop_resolution", {}).get("status", row["desktop_export"])
+                if problem == "export_present":
+                    continue
+            finding = dict(path=path, reasons=reasons + (kind,), conditional=conditional or kind == "delay",
+                           dll=dll, symbol=symbol, problem=problem, candidates=providers)
+            if not providers and "desktop_resolution" in row:
+                finding["desktop_chain"] = row["desktop_resolution"]["chain"]
+            findings.append(finding)
 
         if images[image]["sha256"] == FFX_LOADER:
             for dll, condition in (
@@ -71,8 +74,9 @@ def trace(report, entry):
             heapq.heappush(queue, (conditional or edge != "normal", depth + 1, path + (target,), reasons + (edge,)))
     return dict(entry=entry, reachable=reached, findings=findings, dynamic_lookup_imports=lookups,
                 unlinked_in_this_graph=sorted(set(images) - set(reached)),
-                scope="Package import paths and identified FFX routes. Host forwarders, arbitrary dynamic targets "
-                      "and actual execution order are not resolved.")
+                scope="Package imports and identified FFX routes. Desktop findings use terminal export status "
+                      "where available and first-hop status for older inventories. Dynamic targets and actual "
+                      "execution order require independent evidence.")
 
 
 def main():

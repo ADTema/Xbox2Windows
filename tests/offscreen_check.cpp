@@ -335,6 +335,8 @@ int main(int argc, char** argv)
         const std::string_view operation = argv[2];
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
+        } else if (argc == 3 && operation == "--bvh-root-roundtrip") {
+            check_bvh_root_roundtrip(device.Get());
         } else if (argc == 3 && operation == "--bvh-differential") {
             if (!check_bvh_differential(device.Get())) return 77;
         } else if (argc == 3 && operation == "--bvh-hits") {

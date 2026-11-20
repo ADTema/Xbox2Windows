@@ -102,6 +102,8 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME offscreen_${adapter} COMMAND offscreen_check ${adapter} triangle_${adapter}.bmp)
     add_test(NAME dxr_query_${adapter} COMMAND offscreen_check ${adapter} --ray-query)
     add_test(NAME bvh_buffer_ops_${adapter} COMMAND offscreen_check ${adapter} --buffer-ops)
+    add_test(NAME bvh_root_roundtrip_${adapter} COMMAND offscreen_check ${adapter} --bvh-root-roundtrip)
+    set_tests_properties(bvh_root_roundtrip_${adapter} PROPERTIES TIMEOUT 45)
     foreach(work IN ITEMS reads waves wave64 hits differential)
         add_test(NAME bvh_${work}_${adapter} COMMAND offscreen_check ${adapter} --bvh-${work})
         set_tests_properties(bvh_${work}_${adapter} PROPERTIES TIMEOUT 45)
@@ -112,6 +114,7 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(offscreen_${adapter} PROPERTIES TIMEOUT 45)
 endforeach()
 set_tests_properties(offscreen_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(bvh_root_roundtrip_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_buffer_ops_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_reads_hardware bvh_waves_hardware bvh_hits_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -138,7 +141,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(intake_provider SHARED tests/intake/provider.cpp tests/intake/provider.def)
     add_library(intake_delay SHARED tests/intake/provider.cpp tests/intake/delay.def)
     add_executable(intake_candidate tests/intake/candidate.cpp)
-    target_link_libraries(intake_candidate PRIVATE intake_provider intake_delay delayimp)
+    # Build an import library from a name only. No graphics DLL is linked or executed at build time.
+    set(graphics_import "${CMAKE_CURRENT_BINARY_DIR}/intake_graphics.lib")
+    add_custom_command(OUTPUT "${graphics_import}"
+        COMMAND "${CMAKE_AR}" /nologo /machine:x64 "/def:${CMAKE_CURRENT_SOURCE_DIR}/tests/intake/graphics_import.def"
+                "/out:${graphics_import}"
+        DEPENDS tests/intake/graphics_import.def VERBATIM)
+    target_sources(intake_candidate PRIVATE "${graphics_import}")
+    target_link_libraries(intake_candidate PRIVATE intake_provider intake_delay delayimp "${graphics_import}")
     target_link_options(intake_candidate PRIVATE /DELAYLOAD:intake_delay.dll)
     add_test(NAME static_exe_intake COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/intake/check.py" "$<TARGET_FILE:intake_candidate>"
