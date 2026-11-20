@@ -1,12 +1,17 @@
 # Xbox2Windows
 
-Xbox2Windows 研究 Xbox Series X|S（Scarlett）程序在 x64 Windows 上的兼容性。目前可以复现的是内存接口、PE 依赖分析、D3D12 绘制和 BVH 射线命中实验。运行社区测试只需 Windows PC。完整商业游戏启动仍待验证。
+Xbox2Windows investigates what it takes to run Xbox Series X|S (Scarlett) software on x64 Windows. **Grand Theft Auto VI (GTA 6) on Xbox Series X (XSX)** is the motivating case study. The part you can run today is a set of source-built Windows experiments covering executable dependencies, memory allocation, D3D12 shaders and ray tracing. Full-game startup and frame rate remain unverified.
 
-**For contributors:** Xbox2Windows studies Xbox Series X|S compatibility on Windows. All community tests use source-built fixtures and run on a PC. Contributions and test reports in English or Chinese are welcome. [Contribution guide](CONTRIBUTING.md)
+## Where a contributor can help
 
-## 第一次构建
+Our RTX 2060 runs 32-lane waves and Microsoft's WARP software renderer runs 4-lane waves. Both passed the same 408 BVH ray comparisons and skipped the native 64-lane test. Two tasks are ready to pick up:
 
-在 Windows x64 上安装 Visual Studio 的“使用 C++ 的桌面开发”工作负载，包含 MSVC x64、C++ CMake 工具以及 Windows SDK 10.0.26100（含 DXC）。从仓库根目录打开 PowerShell。
+- **Have a wave64-capable GPU?** Run three BVH tests and report the adapter, lane range and first mismatch, if any. [Native wave64 coverage (#1)](https://github.com/R0Y00/Xbox2Windows/issues/1) · [Measured results](docs/experiments.md#independent-bvh-checks-on-pc)
+- **New to graphics programming?** Try the first build on a clean Windows checkout and tell us where the instructions work or break down. This task uses software rendering. [First-build check (#2)](https://github.com/R0Y00/Xbox2Windows/issues/2)
+
+## First build
+
+On x64 Windows, install Visual Studio's **Desktop development with C++** workload, including x64 MSVC, the C++ CMake tools with Ninja, and Windows SDK 10.0.26100 with DXC. From the repository root in PowerShell, run:
 
 ```powershell
 .\tools\dev.ps1
@@ -15,7 +20,7 @@ cmake --build --preset dev
 ctest --preset dev -R 'desktop_root_signature|era_heap_allocation|offscreen_warp'
 ```
 
-最后一条命令验证根签名、内存分配和软件渲染。安装 x64 Python 3.11 或更高版本后可启用 PE 和着色器元数据测试。创建虚拟环境后重新配置，CMake 会注册这些用例。
+These three tests exercise a D3D12 root signature, heap allocation and software rendering. To enable the PE and shader metadata tests, install x64 Python 3.11 or newer, then configure again:
 
 ```powershell
 python -m venv out/pe-env
@@ -25,17 +30,21 @@ cmake --build --preset dev
 ctest --preset dev
 ```
 
-## 从哪里参与
+## Choose an experiment
 
-| 方向 | 可以独立完成的第一项工作 | 本地验证 |
+| Area | A contribution you can verify | Focused CTest command |
 |---|---|---|
-| D3D12 / GPU | 在另一种适配器上复测 BVH，报告驱动、通道宽度、命中差异和能力跳过项 | `ctest --preset dev -R 'bvh_differential\|bvh_wave64' -V` |
-| Windows 运行时 | 用自建分配请求复现一个内存行为，给出 Windows 端的期望值 | `ctest --preset dev -R 'era_heap\|desktop_memory_query'` |
-| PE 与工具 | 用自行编译的 DLL 或 EXE 补一个导入解析边界用例 | `ctest --preset dev -R 'static_exe_intake\|conditional_import_paths'` |
-| 文档和复现 | 从全新工作副本运行上面的命令，记录第一个需要补充说明的步骤 | 附系统、工具版本、命令和输出 |
+| D3D12 and ray tracing | Compare the CPU reference, custom BVH shader and DXR on another adapter. Record the driver and native wave width. | `ctest --preset dev -R '^bvh_(differential\|wave64)_hardware$' -V` |
+| Windows runtime | Add a source-built allocation case with a measurable Windows result. | `ctest --preset dev -R 'era_heap\|desktop_memory_query'` |
+| PE tooling | Reproduce an import-resolution edge case with a DLL or EXE built from source. | `ctest --preset dev -R 'static_exe_intake\|conditional_import_paths'` |
+| Build and documentation | Try the first build from a clean clone. Identify the first missing prerequisite or unclear instruction. | Use the three-test command above. |
 
-在 [Issues](https://github.com/R0Y00/Xbox2Windows/issues) 查看或提出任务。提交范围、复现信息和评审流程见[贡献指南](CONTRIBUTING.md)。已有实验的输入、结果和局限见[实验记录](docs/experiments.md)。
+The contribution guide explains how to claim a task, report a skip, or submit a patch. [Contributing](CONTRIBUTING.md) · [Open an issue](https://github.com/R0Y00/Xbox2Windows/issues/new/choose)
 
-## 许可
+## GTA VI case study and provenance
 
-本项目的原创代码和文档采用 [MIT 许可证](LICENSE)。第三方游戏、素材、SDK 和商标的权利归各自权利人。项目独立维护，与 Rockstar Games、Take-Two、Microsoft 和 AMD 均无隶属关系。
+In a statement dated November 20, 2026 and supplied to the project maintainer, CYBERLEEK claimed to have a November Xbox build of GTA VI and said the main executable had been withheld. The project's local intake recorded a Scarlett entry in the installation metadata and the absence of that executable from the inspected file set. Build authorship, date and completeness remain unverified. The public regression suite uses synthetic fixtures and independently built shaders. [Intake methods and evidence](docs/experiments.md#static-executable-intake)
+
+## License
+
+Original project code and documentation use the [MIT License](LICENSE). Third-party games, assets, SDKs and trademarks belong to their respective owners. Xbox2Windows is an independent community project, unaffiliated with Rockstar Games, Take-Two, Microsoft or AMD.

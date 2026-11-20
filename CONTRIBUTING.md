@@ -1,34 +1,34 @@
 # Contributing to Xbox2Windows
 
-欢迎用中文或英文提交改动、复现报告和不同显卡的测试结果。社区维护的回归用例全部来自仓库源码。参与者可以在 PC 上构建并运行它们。
+You can contribute a hardware result, a source-built failing case, a documentation fix or a patch from an x64 Windows PC. Our GTA VI / Xbox Series X case study supplies research questions. The shared regression suite runs with public tools and fixtures built from this repository.
 
-## Pick up work / 认领任务
+## Find and claim a task
 
-1. Search [open issues](https://github.com/R0Y00/Xbox2Windows/issues) for the behavior or test name. 对已有任务，留言说明你准备验证的部分，方便其他人并行处理其余部分。小修正可以直接提 PR。
-2. For a new investigation, open a research proposal. 写清输入、能观察到的结果和完成条件。维护者可用 GitHub 的 assignee、关联 PR 和关闭原因记录进度。
-3. Create a topic branch from the current `main`. External contributors can work on a fork when available. 每个 PR 聚焦一个可评审的问题，通过 `Fixes #123` 或 `Refs #123` 关联已有讨论。
+1. Search the [issue tracker](https://github.com/R0Y00/Xbox2Windows/issues) for the test name or observed behavior. Issues labeled **good first issue** have a small first step. **help wanted** marks work that can proceed independently.
+2. For an existing task, comment with the part you plan to test and your environment. Multiple adapters can be tested in parallel. For a new investigation, open a research task with a question, reproducible inputs and a completion condition. Small fixes can start with a PR.
+3. If another contributor takes over, leave the commit, last command, observed result and next unanswered question on the issue. A maintainer can use the assignee field to record ownership of a patch.
 
-## Build and test / 构建与验证
+## Build and test
 
-Use x64 Windows, Visual Studio C++ Build Tools with MSVC and CMake/Ninja, and Windows SDK 10.0.26100 with DXC. Start PowerShell at the repository root. Run the commands in the [README](README.md#第一次构建). Install the pinned Python dependency before configuring to include the PE tests. `ctest --preset dev -N` lists the tests registered on your machine.
+Start with the [first build](README.md#first-build). Install the pinned Python dependency before configuring to include the PE tests. List the tests registered in your environment with `ctest --preset dev -N`, then run a focused test with `ctest --preset dev -R <name> -V`.
 
-| Where to work | What belongs there |
+| Location | What to work on |
 |---|---|
-| `src/` | Windows runtime implementations; exercise public behavior through the matching test. |
-| `tests/` | C++, HLSL and generated-input fixtures. The `_warp` suffix selects the software adapter. The `_hardware` suffix selects a physical GPU. |
-| `tools/` | Build environment and offline metadata tools. Run PE checks on the locally built fixtures in `tests/intake/`. |
-| `docs/experiments.md` | Measured results, input assumptions and commands for repeating an experiment. |
+| `src/` | Windows runtime implementations and their observable behavior. |
+| `tests/` | C++, HLSL and generated-input fixtures. Tests ending in `_warp` use the software adapter. Those ending in `_hardware` use a physical GPU. |
+| `tools/` | Build setup and offline metadata tools. The PE fixtures live in `tests/intake/`. |
+| `docs/experiments.md` | Measured results, assumptions and reproduction commands. |
 
-Use `ctest --preset dev -R <name> -V` for a focused run. For GPU work, record the adapter, driver, feature tier or wave width, and whether the debug layer was enabled. Include skipped test names and the reported capability. CI builds the C++ and HLSL, then runs the CPU, Python and WARP checks on a Windows runner. Physical GPU results come from contributor runs.
+Windows CI builds the C++ and HLSL, then runs the CPU, Python and WARP checks. Contributors supply physical GPU coverage. For a hardware report, record the commit, adapter and driver, Windows version, test names and debug-layer status. Include the reported feature tier or wave width when relevant. A capability skip is a useful observation. Record it separately from a pass or failure.
 
-## Fixtures and evidence / 样例与证据
+## Share a reproducible finding
 
-Submit original source, synthetic inputs, or a link to a public sample with its revision and license. Keep game files, distribution links, SDK redistributables and local dumps out of Git, issues and PR attachments. Store local inputs in `game-files/` and generated results in `out/`. For a bug report, share the smallest source fixture that reproduces the behavior. Remove personal paths and credentials from logs.
+Use original source, synthetic inputs or a public sample with its revision and license. Store local inputs in `game-files/` and generated output in `out/`. Keep game files, distribution links, SDK redistributables and dumps out of issues, PRs and Git. Remove personal paths and credentials from logs.
 
-Submit original contributions under the project's [MIT license](LICENSE). Preserve any applicable third-party attribution and license notices.
+State what the test measured and which behavior remains a hypothesis. For example, a BVH report can identify the first differing ray and give the CPU, shader and DXR hit distances. If several primitives coincide, describe which IDs are valid. Claims about the GTA VI build should identify their source. A passing fixture supports the behavior under test; full-game startup requires its own execution evidence.
 
-Distinguish a measured result from a proposed interpretation. For a BVH change, for example, report the failing ray, the expected distance or primitive, and what the CPU, custom shader and DXR each returned. Where multiple primitives can satisfy a query, describe the accepted result set.
+## Submit and review a patch
 
-## Review / 合并
+Create a topic branch from current `main` in your fork. Keep a PR focused on one reviewable behavior, include the exact test command and result, and link any related issue with `Refs #123`. Use `Fixes #123` when the patch meets that issue's completion condition. Submit original contributions under the [MIT License](LICENSE) and preserve applicable third-party notices.
 
-Describe the user-visible or testable change, include the command and result, and identify the behavior that still needs verification. Reviewers can reproduce the smallest failing case, check the source of new fixtures and compare the expected behavior before and after the patch. Maintainers merge reviewed changes after the relevant checks pass and link follow-up work to the original issue.
+Reviewers reproduce the smallest relevant case, check the origin of any new fixtures and compare behavior before and after the change. Maintainers merge through a PR after the Windows check passes and review conversations are resolved. Record remaining questions in a linked issue so the next contributor can pick them up.

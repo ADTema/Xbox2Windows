@@ -1,16 +1,16 @@
-# 实验记录与复测命令
+# Experiment notes and reproduction commands
 
-以下命令均在仓库根目录运行。首次参与请先阅读[项目首页](../README.md)和[贡献指南](../CONTRIBUTING.md)。本记录包含使用本地输入的专项研究，社区回归使用仓库中的自建样例。
+Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
-## 本地开发
+## Local tools
 
-在仓库根目录打开 PowerShell。需要 Visual Studio Build Tools 的 x64 C++、CMake 工具和 Windows SDK。首次配置时运行以下命令，从微软固定版本的源码构建静态依赖分析工具。
+For optional static dependency inspection, build Microsoft's pinned version of xbdepends from PowerShell with x64 Visual Studio Build Tools, CMake and the Windows SDK.
 
 ```powershell
 .\tools\setup-xbdepends.ps1
 ```
 
-在每个新的开发终端中加载工具链，然后配置、构建并测试。
+Load the toolchain in each new development shell, then configure, build and test.
 
 ```powershell
 .\tools\dev.ps1
@@ -19,113 +19,113 @@ cmake --build --preset dev
 ctest --preset dev
 ```
 
-测试使用自建根签名验证桌面 D3D12 的序列化与反序列化。可以用测试产物练习静态检查。
+The tests exercise desktop D3D12 root signature serialization and deserialization. Use the resulting test binary to try the static inspection tools.
 
 ```powershell
 xbdepends -v .\out\build\dev\d3d12_sdk_check.exe
 dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 ```
 
-构建产物和工具源码缓存在 `out/`。工具用法见[微软 xbdepends 文档](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)。
+Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
-## 构建完整性
+## Package integrity
 
-对同时包含多文件 v1 种子和 `layout*.xml` 的构建目录，可以用 Python 3.9+ 离线校验。将下方路径替换为本机构建目录。
+For a local build with a multi-file v1 torrent and `layout*.xml`, run the offline verification with Python 3.9 or newer. Substitute your local directory name.
 
 ```powershell
-python tools/verify_build.py "game-files/<构建目录名>"
+python tools/verify_build.py "game-files/<build-directory>"
 ```
 
-脚本按种子顺序读取文件，校验跨文件的 SHA-1 分块，再将安装布局的目标路径与磁盘、种子分别核对。报告位于 `out/integrity/<构建目录名>.json`。退出码 0 表示种子内容通过，布局缺项单独记录在 `layout.absent_from_disk`。
+The script verifies SHA-1 pieces across file boundaries in torrent order and compares layout destinations separately with disk and torrent entries. The report is `out/integrity/<build-directory>.json`. Exit code 0 means the payload passed piece verification. `layout.absent_from_disk` lists missing layout entries separately.
 
-## PE 依赖基线
+## PE dependency baseline
 
-扫描器使用 x64 Windows、Python 3.11+ 和 pefile。首次配置隔离环境可以运行以下命令。
+The scanner uses x64 Windows, Python 3.11 or newer and pefile. Set up an isolated environment once.
 
 ```powershell
 python -m venv out/pe-env
 .\out\pe-env\Scripts\python.exe -m pip install pefile==2024.8.26
 ```
 
-在只有 DLL 时保存基线。后续加入 EXE 后另存新报告，并将旧报告作为比较输入。
+Capture a DLL-only baseline. When an EXE becomes available, write a separate report and compare it with the saved baseline.
 
 ```powershell
 $pePython = '.\out\pe-env\Scripts\python.exe'
-$buildDir = 'game-files/<构建目录名>'
+$buildDir = 'game-files/<build-directory>'
 & $pePython tools/pe_inventory.py $buildDir --output out/dependencies/pre-exe.json
-# 加入主程序后执行下一行
+# Run the next command after adding the main executable.
 & $pePython tools/pe_inventory.py $buildDir --baseline out/dependencies/pre-exe.json --output out/dependencies/with-exe.json
 ```
 
-`summary` 给出计数，`unresolved_edges` 列出包内和本机均未找到指定导出的条目。每条 `imports` 记录对应一个调用模块、导入方式、提供方和符号的组合，`#N` 表示按序号导入。`images` 记录架构、SHA-256、导出名、序号和转发目标。`diff` 区分新增调用关系和整个构建首次出现的依赖。
+`summary` gives counts. `unresolved_edges` lists requested exports missing from both the package and the host. Each `imports` entry identifies the caller, import mechanism, provider and symbol. `#N` denotes an ordinal. `images` includes architecture, SHA-256, export names, ordinals and forwarders. `diff` distinguishes new caller relationships from dependencies seen for the first time in the build.
 
-桌面对照读取本机 System32 的导出表，并按主机的 API-set v6 映射查找提供方。同名或同序号匹配包含转发导出，最终转发目标、函数参数、运行时动态加载和对象方法仍需验证。[API-set v6 结构与查找实现](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/loader.c)
+The desktop comparison reads System32 export tables and resolves providers using the host API-set v6 map. Name and ordinal matches include forwarded exports. Final forwarding destinations, parameters, runtime lookups and object methods need separate checks. [Wine API-set lookup](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/loader.c)
 
-## 普通堆内存实验
+## Heap and process memory
 
-`src/era_heap.cpp` 是供自有程序调用的桌面实验。对齐指数按 SlimEra 的 Xbox One ERA 定义取属性的第 24–28 位；当前仅处理其他属性位为零的普通堆请求。Scarlett 的属性编码、错误约定和图形内存语义仍待验证。[SlimEra 属性定义](https://github.com/XWine1/SlimEra/blob/main/era.h#L105-L137) · [SlimEra 默认堆实现](https://github.com/XWine1/SlimEra/blob/main/kernelx.cpp#L600-L657)
+`src/era_heap.cpp` implements ordinary desktop heap requests for source-built callers. The alignment exponent uses attribute bits 24–28 following SlimEra's Xbox One ERA definition. The fixture accepts ordinary heap requests with all other attribute bits clear. Scarlett attribute encodings, error conventions and graphics memory semantics remain open questions. [SlimEra attributes](https://github.com/XWine1/SlimEra/blob/main/era.h#L105-L137) · [SlimEra default heap](https://github.com/XWine1/SlimEra/blob/main/kernelx.cpp#L600-L657)
 
-| CTest 用例 | 输入及验收条件 |
+| CTest case | Inputs and checks |
 |---|---|
-| `era_heap_allocation` | 257 字节、6 种对齐指数；检查至少 16 字节及指定对齐、初始清零、写入和释放。Debug 构建额外核对 CRT 堆快照。 |
-| `era_heap_failure` | 对零长度、超大长度、图形内存、非默认页和保留位请求，实验返回空指针。这是本实验定义的失败策略。 |
-| `era_heap_concurrency` | 4 个线程各 100 轮，同时持有分配并写入不同值，逐字节检查数据独立性后释放。 |
+| `era_heap_allocation` | Allocate 257 bytes using six alignment exponents. Check alignment of at least 16 bytes and the requested alignment, initial zeroing, writes and release. Debug builds also compare CRT heap snapshots. |
+| `era_heap_failure` | Zero size, excessive size, graphics memory, nondefault pages and reserved bits return a null pointer under the fixture's error policy. |
+| `era_heap_concurrency` | Four threads run 100 rounds each. They hold simultaneous allocations, write distinct values, compare every byte and release the memory. |
 
-`desktop_memory_query` 为 `XMemVirtualQuery` 和 `XMemGetWorkingSetStatistics` 提供 Windows 侧对照。用例预留一段内存，提交并逐页写入其中 1,024 页，验证只读页和可写页的分界，再撤销提交。它检查锁定页的驻留状态，并记录三个时点的进程工作集、峰值工作集和私有提交字节数。不同次运行的统计值会浮动。Scarlett 返回结构、单位和统计范围仍待核对。[Windows 工作集说明](https://learn.microsoft.com/en-us/windows/win32/memory/working-set)
+`desktop_memory_query` supplies Windows observations for `XMemVirtualQuery` and `XMemGetWorkingSetStatistics`. The test reserves memory, commits and writes 1,024 pages, checks the read-only/writable boundary, then decommits. It verifies residency of a locked page and records working set, peak working set and private commit at three points. Values vary between runs. Scarlett structure layout, units and accounting scope remain unconfirmed. [Windows working sets](https://learn.microsoft.com/en-us/windows/win32/memory/working-set)
 
-## 离屏绘制与读回
+## Offscreen rendering and readback
 
-`offscreen_hardware` 使用高性能硬件适配器，`offscreen_warp` 使用微软软件光栅器。两个用例使用 DXC 编译的同一组自建着色器，在 64×64 RGBA8 纹理绘制三角形，等 GPU 完成后按行距读回，逐像素核对颜色和覆盖范围。输出在构建目录的 `triangle_hardware.bmp` 和 `triangle_warp.bmp`。运行 `ctest --preset dev -V` 可查看适配器、驱动、调试层状态和像素差异。具备调试层时，队列中的错误或损坏级别消息会使测试失败。
+`offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
 
-本机已安装 Windows Graphics Tools。另一个构建目录 `out/build/agility` 使用微软 Agility SDK 1.620.2 验证同一用例。复建时给 CMake 指定 `-DOFFSCREEN_AGILITY_620_DIR=<SDK 的 x64 DLL 目录>`。此配置会检查调试接口是否真正启用。[微软 Agility SDK 包](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
+The original test machine had Windows Graphics Tools installed. A second build in `out/build/agility` used Microsoft Agility SDK 1.620.2. Set `-DOFFSCREEN_AGILITY_620_DIR=<directory containing the x64 SDK DLLs>` to reproduce it. This configuration verifies debug interface activation. [Agility SDK package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
 
-## 主程序静态接收
+## Static executable intake
 
-在仓库根目录运行下列命令。默认从唯一构建的 `MicrosoftGame.Config` 读取 Scarlett 入口。文件可以在安装布局指定的位置，也可以作为单独的路径参数传入。整个流程只读取游戏文件。
+By default, the intake tool locates the Scarlett entry in the sole build's `MicrosoftGame.Config`. It accepts the layout path or a separate candidate file and opens the game files for reading only.
 
 ```powershell
 .\out\pe-env\Scripts\python.exe -B tools/intake_exe.py
-# 独立收到的文件可以直接检查
+# Inspect a separately supplied candidate.
 .\out\pe-env\Scripts\python.exe -B tools/intake_exe.py "E:\incoming\game_scarlett_master.exe"
 ```
 
-每次检查在 `out/intake/` 新建 JSON。退出码 3 表示仍在等待布局中的文件，2 表示输入或检查失败，0 表示静态检查完成。报告关联上次完整性校验的时间、种子 SHA-256、安装分块和基线摘要。当前种子未收录这个 EXE，历史上的 13,345 个匹配分块无法证明后来文件的来源。工具重新扫描包内 PE 并另列发生变化的 DLL，历史上的 223,880,932,870 字节资源校验结果保留在原报告中。
+Each run writes a new JSON report in `out/intake/`. Exit codes are 3 for a missing layout executable, 2 for an input or inspection failure and 0 for completed inspection. The report links the previous verification time, torrent SHA-256, install chunks and baseline summary. The inspected torrent omitted the EXE. The 13,345 matching pieces and 223,880,932,870 bytes verified in the historical report cover that original payload. A later EXE needs separate provenance. Intake rescans the package PEs and lists changed DLLs.
 
-对候选文件记录 SHA-256、架构、入口 RVA 和节、TLS 目录及回调顺序，随后列出相对基线新增的导入、模块和未解析项。测试用自建 PE 和单独的小种子覆盖按名、按序号、延迟导入、缺少提供方、TLS 回调、非法回调地址、截断、入口文件尚缺和路径冲突。接收结果不代表来源鉴定或可启动性。
+For each candidate the tool records SHA-256, architecture, entry RVA and section, TLS directory and callback order, then compares imports, modules and unresolved items with the baseline. Source-built PE fixtures and a miniature torrent cover named, ordinal and delayed imports, missing providers, TLS callbacks, invalid callback addresses, truncation, an absent entry and path conflicts. These checks establish static properties. Authenticity and startup remain unverified.
 
-## 六个接口的调用点
+## Six API call sites
 
-在加载开发工具链后可复查三个 DLL。输出的 `out/calls/six-apis.json` 包含镜像 SHA-256、导入槽、跳板上游、内嵌容器的分段以及代码引用。下表中的地址均为该 DLL 的 RVA，间接回调的运行时选择仍需执行证据。
+After loading the toolchain, inspect three local DLLs. `out/calls/six-apis.json` records image SHA-256, import slots, callers of thunks, embedded container sections and code references. Addresses below are RVAs in the relevant DLL. Indirect calls need execution evidence to identify the selected path.
 
 ```powershell
 .\tools\dev.ps1
-.\out\pe-env\Scripts\python.exe -B tools/call_evidence.py "game-files/<构建目录名>"
+.\out\pe-env\Scripts\python.exe -B tools/call_evidence.py "game-files/<build-directory>"
 ```
 
-| 导入 | 已观察到的输入、返回处理与桌面验证 |
+| Import | Observed inputs, return handling and desktop check |
 |---|---|
-| `XMemAlloc` | Bink 在 `0x25c35` 经跳板传入请求长度加 64 和属性 `0x05e50000`。返回空指针进入失败分支，成功时包装返回指针。AMD 在 `0x565d` 将长度向上取整到 256 的倍数，属性取自 `0x6eee0`，磁盘初值为 `0xa8004000`，也检查空指针。两组属性都超出现有普通堆实验的支持范围，已添加回归断言。 |
-| `XMemFree` | Bink 在 `0x25be4` 用包装指针前的偏移还原分配基址，并传回相同属性；空指针直接返回，自定义分配走配对回调。AMD 在 `0x5712` 和 `0x5921` 从同一全局槽读取属性，后者释放后清空持有者指针。没有观察到调用者使用返回值。 |
-| `XMemVirtualQuery` | BVH 的四个调用点是 `0x19c69/19ccb/19d9d/19df9`。传入当前进程、待查地址和清零的 64 字节输出区。返回零走诊断分支，成功后读取偏移 `+0x20` 和 `+0x30`，第一处还读取 `+0x24`。桌面对照向 `VirtualQueryEx` 提供 64 字节空间，实测写回 48 字节，最后 16 字节的标记保持原值。游戏读取的 `+0x30` 需要独立解释。 |
-| `XMemGetWorkingSetStatistics` | AMD 的七处调用使用选择值 `0x20000001` 和本地输出地址。在 `0x26b3` 及多处调用中，返回零时将参与计算的数置零，成功使用输出 `+8` 的 64 位值。`0x74d2/75b1` 附近用前后差值更新计数。单位、统计范围及选择值语义待核实。 |
-| `D3D12SerializeVersionedRootSignature` | BVH 在 `0xc2d0` 复制调用者传来的 48 字节描述符，在 `+0x28` 的标志位并入 `0x03000000`，`0xc32f` 传入描述符、blob 输出指针及空错误输出。负 HRESULT 进入诊断路径，成功后使用 blob 的长度与数据指针。桌面测试使用同一份自建 v1.1 描述符，无附加标志返回 `S_OK`，加入这两位后返回 `E_INVALIDARG`。 |
-| `D3D12CreateRootSignatureDeserializer` | AMD 在 `0x4f88` 从传入记录的 `+0/+8` 取字节指针和 32 位长度，传入接口 IID 及对象输出地址。负 HRESULT 或空对象进入清理部分状态的路径，成功后通过对象取描述符。桌面对照可从微软样例的完整着色器读取内嵌根签名，对自建的无根签名着色器返回 `E_INVALIDARG`。 |
+| `XMemAlloc` | At `0x25c35`, Bink passes the requested length plus 64 and attributes `0x05e50000` through a thunk. A null return enters diagnostics. Success wraps the pointer. At `0x565d`, AMD rounds the length up to a multiple of 256, reads the attributes at `0x6eee0` (on-disk initial value `0xa8004000`) and checks for null. Regression assertions cover both attribute sets, which exceed the ordinary-heap fixture's supported range. |
+| `XMemFree` | At `0x25be4`, Bink recovers the base pointer from an offset preceding the wrapper, passes the same attributes, and uses a matching callback for custom allocation. At `0x5712` and `0x5921`, AMD reads the same global slot and clears the stored pointer after release. No observed caller consumes the return value. |
+| `XMemVirtualQuery` | The BVH callers at `0x19c69`, `0x19ccb`, `0x19d9d` and `0x19df9` pass the current process, a target address and a zeroed 64-byte buffer. Zero enters diagnostics. On success the code reads `+0x20` and `+0x30`, and the first caller also reads `+0x24`. Desktop `VirtualQueryEx` wrote 48 of 64 bytes and left the last 16 sentinel bytes intact. The read at `+0x30` remains unexplained. |
+| `XMemGetWorkingSetStatistics` | Seven AMD calls pass selector `0x20000001` and a local output address. At `0x26b3` and elsewhere a zero return contributes zero to a calculation. Success uses the 64-bit value at `+8`. Code near `0x74d2/75b1` uses a before/after difference to update a counter. The units, scope and selector meaning remain open. |
+| `D3D12SerializeVersionedRootSignature` | At `0xc2d0` the BVH code copies a caller's 48-byte descriptor and adds flags `0x03000000` at `+0x28`. At `0xc32f` it passes the descriptor, a blob output pointer and a null error output. Negative HRESULT enters diagnostics. Success uses the blob length and data pointer. A synthetic v1.1 descriptor returned `S_OK` with baseline flags and `E_INVALIDARG` with the two added bits. |
+| `D3D12CreateRootSignatureDeserializer` | At `0x4f88`, AMD reads a byte pointer and a 32-bit length from record offsets `+0/+8`, then supplies an interface IID and object output address. A negative HRESULT or null object triggers partial cleanup. Success retrieves the descriptor via the object. Desktop code read the root signature from a complete Microsoft sample shader and returned `E_INVALIDARG` for a synthetic shader without one. |
 
-### 两条图形输入路径
+### Graphics input paths
 
-- BVH 的序列化辅助函数有 16 处直接调用。例如 `0xd967–0xd998` 在栈上组装版本、六个参数及参数数组地址，再调用该函数。另一路径在 `0x2151d` 引用内嵌容器 `0x25700`，把它和长度 `0x1134` 交给后续函数。这个 DLL 内有 52 个带代码引用的完整 DXBC 容器，均含结构验证通过的 DXIL 程序及 `RTS0`，52 个根签名头都记录了 `0x03000000`。这将桌面的失败用例与文件中的实际数据联系起来，两个标志的语义仍待确认。
-- AMD 在 `0xcea3–0xceaa` 将反序列化所在函数登记到回调表。一个内部生产路径在 `0xe9b8/0xe9c3` 取出容器 `0x714f0` 及长度 `0x1910`，复制描述记录，然后在 `0xebad` 通过表间接调用。DLL 内有 29 个结构完整的容器，每个都有匹配长度的指针表项、`RTS0` 和 `ACCC` 分段，均未检出 DXIL 程序。这个样本支持内嵌来源，间接调用最终选中哪条路径取决于实际初始化。
-- 这些计数只覆盖上述 DLL。游戏场景着色器、资源归档读取顺序和启动时使用的图形路径还没有运行记录。后续从主 EXE 新增的导入及初始化调用开始追踪。
+- The BVH serializer helper has 16 direct calls. At `0xd967–0xd998` the caller builds a version, six parameters and the parameter-array address on the stack. At `0x2151d` another path references container `0x25700` and passes it downstream with length `0x1134`. The DLL contains 52 code-referenced DXBC containers with structurally valid DXIL programs and `RTS0` sections. All 52 root signature headers carry `0x03000000`. The desktop failure case reproduces these flag bits. Their meaning remains unconfirmed.
+- AMD registers the deserialization function in a callback table at `0xcea3–0xceaa`. A producer at `0xe9b8/0xe9c3` selects container `0x714f0` of length `0x1910`, copies its descriptor record and calls through the table at `0xebad`. The DLL has 29 structurally complete containers, each with a matching pointer-table entry and `RTS0` and `ACCC` sections. None contains DXIL. These observations support an embedded source. Runtime initialization determines the indirect path.
+- Counts cover the inspected DLLs. Scene shaders, archive read order and the graphics path used at startup have no execution record here. An entry executable would allow its imports and initialization calls to be examined.
 
-### 微软样例的桌面对照
+### Microsoft sample on desktop
 
-使用微软 `Xbox-GDK-Samples` 提交 `b1e77b6ac10f95b07296025fda171ca2ddc42dbe` 的 SimpleTriangle。工程含 `Gaming.Xbox.Scarlett.x64` 配置，说明文档提供参考图。本机将该提交的两份 HLSL 编译为桌面着色器，在离屏用例中使用源程序指定的三个顶点、颜色、sRGB 渲染目标和清屏色。测试核对两份 HLSL 和参考图的 SHA-256。要在其他工作副本复现，可将 CMake 变量 `SIMPLE_TRIANGLE_DIR` 指向该提交中的样例目录，再运行 `ctest --preset dev -R reference_triangle -V`。[微软样例说明](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/simpletriangle/) · [固定版本源码和参考图](https://github.com/microsoft/Xbox-GDK-Samples/tree/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/IntroGraphics/SimpleTriangle)
+The test uses Microsoft's SimpleTriangle at `Xbox-GDK-Samples` commit `b1e77b6ac10f95b07296025fda171ca2ddc42dbe`. The project includes a `Gaming.Xbox.Scarlett.x64` configuration and a published reference image. Desktop builds compile the two HLSL files using the sample's three vertices, colors, sRGB render target and clear color. The test checks SHA-256 for both shaders and the image. Set `SIMPLE_TRIANGLE_DIR` to that revision's sample directory and run `ctest --preset dev -R reference_triangle -V`. [Microsoft sample overview](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/simpletriangle/) · [Pinned source and reference image](https://github.com/microsoft/Xbox-GDK-Samples/tree/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/IntroGraphics/SimpleTriangle)
 
-RTX 2060 和 WARP 都完成了 64×64 渲染。按归一化坐标排除三角形边缘后，每个后端各比较 10,812 个颜色通道，所有通道与源码推算的颜色相差至多 2，与微软发布图相比平均绝对差为 6.88、最大为 17（8 位通道）。两个桌面后端的整幅图有 94 个像素不同，最大通道差为 1。发布图未附设备型号、构建哈希或无损 GPU 读回记录。桌面像素验收采用样例源码推算值，发布图作为辅助参考。微软将主机构建所需的 GDKX 列在单独的受限下载中。[微软开发资源](https://developer.microsoft.com/en-us/games/resources/)
+RTX 2060 and WARP rendered at 64×64. Excluding triangle edges by normalized coordinates left 10,812 color channels per adapter. Differences from the source-derived colors were at most 2 on an 8-bit scale. Against the published image the mean absolute difference was 6.88 and the maximum was 17. The two desktop images differed at 94 pixels, by at most 1 per channel. The published image came without a device model, build hash or lossless GPU readback. Source-derived colors supply the acceptance values. Microsoft distributes console GDKX separately. [Microsoft developer resources](https://developer.microsoft.com/en-us/games/resources/)
 
-## 主程序到达前的计算与光追验证
+## Compute and ray tracing before executable intake
 
-本轮检查只从两个游戏 DLL 读取字节。桌面原生解析器检查序列化描述和 DXIL，GPU 测试使用本仓库编译的 HLSL。开发构建完成后可以复测。
+The inspection reads bytes from two local DLLs. Desktop parsers inspect serialized descriptors and DXIL. GPU tests execute HLSL built from this repository. After building, run:
 
 ```powershell
 $pkg = (Get-ChildItem game-files -Directory)[0].FullName
@@ -133,95 +133,95 @@ $pkg = (Get-ChildItem game-files -Directory)[0].FullName
 ctest --preset dev -R 'compute_|dxr_query|shader_metadata|bvh_buffer_ops' -V
 ```
 
-`out/calls/desktop-roots.json` 逐个记录返回码、根签名摘要、对应的桌面用例、静态调用点计数和校验器诊断。它也记录输入清单和探针程序的 SHA-256。下表统计的是各容器独立接受检查的结果。
+`out/calls/desktop-roots.json` records per-container return codes, root signature summaries, matching desktop fixtures, static call counts and validator diagnostics. It also hashes the input inventory and probe executable. Each container was checked independently.
 
-| Windows 检查 | XboxBvhBuilder | AMD upscaler |
+| Windows check | XboxBvhBuilder | AMD upscaler |
 |---|---|---|
-| 两种 D3D12 反序列化接口读取完整容器内的根签名 | 52/52 成功，16 种根签名内容 | 29/29 成功，3 种根签名内容 |
-| 原样重新序列化 v1.1 描述符 | 52/52 返回 `E_INVALIDARG` | 29/29 成功 |
-| 在内存副本中仅清除 `0x03000000` 后重新序列化 | 52/52 成功，两个标志的主机语义仍待核实 | 原始标志均为零 |
-| Windows SDK DXIL 校验器单独检查完整容器和内部 bitcode | 两种检查都拒绝 52/52 个计算程序，均为 Shader Model 6.5 | 容器含 `ACCC`，没有 DXIL 输入 |
+| Both D3D12 deserializers read the embedded signature from the full container | 52/52 accepted, 16 distinct signatures | 29/29 accepted, 3 distinct signatures |
+| Reserialize unmodified v1.1 descriptor | 52/52 returned `E_INVALIDARG` | 29/29 accepted |
+| Clear only `0x03000000` in a memory copy and reserialize | 52/52 accepted. Console flag semantics are unknown. | Original flags were zero. |
+| Validate the entire container and the internal bitcode separately using the Windows SDK | Both checks rejected all 52 Shader Model 6.5 compute programs. | `ACCC` present, no DXIL input. |
 
-已编译的两份自建着色器都通过了同一套容器和模块校验。对 BVH，校验器均报告不识别 `dxil-ms-xb2` 目标及 `xbox.compiler.options` 元数据。DXC 的静态反汇编显示，43 个模块中有直接调用，以 `xbox.` 开头的函数共 33 种，包括带缓存控制的读取、跨通道取值及浮点原子操作。另 9 个模块未检出这种直接调用。诊断文本每次最多保存前 2 KiB，调用数从完整反汇编计算。[微软 DXC 校验接口](https://github.com/microsoft/DirectXShaderCompiler/blob/main/include/dxc/dxcapi.h)
+Both source-built control shaders passed container and module validation. For the BVH modules the validator reported an unrecognized `dxil-ms-xb2` target and `xbox.compiler.options` metadata. DXC disassembly showed 43 modules directly calling 33 distinct `xbox.` functions, including cache-controlled reads, cross-lane operations and floating-point atomics. The other nine had no such direct calls. Diagnostics retain up to 2 KiB per message. Counts use the complete disassembly. [DXC validator interface](https://github.com/microsoft/DirectXShaderCompiler/blob/main/include/dxc/dxcapi.h)
 
-两套自建计算用例的 `RTS0` 载荷做了逐字节比对。第一套的 SRV、UAV 和 16 个根常量与清除上述标志后的 11 个 BVH 容器吻合。第二套的 13 个 UAV、21 个 SRV、4 个根 CBV 和静态采样器与 27 个 AMD 容器原样吻合。测试实际读取和写入描述符表的末端寄存器。RTX 2060 与 WARP 在两套布局下均正确写回 257 个整数字，另外 63 个哨兵字保持原值。
+The first synthetic compute layout uses an SRV, a UAV and 16 root constants. Its `RTS0` payload matches 11 BVH containers byte for byte after clearing the two flags. The second uses 13 UAVs, 21 SRVs, four root CBVs and a static sampler. It matches 27 unmodified AMD containers. Both tests access the last registers in the descriptor tables. RTX 2060 and WARP wrote 257 correct integer words per layout and preserved 63 sentinel words.
 
-原生 DXR 用例由一个三角形构建底层加速结构（BLAS），再用同一 BLAS 的两个实例构建顶层加速结构（TLAS）。它以 Shader Model 6.5 的内联射线查询核对五组结果，涵盖命中、几何未命中、距离裁剪、实例平移和实例掩码。两个后端都命中了预期的实例 7 和 11，命中距离均为 1，其余三条射线均未命中。Xbox 构建使用的加速结构布局和下游消费者能否接入桌面 DXR，仍需单独验证。[微软 DXR 规范](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html)
+The native DXR fixture builds a bottom-level structure (BLAS) from one triangle and a top-level structure (TLAS) from two instances. Five inline Shader Model 6.5 queries cover hits, a geometric miss, distance clipping, translation and instance masks. Both backends hit instances 7 and 11 at distance 1 and missed the other three rays. Integration of the game's acceleration structure layout and consumers with desktop DXR remains unverified. [Microsoft DXR specification](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html)
 
-四个优先验证的 BVH 容器均匹配第一套布局，都由从 `0x20270` 开始的同一个函数引用，线程组大小均为 32×1×1。根据静态指令整理出的数据行为已在自建 HLSL 中复现。桌面实验以独立的 CPU 计算结果为对照。
+Four priority BVH containers use the first layout, are referenced by the function starting at `0x20270` and use 32×1×1 thread groups. Source-built HLSL reproduces the data operations inferred from static instructions. Independent CPU results supply the expected values.
 
-| 容器 RVA | 静态输入和写入行为 |
+| Container RVA | Observed input and write behavior |
 |---|---|
-| `0xb3ae0` | 按计数将输入中的 16 字节块复制到输出的同一偏移。 |
-| `0xb82e0` | 向每个有效块的四个 32 位字写入同一个常量。 |
-| `0xb4bd0` | 从给定种子开始，依次写入连续的 32 位无符号整数。 |
-| `0xb5be0` | 从输入第二个字读取长度参数，分步复制 `64 × (参数 + 1)` 字节。设置重置标志时，还向输出偏移 16–39 的六个 32 位字写入正、负最大有限浮点数的位模式。 |
+| `0xb3ae0` | Copy the specified count of 16-byte input blocks to matching output offsets. |
+| `0xb82e0` | Write the same constant to all four 32-bit words of each valid block. |
+| `0xb4bd0` | Write consecutive unsigned 32-bit integers starting at a seed. |
+| `0xb5be0` | Read the length parameter from the second input word and copy `64 × (parameter + 1)` bytes in steps. When reset is enabled, write the positive and negative maximum finite float bit patterns to six words at output offsets 16–39. |
 
-测试在互不重叠的缓冲区上检查零长度、线程组边界、编号回绕和未写入区域。每个桌面后端运行 26 组，每组逐字核对 384 个字。第四个操作的桌面实验将可选重置放到独立的第二次 dispatch，以 UAV 屏障保证顺序。源程序的跨工作组同步、输入与输出别名和实际游戏调用参数仍待核对。
+Tests use disjoint buffers and cover zero length, thread-group boundaries, integer wraparound and untouched memory. Each desktop backend runs 26 cases and checks 384 words per case. The fourth operation schedules its optional reset in a second dispatch with a UAV barrier. Source cross-group synchronization, aliasing and actual game call parameters remain open.
 
-### BVH 缓存读取与跨通道试验
+### BVH reads and cross-lane operations
 
-`tools/probe_roots.py` 在 `out/calls/desktop-roots.json` 的 `static_operands` 中按函数、模块数、调用点和操作数形式汇总。计数来自本构建 52 个 BVH 程序的静态指令，不能用于推算每帧执行频率。
+In `out/calls/desktop-roots.json`, `static_operands` from `tools/probe_roots.py` groups functions by module count, call site and operand form. The counts below describe static instructions across the 52 BVH programs. Runtime frequency is unknown.
 
-| 读取形式 | 模块数 | 静态调用点 |
+| Read form | Modules | Static calls |
 |---|---:|---:|
-| Global，单字 | 17 | 227 |
-| Global，双字 | 3 | 129 |
-| Global，三字 | 12 | 184 |
-| Global，四字 | 10 | 44 |
-| Scalar，单字 | 16 | 32 |
+| Global, one word | 17 | 227 |
+| Global, two words | 3 | 129 |
+| Global, three words | 12 | 184 |
+| Global, four words | 10 | 44 |
+| Scalar, one word | 16 | 32 |
 
-合计 27 个不同模块、616 处读取。每处均使用 64 位地址，最后两个参数均为 LLVM `undef`。这些操作数没有给出可采用的确定缓存策略。RVA `0xa4780` 从常量缓冲区中的基址加 12 读取计数，用来限制参与工作的线程；`0xc6260` 中的一段循环从基址加四倍索引读取一个字并写到目标。桌面测试抽取了这两种数据行为，也覆盖标量偏移 `(index << 8) | 44`。
+Across 27 distinct modules, all 616 reads use 64-bit addresses and end with two LLVM `undef` arguments. They provide no definite cache policy. At RVA `0xa4780` a count read from base plus 12 limits active threads. A loop in `0xc6260` reads a word at base plus four times the index and writes it to the destination. The fixture exercises both data behaviors and the scalar offset `(index << 8) | 44`.
 
-桌面读取用例在同一个 GPU 缓冲区先后写入两组数据，通过 UAV 到 SRV 的资源状态转换排序，再执行四种读取宽度。每轮有 128 个合成请求。输入覆盖跨越地址低 32 位的进位、共享和分散地址、末端合法向量、向量越界、未按字对齐和不同高位的地址。CPU 独立按 64 位范围计算预期结果，逐字核对两轮读回。越界返回标记是测试规则。主机的缓存命中率、地址归属、非法读取行为和缺少显式同步时的可见性仍未知。
+Two successive writes to the same GPU buffer are each ordered by a UAV-to-SRV transition before reads of all four widths. Each round submits 128 synthetic requests covering low-word carry, shared and scattered addresses, a final valid vector, overrun, misalignment and different high words. The CPU uses independent 64-bit range arithmetic and compares each returned word. Out-of-range sentinels are a fixture rule. Console cache hit rate, address ownership, invalid access behavior and visibility without explicit ordering remain unknown.
 
-八个模块中的 75 处 `LaneSwizzle.i32` 只出现五个立即数：30、60、120、240、480，各 15 次。在 RVA `0x95e20` 的调用序列中，交换结果经条件选择后累加，随后读取第 31 通道。据此测试一个候选解释：每个 32 通道分组内按五级路由求前缀和。用例在原生 wave 和组共享内存两条路径上分别验证。逻辑 64 通道路径还核对高低两段投票掩码、前缀计数、动态索引及第 31 通道读取；原生路径额外核对活动通道最小值、广播、分支内投票和动态取值。CPU 按 GPU 回报的原生通道编号重建参考值。
+Eight modules contain 75 calls to `LaneSwizzle.i32`, with immediates 30, 60, 120, 240 and 480 occurring 15 times each. The `0x95e20` sequence conditionally accumulates exchanged values and reads lane 31. This motivated a candidate five-stage prefix sum within each 32-lane subgroup. Tests exercise native waves and group-shared memory separately. The logical 64-lane path also checks both halves of the ballot mask, prefix counts, dynamic indices and lane 31. The native path checks the active minimum, broadcast, divergent votes and dynamic reads. The CPU reconstructs expectations from GPU-reported native lane IDs.
 
-每个后端运行 38 个工作组，包括空、满、稀疏投票和 32 个单点输入，逐一检验每半组中的所有输入位置。RTX 2060 报告原生范围 32–32，WARP 报告 4–4。两者通过 64 个逻辑通道的组共享对照。强制原生 64 通道用例按能力跳过，具备相应能力的设备将实际运行该用例。通道路由的 PC 验收采用单点输入和 CPU 前缀和，再用下文的射线查询检验路由差错对命中的影响。[微软 WaveReadLaneAt 语义](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/wavereadlaneat)
+Each backend runs 38 groups with empty, full and sparse ballots and 32 single-point inputs covering every position in each half. RTX 2060 reported native width 32–32 and WARP 4–4. Both passed the group-shared 64-logical-lane test and skipped forced native wave64 on capability grounds. A capable adapter will run that case. Single-point inputs, CPU prefix sums and final ray hits provide the PC acceptance checks. [WaveReadLaneAt semantics](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/wavereadlaneat)
 
 ```powershell
 ctest --preset dev -R 'bvh_reads|bvh_waves|bvh_wave64|bvh_hits' -V
 ```
 
-### 从缓存读取到射线命中
+### From buffer reads to ray hits
 
-`bvh_hits_hardware` 和 `bvh_hits_warp` 将上述有界地址读取、半组前缀和与射线求交接在一起。包围盒筛选和三角形求交参考 AMD GPURT 的软件路径。测试自定义一个含 64 个子包围盒的根节点，每个子项通过 64 位逻辑地址引用一个三角形。64 个逻辑通道分别读取包围盒，按两个半组的前缀和紧凑排列候选地址，再由接收通道读取顶点，按原生 wave 归约最近命中。最后跨 wave 合并距离，同距时取最小图元编号。[AMD GPURT 求交源码](https://github.com/GPUOpen-Drivers/gpurt/blob/dev/src/shaders/IntersectCommon.hlsl)
+`bvh_hits_hardware` and `bvh_hits_warp` connect bounded address reads and half-group prefix sums to ray intersections. Box and triangle tests follow AMD GPURT's software approach. A synthetic root holds 64 child bounds with logical 64-bit triangle addresses. The 64 logical lanes test bounds and compact candidates using both half-group sums. Receiving lanes fetch vertices and reduce nearest hits within and across native waves. The fixture breaks distance ties by the smallest primitive ID. [AMD GPURT intersections](https://github.com/GPUOpen-Drivers/gpurt/blob/dev/src/shaders/IntersectCommon.hlsl)
 
-同一 GPU 缓冲区依次接收三份场景，每次先通过 UAV 写入，再转为 SRV 读取。CPU 直接遍历几何体，用双精度计算射线与三角形所在平面的交点，逐条核对候选包围盒数、命中三角形数、最近距离和图元编号。每轮使用相同的 130 条射线，包括隔离每个叶节点的距离区间、正反向射线、斜射、边、顶点、零距离和仅穿过包围盒的情形。
+Three successive scenes occupy the same GPU buffer. Each is written as a UAV and then read as an SRV. A CPU brute-force, double-precision plane intersection independently checks each ray's box count, triangle hit count, closest distance and primitive ID. Each round uses the same 130 rays, covering each leaf in isolation, forward, reverse and oblique rays, edges, vertices, zero distance and box-only intersections.
 
-| 同一批射线的结果 | 命中 | 未命中 |
+| Scene | Hits | Misses |
 |---|---:|---:|
-| 分散布局，逐个覆盖 64 个叶节点 | 112 | 18 |
-| 重排叶地址，重叠几何并制造等距命中 | 14 | 116 |
-| 再次重排，加入地址高位错误、末端越界和退化三角形 | 108 | 22 |
+| Sparse layout, isolate all 64 leaves | 112 | 18 |
+| Permuted addresses, overlapping geometry and equal-distance hits | 14 | 116 |
+| Permuted again, with invalid address high bits, an out-of-range tail and a degenerate triangle | 108 | 22 |
 
-RTX 2060 和 WARP 均与 CPU 逐项一致。闭区间裁剪、同距选择和非法叶地址的处理均由本用例定义。此测试验证桌面同步后的读值和命中结果。Scarlett 节点格式与缓存提示的解释保留为假设，后续根据文件中生产端的写入和消费端的读取约束逐项核对。
+RTX 2060 and WARP agreed with the CPU on every field. Closed intervals, tie breaking and invalid-leaf handling are fixture rules. The tests establish synchronized desktop reads and hit results. Scarlett node layouts and cache hints remain hypotheses to check against producer writes and consumer reads.
 
-### PC 上的独立 BVH 验收
+### Independent BVH checks on PC
 
-每个场景把同一批 136 条射线交给三条路径。CPU 用双精度逐个求交，自建计算着色器读取打包的节点，标准 DXR 从原始顶点独立构建 BLAS 和 TLAS，再执行内联射线查询。DXR 只接收有效地址对应的几何体。三条路径核对命中状态和最近距离。CPU 还检查 DXR 选中的图元确实在该距离相交，因此重合三角形可以有多个正确编号。跨实现比较使用三角形内部的交点和有余量的距离区间，边缘及端点由前一节的固定规则单独测试。[微软 DXR 射线区间规范](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#ray-extents)
+Each scene sends the same 136 rays through a double-precision brute-force CPU test, a custom shader reading packed nodes, and standard DXR. DXR builds its own BLAS and TLAS from the original accessible vertices and runs inline queries. All paths check hit status and closest distance. The CPU also checks that the specific DXR-selected primitive intersects at that distance, allowing valid ties. Comparisons use triangle interiors and distance margins. Edge and endpoint cases use the preceding fixture's fixed conventions. [DXR ray extents](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#ray-extents)
 
-RTX 2060 与 WARP 各完成 408 次比较。为验证比较器确实能发现错误，只改变自建着色器的输入，CPU 和 DXR 始终接收原场景。调换第 0 与第 32 个子项的地址使 4 条射线的命中结果改变，重放上一轮场景影响 102 条，把错误高位映入有效地址影响 1 条。每个故障都必须在指定射线上被检出。运行 `ctest --preset dev -R bvh_differential -V` 可以看到各场景的命中数、差异数和指定射线编号。
+RTX 2060 and WARP each completed 408 comparisons. In fault controls only the custom shader's input changes. Swapping child 0 and 32 addresses changed four results, replaying the previous scene changed 102 and aliasing invalid address high bits changed one. Each fault must alter its designated witness ray. Run `ctest --preset dev -R bvh_differential -V` for hit counts, changed results and witness indices.
 
-工程以 PC 上可复现的行为作为验收条件。真实游戏路径的下一项验收是从主 EXE 确认所用构建器、节点缓冲的输入输出和下游查询，再把这些约束加入 PC 回归。
+Project acceptance uses reproducible PC behavior. The next game-specific check is to identify the builder selected by the main executable, its node-buffer inputs and outputs, and the downstream queries, then add the observed constraints to PC tests.
 
-### 动态依赖对启动评估的影响
+### Dynamic dependencies at startup
 
-已核对本构建 AMD 加载器的五个 `GetProcAddress` 调用点。按描述符中的功能值，`0x10000` 路径选择包内的 upscaler，其五个导出均可匹配。`0x20000` 和 `0x30000` 路径选择 `amd_fidelityfx_framegeneration_xbox.dll`，当前目录和种子清单均未列出该文件。加载函数先查已加载模块，必要时再调用 `LoadLibraryA`。静态分析尚不能判断主程序是否请求帧生成。[AMD FidelityFX 公开接口和功能编号](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/main/Kits/FidelityFX/api/include/ffx_api.h)
+Five `GetProcAddress` calls were inspected in the local AMD loader. The `0x10000` descriptor selects the packaged upscaler, whose five exports match. `0x20000` and `0x30000` select `amd_fidelityfx_framegeneration_xbox.dll`, absent from the inspected directory and torrent manifest. The loader checks for an already-loaded module before calling `LoadLibraryA`. Whether the main executable requests frame generation remains unknown. [AMD FidelityFX API](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/main/Kits/FidelityFX/api/include/ffx_api.h)
 
-主 EXE 接收报告新增 `dependency_paths`。从入口出发，它列出包内依赖的一条解释路径，优先显示普通导入链，同时标记延迟导入及已确认的 AMD 条件分支。AMD 分支记录仅适用于 SHA-256 匹配的加载器。未解析的运行时查找、系统转发链路和真实执行顺序仍需独立证据。在没有主 EXE 时可以分别以各 DLL 为起点：
+The executable intake report's `dependency_paths` gives an explanatory path from the entry to each reachable dependency, preferring ordinary imports and marking delay imports and confirmed AMD branches. The AMD branch data applies only to a SHA-256-matched loader. Dynamic lookups, host forwarders and execution order require separate evidence. With DLLs alone, trace from each one:
 
 ```powershell
 .\out\pe-env\Scripts\python.exe -B tools/dependency_paths.py out/dependencies/pre-exe.json |
     Set-Content out/dependencies/pre-exe-paths.json -Encoding utf8
 ```
 
-## 资源分块与着色器格式检查
+## Resource chunks and shader formats
 
-在开发构建完成后运行以下命令。自建像素着色器提供已知的 DXIL 阳性对照。
+After building, use the source-built pixel shader as a known DXIL control.
 
 ```powershell
-python -B tools/resource_inventory.py "game-files/<构建目录名>" --shader-control out/build/dev/triangle_ps.cso
+python -B tools/resource_inventory.py "game-files/<build-directory>" --shader-control out/build/dev/triangle_ps.cso
 ```
 
-`out/resources/<构建目录名>.json` 按布局的目标路径记录安装分块、标记、字节数和缺项。报告记录全部构建文件的文件头特征，对 `appdata0.rpf`、`common.rpf` 和 `shaders.rpf` 的原始字节做全文件标记检查。检测到候选 DXBC 容器时核对长度、分段边界和 DXIL 程序头。报告的 `sample_streams` 仅覆盖各文件前 4 MiB 内符合筛选条件的最多八个 zlib 流，明文留在内存中。该样本不足以推断归档内其他条目的表示。安装顺序和运行时 I/O 需分别验证。[微软 DXIL 容器说明](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst) · [RPF9 压缩流观察来源](https://gtamodx.com/columns/eXk_fiBUaYta)
+`out/resources/<build-directory>.json` records install chunks, flags, byte counts and missing layout destinations. It records file-header signatures for the build and scans all raw bytes in `appdata0.rpf`, `common.rpf` and `shaders.rpf` for format markers. Candidate DXBC containers are checked for length, section boundaries and DXIL program headers. `sample_streams` covers at most eight qualifying zlib streams per file within the first 4 MiB. Plaintext stays in memory. The sample cannot characterize the rest of the archive. Installation order and runtime I/O need independent checks. [DXIL container format](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst) · [RPF9 observation source](https://gtamodx.com/columns/eXk_fiBUaYta)

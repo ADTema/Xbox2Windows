@@ -1,11 +1,11 @@
-## Change / 变更
+## Change
 
-What behavior changes? Link the issue if available.
+Describe the observable change and link the issue. For a documentation patch, identify the contributor task the edit helps someone complete.
 
-## Verification / 验证
+## Verification
 
-Give the exact command and result. For GPU changes include the adapter, backend and any skipped cases.
+Give the commit or build, command and result. For GPU changes include the adapter, backend, first mismatch if any, and capability skips.
 
-## Evidence / 依据
+## Evidence and follow-up
 
-For new fixtures, describe how they were generated or link their public source and license. Note any assumption affecting the result.
+For new fixtures, describe their source or generation method and license. Identify assumptions that affect the result and link any work another contributor can pick up.
