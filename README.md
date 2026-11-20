@@ -2,12 +2,25 @@
 
 Xbox2Windows investigates what it takes to run Xbox Series X|S (Scarlett) software on x64 Windows. **Grand Theft Auto VI (GTA 6) on Xbox Series X (XSX)** is the motivating case study. The part you can run today is a set of source-built Windows experiments covering executable dependencies, memory allocation, D3D12 shaders and ray tracing. Full-game startup and frame rate remain unverified.
 
-## Where a contributor can help
+## Run the GPU check
 
-Our RTX 2060 runs 32-lane waves and Microsoft's WARP software renderer runs 4-lane waves. Both passed the same 408 BVH ray comparisons and skipped the native 64-lane test. Two tasks are ready to pick up:
+Download the [Windows x64 GPU check and SHA-256](https://github.com/R0Y00/Xbox2Windows/releases/tag/gpu-check-v0.1.0), verify and extract the ZIP, then run this in PowerShell from the extracted folder. The package contains its own shaders and needs no compiler, console or game files.
 
-- **Have a wave64-capable GPU?** Run three BVH tests and report the adapter, lane range and first mismatch, if any. [Native wave64 coverage (#1)](https://github.com/R0Y00/Xbox2Windows/issues/1) · [Measured results](docs/experiments.md#independent-bvh-checks-on-pc)
-- **New to graphics programming?** Try the first build on a clean Windows checkout and tell us where the instructions work or break down. This task uses software rendering. [First-build check (#2)](https://github.com/R0Y00/Xbox2Windows/issues/2)
+```powershell
+.\Run-GpuCheck.ps1
+```
+
+Review `gpu-report-hardware.md` and paste it in the [hardware coverage thread (#1)](https://github.com/R0Y00/Xbox2Windows/issues/1). Reports with a failure or capability skip are welcome. [Package instructions](tools/gpu-check/README.md)
+
+### Hardware coverage
+
+| Adapter or backend | Reported native lanes | Forced wave64 | BVH differential | Evidence |
+|---|---:|---|---|---|
+| NVIDIA GeForce RTX 2060 | 32 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
+| Microsoft WARP (software) | 4 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
+| Wave64-capable Windows GPU | Awaiting report | Awaiting execution | Awaiting report | [Contribute a run](https://github.com/R0Y00/Xbox2Windows/issues/1) |
+
+Maintainers link independent results to the original report and record the adapter, driver, commit and outcome. Names or handles are added on request. Our first community milestones are three independent hardware reports, one independent clean build and one verified fix driven by contributor feedback. New to graphics programming? Try the [first-build task (#2)](https://github.com/R0Y00/Xbox2Windows/issues/2).
 
 ## First build
 

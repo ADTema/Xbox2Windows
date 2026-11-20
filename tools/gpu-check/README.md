@@ -1,0 +1,15 @@
+# Xbox2Windows GPU Check
+
+These three synthetic Direct3D 12 tests run on x64 Windows with a D3D12 adapter. The ZIP contains the compiled test, its PowerShell runner, source commit and MIT license. The shaders and C++ runtime are built into the test executable. A console, game files, Python and the Windows SDK are unnecessary.
+
+1. Download the ZIP and its SHA-256 file from the [project's GitHub Releases](https://github.com/R0Y00/Xbox2Windows/releases). Compare the hash with `Get-FileHash .\Xbox2Windows-GpuCheck-win-x64.zip -Algorithm SHA256`.
+2. Extract the ZIP into a writable directory. If Windows blocks the downloaded script, review it and the hash first. On a personally managed PC you can unblock the verified ZIP using its **Properties > Unblock** option before extracting it.
+3. Open PowerShell in the extracted directory and run the command below.
+
+```powershell
+.\Run-GpuCheck.ps1
+```
+
+The hardware run uses the high-performance D3D12 adapter selected by DXGI. Check the adapter name in the output, especially on multi-GPU systems. To run Microsoft's software renderer separately, use `.\Run-GpuCheck.ps1 -Backend warp`. The runner prints the output and saves `gpu-report-hardware.md` or `gpu-report-warp.md` beside the executable. A reported failure gives exit code 1. An unsupported capability gives a named SKIP and remains visible in the report.
+
+Review the report, then paste its contents in the [hardware coverage issue](https://github.com/R0Y00/Xbox2Windows/issues/1). If you would like a name or handle displayed in the coverage table, say so in your comment. Reports are shared manually. No game startup or frame rate is measured.
