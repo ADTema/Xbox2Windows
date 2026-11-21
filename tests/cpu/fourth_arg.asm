@@ -1,5 +1,6 @@
 ; A fourth integer argument in R9 for the jump-table translator.
-; Every export takes RCX, RDX, R8 = address of three writable QWORDs, and R9.
+; Every export takes RCX, RDX and R8 = address of three writable QWORDs. r9_mix, r9_loop and no_r9
+; are translated with R9 as a fourth argument; r9_scratch takes three and uses R9 as scratch.
 .code
 ; RAX = RCX + 2 * R9 - RDX, [R8] = R9.
 r9_mix PROC FRAME
