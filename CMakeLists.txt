@@ -171,6 +171,9 @@ set_tests_properties(bvh_atomics_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_numeric_hardware bvh_packed_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_buffer_ops_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_reads_hardware bvh_waves_hardware bvh_hits_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# The cs_6_5 fixtures skip on a WARP below SM 6.5. The Windows 10 in-box WARP reports SM 6.2.
+set_tests_properties(bvh_buffer_ops_warp bvh_reads_warp bvh_waves_warp bvh_hits_warp bvh_packed_warp
+    bvh_numeric_warp bvh_atomics_warp PROPERTIES SKIP_RETURN_CODE 77)
 
 set(SIMPLE_TRIANGLE_DIR "${CMAKE_SOURCE_DIR}/out/reference/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/IntroGraphics/SimpleTriangle"
     CACHE PATH "Microsoft SimpleTriangle sample directory")
@@ -188,6 +191,38 @@ set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILE
     "Native x64 Python with pefile for static intake tests")
 target_sources(offscreen_check PRIVATE tests/ffx_device_init.cpp tests/ffx_backend_slots.cpp tests/ffx_recurrent.cpp tests/ffx_provider_loop.cpp)
 set(FFX_UPSCALER_IMAGE "" CACHE FILEPATH "Local Xbox upscaler DLL for offline backend translation")
+set(FFX_DISPATCH_SHADER_DIR "" CACHE PATH "Directory containing locally translated FSR4 shaders and scratch_reference.h")
+if(FFX_DISPATCH_SHADER_DIR)
+    if(NOT FFX_UPSCALER_IMAGE)
+        message(FATAL_ERROR "Package dispatch replay requires FFX_UPSCALER_IMAGE")
+    endif()
+    target_compile_definitions(offscreen_check PRIVATE FFX_DISPATCH_AOT)
+    target_include_directories(offscreen_check PRIVATE "${FFX_DISPATCH_SHADER_DIR}")
+endif()
+target_sources(offscreen_check PRIVATE tests/ffx_dispatch.cpp tests/ffx_dispatch_scratch.cpp)
+foreach(stage IN ITEMS pass24 pass25 producer rcas)
+    set(shader "${CMAKE_CURRENT_SOURCE_DIR}/tests/ffx_dispatch_control.hlsl")
+    set(entry "${stage}")
+    if(FFX_DISPATCH_SHADER_DIR)
+        set(shader "${FFX_DISPATCH_SHADER_DIR}/${stage}.hlsl")
+        set(entry main)
+    endif()
+    set(storage_formats Native Packed)
+    if(stage MATCHES "^pass")
+        set(storage_formats Raw)
+    endif()
+    foreach(storage IN LISTS storage_formats)
+        set(symbol "${stage}${storage}")
+        set(header "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.h")
+        add_custom_command(OUTPUT "${header}"
+            COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E "${entry}" -D "STORAGE_${storage}=1"
+                -I "${CMAKE_CURRENT_SOURCE_DIR}/tests" -Vn "${symbol}" -Fh "${header}"
+                -Fo "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.cso" "${shader}"
+            DEPENDS "${shader}" tests/ffx_dispatch_io.hlsli src/rgb9e5.hlsli
+            BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.cso" VERBATIM)
+        target_sources(offscreen_check PRIVATE "${header}")
+    endforeach()
+endforeach()
 if(FFX_UPSCALER_IMAGE)
     if(NOT EXISTS "${INTAKE_PYTHON}" OR NOT EXISTS "${FFX_UPSCALER_IMAGE}")
         message(FATAL_ERROR "Package translation requires INTAKE_PYTHON and FFX_UPSCALER_IMAGE")
@@ -195,7 +230,7 @@ if(FFX_UPSCALER_IMAGE)
     set(device_slice "${CMAKE_CURRENT_BINARY_DIR}/ffx_device_slice.cpp")
     add_custom_command(OUTPUT "${device_slice}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/ffx_device_init.py" "${FFX_UPSCALER_IMAGE}" "${device_slice}"
-        DEPENDS "${FFX_UPSCALER_IMAGE}" tools/ffx_device_init.py tools/ffx_recurrent.py tools/ffx_provider_loop.py tools/ffx_version_query.py tools/cpu_ranges.py tools/cpu_leaf_aot.py
+        DEPENDS "${FFX_UPSCALER_IMAGE}" tools/ffx_device_init.py tools/ffx_recurrent.py tools/ffx_provider_loop.py tools/ffx_dispatch_profile.py tools/ffx_version_query.py tools/cpu_ranges.py tools/cpu_leaf_aot.py
         VERBATIM)
     target_sources(offscreen_check PRIVATE "${device_slice}")
     target_include_directories(offscreen_check PRIVATE "${CMAKE_SOURCE_DIR}/tests")
@@ -271,6 +306,36 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_callback callback)
     cpu_asm_fixture(cpu_version_query version_query)
     cpu_asm_fixture(cpu_heap_layout heap_layout)
+    cpu_asm_fixture(cpu_bink_heap bink_heap)
+    add_library(cpu_bink_heap_provider SHARED tests/cpu/bink_heap_provider.cpp)
+    target_link_libraries(cpu_bink_heap PRIVATE cpu_bink_heap_provider)
+    function(bink_heap_translation target image dependency)
+        set(cpp "${CMAKE_CURRENT_BINARY_DIR}/${target}.cpp")
+        add_custom_command(OUTPUT "${cpp}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/bink_heap_aot.py"
+                "${image}" "${cpp}" ${ARGN}
+            DEPENDS ${dependency} tools/bink_heap_aot.py tools/ffx_version_query.py
+                tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(${target} SHARED "${cpp}")
+        target_link_libraries(${target} PRIVATE cpu_bink_heap_provider)
+    endfunction()
+    bink_heap_translation(cpu_bink_heap_lifted "$<TARGET_FILE:cpu_bink_heap>" cpu_bink_heap)
+    add_test(NAME cpu_aot_bink_heap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bink_heap_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
+        "$<TARGET_FILE:cpu_bink_heap>" "$<TARGET_FILE:cpu_bink_heap_lifted>")
+    set(BINK_HEAP_IMAGE "" CACHE FILEPATH "Local PE containing the Bink allocation and release callers")
+    set(BINK_HEAP_ENTRIES "" CACHE STRING "Two semicolon-separated entry RVAs (allocation;release)")
+    if(BINK_HEAP_IMAGE)
+        list(LENGTH BINK_HEAP_ENTRIES entry_count)
+        if(NOT entry_count EQUAL 2)
+            message(FATAL_ERROR "Provide both BINK_HEAP_ENTRIES for the selected local image")
+        endif()
+        bink_heap_translation(cpu_bink_package_lifted "${BINK_HEAP_IMAGE}" "${BINK_HEAP_IMAGE}"
+            --entries ${BINK_HEAP_ENTRIES})
+        add_test(NAME cpu_aot_bink_package_heap COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/bink_heap_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
+            "$<TARGET_FILE:cpu_bink_package_lifted>")
+    endif()
     set(heap_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_heap_layout_lifted.cpp")
     add_custom_command(OUTPUT "${heap_fixture}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/heap_layout.py"
@@ -359,6 +424,24 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_ordinal_provider>" "$<TARGET_FILE:cpu_ordinal_altered>"
         --reloc "$<TARGET_FILE:cpu_reloc_original>" "$<TARGET_FILE:cpu_import_provider>"
             "$<TARGET_FILE:cpu_import_altered>")
+    cpu_asm_fixture(cpu_seh_original seh_route)
+    add_test(NAME cpu_native_seh COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_seh_check.py" "$<TARGET_FILE:cpu_seh_original>"
+        "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_register_probe>")
+    add_test(NAME cpu_native_section COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_section_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_register_probe>")
+    add_library(cpu_tls_sink SHARED tests/cpu/tls_sink.cpp)
+    foreach(variant IN ITEMS original refuse)
+        add_library(cpu_tls_${variant} SHARED tests/cpu/tls_route.asm tests/cpu/tls_route.def)
+        set_target_properties(cpu_tls_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_tls_${variant} PRIVATE /ENTRY:dll_entry /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(cpu_tls_${variant} PRIVATE cpu_tls_sink)
+    endforeach()
+    target_compile_definitions(cpu_tls_refuse PRIVATE ENTRY_FAILS)
+    add_test(NAME cpu_native_tls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_tls_check.py" "$<TARGET_FILE:cpu_tls_original>"
+        "$<TARGET_FILE:cpu_tls_refuse>" "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:pe_map>")
     add_library(script_path_host SHARED tools/script_path_host.cpp)
     target_compile_features(script_path_host PRIVATE cxx_std_17)
     add_test(NAME script_path_links COMMAND "${INTAKE_PYTHON}" -B
