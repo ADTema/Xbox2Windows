@@ -455,6 +455,12 @@ int main(int argc, char** argv)
             check_bvh_reads(device.Get());
         } else if (argc == 3 && (operation == "--bvh-waves" || operation == "--bvh-wave64")) {
             if (!check_bvh_waves(device.Get(), operation == "--bvh-wave64")) return 77;
+        } else if (argc == 3 && operation == "--gpu-alias") {
+            if (!check_gpu_alias(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--gpu-alias-lookup") {
+            if (!check_gpu_alias_lookup(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--gpu-alias-lookup-writes") {
+            if (!check_gpu_alias_lookup_writes(device.Get())) return 77;
         } else if (argc == 3 && operation == "--buffer-ops") {
             check_buffer_ops(device.Get());
         } else if (argc == 3 && operation == "--ray-query") {

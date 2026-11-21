@@ -44,22 +44,31 @@ CPU_FIXTURES = {
     "create_context": "cpu_aot_context_lifecycle",
     "bink_heap": "cpu_aot_bink_heap",
     "heap_layout": "cpu_aot_heap_layout",
+    "shift_count": "cpu_aot_shift_count",
     "version_query": "cpu_aot_version_query",
     "bink_descriptors": "cpu_bink_descriptors",
     "switch": "cpu_aot_jump_tables",
+    "switch_addr32": "cpu_aot_switch_addr32",
+    "fourth_arg": "cpu_aot_fourth_argument",
     "repeat_call": "cpu_aot_repeated_call",
     "working_set_delta": "cpu_working_set_delta",
+    "exe_entry": "cpu_aot_exe_entry",
+    "address_size": "cpu_aot_address_size",
+    "call_pair": "cpu_aot_call_pair",
+    "bmi1": "cpu_aot_bmi1",
     "register_probe": None,  # measurement harness
     "two_imports": None,     # mapped and run unchanged by pe_map
+    "exe_start": None,       # mapped and run unchanged by pe_map
     "reloc_route": None,     # mapped and run unchanged by pe_map
     "seh_route": None,       # mapped and run unchanged by pe_map
     "tls_route": None,       # mapped and run unchanged by pe_map
 }
 
 MASM_DIRECTIVES = {"ifdef", "ifndef", "if", "else", "elseif", "endif", "end", "public", "extern",
-                   "externdef", "include", "includelib", "option", "align", "even", "org", "assume"}
+                   "externdef", "include", "includelib", "option", "align", "even", "org", "assume", "local"}
 MASM_DEFINERS = {"proc", "endp", "label", "equ", "db", "dw", "dd", "dq", "byte", "word", "dword",
                  "qword", "segment", "ends", "struct", "macro", "endm", "textequ"}
+MASM_PREFIXES = {"lock", "rep", "repe", "repz", "repne", "repnz"}
 # MASM condition-code spellings -> iced-x86's canonical mnemonic suffix.
 CONDITION_ALIASES = {"z": "e", "nz": "ne", "c": "b", "nae": "b", "nc": "ae", "nb": "ae", "nbe": "a",
                      "na": "be", "nge": "l", "nl": "ge", "nle": "g", "ng": "le", "pe": "p", "po": "np"}
@@ -68,11 +77,19 @@ CONDITION_ALIASES = {"z": "e", "nz": "ne", "c": "b", "nae": "b", "nc": "ae", "nb
 def masm_mnemonics(text):
     """Instruction mnemonics in MASM source; both arms of IFDEF/ELSE count (both variants are built)."""
     found = set()
+    macros = set()
     for line in text.splitlines():
         line = re.sub(r"^\s*\w+::?", "", line.split(";", 1)[0]).strip()  # local or global label
         words = line.lower().split()
-        if (not words or words[0].startswith(".") or words[0] in MASM_DIRECTIVES | MASM_DEFINERS
+        if len(words) > 1 and words[1] == "macro":
+            macros.add(words[0])
+            continue
+        if (not words or words[0].startswith(".") or words[0] in MASM_DIRECTIVES | MASM_DEFINERS | macros
                 or (len(words) > 1 and words[1] in MASM_DEFINERS and words[2:3] != ["ptr"])):
+            continue
+        while words and words[0] in MASM_PREFIXES:
+            words = words[1:]
+        if not words:
             continue
         found.add(x64_canonical(words[0]))
     return found
@@ -105,7 +122,14 @@ def read_results(junit):
     run's (start, end) in seconds since the epoch. CTest writes the start as local time in whole seconds."""
     suite = ET.parse(junit).getroot()
     status = {"run": "pass", "fail": "fail", "notrun": "skip"}
-    results = {case.get("name"): status.get(case.get("status"), "fail") for case in suite.iter("testcase")}
+    results = {}
+    for case in suite.iter("testcase"):
+        state = status.get(case.get("status"), "fail")
+        if case.find("failure") is not None or case.find("error") is not None:
+            state = "fail"
+        elif state == "pass" and case.find("skipped") is not None:
+            state = "skip"
+        results[case.get("name")] = state
     start = datetime.fromisoformat(suite.get("timestamp")).timestamp()
     return results, (start - 1, start + float(suite.get("time")) + 2)
 
