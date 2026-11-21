@@ -573,6 +573,36 @@ cmake --build --preset dev --target pe_map cpu_startup_exe cpu_startup_a cpu_sta
 ctest --preset dev --no-tests=error -R '^cpu_native_startup$' -V
 ```
 
+### Lifecycle of two DLLs with the static C runtime
+
+`cpu_life_a` and `cpu_life_b` are built with the static MSVC runtime (`/MT`, linked without `/INCREMENTAL`, so the PE entry point is the runtime's `_DllMainCRTStartup` and not an incremental-link thunk). A real global constructor runs before `DllMain(DLL_PROCESS_ATTACH)` and a real global destructor after `DllMain(DLL_PROCESS_DETACH)`. Nothing calls them by hand. B imports A. A's constructor sets its state to 7. B's constructor stores `a_value() * 2`, and its destructor reads A's state again. `b_via_a()` returns `a_value() + b_value()` at the time of the call. Every constructor, destructor and `DllMain` call logs a token into `cpu_life_sink.dll`, a small CRT-free DLL that the test host loads first and keeps for the whole child process, so it is valid during every destruction and sees the last destructor. `DllMain` only calls into the sink, which takes no lock and needs nothing from the loader.
+
+Each constructor also records its callers with `RtlCaptureContext`, `RtlLookupFunctionEntry` and `RtlVirtualUnwind`. The test reads the entry-point function from `.pdata`, follows its closing `jmp rel32` to the function that dispatches the process attach and detach (this is why the entry point itself is not on the stack), and requires that function on the constructor's stack with the next frame outside the image. That frame is the loader's under Windows and `pe_map`'s under `pe_map`. `RtlCaptureStackBackTrace` is not used: on an image that `pe_map` mapped it returns only the first frame.
+
+`cpu_native_crt_lifecycle` runs one scenario in fresh child processes with a 30 s timeout: through `LoadLibraryExW` and `FreeLibrary`, where the loader finds A as B's dependency and decides every order, and through `pe_map_image`, `pe_map_export` and `pe_map_release`. For `pe_map` the harness orders the images from the import tables, maps A before B, serves B's import of A with `pe_map_export` and releases B before A; `pe_map` itself keeps no dependency graph. The scenario loads B, calls the exports, changes A's state with `a_set(99)`, unloads, reloads, unloads, and then runs two more load and unload cycles. Three fresh processes per loader must report identical stages. On Windows 11 build 26300 both loaders give identical events, values and residency at every stage:
+
+```text
+load:           A:ctor, A:attach, B:ctor, B:attach          a_value 7, b_value 14, b_via_a 21, a_ctor_runs 1
+a_set(99):      (no events)                                 a_value 99, b_via_a 113
+unload:         B:detach, B:dtor a=9, A:detach, A:dtor      A and B no longer mapped
+reload:         A:ctor, A:attach, B:ctor, B:attach          a_value 7, b_via_a 21, a_ctor_runs 1
+unload again:   B:detach, B:dtor a=7, A:detach, A:dtor      A and B no longer mapped
+cycles 3, 4:    the load and unload lines above
+```
+
+The reload starts from fresh state (7, not 99) and runs each constructor once more. B's destructor still sees A alive, with A's state at that time (`a=9`, then `a=7`). Residency is `GetModuleHandleW` for Windows and `VirtualQuery` on the mapped base right after the releases for `pe_map`.
+
+- Without A's constructor (`cpu_life_a_noctor`) both loaders log `A:attach, B:ctor, B:attach`, every value is 0 and A's constructor is not among the callers. Without B's destructor (`cpu_life_b_nodtor`) both log `B:detach, A:detach, A:dtor` on unload. Both controls differ from the original in the events under both loaders.
+- Base addresses: Windows loaded B at the same address in all three processes, as the system randomizes a DLL's base once per boot. `pe_map` mapped it at a different address every time and never at the preferred base, so the relocation path ran on every mapping.
+- Responsibilities: Windows counts references. A second `LoadLibrary` of B returns the same module and runs nothing, and A stays loaded while B or the harness holds it. `pe_map` keeps no module table and no reference counts. Mapping B twice gives a second image that runs its constructor again. The order of mapping and release and the import of A are the harness's work.
+- Mutation checks, not in CI: making `pe_map_release` skip the process detach, or not free the image, each made `cpu_native_crt_lifecycle` fail.
+- Not covered here: a double release, null and foreign or interior pointers, which `cpu_native_lifetime` already checks for `pe_map_release` (it returns 1 once and 0 otherwise); and releasing A before B, which would touch released memory. Neither this test nor the harness depends on freed memory, apart from asking `VirtualQuery` about the released range right after the release.
+
+```powershell
+cmake --build --preset dev --target pe_map cpu_life_sink cpu_life_a cpu_life_a_noctor cpu_life_b cpu_life_b_nodtor
+ctest --preset dev --no-tests=error -R '^cpu_native_crt_lifecycle$' -V
+```
+
 ### An empty relocation directory away from the preferred base
 
 `cpu_import_original` contains no absolute addresses. Its base-relocation directory has Size 0 and `IMAGE_FILE_RELOCS_STRIPPED` is clear. The issue used `cpu_register_probe`, which has the same properties; this test uses `cpu_import_original` because it exports `call_mix`, so a call can be checked after loading, and the register probe is the harness.
