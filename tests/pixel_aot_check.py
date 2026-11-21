@@ -307,6 +307,27 @@ def ceiling():
     ])
 
 
+def int_minmax_pair(encoding):
+    return with_constants([
+        "v_mov_b32_e32 v18, s45",
+        f"v_min_i32_{encoding} v12, s44, v18",
+        f"v_max_i32_{encoding} v13, s44, v18",
+        f"v_min_u32_{encoding} v14, s44, v18",
+        f"v_max_u32_{encoding} v15, s44, v18",
+    ])
+
+
+def int_minmax_triple(kind):
+    return with_constants([
+        "v_mov_b32_e32 v18, s45",
+        "v_mov_b32_e32 v19, s46",
+        f"v_min3_{kind} v12, s44, v18, v19",
+        f"v_max3_{kind} v13, s44, v18, v19",
+        f"v_med3_{kind} v14, s44, v18, v19",
+        f"v_med3_{kind} v15, s46, v18, v18",
+    ])
+
+
 # The gfx10 predicate number is a four-bit truth table. Bits 0..3 select
 # less, equal, greater and unordered respectively, independent of the HLSL.
 PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
@@ -1233,12 +1254,52 @@ def check_controls(directory):
     cnd_pos = sel.index("v_cndmask_b32_e64 v13, v13, s46, s[52:53]")
     must_reject(translate, sel[:cnd_pos] + ["s_not_b64 s[52:53], 0"] + sel[cnd_pos:])
 
+    # 32-bit integer min/max/min3/max3/med3 controls and rejections.
+    pair_src = translate(int_minmax_pair("e32"))
+    assert "asfloat(min(asint(params[0].w), asint(alu20)))" in pair_src, pair_src
+    assert "asfloat(max(asuint(params[0].w), asuint(alu20)))" in pair_src, pair_src
+    assert translate(int_minmax_pair("e64")) == pair_src
+    tri_i32 = translate(int_minmax_triple("i32"))
+    tri_u32 = translate(int_minmax_triple("u32"))
+    assert "asfloat(min(min(asint(params[0].w), asint(alu20)), asint(alu21)))" in tri_i32, tri_i32
+    assert tri_i32.count("int3 med") == 2 and tri_u32.count("uint3 med") == 2
+    for bad_pair in (
+        "v_min_i32_e64 v12, -s44, v18",
+        "v_min_i32_e64 v12, |s44|, v18",
+        "v_min_i32_e64 v12, s44, v18 clamp",
+        "v_min_i32_e64 v12, s44",
+        "v_min_i32_e64 v12, 0x100000000, v18",
+    ):
+        changed = [line.replace("v_min_i32_e64 v12, s44, v18", bad_pair) for line in int_minmax_pair("e64")]
+        assert changed != int_minmax_pair("e64")
+        must_reject(translate, changed)
+    for bad_tri in (
+        "v_med3_i32 v14, -s44, v18, v19",
+        "v_med3_i32 v14, s44, |v18|, v19",
+        "v_med3_i32 v14, s44, v18, v19 clamp",
+        "v_med3_i32 v14, s44, v18",
+    ):
+        changed = [line.replace("v_med3_i32 v14, s44, v18, v19", bad_tri) for line in int_minmax_triple("i32")]
+        assert changed != int_minmax_triple("i32")
+        must_reject(translate, changed)
+    base_pair = int_minmax_pair("e32")
+    wait = base_pair.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, base_pair[:wait] + ["v_min_i32_e32 v12, 0, 1"] + base_pair[wait:])
+    must_reject(translate, base_pair[:wait] + ["v_med3_u32 v13, 0, 1, 2"] + base_pair[wait:])
+    load = next(i for i, line in enumerate(base_pair) if line.startswith("s_buffer_load_dwordx4"))
+    lgkm = base_pair.index("s_waitcnt lgkmcnt(0)", load)
+    must_reject(translate, base_pair[:lgkm] + ["v_max_u32_e32 v20, s44, 0"] + base_pair[lgkm:])
+    wqm = base_pair.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, base_pair[:wqm] + ["v_min_u32_e32 v20, 0, 1"] + base_pair[wqm:])
+
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate),
                 (ceiling(), translate), (scalar64(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
+    fixtures.extend((int_minmax_pair(encoding), translate) for encoding in ("e32", "e64"))
+    fixtures.extend((int_minmax_triple(kind), translate) for kind in ("i32", "u32"))
     fixtures.append((with_constants(CUBE_BODY), translate))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((with_constants(HALF_BODY), translate))
@@ -1287,6 +1348,69 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Replacing ceiling with floor escaped detection")
+
+
+def check_int_minmax_draws(directory, compiler, renderer, backend):
+    source = directory / "int_minmax.hlsl"
+    shader = directory / "int_minmax.cso"
+    case = directory / "int_minmax.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+
+    def order_key(value, signed):
+        return struct.unpack("<i" if signed else "<I", struct.pack("<f", value))[0]
+
+    def pick_pair(a, b):
+        return (
+            min(a, b, key=lambda v: order_key(v, True)),
+            max(a, b, key=lambda v: order_key(v, True)),
+            min(a, b, key=lambda v: order_key(v, False)),
+            max(a, b, key=lambda v: order_key(v, False)),
+        )
+
+    def pick_triple(a, b, c, signed):
+        ordered = sorted((a, b, c), key=lambda v: order_key(v, signed))
+        tied = sorted((c, b, b), key=lambda v: order_key(v, signed))[1]
+        return ordered[0], ordered[2], ordered[1], tied
+
+    # Exact binary16 floats whose 32-bit patterns reverse order across signed, unsigned, and float.
+    for encoding in ("e32", "e64"):
+        source.write_text(translate(int_minmax_pair(encoding)), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for a, b in ((-2.0, 1.0), (-2.0, -1.0)):
+            constants = bytearray(256)
+            struct.pack_into("<4f", constants, 12, a, b, 0.0, 0.0)
+            case.write_bytes(constants + struct.pack("<4f", *pick_pair(a, b)) * 64)
+            subprocess.run(draw, check=True)
+
+    swapped = [line.replace("v_min_i32_e32", "v_min_u32_e32") for line in int_minmax_pair("e32")]
+    source.write_text(translate(swapped), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, -2.0, 1.0, 0.0, 0.0)
+    case.write_bytes(constants + struct.pack("<4f", *pick_pair(-2.0, 1.0)) * 64)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Replacing v_min_i32 with v_min_u32 escaped detection")
+
+    for kind in ("i32", "u32"):
+        source.write_text(translate(int_minmax_triple(kind)), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for a, b, c in ((-2.0, -1.0, 1.0), (0.5, -0.5, 4.0)):
+            constants = bytearray(256)
+            struct.pack_into("<4f", constants, 12, a, b, c, 0.0)
+            case.write_bytes(constants + struct.pack("<4f", *pick_triple(a, b, c, kind == "i32")) * 64)
+            subprocess.run(draw, check=True)
+
+    wrong_med = [line.replace("v_med3_i32", "v_med3_u32") for line in int_minmax_triple("i32")]
+    source.write_text(translate(wrong_med), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, -2.0, -1.0, 1.0, 0.0)
+    case.write_bytes(constants + struct.pack("<4f", *pick_triple(-2.0, -1.0, 1.0, True)) * 64)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Replacing v_med3_i32 with v_med3_u32 escaped detection")
 
 
 def check_render(directory, compiler, renderer, backend):
@@ -1417,6 +1541,7 @@ def check_render(directory, compiler, renderer, backend):
         raise AssertionError("Swapped blend weights escaped detection")
     check_cube_draw(directory, compiler, renderer, backend)
     check_fract_draw(directory, compiler, renderer, backend)
+    check_int_minmax_draws(directory, compiler, renderer, backend)
 
     program = scalar64()
     source.write_text(translate(program), encoding="ascii")

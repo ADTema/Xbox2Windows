@@ -350,6 +350,20 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
     raise ValueError(f"Unsupported arithmetic operand {token}")
 
 
+def int_operand(token, scalar, vector, pending, sample_pending, *, signed):
+    if re.fullmatch(r"v\d+", token):
+        value = vector[token]
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+            raise ValueError("Expected a numeric register")
+        if sample_pending and value.startswith("sample"):
+            raise ValueError("Sample used before vmcnt wait")
+        return f"asint({value})" if signed else f"asuint({value})"
+    bits = scalar_u32(token, scalar, pending)
+    if signed and bits.startswith("asuint(") and bits.endswith(")"):
+        return f"asint({bits[7:-1]})"
+    return f"asint({bits})" if signed else bits
+
+
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
     """Track descriptor provenance, interpolation and packed exports through register writes."""
     if (texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105
@@ -599,6 +613,33 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+                      for t in tokens]
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({op}({values[0]}, {values[1]}));")
+        elif m := match(r"v_(min3|max3|med3)_(i32|u32)(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+                      for t in tokens]
+            if op == "med3":
+                vec_type = "int3" if kind == "i32" else "uint3"
+                lines.append(f"    {vec_type} med{i} = {vec_type}({values[0]}, {values[1]}, {values[2]});")
+                expression = f"max(min(med{i}.x, med{i}.y), min(max(med{i}.x, med{i}.y), med{i}.z))"
+            else:
+                fn = op[:-1]
+                expression = f"{fn}({fn}({values[0]}, {values[1]}), {values[2]})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({expression});")
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, dst, *tokens = m.groups()
             regs = lane_mask(dst)
