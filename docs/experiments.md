@@ -680,6 +680,8 @@ python3 -B tools/pixel_aot.py "$archive" "$record" --llvm libLLVM-15.so.1 \
     --sampler-words "$word0" "$word1" "$word2" "$word3" --output out/pixel-aot/translated.hlsl
 ```
 
+When several records share the exact name, add `--container-sha256` with the SHA-256 of the full decoded DXBC container. Run the [shader extractor](#optional-compressed-record-inventory) with `--length-prefixed-names --format dxbc`, then hash the desired `.dxbc` file using `sha256sum` or `Get-FileHash -Algorithm SHA256`. Exactly one record must match both the name and the digest. Two containers can carry identical native instructions and different metadata, so their native program hashes can be identical.
+
 ```powershell
 .\tools\dev.ps1
 dxc -T ps_6_0 -E main -Fo out/pixel-aot/translated.cso out/pixel-aot/translated.hlsl

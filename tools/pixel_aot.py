@@ -23,22 +23,53 @@ def inflate(data, size, window):
     return image
 
 
-def native_program(archive, record):
+def _read_named_container(data: mmap.mmap, end: int) -> bytes:
+    payload = end + 17
+    if payload > len(data):
+        raise ValueError("Missing or truncated named record")
+    stored, _, repeat, size = struct.unpack_from("<4I", data, end + 1)
+    if stored != repeat or not 0 < stored <= 8 << 20 or payload + stored > len(data):
+        raise ValueError("Invalid record extent")
+    return inflate(data[payload:payload + stored], size, -15)
+
+
+def _select_named_container(data: mmap.mmap, needle: bytes, digest: str) -> bytes:
+    selected = None
+    cursor = 0
+    while (pos := data.find(needle, cursor)) >= 0:
+        # Advance past the name, independent of the candidate's claimed payload extent.
+        cursor = pos + len(needle)
+        try:
+            blob = _read_named_container(data, cursor)
+        except (ValueError, zlib.error):
+            continue
+        if hashlib.sha256(blob).hexdigest() == digest:
+            if selected is not None:
+                raise ValueError("Multiple records match the name and container SHA-256")
+            selected = blob
+    if selected is None:
+        raise ValueError("No record matches the name and container SHA-256")
+    return selected
+
+
+def native_program(archive: Path, record: str, *, container_sha256: str | None = None) -> tuple[bytes, bytes]:
     name = record.encode("ascii")
     if not 0 < len(name) < 255 or b"\0" in name:
         raise ValueError("Invalid length-prefixed record name")
     needle = bytes([len(name) + 1]) + name + b"\0"
+    if container_sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", container_sha256):
+        raise ValueError("Invalid decoded container SHA-256")
     with archive.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-        pos = data.find(needle)
-        end = pos + len(needle)
-        if pos < 0 or end + 17 > len(data):
-            raise ValueError("Missing or truncated named record")
-        if data.find(needle, end) >= 0:
-            raise ValueError("Multiple records match the name")
-        stored, _, repeat, size = struct.unpack_from("<4I", data, end + 1)
-        if stored != repeat or not 0 < stored <= 8 << 20 or end+17+stored > len(data):
-            raise ValueError("Invalid record extent")
-        blob = inflate(data[end+17:end+17+stored], size, -15)
+        if container_sha256 is None:
+            pos = data.find(needle)
+            end = pos + len(needle)
+            if pos < 0 or end + 17 > len(data):
+                raise ValueError("Missing or truncated named record")
+            if data.find(needle, end) >= 0:
+                raise ValueError("Multiple records match the name")
+            blob = _read_named_container(data, end)
+        else:
+            blob = _select_named_container(data, needle, container_sha256.lower())
     program = parts(blob)[b"DXIL"]
     if len(program) < 24 or struct.unpack_from("<H", program, 2)[0] != 0:
         raise ValueError("Expected a pixel shader")
@@ -383,6 +414,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("record")
+    parser.add_argument("--container-sha256", help="SHA-256 of the full decoded DXBC container to select by name")
     parser.add_argument("--llvm", required=True, help="LLVM C library with AMDGPU support")
     parser.add_argument("--texture-sgpr", type=int, required=True, help="Entry register for the low texture address")
     parser.add_argument("--interp-sgpr", type=int, required=True, help="Entry register for the interpolation base")
@@ -397,7 +429,7 @@ def main():
     if dest.suffix.lower() != ".hlsl" or dest == args.archive.resolve():
         parser.error("Choose an HLSL destination distinct from the input")
     try:
-        blob, code = native_program(args.archive, args.record)
+        blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256)
         instructions = disassemble(code, args.llvm)
         source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor, second_texture_offset=args.second_texture_offset)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
