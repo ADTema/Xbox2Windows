@@ -190,6 +190,7 @@ VOP2_OPS = {
     0x26: ("v_sub_nc_u32_e32", "Vector sub uint32 without carry"),
     0x27: ("v_subrev_nc_u32_e32", "Vector reverse sub uint32 without carry"),
     0x2b: ("v_fmac_f32_e32", "Vector fused multiply-accumulate float32"),
+    0x2f: ("v_cvt_pkrtz_f16_f32_e32", "Convert two float32 to packed float16 (round to zero)"),
 }
 
 EXP_TARGETS = {

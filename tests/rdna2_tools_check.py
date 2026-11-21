@@ -192,6 +192,7 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_sub_nc_u32_e32 v3, v1, v2",
             "v_subrev_nc_u32_e32 v3, v1, v2",
             "v_fmac_f32_e32 v3, v1, v2",
+            "v_cvt_pkrtz_f16_f32_e32 v3, v1, v2",
             "s_endpgm",
         ]
 
