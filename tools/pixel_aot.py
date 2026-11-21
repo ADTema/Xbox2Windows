@@ -176,6 +176,127 @@ COMPARE = {
     "neq": "!({0} == {1})", "nlt": "({0} >= {1} || isnan({0}) || isnan({1}))",
 }
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
+SALU_BIT64 = {
+    "and": "uint2({0} & {2}, {1} & {3})",
+    "or": "uint2({0} | {2}, {1} | {3})",
+    "xor": "uint2({0} ^ {2}, {1} ^ {3})",
+    "andn2": "uint2({0} & ~{2}, {1} & ~{3})",
+    "orn2": "uint2({0} | ~{2}, {1} | ~{3})",
+}
+SALU_HELPERS = {
+    "s_lshl_b64": (
+        "uint2 s_lshl_b64(uint2 v, uint s) {\n"
+        "    s &= 63u;\n"
+        "    if (s == 0u) return v;\n"
+        "    if (s < 32u) return uint2(v.x << s, (v.y << s) | (v.x >> (32u - s)));\n"
+        "    return uint2(0u, v.x << (s - 32u));\n"
+        "}"
+    ),
+    "s_lshr_b64": (
+        "uint2 s_lshr_b64(uint2 v, uint s) {\n"
+        "    s &= 63u;\n"
+        "    if (s == 0u) return v;\n"
+        "    if (s < 32u) return uint2((v.x >> s) | (v.y << (32u - s)), v.y >> s);\n"
+        "    return uint2(v.y >> (s - 32u), 0u);\n"
+        "}"
+    ),
+    "s_ashr_i64": (
+        "uint2 s_ashr_i64(uint2 v, uint s) {\n"
+        "    s &= 63u;\n"
+        "    if (s == 0u) return v;\n"
+        "    if (s < 32u) return uint2((v.x >> s) | (v.y << (32u - s)), asuint(asint(v.y) >> s));\n"
+        "    return uint2(asuint(asint(v.y) >> (s - 32u)), asuint(asint(v.y) >> 31));\n"
+        "}"
+    ),
+    "s_bfm_b64": (
+        "uint2 s_bfm_b64(uint width, uint offset) {\n"
+        "    uint w = width & 63u;\n"
+        "    uint2 m = uint2(0u, 0u);\n"
+        "    if (w > 0u && w < 32u) m = uint2((1u << w) - 1u, 0u);\n"
+        "    else if (w == 32u) m = uint2(0xffffffffu, 0u);\n"
+        "    else if (w > 32u) m = uint2(0xffffffffu, (1u << (w - 32u)) - 1u);\n"
+        "    return s_lshl_b64(m, offset);\n"
+        "}"
+    ),
+    "s_bfe_u32": (
+        "uint s_bfe_u32(uint src, uint ctrl) {\n"
+        "    uint off = ctrl & 31u;\n"
+        "    uint w = (ctrl >> 16) & 127u;\n"
+        "    if (w == 0u) return 0u;\n"
+        "    if (off + w < 32u) return (src << (32u - off - w)) >> (32u - w);\n"
+        "    return src >> off;\n"
+        "}"
+    ),
+    "s_bfe_i32": (
+        "uint s_bfe_i32(uint src, uint ctrl) {\n"
+        "    uint off = ctrl & 31u;\n"
+        "    uint w = (ctrl >> 16) & 127u;\n"
+        "    if (w == 0u) return 0u;\n"
+        "    if (off + w < 32u) return asuint(asint(src << (32u - off - w)) >> (32u - w));\n"
+        "    return asuint(asint(src) >> off);\n"
+        "}"
+    ),
+}
+
+
+def sgpr_name(token):
+    if not (m := re.fullmatch(r"s(\d+)", token)):
+        raise ValueError(f"Expected a scalar register, got {token}")
+    if not 0 <= int(m.group(1)) <= 105:
+        raise ValueError(f"Scalar register out of range: {token}")
+    return token
+
+
+def sgpr_pair(token):
+    if not (m := re.fullmatch(r"s\[(\d+):(\d+)\]", token)):
+        raise ValueError(f"Expected a 64-bit scalar register pair, got {token}")
+    regs = registers(*m.groups(), 2)
+    if regs.start < 0 or regs.stop - 1 > 105 or regs.start % 2:
+        raise ValueError(f"Invalid 64-bit scalar register pair: {token}")
+    return [f"s{n}" for n in regs]
+
+
+def scalar_u32(token, scalar, pending):
+    if re.fullmatch(r"s\d+", token):
+        sgpr_name(token)
+        if token in pending:
+            raise ValueError("Constant read before load completion")
+        value = scalar[token]
+        if isinstance(value, int):
+            return f"{value}u"
+        if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
+            return value[1]
+        if isinstance(value, str) and value.startswith("params["):
+            return f"asuint({value})"
+        raise ValueError(f"Expected a numeric scalar register: {token}")
+    if re.fullmatch(r"-?\d+", token):
+        value = int(token)
+        if not -0x80000000 <= value <= 0xffffffff:
+            raise ValueError(f"32-bit scalar immediate out of range: {token}")
+        return f"{value & 0xffffffff}u"
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", token):
+        return f"{int(token, 16)}u"
+    if re.fullmatch(r"-?\d+\.\d+", token):
+        bits, = struct.unpack("<I", struct.pack("<f", float(token)))
+        return f"{bits}u"
+    raise ValueError(f"Unsupported 32-bit scalar operand {token}")
+
+
+def scalar_u64(token, scalar, pending, *, signed=False):
+    if token.startswith("s["):
+        lo, hi = sgpr_pair(token)
+        return scalar_u32(lo, scalar, pending), scalar_u32(hi, scalar, pending)
+    if re.fullmatch(r"-?\d+", token):
+        value = int(token)
+        if not -0x8000000000000000 <= value <= 0xffffffffffffffff:
+            raise ValueError(f"64-bit scalar immediate out of range: {token}")
+        bits = value & 0xffffffffffffffff
+        return f"{bits & 0xffffffff}u", f"{bits >> 32}u"
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", token):
+        value = int(token, 16)
+        high = 0xffffffff if signed and (value & 0x80000000) else 0
+        return f"{value}u", f"{high}u"
+    raise ValueError(f"Unsupported 64-bit scalar operand {token}")
 
 
 def lane_mask(token):
@@ -201,6 +322,8 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
         value = (vector if token.startswith("v") else scalar)[token]
         if isinstance(value, int):
             return f"asfloat({value}u)"
+        if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
+            return f"asfloat({value[1]})"
         if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
             raise ValueError("Expected a numeric register")
         if sample_pending and value.startswith("sample"):
@@ -235,6 +358,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             start < constant_descriptor + 16 and constant_descriptor < start + 32 for start in bindings):
         raise ValueError("Texture and constant descriptors overlap")
     pending = set()
+    scc = None
+    helpers = set()
     mask = "entry"
     samples = 0
     sample_pending = False
@@ -264,11 +389,71 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 scalar[f"s{n}"] = (mask, n-regs.start)
         elif line == "s_wqm_b64 exec, exec" and mask == "entry":
             mask = "quad"
+            scc = None
         elif m := match(r"s_and_b64 exec, exec, s\[(\d+):(\d+)\]"):
             pair = registers(*m.groups(), 2)
             if mask != "quad" or [scalar.get(f"s{n}") for n in pair] != [("entry",0),("entry",1)]:
                 raise ValueError("Unsupported execution mask")
             mask = "entry"
+            scc = None
+        elif m := match(r"s_(cmov|not|brev)_b64 (s\[\d+:\d+\]), ([^,]+)"):
+            op, dst, src = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            s0, s1 = scalar_u64(src, scalar, pending)
+            if op == "cmov":
+                if scc is None:
+                    raise ValueError("Conditional move requires a tracked SCC")
+                d0, d1 = scalar_u64(dst, scalar, pending)
+                expr = f"({scc} ? uint2({s0}, {s1}) : uint2({d0}, {d1}))"
+            elif op == "not":
+                expr = f"uint2(~{s0}, ~{s1})"
+            else:
+                expr = f"uint2(reversebits({s1}), reversebits({s0}))"
+            lines.append(f"    uint2 salu{i} = {expr};")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
+            if op == "not":
+                scc = f"((salu{i}.x | salu{i}.y) != 0u)"
+        elif m := match(rf"s_({'|'.join(SALU_BIT64)})_b64 (s\[\d+:\d+\]), ([^,]+), ([^,]+)"):
+            op, dst, src0, src1 = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            a0, a1 = scalar_u64(src0, scalar, pending)
+            b0, b1 = scalar_u64(src1, scalar, pending)
+            lines.append(f"    uint2 salu{i} = {SALU_BIT64[op].format(a0, a1, b0, b1)};")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
+            scc = f"((salu{i}.x | salu{i}.y) != 0u)"
+        elif m := match(r"(s_lshl_b64|s_lshr_b64|s_ashr_i64|s_bfm_b64) (s\[\d+:\d+\]), ([^,]+), ([^,]+)"):
+            op, dst, src0, src1 = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            shift = scalar_u32(src1, scalar, pending)
+            if op == "s_bfm_b64":
+                width = scalar_u32(src0, scalar, pending)
+                helpers.update(("s_lshl_b64", "s_bfm_b64"))
+                expr = f"s_bfm_b64({width}, {shift})"
+            else:
+                a0, a1 = scalar_u64(src0, scalar, pending, signed=(op == "s_ashr_i64"))
+                helpers.add(op)
+                expr = f"{op}(uint2({a0}, {a1}), {shift})"
+            lines.append(f"    uint2 salu{i} = {expr};")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
+            if op != "s_bfm_b64":
+                scc = f"((salu{i}.x | salu{i}.y) != 0u)"
+        elif m := match(r"(s_bfe_u32|s_bfe_i32) (s\d+), ([^,]+), ([^,]+)"):
+            op, dst, src0, src1 = m.groups()
+            sgpr_name(dst)
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            a = scalar_u32(src0, scalar, pending)
+            b = scalar_u32(src1, scalar, pending)
+            helpers.add(op)
+            lines.append(f"    uint salu{i} = {op}({a}, {b});")
+            scalar[dst] = ("uint", f"salu{i}")
+            scc = f"(salu{i} != 0u)"
         elif m := match(r"(s_mov_b32|s_movk_i32) (s\d+|m0), (s\d+|0x[0-9a-f]+|\d+)"):
             op, dst, src = m.groups()
             if src in pending or dst in pending:
@@ -430,6 +615,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             raise ValueError(f"Unsupported instruction {i}: {line}")
     if not ended or samples != (2 if second_texture_offset is not None else 1):
         raise ValueError("Unexpected sample count or missing color export")
+    if helpers:
+        defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
+        pos = lines.index(PREAMBLE)
+        lines[pos:pos] = defs
     return "\n".join([*lines, "}",""])
 
 
