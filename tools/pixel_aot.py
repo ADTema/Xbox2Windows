@@ -155,21 +155,24 @@ def lane_mask(token):
     return [token]
 
 
-def fp_operand(token, scalar, vector, pending, sample_pending):
+def fp_operand(token, scalar, vector, pending, sample_pending, *, quad_values: dict[str, bool] | None = None):
     if re.fullmatch(r"-\d+", token):
         return f"asfloat({int(token) & 0xffffffff}u)"
     if token.startswith("-"):
-        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_pending) + ")"
+        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_pending, quad_values=quad_values) + ")"
     if absolute := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
         inner = absolute.group(1) or absolute.group(2)
-        return f"abs({fp_operand(inner, scalar, vector, pending, sample_pending)})"
+        return f"abs({fp_operand(inner, scalar, vector, pending, sample_pending, quad_values=quad_values)})"
     if re.fullmatch(r"[vs]\d+", token):
         if token in pending:
             raise ValueError("Constant read before load completion")
         value = (vector if token.startswith("v") else scalar)[token]
+        if quad_values is not None and token.startswith("v") and value not in quad_values:
+            raise ValueError("Operand lacks a helper-lane definition")
         if isinstance(value, int):
             return f"asfloat({value}u)"
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not (value.startswith(("sample", "alu", "params["))
+                or (quad_values is not None and value in quad_values)):
             raise ValueError("Expected a numeric register")
         if sample_pending and value.startswith("sample"):
             raise ValueError("Sample used before vmcnt wait")
@@ -188,6 +191,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Invalid scalar inputs or sampler descriptor words")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
     vector = {"v0": "bary_i", "v1": "bary_j"}
+    # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
+    # The boolean records whether the quad value depends on interpolated coordinates.
+    quad_values = {"uv.x": True, "uv.y": True}
     lines = [PREAMBLE]
     if constant_descriptor is not None:
         if constant_descriptor < 0 or constant_descriptor % 4:
@@ -301,7 +307,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
             uv = [vector[f"v{n}"] for n in coords]
-            if any(v not in ("uv.x", "uv.y") for v in uv):
+            if any(v not in quad_values for v in uv):
                 raise ValueError("Unsupported texture coordinate")
             lines.append(f"    float4 sample{i} = {texture}.Sample(samp, float2({', '.join(uv)}));")
             samples += 1
@@ -325,11 +331,22 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if op == "fmac":
                 tokens.append(dst)
             arity, template = ALU[op]
-            if mask != "entry" or len(tokens) != arity:
+            quad = mask == "quad"
+            if (mask not in ("entry", "quad") or len(tokens) != arity
+                    or (quad and (samples or second_texture_offset is not None
+                                  or op not in ("add", "fma", "mul_legacy")))):
                 raise ValueError("Invalid arithmetic operation")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            if quad and (clamp or any("|" in t or "abs(" in t for t in tokens)):
+                raise ValueError("Whole-quad coordinate arithmetic must be affine")
+            helpers = quad_values if quad else None
+            values = [fp_operand(t, scalar, vector, pending, sample_pending, quad_values=helpers) for t in tokens]
+            if quad:
+                varying = [quad_values.get(vector.get(t.lstrip("-"), ""), False) for t in tokens]
+                if op != "add" and all(varying[:2]):
+                    raise ValueError("Whole-quad coordinate arithmetic must be affine")
+                quad_values[f"alu{i}"] = any(varying)
             expression = template.format(*values)
             if clamp:
                 expression = f"saturate({expression})"
