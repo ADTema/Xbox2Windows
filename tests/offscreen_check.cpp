@@ -343,6 +343,8 @@ int main(int argc, char** argv)
             check_bvh_hits(device.Get());
         } else if (argc == 3 && operation == "--dxr-update") {
             if (!check_dxr_update(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--bvh-packed") {
+            check_bvh_packed(device.Get());
         } else if (argc == 3 && operation == "--bvh-numeric") {
             check_bvh_numeric(device.Get());
         } else if (argc == 3 && operation == "--bvh-atomics") {

@@ -38,6 +38,51 @@ def parts(blob):
     return result
 
 
+def packing_evidence(text):
+    """Summarize immediate SSA definitions in the SDK disassembler's textual IR."""
+    selectors = Counter()
+    addresses = Counter()
+    adjacent_extrema = 0
+    definitions = {}
+    previous_positive = None
+    local = r"%[\w.$-]+"
+    for raw in text.splitlines():
+        line = raw.partition(";")[0].strip()
+        if line.startswith("define ") or line == "}":
+            definitions.clear()
+            previous_positive = None
+        definition = re.match(rf"({local}) = (.+)", line)
+        if definition:
+            definitions[definition[1]] = definition[2]
+        if "call " not in line:
+            continue
+        if "@xbox.V_ALIGNBYTE_B32(" in line:
+            selector = re.search(rf", i32 ({local})\)", line)
+            producer = definitions.get(selector[1], "") if selector else ""
+            masked = re.fullmatch(rf"and i32 (?:{local}, 3|3, {local})", producer)
+            selectors["and_3" if masked else "other_or_unknown"] += 1
+        store = re.search(rf"@xbox\.global_store_(dword(?:x[34])?)_with_cache\(i32 \d+, i64 ({local}), (.*)", line)
+        if not store:
+            continue
+        width, address, payload = store.groups()
+        producer = definitions.get(address, "")
+        addition = re.fullmatch(rf"add i64 ({local}), (-?\d+|{local})", producer)
+        if addition:
+            kind = "add_variable" if addition[2].startswith("%") else "add_" + addition[2]
+        else:
+            kind = "extractvalue" if producer.startswith("extractvalue ") else "other_or_unknown"
+        addresses[f"{width}:{kind}"] += 1
+        # Only count a second triple whose address actually uses the preceding
+        # triple's SSA address. Equal offsets on separate bases are insufficient.
+        literal = re.match(r"\{ i32, i32, i32 \} \{ i32 (-?\d+), i32 \1, i32 \1 \}", payload)
+        extremum = int(literal[1]) if width == "dwordx3" and literal else None
+        if extremum == -8388609 and addition and addition[1] == previous_positive and addition[2] == "12":
+            adjacent_extrema += 1
+        previous_positive = address if extremum == 2139095039 else None
+    return dict(alignbyte_selectors=dict(selectors), store_addresses=dict(addresses),
+                adjacent_extrema_store_pairs=adjacent_extrema)
+
+
 def validate_shader(probe, blob, program):
     if len(program) < 24:
         raise ValueError("Truncated DXIL program")
@@ -75,7 +120,8 @@ def validate_shader(probe, blob, program):
             elif symbol.startswith("dx.op."):
                 standard[symbol] += 1
     checks["ir"] = dict(target_triple=triple[1], xbox_call_sites=dict(sorted(calls.items())),
-                        dx_op_call_sites=dict(sorted(standard.items())), operand_forms=operand_forms)
+                        dx_op_call_sites=dict(sorted(standard.items())), operand_forms=operand_forms,
+                        packing=packing_evidence(text))
     return checks
 
 

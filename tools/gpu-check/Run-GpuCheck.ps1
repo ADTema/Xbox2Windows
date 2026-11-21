@@ -20,7 +20,7 @@ $report.Add("Windows build: $($windows.CurrentBuildNumber).$($windows.UBR)")
 $report.Add("Backend: $Backend")
 $report.Add('')
 $failed = $false
-foreach ($test in 'bvh-waves', 'bvh-wave64', 'bvh-differential', 'bvh-atomics', 'bvh-numeric', 'bvh-root-roundtrip', 'dxr-update') {
+foreach ($test in 'bvh-waves', 'bvh-wave64', 'bvh-differential', 'bvh-packed', 'bvh-atomics', 'bvh-numeric', 'bvh-root-roundtrip', 'dxr-update') {
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo.FileName = $binary
     $process.StartInfo.Arguments = "$Backend --$test"

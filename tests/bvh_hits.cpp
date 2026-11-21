@@ -2,6 +2,7 @@
 #include "dxr_fixture.h"
 #include "TraceHits.h"
 #include "WriteScene.h"
+#include "ExpandLeaves.h"
 
 using namespace bvh_fixture;
 namespace {
@@ -97,11 +98,34 @@ Row reference(const std::array<Leaf, N>& scene, const Ray& r) {
     return result;
 }
 
-enum class Inputs { original, faultControls };
+using PackedLeaf = std::array<std::uint8_t, 32>;
+std::vector<PackedLeaf> encode_leaves(const Scene& scene, Word epoch, bool flipId) {
+    std::vector<PackedLeaf> packed(leaves);
+    constexpr Word masks[]{0,1,3,7,15,31,63,127,255,511,1023,0xaaaaaaaa,0x55555555,0xffffffff};
+    for (Word i = 0; i < leaves; ++i) {
+        const auto& leaf = scene[i];
+        auto& bytes = packed[i];
+        bytes.fill(static_cast<std::uint8_t>(0x95u + i));
+        Word header = leaf.id | (static_cast<Word>(leaf.degenerate) << 18);
+        if (!leaf.readable) header |= 1u << (i == 31 ? 16 : 17);
+        const Word mask = masks[(i + epoch) % std::size(masks)];
+        Word first = header ^ ~mask, second = header ^ mask;
+        // The witness changes one selected ID bit in the encoded input only.
+        if (flipId && epoch == 0 && i == 0) second ^= 1;
+        const Word fields[]{bits(leaf.x), bits(leaf.y), bits(leaf.z), first, second, (13*i + epoch*7) % leaves};
+        std::memcpy(bytes.data() + (i + epoch) % 4, fields, sizeof(fields));
+        std::memcpy(bytes.data() + 28, &mask, sizeof(mask));
+    }
+    return packed;
+}
+
+enum class Inputs { original, faultControls, packed, packedIdFlip };
 std::vector<Word> trace_custom(ID3D12Device* device, const std::vector<Ray>& rays, Inputs inputs) {
     const UINT count = static_cast<UINT>(rays.size());
     const UINT frameBytes = count * sizeof(Row);
     const UINT sceneBytes = sceneRows * sizeof(Row);
+    const bool packed = inputs == Inputs::packed || inputs == Inputs::packedIdFlip;
+    const UINT storageBytes = sceneBytes + (packed ? sizeof(Row) : 0);
     std::vector<Row> rayRows;
     for (const auto& r : rays) {
         rayRows.push_back(pack(r.x, r.y, r.z, bits(r.nearT)));
@@ -109,15 +133,22 @@ std::vector<Word> trace_custom(ID3D12Device* device, const std::vector<Ray>& ray
     }
     auto rayInput = upload(device, rayRows);
     constexpr auto writable = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    auto scene = make_buffer(device, sceneBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, writable);
+    auto scene = make_buffer(device, storageBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, writable);
     auto output = make_buffer(device, frameBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, writable);
     auto back = make_buffer(device, epochs*frameBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     std::array<ComPtr<ID3D12Resource>, epochs> sources;
-    Kernel writer(device, {WriteScene, sizeof(WriteScene)}), tracer(device, {TraceHits, sizeof(TraceHits)});
+    std::array<ComPtr<ID3D12Resource>, epochs> seeds;
+    ComPtr<ID3D12Resource> sceneBack;
+    if (packed) sceneBack = make_buffer(device, epochs*storageBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    Kernel writer(device, packed ? D3D12_SHADER_BYTECODE{ExpandLeaves, sizeof(ExpandLeaves)} :
+                                   D3D12_SHADER_BYTECODE{WriteScene, sizeof(WriteScene)});
+    Kernel tracer(device, {TraceHits, sizeof(TraceHits)});
     ComputeCommands commands(device, writer.pipeline.Get());
     auto* list = commands.list.Get();
+    auto sceneState = D3D12_RESOURCE_STATE_COMMON;
     for (Word epoch = 0; epoch < epochs; ++epoch) {
-        auto rows = serialize(make_scene(epoch), epoch);
+        const auto geometry = make_scene(epoch);
+        auto rows = serialize(geometry, epoch);
         if (inputs == Inputs::faultControls) {
             // Misroute addresses between the two half-groups, replay stale
             // geometry, or alias an invalid high word into the allocation.
@@ -130,15 +161,28 @@ std::vector<Word> trace_custom(ID3D12Device* device, const std::vector<Ray>& ray
                 --rows[2*31+1][3];
             }
         }
-        sources[epoch] = upload(device, rows);
-        transition(list, scene.Get(), epoch ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON,
-                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (packed) {
+            sources[epoch] = upload(device, encode_leaves(geometry, epoch, inputs == Inputs::packedIdFlip));
+            // Poison every output field so even an omitted zero write is visible.
+            for (auto& row : rows) for (auto& word : row) word = ~word;
+            rows.push_back({0xdeadbeef, 0x12345678, 0x543210ab, epoch});
+            seeds[epoch] = upload(device, rows);
+            transition(list, scene.Get(), sceneState, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(scene.Get(), 0, seeds[epoch].Get(), 0, storageBytes);
+            sceneState = D3D12_RESOURCE_STATE_COPY_DEST;
+        } else {
+            sources[epoch] = upload(device, rows);
+        }
+        transition(list, scene.Get(), sceneState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         list->SetPipelineState(writer.pipeline.Get());
         list->SetComputeRootSignature(writer.root.Get());
         list->SetComputeRootShaderResourceView(0, sources[epoch]->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(1, scene->GetGPUVirtualAddress());
-        list->Dispatch(sceneRows/64, 1, 1);
+        Row settings{static_cast<Word>(base), static_cast<Word>(base >> 32), sceneBytes, epoch};
+        if (packed) list->SetComputeRoot32BitConstants(2, 4, settings.data(), 0);
+        list->Dispatch(packed ? leaves/32 : sceneRows/64, 1, 1);
         transition(list, scene.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        sceneState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         transition(list, output.Get(), epoch ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_COMMON,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         list->SetPipelineState(tracer.pipeline.Get());
@@ -146,13 +190,29 @@ std::vector<Word> trace_custom(ID3D12Device* device, const std::vector<Ray>& ray
         list->SetComputeRootShaderResourceView(0, scene->GetGPUVirtualAddress());
         list->SetComputeRootShaderResourceView(1, rayInput->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(2, output->GetGPUVirtualAddress());
-        Row settings{static_cast<Word>(base), static_cast<Word>(base >> 32), sceneBytes, epoch};
         list->SetComputeRoot32BitConstants(3, 4, settings.data(), 0);
         list->Dispatch(count, 1, 1);
         transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->CopyBufferRegion(back.Get(), epoch*frameBytes, output.Get(), 0, frameBytes);
+        if (packed) {
+            transition(list, scene.Get(), sceneState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            sceneState = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            list->CopyBufferRegion(sceneBack.Get(), epoch*storageBytes, scene.Get(), 0, storageBytes);
+        }
     }
     commands.submit_and_wait(device);
+    if (packed) {
+        const auto actual = read(sceneBack.Get(), epochs * storageBytes / sizeof(Word));
+        for (Word epoch = 0; epoch < epochs; ++epoch) {
+            auto geometry = make_scene(epoch);
+            if (inputs == Inputs::packedIdFlip && epoch == 0) geometry[0].id ^= 1;
+            auto expected = serialize(geometry, epoch);
+            expected.push_back({0xdeadbeef, 0x12345678, 0x543210ab, epoch});
+            for (Word i = 0; i < expected.size(); ++i)
+                for (Word field = 0; field < 4; ++field)
+                    equal(actual[epoch * storageBytes / sizeof(Word) + 4 * i + field], expected[i][field], i, field);
+        }
+    }
     return read(back.Get(), epochs*count*4);
 }
 }
@@ -173,6 +233,31 @@ void check_bvh_hits(ID3D12Device* device) {
         }
         std::printf("epoch=%u rays=%u hits=%u misses=%u mismatches=0\n", epoch, count, hits, count-hits);
     }
+}
+
+void check_bvh_packed(ID3D12Device* device) {
+    const auto rays = make_rays();
+    const auto result = trace_custom(device, rays, Inputs::packed);
+    const auto changed = trace_custom(device, rays, Inputs::packedIdFlip);
+    Word changedRays = 0;
+    for (Word epoch = 0; epoch < epochs; ++epoch) {
+        const auto geometry = make_scene(epoch);
+        auto edited = geometry;
+        if (epoch == 0) edited[0].id ^= 1;
+        for (Word i = 0; i < rays.size(); ++i) {
+            const auto expected = reference(geometry, rays[i]);
+            const auto expectedEdit = reference(edited, rays[i]);
+            const Word record = static_cast<Word>(epoch * rays.size() + i);
+            for (Word field = 0; field < 4; ++field) {
+                equal(result[4*record + field], expected[field], record, field);
+                equal(changed[4*record + field], expectedEdit[field], record, field);
+            }
+            changedRays += result[4*record] != changed[4*record];
+        }
+    }
+    if (result[0] == changed[0]) throw std::runtime_error("Packed ID witness missed the selected field");
+    std::printf("packed_epochs=%u scene_words_per_epoch=%u guard_words=4 rays_per_run=%zu changed_ids=%u\n",
+                epochs, sceneRows * 4, epochs * rays.size(), changedRays);
 }
 
 bool check_bvh_differential(ID3D12Device* device) {

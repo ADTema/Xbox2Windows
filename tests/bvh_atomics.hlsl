@@ -3,6 +3,14 @@ RWByteAddressBuffer result : register(u0);
 cbuffer Settings : register(b0) { uint count; uint outputOffset; uint bucketCount; }
 #define LAYOUT "SRV(t0), UAV(u0), RootConstants(num32BitConstants=3,b0)"
 
+[RootSignature(LAYOUT)] [numthreads(32, 1, 1)]
+void InitBounds(uint i : SV_DispatchThreadID)
+{
+    if (i >= bucketCount) return;
+    result.Store3(i * 32, 0x7f7fffffu.xxx);
+    result.Store3(i * 32 + 12, 0xff7fffffu.xxx);
+}
+
 // Compare finite IEEE-754 values, preserving raw float bits in the six bound fields.
 // This also gives a deterministic order to signed zeros.
 uint orderKey(uint bits)
