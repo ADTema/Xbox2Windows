@@ -190,7 +190,7 @@ def scene_records(data, validator=None):
                                  timeout=15, check=True)
             result = json.loads(run.stdout)
             samples[stage] = {"call_hr": result["call_hr"], "status": result.get("status")}
-        cursor = start + stored
+        cursor = start + (stored - len(stream.unused_data))
     return {"records": sum(stages.values()), "stages": stages, "section_counts": sections_seen,
             "framed_bitcode": framed, "trailing_byte_counts": tails, "candidate_rejections": rejected,
             "validator_samples": len(samples), "first_per_stage": samples}

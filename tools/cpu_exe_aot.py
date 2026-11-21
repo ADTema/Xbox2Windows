@@ -20,9 +20,11 @@ def require_local_pointer(previous, register, call, jump_targets):
 def translate(image, io_provider, mix_provider):
     with pefile.PE(str(image), fast_load=True) as pe:
         if (pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20b
+                or not pe.FILE_HEADER.Characteristics & 2
                 or pe.FILE_HEADER.Characteristics & 0x2000):
             raise ValueError("expected an AMD64 PE32+ executable")
-        if pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress:
+        directories = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+        if len(directories) > 9 and directories[9].VirtualAddress:
             raise ValueError("TLS startup is outside this entry profile")
         entry = pe.OPTIONAL_HEADER.AddressOfEntryPoint
         body = region(pe, entry, entry + len(bounded_code(pe, entry)))
