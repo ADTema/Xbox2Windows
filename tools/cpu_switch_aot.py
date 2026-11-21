@@ -314,7 +314,7 @@ class Lifter:
         return name if width == 8 else f"static_cast<{unsigned(width)}>({name})"
 
     def address(self, ins):
-        if (ins.memory_base == R.RIP or ins.memory_base == R.RSP or ins.memory_index == R.RSP
+        if (ins.memory_base in (R.RIP, R.EIP, R.RSP, R.ESP) or ins.memory_index in (R.RSP, R.ESP)
                 or ins.has_segment_prefix or ins.memory_base == R.NONE):
             raise ValueError(f"unsupported memory operand at RVA {ins.ip:#x}")
         parts = [self.reg(ins.memory_base)]
@@ -325,6 +325,9 @@ class Lifter:
         displacement = ins.memory_displacement & ((1 << 64) - 1)
         if displacement:
             parts.append(f"{displacement:#x}ull")
+        if RegisterExt.is_gpr32(ins.memory_base):
+            # A 67h prefix selects 32-bit addressing: the sum wraps at 32 bits and is zero-extended.
+            return f"static_cast<std::uint64_t>(static_cast<std::uint32_t>({' + '.join(parts)}))"
         return "(" + " + ".join(parts) + ")"
 
     def operand(self, ins, number, width):
