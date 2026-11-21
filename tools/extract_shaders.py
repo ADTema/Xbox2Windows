@@ -115,6 +115,7 @@ def extract_shaders(
 
     names_pattern = re.compile(rb"[!-~]{4,}")
     stage_counters = Counter()
+    stage_name_counts = Counter()
     extracted_records = []
     total_found = 0
     extracted_count = 0
@@ -175,6 +176,10 @@ def extract_shaders(
             stage_dir.mkdir(parents=True, exist_ok=True)
 
             safe_name = sanitize_filename(record_name)
+            name_occ = stage_name_counts[(stage, safe_name)]
+            stage_name_counts[(stage, safe_name)] += 1
+            file_stem = safe_name if name_occ == 0 else f"{safe_name}_{name_occ}"
+
             record_info = {
                 "name": record_name,
                 "stage": stage,
@@ -184,24 +189,24 @@ def extract_shaders(
 
             # Save formats
             if extract_format in ("dxbc", "both"):
-                dxbc_path = stage_dir / f"{safe_name}.dxbc"
+                dxbc_path = stage_dir / f"{file_stem}.dxbc"
                 with dxbc_path.open("wb") as out_f:
                     out_f.write(blob)
-                record_info["dxbc_file"] = f"{stage}/{safe_name}.dxbc"
+                record_info["dxbc_file"] = f"{stage}/{file_stem}.dxbc"
 
             if extract_format in ("native", "both"):
                 if native_code:
-                    bin_path = stage_dir / f"{safe_name}.bin"
+                    bin_path = stage_dir / f"{file_stem}.bin"
                     with bin_path.open("wb") as out_f:
                         out_f.write(native_code)
-                    record_info["native_file"] = f"{stage}/{safe_name}.bin"
+                    record_info["native_file"] = f"{stage}/{file_stem}.bin"
                     record_info["sha256"] = hashlib.sha256(native_code).hexdigest()
                 else:
                     # Fallback to dxbc if native code not unpackable
-                    dxbc_path = stage_dir / f"{safe_name}.dxbc"
+                    dxbc_path = stage_dir / f"{file_stem}.dxbc"
                     with dxbc_path.open("wb") as out_f:
                         out_f.write(blob)
-                    record_info["dxbc_file"] = f"{stage}/{safe_name}.dxbc"
+                    record_info["dxbc_file"] = f"{stage}/{file_stem}.dxbc"
 
             extracted_records.append(record_info)
             extracted_count += 1

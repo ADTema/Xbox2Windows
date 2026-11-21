@@ -17,6 +17,7 @@ from extract_shaders import extract_shaders, extract_native_rdna2_code
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
     is_instruction_supported,
+    is_opcode_recognized,
     classify_isa_category,
     generate_reports,
 )
@@ -24,6 +25,27 @@ try:
     from pixel_aot import disassemble as llvm_disassemble
 except ImportError:
     llvm_disassemble = None
+
+
+def resolve_llvm_lib(name_or_path: str) -> str:
+    """Resolve an LLVM shared library name or path for ctypes.CDLL loading."""
+    p = Path(name_or_path)
+    if p.is_file():
+        return str(p.resolve())
+    import ctypes.util
+    found = ctypes.util.find_library(name_or_path)
+    if found and Path(found).is_file():
+        return str(Path(found).resolve())
+    for directory in [
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib",
+        "/usr/local/lib",
+    ]:
+        candidate = Path(directory) / name_or_path
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return name_or_path
 
 
 def envelope(code: bytes, name: bytes = b"fixture_ps") -> bytes:
@@ -77,19 +99,25 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertIn("s_endpgm", res.stdout)
 
     def test_llvm_comparison(self):
-        llvm_lib = os.environ.get("LLVM_LIB")
-        if not llvm_lib or not Path(llvm_lib).exists() or llvm_disassemble is None:
-            self.skipTest("LLVM library path not configured; verified against golden vectors")
+        llvm_lib_env = os.environ.get("LLVM_LIB")
+        if not llvm_lib_env:
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
 
-        # Golden program with multiple instruction classes
+        if llvm_disassemble is None:
+            self.fail("pixel_aot.disassemble helper could not be imported")
+
+        resolved_lib = resolve_llvm_lib(llvm_lib_env)
         test_code = bytes.fromhex(
             "000080bf"  # s_nop 0
-            "000182be"  # s_mov_b32 s2, s0
+            "000082be"  # s_mov_b32 s2, s0
             "000081bf"  # s_endpgm
         )
-        llvm_lines = llvm_disassemble(test_code, llvm_lib)
-        rdna2_insns = disasm_rdna2(test_code)
+        try:
+            llvm_lines = llvm_disassemble(test_code, resolved_lib)
+        except Exception as e:
+            self.fail(f"Designated LLVM comparison failed to load or run with '{llvm_lib_env}' (resolved: '{resolved_lib}'): {e}")
 
+        rdna2_insns = disasm_rdna2(test_code)
         self.assertEqual(len(llvm_lines), len(rdna2_insns))
         for llvm_line, rdna2_rec in zip(llvm_lines, rdna2_insns):
             llvm_op = llvm_line.split()[0].lower()
@@ -130,6 +158,57 @@ class TestRdna2Extractor(unittest.TestCase):
             self.assertEqual(manifest["shaders"][0]["native_size"], len(known_code))
             self.assertEqual(manifest["shaders"][0]["stage"], "pixel")
 
+    def test_duplicate_record_names(self):
+        """Verify that duplicate record names produce distinct files without overwriting."""
+        code_1 = bytes.fromhex("000080bf 000081bf")  # s_nop 0, s_endpgm
+        code_2 = bytes.fromhex("000082be 000081bf")  # s_mov_b32, s_endpgm
+        record_1 = envelope(code_1, b"PS_DuplicateName")
+        record_2 = envelope(code_2, b"PS_DuplicateName")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "dups.rpf"
+            archive.write_bytes(b"RPF\0" + record_1 + record_2)
+
+            output_dir = tmp_path / "extracted_dups"
+            out_path, manifest_file = extract_shaders(archive, output_dir, target_stages={"pixel"})
+
+            file_1 = out_path / "pixel" / "PS_DuplicateName.bin"
+            file_2 = out_path / "pixel" / "PS_DuplicateName_1.bin"
+
+            self.assertTrue(file_1.is_file(), "First duplicate shader file not found")
+            self.assertTrue(file_2.is_file(), "Second duplicate disambiguated file not found")
+
+            self.assertEqual(file_1.read_bytes(), code_1)
+            self.assertEqual(file_2.read_bytes(), code_2)
+
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 2)
+            self.assertEqual(manifest["shaders"][0]["native_file"], "pixel/PS_DuplicateName.bin")
+            self.assertEqual(manifest["shaders"][1]["native_file"], "pixel/PS_DuplicateName_1.bin")
+            self.assertNotEqual(manifest["shaders"][0]["sha256"], manifest["shaders"][1]["sha256"])
+
+    def test_cli_extraction(self):
+        """Invoke extractor via its actual CLI entry point on synthetic fixture."""
+        known_code = bytes.fromhex("000080bf 000081bf")
+        record = envelope(known_code, b"PS_CliTest")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "cli_shaders.rpf"
+            archive.write_bytes(b"RPF_MAGIC\0" + record)
+            output_dir = tmp_path / "cli_out"
+            script = Path(__file__).resolve().parents[1] / "tools" / "extract_shaders.py"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), str(archive), "--output-dir", str(output_dir), "--stage", "pixel"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(res.returncode, 0)
+            self.assertTrue((output_dir / "pixel" / "PS_CliTest.bin").is_file())
+            self.assertEqual((output_dir / "pixel" / "PS_CliTest.bin").read_bytes(), known_code)
+            self.assertTrue((output_dir / "manifest.json").is_file())
+
     def test_stage_filtering(self):
         known_code = bytes.fromhex("000080bf 000081bf")
         record = envelope(known_code, b"PS_PixelOnly")
@@ -140,7 +219,6 @@ class TestRdna2Extractor(unittest.TestCase):
             archive.write_bytes(b"HEADER\0" + record)
 
             output_dir = tmp_path / "extracted_compute"
-            # Requesting only compute shaders when the fixture is a pixel shader
             out_path, manifest_file = extract_shaders(archive, output_dir, target_stages={"compute"})
             manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
             self.assertEqual(manifest["total_extracted"], 0)
@@ -211,6 +289,49 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(res["translator_accepted"])
         self.assertEqual(res["compatibility_category"], "unsupported_opcodes")
         self.assertIn("v_imaginary_opcode_xyz", res["unsupported_opcodes"])
+
+    def test_cli_scanner(self):
+        """Invoke scanner via its actual CLI entry point on synthetic assembly file."""
+        canonical_shader = "\n".join([
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            shader_file = tmp_path / "canonical.s"
+            shader_file.write_text(canonical_shader, encoding="utf-8")
+            out_dir = tmp_path / "scan_reports"
+            script = Path(__file__).resolve().parents[1] / "tools" / "scan_unsupported_shaders.py"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), str(shader_file), "--output-dir", str(out_dir)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(res.returncode, 0)
+            self.assertIn("SCAN RESULTS SUMMARY", res.stdout)
+            self.assertIn("Full Shaders Accepted by Translator:       1", res.stdout)
+            self.assertTrue((out_dir / "shader_scan_report.json").is_file())
+            self.assertTrue((out_dir / "shader_scan_report.md").is_file())
 
     def test_report_generation(self):
         canonical_shader = [
