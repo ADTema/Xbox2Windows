@@ -254,13 +254,15 @@ def check_controls(directory):
     for wave64 in (False, True):
         program = select(wave64)
         mask = "s[52:53]" if wave64 else "s52"
+        absolute_compare = [line.replace("v13, s45", "v13, |v12|") for line in program]
+        assert "abs(" in translate(absolute_compare)
         pos = program.index(f"v_cndmask_b32_e64 v13, v13, s46, {mask}")
         must_reject(translate, program[:pos] + ["s_mov_b32 s52, 0"] + program[pos:])
         for old, new in ((f"s46, {mask}", "s46, s[53:54]" if wave64 else "s46, s50"),
                          ("v_cmp_eq_f32_e32", "v_cmp_class_f32_e32"),
                          ("v_cmp_ge_f32_e64", "v_cmpx_ge_f32_e64"),
                          (f"v_cmp_ge_f32_e64 {mask}", "v_cmp_ge_f32_e64 " + ("s[56:57]" if wave64 else "s56")),
-                         ("v13, s45", "v13, |v12|"),
+                         ("v13, s45", "v13, |v12"),
                          ("v15, s47, v15", "v15, s50, v15")):
             changed = [line.replace(old, new) for line in program]
             assert changed != program
