@@ -14,7 +14,9 @@ SAVED = {reg: f"saved_{reg}" for reg in (R.RBX, R.RBP, R.RDI, R.RSI, R.R12, R.R1
 GPRS = set(SAVED) | {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 
 
-def translate(image, name, partial=False):
+def translate(image, name, partial=False, callback_offset=None):
+    if callback_offset is not None and (not 0 <= callback_offset <= 0x7fffffff or callback_offset % 8):
+        raise ValueError("callback slot must be a nonnegative aligned table offset")
     with pefile.PE(str(image), fast_load=True) as pe:
         entry = export_rva(pe, name)
         ranges = function_ranges(pe, entry)
@@ -95,6 +97,21 @@ def translate(image, name, partial=False):
                 returns.append(ip)
                 lines.extend([indent + f"*output = {regs[R.RAX]};", indent + "return 1;"])
                 return
+            elif (code == Code.CALL_RM64 and callback_offset is not None
+                  and ins.op0_kind == OpKind.MEMORY and simple and base in regs
+                  and regs[base] not in SAVED.values() and disp == callback_offset):
+                if (sp > -40 or (sp + 8) % 16 or
+                        any(regs.get(r) in (None, *SAVED.values()) for r in (R.RCX, R.RDX))):
+                    raise ValueError(f"unknown callback arguments or invalid call frame at {ip:#x}")
+                table = regs[base]
+                lines.extend([
+                    indent + f"if (!binding || !binding->target || !binding->table || binding->table != {table}) return 0;",
+                    indent + f"if (read_word(binding->table + {disp}ull) != reinterpret_cast<word>(binding->target)) return 0;",
+                    indent + f"const word call_{ip:x} = binding->target({regs[R.RCX]}, {regs[R.RDX]});",
+                ])
+                regs = {r: v for r, v in regs.items() if r in SAVED}
+                regs[R.RAX] = f"call_{ip:x}"
+                stack = {k: v for k, v in stack.items() if not sp <= k < sp + 32}
             elif code == Code.CALL_RM64 and partial:
                 stops.add(ip)
                 lines.append(indent + "return 0;")
@@ -112,7 +129,13 @@ static word read_word(word address) {
     std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
     return value;
 }
-extern "C" __declspec(dllexport) word try_lifted(word first, word second, word* output) {
+"""
+    if callback_offset is None:
+        source += 'extern "C" __declspec(dllexport) word try_lifted(word first, word second, word* output) {\n'
+    else:
+        source += """using Callback = word (*)(word, word);
+struct CallbackBinding { word table; Callback target; };
+extern "C" __declspec(dllexport) word try_lifted_callback(word first, word second, word* output, const CallbackBinding* binding) {
 """
     return source + "\n".join(lines) + "\n}\n", ranges, returns, stops
 
@@ -123,9 +146,11 @@ if __name__ == "__main__":
     parser.add_argument("export")
     parser.add_argument("output", type=Path)
     parser.add_argument("--partial", action="store_true", help="return status 0 at an indirect call")
+    parser.add_argument("--callback-offset", type=lambda s: int(s, 0),
+                        help="bind a table slot with a known Windows x64 word(word, word) callback ABI")
     args = parser.parse_args()
     try:
-        source, ranges, returns, stops = translate(args.image, args.export, args.partial)
+        source, ranges, returns, stops = translate(args.image, args.export, args.partial, args.callback_offset)
         args.output.write_text(source, encoding="utf-8")
         print(f"{len(ranges)} owned ranges, {len(returns)} return paths, indirect stops: {sorted(stops)}")
     except (ValueError, OSError, pefile.PEFormatError) as error:
