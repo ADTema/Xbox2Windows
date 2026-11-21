@@ -136,6 +136,17 @@ def with_constants(body):
     return program
 
 
+def with_scalar_constant_reads() -> list[str]:
+    program = with_constants(["v_mov_b32_e32 v12, s61", "v_mov_b32_e32 v13, s62", "v_mov_b32_e32 v14, s63"])
+    load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc")
+    program[load:load + 1] = [
+        "s_buffer_load_dword s61, s[44:47], null",
+        "s_buffer_load_dword s62, s[44:47], 0x8",
+        "s_buffer_load_dword s63, s[44:47], 0xfc",
+    ]
+    return program
+
+
 def curve():
     return with_constants([
         "v_max_f32_e32 v18, s46, v12",
@@ -418,8 +429,34 @@ def check_constant_descriptor_bounds() -> None:
                 raise AssertionError(f"Constant descriptor at {offset} overlaps texture 0")
 
 
+def check_scalar_constant_reads() -> None:
+    program = with_scalar_constant_reads()
+    source = translate(program)
+    for field in ("params[0].x", "params[0].z", "params[15].w"):
+        assert f"= {field};" in source
+
+    load = "s_buffer_load_dword s62, s[44:47], 0x8"
+    for bad in (load.replace("0x8", "0x9"), load.replace("0x8", "0x100"), load.replace("0x8", "s60"),
+                load.replace("s[44:47]", "s[28:31]"), load.replace("s[44:47]", "s[44:46]")):
+        must_reject(translate, [bad if line == load else line for line in program])
+
+    first = program.index("s_buffer_load_dword s61, s[44:47], null")
+    wait = program.index("s_waitcnt lgkmcnt(0)", first)
+    descriptor = program.index("s_load_dwordx4 s[44:47], s[20:21], 0x40")
+    must_reject(translate, program[:descriptor + 1] + [load] + program[descriptor + 1:])
+    must_reject(translate, program[:wait] + program[wait + 1:])  # Result read before the wait.
+    must_reject(translate, program[:wait] + [load] + program[wait:])  # Outstanding write to the same SGPR.
+    must_reject(translate, program[:first] + ["s_mov_b32 s46, 0"] + program[first:])
+    must_reject(translate, [line.replace("s[44:47]", "s[46:49]") for line in program])
+
+    alias = [line.replace("s63", "s46") for line in program]
+    assert translate(alias) == source
+    must_reject(translate, alias[:wait + 1] + [load] + alias[wait + 1:])
+
+
 def check_controls(directory):
     check_constant_descriptor_bounds()
+    check_scalar_constant_reads()
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     record = envelope(code)
@@ -534,7 +571,7 @@ def check_controls(directory):
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
-                (arithmetic(), translate)]
+                (arithmetic(), translate), (with_scalar_constant_reads(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
@@ -579,6 +616,25 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapped subtraction operands escaped detection")
+
+    program = with_scalar_constant_reads()
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    case = directory / "scalar-constants.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for red, green, blue in ((.25, -.5, .75), (-.125, .625, .875)):
+        constants = bytearray(256)
+        for offset, value in ((0, red), (8, green), (252, blue)):
+            struct.pack_into("<f", constants, offset, value)
+        case.write_bytes(constants + struct.pack("<4f", red, green, blue, 1) * 64)
+        subprocess.run(draw, check=True)
+    wrong_word = [line.replace("s62, s[44:47], 0x8", "s62, s[44:47], 0x4") for line in program]
+    source.write_text(translate(wrong_word), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Reading the neighboring constant word escaped detection")
+
     for program_fn, case_fn in ((curve, curve_case), (shaping, shaping_case)):
         source.write_text(translate(program_fn()), encoding="ascii")
         subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
