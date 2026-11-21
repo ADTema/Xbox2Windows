@@ -33,6 +33,16 @@ void check(HRESULT hr, const char* stage)
     }
 }
 
+HRESULT check_feature(ID3D12Device* device, D3D12_FEATURE feature, void* data, UINT size)
+{
+#if defined(OFFSCREEN_AGILITY_620) && defined(__ID3D12Device16_INTERFACE_DEFINED__)
+    ComPtr<ID3D12Device16> versioned;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&versioned))))
+        return versioned->CheckFeatureSupport1(feature, data, size, D3D12SDKVersion);
+#endif
+    return device->CheckFeatureSupport(feature, data, size);
+}
+
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
     const size_t length = std::wcslen(part);
@@ -341,7 +351,7 @@ bool needs_cs_6_5(std::string_view operation)
 bool supports_cs_6_5(ID3D12Device* device)
 {
     D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_5};
-    check(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query fixture shader model");
+    check(check_feature(device, D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query fixture shader model");
     std::printf("shader_model_capped_at_6_5=0x%x\n", model.HighestShaderModel);
     return model.HighestShaderModel >= D3D_SHADER_MODEL_6_5;
 }

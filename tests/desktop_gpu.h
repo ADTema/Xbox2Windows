@@ -3,6 +3,9 @@
 #include <wrl/client.h>
 
 void check(HRESULT hr, const char* stage);
+// CheckFeatureSupport, routed through ID3D12Device16::CheckFeatureSupport1 with the app-local Agility
+// SDK version when one is configured. The debug layer reports D3D12 989 for the unversioned call there.
+HRESULT check_feature(ID3D12Device* device, D3D12_FEATURE feature, void* data, UINT size);
 Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc,
     D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear = nullptr);
 void check_compute(ID3D12Device* device, bool tables);

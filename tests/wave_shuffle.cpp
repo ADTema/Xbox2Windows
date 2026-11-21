@@ -74,8 +74,8 @@ bool check_wave_shuffle(ID3D12Device* device)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 caps{};
     D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
-    check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &caps, sizeof(caps)), "Query wave range");
-    check(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query wave shader model");
+    check(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS1, &caps, sizeof(caps)), "Query wave range");
+    check(check_feature(device, D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query wave shader model");
     std::printf("native_lane_range=%u..%u shader_model_capped_at_6_6=0x%x\n",
                 caps.WaveLaneCountMin, caps.WaveLaneCountMax, model.HighestShaderModel);
     // The native variant is cs_6_5 like the other dynamic-shuffle fixtures. The Windows 10 in-box WARP
