@@ -620,6 +620,10 @@ def lift(pe, name):
             raise ValueError(f"undefined register {NAMES[min(missing)]} at RVA {ip:#x}")
 
     labels = set(edges)
+    if order[0] != entry:
+        # Emission follows address order. Code that the function reaches below its entry
+        # comes first in the text, so execution has to start with a jump to the entry.
+        labels.add(entry)
     for position, ip in enumerate(order):
         ins = instructions[ip]
         following = order[position + 1] if position + 1 < len(order) else None
@@ -629,7 +633,7 @@ def lift(pe, name):
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
     if lifter.flags:
         declarations.append("word fa = 0, fb = 0;")
-    text = []
+    text = [f"    goto loc_{entry:x};"] if order[0] != entry else []
     for position, ip in enumerate(order):
         if ip in labels:
             text.append(f"loc_{ip:x}:")
