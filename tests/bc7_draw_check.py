@@ -1,4 +1,4 @@
-"""Draw an original tiled BC7 mode-6 fixture with the translated copy program."""
+"""Draw source-built BC7 blocks and tiled mode-6 mip levels with the translated copy program."""
 from pathlib import Path
 import struct
 import subprocess
@@ -55,6 +55,23 @@ def fixture(columns=20, rows=18):
     return struct.pack("<4sII", b"BC7C", width, height), converted, expected
 
 
+def check_all_modes(work: Path, renderer: str, backend: str, shader: Path) -> None:
+    case = work / "all-modes.case"
+    generator = Path(__file__).resolve().parents[1] / "tools" / "bc7_blocks.py"
+    subprocess.run([sys.executable, "-B", generator, case], check=True)
+    draw = [renderer, backend, "--check-bc7", shader, case]
+    subprocess.run(draw, check=True)
+
+    # The first eight blocks cycle through modes 0-7. Flip the low rotation bit
+    # of the mode-4 block so its red and alpha channels swap at pixel (16, 0).
+    changed = bytearray(case.read_bytes())
+    changed[struct.calcsize("<4sII") + 4 * 16] ^= 1 << 5
+    case.write_bytes(changed)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch x=16 y=0" not in wrong.stderr.splitlines():
+        raise AssertionError(f"Expected a mode-4 rotation mismatch at (16, 0): {wrong.stderr}")
+
+
 def main():
     compiler, renderer, backend = sys.argv[1:]
     with tempfile.TemporaryDirectory() as directory:
@@ -70,6 +87,7 @@ def main():
         if result.returncode:
             return result.returncode
         assert output.read_bytes() == expected
+        check_all_modes(work, renderer, backend, shader)
         lower = work / "mip1.case"
         header, rows, expected = fixture(10, 9)
         lower.write_bytes(header + rows + expected)
