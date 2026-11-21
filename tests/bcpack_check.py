@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from bc7_tiles import linearize_4k_s_tail
-from bcpack_probe import probe
+from bcpack_probe import probe, scan_lanes
 
 
 class TextureChecks(unittest.TestCase):
@@ -52,6 +52,32 @@ class TextureChecks(unittest.TestCase):
         self.assertFalse(probe(prefix, 11358))
         with self.assertRaises(ValueError):
             probe(prefix[:-1], 2)
+
+    def test_contiguous_six_byte_lanes(self):
+        prefix = bytearray(48)
+        prefix[24:30] = bytes.fromhex("de 03 01 00 40 02")
+        result, = probe(prefix, 2, lane_stride=6)
+        self.assertEqual((result["lane"], result["status"]), (4, "verified_constant_lane"))
+        # The same bytes are not a valid lane in the default interleaved layout.
+        self.assertFalse(probe(prefix, 2))
+        with self.assertRaises(ValueError):
+            probe(prefix, 2, lane_stride=7)
+
+    def test_scan_lanes(self):
+        records = [bytes(6) for _ in range(8)]
+        records[1] = bytes([0x7b, 0x3b, 0x03, 0x03, 0x00, 0x00])
+        prefix = b"".join(records)
+        scan = scan_lanes(prefix, lane_stride=6)
+        self.assertEqual(len(scan), 8)
+        self.assertEqual((scan[1]["mode"], scan[1]["budget"]), (0x7b, 0x3b))
+        self.assertEqual(scan[1]["state"], "03030000")
+        self.assertFalse(scan[1]["known_constant_mode"])
+        known = scan_lanes(bytes.fromhex("de 03 01 00 40 02") + bytes(42), lane_stride=6)
+        self.assertTrue(known[0]["known_constant_mode"])
+        with self.assertRaises(ValueError):
+            scan_lanes(prefix[:-1], lane_stride=6)
+        with self.assertRaises(ValueError):
+            scan_lanes(prefix, lane_stride=7)
 
     def test_packed_tail_slots(self):
         tile = b"".join(struct.pack("<4I", *([index] * 4)) for index in range(256))
