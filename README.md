@@ -1,12 +1,12 @@
 # Xbox2Windows
 
-Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) software for x64 Windows**, using Grand Theft Auto VI as its case study. The CPU experiment translates a source-built x64 leaf function from PE machine code through C++ to a new Windows DLL. The shader experiment translates selected gfx1013 pixel shaders through HLSL to desktop DXIL. Other experiments test the Windows runtime, render recovered texture levels and read script state data. Title CPU code execution, full-game startup and frame rate remain unverified.
+Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) software for x64 Windows**, using Grand Theft Auto VI as its case study. The CPU experiments translate source-built x64 functions from PE machine code through C++ to new Windows DLLs, including a direct call between two functions. The shader experiment translates selected gfx1013 pixel shaders through HLSL to desktop DXIL. Other experiments test the Windows runtime, render recovered texture levels and read script state data. Title CPU code execution, full-game startup and frame rate remain unverified.
 
 ## Current results and open work
 
 | Area | Result on Windows | Open question or contribution |
 |---|---|---|
-| CPU translation | Both branches of a source-built integer function match the original on return value and guarded memory output, including unsigned wraparound. [CPU leaf experiment](docs/experiments.md#offline-cpu-leaf-recompilation) | Extend the differential check across a direct call. [Issue #22](https://github.com/R0Y00/Xbox2Windows/issues/22) |
+| CPU translation | Both branches of a [leaf function](docs/experiments.md#offline-cpu-leaf-recompilation) match the original. A [direct call](docs/experiments.md#recompiling-a-direct-x64-call) also matches on arguments, guarded writes, RBX/RSI preservation and returns. | Verify a call through a PE import. [Issue #24](https://github.com/R0Y00/Xbox2Windows/issues/24) |
 | Shader translation | Supported pixel programs sample a texture, read constants and export color. D3D12 readback is checked against a CPU reference. [Translation and bindings](docs/experiments.md#offline-pixel-shader-recompilation) | Supply a source-built instruction case with known register inputs and an expected color. |
 | BC7 textures | A translated shader samples recovered mip levels on hardware and WARP. Requests for missing high-resolution levels use the first resident level. [Mip fallback tests](docs/experiments.md#drawing-bc7-textures-with-a-recompiled-pixel-shader) | Match a variable BCPack lane against independently known BC7 blocks. [Issue #15](https://github.com/R0Y00/Xbox2Windows/issues/15) |
 | Script states | A native x64 probe follows state-tree links and reproduces distinct camera limits for front and rear selections. The replay supplies the selection requests. [State replay](docs/experiments.md#state-linked-settings-in-a-script-archive) | Identify an event or caller that supplies a context and state ID, with a control input that takes a different branch. [Issue #19](https://github.com/R0Y00/Xbox2Windows/issues/19) |
@@ -60,7 +60,7 @@ ctest --preset dev --no-tests=error
 
 | Area | A contribution you can verify | Focused CTest command |
 |---|---|---|
-| Static CPU recompilation | Check both paths of an x64 leaf function against the original DLL and an inverted-branch control. | `ctest --preset dev --no-tests=error -R '^cpu_leaf_aot_branches$' -V` |
+| Static CPU recompilation | Compare an x64 leaf and a caller/callee pair with their original DLLs and negative controls. | `ctest --preset dev --no-tests=error -R '^cpu_' -V` |
 | Script states | Reproduce a parent/child lookup, an ambiguous selection or a damaged sibling link with a synthetic tree. | `ctest --preset dev --no-tests=error -R '^script_(state_literals\|path_links)$' -V` |
 | Texture recovery | Check a packed mip tail, a first refill byte, or a resident mip drawn on the software adapter. | `ctest --preset dev --no-tests=error -R '^(bcpack_prefix_and_mip_tail\|bc7_draw_warp)$' -V` |
 | Static shader recompilation | Translate the single-texture pixel shader fixtures to desktop DXIL and check every output channel. [Supported instructions and bindings](docs/experiments.md#offline-pixel-shader-recompilation) | `ctest --preset dev -R '^pixel_aot_' -V` |
