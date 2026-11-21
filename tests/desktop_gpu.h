@@ -29,6 +29,7 @@ bool check_bvh_differential(ID3D12Device* device);
 bool check_bvh_waves(ID3D12Device* device, bool force64);
 bool check_gpu_alias(ID3D12Device* device);
 bool check_gpu_alias_lookup(ID3D12Device* device);
+bool check_gpu_alias_lookup_writes(ID3D12Device* device);
 bool check_wave_shuffle(ID3D12Device* device);
 bool check_ray_query(ID3D12Device* device);
 bool check_dxr_update(ID3D12Device* device);

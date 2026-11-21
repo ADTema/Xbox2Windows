@@ -1,17 +1,22 @@
 // Four title allocations (three era_heap graphics allocations and one placed across a 4 GiB line)
-// opened as D3D12 heaps (era_gpu_alias), packed for the shader
-// lookup (era_title_va::shader_ranges), and read by a compute shader through 64-bit title
-// addresses taken from an input buffer (src/title_va_lookup.hlsli). Expected values come from
-// the CPU through the title pointers.
+// opened as D3D12 heaps (era_gpu_alias) and packed for the shader lookup
+// (era_title_va::shader_ranges, src/title_va_lookup.hlsli). Compute shaders take 64-bit title
+// addresses from an input buffer and load (check_gpu_alias_lookup) or store and update with
+// atomics (check_gpu_alias_lookup_writes) through them. Expected values come from the CPU
+// through the title pointers.
 #include "bvh_fixture.h"
 #include "era_gpu_alias.h"
 #include "era_heap.h"
 #include "era_title_va.h"
 #include "LookupTitleAddresses.h"
+#include "WriteTitleAddresses.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -22,10 +27,9 @@ namespace {
 // XALLOC_ATTRIBUTES: memoryType 1 (graphics), pageSize 1 (64 KB), alignment 16 (64 KB).
 constexpr std::uint64_t graphics_64k = (1ull << 29) | (1ull << 14) | (16ull << 24);
 constexpr std::array<std::size_t, 3> sizes{256 * 1024, 64 * 1024, 128 * 1024};
-constexpr UINT descriptor_count = 8;  // matches Aliases[8] in tests/gpu_alias_lookup.hlsl
-constexpr Word miss = 0xdeadbeef;
-
 constexpr std::size_t straddle_bytes = 128 * 1024;
+constexpr UINT descriptor_count = 8;  // matches Aliases[8] in the shaders
+constexpr Word miss = 0xdeadbeef;
 
 struct TitleAllocation {
     explicit TitleAllocation(std::size_t bytes) : base(era_heap::allocate(bytes, graphics_64k)), size(bytes) {}
@@ -47,6 +51,7 @@ struct TitleAllocation {
     }
     TitleAllocation(const TitleAllocation&) = delete;
     TitleAllocation& operator=(const TitleAllocation&) = delete;
+    std::uint64_t begin() const { return reinterpret_cast<std::uint64_t>(base); }
     void* base;
     std::size_t size;
     bool placed = false;
@@ -56,46 +61,140 @@ Word pattern(std::size_t allocation, std::size_t offset)
 {
     return static_cast<Word>((allocation + 1) * 0x01000193u ^ (offset * 2654435761u));
 }
+
+Word& word_at(std::uint64_t address) { return *reinterpret_cast<Word*>(address); }
+
+// The allocations, their aliases and table, the packed ranges and a descriptor table whose slot
+// i holds a raw UAV of the alias of ranges[i].
+struct AliasFixture {
+    std::vector<std::unique_ptr<TitleAllocation>> titles;
+    std::vector<era_gpu_alias::Alias> aliases;
+    era_title_va::Table table;
+    std::vector<era_title_va::Range> ranges;
+    std::vector<era_title_va::ShaderRange> packed;
+    ComPtr<ID3D12DescriptorHeap> heap;
+
+    // Returns false when the adapter does not support existing heaps.
+    bool open(ID3D12Device* device)
+    {
+        for (const auto bytes : sizes) titles.push_back(std::make_unique<TitleAllocation>(bytes));
+        titles.push_back(std::make_unique<TitleAllocation>());
+        aliases.resize(titles.size());
+        for (std::size_t a = 0; a < titles.size(); ++a) {
+            auto* base = static_cast<unsigned char*>(titles[a]->base);
+            if (!base) throw std::runtime_error("title allocation failed");
+            const HRESULT hr = era_gpu_alias::open(device, base, titles[a]->size, aliases[a]);
+            if (hr == E_NOTIMPL) {
+                std::puts("existing heaps are not supported by this adapter");
+                return false;
+            }
+            check(hr, "Open a title allocation as a D3D12 heap");
+            if (!table.add(titles[a]->begin(), titles[a]->size, aliases[a].buffer->GetGPUVirtualAddress()))
+                throw std::runtime_error("table rejected an alias");
+            for (std::size_t offset = 0; offset < titles[a]->size; offset += sizeof(Word))
+                *reinterpret_cast<Word*>(base + offset) = pattern(a, offset);
+        }
+        ranges = table.ranges();
+        if (!era_title_va::shader_ranges(ranges, packed)) throw std::runtime_error("shader_ranges rejected the table");
+        if ((line() & 0xffffffffull) != 0) throw std::runtime_error("placed allocation does not straddle a 4 GiB line");
+
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptor_count,
+                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "Create lookup descriptor heap");
+        const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        for (UINT slot = 0; slot < descriptor_count; ++slot) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+            view.Format = DXGI_FORMAT_R32_TYPELESS;
+            view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            ID3D12Resource* resource = nullptr;
+            if (slot < ranges.size()) {
+                const auto a = allocation_of(ranges[slot].title_begin);
+                resource = aliases[a].buffer.Get();
+                view.Buffer.NumElements = static_cast<UINT>(titles[a]->size / sizeof(Word));
+            }
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr += static_cast<SIZE_T>(slot) * stride;
+            device->CreateUnorderedAccessView(resource, nullptr, &view, cpu);
+        }
+        return true;
+    }
+
+    std::size_t allocation_of(std::uint64_t title_begin) const
+    {
+        for (std::size_t a = 0; a < titles.size(); ++a)
+            if (titles[a]->begin() == title_begin) return a;
+        throw std::runtime_error("range without an allocation");
+    }
+
+    // The 4 GiB line inside the placed allocation.
+    std::uint64_t line() const { return titles.back()->begin() + straddle_bytes / 2; }
+
+    // Slot + 1 of the range holding [address, address + 4), or 0.
+    Word slot_of(std::uint64_t address) const
+    {
+        if (!table.translate(address, sizeof(Word))) return 0;
+        for (std::size_t slot = 0; slot < ranges.size(); ++slot)
+            if (address >= ranges[slot].title_begin && address < ranges[slot].title_end)
+                return static_cast<Word>(slot + 1);
+        return 0;
+    }
+
+    // Runs `kernel` once per record and returns the results buffer's words.
+    template<class Record>
+    std::vector<Word> run(ID3D12Device* device, const Kernel& kernel, const std::vector<Record>& records,
+                          std::size_t result_words)
+    {
+        auto range_buffer = upload(device, packed);
+        auto record_buffer = upload(device, records);
+        const std::size_t result_bytes = result_words * sizeof(Word);
+        auto results = make_buffer(device, result_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto back = make_buffer(device, result_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        ComputeCommands cmd(device, kernel.pipeline.Get());
+        auto* list = cmd.list.Get();
+        for (auto& alias : aliases)
+            transition(list, alias.buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(list, results.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap* heaps[] = {heap.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetComputeRootSignature(kernel.root.Get());
+        list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+        list->SetComputeRootShaderResourceView(1, range_buffer->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(2, record_buffer->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(3, results->GetGPUVirtualAddress());
+        const auto record_count = static_cast<UINT>(records.size());
+        list->SetComputeRoot32BitConstant(4, static_cast<UINT>(packed.size()), 0);
+        list->SetComputeRoot32BitConstant(4, record_count, 1);
+        list->Dispatch((record_count + 63) / 64, 1, 1);
+        for (auto& alias : aliases)
+            transition(list, alias.buffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        transition(list, results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(back.Get(), 0, results.Get(), 0, result_bytes);
+        cmd.submit_and_wait(device);
+        return read(back.Get(), result_words);
+    }
+};
+
+Word float_bits(float value)
+{
+    Word bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
 }
 
 bool check_gpu_alias_lookup(ID3D12Device* device)
 {
-    std::vector<std::unique_ptr<TitleAllocation>> titles;
-    for (const auto bytes : sizes) titles.push_back(std::make_unique<TitleAllocation>(bytes));
-    titles.push_back(std::make_unique<TitleAllocation>());
-    std::vector<era_gpu_alias::Alias> aliases(titles.size());
-    era_title_va::Table table;
-    for (std::size_t a = 0; a < titles.size(); ++a) {
-        auto* base = static_cast<unsigned char*>(titles[a]->base);
-        if (!base) throw std::runtime_error("title allocation failed");
-        const HRESULT hr = era_gpu_alias::open(device, base, titles[a]->size, aliases[a]);
-        if (hr == E_NOTIMPL) {
-            std::puts("existing heaps are not supported by this adapter");
-            return false;
-        }
-        check(hr, "Open a title allocation as a D3D12 heap");
-        if (!table.add(reinterpret_cast<std::uint64_t>(base), titles[a]->size,
-                       aliases[a].buffer->GetGPUVirtualAddress()))
-            throw std::runtime_error("table rejected an alias");
-        for (std::size_t offset = 0; offset < titles[a]->size; offset += sizeof(Word))
-            *reinterpret_cast<Word*>(base + offset) = pattern(a, offset);
-    }
-
-    const auto ranges = table.ranges();
-    std::vector<era_title_va::ShaderRange> packed;
-    if (!era_title_va::shader_ranges(ranges, packed)) throw std::runtime_error("shader_ranges rejected the table");
-    // Slot i of the descriptor table holds the alias of ranges[i].
-    std::vector<std::size_t> slot_allocation(ranges.size());
-    for (std::size_t slot = 0; slot < ranges.size(); ++slot)
-        for (std::size_t a = 0; a < titles.size(); ++a)
-            if (reinterpret_cast<std::uint64_t>(titles[a]->base) == ranges[slot].title_begin) slot_allocation[slot] = a;
+    AliasFixture fixture;
+    if (!fixture.open(device)) return false;
 
     // Records: start, second word, middle words, last word and the words just outside each
     // allocation (outside words count as hits only if another allocation happens to be there),
     // plus the null page and an address with a high 32-bit word above any user address.
     std::vector<std::uint64_t> records;
-    for (const auto& title : titles) {
-        const auto begin = reinterpret_cast<std::uint64_t>(title->base);
+    for (const auto& title : fixture.titles) {
+        const auto begin = title->begin();
         for (std::uint64_t offset : {std::uint64_t{0}, std::uint64_t{4}, title->size / 2, title->size / 2 + 0x124,
                                      title->size - 4})
             records.push_back(begin + offset);
@@ -105,8 +204,7 @@ bool check_gpu_alias_lookup(ID3D12Device* device)
     }
     // Around the 4 GiB line inside the placed allocation, and the same low words one 4 GiB
     // above and below, which only a full 64-bit comparison rejects.
-    const auto line = reinterpret_cast<std::uint64_t>(titles.back()->base) + straddle_bytes / 2;
-    if ((line & 0xffffffffull) != 0) throw std::runtime_error("placed allocation does not straddle a 4 GiB line");
+    const auto line = fixture.line();
     for (std::uint64_t address : {line - 8, line - 4, line, line + 4, line + 0x1234}) {
         records.push_back(address);
         records.push_back(address + (1ull << 32));
@@ -114,83 +212,118 @@ bool check_gpu_alias_lookup(ID3D12Device* device)
     }
     records.push_back(0x10);
     records.push_back(0xfffffffffffffff0ull);
-    const auto record_count = static_cast<Word>(records.size());
 
     // Expected results from the CPU through the title pointers.
     std::vector<Word> expected(records.size() * 2);
     Word hits = 0, misses = 0;
     for (std::size_t r = 0; r < records.size(); ++r) {
-        expected[r * 2] = miss;
-        expected[r * 2 + 1] = 0;
-        if (!table.translate(records[r], sizeof(Word))) {
-            ++misses;
-            continue;
-        }
-        for (std::size_t slot = 0; slot < ranges.size(); ++slot) {
-            if (records[r] >= ranges[slot].title_begin && records[r] < ranges[slot].title_end) {
-                expected[r * 2] = *reinterpret_cast<const Word*>(records[r]);
-                expected[r * 2 + 1] = static_cast<Word>(slot + 1);
-            }
-        }
-        ++hits;
+        const Word slot = fixture.slot_of(records[r]);
+        expected[r * 2] = slot ? word_at(records[r]) : miss;
+        expected[r * 2 + 1] = slot;
+        ++(slot ? hits : misses);
     }
     if (misses < 12) throw std::runtime_error("fixture needs the twelve guaranteed misses");
 
-    ComPtr<ID3D12DescriptorHeap> heap;
-    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptor_count,
-                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "Create lookup descriptor heap");
-    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    for (UINT slot = 0; slot < descriptor_count; ++slot) {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-        view.Format = DXGI_FORMAT_R32_TYPELESS;
-        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-        ID3D12Resource* resource = nullptr;
-        if (slot < ranges.size()) {
-            const auto a = slot_allocation[slot];
-            resource = aliases[a].buffer.Get();
-            view.Buffer.NumElements = static_cast<UINT>(titles[a]->size / sizeof(Word));
-        }
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
-        cpu.ptr += static_cast<SIZE_T>(slot) * stride;
-        device->CreateUnorderedAccessView(resource, nullptr, &view, cpu);
-    }
-
     Kernel kernel(device, {LookupTitleAddresses, sizeof(LookupTitleAddresses)});
-    auto range_buffer = upload(device, packed);
-    auto record_buffer = upload(device, records);
-    const std::size_t result_bytes = expected.size() * sizeof(Word);
-    auto results = make_buffer(device, result_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
-                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    auto back = make_buffer(device, result_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    ComputeCommands cmd(device, kernel.pipeline.Get());
-    auto* list = cmd.list.Get();
-    for (auto& alias : aliases)
-        transition(list, alias.buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    transition(list, results.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    ID3D12DescriptorHeap* heaps[] = {heap.Get()};
-    list->SetDescriptorHeaps(1, heaps);
-    list->SetComputeRootSignature(kernel.root.Get());
-    list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
-    list->SetComputeRootShaderResourceView(1, range_buffer->GetGPUVirtualAddress());
-    list->SetComputeRootShaderResourceView(2, record_buffer->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(3, results->GetGPUVirtualAddress());
-    list->SetComputeRoot32BitConstant(4, static_cast<UINT>(packed.size()), 0);
-    list->SetComputeRoot32BitConstant(4, record_count, 1);
-    list->Dispatch((record_count + 63) / 64, 1, 1);
-    for (auto& alias : aliases)
-        transition(list, alias.buffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-    transition(list, results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->CopyBufferRegion(back.Get(), 0, results.Get(), 0, result_bytes);
-    cmd.submit_and_wait(device);
-
-    const auto actual = read(back.Get(), expected.size());
+    const auto actual = fixture.run(device, kernel, records, expected.size());
     for (std::size_t r = 0; r < records.size(); ++r) {
         equal(actual[r * 2], expected[r * 2], static_cast<unsigned>(r), 0);
         equal(actual[r * 2 + 1], expected[r * 2 + 1], static_cast<unsigned>(r), 1);
     }
-    std::printf("gpu_alias_lookup ranges=%zu records=%u hits=%u misses=%u mismatches=0\n", packed.size(),
-                record_count, hits, misses);
+    std::printf("gpu_alias_lookup ranges=%zu records=%zu hits=%u misses=%u mismatches=0\n", fixture.packed.size(),
+                records.size(), hits, misses);
+    return true;
+}
+
+bool check_gpu_alias_lookup_writes(ID3D12Device* device)
+{
+    AliasFixture fixture;
+    if (!fixture.open(device)) return false;
+    enum : Word { Store = 0, Add = 1, Sub = 2, MinFloat = 3, MaxFloat = 4 };
+    struct Record {
+        std::uint64_t address;
+        Word operation;
+        Word operand;
+    };
+    static_assert(sizeof(Record) == 16);
+    std::vector<Record> records;
+
+    // Stores: words at the start, middle and end of every allocation and on both sides of the
+    // 4 GiB line. Neighbouring words keep their pattern.
+    std::vector<std::uint64_t> stored;
+    for (const auto& title : fixture.titles)
+        for (std::uint64_t offset : {std::uint64_t{0}, title->size / 2, title->size - 4})
+            stored.push_back(title->begin() + offset);
+    stored.push_back(fixture.line() - 4);
+    stored.push_back(fixture.line());
+    for (std::size_t i = 0; i < stored.size(); ++i)
+        records.push_back({stored[i], Store, 0x5100'0000u + static_cast<Word>(i)});
+
+    // Atomics: 256 threads each update one shared word per operation. The add and sub words sit
+    // in the second and third allocations; the float words straddle the 4 GiB line's neighbours.
+    constexpr Word contenders = 256;
+    const std::uint64_t add_word = fixture.titles[1]->begin() + 0x100;
+    const std::uint64_t sub_word = fixture.titles[2]->begin() + 0x200;
+    const std::uint64_t min_word = fixture.line() + 0x40;
+    const std::uint64_t max_word = fixture.line() - 0x40;
+    word_at(add_word) = 0;
+    word_at(sub_word) = 1'000'000;
+    word_at(min_word) = float_bits(std::numeric_limits<float>::infinity());
+    word_at(max_word) = float_bits(-std::numeric_limits<float>::infinity());
+    Word sum = 0;
+    float lowest = std::numeric_limits<float>::infinity();
+    float highest = -std::numeric_limits<float>::infinity();
+    for (Word i = 0; i < contenders; ++i) {
+        const Word value = (i * 7919u) % 1000u + 1;
+        const float number = static_cast<float>(static_cast<int>((i * 2654435761u) % 20001u) - 10000) / 8.0f;
+        records.push_back({add_word, Add, value});
+        records.push_back({sub_word, Sub, value});
+        records.push_back({min_word, MinFloat, float_bits(number)});
+        records.push_back({max_word, MaxFloat, float_bits(number)});
+        sum += value;
+        lowest = (std::min)(lowest, number);
+        highest = (std::max)(highest, number);
+    }
+    // Misses: stores to unmapped addresses must change nothing and report 0.
+    const std::uint64_t ghost = fixture.line() + 4 + (1ull << 32);
+    for (std::uint64_t address : {std::uint64_t{0x10}, 0xfffffffffffffff0ull, ghost})
+        records.push_back({address, Store, miss});
+
+    // Every word in every allocation, as the CPU expects it after the dispatch.
+    std::vector<std::vector<Word>> expected(fixture.titles.size());
+    for (std::size_t a = 0; a < fixture.titles.size(); ++a)
+        expected[a].assign(static_cast<const Word*>(fixture.titles[a]->base),
+                           static_cast<const Word*>(fixture.titles[a]->base) + fixture.titles[a]->size / 4);
+    const auto expect_word = [&](std::uint64_t address, Word value) {
+        for (std::size_t a = 0; a < fixture.titles.size(); ++a)
+            if (address >= fixture.titles[a]->begin() && address < fixture.titles[a]->begin() + fixture.titles[a]->size)
+                expected[a][(address - fixture.titles[a]->begin()) / 4] = value;
+    };
+    for (std::size_t i = 0; i < stored.size(); ++i) expect_word(stored[i], 0x5100'0000u + static_cast<Word>(i));
+    expect_word(add_word, sum);
+    expect_word(sub_word, 1'000'000 - sum);
+    expect_word(min_word, float_bits(lowest));
+    expect_word(max_word, float_bits(highest));
+    std::vector<Word> expected_results(records.size());
+    Word misses = 0;
+    for (std::size_t r = 0; r < records.size(); ++r) {
+        expected_results[r] = fixture.slot_of(records[r].address) ? 1 : 0;
+        misses += expected_results[r] ? 0 : 1;
+    }
+    if (misses != 3) throw std::runtime_error("fixture needs exactly the three miss records to miss");
+
+    Kernel kernel(device, {WriteTitleAddresses, sizeof(WriteTitleAddresses)});
+    const auto results = fixture.run(device, kernel, records, records.size());
+    for (std::size_t r = 0; r < records.size(); ++r) equal(results[r], expected_results[r], static_cast<unsigned>(r), 0);
+    // Read back through the title pointers: no copy of the aliased memory was made.
+    std::size_t words = 0;
+    for (std::size_t a = 0; a < fixture.titles.size(); ++a) {
+        const auto* actual = static_cast<const Word*>(fixture.titles[a]->base);
+        for (std::size_t w = 0; w < expected[a].size(); ++w, ++words)
+            equal(actual[w], expected[a][w], static_cast<unsigned>(a), static_cast<unsigned>(w));
+    }
+    std::printf("gpu_alias_lookup_writes ranges=%zu records=%zu stores=%zu contenders=%u sum=%u min=%g max=%g "
+                "misses=%u words_checked=%zu mismatches=0\n",
+                fixture.packed.size(), records.size(), stored.size(), contenders, sum, lowest, highest, misses, words);
     return true;
 }
