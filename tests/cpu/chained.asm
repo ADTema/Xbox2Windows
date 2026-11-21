@@ -25,6 +25,9 @@ ELSE
     mov rbx, [rsi]
     test rbx, rbx
     jz short empty_value
+IFDEF USE_XOR_ZERO
+    xor rdx, rdx
+ENDIF
     mov eax, 21
     jmp short finish_value
 ENDIF
@@ -36,7 +39,11 @@ neighbor PROC
 neighbor ENDP
 neighbor_end LABEL BYTE
 empty_value::
+IFDEF USE_XOR_ZERO
+    xor eax, eax
+ELSE
     mov eax, 7
+ENDIF
 finish_value::
     add rsp, 8
     pop rsi
