@@ -102,6 +102,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/resource_ranges_check.py
 ./out/pe-env/bin/python -B tests/script_state_check.py
 ./out/pe-env/bin/python -B tests/intake/paths_check.py
+./out/pe-env/bin/python -B tests/form_coverage_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support

@@ -1,4 +1,4 @@
-# 948 forms. Source: iced-x86 1.21.0 mnemonics, Zen 2 user-mode CPUID groups. Regenerate: tools/progress_reference.py
+# 948 forms. Source: iced-x86 1.21.0 mnemonics, Zen 2 user-mode CPUID groups. Regenerate: tools/form_reference.py
 AVX	vaddpd
 AVX	vaddps
 AVX	vaddsd

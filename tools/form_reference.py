@@ -1,6 +1,6 @@
-"""Regenerate the instruction reference lists in docs/progress/reference/ (rarely needed).
+"""Regenerate the instruction reference lists in docs/coverage/ (rarely needed).
 
-Usage: out/pe-env/Scripts/python.exe tools/progress_reference.py <llvm-docs-dir>
+Usage: out/pe-env/Scripts/python.exe tools/form_reference.py <llvm-docs-dir>
 
 <llvm-docs-dir> holds AMDGPUAsmGFX10.rst, AMDGPUAsmGFX1011.rst, AMDGPUAsmGFX1013.rst and
 AMDGPUAsmGFX1030.rst from llvm-project tag llvmorg-15.0.7, llvm/docs/AMDGPU/ (Apache-2.0 WITH
@@ -11,7 +11,7 @@ import re
 import sys
 from pathlib import Path
 
-OUT = Path(__file__).resolve().parents[1] / "docs" / "progress" / "reference"
+OUT = Path(__file__).resolve().parents[1] / "docs" / "coverage"
 LLVM_SOURCE = "llvm-project llvmorg-15.0.7 llvm/docs/AMDGPU/"
 
 # Xbox Series CPUs are AMD Zen 2. These iced CPUID groups are what Zen 2 runs in user mode; the group
@@ -76,7 +76,7 @@ def x64_forms():
 def write(name, source, forms):
     OUT.mkdir(parents=True, exist_ok=True)
     body = "".join(f"{g}\t{f}\n" for g, f in sorted(forms))
-    (OUT / name).write_text(f"# {len(forms)} forms. Source: {source}. Regenerate: tools/progress_reference.py\n"
+    (OUT / name).write_text(f"# {len(forms)} forms. Source: {source}. Regenerate: tools/form_reference.py\n"
                             + body, encoding="utf-8")
     print(name, len(forms))
 
