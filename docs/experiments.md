@@ -294,6 +294,23 @@ For 249 input pairs both callers match the provider's observed arguments, guarde
 
 The local Bink DLL imports ordinal 1 from XAudio2_9.dll. A read-only check confirmed an executable export at that ordinal in this workstation's System32 provider. The Bink call's argument and result contract remains unverified.
 
+## Mapping an image without LoadLibrary
+
+`tools/pe_map.cpp` maps an x64 PE32+ image into memory it allocates itself, away from the preferred base, and applies its DIR64 base relocations. It binds each ordinary import through a resolver supplied by the host, sets section protections, records the actual base in the mapped headers and registers `.pdata` with `RtlAddFunctionTable`. The original machine code runs unchanged. Header fields are checked against the file and image size before use. TLS directories, delay imports and entry points are rejected. [Issue #46](https://github.com/R0Y00/Xbox2Windows/issues/46)
+
+```powershell
+cmake --build --preset dev --target pe_map cpu_reloc_original cpu_import_original_lifted cpu_ordinal_original_lifted cpu_import_altered cpu_ordinal_altered cpu_register_probe
+ctest --preset dev --no-tests=error -R '^cpu_native_map$' -V
+```
+
+The test maps the named and ordinal import fixtures and `reloc_route`. In `reloc_route`, `call_mix` reaches the provider through an absolute code pointer in `.data`, which gives the image exactly one DIR64 relocation; the test checks that the mapped pointer equals its linked value plus the load delta. The two import fixtures have no relocation entries. For every image the test checks the following:
+
+- the base differs from the preferred base and is recorded in the mapped headers;
+- the IAT slot holds the export the resolver returned;
+- `RtlLookupFunctionEntry` finds `call_mix` in the registered table until the image is released.
+
+The mapped `call_mix` is compared over 249 input pairs on arguments, guarded writes, RBX/RSI sentinels and return value. It matches the reference and the same image loaded by Windows, and for the import fixtures it also matches the lifted DLL. If the import is bound to the altered provider instead of the linked one, only the return changes. An unbound import is rejected with its DLL and symbol or ordinal. Copies patched to have an entry point, or an import directory that runs past the image, are rejected before any import is requested. SEH through a mapped image, TLS callbacks and entry-point calls remain open.
+
 ## Offline pixel shader recompilation
 
 `tools/pixel_aot.py` extracts one named pixel program from a local archive, decodes gfx1013 instructions with LLVM and emits HLSL. DXC compiles the result to desktop DXIL before the draw. The lowerer tracks register writes across whole-quad interpolation of attribute 0, a scalar texture-descriptor load, a 2D RGBA sample, packed round-toward-zero binary16 conversions and one compressed color export. Unknown instructions, mismatched bindings and reads before the required wait cause translation to fail. [LLVM disassembler API](https://llvm.org/docs/doxygen/group__LLVMCDisassembler.html) · [Leonida public format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/fssm_unpack.py)
