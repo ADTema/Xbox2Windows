@@ -20,9 +20,11 @@ the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc) may sit between them.
 A forward pass records how many low bytes (0, 1, 2 or 8) of each register every
 path defines. A read needs as many defined bytes as it uses, and an 8- or 16-bit
 write keeps the other bytes of its register. The return width is the number of
-low RAX bytes defined at every RET, and only those bytes are a result: 0 for a
-function without a return value, 1 for MSVC's `mov al, 1; ret`. The generated
-source states the width when it is below 8.
+consecutive low RAX bytes that are definitely defined at every reachable RET or
+RET 0: 0, 1, 2 or 8, the lower bound over joins and over returns. It counts
+defined bytes and does not establish a source-language type. It is None when no
+RET is reachable, which describes the reachable control flow and makes no
+termination claim. The generated source states the width unless it is 8.
 """
 
 import argparse
@@ -647,8 +649,8 @@ def lift(pe, name):
             if guest:
                 raise ValueError(f"return value may hold a guest address at RVA {ip:#x}")
             widths.append(defined)
-    # The low bytes of RAX defined at every RET; a function without a RET never returns.
-    function.return_width = min(widths, default=8)
+    # Consecutive low RAX bytes defined at every reachable RET; None when no RET is reachable.
+    function.return_width = min(widths) if widths else None
 
     labels = set(edges)
     if order[0] != entry:
@@ -677,10 +679,10 @@ def lift(pe, name):
     signature = (f'extern "C" __declspec(dllexport) word lifted_{name}'
                  f'({", ".join(f"word {NAMES[r]}" for r in ARGUMENTS)})')
     comment = []
-    if function.return_width == 0:
-        comment = ["// RAX: no return value; no byte of RAX is defined at every RET"]
+    if function.return_width is None:
+        comment = ["// RAX: no reachable normal return"]
     elif function.return_width < 8:
-        comment = [f"// RAX: only the low {function.return_width} byte(s) are defined at every RET"]
+        comment = [f"// RAX: {function.return_width} low byte(s) are defined at every reachable RET"]
     source = [*comment, signature + " {", *("    " + d for d in declarations), *text, "}"]
     return "\n".join(source), function
 
@@ -728,6 +730,7 @@ if __name__ == "__main__":
         for function in functions:
             print(f"RVA {function.entry:#x}: {len(function.instructions)} instructions, "
                   f"{sum(len(d[1]) for d in function.dispatches.values())} table entries, "
-                  f"{function.return_width} defined RAX byte(s) at return")
+                  + ("no reachable normal return" if function.return_width is None else
+                     f"{function.return_width} defined RAX byte(s) at every reachable RET"))
     except (ValueError, OSError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")

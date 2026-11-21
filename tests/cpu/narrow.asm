@@ -1,4 +1,5 @@
-; 8- and 16-bit register writes and narrow or absent return values for the jump-table translator.
+; 8- and 16-bit register writes and returns that define 0, 1, 2 or 8 low bytes of RAX, for the
+; jump-table translator.
 ; Every export takes RCX, RDX and R8 = address of three writable QWORDs. An 8- or 16-bit write
 ; leaves the other bytes of its register unchanged; a 32-bit write zero-extends.
 .code
@@ -62,8 +63,8 @@ byte_unary PROC FRAME
     ret
 byte_unary ENDP
 
-; MSVC's bool return: only AL is written, the rest of RAX is whatever the caller left.
-bool_less PROC FRAME
+; Only AL is written on both paths; the rest of RAX is whatever the caller left.
+al_less PROC FRAME
     .endprolog
     cmp rcx, rdx
     jb is_less
@@ -72,7 +73,7 @@ bool_less PROC FRAME
 is_less:
     mov al, 1
     ret
-bool_less ENDP
+al_less ENDP
 
 ; One RET returns a 32-bit value, the other only AL: one byte is defined at every RET.
 mixed_width PROC FRAME
@@ -85,6 +86,13 @@ byte_path:
     mov al, dl
     ret
 mixed_width ENDP
+
+; Only AX is written: two low bytes of RAX are defined at the RET.
+ax_copy PROC FRAME
+    .endprolog
+    mov ax, dx
+    ret
+ax_copy ENDP
 
 ; MOVZX from AL defines all of RAX again.
 zx_byte PROC FRAME
@@ -115,18 +123,26 @@ set_zx PROC FRAME
     ret
 set_zx ENDP
 
-void_store PROC FRAME
+store_only PROC FRAME
     .endprolog
     mov QWORD PTR [r8], rdx
     ret
-void_store ENDP
+store_only ENDP
 
 ; ML64 encodes RET 0 as C3, so the C2 form is emitted as bytes.
-void_ret0 PROC FRAME
+store_ret0 PROC FRAME
     .endprolog
     mov QWORD PTR [r8+8], rcx
     DB 0C2h, 0, 0
-void_ret0 ENDP
+store_ret0 ENDP
+
+; No RET is reachable: the loop branches to itself. It is translated and inspected, never called.
+self_loop PROC FRAME
+    .endprolog
+spin:
+    inc rcx
+    jmp spin
+self_loop ENDP
 
 ; Rejected: after the join only AL is defined on one path, and ADD reads all of EAX.
 join_wide PROC FRAME

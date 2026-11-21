@@ -13,9 +13,10 @@ from cpu_switch_aot import translate
 from cpu_leaf_aot import export_rva
 from direct_check import GUARDS, MASK, SENTINELS, input_pairs, observe, register_probe
 
-# Low bytes of RAX defined at every RET of each translated export.
-WIDTHS = {"byte_merge": 8, "word_ops": 8, "byte_shift": 8, "byte_unary": 8, "bool_less": 1,
-          "mixed_width": 1, "zx_byte": 8, "set_less": 1, "set_zx": 8, "void_store": 0, "void_ret0": 0}
+# Consecutive low bytes of RAX defined at every reachable RET of each export that the test calls.
+WIDTHS = {"byte_merge": 8, "word_ops": 8, "byte_shift": 8, "byte_unary": 8, "al_less": 1,
+          "mixed_width": 1, "ax_copy": 2, "zx_byte": 8, "set_less": 1, "set_zx": 8, "store_only": 0,
+          "store_ret0": 0}
 
 
 def merge(register, value, width):
@@ -45,19 +46,21 @@ def reference(name, x, y, rax):
     elif name == "byte_unary":
         rax = merge(x, x + 1, 1)
         trace = [merge(x, -x, 2), merge(y, ~y, 1), merge(y, y - 1, 1)]
-    elif name == "bool_less":
+    elif name == "al_less":
         rax = merge(rax, int(x < y), 1)
     elif name == "mixed_width":
         rax = merge(rax, y, 1) if x & 1 else y & 0xffffffff
+    elif name == "ax_copy":
+        rax = merge(rax, y, 2)
     elif name == "zx_byte":
         rax = y & 0xff
     elif name == "set_less":
         rax, trace[0] = merge(rax, int(signed(x, 64) < signed(y, 64)), 1), merge(y, x, 1)
     elif name == "set_zx":
         rax = int(x & 0xff < y & 0xff)
-    elif name == "void_store":
+    elif name == "store_only":
         trace[0] = y
-    elif name == "void_ret0":
+    elif name == "store_ret0":
         trace[1] = x
     return rax, (GUARDS[0], *trace, GUARDS[1])
 
@@ -101,6 +104,22 @@ def check(probe_path, original_path, lifted_path):
     print(f"{total} inputs match the reference on the defined RAX bytes, the guarded trace, RBX and RSI")
 
 
+def check_return_reports(original_path):
+    """A loop without a reachable RET reports None; a reachable RET that defines no RAX byte reports 0.
+
+    self_loop is translated and inspected here and is never called."""
+    for name, width, report in (("self_loop", None, "no reachable normal return"),
+                                ("store_only", 0, "0 low byte(s) are defined at every reachable RET")):
+        source, (function,) = translate(original_path, [name])
+        comments = [line for line in source.splitlines() if line.startswith("// RAX: ")]
+        if function.return_width != width or comments != ["// RAX: " + report]:
+            raise AssertionError(f"{name}: return width {function.return_width}, source comments {comments}")
+        returns = sum(line.strip() == "return rax;" for line in source.splitlines())
+        if bool(returns) != (width is not None):
+            raise AssertionError(f"{name}: {returns} return statements with return width {width}")
+        print(f"inspected {name}: return_width {width}, {returns} return statement(s), source says: {report}")
+
+
 def instruction(pe, name, mnemonic, register=None):
     entry = export_rva(pe, name)
     for ins in Decoder(64, pe.get_data(entry, 0x40), ip=entry):
@@ -117,7 +136,7 @@ def check_rejections(original_path):
             ("zx_byte", instruction(pe, "zx_byte", Mnemonic.MOVZX), "83 c0 00", "undefined register rax"),
             # After SETB AL only AL is defined, so a 32-bit read of EAX must be refused.
             ("set_zx", instruction(pe, "set_zx", Mnemonic.MOVZX), "83 c0 00", "undefined register rax"),
-            ("void_ret0", instruction(pe, "void_ret0", Mnemonic.RET), "c2 08 00", "unsupported control flow"),
+            ("store_ret0", instruction(pe, "store_ret0", Mnemonic.RET), "c2 08 00", "unsupported control flow"),
         ]
         offsets = [pe.get_offset_from_rva(ins.ip) for _, ins, _, _ in controls]
     with TemporaryDirectory() as folder:
@@ -151,4 +170,5 @@ def run_control(name, change, image, reason):
 
 if __name__ == "__main__":
     check(*sys.argv[1:])
+    check_return_reports(sys.argv[2])
     check_rejections(sys.argv[2])
