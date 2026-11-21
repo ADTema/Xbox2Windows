@@ -115,6 +115,36 @@ bool readable(const void* address, std::size_t size) {
     return true;
 }
 
+// True if the page at address is committed and neither guarded nor PAGE_NOACCESS. Unlike
+// readable(), this accepts execute-only pages, which can hold exported code GetProcAddress returns.
+bool accessible(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT) return false;
+    const DWORD access = info.Protect & 0xff;
+    return !(info.Protect & PAGE_GUARD) && access != PAGE_NOACCESS;
+}
+
+// A NUL-terminated string inside the image, scanned only across readable committed pages.
+// Returns null if the string would require reading past the image or an unreadable page.
+const char* readable_string(const Image& image, std::uint64_t rva) {
+    if (rva >= image.size) return nullptr;
+    const auto* start = image.base + rva;
+    for (std::uint64_t scanned = 0; scanned < image.size - rva;) {
+        const auto* cursor = start + scanned;
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(cursor, &info, sizeof(info)) || info.State != MEM_COMMIT) return nullptr;
+        const DWORD access = info.Protect & 0xff;
+        if ((info.Protect & PAGE_GUARD) || access == PAGE_NOACCESS || access == PAGE_EXECUTE) return nullptr;
+        const auto offset = static_cast<std::uint64_t>(cursor - static_cast<const std::uint8_t*>(info.BaseAddress));
+        const std::uint64_t run = info.RegionSize - offset;
+        const std::uint64_t left = image.size - rva - scanned;
+        const std::uint64_t span = run < left ? run : left;
+        if (std::memchr(cursor, 0, static_cast<std::size_t>(span))) return reinterpret_cast<const char*>(start);
+        scanned += span;
+    }
+    return nullptr;
+}
+
 constexpr std::uint64_t MAX_TLS_CALLBACKS = 256;
 constexpr const char* TOO_MANY_TLS_CALLBACKS = "more than 256 TLS callbacks";
 
@@ -393,20 +423,27 @@ extern "C" __declspec(dllexport) void* pe_map_export(void* mapped, const char* n
     const Image image{static_cast<std::uint8_t*>(mapped), nt->OptionalHeader.SizeOfImage};
     const auto& exports = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
     const auto* dir = exports.Size ? image.at<IMAGE_EXPORT_DIRECTORY>(exports.VirtualAddress) : nullptr;
-    if (!dir) return nullptr;
+    // A mapped section can lack read access, by its characteristics or after a run-time reprotect.
+    // Image bounds alone do not make the export tables readable, so every read below is checked
+    // against the live protection first, as the TLS path already does.
+    if (!dir || !readable(dir, sizeof(IMAGE_EXPORT_DIRECTORY))) return nullptr;
     const auto* names = image.at<DWORD>(dir->AddressOfNames, dir->NumberOfNames);
     const auto* ordinals = image.at<WORD>(dir->AddressOfNameOrdinals, dir->NumberOfNames);
     const auto* functions = image.at<DWORD>(dir->AddressOfFunctions, dir->NumberOfFunctions);
     if (!names || !ordinals || !functions) return nullptr;
+    if (!readable(names, sizeof(DWORD) * dir->NumberOfNames) ||
+        !readable(ordinals, sizeof(WORD) * dir->NumberOfNames) ||
+        !readable(functions, sizeof(DWORD) * dir->NumberOfFunctions)) return nullptr;
     for (DWORD i = 0; i < dir->NumberOfNames; ++i) {
-        const char* exported = image.string(names[i]);
+        const char* exported = readable_string(image, names[i]);
         if (!exported || std::strcmp(exported, name) != 0) continue;
         if (ordinals[i] >= dir->NumberOfFunctions) return nullptr;
         const DWORD rva = functions[ordinals[i]];
         // Forwarded exports point back into the export directory; they are not code here.
         if (rva >= exports.VirtualAddress && rva - exports.VirtualAddress < exports.Size) return nullptr;
-        // An empty slot (RVA 0) names no code; returning the image base would be wrong.
-        return rva && rva < image.size ? image.base + rva : nullptr;
+        // An empty slot (RVA 0) names no code; returning the image base would be wrong. An exported
+        // address must be accessible, but it may be execute-only, so readable() is not used here.
+        return rva && rva < image.size && accessible(image.base + rva) ? image.base + rva : nullptr;
     }
     return nullptr;
 }

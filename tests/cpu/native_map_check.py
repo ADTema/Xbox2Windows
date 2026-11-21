@@ -296,6 +296,41 @@ def check_empty_export_slot(mapper, image):
     print(f"{image.name}: empty export slot returns null, probe still resolves")
 
 
+def check_unreadable_export(mapper, image):
+    """Map a copy whose export section cannot be read: lookup must return null, not a pointer into it.
+
+    A section can be mapped without read access by its characteristics. The export directory, its
+    three tables and each name string must be checked against the live protection before they are
+    read, so a lookup returns null instead of faulting or returning a pointer into an unreadable page.
+    """
+    with pefile.PE(str(image)) as pe:
+        export = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]
+        span = lambda s: max(s.Misc_VirtualSize, s.SizeOfRawData)
+        section = next(s for s in pe.sections
+                       if s.VirtualAddress <= export.VirtualAddress < s.VirtualAddress + span(s))
+        offset = (pe.OPTIONAL_HEADER.get_file_offset() + pe.FILE_HEADER.SizeOfOptionalHeader
+                  + pe.sections.index(section) * 40 + 36)  # Characteristics in IMAGE_SECTION_HEADER
+        characteristics = section.Characteristics
+    cases = (("no read", characteristics & ~0x40000000),
+             ("execute only", (characteristics & ~0x40000000) | 0x20000000))
+    for name, value in cases:
+        data = bytearray(image.read_bytes())
+        struct.pack_into("<I", data, offset, value)
+        with TemporaryDirectory() as temp:
+            copy = Path(temp) / image.name
+            copy.write_bytes(data)
+            base, status, detail, requests = mapper(copy, {})
+        if not base or status != STATUS["ok"] or requests:
+            raise AssertionError(f"unreadable export {name}: map failed with {status}: {detail}")
+        try:
+            resolved = [mapper.export(base, symbol) for symbol in (b"probe", b"clobber_control")]
+        finally:
+            mapper.release(base)
+        if any(resolved):
+            raise AssertionError(f"unreadable export {name}: lookup returned {resolved}")
+    print(f"{image.name}: export lookup returns null when the export section has no read access")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mapper", type=Path)
@@ -310,6 +345,7 @@ def main():
     mapper = Mapper(args.mapper)
     probe = register_probe(str(args.probe))
     check_empty_export_slot(mapper, args.probe)
+    check_unreadable_export(mapper, args.probe)
     check_delay_directory(mapper, args.named[0], args.named[2])
     for case, paths, symbol in (("named", args.named, "mix_args"), ("ordinal", args.ordinal, 77)):
         original, lifted, provider, altered = paths
