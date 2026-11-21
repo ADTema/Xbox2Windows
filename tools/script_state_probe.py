@@ -161,6 +161,8 @@ def inspect_tree(nodes, attrs, vectors, state_id):
         if count and first + count > len(attrs):
             raise ValueError("Attribute range outside pool")
         values = {key: (digest, value, kind) for key, digest, value, kind, _, _ in attrs[first:first + count]}
+        if name == joaat("state") and sum(a[0] == joaat("id") and a[3] == 5 for a in attrs[first:first + count]) > 1:
+            raise ValueError("Duplicate state ID attribute")
         if name == joaat("state"):
             counts["state_nodes"] += 1
             # Only a label-kind (5) id names a state, as in script_path_replay.state_index.
