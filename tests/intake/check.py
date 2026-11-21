@@ -119,6 +119,26 @@ def check(folder, fixture, provider):
     peer.unlink()
     assert repeated["entry_import_gaps"]
     assert all(r["seen_unresolved_in_baseline"] for r in repeated["entry_import_gaps"])
+    # pefile skips import names outside letters, digits and ._?@$()<>, and drops a descriptor
+    # left empty. A same-length rename keeps the image layout and must keep both edges.
+    renamed = folder / "renamed-imports.exe"
+    with pefile.PE(str(fixture)) as pe:
+        targets = [s for d in pe.DIRECTORY_ENTRY_IMPORT + pe.DIRECTORY_ENTRY_DELAY_IMPORT
+                   for s in d.imports if s.name in (b"named_value", b"delayed_value")]
+        assert len(targets) == 2
+        for s in targets:
+            pe.set_bytes_at_offset(s.name_offset, s.name.replace(b"_", b"-"))
+        pe.write(str(renamed))
+    renamed_report = run(0, renamed)
+    renamed_edges = {(r["kind"], r["dll"], r["symbol"]) for r in renamed_report["inventory"]["imports"]
+                     if r["image"] == slot}
+    assert renamed_edges == set(edges) - {("normal", provider.name, "named_value"),
+                                          ("delay", "intake_delay.dll", "delayed_value")} | {
+        ("normal", provider.name, "named-value"), ("delay", "intake_delay.dll", "delayed-value")}
+    renamed_gaps = {(r["kind"], r["dll"], r["symbol"]) for r in renamed_report["entry_import_gaps"]}
+    assert {("normal", provider.name, "named-value"), ("delay", "intake_delay.dll", "delayed-value")} <= renamed_gaps
+    mismatch, = [f for f in renamed_report["dependency_paths"]["findings"] if f.get("symbol") == "named-value"]
+    assert mismatch["problem"] == "bundled_export_missing" and mismatch["candidates"] == [provider.name]
     truncated = folder / "truncated.exe"
     truncated.write_bytes(fixture.read_bytes()[:-256])
     assert "Section extends" in run(2, truncated)["error"]

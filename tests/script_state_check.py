@@ -10,23 +10,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from script_state_probe import inspect, inspect_tree, joaat
 
 
-def fixture(*, damage_value=False, self_parent=False):
+def fixture(*, damage_value=False, self_parent=False, id_kind=5, parent_tag="state", drop=None, root_parent=65535):
     example = "synthetic_orbit"
     def attr(name, spelling, raw, kind):
         return struct.pack("<IIIBBH", joaat(name), joaat(spelling), raw, kind, 1, 0)
 
-    attrs = b"".join((
-        attr("id", example, 0, 5), attr("priority", "9", 9, 3),
+    rows = (
+        attr("id", example, 0, id_kind), attr("priority", "9", 9, 3),
         attr("blendduration", "37", 37, 3),
         attr("orbitdistance", "1.500000", 0x40000000 if damage_value else 0x3fc00000, 2),
         attr("pitchlimits", "-0.250000,0.500000,0.000000", 0, 1),
         attr("headinglimits", "-1.000000,1.000000,0.000000", 1, 1),
-    ))
+    )
+    if drop is not None:
+        rows = rows[:drop] + rows[drop + 1:]
+    attrs = b"".join(rows)
     nodes = b"".join(struct.pack("<I5H2B", joaat(name), parent, 0, 0, 0, start, count, 1)
-                     for name, parent, start, count in (("state", 65535, 0, 1),
-                                                        ("fixture_child", int(self_parent), 1, 5)))
+                     for name, parent, start, count in ((parent_tag, root_parent, 0, 1),
+                                                        ("fixture_child", int(self_parent), 1, len(rows) - 1)))
     vecs = struct.pack("<6f", -0.25, 0.5, 0, -1, 1, 0)
-    root = b"".join(struct.pack("<IIQ", n, n, ref) for n, ref in ((6, 2), (0, 0), (2, 4), (0, 0), (2, 3)))
+    root = b"".join(struct.pack("<IIQ", n, n, ref) for n, ref in ((len(rows), 2), (0, 0), (2, 4), (0, 0), (2, 3)))
     blocks = (root, attrs, nodes, vecs)
     instances = bytearray()
     for kind, blob in enumerate(blocks, 1):
@@ -67,11 +70,11 @@ class DuplicateStateIdTests(unittest.TestCase):
 
 
 class ScriptStateTests(unittest.TestCase):
-    def run_probe(self, **options):
+    def run_probe(self, state="synthetic_orbit", **options):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "original.rpf"
             path.write_bytes(fixture(**options))
-            return inspect(path, "synthetic_orbit")
+            return inspect(path, state)
 
     def test_linked_values(self):
         result = self.run_probe()
@@ -86,6 +89,31 @@ class ScriptStateTests(unittest.TestCase):
     def test_parent_cycle(self):
         with self.assertRaisesRegex(ValueError, "parent index"):
             self.run_probe(self_parent=True)
+
+    def test_state_id_must_be_a_label(self):
+        # An integer attribute named id whose hash equals the label must not select the state.
+        result = self.run_probe(id_kind=3)
+        self.assertEqual(result["counts"]["all_five_literals_verified"], 1)
+        self.assertIsNone(result["first_verified_example"])
+
+    def test_other_label_selects_nothing(self):
+        result = self.run_probe(state="synthetic_other")
+        self.assertEqual(result["counts"]["all_five_literals_verified"], 1)
+        self.assertIsNone(result["first_verified_example"])
+
+    def test_parent_must_be_a_state(self):
+        counts = self.run_probe(parent_tag="zone")["counts"]
+        self.assertNotIn("camera_parameter_sets", counts)
+        self.assertNotIn("state_nodes", counts)
+
+    def test_missing_camera_attribute(self):
+        result = self.run_probe(drop=3)
+        self.assertNotIn("camera_parameter_sets", result["counts"])
+        self.assertIsNone(result["first_verified_example"])
+
+    def test_root_with_parent(self):
+        with self.assertRaisesRegex(ValueError, "parent index"):
+            self.run_probe(root_parent=0)
 
 
 if __name__ == "__main__":

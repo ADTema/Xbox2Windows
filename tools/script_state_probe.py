@@ -165,7 +165,9 @@ def inspect_tree(nodes, attrs, vectors, state_id):
             raise ValueError("Duplicate state ID attribute")
         if name == joaat("state"):
             counts["state_nodes"] += 1
-            state_ids[index] = values.get(joaat("id"), (None,))[0]
+            # Only a label-kind (5) id names a state, as in script_path_replay.state_index.
+            digest, _, kind = values.get(joaat("id"), (None, 0, 0))
+            state_ids[index] = digest if kind == 5 else None
         if parent not in state_ids or not CAMERA.keys() <= values.keys():
             continue
         counts["camera_parameter_sets"] += 1
