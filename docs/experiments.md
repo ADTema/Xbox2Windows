@@ -521,6 +521,24 @@ On Windows build 26200, the pre-executable inventory covered 16 package DLLs and
 
 `desktop_memory_query` supplies Windows observations for `XMemVirtualQuery` and `XMemGetWorkingSetStatistics`. The test reserves memory, commits and writes 1,024 pages, checks the read-only/writable boundary, then decommits. It verifies residency of a locked page and records working set, peak working set and private commit at three points. Values vary between runs. Scarlett structure layout, units and accounting scope remain unconfirmed. [Windows working sets](https://learn.microsoft.com/en-us/windows/win32/memory/working-set)
 
+`src/era_query.cpp` is a desktop handler for `XMemVirtualQuery`, shaped by the four BVH call sites. It writes the Win32 `MEMORY_BASIC_INFORMATION` to bytes `0x00`–`0x2F`; the callers read State at `+0x20` and Protect at `+0x24`, matching that layout. The byte at `+0x30` has no public definition: the Microsoft reference for `XMemVirtualQuery` and its result structure is restricted to the Xbox developer program.
+
+The handler therefore fills that byte by a desktop policy, not by a confirmed Scarlett field:
+
+- it writes `0x01` when the queried address lies in a region registered with `register_gpu_region`, and `0x00` otherwise;
+- later bytes are left untouched;
+- the policy applies only to queries of the current process;
+- a buffer shorter than 48 bytes fails with `ERROR_BAD_LENGTH`, as `VirtualQueryEx` does.
+
+With registration, the callers' predicates accept GPU-intended memory and reject everything else. What the console's tail byte means, and what sets it, remain open. `XMemGetWorkingSetStatistics` gets no handler: the selector `0x20000001` and the output units have no public reference.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `era_query_fields` | Reserved, committed read/write, read-only and no-access pages, each queried with and without registration. Bytes `0x00`–`0x2F` match a plain `VirtualQueryEx` result byte for byte, and bytes after `+0x30` keep their sentinel. |
+| `era_query_tail` | Negative control: before registration a committed read/write page fails the tail check. After registering two pages, the tail byte is set at the first, middle and last byte and clear on the next committed page and on a reserved page. The callers' predicates accept read/write and read-only, reject the source check on no-access, and reject both after decommit. A real handle to the process counts as the current process, and unregistering clears the flag. |
+| `era_query_registry` | Null, empty and wrapping ranges are refused. Exact, front, back, containing and contained overlaps are refused, adjacent ranges are accepted, and unregistering needs the exact base. |
+| `era_query_short` | A 47-byte buffer returns 0 with `ERROR_BAD_LENGTH` and is left untouched. A 48-byte buffer succeeds without writing the tail byte. A null buffer fails. |
+
 ## Offscreen rendering and readback
 
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
