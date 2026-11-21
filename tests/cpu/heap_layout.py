@@ -19,10 +19,15 @@ def emit(image, output):
         scan = lower(region(pe, *bounds), ["rcx = count; rdx = reinterpret_cast<word>(flags);",
                                          "r8 = reinterpret_cast<word>(sizes); r9 = reinterpret_cast<word>(index);"],
                      {}, {}, {})
+        (bounds,) = function_ranges(pe, export_rva(pe, "descriptor_fields"))
+        fields = lower(region(pe, *bounds), ["rcx = count; rdx = reinterpret_cast<word>(src);",
+                                             "r8 = reinterpret_cast<word>(dst);"], {}, {}, {})
     output.write_text(INTEGER_HEADER + 'extern "C" __declspec(dllexport) word heap_layout(uint32_t count, '
                       'uint32_t* sizes) {\n' + code + '\n}\n'
                       'extern "C" __declspec(dllexport) uint32_t slot_probe(uint32_t count, const uint8_t* flags, '
-                      'const uint32_t* sizes, uint32_t* index) {\n' + scan + '\n}\n', encoding="ascii")
+                      'const uint32_t* sizes, uint32_t* index) {\n' + scan + '\n}\n'
+                      'extern "C" __declspec(dllexport) word descriptor_fields(uint32_t count, const uint8_t* src, '
+                      'uint8_t* dst) {\n' + fields + '\n}\n', encoding="ascii")
 
 
 def check(image, native):
@@ -52,6 +57,15 @@ def check(image, native):
         expected = uint(sum(values)).value if selected != sentinel else 0
         if (index.value, result) != (selected, expected):
             raise AssertionError(f"{image.name}: flags {flags} yielded {(index.value, result)}")
+    fields = lib.descriptor_fields
+    fields.argtypes = [uint, ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint8)]
+    fields.restype = ctypes.c_uint64
+    src = (ctypes.c_uint8 * 32)(*range(32))
+    for count in (1, 0x80001234):
+        dst = (ctypes.c_uint8 * 96)(*([255] * 96))
+        value = fields(count, src, dst)
+        if value != (17 if count == 1 else count - 1) or bytes(dst) != bytes(src) + bytes(src[:16]) + bytes(48):
+            raise AssertionError(f"{image.name}: descriptor copy or field selection differs for {count:#x}")
 
 
 if __name__ == "__main__":
