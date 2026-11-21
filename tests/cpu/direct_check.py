@@ -36,19 +36,27 @@ def reference(x, y, *, caller, altered=False):
     return returned, (GUARDS[0], a, b, stored, GUARDS[1]), SENTINELS
 
 
-def check(probe_path, original_path, lifted_path, altered_path):
+def register_probe(probe_path):
     harness = ctypes.CDLL(probe_path)
     probe = harness.probe
     probe.argtypes = [ctypes.c_void_p, Word, Word, ctypes.POINTER(Word), ctypes.POINTER(Word)]
     probe.restype = Word
-    if observe(probe, harness.clobber_control, 0, 0)[2] != (0, 0):
-        raise AssertionError("physical register probe missed the clobber control")
+    return probe
 
-    native, lifted, altered = map(ctypes.CDLL, (original_path, lifted_path, altered_path))
+def input_pairs():
     edges = (0, 1, 2, 3, 7, (1 << 32) - 1, 1 << 32, (1 << 63) - 1, 1 << 63, MASK - 6, MASK)
     inputs = [(x, y) for x in edges for y in edges]
     rng = random.Random(22)
     inputs.extend((rng.getrandbits(64), rng.getrandbits(64)) for _ in range(128))
+    return inputs
+
+
+def check(probe_path, original_path, lifted_path, altered_path):
+    probe = register_probe(probe_path)
+    if observe(probe, ctypes.CDLL(probe_path).clobber_control, 0, 0)[2] != (0, 0):
+        raise AssertionError("physical register probe missed the clobber control")
+    native, lifted, altered = map(ctypes.CDLL, (original_path, lifted_path, altered_path))
+    inputs = input_pairs()
     for caller, source, compiled, control in (
             (True, native.call_mix, lifted.lifted, altered.lifted),
             (False, native.mix_args, lifted.lifted_callee, altered.lifted_callee)):
