@@ -189,6 +189,10 @@ COMPARE = {
     "ngt": "({0} <= {1} || isnan({0}) || isnan({1}))", "nle": "({0} > {1} || isnan({0}) || isnan({1}))",
     "neq": "!({0} == {1})", "nlt": "({0} >= {1} || isnan({0}) || isnan({1}))",
 }
+INT_COMPARE = {
+    "f": "false", "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}",
+    "gt": "{0} > {1}", "ne": "{0} != {1}", "ge": "{0} >= {1}", "t": "true",
+}
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
     "and": "uint2({0} & {2}, {1} & {3})",
@@ -348,6 +352,20 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
     if re.fullmatch(r"\d+\.\d+", token):
         return token + "f"
     raise ValueError(f"Unsupported arithmetic operand {token}")
+
+
+def int_operand(token, scalar, vector, pending, sample_pending, *, signed):
+    if re.fullmatch(r"v\d+", token):
+        value = vector[token]
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+            raise ValueError("Expected a numeric register")
+        if sample_pending and value.startswith("sample"):
+            raise ValueError("Sample used before vmcnt wait")
+        return f"asint({value})" if signed else f"asuint({value})"
+    bits = scalar_u32(token, scalar, pending)
+    if signed and bits.startswith("asuint(") and bits.endswith(")"):
+        return f"asint({bits[7:-1]})"
+    return f"asint({bits})" if signed else bits
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
@@ -608,6 +626,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+        elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32)(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+                      for t in tokens]
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {INT_COMPARE[op].format(*values)};")
         elif m := match(rf"v_cndmask_b32(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+), {LANE_MASK}"):
             dst, unset, chosen, source = m.groups()
             regs = lane_mask(source)
