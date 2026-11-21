@@ -447,6 +447,14 @@ cmake --build --preset dev --target pe_map cpu_import_original cpu_import_provid
 ctest --preset dev --no-tests=error -R '^cpu_native_reloc_free$' -V
 ```
 
+### Mutated images
+
+`cpu_native_mutation` applies a fixed list of single-field edits to the header, the first section header, and the export, import and base-relocation directories of `cpu_register_probe` and `cpu_import_original`, plus three truncations. Each case runs in its own process and must print either `MAP_OK` or a named `MapStatus` with a detail string; a crash or a timeout fails the case. Across 46 cases the outcomes were 26 `format`, 16 `ok` and 4 `relocation`, with no crash. A three-line mapper that dereferences null makes the parent report `child exited 0xc0000005`, so the harness detects the failure mode it covers.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_mutation$' -V
+```
+
 ## Switch dispatch through jump tables
 
 Compilers lower a dense `switch` to a bounds check and an indirect `JMP` through a table of 32-bit entries. The [jump-table translator](../tools/cpu_switch_aot.py) recognizes the two x64 layouts in common use. MSVC stores image-relative entries and loads them through a register holding `__ImageBase`. LLVM stores signed offsets from the table and adds the table address. The translator reads the table from the PE, then emits a C++ `switch` whose cases jump to labels at the decoded targets. The host compiler builds its own dispatch from that switch.

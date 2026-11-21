@@ -523,6 +523,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_import_altered>"
         --two "$<TARGET_FILE:cpu_two_imports>" "$<TARGET_FILE:cpu_import_provider>"
             "$<TARGET_FILE:cpu_register_probe>")
+    add_test(NAME cpu_native_mutation COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_mutation_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_register_probe>" "$<TARGET_FILE:cpu_import_original>"
+        --provider "$<TARGET_FILE:cpu_import_provider>")
     add_test(NAME cpu_native_reloc_free COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_reloc_free_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_register_probe>" "$<TARGET_FILE:cpu_import_original>"
