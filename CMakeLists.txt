@@ -382,6 +382,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_version_query COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/version_query_fixture.py" check "$<TARGET_FILE:cpu_version_query>"
         "$<TARGET_FILE:cpu_version_query_lifted>")
+    add_test(NAME cpu_lower_prefixes COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/lower_prefixes_check.py")
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)

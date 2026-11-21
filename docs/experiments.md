@@ -314,6 +314,8 @@ cl /nologo /O2 /EHsc /LD /Fo:out/ffx-query/query.obj out/ffx-query/query.cpp /li
 
 The public CTest `cpu_aot_version_query` runs the same output checks against an independent MASM fixture and its translation. The fixture uses a different name and 64-bit ID. The two proprietary inputs and generated code stay local.
 
+The shared integer lowering in this tool emits flat loads and stores, so it rejects FS or GS segment overrides and LOCK prefixes instead of dropping them. A thread-block access such as `gs:[0x30]` would otherwise read absolute address 0x30, and a locked read-modify-write would lose its atomicity. Segment overrides without effect in 64-bit mode and `rep ret` lower like the bare instruction. A host operation that replaces an instruction bypasses the check. `ctest --preset dev --no-tests=error -R '^cpu_lower_prefixes$' -V` checks 11 rejected encodings and 6 accepted controls with synthetic bytes.
+
 ## Recompiling a direct x64 call
 
 The [caller and callee](../tests/cpu/direct.asm) each accept two unsigned 64-bit integers and an output pointer. The [translator](../tools/cpu_call_aot.py) starts at the caller export, follows the signed displacement in its E8 call and reads the target's runtime-function interval. It generates two C++ functions from the linked machine code. MSVC emits a separate x64 DLL with a non-inlined call. The Windows test checks the relative call against the two export addresses in both the input and output DLLs.
