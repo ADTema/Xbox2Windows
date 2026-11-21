@@ -102,22 +102,66 @@ def resolve_desktop(dll, symbol, importer, contracts, system_exports):
     return dict(status=status, chain=chain)
 
 
+def read_rva(pe, rva, size):
+    section = pe.get_section_by_rva(rva)
+    data = section.get_data(rva, size) if section else b""
+    if len(data) != size:
+        raise ValueError(f"Import data at RVA {rva:#x} is outside the file's sections")
+    return data
+
+
+def read_name(pe, rva):
+    section = pe.get_section_by_rva(rva)
+    name, terminator, _ = (section.get_data(rva, 0x10000) if section else b"").partition(b"\0")
+    if not terminator:
+        raise ValueError(f"Unterminated import name at RVA {rva:#x}")
+    return name
+
+
+def import_tables(pe, path):
+    """Read import descriptors and lookup tables as stored.
+
+    pefile skips lookup entries whose names fall outside its function-name character set and
+    entries for ordinal 0, drops a descriptor left empty by either, and names ordinal imports
+    from a few system DLLs. The inventory keeps every entry exactly as the image requests it.
+    """
+    wide = pe.OPTIONAL_HEADER.Magic == 0x20B
+    width, by_ordinal = (8, 1 << 63) if wide else (4, 1 << 31)
+    directories = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    imports = []
+    for kind, index, layout in (("normal", 1, struct.Struct("<5I")), ("delay", 13, struct.Struct("<8I"))):
+        if index >= len(directories) or not (directories[index].VirtualAddress or directories[index].Size):
+            continue
+        rva, found = directories[index].VirtualAddress, 0
+        while True:
+            fields = layout.unpack(read_rva(pe, rva, layout.size))
+            rva += layout.size
+            if kind == "normal":
+                original_first_thunk, _, _, name, first_thunk = fields
+                lookup, base = original_first_thunk or first_thunk, 0
+            else:
+                attributes, name, _, _, lookup = fields[:5]
+                # Version 1 delay descriptors hold RVAs. Older ones hold virtual addresses.
+                base = 0 if attributes & 1 else pe.OPTIONAL_HEADER.ImageBase
+            if not name:
+                break
+            found += 1
+            module = label(read_name(pe, name - base)).lower()
+            entry = lookup - base
+            while value := int.from_bytes(read_rva(pe, entry, width), "little"):
+                entry += width
+                symbol = (f"#{value & 0xFFFF}" if value & by_ordinal
+                          else label(read_name(pe, ((value - base) & 0x7FFFFFFF) + 2)))
+                imports.append((kind, module, symbol))
+        if not found:
+            raise ValueError(f"Could not parse {kind} imports in {path}")
+    return imports
+
+
 def parse_image(path):
     with pefile.PE(str(path), fast_load=True) as pe:
-        pe.parse_data_directories(directories=[0, 1, 13])
-        imports = []
-        for kind, attribute, index in (("normal", "DIRECTORY_ENTRY_IMPORT", 1),
-                                       ("delay", "DIRECTORY_ENTRY_DELAY_IMPORT", 13)):
-            descriptors = getattr(pe, attribute, [])
-            directories = pe.OPTIONAL_HEADER.DATA_DIRECTORY
-            if (index < len(directories) and (directories[index].VirtualAddress or directories[index].Size)
-                    and not descriptors):
-                raise ValueError(f"Could not parse {kind} imports in {path}")
-            for d in descriptors:
-                module = label(d.dll).lower()
-                for s in d.imports:
-                    symbol = label(s.name) if s.name is not None else f"#{s.ordinal}"
-                    imports.append((kind, module, symbol))
+        pe.parse_data_directories(directories=[0])
+        imports = import_tables(pe, path)
         with path.open("rb") as f:
             digest = hashlib.file_digest(f, "sha256").hexdigest()
         info = {

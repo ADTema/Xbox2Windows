@@ -239,7 +239,15 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         if (s.VirtualAddress < opt.SizeOfHeaders || !inside(s.VirtualAddress, span, opt.SizeOfImage)
             || !inside(s.PointerToRawData, copy, raw.size()))
             return release(fail(MAP_FORMAT, "section %.8s outside image", reinterpret_cast<const char*>(s.Name)));
-        std::memcpy(base + s.VirtualAddress, raw.data() + s.PointerToRawData, copy);
+        if (copy) {
+            // Like the Windows loader, read whole 0x200-byte file sectors: round the start of the raw
+            // data down and its end up. Sector bytes past the end of the file stay zero.
+            const std::uint64_t first = s.PointerToRawData & ~std::uint64_t{0x1ff};
+            std::uint64_t end = (std::uint64_t{s.PointerToRawData} + s.SizeOfRawData + 0x1ff) & ~std::uint64_t{0x1ff};
+            if (end > raw.size()) end = raw.size();
+            const std::uint64_t length = end - first < span ? end - first : span;
+            std::memcpy(base + s.VirtualAddress, raw.data() + first, static_cast<std::size_t>(length));
+        }
     }
 
     // TLS data needs a slot in each thread's ThreadLocalStoragePointer array, which ntdll owns.
