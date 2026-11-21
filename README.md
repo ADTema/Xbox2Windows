@@ -5,8 +5,7 @@ Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) s
 New to the project? The [pinned guide in GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions/75) will help you choose a first contribution. Ask build and debugging questions in [Development Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a).
 
 [![Instruction-form coverage of source-built fixtures, not a measure of port completion](docs/coverage/dashboard.svg)](tools/coverage_svg.py)
-<img width="1051" height="836" alt="image" src="https://github.com/user-attachments/assets/27a52021-1932-48a8-8800-add29c16d86e" />
-<img width="1051" height="836" alt="image" src="https://github.com/user-attachments/assets/b3f388db-1b61-4e58-9bb4-fb086e48d13e" />
+
 
 ## Current results and open work
 
