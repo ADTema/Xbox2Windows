@@ -147,6 +147,7 @@ SMEM_OPS = {
 }
 
 VOP1_OPS = {
+    0x00: ("v_nop", "Vector no-op"),
     0x01: ("v_mov_b32_e32", "Vector copy 32-bit"),
     0x02: ("v_readfirstlane_b32", "Read first active lane into SGPR"),
     0x04: ("v_not_b32_e32", "Vector bitwise NOT"),
@@ -270,7 +271,10 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0 = w0 & 0x1ff
         op_info = VOP1_OPS.get(op, (f"v_vop1_{op:02x}", "Unknown VOP1"))
         op_name, comment = op_info
-        asm = f"{op_name} v{vdst}, {decode_v_reg(src0)}"
+        if op_name == "v_nop":
+            asm = "v_nop"
+        else:
+            asm = f"{op_name} v{vdst}, {decode_v_reg(src0)}"
         return (4, op_name, asm, comment)
 
     # 6. VOP2: [31] == 0
@@ -361,6 +365,10 @@ def disassemble_binary(data: bytes, shader_name: str = "shader") -> list[dict]:
     return instructions
 
 
+# Alias for library usage
+disasm_rdna2 = disassemble_binary
+
+
 def print_disassembly(shader_name: str, instructions: list[dict], show_comments: bool = True):
     """Print beautifully formatted disassembly with offsets and annotations."""
     print("=" * 80)
@@ -385,7 +393,7 @@ def print_disassembly(shader_name: str, instructions: list[dict], show_comments:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("targets", nargs="+", type=Path, help="Path to shader binary .bin file(s) or folder")
+    parser.add_argument("targets", nargs="*", type=Path, default=[], help="Path to shader binary .bin file(s) or folder")
     parser.add_argument("--hex", default=None, help="Direct hex string to decode (e.g. '0300a0bf8002047e')")
     parser.add_argument("--output", type=Path, default=None, help="Save disassembly listing to output file")
 
@@ -397,6 +405,9 @@ def main():
         insns = disassemble_binary(raw_bytes, "hex_input")
         print_disassembly("hex_input", insns)
         return 0
+
+    if not args.targets:
+        parser.error("Specify targets or provide hex via --hex")
 
     all_listings = []
     for target in args.targets:
