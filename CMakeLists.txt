@@ -130,6 +130,7 @@ foreach(layout IN ITEMS root tables)
 endforeach()
 foreach(adapter IN ITEMS hardware warp)
     add_test(NAME offscreen_${adapter} COMMAND offscreen_check ${adapter} triangle_${adapter}.bmp)
+    add_test(NAME ffx_device_init_${adapter} COMMAND offscreen_check ${adapter} --ffx-device-init)
     add_test(NAME dual_uav_${adapter} COMMAND offscreen_check ${adapter} --dual-uav)
     add_test(NAME texture_mips_${adapter} COMMAND offscreen_check ${adapter} --texture-mips)
     set_tests_properties(dual_uav_${adapter} texture_mips_${adapter} PROPERTIES TIMEOUT 45)
@@ -148,7 +149,7 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(dxr_query_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(offscreen_${adapter} PROPERTIES TIMEOUT 45)
 endforeach()
-set_tests_properties(offscreen_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(offscreen_hardware ffx_device_init_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(dual_uav_hardware texture_mips_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_root_roundtrip_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_atomics_hardware PROPERTIES SKIP_RETURN_CODE 77)
@@ -170,6 +171,21 @@ endif()
 
 set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
     "Native x64 Python with pefile for static intake tests")
+target_sources(offscreen_check PRIVATE tests/ffx_device_init.cpp)
+set(FFX_UPSCALER_IMAGE "" CACHE FILEPATH "Local Xbox upscaler DLL for offline backend translation")
+if(FFX_UPSCALER_IMAGE)
+    if(NOT EXISTS "${INTAKE_PYTHON}" OR NOT EXISTS "${FFX_UPSCALER_IMAGE}")
+        message(FATAL_ERROR "Package translation requires INTAKE_PYTHON and FFX_UPSCALER_IMAGE")
+    endif()
+    set(device_slice "${CMAKE_CURRENT_BINARY_DIR}/ffx_device_slice.cpp")
+    add_custom_command(OUTPUT "${device_slice}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/ffx_device_init.py" "${FFX_UPSCALER_IMAGE}" "${device_slice}"
+        DEPENDS "${FFX_UPSCALER_IMAGE}" tools/ffx_device_init.py tools/ffx_version_query.py tools/cpu_ranges.py tools/cpu_leaf_aot.py
+        VERBATIM)
+    target_sources(offscreen_check PRIVATE "${device_slice}")
+    target_include_directories(offscreen_check PRIVATE "${CMAKE_SOURCE_DIR}/tests")
+    target_compile_definitions(offscreen_check PRIVATE FFX_PACKAGE_DEVICE_SLICE)
+endif()
 if(EXISTS "${INTAKE_PYTHON}")
     enable_language(ASM_MASM)
     function(cpu_asm_fixture image source)
@@ -227,6 +243,16 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_callback callback)
     cpu_asm_fixture(cpu_version_query version_query)
+    cpu_asm_fixture(cpu_heap_layout heap_layout)
+    set(heap_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_heap_layout_lifted.cpp")
+    add_custom_command(OUTPUT "${heap_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/heap_layout.py"
+            emit "$<TARGET_FILE:cpu_heap_layout>" "${heap_fixture}"
+        DEPENDS cpu_heap_layout tests/cpu/heap_layout.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_heap_layout_lifted SHARED "${heap_fixture}")
+    add_test(NAME cpu_aot_heap_layout COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/heap_layout.py"
+        check "$<TARGET_FILE:cpu_heap_layout>" "$<TARGET_FILE:cpu_heap_layout_lifted>")
     set(query_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_version_query_lifted.cpp")
     add_custom_command(OUTPUT "${query_fixture}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/version_query_fixture.py"
