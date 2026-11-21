@@ -461,6 +461,9 @@ int main(int argc, char** argv)
             if (!check_ray_query(device.Get())) return 77;
         } else if (argc == 3 && operation == "--wave-shuffle") {
             if (!check_wave_shuffle(device.Get())) return 77;
+        } else if (operation.substr(0, 2) == "--") {
+            std::fprintf(stderr, "Unknown GPU operation or invalid arguments: %s\n", argv[2]);
+            return 2;
         } else {
             draw(device.Get(), argv[2], argc == 5 ? argv + 3 : nullptr);
         }
