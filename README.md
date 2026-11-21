@@ -95,7 +95,7 @@ cmake --build --preset dev
 ctest --preset dev --no-tests=error -R 'desktop_root_signature|era_heap_allocation|offscreen_warp'
 ```
 
-These three tests exercise a D3D12 root signature, heap allocation and software rendering. To enable the script, shader, texture and PE fixture tests, install x64 Python 3.11 or newer and configure again. Windows CI uses Python 3.12.
+These three tests exercise a D3D12 root signature, heap allocation and software rendering. CMake warns when the Python executable for the remaining fixture tests is missing. To enable the CPU, script, shader, texture and PE fixture tests, install x64 Python 3.11 or newer and configure again. Windows CI uses Python 3.12.
 
 ```powershell
 python -m venv out/pe-env
