@@ -13,8 +13,39 @@
 #ifdef _DEBUG
 #include <crtdbg.h>
 #endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 using namespace std::literals;
+
+namespace {
+// Attribute words recorded at the Bink fallback and AMD upscaler XMemAlloc call sites.
+constexpr std::uint64_t bink_word = 0x05e50000;
+constexpr std::uint64_t amd_word = 0xa8004000;
+constexpr std::uint64_t memory_type_mask = std::uint64_t{15} << 29;
+
+std::size_t allocation_granularity()
+{
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    return info.dwAllocationGranularity;
+}
+
+bool rejects(std::size_t bytes, std::uint64_t attributes)
+{
+    void* p = era_heap::allocate(bytes, attributes);
+    if (p) {
+        era_heap::release_with_attributes(p, attributes);
+        return false;
+    }
+    return true;
+}
+}
 
 bool allocation_checks()
 {
@@ -49,23 +80,99 @@ bool allocation_checks()
 
 bool failure_checks()
 {
-    // Mix each unsupported bit with a valid alignment. Every combination must fail closed.
-    for (unsigned bit = 0; bit < 64; ++bit) {
-        if (bit >= 24 && bit <= 28) continue;
-        const auto flags = (std::uint64_t{1} << bit) | (std::uint64_t{6} << 24);
-        auto* p = era_heap::allocate(257, flags);
-        if (p) {
-            era_heap::release(p);
+    // Mix each reserved bit with a valid heap alignment and with the AMD graphics word.
+    for (unsigned bit = 33; bit < 64; ++bit) {
+        const auto reserved = std::uint64_t{1} << bit;
+        if (!rejects(257, reserved | (std::uint64_t{6} << 24)) || !rejects(512, reserved | amd_word)) {
             return false;
         }
     }
-    return era_heap::allocate(0, 0) == nullptr &&
-           era_heap::allocate(std::numeric_limits<std::size_t>::max(), 0) == nullptr &&
-           era_heap::allocate(64, 1ull << 29) == nullptr &&  // graphics memory type
-           era_heap::allocate(64, 1ull << 14) == nullptr &&  // non-default page size
-           era_heap::allocate(64, 1ull << 63) == nullptr &&
-           era_heap::allocate(257 + 64, 0x05e50000) == nullptr &&  // Bink fallback
-           era_heap::allocate(512, 0xa8004000) == nullptr;        // AMD, 257 rounded up
+    // Physical memory types 7-9 are not modeled. Types 10-15 are undefined.
+    for (std::uint64_t type = 7; type < 16; ++type) {
+        if (!rejects(512, (amd_word & ~memory_type_mask) | (type << 29))) return false;
+    }
+    // Graphics memory with 4 MB pages or a 128 KiB alignment exceeds the desktop
+    // allocation granularity. The undefined page size value 3 fails for every type.
+    const auto four_mb_pages = (amd_word & ~(std::uint64_t{3} << 14)) | (std::uint64_t{2} << 14);
+    const auto wide_alignment = (amd_word & ~(std::uint64_t{31} << 24)) | (std::uint64_t{17} << 24);
+    if ((allocation_granularity() < (std::size_t{4} << 20) && !rejects(512, four_mb_pages)) ||
+        (allocation_granularity() < (std::size_t{1} << 17) && !rejects(512, wide_alignment)) ||
+        !rejects(512, amd_word | (std::uint64_t{3} << 14)) ||
+        !rejects(64, bink_word | (std::uint64_t{3} << 14))) {
+        return false;
+    }
+    return rejects(0, 0) && rejects(0, amd_word) &&
+           rejects(std::numeric_limits<std::size_t>::max(), 0) &&
+           rejects(std::numeric_limits<std::size_t>::max(), amd_word);
+}
+
+bool observed_word_checks()
+{
+    using Byte = unsigned char;
+    const auto bink = era_heap::decode(bink_word);
+    const auto amd = era_heap::decode(amd_word);
+    if (bink.object_type != 0 || bink.page_size != 0 || bink.allocator_id != 0xe5 ||
+        bink.alignment != 5 || bink.memory_type != 0 || bink.reserved != 0 ||
+        amd.object_type != 0 || amd.page_size != 1 || amd.allocator_id != 0 ||
+        amd.alignment != 8 || amd.memory_type != 5 || amd.reserved != 0) {
+        return false;
+    }
+
+    // Bink requests the payload length plus 64 and builds its header in front of the payload.
+    constexpr Byte marker = 0x51, tag = 0x34;
+    for (std::size_t length : {33u, 129u}) {
+        const auto total = length + 64;
+        auto* base = static_cast<Byte*>(era_heap::allocate(total, bink_word));
+        if (!base) return false;
+        const auto address = reinterpret_cast<std::uintptr_t>(base);
+        bool ok = address % 32 == 0 && std::all_of(base, base + total, [](Byte b) { return b == 0; });
+        const auto offset = static_cast<Byte>(64 - (address & 31));
+        auto* user = base + offset;
+        ok = ok && reinterpret_cast<std::uintptr_t>(user) % 32 == 0 && user + length <= base + total;
+        if (ok) {
+            user[-2] = tag;
+            user[-1] = offset;
+            std::fill_n(user, length, marker);
+            ok = user - user[-1] == base && user[-2] == tag &&
+                 std::all_of(user, user + length, [](Byte b) { return b == marker; });
+        }
+        era_heap::release_with_attributes(base, bink_word);
+        if (!ok) return false;
+    }
+
+    // AMD rounds each nonzero request up to a multiple of 256 before calling XMemAlloc.
+    const auto granularity = allocation_granularity();
+    for (std::size_t requested : {1u, 257u, 4097u, 65537u}) {
+        const auto rounded = (requested + 255) & ~std::size_t{255};
+        auto* p = static_cast<Byte*>(era_heap::allocate(rounded, amd_word));
+        if (!p) return false;
+        MEMORY_BASIC_INFORMATION info{};
+        bool ok = VirtualQuery(p, &info, sizeof(info)) == sizeof(info) &&
+                  info.AllocationBase == p && info.State == MEM_COMMIT &&
+                  info.Protect == PAGE_READWRITE && info.RegionSize >= rounded &&
+                  reinterpret_cast<std::uintptr_t>(p) % (std::size_t{64} << 10) == 0 &&
+                  reinterpret_cast<std::uintptr_t>(p) % granularity == 0 &&
+                  std::all_of(p, p + rounded, [](Byte b) { return b == 0; });
+        if (ok) {
+            std::fill_n(p, rounded, marker);
+            ok = std::all_of(p, p + rounded, [](Byte b) { return b == marker; });
+        }
+        era_heap::release_with_attributes(p, amd_word);
+        MEMORY_BASIC_INFORMATION after{};
+        if (!ok || VirtualQuery(p, &after, sizeof(after)) != sizeof(after) || after.State != MEM_FREE) {
+            return false;
+        }
+    }
+
+    // Object type and allocator ID are tags and do not change heap placement.
+    const auto tagged = bink_word | 0x1234 | (std::uint64_t{0x7f} << 16);
+    auto* p = era_heap::allocate(97, tagged);
+    const bool tagged_ok = p && reinterpret_cast<std::uintptr_t>(p) % 32 == 0;
+    era_heap::release_with_attributes(p, tagged);
+    if (!tagged_ok) return false;
+
+    std::printf("bink_blocks=2 amd_blocks=4 granularity=%zu\n", granularity);
+    return true;
 }
 
 bool caller_layout_checks()
@@ -76,7 +183,7 @@ bool caller_layout_checks()
     // Supply owned storage with a known origin for each possible base address residue.
     for (std::size_t length : {1u, 31u, 32u, 33u, 255u, 256u, 257u, 4097u}) {
         const auto total = length + 64 + 96;
-        Block block(era_heap::allocate(total, 5ull << 24), era_heap::release);
+        Block block(era_heap::allocate(total, bink_word), era_heap::release);
         if (!block) return false;
         auto* storage = static_cast<Byte*>(block.get());
         for (unsigned residue = 0; residue < 32; ++residue) {
@@ -96,7 +203,7 @@ bool caller_layout_checks()
                 return false;
         }
     }
-    // AMD rounds the size. This experiment imposes no 256-byte pointer alignment.
+    // AMD rounds the size. These ordinary heap blocks impose no 256-byte pointer alignment.
     struct SizeCase { std::size_t requested, allocated; };
     constexpr SizeCase sizes[]{{1,256}, {255,256}, {256,256}, {257,512}, {511,512},
                                {512,512}, {513,768}, {4095,4096}, {4096,4096}, {4097,4352}};
@@ -191,6 +298,8 @@ int main(int argc, char** argv)
         passed = caller_layout_checks();
     } else if (scenario == "reuse"sv) {
         passed = reuse_checks();
+    } else if (scenario == "observed_words"sv) {
+        passed = observed_word_checks();
     } else if (scenario == "concurrency"sv) {
         passed = concurrency_checks();
     } else {

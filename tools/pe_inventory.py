@@ -17,8 +17,8 @@ import pefile
 
 # The linked tests exercise desktop behavior; none provides a Scarlett oracle.
 EXPERIMENTS = {
-    ("xmem.dll", "XMemAlloc"): "era_heap_allocation, era_heap_failure, era_heap_concurrency",
-    ("xmem.dll", "XMemFree"): "era_heap_allocation, era_heap_concurrency",
+    ("xmem.dll", "XMemAlloc"): "era_heap_allocation, era_heap_failure, era_heap_concurrency, era_heap_observed_words",
+    ("xmem.dll", "XMemFree"): "era_heap_allocation, era_heap_concurrency, era_heap_observed_words",
     ("xmem.dll", "XMemVirtualQuery"): "desktop_memory_query, era_query_fields, era_query_tail: Windows page states; tail byte is a desktop policy; Scarlett ABI unverified",
     ("xmem.dll", "XMemGetWorkingSetStatistics"): "desktop_memory_query: Windows process counters; Scarlett scope and units unverified",
     ("d3d12_xs.dll", "D3D12SerializeVersionedRootSignature"): "desktop_root_signature",
