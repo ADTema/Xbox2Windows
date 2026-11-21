@@ -13,6 +13,14 @@ B must hold the same RIP-relative address on every path, and the index must be
 shown to carry the compared value. The generated C++ replaces the dispatch with
 a switch over the table targets.
 
+An export listed as "name:4" also takes a fourth integer word in R9: R9 is then
+defined at entry and the generated function has a fourth parameter. "name" and
+"name:3" take three, and R9 is a scratch register that must be written before it
+is read; any other count is rejected. The count is chosen by whoever invokes the
+translator, not derived from the machine code, and the host must call the
+translated function with the same number of arguments. Stack arguments (the
+fifth and later) and floating-point arguments are not supported.
+
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
 CMOVcc) in one straight-line run that no edge enters. Instructions that leave
 the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc) may sit between them.
@@ -42,7 +50,10 @@ from cpu_ranges import function_ranges, image_bytes
 NAMES = {R.RAX: "rax", R.RCX: "rcx", R.RDX: "rdx", R.RBX: "rbx", R.RSP: "rsp", R.RBP: "rbp",
          R.RSI: "rsi", R.RDI: "rdi", R.R8: "r8", R.R9: "r9", R.R10: "r10", R.R11: "r11",
          R.R12: "r12", R.R13: "r13", R.R14: "r14", R.R15: "r15"}
-ARGUMENTS = (R.RCX, R.RDX, R.R8)
+# Integer argument registers in order. An entry takes the first three unless it is listed as "name:4".
+ARGUMENT_REGISTERS = (R.RCX, R.RDX, R.R8, R.R9)
+ARGUMENT_COUNTS = (3, 4)
+DEFAULT_ARGUMENTS = 3
 VOLATILE = {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
@@ -564,9 +575,13 @@ def flag_producer(function, edges, consumer):
     raise ValueError(f"flag producer too far before RVA {consumer.ip:#x}")
 
 
-def lift(pe, name):
+def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
+    """Translate one export that takes the given number of integer arguments, 3 or 4."""
+    if not isinstance(arguments, int) or arguments not in ARGUMENT_COUNTS:
+        raise ValueError(f"unsupported argument count {arguments!r} for export {name}: expected 3 or 4")
     entry = export_rva(pe, name)
     function = Function(pe, entry)
+    function.arguments = ARGUMENT_REGISTERS[:arguments]
     edges = function.explore()
     lifter = Lifter()
     order = sorted(function.instructions)
@@ -621,7 +636,7 @@ def lift(pe, name):
     # Per register: (low bytes defined on every path: 0, 1, 2 or 8; may hold a guest address that
     # the translation does not reproduce). Arguments are defined at entry; joins meet as (min, or).
     state = {ip: dict.fromkeys(NAMES, (8, False)) for ip in order}
-    state[entry] = {r: (8 if r in ARGUMENTS else 0, False) for r in NAMES}
+    state[entry] = {r: (8 if r in function.arguments else 0, False) for r in NAMES}
     changed = True
     while changed:
         changed = False
@@ -662,7 +677,7 @@ def lift(pe, name):
         following = order[position + 1] if position + 1 < len(order) else None
         if ins.flow_control in (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH) and following != ins.next_ip:
             labels.add(ins.next_ip)
-    locals_ = sorted((lifter.used | {R.RAX}) - set(ARGUMENTS), key=lambda r: NAMES[r])
+    locals_ = sorted((lifter.used | {R.RAX}) - set(function.arguments), key=lambda r: NAMES[r])
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
     if lifter.flags:
         declarations.append("word fa = 0, fb = 0;")
@@ -677,7 +692,7 @@ def lift(pe, name):
         if ins.flow_control in (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH) and following != ins.next_ip:
             text.append(f"    goto loc_{ins.next_ip:x};")
     signature = (f'extern "C" __declspec(dllexport) word lifted_{name}'
-                 f'({", ".join(f"word {NAMES[r]}" for r in ARGUMENTS)})')
+                 f'({", ".join(f"word {NAMES[r]}" for r in function.arguments)})')
     comment = []
     if function.return_width is None:
         comment = ["// RAX: no reachable normal return"]
@@ -706,10 +721,20 @@ template <class T> static void store(word address, T value) {
 """
 
 
+def parse_entry(spec):
+    """Split an export-list item, "name" or "name:N", into the name and its integer argument count."""
+    name, colon, count = spec.partition(":")
+    if not colon:
+        return name, DEFAULT_ARGUMENTS
+    if not (count.isascii() and count.isdigit()):
+        raise ValueError(f"unsupported argument count {count!r} for export {name}: expected 3 or 4")
+    return name, int(count)
+
+
 def translate_pe(pe, names):
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
-    functions = [lift(pe, name) for name in names]
+    functions = [lift(pe, *parse_entry(name)) for name in names]
     return PRELUDE + "\n".join(f"\n{source}" for source, _ in functions) + "\n", [f for _, f in functions]
 
 
@@ -721,7 +746,8 @@ def translate(image, names):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("image", type=Path)
-    parser.add_argument("exports", help="comma-separated export names")
+    parser.add_argument("exports", help='comma-separated export names; "name:4" translates that export with a '
+                                        "fourth integer argument in R9, and the host must pass four")
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
     try:
