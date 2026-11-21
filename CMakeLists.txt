@@ -5,6 +5,9 @@ enable_testing()
 add_executable(root_probe tools/root_probe.cpp)
 target_compile_features(root_probe PRIVATE cxx_std_17)
 target_link_libraries(root_probe PRIVATE d3d12)
+add_executable(root_device_probe tools/root_device_probe.cpp)
+target_compile_features(root_device_probe PRIVATE cxx_std_17)
+target_link_libraries(root_device_probe PRIVATE d3d12 dxgi)
 add_executable(d3d12_sdk_check tests/d3d12_sdk_check.cpp)
 target_compile_features(d3d12_sdk_check PRIVATE cxx_std_17)
 target_link_libraries(d3d12_sdk_check PRIVATE d3d12)
@@ -150,6 +153,8 @@ endif()
 set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
     "Native x64 Python with pefile for static intake tests")
 if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME root_device_controls_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tools/probe_root_devices.py" --warp-only --bin "$<TARGET_FILE_DIR:root_device_probe>")
     add_test(NAME shader_metadata_probe COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/shader_probe_check.py" "$<TARGET_FILE:root_probe>"
         "${CMAKE_CURRENT_BINARY_DIR}/compute_root.cso" "${CMAKE_CURRENT_BINARY_DIR}/compute_tables.cso"
