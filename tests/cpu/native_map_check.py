@@ -245,7 +245,8 @@ def check_delay_directory(mapper, image, provider):
         ("address 0, Size 32", [(size, 32)], "ok", ""),
         ("address past the image", [(address, image_size + 0x1000), (size, 32)], "format",
          "delay import directory outside image"),
-        ("descriptor naming a DLL, Size 0", [(address, named)], "unsupported", "delay imports"),
+        ("descriptor naming a DLL, Size 0", [(address, named)], "unsupported",
+         "delay imports without RVA attributes"),
     )
     bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
     for name, edits, expected, message in cases:
@@ -268,7 +269,8 @@ def check_delay_directory(mapper, image, provider):
                 or bool(requests) != (expected == "ok"):
             raise AssertionError(f"delay {name}: {base=} {status=} {detail=} {requests=}")
     print(f"{image.name}: Windows loads every delay-import variant; pe_map maps an address of 0 and an empty "
-          "table, and rejects a directory past the image (format) and a descriptor naming a DLL (unsupported)")
+          "table, and rejects a directory past the image (format) and a descriptor naming a DLL without RVA "
+          "attributes (unsupported)")
 
 
 def check_empty_export_slot(mapper, image):

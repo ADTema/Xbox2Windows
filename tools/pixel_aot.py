@@ -119,6 +119,9 @@ def registers(first, last, count):
 
 ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
+    "sqrt": (1, "sqrt({0})"), "rsq": (1, "rsqrt({0})"),
+    "floor": (1, "floor({0})"), "fract": (1, "frac({0})"),
+    "add": (2, "({0} + {1})"), "mul": (2, "({0} * {1})"),
     "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
@@ -296,7 +299,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             pending_samples.append(f"sample{i}")
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
-        elif m := match(r"v_(log|exp|rcp|max|min|sub|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|fract|add|mul|max|min|sub|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
             if op == "fmac":
