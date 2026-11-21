@@ -375,7 +375,7 @@ The mapped `call_mix` is compared over 249 input pairs on arguments, guarded wri
 ctest --preset dev --no-tests=error -R '^cpu_native_seh$' -V
 ```
 
-`cpu_native_section` compares every section of the register probe after `LoadLibraryExW` and after `pe_map`, byte for byte. The probe has no entry point and no imports, so the Windows load runs none of its code. In a copy whose `.rsrc` header has `PointerToRawData` set to zero and `SizeOfRawData` unchanged, the Windows loader leaves `.rsrc` zero-filled, and `pe_map` does the same instead of copying the headers from file offset 0. The other sections are unchanged in both loaders. On Windows 11 build 26300.9974, setting the same field to `0x100` or `0x1ff`, below the `0x200` file alignment, made `LoadLibraryExW` fail with `ERROR_BAD_EXE_FORMAT`. `pe_map` still maps those copies, which remains open.
+`cpu_native_section` compares every section of the register probe after `LoadLibraryExW` and after `pe_map`, byte for byte. The probe has no entry point and no imports, so the Windows load runs none of its code. In a copy whose `.rsrc` header has `PointerToRawData` set to zero and `SizeOfRawData` unchanged, the Windows loader leaves `.rsrc` zero-filled, and `pe_map` does the same instead of copying the headers from file offset 0. The other sections are unchanged in both loaders. A nonzero `PointerToRawData` is a different case: Windows rounds it down to a multiple of `0x200`, so `0x100` reads the section from offset 0. In `.rsrc` that puts the headers where the resource directory should be, and `LoadLibraryExW` fails with `ERROR_BAD_EXE_FORMAT`; with the resource directory entry cleared, the same copy loads.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_section$' -V
