@@ -54,3 +54,42 @@ extern "C" __declspec(dllexport) std::size_t sink_read(Call* out, std::size_t ca
 }
 
 extern "C" __declspec(dllexport) void sink_clear() { InterlockedExchange(&count, 0); }
+
+// Releases one image from `threads` native threads at once. Each thread spins until every thread is
+// ready, then calls release(image) and stores the result. Returns only after every thread has fully
+// exited, including its DLL_THREAD_DETACH, so no notification of the race is still in flight.
+using Release = int (*)(void*);
+struct Race {
+    Release release;
+    void* image;
+    volatile LONG ready;
+    volatile LONG go;
+    int* results;
+    LONG index;
+};
+
+static DWORD WINAPI race_thread(void* parameter) {
+    auto* race = static_cast<Race*>(parameter);
+    const LONG slot = InterlockedIncrement(&race->index) - 1;
+    InterlockedIncrement(&race->ready);
+    while (!InterlockedCompareExchange(&race->go, 0, 0)) YieldProcessor();
+    race->results[slot] = race->release(race->image);
+    return 0;
+}
+
+extern "C" __declspec(dllexport) int sink_race_release(Release release, void* image, int threads,
+                                                       int* results) {
+    if (threads <= 0 || threads > MAXIMUM_WAIT_OBJECTS) return 0;
+    Race race{release, image, 0, 0, results, 0};
+    HANDLE handles[MAXIMUM_WAIT_OBJECTS] = {};
+    int started = 0;
+    for (; started < threads; ++started) {
+        handles[started] = CreateThread(nullptr, 0, race_thread, &race, 0, nullptr);
+        if (!handles[started]) break;
+    }
+    while (InterlockedCompareExchange(&race.ready, 0, 0) < started) YieldProcessor();
+    InterlockedExchange(&race.go, 1);
+    WaitForMultipleObjects(static_cast<DWORD>(started), handles, TRUE, INFINITE);
+    for (int i = 0; i < started; ++i) CloseHandle(handles[i]);
+    return started;
+}

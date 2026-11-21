@@ -220,10 +220,12 @@ bool read_file(const wchar_t* path, std::vector<std::uint8_t>& raw) {
 // callbacks after releasing it, so a callback may map or release any image, its own included.
 // pe_map_release unregisters the image and drops the registration reference without waiting. The
 // image's process detach and unmapping run when the last reference goes, either inside
-// pe_map_release or on the thread that finishes the last notification. No notification that starts
-// after the release reaches the image, even from a notifier that took its reference before it. A
-// notification already in progress finishes: when a TLS callback releases its own image, that
-// image's entry point still receives the same thread attach.
+// pe_map_release or on the thread that finishes the last notification. A notification is admitted
+// when its thread takes the reference under the registry lock; none is admitted after the release
+// unregisters the image. An admitted notification skips an image already marked released, but one
+// whose callback has started finishes: when a TLS callback releases its own image, that image's
+// entry point still receives the same thread attach. Addresses are the only identity, so once a
+// released address is reused by a new mapping, a stale pointer releases that new mapping.
 SRWLOCK mapped_lock = SRWLOCK_INIT;
 
 struct Mapped {
