@@ -95,15 +95,18 @@ def translate(image, name, partial=False, callback_offset=None, ffx_destroy=Fals
                 regs[dest] = f"static_cast<std::uint32_t>({regs[source]})"
             elif code == Code.TEST_RM64_R64 and dst == src and reg_src and regs[src] not in SAVED.values():
                 branch = instructions.get(ins.next_ip)
-                if branch is None or branch.code not in (Code.JE_REL8_64, Code.JE_REL32_64):
-                    raise ValueError(f"expected JE after TEST at {ip:#x}")
-                lines.append(indent + f"if ({regs[src]} == 0) {{")
+                if branch is None or branch.code not in (
+                        Code.JE_REL8_64, Code.JE_REL32_64, Code.JNE_REL8_64, Code.JNE_REL32_64):
+                    raise ValueError(f"expected JE or JNE after TEST at {ip:#x}")
+                taken_zero = branch.code in (Code.JE_REL8_64, Code.JE_REL32_64)
+                op = "==" if taken_zero else "!="
+                lines.append(indent + f"if ({regs[src]} {op} 0) {{")
                 checks_allocator = ffx_destroy and regs[src] == "second"
                 walk(branch.near_branch_target, regs.copy(), stack.copy(), sp, visited.copy(), indent + "    ",
-                     stage, True if checks_allocator else allocator_null)
+                     stage, taken_zero if checks_allocator else allocator_null)
                 lines.append(indent + "}")
                 if checks_allocator:
-                    allocator_null = False
+                    allocator_null = not taken_zero
                 ip = branch.next_ip
                 continue
             elif code in (Code.JMP_REL8_64, Code.JMP_REL32_64):
