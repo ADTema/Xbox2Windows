@@ -345,6 +345,25 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/cpu/bink_heap_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
             "$<TARGET_FILE:cpu_bink_package_lifted>")
     endif()
+    cpu_asm_fixture(cpu_working_set_delta working_set_delta)
+    function(working_set_delta_translation target image dependency)
+        set(cpp "${CMAKE_CURRENT_BINARY_DIR}/${target}.cpp")
+        add_custom_command(OUTPUT "${cpp}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/ffx_working_set_delta.py"
+                "${image}" "${cpp}" ${ARGN}
+            DEPENDS ${dependency} tools/ffx_working_set_delta.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(${target} SHARED "${cpp}")
+    endfunction()
+    working_set_delta_translation(cpu_working_set_delta_lifted "$<TARGET_FILE:cpu_working_set_delta>" cpu_working_set_delta)
+    add_test(NAME cpu_working_set_delta COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/working_set_delta_check.py" "$<TARGET_FILE:cpu_working_set_delta>"
+        "$<TARGET_FILE:cpu_working_set_delta_lifted>")
+    if(FFX_UPSCALER_IMAGE)
+        working_set_delta_translation(ffx_package_working_set_delta "${FFX_UPSCALER_IMAGE}" "${FFX_UPSCALER_IMAGE}" --package)
+        add_test(NAME ffx_package_working_set_delta COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/working_set_delta_check.py" "$<TARGET_FILE:ffx_package_working_set_delta>")
+    endif()
     set(heap_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_heap_layout_lifted.cpp")
     add_custom_command(OUTPUT "${heap_fixture}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/heap_layout.py"
