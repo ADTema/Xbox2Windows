@@ -82,6 +82,27 @@ void run_recurrent(RecurrentBinding& binding, RecurrentProvider& provider, const
     write_at(record, 0, handle);
     write_at(record, 0x28, 2u);
     write_at(record, 0x2c, 2u);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    const auto self = reinterpret_cast<uintptr_t>(binding.device);
+    const auto texture = reinterpret_cast<uintptr_t>(handle);
+    const auto stride = binding.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto destination = [&](size_t offset, uint32_t slot_index) {
+        return read_at<ID3D12DescriptorHeap*>(scratch, offset)->GetCPUDescriptorHandleForHeapStart().ptr + slot_index * stride;
+    };
+    binding.create_srv(self, texture, reinterpret_cast<uintptr_t>(&srv), destination(0x28, index));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = srv.Format;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    const auto base = read_at<uint32_t>(slot, 0xc);
+    write_at(record, 0x34, base);
+    write_at(record, 0x38, 1u);
+    for (auto offset : {0x38, 0x30})
+        binding.create_uav(self, texture, 0, reinterpret_cast<uintptr_t>(&uav), destination(offset, base));
+    write_at(slot, 0xc, base + 1);
 }
 #endif
 
@@ -112,7 +133,7 @@ void check_ffx_recurrent(ID3D12Device* device)
         auto* records = read_at<uint8_t*>(scratch, 0x1070);
         if (records != scratch + 0xbf100 || read_at<uint32_t>(slot, 4) != 1)
             throw std::runtime_error("Unexpected initial resource table or cursor");
-        RecurrentBinding binding{device};
+        RecurrentBinding binding{probe};
         run_recurrent(binding, provider, config);
         auto wanted_indices = std::array<uint32_t, 24>{};
         wanted_indices.fill(UINT32_MAX);
@@ -128,10 +149,10 @@ void check_ffx_recurrent(ID3D12Device* device)
             desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality || desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN ||
             (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT))
             throw std::runtime_error("Recurrent GetDesc mismatch");
-        ComputeCommands commands(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
-        transition(commands.list.Get(), binding.resource.Get(), initial_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        transition(commands.list.Get(), binding.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, initial_state);
-        commands.submit_and_wait(device);
+        if (read_at<uint32_t>(records, 64+0x34) != 1 || read_at<uint32_t>(records, 64+0x38) != 1 ||
+            read_at<uint32_t>(slot, 0xc) != 2)
+            throw std::runtime_error("Recurrent UAV base, count or next slot differs");
+        check_recurrent_views(binding);
         std::printf("recurrent_desc=%llux%u format=%u flags=0x%x alignment=%llu context=%u id=13 index=%u next=%u barriers=passed\n",
                     desc.Width, desc.Height, unsigned(desc.Format), unsigned(desc.Flags), desc.Alignment,
                     provider.slot.index, provider.resources[13], read_at<uint32_t>(slot, 4));

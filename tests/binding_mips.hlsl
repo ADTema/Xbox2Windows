@@ -1,5 +1,16 @@
 RWByteAddressBuffer src : register(u0);
 RWByteAddressBuffer dst : register(u1);
+RWTexture2D<float4> recurrent : register(u2);
+cbuffer RecurrentPattern : register(b2) { uint outputWidth, outputHeight, seed; }
+
+[RootSignature("DescriptorTable(UAV(u2)),RootConstants(num32BitConstants=3,b2)")]
+[numthreads(8,8,1)]
+void WriteRecurrent(uint2 xy : SV_DispatchThreadID)
+{
+    if (xy.x >= outputWidth || xy.y >= outputHeight) return;
+    uint4 rgba = uint4(xy.x + seed, xy.y + 3 * seed, (xy.x ^ xy.y) + seed, 193 + seed);
+    recurrent[xy] = float4(rgba & 255u) / 255.0;
+}
 cbuffer Bounds : register(b0) { uint count; }
 
 [RootSignature("UAV(u0),UAV(u1),RootConstants(num32BitConstants=1,b0)")]
