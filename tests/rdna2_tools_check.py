@@ -117,6 +117,9 @@ class TestRdna2Disasm(unittest.TestCase):
             ("000082be", "s_mov_b32", "s_mov_b32 s2, s0"),
             ("000182be", "s_mov_b64", "s_mov_b64 s2, s0"),
             ("00008080", "s_sub_u32", "s_sub_u32 s0, s0, s0"),
+            # GFX10 scalar operand codes: 108-123 are ttmp0-15, 125 is null (SOP2 ssrc1)
+            ("007d8080", "s_sub_u32", "s_sub_u32 s0, s0, null"),
+            ("006c8080", "s_sub_u32", "s_sub_u32 s0, s0, ttmp0"),
             ("0000027e", "v_nop", "v_nop"),
             # VOP1 9-bit SRC0: 0..255 scalar/constant, 256..511 VGPR
             ("0103007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, v1"),
