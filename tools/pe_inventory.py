@@ -17,9 +17,9 @@ import pefile
 
 # The linked tests exercise desktop behavior; none provides a Scarlett oracle.
 EXPERIMENTS = {
-    ("xmem.dll", "XMemAlloc"): "era_heap_allocation, era_heap_failure, era_heap_concurrency",
-    ("xmem.dll", "XMemFree"): "era_heap_allocation, era_heap_concurrency",
-    ("xmem.dll", "XMemVirtualQuery"): "desktop_memory_query: Windows page states; Scarlett ABI unverified",
+    ("xmem.dll", "XMemAlloc"): "era_heap_allocation, era_heap_failure, era_heap_concurrency, era_heap_observed_words",
+    ("xmem.dll", "XMemFree"): "era_heap_allocation, era_heap_concurrency, era_heap_observed_words",
+    ("xmem.dll", "XMemVirtualQuery"): "desktop_memory_query, era_query_fields, era_query_tail: Windows page states; tail byte is a desktop policy; Scarlett ABI unverified",
     ("xmem.dll", "XMemGetWorkingSetStatistics"): "desktop_memory_query: Windows process counters; Scarlett scope and units unverified",
     ("d3d12_xs.dll", "D3D12SerializeVersionedRootSignature"): "desktop_root_signature",
     ("d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer"): "desktop_root_signature",
@@ -30,9 +30,15 @@ def label(raw):
     return raw.decode("ascii", errors="backslashreplace") if raw is not None else None
 
 
-def api_sets(system):
+def _file_digest(path):
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+@cache
+def _parsed_api_sets(path, digest):
     # Read the v6 namespace and its per-importer overrides from the host image.
-    with pefile.PE(str(system / "apisetschema.dll"), fast_load=True) as pe:
+    with pefile.PE(path, fast_load=True) as pe:
         section = next(s for s in pe.sections if s.Name.rstrip(b"\0") == b".apiset")
         data = section.get_data()
     version, _, _, count, entries, _, _ = struct.unpack_from("<7I", data)
@@ -51,6 +57,11 @@ def api_sets(system):
             hosts[name(alias, alias_size)] = name(host, host_size)
         contracts[name(start, hashed_size)] = hosts
     return contracts
+
+
+def api_sets(system):
+    schema = Path(system) / "apisetschema.dll"
+    return _parsed_api_sets(str(schema), _file_digest(schema))
 
 
 def exports(pe):
@@ -177,8 +188,7 @@ def parse_image(path):
     with pefile.PE(str(path), fast_load=True) as pe:
         pe.parse_data_directories(directories=[0])
         imports = import_tables(pe, path)
-        with path.open("rb") as f:
-            digest = hashlib.file_digest(f, "sha256").hexdigest()
+        digest = _file_digest(path)
         info = {
             "machine": pefile.MACHINE_TYPE.get(pe.FILE_HEADER.Machine, hex(pe.FILE_HEADER.Machine)),
             "sha256": digest, "exports": exports(pe), "parse_warnings": pe.get_warnings(),
@@ -186,8 +196,24 @@ def parse_image(path):
     return info, imports
 
 
-def scan(root, *, extra_image=None):
-    system = Path(os.environ["SystemRoot"]) / "System32"
+def _export_table(rows):
+    table = {}
+    for row in rows:
+        table[f"#{row['ordinal']}"] = row["forwarder"]
+        if row["name"] is not None:
+            table[row["name"]] = row["forwarder"]
+    return table
+
+
+@cache
+def _parsed_system_exports(path, digest):
+    with pefile.PE(path, fast_load=True) as pe:
+        pe.parse_data_directories(directories=[0])
+        return _export_table(exports(pe))
+
+
+def scan(root, *, extra_image=None, system=None):
+    system = Path(system) if system is not None else Path(os.environ["SystemRoot"]) / "System32"
     process, native = ctypes.c_ushort(), ctypes.c_ushort()
     if not ctypes.windll.kernel32.IsWow64Process2(
             ctypes.c_void_p(-1), ctypes.byref(process), ctypes.byref(native)):
@@ -197,21 +223,12 @@ def scan(root, *, extra_image=None):
     contracts = api_sets(system)
     system_images = {p.name.lower(): p for p in system.glob("*.dll")}
 
-    def export_table(rows):
-        table = {}
-        for row in rows:
-            table[f"#{row['ordinal']}"] = row["forwarder"]
-            if row["name"] is not None:
-                table[row["name"]] = row["forwarder"]
-        return table
-
     @cache
     def system_exports(name):
         if name not in system_images:
             return None
-        with pefile.PE(str(system_images[name]), fast_load=True) as pe:
-            pe.parse_data_directories(directories=[0])
-            return export_table(exports(pe))
+        target = system_images[name]
+        return _parsed_system_exports(str(target), _file_digest(target))
 
     images = {}
     edges = []
@@ -235,7 +252,7 @@ def scan(root, *, extra_image=None):
 
     def package_exports(name):
         found = [path for path, _ in bundled[name]]
-        return found, export_table(images[found[0]]["exports"]) if len(found) == 1 else None
+        return found, _export_table(images[found[0]]["exports"]) if len(found) == 1 else None
 
     rows = []
     for image, kind, dll, symbol in sorted(set(edges)):

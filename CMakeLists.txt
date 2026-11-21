@@ -17,7 +17,7 @@ add_test(NAME desktop_bvh_root_flags COMMAND d3d12_sdk_check bvh-flags)
 add_executable(era_heap_check tests/era_heap_check.cpp src/era_heap.cpp)
 target_include_directories(era_heap_check PRIVATE src)
 target_compile_features(era_heap_check PRIVATE cxx_std_20)
-foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse)
+foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words)
     add_test(NAME era_heap_${scenario} COMMAND era_heap_check ${scenario})
 endforeach()
 
@@ -25,6 +25,13 @@ add_executable(memory_query_check tests/memory_query_check.cpp)
 target_compile_features(memory_query_check PRIVATE cxx_std_17)
 target_link_libraries(memory_query_check PRIVATE psapi)
 add_test(NAME desktop_memory_query COMMAND memory_query_check)
+
+add_executable(era_query_check tests/era_query_check.cpp src/era_query.cpp)
+target_include_directories(era_query_check PRIVATE src)
+target_compile_features(era_query_check PRIVATE cxx_std_17)
+foreach(scenario IN ITEMS fields tail registry short)
+    add_test(NAME era_query_${scenario} COMMAND era_query_check ${scenario})
+endforeach()
 
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
@@ -110,6 +117,22 @@ foreach(entry IN ITEMS Produce ReadValues WaveValues Wave64 WriteScene ExpandLea
         BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
     target_sources(offscreen_check PRIVATE "${header}")
 endforeach()
+target_sources(offscreen_check PRIVATE tests/wave_shuffle.cpp)
+foreach(width IN ITEMS 0 16 32 64)
+    if(width)
+        set(entry WaveShuffle${width})
+        set(shuffle_args -T cs_6_6 -D WAVE_SIZE=${width})
+    else()
+        set(entry WaveShuffle)
+        set(shuffle_args -T cs_6_5)
+    endif()
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
+    add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" ${shuffle_args} -E Shuffle -Vn ${entry}
+        -Fh "${header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/wave_shuffle.hlsl" DEPENDS tests/wave_shuffle.hlsl
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
+    target_sources(offscreen_check PRIVATE "${header}")
+endforeach()
 foreach(entry IN ITEMS CopyBlocks FillBlocks NumberBlocks CopySpan ResetBounds)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
     add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E ${entry} -Vn ${entry}
@@ -122,7 +145,7 @@ add_custom_command(OUTPUT "${ray_header}"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CSMain -Vn ray_query -Fh "${ray_header}"
             -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_query.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_query.hlsl"
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_query.cso" DEPENDS tests/ray_query.hlsl VERBATIM)
-target_sources(offscreen_check PRIVATE "${ray_header}")
+target_sources(offscreen_check PRIVATE "${ray_header}" tests/dxr_facing.cpp)
 foreach(layout IN ITEMS root tables)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/compute_${layout}.h")
     set(binary "${CMAKE_CURRENT_BINARY_DIR}/compute_${layout}.cso")
@@ -152,6 +175,8 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME dxr_query_${adapter} COMMAND offscreen_check ${adapter} --ray-query)
     add_test(NAME dxr_update_${adapter} COMMAND offscreen_check ${adapter} --dxr-update)
     set_tests_properties(dxr_update_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    add_test(NAME dxr_facing_${adapter} COMMAND offscreen_check ${adapter} --dxr-facing)
+    set_tests_properties(dxr_facing_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_buffer_ops_${adapter} COMMAND offscreen_check ${adapter} --buffer-ops)
     add_test(NAME bvh_root_roundtrip_${adapter} COMMAND offscreen_check ${adapter} --bvh-root-roundtrip)
     set_tests_properties(bvh_root_roundtrip_${adapter} PROPERTIES TIMEOUT 45)
@@ -160,6 +185,8 @@ foreach(adapter IN ITEMS hardware warp)
         set_tests_properties(bvh_${work}_${adapter} PROPERTIES TIMEOUT 45)
     endforeach()
     set_tests_properties(bvh_wave64_${adapter} bvh_differential_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME wave_shuffle_${adapter} COMMAND offscreen_check ${adapter} --wave-shuffle)
+    set_tests_properties(wave_shuffle_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(bvh_buffer_ops_${adapter} PROPERTIES TIMEOUT 45)
     set_tests_properties(dxr_query_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(offscreen_${adapter} PROPERTIES TIMEOUT 45)
@@ -328,10 +355,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_library(${target} SHARED "${cpp}")
         target_link_libraries(${target} PRIVATE cpu_bink_heap_provider)
     endfunction()
-    bink_heap_translation(cpu_bink_heap_lifted "$<TARGET_FILE:cpu_bink_heap>" cpu_bink_heap)
+    bink_heap_translation(cpu_bink_heap_lifted "$<TARGET_FILE:cpu_bink_heap>" cpu_bink_heap --group-entry heap_group)
     add_test(NAME cpu_aot_bink_heap COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/bink_heap_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
         "$<TARGET_FILE:cpu_bink_heap>" "$<TARGET_FILE:cpu_bink_heap_lifted>")
+    add_test(NAME cpu_aot_bink_group COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bink_group_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
+        "$<TARGET_FILE:cpu_bink_heap>" "$<TARGET_FILE:cpu_bink_heap_lifted>")
+    set(BINK_GROUP_ENTRY "" CACHE STRING "Optional grouped allocation caller RVA in the local Bink image")
     set(BINK_HEAP_IMAGE "" CACHE FILEPATH "Local PE containing the Bink allocation and release callers")
     set(BINK_HEAP_ENTRIES "" CACHE STRING "Two semicolon-separated entry RVAs (allocation;release)")
     if(BINK_HEAP_IMAGE)
@@ -339,11 +370,38 @@ if(EXISTS "${INTAKE_PYTHON}")
         if(NOT entry_count EQUAL 2)
             message(FATAL_ERROR "Provide both BINK_HEAP_ENTRIES for the selected local image")
         endif()
+        set(group_args)
+        if(BINK_GROUP_ENTRY)
+            set(group_args --group-entry "${BINK_GROUP_ENTRY}")
+            add_test(NAME cpu_aot_bink_package_group COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/cpu/bink_group_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
+                "$<TARGET_FILE:cpu_bink_package_lifted>")
+        endif()
         bink_heap_translation(cpu_bink_package_lifted "${BINK_HEAP_IMAGE}" "${BINK_HEAP_IMAGE}"
-            --entries ${BINK_HEAP_ENTRIES})
+            --entries ${BINK_HEAP_ENTRIES} ${group_args})
         add_test(NAME cpu_aot_bink_package_heap COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/cpu/bink_heap_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
             "$<TARGET_FILE:cpu_bink_package_lifted>")
+    endif()
+    cpu_asm_fixture(cpu_bink_descriptors bink_descriptors)
+    function(bink_descriptors_translation target image dependency)
+        set(cpp "${CMAKE_CURRENT_BINARY_DIR}/${target}.cpp")
+        add_custom_command(OUTPUT "${cpp}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/bink_descriptors_aot.py"
+                "${image}" "${cpp}" ${ARGN}
+            DEPENDS ${dependency} tools/bink_descriptors_aot.py tools/bink_heap_aot.py
+                tools/ffx_version_query.py tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(${target} SHARED "${cpp}")
+    endfunction()
+    bink_descriptors_translation(cpu_bink_descriptors_lifted "$<TARGET_FILE:cpu_bink_descriptors>" cpu_bink_descriptors)
+    add_test(NAME cpu_bink_descriptors COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bink_descriptors_check.py" --native "$<TARGET_FILE:cpu_bink_descriptors>"
+        "$<TARGET_FILE:cpu_bink_descriptors_lifted>")
+    set(BINK_DESCRIPTOR_IMAGE "" CACHE FILEPATH "Local Bink DLL for the grouped descriptor producer experiment")
+    if(BINK_DESCRIPTOR_IMAGE)
+        bink_descriptors_translation(cpu_bink_package_descriptors "${BINK_DESCRIPTOR_IMAGE}" "${BINK_DESCRIPTOR_IMAGE}" --package)
+        add_test(NAME cpu_bink_package_descriptors COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/bink_descriptors_check.py" "$<TARGET_FILE:cpu_bink_package_descriptors>")
     endif()
     set(heap_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_heap_layout_lifted.cpp")
     add_custom_command(OUTPUT "${heap_fixture}"
@@ -437,6 +495,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_import_altered>"
         --two "$<TARGET_FILE:cpu_two_imports>" "$<TARGET_FILE:cpu_import_provider>"
             "$<TARGET_FILE:cpu_register_probe>")
+    add_test(NAME cpu_native_reloc_free COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_reloc_free_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_register_probe>" "$<TARGET_FILE:cpu_import_original>"
+        "$<TARGET_FILE:cpu_import_provider>")
     cpu_asm_fixture(cpu_seh_original seh_route)
     add_test(NAME cpu_native_seh COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_seh_check.py" "$<TARGET_FILE:cpu_seh_original>"
@@ -455,21 +517,54 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_tls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_tls_check.py" "$<TARGET_FILE:cpu_tls_original>"
         "$<TARGET_FILE:cpu_tls_refuse>" "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:pe_map>")
+    add_library(cpu_frame_host SHARED tests/cpu/frame_host.cpp)
+    add_library(cpu_frame_guest SHARED tests/cpu/tls_route.asm tests/cpu/frame_route.def)
+    set_target_properties(cpu_frame_guest PROPERTIES LINKER_LANGUAGE CXX)
+    target_compile_definitions(cpu_frame_guest PRIVATE FRAME_GUEST)
+    target_link_options(cpu_frame_guest PRIVATE /ENTRY:dll_entry /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_frame_guest PRIVATE cpu_tls_sink cpu_frame_host)
+
+    add_library(cpu_delay_provider SHARED tests/cpu/delay_provider.cpp tests/cpu/delay_provider.def)
+    add_library(cpu_delay_provider_altered SHARED tests/cpu/delay_provider.cpp
+        tests/cpu/delay_provider_altered.def)
+    target_compile_definitions(cpu_delay_provider_altered PRIVATE ALTER_RETURN)
+    add_library(cpu_delay_route SHARED tests/cpu/delay_route.cpp)
+    target_link_libraries(cpu_delay_route PRIVATE cpu_delay_provider delayimp)
+    target_link_options(cpu_delay_route PRIVATE /DELAYLOAD:cpu_delay_provider.dll /INCREMENTAL:NO)
+    add_test(NAME cpu_native_delay COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_delay_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_delay_route>" "$<TARGET_FILE:cpu_delay_provider>"
+        "$<TARGET_FILE:cpu_delay_provider_altered>")
     add_library(script_path_host SHARED tools/script_path_host.cpp)
     target_compile_features(script_path_host PRIVATE cxx_std_17)
     add_test(NAME script_path_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/script_path_check.py" "$<TARGET_FILE:script_path_host>")
+    add_executable(ffx_pass26_lds tests/ffx_pass26_lds/gate.cpp)
+    target_link_libraries(ffx_pass26_lds PRIVATE d3d11 d3dcompiler)
+    add_test(NAME ffx_pass26_lds_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/ffx_pass26_lds/verify.py"
+        --host $<TARGET_FILE:ffx_pass26_lds> --backend warp)
+
     add_test(NAME script_state_literals COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/script_state_check.py")
+    add_test(NAME script_dispatch_pairs COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/script_dispatch_check.py" "$<TARGET_FILE:script_path_host>")
     add_test(NAME bcpack_prefix_and_mip_tail COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bcpack_check.py")
     add_test(NAME bc7_block_reference COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bc7_blocks_check.py")
     add_test(NAME resource_range_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/resource_ranges_check.py")
+    add_test(NAME rdna2_tools_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/rdna2_tools_check.py")
     add_test(NAME dxcontainer_part_offsets COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxcontainer_part_offsets_check.py")
     foreach(adapter IN ITEMS hardware warp)
+        add_test(NAME cpu_native_frame_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/native_frame_check.py" "$<TARGET_FILE:cpu_frame_guest>"
+            "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:cpu_frame_host>" "$<TARGET_FILE:pe_map>"
+            "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(cpu_native_frame_${adapter} PROPERTIES TIMEOUT 95)
         add_test(NAME pixel_aot_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -479,7 +574,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(bc7_draw_${adapter} PROPERTIES TIMEOUT 60)
     endforeach()
-    set_tests_properties(pixel_aot_hardware bc7_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(cpu_native_frame_hardware pixel_aot_hardware bc7_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compressed_scene_metadata COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/scene_records_check.py" "${CMAKE_CURRENT_BINARY_DIR}/DualUav.cso"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.cso" "$<TARGET_FILE:root_probe>")
@@ -523,4 +618,14 @@ else()
         "INTAKE_PYTHON was not found at '${INTAKE_PYTHON}'. "
         "Follow the Python setup under First build in README.md, or set INTAKE_PYTHON "
         "to an interpreter with requirements-dev.txt installed. Then rerun CMake.")
+endif()
+
+if(EXISTS "${INTAKE_PYTHON}")
+    add_executable(rcas_coordinate_readback tests/rcas_coordinate_readback/readback.cpp)
+    target_link_libraries(rcas_coordinate_readback PRIVATE d3d11 d3dcompiler)
+    foreach(control IN ITEMS positive negative)
+        add_test(NAME rcas_coordinate_${control}_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/rcas_coordinate_readback/verify.py" "${CMAKE_SOURCE_DIR}"
+            --host $<TARGET_FILE:rcas_coordinate_readback> --backend warp --case ${control})
+    endforeach()
 endif()

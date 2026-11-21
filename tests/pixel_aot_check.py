@@ -132,6 +132,23 @@ def curve():
     ])
 
 
+def shaping():
+    return with_constants([
+        "v_max_f32_e32 v18, s46, v12",
+        "v_sqrt_f32_e32 v18, v18",
+        "v_mul_f32_e32 v18, s45, v18",
+        "v_add_f32_e32 v19, s44, v13",
+        "v_rsq_f32_e32 v19, v19",
+        "v_add_f32_e32 v18, v19, v18",
+        "v_mul_f32_e32 v20, s44, v13",
+        "v_floor_f32_e32 v21, v20",
+        "v_fract_f32_e32 v20, v20",
+        "v_fma_f32 v12, s47, v20, v18",
+        "v_sub_f32_e32 v12, v12, v21",
+        "v_mul_f32_e64 v12, v12, 1.0 clamp",
+    ])
+
+
 def select(wave64=False):
     """Compare into lane masks and select; LLVM names the masks by wavefront width."""
     vcc, first, second = ("vcc", "s[52:53]", "s[54:55]") if wave64 else ("vcc_lo", "s52", "s53")
@@ -158,6 +175,45 @@ def absolute_value():
     return program
 
 
+# The gfx10 predicate number is a four-bit truth table. Bits 0..3 select
+# less, equal, greater and unordered respectively, independent of the HLSL.
+PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
+              "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru")
+
+
+def predicate_group(first):
+    # Copy runtime constants into vector registers using supported operations.
+    body = ["v_sub_f32_e64 v18, s45, 0", "v_sub_f32_e64 v19, s47, 0"]
+    for channel, op in enumerate(PREDICATES[first:first + 4]):
+        body.extend([f"v_cmp_{op}_f32_e32 vcc_lo, s44, v18",
+                     f"v_cndmask_b32_e32 v{12 + channel}, 0, v19, vcc_lo"])
+    return with_constants(body)
+
+
+def check_predicate_draws(directory, compiler, renderer, backend):
+    source = directory / "predicates.hlsl"
+    shader = directory / "predicates.cso"
+    case = directory / "predicates.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    inputs = ((-1, 1, 0), (-0.0, 0.0, 1), (1, -1, 2),
+              (math.nan, 1, 3), (1, math.nan, 3))
+    for first in range(0, 16, 4):
+        source.write_text(translate(predicate_group(first)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        for left, right, relation in inputs:
+            constants = bytearray(256)
+            struct.pack_into("<4f", constants, 12, left, right, 0, 1)
+            pixel = struct.pack("<4f", *((op >> relation) & 1 for op in range(first, first + 4)))
+            case.write_bytes(constants + pixel * 64)
+            subprocess.run(draw, check=True)
+    # Keep the unordered oracle and change only the NaN operand to equal.
+    struct.pack_into("<f", constants, 16, 1.0)
+    case.write_bytes(constants + pixel * 64)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Replacing NaN with a finite equal operand escaped detection")
+
+
 def half_rtz(x):
     bits, = struct.unpack("<H", struct.pack("<e", x))
     rounded, = struct.unpack("<e", struct.pack("<H", bits))
@@ -174,6 +230,24 @@ def curve_case(directory, gain):
             r = gain * math.sqrt(max(floor, x / 255)) - (1 - g) + mix * g
             case.extend(struct.pack("<4f", half_rtz(min(1, max(0, r))), half_rtz(g), half_rtz(128/255), 1))
     path = directory / "curve.case"
+    path.write_bytes(case)
+    return path
+
+
+def shaping_case(directory, gain):
+    scale, floor, mix = 2.0, .125, .25
+    case = bytearray(256)
+    struct.pack_into("<4f", case, 12, scale, gain, floor, mix)
+    for y in RAMP:
+        for x in RAMP:
+            g = y / 255
+            scaled = scale * g
+            r = (gain * math.sqrt(max(floor, x / 255))
+                 + 1.0 / math.sqrt(scale + g)
+                 + mix * (scaled - math.floor(scaled))
+                 - math.floor(scaled))
+            case.extend(struct.pack("<4f", half_rtz(min(1, max(0, r))), half_rtz(g), half_rtz(128/255), 1))
+    path = directory / "shaping.case"
     path.write_bytes(case)
     return path
 
@@ -209,7 +283,23 @@ def select_case(directory, fold, limit, capped, unequal):
     return path
 
 
+def check_constant_descriptor_bounds() -> None:
+    for offset in (0, 28, 32):
+        program = [line.replace("s[20:21], 0x40", f"s[20:21], {offset:#x}")
+                   for line in curve()]
+        if offset == 32:
+            assert lower(program, 20, 24, [1, 2, 3, 4], offset) == translate(curve())
+        else:
+            try:
+                lower(program, 20, 24, [1, 2, 3, 4], offset)
+            except ValueError as error:
+                assert "descriptors overlap" in str(error), error
+            else:
+                raise AssertionError(f"Constant descriptor at {offset} overlaps texture 0")
+
+
 def check_controls(directory):
+    check_constant_descriptor_bounds()
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     record = envelope(code)
@@ -223,11 +313,15 @@ def check_controls(directory):
         must_reject(native_program, archive, "fixture")
 
     # LLVM 15 prints "exp mrt0 v16, ..."; newer LLVM prints "exp mrt0, v16, ...".
-    for program in (assembly(False), assembly(True), curve()):
+    for program in (assembly(False), assembly(True), curve(), shaping()):
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
         assert modern != program
         assert translate(modern) == translate(program)
         must_reject(translate, [line.replace("exp mrt0 ", "exp mrt0,, ") for line in program])
+
+    for old, new in (("v_sqrt_f32_e32 v18, v18", "v_sqrt_f32_e32 v18, v18, v18"),
+                     ("v_add_f32_e32 v19, s44, v13", "v_add_f32_e32 v19, v13")):
+        must_reject(translate, [line.replace(old, new) for line in shaping()])
 
     program = absolute_value()
     alternate = [line.replace("|v12|", "abs(v12)") for line in program]
@@ -272,7 +366,8 @@ def check_controls(directory):
 
 
 def check_binary(directory, assembler, objcopy, library):
-    fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (select(), translate), (absolute_value(), translate)]
+    fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate)]
+    fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     for instructions, lower_fixture in fixtures:
@@ -304,18 +399,19 @@ def check_render(directory, compiler, renderer, backend):
             wrong = subprocess.run([*draw, "rgba"], capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("The renderer failed to detect the changed channel order")
-    source.write_text(translate(curve()), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
-    for gain in (.75, 1.125):
-        case = curve_case(directory, gain)
-        draw = [renderer, backend, "--check-pixel-case", shader, case]
-        subprocess.run(draw, check=True)
-    corrupted = bytearray(case.read_bytes())
-    struct.pack_into("<f", corrupted, 16, 0.0)
-    case.write_bytes(corrupted)
-    wrong = subprocess.run(draw, capture_output=True, text=True)
-    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
-        raise AssertionError("Stale reference accepted after changing the bound constants")
+    for program_fn, case_fn in ((curve, curve_case), (shaping, shaping_case)):
+        source.write_text(translate(program_fn()), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        for gain in (.75, 1.125):
+            case = case_fn(directory, gain)
+            draw = [renderer, backend, "--check-pixel-case", shader, case]
+            subprocess.run(draw, check=True)
+        corrupted = bytearray(case.read_bytes())
+        struct.pack_into("<f", corrupted, 16, 0.0)
+        case.write_bytes(corrupted)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError("Stale reference accepted after changing the bound constants")
 
     program = absolute_value()
     case = absolute_case(directory)
@@ -342,6 +438,7 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Stale reference accepted after moving the comparison threshold")
+    check_predicate_draws(directory, compiler, renderer, backend)
     capture = directory / "blend.rgba"
     draw = [renderer, backend, "--dual-pixel", shader, capture]
     for case in DUAL_CASES:

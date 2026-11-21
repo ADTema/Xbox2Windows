@@ -3,6 +3,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <cstdio>
+#include <cwchar>
 #include <fstream>
 #include <stdexcept>
 #include <string_view>
@@ -32,25 +33,63 @@ void check(HRESULT hr, const char* stage)
     }
 }
 
-ComPtr<IDXGIAdapter1> select_adapter(IDXGIFactory6* factory, bool warp)
+bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
+    const size_t length = std::wcslen(part);
+    for (; *text; ++text) {
+        if (_wcsnicmp(text, part, length) == 0) return true;
+    }
+    return false;
+}
+
+// Without XBOX2WINDOWS_ADAPTER, the first D3D12 hardware adapter in high-performance order is used.
+// With it, the first whose description contains the value, ignoring case, so a PC with several GPUs
+// can test each one. A value that matches no adapter is an error, not a skipped test.
+ComPtr<IDXGIAdapter1> select_adapter(IDXGIFactory6* factory, bool warp, ComPtr<ID3D12Device>& device
+#ifdef OFFSCREEN_AGILITY_620
+    , ID3D12DeviceFactory* device_factory
+#endif
+)
+{
+    auto create_device = [&](IDXGIAdapter1* candidate) {
+#ifdef OFFSCREEN_AGILITY_620
+        return device_factory->CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(device.ReleaseAndGetAddressOf()));
+#else
+        return D3D12CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(device.ReleaseAndGetAddressOf()));
+#endif
+    };
+    auto supports_d3d12 = [&](IDXGIAdapter1* candidate) {
+#ifdef OFFSCREEN_AGILITY_620
+        return SUCCEEDED(device_factory->CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr));
+#else
+        return SUCCEEDED(D3D12CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr));
+#endif
+    };
     ComPtr<IDXGIAdapter1> adapter;
     if (warp) {
         check(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "EnumWarpAdapter");
+        check(create_device(adapter.Get()), "Create device");
         return adapter;
     }
+    wchar_t wanted[128]{};
+    const DWORD filter = GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", wanted, 128);
+    if (filter >= 128) throw std::runtime_error("XBOX2WINDOWS_ADAPTER is longer than 127 characters");
     for (UINT index = 0;; ++index) {
         HRESULT hr = factory->EnumAdapterByGpuPreference(index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
                                                         IID_PPV_ARGS(adapter.ReleaseAndGetAddressOf()));
         if (hr == DXGI_ERROR_NOT_FOUND) {
-            return {};
+            if (!filter) return {};
+            std::fprintf(stderr, "No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=%ls\n", wanted);
+            throw std::runtime_error("Select adapter");
         }
         check(hr, "Enumerate hardware");
         DXGI_ADAPTER_DESC1 desc{};
         check(adapter->GetDesc1(&desc), "Adapter description");
-        if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-            SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr))) {
-            return adapter;
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        if (!filter || contains_ignoring_case(desc.Description, wanted)) {
+            if (SUCCEEDED(create_device(adapter.Get()))) return adapter;
+        } else if (supports_d3d12(adapter.Get())) {
+            std::fprintf(stderr, "XBOX2WINDOWS_ADAPTER: skipping %ls\n", desc.Description);
         }
     }
 }
@@ -335,7 +374,12 @@ int main(int argc, char** argv)
         std::printf("backend=%s debug_layer=%s\n", argv[1], debug ? "enabled" : "unavailable");
         ComPtr<IDXGIFactory6> factory;
         check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "Create DXGI factory");
-        auto adapter = select_adapter(factory.Get(), mode == "warp");
+        ComPtr<ID3D12Device> device;
+#ifdef OFFSCREEN_AGILITY_620
+        auto adapter = select_adapter(factory.Get(), mode == "warp", device, device_factory.Get());
+#else
+        auto adapter = select_adapter(factory.Get(), mode == "warp", device);
+#endif
         if (!adapter) {
             std::puts("No D3D12-capable hardware adapter visible");
             return 77;
@@ -350,13 +394,6 @@ int main(int argc, char** argv)
         } else {
             std::puts("driver=unavailable via DXGI");
         }
-        ComPtr<ID3D12Device> device;
-#ifdef OFFSCREEN_AGILITY_620
-        check(device_factory->CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
-              "Create device with debug factory");
-#else
-        check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "Create device");
-#endif
         if (debug) check(device.As(&messages), "Read debug queue");
         if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
@@ -393,6 +430,8 @@ int main(int argc, char** argv)
             check_bvh_hits(device.Get());
         } else if (argc == 3 && operation == "--dxr-update") {
             if (!check_dxr_update(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--dxr-facing") {
+            if (!check_dxr_facing(device.Get())) return 77;
         } else if (argc == 3 && operation == "--bvh-packed") {
             check_bvh_packed(device.Get());
         } else if (argc == 3 && operation == "--bvh-numeric") {
@@ -407,6 +446,8 @@ int main(int argc, char** argv)
             check_buffer_ops(device.Get());
         } else if (argc == 3 && operation == "--ray-query") {
             if (!check_ray_query(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--wave-shuffle") {
+            if (!check_wave_shuffle(device.Get())) return 77;
         } else {
             draw(device.Get(), argv[2], argc == 5 ? argv + 3 : nullptr);
         }

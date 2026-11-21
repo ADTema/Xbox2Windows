@@ -45,7 +45,7 @@ def trace(report, entry):
                         continue
                     # Snapping a forwarded export also loads each packaged module named in its chain.
                     hops = tuple(dict.fromkeys(s["provider"] for s in package["chain"][1:]
-                                               if s["package"] and s["provider"] != providers[0]))
+                                               if s["package"] and s["provider"] and s["provider"] != providers[0]))
                     if hops:
                         forwarded[(kind, providers[0])].add(hops)
                     if package["status"] == "export_present":
