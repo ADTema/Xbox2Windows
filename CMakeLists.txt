@@ -319,10 +319,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_library(${target} SHARED "${cpp}")
         target_link_libraries(${target} PRIVATE cpu_bink_heap_provider)
     endfunction()
-    bink_heap_translation(cpu_bink_heap_lifted "$<TARGET_FILE:cpu_bink_heap>" cpu_bink_heap)
+    bink_heap_translation(cpu_bink_heap_lifted "$<TARGET_FILE:cpu_bink_heap>" cpu_bink_heap --group-entry heap_group)
     add_test(NAME cpu_aot_bink_heap COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/bink_heap_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
         "$<TARGET_FILE:cpu_bink_heap>" "$<TARGET_FILE:cpu_bink_heap_lifted>")
+    add_test(NAME cpu_aot_bink_group COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bink_group_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
+        "$<TARGET_FILE:cpu_bink_heap>" "$<TARGET_FILE:cpu_bink_heap_lifted>")
+    set(BINK_GROUP_ENTRY "" CACHE STRING "Optional grouped allocation caller RVA in the local Bink image")
     set(BINK_HEAP_IMAGE "" CACHE FILEPATH "Local PE containing the Bink allocation and release callers")
     set(BINK_HEAP_ENTRIES "" CACHE STRING "Two semicolon-separated entry RVAs (allocation;release)")
     if(BINK_HEAP_IMAGE)
@@ -330,8 +334,15 @@ if(EXISTS "${INTAKE_PYTHON}")
         if(NOT entry_count EQUAL 2)
             message(FATAL_ERROR "Provide both BINK_HEAP_ENTRIES for the selected local image")
         endif()
+        set(group_args)
+        if(BINK_GROUP_ENTRY)
+            set(group_args --group-entry "${BINK_GROUP_ENTRY}")
+            add_test(NAME cpu_aot_bink_package_group COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/cpu/bink_group_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
+                "$<TARGET_FILE:cpu_bink_package_lifted>")
+        endif()
         bink_heap_translation(cpu_bink_package_lifted "${BINK_HEAP_IMAGE}" "${BINK_HEAP_IMAGE}"
-            --entries ${BINK_HEAP_ENTRIES})
+            --entries ${BINK_HEAP_ENTRIES} ${group_args})
         add_test(NAME cpu_aot_bink_package_heap COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/cpu/bink_heap_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
             "$<TARGET_FILE:cpu_bink_package_lifted>")

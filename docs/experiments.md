@@ -521,6 +521,10 @@ On Windows, the public native fixture, its translation and the locally translate
 
 For the public control, build `cpu_bink_heap_lifted` in the dev preset, then run `ctest --preset dev -R '^cpu_aot_bink_heap$' --no-tests=error -V`. For a local package, set the CMake cache entries `BINK_HEAP_IMAGE` to the DLL path and `BINK_HEAP_ENTRIES` to the semicolon-separated allocation and release function **entry** RVAs for that image. Build `cpu_bink_package_lifted` and run `cpu_aot_bink_package_heap`. Generated translations stay in the build directory.
 
+The grouped caller at RVA `0x25a40` in the inspected Bink DLL tail-calls the allocator at `0x25bf0` when its first argument is null. A 33-byte prefix becomes 64 bytes before the allocator adds its own 64 bytes. With a group and 48 extra bytes, the same input produces a 176-byte request at the heap provider. On success, an odd length word selects a pointer slot relative to the returned block and an even word selects an external slot. Clearing the low bit gives the payload stride. On allocation failure both the extra-byte total and the entry count are cleared and the external slot retains its value. The origin of the descriptors remains open.
+
+Build `cpu_bink_heap_lifted` and run `ctest --preset dev --no-tests=error -R '^cpu_aot_bink_group$'` for the source-built assembly control and its translation. For the inspected local DLL (SHA-256 `9eaf045d004cd7d6a8382aaff0c6ea23a29fec4ef8bfacd726b54f5bc26fafd0`), set `BINK_HEAP_ENTRIES` to `0x25bf0;0x25bc0` and `BINK_GROUP_ENTRY` to `0x25a40` alongside `BINK_HEAP_IMAGE`. Build `cpu_bink_package_lifted` and run `cpu_aot_bink_package_group`. The test supplies both descriptor arrays and runs the translated caller with the Windows test heap.
+
 ## Six API call sites
 
 After loading the toolchain, inspect three local DLLs. `out/calls/six-apis.json` records image SHA-256, import slots, callers of thunks, embedded container sections and code references. Addresses below are RVAs in the relevant DLL. Indirect calls need execution evidence to identify the selected path.
