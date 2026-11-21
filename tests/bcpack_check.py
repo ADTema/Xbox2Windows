@@ -94,6 +94,32 @@ class TextureChecks(unittest.TestCase):
             with self.assertRaises(ValueError):
                 linearize_4k_s_tail(tile, size, size, level)
 
+    def test_partial_tail_reads(self) -> None:
+        class CountedTile(bytes):
+            bytes_read: int = 0
+
+            def __getitem__(self, key: int | slice) -> int | bytes:
+                value = super().__getitem__(key)
+                self.bytes_read += 1 if isinstance(value, int) else len(value)
+                return value
+
+        # Each physical block carries its own address in all sixteen bytes.
+        tile = CountedTile(b"".join(bytes([index]) * 16 for index in range(256)))
+        # At level zero the fifth block in a row crosses a swizzle boundary.
+        for width, height, level, addresses in (
+            (17, 5, 0, (128, 132, 136, 140, 160, 129, 133, 137, 141, 161)),
+            (1, 1, 7, (0,)),
+        ):
+            with self.subTest(level=level):
+                tile.bytes_read = 0
+                expected = b"".join(bytes([index]) * 16 for index in addresses)
+                self.assertEqual(linearize_4k_s_tail(tile, width, height, level), expected)
+                self.assertLessEqual(tile.bytes_read, len(expected))
+
+        for size in (4095, 4097):
+            with self.assertRaises(ValueError):
+                linearize_4k_s_tail(bytes(size), 1, 1, 7)
+
 
 if __name__ == "__main__":
     unittest.main()
