@@ -235,9 +235,15 @@ def run_release_case(case, mapper, sink, map_copy, entry, quiet):
             # Addresses are the only identity: a reused address releases the mapping now there.
             sink.sink_clear()
             reused = map_copy(directory, "tls_reuse.dll")
-            # The preferred base is free again after the last round, so the new mapping takes it.
-            expect("reused address", reused, previous_base)
-            expect("stale pointer to a reused address", mapper.release(previous_base), 1)
+            # pe_map lets VirtualAlloc choose the base, so the new mapping may or may not reuse it.
+            if reused == previous_base:
+                expect("stale pointer to a reused address", mapper.release(previous_base), 1)
+                print("the new mapping reused the address; the stale pointer released it")
+            else:
+                expect("stale pointer to a freed address", mapper.release(previous_base), 0)
+                expect("process detach after the stale release", process_detaches(sink, reused), [])
+                expect("release of the new mapping", mapper.release(reused), 1)
+                print("the new mapping took another address; the stale pointer released nothing")
             expect("process detach of the new mapping", process_detaches(sink, reused), a_release)
             print(f"{RACE_ROUNDS} rounds of {RACE_THREADS} native concurrent releases: one winner each")
             return
