@@ -428,6 +428,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_seh COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_seh_check.py" "$<TARGET_FILE:cpu_seh_original>"
         "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_register_probe>")
+    add_test(NAME cpu_native_section COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_section_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_register_probe>")
     add_library(cpu_tls_sink SHARED tests/cpu/tls_sink.cpp)
     foreach(variant IN ITEMS original refuse)
         add_library(cpu_tls_${variant} SHARED tests/cpu/tls_route.asm tests/cpu/tls_route.def)

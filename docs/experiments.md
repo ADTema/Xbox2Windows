@@ -375,6 +375,13 @@ The mapped `call_mix` is compared over 249 input pairs on arguments, guarded wri
 ctest --preset dev --no-tests=error -R '^cpu_native_seh$' -V
 ```
 
+`cpu_native_section` compares every section of the register probe after `LoadLibraryExW` and after `pe_map`, byte for byte. The probe has no entry point and no imports, so the Windows load runs none of its code. In a copy whose `.rsrc` header has `PointerToRawData` set to zero and `SizeOfRawData` unchanged, the Windows loader leaves `.rsrc` zero-filled, and `pe_map` does the same instead of copying the headers from file offset 0. The other sections are unchanged in both loaders. A nonzero `PointerToRawData` is a different case: Windows rounds it down to a multiple of `0x200`, so `0x100` reads the section from offset 0. In `.rsrc` that puts the headers where the resource directory should be, and `LoadLibraryExW` fails with `ERROR_BAD_EXE_FORMAT`; with the resource directory entry cleared, the same copy loads.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_section$' -V
+```
+
+
 ### TLS callbacks and the entry point
 
 `tls_route` has an entry point and a TLS directory whose callback list holds one routine and whose data template is empty. Both routines report each call to `cpu_tls_sink.dll`, which outlives the image, so calls made during release stay visible. `cpu_native_tls` loads the image with `LoadLibraryW` and maps it with `pe_map`, each in its own child process, and compares the process notifications:
