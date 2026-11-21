@@ -1,0 +1,206 @@
+"""Offline C++ lowering for the null-context FidelityFX version-query path."""
+import argparse
+import hashlib
+from pathlib import Path
+
+import pefile
+from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
+
+from cpu_leaf_aot import export_rva
+from cpu_ranges import function_ranges, image_bytes
+
+
+LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
+UPSCALER = "faff02f294a7e9149ce079dffe3dedbcabe99b1f180ab14222aa8689e00a75fa"
+REGS = {getattr(R, n.upper()): n for n in "rax rbx rcx rdx rsi rdi rbp rsp r8 r12 r13 r14 r15".split()}
+UINT = {1: "uint8_t", 4: "uint32_t", 8: "uint64_t"}
+
+HEADER = """#include <cstdint>
+#include <cstring>
+using namespace std;
+using word = uint64_t;
+static_assert(sizeof(void*) == sizeof(word));
+template<class T> T load(word address) {
+    T v; memcpy(&v, reinterpret_cast<const void*>(address), sizeof v); return v;
+}
+template<class T> void store(word address, T v) {
+    memcpy(reinterpret_cast<void*>(address), &v, sizeof v);
+}
+struct Query { word type, next, effect, device, count, ids, names; };
+"""
+
+
+def reg(number):
+    return REGS[RegisterExt.full_register(number)]
+
+
+def region(pe, start, end):
+    ins = list(Decoder(64, image_bytes(pe, start, end-start, executable=True), ip=start))
+    if not ins or ins[-1].next_ip != end or any(i.is_invalid for i in ins):
+        raise ValueError("query interval does not end on an instruction boundary")
+    return ins
+
+
+def lower(body, initial, globals_, calls, exits):
+    """Emit only query integer operations. All external edges and calls need named bindings."""
+    lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
+             "bool zero=false, carry=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
+    allowed = {i.ip for i in body} | set(exits)
+    for index, i in enumerate(body):
+        op = i.mnemonic
+
+        def address():
+            if i.is_ip_rel_memory_operand:
+                return globals_[i.ip_rel_memory_address]
+            terms = []
+            if i.memory_base != R.NONE:
+                terms.append(reg(i.memory_base))
+            if i.memory_index != R.NONE:
+                terms.append(f"{reg(i.memory_index)} * {i.memory_index_scale}ull")
+            terms.append(f"{i.memory_displacement}ull")
+            return " + ".join(terms)
+
+        def operand(n):
+            kind = i.op_kind(n)
+            if kind == K.REGISTER:
+                register = i.op_register(n)
+                return f"static_cast<{UINT[RegisterExt.size(register)]}>({reg(register)})"
+            if kind == K.MEMORY:
+                return f"load<{UINT[MemorySizeExt.size(i.memory_size)]}>({address()})"
+            return f"{i.immediate(n)}ull"
+
+        def write(expr):
+            if i.op0_kind == K.MEMORY:
+                return f"store<{UINT[MemorySizeExt.size(i.memory_size)]}>({address()}, {expr});"
+            dest = i.op0_register
+            size = RegisterExt.size(dest)
+            value = f"static_cast<{UINT[size]}>({expr})"
+            if size == 1:
+                value = f"({reg(dest)} & ~255ull) | {value}"
+            return f"{reg(dest)} = {value};"
+
+        if op in (M.JE, M.JNE, M.JAE, M.JMP):
+            target = i.near_branch_target
+            if target not in allowed:
+                raise ValueError(f"unbound branch at {i.ip:#x}")
+            cond = {M.JE: "if (zero) ", M.JNE: "if (!zero) ", M.JAE: "if (!carry) ", M.JMP: ""}[op]
+            stmt = f"{cond}goto block_{target:x};"
+        elif op == M.MOV:
+            stmt = write(operand(1))
+        elif op == M.LEA:
+            stmt = write(address())
+        elif op == M.CMP:
+            stmt = f"zero = ({operand(0)} == {operand(1)}); carry = ({operand(0)} < {operand(1)});"
+        elif op == M.TEST:
+            stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false;"
+        elif op in (M.ADD, M.AND, M.XOR, M.INC, M.SBB):
+            operator = {M.ADD: "+", M.INC: "+", M.AND: "&", M.XOR: "^", M.SBB: "-"}[op]
+            rhs = "1" if op == M.INC else operand(1)
+            width = UINT[RegisterExt.size(i.op0_register)]
+            expr = f"a {operator} b" + (" - word(carry)" if op == M.SBB else "")
+            update = {M.ADD: "carry = v < a;", M.SBB: "carry = a < b || (carry && a == b);",
+                      M.INC: "", M.XOR: "carry = false;", M.AND: "carry = false;"}[op]
+            stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
+                    f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
+        elif op == M.SETE:
+            stmt = write("zero")
+        elif op == M.CALL:
+            stmt = calls[i.ip]
+        elif op == M.RET:
+            stmt = "return rax;"
+        else:
+            raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+        lines.append(f"block_{i.ip:x}: {stmt}")
+        if (op not in (M.RET, M.JMP) and
+                (index + 1 == len(body) or body[index + 1].ip != i.next_ip)):
+            if i.next_ip not in allowed:
+                raise ValueError(f"unbound fallthrough at {i.ip:#x}")
+            lines.append(f"goto block_{i.next_ip:x};")
+    lines.extend(f"block_{target:x}: {statement}" for target, statement in exits.items())
+    return "\n".join("    " + line for line in lines)
+
+
+def leaf(pe, address):
+    for i in Decoder(64, image_bytes(pe, address, 32, executable=True), ip=address):
+        if i.mnemonic == M.RET:
+            return region(pe, address, i.next_ip)
+    raise ValueError("unsupported provider predicate")
+
+
+def checked_image(path, digest):
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise ValueError(f"unrecognized {path.name} version-query profile")
+    return pefile.PE(data=data, fast_load=True)
+
+
+def query_body(pe, slices):
+    owned = function_ranges(pe, export_rva(pe, "ffxQuery"))
+    if not all(any(lo <= a < b <= hi for lo, hi in owned) for a, b in slices):
+        raise ValueError("query slice outside exported function")
+    return [ins for a, b in slices for ins in region(pe, a, b)]
+
+
+def generate(loader, upscaler):
+    # These two build-specific profiles specialize the entry guards to (nullptr, type 4).
+    # Recover the record from initializer stores; the on-disk registry is zero-filled.
+    with checked_image(upscaler, UPSCALER) as pe:
+        init = {i.ip: i for i in region(pe, 0x10bb, 0x1144)}
+        record = init[0x1130].ip_rel_memory_address
+        fields = {init[addr].ip_rel_memory_address-record: value for addr, value in [
+            (0x10d0, init[0x10bb].immediate(1)), (0x10e5, init[0x10e5].immediate(1)),
+            (0x10f0, init[0x10de].ip_rel_memory_address)]}
+        name = pe.get_string_at_rva(fields[32], 128)
+        if not name or not all(32 <= c < 127 for c in name):
+            raise ValueError("invalid provider version name")
+        vtable = init[0x1105].ip_rel_memory_address
+        predicates = []
+        for slot, symbol in ((1, "supports_effect"), (2, "supports_device")):
+            addr = pe.get_qword_at_rva(vtable + 8*slot) - pe.OPTIONAL_HEADER.ImageBase
+            code = lower(leaf(pe, addr), ["rcx = self; rdx = input;"], {}, {}, {})
+            predicates.append(f"static word {symbol}(word self, word input) {{\n{code}\n}}")
+        globals_ = {init[0x1137].ip_rel_memory_address: "reinterpret_cast<word>(registry)",
+                    record: "reinterpret_cast<word>(registry + 1)"}
+        # The actual registry occupies one pointer between the decoded start and end.
+        if record - init[0x1137].ip_rel_memory_address != 8:
+            raise ValueError("unexpected provider registry size")
+        calls = {site: f"rax = {fn}(rcx, rdx);" for site, fn in [
+            (0x1595, "supports_effect"), (0x15a5, "supports_device"),
+            (0x161a, "supports_effect"), (0x162a, "supports_device")]}
+        provider = lower(query_body(pe, [(0x152b, 0x164a)]),
+                         ["r15 = reinterpret_cast<word>(query); rdi = 0;"], globals_, calls,
+                         {0x1999: "return static_cast<uint32_t>(rax);", 0x164a: "return 6;"})
+    with checked_image(loader, LOADER) as pe:
+        # The desktop binding supplies the translated upscaler; frame generation is absent.
+        slots = {0x4088: "reinterpret_cast<word>(&present)", 0x40c0: "reinterpret_cast<word>(&absent)",
+                 0x40a8: "reinterpret_cast<word>(&present)", 0x40e0: "reinterpret_cast<word>(&absent)"}
+        caller = lower(query_body(pe, [(0x144b, 0x14b2), (0x14c2, 0x14d5)]),
+                       ["rbx = reinterpret_cast<word>(query); rdi = reinterpret_cast<word>(&query->effect);"],
+                       slots, {0x1456: "/* selected modules are bound offline */",
+                               0x14ac: "rax = provider_versions(reinterpret_cast<Query*>(rdx));"},
+                       {0x14b2: "return static_cast<uint32_t>(rax);", 0x150f: "return static_cast<uint32_t>(rax);",
+                        0x14e5: "return 6;", 0x14d5: "return static_cast<uint32_t>(rax);"})
+    chars = ", ".join(str(b) for b in name + b"\0")
+    return HEADER + "\n".join(predicates) + f"""
+static const char version_name[] = {{{chars}}};
+static const word present = 1, absent = 0;
+static const word entry[] = {{0, 0, {fields[16]}ull, {fields[24]}ull, reinterpret_cast<word>(version_name)}};
+static const word registry[] = {{reinterpret_cast<word>(entry)}};
+static uint32_t provider_versions(Query* query) {{
+{provider}
+}}
+extern "C" __declspec(dllexport) uint32_t query_versions(Query* query) {{
+    if (!query || query->type != 4) return 6;
+{caller}
+}}
+"""
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    for arg in ("loader", "upscaler", "output"):
+        parser.add_argument(arg, type=Path)
+    args = parser.parse_args()
+    if args.output.suffix.lower() != ".cpp" or args.output.resolve() in (args.loader.resolve(), args.upscaler.resolve()):
+        parser.error("choose a distinct .cpp output")
+    args.output.write_text(generate(args.loader, args.upscaler), encoding="ascii")

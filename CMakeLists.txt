@@ -226,6 +226,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_callback callback)
+    cpu_asm_fixture(cpu_version_query version_query)
+    set(query_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_version_query_lifted.cpp")
+    add_custom_command(OUTPUT "${query_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/version_query_fixture.py"
+            emit "$<TARGET_FILE:cpu_version_query>" "${query_fixture}"
+        DEPENDS cpu_version_query tests/cpu/version_query_fixture.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py tests/cpu/version_query_check.py VERBATIM)
+    add_library(cpu_version_query_lifted SHARED "${query_fixture}")
+    add_test(NAME cpu_aot_version_query COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/version_query_fixture.py" check "$<TARGET_FILE:cpu_version_query>"
+        "$<TARGET_FILE:cpu_version_query_lifted>")
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
