@@ -161,7 +161,8 @@ def check_unclassified():
 
 def check_shader_records():
     """gfx forms come only from programs the translator accepted, recorded by the same run. The review's
-    example: tests/pixel_aot_check.py passes s_nop only to must_reject, so it must stay out of covered."""
+    example: a program that reaches only must_reject (s_nop in place of a wait below, s_branch in the real
+    controls) must stay out of covered."""
     import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
     gfx = fc.load_reference("gfx1013.tsv")
     assert ("SOPP", "s_nop") in gfx  # so counting s_nop would change the result
