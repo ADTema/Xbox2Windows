@@ -30,6 +30,18 @@ def check_desktop_forwarders():
     broken = resolve("front.dll", "Broken")
     assert broken["status"] == "export_not_found" and broken["chain"][-1]["symbol"] == "Missing"
 
+    # A packaged module shadows the System32 name. API-set contracts still select System32 hosts.
+    package = {"shim.dll": (["bin/shim.dll"], {"Begin": "middle.#77", "Api": "api-ms-fixture-l1-1-0.#77"}),
+               "middle.dll": (["bin/middle.dll"], {}), "twin.dll": (["a/twin.dll", "b/twin.dll"], None)}
+    shadowed = resolve_desktop("shim.dll", "Begin", "entry.exe", contracts, tables.get,
+                               lambda name: package.get(name, ((), None)))
+    assert shadowed["status"] == "export_not_found" and shadowed["chain"][-1]["provider"] == "bin/middle.dll"
+    contract = resolve_desktop("shim.dll", "Api", "entry.exe", contracts, tables.get,
+                               lambda name: package.get(name, ((), None)))
+    assert contract["status"] == "provider_not_found" and contract["chain"][-1]["provider"] == "absent.dll"
+    twin = resolve_desktop("twin.dll", "Value", "entry.exe", contracts, tables.get, package.get)
+    assert twin["status"] == "ambiguous_package_basename" and twin["chain"][-1]["provider"] is None
+
     row = dict(image="entry.exe", kind="normal", dll="front.dll", symbol="Broken",
                bundle_exports_in=[], desktop_export="export_present", desktop_resolution=broken)
     inventory = dict(images={"entry.exe": {"sha256": "fixture", "exports": []}}, imports=[row])
@@ -38,6 +50,17 @@ def check_desktop_forwarders():
     assert finding["desktop_chain"][-1] == dict(dll="middle.dll", provider="middle.dll", symbol="Missing")
     del row["desktop_resolution"]
     assert not trace(inventory, "entry.exe")["findings"]
+
+    # Each packaged module in a forwarder chain is loaded with the provider, including intermediate ones.
+    modules = ("front.dll", "relay.dll", "last.dll")
+    hops = [dict(dll=n, provider=n, symbol="Value", package=True) for n in modules]
+    inventory["images"].update({n: {"sha256": "fixture", "exports": []} for n in modules})
+    row.update(symbol="Value", bundle_exports_in=["front.dll"],
+               package_resolution=dict(status="export_present", chain=hops))
+    report = trace(inventory, "entry.exe")
+    assert not report["findings"]
+    assert report["reachable"]["relay.dll"]["reasons"] == ("normal", "forwarder")
+    assert report["reachable"]["last.dll"]["path"] == ("entry.exe", "front.dll", "relay.dll", "last.dll")
 
 
 def main():
