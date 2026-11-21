@@ -17,6 +17,9 @@ STATUS = {"ok": 0, "format": 2, "unresolved": 5, "unsupported": 6, "init_failed"
 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
 kernel.GetProcAddress.restype = ctypes.c_void_p
+kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
+kernel.LoadLibraryExW.restype = wintypes.HMODULE
+kernel.FreeLibrary.argtypes = [wintypes.HMODULE]
 lookup_entry = kernel.RtlLookupFunctionEntry
 lookup_entry.argtypes = [ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p]
 lookup_entry.restype = ctypes.c_void_p
@@ -145,6 +148,63 @@ def check_rejections(mapper, image, provider, symbol):
           "and one smaller than a descriptor")
 
 
+LOAD_ALTERED_SEARCH = 0x8  # LOAD_WITH_ALTERED_SEARCH_PATH: dependencies from the image's own folder
+
+
+def check_delay_directory(mapper, image, provider):
+    """The Windows loader does not read the delay-import directory; pe_map separates its cases.
+
+    An address of 0 or an empty table maps like Windows, a directory outside the image is malformed,
+    and a descriptor that names a DLL is unsupported. The named fixture has no delay imports.
+    """
+    with pefile.PE(str(image)) as pe:
+        delay = pe.OPTIONAL_HEADER.DATA_DIRECTORY[13]
+        address, size = (delay.get_field_absolute_offset(f) for f in ("VirtualAddress", "Size"))
+        if delay.VirtualAddress or delay.Size:
+            raise AssertionError(f"{image.name}: fixture must have no delay-import directory")
+        imports = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1].VirtualAddress
+        image_size = pe.OPTIONAL_HEADER.SizeOfImage
+        align = pe.OPTIONAL_HEADER.SectionAlignment
+        rdata = next(s for s in pe.sections if s.Name.rstrip(b"\0") == b".rdata")
+    # The rest of the .rdata page past VirtualSize is mapped and zero under both loaders: an empty table.
+    empty = (rdata.VirtualAddress + rdata.Misc_VirtualSize + 7) & ~7
+    if empty + 32 > (rdata.VirtualAddress + rdata.Misc_VirtualSize + align - 1) & ~(align - 1):
+        raise AssertionError(f"{image.name}: no room for an empty delay descriptor in .rdata")
+    # 8 bytes into the import descriptor, ForwarderChain (0) and Name line up with a delay
+    # descriptor's Attributes and DllNameRVA: a descriptor that names the provider DLL.
+    named = imports + 8
+    cases = (
+        ("empty table, Size 0", [(address, empty)], "ok", ""),
+        ("empty table, Size 32", [(address, empty), (size, 32)], "ok", ""),
+        ("address 0, Size 32", [(size, 32)], "ok", ""),
+        ("address past the image", [(address, image_size + 0x1000), (size, 32)], "format",
+         "delay import directory outside image"),
+        ("descriptor naming a DLL, Size 0", [(address, named)], "unsupported", "delay imports"),
+    )
+    bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
+    for name, edits, expected, message in cases:
+        data = bytearray(image.read_bytes())
+        for offset, value in edits:
+            struct.pack_into("<I", data, offset, value)
+        with TemporaryDirectory() as temp:
+            copy = Path(temp) / image.name
+            copy.write_bytes(data)
+            (Path(temp) / provider.name).write_bytes(provider.read_bytes())
+            # Windows: the copy has no entry point, so loading it runs nothing in the image.
+            module = kernel.LoadLibraryExW(str(copy), None, LOAD_ALTERED_SEARCH)
+            if not module:
+                raise AssertionError(f"delay {name}: LoadLibraryExW failed with {ctypes.get_last_error()}")
+            kernel.FreeLibrary(module)
+            base, status, detail, requests = mapper(copy, bindings)
+        if base:
+            mapper.release(base)
+        if status != STATUS[expected] or detail != message or bool(base) != (expected == "ok") \
+                or bool(requests) != (expected == "ok"):
+            raise AssertionError(f"delay {name}: {base=} {status=} {detail=} {requests=}")
+    print(f"{image.name}: Windows loads every delay-import variant; pe_map maps an address of 0 and an empty "
+          "table, and rejects a directory past the image (format) and a descriptor naming a DLL (unsupported)")
+
+
 def check_empty_export_slot(mapper, image):
     """Zero one export address table slot: its name must no longer resolve, the other export still must."""
     with pefile.PE(str(image)) as pe:
@@ -183,6 +243,7 @@ def main():
     mapper = Mapper(args.mapper)
     probe = register_probe(str(args.probe))
     check_empty_export_slot(mapper, args.probe)
+    check_delay_directory(mapper, args.named[0], args.named[2])
     for case, paths, symbol in (("named", args.named, "mix_args"), ("ordinal", args.ordinal, 77)):
         original, lifted, provider, altered = paths
         natives = [("native LoadLibrary", ctypes.CDLL(str(original)).call_mix),
