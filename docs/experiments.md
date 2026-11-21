@@ -57,6 +57,41 @@ cmake --build --preset dev --target pe_map cpu_exe_original_lifted
 ctest --preset dev --no-tests=error -R '^cpu_native_exe_chain$' -V
 ```
 
+## Pipeline readiness from shader manifests
+
+`tools/pso_readiness.py` joins the native SHA-256 and stage in the shader extraction manifest with explicit pipeline references. It counts archive records, records with a native hash and unique stage/hash pairs separately. Multiple archive records can refer to the same native code. A hash from one stage does not establish coverage in another stage.
+
+Export the archive manifest with `extract_shaders.py --format native` or `--format both`. Supply a separate JSON file containing pipeline IDs, their effective root signature status and shader references. Here's a synthetic example. The zero hash stands for a missing archive entry.
+
+```json
+{
+  "pipelines": [
+    {
+      "id": "example-pixel-pipeline",
+      "effective_root_signature": "unknown",
+      "shaders": [
+        {
+          "stage": "pixel",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Set `effective_root_signature` to `present`, `missing` or `unknown` after accounting for both the embedded signature and any signature provided by the caller. The report accepts normalized references from an inspection tool or a trace and assigns no references from archive proximity.
+
+```powershell
+python -B tools/pso_readiness.py out/shaders/manifest.json out/pipelines.json
+cmake --build --preset dev --target pso_root_check
+ctest --preset dev --no-tests=error -R '^pso_(readiness_check|root_signature_warp)$' -V
+```
+
+Add `--llvm <AMDGPU LLVM library>` to disassemble referenced native pixel code and run the existing pixel scanner and lowering probe. Each unique stage/hash pair is assessed once. A known missing root signature takes precedence over shader diagnostics. Missing references, unassessed stages and unknown signature status require more evidence. Passing the pixel probe leaves the pipeline awaiting PSO validation, since the scanner uses synthetic bindings.
+
+The WARP control compiles the source-built compute shader with its root signature stripped. D3D12 rejects creation without a root signature. The same shader creates a PSO when given the matching signature from the embedded build. The control measures PSO creation on the source-built fixture.
+
 ## Offline CPU leaf recompilation
 
 With the Python-enabled Windows dev preset configured, run:

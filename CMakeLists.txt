@@ -189,6 +189,24 @@ foreach(layout IN ITEMS root tables)
     endforeach()
     set_tests_properties(compute_${layout}_hardware PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
+add_executable(pso_root_check tests/pso_root_check.cpp)
+target_compile_features(pso_root_check PRIVATE cxx_std_17)
+target_include_directories(pso_root_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(pso_root_check PRIVATE d3d12 dxgi)
+foreach(mode IN ITEMS embedded stripped)
+    set(symbol pso_compute_${mode})
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.h")
+    set(strip_root)
+    if(mode STREQUAL "stripped")
+        set(strip_root -Qstrip_rootsignature)
+    endif()
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain ${strip_root} -Vn ${symbol}
+                -Fh "${header}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/compute.hlsl"
+        DEPENDS tests/compute.hlsl VERBATIM)
+    target_sources(pso_root_check PRIVATE "${header}")
+endforeach()
+add_test(NAME pso_root_signature_warp COMMAND pso_root_check)
 foreach(adapter IN ITEMS hardware warp)
     add_test(NAME offscreen_${adapter} COMMAND offscreen_check ${adapter} triangle_${adapter}.bmp)
     add_test(NAME ffx_provider_loop_${adapter} COMMAND offscreen_check ${adapter} --ffx-provider-loop)
@@ -747,6 +765,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/resource_ranges_check.py")
     add_test(NAME rdna2_tools_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/rdna2_tools_check.py")
+    add_test(NAME pso_readiness_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pso_readiness_check.py")
     add_test(NAME dxcontainer_part_offsets COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxcontainer_part_offsets_check.py")
     foreach(adapter IN ITEMS hardware warp)
