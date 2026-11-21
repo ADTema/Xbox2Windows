@@ -88,6 +88,10 @@ def translate(image, name, partial=False, callback_offset=None, ffx_destroy=Fals
                     regs[dst] = address
             elif code == Code.MOV_R32_IMM32 and dst == R.EAX:
                 regs[R.RAX] = str(ins.immediate32)
+            elif (code in (Code.XOR_RM32_R32, Code.XOR_R32_RM32, Code.XOR_RM64_R64, Code.XOR_R64_RM64)
+                  and ins.op0_kind == ins.op1_kind == OpKind.REGISTER and dst == src
+                  and RegisterExt.full_register(dst) in GPRS):
+                regs[RegisterExt.full_register(dst)] = "0ull"
             elif code in (Code.MOV_RM32_R32, Code.MOV_R32_RM32) and ins.op0_kind == ins.op1_kind == OpKind.REGISTER:
                 dest, source = RegisterExt.full_register(dst), RegisterExt.full_register(src)
                 if dest not in GPRS or regs.get(source) in (None, *SAVED.values()):
