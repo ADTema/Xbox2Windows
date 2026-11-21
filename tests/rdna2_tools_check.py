@@ -305,6 +305,85 @@ class TestRdna2Extractor(unittest.TestCase):
             manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
             self.assertEqual(manifest["total_extracted"], 0)
 
+    def test_false_positive_header_does_not_skip_following_record(self):
+        """A candidate header whose deflate payload fails must not skip a valid record inside its span."""
+        known_code = bytes.fromhex("000080bf 000081bf")
+        valid_record = envelope(known_code, b"PS_AfterFalsePositive")
+        bogus_stored = len(valid_record) + 16
+        false_header = b"FAKE_HDR\0\0" + struct.pack("<4I", bogus_stored, 0, bogus_stored, 256)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "false_positive.rpf"
+            archive.write_bytes(false_header + b"\x00\x01\x02\x03" + valid_record + bytes(16))
+
+            output_dir = tmp_path / "extracted_fp"
+            out_path, manifest_file = extract_shaders(archive, output_dir, target_stages={"pixel"})
+            extracted_file = out_path / "pixel" / "PS_AfterFalsePositive.bin"
+            self.assertTrue(extracted_file.is_file(), "Valid record after false-positive header was skipped")
+            self.assertEqual(extracted_file.read_bytes(), known_code)
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 1)
+
+    def test_disambiguated_stem_does_not_collide_with_existing_or_case_variant(self):
+        """Disambiguated stems must not overwrite explicit _1 names or case variants."""
+        codes = [
+            bytes.fromhex("000080bf 000081bf"),
+            bytes.fromhex("000082be 000081bf"),
+            bytes.fromhex("000182be 000081bf"),
+            bytes.fromhex("0000027e 000081bf"),
+        ]
+        records = [
+            envelope(codes[0], b"PS_Dup"),
+            envelope(codes[1], b"PS_Dup"),
+            envelope(codes[2], b"PS_Dup_1"),
+            envelope(codes[3], b"ps_dup"),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "collisions.rpf"
+            archive.write_bytes(b"RPF\0" + b"".join(records))
+
+            output_dir = tmp_path / "extracted_collisions"
+            out_path, manifest_file = extract_shaders(archive, output_dir, target_stages={"pixel"})
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 4)
+            paths = [entry["native_file"] for entry in manifest["shaders"]]
+            self.assertEqual(len({p.casefold() for p in paths}), 4, f"Colliding output paths: {paths}")
+            for entry, expected in zip(manifest["shaders"], codes):
+                self.assertEqual((out_path / entry["native_file"]).read_bytes(), expected)
+
+    def test_empty_archive_produces_empty_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "empty.rpf"
+            archive.write_bytes(b"")
+
+            output_dir = tmp_path / "extracted_empty"
+            _, manifest_file = extract_shaders(archive, output_dir, target_stages={"all"})
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 0)
+            self.assertEqual(manifest["shaders"], [])
+
+    def test_invalid_xbch_offset_or_size_rejected(self):
+        known_code = bytes.fromhex("000080bf 000081bf")
+        program_start = 256
+        image = bytearray(program_start) + known_code
+        image[:4] = b"FSSM"
+        struct.pack_into("<I", image, 192, program_start - 40)
+        compressed = zlib.compress(image)
+
+        wrong_size_native = b"XBCH" + bytes(12) + struct.pack("<II", len(image) + 4, 0) + compressed
+        wrong_size_program = (bytes(24) + b"XDAT" + struct.pack("<II", 1, 0)
+                              + struct.pack("<III", 13, 48, len(wrong_size_native)) + wrong_size_native)
+        self.assertIsNone(extract_native_rdna2_code(wrong_size_program))
+
+        valid_native = b"XBCH" + bytes(12) + struct.pack("<II", len(image), 0) + compressed
+        overlapping_program = (b"XBCH" + bytes(20) + b"XDAT" + struct.pack("<II", 1, 0)
+                               + struct.pack("<III", 13, 0, len(valid_native)) + valid_native)
+        self.assertIsNone(extract_native_rdna2_code(overlapping_program))
+
 
 class TestRdna2Scanner(unittest.TestCase):
     """Test scanner instruction recognition vs full shader translator acceptance."""
