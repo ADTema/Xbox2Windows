@@ -12,6 +12,10 @@ the fallthrough of an unsigned bound check on the index:
 B must hold the same RIP-relative address on every path, and the index must be
 shown to carry the compared value. The generated C++ replaces the dispatch with
 a switch over the table targets.
+
+Flags are modeled only between a producer and its consumers (Jcc, SETcc,
+CMOVcc) in one straight-line run that no edge enters. Instructions that leave
+the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc) may sit between them.
 """
 
 import argparse
@@ -34,6 +38,14 @@ VOLATILE = {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
+_CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
+SETCC = {getattr(M, "SET" + code) for code in _CODES}
+CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
+# Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
+# which only read them.
+FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC}
+MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
               CC.L: "l", CC.GE: "ge", CC.LE: "le", CC.G: "g", CC.S: "s", CC.NS: "ns"}
 MAX_CASES = 1024
@@ -383,8 +395,11 @@ class Lifter:
             raise ValueError(f"unsupported condition after {producer.mnemonic} at RVA {jcc.ip:#x}")
         return table[code]
 
-    def statement(self, ins, next_ins):
-        """Return C++ for one instruction and the registers it reads and writes."""
+    def statement(self, ins, sets_flags=False, producer=None):
+        """Return C++ for one instruction and the registers it reads and writes.
+
+        sets_flags records the flag inputs for a later consumer; producer is the
+        instruction whose flags a SETcc or CMOVcc reads."""
         mnemonic = ins.mnemonic
         width = self.width(ins)
         reads, writes = set(), set()
@@ -426,8 +441,7 @@ class Lifter:
             b = self.operand(ins, 1, width) if not same else a
             operator = ALU.get(mnemonic, "&")
             lines = []
-            fused = next_ins is not None and next_ins.flow_control == FlowControl.CONDITIONAL_BRANCH
-            if fused:
+            if sets_flags:
                 self.flags = True
                 if mnemonic in (M.CMP, M.SUB):
                     lines.append(f"fa = {a}; fb = {b};")
@@ -443,7 +457,7 @@ class Lifter:
             a = self.operand(ins, 0, width)
             value = {M.INC: f"{a} + 1u", M.DEC: f"{a} - 1u", M.NEG: f"0u - {a}", M.NOT: f"~{a}"}[mnemonic]
             line = self.write(ins, width, value)
-            if next_ins is not None and next_ins.flow_control == FlowControl.CONDITIONAL_BRANCH:
+            if sets_flags:
                 if mnemonic not in (M.INC, M.DEC):
                     raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
                 self.flags = True
@@ -475,6 +489,33 @@ class Lifter:
             else:
                 a, b = self.operand(ins, 1, width), self.operand(ins, 2, width)
             return self.write(ins, width, f"{a} * {b}"), reads, writes
+        if mnemonic in SETCC:
+            condition = self.condition(producer, ins)
+            if ins.op0_kind == OpKind.MEMORY:
+                return f"store<std::uint8_t>({self.address(ins)}, static_cast<std::uint8_t>({condition}));", reads, writes
+            register = ins.op0_register
+            if register in HIGH_BYTES or RegisterExt.size(register) != 1:
+                raise ValueError(f"unsupported register {register}")
+            # A byte write keeps bits 8..63 of the full register.
+            name = NAMES[full(register)]
+            self.used.add(full(register))
+            reads.add(full(register))
+            return f"{name} = ({name} & ~0xffull) | static_cast<word>({condition});", reads, writes
+        if mnemonic in CMOVCC:
+            if width not in (4, 8):
+                raise ValueError(f"unsupported partial register write at RVA {ins.ip:#x}")
+            note(0, 1)
+            condition = self.condition(producer, ins)
+            source, destination = self.operand(ins, 1, width), self.operand(ins, 0, width)
+            # A 32-bit CMOVcc zero-extends the destination even when the condition is false,
+            # and a memory source is read either way.
+            if ins.op1_kind == OpKind.MEMORY:
+                line = self.write(ins, width, f"({condition}) ? source : {destination}")
+                # A volatile read: when the condition folds to false the compiler may not drop the load,
+                # which faults on hardware for an inaccessible source.
+                source = f"load_always<{unsigned(width)}>({self.address(ins)})"
+                return f"{{ const {unsigned(width)} source = {source}; {line} }}", reads, writes
+            return self.write(ins, width, f"({condition}) ? {source} : {destination}"), reads, writes
         if mnemonic == M.RET:
             return "return rax;", {R.RAX}, set()
         raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
@@ -487,6 +528,22 @@ def _memory_width(ins):
     return width
 
 
+def flag_producer(function, edges, consumer):
+    """The instruction whose flags consumer reads, within one straight-line run."""
+    current = consumer
+    for _ in range(MAX_FLAG_DISTANCE):
+        before = function.ending.get(current.ip)
+        if (current.ip in edges or current.ip == function.entry or before is None
+                or before.flow_control != FlowControl.NEXT):
+            raise ValueError(f"flags cross a join before RVA {consumer.ip:#x}")
+        if before.mnemonic not in FLAG_NEUTRAL:
+            if before.mnemonic not in FLAG_PRODUCERS:
+                raise ValueError(f"unsupported flag producer at RVA {before.ip:#x}")
+            return before
+        current = before
+    raise ValueError(f"flag producer too far before RVA {consumer.ip:#x}")
+
+
 def lift(pe, name):
     entry = export_rva(pe, name)
     function = Function(pe, entry)
@@ -494,6 +551,9 @@ def lift(pe, name):
     lifter = Lifter()
     order = sorted(function.instructions)
     instructions = function.instructions
+    producers = {ip: flag_producer(function, edges, ins) for ip, ins in instructions.items()
+                 if ins.flow_control == FlowControl.CONDITIONAL_BRANCH or ins.mnemonic in SETCC | CMOVCC}
+    sets_flags = {producer.ip for producer in producers.values()}
     loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
     skipped = {ip for _, _, sequence, _, _, _ in function.dispatches.values() for ip in sequence}
     body = {}
@@ -502,15 +562,9 @@ def lift(pe, name):
         ins = instructions[ip]
         if ins.has_lock_prefix or ins.has_rep_prefix or ins.has_repne_prefix:
             raise ValueError(f"unsupported prefix at RVA {ip:#x}")
-        following = instructions.get(ins.next_ip) if ins.flow_control == FlowControl.NEXT else None
         body[ip] = ""
         if ins.flow_control == FlowControl.CONDITIONAL_BRANCH:
-            producer = function.ending.get(ip)
-            if ip in edges or producer is None or producer.flow_control != FlowControl.NEXT:
-                raise ValueError(f"flags cross a join before RVA {ip:#x}")
-            if producer.mnemonic not in (*ALU, M.CMP, M.TEST, M.INC, M.DEC):
-                raise ValueError(f"unsupported flag producer at RVA {producer.ip:#x}")
-            body[ip] = f"if ({lifter.condition(producer, ins)}) goto loc_{ins.near_branch_target:x};"
+            body[ip] = f"if ({lifter.condition(producers[ip], ins)}) goto loc_{ins.near_branch_target:x};"
             effects[ip] = (set(), set(), set())
         elif ins.flow_control == FlowControl.UNCONDITIONAL_BRANCH:
             body[ip] = f"goto loc_{ins.near_branch_target:x};"
@@ -537,7 +591,7 @@ def lift(pe, name):
         else:
             if ins.mnemonic != M.RET and ins.is_stack_instruction:
                 raise ValueError(f"stack operation in leaf profile at RVA {ip:#x}")
-            text, reads, writes = lifter.statement(ins, following)
+            text, reads, writes = lifter.statement(ins, ip in sets_flags, producers.get(ip))
             body[ip] = text
             effects[ip] = (reads, writes, set())
         touched = set().union(*effects[ip])
@@ -599,6 +653,10 @@ template <class T> static T load(word address) {
     T value;
     std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
     return value;
+}
+// A read the compiler must perform even when its value is unused (a CMOVcc memory source).
+template <class T> static T load_always(word address) {
+    return *reinterpret_cast<const volatile T*>(address);
 }
 template <class T> static void store(word address, T value) {
     std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
