@@ -1,8 +1,15 @@
 """Compare complete Windows processes, including a translated inverted branch."""
+from pathlib import Path
 import struct
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 from typing import NamedTuple
+
+import pefile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+from cpu_exe_aot import translate
 
 
 class Observation(NamedTuple):
@@ -44,5 +51,43 @@ def compare(native, lifted, inverted_native, inverted_lifted):
         check("empty stdin", run(program, b""), Observation(b"", b"", 2))
 
 
+def check_header_guards(native, io_provider, mix_provider):
+    native_path, io_path, mix_path = map(Path, (native, io_provider, mix_provider))
+    expected = translate(native_path, io_path, mix_path)
+    with TemporaryDirectory() as folder:
+        short_dirs = Path(folder) / "short-dirs.exe"
+        with pefile.PE(str(native_path), fast_load=True) as pe:
+            pe.OPTIONAL_HEADER.NumberOfRvaAndSizes = 4
+            pe.write(str(short_dirs))
+        if translate(short_dirs, io_path, mix_path) != expected:
+            raise AssertionError("4-directory PE32+ executable changed the translation")
+
+        rejections = [
+            ("tls.exe", lambda pe: setattr(pe.OPTIONAL_HEADER.DATA_DIRECTORY[9], "VirtualAddress", 0x1000),
+             "TLS startup"),
+            ("dll.exe", lambda pe: setattr(pe.FILE_HEADER, "Characteristics",
+                                           pe.FILE_HEADER.Characteristics | 0x2000),
+             "AMD64 PE32+ executable"),
+            ("nonexec.exe", lambda pe: setattr(pe.FILE_HEADER, "Characteristics",
+                                               pe.FILE_HEADER.Characteristics & ~0x2),
+             "AMD64 PE32+ executable"),
+        ]
+        for name, mutate, reason in rejections:
+            copy = Path(folder) / name
+            with pefile.PE(str(native_path), fast_load=True) as pe:
+                mutate(pe)
+                pe.write(str(copy))
+            try:
+                translate(copy, io_path, mix_path)
+            except ValueError as exc:
+                if reason not in str(exc):
+                    raise AssertionError(f"{name}: expected {reason!r}, got {exc}") from exc
+            else:
+                raise AssertionError(f"{name}: accepted, expected {reason!r}")
+    print("4-directory EXE translation and 3 PE header rejection controls passed")
+
+
 if __name__ == "__main__":
-    compare(*sys.argv[1:])
+    compare(*sys.argv[1:5])
+    if len(sys.argv) > 5:
+        check_header_guards(sys.argv[1], sys.argv[5], sys.argv[6])
