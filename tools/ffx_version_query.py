@@ -154,6 +154,30 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = {lhs} {shift} {count}; "
                     f"carry = ((a >> {last}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else \
                 write(operand(0))  # A masked zero count keeps the flags but still zero-extends a 32-bit destination.
+        elif op in (M.RCL, M.RCR):
+            # The 9-, 17-, 33- or 65-bit rotation through CF, one bit per step as in the SDM pseudocode.
+            # Counts mask to five bits (six for 64-bit). Reducing 8- and 16-bit counts modulo 9 and 17 only
+            # bounds the loop, since those rotations repeat with that period.
+            # A zero step count keeps CF; ZF is never affected. OF (count 1) is not modelled here.
+            size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            count = f"(static_cast<unsigned>({operand(1)}) & {0x3f if size == 8 else 0x1f}u)"
+            if size < 4:
+                count = f"({count} % {bits + 1}u)"
+            if op == M.RCL:
+                step = (f"const bool out = ((v >> {bits - 1}) & 1) != 0; "
+                        f"v = static_cast<{width}>((v << 1) | {width}(c));")
+            else:
+                step = (f"const bool out = (v & 1) != 0; "
+                        f"v = static_cast<{width}>((v >> 1) | ({width}(c) << {bits - 1}));")
+            stmt = (f"{{ {width} v = {operand(0)}; bool c = carry; "
+                    f"for (unsigned n = {count}; n != 0; --n) {{ {step} c = out; }} carry = c; {write('v')} }}")
+        elif op == M.CLC:
+            stmt = "carry = false;"
+        elif op == M.STC:
+            stmt = "carry = true;"
+        elif op == M.CMC:
+            stmt = "carry = !carry;"
         elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.DEC, M.SUB, M.SBB):
             operator = {M.ADD: "+", M.INC: "+", M.DEC: "-", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]
             rhs = "1" if op in (M.INC, M.DEC) else operand(1)
