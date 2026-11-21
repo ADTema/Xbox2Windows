@@ -6,7 +6,7 @@ Xbox2Windows targets x64 Windows for its C++, HLSL, MASM, D3D12, WARP, and GPU t
 
 | Work or check | macOS / Linux | x64 Windows | Notes |
 |---|---|---|---|
-| Documentation edits | Yes | Yes | Markdown, diff hygiene, and link checks. |
+| Documentation edits | Yes | Yes | Markdown, diff hygiene, and link checks (`tests/docs_links_check.py`). |
 | 8 pure-Python checks | Yes | Yes | `script_state_check.py`, `bcpack_check.py`, `resource_ranges_check.py`, `dxcontainer_part_offsets_check.py`, `layout_chunks_check.py`, `intake/paths_check.py`, `shader_probe_check.py` (no args), `gpu_report_format_check.py`. |
 | LLVM 15 `gfx1013` translation checks | Yes | No (via CI / separate LLVM) | `tests/pixel_aot_check.py binary` and `tests/ffx_dispatch_aot_check.py` verify assembling, disassembling, and lowering only. |
 | `cmake --preset dev` build (MSVC `cl` + Ninja) | No | Yes | `CMakePresets.json` selects `cl`. |

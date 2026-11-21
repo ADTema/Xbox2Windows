@@ -301,6 +301,9 @@ if(FFX_UPSCALER_IMAGE)
     endif()
 endif()
 if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")
+
     enable_language(ASM_MASM)
     function(cpu_asm_fixture image source)
         if(ARGC GREATER 2)
