@@ -599,10 +599,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
         "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
     add_library(cpu_exe_io SHARED tests/cpu/exe_io.cpp)
-    foreach(variant IN ITEMS original inverted)
+    foreach(variant IN ITEMS original inverted pair swapped)
         set(native cpu_exe_${variant})
         set(lifted ${native}_lifted)
         add_executable(${native} tests/cpu/exe_entry.asm tests/cpu/direct.asm)
+        if(variant STREQUAL "pair" OR variant STREQUAL "swapped")
+            target_sources(${native} PRIVATE tests/cpu/alt.asm)
+            target_compile_definitions(${native} PRIVATE TWO_TARGETS)
+        endif()
+        if(variant STREQUAL "swapped")
+            target_compile_definitions(${native} PRIVATE SWAP_TARGETS)
+        endif()
         set_target_properties(${native} PROPERTIES LINKER_LANGUAGE CXX)
         target_compile_definitions(${native} PRIVATE IMPORT_MIX)
         if(variant STREQUAL "inverted")
@@ -627,6 +634,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/exe_entry_check.py"
         "$<TARGET_FILE:cpu_exe_original>" "$<TARGET_FILE:cpu_exe_original_lifted>"
         "$<TARGET_FILE:cpu_exe_inverted>" "$<TARGET_FILE:cpu_exe_inverted_lifted>")
+    add_test(NAME cpu_aot_exe_call_targets COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/exe_entry_check.py" --targets
+        "$<TARGET_FILE:cpu_exe_pair>" "$<TARGET_FILE:cpu_exe_pair_lifted>"
+        "$<TARGET_FILE:cpu_exe_swapped>" "$<TARGET_FILE:cpu_exe_swapped_lifted>")
     add_test(NAME cpu_aot_ordinal_import COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/import_check.py" "$<TARGET_FILE:cpu_ordinal_original>"
         "$<TARGET_FILE:cpu_ordinal_original_lifted>" "$<TARGET_FILE:cpu_ordinal_provider>"

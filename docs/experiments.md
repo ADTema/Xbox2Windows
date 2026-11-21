@@ -42,9 +42,11 @@ The [Windows test](../tests/cpu/exe_entry_check.py) sends one byte to each child
 A second build flips the selector's conditional jump. The same translator compiles that EXE, and both inverted programs must exchange the two rows in all three observations. Empty input returns 2 with both pipes empty in all four programs. The ordinary process launch and the first exit code follow the contributor's [mapped-process experiment](https://github.com/R0Y00/Xbox2Windows/issues/165). That experiment covers TLS startup separately.
 
 ```powershell
-cmake --build --preset dev --target cpu_exe_original_lifted cpu_exe_inverted_lifted
-ctest --preset dev --no-tests=error -R '^cpu_aot_exe_entry$' -V
+cmake --build --preset dev --target cpu_exe_original_lifted cpu_exe_inverted_lifted cpu_exe_pair_lifted cpu_exe_swapped_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_exe_(entry|call_targets)$' -V
 ```
+
+The two-target fixture gives each branch its own direct call site. One caller adds seven to the first import argument and the other adds nine. Swapping the targets while keeping the selector and incoming arguments fixed changes the imported arguments, output bytes and process status for each input. Both native and translated variants are checked against these expected observations.
 
 ## Offline CPU leaf recompilation
 
