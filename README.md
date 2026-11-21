@@ -4,6 +4,8 @@ Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) s
 
 New to the project? The [pinned guide in GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions/75) will help you choose a first contribution. Ask build and debugging questions in [Development Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a).
 
+[![Progress dashboard: instruction forms translated and tests passing](docs/progress/dashboard.svg)](docs/progress/PROGRESS.md)
+
 ## Current results and open work
 
 | Area | Result on Windows | Open question or contribution |
