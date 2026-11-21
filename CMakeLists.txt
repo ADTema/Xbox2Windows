@@ -515,4 +515,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:intake_forward>" "$<TARGET_FILE:intake_provider>")
     add_test(NAME layout_chunk_summary COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/layout_chunks_check.py")
+else()
+    message(WARNING
+        "Python-driven tests, including the CPU fixtures, are disabled because "
+        "INTAKE_PYTHON was not found at '${INTAKE_PYTHON}'. "
+        "Follow the Python setup under First build in README.md, or set INTAKE_PYTHON "
+        "to an interpreter with requirements-dev.txt installed. Then rerun CMake.")
 endif()
