@@ -188,10 +188,10 @@ void check_bvh_root_roundtrip(ID3D12Device* device)
     std::puts("normalized_signature=matched_control root_creation=passed pipeline_creation=passed dispatch=passed");
 }
 
-ComputeCommands::ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline)
+ComputeCommands::ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline, D3D12_COMMAND_LIST_TYPE type)
 {
     D3D12_COMMAND_QUEUE_DESC desc{};
-    desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    desc.Type = type;
     check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "Create compute queue");
     check(device->CreateCommandAllocator(desc.Type, IID_PPV_ARGS(&allocator)), "Create compute allocator");
     check(device->CreateCommandList(0, desc.Type, allocator.Get(), pipeline, IID_PPV_ARGS(&list)),

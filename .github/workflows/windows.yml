@@ -11,6 +11,19 @@ permissions:
   contents: read
 
 jobs:
+  pixel-binary:
+    name: Assemble and translate gfx1013 fixtures
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Check machine-code inputs with LLVM 15
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends llvm-15
+          python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025

@@ -57,6 +57,11 @@ foreach(stage IN ITEMS vs ps)
     target_sources(offscreen_check PRIVATE "${header}")
 endforeach()
 set(ray_header "${CMAKE_CURRENT_BINARY_DIR}/ray_query.h")
+set(pixel_vs "${CMAKE_CURRENT_BINARY_DIR}/pixel_aot_vs.h")
+add_custom_command(OUTPUT "${pixel_vs}" COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E main
+    -Fh "${pixel_vs}" -Vn pixel_aot_vs "${CMAKE_CURRENT_SOURCE_DIR}/tests/pixel_aot_vs.hlsl"
+    DEPENDS tests/pixel_aot_vs.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp "${pixel_vs}")
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp)
 foreach(entry IN ITEMS DualUav SampleMip)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
@@ -166,6 +171,13 @@ endif()
 set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
     "Native x64 Python with pefile for static intake tests")
 if(EXISTS "${INTAKE_PYTHON}")
+    foreach(adapter IN ITEMS hardware warp)
+        add_test(NAME pixel_aot_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_${adapter} PROPERTIES TIMEOUT 60)
+    endforeach()
+    set_tests_properties(pixel_aot_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compressed_scene_metadata COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/scene_records_check.py" "${CMAKE_CURRENT_BINARY_DIR}/DualUav.cso"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.cso" "$<TARGET_FILE:root_probe>")

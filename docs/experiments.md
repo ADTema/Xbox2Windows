@@ -28,6 +28,39 @@ dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 
 Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
+## Offline pixel shader recompilation
+
+`tools/pixel_aot.py` extracts one named pixel program from a local archive, decodes gfx1013 instructions with LLVM and emits HLSL. DXC compiles the result to desktop DXIL before the draw. The lowerer tracks register writes across whole-quad interpolation of attribute 0, a scalar texture-descriptor load, a 2D RGBA sample, packed round-toward-zero binary16 conversions and one compressed color export. Unknown instructions, mismatched bindings and reads before the required wait cause translation to fail. [LLVM disassembler API](https://llvm.org/docs/doxygen/group__LLVMCDisassembler.html) · [Leonida public format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/fssm_unpack.py)
+
+The caller identifies the entry registers for the texture address and interpolation base, and supplies the four sampler descriptor words to match. The generated pixel shader uses `TEXCOORD0`, texture `t0` and sampler `s0`. The test binds a point-clamp sampler, one mip and a full-screen triangle. These bindings are an explicit specialization. The test measures finite UNORM inputs under full pixel coverage. Execution with a title's original pipeline state, helper-lane behavior at triangle edges and other texture formats require separate validation.
+
+From the repository root on Linux with LLVM 15 installed, assemble both original test shaders, wrap them in synthetic records, then extract, decode and translate them. The test compares the result with lowering the source operands directly.
+
+```sh
+python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+On Windows, use the Python-enabled build from the project README. Each backend draws a copy and a red/blue swap, reads all 4,096 pixels back from a floating-point target and compares all four channels bitwise with a CPU reference. A third draw uses the swapped shader with the copy expectation and must report a mismatch.
+
+```powershell
+ctest --preset dev -R '^pixel_aot_' -V
+```
+
+For a compatible local record, substitute the archive, exact record name, two register numbers and four descriptor words below. Run the translator from the repository root in WSL, then compile and draw from a Windows development shell. The JSON printed by the translator identifies each input and output by SHA-256 for local reproduction. The renderer's `rgba` expectation checks a copy and `bgra` checks a red/blue swap.
+
+```sh
+python3 -B tools/pixel_aot.py "$archive" "$record" --llvm libLLVM-15.so.1 \
+    --texture-sgpr "$texture_reg" --interp-sgpr "$interp_reg" \
+    --sampler-words "$word0" "$word1" "$word2" "$word3" --output out/pixel-aot/translated.hlsl
+```
+
+```powershell
+.\tools\dev.ps1
+dxc -T ps_6_0 -E main -Fo out/pixel-aot/translated.cso out/pixel-aot/translated.hlsl
+.\out\build\dev\offscreen_check.exe hardware --check-pixel out/pixel-aot/translated.cso rgba
+.\out\build\dev\offscreen_check.exe warp --check-pixel out/pixel-aot/translated.cso rgba
+```
+
 ## Package integrity
 
 For a local build with a multi-file v1 torrent and `layout*.xml`, run the offline verification with Python 3.9 or newer. Substitute your local directory name.

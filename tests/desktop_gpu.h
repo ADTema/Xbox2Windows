@@ -8,6 +8,7 @@ Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D1
 void check_compute(ID3D12Device* device, bool tables);
 void check_dual_uav(ID3D12Device* device);
 void check_texture_mips(ID3D12Device* device);
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB);
 void check_bvh_root_roundtrip(ID3D12Device* device);
 void check_buffer_ops(ID3D12Device* device);
 void check_bvh_reads(ID3D12Device* device);
@@ -26,7 +27,8 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer,
                 D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after);
 
 struct ComputeCommands {
-    ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline);
+    ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline,
+                    D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_COMPUTE);
     void submit_and_wait(ID3D12Device* device);
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
