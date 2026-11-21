@@ -2,11 +2,13 @@
 import argparse
 from collections import Counter
 from collections.abc import Iterator
+from dataclasses import asdict, dataclass
 from itertools import pairwise
 import json
 from pathlib import Path
 import struct
 from typing import BinaryIO, NamedTuple
+import zlib
 
 from paged_resource import PagedResource, Segment
 
@@ -35,6 +37,13 @@ class Tables(NamedTuple):
 class PageMap(NamedTuple):
     logical_offset: int
     file_offset: int
+
+
+@dataclass(frozen=True)
+class ZlibSegment:
+    segment_logical_offset: int
+    page_offset_in_segment: int
+    segment: Segment
 
 
 def boundary(data: bytes, offset: int = 0) -> Boundary:
@@ -110,36 +119,69 @@ def iter_boundaries(tables: Tables) -> Iterator[Boundary]:
             yield boundary(batch, position)
 
 
-def raw_page_map(stream: BinaryIO, index: int) -> PageMap:
-    tables = read_tables(stream)
+def descriptor_interval(tables: Tables, index: int) -> tuple[int, Boundary, Boundary]:
     if not 0 <= index < tables.records:
         raise ValueError("Descriptor index outside the ETPF table")
     location, = struct.unpack("<I", tables.metadata.read(16 + index * 16 + 8, 4))
     address = page_address(location, tables.logical_size)
-    mapped: PageMap | None = None
+    selected: tuple[Boundary, Boundary] | None = None
     for left, right in pairwise(iter_boundaries(tables)):
         if right.stored <= left.stored or right.logical <= left.logical:
             raise ValueError("RDS5 boundaries must increase in both address spaces")
         if left.logical <= address < right.logical:
-            if left.codec:
-                raise ValueError("Descriptor page belongs to a coded RDS5 range")
-            if right.stored - left.stored != right.logical - left.logical:
-                raise ValueError("Raw mapping requires equal stored and logical range sizes")
-            mapped = PageMap(address, left.stored + address - left.logical)
-    if mapped is None:
+            selected = left, right
+    if selected is None:
         raise ValueError("Descriptor page has no RDS5 range")
-    return mapped
+    return address, *selected
+
+
+def raw_page_map(stream: BinaryIO, index: int) -> PageMap:
+    address, left, right = descriptor_interval(read_tables(stream), index)
+    if left.codec:
+        raise ValueError("Descriptor page belongs to a coded RDS5 range")
+    if right.stored - left.stored != right.logical - left.logical:
+        raise ValueError("Raw mapping requires equal stored and logical range sizes")
+    return PageMap(address, left.stored + address - left.logical)
+
+
+def zlib_segment(stream: BinaryIO, index: int) -> ZlibSegment:
+    tables = read_tables(stream)
+    address, left, right = descriptor_interval(tables, index)
+    if left.codec != 8:
+        raise ValueError("Descriptor page requires a zlib RDS5 range")
+    stored_span = right.stored - left.stored
+    decoded_size = right.logical - left.logical
+    if max(stored_span, decoded_size) > 1 << 20:
+        raise ValueError("Zlib interval exceeds 1 MiB stored or decoded budget")
+    data = tables.archive.read(left.stored, stored_span)
+    decoder = zlib.decompressobj()
+    try:
+        decoded = decoder.decompress(data, decoded_size + 1)
+    except zlib.error as exc:
+        raise ValueError("Invalid zlib stream or checksum") from exc
+    if not decoder.eof or len(decoded) != decoded_size:
+        raise ValueError("Incomplete zlib stream or mismatched logical range size")
+    if any(decoder.unused_data):
+        raise ValueError("Nonzero bytes follow the zlib stream")
+    stored = stored_span - len(decoder.unused_data)
+    segment = Segment(left.stored, stored, decoded_size, "zlib")
+    return ZlibSegment(left.logical, address - left.logical, segment)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
-    parser.add_argument("--raw-page-map", type=int, metavar="INDEX",
-                        help="Report offsets of a zero-based descriptor's first 4 KiB page in an equal-size raw range")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--raw-page-map", type=int, metavar="INDEX",
+                      help="Report offsets of a zero-based descriptor's first 4 KiB page in an equal-size raw range")
+    mode.add_argument("--zlib-segment", type=int, metavar="INDEX",
+                      help="Verify the zlib interval containing the descriptor's first page and report its extents")
     args = parser.parse_args()
     try:
         with args.archive.open("rb") as file:
-            if args.raw_page_map is None:
+            if args.zlib_segment is not None:
+                print(json.dumps(asdict(zlib_segment(file, args.zlib_segment)), indent=2))
+            elif args.raw_page_map is None:
                 counts = inventory(file)
                 print(json.dumps({"descriptor_count": sum(counts.values()), "groups": [
                     {**item._asdict(), "count": counts[item]} for item in sorted(counts)

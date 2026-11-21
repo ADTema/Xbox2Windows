@@ -1239,6 +1239,8 @@ Run `python -B tools/texture_descriptors.py <archive.ttpf>` to group descriptors
 
 Add `--raw-page-map INDEX` to report the logical and file offsets of a zero-based descriptor's first 4 KiB page. The containing interval must be raw and have equal stored and logical lengths. The command checks that boundary positions increase strictly, reads the boundary table in batches of at most 4 KiB, and accepts tables up to 1 MiB. It reads no texture payload.
 
+Use `--zlib-segment INDEX` for a descriptor in a codec-8 interval. This mode reads and decompresses the selected interval, limiting both stored and decoded sizes to 1 MiB. It verifies the zlib checksum and end of stream, checks the decoded length against the declared extent, and requires any trailing bytes to be zero. The report contains the fields for a `Segment`, its logical start, and the descriptor page's offset within it. Decoded bytes are not included in the report.
+
 `tools/section_probe.py` samples up to 8 MiB at the start, middle and end of each input. It looks for 16-byte-aligned zlib streams, with stored and decoded sizes capped at 256 KiB. A section record must start and end with the requested tags, and its big-endian section sizes must exactly cover the decoded buffer. Streams cut off by a window or size cap are omitted. Counts establish record boundaries within sampled regions. Interpreting payload fields or validating a checksum inside a section requires its format.
 
 ```powershell
