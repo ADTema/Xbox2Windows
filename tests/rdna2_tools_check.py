@@ -22,6 +22,9 @@ from scan_unsupported_shaders import (
     is_opcode_recognized,
     classify_isa_category,
     generate_reports,
+    scan_directory_or_files,
+    detect_shader_stage,
+    generate_progress_dashboard,
 )
 try:
     from pixel_aot import disassemble as llvm_disassemble
@@ -673,6 +676,71 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertEqual(summary["total_shaders_scanned"], 2)
             self.assertEqual(summary["translator_accepted"], 1)
             self.assertEqual(summary["opcodes_recognized_translator_rejected"], 1)
+
+    def test_detect_shader_stage(self):
+        """Verify pipeline stage detection from file names and relative paths."""
+        self.assertEqual(detect_shader_stage("shaders/pixel/ps_draw.bin"), "pixel")
+        self.assertEqual(detect_shader_stage("cs_dispatch.bin"), "compute")
+        self.assertEqual(detect_shader_stage("shaders/vertex/vs_main.s"), "vertex")
+        self.assertEqual(detect_shader_stage("unknown_kernel.bin"), "other")
+
+    def test_binary_shader_scanning(self):
+        """Verify scanning raw .bin files directly with disasm_rdna2 without LLVM."""
+        raw_code = bytes.fromhex(
+            "000080bf"  # s_nop 0
+            "7f008cbf"  # s_waitcnt
+            "000081bf"  # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_file = tmp_path / "ps_test.bin"
+            bin_file.write_bytes(raw_code)
+            results = scan_directory_or_files([bin_file])
+            self.assertEqual(len(results), 1)
+            res = results[0]
+            self.assertEqual(res["shader_name"], "ps_test.bin")
+            self.assertEqual(res["stage"], "pixel")
+            self.assertEqual(res["total_instructions"], 3)
+            self.assertTrue(res["opcodes_recognized"])
+
+    def test_dashboard_report_generation(self):
+        """Verify generation of PROGRESS.md and progress.json."""
+        canonical_shader = [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        results = [analyze_shader_instructions("ps_canonical", canonical_shader)]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            json_file, md_file = generate_progress_dashboard(results, tmp_path)
+            self.assertTrue(json_file.is_file())
+            self.assertTrue(md_file.is_file())
+            md_content = md_file.read_text(encoding="utf-8")
+            self.assertIn("Overall Coverage:", md_content)
+            self.assertIn("Pipeline Stage Breakdown", md_content)
+            json_content = json.loads(json_file.read_text(encoding="utf-8"))
+            self.assertIn("overall", json_content)
+            self.assertIn("stages", json_content)
+            self.assertIn("missing_opcodes_ranked", json_content)
 
 
 if __name__ == "__main__":
