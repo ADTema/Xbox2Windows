@@ -2,6 +2,8 @@
 // DLL; the entry point then runs two worker threads in turn, each with a per-thread value kept by TlsAlloc (an
 // explicit slot, not implicit __declspec(thread) data) and writes the whole log to standard output.
 // Exit code: b_value() | first worker's value << 8 | second worker's << 16 | main thread's << 24.
+// A failure ends the process with 0xE0000001 (TlsAlloc), 0xE0000002 (CreateThread), 0xE0000003 (wait timed out),
+// 0xE0000004 (wait failed) or 0xE0000005 (unexpected wait result).
 #include <windows.h>
 
 #pragma runtime_checks("", off)
@@ -15,7 +17,29 @@ DWORD g_slot;
 volatile DWORD g_worker_value;
 DWORD g_next_value;
 
+// A failed worker setup or a wait that does not return WAIT_OBJECT_0 must not be consumed as a result: the
+// worker could still be writing the shared log or g_worker_value. The EXE ends the whole process with a
+// code that names the failure. ExitProcess stops every other thread, which CloseHandle does not: closing a
+// handle leaves the thread running. In a mapped image a thread that outlived the entry point would also run
+// unmapped code. The codes are reported by the isolated child, never by the host test process.
+constexpr UINT TLS_ALLOC_FAILED = 0xE0000001u, CREATE_FAILED = 0xE0000002u, WAIT_TIMED_OUT = 0xE0000003u,
+               WAIT_FAILED_CODE = 0xE0000004u, WAIT_UNEXPECTED = 0xE0000005u;
+#if defined(TIMEOUT_CONTROL)
+constexpr DWORD WAIT_MS = 1;  // control: the worker sleeps far longer than this
+#else
+constexpr DWORD WAIT_MS = 10000;  // shorter than the harness's 30 s process limit, so the exit code is observed
+#endif
+#if defined(CREATE_CONTROL)
+constexpr SIZE_T STACK_SIZE = static_cast<SIZE_T>(1) << 62;  // control: larger than the address space, so CreateThread
+                                                           // fails with ERROR_INVALID_PARAMETER whatever the free memory
+#else
+constexpr SIZE_T STACK_SIZE = 0;
+#endif
+
 DWORD WINAPI worker(void*) {
+#ifdef TIMEOUT_CONTROL
+    Sleep(500);
+#endif
     TlsSetValue(g_slot, reinterpret_cast<void*>(static_cast<ULONG_PTR>(g_next_value)));
     const DWORD seen = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(TlsGetValue(g_slot)));
     g_worker_value = seen;
@@ -60,13 +84,18 @@ extern "C" const TlsDirectory _tls_used = {nullptr, nullptr, &tls_index_slot, tl
 extern "C" DWORD WINAPI exe_entry(void*) {
     a_log('e');
     g_slot = TlsAlloc();
+    if (g_slot == TLS_OUT_OF_INDEXES) ExitProcess(TLS_ALLOC_FAILED);
     TlsSetValue(g_slot, reinterpret_cast<void*>(1));
     DWORD worker_values[2];
     for (DWORD i = 0; i < 2; ++i) {  // two workers one after the other, so the log order is fixed
         g_next_value = 2 + i;
-        HANDLE thread = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
-        WaitForSingleObject(thread, 30000);
-        CloseHandle(thread);
+        HANDLE thread = CreateThread(nullptr, STACK_SIZE, worker, nullptr, 0, nullptr);
+        if (!thread) ExitProcess(CREATE_FAILED);
+        const DWORD waited = WaitForSingleObject(thread, WAIT_MS);
+        if (waited == WAIT_TIMEOUT) ExitProcess(WAIT_TIMED_OUT);
+        if (waited == WAIT_FAILED) ExitProcess(WAIT_FAILED_CODE);
+        if (waited != WAIT_OBJECT_0) ExitProcess(WAIT_UNEXPECTED);
+        CloseHandle(thread);  // the worker has finished; this only releases the handle
         worker_values[i] = g_worker_value;
     }
     const DWORD mine = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(TlsGetValue(g_slot)));

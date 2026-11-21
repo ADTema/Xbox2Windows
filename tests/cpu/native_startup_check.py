@@ -14,13 +14,14 @@ import pefile
 from native_map_check import Mapper, Resolver, STATUS
 
 A, B, EXE = "cpu_startup_a.dll", "cpu_startup_b.dll", "cpu_startup_exe.exe"
-TIMEOUT = 30
+TIMEOUT = 30  # per process; longer than the 10 s wait inside the EXE, so its failure code is observed first
 # startup_*.cpp: a_main logs 'a' and sets 7; b_main logs 'b' and publishes a_value() * 2; the EXE's TLS
 # callback logs 't', its entry point 'e', each of two workers 'w' + its TlsGetValue (2, then 3), and the
 # main thread 'm' + 1. Exit code: b_value | first worker << 8 | second worker << 16 | main << 24.
 LOG = "abtew2w3m1"
 EXIT = 14 | (2 << 8) | (3 << 16) | (1 << 24)
 LOG_WITHOUT_B, EXIT_WITHOUT_B = "atew2w3m1", (2 << 8) | (3 << 16) | (1 << 24)
+CREATE_FAILED, WAIT_TIMED_OUT = 0xE0000002, 0xE0000003  # startup_exe.cpp failure codes
 EXIT_ALTERED_A = 18 | (2 << 8) | (3 << 16) | (1 << 24)  # a_value 9 instead of 7
 
 
@@ -128,8 +129,27 @@ def run(mapper_path, result_file, specs, reverse):
                                              "exit": exit_code.value, "requests": requests}))
 
 
-def check(mapper, exe, a, b, b_noinit, a_alt):
+def check_failure_control(mapper, exe_control, a, b, expected, what):
+    """A worker that cannot be created or outlives the wait must end the process with a fixed code, under both
+    loaders, before any result is consumed or the log is printed."""
+    with TemporaryDirectory() as temp:
+        for name, path in ((A, a), (B, b), (EXE, exe_control)):
+            shutil.copy(path, Path(temp) / name)
+        native_done = subprocess.run([str(Path(temp) / EXE)], capture_output=True, timeout=TIMEOUT)
+        command = [sys.executable, "-B", __file__, "--run", str(mapper), str(Path(temp) / "unused.json"),
+                   f"{A}={a}", f"{B}={b}", f"{EXE}={exe_control}"]
+        mapped_done = subprocess.run(command, capture_output=True, timeout=TIMEOUT)
+    codes = (native_done.returncode & 0xffffffff, mapped_done.returncode & 0xffffffff)
+    if codes != (expected, expected) or native_done.stdout or mapped_done.stdout:
+        raise AssertionError(f"{what}: exit codes {codes[0]:#x} and {codes[1]:#x}, "
+                             f"stdout {native_done.stdout!r} and {mapped_done.stdout!r}")
+    print(f"control, {what}: both processes end with {expected:#x} before consuming a result or printing the log")
+
+
+def check(mapper, exe, a, b, b_noinit, a_alt, exe_timeout, exe_create):
     check_pe_dependencies(exe, a, b)
+    check_failure_control(mapper, exe_timeout, a, b, WAIT_TIMED_OUT, "a worker that outlives the wait")
+    check_failure_control(mapper, exe_create, a, b, CREATE_FAILED, "a worker thread that cannot be created")
     nat, map_ = native(exe, a, b), mapped(mapper, exe, a, b)
     print(f"native: LOG:{nat['log']} exit {nat['exit']:#x}")
     print(f"mapped: LOG:{map_['log']} exit {map_['exit']:#x}; mapped in order {map_['order']}")
@@ -171,7 +191,7 @@ if __name__ == "__main__":
         run(sys.argv[2], sys.argv[3], sys.argv[4:-1] if flagged else sys.argv[4:], flagged)
     else:
         parser = argparse.ArgumentParser()
-        for argument in ("mapper", "exe", "a", "b", "b_noinit", "a_alt"):
+        for argument in ("mapper", "exe", "a", "b", "b_noinit", "a_alt", "exe_timeout", "exe_create"):
             parser.add_argument(argument, type=Path)
         args = parser.parse_args()
-        check(args.mapper, args.exe, args.a, args.b, args.b_noinit, args.a_alt)
+        check(args.mapper, args.exe, args.a, args.b, args.b_noinit, args.a_alt, args.exe_timeout, args.exe_create)
