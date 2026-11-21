@@ -11,3 +11,6 @@ EXPORTS
     shrd64_cl
     shld32_imm
     shrd64_imm
+    shld32_imm32
+    rol32_cl_zf
+    shld32_cl_zf

@@ -201,4 +201,56 @@ shrd64_imm PROC FRAME
     ret
 shrd64_imm ENDP
 
+; Immediate count 32 masks to 0 for 32-bit SHLD: must preserve ZF=1, CF=0 and zero-extend RAX.
+shld32_imm32 PROC FRAME
+    .endprolog
+    cmp r10d, r10d      ; seed ZF=1, CF=0
+    mov rax, rcx
+    shld eax, edx, 32
+    mov r10d, 0
+    jae short @F
+    mov r10d, 2
+@@:
+    jne short @F
+    or r10d, 1
+@@:
+    mov qword ptr [r8], r10
+    ret
+shld32_imm32 ENDP
+
+; Alternate flag seed (ZF=1, CF=0) for CL zero-count preservation checks.
+rol32_cl_zf PROC FRAME
+    .endprolog
+    cmp r10d, r10d      ; seed ZF=1, CF=0
+    mov rax, rcx
+    mov rcx, rdx
+    rol eax, cl
+    mov r9d, 0
+    jae short @F
+    mov r9d, 2
+@@:
+    jne short @F
+    or r9d, 1
+@@:
+    mov qword ptr [r8], r9
+    ret
+rol32_cl_zf ENDP
+
+shld32_cl_zf PROC FRAME
+    .endprolog
+    cmp r10d, r10d      ; seed ZF=1, CF=0
+    mov rax, rcx
+    mov rcx, r8
+    shld eax, edx, cl
+    mov r10d, 0
+    jae short @F
+    mov r10d, 2
+@@:
+    jne short @F
+    or r10d, 1
+@@:
+    mov qword ptr [r9], r10
+    ret
+shld32_cl_zf ENDP
+
 END

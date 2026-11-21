@@ -13,10 +13,10 @@ from ffx_version_query import INTEGER_HEADER, lower, region
 
 U64 = ctypes.c_uint64
 
-ROT_CL = ("rol32_cl", "rol64_cl", "ror32_cl", "ror64_cl")
+ROT_CL = ("rol32_cl", "rol64_cl", "ror32_cl", "ror64_cl", "rol32_cl_zf")
 ROT_IMM = ("rol32_imm", "ror64_imm")
-SHD_CL = ("shld32_cl", "shld64_cl", "shrd32_cl", "shrd64_cl")
-SHD_IMM = ("shld32_imm", "shrd64_imm")
+SHD_CL = ("shld32_cl", "shld64_cl", "shrd32_cl", "shrd64_cl", "shld32_cl_zf")
+SHD_IMM = ("shld32_imm", "shrd64_imm", "shld32_imm32")
 
 
 def emit(image, output):
@@ -152,6 +152,38 @@ def check(native_path, lifted_path):
                             f"expected ({want_v:#x}, {want_f:#x})"
                         )
                 cases += 1
+
+    for a in values:
+        want_v, want_f = ref_shd(True, a, 0x12345678, 32, 32, seed_flags=1)
+        for lib, label in ((native, "native"), (lifted, "lifted")):
+            slot.value = 0xdeadbeef
+            got = lib.shld32_imm32(a, 0x12345678, ctypes.byref(slot))
+            if (got, slot.value) != (want_v, want_f):
+                raise AssertionError(
+                    f"{label} shld32_imm32({a:#x}) = ({got:#x}, {slot.value:#x}), expected ({want_v:#x}, {want_f:#x})"
+                )
+        cases += 1
+
+    for a in values:
+        for count in (0, 32, 64):
+            want_v, want_f = ref_rot(True, a, count, 32, seed_flags=1)
+            for lib, label in ((native, "native"), (lifted, "lifted")):
+                slot.value = 0xdeadbeef
+                got = lib.rol32_cl_zf(a, count, ctypes.byref(slot))
+                if (got, slot.value) != (want_v, want_f):
+                    raise AssertionError(
+                        f"{label} rol32_cl_zf({a:#x}, {count}) = ({got:#x}, {slot.value:#x}), expected ({want_v:#x}, {want_f:#x})"
+                    )
+            cases += 1
+            want_v, want_f = ref_shd(True, a, 0x12345678, count, 32, seed_flags=1)
+            for lib, label in ((native, "native"), (lifted, "lifted")):
+                slot.value = 0xdeadbeef
+                got = lib.shld32_cl_zf(a, 0x12345678, count, ctypes.byref(slot))
+                if (got, slot.value) != (want_v, want_f):
+                    raise AssertionError(
+                        f"{label} shld32_cl_zf({a:#x}, {count}) = ({got:#x}, {slot.value:#x}), expected ({want_v:#x}, {want_f:#x})"
+                    )
+            cases += 1
 
     print(f"{cases} rotate and double-precision shift cases (ROL, ROR, SHLD, SHRD) matched native and translated DLLs")
 
