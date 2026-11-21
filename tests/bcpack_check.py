@@ -19,6 +19,14 @@ class TextureChecks(unittest.TestCase):
         prefix[4::8] = bytes.fromhex("de 04 01 00 11 30")
         result, = probe(prefix, 11358)
         self.assertEqual((result["refill_bytes"], result["status"]), (1, "header_match"))
+        # Lanes 0, 2 and 4 read in this round. Lane 4 takes the third byte.
+        result, = probe(prefix, 11358, prefetch_mask=0x15, prefetch=bytes([2, 17, 125]))
+        self.assertEqual(result["first_refill_offset"], 50)
+        self.assertTrue(result["first_refill_matches"])
+        result, = probe(prefix, 11358, prefetch_mask=0x15, prefetch=bytes([2, 125, 17]))
+        self.assertFalse(result["first_refill_matches"])
+        with self.assertRaises(ValueError):
+            probe(prefix, 11358, prefetch_mask=0x15, prefetch=bytes([125]))
         prefix[12] -= 1
         self.assertFalse(probe(prefix, 11358))
         with self.assertRaises(ValueError):

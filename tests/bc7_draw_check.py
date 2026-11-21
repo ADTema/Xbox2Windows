@@ -79,6 +79,18 @@ def main():
         wrong = subprocess.run(mip_draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError("Moving BC7 blocks must change the readback")
+        tail = []
+        for level, blocks in enumerate((16, 8, 4, 2, 1), start=3):
+            mip = work / f"resident{level}.case"
+            mip.write_bytes(b"".join(fixture(blocks, blocks)))
+            tail.append(mip)
+        chain = [renderer, backend, "--check-bc7-tail", shader, "3", *tail]
+        subprocess.run(chain, check=True)
+        header, rows, expected = fixture(4, 4)
+        tail[2].write_bytes(header + rows[16:] + rows[:16] + expected)
+        wrong = subprocess.run(chain, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError("An incorrect middle mip must fail verification")
     return 0
 
 

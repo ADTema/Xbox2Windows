@@ -9,9 +9,11 @@ SCALE = 1 << 16
 EXCEPTIONS = {0xdc: 4, 0xdd: 8, 0xde: 32}
 
 
-def probe(prefix, blocks):
+def probe(prefix, blocks, *, prefetch_mask=0, prefetch=b""):
     if len(prefix) != 48 or not 1 <= blocks <= 1 << 20:
         raise ValueError("Expected a 48-byte prefix and a positive bounded block count")
+    if not 0 <= prefetch_mask <= 255 or len(prefetch) != prefetch_mask.bit_count():
+        raise ValueError("Expected one first-round byte per participating lane")
     matches = []
     for lane in range(8):
         mode, budget, *state_bytes = prefix[lane::8]
@@ -20,8 +22,11 @@ def probe(prefix, blocks):
         freq = SCALE - EXCEPTIONS[mode]
         state = LOWER
         refills = 0
+        first_refill = None
         for _ in range(blocks):
             if state >= (LOWER // SCALE) * 256 * freq:
+                # Encoding runs backwards. The last emitted byte is consumed first.
+                first_refill = state & 255
                 state >>= 8
                 refills += 1
             quotient, remainder = divmod(state, freq)
@@ -40,7 +45,12 @@ def probe(prefix, blocks):
             if state != LOWER:
                 raise ValueError("Incorrect rANS terminal state")
             status = "verified_constant_lane"
-        matches.append({"lane": lane, "mode": mode, "refill_bytes": refills, "status": status})
+        match = {"lane": lane, "mode": mode, "refill_bytes": refills, "status": status}
+        if refills and prefetch_mask & (1 << lane):
+            index = (prefetch_mask & ((1 << lane) - 1)).bit_count()
+            match["first_refill_offset"] = 48 + index
+            match["first_refill_matches"] = prefetch[index] == first_refill
+        matches.append(match)
     return matches
 
 
@@ -48,6 +58,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("packet", type=Path)
     parser.add_argument("--blocks", required=True, type=int)
+    parser.add_argument("--prefetch-mask", type=lambda s: int(s, 0), default=0, choices=range(256),
+                        metavar="MASK", help="Bit i means lane i reads a byte in the first round after the header")
     args = parser.parse_args()
     with args.packet.open("rb") as stream:
-        print(json.dumps(probe(stream.read(48), args.blocks), indent=2))
+        prefix = stream.read(48)
+        prefetch = stream.read(args.prefetch_mask.bit_count())
+        print(json.dumps(probe(prefix, args.blocks, prefetch_mask=args.prefetch_mask, prefetch=prefetch), indent=2))
