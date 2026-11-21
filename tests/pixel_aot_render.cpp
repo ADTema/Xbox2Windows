@@ -35,8 +35,18 @@ float expected_channel(UINT byte)
 }
 }
 
-void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB)
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference)
 {
+    std::vector<Word> constants(64);
+    std::array<std::array<float, 4>, 64> referenceColors{};
+    if (reference) {
+        std::ifstream input(reference, std::ios::binary);
+        input.read(reinterpret_cast<char*>(constants.data()), constants.size() * sizeof(Word));
+        input.read(reinterpret_cast<char*>(referenceColors.data()), sizeof(referenceColors));
+        if (!input || input.peek() != std::char_traits<char>::eof())
+            throw std::runtime_error("Expected a 256-byte constant buffer and 64 float4 reference colors");
+    }
+    auto cb = upload(device, constants);
     std::ifstream file(path, std::ios::binary);
     std::vector<char> ps{std::istreambuf_iterator<char>(file), {}};
     if (ps.empty() || file.bad()) throw std::runtime_error("Cannot read compiled pixel shader");
@@ -104,6 +114,7 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB)
     list->SetDescriptorHeaps(1, heaps);
     list->SetGraphicsRootSignature(root.Get());
     list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
+    list->SetGraphicsRootConstantBufferView(1, cb->GetGPUVirtualAddress());
     const D3D12_VIEWPORT viewport{0,0,64,64,0,1};
     const D3D12_RECT scissor{0,0,64,64};
     list->RSSetViewports(1, &viewport);
@@ -127,9 +138,14 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB)
             std::array<float, 4> expected{
                 expected_channel(ramp[x / 8]), expected_channel(ramp[y / 8]), expected_channel(128), 1.0f};
             if (swapRB) std::swap(expected[0], expected[2]);
+            if (reference) expected = referenceColors[(y / 8) * 8 + x / 8];
             const auto offset = y * resultLayout.Footprint.RowPitch / 4 + x * 4;
             if (std::memcmp(words.data() + offset, expected.data(), sizeof(expected)) != 0) {
                 std::fprintf(stderr, "pixel_mismatch x=%u y=%u\n", x, y);
+                std::array<float, 4> actual;
+                std::memcpy(actual.data(), words.data() + offset, sizeof(actual));
+                for (size_t c = 0; c < actual.size(); ++c)
+                    std::fprintf(stderr, "channel=%zu expected=%g actual=%g\n", c, expected[c], actual[c]);
                 throw std::runtime_error("AOT color export differs from CPU reference");
             }
         }

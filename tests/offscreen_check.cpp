@@ -335,6 +335,8 @@ int main(int argc, char** argv)
         const std::string_view operation = argv[2];
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
+        } else if (argc == 5 && operation == "--check-pixel-case") {
+            check_translated_pixel(device.Get(), argv[3], false, argv[4]);
         } else if (operation == "--check-pixel") {
             if (argc != 5 || (std::string_view(argv[4]) != "rgba" && std::string_view(argv[4]) != "bgra"))
                 throw std::runtime_error("Expected --check-pixel <pixel.cso> rgba|bgra");

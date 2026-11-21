@@ -116,7 +116,38 @@ def registers(first, last, count):
     return range(first, last+1)
 
 
-def lower(instructions, texture_sgpr, interp_sgpr, sampler):
+ALU = {
+    "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
+    "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
+    "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
+    "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
+}
+
+
+def fp_operand(token, scalar, vector, pending, sample_pending):
+    if re.fullmatch(r"-\d+", token):
+        return f"asfloat({int(token) & 0xffffffff}u)"
+    if token.startswith("-"):
+        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_pending) + ")"
+    if re.fullmatch(r"[vs]\d+", token):
+        if token in pending:
+            raise ValueError("Constant read before load completion")
+        value = (vector if token.startswith("v") else scalar)[token]
+        if isinstance(value, int):
+            return f"asfloat({value}u)"
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+            raise ValueError("Expected a numeric register")
+        if sample_pending and value.startswith("sample"):
+            raise ValueError("Sample used before vmcnt wait")
+        return value
+    if re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", token):
+        return f"asfloat({int(token, 0)}u)"
+    if re.fullmatch(r"\d+\.\d+", token):
+        return token + "f"
+    raise ValueError(f"Unsupported arithmetic operand {token}")
+
+
+def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None):
     """Track descriptor provenance, interpolation and packed exports through register writes."""
     if (texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105
             or len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
@@ -124,9 +155,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler):
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
     vector = {"v0": "bary_i", "v1": "bary_j"}
     lines = [PREAMBLE]
+    if constant_descriptor is not None:
+        if constant_descriptor < 0 or constant_descriptor % 4:
+            raise ValueError("Invalid constant descriptor offset")
+        lines.insert(0, "cbuffer Constants : register(b0) { float4 params[16]; };")
+    pending = set()
     mask = "entry"
     samples = 0
-    texture_pending = False
     sample_pending = False
     exported = False
     ended = False
@@ -141,12 +176,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler):
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
             continue
         if line == "s_waitcnt lgkmcnt(0)":
-            texture_pending = False
+            pending.clear()
         elif line == "s_waitcnt vmcnt(0)":
             sample_pending = False
         elif m := match(r"s_mov_b64 s\[(\d+):(\d+)\], exec"):
             regs = registers(*m.groups(), 2)
             for n in regs:
+                if f"s{n}" in pending:
+                    raise ValueError("Write overlaps an outstanding scalar load")
                 scalar[f"s{n}"] = (mask, n-regs.start)
         elif line == "s_wqm_b64 exec, exec" and mask == "entry":
             mask = "quad"
@@ -157,9 +194,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler):
             mask = "entry"
         elif m := match(r"(s_mov_b32|s_movk_i32) (s\d+|m0), (s\d+|0x[0-9a-f]+|\d+)"):
             op, dst, src = m.groups()
+            if src in pending or dst in pending:
+                raise ValueError("Unresolved scalar memory dependency")
             val = scalar[src] if src.startswith("s") else int(src, 0)
-            if texture_pending and isinstance(val, tuple) and val[0] == "texture":
-                raise ValueError("Texture descriptor read before load completion")
             if op == "s_movk_i32":
                 if not isinstance(val, int) or not 0 <= val <= 0xffff:
                     raise ValueError("Invalid movk immediate")
@@ -168,11 +205,29 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler):
         elif m := match(r"s_load_dwordx8 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], null"):
             dst = registers(*m.groups()[:2], 8)
             addr = registers(*m.groups()[2:], 2)
-            if [scalar.get(f"s{n}") for n in addr] != ["texture_ptr", 0]:
+            if any(f"s{n}" in pending for n in (*addr, *dst)) or [scalar.get(f"s{n}") for n in addr] != ["texture_ptr", 0]:
                 raise ValueError("Texture address differs from binding contract")
             for j, n in enumerate(dst):
                 scalar[f"s{n}"] = ("texture", j)
-            texture_pending = True
+                pending.add(f"s{n}")
+        elif m := match(r"(s_load_dwordx4|s_buffer_load_dwordx4) s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (0x[0-9a-f]+|null)"):
+            op, first, last, low, high, imm = m.groups()
+            offset = 0 if imm == "null" else int(imm, 16)
+            descriptor = op == "s_load_dwordx4"
+            base = [f"s{n}" for n in registers(low, high, 2 if descriptor else 4)]
+            expected = ["texture_ptr", 0] if descriptor else [("cbv", n) for n in range(4)]
+            if constant_descriptor is None or pending.intersection(base) or [scalar.get(r) for r in base] != expected:
+                raise ValueError("Unresolved constant buffer binding")
+            if descriptor and offset != constant_descriptor:
+                raise ValueError("Constant descriptor differs from binding contract")
+            if not descriptor and (offset % 4 or offset + 16 > 256):
+                raise ValueError("Constant read exceeds binding or is unaligned")
+            for j, n in enumerate(registers(first, last, 4)):
+                if f"s{n}" in pending:
+                    raise ValueError("Write overlaps an outstanding scalar load")
+                word = offset // 4 + j
+                scalar[f"s{n}"] = ("cbv", j) if descriptor else f"params[{word // 4}].{'xyzw'[word % 4]}"
+                pending.add(f"s{n}")
         elif m := match(r"v_interp_p([12])_f32_e32 (v\d+), (v\d+), attr0\.([xy])"):
             phase, dst, src, component = m.groups()
             if mask != "quad" or scalar.get("m0") != "interp_base":
@@ -187,7 +242,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler):
             operands = m.groups()
             dest, coords, image, state = [registers(*operands[k:k+2], width)
                                           for k, width in zip((0,2,4,6), (4,2,8,4))]
-            if (mask != "entry" or texture_pending or [scalar.get(f"s{n}") for n in image] != [("texture",j) for j in range(8)]
+            if (mask != "entry" or any(f"s{n}" in pending for n in (*image, *state))
+                    or [scalar.get(f"s{n}") for n in image] != [("texture",j) for j in range(8)]
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
             uv = [vector[f"v{n}"] for n in coords]
@@ -198,16 +254,30 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler):
             sample_pending = True
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
+        elif m := match(r"v_(log|exp|rcp|max|min|sub|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+            op, dst, operands, clamp = m.groups()
+            tokens = operands.split(", ")
+            if op == "fmac":
+                tokens.append(dst)
+            arity, template = ALU[op]
+            if mask != "entry" or len(tokens) != arity:
+                raise ValueError("Invalid arithmetic operation")
+            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            expression = template.format(*values)
+            if clamp:
+                expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             pair = (vector[lo], vector[hi])
-            if mask != "entry" or sample_pending or not all(isinstance(v, str) and v.startswith("sample") for v in pair):
+            if mask != "entry" or sample_pending or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
         elif m := match(r"exp mrt0 (v\d+), \1, (v\d+), \2 done compr vm"):
             pairs = [vector[v] for v in m.groups()]
             if mask != "entry" or exported or not all(isinstance(p, tuple) and len(p)==2 and
-                    all(v.startswith("sample") for v in p) for p in pairs):
+                    all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
                 raise ValueError("Unsupported export")
             args = [f"export16({v})" for pair in pairs for v in pair]
             lines.append(f"    return float4({', '.join(args)});")
@@ -231,6 +301,8 @@ def main():
     parser.add_argument("--sampler-words", nargs=4, type=lambda s: int(s, 0), required=True,
                         help="Four descriptor words to bind to the supplied desktop sampler at s0")
     parser.add_argument("--output", type=Path, required=True, help="Destination .hlsl in a local output directory")
+    parser.add_argument("--constant-descriptor", type=lambda s: int(s, 0),
+                        help="Byte offset of a descriptor mapped to the 256-byte desktop buffer b0")
     args = parser.parse_args()
     dest = args.output.resolve()
     if dest.suffix.lower() != ".hlsl" or dest == args.archive.resolve():
@@ -238,7 +310,7 @@ def main():
     try:
         blob, code = native_program(args.archive, args.record)
         instructions = disassemble(code, args.llvm)
-        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words)
+        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")
     dest.parent.mkdir(parents=True, exist_ok=True)
