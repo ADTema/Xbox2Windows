@@ -20,7 +20,17 @@ UNARY_EXPORTS = ("blsi32", "blsi64", "blsmsk32", "blsmsk64", "blsr32", "blsr64",
 
 
 def emit(image, output):
-    parts = [INTEGER_HEADER]
+    parts = [
+        "#include <intrin.h>\n",
+        INTEGER_HEADER,
+        'extern "C" __declspec(dllexport) int host_has_bmi1() {\n'
+        "    int regs[4]{};\n"
+        "    __cpuid(regs, 0);\n"
+        "    if (regs[0] < 7) return 0;\n"
+        "    __cpuidex(regs, 7, 0);\n"
+        "    return (regs[1] & (1 << 3)) != 0;\n"
+        "}\n",
+    ]
     with pefile.PE(str(image), fast_load=True) as pe:
         for name in BINARY_EXPORTS:
             (bounds,) = function_ranges(pe, export_rva(pe, name))
@@ -96,7 +106,12 @@ def ref_tzcnt(a, bits):
 
 
 def check(native_path, lifted_path):
-    native, lifted = load_lib(native_path), load_lib(lifted_path)
+    lifted = load_lib(lifted_path)
+    lifted.host_has_bmi1.argtypes, lifted.host_has_bmi1.restype = [], ctypes.c_int
+    if not lifted.host_has_bmi1():
+        print("Host CPU lacks BMI1 (CPUID leaf 7 EBX bit 3); skipping native differential check.")
+        sys.exit(77)
+    native = load_lib(native_path)
     flag_slot = U64(0)
     values = (
         0, 1, 2, 3, 0x80, 0x100, 0x55aa55aa, 0x7fffffff, 0x80000000, 0xffffffff,
