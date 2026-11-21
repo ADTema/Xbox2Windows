@@ -242,6 +242,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
     add_library(cpu_destroy_provider SHARED tests/cpu/destroy_provider.cpp)
+    cpu_asm_fixture(cpu_create create_context)
+    set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
+    add_custom_command(OUTPUT "${create_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/create_fixture.py"
+            "$<TARGET_FILE:cpu_create>" "${create_fixture}"
+        DEPENDS cpu_create tests/cpu/create_fixture.py tools/ffx_create_context.py
+            tools/ffx_version_query.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_create_lifted SHARED "${create_fixture}")
+    add_test(NAME cpu_aot_context_lifecycle COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/context_lifecycle.py" "$<TARGET_FILE:cpu_create>"
+        "$<TARGET_FILE:cpu_create_lifted>" "$<TARGET_FILE:cpu_destroy_lifted>")
     add_test(NAME cpu_aot_destroy_contract COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/destroy_check.py" "$<TARGET_FILE:cpu_destroy>"
         "$<TARGET_FILE:cpu_destroy_lifted>" "$<TARGET_FILE:cpu_destroy_provider>")

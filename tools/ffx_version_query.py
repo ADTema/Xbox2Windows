@@ -12,10 +12,10 @@ from cpu_ranges import function_ranges, image_bytes
 
 LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
 UPSCALER = "faff02f294a7e9149ce079dffe3dedbcabe99b1f180ab14222aa8689e00a75fa"
-REGS = {getattr(R, n.upper()): n for n in "rax rbx rcx rdx rsi rdi rbp rsp r8 r12 r13 r14 r15".split()}
+REGS = {getattr(R, n.upper()): n for n in "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r12 r13 r14 r15".split()}
 UINT = {1: "uint8_t", 4: "uint32_t", 8: "uint64_t"}
 
-HEADER = """#include <cstdint>
+INTEGER_HEADER = """#include <cstdint>
 #include <cstring>
 using namespace std;
 using word = uint64_t;
@@ -26,8 +26,8 @@ template<class T> T load(word address) {
 template<class T> void store(word address, T v) {
     memcpy(reinterpret_cast<void*>(address), &v, sizeof v);
 }
-struct Query { word type, next, effect, device, count, ids, names; };
 """
+HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
 
 
 def reg(number):
@@ -134,10 +134,10 @@ def checked_image(path, digest):
     return pefile.PE(data=data, fast_load=True)
 
 
-def query_body(pe, slices):
-    owned = function_ranges(pe, export_rva(pe, "ffxQuery"))
+def export_body(pe, name, slices):
+    owned = function_ranges(pe, export_rva(pe, name))
     if not all(any(lo <= a < b <= hi for lo, hi in owned) for a, b in slices):
-        raise ValueError("query slice outside exported function")
+        raise ValueError(f"slice outside exported function {name}")
     return [ins for a, b in slices for ins in region(pe, a, b)]
 
 
@@ -167,14 +167,14 @@ def generate(loader, upscaler):
         calls = {site: f"rax = {fn}(rcx, rdx);" for site, fn in [
             (0x1595, "supports_effect"), (0x15a5, "supports_device"),
             (0x161a, "supports_effect"), (0x162a, "supports_device")]}
-        provider = lower(query_body(pe, [(0x152b, 0x164a)]),
+        provider = lower(export_body(pe, "ffxQuery", [(0x152b, 0x164a)]),
                          ["r15 = reinterpret_cast<word>(query); rdi = 0;"], globals_, calls,
                          {0x1999: "return static_cast<uint32_t>(rax);", 0x164a: "return 6;"})
     with checked_image(loader, LOADER) as pe:
         # The desktop binding supplies the translated upscaler; frame generation is absent.
         slots = {0x4088: "reinterpret_cast<word>(&present)", 0x40c0: "reinterpret_cast<word>(&absent)",
                  0x40a8: "reinterpret_cast<word>(&present)", 0x40e0: "reinterpret_cast<word>(&absent)"}
-        caller = lower(query_body(pe, [(0x144b, 0x14b2), (0x14c2, 0x14d5)]),
+        caller = lower(export_body(pe, "ffxQuery", [(0x144b, 0x14b2), (0x14c2, 0x14d5)]),
                        ["rbx = reinterpret_cast<word>(query); rdi = reinterpret_cast<word>(&query->effect);"],
                        slots, {0x1456: "/* selected modules are bound offline */",
                                0x14ac: "rax = provider_versions(reinterpret_cast<Query*>(rdx));"},
