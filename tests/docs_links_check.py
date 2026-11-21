@@ -85,9 +85,22 @@ def heading_slugs(lines):
     return used
 
 
+SKIP = 77
+
+
+def git_checkout(root):
+    """True if root has Git metadata. A source archive has none; anything else wrong with Git
+    then fails loudly in git ls-files instead of turning into a skip."""
+    return (root / ".git").exists()
+
+
 def tracked_files(root):
     """Paths Git tracks, so links are checked with exact case and untracked local files never count."""
-    result = subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True)
+    # An inherited GIT_DIR or GIT_WORK_TREE, as in a Git hook, would point at another repository.
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in ("GIT_DIR", "GIT_WORK_TREE")}
+    result = subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True,
+                            env=environment)
     return {Path(path) for path in result.stdout.decode("utf-8").split("\0") if path}
 
 
@@ -195,6 +208,8 @@ def self_test():
             4, ["links.md:1: docs/guide.md (file is not tracked (check the case of the path))",
                 "links.md:4: docs/#guide (fragment on a directory)"],
         )
+        # A directory without Git metadata, like an extracted source archive, is not a checkout.
+        assert not git_checkout(root)
     print("Self-test passed.")
 
 
@@ -207,6 +222,11 @@ def main():
     if args.self_test:
         return 0
     root = Path(__file__).resolve().parents[1]
+    # The tracked-path and case checks need Git metadata. A source archive has none, so the
+    # check reports a capability skip there instead of failing; CI always runs in a checkout.
+    if not git_checkout(root):
+        print(f"Skipped: {root} has no Git metadata, so tracked paths are unknown.")
+        return SKIP
     tracked = tracked_files(root)
     files = tracked_markdown(tracked)
     count, broken = check_links(root, files, tracked)
