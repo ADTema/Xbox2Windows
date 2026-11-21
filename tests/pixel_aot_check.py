@@ -10,7 +10,7 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import pixel_aot
-from pixel_aot import disassemble, native_program
+from pixel_aot import ALU, disassemble, native_program
 
 # First word of each line of every program lower() accepted in this run. tools/form_coverage.py counts
 # these when this test passes; a program a check expects to be rejected raises before it is recorded.
@@ -202,6 +202,16 @@ def select(wave64=False):
         f"v_cmp_ge_f32_e64 {first}, v13, s45",
         f"v_cndmask_b32_e64 v13, v13, s46, {first}",
         f"v_cndmask_b32_e32 v12, v12, v18, {vcc}",
+    ])
+
+
+def three_way():
+    """Median, minimum and maximum of three operands, each result one of its inputs."""
+    return with_constants([
+        "v_med3_f32 v15, s47, v13, v12",
+        "v_max3_f32 v14, v12, v14, v13",
+        "v_med3_f32 v12, v12, s44, s45",
+        "v_min3_f32 v13, |s46|, v13, v12",
     ])
 
 
@@ -480,6 +490,33 @@ def check_scalar_constant_reads() -> None:
     must_reject(translate, alias[:wait + 1] + [load] + alias[wait + 1:])
 
 
+def three_way_case(directory, low, high, cap, middle):
+    """Expected colors for three_way(); no rounding occurs before the half export."""
+    case = bytearray(256)
+    struct.pack_into("<4f", case, 12, low, high, cap, middle)
+    for y in RAMP:
+        for x in RAMP:
+            r, g, b = single(x / 255), single(y / 255), single(128 / 255)
+            clamped = sorted((r, low, high))[1]
+            color = (clamped, min(abs(cap), g, clamped), max(r, b, g), sorted((middle, g, r))[1])
+            case.extend(struct.pack("<4f", *map(half_rtz, color)))
+    path = directory / "three_way.case"
+    path.write_bytes(case)
+    return path
+
+
+def check_three_way_templates():
+    """The HLSL forms must pick the expected operand for every operand order."""
+    values = (-1.5, 0.0, 0.25, 0.25, 3.0)
+    for a in values:
+        for b in values:
+            for c in values:
+                pick = {name: eval(ALU[name][1].format("a", "b", "c"), {"min": min, "max": max},
+                                   {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
+                assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
+                                "med3": sorted((a, b, c))[1]}, (a, b, c)
+
+
 def check_controls(directory):
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
@@ -496,7 +533,7 @@ def check_controls(directory):
         must_reject(native_program, archive, "fixture")
 
     # LLVM 15 prints "exp mrt0 v16, ..."; newer LLVM prints "exp mrt0, v16, ...".
-    for program in (assembly(False), assembly(True), curve(), shaping(), arithmetic()):
+    for program in (assembly(False), assembly(True), curve(), shaping(), arithmetic(), three_way()):
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
         assert modern != program
         assert translate(modern) == translate(program)
@@ -505,6 +542,20 @@ def check_controls(directory):
     for old, new in (("v_sqrt_f32_e32 v18, v18", "v_sqrt_f32_e32 v18, v18, v18"),
                      ("v_add_f32_e32 v19, s44, v13", "v_add_f32_e32 v19, v13")):
         must_reject(translate, [line.replace(old, new) for line in shaping()])
+    check_three_way_templates()
+    source = translate(three_way())
+    for expected in ("max(min(params[1].z, sample16.y), min(max(params[1].z, sample16.y), sample16.x))",
+                     "max(max(sample16.x, sample16.z), sample16.y)",
+                     "max(min(sample16.x, params[0].w), min(max(sample16.x, params[0].w), params[1].x))",
+                     "min(min(abs(params[1].y), sample16.y), alu"):
+        assert expected in source, expected
+    for old, new in (("v_med3_f32 v12, v12, s44, s45", "v_med3_f32 v12, v12, s44"),
+                     ("v_med3_f32 v15", "v_med3_i32 v15"),
+                     ("v_max3_f32", "v_max3_u32"),
+                     ("v_min3_f32 v13, |s46|", "v_min3_f16 v13, |s46|")):
+        changed = [line.replace(old, new) for line in three_way()]
+        assert changed != three_way()
+        must_reject(translate, changed)
 
     program = truncate_values()
     source = translate(program)
@@ -614,7 +665,7 @@ def check_controls(directory):
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
-                (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate)]
+                (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate), (three_way(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
@@ -741,6 +792,24 @@ def check_render(directory, compiler, renderer, backend):
     case = directory / "signed-export.case"
     case.write_bytes(constants + struct.pack("<4f", *map(half_rtz, values)) * 64)
     subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
+    source.write_text(translate(three_way()), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    for constants in ((.25, .75, .375, .5), (.625, .125, -.3125, .5)):
+        case = three_way_case(directory, *constants)
+        draw = [renderer, backend, "--check-pixel-case", shader, case]
+        subprocess.run(draw, check=True)
+    without_abs = [line.replace("|s46|", "s46") for line in three_way()]
+    source.write_text(translate(without_abs), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("The renderer failed to detect the missing min3 absolute value")
+    source.write_text(translate([line.replace("v_med3_f32 v12", "v_min3_f32 v12") for line in three_way()]),
+                      encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A minimum replaced the median without a mismatch")
     check_predicate_draws(directory, compiler, renderer, backend)
     capture = directory / "blend.rgba"
     draw = [renderer, backend, "--dual-pixel", shader, capture]
