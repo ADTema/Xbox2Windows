@@ -9,6 +9,7 @@
 #include "era_heap.h"
 #include "era_title_va.h"
 #include "LookupTitleAddresses.h"
+#include "ProbeArrayAtomics.h"
 #include "WriteTitleAddresses.h"
 
 #include <algorithm>
@@ -187,6 +188,63 @@ Word float_bits(float value)
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
 }
+
+// Whether InterlockedAdd through a per-thread index into a UAV array updates each word exactly
+// once per thread, measured on plain committed buffers so the answer does not depend on the
+// aliases under test. 256 threads each add 1 to word 0 of one of four zeroed buffers, 64 threads
+// per buffer. The in-box WARP of Windows 10 (10.0.19041) applies each such add four times.
+bool array_atomics_exact(ID3D12Device* device)
+{
+    constexpr UINT targets = 4, threads = 256;
+    Kernel kernel(device, {ProbeArrayAtomics, sizeof(ProbeArrayAtomics)});
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptor_count,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "Create atomics probe descriptor heap");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    std::array<ComPtr<ID3D12Resource>, targets> buffers;
+    for (UINT slot = 0; slot < descriptor_count; ++slot) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        view.Buffer.NumElements = 1;
+        ID3D12Resource* resource = nullptr;
+        if (slot < targets) {
+            buffers[slot] = make_buffer(device, sizeof(Word), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            resource = buffers[slot].Get();
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += static_cast<SIZE_T>(slot) * stride;
+        device->CreateUnorderedAccessView(resource, nullptr, &view, cpu);
+    }
+    auto zero = upload(device, std::vector<Word>(1, 0));
+    auto back = make_buffer(device, targets * sizeof(Word), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    ComputeCommands cmd(device, kernel.pipeline.Get());
+    auto* list = cmd.list.Get();
+    for (auto& buffer : buffers) {
+        list->CopyBufferRegion(buffer.Get(), 0, zero.Get(), 0, sizeof(Word));
+        transition(list, buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    ID3D12DescriptorHeap* heaps[] = {heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(kernel.root.Get());
+    list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRoot32BitConstant(1, targets, 0);
+    list->SetComputeRoot32BitConstant(1, threads, 1);
+    list->Dispatch(threads / 64, 1, 1);
+    for (UINT i = 0; i < targets; ++i) {
+        transition(list, buffers[i].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(back.Get(), i * sizeof(Word), buffers[i].Get(), 0, sizeof(Word));
+    }
+    cmd.submit_and_wait(device);
+    const auto counts = read(back.Get(), targets);
+    const Word expected = threads / targets;
+    std::printf("array_atomics threads=%u buffers=%u expected=%u actual=%u,%u,%u,%u\n", threads, targets, expected,
+                counts[0], counts[1], counts[2], counts[3]);
+    return std::all_of(counts.begin(), counts.end(), [=](Word count) { return count == expected; });
+}
 }
 
 bool check_gpu_alias_lookup(ID3D12Device* device)
@@ -249,6 +307,12 @@ bool check_gpu_alias_lookup(ID3D12Device* device)
 
 bool check_gpu_alias_lookup_writes(ID3D12Device* device)
 {
+    // The add and sub records need exact atomics through the UAV array. An adapter that miscounts
+    // them on plain buffers cannot run this fixture, whatever the lookup does.
+    if (!array_atomics_exact(device)) {
+        std::puts("InterlockedAdd through a per-thread index into a UAV array is not exact on this adapter");
+        return false;
+    }
     AliasFixture fixture;
     if (!fixture.open(device)) return false;
     enum : Word { Store = 0, Add = 1, Sub = 2, MinFloat = 3, MaxFloat = 4 };
