@@ -1,5 +1,7 @@
 """Exercise offline pixel translation with independently assembled test programs."""
 from pathlib import Path
+import hashlib
+import json
 import math
 import os
 import struct
@@ -93,7 +95,14 @@ def translate_dual(instructions):
     return lower(instructions, 20, 24, [1, 2, 3, 4], second_texture_offset=32)
 
 
-def envelope(code, name=b"fixture"):
+def shader_record(blob: bytes, name: bytes) -> bytes:
+    encoder = zlib.compressobj(wbits=-15)
+    payload = encoder.compress(blob) + encoder.flush()
+    return (bytes([len(name) + 1]) + name + b"\0\0"
+            + struct.pack("<4I", len(payload), 0, len(payload), len(blob)) + payload)
+
+
+def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | None = None) -> bytes:
     program_start = 256
     image = bytearray(program_start) + code
     image[:4] = b"FSSM"
@@ -101,12 +110,16 @@ def envelope(code, name=b"fixture"):
     native = b"XBCH" + bytes(12) + struct.pack("<II", len(image), 0) + zlib.compress(image)
     program = (bytes(24) + b"XDAT" + struct.pack("<II", 1, 0)
                + struct.pack("<III", 13, 48, len(native)) + native)
-    blob = (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 44 + len(program), 1, 36)
-            + b"DXIL" + struct.pack("<I", len(program)) + program)
-    encoder = zlib.compressobj(wbits=-15)
-    payload = encoder.compress(blob) + encoder.flush()
-    return (bytes([len(name) + 1]) + name + b"\0\0"
-            + struct.pack("<4I", len(payload), 0, len(payload), len(blob)) + payload)
+    sections = [b"DXIL" + struct.pack("<I", len(program)) + program]
+    if private_data is not None:
+        sections.append(b"PRIV" + struct.pack("<I", len(private_data)) + private_data)
+    offset = 32 + 4 * len(sections)
+    offsets = bytearray()
+    for section in sections:
+        offsets.extend(struct.pack("<I", offset))
+        offset += len(section)
+    blob = b"DXBC" + bytes(16) + struct.pack("<3I", 1, offset, len(sections)) + offsets + b"".join(sections)
+    return shader_record(blob, name)
 
 
 def must_reject(function, *args):
@@ -115,6 +128,76 @@ def must_reject(function, *args):
     except (ValueError, KeyError):
         return
     raise AssertionError(f"{function.__name__} accepted invalid input")
+
+
+def check_container_selector(directory: Path, code: bytes, library: str | None = None) -> None:
+    archive = directory / "same-name.rpf"
+    records = [envelope(code, private_data=metadata) for metadata in (b"first", b"second")]
+    containers = []
+    for record in records:
+        archive.write_bytes(record)
+        container, native = native_program(archive, "fixture")
+        assert native == code
+        containers.append(container)
+    digests = [hashlib.sha256(blob).hexdigest() for blob in containers]
+    first, second = records
+    broken = b"\x08fixture\0\0" + struct.pack("<4I", 2, 0, 2, 8) + b"\x07\xff"
+    archive.write_bytes(first + second)
+    must_reject(native_program, archive, "fixture")
+    for digest, blob in zip(digests, containers, strict=True):
+        assert native_program(archive, "fixture", container_sha256=digest.upper()) == (blob, code)
+
+    for order in (broken + first, first + broken):
+        archive.write_bytes(order)
+        assert native_program(archive, "fixture", container_sha256=digests[0]) == (containers[0], code)
+    # A bad frame can claim bytes covering a subsequent record of the same name.
+    archive.write_bytes(b"\x08fixture\0\0" + struct.pack("<4I", len(first) + 2, 0, len(first) + 2, 8)
+                        + b"\x07\xff" + first)
+    assert native_program(archive, "fixture", container_sha256=digests[0]) == (containers[0], code)
+    archive.write_bytes(first * 257 + second)
+    assert native_program(archive, "fixture", container_sha256=digests[1]) == (containers[1], code)
+
+    archive.write_bytes(envelope(code))
+    intact, _ = native_program(archive, "fixture")
+    corrupt = intact[:-1] + bytes([intact[-1] ^ 1])
+    archive.write_bytes(first + shader_record(corrupt, b"fixture"))
+    try:
+        native_program(archive, "fixture", container_sha256=hashlib.sha256(corrupt).hexdigest())
+    except zlib.error as error:
+        assert "incorrect data check" in str(error), error
+    else:
+        raise AssertionError("Container selection hid a corrupt native stream")
+
+    for contents, digest, reason in (
+        (first + second, hashlib.sha256(code).hexdigest(), "No record matches the name and container SHA-256"),
+        (first + second, "bad", "Invalid decoded container SHA-256"),
+        (first + broken + first + second, digests[0], "Multiple records match the name and container SHA-256"),
+    ):
+        archive.write_bytes(contents)
+        try:
+            native_program(archive, "fixture", container_sha256=digest)
+        except ValueError as error:
+            assert str(error) == reason, error
+        else:
+            raise AssertionError("Container selection accepted an invalid digest or ambiguous record")
+
+    if library is None:
+        return
+    archive.write_bytes(first + second)
+    output = directory / "selected.hlsl"
+    command = [sys.executable, "-B", Path(pixel_aot.__file__), archive, "fixture", "--llvm", library,
+               "--texture-sgpr", "20", "--interp-sgpr", "24", "--sampler-words", "1", "2", "3", "4",
+               "--output", output]
+    ambiguous = subprocess.run(command, capture_output=True, text=True)
+    assert ambiguous.returncode == 1 and "Multiple records match the name" in ambiguous.stderr
+    for digest in digests:
+        result = subprocess.run([*command, "--container-sha256", digest], capture_output=True, text=True, check=True)
+        summary = json.loads(result.stdout)
+        assert summary["container_sha256"] == digest
+        assert summary["native_sha256"] == hashlib.sha256(code).hexdigest()
+        assert output.read_text(encoding="utf-8") == lower(assembly(False), 20, 24, [1, 2, 3, 4])
+    wrong = subprocess.run([*command, "--container-sha256", "0" * 64], capture_output=True, text=True)
+    assert wrong.returncode == 1 and "No record matches the name and container SHA-256" in wrong.stderr
 
 
 def translate(instructions):
@@ -231,6 +314,15 @@ def absolute_value():
         "v_sub_f32_e64 v12, |v12|, 0",
     ]
     return program
+
+
+def ceiling():
+    return with_constants([
+        "v_ceil_f32_e32 v12, s44",
+        "v_ceil_f32_e64 v13, -|s45|",
+        "v_ceil_f32_e64 v14, |s46|",
+        "v_ceil_f32_e64 v15, |s47| clamp",
+    ])
 
 
 # The gfx10 predicate number is a four-bit truth table. Bits 0..3 select
@@ -458,6 +550,63 @@ def select_case(directory, fold, limit, capped, unequal):
     return path
 
 
+# v_cube{id,sc,tc,ma}_f32 follow LLVM's ConstantFoldAMDGCNCubeIntrinsic. The direction sets cover all
+# six faces, the y/x and z/x ties (the later axis in z, y, x order wins) and -0 on the major axis,
+# which selects the positive face. Each set has one wrong reference for the property it isolates.
+CUBE_BODY = [
+    "v_mov_b32_e32 v18, s45",
+    "v_mov_b32_e32 v19, s46",
+    "v_cubeid_f32 v12, s44, v18, v19",
+    "v_cubesc_f32 v13, s44, v18, v19",
+    "v_cubetc_f32 v14, s44, v18, v19",
+    "v_cubema_f32 v15, s44, v18, v19",
+]
+CUBE_SETS = (
+    ((2.0, -2.0, 1.0), (0, 1.0)),
+    ((-1.5, 0.25, -1.5), (0, 1.0)),
+    ((-3.0, 1.0, 2.0), (3, 6.0)),
+    ((0.0, 0.0, -0.0), (0, 5.0)),
+    ((1.0, 0.5, -0.25), (1, -0.25)),
+    ((0.25, 1.0, 0.5), (2, -0.5)),
+)
+
+
+def cube_reference(x, y, z):
+    if abs(z) >= abs(x) and abs(z) >= abs(y):
+        face, sc, tc, ma = (5.0, -x, -y, z) if z < 0 else (4.0, x, -y, z)
+    elif abs(y) >= abs(x):
+        face, sc, tc, ma = (3.0, x, -z, y) if y < 0 else (2.0, x, z, y)
+    else:
+        face, sc, tc, ma = (1.0, z, -y, x) if x < 0 else (0.0, -z, -y, x)
+    return [face, sc, tc, ma + ma]
+
+
+def check_cube_draw(directory, compiler, renderer, backend):
+    source = directory / "cube.hlsl"
+    shader = directory / "cube.cso"
+    case = directory / "cube.case"
+    source.write_text(translate(with_constants(CUBE_BODY)), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    faces = set()
+    for direction, (channel, wrong_value) in CUBE_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<3f", constants, 12, *direction)
+        expected = cube_reference(*direction)
+        faces.add(expected[0])
+        assert all(half_rtz(x) == x for x in (*expected, wrong_value)) and wrong_value != expected[channel]
+        draw = [renderer, backend, "--check-pixel-case", shader, case]
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+        wrong_values = list(expected)
+        wrong_values[channel] = wrong_value
+        case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
+        result = subprocess.run(draw, capture_output=True, text=True)
+        if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+            raise AssertionError(f"A wrong cube result escaped detection for {direction}")
+    assert faces == {0.0, 1.0, 2.0, 3.0, 4.0, 5.0}
+    assert math.copysign(1.0, cube_reference(0.0, 0.0, -0.0)[3]) < 0
+
+
 def check_constant_descriptor_bounds() -> None:
     for offset in (0, 28, 32):
         program = [line.replace("s[20:21], 0x40", f"s[20:21], {offset:#x}")
@@ -537,6 +686,7 @@ def check_controls(directory):
     check_affine_coordinates()
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
+    check_container_selector(directory, code)
     record = envelope(code)
     archive.write_bytes(b"another_fixture\0" + record)
     assert native_program(archive, "fixture")[1] == code
@@ -570,6 +720,10 @@ def check_controls(directory):
     program = absolute_value()
     alternate = [line.replace("|v12|", "abs(v12)") for line in program]
     assert translate(program) == translate(alternate)
+    # Each cube operation reads the three coordinates once and needs all three operands.
+    body = translate(with_constants(CUBE_BODY)).split("float4 main", 1)[1]
+    assert body.count("precise float3 cube") == 4 and body.count("* 2.0f)") == 1, body
+    must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", "v_cubeid_f32 v12, s44, v18"]))
 
     program = assembly(False)
     for old, new in (("s_mov_b32 s21, 0", "s_mov_b32 s21, 1"),
@@ -616,6 +770,7 @@ def check_controls(directory):
     wait = program.index("s_waitcnt vmcnt(0)")
     for register in ("v12", "v13", "v14", "v15"):
         must_reject(translate, program[:wait] + [f"v_mov_b32_e32 {register}, 1.0"] + program[wait:])
+    must_reject(translate, program[:wait] + ["v_ceil_f32_e32 v12, 1.0"] + program[wait:])
     free = translate(program[:wait] + ["v_mov_b32_e32 v21, 1.0"] + program[wait:])
     assert free.index("tex.Sample") < free.index("= 1.0f;") < free.index("= sample16.x;")
     late = translate(program[:wait+1] + ["v_mov_b32_e32 v12, 1.0"] + program[wait+1:])
@@ -667,11 +822,12 @@ def check_controls(directory):
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate),
-                (affine_coordinates(), translate)]
+                (affine_coordinates(), translate), (ceiling(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
+    fixtures.append((with_constants(CUBE_BODY), translate))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
-    for instructions, lower_fixture in fixtures:
+    for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
         binary = directory / "fixture.bin"
@@ -684,6 +840,36 @@ def check_binary(directory, assembler, objcopy, library):
         _, native = native_program(archive, "fixture")
         assert native == binary.read_bytes()
         assert lower_fixture(disassemble(native, library)) == lower_fixture(instructions)
+        if index == 0:
+            check_container_selector(directory, native, library)
+
+
+def check_ceiling_draws(directory, compiler, renderer, backend):
+    instructions = ceiling()
+    source = directory / "ceiling.hlsl"
+    shader = directory / "ceiling.cso"
+    case = directory / "ceiling.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(instructions), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for a, b, c, d in ((-1.75, 1.75, -1.75, -1.75), (-2.0, 2.0, 0.0, 0.0),
+                       (-0.75, 0.75, -0.75, -0.75), (2.25, -2.75, 2.25, 2.25)):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, a, b, c, d)
+        # Python's integer results lose the sign of zero. The readback compares float bits.
+        expected = struct.pack("<4f", math.copysign(math.ceil(a), a),
+                               math.copysign(math.ceil(-abs(b)), -1), math.ceil(abs(c)),
+                               min(math.ceil(abs(d)), 1))
+        case.write_bytes(constants + expected * 64)
+        subprocess.run(draw, check=True)
+
+    floor = [line.replace("v_ceil_f32_e32", "v_floor_f32_e32") for line in instructions]
+    source.write_text(translate(floor), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Replacing ceiling with floor escaped detection")
 
 
 def check_affine_lod_draw(directory: Path, compiler: str, renderer: str, backend: str) -> None:
@@ -797,6 +983,7 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("The renderer failed to detect the missing absolute value")
+    check_ceiling_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):
@@ -834,6 +1021,7 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapped blend weights escaped detection")
+    check_cube_draw(directory, compiler, renderer, backend)
     check_fract_draw(directory, compiler, renderer, backend)
     return 0
 

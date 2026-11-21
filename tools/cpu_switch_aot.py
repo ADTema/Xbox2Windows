@@ -16,6 +16,15 @@ a switch over the table targets.
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
 CMOVcc) in one straight-line run that no edge enters. Instructions that leave
 the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc) may sit between them.
+
+A forward pass records how many low bytes (0, 1, 2 or 8) of each register every
+path defines. A read needs as many defined bytes as it uses, and an 8- or 16-bit
+write keeps the other bytes of its register. The return width is the number of
+consecutive low RAX bytes that are definitely defined at every reachable RET or
+RET 0: 0, 1, 2 or 8, the lower bound over joins and over returns. It counts
+defined bytes and does not establish a source-language type. It is None when no
+RET is reachable, which describes the reachable control flow and makes no
+termination claim. The generated source states the width unless it is 8.
 """
 
 import argparse
@@ -148,7 +157,7 @@ class Function:
                 targets = [ins.near_branch_target, ins.next_ip]
             elif flow == FlowControl.UNCONDITIONAL_BRANCH and ins.is_jmp_short_or_near:
                 targets = [ins.near_branch_target]
-            elif flow == FlowControl.RETURN and ins.mnemonic == M.RET and ins.op_count == 0:
+            elif flow == FlowControl.RETURN and ins.mnemonic == M.RET and (ins.op_count == 0 or ins.immediate(0) == 0):
                 targets = []
             elif flow == FlowControl.INDIRECT_BRANCH and ins.op0_kind == OpKind.REGISTER:
                 targets = []
@@ -357,10 +366,17 @@ class Lifter:
         if ins.op0_kind == OpKind.MEMORY:
             return f"store<{unsigned(width)}>({self.address(ins)}, static_cast<{unsigned(width)}>({expression}));"
         register = ins.op0_register
-        if width not in (4, 8) or RegisterExt.size(register) != width:
+        if register in HIGH_BYTES:
+            raise ValueError(f"unsupported register {register}")
+        if width not in (1, 2, 4, 8) or RegisterExt.size(register) != width:
             raise ValueError(f"unsupported partial register write at RVA {ins.ip:#x}")
         self.used.add(full(register))
-        return f"{NAMES[full(register)]} = static_cast<{unsigned(width)}>({expression});"
+        name = NAMES[full(register)]
+        if width < 4:
+            # An 8- or 16-bit destination leaves the rest of the register unchanged.
+            mask = (1 << width * 8) - 1
+            return f"{name} = ({name} & ~{mask:#x}ull) | static_cast<{unsigned(width)}>({expression});"
+        return f"{name} = static_cast<{unsigned(width)}>({expression});"
 
     def width(self, ins):
         if ins.op0_kind == OpKind.REGISTER:
@@ -396,28 +412,34 @@ class Lifter:
         return table[code]
 
     def statement(self, ins, sets_flags=False, producer=None):
-        """Return C++ for one instruction and the registers it reads and writes.
+        """Return C++ for one instruction, the low bytes it reads from each full register and the
+        width it writes to each full register.
 
         sets_flags records the flag inputs for a later consumer; producer is the
         instruction whose flags a SETcc or CMOVcc reads."""
         mnemonic = ins.mnemonic
         width = self.width(ins)
-        reads, writes = set(), set()
+        reads, writes = {}, {}
+
+        def read(register):
+            reads[full(register)] = max(reads.get(full(register), 0), RegisterExt.size(register))
 
         def note(*numbers):
             for number in numbers:
                 kind = ins.op_kind(number)
                 if kind == OpKind.REGISTER:
-                    reads.add(full(ins.op_register(number)))
+                    read(ins.op_register(number))
                 elif kind == OpKind.MEMORY:
-                    reads.update(full(r) for r in (ins.memory_base, ins.memory_index) if r != R.NONE)
+                    for register in (ins.memory_base, ins.memory_index):
+                        if register != R.NONE:
+                            read(register)
 
         if ins.op_count and ins.op0_kind == OpKind.REGISTER:
-            writes.add(full(ins.op0_register))
+            writes[full(ins.op0_register)] = width
         elif ins.op_count and ins.op0_kind == OpKind.MEMORY:
             note(0)
         if mnemonic == M.NOP:
-            return "", set(), set()
+            return "", {}, {}
         if mnemonic == M.MOV:
             note(1)
             return self.write(ins, width, self.operand(ins, 1, width)), reads, writes
@@ -473,7 +495,7 @@ class Lifter:
             if ins.op1_kind == OpKind.REGISTER:
                 if ins.op1_register != R.CL:
                     raise ValueError(f"unsupported shift count at RVA {ins.ip:#x}")
-                reads.add(R.RCX)
+                read(R.CL)
                 count = f"({self.reg(R.RCX)} & {mask}u)"
             else:
                 count = f"{ins.immediate(1) & mask}u"
@@ -488,19 +510,16 @@ class Lifter:
                 a, b = self.operand(ins, 0, width), self.operand(ins, 1, width)
             else:
                 a, b = self.operand(ins, 1, width), self.operand(ins, 2, width)
+            if width == 2:
+                # Two uint16_t factors would be promoted to int, where 0xffff * 0xffff overflows.
+                a, b = f"static_cast<std::uint32_t>({a})", f"static_cast<std::uint32_t>({b})"
             return self.write(ins, width, f"{a} * {b}"), reads, writes
         if mnemonic in SETCC:
             condition = self.condition(producer, ins)
             if ins.op0_kind == OpKind.MEMORY:
                 return f"store<std::uint8_t>({self.address(ins)}, static_cast<std::uint8_t>({condition}));", reads, writes
-            register = ins.op0_register
-            if register in HIGH_BYTES or RegisterExt.size(register) != 1:
-                raise ValueError(f"unsupported register {register}")
-            # A byte write keeps bits 8..63 of the full register.
-            name = NAMES[full(register)]
-            self.used.add(full(register))
-            reads.add(full(register))
-            return f"{name} = ({name} & ~0xffull) | static_cast<word>({condition});", reads, writes
+            # A byte write: it keeps bits 8..63 of the full register and does not read them.
+            return self.write(ins, 1, condition), reads, writes
         if mnemonic in CMOVCC:
             if width not in (4, 8):
                 raise ValueError(f"unsupported partial register write at RVA {ins.ip:#x}")
@@ -517,7 +536,8 @@ class Lifter:
                 return f"{{ const {unsigned(width)} source = {source}; {line} }}", reads, writes
             return self.write(ins, width, f"({condition}) ? {source} : {destination}"), reads, writes
         if mnemonic == M.RET:
-            return "return rax;", {R.RAX}, set()
+            # Which bytes of RAX are a return value is decided by the definedness pass in lift().
+            return "return rax;", {}, {}
         raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
 
 
@@ -565,10 +585,10 @@ def lift(pe, name):
         body[ip] = ""
         if ins.flow_control == FlowControl.CONDITIONAL_BRANCH:
             body[ip] = f"if ({lifter.condition(producers[ip], ins)}) goto loc_{ins.near_branch_target:x};"
-            effects[ip] = (set(), set(), set())
+            effects[ip] = ({}, {}, set())
         elif ins.flow_control == FlowControl.UNCONDITIONAL_BRANCH:
             body[ip] = f"goto loc_{ins.near_branch_target:x};"
-            effects[ip] = (set(), set(), set())
+            effects[ip] = ({}, {}, set())
         elif ip in function.dispatches:
             index, targets, _, _, target, _ = function.dispatches[ip]
             cases = {}
@@ -581,13 +601,13 @@ def lift(pe, name):
             lines += ["    default: std::abort();", "}"]
             body[ip] = "\n    ".join(lines)
             # The guest jump target has no host meaning after the dispatch.
-            effects[ip] = (set(), set(), {target})
+            effects[ip] = ({}, {}, {target})
         elif ip in skipped:
-            # The table load reads the index; it and the add leave guest addresses behind.
-            effects[ip] = ({loads[ip]} if ip in loads else set(), set(), {full(ins.op0_register)})
+            # The table load reads the 64-bit index; it and the add leave guest addresses behind.
+            effects[ip] = ({loads[ip]: 8} if ip in loads else {}, {}, {full(ins.op0_register)})
         elif ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register):
             # A guest address is only usable as a jump-table base, which the switch replaces.
-            effects[ip] = (set(), set(), {full(ins.op0_register)})
+            effects[ip] = ({}, {}, {full(ins.op0_register)})
         else:
             if ins.mnemonic != M.RET and ins.is_stack_instruction:
                 raise ValueError(f"stack operation in leaf profile at RVA {ip:#x}")
@@ -598,26 +618,39 @@ def lift(pe, name):
         if touched - VOLATILE:
             raise ValueError(f"nonvolatile register {NAMES[min(touched - VOLATILE)]} at RVA {ip:#x}")
 
-    # Must-defined registers: arguments at entry, intersected at every join.
-    defined = {ip: set(NAMES) for ip in order}
-    defined[entry] = set(ARGUMENTS)
+    # Per register: (low bytes defined on every path: 0, 1, 2 or 8; may hold a guest address that
+    # the translation does not reproduce). Arguments are defined at entry; joins meet as (min, or).
+    state = {ip: dict.fromkeys(NAMES, (8, False)) for ip in order}
+    state[entry] = {r: (8 if r in ARGUMENTS else 0, False) for r in NAMES}
     changed = True
     while changed:
         changed = False
         for ip in order:
             _, writes, kills = effects[ip]
-            out = (defined[ip] | writes) - kills
+            out = dict(state[ip])
+            for r, width in writes.items():
+                # A 32- or 64-bit write defines all eight bytes; an 8- or 16-bit write keeps the rest.
+                out[r] = (8, False) if width >= 4 else (max(out[r][0], width), out[r][1])
+            for r in kills:
+                out[r] = (0, True)
             for successor in function.successors[ip]:
-                merged = defined[successor] & out
-                if successor == entry:
-                    merged &= set(ARGUMENTS)
-                if merged != defined[successor]:
-                    defined[successor] = merged
+                old = state[successor]
+                merged = {r: (min(old[r][0], out[r][0]), old[r][1] or out[r][1]) for r in NAMES}
+                if merged != old:
+                    state[successor] = merged
                     changed = True
+    widths = []
     for ip in order:
-        missing = effects[ip][0] - defined[ip]
+        missing = [r for r, width in effects[ip][0].items() if state[ip][r][0] < width]
         if missing:
             raise ValueError(f"undefined register {NAMES[min(missing)]} at RVA {ip:#x}")
+        if instructions[ip].mnemonic == M.RET:
+            defined, guest = state[ip][R.RAX]
+            if guest:
+                raise ValueError(f"return value may hold a guest address at RVA {ip:#x}")
+            widths.append(defined)
+    # Consecutive low RAX bytes defined at every reachable RET; None when no RET is reachable.
+    function.return_width = min(widths) if widths else None
 
     labels = set(edges)
     if order[0] != entry:
@@ -645,7 +678,12 @@ def lift(pe, name):
             text.append(f"    goto loc_{ins.next_ip:x};")
     signature = (f'extern "C" __declspec(dllexport) word lifted_{name}'
                  f'({", ".join(f"word {NAMES[r]}" for r in ARGUMENTS)})')
-    source = [signature + " {", *("    " + d for d in declarations), *text, "}"]
+    comment = []
+    if function.return_width is None:
+        comment = ["// RAX: no reachable normal return"]
+    elif function.return_width < 8:
+        comment = [f"// RAX: {function.return_width} low byte(s) are defined at every reachable RET"]
+    source = [*comment, signature + " {", *("    " + d for d in declarations), *text, "}"]
     return "\n".join(source), function
 
 
@@ -691,6 +729,8 @@ if __name__ == "__main__":
         args.output.write_text(source, encoding="utf-8")
         for function in functions:
             print(f"RVA {function.entry:#x}: {len(function.instructions)} instructions, "
-                  f"{sum(len(d[1]) for d in function.dispatches.values())} table entries")
+                  f"{sum(len(d[1]) for d in function.dispatches.values())} table entries, "
+                  + ("no reachable normal return" if function.return_width is None else
+                     f"{function.return_width} defined RAX byte(s) at every reachable RET"))
     except (ValueError, OSError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")

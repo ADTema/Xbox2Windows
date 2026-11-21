@@ -195,6 +195,54 @@ class ResourceChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mapping budget"):
             raw_page_map(io.BytesIO(changed), 0)
 
+    def test_raw_page_declared_padding(self) -> None:
+        archive = raw_page_archive()
+        padding = 1280
+        archive[12800:12800] = bytes(padding)
+        struct.pack_into("<I", archive, 36, padding << 20)
+        # The following range's field is different. Keep its virtual position.
+        struct.pack_into("<II", archive, 40, (7 << 26) | 55, (20 << 20) | 1)
+        struct.pack_into("<I", archive, 48, (1 << 30) | 69)
+
+        class PaddingOnly(io.BytesIO):
+            readable_padding = padding
+
+            def read(self, size: int = -1, /) -> bytes:
+                pos = self.tell()
+                if not (0 <= size and (pos + size <= 56 or 256 <= pos <= pos + size <= 288 or
+                                       12800 <= pos <= pos + size <= 12800 + self.readable_padding)):
+                    raise AssertionError("Raw page mapping read outside metadata and declared padding")
+                return super().read(min(size, 7))
+
+        self.assertEqual(raw_page_map(PaddingOnly(archive), 0).file_offset, 8704)
+
+        class TruncatedPadding(PaddingOnly):
+            def read(self, size: int = -1, /) -> bytes:
+                if self.tell() >= 12800:
+                    size = min(size, 12800 + padding - 1 - self.tell())
+                return super().read(size)
+
+        with self.assertRaisesRegex(ValueError, "Truncated segment"):
+            raw_page_map(TruncatedPadding(archive), 0)
+        for label, offset, value in (
+            ("nonzero first padding byte", 12800, b"x"),
+            ("nonzero last padding byte", 12800 + padding - 1, b"y"),
+            ("wrong boundary's count", 36, struct.pack("<I", 20 << 20)),
+            ("truncated count", 36, bytes(4)),
+        ):
+            with self.subTest(label=label):
+                changed = archive.copy()
+                changed[offset:offset + len(value)] = value
+                with self.assertRaises(ValueError):
+                    raw_page_map(PaddingOnly(changed), 0)
+
+        # The preexisting equal-size mapping uses the range lengths alone.
+        unchanged_size = raw_page_archive()
+        struct.pack_into("<I", unchanged_size, 36, 0xe00 << 20)
+        equal_range = PaddingOnly(unchanged_size)
+        equal_range.readable_padding = 0
+        self.assertEqual(raw_page_map(equal_range, 0).file_offset, 8704)
+
     def test_raw_page_map_across_boundary_batches(self) -> None:
         # Boundary 511 ends the first 4 KiB batch; boundary 512 ends its interval.
         count = 513
