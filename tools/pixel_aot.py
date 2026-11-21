@@ -258,19 +258,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dst):
                 scalar[f"s{n}"] = (bindings[offset], j)
                 pending.add(f"s{n}")
-        elif m := match(r"(s_load_dwordx4|s_buffer_load_dwordx4) s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (0x[0-9a-f]+|null)"):
-            op, first, last, low, high, imm = m.groups()
+        elif m := match(r"(?:(s_load_dwordx4|s_buffer_load_dwordx4) s\[(\d+):(\d+)\]|s_buffer_load_dword s(\d+))"
+                        r", s\[(\d+):(\d+)\], (0x[0-9a-f]+|null)"):
+            op, first, last, single, low, high, imm = m.groups()
             offset = 0 if imm == "null" else int(imm, 16)
             descriptor = op == "s_load_dwordx4"
+            if single is not None and (int(single) > 105 or int(low) % 4 or int(high) > 105):
+                raise ValueError("Invalid scalar buffer registers")
+            dst = registers(single, single, 1) if single is not None else registers(first, last, 4)
             base = [f"s{n}" for n in registers(low, high, 2 if descriptor else 4)]
             expected = ["texture_ptr", 0] if descriptor else [("cbv", n) for n in range(4)]
             if constant_descriptor is None or pending.intersection(base) or [scalar.get(r) for r in base] != expected:
                 raise ValueError("Unresolved constant buffer binding")
             if descriptor and offset != constant_descriptor:
                 raise ValueError("Constant descriptor differs from binding contract")
-            if not descriptor and (offset % 4 or offset + 16 > 256):
+            if not descriptor and (offset % 4 or offset + 4 * len(dst) > 256):
                 raise ValueError("Constant read exceeds binding or is unaligned")
-            for j, n in enumerate(registers(first, last, 4)):
+            for j, n in enumerate(dst):
                 if f"s{n}" in pending:
                     raise ValueError("Write overlaps an outstanding scalar load")
                 word = offset // 4 + j
