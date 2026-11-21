@@ -122,6 +122,24 @@ ALU = {
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
 }
+# The n-prefixed predicates are also true for unordered operands, so they stay negations.
+COMPARE = {
+    "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}", "gt": "{0} > {1}",
+    "lg": "({0} < {1} || {0} > {1})", "ge": "{0} >= {1}",
+    "o": "({0} == {0} && {1} == {1})", "u": "({0} != {0} || {1} != {1})",
+    "nge": "!({0} >= {1})", "nlg": "!({0} < {1} || {0} > {1})", "ngt": "!({0} > {1})",
+    "nle": "!({0} <= {1})", "neq": "!({0} == {1})", "nlt": "!({0} < {1})",
+}
+LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
+
+
+def lane_mask(token):
+    """Name the registers of a per-lane condition for either wavefront width."""
+    if token.startswith("vcc"):
+        return ["vcc"]
+    if m := re.fullmatch(r"s\[(\d+):(\d+)\]", token):
+        return [f"s{n}" for n in registers(*m.groups(), 2)]
+    return [token]
 
 
 def fp_operand(token, scalar, vector, pending, sample_pending):
@@ -268,6 +286,26 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            op, dst, *tokens = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+        elif m := match(rf"v_cndmask_b32(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+), {LANE_MASK}"):
+            dst, unset, chosen, source = m.groups()
+            regs = lane_mask(source)
+            condition = scalar.get(regs[0])
+            if (mask != "entry" or pending.intersection(regs) or not isinstance(condition, tuple)
+                    or condition[0] != "condition"
+                    or [scalar.get(r) for r in regs] != [(*condition[:2], j, len(regs)) for j in range(len(regs))]):
+                raise ValueError("Select mask is not a tracked comparison")
+            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in (chosen, unset)]
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {condition[1]} ? {values[0]} : {values[1]};")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             pair = (vector[lo], vector[hi])
