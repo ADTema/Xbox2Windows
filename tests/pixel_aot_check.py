@@ -195,6 +195,17 @@ def check_predicate_draws(directory, compiler, renderer, backend):
     shader = directory / "predicates.cso"
     case = directory / "predicates.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
+    # Isolate NLG so another predicate cannot supply the unordered test.
+    nlg = with_constants(["v_sub_f32_e64 v18, s45, 0",
+                          "v_cmp_nlg_f32_e32 vcc_lo, s44, v18",
+                          "v_cndmask_b32_e32 v12, 0, 1.0, vcc_lo"])
+    source.write_text(translate(nlg), encoding="ascii")
+    listing = directory / "nlg.ll"
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main",
+                    "-Fc", listing, "-Fo", shader, source], check=True)
+    dxil = listing.read_text(encoding="utf-8")
+    if not any(op in dxil for op in ("@dx.op.isSpecialFloat.f32(i32 8,", "fcmp uno ", "fcmp ueq ")):
+        raise AssertionError("NLG lacks an explicit unordered comparison in DXIL")
     inputs = ((-1, 1, 0), (-0.0, 0.0, 1), (1, -1, 2),
               (math.nan, 1, 3), (1, math.nan, 3))
     for first in range(0, 16, 4):
