@@ -45,12 +45,14 @@ def check():
         assert absent["shaders"]["pixel"]["status"] == "shader_not_in_manifest"
         assert untested["status"] == "needs_evidence"
         assert untested["shaders"]["pixel"]["archive_records"] == 2
+        # Temporary paths can contain a directory alias on Windows CI.
+        unnormalized_root = root / ".." / root.name
         for instructions, status, blocker in (
                 (assembly(False), "needs_pso_validation", None),
                 (["s_endpgm"], "blocked", "pixel_lowering_rejected"),
                 (["unknown_instruction"], "blocked", "unsupported_opcodes")):
             with patch("pixel_aot.disassemble", return_value=instructions) as scan:
-                rows = report(manifest, pipelines, root, "test-llvm")["pipelines"]
+                rows = report(manifest, pipelines, unnormalized_root, "test-llvm")["pipelines"]
                 assert rows[0]["first_blocker"] == {"reason": "missing_root_signature"}
                 assert rows[-1]["status"] == status, rows[-1]
                 if blocker:
@@ -65,6 +67,14 @@ def check():
             assert "does not match SHA-256" in str(exc)
         else:
             raise AssertionError("accepted native bytes under the wrong hash")
+
+        outside = {"shaders": [dict(pixel, native_file="../pixel.bin")]}
+        try:
+            report(outside, pipelines, unnormalized_root, "test-llvm")
+        except ValueError as exc:
+            assert "outside the manifest directory" in str(exc)
+        else:
+            raise AssertionError("accepted a native path outside the manifest directory")
     print("PSO census, evidence states, and native hash control passed")
 
 

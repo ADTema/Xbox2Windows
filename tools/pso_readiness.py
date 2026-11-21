@@ -44,6 +44,7 @@ def scan_pixel(root, records, digest, llvm):
 
 
 def report(manifest, pipelines, root, llvm=None):
+    root = root.resolve()
     records = manifest["shaders"]
     indexed = defaultdict(list)
     for record in records:
