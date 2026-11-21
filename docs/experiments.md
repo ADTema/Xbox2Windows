@@ -880,6 +880,26 @@ cmake --build out/build/dxc-check
 ctest --test-dir out/build/dxc-check --no-tests=error -R '^shader_metadata_probe$' -V
 ```
 
+### Retargeting dxil-ms-xb2 modules to desktop DXIL
+
+`tools/dxil_retarget.py` parses LLVM 3.7 bitcode blocks and records without modifying opaque subblocks such as function bodies. It rewrites `MODULE_CODE_TRIPLE` from `dxil-ms-xb2` to `dxil-ms-dx` and removes the `METADATA_NAME`/`METADATA_NAMED_NODE` pair for `xbox.compiler.options` in `METADATA_BLOCK_ID`, preserving numbered metadata indices. For a DXBC container it also canonicalizes the `DXIL` program header to `BitcodeOffset=16`, retargets any DXIL `STAT` reflection part, clears the `0x03000000` root signature flag pair in `RTS0` (unless `--keep-root-flags` is set) and zeroes the stale 16-byte DXBC digest. Desktop DXC rejects `dxil-ms` as an unknown triple; `dxil-ms-dx` is the accepted desktop DXIL triple.
+
+On the local `XboxBvhBuilder.dll` (SHA-256 `99f803ac22c01ef329dddb1d40be67238d2a812d01e8d040b3cb5135bc23707e`; 52 SM 6.5 compute containers), 9 modules make no direct `xbox.*` calls (`0x25700`, `0x35720`, `0x3ab00`, `0x46880`, `0x92e30`, `0xb3ae0`, `0xb4bd0`, `0xb5be0`, `0xb82e0`). With `dxil.dll` 1.9.2602.17 through `root_probe`:
+
+- Before retargeting, all 9 failed both container and `ModuleOnly` validation with `0x80aa0009` (`Unknown target triple 'dxil-ms-xb2'` and `Named metadata 'xbox.compiler.options' is unknown`).
+- With `--keep-root-flags`, all 9 passed `ModuleOnly` (`0x00000000`, zero diagnostics) and all 9 failed container validation with `0x80aa0013` (`Unsupported bit-flag set (root signature flags 0x3000000)`).
+- With default container retargeting (clearing `0x03000000`), all 9 passed both `ModuleOnly` and container validation (`0x00000000`, zero diagnostics).
+
+The other 43 BVH modules still fail validation after retargeting because of direct `xbox.*` calls and aggregate `insertvalue`/`extractvalue` instructions used with those intrinsics. The 29 AMD upscaler containers carry `RTS0` and `ACCC` without a `DXIL` part. Re-signing containers for live `CreateComputePipelineState` execution remains separate work.
+
+Public CI tests pure-Python bitcode/container controls (`dxil_retarget_controls`) and source-built `compute_root.cso` and `CopyBlocks.cso` shaders synthetically injected with `dxil-ms-xb2`, `xbox.compiler.options`, `BitcodeOffset=112` and `RTS0` flags `0x03000000` (`dxil_retarget_probe`), including negative controls for unmodified xb2, `--target-triple dxil-ms` and `--keep-root-flags`.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^dxil_retarget_' -V
+# Local validation of the 9 modules without xbox.* calls:
+.\out\pe-env\Scripts\python.exe -B tools/dxil_retarget.py --pe "game-files/<build-directory>/XboxBvhBuilder.dll" --only-without-xbox-calls --probe out/build/dev/root_probe.exe --report out/calls/dxil-retarget.json
+```
+
 ### BVH reads and cross-lane operations
 
 In `out/calls/desktop-roots.json`, `static_operands` from `tools/probe_roots.py` groups functions by module count, call site and operand form. The counts below describe static instructions across the 52 BVH programs. Runtime frequency is unknown.
