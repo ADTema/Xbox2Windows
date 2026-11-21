@@ -1,0 +1,15 @@
+EXPORTS
+    byte_merge
+    word_ops
+    byte_shift
+    byte_unary
+    bool_less
+    mixed_width
+    zx_byte
+    set_less
+    set_zx
+    void_store
+    void_ret0
+    join_wide
+    cmov_word
+    address_return
