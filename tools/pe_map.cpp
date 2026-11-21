@@ -544,7 +544,8 @@ extern "C" __declspec(dllexport) void pe_map_release(void* mapped) {
 //   that calls ExitProcess ends the host), and they run on the calling thread, so their stack, TLS and
 //   loader-lock state are the caller's. Run untrusted or unknown images in a child process.
 // pe_map_image maps an EXE without notifying it, like LoadLibrary, so nothing has run before this call.
-// Call this at most once per mapped image: a second call runs the callbacks and the entry point again.
+// Start once per mapping. The caller keeps it live throughout the call and prevents any thread,
+// TLS callback or entry point from re-entering run or releasing this mapping during startup.
 //
 // Returns 0 without running anything for a DLL, which pe_map_image already notified, for an image without
 // an entry point, for a null exit_code and for an unreadable TLS callback list. The PEB argument that

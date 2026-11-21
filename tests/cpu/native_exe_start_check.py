@@ -12,7 +12,7 @@ from tempfile import TemporaryDirectory
 
 import pefile
 
-from native_map_check import Mapper, STATUS
+from native_map_check import Mapper, STATUS, kernel
 
 IMAGE_FILE_DLL = 0x2000
 ACCESS_VIOLATION = 0xC0000005
@@ -102,6 +102,45 @@ def check_dll_refused(mapper, original, provider):
     print("pe_map_run refuses an image with IMAGE_FILE_DLL set and leaves the exit code untouched")
 
 
+def check_refusals(mapper_path, original, provider):
+    """Each refused startup leaves the fixture's writable log and output sentinel intact."""
+    mapper = Mapper(mapper_path)
+    start = ctypes.CDLL(str(mapper_path)).pe_map_run
+    start.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    start.restype = ctypes.c_int
+    kernel.VirtualProtect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32,
+                                      ctypes.POINTER(ctypes.c_uint32)]
+    with TemporaryDirectory() as temp, pefile.PE(str(original)) as pe:
+        data = next(s for s in pe.sections if s.Name.rstrip(b"\0") == b".data")
+        table = pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks - pe.OPTIONAL_HEADER.ImageBase
+        no_entry = Path(temp) / "no-entry.exe"
+        pe.OPTIONAL_HEADER.AddressOfEntryPoint = 0
+        pe.write(str(no_entry))
+        for case in ("no entry", "null output", "unreadable callbacks"):
+            image = no_entry if case == "no entry" else original
+            modules = {IMPORTED_DLL: ctypes.CDLL(str(provider))}
+            base, status, detail, _ = mapper(image, modules)
+            if not base:
+                raise AssertionError(f"{case} map failed: {status} {detail}")
+            old = ctypes.c_uint32()
+            try:
+                before = ctypes.string_at(base + data.VirtualAddress, data.Misc_VirtualSize)
+                if case == "unreadable callbacks":
+                    if not kernel.VirtualProtect(base + table, 8, 1, ctypes.byref(old)):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                output = ctypes.c_uint32(0xdeadbeef)
+                argument = None if case == "null output" else ctypes.byref(output)
+                result = start(base, argument)
+                after = ctypes.string_at(base + data.VirtualAddress, data.Misc_VirtualSize)
+                if result != 0 or output.value != 0xdeadbeef or before != after:
+                    raise AssertionError(f"{case}: result={result} output={output.value:#x}")
+            finally:
+                if old.value:
+                    kernel.VirtualProtect(base + table, 8, old.value, ctypes.byref(old))
+                mapper.release(base)
+            print(f"refused {case} before guest startup")
+
+
 def check_entry_outside_code(mapper, original, provider):
     """An entry point in .data: pe_map rejects the image before running anything; Windows runs it and faults."""
     with pefile.PE(str(original)) as pe:
@@ -133,4 +172,5 @@ if __name__ == "__main__":
         args = parser.parse_args()
         check(args.mapper, args.original, args.no_tls, args.provider, args.altered)
         check_dll_refused(args.mapper, args.original, args.provider)
+        check_refusals(args.mapper, args.original, args.provider)
         check_entry_outside_code(args.mapper, args.original, args.provider)
