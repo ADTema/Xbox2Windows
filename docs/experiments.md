@@ -947,7 +947,9 @@ Eight mutants of the registry each fail the test:
 - reversing the shader view's buffers;
 - skipping the `era_query` registration.
 
-Measured on WARP 10.0.26100.9818, Windows 11 build 26300: `gpu_alias_registry_warp` passed, with attach reporting `0x80070057` for the interior block and mismatches 0, and passed 5 of 5 repeated runs. The hardware variant was not run for this change (the GPU was in use).
+Measured at commit `d52905d`, Windows 11 build 26300, debug layer unavailable:
+- `gpu_alias_registry_warp` passed on WARP 10.0.26100.9818, with attach reporting `0x80070057` for the interior block and mismatches 0. It passed 5 of 5 repeated runs.
+- `gpu_alias_registry_hardware` passed on an NVIDIA GeForce RTX 3070 Laptop GPU (driver 32.0.16.1088), with the same results. It passed 10 of 10 repeated runs, and each of the eight mutants also fails there.
 
 ### Windows 10 with the app-local Agility SDK and WARP
 
