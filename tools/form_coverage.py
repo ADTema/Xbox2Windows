@@ -53,6 +53,7 @@ CPU_FIXTURES = {
     "repeat_call": "cpu_aot_repeated_call",
     "working_set_delta": "cpu_working_set_delta",
     "exe_entry": "cpu_aot_exe_entry",
+    "xchg": "cpu_aot_xchg",
     "address_size": "cpu_aot_address_size",
     "call_pair": "cpu_aot_call_pair",
     "bmi1": "cpu_aot_bmi1",

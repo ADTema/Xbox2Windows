@@ -19,6 +19,7 @@ UINT = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
 INTEGER_HEADER = """#include <array>
 #include <cstdint>
 #include <cstring>
+#include <intrin.h>
 #include <emmintrin.h>
 using std::memcpy;
 using std::memset;
@@ -98,7 +99,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
         def write(expr):
             if i.op0_kind == K.MEMORY:
                 return f"store<{UINT[MemorySizeExt.size(i.memory_size)]}>({address()}, {expr});"
-            dest = i.op0_register
+            return write_register(i.op0_register, expr)
+
+        def write_register(dest, expr):
             if dest in HIGH_BYTE:
                 return f"{reg(dest)} = ({reg(dest)} & ~0xff00ull) | (static_cast<word>(static_cast<uint8_t>({expr})) << 8);"
             size = RegisterExt.size(dest)
@@ -230,6 +233,21 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = f"{xmm[i.op0_register]} = _mm_add_epi32({xmm[i.op1_register]}, {xmm[i.op2_register]});"
         elif op == M.VMOVD and i.op1_register in xmm:
             stmt = write(f"_mm_cvtsi128_si32({xmm[i.op1_register]})")
+        elif op == M.XCHG and i.op_count == 2 and i.op0_kind == i.op1_kind == K.REGISTER:
+            # Both values are read before either write; 32-bit forms zero-extend both registers, so
+            # 87 C0 (xchg eax, eax) clears the upper half of RAX where the one-byte 90 is a NOP.
+            stmt = (f"{{ const word x = {operand(0)}, y = {operand(1)}; "
+                    f"{write_register(i.op0_register, 'y')} {write_register(i.op1_register, 'x')} }}")
+        elif op == M.XCHG and i.op_count == 2:
+            # XCHG with memory is atomic without a LOCK prefix, so it lowers to the host's interlocked
+            # exchange instead of a flat load and store. Ordering of the surrounding flat accesses is
+            # not modelled.
+            n = 1 if i.op0_kind == K.MEMORY else 0
+            register = i.op_register(n)
+            size = RegisterExt.size(register)
+            suffix, host = {1: ("8", "char"), 2: ("16", "short"), 4: ("", "long"), 8: ("64", "__int64")}[size]
+            stmt = write_register(register, f"_InterlockedExchange{suffix}(reinterpret_cast<{host} volatile*>({address()}), "
+                                            f"static_cast<{host}>({operand(n)}))")
         elif op == M.NOP or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
             stmt = ";"
         elif op == M.SETE:
