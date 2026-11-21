@@ -117,11 +117,43 @@ def check(root, caller, forward, provider):
         "forwarded_absent": "provider_not_found"}
     assert problems["forwarded_missing"]["package_chain"][-1]["symbol"] == "absent_value"
 
+    check_descriptor_names(root, caller, report, entry)
+
     # Older inventories lack package chains and keep the first-hop bundled result.
     for row in report["imports"]:
         del row["package_resolution"]
     legacy = trace(report, entry)
     assert not legacy["findings"] and PROVIDER in legacy["unlinked_in_this_graph"]
+
+
+def check_descriptor_names(root, caller, report, entry):
+    """An import descriptor may omit the extension. The loader then appends .dll, unless the name
+    ends with a dot, which stops the append and is dropped from the file name."""
+    def results(rows):
+        return {(r["dll"], r["symbol"]): (r["bundle_exports_in"], r["desktop_export"],
+                                         r["package_resolution"]) for r in rows}
+
+    expected = results(r for r in report["imports"] if r["image"] == entry)
+    with pefile.PE(str(caller), fast_load=True) as pe:
+        pe.parse_data_directories(directories=[1])
+        descriptor, = [d for d in pe.DIRECTORY_ENTRY_IMPORT if d.dll.lower() == FORWARD.encode()]
+        offset = pe.get_offset_from_rva(descriptor.struct.Name)
+        image = bytearray(pe.__data__)
+    stored = len(FORWARD)
+    for name, provider in ((b"INTAKE_FORWARD", FORWARD), (b"intake_forward.", "intake_forward")):
+        # Same-length rewrite of the descriptor's name; the rest of the image is unchanged.
+        image[offset:offset + stored] = name.ljust(stored, b"\0")
+        (root / entry).write_bytes(image)
+        rows = [r for r in scan(root)["imports"] if r["image"] == entry]
+        named = {r["dll"] for r in rows} - {r["dll"] for r in report["imports"] if r["image"] == entry}
+        if provider == FORWARD:
+            assert not named and results(rows) == expected, named
+        else:
+            assert named == {provider}, named
+            assert {r["desktop_export"] for r in rows if r["dll"] == provider} == {"provider_not_found"}
+            assert all(not r["bundle_exports_in"] and r["package_resolution"] is None
+                       for r in rows if r["dll"] == provider)
+    (root / entry).write_bytes(caller.read_bytes())
 
 
 if __name__ == "__main__":
