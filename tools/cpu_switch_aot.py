@@ -449,15 +449,21 @@ class Lifter:
         if mnemonic in SHIFTS:
             note(0)
             a = self.operand(ins, 0, width)
+            # x86 masks the count to six bits for 64-bit operands and to five bits otherwise, so an
+            # 8- or 16-bit destination can be shifted by up to 31. The shift is done in 64 bits
+            # (count < 64, no host overflow) and the write truncates the result to the destination.
+            mask = 63 if width == 8 else 31
             if ins.op1_kind == OpKind.REGISTER:
                 if ins.op1_register != R.CL:
                     raise ValueError(f"unsupported shift count at RVA {ins.ip:#x}")
                 reads.add(R.RCX)
-                count = f"({self.reg(R.RCX)} & {width * 8 - 1}u)"
+                count = f"({self.reg(R.RCX)} & {mask}u)"
             else:
-                count = f"{ins.immediate(1) & (width * 8 - 1)}u"
+                count = f"{ins.immediate(1) & mask}u"
             if mnemonic == M.SAR:
-                a = f"static_cast<{signed(width)}>({a})"
+                a = f"static_cast<std::int64_t>(static_cast<{signed(width)}>({a}))"
+            else:
+                a = f"static_cast<std::uint64_t>({a})"
             return self.write(ins, width, f"{a} {SHIFTS[mnemonic]} {count}"), reads, writes
         if mnemonic == M.IMUL and ins.op_count in (2, 3):
             note(*range(ins.op_count))

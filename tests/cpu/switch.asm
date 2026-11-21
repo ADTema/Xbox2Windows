@@ -150,4 +150,56 @@ ELSE
 ENDIF
     DD IMAGEREL op_shift, IMAGEREL op_neg
 run_ops ENDP
+
+; Narrow memory shifts: the DWORD at R8 first receives EDX, then ECX selects one of six byte or
+; word shifts of it by CL = EDX bits 16..23. x86 masks the count to five bits for 8- and 16-bit
+; destinations too, so counts of 8 to 31 still apply (a byte shifted left by 8 becomes zero).
+shift_narrow PROC FRAME
+    .endprolog
+    mov DWORD PTR [r8], edx
+    mov eax, ecx
+    cmp ecx, 5
+    ja narrow_done
+    mov ecx, eax
+    lea r9, narrow_table
+    movsxd rcx, DWORD PTR [r9+rcx*4]
+    add rcx, r9
+    jmp rcx
+narrow_shl8:
+    mov ecx, edx
+    shr ecx, 16
+    shl BYTE PTR [r8], cl
+    jmp narrow_done
+narrow_shr8:
+    mov ecx, edx
+    shr ecx, 16
+    shr BYTE PTR [r8], cl
+    jmp narrow_done
+narrow_sar8:
+    mov ecx, edx
+    shr ecx, 16
+    sar BYTE PTR [r8], cl
+    jmp narrow_done
+narrow_shl16:
+    mov ecx, edx
+    shr ecx, 16
+    shl WORD PTR [r8], cl
+    jmp narrow_done
+narrow_shr16:
+    mov ecx, edx
+    shr ecx, 16
+    shr WORD PTR [r8], cl
+    jmp narrow_done
+narrow_sar16:
+    mov ecx, edx
+    shr ecx, 16
+    sar WORD PTR [r8], cl
+narrow_done:
+    mov eax, DWORD PTR [r8]
+    ret
+    ALIGN 4
+narrow_table:
+    DD narrow_shl8 - narrow_table, narrow_shr8 - narrow_table, narrow_sar8 - narrow_table
+    DD narrow_shl16 - narrow_table, narrow_shr16 - narrow_table, narrow_sar16 - narrow_table
+shift_narrow ENDP
 END

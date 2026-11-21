@@ -50,6 +50,44 @@ def ops_reference(program, swapped=False):
     return acc, acc
 
 
+def narrow_reference(selector, operand):
+    """shift_narrow: byte or word shift of the stored DWORD; x86 masks the count to five bits."""
+    selector, value = selector & MASK32, operand & MASK32
+    if selector > 5:
+        return value, value
+    count = (value >> 16) & 31
+    bits = 8 if selector < 3 else 16
+    mask = (1 << bits) - 1
+    part = value & mask
+    kind = selector % 3
+    if kind == 0:
+        part = (part << count) & mask
+    elif kind == 1:
+        part >>= count
+    else:
+        signed = part - (1 << bits) if part >> (bits - 1) else part
+        part = (signed >> count) & mask
+    stored = (value & ~mask & MASK32) | part
+    return stored, stored
+
+
+def narrow_inputs():
+    """Each byte and word shift with counts 0..31 (and count bytes above 31) on sign/edge patterns."""
+    lows = (0x0001, 0x0080, 0x00ff, 0x8001, 0x7fff, 0xffff, 0x1234, 0xc3a5)
+    counts = [*range(32), 0x21, 0x3f, 0x80, 0xff]
+    return [(s | high, (0xab << 24) | (c << 16) | low)
+            for s in (*range(7), 0x80000000) for c in counts for low in lows for high in (0, 0xdeadbeef << 32)]
+
+
+def check_narrow(probe, libraries, label):
+    invoke = windows_invoker(probe, libraries)
+    from direct_check import SENTINELS
+    for x, y in narrow_inputs():
+        rax, words, registers = invoke("shift_narrow", x, y)
+        want, stored = narrow_reference(x, y)
+        if (rax, words) != (want, (GUARDS[0], stored, GUARDS[1])) or registers != SENTINELS:
+            raise AssertionError(f"{label} shift_narrow({x:#x}, {y:#x}): {rax:#x} {words} {registers}")
+
 def select_inputs():
     selectors = [*range(11), 0x7fffffff, 0x80000000, *range(MASK32 - 6, MASK32 + 1)]
     operands = [0, 1, 2, 0x5a5a, 0x7fffffff, 0x80000000, MASK32]
@@ -126,8 +164,12 @@ def check(probe_path, original_path, lifted_path, swapped_path):
     changed = {n: sum(a != b for a, b in zip(original[n], control[n])) for n in names}
     if not all(changed.values()):
         raise AssertionError(f"swapped-table control matched the original: {changed}")
+    check_narrow(probe, lambda n: getattr(native, n), "source fixture")
+    check_narrow(probe, lambda n: getattr(lifted, "lifted_" + n), "translation")
+    check_narrow(probe, lambda n: getattr(swapped, "lifted_" + n), "swapped-table build")
     print(f"{len(select_inputs())} selector pairs per table layout and {len(programs())} programs match on "
-          f"return, guarded store, RBX and RSI; swapped tables changed {changed}")
+          f"return, guarded store, RBX and RSI; swapped tables changed {changed}; {len(narrow_inputs())} byte and "
+          f"word memory shifts match x86 count masking")
 
 
 def instructions(pe, name):
