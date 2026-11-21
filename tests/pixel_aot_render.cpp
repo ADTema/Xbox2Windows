@@ -11,11 +11,12 @@ namespace {
 // Includes UNORM values on both sides of a binary16 rounding midpoint.
 constexpr std::array<UINT, 8> ramp{0, 16, 37, 64, 101, 153, 219, 254};
 
-D3D12_RESOURCE_DESC texture_desc(UINT side, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags)
+D3D12_RESOURCE_DESC texture_desc(UINT width, UINT height, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags)
 {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = desc.Height = side;
+    desc.Width = width;
+    desc.Height = height;
     desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
     desc.Format = format;
     desc.Flags = flags;
@@ -33,20 +34,20 @@ float expected_channel(UINT byte)
     const double scale = std::ldexp(1.0, 11 - exponent);
     return static_cast<float>(std::floor(value * scale) / scale);
 }
-}
+using Color = std::array<float, 4>;
 
-void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference)
+struct PixelInput {
+    UINT width, height, scale;
+    DXGI_FORMAT format;
+    std::vector<BYTE> rows;
+    std::vector<Color> expected;
+    std::vector<Word> constants = std::vector<Word>(64);
+};
+
+void draw_verified(ID3D12Device* device, const char* path, const PixelInput& input, const char* capture,
+                   const PixelInput* mip1 = nullptr)
 {
-    std::vector<Word> constants(64);
-    std::array<std::array<float, 4>, 64> referenceColors{};
-    if (reference) {
-        std::ifstream input(reference, std::ios::binary);
-        input.read(reinterpret_cast<char*>(constants.data()), constants.size() * sizeof(Word));
-        input.read(reinterpret_cast<char*>(referenceColors.data()), sizeof(referenceColors));
-        if (!input || input.peek() != std::char_traits<char>::eof())
-            throw std::runtime_error("Expected a 256-byte constant buffer and 64 float4 reference colors");
-    }
-    auto cb = upload(device, constants);
+    auto cb = upload(device, input.constants);
     std::ifstream file(path, std::ios::binary);
     std::vector<char> ps{std::istreambuf_iterator<char>(file), {}};
     if (ps.empty() || file.bad()) throw std::runtime_error("Cannot read compiled pixel shader");
@@ -72,19 +73,29 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
     ComPtr<ID3D12PipelineState> pso;
     check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), "Translated pixel pipeline");
 
-    auto srcDesc = texture_desc(8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
-    auto dstDesc = texture_desc(64, desc.RTVFormats[0], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const auto& sampled = mip1 ? *mip1 : input;
+    const UINT width = sampled.width * sampled.scale, height = sampled.height * sampled.scale;
+    auto srcDesc = texture_desc(input.width, input.height, input.format, D3D12_RESOURCE_FLAG_NONE);
+    srcDesc.MipLevels = mip1 ? 2 : 1;
+    auto dstDesc = texture_desc(width, height, desc.RTVFormats[0], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto texture = resource(device, srcDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     const D3D12_CLEAR_VALUE clear{desc.RTVFormats[0], {-1, -1, -1, -1}};
     auto target = resource(device, dstDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT sourceLayout{}, resultLayout{};
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> layouts{};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT resultLayout{};
     UINT64 sourceBytes, resultBytes;
-    device->GetCopyableFootprints(&srcDesc, 0, 1, 0, &sourceLayout, nullptr, nullptr, &sourceBytes);
+    std::array<UINT, 2> rows{};
+    std::array<UINT64, 2> rowBytes{};
+    device->GetCopyableFootprints(&srcDesc, 0, srcDesc.MipLevels, 0, layouts.data(), rows.data(), rowBytes.data(), &sourceBytes);
     device->GetCopyableFootprints(&dstDesc, 0, 1, 0, &resultLayout, nullptr, nullptr, &resultBytes);
-    std::vector<Word> colors(sourceBytes / 4);
-    for (UINT y = 0; y < ramp.size(); ++y) {
-        for (UINT x = 0; x < ramp.size(); ++x) {
-            colors[y * sourceLayout.Footprint.RowPitch / 4 + x] = ramp[x] | (ramp[y] << 8) | 0xff800000u;
+    std::vector<BYTE> colors(sourceBytes);
+    const PixelInput* levels[]{&input, mip1};
+    for (UINT level = 0; level < srcDesc.MipLevels; ++level) {
+        const auto& packed = levels[level]->rows;
+        if (rowBytes[level] * rows[level] != packed.size()) throw std::runtime_error("Invalid texture row size");
+        for (UINT y = 0; y < rows[level]; ++y) {
+            auto offset = layouts[level].Offset + size_t(y) * layouts[level].Footprint.RowPitch;
+            std::memcpy(colors.data() + offset, packed.data() + y * rowBytes[level], rowBytes[level]);
         }
     }
     auto staging = upload(device, colors);
@@ -105,18 +116,21 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
     src.pResource = staging.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint = sourceLayout;
     dst.pResource = texture.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    for (UINT level = 0; level < srcDesc.MipLevels; ++level) {
+        src.PlacedFootprint = layouts[level];
+        dst.SubresourceIndex = level;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ID3D12DescriptorHeap* heaps[]{srvs.Get()};
     list->SetDescriptorHeaps(1, heaps);
     list->SetGraphicsRootSignature(root.Get());
     list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
     list->SetGraphicsRootConstantBufferView(1, cb->GetGPUVirtualAddress());
-    const D3D12_VIEWPORT viewport{0,0,64,64,0,1};
-    const D3D12_RECT scissor{0,0,64,64};
+    const D3D12_VIEWPORT viewport{0,0,float(width),float(height),0,1};
+    const D3D12_RECT scissor{0,0,LONG(width),LONG(height)};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -133,22 +147,95 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
     list->CopyTextureRegion(&dst, 0,0,0, &src, nullptr);
     cmd.submit_and_wait(device);
     auto words = read(back.Get(), resultBytes/4);
-    for (UINT y = 0; y < 64; ++y) {
-        for (UINT x = 0; x < 64; ++x) {
-            std::array<float, 4> expected{
-                expected_channel(ramp[x / 8]), expected_channel(ramp[y / 8]), expected_channel(128), 1.0f};
-            if (swapRB) std::swap(expected[0], expected[2]);
-            if (reference) expected = referenceColors[(y / 8) * 8 + x / 8];
+    std::vector<BYTE> image;
+    if (capture) image.reserve(size_t(width) * height * 4);
+    for (UINT y = 0; y < height; ++y) {
+        for (UINT x = 0; x < width; ++x) {
+            const auto& expected = sampled.expected[(y / sampled.scale) * sampled.width + x / sampled.scale];
             const auto offset = y * resultLayout.Footprint.RowPitch / 4 + x * 4;
-            if (std::memcmp(words.data() + offset, expected.data(), sizeof(expected)) != 0) {
+            Color actual;
+            std::memcpy(actual.data(), words.data() + offset, sizeof(actual));
+            if (std::memcmp(actual.data(), expected.data(), sizeof(actual)) != 0) {
                 std::fprintf(stderr, "pixel_mismatch x=%u y=%u\n", x, y);
-                std::array<float, 4> actual;
-                std::memcpy(actual.data(), words.data() + offset, sizeof(actual));
                 for (size_t c = 0; c < actual.size(); ++c)
                     std::fprintf(stderr, "channel=%zu expected=%g actual=%g\n", c, expected[c], actual[c]);
                 throw std::runtime_error("AOT color export differs from CPU reference");
             }
+            if (capture) {
+                for (float value : actual) image.push_back(static_cast<BYTE>(std::lround(value * 255)));
+            }
         }
     }
-    std::puts("pixels=4096 channels=16384 max_absolute_error=0");
+    if (capture) {
+        std::ofstream output(capture, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(image.data()), image.size());
+        output.close();
+        if (!output) throw std::runtime_error("Cannot save GPU readback");
+    }
+    std::printf("pixels=%u channels=%u max_absolute_error=0\n", width * height, width * height * 4);
+}
+}
+
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference)
+{
+    PixelInput input{8, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM};
+    for (auto g : ramp) {
+        for (auto r : ramp) {
+            input.rows.insert(input.rows.end(), {BYTE(r), BYTE(g), 128, 255});
+            Color expected{expected_channel(r), expected_channel(g), expected_channel(128), 1};
+            if (swapRB) std::swap(expected[0], expected[2]);
+            input.expected.push_back(expected);
+        }
+    }
+    if (reference) {
+        std::ifstream file(reference, std::ios::binary);
+        file.read(reinterpret_cast<char*>(input.constants.data()), input.constants.size() * sizeof(Word));
+        file.read(reinterpret_cast<char*>(input.expected.data()), input.expected.size() * sizeof(Color));
+        if (!file || file.peek() != std::char_traits<char>::eof())
+            throw std::runtime_error("Expected a 256-byte constant buffer and 64 float4 reference colors");
+    }
+    draw_verified(device, path, input, nullptr);
+}
+
+namespace {
+PixelInput read_bc7_case(const char* fixture)
+{
+    std::ifstream file(fixture, std::ios::binary);
+    std::array<char,4> magic{};
+    UINT w = 0, h = 0;
+    file.read(magic.data(), 4);
+    file.read(reinterpret_cast<char*>(&w), sizeof(w));
+    file.read(reinterpret_cast<char*>(&h), sizeof(h));
+    if (!file || std::memcmp(magic.data(), "BC7C", 4) || !w || !h || w % 4 || h % 4 ||
+        w > 4096 || h > 4096 || size_t(w) * h > 4 * 1024 * 1024)
+        throw std::runtime_error("Invalid single-level BC7 case dimensions or header");
+    PixelInput input{w, h, 1, DXGI_FORMAT_BC7_UNORM};
+    const size_t pixels = size_t(w) * h;
+    input.rows.resize(pixels);  // 16 bytes per 4x4 block
+    file.read(reinterpret_cast<char*>(input.rows.data()), input.rows.size());
+    std::vector<std::array<BYTE,4>> reference(pixels);
+    file.read(reinterpret_cast<char*>(reference.data()), pixels * 4);
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        throw std::runtime_error("BC7 block rows or RGBA reference have incorrect size");
+    input.expected.reserve(pixels);
+    for (const auto& rgba : reference) {
+        input.expected.push_back({expected_channel(rgba[0]), expected_channel(rgba[1]),
+                                  expected_channel(rgba[2]), expected_channel(rgba[3])});
+    }
+    return input;
+}
+}
+
+void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* fixture,
+                     const char* capture, const char* mip1)
+{
+    auto input = read_bc7_case(fixture);
+    if (mip1) {
+        auto lower = read_bc7_case(mip1);
+        if (lower.width * 2 != input.width || lower.height * 2 != input.height)
+            throw std::runtime_error("Expected a half-size BC7 mip");
+        draw_verified(device, shader, input, capture, &lower);
+    } else {
+        draw_verified(device, shader, input, capture);
+    }
 }
