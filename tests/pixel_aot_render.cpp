@@ -178,7 +178,14 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->SetGraphicsRootSignature(root.Get());
         list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
         list->SetGraphicsRootConstantBufferView(1, cb->GetGPUVirtualAddress());
-        const D3D12_VIEWPORT viewport{0,0,float(width),float(height),0,1};
+        // Keep the implicit derivatives at the requested mip even when its
+        // logical dimensions round down. Center the fractional viewport so
+        // each visible pixel still point-samples its corresponding texel.
+        const float mipScale = std::ldexp(float(req.scale), -static_cast<int>(req.sampledLevel));
+        const float viewportWidth = (std::max)(float(width), input.width * mipScale);
+        const float viewportHeight = (std::max)(float(height), input.height * mipScale);
+        const D3D12_VIEWPORT viewport{(width - viewportWidth) * 0.5f, (height - viewportHeight) * 0.5f,
+                                      viewportWidth, viewportHeight, 0, 1};
         const D3D12_RECT scissor{0,0,LONG(width),LONG(height)};
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
