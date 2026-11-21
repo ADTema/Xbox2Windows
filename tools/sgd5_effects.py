@@ -99,10 +99,14 @@ def inspect_container(view: PagedResource, program: Program, group: str, index: 
     if not decoder.eof or decoder.unused_data or len(blob) != program.decoded:
         raise ValueError("Candidate container disagrees with its declared extents")
     dxil = parts(blob).get(b"DXIL", b"")
-    if len(dxil) < 24 or dxil[8:12] != b"DXIL" or struct.unpack_from("<I", dxil, 4)[0] * 4 != len(dxil):
-        raise ValueError("Candidate has no framed DXIL program header")
-    return Candidate(group, index, program.name, struct.unpack_from("<H", dxil, 2)[0],
-                     hashlib.sha256(blob).hexdigest())
+    if len(dxil) < 24:
+        raise ValueError("Truncated candidate DXIL program header")
+    version_type, words, magic, _, payload_offset, payload_size = struct.unpack_from("<II4sIII", dxil)
+    # Console payloads may have a different signature from desktop LLVM bitcode.
+    if (magic != b"DXIL" or payload_offset < 16 or payload_size < 4
+            or not 8 + payload_offset + payload_size <= 4 * words <= len(dxil)):
+        raise ValueError("Candidate DXIL program exceeds its declared extents or has an invalid header")
+    return Candidate(group, index, program.name, version_type >> 16, hashlib.sha256(blob).hexdigest())
 
 
 def candidates(stream: BinaryIO, name: str, group_start: int, group_end: int, arrays: int,

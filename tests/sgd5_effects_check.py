@@ -20,8 +20,9 @@ def name(s: str) -> bytes:
     return bytes([len(encoded)]) + encoded
 
 
-def program(label: str, kind: int, identity: int) -> tuple[bytes, str]:
-    dxil = struct.pack("<HHI4sIII4sI", 0x60, kind, 8, b"DXIL", 0x100, 16, 8, b"BC\xc0\xde", identity)
+def program(label: str, kind: int, identity: int, *, words: int = 8, trailer: bytes = b"",
+            payload_magic: bytes = b"BC\xc0\xde") -> tuple[bytes, str]:
+    dxil = struct.pack("<HHI4sIII4sI", 0x60, kind, words, b"DXIL", 0x100, 16, 8, payload_magic, identity) + trailer
     blob = b"DXBC" + bytes(16) + struct.pack("<4I", 1, 44 + len(dxil), 1, 36) + b"DXIL" + word(len(dxil)) + dxil
     compressor = zlib.compressobj(wbits=-15)
     packed = compressor.compress(blob) + compressor.flush()
@@ -39,9 +40,26 @@ def effect(label: str, vs: list[int], ps: list[int]) -> bytes:
 
 
 class EffectChecks(unittest.TestCase):
+    def test_padded_dxil_part(self) -> None:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+        from sgd5_effects import candidates
+
+        # The part occupies nine words. Its bitcode ends at the eighth word.
+        for words in (8, 7, 10):
+            with self.subTest(words=words):
+                entry, digest = program("padded", 0, 7, words=words, trailer=bytes(4))
+                table = b"SGD5" + bytes(28) + word(0) + word(1) + entry + word(0) * 4 + word(1)
+                data = table + effect("probe", [], [0])
+                if words == 8:
+                    result = candidates(io.BytesIO(data), "probe", 0, len(data), 32, len(table), len(data))
+                    self.assertEqual([(item.dxil_kind, item.container_sha256) for item in result], [(0, digest)])
+                else:
+                    with self.assertRaises(ValueError):
+                        candidates(io.BytesIO(data), "probe", 0, len(data), 32, len(table), len(data))
+
     def test_candidates_and_boundaries(self) -> None:
         tool = Path(__file__).resolve().parents[1] / "tools" / "sgd5_effects.py"
-        mesh, mesh_digest = program("shared", 13, 1)
+        mesh, mesh_digest = program("shared", 13, 1, payload_magic=b"TEST")
         ps0, first_digest = program("shared", 0, 2)
         ps1, second_digest = program("shared", 0, 3)
         arrays = word(1) + mesh + word(2) + ps0 + ps1 + word(0) * 4
