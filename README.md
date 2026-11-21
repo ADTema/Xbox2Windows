@@ -2,6 +2,8 @@
 
 Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) software for x64 Windows**. The CPU experiments translate source-built x64 functions from PE machine code through C++ to new Windows DLLs, including a direct call and cross-DLL imports by name and ordinal. The shader experiment translates selected gfx1013 pixel shaders through HLSL to desktop DXIL. Other experiments test the Windows runtime, render recovered texture levels and read script state data. Title CPU code execution, full-game startup and frame rate remain unverified.
 
+New to the project? The [pinned guide in GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions/75) will help you choose a first contribution. Ask build and debugging questions in [Development Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a).
+
 ## Current results and open work
 
 | Area | Result on Windows | Open question or contribution |
