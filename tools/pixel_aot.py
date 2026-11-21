@@ -125,6 +125,7 @@ ALU = {
 }
 # The n-prefixed predicates are also true for unordered operands, so they stay negations.
 COMPARE = {
+    "f": "false", "tru": "true",
     "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}", "gt": "{0} > {1}",
     "lg": "({0} < {1} || {0} > {1})", "ge": "{0} >= {1}",
     "o": "({0} == {0} && {1} == {1})", "u": "({0} != {0} || {1} != {1})",
@@ -185,11 +186,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if second_texture_offset is not None:
         if second_texture_offset < 32 or second_texture_offset % 32:
             raise ValueError("Second texture descriptor must have a distinct aligned offset")
-        if constant_descriptor is not None and (second_texture_offset < constant_descriptor + 16
-                                                and constant_descriptor < second_texture_offset + 32):
-            raise ValueError("Texture and constant descriptors overlap")
         bindings[second_texture_offset] = "tex1"
         lines.insert(0, "Texture2D<float4> tex1 : register(t1);")
+    if constant_descriptor is not None and any(
+            start < constant_descriptor + 16 and constant_descriptor < start + 32 for start in bindings):
+        raise ValueError("Texture and constant descriptors overlap")
     pending = set()
     mask = "entry"
     samples = 0
