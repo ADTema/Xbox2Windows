@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from paged_resource import PagedResource, Segment
 from section_probe import inspect as inspect_sections
 from section_probe import scan_window, sections
-from texture_descriptors import inventory
+from texture_descriptors import inventory, raw_page_map
 
 
 class ShortReadStream(io.BytesIO):
@@ -37,7 +37,98 @@ def descriptor_archive() -> bytearray:
     return archive
 
 
+def raw_page_archive() -> bytearray:
+    archive = bytearray(16384)
+    struct.pack_into("<4sIQ", archive, 0, b"RDS5", 5, 20480)
+    # The raw interval at stored [4608, 12800) contains logical pages 2 and 3.
+    # Its neighbors advertise zlib (8) and BCPack (7), respectively.
+    struct.pack_into("<10I", archive, 16, 1, 0, (1 << 30) | (8 << 26) | 17, 0,
+                     (2 << 30) | 18, 0, (7 << 26) | 50, 1, (1 << 30) | 64, 1)
+    struct.pack_into("<4sIII", archive, 256, b"ETPF", 0, 5, 0)
+    for index, page in enumerate((3, 2, 3, 1, 4)):
+        struct.pack_into("<4I", archive, 272 + index * 16, 0x3c00f, 98 << 3, page, 0)
+    archive[4608:8704] = bytes((i * 7 + 19) % 256 for i in range(4096))
+    archive[8704:12800] = bytes((i * 13 + 17) % 256 for i in range(4096))
+    return archive
+
+
 class ResourceChecks(unittest.TestCase):
+    def test_raw_page_map(self) -> None:
+        tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
+        archive = raw_page_archive()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "raw.ttpf"
+            path.write_bytes(archive)
+            result = subprocess.run([sys.executable, "-B", tool, path, "--raw-page-map", "0"],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mapping = json.loads(result.stdout)
+        self.assertEqual(mapping, {"logical_offset": 12288, "file_offset": 8704})
+        start = mapping["file_offset"]
+        self.assertEqual(archive[start:start + 4096], bytes((i * 13 + 17) % 256 for i in range(4096)))
+
+    def test_raw_page_map_boundaries(self) -> None:
+        archive = raw_page_archive()
+        self.assertEqual(raw_page_map(io.BytesIO(archive), 1).file_offset, 4608)
+        self.assertEqual(raw_page_map(io.BytesIO(archive), 2).file_offset, 8704)
+        for index in (-1, 3, 4, 5):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                raw_page_map(io.BytesIO(archive), index)
+
+        for label, offset, change in (
+            ("padded raw", 40, struct.pack("<I", (7 << 26) | 51)),
+            ("undersized raw", 40, struct.pack("<I", (7 << 26) | 49)),
+            ("duplicate logical boundary", 40, struct.pack("<2I", (2 << 30) | 50, 0)),
+            ("descending stored boundary", 40, struct.pack("<I", (7 << 26) | 17)),
+            ("page at logical end", 280, struct.pack("<I", 5)),
+        ):
+            with self.subTest(label=label):
+                changed = archive.copy()
+                changed[offset:offset + len(change)] = change
+                with self.assertRaises(ValueError):
+                    raw_page_map(io.BytesIO(changed), 0)
+
+        changed = archive.copy()
+        struct.pack_into("<I", changed, 4, 6)
+        changed[48:64] = archive[40:56]  # Repeat the preceding boundary after the selected interval.
+        with self.assertRaisesRegex(ValueError, "increase"):
+            raw_page_map(io.BytesIO(changed), 0)
+
+        count = (1 << 17) + 1  # One boundary above the 1 MiB mapping budget.
+        start = (1 << 20) + 256
+        changed = bytearray(start + len(archive) - 256)
+        changed[:56] = archive[:56]
+        struct.pack_into("<I", changed, 4, count)
+        struct.pack_into("<I", changed, 16, start // 256)
+        struct.pack_into("<I", changed, 24, (1 << 30) | (8 << 26) | (start // 256 + 16))
+        struct.pack_into("<2I", changed, 16 + (count - 1) * 8, (1 << 30) | (len(changed) // 256), 1)
+        changed[start:start + 96] = archive[256:352]
+        with self.assertRaisesRegex(ValueError, "mapping budget"):
+            raw_page_map(io.BytesIO(changed), 0)
+
+    def test_raw_page_map_across_boundary_batches(self) -> None:
+        # Boundary 511 ends the first 4 KiB batch; boundary 512 ends its interval.
+        count = 513
+        start = 4352
+        size = start + (count - 1) * 4096
+        archive = bytearray(size)
+        struct.pack_into("<4sIQ", archive, 0, b"RDS5", count, size - start)
+        for index in range(count):
+            stored_pages = (start + index * 4096) // 256
+            struct.pack_into("<II", archive, 16 + 8 * index, stored_pages | ((index % 4) << 30), index // 4)
+        struct.pack_into("<4sIII", archive, start, b"ETPF", 0, 1, 0)
+        struct.pack_into("<4I", archive, start + 16, 0, 0, 511, 0)
+
+        class MetadataOnly(io.BytesIO):
+            def read(self, length: int = -1, /) -> bytes:
+                pos = self.tell()
+                if not (0 <= length <= 4096 and
+                        (pos + length <= 16 + count * 8 or start <= pos <= pos + length <= start + 32)):
+                    raise AssertionError(f"Unexpected map read of {length} bytes at {pos}")
+                return super().read(length)
+
+        self.assertEqual(raw_page_map(MetadataOnly(archive), 0).file_offset, size - 4096)
+
     def test_texture_descriptor_inventory(self) -> None:
         tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
         with TemporaryDirectory() as directory:
