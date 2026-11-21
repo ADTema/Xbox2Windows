@@ -3,8 +3,9 @@
 include("${SOURCE_DIR}/cmake/app_local_warp.cmake")
 set(package "${WORK_DIR}/warp-package")
 set(build "${WORK_DIR}/build")
-file(REMOVE_RECURSE "${WORK_DIR}")
 file(MAKE_DIRECTORY "${package}" "${build}")
+# Clear only the stand-in files this test creates; anything else under WORK_DIR is left alone.
+file(REMOVE "${package}/d3d10warp.dll" "${build}/d3d10warp.dll")
 file(WRITE "${package}/d3d10warp.dll" "stand-in WARP")
 
 offscreen_app_local_warp("${package}" "${build}")
