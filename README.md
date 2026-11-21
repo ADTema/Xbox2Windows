@@ -17,6 +17,7 @@ Review `gpu-report-hardware.md` and paste it in the [hardware coverage thread (#
 | Adapter or backend | Reported native lanes | Forced wave64 | BVH differential | Evidence |
 |---|---:|---|---|---|
 | NVIDIA GeForce RTX 2060 | 32 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
+| NVIDIA GeForce RTX 4060 Laptop GPU | 32 | Skipped | 408 queries passed | [Second maintainer workstation](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7058907095) |
 | Microsoft WARP (software) | 4 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
 | Wave64-capable Windows GPU | Awaiting report | Awaiting execution | Awaiting report | [Contribute a run](https://github.com/R0Y00/Xbox2Windows/issues/1) |
 
