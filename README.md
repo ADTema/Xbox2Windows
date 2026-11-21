@@ -6,7 +6,6 @@ New to the project? The [pinned guide in GitHub Discussions](https://github.com/
 
 [![Instruction-form coverage of source-built fixtures, not a measure of port completion](docs/coverage/dashboard.svg)](tools/coverage_svg.py)
 
-
 ## Current results and open work
 
 | Area | Result on Windows | Open question or contribution |
