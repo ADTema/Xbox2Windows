@@ -41,24 +41,75 @@ def check_denominators():
             raise AssertionError("a form filed under the wrong encoding was accepted")
 
 
+# Small fixtures written here, so later edits to the repository's own tests/cpu/*.asm cannot change the
+# expected counts. They use the repository's fixture names, so the real CPU_FIXTURES mapping applies.
+BRANCH = """branch PROC
+    mov eax, ecx
+    cmp ecx, edx
+IFDEF INVERT_BRANCH
+    jae short high
+ELSE
+    jb short low
+ENDIF
+    add eax, 1
+    jmp short done
+low:
+    sub eax, 1
+high:
+done:
+    ret
+branch ENDP
+END
+"""
+DIRECT = "direct PROC\n    sub rsp, 28h\n    call helper\n    add rsp, 28h\n    ret\ndirect ENDP\nEND\n"
+SWITCH = """switch PROC
+    cmp ecx, 3
+    ja short default
+    lea rdx, table
+    movsxd rax, DWORD PTR [rdx+rcx*4]
+    add rax, rdx
+    jmp rax
+default:
+    neg eax
+    ret
+table DD 0
+switch ENDP
+END
+"""
+
+
+def sample_repo(tmp, cpu, scripts=None):
+    """A repository root holding only the given tests/cpu/<name>.asm and tests/<name>.py sources."""
+    root = Path(tmp)
+    (root / "tests" / "cpu").mkdir(parents=True, exist_ok=True)
+    for name, text in cpu.items():
+        (root / "tests" / "cpu" / f"{name}.asm").write_text(text, encoding="utf-8")
+    for name, text in (scripts or {}).items():
+        (root / "tests" / name).write_text(text, encoding="utf-8")
+    return root
+
+
 def check_example():
-    """tests/cpu/branch.asm -> eight x64 forms, counted only while cpu_leaf_aot_branches passes."""
-    branch = fc.masm_mnemonics((fc.ROOT / "tests/cpu/branch.asm").read_text(encoding="utf-8"))
+    """branch.asm -> eight x64 forms, counted only while cpu_leaf_aot_branches passes."""
+    branch = fc.masm_mnemonics(BRANCH)
     assert branch == {"mov", "cmp", "jb", "jae", "add", "jmp", "sub", "ret"}, branch  # jae: INVERT_BRANCH build
     reference = fc.load_reference("x64_zen2.tsv")
     assert fc.x64_forms(branch, reference) == {("Integer", m) for m in branch}
 
-    passed = fc.measure({"cpu_leaf_aot_branches": "pass"})["x64_zen2"]
-    skipped = fc.measure({"cpu_leaf_aot_branches": "skip"})["x64_zen2"]
-    failed = fc.measure({"cpu_leaf_aot_branches": "fail"})["x64_zen2"]
-    assert passed["covered"] == 8 and passed["groups"]["Integer"]["covered"] == 8
-    assert skipped["covered"] == 0 and skipped["blocked_by_skip"] == sorted(f"Integer {m}" for m in branch)
-    assert failed["covered"] == 0 and failed["blocked_by_skip"] == []
-    # A skip never adds coverage, even when another passing fixture already covers the same form.
-    both = fc.measure({"cpu_leaf_aot_branches": "skip", "cpu_aot_direct_call": "pass"})["x64_zen2"]
-    direct = fc.masm_mnemonics((fc.ROOT / "tests/cpu/direct.asm").read_text(encoding="utf-8"))
-    assert both["covered"] == len(fc.x64_forms(direct, reference))
-    assert both["blocked_by_skip"] == sorted(f"Integer {m}" for m in branch - direct)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"branch": BRANCH, "direct": DIRECT})
+        passed = fc.measure({"cpu_leaf_aot_branches": "pass"}, root)["x64_zen2"]
+        skipped = fc.measure({"cpu_leaf_aot_branches": "skip"}, root)["x64_zen2"]
+        failed = fc.measure({"cpu_leaf_aot_branches": "fail"}, root)["x64_zen2"]
+        assert passed["covered"] == 8 and passed["groups"]["Integer"]["covered"] == 8
+        assert skipped["covered"] == 0 and skipped["blocked_by_skip"] == sorted(f"Integer {m}" for m in branch)
+        assert failed["covered"] == 0 and failed["blocked_by_skip"] == []
+        # A skip never adds coverage, even when another passing fixture already covers the same form.
+        both = fc.measure({"cpu_leaf_aot_branches": "skip", "cpu_aot_direct_call": "pass"}, root)["x64_zen2"]
+        direct = fc.masm_mnemonics(DIRECT)
+        assert direct == {"sub", "call", "add", "ret"}, direct
+        assert both["covered"] == len(fc.x64_forms(direct, reference)) == 4
+        assert both["blocked_by_skip"] == sorted(f"Integer {m}" for m in branch - direct)
 
     # gfx1013: _e32 selects the plain encoding, _e64 the VOP3 form; any passing adapter counts.
     gfx = fc.load_reference("gfx1013.tsv")
@@ -70,20 +121,34 @@ def check_example():
 
 
 def check_jump_tables():
-    """tests/cpu/switch.asm (#86): a skipped cpu_aot_jump_tables run contributes zero covered forms."""
-    switch = fc.masm_mnemonics((fc.ROOT / "tests/cpu/switch.asm").read_text(encoding="utf-8"))
-    assert switch == {"add", "cmp", "imul", "ja", "jmp", "jne", "lea", "mov", "movsxd", "movzx", "neg", "not",
-                      "ret", "sar", "shl", "shr", "sub", "xor"}, sorted(switch)
-    assert fc.CPU_FIXTURES["switch"] == "cpu_aot_jump_tables"
-    passed = fc.measure({"cpu_aot_jump_tables": "pass"})["x64_zen2"]
-    skipped = fc.measure({"cpu_aot_jump_tables": "skip"})["x64_zen2"]
-    assert passed["covered"] == len(switch) == 18
-    assert skipped["covered"] == 0 and skipped["blocked_by_skip"] == sorted(f"Integer {m}" for m in switch)
-    # Next to a passing fixture, the skipped run still adds nothing: only branch.asm's forms count.
-    branch = fc.masm_mnemonics((fc.ROOT / "tests/cpu/branch.asm").read_text(encoding="utf-8"))
-    mixed = fc.measure({"cpu_aot_jump_tables": "skip", "cpu_leaf_aot_branches": "pass"})["x64_zen2"]
-    assert mixed["covered"] == len(branch)
-    assert mixed["blocked_by_skip"] == sorted(f"Integer {m}" for m in switch - branch)
+    """switch.asm (#86): a skipped cpu_aot_jump_tables run contributes zero covered forms."""
+    switch = fc.masm_mnemonics(SWITCH)
+    assert switch == {"cmp", "ja", "lea", "movsxd", "add", "jmp", "neg", "ret"}, sorted(switch)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"switch": SWITCH, "branch": BRANCH})
+        passed = fc.measure({"cpu_aot_jump_tables": "pass"}, root)["x64_zen2"]
+        skipped = fc.measure({"cpu_aot_jump_tables": "skip"}, root)["x64_zen2"]
+        assert passed["covered"] == len(switch) == 8
+        assert skipped["covered"] == 0 and skipped["blocked_by_skip"] == sorted(f"Integer {m}" for m in switch)
+        # Next to a passing fixture, the skipped run still adds nothing: only branch.asm's forms count.
+        mixed = fc.measure({"cpu_aot_jump_tables": "skip", "cpu_leaf_aot_branches": "pass"}, root)["x64_zen2"]
+        assert mixed["covered"] == len(fc.masm_mnemonics(BRANCH)) == 8
+        assert mixed["blocked_by_skip"] == sorted(f"Integer {m}" for m in switch - fc.masm_mnemonics(BRANCH))
+
+
+def check_unclassified():
+    """A fixture missing from CPU_FIXTURES / SHADER_FIXTURES is reported, never counted, never fatal."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"branch": BRANCH, "added_later": "f PROC\n    xor eax, eax\n    ret\nf ENDP\nEND\n"},
+                           {"added_later_check.py": 'P = "s_mov_b32 s0, 0\\ns_endpgm"\n'})
+        every_test_passed = {"cpu_leaf_aot_branches": "pass", "added_later": "pass", "added_later_check": "pass"}
+        m = fc.measure(every_test_passed, root)
+        assert m["unclassified"] == ["added_later.asm", "added_later_check.py"], m["unclassified"]
+        assert m["x64_zen2"]["covered"] == 8  # branch.asm only; xor stays uncovered
+        assert ("Integer", "xor") in fc.x64_forms({"xor"}, fc.load_reference("x64_zen2.tsv"))
+        assert m["gfx1013"]["covered"] == 0 and m["gfx1013"]["blocked_by_skip"] == []
+        assert "Not counted until classified" in fc.report(m) and "added_later.asm" in fc.report(m)
+        assert "Not counted" not in fc.report(fc.measure(every_test_passed, sample_repo(tmp + "/b", {"branch": BRANCH})))
 
 
 def check_parsing():
@@ -97,7 +162,7 @@ def check_parsing():
     assert fc.masm_mnemonics(asm) == {"jae", "jne", "mov", "ud2", "ret"}
     source = 'p = ["s_mov_b32 m0, s24", "exp mrt0 v1", "not asm"]\nq = "image_sample v[0:3]\\ns_endpgm"'
     assert fc.gfx_mnemonics(source) == {"s_mov_b32", "exp", "image_sample", "s_endpgm"}
-    # Every repository fixture is classified, and the report never calls coverage completion.
+    # The real repository measures without error, and the report never calls coverage completion.
     full = fc.measure({})
     assert "not a measure of port completion" in fc.report(full)
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
@@ -107,5 +172,6 @@ if __name__ == "__main__":
     check_denominators()
     check_example()
     check_jump_tables()
+    check_unclassified()
     check_parsing()
     print("form coverage checks passed")

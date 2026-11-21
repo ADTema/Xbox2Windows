@@ -11,6 +11,8 @@ covering a form in one fixture does not prove every operand variant or any title
 Rules:
 - A fixture's forms are covered only when its test passed. A skipped or failed test (or one that is
   not registered) leaves them uncovered; forms held back only by a skip are listed separately.
+- A fixture not yet listed in CPU_FIXTURES or SHADER_FIXTURES is never counted. It is reported as
+  unclassified so it can be added, without failing the run.
 - Reference lists (denominators) live in docs/coverage/ and are produced by tools/form_reference.py.
 Python standard library only.
 """
@@ -26,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / "docs" / "coverage"
 
 # The test that proves each CPU fixture was translated. Fixtures that run unchanged (not translated)
-# map to None: their forms are known but never covered. A new .asm must be classified here.
+# map to None: their forms are known but never covered. An unlisted .asm is reported as unclassified.
 CPU_FIXTURES = {
     "branch": "cpu_leaf_aot_branches",
     "direct": "cpu_aot_direct_call",
@@ -37,6 +39,7 @@ CPU_FIXTURES = {
     "bink_heap": "cpu_aot_bink_heap",
     "heap_layout": "cpu_aot_heap_layout",
     "version_query": "cpu_aot_version_query",
+    "bink_descriptors": "cpu_bink_descriptors",
     "switch": "cpu_aot_jump_tables",
     "register_probe": None,  # measurement harness
     "two_imports": None,     # mapped and run unchanged by pe_map
@@ -46,11 +49,12 @@ CPU_FIXTURES = {
 }
 # Python files under tests/ whose strings contain gfx1013 assembly, and the CTest tests that translate
 # and draw them. () means a fixture with no CTest test (ffx_dispatch_aot_check.py needs LLVM 15 and runs
-# only in the Linux CI job); None means the strings are not fixtures. New files must be classified here.
+# only in the Linux CI job); None means the strings are not fixtures. Unlisted files are reported as unclassified.
 SHADER_FIXTURES = {
     "pixel_aot_check.py": ("pixel_aot_warp", "pixel_aot_hardware"),
     "ffx_dispatch_aot_check.py": (),
     "form_coverage_check.py": None,  # this tool's own test data
+    "rdna2_tools_check.py": None,    # disassembler and scanner inputs, not translated
 }
 
 MASM_DIRECTIVES = {"ifdef", "ifndef", "if", "else", "elseif", "endif", "end", "public", "extern",
@@ -142,27 +146,30 @@ def summarize(reference, fixtures, select):
             "fixture_forms_not_in_reference": unmatched}
 
 
-def measure(results):
+def measure(results, root=ROOT):
+    """root: the repository whose tests/ are scanned (the check passes a temporary one)."""
     cpu = {}
-    for asm in sorted((ROOT / "tests" / "cpu").glob("*.asm")):
+    for asm in sorted((root / "tests" / "cpu").glob("*.asm")):
         if asm.stem not in CPU_FIXTURES:
-            raise SystemExit(f"Classify the new CPU fixture {asm.name} in CPU_FIXTURES")
-        test = CPU_FIXTURES[asm.stem]
-        status = fixture_status(results, [test]) if test else "not translated"
+            status = "unclassified"
+        else:
+            test = CPU_FIXTURES[asm.stem]
+            status = fixture_status(results, [test]) if test else "not translated"
         cpu[asm.name] = (masm_mnemonics(asm.read_text(encoding="utf-8")), status)
     shaders = {}
-    for py in sorted((ROOT / "tests").glob("*.py")):
+    for py in sorted((root / "tests").glob("*.py")):
         if found := gfx_mnemonics(py.read_text(encoding="utf-8")):
             if py.name not in SHADER_FIXTURES:
-                raise SystemExit(f"Classify {py.name}, which contains gfx1013 assembly, in SHADER_FIXTURES")
-            tests = SHADER_FIXTURES[py.name]
-            if tests is not None:
+                shaders[py.name] = (found, "unclassified")
+            elif (tests := SHADER_FIXTURES[py.name]) is not None:
                 shaders[py.name] = (found, fixture_status(results, tests) if tests else "no CTest test")
     x64 = load_reference("x64_zen2.tsv")
+    fixtures = {name: status for name, (_, status) in {**cpu, **shaders}.items()}
     return {
         "note": "Instruction-form coverage of source-built fixtures; not a measure of port completion.",
         "tests": {s: sum(v == s for v in results.values()) for s in ("pass", "fail", "skip")},
-        "fixtures": {name: status for name, (_, status) in {**cpu, **shaders}.items()},
+        "fixtures": fixtures,
+        "unclassified": sorted(name for name, status in fixtures.items() if status == "unclassified"),
         "x64_zen2": summarize(x64, cpu, x64_forms),
         "gfx1013": summarize(load_reference("gfx1013.tsv"), shaders, gfx_forms),
         "gfx1030": summarize(load_reference("rdna2.tsv"), shaders, gfx_forms),
@@ -177,6 +184,8 @@ def report(m):
         r = m[key]
         lines.append(f"{label}: {r['covered']} of {r['total']} covered "
                      f"({r['known_in_fixtures']} appear in fixtures; {len(r['blocked_by_skip'])} held back by skips)")
+    if m["unclassified"]:
+        lines += ["", "Not counted until classified in tools/form_coverage.py: " + ", ".join(m["unclassified"])]
     return "\n".join(lines)
 
 
