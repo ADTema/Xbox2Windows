@@ -200,8 +200,9 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
 
     const auto& imports = directory(nt, IMAGE_DIRECTORY_ENTRY_IMPORT);
     if (imports.Size) {
-        if (!resolve) return release(fail(MAP_UNRESOLVED_IMPORT, "imports present without a resolver"));
         const auto descriptors = imports.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        if (!descriptors) return release(fail(MAP_FORMAT, "import directory smaller than one descriptor"));
+        if (!resolve) return release(fail(MAP_UNRESOLVED_IMPORT, "imports present without a resolver"));
         const auto* desc = image.at<IMAGE_IMPORT_DESCRIPTOR>(imports.VirtualAddress, descriptors);
         if (!desc) return release(fail(MAP_FORMAT, "import directory outside image"));
         for (std::uint64_t d = 0; d < descriptors && desc[d].Name; ++d) {
@@ -273,7 +274,8 @@ extern "C" __declspec(dllexport) void* pe_map_export(void* mapped, const char* n
         const DWORD rva = functions[ordinals[i]];
         // Forwarded exports point back into the export directory; they are not code here.
         if (rva >= exports.VirtualAddress && rva - exports.VirtualAddress < exports.Size) return nullptr;
-        return rva < image.size ? image.base + rva : nullptr;
+        // An empty slot (RVA 0) names no code; returning the image base would be wrong.
+        return rva && rva < image.size ? image.base + rva : nullptr;
     }
     return nullptr;
 }

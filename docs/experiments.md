@@ -303,13 +303,13 @@ cmake --build --preset dev --target pe_map cpu_reloc_original cpu_import_origina
 ctest --preset dev --no-tests=error -R '^cpu_native_map$' -V
 ```
 
-The test maps the named and ordinal import fixtures and `reloc_route`. In `reloc_route`, `call_mix` reaches the provider through an absolute code pointer in `.data`, which gives the image exactly one DIR64 relocation; the test checks that the mapped pointer equals its linked value plus the load delta. The two import fixtures have no relocation entries. For every image the test checks the following:
+The test maps the named and ordinal import fixtures, `reloc_route` and a damaged copy of the register probe. In `reloc_route`, `call_mix` reaches the provider through an absolute code pointer in `.data`, which gives the image exactly one DIR64 relocation; the test checks that the mapped pointer equals its linked value plus the load delta. The two import fixtures have no relocation entries. For every image the test checks the following:
 
 - the base differs from the preferred base and is recorded in the mapped headers;
 - the IAT slot holds the export the resolver returned;
 - `RtlLookupFunctionEntry` finds `call_mix` in the registered table until the image is released.
 
-The mapped `call_mix` is compared over 249 input pairs on arguments, guarded writes, RBX/RSI sentinels and return value. It matches the reference and the same image loaded by Windows, and for the import fixtures it also matches the lifted DLL. If the import is bound to the altered provider instead of the linked one, only the return changes. An unbound import is rejected with its DLL and symbol or ordinal. Copies patched to have an entry point, or an import directory that runs past the image, are rejected before any import is requested. SEH through a mapped image, TLS callbacks and entry-point calls remain open.
+The mapped `call_mix` is compared over 249 input pairs on arguments, guarded writes, RBX/RSI sentinels and return value. It matches the reference and the same image loaded by Windows, and for the import fixtures it also matches the lifted DLL. If the import is bound to the altered provider instead of the linked one, only the return changes. An unbound import is rejected with its DLL and symbol or ordinal. Copies patched to have an entry point, an import directory that runs past the image or one smaller than a single descriptor are rejected before any import is requested. In a copy of the register probe with the `clobber_control` export address slot zeroed, that name no longer resolves while `probe` still does. SEH through a mapped image, TLS callbacks and entry-point calls remain open.
 
 ## Offline pixel shader recompilation
 

@@ -123,11 +123,16 @@ def check_rejections(mapper, image, provider, symbol):
         raise AssertionError(f"unbound import: {base=} {status=} {detail=}")
     with pefile.PE(str(image)) as pe:
         entry = pe.OPTIONAL_HEADER.get_field_absolute_offset("AddressOfEntryPoint")
-        imports = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1].get_field_absolute_offset("VirtualAddress")
+        imports = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1]
+        address = imports.get_field_absolute_offset("VirtualAddress")
+        length = imports.get_field_absolute_offset("Size")
         size = pe.OPTIONAL_HEADER.SizeOfImage
     bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
-    for field, value, expected, message in ((entry, 0x1000, "unsupported", "entry point"),
-                                            (imports, size - 4, "format", "import directory outside image")):
+    descriptor = 20  # sizeof(IMAGE_IMPORT_DESCRIPTOR)
+    for field, value, expected, message in (
+            (entry, 0x1000, "unsupported", "entry point"),
+            (address, size - 4, "format", "import directory outside image"),
+            (length, descriptor - 1, "format", "import directory smaller than one descriptor")):
         data = bytearray(image.read_bytes())
         struct.pack_into("<I", data, field, value)
         with TemporaryDirectory() as temp:
@@ -136,7 +141,33 @@ def check_rejections(mapper, image, provider, symbol):
             base, status, detail, requests = mapper(damaged, bindings)
         if base or status != STATUS[expected] or detail != message or requests:
             raise AssertionError(f"{message} control: {base=} {status=} {detail=} {requests=}")
-    print(f"{image.name}: rejected unbound {identity}, an entry point and an import directory outside the image")
+    print(f"{image.name}: rejected unbound {identity}, an entry point, an import directory outside the image "
+          "and one smaller than a descriptor")
+
+
+def check_empty_export_slot(mapper, image):
+    """Zero one export address table slot: its name must no longer resolve, the other export still must."""
+    with pefile.PE(str(image)) as pe:
+        exports = pe.DIRECTORY_ENTRY_EXPORT
+        table = exports.struct.AddressOfFunctions
+        by_name = {e.name.decode(): e for e in exports.symbols if e.name}
+        slot = pe.get_offset_from_rva(table + 4 * (by_name["clobber_control"].ordinal - exports.struct.Base))
+        kept = by_name["probe"].address
+    data = bytearray(image.read_bytes())
+    struct.pack_into("<I", data, slot, 0)
+    with TemporaryDirectory() as temp:
+        damaged = Path(temp) / image.name
+        damaged.write_bytes(data)
+        base, status, detail, requests = mapper(damaged, {})
+    if not base or status != STATUS["ok"] or requests:
+        raise AssertionError(f"empty export slot image: {base=} {status=} {detail=} {requests=}")
+    try:
+        empty, valid = mapper.export(base, b"clobber_control"), mapper.export(base, b"probe")
+    finally:
+        mapper.release(base)
+    if empty is not None or valid != base + kept:
+        raise AssertionError(f"export lookup: empty slot gave {empty}, valid export gave {valid}")
+    print(f"{image.name}: empty export slot returns null, probe still resolves")
 
 
 def main():
@@ -151,6 +182,7 @@ def main():
     args = parser.parse_args()
     mapper = Mapper(args.mapper)
     probe = register_probe(str(args.probe))
+    check_empty_export_slot(mapper, args.probe)
     for case, paths, symbol in (("named", args.named, "mix_args"), ("ordinal", args.ordinal, 77)):
         original, lifted, provider, altered = paths
         natives = [("native LoadLibrary", ctypes.CDLL(str(original)).call_mix),
