@@ -8,3 +8,9 @@ Each of 64 lanes starts at (lane%8,lane/8). Source texel ID = 8*y+x.
 Reference uses signed CPU coordinates and zero for out-of-bounds reads.
 Only the RCAS coordinate/load fragment is exercised; test bindings target D3D11 SM5.
 The last case must fail the left-neighbor oracle.
+
+Windows CI builds the D3D11 host and runs both controls using the synthetic
+instruction encoding included alongside its assembly. Reproduce from the root:
+  cmake --build --preset dev --target rcas_coordinate_readback
+  ctest --preset dev --no-tests=error -R "^rcas_coordinate_(positive|negative)_warp$" -V
+The optional LLVM command above independently assembles and decodes the input.
