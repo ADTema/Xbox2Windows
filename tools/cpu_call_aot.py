@@ -51,8 +51,8 @@ def lift_body(start, code, *, caller, bind_import=None):
         is_call = via_iat or body[pos] == 0xe8
         r8_move = r8_register_move(body, pos)
         if is_call:
-            # Repeated direct calls must share one target, so one callee is lifted.
-            if not caller or via_iat and target is not None:
+            # Repeated calls must share one target, so one callee or import is bound.
+            if not caller:
                 raise ValueError(f"unexpected additional call at RVA {rva:#x}")
             length = 6 if via_iat else 5
             if pos + length > len(body):
@@ -61,8 +61,13 @@ def lift_body(start, code, *, caller, bind_import=None):
             if via_iat:
                 if bind_import is None:
                     raise ValueError(f"no provider binding for IAT slot RVA {address:#x}")
-                name = bind_import(address)
-                target = ("import", name)
+                if target is not None:
+                    if target[0] != "import" or target[1] != address:
+                        raise ValueError(f"call to a second target at RVA {rva:#x}")
+                    name = target[2]
+                else:
+                    name = bind_import(address)
+                    target = ("import", address, name)
                 callee = f"::{name}"
             else:
                 if target is not None and target != ("direct", address):
@@ -185,10 +190,12 @@ def translate(image, entry, binding=None, link_name=None):
         def bind_import(slot):
             return resolve_import(pe, slot, Path(binding[0]), binding[1], link_name)
 
-        caller, (kind, target) = lift_body(start, code, caller=True, bind_import=bind_import if binding else None)
+        caller, target_info = lift_body(start, code, caller=True, bind_import=bind_import if binding else None)
+        kind = target_info[0]
         if kind == "import":
-            callee = f'extern "C" __declspec(dllimport) word {target}(word, word, word*);'
+            callee = f'extern "C" __declspec(dllimport) word {target_info[2]}(word, word, word*);'
         else:
+            target = target_info[1]
             if binding:
                 raise ValueError("provider binding supplied for a direct call")
             callee_code = bounded_code(pe, target)
