@@ -33,7 +33,10 @@ def load_case(case, native, lifted, probe_path):
     # A fresh process per provider configuration avoids Windows' loaded-module cache.
     expected_error = {"missing": 126, "wrong-export": 127}.get(case)
     if expected_error:
-        load = ctypes.WinDLL("kernel32", use_last_error=True).LoadLibraryExW
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        # This disposable child must return loader errors even on interactive runners.
+        kernel.SetErrorMode(kernel.GetErrorMode() | 0x0001)  # SEM_FAILCRITICALERRORS
+        load = kernel.LoadLibraryExW
         load.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
         load.restype = ctypes.c_void_p
         for path in (native, lifted):
@@ -80,7 +83,7 @@ def check(native, lifted, provider, altered, probe):
             if implementation:
                 shutil.copy2(implementation, bound)
             subprocess.run([sys.executable, "-B", __file__, "--load", case, str(source), str(compiled),
-                            str(probe)], cwd=folder, check=True)
+                            str(probe)], cwd=folder, check=True, timeout=45)
             identity = f"{provider.name}!mix_args"
             if case == "missing":
                 reject(source, bound, f"missing provider for {identity}")
