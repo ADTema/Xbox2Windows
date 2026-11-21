@@ -19,7 +19,17 @@ PLAIN2_EXPORTS = ("shrx32", "shrx64", "sarx32", "sarx64", "pdep32", "pdep64", "p
 
 
 def emit(image, output):
-    parts = [INTEGER_HEADER]
+    parts = [
+        "#include <intrin.h>\n",
+        INTEGER_HEADER,
+        'extern "C" __declspec(dllexport) int host_has_bmi2() {\n'
+        "    int regs[4]{};\n"
+        "    __cpuid(regs, 0);\n"
+        "    if (regs[0] < 7) return 0;\n"
+        "    __cpuidex(regs, 7, 0);\n"
+        "    return (regs[1] & (1 << 8)) != 0;\n"
+        "}\n",
+    ]
     with pefile.PE(str(image), fast_load=True) as pe:
         for name in OUT2_EXPORTS:
             (bounds,) = function_ranges(pe, export_rva(pe, name))
@@ -120,7 +130,12 @@ def ref_mulx(a, b, bits):
 
 
 def check(native_path, lifted_path):
-    native, lifted = load_lib(native_path), load_lib(lifted_path)
+    lifted = load_lib(lifted_path)
+    lifted.host_has_bmi2.argtypes, lifted.host_has_bmi2.restype = [], ctypes.c_int
+    if not lifted.host_has_bmi2():
+        print("Host CPU lacks BMI2 (CPUID leaf 7 EBX bit 8); skipping native differential check.")
+        sys.exit(77)
+    native = load_lib(native_path)
     slot = U64(0)
     values = (
         0, 1, 2, 0x55aa55aa, 0x7fffffff, 0x80000000, 0xffffffff,
