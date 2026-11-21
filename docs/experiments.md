@@ -754,6 +754,8 @@ The tail check uses one logical texture per draw. It uploads all supplied consec
 
 To check a proposed first read round in the BCPack probe, append `--prefetch-mask MASK`. Set bit *i* for each of the first eight lanes expected to read a byte in that round. The probe uses the proposed lane order to locate the byte and compares it with the last byte emitted by the reverse encoder. A matching first byte tests a single refill prediction. Later refill positions and the assignment of BC7 block fields require separate evidence.
 
+The default header layout is interleaved at an eight-byte stride. Pass `--lane-stride 6` to read eight contiguous six-byte records, as proposed for BC7 BCPack streams in [#15](https://github.com/R0Y00/Xbox2Windows/issues/15). `--scan-lanes` prints each lane's mode, budget and state bytes without claiming a decode. The option changes only how the 48-byte header is read; the constant-lane model, the variable BC7 lane models and an independently known BC7 block remain separate questions.
+
 The optional capture contains verified, top-down RGBA8 pixels converted from the GPU readback. The mip test binds both levels in one texture and renders to a half-size target so implicit derivatives select the lower mip. An original mode-6 fixture varies endpoints by block and indices by texel. The negative control shifts only the lower level's compressed blocks and requires a pixel mismatch. [Microsoft BC7 mode reference](https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc7-format-mode-reference)
 
 ### Reading logical ranges and probing structured resources
