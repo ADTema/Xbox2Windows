@@ -1,12 +1,12 @@
 # Xbox2Windows
 
-Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) software for x64 Windows**, using Grand Theft Auto VI as its case study. The CPU experiments translate source-built x64 functions from PE machine code through C++ to new Windows DLLs, including a direct call and cross-DLL imports by name and ordinal. The shader experiment translates selected gfx1013 pixel shaders through HLSL to desktop DXIL. Other experiments test the Windows runtime, render recovered texture levels and read script state data. Title CPU code execution, full-game startup and frame rate remain unverified.
+Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) software for x64 Windows**. The CPU experiments translate source-built x64 functions from PE machine code through C++ to new Windows DLLs, including a direct call and cross-DLL imports by name and ordinal. The shader experiment translates selected gfx1013 pixel shaders through HLSL to desktop DXIL. Other experiments test the Windows runtime, render recovered texture levels and read script state data. Title CPU code execution, full-game startup and frame rate remain unverified.
 
 ## Current results and open work
 
 | Area | Result on Windows | Open question or contribution |
 |---|---|---|
-| FidelityFX upscaler | The recompiled provider creates 11 resources at 720p → 1080p and a twelfth with the debug flag. On RTX 4060 Laptop and WARP, both the per-resource indices and the returned loader and provider handles passed. The RCAS intermediate matched CPU readback for 1,024 HDR colors on both adapters. [RCAS format test](docs/experiments.md#rcas-intermediate-texel-access) · [Provider loop and desktop mappings](docs/experiments.md#provider-resource-loop-and-returned-handles) · [Recurrent texture pixel readback](docs/experiments.md#recurrent-texture-views-and-pixel-readback) | Trace the package shader that consumes RCAS resource ID 16 and identify its texture access. |
+| FidelityFX upscaler | The recompiled provider creates 11 resources at 720p → 1080p and a twelfth with the debug flag. On RTX 4060 Laptop and WARP, both the per-resource indices and the returned loader and provider handles passed. Recompiled graph pass 26 wrote the RCAS intermediate and the recompiled RCAS shader read it with five integer texel loads per output. Both adapters passed a 256-pixel comparison. [Dispatch trace and replay](docs/experiments.md#fsr4-dispatch-through-the-rcas-input) · [RCAS format test](docs/experiments.md#rcas-intermediate-texel-access) · [Provider loop and desktop mappings](docs/experiments.md#provider-resource-loop-and-returned-handles) · [Recurrent texture pixel readback](docs/experiments.md#recurrent-texture-views-and-pixel-readback) | Exercise the full-wave LDS path of pass 26 with a larger tile and nonzero scratch from an earlier graph job. |
 | x64 context callbacks | The recompiled FidelityFX loader destroy function calls the bound provider and preserves its 32-bit result across both cleanup paths on Windows. The upscaler slot was identified in the local package. [Provider and Windows comparison](docs/experiments.md#fidelityfx-destroy-provider-and-cleanup) | Verify the upscaler's internal effect teardown with a successfully created graphics context. |
 | CPU translation | A [leaf function](docs/experiments.md#offline-cpu-leaf-recompilation), a [direct call](docs/experiments.md#recompiling-a-direct-x64-call) and cross-DLL imports [by name](docs/experiments.md#calling-another-dll-through-a-named-pe-import) and [by ordinal](docs/experiments.md#calling-an-ordinal-only-export) match the original fixtures on Windows. The import fixtures and a relocated variant also run from an image [mapped without LoadLibrary](docs/experiments.md#mapping-an-image-without-loadlibrary), with imports bound through a host resolver. | Establish the argument and result contract at a package import call site. |
 | Shader translation | Supported pixel programs sample a texture, read constants and export color. D3D12 readback is checked against a CPU reference. [Translation and bindings](docs/experiments.md#offline-pixel-shader-recompilation) | Supply a source-built instruction case with known register inputs and an expected color. |
@@ -32,7 +32,7 @@ Review `gpu-report-hardware.md` and paste it in the [hardware coverage thread (#
 |---|---:|---|---|---|
 | NVIDIA GeForce RTX 2060 | 32 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
 | NVIDIA GeForce RTX 3070 (driver 32.0.16.1088) | 32 | Skipped, lane range 32–32 | 408 queries passed | [RTX 3070 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063566753) |
-| NVIDIA GeForce RTX 4060 Laptop GPU | 32 | Skipped | 408 queries passed | [Second maintainer workstation](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7058907095) |
+| NVIDIA GeForce RTX 4060 Laptop GPU | 32 | Skipped | 408 queries passed | [Second maintainer workstation](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7058907095) · [Independent Windows run, driver 32.0.16.2124](https://github.com/R0Y00/Xbox2Windows/issues/60) |
 | NVIDIA GeForce RTX 5070 | 32 on both drivers | Skipped on both, lane range 32–32 | 408 queries passed per run | [32.0.16.1692, debug layer unavailable](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063361337) · [32.0.16.2135 retest, debug layer enabled](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063626309) |
 | AMD Radeon RX 6600 (driver 32.0.21045.16010) | 32 | Passed, 64 lanes | 408 queries passed | [RX 6600 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063312495) · [32.0.11037.4004 retest](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063794169) |
 | AMD Radeon RX 6750 XT (driver 32.0.21045.29003) | 32 | Passed, 64 lanes | 408 queries passed | [RX 6750 XT report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7062253227) |
@@ -46,6 +46,9 @@ Review `gpu-report-hardware.md` and paste it in the [hardware coverage thread (#
 | AMD Radeon RX 9060 XT (driver 32.0.32029.2010) | 64 | Passed, 64 lanes | 408 queries passed | [Hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064143537) |
 | NVIDIA GeForce RTX 4060 (driver 32.0.16.1088) | 32 | Skipped, lane range 32–32 | 408 queries passed | [Hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064173447) |
 | NVIDIA GeForce RTX 4050 Laptop GPU (driver 32.0.16.1088) | 32 | Skipped, lane range 32–32 | 408 queries passed | [Hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064193927) |
+| NVIDIA GeForce RTX 2060 SUPER (driver 32.0.16.2124) | 32 | Skipped, lane range 32–32 | 408 queries passed | [Windows hardware report](https://github.com/R0Y00/Xbox2Windows/issues/57) |
+| NVIDIA GeForce RTX 3060 (driver 32.0.16.2124) | 32 | Skipped, lane range 32–32 | 408 queries passed | [Windows hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064352679) |
+| Intel Arc B570 (driver 32.0.101.9175) | 32 | Skipped, lane range 16–32 | 408 queries passed | [Windows hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064376175) |
 | Microsoft WARP (software) | 4 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
 
 On CachyOS, an RTX 3060 completed 408 comparisons through Proton and vkd3d-proton with NVIDIA driver 620.70.06. The adapter reported a 32-lane maximum and skipped forced wave64. [Linux translation-layer report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064204388)
@@ -92,7 +95,7 @@ An independent contributor passed all three smoke tests from a clean checkout of
 
 For task ownership, evidence requirements and PR review, see the [contribution guide](CONTRIBUTING.md). [Open an issue](https://github.com/R0Y00/Xbox2Windows/issues/new/choose) · [Community conduct](CODE_OF_CONDUCT.md) · [Private security reports](SECURITY.md)
 
-## GTA VI case study and provenance
+## Case study and provenance
 
 The installation metadata inspected for this case study lists a Scarlett executable. The main executable was absent from the inspected files. The public regression suite uses source-built fixtures and independently built shaders. [Intake methods and evidence](docs/experiments.md#static-executable-intake)
 

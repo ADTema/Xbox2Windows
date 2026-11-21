@@ -125,6 +125,13 @@ def check_controls(directory):
         archive.write_bytes(invalid)
         must_reject(native_program, archive, "fixture")
 
+    # LLVM 15 prints "exp mrt0 v16, ..."; newer LLVM prints "exp mrt0, v16, ...".
+    for program in (assembly(False), assembly(True), curve()):
+        modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
+        assert modern != program
+        assert translate(modern) == translate(program)
+        must_reject(translate, [line.replace("exp mrt0 ", "exp mrt0,, ") for line in program])
+
     program = assembly(False)
     for old, new in (("s_mov_b32 s21, 0", "s_mov_b32 s21, 1"),
                      ("s_mov_b32 s40, 1", "s_mov_b32 s40, 8"),
