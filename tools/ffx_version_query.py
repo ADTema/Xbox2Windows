@@ -194,28 +194,34 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
               and (i.op1_kind == K.IMMEDIATE8 or i.op1_register == R.CL)):
             size = RegisterExt.size(i.op0_register)
             width, bits = UINT[size], 8 * size
-            count_expr = f"{i.immediate(1) & (bits - 1)}u" if i.op1_kind == K.IMMEDIATE8 else f"static_cast<unsigned>(rcx) & {bits - 1}u"
-            if op == M.ROL:
-                stmt = (f"{{ const {width} a = {operand(0)}; const unsigned c = {count_expr}; "
-                        f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a << c) | (a >> ({bits}u - c))); "
-                        f"carry = (v & 1u) != 0; }} {write('v')} }}")
-            else:  # M.ROR
-                stmt = (f"{{ const {width} a = {operand(0)}; const unsigned c = {count_expr}; "
-                        f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a >> c) | (a << ({bits}u - c))); "
-                        f"carry = ((v >> {bits - 1}u) & 1u) != 0; }} {write('v')} }}")
+            if i.op1_kind == K.IMMEDIATE8 and (i.immediate(1) & (bits - 1)) == 0:
+                stmt = write(operand(0))
+            else:
+                count_expr = f"{i.immediate(1) & (bits - 1)}u" if i.op1_kind == K.IMMEDIATE8 else f"static_cast<unsigned>(rcx) & {bits - 1}u"
+                if op == M.ROL:
+                    stmt = (f"{{ const {width} a = {operand(0)}; const unsigned c = {count_expr}; "
+                            f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a << c) | (a >> ({bits}u - c))); "
+                            f"carry = (v & 1u) != 0; }} {write('v')} }}")
+                else:  # M.ROR
+                    stmt = (f"{{ const {width} a = {operand(0)}; const unsigned c = {count_expr}; "
+                            f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a >> c) | (a << ({bits}u - c))); "
+                            f"carry = ((v >> {bits - 1}u) & 1u) != 0; }} {write('v')} }}")
         elif (op in (M.SHLD, M.SHRD) and i.op0_kind == K.REGISTER and RegisterExt.size(i.op0_register) in (4, 8)
               and (i.op2_kind == K.IMMEDIATE8 or i.op2_register == R.CL)):
             size = RegisterExt.size(i.op0_register)
             width, bits = UINT[size], 8 * size
-            count_expr = f"{i.immediate(2) & (bits - 1)}u" if i.op2_kind == K.IMMEDIATE8 else f"static_cast<unsigned>(rcx) & {bits - 1}u"
-            if op == M.SHLD:
-                stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}; const unsigned c = {count_expr}; "
-                        f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a << c) | (b >> ({bits}u - c))); "
-                        f"carry = ((a >> ({bits}u - c)) & 1u) != 0; zero = v == 0; }} {write('v')} }}")
-            else:  # M.SHRD
-                stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}; const unsigned c = {count_expr}; "
-                        f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a >> c) | (b << ({bits}u - c))); "
-                        f"carry = ((a >> (c - 1u)) & 1u) != 0; zero = v == 0; }} {write('v')} }}")
+            if i.op2_kind == K.IMMEDIATE8 and (i.immediate(2) & (bits - 1)) == 0:
+                stmt = write(operand(0))
+            else:
+                count_expr = f"{i.immediate(2) & (bits - 1)}u" if i.op2_kind == K.IMMEDIATE8 else f"static_cast<unsigned>(rcx) & {bits - 1}u"
+                if op == M.SHLD:
+                    stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}; const unsigned c = {count_expr}; "
+                            f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a << c) | (b >> ({bits}u - c))); "
+                            f"carry = ((a >> ({bits}u - c)) & 1u) != 0; zero = v == 0; }} {write('v')} }}")
+                else:  # M.SHRD
+                    stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}; const unsigned c = {count_expr}; "
+                            f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a >> c) | (b << ({bits}u - c))); "
+                            f"carry = ((a >> (c - 1u)) & 1u) != 0; zero = v == 0; }} {write('v')} }}")
         elif op in (M.VMOVQ, M.VMOVSD, M.VMOVHPD) and has_wide:
             lanes = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
             if i.op1_kind == K.MEMORY and op != M.VMOVHPD:
