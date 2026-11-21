@@ -46,14 +46,14 @@ def dual_program():
     program.insert(pos, "image_sample v[20:23], v[8:9], s[56:63], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D")
     ops = []
     for i in range(4):
-        ops.extend([f"v_mul_legacy_f32_e32 v{12+i}, 0.75, v{12+i}",
-                    f"v_fma_f32 v{12+i}, 0.25, v{20+i}, v{12+i}"])
+        ops.extend([f"v_mul_legacy_f32_e32 v{12+i}, 0x3f400000, v{12+i}",
+                    f"v_fma_f32 v{12+i}, 0x3e800000, v{20+i}, v{12+i}"])
     program[pos+2:pos+2] = ops
     return program
 
 
-def dual_source():
-    return lower(dual_program(), 20, 24, [1, 2, 3, 4], second_texture_offset=32)
+def translate_dual(instructions):
+    return lower(instructions, 20, 24, [1, 2, 3, 4], second_texture_offset=32)
 
 
 def envelope(code, name=b"fixture"):
@@ -165,7 +165,7 @@ def check_controls(directory):
 
 
 def check_binary(directory, assembler, objcopy, library):
-    for instructions in (assembly(False), assembly(True), curve()):
+    for instructions, lower_fixture in ((assembly(False), translate), (assembly(True), translate), (curve(), translate), (dual_program(), translate_dual)):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
         binary = directory / "fixture.bin"
@@ -177,7 +177,7 @@ def check_binary(directory, assembler, objcopy, library):
         archive.write_bytes(envelope(binary.read_bytes()))
         _, native = native_program(archive, "fixture")
         assert native == binary.read_bytes()
-        assert translate(disassemble(native, library)) == translate(instructions)
+        assert lower_fixture(disassemble(native, library)) == lower_fixture(instructions)
 
 
 def check_render(directory, compiler, renderer, backend):
@@ -206,7 +206,7 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Stale reference accepted after changing the bound constants")
-    source.write_text(dual_source(), encoding="ascii")
+    source.write_text(translate_dual(dual_program()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     capture = directory / "blend.rgba"
     subprocess.run([renderer, backend, "--dual-pixel", shader, capture], check=True)
