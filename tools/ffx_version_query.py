@@ -163,6 +163,33 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                       M.INC: "", M.DEC: "", M.XOR: "carry = false;", M.AND: "carry = false;", M.OR: "carry = false;"}[op]
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
+        elif op in (M.ANDN, M.BEXTR, M.BLSI, M.BLSMSK, M.BLSR, M.TZCNT) and RegisterExt.size(i.op0_register) in (4, 8):
+            size = RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            if op == M.ANDN:
+                stmt = (f"{{ const {width} v = static_cast<{width}>(~static_cast<{width}>({operand(1)}) "
+                        f"& static_cast<{width}>({operand(2)})); carry = false; zero = v == 0; {write('v')} }}")
+            elif op == M.BEXTR:
+                stmt = (f"{{ const {width} a = {operand(1)}, ctrl = {operand(2)}; "
+                        f"const unsigned start = static_cast<unsigned>(ctrl & 0xffu), "
+                        f"len = static_cast<unsigned>((ctrl >> 8) & 0xffu); "
+                        f"{width} v = 0; if (start < {bits}u && len > 0u) {{ "
+                        f"const {width} s = a >> start; "
+                        f"v = len >= {bits}u ? s : static_cast<{width}>(s & ((static_cast<{width}>(1) << len) - 1)); }} "
+                        f"carry = false; zero = v == 0; {write('v')} }}")
+            elif op == M.BLSI:
+                stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a & (static_cast<{width}>(0) - a)); "
+                        f"carry = a != 0; zero = v == 0; {write('v')} }}")
+            elif op == M.BLSMSK:
+                stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a ^ (a - 1)); "
+                        f"carry = a == 0; zero = false; {write('v')} }}")
+            elif op == M.BLSR:
+                stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a & (a - 1)); "
+                        f"carry = a == 0; zero = v == 0; {write('v')} }}")
+            else:  # M.TZCNT
+                stmt = (f"{{ const {width} a = {operand(1)}; {width} v = 0; "
+                        f"if (a == 0) {{ v = {bits}; }} else {{ while (((a >> v) & 1) == 0) ++v; }} "
+                        f"carry = a == 0; zero = v == 0; {write('v')} }}")
         elif op in (M.VMOVQ, M.VMOVSD, M.VMOVHPD) and has_wide:
             lanes = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
             if i.op1_kind == K.MEMORY and op != M.VMOVHPD:
