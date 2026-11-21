@@ -26,6 +26,13 @@ target_compile_features(memory_query_check PRIVATE cxx_std_17)
 target_link_libraries(memory_query_check PRIVATE psapi)
 add_test(NAME desktop_memory_query COMMAND memory_query_check)
 
+add_executable(era_query_check tests/era_query_check.cpp src/era_query.cpp)
+target_include_directories(era_query_check PRIVATE src)
+target_compile_features(era_query_check PRIVATE cxx_std_17)
+foreach(scenario IN ITEMS fields tail registry short)
+    add_test(NAME era_query_${scenario} COMMAND era_query_check ${scenario})
+endforeach()
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
