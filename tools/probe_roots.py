@@ -14,28 +14,9 @@ from tempfile import NamedTemporaryFile
 import pefile
 
 from call_evidence import NAMES
+from resource_inventory import parts
 
 PROJECT = Path(__file__).resolve().parents[1]
-
-
-def parts(blob):
-    if len(blob) < 32 or blob[:4] != b"DXBC":
-        raise ValueError("Expected a DXBC container")
-    version, size, count = struct.unpack_from("<3I", blob, 20)
-    end = 32 + 4 * count
-    if version != 1 or size != len(blob) or end > size:
-        raise ValueError("Container header disagrees with inventory")
-    result = {}
-    for index in range(count):
-        offset, = struct.unpack_from("<I", blob, 32 + 4 * index)
-        if offset < end or offset + 8 > size:
-            raise ValueError("Invalid container part offset")
-        tag, length = struct.unpack_from("<4sI", blob, offset)
-        end = offset + 8 + length
-        if end > size or tag in result:
-            raise ValueError("Invalid container part")
-        result[tag] = blob[offset + 8:end]
-    return result
 
 
 def packing_evidence(text):

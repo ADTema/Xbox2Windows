@@ -76,7 +76,7 @@ void WaveValues(uint t : SV_GroupIndex, uint g : SV_GroupID)
     for (uint j=0; j<64; ++j) ballot[j/32] |= votes[j] << (j%32);
     uint rank = 0;
     for (uint k=0; k<logical; ++k) rank += votes[k];
-    uint p = (g*64+logical)*112;
+    uint p = (g*64+logical)*128;
     output.Store4(p, uint4(scans[logical], scans[logical]-v, scans[(logical & 32)+31], values[(logical*7+3)%64]));
     output.Store4(p+16, uint4(ballot, rank, values[0]));
     // Independently expose the actual native lane assignment for the CPU oracle.
@@ -103,6 +103,12 @@ void WaveValues(uint t : SV_GroupIndex, uint g : SV_GroupID)
         routed=uint4(sum, WaveReadLaneAt(v,(nativeLane*7+3)%width),width,1);
     }
     output.Store4(p+96,routed);
+    // Mirrors exchange the middle pair (31,32). The half-local mirror is the fault control.
+    uint nativeMirror = 0xffffffffu;
+    if (width == 64 && WaveActiveCountBits(true) == 64)
+        nativeMirror = WaveReadLaneAt(v, 63 - nativeLane);
+    output.Store4(p+112, uint4(values[63-logical], values[logical ^ 31], nativeMirror,
+                               scans[logical] + (logical >= 32 ? scans[31] : 0)));
 }
 
 // One workgroup per ray. The synthetic root has 64 bounds and each child

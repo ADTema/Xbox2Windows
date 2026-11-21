@@ -56,6 +56,20 @@ bool check_query_tail(BYTE* address, bool committed, bool sourceReadable)
     return true;
 }
 
+bool check_short_query(BYTE* address)
+{
+    QueryBuffer buffer{};
+    buffer.tail.fill(0xd7);
+    // Exercise the actual desktop failure path and feed its return to both caller predicates.
+    SetLastError(ERROR_SUCCESS);
+    const SIZE_T written = VirtualQueryEx(GetCurrentProcess(), address, &buffer.info, 1);
+    const DWORD error = GetLastError();
+    std::printf("short_query_bytes=%zu last_error=%lu\n", written, error);
+    return written == 0 && error != ERROR_SUCCESS &&
+           std::all_of(buffer.tail.begin(), buffer.tail.end(), [](BYTE b) { return b == 0xd7; }) &&
+           !caller_accepts(buffer, written, false) && !caller_accepts(buffer, written, true);
+}
+
 bool snapshot(const char* stage)
 {
     PROCESS_MEMORY_COUNTERS_EX counters{};
@@ -79,7 +93,7 @@ int main()
         VirtualAlloc(nullptr, bytes + page, MEM_RESERVE, PAGE_NOACCESS)));
     BYTE* base = storage.get();
     if (!base || !region_is(base, base, MEM_RESERVE, bytes + page, 0) ||
-        !check_query_tail(base, false, false) || !snapshot("reserved")) {
+        !check_query_tail(base, false, false) || !check_short_query(base) || !snapshot("reserved")) {
         std::fputs("Reserve/query failed\n", stderr);
         return 1;
     }

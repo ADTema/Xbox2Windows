@@ -111,7 +111,7 @@ bool check_bvh_waves(ID3D12Device* device, bool force64) {
         if (!caps.WaveOps || model.HighestShaderModel<D3D_SHADER_MODEL_6_6 ||
                 caps.WaveLaneCountMin>64 || caps.WaveLaneCountMax<64) return false;
     }
-    constexpr Word groups=6+32, count=groups*64, fields=28;
+    constexpr Word groups=6+32, count=groups*64, fields=32;
     std::vector<Row> queries;
     for (Word i=0;i<count;++i) {
         Word g=i/64, lane=i%64;
@@ -151,13 +151,19 @@ bool check_bvh_waves(ID3D12Device* device, bool force64) {
         const Word* records=result.data()+64*g*fields;
         Row logical_mask{};
         for (Word t=0;t<64;++t) logical_mask[t/32] |= q[t][1]<<(t%32);
-        Word rank=0;
+        Word rank=0, fullPrefix=0;
         for (Word t=0;t<64;++t) {
             auto r=records+t*fields;
             Word sum=0,total=0;
             for (Word j=t&32;j<(t&32)+32;++j) { total+=q[j][0]; if (j<t) sum+=q[j][0]; }
             Word expected[]{sum+q[t][0],sum,total,q[(7*t+3)%64][0],logical_mask[0],logical_mask[1],rank,q[0][0]};
             for (Word j=0;j<8;++j) equal(r[j],expected[j],64*g+t,j);
+            fullPrefix += q[t][0];
+            equal(r[28],q[63-t][0],64*g+t,28);
+            equal(r[29],q[t^31][0],64*g+t,29);
+            equal(r[31],fullPrefix,64*g+t,31);
+            if (g==3 && (t==31 || t==32) && r[28]==r[29])
+                throw std::runtime_error("Half-local mirror missed its boundary witness");
             rank+=q[t][1];
             if (r[8]>=width || r[10]>=64) throw std::runtime_error("Invalid native lane record");
             equal(r[9],width,t,9);
@@ -183,6 +189,8 @@ bool check_bvh_waves(ID3D12Device* device, bool force64) {
             Word prefix=0,sum=0;
             for (Word t:threads) {
                 auto r=records+t*fields;
+                const Word mirror = width==64 && threads.size()==64 ? q[threads[63-lane(t)]][0] : UINT32_MAX;
+                equal(r[30],mirror,t,30);
                 equal(r[11],q[threads.back()][0],t,11);
                 for (Word j=0;j<4;++j) equal(r[12+j],mask[j],t,12+j);
                 Word expected[]{prefix,minimum,sum,q[first][0],prefix,active_min,active_first,active_count};

@@ -99,8 +99,23 @@ def check(folder, fixture, provider):
     for symbol in ("named_value", "#77"):
         assert edges["normal", provider.name, symbol]["bundle_exports_in"] == [provider.name]
     delayed = edges["delay", "intake_delay.dll", "delayed_value"]
+    gaps = {(r["kind"], r["dll"], r["symbol"]): r["seen_unresolved_in_baseline"]
+            for r in report["entry_import_gaps"]}
+    assert gaps["delay", "intake_delay.dll", "delayed_value"] is False
+    assert gaps["normal", loader, "ffxQuery"] is False
+    assert ("normal", provider.name, "named_value") not in gaps
     assert not delayed["bundle_exports_in"] and delayed["desktop_export"] == "provider_not_found"
     assert not (root / slot).exists()
+    # A second synthetic image already asks for the same unresolved symbols.
+    # Its baseline demonstrates the difference between a new caller and a new gap.
+    peer = root / "peer.exe"
+    shutil.copyfile(fixture, peer)
+    peer_baseline = folder / "peer-baseline.json"
+    peer_baseline.write_text(json.dumps(scan(root)))
+    repeated = run(0, fixture, "--baseline", peer_baseline)
+    peer.unlink()
+    assert repeated["entry_import_gaps"]
+    assert all(r["seen_unresolved_in_baseline"] for r in repeated["entry_import_gaps"])
     truncated = folder / "truncated.exe"
     truncated.write_bytes(fixture.read_bytes()[:-256])
     assert "Section extends" in run(2, truncated)["error"]

@@ -48,6 +48,16 @@ bool allocation_checks()
 
 bool failure_checks()
 {
+    // Mix each unsupported bit with a valid alignment. Every combination must fail closed.
+    for (unsigned bit = 0; bit < 64; ++bit) {
+        if (bit >= 24 && bit <= 28) continue;
+        const auto flags = (std::uint64_t{1} << bit) | (std::uint64_t{6} << 24);
+        auto* p = era_heap::allocate(257, flags);
+        if (p) {
+            era_heap::release(p);
+            return false;
+        }
+    }
     return era_heap::allocate(0, 0) == nullptr &&
            era_heap::allocate(std::numeric_limits<std::size_t>::max(), 0) == nullptr &&
            era_heap::allocate(64, 1ull << 29) == nullptr &&  // graphics memory type

@@ -6,7 +6,9 @@ import hashlib
 import json
 import mmap
 from pathlib import Path
+import re
 import struct
+import subprocess
 from tempfile import NamedTemporaryFile
 import zlib
 
@@ -28,6 +30,26 @@ def signature(header):
         if header.startswith(tag):
             return tag.decode("ascii")
     return "unclassified"
+
+
+def parts(blob):
+    if len(blob) < 32 or blob[:4] != b"DXBC":
+        raise ValueError("Expected a DXBC container")
+    version, size, count = struct.unpack_from("<3I", blob, 20)
+    end = 32 + 4 * count
+    if version != 1 or size != len(blob) or end > size:
+        raise ValueError("Container header disagrees with inventory")
+    result = {}
+    for index in range(count):
+        offset, = struct.unpack_from("<I", blob, 32 + 4 * index)
+        if offset < end or offset + 8 > size:
+            raise ValueError("Invalid container part offset")
+        tag, length = struct.unpack_from("<4sI", blob, offset)
+        end = offset + 8 + length
+        if end > size or tag in result:
+            raise ValueError("Invalid container part")
+        result[tag] = blob[offset + 8:end]
+    return result
 
 
 def dxil_program(data, offset):
@@ -100,10 +122,72 @@ def probe_archive(path):
             "sample_streams": streams}
 
 
+def scene_records(data, validator=None):
+    """Summarize candidate named raw-DEFLATE shader records without exporting their contents."""
+    names = re.compile(rb"[!-~]{3,}")
+    stages = Counter()
+    sections_seen = Counter()
+    tails = Counter()
+    rejected = Counter()
+    samples = {}
+    framed = 0
+    cursor = 0
+    while match := names.search(data, cursor):
+        cursor = match.end()
+        if cursor + 18 > len(data) or data[cursor] != 0:
+            continue
+        stored, _, repeated, decoded = struct.unpack_from("<4I", data, cursor + 2)
+        if not (16 < stored <= 8 << 20 and 32 <= decoded <= 16 << 20):
+            continue
+        if stored != repeated:
+            rejected["unequal_stored_lengths"] += 1
+            continue
+        start = cursor + 18
+        if start + stored > len(data):
+            rejected["truncated_span"] += 1
+            continue
+        stream = zlib.decompressobj(-15)
+        try:
+            blob = stream.decompress(data[start:start+stored], decoded + 1)
+        except zlib.error:
+            rejected["deflate_error"] += 1
+            continue
+        if len(blob) != decoded or not stream.eof:
+            rejected["decoded_length_or_eof"] += 1
+            continue
+        try:
+            sections = parts(blob)
+        except ValueError:
+            rejected["container_framing"] += 1
+            continue
+        program = sections.get(b"DXIL", b"")
+        if len(program) < 24:
+            rejected["no_program_header"] += 1
+            continue
+        kind = struct.unpack_from("<H", program, 2)[0]
+        stage = {0:"pixel", 1:"vertex", 2:"geometry", 3:"hull", 4:"domain", 5:"compute",
+                 6:"library", 13:"mesh", 14:"amplification"}.get(kind, f"kind_{kind}")
+        stages[stage] += 1
+        sections_seen.update(tag.decode("ascii", "replace") for tag in sections)
+        tails[len(stream.unused_data)] += 1
+        framed += dxil_program(blob, 0)
+        if validator and stage not in samples:
+            run = subprocess.run([validator, "--container"], input=blob, capture_output=True,
+                                 timeout=15, check=True)
+            result = json.loads(run.stdout)
+            samples[stage] = {"call_hr": result["call_hr"], "status": result.get("status")}
+        cursor = start + stored
+    return {"records": sum(stages.values()), "stages": stages, "section_counts": sections_seen,
+            "framed_bitcode": framed, "trailing_byte_counts": tails, "candidate_rejections": rejected,
+            "validator_samples": len(samples), "first_per_stage": samples}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--shader-control", type=Path)
+    parser.add_argument("--scene-records", action="store_true", help="Inspect compressed records in shaders.rpf")
+    parser.add_argument("--scene-validator", type=Path, help="Use the built root_probe.exe on one container per stage")
     args = parser.parse_args()
     root = args.directory.resolve(strict=True)
     layout, = root.glob("layout*.xml")
@@ -149,6 +233,13 @@ def main():
         "probe_scope": "Raw marker search covers the three entire archives. Sample up to 8 checksum-valid zlib streams at 16-byte aligned 78xx headers in first 4 MiB; limits 512 KiB input and 2 MiB output per candidate. No inference about remaining encoded content.",
         "positive_control": control, "archive_probes": focus,
     }
+    if args.scene_records or args.scene_validator:
+        with (root / "shaders.rpf").open("rb") as stream:
+            if stream.seek(0, 2):
+                with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                    report["scene_records"] = scene_records(data, args.scene_validator)
+            else:
+                report["scene_records"] = scene_records(b"")
     output = Path(__file__).resolve().parents[1] / "out" / "resources" / (root.name + ".json")
     if output.resolve().is_relative_to(root):
         raise ValueError("Resource report must be outside the game directory")
