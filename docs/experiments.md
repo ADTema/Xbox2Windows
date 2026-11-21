@@ -338,7 +338,18 @@ The test maps the named and ordinal import fixtures, `reloc_route` and a damaged
 - the IAT slot holds the export the resolver returned;
 - `RtlLookupFunctionEntry` finds `call_mix` in the registered table until the image is released.
 
-The mapped `call_mix` is compared over 249 input pairs on arguments, guarded writes, RBX/RSI sentinels and return value. It matches the reference and the same image loaded by Windows, and for the import fixtures it also matches the lifted DLL. If the import is bound to the altered provider instead of the linked one, only the return changes. An unbound import is rejected with its DLL and symbol or ordinal. Copies patched to have an entry point, an import directory that runs past the image or one smaller than a single descriptor are rejected before any import is requested. In a copy of the register probe with the `clobber_control` export address slot zeroed, that name no longer resolves while `probe` still does. SEH through a mapped image, TLS callbacks and entry-point calls remain open.
+The mapped `call_mix` is compared over 249 input pairs on arguments, guarded writes, RBX/RSI sentinels and return value. It matches the reference and the same image loaded by Windows, and for the import fixtures it also matches the lifted DLL. If the import is bound to the altered provider instead of the linked one, only the return changes. An unbound import is rejected with its DLL and symbol or ordinal. Copies patched to have an entry point, an import directory that runs past the image or one smaller than a single descriptor are rejected before any import is requested. In a copy of the register probe with the `clobber_control` export address slot zeroed, that name no longer resolves while `probe` still does. TLS callbacks and entry-point calls remain open.
+
+`cpu_native_seh` checks exception dispatch through a mapped image. In `seh_route`, `guarded_load(address, mode, trace)` names its own exception handler in its unwind data. The handler resumes an access violation raised by the load instruction at a recovery label with a fixed value in RAX, and declines every other exception. The cases run in one child process for the Windows-loaded original and another for the mapped copy, so a broken unwind crashes only the child and is reported as a failed check:
+
+- a valid load returns the value;
+- a load from address zero is caught by the image's own handler and returns the fixed value, with RBX and RSI restored;
+- an illegal instruction, reached after the first trace write, is declined and unwinds through the mapped frame to the ctypes caller, which reports exception code `0xc000001d`;
+- a later valid call still succeeds.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_seh$' -V
+```
 
 ## Offline pixel shader recompilation
 
