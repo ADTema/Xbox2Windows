@@ -220,11 +220,15 @@ def check_parsing():
            "x PROC FRAME\n    .endprolog\nIFDEF A\n    jae short l\nELSE\n    jnz short l\nENDIF\n"
            "l:  mov DWORD PTR [rdx], eax ; c\ng:: ud2\n    emit rax\nvalue DQ 0\n    dd 1\n    ret\nx ENDP\nEND\n")
     assert fc.masm_mnemonics(asm) == {"cmpxchg", "movsb", "jae", "jne", "mov", "ud2", "ret"}, fc.masm_mnemonics(asm)
+    with tempfile.TemporaryDirectory() as tmp:
+        isolated = fc.measure({}, sample_repo(tmp, {"branch": asm}))["x64_zen2"]
+        assert isolated["fixture_forms_not_in_reference"] == [], isolated["fixture_forms_not_in_reference"]
     # The real repository measures without error, with no macro names or LOCAL leaking into unmatched forms.
     full = fc.measure({})
     assert "not a measure of port completion" in fc.report(full)
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
-    assert full["x64_zen2"]["fixture_forms_not_in_reference"] == [], full["x64_zen2"]["fixture_forms_not_in_reference"]
+    unmatched = full["x64_zen2"]["fixture_forms_not_in_reference"]
+    assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
 
 
 if __name__ == "__main__":
