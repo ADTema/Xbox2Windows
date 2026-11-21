@@ -10,6 +10,7 @@ void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);
 void check_dual_uav(ID3D12Device* device);
 void check_texture_mips(ID3D12Device* device);
+void check_dual_pixel(ID3D12Device*, const char*, const char*, bool);
 void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr);
 void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* input,
                      const char* capture, const char* mip1 = nullptr);
