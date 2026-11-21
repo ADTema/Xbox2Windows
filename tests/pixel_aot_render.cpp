@@ -47,8 +47,15 @@ struct PixelInput {
     std::vector<Word> constants = std::vector<Word>(64);
 };
 
+struct MipDraw {
+    UINT sampledLevel;
+    UINT scale;
+    UINT requestedMip = 0;
+    bool reportMip = false;
+};
+
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
-                   UINT firstResident, UINT sampledLevel, const char* capture)
+                   UINT firstResident, const std::vector<MipDraw>& draws, const char* capture)
 {
     const auto& input = levels.front();
     auto cb = upload(device, input.constants);
@@ -77,23 +84,17 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     ComPtr<ID3D12PipelineState> pso;
     check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), "Translated pixel pipeline");
 
-    const auto& sampled = levels.at(sampledLevel);
-    const UINT width = sampled.width * sampled.scale, height = sampled.height * sampled.scale;
     auto srcDesc = texture_desc(input.width << firstResident, input.height << firstResident,
                                 input.format, D3D12_RESOURCE_FLAG_NONE);
     const UINT residentCount = static_cast<UINT>(levels.size());
     srcDesc.MipLevels = static_cast<UINT16>(firstResident + residentCount);
-    auto dstDesc = texture_desc(width, height, desc.RTVFormats[0], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto texture = resource(device, srcDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     const D3D12_CLEAR_VALUE clear{desc.RTVFormats[0], {-1, -1, -1, -1}};
-    auto target = resource(device, dstDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(residentCount);
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT resultLayout{};
-    UINT64 sourceBytes, resultBytes;
+    UINT64 sourceBytes = 0;
     std::vector<UINT> rows(residentCount);
     std::vector<UINT64> rowBytes(residentCount);
     device->GetCopyableFootprints(&srcDesc, firstResident, residentCount, 0, layouts.data(), rows.data(), rowBytes.data(), &sourceBytes);
-    device->GetCopyableFootprints(&dstDesc, 0, 1, 0, &resultLayout, nullptr, nullptr, &resultBytes);
     std::vector<BYTE> colors(sourceBytes);
     for (UINT level = 0; level < residentCount; ++level) {
         const auto& packed = levels[level].rows;
@@ -114,7 +115,6 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         secondStaging = upload(device, colors);
         secondTexture = resource(device, srcDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     }
-    auto back = make_buffer(device, resultBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
     heapDesc.NumDescriptors = 1;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -125,7 +125,6 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srvs)), "Pixel texture heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
-    device->CreateRenderTargetView(target.Get(), nullptr, rtv);
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Format = input.format;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -136,74 +135,98 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     auto secondHandle = srvs->GetCPUDescriptorHandleForHeapStart();
     secondHandle.ptr += device->GetDescriptorHandleIncrementSize(heapDesc.Type);
     device->CreateShaderResourceView(secondTexture.Get(), &view, secondHandle);
-    ComputeCommands cmd(device, pso.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
-    auto* list = cmd.list.Get();
-    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-    src.pResource = staging.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.pResource = texture.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    for (UINT level = 0; level < residentCount; ++level) {
-        src.PlacedFootprint = layouts[level];
-        dst.SubresourceIndex = firstResident + level;
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    }
-    transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    if (secondTexture) {
-        src.pResource = secondStaging.Get();
-        dst.pResource = secondTexture.Get();
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        transition(list, secondTexture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    }
-    ID3D12DescriptorHeap* heaps[]{srvs.Get()};
-    list->SetDescriptorHeaps(1, heaps);
-    list->SetGraphicsRootSignature(root.Get());
-    list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
-    list->SetGraphicsRootConstantBufferView(1, cb->GetGPUVirtualAddress());
-    const D3D12_VIEWPORT viewport{0,0,float(width),float(height),0,1};
-    const D3D12_RECT scissor{0,0,LONG(width),LONG(height)};
-    list->RSSetViewports(1, &viewport);
-    list->RSSetScissorRects(1, &scissor);
-    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
-    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list->DrawInstanced(3,1,0,0);
-    transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    src.pResource = target.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.SubresourceIndex = 0;
-    dst.pResource = back.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint = resultLayout;
-    list->CopyTextureRegion(&dst, 0,0,0, &src, nullptr);
-    cmd.submit_and_wait(device);
-    auto words = read(back.Get(), resultBytes/4);
-    std::vector<BYTE> image;
-    if (capture) image.reserve(size_t(width) * height * 4);
-    for (UINT y = 0; y < height; ++y) {
-        for (UINT x = 0; x < width; ++x) {
-            const auto& expected = sampled.expected[(y / sampled.scale) * sampled.width + x / sampled.scale];
-            const auto offset = y * resultLayout.Footprint.RowPitch / 4 + x * 4;
-            Color actual;
-            std::memcpy(actual.data(), words.data() + offset, sizeof(actual));
-            if (std::memcmp(actual.data(), expected.data(), sizeof(actual)) != 0) {
-                std::fprintf(stderr, "pixel_mismatch x=%u y=%u\n", x, y);
-                for (size_t c = 0; c < actual.size(); ++c)
-                    std::fprintf(stderr, "channel=%zu expected=%g actual=%g\n", c, expected[c], actual[c]);
-                throw std::runtime_error("AOT color export differs from CPU reference");
+
+    bool textureUploaded = false;
+    for (const auto& req : draws) {
+        if (req.reportMip)
+            std::printf("requested_mip=%u sampled_mip=%u ", req.requestedMip, req.sampledLevel + firstResident);
+        const auto& sampled = levels.at(req.sampledLevel);
+        const UINT width = sampled.width * req.scale, height = sampled.height * req.scale;
+        auto dstDesc = texture_desc(width, height, desc.RTVFormats[0], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto target = resource(device, dstDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT resultLayout{};
+        UINT64 resultBytes = 0;
+        device->GetCopyableFootprints(&dstDesc, 0, 1, 0, &resultLayout, nullptr, nullptr, &resultBytes);
+        auto back = make_buffer(device, resultBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+        ComputeCommands cmd(device, pso.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+        auto* list = cmd.list.Get();
+        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+        if (!textureUploaded) {
+            src.pResource = staging.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.pResource = texture.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            for (UINT level = 0; level < residentCount; ++level) {
+                src.PlacedFootprint = layouts[level];
+                dst.SubresourceIndex = firstResident + level;
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             }
-            if (capture) {
-                for (float value : actual) image.push_back(static_cast<BYTE>(std::lround(value * 255)));
+            transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (secondTexture) {
+                src.pResource = secondStaging.Get();
+                dst.pResource = secondTexture.Get();
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                transition(list, secondTexture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
+            textureUploaded = true;
+        }
+        ID3D12DescriptorHeap* heaps[]{srvs.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetGraphicsRootSignature(root.Get());
+        list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
+        list->SetGraphicsRootConstantBufferView(1, cb->GetGPUVirtualAddress());
+        const D3D12_VIEWPORT viewport{0,0,float(width),float(height),0,1};
+        const D3D12_RECT scissor{0,0,LONG(width),LONG(height)};
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3,1,0,0);
+        transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        src.pResource = target.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        dst.pResource = back.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = resultLayout;
+        list->CopyTextureRegion(&dst, 0,0,0, &src, nullptr);
+        cmd.submit_and_wait(device);
+        auto words = read(back.Get(), resultBytes/4);
+        std::vector<BYTE> image;
+        if (capture) image.reserve(size_t(width) * height * 4);
+        for (UINT y = 0; y < height; ++y) {
+            for (UINT x = 0; x < width; ++x) {
+                const auto& expected = sampled.expected[(y / req.scale) * sampled.width + x / req.scale];
+                const auto offset = y * resultLayout.Footprint.RowPitch / 4 + x * 4;
+                Color actual;
+                std::memcpy(actual.data(), words.data() + offset, sizeof(actual));
+                if (std::memcmp(actual.data(), expected.data(), sizeof(actual)) != 0) {
+                    std::fprintf(stderr, "pixel_mismatch x=%u y=%u\n", x, y);
+                    for (size_t c = 0; c < actual.size(); ++c)
+                        std::fprintf(stderr, "channel=%zu expected=%g actual=%g\n", c, expected[c], actual[c]);
+                    throw std::runtime_error("AOT color export differs from CPU reference");
+                }
+                if (capture) {
+                    for (float value : actual) image.push_back(static_cast<BYTE>(std::lround(value * 255)));
+                }
             }
         }
+        if (capture) {
+            std::ofstream output(capture, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(image.data()), image.size());
+            output.close();
+            if (!output) throw std::runtime_error("Cannot save GPU readback");
+        }
+        std::printf("pixels=%u channels=%u max_absolute_error=0\n", width * height, width * height * 4);
     }
-    if (capture) {
-        std::ofstream output(capture, std::ios::binary);
-        output.write(reinterpret_cast<const char*>(image.data()), image.size());
-        output.close();
-        if (!output) throw std::runtime_error("Cannot save GPU readback");
-    }
-    std::printf("pixels=%u channels=%u max_absolute_error=0\n", width * height, width * height * 4);
+}
+
+void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
+                   UINT firstResident, UINT sampledLevel, const char* capture)
+{
+    draw_verified(device, path, levels, firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture);
 }
 }
 
@@ -308,10 +331,11 @@ void check_bc7_tail(ID3D12Device* device, const char* shader, const char* firstM
         levels.push_back(std::move(level));
     }
     // Changing the viewport exercises the copy shader's implicit LOD with the same SRV range.
+    std::vector<MipDraw> draws;
     for (UINT mip = 0; mip < first + levels.size(); ++mip) {
-        levels.front().scale = mip < first ? 1u << (first - mip) : 1u;
+        const UINT scale = mip < first ? 1u << (first - mip) : 1u;
         const UINT selected = mip < first ? 0 : mip - first;
-        std::printf("requested_mip=%u sampled_mip=%u ", mip, selected + first);
-        draw_verified(device, shader, levels, first, selected, nullptr);
+        draws.push_back({selected, scale, mip, true});
     }
+    draw_verified(device, shader, levels, first, draws, nullptr);
 }
