@@ -1235,6 +1235,14 @@ The tool reads the candidate as a file and uses the manifest slot as its graph n
 
 ## Resource chunks and shader formats
 
+### Relocated resource root
+
+Run `python -B tools/resource_root.py <archive> --offset <byte-offset> --stored <compressed-bytes> --decoded <decoded-bytes>` for one known zlib member. Both sizes must be exact and at most 2 MiB. The output contains the selected root's numeric type hash and byte size. The source-built control runs with `ctest --preset dev --no-tests=error -R '^resource_relocated_root$' -V`.
+
+The measured little-endian PRD0 v0x7a header stores a one-based root block index at byte 32, schema and instance directory pointers at bytes 40 and 56, and their counts at bytes 72 and 76. The reader resolves pointers relative to virtual address `0x50000000` within the decoded member. Each 16-byte instance entry gives a type, length and pointer. Exactly one 32-byte schema entry must have the root type, and its declared structure size must equal the root length. The root and both directories must fit in disjoint spans. This is a profile of the observed relocated records. The section-based script walker below uses separate LSCH and PSIN tables. [Related metadata row layouts and root selection](https://github.com/dexyfex/CodeWalker/blob/485d56bec00262ed7fa472261cce7bbc6202b96e/CodeWalker.Core/GameFiles/MetaTypes/Meta.cs) · [Observed-version header reference](https://github.com/rpatty-dev/PercyStar/blob/1b710c5349ef1911d94092f19173e9813dfb300c/src/anim.rs#L180-L219)
+
+Three 8 MiB windows per archive (start, middle, end) yielded 556 verified roots of 352 bytes in an animation archive, 189 of 304 bytes in a navigation archive and 43 of 192 bytes in a pack archive. Each archive had a distinct root type across these samples. A further 102 marked members lacked a required in-range extent. The marker alone cannot identify an animation class or establish clip counts or playback behavior.
+
 ### State-linked settings in a script archive
 
 `python -B tools/script_state_probe.py path/to/script.rpf --state <label>` checks aligned zlib pages, section lengths through CHKS, schema and array extents, and parent-to-child attribute ranges, and rejects a state node with more than one label-kind `id` attribute, as the replay does. It emits aggregate counts and at most one matching example. The supported profile has five root arrays. Other layouts and entries outside the recognized zlib framing require separate inspection.
