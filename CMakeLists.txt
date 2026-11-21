@@ -514,6 +514,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_version_query_lifted>")
     add_test(NAME cpu_lower_prefixes COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/lower_prefixes_check.py")
+    cpu_asm_fixture(cpu_address_size address_size)
+    set(address_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_address_size_lifted.cpp")
+    add_custom_command(OUTPUT "${address_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/address_size.py"
+            emit "$<TARGET_FILE:cpu_address_size>" "${address_fixture}"
+        DEPENDS cpu_address_size tests/cpu/address_size.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_address_size_lifted SHARED "${address_fixture}")
+    add_test(NAME cpu_aot_address_size COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/address_size.py"
+        check "$<TARGET_FILE:cpu_address_size>" "$<TARGET_FILE:cpu_address_size_lifted>")
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
