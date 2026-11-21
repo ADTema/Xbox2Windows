@@ -511,6 +511,9 @@ class Lifter:
             # and a memory source is read either way.
             if ins.op1_kind == OpKind.MEMORY:
                 line = self.write(ins, width, f"({condition}) ? source : {destination}")
+                # A volatile read: when the condition folds to false the compiler may not drop the load,
+                # which faults on hardware for an inaccessible source.
+                source = f"load_always<{unsigned(width)}>({self.address(ins)})"
                 return f"{{ const {unsigned(width)} source = {source}; {line} }}", reads, writes
             return self.write(ins, width, f"({condition}) ? {source} : {destination}"), reads, writes
         if mnemonic == M.RET:
@@ -650,6 +653,10 @@ template <class T> static T load(word address) {
     T value;
     std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
     return value;
+}
+// A read the compiler must perform even when its value is unused (a CMOVcc memory source).
+template <class T> static T load_always(word address) {
+    return *reinterpret_cast<const volatile T*>(address);
 }
 template <class T> static void store(word address, T value) {
     std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));

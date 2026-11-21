@@ -281,4 +281,13 @@ ENDIF
     DD flag_cmovns - flag_table, flag_cmovge_mem - flag_table
     DD flag_setne_word - flag_table, flag_cmove_test - flag_table
 flag_select ENDP
+
+; A CMOVcc whose condition is always false still reads its memory source, so an inaccessible
+; R8 faults: the translation must keep the load.
+cmov_read PROC
+    mov rax, rdx
+    cmp ecx, ecx
+    cmovne eax, DWORD PTR [r8]
+    ret
+cmov_read ENDP
 END

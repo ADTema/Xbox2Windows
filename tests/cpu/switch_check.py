@@ -203,10 +203,31 @@ def windows_invoker(probe, libraries):
     return invoke
 
 
+def check_cmov_read(libraries):
+    """cmov_read: CMOVNE after CMP ECX, ECX never moves, but its memory source is read either way."""
+    word = ctypes.c_uint32(0x5a5a1234)
+    for label, library in libraries:
+        function = library
+        function.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_void_p]
+        function.restype = ctypes.c_uint64
+        # A 32-bit CMOVcc clears bits 32-63 of the destination even when it does not move.
+        result = function(7, 0xdeadbeef00000001, ctypes.addressof(word))
+        if result != 1:
+            raise AssertionError(f"{label} cmov_read: {result:#x} != 0x1")
+        try:
+            function(7, 1, None)
+        except OSError as error:
+            if "access violation" not in str(error):
+                raise AssertionError(f"{label} cmov_read with a null source: {error}") from error
+        else:
+            raise AssertionError(f"{label} cmov_read with a null source did not fault")
+
 def check(probe_path, original_path, lifted_path, swapped_path):
     from direct_check import SENTINELS, register_probe
     probe = register_probe(probe_path)
     native, lifted, swapped = map(ctypes.CDLL, (original_path, lifted_path, swapped_path))
+    check_cmov_read([("source fixture", native.cmov_read), ("translation", lifted.lifted_cmov_read),
+                     ("swapped-table build", swapped.lifted_cmov_read)])
     names = (*SELECTORS, "run_ops")
     original = outcomes(windows_invoker(probe, lambda n: getattr(native, n)), SELECTORS, "run_ops")
     verify(original, expected(SELECTORS, "run_ops"), SENTINELS, "source fixture")

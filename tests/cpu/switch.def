@@ -4,3 +4,4 @@ EXPORTS
     run_ops
     shift_narrow
     flag_select
+    cmov_read
