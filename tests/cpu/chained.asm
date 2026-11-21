@@ -7,6 +7,19 @@ choose_value PROC
     push rsi
     sub rsp, 8
     mov rsi, rcx
+IFDEF USE_JNE
+    test rsi, rsi
+    jnz short load_inner
+    jmp short empty_value
+load_inner:
+    mov rbx, [rsi]
+    test rbx, rbx
+    jnz short non_empty
+    jmp short empty_value
+non_empty:
+    mov eax, 21
+    jmp short finish_value
+ELSE
     test rsi, rsi
     jz short empty_value
     mov rbx, [rsi]
@@ -14,6 +27,7 @@ choose_value PROC
     jz short empty_value
     mov eax, 21
     jmp short finish_value
+ENDIF
 choose_value ENDP
 primary_end LABEL BYTE
 neighbor PROC
