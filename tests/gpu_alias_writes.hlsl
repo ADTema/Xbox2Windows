@@ -59,7 +59,7 @@ void WriteTitleAddresses(uint id : SV_DispatchThreadID)
     Results.Store(id * 4, 1);
 }
 
-// Capability probe for the atomics above, run on plain buffers before the fixture. Each of
+// Correctness probe for the atomics above, run on plain buffers before the fixture. Each of
 // recordCount threads adds 1 to word 0 of Aliases[id % rangeCount], the same per-thread index
 // into the UAV array that WriteTitleAddresses uses, so buffer i must gain exactly the number of
 // ids congruent to i.

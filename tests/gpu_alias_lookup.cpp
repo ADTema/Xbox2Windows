@@ -192,7 +192,8 @@ Word float_bits(float value)
 // Whether InterlockedAdd through a per-thread index into a UAV array updates each word exactly
 // once per thread, measured on plain committed buffers so the answer does not depend on the
 // aliases under test. 256 threads each add 1 to word 0 of one of four zeroed buffers, 64 threads
-// per buffer. The in-box WARP of Windows 10 (10.0.19041) applies each such add four times.
+// per buffer. Prints the expected and actual counts. The in-box WARP of Windows 10 (10.0.19041)
+// applies each such add four times, which is a wrong result, not a missing capability.
 bool array_atomics_exact(ID3D12Device* device)
 {
     constexpr UINT targets = 4, threads = 256;
@@ -307,14 +308,11 @@ bool check_gpu_alias_lookup(ID3D12Device* device)
 
 bool check_gpu_alias_lookup_writes(ID3D12Device* device)
 {
-    // The add and sub records need exact atomics through the UAV array. An adapter that miscounts
-    // them on plain buffers cannot run this fixture, whatever the lookup does.
-    if (!array_atomics_exact(device)) {
-        std::puts("InterlockedAdd through a per-thread index into a UAV array is not exact on this adapter");
-        return false;
-    }
     AliasFixture fixture;
     if (!fixture.open(device)) return false;
+    // Measured first and always printed. Wrong counts fail the test at the end, after the whole
+    // fixture has run, so the output separates the add and sub words from every other check.
+    const bool atomics_exact = array_atomics_exact(device);
     enum : Word { Store = 0, Add = 1, Sub = 2, MinFloat = 3, MaxFloat = 4 };
     struct Record {
         std::uint64_t address;
@@ -405,16 +403,44 @@ bool check_gpu_alias_lookup_writes(ID3D12Device* device)
 
     Kernel kernel(device, {WriteTitleAddresses, sizeof(WriteTitleAddresses)});
     const auto results = fixture.run(device, kernel, records, records.size());
-    for (std::size_t r = 0; r < records.size(); ++r) equal(results[r], expected_results[r], static_cast<unsigned>(r), 0);
+    // Two groups, each with its own count and first mismatch: the shared add and sub words, which
+    // depend on InterlockedAdd through the UAV array, and everything else (the per-record results,
+    // then every other word: stores, float min and max, rejected records and untouched words).
+    unsigned add_sub_mismatches = 0, other_mismatches = 0;
+    const auto differs = [](unsigned& count, const char* what, Word actual, Word expected, unsigned record, unsigned field) {
+        if (actual == expected) return;
+        if (count++ == 0)
+            std::fprintf(stderr, "%s record=%u field=%u expected=%08x actual=%08x\n", what, record, field, expected, actual);
+    };
+    for (std::size_t r = 0; r < records.size(); ++r)
+        differs(other_mismatches, "result", results[r], expected_results[r], static_cast<unsigned>(r), 0);
     // Read back through the title pointers: no copy of the aliased memory was made.
     std::size_t words = 0;
     for (std::size_t a = 0; a < fixture.titles.size(); ++a) {
         const auto* actual = static_cast<const Word*>(fixture.titles[a]->base);
-        for (std::size_t w = 0; w < expected[a].size(); ++w, ++words)
-            equal(actual[w], expected[a][w], static_cast<unsigned>(a), static_cast<unsigned>(w));
+        for (std::size_t w = 0; w < expected[a].size(); ++w, ++words) {
+            const auto* address = actual + w;
+            if (address == &word_at(add_word))
+                differs(add_sub_mismatches, "add_word", actual[w], expected[a][w], static_cast<unsigned>(a), static_cast<unsigned>(w));
+            else if (address == &word_at(sub_word))
+                differs(add_sub_mismatches, "sub_word", actual[w], expected[a][w], static_cast<unsigned>(a), static_cast<unsigned>(w));
+            else
+                differs(other_mismatches, "word", actual[w], expected[a][w], static_cast<unsigned>(a), static_cast<unsigned>(w));
+        }
     }
+    std::printf("gpu_alias_lookup_writes add_sub words=2 add=%08x sub=%08x expected_add=%08x expected_sub=%08x mismatches=%u\n",
+                word_at(add_word), word_at(sub_word), sum, 1'000'000 - sum, add_sub_mismatches);
+    std::printf("gpu_alias_lookup_writes other results=%zu words=%zu mismatches=%u\n", records.size(), words - 2,
+                other_mismatches);
     std::printf("gpu_alias_lookup_writes ranges=%zu records=%zu stores=%zu contenders=%u sum=%u min=%g max=%g "
-                "misses=%u words_checked=%zu mismatches=0\n",
-                fixture.packed.size(), records.size(), stored.size(), contenders, sum, lowest, highest, misses, words);
+                "misses=%u words_checked=%zu mismatches=%u\n",
+                fixture.packed.size(), records.size(), stored.size(), contenders, sum, lowest, highest, misses, words,
+                add_sub_mismatches + other_mismatches);
+    if (!atomics_exact)
+        throw std::runtime_error("InterlockedAdd through a per-thread index into a UAV array is not applied exactly once "
+                                 "per thread on this adapter (array_atomics counts above). This is an adapter defect, "
+                                 "recorded for the Windows 10 in-box WARP 10.0.19041 in docs/experiments.md");
+    if (add_sub_mismatches + other_mismatches != 0)
+        throw std::runtime_error("gpu_alias_lookup_writes differs from the CPU reference");
     return true;
 }
