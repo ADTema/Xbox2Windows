@@ -109,8 +109,9 @@ def check_translation(image, dropped):
             path.write_bytes(damaged)
             return path
 
-        cases = (((None, callee + 1), "call to a second target"),
-                 ((callee + 1, None), "call to a second target"),
+        # A call into the callee interior names no function interval of its own.
+        cases = (((None, callee + 1), "no unique function interval"),
+                 ((callee + 1, None), "no unique function interval"),
                  ((callee + 1, callee + 1), "no unique function interval"),
                  ((caller, caller), "overlapping call target"))
         for targets, reason in cases:
@@ -129,16 +130,16 @@ def check_translation(image, dropped):
 
 
 def check_mixed_calls():
-    # A direct call and an import call, or two different IAT slots, would need two callees.
+    # An import call may repeat one IAT slot, but not mix with direct calls or name a second slot.
     prologue = bytes.fromhex("53 56 48 83 ec 28")
     epilogue = bytes.fromhex("48 83 c4 28 5e 5b c3")
     direct = bytes.fromhex("e8 00 01 00 00")
     imported = bytes.fromhex("ff 15 00 02 00 00")
     # Second IAT call targets a different slot from the first.
     other_imported = bytes.fromhex("ff 15 02 02 00 00")
-    for calls, reason in (((direct, imported), "call to a second target"),
-                          ((imported, direct), "call to a second target"),
-                          ((imported, other_imported), "call to a second target")):
+    for calls, reason in (((direct, imported), "mixed import and direct calls"),
+                          ((imported, direct), "mixed import and direct calls"),
+                          ((imported, other_imported), "call to a second IAT slot")):
         try:
             lift_body(0x1000, prologue + b"".join(calls) + epilogue,
                       caller=True, bind_import=lambda slot: "mix_args")

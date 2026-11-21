@@ -373,7 +373,7 @@ The caller changes both arguments and keeps its original inputs live across the 
 
 A rebuilt callee that increments only its return after storing the result exposes a mismatch for every pair. A register-clobber control checks the probe itself. Targets redirected into the middle of the callee or back to the caller are rejected during translation.
 
-A [second caller](../tests/cpu/repeat_call.asm) calls the same callee twice. Only RBX and RSI survive each call, so it parks the trace pointer in RSI and copies it back to R8 for the second call, whose arguments depend on the first result. The translator decodes 64-bit moves between R8 and the profile registers in both the opcode 8B form that ML64 emits and the opcode 89 form. It accepts repeated direct calls or repeated IAT import calls only when they share one target, and lifts or binds that target once. It tracks which registers still hold the entry R8 value, so R8 can only be reloaded from such a copy and every store stays inside the trace.
+A [second caller](../tests/cpu/repeat_call.asm) calls the same callee twice. Only RBX and RSI survive each call, so it parks the trace pointer in RSI and copies it back to R8 for the second call, whose arguments depend on the first result. The translator decodes 64-bit moves between R8 and the profile registers in both the opcode 8B form that ML64 emits and the opcode 89 form. A repeated direct call to the same target lifts that callee once, and a repeated import call through the same IAT slot binds that import once. It tracks which registers still hold the entry R8 value, so R8 can only be reloaded from such a copy and every store stays inside the trace.
 
 ```powershell
 cmake --build --preset dev --target cpu_repeat_original_lifted cpu_repeat_altered_lifted cpu_repeat_dropped cpu_repeat_import_lifted cpu_register_probe
@@ -382,14 +382,23 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_repeated_call$' -V
 
 For the same 249 input pairs, the caller and callee match the original and independent arithmetic (for both the direct-call fixture and the repeated-import `IMPORT_MIX` build). The comparison covers the return, the trace written by the second call, the guards and the RBX/RSI sentinels. With a callee that returns one more, the caller's return and trace change on every pair. Both the original and the lifted DLL contain two rel32 calls to their callee. Replacing both R8 moves with their opcode 89 encodings leaves the translation unchanged. Translation rejects mixed direct/import calls, two distinct IAT slots, and six patched or rebuilt copies:
 - one assembled without the R8 reload, as an undefined register;
-- the first or the second call redirected into the callee interior, as a second target;
+- the first or the second call redirected into the callee interior, which owns no function interval;
 - both calls redirected there;
 - both calls redirected back to the caller;
 - R8 reloaded from RBX, which holds an input word.
 
-Hand-built callers that combine a direct call and an import call are rejected in either order.
+Hand-built callers that combine a direct call and an import call are rejected in either order, as mixed import and direct calls. A caller that calls two different IAT slots is rejected as a call to a second IAT slot.
 
-Coverage is limited to this integer ABI, at most one callee, its two fixed frame layouts and the decoded register operations. The fixture exercises the R8 moves only through RSI, and an import call is still limited to one per caller. [Windows x64 calling convention](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention) · [Import-call follow-up](https://github.com/R0Y00/Xbox2Windows/issues/24)
+A [third caller](../tests/cpu/call_pair.asm) calls two different callees, `mix_args` and then `mix_other`, which combines its arguments with XOR so the two calls do not commute. The translator lifts each distinct direct target once, in call order, as `lifted_callee`, `lifted_callee2` and so on. Each target must own a function interval that overlaps neither the caller nor another callee.
+
+```powershell
+cmake --build --preset dev --target cpu_pair_original_lifted cpu_pair_swapped_lifted cpu_pair_first_lifted cpu_pair_second_lifted cpu_register_probe
+ctest --preset dev --no-tests=error -R '^cpu_aot_call_pair$' -V
+```
+
+For the same 249 input pairs, the caller and all four lifted callees match the original and independent arithmetic, with guards and RBX/RSI sentinels. A copy assembled with the two calls swapped follows its own reference and changes all 249 results, and its lifted DLL names `mix_other` first. Copies with only `mix_args` or only `mix_other` returning one more each change the caller's return on every pair. Each original and lifted caller contains exactly one rel32 call to each of its callees. Translation rejects three redirected calls: either call into the other callee's interior, and the second call back to the caller. A copy whose `mix_args` runtime-function entry is extended into `mix_other` is refused earlier, by the range reader, as an invalid runtime-function interval.
+
+Coverage is limited to this integer ABI, its two fixed frame layouts and the decoded register operations. The fixtures exercise two distinct callees at most, and not a caller that returns to an earlier callee after calling another. They exercise the R8 moves only through RSI, and import calls are still limited to one IAT slot per caller. [Windows x64 calling convention](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention) · [Import-call follow-up](https://github.com/R0Y00/Xbox2Windows/issues/24)
 
 ## Calling another DLL through a named PE import
 

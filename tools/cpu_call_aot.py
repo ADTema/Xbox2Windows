@@ -1,4 +1,4 @@
-"""Recompile a bounded Windows x64 caller with one direct or ordinary import call."""
+"""Recompile a bounded Windows x64 caller with direct calls or one ordinary import call."""
 
 import argparse
 from pathlib import Path
@@ -28,7 +28,12 @@ def r8_register_move(body, pos):
     return None
 
 
-def lift_body(start, code, *, caller, bind_import=None):
+def callee_name(index):
+    # The first callee keeps the name used before more than one target was supported.
+    return "lifted_callee" if index == 0 else f"lifted_callee{index + 1}"
+
+
+def lift_body(start, code, *, caller, bind_import=None, name="lifted_callee"):
     # In this profile only RBX/RSI survive the call. The host compiler owns
     # physical register allocation and emits its own ABI frame for each function.
     frame = 40 if caller else 8
@@ -51,9 +56,12 @@ def lift_body(start, code, *, caller, bind_import=None):
         is_call = via_iat or body[pos] == 0xe8
         r8_move = r8_register_move(body, pos)
         if is_call:
-            # Repeated calls must share one target, so one callee or import is bound.
+            # Direct calls may repeat or name further targets, and each distinct
+            # target is lifted once. Import calls may repeat one IAT slot only.
             if not caller:
                 raise ValueError(f"unexpected additional call at RVA {rva:#x}")
+            if target is not None and (target[0] == "import") != via_iat:
+                raise ValueError(f"mixed import and direct calls at RVA {rva:#x}")
             length = 6 if via_iat else 5
             if pos + length > len(body):
                 raise ValueError(f"truncated call at RVA {rva:#x}")
@@ -62,18 +70,19 @@ def lift_body(start, code, *, caller, bind_import=None):
                 if bind_import is None:
                     raise ValueError(f"no provider binding for IAT slot RVA {address:#x}")
                 if target is not None:
-                    if target[0] != "import" or target[1] != address:
-                        raise ValueError(f"call to a second target at RVA {rva:#x}")
-                    name = target[2]
+                    if target[1] != address:
+                        raise ValueError(f"call to a second IAT slot at RVA {rva:#x}")
+                    symbol = target[2]
                 else:
-                    name = bind_import(address)
-                    target = ("import", address, name)
-                callee = f"::{name}"
+                    symbol = bind_import(address)
+                    target = ("import", address, symbol)
+                callee = f"::{symbol}"
             else:
-                if target is not None and target != ("direct", address):
-                    raise ValueError(f"call to a second target at RVA {rva:#x}")
-                target = ("direct", address)
-                callee = "lifted_callee"
+                if target is None:
+                    target = ("direct", [])
+                if address not in target[1]:
+                    target[1].append(address)
+                callee = callee_name(target[1].index(address))
             reads = {"rcx", "rdx", "r8"}
             statement = f"rax = {callee}(rcx, rdx, r8);"
             write = "rax"
@@ -142,7 +151,7 @@ def lift_body(start, code, *, caller, bind_import=None):
 
     if "rax" not in available or (caller and target is None):
         raise ValueError(f"missing return value or call at RVA {start:#x}")
-    name = "lifted" if caller else "lifted_callee"
+    name = "lifted" if caller else name
     signature = f'extern "C" __declspec(dllexport) __declspec(noinline) word {name}(word rcx, word rdx, word* r8)'
     return "\n".join([signature + " {", "    word rax, rbx, rsi;", *lines, "    return rax;", "}"]), target
 
@@ -193,16 +202,24 @@ def translate(image, entry, binding=None, link_name=None):
         caller, target_info = lift_body(start, code, caller=True, bind_import=bind_import if binding else None)
         kind = target_info[0]
         if kind == "import":
-            callee = f'extern "C" __declspec(dllimport) word {target_info[2]}(word, word, word*);'
+            callees = [f'extern "C" __declspec(dllimport) word {target_info[2]}(word, word, word*);']
         else:
             target = target_info[1]
             if binding:
                 raise ValueError("provider binding supplied for a direct call")
-            callee_code = bounded_code(pe, target)
-            if target < start + len(code) and start < target + len(callee_code):
-                raise ValueError(f"overlapping call target at RVA {target:#x}")
-            callee, _ = lift_body(target, callee_code, caller=False)
-    return f"#include <cstdint>\nusing word = std::uint64_t;\n{callee}\n\n{caller}\n"
+            intervals = [(start, start + len(code))]
+            callees = []
+            for index, address in enumerate(target):
+                callee_code = bounded_code(pe, address)
+                end = address + len(callee_code)
+                # Each target must own an interval apart from the caller and the other callees.
+                if any(address < high and low < end for low, high in intervals):
+                    raise ValueError(f"overlapping call target at RVA {address:#x}")
+                intervals.append((address, end))
+                callee, _ = lift_body(address, callee_code, caller=False, name=callee_name(index))
+                callees.append(callee)
+    body = "\n\n".join([*callees, caller])
+    return f"#include <cstdint>\nusing word = std::uint64_t;\n{body}\n"
 
 
 if __name__ == "__main__":
