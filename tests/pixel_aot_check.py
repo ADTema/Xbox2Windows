@@ -822,6 +822,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(CUBE_BODY), translate))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
+    fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
