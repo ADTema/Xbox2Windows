@@ -232,12 +232,21 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                 bool matched = matches(expected);
                 if (!matched && req.isTailDraw && req.scale > 1) {
                     // A pixel exactly on a source texel boundary can interpolate
-                    // to either side. Each candidate must match as a whole RGBA texel.
+                    // to either side. Point addressing also snaps the scaled
+                    // coordinate to fixed point: with 8 fractional bits, a center
+                    // within 1/512 texel below a boundary rounds up to the next
+                    // texel. Each candidate must match as a whole RGBA texel.
+                    const auto snapsUp = [](UINT numerator, UINT denominator) {
+                        return UINT64(numerator % denominator) * 512 >= UINT64(denominator) * 511;
+                    };
                     const UINT left = sampleX - (numeratorX % (2 * width) == 0);
                     const UINT top = sampleY - (numeratorY % (2 * height) == 0);
-                    matched = matches(sampled.expected[top * sampled.width + left]) ||
-                              matches(sampled.expected[top * sampled.width + sampleX]) ||
-                              matches(sampled.expected[sampleY * sampled.width + left]);
+                    const UINT right = (std::min)(sampleX + snapsUp(numeratorX, 2 * width), sampled.width - 1);
+                    const UINT bottom = (std::min)(sampleY + snapsUp(numeratorY, 2 * height), sampled.height - 1);
+                    for (const UINT candidateY : {top, sampleY, bottom}) {
+                        for (const UINT candidateX : {left, sampleX, right})
+                            matched = matched || matches(sampled.expected[candidateY * sampled.width + candidateX]);
+                    }
                 }
                 if (!matched) {
                     std::fprintf(stderr, "pixel_mismatch x=%u y=%u\n", x, y);

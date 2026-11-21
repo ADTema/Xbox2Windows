@@ -163,6 +163,25 @@ def main():
                 expected_draw = f"requested_mip={mip} sampled_mip={max(first, mip)} pixels={pixels} "
                 if expected_draw not in result.stdout:
                     raise AssertionError(f"Missing verified draw for {width}x{height}: {expected_draw}")
+        # Drawing the 2x1 mip of 4096x4 at 4096x4 puts pixels 2044-2047 within
+        # 1/512 texel of the texel boundary, where 8-bit fixed-point addressing
+        # may select the second texel. A 1/64-texel shift moves the first changed
+        # pixel to 2016 (2012 with 8-bit snapping), which must still be rejected.
+        strip = [write_patterned_mip(work, 4096 >> level, 1) for level in (11, 12)]
+        strip_args = ["11", "--base-size", "4096", "4", *strip]
+        shifted_source, shifted = work / "shifted.hlsl", work / "shifted.cso"
+        shifted_source.write_text("#define main copy_pixel\n" + source.read_text(encoding="ascii") + """
+#undef main
+float4 main(float2 uv : TEXCOORD0) : SV_Target0 {
+    return copy_pixel(uv + float2(1.0 / 128, 0));
+}
+""", encoding="ascii")
+        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shifted, shifted_source], check=True)
+        wrong = subprocess.run([renderer, backend, "--check-bc7-tail", shifted, *strip_args],
+                               capture_output=True, text=True)
+        allowed = [f"pixel_mismatch x={x} y=0" for x in range(2012, 2017)]
+        if wrong.returncode != 1 or not any(line in allowed for line in wrong.stderr.splitlines()):
+            raise AssertionError(f"A texel shift beyond the snapping band must fail near x=2016:\n{wrong.stderr}")
         # The 29x19 fallback has an exact point-sample tie at (14, 0).
         # Combine channels from the two texels on either side only at that pixel.
         boundary_levels = [write_patterned_mip(work, max(1, 116 >> level), max(1, 76 >> level))
