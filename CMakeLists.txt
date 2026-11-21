@@ -817,6 +817,26 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_startup_exe>" "$<TARGET_FILE:cpu_startup_a>" "$<TARGET_FILE:cpu_startup_b>"
         "$<TARGET_FILE:cpu_startup_b_noinit>" "$<TARGET_FILE:cpu_startup_a_alt>"
         "$<TARGET_FILE:cpu_startup_exe_timeout>" "$<TARGET_FILE:cpu_startup_exe_create>")
+    # Lifecycle fixtures: two DLLs with the static MSVC runtime (B imports A) and a CRT-free event sink.
+    add_library(cpu_life_sink SHARED tests/cpu/life_sink.cpp)
+    target_compile_options(cpu_life_sink PRIVATE /GS- /Zl)
+    target_link_options(cpu_life_sink PRIVATE /ENTRY:sink_main /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_life_sink PRIVATE kernel32)
+    foreach(dll IN ITEMS a a_noctor b b_nodtor)
+        string(REGEX REPLACE "_(noctor|nodtor)$" "" source "${dll}")
+        add_library(cpu_life_${dll} SHARED tests/cpu/life_${source}.cpp)
+        set_target_properties(cpu_life_${dll} PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreaded)
+        target_link_options(cpu_life_${dll} PRIVATE /INCREMENTAL:NO)  # no incremental thunk in front of the entry point
+        target_link_libraries(cpu_life_${dll} PRIVATE cpu_life_sink)
+    endforeach()
+    target_compile_definitions(cpu_life_a_noctor PRIVATE NO_CTOR)
+    target_compile_definitions(cpu_life_b_nodtor PRIVATE NO_DTOR)
+    target_link_libraries(cpu_life_b PRIVATE cpu_life_a)
+    target_link_libraries(cpu_life_b_nodtor PRIVATE cpu_life_a)
+    add_test(NAME cpu_native_crt_lifecycle COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_crt_lifecycle_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_life_sink>" "$<TARGET_FILE:cpu_life_a>" "$<TARGET_FILE:cpu_life_b>"
+        "$<TARGET_FILE:cpu_life_a_noctor>" "$<TARGET_FILE:cpu_life_b_nodtor>")
     add_library(cpu_frame_host SHARED tests/cpu/frame_host.cpp)
     add_library(cpu_frame_guest SHARED tests/cpu/tls_route.asm tests/cpu/frame_route.def)
     set_target_properties(cpu_frame_guest PROPERTIES LINKER_LANGUAGE CXX)
