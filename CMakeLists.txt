@@ -327,6 +327,15 @@ if(EXISTS "${INTAKE_PYTHON}")
         target_link_options(cpu_call_${variant}_lifted PRIVATE /INCREMENTAL:NO)
     endforeach()
     target_compile_definitions(cpu_call_altered PRIVATE ALTER_RETURN)
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_repeat_${variant} repeat_call)
+        cpu_translation(cpu_repeat_${variant} cpu_call_aot call_twice)
+        target_link_options(cpu_repeat_${variant}_lifted PRIVATE /INCREMENTAL:NO)
+    endforeach()
+    target_compile_definitions(cpu_repeat_altered PRIVATE ALTER_RETURN)
+    # Translation must reject this copy, which omits the trace-pointer reload.
+    cpu_asm_fixture(cpu_repeat_dropped repeat_call)
+    target_compile_definitions(cpu_repeat_dropped PRIVATE DROP_RELOAD)
     cpu_asm_fixture(cpu_register_probe register_probe)
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_switch_${variant} switch)
@@ -339,11 +348,15 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_switch_swapped_lifted>")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
+    cpu_asm_fixture(cpu_chained_jne chained)
+    target_compile_definitions(cpu_chained_jne PRIVATE USE_JNE)
+    cpu_translation(cpu_chained_jne cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_callback callback)
     cpu_asm_fixture(cpu_version_query version_query)
     cpu_asm_fixture(cpu_heap_layout heap_layout)
     cpu_asm_fixture(cpu_bink_heap bink_heap)
-    add_library(cpu_bink_heap_provider SHARED tests/cpu/bink_heap_provider.cpp)
+    add_library(cpu_bink_heap_provider SHARED tests/cpu/bink_heap_provider.cpp src/era_heap.cpp)
+    target_include_directories(cpu_bink_heap_provider PRIVATE src)
     target_link_libraries(cpu_bink_heap PRIVATE cpu_bink_heap_provider)
     function(bink_heap_translation target image dependency)
         set(cpp "${CMAKE_CURRENT_BINARY_DIR}/${target}.cpp")
@@ -383,12 +396,31 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/cpu/bink_heap_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
             "$<TARGET_FILE:cpu_bink_package_lifted>")
     endif()
+    cpu_asm_fixture(cpu_working_set_delta working_set_delta)
+    function(working_set_delta_translation target image dependency)
+        set(cpp "${CMAKE_CURRENT_BINARY_DIR}/${target}.cpp")
+        add_custom_command(OUTPUT "${cpp}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/ffx_working_set_delta.py"
+                "${image}" "${cpp}" ${ARGN}
+            DEPENDS ${dependency} tools/ffx_working_set_delta.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(${target} SHARED "${cpp}")
+    endfunction()
+    working_set_delta_translation(cpu_working_set_delta_lifted "$<TARGET_FILE:cpu_working_set_delta>" cpu_working_set_delta)
+    add_test(NAME cpu_working_set_delta COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/working_set_delta_check.py" "$<TARGET_FILE:cpu_working_set_delta>"
+        "$<TARGET_FILE:cpu_working_set_delta_lifted>")
+    if(FFX_UPSCALER_IMAGE)
+        working_set_delta_translation(ffx_package_working_set_delta "${FFX_UPSCALER_IMAGE}" "${FFX_UPSCALER_IMAGE}" --package)
+        add_test(NAME ffx_package_working_set_delta COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/working_set_delta_check.py" "$<TARGET_FILE:ffx_package_working_set_delta>")
+    endif()
     cpu_asm_fixture(cpu_bink_descriptors bink_descriptors)
     function(bink_descriptors_translation target image dependency)
         set(cpp "${CMAKE_CURRENT_BINARY_DIR}/${target}.cpp")
         add_custom_command(OUTPUT "${cpp}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/bink_descriptors_aot.py"
-                "${image}" "${cpp}" ${ARGN}
+                "${image}" "${cpp}" --frame-planes ${ARGN}
             DEPENDS ${dependency} tools/bink_descriptors_aot.py tools/bink_heap_aot.py
                 tools/ffx_version_query.py tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
         add_library(${target} SHARED "${cpp}")
@@ -397,9 +429,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_bink_descriptors COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/bink_descriptors_check.py" --native "$<TARGET_FILE:cpu_bink_descriptors>"
         "$<TARGET_FILE:cpu_bink_descriptors_lifted>")
+    add_test(NAME cpu_bink_frame_planes COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bink_frame_planes_check.py" "$<TARGET_FILE:cpu_bink_descriptors>"
+        "$<TARGET_FILE:cpu_bink_descriptors_lifted>")
     set(BINK_DESCRIPTOR_IMAGE "" CACHE FILEPATH "Local Bink DLL for the grouped descriptor producer experiment")
     if(BINK_DESCRIPTOR_IMAGE)
         bink_descriptors_translation(cpu_bink_package_descriptors "${BINK_DESCRIPTOR_IMAGE}" "${BINK_DESCRIPTOR_IMAGE}" --package)
+        add_test(NAME cpu_bink_package_frame_planes COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/bink_frame_planes_check.py" "$<TARGET_FILE:cpu_bink_package_descriptors>")
         add_test(NAME cpu_bink_package_descriptors COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/cpu/bink_descriptors_check.py" "$<TARGET_FILE:cpu_bink_package_descriptors>")
     endif()
@@ -422,6 +459,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_version_query COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/version_query_fixture.py" check "$<TARGET_FILE:cpu_version_query>"
         "$<TARGET_FILE:cpu_version_query_lifted>")
+    add_test(NAME cpu_lower_prefixes COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/lower_prefixes_check.py")
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
@@ -446,11 +485,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_callback_lifted>")
     add_test(NAME cpu_aot_chained_ranges COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/chained_check.py" "$<TARGET_FILE:cpu_chained>"
-        "$<TARGET_FILE:cpu_chained_lifted>" "$<TARGET_FILE:cpu_register_probe>")
+        "$<TARGET_FILE:cpu_chained_lifted>" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_chained_jne>" "$<TARGET_FILE:cpu_chained_jne_lifted>")
     add_test(NAME cpu_aot_direct_call COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/direct_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_call_original>" "$<TARGET_FILE:cpu_call_original_lifted>"
         "$<TARGET_FILE:cpu_call_altered_lifted>")
+    add_test(NAME cpu_aot_repeated_call COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/repeat_call_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_repeat_original>" "$<TARGET_FILE:cpu_repeat_original_lifted>"
+        "$<TARGET_FILE:cpu_repeat_altered_lifted>" "$<TARGET_FILE:cpu_repeat_dropped>")
     foreach(kind IN ITEMS named ordinal)
         if(kind STREQUAL "named")
             set(prefix cpu_import)
@@ -495,6 +539,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_import_altered>"
         --two "$<TARGET_FILE:cpu_two_imports>" "$<TARGET_FILE:cpu_import_provider>"
             "$<TARGET_FILE:cpu_register_probe>")
+    add_test(NAME cpu_native_mutation COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_mutation_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_register_probe>" "$<TARGET_FILE:cpu_import_original>"
+        --provider "$<TARGET_FILE:cpu_import_provider>")
     add_test(NAME cpu_native_reloc_free COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_reloc_free_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_register_probe>" "$<TARGET_FILE:cpu_import_original>"

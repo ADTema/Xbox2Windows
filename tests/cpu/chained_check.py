@@ -15,18 +15,22 @@ from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges
 
 
-def check(native, compiled, harness):
+def check(native, compiled, harness, native_jne=None, compiled_jne=None):
     probe = register_probe(str(harness))
-    source = ctypes.CDLL(str(native)).choose_value
-    lifted = ctypes.CDLL(str(compiled)).try_lifted
-    for value, expected in ((None, 7), (0, 7), (1, 21), (0xffffffffffffffff, 21)):
-        slot = Word(value or 0)
-        address = 0 if value is None else ctypes.addressof(slot)
-        result, trace, regs = observe(probe, source, address, 0)
-        status, actual, kept = observe(probe, lifted, address, 0)
-        if (result != expected or regs != SENTINELS or kept != regs or status != 1
-                or actual != (trace[0], result, *trace[2:]) or slot.value != (value or 0)):
-            raise AssertionError((value, result, actual, kept))
+    pairs = [(native, compiled)]
+    if native_jne is not None and compiled_jne is not None:
+        pairs.append((native_jne, compiled_jne))
+    for orig_path, lifted_path in pairs:
+        source = ctypes.CDLL(str(orig_path)).choose_value
+        lifted = ctypes.CDLL(str(lifted_path)).try_lifted
+        for value, expected in ((None, 7), (0, 7), (1, 21), (0xffffffffffffffff, 21)):
+            slot = Word(value or 0)
+            address = 0 if value is None else ctypes.addressof(slot)
+            result, trace, regs = observe(probe, source, address, 0)
+            status, actual, kept = observe(probe, lifted, address, 0)
+            if (result != expected or regs != SENTINELS or kept != regs or status != 1
+                    or actual != (trace[0], result, *trace[2:]) or slot.value != (value or 0)):
+                raise AssertionError((orig_path.name, value, result, actual, kept))
 
     with pefile.PE(str(native), fast_load=True) as pe:
         entry = export_rva(pe, "choose_value")
@@ -35,6 +39,7 @@ def check(native, compiled, harness):
         assert len(ranges) == 3 and all(not a <= neighbor < b for a, b in ranges)
         body = pe.get_data(entry, ranges[0][1] - entry)
         jump = next(i for i in Decoder(64, body, ip=entry) if i.code == Code.JE_REL8_64)
+        jump_opcode_offset = pe.get_offset_from_rva(jump.ip)
         jump_offset = pe.get_offset_from_rva(jump.ip + 1)
         move = next(i for i in Decoder(64, body, ip=entry) if i.code == Code.MOV_R32_IMM32)
         move_offset = pe.get_offset_from_rva(move.ip)
@@ -52,7 +57,8 @@ def check(native, compiled, harness):
                  (parent_offset, struct.pack("<III", *ranges[1], info), "invalid unwind chain"),
                  (header_offset, bytes([(4 << 3) | 0]), "unsupported chained unwind header"),
                  (header_offset, bytes([(4 << 3) | 3]), "unsupported chained unwind header"),
-                 (header_offset, bytes([(5 << 3) | 2]), "unsupported chained unwind header")]
+                 (header_offset, bytes([(5 << 3) | 2]), "unsupported chained unwind header"),
+                 (jump_opcode_offset, b"\x78", "expected JE or JNE after TEST")]
     with TemporaryDirectory() as folder:
         for offset, patch, reason in controls:
             damaged = bytearray(data)
@@ -85,7 +91,7 @@ def check(native, compiled, harness):
                 raise
         else:
             raise AssertionError("strict translation accepted an indirect call")
-    print("two null paths, two non-null inputs, RBX/RSI, guarded writes, version-2 chained unwind and seven rejection controls passed")
+    print("two null paths, two non-null inputs (JE and JNE), RBX/RSI, guarded writes, version-2 chained unwind and eight rejection controls passed")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,20 @@ OPERATORS = {0x89: "=", 0x8b: "=", 0x01: "+=", 0x03: "+=",
              0x29: "-=", 0x2b: "-=", 0x31: "^=", 0x33: "^="}
 
 
+def r8_register_move(body, pos):
+    """Decode a 64-bit register move between R8 and a profile GPR as (write, read)."""
+    if pos + 3 > len(body) or body[pos + 2] >> 6 != 3:
+        return None
+    rex, opcode, modrm = body[pos:pos + 3]
+    reg, rm = GPR.get((modrm >> 3) & 7), GPR.get(modrm & 7)
+    # REX.B selects R8 in the r/m field and REX.R selects it in the reg field.
+    if rex == 0x49 and modrm & 7 == 0 and reg:
+        return {0x8b: (reg, "r8"), 0x89: ("r8", reg)}.get(opcode)
+    if rex == 0x4c and (modrm >> 3) & 7 == 0 and rm:
+        return {0x8b: ("r8", rm), 0x89: (rm, "r8")}.get(opcode)
+    return None
+
+
 def lift_body(start, code, *, caller, bind_import=None):
     # In this profile only RBX/RSI survive the call. The host compiler owns
     # physical register allocation and emits its own ABI frame for each function.
@@ -24,6 +38,8 @@ def lift_body(start, code, *, caller, bind_import=None):
         raise ValueError(f"unsupported save/restore frame at RVA {start:#x}")
     body = code[len(prologue):-len(epilogue)]
     available = {"rcx", "rdx", "r8"}
+    # Registers that hold the entry R8 value, so stores stay inside the trace.
+    pointer = {"r8"}
     lines = []
     target = None
     pos = 0
@@ -33,8 +49,10 @@ def lift_body(start, code, *, caller, bind_import=None):
         write = None
         via_iat = body[pos:pos + 2] == b"\xff\x15"
         is_call = via_iat or body[pos] == 0xe8
+        r8_move = r8_register_move(body, pos)
         if is_call:
-            if not caller or target is not None:
+            # Repeated direct calls must share one target, so one callee is lifted.
+            if not caller or via_iat and target is not None:
                 raise ValueError(f"unexpected additional call at RVA {rva:#x}")
             length = 6 if via_iat else 5
             if pos + length > len(body):
@@ -47,12 +65,22 @@ def lift_body(start, code, *, caller, bind_import=None):
                 target = ("import", name)
                 callee = f"::{name}"
             else:
+                if target is not None and target != ("direct", address):
+                    raise ValueError(f"call to a second target at RVA {rva:#x}")
                 target = ("direct", address)
                 callee = "lifted_callee"
             reads = {"rcx", "rdx", "r8"}
             statement = f"rax = {callee}(rcx, rdx, r8);"
             write = "rax"
             pos += length
+        elif r8_move:
+            write, source = r8_move
+            reads = {source}
+            if write == "r8":
+                statement = f"r8 = reinterpret_cast<word*>({source});"
+            else:
+                statement = f"{write} = reinterpret_cast<word>(r8);"
+            pos += 3
         elif body[pos:pos + 2] == b"\x49\x89" and pos + 3 <= len(body):
             modrm = body[pos + 2]
             src = GPR.get((modrm >> 3) & 7)
@@ -93,10 +121,18 @@ def lift_body(start, code, *, caller, bind_import=None):
 
         if not reads <= available:
             raise ValueError(f"undefined register at RVA {rva:#x}: {sorted(reads - available)}")
+        if r8_move and write == "r8" and source not in pointer:
+            raise ValueError(f"R8 reloaded without the output pointer at RVA {rva:#x}")
         if is_call:
             available.intersection_update({"rbx", "rsi"})
+            pointer.intersection_update({"rbx", "rsi"})
         if write:
             available.add(write)
+            # Only an R8 move copies the output pointer; any other write replaces it.
+            if r8_move:
+                pointer.add(write)
+            else:
+                pointer.discard(write)
         lines.append("    " + statement)
 
     if "rax" not in available or (caller and target is None):

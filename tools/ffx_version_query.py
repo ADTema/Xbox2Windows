@@ -13,6 +13,7 @@ from cpu_ranges import function_ranges, image_bytes
 LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
 UPSCALER = "faff02f294a7e9149ce079dffe3dedbcabe99b1f180ab14222aa8689e00a75fa"
 REGS = {getattr(R, n.upper()): n for n in "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15".split()}
+HIGH_BYTE = {R.AH, R.BH, R.CH, R.DH}
 UINT = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
 
 INTEGER_HEADER = """#include <array>
@@ -80,6 +81,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             kind = i.op_kind(n)
             if kind == K.REGISTER:
                 register = i.op_register(n)
+                if register in HIGH_BYTE:
+                    return f"static_cast<uint8_t>({reg(register)} >> 8)"
                 return f"static_cast<{UINT[RegisterExt.size(register)]}>({reg(register)})"
             if kind == K.MEMORY:
                 return f"load<{UINT[MemorySizeExt.size(i.memory_size)]}>({address()})"
@@ -89,6 +92,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             if i.op0_kind == K.MEMORY:
                 return f"store<{UINT[MemorySizeExt.size(i.memory_size)]}>({address()}, {expr});"
             dest = i.op0_register
+            if dest in HIGH_BYTE:
+                return f"{reg(dest)} = ({reg(dest)} & ~0xff00ull) | (static_cast<word>(static_cast<uint8_t>({expr})) << 8);"
             size = RegisterExt.size(dest)
             value = f"static_cast<{UINT[size]}>({expr})"
             if size < 4:
@@ -97,6 +102,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
 
         if host_ops and i.ip in host_ops:
             stmt = host_ops[i.ip]
+        elif i.segment_prefix in (R.FS, R.GS) or i.has_lock_prefix:
+            # FS/GS select a thread block base and LOCK makes the access atomic;
+            # the flat loads and stores below would silently drop both.
+            raise ValueError(f"unsupported instruction prefix at {i.ip:#x}: {i}")
         elif op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP):
             target = i.near_branch_target
             if target not in allowed:

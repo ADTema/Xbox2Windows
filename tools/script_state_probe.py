@@ -101,7 +101,8 @@ def tree_arrays(fields):
                    struct.iter_unpack("<IIBBHI", schema[pos:end])}
         schemas[kind] = size, members
         pos = end
-    if (joaat("attributes"), 0, 0x5c) not in schemas.get(root_kind, (0, set()))[1]:
+    root_size, root_members = schemas.get(root_kind, (0, set()))
+    if root_size != len(root) or (joaat("attributes"), 0, 0x5c) not in root_members:
         return None
 
     def array(slot, stride, required):

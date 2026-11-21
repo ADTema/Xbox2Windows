@@ -123,16 +123,17 @@ ALU = {
     "floor": (1, "floor({0})"), "fract": (1, "frac({0})"),
     "add": (2, "({0} + {1})"), "mul": (2, "({0} * {1})"),
     "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
+    "subrev": (2, "({1} - {0})"),
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
 }
-# The n-prefixed predicates are also true for unordered operands, so they stay negations.
+# N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
     "f": "false", "tru": "true",
     "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}", "gt": "{0} > {1}",
     "lg": "({0} < {1} || {0} > {1})", "ge": "{0} >= {1}",
     "o": "({0} == {0} && {1} == {1})", "u": "({0} != {0} || {1} != {1})",
-    "nge": "!({0} >= {1})", "nlg": "!({0} < {1} || {0} > {1})", "ngt": "!({0} > {1})",
+    "nge": "!({0} >= {1})", "nlg": "({0} == {1} || isnan({0}) || isnan({1}))", "ngt": "!({0} > {1})",
     "nle": "!({0} <= {1})", "neq": "!({0} == {1})", "nlt": "!({0} < {1})",
 }
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
@@ -198,6 +199,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     mask = "entry"
     samples = 0
     sample_pending = False
+    sample_dest = set()
     exported = False
     ended = False
     for i, line in enumerate(instructions):
@@ -214,6 +216,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             pending.clear()
         elif line == "s_waitcnt vmcnt(0)":
             sample_pending = False
+            sample_dest.clear()
         elif m := match(r"s_mov_b64 s\[(\d+):(\d+)\], exec"):
             regs = registers(*m.groups(), 2)
             for n in regs:
@@ -294,7 +297,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             sample_pending = True
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
-        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|fract|add|mul|max|min|sub|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+                sample_dest.add(f"v{n}")
+        elif m := match(r"v_mov_b32(?:_e32|_e64)? (v\d+), (-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)"):
+            # A bit copy of a numeric value; integer inline constants are bit patterns.
+            dst, src = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid register move")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            value = fp_operand(src, scalar, vector, pending, sample_pending)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {value};")
+        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|fract|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
             if op == "fmac":
