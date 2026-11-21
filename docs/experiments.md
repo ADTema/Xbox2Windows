@@ -603,7 +603,7 @@ The handler therefore fills that byte by a desktop policy, not by a confirmed Sc
 - the policy applies only to queries of the current process;
 - a buffer shorter than 48 bytes fails with `ERROR_BAD_LENGTH`, as `VirtualQueryEx` does.
 
-With registration, the callers' predicates accept GPU-intended memory and reject everything else. What the console's tail byte means, and what sets it, remain open. `XMemGetWorkingSetStatistics` gets no handler: the selector `0x20000001` and the output units have no public reference.
+With registration, the callers' predicates accept GPU-intended memory and reject everything else. What the console's tail byte means, and what sets it, remain open. The selector `0x20000001` and the output units of `XMemGetWorkingSetStatistics` have no public reference either; the desktop `xmem.dll` below reports that call as unsupported.
 
 | CTest case | Inputs and checks |
 |---|---|
@@ -611,6 +611,28 @@ With registration, the callers' predicates accept GPU-intended memory and reject
 | `era_query_tail` | Negative control: before registration a committed read/write page fails the tail check. After registering two pages, the tail byte is set at the first, middle and last byte and clear on the next committed page and on a reserved page. The callers' predicates accept read/write and read-only, reject the source check on no-access, and reject both after decommit. A real handle to the process counts as the current process, and unregistering clears the flag. |
 | `era_query_registry` | Null, empty and wrapping ranges are refused. Exact, front, back, containing and contained overlaps are refused, adjacent ranges are accepted, and unregistering needs the exact base. |
 | `era_query_short` | A 47-byte buffer returns 0 with `ERROR_BAD_LENGTH` and is left untouched. A 48-byte buffer succeeds without writing the tail byte. A null buffer fails. |
+
+### Desktop xmem.dll
+
+`src/xmem_shim.cpp` builds `xmem.dll`, which exports the four functions the package DLLs import by name. The call shapes come from the observed call sites, not from a published header:
+
+| Export | Observed call shape | Desktop handling |
+|---|---|---|
+| `XMemAlloc` | Size and attribute word (Bink and AMD callers). | `era_heap::allocate`. Graphics memory types are also registered with `era_query`, so they count as GPU-intended. |
+| `XMemFree` | Allocation and the same attribute word. | Unregisters graphics allocations, then `era_heap::release_with_attributes`. |
+| `XMemVirtualQuery` | The four BVH callers pass the process in `rcx`, the address in `rdx` and a 64-byte buffer in `r8`; `r9` is not set, so there is no length argument. They test the 32-bit result in `eax`. | `era_query::query` on the 64-byte buffer; returns `TRUE` when it succeeds. |
+| `XMemGetWorkingSetStatistics` | The seven AMD callers pass `0x20000001` in `ecx` and an output address in `rdx` and test the 32-bit result. On failure each uses zero instead of the 64-bit value at `+8`. | Returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the output untouched. |
+
+The registration of graphics memory and the unsupported working-set call are desktop policies, not confirmed Scarlett behavior.
+
+A local scan of the inspected package's 16 DLLs together with this `xmem.dll` (`tools/pe_inventory.py`) resolved all six xmem import edges to it. The unresolved edges dropped from eight to two, both `d3d12_xs.dll` root-signature functions. The scan reads the images and runs no package code.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `xmem_shim_exports` | The four names resolve through `GetProcAddress`, and the test's named imports bind to the same module. |
+| `xmem_shim_allocation` | The Bink word returns 32-byte-aligned, zeroed heap memory. The AMD word returns committed read/write memory on a 64 KiB boundary that `XMemFree` releases (`MEM_FREE`). Zero size, a reserved bit and a physical memory type return null, and freeing null is a no-op for both memory types. |
+| `xmem_shim_query` | Graphics memory from `XMemAlloc` passes both BVH predicates and keeps the sentinel after `+0x30`, through the pseudo-handle and a real handle. After `XMemFree` the address reads as `MEM_FREE` with a clear tail. Heap memory fails the tail check, and an address outside user space returns `FALSE` without touching the buffer. |
+| `xmem_shim_working_set` | Returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the output untouched, so the callers' value is zero. |
 
 ## Offscreen rendering and readback
 
