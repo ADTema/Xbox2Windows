@@ -70,12 +70,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             if i.is_ip_rel_memory_operand:
                 return globals_[i.ip_rel_memory_address]
             terms = []
+            addr32 = False
             if i.memory_base != R.NONE:
+                addr32 |= RegisterExt.size(i.memory_base) == 4
                 terms.append(reg(i.memory_base))
             if i.memory_index != R.NONE:
+                addr32 |= RegisterExt.size(i.memory_index) == 4
                 terms.append(f"{reg(i.memory_index)} * {i.memory_index_scale}ull")
             terms.append(f"{i.memory_displacement}ull")
-            return " + ".join(terms)
+            expr = " + ".join(terms)
+            return f"static_cast<uint32_t>({expr})" if addr32 else expr
 
         def operand(n):
             kind = i.op_kind(n)
