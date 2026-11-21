@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 import pefile
-from iced_x86 import Code, Decoder, OpKind, Register as R
+from iced_x86 import Code, Decoder, OpKind, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -14,11 +14,20 @@ SAVED = {reg: f"saved_{reg}" for reg in (R.RBX, R.RBP, R.RDI, R.RSI, R.R12, R.R1
 GPRS = set(SAVED) | {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 
 
-def translate(image, name, partial=False, callback_offset=None):
+def translate(image, name, partial=False, callback_offset=None, ffx_destroy=False):
+    if ffx_destroy and (partial or callback_offset is not None):
+        raise ValueError("the destroy contract requires a complete translation and its own typed bindings")
     if callback_offset is not None and (not 0 <= callback_offset <= 0x7fffffff or callback_offset % 8):
         raise ValueError("callback slot must be a nonnegative aligned table offset")
     with pefile.PE(str(image), fast_load=True) as pe:
         entry = export_rva(pe, name)
+        free_slots = set()
+        if ffx_destroy:
+            pe.parse_data_directories(directories=[1])
+            free_slots = {imp.address - pe.OPTIONAL_HEADER.ImageBase
+                          for dll in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])
+                          if dll.dll.lower() == b"api-ms-win-crt-heap-l1-1-0.dll"
+                          for imp in dll.imports if imp.name == b"free"}
         ranges = function_ranges(pe, entry)
         instructions = {}
         for begin, end in ranges:
@@ -31,7 +40,7 @@ def translate(image, name, partial=False, callback_offset=None):
     returns = []
     lines = []
     steps = 0
-    def walk(ip, regs, stack, sp, visited, indent):
+    def walk(ip, regs, stack, sp, visited, indent, stage="entry", allocator_null=None):
         nonlocal steps
         while True:
             if ip not in instructions:
@@ -79,24 +88,67 @@ def translate(image, name, partial=False, callback_offset=None):
                     regs[dst] = address
             elif code == Code.MOV_R32_IMM32 and dst == R.EAX:
                 regs[R.RAX] = str(ins.immediate32)
+            elif code in (Code.MOV_RM32_R32, Code.MOV_R32_RM32) and ins.op0_kind == ins.op1_kind == OpKind.REGISTER:
+                dest, source = RegisterExt.full_register(dst), RegisterExt.full_register(src)
+                if dest not in GPRS or regs.get(source) in (None, *SAVED.values()):
+                    raise ValueError(f"unknown 32-bit register at {ip:#x}")
+                regs[dest] = f"static_cast<std::uint32_t>({regs[source]})"
             elif code == Code.TEST_RM64_R64 and dst == src and reg_src and regs[src] not in SAVED.values():
                 branch = instructions.get(ins.next_ip)
                 if branch is None or branch.code not in (Code.JE_REL8_64, Code.JE_REL32_64):
                     raise ValueError(f"expected JE after TEST at {ip:#x}")
                 lines.append(indent + f"if ({regs[src]} == 0) {{")
-                walk(branch.near_branch_target, regs.copy(), stack.copy(), sp, visited.copy(), indent + "    ")
+                checks_allocator = ffx_destroy and regs[src] == "second"
+                walk(branch.near_branch_target, regs.copy(), stack.copy(), sp, visited.copy(), indent + "    ",
+                     stage, True if checks_allocator else allocator_null)
                 lines.append(indent + "}")
+                if checks_allocator:
+                    allocator_null = False
                 ip = branch.next_ip
                 continue
             elif code in (Code.JMP_REL8_64, Code.JMP_REL32_64):
                 ip = ins.near_branch_target
                 continue
             elif code == Code.RETNQ:
+                if stage == "destroyed":
+                    raise ValueError(f"missing wrapper cleanup at {ip:#x}")
                 if sp or any(regs[r] != v for r, v in SAVED.items()) or regs.get(R.RAX) in (None, *SAVED.values()):
                     raise ValueError(f"unrestored state or unknown return at {ip:#x}")
                 returns.append(ip)
                 lines.extend([indent + f"*output = {regs[R.RAX]};", indent + "return 1;"])
                 return
+            elif code == Code.CALL_RM64 and ffx_destroy and ins.op0_kind == OpKind.MEMORY and simple:
+                first_arg = regs.get(R.RCX)
+                second_arg = regs.get(R.RDX)
+                if sp > -40 or (sp + 8) % 16 or first_arg in (None, *SAVED.values()):
+                    raise ValueError(f"invalid destroy call frame or argument at {ip:#x}")
+                result = None
+                if (stage == "entry" and disp == 8 and base in regs and regs[base] not in SAVED.values()
+                        and second_arg == "second"):
+                    lines.extend([
+                        indent + f"if (!known || !known->destroy || !known->table || known->table != {regs[base]}) return 0;",
+                        indent + "if (read_word(known->table + 8) != reinterpret_cast<word>(known->destroy)) return 0;",
+                        indent + "if (second != known->allocator) return 0;",
+                        indent + "if (second && (!known->dealloc || read_word(second + 16) != reinterpret_cast<word>(known->dealloc))) return 0;",
+                        indent + "if (!second && !known->release) return 0;",
+                    ])
+                    result = f"status_{ip:x}"
+                    lines.append(indent + f"const auto {result} = known->destroy(reinterpret_cast<void**>({first_arg}), reinterpret_cast<const Allocator*>(second));")
+                    stage = "destroyed"
+                elif (stage == "destroyed" and allocator_null is False and regs.get(base) == "second"
+                      and disp == 16 and second_arg not in (None, *SAVED.values())):
+                    lines.append(indent + f"known->dealloc(reinterpret_cast<void*>({first_arg}), reinterpret_cast<void*>({second_arg}));")
+                    stage = "released"
+                elif (stage == "destroyed" and allocator_null is True and ins.is_ip_rel_memory_operand
+                      and ins.ip_rel_memory_address in free_slots):
+                    lines.append(indent + f"known->release(reinterpret_cast<void*>({first_arg}));")
+                    stage = "released"
+                else:
+                    raise ValueError(f"unbound destroy call at {ip:#x}")
+                regs = {r: v for r, v in regs.items() if r in SAVED}
+                if result is not None:
+                    regs[R.RAX] = result
+                stack = {k: v for k, v in stack.items() if not sp <= k < sp + 32}
             elif (code == Code.CALL_RM64 and callback_offset is not None
                   and ins.op0_kind == OpKind.MEMORY and simple and base in regs
                   and regs[base] not in SAVED.values() and disp == callback_offset):
@@ -130,7 +182,14 @@ static word read_word(word address) {
     return value;
 }
 """
-    if callback_offset is None:
+    if ffx_destroy:
+        source += """struct Allocator;
+using Destroy = std::uint32_t (*)(void**, const Allocator*);
+using Dealloc = void (*)(void*, void*);
+struct DestroyBinding { word table; Destroy destroy; word allocator; Dealloc dealloc; void (*release)(void*); };
+extern "C" __declspec(dllexport) word try_destroy(word first, word second, word* output, const DestroyBinding* known) {
+"""
+    elif callback_offset is None:
         source += 'extern "C" __declspec(dllexport) word try_lifted(word first, word second, word* output) {\n'
     else:
         source += """using Callback = word (*)(word, word);
@@ -146,11 +205,12 @@ if __name__ == "__main__":
     parser.add_argument("export")
     parser.add_argument("output", type=Path)
     parser.add_argument("--partial", action="store_true", help="return status 0 at an indirect call")
+    parser.add_argument("--ffx-destroy", action="store_true", help="use the verified FidelityFX destroy and cleanup ABI")
     parser.add_argument("--callback-offset", type=lambda s: int(s, 0),
                         help="bind a table slot with a known Windows x64 word(word, word) callback ABI")
     args = parser.parse_args()
     try:
-        source, ranges, returns, stops = translate(args.image, args.export, args.partial, args.callback_offset)
+        source, ranges, returns, stops = translate(args.image, args.export, args.partial, args.callback_offset, args.ffx_destroy)
         args.output.write_text(source, encoding="utf-8")
         print(f"{len(ranges)} owned ranges, {len(returns)} return paths, indirect stops: {sorted(stops)}")
     except (ValueError, OSError, pefile.PEFormatError) as error:
