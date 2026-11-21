@@ -44,7 +44,7 @@ def region(pe, start, end):
     return ins
 
 
-def lower(body, initial, globals_, calls, exits):
+def lower(body, initial, globals_, calls, exits, *, host_ops=None):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
@@ -95,7 +95,9 @@ def lower(body, initial, globals_, calls, exits):
                 value = f"({reg(dest)} & ~{(1 << (8*size))-1}ull) | {value}"
             return f"{reg(dest)} = {value};"
 
-        if op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP):
+        if host_ops and i.ip in host_ops:
+            stmt = host_ops[i.ip]
+        elif op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP):
             target = i.near_branch_target
             if target not in allowed:
                 raise ValueError(f"unbound branch at {i.ip:#x}")
@@ -115,19 +117,25 @@ def lower(body, initial, globals_, calls, exits):
         elif op == M.LEA:
             stmt = write(address())
         elif op == M.CMP:
-            stmt = f"zero = ({operand(0)} == {operand(1)}); carry = ({operand(0)} < {operand(1)});"
+            # Sign-extended immediates arrive as 64-bit values; compare at the destination width.
+            width = UINT[MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)]
+            stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({operand(1)}); "
+                    f"zero = a == b; carry = a < b; }}")
         elif op == M.TEST:
             stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false;"
         elif op == M.IMUL and i.op_count in (2, 3) and RegisterExt.size(i.op0_register) == 4:
             lhs, rhs = operand(i.op_count - 2), operand(i.op_count - 1)
             stmt = (f"{{ const int64_t product = int64_t(int32_t({lhs})) * int32_t({rhs}); "
                     f"carry = product != int32_t(product); {write('product')} }}")
-        elif op in (M.SHL, M.SHR) and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
+        elif op == M.CDQ:
+            stmt = "rdx = uint32_t(int32_t(rax) >> 31);"
+        elif op in (M.SHL, M.SHR, M.SAR) and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
             size = RegisterExt.size(i.op0_register)
             bits = 8 * size
             count = i.immediate(1) & (bits - 1)
             shift, last = ("<<", bits-count) if op == M.SHL else (">>", count-1)
-            stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = a {shift} {count}; "
+            lhs = f"int{bits}_t(a)" if op == M.SAR else "a"
+            stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = {lhs} {shift} {count}; "
                     f"carry = ((a >> {last}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else ";"
         elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.DEC, M.SUB, M.SBB):
             operator = {M.ADD: "+", M.INC: "+", M.DEC: "-", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]

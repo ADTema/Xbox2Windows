@@ -43,6 +43,7 @@ struct PixelInput {
     DXGI_FORMAT format;
     std::vector<BYTE> rows;
     std::vector<Color> expected;
+    std::vector<BYTE> secondRows;
     std::vector<Word> constants = std::vector<Word>(64);
 };
 
@@ -103,6 +104,16 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         }
     }
     auto staging = upload(device, colors);
+    ComPtr<ID3D12Resource> secondTexture, secondStaging;
+    if (!input.secondRows.empty()) {
+        if (residentCount != 1 || firstResident || input.secondRows.size() != input.rows.size())
+            throw std::runtime_error("Invalid second texture extent");
+        for (UINT y = 0; y < rows[0]; ++y)
+            std::memcpy(colors.data() + y * layouts[0].Footprint.RowPitch,
+                        input.secondRows.data() + y * rowBytes[0], rowBytes[0]);
+        secondStaging = upload(device, colors);
+        secondTexture = resource(device, srcDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
     auto back = make_buffer(device, resultBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
     heapDesc.NumDescriptors = 1;
@@ -110,6 +121,7 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     ComPtr<ID3D12DescriptorHeap> rtvs, srvs;
     check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&rtvs)), "Pixel target heap");
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors = 2;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srvs)), "Pixel texture heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
@@ -121,6 +133,9 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     view.Texture2D.MostDetailedMip = firstResident;
     view.Texture2D.MipLevels = residentCount;
     device->CreateShaderResourceView(texture.Get(), &view, srvs->GetCPUDescriptorHandleForHeapStart());
+    auto secondHandle = srvs->GetCPUDescriptorHandleForHeapStart();
+    secondHandle.ptr += device->GetDescriptorHandleIncrementSize(heapDesc.Type);
+    device->CreateShaderResourceView(secondTexture.Get(), &view, secondHandle);
     ComputeCommands cmd(device, pso.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = cmd.list.Get();
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
@@ -134,6 +149,12 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (secondTexture) {
+        src.pResource = secondStaging.Get();
+        dst.pResource = secondTexture.Get();
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        transition(list, secondTexture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
     ID3D12DescriptorHeap* heaps[]{srvs.Get()};
     list->SetDescriptorHeaps(1, heaps);
     list->SetGraphicsRootSignature(root.Get());
@@ -207,6 +228,21 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
     std::vector<PixelInput> levels;
     levels.push_back(std::move(input));
     draw_verified(device, path, levels, 0, 0, nullptr);
+}
+
+void check_dual_pixel(ID3D12Device* device, const char* shader, const char* capture, bool swap)
+{
+    PixelInput input{8, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM};
+    for (auto blue : ramp) {
+        for (auto red : ramp) {
+            input.rows.insert(input.rows.end(), {BYTE(red), 0, 0, 255});
+            input.secondRows.insert(input.secondRows.end(), {0, 0, BYTE(blue), 255});
+            // The two nonzero channels use exact power-of-two scaling after UNORM conversion.
+            input.expected.push_back({expected_channel(red * 3) / 4, 0, expected_channel(blue) / 4, 1});
+        }
+    }
+    if (swap) std::swap(input.rows, input.secondRows);
+    draw_verified(device, shader, {input}, 0, 0, capture);
 }
 
 namespace {
