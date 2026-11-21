@@ -290,6 +290,23 @@ bool report_debug_errors(ID3D12InfoQueue* messages)
     return errors != 0;
 }
 
+// These operations create pipelines from cs_6_5 fixtures. An adapter below SM 6.5, such as the
+// Windows 10 in-box WARP (SM 6.2), rejects them at pipeline creation with E_INVALIDARG.
+bool needs_cs_6_5(std::string_view operation)
+{
+    return operation == "--buffer-ops" || operation == "--bvh-reads" || operation == "--bvh-waves" ||
+           operation == "--bvh-hits" || operation == "--bvh-packed" || operation == "--bvh-numeric" ||
+           operation == "--bvh-atomics";
+}
+
+bool supports_cs_6_5(ID3D12Device* device)
+{
+    D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_5};
+    check(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query fixture shader model");
+    std::printf("shader_model_capped_at_6_5=0x%x\n", model.HighestShaderModel);
+    return model.HighestShaderModel >= D3D_SHADER_MODEL_6_5;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3) return 2;
@@ -341,6 +358,7 @@ int main(int argc, char** argv)
         check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "Create device");
 #endif
         if (debug) check(device.As(&messages), "Read debug queue");
+        if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
         } else if (argc == 3 && operation == "--ffx-device-init") {

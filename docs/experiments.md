@@ -127,7 +127,7 @@ At the first free slot, the store at `0x2980` writes the index directly to the p
 | Controlled two-slot table, slot 0 occupied | 0 | 1 | 1 → 2 | Slot 1 becomes occupied. Its range starts after slot 0 at `0x32008` |
 | Both controlled slots occupied | 0 | `0xfeedface` preserved | 2 → 3 | None |
 
-The package translation and an independently compiled C++ control ran on the RTX 4060 Laptop and WARP using the commands above. The test compares the entire scratch buffer and provider output region, including bytes around the index. The exhaustion cases supply a new output field initialized to the sentinel. The dual-slot setup exercises a nonzero index with a controlled capacity and four nonzero sizes. Public CI runs the desktop control plus a source-built x64 scan and four-lane sum in `cpu_aot_heap_layout`.
+The package translation and an independently compiled C++ control ran on the RTX 4060 Laptop and WARP using the commands above. The test compares the entire scratch buffer and provider output region, including bytes around the index. The exhaustion cases supply a new output field initialized to the sentinel. The dual-slot setup exercises a nonzero index with a controlled capacity and four nonzero sizes. Public CI runs the desktop control plus a source-built x64 scan and four-lane sum in `cpu_aot_heap_layout`. The same fixture compares 32-bit registers with sign-extended 8-bit immediates such as `cmp ecx,-1`, which the lowerer evaluates at the operand width.
 
 The provider tests EAX at `0xcfc2`. A zero backend return continues initialization. It later loads the same index field into R8D at `0xd1f4` for the resource callback at `0x2e30`. On the default path the first descriptor identifies `FSR4UPSCALER_Recurrent` (ID 13), with its allocation mode and placed-resource flag both zero and the optional allocation callback unset. The intervening descriptor-builder call at `0xc4ff` resolves to a CPU-only helper at `0x7900`, and the import at `0x2ea1` is an XMem working-set query. The next call **on the device** is at `0x33cc`, Xbox vtable slot 76 (+0x260). Its arguments include heap properties, zero heap flags, a resource description, initial state, a null clear value, the `ID3D12Resource` IID and an output pointer. Those arguments match the shape of desktop committed-resource creation. The Windows replay below binds that call to the desktop device. [Desktop CreateCommittedResource signature](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createcommittedresource)
 
@@ -343,13 +343,13 @@ cmake --build --preset dev --target cpu_ordinal_original_lifted cpu_ordinal_alte
 ctest --preset dev --no-tests=error -R '^cpu_aot_ordinal_import$' -V
 ```
 
-For 249 input pairs both callers match the provider's observed arguments, guarded writes, register sentinels and expected return. Replacing the provider changes the return on all inputs. Both callers fail to load with error 126 when the DLL is absent and error 182 when the DLL exports the same link name but lacks ordinal 77. The static translator diagnoses a mismatched binding, a missing link name, a missing ordinal and a displacement into the middle of a slot.
+For 249 input pairs both callers match the provider's observed arguments, guarded writes, register sentinels and expected return. Replacing the provider changes the return on all inputs. Both callers fail to load with error 126 when the DLL is absent and error 182 when the DLL exports the same link name but lacks ordinal 77. The static translator diagnoses a mismatched binding, a missing link name, a missing ordinal and a displacement into the middle of a slot. When the provider is renamed `ws2_32.dll`, pefile names ordinal 77 from its built-in table. The translator still requires the `#77` binding and rejects that name.
 
 The local Bink DLL imports ordinal 1 from XAudio2_9.dll. A read-only check confirmed an executable export at that ordinal in this workstation's System32 provider. The Bink call's argument and result contract remains unverified.
 
 ## Mapping an image without LoadLibrary
 
-`tools/pe_map.cpp` maps an x64 PE32+ image into memory it allocates itself, away from the preferred base, and applies its DIR64 base relocations. It binds each ordinary import through a resolver supplied by the host, sets section protections, records the actual base in the mapped headers and registers `.pdata` with `RtlAddFunctionTable`. The original machine code runs unchanged. Header fields are checked against the file and image size before use. TLS directories, delay imports and entry points are rejected. [Issue #46](https://github.com/R0Y00/Xbox2Windows/issues/46)
+`tools/pe_map.cpp` maps an x64 PE32+ image into memory it allocates itself, away from the preferred base, and applies its DIR64 base relocations. It binds each ordinary import through a resolver supplied by the host, sets section protections, records the actual base in the mapped headers and registers `.pdata` with `RtlAddFunctionTable`. The original machine code runs unchanged. Header fields are checked against the file and image size before use. It then calls TLS callbacks and the entry point. Delay imports and TLS data templates are rejected. [Issue #46](https://github.com/R0Y00/Xbox2Windows/issues/46)
 
 ```powershell
 cmake --build --preset dev --target pe_map cpu_reloc_original cpu_import_original_lifted cpu_ordinal_original_lifted cpu_import_altered cpu_ordinal_altered cpu_register_probe
@@ -362,7 +362,7 @@ The test maps the named and ordinal import fixtures, `reloc_route` and a damaged
 - the IAT slot holds the export the resolver returned;
 - `RtlLookupFunctionEntry` finds `call_mix` in the registered table until the image is released.
 
-The mapped `call_mix` is compared over 249 input pairs on arguments, guarded writes, RBX/RSI sentinels and return value. It matches the reference and the same image loaded by Windows, and for the import fixtures it also matches the lifted DLL. If the import is bound to the altered provider instead of the linked one, only the return changes. An unbound import is rejected with its DLL and symbol or ordinal. Copies patched to have an entry point, an import directory that runs past the image or one smaller than a single descriptor are rejected before any import is requested. In a copy of the register probe with the `clobber_control` export address slot zeroed, that name no longer resolves while `probe` still does. TLS callbacks and entry-point calls remain open.
+The mapped `call_mix` is compared over 249 input pairs on arguments, guarded writes, RBX/RSI sentinels and return value. It matches the reference and the same image loaded by Windows, and for the import fixtures it also matches the lifted DLL. If the import is bound to the altered provider instead of the linked one, only the return changes. An unbound import is rejected with its DLL and symbol or ordinal. Copies patched to have an entry point outside any executable section, an import directory that runs past the image or one smaller than a single descriptor are rejected before any import is requested. In a copy of the register probe with the `clobber_control` export address slot zeroed, that name no longer resolves while `probe` still does.
 
 `cpu_native_seh` checks exception dispatch through a mapped image. In `seh_route`, `guarded_load(address, mode, trace)` names its own exception handler in its unwind data. The handler resumes an access violation raised by the load instruction at a recovery label with a fixed value in RAX, and declines every other exception. The cases run in one child process for the Windows-loaded original and another for the mapped copy, so a broken unwind crashes only the child and is reported as a failed check:
 
@@ -373,6 +373,20 @@ The mapped `call_mix` is compared over 249 input pairs on arguments, guarded wri
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_seh$' -V
+```
+
+### TLS callbacks and the entry point
+
+`tls_route` has an entry point and a TLS directory whose callback list holds one routine and whose data template is empty. Both routines report each call to `cpu_tls_sink.dll`, which outlives the image, so calls made during release stay visible. `cpu_native_tls` loads the image with `LoadLibraryW` and maps it with `pe_map`, each in its own child process, and compares the process notifications:
+
+- Attach: with both loaders the TLS callback runs before the entry point, each with `DLL_PROCESS_ATTACH`, the module base and a null reserved argument.
+- Detach: on Windows 11 build 26300, `FreeLibrary` called the TLS callback first and then the entry point, both with `DLL_PROCESS_DETACH`. `pe_map_release` follows that measured order. No Microsoft documentation specifies it.
+- Failed attach: in `cpu_tls_refuse` the entry point returns FALSE. Windows then sends a full detach in the same order, and `LoadLibraryW` fails with error 1114. In the same case `pe_map` sends the same detach and returns `MAP_INIT_FAILED`.
+
+The test ignores thread attach and detach, because they depend on unrelated threads in the process. Damaged copies are rejected before any notification: one with a nonzero `SizeOfZeroFill` as TLS data, one with the entry point moved into `.data`, and one with its TLS callback pointing into `.data`. The entry point and callbacks must lie in an executable section. The TLS directory and each callback slot are read after section protections are applied, so `pe_map` checks the live page protection with `VirtualQuery` before every such read, on attach and on release. In `tls_route` the callback list has its own read-only `.tlscb` section. Copies with `.data` or `.tlscb` made inaccessible are rejected as "TLS directory not readable" or "TLS callback list not readable". A list made `PAGE_NOACCESS` after mapping is skipped on release while the entry point is still detached. `pe_map_export` does not yet apply this check to the export tables. A list longer than 256 callbacks is rejected as unsupported. With `IMAGE_FILE_DLL` cleared, with or without an entry point, `LoadLibraryW` loads and frees the copy without calling the TLS callback or the entry point, and `pe_map` does the same. `pe_map` still applies the executable-section checks to such an image, where Windows would load it and call nothing. The callback list collected before attach is reused for the detach that follows a failed attach. The list is re-read on release; if it was overwritten with a non-executable address or made unreadable after mapping, only the entry point is detached. Implicit TLS data would need a slot in each thread's `ThreadLocalStoragePointer` array, which ntdll owns. `pe_map` therefore leaves `AddressOfIndex` as linked. In the test process, Windows wrote index 8 for this image even though its template is empty.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_tls$' -V
 ```
 
 ## Offline pixel shader recompilation
@@ -484,13 +498,15 @@ For each candidate the tool records SHA-256, architecture, entry RVA and section
 
 ### Bink allocation and release on the Windows heap
 
-The local test lowers the two default-allocator callers from x64 machine code to C++, links the result to a Windows process-heap adapter, and runs the new DLL. The translator resolves the named PE imports, including tail transfers through linker thunks. It specializes the callback slots to their initial null values. Custom Bink allocators and the console-specific meaning of the heap attributes remain open.
+The local test lowers the allocation and release callers and the exported `BinkSetMemory` setter from x64 machine code to C++, links the result to a Windows process-heap adapter, and runs the new DLL. The translator follows the setter's export jump and binds its two pointer stores to the same slots the allocation path reads. It also resolves the named PE imports, including tail transfers through linker thunks. The console-specific meaning of the heap attributes remains open.
 
 On Windows, the public native fixture, its translation and the locally translated callers passed the same checks:
 
 - Lengths 0 and `0xffffffff` returned null before reaching the allocator. Three forced allocation failures returned null after one request each. The largest input, `0x100000001`, verified 64-bit size handling without a large allocation.
 - Each accepted length requested 64 extra bytes with attributes `0x05e50000`. Returning heap-backed storage at each of the 32 possible base residues produced a 32-byte-aligned user pointer. The check wrote the entire payload and compared both header bytes and the surrounding guards.
 - With 32 allocations live, releasing them in reverse order passed each original base to the adapter once with the allocation attributes. All 32 backing blocks were freed by `HeapFree`. Releasing null made no allocator call.
+- Callback pairs A and B each received one allocation request (97 and 193 bytes for 33- and 129-byte payloads). Both blocks contained the corresponding release function address, and the payload and guards matched. After installing B, releasing A's block called A's release function once with A's original base. After clearing the callbacks, releasing B's block likewise called B once with B's base. Neither operation called the XMem adapter.
+- A null custom return for a 65-byte payload led to exactly one 129-byte `XMemAlloc` request. After switching callbacks, that block went back to `XMemFree` once with the original base and attributes. When both allocation attempts failed the caller returned null. A separate all-ones custom return stopped the request before the XMem adapter.
 
 For the public control, build `cpu_bink_heap_lifted` in the dev preset, then run `ctest --preset dev -R '^cpu_aot_bink_heap$' --no-tests=error -V`. For a local package, set the CMake cache entries `BINK_HEAP_IMAGE` to the DLL path and `BINK_HEAP_ENTRIES` to the semicolon-separated allocation and release function **entry** RVAs for that image. Build `cpu_bink_package_lifted` and run `cpu_aot_bink_package_heap`. Generated translations stay in the build directory.
 
