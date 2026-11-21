@@ -630,6 +630,8 @@ On Linux, the fixture was assembled and linked with LLVM (`llvm-mc`, `lld-link`)
 
 The jump-table translator wraps a 67h (32-bit) effective address at 32 bits and zero-extends it, as the hardware does. It rejects EIP- and ESP-based operands. `cpu_aot_switch_addr32` builds `lea rax, [ecx+1]`, `lea rax, [ecx-8]`, `mov eax, [ecx-8]` and `mov [ecx+8], edx` from separate MASM source. It compares the native and translated images over wrapped sums and upper-half register noise, using a page committed below 4 GiB for the load and store. Before this change the translation returned `0x100000000` for `lea_wrap(0xffffffff)` where the hardware returns 0. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_switch_addr32$' -V`.
 
+The generated C++ follows address order, so a function that continues in code below its entry starts with a jump to the entry. A leaf without unwind data can reach such code through a jump, because it may use any unowned bytes of its section. Before this jump was emitted, the translation of such a function began at its lowest instruction and never ran the entry. `cpu_aot_entry_order` builds `inc_square`, which increments RCX and jumps to `square_tail` below it, and `pick_tail`, which branches there on a comparison. Both match the native exports on return, guarded trace, RBX and RSI over 249 input pairs. The control export `square_tail`, whose entry is its lowest instruction, still starts at the entry. A function whose chained unwind range lies below its entry takes the same path and has no fixture yet.
+
 ### Delay imports
 
 `delay_route` imports `delayed_value` from `cpu_delay_provider.dll` by name and `delayed_ordinal` by ordinal 2 with `/DELAYLOAD`, and exports one caller for each. `cpu_native_delay` compares two paths: `LoadLibrary` plus the image's own delay helper, and `pe_map` with a resolver bound to the same provider. The mapped calls return the provider values, and IAT slot checks confirm both hold the `GetProcAddress` results before the calls. Binding the altered provider returns its values instead.
@@ -657,6 +659,8 @@ python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15
 ```
 
 On Windows, use the Python-enabled build from the project README. Each backend draws a copy, a red/blue swap, a nonlinear curve and a compare-and-select program, the last two with two sets of constants each. It compares all four channels of 4,096 pixels bitwise with an independent CPU reference. Negative controls change the expected channel order, the bound gain or the comparison threshold and must report a mismatch. The select program uses only comparisons, one subtraction and selects, so its reference contains no transcendental or fused step and assumes only correctly rounded UNORM sampling. Its inputs are finite, so NaN operands remain unmeasured. The absolute-value fixture also draws abs(0.5 - red) and checks that removing the modifier produces a mismatch. The add, multiply and move program is drawn with two sets of constants, and replacing its reversed subtractions with forward ones must produce a mismatch. Its reference asserts that every addition, subtraction and multiplication is exact in binary32 for the test inputs, so it does not depend on rounding direction or fusion.
+
+The same binary and draw checks cover `v_trunc_f32` in e32 and e64 forms. The lowerer emits HLSL `trunc`, which rounds toward zero and returns a floating-point value. With two constant sets, the RTX 5080 and WARP draws matched all four channels of 4,096 pixels per draw against the CPU reference. The fixture covers both signs, signed zero, source negation and absolute value, and both clamp bounds. Replacing truncation with floor changed the first pixel on both adapters. Removing the upper clamp changed alpha from 1 to 2 in the first pixel on WARP. The source-built fixture verifies desktop readback with the bindings above. Execution with a title's own pipeline state remains unverified.
 
 To supply a reference for another arithmetic program, run `offscreen_check.exe hardware --check-pixel-case shader.cso reference.case`. The case contains 256 bytes of constants followed by 64 expected RGBA colors in row-major little-endian binary32, one for each texel of the test texture. Generate the expected colors after round-toward-zero half export and widening back to float.
 
@@ -1011,6 +1015,26 @@ cmake --build out/build/dxc-check
 ctest --test-dir out/build/dxc-check --no-tests=error -R '^shader_metadata_probe$' -V
 ```
 
+### Retargeting dxil-ms-xb2 modules to desktop DXIL
+
+`tools/dxil_retarget.py` parses LLVM 3.7 bitcode blocks and records without modifying opaque subblocks such as function bodies. It rewrites `MODULE_CODE_TRIPLE` from `dxil-ms-xb2` to `dxil-ms-dx` and removes the `METADATA_NAME`/`METADATA_NAMED_NODE` pair for `xbox.compiler.options` in `METADATA_BLOCK_ID`, preserving numbered metadata indices. For a DXBC container it also canonicalizes the `DXIL` program header to `BitcodeOffset=16`, retargets any DXIL `STAT` reflection part, clears the `0x03000000` root signature flag pair in `RTS0` (unless `--keep-root-flags` is set) and zeroes the stale 16-byte DXBC digest. Desktop DXC rejects `dxil-ms` as an unknown triple; `dxil-ms-dx` is the accepted desktop DXIL triple.
+
+On the local `XboxBvhBuilder.dll` (SHA-256 `99f803ac22c01ef329dddb1d40be67238d2a812d01e8d040b3cb5135bc23707e`; 52 SM 6.5 compute containers), 9 modules make no direct `xbox.*` calls (`0x25700`, `0x35720`, `0x3ab00`, `0x46880`, `0x92e30`, `0xb3ae0`, `0xb4bd0`, `0xb5be0`, `0xb82e0`). With `dxil.dll` 1.9.2602.17 through `root_probe`:
+
+- Before retargeting, all 9 failed both container and `ModuleOnly` validation with `0x80aa0009` (`Unknown target triple 'dxil-ms-xb2'` and `Named metadata 'xbox.compiler.options' is unknown`).
+- With `--keep-root-flags`, all 9 passed `ModuleOnly` (`0x00000000`, zero diagnostics) and all 9 failed container validation with `0x80aa0013` (`Unsupported bit-flag set (root signature flags 0x3000000)`).
+- With default container retargeting (clearing `0x03000000`), all 9 passed both `ModuleOnly` and container validation (`0x00000000`, zero diagnostics).
+
+The other 43 BVH modules still fail validation after retargeting because of direct `xbox.*` calls and aggregate `insertvalue`/`extractvalue` instructions used with those intrinsics. The 29 AMD upscaler containers carry `RTS0` and `ACCC` without a `DXIL` part. Re-signing containers for live `CreateComputePipelineState` execution remains separate work.
+
+Public CI tests pure-Python bitcode/container controls (`dxil_retarget_controls`) and source-built `compute_root.cso` and `CopyBlocks.cso` shaders synthetically injected with `dxil-ms-xb2`, `xbox.compiler.options`, `BitcodeOffset=112` and `RTS0` flags `0x03000000` (`dxil_retarget_probe`), including negative controls for unmodified xb2, `--target-triple dxil-ms` and `--keep-root-flags`.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^dxil_retarget_' -V
+# Local validation of the 9 modules without xbox.* calls:
+.\out\pe-env\Scripts\python.exe -B tools/dxil_retarget.py --pe "game-files/<build-directory>/XboxBvhBuilder.dll" --only-without-xbox-calls --probe out/build/dev/root_probe.exe --report out/calls/dxil-retarget.json
+```
+
 ### BVH reads and cross-lane operations
 
 In `out/calls/desktop-roots.json`, `static_operands` from `tools/probe_roots.py` groups functions by module count, call site and operand form. The counts below describe static instructions across the 52 BVH programs. Runtime frequency is unknown.
@@ -1216,6 +1240,8 @@ The optional capture contains verified, top-down RGBA8 pixels converted from the
 Run `python -B tools/texture_descriptors.py <archive.ttpf>` to group descriptors in the first raw ETPF table by width, height, DXGI format number and mip-marker byte. The reader checks stored and logical bounds and reads up to 1 MiB of descriptors in batches of at most 4 KiB. It leaves texture payloads unread. The marker alone does not identify a resident mip. [Published descriptor layout](https://github.com/rpatty-dev/PercyStar/blob/1b710c5349ef1911d94092f19173e9813dfb300c/src/tex.rs#L748-L785)
 
 Add `--raw-page-map INDEX` to report the logical and file offsets of a zero-based descriptor's first 4 KiB page. The containing interval must be raw and have equal stored and logical lengths. The command checks that boundary positions increase strictly, reads the boundary table in batches of at most 4 KiB, and accepts tables up to 1 MiB. It reads no texture payload.
+
+Use `--zlib-segment INDEX` for a descriptor in a codec-8 interval. This mode reads and decompresses the selected interval, limiting both stored and decoded sizes to 1 MiB. It verifies the zlib checksum and end of stream, checks the decoded length against the declared extent, and requires any trailing bytes to be zero. The report contains the fields for a `Segment`, its logical start, and the descriptor page's offset within it. Decoded bytes are not included in the report.
 
 `tools/section_probe.py` samples up to 8 MiB at the start, middle and end of each input. It looks for 16-byte-aligned zlib streams, with stored and decoded sizes capped at 256 KiB. A section record must start and end with the requested tags, and its big-endian section sizes must exactly cover the decoded buffer. Streams cut off by a window or size cap are omitted. Counts establish record boundaries within sampled regions. Interpreting payload fields or validating a checksum inside a section requires its format.
 
