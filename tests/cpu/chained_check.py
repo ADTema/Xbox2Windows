@@ -40,13 +40,19 @@ def check(native, compiled, harness):
         move_offset = pe.get_offset_from_rva(move.ip)
         info = next(r.struct.UnwindData for r in pe.DIRECTORY_ENTRY_EXCEPTION
                     if r.struct.BeginAddress == ranges[1][0])
+        header_offset = pe.get_offset_from_rva(info)
         parent_offset = pe.get_offset_from_rva(info + 4)
 
     data = native.read_bytes()
+    assert data[header_offset] == (4 << 3) | 1
+    expected_translation = translate(native, "choose_value")
     controls = [(jump_offset, struct.pack("b", target - jump.next_ip), "outside owned instruction")
                 for target in (neighbor, ranges[1][0] + 1)]
     controls += [(parent_offset, struct.pack("<I", entry + 1), "invalid unwind chain"),
-                 (parent_offset, struct.pack("<III", *ranges[1], info), "invalid unwind chain")]
+                 (parent_offset, struct.pack("<III", *ranges[1], info), "invalid unwind chain"),
+                 (header_offset, bytes([(4 << 3) | 0]), "unsupported chained unwind header"),
+                 (header_offset, bytes([(4 << 3) | 3]), "unsupported chained unwind header"),
+                 (header_offset, bytes([(5 << 3) | 2]), "unsupported chained unwind header")]
     with TemporaryDirectory() as folder:
         for offset, patch, reason in controls:
             damaged = bytearray(data)
@@ -60,6 +66,12 @@ def check(native, compiled, harness):
                     raise
             else:
                 raise AssertionError(f"accepted control: {reason}")
+        # Version-2 UNWIND_INFO keeps the same chained RUNTIME_FUNCTION trailer layout as version 1.
+        v2 = bytearray(data)
+        v2[header_offset] = (4 << 3) | 2
+        v2_path = Path(folder) / "v2.dll"
+        v2_path.write_bytes(v2)
+        assert translate(v2_path, "choose_value") == expected_translation
         # Preserve instruction boundaries after a synthetic call through [rbx].
         damaged = bytearray(data)
         damaged[move_offset:move_offset + 5] = bytes.fromhex("ff 13 90 90 90")
@@ -73,7 +85,7 @@ def check(native, compiled, harness):
                 raise
         else:
             raise AssertionError("strict translation accepted an indirect call")
-    print("two null paths, two non-null inputs, RBX/RSI, guarded writes and four rejection controls passed")
+    print("two null paths, two non-null inputs, RBX/RSI, guarded writes, version-2 chained unwind and seven rejection controls passed")
 
 
 if __name__ == "__main__":
