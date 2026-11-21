@@ -291,9 +291,14 @@ bool report_debug_errors(ID3D12InfoQueue* messages)
 
 int main(int argc, char** argv)
 {
-    if (argc != 3 && argc != 5 && argc != 6) return 2;
+    if (argc < 3) return 2;
     const std::string_view operation = argv[2];
-    if (argc == 6 && operation != "--check-bc7" && operation != "--check-bc7-mip1") return 2;
+    if (operation == "--check-bc7-tail") {
+        if (argc < 6 || argc > 16) return 2;
+    } else {
+        if (argc != 3 && argc != 5 && argc != 6) return 2;
+        if (argc == 6 && operation != "--check-bc7" && operation != "--check-bc7-mip1") return 2;
+    }
     if ((operation == "--check-bc7" && argc < 5) || (operation == "--check-bc7-mip1" && argc != 6)) return 2;
     const std::string_view mode = argv[1];
     if (mode != "warp" && mode != "hardware") return 2;
@@ -337,6 +342,8 @@ int main(int argc, char** argv)
         if (debug) check(device.As(&messages), "Read debug queue");
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
+        } else if (operation == "--check-bc7-tail") {
+            check_bc7_tail(device.Get(), argv[3], argv[4], argc - 5, argv + 5);
         } else if (argc == 6 && operation == "--check-bc7-mip1") {
             check_bc7_pixel(device.Get(), argv[3], argv[4], nullptr, argv[5]);
         } else if ((argc == 5 || argc == 6) && operation == "--check-bc7") {

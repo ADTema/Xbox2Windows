@@ -11,6 +11,7 @@ void check_texture_mips(ID3D12Device* device);
 void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr);
 void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* input,
                      const char* capture, const char* mip1 = nullptr);
+void check_bc7_tail(ID3D12Device* device, const char* shader, const char* firstMip, int count, char** paths);
 void check_bvh_root_roundtrip(ID3D12Device* device);
 void check_buffer_ops(ID3D12Device* device);
 void check_bvh_reads(ID3D12Device* device);

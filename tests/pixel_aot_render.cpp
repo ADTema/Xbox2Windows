@@ -1,9 +1,11 @@
 #include "bvh_fixture.h"
 #include "pixel_aot_vs.h"
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <fstream>
 #include <iterator>
+#include <string_view>
 
 using namespace bvh_fixture;
 
@@ -44,9 +46,10 @@ struct PixelInput {
     std::vector<Word> constants = std::vector<Word>(64);
 };
 
-void draw_verified(ID3D12Device* device, const char* path, const PixelInput& input, const char* capture,
-                   const PixelInput* mip1 = nullptr)
+void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
+                   UINT firstResident, UINT sampledLevel, const char* capture)
 {
+    const auto& input = levels.front();
     auto cb = upload(device, input.constants);
     std::ifstream file(path, std::ios::binary);
     std::vector<char> ps{std::istreambuf_iterator<char>(file), {}};
@@ -73,25 +76,26 @@ void draw_verified(ID3D12Device* device, const char* path, const PixelInput& inp
     ComPtr<ID3D12PipelineState> pso;
     check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), "Translated pixel pipeline");
 
-    const auto& sampled = mip1 ? *mip1 : input;
+    const auto& sampled = levels.at(sampledLevel);
     const UINT width = sampled.width * sampled.scale, height = sampled.height * sampled.scale;
-    auto srcDesc = texture_desc(input.width, input.height, input.format, D3D12_RESOURCE_FLAG_NONE);
-    srcDesc.MipLevels = mip1 ? 2 : 1;
+    auto srcDesc = texture_desc(input.width << firstResident, input.height << firstResident,
+                                input.format, D3D12_RESOURCE_FLAG_NONE);
+    const UINT residentCount = static_cast<UINT>(levels.size());
+    srcDesc.MipLevels = static_cast<UINT16>(firstResident + residentCount);
     auto dstDesc = texture_desc(width, height, desc.RTVFormats[0], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto texture = resource(device, srcDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     const D3D12_CLEAR_VALUE clear{desc.RTVFormats[0], {-1, -1, -1, -1}};
     auto target = resource(device, dstDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
-    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> layouts{};
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(residentCount);
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT resultLayout{};
     UINT64 sourceBytes, resultBytes;
-    std::array<UINT, 2> rows{};
-    std::array<UINT64, 2> rowBytes{};
-    device->GetCopyableFootprints(&srcDesc, 0, srcDesc.MipLevels, 0, layouts.data(), rows.data(), rowBytes.data(), &sourceBytes);
+    std::vector<UINT> rows(residentCount);
+    std::vector<UINT64> rowBytes(residentCount);
+    device->GetCopyableFootprints(&srcDesc, firstResident, residentCount, 0, layouts.data(), rows.data(), rowBytes.data(), &sourceBytes);
     device->GetCopyableFootprints(&dstDesc, 0, 1, 0, &resultLayout, nullptr, nullptr, &resultBytes);
     std::vector<BYTE> colors(sourceBytes);
-    const PixelInput* levels[]{&input, mip1};
-    for (UINT level = 0; level < srcDesc.MipLevels; ++level) {
-        const auto& packed = levels[level]->rows;
+    for (UINT level = 0; level < residentCount; ++level) {
+        const auto& packed = levels[level].rows;
         if (rowBytes[level] * rows[level] != packed.size()) throw std::runtime_error("Invalid texture row size");
         for (UINT y = 0; y < rows[level]; ++y) {
             auto offset = layouts[level].Offset + size_t(y) * layouts[level].Footprint.RowPitch;
@@ -110,7 +114,13 @@ void draw_verified(ID3D12Device* device, const char* path, const PixelInput& inp
     check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srvs)), "Pixel texture heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(target.Get(), nullptr, rtv);
-    device->CreateShaderResourceView(texture.Get(), nullptr, srvs->GetCPUDescriptorHandleForHeapStart());
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = input.format;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MostDetailedMip = firstResident;
+    view.Texture2D.MipLevels = residentCount;
+    device->CreateShaderResourceView(texture.Get(), &view, srvs->GetCPUDescriptorHandleForHeapStart());
     ComputeCommands cmd(device, pso.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = cmd.list.Get();
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
@@ -118,9 +128,9 @@ void draw_verified(ID3D12Device* device, const char* path, const PixelInput& inp
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.pResource = texture.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    for (UINT level = 0; level < srcDesc.MipLevels; ++level) {
+    for (UINT level = 0; level < residentCount; ++level) {
         src.PlacedFootprint = layouts[level];
-        dst.SubresourceIndex = level;
+        dst.SubresourceIndex = firstResident + level;
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -194,7 +204,9 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
         if (!file || file.peek() != std::char_traits<char>::eof())
             throw std::runtime_error("Expected a 256-byte constant buffer and 64 float4 reference colors");
     }
-    draw_verified(device, path, input, nullptr);
+    std::vector<PixelInput> levels;
+    levels.push_back(std::move(input));
+    draw_verified(device, path, levels, 0, 0, nullptr);
 }
 
 namespace {
@@ -229,13 +241,41 @@ PixelInput read_bc7_case(const char* fixture)
 void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* fixture,
                      const char* capture, const char* mip1)
 {
-    auto input = read_bc7_case(fixture);
+    std::vector<PixelInput> levels;
+    levels.push_back(read_bc7_case(fixture));
     if (mip1) {
         auto lower = read_bc7_case(mip1);
-        if (lower.width * 2 != input.width || lower.height * 2 != input.height)
+        if (lower.width * 2 != levels.front().width || lower.height * 2 != levels.front().height)
             throw std::runtime_error("Expected a half-size BC7 mip");
-        draw_verified(device, shader, input, capture, &lower);
-    } else {
-        draw_verified(device, shader, input, capture);
+        levels.push_back(std::move(lower));
+    }
+    draw_verified(device, shader, levels, 0, static_cast<UINT>(levels.size() - 1), capture);
+}
+
+void check_bc7_tail(ID3D12Device* device, const char* shader, const char* firstMip, int count, char** paths)
+{
+    const std::string_view arg(firstMip);
+    UINT first = 0;
+    const auto parsed = std::from_chars(arg.data(), arg.data() + arg.size(), first);
+    if (parsed.ec != std::errc{} || parsed.ptr != arg.data() + arg.size() || first > 10)
+        throw std::runtime_error("Invalid first resident mip");
+    std::vector<PixelInput> levels;
+    for (int i = 0; i < count; ++i) {
+        auto level = read_bc7_case(paths[i]);
+        if (levels.empty()) {
+            const UINT width = level.width << first, height = level.height << first;
+            if (width > 4096 || height > 4096 || UINT64(width) * height > 4 * 1024 * 1024)
+                throw std::runtime_error("Logical BC7 texture exceeds fixture bounds");
+        } else if (levels.back().width / 2 != level.width || levels.back().height / 2 != level.height) {
+            throw std::runtime_error("Expected consecutive BC7 mip sizes");
+        }
+        levels.push_back(std::move(level));
+    }
+    // Changing the viewport exercises the copy shader's implicit LOD with the same SRV range.
+    for (UINT mip = 0; mip < first + levels.size(); ++mip) {
+        levels.front().scale = mip < first ? 1u << (first - mip) : 1u;
+        const UINT selected = mip < first ? 0 : mip - first;
+        std::printf("requested_mip=%u sampled_mip=%u ", mip, selected + first);
+        draw_verified(device, shader, levels, first, selected, nullptr);
     }
 }
