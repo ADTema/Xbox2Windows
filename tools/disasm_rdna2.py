@@ -23,10 +23,12 @@ def decode_s_reg(reg_id: int) -> str:
         return "vcc_lo"
     if reg_id == 107:
         return "vcc_hi"
-    if reg_id == 108:
-        return "null"
+    if 108 <= reg_id <= 123:
+        return f"ttmp{reg_id - 108}"
     if reg_id == 124:
         return "m0"
+    if reg_id == 125:
+        return "null"
     if reg_id == 126:
         return "exec_lo"
     if reg_id == 127:
@@ -76,25 +78,21 @@ SOPP_OPS = {
     0x09: ("s_cbranch_execnz", "Branch if EXEC is non-zero"),
     0x0a: ("s_barrier", "Synchronize wavefronts in workgroup"),
     0x0c: ("s_waitcnt", "Wait for memory operations"),
-    0x14: ("s_inst_prefetch", "Instruction cache prefetch"),
-    0x19: ("s_clause", "Begin hard clause"),
-    0x1e: ("s_waitcnt_vscnt", "Wait for vector store counter"),
-    0x1f: ("s_waitcnt_vmcnt", "Wait for vector memory counter"),
-    0x20: ("s_waitcnt_expcnt", "Wait for export counter"),
-    0x21: ("s_waitcnt_lgkmcnt", "Wait for LDS/GDS/K/M counter"),
+    0x20: ("s_inst_prefetch", "Instruction cache prefetch"),
+    0x21: ("s_clause", "Begin hard clause"),
 }
 
 SOP1_OPS = {
-    0x00: ("s_mov_b32", "Scalar move 32-bit"),
-    0x01: ("s_mov_b64", "Scalar move 64-bit"),
-    0x02: ("s_cmov_b32", "Scalar conditional move 32-bit"),
-    0x03: ("s_cmov_b64", "Scalar conditional move 64-bit"),
-    0x04: ("s_not_b32", "Scalar bitwise NOT 32-bit"),
-    0x05: ("s_not_b64", "Scalar bitwise NOT 64-bit"),
-    0x06: ("s_wqm_b32", "Scalar whole-quad-mode 32-bit"),
-    0x07: ("s_wqm_b64", "Scalar whole-quad-mode 64-bit"),
-    0x20: ("s_swappc_b64", "Swap program counter 64-bit"),
-    0x22: ("s_setpc_b64", "Set program counter 64-bit"),
+    0x03: ("s_mov_b32", "Scalar move 32-bit"),
+    0x04: ("s_mov_b64", "Scalar move 64-bit"),
+    0x05: ("s_cmov_b32", "Scalar conditional move 32-bit"),
+    0x06: ("s_cmov_b64", "Scalar conditional move 64-bit"),
+    0x07: ("s_not_b32", "Scalar bitwise NOT 32-bit"),
+    0x08: ("s_not_b64", "Scalar bitwise NOT 64-bit"),
+    0x09: ("s_wqm_b32", "Scalar whole-quad-mode 32-bit"),
+    0x0a: ("s_wqm_b64", "Scalar whole-quad-mode 64-bit"),
+    0x20: ("s_setpc_b64", "Set program counter 64-bit"),
+    0x21: ("s_swappc_b64", "Swap program counter 64-bit"),
 }
 
 SOP2_OPS = {
@@ -102,11 +100,11 @@ SOP2_OPS = {
     0x01: ("s_sub_u32", "Scalar sub unsigned 32-bit"),
     0x02: ("s_add_i32", "Scalar add signed 32-bit"),
     0x03: ("s_sub_i32", "Scalar sub signed 32-bit"),
-    0x08: ("s_min_i32", "Scalar minimum signed 32-bit"),
-    0x09: ("s_min_u32", "Scalar minimum unsigned 32-bit"),
-    0x0a: ("s_max_i32", "Scalar maximum signed 32-bit"),
-    0x0b: ("s_max_u32", "Scalar maximum unsigned 32-bit"),
-    0x0c: ("s_cselect_b32", "Scalar conditional select 32-bit"),
+    0x06: ("s_min_i32", "Scalar minimum signed 32-bit"),
+    0x07: ("s_min_u32", "Scalar minimum unsigned 32-bit"),
+    0x08: ("s_max_i32", "Scalar maximum signed 32-bit"),
+    0x09: ("s_max_u32", "Scalar maximum unsigned 32-bit"),
+    0x0a: ("s_cselect_b32", "Scalar conditional select 32-bit"),
     0x0e: ("s_and_b32", "Scalar bitwise AND 32-bit"),
     0x0f: ("s_and_b64", "Scalar bitwise AND 64-bit"),
     0x10: ("s_or_b32", "Scalar bitwise OR 32-bit"),
@@ -120,17 +118,21 @@ SOP2_OPS = {
     0x20: ("s_lshr_b32", "Scalar logical shift right 32-bit"),
     0x21: ("s_lshr_b64", "Scalar logical shift right 64-bit"),
     0x22: ("s_ashr_i32", "Scalar arithmetic shift right 32-bit"),
-    0x28: ("s_mul_i32", "Scalar multiply signed 32-bit"),
+    0x26: ("s_mul_i32", "Scalar multiply signed 32-bit"),
 }
 
 SOPK_OPS = {
     0x00: ("s_movk_i32", "Scalar move 16-bit sign-extended immediate"),
-    0x01: ("s_cmovk_i32", "Scalar conditional move immediate"),
-    0x02: ("s_cmpk_eq_i32", "Scalar compare equal immediate"),
-    0x03: ("s_cmpk_lg_i32", "Scalar compare not-equal immediate"),
-    0x04: ("s_cmpk_gt_i32", "Scalar compare greater immediate"),
-    0x0e: ("s_addk_i32", "Scalar add immediate"),
-    0x0f: ("s_mulk_i32", "Scalar multiply immediate"),
+    0x02: ("s_cmovk_i32", "Scalar conditional move immediate"),
+    0x03: ("s_cmpk_eq_i32", "Scalar compare equal immediate"),
+    0x04: ("s_cmpk_lg_i32", "Scalar compare not-equal immediate"),
+    0x05: ("s_cmpk_gt_i32", "Scalar compare greater immediate"),
+    0x0f: ("s_addk_i32", "Scalar add immediate"),
+    0x10: ("s_mulk_i32", "Scalar multiply immediate"),
+    0x17: ("s_waitcnt_vscnt", "Wait for vector store counter"),
+    0x18: ("s_waitcnt_vmcnt", "Wait for vector memory counter"),
+    0x19: ("s_waitcnt_expcnt", "Wait for export counter"),
+    0x1a: ("s_waitcnt_lgkmcnt", "Wait for LDS/GDS/K/M counter"),
 }
 
 SMEM_OPS = {
@@ -150,21 +152,21 @@ VOP1_OPS = {
     0x00: ("v_nop", "Vector no-op"),
     0x01: ("v_mov_b32_e32", "Vector copy 32-bit"),
     0x02: ("v_readfirstlane_b32", "Read first active lane into SGPR"),
-    0x04: ("v_not_b32_e32", "Vector bitwise NOT"),
-    0x05: ("v_bfrev_b32_e32", "Vector bit-reverse"),
-    0x0b: ("v_rcp_f32_e32", "Reciprocal 1/x float32"),
-    0x0e: ("v_rsq_f32_e32", "Reciprocal square root 1/sqrt(x)"),
-    0x1f: ("v_log_f32_e32", "Logarithm log2(x) float32"),
-    0x20: ("v_exp_f32_e32", "Exponent 2^x float32"),
-    0x22: ("v_sin_f32_e32", "Sine float32"),
-    0x23: ("v_cos_f32_e32", "Cosine float32"),
-    0x25: ("v_sqrt_f32_e32", "Square root sqrt(x) float32"),
-    0x2b: ("v_cvt_f32_i32_e32", "Convert int32 to float32"),
-    0x2c: ("v_cvt_f32_u32_e32", "Convert uint32 to float32"),
-    0x2d: ("v_cvt_u32_f32_e32", "Convert float32 to uint32"),
-    0x2e: ("v_cvt_i32_f32_e32", "Convert float32 to int32"),
-    0x33: ("v_cvt_f16_f32_e32", "Convert float32 to float16"),
-    0x34: ("v_cvt_f32_f16_e32", "Convert float16 to float32"),
+    0x05: ("v_cvt_f32_i32_e32", "Convert int32 to float32"),
+    0x06: ("v_cvt_f32_u32_e32", "Convert uint32 to float32"),
+    0x07: ("v_cvt_u32_f32_e32", "Convert float32 to uint32"),
+    0x08: ("v_cvt_i32_f32_e32", "Convert float32 to int32"),
+    0x0a: ("v_cvt_f16_f32_e32", "Convert float32 to float16"),
+    0x0b: ("v_cvt_f32_f16_e32", "Convert float16 to float32"),
+    0x25: ("v_exp_f32_e32", "Exponent 2^x float32"),
+    0x27: ("v_log_f32_e32", "Logarithm log2(x) float32"),
+    0x2a: ("v_rcp_f32_e32", "Reciprocal 1/x float32"),
+    0x2e: ("v_rsq_f32_e32", "Reciprocal square root 1/sqrt(x)"),
+    0x33: ("v_sqrt_f32_e32", "Square root sqrt(x) float32"),
+    0x35: ("v_sin_f32_e32", "Sine float32"),
+    0x36: ("v_cos_f32_e32", "Cosine float32"),
+    0x37: ("v_not_b32_e32", "Vector bitwise NOT"),
+    0x38: ("v_bfrev_b32_e32", "Vector bit-reverse"),
 }
 
 VOP2_OPS = {
