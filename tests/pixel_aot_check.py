@@ -38,17 +38,32 @@ def assembly(swap):
     ]
 
 
-def dual_program():
+DUAL_CASES = ("forward", "reverse", "reuse")
+
+
+def dual_program(case="forward", *, swap_weights=False):
     program = assembly(False)
-    load = program.index("s_mov_b32 s40, 1")
-    program.insert(load, "s_load_dwordx8 s[56:63], s[20:21], 0x20")
-    pos = program.index("s_waitcnt vmcnt(0)")
-    program.insert(pos, "image_sample v[20:23], v[8:9], s[56:63], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D")
+    first = next(i for i, line in enumerate(program) if line.startswith("image_sample"))
+    sample_a = program[first]
+    sample_b = sample_a.replace("v[12:15]", "v[20:23]").replace("s[28:35]", "s[56:63]")
+    load_b = "s_load_dwordx8 s[56:63], s[20:21], 0x20"
+    if case == "reuse":
+        # Finish A before reloading the same descriptor registers for B.
+        program[first:first+1] = [sample_a, "s_waitcnt vmcnt(0)",
+                                  load_b.replace("56:63", "28:35"), "s_waitcnt lgkmcnt(0)",
+                                  sample_b.replace("56:63", "28:35")]
+    elif case in ("forward", "reverse"):
+        program[first:first+1] = [sample_a, sample_b] if case == "forward" else [sample_b, sample_a]
+        program.insert(program.index("s_mov_b32 s40, 1"), load_b)
+    else:
+        raise ValueError(f"Unknown dual-texture case: {case}")
+    pos = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
+    a, b = ("0x3e800000", "0x3f400000") if swap_weights else ("0x3f400000", "0x3e800000")
     ops = []
     for i in range(4):
-        ops.extend([f"v_mul_legacy_f32_e32 v{12+i}, 0x3f400000, v{12+i}",
-                    f"v_fma_f32 v{12+i}, 0x3e800000, v{20+i}, v{12+i}"])
-    program[pos+2:pos+2] = ops
+        ops.extend([f"v_mul_legacy_f32_e32 v{12+i}, {a}, v{12+i}",
+                    f"v_fma_f32 v{12+i}, {b}, v{20+i}, v{12+i}"])
+    program[pos:pos] = ops
     return program
 
 
@@ -165,7 +180,10 @@ def check_controls(directory):
 
 
 def check_binary(directory, assembler, objcopy, library):
-    for instructions, lower_fixture in ((assembly(False), translate), (assembly(True), translate), (curve(), translate), (dual_program(), translate_dual)):
+    fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate)]
+    fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
+    fixtures.append((dual_program(swap_weights=True), translate_dual))
+    for instructions, lower_fixture in fixtures:
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
         binary = directory / "fixture.bin"
@@ -206,13 +224,20 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Stale reference accepted after changing the bound constants")
-    source.write_text(translate_dual(dual_program()), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     capture = directory / "blend.rgba"
-    subprocess.run([renderer, backend, "--dual-pixel", shader, capture], check=True)
+    draw = [renderer, backend, "--dual-pixel", shader, capture]
+    for case in DUAL_CASES:
+        source.write_text(translate_dual(dual_program(case)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        subprocess.run(draw, check=True)
     wrong = subprocess.run([renderer, backend, "--dual-pixel-swapped", shader, capture], capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapped texture bindings escaped detection")
+    source.write_text(translate_dual(dual_program(swap_weights=True)), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Swapped blend weights escaped detection")
     return 0
 
 
