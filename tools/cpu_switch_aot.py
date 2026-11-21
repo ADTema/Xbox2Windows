@@ -24,7 +24,18 @@ fifth and later) and floating-point arguments are not supported.
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
 CMOVcc) in one straight-line run that no edge enters. Overflow and low-byte
 parity conditions use the producer operand width, including narrow arithmetic.
-Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc) may sit between them.
+Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc, and
+CBW, CWDE, CDQE, CDQ and CQO) may sit between them.
+
+One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
+and RDX without naming them. Products of up to 32-bit factors are computed in
+std::uint64_t; 64-bit products and all quotients use the MSVC intrinsics
+_umul128, _mul128, _udiv64, _div64, _udiv128 and _div128. The divide
+intrinsics execute DIV or IDIV, so a zero divisor or a quotient that does not
+fit raises the same divide error. An optimizing build removes a divide whose
+quotient and remainder are both unused, as it removes an unused load, and the
+error is then not raised. 8- and 16-bit divides are rejected, and so is a flag
+consumer after a multiply or divide.
 
 A forward pass records how many low bytes (0, 1, 2 or 8) of each register every
 path defines. A read needs as many defined bytes as it uses, and an 8- or 16-bit
@@ -125,9 +136,15 @@ SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
+# Sign extensions inside RDX:RAX, as (source, destination). The Intel SDM lists "Flags Affected: None".
+SIGN_EXTENSIONS = {M.CBW: (R.AL, R.AX), M.CWDE: (R.AX, R.EAX), M.CDQE: (R.EAX, R.RAX),
+                   M.CDQ: (R.EAX, R.EDX), M.CQO: (R.RAX, R.RDX)}
+# Implicit operands of one-operand MUL, IMUL, DIV and IDIV, by operand width.
+ACCUMULATOR = {1: R.AL, 2: R.AX, 4: R.EAX, 8: R.RAX}
+DATA = {2: R.DX, 4: R.EDX, 8: R.RDX}
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC}
+FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS}
 FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
@@ -150,6 +167,26 @@ def full(register):
     if full_register not in NAMES:
         raise ValueError(f"unsupported register {register}")
     return full_register
+
+
+def implicit_writes(ins):
+    """Full registers that an instruction writes without naming them as operand 0. RDX counts for
+    every one-operand multiply or divide, although an 8-bit multiply leaves it unchanged."""
+    if ins.mnemonic in SIGN_EXTENSIONS:
+        return {full(SIGN_EXTENSIONS[ins.mnemonic][1])}
+    if ins.mnemonic in (M.MUL, M.IMUL, M.DIV, M.IDIV) and ins.op_count == 1:
+        return {R.RAX, R.RDX}
+    return set()
+
+
+def extend(value, width, sign):
+    """value (width bytes) widened to std::uint64_t. (x ^ s) - s sign-extends x from its top bit s;
+    unsigned arithmetic wraps by definition, so no signed conversion or shift is involved."""
+    value = f"static_cast<std::uint64_t>({value})"
+    if not sign:
+        return value
+    top = 1 << width * 8 - 1
+    return f"(({value} ^ {top:#x}ull) - {top:#x}ull)"
 
 
 def runtime_functions(pe):
@@ -484,6 +521,8 @@ class Function:
                 known[ins.op0_register] = ins.ip_rel_memory_address
             elif ins.op_count and ins.op0_kind == OpKind.REGISTER and ins.mnemonic not in (M.CMP, M.TEST):
                 known.pop(full(ins.op0_register), None)
+            for register in implicit_writes(ins):
+                known.pop(register, None)
             for successor in self.successors.get(ip, ()):
                 if successor not in self.instructions:
                     continue
@@ -583,6 +622,8 @@ class Function:
             return values[reg]
 
         def step(ins):
+            for register in implicit_writes(ins):
+                values[register] = (next(counter), "full")
             if ins.op_count == 0 or ins.op0_kind != OpKind.REGISTER:
                 return
             dst = ins.op0_register
@@ -660,10 +701,12 @@ class Lifter:
             return f"static_cast<{unsigned(width)}>({ins.immediate(number) & ((1 << width * 8) - 1):#x}ull)"
         raise ValueError(f"unsupported operand at RVA {ins.ip:#x}")
 
-    def write(self, ins, width, expression):
-        if ins.op0_kind == OpKind.MEMORY:
-            return f"store<{unsigned(width)}>({self.address(ins)}, static_cast<{unsigned(width)}>({expression}));"
-        register = ins.op0_register
+    def write(self, ins, width, expression, register=None):
+        """C++ that writes expression to operand 0, or to register when one is given."""
+        if register is None:
+            if ins.op0_kind == OpKind.MEMORY:
+                return f"store<{unsigned(width)}>({self.address(ins)}, static_cast<{unsigned(width)}>({expression}));"
+            register = ins.op0_register
         if register in HIGH_BYTES:
             raise ValueError(f"unsupported register {register}")
         if width not in (1, 2, 4, 8) or RegisterExt.size(register) != width:
@@ -850,6 +893,63 @@ class Lifter:
                 # Two uint16_t factors would be promoted to int, where 0xffff * 0xffff overflows.
                 a, b = f"static_cast<std::uint32_t>({a})", f"static_cast<std::uint32_t>({b})"
             return self.write(ins, width, f"{a} * {b}"), reads, writes
+        if mnemonic in SIGN_EXTENSIONS:
+            source, destination = SIGN_EXTENSIONS[mnemonic]
+            size = RegisterExt.size(destination)
+            read(source)
+            writes[full(destination)] = size
+            if full(destination) == R.RAX:
+                value = extend(self.reg(source), RegisterExt.size(source), True)
+            else:
+                # Every bit of EDX or RDX becomes the sign bit of the source: 0 - 0 or 0 - 1, wrapped.
+                value = f"0ull - (static_cast<std::uint64_t>({self.reg(source)}) >> {RegisterExt.size(source) * 8 - 1})"
+            return self.write(ins, size, value, destination), reads, writes
+        if mnemonic in (M.MUL, M.IMUL, M.DIV, M.IDIV) and ins.op_count == 1:
+            # Operand 0 is a source, not the destination. Every input is copied into a const temporary
+            # before RAX or RDX is written, since operand 0 may be one of them or address memory through them.
+            writes.clear()
+            note(0)
+            read(ACCUMULATOR[width])
+            accumulator, source = self.reg(ACCUMULATOR[width]), self.operand(ins, 0, width)
+            sign = mnemonic in (M.IMUL, M.IDIV)
+            if mnemonic in (M.DIV, M.IDIV):
+                # An 8-bit divide writes AH, which is not modelled; no intrinsic executes a 16-bit divide.
+                if width not in (4, 8):
+                    raise ValueError(f"unsupported divide width at RVA {ins.ip:#x}")
+                read(DATA[width])
+                # The intrinsics execute DIV or IDIV: a zero divisor or a quotient that does not fit raises
+                # the same divide error as the original, and no C++ division is involved.
+                kind, call = (signed if sign else unsigned)(width), "_div" if sign else "_udiv"
+                if width == 8:
+                    lines = [f"const {kind} high = static_cast<{kind}>({self.reg(DATA[8])}), "
+                             f"low = static_cast<{kind}>({accumulator}), divisor = static_cast<{kind}>({source});",
+                             f"{kind} remainder;", f"const {kind} quotient = {call}128(high, low, divisor, &remainder);"]
+                else:
+                    wide = signed(8) if sign else unsigned(8)
+                    lines = [f"const {wide} dividend = static_cast<{wide}>((static_cast<std::uint64_t>("
+                             f"{self.reg(DATA[4])}) << 32) | {accumulator});",
+                             f"const {kind} divisor = static_cast<{kind}>({source});",
+                             f"{kind} remainder;", f"const {kind} quotient = {call}64(dividend, divisor, &remainder);"]
+                low, high = "quotient", "remainder"
+            elif width == 8:
+                kind = signed(8) if sign else unsigned(8)
+                lines = [f"const {kind} a = static_cast<{kind}>({accumulator}), b = static_cast<{kind}>({source});",
+                         f"{kind} high;", f"const {kind} low = {'_mul128' if sign else '_umul128'}(a, b, &high);"]
+                low, high = "low", "high"
+            else:
+                # Factors of up to 32 bits, sign- or zero-extended: their product fits in 64 bits, so the
+                # wrapped std::uint64_t product is exact (in two's complement for IMUL).
+                lines = [f"const std::uint64_t a = {extend(accumulator, width, sign)}, "
+                         f"b = {extend(source, width, sign)};", "const std::uint64_t product = a * b;"]
+                low, high = "product", f"product >> {width * 8}"
+            if width == 1:
+                # MUL and IMUL r/m8 write the whole 16-bit product to AX and leave RDX alone.
+                lines.append(self.write(ins, 2, low, R.AX))
+                writes[R.RAX] = 2
+            else:
+                lines += [self.write(ins, width, low, ACCUMULATOR[width]), self.write(ins, width, high, DATA[width])]
+                writes.update({R.RAX: width, R.RDX: width})
+            return "{ " + " ".join(lines) + " }", reads, writes
         if mnemonic in SETCC:
             condition = self.condition(producer, ins)
             if ins.op0_kind == OpKind.MEMORY:
@@ -1338,6 +1438,7 @@ def lift_function(program, entry, symbol, arguments, internal):
 PRELUDE = """#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <intrin.h>
 using word = std::uint64_t;
 static inline bool even_parity(word value) {
     // Fold the low byte into a nibble; bit n of 0x6996 is its odd parity.
