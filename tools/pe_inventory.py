@@ -2,6 +2,7 @@
 
 import argparse
 from collections import Counter, defaultdict
+import ctypes
 from functools import cache
 import hashlib
 import json
@@ -128,7 +129,11 @@ def parse_image(path):
 
 def scan(root, *, extra_image=None):
     system = Path(os.environ["SystemRoot"]) / "System32"
-    if sys.maxsize <= 2**32 or os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() != "amd64":
+    process, native = ctypes.c_ushort(), ctypes.c_ushort()
+    if not ctypes.windll.kernel32.IsWow64Process2(
+            ctypes.c_void_p(-1), ctypes.byref(process), ctypes.byref(native)):
+        raise ctypes.WinError()
+    if process.value != 0 or native.value != 0x8664:
         raise ValueError("Use a native x64 Windows Python for the desktop comparison")
     contracts = api_sets(system)
     system_images = {p.name.lower(): p for p in system.glob("*.dll")}
