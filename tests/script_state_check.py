@@ -10,26 +10,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from script_state_probe import inspect, inspect_tree, joaat
 
 
-def fixture(*, damage_value=False, self_parent=False, id_kind=5, parent_tag="state", drop=None, root_parent=65535):
+def fixture(*, damage_value=False, self_parent=False, priorities=(9,), duplicate_attr=False,
+            id_kind=5, parent_tag="state", drop=None, root_parent=65535):
     example = "synthetic_orbit"
     def attr(name, spelling, raw, kind):
         return struct.pack("<IIIBBH", joaat(name), joaat(spelling), raw, kind, 1, 0)
 
-    rows = (
-        attr("id", example, 0, id_kind), attr("priority", "9", 9, 3),
-        attr("blendduration", "37", 37, 3),
-        attr("orbitdistance", "1.500000", 0x40000000 if damage_value else 0x3fc00000, 2),
-        attr("pitchlimits", "-0.250000,0.500000,0.000000", 0, 1),
-        attr("headinglimits", "-1.000000,1.000000,0.000000", 1, 1),
-    )
-    if drop is not None:
-        rows = rows[:drop] + rows[drop + 1:]
-    attrs = b"".join(rows)
-    nodes = b"".join(struct.pack("<I5H2B", joaat(name), parent, 0, 0, 0, start, count, 1)
-                     for name, parent, start, count in ((parent_tag, root_parent, 0, 1),
-                                                        ("fixture_child", int(self_parent), 1, len(rows) - 1)))
+    attrs = bytearray()
+    nodes = bytearray()
+
+    def node(name, parent, attributes):
+        index = len(nodes) // 16
+        nodes.extend(struct.pack("<I5H2B", joaat(name), parent, 0, 0, 0,
+                                 len(attrs) // 16, len(attributes), 1))
+        attrs.extend(b"".join(attributes))
+        return index
+
+    if len(priorities) > 1:
+        root_parent = node("root", root_parent, [])
+    for priority in priorities:
+        ids = [attr("id", example, 0, id_kind)]
+        if duplicate_attr:
+            ids.append(attr("id", "other", 0, 5))
+        state = node(parent_tag, root_parent, [] if drop == 0 else ids)
+        camera = [
+            attr("priority", str(priority), priority, 3),
+            attr("blendduration", "37", 37, 3),
+            attr("orbitdistance", "1.500000", 0x40000000 if damage_value else 0x3fc00000, 2),
+            attr("pitchlimits", "-0.250000,0.500000,0.000000", 0, 1),
+            attr("headinglimits", "-1.000000,1.000000,0.000000", 1, 1),
+        ]
+        node("fixture_child", state + int(self_parent),
+             [row for i, row in enumerate(camera, 1) if i != drop])
     vecs = struct.pack("<6f", -0.25, 0.5, 0, -1, 1, 0)
-    root = b"".join(struct.pack("<IIQ", n, n, ref) for n, ref in ((len(rows), 2), (0, 0), (2, 4), (0, 0), (2, 3)))
+    arrays = ((len(attrs)//16, 2), (0, 0), (2, 4), (0, 0), (len(nodes)//16, 3))
+    root = b"".join(struct.pack("<IIQ", n, n, ref) for n, ref in arrays)
     blocks = (root, attrs, nodes, vecs)
     instances = bytearray()
     for kind, blob in enumerate(blocks, 1):
@@ -85,6 +100,32 @@ class ScriptStateTests(unittest.TestCase):
         result = self.run_probe(damage_value=True)
         self.assertEqual(result["counts"]["camera_parameter_sets"], 1)
         self.assertIsNone(result["first_verified_example"])
+
+    def test_ambiguous_states_in_either_order(self):
+        for priorities in ((9, 17), (17, 9)):
+            result = self.run_probe(priorities=priorities)
+            self.assertIsNone(result["first_verified_example"])
+            matches = result["ambiguous_state_candidates"]
+            self.assertEqual([m["node_path"] for m in matches], [[0, 1], [0, 3]])
+            self.assertEqual([m["record_index"] for m in matches], [0, 0])
+            self.assertEqual([m["first_verified_example"]["priority"] for m in matches],
+                             list(map(str, priorities)))
+
+    def test_matches_across_records(self):
+        first = fixture()
+        second = fixture(priorities=(17,))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "two.rpf"
+            path.write_bytes(first + bytes(-len(first) % 16) + second[16:])
+            result = inspect(path, "synthetic_orbit")
+            self.assertNotIn("ambiguous_state_candidates", inspect(path, "missing"))
+        self.assertIsNone(result["first_verified_example"])
+        self.assertEqual([(m["record_index"], m["node_path"])
+                          for m in result["ambiguous_state_candidates"]], [(0, [0]), (1, [0])])
+
+    def test_duplicate_id_attributes(self):
+        with self.assertRaisesRegex(ValueError, "Duplicate state ID attribute"):
+            self.run_probe(duplicate_attr=True)
 
     def test_parent_cycle(self):
         with self.assertRaisesRegex(ValueError, "parent index"):
