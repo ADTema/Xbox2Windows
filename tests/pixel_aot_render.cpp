@@ -230,23 +230,28 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                     return std::memcmp(actual.data(), ref.data(), sizeof(actual)) == 0;
                 };
                 bool matched = matches(expected);
+                // The exact texel is always tried first. Neighbors are admitted only
+                // for magnified tail draws, which sample through the root signature's
+                // single static sampler (MIN_MAG_MIP_POINT, clamp addressing).
                 if (!matched && req.isTailDraw && req.scale > 1) {
-                    // A pixel exactly on a source texel boundary can interpolate
-                    // to either side. Point addressing also snaps the scaled
-                    // coordinate to fixed point: with 8 fractional bits, a center
-                    // within 1/512 texel below a boundary rounds up to the next
-                    // texel. Each candidate must match as a whole RGBA texel.
-                    const auto snapsUp = [](UINT numerator, UINT denominator) {
-                        return UINT64(numerator % denominator) * 512 >= UINT64(denominator) * 511;
+                    // Per axis, at most one immediate neighbor in the same mip:
+                    // the previous texel for a center exactly on a boundary, or
+                    // the next texel for a center up to 1/512 texel below a
+                    // boundary (tie included), where rounding the scaled
+                    // coordinate to 8 fractional bits crosses it. The last texel
+                    // has no boundary above it under clamp addressing.
+                    const auto neighbor = [](UINT numerator, UINT denominator, UINT sample, UINT extent) {
+                        const UINT remainder = numerator % denominator;
+                        if (!remainder) return sample - 1;
+                        const bool roundsUp = UINT64(remainder) * 512 >= UINT64(denominator) * 511;
+                        return roundsUp && sample + 1 < extent ? sample + 1 : sample;
                     };
-                    const UINT left = sampleX - (numeratorX % (2 * width) == 0);
-                    const UINT top = sampleY - (numeratorY % (2 * height) == 0);
-                    const UINT right = (std::min)(sampleX + snapsUp(numeratorX, 2 * width), sampled.width - 1);
-                    const UINT bottom = (std::min)(sampleY + snapsUp(numeratorY, 2 * height), sampled.height - 1);
-                    for (const UINT candidateY : {top, sampleY, bottom}) {
-                        for (const UINT candidateX : {left, sampleX, right})
-                            matched = matched || matches(sampled.expected[candidateY * sampled.width + candidateX]);
-                    }
+                    const UINT nearX = neighbor(numeratorX, 2 * width, sampleX, sampled.width);
+                    const UINT nearY = neighbor(numeratorY, 2 * height, sampleY, sampled.height);
+                    // Each candidate must match as a whole RGBA texel.
+                    matched = matches(sampled.expected[sampleY * sampled.width + nearX]) ||
+                              matches(sampled.expected[nearY * sampled.width + sampleX]) ||
+                              matches(sampled.expected[nearY * sampled.width + nearX]);
                 }
                 if (!matched) {
                     std::fprintf(stderr, "pixel_mismatch x=%u y=%u\n", x, y);
