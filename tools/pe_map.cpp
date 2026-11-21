@@ -279,29 +279,39 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         return rva >= opt.SizeOfHeaders && image.at<std::uint64_t>(rva) && !overlaps;
     };
 
+    // Like the Windows loader, an empty relocation directory (VirtualAddress 0 or Size 0) is a
+    // no-op, and a non-empty directory that leaves fewer than sizeof(IMAGE_BASE_RELOCATION)
+    // trailing bytes fails the load (ERROR_NOACCESS under LoadLibraryExW on Windows 11). Windows
+    // accepts an odd SizeOfBlock when it equals relocs.Size by truncating (SizeOfBlock - 8) / 2;
+    // pe_map is intentionally stricter and requires 2-byte WORD alignment for every block.
     const auto delta = reinterpret_cast<std::uint64_t>(base) - opt.ImageBase;
     const auto& relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
     if (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED)
         return release(fail(MAP_RELOCATION, "relocations stripped"));
     if (!inside(relocs.VirtualAddress, relocs.Size, opt.SizeOfImage))
         return release(fail(MAP_RELOCATION, "relocation directory outside image"));
-    for (std::uint64_t offset = 0; offset + sizeof(IMAGE_BASE_RELOCATION) <= relocs.Size;) {
-        const auto* block = image.at<IMAGE_BASE_RELOCATION>(relocs.VirtualAddress + offset);
-        const DWORD page = block->VirtualAddress, length = block->SizeOfBlock;
-        if (length < sizeof(IMAGE_BASE_RELOCATION) || length > relocs.Size - offset)
-            return release(fail(MAP_RELOCATION, "bad relocation block"));
-        const auto* entry = reinterpret_cast<const WORD*>(block + 1);
-        const DWORD count = (length - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-        for (DWORD k = 0; k < count; ++k) {
-            const WORD type = entry[k] >> 12;
-            const std::uint64_t target = page + std::uint64_t{entry[k] & 0xfffu};
-            if (type == IMAGE_REL_BASED_ABSOLUTE) continue;
-            if (type != IMAGE_REL_BASED_DIR64 || !writable(target, relocs))
-                return release(fail(MAP_RELOCATION, "unsupported relocation at RVA %#llx",
-                                    static_cast<unsigned long long>(target)));
-            *image.at<std::uint64_t>(target) += delta;
+    if (relocs.VirtualAddress && relocs.Size) {
+        std::uint64_t offset = 0;
+        while (offset + sizeof(IMAGE_BASE_RELOCATION) <= relocs.Size) {
+            const auto* block = image.at<IMAGE_BASE_RELOCATION>(relocs.VirtualAddress + offset);
+            const DWORD page = block->VirtualAddress, length = block->SizeOfBlock;
+            if (length < sizeof(IMAGE_BASE_RELOCATION) || length > relocs.Size - offset || length % sizeof(WORD))
+                return release(fail(MAP_RELOCATION, "bad relocation block"));
+            const auto* entry = reinterpret_cast<const WORD*>(block + 1);
+            const DWORD count = (length - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+            for (DWORD k = 0; k < count; ++k) {
+                const WORD type = entry[k] >> 12;
+                const std::uint64_t target = page + std::uint64_t{entry[k] & 0xfffu};
+                if (type == IMAGE_REL_BASED_ABSOLUTE) continue;
+                if (type != IMAGE_REL_BASED_DIR64 || !writable(target, relocs))
+                    return release(fail(MAP_RELOCATION, "unsupported relocation at RVA %#llx",
+                                        static_cast<unsigned long long>(target)));
+                *image.at<std::uint64_t>(target) += delta;
+            }
+            offset += length;
         }
-        offset += length;
+        if (offset != relocs.Size)
+            return release(fail(MAP_RELOCATION, "bad relocation block"));
     }
 
     // Like the Windows loader, find the import table by its address and walk it to the null
@@ -362,10 +372,18 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     }
     FlushInstructionCache(GetCurrentProcess(), base, opt.SizeOfImage);
 
+    // Windows maps the image without calling RtlAddFunctionTable; at unwind time it divides
+    // pdata.Size by sizeof(RUNTIME_FUNCTION), ignoring a zero Size or trailing bytes < 12.
+    // Because pe_map registers the table explicitly with RtlAddFunctionTable, it is intentionally
+    // stricter and rejects a non-empty exception directory whose Size is zero, not a multiple of
+    // sizeof(RUNTIME_FUNCTION), or outside SizeOfImage.
     const auto& pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
-    if (pdata.Size) {
-        auto* table = image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress, pdata.Size / sizeof(RUNTIME_FUNCTION));
-        if (!table || !RtlAddFunctionTable(table, pdata.Size / sizeof(RUNTIME_FUNCTION),
+    if (pdata.VirtualAddress || pdata.Size) {
+        if (!pdata.Size || pdata.Size % sizeof(RUNTIME_FUNCTION))
+            return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
+        const auto count = pdata.Size / sizeof(RUNTIME_FUNCTION);
+        auto* table = image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress, count);
+        if (!table || !RtlAddFunctionTable(table, static_cast<DWORD>(count),
                                            reinterpret_cast<DWORD64>(base)))
             return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
     }
