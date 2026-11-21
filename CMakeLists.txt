@@ -17,7 +17,7 @@ add_test(NAME desktop_bvh_root_flags COMMAND d3d12_sdk_check bvh-flags)
 add_executable(era_heap_check tests/era_heap_check.cpp src/era_heap.cpp)
 target_include_directories(era_heap_check PRIVATE src)
 target_compile_features(era_heap_check PRIVATE cxx_std_20)
-foreach(scenario IN ITEMS allocation failure concurrency caller_layout)
+foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse)
     add_test(NAME era_heap_${scenario} COMMAND era_heap_check ${scenario})
 endforeach()
 
@@ -490,6 +490,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME static_exe_intake COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/intake/check.py" "$<TARGET_FILE:intake_candidate>"
         "$<TARGET_FILE:intake_provider>")
+    # intake_forward exports six placeholders. The test rewrites a copy so each export is a forwarder;
+    # it reads the images and never loads them.
+    add_library(intake_forward SHARED tests/intake/provider.cpp tests/intake/forward.def)
+    add_executable(intake_forward_caller tests/intake/forward_caller.cpp)
+    target_link_libraries(intake_forward_caller PRIVATE intake_forward)
+    add_test(NAME bundled_export_forwarders COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/intake/forwarders_check.py" "$<TARGET_FILE:intake_forward_caller>"
+        "$<TARGET_FILE:intake_forward>" "$<TARGET_FILE:intake_provider>")
     add_test(NAME layout_chunk_summary COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/layout_chunks_check.py")
 endif()
