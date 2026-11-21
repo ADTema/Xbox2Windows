@@ -1,4 +1,4 @@
-"""Offline lowering for a straight-line, single-texture gfx1013 pixel shader."""
+"""Offline lowering for a straight-line, texture-sampling gfx1013 pixel shader."""
 import argparse
 import ctypes as C
 import hashlib
@@ -148,7 +148,7 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
     raise ValueError(f"Unsupported arithmetic operand {token}")
 
 
-def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None):
+def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
     """Track descriptor provenance, interpolation and packed exports through register writes."""
     if (texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105
             or len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
@@ -160,6 +160,15 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if constant_descriptor < 0 or constant_descriptor % 4:
             raise ValueError("Invalid constant descriptor offset")
         lines.insert(0, "cbuffer Constants : register(b0) { float4 params[16]; };")
+    bindings = {0: "tex"}
+    if second_texture_offset is not None:
+        if second_texture_offset < 32 or second_texture_offset % 32:
+            raise ValueError("Second texture descriptor must have a distinct aligned offset")
+        if constant_descriptor is not None and (second_texture_offset < constant_descriptor + 16
+                                                and constant_descriptor < second_texture_offset + 32):
+            raise ValueError("Texture and constant descriptors overlap")
+        bindings[second_texture_offset] = "tex1"
+        lines.insert(0, "Texture2D<float4> tex1 : register(t1);")
     pending = set()
     mask = "entry"
     samples = 0
@@ -203,13 +212,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError("Invalid movk immediate")
                 val = (val if val < 0x8000 else val - 0x10000) & 0xffffffff
             scalar[dst] = val
-        elif m := match(r"s_load_dwordx8 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], null"):
+        elif m := match(r"s_load_dwordx8 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)"):
             dst = registers(*m.groups()[:2], 8)
-            addr = registers(*m.groups()[2:], 2)
+            addr = registers(*m.groups()[2:4], 2)
+            offset = 0 if m[5] == "null" else int(m[5], 16)
+            if offset not in bindings:
+                raise ValueError("Unbound texture descriptor offset")
             if any(f"s{n}" in pending for n in (*addr, *dst)) or [scalar.get(f"s{n}") for n in addr] != ["texture_ptr", 0]:
                 raise ValueError("Texture address differs from binding contract")
             for j, n in enumerate(dst):
-                scalar[f"s{n}"] = ("texture", j)
+                scalar[f"s{n}"] = (bindings[offset], j)
                 pending.add(f"s{n}")
         elif m := match(r"(s_load_dwordx4|s_buffer_load_dwordx4) s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (0x[0-9a-f]+|null)"):
             op, first, last, low, high, imm = m.groups()
@@ -243,14 +255,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             operands = m.groups()
             dest, coords, image, state = [registers(*operands[k:k+2], width)
                                           for k, width in zip((0,2,4,6), (4,2,8,4))]
+            descriptor = [scalar.get(f"s{n}") for n in image]
+            texture = next((name for name in bindings.values() if descriptor == [(name, j) for j in range(8)]), None)
             if (mask != "entry" or any(f"s{n}" in pending for n in (*image, *state))
-                    or [scalar.get(f"s{n}") for n in image] != [("texture",j) for j in range(8)]
+                    or texture is None
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
             uv = [vector[f"v{n}"] for n in coords]
             if any(v not in ("uv.x", "uv.y") for v in uv):
                 raise ValueError("Unsupported texture coordinate")
-            lines.append(f"    float4 sample{i} = tex.Sample(samp, float2({', '.join(uv)}));")
+            lines.append(f"    float4 sample{i} = {texture}.Sample(samp, float2({', '.join(uv)}));")
             samples += 1
             sample_pending = True
             for j, n in enumerate(dest):
@@ -287,8 +301,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             ended = True
         else:
             raise ValueError(f"Unsupported instruction {i}: {line}")
-    if not ended or samples != 1:
-        raise ValueError("Expected one sample and a terminated color export")
+    if not ended or samples != (2 if second_texture_offset is not None else 1):
+        raise ValueError("Unexpected sample count or missing color export")
     return "\n".join([*lines, "}",""])
 
 
@@ -304,6 +318,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="Destination .hlsl in a local output directory")
     parser.add_argument("--constant-descriptor", type=lambda s: int(s, 0),
                         help="Byte offset of a descriptor mapped to the 256-byte desktop buffer b0")
+    parser.add_argument("--second-texture-offset", type=lambda s: int(s, 0), help="Byte offset of the t1 descriptor for a two-sample shader")
     args = parser.parse_args()
     dest = args.output.resolve()
     if dest.suffix.lower() != ".hlsl" or dest == args.archive.resolve():
@@ -311,7 +326,7 @@ def main():
     try:
         blob, code = native_program(args.archive, args.record)
         instructions = disassemble(code, args.llvm)
-        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor)
+        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor, second_texture_offset=args.second_texture_offset)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")
     dest.parent.mkdir(parents=True, exist_ok=True)
