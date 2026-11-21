@@ -4,6 +4,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -46,6 +47,44 @@ def resolve_llvm_lib(name_or_path: str) -> str:
         if candidate.is_file():
             return str(candidate.resolve())
     return name_or_path
+
+
+def resolve_tool(env_var: str, default_names: list[str]) -> str | None:
+    """Resolve a command-line tool path via environment variable or system search."""
+    val = os.environ.get(env_var)
+    if val:
+        w = shutil.which(val)
+        if w:
+            return w
+        p = Path(val)
+        if p.is_file():
+            return str(p.resolve())
+    for name in default_names:
+        w = shutil.which(name)
+        if w:
+            return w
+    return None
+
+
+def assemble_with_llvm_mc(instructions: list[str], assembler: str, objcopy: str) -> bytes:
+    """Assemble AMDGPU instructions for gfx1013 using llvm-mc and extract .text bytes."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        src = tmp_dir / "fixture.s"
+        obj = tmp_dir / "fixture.o"
+        binary = tmp_dir / "fixture.bin"
+        src.write_text("\n".join(instructions) + "\n", encoding="ascii")
+        subprocess.run(
+            [assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", str(src), "-o", str(obj)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [objcopy, "-O", "binary", "--only-section=.text", str(obj), str(binary)],
+            check=True,
+            capture_output=True,
+        )
+        return binary.read_bytes()
 
 
 def envelope(code: bytes, name: bytes = b"fixture_ps") -> bytes:
@@ -107,21 +146,64 @@ class TestRdna2Disasm(unittest.TestCase):
             self.fail("pixel_aot.disassemble helper could not be imported")
 
         resolved_lib = resolve_llvm_lib(llvm_lib_env)
-        test_code = bytes.fromhex(
-            "000080bf"  # s_nop 0
-            "000082be"  # s_mov_b32 s2, s0
-            "000081bf"  # s_endpgm
-        )
-        try:
-            llvm_lines = llvm_disassemble(test_code, resolved_lib)
-        except Exception as e:
-            self.fail(f"Designated LLVM comparison failed to load or run with '{llvm_lib_env}' (resolved: '{resolved_lib}'): {e}")
 
-        rdna2_insns = disasm_rdna2(test_code)
-        self.assertEqual(len(llvm_lines), len(rdna2_insns))
-        for llvm_line, rdna2_rec in zip(llvm_lines, rdna2_insns):
+        fixture_instructions = [
+            "s_nop 0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_endpgm",
+        ]
+
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+
+        if not assembler or not objcopy:
+            self.fail(
+                f"Designated LLVM comparison job requires llvm-mc and llvm-objcopy "
+                f"(assembler={assembler}, objcopy={objcopy})"
+            )
+
+        try:
+            emitted_bytes = assemble_with_llvm_mc(fixture_instructions, assembler, objcopy)
+        except Exception as e:
+            self.fail(f"Failed to assemble comparison fixture with llvm-mc: {e}")
+
+        self.assertGreater(len(emitted_bytes), 0, "llvm-mc emitted empty machine code")
+        self.assertEqual(len(emitted_bytes) % 4, 0, "Emitted bytes length must be multiple of 4")
+
+        try:
+            llvm_lines = llvm_disassemble(emitted_bytes, resolved_lib)
+        except Exception as e:
+            self.fail(
+                f"Designated LLVM comparison failed to load or run with '{llvm_lib_env}' "
+                f"(resolved: '{resolved_lib}'): {e}"
+            )
+
+        rdna2_insns = disasm_rdna2(emitted_bytes)
+        self.assertEqual(
+            len(llvm_lines), len(fixture_instructions),
+            f"LLVM disassembled instruction count mismatch: {llvm_lines}"
+        )
+        self.assertEqual(
+            len(rdna2_insns), len(fixture_instructions),
+            f"RDNA 2 disassembled instruction count mismatch: {rdna2_insns}"
+        )
+
+        for i, (orig_inst, llvm_line, rdna2_rec) in enumerate(zip(fixture_instructions, llvm_lines, rdna2_insns)):
+            orig_op = orig_inst.split()[0].lower()
             llvm_op = llvm_line.split()[0].lower()
-            self.assertEqual(rdna2_rec["opcode"].lower(), llvm_op)
+            rdna2_op = rdna2_rec["opcode"].lower()
+            self.assertEqual(
+                llvm_op, orig_op,
+                f"Instruction {i}: LLVM opcode '{llvm_op}' does not match original '{orig_op}'"
+            )
+            self.assertEqual(
+                rdna2_op, orig_op,
+                f"Instruction {i}: disasm_rdna2 opcode '{rdna2_op}' does not match original '{orig_op}'"
+            )
+            self.assertEqual(
+                rdna2_op, llvm_op,
+                f"Instruction {i}: disasm_rdna2 opcode '{rdna2_op}' does not match LLVM opcode '{llvm_op}'"
+            )
 
 
 class TestRdna2Extractor(unittest.TestCase):

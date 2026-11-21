@@ -25,7 +25,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends llvm-15
           python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/ffx_dispatch_aot_check.py llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          LLVM_LIB=libLLVM-15.so.1 python3 -B tests/rdna2_tools_check.py
+          LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 python3 -B tests/rdna2_tools_check.py
   python-linux:
     name: Run platform-independent Python checks on Linux
     runs-on: ubuntu-24.04
