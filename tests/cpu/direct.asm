@@ -1,5 +1,9 @@
 ; Both functions take (uint64_t, uint64_t, uint64_t trace[3]).
+IFDEF IMPORT_MIX
+EXTERN __imp_mix_args:QWORD
+ENDIF
 .code
+IFNDEF IMPORT_MIX
 mix_args PROC FRAME
     push rbx
     .pushreg rbx
@@ -24,6 +28,7 @@ ENDIF
     pop rbx
     ret
 mix_args ENDP
+ENDIF
 
 call_mix PROC FRAME
     push rbx
@@ -37,7 +42,11 @@ call_mix PROC FRAME
     mov rsi, rdx
     add rcx, 7
     sub rdx, 3
+IFDEF IMPORT_MIX
+    call QWORD PTR [__imp_mix_args]
+ELSE
     call mix_args
+ENDIF
     add rax, rbx
     xor rax, rsi
     add rsp, 28h

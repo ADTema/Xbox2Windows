@@ -173,17 +173,29 @@ set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILE
 if(EXISTS "${INTAKE_PYTHON}")
     enable_language(ASM_MASM)
     function(cpu_asm_fixture image source)
-        add_library(${image} SHARED tests/cpu/${source}.asm tests/cpu/${source}.def)
+        if(ARGC GREATER 2)
+            set(exports "${ARGV2}")
+        else()
+            set(exports "${source}")
+        endif()
+        add_library(${image} SHARED tests/cpu/${source}.asm tests/cpu/${exports}.def)
         set_target_properties(${image} PROPERTIES LINKER_LANGUAGE CXX)
         target_link_options(${image} PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO)
     endfunction()
     function(cpu_translation image translator entry)
+        cmake_parse_arguments(BIND "" "PROVIDER;SYMBOL" "" ${ARGN})
+        if(BIND_PROVIDER)
+            set(binding --bind "$<TARGET_FILE:${BIND_PROVIDER}>" "${BIND_SYMBOL}")
+        endif()
         set(lifted "${CMAKE_CURRENT_BINARY_DIR}/${image}_lifted.cpp")
         add_custom_command(OUTPUT "${lifted}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/${translator}.py"
-                "$<TARGET_FILE:${image}>" ${entry} "${lifted}"
-            DEPENDS ${image} tools/${translator}.py tools/cpu_leaf_aot.py VERBATIM)
+                "$<TARGET_FILE:${image}>" ${entry} "${lifted}" ${binding}
+            DEPENDS ${image} ${BIND_PROVIDER} tools/${translator}.py tools/cpu_leaf_aot.py VERBATIM)
         add_library(${image}_lifted SHARED "${lifted}")
+        if(BIND_PROVIDER)
+            target_link_libraries(${image}_lifted PRIVATE ${BIND_PROVIDER})
+        endif()
     endfunction()
     foreach(variant IN ITEMS original inverted)
         cpu_asm_fixture(cpu_leaf_${variant} branch)
@@ -205,6 +217,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/direct_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_call_original>" "$<TARGET_FILE:cpu_call_original_lifted>"
         "$<TARGET_FILE:cpu_call_altered_lifted>")
+    add_library(cpu_import_provider SHARED tests/cpu/import_provider.cpp)
+    add_library(cpu_import_altered SHARED tests/cpu/import_provider.cpp)
+    target_compile_definitions(cpu_import_altered PRIVATE ALTER_RETURN)
+    cpu_asm_fixture(cpu_import_original direct import)
+    target_compile_definitions(cpu_import_original PRIVATE IMPORT_MIX)
+    target_link_libraries(cpu_import_original PRIVATE cpu_import_provider)
+    cpu_translation(cpu_import_original cpu_call_aot call_mix PROVIDER cpu_import_provider SYMBOL mix_args)
+    target_link_options(cpu_import_original_lifted PRIVATE /INCREMENTAL:NO)
+    add_test(NAME cpu_aot_import_call COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/import_check.py" "$<TARGET_FILE:cpu_import_original>"
+        "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
+        "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
     add_library(script_path_host SHARED tools/script_path_host.cpp)
     target_compile_features(script_path_host PRIVATE cxx_std_17)
     add_test(NAME script_path_links COMMAND "${INTAKE_PYTHON}" -B

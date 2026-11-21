@@ -1,4 +1,4 @@
-"""Recompile a bounded pair of Windows x64 functions with one direct rel32 call."""
+"""Recompile a bounded Windows x64 caller with one direct or named import call."""
 
 import argparse
 from pathlib import Path
@@ -14,7 +14,7 @@ OPERATORS = {0x89: "=", 0x8b: "=", 0x01: "+=", 0x03: "+=",
              0x29: "-=", 0x2b: "-=", 0x31: "^=", 0x33: "^="}
 
 
-def lift_body(start, code, *, caller):
+def lift_body(start, code, *, caller, bind_import=None):
     # In this profile only RBX/RSI survive the call. The host compiler owns
     # physical register allocation and emits its own ABI frame for each function.
     frame = 40 if caller else 8
@@ -31,15 +31,28 @@ def lift_body(start, code, *, caller):
         rva = start + len(prologue) + pos
         reads = set()
         write = None
-        is_call = body[pos] == 0xe8
-        if is_call and pos + 5 <= len(body):
+        via_iat = body[pos:pos + 2] == b"\xff\x15"
+        is_call = via_iat or body[pos] == 0xe8
+        if is_call:
             if not caller or target is not None:
                 raise ValueError(f"unexpected additional call at RVA {rva:#x}")
-            target = rva + 5 + struct.unpack_from("<i", body, pos + 1)[0]
+            length = 6 if via_iat else 5
+            if pos + length > len(body):
+                raise ValueError(f"truncated call at RVA {rva:#x}")
+            address = rva + length + struct.unpack_from("<i", body, pos + length - 4)[0]
+            if via_iat:
+                if bind_import is None:
+                    raise ValueError(f"no provider binding for IAT slot RVA {address:#x}")
+                name = bind_import(address)
+                target = ("import", name)
+                callee = f"::{name}"
+            else:
+                target = ("direct", address)
+                callee = "lifted_callee"
             reads = {"rcx", "rdx", "r8"}
-            statement = "rax = lifted_callee(rcx, rdx, r8);"
+            statement = f"rax = {callee}(rcx, rdx, r8);"
             write = "rax"
-            pos += 5
+            pos += length
         elif body[pos:pos + 2] == b"\x49\x89" and pos + 3 <= len(body):
             modrm = body[pos + 2]
             src = GPR.get((modrm >> 3) & 7)
@@ -87,21 +100,57 @@ def lift_body(start, code, *, caller):
         lines.append("    " + statement)
 
     if "rax" not in available or (caller and target is None):
-        raise ValueError(f"missing return value or direct call at RVA {start:#x}")
+        raise ValueError(f"missing return value or call at RVA {start:#x}")
     name = "lifted" if caller else "lifted_callee"
     signature = f'extern "C" __declspec(dllexport) __declspec(noinline) word {name}(word rcx, word rdx, word* r8)'
     return "\n".join([signature + " {", "    word rax, rbx, rsi;", *lines, "    return rax;", "}"]), target
 
 
-def translate(image, entry):
+def resolve_import(pe, slot, provider, symbol):
+    pe.parse_data_directories(directories=[1])  # ordinary import directory
+    matches = [(desc.dll, imp) for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])
+               for imp in desc.imports if imp.address - pe.OPTIONAL_HEADER.ImageBase == slot]
+    if len(matches) != 1:
+        raise ValueError(f"no unique ordinary import at IAT slot RVA {slot:#x}")
+    module, imp = matches[0]
+    if imp.name is None:
+        raise ValueError(f"unsupported ordinal import {module!r} #{imp.ordinal}")
+    dll, name = module.decode("ascii"), imp.name.decode("ascii")
+    identity = f"{dll}!{name}"
+    if dll.casefold() != provider.name.casefold() or symbol != name:
+        raise ValueError(f"unbound import {identity} at IAT slot RVA {slot:#x}")
+    if not name.isascii() or not name.isidentifier():
+        raise ValueError(f"unsupported C import name {identity}")
+    if not provider.is_file():
+        raise ValueError(f"missing provider for {identity}")
+    with pefile.PE(str(provider), fast_load=True) as library:
+        try:
+            rva = export_rva(library, name)
+        except ValueError as exc:
+            raise ValueError(f"unresolved import {identity}: {exc}") from exc
+        section = library.get_section_by_rva(rva)
+        if not section or not section.Characteristics & 0x20000000:
+            raise ValueError(f"non-executable export for {identity}")
+    return name
+
+
+def translate(image, entry, binding=None):
     with pefile.PE(str(image), fast_load=True) as pe:
         start = export_rva(pe, entry)
         code = bounded_code(pe, start)
-        caller, target = lift_body(start, code, caller=True)
-        callee_code = bounded_code(pe, target)
-        if target < start + len(code) and start < target + len(callee_code):
-            raise ValueError(f"overlapping call target at RVA {target:#x}")
-        callee, _ = lift_body(target, callee_code, caller=False)
+        def bind_import(slot):
+            return resolve_import(pe, slot, Path(binding[0]), binding[1])
+
+        caller, (kind, target) = lift_body(start, code, caller=True, bind_import=bind_import if binding else None)
+        if kind == "import":
+            callee = f'extern "C" __declspec(dllimport) word {target}(word, word, word*);'
+        else:
+            if binding:
+                raise ValueError("provider binding supplied for a direct call")
+            callee_code = bounded_code(pe, target)
+            if target < start + len(code) and start < target + len(callee_code):
+                raise ValueError(f"overlapping call target at RVA {target:#x}")
+            callee, _ = lift_body(target, callee_code, caller=False)
     return f"#include <cstdint>\nusing word = std::uint64_t;\n{callee}\n\n{caller}\n"
 
 
@@ -110,8 +159,10 @@ if __name__ == "__main__":
     parser.add_argument("image", type=Path)
     parser.add_argument("export")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"),
+                        help="named import with the fixture's two-word and output-pointer ABI")
     args = parser.parse_args()
     try:
-        args.output.write_text(translate(args.image, args.export), encoding="utf-8")
+        args.output.write_text(translate(args.image, args.export, args.bind), encoding="utf-8")
     except (OSError, ValueError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")
