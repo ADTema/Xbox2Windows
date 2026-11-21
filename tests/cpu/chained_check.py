@@ -1,0 +1,80 @@
+"""Differential returns and unwind ownership controls for a split x64 function."""
+
+import ctypes
+from pathlib import Path
+import struct
+import sys
+from tempfile import TemporaryDirectory
+
+import pefile
+from iced_x86 import Code, Decoder
+
+from direct_check import SENTINELS, Word, observe, register_probe
+from cpu_chained_aot import translate
+from cpu_leaf_aot import export_rva
+from cpu_ranges import function_ranges
+
+
+def check(native, compiled, harness):
+    probe = register_probe(str(harness))
+    source = ctypes.CDLL(str(native)).choose_value
+    lifted = ctypes.CDLL(str(compiled)).try_lifted
+    for value, expected in ((None, 7), (0, 7), (1, 21), (0xffffffffffffffff, 21)):
+        slot = Word(value or 0)
+        address = 0 if value is None else ctypes.addressof(slot)
+        result, trace, regs = observe(probe, source, address, 0)
+        status, actual, kept = observe(probe, lifted, address, 0)
+        if (result != expected or regs != SENTINELS or kept != regs or status != 1
+                or actual != (trace[0], result, *trace[2:]) or slot.value != (value or 0)):
+            raise AssertionError((value, result, actual, kept))
+
+    with pefile.PE(str(native), fast_load=True) as pe:
+        entry = export_rva(pe, "choose_value")
+        neighbor = export_rva(pe, "neighbor")
+        ranges = function_ranges(pe, entry)
+        assert len(ranges) == 3 and all(not a <= neighbor < b for a, b in ranges)
+        body = pe.get_data(entry, ranges[0][1] - entry)
+        jump = next(i for i in Decoder(64, body, ip=entry) if i.code == Code.JE_REL8_64)
+        jump_offset = pe.get_offset_from_rva(jump.ip + 1)
+        move = next(i for i in Decoder(64, body, ip=entry) if i.code == Code.MOV_R32_IMM32)
+        move_offset = pe.get_offset_from_rva(move.ip)
+        info = next(r.struct.UnwindData for r in pe.DIRECTORY_ENTRY_EXCEPTION
+                    if r.struct.BeginAddress == ranges[1][0])
+        parent_offset = pe.get_offset_from_rva(info + 4)
+
+    data = native.read_bytes()
+    controls = [(jump_offset, struct.pack("b", target - jump.next_ip), "outside owned instruction")
+                for target in (neighbor, ranges[1][0] + 1)]
+    controls += [(parent_offset, struct.pack("<I", entry + 1), "invalid unwind chain"),
+                 (parent_offset, struct.pack("<III", *ranges[1], info), "invalid unwind chain")]
+    with TemporaryDirectory() as folder:
+        for offset, patch, reason in controls:
+            damaged = bytearray(data)
+            damaged[offset:offset + len(patch)] = patch
+            path = Path(folder) / "control.dll"
+            path.write_bytes(damaged)
+            try:
+                translate(path, "choose_value")
+            except ValueError as exc:
+                if reason not in str(exc):
+                    raise
+            else:
+                raise AssertionError(f"accepted control: {reason}")
+        # Preserve instruction boundaries after a synthetic call through [rbx].
+        damaged = bytearray(data)
+        damaged[move_offset:move_offset + 5] = bytes.fromhex("ff 13 90 90 90")
+        path.write_bytes(damaged)
+        _, _, returns, stops = translate(path, "choose_value", partial=True)
+        assert len(returns) == 2 and stops == {move.ip}
+        try:
+            translate(path, "choose_value")
+        except ValueError as exc:
+            if "unsupported operation" not in str(exc):
+                raise
+        else:
+            raise AssertionError("strict translation accepted an indirect call")
+    print("two null paths, two non-null inputs, RBX/RSI, guarded writes and four rejection controls passed")
+
+
+if __name__ == "__main__":
+    check(*map(Path, sys.argv[1:]))
