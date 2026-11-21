@@ -131,6 +131,7 @@ def extract_shaders(
             cursor = 0
 
             while match := names_pattern.search(data, cursor):
+                scan_start = cursor
                 cursor = match.end()
                 if cursor + 18 > data_len or data[cursor] != 0:
                     continue
@@ -163,7 +164,13 @@ def extract_shaders(
                 if len(program) < 24:
                     continue
 
-                record_name = match.group().decode("ascii", "replace")
+                name = match.group()
+                # The length includes the terminator. A printable length byte can join the name's run.
+                if name[0] == len(name):
+                    name_start = match.start()
+                    if name_start == scan_start or data[name_start - 1] != len(name) + 1:
+                        name = name[1:]
+                record_name = name.decode("ascii", "replace")
                 cursor = start_payload + (stored - len(stream.unused_data))
                 total_found += 1
 

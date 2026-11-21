@@ -15,6 +15,7 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from disasm_rdna2 import disasm_rdna2, decode_instruction, disassemble_binary
 from extract_shaders import extract_shaders, extract_native_rdna2_code
+from pixel_aot import native_program
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
     is_instruction_supported,
@@ -290,6 +291,30 @@ class TestRdna2Extractor(unittest.TestCase):
             self.assertTrue((output_dir / "pixel" / "PS_CliTest.bin").is_file())
             self.assertEqual((output_dir / "pixel" / "PS_CliTest.bin").read_bytes(), known_code)
             self.assertTrue((output_dir / "manifest.json").is_file())
+
+    def test_extracted_names_round_trip_length_prefixed_records(self) -> None:
+        code = bytes.fromhex("000080bf 000081bf")
+        names = (b"PS_A", b"PS_" + b"S" * 28, b"!" + b"A" * 32,
+                 b"PS_" + b"X" * 122, b"~" + b"B" * 125, b"~" + b"C" * 126)
+        legacy_name = b"PS_Legacy"
+        legacy = envelope(code, legacy_name)[1:]
+        truncated = envelope(code, b"PS_Truncated_Length_Prefix_Fixture")[:-1]
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            archive = work / "source_built.rpf"
+            archive.write_bytes(b"RPF\0" + b"".join(envelope(code, name) for name in names) + legacy + truncated)
+            output, manifest_path = extract_shaders(archive, work / "shaders", target_stages={"pixel"})
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["total_extracted"], len(names) + 1)
+            for source_name, record in zip((*names, legacy_name), manifest["shaders"], strict=True):
+                name = source_name.decode("ascii")
+                with self.subTest(length=len(source_name)):
+                    self.assertEqual(record["name"], name)
+                    self.assertEqual(record["native_file"], f"pixel/{name}.bin")
+                    self.assertEqual((output / record["native_file"]).read_bytes(), code)
+                    if source_name != legacy_name:
+                        self.assertEqual(native_program(archive, record["name"])[1], code)
 
     def test_stage_filtering(self):
         known_code = bytes.fromhex("000080bf 000081bf")
