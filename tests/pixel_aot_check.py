@@ -38,6 +38,24 @@ def assembly(swap):
     ]
 
 
+def dual_program():
+    program = assembly(False)
+    load = program.index("s_mov_b32 s40, 1")
+    program.insert(load, "s_load_dwordx8 s[56:63], s[20:21], 0x20")
+    pos = program.index("s_waitcnt vmcnt(0)")
+    program.insert(pos, "image_sample v[20:23], v[8:9], s[56:63], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D")
+    ops = []
+    for i in range(4):
+        ops.extend([f"v_mul_legacy_f32_e32 v{12+i}, 0.75, v{12+i}",
+                    f"v_fma_f32 v{12+i}, 0.25, v{20+i}, v{12+i}"])
+    program[pos+2:pos+2] = ops
+    return program
+
+
+def dual_source():
+    return lower(dual_program(), 20, 24, [1, 2, 3, 4], second_texture_offset=32)
+
+
 def envelope(code, name=b"fixture"):
     program_start = 256
     image = bytearray(program_start) + code
@@ -188,6 +206,13 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Stale reference accepted after changing the bound constants")
+    source.write_text(dual_source(), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    capture = directory / "blend.rgba"
+    subprocess.run([renderer, backend, "--dual-pixel", shader, capture], check=True)
+    wrong = subprocess.run([renderer, backend, "--dual-pixel-swapped", shader, capture], capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Swapped texture bindings escaped detection")
     return 0
 
 
