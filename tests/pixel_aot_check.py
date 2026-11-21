@@ -402,6 +402,50 @@ def half_rtz(x):
     return struct.unpack("<e", struct.pack("<H", bits - (abs(rounded) > abs(x))))[0]
 
 
+# v_cvt_f32_f16 widens the binary16 in the low half of S0; the high half holds junk that must be ignored.
+# The second channel applies -|x| to -5.0, the third is the largest finite half and the fourth is the
+# smallest subnormal half, 2**-24, scaled by 2**24 so a flushed subnormal exports 0 instead of 1.0.
+HALF_WORDS = (0xdead3c00, 0x0000c500, 0x00007bff, 0xbeef0001)
+HALF_BODY = [
+    "v_cvt_f32_f16_e32 v12, s44",
+    "v_cvt_f32_f16_e64 v13, -|s45|",
+    "v_cvt_f32_f16_e32 v14, s46",
+    "v_cvt_f32_f16_e32 v15, s47",
+    "v_mul_f32_e32 v15, 0x4b800000, v15",
+]
+
+
+def half_value(word):
+    return struct.unpack("<e", struct.pack("<H", word & 0xffff))[0]
+
+
+def check_half_draw(directory, compiler, renderer, backend):
+    source = directory / "half.hlsl"
+    shader = directory / "half.cso"
+    case = directory / "half.case"
+    source.write_text(translate(with_constants(HALF_BODY)), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *HALF_WORDS)
+    first, second, third, fourth = map(half_value, HALF_WORDS)
+    expected = [first, -abs(second), third, fourth * 2.0 ** 24]
+    assert expected == [1.0, -5.0, 65504.0, 1.0] and fourth == 2.0 ** -24
+    # Reading the high half, dropping the negation, a wrong exponent and a flushed subnormal.
+    wrong = [half_value(HALF_WORDS[0] >> 16), 5.0, 32752.0, 0.0]
+    for x in (*expected, *wrong):
+        assert half_rtz(x) == x, x
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+    subprocess.run(draw, check=True)
+    for k in range(4):
+        wrong_values = list(expected)
+        wrong_values[k] = wrong[k]
+        case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
+        result = subprocess.run(draw, capture_output=True, text=True)
+        if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+            raise AssertionError(f"A wrong half conversion escaped detection in channel {k}")
+
+
 def arithmetic():
     """Add, multiply, reversed subtraction and moves on the sample and constant words 8 to 11."""
     program = assembly(False)
@@ -632,6 +676,11 @@ def check_scalar_constant_reads() -> None:
 def check_controls(directory):
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
+    # v_cvt_f32_f16 widens the low half through widen16 and applies modifiers after widening.
+    body = translate(with_constants(HALF_BODY)).split("float4 main", 1)[1]
+    assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body
+    must_reject(translate, with_constants(["v_cvt_f32_f16_e32 v12, 1.0"]))
+    must_reject(translate, with_constants(["v_cvt_f32_f16_sdwa v12, s44 src0_sel:WORD_1"]))
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     check_container_selector(directory, code)
@@ -774,6 +823,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.append((with_constants(CUBE_BODY), translate))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
+    fixtures.append((with_constants(HALF_BODY), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
@@ -821,6 +871,7 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
 
 
 def check_render(directory, compiler, renderer, backend):
+    check_half_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"
