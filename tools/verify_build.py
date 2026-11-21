@@ -181,8 +181,15 @@ def main():
     destination = args.output or Path(__file__).resolve().parents[1] / "out" / "integrity" / (root.name + ".json")
     if destination.resolve().is_relative_to(root):
         parser.error("Choose an output outside the input directory")
-    torrent, = root.glob("*.torrent")
-    layout, = root.glob("layout*.xml")
+
+    def manifest(pattern: str) -> Path:
+        matches = [path for path in root.glob(pattern) if path.is_file()]
+        if len(matches) != 1:
+            parser.error(f"expected exactly one {pattern} file in {root}, found {len(matches)}")
+        return matches[0]
+
+    torrent = manifest("*.torrent")
+    layout = manifest("layout*.xml")
     start = datetime.now(timezone.utc)
     raw = torrent.read_bytes()
     info = decode_torrent(raw)[b"info"]
