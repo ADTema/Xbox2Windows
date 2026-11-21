@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,6 +17,8 @@ from pe_inventory import scan
 
 
 def check(folder, fixture, provider):
+    # A native x64 interpreter can run in a shell without this environment hint.
+    os.environ.pop("PROCESSOR_ARCHITECTURE", None)
     root = folder / "build"
     root.mkdir()
     shutil.copyfile(provider, root / provider.name)

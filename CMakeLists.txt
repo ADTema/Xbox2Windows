@@ -171,6 +171,25 @@ endif()
 set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
     "Native x64 Python with pefile for static intake tests")
 if(EXISTS "${INTAKE_PYTHON}")
+    enable_language(ASM_MASM)
+    foreach(variant IN ITEMS original inverted)
+        set(image cpu_leaf_${variant})
+        add_library(${image} SHARED tests/cpu/branch.asm tests/cpu/branch.def)
+        set_target_properties(${image} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(${image} PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO)
+        if(variant STREQUAL "inverted")
+            target_compile_definitions(${image} PRIVATE INVERT_BRANCH)
+        endif()
+        set(lifted "${CMAKE_CURRENT_BINARY_DIR}/${image}_lifted.cpp")
+        add_custom_command(OUTPUT "${lifted}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_leaf_aot.py"
+                "$<TARGET_FILE:${image}>" branch_value "${lifted}"
+            DEPENDS ${image} tools/cpu_leaf_aot.py VERBATIM)
+        add_library(${image}_lifted SHARED "${lifted}")
+    endforeach()
+    add_test(NAME cpu_leaf_aot_branches COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/branches.py" "$<TARGET_FILE:cpu_leaf_original>"
+        "$<TARGET_FILE:cpu_leaf_original_lifted>" "$<TARGET_FILE:cpu_leaf_inverted_lifted>")
     add_library(script_path_host SHARED tools/script_path_host.cpp)
     target_compile_features(script_path_host PRIVATE cxx_std_17)
     add_test(NAME script_path_links COMMAND "${INTAKE_PYTHON}" -B
