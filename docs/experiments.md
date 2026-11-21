@@ -805,10 +805,15 @@ On the console a graphics allocation's CPU pointer is also its GPU virtual addre
 
 What is covered:
 - Translating title addresses that D3D12 calls receive. Root views at translated addresses are exercised below.
+- Shader loads through 64-bit title addresses read from memory, via `src/title_va_lookup.hlsli`.
 
 Not covered:
-- Shaders that load through 64-bit addresses read from memory. They need a shader-side lookup of the same ranges (`Table::ranges()`).
 - Performance. GPU access to this heap goes over the bus.
+
+How the shader lookup works:
+- `era_title_va::shader_ranges` packs the table's sorted ranges: low and high words of begin and end, and a descriptor slot.
+- `TitleLookup` binary-searches them with 64-bit comparisons on `uint2`. It returns the slot of the buffer that aliases the range, and the byte offset, which is exact because a range is shorter than 4 GiB.
+- The shader then loads through that slot's raw UAV.
 
 | CTest case | Inputs and checks |
 |---|---|
@@ -816,11 +821,14 @@ Not covered:
 | `era_title_va_bounds` | Bytes just before and after a range, spans crossing its end, a span longer than the range and a wrapping span return 0. |
 | `era_title_va_registry` | Empty, wrapping, zero-GPU and overlapping ranges are rejected; adjacent ranges are accepted and listed in order; a removed range no longer translates. |
 | `gpu_alias_warp`, `gpu_alias_hardware` | A 256 KiB memory-type-1 allocation from `era_heap` is opened as a heap. A compute shader reads 4,096 words through a root UAV at the translated title address `+0x1000` and writes transformed words through a root UAV at `+0x20000`. The CPU checks every result and the unchanged source through the title pointer, with no readback buffer. 64 guard words after the written range must keep their sentinel. Opening a pointer `0x1000` into the allocation must return `E_INVALIDARG` from `era_gpu_alias::open` without reaching D3D12; passing it to `OpenExistingHeapFromAddress` makes the debug layer report message 1088. Returns 77 when the adapter does not report `D3D12_FEATURE_EXISTING_HEAPS`. |
+| `era_title_va_shader` | Packing splits begin and end into low and high words, including a range across a 4 GiB line; slots follow table order; unsorted, overlapping, empty and 4 GiB ranges are rejected. |
+| `gpu_alias_lookup_warp`, `gpu_alias_lookup_hardware` | Three memory-type-1 allocations and one placed across a 4 GiB line are opened as heaps, packed, and bound as raw UAVs in a descriptor table. A compute shader loads one word through each of 122 title addresses read from an input buffer: starts, last words, middles, the words just outside each allocation, the null page, an address above user space, and the same low words 4 GiB above and below the placed allocation. Values and slots must match the CPU reading through the title pointers; addresses outside every range must return the miss marker. The hit and miss split varies with where the allocations land. |
 
 Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer unavailable (Graphics Tools not installed):
 - `gpu_alias_hardware` passed on an NVIDIA GeForce RTX 3070 Laptop GPU (driver 32.0.16.1088).
 - `gpu_alias_warp` passed on WARP 10.0.26100.9818.
 - On both, the interior open returned `E_INVALIDARG` (`0x80070057`).
+- At commit `53c8d69`, `gpu_alias_lookup_hardware` and `gpu_alias_lookup_warp` passed on the same two adapters with 4 ranges and 122 records, mismatches 0 (one run: 104 hits and 18 misses).
 
 ## Offscreen rendering and readback
 
