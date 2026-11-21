@@ -595,6 +595,8 @@ On Windows, use the Python-enabled build from the project README. Each backend d
 
 To supply a reference for another arithmetic program, run `offscreen_check.exe hardware --check-pixel-case shader.cso reference.case`. The case contains 256 bytes of constants followed by 64 expected RGBA colors in row-major little-endian binary32, one for each texel of the test texture. Generate the expected colors after round-toward-zero half export and widening back to float.
 
+`v_fract_f32` returns x - floor(x) clamped to `0x3f7fffff`, so its result stays below 1.0. The lowering uses an explicit clamp, not a bare D3D `frac`, which has no clamp and differs between adapters. For an input of -2^-30 the unclamped difference rounds to 1.0. An RTX 4070 Ti (driver 32.0.16.1088) exported 1.0 for that input, while WARP 10.0.26100.9818 already exported the clamped value. The draw also checks -0.25, 2.75 and -2^-23, which stay below the clamp. A reference that expects 1.0 for the first input must report a mismatch. NaN still propagates: it fails the clamp comparison.
+
 ```powershell
 ctest --preset dev -R '^pixel_aot_' -V
 ```
