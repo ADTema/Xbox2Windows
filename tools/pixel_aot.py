@@ -24,20 +24,17 @@ def inflate(data, size, window):
 
 
 def native_program(archive, record):
-    needle = record.encode("ascii") + b"\0"
-    if not record or b"\0" in needle[:-1]:
-        raise ValueError("Expected a nonempty record name")
+    name = record.encode("ascii")
+    if not 0 < len(name) < 255 or b"\0" in name:
+        raise ValueError("Invalid length-prefixed record name")
+    needle = bytes([len(name) + 1]) + name + b"\0"
     with archive.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-        end = None
         pos = data.find(needle)
-        while pos >= 0:
-            if pos == 0 or not 33 <= data[pos - 1] <= 126:
-                if end is not None:
-                    raise ValueError("Multiple records match the name")
-                end = pos + len(needle)
-            pos = data.find(needle, pos + 1)
-        if end is None or end + 17 > len(data):
+        end = pos + len(needle)
+        if pos < 0 or end + 17 > len(data):
             raise ValueError("Missing or truncated named record")
+        if data.find(needle, end) >= 0:
+            raise ValueError("Multiple records match the name")
         stored, _, repeat, size = struct.unpack_from("<4I", data, end + 1)
         if stored != repeat or not 0 < stored <= 8 << 20 or end+17+stored > len(data):
             raise ValueError("Invalid record extent")

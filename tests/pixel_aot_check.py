@@ -37,7 +37,7 @@ def assembly(swap):
     ]
 
 
-def envelope(code):
+def envelope(code, name=b"fixture"):
     program_start = 256
     image = bytearray(program_start) + code
     image[:4] = b"FSSM"
@@ -49,7 +49,8 @@ def envelope(code):
             + b"DXIL" + struct.pack("<I", len(program)) + program)
     encoder = zlib.compressobj(wbits=-15)
     payload = encoder.compress(blob) + encoder.flush()
-    return b"fixture\0\0" + struct.pack("<4I", len(payload), 0, len(payload), len(blob)) + payload
+    return (bytes([len(name) + 1]) + name + b"\0\0"
+            + struct.pack("<4I", len(payload), 0, len(payload), len(blob)) + payload)
 
 
 def must_reject(function, *args):
@@ -70,6 +71,9 @@ def check_controls(directory):
     record = envelope(code)
     archive.write_bytes(b"another_fixture\0" + record)
     assert native_program(archive, "fixture")[1] == code
+    long_name = b"synthetic_pixel_with_a_printable_length"
+    archive.write_bytes(envelope(code, long_name))
+    assert native_program(archive, long_name.decode())[1] == code
     for invalid in (record[:-1], record + b"\0" + record, envelope(code + code)):
         archive.write_bytes(invalid)
         must_reject(native_program, archive, "fixture")
