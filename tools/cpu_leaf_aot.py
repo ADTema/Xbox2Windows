@@ -14,10 +14,12 @@ def export_rva(pe, name):
         raise ValueError("expected AMD64 PE32+")
     pe.parse_data_directories(directories=[0, 3])  # exports and runtime functions
     exports = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
-    matches = [e.address for e in exports.symbols if e.name == name.encode("ascii")
-               and not e.forwarder] if exports else []
+    ordinal = isinstance(name, int)
+    key = name if ordinal else name.encode("ascii")
+    matches = [e.address for e in exports.symbols if (e.ordinal if ordinal else e.name) == key
+               and e.address and not e.forwarder] if exports else []
     if len(matches) != 1:
-        raise ValueError(f"expected one local export named {name}")
+        raise ValueError(f"expected one local export for {name}")
     return matches[0]
 
 

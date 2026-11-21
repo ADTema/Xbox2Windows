@@ -1,4 +1,4 @@
-"""Recompile a bounded Windows x64 caller with one direct or named import call."""
+"""Recompile a bounded Windows x64 caller with one direct or ordinary import call."""
 
 import argparse
 from pathlib import Path
@@ -106,40 +106,47 @@ def lift_body(start, code, *, caller, bind_import=None):
     return "\n".join([signature + " {", "    word rax, rbx, rsi;", *lines, "    return rax;", "}"]), target
 
 
-def resolve_import(pe, slot, provider, symbol):
+def resolve_import(pe, slot, provider, symbol, link_name=None):
     pe.parse_data_directories(directories=[1])  # ordinary import directory
     matches = [(desc.dll, imp) for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])
                for imp in desc.imports if imp.address - pe.OPTIONAL_HEADER.ImageBase == slot]
     if len(matches) != 1:
         raise ValueError(f"no unique ordinary import at IAT slot RVA {slot:#x}")
     module, imp = matches[0]
-    if imp.name is None:
-        raise ValueError(f"unsupported ordinal import {module!r} #{imp.ordinal}")
-    dll, name = module.decode("ascii"), imp.name.decode("ascii")
+    dll = module.decode("ascii")
+    by_ordinal = imp.name is None
+    name = f"#{imp.ordinal}" if by_ordinal else imp.name.decode("ascii")
     identity = f"{dll}!{name}"
     if dll.casefold() != provider.name.casefold() or symbol != name:
         raise ValueError(f"unbound import {identity} at IAT slot RVA {slot:#x}")
-    if not name.isascii() or not name.isidentifier():
+    if by_ordinal and not link_name:
+        raise ValueError(f"import-library link name required for {identity}")
+    if not by_ordinal and link_name is not None:
+        raise ValueError(f"unexpected link name for named import {identity}")
+    identifier = link_name if by_ordinal else name
+    if not identifier.isascii() or not identifier.isidentifier():
         raise ValueError(f"unsupported C import name {identity}")
     if not provider.is_file():
         raise ValueError(f"missing provider for {identity}")
     with pefile.PE(str(provider), fast_load=True) as library:
         try:
-            rva = export_rva(library, name)
+            rva = export_rva(library, imp.ordinal if by_ordinal else name)
         except ValueError as exc:
             raise ValueError(f"unresolved import {identity}: {exc}") from exc
         section = library.get_section_by_rva(rva)
         if not section or not section.Characteristics & 0x20000000:
             raise ValueError(f"non-executable export for {identity}")
-    return name
+    return identifier
 
 
-def translate(image, entry, binding=None):
+def translate(image, entry, binding=None, link_name=None):
+    if link_name is not None and not binding:
+        raise ValueError("link name requires a provider binding")
     with pefile.PE(str(image), fast_load=True) as pe:
         start = export_rva(pe, entry)
         code = bounded_code(pe, start)
         def bind_import(slot):
-            return resolve_import(pe, slot, Path(binding[0]), binding[1])
+            return resolve_import(pe, slot, Path(binding[0]), binding[1], link_name)
 
         caller, (kind, target) = lift_body(start, code, caller=True, bind_import=bind_import if binding else None)
         if kind == "import":
@@ -160,9 +167,10 @@ if __name__ == "__main__":
     parser.add_argument("export")
     parser.add_argument("output", type=Path)
     parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"),
-                        help="named import with the fixture's two-word and output-pointer ABI")
+                        help="export name or #ordinal with the fixture's two-word and output-pointer ABI")
+    parser.add_argument("--link-name", help="local import-library symbol for an ordinal binding")
     args = parser.parse_args()
     try:
-        args.output.write_text(translate(args.image, args.export, args.bind), encoding="utf-8")
+        args.output.write_text(translate(args.image, args.export, args.bind, args.link_name), encoding="utf-8")
     except (OSError, ValueError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")

@@ -183,9 +183,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         target_link_options(${image} PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO)
     endfunction()
     function(cpu_translation image translator entry)
-        cmake_parse_arguments(BIND "" "PROVIDER;SYMBOL" "" ${ARGN})
+        cmake_parse_arguments(BIND "" "PROVIDER;SYMBOL;LINK_NAME" "" ${ARGN})
         if(BIND_PROVIDER)
             set(binding --bind "$<TARGET_FILE:${BIND_PROVIDER}>" "${BIND_SYMBOL}")
+            if(BIND_LINK_NAME)
+                list(APPEND binding --link-name "${BIND_LINK_NAME}")
+            endif()
         endif()
         set(lifted "${CMAKE_CURRENT_BINARY_DIR}/${image}_lifted.cpp")
         add_custom_command(OUTPUT "${lifted}"
@@ -222,18 +225,33 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/direct_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_call_original>" "$<TARGET_FILE:cpu_call_original_lifted>"
         "$<TARGET_FILE:cpu_call_altered_lifted>")
-    add_library(cpu_import_provider SHARED tests/cpu/import_provider.cpp)
-    add_library(cpu_import_altered SHARED tests/cpu/import_provider.cpp)
-    target_compile_definitions(cpu_import_altered PRIVATE ALTER_RETURN)
-    cpu_asm_fixture(cpu_import_original direct import)
-    target_compile_definitions(cpu_import_original PRIVATE IMPORT_MIX)
-    target_link_libraries(cpu_import_original PRIVATE cpu_import_provider)
-    cpu_translation(cpu_import_original cpu_call_aot call_mix PROVIDER cpu_import_provider SYMBOL mix_args)
-    target_link_options(cpu_import_original_lifted PRIVATE /INCREMENTAL:NO)
+    foreach(kind IN ITEMS named ordinal)
+        if(kind STREQUAL "named")
+            set(prefix cpu_import)
+            set(contract SYMBOL mix_args)
+        else()
+            set(prefix cpu_ordinal)
+            set(contract SYMBOL "#77" LINK_NAME mix_args)
+        endif()
+        foreach(variant IN ITEMS provider altered)
+            add_library(${prefix}_${variant} SHARED tests/cpu/import_provider.cpp tests/cpu/${kind}_provider.def)
+        endforeach()
+        target_compile_definitions(${prefix}_altered PRIVATE ALTER_RETURN)
+        cpu_asm_fixture(${prefix}_original direct import)
+        target_compile_definitions(${prefix}_original PRIVATE IMPORT_MIX)
+        target_link_libraries(${prefix}_original PRIVATE ${prefix}_provider)
+        cpu_translation(${prefix}_original cpu_call_aot call_mix PROVIDER ${prefix}_provider ${contract})
+        target_link_options(${prefix}_original_lifted PRIVATE /INCREMENTAL:NO)
+    endforeach()
     add_test(NAME cpu_aot_import_call COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/import_check.py" "$<TARGET_FILE:cpu_import_original>"
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
         "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
+    add_test(NAME cpu_aot_ordinal_import COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/import_check.py" "$<TARGET_FILE:cpu_ordinal_original>"
+        "$<TARGET_FILE:cpu_ordinal_original_lifted>" "$<TARGET_FILE:cpu_ordinal_provider>"
+        "$<TARGET_FILE:cpu_ordinal_altered>" "$<TARGET_FILE:cpu_register_probe>"
+        --ordinal-control "$<TARGET_FILE:cpu_import_provider>")
     add_library(script_path_host SHARED tools/script_path_host.cpp)
     target_compile_features(script_path_host PRIVATE cxx_std_17)
     add_test(NAME script_path_links COMMAND "${INTAKE_PYTHON}" -B
