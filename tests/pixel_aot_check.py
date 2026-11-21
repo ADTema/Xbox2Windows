@@ -1013,6 +1013,19 @@ def check_affine_coordinates() -> None:
         must_reject(translate, changed)
 
 
+def check_scalar_helpers_with_vector_arithmetic() -> None:
+    entry = assembly(False)
+    entry_add = "v_add_f32_e32 v12, 0.0, v12"
+    entry.insert(entry.index("s_waitcnt vmcnt(0)") + 1, entry_add)
+    quad_add = "v_add_f32_e32 v8, 0.5, v8"
+    scalar = "s_bfe_u32 s70, 1, 0x10000"
+    for program, vector in ((entry, entry_add), (affine_coordinates(), quad_add)):
+        position = program.index(vector)
+        for index in (position, position + 1):
+            source = translate(program[:index] + [scalar] + program[index:])
+            assert "uint s_bfe_u32(" in source and " = s_bfe_u32(" in source
+
+
 # v_fmaak_f32 computes S0 * S1 + K and v_fmamk_f32 computes S0 * K + S1, with K a 32-bit literal.
 # Every product and sum is exact in binary32, so the reference does not depend on fusion. Swapping
 # the literal with S1 changes each result.
@@ -1058,6 +1071,7 @@ def check_controls(directory):
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
     check_affine_coordinates()
+    check_scalar_helpers_with_vector_arithmetic()
     # v_cvt_f32_f16 widens the low half through widen16 and applies modifiers after widening.
     body = translate(with_constants(HALF_BODY)).split("float4 main", 1)[1]
     assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body

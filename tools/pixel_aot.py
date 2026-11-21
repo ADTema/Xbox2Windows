@@ -604,8 +604,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Write overlaps an outstanding sample")
             if quad and (clamp or any("|" in t or "abs(" in t for t in tokens)):
                 raise ValueError("Whole-quad coordinate arithmetic must be affine")
-            helpers = quad_values if quad else None
-            values = [fp_operand(t, scalar, vector, pending, sample_pending, quad_values=helpers) for t in tokens]
+            provenance = quad_values if quad else None
+            values = [fp_operand(t, scalar, vector, pending, sample_pending, quad_values=provenance) for t in tokens]
             if quad:
                 varying = [quad_values.get(vector.get(t.lstrip("-"), ""), False) for t in tokens]
                 if op != "add" and all(varying[:2]):
