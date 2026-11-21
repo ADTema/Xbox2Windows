@@ -652,6 +652,8 @@ Build `cpu_bink_descriptors_lifted` and run `ctest --preset dev --no-tests=error
 
 ### Bink allocation and release on the Windows heap
 
+The exported binding now serves requests from `era_heap`, so the Bink shim and the heap experiments share one attribute decoder, alignment rule and release path. `bink_heap_check.py` checks on the binding directly that a 97- or 129-byte request with `0x05e50000` returns a 32-byte-aligned, zeroed block and that the matching release frees it.
+
 The local test lowers the allocation and release callers and the exported `BinkSetMemory` setter from x64 machine code to C++, links the result to a Windows process-heap adapter, and runs the new DLL. The translator follows the setter's export jump and binds its two pointer stores to the same slots the allocation path reads. It also resolves the named PE imports, including tail transfers through linker thunks. The console-specific meaning of the heap attributes remains open.
 
 On Windows, the public native fixture, its translation and the locally translated callers passed the same checks:
