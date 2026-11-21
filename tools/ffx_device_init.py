@@ -6,6 +6,7 @@ from uuid import UUID
 from iced_x86 import Mnemonic, Register
 
 from cpu_ranges import function_ranges
+from ffx_recurrent import generate_recurrent
 from ffx_version_query import INTEGER_HEADER, UPSCALER, checked_image, lower, region
 
 
@@ -38,11 +39,12 @@ def generate(image):
                        "rbp = 0x14;"], {}, {},
                       {0xcf9b: "r14 = r9; goto block_27a7;",
                        0x27b0: "goto block_2938;", 0x2aa1: "return static_cast<uint32_t>(rax);"})
+        recurrent = generate_recurrent(pe)
     return INTEGER_HEADER + '\n#include "ffx_device_init.h"\n' + (
         "static const unsigned char heap_iid[] = {" + ", ".join(map(str, guid)) + "};\n"
         "void run_device_slice(FfxDeviceProbe& probe) {\n" + code + "\n}\n"
         "uint32_t run_backend_slots(uint8_t* scratch, FfxSlotOutput& provider, const uint32_t* sizes) {\n"
-        + slots + "\n}\n")
+        + slots + "\n}\n" + recurrent)
 
 
 if __name__ == "__main__":

@@ -83,6 +83,8 @@ void run_device_slice(FfxDeviceProbe& probe)
     // The last 96 bytes of the single-context scratch hold its slot record.
     auto* table = probe.scratch.data() + probe.scratch.size() - 96;
     std::memcpy(probe.scratch.data() + 0x1078, &table, sizeof table);
+    auto* records = probe.scratch.data() + 0xbf100;
+    std::memcpy(probe.scratch.data() + 0x1070, &records, sizeof records);
 }
 #endif
 

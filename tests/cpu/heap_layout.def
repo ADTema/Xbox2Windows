@@ -1,3 +1,4 @@
 EXPORTS
     heap_layout
     slot_probe
+    descriptor_fields

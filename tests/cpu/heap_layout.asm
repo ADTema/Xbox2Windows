@@ -40,4 +40,20 @@ available:
     vmovd eax,xmm0
     ret
 slot_probe ENDP
+
+; Exercise full-width descriptor copies, zeroing and packed 16-bit fields.
+descriptor_fields PROC FRAME
+    .endprolog
+    vmovups ymm1,ymmword ptr [rdx]
+    vmovups ymmword ptr [r8],ymm1
+    vzeroupper
+    vmovups ymmword ptr [r8+32],ymm1
+    vpxor xmm1,xmm1,xmm1
+    vmovups ymmword ptr [r8+64],ymm1
+    movsxd rax,ecx
+    mov ax,17
+    sub ecx,1
+    cmovne eax,ecx
+    ret
+descriptor_fields ENDP
 END
