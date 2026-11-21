@@ -428,6 +428,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_seh COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_seh_check.py" "$<TARGET_FILE:cpu_seh_original>"
         "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_register_probe>")
+    add_library(cpu_tls_sink SHARED tests/cpu/tls_sink.cpp)
+    foreach(variant IN ITEMS original refuse)
+        add_library(cpu_tls_${variant} SHARED tests/cpu/tls_route.asm tests/cpu/tls_route.def)
+        set_target_properties(cpu_tls_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_tls_${variant} PRIVATE /ENTRY:dll_entry /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(cpu_tls_${variant} PRIVATE cpu_tls_sink)
+    endforeach()
+    target_compile_definitions(cpu_tls_refuse PRIVATE ENTRY_FAILS)
+    add_test(NAME cpu_native_tls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_tls_check.py" "$<TARGET_FILE:cpu_tls_original>"
+        "$<TARGET_FILE:cpu_tls_refuse>" "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:pe_map>")
     add_library(script_path_host SHARED tools/script_path_host.cpp)
     target_compile_features(script_path_host PRIVATE cxx_std_17)
     add_test(NAME script_path_links COMMAND "${INTAKE_PYTHON}" -B
