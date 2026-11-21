@@ -173,6 +173,12 @@ def collect(root, candidate, baseline, integrity, report):
         raise ValueError("Candidate changed during intake")
     report["diff"] = changes(old, current)
     report["dependency_paths"] = trace(current, candidate_key)
+    previous_missing = {(r["dll"], r["symbol"]) for r in old["unresolved_edges"]}
+    report["entry_import_gaps"] = [
+        {"dll": r["dll"], "symbol": r["symbol"], "kind": r["kind"],
+         "seen_unresolved_in_baseline": (r["dll"], r["symbol"]) in previous_missing}
+        for r in current["unresolved_edges"] if r["image"] == candidate_key
+    ]
     report["inventory"] = current
     report["status"] = "inspected"
     return 0

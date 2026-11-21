@@ -57,6 +57,15 @@ foreach(stage IN ITEMS vs ps)
     target_sources(offscreen_check PRIVATE "${header}")
 endforeach()
 set(ray_header "${CMAKE_CURRENT_BINARY_DIR}/ray_query.h")
+target_sources(offscreen_check PRIVATE tests/binding_mips.cpp)
+foreach(entry IN ITEMS DualUav SampleMip)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
+    add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E ${entry}
+        -Vn ${entry} -Fh "${header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/binding_mips.hlsl" DEPENDS tests/binding_mips.hlsl
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
+    target_sources(offscreen_check PRIVATE "${header}")
+endforeach()
 target_sources(offscreen_check PRIVATE tests/bvh_reads_waves.cpp tests/bvh_hits.cpp)
 target_sources(offscreen_check PRIVATE tests/bvh_atomics.cpp tests/bvh_numeric.cpp)
 foreach(entry IN ITEMS InitBounds AtomicBounds QueryBounds NumericBounds)
@@ -116,6 +125,9 @@ foreach(layout IN ITEMS root tables)
 endforeach()
 foreach(adapter IN ITEMS hardware warp)
     add_test(NAME offscreen_${adapter} COMMAND offscreen_check ${adapter} triangle_${adapter}.bmp)
+    add_test(NAME dual_uav_${adapter} COMMAND offscreen_check ${adapter} --dual-uav)
+    add_test(NAME texture_mips_${adapter} COMMAND offscreen_check ${adapter} --texture-mips)
+    set_tests_properties(dual_uav_${adapter} texture_mips_${adapter} PROPERTIES TIMEOUT 45)
     add_test(NAME dxr_query_${adapter} COMMAND offscreen_check ${adapter} --ray-query)
     add_test(NAME dxr_update_${adapter} COMMAND offscreen_check ${adapter} --dxr-update)
     set_tests_properties(dxr_update_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
@@ -132,6 +144,7 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(offscreen_${adapter} PROPERTIES TIMEOUT 45)
 endforeach()
 set_tests_properties(offscreen_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(dual_uav_hardware texture_mips_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_root_roundtrip_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_atomics_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_numeric_hardware bvh_packed_hardware PROPERTIES SKIP_RETURN_CODE 77)
@@ -153,6 +166,9 @@ endif()
 set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
     "Native x64 Python with pefile for static intake tests")
 if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME compressed_scene_metadata COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/scene_records_check.py" "${CMAKE_CURRENT_BINARY_DIR}/DualUav.cso"
+        "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.cso" "$<TARGET_FILE:root_probe>")
     add_test(NAME root_device_controls_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tools/probe_root_devices.py" --warp-only --bin "$<TARGET_FILE_DIR:root_device_probe>")
     add_test(NAME shader_metadata_probe COMMAND "${INTAKE_PYTHON}" -B
