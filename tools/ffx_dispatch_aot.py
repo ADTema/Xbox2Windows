@@ -60,7 +60,7 @@ OPS = {
     "max_i32": "max(asint({0}),asint({1}))", "min_i32": "min(asint({0}),asint({1}))",
     "max_u32": "max({0},{1})", "abs_i32": "abs(asint({0}))",
     "med3_i32": "median_i(asint({0}),asint({1}),asint({2}))",
-    "bfe_u32": "({0}>>{1}) & ((1u<<{2})-1)", "bfe_i32": "asint({0}<<(32-{1}-{2}))>>(32-{2})",
+    "bfe_u32": "bfe_u({0},{1},{2})", "bfe_i32": "bfe_i({0},{1},{2})",
     "cvt_f32_i32": "asuint(float(asint({0})))", "cvt_f32_u32": "asuint(float({0}))",
     "cvt_i32_f32": "uint(int(asfloat({0})))", "cvt_u32_f32": "uint(asfloat({0}))",
     "cvt_pk_u8_f32": "insert_byte({2},{1},uint(round(clamp(asfloat({0}),0.0,255.0))))",
@@ -140,8 +140,8 @@ def alu(mn, tokens, mods):
             args[1] = f"(({args[1]}<<16)|({args[1]}>>16))"
         else:
             raise ValueError(mods)
-    if mn == "s_bfe_u32":
-        args = [args[0], str(int(inputs[1], 0) & 31), str(int(inputs[1], 0) >> 16)]
+    if op in ("bfe_u32", "bfe_i32"):
+        args = [args[0], args[1], f"(({args[1]}>>16)&127u)" if mn.startswith("s_") else f"({args[2]}&31u)"]
     if op in FLOAT:
         expr = FLOAT[op].format(*[f"asfloat({a})" for a in args], d=f"asfloat({dest})")
         if mods == "mul:2":

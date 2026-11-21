@@ -38,6 +38,16 @@ float median_f(float a, float b, float c) { return max(min(a,b), min(max(a,b),c)
 uint insert_byte(uint old, uint lane, uint value) {
     return (old & ~(255u << (8*lane))) | (value << (8*lane));
 }
+uint bfe_u(uint src, uint offset, uint width) {
+    uint count = min(width, 32u);
+    return count != 0u ? (src >> (offset & 31u)) & (0xffffffffu >> ((32u - count) & 31u)) : 0u;
+}
+int bfe_i(uint src, uint offset, uint width) {
+    uint count = min(width, 32u);
+    uint shift = (32u - count) & 31u;
+    int shifted = asint(src) >> (offset & 31u);
+    return count != 0u ? (asint(uint(shifted) << shift) >> shift) : 0;
+}
 int idot(uint a, uint b, int sum) {
     [unroll] for (int i=0; i<4; ++i) {
         sum += (asint(a << (24-8*i)) >> 24) * (asint(b << (24-8*i)) >> 24);
