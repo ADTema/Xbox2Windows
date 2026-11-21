@@ -46,6 +46,7 @@ jobs:
           python -B tests/dxcontainer_part_offsets_check.py
           python -B tests/layout_chunks_check.py
           python -B tests/intake/paths_check.py
+          python -B tests/shader_probe_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
