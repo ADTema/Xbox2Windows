@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import form_coverage as fc
@@ -217,6 +218,24 @@ def check_parsing():
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
 
 
+def check_dashboard():
+    """tools/coverage_svg.py draws one square per reference form, coloured by its measured state."""
+    import coverage_svg as svg
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"branch": BRANCH, "switch": SWITCH})
+        m = fc.measure({"cpu_leaf_aot_branches": "pass", "cpu_aot_jump_tables": "skip"}, root)
+    drawn = svg.render(m, "a test run")
+    assert drawn == svg.render(m, "a test run") and fc.measure({})["note"] == svg.NOTE in drawn
+    assert "%" not in drawn  # counts only: coverage is not a completion percentage
+    squares = {svg.COVERED: 0, svg.HELD: 0, svg.OPEN: 0}
+    for g in ET.fromstring(drawn).iter("{http://www.w3.org/2000/svg}g"):
+        if g.get("fill") in squares:
+            squares[g.get("fill")] += len(g)
+    held = fc.masm_mnemonics(SWITCH) - fc.masm_mnemonics(BRANCH)
+    total = sum(m[key]["total"] for key, _, _ in svg.AREAS)
+    assert squares == {svg.COVERED: 8, svg.HELD: len(held), svg.OPEN: total - 8 - len(held)}, squares
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -224,4 +243,5 @@ if __name__ == "__main__":
     check_unclassified()
     check_shader_records()
     check_parsing()
+    check_dashboard()
     print("form coverage checks passed")
