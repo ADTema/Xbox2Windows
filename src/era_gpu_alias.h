@@ -23,8 +23,10 @@ struct Alias {
     std::uint64_t size = 0;
 };
 
-// base must be the start of the allocation, as returned by VirtualAlloc, and the allocation
-// must cover size bytes. Returns E_NOTIMPL when the device does not support existing heaps,
-// E_INVALIDARG for bad arguments or a too-small allocation, or the failing D3D12 HRESULT.
+// base must be the start of a committed allocation, as returned by VirtualAlloc, and the
+// allocation must cover size bytes. Returns E_INVALIDARG without calling D3D12 when base is
+// not the start of a committed allocation, E_INVALIDARG for other bad arguments or a too-small
+// allocation, E_NOTIMPL when the device does not support existing heaps, or the failing D3D12
+// HRESULT.
 HRESULT open(ID3D12Device* device, void* base, std::uint64_t size, Alias& alias) noexcept;
 }

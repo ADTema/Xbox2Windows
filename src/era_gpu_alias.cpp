@@ -7,6 +7,13 @@ HRESULT open(ID3D12Device* device, void* base, std::uint64_t size, Alias& alias)
     if (!device || !base || size == 0) {
         return E_INVALIDARG;
     }
+    // OpenExistingHeapFromAddress requires the base of an allocation (debug layer message 1088
+    // otherwise). Reject anything else here so an invalid pointer never reaches D3D12.
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(base, &info, sizeof(info)) != sizeof(info) || info.AllocationBase != base ||
+        info.State != MEM_COMMIT) {
+        return E_INVALIDARG;
+    }
     D3D12_FEATURE_DATA_EXISTING_HEAPS existing{};
     if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &existing, sizeof(existing))) ||
         !existing.Supported) {

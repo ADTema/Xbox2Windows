@@ -48,10 +48,12 @@ bool check_gpu_alias(ID3D12Device* device)
     }
     check(hr, "Open the title allocation as a D3D12 heap");
 
-    // Failure case: a pointer inside the allocation is not the start of an allocation.
+    // Failure case: a pointer inside the allocation is not the start of an allocation. open must
+    // reject it before calling D3D12, so the debug layer reports no error for this control.
     era_gpu_alias::Alias interior;
     const HRESULT interior_hr = era_gpu_alias::open(device, base + 0x1000, allocation_bytes - 0x1000, interior);
-    if (SUCCEEDED(interior_hr)) throw std::runtime_error("an interior pointer was opened as a heap");
+    if (interior_hr != E_INVALIDARG || interior.heap || interior.buffer)
+        throw std::runtime_error("an interior pointer was not rejected with E_INVALIDARG");
 
     era_title_va::Table table;
     const auto title_begin = reinterpret_cast<std::uint64_t>(base);
