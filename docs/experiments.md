@@ -375,6 +375,12 @@ The mapped `call_mix` is compared over 249 input pairs on arguments, guarded wri
 ctest --preset dev --no-tests=error -R '^cpu_native_seh$' -V
 ```
 
+`cpu_native_section` compares every section of the register probe after `LoadLibraryExW` and after `pe_map`, byte for byte. The probe has no entry point and no imports, so the Windows load runs none of its code. In a copy whose `.rsrc` header has `PointerToRawData` set to zero and `SizeOfRawData` unchanged, the Windows loader leaves `.rsrc` zero-filled, and `pe_map` does the same instead of copying the headers from file offset 0. The other sections are unchanged in both loaders. On Windows 11 build 26300.9974, setting the same field to `0x100` or `0x1ff`, below the `0x200` file alignment, made `LoadLibraryExW` fail with `ERROR_BAD_EXE_FORMAT`. `pe_map` still maps those copies, which remains open.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_section$' -V
+```
+
 ## Offline pixel shader recompilation
 
 `tools/pixel_aot.py` extracts one named pixel program from a local archive, decodes gfx1013 instructions with LLVM and emits HLSL. DXC compiles the result to desktop DXIL before the draw. The lowerer tracks register writes across whole-quad interpolation of attribute 0, a scalar texture-descriptor load, a 2D RGBA sample, packed round-toward-zero binary16 conversions and one compressed color export. Unknown instructions, mismatched bindings and reads before the required wait cause translation to fail. [LLVM disassembler API](https://llvm.org/docs/doxygen/group__LLVMCDisassembler.html) · [Leonida public format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/fssm_unpack.py)

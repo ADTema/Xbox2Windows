@@ -158,7 +158,9 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
         const auto& s = sections[i];
         const DWORD span = s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData;
-        const DWORD copy = s.SizeOfRawData < span ? s.SizeOfRawData : span;
+        // Like the Windows loader, a section without a file offset stays zero-filled even when
+        // SizeOfRawData is set; it does not take the headers at file offset 0.
+        const DWORD copy = !s.PointerToRawData ? 0 : s.SizeOfRawData < span ? s.SizeOfRawData : span;
         if (s.VirtualAddress < opt.SizeOfHeaders || !inside(s.VirtualAddress, span, opt.SizeOfImage)
             || !inside(s.PointerToRawData, copy, raw.size()))
             return release(fail(MAP_FORMAT, "section %.8s outside image", reinterpret_cast<const char*>(s.Name)));
