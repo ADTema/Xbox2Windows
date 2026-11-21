@@ -261,7 +261,8 @@ def parse_assembly_file(path: Path) -> list[str]:
             # Ignore empty lines and pure comments / assembler directives like .text, .globl
             if not stripped or stripped.startswith(("//", ";", "#", "@")):
                 continue
-            if stripped.startswith(".") and not stripped.startswith("."):
+            # Symbol metadata emits no instruction. Keep data and alignment directives visible.
+            if stripped == ".text" or stripped.split(None, 1)[0] in (".globl", ".global", ".type", ".size"):
                 continue
             if stripped.endswith(":") and " " not in stripped:
                 continue  # label

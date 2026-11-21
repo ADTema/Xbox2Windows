@@ -400,7 +400,8 @@ class TestRdna2Scanner(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             shader_file = tmp_path / "canonical.s"
-            shader_file.write_text(canonical_shader, encoding="utf-8")
+            shader_file.write_text(".text\n.globl pixel\n.type pixel,@function\npixel:\n"
+                                   + canonical_shader + "\n.size pixel, .-pixel\n", encoding="utf-8")
             out_dir = tmp_path / "scan_reports"
             script = Path(__file__).resolve().parents[1] / "tools" / "scan_unsupported_shaders.py"
             res = subprocess.run(
@@ -414,6 +415,11 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertIn("Full Shaders Accepted by Translator:       1", res.stdout)
             self.assertTrue((out_dir / "shader_scan_report.json").is_file())
             self.assertTrue((out_dir / "shader_scan_report.md").is_file())
+            with shader_file.open("a", encoding="utf-8") as stream:
+                stream.write(".long 0\n")
+            result = subprocess.run([sys.executable, "-B", str(script), str(shader_file),
+                                     "--output-dir", str(out_dir)], capture_output=True, text=True, check=True)
+            self.assertIn("Full Shaders Accepted by Translator:       0", result.stdout)
 
     def test_report_generation(self):
         canonical_shader = [
