@@ -263,17 +263,19 @@ Both desktop shaders come from offline decoding of the pinned native streams (3,
 
 The GPU test checks all 32 intermediate texels and 257 surrounding guard texels. It then compares all 256 final pixels, including edges between different colors, with an independent FP32 five-tap reference (per-channel tolerance 2.5% plus 0.00005 for packed-half arithmetic). Alpha must equal red. RTX 4060 Laptop passed using R32_UINT. WARP passed with native RGB9E5 and with forced R32_UINT. Both debug layers reported zero errors and warnings. These are controlled single-group results.
 
-From a VS x64 developer shell at the repository root, set `$upscaler` to the pinned local DLL. The middle command runs in WSL with Python 3 and libLLVM 15 installed. All extracted programs and generated shaders stay under `out/`.
+From a VS x64 developer shell at the repository root, set `$upscaler` to the pinned local DLL. The middle command needs the LLVM 15 C library. On Windows, the official LLVM 15.0.7 installer (`winget install --id LLVM.LLVM --version 15.0.7 --exact`) provides `LLVM-C.dll` with the AMDGPU disassembler, so no WSL is required. All extracted programs and generated shaders stay under `out/`.
 
 ```powershell
 ./out/pe-env/Scripts/python.exe -B tools/ffx_dispatch_profile.py $upscaler out/ffx-dispatch
-wsl -d Ubuntu-22.04 -- python3 -B tools/ffx_dispatch_aot.py out/ffx-dispatch --llvm libLLVM-15.so.1
+./out/pe-env/Scripts/python.exe -B tools/ffx_dispatch_aot.py out/ffx-dispatch --llvm "C:/Program Files/LLVM/bin/LLVM-C.dll"
+# Alternatively, in WSL with libLLVM 15 installed:
+# wsl -d Ubuntu-22.04 -- python3 -B tools/ffx_dispatch_aot.py out/ffx-dispatch --llvm libLLVM-15.so.1
 cmake --preset dev -B out/build/ffx-device "-DFFX_UPSCALER_IMAGE=$upscaler" "-DFFX_DISPATCH_SHADER_DIR=$PWD/out/ffx-dispatch"
 cmake --build out/build/ffx-device --target offscreen_check
 ctest --test-dir out/build/ffx-device -R '^ffx_provider_loop_' --no-tests=error -V
 ```
 
-The local log reports `dispatch=package-aot`. Public Windows CI runs source-built descriptor and dispatch controls on WARP (`dispatch=desktop-control`). Linux CI assembles an independent integer-coordinate regression for the translator.
+The local log reports `dispatch=package-aot`. Through the native Windows route above (LLVM 15.0.7 `LLVM-C.dll`, Python 3.14.6), the translator decoded 1152, 100, 3482 and 437 instructions for pass 24, pass 25, the producer and RCAS. `ffx_provider_loop_hardware` passed on an RTX 4070 Ti (driver 32.0.16.1088) and `ffx_provider_loop_warp` passed on WARP, both with the debug layer enabled. Each reported `dispatch=package-aot` with 256 final pixels and zero mismatches for the bypass, zero and pattern scratch cases. Public Windows CI runs source-built descriptor and dispatch controls on WARP (`dispatch=desktop-control`). Linux CI assembles an independent integer-coordinate regression for the translator.
 
 ### First pass 26 LDS write block
 
