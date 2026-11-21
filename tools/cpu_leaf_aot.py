@@ -7,30 +7,38 @@ import struct
 import pefile
 
 
+def export_rva(pe, name):
+    if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
+        raise ValueError("expected AMD64 PE32+")
+    pe.parse_data_directories(directories=[0, 3])  # exports and runtime functions
+    exports = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
+    matches = [e.address for e in exports.symbols if e.name == name.encode("ascii")
+               and not e.forwarder] if exports else []
+    if len(matches) != 1:
+        raise ValueError(f"expected one local export named {name}")
+    return matches[0]
+
+
+def bounded_code(pe, start):
+    ends = [f.struct.EndAddress for f in getattr(pe, "DIRECTORY_ENTRY_EXCEPTION", [])
+            if f.struct.BeginAddress == start]
+    if len(ends) != 1 or ends[0] <= start:
+        raise ValueError(f"no unique function interval at RVA {start:#x}")
+    section = pe.get_section_by_rva(start)
+    size = ends[0] - start
+    if (not section or not section.Characteristics & 0x20000000
+            or ends[0] - section.VirtualAddress > min(section.Misc_VirtualSize, section.SizeOfRawData)):
+        raise ValueError(f"function outside file-backed executable section at RVA {start:#x}")
+    data = pe.get_data(start, size)
+    if len(data) != size:
+        raise ValueError(f"truncated function at RVA {start:#x}")
+    return data
+
+
 def function_bytes(image, name):
     with pefile.PE(str(image), fast_load=True) as pe:
-        if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
-            raise ValueError("expected AMD64 PE32+")
-        pe.parse_data_directories(directories=[0, 3])  # exports and runtime functions
-        exports = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
-        matches = [e.address for e in exports.symbols if e.name == name.encode("ascii")
-                   and not e.forwarder] if exports else []
-        if len(matches) != 1:
-            raise ValueError(f"expected one local export named {name}")
-        start = matches[0]
-        ends = [f.struct.EndAddress for f in getattr(pe, "DIRECTORY_ENTRY_EXCEPTION", [])
-                if f.struct.BeginAddress == start]
-        if len(ends) != 1 or ends[0] <= start:
-            raise ValueError(f"no unique function interval at RVA {start:#x}")
-        section = pe.get_section_by_rva(start)
-        size = ends[0] - start
-        if (not section or not section.Characteristics & 0x20000000
-                or ends[0] - section.VirtualAddress > min(section.Misc_VirtualSize, section.SizeOfRawData)):
-            raise ValueError(f"function outside file-backed executable section at RVA {start:#x}")
-        data = pe.get_data(start, size)
-        if len(data) != size:
-            raise ValueError(f"truncated function at RVA {start:#x}")
-        return start, data
+        start = export_rva(pe, name)
+        return start, bounded_code(pe, start)
 
 
 def translate(start, code):

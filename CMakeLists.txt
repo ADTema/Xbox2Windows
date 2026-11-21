@@ -172,24 +172,39 @@ set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILE
     "Native x64 Python with pefile for static intake tests")
 if(EXISTS "${INTAKE_PYTHON}")
     enable_language(ASM_MASM)
-    foreach(variant IN ITEMS original inverted)
-        set(image cpu_leaf_${variant})
-        add_library(${image} SHARED tests/cpu/branch.asm tests/cpu/branch.def)
+    function(cpu_asm_fixture image source)
+        add_library(${image} SHARED tests/cpu/${source}.asm tests/cpu/${source}.def)
         set_target_properties(${image} PROPERTIES LINKER_LANGUAGE CXX)
         target_link_options(${image} PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO)
-        if(variant STREQUAL "inverted")
-            target_compile_definitions(${image} PRIVATE INVERT_BRANCH)
-        endif()
+    endfunction()
+    function(cpu_translation image translator entry)
         set(lifted "${CMAKE_CURRENT_BINARY_DIR}/${image}_lifted.cpp")
         add_custom_command(OUTPUT "${lifted}"
-            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_leaf_aot.py"
-                "$<TARGET_FILE:${image}>" branch_value "${lifted}"
-            DEPENDS ${image} tools/cpu_leaf_aot.py VERBATIM)
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/${translator}.py"
+                "$<TARGET_FILE:${image}>" ${entry} "${lifted}"
+            DEPENDS ${image} tools/${translator}.py tools/cpu_leaf_aot.py VERBATIM)
         add_library(${image}_lifted SHARED "${lifted}")
+    endfunction()
+    foreach(variant IN ITEMS original inverted)
+        cpu_asm_fixture(cpu_leaf_${variant} branch)
+        cpu_translation(cpu_leaf_${variant} cpu_leaf_aot branch_value)
     endforeach()
+    target_compile_definitions(cpu_leaf_inverted PRIVATE INVERT_BRANCH)
     add_test(NAME cpu_leaf_aot_branches COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/branches.py" "$<TARGET_FILE:cpu_leaf_original>"
         "$<TARGET_FILE:cpu_leaf_original_lifted>" "$<TARGET_FILE:cpu_leaf_inverted_lifted>")
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_call_${variant} direct)
+        cpu_translation(cpu_call_${variant} cpu_call_aot call_mix)
+        # Keep the linked caller's rel32 directed at the callee itself for inspection.
+        target_link_options(cpu_call_${variant}_lifted PRIVATE /INCREMENTAL:NO)
+    endforeach()
+    target_compile_definitions(cpu_call_altered PRIVATE ALTER_RETURN)
+    cpu_asm_fixture(cpu_register_probe register_probe)
+    add_test(NAME cpu_aot_direct_call COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/direct_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_call_original>" "$<TARGET_FILE:cpu_call_original_lifted>"
+        "$<TARGET_FILE:cpu_call_altered_lifted>")
     add_library(script_path_host SHARED tools/script_path_host.cpp)
     target_compile_features(script_path_host PRIVATE cxx_std_17)
     add_test(NAME script_path_links COMMAND "${INTAKE_PYTHON}" -B
