@@ -1241,6 +1241,8 @@ Add `--raw-page-map INDEX` to report the logical and file offsets of a zero-base
 
 Use `--zlib-segment INDEX` for a descriptor in a codec-8 interval. This mode reads and decompresses the selected interval, limiting both stored and decoded sizes to 1 MiB. It verifies the zlib checksum and end of stream, checks the decoded length against the declared extent, and requires any trailing bytes to be zero. The report contains the fields for a `Segment`, its logical start, and the descriptor page's offset within it. Decoded bytes are not included in the report.
 
+Run `python -B tools/texture_descriptors.py --lookup-key 0x0123456789abcdef first.ttpf second.ttpf` to search the parallel little-endian 64-bit key tables in ETPF version 0x27a. Each match lists the archive path and zero-based descriptor index, in input order and then index order. Repeated keys produce separate matches. An absent key produces an empty list. The reader scans at most 512 KiB of keys per archive in batches of up to 4 KiB and leaves descriptor bodies and texture payloads unread. [Key table layout](https://github.com/holdmysocks/SixNG/blob/2f672555819f96993adeed3273653ad53eeb1d81/crates/sixng-core/src/ttpf.rs#L112-L123)
+
 `tools/section_probe.py` samples up to 8 MiB at the start, middle and end of each input. It looks for 16-byte-aligned zlib streams, with stored and decoded sizes capped at 256 KiB. A section record must start and end with the requested tags, and its big-endian section sizes must exactly cover the decoded buffer. Streams cut off by a window or size cap are omitted. Counts establish record boundaries within sampled regions. Interpreting payload fields or validating a checksum inside a section requires its format.
 
 ```powershell
