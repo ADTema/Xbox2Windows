@@ -121,6 +121,8 @@ def check(native_path, lifted_path):
     controls = (
         0x0000, 0x0100, 0x0400, 0x0804, 0x1010, 0x2000, 0x201f, 0x2020,
         0x4000, 0x403f, 0x4040, 0xff00, 0xffff, 0x0838,
+        # Bits above 15 are ignored: the length is bits 15..8 only.
+        0x10100, 0x232008, 0xfe0410,
     )
 
     binary_checks = 0
