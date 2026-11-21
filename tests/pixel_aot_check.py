@@ -136,6 +136,17 @@ def with_constants(body):
     return program
 
 
+def with_scalar_constant_reads() -> list[str]:
+    program = with_constants(["v_mov_b32_e32 v12, s61", "v_mov_b32_e32 v13, s62", "v_mov_b32_e32 v14, s63"])
+    load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc")
+    program[load:load + 1] = [
+        "s_buffer_load_dword s61, s[44:47], null",
+        "s_buffer_load_dword s62, s[44:47], 0x8",
+        "s_buffer_load_dword s63, s[44:47], 0xfc",
+    ]
+    return program
+
+
 def curve():
     return with_constants([
         "v_max_f32_e32 v18, s46, v12",
@@ -165,6 +176,16 @@ def shaping():
         "v_fma_f32 v12, s47, v20, v18",
         "v_sub_f32_e32 v12, v12, v21",
         "v_mul_f32_e64 v12, v12, 1.0 clamp",
+    ])
+
+
+def truncate_values() -> list[str]:
+    return with_constants([
+        "v_add_f32_e32 v12, s44, v12",
+        "v_trunc_f32_e32 v12, v12",
+        "v_trunc_f32_e32 v13, s45",
+        "v_trunc_f32_e64 v14, -|s46|",
+        "v_trunc_f32_e64 v15, s47 clamp",
     ])
 
 
@@ -216,6 +237,33 @@ def predicate_group(first):
         body.extend([f"v_cmp_{op}_f32_e32 vcc_lo, s44, v18",
                      f"v_cndmask_b32_e32 v{12 + channel}, 0, v19, vcc_lo"])
     return with_constants(body)
+
+
+# v_fract_f32 clamps x - floor(x) to 0x3f7fffff. For -2**-30 the unclamped difference rounds to 1.0;
+# the other inputs are exact and stay below the clamp.
+FRACT_INPUTS = (-2.0 ** -30, -0.25, 2.75, -2.0 ** -23)
+FRACT_CLAMP = struct.unpack("<f", struct.pack("<I", 0x3f7fffff))[0]
+
+
+def check_fract_draw(directory, compiler, renderer, backend):
+    source = directory / "fract.hlsl"
+    shader = directory / "fract.cso"
+    case = directory / "fract.case"
+    program = with_constants([f"v_fract_f32_e32 v{12 + i}, s{44 + i}" for i in range(4)])
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, *FRACT_INPUTS)
+    expected = [min(single(x - math.floor(x)), FRACT_CLAMP) for x in FRACT_INPUTS]
+    assert expected[0] == FRACT_CLAMP and single(FRACT_INPUTS[0] - math.floor(FRACT_INPUTS[0])) == 1.0
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    case.write_bytes(constants + struct.pack("<4f", *map(half_rtz, expected)) * 64)
+    subprocess.run(draw, check=True)
+    # An unclamped fract exports 1.0 for the first input; the renderer must tell it from the clamp.
+    case.write_bytes(constants + struct.pack("<4f", 1.0, *map(half_rtz, expected[1:])) * 64)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("An unclamped fract result escaped detection")
 
 
 def check_predicate_draws(directory, compiler, renderer, backend):
@@ -354,6 +402,22 @@ def shaping_case(directory, gain):
     return path
 
 
+def truncate_case(directory: Path, bias: float, green: float, blue: float, alpha: float) -> Path:
+    case = bytearray(256)
+    struct.pack_into("<4f", case, 12, bias, green, blue, alpha)
+    # modf returns the integer component as a float and preserves the sign of zero.
+    green = math.modf(green)[1]
+    blue = math.modf(-abs(blue))[1]
+    alpha = max(0.0, min(1.0, math.modf(alpha)[1]))
+    for _ in RAMP:
+        for x in RAMP:
+            red = math.modf(bias + x / 255)[1]
+            case.extend(struct.pack("<4f", red, green, blue, alpha))
+    path = directory / "truncate.case"
+    path.write_bytes(case)
+    return path
+
+
 def absolute_case(directory):
     case = bytearray(256)
     for y in RAMP:
@@ -400,8 +464,34 @@ def check_constant_descriptor_bounds() -> None:
                 raise AssertionError(f"Constant descriptor at {offset} overlaps texture 0")
 
 
+def check_scalar_constant_reads() -> None:
+    program = with_scalar_constant_reads()
+    source = translate(program)
+    for field in ("params[0].x", "params[0].z", "params[15].w"):
+        assert f"= {field};" in source
+
+    load = "s_buffer_load_dword s62, s[44:47], 0x8"
+    for bad in (load.replace("0x8", "0x9"), load.replace("0x8", "0x100"), load.replace("0x8", "s60"),
+                load.replace("s[44:47]", "s[28:31]"), load.replace("s[44:47]", "s[44:46]")):
+        must_reject(translate, [bad if line == load else line for line in program])
+
+    first = program.index("s_buffer_load_dword s61, s[44:47], null")
+    wait = program.index("s_waitcnt lgkmcnt(0)", first)
+    descriptor = program.index("s_load_dwordx4 s[44:47], s[20:21], 0x40")
+    must_reject(translate, program[:descriptor + 1] + [load] + program[descriptor + 1:])
+    must_reject(translate, program[:wait] + program[wait + 1:])  # Result read before the wait.
+    must_reject(translate, program[:wait] + [load] + program[wait:])  # Outstanding write to the same SGPR.
+    must_reject(translate, program[:first] + ["s_mov_b32 s46, 0"] + program[first:])
+    must_reject(translate, [line.replace("s[44:47]", "s[46:49]") for line in program])
+
+    alias = [line.replace("s63", "s46") for line in program]
+    assert translate(alias) == source
+    must_reject(translate, alias[:wait + 1] + [load] + alias[wait + 1:])
+
+
 def check_controls(directory):
     check_constant_descriptor_bounds()
+    check_scalar_constant_reads()
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     record = envelope(code)
@@ -425,6 +515,15 @@ def check_controls(directory):
                      ("v_add_f32_e32 v19, s44, v13", "v_add_f32_e32 v19, v13")):
         must_reject(translate, [line.replace(old, new) for line in shaping()])
 
+    program = truncate_values()
+    source = translate(program)
+    assert "trunc(params[1].x)" in source
+    must_reject(translate, [line.replace("v13, s45", "v13, s45, v12") for line in program])
+    wait = program.index("s_waitcnt vmcnt(0)")
+    program.remove("v_trunc_f32_e32 v13, s45")
+    program.insert(wait, "v_trunc_f32_e32 v13, s45")
+    must_reject(translate, program)
+
     program = absolute_value()
     alternate = [line.replace("|v12|", "abs(v12)") for line in program]
     assert translate(program) == translate(alternate)
@@ -438,6 +537,14 @@ def check_controls(directory):
     must_reject(translate, program[:-1])
     for wait in ("s_waitcnt vmcnt(0)", "s_waitcnt lgkmcnt(0)"):
         must_reject(translate, [line for line in program if line != wait])
+
+    wait = program.index("s_waitcnt vmcnt(0)")
+    overwrite = "v_floor_f32_e32 v13, 1.0"
+    must_reject(translate, program[:wait] + [overwrite] + program[wait:])
+    free = translate(program[:wait] + ["v_floor_f32_e32 v24, 1.0"] + program[wait:])
+    late = translate(program[:wait+1] + [overwrite] + program[wait+1:])
+    assert "export16(sample15.y)" in free
+    assert "export16(alu17)" in late
 
     program = arithmetic()
     source = translate(program)
@@ -510,11 +617,15 @@ def check_controls(directory):
             must_reject(translate, changed)
         pos = program.index("s_waitcnt vmcnt(0)")
         must_reject(translate, program[:pos] + program[pos+1:])
+    # v_fract_f32 goes through the clamped helper, never through a bare D3D frac.
+    body = translate(shaping()).split("float4 main", 1)[1]
+    assert "fract32(" in body and "frac(" not in body, body
 
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
-                (arithmetic(), translate), (ceiling(), translate)]
+                (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate),
+                (ceiling(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
@@ -587,6 +698,25 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapped subtraction operands escaped detection")
+
+    program = with_scalar_constant_reads()
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    case = directory / "scalar-constants.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for red, green, blue in ((.25, -.5, .75), (-.125, .625, .875)):
+        constants = bytearray(256)
+        for offset, value in ((0, red), (8, green), (252, blue)):
+            struct.pack_into("<f", constants, offset, value)
+        case.write_bytes(constants + struct.pack("<4f", red, green, blue, 1) * 64)
+        subprocess.run(draw, check=True)
+    wrong_word = [line.replace("s62, s[44:47], 0x8", "s62, s[44:47], 0x4") for line in program]
+    source.write_text(translate(wrong_word), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Reading the neighboring constant word escaped detection")
+
     for program_fn, case_fn in ((curve, curve_case), (shaping, shaping_case)):
         source.write_text(translate(program_fn()), encoding="ascii")
         subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
@@ -600,6 +730,20 @@ def check_render(directory, compiler, renderer, backend):
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError("Stale reference accepted after changing the bound constants")
+
+    program = truncate_values()
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    for constants in ((1.75, -1.75, -2.75, 2.75), (-1.75, 2.75, 3.75, -1.75)):
+        case = truncate_case(directory, *constants)
+        draw = [renderer, backend, "--check-pixel-case", shader, case]
+        subprocess.run(draw, check=True)
+    rounded_down = [line.replace("v_trunc_f32", "v_floor_f32") for line in program]
+    source.write_text(translate(rounded_down), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Rounding toward negative infinity escaped detection")
 
     program = absolute_value()
     case = absolute_case(directory)
@@ -652,6 +796,7 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapped blend weights escaped detection")
+    check_fract_draw(directory, compiler, renderer, backend)
     return 0
 
 

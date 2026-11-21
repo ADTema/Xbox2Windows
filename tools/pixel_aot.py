@@ -101,6 +101,12 @@ def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):
 
 PREAMBLE = """Texture2D<float4> tex : register(t0);
 SamplerState samp : register(s0);
+// v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
+// D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
+float fract32(float value) {
+    float f = frac(value);
+    return f >= 1.0f ? asfloat(0x3f7fffffu) : f;
+}
 // Finite binary32 to binary16, round toward zero, then widen for the float target.
 float export16(float value) {
     uint h = f32tof16(value);
@@ -120,7 +126,8 @@ def registers(first, last, count):
 ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
     "sqrt": (1, "sqrt({0})"), "rsq": (1, "rsqrt({0})"),
-    "floor": (1, "floor({0})"), "ceil": (1, "ceil({0})"), "fract": (1, "frac({0})"),
+    "floor": (1, "floor({0})"), "ceil": (1, "ceil({0})"), "fract": (1, "fract32({0})"),
+    "trunc": (1, "trunc({0})"),
     "add": (2, "({0} + {1})"), "mul": (2, "({0} * {1})"),
     "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
     "subrev": (2, "({1} - {0})"),
@@ -252,19 +259,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dst):
                 scalar[f"s{n}"] = (bindings[offset], j)
                 pending.add(f"s{n}")
-        elif m := match(r"(s_load_dwordx4|s_buffer_load_dwordx4) s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (0x[0-9a-f]+|null)"):
-            op, first, last, low, high, imm = m.groups()
+        elif m := match(r"(?:(s_load_dwordx4|s_buffer_load_dwordx4) s\[(\d+):(\d+)\]|s_buffer_load_dword s(\d+))"
+                        r", s\[(\d+):(\d+)\], (0x[0-9a-f]+|null)"):
+            op, first, last, single, low, high, imm = m.groups()
             offset = 0 if imm == "null" else int(imm, 16)
             descriptor = op == "s_load_dwordx4"
+            if single is not None and (int(single) > 105 or int(low) % 4 or int(high) > 105):
+                raise ValueError("Invalid scalar buffer registers")
+            dst = registers(single, single, 1) if single is not None else registers(first, last, 4)
             base = [f"s{n}" for n in registers(low, high, 2 if descriptor else 4)]
             expected = ["texture_ptr", 0] if descriptor else [("cbv", n) for n in range(4)]
             if constant_descriptor is None or pending.intersection(base) or [scalar.get(r) for r in base] != expected:
                 raise ValueError("Unresolved constant buffer binding")
             if descriptor and offset != constant_descriptor:
                 raise ValueError("Constant descriptor differs from binding contract")
-            if not descriptor and (offset % 4 or offset + 16 > 256):
+            if not descriptor and (offset % 4 or offset + 4 * len(dst) > 256):
                 raise ValueError("Constant read exceeds binding or is unaligned")
-            for j, n in enumerate(registers(first, last, 4)):
+            for j, n in enumerate(dst):
                 if f"s{n}" in pending:
                     raise ValueError("Write overlaps an outstanding scalar load")
                 word = offset // 4 + j
@@ -309,7 +320,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_pending)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
-        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
             if op == "fmac":
@@ -317,7 +328,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             arity, template = ALU[op]
             if mask != "entry" or len(tokens) != arity:
                 raise ValueError("Invalid arithmetic operation")
-            if op == "ceil" and dst in sample_dest:
+            if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
             expression = template.format(*values)

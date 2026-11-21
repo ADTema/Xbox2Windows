@@ -202,20 +202,34 @@ def check_shader_records():
 def check_parsing():
     with tempfile.TemporaryDirectory() as tmp:
         junit = Path(tmp) / "results.xml"
-        junit.write_text('<testsuite time="32" timestamp="2026-11-21T21:05:21"><testcase name="a" status="run"/>'
-                         '<testcase name="b" status="fail"/><testcase name="c" status="notrun"/></testsuite>',
-                         encoding="utf-8")
+        junit.write_text(
+            '<testsuite time="32" timestamp="2026-11-21T21:05:21">'
+            '<testcase name="a" status="run"/>'
+            '<testcase name="b" status="fail"/>'
+            '<testcase name="c" status="notrun"/>'
+            '<testcase name="d" status="run"><failure message="mismatch"/></testcase>'
+            '<testcase name="e" status="run"><error message="crash"/></testcase>'
+            '<testcase name="f" status="run"><skipped/></testcase>'
+            '</testsuite>',
+            encoding="utf-8",
+        )
         results, window = fc.read_results(junit)
-        assert results == {"a": "pass", "b": "fail", "c": "skip"}
+        assert results == {"a": "pass", "b": "fail", "c": "skip", "d": "fail", "e": "fail", "f": "skip"}, results
         start = datetime(2026, 11, 21, 21, 5, 21).timestamp()  # CTest writes local time
         assert window == (start - 1, start + 34), window
-    asm = ("x PROC FRAME\n    .endprolog\nIFDEF A\n    jae short l\nELSE\n    jnz short l\nENDIF\n"
-           "l:  mov DWORD PTR [rdx], eax ; c\ng:: ud2\nvalue DQ 0\n    dd 1\n    ret\nx ENDP\nEND\n")
-    assert fc.masm_mnemonics(asm) == {"jae", "jne", "mov", "ud2", "ret"}
-    # The real repository measures without error, and the report never calls coverage completion.
+    asm = ("emit MACRO dst\nLOCAL skip\n    lock cmpxchg [rdx], eax\n    rep movsb\nskip:\nENDM\n"
+           "x PROC FRAME\n    .endprolog\nIFDEF A\n    jae short l\nELSE\n    jnz short l\nENDIF\n"
+           "l:  mov DWORD PTR [rdx], eax ; c\ng:: ud2\n    emit rax\nvalue DQ 0\n    dd 1\n    ret\nx ENDP\nEND\n")
+    assert fc.masm_mnemonics(asm) == {"cmpxchg", "movsb", "jae", "jne", "mov", "ud2", "ret"}, fc.masm_mnemonics(asm)
+    with tempfile.TemporaryDirectory() as tmp:
+        isolated = fc.measure({}, sample_repo(tmp, {"branch": asm}))["x64_zen2"]
+        assert isolated["fixture_forms_not_in_reference"] == [], isolated["fixture_forms_not_in_reference"]
+    # The real repository measures without error, with no macro names or LOCAL leaking into unmatched forms.
     full = fc.measure({})
     assert "not a measure of port completion" in fc.report(full)
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
+    unmatched = full["x64_zen2"]["fixture_forms_not_in_reference"]
+    assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
 
 
 def check_dashboard():
