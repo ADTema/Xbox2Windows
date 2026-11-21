@@ -443,6 +443,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME static_exe_intake COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/intake/check.py" "$<TARGET_FILE:intake_candidate>"
         "$<TARGET_FILE:intake_provider>")
+    # intake_forward exports six placeholders. The test rewrites a copy so each export is a forwarder;
+    # it reads the images and never loads them.
+    add_library(intake_forward SHARED tests/intake/provider.cpp tests/intake/forward.def)
+    add_executable(intake_forward_caller tests/intake/forward_caller.cpp)
+    target_link_libraries(intake_forward_caller PRIVATE intake_forward)
+    add_test(NAME bundled_export_forwarders COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/intake/forwarders_check.py" "$<TARGET_FILE:intake_forward_caller>"
+        "$<TARGET_FILE:intake_forward>" "$<TARGET_FILE:intake_provider>")
     add_test(NAME layout_chunk_summary COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/layout_chunks_check.py")
 endif()

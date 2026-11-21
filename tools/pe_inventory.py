@@ -67,20 +67,35 @@ def export_keys(rows):
     return keys
 
 
-def resolve_desktop(dll, symbol, importer, contracts, system_exports):
-    """Follow System32 export forwarders without loading any DLL."""
+def resolve_desktop(dll, symbol, importer, contracts, system_exports, package_exports=None):
+    """Follow export forwarders without loading any DLL.
+
+    package_exports, when given, maps a plain module name to its package paths and export table.
+    Package images then take precedence over System32. API-set contracts always select System32 hosts.
+    """
     chain = []
     seen = set()
     while True:
         aliases = contracts.get(dll.rpartition("-")[0]) if dll.startswith(("api-", "ext-")) else None
-        host = dll if aliases is None else aliases.get(importer, aliases.get("", ""))
+        packaged, table = package_exports(dll) if package_exports and aliases is None else ((), None)
+        if len(packaged) == 1:
+            host = packaged[0]
+        else:
+            host = dll if aliases is None else aliases.get(importer, aliases.get("", ""))
         step = dict(dll=dll, provider=host or None, symbol=symbol)
+        if package_exports:
+            step["package"] = bool(packaged)
         chain.append(step)
+        if len(packaged) > 1:
+            step["provider"] = None
+            status = "ambiguous_package_basename"
+            break
         if (host, symbol) in seen:
             status = "forwarder_cycle"
             break
         seen.add((host, symbol))
-        table = system_exports(host)
+        if not packaged:
+            table = system_exports(host)
         if table is None:
             status = "provider_not_found"
             break
@@ -98,7 +113,7 @@ def resolve_desktop(dll, symbol, importer, contracts, system_exports):
         if not separator or not module or not name:
             status = "invalid_forwarder"
             break
-        dll, symbol, importer = module.lower() + ".dll", name, host
+        dll, symbol, importer = module.lower() + ".dll", name, Path(host).name.lower()
     return dict(status=status, chain=chain)
 
 
@@ -138,18 +153,21 @@ def scan(root, *, extra_image=None):
     contracts = api_sets(system)
     system_images = {p.name.lower(): p for p in system.glob("*.dll")}
 
+    def export_table(rows):
+        table = {}
+        for row in rows:
+            table[f"#{row['ordinal']}"] = row["forwarder"]
+            if row["name"] is not None:
+                table[row["name"]] = row["forwarder"]
+        return table
+
     @cache
     def system_exports(name):
         if name not in system_images:
             return None
         with pefile.PE(str(system_images[name]), fast_load=True) as pe:
             pe.parse_data_directories(directories=[0])
-            table = {}
-            for row in exports(pe):
-                table[f"#{row['ordinal']}"] = row["forwarder"]
-                if row["name"] is not None:
-                    table[row["name"]] = row["forwarder"]
-            return table
+            return export_table(exports(pe))
 
     images = {}
     edges = []
@@ -171,9 +189,14 @@ def scan(root, *, extra_image=None):
     if not images:
         raise ValueError(f"No DLLs or EXEs under {root}")
 
+    def package_exports(name):
+        found = [path for path, _ in bundled[name]]
+        return found, export_table(images[found[0]]["exports"]) if len(found) == 1 else None
+
     rows = []
     for image, kind, dll, symbol in sorted(set(edges)):
-        resolution = resolve_desktop(dll, symbol, Path(image).name.lower(), contracts, system_exports)
+        importer = Path(image).name.lower()
+        resolution = resolve_desktop(dll, symbol, importer, contracts, system_exports)
         first = resolution["chain"][0]
         # Keep desktop_export as the first-hop comparison for existing report readers.
         status = "export_present" if "forwarder" in first else resolution["status"]
@@ -185,8 +208,14 @@ def scan(root, *, extra_image=None):
             "bundle_exports_in": sorted(p for p, keys in bundled[dll] if symbol in keys),
             "desktop_provider": first["provider"], "desktop_export": status, "desktop_candidate": candidate,
             "desktop_resolution": resolution,
+            # Follow forwarders in a packaged provider. Absent when the package lacks the module.
+            "package_resolution": resolve_desktop(dll, symbol, importer, contracts, system_exports,
+                                                  package_exports) if bundled[dll] else None,
         })
-    unresolved = [r for r in rows if r["desktop_resolution"]["status"] != "export_present" and not r["bundle_exports_in"]]
+    # A packaged forwarder satisfies an edge only when its chain reaches a terminal export.
+    unresolved = [r for r in rows if r["desktop_resolution"]["status"] != "export_present"
+                  and not (r["bundle_exports_in"] and r["package_resolution"]["status"]
+                           in {"export_present", "ambiguous_package_basename"})]
     return {
         "schema": 1, "host_windows_build": sys.getwindowsversion().build, "pefile": pefile.__version__,
         "behavior": "Scarlett behavior unverified for every import. Static export matches include forwarders.",
@@ -201,6 +230,8 @@ def scan(root, *, extra_image=None):
             "desktop_results": dict(Counter(r["desktop_export"] for r in rows)),
             "desktop_terminal_results": dict(Counter(r["desktop_resolution"]["status"] for r in rows)),
             "desktop_forwarded_edges": sum(len(r["desktop_resolution"]["chain"]) > 1 for r in rows),
+            "package_terminal_results": dict(Counter(r["package_resolution"]["status"]
+                                                     for r in rows if r["package_resolution"])),
         },
         "unresolved_edges": [dict(r, desktop_experiment=EXPERIMENTS.get((r["dll"], r["symbol"])))
                              for r in unresolved],
