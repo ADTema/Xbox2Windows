@@ -527,6 +527,16 @@ On Windows build 26200, the pre-executable inventory covered 16 package DLLs and
 
 The original test machine had Windows Graphics Tools installed. A second build in `out/build/agility` used Microsoft Agility SDK 1.620.2. Set `-DOFFSCREEN_AGILITY_620_DIR=<directory containing the x64 SDK DLLs>` to reproduce it. This configuration verifies debug interface activation. [Agility SDK package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
 
+## Mapped DLL draw with a Windows reference
+
+`cpu_native_frame_hardware` and `cpu_native_frame_warp` load the same source-built DLL with `LoadLibraryW` and with `pe_map`. Both paths record TLS before the DLL entry on process attach and detach. The DLL's `guest_draw` export selects the shared two-texture shader fixture and calls the graphics provider through its bound import. The provider calls the host test, which runs the existing offscreen renderer in a child process. The renderer checks every RGBA channel against the CPU reference, and the test compares the two 64×64 captures byte for byte. Withholding the graphics provider must fail mapping before startup or drawing.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_frame_(hardware|warp)$' -V
+```
+
+On Windows 11 build 26200, the RTX 3060 Ti (driver 621.14) and WARP each matched all 4,096 pixels per load path with zero D3D12 debug warnings or errors.
+
 ## Static executable intake
 
 By default, the intake tool locates the Scarlett entry in the sole build's `MicrosoftGame.Config`. It accepts the layout path or a separate candidate file and opens the game files for reading only.
