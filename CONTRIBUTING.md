@@ -39,6 +39,16 @@ For findings from a local installation, share a limited observation such as a co
 
 Create a topic branch from current `main` in your fork. Keep a PR focused on one reviewable behavior, include the exact test command and result, and link any related issue with `Refs #123`. Use `Fixes #123` when the patch meets that issue's completion condition. Submit original contributions under the [MIT License](LICENSE) and preserve applicable third-party notices.
 
+Use `<area>: <summary>` for new pull request titles. Keep the area lowercase and write the summary in the imperative. The areas are `cpu`, `gpu`, `shader`, `ffx`, `textures`, `script`, `pe`, `runtime`, `tooling`, `docs`, `ci`, `build` and `meta`. For example:
+
+```text
+cpu: reject branches into instruction interiors
+bcpack: add a stride-6 lane diagnostic
+docs: add a contributor guide for non-Windows hosts
+```
+
+Do not rename existing pull requests or issues. Issue titles remain free-form; the issue forms and labels carry the classification. A title check is not enforced by a bot in this change.
+
 Reviewers reproduce the smallest relevant case, check the origin of any new fixtures and compare behavior before and after the change. Maintainers merge through a PR after the Windows check passes and review conversations are resolved. Record remaining questions in a linked issue so the next contributor can pick them up.
 
 When a PR changes a public capability or build requirement, update the relevant README row or first-build step in that PR. Put reproduction details in `docs/experiments.md`. Link an existing issue for unresolved behavior, or open one if another contributor can test it. The release tag identifies the exact standalone package a hardware reporter used.
