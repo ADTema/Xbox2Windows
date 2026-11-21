@@ -41,7 +41,7 @@ def assembly(swap):
     ]
 
 
-DUAL_CASES = ("forward", "reverse", "reuse")
+DUAL_CASES = ("forward", "reverse", "reuse", "partial")
 
 
 def dual_program(case="forward", *, swap_weights=False):
@@ -55,8 +55,8 @@ def dual_program(case="forward", *, swap_weights=False):
         program[first:first+1] = [sample_a, "s_waitcnt vmcnt(0)",
                                   load_b.replace("56:63", "28:35"), "s_waitcnt lgkmcnt(0)",
                                   sample_b.replace("56:63", "28:35")]
-    elif case in ("forward", "reverse"):
-        program[first:first+1] = [sample_a, sample_b] if case == "forward" else [sample_b, sample_a]
+    elif case in ("forward", "reverse", "partial"):
+        program[first:first+1] = [sample_a, sample_b] if case != "reverse" else [sample_b, sample_a]
         program.insert(program.index("s_mov_b32 s40, 1"), load_b)
     else:
         raise ValueError(f"Unknown dual-texture case: {case}")
@@ -66,6 +66,11 @@ def dual_program(case="forward", *, swap_weights=False):
     for i in range(4):
         ops.extend([f"v_mul_legacy_f32_e32 v{12+i}, {a}, v{12+i}",
                     f"v_fma_f32 v{12+i}, {b}, v{20+i}, v{12+i}"])
+    if case == "partial":
+        # Scale A's red channel while B is still outstanding.
+        wait = program.index("s_waitcnt vmcnt(0)")
+        program[wait:wait] = ["s_waitcnt vmcnt(1)", ops.pop(0)]
+        pos += 2
     program[pos:pos] = ops
     return program
 
@@ -276,6 +281,29 @@ def check_controls(directory):
     for invalid in (record[:-1], record + b"\0" + record, envelope(code + code)):
         archive.write_bytes(invalid)
         must_reject(native_program, archive, "fixture")
+
+    partial = dual_program("partial")
+    wait = partial.index("s_waitcnt vmcnt(1)")
+    # Keep the early read of A but issue B first. Now A is still pending.
+    reversed_samples = partial.copy()
+    reversed_samples[wait - 2:wait] = reversed(reversed_samples[wait - 2:wait])
+    must_reject(translate_dual, reversed_samples)
+    for count in (2, 63):
+        changed = partial.copy()
+        changed[wait] = f"s_waitcnt vmcnt({count})"
+        must_reject(translate_dual, changed)
+    for early_use in ("v_mul_legacy_f32_e32 v12, 1.0, v20",
+                      "v_cvt_pkrtz_f16_f32_e32 v24, v12, v20"):
+        changed = partial.copy()
+        changed[wait + 1] = early_use
+        must_reject(translate_dual, changed)
+    # Packing A is legal here even though B is outstanding.
+    translate_dual(partial[:wait + 1] + ["v_cvt_pkrtz_f16_f32_e32 v24, v12, v13"] + partial[wait + 1:])
+    # A larger legal wait after draining does not invalidate completed samples.
+    end_wait = partial.index("s_waitcnt vmcnt(0)")
+    drained = partial[:end_wait + 1] + ["s_waitcnt vmcnt(63)"] + partial[end_wait + 1:]
+    translate_dual(drained)
+    must_reject(translate_dual, [op.replace("vmcnt(63)", "vmcnt(64)") for op in drained])
 
     # LLVM 15 prints "exp mrt0 v16, ..."; newer LLVM prints "exp mrt0, v16, ...".
     for program in (assembly(False), assembly(True), curve()):

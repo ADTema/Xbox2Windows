@@ -144,14 +144,14 @@ def lane_mask(token):
     return [token]
 
 
-def fp_operand(token, scalar, vector, pending, sample_pending):
+def fp_operand(token, scalar, vector, pending, pending_samples):
     if re.fullmatch(r"-\d+", token):
         return f"asfloat({int(token) & 0xffffffff}u)"
     if token.startswith("-"):
-        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_pending) + ")"
+        return "(-" + fp_operand(token[1:], scalar, vector, pending, pending_samples) + ")"
     if absolute := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
         inner = absolute.group(1) or absolute.group(2)
-        return f"abs({fp_operand(inner, scalar, vector, pending, sample_pending)})"
+        return f"abs({fp_operand(inner, scalar, vector, pending, pending_samples)})"
     if re.fullmatch(r"[vs]\d+", token):
         if token in pending:
             raise ValueError("Constant read before load completion")
@@ -160,7 +160,7 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
             return f"asfloat({value}u)"
         if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
             raise ValueError("Expected a numeric register")
-        if sample_pending and value.startswith("sample"):
+        if value.partition(".")[0] in pending_samples:
             raise ValueError("Sample used before vmcnt wait")
         return value
     if re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", token):
@@ -194,7 +194,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     pending = set()
     mask = "entry"
     samples = 0
-    sample_pending = False
+    pending_samples = []
     exported = False
     ended = False
     for i, line in enumerate(instructions):
@@ -209,8 +209,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             continue
         if line == "s_waitcnt lgkmcnt(0)":
             pending.clear()
-        elif line == "s_waitcnt vmcnt(0)":
-            sample_pending = False
+        elif m := match(r"s_waitcnt vmcnt\((\d+)\)"):
+            limit = int(m[1])
+            if limit > 63:
+                raise ValueError("VM wait count exceeds the gfx10 six-bit field")
+            # image_sample is the only supported VM producer. Samples retire
+            # in issue order within this class; at most the newest limit remain.
+            del pending_samples[:max(0, len(pending_samples) - limit)]
         elif m := match(r"s_mov_b64 s\[(\d+):(\d+)\], exec"):
             regs = registers(*m.groups(), 2)
             for n in regs:
@@ -288,7 +293,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Unsupported texture coordinate")
             lines.append(f"    float4 sample{i} = {texture}.Sample(samp, float2({', '.join(uv)}));")
             samples += 1
-            sample_pending = True
+            pending_samples.append(f"sample{i}")
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
         elif m := match(r"v_(log|exp|rcp|max|min|sub|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
@@ -299,7 +304,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             arity, template = ALU[op]
             if mask != "entry" or len(tokens) != arity:
                 raise ValueError("Invalid arithmetic operation")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            values = [fp_operand(t, scalar, vector, pending, pending_samples) for t in tokens]
             expression = template.format(*values)
             if clamp:
                 expression = f"saturate({expression})"
@@ -310,7 +315,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            values = [fp_operand(t, scalar, vector, pending, pending_samples) for t in tokens]
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
@@ -322,13 +327,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or condition[0] != "condition"
                     or [scalar.get(r) for r in regs] != [(*condition[:2], j, len(regs)) for j in range(len(regs))]):
                 raise ValueError("Select mask is not a tracked comparison")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in (chosen, unset)]
+            values = [fp_operand(t, scalar, vector, pending, pending_samples) for t in (chosen, unset)]
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {condition[1]} ? {values[0]} : {values[1]};")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             pair = (vector[lo], vector[hi])
-            if mask != "entry" or sample_pending or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
+            if mask != "entry" or not all(isinstance(v, str) and v.startswith(("sample", "alu"))
+                                          and v.partition(".")[0] not in pending_samples for v in pair):
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
         elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+), \2 done compr vm"):
