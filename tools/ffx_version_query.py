@@ -93,13 +93,20 @@ def lower(body, initial, globals_, calls, exits):
             stmt = f"zero = ({operand(0)} == {operand(1)}); carry = ({operand(0)} < {operand(1)});"
         elif op == M.TEST:
             stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false;"
-        elif op in (M.ADD, M.AND, M.XOR, M.INC, M.SBB):
-            operator = {M.ADD: "+", M.INC: "+", M.AND: "&", M.XOR: "^", M.SBB: "-"}[op]
+        elif op == M.IMUL and i.op_count == 3 and RegisterExt.size(i.op0_register) == 4:
+            stmt = (f"{{ const int64_t product = int64_t(int32_t({operand(1)})) * int32_t({operand(2)}); "
+                    f"carry = product != int32_t(product); {write('product')} }}")
+        elif op == M.SHL and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) == 4:
+            count = i.immediate(1) & 31
+            stmt = (f"{{ const uint32_t a = {operand(0)}, v = a << {count}; "
+                    f"carry = ((a >> {32-count}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else ";"
+        elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.SBB):
+            operator = {M.ADD: "+", M.INC: "+", M.AND: "&", M.OR: "|", M.XOR: "^", M.SBB: "-"}[op]
             rhs = "1" if op == M.INC else operand(1)
             width = UINT[RegisterExt.size(i.op0_register)]
             expr = f"a {operator} b" + (" - word(carry)" if op == M.SBB else "")
             update = {M.ADD: "carry = v < a;", M.SBB: "carry = a < b || (carry && a == b);",
-                      M.INC: "", M.XOR: "carry = false;", M.AND: "carry = false;"}[op]
+                      M.INC: "", M.XOR: "carry = false;", M.AND: "carry = false;", M.OR: "carry = false;"}[op]
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
         elif op == M.SETE:
