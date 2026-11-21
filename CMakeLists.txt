@@ -375,7 +375,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         set(cpp "${CMAKE_CURRENT_BINARY_DIR}/${target}.cpp")
         add_custom_command(OUTPUT "${cpp}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/bink_descriptors_aot.py"
-                "${image}" "${cpp}" ${ARGN}
+                "${image}" "${cpp}" --frame-planes ${ARGN}
             DEPENDS ${dependency} tools/bink_descriptors_aot.py tools/bink_heap_aot.py
                 tools/ffx_version_query.py tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
         add_library(${target} SHARED "${cpp}")
@@ -384,9 +384,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_bink_descriptors COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/bink_descriptors_check.py" --native "$<TARGET_FILE:cpu_bink_descriptors>"
         "$<TARGET_FILE:cpu_bink_descriptors_lifted>")
+    add_test(NAME cpu_bink_frame_planes COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bink_frame_planes_check.py" "$<TARGET_FILE:cpu_bink_descriptors>"
+        "$<TARGET_FILE:cpu_bink_descriptors_lifted>")
     set(BINK_DESCRIPTOR_IMAGE "" CACHE FILEPATH "Local Bink DLL for the grouped descriptor producer experiment")
     if(BINK_DESCRIPTOR_IMAGE)
         bink_descriptors_translation(cpu_bink_package_descriptors "${BINK_DESCRIPTOR_IMAGE}" "${BINK_DESCRIPTOR_IMAGE}" --package)
+        add_test(NAME cpu_bink_package_frame_planes COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/bink_frame_planes_check.py" "$<TARGET_FILE:cpu_bink_package_descriptors>")
         add_test(NAME cpu_bink_package_descriptors COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/cpu/bink_descriptors_check.py" "$<TARGET_FILE:cpu_bink_package_descriptors>")
     endif()
