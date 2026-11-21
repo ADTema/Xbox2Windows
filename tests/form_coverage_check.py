@@ -192,11 +192,14 @@ def check_shader_records():
         # A record written outside the JUnit run comes from another run, so it is ignored.
         os.utime(record, (now - 3600, now - 3600))
         assert fc.read_records(record.parent, (now - 60, now + 60)) == {}
-    # The same holds for the review's case in the real controls, which feed s_nop only to must_reject.
+    # The same holds in the real controls. The scheduling-hint fixtures translate programs with s_nop
+    # and the hints, so those forms are recorded; s_branch reaches only must_reject and stays out.
+    assert ("SOPP", "s_branch") in gfx
     pixel.ACCEPTED.clear()
     with tempfile.TemporaryDirectory() as tmp:
         pixel.check_controls(Path(tmp))
-    assert "s_nop" not in pixel.ACCEPTED and "image_sample" in pixel.ACCEPTED
+    assert {"s_nop", "s_clause", "s_setprio", "s_sleep", "image_sample"} <= pixel.ACCEPTED
+    assert "s_branch" not in pixel.ACCEPTED and "s_code_end" not in pixel.ACCEPTED
     # Every newly lowered 64-bit SOP1/SOP2 and 32-bit BFE form is counted in both gfx1013 and rdna2,
     # while rejected neighbors (exec save/restore, #257 ops, 64-bit BFE/cselect) stay out of covered.
     scalar64_forms = {

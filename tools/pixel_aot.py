@@ -386,9 +386,6 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         def match(pattern):
             return re.fullmatch(pattern, line)
 
-        # s_code_end pads the code object after the program and has no effect.
-        if ended and line == "s_code_end":
-            continue
         if ended:
             raise ValueError("Instruction follows program end")
         if exported and line != "s_endpgm":
