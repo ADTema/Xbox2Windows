@@ -740,6 +740,37 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_start_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_start_original>" "$<TARGET_FILE:cpu_exe_start_no_tls>"
         "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>")
+    # Two CRT-free DLLs and an EXE: A has no imports, B imports A, the EXE imports both.
+    foreach(dll IN ITEMS a a_alt b b_noinit)
+        string(REGEX REPLACE "_(noinit|alt)$" "" source "${dll}")
+        add_library(cpu_startup_${dll} SHARED tests/cpu/startup_${source}.cpp)
+        target_compile_options(cpu_startup_${dll} PRIVATE /GS- /Zl)
+        target_link_options(cpu_startup_${dll} PRIVATE /ENTRY:${source}_main /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(cpu_startup_${dll} PRIVATE kernel32)
+    endforeach()
+    target_compile_definitions(cpu_startup_b_noinit PRIVATE NO_INIT)
+    target_compile_definitions(cpu_startup_a_alt PRIVATE ALTER)
+    target_link_libraries(cpu_startup_b PRIVATE cpu_startup_a)
+    target_link_libraries(cpu_startup_b_noinit PRIVATE cpu_startup_a)
+    add_executable(cpu_startup_exe tests/cpu/startup_exe.cpp)
+    target_compile_options(cpu_startup_exe PRIVATE /GS- /Zl)
+    target_link_options(cpu_startup_exe PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
+        /INCREMENTAL:NO)
+    target_link_libraries(cpu_startup_exe PRIVATE kernel32 cpu_startup_a cpu_startup_b)
+    foreach(control IN ITEMS timeout create)  # controls: a worker that outlives the wait, and one that cannot start
+        add_executable(cpu_startup_exe_${control} tests/cpu/startup_exe.cpp)
+        string(TOUPPER "${control}" definition)
+        target_compile_definitions(cpu_startup_exe_${control} PRIVATE ${definition}_CONTROL)
+        target_compile_options(cpu_startup_exe_${control} PRIVATE /GS- /Zl)
+        target_link_options(cpu_startup_exe_${control} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
+            /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_startup_exe_${control} PRIVATE kernel32 cpu_startup_a cpu_startup_b)
+    endforeach()
+    add_test(NAME cpu_native_startup COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_startup_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_startup_exe>" "$<TARGET_FILE:cpu_startup_a>" "$<TARGET_FILE:cpu_startup_b>"
+        "$<TARGET_FILE:cpu_startup_b_noinit>" "$<TARGET_FILE:cpu_startup_a_alt>"
+        "$<TARGET_FILE:cpu_startup_exe_timeout>" "$<TARGET_FILE:cpu_startup_exe_create>")
     add_library(cpu_frame_host SHARED tests/cpu/frame_host.cpp)
     add_library(cpu_frame_guest SHARED tests/cpu/tls_route.asm tests/cpu/frame_route.def)
     set_target_properties(cpu_frame_guest PROPERTIES LINKER_LANGUAGE CXX)
