@@ -453,11 +453,13 @@ def check_validator_fixtures(
 
             if offscreen is not None and shader_path.name == "compute_root.cso":
                 bad_run = subprocess.run([str(offscreen), "warp", "--compute-root-file", str(unsigned_path)],
-                                         capture_output=True, timeout=45)
-                assert bad_run.returncode != 0, "offscreen_check accepted unsigned retargeted compute shader"
+                                         capture_output=True, text=True, timeout=45)
+                assert bad_run.returncode == 1 and "Create compute pipeline" in bad_run.stderr, (
+                    bad_run.returncode, bad_run.stdout, bad_run.stderr
+                )
                 good_run = subprocess.run([str(offscreen), "warp", "--compute-root-file", str(signed_path)],
                                           capture_output=True, text=True, timeout=45)
-                assert good_run.returncode == 0, good_run.stdout + good_run.stderr
+                assert good_run.returncode == 0, (good_run.returncode, good_run.stdout, good_run.stderr)
                 assert "mismatches=0" in good_run.stdout, good_run.stdout
                 pso_summary += " dispatch=ok"
 
