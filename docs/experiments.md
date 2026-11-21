@@ -52,6 +52,13 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_exe_entry$' -V
 
 The first host dependency appears during IAT binding, before any guest instruction runs. On the tested MSVC build, an empty binding table stops at `cpu_exe_io.dll!emit_trace`; supplying just the I/O DLL stops at `cpu_import_provider.dll!mix_args`. The first import invoked at runtime is `read_selector`. With both DLLs bound, the entry and its internal caller execute unchanged. This measures the source-built Windows fixture and its providers.
 
+`cpu_native_exe_two_providers` exercises two ordinary named imports from the same internal caller. The caller feeds the result from `cpu_import_provider.dll!mix_args` into `cpu_exe_second_provider.dll!accumulate_args`. The translator accepts the second provider through an explicit `--provider DLL SYMBOL` binding and verifies each used import against the corresponding DLL. Both calls use two integer arguments and the same three-word trace ABI. Windows, `pe_map`, and AOT are compared against independent expected arguments, output bytes, and exit status for both selectors. Removing the second mapping binding stops before entry, and the translator reports the missing import when its binding is omitted or names the wrong DLL.
+
+```powershell
+cmake --build --preset dev --target cpu_exe_two_providers_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_exe_two_providers$' -V
+```
+
 ```powershell
 cmake --build --preset dev --target pe_map cpu_exe_original_lifted
 ctest --preset dev --no-tests=error -R '^cpu_native_exe_chain$' -V

@@ -1,6 +1,10 @@
 ; A CRT-free PE entry. The existing call_mix (direct.asm, IMPORT_MIX)
 ; calls the named DLL import and records the two actual arguments and its output.
+IFDEF TWO_PROVIDERS
+EXTERN call_twice:PROC
+ELSE
 EXTERN call_mix:PROC
+ENDIF
 EXTERN __imp_read_selector:QWORD
 EXTERN __imp_emit_trace:QWORD
 
@@ -26,7 +30,11 @@ wide_input:
     mov rdx, 100000000h
 dispatch:
     lea r8, [rsp+32]
+IFDEF TWO_PROVIDERS
+    call call_twice
+ELSE
     call call_mix
+ENDIF
     mov [rsp+56], rax
     lea rcx, [rsp+32]
     call qword ptr [__imp_emit_trace]

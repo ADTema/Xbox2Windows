@@ -17,7 +17,13 @@ def require_local_pointer(previous, register, call, jump_targets):
         raise ValueError(f"expected aligned local trace pointer before call at {call.ip:#x}")
 
 
-def translate(image, io_provider, mix_provider):
+def translate(image, io_provider, mix_provider, extra_providers=()):
+    providers = {"mix_args": mix_provider}
+    for provider, symbol in extra_providers:
+        if symbol in providers or symbol in ("read_selector", "emit_trace", "lifted", "main"):
+            raise ValueError(f"duplicate or reserved import symbol {symbol}")
+        providers[symbol] = provider
+    bound_symbols = {}
     with pefile.PE(str(image), fast_load=True) as pe:
         if (pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20b
                 or not pe.FILE_HEADER.Characteristics & 2
@@ -40,8 +46,23 @@ def translate(image, io_provider, mix_provider):
         if ret.mnemonic != M.RET or ret.op_count:
             raise ValueError("expected return from process entry")
         pe.parse_data_directories(directories=[1])
-        imports = {imp.address - pe.OPTIONAL_HEADER.ImageBase: imp.name
+        imports = {imp.address - pe.OPTIONAL_HEADER.ImageBase: (module.dll, imp)
                    for module in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) for imp in module.imports}
+
+        def bind_provider(slot):
+            item = imports.get(slot)
+            if item is None:
+                raise ValueError(f"no ordinary import at IAT slot RVA {slot:#x}")
+            dll, imp = item
+            if imp.import_by_ordinal:
+                raise ValueError(f"unbound import {dll.decode('ascii')}!#{imp.ordinal}")
+            symbol = imp.name.decode("ascii")
+            provider = providers.get(symbol)
+            if provider is None:
+                raise ValueError(f"unbound import {dll.decode('ascii')}!{symbol}")
+            bound_symbols[symbol] = resolve_import(pe, slot, provider, symbol)
+            return bound_symbols[symbol]
+
         io_calls = {b"read_selector": "rax = read_selector();",
                     b"emit_trace": "rax = emit_trace(reinterpret_cast<const word*>(rcx));"}
         bindings = {}
@@ -59,14 +80,15 @@ def translate(image, io_provider, mix_provider):
                     if target < entry < target + len(native):
                         raise ValueError("overlapping entry and internal callee")
                     callee, edge = lift_body(target, native, caller=True,
-                                             bind_import=lambda slot: resolve_import(
-                                                 pe, slot, mix_provider, "mix_args"))
-                    if edge[0] != "import" or edge[-1] != "mix_args":
+                                             bind_import=bind_provider,
+                                             allow_distinct_imports=True)
+                    if edge[0] != "import" or "mix_args" not in bound_symbols:
                         raise ValueError("internal callee must reach the named provider")
                     bindings[ins.ip] = "rax = lifted(rcx, rdx, reinterpret_cast<word*>(r8));"
                 elif ins.is_ip_rel_memory_operand:
                     slot = ins.ip_rel_memory_address
-                    name = imports.get(slot)
+                    item = imports.get(slot)
+                    name = item[1].name if item is not None else None
                     if name not in io_calls:
                         raise ValueError("unsupported entry import")
                     if name == b"emit_trace":
@@ -89,18 +111,22 @@ def translate(image, io_provider, mix_provider):
         if callee is None:
             raise ValueError("expected an internal call in the entry profile")
         code = lower(body, [], {}, bindings, {}, host_ops={prologue.ip: ";", epilogue.ip: ";"})
+    declarations = "".join(f'extern "C" __declspec(dllimport) word {symbol}(word, word, word*);\n'
+                           for symbol in bound_symbols)
     return INTEGER_HEADER + """
 extern "C" __declspec(dllimport) uint32_t read_selector();
 extern "C" __declspec(dllimport) uint32_t emit_trace(const word*);
-extern "C" __declspec(dllimport) word mix_args(word, word, word*);
-""" + callee + '\nint main() {\n' + code + '\n}\n'
+""" + declarations + callee + '\nint main() {\n' + code + '\n}\n'
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("image", "io_provider", "mix_provider", "output"):
         parser.add_argument(name, type=Path)
+    parser.add_argument("--provider", action="append", nargs=2, default=[], metavar=("DLL", "SYMBOL"),
+                        help="authorize an additional named import with the same trace ABI")
     args = parser.parse_args()
     if args.output.suffix.lower() != ".cpp":
         parser.error("choose a .cpp output")
-    args.output.write_text(translate(args.image, args.io_provider, args.mix_provider), encoding="ascii")
+    providers = [(Path(path), symbol) for path, symbol in args.provider]
+    args.output.write_text(translate(args.image, args.io_provider, args.mix_provider, providers), encoding="ascii")

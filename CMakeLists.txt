@@ -614,28 +614,42 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
         "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
     add_library(cpu_exe_io SHARED tests/cpu/exe_io.cpp)
-    foreach(variant IN ITEMS original inverted)
+    add_library(cpu_exe_second_provider SHARED tests/cpu/exe_second_provider.cpp)
+    target_link_libraries(cpu_exe_second_provider PRIVATE cpu_exe_io)
+    foreach(variant IN ITEMS original inverted two_providers)
         set(native cpu_exe_${variant})
         set(lifted ${native}_lifted)
-        add_executable(${native} tests/cpu/exe_entry.asm tests/cpu/direct.asm)
+        add_executable(${native} tests/cpu/exe_entry.asm)
+        if(variant STREQUAL "two_providers")
+            target_sources(${native} PRIVATE tests/cpu/repeat_call.asm)
+            target_compile_definitions(${native} PRIVATE TWO_PROVIDERS IMPORT_ACCUMULATE)
+        else()
+            target_sources(${native} PRIVATE tests/cpu/direct.asm)
+        endif()
         set_target_properties(${native} PROPERTIES LINKER_LANGUAGE CXX)
         target_compile_definitions(${native} PRIVATE IMPORT_MIX)
         if(variant STREQUAL "inverted")
             target_compile_definitions(${native} PRIVATE FLIP_SELECTOR)
         endif()
         target_link_options(${native} PRIVATE /ENTRY:native_entry /NODEFAULTLIB /INCREMENTAL:NO)
+        set(extra_provider_args)
+        set(extra_provider_target)
+        if(variant STREQUAL "two_providers")
+            set(extra_provider_args --provider "$<TARGET_FILE:cpu_exe_second_provider>" accumulate_args)
+            set(extra_provider_target cpu_exe_second_provider)
+        endif()
         set(source "${CMAKE_CURRENT_BINARY_DIR}/${lifted}.cpp")
         add_custom_command(OUTPUT "${source}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_exe_aot.py"
                 "$<TARGET_FILE:${native}>" "$<TARGET_FILE:cpu_exe_io>"
-                "$<TARGET_FILE:cpu_import_provider>" "${source}"
-            DEPENDS ${native} cpu_exe_io cpu_import_provider tools/cpu_exe_aot.py
+                "$<TARGET_FILE:cpu_import_provider>" "${source}" ${extra_provider_args}
+            DEPENDS ${native} cpu_exe_io cpu_import_provider ${extra_provider_target} tools/cpu_exe_aot.py
                 tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py tools/ffx_version_query.py
             VERBATIM)
         add_executable(${lifted} "${source}")
         target_link_options(${lifted} PRIVATE /INCREMENTAL:NO)
         foreach(program IN ITEMS ${native} ${lifted})
-            target_link_libraries(${program} PRIVATE cpu_exe_io cpu_import_provider)
+            target_link_libraries(${program} PRIVATE cpu_exe_io cpu_import_provider ${extra_provider_target})
         endforeach()
     endforeach()
     add_test(NAME cpu_aot_exe_entry COMMAND "${INTAKE_PYTHON}" -B
@@ -657,6 +671,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_original>" "$<TARGET_FILE:cpu_exe_original_lifted>"
         "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>")
+    add_test(NAME cpu_native_exe_two_providers COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" --two-providers "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_two_providers>" "$<TARGET_FILE:cpu_exe_two_providers_lifted>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_exe_second_provider>")
     target_compile_features(pe_map PRIVATE cxx_std_17)
     add_test(NAME cpu_native_map COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_map_check.py" "$<TARGET_FILE:pe_map>"
