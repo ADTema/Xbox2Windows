@@ -26,6 +26,7 @@ class Boundary(NamedTuple):
     stored: int
     logical: int
     codec: int
+    trailing_bytes: int
 
 
 class Tables(NamedTuple):
@@ -53,7 +54,7 @@ def boundary(data: bytes, offset: int = 0) -> Boundary:
     low, high = struct.unpack_from("<II", data, offset)
     return Boundary((low & 0x03ffffff) * 256,
                     ((high & 0xfffff) * 4 + (low >> 30)) * 4096,
-                    (low >> 26) & 15)
+                    (low >> 26) & 15, high >> 20)
 
 
 def read_tables(stream: BinaryIO) -> Tables:
@@ -158,11 +159,16 @@ def descriptor_interval(tables: Tables, index: int) -> tuple[int, Boundary, Boun
 
 
 def raw_page_map(stream: BinaryIO, index: int) -> PageMap:
-    address, left, right = descriptor_interval(read_tables(stream), index)
+    tables = read_tables(stream)
+    address, left, right = descriptor_interval(tables, index)
     if left.codec:
         raise ValueError("Descriptor page belongs to a coded RDS5 range")
-    if right.stored - left.stored != right.logical - left.logical:
-        raise ValueError("Raw mapping requires equal stored and logical range sizes")
+    payload_end = left.stored + (right.logical - left.logical)
+    if right.stored != payload_end:
+        if right.stored - payload_end != left.trailing_bytes:
+            raise ValueError("Raw interval size disagrees with its declared padding")
+        if any(tables.archive.read(payload_end, left.trailing_bytes)):
+            raise ValueError("Nonzero bytes in declared raw interval padding")
     return PageMap(address, left.stored + address - left.logical)
 
 
@@ -195,7 +201,7 @@ if __name__ == "__main__":
     parser.add_argument("archives", metavar="archive", type=Path, nargs="+")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--raw-page-map", type=int, metavar="INDEX",
-                      help="Report offsets of a zero-based descriptor's first 4 KiB page in an equal-size raw range")
+                      help="Report offsets of a zero-based descriptor's first 4 KiB page in a verified raw range")
     mode.add_argument("--zlib-segment", type=int, metavar="INDEX",
                       help="Verify the zlib interval containing the descriptor's first page and report its extents")
     mode.add_argument("--lookup-key", metavar="KEY",
