@@ -27,6 +27,7 @@ bool check_bvh_waves(ID3D12Device* device, bool force64);
 bool check_wave_shuffle(ID3D12Device* device);
 bool check_ray_query(ID3D12Device* device);
 bool check_dxr_update(ID3D12Device* device);
+bool check_dxr_facing(ID3D12Device* device);
 
 Microsoft::WRL::ComPtr<ID3D12Resource> make_buffer(ID3D12Device* device, UINT64 length, D3D12_HEAP_TYPE heap,
     D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);
