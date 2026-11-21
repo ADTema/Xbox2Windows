@@ -7,7 +7,7 @@ import unittest
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from script_state_probe import inspect, joaat
+from script_state_probe import inspect, inspect_tree, joaat
 
 
 def fixture(*, damage_value=False, self_parent=False, id_kind=5, parent_tag="state", drop=None, root_parent=65535):
@@ -58,6 +58,15 @@ def fixture(*, damage_value=False, self_parent=False, id_kind=5, parent_tag="sta
         archive += bytes(-len(archive) % 16)
         archive += zlib.compress(body[i:i + 65536])
     return archive
+
+
+class DuplicateStateIdTests(unittest.TestCase):
+    def test_duplicate_state_id_is_rejected(self):
+        # Two label-kind id attributes on one state: the replay raises, so the probe must not let the last win.
+        nodes = [(joaat("state"), 65535, 0, 0, 0, 0, 2, 1)]
+        attrs = [(joaat("id"), joaat(label), 0, 5, 1, 0) for label in ("first", "second")]
+        with self.assertRaisesRegex(ValueError, "Duplicate state ID"):
+            inspect_tree(nodes, attrs, b"", joaat("second"))
 
 
 class ScriptStateTests(unittest.TestCase):

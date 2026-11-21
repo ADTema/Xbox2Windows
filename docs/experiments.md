@@ -617,6 +617,27 @@ Four priority BVH containers use the first layout, are referenced by the functio
 
 Tests use disjoint buffers and cover zero length, thread-group boundaries, integer wraparound and untouched memory. Each desktop backend runs 26 cases and checks 384 words per case. The fourth operation schedules its optional reset in a second dispatch with a UAV barrier. Source cross-group synchronization, aliasing and actual game call parameters remain open.
 
+### Module-only validation by DXC release
+
+`shader_metadata_probe` validates each control shader twice through `root_probe`: the whole container with default flags, then the bare bitcode with `DxcValidatorFlags_ModuleOnly`. With the DXC 1.7.2308 in the original Windows SDK 10.0.26100 release, the second call returns `E_INVALIDARG` without a validation status. [Issue #98](https://github.com/R0Y00/Xbox2Windows/issues/98) The test still runs the root signature, container and disassembly checks. It reports a skip only when both module calls return that code and `dxil.dll` has a 101.x file version. `shader_metadata_controls` checks that rule without a validator and prints each case. A refusal from a 1.x validator, one refused and one validated shader in either order, another call failure and a failed module status are all rejected. The Linux Python job runs the same controls.
+
+The table repeats `root_probe`'s two calls with the `dxcompiler.dll` and `dxil.dll` of each official x64 release. The inputs were `compute_root`, `compute_tables` and `triangle_vs` compiled by DXC 1.7.2308. Every release accepted the three containers. The calls ran under Wine 11.0. The 1.7.2308 and 1.9.2609 rows match the native Windows 10 results in #98. `IDxcVersionInfo` reports 1.8 on both sides of the boundary, so the test reads the file version instead.
+
+| DXC release | `dxil.dll` file version | `IDxcVersionInfo` | Module-only call |
+|---|---|---|---|
+| 1.7.2308 | 101.7.2308.12 | 1.7 | `E_INVALIDARG` |
+| 1.8.2403, 1.8.2405, 1.8.2407 | 101.8.2403.18, 101.8.2405.17, 101.8.2407.12 | 1.8 | `E_INVALIDARG` |
+| 1.8.2502 | 1.8.2502.8 | 1.8 | Status 0 |
+| 1.8.2505, 1.8.2505.1, 1.9.2602, 1.9.2602.24, 1.9.2607, 1.9.2609 | 1.x | 1.9 | Status 0 |
+
+To check another release on Windows, configure a separate build directory with its compiler, then run the test:
+
+```powershell
+cmake --preset dev -B out/build/dxc-check -DDXC_EXECUTABLE=<path>\bin\x64\dxc.exe
+cmake --build out/build/dxc-check
+ctest --test-dir out/build/dxc-check --no-tests=error -R '^shader_metadata_probe$' -V
+```
+
 ### BVH reads and cross-lane operations
 
 In `out/calls/desktop-roots.json`, `static_operands` from `tools/probe_roots.py` groups functions by module count, call site and operand form. The counts below describe static instructions across the 52 BVH programs. Runtime frequency is unknown.
@@ -751,7 +772,7 @@ The tool reads the candidate as a file and uses the manifest slot as its graph n
 
 ### State-linked settings in a script archive
 
-`python -B tools/script_state_probe.py path/to/script.rpf --state <label>` checks aligned zlib pages, section lengths through CHKS, schema and array extents, and parent-to-child attribute ranges. It emits aggregate counts and at most one matching example. The supported profile has five root arrays. Other layouts and entries outside the recognized zlib framing require separate inspection.
+`python -B tools/script_state_probe.py path/to/script.rpf --state <label>` checks aligned zlib pages, section lengths through CHKS, schema and array extents, and parent-to-child attribute ranges, and rejects a state node with more than one label-kind `id` attribute, as the replay does. It emits aggregate counts and at most one matching example. The supported profile has five root arrays. Other layouts and entries outside the recognized zlib framing require separate inspection.
 
 In the local base script archive, 532 children of state nodes carried orbit distance, heading and pitch bounds, blend duration and priority together. Reformatting the stored integers, floats and vectors as decimal strings reproduced all five saved value hashes for each child. This establishes authored camera settings associated with states. Activation conditions, time units, interpolation and native calls still need execution evidence. The source-built regression changes a scalar while preserving its saved hash and separately introduces a parent cycle. Further synthetic trees cover a non-state parent, a missing camera attribute, a root with a parent, a state label that selects nothing, and an integer `id` attribute whose hash equals the label, which does not name a state (only label-kind IDs do, as in the replay). [CodeWalker field-name reference](https://github.com/dexyfex/CodeWalker/blob/master/CodeWalker.Core/GameFiles/MetaTypes/MetaNames.cs)
 
