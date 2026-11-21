@@ -49,6 +49,7 @@ CPU_FIXTURES = {
     "switch": "cpu_aot_jump_tables",
     "repeat_call": "cpu_aot_repeated_call",
     "working_set_delta": "cpu_working_set_delta",
+    "exe_entry": "cpu_aot_exe_entry",
     "register_probe": None,  # measurement harness
     "two_imports": None,     # mapped and run unchanged by pe_map
     "reloc_route": None,     # mapped and run unchanged by pe_map
