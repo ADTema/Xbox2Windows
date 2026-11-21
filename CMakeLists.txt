@@ -458,6 +458,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_flag_conditions COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/flag_conditions_check.py" check
         "$<TARGET_FILE:cpu_flag_conditions>" "$<TARGET_FILE:cpu_flag_conditions_lifted>")
+    set_tests_properties(cpu_aot_flag_conditions PROPERTIES
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_flag_conditions.txt")
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_translation(cpu_switch_addr32 cpu_switch_aot lea_wrap,lea_back,load_back,store_ahead)
     add_test(NAME cpu_aot_switch_addr32 COMMAND "${INTAKE_PYTHON}" -B

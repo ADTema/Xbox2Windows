@@ -1,5 +1,6 @@
 """Native/AOT differential checks for integer OF/PF conditional consumers."""
 import ctypes
+import os
 from pathlib import Path
 import random
 import struct
@@ -111,6 +112,15 @@ def check(original, lifted):
                                                  f'return={result}, trace={bytes(buffer).hex()}, expected={expected.hex()}')
                     count += 1
     rejected(original)
+    record = os.environ.get('FORM_COVERAGE_RECORD')
+    if record:
+        from iced_x86 import Formatter, FormatterSyntax
+        formatter = Formatter(FormatterSyntax.INTEL)
+        _, translated = translate(original, NAMES)
+        forms = {formatter.format_mnemonic(ins).lower()
+                 for function in translated for ins in function.instructions.values()}
+        Path(record).parent.mkdir(parents=True, exist_ok=True)
+        Path(record).write_text(''.join(word + '\n' for word in sorted(forms)), encoding='utf-8')
     print(f'{len(NAMES)} exports: {count} native/AOT/reference comparisons passed '
           '(Jcc, SETcc, CMOVcc; 8/16/32/64-bit producers; output guards intact)')
 
@@ -120,6 +130,8 @@ if __name__ == '__main__':
     if mode == 'emit':
         Path(destination).write_text(translate(original, NAMES)[0], encoding='utf-8')
     elif mode == 'check':
+        if os.environ.get('FORM_COVERAGE_RECORD'):
+            Path(os.environ['FORM_COVERAGE_RECORD']).unlink(missing_ok=True)
         check(original, destination)
     else:
         raise SystemExit('expected emit or check')

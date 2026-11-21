@@ -678,6 +678,11 @@ shift substituted for the producer must be rejected. On Windows 11 build
 26300.9974, MSVC/ML64 19.44.35230 and Python 3.12.8, this test and the four
 existing jump-table, address-size, entry-order and narrow-return tests passed.
 The former `SETO` rejection control now checks successful translation.
+The test also records its decoded mnemonics through `FORM_COVERAGE_RECORD`.
+Coverage reads that record for this parameterized MASM fixture instead of
+interpreting macro tokens. Only a passing test with a current record covers the
+12 new overflow/parity instruction forms; failed, skipped and missing records
+cannot add green cells.
 
 ```powershell
 cmake --build --preset dev --target cpu_flag_conditions_lifted

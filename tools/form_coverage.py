@@ -13,6 +13,8 @@ Rules:
   not registered) leaves them uncovered; forms held back only by a skip are listed separately.
 - x64: the mnemonics of a tests/cpu/*.asm source count for the test CPU_FIXTURES names. An unlisted
   .asm is never counted; it is reported as unclassified so it can be added, without failing the run.
+  Parameterized fixtures in CPU_RECORD_FIXTURES instead require decoded-instruction records
+  emitted by their differential test during the JUnit run; source macro tokens are not counted.
 - gfx: only programs the translator accepted count. tests/pixel_aot_check.py records the first word
   of each line of every program tools/pixel_aot.py lowered without an error, in the file CTest names
   in FORM_COVERAGE_RECORD (<build>/form_coverage/<test>.txt). Programs a check expects to be rejected
@@ -51,6 +53,7 @@ CPU_FIXTURES = {
     "version_query": "cpu_aot_version_query",
     "bink_descriptors": "cpu_bink_descriptors",
     "switch": "cpu_aot_jump_tables",
+    "flag_conditions": "cpu_aot_flag_conditions",
     "switch_addr32": "cpu_aot_switch_addr32",
     "fourth_arg": "cpu_aot_fourth_argument",
     "repeat_call": "cpu_aot_repeated_call",
@@ -69,6 +72,10 @@ CPU_FIXTURES = {
     "seh_route": None,       # mapped and run unchanged by pe_map
     "tls_route": None,       # mapped and run unchanged by pe_map
 }
+
+# These sources use parameterized macros. Count decoded instructions recorded by
+# their passing differential test, rather than guessing the macro expansion.
+CPU_RECORD_FIXTURES = {"flag_conditions"}
 
 MASM_DIRECTIVES = {"ifdef", "ifndef", "if", "else", "elseif", "endif", "end", "public", "extern",
                    "externdef", "include", "includelib", "option", "align", "even", "org", "assume", "local"}
@@ -176,14 +183,21 @@ def measure(results, root=ROOT, records=None):
     """results: {test: status}. root: the repository whose tests/cpu is scanned (the check passes a
     temporary one). records: {test: accepted gfx mnemonics} from read_records."""
     cpu = {}
+    records = records or {}
+    cpu_tests = set(CPU_FIXTURES.values()) - {None}
     for asm in sorted((root / "tests" / "cpu").glob("*.asm")):
         if asm.stem not in CPU_FIXTURES:
             status = "unclassified"
         else:
             test = CPU_FIXTURES[asm.stem]
             status = fixture_status(results, [test]) if test else "not translated"
-        cpu[asm.name] = (masm_mnemonics(asm.read_text(encoding="utf-8")), status)
-    shaders = {test: (forms, fixture_status(results, [test])) for test, forms in (records or {}).items()}
+        if asm.stem in CPU_RECORD_FIXTURES:
+            forms = {x64_canonical(m) for m in records.get(CPU_FIXTURES[asm.stem], set())}
+        else:
+            forms = masm_mnemonics(asm.read_text(encoding="utf-8"))
+        cpu[asm.name] = (forms, status)
+    shaders = {test: (forms, fixture_status(results, [test]))
+               for test, forms in records.items() if test not in cpu_tests}
     x64 = load_reference("x64_zen2.tsv")
     fixtures = {name: status for name, (_, status) in {**cpu, **shaders}.items()}
     return {
