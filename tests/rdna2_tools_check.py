@@ -481,6 +481,31 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(res["compatibility_category"], "unsupported_opcodes")
         self.assertIn("v_imaginary_opcode_xyz", res["unsupported_opcodes"])
 
+    def test_vopc_classification(self):
+        """Vector compare opcodes with type suffixes must classify as VOPC, not VALU."""
+        for opcode in ("v_cmp_lt_f32", "v_cmp_eq_u32", "v_cmp_gt_i32", "v_cmp_le_f16"):
+            self.assertEqual(classify_isa_category(opcode), "VOPC (Vector Compare)", opcode)
+        self.assertEqual(classify_isa_category("v_add_f32"), "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)")
+
+    def test_inline_slash_comments_and_blank_lines(self):
+        """Inline // comments must be stripped and blank/comment lines must not inflate counts."""
+        self.assertTrue(is_instruction_supported("s_endpgm // shader exit"))
+        res = analyze_shader_instructions(
+            "commented_ps",
+            [
+                "",
+                "; header comment",
+                "// llvm-style comment",
+                "s_endpgm // shader exit",
+                "v_imaginary_opcode_xyz v0, v1 // unsupported",
+            ],
+        )
+        self.assertEqual(res["total_instructions"], 2)
+        self.assertEqual(res["supported_instructions"], 1)
+        self.assertEqual(res["unsupported_count"], 1)
+        self.assertEqual(res["support_percentage"], 50.0)
+        self.assertEqual(res["unsupported_details"][0]["raw"], "v_imaginary_opcode_xyz v0, v1")
+
     def test_cli_scanner(self):
         """Invoke scanner via its actual CLI entry point on synthetic assembly file."""
         canonical_shader = "\n".join([

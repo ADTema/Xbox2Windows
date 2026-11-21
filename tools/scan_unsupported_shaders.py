@@ -123,10 +123,10 @@ def classify_isa_category(opcode: str) -> str:
     if op.startswith("v_interp"):
         return "VINTRP (Parameter Interpolation)"
     if op.startswith("v_"):
-        if "_f16" in op or "_f32" in op or "_f64" in op or "_u32" in op or "_i32" in op or "_pk_" in op:
-            return "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)"
         if op.startswith("v_cmp"):
             return "VOPC (Vector Compare)"
+        if "_f16" in op or "_f32" in op or "_f64" in op or "_u32" in op or "_i32" in op or "_pk_" in op:
+            return "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)"
         return "VALU (Vector ALU)"
     if op.startswith("s_"):
         if op.startswith("s_cbranch") or op.startswith("s_branch"):
@@ -153,7 +153,7 @@ def extract_opcode(instruction_line: str) -> str:
     """Extract primary opcode token from assembly instruction."""
     line = instruction_line.strip()
     # Strip comments
-    line = re.split(r"[;#/]", line)[0].strip()
+    line = re.split(r"//|[;#]", line)[0].strip()
     if not line:
         return ""
     # Extract first word
@@ -164,7 +164,7 @@ def extract_opcode(instruction_line: str) -> str:
 def is_instruction_supported(instruction_line: str) -> bool:
     """Check if instruction is supported by pixel_aot regex patterns."""
     clean = instruction_line.strip()
-    clean = re.split(r"[;#]", clean)[0].strip()
+    clean = re.split(r"//|[;#]", clean)[0].strip()
     if not clean:
         return True
     return any(pattern.match(clean) for pattern in COMPILED_SUPPORTED_PATTERNS)
@@ -177,17 +177,18 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str]) -> di
       1. Opcode recognition: whether every instruction opcode is known to the RDNA 2 ISA scanner.
       2. Translator acceptance: whether pixel_aot.lower() actually accepts the shader sequence.
     """
-    total = len(instructions)
+    total = 0
     unrecognized_opcodes = Counter()
     unsupported_translator_items = []
     opcode_distribution = Counter()
 
     for idx, raw_line in enumerate(instructions, start=1):
         line = raw_line.strip()
-        line = re.split(r"[;#]", line)[0].strip()
+        line = re.split(r"//|[;#]", line)[0].strip()
         if not line:
             continue
 
+        total += 1
         opcode = extract_opcode(line)
         opcode_distribution[opcode] += 1
 
