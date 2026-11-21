@@ -375,6 +375,15 @@ The mapped `call_mix` is compared over 249 input pairs on arguments, guarded wri
 ctest --preset dev --no-tests=error -R '^cpu_native_seh$' -V
 ```
 
+`cpu_native_section` compares every section of the register probe after `LoadLibraryExW` and after `pe_map`, byte for byte, on the original and on copies with one section header patched. The probe has no entry point and no imports, so the Windows load runs none of its code. On Windows 11 build 26300.9974, the loader reads section data in whole `0x200`-byte file sectors: it rounds `PointerToRawData` down and the end of the raw data, `PointerToRawData + SizeOfRawData`, up to a multiple of `0x200`. It copies that range up to the section's virtual size, and bytes past the end of the file stay zero. `pe_map` now reads the same range. The test covers a start inside a sector, a start in the first sector, which reads the headers from offset 0, a raw size below one sector and raw data that crosses a sector boundary. In each case Windows differs from an exact read of `SizeOfRawData` bytes at `PointerToRawData`. A last case shortens the file so that the rounded end of `.rsrc` lies past it.
+
+A `PointerToRawData` of zero is the exception: Windows leaves that section zero-filled even when `SizeOfRawData` is set, and so does `pe_map`. The rounding cases patch `.rdata`, because in `.rsrc` a rounded start can put other data where the resource directory should be, and `LoadLibraryExW` then fails with `ERROR_BAD_EXE_FORMAT`. These results were measured with a `FileAlignment` of `0x200` and `0x400`. With `0x1000`, Windows filled more of a section whose raw size is below one sector than the rounded sector end allows, which remains open.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_section$' -V
+```
+
+
 ### TLS callbacks and the entry point
 
 `tls_route` has an entry point and a TLS directory whose callback list holds one routine and whose data template is empty. Both routines report each call to `cpu_tls_sink.dll`, which outlives the image, so calls made during release stay visible. `cpu_native_tls` loads the image with `LoadLibraryW` and maps it with `pe_map`, each in its own child process, and compares the process notifications:
