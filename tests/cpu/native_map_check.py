@@ -13,7 +13,7 @@ import pefile
 from direct_check import input_pairs, observe, reference, register_probe
 
 Resolver = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32)
-STATUS = {"ok": 0, "format": 2, "unresolved": 5, "unsupported": 6}  # MapStatus in tools/pe_map.cpp
+STATUS = {"ok": 0, "format": 2, "unresolved": 5, "unsupported": 6, "init_failed": 9}  # MapStatus in tools/pe_map.cpp
 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
 kernel.GetProcAddress.restype = ctypes.c_void_p
@@ -130,7 +130,7 @@ def check_rejections(mapper, image, provider, symbol):
     bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
     descriptor = 20  # sizeof(IMAGE_IMPORT_DESCRIPTOR)
     for field, value, expected, message in (
-            (entry, 0x1000, "unsupported", "entry point"),
+            (entry, size + 0x1000, "format", "entry point outside executable section"),
             (address, size - 4, "format", "import directory outside image"),
             (length, descriptor - 1, "format", "import directory smaller than one descriptor")):
         data = bytearray(image.read_bytes())
@@ -141,7 +141,7 @@ def check_rejections(mapper, image, provider, symbol):
             base, status, detail, requests = mapper(damaged, bindings)
         if base or status != STATUS[expected] or detail != message or requests:
             raise AssertionError(f"{message} control: {base=} {status=} {detail=} {requests=}")
-    print(f"{image.name}: rejected unbound {identity}, an entry point, an import directory outside the image "
+    print(f"{image.name}: rejected unbound {identity}, an entry point and an import directory outside the image "
           "and one smaller than a descriptor")
 
 
