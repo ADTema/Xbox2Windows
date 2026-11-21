@@ -148,6 +148,29 @@ def check(folder, fixture, provider):
         pe.set_qword_at_rva(table_va - pe.OPTIONAL_HEADER.ImageBase, 1)
         pe.write(str(bad_tls))
     assert "RVA" in run(2, bad_tls)["error"]
+    # Windows locates the TLS directory by VirtualAddress alone and ignores Size.
+    for size in (0, 39):
+        small_tls = folder / f"tls-size-{size}.exe"
+        with pefile.PE(str(fixture), fast_load=True) as pe:
+            pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = size
+            pe.write(str(small_tls))
+        small_report = run(0, small_tls)
+        assert small_report["pe"]["tls"] == report["pe"]["tls"]
+        assert small_report["pe"]["startup"]["locations"] == locations
+    zero_tls_addr = folder / "tls-zero-addr.exe"
+    with pefile.PE(str(fixture), fast_load=True) as pe:
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = 0
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 40
+        pe.write(str(zero_tls_addr))
+    zero_tls_report = run(0, zero_tls_addr)
+    assert zero_tls_report["pe"]["tls"] is None
+    assert [loc["role"] for loc in zero_tls_report["pe"]["startup"]["locations"]] == ["entry"]
+    oob_tls = folder / "tls-oob.exe"
+    with pefile.PE(str(fixture), fast_load=True) as pe:
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = pe.OPTIONAL_HEADER.SizeOfImage - 16
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 0
+        pe.write(str(oob_tls))
+    assert "RVA" in run(2, oob_tls)["error"]
     staged = root / "incoming.exe"
     shutil.copyfile(fixture, staged)
     assert run(0, staged)["diff"]["added_images"] == [slot]
