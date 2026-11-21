@@ -457,6 +457,14 @@ def check_controls(directory):
     for wait in ("s_waitcnt vmcnt(0)", "s_waitcnt lgkmcnt(0)"):
         must_reject(translate, [line for line in program if line != wait])
 
+    wait = program.index("s_waitcnt vmcnt(0)")
+    overwrite = "v_floor_f32_e32 v13, 1.0"
+    must_reject(translate, program[:wait] + [overwrite] + program[wait:])
+    free = translate(program[:wait] + ["v_floor_f32_e32 v24, 1.0"] + program[wait:])
+    late = translate(program[:wait+1] + [overwrite] + program[wait+1:])
+    assert "export16(sample15.y)" in free
+    assert "export16(alu17)" in late
+
     program = arithmetic()
     source = translate(program)
     for expected in ("= sample16.x;", "= (params[2].x * alu20);", "= saturate((alu21 + params[2].y));",

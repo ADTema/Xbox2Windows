@@ -323,6 +323,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             arity, template = ALU[op]
             if mask != "entry" or len(tokens) != arity:
                 raise ValueError("Invalid arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
             values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
             expression = template.format(*values)
             if clamp:
