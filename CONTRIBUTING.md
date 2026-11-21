@@ -2,6 +2,8 @@
 
 You can contribute a hardware result, a source-built failing case, a documentation fix or a patch from an x64 Windows PC. Our Xbox Series X case study supplies research questions. The shared regression suite runs with public tools and fixtures built from this repository.
 
+Visit [GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions) and follow the [pinned newcomer guide](https://github.com/R0Y00/Xbox2Windows/discussions/75) to get started. For build or debugging help, post the commit, command and observed result in [Development Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a).
+
 ## Find and claim a task
 
 1. Search the [issue tracker](https://github.com/R0Y00/Xbox2Windows/issues) for the test name or observed behavior. Issues labeled **good first issue** have a small first step. **help wanted** marks work that can proceed independently.
@@ -23,7 +25,7 @@ Start with the [first build](README.md#first-build). Create the Python environme
 | `tools/` | Build setup and offline metadata tools. The PE fixtures live in `tests/intake/`. |
 | `docs/experiments.md` | Measured results, assumptions and reproduction commands. |
 
-The Windows job builds the C++ and HLSL, runs the CPU, Python and WARP tests, and smoke-tests the standalone GPU package. The Ubuntu job assembles and translates gfx1013 fixtures with LLVM 15. Contributors supply physical GPU coverage. For a hardware report, record the commit, adapter and driver, Windows version, test names and debug-layer status. Include the reported feature tier or wave width when relevant. Record capability skips separately from passes and failures. [CI workflow](.github/workflows/windows.yml)
+The Windows job builds the C++ and HLSL, runs the CPU, Python and WARP tests, and smoke-tests the standalone GPU package. The Ubuntu job assembles and translates gfx1013 fixtures with LLVM 15. A second Ubuntu job runs the platform-independent Python checks. Contributors supply physical GPU coverage. For a hardware report, record the commit, adapter and driver, Windows version, test names and debug-layer status. Include the reported feature tier or wave width when relevant. Record capability skips separately from passes and failures. [CI workflow](.github/workflows/windows.yml)
 
 ## Share a reproducible finding
 
