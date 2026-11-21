@@ -725,6 +725,33 @@ A local scan of the inspected package's 16 DLLs together with this `xmem.dll` (`
 | `xmem_shim_query` | Graphics memory from `XMemAlloc` passes both BVH predicates and keeps the sentinel after `+0x30`, through the pseudo-handle and a real handle. After `XMemFree` the address reads as `MEM_FREE` with a clear tail. Heap memory fails the tail check, and an address outside user space returns `FALSE` without touching the buffer. |
 | `xmem_shim_working_set` | Returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the output untouched, so the callers' value is zero. |
 
+### Desktop GPU addresses for title allocations
+
+On the console a graphics allocation's CPU pointer is also its GPU virtual address. Titles pass those addresses to D3D12 calls, and the BVH builder's shaders read 64-bit addresses from their input records. A desktop D3D12 resource gets a GPU virtual address chosen by the driver.
+
+- `era_gpu_alias::open` (`src/era_gpu_alias.cpp`) opens an existing `VirtualAlloc` allocation, such as an `era_heap` graphics allocation, with `ID3D12Device3::OpenExistingHeapFromAddress`. It then places one cross-adapter buffer with unordered access over it.
+- The title pointer and the buffer's GPU virtual address then name the same system-memory bytes, without copies.
+- `era_title_va::Table` (`src/era_title_va.cpp`) maps title address ranges to those desktop GPU virtual addresses.
+
+What is covered:
+- Translating title addresses that D3D12 calls receive. Root views at translated addresses are exercised below.
+
+Not covered:
+- Shaders that load through 64-bit addresses read from memory. They need a shader-side lookup of the same ranges (`Table::ranges()`).
+- Performance. GPU access to this heap goes over the bus.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `era_title_va_translate` | Offsets inside two ranges, the last word of a range, and a zero byte count translate to the matching desktop address. |
+| `era_title_va_bounds` | Bytes just before and after a range, spans crossing its end, a span longer than the range and a wrapping span return 0. |
+| `era_title_va_registry` | Empty, wrapping, zero-GPU and overlapping ranges are rejected; adjacent ranges are accepted and listed in order; a removed range no longer translates. |
+| `gpu_alias_warp`, `gpu_alias_hardware` | A 256 KiB memory-type-1 allocation from `era_heap` is opened as a heap. A compute shader reads 4,096 words through a root UAV at the translated title address `+0x1000` and writes transformed words through a root UAV at `+0x20000`. The CPU checks every result and the unchanged source through the title pointer, with no readback buffer. 64 guard words after the written range must keep their sentinel. Opening a pointer `0x1000` into the allocation must fail. Returns 77 when the adapter does not report `D3D12_FEATURE_EXISTING_HEAPS`. |
+
+Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer unavailable (Graphics Tools not installed):
+- `gpu_alias_hardware` passed on an NVIDIA GeForce RTX 3070 Laptop GPU (driver 32.0.16.1088).
+- `gpu_alias_warp` passed on WARP 10.0.26100.9818.
+- On both, the interior open returned `E_INVALIDARG` (`0x80070057`).
+
 ## Offscreen rendering and readback
 
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
