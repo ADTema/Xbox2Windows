@@ -125,6 +125,7 @@ ALU = {
 }
 # The n-prefixed predicates are also true for unordered operands, so they stay negations.
 COMPARE = {
+    "f": "false", "tru": "true",
     "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}", "gt": "{0} > {1}",
     "lg": "({0} < {1} || {0} > {1})", "ge": "{0} >= {1}",
     "o": "({0} == {0} && {1} == {1})", "u": "({0} != {0} || {1} != {1})",
