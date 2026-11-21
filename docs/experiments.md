@@ -806,6 +806,7 @@ On the console a graphics allocation's CPU pointer is also its GPU virtual addre
 What is covered:
 - Translating title addresses that D3D12 calls receive. Root views at translated addresses are exercised below.
 - Shader loads through 64-bit title addresses read from memory, via `src/title_va_lookup.hlsli`.
+- Stores, integer add and sub atomics, and float min and max (a compare-exchange loop) through those addresses, on the same aliased system-memory heaps.
 
 Not covered:
 - Performance. GPU access to this heap goes over the bus.
@@ -823,12 +824,14 @@ How the shader lookup works:
 | `gpu_alias_warp`, `gpu_alias_hardware` | A 256 KiB memory-type-1 allocation from `era_heap` is opened as a heap. A compute shader reads 4,096 words through a root UAV at the translated title address `+0x1000` and writes transformed words through a root UAV at `+0x20000`. The CPU checks every result and the unchanged source through the title pointer, with no readback buffer. 64 guard words after the written range must keep their sentinel. Opening a pointer `0x1000` into the allocation must return `E_INVALIDARG` from `era_gpu_alias::open` without reaching D3D12; passing it to `OpenExistingHeapFromAddress` makes the debug layer report message 1088. Returns 77 when the adapter does not report `D3D12_FEATURE_EXISTING_HEAPS`. |
 | `era_title_va_shader` | Packing splits begin and end into low and high words, including a range across a 4 GiB line; slots follow table order; unsorted, overlapping, empty and 4 GiB ranges are rejected. |
 | `gpu_alias_lookup_warp`, `gpu_alias_lookup_hardware` | Three memory-type-1 allocations and one placed across a 4 GiB line are opened as heaps, packed, and bound as raw UAVs in a descriptor table. A compute shader loads one word through each of 122 title addresses read from an input buffer: starts, last words, middles, the words just outside each allocation, the null page, an address above user space, and the same low words 4 GiB above and below the placed allocation. Values and slots must match the CPU reading through the title pointers; addresses outside every range must return the miss marker. The hit and miss split varies with where the allocations land. |
+| `gpu_alias_lookup_writes_warp`, `gpu_alias_lookup_writes_hardware` | The same four allocations. A compute shader runs 1,041 records through the lookup: 14 stores (range starts, middles, ends, both sides of the 4 GiB line); 256 contending threads each for add, sub, float min and float max on one word per operation; and three stores to unmapped addresses, which must report 0. Every word of all four allocations is then compared with the CPU expectation through the title pointers. A compare-exchange loop that does not retry after losing a race passes on WARP, which showed no conflicting update; only hardware can catch it. |
 
 Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer unavailable (Graphics Tools not installed):
 - `gpu_alias_hardware` passed on an NVIDIA GeForce RTX 3070 Laptop GPU (driver 32.0.16.1088).
 - `gpu_alias_warp` passed on WARP 10.0.26100.9818.
 - On both, the interior open returned `E_INVALIDARG` (`0x80070057`).
 - At commit `53c8d69`, `gpu_alias_lookup_hardware` and `gpu_alias_lookup_warp` passed on the same two adapters with 4 ranges and 122 records, mismatches 0 (one run: 104 hits and 18 misses).
+- At commit `0d4c08f`, `gpu_alias_lookup_writes_warp` passed on WARP 10.0.26100.9818: 1,041 records, sum 128416, min -1250, max 1241.62, three misses, 147,456 words checked, mismatches 0. The hardware variant was not run (the GPU was in use by another task).
 
 ## Offscreen rendering and readback
 
