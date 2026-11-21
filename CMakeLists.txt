@@ -361,6 +361,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Translation must reject this copy, which omits the trace-pointer reload.
     cpu_asm_fixture(cpu_repeat_dropped repeat_call)
     target_compile_definitions(cpu_repeat_dropped PRIVATE DROP_RELOAD)
+    foreach(variant IN ITEMS original swapped first second)
+        cpu_asm_fixture(cpu_pair_${variant} call_pair)
+        cpu_translation(cpu_pair_${variant} cpu_call_aot call_pair)
+        target_link_options(cpu_pair_${variant}_lifted PRIVATE /INCREMENTAL:NO)
+    endforeach()
+    target_compile_definitions(cpu_pair_swapped PRIVATE SWAP_CALLS)
+    target_compile_definitions(cpu_pair_first PRIVATE ALTER_FIRST)
+    target_compile_definitions(cpu_pair_second PRIVATE ALTER_SECOND)
     cpu_asm_fixture(cpu_register_probe register_probe)
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_switch_${variant} switch)
@@ -545,6 +553,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/direct_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_call_original>" "$<TARGET_FILE:cpu_call_original_lifted>"
         "$<TARGET_FILE:cpu_call_altered_lifted>")
+    add_test(NAME cpu_aot_call_pair COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/call_pair_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_pair_original>" "$<TARGET_FILE:cpu_pair_swapped>"
+        "$<TARGET_FILE:cpu_pair_original_lifted>" "$<TARGET_FILE:cpu_pair_swapped_lifted>"
+        "$<TARGET_FILE:cpu_pair_first_lifted>" "$<TARGET_FILE:cpu_pair_second_lifted>")
     foreach(kind IN ITEMS named ordinal)
         if(kind STREQUAL "named")
             set(prefix cpu_import)
