@@ -68,6 +68,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
 
         def address():
             if i.is_ip_rel_memory_operand:
+                if i.memory_base == R.EIP:
+                    # The hardware adds the low 32 bits of the runtime RIP; an RVA binding cannot model that.
+                    raise ValueError(f"unsupported EIP-relative operand at {i.ip:#x}: {i}")
                 return globals_[i.ip_rel_memory_address]
             terms = []
             addr32 = False
