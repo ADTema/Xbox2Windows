@@ -8,7 +8,7 @@ Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D1
 void check_compute(ID3D12Device* device, bool tables);
 void check_dual_uav(ID3D12Device* device);
 void check_texture_mips(ID3D12Device* device);
-void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB);
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr);
 void check_bvh_root_roundtrip(ID3D12Device* device);
 void check_buffer_ops(ID3D12Device* device);
 void check_bvh_reads(ID3D12Device* device);

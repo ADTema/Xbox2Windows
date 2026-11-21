@@ -34,13 +34,17 @@ Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepend
 
 The caller identifies the entry registers for the texture address and interpolation base, and supplies the four sampler descriptor words to match. The generated pixel shader uses `TEXCOORD0`, texture `t0` and sampler `s0`. The test binds a point-clamp sampler, one mip and a full-screen triangle. These bindings are an explicit specialization. The test measures finite UNORM inputs under full pixel coverage. Execution with a title's original pipeline state, helper-lane behavior at triangle edges and other texture formats require separate validation.
 
-From the repository root on Linux with LLVM 15 installed, assemble both original test shaders, wrap them in synthetic records, then extract, decode and translate them. The test compares the result with lowering the source operands directly.
+For a shader that reads constants, pass `--constant-descriptor OFFSET` to identify its four-word descriptor in the same table as the texture descriptor. The desktop test binds 256 bytes at `b0`. A four-word read may span two HLSL constant vectors. Arithmetic support includes log2, exp2, reciprocal, min/max, subtraction, legacy zero-preserving multiplication, multiply-add, destination accumulation and saturation. Compile arithmetic shaders with DXC `-Gis`. Transcendental precision and multiply-add rounding may vary by device. [AMD RDNA instruction reference](https://gpuopen.com/wp-content/uploads/2019/08/RDNA_Shader_ISA_5August2019.pdf) · [HLSL mad precision](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/mad)
+
+From the repository root on Linux with LLVM 15 installed, assemble the three original test shaders, wrap them in synthetic records, then extract, decode and translate them. The test compares the result with lowering the source operands directly.
 
 ```sh
 python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
-On Windows, use the Python-enabled build from the project README. Each backend draws a copy and a red/blue swap, reads all 4,096 pixels back from a floating-point target and compares all four channels bitwise with a CPU reference. A third draw uses the swapped shader with the copy expectation and must report a mismatch.
+On Windows, use the Python-enabled build from the project README. Each backend draws a copy, a red/blue swap and a nonlinear curve with two sets of constants. It compares all four channels of 4,096 pixels bitwise with an independent CPU reference. Negative controls change the expected channel order or the bound gain and must report a mismatch.
+
+To supply a reference for another arithmetic program, run `offscreen_check.exe hardware --check-pixel-case shader.cso reference.case`. The case contains 256 bytes of constants followed by 64 expected RGBA colors in row-major little-endian binary32, one for each texel of the test texture. Generate the expected colors after round-toward-zero half export and widening back to float.
 
 ```powershell
 ctest --preset dev -R '^pixel_aot_' -V
