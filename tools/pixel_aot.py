@@ -101,6 +101,12 @@ def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):
 
 PREAMBLE = """Texture2D<float4> tex : register(t0);
 SamplerState samp : register(s0);
+// v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
+// D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
+float fract32(float value) {
+    float f = frac(value);
+    return f >= 1.0f ? asfloat(0x3f7fffffu) : f;
+}
 // Finite binary32 to binary16, round toward zero, then widen for the float target.
 float export16(float value) {
     uint h = f32tof16(value);
@@ -120,7 +126,8 @@ def registers(first, last, count):
 ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
     "sqrt": (1, "sqrt({0})"), "rsq": (1, "rsqrt({0})"),
-    "floor": (1, "floor({0})"), "fract": (1, "frac({0})"), "trunc": (1, "trunc({0})"),
+    "floor": (1, "floor({0})"), "fract": (1, "fract32({0})"),
+    "trunc": (1, "trunc({0})"),
     "add": (2, "({0} + {1})"), "mul": (2, "({0} * {1})"),
     "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
     "subrev": (2, "({1} - {0})"),

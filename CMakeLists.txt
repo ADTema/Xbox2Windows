@@ -17,7 +17,7 @@ add_test(NAME desktop_bvh_root_flags COMMAND d3d12_sdk_check bvh-flags)
 add_executable(era_heap_check tests/era_heap_check.cpp src/era_heap.cpp)
 target_include_directories(era_heap_check PRIVATE src)
 target_compile_features(era_heap_check PRIVATE cxx_std_20)
-foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words)
+foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words large_alignment)
     add_test(NAME era_heap_${scenario} COMMAND era_heap_check ${scenario})
 endforeach()
 
@@ -189,6 +189,24 @@ foreach(layout IN ITEMS root tables)
     endforeach()
     set_tests_properties(compute_${layout}_hardware PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
+add_executable(pso_root_check tests/pso_root_check.cpp)
+target_compile_features(pso_root_check PRIVATE cxx_std_17)
+target_include_directories(pso_root_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(pso_root_check PRIVATE d3d12 dxgi)
+foreach(mode IN ITEMS embedded stripped)
+    set(symbol pso_compute_${mode})
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.h")
+    set(strip_root)
+    if(mode STREQUAL "stripped")
+        set(strip_root -Qstrip_rootsignature)
+    endif()
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain ${strip_root} -Vn ${symbol}
+                -Fh "${header}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/compute.hlsl"
+        DEPENDS tests/compute.hlsl VERBATIM)
+    target_sources(pso_root_check PRIVATE "${header}")
+endforeach()
+add_test(NAME pso_root_signature_warp COMMAND pso_root_check)
 foreach(adapter IN ITEMS hardware warp)
     add_test(NAME offscreen_${adapter} COMMAND offscreen_check ${adapter} triangle_${adapter}.bmp)
     add_test(NAME ffx_provider_loop_${adapter} COMMAND offscreen_check ${adapter} --ffx-provider-loop)
@@ -388,6 +406,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_switch_original>" "$<TARGET_FILE:cpu_switch_original_lifted>"
         "$<TARGET_FILE:cpu_switch_swapped_lifted>")
+    cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
+    cpu_translation(cpu_switch_addr32 cpu_switch_aot lea_wrap,lea_back,load_back,store_ahead)
+    add_test(NAME cpu_aot_switch_addr32 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_addr32_check.py" "$<TARGET_FILE:cpu_switch_addr32>"
+        "$<TARGET_FILE:cpu_switch_addr32_lifted>")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)
@@ -522,6 +545,16 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(cpu_heap_layout_lifted SHARED "${heap_fixture}")
     add_test(NAME cpu_aot_heap_layout COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/heap_layout.py"
         check "$<TARGET_FILE:cpu_heap_layout>" "$<TARGET_FILE:cpu_heap_layout_lifted>")
+    cpu_asm_fixture(cpu_shift_count shift_count)
+    set(shift_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_shift_count_lifted.cpp")
+    add_custom_command(OUTPUT "${shift_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/shift_count.py"
+            emit "$<TARGET_FILE:cpu_shift_count>" "${shift_fixture}"
+        DEPENDS cpu_shift_count tests/cpu/shift_count.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_shift_count_lifted SHARED "${shift_fixture}")
+    add_test(NAME cpu_aot_shift_count COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/shift_count.py"
+        check "$<TARGET_FILE:cpu_shift_count>" "$<TARGET_FILE:cpu_shift_count_lifted>")
     set(query_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_version_query_lifted.cpp")
     add_custom_command(OUTPUT "${query_fixture}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/version_query_fixture.py"
@@ -747,6 +780,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/resource_ranges_check.py")
     add_test(NAME rdna2_tools_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/rdna2_tools_check.py")
+    add_test(NAME pso_readiness_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pso_readiness_check.py")
     add_test(NAME dxcontainer_part_offsets COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxcontainer_part_offsets_check.py")
     foreach(adapter IN ITEMS hardware warp)

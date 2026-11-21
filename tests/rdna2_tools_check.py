@@ -15,6 +15,7 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from disasm_rdna2 import disasm_rdna2, decode_instruction, disassemble_binary
 from extract_shaders import extract_shaders, extract_native_rdna2_code
+from pixel_aot import native_program
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
     is_instruction_supported,
@@ -117,6 +118,9 @@ class TestRdna2Disasm(unittest.TestCase):
             ("000082be", "s_mov_b32", "s_mov_b32 s2, s0"),
             ("000182be", "s_mov_b64", "s_mov_b64 s2, s0"),
             ("00008080", "s_sub_u32", "s_sub_u32 s0, s0, s0"),
+            # GFX10 scalar operand codes: 108-123 are ttmp0-15, 125 is null (SOP2 ssrc1)
+            ("007d8080", "s_sub_u32", "s_sub_u32 s0, s0, null"),
+            ("006c8080", "s_sub_u32", "s_sub_u32 s0, s0, ttmp0"),
             ("0000027e", "v_nop", "v_nop"),
             # VOP1 9-bit SRC0: 0..255 scalar/constant, 256..511 VGPR
             ("0103007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, v1"),
@@ -311,6 +315,55 @@ class TestRdna2Extractor(unittest.TestCase):
             self.assertTrue((output_dir / "pixel" / "PS_CliTest.bin").is_file())
             self.assertEqual((output_dir / "pixel" / "PS_CliTest.bin").read_bytes(), known_code)
             self.assertTrue((output_dir / "manifest.json").is_file())
+
+    def test_extracted_names_round_trip_length_prefixed_records(self) -> None:
+        code = bytes.fromhex("000080bf 000081bf")
+        names = (b"PS_A", b"PS_" + b"S" * 28, b"!" + b"A" * 32,
+                 b"PS_" + b"X" * 122, b"~" + b"B" * 125, b"~" + b"C" * 126)
+        legacy_name = b"PS_Legacy"
+        legacy = envelope(code, legacy_name)[1:]
+        truncated = envelope(code, b"PS_Truncated_Length_Prefix_Fixture")[:-1]
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            archive = work / "source_built.rpf"
+            archive.write_bytes(b"RPF\0" + b"".join(envelope(code, name) for name in names) + legacy + truncated)
+            output, manifest_path = extract_shaders(archive, work / "shaders", target_stages={"pixel"},
+                                                    length_prefixed_names=True)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["total_extracted"], len(names) + 1)
+            for source_name, record in zip((*names, legacy_name), manifest["shaders"], strict=True):
+                name = source_name.decode("ascii")
+                with self.subTest(length=len(source_name)):
+                    self.assertEqual(record["name"], name)
+                    self.assertEqual(record["native_file"], f"pixel/{name}.bin")
+                    self.assertEqual((output / record["native_file"]).read_bytes(), code)
+                    if source_name != legacy_name:
+                        self.assertEqual(native_program(archive, record["name"])[1], code)
+
+    def test_ambiguous_length_prefix_requires_explicit_mode(self) -> None:
+        code = bytes.fromhex("000080bf 000081bf")
+        legacy_name = b"PS_" + b"L" * 77
+        prefixed_name = legacy_name[1:]
+        data = envelope(code, legacy_name)[1:]
+        self.assertEqual(data, envelope(code, prefixed_name))
+        script = Path(__file__).resolve().parents[1] / "tools" / "extract_shaders.py"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            archive = work / "ambiguous.rpf"
+            archive.write_bytes(b"RPF\0" + data)
+            for expected_name, options in ((legacy_name, []), (prefixed_name, ["--length-prefixed-names"])):
+                name = expected_name.decode("ascii")
+                with self.subTest(options=options):
+                    output = work / name
+                    subprocess.run([sys.executable, "-B", str(script), str(archive), "--output-dir", str(output),
+                                    *options], capture_output=True, check=True)
+                    manifest_path = output / "manifest.json"
+                    record, = json.loads(manifest_path.read_text(encoding="utf-8"))["shaders"]
+                    self.assertEqual(record["name"], name)
+                    self.assertEqual(record["native_file"], f"pixel/{name}.bin")
+                    self.assertEqual((output / record["native_file"]).read_bytes(), code)
 
     def test_stage_filtering(self):
         known_code = bytes.fromhex("000080bf 000081bf")

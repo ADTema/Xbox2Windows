@@ -1,7 +1,9 @@
 """Byte-for-byte controls for logical asset reads and bounded section probes."""
 import io
+import json
 from pathlib import Path
 import struct
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -11,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from paged_resource import PagedResource, Segment
 from section_probe import inspect as inspect_sections
 from section_probe import scan_window, sections
+from texture_descriptors import inventory
 
 
 class ShortReadStream(io.BytesIO):
@@ -18,7 +21,79 @@ class ShortReadStream(io.BytesIO):
         return super().read(min(size, 3) if size >= 0 else size)
 
 
+def descriptor_archive() -> bytearray:
+    archive = bytearray(9216)
+    struct.pack_into("<4sIQ", archive, 0, b"RDS5", 3, 16384)
+    # Boundaries give stored offsets 256, 8960, 9216 and virtual offsets
+    # 0, 8192, 16384. The second chunk is outside the metadata inventory.
+    struct.pack_into("<6I", archive, 16, 1, 0x70000000, (2 << 30) | (8 << 26) | 35, 0,
+                     (5 << 26) | 36, 1)
+    struct.pack_into("<4sIII", archive, 256, b"ETPF", 0, 258, 0)
+    for index in range(257):
+        # 44x12, DXGI 99, marker byte 2 and virtual page 3.
+        struct.pack_into("<4I", archive, 272 + index * 16, 0x2C02B, 0x02000318, 3, 0)
+    # Transposed dimensions and a different format after the first 4 KiB read.
+    struct.pack_into("<4I", archive, 272 + 257 * 16, 0xAC00B, 0x238, 2, 0)
+    return archive
+
+
 class ResourceChecks(unittest.TestCase):
+    def test_texture_descriptor_inventory(self) -> None:
+        tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "synthetic.ttpf"
+            path.write_bytes(descriptor_archive())
+            result = subprocess.run([sys.executable, "-B", tool, path], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            "descriptor_count": 258,
+            "groups": [
+                {"width": 12, "height": 44, "dxgi_format": 71, "mip_marker": 0, "count": 1},
+                {"width": 44, "height": 12, "dxgi_format": 99, "mip_marker": 2, "count": 257},
+            ],
+        })
+
+    def test_texture_descriptor_bounds(self) -> None:
+        for label, offset, replacement in (
+            ("RDS5 header", 0, b"TEST"),
+            ("boundary table", 4, struct.pack("<I", 32)),
+            ("raw metadata", 16, struct.pack("<I", 1 | (8 << 26))),
+            ("stored range", 24, struct.pack("<I", (2 << 30) | 40)),
+            ("stored table length", 24, struct.pack("<I", (2 << 30) | 2)),
+            ("virtual range", 28, struct.pack("<I", 2)),
+            ("ETPF header", 256, b"JUNK"),
+            ("descriptor table", 264, struct.pack("<I", 512)),
+            ("descriptor page", 272 + 257 * 16 + 8, struct.pack("<I", 4)),
+        ):
+            with self.subTest(label=label):
+                archive = descriptor_archive()
+                archive[offset:offset + len(replacement)] = replacement
+                with self.assertRaises(ValueError):
+                    inventory(io.BytesIO(archive))
+        with self.assertRaises(ValueError):
+            inventory(io.BytesIO(descriptor_archive()[:-1]))
+
+        archive = descriptor_archive()
+        archive.extend(bytes((1 << 20) + 16384 - len(archive)))
+        struct.pack_into("<Q", archive, 8, len(archive))
+        struct.pack_into("<4I", archive, 24, (2 << 30) | 4144, 64, 4160, 65)
+        struct.pack_into("<I", archive, 264, 65537)
+        with self.assertRaisesRegex(ValueError, "budget"):
+            inventory(io.BytesIO(archive))
+
+    def test_texture_descriptor_read_scope(self) -> None:
+        class MetadataOnly(io.BytesIO):
+            def read(self, size: int = -1, /) -> bytes:
+                start = self.tell()
+                if not (0 <= size <= 4096 and
+                        (start + size <= 40 or 256 <= start <= start + size <= 272 + 258 * 16)):
+                    raise AssertionError(f"Unexpected read of {size} bytes at {start}")
+                return super().read(size)
+
+        # Following bytes need not be part of the declared archive.
+        stream = MetadataOnly(descriptor_archive() + bytes(256))
+        self.assertEqual(sum(inventory(stream).values()), 258)
+
     def test_ranges(self):
         first, middle, last = b"header", b"m" * 93, b"end"
         compressed = zlib.compress(middle)

@@ -57,6 +57,41 @@ cmake --build --preset dev --target pe_map cpu_exe_original_lifted
 ctest --preset dev --no-tests=error -R '^cpu_native_exe_chain$' -V
 ```
 
+## Pipeline readiness from shader manifests
+
+`tools/pso_readiness.py` joins the native SHA-256 and stage in the shader extraction manifest with explicit pipeline references. It counts archive records, records with a native hash and unique stage/hash pairs separately. Multiple archive records can refer to the same native code. A hash from one stage does not establish coverage in another stage.
+
+Export the archive manifest with `extract_shaders.py --format native` or `--format both`. Supply a separate JSON file containing pipeline IDs, their effective root signature status and shader references. Here's a synthetic example. The zero hash stands for a missing archive entry.
+
+```json
+{
+  "pipelines": [
+    {
+      "id": "example-pixel-pipeline",
+      "effective_root_signature": "unknown",
+      "shaders": [
+        {
+          "stage": "pixel",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Set `effective_root_signature` to `present`, `missing` or `unknown` after accounting for both the embedded signature and any signature provided by the caller. The report accepts normalized references from an inspection tool or a trace and assigns no references from archive proximity.
+
+```powershell
+python -B tools/pso_readiness.py out/shaders/manifest.json out/pipelines.json
+cmake --build --preset dev --target pso_root_check
+ctest --preset dev --no-tests=error -R '^pso_(readiness_check|root_signature_warp)$' -V
+```
+
+Add `--llvm <AMDGPU LLVM library>` to disassemble referenced native pixel code and run the existing pixel scanner and lowering probe. Each unique stage/hash pair is assessed once. A known missing root signature takes precedence over shader diagnostics. Missing references, unassessed stages and unknown signature status require more evidence. Passing the pixel probe leaves the pipeline awaiting PSO validation, since the scanner uses synthetic bindings.
+
+The WARP control compiles the source-built compute shader with its root signature stripped. D3D12 rejects creation without a root signature. The same shader creates a PSO when given the matching signature from the embedded build. The control measures PSO creation on the source-built fixture.
+
 ## Offline CPU leaf recompilation
 
 With the Python-enabled Windows dev preset configured, run:
@@ -263,17 +298,19 @@ Both desktop shaders come from offline decoding of the pinned native streams (3,
 
 The GPU test checks all 32 intermediate texels and 257 surrounding guard texels. It then compares all 256 final pixels, including edges between different colors, with an independent FP32 five-tap reference (per-channel tolerance 2.5% plus 0.00005 for packed-half arithmetic). Alpha must equal red. RTX 4060 Laptop passed using R32_UINT. WARP passed with native RGB9E5 and with forced R32_UINT. Both debug layers reported zero errors and warnings. These are controlled single-group results.
 
-From a VS x64 developer shell at the repository root, set `$upscaler` to the pinned local DLL. The middle command runs in WSL with Python 3 and libLLVM 15 installed. All extracted programs and generated shaders stay under `out/`.
+From a VS x64 developer shell at the repository root, set `$upscaler` to the pinned local DLL. The middle command needs the LLVM 15 C library. On Windows, the official LLVM 15.0.7 installer (`winget install --id LLVM.LLVM --version 15.0.7 --exact`) provides `LLVM-C.dll` with the AMDGPU disassembler, so no WSL is required. All extracted programs and generated shaders stay under `out/`.
 
 ```powershell
 ./out/pe-env/Scripts/python.exe -B tools/ffx_dispatch_profile.py $upscaler out/ffx-dispatch
-wsl -d Ubuntu-22.04 -- python3 -B tools/ffx_dispatch_aot.py out/ffx-dispatch --llvm libLLVM-15.so.1
+./out/pe-env/Scripts/python.exe -B tools/ffx_dispatch_aot.py out/ffx-dispatch --llvm "C:/Program Files/LLVM/bin/LLVM-C.dll"
+# Alternatively, in WSL with libLLVM 15 installed:
+# wsl -d Ubuntu-22.04 -- python3 -B tools/ffx_dispatch_aot.py out/ffx-dispatch --llvm libLLVM-15.so.1
 cmake --preset dev -B out/build/ffx-device "-DFFX_UPSCALER_IMAGE=$upscaler" "-DFFX_DISPATCH_SHADER_DIR=$PWD/out/ffx-dispatch"
 cmake --build out/build/ffx-device --target offscreen_check
 ctest --test-dir out/build/ffx-device -R '^ffx_provider_loop_' --no-tests=error -V
 ```
 
-The local log reports `dispatch=package-aot`. Public Windows CI runs source-built descriptor and dispatch controls on WARP (`dispatch=desktop-control`). Linux CI assembles an independent integer-coordinate regression for the translator.
+The local log reports `dispatch=package-aot`. Through the native Windows route above (LLVM 15.0.7 `LLVM-C.dll`, Python 3.14.6), the translator decoded 1152, 100, 3482 and 437 instructions for pass 24, pass 25, the producer and RCAS. `ffx_provider_loop_hardware` passed on an RTX 4070 Ti (driver 32.0.16.1088) and `ffx_provider_loop_warp` passed on WARP, both with the debug layer enabled. Each reported `dispatch=package-aot` with 256 final pixels and zero mismatches for the bypass, zero and pattern scratch cases. Public Windows CI runs source-built descriptor and dispatch controls on WARP (`dispatch=desktop-control`). Linux CI assembles an independent integer-coordinate regression for the translator.
 
 ### First pass 26 LDS write block
 
@@ -372,6 +409,8 @@ The public CTest `cpu_aot_version_query` runs the same output checks against an 
 The shared integer lowering in this tool emits flat loads and stores, so it rejects FS or GS segment overrides and LOCK prefixes instead of dropping them. A thread-block access such as `gs:[0x30]` would otherwise read absolute address 0x30, and a locked read-modify-write would lose its atomicity. Segment overrides without effect in 64-bit mode and `rep ret` lower like the bare instruction. A host operation that replaces an instruction bypasses the check. `ctest --preset dev --no-tests=error -R '^cpu_lower_prefixes$' -V` checks 11 rejected encodings and 6 accepted controls with synthetic bytes.
 
 A 67h address-size prefix selects 32-bit addressing. The lowering wraps base + index × scale + displacement at 32 bits and zero-extends the result, ignoring the upper halves of the registers as the hardware does. In this mode iced reports a displacement of -8 as `0xfffffff8`, so the wrap is also needed when the upper halves are zero. EIP-relative operands are rejected because the hardware adds the low 32 bits of the runtime RIP, which an RVA binding cannot represent. `cpu_aot_address_size` builds `lea`, load and store forms such as `lea rax, [ecx+edx*8-8]` and `mov [ecx+edx], r8d` from MASM source. It translates them and compares both images with a 32-bit reference over wrapped sums and upper-half noise. The loads and stores use a page committed below 4 GiB, and each store must leave the rest of the page unchanged. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_address_size$' -V`.
+
+An immediate SHL, SHR or SAR whose masked count is zero leaves the flags unchanged, but a 32-bit destination is still written and its upper half clears. This covers `shl eax, 0` and `shl eax, 32`, because the count is masked to five bits. The lowering keeps the flags and emits the zero-extending write. A 64-bit destination keeps every bit. `cpu_aot_shift_count` builds these forms from MASM source, together with a nonzero control. It compares the native and translated images with a reference and checks that `sete` after a zero-count shift still observes the preceding compare. Before this change the translation returned `0xdeadbeef12345678` for `shl_zero(0xdeadbeef12345678)` where the hardware returns `0x12345678`. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_shift_count$' -V`.
 
 ## Recompiling a direct x64 call
 
@@ -565,6 +604,8 @@ When `.pdata` no longer covers `select_rva`, the translation must stay unchanged
 
 On Linux, the fixture was assembled and linked with LLVM (`llvm-mc`, `lld-link`) from an equivalent GNU-syntax copy, because `llvm-ml` does not accept `IMAGEREL`. The original machine code ran in-process through an `ms_abi` call. It matched the lifted C++ built with clang on every input, for both the original and the swapped tables. The same translator also handled C switch statements compiled by clang for `x86_64-pc-windows-msvc` at `-O1` and `-O2`. Those builds have no `.pdata` for the leaves, and the loop's table base is hoisted. The generated sources compile without warnings under clang-cl `/W4 /WX`. On Windows 11 with MSVC 14.44 and ML64, `cpu_aot_jump_tables` passes: 600 selector pairs per table layout and 138 programs match, the swapped tables change 60, 60 and 99 results, and all 13 rejection controls and the leaf-without-unwind translation pass. The table labels are declared with `LABEL DWORD`, because ML64 rejects `IMAGEREL` of a code label inside a memory operand.
 
+The jump-table translator wraps a 67h (32-bit) effective address at 32 bits and zero-extends it, as the hardware does. It rejects EIP- and ESP-based operands. `cpu_aot_switch_addr32` builds `lea rax, [ecx+1]`, `lea rax, [ecx-8]`, `mov eax, [ecx-8]` and `mov [ecx+8], edx` from separate MASM source. It compares the native and translated images over wrapped sums and upper-half register noise, using a page committed below 4 GiB for the load and store. Before this change the translation returned `0x100000000` for `lea_wrap(0xffffffff)` where the hardware returns 0. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_switch_addr32$' -V`.
+
 ### Delay imports
 
 `delay_route` imports `delayed_value` from `cpu_delay_provider.dll` by name and `delayed_ordinal` by ordinal 2 with `/DELAYLOAD`, and exports one caller for each. `cpu_native_delay` compares two paths: `LoadLibrary` plus the image's own delay helper, and `pe_map` with a resolver bound to the same provider. The mapped calls return the provider values, and IAT slot checks confirm both hold the `GetProcAddress` results before the calls. Binding the altered provider returns its values instead.
@@ -596,6 +637,8 @@ On Windows, use the Python-enabled build from the project README. Each backend d
 The same binary and draw checks cover `v_trunc_f32` in e32 and e64 forms. The lowerer emits HLSL `trunc`, which rounds toward zero and returns a floating-point value. With two constant sets, the RTX 5080 and WARP draws matched all four channels of 4,096 pixels per draw against the CPU reference. The fixture covers both signs, signed zero, source negation and absolute value, and both clamp bounds. Replacing truncation with floor changed the first pixel on both adapters. Removing the upper clamp changed alpha from 1 to 2 in the first pixel on WARP. The source-built fixture verifies desktop readback with the bindings above. Execution with a title's own pipeline state remains unverified.
 
 To supply a reference for another arithmetic program, run `offscreen_check.exe hardware --check-pixel-case shader.cso reference.case`. The case contains 256 bytes of constants followed by 64 expected RGBA colors in row-major little-endian binary32, one for each texel of the test texture. Generate the expected colors after round-toward-zero half export and widening back to float.
+
+`v_fract_f32` returns x - floor(x) clamped to `0x3f7fffff`, so its result stays below 1.0. The lowering uses an explicit clamp, not a bare D3D `frac`, which has no clamp and differs between adapters. For an input of -2^-30 the unclamped difference rounds to 1.0. An RTX 4070 Ti (driver 32.0.16.1088) exported 1.0 for that input, while WARP 10.0.26100.9818 already exported the clamped value. The draw also checks -0.25, 2.75 and -2^-23, which stay below the clamp. A reference that expects 1.0 for the first input must report a mismatch. NaN still propagates: it fails the clamp comparison.
 
 ```powershell
 ctest --preset dev -R '^pixel_aot_' -V
@@ -659,11 +702,11 @@ On Windows build 26200, the pre-executable inventory covered 16 package DLLs and
 
 The desktop handling is:
 
-- **Heap (memory type 0):** served from the CRT heap at the requested alignment, minimum 16 bytes, and zero-filled. The page size does not affect these requests.
+- **Heap (memory type 0):** served from the CRT heap at the requested alignment, minimum 16 bytes, and zero-filled. The page size does not affect these requests. SlimEra passes every heap request to `_aligned_malloc`, which commits the alignment padding as heap memory, so a 257-byte request with exponent 31 would commit more than 2 GiB. The desktop handler instead gives alignments above the page size their own reservation and commits only the pages that hold the payload; `VirtualAlloc` returns them zeroed.
 - **Graphics (memory types 1–6):** committed as a separate `VirtualAlloc` region. `release_with_attributes` frees it with `VirtualFree`. The region starts on the desktop allocation granularity, which covers 4 KB and 64 KB pages. This is ordinary CPU-visible memory; no GPU mapping or caching behavior is modeled.
 - **Rejected:** physical memory types 7–9, undefined types 10–15, the undefined page-size value 3, reserved bits, and graphics requests whose page size or alignment exceeds the allocation granularity all return a null pointer.
 
-`release` frees heap allocations as before. `release_with_attributes` takes the allocation's attribute word, as `XMemFree` callers do.
+`release` frees heap allocations. It frees a page-backed block with `VirtualFree` when `VirtualQuery` reports it as the base of its own allocation; a CRT block never is, because `_aligned_malloc` stores its base pointer below the returned address. `release_with_attributes` takes the allocation's attribute word, as `XMemFree` callers do.
 
 What is measured is the desktop behavior above. Under the ERA layout, the two recorded words give alignments that match their callers' own arithmetic: 32 bytes for Bink and 256 bytes for AMD. The following remain unconfirmed on Scarlett:
 
@@ -680,6 +723,7 @@ What is measured is the desktop behavior above. Under the ERA layout, the two re
 | `era_heap_failure` | Each reserved bit, combined with a heap alignment and with the AMD graphics word, returns a null pointer. So do memory types 7–15, page-size value 3, graphics memory with 4 MB pages or a 128 KiB alignment, zero size and excessive size. |
 | `era_heap_reuse` | For three alignment exponents and three sizes, fill a block with `0xa5` and release it. Then hold up to 32 new blocks of the same shape until the released address returns. Every new block must read as zero. The output reports `recycled_address`, the number of the nine cases in which the CRT returned the dirty address. glibc returned all nine in a Linux build with a `posix_memalign` stand-in. Windows 11 build 26200.9974 with MSVC 14.44.35207 returned the dirty address in all nine cases in both Debug and Release. Low-fragmentation heap randomization can lower it. |
 | `era_heap_observed_words` | Desktop handling of the two recorded words. Under the ERA layout, the Bink word `0x05e50000` splits into heap memory, 4 KB pages, allocator field `0xe5` and 32-byte alignment. The AMD word `0xa8004000` splits into memory type 5, 64 KB pages, allocator field 0 and 256-byte alignment. Bink-style 97- and 193-byte blocks are 32-byte aligned and zeroed, and each wrapper recovers its base. AMD-rounded requests of 256 to 65,792 bytes start a committed read-write region on a 64 KiB boundary and are zeroed and writable. After release, `VirtualQuery` reports the region as free. Nonzero object-type and allocator tags leave heap placement unchanged. |
+| `era_heap_large_alignment` | Exponents 13, 16, 17, 20 and 31 with sizes of 1 and 257 bytes, one page, one page plus one byte and three pages minus one byte. Each block must be aligned and zeroed. `VirtualQuery` must report the block as the base of its own private read/write allocation, with a committed region equal to the payload rounded up to whole pages. After release the address must be `MEM_FREE`. The output reports the 25 cases, the committed bytes and the summed alignments. With the previous `_aligned_malloc` path, the first case already fails because the block lies inside a CRT heap allocation. |
 | `era_heap_concurrency` | Four threads run 100 rounds each. They hold simultaneous allocations, write distinct values, compare every byte and release the memory. |
 | `era_heap_caller_layout` | Owned desktop storage covers all 32 base residues at eight payload sizes. Each Bink-style wrapper recovers its original base after a payload write and preserves the surrounding guard bytes. Ten AMD-style requests check 256-byte size rounding and the unused tail. These cases establish caller-side arithmetic. The Bink-style storage uses the recorded Bink word. |
 
@@ -753,7 +797,7 @@ ctest --test-dir out/build/w10 --no-tests=error
 
 `OFFSCREEN_WARP_DIR` requires `OFFSCREEN_AGILITY_620_DIR`. On the in-box runtime, WARP 1.0.22 reports DXR tier 1.2, but `dxr_query_warp`, `dxr_update_warp` and `bvh_differential_warp` fail with every ray reported as a miss. With the Agility runtime the same WARP passes them. Configuring the same build directory again without `OFFSCREEN_WARP_DIR` deletes the copied `d3d10warp.dll`, so `offscreen_check` goes back to the in-box WARP. `app_local_warp_toggle` checks this with a stand-in DLL.
 
-In this configuration all `bvh_*_warp`, `dxr_*_warp` and `bvh_differential_warp` tests pass, and the hardware wave64 check skips at its 32-lane range with SM 6.6 available. `bvh_wave64_warp` now runs and fails at field 25, `WaveReadLaneAt(v, (lane*7+3) % 64)`. In two groups, all 128 lanes received the value of lane m where `7m+3 ≡ lane (mod 64)`, which is the inverse of the requested shuffle. Field 24's shuffle, the mirror read and the native-width run pass. At WARP's native width of 8, `7n+3 ≡ 3-n (mod 8)` is self-inverse, so the default `bvh_waves_warp` cannot show the difference. [Open question](https://github.com/R0Y00/Xbox2Windows/issues/145)
+In this configuration all `bvh_*_warp`, `dxr_*_warp` and `bvh_differential_warp` tests pass, and the hardware wave64 check skips at its 32-lane range with SM 6.6 available. `bvh_wave64_warp` now runs and fails at field 25, `WaveReadLaneAt(v, (lane*7+3) % 64)`. In two groups, all 128 lanes received the value of lane m where `7m+3 ≡ lane (mod 64)`, which is the inverse of the requested shuffle. Field 24's shuffle, the mirror read and the native-width run pass. At WARP's native width of 8, `7n+3 ≡ 3-n (mod 8)` is self-inverse, so the default `bvh_waves_warp` cannot show the difference. `wave_shuffle_warp` narrows the cause. WARP 1.0.22 runs a forced wave as blocks of its native 8 lanes, and it picks the source block using the request of the wrong lane: the lane of the reader's block that sits at the requested position. For this shuffle that equals the inverse permutation. A rotation by one lane gets 16 of 64 reads wrong at widths 16, 32 and 64, and none of them match its inverse. Reads where every lane of a block requests the same source block are unaffected. [Open question](https://github.com/R0Y00/Xbox2Windows/issues/145)
 
 ## Mapped DLL draw with a Windows reference
 
@@ -1095,7 +1139,7 @@ ctest --preset dev -R '^bc7_draw_' -V
 .\out\build\dev\offscreen_check.exe hardware --check-bc7-tail copy.cso 3 mip3.case mip4.case mip5.case mip6.case mip7.case
 ```
 
-The tail check uses one logical texture per draw. It uploads all supplied consecutive levels at their original subresource indices and sets the SRV's `MostDetailedMip` to the first supplied level. The command above takes a 64×64 first resident level and tests viewports from 512×512 down to 4×4. Point sampling at the three largest sizes must reproduce magnified pixels from the 64×64 reference. Each smaller viewport must match its own reference. The test uses committed resources and measures sampling correctness.
+The tail check uses one logical texture per draw. For a tail whose resident width or height has already reached one texel, specify the original logical dimensions with `--base-size WIDTH HEIGHT` immediately after the first resident mip index. Without this option the command shifts both first-resident dimensions left by that index. For a magnified fallback pixel exactly on a source texel boundary, the readback must match one complete neighboring RGBA texel. It uploads all supplied consecutive levels at their original subresource indices and sets the SRV's `MostDetailedMip` to the first supplied level. The command above takes a 64×64 first resident level and tests viewports from 512×512 down to 4×4. Point sampling at the three largest sizes must reproduce magnified pixels from the 64×64 reference. Each smaller viewport must match its own reference. The test uses committed resources and measures sampling correctness.
 
 To check a proposed first read round in the BCPack probe, append `--prefetch-mask MASK`. Set bit *i* for each of the first eight lanes expected to read a byte in that round. The probe uses the proposed lane order to locate the byte and compares it with the last byte emitted by the reverse encoder. A matching first byte tests a single refill prediction. `--next-mask MASK` supplies the immediately following round in the same way. Each constant lane takes its next refill byte in every round in which its bit is set, so a lane that skips the first round takes its first refill byte from the second. A read beyond the lane's header budget is listed under `unbudgeted_read_offsets` instead of being ignored. Refill positions after these two rounds and the assignment of BC7 block fields require separate evidence.
 
@@ -1115,6 +1159,8 @@ The optional capture contains verified, top-down RGBA8 pixels converted from the
 ### Reading logical ranges and probing structured resources
 
 `tools/paged_resource.py` reads a logical byte range from an open archive and a supplied segment map. Each segment gives a physical offset, stored byte count excluding padding, decoded byte count, and codec. Raw and zlib segments may be mixed. The reader verifies the complete compressed stream and decoded size before returning bytes from it. Reads that touch an unknown codec fail. Segments after it remain independently addressable.
+
+Run `python -B tools/texture_descriptors.py <archive.ttpf>` to group descriptors in the first raw ETPF table by width, height, DXGI format number and mip-marker byte. The reader checks stored and logical bounds and reads up to 1 MiB of descriptors in batches of at most 4 KiB. It leaves texture payloads unread. The marker alone does not identify a resident mip. [Published descriptor layout](https://github.com/rpatty-dev/PercyStar/blob/1b710c5349ef1911d94092f19173e9813dfb300c/src/tex.rs#L748-L785)
 
 `tools/section_probe.py` samples up to 8 MiB at the start, middle and end of each input. It looks for 16-byte-aligned zlib streams, with stored and decoded sizes capped at 256 KiB. A section record must start and end with the requested tags, and its big-endian section sizes must exactly cover the decoded buffer. Streams cut off by a window or size cap are omitted. Counts establish record boundaries within sampled regions. Interpreting payload fields or validating a checksum inside a section requires its format.
 
@@ -1136,6 +1182,8 @@ ctest --preset dev -R 'dual_uav|texture_mips|bvh_waves|bvh_wave64' -V
 ### Optional compressed-record inventory
 
 Run the following after building the native validator. The optional pass scans named records in the shader archive, decodes one raw-DEFLATE stream at a time and writes only aggregate metadata to the resource report. A candidate must fit the file, have matching stored sizes, reach the stream end, match the declared output length and contain a bounded DXBC section table with a DXIL program header. The pass caps stored and decoded spans at 8 MiB and 16 MiB. It records shader stages, section counts, LLVM bitcode framing, unused bytes at stream end and rejection reasons. The native validator samples the first accepted container per stage. These are content-based counts and depend on the recognized record format. [External record-format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/shader_carve.py)
+
+Use `tools/extract_shaders.py --length-prefixed-names` with archives whose record names begin with a one-byte length that includes the NUL terminator. A printable length byte can also be a valid first character of a prefixless name. The extractor keeps the full printable run by default.
 
 ```powershell
 python -B tools/resource_inventory.py "game-files/<build-directory>" --scene-records --scene-validator out/build/dev/root_probe.exe
