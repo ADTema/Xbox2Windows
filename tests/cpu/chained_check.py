@@ -15,13 +15,16 @@ from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges
 
 
-def check(native, compiled, harness, native_jne=None, compiled_jne=None, native_zero=None, compiled_zero=None):
+def check(native, compiled, harness, native_jne=None, compiled_jne=None,
+          native_zero=None, compiled_zero=None, native_imm=None, compiled_imm=None):
     probe = register_probe(str(harness))
     pairs = [(native, compiled, 7)]
     if native_jne is not None and compiled_jne is not None:
         pairs.append((native_jne, compiled_jne, 7))
     if native_zero is not None and compiled_zero is not None:
         pairs.append((native_zero, compiled_zero, 0))
+    if native_imm is not None and compiled_imm is not None:
+        pairs.append((native_imm, compiled_imm, 7))
     for orig_path, lifted_path, null_expected in pairs:
         source = ctypes.CDLL(str(orig_path)).choose_value
         lifted = ctypes.CDLL(str(lifted_path)).try_lifted
@@ -61,7 +64,8 @@ def check(native, compiled, harness, native_jne=None, compiled_jne=None, native_
                  (header_offset, bytes([(4 << 3) | 3]), "unsupported chained unwind header"),
                  (header_offset, bytes([(5 << 3) | 2]), "unsupported chained unwind header"),
                  (jump_opcode_offset, b"\x78", "expected JE or JNE after TEST"),
-                 (move_offset, bytes.fromhex("31 c8 90 90 90"), "unsupported operation")]
+                 (move_offset, bytes.fromhex("31 c8 90 90 90"), "unsupported operation"),
+                 (move_offset, bytes.fromhex("bf 15 00 00 00"), "unrestored state")]
     with TemporaryDirectory() as folder:
         for offset, patch, reason in controls:
             damaged = bytearray(data)
@@ -94,7 +98,7 @@ def check(native, compiled, harness, native_jne=None, compiled_jne=None, native_
                 raise
         else:
             raise AssertionError("strict translation accepted an indirect call")
-    print("two null paths, two non-null inputs (JE, JNE and XOR zeroing), RBX/RSI, guarded writes, version-2 chained unwind and nine rejection controls passed")
+    print("two null paths, two non-null inputs (JE, JNE, XOR zeroing and 32-bit immediates), RBX/RSI, guarded writes, version-2 chained unwind and ten rejection controls passed")
 
 
 if __name__ == "__main__":

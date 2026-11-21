@@ -28,6 +28,9 @@ ELSE
 IFDEF USE_XOR_ZERO
     xor rdx, rdx
     lea rax, [rdx + 21]
+ELSEIFDEF USE_IMM_REG
+    mov r8d, 21
+    mov rax, r8
 ELSE
     mov eax, 21
 ENDIF
@@ -43,6 +46,9 @@ neighbor_end LABEL BYTE
 empty_value::
 IFDEF USE_XOR_ZERO
     xor eax, eax
+ELSEIFDEF USE_IMM_REG
+    mov edx, 7
+    mov rax, rdx
 ELSE
     mov eax, 7
 ENDIF
