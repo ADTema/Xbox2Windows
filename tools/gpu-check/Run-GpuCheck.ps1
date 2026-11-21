@@ -125,6 +125,6 @@ $report.Add('')
 $report | Write-Output
 [IO.File]::WriteAllLines($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReportPath), $report)
 Write-Output "Saved report: $ReportPath"
-Write-Output "Paste this report as a comment on $threadUrl — do not open a new issue."
+Write-Output "Paste this report as a comment on $threadUrl - do not open a new issue."
 if ($failed) { exit 1 }
 exit 0

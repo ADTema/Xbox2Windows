@@ -114,6 +114,14 @@ class GpuReportFormatChecks(unittest.TestCase):
         self.assertIn("### Submit this report", text)
         self.assertIn(THREAD_URL, text)
 
+    def test_powershell_scripts_are_ascii_for_windows_powershell(self):
+        # Windows PowerShell 5.1 reads BOM-less scripts as the ANSI code page,
+        # so a UTF-8 dash or curly quote can end a string early.
+        for path in (RUNNER, PACKAGE):
+            for number, line in enumerate(path.read_bytes().splitlines(), 1):
+                with self.subTest(path=path.name, line=number):
+                    self.assertTrue(line.isascii(), line.decode("utf-8", "replace"))
+
     def test_instructions_say_not_to_open_a_new_issue(self):
         for path in (README, PACKAGE_README):
             text = path.read_text(encoding="utf-8")
