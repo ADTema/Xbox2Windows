@@ -327,6 +327,15 @@ if(EXISTS "${INTAKE_PYTHON}")
         target_link_options(cpu_call_${variant}_lifted PRIVATE /INCREMENTAL:NO)
     endforeach()
     target_compile_definitions(cpu_call_altered PRIVATE ALTER_RETURN)
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_repeat_${variant} repeat_call)
+        cpu_translation(cpu_repeat_${variant} cpu_call_aot call_twice)
+        target_link_options(cpu_repeat_${variant}_lifted PRIVATE /INCREMENTAL:NO)
+    endforeach()
+    target_compile_definitions(cpu_repeat_altered PRIVATE ALTER_RETURN)
+    # Translation must reject this copy, which omits the trace-pointer reload.
+    cpu_asm_fixture(cpu_repeat_dropped repeat_call)
+    target_compile_definitions(cpu_repeat_dropped PRIVATE DROP_RELOAD)
     cpu_asm_fixture(cpu_register_probe register_probe)
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_switch_${variant} switch)
@@ -479,6 +488,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/direct_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_call_original>" "$<TARGET_FILE:cpu_call_original_lifted>"
         "$<TARGET_FILE:cpu_call_altered_lifted>")
+    add_test(NAME cpu_aot_repeated_call COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/repeat_call_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_repeat_original>" "$<TARGET_FILE:cpu_repeat_original_lifted>"
+        "$<TARGET_FILE:cpu_repeat_altered_lifted>" "$<TARGET_FILE:cpu_repeat_dropped>")
     foreach(kind IN ITEMS named ordinal)
         if(kind STREQUAL "named")
             set(prefix cpu_import)
