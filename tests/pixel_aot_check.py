@@ -179,6 +179,16 @@ def shaping():
     ])
 
 
+def truncate_values() -> list[str]:
+    return with_constants([
+        "v_add_f32_e32 v12, s44, v12",
+        "v_trunc_f32_e32 v12, v12",
+        "v_trunc_f32_e32 v13, s45",
+        "v_trunc_f32_e64 v14, -|s46|",
+        "v_trunc_f32_e64 v15, s47 clamp",
+    ])
+
+
 def select(wave64=False):
     """Compare into lane masks and select; LLVM names the masks by wavefront width."""
     vcc, first, second = ("vcc", "s[52:53]", "s[54:55]") if wave64 else ("vcc_lo", "s52", "s53")
@@ -383,6 +393,22 @@ def shaping_case(directory, gain):
     return path
 
 
+def truncate_case(directory: Path, bias: float, green: float, blue: float, alpha: float) -> Path:
+    case = bytearray(256)
+    struct.pack_into("<4f", case, 12, bias, green, blue, alpha)
+    # modf returns the integer component as a float and preserves the sign of zero.
+    green = math.modf(green)[1]
+    blue = math.modf(-abs(blue))[1]
+    alpha = max(0.0, min(1.0, math.modf(alpha)[1]))
+    for _ in RAMP:
+        for x in RAMP:
+            red = math.modf(bias + x / 255)[1]
+            case.extend(struct.pack("<4f", red, green, blue, alpha))
+    path = directory / "truncate.case"
+    path.write_bytes(case)
+    return path
+
+
 def absolute_case(directory):
     case = bytearray(256)
     for y in RAMP:
@@ -479,6 +505,15 @@ def check_controls(directory):
     for old, new in (("v_sqrt_f32_e32 v18, v18", "v_sqrt_f32_e32 v18, v18, v18"),
                      ("v_add_f32_e32 v19, s44, v13", "v_add_f32_e32 v19, v13")):
         must_reject(translate, [line.replace(old, new) for line in shaping()])
+
+    program = truncate_values()
+    source = translate(program)
+    assert "trunc(params[1].x)" in source
+    must_reject(translate, [line.replace("v13, s45", "v13, s45, v12") for line in program])
+    wait = program.index("s_waitcnt vmcnt(0)")
+    program.remove("v_trunc_f32_e32 v13, s45")
+    program.insert(wait, "v_trunc_f32_e32 v13, s45")
+    must_reject(translate, program)
 
     program = absolute_value()
     alternate = [line.replace("|v12|", "abs(v12)") for line in program]
@@ -579,7 +614,7 @@ def check_controls(directory):
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
-                (arithmetic(), translate), (with_scalar_constant_reads(), translate)]
+                (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
@@ -656,6 +691,20 @@ def check_render(directory, compiler, renderer, backend):
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError("Stale reference accepted after changing the bound constants")
+
+    program = truncate_values()
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    for constants in ((1.75, -1.75, -2.75, 2.75), (-1.75, 2.75, 3.75, -1.75)):
+        case = truncate_case(directory, *constants)
+        draw = [renderer, backend, "--check-pixel-case", shader, case]
+        subprocess.run(draw, check=True)
+    rounded_down = [line.replace("v_trunc_f32", "v_floor_f32") for line in program]
+    source.write_text(translate(rounded_down), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Rounding toward negative infinity escaped detection")
 
     program = absolute_value()
     case = absolute_case(directory)
