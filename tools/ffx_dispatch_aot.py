@@ -48,7 +48,7 @@ def assign(names, values):
 OPS = {
     "mulk_i32": "{d}*{0}", "sub_nc_u32": "{0}-{1}", "min_u32": "min({0},{1})",
     "mul_hi_u32": "mul_high({0},{1})",
-    "add_lshl_u32": "({0}+{1})<<{2}", "cndmask_b32": "{2}?{1}:{0}",
+    "add_lshl_u32": "({0}+{1})<<{2}", "cndmask_b32": "{2}?{1}:{0}", "cselect_b32": "scc?{0}:{1}",
     "mov_b32": "{0}", "movk_i32": "{0}", "add_u32": "{0}+{1}", "add_nc_u32": "{0}+{1}",
     "addk_i32": "{d}+{0}", "sub_i32": "{0}-{1}", "subrev_nc_u32": "{1}-{0}",
     "mul_i32": "{0}*{1}", "mul_lo_u32": "{0}*{1}", "mul_u32_u24": "({0}&0xffffff)*({1}&0xffffff)",
@@ -147,7 +147,10 @@ def alu(mn, tokens, mods):
         if mods == "mul:2":
             expr = f"2.0*({expr})"
         return f"{dest} = asuint({expr});"
-    return f"{dest} = {OPS[op].format(*args, d=dest)};"
+    stmt = f"{dest} = {OPS[op].format(*args, d=dest)};"
+    if mn.startswith("s_bfe_"):
+        stmt += f" scc = {dest} != 0u;"
+    return stmt
 
 
 # An 8x4 active tile uses an aligned 8x8 output tensor. Exposure is one
@@ -202,7 +205,7 @@ def predecessor(name, instructions, initializer):
              f'[numthreads({threads},1,1)] void main(uint3 group:SV_GroupID,uint lane:SV_GroupIndex) {{',
              "uint " + ",".join(f"s{i}=0" for i in range(64)) + ";",
              "uint " + ",".join(f"v{i}=0" for i in range(64)) + ";",
-             "uint vcc_lo=0,exec_lo=1; v0=lane; s14=group.x; s15=group.y;"]
+             "uint scc=0,vcc_lo=0,exec_lo=1; v0=lane; s14=group.x; s15=group.y;"]
     for pc, instruction in instructions:
         mn, _, rest = instruction.partition(" ")
         pieces = re.split(r" (?=\w+:)", rest, maxsplit=1)
