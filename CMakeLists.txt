@@ -17,7 +17,7 @@ add_test(NAME desktop_bvh_root_flags COMMAND d3d12_sdk_check bvh-flags)
 add_executable(era_heap_check tests/era_heap_check.cpp src/era_heap.cpp)
 target_include_directories(era_heap_check PRIVATE src)
 target_compile_features(era_heap_check PRIVATE cxx_std_20)
-foreach(scenario IN ITEMS allocation failure concurrency caller_layout)
+foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse)
     add_test(NAME era_heap_${scenario} COMMAND era_heap_check ${scenario})
 endforeach()
 
@@ -413,6 +413,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         --ordinal-control "$<TARGET_FILE:cpu_import_provider>")
     cpu_asm_fixture(cpu_reloc_original reloc_route)
     target_link_libraries(cpu_reloc_original PRIVATE cpu_import_provider)
+    cpu_asm_fixture(cpu_two_imports two_imports)
+    target_link_libraries(cpu_two_imports PRIVATE cpu_import_provider cpu_register_probe)
     add_library(pe_map SHARED tools/pe_map.cpp)
     target_compile_features(pe_map PRIVATE cxx_std_17)
     add_test(NAME cpu_native_map COMMAND "${INTAKE_PYTHON}" -B
@@ -423,7 +425,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         --ordinal "$<TARGET_FILE:cpu_ordinal_original>" "$<TARGET_FILE:cpu_ordinal_original_lifted>"
             "$<TARGET_FILE:cpu_ordinal_provider>" "$<TARGET_FILE:cpu_ordinal_altered>"
         --reloc "$<TARGET_FILE:cpu_reloc_original>" "$<TARGET_FILE:cpu_import_provider>"
-            "$<TARGET_FILE:cpu_import_altered>")
+            "$<TARGET_FILE:cpu_import_altered>"
+        --two "$<TARGET_FILE:cpu_two_imports>" "$<TARGET_FILE:cpu_import_provider>"
+            "$<TARGET_FILE:cpu_register_probe>")
     cpu_asm_fixture(cpu_seh_original seh_route)
     add_test(NAME cpu_native_seh COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_seh_check.py" "$<TARGET_FILE:cpu_seh_original>"
