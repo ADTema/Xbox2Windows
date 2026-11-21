@@ -33,6 +33,18 @@ foreach(scenario IN ITEMS fields tail registry short)
     add_test(NAME era_query_${scenario} COMMAND era_query_check ${scenario})
 endforeach()
 
+# Desktop xmem.dll for the package DLLs' four named xmem imports.
+add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/era_heap.cpp src/era_query.cpp)
+set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
+target_include_directories(xmem_shim PRIVATE src)
+target_compile_features(xmem_shim PRIVATE cxx_std_20)
+add_executable(xmem_shim_check tests/xmem_shim_check.cpp)
+target_link_libraries(xmem_shim_check PRIVATE xmem_shim)
+target_compile_features(xmem_shim_check PRIVATE cxx_std_17)
+foreach(scenario IN ITEMS exports allocation query working_set)
+    add_test(NAME xmem_shim_${scenario} COMMAND xmem_shim_check ${scenario})
+endforeach()
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
