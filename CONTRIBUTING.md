@@ -2,6 +2,8 @@
 
 You can contribute a hardware result, a source-built failing case, a documentation fix or a patch from an x64 Windows PC. Our Xbox Series X case study supplies research questions. The shared regression suite runs with public tools and fixtures built from this repository.
 
+Visit [GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions) and follow the [pinned newcomer guide](https://github.com/R0Y00/Xbox2Windows/discussions/75) to get started. For build or debugging help, post the commit, command and observed result in [Development Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a).
+
 ## Find and claim a task
 
 1. Search the [issue tracker](https://github.com/R0Y00/Xbox2Windows/issues) for the test name or observed behavior. Issues labeled **good first issue** have a small first step. **help wanted** marks work that can proceed independently.
