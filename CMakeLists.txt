@@ -677,6 +677,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(bc7_draw_${adapter} PROPERTIES TIMEOUT 60)
     endforeach()
     set_tests_properties(cpu_native_frame_hardware pixel_aot_hardware bc7_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    foreach(adapter IN ITEMS hardware warp)
+        # The gfx programs this test translated, for tools/form_coverage.py.
+        set_tests_properties(pixel_aot_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_${adapter}.txt")
+    endforeach()
     add_test(NAME compressed_scene_metadata COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/scene_records_check.py" "${CMAKE_CURRENT_BINARY_DIR}/DualUav.cso"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.cso" "$<TARGET_FILE:root_probe>")
