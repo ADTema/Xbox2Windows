@@ -301,6 +301,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     target_compile_definitions(cpu_call_altered PRIVATE ALTER_RETURN)
     cpu_asm_fixture(cpu_register_probe register_probe)
+    foreach(variant IN ITEMS original swapped)
+        cpu_asm_fixture(cpu_switch_${variant} switch)
+        cpu_translation(cpu_switch_${variant} cpu_switch_aot select_rva,select_rel,run_ops,shift_narrow)
+    endforeach()
+    target_compile_definitions(cpu_switch_swapped PRIVATE SWAP_TABLE)
+    add_test(NAME cpu_aot_jump_tables COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_original>" "$<TARGET_FILE:cpu_switch_original_lifted>"
+        "$<TARGET_FILE:cpu_switch_swapped_lifted>")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_callback callback)
@@ -490,7 +499,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME shader_metadata_probe COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/shader_probe_check.py" "$<TARGET_FILE:root_probe>"
         "${CMAKE_CURRENT_BINARY_DIR}/compute_root.cso" "${CMAKE_CURRENT_BINARY_DIR}/compute_tables.cso"
-        "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.cso")
+        "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.cso" "${DXC_BIN_DIR}/dxil.dll")
+    set_tests_properties(shader_metadata_probe PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME shader_metadata_controls COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/shader_probe_check.py")
     add_test(NAME conditional_import_paths COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/intake/paths_check.py")
     add_library(intake_provider SHARED tests/intake/provider.cpp tests/intake/provider.def)
     add_library(intake_delay SHARED tests/intake/provider.cpp tests/intake/delay.def)
@@ -517,4 +528,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:intake_forward>" "$<TARGET_FILE:intake_provider>")
     add_test(NAME layout_chunk_summary COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/layout_chunks_check.py")
+else()
+    message(WARNING
+        "Python-driven tests, including the CPU fixtures, are disabled because "
+        "INTAKE_PYTHON was not found at '${INTAKE_PYTHON}'. "
+        "Follow the Python setup under First build in README.md, or set INTAKE_PYTHON "
+        "to an interpreter with requirements-dev.txt installed. Then rerun CMake.")
 endif()
