@@ -375,8 +375,11 @@ int main(int argc, char** argv)
 #ifdef OFFSCREEN_AGILITY_620
         ComPtr<ID3D12DeviceFactory> device_factory;
         check(D3D12GetInterface(CLSID_D3D12DeviceFactory, IID_PPV_ARGS(&device_factory)), "Load device factory");
-        check(device_factory->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&debug)),
-              "Load app-local debug layer");
+        // Without Graphics Tools (for example on a default Windows 10 install) the debug layer reports
+        // DXGI_ERROR_SDK_COMPONENT_MISSING even with the SDK layers app-local. The runtime itself still
+        // loads, so continue without the layer and report it as unavailable. Other failures stay fatal.
+        const HRESULT debug_hr = device_factory->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&debug));
+        if (debug_hr != DXGI_ERROR_SDK_COMPONENT_MISSING) check(debug_hr, "Load app-local debug layer");
 #else
         D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
 #endif

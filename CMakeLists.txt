@@ -65,6 +65,19 @@ if(OFFSCREEN_AGILITY_620_DIR)
     endforeach()
     target_compile_definitions(offscreen_check PRIVATE OFFSCREEN_AGILITY_620)
 endif()
+set(OFFSCREEN_WARP_DIR "" CACHE PATH "Directory containing an app-local x64 d3d10warp.dll (Microsoft.Direct3D.WARP)")
+if(OFFSCREEN_WARP_DIR)
+    # On the Windows 10 in-box runtime, WARP 1.0.22 reports DXR tier 1.2 but every ray query misses.
+    # With the Agility SDK runtime the same WARP passes the DXR checks, so require both together.
+    if(NOT OFFSCREEN_AGILITY_620_DIR)
+        message(FATAL_ERROR "OFFSCREEN_WARP_DIR requires OFFSCREEN_AGILITY_620_DIR. "
+                "An app-local WARP on the in-box D3D12 runtime gives wrong ray query results.")
+    endif()
+endif()
+include(cmake/app_local_warp.cmake)
+offscreen_app_local_warp("${OFFSCREEN_WARP_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+add_test(NAME app_local_warp_toggle COMMAND "${CMAKE_COMMAND}" "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
+    "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/app_local_warp_check" -P "${CMAKE_SOURCE_DIR}/tests/app_local_warp_check.cmake")
 foreach(stage IN ITEMS vs ps)
     string(TOUPPER "${stage}" entry)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/triangle_${stage}.h")

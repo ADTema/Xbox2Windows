@@ -670,6 +670,28 @@ A local scan of the inspected package's 16 DLLs together with this `xmem.dll` (`
 
 The original test machine had Windows Graphics Tools installed. A second build in `out/build/agility` used Microsoft Agility SDK 1.620.2. Set `-DOFFSCREEN_AGILITY_620_DIR=<directory containing the x64 SDK DLLs>` to reproduce it. This configuration verifies debug interface activation. [Agility SDK package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
 
+### Windows 10 with the app-local Agility SDK and WARP
+
+The Windows 10 22H2 in-box runtime caps an RTX 3060 at SM 6.5 and the in-box WARP (10.0.19041) at SM 6.2 with no DXR, so the `cs_6_5` BVH fixtures, the DXR checks and forced wave64 skip there. Without Graphics Tools, the debug layer reports `DXGI_ERROR_SDK_COMPONENT_MISSING` even when the SDK layers are app-local. The Agility build therefore continues with `debug_layer=unavailable` for that one result, and other debug-layer failures still stop the test. Capabilities reported on Windows 10 19045.6466:
+
+| Runtime | RTX 3060 (32.0.15.9636) | WARP |
+|---|---|---|
+| In-box | SM 6.5, DXR tier 1.2, 32 lanes | 10.0.19041: SM 6.2, no DXR, 4 lanes |
+| Agility SDK 1.620.2 | SM 6.8, DXR tier 1.2, 32 lanes | 10.0.19041: SM 6.2, no DXR, 4 lanes |
+| Agility SDK 1.620.2 and WARP 1.0.22 | SM 6.8, DXR tier 1.2, 32 lanes | 1.0.22: SM 6.8, DXR tier 1.2, 4 to 128 lanes |
+
+Extract the [Agility SDK](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2) and [WARP](https://www.nuget.org/packages/Microsoft.Direct3D.WARP/1.0.22) packages, then configure with both directories. The Agility directory holds `D3D12Core.dll`, `d3d12SDKLayers.dll` and the package renamed to `sdk.nupkg`. The WARP directory is the package's `build/native/bin/x64`:
+
+```powershell
+cmake --preset dev -B out/build/w10 -DOFFSCREEN_AGILITY_620_DIR=<agility dir> -DOFFSCREEN_WARP_DIR=<warp dir>
+cmake --build out/build/w10
+ctest --test-dir out/build/w10 --no-tests=error
+```
+
+`OFFSCREEN_WARP_DIR` requires `OFFSCREEN_AGILITY_620_DIR`. On the in-box runtime, WARP 1.0.22 reports DXR tier 1.2, but `dxr_query_warp`, `dxr_update_warp` and `bvh_differential_warp` fail with every ray reported as a miss. With the Agility runtime the same WARP passes them. Configuring the same build directory again without `OFFSCREEN_WARP_DIR` deletes the copied `d3d10warp.dll`, so `offscreen_check` goes back to the in-box WARP. `app_local_warp_toggle` checks this with a stand-in DLL.
+
+In this configuration all `bvh_*_warp`, `dxr_*_warp` and `bvh_differential_warp` tests pass, and the hardware wave64 check skips at its 32-lane range with SM 6.6 available. `bvh_wave64_warp` now runs and fails at field 25, `WaveReadLaneAt(v, (lane*7+3) % 64)`. In two groups, all 128 lanes received the value of lane m where `7m+3 ≡ lane (mod 64)`, which is the inverse of the requested shuffle. Field 24's shuffle, the mirror read and the native-width run pass. At WARP's native width of 8, `7n+3 ≡ 3-n (mod 8)` is self-inverse, so the default `bvh_waves_warp` cannot show the difference. [Open question](https://github.com/R0Y00/Xbox2Windows/issues/145)
+
 ## Mapped DLL draw with a Windows reference
 
 `cpu_native_frame_hardware` and `cpu_native_frame_warp` load the same source-built DLL with `LoadLibraryW` and with `pe_map`. Both paths record TLS before the DLL entry on process attach and detach. The DLL's `guest_draw` export selects the shared two-texture shader fixture and calls the graphics provider through its bound import. The provider calls the host test, which runs the existing offscreen renderer in a child process. The renderer checks every RGBA channel against the CPU reference, and the test compares the two 64×64 captures byte for byte. Withholding the graphics provider must fail mapping before startup or drawing.
