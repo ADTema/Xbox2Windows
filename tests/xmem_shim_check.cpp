@@ -132,8 +132,11 @@ bool query_checks()
     const BOOL outside = XMemVirtualQuery(GetCurrentProcess(), reinterpret_cast<LPCVOID>(0xffff800000000000ull), &buffer);
     if (outside || buffer.info.State != 0 ||
         !std::all_of(buffer.tail.begin(), buffer.tail.end(), [](Byte b) { return b == 0xd7; })) return false;
-    std::printf("query_cases=6\n");
-    return true;
+    SetLastError(ERROR_SUCCESS);
+    const BOOL null_output = XMemVirtualQuery(GetCurrentProcess(), &buffer, nullptr);
+    const DWORD null_error = GetLastError();
+    std::printf("query_cases=7 null_output_error=%lu\n", null_error);
+    return !null_output && null_error == ERROR_NOACCESS;
 }
 
 bool working_set_checks()
