@@ -43,6 +43,19 @@ The supported signature takes an unsigned 32-bit integer in ECX and a writable w
 
 The Windows test calls both DLLs with the same 263 inputs. Five take the below-five branch and 258 take the other branch, including equality, the unsigned sign boundary and wraparound. It compares the returned word, the stored word and guards on either side, and checks the original against independent unsigned arithmetic. A control assembles the same source with the conditional jump inverted and runs that PE through the same translator. Its results must differ from the original on every input. [Direct-call follow-up](https://github.com/R0Y00/Xbox2Windows/issues/22)
 
+## Chained function ranges and early returns
+
+The range reader groups runtime-function entries by their complete unwind-chain parent records. The early-return translator uses iced-x86 to decode each owned interval separately. It follows instruction-aligned branches and fallthrough, models stack slots and preserved registers, and checks their restoration at each return. A neighboring function can occupy the gap. The single-interval translators report split functions explicitly. [Microsoft chained unwind information](https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64#chained-unwind-info-structures)
+
+```powershell
+cmake --build --preset dev --target cpu_chained_lifted cpu_register_probe
+ctest --preset dev --no-tests=error -R '^cpu_aot_chained_ranges$' -V
+```
+
+The source-owned fixture has a primary interval, two levels of chaining and a neighboring export. Both null inputs return 7, and two non-null inputs return 21. A Windows probe compares native returns with the generated result, physical RBX/RSI, and guards. Negative controls cover broken and cyclic parent links, jumps into a neighbor or instruction interior, and an indirect call.
+
+For the local FidelityFX loader, run `cpu_chained_aot.py <loader.dll> ffxDestroyContext out/local_context.cpp --partial` using the Python dev environment. Compile the generated C++ as a Windows x64 DLL. Its `try_lifted(first, second, output)` returns 1 and writes the guest result for a completed path. Status 0 leaves the output untouched at an unsupported indirect call. Pointer arguments must reference readable fixture storage on paths that dereference them. The local inspection recovered four owned intervals. Running the generated code produced 6 for a null first argument and for a pointer to a null context. A valid non-null control stopped at the first indirect call with its output sentinel intact. The original package DLL was inspected as a file. Native differential results above are from the repository fixture. [Callback follow-up](https://github.com/R0Y00/Xbox2Windows/issues/29)
+
 ## Recompiling a direct x64 call
 
 The [caller and callee](../tests/cpu/direct.asm) each accept two unsigned 64-bit integers and an output pointer. The [translator](../tools/cpu_call_aot.py) starts at the caller export, follows the signed displacement in its E8 call and reads the target's runtime-function interval. It generates two C++ functions from the linked machine code. MSVC emits a separate x64 DLL with a non-inlined call. The Windows test checks the relative call against the two export addresses in both the input and output DLLs.

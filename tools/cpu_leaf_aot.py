@@ -6,6 +6,8 @@ import struct
 
 import pefile
 
+from cpu_ranges import function_ranges, image_bytes
+
 
 def export_rva(pe, name):
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
@@ -20,19 +22,11 @@ def export_rva(pe, name):
 
 
 def bounded_code(pe, start):
-    ends = [f.struct.EndAddress for f in getattr(pe, "DIRECTORY_ENTRY_EXCEPTION", [])
-            if f.struct.BeginAddress == start]
-    if len(ends) != 1 or ends[0] <= start:
-        raise ValueError(f"no unique function interval at RVA {start:#x}")
-    section = pe.get_section_by_rva(start)
-    size = ends[0] - start
-    if (not section or not section.Characteristics & 0x20000000
-            or ends[0] - section.VirtualAddress > min(section.Misc_VirtualSize, section.SizeOfRawData)):
-        raise ValueError(f"function outside file-backed executable section at RVA {start:#x}")
-    data = pe.get_data(start, size)
-    if len(data) != size:
-        raise ValueError(f"truncated function at RVA {start:#x}")
-    return data
+    ranges = function_ranges(pe, start)
+    if len(ranges) != 1:
+        raise ValueError(f"multiple owned ranges at {start:#x}; use cpu_chained_aot")
+    begin, end = ranges[0]
+    return image_bytes(pe, begin, end - begin, executable=True)
 
 
 def function_bytes(image, name):

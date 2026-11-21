@@ -191,7 +191,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_custom_command(OUTPUT "${lifted}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/${translator}.py"
                 "$<TARGET_FILE:${image}>" ${entry} "${lifted}" ${binding}
-            DEPENDS ${image} ${BIND_PROVIDER} tools/${translator}.py tools/cpu_leaf_aot.py VERBATIM)
+            DEPENDS ${image} ${BIND_PROVIDER} tools/${translator}.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
         add_library(${image}_lifted SHARED "${lifted}")
         if(BIND_PROVIDER)
             target_link_libraries(${image}_lifted PRIVATE ${BIND_PROVIDER})
@@ -213,6 +213,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     target_compile_definitions(cpu_call_altered PRIVATE ALTER_RETURN)
     cpu_asm_fixture(cpu_register_probe register_probe)
+    cpu_asm_fixture(cpu_chained chained)
+    cpu_translation(cpu_chained cpu_chained_aot choose_value)
+    add_test(NAME cpu_aot_chained_ranges COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/chained_check.py" "$<TARGET_FILE:cpu_chained>"
+        "$<TARGET_FILE:cpu_chained_lifted>" "$<TARGET_FILE:cpu_register_probe>")
     add_test(NAME cpu_aot_direct_call COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/direct_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_call_original>" "$<TARGET_FILE:cpu_call_original_lifted>"

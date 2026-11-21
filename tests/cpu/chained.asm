@@ -1,0 +1,48 @@
+; Explicit .pdata/.xdata lets the test place another function in the gap.
+OPTION DOTNAME
+.code
+PUBLIC choose_value, neighbor
+choose_value PROC
+    push rbx
+    push rsi
+    sub rsp, 8
+    mov rsi, rcx
+    test rsi, rsi
+    jz short empty_value
+    mov rbx, [rsi]
+    test rbx, rbx
+    jz short empty_value
+    mov eax, 21
+    jmp short finish_value
+choose_value ENDP
+primary_end LABEL BYTE
+neighbor PROC
+    mov eax, 99
+    ret
+neighbor ENDP
+neighbor_end LABEL BYTE
+empty_value::
+    mov eax, 7
+finish_value::
+    add rsp, 8
+    pop rsi
+    pop rbx
+    ret
+finish_end LABEL BYTE
+
+.xdata SEGMENT READONLY
+ALIGN 4
+primary_info DB 1,6,3,0, 6,02h, 2,60h, 1,30h, 0,0
+neighbor_info DB 1,0,0,0
+empty_info DB 21h,0,0,0
+    DD IMAGEREL choose_value, IMAGEREL primary_end, IMAGEREL primary_info
+finish_info DB 21h,0,0,0
+    DD IMAGEREL empty_value, IMAGEREL finish_value, IMAGEREL empty_info
+.xdata ENDS
+.pdata SEGMENT READONLY
+    DD IMAGEREL choose_value, IMAGEREL primary_end, IMAGEREL primary_info
+    DD IMAGEREL neighbor, IMAGEREL neighbor_end, IMAGEREL neighbor_info
+    DD IMAGEREL empty_value, IMAGEREL finish_value, IMAGEREL empty_info
+    DD IMAGEREL finish_value, IMAGEREL finish_end, IMAGEREL finish_info
+.pdata ENDS
+END
