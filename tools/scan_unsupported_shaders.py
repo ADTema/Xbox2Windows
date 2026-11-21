@@ -170,12 +170,40 @@ def detect_shader_stage(name_or_path: str) -> str:
 def disassemble_binary_shader(data: bytes) -> list[str]:
     """Disassemble raw GFX1013 binary shader using disasm_rdna2."""
     if disasm_rdna2 is None:
-        return []
-    try:
-        records = disasm_rdna2(data)
-        return [rec["assembly"] for rec in records]
-    except Exception:
-        return []
+        raise RuntimeError("disasm_rdna2 module unavailable")
+    if not data:
+        raise ValueError("empty binary shader data")
+    records = disasm_rdna2(data)
+    if not records:
+        raise ValueError("no instruction records decoded from binary")
+    return [rec["assembly"] for rec in records]
+
+
+def make_failed_shader_record(shader_name: str, error_message: str) -> dict:
+    """Create a failed-input analysis record to preserve denominator count."""
+    stage = detect_shader_stage(shader_name)
+    return {
+        "shader_name": shader_name,
+        "stage": stage,
+        "total_instructions": 0,
+        "supported_instructions": 0,
+        "unsupported_count": 0,
+        "support_percentage": 0.0,
+        "opcodes_recognized": False,
+        "translator_accepted": False,
+        "compatibility_category": "unsupported_opcodes",
+        "is_fully_supported": False,
+        "lower_status": "decode_failed",
+        "lower_error": error_message,
+        "unsupported_opcodes": {"<decode_error>": 1},
+        "unsupported_details": [{
+            "line_number": 0,
+            "raw": error_message,
+            "opcode": "<decode_error>",
+            "category": "Other / Unknown",
+        }],
+        "opcode_distribution": {},
+    }
 
 
 def extract_opcode(instruction_line: str) -> str:
@@ -315,10 +343,15 @@ def scan_directory_or_files(target_paths: list[Path], llvm_lib: str = None) -> l
                 instructions = parse_assembly_file(path)
                 if instructions:
                     results.append(analyze_shader_instructions(path.name, instructions))
+                else:
+                    results.append(make_failed_shader_record(path.name, "No assembly instructions found in file"))
             elif suffix == ".bin":
-                instructions = disassemble_binary_shader(path.read_bytes())
-                if instructions:
+                try:
+                    data = path.read_bytes()
+                    instructions = disassemble_binary_shader(data)
                     results.append(analyze_shader_instructions(path.name, instructions))
+                except Exception as e:
+                    results.append(make_failed_shader_record(path.name, str(e)))
             elif suffix == ".rpf" and pixel_aot is not None:
                 print(f"[*] Scanning archive: {path.name}...")
                 archive_results = scan_rpf_archive(path, llvm_lib)
@@ -339,15 +372,20 @@ def scan_directory_or_files(target_paths: list[Path], llvm_lib: str = None) -> l
 
             for idx, file_path in enumerate(all_files, start=1):
                 suffix = file_path.suffix.lower()
-                instructions = None
+                rel_name = str(file_path.relative_to(path))
                 if suffix in (".s", ".asm", ".txt", ".isa"):
                     instructions = parse_assembly_file(file_path)
+                    if instructions:
+                        results.append(analyze_shader_instructions(rel_name, instructions))
+                    else:
+                        results.append(make_failed_shader_record(rel_name, "No assembly instructions found in file"))
                 elif suffix == ".bin":
-                    instructions = disassemble_binary_shader(file_path.read_bytes())
-
-                if instructions:
-                    rel_name = str(file_path.relative_to(path))
-                    results.append(analyze_shader_instructions(rel_name, instructions))
+                    try:
+                        data = file_path.read_bytes()
+                        instructions = disassemble_binary_shader(data)
+                        results.append(analyze_shader_instructions(rel_name, instructions))
+                    except Exception as e:
+                        results.append(make_failed_shader_record(rel_name, str(e)))
 
                 if idx % 500 == 0 or idx == len(all_files):
                     print(f"[*] Scanned {idx}/{len(all_files)} files ({len(results)} valid shaders)...", flush=True)
@@ -425,6 +463,7 @@ def get_implementation_target(opcode: str, category: str) -> str:
 
 def generate_progress_dashboard(results: list[dict], output_dir: Path) -> tuple[Path, Path]:
     """Generate AnyPS5-style visual progress dashboard (PROGRESS.md and progress.json)."""
+    output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     total_shaders = len(results)
@@ -434,7 +473,7 @@ def generate_progress_dashboard(results: list[dict], output_dir: Path) -> tuple[
 
     accepted_shaders = sum(1 for r in results if r["translator_accepted"])
     partial_shaders = sum(1 for r in results if not r["translator_accepted"] and r["supported_instructions"] > 0)
-    unsupported_shaders = sum(1 for r in results if r["supported_instructions"] == 0 and r["total_instructions"] > 0)
+    unsupported_shaders = sum(1 for r in results if not r["translator_accepted"] and r["supported_instructions"] == 0)
 
     # Breakdown by stage
     stages = ["pixel", "compute", "vertex", "other"]
@@ -515,6 +554,7 @@ def generate_progress_dashboard(results: list[dict], output_dir: Path) -> tuple[
             "completely_unsupported": unsupported_shaders,
             "total_instructions": total_instructions,
             "supported_instructions": total_supported,
+            "instruction_coverage_percentage": round(overall_coverage, 2),
             "coverage_percentage": round(overall_coverage, 2),
             "progress_bar": make_progress_bar(overall_coverage, 24, unicode_blocks=True),
         },
@@ -542,7 +582,7 @@ def generate_progress_dashboard(results: list[dict], output_dir: Path) -> tuple[
 
         f.write("## Overall Status\n\n")
         f.write("```text\n")
-        f.write(f"Overall Coverage: {make_progress_bar(overall_coverage, 28, unicode_blocks=True)}\n")
+        f.write(f"Instruction Coverage: {make_progress_bar(overall_coverage, 28, unicode_blocks=True)}\n")
         f.write("```\n\n")
 
         f.write("| Metric | Count | Percentage |\n")
@@ -551,7 +591,7 @@ def generate_progress_dashboard(results: list[dict], output_dir: Path) -> tuple[
         f.write(f"| **Fully Supported / Accepted** | {accepted_shaders:,} | {(accepted_shaders/total_shaders*100.0 if total_shaders else 0):.1f}% |\n")
         f.write(f"| **Partially Supported** | {partial_shaders:,} | {(partial_shaders/total_shaders*100.0 if total_shaders else 0):.1f}% |\n")
         f.write(f"| **Unsupported / Blocked** | {unsupported_shaders:,} | {(unsupported_shaders/total_shaders*100.0 if total_shaders else 0):.1f}% |\n")
-        f.write(f"| **Total Instruction Instances** | {total_instructions:,} | 100.0% |\n")
+        f.write(f"| **Total Decoded Instructions** | {total_instructions:,} | 100.0% |\n")
         f.write(f"| **Supported Instruction Instances** | {total_supported:,} | {overall_coverage:.1f}% |\n\n")
 
         f.write("---\n\n")
@@ -611,7 +651,7 @@ def generate_reports(results: list[dict], output_dir: Path):
     opcodes_recognized_only = sum(1 for r in results if r["compatibility_category"] == "opcode_recognized_translator_rejected")
     unsupported_opcodes_count = sum(1 for r in results if r["compatibility_category"] == "unsupported_opcodes")
     partially_supported = sum(1 for r in results if not r["is_fully_supported"] and r["supported_instructions"] > 0)
-    unsupported_completely = sum(1 for r in results if r["supported_instructions"] == 0 and r["total_instructions"] > 0)
+    unsupported_completely = sum(1 for r in results if not r["translator_accepted"] and r["supported_instructions"] == 0)
 
     # Aggregate all unsupported opcodes across all shaders
     global_unsupported_opcodes = Counter()
@@ -726,12 +766,12 @@ def main():
     print("\n" + "=" * 65)
     print(" SCAN RESULTS SUMMARY (AnyPS5 Style Dashboard) ")
     print("=" * 65)
-    print(f"Overall Coverage: {make_progress_bar(coverage, 24)}")
+    print(f"Instruction Coverage: {make_progress_bar(coverage, 24)}")
     print(f"Total Shaders Scanned:                     {total:,}")
     print(f"Full Shaders Accepted by Translator:       {accepted:,} ({(accepted/total)*100:.1f}%)")
     print(f"Opcodes Recognized, Translator-Rejected:   {recognized_only:,}")
     print(f"Contains Unrecognized Opcodes:             {unsupported_opcodes:,}")
-    print(f"Total Instructions Scanned:                {total_insns:,}")
+    print(f"Total Decoded Instructions:                {total_insns:,}")
     print(f"Supported Instructions:                    {total_supp_insns:,}")
 
     # Stage breakdowns

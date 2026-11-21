@@ -25,6 +25,8 @@ from scan_unsupported_shaders import (
     scan_directory_or_files,
     detect_shader_stage,
     generate_progress_dashboard,
+    disassemble_binary_shader,
+    make_failed_shader_record,
 )
 try:
     from pixel_aot import disassemble as llvm_disassemble
@@ -703,6 +705,67 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertEqual(res["total_instructions"], 3)
             self.assertTrue(res["opcodes_recognized"])
 
+    def test_disassemble_binary_shader_error(self):
+        """Verify disassemble_binary_shader raises on invalid or empty input."""
+        with self.assertRaises(ValueError):
+            disassemble_binary_shader(b"")
+
+    def test_mixed_binary_shader_scanning(self):
+        """Verify that failed/invalid binary inputs are retained in results and denominator."""
+        valid_code = bytes.fromhex(
+            "000080bf"  # s_nop 0
+            "000081bf"  # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            good_file = tmp_path / "ps_good.bin"
+            good_file.write_bytes(valid_code)
+            bad_file = tmp_path / "ps_bad.bin"
+            bad_file.write_bytes(b"")  # Empty binary triggers decoder failure
+
+            results = scan_directory_or_files([tmp_path])
+            # Denominator must account for BOTH inputs
+            self.assertEqual(len(results), 2)
+
+            by_name = {r["shader_name"]: r for r in results}
+            good_res = by_name.get("ps_good.bin")
+            bad_res = by_name.get("ps_bad.bin")
+
+            self.assertIsNotNone(good_res)
+            self.assertEqual(good_res["total_instructions"], 2)
+            self.assertEqual(good_res["supported_instructions"], 2)
+            self.assertTrue(good_res["opcodes_recognized"])
+
+            self.assertIsNotNone(bad_res)
+            self.assertEqual(bad_res["total_instructions"], 0)
+            self.assertFalse(bad_res["is_fully_supported"])
+            self.assertFalse(bad_res["translator_accepted"])
+            self.assertEqual(bad_res["lower_status"], "decode_failed")
+            self.assertIn("empty", bad_res["lower_error"].lower())
+
+            # Verify that dashboard accounts for both inputs and clearly labels instruction vs file metrics
+            out_dir = tmp_path / "out"
+            json_file, md_file = generate_progress_dashboard(results, out_dir)
+            data = json.loads(json_file.read_text(encoding="utf-8"))
+
+            # File-level denominator tested separately: two inputs, one decode failure
+            self.assertEqual(data["overall"]["total_shaders"], 2)
+            self.assertEqual(data["overall"]["completely_unsupported"], 1)
+            self.assertEqual(data["overall"]["fully_accepted"], 0)
+
+            # Instruction metric: every decoded instruction in valid_code is supported,
+            # so instruction coverage legitimately reaches 100% while file denominator retains failure.
+            self.assertEqual(data["overall"]["total_instructions"], 2)
+            self.assertEqual(data["overall"]["supported_instructions"], 2)
+            self.assertEqual(data["overall"]["instruction_coverage_percentage"], 100.0)
+            self.assertEqual(data["overall"]["coverage_percentage"], 100.0)
+
+            md_text = md_file.read_text(encoding="utf-8")
+            self.assertIn("| **Total Shaders Analyzed** | 2 | 100.0% |", md_text)
+            self.assertIn("| **Unsupported / Blocked** | 1 | 50.0% |", md_text)
+            self.assertIn("| **Total Decoded Instructions** | 2 | 100.0% |", md_text)
+            self.assertIn("Instruction Coverage:", md_text)
+
     def test_dashboard_report_generation(self):
         """Verify generation of PROGRESS.md and progress.json."""
         canonical_shader = [
@@ -735,7 +798,7 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertTrue(json_file.is_file())
             self.assertTrue(md_file.is_file())
             md_content = md_file.read_text(encoding="utf-8")
-            self.assertIn("Overall Coverage:", md_content)
+            self.assertIn("Instruction Coverage:", md_content)
             self.assertIn("Pipeline Stage Breakdown", md_content)
             json_content = json.loads(json_file.read_text(encoding="utf-8"))
             self.assertIn("overall", json_content)
