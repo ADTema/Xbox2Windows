@@ -12,7 +12,7 @@ Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) s
 | Shader translation | Supported pixel programs sample a texture, read constants and export color. D3D12 readback is checked against a CPU reference. [Translation and bindings](docs/experiments.md#offline-pixel-shader-recompilation) | Supply a source-built instruction case with known register inputs and an expected color. |
 | BC7 textures | A translated shader samples recovered mip levels on hardware and WARP. Requests for missing high-resolution levels use the first resident level. [Mip fallback tests](docs/experiments.md#drawing-bc7-textures-with-a-recompiled-pixel-shader) | Match a variable BCPack lane against independently known BC7 blocks. [Issue #15](https://github.com/R0Y00/Xbox2Windows/issues/15) |
 | Script states | A native x64 probe follows state-tree links and reproduces distinct camera limits for front and rear selections. The replay supplies the selection requests. [State replay](docs/experiments.md#state-linked-settings-in-a-script-archive) | Identify an event or caller that supplies a context and state ID, with a control input that takes a different branch. [Issue #19](https://github.com/R0Y00/Xbox2Windows/issues/19) |
-| Windows runtime and GPU | Source-built checks cover PE imports, heap operations, root signatures, compute and ray tracing. [Experiment notes](docs/experiments.md) | Run the wave64 fixture on a physical adapter or reproduce the first build on a clean checkout. [Hardware reports](https://github.com/R0Y00/Xbox2Windows/issues/1) · [First builds](https://github.com/R0Y00/Xbox2Windows/issues/2) |
+| Windows runtime and GPU | Source-built checks cover PE imports, heap operations, root signatures, compute and ray tracing. Two Radeon GPUs passed the native wave64 BVH test. [Hardware coverage](#hardware-coverage) · [Experiment notes](docs/experiments.md) | Reproduce the first build on a clean checkout. [First builds](https://github.com/R0Y00/Xbox2Windows/issues/2) |
 
 The public suite builds its own fixtures. A contributor can reproduce the checks below on a PC without a game installation. The standalone release packages the GPU check. To run the script, shader and texture development suite, build from source.
 
@@ -28,12 +28,15 @@ Review `gpu-report-hardware.md` and paste it in the [hardware coverage thread (#
 
 ### Hardware coverage
 
-| Adapter or backend | Reported native lanes | Forced wave64 | BVH differential | Evidence |
+| Adapter or backend | Default native lanes | Forced wave64 | BVH differential | Evidence |
 |---|---:|---|---|---|
 | NVIDIA GeForce RTX 2060 | 32 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
 | NVIDIA GeForce RTX 4060 Laptop GPU | 32 | Skipped | 408 queries passed | [Second maintainer workstation](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7058907095) |
+| AMD Radeon RX 6750 XT (driver 32.0.21045.29003) | 32 | Passed, 64 lanes | 408 queries passed | [RX 6750 XT report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7062253227) |
+| AMD Radeon RX 9070 (driver 32.0.22042.14002) | 64 | Passed, 64 lanes | 408 queries passed | [RX 9070 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7062384428) |
 | Microsoft WARP (software) | 4 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
-| Wave64-capable Windows GPU | Awaiting report | Awaiting execution | Awaiting report | [Contribute a run](https://github.com/R0Y00/Xbox2Windows/issues/1) |
+
+Both Radeon reports used commit `def386a`. Each forced-wave64 run completed 38 groups with zero mismatches. The D3D12 debug layer was unavailable on both systems.
 
 Maintainers link independent results to the original report and record the adapter, driver, commit and outcome. Names or handles are added on request. Our first community milestones are three independent hardware reports, one independent clean build and one verified fix driven by contributor feedback. New to graphics programming? Try the [first-build task (#2)](https://github.com/R0Y00/Xbox2Windows/issues/2).
 
