@@ -69,6 +69,23 @@ def check_example():
     assert fc.fixture_status({"pixel_aot_hardware": "skip"}, ("pixel_aot_warp", "pixel_aot_hardware")) == "skip"
 
 
+def check_jump_tables():
+    """tests/cpu/switch.asm (#86): a skipped cpu_aot_jump_tables run contributes zero covered forms."""
+    switch = fc.masm_mnemonics((fc.ROOT / "tests/cpu/switch.asm").read_text(encoding="utf-8"))
+    assert switch == {"add", "cmp", "imul", "ja", "jmp", "jne", "lea", "mov", "movsxd", "movzx", "neg", "not",
+                      "ret", "sar", "shl", "shr", "sub", "xor"}, sorted(switch)
+    assert fc.CPU_FIXTURES["switch"] == "cpu_aot_jump_tables"
+    passed = fc.measure({"cpu_aot_jump_tables": "pass"})["x64_zen2"]
+    skipped = fc.measure({"cpu_aot_jump_tables": "skip"})["x64_zen2"]
+    assert passed["covered"] == len(switch) == 18
+    assert skipped["covered"] == 0 and skipped["blocked_by_skip"] == sorted(f"Integer {m}" for m in switch)
+    # Next to a passing fixture, the skipped run still adds nothing: only branch.asm's forms count.
+    branch = fc.masm_mnemonics((fc.ROOT / "tests/cpu/branch.asm").read_text(encoding="utf-8"))
+    mixed = fc.measure({"cpu_aot_jump_tables": "skip", "cpu_leaf_aot_branches": "pass"})["x64_zen2"]
+    assert mixed["covered"] == len(branch)
+    assert mixed["blocked_by_skip"] == sorted(f"Integer {m}" for m in switch - branch)
+
+
 def check_parsing():
     with tempfile.TemporaryDirectory() as tmp:
         junit = Path(tmp) / "results.xml"
@@ -89,5 +106,6 @@ def check_parsing():
 if __name__ == "__main__":
     check_denominators()
     check_example()
+    check_jump_tables()
     check_parsing()
     print("form coverage checks passed")

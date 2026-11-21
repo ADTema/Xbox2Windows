@@ -37,7 +37,9 @@ CPU_FIXTURES = {
     "bink_heap": "cpu_aot_bink_heap",
     "heap_layout": "cpu_aot_heap_layout",
     "version_query": "cpu_aot_version_query",
+    "switch": "cpu_aot_jump_tables",
     "register_probe": None,  # measurement harness
+    "two_imports": None,     # mapped and run unchanged by pe_map
     "reloc_route": None,     # mapped and run unchanged by pe_map
     "seh_route": None,       # mapped and run unchanged by pe_map
     "tls_route": None,       # mapped and run unchanged by pe_map
