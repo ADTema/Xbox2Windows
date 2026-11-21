@@ -164,7 +164,7 @@ def extract_shaders(
                     continue
 
                 record_name = match.group().decode("ascii", "replace")
-                cursor = start_payload + stored
+                cursor = start_payload + (stored - len(stream.unused_data))
                 total_found += 1
 
                 kind = struct.unpack_from("<H", program, 2)[0]

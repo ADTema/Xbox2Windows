@@ -325,6 +325,36 @@ class TestRdna2Extractor(unittest.TestCase):
             manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
             self.assertEqual(manifest["total_extracted"], 1)
 
+    def test_oversized_claimed_span_with_unused_data_does_not_skip_following_record(self):
+        """Cursor advancement must stop at consumed deflate bytes when unused_data holds another record."""
+        code_1 = bytes.fromhex("000080bf 000081bf")
+        code_2 = bytes.fromhex("000082be 000081bf")
+        record_1 = envelope(code_1, b"PS_OversizedSpan")
+        record_2 = envelope(code_2, b"PS_InsideUnusedTail")
+        name_end = record_1.index(b"PS_OversizedSpan") + len(b"PS_OversizedSpan")
+        stored_1, _, _, decoded_1 = struct.unpack_from("<4I", record_1, name_end + 2)
+        payload_1 = record_1[name_end + 18:name_end + 18 + stored_1]
+        oversized_stored = stored_1 + len(record_2)
+        oversized_record_1 = (record_1[:name_end + 2]
+                              + struct.pack("<4I", oversized_stored, 0, oversized_stored, decoded_1)
+                              + payload_1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "oversized_span.rpf"
+            archive.write_bytes(b"RPF\0" + oversized_record_1 + record_2)
+
+            output_dir = tmp_path / "extracted_oversized"
+            out_path, manifest_file = extract_shaders(archive, output_dir, target_stages={"pixel"})
+            file_1 = out_path / "pixel" / "PS_OversizedSpan.bin"
+            file_2 = out_path / "pixel" / "PS_InsideUnusedTail.bin"
+            self.assertTrue(file_1.is_file(), "First shader in oversized span not extracted")
+            self.assertTrue(file_2.is_file(), "Second shader inside unused_data tail was skipped")
+            self.assertEqual(file_1.read_bytes(), code_1)
+            self.assertEqual(file_2.read_bytes(), code_2)
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 2)
+
     def test_disambiguated_stem_does_not_collide_with_existing_or_case_variant(self):
         """Disambiguated stems must not overwrite explicit _1 names or case variants."""
         codes = [
