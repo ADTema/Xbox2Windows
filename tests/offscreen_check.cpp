@@ -411,6 +411,8 @@ int main(int argc, char** argv)
         if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
+        } else if (argc == 4 && operation == "--compute-root-file") {
+            check_compute_file(device.Get(), argv[3]);
         } else if (argc == 3 && operation == "--ffx-device-init") {
             check_ffx_device_init(device.Get());
         } else if (argc == 3 && operation == "--ffx-provider-loop") {
