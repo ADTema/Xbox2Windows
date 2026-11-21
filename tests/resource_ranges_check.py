@@ -3,11 +3,13 @@ import io
 from pathlib import Path
 import struct
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from paged_resource import PagedResource, Segment
+from section_probe import inspect as inspect_sections
 from section_probe import scan_window, sections
 
 
@@ -67,10 +69,29 @@ class ResourceChecks(unittest.TestCase):
         packet = zlib.compress(doc)
         self.assertEqual(scan_window(packet, 16, "HEAD", "FOOT"), (1, {"HEAD FOOT": 1}))
         self.assertEqual(scan_window(packet, 1, "HEAD", "FOOT"), (0, {}))
+        self.assertEqual(scan_window(bytes(15) + packet, 1, "HEAD", "FOOT"), (1, {"HEAD FOOT": 1}))
         self.assertEqual(scan_window(packet, 0, "OTHER", "FOOT"), (1, {}))
         self.assertEqual(scan_window(packet[:-1], 0, "HEAD", "FOOT"), (0, {}))
         for data in (doc + b"x", doc[:-1], doc[:4] + bytes(4), doc[:12] + b"\0" * 8):
             self.assertFalse(sections(data))
+
+    def test_section_probe_counts_smaller_zlib_windows(self) -> None:
+        doc = struct.pack(">4sI4s4sI", b"HEAD", 12, b"data", b"FOOT", 8)
+        packets = []
+        for window_bits in range(9, 16):
+            compressor = zlib.compressobj(wbits=window_bits)
+            packets.append(compressor.compress(doc) + compressor.flush())
+        dictionary = zlib.compressobj(wbits=9, zdict=b"HEAD data FOOT")
+        packets.append(dictionary.compress(doc) + dictionary.flush())
+        archive = b"".join(packet + bytes(-len(packet) % 16) for packet in packets)
+        archive += b"\0" + packets[0]
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "synthetic-sections.bin"
+            path.write_bytes(archive)
+            report = inspect_sections(path, "HEAD", "FOOT")
+        self.assertEqual(report["valid_zlib"], 7)
+        self.assertEqual(report["section_records"], 7)
+        self.assertEqual(report["layouts"], {"HEAD FOOT": 7})
 
 
 if __name__ == "__main__":
