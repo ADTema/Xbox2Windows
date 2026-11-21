@@ -658,7 +658,31 @@ cmake --build --preset dev --target cpu_switch_original_lifted cpu_switch_swappe
 ctest --preset dev --no-tests=error -R '^cpu_aot_jump_tables$' -V
 ```
 
-The decoder starts at the export and follows branches, fallthrough and table entries, so it never decodes the table bytes that MSVC places after a function's code. An indirect jump is accepted only in the sequence `load entry; add base; jmp`, reached by the fallthrough of an unsigned `JA` or `JAE` against an immediate. The table length comes from that bound. A must-agree constant pass over the control-flow graph gives the base register's RIP-relative value, which also covers a base loaded once outside a loop. Value numbering over the single-entry block that contains the bound shows that the index register holds the compared value, zero- or sign-extended from 32 bits. Every table entry must be the first byte of a decoded instruction inside the function, and the table must not overlap any decoded instruction. Flags are modelled only between a producer (`CMP`, `TEST`, `ADD`, `SUB`, `AND`, `OR`, `XOR`, `INC` or `DEC`) and its consumers: a conditional jump, `SETcc` or `CMOVcc`. Producer and consumer must sit in one straight-line run that no edge enters; only instructions that leave the flags unchanged (moves, `LEA`, `NOT`, `SETcc`, `CMOVcc`) may lie between them. The overflow and parity conditions are rejected. A forward pass records how many low bytes of each register (0, 1, 2 or 8) every path defines, and rejects a read of more bytes than that. Writes to nonvolatile registers or to AH, BH, CH and DH, 16-bit `CMOVcc`, stack operations and calls are rejected.
+The decoder starts at the export and follows branches, fallthrough and table entries, so it never decodes the table bytes that MSVC places after a function's code. An indirect jump is accepted only in the sequence `load entry; add base; jmp`, reached by the fallthrough of an unsigned `JA` or `JAE` against an immediate. The table length comes from that bound. A must-agree constant pass over the control-flow graph gives the base register's RIP-relative value, which also covers a base loaded once outside a loop. Value numbering over the single-entry block that contains the bound shows that the index register holds the compared value, zero- or sign-extended from 32 bits. Every table entry must be the first byte of a decoded instruction inside the function, and the table must not overlap any decoded instruction. Flags are modelled only between a producer (`CMP`, `TEST`, `ADD`, `SUB`, `AND`, `OR`, `XOR`, `INC` or `DEC`) and its consumers: a conditional jump, `SETcc` or `CMOVcc`. Producer and consumer must sit in one straight-line run that no edge enters; only instructions that leave the flags unchanged (moves, `LEA`, `NOT`, `SETcc`, `CMOVcc`) may lie between them. Overflow and parity conditions are supported for these producers, using their operand width and the low result byte respectively. A forward pass records how many low bytes of each register (0, 1, 2 or 8) every path defines, and rejects a read of more bytes than that. Writes to nonvolatile registers or to AH, BH, CH and DH, 16-bit `CMOVcc`, stack operations and calls are rejected.
+
+The translator also lowers `JO/JNO/JP/JNP`, `SETO/SETNO/SETP/SETNP` and
+`CMOVO/CMOVNO/CMOVP/CMOVNP`. `ADD`, `SUB` and `CMP` overflow is computed from
+saved unsigned operands; `INC` and `DEC` use their wrapped result at the signed
+boundary. Logical producers clear overflow. Parity uses only the low result
+byte, as defined by the [Intel SDM](https://cdrdv2-public.intel.com/843827/253665-sdm-vol-1-dec-24.pdf).
+The existing straight-line and register restrictions still apply, including
+rejection of 16-bit `CMOVcc` and flags from shifts or across joins.
+
+`cpu_aot_flag_conditions` compares 160 MASM exports with their generated C++
+and an independent Python reference over 294,600 inputs. The fixtures cover
+nine flag producers at 8/16/32/64 bits, guarded byte stores, 32- and 64-bit
+conditional moves and conditional branches. Both operand registers are
+clobbered before the consumers to verify that the flag inputs were saved.
+Extra `ADD` cases preserve its existing zero/sign conditions. A variable-count
+shift substituted for the producer must be rejected. On Windows 11 build
+26300.9974, MSVC/ML64 19.44.35230 and Python 3.12.8, this test and the four
+existing jump-table, address-size, entry-order and narrow-return tests passed.
+The former `SETO` rejection control now checks successful translation.
+
+```powershell
+cmake --build --preset dev --target cpu_flag_conditions_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_flag_conditions$' -V
+```
 
 The supported functions take three integer words in RCX, RDX and R8 and return RAX, of which only the low bytes described below are compared. An entry can instead be translated with a fourth integer word in R9, as described below. Stack arguments (the fifth and later) and floating-point arguments are not supported. A leaf function without a `.pdata` entry is bounded by its executable section. Its walk may not enter an interval owned by another function's unwind entry.
 
@@ -673,7 +697,7 @@ On a copy of the linked DLL, the test patches the code, the table or `.pdata`, a
 - a base that is not the image base, or that does not come from a RIP-relative `LEA`;
 - an undefined or nonvolatile register, or an unsupported instruction;
 - a leaf whose walk reaches another function's unwind interval;
-- in `flag_select`, `SETO`, a `SETcc` into `AH`, a flag-writing `NEG` between a compare and its `CMOVGE`, and a second entry that reaches a `SETBE` with another path's flags.
+- in `flag_select`, a `SETcc` into `AH`, a flag-writing `NEG` between a compare and its `CMOVGE`, and a second entry that reaches a `SETBE` with another path's flags.
 
 When `.pdata` no longer covers `select_rva`, the translation must stay unchanged.
 

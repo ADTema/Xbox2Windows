@@ -447,6 +447,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_switch_original>" "$<TARGET_FILE:cpu_switch_original_lifted>"
         "$<TARGET_FILE:cpu_switch_swapped_lifted>")
+    cpu_asm_fixture(cpu_flag_conditions flag_conditions)
+    set(flag_conditions_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_flag_conditions_lifted.cpp")
+    add_custom_command(OUTPUT "${flag_conditions_lifted}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/flag_conditions_check.py"
+            emit "$<TARGET_FILE:cpu_flag_conditions>" "${flag_conditions_lifted}"
+        DEPENDS cpu_flag_conditions tests/cpu/flag_conditions_check.py tools/cpu_switch_aot.py
+            tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_flag_conditions_lifted SHARED "${flag_conditions_lifted}")
+    add_test(NAME cpu_aot_flag_conditions COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/flag_conditions_check.py" check
+        "$<TARGET_FILE:cpu_flag_conditions>" "$<TARGET_FILE:cpu_flag_conditions_lifted>")
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_translation(cpu_switch_addr32 cpu_switch_aot lea_wrap,lea_back,load_back,store_ahead)
     add_test(NAME cpu_aot_switch_addr32 COMMAND "${INTAKE_PYTHON}" -B
