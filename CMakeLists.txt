@@ -33,6 +33,14 @@ foreach(scenario IN ITEMS fields tail registry short)
     add_test(NAME era_query_${scenario} COMMAND era_query_check ${scenario})
 endforeach()
 
+# Title GPU address to desktop GPU virtual address table (no GPU needed).
+add_executable(era_title_va_check tests/era_title_va_check.cpp src/era_title_va.cpp)
+target_include_directories(era_title_va_check PRIVATE src)
+target_compile_features(era_title_va_check PRIVATE cxx_std_17)
+foreach(scenario IN ITEMS translate bounds registry)
+    add_test(NAME era_title_va_${scenario} COMMAND era_title_va_check ${scenario})
+endforeach()
+
 # Desktop xmem.dll for the package DLLs' four named xmem imports.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/era_heap.cpp src/era_query.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
@@ -118,6 +126,14 @@ foreach(entry IN ITEMS DualUav SampleMip WriteRecurrent)
 endforeach()
 target_sources(offscreen_check PRIVATE tests/bvh_reads_waves.cpp tests/bvh_hits.cpp)
 target_sources(offscreen_check PRIVATE tests/bvh_atomics.cpp tests/bvh_numeric.cpp)
+# A title graphics allocation opened as a D3D12 heap and addressed through translated GPU addresses.
+target_sources(offscreen_check PRIVATE tests/gpu_alias.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/era_heap.cpp)
+target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
+    -E AliasTransform -Vn AliasTransform -Fh "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h"
+    -Fo "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_alias.hlsl"
+    DEPENDS tests/gpu_alias.hlsl BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.cso" VERBATIM)
+target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h")
 foreach(entry IN ITEMS InitBounds AtomicBounds QueryBounds NumericBounds)
     set(bounds_source tests/bvh_atomics.hlsl)
     if(entry STREQUAL "NumericBounds")
@@ -221,6 +237,8 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME dxr_facing_${adapter} COMMAND offscreen_check ${adapter} --dxr-facing)
     set_tests_properties(dxr_facing_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_buffer_ops_${adapter} COMMAND offscreen_check ${adapter} --buffer-ops)
+    add_test(NAME gpu_alias_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias)
+    set_tests_properties(gpu_alias_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_root_roundtrip_${adapter} COMMAND offscreen_check ${adapter} --bvh-root-roundtrip)
     set_tests_properties(bvh_root_roundtrip_${adapter} PROPERTIES TIMEOUT 45)
     foreach(work IN ITEMS reads waves wave64 hits differential atomics numeric packed)
@@ -399,7 +417,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_register_probe register_probe)
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_switch_${variant} switch)
-        cpu_translation(cpu_switch_${variant} cpu_switch_aot select_rva,select_rel,run_ops,shift_narrow)
+        cpu_translation(cpu_switch_${variant} cpu_switch_aot select_rva,select_rel,run_ops,shift_narrow,flag_select,cmov_read)
     endforeach()
     target_compile_definitions(cpu_switch_swapped PRIVATE SWAP_TABLE)
     add_test(NAME cpu_aot_jump_tables COMMAND "${INTAKE_PYTHON}" -B
@@ -740,6 +758,37 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_start_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_start_original>" "$<TARGET_FILE:cpu_exe_start_no_tls>"
         "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>")
+    # Two CRT-free DLLs and an EXE: A has no imports, B imports A, the EXE imports both.
+    foreach(dll IN ITEMS a a_alt b b_noinit)
+        string(REGEX REPLACE "_(noinit|alt)$" "" source "${dll}")
+        add_library(cpu_startup_${dll} SHARED tests/cpu/startup_${source}.cpp)
+        target_compile_options(cpu_startup_${dll} PRIVATE /GS- /Zl)
+        target_link_options(cpu_startup_${dll} PRIVATE /ENTRY:${source}_main /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(cpu_startup_${dll} PRIVATE kernel32)
+    endforeach()
+    target_compile_definitions(cpu_startup_b_noinit PRIVATE NO_INIT)
+    target_compile_definitions(cpu_startup_a_alt PRIVATE ALTER)
+    target_link_libraries(cpu_startup_b PRIVATE cpu_startup_a)
+    target_link_libraries(cpu_startup_b_noinit PRIVATE cpu_startup_a)
+    add_executable(cpu_startup_exe tests/cpu/startup_exe.cpp)
+    target_compile_options(cpu_startup_exe PRIVATE /GS- /Zl)
+    target_link_options(cpu_startup_exe PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
+        /INCREMENTAL:NO)
+    target_link_libraries(cpu_startup_exe PRIVATE kernel32 cpu_startup_a cpu_startup_b)
+    foreach(control IN ITEMS timeout create)  # controls: a worker that outlives the wait, and one that cannot start
+        add_executable(cpu_startup_exe_${control} tests/cpu/startup_exe.cpp)
+        string(TOUPPER "${control}" definition)
+        target_compile_definitions(cpu_startup_exe_${control} PRIVATE ${definition}_CONTROL)
+        target_compile_options(cpu_startup_exe_${control} PRIVATE /GS- /Zl)
+        target_link_options(cpu_startup_exe_${control} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
+            /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_startup_exe_${control} PRIVATE kernel32 cpu_startup_a cpu_startup_b)
+    endforeach()
+    add_test(NAME cpu_native_startup COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_startup_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_startup_exe>" "$<TARGET_FILE:cpu_startup_a>" "$<TARGET_FILE:cpu_startup_b>"
+        "$<TARGET_FILE:cpu_startup_b_noinit>" "$<TARGET_FILE:cpu_startup_a_alt>"
+        "$<TARGET_FILE:cpu_startup_exe_timeout>" "$<TARGET_FILE:cpu_startup_exe_create>")
     add_library(cpu_frame_host SHARED tests/cpu/frame_host.cpp)
     add_library(cpu_frame_guest SHARED tests/cpu/tls_route.asm tests/cpu/frame_route.def)
     set_target_properties(cpu_frame_guest PROPERTIES LINKER_LANGUAGE CXX)
@@ -758,6 +807,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_delay_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_delay_route>" "$<TARGET_FILE:cpu_delay_provider>"
         "$<TARGET_FILE:cpu_delay_provider_altered>")
+    add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")
     add_library(script_path_host SHARED tools/script_path_host.cpp)
     target_compile_features(script_path_host PRIVATE cxx_std_17)
     add_test(NAME script_path_links COMMAND "${INTAKE_PYTHON}" -B
