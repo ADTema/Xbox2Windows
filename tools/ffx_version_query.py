@@ -102,6 +102,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
 
         if host_ops and i.ip in host_ops:
             stmt = host_ops[i.ip]
+        elif i.segment_prefix in (R.FS, R.GS) or i.has_lock_prefix:
+            # FS/GS select a thread block base and LOCK makes the access atomic;
+            # the flat loads and stores below would silently drop both.
+            raise ValueError(f"unsupported instruction prefix at {i.ip:#x}: {i}")
         elif op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP):
             target = i.near_branch_target
             if target not in allowed:
