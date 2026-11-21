@@ -23,10 +23,12 @@ def decode_s_reg(reg_id: int) -> str:
         return "vcc_lo"
     if reg_id == 107:
         return "vcc_hi"
-    if reg_id == 108:
-        return "null"
+    if 108 <= reg_id <= 123:
+        return f"ttmp{reg_id - 108}"
     if reg_id == 124:
         return "m0"
+    if reg_id == 125:
+        return "null"
     if reg_id == 126:
         return "exec_lo"
     if reg_id == 127:
