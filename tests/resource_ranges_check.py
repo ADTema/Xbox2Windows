@@ -11,6 +11,11 @@ from paged_resource import PagedResource, Segment
 from section_probe import scan_window, sections
 
 
+class ShortReadStream(io.BytesIO):
+    def read(self, size: int = -1, /) -> bytes:
+        return super().read(min(size, 3) if size >= 0 else size)
+
+
 class ResourceChecks(unittest.TestCase):
     def test_ranges(self):
         first, middle, last = b"header", b"m" * 93, b"end"
@@ -27,6 +32,20 @@ class ResourceChecks(unittest.TestCase):
                 reader.read(pos, size)
         with self.assertRaises(ValueError):
             reader.read(7, 1, limit=8)
+
+    def test_short_reads_of_intact_segments(self) -> None:
+        decoded = b"range data from a synthetic segment"
+        for codec, stored, diagnostic in (
+            ("raw", decoded, "Truncated segment"),
+            ("zlib", zlib.compress(decoded), "Invalid compressed segment"),
+        ):
+            with self.subTest(codec=codec):
+                stream = ShortReadStream(stored)
+                reader = PagedResource(stream, [Segment(0, len(stored), len(decoded), codec)])
+                self.assertEqual(reader.read(2, len(decoded) - 4), decoded[2:-2])
+                stream.truncate(len(stored) - 1)
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    reader.read(0, len(decoded))
 
     def test_invalid_segments(self):
         packet = zlib.compress(b"page")
