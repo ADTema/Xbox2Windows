@@ -211,6 +211,12 @@ On the RTX 4060 Laptop the writer packs RGB into an R32_UINT UAV and the reader 
 
 On both local adapters the storage words and decoded channels matched nearest-even on every input. Both debug layers reported zero warnings and errors. The package supplies the local resource-creation path. These shaders test integer-coordinate texel loads. The next experiment traces the first package writer and reader of this intermediate.
 
+The integrated AMD Radeon(TM) Graphics of a Ryzen 5 7600 (RDNA 2, device `164e`, driver 32.0.21045.29003) reports typed UAV stores for RGB9E5, so the native path runs on a physical GPU. Its stores round the mantissas toward zero. In 317 of the 1,024 inputs this gives a different word from nearest-even, and every stored word matches a round-toward-zero encoding. The SRV loads decode those words exactly. The forced packed context on the same adapter still matches nearest-even. For FLOAT -> RGBE, section 19.3.2.2 of the D3D11.3 functional spec says conversion "should be done with nearest even. Round to nearest is allowed", and notes that hardware does not perform it. Its general rule for conversion to another float format, in section 3.2.2, is round-to-zero. The native check therefore accepts nearest-even, round-to-nearest or round-toward-zero and reports how many texels needed each alternative. A store that mixes the two alternatives fails. The Xbox Series X GPU is also RDNA 2; whether its native stores round the same way is untested.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^ffx_provider_loop_hardware$' -V
+```
+
 ### FSR4 dispatch through the RCAS input
 
 With sharpening enabled, the default i8 graph first touches the physical ID 16 texture in `FFX_FSR4_PASS_26`. It writes `rw_mlsr_output_color` (logical ID 10, UAV `u2`). The following `FFX_FSR4_RCAS_PASS` reads `r_rcas_input` (ID 16, SRV `t18`) and writes the external `rw_rcas_output` (ID 11, UAV `u11`). Each RCAS lane computes four output pixels. For each pixel it loads the center and four axial neighbors at integer texel coordinates. The native program contains 20 RGB `image_load` instructions with half-precision returns, four stores and zero sampler bindings.
