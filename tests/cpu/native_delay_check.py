@@ -28,6 +28,16 @@ def delay_import(image, symbol=None, ordinal=None):
         raise AssertionError(f"{symbol or f'#{ordinal}'} is not a delay import of {image.name}")
 
 
+def delay_thunk_offset(image, symbol):
+    """File offset of the INT thunk for a named delay import."""
+    with pefile.PE(str(image)) as pe:
+        desc, = pe.DIRECTORY_ENTRY_DELAY_IMPORT
+        for index, imported in enumerate(desc.imports):
+            if imported.name and imported.name.decode() == symbol:
+                return pe.get_offset_from_rva(desc.struct.pINT + 8 * index)
+    raise AssertionError(f"{symbol} is not a named delay import of {image.name}")
+
+
 def exports(image):
     with pefile.PE(str(image)) as pe:
         return {entry.name.decode(): entry.address for entry in pe.DIRECTORY_ENTRY_EXPORT.symbols if entry.name}
@@ -114,9 +124,21 @@ def check_call(mapper, image, provider, altered):
             raise AssertionError("zero-size delay directory did not bind the named import")
     finally:
         mapper.release(base)
+
+    # A named thunk with a bit above the 31-bit RVA must be rejected, not masked into a valid RVA.
+    thunk = delay_thunk_offset(image, "delayed_value")
+    copy = bytearray(Path(image).read_bytes())
+    original = struct.unpack_from("<Q", copy, thunk)[0]
+    struct.pack_into("<Q", copy, thunk, original | (1 << 40))
+    with TemporaryDirectory() as temp:
+        high_bits = Path(temp) / image.name
+        high_bits.write_bytes(copy)
+        base, status, detail, _ = mapper(high_bits, {**system, dll.casefold(): module})
+    if base or status != STATUS["format"] or detail != f"delay import name for {dll} outside image":
+        raise AssertionError(f"high-bit delay thunk: {base=} {status=} {detail=}")
     print(f"{image.name}: {dll}!delayed_value and {dll}!#2 bound at map time, the mapped calls match Windows, "
-          "the altered provider changes both results, a zero directory Size still binds, and without a binding "
-          "the map is rejected")
+          "the altered provider changes both results, a zero directory Size still binds, a named thunk with "
+          "bits above the 31-bit RVA is rejected, and without a binding the map is rejected")
 
 
 def check_rejections(mapper_path, image):
