@@ -1,7 +1,8 @@
 ; Source-owned differential fixture for BMI1 bit-manipulation instructions
 ; (ANDN, BEXTR, BLSI, BLSMSK, BLSR, TZCNT) in 32-bit and 64-bit forms.
 ; Each export writes (CF << 1) | ZF to the output pointer and returns RAX. ANDN and BEXTR
-; follow a compare that sets CF, so their CF = 0 is observed rather than inherited.
+; follow a compare that sets CF, and BLSMSK one that sets ZF, so the flags they clear are
+; observed rather than inherited.
 .code
 
 andn32 PROC FRAME
@@ -102,6 +103,7 @@ blsi64 ENDP
 blsmsk32 PROC FRAME
     .endprolog
     mov rax, -1
+    cmp ecx, ecx             ; ZF = 1, which BLSMSK must clear
     blsmsk eax, ecx
     mov r9d, 0
     jae short @F
@@ -116,6 +118,7 @@ blsmsk32 ENDP
 
 blsmsk64 PROC FRAME
     .endprolog
+    cmp ecx, ecx             ; ZF = 1, which BLSMSK must clear
     blsmsk rax, rcx
     mov r9d, 0
     jae short @F

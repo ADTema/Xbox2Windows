@@ -123,6 +123,9 @@ def check(native_path, lifted_path):
         0x4000, 0x403f, 0x4040, 0xff00, 0xffff, 0x0838,
         # Bits above 15 are ignored: the length is bits 15..8 only.
         0x10100, 0x232008, 0xfe0410,
+        # Bit 7 of each field matters (length 128, start 128), and lengths 31 and 63 are one
+        # short of the operand width.
+        0x8000, 0x0180, 0x1f00, 0x3f00,
     )
 
     binary_checks = 0
