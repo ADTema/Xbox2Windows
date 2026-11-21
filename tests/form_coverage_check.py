@@ -248,6 +248,28 @@ def check_dashboard():
     held = fc.masm_mnemonics(SWITCH) - fc.masm_mnemonics(BRANCH)
     total = sum(m[key]["total"] for key, _, _ in svg.AREAS)
     assert squares == {svg.COVERED: 8, svg.HELD: len(held), svg.OPEN: total - 8 - len(held)}, squares
+    # Every group, down to the one-form EXP box, keeps its squares and label inside its own box, and is
+    # labelled there or in the panel's "Too small to label" line.
+    root = ET.fromstring(drawn)
+    ns = "{http://www.w3.org/2000/svg}"
+    boxes = [box for box in root.iter(f"{ns}svg") if box is not root]
+    groups = [(name, g) for key, _, _ in svg.AREAS for name, g in m[key]["groups"].items() if g["total"]]
+    assert len(boxes) == len(groups), (len(boxes), len(groups))
+    labels = []
+    for box in boxes:
+        w, h = float(box.get("width")), float(box.get("height"))
+        for cell in box.iter(f"{ns}rect"):
+            right = float(cell.get("x", 0)) + float(cell.get("width"))
+            bottom = float(cell.get("y", 0)) + float(cell.get("height"))
+            assert right <= w + 0.01 and bottom <= h + 0.01, (box.attrib, cell.attrib)
+        for label in box.iter(f"{ns}text"):
+            assert len(label.text) * svg.LABEL_CHAR + 4 <= w and float(label.get("y")) <= h, (box.attrib, label.text)
+            labels.append(label.text)
+    footnotes = "".join(t.text for t in root.iter(f"{ns}text") if t.text.startswith("Too small to label: "))
+    for name, g in groups:
+        entry = f"{name} {g['covered']}/{g['total']}"
+        assert entry in labels or entry in footnotes, entry
+    assert "EXP 0/1" in footnotes  # the smallest group cannot hold its label
 
 
 if __name__ == "__main__":
