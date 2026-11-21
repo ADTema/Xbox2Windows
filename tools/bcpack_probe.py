@@ -40,6 +40,24 @@ def scan_lanes(prefix, *, lane_stride=8):
     return lanes
 
 
+def _decode_constant_lane(state: int, freq: int, blocks: int, supplied: bytes) -> list[int] | None:
+    """Return the zero-based symbols that consumed bytes, if the whole lane verifies."""
+    refill_symbols: list[int] = []
+    for symbol in range(blocks):
+        quotient, slot = divmod(state, SCALE)
+        if not 1 <= slot <= freq:
+            return None
+        state = freq * quotient + slot - 1
+        if state < LOWER:
+            if len(refill_symbols) == len(supplied):
+                return None
+            state = (state << 8) | supplied[len(refill_symbols)]
+            refill_symbols.append(symbol)
+    if state != LOWER or len(refill_symbols) != len(supplied):
+        return None
+    return refill_symbols
+
+
 def probe(prefix, blocks, *, prefetch_mask=0, prefetch=b"", next_mask=0, next_bytes=b"",
           lane_stride=8):
     if len(prefix) != 48 or not 1 <= blocks <= 1 << 20:
@@ -70,33 +88,31 @@ def probe(prefix, blocks, *, prefetch_mask=0, prefetch=b"", next_mask=0, next_by
         refills = len(refill_bytes)
         if budget != refills + 3 or state != int.from_bytes(state_bytes, "big"):
             continue
-        status = "header_match"
-        if refills == 0:
-            for _ in range(blocks):
-                quotient, slot = divmod(state, SCALE)
-                if not 1 <= slot <= freq:
-                    raise ValueError("Predicted constant lane contains an escape")
-                state = freq * quotient + slot - 1
-                if state < LOWER:
-                    raise ValueError("Decoder requires an unbudgeted input byte")
-            if state != LOWER:
-                raise ValueError("Incorrect rANS terminal state")
-            status = "verified_constant_lane"
-        match = {"lane": lane, "mode": mode, "refill_bytes": refills, "status": status}
+        match = {"lane": lane, "mode": mode, "refill_bytes": refills, "status": "header_match"}
         # Each round in which the lane reads takes its next refill byte, whichever round that is.
-        reads = 0
+        supplied = bytearray()
         for mask, data, start in rounds:
             if not mask & (1 << lane):
                 continue
             index = (mask & ((1 << lane) - 1)).bit_count()
-            if reads < refills:
-                name = ("first", "second")[reads]
+            read = len(supplied)
+            supplied.append(data[index])
+            if read < refills:
+                name = ("first", "second")[read]
                 match[f"{name}_refill_offset"] = start + index
-                match[f"{name}_refill_matches"] = data[index] == refill_bytes[reads]
+                match[f"{name}_refill_matches"] = data[index] == refill_bytes[read]
             else:
                 # The header budget leaves this lane no byte for the read.
                 match.setdefault("unbudgeted_read_offsets", []).append(start + index)
-            reads += 1
+        if refills == 0:
+            if _decode_constant_lane(state, freq, blocks, b"") is None:
+                raise ValueError("Predicted constant lane did not reach its terminal state")
+            match["status"] = "verified_constant_lane"
+        elif len(supplied) == refills:
+            symbols = _decode_constant_lane(state, freq, blocks, bytes(supplied))
+            if symbols is not None:
+                match["status"] = "verified_constant_lane_with_supplied_refills"
+                match["refill_symbol_indices"] = symbols
         matches.append(match)
     return matches
 
