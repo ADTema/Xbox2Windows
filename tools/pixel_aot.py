@@ -549,6 +549,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
                 sample_dest.add(f"v{n}")
+        elif m := match(r"v_(fmaak|fmamk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+            op, dst, *tokens = m.groups()
+            literal = tokens[2] if op == "fmaak" else tokens[1]
+            if mask != "entry" or not re.fullmatch(r"0x[0-9a-f]{1,8}", literal):
+                raise ValueError("Invalid literal multiply-add")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {ALU['fma'][1].format(*values)};")
         elif m := match(r"v_mov_b32(?:_e32|_e64)? (v\d+), (-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)"):
             # A bit copy of a numeric value; integer inline constants are bit patterns.
             dst, src = m.groups()
