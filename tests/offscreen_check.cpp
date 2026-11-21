@@ -361,7 +361,7 @@ int main(int argc, char** argv)
     if (argc < 3) return 2;
     const std::string_view operation = argv[2];
     if (operation == "--check-bc7-tail") {
-        if (argc < 6 || argc > 16) return 2;
+        if (argc < 6) return 2;
     } else {
         if (argc != 3 && argc != 5 && argc != 6) return 2;
         if (argc == 6 && operation != "--check-bc7" && operation != "--check-bc7-mip1") return 2;
