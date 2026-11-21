@@ -68,7 +68,7 @@ def native_program(archive, record):
     return blob, image[start:ends[0]]
 
 
-def disassemble(code, library):
+def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):
     llvm = C.CDLL(library)
     for component in ("TargetInfo", "Target", "TargetMC", "AsmPrinter", "Disassembler"):
         getattr(llvm, "LLVMInitializeAMDGPU" + component)()
@@ -78,9 +78,9 @@ def disassemble(code, library):
     llvm.LLVMDisasmInstruction.argtypes = [pointer, pointer, C.c_uint64, C.c_uint64, pointer, C.c_size_t]
     llvm.LLVMDisasmInstruction.restype = C.c_size_t
     llvm.LLVMDisasmDispose.argtypes = [pointer]
-    ctx = llvm.LLVMCreateDisasmCPU(b"amdgcn--amdpal", b"gfx1013", None, 0, None, None)
+    ctx = llvm.LLVMCreateDisasmCPU(b"amdgcn--amdpal", cpu, None, 0, None, None)
     if not ctx:
-        raise ValueError("LLVM has no gfx1013 disassembler")
+        raise ValueError(f"LLVM has no {cpu.decode()} disassembler")
     raw = C.create_string_buffer(code)
     offset = 0
     instructions = []
@@ -91,7 +91,8 @@ def disassemble(code, library):
                                               offset, line, len(line))
             if not size:
                 raise ValueError(f"Unknown instruction at byte {offset}")
-            instructions.append(line.value.decode("ascii").strip())
+            decoded = line.value.decode("ascii").strip()
+            instructions.append((offset, decoded) if offsets else decoded)
             offset += size
     finally:
         llvm.LLVMDisasmDispose(ctx)
@@ -274,7 +275,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or sample_pending or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
-        elif m := match(r"exp mrt0 (v\d+), \1, (v\d+), \2 done compr vm"):
+        elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+), \2 done compr vm"):
             pairs = [vector[v] for v in m.groups()]
             if mask != "entry" or exported or not all(isinstance(p, tuple) and len(p)==2 and
                     all(v.startswith(("sample", "alu")) for v in p) for p in pairs):

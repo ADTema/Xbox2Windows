@@ -1,0 +1,4 @@
+EXPORTS
+    BinkSetMemory
+    heap_request
+    heap_release
