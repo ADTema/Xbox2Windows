@@ -5,6 +5,8 @@ Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) s
 New to the project? The [pinned guide in GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions/75) will help you choose a first contribution. Ask build and debugging questions in [Development Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a).
 
 [![Instruction-form coverage of source-built fixtures, not a measure of port completion](docs/coverage/dashboard.svg)](tools/coverage_svg.py)
+<img width="1051" height="836" alt="image" src="https://github.com/user-attachments/assets/27a52021-1932-48a8-8800-add29c16d86e" />
+<img width="1051" height="836" alt="image" src="https://github.com/user-attachments/assets/b3f388db-1b61-4e58-9bb4-fb086e48d13e" />
 
 ## Current results and open work
 
@@ -96,6 +98,7 @@ Review `gpu-report-hardware.md` and paste its full contents as a comment on the 
 | NVIDIA GeForce RTX 3090 | 32 | Skipped, lane range 32–32 | 408 queries passed | [32.0.16.2124 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7068348193) |
 | NVIDIA RTX 3500 Ada Generation Laptop GPU | 32 | Skipped, lane range 32–32 | 408 queries passed | [32.0.16.2124 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7068667745) |
 | AMD Radeon Graphics (device 15bf) | 32 | Passed, 64 lanes | 408 queries passed | [32.0.32015.14001 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7069396910) |
+| AMD Radeon RX 5600 XT | 32 | Passed, 64 lanes | Skipped, DXR unsupported | [32.0.21045.16010 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7070378299) |
 | Microsoft WARP (software) | 4 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
 
 On CachyOS, an RTX 3060 completed 408 comparisons through Proton and vkd3d-proton with NVIDIA driver 620.70.06. The adapter reported a 32-lane maximum and skipped forced wave64. [Linux translation-layer report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064204388)
