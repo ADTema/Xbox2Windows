@@ -67,20 +67,35 @@ def export_keys(rows):
     return keys
 
 
-def resolve_desktop(dll, symbol, importer, contracts, system_exports):
-    """Follow System32 export forwarders without loading any DLL."""
+def resolve_desktop(dll, symbol, importer, contracts, system_exports, package_exports=None):
+    """Follow export forwarders without loading any DLL.
+
+    package_exports, when given, maps a plain module name to its package paths and export table.
+    Package images then take precedence over System32. API-set contracts always select System32 hosts.
+    """
     chain = []
     seen = set()
     while True:
         aliases = contracts.get(dll.rpartition("-")[0]) if dll.startswith(("api-", "ext-")) else None
-        host = dll if aliases is None else aliases.get(importer, aliases.get("", ""))
+        packaged, table = package_exports(dll) if package_exports and aliases is None else ((), None)
+        if len(packaged) == 1:
+            host = packaged[0]
+        else:
+            host = dll if aliases is None else aliases.get(importer, aliases.get("", ""))
         step = dict(dll=dll, provider=host or None, symbol=symbol)
+        if package_exports:
+            step["package"] = bool(packaged)
         chain.append(step)
+        if len(packaged) > 1:
+            step["provider"] = None
+            status = "ambiguous_package_basename"
+            break
         if (host, symbol) in seen:
             status = "forwarder_cycle"
             break
         seen.add((host, symbol))
-        table = system_exports(host)
+        if not packaged:
+            table = system_exports(host)
         if table is None:
             status = "provider_not_found"
             break
@@ -98,26 +113,70 @@ def resolve_desktop(dll, symbol, importer, contracts, system_exports):
         if not separator or not module or not name:
             status = "invalid_forwarder"
             break
-        dll, symbol, importer = module.lower() + ".dll", name, host
+        dll, symbol, importer = module.lower() + ".dll", name, Path(host).name.lower()
     return dict(status=status, chain=chain)
+
+
+def read_rva(pe, rva, size):
+    section = pe.get_section_by_rva(rva)
+    data = section.get_data(rva, size) if section else b""
+    if len(data) != size:
+        raise ValueError(f"Import data at RVA {rva:#x} is outside the file's sections")
+    return data
+
+
+def read_name(pe, rva):
+    section = pe.get_section_by_rva(rva)
+    name, terminator, _ = (section.get_data(rva, 0x10000) if section else b"").partition(b"\0")
+    if not terminator:
+        raise ValueError(f"Unterminated import name at RVA {rva:#x}")
+    return name
+
+
+def import_tables(pe, path):
+    """Read import descriptors and lookup tables as stored.
+
+    pefile skips lookup entries whose names fall outside its function-name character set and
+    entries for ordinal 0, drops a descriptor left empty by either, and names ordinal imports
+    from a few system DLLs. The inventory keeps every entry exactly as the image requests it.
+    """
+    wide = pe.OPTIONAL_HEADER.Magic == 0x20B
+    width, by_ordinal = (8, 1 << 63) if wide else (4, 1 << 31)
+    directories = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    imports = []
+    for kind, index, layout in (("normal", 1, struct.Struct("<5I")), ("delay", 13, struct.Struct("<8I"))):
+        if index >= len(directories) or not (directories[index].VirtualAddress or directories[index].Size):
+            continue
+        rva, found = directories[index].VirtualAddress, 0
+        while True:
+            fields = layout.unpack(read_rva(pe, rva, layout.size))
+            rva += layout.size
+            if kind == "normal":
+                original_first_thunk, _, _, name, first_thunk = fields
+                lookup, base = original_first_thunk or first_thunk, 0
+            else:
+                attributes, name, _, _, lookup = fields[:5]
+                # Version 1 delay descriptors hold RVAs. Older ones hold virtual addresses.
+                base = 0 if attributes & 1 else pe.OPTIONAL_HEADER.ImageBase
+            if not name:
+                break
+            found += 1
+            module = label(read_name(pe, name - base)).lower()
+            entry = lookup - base
+            while value := int.from_bytes(read_rva(pe, entry, width), "little"):
+                entry += width
+                symbol = (f"#{value & 0xFFFF}" if value & by_ordinal
+                          else label(read_name(pe, ((value - base) & 0x7FFFFFFF) + 2)))
+                imports.append((kind, module, symbol))
+        if not found:
+            raise ValueError(f"Could not parse {kind} imports in {path}")
+    return imports
 
 
 def parse_image(path):
     with pefile.PE(str(path), fast_load=True) as pe:
-        pe.parse_data_directories(directories=[0, 1, 13])
-        imports = []
-        for kind, attribute, index in (("normal", "DIRECTORY_ENTRY_IMPORT", 1),
-                                       ("delay", "DIRECTORY_ENTRY_DELAY_IMPORT", 13)):
-            descriptors = getattr(pe, attribute, [])
-            directories = pe.OPTIONAL_HEADER.DATA_DIRECTORY
-            if (index < len(directories) and (directories[index].VirtualAddress or directories[index].Size)
-                    and not descriptors):
-                raise ValueError(f"Could not parse {kind} imports in {path}")
-            for d in descriptors:
-                module = label(d.dll).lower()
-                for s in d.imports:
-                    symbol = label(s.name) if s.name is not None else f"#{s.ordinal}"
-                    imports.append((kind, module, symbol))
+        pe.parse_data_directories(directories=[0])
+        imports = import_tables(pe, path)
         with path.open("rb") as f:
             digest = hashlib.file_digest(f, "sha256").hexdigest()
         info = {
@@ -138,18 +197,21 @@ def scan(root, *, extra_image=None):
     contracts = api_sets(system)
     system_images = {p.name.lower(): p for p in system.glob("*.dll")}
 
+    def export_table(rows):
+        table = {}
+        for row in rows:
+            table[f"#{row['ordinal']}"] = row["forwarder"]
+            if row["name"] is not None:
+                table[row["name"]] = row["forwarder"]
+        return table
+
     @cache
     def system_exports(name):
         if name not in system_images:
             return None
         with pefile.PE(str(system_images[name]), fast_load=True) as pe:
             pe.parse_data_directories(directories=[0])
-            table = {}
-            for row in exports(pe):
-                table[f"#{row['ordinal']}"] = row["forwarder"]
-                if row["name"] is not None:
-                    table[row["name"]] = row["forwarder"]
-            return table
+            return export_table(exports(pe))
 
     images = {}
     edges = []
@@ -171,9 +233,14 @@ def scan(root, *, extra_image=None):
     if not images:
         raise ValueError(f"No DLLs or EXEs under {root}")
 
+    def package_exports(name):
+        found = [path for path, _ in bundled[name]]
+        return found, export_table(images[found[0]]["exports"]) if len(found) == 1 else None
+
     rows = []
     for image, kind, dll, symbol in sorted(set(edges)):
-        resolution = resolve_desktop(dll, symbol, Path(image).name.lower(), contracts, system_exports)
+        importer = Path(image).name.lower()
+        resolution = resolve_desktop(dll, symbol, importer, contracts, system_exports)
         first = resolution["chain"][0]
         # Keep desktop_export as the first-hop comparison for existing report readers.
         status = "export_present" if "forwarder" in first else resolution["status"]
@@ -185,8 +252,14 @@ def scan(root, *, extra_image=None):
             "bundle_exports_in": sorted(p for p, keys in bundled[dll] if symbol in keys),
             "desktop_provider": first["provider"], "desktop_export": status, "desktop_candidate": candidate,
             "desktop_resolution": resolution,
+            # Follow forwarders in a packaged provider. Absent when the package lacks the module.
+            "package_resolution": resolve_desktop(dll, symbol, importer, contracts, system_exports,
+                                                  package_exports) if bundled[dll] else None,
         })
-    unresolved = [r for r in rows if r["desktop_resolution"]["status"] != "export_present" and not r["bundle_exports_in"]]
+    # A packaged forwarder satisfies an edge only when its chain reaches a terminal export.
+    unresolved = [r for r in rows if r["desktop_resolution"]["status"] != "export_present"
+                  and not (r["bundle_exports_in"] and r["package_resolution"]["status"]
+                           in {"export_present", "ambiguous_package_basename"})]
     return {
         "schema": 1, "host_windows_build": sys.getwindowsversion().build, "pefile": pefile.__version__,
         "behavior": "Scarlett behavior unverified for every import. Static export matches include forwarders.",
@@ -201,6 +274,8 @@ def scan(root, *, extra_image=None):
             "desktop_results": dict(Counter(r["desktop_export"] for r in rows)),
             "desktop_terminal_results": dict(Counter(r["desktop_resolution"]["status"] for r in rows)),
             "desktop_forwarded_edges": sum(len(r["desktop_resolution"]["chain"]) > 1 for r in rows),
+            "package_terminal_results": dict(Counter(r["package_resolution"]["status"]
+                                                     for r in rows if r["package_resolution"])),
         },
         "unresolved_edges": [dict(r, desktop_experiment=EXPERIMENTS.get((r["dll"], r["symbol"])))
                              for r in unresolved],
