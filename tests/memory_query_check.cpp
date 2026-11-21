@@ -26,15 +26,16 @@ bool caller_accepts(const QueryBuffer& buffer, SIZE_T returned, bool source)
            (!source || (buffer.info.Protect & 6));
 }
 
-bool region_is(BYTE* address, BYTE* base, DWORD state, SIZE_T size, DWORD protection)
+bool region_is(BYTE* page_start, BYTE* base, DWORD state, SIZE_T size, DWORD protection,
+               SIZE_T offset_in_page = 0)
 {
     QueryBuffer buffer{};
     buffer.tail.fill(0xa5);
     auto& info = buffer.info;
-    return VirtualQueryEx(GetCurrentProcess(), address, &info, sizeof(buffer)) == sizeof(info) &&
+    return VirtualQueryEx(GetCurrentProcess(), page_start + offset_in_page, &info, sizeof(buffer)) == sizeof(info) &&
            std::all_of(buffer.tail.begin(), buffer.tail.end(), [](BYTE b) { return b == 0xa5; }) &&
-           info.AllocationBase == base && info.BaseAddress == address &&
-           info.State == state && info.RegionSize >= size &&
+           info.AllocationBase == base && info.BaseAddress == page_start &&
+           info.State == state && info.RegionSize == size &&
            (state != MEM_COMMIT || info.Protect == protection);
 }
 
@@ -70,6 +71,42 @@ bool check_short_query(BYTE* address)
            !caller_accepts(buffer, written, false) && !caller_accepts(buffer, written, true);
 }
 
+bool check_partial_decommit(SIZE_T page)
+{
+    std::unique_ptr<BYTE, ReleaseRegion> storage(static_cast<BYTE*>(
+        VirtualAlloc(nullptr, 4 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)));
+    BYTE* base = storage.get();
+    if (!base) return false;
+    constexpr BYTE marker = 0xa5;
+    std::fill_n(base, 4 * page, marker);
+
+    // The two-byte request spans the middle two pages of the reservation.
+    BYTE* boundary = base + 2 * page;
+    if (!VirtualFree(boundary - 1, 2, MEM_DECOMMIT) ||
+        !region_is(base, base, MEM_COMMIT, page, PAGE_READWRITE) ||
+        !region_is(base + page, base, MEM_RESERVE, 2 * page, 0, page - 1) ||
+        !region_is(boundary, base, MEM_RESERVE, page, 0) ||
+        !region_is(base + 3 * page, base, MEM_COMMIT, page, PAGE_READWRITE)) {
+        std::fputs("Two-byte decommit: expected two reserved pages between committed neighbors\n", stderr);
+        return false;
+    }
+    if (VirtualAlloc(boundary - 1, 2, MEM_COMMIT, PAGE_READWRITE) != base + page ||
+        !region_is(base, base, MEM_COMMIT, 4 * page, PAGE_READWRITE)) {
+        std::fputs("Two-byte recommit: expected one four-page read/write region\n", stderr);
+        return false;
+    }
+    const auto marked = [marker](BYTE byte) { return byte == marker; };
+    if (!std::all_of(base, base + page, marked) ||
+        !std::all_of(base + page, base + 3 * page, [](BYTE byte) { return byte == 0; }) ||
+        !std::all_of(base + 3 * page, base + 4 * page, marked)) {
+        std::fputs("Recommitted pages must be zero and neighboring pages must retain their data\n", stderr);
+        return false;
+    }
+    std::printf("decommitted_bytes=%zu recommitted_zero_bytes=%zu preserved_bytes=%zu\n",
+                2 * page, 2 * page, 2 * page);
+    return true;
+}
+
 bool snapshot(const char* stage)
 {
     PROCESS_MEMORY_COUNTERS_EX counters{};
@@ -88,6 +125,7 @@ int main()
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
     const SIZE_T page = info.dwPageSize;
+    if (!check_partial_decommit(page)) return 1;
     const SIZE_T bytes = 1024 * page;
     std::unique_ptr<BYTE, ReleaseRegion> storage(static_cast<BYTE*>(
         VirtualAlloc(nullptr, bytes + page, MEM_RESERVE, PAGE_NOACCESS)));
