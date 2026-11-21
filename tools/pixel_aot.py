@@ -281,6 +281,29 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 word = offset // 4 + j
                 scalar[f"s{n}"] = ("cbv", j) if descriptor else f"params[{word // 4}].{'xyzw'[word % 4]}"
                 pending.add(f"s{n}")
+        elif m := match(r"v_cube(id|sc|tc|ma)_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+?)( clamp)?"):
+            # LLVM ConstantFoldAMDGCNCubeIntrinsic: z, then y, then x is the major axis; a face is negative
+            # only for a nonzero, non-NaN negative coordinate.
+            op, dst, *tokens, clamp = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid cube operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            x, y, z = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            lines.append(f"    precise float3 cube{i} = float3({x}, {y}, {z});")
+            c, a = f"cube{i}", f"abs(cube{i})"
+            zmajor = f"({a}.z >= {a}.x && {a}.z >= {a}.y)"
+            ymajor = f"({a}.y >= {a}.x)"
+            expression = {
+                "id": f"({zmajor} ? ({c}.z < 0.0f ? 5.0f : 4.0f) : {ymajor} ? ({c}.y < 0.0f ? 3.0f : 2.0f) : ({c}.x < 0.0f ? 1.0f : 0.0f))",
+                "sc": f"({zmajor} ? ({c}.z < 0.0f ? -{c}.x : {c}.x) : {ymajor} ? {c}.x : ({c}.x < 0.0f ? {c}.z : -{c}.z))",
+                "tc": f"({zmajor} ? -{c}.y : {ymajor} ? ({c}.y < 0.0f ? -{c}.z : {c}.z) : -{c}.y)",
+                "ma": f"(({zmajor} ? {c}.z : {ymajor} ? {c}.y : {c}.x) * 2.0f)",
+            }[op]
+            if clamp:
+                expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_interp_p([12])_f32_e32 (v\d+), (v\d+), attr0\.([xy])"):
             phase, dst, src, component = m.groups()
             if mask != "quad" or scalar.get("m0") != "interp_base":
