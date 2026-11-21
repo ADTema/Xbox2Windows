@@ -248,14 +248,18 @@ bool check_gpu_alias_lookup_writes(ID3D12Device* device)
     static_assert(sizeof(Record) == 16);
     std::vector<Record> records;
 
-    // Stores: words at the start, middle and end of every allocation and on both sides of the
-    // 4 GiB line. Neighbouring words keep their pattern.
+    // Stores: words at the start, middle and end of every allocation (the placed allocation's
+    // middle is the 4 GiB line itself) and the words on either side of the line. Every address is
+    // distinct, so no two stores race; neighbouring words keep their pattern.
     std::vector<std::uint64_t> stored;
     for (const auto& title : fixture.titles)
         for (std::uint64_t offset : {std::uint64_t{0}, title->size / 2, title->size - 4})
             stored.push_back(title->begin() + offset);
     stored.push_back(fixture.line() - 4);
-    stored.push_back(fixture.line());
+    stored.push_back(fixture.line() + 4);
+    for (std::size_t i = 0; i < stored.size(); ++i)
+        for (std::size_t j = i + 1; j < stored.size(); ++j)
+            if (stored[i] == stored[j]) throw std::runtime_error("two store records share an address");
     for (std::size_t i = 0; i < stored.size(); ++i)
         records.push_back({stored[i], Store, 0x5100'0000u + static_cast<Word>(i)});
 
