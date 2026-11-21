@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from paged_resource import PagedResource, Segment
 from section_probe import inspect as inspect_sections
 from section_probe import scan_window, sections
-from texture_descriptors import inventory, raw_page_map
+from texture_descriptors import inventory, raw_page_map, zlib_segment
 
 
 class ShortReadStream(io.BytesIO):
@@ -52,7 +52,96 @@ def raw_page_archive() -> bytearray:
     return archive
 
 
+def zlib_page_archive() -> tuple[bytearray, bytes, bytes]:
+    archive = bytearray(8960)
+    struct.pack_into("<4sIQ", archive, 0, b"RDS5", 4, 16384)
+    # One zlib interval occupies 512 stored bytes from offset 4352, and
+    # logical pages 1 and 2. The descriptor points to its second page.
+    struct.pack_into("<8I", archive, 16, 1, 0, (1 << 30) | (8 << 26) | 17, 0,
+                     (3 << 30) | 19, 0, 35, 1)
+    struct.pack_into("<4sIII4I", archive, 256, b"ETPF", 0, 1, 0, 0x3c00f, 98 << 3, 2, 0)
+    plain = b"A" * 4096 + b"BCDE" * 1024
+    packed = zlib.compress(plain)
+    archive[4352:4352 + len(packed)] = packed
+    return archive, packed, plain
+
+
 class ResourceChecks(unittest.TestCase):
+    def test_verified_zlib_segment(self) -> None:
+        tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
+        archive, packed, plain = zlib_page_archive()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "zlib.ttpf"
+            path.write_bytes(archive)
+            result = subprocess.run([sys.executable, "-B", tool, path, "--zlib-segment", "0"],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report, {
+            "segment_logical_offset": 4096, "page_offset_in_segment": 4096,
+            "segment": {"offset": 4352, "stored": len(packed), "size": 8192, "codec": "zlib"},
+        })
+        reader = PagedResource(io.BytesIO(archive), [Segment(**report["segment"])])
+        self.assertEqual(reader.read(report["page_offset_in_segment"], 4096), plain[4096:])
+        padded = PagedResource(io.BytesIO(archive), [Segment(4352, 512, 8192, "zlib")])
+        with self.assertRaises(ValueError):
+            padded.read(0, 1)
+
+    def test_zlib_segment_rejections(self) -> None:
+        archive, packed, plain = zlib_page_archive()
+        bad_checksum = packed[:-1] + bytes([packed[-1] ^ 1])
+        for label, data in (
+            ("checksum", bad_checksum),
+            ("truncated stored stream", zlib.compress(plain, level=0)[:512]),
+            ("short output", zlib.compress(plain[:-1])),
+            ("long output", zlib.compress(plain + b"x")),
+            ("nonzero padding", packed + b"other bytes"),
+            ("second member", packed + zlib.compress(b"another stream")),
+        ):
+            with self.subTest(label=label):
+                changed = archive.copy()
+                changed[4352:4864] = data.ljust(512, b"\0")
+                with self.assertRaises(ValueError):
+                    zlib_segment(io.BytesIO(changed), 0)
+        struct.pack_into("<I", archive, 280, 3)
+        with self.assertRaises(ValueError):
+            zlib_segment(io.BytesIO(archive), 0)
+
+    def test_zlib_segment_read_budget(self) -> None:
+        archive, packed, _ = zlib_page_archive()
+
+        class MetadataOnly(io.BytesIO):
+            def read(self, size: int = -1, /) -> bytes:
+                pos = self.tell()
+                if not (0 <= size and (pos + size <= 48 or 256 <= pos <= pos + size <= 288)):
+                    raise AssertionError("Attempt to read an oversized zlib interval")
+                return super().read(size)
+
+        oversized = (1 << 20) + 4096
+        for label in ("stored", "decoded"):
+            with self.subTest(label=label):
+                changed = archive.copy()
+                if label == "stored":
+                    end = 4352 + oversized
+                    changed.extend(bytes(end + 4096 - len(changed)))
+                    struct.pack_into("<I", changed, 32, (3 << 30) | (end // 256))
+                    struct.pack_into("<I", changed, 40, len(changed) // 256)
+                else:
+                    end = 4096 + oversized
+                    struct.pack_into("<Q", changed, 8, end + 4096)
+                    struct.pack_into("<II", changed, 32, (2 << 30) | 19, end // 16384)
+                    struct.pack_into("<II", changed, 40, (3 << 30) | 35, (end + 4096) // 16384)
+                with self.assertRaisesRegex(ValueError, "budget"):
+                    zlib_segment(MetadataOnly(changed), 0)
+
+        class OneInterval(MetadataOnly):
+            def read(self, size: int = -1, /) -> bytes:
+                if self.tell() == 4352 and size == 512:
+                    return io.BytesIO.read(self, size)
+                return super().read(size)
+
+        self.assertEqual(zlib_segment(OneInterval(archive), 0).segment.stored, len(packed))
+
     def test_raw_page_map(self) -> None:
         tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
         archive = raw_page_archive()
