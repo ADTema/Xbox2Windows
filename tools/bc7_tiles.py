@@ -19,3 +19,21 @@ def linearize_4k_s(payload, width, height):
             dst = (y * columns + x) * 16
             output[dst:dst + 16] = payload[src:src + 16]
     return bytes(output)
+
+
+def linearize_4k_s_tail(tile, width, height, tail_level):
+    """Read a BC7 mip from a shared 4 KiB tile; level zero is the largest packed mip."""
+    if not 0 <= tail_level < 8 or width <= 0 or height <= 0:
+        raise ValueError("Invalid BC7 mip tail dimensions or level")
+    columns, rows = (width + 3) // 4, (height + 3) // 4
+    if columns > max(1, 8 >> tail_level) or rows > max(1, 16 >> tail_level):
+        raise ValueError("Mip exceeds its slot in the 4 KiB tail")
+    # GFX10 thin, 16-byte elements: positions in the 16-by-16 block tile.
+    origins = ((8, 0), (4, 8), (0, 12), (0, 8), (4, 4), (4, 0), (0, 4), (0, 0))
+    x, y = origins[tail_level]
+    raster = linearize_4k_s(tile, 64, 64)
+    output = bytearray()
+    for row in range(y, y + rows):
+        start = (row * 16 + x) * 16
+        output.extend(raster[start:start + columns * 16])
+    return bytes(output)
