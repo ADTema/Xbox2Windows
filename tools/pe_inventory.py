@@ -144,12 +144,25 @@ def read_name(pe, rva):
     return name
 
 
+def module_name(raw):
+    """Return the file name the loader looks for when an import descriptor names raw.
+
+    Like LoadLibrary, the loader appends .dll to a name without an extension. A trailing dot stops
+    the append and is not part of the file name.
+    """
+    name = label(raw).lower()
+    if name.endswith("."):
+        return name.rstrip(".")
+    return name if "." in name.replace("/", "\\").rpartition("\\")[2] else name + ".dll"
+
+
 def import_tables(pe, path):
     """Read import descriptors and lookup tables as stored.
 
     pefile skips lookup entries whose names fall outside its function-name character set and
     entries for ordinal 0, drops a descriptor left empty by either, and names ordinal imports
-    from a few system DLLs. The inventory keeps every entry exactly as the image requests it.
+    from a few system DLLs. The inventory keeps every entry exactly as the image requests it,
+    with each module under the file name the loader looks for.
     """
     wide = pe.OPTIONAL_HEADER.Magic == 0x20B
     width, by_ordinal = (8, 1 << 63) if wide else (4, 1 << 31)
@@ -172,7 +185,7 @@ def import_tables(pe, path):
             if not name:
                 break
             found += 1
-            module = label(read_name(pe, name - base)).lower()
+            module = module_name(read_name(pe, name - base))
             entry = lookup - base
             while value := int.from_bytes(read_rva(pe, entry, width), "little"):
                 entry += width
