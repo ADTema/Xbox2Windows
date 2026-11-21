@@ -428,6 +428,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_seh COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_seh_check.py" "$<TARGET_FILE:cpu_seh_original>"
         "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_register_probe>")
+    add_test(NAME cpu_native_section COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_section_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_register_probe>")
     add_library(cpu_tls_sink SHARED tests/cpu/tls_sink.cpp)
     foreach(variant IN ITEMS original refuse)
         add_library(cpu_tls_${variant} SHARED tests/cpu/tls_route.asm tests/cpu/tls_route.def)
@@ -489,6 +492,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME static_exe_intake COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/intake/check.py" "$<TARGET_FILE:intake_candidate>"
         "$<TARGET_FILE:intake_provider>")
+    # intake_forward exports six placeholders. The test rewrites a copy so each export is a forwarder;
+    # it reads the images and never loads them.
+    add_library(intake_forward SHARED tests/intake/provider.cpp tests/intake/forward.def)
+    add_executable(intake_forward_caller tests/intake/forward_caller.cpp)
+    target_link_libraries(intake_forward_caller PRIVATE intake_forward)
+    add_test(NAME bundled_export_forwarders COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/intake/forwarders_check.py" "$<TARGET_FILE:intake_forward_caller>"
+        "$<TARGET_FILE:intake_forward>" "$<TARGET_FILE:intake_provider>")
     add_test(NAME layout_chunk_summary COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/layout_chunks_check.py")
 endif()

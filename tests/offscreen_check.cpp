@@ -373,6 +373,8 @@ int main(int argc, char** argv)
             check_bc7_pixel(device.Get(), argv[3], argv[4], nullptr, argv[5]);
         } else if ((argc == 5 || argc == 6) && operation == "--check-bc7") {
             check_bc7_pixel(device.Get(), argv[3], argv[4], argc == 6 ? argv[5] : nullptr);
+        } else if (argc == 5 && (operation == "--dual-pixel" || operation == "--dual-pixel-swapped")) {
+            check_dual_pixel(device.Get(), argv[3], argv[4], operation == "--dual-pixel-swapped");
         } else if (argc == 5 && operation == "--check-pixel-case") {
             check_translated_pixel(device.Get(), argv[3], false, argv[4]);
         } else if (operation == "--check-pixel") {
