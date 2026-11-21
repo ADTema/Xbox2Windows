@@ -503,10 +503,6 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/direct_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_call_original>" "$<TARGET_FILE:cpu_call_original_lifted>"
         "$<TARGET_FILE:cpu_call_altered_lifted>")
-    add_test(NAME cpu_aot_repeated_call COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_SOURCE_DIR}/tests/cpu/repeat_call_check.py" "$<TARGET_FILE:cpu_register_probe>"
-        "$<TARGET_FILE:cpu_repeat_original>" "$<TARGET_FILE:cpu_repeat_original_lifted>"
-        "$<TARGET_FILE:cpu_repeat_altered_lifted>" "$<TARGET_FILE:cpu_repeat_dropped>")
     foreach(kind IN ITEMS named ordinal)
         if(kind STREQUAL "named")
             set(prefix cpu_import)
@@ -525,6 +521,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         cpu_translation(${prefix}_original cpu_call_aot call_mix PROVIDER ${prefix}_provider ${contract})
         target_link_options(${prefix}_original_lifted PRIVATE /INCREMENTAL:NO)
     endforeach()
+    cpu_asm_fixture(cpu_repeat_import repeat_call repeat_import)
+    target_compile_definitions(cpu_repeat_import PRIVATE IMPORT_MIX)
+    target_link_libraries(cpu_repeat_import PRIVATE cpu_import_provider)
+    cpu_translation(cpu_repeat_import cpu_call_aot call_twice PROVIDER cpu_import_provider SYMBOL mix_args)
+    target_link_options(cpu_repeat_import_lifted PRIVATE /INCREMENTAL:NO)
+    add_test(NAME cpu_aot_repeated_call COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/repeat_call_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_repeat_original>" "$<TARGET_FILE:cpu_repeat_original_lifted>"
+        "$<TARGET_FILE:cpu_repeat_altered_lifted>" "$<TARGET_FILE:cpu_repeat_dropped>"
+        "$<TARGET_FILE:cpu_repeat_import>" "$<TARGET_FILE:cpu_repeat_import_lifted>")
     add_test(NAME cpu_aot_import_call COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/import_check.py" "$<TARGET_FILE:cpu_import_original>"
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
