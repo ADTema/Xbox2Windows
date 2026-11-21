@@ -117,7 +117,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
         elif op == M.LEA:
             stmt = write(address())
         elif op == M.CMP:
-            stmt = f"zero = ({operand(0)} == {operand(1)}); carry = ({operand(0)} < {operand(1)});"
+            # Sign-extended immediates arrive as 64-bit values; compare at the destination width.
+            width = UINT[MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)]
+            stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({operand(1)}); "
+                    f"zero = a == b; carry = a < b; }}")
         elif op == M.TEST:
             stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false;"
         elif op == M.IMUL and i.op_count in (2, 3) and RegisterExt.size(i.op0_register) == 4:
