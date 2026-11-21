@@ -1,6 +1,8 @@
 """Summarize the ETPF texture descriptors in the first raw range of an RDS5 archive."""
 import argparse
 from collections import Counter
+from collections.abc import Iterator
+from itertools import pairwise
 import json
 from pathlib import Path
 import struct
@@ -22,6 +24,19 @@ class Boundary(NamedTuple):
     codec: int
 
 
+class Tables(NamedTuple):
+    archive: PagedResource
+    metadata: PagedResource
+    boundaries: int
+    records: int
+    logical_size: int
+
+
+class PageMap(NamedTuple):
+    logical_offset: int
+    file_offset: int
+
+
 def boundary(data: bytes, offset: int = 0) -> Boundary:
     low, high = struct.unpack_from("<II", data, offset)
     return Boundary((low & 0x03ffffff) * 256,
@@ -29,7 +44,7 @@ def boundary(data: bytes, offset: int = 0) -> Boundary:
                     (low >> 26) & 15)
 
 
-def inventory(stream: BinaryIO) -> Counter[Descriptor]:
+def read_tables(stream: BinaryIO) -> Tables:
     size = stream.seek(0, 2)
     if size < 32:
         raise ValueError("Truncated RDS5 header")
@@ -61,28 +76,75 @@ def inventory(stream: BinaryIO) -> Counter[Descriptor]:
     table_bytes = records * 16
     if table_bytes > min(1 << 20, extent - 16):
         raise ValueError("ETPF descriptor table exceeds its first range or 1 MiB budget")
+    return Tables(archive, metadata, count, records, logical_size)
 
+
+def page_address(location: int, logical_size: int) -> int:
+    address = (location & 0x1fffff) * 4096
+    if address >= logical_size:
+        raise ValueError("ETPF descriptor page outside the declared logical archive")
+    return address
+
+
+def inventory(stream: BinaryIO) -> Counter[Descriptor]:
+    tables = read_tables(stream)
+    table_bytes = tables.records * 16
     counts: Counter[Descriptor] = Counter()
     for offset in range(0, table_bytes, 4096):
-        batch = metadata.read(16 + offset, min(4096, table_bytes - offset))
+        batch = tables.metadata.read(16 + offset, min(4096, table_bytes - offset))
         for shape, flags, location in struct.iter_unpack("<III4x", batch):
-            if (location & 0x1fffff) * 4096 >= logical_size:
-                raise ValueError("ETPF descriptor page outside the declared logical archive")
+            page_address(location, tables.logical_size)
             item = Descriptor((shape & 0x3fff) + 1, ((shape >> 14) & 0x3fff) + 1,
                               (flags >> 3) & 127, flags >> 24)
             counts[item] += 1
     return counts
 
 
+def iter_boundaries(tables: Tables) -> Iterator[Boundary]:
+    table_bytes = tables.boundaries * 8
+    if table_bytes > 1 << 20:
+        raise ValueError("RDS5 boundary table exceeds 1 MiB mapping budget")
+    for offset in range(0, table_bytes, 4096):
+        batch = tables.archive.read(16 + offset, min(4096, table_bytes - offset))
+        for position in range(0, len(batch), 8):
+            yield boundary(batch, position)
+
+
+def raw_page_map(stream: BinaryIO, index: int) -> PageMap:
+    tables = read_tables(stream)
+    if not 0 <= index < tables.records:
+        raise ValueError("Descriptor index outside the ETPF table")
+    location, = struct.unpack("<I", tables.metadata.read(16 + index * 16 + 8, 4))
+    address = page_address(location, tables.logical_size)
+    mapped: PageMap | None = None
+    for left, right in pairwise(iter_boundaries(tables)):
+        if right.stored <= left.stored or right.logical <= left.logical:
+            raise ValueError("RDS5 boundaries must increase in both address spaces")
+        if left.logical <= address < right.logical:
+            if left.codec:
+                raise ValueError("Descriptor page belongs to a coded RDS5 range")
+            if right.stored - left.stored != right.logical - left.logical:
+                raise ValueError("Raw mapping requires equal stored and logical range sizes")
+            mapped = PageMap(address, left.stored + address - left.logical)
+    if mapped is None:
+        raise ValueError("Descriptor page has no RDS5 range")
+    return mapped
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
+    parser.add_argument("--raw-page-map", type=int, metavar="INDEX",
+                        help="Report offsets of a zero-based descriptor's first 4 KiB page in an equal-size raw range")
     args = parser.parse_args()
     try:
         with args.archive.open("rb") as file:
-            counts = inventory(file)
+            if args.raw_page_map is None:
+                counts = inventory(file)
+                print(json.dumps({"descriptor_count": sum(counts.values()), "groups": [
+                    {**item._asdict(), "count": counts[item]} for item in sorted(counts)
+                ]}, indent=2))
+            else:
+                print(json.dumps(raw_page_map(file, args.raw_page_map)._asdict(), indent=2))
     except (OSError, ValueError) as exc:
         parser.exit(1, f"{args.archive}: {exc}\n")
-    print(json.dumps({"descriptor_count": sum(counts.values()), "groups": [
-        {**item._asdict(), "count": counts[item]} for item in sorted(counts)
-    ]}, indent=2))
