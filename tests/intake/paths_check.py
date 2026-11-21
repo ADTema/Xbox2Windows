@@ -115,8 +115,13 @@ def main():
     assert report["reachable"][upscaler]["reasons"] == ("normal", "normal", "normal")
     finding, = report["findings"]
     assert finding["dll"] == framegen and finding["conditional"]
+    # A different loader build has no conditional routes, and the report says why instead of staying silent.
     data["images"][loader]["sha256"] = "other build"
-    assert not trace(data, "entry.exe")["findings"]
+    unknown = trace(data, "entry.exe")
+    finding, = unknown["findings"]
+    assert finding["problem"] == "unverified_loader_hash", finding
+    assert finding["sha256"] == "other build" and finding["expected"] == FFX_LOADER
+    assert "ffx:0x10000" not in unknown["reachable"][upscaler]["reasons"]
 
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@ jobs:
           python -B tests/resource_ranges_check.py
           python -B tests/dxcontainer_part_offsets_check.py
           python -B tests/layout_chunks_check.py
+          python -B tests/dependency_paths_check.py
           python -B tests/intake/paths_check.py
           python -B tests/shader_probe_check.py
           python -B tests/rdna2_tools_check.py
