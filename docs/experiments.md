@@ -668,6 +668,12 @@ The grouped caller at RVA `0x25a40` in the inspected Bink DLL tail-calls the all
 
 Build `cpu_bink_heap_lifted` and run `ctest --preset dev --no-tests=error -R '^cpu_aot_bink_group$'` for the source-built assembly control and its translation. For the inspected local DLL (SHA-256 `9eaf045d004cd7d6a8382aaff0c6ea23a29fec4ef8bfacd726b54f5bc26fafd0`), set `BINK_HEAP_ENTRIES` to `0x25bf0;0x25bc0` and `BINK_GROUP_ENTRY` to `0x25a40` alongside `BINK_HEAP_IMAGE`. Build `cpu_bink_package_lifted` and run `cpu_aot_bink_package_group`. The test supplies both descriptor arrays and runs the translated caller with the Windows test heap.
 
+## Upscaler working-set counter updates
+
+Immediately after the statistics calls at RVAs `0x74d2` and `0x75b1`, both paths add the new sample minus the previous sample to a 64-bit counter. A zero status substitutes zero for the new sample even if the supplied output word is nonzero. With starting counters 11 and 101, a previous sample of 23, a new sample of 70, successful status and flag 256, creation produces 58 and 148. Release produces 58 and 101 because it reads only the low flag byte. Both counters wrap modulo 2^64.
+
+Build `cpu_working_set_delta_lifted` and run `ctest --preset dev --no-tests=error -R '^cpu_working_set_delta$'` for the source-built assembly control and its translation. With `FFX_UPSCALER_IMAGE` set to the fingerprinted local upscaler, build `ffx_package_working_set_delta` and run its namesake test for the two translated instruction ranges. The test supplies the status, samples and flags at the point where the query returns. The Xbox statistics provider, measurement units and real sample values remain unverified.
+
 ## Six API call sites
 
 After loading the toolchain, inspect three local DLLs. `out/calls/six-apis.json` records image SHA-256, import slots, callers of thunks, embedded container sections and code references. Addresses below are RVAs in the relevant DLL. Indirect calls need execution evidence to identify the selected path.
