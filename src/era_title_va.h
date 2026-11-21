@@ -30,8 +30,9 @@ struct ShaderRange {
 static_assert(sizeof(ShaderRange) == 24);
 
 // Packs sorted, non-overlapping ranges for the shader lookup; slot i is ranges[i]. Returns false
-// and leaves `packed` empty when the ranges are unsorted or overlap, or when a range is 4 GiB or
-// longer, which a raw buffer view cannot cover.
+// and leaves `packed` empty when the ranges are unsorted or overlap, when a range is 4 GiB or
+// longer, which a raw buffer view cannot cover, or when a range does not start on a 4-byte
+// boundary, which would misalign raw DWORD offsets.
 bool shader_ranges(const std::vector<Range>& ranges, std::vector<ShaderRange>& packed);
 
 class Table {

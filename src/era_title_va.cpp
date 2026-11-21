@@ -64,6 +64,7 @@ bool shader_ranges(const std::vector<Range>& ranges, std::vector<ShaderRange>& p
     for (std::size_t i = 0; i < ranges.size(); ++i) {
         const Range& range = ranges[i];
         if (range.title_end <= range.title_begin || range.title_end - range.title_begin >= view_limit ||
+            (range.title_begin & 3) != 0 ||
             (i > 0 && ranges[i - 1].title_end > range.title_begin)) {
             return false;
         }

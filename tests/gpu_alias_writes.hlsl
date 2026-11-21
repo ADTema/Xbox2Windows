@@ -1,8 +1,8 @@
 // Stores and atomics through 64-bit title addresses, the other memory operations a shader that
 // reads addresses from its inputs performs on the console (global_store, global_atomic_add and
 // _sub, and float min and max). TitleLookup finds the aliased buffer and byte offset. Float
-// min and max use a compare-exchange loop on the word's bits. Each record's result is 1 when a
-// range held its address and 0 otherwise; a miss writes nothing else.
+// min and max use a compare-exchange loop on the word's bits. Each record's result is 1 when one
+// range holds the whole aligned DWORD and 0 otherwise; a rejected record writes nothing else.
 #include "title_va_lookup.hlsli"
 
 #define WritesRoot "DescriptorTable(UAV(u0, space = 1, numDescriptors = 8)), SRV(t0), SRV(t1), UAV(u0), " \
@@ -33,7 +33,7 @@ void WriteTitleAddresses(uint id : SV_DispatchThreadID)
     const uint4 record = Records.Load4(id * 16);
     uint slot;
     uint offset;
-    if (!TitleLookup(Ranges, rangeCount, record.xy, slot, offset)) {
+    if (!TitleLookup(Ranges, rangeCount, record.xy, 4, slot, offset)) {
         Results.Store(id * 4, 0);
         return;
     }

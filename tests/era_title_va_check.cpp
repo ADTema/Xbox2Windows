@@ -100,6 +100,10 @@ int check_shader()
     expect(era_title_va::shader_ranges({R{0x10000, 0x10000 + (1ull << 32) - 4, 1}}, packed) && packed.size() == 1,
            "range just under 4 GiB accepted");
     expect(!era_title_va::shader_ranges({R{0x10000, 0x10000, 1}}, packed) && packed.empty(), "empty range rejected");
+    expect(!era_title_va::shader_ranges({R{0x10002, 0x11000, 1}}, packed) && packed.empty(),
+           "range not starting on a 4-byte boundary rejected");
+    expect(era_title_va::shader_ranges({R{0x10000, 0x10ffe, 1}}, packed) && packed.size() == 1,
+           "range whose length is not a multiple of 4 accepted");
     expect(era_title_va::shader_ranges({}, packed) && packed.empty(), "no ranges packs to nothing");
     return failures;
 }

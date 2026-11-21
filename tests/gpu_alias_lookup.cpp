@@ -52,6 +52,11 @@ struct TitleAllocation {
     TitleAllocation(const TitleAllocation&) = delete;
     TitleAllocation& operator=(const TitleAllocation&) = delete;
     std::uint64_t begin() const { return reinterpret_cast<std::uint64_t>(base); }
+    // The placed allocation's range stops two bytes short of the allocation, so its last
+    // aligned word crosses the range end while its first two bytes are still inside.
+    std::size_t range_bytes() const { return placed ? size - 2 : size; }
+    // Start of the last aligned DWORD wholly inside the range.
+    std::uint64_t last_word() const { return begin() + ((range_bytes() - 4) & ~std::size_t{3}); }
     void* base;
     std::size_t size;
     bool placed = false;
@@ -89,7 +94,7 @@ struct AliasFixture {
                 return false;
             }
             check(hr, "Open a title allocation as a D3D12 heap");
-            if (!table.add(titles[a]->begin(), titles[a]->size, aliases[a].buffer->GetGPUVirtualAddress()))
+            if (!table.add(titles[a]->begin(), titles[a]->range_bytes(), aliases[a].buffer->GetGPUVirtualAddress()))
                 throw std::runtime_error("table rejected an alias");
             for (std::size_t offset = 0; offset < titles[a]->size; offset += sizeof(Word))
                 *reinterpret_cast<Word*>(base + offset) = pattern(a, offset);
@@ -130,10 +135,10 @@ struct AliasFixture {
     // The 4 GiB line inside the placed allocation.
     std::uint64_t line() const { return titles.back()->begin() + straddle_bytes / 2; }
 
-    // Slot + 1 of the range holding [address, address + 4), or 0.
+    // Slot + 1 of the range holding the aligned DWORD [address, address + 4), or 0.
     Word slot_of(std::uint64_t address) const
     {
-        if (!table.translate(address, sizeof(Word))) return 0;
+        if ((address & 3) != 0 || !table.translate(address, sizeof(Word))) return 0;
         for (std::size_t slot = 0; slot < ranges.size(); ++slot)
             if (address >= ranges[slot].title_begin && address < ranges[slot].title_end)
                 return static_cast<Word>(slot + 1);
@@ -195,11 +200,17 @@ bool check_gpu_alias_lookup(ID3D12Device* device)
     std::vector<std::uint64_t> records;
     for (const auto& title : fixture.titles) {
         const auto begin = title->begin();
-        for (std::uint64_t offset : {std::uint64_t{0}, std::uint64_t{4}, title->size / 2, title->size / 2 + 0x124,
-                                     title->size - 4})
+        const auto end = begin + title->range_bytes();
+        for (std::uint64_t offset : {std::uint64_t{0}, std::uint64_t{4}, title->size / 2, title->size / 2 + 0x124})
             records.push_back(begin + offset);
+        // The last valid word, the aligned word after it (outside the range, or crossing its end
+        // for the placed allocation), and misaligned starts at both ends.
+        records.push_back(title->last_word());
+        records.push_back(title->last_word() + 4);
+        for (std::uint64_t address : {begin + 1, begin + 2, begin + 3, end - 1, end - 2, end - 3})
+            records.push_back(address);
         records.push_back(begin - 4);
-        records.push_back(begin + title->size);
+        records.push_back(end);
         for (std::uint64_t offset = 0; offset < title->size; offset += 0x1f04) records.push_back(begin + offset);
     }
     // Around the 4 GiB line inside the placed allocation, and the same low words one 4 GiB
@@ -222,7 +233,8 @@ bool check_gpu_alias_lookup(ID3D12Device* device)
         expected[r * 2 + 1] = slot;
         ++(slot ? hits : misses);
     }
-    if (misses < 12) throw std::runtime_error("fixture needs the twelve guaranteed misses");
+    // 12 out-of-range addresses, 24 misaligned starts and the placed range's tail-crossing word.
+    if (misses < 37) throw std::runtime_error("fixture needs the 37 guaranteed misses");
 
     Kernel kernel(device, {LookupTitleAddresses, sizeof(LookupTitleAddresses)});
     const auto actual = fixture.run(device, kernel, records, expected.size());
@@ -253,8 +265,8 @@ bool check_gpu_alias_lookup_writes(ID3D12Device* device)
     // distinct, so no two stores race; neighbouring words keep their pattern.
     std::vector<std::uint64_t> stored;
     for (const auto& title : fixture.titles)
-        for (std::uint64_t offset : {std::uint64_t{0}, title->size / 2, title->size - 4})
-            stored.push_back(title->begin() + offset);
+        for (std::uint64_t address : {title->begin(), title->begin() + title->size / 2, title->last_word()})
+            stored.push_back(address);
     stored.push_back(fixture.line() - 4);
     stored.push_back(fixture.line() + 4);
     for (std::size_t i = 0; i < stored.size(); ++i)
@@ -288,10 +300,21 @@ bool check_gpu_alias_lookup_writes(ID3D12Device* device)
         lowest = (std::min)(lowest, number);
         highest = (std::max)(highest, number);
     }
-    // Misses: stores to unmapped addresses must change nothing and report 0.
+    // Rejected records must report 0 and change nothing, including bytes of a rejected word
+    // that lie inside a range: stores to unmapped addresses, a store and a float min on the
+    // placed range's tail-crossing word, and misaligned store, add and sub inside ranges.
     const std::uint64_t ghost = fixture.line() + 4 + (1ull << 32);
-    for (std::uint64_t address : {std::uint64_t{0x10}, 0xfffffffffffffff0ull, ghost})
-        records.push_back({address, Store, miss});
+    const std::uint64_t tail = fixture.titles.back()->last_word() + 4;
+    records.push_back({0x10, Store, miss});
+    records.push_back({0xfffffffffffffff0ull, Store, miss});
+    records.push_back({ghost, Store, miss});
+    records.push_back({tail, Store, miss});
+    records.push_back({tail, MinFloat, float_bits(-1.0e30f)});
+    records.push_back({fixture.titles[0]->begin() + 2, Store, miss});
+    records.push_back({add_word + 2, Add, 7});
+    records.push_back({sub_word + 1, Sub, 7});
+    records.push_back({fixture.titles[2]->begin() + fixture.titles[2]->range_bytes() - 2, Store, miss});
+    constexpr Word rejected = 9;
 
     // Every word in every allocation, as the CPU expects it after the dispatch.
     std::vector<std::vector<Word>> expected(fixture.titles.size());
@@ -314,7 +337,7 @@ bool check_gpu_alias_lookup_writes(ID3D12Device* device)
         expected_results[r] = fixture.slot_of(records[r].address) ? 1 : 0;
         misses += expected_results[r] ? 0 : 1;
     }
-    if (misses != 3) throw std::runtime_error("fixture needs exactly the three miss records to miss");
+    if (misses != rejected) throw std::runtime_error("fixture needs exactly the rejected records to miss");
 
     Kernel kernel(device, {WriteTitleAddresses, sizeof(WriteTitleAddresses)});
     const auto results = fixture.run(device, kernel, records, records.size());
