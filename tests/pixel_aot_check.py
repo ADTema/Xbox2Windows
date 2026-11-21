@@ -215,6 +215,15 @@ def absolute_value():
     return program
 
 
+def ceiling():
+    return with_constants([
+        "v_ceil_f32_e32 v12, s44",
+        "v_ceil_f32_e64 v13, -|s45|",
+        "v_ceil_f32_e64 v14, |s46|",
+        "v_ceil_f32_e64 v15, |s47| clamp",
+    ])
+
+
 # The gfx10 predicate number is a four-bit truth table. Bits 0..3 select
 # less, equal, greater and unordered respectively, independent of the HLSL.
 PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
@@ -564,6 +573,7 @@ def check_controls(directory):
     wait = program.index("s_waitcnt vmcnt(0)")
     for register in ("v12", "v13", "v14", "v15"):
         must_reject(translate, program[:wait] + [f"v_mov_b32_e32 {register}, 1.0"] + program[wait:])
+    must_reject(translate, program[:wait] + ["v_ceil_f32_e32 v12, 1.0"] + program[wait:])
     free = translate(program[:wait] + ["v_mov_b32_e32 v21, 1.0"] + program[wait:])
     assert free.index("tex.Sample") < free.index("= 1.0f;") < free.index("= sample16.x;")
     late = translate(program[:wait+1] + ["v_mov_b32_e32 v12, 1.0"] + program[wait+1:])
@@ -614,7 +624,8 @@ def check_controls(directory):
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
-                (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate)]
+                (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate),
+                (ceiling(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
@@ -631,6 +642,34 @@ def check_binary(directory, assembler, objcopy, library):
         _, native = native_program(archive, "fixture")
         assert native == binary.read_bytes()
         assert lower_fixture(disassemble(native, library)) == lower_fixture(instructions)
+
+
+def check_ceiling_draws(directory, compiler, renderer, backend):
+    instructions = ceiling()
+    source = directory / "ceiling.hlsl"
+    shader = directory / "ceiling.cso"
+    case = directory / "ceiling.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(instructions), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for a, b, c, d in ((-1.75, 1.75, -1.75, -1.75), (-2.0, 2.0, 0.0, 0.0),
+                       (-0.75, 0.75, -0.75, -0.75), (2.25, -2.75, 2.25, 2.25)):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, a, b, c, d)
+        # Python's integer results lose the sign of zero. The readback compares float bits.
+        expected = struct.pack("<4f", math.copysign(math.ceil(a), a),
+                               math.copysign(math.ceil(-abs(b)), -1), math.ceil(abs(c)),
+                               min(math.ceil(abs(d)), 1))
+        case.write_bytes(constants + expected * 64)
+        subprocess.run(draw, check=True)
+
+    floor = [line.replace("v_ceil_f32_e32", "v_floor_f32_e32") for line in instructions]
+    source.write_text(translate(floor), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Replacing ceiling with floor escaped detection")
 
 
 def check_render(directory, compiler, renderer, backend):
@@ -719,6 +758,7 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("The renderer failed to detect the missing absolute value")
+    check_ceiling_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):
