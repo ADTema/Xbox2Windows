@@ -127,13 +127,13 @@ ALU = {
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
 }
-# The n-prefixed predicates are also true for unordered operands, so they stay negations.
+# N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
     "f": "false", "tru": "true",
     "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}", "gt": "{0} > {1}",
     "lg": "({0} < {1} || {0} > {1})", "ge": "{0} >= {1}",
     "o": "({0} == {0} && {1} == {1})", "u": "({0} != {0} || {1} != {1})",
-    "nge": "!({0} >= {1})", "nlg": "!({0} < {1} || {0} > {1})", "ngt": "!({0} > {1})",
+    "nge": "!({0} >= {1})", "nlg": "({0} == {1} || isnan({0}) || isnan({1}))", "ngt": "!({0} > {1})",
     "nle": "!({0} <= {1})", "neq": "!({0} == {1})", "nlt": "!({0} < {1})",
 }
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
