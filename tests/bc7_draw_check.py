@@ -72,13 +72,15 @@ def check_all_modes(work: Path, renderer: str, backend: str, shader: Path) -> No
         raise AssertionError(f"Expected a mode-4 rotation mismatch at (16, 0): {wrong.stderr}")
 
 
-def write_strip_mip(work: Path, width: int, height: int) -> Path:
-    # One block row, with a different endpoint per level of the power-of-two chain.
-    block, colors = make_block(width.bit_length(), height)
+def write_patterned_mip(work: Path, width: int, height: int) -> Path:
+    # Keep the green endpoint (six times the second argument) within a byte.
+    block, colors = make_block(width.bit_length(), min(height, 32))
     columns = (width + 3) // 4
-    visible = b"".join((colors[row * 16:row * 16 + 16] * columns)[:width * 4] for row in range(height))
-    case = work / f"strip-{width}x{height}.case"
-    case.write_bytes(struct.pack("<4sII", b"BC7C", width, height) + block * columns + visible)
+    pattern = [bytes(colors[row * 16:row * 16 + 16]) for row in range(4)]
+    visible = b"".join((pattern[y % 4] * columns)[:width * 4] for y in range(height))
+    case = work / f"mip-{width}x{height}.case"
+    case.write_bytes(struct.pack("<4sII", b"BC7C", width, height) +
+                     block * (columns * ((height + 3) // 4)) + visible)
     return case
 
 
@@ -112,7 +114,7 @@ def main():
             mip = work / f"resident{level}.case"
             mip.write_bytes(b"".join(fixture(blocks, blocks)))
             tail.append(mip)
-        tail.extend([write_strip_mip(work, 2, 2), write_strip_mip(work, 1, 1)])
+        tail.extend([write_patterned_mip(work, 2, 2), write_patterned_mip(work, 1, 1)])
         chain = [renderer, backend, "--check-bc7-tail", shader, "3", *tail]
         subprocess.run(chain, check=True)
         header, rows, expected = fixture(4, 4)
@@ -121,7 +123,7 @@ def main():
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError("An incorrect middle mip must fail verification")
         # A 4096x4 strip uses all thirteen mip levels while staying small.
-        narrow = [write_strip_mip(work, 4096 >> level, max(1, 4 >> level)) for level in range(13)]
+        narrow = [write_patterned_mip(work, 4096 >> level, max(1, 4 >> level)) for level in range(13)]
         subprocess.run([renderer, backend, "--check-bc7-mip1", shader, *narrow[:2]], check=True)
         narrow_chain = [renderer, backend, "--check-bc7-tail", shader, "0", *narrow]
         subprocess.run(narrow_chain, check=True)
@@ -138,6 +140,12 @@ def main():
         wrong = subprocess.run(narrow_chain, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch x=0 y=0" not in wrong.stderr.splitlines():
             raise AssertionError("The final 1x1 draw must check its visible texel")
+        # At mip 4, the 28-texel axis has one visible texel but a 1.75-texel
+        # unrounded span. Exercise both axes and a view starting at mip 2.
+        for width, height, first in ((28, 128, 2), (128, 28, 0)):
+            levels = [write_patterned_mip(work, max(1, width >> level), max(1, height >> level))
+                      for level in range(first, 8)]
+            subprocess.run([renderer, backend, "--check-bc7-tail", shader, str(first), *levels], check=True)
     return 0
 
 
