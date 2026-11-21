@@ -27,8 +27,10 @@ ELSE
     jz short empty_value
 IFDEF USE_XOR_ZERO
     xor rdx, rdx
-ENDIF
+    lea rax, [rdx + 21]
+ELSE
     mov eax, 21
+ENDIF
     jmp short finish_value
 ENDIF
 choose_value ENDP

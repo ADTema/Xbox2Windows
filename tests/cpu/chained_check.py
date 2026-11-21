@@ -28,8 +28,8 @@ def check(native, compiled, harness, native_jne=None, compiled_jne=None, native_
         for value, expected in ((None, null_expected), (0, null_expected), (1, 21), (0xffffffffffffffff, 21)):
             slot = Word(value or 0)
             address = 0 if value is None else ctypes.addressof(slot)
-            result, trace, regs = observe(probe, source, address, 0)
-            status, actual, kept = observe(probe, lifted, address, 0)
+            result, trace, regs = observe(probe, source, address, 0x1122334455667788)
+            status, actual, kept = observe(probe, lifted, address, 0x1122334455667788)
             if (result != expected or regs != SENTINELS or kept != regs or status != 1
                     or actual != (trace[0], result, *trace[2:]) or slot.value != (value or 0)):
                 raise AssertionError((orig_path.name, value, result, actual, kept))
