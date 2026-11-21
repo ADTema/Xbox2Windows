@@ -1,5 +1,9 @@
 #include "era_heap.h"
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -254,6 +258,54 @@ bool reuse_checks()
     return true;
 }
 
+bool large_alignment_checks()
+{
+    using Byte = unsigned char;
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const std::size_t page = system.dwPageSize;
+    // Alignments above one page. Each block must own its allocation and commit only the
+    // pages that hold the payload, not the alignment padding.
+    unsigned cases = 0;
+    std::size_t committed_total = 0, alignment_total = 0;
+    for (unsigned exponent : {13u, 16u, 17u, 20u, 31u}) {
+        const auto alignment = std::size_t{1} << exponent;
+        for (std::size_t bytes : {std::size_t{1}, std::size_t{257}, page, page + 1, 3 * page - 1}) {
+            auto* p = static_cast<Byte*>(era_heap::allocate(bytes, std::uint64_t{exponent} << 24));
+            if (!p) return false;
+            const auto committed = (bytes + page - 1) & ~(page - 1);
+            MEMORY_BASIC_INFORMATION info{};
+            const bool shaped =
+                reinterpret_cast<std::uintptr_t>(p) % alignment == 0 &&
+                std::all_of(p, p + bytes, [](Byte b) { return b == 0; }) &&
+                VirtualQuery(p, &info, sizeof(info)) == sizeof(info) &&
+                info.AllocationBase == p && info.BaseAddress == p && info.State == MEM_COMMIT &&
+                info.Protect == PAGE_READWRITE && info.Type == MEM_PRIVATE &&
+                info.RegionSize == committed;
+            if (!shaped) {
+                std::printf("exponent=%u bytes=%zu base_matches=%d state=%lx region=%zu\n", exponent,
+                            bytes, info.AllocationBase == p, static_cast<unsigned long>(info.State),
+                            static_cast<std::size_t>(info.RegionSize));
+                era_heap::release(p);
+                return false;
+            }
+            std::fill_n(p, bytes, 0xa5);
+            era_heap::release(p);
+            if (VirtualQuery(p, &info, sizeof(info)) != sizeof(info) || info.State != MEM_FREE) {
+                std::printf("exponent=%u bytes=%zu not released (state=%lx)\n", exponent, bytes,
+                            static_cast<unsigned long>(info.State));
+                return false;
+            }
+            committed_total += committed;
+            alignment_total += alignment;
+            ++cases;
+        }
+    }
+    std::printf("large_alignment_cases=%u committed_bytes=%zu alignment_bytes=%zu\n", cases,
+                committed_total, alignment_total);
+    return true;
+}
+
 bool concurrency_checks()
 {
     constexpr std::size_t bytes = 511;
@@ -300,6 +352,8 @@ int main(int argc, char** argv)
         passed = reuse_checks();
     } else if (scenario == "observed_words"sv) {
         passed = observed_word_checks();
+    } else if (scenario == "large_alignment"sv) {
+        passed = large_alignment_checks();
     } else if (scenario == "concurrency"sv) {
         passed = concurrency_checks();
     } else {
