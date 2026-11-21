@@ -175,7 +175,7 @@ def scene_records(data, validator=None):
             rejected["container_framing"] += 1
             continue
         program = sections.get(b"DXIL", b"")
-        if len(program) < 24:
+        if len(program) < 24 or program[8:12] != b"DXIL":
             rejected["no_program_header"] += 1
             continue
         kind = struct.unpack_from("<H", program, 2)[0]
