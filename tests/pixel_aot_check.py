@@ -601,7 +601,7 @@ def check_render(directory, compiler, renderer, backend):
     program = truncate_values()
     source.write_text(translate(program), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
-    for constants in ((1.75, -1.75, -2.75, 1.75), (-1.75, 2.75, 3.75, -1.75)):
+    for constants in ((1.75, -1.75, -2.75, 2.75), (-1.75, 2.75, 3.75, -1.75)):
         case = truncate_case(directory, *constants)
         draw = [renderer, backend, "--check-pixel-case", shader, case]
         subprocess.run(draw, check=True)
