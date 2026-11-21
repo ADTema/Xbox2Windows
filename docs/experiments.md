@@ -669,6 +669,8 @@ On x64 Windows, `desktop_memory_query` observed a 48-byte write from `VirtualQue
 
 `bvh_root_roundtrip` uses a source-built compute shader with a v1.1 root signature. The desktop serializer rejected the added `0x03000000` bits with `E_INVALIDARG`. Clearing just those bits and serializing, decoding and serializing again produced the same bytes as the original control. RTX 2060 and WARP both created the root signature and pipeline from the control shader and recovered signature. Each dispatch matched 257 CPU reference words and preserved 63 guard words. This establishes the desktop behavior for that shader. The two flags' Scarlett semantics remain open.
 
+`desktop_bvh_root_flags` asserts the same three cases with a synthetic v1.1 descriptor and no local inputs: baseline flags serialize, while `0x01000000`, `0x02000000` and the pair each return `E_INVALIDARG` with no blob produced. The suite therefore fails if a future SDK or driver starts accepting either console bit on its own.
+
 ### Creating root signatures on a second workstation
 
 The second maintainer workstation ran Windows 26200.9974 with SDK 10.0.26100.0, an RTX 4060 Laptop GPU (driver 32.0.16.1656) and WARP (10.0.26100.9818). At commit `127fa86`, both backends passed 408 differential ray queries with the debug layer enabled. Forced native wave64 skipped on both. The hardware reported 32 native lanes and WARP reported 4. [Hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7058907095)
