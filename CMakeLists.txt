@@ -506,6 +506,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_compile_definitions(cpu_frame_guest PRIVATE FRAME_GUEST)
     target_link_options(cpu_frame_guest PRIVATE /ENTRY:dll_entry /NODEFAULTLIB /INCREMENTAL:NO)
     target_link_libraries(cpu_frame_guest PRIVATE cpu_tls_sink cpu_frame_host)
+
+    add_library(cpu_delay_provider SHARED tests/cpu/delay_provider.cpp tests/cpu/delay_provider.def)
+    add_library(cpu_delay_provider_altered SHARED tests/cpu/delay_provider.cpp
+        tests/cpu/delay_provider_altered.def)
+    target_compile_definitions(cpu_delay_provider_altered PRIVATE ALTER_RETURN)
+    add_library(cpu_delay_route SHARED tests/cpu/delay_route.cpp)
+    target_link_libraries(cpu_delay_route PRIVATE cpu_delay_provider delayimp)
+    target_link_options(cpu_delay_route PRIVATE /DELAYLOAD:cpu_delay_provider.dll /INCREMENTAL:NO)
+    add_test(NAME cpu_native_delay COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_delay_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_delay_route>" "$<TARGET_FILE:cpu_delay_provider>"
+        "$<TARGET_FILE:cpu_delay_provider_altered>")
     add_library(script_path_host SHARED tools/script_path_host.cpp)
     target_compile_features(script_path_host PRIVATE cxx_std_17)
     add_test(NAME script_path_links COMMAND "${INTAKE_PYTHON}" -B

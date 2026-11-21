@@ -355,7 +355,7 @@ The local Bink DLL imports ordinal 1 from XAudio2_9.dll. A read-only check confi
 
 ## Mapping an image without LoadLibrary
 
-`tools/pe_map.cpp` maps an x64 PE32+ image into memory it allocates itself, away from the preferred base, and applies its DIR64 base relocations. It binds each ordinary import through a resolver supplied by the host, sets section protections, records the actual base in the mapped headers and registers `.pdata` with `RtlAddFunctionTable`. The original machine code runs unchanged. Header fields are checked against the file and image size before use. It then calls TLS callbacks and the entry point. Delay imports and TLS data templates are rejected. [Issue #46](https://github.com/R0Y00/Xbox2Windows/issues/46)
+`tools/pe_map.cpp` maps an x64 PE32+ image into memory it allocates itself, away from the preferred base, and applies its DIR64 base relocations. It binds ordinary and delay imports through a resolver supplied by the host, sets section protections, records the actual base in the mapped headers and registers `.pdata` with `RtlAddFunctionTable`. The original machine code runs unchanged. Header fields are checked against the file and image size before use. It then calls TLS callbacks and the entry point. TLS data templates are rejected. [Issue #46](https://github.com/R0Y00/Xbox2Windows/issues/46)
 
 ```powershell
 cmake --build --preset dev --target pe_map cpu_reloc_original cpu_import_original_lifted cpu_ordinal_original_lifted cpu_import_altered cpu_ordinal_altered cpu_register_probe cpu_two_imports
@@ -432,6 +432,18 @@ On a copy of the linked DLL, the test patches the code, the table or `.pdata`, a
 When `.pdata` no longer covers `select_rva`, the translation must stay unchanged.
 
 On Linux, the fixture was assembled and linked with LLVM (`llvm-mc`, `lld-link`) from an equivalent GNU-syntax copy, because `llvm-ml` does not accept `IMAGEREL`. The original machine code ran in-process through an `ms_abi` call. It matched the lifted C++ built with clang on every input, for both the original and the swapped tables. The same translator also handled C switch statements compiled by clang for `x86_64-pc-windows-msvc` at `-O1` and `-O2`. Those builds have no `.pdata` for the leaves, and the loop's table base is hoisted. The generated sources compile without warnings under clang-cl `/W4 /WX`. On Windows 11 with MSVC 14.44 and ML64, `cpu_aot_jump_tables` passes: 600 selector pairs per table layout and 138 programs match, the swapped tables change 60, 60 and 99 results, and all 13 rejection controls and the leaf-without-unwind translation pass. The table labels are declared with `LABEL DWORD`, because ML64 rejects `IMAGEREL` of a code label inside a memory operand.
+
+### Delay imports
+
+`delay_route` imports `delayed_value` from `cpu_delay_provider.dll` by name and `delayed_ordinal` by ordinal 2 with `/DELAYLOAD`, and exports one caller for each. `cpu_native_delay` compares two paths: `LoadLibrary` plus the image's own delay helper, and `pe_map` with a resolver bound to the same provider. The mapped calls return the provider values, and IAT slot checks confirm both hold the `GetProcAddress` results before the calls. Binding the altered provider returns its values instead.
+
+Windows leaves a delay IAT slot pointing at its thunk until the first call. `pe_map` resolves every delay descriptor at map time because it has no `LoadLibrary`, and the image's helper would bypass the host resolver. An absent provider therefore fails the map with `MAP_UNRESOLVED_IMPORT`, where Windows would map and fail on the first call. Descriptors must set `dlattrRva`; a descriptor without it stores virtual addresses and is rejected as unsupported.
+
+Like the TLS and ordinary import tables, the delay-import directory is found by its address and `Size` is not used. The table is walked to the null descriptor; a copy with `Size` zero still binds, and a directory address of zero ignores a nonzero `Size`. Copies patched to clear `dlattrRva`, point the DLL name outside the image, zero the name table, point the IAT outside the image, or move the directory address outside the image are rejected before the provider is requested.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_delay$' -V
+```
 
 ## Offline pixel shader recompilation
 
