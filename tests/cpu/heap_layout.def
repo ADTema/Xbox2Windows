@@ -1,2 +1,3 @@
 EXPORTS
     heap_layout
+    slot_probe

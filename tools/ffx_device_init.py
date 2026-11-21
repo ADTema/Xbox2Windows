@@ -1,4 +1,4 @@
-"""Translate the packaged single-context backend from device retention through heap creation."""
+"""Translate the packaged upscaler's device and context-slot initialization."""
 import argparse
 from pathlib import Path
 from uuid import UUID
@@ -29,9 +29,20 @@ def generate(image):
         code = lower(body, ["rdi = reinterpret_cast<word>(probe.device);",
                             "rbx = reinterpret_cast<word>(probe.scratch.data());"],
                      {0x482e0: "reinterpret_cast<word>(heap_iid)"}, calls, {end: "return;"})
+        # R9 is formed by the provider and saved in R14 by the callback. The
+        # first-use prefix through the fifth heap call executes in run_device_slice.
+        slots = lower(region(pe, 0xcf94, 0xcf9b) + region(pe, 0x27a7, 0x27b0) +
+                      region(pe, 0x2938, 0x2aa1),
+                      ["rdi = reinterpret_cast<word>(&provider);",
+                       "rbx = reinterpret_cast<word>(scratch); rsi = reinterpret_cast<word>(sizes);",
+                       "rbp = 0x14;"], {}, {},
+                      {0xcf9b: "r14 = r9; goto block_27a7;",
+                       0x27b0: "goto block_2938;", 0x2aa1: "return static_cast<uint32_t>(rax);"})
     return INTEGER_HEADER + '\n#include "ffx_device_init.h"\n' + (
         "static const unsigned char heap_iid[] = {" + ", ".join(map(str, guid)) + "};\n"
-        "void run_device_slice(FfxDeviceProbe& probe) {\n" + code + "\n}\n")
+        "void run_device_slice(FfxDeviceProbe& probe) {\n" + code + "\n}\n"
+        "uint32_t run_backend_slots(uint8_t* scratch, FfxSlotOutput& provider, const uint32_t* sizes) {\n"
+        + slots + "\n}\n")
 
 
 if __name__ == "__main__":

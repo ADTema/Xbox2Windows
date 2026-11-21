@@ -12,11 +12,12 @@ from cpu_ranges import function_ranges, image_bytes
 
 LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
 UPSCALER = "faff02f294a7e9149ce079dffe3dedbcabe99b1f180ab14222aa8689e00a75fa"
-REGS = {getattr(R, n.upper()): n for n in "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r12 r13 r14 r15".split()}
+REGS = {getattr(R, n.upper()): n for n in "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15".split()}
 UINT = {1: "uint8_t", 4: "uint32_t", 8: "uint64_t"}
 
 INTEGER_HEADER = """#include <cstdint>
 #include <cstring>
+#include <emmintrin.h>
 using namespace std;
 using word = uint64_t;
 static_assert(sizeof(void*) == sizeof(word));
@@ -46,6 +47,9 @@ def lower(body, initial, globals_, calls, exits):
     lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
     allowed = {i.ip for i in body} | set(exits)
+    xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
+    if any(i.mnemonic in (M.VMOVDQU, M.VPSRLDQ, M.VPADDD, M.VMOVD) for i in body):
+        lines.append("__m128i xmm0{}, xmm1{}, xmm2{};")
     for index, i in enumerate(body):
         op = i.mnemonic
 
@@ -79,13 +83,14 @@ def lower(body, initial, globals_, calls, exits):
                 value = f"({reg(dest)} & ~255ull) | {value}"
             return f"{reg(dest)} = {value};"
 
-        if op in (M.JE, M.JNE, M.JAE, M.JMP):
+        if op in (M.JE, M.JNE, M.JAE, M.JB, M.JBE, M.JMP):
             target = i.near_branch_target
             if target not in allowed:
                 raise ValueError(f"unbound branch at {i.ip:#x}")
-            cond = {M.JE: "if (zero) ", M.JNE: "if (!zero) ", M.JAE: "if (!carry) ", M.JMP: ""}[op]
+            cond = {M.JE: "if (zero) ", M.JNE: "if (!zero) ", M.JAE: "if (!carry) ",
+                    M.JB: "if (carry) ", M.JBE: "if (carry || zero) ", M.JMP: ""}[op]
             stmt = f"{cond}goto block_{target:x};"
-        elif op == M.MOV:
+        elif op in (M.MOV, M.MOVZX):
             stmt = write(operand(1))
         elif op == M.LEA:
             stmt = write(address())
@@ -96,19 +101,31 @@ def lower(body, initial, globals_, calls, exits):
         elif op == M.IMUL and i.op_count == 3 and RegisterExt.size(i.op0_register) == 4:
             stmt = (f"{{ const int64_t product = int64_t(int32_t({operand(1)})) * int32_t({operand(2)}); "
                     f"carry = product != int32_t(product); {write('product')} }}")
-        elif op == M.SHL and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) == 4:
-            count = i.immediate(1) & 31
-            stmt = (f"{{ const uint32_t a = {operand(0)}, v = a << {count}; "
-                    f"carry = ((a >> {32-count}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else ";"
+        elif op == M.SHL and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
+            size = RegisterExt.size(i.op0_register)
+            bits = 8 * size
+            count = i.immediate(1) & (bits - 1)
+            stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = a << {count}; "
+                    f"carry = ((a >> {bits-count}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else ";"
         elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.SBB):
             operator = {M.ADD: "+", M.INC: "+", M.AND: "&", M.OR: "|", M.XOR: "^", M.SBB: "-"}[op]
             rhs = "1" if op == M.INC else operand(1)
-            width = UINT[RegisterExt.size(i.op0_register)]
+            width = UINT[MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)]
             expr = f"a {operator} b" + (" - word(carry)" if op == M.SBB else "")
             update = {M.ADD: "carry = v < a;", M.SBB: "carry = a < b || (carry && a == b);",
                       M.INC: "", M.XOR: "carry = false;", M.AND: "carry = false;", M.OR: "carry = false;"}[op]
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
+        elif op == M.VMOVDQU and i.op1_kind == K.MEMORY:
+            stmt = f"{xmm[i.op0_register]} = load<__m128i>({address()});"
+        elif op == M.VPSRLDQ:
+            stmt = f"{xmm[i.op0_register]} = _mm_srli_si128({xmm[i.op1_register]}, {i.immediate(2)});"
+        elif op == M.VPADDD:
+            stmt = f"{xmm[i.op0_register]} = _mm_add_epi32({xmm[i.op1_register]}, {xmm[i.op2_register]});"
+        elif op == M.VMOVD and i.op1_register in xmm:
+            stmt = write(f"_mm_cvtsi128_si32({xmm[i.op1_register]})")
+        elif op == M.NOP or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
+            stmt = ";"
         elif op == M.SETE:
             stmt = write("zero")
         elif op == M.CALL:

@@ -80,6 +80,9 @@ void run_device_slice(FfxDeviceProbe& probe)
                      reinterpret_cast<uintptr_t>(&__uuidof(ID3D12DescriptorHeap)),
                      reinterpret_cast<uintptr_t>(probe.scratch.data() + heap.offset));
     }
+    // The last 96 bytes of the single-context scratch hold its slot record.
+    auto* table = probe.scratch.data() + probe.scratch.size() - 96;
+    std::memcpy(probe.scratch.data() + 0x1078, &table, sizeof table);
 }
 #endif
 
@@ -101,4 +104,5 @@ void check_ffx_device_init(ID3D12Device* device)
         std::memcpy(&handle, probe.scratch.data() + expected[i].offset, sizeof handle);
         if (handle != probe.heaps[i].Get()) throw std::runtime_error("Heap output slot changed");
     }
+    check_backend_slots(probe);
 }
