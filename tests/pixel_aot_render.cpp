@@ -86,6 +86,8 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
 
     auto srcDesc = texture_desc(input.width << firstResident, input.height << firstResident,
                                 input.format, D3D12_RESOURCE_FLAG_NONE);
+    if (input.format == DXGI_FORMAT_BC7_UNORM && (srcDesc.Width % 4 || srcDesc.Height % 4))
+        throw std::runtime_error("Expected block-aligned BC7 base dimensions");
     const UINT residentCount = static_cast<UINT>(levels.size());
     srcDesc.MipLevels = static_cast<UINT16>(firstResident + residentCount);
     auto texture = resource(device, srcDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -277,12 +279,12 @@ PixelInput read_bc7_case(const char* fixture)
     file.read(magic.data(), 4);
     file.read(reinterpret_cast<char*>(&w), sizeof(w));
     file.read(reinterpret_cast<char*>(&h), sizeof(h));
-    if (!file || std::memcmp(magic.data(), "BC7C", 4) || !w || !h || w % 4 || h % 4 ||
+    if (!file || std::memcmp(magic.data(), "BC7C", 4) || !w || !h ||
         w > 4096 || h > 4096 || size_t(w) * h > 4 * 1024 * 1024)
         throw std::runtime_error("Invalid single-level BC7 case dimensions or header");
     PixelInput input{w, h, 1, DXGI_FORMAT_BC7_UNORM};
     const size_t pixels = size_t(w) * h;
-    input.rows.resize(pixels);  // 16 bytes per 4x4 block
+    input.rows.resize(((w + 3) / 4) * ((h + 3) / 4) * 16);
     file.read(reinterpret_cast<char*>(input.rows.data()), input.rows.size());
     std::vector<std::array<BYTE,4>> reference(pixels);
     file.read(reinterpret_cast<char*>(reference.data()), pixels * 4);
@@ -295,6 +297,13 @@ PixelInput read_bc7_case(const char* fixture)
     }
     return input;
 }
+
+bool is_next_mip(const PixelInput& upper, const PixelInput& lower)
+{
+    return (upper.width > 1 || upper.height > 1) &&
+           lower.width == std::max<UINT>(1, upper.width / 2) &&
+           lower.height == std::max<UINT>(1, upper.height / 2);
+}
 }
 
 void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* fixture,
@@ -304,7 +313,7 @@ void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* fixtu
     levels.push_back(read_bc7_case(fixture));
     if (mip1) {
         auto lower = read_bc7_case(mip1);
-        if (lower.width * 2 != levels.front().width || lower.height * 2 != levels.front().height)
+        if (!is_next_mip(levels.front(), lower))
             throw std::runtime_error("Expected a half-size BC7 mip");
         levels.push_back(std::move(lower));
     }
@@ -316,7 +325,7 @@ void check_bc7_tail(ID3D12Device* device, const char* shader, const char* firstM
     const std::string_view arg(firstMip);
     UINT first = 0;
     const auto parsed = std::from_chars(arg.data(), arg.data() + arg.size(), first);
-    if (parsed.ec != std::errc{} || parsed.ptr != arg.data() + arg.size() || first > 10)
+    if (parsed.ec != std::errc{} || parsed.ptr != arg.data() + arg.size() || first > 12)
         throw std::runtime_error("Invalid first resident mip");
     std::vector<PixelInput> levels;
     for (int i = 0; i < count; ++i) {
@@ -325,7 +334,7 @@ void check_bc7_tail(ID3D12Device* device, const char* shader, const char* firstM
             const UINT width = level.width << first, height = level.height << first;
             if (width > 4096 || height > 4096 || UINT64(width) * height > 4 * 1024 * 1024)
                 throw std::runtime_error("Logical BC7 texture exceeds fixture bounds");
-        } else if (levels.back().width / 2 != level.width || levels.back().height / 2 != level.height) {
+        } else if (!is_next_mip(levels.back(), level)) {
             throw std::runtime_error("Expected consecutive BC7 mip sizes");
         }
         levels.push_back(std::move(level));

@@ -965,7 +965,7 @@ To test the published fixed-symbol rANS hypothesis against an isolated BCPack pr
 
 `tools/bc7_tiles.py` converts one padded GFX10 `SW_4K_S` surface of 16-byte BC7 blocks to desktop block rows. The caller supplies the pixel dimensions and the bytes of one mip level. Each 4 KiB tile contains 16 × 16 BC7 blocks. The address equation applies to the standard non-XOR mode. [AMD GFX10 swizzle tables](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10SwizzlePattern.h)
 
-The desktop check uploads those rows as `DXGI_FORMAT_BC7_UNORM`, runs the translated copy shader, and checks its floating-point readback against CPU-decoded RGBA values after half-precision export. Its case file starts with `BC7C` and two little-endian 32-bit pixel dimensions, followed by tightly packed BC7 block rows and one reference RGBA8 value per texel. The draw check accepts dimensions divisible by four, up to 4096 on either axis and 4 Mi pixels total.
+The desktop check uploads those rows as `DXGI_FORMAT_BC7_UNORM`, runs the translated copy shader, and checks its floating-point readback against CPU-decoded RGBA values after half-precision export. Its case file starts with `BC7C` and two little-endian 32-bit pixel dimensions, followed by tightly packed BC7 block rows and one reference RGBA8 value per texel. The base texture dimensions must be divisible by four. Each resident mip uses its logical dimensions, up to 4096 on either axis and 4 Mi pixels total, with one reference value per texel. Even a 1×1 mip occupies a complete 16-byte BC7 block.
 
 ```powershell
 ctest --preset dev -R '^bc7_draw_' -V
