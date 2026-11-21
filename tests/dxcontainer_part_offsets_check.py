@@ -9,27 +9,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from resource_inventory import dxil_program, parts, shader_markers
 
 
-def container(*, reversed_directory=False, overlapping=False):
+def container(*, reversed_directory=False, overlapping=False, extra_fourcc=None):
     # This is a deliberately minimal framing probe, not executable DXIL.
     # No third-party shaders or game assets are required.
     program = struct.pack("<II4sIII", 0, 8, b"DXIL", 0, 16, 4) + b"BC\xc0\xde" + bytes(4)
     assert len(program) == 32
     dxil = b"DXIL" + struct.pack("<I", len(program)) + program
     note = b"NOTE" + struct.pack("<I", 4) + b"test"
-    table_end = 32 + 2 * 4
-    dxil_start, note_start = table_end, table_end + len(dxil)
-    physical = dxil + note
+    if extra_fourcc is not None:
+        assert len(extra_fourcc) == 4 and not overlapping
+    sections = [dxil, note]
+    if extra_fourcc is not None:
+        sections.append(extra_fourcc + struct.pack("<I", 5) + b"extra")
+    table_end = 32 + 4 * len(sections)
+    offsets = []
+    cursor = table_end
+    for section in sections:
+        offsets.append(cursor)
+        cursor += len(section)
+    physical = b"".join(sections)
     if overlapping:
         # Make a second valid part header WITHIN the first one's payload.
         # In this case both intervals may be in-bounds, but overlap.
         physical = b"OUTR" + struct.pack("<I", 28) + b"INNR" + struct.pack("<I", 4) + b"test" + bytes(16)
-        dxil_start, note_start = table_end, table_end + 8
-    offsets = [dxil_start, note_start]
+        offsets = [table_end, table_end + 8]
     if reversed_directory:
         offsets.reverse()
     size = table_end + len(physical)
-    return (b"DXBC" + bytes(16) + struct.pack("<III", 1, size, 2)
-            + struct.pack("<2I", *offsets) + physical)
+    return (b"DXBC" + bytes(16) + struct.pack("<III", 1, size, len(offsets))
+            + struct.pack(f"<{len(offsets)}I", *offsets) + physical)
 
 
 class DXContainerPartOffsets(unittest.TestCase):
@@ -49,6 +57,23 @@ class DXContainerPartOffsets(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parts(data)
                 self.assertFalse(dxil_program(data, 0))
+
+    def test_duplicate_fourcc_rejected_by_both_readers(self):
+        # Two separate NOTE sections overlap neither each other nor the DXIL
+        # section. A unique FourCC control proves valid DXIL framing is present.
+        for reverse in (False, True):
+            with self.subTest(reversed_directory=reverse):
+                control = container(reversed_directory=reverse, extra_fourcc=b"UNIQ")
+                duplicate = container(reversed_directory=reverse, extra_fourcc=b"NOTE")
+                self.assertEqual(len(control), len(duplicate))
+                self.assertEqual(set(parts(control)), {b"DXIL", b"NOTE", b"UNIQ"})
+                self.assertTrue(dxil_program(control, 0))
+                self.assertEqual(shader_markers(control)["framed_dxil_programs"], 1)
+                self.assertIn(b"BC\xc0\xde", duplicate)
+                with self.assertRaisesRegex(ValueError, "Invalid container part"):
+                    parts(duplicate)
+                self.assertFalse(dxil_program(duplicate, 0))
+                self.assertEqual(shader_markers(duplicate)["framed_dxil_programs"], 0)
 
     def test_part_outside_container_remains_invalid(self):
         data = bytearray(container())

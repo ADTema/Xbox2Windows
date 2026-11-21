@@ -71,6 +71,7 @@ def dxil_program(data, offset):
         return False
     table_end = 32 + parts * 4
     spans = []
+    seen_tags = set()
     program = False
     for i in range(parts):
         relative, = struct.unpack_from("<I", data, offset + 32 + 4 * i)
@@ -79,8 +80,9 @@ def dxil_program(data, offset):
         start = offset + relative
         tag, extent = struct.unpack_from("<4sI", data, start)
         part_end = relative + 8 + extent
-        if part_end > size:
+        if part_end > size or tag in seen_tags:
             return False
+        seen_tags.add(tag)
         spans.append((relative, part_end))
         if tag == b"DXIL" and extent >= 24:
             body = start + 8
