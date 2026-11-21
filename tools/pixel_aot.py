@@ -130,6 +130,9 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
         return f"asfloat({int(token) & 0xffffffff}u)"
     if token.startswith("-"):
         return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_pending) + ")"
+    if absolute := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
+        inner = absolute.group(1) or absolute.group(2)
+        return f"abs({fp_operand(inner, scalar, vector, pending, sample_pending)})"
     if re.fullmatch(r"[vs]\d+", token):
         if token in pending:
             raise ValueError("Constant read before load completion")

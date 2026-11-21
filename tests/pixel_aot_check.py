@@ -1,4 +1,4 @@
-"""Exercise offline pixel translation with two independently assembled test programs."""
+"""Exercise offline pixel translation with independently assembled test programs."""
 from pathlib import Path
 import math
 import struct
@@ -9,6 +9,9 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from pixel_aot import disassemble, lower, native_program
+
+
+RAMP = (0, 16, 37, 64, 101, 153, 219, 254)
 
 
 def assembly(swap):
@@ -91,6 +94,16 @@ def curve():
     return program
 
 
+def absolute_value():
+    program = assembly(False)
+    pos = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
+    program[pos:pos] = [
+        "v_sub_f32_e32 v12, 0.5, v12",
+        "v_sub_f32_e64 v12, |v12|, 0",
+    ]
+    return program
+
+
 def half_rtz(x):
     bits, = struct.unpack("<H", struct.pack("<e", x))
     rounded, = struct.unpack("<e", struct.pack("<H", bits))
@@ -101,13 +114,23 @@ def curve_case(directory, gain):
     gamma, floor, mix = 2.0, .125, .25
     case = bytearray(256)
     struct.pack_into("<4f", case, 12, gamma, gain, floor, mix)
-    ramp = (0, 16, 37, 64, 101, 153, 219, 254)
-    for y in ramp:
-        for x in ramp:
+    for y in RAMP:
+        for x in RAMP:
             g = y / 255
             r = gain * math.sqrt(max(floor, x / 255)) - (1 - g) + mix * g
             case.extend(struct.pack("<4f", half_rtz(min(1, max(0, r))), half_rtz(g), half_rtz(128/255), 1))
     path = directory / "curve.case"
+    path.write_bytes(case)
+    return path
+
+
+def absolute_case(directory):
+    case = bytearray(256)
+    for y in RAMP:
+        for x in RAMP:
+            red = abs(0.5 - x / 255)
+            case.extend(struct.pack("<4f", half_rtz(red), half_rtz(y / 255), half_rtz(128 / 255), 1))
+    path = directory / "absolute.case"
     path.write_bytes(case)
     return path
 
@@ -132,6 +155,10 @@ def check_controls(directory):
         assert translate(modern) == translate(program)
         must_reject(translate, [line.replace("exp mrt0 ", "exp mrt0,, ") for line in program])
 
+    program = absolute_value()
+    alternate = [line.replace("|v12|", "abs(v12)") for line in program]
+    assert translate(program) == translate(alternate)
+
     program = assembly(False)
     for old, new in (("s_mov_b32 s21, 0", "s_mov_b32 s21, 1"),
                      ("s_mov_b32 s40, 1", "s_mov_b32 s40, 8"),
@@ -147,7 +174,7 @@ def check_controls(directory):
 
 
 def check_binary(directory, assembler, objcopy, library):
-    for instructions in (assembly(False), assembly(True), curve()):
+    for instructions in (assembly(False), assembly(True), curve(), absolute_value()):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
         binary = directory / "fixture.bin"
@@ -188,6 +215,20 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Stale reference accepted after changing the bound constants")
+
+    program = absolute_value()
+    case = absolute_case(directory)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    subprocess.run(draw, check=True)
+
+    without_abs = [line.replace("|v12|", "v12") for line in program]
+    source.write_text(translate(without_abs), encoding="ascii")
+    subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("The renderer failed to detect the missing absolute value")
     return 0
 
 
