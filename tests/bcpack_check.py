@@ -31,6 +31,30 @@ class TextureChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             probe(prefix, 25000, next_mask=0x10)
 
+    def test_refill_follows_lane_read_count(self):
+        prefix = bytearray(48)
+        prefix[4::8] = bytes.fromhex("de 05 03 0c 86 4e")
+        # Lane 4 skips the first round, so its first read in the second round takes AC.
+        for byte, expected in ((0xAC, True), (0x7D, False)):
+            result, = probe(prefix, 25000, prefetch_mask=0x01, prefetch=b"\x00",
+                            next_mask=0x11, next_bytes=bytes([0, byte]))
+            self.assertEqual(result["first_refill_offset"], 50)
+            self.assertEqual(result["first_refill_matches"], expected)
+            self.assertNotIn("second_refill_offset", result)
+
+        # The one-refill lane has no byte left for a second read.
+        prefix[4::8] = bytes.fromhex("de 04 01 00 11 30")
+        result, = probe(prefix, 11358, prefetch_mask=0x10, prefetch=b"\x7d",
+                        next_mask=0x11, next_bytes=b"\x00\x00")
+        self.assertTrue(result["first_refill_matches"])
+        self.assertEqual(result["unbudgeted_read_offsets"], [50])
+        self.assertNotIn("second_refill_offset", result)
+        # A verified constant lane reads nothing after its header.
+        prefix[4::8] = bytes.fromhex("de 03 01 00 40 02")
+        result, = probe(prefix, 2, prefetch_mask=0x10, prefetch=b"\x00")
+        self.assertEqual((result["status"], result["unbudgeted_read_offsets"]), ("verified_constant_lane", [48]))
+        self.assertNotIn("first_refill_matches", result)
+
     def test_constant_lane(self):
         prefix = bytearray(48)
         prefix[4::8] = bytes.fromhex("de 03 01 00 40 02")
