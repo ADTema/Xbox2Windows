@@ -144,8 +144,6 @@ the behavior under test; it does not establish full-game startup.
 - Update the relevant README row or `docs/experiments.md` when a public
   capability, build requirement or reproduction command changes.
 - Include the exact test command and result in the PR body.
-- If the change was AI-assisted, disclose it in the PR description. Recent
-  contributions follow this practice.
 - Do not include game files, dumps, distribution links or secrets.
 
 ## First places to look
