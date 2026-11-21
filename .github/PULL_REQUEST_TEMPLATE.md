@@ -9,3 +9,5 @@ Give the commit or build, command and result. For GPU changes include the adapte
 ## Evidence and follow-up
 
 For new fixtures, describe their source or generation method and license. Identify assumptions that affect the result and link any work another contributor can pick up.
+
+If this changes what contributors can run, link the updated README entry or build step and the reproduction command. For a local-data result, identify the part the public fixture verifies.
