@@ -128,7 +128,8 @@ def read_layout_chunks(path):
     for chunk in ET.parse(path).getroot().findall("Chunk"):
         files = []
         for group in chunk.findall("FileGroup"):
-            directory = group.attrib["DestinationPath"].replace("\\", "/").strip("/")
+            parts = group.attrib["DestinationPath"].replace("\\", "/").split("/")
+            directory = "/".join(part for part in parts if part not in ("", "."))
             files.append("/".join(filter(None, [directory, group.attrib["Include"]])))
         chunks.append({"id": chunk.attrib["Id"], "marker": chunk.get("Marker"), "files": files})
     return chunks
