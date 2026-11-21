@@ -62,6 +62,37 @@ def check_desktop_forwarders():
     assert report["reachable"]["relay.dll"]["reasons"] == ("normal", "forwarder")
     assert report["reachable"]["last.dll"]["path"] == ("entry.exe", "front.dll", "relay.dll", "last.dll")
 
+    # Forwarded chains ending at an ambiguous package basename keep resolved hops without queuing None.
+    ambiguous_pkg = {
+        "front.dll": (["front.dll"], {"DirectTwin": "twin.Value", "Twin": "mid.Step"}),
+        "mid.dll": (["bin/mid.dll"], {"Step": "twin.Value"}),
+        "twin.dll": (["a/twin.dll", "b/twin.dll"], None),
+    }
+    direct_twin = resolve_desktop("front.dll", "DirectTwin", "entry.exe", contracts, tables.get,
+                                  lambda name: ambiguous_pkg.get(name, ((), None)))
+    relayed_twin = resolve_desktop("front.dll", "Twin", "entry.exe", contracts, tables.get,
+                                   lambda name: ambiguous_pkg.get(name, ((), None)))
+    for result in (direct_twin, relayed_twin):
+        assert result["status"] == "ambiguous_package_basename"
+        assert result["chain"][-1] == dict(dll="twin.dll", provider=None, symbol="Value", package=True)
+    inventory["images"].update({n: {"sha256": "fixture", "exports": []}
+                                for n in ("bin/mid.dll", "a/twin.dll", "b/twin.dll")})
+    direct_row = dict(image="entry.exe", kind="normal", dll="front.dll", symbol="DirectTwin",
+                      bundle_exports_in=["front.dll"], desktop_export="provider_not_found",
+                      package_resolution=direct_twin)
+    relayed_row = dict(image="entry.exe", kind="normal", dll="front.dll", symbol="Twin",
+                       bundle_exports_in=["front.dll"], desktop_export="provider_not_found",
+                       package_resolution=relayed_twin)
+    for imports_case in ([direct_row], [row, direct_row, relayed_row]):
+        inventory["imports"] = imports_case
+        report = trace(inventory, "entry.exe")
+        assert None not in report["reachable"]
+        problems = {f["symbol"]: (f["problem"], f["package_chain"]) for f in report["findings"]}
+        assert problems["DirectTwin"] == ("ambiguous_package_basename", direct_twin["chain"])
+    assert report["reachable"]["bin/mid.dll"]["path"] == ("entry.exe", "front.dll", "bin/mid.dll")
+    assert report["reachable"]["bin/mid.dll"]["reasons"] == ("normal", "forwarder")
+    assert problems["Twin"] == ("ambiguous_package_basename", relayed_twin["chain"])
+
 
 def main():
     loader = "amd_fidelityfx_loader_xbox.dll"
