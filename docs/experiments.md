@@ -715,6 +715,15 @@ The tail check uses one logical texture per draw. It uploads all supplied consec
 
 To check a proposed first read round in the BCPack probe, append `--prefetch-mask MASK`. Set bit *i* for each of the first eight lanes expected to read a byte in that round. The probe uses the proposed lane order to locate the byte and compares it with the last byte emitted by the reverse encoder. A matching first byte tests a single refill prediction. Later refill positions and the assignment of BC7 block fields require separate evidence.
 
+`tools/bc7_blocks.py` supplies independently known BC7 blocks for [issue #15](https://github.com/R0Y00/Xbox2Windows/issues/15). `layout(mode, partition)` lists the name, first bit and width of every field in a 16-byte block, with bit 0 as the low bit of the first byte. `unpack(block)` and `pack(fields)` convert between a block and those named values, and `decode(block)` returns sixteen RGBA8 texels. Every bit of the eight valid modes belongs to one field, so `pack(unpack(block))` reproduces any such block. `fixture()` builds a 64×128 surface of 512 blocks. Each field value comes from a SHA-256 digest of the mode, case number and field name. It cycles through the modes and covers every partition, rotation and index selection value. The module contains no BCPack logic. It gives a candidate lane-to-field mapping the complete block rows and field values to compare against. [Microsoft BC7 format](https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc7-format)
+
+```powershell
+ctest --preset dev --no-tests=error -R '^bc7_block_reference$' -V
+python -B tools/bc7_blocks.py out/bc7_fields.case --fields out/bc7_fields.json
+```
+
+The test compares the first bit of each field group with offsets transcribed from the published mode layouts, checks that every anchor texel lies in its subset, and decodes three blocks whose texels are worked out by hand in the test comments. It also decodes the mode-6 blocks of the draw fixture, which builds its own reference texels, and pins SHA-256 digests of the generated block rows and texels. When the optional `texture2ddecoder` package is installed, the test additionally compares 16,897 decoded blocks with that decoder. This comparison is skipped otherwise. The command above writes the fixture in the `BC7C` case layout. Drawing that case through `offscreen_check` has not been run and would add a GPU decoder as a further reference.
+
 The optional capture contains verified, top-down RGBA8 pixels converted from the GPU readback. The mip test binds both levels in one texture and renders to a half-size target so implicit derivatives select the lower mip. An original mode-6 fixture varies endpoints by block and indices by texel. The negative control shifts only the lower level's compressed blocks and requires a pixel mismatch. [Microsoft BC7 mode reference](https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc7-format-mode-reference)
 
 ### Reading logical ranges and probing structured resources
