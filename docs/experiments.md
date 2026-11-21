@@ -852,8 +852,8 @@ With registration, the callers' predicates accept GPU-intended memory and reject
 
 | Export | Observed call shape | Desktop handling |
 |---|---|---|
-| `XMemAlloc` | Size and attribute word (Bink and AMD callers). | `era_heap::allocate`. Graphics memory types are also registered with `era_query`, so they count as GPU-intended. |
-| `XMemFree` | Allocation and the same attribute word. | Unregisters graphics allocations, then `era_heap::release_with_attributes`. |
+| `XMemAlloc` | Size and attribute word (Bink and AMD callers). | `era_heap::allocate`. Graphics memory types are also tracked by `era_title_gpu`, which registers them with `era_query` so they count as GPU-intended, and gives them desktop GPU addresses once a D3D12 device is attached (see below). |
+| `XMemFree` | Allocation and the same attribute word. | Untracks graphics allocations, dropping any alias and the `era_query` registration, then `era_heap::release_with_attributes`. |
 | `XMemVirtualQuery` | The four BVH callers pass the process in `rcx`, the address in `rdx` and a 64-byte buffer in `r8`; `r9` is not set, so there is no length argument. They test the 32-bit result in `eax`. | `era_query::query` on the 64-byte buffer; returns `TRUE` when it succeeds. |
 | `XMemGetWorkingSetStatistics` | The seven AMD callers pass `0x20000001` in `ecx` and an output address in `rdx` and test the 32-bit result. On failure each uses zero instead of the 64-bit value at `+8`. | Returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the output untouched. |
 
@@ -914,6 +914,40 @@ Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer una
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
 
 The original test machine had Windows Graphics Tools installed. A second build in `out/build/agility` used Microsoft Agility SDK 1.620.2. Set `-DOFFSCREEN_AGILITY_620_DIR=<directory containing the x64 SDK DLLs>` to reproduce it. This configuration verifies debug interface activation. [Agility SDK package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
+
+### Desktop GPU addresses for xmem graphics allocations
+
+`era_title_gpu` (`src/era_title_gpu.cpp`) is a process-wide registry that connects `xmem.dll` to the GPU address pieces above.
+
+How it works:
+- `xmem.dll` tracks every graphics allocation through it. Without a device this only registers the region with `era_query`, as before.
+- `attach(device)` opens every tracked allocation as an `era_gpu_alias` heap and adds its range to an `era_title_va::Table`. Allocations tracked later are aliased at once.
+- `translate` gives the desktop GPU address of a title span, and `locate` gives the buffer and offset behind it, for descriptors.
+- `shader_view` returns the packed ranges and the buffers in slot order for `TitleLookup`.
+
+Failures and lifecycle:
+- An allocation that cannot be aliased stays tracked without a translation. `attach` reports the first such failure after trying every allocation.
+- `detach` drops every alias and keeps tracking. Attaching a different device re-aliases everything.
+- The registry does not wait for GPU work before an alias is released: releasing memory the GPU still uses is a title error on the console as well.
+
+`xmem.dll` keeps its four exports and its imports, and loading it does not load D3D12. How a separate D3D12 layer would call `attach`, `translate` and `shader_view` across the DLL boundary is left to the lead's export decision (#132). The test links the registry directly.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `gpu_alias_registry_warp`, `gpu_alias_registry_hardware` | Two memory-type-1 allocations and an interior block of a region placed below the first one (not an allocation base, so it cannot be aliased) are tracked before attach. `era_query` must report them GPU-intended, with nothing translated. `attach` must report the interior block's `E_INVALIDARG` and still alias both allocations. `locate` and `translate` must agree. A span past the end and the interior block must not be translated or located. A third allocation tracked after attach is aliased at once, and an unaliasable block tracked after attach stays tracked without a translation. Re-attaching the same device keeps existing aliases. The registry's shader view then drives `TitleLookup` on the GPU: 15 addresses, 12 hits, matching CPU reads through the title pointers. `untrack`, `detach` and a full re-attach are checked against the same translations. Duplicate, overlapping, null and empty input are rejected. |
+| `xmem_shim_exports` | Now also requires that loading `xmem.dll` has not loaded `d3d12.dll`. |
+
+Eight mutants of the registry each fail the test:
+- never aliasing on `track`;
+- stopping `attach` at the first failure;
+- keeping the `era_query` registration after `untrack`;
+- keeping aliases on `detach`;
+- no bounds in `locate`;
+- untracking on an alias failure;
+- reversing the shader view's buffers;
+- skipping the `era_query` registration.
+
+Measured on WARP 10.0.26100.9818, Windows 11 build 26300: `gpu_alias_registry_warp` passed, with attach reporting `0x80070057` for the interior block and mismatches 0, and passed 5 of 5 repeated runs. The hardware variant was not run for this change (the GPU was in use).
 
 ### Windows 10 with the app-local Agility SDK and WARP
 
