@@ -128,11 +128,9 @@ def check_rejections(mapper, image, provider, symbol):
         length = imports.get_field_absolute_offset("Size")
         size = pe.OPTIONAL_HEADER.SizeOfImage
     bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
-    descriptor = 20  # sizeof(IMAGE_IMPORT_DESCRIPTOR)
     for field, value, expected, message in (
             (entry, size + 0x1000, "format", "entry point outside executable section"),
-            (address, size - 4, "format", "import directory outside image"),
-            (length, descriptor - 1, "format", "import directory smaller than one descriptor")):
+            (address, size - 4, "format", "import directory outside image")):
         data = bytearray(image.read_bytes())
         struct.pack_into("<I", data, field, value)
         with TemporaryDirectory() as temp:
@@ -141,8 +139,76 @@ def check_rejections(mapper, image, provider, symbol):
             base, status, detail, requests = mapper(damaged, bindings)
         if base or status != STATUS[expected] or detail != message or requests:
             raise AssertionError(f"{message} control: {base=} {status=} {detail=} {requests=}")
-    print(f"{image.name}: rejected unbound {identity}, an entry point and an import directory outside the image "
-          "and one smaller than a descriptor")
+    print(f"{image.name}: rejected unbound {identity}, an entry point and an import directory outside the image")
+
+
+LOAD_SEARCH = 0x00000100 | 0x00001000  # LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
+kernel.LoadLibraryExW.restype = wintypes.HMODULE
+kernel.FreeLibrary.argtypes = [wintypes.HMODULE]
+kernel.GetModuleHandleExW.argtypes = [wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.HMODULE)]
+FROM_ADDRESS_UNCHANGED = 0x4 | 0x2  # GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | _UNCHANGED_REFCOUNT
+
+
+def bound_symbol(value, slots):
+    """Return (dll, symbol) of the slot entry whose provider export equals value, or None."""
+    owner = wintypes.HMODULE()
+    if not kernel.GetModuleHandleExW(FROM_ADDRESS_UNCHANGED, ctypes.c_void_p(value), ctypes.byref(owner)):
+        return None
+    for dll, symbol in slots.values():
+        if kernel.GetProcAddress(owner, symbol.encode()) == value:
+            return dll, symbol
+    return None
+
+
+def check_import_walk(mapper, image, providers):
+    """Patch the import directory Size of a two-descriptor image and compare pe_map with Windows.
+
+    The Windows loader finds the import table by address and walks to the null descriptor, so a Size
+    that is zero, below one descriptor or ends after the first descriptor still binds every slot.
+    """
+    with pefile.PE(str(image)) as pe:
+        imports = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1]
+        length = imports.get_field_absolute_offset("Size")
+        built = imports.Size
+        slots = {d.struct.FirstThunk + 8 * i: (d.dll.decode().casefold(), imp.name.decode())
+                 for d in pe.DIRECTORY_ENTRY_IMPORT for i, imp in enumerate(d.imports)}
+    if sorted(dll for dll, _ in slots.values()) != sorted(p.name.casefold() for p in providers):
+        raise AssertionError(f"{image.name}: expected one import from each provider, got {slots}")
+    descriptor = 20  # sizeof(IMAGE_IMPORT_DESCRIPTOR)
+    if built != 3 * descriptor:
+        raise AssertionError(f"{image.name}: import directory Size {built}, expected two descriptors and a terminator")
+    modules = {p.name.casefold(): ctypes.CDLL(str(p)) for p in providers}
+    for value in (built, 0, descriptor - 1, descriptor):
+        data = bytearray(image.read_bytes())
+        struct.pack_into("<I", data, length, value)
+        with TemporaryDirectory() as temp:
+            copy = Path(temp) / image.name
+            copy.write_bytes(data)
+            for p in providers:
+                (Path(temp) / p.name).write_bytes(p.read_bytes())
+            # Windows: only the IAT is read after the load; nothing in the image runs (no entry point).
+            module = kernel.LoadLibraryExW(str(copy), None, LOAD_SEARCH)
+            if not module:
+                raise AssertionError(f"Size {value}: LoadLibraryExW failed with {ctypes.get_last_error()}")
+            try:
+                windows = {slot: bound_symbol(ctypes.c_uint64.from_address(module + slot).value, slots)
+                           for slot in slots}
+            finally:
+                kernel.FreeLibrary(module)
+            base, status, detail, requests = mapper(copy, modules)
+        if status != STATUS["ok"] or not base:
+            raise AssertionError(f"Size {value}: pe_map failed with {status}: {detail}")
+        try:
+            mapped = {slot: bound_symbol(ctypes.c_uint64.from_address(base + slot).value, slots) for slot in slots}
+        finally:
+            mapper.release(base)
+        if sorted((dll.casefold(), item) for dll, item in requests) != sorted(slots.values()):
+            raise AssertionError(f"Size {value}: unexpected import requests {requests}")
+        if windows != slots or mapped != slots:
+            raise AssertionError(f"Size {value}: expected {slots}, Windows bound {windows}, pe_map bound {mapped}")
+    print(f"{image.name}: import directory Size {built}, 0, {descriptor - 1} and {descriptor} bind both slots "
+          "under LoadLibraryExW and pe_map")
 
 
 def check_empty_export_slot(mapper, image):
@@ -179,6 +245,7 @@ def main():
     parser.add_argument("--ordinal", type=Path, nargs=4, metavar=("ORIGINAL", "LIFTED", "PROVIDER", "ALTERED"),
                         required=True)
     parser.add_argument("--reloc", type=Path, nargs=3, metavar=("ORIGINAL", "PROVIDER", "ALTERED"), required=True)
+    parser.add_argument("--two", type=Path, nargs=3, metavar=("IMAGE", "PROVIDER", "SECOND_PROVIDER"), required=True)
     args = parser.parse_args()
     mapper = Mapper(args.mapper)
     probe = register_probe(str(args.probe))
@@ -196,6 +263,8 @@ def main():
         raise AssertionError("relocation fixture must have exactly one DIR64 entry")
     check_mapping(mapper, "relocated", original, provider, "mix_args", probe, natives)
     check_mapping(mapper, "relocated with altered shim", original, provider, "mix_args", probe, [], altered)
+    image, *providers = args.two
+    check_import_walk(mapper, image, providers)
 
 
 if __name__ == "__main__":
