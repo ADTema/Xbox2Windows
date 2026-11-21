@@ -146,6 +146,50 @@ def main():
             levels = [write_patterned_mip(work, max(1, width >> level), max(1, height >> level))
                       for level in range(first, 8)]
             subprocess.run([renderer, backend, "--check-bc7-tail", shader, str(first), *levels], check=True)
+        for width, height, first in ((4096, 4, 11), (4, 4096, 11), (4096, 4, 12)):
+            levels = [write_patterned_mip(work, max(1, width >> level), max(1, height >> level))
+                      for level in range(first, max(width, height).bit_length())]
+            draw = [renderer, backend, "--check-bc7-tail", shader, str(first),
+                    "--base-size", str(width), str(height), *levels]
+            result = subprocess.run(draw, capture_output=True, text=True, check=True)
+            if f"requested_mip=0 sampled_mip={first} pixels={width * height} " not in result.stdout:
+                raise AssertionError("The fallback draw must cover the declared base texture")
+        # The 29x19 fallback has an exact point-sample tie at (14, 0).
+        # Combine channels from the two texels on either side only at that pixel.
+        boundary_levels = [write_patterned_mip(work, max(1, 116 >> level), max(1, 76 >> level))
+                           for level in range(3, 7)]
+        boundary_args = ["3", "--base-size", "116", "76", *boundary_levels]
+        subprocess.run([renderer, backend, "--check-bc7-tail", shader, *boundary_args], check=True)
+        source.write_text("#define main copy_pixel\n" + source.read_text(encoding="ascii") + """
+#undef main
+float4 main(float2 uv : TEXCOORD0) : SV_Target0 {
+    float4 original = copy_pixel(uv);
+    float4 left = copy_pixel(uv - float2(0.25 / 14, 0));
+    float4 right = copy_pixel(uv + float2(0.25 / 14, 0));
+    if (abs(uv.x - 0.5) < 0.00001 && abs(uv.y - 0.5 / 19) < 0.00001)
+        return float4(left.r, right.g, left.b, right.a);
+    return original;
+}
+""", encoding="ascii")
+        mixed = work / "mixed.cso"
+        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", mixed, source], check=True)
+        wrong = subprocess.run([renderer, backend, "--check-bc7-tail", mixed, *boundary_args],
+                               capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch x=14 y=0" not in wrong.stderr.splitlines():
+            raise AssertionError("An exact boundary must still match one whole reference texel")
+        # The same 1x1 data is also legal at mip 12 of a tall strip, but 4x4
+        # has only three mip levels and cannot have mip 12 at all.
+        tiny = write_patterned_mip(work, 1, 1)
+        start = [renderer, backend, "--check-bc7-tail", shader, "12", "--base-size"]
+        subprocess.run([*start, "4", "4096", tiny], check=True)
+        invalid = subprocess.run([*start, "4", "4", tiny], capture_output=True, text=True)
+        if invalid.returncode != 1 or "incompatible with the first resident mip" not in invalid.stderr:
+            raise AssertionError("A declared texture must actually contain the supplied level")
+        transposed = write_patterned_mip(work, 1, 2)
+        wrong = subprocess.run([renderer, backend, "--check-bc7-tail", shader, "11",
+                                "--base-size", "4096", "4", transposed], capture_output=True, text=True)
+        if wrong.returncode != 1 or "incompatible with the first resident mip" not in wrong.stderr:
+            raise AssertionError("Reject a resident mip with transposed dimensions")
     return 0
 
 
