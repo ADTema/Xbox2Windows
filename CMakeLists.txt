@@ -301,6 +301,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     target_compile_definitions(cpu_call_altered PRIVATE ALTER_RETURN)
     cpu_asm_fixture(cpu_register_probe register_probe)
+    foreach(variant IN ITEMS original swapped)
+        cpu_asm_fixture(cpu_switch_${variant} switch)
+        cpu_translation(cpu_switch_${variant} cpu_switch_aot select_rva,select_rel,run_ops)
+    endforeach()
+    target_compile_definitions(cpu_switch_swapped PRIVATE SWAP_TABLE)
+    add_test(NAME cpu_aot_jump_tables COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_original>" "$<TARGET_FILE:cpu_switch_original_lifted>"
+        "$<TARGET_FILE:cpu_switch_swapped_lifted>")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_callback callback)
