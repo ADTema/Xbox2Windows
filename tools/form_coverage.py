@@ -50,8 +50,11 @@ CPU_FIXTURES = {
     "repeat_call": "cpu_aot_repeated_call",
     "working_set_delta": "cpu_working_set_delta",
     "exe_entry": "cpu_aot_exe_entry",
+    "address_size": "cpu_aot_address_size",
+    "call_pair": "cpu_aot_call_pair",
     "register_probe": None,  # measurement harness
     "two_imports": None,     # mapped and run unchanged by pe_map
+    "exe_start": None,       # mapped and run unchanged by pe_map
     "reloc_route": None,     # mapped and run unchanged by pe_map
     "seh_route": None,       # mapped and run unchanged by pe_map
     "tls_route": None,       # mapped and run unchanged by pe_map
