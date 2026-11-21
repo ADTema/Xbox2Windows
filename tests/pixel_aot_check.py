@@ -216,7 +216,16 @@ def check_predicate_draws(directory, compiler, renderer, backend):
             struct.pack_into("<4f", constants, 12, left, right, 0, 1)
             pixel = struct.pack("<4f", *((op >> relation) & 1 for op in range(first, first + 4)))
             case.write_bytes(constants + pixel * 64)
-            subprocess.run(draw, check=True)
+            try:
+                subprocess.run(draw, check=True)
+            except subprocess.CalledProcessError as error:
+                channels = ", ".join(
+                    f"{channel}={op}" for channel, op in enumerate(PREDICATES[first:first + 4])
+                )
+                error.add_note(
+                    f"Predicate draw on {backend}, first={first}, left={left!r}, right={right!r}, channels {channels}"
+                )
+                raise
     # Keep the unordered oracle and change only the NaN operand to equal.
     struct.pack_into("<f", constants, 16, 1.0)
     case.write_bytes(constants + pixel * 64)
