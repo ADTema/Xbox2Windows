@@ -303,7 +303,8 @@ class TestRdna2Extractor(unittest.TestCase):
             work = Path(tmp)
             archive = work / "source_built.rpf"
             archive.write_bytes(b"RPF\0" + b"".join(envelope(code, name) for name in names) + legacy + truncated)
-            output, manifest_path = extract_shaders(archive, work / "shaders", target_stages={"pixel"})
+            output, manifest_path = extract_shaders(archive, work / "shaders", target_stages={"pixel"},
+                                                    length_prefixed_names=True)
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
             self.assertEqual(manifest["total_extracted"], len(names) + 1)
@@ -315,6 +316,30 @@ class TestRdna2Extractor(unittest.TestCase):
                     self.assertEqual((output / record["native_file"]).read_bytes(), code)
                     if source_name != legacy_name:
                         self.assertEqual(native_program(archive, record["name"])[1], code)
+
+    def test_ambiguous_length_prefix_requires_explicit_mode(self) -> None:
+        code = bytes.fromhex("000080bf 000081bf")
+        legacy_name = b"PS_" + b"L" * 77
+        prefixed_name = legacy_name[1:]
+        data = envelope(code, legacy_name)[1:]
+        self.assertEqual(data, envelope(code, prefixed_name))
+        script = Path(__file__).resolve().parents[1] / "tools" / "extract_shaders.py"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            archive = work / "ambiguous.rpf"
+            archive.write_bytes(b"RPF\0" + data)
+            for expected_name, options in ((legacy_name, []), (prefixed_name, ["--length-prefixed-names"])):
+                name = expected_name.decode("ascii")
+                with self.subTest(options=options):
+                    output = work / name
+                    subprocess.run([sys.executable, "-B", str(script), str(archive), "--output-dir", str(output),
+                                    *options], capture_output=True, check=True)
+                    manifest_path = output / "manifest.json"
+                    record, = json.loads(manifest_path.read_text(encoding="utf-8"))["shaders"]
+                    self.assertEqual(record["name"], name)
+                    self.assertEqual(record["native_file"], f"pixel/{name}.bin")
+                    self.assertEqual((output / record["native_file"]).read_bytes(), code)
 
     def test_stage_filtering(self):
         known_code = bytes.fromhex("000080bf 000081bf")
