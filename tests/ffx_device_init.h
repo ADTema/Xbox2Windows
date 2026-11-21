@@ -17,3 +17,12 @@ struct FfxDeviceProbe {
 };
 
 void run_device_slice(FfxDeviceProbe& probe);
+
+struct FfxSlotOutput {
+    std::array<uint8_t, 0xec> prefix{};
+    uint32_t index;
+    uint32_t guard;
+};
+static_assert(offsetof(FfxSlotOutput, index) == 0xec);
+uint32_t run_backend_slots(uint8_t* scratch, FfxSlotOutput& provider, const uint32_t* sizes);
+void check_backend_slots(FfxDeviceProbe& probe);
