@@ -457,6 +457,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_narrow_returns COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/narrow_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_narrow>" "$<TARGET_FILE:cpu_narrow_lifted>")
+    cpu_asm_fixture(cpu_fourth_arg fourth_arg)
+    cpu_translation(cpu_fourth_arg cpu_switch_aot r9_mix,r9_loop,no_r9,r9_scratch)
+    add_test(NAME cpu_aot_fourth_argument COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/fourth_arg_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_fourth_arg>" "$<TARGET_FILE:cpu_fourth_arg_lifted>")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)

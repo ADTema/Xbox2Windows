@@ -1,6 +1,6 @@
 """Recompile bounded Windows x64 leaf functions with jump-table dispatch to C++.
 
-Each export takes three integer words in RCX, RDX and R8 and returns RAX. The
+Each export takes four integer words in RCX, RDX, R8 and R9 and returns RAX. The
 translator follows branches and jump-table entries from the export, so data
 placed after the code (as MSVC does with its tables) is never decoded. An
 indirect JMP is accepted only at the end of one of these sequences, reached by
@@ -12,6 +12,11 @@ the fallthrough of an unsigned bound check on the index:
 B must hold the same RIP-relative address on every path, and the index must be
 shown to carry the compared value. The generated C++ replaces the dispatch with
 a switch over the table targets.
+
+Stack arguments (the fifth and later) and floating-point arguments are not
+supported. All four argument registers are defined at entry, because the machine
+code does not show how many parameters the source function declares: a read of
+one that the source does not declare is accepted and sees what the caller left.
 
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
 CMOVcc) in one straight-line run that no edge enters. Instructions that leave
@@ -42,7 +47,7 @@ from cpu_ranges import function_ranges, image_bytes
 NAMES = {R.RAX: "rax", R.RCX: "rcx", R.RDX: "rdx", R.RBX: "rbx", R.RSP: "rsp", R.RBP: "rbp",
          R.RSI: "rsi", R.RDI: "rdi", R.R8: "r8", R.R9: "r9", R.R10: "r10", R.R11: "r11",
          R.R12: "r12", R.R13: "r13", R.R14: "r14", R.R15: "r15"}
-ARGUMENTS = (R.RCX, R.RDX, R.R8)
+ARGUMENTS = (R.RCX, R.RDX, R.R8, R.R9)
 VOLATILE = {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}

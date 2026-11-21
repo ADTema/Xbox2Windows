@@ -49,6 +49,7 @@ CPU_FIXTURES = {
     "bink_descriptors": "cpu_bink_descriptors",
     "switch": "cpu_aot_jump_tables",
     "switch_addr32": "cpu_aot_switch_addr32",
+    "fourth_arg": "cpu_aot_fourth_argument",
     "repeat_call": "cpu_aot_repeated_call",
     "working_set_delta": "cpu_working_set_delta",
     "exe_entry": "cpu_aot_exe_entry",
