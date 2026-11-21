@@ -619,3 +619,13 @@ else()
         "Follow the Python setup under First build in README.md, or set INTAKE_PYTHON "
         "to an interpreter with requirements-dev.txt installed. Then rerun CMake.")
 endif()
+
+if(EXISTS "${INTAKE_PYTHON}")
+    add_executable(rcas_coordinate_readback tests/rcas_coordinate_readback/readback.cpp)
+    target_link_libraries(rcas_coordinate_readback PRIVATE d3d11 d3dcompiler)
+    foreach(control IN ITEMS positive negative)
+        add_test(NAME rcas_coordinate_${control}_warp COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/rcas_coordinate_readback/verify.py" "${CMAKE_SOURCE_DIR}"
+            --host $<TARGET_FILE:rcas_coordinate_readback> --backend warp --case ${control})
+    endforeach()
+endif()
