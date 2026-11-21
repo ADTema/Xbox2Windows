@@ -985,6 +985,12 @@ The executable intake report's `dependency_paths` gives an explanatory path from
     Set-Content out/dependencies/pre-exe-paths.json -Encoding utf8
 ```
 
+The conditional FidelityFX routes are pinned to one loader hash. When a reachable image has the loader's basename but a different SHA-256, the report adds an `unverified_loader_hash` finding that names both hashes, instead of returning no conditional edge and exiting successfully. `dependency_paths_controls` checks the pinned hash and a changed one with a synthetic inventory.
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tests/dependency_paths_check.py
+```
+
 To rehearse intake with the locally built candidate, keep its report in a separate directory:
 
 ```powershell

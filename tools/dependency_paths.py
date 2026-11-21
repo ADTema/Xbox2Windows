@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 FFX_LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
+FFX_LOADER_NAME = "amd_fidelityfx_loader_xbox.dll"
 FFX_EXPORTS = ("ffxConfigure", "ffxCreateContext", "ffxDestroyContext", "ffxDispatch", "ffxQuery")
 
 
@@ -84,6 +85,12 @@ def trace(report, entry):
                     problem = "conditional_module_absent_from_package" if not providers else "ambiguous_package_basename"
                 findings.append(dict(path=path, reasons=reasons + (condition,), conditional=True, dll=dll,
                                      missing_exports=missing, problem=problem, candidates=providers))
+        elif Path(image).name.casefold() == FFX_LOADER_NAME:
+            # The conditional routes are pinned to one loader hash. Report a different build instead
+            # of returning no conditional edge and exiting successfully.
+            findings.append(dict(path=path, reasons=reasons, dll=Path(image).name,
+                                 problem="unverified_loader_hash",
+                                 sha256=images[image]["sha256"], expected=FFX_LOADER))
         for edge, target in sorted(targets):
             heapq.heappush(queue, (conditional or edge != "normal", depth + 1, path + (target,), reasons + (edge,)))
             for hops in sorted(forwarded[(edge, target)]):
