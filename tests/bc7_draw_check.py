@@ -146,14 +146,23 @@ def main():
             levels = [write_patterned_mip(work, max(1, width >> level), max(1, height >> level))
                       for level in range(first, 8)]
             subprocess.run([renderer, backend, "--check-bc7-tail", shader, str(first), *levels], check=True)
-        for width, height, first in ((4096, 4, 11), (4, 4096, 11), (4096, 4, 12)):
+        # At mip 5 of 92x4 the resident width is 2; its successor must use
+        # the 1x1 mip even though 92 / 64 is still 1.4375.
+        for width, height, first in ((4096, 4, 11), (4, 4096, 11), (4096, 4, 12),
+                                     (92, 4, 5), (4, 92, 5)):
             levels = [write_patterned_mip(work, max(1, width >> level), max(1, height >> level))
                       for level in range(first, max(width, height).bit_length())]
             draw = [renderer, backend, "--check-bc7-tail", shader, str(first),
                     "--base-size", str(width), str(height), *levels]
-            result = subprocess.run(draw, capture_output=True, text=True, check=True)
-            if f"requested_mip=0 sampled_mip={first} pixels={width * height} " not in result.stdout:
-                raise AssertionError("The fallback draw must cover the declared base texture")
+            result = subprocess.run(draw, capture_output=True, text=True)
+            if result.returncode:
+                raise AssertionError(f"Tail draw failed for {width}x{height} at mip {first}:\n"
+                                     f"{result.stdout}\n{result.stderr}")
+            for mip in range(first + len(levels)):
+                pixels = max(1, width >> mip) * max(1, height >> mip)
+                expected_draw = f"requested_mip={mip} sampled_mip={max(first, mip)} pixels={pixels} "
+                if expected_draw not in result.stdout:
+                    raise AssertionError(f"Missing verified draw for {width}x{height}: {expected_draw}")
         # The 29x19 fallback has an exact point-sample tie at (14, 0).
         # Combine channels from the two texels on either side only at that pixel.
         boundary_levels = [write_patterned_mip(work, max(1, 116 >> level), max(1, 76 >> level))

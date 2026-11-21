@@ -185,12 +185,16 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->SetGraphicsRootSignature(root.Get());
         list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
         list->SetGraphicsRootConstantBufferView(1, cb->GetGPUVirtualAddress());
-        // Keep the implicit derivatives at the requested mip even when its
-        // logical dimensions round down. Center the fractional viewport so
-        // each visible pixel still point-samples its corresponding texel.
-        const float mipScale = std::ldexp(1.0f, -static_cast<int>(firstResident + req.sampledLevel));
-        const float viewportWidth = (std::max)(float(width), base.width * mipScale);
-        const float viewportHeight = (std::max)(float(height), base.height * mipScale);
+        // WARP and hardware can use either the rounded SRV extent or the
+        // unrounded base extent for implicit LOD. Their geometric mean is
+        // within half a mip of both, since rounding discards less than one texel.
+        const auto viewportAxis = [&](UINT target, UINT resident, UINT baseAxis) {
+            const float unrounded = std::ldexp(float(baseAxis), -static_cast<int>(firstResident));
+            const float span = std::sqrt(resident * (std::max)(1.0f, unrounded));
+            return (std::max)(float(target), std::ldexp(span, -static_cast<int>(req.sampledLevel)));
+        };
+        const float viewportWidth = viewportAxis(width, input.width, base.width);
+        const float viewportHeight = viewportAxis(height, input.height, base.height);
         const D3D12_VIEWPORT viewport{(width - viewportWidth) * 0.5f, (height - viewportHeight) * 0.5f,
                                       viewportWidth, viewportHeight, 0, 1};
         const D3D12_RECT scissor{0,0,LONG(width),LONG(height)};
