@@ -56,4 +56,21 @@ descriptor_fields PROC FRAME
     cmovne eax,ecx
     ret
 descriptor_fields ENDP
+
+; Public control for conditional mip selection and descriptor stride math.
+view_offset PROC FRAME
+    .endprolog
+    xor eax,eax
+    dec r9d
+    cmp r9d,1
+    cmovbe eax,edx
+    add eax,ecx
+    cmp eax,511
+    ja out_of_heap
+    imul eax,r8d
+    ret
+out_of_heap:
+    mov eax,0ffffffffh
+    ret
+view_offset ENDP
 END

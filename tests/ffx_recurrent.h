@@ -17,10 +17,16 @@ struct RecurrentProvider {
 static_assert(offsetof(RecurrentProvider, resources) == 0x148 && offsetof(RecurrentProvider, output) == 0x230);
 
 struct RecurrentBinding {
+    explicit RecurrentBinding(FfxDeviceProbe& owner) : probe(owner), device(owner.device) {}
+    FfxDeviceProbe& probe;
     ID3D12Device* device;
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     HRESULT result = E_PENDING;
     uint32_t create(uintptr_t self, uintptr_t heap, uintptr_t flags, uintptr_t description, const uint64_t* frame);
+    D3D12_CPU_DESCRIPTOR_HANDLE srv{}, visible_uav{}, cpu_uav{};
+    void create_srv(uintptr_t self, uintptr_t texture, uintptr_t desc, uintptr_t dest);
+    void create_uav(uintptr_t self, uintptr_t texture, uintptr_t counter, uintptr_t desc, uintptr_t dest);
 };
 
+void check_recurrent_views(const RecurrentBinding& binding);
 void run_recurrent(RecurrentBinding& binding, RecurrentProvider& provider, const RecurrentConfig& config);

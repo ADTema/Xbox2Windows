@@ -94,12 +94,12 @@ def lower(body, initial, globals_, calls, exits):
                 value = f"({reg(dest)} & ~{(1 << (8*size))-1}ull) | {value}"
             return f"{reg(dest)} = {value};"
 
-        if op in (M.JE, M.JNE, M.JAE, M.JB, M.JBE, M.JMP):
+        if op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP):
             target = i.near_branch_target
             if target not in allowed:
                 raise ValueError(f"unbound branch at {i.ip:#x}")
             cond = {M.JE: "if (zero) ", M.JNE: "if (!zero) ", M.JAE: "if (!carry) ",
-                    M.JB: "if (carry) ", M.JBE: "if (carry || zero) ", M.JMP: ""}[op]
+                    M.JA: "if (!carry && !zero) ", M.JB: "if (carry) ", M.JBE: "if (carry || zero) ", M.JMP: ""}[op]
             stmt = f"{cond}goto block_{target:x};"
         elif op in (M.MOV, M.MOVZX):
             stmt = write(operand(1))
@@ -107,14 +107,17 @@ def lower(body, initial, globals_, calls, exits):
             stmt = write(f"int64_t(int32_t({operand(1)}))")
         elif op == M.CMOVNE:
             stmt = write(f"zero ? {operand(0)} : {operand(1)}")
+        elif op == M.CMOVBE:
+            stmt = write(f"(carry || zero) ? {operand(1)} : {operand(0)}")
         elif op == M.LEA:
             stmt = write(address())
         elif op == M.CMP:
             stmt = f"zero = ({operand(0)} == {operand(1)}); carry = ({operand(0)} < {operand(1)});"
         elif op == M.TEST:
             stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false;"
-        elif op == M.IMUL and i.op_count == 3 and RegisterExt.size(i.op0_register) == 4:
-            stmt = (f"{{ const int64_t product = int64_t(int32_t({operand(1)})) * int32_t({operand(2)}); "
+        elif op == M.IMUL and i.op_count in (2, 3) and RegisterExt.size(i.op0_register) == 4:
+            lhs, rhs = operand(i.op_count - 2), operand(i.op_count - 1)
+            stmt = (f"{{ const int64_t product = int64_t(int32_t({lhs})) * int32_t({rhs}); "
                     f"carry = product != int32_t(product); {write('product')} }}")
         elif op == M.SHL and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
             size = RegisterExt.size(i.op0_register)
@@ -122,13 +125,13 @@ def lower(body, initial, globals_, calls, exits):
             count = i.immediate(1) & (bits - 1)
             stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = a << {count}; "
                     f"carry = ((a >> {bits-count}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else ";"
-        elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.SUB, M.SBB):
-            operator = {M.ADD: "+", M.INC: "+", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]
-            rhs = "1" if op == M.INC else operand(1)
+        elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.DEC, M.SUB, M.SBB):
+            operator = {M.ADD: "+", M.INC: "+", M.DEC: "-", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]
+            rhs = "1" if op in (M.INC, M.DEC) else operand(1)
             width = UINT[MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)]
             expr = f"a {operator} b" + (" - word(carry)" if op == M.SBB else "")
             update = {M.ADD: "carry = v < a;", M.SUB: "carry = a < b;", M.SBB: "carry = a < b || (carry && a == b);",
-                      M.INC: "", M.XOR: "carry = false;", M.AND: "carry = false;", M.OR: "carry = false;"}[op]
+                      M.INC: "", M.DEC: "", M.XOR: "carry = false;", M.AND: "carry = false;", M.OR: "carry = false;"}[op]
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:

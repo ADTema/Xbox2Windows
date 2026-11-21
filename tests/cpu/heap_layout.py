@@ -22,12 +22,16 @@ def emit(image, output):
         (bounds,) = function_ranges(pe, export_rva(pe, "descriptor_fields"))
         fields = lower(region(pe, *bounds), ["rcx = count; rdx = reinterpret_cast<word>(src);",
                                              "r8 = reinterpret_cast<word>(dst);"], {}, {}, {})
+        (bounds,) = function_ranges(pe, export_rva(pe, "view_offset"))
+        offset = lower(region(pe, *bounds), ["rcx = slot; rdx = mip; r8 = stride; r9 = kind;"], {}, {}, {})
     output.write_text(INTEGER_HEADER + 'extern "C" __declspec(dllexport) word heap_layout(uint32_t count, '
                       'uint32_t* sizes) {\n' + code + '\n}\n'
                       'extern "C" __declspec(dllexport) uint32_t slot_probe(uint32_t count, const uint8_t* flags, '
                       'const uint32_t* sizes, uint32_t* index) {\n' + scan + '\n}\n'
                       'extern "C" __declspec(dllexport) word descriptor_fields(uint32_t count, const uint8_t* src, '
-                      'uint8_t* dst) {\n' + fields + '\n}\n', encoding="ascii")
+                      'uint8_t* dst) {\n' + fields + '\n}\n'
+                      'extern "C" __declspec(dllexport) uint32_t view_offset(uint32_t slot, uint32_t mip, '
+                      'uint32_t stride, uint32_t kind) {\n' + offset + '\n}\n', encoding="ascii")
 
 
 def check(image, native):
@@ -42,6 +46,14 @@ def check(image, native):
                     uint(count * 0xbe000).value | 0x1100)
         if (*sizes, result) != expected:
             raise AssertionError(f"{image.name}: count {count:#x} yielded {(*sizes, result)}, expected {expected}")
+    lib.view_offset.argtypes = [uint] * 4
+    lib.view_offset.restype = uint
+    for slot, mip, stride, kind in ((1, 0, 32, 2), (1, 3, 64, 2), (1, 3, 32, 4),
+                                    (511, 0, 32, 1), (511, 1, 64, 2)):
+        index = slot + (mip if kind in (1, 2) else 0)
+        expected = index * stride if index < 512 else 0xffffffff
+        if lib.view_offset(slot, mip, stride, kind) != expected:
+            raise AssertionError(f"{image.name}: unexpected view offset for {(slot, mip, stride, kind)}")
     if native and not ctypes.windll.kernel32.IsProcessorFeaturePresent(39):  # PF_AVX_INSTRUCTIONS_AVAILABLE
         print("Native vector fixture skipped: AVX unavailable")
         return
