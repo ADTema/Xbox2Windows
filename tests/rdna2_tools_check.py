@@ -115,12 +115,20 @@ class TestRdna2Disasm(unittest.TestCase):
             ("000081bf", "s_endpgm", "s_endpgm"),
             ("000082bf", "s_branch", "s_branch label_0x4"),
             ("7f008cbf", "s_waitcnt", "s_waitcnt vmcnt(7) lgkmcnt(0)"),
-            ("000082be", "s_mov_b32", "s_mov_b32 s2, s0"),
-            ("000182be", "s_mov_b64", "s_mov_b64 s2, s0"),
+            ("000382be", "s_mov_b32", "s_mov_b32 s2, s0"),
+            ("000482be", "s_mov_b64", "s_mov_b64 s2, s0"),
             ("00008080", "s_sub_u32", "s_sub_u32 s0, s0, s0"),
             # GFX10 scalar operand codes: 108-123 are ttmp0-15, 125 is null (SOP2 ssrc1)
             ("007d8080", "s_sub_u32", "s_sub_u32 s0, s0, null"),
             ("006c8080", "s_sub_u32", "s_sub_u32 s0, s0, ttmp0"),
+            # GFX10 / RDNA 2 opcode numbers, encodings as in LLVM's gfx10 MC tests
+            ("01020083", "s_min_i32", "s_min_i32 s0, s1, s2"),
+            ("01020093", "s_mul_i32", "s_mul_i32 s0, s1, s2"),
+            ("341281b1", "s_cmpk_eq_i32", "s_cmpk_eq_i32 s1, 0x1234"),
+            ("000080bb", "s_waitcnt_vscnt", "s_waitcnt_vscnt s0, 0x0"),
+            ("0100a0bf", "s_inst_prefetch", "s_inst_prefetch 0x1"),
+            ("0255027e", "v_rcp_f32_e32", "v_rcp_f32_e32 v1, v2"),
+            ("010d007e", "v_cvt_f32_u32_e32", "v_cvt_f32_u32_e32 v0, v1"),
             ("0000027e", "v_nop", "v_nop"),
             # VOP1 9-bit SRC0: 0..255 scalar/constant, 256..511 VGPR
             ("0103007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, v1"),
@@ -268,7 +276,7 @@ class TestRdna2Extractor(unittest.TestCase):
     def test_duplicate_record_names(self):
         """Verify that duplicate record names produce distinct files without overwriting."""
         code_1 = bytes.fromhex("000080bf 000081bf")  # s_nop 0, s_endpgm
-        code_2 = bytes.fromhex("000082be 000081bf")  # s_mov_b32, s_endpgm
+        code_2 = bytes.fromhex("000382be 000081bf")  # s_mov_b32, s_endpgm
         record_1 = envelope(code_1, b"PS_DuplicateName")
         record_2 = envelope(code_2, b"PS_DuplicateName")
 
