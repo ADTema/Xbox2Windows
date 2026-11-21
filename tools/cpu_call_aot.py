@@ -114,7 +114,8 @@ def resolve_import(pe, slot, provider, symbol, link_name=None):
         raise ValueError(f"no unique ordinary import at IAT slot RVA {slot:#x}")
     module, imp = matches[0]
     dll = module.decode("ascii")
-    by_ordinal = imp.name is None
+    # pefile names some system ordinal imports from a built-in table; keep the stored ordinal.
+    by_ordinal = imp.import_by_ordinal
     name = f"#{imp.ordinal}" if by_ordinal else imp.name.decode("ascii")
     identity = f"{dll}!{name}"
     if dll.casefold() != provider.name.casefold() or symbol != name:
