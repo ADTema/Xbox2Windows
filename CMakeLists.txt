@@ -171,6 +171,8 @@ endif()
 set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
     "Native x64 Python with pefile for static intake tests")
 if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME resource_range_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/resource_ranges_check.py")
     foreach(adapter IN ITEMS hardware warp)
         add_test(NAME pixel_aot_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw "${DXC_EXECUTABLE}"
