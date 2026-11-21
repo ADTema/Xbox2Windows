@@ -1284,6 +1284,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (ceiling(), translate), (scalar64(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.append((with_constants(CUBE_BODY), translate))
+    fixtures.append((with_constants(MAD_BODY), translate))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((with_constants(HALF_BODY), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
