@@ -209,7 +209,23 @@ def select_case(directory, fold, limit, capped, unequal):
     return path
 
 
+def check_constant_descriptor_bounds() -> None:
+    for offset in (0, 28, 32):
+        program = [line.replace("s[20:21], 0x40", f"s[20:21], {offset:#x}")
+                   for line in curve()]
+        if offset == 32:
+            assert lower(program, 20, 24, [1, 2, 3, 4], offset) == translate(curve())
+        else:
+            try:
+                lower(program, 20, 24, [1, 2, 3, 4], offset)
+            except ValueError as error:
+                assert "descriptors overlap" in str(error), error
+            else:
+                raise AssertionError(f"Constant descriptor at {offset} overlaps texture 0")
+
+
 def check_controls(directory):
+    check_constant_descriptor_bounds()
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     record = envelope(code)
