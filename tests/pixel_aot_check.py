@@ -1,6 +1,7 @@
 """Exercise offline pixel translation with independently assembled test programs."""
 from pathlib import Path
 import math
+import os
 import struct
 import subprocess
 import sys
@@ -8,7 +9,25 @@ import tempfile
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from pixel_aot import disassemble, lower, native_program
+import pixel_aot
+from pixel_aot import disassemble, native_program
+
+# First word of each line of every program lower() accepted in this run. tools/form_coverage.py counts
+# these when this test passes; a program a check expects to be rejected raises before it is recorded.
+ACCEPTED = set()
+
+
+def lower(instructions, *args, **kwargs):
+    source = pixel_aot.lower(instructions, *args, **kwargs)
+    ACCEPTED.update(line.split()[0] for line in instructions if line.strip())
+    return source
+
+
+def write_record(path):
+    """Save ACCEPTED where CTest's FORM_COVERAGE_RECORD points; nothing is written without it."""
+    if path:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text("".join(f"{word}\n" for word in sorted(ACCEPTED)), encoding="utf-8")
 
 
 RAMP = (0, 16, 37, 64, 101, 153, 219, 254)
@@ -588,4 +607,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    finally:  # also on skip or failure; tools/form_coverage.py reads the test's status from JUnit
+        write_record(os.environ.get("FORM_COVERAGE_RECORD"))

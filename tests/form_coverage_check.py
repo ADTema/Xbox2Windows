@@ -1,8 +1,12 @@
 """Check tools/form_coverage.py: its reference lists (denominators), one fixture-to-instruction example,
-and how skipped and failed tests change the count. Needs requirements-dev.txt (iced-x86); no Windows."""
+how skipped and failed tests change the count, and that only accepted shader programs count.
+Needs requirements-dev.txt (iced-x86); no Windows."""
+from datetime import datetime
+import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import form_coverage as fc
@@ -137,31 +141,76 @@ def check_jump_tables():
 
 
 def check_unclassified():
-    """A fixture missing from CPU_FIXTURES / SHADER_FIXTURES is reported, never counted, never fatal."""
+    """A CPU fixture missing from CPU_FIXTURES is reported, never counted, never fatal. Shader text in a
+    test file counts for nothing: only translation records do."""
     with tempfile.TemporaryDirectory() as tmp:
         root = sample_repo(tmp, {"branch": BRANCH, "added_later": "f PROC\n    xor eax, eax\n    ret\nf ENDP\nEND\n"},
                            {"added_later_check.py": 'P = "s_mov_b32 s0, 0\\ns_endpgm"\n'})
         every_test_passed = {"cpu_leaf_aot_branches": "pass", "added_later": "pass", "added_later_check": "pass"}
         m = fc.measure(every_test_passed, root)
-        assert m["unclassified"] == ["added_later.asm", "added_later_check.py"], m["unclassified"]
+        assert m["unclassified"] == ["added_later.asm"], m["unclassified"]
         assert m["x64_zen2"]["covered"] == 8  # branch.asm only; xor stays uncovered
         assert ("Integer", "xor") in fc.x64_forms({"xor"}, fc.load_reference("x64_zen2.tsv"))
-        assert m["gfx1013"]["covered"] == 0 and m["gfx1013"]["blocked_by_skip"] == []
-        assert "Not counted until classified" in fc.report(m) and "added_later.asm" in fc.report(m)
-        assert "Not counted" not in fc.report(fc.measure(every_test_passed, sample_repo(tmp + "/b", {"branch": BRANCH})))
+        assert m["gfx1013"]["covered"] == m["gfx1013"]["known_in_fixtures"] == 0
+        report = fc.report(m)
+        assert "Not counted until classified in tools/form_coverage.py: added_later.asm" in report
+        assert "Shader translation records from this run: none" in report
+        assert "Not counted" not in fc.report(fc.measure(every_test_passed, sample_repo(Path(tmp) / "b", {"branch": BRANCH})))
+
+
+def check_shader_records():
+    """gfx forms come only from programs the translator accepted, recorded by the same run. The review's
+    example: tests/pixel_aot_check.py passes s_nop only to must_reject, so it must stay out of covered."""
+    import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
+    gfx = fc.load_reference("gfx1013.tsv")
+    assert ("SOPP", "s_nop") in gfx  # so counting s_nop would change the result
+    pixel.ACCEPTED.clear()
+    program = pixel.assembly(False)
+    pixel.must_reject(pixel.translate, [line.replace("s_waitcnt lgkmcnt(0)", "s_nop 0") for line in program])
+    assert not pixel.ACCEPTED  # the rejected program left no trace
+    pixel.translate(program)
+    accepted = {line.split()[0] for line in program}
+    assert pixel.ACCEPTED == accepted and "s_nop" not in accepted
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(Path(tmp) / "repo", {})
+        record = Path(tmp) / "records" / "pixel_aot_warp.txt"
+        pixel.write_record(record)
+        now = time.time()
+        records = fc.read_records(record.parent, (now - 60, now + 60))
+        assert records == {"pixel_aot_warp": accepted}
+        expected = len(fc.gfx_forms(accepted, gfx))
+        passed = fc.measure({"pixel_aot_warp": "pass"}, root, records)["gfx1013"]
+        skipped = fc.measure({"pixel_aot_warp": "skip"}, root, records)["gfx1013"]
+        failed = fc.measure({"pixel_aot_warp": "fail"}, root, records)["gfx1013"]
+        assert passed["covered"] == expected > 0
+        assert skipped["covered"] == 0 and len(skipped["blocked_by_skip"]) == expected
+        assert failed["covered"] == 0 and failed["blocked_by_skip"] == []
+        # Negative control: had the rejected program been recorded, s_nop would be covered.
+        leaked = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": accepted | {"s_nop"}})["gfx1013"]
+        assert leaked["covered"] == expected + 1
+        # A record written outside the JUnit run comes from another run, so it is ignored.
+        os.utime(record, (now - 3600, now - 3600))
+        assert fc.read_records(record.parent, (now - 60, now + 60)) == {}
+    # The same holds for the review's case in the real controls, which feed s_nop only to must_reject.
+    pixel.ACCEPTED.clear()
+    with tempfile.TemporaryDirectory() as tmp:
+        pixel.check_controls(Path(tmp))
+    assert "s_nop" not in pixel.ACCEPTED and "image_sample" in pixel.ACCEPTED
 
 
 def check_parsing():
     with tempfile.TemporaryDirectory() as tmp:
         junit = Path(tmp) / "results.xml"
-        junit.write_text('<testsuite><testcase name="a" status="run"/><testcase name="b" status="fail"/>'
-                         '<testcase name="c" status="notrun"/></testsuite>', encoding="utf-8")
-        assert fc.read_results(junit) == {"a": "pass", "b": "fail", "c": "skip"}
+        junit.write_text('<testsuite time="32" timestamp="2026-11-21T21:05:21"><testcase name="a" status="run"/>'
+                         '<testcase name="b" status="fail"/><testcase name="c" status="notrun"/></testsuite>',
+                         encoding="utf-8")
+        results, window = fc.read_results(junit)
+        assert results == {"a": "pass", "b": "fail", "c": "skip"}
+        start = datetime(2026, 11, 21, 21, 5, 21).timestamp()  # CTest writes local time
+        assert window == (start - 1, start + 34), window
     asm = ("x PROC FRAME\n    .endprolog\nIFDEF A\n    jae short l\nELSE\n    jnz short l\nENDIF\n"
            "l:  mov DWORD PTR [rdx], eax ; c\ng:: ud2\nvalue DQ 0\n    dd 1\n    ret\nx ENDP\nEND\n")
     assert fc.masm_mnemonics(asm) == {"jae", "jne", "mov", "ud2", "ret"}
-    source = 'p = ["s_mov_b32 m0, s24", "exp mrt0 v1", "not asm"]\nq = "image_sample v[0:3]\\ns_endpgm"'
-    assert fc.gfx_mnemonics(source) == {"s_mov_b32", "exp", "image_sample", "s_endpgm"}
     # The real repository measures without error, and the report never calls coverage completion.
     full = fc.measure({})
     assert "not a measure of port completion" in fc.report(full)
@@ -173,5 +222,6 @@ if __name__ == "__main__":
     check_example()
     check_jump_tables()
     check_unclassified()
+    check_shader_records()
     check_parsing()
     print("form coverage checks passed")
