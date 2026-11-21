@@ -11,6 +11,7 @@ void check_buffer_ops(ID3D12Device* device);
 void check_bvh_reads(ID3D12Device* device);
 void check_bvh_atomics(ID3D12Device* device);
 void check_bvh_numeric(ID3D12Device* device);
+void check_bvh_packed(ID3D12Device* device);
 void check_bvh_hits(ID3D12Device* device);
 bool check_bvh_differential(ID3D12Device* device);
 bool check_bvh_waves(ID3D12Device* device, bool force64);

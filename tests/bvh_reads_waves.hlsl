@@ -119,6 +119,41 @@ uint2 offsetAddress(uint2 address, uint bytes)
     return uint2(lo, address.y + uint(lo < address.x));
 }
 
+// Inputs are source-built 32-byte records. The six coordinate/metadata words
+// may start at any byte in the first dword. The final dword holds the mask.
+uint alignedField(uint low, uint high, uint shift)
+{
+    if (shift == 0) return low;
+    return (low >> shift) | (high << (32 - shift));
+}
+
+[RootSignature("SRV(t0),UAV(u0),RootConstants(num32BitConstants=4,b0)")] [numthreads(32,1,1)]
+void ExpandLeaves(uint i : SV_DispatchThreadID)
+{
+    uint start = i * 32;
+    uint4 a = data.Load4(start);
+    uint4 b = data.Load4(start + 16);
+    uint shift = ((i + epoch) & 3) * 8;
+    float3 lo = asfloat(uint3(alignedField(a.x, a.y, shift), alignedField(a.y, a.z, shift),
+                              alignedField(a.z, a.w, shift)));
+    uint first = alignedField(a.w, b.x, shift), second = alignedField(b.x, b.y, shift);
+    uint header = (first & b.w) | (second & ~b.w);
+    float3 hi = lo + float3(2, 2, 0);
+    uint slot = alignedField(b.y, b.z, shift);
+    if (slot >= 64) return;
+    uint triangleOffset = (128 + slot * 3) * 16;
+    uint2 address = offsetAddress(uint2(baseLo, baseHi), triangleOffset);
+    if (header & (1u << 16)) address.y++;
+    if (header & (1u << 17)) address = offsetAddress(uint2(baseLo, baseHi), extent - 8);
+    output.Store4(i * 32, uint4(asuint(lo), address.x));
+    output.Store4(i * 32 + 16, uint4(asuint(hi), address.y));
+    output.Store4(triangleOffset, uint4(asuint(lo), 0));
+    output.Store4(triangleOffset + 16, uint4(asuint(float3(hi.x, lo.yz)), 0));
+    float y = (header & (1u << 18)) ? lo.y : hi.y;
+    output.Store3(triangleOffset + 32, asuint(float3(lo.x, y, lo.z)));
+    output.Store(triangleOffset + 44, header & 1023);
+}
+
 bool intersectsBounds(float3 origin, float3 direction, float3 lo, float3 hi, float nearT, float farT)
 {
     for (uint axis = 0; axis < 3; ++axis) {

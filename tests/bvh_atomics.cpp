@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "bvh_fixture.h"
 #include "AtomicBounds.h"
+#include "InitBounds.h"
 #include "QueryBounds.h"
 #include <algorithm>
 #include <cmath>
@@ -81,20 +82,20 @@ Word ray_mask(const Row& ray, const std::vector<Row>& points, const std::vector<
     return mask;
 }
 
-void run(ID3D12Device* device, const Kernel& kernel, const Kernel& consumer,
+void run(ID3D12Device* device, const Kernel& init, const Kernel& kernel, const Kernel& consumer,
          const std::vector<Row>& rows, Word count)
 {
     const auto rays = make_rays();
     constexpr Word rayStart = ticketStart + 2 * capacity;
     std::vector<Word> initial(rayStart + rays.size() + 16, guard);
+    auto expected = initial;
     for (Word bucket = 0; bucket < buckets; ++bucket) {
-        auto* record = initial.data() + bucket * fields;
+        auto* record = expected.data() + bucket * fields;
         std::fill_n(record, 3, bits(std::numeric_limits<float>::max()));
         std::fill_n(record + 3, 3, bits(std::numeric_limits<float>::lowest()));
-        record[6] = firstAdd;
-        record[7] = firstSub;
+        record[6] = initial[bucket * fields + 6] = firstAdd;
+        record[7] = initial[bucket * fields + 7] = firstSub;
     }
-    auto expected = initial;
     std::array<Word, buckets> accepted{};
     std::vector<bool> valid(capacity);
     for (Word i = 0; i < count; ++i) {
@@ -120,20 +121,24 @@ void run(ID3D12Device* device, const Kernel& kernel, const Kernel& consumer,
     auto out = make_buffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto back = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    ComputeCommands cmd(device, kernel.pipeline.Get());
+    ComputeCommands cmd(device, init.pipeline.Get());
     auto* list = cmd.list.Get();
     transition(list, out.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(out.Get(), 0, seed.Get(), 0, bytes);
     transition(list, out.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    list->SetComputeRootSignature(kernel.root.Get());
+    // The two kernels share an identical serialized root layout.
+    list->SetComputeRootSignature(init.root.Get());
     list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
     const Word args[]{count, ticketStart * sizeof(Word), buckets};
     list->SetComputeRoot32BitConstants(2, 3, args, 0);
-    list->Dispatch((capacity + 31) / 32, 1, 1);
+    list->Dispatch((buckets + 31) / 32, 1, 1);
     D3D12_RESOURCE_BARRIER order{};
     order.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     order.UAV.pResource = out.Get();
+    list->ResourceBarrier(1, &order);
+    list->SetPipelineState(kernel.pipeline.Get());
+    list->Dispatch((capacity + 31) / 32, 1, 1);
     list->ResourceBarrier(1, &order);
     list->SetPipelineState(consumer.pipeline.Get());
     list->SetComputeRootSignature(consumer.root.Get());
@@ -173,10 +178,11 @@ void run(ID3D12Device* device, const Kernel& kernel, const Kernel& consumer,
 
 void check_bvh_atomics(ID3D12Device* device)
 {
+    Kernel init(device, {InitBounds, sizeof(InitBounds)});
     Kernel kernel(device, {AtomicBounds, sizeof(AtomicBounds)});
     Kernel consumer(device, {QueryBounds, sizeof(QueryBounds)});
     auto rows = make_points();
-    for (Word count : {0u, 31u, 33u, capacity}) run(device, kernel, consumer, rows, count);
+    for (Word count : {0u, 31u, 33u, capacity}) run(device, init, kernel, consumer, rows, count);
     std::reverse(rows.begin(), rows.end());
-    run(device, kernel, consumer, rows, capacity);
+    run(device, init, kernel, consumer, rows, capacity);
 }
