@@ -138,6 +138,19 @@ def literal(value, kind, vectors):
     return None
 
 
+def verified_camera(values, vectors):
+    if not CAMERA.keys() <= values.keys():
+        return None
+    verified = {}
+    for key, label in CAMERA.items():
+        digest, value, kind = values[key]
+        spelling = literal(value, kind, vectors)
+        if spelling is None or joaat(spelling) != digest:
+            return None
+        verified[label] = spelling
+    return verified
+
+
 def inspect_tree(nodes, attrs, vectors, state_id):
     counts = Counter()
     witness = None
@@ -154,13 +167,8 @@ def inspect_tree(nodes, attrs, vectors, state_id):
         if parent not in state_ids or not CAMERA.keys() <= values.keys():
             continue
         counts["camera_parameter_sets"] += 1
-        verified = {}
-        for key, label in CAMERA.items():
-            digest, value, kind = values[key]
-            spelling = literal(value, kind, vectors)
-            if spelling is not None and joaat(spelling) == digest:
-                verified[label] = spelling
-        if len(verified) == len(CAMERA):
+        verified = verified_camera(values, vectors)
+        if verified is not None:
             counts["all_five_literals_verified"] += 1
             if state_ids[parent] == state_id and witness is None and state_id is not None:
                 witness = verified
