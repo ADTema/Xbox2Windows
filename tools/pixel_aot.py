@@ -1365,7 +1365,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         elif m := match(r"v_interp_p([12])_f32_e32 (v\d+), (v\d+), attr0\.([xyzw])"):
             phase, dst, src, component = m.groups()
             entry_interp = mask == "entry" and sampler is None
-            if ((not entry_interp and (mask != "quad" or component not in "xy"))
+            if ((not entry_interp and (mask not in ("entry", "quad") or component not in "xy"))
                     or scalar.get("m0") != "interp_base"):
                 raise ValueError("Unknown interpolation context")
             if dst in sample_dest:
@@ -1378,11 +1378,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"alu{i}"
                     lines.append(f"    float alu{i} = uv.{component};")
                 else:
-                    vector[dst] = f"uv.{component}"
+                    vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"image_sample v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:(0x[7f]) dim:SQ_RSRC_IMG_2D"):
-            *operands, dmask = m.groups()
+        elif m := match(r"(image_sample(?:_lz)?) v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:(0x[7f]) dim:SQ_RSRC_IMG_2D"):
+            op, *operands, dmask = m.groups()
+            lod_zero = op == "image_sample_lz"
+            if lod_zero and dmask != "0xf":
+                raise ValueError("LOD-zero sampling requires dmask:0xf")
             channel_count = 3 if dmask == "0x7" else 4
             dest, coords, image, state = [registers(*operands[k:k+2], width)
                                           for k, width in zip((0,2,4,6), (channel_count,2,8,4))]
@@ -1395,9 +1398,15 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
             uv = [vector[f"v{n}"] for n in coords]
+            if lod_zero:
+                if second_texture_offset is not None:
+                    raise ValueError("LOD-zero sampling requires a single texture sample")
+                uv = [f"uv.{v[1]}" if isinstance(v, tuple) and v[0] == "entry_uv" else v for v in uv]
             if any(v not in quad_values for v in uv):
                 raise ValueError("Unsupported texture coordinate")
-            lines.append(f"    float4 sample{i} = {texture}.Sample(samp, float2({', '.join(uv)}));")
+            coordinate = f"float2({', '.join(uv)})"
+            call = f"SampleLevel(samp, {coordinate}, 0.0f)" if lod_zero else f"Sample(samp, {coordinate})"
+            lines.append(f"    float4 sample{i} = {texture}.{call};")
             samples += 1
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"

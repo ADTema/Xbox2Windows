@@ -83,6 +83,12 @@ def rgb_sample() -> list[str]:
     return program
 
 
+def lod_zero_sample() -> list[str]:
+    mask_ops = ("s_mov_b64", "s_wqm_b64", "s_and_b64")
+    return [line.replace("image_sample ", "image_sample_lz ") for line in assembly(False)
+            if not line.startswith(mask_ops)]
+
+
 DUAL_CASES = ("forward", "reverse", "reuse", "partial")
 
 
@@ -2849,6 +2855,14 @@ def check_controls(directory):
     must_reject(translate, rgb[:wait] + rgb[wait+1:])
     must_reject(translate, rgb[:wait] + ["v_mov_b32_e32 v14, 1.0"] + rgb[wait:])
     translate(rgb[:wait] + ["v_mov_b32_e32 v15, 1.0"] + rgb[wait:])
+    lod_zero = lod_zero_sample()
+    assert ".SampleLevel(samp, float2(uv.x, uv.y), 0.0f)" in translate(lod_zero)
+    must_reject(translate, [line.replace("image_sample_lz ", "image_sample ") for line in lod_zero])
+    mixed_masks = [line.replace("image_sample ", "image_sample_lz ") for line in assembly(False)]
+    restore = mixed_masks.pop(mixed_masks.index("s_and_b64 exec, exec, s[50:51]"))
+    phase_two = next(i for i, line in enumerate(mixed_masks) if line.startswith("v_interp_p2"))
+    mixed_masks.insert(phase_two, restore)
+    must_reject(translate, mixed_masks)
     # v_cvt_f32_f16 widens the low half through widen16 and applies modifiers after widening.
     body = translate(with_constants(HALF_BODY)).split("float4 main", 1)[1]
     assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body
@@ -3446,6 +3460,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((with_constants(body), translate) for body, *_ in E64_ARITH)
     fixtures.extend((predicate_group_e64(first), translate) for first in range(0, 16, 4))
     fixtures.append((scalar(), translate))
+    fixtures.append((lod_zero_sample(), translate))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((unpack_bytes(), translate))
     fixtures.append((reciprocal_iflag(), translate))
