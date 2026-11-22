@@ -2,9 +2,8 @@
 
 LFENCE, MFENCE, SFENCE, PAUSE, PREFETCHT0, PREFETCHT1, PREFETCHT2, PREFETCHNTA, PREFETCH, PREFETCHW,
 CLFLUSH, CLFLUSHOPT and CLWB have no register result, so each export loads and stores around the
-instruction and the check compares the return value and the buffer. A host without CLFLUSHOPT, CLWB
-or PREFETCH/PREFETCHW raises an illegal instruction in the native DLL; the check then exits with 77
-(skip) instead of claiming the forms.
+instruction and the check compares the return value and the buffer. Native illegal instructions
+in optional groups skip only the corresponding CTest.
 """
 import ctypes
 from pathlib import Path
@@ -20,6 +19,13 @@ from ffx_version_query import INTEGER_HEADER, lower, region
 
 U64 = ctypes.c_uint64
 EXPORTS = ("fence_order", "pause_spin", "prefetch_sum", "prefetch_write", "flush_store", "flushopt_store", "clwb_store")
+GROUPS = {
+    "baseline": ("fence_order", "pause_spin", "prefetch_sum"),
+    "prefetch_amd": ("prefetch_write",),
+    "clflush": ("flush_store",),
+    "clflushopt": ("flushopt_store",),
+    "clwb": ("clwb_store",),
+}
 MASK = (1 << 64) - 1
 ILLEGAL_INSTRUCTION = 0xC000001D
 SKIP = 77
@@ -56,8 +62,9 @@ def rejections():
     return 2
 
 
-def check(native_path, lifted_path):
-    rejected = rejections()
+def check(native_path, lifted_path, group):
+    enabled = GROUPS[group]
+    rejected = rejections() if group == "baseline" else 0
     native, lifted = load_lib(native_path), load_lib(lifted_path)
     buffer = (U64 * 64)()
     base = ctypes.addressof(buffer)
@@ -66,14 +73,17 @@ def check(native_path, lifted_path):
 
     def run(name, v, q, seed, want_return, want_slots):
         nonlocal cases
+        if name not in enabled:
+            return
         for lib, label in ((native, "native"), (lifted, "lifted")):
             for k in range(64):
                 buffer[k] = (seed * 0x9e3779b97f4a7c15 + k * 0x100000001b3) & MASK
             try:
                 got = getattr(lib, name)(base, v, q)
             except OSError as error:
-                if label == "native" and (error.winerror or 0) & 0xFFFFFFFF == ILLEGAL_INSTRUCTION:
-                    print(f"skip: this host raises an illegal instruction in {name}")
+                if (group != "baseline" and cases == 0 and label == "native"
+                        and (getattr(error, "winerror", 0) or 0) & 0xFFFFFFFF == ILLEGAL_INSTRUCTION):
+                    print(f"skip: {group} is unavailable in the native fixture ({name})")
                     sys.exit(SKIP)
                 raise
             if got != want_return(buffer_before):
@@ -99,15 +109,14 @@ def check(native_path, lifted_path):
         buffer_before = [(seed * 0x9e3779b97f4a7c15 + k * 0x100000001b3) & MASK for k in range(64)]
         run("pause_spin", n, 0, seed, lambda b: 3 * n, lambda b: {})
 
-    print(f"{cases} cases of LFENCE, MFENCE, SFENCE, PAUSE, PREFETCHT0/T1/T2/NTA, PREFETCH, PREFETCHW, CLFLUSH, "
-          f"CLFLUSHOPT and CLWB matched native and translated DLLs; {rejected} negative controls rejected")
+    print(f"{group}: {cases} cases matched native and translated DLLs; {rejected} negative controls rejected")
 
 
 if __name__ == "__main__":
-    mode, native, other = sys.argv[1:]
+    mode, native, other, *args = sys.argv[1:]
     if mode == "emit":
         emit(Path(native), Path(other))
     elif mode == "check":
-        check(native, other)
+        check(native, other, *args)
     else:
         raise ValueError(mode)

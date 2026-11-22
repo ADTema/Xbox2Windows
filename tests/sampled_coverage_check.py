@@ -101,6 +101,42 @@ def controls():
     must_reject(lower, program, bindings(2))
     must_reject(lower, program, bindings(0) | {"selector_byte": 12})
 
+    source = "\n".join(PROGRAM)
+    selector_load = "s_buffer_load_dword s6, s[72:75], s7"
+    zero_offset = source.replace(selector_load, selector_load.replace(", s7", ", null"))
+    must_reject(lower, decoded(zero_offset.splitlines()), bindings(0) | {"selector_byte": False})
+
+    overlap = bindings(0)
+    overlap["descriptors"].append([20, 64, "cb", 0])
+    must_reject(lower, program, overlap)
+
+    wide_sampler = source.replace(
+        "s_load_dwordx4 s[60:63], s[30:31], 0x10",
+        "s_load_dwordx8 s[56:63], s[30:31], 0x10",
+    ).replace("s[60:63] dmask", "s[56:59] dmask")
+    must_reject(lower, decoded(wide_sampler.splitlines()), bindings(0))
+
+    scalar_wait = "s_waitcnt lgkmcnt(0)"
+    early_selector = source.replace(
+        f"{scalar_wait}\n{selector_load}", f"{selector_load}\n{scalar_wait}"
+    )
+    must_reject(lower, decoded(early_selector.splitlines()), bindings(0))
+
+    swapped_coords = source.replace("attr0.x", "attr0.y").replace(
+        "v9, v0, attr0.y", "v9, v0, attr0.x"
+    ).replace("v9, v1, attr0.y", "v9, v1, attr0.x")
+    must_reject(lower, decoded(swapped_coords.splitlines()), bindings(0))
+
+    sample_wait = "s_waitcnt vmcnt(0)"
+    product = "v_mul_legacy_f32_e32 v11, s3, v10"
+    early_product = source.replace(f"{sample_wait}\n{product}", f"{product}\n{sample_wait}")
+    must_reject(lower, decoded(early_product.splitlines()), bindings(0))
+
+    wrong_quad_source = source.replace(
+        "s_wqm_b64 s[54:55], s[48:49]", "s_wqm_b64 s[54:55], s[52:53]"
+    )
+    must_reject(lower, decoded(wrong_quad_source.splitlines()), bindings(0))
+
 
 def binary(tmp, assembler, objcopy, library):
     src, obj, raw = (tmp / n for n in ("synthetic.s", "synthetic.o", "synthetic.bin"))
@@ -148,7 +184,26 @@ def binary(tmp, assembler, objcopy, library):
         assert out.read_text() == lower(decoded(PROGRAM), bindings(slot))
 
 
-def case(slot, scale, threshold, scale_word, threshold_word):
+def red_bindings(slot, scale_base=0):
+    config = bindings(0x00800000)
+    config["descriptors"][1] = [20, 64, "cb", scale_base]
+    config["descriptors"][-4] = [20, 112, "cb", 8]
+    config["descriptors"][-2:] = [
+        [40, 0x80000000, "texture", slot],
+        [40, 0x00800000, "texture", 1 - slot],
+        [40, 0, "texture", 1 - slot],
+    ]
+    return config
+
+
+RED_PROGRAM = [
+    line.replace("s_lshl_b32 s12, s6, 5", "s_lshl_b32 s12, s6, 8")
+    .replace("dmask:0x8", "dmask:0x1")
+    for line in PROGRAM
+]
+
+
+def case(slot, scale, threshold, scale_word, threshold_word, red=False):
     cb = bytearray(256)
     struct.pack_into("<f", cb, 4 * scale_word, scale)
     struct.pack_into("<f", cb, 4 * threshold_word, threshold)
@@ -156,25 +211,29 @@ def case(slot, scale, threshold, scale_word, threshold_word):
     for y in range(8):
         for x in range(8):
             byte = (41 * x + 19 * y) & 255
-            alpha = (255 - byte if slot else byte) / 255
-            ref.append(int(alpha * scale >= threshold))
+            sample = 1 - slot if red else (255 - byte if slot else byte) / 255
+            ref.append(int(sample * scale >= threshold))
     return cb + ref
 
 
-def draw(tmp, dxc, renderer, adapter, sources, scale_word, threshold_word):
+def draw(tmp, dxc, renderer, adapter, sources, scale_word, threshold_word, red=False):
+    cases = ((1, 0.75),) if red else (
+        (1, 0.5), (0.5, 0.375), (1, 0), (0, 0.25), (-1, -0.5)
+    )
     for slot, source in enumerate(sources):
         src, ps = tmp / "draw.hlsl", tmp / "draw.dxil"
         src.write_text(source)
         subprocess.run([dxc, "-T", "ps_6_0", "-E", "main", "-Fo", ps, src], check=True)
-        for scale, threshold in ((1, 0.5), (0.5, 0.375), (1, 0), (0, 0.25)):
+        for scale, threshold in cases:
             ref = tmp / "samples.bin"
-            ref.write_bytes(case(slot, scale, threshold, scale_word, threshold_word))
+            ref.write_bytes(case(slot, scale, threshold, scale_word, threshold_word, red))
             args = [renderer, adapter, "--sampled-coverage", ps, ref]
             result = subprocess.run(args)
             if result.returncode == 77:
                 return 77
             result.check_returncode()
-        ref.write_bytes(case(1 - slot, 1, 0.5, scale_word, threshold_word))
+        scale, threshold = cases[0]
+        ref.write_bytes(case(1 - slot, scale, threshold, scale_word, threshold_word, red))
         wrong = subprocess.run(args, capture_output=True, text=True)
         if wrong.returncode != 1 or "Sample coverage mismatch" not in wrong.stderr:
             raise AssertionError(
@@ -197,5 +256,21 @@ if __name__ == "__main__":
                     [lower(decoded(PROGRAM), bindings(slot)) for slot in range(2)],
                     1,
                     6,
+                )
+                or draw(
+                    tmp,
+                    *sys.argv[1:],
+                    [lower(decoded(RED_PROGRAM), red_bindings(slot)) for slot in range(2)],
+                    1,
+                    10,
+                    red=True,
+                )
+                or draw(
+                    tmp,
+                    *sys.argv[1:],
+                    [lower(decoded(RED_PROGRAM), red_bindings(0, scale_base=2))],
+                    3,
+                    10,
+                    red=True,
                 )
             )
