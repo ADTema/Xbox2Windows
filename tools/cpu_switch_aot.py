@@ -789,12 +789,13 @@ class Frame:
     """RSP as entry RSP + a constant at each instruction, and the stack bytes each instruction accesses.
 
     offsets: RVA -> RSP - entry RSP before the instruction. accesses: RVA -> (offset of the first byte from entry
-    RSP, width, reads, writes). The frame array starts at entry RSP + start, the lowest offset rounded down to
+    RSP, width, reads, writes). released: RVA -> (RSP before, RSP after) for an ADD RSP or POP, which leaves
+    those bytes below RSP, where their contents may change. The frame array starts at entry RSP + start, the lowest offset rounded down to
     8 mod 16: with RSP + 8 a multiple of 16 at entry, as the ABI requires, every array byte then has the address
     residue mod 16 of the stack byte it stands for. It ends with the home space at entry RSP + 40."""
 
     def __init__(self, function):
-        self.offsets, self.accesses, self.adjustments = {function.entry: 0}, {}, set()
+        self.offsets, self.accesses, self.adjustments, self.released = {function.entry: 0}, {}, set(), {}
         work = [function.entry]
         while work:
             ip = work.pop()
@@ -803,6 +804,8 @@ class Frame:
                 after = self.offsets[ip]
             else:
                 after = self.step(function.instructions[ip], self.offsets[ip])
+                if after > self.offsets[ip]:
+                    self.released[ip] = (self.offsets[ip], after)
             for successor in function.successors[ip]:
                 if successor not in self.offsets:
                     self.offsets[successor] = after
@@ -884,7 +887,9 @@ def prove_frame(function, order, effects, frame):
 
     Per stack byte: 1 once a store writes it; 2 + 8 * i + k while it holds byte k of the entry value of
     NONVOLATILE[i], saved by PUSH or MOV [RSP+d] while that register holds its entry value; 0 when not
-    written on some path. Per nonvolatile register: "entry", "written" since entry or the last restore, or
+    written on some path, or released since: when ADD RSP or POP raises RSP, the bytes it leaves below RSP
+    become 0 after the POP has read its source, because their contents may change before a later allocation
+    brings them back into the frame. Per nonvolatile register: "entry", "written" since entry or the last restore, or
     None when paths disagree. A join keeps what both sides agree on. A save is not a read of the entry value
     as data, so its register read is removed from effects before the register pass."""
     instructions = function.instructions
@@ -907,6 +912,9 @@ def prove_frame(function, order, effects, frame):
             if writes:
                 value = saved[register] if register is not None and status[register] == "entry" else b"\1" * width
                 data = data[:index] + value + data[index + width:]
+        if ip in frame.released:
+            low, high = (offset - frame.start for offset in frame.released[ip])
+            data = data[:low] + bytes(high - low) + data[high:]
         for register in (*effects[ip][1], *effects[ip][2]):
             if register in status:
                 status[register] = "entry" if register == restored else "written"

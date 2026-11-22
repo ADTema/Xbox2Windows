@@ -218,6 +218,52 @@ frame_bound PROC FRAME
     ret
 frame_bound ENDP
 
+; Releases its allocation and allocates the same bytes again, then writes the slot before reading it.
+; RAX = RCX + RDX, stored to the first trace word.
+realloc_slot PROC FRAME
+    sub rsp, 18h
+    .allocstack 18h
+    .endprolog
+    mov QWORD PTR [rsp], rcx
+    mov rax, QWORD PTR [rsp]
+    add rsp, 18h
+    sub rsp, 18h
+    mov QWORD PTR [rsp], rdx
+    add rax, QWORD PTR [rsp]
+    mov QWORD PTR [r8], rax
+    add rsp, 18h
+    ret
+realloc_slot ENDP
+
+; Rejected: the slot that holds the saved RBX is released by ADD RSP and allocated again, so POP RBX
+; no longer restores a value the function may rely on.
+stale_save PROC FRAME
+    push rbx
+    .pushreg rbx
+    .endprolog
+    add rsp, 8
+    sub rsp, 8
+    pop rbx
+    ret
+stale_save ENDP
+
+; Rejected: POP RSI reads the stored RCX and releases its slot; the slot is allocated again and read
+; without a new store.
+stale_pop PROC FRAME
+    push rsi
+    .pushreg rsi
+    sub rsp, 8
+    .allocstack 8
+    .endprolog
+    mov QWORD PTR [rsp], rcx
+    pop rsi
+    sub rsp, 8
+    mov rax, QWORD PTR [rsp]
+    add rsp, 8
+    pop rsi
+    ret
+stale_pop ENDP
+
 ; Rejected: RAX holds a guest address (a RIP-relative LEA) that is spilled and reloaded.
 guest_spill PROC FRAME
     sub rsp, 8
