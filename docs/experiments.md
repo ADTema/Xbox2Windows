@@ -1636,8 +1636,6 @@ The CPU block test and the D3D12 BC7 draw tests check all 16 RGBA texels against
 
 ### Exporting two TTPF entries to DDS
 
-To run every step from this checkout using Python and a matching local pool, follow the [offline archive reproduction guide](bcpack-archive-reproduction.md). It includes the chunk offsets, payload sizes, tiling equations, calibration conversion and complete source listings.
-
 These measurements use Leonida's Python exporter on Windows with Python 3.14.2. Both indices are zero-based and refer to the same local `ttdb_ui.ttpf` pool, 845,115,648 bytes, SHA-256 `dc983ed7f6b78d1693fa5757f17c03bafb790e851594fdf4d412579b61d867f6`. The SHA-256 values in the table cover each complete DDS, including its header. Original pixel colours and coverage across the full set remain unverified. [Measurement request](https://github.com/R0Y00/Xbox2Windows/issues/458#issuecomment-7074603775)
 
 | Pool index | BCPack codec / DXGI format | Dimensions / mips | Export mode | Observed result |
@@ -1646,7 +1644,7 @@ These measurements use Leonida's Python exporter on Windows with Python 3.14.2. 
 | 8253 | 7 / BC7_UNORM (98) | 512 × 256 / 1 | Strict | Exit 2, `BC7 signature rank 149 is inferred-only (unconfirmed)`, no DDS written |
 | 8253 | 7 / BC7_UNORM (98) | 512 × 256 / 1 | Fitted, history revision `3c997c411666b31372b0d2b82afd5ea669b4d774` | Exit 0, 131,220 bytes, SHA-256 `84e7abf023a568056178f6353d8e86e5d848e536e2aa92f1a028266231b1e15f` |
 
-Run the following PowerShell commands from the Xbox2Windows repository root with a fresh output directory. Set `$pool` to the matching local pool. The layout commands report the dimensions, mip count and the codecs used by each mip.
+Run the following PowerShell commands from the Xbox2Windows repository root with a fresh output directory. Set `$pool` to the matching local pool. The layout commands report the dimensions, mip count and the codecs used by each mip. [Pinned exporter](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tools/ttpf_mips.py) · [Pinned decoder](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tools/bcpack.py)
 
 ```powershell
 $pool = (Resolve-Path 'game-files/ttdb_ui.ttpf').Path
@@ -1691,28 +1689,6 @@ bc7 = {
 '@ | python -I - "$out"
 python -I $exporter export $pool 8253 "$out/fitted-8253.dds" --allow-provisional --history "$out/history.json"
 Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
-```
-
-#### BCPack decoding by BC format
-
-The [synthetic decoder checks](bcpack-decoder-tests.md) record the construction of the test streams, all twelve checks, six complete input/output byte pairs and an archived copy of the runnable test sources.
-
-The RDS5 reader selects the decoder with `codec = (entry >> 26) & 15` from a little-endian 64-bit chunk-table entry. The tag column shows those bits in the archive's fourth byte, masked with `0x3c`. Each lane emits one symbol per eight decoded bytes. The texture descriptor supplies the DXGI format and layout for assembling the resulting 4 × 4 blocks into a DDS. [Pinned decoder and lane tables](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tools/bcpack.py) · [Pinned archive reader and exporter](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tools/ttpf_mips.py)
-
-| Output format | Tag / codec | Bytes per 4 × 4 block | Lane widths in stream order (bits) | Output block fields |
-|---|---|---:|---|---|
-| BC1 | `0x04` / 1 | 8 | 8,8,5,6,5,5,6,5,8,8,8,8 | RGB565 endpoint pair and 2-bit selectors |
-| BC2 | Codec 2 unsupported | 16 | No lane decoder in this revision | Standard BC2 uses explicit 4-bit alpha and a colour block |
-| BC3 | `0x0c` / 3 | 16 | 4,4,8,6,6,6,6,5,6,5,8,8 | Alpha endpoints and selectors, then a colour block |
-| BC4 | `0x10` / 4 | 8 | 8,8,8,8,6,6,6,6,6,6,6,6 | Single-channel endpoints and 3-bit selectors |
-| BC5 | `0x14` / 5 | 16 | 4,4,8,8,6,6,6,6,6,6,6,6 | Two single-channel blocks, red then green |
-| BC6H | `0x18` / 6 | 16 | 4,4,8,8,8,5,5,5,6,6,6,8,8,8,8,5 | Mode-dependent HDR RGB endpoints and selectors |
-| BC7 | `0x1c` / 7 | 16 | 4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5 | Mode-dependent colour/alpha endpoints and selectors |
-
-To reproduce the codec checks, run the following command after fetching the exporter above. All 12 tests passed at the pinned revision, including block reconstruction for the six implemented codecs and the expected rejection of codec 2. The two archive entries above additionally exercise DDS layout and export. [Test vectors and assertions](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tests/test_bcpack.py)
-
-```powershell
-python -I "$out/Leonida/tests/test_bcpack.py" -v
 ```
 
 ### Drawing BC7 textures with a recompiled pixel shader
