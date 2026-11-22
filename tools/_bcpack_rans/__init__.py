@@ -1,5 +1,6 @@
 # bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
 # Source: https://github.com/Ahmet-Dedeler/bcpack-rs
+# Revision: 5bf5cc56ed56f1ababf1f9592300bd182ff90bd8
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
 """MDU entropy layer extracted from bcpack-rs; see README.md for provenance.
@@ -237,6 +238,13 @@ def decode_lanes(data, alphabet_bits, targets, window=FEED_WINDOW, source=None):
                             ln.final = ln.forward_state(x, ln.sym) if nsf else x
                 elif x <= L:
                     if new_out > 0:
+                        # A completed flushed fragment must return to the
+                        # rANS home state. Merely being below L could silently
+                        # accept a damaged/short fragment, then discard the
+                        # invalid state when the next header resets the lane.
+                        if ln.flush and x != L:
+                            raise BCPackError(
+                                "lane %d: flushed fragment did not return to its home state" % ln.idx)
                         ln.state = HDR0
                         if ln.flush:
                             ln.p0 = ln.p1 = 0

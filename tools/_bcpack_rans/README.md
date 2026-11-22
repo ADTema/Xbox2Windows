@@ -4,13 +4,18 @@ From [bcpack-rs by Ahmet Dedeler](https://github.com/Ahmet-Dedeler/bcpack-rs),
 revision `5bf5cc56ed56f1ababf1f9592300bd182ff90bd8`.
 The code is licensed MIT OR Apache-2.0. Microsoft's model tables and per-lane
 decoder port additionally carry the MIT notice in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-Both upstream licenses are preserved: [MIT](LICENSE-MIT), [Apache-2.0](LICENSE-APACHE).
+The complete upstream license terms are included: [MIT](LICENSE-MIT) and
+[Apache-2.0](LICENSE-APACHE). The Apache file contains the full license
+text, not only the short source-file notice.
 
 - `__init__.py` extracts the constants, model and cycle-level entropy decoder
   from upstream `python/bcpack.py`, ending before `decode_symbols`. The module
   description and imports are replaced; the tables import is package-relative.
   Xbox2Windows adds a per-fragment counter and restores at most two omitted
   low zero bytes when a flushed fragment exhausts its physical byte budget.
+  The next fragment's header is now accepted only after a flushed fragment
+  returns to the rANS home state L; non-home intermediate states are
+  rejected instead of silently discarded.
   This extension is checked against the existing 16-lane mode-6 fixture in
   issue #442 and trimmed/untrimmed reverse-encoded single-lane controls.
   It does not consume bytes beyond a fragment budget. Other decoder logic is

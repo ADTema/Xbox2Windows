@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -151,6 +152,48 @@ class SymbolChecks(unittest.TestCase):
                                     ([8], 1, bytes(MAX_INPUT + 1))):
             with self.subTest(widths=widths, count=count, length=len(data)), self.assertRaises(ValueError):
                 decode(data, widths, count)
+
+    def test_flushed_fragment_must_reach_home_state(self):
+        # A real encoder can omit the last zero byte here. But dropping
+        # additional bytes, even while shortening the declared payload length,
+        # must not silently advance to the next fragment's header.
+        values = [0, 1, 2, 3] * 5
+        first = encode_fragment(2, 0, values)
+        second = encode_fragment(2, 7, values)
+        self.assertFalse(first[0] & 0x20)
+        self.assertEqual(first[-1], 0)
+        expected = [values + values]
+        self.assertEqual(decode(first + second, [2], len(values) * 2)["syms"], expected)
+        valid_trim = bytes((first[0], first[1] - 1)) + first[2:-1] + second
+        self.assertEqual(decode(valid_trim, [2], len(values) * 2)["syms"], expected)
+        for missing in (2, 3, 4):
+            with self.subTest(missing=missing):
+                truncated = bytes((first[0], first[1] - missing)) + first[2:-missing] + second
+                with self.assertRaisesRegex(BCPackError, "flushed fragment did not return"):
+                    decode(truncated, [2], len(values) * 2)
+
+    def test_exact_public_api_limits(self):
+        # The backend would allocate millions of symbols. A sentinel proves
+        # that the public validator accepts the exact bound, without decoding
+        # or materializing a near-gigabyte result in a unit test.
+        class EnteredDecoder(Exception):
+            pass
+
+        for lanes in (1, 2, 16):
+            widths = [8] * lanes
+            max_per_lane = MAX_SYMBOLS // lanes
+            with self.subTest(lanes=lanes), patch(
+                "bcpack_symbols.decode_lanes", side_effect=EnteredDecoder
+            ):
+                with self.assertRaises(EnteredDecoder):
+                    decode(b"\x10", widths, max_per_lane)
+                with self.assertRaisesRegex(ValueError, "at most 1048576"):
+                    decode(b"\x10", widths, max_per_lane + 1)
+        with patch("bcpack_symbols.decode_lanes", side_effect=EnteredDecoder):
+            with self.assertRaises(EnteredDecoder):
+                decode(bytes(MAX_INPUT), [8], 1)
+            with self.assertRaisesRegex(ValueError, "2097152 bytes"):
+                decode(bytes(MAX_INPUT + 1), [8], 1)
 
     def test_cli(self):
         with tempfile.TemporaryDirectory() as directory:
