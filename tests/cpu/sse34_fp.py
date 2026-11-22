@@ -453,6 +453,21 @@ def _p64s(vals) -> bytes:
     return struct.pack("<2Q", *vals)
 
 
+def _dp_allowed(fmt, xa, xb, imm: int) -> set:
+    # The product and pairwise reduction trees are architectural; the operand order
+    # inside each commutative operation is vendor-defined, so enumerate every legal
+    # result. NaN selection between two NaN operands differs across hosts.
+    ts = [
+        {fmt.mul(xa[k], xb[k]), fmt.mul(xb[k], xa[k])} if (imm & (1 << (4 + k))) else {0}
+        for k in range(len(xa))
+    ]
+    if len(xa) == 2:
+        return {fmt.add(x, y) for x in ts[0] for y in ts[1]} | {fmt.add(y, x) for x in ts[0] for y in ts[1]}
+    p01 = {fmt.add(x, y) for x in ts[0] for y in ts[1]} | {fmt.add(y, x) for x in ts[0] for y in ts[1]}
+    p23 = {fmt.add(x, y) for x in ts[2] for y in ts[3]} | {fmt.add(y, x) for x in ts[2] for y in ts[3]}
+    return {fmt.add(x, y) for x in p01 for y in p23} | {fmt.add(y, x) for x in p01 for y in p23}
+
+
 def ref_binary(name: str, a: bytes, b: bytes, imm: int = 0) -> bytes:
     if name in ("addsubps_op", "addsubps_mem_op"):
         xa, xb = _u32s(a), _u32s(b)
@@ -499,13 +514,17 @@ def ref_binary(name: str, a: bytes, b: bytes, imm: int = 0) -> bytes:
         return _p64s(xa)
     if name == "dpps_op":
         xa, xb = _u32s(a), _u32s(b)
-        t = [F32.mul(xa[k], xb[k]) if (imm & (1 << (4 + k))) else 0 for k in range(4)]
-        total = F32.add(F32.add(t[0], t[1]), F32.add(t[2], t[3]))
+        allowed = _dp_allowed(F32, xa, xb, imm)
+        if len(allowed) != 1:
+            raise AssertionError(f"dpps_op reference is vendor-dependent: {sorted(hex(v) for v in allowed)}")
+        total = allowed.pop()
         return _p32s(total if (imm & (1 << k)) else 0 for k in range(4))
     if name == "dppd_op":
         xa, xb = _u64s(a), _u64s(b)
-        t = [F64.mul(xa[k], xb[k]) if (imm & (1 << (4 + k))) else 0 for k in range(2)]
-        total = F64.add(t[0], t[1])
+        allowed = _dp_allowed(F64, xa, xb, imm)
+        if len(allowed) != 1:
+            raise AssertionError(f"dppd_op reference is vendor-dependent: {sorted(hex(v) for v in allowed)}")
+        total = allowed.pop()
         return _p64s(total if (imm & (1 << k)) else 0 for k in range(2))
     if name == "blendps_op":
         xa, xb = _u32s(a), _u32s(b)
@@ -674,7 +693,7 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
     out_l = (ctypes.c_ubyte * 16)()
     cases = 0
 
-    def run_vec(name: str, a_bytes: bytes, b_bytes: bytes, arg3: int = 0, expect: bytes | None = None):
+    def run_vec(name: str, a_bytes: bytes, b_bytes: bytes, arg3: int = 0):
         nonlocal cases
         ra, pa = _aligned_buf(a_bytes)
         rb, pb = _aligned_buf(b_bytes)
@@ -683,7 +702,29 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
         getattr(native, name)(pa, pb, ctypes.addressof(out_n), arg3)
         getattr(lifted, name)(pa, pb, ctypes.addressof(out_l), arg3)
         got_n, got_l = bytes(out_n), bytes(out_l)
-        want = ref_binary(name, a_bytes, b_bytes, arg3) if expect is None else expect
+        if name in ("dpps_op", "dppd_op"):
+            fmt, xs, lanes = (F32, _u32s, 4) if name == "dpps_op" else (F64, _u64s, 2)
+            allowed = _dp_allowed(fmt, xs(a_bytes), xs(b_bytes), arg3)
+            bad = None
+            if got_n != got_l:
+                bad = "native and lifted disagree"
+            else:
+                words = xs(got_n)
+                enabled = {words[k] for k in range(lanes) if arg3 & (1 << k)}
+                if any(words[k] != 0 for k in range(lanes) if not (arg3 & (1 << k))):
+                    bad = "disabled lane is not +0.0"
+                elif len(enabled) > 1:
+                    bad = "enabled lanes differ"
+                elif enabled and enabled.pop() not in allowed:
+                    bad = f"result not in architecturally allowed set {sorted(allowed)}"
+            if bad:
+                raise AssertionError(
+                    f"{name}(arg3={arg3:#x}): {bad}: a={a_bytes.hex()} b={b_bytes.hex()} "
+                    f"native={got_n.hex()} lifted={got_l.hex()}"
+                )
+            cases += 1
+            return
+        want = ref_binary(name, a_bytes, b_bytes, arg3)
         if got_n != want or got_l != want:
             raise AssertionError(
                 f"{name}(arg3={arg3:#x}): a={a_bytes.hex()} b={b_bytes.hex()} "
