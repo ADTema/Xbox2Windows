@@ -1026,6 +1026,102 @@ E64_ARITH = (
 )
 E64_ARITH_INPUTS = (2.5, 1.25, 3.0, -4.0)
 
+# VOP3 (e64) encodings of v_exp_f32, v_log_f32 and v_mac_f32, which the translator accepted with no fixture
+# drawing them. D3D allows exp2 and log2 a last-place error, so a raw result has no single binary32 reference:
+# each input makes the true result a small integer, and adding 0.5 then taking the floor returns that integer
+# for any result within 0.5 of it. That checks the operation and its source modifiers, which are what e64 adds
+# over e32, and not last-place accuracy. v_mac_f32 is exact and is compared directly: channel 2 accumulates a
+# product of modified sources, and channel 3 is the 4097 * 4097 case of MAD_BODY (0 unfused, 1.0 fused) with
+# both sources negated. A, B, C and D are the constants in s44 to s47.
+APPROX_E64_ACCUMULATOR = -16785408.0  # 0xcb801000, -(2**24 + 2**13)
+APPROX_E64_BODY = [
+    "v_exp_f32_e64 v12, -s44",
+    "v_log_f32_e64 v13, |s45|",
+    *[line for channel in (12, 13)
+      for line in (f"v_add_f32_e32 v{channel}, 0.5, v{channel}", f"v_floor_f32_e32 v{channel}, v{channel}")],
+    "v_mov_b32_e32 v14, s46",
+    "v_mac_f32_e64 v14, -s44, |s45|",
+    "v_mov_b32_e32 v15, 0xcb801000",
+    "v_mac_f32_e64 v15, -s47, -s47",
+]
+APPROX_E64_OPS = ("v_exp_f32_e64", "v_log_f32_e64", "v_mac_f32_e64")
+APPROX_E64_ROWS = ((-3.0, -32.0, 0.25, 4097.0), (-4.0, -8.0, 0.5, 4097.0))
+
+
+def approx_e64_reference(a, b, c, d):
+    """The four exported values: exp2(-A), log2(|B|), -A * |B| + C, and the unfused D * D + accumulator."""
+    return (2.0 ** -a, math.log2(abs(b)), single(single(-a * abs(b)) + c),
+            single(single(d * d) + APPROX_E64_ACCUMULATOR))
+
+
+# Negative controls: (channel, value a wrong lowering would export, what went wrong). Each is drawn on the
+# first row and must report a mismatch. The rounding step is applied to the wrong exp and log values as well.
+APPROX_E64_WRONG = (
+    (0, lambda a, b, c, d: math.floor(2.0 ** a + 0.5), "negation dropped on exp"),
+    (0, lambda a, b, c, d: math.floor(math.exp(-a) + 0.5), "natural exponential for exp2"),
+    (0, lambda a, b, c, d: math.floor(math.log2(-a) + 0.5), "log for exp"),
+    (1, lambda a, b, c, d: math.floor(math.log(abs(b)) + 0.5), "natural logarithm for log2"),
+    (1, lambda a, b, c, d: 2.0 ** abs(b), "exp for log"),
+    (2, lambda a, b, c, d: a * abs(b) + c, "negation dropped on mac"),
+    (2, lambda a, b, c, d: -a * abs(b), "accumulator dropped"),
+    (3, lambda a, b, c, d: single(d * d + APPROX_E64_ACCUMULATOR), "fused multiply-add"),
+)
+
+
+def check_e64_approx_lowering():
+    """Static checks for APPROX_E64_BODY: the modifiers reach exp2, log2 and the unfused helper."""
+    body = translate(with_constants(APPROX_E64_BODY)).split("float4 main", 1)[1]
+    assert set(APPROX_E64_OPS) <= ACCEPTED, set(APPROX_E64_OPS) - ACCEPTED
+    assert "exp2((-params[0].w))" in body and "log2(abs(params[1].x))" in body, body
+    assert "mad32((-params[0].w), abs(params[1].x), " in body and "mad32((-params[1].z), (-params[1].z), " in body, body
+    assert body.count("mad32(") == 2 and " mad(" not in body, body
+    # v_mac_f32 reads its destination, so an unwritten one is refused, as is a third source.
+    must_reject(translate, with_constants(["v_mac_f32_e64 v20, -s44, |s45|"]))
+    must_reject(translate, with_constants(["v_mov_b32_e32 v14, s46", "v_mac_f32_e64 v14, -s44, |s45|, v14"]))
+
+
+def check_e64_approx_draws(directory, compiler, renderer, backend):
+    """Draw APPROX_E64_BODY once per row of APPROX_E64_ROWS, and once per wrong reference on the first row.
+
+    One compile and one renderer batch. A renderer that reports an unavailable adapter (exit 77) makes this a
+    skip. On a desktop GPU the draws establish what the translated shader computes, not what the console does.
+    """
+    source = directory / "e64_approx.hlsl"
+    shader = directory / "e64_approx.cso"
+    source.write_text(translate(with_constants(APPROX_E64_BODY)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+
+    def add_case(row, values, status):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, *row)
+        path = directory / f"e64_approx-{len(cases)}.case"
+        path.write_bytes(bytes(constants) + struct.pack("<4f", *values) * 64)
+        cases.append((path, status))
+
+    for index, row in enumerate(APPROX_E64_ROWS):
+        right = approx_e64_reference(*row)
+        # The true exp2 and log2 results are integers, every right value survives the binary16 export
+        # unchanged, and the unfused sum is exactly zero where a fused one is 1.0.
+        assert right[0] == int(right[0]) and right[1] == int(right[1]) and right[3] == 0.0, right
+        assert tuple(map(half_rtz, right)) == right, right
+        add_case(row, right, "pass")
+        if index:
+            continue
+        for channel, wrong, reason in APPROX_E64_WRONG:
+            values = list(right)
+            values[channel] = float(wrong(*row))
+            assert values[channel] != right[channel], reason
+            add_case(row, values, "mismatch")
+    assert (cases[0][1], cases[-1][1]) == ("pass", "pass")
+    try:
+        run_pixel_batch(renderer, backend, shader, cases)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 77:
+            return 77
+        raise
+    return 0
+
 
 def predicate_group_e64(first):
     body = ["v_sub_f32_e64 v18, s45, 0", "v_sub_f32_e64 v19, s47, 0"]
@@ -5295,6 +5391,7 @@ def check_controls(directory):
     assert body.count("mad32(") == 4 and " mad(" not in body, body
     must_reject(translate, with_constants(["v_mad_f32 v12, s44, s45"]))
     must_reject(translate, with_constants(["v_mac_f32_e32 v14, s44, v15, v14"]))
+    check_e64_approx_lowering()
     # v_madak_f32 and v_madmk_f32 use the same helper. The literal is the last operand of madak and the
     # second of madmk; a register there, a missing operand, and the e64, DPP and SDWA spellings are refused.
     body = translate(with_constants(MAD_LITERAL_BODY)).split("float4 main", 1)[1]
@@ -5778,6 +5875,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((mode_program(), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.extend((with_constants(body), translate) for body, *_ in E64_ARITH)
+    fixtures.append((with_constants(APPROX_E64_BODY), translate))
     fixtures.extend((predicate_group_e64(first), translate) for first in range(0, 16, 4))
     fixtures.append((scalar(), translate))
     fixtures.append((lod_zero_sample(), translate))
@@ -7872,6 +7970,8 @@ def main():
         if mode == "draw-e64":
             # The controls already run in the binary and draw modes; this mode only draws.
             return check_e64_render(directory, *args)
+        if mode == "draw-e64-approx":
+            return check_e64_approx_draws(directory, *args)
         check_controls(directory)
         try:
             if mode == "binary":

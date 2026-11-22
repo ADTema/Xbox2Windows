@@ -322,6 +322,10 @@ def check_shader_records():
         assert e64_integer_forms <= covered, (name, e64_integer_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
+        # v_mac_f32 is in the gfx1013 list only.
+        approx_e64_forms = {("VOP3", "v_exp_f32_e64"), ("VOP3", "v_log_f32_e64")}
+        approx_e64_forms |= {("VOP3", "v_mac_f32_e64")} if name == "gfx1013.tsv" else set()
+        assert approx_e64_forms <= covered, (name, approx_e64_forms - covered)
     # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit
     # predicate the translator lowers; the rejected exec-writing and 64-bit neighbours stay out.
     int_compares = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
