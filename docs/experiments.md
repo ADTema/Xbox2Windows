@@ -293,6 +293,47 @@ The 21,522 cache entries sit on the other side of the archive. The last named re
 
 The 218 re-detections are suffix aliases. Each one starts inside the name of the previous record, at a byte whose value equals its distance to the name's terminating NUL, and shares that record's terminator, header and payload. The count does not change either way, because de-duplication keeps the earlier start whenever the end offset and the digest match.
 
+### Reporting shader census populations
+
+`tools/shader_census.py` reports accepted record occurrences, distinct header
+digests and full-container SHA-256 counts without running LLVM or changing
+`shader_profile_audit.py` output. It reuses the same `scene_records` acceptance
+and scan order as the profile audit. With an already decoded cache from the
+same build, it also reports index entries, distinct `(code_offset,
+allocation_size)` spans and alias counts. The supported cache profile starts
+with bytes `50 53 00 09`; the four u32 counts at byte 80 describe 0x70-byte,
+0x18-byte, 8-byte and index-entry tables following a 128-byte header. Each index entry is
+a little-endian offset and size pair, relative to a caller-established code-area
+base. The tool does not guess that base or decompress cache streams.
+
+```powershell
+python -B tools/shader_census.py local.archive
+python -B tools/shader_census.py local.archive --cache-blob out/decoded.cache --code-base 0x2100000
+ctest --preset dev --no-tests=error -R 'shader_metadata|dxcontainer_part_offsets' -V
+```
+
+The base in the example is illustrative: replace it with the independently
+established offset for that cache. Missing cache input reports `null`, not zero.
+The parser checks table extents, a limit of 1,048,576 index entries, nonzero
+in-range allocations, 16-byte relative offset alignment and distinct-span
+overlaps. Exact aliases remain separate index entries. It does not validate the
+programs inside allocations or prove that two supplied inputs share a build.
+
+Run `python -B tests/shader_census_check.py` without local archives or a GPU.
+Its source-built framing fixture has four accepted records, two deliberately
+colliding header digests, three complete-container hashes and five cache index
+entries. It is not executable DXIL. Rejection controls cover malformed cache
+tables, allocation bounds and overlaps, invalid archive framing and CLI input.
+Separate controls verify alias accounting, missing-cache output and that the
+unchanged profile audit still counts all four occurrences while classifying
+only the three full-container hashes.
+
+Observed with Python 3.14.4 on Linux: all seven census test methods and all
+seven DXContainer controls passed. On Windows 11 build 26300.9974, MSVC
+19.44.35230 and Python 3.12.8, the CTest filter above passed 4/4 tests, including
+the existing native metadata probe, with no skips. No archive totals were
+remeasured for this change.
+
 ### Fixed-profile archive rescan
 
 The fixed profiles previously verified 861 records. The Windows readback run at `1aafb0f` revisited all 26,503 records and added a packed RGB PS. Reclassification at `f94c254` reproduced the same 862 passes. A final full scan at `26544c6` reproduced every previous accepted source byte for byte and added one texture-sampling PS. The table incorporates its separate Windows readback.
