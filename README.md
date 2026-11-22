@@ -6,6 +6,8 @@ New to the project? The [pinned guide in GitHub Discussions](https://github.com/
 
 [![Instruction-form coverage of source-built fixtures, not a measure of port completion](docs/coverage/dashboard.svg)](tools/coverage_svg.py)
 
+Snapshot measured at [c04e65a](https://github.com/R0Y00/Xbox2Windows/commit/c04e65a8a9c1a6881edaf4bdd283d35e39dac8ce). For the latest chart, open the newest [successful Windows checks run on main](https://github.com/R0Y00/Xbox2Windows/actions/workflows/windows.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) and download `coverage-dashboard` from Artifacts.
+
 ## Current results and open work
 
 | Area | Result on Windows | Open question or contribution |
