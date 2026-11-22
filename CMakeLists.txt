@@ -41,6 +41,15 @@ foreach(scenario IN ITEMS translate bounds registry shader)
     add_test(NAME era_title_va_${scenario} COMMAND era_title_va_check ${scenario})
 endforeach()
 
+# era_title_gpu under allocation failure (no GPU needed). The program replaces operator new to fail
+# one chosen allocation at a time.
+add_executable(era_title_gpu_alloc_check tests/era_title_gpu_alloc_check.cpp src/era_title_gpu.cpp
+    src/era_gpu_alias.cpp src/era_title_va.cpp src/era_query.cpp)
+target_include_directories(era_title_gpu_alloc_check PRIVATE src)
+target_compile_features(era_title_gpu_alloc_check PRIVATE cxx_std_20)
+add_test(NAME era_title_gpu_alloc COMMAND era_title_gpu_alloc_check)
+set_tests_properties(era_title_gpu_alloc PROPERTIES TIMEOUT 30)
+
 # Desktop xmem.dll for the package DLLs' four named xmem imports.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/era_heap.cpp src/era_query.cpp
     src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp)

@@ -2,11 +2,13 @@
 
 #include "era_query.h"
 
+#include <atomic>
 #include <exception>
 #include <iterator>
 #include <map>
 #include <mutex>
 #include <new>
+#include <type_traits>
 #include <utility>
 
 namespace era_title_gpu {
@@ -23,11 +25,39 @@ struct State {
     era_title_va::Table table;
 };
 
-// Never destroyed: releasing D3D12 objects while the process or DLL is unloading is not safe.
-State& state()
+// Created by the first track or attach and never destroyed: releasing D3D12 objects while the
+// process or DLL is unloading is not safe. The pointer is constant-initialized and trivially
+// destructible, so loading and unloading the module run no code for it.
+std::atomic<State*> registry{nullptr};
+static_assert(std::is_trivially_destructible_v<std::atomic<State*>>);
+
+// The registry if it exists. The other entry points never create it, and without it they behave
+// as for an empty registry.
+State* existing() noexcept
 {
-    static State* const instance = new State;
-    return *instance;
+    return registry.load(std::memory_order_acquire);
+}
+
+// The registry, created on first use. Returns null when it cannot be allocated; nothing has been
+// registered then, and a later call can retry.
+State* created() noexcept
+{
+    if (State* s = existing()) {
+        return s;
+    }
+    State* fresh = nullptr;
+    try {
+        fresh = new State;  // the std::map members can allocate in their constructors too
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+    State* published = nullptr;
+    if (!registry.compare_exchange_strong(published, fresh, std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+        delete fresh;  // another thread published first; this one never held a device
+        return published;
+    }
+    return fresh;
 }
 
 HRESULT alias(State& s, std::uintptr_t base, Entry& entry) noexcept
@@ -76,7 +106,11 @@ bool track(void* base, std::size_t bytes) noexcept
     if (!base || bytes == 0) {
         return false;
     }
-    State& s = state();
+    State* const registry_state = created();
+    if (!registry_state) {
+        return false;  // allocation failure before anything was registered
+    }
+    State& s = *registry_state;
     std::lock_guard<std::mutex> guard(s.lock);
     if (!era_query::register_gpu_region(base, bytes)) {
         return false;  // empty, wrapping or overlapping
@@ -100,7 +134,11 @@ bool track(void* base, std::size_t bytes) noexcept
 
 bool untrack(void* base) noexcept
 {
-    State& s = state();
+    State* const registry_state = existing();
+    if (!registry_state) {
+        return false;
+    }
+    State& s = *registry_state;
     std::lock_guard<std::mutex> guard(s.lock);
     auto entry = s.entries.find(reinterpret_cast<std::uintptr_t>(base));
     if (entry == s.entries.end()) {
@@ -122,7 +160,11 @@ HRESULT attach(ID3D12Device* device) noexcept
         !existing.Supported) {
         return E_NOTIMPL;
     }
-    State& s = state();
+    State* const registry_state = created();
+    if (!registry_state) {
+        return E_OUTOFMEMORY;
+    }
+    State& s = *registry_state;
     std::lock_guard<std::mutex> guard(s.lock);
     if (s.device.Get() != device) {
         for (auto& [base, entry] : s.entries) {
@@ -145,7 +187,11 @@ HRESULT attach(ID3D12Device* device) noexcept
 
 void detach() noexcept
 {
-    State& s = state();
+    State* const registry_state = existing();
+    if (!registry_state) {
+        return;
+    }
+    State& s = *registry_state;
     std::lock_guard<std::mutex> guard(s.lock);
     for (auto& [base, entry] : s.entries) {
         unalias(s, base, entry);
@@ -155,16 +201,18 @@ void detach() noexcept
 
 std::uint64_t translate(std::uint64_t title_address, std::uint64_t bytes) noexcept
 {
-    return state().table.translate(title_address, bytes);
+    const State* const registry_state = existing();
+    return registry_state ? registry_state->table.translate(title_address, bytes) : 0;
 }
 
 bool locate(std::uint64_t title_address, std::uint64_t bytes, ID3D12Resource** buffer,
             std::uint64_t* offset) noexcept
 {
-    if (!buffer || !offset) {
+    State* const registry_state = existing();
+    if (!buffer || !offset || !registry_state) {
         return false;
     }
-    State& s = state();
+    State& s = *registry_state;
     std::lock_guard<std::mutex> guard(s.lock);
     auto entry = find(s, title_address, bytes);
     if (entry == s.entries.end()) {
@@ -177,7 +225,15 @@ bool locate(std::uint64_t title_address, std::uint64_t bytes, ID3D12Resource** b
 
 bool shader_view(ShaderView& view) noexcept
 {
-    State& s = state();
+    State* const registry_state = existing();
+    if (!registry_state) {
+        // No registry, so no aliased allocations. clear() allocates nothing; even an empty vector's
+        // constructor allocates with the debug STL's iterator checks.
+        view.ranges.clear();
+        view.resources.clear();
+        return true;
+    }
+    State& s = *registry_state;
     std::lock_guard<std::mutex> guard(s.lock);
     try {
         ShaderView result;
@@ -198,7 +254,11 @@ bool shader_view(ShaderView& view) noexcept
 
 Counts counts() noexcept
 {
-    State& s = state();
+    State* const registry_state = existing();
+    if (!registry_state) {
+        return {0, 0};
+    }
+    State& s = *registry_state;
     std::lock_guard<std::mutex> guard(s.lock);
     Counts result{s.entries.size(), 0};
     for (const auto& [base, entry] : s.entries) {
