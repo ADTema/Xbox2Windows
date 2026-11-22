@@ -122,6 +122,20 @@ WIDE = [
     "buffer_store_dword v3, v3, s[12:15], 0 idxen",
     "s_endpgm",
 ]
+# 4x4x4 cube: plane = dispatch Z through idxen; row = dispatch Y and column = dispatch X
+# folded into one offen byte offset. One word per invocation, the dispatch Z index.
+CUBE = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v3, s10, 2, v0",
+    "v_lshl_add_u32 v4, s11, 2, v1",
+    "v_lshl_add_u32 v6, s16, 2, v2",
+    "v_lshlrev_b32_e32 v5, 2, v3",
+    "v_lshl_add_u32 v7, v4, 4, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v6, v[6:7], s[12:15], 0 idxen offen",
+    "s_endpgm",
+]
 INDEX_BINDING = dict(table_reg=7, group_reg=11, descriptor_offset=48, stride=12)
 FIXED_BINDING = dict(table_reg=8, descriptor_offset=0)
 RUNTIME_BINDING = dict(FIXED_BINDING, constant_descriptor=32)
@@ -129,6 +143,7 @@ TILE_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, stride=72)
 SLAB_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_z=16, stride=68)
 QUAD_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, stride=52)
 WIDE_BINDING = dict(FIXED_BINDING, group_reg=10, stride=4)
+CUBE_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, group_reg_z=16, stride=132)
 CASES = [
     ("indexed", INDEXED, 32, INDEX_BINDING),
     ("fixed", FIXED, 1, FIXED_BINDING),
@@ -139,6 +154,7 @@ CASES = [
     ("slab", SLAB, (4, 1, 8), SLAB_BINDING),
     ("quad", QUAD, (4, 4, 1), QUAD_BINDING),
     ("wide", WIDE, (256, 1, 1), WIDE_BINDING),
+    ("cube", CUBE, (4, 4, 4), CUBE_BINDING),
 ]
 
 
@@ -155,6 +171,8 @@ def grid_words(name, groups):
                     words[(68 * z + 16 * x + 4) // 4:(68 * z + 16 * x + 4) // 4 + 2] = [z, x]
                 elif name == "quad":
                     words[(52 * y + 4 * x) // 4] = x
+                elif name == "cube":
+                    words[(132 * z + 16 * y + 4 * x) // 4] = z
                 else:
                     words[x] = x
     return words
@@ -165,6 +183,7 @@ GRID_DISPATCHES = {
     "slab": ((1, 1, 1), (1, 1, 2)),
     "quad": ((1, 1, 1), (3, 2, 1)),
     "wide": ((1, 1, 1),),
+    "cube": ((1, 1, 1), (1, 2, 2)),
 }
 
 
@@ -297,7 +316,42 @@ def grid_controls():
     # A store with an unresolved local ID as data is still rejected.
     must_reject(lambda: aot.lower([s.replace("v_mov_b32_e32 v6, v3", "v_mov_b32_e32 v6, v1") for s in TILE],
                                   (8, 8, 1), **TILE_BINDING))
+    cube_controls()
     audit_candidates()
+
+
+def cube_controls():
+    """Three-axis stores: exact output, then one rejection per broken assumption."""
+    cube = aot.lower(CUBE, (4, 4, 4), **CUBE_BINDING).splitlines()
+    assert "[numthreads(4,4,4)]" in cube
+    assert "    outputData.Store(tid.z * 132u + (tid.y << 4u) + (tid.x << 2u) + 0u, tid.z);" in cube
+    # Z of one leaves v2 undefined; a wrong group size breaks a shift; a group register is missing.
+    for group in ((4, 4, 1), (4, 4, 2), (4, 2, 4), (2, 4, 4), (4, 4, 8)):
+        must_reject(lambda: aot.lower(CUBE, group, **CUBE_BINDING))
+    for change in (dict(group_reg_z=None), dict(group_reg_z=11), dict(group_reg_z=12)):
+        must_reject(lambda: aot.lower(CUBE, (4, 4, 4), **(CUBE_BINDING | change)))
+    for old, new in (
+        # Row and column from the same axis, or index and row from the same axis.
+        ("v_lshl_add_u32 v7, v4, 4, v5", "v_lshl_add_u32 v7, v3, 4, v5"),
+        ("v_lshl_add_u32 v6, s16, 2, v2", "v_lshl_add_u32 v6, s11, 2, v1"),
+        # Row operand is a raw local ID; column operand is an index, not a byte offset.
+        ("v_lshl_add_u32 v7, v4, 4, v5", "v_lshl_add_u32 v7, v1, 4, v5"),
+        ("v_lshl_add_u32 v7, v4, 4, v5", "v_lshl_add_u32 v7, v4, 4, v3"),
+        # The group's columns overflow a row, or the element overflows a column.
+        ("v_lshl_add_u32 v7, v4, 4, v5", "v_lshl_add_u32 v7, v4, 3, v5"),
+        ("v_lshlrev_b32_e32 v5, 2, v3", "v_lshlrev_b32_e32 v5, 1, v3"),
+        ("0 idxen offen", "0 idxen offen offset:4"),
+        # A plane offset without its index, or with the operands in the wrong order.
+        ("v[6:7], s[12:15], 0 idxen offen", "v7, s[12:15], 0 offen"),
+        ("v[6:7], s[12:15], 0 idxen offen", "v[7:8], s[12:15], 0 idxen offen"),
+    ):
+        must_reject(lambda: aot.lower([s.replace(old, new) for s in CUBE], (4, 4, 4), **CUBE_BINDING))
+    # The group's rows overflow the plane stride.
+    for stride in (60, None):
+        must_reject(lambda: aot.lower(CUBE, (4, 4, 4), **(CUBE_BINDING | dict(stride=stride))))
+    # The plane offset is not a storable word.
+    must_reject(lambda: aot.lower([s.replace("buffer_store_dword v6,", "buffer_store_dword v7,") for s in CUBE],
+                                  (4, 4, 4), **CUBE_BINDING))
 
 
 def audit_candidates():
@@ -375,7 +429,7 @@ def grid_mutations(source, name):
     a, b = {"slab": ("tid.z", "tid.x")}.get(name, ("tid.x", "tid.y"))
     if name != "wide":
         yield "swapped axes", source.replace(a, "tid.T").replace(b, a).replace("tid.T", b)
-    if name == "slab":
+    if name in ("slab", "cube"):
         yield "Z ignored", source.replace("tid.z", "tid.y")
     dims = dict((case[0], case[2]) for case in CASES)[name]
     shrunk = (dims[0] // 2, *dims[1:])
