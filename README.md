@@ -69,6 +69,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | Native, mapped and recompiled archive reader | `ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V` |
 | Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
 | Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
+| PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 
 The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#repeated-memory-copies-in-the-control-flow-cpu-lifter). REP MOVSB/MOVSW/MOVSD/MOVSQ copy 1-, 2-, 4- and 8-byte elements.
 
