@@ -1636,6 +1636,8 @@ The CPU block test and the D3D12 BC7 draw tests check all 16 RGBA texels against
 
 ### Exporting two TTPF entries to DDS
 
+To run every step from this checkout using Python and a matching local pool, follow the [offline archive reproduction guide](bcpack-archive-reproduction.md). It includes the chunk offsets, payload sizes, tiling equations, calibration conversion and complete source listings.
+
 These measurements use Leonida's Python exporter on Windows with Python 3.14.2. Both indices are zero-based and refer to the same local `ttdb_ui.ttpf` pool, 845,115,648 bytes, SHA-256 `dc983ed7f6b78d1693fa5757f17c03bafb790e851594fdf4d412579b61d867f6`. The SHA-256 values in the table cover each complete DDS, including its header. Original pixel colours and coverage across the full set remain unverified. [Measurement request](https://github.com/R0Y00/Xbox2Windows/issues/458#issuecomment-7074603775)
 
 | Pool index | BCPack codec / DXGI format | Dimensions / mips | Export mode | Observed result |
