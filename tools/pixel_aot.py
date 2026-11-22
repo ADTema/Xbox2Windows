@@ -1079,6 +1079,8 @@ def sdwa_dest(result, sel, unused, old):
         raise ValueError("UNUSED_PRESERVE needs a tracked numeric destination")
     keep = ~(((1 << width) - 1) << offset) & 0xffffffff
     return f"((asuint({old}) & {keep:#x}u) | {field})"
+# Exact arithmetic with SDWA forms on gfx1013 (docs/coverage/gfx1013.tsv).
+SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", "ceil", "fract", "trunc")
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
@@ -1446,6 +1448,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"(-{expression})"
             if clamp:
                 expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_({'|'.join(SDWA_ALU)})_f32_sdwa (v\d+), (.+?)( clamp)? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:DWORD( src1_sel:DWORD)?"):
+            # SDWA forms of exact arithmetic take whole-dword sources, so the binary32 denormal mode never applies
+            # to a zero-extended field; the result is placed like an SDWA move.
+            op, dst, operands, clamp, dst_sel, unused, src1_sel = m.groups()
+            tokens = operands.split(", ")
+            arity, template = ALU[op]
+            if mask != "entry" or len(tokens) != arity or bool(src1_sel) != (arity == 2):
+                raise ValueError("Invalid arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            expression = template.format(*[fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens])
+            if clamp:
+                expression = f"saturate({expression})"
+            if dst_sel != "DWORD":
+                expression = f"asfloat({sdwa_dest(f'asuint({expression})', dst_sel, unused, vector.get(dst))})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_mov_b32(?:_e32|_e64)? (v\d+), (-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)"):
