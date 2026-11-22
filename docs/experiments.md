@@ -1655,6 +1655,63 @@ The [fixture supplied in #442](https://github.com/R0Y00/Xbox2Windows/issues/442)
 
 The CPU block test and the D3D12 BC7 draw tests check all 16 RGBA texels against fixed expected bytes. Changing the last selector from 15 to 0 selects the opposite endpoint only for the final texel. This covers a single zero-history synthetic vector. The local BCPack probe does not decode arbitrary BC7 streams.
 
+### Exporting two TTPF entries to DDS
+
+These measurements use Leonida's Python exporter on Windows with Python 3.14.2. Both indices are zero-based and refer to the same local `ttdb_ui.ttpf` pool, 845,115,648 bytes, SHA-256 `dc983ed7f6b78d1693fa5757f17c03bafb790e851594fdf4d412579b61d867f6`. The SHA-256 values in the table cover each complete DDS, including its header. Original pixel colours and coverage across the full set remain unverified. [Measurement request](https://github.com/R0Y00/Xbox2Windows/issues/458#issuecomment-7074603775)
+
+| Pool index | BCPack codec / DXGI format | Dimensions / mips | Export mode | Observed result |
+|---:|---|---|---|---|
+| 0 | 1 / BC1_UNORM (71) | 512 × 512 / 1 | Strict | Exit 0, 131,220 bytes, SHA-256 `cd39c88921eb395ad633b1bd9ee05a160f693bea8b1e85ad8543bc9cd272022a` |
+| 8253 | 7 / BC7_UNORM (98) | 512 × 256 / 1 | Strict | Exit 2, `BC7 signature rank 149 is inferred-only (unconfirmed)`, no DDS written |
+| 8253 | 7 / BC7_UNORM (98) | 512 × 256 / 1 | Fitted, history revision `3c997c411666b31372b0d2b82afd5ea669b4d774` | Exit 0, 131,220 bytes, SHA-256 `84e7abf023a568056178f6353d8e86e5d848e536e2aa92f1a028266231b1e15f` |
+
+Run the following PowerShell commands from the Xbox2Windows repository root with a fresh output directory. Set `$pool` to the matching local pool. The layout commands report the dimensions, mip count and the codecs used by each mip. [Pinned exporter](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tools/ttpf_mips.py) · [Pinned decoder](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tools/bcpack.py)
+
+```powershell
+$pool = (Resolve-Path 'game-files/ttdb_ui.ttpf').Path
+(Get-Item -LiteralPath $pool).Length
+Get-FileHash -LiteralPath $pool -Algorithm SHA256
+$out = New-Item -ItemType Directory -Path out/ttpf-dds-measurements
+git init --quiet "$out/Leonida"
+git -C "$out/Leonida" fetch --depth 1 https://github.com/ItsNotRexed/Leonida.git b0befb4b88d6640354940117448ea19d52507584
+git -C "$out/Leonida" checkout --detach b0befb4b88d6640354940117448ea19d52507584
+$exporter = "$out/Leonida/tools/ttpf_mips.py"
+python -I $exporter layout $pool 0
+python -I $exporter export $pool 0 "$out/strict-0.dds"
+Get-FileHash "$out/strict-0.dds" -Algorithm SHA256
+python -I $exporter layout $pool 8253
+python -I $exporter export $pool 8253 "$out/strict-8253.dds"
+$LASTEXITCODE
+Test-Path "$out/strict-8253.dds"
+```
+
+For the fitted run, use the same PowerShell session. The pinned calibration module exposes the BC7 endpoint and index history, including which bits were confirmed and which endpoint slots used a last-resort estimate. The commands serialize these fields to the JSON format accepted by the exporter. [Calibration source](https://github.com/timelery/Leonida/blob/3c997c411666b31372b0d2b82afd5ea669b4d774/tools/bcpack_tables_bptc.py)
+
+```powershell
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/timelery/Leonida/3c997c411666b31372b0d2b82afd5ea669b4d774/tools/bcpack_tables_bptc.py' -OutFile "$out/history_snapshot.py"
+@'
+import json
+import runpy
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+table = runpy.run_path(str(out / "history_snapshot.py"))["load_bc7"]()
+bc7 = {
+    "historyEndpoints": table["history_endpoints"],
+    "historyEndpointBits": table["history_endpoint_bits"],
+    "historyEndpointConfirmedBits": table["history_endpoint_confirmed_bits"],
+    "historyIndices": table["history_indices"],
+    "historyIndexBits": table["history_index_bits"],
+    "historyIndexConfirmedBits": table["history_index_confirmed_bits"],
+    "historyEndpointLastResort": sorted(table["last_resort"]),
+}
+(out / "history.json").write_text(json.dumps({"bc7": bc7}), encoding="utf-8")
+'@ | python -I - "$out"
+python -I $exporter export $pool 8253 "$out/fitted-8253.dds" --allow-provisional --history "$out/history.json"
+Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
+```
+
 ### Drawing BC7 textures with a recompiled pixel shader
 
 `linearize_4k_s_tail(tile, width, height, tail_level)` reads a single BC7 level from a shared GFX10 4 KiB mip-tail tile. Supply the decoded tile, the requested pixel dimensions and its zero-based position within the tail. Whole-tile storage and per-slot bounds are checked before reading. [AMD mip-tail address calculation](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10addrlib.cpp)
