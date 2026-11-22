@@ -559,6 +559,25 @@ def lane_mask(token):
     return [token]
 
 
+# 32-bit scalar ALU on uniform register bits as (source count, result, SCC); SCC None leaves it unchanged.
+# {r} names the result. Shift counts use their low five bits; signed overflow sets SCC for _i32 add/sub.
+NONZERO = "{r} != 0u"
+SCALAR = {
+    "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),
+    "add_i32": (2, "{0} + {1}", "(~({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
+    "sub_i32": (2, "{0} - {1}", "(({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
+    "mul_i32": (2, "{0} * {1}", None),
+    "min_u32": (2, "min({0}, {1})", "{0} < {1}"), "max_u32": (2, "max({0}, {1})", "{0} > {1}"),
+    "min_i32": (2, "asuint(min(asint({0}), asint({1})))", "asint({0}) < asint({1})"),
+    "max_i32": (2, "asuint(max(asint({0}), asint({1})))", "asint({0}) > asint({1})"),
+    "and_b32": (2, "{0} & {1}", NONZERO), "or_b32": (2, "{0} | {1}", NONZERO),
+    "xor_b32": (2, "{0} ^ {1}", NONZERO), "andn2_b32": (2, "{0} & ~{1}", NONZERO),
+    "orn2_b32": (2, "{0} | ~{1}", NONZERO), "not_b32": (1, "~{0}", NONZERO),
+    "lshl_b32": (2, "{0} << ({1} & 31u)", NONZERO), "lshr_b32": (2, "{0} >> ({1} & 31u)", NONZERO),
+    "ashr_i32": (2, "asuint(asint({0}) >> ({1} & 31u))", NONZERO),
+}
+
+
 def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict[str, bool] | None = None):
     if re.fullmatch(r"-\d+", token):
         return f"asfloat({int(token) & 0xffffffff}u)"
@@ -940,6 +959,29 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError("Invalid movk immediate")
                 val = (val if val < 0x8000 else val - 0x10000) & 0xffffffff
             scalar[dst] = val
+        elif m := match(rf"s_({'|'.join(SCALAR)}) (s\d+), (.+)"):
+            # Uniform values become HLSL uint locals; an exec mask does not affect them.
+            op, dst, operands = m.groups()
+            arity, template, carry = SCALAR[op]
+            tokens = operands.split(", ")
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            if len(tokens) != arity:
+                raise ValueError("Invalid scalar operation")
+            values = [scalar_u32(t, scalar, pending) for t in tokens]
+            lines.append(f"    uint salu{i} = {template.format(*values)};")
+            if carry:
+                scc = f"({carry.format(*values, r=f'salu{i}')})"
+            scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"s_cselect_b32 (s\d+), ([^,]+), ([^,]+)"):
+            dst, *tokens = m.groups()
+            if scc is None:
+                raise ValueError("Select condition is not a tracked scalar result")
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            values = [scalar_u32(t, scalar, pending) for t in tokens]
+            lines.append(f"    uint salu{i} = {scc} ? {values[0]} : {values[1]};")
+            scalar[dst] = ("uint", f"salu{i}")
         elif m := match(r"s_load_dwordx8 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)"):
             dst = registers(*m.groups()[:2], 8)
             addr = registers(*m.groups()[2:4], 2)
