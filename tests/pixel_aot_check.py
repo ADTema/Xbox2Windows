@@ -1859,6 +1859,90 @@ def check_three_way_templates():
                                    {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
                 assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
                                 "med3": sorted((a, b, c))[1]}, (a, b, c)
+def pack_f16_pair(lo, hi):
+    lo_b = struct.unpack("<H", struct.pack("<e", lo))[0]
+    hi_b = struct.unpack("<H", struct.pack("<e", hi))[0]
+    return lo_b | (hi_b << 16)
+
+
+def rne_f16(value):
+    return struct.unpack("<e", struct.pack("<e", value))[0]
+
+
+# Mixed-precision VOP3P FMA fixture covering v_fma_mix_f32, v_fma_mixlo_f16, v_fma_mixhi_f16,
+# op_sel / op_sel_hi, |.| / -, clamp, inline f16 constants, and untouched-half preservation.
+FMA_MIX_BODY = [
+    "v_mov_b32_e32 v19, s45",
+    "v_mov_b32_e32 v20, s46",
+    "v_mov_b32_e32 v21, s47",
+    "v_mov_b32_e32 v22, 0x40003c00",
+    "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]",
+    "v_fma_mixlo_f16 v22, s44, 0.5, v21 op_sel:[1,1,0]",
+    "v_fma_mix_f32 v23, v22, 1.0, 0 op_sel:[1,0,0] op_sel_hi:[1,0,0]",
+    "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp",
+    "v_cvt_f32_f16_e32 v13, v22",
+    "v_fma_mix_f32 v14, v22, 1.0, 0 op_sel:[1,0,0] op_sel_hi:[1,0,0]",
+    "v_fma_mix_f32 v15, v12, 1.0, 0.5 clamp",
+]
+
+FMA_MIX_SETS = (
+    # Set 1: mixed f16/f32 with |.|, -, op_sel_hi, and untouched-half preservation on both mixlo & mixhi.
+    (pack_f16_pair(1.5, -2.0), pack_f16_pair(0.5, -0.25), 0.75, 0.25),
+    # Set 2: saturates both v_fma_mixhi_f16 clamp and v_fma_mix_f32 clamp to [0, 1].
+    (pack_f16_pair(3.0, -4.0), pack_f16_pair(-0.5, 0.5), 2.5, -1.0),
+    # Set 3: exact binary16 halfway ties (odd mantissa -> round up under RNE vs down under RTZ).
+    (pack_f16_pair(2.0 + 2 ** -9, 1.0), pack_f16_pair(0.5, 0.25), 1.0 + 2 ** -11 + 2 ** -12, 2 ** -11),
+)
+
+
+def fma_mix_reference(a_bits, b_bits, c_val, d_val):
+    a_lo = struct.unpack("<e", struct.pack("<H", a_bits & 0xffff))[0]
+    a_hi = struct.unpack("<e", struct.pack("<H", (a_bits >> 16) & 0xffff))[0]
+    b_lo = struct.unpack("<e", struct.pack("<H", b_bits & 0xffff))[0]
+    b_hi = struct.unpack("<e", struct.pack("<H", (b_bits >> 16) & 0xffff))[0]
+    v12 = single(abs(a_hi) * (-b_lo) + c_val)
+    lo = rne_f16(single(a_lo * 0.5 + d_val))
+    hi = rne_f16(min(max(single(-abs(b_hi) * 2.0 + c_val), 0.0), 1.0))
+    v15 = min(max(single(v12 + 0.5), 0.0), 1.0)
+    return (half_rtz(v12), half_rtz(lo), half_rtz(hi), half_rtz(v15))
+
+
+def check_fma_mix_draw(directory, compiler, renderer, backend):
+    program = with_constants(FMA_MIX_BODY)
+    source = directory / "fma_mix.hlsl"
+    shader = directory / "fma_mix.cso"
+    case = directory / "fma_mix.case"
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for a_bits, b_bits, c_val, d_val in FMA_MIX_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<2I2f", constants, 12, a_bits, b_bits, c_val, d_val)
+        expected = fma_mix_reference(a_bits, b_bits, c_val, d_val)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    # Mutations verified against Set 1 (modifiers, half selection, preservation) and Set 2 (clamp).
+    for set_idx, old, new, label in (
+        (0, "v_fma_mix_f32 v12, |s44|, -v19, v20", "v_fma_mix_f32 v12, s44, -v19, v20", "abs modifier"),
+        (0, "v_fma_mix_f32 v12, |s44|, -v19, v20", "v_fma_mix_f32 v12, |s44|, v19, v20", "neg modifier"),
+        (0, "op_sel:[1,1,0] op_sel_hi:[1,0,0]", "op_sel:[1,1,0]", "op_sel_hi half select"),
+        (0, "v_fma_mixhi_f16 v22, -|v19|", "v_fma_mixlo_f16 v22, -|v19|", "mixhi half preservation"),
+        (1, "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp",
+         "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0]", "mixhi clamp"),
+    ):
+        a_bits, b_bits, c_val, d_val = FMA_MIX_SETS[set_idx]
+        constants = bytearray(256)
+        struct.pack_into("<2I2f", constants, 12, a_bits, b_bits, c_val, d_val)
+        expected = fma_mix_reference(a_bits, b_bits, c_val, d_val)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
 
 
 def sopc_group() -> list[str]:
@@ -2428,6 +2512,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(MOVK_BODY), translate))
     fixtures.append((with_constants(HALF_BODY), translate))
     fixtures.append((with_constants(VOP3P_BODY), translate))
+    fixtures.append((with_constants(FMA_MIX_BODY), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.extend((with_constants(body), translate) for body, *_ in E64_ARITH)
     fixtures.extend((predicate_group_e64(first), translate) for first in range(0, 16, 4))
@@ -2714,6 +2799,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
                 raise AssertionError("The renderer failed to detect the changed channel order")
     check_vop3p_draw(directory, compiler, renderer, backend)
     check_bitwise_draw(directory, compiler, renderer, backend)
+    check_fma_mix_draw(directory, compiler, renderer, backend)
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
     for exp_shader_inst in ("s_waitcnt_expcnt null, 0x3", "s_waitcnt expcnt(0)"):
