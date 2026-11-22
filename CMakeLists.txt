@@ -338,7 +338,7 @@ foreach(stage IN ITEMS pass24 pass25 producer rcas)
             COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E "${entry}" -D "STORAGE_${storage}=1"
                 -I "${CMAKE_CURRENT_SOURCE_DIR}/tests" -Vn "${symbol}" -Fh "${header}"
                 -Fo "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.cso" "${shader}"
-            DEPENDS "${shader}" tests/ffx_dispatch_io.hlsli src/rgb9e5.hlsli
+            DEPENDS "${shader}" tests/ffx_dispatch_io.hlsli src/rgb9e5.hlsli src/ffx_float_to_int.hlsli
             BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.cso" VERBATIM)
         target_sources(offscreen_check PRIVATE "${header}")
     endforeach()
@@ -1194,6 +1194,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/script_path_check.py" "$<TARGET_FILE:script_path_host>")
     add_executable(ffx_pass26_lds tests/ffx_pass26_lds/gate.cpp)
     target_link_libraries(ffx_pass26_lds PRIVATE d3d11 d3dcompiler)
+    add_test(NAME ffx_float_to_int_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/ffx_dispatch_aot_check.py" --readback $<TARGET_FILE:ffx_pass26_lds> warp)
     add_test(NAME ffx_pass26_lds_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/ffx_pass26_lds/verify.py"
         --host $<TARGET_FILE:ffx_pass26_lds> --backend warp)

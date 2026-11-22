@@ -292,6 +292,17 @@ The integrated AMD Radeon(TM) Graphics of a Ryzen 5 7600 (RDNA 2, device `164e`,
 ctest --preset dev --no-tests=error -R '^ffx_provider_loop_hardware$' -V
 ```
 
+### Float-to-integer conversions in translated dispatches
+
+The dispatch lowerer maps NaN to zero, truncates finite values toward zero and saturates out-of-range inputs to the signed or unsigned endpoint. The cast receives a finite value in range even if the compiler evaluates both arms of the endpoint selection.
+
+The LLVM 15 check assembles both conversions and compares the translated register results with 19 pairs of expected words. The same inputs run through the emitted ALU expressions and production HLSL helpers on WARP. On Windows build 26300.9974, WARP and an RTX 4060 (driver 610.88) matched all pairs. The previous bare casts also matched in this D3D11 harness on these adapters. The fix removes dependence on out-of-range cast behaviour. Whether a normal dispatch supplies such values remains unmeasured.
+
+```powershell
+cmake --build --preset dev --target ffx_pass26_lds
+ctest --preset dev --no-tests=error -R '^ffx_float_to_int_warp$' -V
+```
+
 ### FSR4 dispatch through the RCAS input
 
 With sharpening enabled, the default i8 graph first touches the physical ID 16 texture in `FFX_FSR4_PASS_26`. It writes `rw_mlsr_output_color` (logical ID 10, UAV `u2`). The following `FFX_FSR4_RCAS_PASS` reads `r_rcas_input` (ID 16, SRV `t18`) and writes the external `rw_rcas_output` (ID 11, UAV `u11`). Each RCAS lane computes four output pixels. For each pixel it loads the center and four axial neighbors at integer texel coordinates. The native program contains 20 RGB `image_load` instructions with half-precision returns, four stores and zero sampler bindings.
