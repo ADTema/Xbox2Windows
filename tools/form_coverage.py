@@ -52,6 +52,7 @@ CPU_FIXTURES = {
     "fourth_arg": "cpu_aot_fourth_argument",
     "repeat_call": "cpu_aot_repeated_call",
     "working_set_delta": "cpu_working_set_delta",
+    "xlatb": "cpu_aot_xlatb",
     "exe_entry": "cpu_aot_exe_entry",
     "address_size": "cpu_aot_address_size",
     "call_pair": "cpu_aot_call_pair",

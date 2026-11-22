@@ -236,6 +236,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = write("zero")
         elif op == M.CALL:
             stmt = calls[i.ip]
+        elif op == M.XLATB:
+            # AL = [RBX + AL]: iced names AL as the index, and address() would add all of RAX. The sum
+            # wraps at 32 bits under 67h (base EBX). The flags and bits 8 to 63 of RAX are unchanged.
+            table = f"{reg(i.memory_base)} + static_cast<uint8_t>(rax)"
+            if RegisterExt.size(i.memory_base) == 4:
+                table = f"static_cast<uint32_t>({table})"
+            stmt = f"rax = (rax & ~0xffull) | load<uint8_t>({table});"
         elif op == M.RET:
             stmt = "return rax;"
         else:

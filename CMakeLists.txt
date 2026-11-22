@@ -649,6 +649,20 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_bmi1>" "$<TARGET_FILE:cpu_bmi1_lifted>")
     set_tests_properties(cpu_aot_bmi1 PROPERTIES SKIP_RETURN_CODE 77)
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
+    cpu_asm_fixture(cpu_xlatb xlatb)
+    # The lifted DLL and three mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted signed noaddr32 clear)
+        set(xlatb_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_xlatb_${variant}.cpp")
+        add_custom_command(OUTPUT "${xlatb_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xlatb.py"
+                emit "$<TARGET_FILE:cpu_xlatb>" "${xlatb_fixture}" ${variant}
+            DEPENDS cpu_xlatb tests/cpu/xlatb.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_xlatb_${variant} SHARED "${xlatb_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_xlatb COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xlatb.py"
+        check "$<TARGET_FILE:cpu_xlatb>" "$<TARGET_FILE:cpu_xlatb_lifted>"
+        "$<TARGET_FILE:cpu_xlatb_signed>" "$<TARGET_FILE:cpu_xlatb_noaddr32>" "$<TARGET_FILE:cpu_xlatb_clear>")
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
