@@ -2050,8 +2050,30 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_link_libraries(cpu_shim_compute PRIVATE xmem_shim dxgi d3d12)
     add_library(cpu_shim_draw SHARED tests/cpu/shim_draw_provider.cpp tests/cpu/shim_draw_gpu.cpp
         tests/cpu/shim_chain_gpu.cpp)
+    set(shim_draw_color_header "${CMAKE_CURRENT_BINARY_DIR}/shim_draw_color.h")
+    add_custom_command(OUTPUT "${shim_draw_color_header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E main -Fh "${shim_draw_color_header}" -Vn shim_draw_color
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_draw_color.hlsl"
+        DEPENDS tests/cpu/shim_draw_color.hlsl VERBATIM)
+    foreach(stage IN ITEMS texture_init texture_read texture_swap)
+        set(profile ps_6_0)
+        set(definition)
+        if(stage STREQUAL texture_init)
+            set(profile cs_6_0)
+            set(definition -DINITIALIZE_TEXTURE)
+        elseif(stage STREQUAL texture_swap)
+            set(definition -DSWAP_CHANNELS)
+        endif()
+        set(header "${CMAKE_CURRENT_BINARY_DIR}/shim_draw_${stage}.h")
+        add_custom_command(OUTPUT "${header}"
+            COMMAND "${DXC_EXECUTABLE}" -T "${profile}" -E main ${definition}
+                -Fh "${header}" -Vn "shim_draw_${stage}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_draw_texture.hlsl"
+            DEPENDS tests/cpu/shim_draw_texture.hlsl VERBATIM)
+        target_sources(cpu_shim_draw PRIVATE "${header}")
+    endforeach()
     add_dependencies(cpu_shim_draw triangle_headers)
     target_sources(cpu_shim_draw PRIVATE
+        "${shim_draw_color_header}"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.h"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.h"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs_flip.h"
@@ -2096,8 +2118,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE:cpu_shim_draw>")
         set_tests_properties(cpu_shim_draw_${adapter} PROPERTIES TIMEOUT 180
             ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
+        add_test(NAME cpu_shim_texture_reuse_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_draw_check.py"
+            "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_shim_startup>" "$<TARGET_FILE:cpu_shim_startup_lifted>"
+            "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:xmem_shim>"
+            "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE:cpu_shim_draw>" --texture-reuse)
+        set_tests_properties(cpu_shim_texture_reuse_${adapter} PROPERTIES TIMEOUT 180
+            ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
     endforeach()
-    set_tests_properties(cpu_shim_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(cpu_shim_draw_hardware cpu_shim_texture_reuse_hardware PROPERTIES SKIP_RETURN_CODE 77)
     # The translated compute -> mesh -> pixel chain (#658) from the same EXE entry (#671).
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME cpu_shim_chain_${adapter} COMMAND "${INTAKE_PYTHON}" -B
