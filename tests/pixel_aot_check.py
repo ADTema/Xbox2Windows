@@ -615,6 +615,67 @@ def check_reciprocal_draw(directory, compiler, renderer, backend):
                 raise AssertionError("Substituting reciprocal for reciprocal square root escaped detection")
         else:
             subprocess.run(draw, check=True)
+# VOP3 (e64) encodings that the translator already accepts but no other fixture draws: floor, fract, max, min and
+# fmac with source modifiers, and the 16 comparisons writing an SGPR mask from negated operands. Negating both
+# operands swaps the less and greater relations and keeps equality and unordered.
+E64_ARITH = (
+    (["v_floor_f32_e64 v12, -|s44|", "v_fract_f32_e64 v13, -s45",
+      "v_max_f32_e64 v14, -s46, |s47|", "v_min_f32_e64 v15, s46, -|s47|"],
+     [-3.0, 0.75, 4.0, -4.0], ((0, 2.0), (1, 0.25), (2, -3.0), (3, 3.0))),
+    (["v_mov_b32_e32 v12, s46", "v_fmac_f32_e64 v12, -s44, |s45|",
+      "v_mov_b32_e32 v13, 0", "v_mov_b32_e32 v14, 0", "v_mov_b32_e32 v15, 0"],
+     [-0.125, 0.0, 0.0, 0.0], ((0, 6.125),)),
+)
+E64_ARITH_INPUTS = (2.5, 1.25, 3.0, -4.0)
+
+
+def predicate_group_e64(first):
+    body = ["v_sub_f32_e64 v18, s45, 0", "v_sub_f32_e64 v19, s47, 0"]
+    for channel, op in enumerate(PREDICATES[first:first + 4]):
+        body.extend([f"v_cmp_{op}_f32_e64 s0, -s44, -v18", f"v_cndmask_b32_e64 v{12 + channel}, 0, v19, s0"])
+    return with_constants(body)
+
+
+def check_e64_draws(directory, compiler, renderer, backend):
+    source = directory / "e64.hlsl"
+    shader = directory / "e64.cso"
+    case = directory / "e64.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    x, y, z, w = E64_ARITH_INPUTS
+    assert [math.floor(-abs(x)), -y - math.floor(-y), max(-z, abs(w)), min(z, -abs(w))] == E64_ARITH[0][1]
+    assert [-x * abs(y) + z, 0.0, 0.0, 0.0] == E64_ARITH[1][1]
+    for body, expected, wrongs in E64_ARITH:
+        source.write_text(translate(with_constants(body)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, *E64_ARITH_INPUTS)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+        for channel, value in wrongs:
+            wrong_values = list(expected)
+            wrong_values[channel] = value
+            case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
+            result = subprocess.run(draw, capture_output=True, text=True)
+            if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+                raise AssertionError(f"A wrong e64 result escaped detection in channel {channel}")
+    inputs = ((-1, 1, 0), (-0.0, 0.0, 1), (1, -1, 2), (math.nan, 1, 3), (1, math.nan, 3))
+    negated = {0: 2, 1: 1, 2: 0, 3: 3}
+    for first in range(0, 16, 4):
+        source.write_text(translate(predicate_group_e64(first)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        for left, right, relation in inputs:
+            constants = bytearray(256)
+            struct.pack_into("<4f", constants, 12, left, right, 0, 1)
+            expected = [float((op >> negated[relation]) & 1) for op in range(first, first + 4)]
+            case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+            subprocess.run(draw, check=True)
+            # A lowering that dropped the negations would follow the original relation.
+            unnegated = [float((op >> relation) & 1) for op in range(first, first + 4)]
+            if unnegated != expected:
+                case.write_bytes(constants + struct.pack("<4f", *unnegated) * 64)
+                result = subprocess.run(draw, capture_output=True, text=True)
+                if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+                    raise AssertionError(f"Dropped e64 negation escaped detection, first={first}, left={left}")
 
 
 def bitwise_program():
@@ -2253,6 +2314,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(MOVK_BODY), translate))
     fixtures.append((with_constants(HALF_BODY), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
+    fixtures.extend((with_constants(body), translate) for body, *_ in E64_ARITH)
+    fixtures.extend((predicate_group_e64(first), translate) for first in range(0, 16, 4))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((unpack_bytes(), translate))
     fixtures.append((scheduling_hints(), translate))
@@ -2520,7 +2583,7 @@ def check_unpack_byte_draws(directory, compiler, renderer, backend):
         raise AssertionError("Reading the wrong byte escaped detection")
 
 
-def check_render(directory, compiler, renderer, backend):
+def check_render(directory, compiler, renderer, backend, *, core_only=False):
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"
@@ -2612,6 +2675,15 @@ def check_render(directory, compiler, renderer, backend):
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError("Stale reference accepted after changing the bound constants")
 
+    if core_only:
+        return 0
+    check_predicate_and_rounding_draws(directory, compiler, renderer, backend)
+    return check_blend_and_scalar_draws(directory, compiler, renderer, backend)
+
+
+def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
+    source = directory / "fixture.hlsl"
+    shader = directory / "fixture.cso"
     program = truncate_values()
     source.write_text(translate(program), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
@@ -2668,6 +2740,12 @@ def check_render(directory, compiler, renderer, backend):
     check_int_predicate_draws(directory, compiler, renderer, backend)
     check_sdwa_predicate_draws(directory, compiler, renderer, backend)
     check_literal_fma_draw(directory, compiler, renderer, backend)
+    return 0
+
+
+def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
+    source = directory / "fixture.hlsl"
+    shader = directory / "fixture.cso"
     capture = directory / "blend.rgba"
     draw = [renderer, backend, "--dual-pixel", shader, capture]
     for case in DUAL_CASES:
@@ -2728,6 +2806,18 @@ def check_render(directory, compiler, renderer, backend):
     return 0
 
 
+def check_e64_render(directory, compiler, renderer, backend):
+    """The e64 draw cases on their own, so they run as a separate CTest entry per backend. A renderer that reports an
+    unavailable adapter (exit 77) makes this a skip, as for the other pixel draws."""
+    try:
+        check_e64_draws(directory, compiler, renderer, backend)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 77:
+            return 77
+        raise
+    return 0
+
+
 def main():
     if len(sys.argv) == 1:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2736,17 +2826,28 @@ def main():
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
+        if mode in ("draw-blend-scalar", "draw-predicate-rounding"):
+            try:
+                draw = check_blend_and_scalar_draws if mode == "draw-blend-scalar" else check_predicate_and_rounding_draws
+                return draw(directory, *args)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
+                    return 77
+                raise
+        if mode == "draw-e64":
+            # The controls already run in the binary and draw modes; this mode only draws.
+            return check_e64_render(directory, *args)
         check_controls(directory)
         if mode == "binary":
             check_binary(directory, *args)
-        elif mode == "draw":
-            return check_render(directory, *args)
+        elif mode in ("draw", "draw-core"):
+            return check_render(directory, *args, core_only=mode == "draw-core")
         elif mode == "three-way":
             return check_three_way_draw(directory, *args)
         elif mode == "buffer-color":
             return check_buffer_color_draw(directory, *args)
         else:
-            raise ValueError("Expected binary, draw, three-way or buffer-color mode")
+            raise ValueError("Expected binary, draw, draw-e64, three-way or buffer-color mode")
 
 
 if __name__ == "__main__":
