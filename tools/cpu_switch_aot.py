@@ -22,8 +22,9 @@ translated function with the same number of arguments. Stack arguments (the
 fifth and later) and floating-point arguments are not supported.
 
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
-CMOVcc) in one straight-line run that no edge enters. Instructions that leave
-the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc) may sit between them.
+CMOVcc) in one straight-line run that no edge enters. Overflow and low-byte
+parity conditions use the producer operand width, including narrow arithmetic.
+Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc) may sit between them.
 
 A forward pass records how many low bytes (0, 1, 2 or 8) of each register every
 path defines. A read needs as many defined bytes as it uses, and an 8- or 16-bit
@@ -92,7 +93,8 @@ CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
 FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC}
 FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC}
 MAX_FLAG_DISTANCE = 16
-CONDITIONS = {CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
+CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
+              CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
               CC.L: "l", CC.GE: "ge", CC.LE: "le", CC.G: "g", CC.S: "s", CC.NS: "ns"}
 MAX_CASES = 1024
 MAX_INSTRUCTIONS = 4096
@@ -457,6 +459,30 @@ class Lifter:
                 table.update({"b": "false", "ae": "true", "be": f"{result} == 0", "a": f"{result} != 0",
                               "l": table["s"], "ge": table["ns"],
                               "le": f"{result} == 0 || {table['s']}", "g": f"{result} != 0 && {table['ns']}"})
+        # PF is even parity of only the low result byte. OF is signed overflow,
+        # independent of the host's signed arithmetic and its overflow rules.
+        a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
+        sign = f"{1 << (width * 8 - 1):#x}ull"
+        if producer.mnemonic in (M.CMP, M.SUB, M.ADD):
+            operator = "+" if producer.mnemonic == M.ADD else "-"
+            flag_result = f"static_cast<{u}>({a} {operator} {b})"
+            same_sign = f"~({a} ^ {b})" if producer.mnemonic == M.ADD else f"({a} ^ {b})"
+            overflow = f"(({same_sign} & ({a} ^ {flag_result}) & {sign}) != 0)"
+            if producer.mnemonic == M.ADD:
+                # ADD now snapshots its operands, rather than just its result.
+                table.update({"e": f"{flag_result} == 0", "ne": f"{flag_result} != 0",
+                              "s": f"static_cast<{s}>({flag_result}) < 0",
+                              "ns": f"static_cast<{s}>({flag_result}) >= 0"})
+        else:
+            flag_result = f"static_cast<{u}>(fa)"
+            if producer.mnemonic == M.INC:
+                overflow = f"{flag_result} == {sign}"
+            elif producer.mnemonic == M.DEC:
+                overflow = f"{flag_result} == {((1 << (width * 8 - 1)) - 1):#x}ull"
+            else:
+                overflow = "false"  # TEST, AND, OR and XOR clear OF.
+        table.update({"o": overflow, "no": f"!({overflow})",
+                      "p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
         if code not in table:
             raise ValueError(f"unsupported condition after {producer.mnemonic} at RVA {jcc.ip:#x}")
         return table[code]
@@ -527,7 +553,7 @@ class Lifter:
             lines = []
             if sets_flags:
                 self.flags = True
-                if mnemonic in (M.CMP, M.SUB):
+                if mnemonic in (M.CMP, M.SUB, M.ADD):
                     lines.append(f"fa = {a}; fb = {b};")
                 else:
                     lines.append(f"fa = static_cast<{unsigned(width)}>({a} {operator} {b});")
@@ -927,6 +953,11 @@ PRELUDE = """#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 using word = std::uint64_t;
+static inline bool even_parity(word value) {
+    // Fold the low byte into a nibble; bit n of 0x6996 is its odd parity.
+    const auto folded = static_cast<unsigned>((value ^ (value >> 4)) & 15u);
+    return ((0x6996u >> folded) & 1u) == 0;
+}
 template <class T> static T load(word address) {
     T value;
     std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
