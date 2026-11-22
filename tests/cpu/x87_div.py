@@ -364,7 +364,7 @@ def check_rejections():
         "fidivr m16": (attempt(f"{fld} de 39 {fstp} c3"), "unsupported x87 operation"),
         "fsqrt": (attempt(f"{fld} d9 fa {fstp} c3"), "unsupported x87 operation"),
         "fprem": (attempt(f"{fld} {fld} d9 f8 {fstp} {fstp} c3"), "unsupported x87 operation"),
-        "fadd m32": (attempt(f"{fld} d8 01 {fstp} c3"), "unsupported x87 operation"),
+        "fiadd m32": (attempt(f"{fld} da 01 {fstp} c3"), "unsupported x87 operation"),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:
