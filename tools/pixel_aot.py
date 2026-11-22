@@ -282,6 +282,19 @@ float ldexp32(float value, int delta) {
     }
     return asfloat(sign | ((uint)e << 23) | mant);
 }
+// v_sin_f32 and v_cos_f32 take revolutions: sin(2 * pi * x). Removing the nearest integer is exact in
+// binary32 and keeps the radian argument within [-pi, pi], where D3D bounds the sin and cos error;
+// x * 2 * pi on the unreduced input would round away the fraction of a large argument. Inputs of at
+// most half a turn pass unchanged, so -0 keeps its sign. An infinity reduces to NaN.
+float turns(float value) {
+    return abs(value) > 0.5f ? value - round(value) : value;
+}
+float sin32(float value) {
+    return sin(turns(value) * 6.28318548f);
+}
+float cos32(float value) {
+    return cos(turns(value) * 6.28318548f);
+}
 // Finite binary32 to binary16, round toward zero, then widen for the float target.
 float export16(float value) {
     uint h = f32tof16(value);
@@ -347,6 +360,7 @@ ALU = {
     "floor": (1, "floor({0})"), "ceil": (1, "ceil({0})"), "fract": (1, "fract32({0})"),
     "trunc": (1, "trunc({0})"), "frexp_mant": (1, "frexp_mant32({0})"),
     "rndne": (1, "round({0})"),  # HLSL round is DXIL Round_ne: ties to even
+    "sin": (1, "sin32({0})"), "cos": (1, "cos32({0})"),
     "add": (2, "({0} + {1})"), "mul": (2, "({0} * {1})"),
     "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
     "subrev": (2, "({1} - {0})"),
