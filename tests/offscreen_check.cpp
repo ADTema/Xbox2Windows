@@ -380,7 +380,7 @@ int main(int argc, char** argv)
     } else if ((operation == "--depth-mask" || operation == "--depth-mask-swapped")) {
         if (argc != 6) return 2;
     } else if (operation == "--spirv-compare-sampler") {
-        if (argc != 6) return 2;
+        if (argc != 6 && argc != 7) return 2;
     } else if (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion" ||
                operation == "--spirv-address-window" || operation == "--spirv-sampler-views") {
         if (argc != 4) return 2;
@@ -485,7 +485,7 @@ int main(int argc, char** argv)
                 std::puts("skip: comparison-sampler fixture requires SM 6.6");
                 return 77;
             }
-            check_spirv_compare_sampler(device.Get(), argv[3], argv[4], argv[5]);
+            check_spirv_compare_sampler(device.Get(), argv[3], argv[4], argv[5], argc == 7 ? argv[6] : nullptr);
         } else if (argc == 4 && (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
             check_compute_file(device.Get(), argv[3], operation == "--ffx-immediate-conversion");
         } else if (argc == 5 && operation == "--compute-store-case") {

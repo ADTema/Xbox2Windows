@@ -121,27 +121,45 @@ def compile_dxil(directory, dxc, outputs):
     return dxil
 
 
+def with_words(**words):
+    reference = EXPECTED.copy()
+    for index, value in words.items():
+        reference[int(index[1:])] = value
+    return reference
+
+
+# (name, descriptor variant, reference, mismatching words reported on stderr)
+DRAWS = [
+    ("baseline", "baseline", EXPECTED, []),
+    # Wrong reference: claim the failing comparison passed.
+    ("wrong reference", "baseline", with_words(w1=0x3f800000), ["word=1 expected=3f800000 actual=00000000"]),
+    # s2 switched to GREATER: only the two comparison words change, against the baseline reference.
+    ("comparison descriptor vs baseline", "comparison-greater", EXPECTED,
+     ["word=0 expected=3f800000 actual=00000000", "word=1 expected=00000000 actual=3f800000"]),
+    ("comparison descriptor", "comparison-greater", with_words(w0=0x00000000, w1=0x3f800000), []),
+    # Ordinary sampler clamped to MinLOD 1: only the ordinary word changes, to t1's 1x1 mip (0.625).
+    ("ordinary descriptor vs baseline", "ordinary-min-lod1", EXPECTED,
+     ["word=2 expected=3ec00000 actual=3f200000"]),
+    ("ordinary descriptor", "ordinary-min-lod1", with_words(w2=0x3f200000), []),
+]
+
+
 def draw(directory, dxil, renderer, adapter):
-    for wrong in (False, True):
-        expected = EXPECTED.copy()
-        if wrong:
-            expected[1] = 0x3f800000  # claim the failing comparison passed
-        reference = directory / "reference.bin"
+    reference = directory / "reference.bin"
+    for name, variant, expected, mismatches in DRAWS:
         reference.write_bytes(struct.pack("<16I", *expected))
-        run = subprocess.run([renderer, adapter, "--spirv-compare-sampler", dxil, str(ORDINARY_BINDING), reference],
-                             capture_output=True, text=True)
-        print(run.stdout, run.stderr, flush=True)
-        if run.returncode == 77 and not wrong:
+        run = subprocess.run([renderer, adapter, "--spirv-compare-sampler", dxil, str(ORDINARY_BINDING), reference,
+                              variant], capture_output=True, text=True)
+        print(f"[{name}]", run.stdout, run.stderr, flush=True)
+        if run.returncode == 77 and name == "baseline":
             return 77
-        if wrong:
-            ok = (run.returncode == 1 and "compared_words=16 mismatches=1" in run.stdout
-                  and "word=1 expected=3f800000 actual=00000000" in run.stderr)
-        else:
-            ok = (run.returncode == 0 and "outputs=3f800000,00000000,3ec00000" in run.stdout
-                  and "compared_words=16 mismatches=0" in run.stdout)
-        if not ok:
-            raise RuntimeError("Unexpected wrong-reference result" if wrong else "Unexpected comparison-sampler readback")
-    print("wrong-reference control: exactly one mismatch at word 1", flush=True)
+        reported = [line for line in run.stderr.splitlines() if line.startswith("word=")]
+        if (run.returncode != int(bool(mismatches)) or reported != mismatches
+                or f"descriptors={variant} " not in run.stdout
+                or f"compared_words=16 mismatches={len(mismatches)}" not in run.stdout):
+            raise RuntimeError(f"Unexpected {name} readback")
+    print("wrong reference fails only at word 1; s2 changes only words 0-1; "
+          f"s{ORDINARY_BINDING} changes only word 2", flush=True)
     return 0
 
 
