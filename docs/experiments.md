@@ -1017,6 +1017,24 @@ A local scan of the inspected package's 16 DLLs together with this `xmem.dll` (`
 | `xmem_shim_query` | Graphics memory from `XMemAlloc` passes both BVH predicates and keeps the sentinel after `+0x30`, through the pseudo-handle and a real handle. After `XMemFree` the address reads as `MEM_FREE` with a clear tail. Heap memory fails the tail check, and an address outside user space returns `FALSE` without touching the buffer. |
 | `xmem_shim_working_set` | Returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the output untouched, so the callers' value is zero. |
 
+### Desktop d3d12_xs.dll
+
+`src/d3d12_xs_shim.cpp` builds `d3d12_xs.dll`, exporting the two root-signature functions that remained unresolved across the 16 package DLLs after `xmem.dll`:
+
+| Export | Observed call shape | Desktop handling |
+|---|---|---|
+| `D3D12SerializeVersionedRootSignature` | `XboxBvhBuilder.dll` (`0xc2d0`/`0xc32f`) copies a 48-byte descriptor, sets console flag bits `0x03000000` at `+0x28`, and passes a null error blob. | Clears only the observed `0x03000000` bits in a local copy for v1.0/v1.1 descriptors before calling desktop `d3d12.dll`. Unobserved invalid flag bits stay untouched so desktop `d3d12.dll` still returns `E_INVALIDARG`. |
+| `D3D12CreateRootSignatureDeserializer` | `amd_fidelityfx_upscaler_xbox.dll` (`0x4f88`) passes a pointer and length from an embedded container plus an interface IID and output address. | Forwards directly to desktop `d3d12.dll`. |
+
+This covers only the two root-signature imports observed in the pre-executable DLL inventory. Any `d3d12_xs.dll` APIs imported by a future main executable remain separate work.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `d3d12_xs_shim_exports` | Both names resolve through `GetProcAddress` inside `d3d12_xs.dll`, and the test's named import accepts `0x03000000` while desktop `d3d12.dll` rejects it with `E_INVALIDARG`. |
+| `d3d12_xs_shim_serialize` | Baseline and console-tagged (`0x01000000`, `0x02000000`, `0x03000000`) v1.1 and v1.0 descriptors serialize identically to desktop `d3d12.dll` without mutating caller input while preserving desktop flags. Unobserved flag bits (`0x04000000`, `0x07000000`, `0x08000000`) return `E_INVALIDARG`, and a null descriptor or unknown version fails with the same HRESULT as desktop `d3d12.dll`. |
+| `d3d12_xs_shim_deserialize` | Round-trips a sanitized blob from `d3d12_xs.dll` and reads the embedded `RTS0` part of `pso_compute_embedded`; rejects `pso_compute_stripped` and empty/null buffers with `E_INVALIDARG`. |
+| `d3d12_xs_shim_warp_root` | Serializes a v1.1 `SRV(t0),UAV(u0),RootConstants(16,b0)` descriptor tagged with `0x03000000` through `d3d12_xs.dll` (verified rejected by desktop `d3d12.dll`), creates a WARP `ID3D12RootSignature`, and builds a compute PSO with `pso_compute_stripped`. |
+
 ### Attribute words at xmem call sites
 
 `tools/xmem_attribute_scan.py` reads a PE image without loading or running it. It reports the attribute word at each call or tail jump into `xmem.dll`'s `XMemAlloc` or `XMemFree`, from a normal or delay-load import. It finds sites reached through the IAT slot, through an import thunk, or through a register loaded from the slot.
