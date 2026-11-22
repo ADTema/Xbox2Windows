@@ -25,6 +25,11 @@ SOPC_OPS = (
     "s_bitcmp0_b32", "s_bitcmp1_b32",
     "s_bitcmp0_b64", "s_bitcmp1_b64",
 )
+VOP2_INT_OPS = (
+    "v_lshrrev_b32_e32", "v_ashrrev_i32_e32", "v_lshlrev_b32_e32",
+    "v_and_b32_e32", "v_or_b32_e32", "v_xor_b32_e32",
+    "v_add_nc_u32_e32", "v_sub_nc_u32_e32",
+)
 
 
 def lower(instructions, *args, **kwargs):
@@ -1680,6 +1685,20 @@ def sopc_group() -> list[str]:
     return with_constants(body)
 
 
+def vop2_integer_group() -> list[str]:
+    return with_constants([
+        "v_mov_b32_e32 v18, s45",
+        "v_lshrrev_b32_e32 v12, s44, v18",
+        "v_ashrrev_i32_e32 v13, s44, v18",
+        "v_lshlrev_b32_e32 v14, s44, v18",
+        "v_and_b32_e32 v15, s44, v18",
+        "v_or_b32_e32 v12, s44, v18",
+        "v_xor_b32_e32 v13, s44, v18",
+        "v_add_nc_u32_e32 v14, s44, v18",
+        "v_sub_nc_u32_e32 v15, s44, v18",
+    ])
+
+
 def check_controls(directory):
     program = bitwise_program()
     for before, after in (("s44, v18", "s44, |v18|"), ("20, v19", "20, v19 clamp"),
@@ -1727,6 +1746,29 @@ def check_controls(directory):
         "s_cmp_eq_u64 s[105:106], s[46:47]",
     ):
         must_reject(translate, with_constants([bad_sopc]))
+    vop2_source = translate(vop2_integer_group())
+    assert set(VOP2_INT_OPS) <= ACCEPTED
+    for expected in (
+        "(asuint(alu20) >> (asuint(params[0].w) & 31u))",
+        "asuint(asint(asuint(alu20)) >> (asuint(params[0].w) & 31u))",
+        "(asuint(alu20) << (asuint(params[0].w) & 31u))",
+        "(asuint(params[0].w) & asuint(alu20))",
+        "(asuint(params[0].w) | asuint(alu20))",
+        "(asuint(params[0].w) ^ asuint(alu20))",
+        "(asuint(params[0].w) + asuint(alu20))",
+        "(asuint(params[0].w) - asuint(alu20))",
+    ):
+        assert expected in vop2_source, expected
+    for bad_vop2 in (
+        "v_add_nc_u32_e64 v12, s44, v18",
+        "v_sub_nc_u32_e64 v12, s44, v18",
+        "v_sub_nc_u32_e32 v12, abs(v18), v18",
+        "v_and_b32_e32 v12, -v18, v18",
+        "v_and_b32_e32 v12, abs(v18), v18",
+        "v_and_b32_e32 v12, v106, v18",
+        "v_and_b32_e32 v12, s44, v106",
+    ):
+        must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop2]))
     # v_cvt_f32_f16 widens the low half through widen16 and applies modifiers after widening.
     body = translate(with_constants(HALF_BODY)).split("float4 main", 1)[1]
     assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body
