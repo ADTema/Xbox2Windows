@@ -1153,6 +1153,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_avx2_shifts COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx2_shifts.py"
         check "$<TARGET_FILE:cpu_avx2_shifts>" "$<TARGET_FILE:cpu_avx2_shifts_lifted>")
     set_tests_properties(cpu_aot_avx2_shifts PROPERTIES SKIP_RETURN_CODE 77)
+
+    cpu_asm_fixture(cpu_sse41_int sse41_int)
+    set(sse41_int_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse41_int_lifted.cpp")
+    add_custom_command(OUTPUT "${sse41_int_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse41_int.py"
+            emit "$<TARGET_FILE:cpu_sse41_int>" "${sse41_int_fixture}"
+        DEPENDS cpu_sse41_int tests/cpu/sse41_int.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_sse41_int_lifted SHARED "${sse41_int_fixture}")
+    add_test(NAME cpu_aot_sse41_int COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse41_int.py"
+        check "$<TARGET_FILE:cpu_sse41_int>" "$<TARGET_FILE:cpu_sse41_int_lifted>")
+    set_tests_properties(cpu_aot_sse41_int PROPERTIES SKIP_RETURN_CODE 77)
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
