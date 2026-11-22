@@ -35,7 +35,7 @@ defined bytes and does not establish a source-language type. It is None when no
 RET is reachable, which describes the reachable control flow and makes no
 termination claim. The generated source states the width unless it is 8.
 
-A function that makes no call may use its stack. A forward pass gives RSP at
+A function may use its stack. A forward pass gives RSP at
 every instruction as entry RSP plus a constant that must agree at joins and be
 0 at every RET. PUSH and POP of a nonvolatile register and SUB or ADD RSP by a
 multiple of 8 are the only changes of RSP accepted; any other write of RSP is a
@@ -54,6 +54,28 @@ entry values are not arguments: one may only be saved, and its saved bytes
 only restored into the same register. The generated function is C++ that the
 host compiler gives its own frame, so exception unwinding through the original
 frame layout is not reproduced.
+
+A direct CALL, and a direct JMP that leaves the function for another function's
+entry (a tail jump), are translated by RVA into the same source: each callee
+once, as a static function named fn_<rva> that takes RCX, RDX, R8 and R9,
+defined before its first caller. A target must be the first byte of a verified
+primary runtime function (unchained, version 1 or 2 unwind data, executable) or
+a non-forwarded code export that no other function's interval holds; chained
+ranges, interior labels, forwarded and data exports are refused. A call
+to the caller's own entry and any call cycle are refused, and a caller is
+refused when any callee is. A callee records how many low bytes of each argument
+register it may read before writing it, and the caller must define them at the
+call. After a call RAX holds the callee's return width of defined bytes; the
+other volatile registers, the flags and the callee's 32-byte home space at RSP
+are undefined, and the nonvolatile registers and the rest of the frame,
+including the caller's own home space above entry RSP, are kept. The return
+address and the callee's frame lie below RSP, where every byte is already
+undefined because the frame proof forgets the bytes that ADD RSP and POP leave
+below RSP. RSP must be 8
+mod 16 from entry at a call, with the callee's home space below the return
+address. A tail jump is checked as a RET and contributes the callee's return
+width. The callee's frame is its own array, so no frame address crosses a call,
+and stack arguments stay refused.
 """
 
 import argparse
@@ -79,10 +101,15 @@ VOLATILE = {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 NONVOLATILE = tuple(sorted(set(NAMES) - VOLATILE - {R.RSP}))  # RBX, RBP, RSI, RDI, R12-R15
 # The caller's home space ends 40 bytes above entry RSP: 8 for the return address and 32 reserved.
 HOME_END = 40
-# Bytes of the frame array. MSVC calls __chkstk before it allocates a page (4096 bytes) or more, and calls are
-# rejected, so the frame of a call-free MSVC function stays below a page.
+# Bytes of the frame array. MSVC calls __chkstk before it allocates a page (4096 bytes) or more, and that
+# call's target has no unwind entry, so an accepted MSVC frame stays below a page.
 MAX_FRAME = 4096
+# The home space a callee may write: the 32 bytes at RSP when the CALL executes.
+HOME_SIZE = 32
 HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
+# Flow that continues at the next instruction (a direct call does once its callee returns).
+STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL)
+MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
@@ -139,10 +166,106 @@ def owned_ranges(pe, entry):
     return [(section.VirtualAddress, end)], records
 
 
+def executable(pe, rva):
+    section = pe.get_section_by_rva(rva)
+    return bool(section and section.Characteristics & 0x20000000)
+
+
+class Entries:
+    """The RVAs of this image that a direct call or tail jump may treat as a function.
+
+    An entry is the first byte of a verified primary runtime function (an unchained record with a
+    version 1 or 2 unwind header, a non-empty interval and executable code) or a non-forwarded code
+    export (an export outside the export directory, in an executable section and not inside any
+    runtime-function interval except at a primary start). Chained secondary ranges, interior labels,
+    forwarded exports and data exports are not entries."""
+
+    MAX_CHAIN = 32
+
+    def __init__(self, pe):
+        table = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+        data = image_bytes(pe, table.VirtualAddress, table.Size - table.Size % 12) if table.Size >= 12 else b""
+        self.records = list(struct.iter_unpack("<III", data))
+        self.primary = set()
+        self.unverified = set()  # unchained records whose unwind header or interval fails the check
+        self.parents = {}  # begin of a chained record -> begin of the record it continues
+        for begin, end, info in self.records:
+            try:
+                header = image_bytes(pe, info, 4)
+            except ValueError:
+                self.unverified.add(begin)
+                continue
+            version, flags = header[0] & 7, header[0] >> 3
+            if flags & 4:
+                trailer = info + 4 + ((header[2] + 1) & ~1) * 2
+                try:
+                    self.parents[begin] = struct.unpack("<III", image_bytes(pe, trailer, 12))[0]
+                except ValueError:
+                    self.parents[begin] = None
+            elif version in (1, 2) and begin < end and executable(pe, begin):
+                self.primary.add(begin)
+            else:
+                self.unverified.add(begin)
+        pe.parse_data_directories(directories=[0])
+        directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]
+        exports = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
+        self.exports = {}
+        for symbol in (exports.symbols if exports else ()):
+            rva = symbol.address
+            if not rva:
+                continue
+            if symbol.forwarder or directory.VirtualAddress <= rva < directory.VirtualAddress + directory.Size:
+                kind = "forward"
+            elif not executable(pe, rva):
+                kind = "data"
+            else:
+                kind = "code"
+            # A forwarder or data kind wins over code for the same RVA.
+            if self.exports.get(rva) in (None, "code"):
+                self.exports[rva] = kind
+        self.entries = set(self.primary)
+        self.entries.update(rva for rva, kind in self.exports.items()
+                            if kind == "code" and self.owner(rva) is None)
+
+    def root(self, begin):
+        for _ in range(self.MAX_CHAIN):
+            if begin not in self.parents or self.parents[begin] is None:
+                return begin
+            begin = self.parents[begin]
+        return begin
+
+    def owner(self, rva):
+        """The primary function whose runtime-function interval holds rva, or None."""
+        for begin, end, _ in self.records:
+            if begin <= rva < end:
+                return self.root(begin)
+        return None
+
+    def __contains__(self, rva):
+        return rva in self.entries
+
+    def why_not(self, rva):
+        kind = self.exports.get(rva)
+        if kind == "forward":
+            return "a forwarded export"
+        if kind == "data":
+            return "a data export in a non-executable section"
+        if rva in self.parents:
+            return f"the start of a chained range of the function at {self.root(rva):#x}"
+        if rva in self.unverified:
+            return "a runtime function whose unwind data is not version 1 or 2 in executable code"
+        owner = self.owner(rva)
+        if owner is not None:
+            label = "an exported label" if kind else "an address"
+            return f"{label} inside the function at {owner:#x}"
+        return "no runtime-function entry or export"
+
+
 class Function:
-    def __init__(self, pe, entry):
+    def __init__(self, pe, entry, entries=None):
         self.pe = pe
         self.entry = entry
+        self.entries = entries if entries is not None else Entries(pe)
         ranges, self.foreign = owned_ranges(pe, entry)
         self.ranges = [(begin, end, image_bytes(pe, begin, end - begin, executable=True))
                        for begin, end in ranges]
@@ -151,6 +274,44 @@ class Function:
         self.ending = {}
         self.successors = {}
         self.dispatches = {}
+        # Direct calls and tail jumps to other functions, by the RVA of the CALL or JMP.
+        self.calls = {}
+        self.tails = {}
+
+    def leaves_for(self, ins):
+        """Whether a JMP out of this function is a tail jump. A target the image names as a function
+        start (a runtime-function record or an export) that is not an entry is refused here."""
+        target = ins.near_branch_target
+        if target in self.entries:
+            return True
+        named = target in self.entries.exports or any(begin == target for begin, _, _ in self.entries.records)
+        if named and target != self.entry:
+            raise ValueError(f"jump target {target:#x} is not a function entry ({self.entries.why_not(target)}) "
+                             f"at RVA {ins.ip:#x}")
+        return False
+
+    def owns(self, ip):
+        return (any(begin <= ip < end for begin, end, _ in self.ranges)
+                and not any(start <= ip < stop for start, stop in self.foreign))
+
+    def callee(self, ins):
+        """Validate the target of a direct CALL as the entry of another function in the image."""
+        target = ins.near_branch_target
+        if target == self.entry:
+            raise ValueError(f"self-recursion at RVA {ins.ip:#x}")
+        if not 0 <= target < self.pe.OPTIONAL_HEADER.SizeOfImage:
+            raise ValueError(f"call target outside the image at RVA {ins.ip:#x}")
+        section = self.pe.get_section_by_rva(target)
+        if target not in self.entries and self.entries.exports.get(target) in ("forward", "data"):
+            raise ValueError(f"call target {target:#x} is not a function entry ({self.entries.why_not(target)}) "
+                             f"at RVA {ins.ip:#x}")
+        if not section or not section.Characteristics & 0x20000000:
+            raise ValueError(f"call target {target:#x} is not in an executable section at RVA {ins.ip:#x}")
+        if target not in self.entries:
+            # A leaf without unwind data or an import thunk has no entry that the image records.
+            raise ValueError(f"call target {target:#x} is not a function entry ({self.entries.why_not(target)}) "
+                             f"at RVA {ins.ip:#x}")
+        return target
 
     def decode(self, ip):
         for begin, end, data in self.ranges:
@@ -194,8 +355,16 @@ class Function:
                 targets = [ins.next_ip]
             elif flow == FlowControl.CONDITIONAL_BRANCH and ins.is_jcc_short_or_near:
                 targets = [ins.near_branch_target, ins.next_ip]
+            elif (flow == FlowControl.UNCONDITIONAL_BRANCH and ins.is_jmp_short_or_near
+                  and not self.owns(ins.near_branch_target) and self.leaves_for(ins)):
+                # A jump to another function's entry outside this one is a tail call.
+                self.tails[ip] = ins.near_branch_target
+                targets = []
             elif flow == FlowControl.UNCONDITIONAL_BRANCH and ins.is_jmp_short_or_near:
                 targets = [ins.near_branch_target]
+            elif flow == FlowControl.CALL and ins.is_call_near:
+                self.calls[ip] = self.callee(ins)
+                targets = [ins.next_ip]
             elif flow == FlowControl.RETURN and ins.mnemonic == M.RET and (ins.op_count == 0 or ins.immediate(0) == 0):
                 targets = []
             elif flow == FlowControl.INDIRECT_BRANCH and ins.op0_kind == OpKind.REGISTER:
@@ -207,7 +376,7 @@ class Function:
             pending.extend(reversed(targets))
         edges = {target for ip, targets in self.successors.items() for target in targets
                  if target != self.instructions[ip].next_ip
-                 or self.instructions[ip].flow_control not in (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH)}
+                 or self.instructions[ip].flow_control not in STRAIGHT}
         # A conditional branch to its own fallthrough still emits a goto, so its target needs a label.
         edges |= {ins.near_branch_target for ins in self.instructions.values()
                   if ins.flow_control == FlowControl.CONDITIONAL_BRANCH}
@@ -234,6 +403,8 @@ class Function:
             known = dict(state[ip])
             if ip in self.dispatches:
                 known.pop(self.dispatches[ip][4], None)
+            elif ip in self.calls:
+                known = {r: v for r, v in known.items() if r not in VOLATILE}
             elif ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register):
                 known[ins.op0_register] = ins.ip_rel_memory_address
             elif ins.op_count and ins.op0_kind == OpKind.REGISTER and ins.mnemonic not in (M.CMP, M.TEST):
@@ -656,9 +827,13 @@ class Frame:
         work = [function.entry]
         while work:
             ip = work.pop()
-            after = self.step(function.instructions[ip], self.offsets[ip])
-            if after > self.offsets[ip]:
-                self.released[ip] = (self.offsets[ip], after)
+            if ip in function.calls or ip in function.tails:
+                # The callee pops its return address; call sites are checked by check_call_sites.
+                after = self.offsets[ip]
+            else:
+                after = self.step(function.instructions[ip], self.offsets[ip])
+                if after > self.offsets[ip]:
+                    self.released[ip] = (self.offsets[ip], after)
             for successor in function.successors[ip]:
                 if successor not in self.offsets:
                     self.offsets[successor] = after
@@ -749,6 +924,13 @@ def prove_frame(function, order, effects, frame):
     saved = {register: bytes(range(2 + 8 * i, 10 + 8 * i)) for i, register in enumerate(NONVOLATILE)}
 
     def step(ip, status, data):
+        if ip in function.calls:
+            # The callee may write its home space, the 32 bytes at RSP. The CALL's return address and the
+            # callee's frame lie below RSP, where every byte is already 0: no access is below RSP, and the
+            # bytes that ADD RSP and POP leave below RSP become 0. The rest of the frame, including this
+            # function's own home space above entry RSP, is kept.
+            index = frame.offsets[ip] - frame.start
+            return status, data[:index] + bytes(HOME_SIZE) + data[index + HOME_SIZE:]
         status, restored = dict(zip(NONVOLATILE, status)), None
         if ip in frame.accesses:
             offset, width, reads, writes = frame.accesses[ip]
@@ -794,11 +976,12 @@ def prove_frame(function, order, effects, frame):
                 raise ValueError(f"undefined stack byte at entry RSP{offset + got.index(0):+#x} at RVA {ip:#x}")
             raise ValueError(f"stack bytes at entry RSP{offset:+#x} hold the saved "
                              f"{NAMES[NONVOLATILE[(max(got) - 2) // 8]]}, read as data at RVA {ip:#x}")
-        if ins.mnemonic == M.RET:
+        if ins.mnemonic == M.RET or ip in function.tails:
+            site = "tail jump" if ip in function.tails else "RET"
             for register, value in status.items():
                 if value != "entry":
                     raise ValueError(f"nonvolatile register {NAMES[register]} is not restored on every path to "
-                                     f"the RET at RVA {ip:#x}")
+                                     f"the {site} at RVA {ip:#x}")
 
 
 def flag_producer(function, edges, consumer):
@@ -806,6 +989,8 @@ def flag_producer(function, edges, consumer):
     current = consumer
     for _ in range(MAX_FLAG_DISTANCE):
         before = function.ending.get(current.ip)
+        if before is not None and before.ip in function.calls:
+            raise ValueError(f"flags clobbered by the call at RVA {before.ip:#x} are read at RVA {consumer.ip:#x}")
         if (current.ip in edges or current.ip == function.entry or before is None
                 or before.flow_control != FlowControl.NEXT):
             raise ValueError(f"flags cross a join before RVA {consumer.ip:#x}")
@@ -817,23 +1002,119 @@ def flag_producer(function, edges, consumer):
     raise ValueError(f"flag producer too far before RVA {consumer.ip:#x}")
 
 
-def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
-    """Translate one export that takes the given number of integer arguments, 3 or 4."""
+def check_call_sites(function, offsets):
+    """The frame conditions of direct calls and tail jumps, given RSP before each instruction as an
+    offset from entry RSP."""
+    for ip in sorted({**function.calls, **function.tails}):
+        if ip in function.tails and offsets[ip] != 0:
+            raise ValueError(f"stack not balanced at tail jump RVA {ip:#x}: RSP is entry RSP{offsets[ip]:+#x}")
+        if ip in function.calls and (offsets[ip] % 16 != 8 or offsets[ip] + HOME_SIZE > 0):
+            # Entry RSP is 8 mod 16, and the callee's home space must lie below the return address.
+            raise ValueError(f"call without an aligned home space at entry RSP{offsets[ip]:+#x} at RVA {ip:#x}")
+
+
+def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None):
+    """Translate one export that takes the given number of integer arguments, 3 or 4.
+
+    Functions it reaches through direct calls and tail jumps are translated into program."""
     if not isinstance(arguments, int) or arguments not in ARGUMENT_COUNTS:
         raise ValueError(f"unsupported argument count {arguments!r} for export {name}: expected 3 or 4")
     entry = export_rva(pe, name)
-    function = Function(pe, entry)
-    function.arguments = ARGUMENT_REGISTERS[:arguments]
+    program = program or Program(pe)
+    return program.lift(entry, f"lifted_{name}", ARGUMENT_REGISTERS[:arguments])
+
+
+class Program:
+    """The functions of one image reached from the requested exports through direct calls and tail
+    jumps. Each callee is translated once, in internal mode, and its source precedes its callers'."""
+
+    def __init__(self, pe):
+        self.pe = pe
+        self.entries = Entries(pe)
+        self.active = []
+        self.callees = {}
+        self.refused = {}
+        self.sources = []
+
+    def lift(self, entry, symbol, arguments, internal=False):
+        self.active.append(entry)
+        try:
+            return lift_function(self, entry, symbol, arguments, internal)
+        finally:
+            self.active.pop()
+
+    def callee(self, target, ip):
+        if target in self.refused:
+            raise ValueError(f"callee at RVA {target:#x} refused: {self.refused[target]}")
+        if target in self.callees:
+            return self.callees[target]
+        if target in self.active:
+            cycle = self.active[self.active.index(target):] + [target]
+            raise ValueError(f"mutual recursion: call cycle {' -> '.join(f'{rva:#x}' for rva in cycle)} "
+                             f"at RVA {ip:#x}")
+        if len(self.callees) >= MAX_CALLEES:
+            raise ValueError(f"callee limit reached at RVA {ip:#x}")
+        try:
+            source, function = self.lift(target, f"fn_{target:x}", ARGUMENT_REGISTERS, internal=True)
+        except ValueError as error:
+            self.refused[target] = str(error)
+            raise ValueError(f"callee at RVA {target:#x} refused: {error}") from None
+        if function.return_width is None:
+            error = "no reachable normal return"
+            self.refused[target] = error
+            raise ValueError(f"callee at RVA {target:#x} refused: {error}")
+        self.callees[target] = function
+        self.sources.append(source)
+        return function
+
+
+def argument_demands(function, order, effects):
+    """Low bytes of each argument register that the function may read while it may still hold the
+    value passed at entry. Any write of 32 or 64 bits ends that value; an 8- or 16-bit write keeps
+    the rest of it, so a later wider read still counts. Joins take the union."""
+    holding = {function.entry: frozenset(function.arguments)}
+    demands = {}
+    changed = True
+    while changed:
+        changed = False
+        for ip in order:
+            if ip not in holding:
+                continue
+            reads, writes, kills = effects[ip]
+            for r, width in reads.items():
+                if r in holding[ip]:
+                    demands[r] = max(demands.get(r, 0), width)
+            out = set(holding[ip]) - set(kills)
+            out -= {r for r, width in writes.items() if width >= 4}
+            if ip in function.calls:
+                out -= VOLATILE
+            for successor in function.successors[ip]:
+                merged = holding.get(successor, frozenset()) | out
+                if merged != holding.get(successor):
+                    holding[successor] = merged
+                    changed = True
+    return demands
+
+
+def lift_function(program, entry, symbol, arguments, internal):
+    """Translate the function at entry. An internal function takes all four argument registers, and
+    its demands record how many low bytes of each one it may read before writing it."""
+    pe = program.pe
+    function = Function(pe, entry, program.entries)
+    function.arguments = arguments
     edges = function.explore()
     lifter = Lifter()
     order = sorted(function.instructions)
     instructions = function.instructions
     frame = Frame(function)
+    check_call_sites(function, frame.offsets)
     lifter.frame = {ip: access[0] - frame.start for ip, access in frame.accesses.items()}
     lifter.adjustments = frame.adjustments
     producers = {ip: flag_producer(function, edges, ins) for ip, ins in instructions.items()
                  if ins.flow_control == FlowControl.CONDITIONAL_BRANCH or ins.mnemonic in SETCC | CMOVCC}
     sets_flags = {producer.ip for producer in producers.values()}
+    # Callees are translated first: the caller's definedness pass needs their return widths and demands.
+    callees = {ip: program.callee(target, ip) for ip, target in sorted({**function.calls, **function.tails}.items())}
     loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
     skipped = {ip for _, _, sequence, _, _, _ in function.dispatches.values() for ip in sequence}
     body = {}
@@ -843,7 +1124,14 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
         if ins.has_lock_prefix or ins.has_rep_prefix or ins.has_repne_prefix:
             raise ValueError(f"unsupported prefix at RVA {ip:#x}")
         body[ip] = ""
-        if ins.flow_control == FlowControl.CONDITIONAL_BRANCH:
+        if ip in callees:
+            callee = callees[ip]
+            call = f"fn_{callee.entry:x}({', '.join(lifter.reg(r) for r in ARGUMENT_REGISTERS)})"
+            lifter.used.add(R.RAX)
+            # A tail jump returns the callee's RAX; a call leaves it in RAX.
+            body[ip] = f"return {call};" if ip in function.tails else f"rax = {call};"
+            effects[ip] = (dict(callee.demands), {}, set())
+        elif ins.flow_control == FlowControl.CONDITIONAL_BRANCH:
             body[ip] = f"if ({lifter.condition(producers[ip], ins)}) goto loc_{ins.near_branch_target:x};"
             effects[ip] = ({}, {}, set())
         elif ins.flow_control == FlowControl.UNCONDITIONAL_BRANCH:
@@ -892,6 +1180,12 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
                 out[r] = (8, False) if width >= 4 else (max(out[r][0], width), out[r][1])
             for r in kills:
                 out[r] = (0, True)
+            if ip in function.calls:
+                # The callee may change every volatile register. RAX keeps the low bytes that the
+                # callee defines at every reachable return; nonvolatile registers are kept.
+                for r in VOLATILE:
+                    out[r] = (0, False)
+                out[R.RAX] = (callees[ip].return_width, False)
             for successor in function.successors[ip]:
                 old = state[successor]
                 merged = {r: (min(old[r][0], out[r][0]), old[r][1] or out[r][1]) for r in NAMES}
@@ -902,14 +1196,20 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
     for ip in order:
         missing = [r for r, width in effects[ip][0].items() if state[ip][r][0] < width]
         if missing:
+            if ip in callees:
+                raise ValueError(f"callee argument {NAMES[min(missing)]} is undefined at RVA {ip:#x}")
             raise ValueError(f"undefined register {NAMES[min(missing)]} at RVA {ip:#x}")
-        if instructions[ip].mnemonic == M.RET:
+        if ip in function.tails:
+            # The callee returns to this function's caller with its own defined RAX bytes.
+            widths.append(callees[ip].return_width)
+        elif instructions[ip].mnemonic == M.RET:
             defined, guest = state[ip][R.RAX]
             if guest:
                 raise ValueError(f"return value may hold a guest address at RVA {ip:#x}")
             widths.append(defined)
-    # Consecutive low RAX bytes defined at every reachable RET; None when no RET is reachable.
+    # Consecutive low RAX bytes defined at every reachable RET or tail jump; None when there is none.
     function.return_width = min(widths) if widths else None
+    function.demands = argument_demands(function, order, effects)
 
     labels = set(edges)
     if order[0] != entry:
@@ -919,7 +1219,7 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
     for position, ip in enumerate(order):
         ins = instructions[ip]
         following = order[position + 1] if position + 1 < len(order) else None
-        if ins.flow_control in (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH) and following != ins.next_ip:
+        if ins.flow_control in STRAIGHT and following != ins.next_ip:
             labels.add(ins.next_ip)
     locals_ = sorted((lifter.used | {R.RAX}) - set(function.arguments), key=lambda r: NAMES[r])
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
@@ -936,10 +1236,10 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
             text.append("    " + body[ip])
         ins = instructions[ip]
         following = order[position + 1] if position + 1 < len(order) else None
-        if ins.flow_control in (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH) and following != ins.next_ip:
+        if ins.flow_control in STRAIGHT and following != ins.next_ip:
             text.append(f"    goto loc_{ins.next_ip:x};")
-    signature = (f'extern "C" __declspec(dllexport) word lifted_{name}'
-                 f'({", ".join(f"word {NAMES[r]}" for r in function.arguments)})')
+    linkage = "static" if internal else 'extern "C" __declspec(dllexport)'
+    signature = f'{linkage} word {symbol}({", ".join(f"word {NAMES[r]}" for r in function.arguments)})'
     comment = []
     if function.return_width is None:
         comment = ["// RAX: no reachable normal return"]
@@ -986,8 +1286,11 @@ def parse_entry(spec):
 def translate_pe(pe, names):
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
-    functions = [lift(pe, *parse_entry(name)) for name in names]
-    return PRELUDE + "\n".join(f"\n{source}" for source, _ in functions) + "\n", [f for _, f in functions]
+    program = Program(pe)
+    functions = [lift(pe, *parse_entry(name), program=program) for name in names]
+    # Callees precede every caller, so each internal function is defined before its first use.
+    sources = program.sources + [source for source, _ in functions]
+    return PRELUDE + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
 
 
 def translate(image, names):
