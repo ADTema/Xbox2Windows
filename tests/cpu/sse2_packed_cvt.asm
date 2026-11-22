@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_sse2_packed_cvt
 ; Source-owned differential fixture for 25 baseline 128-bit SSE/SSE2 packed conversions, compares, half moves, and scalar sqrt/min/max.
 .code
 
