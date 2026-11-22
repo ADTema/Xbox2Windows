@@ -2985,10 +2985,22 @@ comparison function in the second. Both operations retain their texture and
 coordinates. Set 3 must be free. The supported path has a direct access chain,
 sampler load and sampled image. Decorated sampler paths require separate support.
 
-Run `ctest --preset dev --no-tests=error -R spirv_sampler_views -V` with
-SPIRV-Tools and SPIRV-Cross installed. The source-built PS uses implicit LOD,
-the CS uses explicit LOD, and both compare against a depth reference. The CS
-readback on RTX 4060 Laptop and WARP sampled 0.25 and 0.75 and compared them to
-0.5, yielding 0 and 1. Reversing the ordinary wrap/clamp descriptors exchanged
-only the sampled values. Reversing the comparison descriptors exchanged only
-the two comparison results.
+With SPIRV-Tools and SPIRV-Cross installed, run:
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^spirv_sampler_views_' -V
+```
+
+The fixture compiles both shaders at Shader Model 6.0 and dispatches the compute
+shader for readback. The compiled pixel shader uses implicit LOD and the
+compute shader uses explicit LOD. Both compare against a depth reference.
+
+On Windows 10 build 19045.6456, the GTX 1060 (32.0.15.6094) and in-box WARP
+(10.0.19041.5794) matched all four readback words in each of the three sampler
+orders. Sampling returned 0.25 and 0.75, and comparison against 0.5 returned 0
+and 1. Reversing either pair of wrap/clamp descriptors exchanged only that
+pair's results. App-local WARP 1.0.22 produced identical results with the
+SM 6.0 and SM 6.6 compute shaders. All these runs reported zero D3D12 warnings
+and errors. The original SM 6.6 readback on RTX 4060 Laptop and WARP produced
+the same values.

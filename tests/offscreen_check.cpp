@@ -455,11 +455,11 @@ int main(int argc, char** argv)
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
         } else if (operation == "--spirv-sampler-views") {
-            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_0};
             auto hr = check_feature(device.Get(), D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
             if (hr != E_INVALIDARG) check(hr, "Query sampler fixture shader model");
-            if (hr == E_INVALIDARG || model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
-                std::puts("skip: sampler fixture requires SM 6.6");
+            if (hr == E_INVALIDARG || model.HighestShaderModel < D3D_SHADER_MODEL_6_0) {
+                std::puts("skip: sampler fixture requires SM 6.0");
                 return 77;
             }
             check_sampler_views(device.Get(), argv[3]);
