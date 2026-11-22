@@ -161,6 +161,28 @@ static const uint inputs[{len(CONVERSIONS)}] = {{{inputs}}};
     print(f"{len(rows)} signed/unsigned pairs matched")
 
 
+def check_immediate_conversion(compiler, renderer, backend):
+    helpers = (Path(__file__).resolve().parents[1] / "src/ffx_float_to_int.hlsli").read_text()
+    unsigned = alu("v_cvt_u32_f32_e32", ["v1", "0x7f800000"], "")
+    signed = alu("v_cvt_i32_f32_e32", ["v2", "0x7f800000"], "")
+    shader = f"""{helpers}
+RWByteAddressBuffer output : register(u0);
+[RootSignature("SRV(t0), UAV(u0), RootConstants(num32BitConstants=16,b0)")]
+[numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID) {{
+    if (id.x != 0) return;
+    uint v1, v2;
+    {unsigned}
+    {signed}
+    output.Store2(0, uint2(v1, v2));
+}}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        source, binary = Path(tmp) / "immediate.hlsl", Path(tmp) / "immediate.cso"
+        source.write_text(shader, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", binary, source], check=True)
+        subprocess.run([renderer, backend, "--ffx-immediate-conversion", binary], check=True)
+
+
 def eval_generated(shader, init):
     env = {f"s{i}": 0 for i in range(32)}
     env.update({f"v{i}": 0 for i in range(32)})
@@ -512,7 +534,9 @@ def main(assembler, objcopy, library):
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--readback"]:
+    if sys.argv[1:2] == ["--immediate"]:
+        check_immediate_conversion(*sys.argv[2:])
+    elif sys.argv[1:2] == ["--readback"]:
         check_conversion_readback(*sys.argv[2:])
     else:
         main(*sys.argv[1:])

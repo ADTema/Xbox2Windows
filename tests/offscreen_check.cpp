@@ -364,7 +364,7 @@ int main(int argc, char** argv)
         if (argc != 4) return 2;
     } else if (operation == "--check-bc7-tail") {
         if (argc < 6) return 2;
-    } else if (operation == "--compute-root-file") {
+    } else if ((operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
         if (argc != 4) return 2;
     } else {
         if (argc != 3 && argc != 5 && argc != 6) return 2;
@@ -415,8 +415,8 @@ int main(int argc, char** argv)
         if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
-        } else if (argc == 4 && operation == "--compute-root-file") {
-            check_compute_file(device.Get(), argv[3]);
+        } else if (argc == 4 && (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
+            check_compute_file(device.Get(), argv[3], operation == "--ffx-immediate-conversion");
         } else if (argc == 3 && operation == "--ffx-device-init") {
             check_ffx_device_init(device.Get());
         } else if (argc == 3 && operation == "--ffx-provider-loop") {

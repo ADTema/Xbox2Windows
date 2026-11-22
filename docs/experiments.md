@@ -294,13 +294,15 @@ ctest --preset dev --no-tests=error -R '^ffx_provider_loop_hardware$' -V
 
 ### Float-to-integer conversions in translated dispatches
 
+The immediate control feeds positive infinity (0x7f800000) directly to both FFX emitter instructions and stores the results to a UAV. With DXC 1.8.2502.11 (239921522), cs_6_0, substituting the previous bare casts caused DXIL validation to fail with `Assignment of undefined values to UAV.` The guarded shader compiled and its DXIL returned 0xffffffff and 0x7fffffff on D3D12 WARP, with all 318 guard words intact.
+
 The dispatch lowerer maps NaN to zero, truncates finite values toward zero and saturates out-of-range inputs to the signed or unsigned endpoint. The cast receives a finite value in range even if the compiler evaluates both arms of the endpoint selection.
 
 The LLVM 15 check assembles both conversions and compares the translated register results with 19 pairs of expected words. The same inputs run through the emitted ALU expressions and production HLSL helpers on WARP. On Windows build 26300.9974, WARP and an RTX 4060 (driver 610.88) matched all pairs. The previous bare casts also matched in this D3D11 harness on these adapters. The fix removes dependence on out-of-range cast behaviour. Whether a normal dispatch supplies such values remains unmeasured.
 
 ```powershell
-cmake --build --preset dev --target ffx_pass26_lds
-ctest --preset dev --no-tests=error -R '^ffx_float_to_int_warp$' -V
+cmake --build --preset dev --target ffx_pass26_lds offscreen_check
+ctest --preset dev --no-tests=error -R '^ffx_(immediate_)?float_to_int_warp$' -V
 ```
 
 ### FSR4 dispatch through the RCAS input
@@ -349,7 +351,7 @@ On Windows build 26300.9974, NVIDIA GeForce RTX 4060 (610.88) and Microsoft WARP
 The Windows build compiles the readback host. The default CTest uses a source-owned HLSL fixture on WARP, exercising the same gate cases, inclusive-limit negative control and tagged stores against the CPU expectations. From the repository root, after configuring the dev preset:
 
 ```powershell
-cmake --build --preset dev --target ffx_pass26_lds
+cmake --build --preset dev --target ffx_pass26_lds offscreen_check
 ctest --preset dev --no-tests=error -R '^ffx_pass26_lds_warp$' -V
 ```
 
