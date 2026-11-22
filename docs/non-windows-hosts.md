@@ -50,6 +50,7 @@ for t in \
   tests/pso_readiness_check.py \
   tests/docs_links_check.py \
   tests/bidi_controls_check.py \
+  tests/hardware_reports_check.py \
   tests/gpu_report_format_check.py; do
   ./out/pe-env/bin/python -B "$t"
 done
@@ -98,6 +99,7 @@ for t in \
   tests/xmem_attribute_scan_check.py \
   tests/docs_links_check.py \
   tests/bidi_controls_check.py \
+  tests/hardware_reports_check.py \
   tests/gpu_report_format_check.py; do
   ./out/pe-env/bin/python -B "$t"
 done
