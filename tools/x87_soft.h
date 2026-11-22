@@ -233,3 +233,28 @@ static inline X87Value x87_mul(X87Value a, X87Value b) {
     const X87Rounded r = x87_round(sign, e, hi, lo, x87_arith, x87_rc);
     return {r.sig, static_cast<uint16_t>(s | r.biased)};
 }
+
+// FDIV: the quotient rounded to the arithmetic format. A 64-bit quotient of the significands and a sticky
+// bit for a nonzero remainder are enough to round to 53 bits. The sign is the exclusive or of the operand
+// signs. Zero by zero and infinity by infinity are invalid and give the indefinite; a finite nonzero value
+// by zero gives infinity (the masked divide-by-zero response); a finite value by infinity gives zero.
+static inline X87Value x87_div(X87Value a, X87Value b) {
+    X87Value out;
+    if (x87_special_operands(a, b, &out)) return out;
+    const bool sign = x87_sign(a) != x87_sign(b);
+    const uint16_t s = sign ? 0x8000 : 0;
+    const bool ia = x87_is_inf(a), ib = x87_is_inf(b), za = x87_is_zero(a), zb = x87_is_zero(b);
+    if ((ia && ib) || (za && zb)) return x87_indefinite;
+    if (ia || zb) return {x87_integer_bit, static_cast<uint16_t>(s | 0x7fff)};
+    if (ib || za) return {0, s};
+    const X87Unpacked x = x87_unpack(a), y = x87_unpack(b);
+    // Divide x.sig * 2^64 (or x.sig * 2^63 when x.sig >= y.sig) by y.sig: the quotient lies in [2^63, 2^64).
+    const bool shift = x.sig >= y.sig;
+    uint64_t remainder;
+    const uint64_t q = _udiv128(shift ? x.sig >> 1 : x.sig, shift ? x.sig << 63 : 0, y.sig, &remainder);
+    const uint64_t lo = remainder != 0;  // sticky
+    const X87Rounded r = x87_round(sign, x.e - y.e - (shift ? 0 : 1), q, lo, x87_arith, x87_rc);
+    return {r.sig, static_cast<uint16_t>(s | r.biased)};
+}
+// FDIVR: the same division with the operands exchanged.
+static inline X87Value x87_divr(X87Value a, X87Value b) { return x87_div(b, a); }
