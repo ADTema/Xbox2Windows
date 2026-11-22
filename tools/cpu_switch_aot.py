@@ -180,6 +180,9 @@ class Function:
         edges = {target for ip, targets in self.successors.items() for target in targets
                  if target != self.instructions[ip].next_ip
                  or self.instructions[ip].flow_control not in (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH)}
+        # A conditional branch to its own fallthrough still emits a goto, so its target needs a label.
+        edges |= {ins.near_branch_target for ins in self.instructions.values()
+                  if ins.flow_control == FlowControl.CONDITIONAL_BRANCH}
         constants = self.constants()
         for ip in self.dispatches:
             self.prove(ip, edges, constants)
