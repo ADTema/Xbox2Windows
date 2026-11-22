@@ -2538,7 +2538,9 @@ def scalar_leading_bit_values(width):
     body = []
     for i, op in enumerate(ops):
         body.extend([
-            "s_cmp_eq_u32 s44, s45", f"{op} s62, {src}",
+            # s_flbit does not write SCC: rows whose words are equal, including the
+            # zero pair that finds no bit, must keep the false SCC seeded here.
+            "s_cmp_lg_u32 s44, s45", f"{op} s62, {src}",
             "s_cselect_b32 s63, 0x3f800000, 0", f"v_mov_b32_e32 v{14 + i}, s63",
             f"s_cmp_eq_u32 s62, s{46 + i}",
             "s_cselect_b32 s63, 0x3f800000, 0", f"v_mov_b32_e32 v{12 + i}, s63",
@@ -2562,7 +2564,7 @@ def check_scalar_leading_bit_draw(directory, compiler, renderer, backend):
             constants = bytearray(256)
             struct.pack_into("<4I", constants, 12, lo, hi, unsigned & 0xffffffff, signed & 0xffffffff)
             case = directory / f"leading-bit-{width}-{idx}.case"
-            case.write_bytes(constants + struct.pack("<4f", 1, 1, lo == hi, lo == hi) * 64)
+            case.write_bytes(constants + struct.pack("<4f", 1, 1, lo != hi, lo != hi) * 64)
             cases.append((case, "pass"))
         run_pixel_batch(renderer, backend, shader, cases)
     # For -2, the signed search must cross into the low word; the unsigned search returns zero.
@@ -2573,17 +2575,6 @@ def check_scalar_leading_bit_draw(directory, compiler, renderer, backend):
                            capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Unsigned leading-bit scan matched the signed reference")
-
-    # s_flbit does not write SCC: seed it false before each scan of a zero pair.
-    program = [line.replace("s_cmp_eq_u32 s44, s45", "s_cmp_lg_u32 s44, s45")
-               for line in scalar_leading_bit_values(64)]
-    source.write_text(translate(program), encoding="ascii")
-    compile_shader(compiler, source, shader, ieee=False)
-    constants = bytearray(256)
-    struct.pack_into("<4I", constants, 12, 0, 0, 0xffffffff, 0xffffffff)
-    case = directory / "leading-bit-scc.case"
-    case.write_bytes(constants + struct.pack("<4f", 1, 1, 0, 0) * 64)
-    run_pixel_batch(renderer, backend, shader, [(case, "pass")])
 
 
 def scalar_bit_count_values(width):
