@@ -351,6 +351,39 @@ class TestRdna2Disasm(unittest.TestCase):
             ],
         )
 
+    def test_second_dword_forms_keep_the_stream_aligned(self):
+        # Independent GFX10 encodings from LLVM MC 15.0.7 test/MC/AMDGPU (gfx10_asm_vop1.s,
+        # gfx10_asm_vop2.s, gfx10_asm_dpp8.s, gfx10_asm_sop.s). Each is one 8-byte instruction.
+        endpgm = bytes.fromhex("000081bf")
+        cases = (
+            ("f9160a7e01060600", "vop1_sdwa", "v_cvt_f32_f16_sdwa <unsupported SDWA>"),
+            ("fa020a7e01e40000", "vop1_dpp16", "v_mov_b32_dpp <unsupported DPP16>"),
+            ("e9020a7e0188c6fa", "vop1_dpp8", "v_mov_b32_dpp <unsupported DPP8>"),
+            ("ea020a7e0188c6fa", "vop1_dpp8", "v_mov_b32_dpp <unsupported DPP8>"),  # fi:1
+            ("f9040a0601060606", "vop2_sdwa", "v_add_f32_sdwa <unsupported SDWA>"),
+            ("fa040a1001e40000", "vop2_dpp16", "v_mul_f32_dpp <unsupported DPP16>"),
+            ("e9040a060188c6fa", "vop2_dpp8", "v_add_f32_dpp <unsupported DPP8>"),
+            ("01070a6e21110000", "v_fmamk_f16", "v_fmamk_f16 v5, v1, 0x1121, v3"),
+            ("01050a7021110000", "v_fmaak_f16", "v_fmaak_f16 v5, v1, v2, 0x1121"),
+            ("341280ba41312111", "s_setreg_imm32_b32", "s_setreg_imm32_b32 0x1234, 0x11213141"),
+        )
+        for raw, opcode, assembly in cases:
+            with self.subTest(raw=raw):
+                insns = disasm_rdna2(bytes.fromhex(raw) + endpgm)
+                self.assertEqual([(i["offset"], i["length"], i["opcode"]) for i in insns],
+                                 [(0, 8, opcode), (8, 4, "s_endpgm")])
+                self.assertEqual(insns[0]["assembly"], assembly)
+                truncated = disasm_rdna2(bytes.fromhex(raw)[:4])
+                self.assertEqual(len(truncated), 1)
+                self.assertEqual(truncated[0]["length"], 4)
+                self.assertTrue(truncated[0]["opcode"].endswith("_truncated"), truncated[0]["opcode"])
+
+        # Control: SRC0 codes next to the extension codes name an operand and stay one dword.
+        for src0 in (232, 235, 248, 251, 256):
+            with self.subTest(src0=src0):
+                insns = disasm_rdna2(struct.pack("<I", 0x7e0a0200 | src0) + endpgm)
+                self.assertEqual([(i["length"], i["opcode"]) for i in insns], [(4, "v_mov_b32_e32"), (4, "s_endpgm")])
+
     def test_sopc_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import SOPC_OPS
         for op, (expected_name, _) in SOPC_OPS.items():
