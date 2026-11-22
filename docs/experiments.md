@@ -1402,7 +1402,7 @@ ctest --test-dir out/native --no-tests=error -R '^cpu_aot_switch_strings$' -V
 ```
 
 Windows 11 build 26300.9974, MSVC/ML64 19.44.35230 and Python 3.12.8:
-38 exports, 24,243 native/AOT/reference comparisons and 93 access-violation
+43 exports, 24,915 native/AOT/reference comparisons and 96 access-violation
 comparisons passed, including the `/O2` translation. Compiled incorrect
 implementations must fail the comparison: a bulk `memmove` on destructive overlap
 and a truncated repeat count, plus ignored backwards direction.
