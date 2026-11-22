@@ -2199,23 +2199,40 @@ Depth-comparison sampling covers one form: `image_sample_c_lz vD, v[a:a+2], ... 
 - a non-zero `MIN_LOD` or LOD bias;
 - different min and mag filters;
 - mip filter 3 or word 2 bits 28–31;
-- word 3 bits 12–29, unnamed on gfx10 (bit 29 is `UPGRADED_DEPTH` on GFX8).
+- word 3 bits 12–29, unnamed on gfx10 (bit 29 is `UPGRADED_DEPTH` on GFX8);
+- `TRUNC_COORD` 0 with point filtering, or 1 with bilinear filtering.
 
-Fields that cannot change a 2D LOD-zero result under this profile are not read: `CLAMP_Z`, `DISABLE_CUBE_WRAP`, `Z_FILTER`, the anisotropy threshold and bias, `MAX_LOD`, `PERF_MIP`/`PERF_Z`, the border colour and word 0 bit 31. `TRUNC_COORD` is reported but not applied. A program that mixes comparison and ordinary sampling, or uses a second texture, is refused, because both would need `s0`. Field positions follow `SQ_IMG_SAMP_WORD0`…`3` in Mesa [`src/amd/registers/gfx10-rsrc.json`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-23.3.6/src/amd/registers/gfx10-rsrc.json), and the enum values follow Linux `navi10_enum.h` (`SQ_TEX_DEPTH_COMPARE`, `SQ_TEX_CLAMP`, `SQ_TEX_XY_FILTER`). [HLSL SampleCmpLevelZero](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplecmplevelzero)
+`TRUNC_COORD` (word 0 bit 27) is part of the binding contract. On gfx10 it applies to X and Y for every filter ([`ac_gpu_info.h`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-23.3.6/src/amd/common/ac_gpu_info.h)). With 1 the texel-space coordinate is truncated, so point sampling takes the floor, which is the D3D rule ([D3D11.3 §7.18.7](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#7.18.7%20Point%20Sample%20Addressing)). With 0 the coordinate is rounded to nearest even at six fraction bits and point sampling then drops the fraction ([Mesa d573d1d8](https://gitlab.freedesktop.org/mesa/mesa/-/commit/d573d1d82524b8a2e5f56938069cabc0f0176a0e)), so it can take the next texel when the coordinate is up to 1/128 texel below an edge. The accepted pairs are the ones RADV programs on gfx10 by default ([`radv_sampler.c`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-23.3.6/src/amd/vulkan/radv_sampler.c)): point with 1 and bilinear with 0. RADV clears the bit for DXVK and vkd3d-proton ([`00-radv-defaults.conf`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-23.3.6/src/util/00-radv-defaults.conf)), so point with 0 is a setting drivers use; it is refused here. Bilinear results are in the contract where the texel-space position (u × width − ½) is a multiple of 1/64, where that rounding is exact and D3D's 8-bit subtexel precision is exact too.
+
+The reference and the texels are in the contract within [0, 1], ends included. D3D quantizes the reference to the texture format and clamps it to the format range before comparing ([`sample_c`](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#22.4.19%20sample_c)). The lowering does not decode the image format and the draws bind `R32_FLOAT`, so references or texels outside [0, 1], and NaN, are outside the contract.
+
+Fields that cannot change a 2D LOD-zero result under this profile are not read: `CLAMP_Z`, `DISABLE_CUBE_WRAP`, `Z_FILTER`, the anisotropy threshold and bias, `MAX_LOD`, `PERF_MIP`/`PERF_Z`, the border colour and word 0 bit 31. A program that mixes comparison and ordinary sampling, or uses a second texture, is refused, because both would need `s0`. Field positions follow `SQ_IMG_SAMP_WORD0`…`3` in Mesa [`src/amd/registers/gfx10-rsrc.json`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-23.3.6/src/amd/registers/gfx10-rsrc.json), and the enum values follow Linux `navi10_enum.h` (`SQ_TEX_DEPTH_COMPARE`, `SQ_TEX_CLAMP`, `SQ_TEX_XY_FILTER`). [HLSL SampleCmpLevelZero](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplecmplevelzero)
 
 The fixed root signature of `tests/pixel_aot_vs.hlsl` has one ordinary static sampler, so `offscreen_check --check-pixel-compare` uses its own root signature with a descriptor-heap sampler. The case file supplies the filter and compare function from the decoded state. `tests/pixel_compare_check.py` draws an 8×8 `R32_FLOAT` texture into a 16×16 target, so bilinear weights are 1/4 and 3/4 and the expected results are exact multiples of 1/16. Three source-built programs cover all eight compare functions with both filters:
 - the reference from constant word 0, equal to some texels, so `EQUAL` and the `LESS`/`LESS_EQUAL` split are visible;
 - the reference interpolated from `attr0.x`, which varies per pixel and is never equal to a texel;
 - the reference computed by `v_fma_f32` from constants, in the NSA form.
 
+Three more programs move u and v by a constant in whole-quad mode before the sample, all eight compare functions each:
+- point filtering 1/256 texel below an edge at every even pixel: truncation takes the texel below, rounding at six fraction bits the one above (96 of 256 pixels differ for `LESS`);
+- point filtering exactly on an edge at even pixels: the floor takes the texel above;
+- bilinear filtering on texel centres (one weight 0) and halfway between them.
+
+Two more cover the ends of the interval: constant references 0 and 1 on a texture with texels equal to 0 and 1, both filters, so the strict and inclusive functions differ.
+
 The expected images come from an independent CPU model: compare each texel, clamp to the edge, then weight bilinearly. The sampler words are written from the field layout in the test, not by the decoder.
 
-On Windows 11 build 26200.9974 with the D3D12 debug layer enabled, NVIDIA GeForce RTX 3070 (driver 621.01) and WARP each matched all 48 draws (256 pixels, four channels, bitwise) with no debug messages. On each adapter, all 13 negative controls failed at pixel comparison:
+On Windows 11 build 26200.9974 with the D3D12 debug layer enabled, NVIDIA GeForce RTX 3070 (driver 621.01) and WARP each matched all 104 draws (256 pixels, four channels, bitwise) with no debug messages. On each adapter, all 18 negative controls failed at pixel comparison:
 - expected images for `GREATER` and `GREATER_EQUAL` (and `LESS_EQUAL` for the constant reference) against a `LESS` descriptor;
 - bilinear depths compared once instead of compared texels filtered (192 and 159 of 256 pixels differ);
 - a point sampler in place of bilinear;
 - recompiled HLSL that ignores the reference;
-- recompiled HLSL that swaps u and v.
+- recompiled HLSL that swaps u and v;
+- below an edge, the image for `TRUNC_COORD` 0, and on an edge, the texel below;
+- on texel centres, the image without the offset;
+- at references 0 and 1, the inclusive function against the strict one.
+
+The draws show the desktop side. They show that the accepted point rule is the floor and that D3D does not round at six fraction bits; they cannot show the console rule.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^pixel_aot_compare_' -V
@@ -2226,7 +2243,7 @@ python3 -B tests/pixel_compare_check.py
 python3 -B tests/pixel_compare_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
-Not covered: implicit-LOD `image_sample_c`, `_c_l`, `_c_b`, `_c_o`, `_c_d`, `image_gather4_c*`, cube and array shadow maps, border-colour addressing, references outside [0, 1] and texels on exact filter boundaries with `TRUNC_COORD` 0. How many archive records use these forms has not been measured.
+Not covered: implicit-LOD `image_sample_c`, `_c_l`, `_c_b`, `_c_o`, `_c_d`, `image_gather4_c*`, cube and array shadow maps, border-colour addressing, references or texels outside [0, 1] (outside the contract above) and the two refused `TRUNC_COORD` pairs. How many archive records use these forms has not been measured.
 
 For a shader that reads constants, pass `--constant-descriptor OFFSET` to identify its four-word descriptor in the same table as the texture descriptor. The desktop test binds 256 bytes at `b0`. A four-word read may span two HLSL constant vectors. Arithmetic support includes log2, exp2, reciprocal, rounding up (`v_ceil_f32`) and to nearest even (`v_rndne_f32`, lowered to HLSL `round`, which DXC emits as `Round_ne`), two-operand min/max, three-operand minimum, maximum and median (`v_min3_f32`, `v_max3_f32`, `v_med3_f32`), addition, multiplication, subtraction in either operand order, legacy zero-preserving multiplication, multiply-add, destination accumulation and saturation. The three-operand forms are emitted as nested HLSL `min` and `max`, with the median as `max(min(a, b), min(max(a, b), c))`. Each result is one of its operands, so finite inputs involve no rounding; NaN operands are not measured and may differ from the hardware's NaN rules. `v_mov_b32` copies a sample component, a loaded constant, an earlier result or an inline or literal constant, and rejects interpolation state, packed values and source modifiers. The lowerer rejects moves and floating-point arithmetic writes to the destination registers of an outstanding sample until its result is ready. With two samples in flight, `vmcnt(1)` permits moving the older result while all four destination registers of the newer sample remain protected. The dual-texture fixture uses that move in the rendered blend. As in the other operands, an integer inline constant is a bit pattern, not a converted value. Ordered and unordered `v_cmp_*_f32` comparisons, including the always-false and always-true predicates, but excluding class and exec-writing forms, become HLSL booleans, and `v_cndmask_b32` selects between two numeric operands with one. The lowerer accepts a mask in `vcc` or a scalar register under either wavefront-width spelling and rejects a select whose mask it did not see a comparison write. For `nlg`, equality or an explicit NaN check on either operand preserves the unordered case in DXIL. The earlier ordered comparisons produced a mismatch on the [reported RX 9070 XT driver](https://github.com/R0Y00/Xbox2Windows/issues/179). The pixel draw checks cover all 16 truth tables with less-than, signed-zero equality, greater-than and a quiet NaN on either side. Replacing a NaN with an equal finite operand must fail against the saved unordered reference. Compile arithmetic shaders with DXC `-Gis`. Transcendental precision and multiply-add rounding may vary by device. [AMD RDNA instruction reference](https://gpuopen.com/wp-content/uploads/2019/08/RDNA_Shader_ISA_5August2019.pdf) · [HLSL mad precision](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/mad)
 

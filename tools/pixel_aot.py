@@ -230,9 +230,17 @@ def comparison_sampler_state(words):
     src/amd/registers/gfx10-rsrc.json; enum values in the Linux navi10_enum.h). Not read, because the accepted profile makes them irrelevant: CLAMP_Z,
     DISABLE_CUBE_WRAP and Z_FILTER (2D only), ANISO_THRESHOLD and ANISO_BIAS (ratio 1), word 0 bit 31
     (degamma control; no effect on a float depth texel), MAX_LOD, PERF_MIP and PERF_Z (LOD 0 only), and
-    BORDER_COLOR_PTR and BORDER_COLOR_TYPE (no border addressing). TRUNC_COORD is reported, not applied.
-    Any other non-zero field is refused, including word 2 bits 28-31 (MIP_POINT_PRECLAMP, ANISO_OVERRIDE,
-    BLEND_ZERO_PRT) and word 3 bits 12-29, which gfx10 leaves unnamed (bit 29 is UPGRADED_DEPTH on GFX8).
+    BORDER_COLOR_PTR and BORDER_COLOR_TYPE (no border addressing). Any other non-zero field is refused,
+    including word 2 bits 28-31 (MIP_POINT_PRECLAMP, ANISO_OVERRIDE, BLEND_ZERO_PRT) and word 3 bits 12-29,
+    which gfx10 leaves unnamed (bit 29 is UPGRADED_DEPTH on GFX8).
+
+    TRUNC_COORD (word 0 bit 27) applies to X and Y for every filter on gfx10 (Mesa ac_gpu_info.h). With 1 the
+    texel-space coordinate is truncated; with 0 it is rounded to nearest even at six fraction bits, and point
+    sampling then drops the fraction (Mesa commit d573d1d8), so it can select the next texel up to 1/128 texel
+    below an edge. D3D point sampling takes the floor (D3D11.3 7.18.7). The accepted pairs are the ones RADV
+    programs on gfx10 by default (radv_sampler.c), point with 1 and bilinear with 0; the other two are refused,
+    including point with 0, which RADV programs for DXVK and vkd3d-proton. Bilinear results are in the
+    contract where the texel-space position is a multiple of 1/64, so the rounding is exact on both sides.
     """
     w0, w1, w2, w3 = words
     if (w0 & 7, (w0 >> 3) & 7) != (2, 2):
@@ -258,14 +266,20 @@ def comparison_sampler_state(words):
         raise ValueError("Comparison sampling with word 3 bits 12-29 (UPGRADED_DEPTH on GFX8) is not supported")
     func = (w0 >> 12) & 7
     filter_name, d3d_filter = COMPARISON_FILTERS[mag]
+    trunc_coord = (w0 >> 27) & 1
+    if trunc_coord != (filter_name == "point"):
+        raise ValueError(f"Comparison sampling with {filter_name} filtering requires TRUNC_COORD "
+                         f"{int(filter_name == 'point')}")
     return {"compare": DEPTH_COMPARE[func], "d3d12_comparison_func": func + 1,
             "filter": filter_name, "d3d12_filter": d3d_filter, "address": "clamp",
-            "trunc_coord": (w0 >> 27) & 1}
+            "trunc_coord": trunc_coord}
 
 
 def comparison_resources(state):
     return (f"// s0 comparison sampler: D3D12_FILTER 0x{state['d3d12_filter']:x}, "
             f"D3D12_COMPARISON_FUNC {state['d3d12_comparison_func']} ({state['compare']}), address CLAMP\n"
+            f"// Console TRUNC_COORD {state['trunc_coord']}. Contract: reference and texels in [0, 1] on an R32_FLOAT "
+            "view; outside it the result depends on the image format, which is not decoded.\n"
             "Texture2D<float> tex : register(t0);\n"
             "SamplerComparisonState samp : register(s0);")
 PREAMBLE = """// v_cmp_class_f32: the ten binary32 classes of LLVM SIInstrFlags::ClassFlags, from the raw encoding:
@@ -2073,6 +2087,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             image = registers(*m.groups()[6:8], 8)
             state = registers(*m.groups()[8:10], 4)
             address = ([f"v{n}" for n in registers(first, last, 3)] if first is not None else nsa)
+            if any(int(reg[1:]) > 255 for reg in (dst, *address)):
+                raise ValueError("Comparison sample VGPR out of range")
             if sampler is None or second_texture_offset is not None or sample_kind == "plain":
                 raise ValueError("Comparison sampling requires one texture and no ordinary sampling")
             if dst in sample_dest:
