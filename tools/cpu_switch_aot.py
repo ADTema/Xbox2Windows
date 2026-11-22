@@ -76,9 +76,19 @@ mod 16 from entry at a call, with the callee's home space below the return
 address. A tail jump is checked as a RET and contributes the callee's return
 width. The callee's frame is its own array, so no frame address crosses a call,
 and stack arguments stay refused.
+
+A target without unwind data or export is refused, with a message saying that
+a range binding is needed, unless the invoker supplies one: --bind-ranges names
+a JSON manifest of trusted [start, end) RVAs from the source labels of this
+exact image, bound to its SHA-256. Each range must lie in executable code and
+overlap no runtime function and no other binding. A call or tail jump may enter
+a bound range only at its start; the callee is walked within that range alone,
+may not move RSP or call, and may not be an import thunk.
 """
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 import struct
 
@@ -182,7 +192,7 @@ class Entries:
 
     MAX_CHAIN = 32
 
-    def __init__(self, pe):
+    def __init__(self, pe, bindings=None):
         table = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
         data = image_bytes(pe, table.VirtualAddress, table.Size - table.Size % 12) if table.Size >= 12 else b""
         self.records = list(struct.iter_unpack("<III", data))
@@ -226,6 +236,45 @@ class Entries:
         self.entries = set(self.primary)
         self.entries.update(rva for rva, kind in self.exports.items()
                             if kind == "code" and self.owner(rva) is None)
+        self.bound = {}  # start -> (end, name) of each verified range binding
+        if bindings is not None:
+            self.bind(pe, bindings)
+
+    def bind(self, pe, bindings):
+        """Verify a range manifest for this image: its hash, executable bounds and no overlap with
+        another binding or a runtime function."""
+        digest = hashlib.sha256(bytes(pe.__data__)).hexdigest()
+        if bindings["image_sha256"] != digest:
+            raise ValueError(f"range binding is for another image: manifest sha256 {bindings['image_sha256']}, "
+                             f"image sha256 {digest}")
+        previous = None
+        for start, end, name in sorted(bindings["functions"]):
+            section = pe.get_section_by_rva(start)
+            if (not start < end or not section or not section.Characteristics & 0x20000000 or end >
+                    section.VirtualAddress + min(section.Misc_VirtualSize, section.SizeOfRawData)):
+                raise ValueError(f"range binding {name} [{start:#x}, {end:#x}) is not inside executable code")
+            for begin, stop, _ in self.records:
+                if begin < end and start < stop:
+                    raise ValueError(f"range binding {name} [{start:#x}, {end:#x}) overlaps the runtime "
+                                     f"function at {self.root(begin):#x}")
+            if previous is not None and start < previous[1]:
+                raise ValueError(f"range binding {name} [{start:#x}, {end:#x}) overlaps range binding "
+                                 f"{previous[2]} [{previous[0]:#x}, {previous[1]:#x})")
+            previous = (start, end, name)
+            self.bound[start] = (end, name)
+
+    def bound_range(self, rva):
+        """(start, end, name) of the binding that starts at rva, or None."""
+        if rva in self.bound:
+            return (rva, *self.bound[rva])
+        return None
+
+    def bound_holder(self, rva):
+        """(start, end, name) of the binding whose range holds rva, or None."""
+        for start, (end, name) in self.bound.items():
+            if start <= rva < end:
+                return start, end, name
+        return None
 
     def root(self, begin):
         for _ in range(self.MAX_CHAIN):
@@ -242,7 +291,7 @@ class Entries:
         return None
 
     def __contains__(self, rva):
-        return rva in self.entries
+        return rva in self.entries or self.bound_range(rva) is not None
 
     def why_not(self, rva):
         kind = self.exports.get(rva)
@@ -258,7 +307,11 @@ class Entries:
         if owner is not None:
             label = "an exported label" if kind else "an address"
             return f"{label} inside the function at {owner:#x}"
-        return "no runtime-function entry or export"
+        holder = self.bound_holder(rva)
+        if holder is not None:
+            return f"inside the bound range {holder[2]} [{holder[0]:#x}, {holder[1]:#x}), not its start"
+        return ("no runtime-function entry or export; a range binding [start, end) for this image "
+                "(--bind-ranges) is needed")
 
 
 class Function:
@@ -266,7 +319,18 @@ class Function:
         self.pe = pe
         self.entry = entry
         self.entries = entries if entries is not None else Entries(pe)
-        ranges, self.foreign = owned_ranges(pe, entry)
+        self.unwound = any(begin <= entry < end for begin, end in runtime_functions(pe))
+        self.bound = self.entries.bound_range(entry)
+        others = [(start, end) for start, (end, _) in self.entries.bound.items()
+                  if self.bound is None or start != self.bound[0]]
+        if self.bound is not None:
+            # Trusted [start, end): every reachable edge must stay inside it.
+            ranges, self.foreign = [self.bound[:2]], runtime_functions(pe) + others
+        else:
+            ranges, self.foreign = owned_ranges(pe, entry)
+            if not self.unwound:
+                # A leaf without unwind data may not enter another bound range either.
+                self.foreign = self.foreign + others
         self.ranges = [(begin, end, image_bytes(pe, begin, end - begin, executable=True))
                        for begin, end in ranges]
         self.instructions = {}
@@ -284,8 +348,11 @@ class Function:
         target = ins.near_branch_target
         if target in self.entries:
             return True
-        named = target in self.entries.exports or any(begin == target for begin, _, _ in self.entries.records)
-        if named and target != self.entry:
+        named = (target in self.entries.exports or any(begin == target for begin, _, _ in self.entries.records)
+                 or self.entries.bound_holder(target) is not None)
+        # Executable code outside every runtime function and binding: say which binding would be needed.
+        unbound = executable(self.pe, target) and self.entries.owner(target) is None
+        if (named or unbound) and target != self.entry:
             raise ValueError(f"jump target {target:#x} is not a function entry ({self.entries.why_not(target)}) "
                              f"at RVA {ins.ip:#x}")
         return False
@@ -322,6 +389,14 @@ class Function:
                 if any(ip < stop and start < ins.next_ip for start, stop in self.foreign):
                     raise ValueError(f"edge outside owned ranges at RVA {ip:#x}: another function's unwind interval")
                 return ins
+        if self.bound is not None:
+            # A bound function's edges must stay inside its range; name what the edge reaches instead.
+            if any(begin <= ip < end for begin, end in runtime_functions(self.pe)):
+                raise ValueError(f"edge outside owned ranges at RVA {ip:#x}: another function's unwind interval")
+            holder = self.entries.bound_holder(ip)
+            if holder is not None:
+                raise ValueError(f"edge outside owned ranges at RVA {ip:#x}: the bound range {holder[2]}")
+            raise ValueError(f"edge outside owned ranges at RVA {ip:#x}: outside the bound range {self.bound[2]}")
         raise ValueError(f"edge outside owned ranges at RVA {ip:#x}")
 
     def claim(self, begin, end, owner, what):
@@ -1028,9 +1103,9 @@ class Program:
     """The functions of one image reached from the requested exports through direct calls and tail
     jumps. Each callee is translated once, in internal mode, and its source precedes its callers'."""
 
-    def __init__(self, pe):
+    def __init__(self, pe, bindings=None):
         self.pe = pe
-        self.entries = Entries(pe)
+        self.entries = Entries(pe, bindings)
         self.active = []
         self.callees = {}
         self.refused = {}
@@ -1102,11 +1177,22 @@ def lift_function(program, entry, symbol, arguments, internal):
     pe = program.pe
     function = Function(pe, entry, program.entries)
     function.arguments = arguments
+    if function.bound is not None:
+        first = function.decode(entry)
+        if first.flow_control == FlowControl.INDIRECT_BRANCH and first.op0_kind == OpKind.MEMORY:
+            raise ValueError(f"bound function {function.bound[2]} at RVA {entry:#x} is an import thunk "
+                             "(an indirect jump through memory)")
     edges = function.explore()
     lifter = Lifter()
     order = sorted(function.instructions)
     instructions = function.instructions
     frame = Frame(function)
+    if internal and not function.unwound:
+        # Without unwind data a function may not move RSP, so it cannot push, allocate or call.
+        moved = sorted(ip for ip, offset in frame.offsets.items() if offset or ip in function.calls)
+        if moved:
+            what = "call" if moved[0] in function.calls else "stack change"
+            raise ValueError(f"{what} in a function without unwind data at RVA {moved[0]:#x}")
     check_call_sites(function, frame.offsets)
     lifter.frame = {ip: access[0] - frame.start for ip, access in frame.accesses.items()}
     lifter.adjustments = frame.adjustments
@@ -1283,19 +1369,36 @@ def parse_entry(spec):
     return name, int(count)
 
 
-def translate_pe(pe, names):
+def load_bindings(source):
+    """A range manifest: {"image_sha256": hex, "functions": [{"name", "start", "end"}, ...]}, where start
+    and end are RVAs (integers or hex strings) of a function's first byte and the byte after it."""
+    manifest = json.loads(Path(source).read_text(encoding="utf-8")) if not isinstance(source, dict) else source
+    digest = manifest.get("image_sha256")
+    if not isinstance(digest, str) or len(digest) != 64 or digest.strip("0123456789abcdef"):
+        raise ValueError("range manifest needs a lowercase hex image_sha256")
+    functions = []
+    for item in manifest.get("functions", []):
+        name, start, end = item.get("name"), item.get("start"), item.get("end")
+        start, end = (int(v, 16) if isinstance(v, str) else v for v in (start, end))
+        if not isinstance(name, str) or not isinstance(start, int) or not isinstance(end, int):
+            raise ValueError(f"malformed range manifest entry {item!r}")
+        functions.append((start, end, name))
+    return {"image_sha256": digest, "functions": functions}
+
+
+def translate_pe(pe, names, bindings=None):
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
-    program = Program(pe)
+    program = Program(pe, None if bindings is None else load_bindings(bindings))
     functions = [lift(pe, *parse_entry(name), program=program) for name in names]
     # Callees precede every caller, so each internal function is defined before its first use.
     sources = program.sources + [source for source, _ in functions]
     return PRELUDE + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
 
 
-def translate(image, names):
+def translate(image, names, bindings=None):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names)
+        return translate_pe(pe, names, bindings)
 
 
 if __name__ == "__main__":
@@ -1304,9 +1407,11 @@ if __name__ == "__main__":
     parser.add_argument("exports", help='comma-separated export names; "name:4" translates that export with a '
                                         "fourth integer argument in R9, and the host must pass four")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--bind-ranges", type=Path, metavar="MANIFEST",
+                        help="trusted [start, end) ranges of functions without unwind data, bound to this image's sha256")
     args = parser.parse_args()
     try:
-        source, functions = translate(args.image, args.exports.split(","))
+        source, functions = translate(args.image, args.exports.split(","), args.bind_ranges)
         args.output.write_text(source, encoding="utf-8")
         for function in functions:
             print(f"RVA {function.entry:#x}: {len(function.instructions)} instructions, "
