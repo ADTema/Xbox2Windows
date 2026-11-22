@@ -567,10 +567,12 @@ class Lifter:
                 a = f"static_cast<std::uint64_t>({a})"
             return self.write(ins, width, f"{a} {SHIFTS[mnemonic]} {count}"), reads, writes
         if mnemonic == M.IMUL and ins.op_count in (2, 3):
-            note(*range(ins.op_count))
+            # The two-operand form reads its destination; the three-operand form only writes it.
             if ins.op_count == 2:
+                note(0, 1)
                 a, b = self.operand(ins, 0, width), self.operand(ins, 1, width)
             else:
+                note(1, 2)
                 a, b = self.operand(ins, 1, width), self.operand(ins, 2, width)
             if width == 2:
                 # Two uint16_t factors would be promoted to int, where 0xffff * 0xffff overflows.
