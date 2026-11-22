@@ -238,6 +238,10 @@ uint class16(uint bits) {
     if (magnitude != 0u) return negative ? 0x10u : 0x80u;
     return negative ? 0x20u : 0x40u;
 }
+// binary16 operand is not a NaN: decided on the encoding, because some desktop compilers fold float NaN tests.
+bool num16(uint bits) {
+    return (bits & 0x7fffu) <= 0x7c00u;
+}
 // v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
 // D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
 float fract32(float value) {
@@ -2094,9 +2098,26 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=False)
                 for t in tokens
             ]
+            raw = [
+                f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=True)
+                for t in tokens
+            ]
+            ordered = f"(num16({raw[0]}) && num16({raw[1]}))"
+            direct = {"lt": "lt", "eq": "eq", "le": "le", "gt": "gt", "lg": "lg", "ge": "ge"}
+            negated = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
+            if op in direct:
+                expr = f"({ordered} && ({COMPARE[op].format(*values)}))"
+            elif op in negated:
+                expr = f"!({ordered} && ({COMPARE[negated[op]].format(*values)}))"
+            elif op == "o":
+                expr = ordered
+            elif op == "u":
+                expr = f"!{ordered}"
+            else:
+                expr = COMPARE[op]
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
-            lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+            lines.append(f"    bool cmp{i} = {expr};")
         elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32)(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, kind, dst, *tokens = m.groups()
             regs = lane_mask(dst)
