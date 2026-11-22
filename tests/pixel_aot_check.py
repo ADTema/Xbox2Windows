@@ -665,6 +665,18 @@ def offset_nibbles():
     ])
 
 
+def legacy_multiply_add():
+    # gfx10 allows two scalar operands per VOP3 instruction, so two constants move to VGPRs.
+    return uncompressed_export([
+        "v_mov_b32_e32 v18, s46",
+        "v_mov_b32_e32 v19, s47",
+        "v_mad_legacy_f32 v12, s44, s45, v18",
+        "v_mad_legacy_f32 v13, s45, s44, -v19",
+        "v_mad_legacy_f32 v14, |v18|, s47, s44",
+        "v_mad_legacy_f32 v15, s44, v19, v18 clamp",
+    ])
+
+
 def ceiling():
     return with_constants([
         "v_ceil_f32_e32 v12, s44",
@@ -4860,6 +4872,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((unpack_bytes(), translate))
     fixtures.append((reciprocal_iflag(), translate))
     fixtures.append((offset_nibbles(), translate))
+    fixtures.append((legacy_multiply_add(), translate))
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
@@ -6066,6 +6079,57 @@ def check_trig_draws(directory, compiler, renderer, backend):
     print(f"trig_unreduced_mismatches={sum(unreduced)}/{len(unreduced)}")
 
 
+def check_legacy_multiply_add_draws(directory, compiler, renderer, backend):
+    instructions = legacy_multiply_add()
+    source = directory / "mad_legacy.hlsl"
+    shader = directory / "mad_legacy.cso"
+    case = directory / "mad_legacy.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(instructions), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+
+    def legacy(x, y, z):
+        product = 0.0 if x == 0 or y == 0 else x * y
+        rounded_product, = struct.unpack("<f", struct.pack("<f", product))
+        return rounded_product + z
+
+    inf, nan = math.inf, math.nan
+    # The last set detects unintended fusion: (1 + 2^-23) * (1 - 2^-23)
+    # rounds to 1 as a float before adding -1, instead of returning -2^-46.
+    delta = 2.0**-23
+    sets = ((0.0, inf, 1.5, -2.0), (2.0, 3.0, 0.5, 0.25), (0.0, nan, -0.75, 4.0),
+            (-1.5, 0.0, 2.0, 0.5), (1 + delta, 1 - delta, -1.0, 0.0))
+
+    def write_case(values, *, fused_first_channel=False):
+        a, b, c, d = values
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, a, b, c, d)
+        expected = (legacy(a, b, c), legacy(b, a, -d), legacy(abs(c), d, a),
+                    min(1.0, max(0.0, legacy(a, d, c))))
+        if fused_first_channel:
+            expected = (a * b + c, *expected[1:])
+        assert not any(math.isnan(v) for v in expected), expected
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+    for values in sets:
+        write_case(values)
+        subprocess.run(draw, check=True)
+
+    write_case(sets[-1], fused_first_channel=True)
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+        raise AssertionError("The renderer accepted the fused reference despite intermediate rounding")
+
+    # An ordinary multiply-add gives NaN for 0 * inf on the first set.
+    wrong = [line.replace("v_mad_legacy_f32", "v_fma_f32") for line in instructions]
+    source.write_text(translate(wrong), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    write_case(sets[0])
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+        raise AssertionError("Replacing the legacy multiply-add lost the zero rule without detection")
+
+
 def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend: str) -> None:
     hlsl = directory / "rgb-sample.hlsl"
     shader = directory / "rgb-sample.cso"
@@ -6308,6 +6372,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_unpack_byte_draws(directory, compiler, renderer, backend)
     check_reciprocal_iflag_draws(directory, compiler, renderer, backend)
     check_offset_nibble_draws(directory, compiler, renderer, backend)
+    check_legacy_multiply_add_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
     compile_shader(compiler, source, shader)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):

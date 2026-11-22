@@ -366,6 +366,8 @@ ALU = {
     "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
     "subrev": (2, "({1} - {0})"),
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
+    # Legacy multiply, then an unfused add: 0 * x is 0 even for an infinite or NaN x.
+    "mad_legacy": (3, "((({0} == 0 || {1} == 0) ? 0.0f : {0} * {1}) + {2})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
     "mad": (3, "mad32({0}, {1}, {2})"), "mac": (3, "mad32({0}, {1}, {2})"),
     # Each result is one of the operands, so finite inputs need no rounding.
