@@ -59,6 +59,7 @@ CPU_FIXTURES = {
     "exe_entry": "cpu_aot_exe_entry",
     "address_size": "cpu_aot_address_size",
     "call_pair": "cpu_aot_call_pair",
+    "movbe": "cpu_aot_movbe",
     "bmi1": "cpu_aot_bmi1",
     "rotates_shifts": "cpu_aot_rotates_shifts",
     "register_probe": None,  # measurement harness
