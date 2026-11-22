@@ -47,6 +47,7 @@ jobs:
           python -B tests/resource_root_check.py
           python -B tests/bcpack_check.py
           python -B tests/bc7_blocks_check.py
+          python -B tests/bc7_tiles_check.py
           python -B tests/form_coverage_check.py
           python -B tests/resource_ranges_check.py
           python -B tests/awc_metadata_check.py
