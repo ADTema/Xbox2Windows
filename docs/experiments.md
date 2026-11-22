@@ -558,6 +558,8 @@ All seven SHA-NI forms (`sha1msg1`, `sha1msg2`, `sha1nexte`, `sha1rnds4`, `sha25
 
 The shared lowering also handles 32-bit and 64-bit `mul`, `div`, `idiv`, `xadd`, and `cmpxchg` (with `LOCK` still rejected by the prefix guard), using portable 128-bit arithmetic for 64-bit widening multiply/divide. `cpu_aot_mul_div` builds all 10 exports from MASM source (`tests/cpu/mul_div.asm`), translates them, and compares results and ZF/CF flags against the native DLL and a reference model. Run `cmake --build --preset dev --target cpu_mul_div_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_mul_div$' -V`.
 
+The shared lowering also handles all six unsigned/equality `cmovcc` (`cmove`, `cmovne`, `cmova`, `cmovae`, `cmovb`, `cmovbe`) and `setcc` (`sete`, `setne`, `seta`, `setae`, `setb`, `setbe`) forms, unconditionally zero-extending 32-bit `cmovcc` destinations and preserving upper bytes on `setcc`. `cpu_aot_cmov_setcc` builds 13 exports from MASM source (`tests/cpu/cmov_setcc.asm`), translates them, and compares results against the native DLL and a reference model. Run `cmake --build --preset dev --target cpu_cmov_setcc_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_cmov_setcc$' -V`.
+
 ## Recompiling a direct x64 call
 
 The [caller and callee](../tests/cpu/direct.asm) each accept two unsigned 64-bit integers and an output pointer. The [translator](../tools/cpu_call_aot.py) starts at the caller export, follows the signed displacement in its E8 call and reads the target's runtime-function interval. It generates two C++ functions from the linked machine code. MSVC emits a separate x64 DLL with a non-inlined call. The Windows test checks the relative call against the two export addresses in both the input and output DLLs.
