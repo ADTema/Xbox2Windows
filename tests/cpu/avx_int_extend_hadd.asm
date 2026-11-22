@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_avx_int_extend_hadd
 ; Source-owned differential fixture for 19 VEX AVX sign/zero-extend and horizontal integer instructions.
 .code
 
