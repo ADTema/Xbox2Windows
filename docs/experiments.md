@@ -1054,8 +1054,8 @@ With registration, the callers' predicates accept GPU-intended memory and reject
 
 | Export | Observed call shape | Desktop handling |
 |---|---|---|
-| `XMemAlloc` | Size and attribute word (Bink and AMD callers). | `era_heap::allocate`. Graphics memory types are also registered with `era_query`, so they count as GPU-intended. |
-| `XMemFree` | Allocation and the same attribute word. | Unregisters graphics allocations, then `era_heap::release_with_attributes`. |
+| `XMemAlloc` | Size and attribute word (Bink and AMD callers). | `era_heap::allocate`. Graphics memory types are also tracked by `era_title_gpu`, which registers them with `era_query` so they count as GPU-intended, and gives them desktop GPU addresses once a D3D12 device is attached (see below). |
+| `XMemFree` | Allocation and the same attribute word. | Untracks graphics allocations, dropping any alias and the `era_query` registration, then `era_heap::release_with_attributes`. |
 | `XMemVirtualQuery` | The four BVH callers pass the process in `rcx`, the address in `rdx` and a 64-byte buffer in `r8`; `r9` is not set, so there is no length argument. They test the 32-bit result in `eax`. | `era_query::query` on the 64-byte buffer; returns `TRUE` when it succeeds. |
 | `XMemGetWorkingSetStatistics` | The seven AMD callers pass `0x20000001` in `ecx` and an output address in `rdx` and test the 32-bit result. On failure each uses zero instead of the 64-bit value at `+8`. | Returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the output untouched. |
 
@@ -1174,6 +1174,59 @@ Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer una
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
 
 The original test machine had Windows Graphics Tools installed. A second build in `out/build/agility` used Microsoft Agility SDK 1.620.2. Set `-DOFFSCREEN_AGILITY_620_DIR=<directory containing the x64 SDK DLLs>` to reproduce it. This configuration verifies debug interface activation. [Agility SDK package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
+
+### Desktop GPU addresses for xmem graphics allocations
+
+`era_title_gpu` (`src/era_title_gpu.cpp`) is a process-wide registry that connects `xmem.dll` to the GPU address pieces above.
+
+How it works:
+- `xmem.dll` tracks every graphics allocation through it. Without a device this only registers the region with `era_query`, as before.
+- `attach(device)` opens every tracked allocation as an `era_gpu_alias` heap and adds its range to an `era_title_va::Table`. Allocations tracked later are aliased at once.
+- `translate` gives the desktop GPU address of a title span, and `locate` gives the buffer and offset behind it, for descriptors.
+- `shader_view` returns the packed ranges and the buffers in slot order for `TitleLookup`.
+
+Failures and lifecycle:
+- An allocation that cannot be aliased stays tracked without a translation. `attach` reports the first such failure after trying every allocation.
+- `detach` drops every alias and keeps tracking. Attaching a different device re-aliases everything.
+- The registry does not wait for GPU work before an alias is released: releasing memory the GPU still uses is a title error on the console as well.
+- The first `track` or `attach` creates the registry, and it is never destroyed, so unloading the module releases no D3D12 object. The other functions never create it; without it they behave as for an empty registry.
+- These functions are `noexcept`, and `track` runs while `XMemAlloc` is being serviced. An allocation failure, including while creating the registry, returns `false` from `track` (`E_OUTOFMEMORY` from `attach`) instead of ending the process. It registers nothing, and the call can be retried.
+
+The registry is private to the module that links it. `xmem.dll` keeps its four exports and its imports, and loading it does not load D3D12. The direct-linked tests cover attach and lookup within that module. A D3D12 client in another DLL cannot reach the registry: a shared registry, with a fixture that loads both DLLs and shows the client sees the real provider's allocations, is left for the first such client.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `gpu_alias_registry_warp`, `gpu_alias_registry_hardware` | Two memory-type-1 allocations and an interior block of a region placed below the first one (not an allocation base, so it cannot be aliased) are tracked before attach. `era_query` must report them GPU-intended, with nothing translated. `attach` must report the interior block's `E_INVALIDARG` and still alias both allocations. `locate` and `translate` must agree. A span past the end and the interior block must not be translated or located. A third allocation tracked after attach is aliased at once, and an unaliasable block tracked after attach stays tracked without a translation. Re-attaching the same device keeps existing aliases. The registry's shader view then drives `TitleLookup` on the GPU: 15 addresses, 12 hits, matching CPU reads through the title pointers. `untrack`, `detach` and a full re-attach are checked against the same translations. Duplicate, overlapping, null and empty input are rejected. |
+| `xmem_shim_exports` | Now also requires that loading `xmem.dll` has not loaded `d3d12.dll`. |
+| `era_title_gpu_alloc` | No GPU. The program replaces the global `operator new` so that one chosen allocation fails. Before the first `track`, `counts`, `translate`, `locate`, `shader_view`, `untrack` and `detach` must make no allocation. Then every allocation of a first `track` (registry creation included) and of a later one is failed in turn. Each failure must return `false`, leave nothing tracked, registered with `era_query` or translated, and the call is retried. The first `track` must have more allocations that can fail than the later one. An `abort()` is reported on stderr instead of the debug CRT's dialog, and the test has a 30 s timeout. |
+
+Eight mutants of the registry each fail the test:
+- never aliasing on `track`;
+- stopping `attach` at the first failure;
+- keeping the `era_query` registration after `untrack`;
+- keeping aliases on `detach`;
+- no bounds in `locate`;
+- untracking on an alias failure;
+- reversing the shader view's buffers;
+- skipping the `era_query` registration.
+
+Measured at commit `f847956`, Windows 11 build 26300, debug layer enabled:
+- `gpu_alias_registry_warp` passed on WARP 10.0.26100.9818, with attach reporting `0x80070057` for the interior block, mismatches 0 and `debug_errors=0`. It passed 100 of 100 repeated runs.
+- `gpu_alias_registry_hardware` passed on an NVIDIA GeForce RTX 3070 Laptop GPU (driver 32.0.16.1088), with the same results. It passed 200 of 200 repeated runs.
+- The full suite passed: 148 tests, with 3 capability skips (`bvh_wave64_hardware`, `bvh_wave64_warp`, `wave_shuffle_warp`).
+- The stop-at-first-failure mutant failed 20 of 20 runs on each adapter ("two of three aliased"). All eight mutants were first measured at `d52905d`, on the RTX 3070 with the debug layer unavailable.
+
+Before `f847956`, the interior block's search tried only the 256 MB directly below the first allocation. That search found no free block in about 1 of 40 hardware runs, and the test failed in setup ("region below the first allocation").
+
+Measured at commit `21a65e5`, Windows 11 build 26300, debug layer enabled:
+- The full suite passed: 149 tests, with the same 3 capability skips.
+- `era_title_gpu_alloc` handled 6 failing allocations in a first `track` and 2 in a later one. It passed 50 of 50 repeated runs.
+- `gpu_alias_registry_hardware` passed 100 of 100 repeated runs on the RTX 3070, and `gpu_alias_registry_warp` passed 50 of 50.
+- Four mutants fail `era_title_gpu_alloc`:
+  - creating the registry with a throwing `new`: `abort()`, exit 3;
+  - building `shader_view`'s empty result by construction, which allocates under the debug STL: `abort()`, exit 3;
+  - a `counts` that creates the registry: exit 1;
+  - a `track` that keeps the `era_query` registration after a failed insertion: exit 1.
 
 ### Windows 10 with the app-local Agility SDK and WARP
 
