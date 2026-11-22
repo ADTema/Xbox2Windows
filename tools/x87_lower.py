@@ -1,25 +1,30 @@
 """Opt-in x87 leaf-function profile for ffx_version_query.lower(x87=True).
 
-The profile accepts FLD and FSTP with an m32, m64 or m80 operand and FADDP ST(i), ST(0) for i from 1 to
-7. A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status word, and
-must return with the stack empty. The stack depth before every instruction is fixed at translation
-time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
-instruction outside the profile (including control-word and status-word access and FADDP ST(0), ST(0)),
-a stack overflow or underflow, a depth that differs where control flow joins, an x87 instruction it
-cannot reach from the entry through direct edges, and x87 state that is live at a call, a return, an
-indirect branch or an external edge. The helpers are in tools/x87_soft.h, which the generated source
-must include before the lowered functions (X87_HEADER).
+The profile accepts FLD and FSTP with an m32, m64 or m80 operand; FADDP ST(i), ST(0) for i from 1 to 7;
+and FMUL with an m32 or m64 operand, FMUL ST(0), ST(i), FMUL ST(i), ST(0) and FMULP ST(i), ST(0) for i
+from 1 to 7. A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status
+word, and must return with the stack empty. The stack depth before every instruction is fixed at
+translation time, so each register maps to a C++ slot and no TOP is needed at run time. Translation
+rejects any x87 instruction outside the profile (including control-word and status-word access, and
+FADDP or FMULP with ST(0) as the destination), a stack overflow or underflow, a depth that differs where
+control flow joins, an x87 instruction it cannot reach from the entry through direct edges, and x87
+state that is live at a call, a return, an indirect branch or an external edge. The helpers are in
+tools/x87_soft.h, which the generated source must include before the lowered functions (X87_HEADER).
 """
 from pathlib import Path
 
 from iced_x86 import FlowControl, MemorySize as S, Mnemonic as M, OpKind as K, Register as R
 
 X87_HEADER = Path(__file__).with_name("x87_soft.h").read_text(encoding="ascii")
-X87_OPS = frozenset({M.FLD, M.FSTP, M.FADDP})
+X87_OPS = frozenset({M.FLD, M.FSTP, M.FADDP, M.FMUL, M.FMULP})
 DECLARATION = "X87Value x87_slot[8]{};"
 
 LOADS = {S.FLOAT32: "x87_from_f32(load<uint32_t>(a))", S.FLOAT64: "x87_from_f64(load<uint64_t>(a))",
          S.FLOAT80: "x87_from_m80(load<uint64_t>(a), load<uint16_t>(a + 8))"}
+# An arithmetic memory operand keeps a signaling NaN signaling until the NaN rules have seen it.
+OPERANDS = {S.FLOAT32: "x87_operand_f32(load<uint32_t>(a))", S.FLOAT64: "x87_operand_f64(load<uint64_t>(a))"}
+# Two-operand register arithmetic: mnemonic -> helper. The P forms pop after writing ST(i).
+ARITHMETIC = {M.FADDP: "x87_add", M.FMUL: "x87_mul", M.FMULP: "x87_mul"}
 
 
 # Every x87 mnemonic in iced starts with F (including FXSAVE/FXRSTOR, which store the x87 state, and
@@ -44,7 +49,17 @@ def _effect(i, depth):
         if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth - 1
-    if op == M.FADDP and i.op_count == 2 and i.op1_register == R.ST0 and i.op0_register != R.ST0:
+    if op == M.FMUL and i.op_count == 1:
+        if i.op0_kind != K.MEMORY or i.memory_size not in OPERANDS:
+            raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
+        if depth == 0:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth
+    if op == M.FMUL and i.op_count == 2 and R.ST0 in (i.op0_register, i.op1_register):
+        if depth <= max(i.op0_register, i.op1_register) - R.ST0:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth
+    if op in (M.FADDP, M.FMULP) and i.op_count == 2 and i.op1_register == R.ST0 and i.op0_register != R.ST0:
         if depth <= i.op0_register - R.ST0 or depth < 2:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth - 1
@@ -99,5 +114,9 @@ def statement(i, depth, address):
         store = {S.FLOAT32: f"store<uint32_t>(a, x87_to_f32({v}));", S.FLOAT64: f"store<uint64_t>(a, x87_to_f64({v}));",
                  S.FLOAT80: f"store<uint64_t>(a, {v}.sig); store<uint16_t>(a + 8, {v}.se);"}[i.memory_size]
         return f"{{ const word a = {address()}; {store} }}"
-    k = top - (i.op0_register - R.ST0)
-    return f"x87_slot[{k}] = x87_add(x87_slot[{k}], x87_slot[{top}]);"
+    if i.op_count == 1:  # FMUL m32/m64: ST(0) = ST(0) * operand
+        return (f"{{ const word a = {address()}; "
+                f"x87_slot[{top}] = x87_mul(x87_slot[{top}], {OPERANDS[i.memory_size]}); }}")
+    # The destination is the first operand: ST(i) for FMUL ST(i), ST(0) and the P forms, ST(0) otherwise.
+    destination, source = (top - (i.op0_register - R.ST0), top - (i.op1_register - R.ST0))
+    return f"x87_slot[{destination}] = {ARITHMETIC[op]}(x87_slot[{destination}], x87_slot[{source}]);"
