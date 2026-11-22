@@ -109,6 +109,7 @@ def _check_two_exits(code, llvm):
                   or op in ("s_nop", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
                             "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
                             "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
+                            "s_bitreplicate_b64_b32",
                             "s_setreg_imm32_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
@@ -225,6 +226,22 @@ uint class32(float value) {
     if (magnitude >= 0x00800000u) return negative ? 0x8u : 0x100u;
     if (magnitude != 0u) return negative ? 0x10u : 0x80u;
     return negative ? 0x20u : 0x40u;
+}
+// v_cmp_class_f16: the ten binary16 classes of LLVM SIInstrFlags::ClassFlags, from bits [15:0]:
+// signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
+uint class16(uint bits) {
+    uint h = bits & 0xffffu;
+    uint magnitude = h & 0x7fffu;
+    bool negative = h >= 0x8000u;
+    if (magnitude > 0x7c00u) return (h & 0x0200u) != 0u ? 0x2u : 0x1u;
+    if (magnitude == 0x7c00u) return negative ? 0x4u : 0x200u;
+    if (magnitude >= 0x0400u) return negative ? 0x8u : 0x100u;
+    if (magnitude != 0u) return negative ? 0x10u : 0x80u;
+    return negative ? 0x20u : 0x40u;
+}
+// binary16 operand is not a NaN: decided on the encoding, because some desktop compilers fold float NaN tests.
+bool num16(uint bits) {
+    return (bits & 0x7fffu) <= 0x7c00u;
 }
 // v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
 // D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
@@ -467,6 +484,34 @@ uint mul_hi_i32(uint a, uint b) {
         "    return uint2(asuint(asint(v.y) >> (s - 32u)), asuint(asint(v.y) >> 31));\n"
         "}"
     ),
+    "s_quadmask_b32": """uint s_quadmask_b32(uint value) {
+    uint result = 0u;
+    [unroll]
+    for (uint group = 0u; group < 8u; ++group) {
+        if ((value & (0xfu << (group * 4u))) != 0u) result |= 1u << group;
+    }
+    return result;
+}
+""",
+    "s_quadmask_b64": """uint2 s_quadmask_b64(uint2 value) {
+    uint result = s_quadmask_b32(value.x) | (s_quadmask_b32(value.y) << 8u);
+    return uint2(result, 0u);
+}
+""",
+    "s_bitreplicate_b64_b32": """uint2 s_bitreplicate_b64_b32(uint value) {
+    uint low = value & 0xffffu;
+    uint high = value >> 16u;
+    low = (low | (low << 8u)) & 0x00ff00ffu;
+    high = (high | (high << 8u)) & 0x00ff00ffu;
+    low = (low | (low << 4u)) & 0x0f0f0f0fu;
+    high = (high | (high << 4u)) & 0x0f0f0f0fu;
+    low = (low | (low << 2u)) & 0x33333333u;
+    high = (high | (high << 2u)) & 0x33333333u;
+    low = (low | (low << 1u)) & 0x55555555u;
+    high = (high | (high << 1u)) & 0x55555555u;
+    return uint2(low | (low << 1u), high | (high << 1u));
+}
+""",
     "s_bfm_b64": (
         "uint2 s_bfm_b64(uint width, uint offset) {\n"
         "    uint w = width & 63u;\n"
@@ -1067,6 +1112,37 @@ def vop3p_f16_word(token, scalar, vector, pending, sample_dest):
             raise ValueError(f"Unsupported packed integer inline constant {token}")
         return f"{value & 0xffffffff}u"
     raise ValueError(f"Unsupported packed operand {token}")
+
+
+def f16_cmp_operand(token, scalar, vector, pending, sample_dest, *, allow_mods, as_bits):
+    """Return one binary16 comparison source as low-16-bit uint bits or a widened float."""
+    neg = False
+    use_abs = False
+    if token not in INLINE_F16 and not re.fullmatch(r"-\d+", token):
+        if token.startswith("-"):
+            neg = True
+            token = token[1:]
+        if m := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
+            use_abs = True
+            token = m.group(1) or m.group(2)
+        if (neg or use_abs) and not allow_mods:
+            raise ValueError("Input modifiers require VOP3 encoding")
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", token) and int(token, 16) > 0xffff:
+        raise ValueError(f"16-bit literal out of range: {token}")
+    word = vop3p_f16_word(token, scalar, vector, pending, sample_dest)
+    if as_bits:
+        expr = f"({word} & 0xffffu)"
+        if use_abs:
+            expr = f"({expr} & 0x7fffu)"
+        if neg:
+            expr = f"({expr} ^ 0x8000u)"
+        return expr
+    expr = f"widen16({word})"
+    if use_abs:
+        expr = f"abs({expr})"
+    if neg:
+        expr = f"(-{expr})"
+    return expr
 
 
 def parse_vop3p_f16(rest, arity):
@@ -1753,6 +1829,35 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             expr = f"({prev} & ~(1u << ({bit} & 31u)))" if op == "s_bitset0_b32" else f"({prev} | (1u << ({bit} & 31u)))"
             lines.append(f"    uint salu{i} = {expr};")
             scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"(s_quadmask_b32) (s\d+), ([^,]+)"):
+            op, dst, src = m.groups()
+            sgpr_name(dst)
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            value = scalar_u32(src, scalar, pending)
+            helpers.add(op)
+            lines.append(f"    uint salu{i} = {op}({value});")
+            scalar[dst] = ("uint", f"salu{i}")
+            scc = f"(salu{i} != 0u)"
+        elif m := match(r"(s_quadmask_b64) (s\[\d+:\d+\]), ([^,]+)"):
+            op, dst, src = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            low, high = scalar_u64(src, scalar, pending)
+            helpers.update(("s_quadmask_b32", op))
+            lines.append(f"    uint2 salu{i} = {op}(uint2({low}, {high}));")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
+            scc = f"((salu{i}.x | salu{i}.y) != 0u)"
+        elif m := match(r"(s_bitreplicate_b64_b32) (s\[\d+:\d+\]), ([^,]+)"):
+            op, dst, src = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            value = scalar_u32(src, scalar, pending)
+            helpers.add(op)
+            lines.append(f"    uint2 salu{i} = {op}({value});")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
         elif m := match(r"(s_addk_i32|s_mulk_i32) (s\d+), (-?\d+|0x[0-9a-f]+)"):
             op, dst, imm = m.groups()
             operand = scalar_u32(dst, scalar, pending)
@@ -1991,6 +2096,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
+        elif m := match(rf"v_cmp_class_f16(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            enc, dst, value, classes = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+                bits = f"{int(classes, 0) & 0xffffffff}u"
+            elif re.fullmatch(r"[vs]\d+", classes):
+                bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
+            else:
+                raise ValueError("Unsupported class mask")
+            operand = f16_cmp_operand(
+                value, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=True
+            )
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = (class16({operand}) & {bits}) != 0u;")
 
         elif m := (match(r"v_(add|sub|subrev)_nc_u32(?:_e32|_e64)? (v\d+), ([^,\s]+), ([^,\s]+)")
                    or match(r"v_(add|sub)_nc_i32 (v\d+), ([^,\s]+), ([^,\s]+)")):
@@ -2054,6 +2176,35 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+        elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f16(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            op, enc, dst, *tokens = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            values = [
+                f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=False)
+                for t in tokens
+            ]
+            raw = [
+                f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=True)
+                for t in tokens
+            ]
+            ordered = f"(num16({raw[0]}) && num16({raw[1]}))"
+            direct = {"lt": "lt", "eq": "eq", "le": "le", "gt": "gt", "lg": "lg", "ge": "ge"}
+            negated = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
+            if op in direct:
+                expr = f"({ordered} && ({COMPARE[op].format(*values)}))"
+            elif op in negated:
+                expr = f"!({ordered} && ({COMPARE[negated[op]].format(*values)}))"
+            elif op == "o":
+                expr = ordered
+            elif op == "u":
+                expr = f"!{ordered}"
+            else:
+                expr = COMPARE[op]
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {expr};")
         elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32)(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, kind, dst, *tokens = m.groups()
             regs = lane_mask(dst)

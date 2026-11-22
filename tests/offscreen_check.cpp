@@ -525,6 +525,13 @@ OperationResult run_spirv_address_window(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_spirv_compare_sampler(const OperationContext& ctx)
+{
+    check_spirv_compare_sampler(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                ctx.argc == 7 ? ctx.argv[6] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_ffx_device_init(const OperationContext& ctx)
 {
     check_ffx_device_init(ctx.device);
@@ -815,9 +822,13 @@ constexpr CapabilityGate kGateWaveShuffle{
     D3D_SHADER_MODEL_6_5, false, true, 0,
     "skip: wave shuffle fixture requires SM 6.5 and WaveOps",
     CapsDiagnostic::wave_6_6};
-constexpr CapabilityGate kGateSm66SamplerViews{
+constexpr CapabilityGate kGateSm60SamplerViews{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: sampler fixture requires SM 6.0",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66CompareSampler{
     D3D_SHADER_MODEL_6_6, false, false, 0,
-    "skip: sampler fixture requires SM 6.6",
+    "skip: comparison-sampler fixture requires SM 6.6",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_6, true, false, 0,
@@ -834,8 +845,9 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
-    {"--spirv-sampler-views", 4, 4, nullptr, kGateSm66SamplerViews, run_spirv_sampler_views},
+    {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
+    {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm66CompareSampler, run_spirv_compare_sampler},
     {"--ffx-device-init", 3, 3, nullptr, kNoGate, run_ffx_device_init},
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
@@ -1059,6 +1071,11 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --compute-root-file")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-sampler-views"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --spirv-sampler-views")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --spirv-compare-sampler")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin", "baseline", "extra"},
+                   CliAction::usage_error, "Unknown GPU operation or invalid arguments: --spirv-compare-sampler"))
+        return 1;
     if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "invalid"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,
@@ -1073,6 +1090,10 @@ int run_self_test()
     if (!check_cli({"offscreen_check", "warp", "out.bmp"}, CliAction::draw)) return 1;
     if (!check_cli({"offscreen_check", "hardware", "out.bmp", "vs.cso", "ps.cso"}, CliAction::draw)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "bgra"}, CliAction::operation)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin"},
+                   CliAction::operation)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin", "baseline"},
+                   CliAction::operation)) return 1;
 
     // (b) Unmet CapabilityGate exits 77 with named skip reason without invoking the handler.
     {
