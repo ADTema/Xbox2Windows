@@ -192,6 +192,32 @@ ALU = {
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
     "mad": (3, "mad32({0}, {1}, {2})"), "mac": (3, "mad32({0}, {1}, {2})"),
 }
+# Untyped vector bit operations. VGPRs retain their raw 32 bits through asfloat/asuint.
+VALU_BITS = {
+    "v_bfe_u32": (3, "(({0} >> ({1} & 31u)) & ((1u << ({2} & 31u)) - 1u))"),
+    "v_bfe_i32": (3, "v_bfe_i32({0}, {1}, {2})"),
+    "v_bfm_b32": (2, "(((1u << ({0} & 31u)) - 1u) << ({1} & 31u))"),
+    "v_bcnt_u32_b32": (2, "(countbits({0}) + {1})"),
+    "v_bfrev_b32": (1, "reversebits({0})"),
+    "v_ffbh_u32": (1, "v_ffbh_u32({0})"),
+    "v_ffbh_i32": (1, "v_ffbh_u32(({0} & 0x80000000u) != 0u ? ~{0} : {0})"),
+    "v_ffbl_b32": (1, "uint(firstbitlow({0}))"),
+}
+VALU_BIT_HELPERS = {
+    "v_bfe_i32": (
+        "uint v_bfe_i32(uint src, uint off, uint width) {\n"
+        "    off &= 31u; width &= 31u;\n"
+        "    if (width == 0u) return 0u;\n"
+        "    if (off + width < 32u) return asuint(asint(src << (32u - off - width)) >> (32u - width));\n"
+        "    return asuint(asint(src) >> off);\n"
+        "}"
+    ),
+    "v_ffbh_u32": (
+        "uint v_ffbh_u32(uint src) {\n"
+        "    return src == 0u ? 0xffffffffu : 31u - uint(firstbithigh(src));\n"
+        "}"
+    ),
+}
 # N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
     "f": "false", "tru": "true",
@@ -635,6 +661,27 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"({'|'.join(VALU_BITS)})(_e32|_e64)? (v\d+), (.+)"):
+            op, encoding, dst, operands = m.groups()
+            arity, template = VALU_BITS[op]
+            tokens = operands.split(", ")
+            if mask != "entry" or len(tokens) != arity or (arity > 1 and encoding == "_e32"):
+                raise ValueError("Invalid vector bit operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = []
+            for token in tokens:
+                if re.fullmatch(r"v\d+", token):
+                    values.append(f"asuint({fp_operand(token, scalar, vector, pending, sample_pending)})")
+                else:
+                    values.append(scalar_u32(token, scalar, pending))
+            if op == "v_bfe_i32":
+                helpers.add(op)
+            elif op in ("v_ffbh_i32", "v_ffbh_u32"):
+                helpers.add("v_ffbh_u32")
+            expression = template.format(*values)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({expression});")
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, dst, *tokens = m.groups()
             regs = lane_mask(dst)
@@ -696,7 +743,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if not ended or samples != (2 if second_texture_offset is not None else 1):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
-        defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
+        defs = [body for name, body in (*SALU_HELPERS.items(), *VALU_BIT_HELPERS.items()) if name in helpers]
         pos = lines.index(PREAMBLE)
         lines[pos:pos] = defs
     return "\n".join([*lines, "}",""])

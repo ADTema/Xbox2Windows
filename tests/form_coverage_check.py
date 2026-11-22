@@ -295,12 +295,40 @@ def check_dashboard():
     assert "EXP 0/1" in footnotes  # the smallest group cannot hold its label
 
 
+
+def check_vector_bit_forms():
+    import pixel_aot_check as pixel
+    recorded = set(pixel.ACCEPTED)
+    pixel.check_bit_controls()
+    assert pixel.ACCEPTED == recorded, 'acceptance controls leaked forms into unrelated GPU records'
+    unary = {'v_bfrev_b32', 'v_ffbh_u32', 'v_ffbh_i32', 'v_ffbl_b32'}
+    vop3 = {'v_bfe_u32', 'v_bfe_i32', 'v_bfm_b32', 'v_bcnt_u32_b32'}
+    expected = {('VOP1', op) for op in unary} | {('VOP3', op + '_e64') for op in unary}
+    expected |= {('VOP3', op) for op in vop3}
+    # Count actual accepted source programs, including both encodings of unary operations.
+    forms = set()
+    for op in pixel.BIT_OPERATIONS:
+        program = pixel.bit_program(op)
+        pixel.translate(program)
+        forms.update(line.split()[0] for line in program)
+    for name in ('gfx1013.tsv', 'rdna2.tsv'):
+        selected = fc.gfx_forms(forms, fc.load_reference(name))
+        assert expected <= selected and len(expected) == 12
+        assert not any(group in {'SDWA', 'DPP8', 'DPP16'} for group, _ in selected)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {})
+        for state, count in (('pass', 12), ('fail', 0), ('skip', 0)):
+            m = fc.measure({'pixel_aot_bits_warp': state}, root,
+                           {'pixel_aot_bits_warp': set(pixel.BIT_OPERATIONS)})
+            assert m['gfx1013']['covered'] == m['gfx1030']['covered'] == count
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
     check_jump_tables()
     check_unclassified()
     check_shader_records()
+    check_vector_bit_forms()
     check_parsing()
     check_dashboard()
     print("form coverage checks passed")

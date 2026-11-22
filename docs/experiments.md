@@ -716,6 +716,59 @@ The report follows the effect's stored list order. Each entry gives its stored g
 
 Two independently located local effects yielded 5 and 81 candidates across all groups. Their pixel lists contained 2 and 41 candidates respectively, and every pixel-container digest matched an independent decode. Identifying which candidate a draw uses still requires evidence of pass selection.
 
+## Vector bit operations in pixel shaders
+
+`pixel_aot.py` lowers vector bitfield extraction (`v_bfe_u32`, `v_bfe_i32`),
+mask construction (`v_bfm_b32`), population count plus accumulator
+(`v_bcnt_u32_b32`), bit reversal (`v_bfrev_b32`) and first-bit searches
+(`v_ffbh_u32`, `v_ffbh_i32`, `v_ffbl_b32`). The four unary instructions have
+both e32 and e64 coverage: twelve gfx1013 forms, also present in gfx1030.
+Offset and width use their low five bits, including width 32 becoming zero.
+Signed extracts preserve sign when a field crosses bit 31; scans preserve the
+all-bits-set sentinel. Integer results remain raw VGPR bits through bitcasts.
+
+The semantics follow the [AMD RDNA2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+and [LLVM's constant BFE folding](https://llvm.org/doxygen/AMDGPUInstCombineIntrinsic_8cpp_source.html).
+Bit scans map to [HLSL first-bit intrinsics](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/firstbithigh),
+with the required leading-count conversion and signed input normalization.
+No SDWA/DPP modifiers, lane-mask counts, floating input modifiers or clamp are
+accepted by this lane-local profile. Existing pending-load, pending-sample and
+execution-mask checks still apply.
+
+The original source fixtures run each form on sixteen constant triples. Each
+32-bit result is exported as four exact byte values using BFE, half widening
+and power-of-two scaling. The Python reference uses explicit bit-position loops,
+signed fields and masked operand widths. Each backend performs 192 positive
+draws and twelve deliberately wrong references that must report pixel mismatch.
+At most four independent renderer processes run at once, each with its own
+case file and a 15-second deadline; this bounds device-initialization overhead.
+The acceptance-only controls do not add forms to other draw tests' records.
+`tests/form_coverage_check.py` requires precisely the twelve forms in both GPU
+reference lists and leaves them uncovered for failed or skipped tests.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_bits_(hardware|warp)$' -V
+```
+
+Measured on Windows 11 build 26300.9974, MSVC 19.44.35230 and Windows SDK
+10.0.26100 DXC, based on main `6ee2406` plus this change: both new CTests
+passed, without capability skips, with zero pixel error. NVIDIA GeForce RTX 3060
+(10de:2503), driver 32.0.16.2101, completed in 113.72 seconds; WARP
+10.0.26100.9818 completed in 8.46 seconds. The debug layer was unavailable.
+The earlier serial hardware matrix exceeded its 180-second suite deadline;
+completed draws matched. Bounded parallel device initialization completed the
+same matrix within that budget. The existing `pixel_aot_warp` also passed;
+the legacy `pixel_aot_hardware` reached its separate 60-second timeout and is
+not counted as a pass. No full-suite success is claimed.
+
+The native AMDGPU binary round trip is also part of `pixel_aot_check.py binary`;
+LLVM 18 assembled and disassembled all twelve forms for gfx1013 and the generated
+HLSL matched source lowering. The tests and implementation are original MIT code.
+During this work, Leonida's independently implemented SPIR-V semantic tests were
+reviewed at revision `67204bf8c0471335d9046890288b33e8d5e2875b`; no Leonida source
+was incorporated into this translator.
+
 ## Offline pixel shader recompilation
 
 `tools/pixel_aot.py` extracts one named pixel program from a local archive, decodes gfx1013 instructions with LLVM and emits HLSL. DXC compiles the result to desktop DXIL before the draw. The lowerer tracks register writes across whole-quad interpolation of attribute 0, a scalar texture-descriptor load, a 2D RGBA sample, packed round-toward-zero binary16 conversions and one compressed color export. Unknown instructions, mismatched bindings and reads before the required wait cause translation to fail. [LLVM disassembler API](https://llvm.org/docs/doxygen/group__LLVMCDisassembler.html) · [Leonida public format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/fssm_unpack.py)
