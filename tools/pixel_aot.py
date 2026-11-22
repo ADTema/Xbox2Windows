@@ -687,6 +687,34 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
+
+        elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+                      for t in tokens]
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({op}({values[0]}, {values[1]}));")
+        elif m := match(r"v_(min3|max3|med3)_(i32|u32)(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+                      for t in tokens]
+            if op == "med3":
+                vec_type = "int3" if kind == "i32" else "uint3"
+                lines.append(f"    {vec_type} med{i} = {vec_type}({values[0]}, {values[1]}, {values[2]});")
+                expression = f"max(min(med{i}.x, med{i}.y), min(max(med{i}.x, med{i}.y), med{i}.z))"
+            else:
+                fn = op[:-1]
+                expression = f"{fn}({fn}({values[0]}, {values[1]}), {values[2]})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({expression});")
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, dst, *tokens = m.groups()
             regs = lane_mask(dst)
