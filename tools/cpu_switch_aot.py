@@ -106,6 +106,30 @@ exact image, bound to its SHA-256. Each range must lie in executable code and
 overlap no runtime function and no other binding. A call or tail jump may enter
 a bound range only at its start; the callee is walked within that range alone,
 may not move RSP or call, and may not be an import thunk.
+
+A call or tail jump through the import address table is translated only through
+an explicit binding (--bind, --import-arguments, --return-bytes): one IAT slot
+for all functions of a run, which must hold the import that the binding names.
+It may be reached by call or jmp QWORD PTR [rip+slot], or by a direct CALL or
+JMP of an import thunk: the six bytes FF 25 disp32 at a target outside every
+unwind interval and bound range, read as a call or tail jump through their
+slot. A call or thunk counts only when its slot is one of the ordinary import
+directory; the slot must be eight bytes of one section marked readable.
+Those checks establish the slot identity and expected initial mapping. During
+execution of the original and its translation, the caller must keep the image
+and bound target valid and ensure the slot stays readable and contains that
+target. The translation directly calls the binding. Delay-loaded imports,
+rebinding and page protection changes are outside this contract. A call becomes
+"rax = import(...);" under the rules of a direct call above: RSP 8
+mod 16, the home space below the return address, and each register of the
+binding's argument count (RCX, RDX, R8, then R9) fully defined. After it RAX
+holds the binding's number of guaranteed low bytes, none for 0, and the other
+volatile registers, the flags and the 32 bytes at RSP are undefined; the
+nonvolatile registers and the rest of the frame are kept. That is a term of the
+binding: the import is taken to follow the Windows x64 calling convention,
+which the translator cannot check. A tail jump becomes "return import(...);"
+and contributes the binding's number to the return width; a call contributes
+only through the RAX bytes defined at a later RET.
 """
 
 import re
@@ -157,9 +181,17 @@ SIGN_EXTENSIONS = {M.CBW: (R.AL, R.AX), M.CWDE: (R.AX, R.EAX), M.CDQE: (R.EAX, R
 # Implicit operands of one-operand MUL, IMUL, DIV and IDIV, by operand width.
 ACCUMULATOR = {1: R.AL, 2: R.AX, 4: R.EAX, 8: R.RAX}
 DATA = {2: R.DX, 4: R.EDX, 8: R.RDX}
+# Key by decoded Code, not Mnemonic: MOVSD also names an unrelated SSE instruction.
+STRING_TRANSFERS = {
+    Code.MOVSB_M8_M8: ("movs", 1), Code.MOVSW_M16_M16: ("movs", 2),
+    Code.MOVSD_M32_M32: ("movs", 4), Code.MOVSQ_M64_M64: ("movs", 8),
+    Code.STOSB_M8_AL: ("stos", 1), Code.STOSW_M16_AX: ("stos", 2),
+    Code.STOSD_M32_EAX: ("stos", 4), Code.STOSQ_M64_RAX: ("stos", 8),
+}
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS}
+FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
+                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD}
 FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
@@ -191,6 +223,9 @@ def full(register):
 def implicit_writes(ins):
     """Full registers that an instruction writes without naming them as operand 0. RDX counts for
     every one-operand multiply or divide, although an 8-bit multiply leaves it unchanged."""
+    if ins.code in STRING_TRANSFERS:
+        kind, _ = STRING_TRANSFERS[ins.code]
+        return {R.RDI} | ({R.RSI} if kind == "movs" else set()) | ({R.RCX} if ins.has_rep_prefix else set())
     if ins.mnemonic in SIGN_EXTENSIONS:
         return {full(SIGN_EXTENSIONS[ins.mnemonic][1])}
     if ins.mnemonic in (M.MUL, M.IMUL, M.DIV, M.IDIV) and ins.op_count == 1:
@@ -292,6 +327,11 @@ class Entries:
         self.entries = set(self.primary)
         self.entries.update(rva for rva, kind in self.exports.items()
                             if kind == "code" and self.owner(rva) is None)
+        # The IAT slots of the ordinary import directory: a call through one, or a direct call or jump to a thunk
+        # through one, goes to the import binding.
+        pe.parse_data_directories(directories=[1])
+        self.import_slots = {imp.address - pe.OPTIONAL_HEADER.ImageBase
+                             for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", ()) for imp in desc.imports}
         self.bound = {}  # start -> (end, name) of each verified range binding
         if bindings is not None:
             self.bind(pe, bindings)
@@ -463,10 +503,10 @@ class Function:
         for address in range(begin, end):
             self.owner[address] = owner
 
-    def thunk_slot(self, ins, imports):
+    def thunk_slot(self, ins):
         """Recognize the complete x64 FF 25 disp32 linker thunk in executable bytes."""
         target = ins.near_branch_target
-        if not imports or not executable(self.pe, target):
+        if not executable(self.pe, target):
             return None
         if self.pe.get_data(target, 2) != b"\xff\x25":
             return None
@@ -476,7 +516,13 @@ class Function:
         code = image_bytes(self.pe, target, 6, executable=True)
         return target + 6 + int.from_bytes(code[2:], "little", signed=True)
 
-    def explore(self, imports=None, *, callback_calls=False, tail_resolver=None):
+    def bound_import(self, resolver, slot, ip, what):
+        """The import that the call or tail jump at ip reaches through IAT slot slot, given by the binding."""
+        if resolver is None:
+            raise ValueError(f"no binding for the {what} through IAT slot RVA {slot:#x} at RVA {ip:#x}")
+        return resolver(slot)
+
+    def explore(self, imports=None, *, callback_calls=False, import_resolver=None):
         pending = [self.entry]
         indirect = []
         while pending or indirect:
@@ -501,6 +547,15 @@ class Function:
             elif flow == FlowControl.CONDITIONAL_BRANCH and ins.is_jcc_short_or_near:
                 targets = [ins.near_branch_target, ins.next_ip]
             elif (flow == FlowControl.UNCONDITIONAL_BRANCH and ins.is_jmp_short_or_near
+                  and self.entries.import_slots and not self.owns(ins.near_branch_target)
+                  and self.thunk_slot(ins) in self.entries.import_slots):
+                # A jump to an import thunk is a tail jump through the thunk's slot.
+                slot = self.thunk_slot(ins)
+                self.host_calls[ip] = self.bound_import(
+                    import_resolver, slot, ip, f"tail jump to the thunk at RVA {ins.near_branch_target:#x}")
+                self.tails[ip] = slot
+                targets = []
+            elif (flow == FlowControl.UNCONDITIONAL_BRANCH and ins.is_jmp_short_or_near
                   and not self.owns(ins.near_branch_target) and self.leaves_for(ins)):
                 # A jump to another function's entry outside this one is a tail call.
                 self.tails[ip] = ins.near_branch_target
@@ -509,15 +564,18 @@ class Function:
                 targets = [ins.near_branch_target]
             elif (ins.code == Code.JMP_RM64 and ins.memory_base == R.RIP and not ins.has_segment_prefix):
                 slot = ins.ip_rel_memory_address
-                if tail_resolver is None:
-                    raise ValueError(f"no binding for the tail jump through IAT slot RVA {slot:#x} at RVA {ip:#x}")
-                self.host_calls[ip] = tail_resolver(slot)
+                self.host_calls[ip] = self.bound_import(import_resolver, slot, ip, "tail jump")
                 self.tails[ip] = slot
                 targets = []
             elif flow == FlowControl.CALL and ins.is_call_near:
-                slot = self.thunk_slot(ins, imports)
-                if slot is not None and slot in imports:
+                slot = self.thunk_slot(ins) if imports or self.entries.import_slots else None
+                if slot is not None and imports and slot in imports:
                     self.host_calls[ip] = imports[slot]
+                    self.calls[ip] = slot
+                elif slot in self.entries.import_slots:
+                    # A call of an import thunk is a call through the thunk's slot.
+                    self.host_calls[ip] = self.bound_import(
+                        import_resolver, slot, ip, f"call of the thunk at RVA {ins.near_branch_target:#x}")
                     self.calls[ip] = slot
                 else:
                     self.calls[ip] = self.callee(ins)
@@ -526,6 +584,13 @@ class Function:
                   and not ins.has_segment_prefix and ins.ip_rel_memory_address in imports):
                 self.host_calls[ip] = imports[ins.ip_rel_memory_address]
                 self.calls[ip] = ins.ip_rel_memory_address
+                targets = [ins.next_ip]
+            elif (ins.code == Code.CALL_RM64 and ins.memory_base == R.RIP and not ins.has_segment_prefix
+                  and ins.ip_rel_memory_address in self.entries.import_slots):
+                # An ordinary call through an IAT slot.
+                slot = ins.ip_rel_memory_address
+                self.host_calls[ip] = self.bound_import(import_resolver, slot, ip, "call")
+                self.calls[ip] = slot
                 targets = [ins.next_ip]
             elif (callback_calls and ins.code == Code.CALL_RM64 and not ins.has_segment_prefix
                   and ins.op0_kind == OpKind.MEMORY and ins.memory_base != R.RIP):
@@ -904,6 +969,34 @@ class Lifter:
         sets_flags records the flag inputs for a later consumer; producer is the
         instruction whose flags a SETcc or CMOVcc reads."""
         mnemonic = ins.mnemonic
+        if ins.code in STRING_TRANSFERS:
+            kind, width = STRING_TRANSFERS[ins.code]
+            if (ins.has_segment_prefix or ins.has_repne_prefix or ins.has_lock_prefix
+                    or any(ins.op_kind(n) not in (OpKind.REGISTER, OpKind.MEMORY_ESRDI, OpKind.MEMORY_SEG_RSI)
+                           for n in range(ins.op_count))):
+                raise ValueError(f"unsupported string addressing or prefix at RVA {ins.ip:#x}")
+            registers = {R.RDI} | ({R.RSI} if kind == "movs" else set())
+            self.used.update(registers)
+            reads = dict.fromkeys(registers, 8)
+            writes = dict.fromkeys(registers, 8)
+            if kind == "movs":
+                value = f"load_always<{unsigned(width)}>(rsi)"
+            else:
+                self.used.add(R.RAX)
+                reads[R.RAX] = width
+                value = f"static_cast<{unsigned(width)}>(rax)"
+            # One element at a time: neither memcpy nor memmove reproduces a forward
+            # overlapping MOVS that reads the bytes just written by earlier iterations.
+            alignment = " __unaligned" if width > 1 else ""
+            step = (f"*reinterpret_cast<volatile {unsigned(width)}{alignment}*>(rdi) = {value}; "
+                    + ("rsi += step; " if kind == "movs" else "") + "rdi += step;")
+            if ins.has_rep_prefix:
+                self.used.add(R.RCX)
+                reads[R.RCX] = writes[R.RCX] = 8
+                step = f"while (rcx != 0) {{ {step} --rcx; }}"
+            return f"{{ const word step = direction ? 0ull - {width}ull : {width}ull; {step} }}", reads, writes
+        if mnemonic in (M.CLD, M.STD):
+            return f"direction = {'true' if mnemonic == M.STD else 'false'};", {}, {}
         width = self.width(ins)
         reads, writes = {}, {}
 
@@ -1308,6 +1401,28 @@ def check_call_sites(function, offsets):
             raise ValueError(f"call without an aligned home space at entry RSP{offsets[ip]:+#x} at RVA {ip:#x}")
 
 
+def prove_direction(function):
+    """The Windows ABI enters with DF clear and requires it clear at calls and returns.
+
+    Keep both possibilities at joins. The emitted local follows the actual path;
+    this proof prevents a backwards-copy region from leaking DF across an ABI edge.
+    """
+    states = {function.entry: frozenset({False})}
+    work = [function.entry]
+    while work:
+        ip = work.pop()
+        ins = function.instructions[ip]
+        incoming = states[ip]
+        if (ins.mnemonic == M.RET or ip in function.calls or ip in function.tails) and True in incoming:
+            raise ValueError(f"direction flag may be set at call or return RVA {ip:#x}")
+        outgoing = (frozenset({ins.mnemonic == M.STD}) if ins.mnemonic in (M.CLD, M.STD) else incoming)
+        for target in function.successors[ip]:
+            merged = states.get(target, frozenset()) | outgoing
+            if merged != states.get(target):
+                states[target] = merged
+                work.append(target)
+
+
 def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=False):
     """Translate one export that takes the given number of integer arguments, 3 or 4.
 
@@ -1351,7 +1466,7 @@ class Program:
         self.callees = {}
         self.refused = {}
         self.sources = []
-        self.tail_resolver = None
+        self.import_resolver = None
 
     def lift(self, entry, symbol, arguments, internal=False):
         self.active.append(entry)
@@ -1424,7 +1539,7 @@ def lift_function(program, entry, symbol, arguments, internal):
         if first.flow_control == FlowControl.INDIRECT_BRANCH and first.op0_kind == OpKind.MEMORY:
             raise ValueError(f"bound function {function.bound[2]} at RVA {entry:#x} is an import thunk "
                              "(an indirect jump through memory)")
-    edges = function.explore(program.imports, tail_resolver=program.tail_resolver)
+    edges = function.explore(program.imports, import_resolver=program.import_resolver)
     image_data = program.image_data
     lifter = Lifter(pe if image_data else None)
     # A RIP-relative LEA that loads a recognised table base stays a guest address, with or without image data.
@@ -1439,6 +1554,7 @@ def lift_function(program, entry, symbol, arguments, internal):
             what = "call" if moved[0] in function.calls else "stack change"
             raise ValueError(f"{what} in a function without unwind data at RVA {moved[0]:#x}")
     check_call_sites(function, frame.offsets)
+    prove_direction(function)
     lifter.frame = {ip: access[0] - frame.start for ip, access in frame.accesses.items()}
     lifter.adjustments = frame.adjustments
     producers = {ip: flag_producer(function, edges, ins) for ip, ins in instructions.items()
@@ -1454,7 +1570,7 @@ def lift_function(program, entry, symbol, arguments, internal):
     effects = {}
     for ip in order:
         ins = instructions[ip]
-        if ins.has_lock_prefix or ins.has_rep_prefix or ins.has_repne_prefix:
+        if ins.has_lock_prefix or ins.has_repne_prefix or (ins.has_rep_prefix and ins.code not in STRING_TRANSFERS):
             raise ValueError(f"unsupported prefix at RVA {ip:#x}")
         body[ip] = ""
         if ip in callees:
@@ -1576,6 +1692,8 @@ def lift_function(program, entry, symbol, arguments, internal):
             labels.add(ins.next_ip)
     locals_ = sorted((lifter.used | {R.RAX}) - set(function.arguments), key=lambda r: NAMES[r])
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
+    if any(ins.code in STRING_TRANSFERS or ins.mnemonic in (M.CLD, M.STD) for ins in instructions.values()):
+        declarations.append("bool direction = false;  // Windows x64 ABI entry state")
     function.image_data = lifter.image_used
     if lifter.image_used:
         # Read once at entry: a call while nothing is bound fails here, before any access.
@@ -1631,7 +1749,7 @@ template <class T> static T load(word address) {
 // Every guest read, once per instruction: the compiler must perform it even when its value is unused,
 // because the original faults on an inaccessible address either way.
 template <class T> static T load_always(word address) {
-    return *reinterpret_cast<const volatile T*>(address);
+    return *reinterpret_cast<const volatile T __unaligned*>(address);
 }
 template <class T> static void store(word address, T value) {
     std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
@@ -1773,20 +1891,25 @@ def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
         if binding.arguments not in ARGUMENT_COUNTS or binding.return_bytes not in (0, 1, 2, 8):
             raise ValueError(f"unsupported binding of {binding.symbol}")
 
-        def resolve_tail(slot):
+        def resolve_slot(slot):
             if slots and slot not in slots:
-                raise ValueError(f"tail jump through a second IAT slot RVA {slot:#x}")
+                raise ValueError(f"call or tail jump through a second IAT slot RVA {slot:#x}")
             symbol = resolve_import(pe, slot, Path(binding.provider), binding.symbol, binding.link_name)
+            # The translation calls the import instead of reading the slot; the original's read must not fault.
+            if not any(s.VirtualAddress <= slot and slot + 8 <= s.VirtualAddress + extent(s)
+                       and s.Characteristics & SCN_READ for s in pe.sections):
+                raise ValueError(f"IAT slot RVA {slot:#x} is not 8 bytes of one readable section")
             slots[slot] = HostImport(symbol, (8,) * binding.arguments, binding.return_bytes)
             return slots[slot]
-        program.tail_resolver = resolve_tail
+        program.import_resolver = resolve_slot
     functions = [lift(pe, *parse_entry(name), program=program) for name in names]
     # Callees precede every caller, so each internal function is defined before its first use.
     sources = program.sources + [source for source, _ in functions]
     declarations = ""
     if binding is not None:
         if not slots:
-            raise ValueError(f"binding {Path(binding.provider).name}!{binding.symbol} supplied but no tail jump uses it")
+            raise ValueError(f"binding {Path(binding.provider).name}!{binding.symbol} supplied but no call or "
+                             "tail jump uses it")
         symbol = next(iter(slots.values())).symbol
         params = ", ".join(["word"] * binding.arguments)
         declarations = f'\nextern "C" __declspec(dllimport) word {symbol}({params});\n'
@@ -1810,7 +1933,9 @@ if __name__ == "__main__":
     parser.add_argument("--bind-ranges", type=Path, metavar="MANIFEST",
                         help="trusted [start, end) ranges of functions without unwind data, bound to this image's sha256")
     parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"),
-                        help="provider and export name or #ordinal of the import that a tail jump calls")
+                        help="provider and export name or #ordinal of the import that calls and tail jumps "
+                             "through the import address table reach. The image and target must stay valid and "
+                             "the original slot must stay readable and contain that target throughout execution")
     parser.add_argument("--link-name", help="local import-library symbol for an ordinal binding")
     parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS,
                         help="integer arguments the bound import takes; stated by the binding, not derived from "
