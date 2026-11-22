@@ -1744,6 +1744,32 @@ compares all 320 output words each time. The stale reference fails on exactly
 eight stored words. The binding is limited to unsigned 32-bit words and fixed
 byte offsets.
 
+### Compute programs with two exits
+
+Compute programs (stage 5) now use the [pixel two-exit check](#pixel-programs-with-two-exits) from #477 when LLVM is supplied. Only exactly two aligned `s_endpgm` markers qualify. One marker is unchanged, three or more are rejected, and mesh programs (stage 13) with more than one marker are still rejected. `compute_store_aot.py` now passes `--llvm` to the extractor, and `shader_profile_audit.py` already did. This step extracts the code span only. The store profile does not lower branches, so a two-exit program now stops at its first unsupported instruction instead of at extraction.
+
+The fixtures are original kernels compiled with LLVM 15 and reassembled with `llvm-mc-15`:
+
+```sh
+llc-15 -mtriple=amdgcn--amdpal -mcpu=gfx1013 -O2 -filetype=obj kernel.ll -o kernel.o
+llvm-objdump-15 -d --mcpu=gfx1013 kernel.o
+```
+
+A wave-uniform `if (gid >= n) return;` with branch weights that mark the return likely compiles to `s_cmp_ge_u32`, then `s_cbranch_scc0` over the early `s_endpgm` to the store block. That is the layout #477 verifies. Both an `amdgpu_kernel` and an `amdgpu_cs` form are extracted unchanged, and the CLI and the audit then stop at the lowering. Without branch weights, LLVM 15 branches to one shared exit instead. A per-lane bound (`local X >= n`) compiles to `s_and_saveexec_b32` and `s_cbranch_execz` over the store to a single `s_endpgm`, which already passes as a one-exit program.
+
+`tests/compute_store_check.py binary` rejects:
+
+- the same program without LLVM, or marked as a mesh program;
+- a branch one instruction late, a branch to the final exit, a target separated from the early exit by a NOP, and a skipped non-NOP word;
+- an unconditional branch that disconnects the early exit, and a missing branch that disconnects the store block;
+- a third exit, or a literal word equal to `s_endpgm` that makes a third marker;
+- in a one-exit program, the same literal, which gives two markers but one decoded exit;
+- a branch into a literal operand or into the trailing `s_code_end` padding.
+
+An `s_branch` that skips an alignment NOP at the start is still accepted, and the NOP stays in the span.
+
+These are fixture results only. The 1,002 multi-exit CS records in the [fixed-profile rescan](#fixed-profile-archive-rescan) have not been split by marker count, so it is not known how many have exactly two exits or this layout. Their counts have not been remeasured after this change.
+
 ### Two- and three-dimensional thread groups
 
 The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits
