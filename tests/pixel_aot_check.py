@@ -425,6 +425,25 @@ def int_minmax_triple(kind):
     ])
 
 
+def frexp_mant_values():
+    return with_constants([
+        "v_frexp_mant_f32_e32 v12, s44",
+        "v_frexp_mant_f32_e64 v13, -|s45|",
+        "v_frexp_mant_f32_e64 v14, |s46|",
+        "v_frexp_mant_f32_e64 v15, s47 clamp",
+    ])
+
+
+def ldexp_values():
+    return with_constants([
+        "v_mov_b32_e32 v18, s44",
+        "v_ldexp_f32 v12, v18, s45",
+        "v_ldexp_f32 v13, -|s44|, 2",
+        "v_ldexp_f32 v14, s46, -2",
+        "v_ldexp_f32 v15, s47, 3 clamp",
+    ])
+
+
 # The gfx10 predicate number is a four-bit truth table. Bits 0..3 select
 # less, equal, greater and unordered respectively, independent of the HLSL.
 PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
@@ -1766,6 +1785,36 @@ def check_controls(directory):
     wqm = base_pair.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base_pair[:wqm] + ["v_min_u32_e32 v20, 0, 1"] + base_pair[wqm:])
 
+    # v_frexp_mant_f32 and v_ldexp_f32 controls and rejections.
+    frexp_body = translate(frexp_mant_values()).split("float4 main", 1)[1]
+    assert "frexp_mant32(params[0].w)" in frexp_body, frexp_body
+    assert "frexp_mant32((-abs(params[1].x)))" in frexp_body, frexp_body
+    assert "saturate(frexp_mant32(params[1].z))" in frexp_body, frexp_body
+    ldexp_body = translate(ldexp_values()).split("float4 main", 1)[1]
+    assert "ldexp32(alu20, asint(params[1].x))" in ldexp_body, ldexp_body
+    assert "ldexp32((-abs(params[0].w)), asint(2u))" in ldexp_body, ldexp_body
+    assert "ldexp32(params[1].y, asint(4294967294u))" in ldexp_body, ldexp_body
+    assert "saturate(ldexp32(params[1].z, asint(3u)))" in ldexp_body, ldexp_body
+    for bad in (
+        "v_ldexp_f32 v12, v18, -s45",
+        "v_ldexp_f32 v12, v18, |s45|",
+        "v_ldexp_f32 v12, v18, abs(s45)",
+        "v_ldexp_f32 v12, v18",
+        "v_ldexp_f32 v12, v18, 0x100000000",
+    ):
+        changed = [line.replace("v_ldexp_f32 v12, v18, s45", bad) for line in ldexp_values()]
+        assert changed != ldexp_values()
+        must_reject(translate, changed)
+    base_ld = ldexp_values()
+    wait = base_ld.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, base_ld[:wait] + ["v_frexp_mant_f32_e32 v12, 1.0"] + base_ld[wait:])
+    must_reject(translate, base_ld[:wait] + ["v_ldexp_f32 v13, 1.0, 2"] + base_ld[wait:])
+    load = next(i for i, line in enumerate(base_ld) if line.startswith("s_buffer_load_dwordx4"))
+    lgkm = base_ld.index("s_waitcnt lgkmcnt(0)", load)
+    must_reject(translate, base_ld[:lgkm] + ["v_ldexp_f32 v20, 1.0, s45"] + base_ld[lgkm:])
+    wqm = base_ld.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, base_ld[:wqm] + ["v_ldexp_f32 v20, 1.0, 2"] + base_ld[wqm:])
+
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
@@ -1773,6 +1822,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate)]
     fixtures.append((with_constants(CLASS_BODY), translate))
+    fixtures.extend([(frexp_mant_values(), translate), (ldexp_values(), translate)])
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((int_predicate_group(kind, encoding, first), translate)
                     for kind in ("i32", "u32") for encoding in ("e32", "e64") for first in (0, 4))
@@ -1916,6 +1966,61 @@ def check_int_minmax_draws(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Replacing v_med3_i32 with v_med3_u32 escaped detection")
+
+def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
+    source = directory / "frexp_ldexp.hlsl"
+    shader = directory / "frexp_ldexp.cso"
+    case = directory / "frexp_ldexp.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+
+    source.write_text(translate(frexp_mant_values()), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for a, b, c, d in ((3.0, 6.0, -0.25, -3.0), (-0.0, 0.0, 0.75, 12.0)):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, a, b, c, d)
+        expected = (
+            math.frexp(a)[0],
+            math.frexp(-abs(b))[0],
+            math.frexp(abs(c))[0],
+            min(1.0, max(0.0, math.frexp(d)[0])),
+        )
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+
+    wrong_frexp = [line.replace("v_frexp_mant_f32_e32", "v_mov_b32_e32") for line in frexp_mant_values()]
+    source.write_text(translate(wrong_frexp), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, 3.0, 6.0, -0.25, -3.0)
+    case.write_bytes(constants + struct.pack("<4f", 0.75, -0.75, 0.5, 0.0) * 64)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Replacing v_frexp_mant_f32 with v_mov_b32 escaped detection")
+
+    source.write_text(translate(ldexp_values()), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for a, exp_i, c, d in ((0.75, 3, 6.0, 0.25), (-0.0, 10, -2.0, -0.5), (1.5, -2, 0.5, 0.0625)):
+        constants = bytearray(256)
+        struct.pack_into("<fiff", constants, 12, a, exp_i, c, d)
+        expected = (
+            math.ldexp(a, exp_i),
+            math.ldexp(-abs(a), 2),
+            math.ldexp(c, -2),
+            min(1.0, max(0.0, math.ldexp(d, 3))),
+        )
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+
+    wrong_ldexp = [line.replace("v_ldexp_f32 v14, s46, -2", "v_ldexp_f32 v14, s46, 2") for line in ldexp_values()]
+    source.write_text(translate(wrong_ldexp), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    constants = bytearray(256)
+    struct.pack_into("<fiff", constants, 12, 0.75, 3, 6.0, 0.25)
+    case.write_bytes(constants + struct.pack("<4f", 6.0, -3.0, 1.5, 1.0) * 64)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Inverting the v_ldexp_f32 exponent sign escaped detection")
 
 
 def check_render(directory, compiler, renderer, backend):
@@ -2075,6 +2180,8 @@ def check_render(directory, compiler, renderer, backend):
     check_cube_draw(directory, compiler, renderer, backend)
     check_fract_draw(directory, compiler, renderer, backend)
     check_int_minmax_draws(directory, compiler, renderer, backend)
+
+    check_frexp_ldexp_draws(directory, compiler, renderer, backend)
 
     program = scalar64()
     source.write_text(translate(program), encoding="ascii")

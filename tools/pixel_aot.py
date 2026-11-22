@@ -160,6 +160,47 @@ float mad32(float a, float b, float c) {
     precise float sum = product + ftz32(c);
     return ftz32(sum);
 }
+// v_frexp_mant_f32: normalized significand in (-1, -0.5] U [0.5, 1), preserving +/-0, +/-Inf and NaN.
+float frexp_mant32(float value) {
+    uint bits = asuint(value);
+    uint exp = (bits >> 23) & 0xffu;
+    uint mant = bits & 0x7fffffu;
+    if (exp == 0xffu || (exp == 0u && mant == 0u)) return value;
+    uint sign = bits & 0x80000000u;
+    if (exp == 0u) {
+        uint shift = 23u - firstbithigh(mant);
+        mant = (mant << shift) & 0x7fffffu;
+    }
+    return asfloat(sign | 0x3f000000u | mant);
+}
+// v_ldexp_f32: exact binary32 scaling by 2^delta, preserving +/-0, +/-Inf and NaN.
+float ldexp32(float value, int delta) {
+    uint bits = asuint(value);
+    uint sign = bits & 0x80000000u;
+    uint exp = (bits >> 23) & 0xffu;
+    uint mant = bits & 0x7fffffu;
+    if (exp == 0xffu || (exp == 0u && mant == 0u)) return value;
+    int e = (int)exp;
+    if (exp == 0u) {
+        uint shift = 23u - firstbithigh(mant);
+        mant = (mant << shift) & 0x7fffffu;
+        e = 1 - (int)shift;
+    }
+    e += clamp(delta, -512, 512);
+    if (e >= 255) return asfloat(sign | 0x7f800000u);
+    if (e <= 0) {
+        if (e < -23) return asfloat(sign);
+        uint full = mant | 0x800000u;
+        uint shift = (uint)(1 - e);
+        uint half_bit = 1u << (shift - 1u);
+        uint mask = (1u << shift) - 1u;
+        uint rem = full & mask;
+        uint q = full >> shift;
+        if (rem > half_bit || (rem == half_bit && (q & 1u) != 0u)) q++;
+        return asfloat(sign | q);
+    }
+    return asfloat(sign | ((uint)e << 23) | mant);
+}
 // Finite binary32 to binary16, round toward zero, then widen for the float target.
 float export16(float value) {
     uint h = f32tof16(value);
@@ -196,7 +237,7 @@ ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
     "sqrt": (1, "sqrt({0})"), "rsq": (1, "rsqrt({0})"),
     "floor": (1, "floor({0})"), "ceil": (1, "ceil({0})"), "fract": (1, "fract32({0})"),
-    "trunc": (1, "trunc({0})"),
+    "trunc": (1, "trunc({0})"), "frexp_mant": (1, "frexp_mant32({0})"),
     "add": (2, "({0} + {1})"), "mul": (2, "({0} * {1})"),
     "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
     "subrev": (2, "({1} - {0})"),
@@ -645,7 +686,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_pending)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
-        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
             if op in ("fmac", "mac"):
@@ -715,6 +756,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"{fn}({fn}({values[0]}, {values[1]}), {values[2]})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({expression});")
+
+        elif m := match(r"v_ldexp_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+?)( clamp)?"):
+            dst, src0, src1, clamp = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            value = fp_operand(src0, scalar, vector, pending, sample_pending)
+            exponent = int_operand(src1, scalar, vector, pending, sample_pending, signed=True)
+            expression = f"ldexp32({value}, {exponent})"
+            if clamp:
+                expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, dst, *tokens = m.groups()
             regs = lane_mask(dst)
