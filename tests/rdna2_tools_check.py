@@ -119,7 +119,7 @@ class TestRdna2Disasm(unittest.TestCase):
             ("000080bf", "s_nop", "s_nop 0"),
             ("000081bf", "s_endpgm", "s_endpgm"),
             ("000082bf", "s_branch", "s_branch label_0x4"),
-            ("7f008cbf", "s_waitcnt", "s_waitcnt vmcnt(7) lgkmcnt(0)"),
+            ("7f008cbf", "s_waitcnt", "s_waitcnt vmcnt(15) lgkmcnt(0)"),
             ("000382be", "s_mov_b32", "s_mov_b32 s2, s0"),
             ("000482be", "s_mov_b64", "s_mov_b64 s2, s0"),
             ("00008080", "s_sub_u32", "s_sub_u32 s0, s0, s0"),
@@ -299,6 +299,31 @@ class TestRdna2Disasm(unittest.TestCase):
                 self.assertEqual(len(records), 1)
                 self.assertEqual(records[0]["assembly"],
                                  f"exp mrt0 {registers} done compr vm en:{mask:#x}")
+
+    def test_waitcnt_uses_gfx10_counter_fields(self):
+        # GFX10 s_waitcnt simm16: vmcnt [3:0] and [15:14], expcnt [6:4], lgkmcnt [13:8].
+        vectors = [
+            # Printed by LLVM 15.0.7 (MC/Disassembler/AMDGPU/gfx10_dasm_all.txt).
+            ("00008cbf", "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)"),
+            ("34128cbf", "s_waitcnt vmcnt(4) expcnt(3) lgkmcnt(18)"),
+            ("51c18cbf", "s_waitcnt vmcnt(49) expcnt(5) lgkmcnt(1)"),
+            # Encoded by LLVM 15.0.7 (MC/AMDGPU/gfx10_asm_sop.s); bit 7 is unused.
+            ("d1c18cbf", "s_waitcnt vmcnt(49) expcnt(5) lgkmcnt(1)"),
+            # One counter each; the others at their maximum are omitted.
+            ("703f8cbf", "s_waitcnt vmcnt(0)"),
+            ("707f8cbf", "s_waitcnt vmcnt(16)"),
+            ("7f3f8cbf", "s_waitcnt vmcnt(15)"),
+            ("0fff8cbf", "s_waitcnt expcnt(0)"),
+            ("7fc08cbf", "s_waitcnt lgkmcnt(0)"),
+            ("7fff8cbf", "s_waitcnt vmcnt(63) expcnt(7) lgkmcnt(63)"),
+        ]
+        for hex_str, expected in vectors:
+            with self.subTest(encoding=hex_str):
+                records = disasm_rdna2(bytes.fromhex(hex_str + "000081bf"))
+                self.assertEqual([(r["opcode"], r["length"]) for r in records],
+                                 [("s_waitcnt", 4), ("s_endpgm", 4)])
+                self.assertEqual(records[0]["assembly"], expected)
+                self.assertTrue(is_instruction_supported(expected))
 
     def test_literal_operands_keep_stream_aligned(self):
         # SOP1, SOP2, VOP1, VOP2 (src0 == 255) and v_fmaak_f32 each consume a trailing 32-bit literal.
