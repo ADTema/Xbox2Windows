@@ -379,6 +379,8 @@ int main(int argc, char** argv)
         if (argc < 6) return 2;
     } else if ((operation == "--depth-mask" || operation == "--depth-mask-swapped")) {
         if (argc != 6) return 2;
+    } else if (operation == "--spirv-compare-sampler") {
+        if (argc != 6) return 2;
     } else if (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion" ||
                operation == "--spirv-address-window" || operation == "--spirv-sampler-views") {
         if (argc != 4) return 2;
@@ -475,6 +477,15 @@ int main(int argc, char** argv)
                 return 77;
             }
             check_spirv_window(device.Get(), argv[3]);
+        } else if (operation == "--spirv-compare-sampler") {
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+            auto model_hr = check_feature(device.Get(), D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+            if (model_hr != E_INVALIDARG) check(model_hr, "Query comparison-sampler shader model");
+            if (model_hr == E_INVALIDARG || model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
+                std::puts("skip: comparison-sampler fixture requires SM 6.6");
+                return 77;
+            }
+            check_spirv_compare_sampler(device.Get(), argv[3], argv[4], argv[5]);
         } else if (argc == 4 && (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
             check_compute_file(device.Get(), argv[3], operation == "--ffx-immediate-conversion");
         } else if (argc == 5 && operation == "--compute-store-case") {
