@@ -254,13 +254,14 @@ def flush_ftz(value):
     return value
 
 
-def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False):
+def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extra_constants=None):
     """Write a renderer case: 256 constant bytes, then 64 expected float4 rows in row-major order.
 
     A single float4 broadcasts to every texel. The optional trailer appends one flags byte, whose
     bit 0 selects the lossless R32G32B32A32_UINT readback target. Floating-point cases may instead
     append a zero flags byte and 64 mask bytes for per-channel NaN-class checks. Cases written without
-    integer_rt or nan_mask keep the original 1280-byte format exactly.
+    integer_rt or nan_mask keep the original 1280-byte format exactly. extra_constants sets bit 3 of
+    the flags byte and stores 512 bytes after it: the 256-byte buffers bound to b1 and b2.
     """
     rows = [pixels] * 64 if len(pixels) == 4 and not isinstance(pixels[0], (list, tuple)) else list(pixels)
     if len(rows) != 64 or any(len(row) != 4 for row in rows):
@@ -268,7 +269,14 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False):
     data = bytearray(bytes(constants))
     for row in rows:
         data += struct.pack("<4f", *row)
-    if integer_rt:
+    if extra_constants is not None:
+        if integer_rt or nan_mask is not None:
+            raise ValueError("Extra constant buffers are not combined with other trailer fields")
+        if len(extra_constants) != 512:
+            raise ValueError("The b1 and b2 buffers need exactly 512 bytes")
+        data.append(8)
+        data += extra_constants
+    elif integer_rt:
         if nan_mask is not None:
             raise ValueError("NaN-class masks require a floating-point render target")
         data.append(1)
@@ -433,6 +441,33 @@ def with_scalar_constant_reads() -> list[str]:
         "s_buffer_load_dword s63, s[44:47], 0xfc",
     ]
     return program
+
+
+# Two further descriptors beside the b0 one: another slot of the texture table, and a slot of the
+# table whose low address word arrives in entry s9. Every read takes word 2, so only the buffer differs.
+THREE_BUFFERS = dict(constant_descriptor=64, extra_constants=[(20, 0x60), (9, 0x20)])
+
+
+def with_three_constant_buffers() -> list[str]:
+    program = with_constants(["v_mov_b32_e32 v12, s61", "v_mov_b32_e32 v13, s62", "v_mov_b32_e32 v14, s63"])
+    descriptor = program.index("s_load_dwordx4 s[44:47], s[20:21], 0x40")
+    program[descriptor + 1:descriptor + 1] = [
+        "s_load_dwordx4 s[52:55], s[20:21], 0x60",
+        "s_mov_b32 s64, s9",
+        "s_mov_b32 s65, 0",
+        "s_load_dwordx4 s[56:59], s[64:65], 0x20",
+    ]
+    load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc")
+    program[load:load + 1] = [
+        "s_buffer_load_dword s61, s[44:47], 0x8",
+        "s_buffer_load_dword s62, s[52:55], 0x8",
+        "s_buffer_load_dword s63, s[56:59], 0x8",
+    ]
+    return program
+
+
+def translate_three_buffers(instructions):
+    return lower(instructions, 20, 24, [1, 2, 3, 4], **THREE_BUFFERS)
 
 
 def affine_coordinates() -> list[str]:
@@ -1138,6 +1173,44 @@ MAD_BODY = [
     "v_mac_f32_e32 v14, s44, v15",
     "v_mad_f32 v15, 0.5, 4.0, 0.5",
 ]
+
+
+def check_three_buffer_draw(directory, compiler, renderer, backend):
+    """Each channel comes from word 2 of a different buffer; every other word holds a sentinel."""
+    source = directory / "three-buffers.hlsl"
+    shader = directory / "three-buffers.cso"
+    program = with_three_constant_buffers()
+    source.write_text(translate_three_buffers(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+
+    def buffers(values):
+        data = [bytearray(struct.pack("<f", 0.0625) * 64) for _ in values]
+        for buffer, value in zip(data, values, strict=True):
+            struct.pack_into("<f", buffer, 8, value)
+        return data[0], bytes(data[1] + data[2])
+
+    cases = []
+    for idx, (values, expected, status) in enumerate((
+            ((.25, -.5, .75), (.25, -.5, .75), "pass"),
+            ((-.125, .625, .875), (-.125, .625, .875), "pass"),
+            # The reference reads b1 and b2 exchanged, then b0 in place of b1.
+            ((.25, -.5, .75), (.25, .75, -.5), "mismatch"),
+            ((.25, -.5, .75), (.25, .25, .75), "mismatch"))):
+        first, extra = buffers(values)
+        case = write_case(directory / f"three-buffers-{idx}.case", first, (*expected, 1), extra_constants=extra)
+        cases.append((case, status))
+    run_pixel_batch(renderer, backend, shader, cases)
+    # Exchanging the two contract entries exchanges b1 and b2 in the translation.
+    exchanged = dict(THREE_BUFFERS, extra_constants=THREE_BUFFERS["extra_constants"][::-1])
+    source.write_text(lower(program, 20, 24, [1, 2, 3, 4], **exchanged), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    run_pixel_batch(renderer, backend, shader, [(cases[0][0], "mismatch"), (cases[2][0], "pass")])
+    # A truncated pair of extra buffers is a case-format error, not a draw.
+    short = directory / "three-buffers-short.case"
+    short.write_bytes(cases[0][0].read_bytes()[:-4])
+    broken = subprocess.run([renderer, backend, "--check-pixel-case", shader, short], capture_output=True, text=True)
+    if broken.returncode != 1 or "Expected two 256-byte constant buffers for b1 and b2" not in broken.stderr:
+        raise AssertionError(f"A short extra-constant case was accepted\n{broken.stdout}\n{broken.stderr}")
 
 
 def check_mad_draw(directory, compiler, renderer, backend):
@@ -3246,6 +3319,86 @@ def check_constant_descriptor_bounds() -> None:
                 raise AssertionError(f"Constant descriptor at {offset} overlaps texture 0")
 
 
+def check_three_constant_buffers() -> None:
+    program = with_three_constant_buffers()
+    source = translate_three_buffers(program)
+    for slot, name in enumerate(("params", "params1", "params2")):
+        suffix = str(slot) if slot else ""
+        assert f"cbuffer Constants{suffix} : register(b{slot}) {{ float4 {name}[16]; }};" in source
+        assert source.count(f"{name}[0].z") == 1
+
+    def bound(instructions, constant_descriptor=64, extra_constants=((20, 0x60), (9, 0x20))):
+        return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor, extra_constants=extra_constants)
+
+    def changed(old, new):
+        assert old in program
+        return [new if line == old else line for line in program]
+
+    def exchange(text, a, b):
+        return text.replace(a, "#").replace(b, a).replace("#", b)
+
+    # The contract order alone selects the register, and b0 is optional.
+    swapped = bound(program, extra_constants=((9, 0x20), (20, 0x60)))
+    assert swapped != source and swapped == exchange(source, "params1[0].z", "params2[0].z")
+    only_extra = bound(program, None, ((20, 0x40), (20, 0x60), (9, 0x20)))
+    assert "register(b0)" not in only_extra and "params3[0].z" in only_extra
+    # One offset on two tables names two descriptors.
+    same_offset = changed("s_load_dwordx4 s[56:59], s[64:65], 0x20", "s_load_dwordx4 s[56:59], s[64:65], 0x60")
+    assert bound(same_offset, extra_constants=((20, 0x60), (9, 0x60))) == source
+
+    # A descriptor the contract does not name is refused, on either table.
+    for old in ("s_load_dwordx4 s[52:55], s[20:21], 0x60", "s_load_dwordx4 s[56:59], s[64:65], 0x20"):
+        expect_value_error(bound, changed(old, old[:-2] + "70"), "Constant descriptor differs from binding contract")
+    expect_value_error(translate, program, "Constant descriptor differs from binding contract")
+    expect_value_error(lambda p: bound(p, extra_constants=((9, 0x20),)), program,
+                       "Constant descriptor differs from binding contract")
+    expect_value_error(lambda p: bound(p, None, ()), program, "Unresolved constant buffer binding")
+    # An entry register outside the contract stays unbound.
+    try:
+        bound(program, extra_constants=((20, 0x60),))
+    except KeyError as error:
+        assert error.args == ("s9",), error
+    else:
+        raise AssertionError("An unbound table register was accepted")
+    # The table address needs a zero high word, and its low word is not a number.
+    for high in ("s_mov_b32 s65, 1", "s_mov_b32 s65, s9", "s_mov_b32 s65, s20"):
+        expect_value_error(bound, changed("s_mov_b32 s65, 0", high), "Unresolved constant buffer binding")
+    expect_value_error(bound, changed("s_mov_b32 s64, s9", "s_add_i32 s64, s9, 4"),
+                       "Expected a numeric scalar register: s9")
+    # A texture descriptor is not read from a constant table.
+    expect_value_error(bound, changed("s_load_dwordx4 s[56:59], s[64:65], 0x20",
+                                      "s_load_dwordx8 s[56:63], s[64:65], 0x20"),
+                       "Unbound texture descriptor offset")
+    expect_value_error(lambda p: bound(p, extra_constants=((20, 0x60), (9, 0x20))),
+                       changed("s_load_dwordx4 s[56:59], s[64:65], 0x20", "s_load_dwordx8 s[56:63], s[64:65], null"),
+                       "Texture address differs from binding contract")
+    # Descriptor words from two buffers do not form one descriptor.
+    read = program.index("s_buffer_load_dword s62, s[52:55], 0x8")
+    wait = "s_waitcnt lgkmcnt(0)"
+    for mixed in ("s_mov_b32 s53, s57", "s_mov_b32 s52, s56", "s_mov_b32 s55, 0"):
+        expect_value_error(bound, program[:read] + [wait, mixed] + program[read:], "Unresolved constant buffer binding")
+    # A whole descriptor copied word by word keeps its buffer.
+    copied = program[:read] + [wait, *(f"s_mov_b32 s{52 + n}, s{56 + n}" for n in range(4))] + program[read:]
+    assert "params1" not in bound(copied).split("main(")[1] and bound(copied).count("params2[0].z") == 2
+    # A descriptor is read only after its load completes.
+    first_wait = program.index(wait)
+    must_reject(bound, program[:first_wait] + ["s_buffer_load_dword s62, s[52:55], 0x8"] + program[first_wait:])
+
+    for extra, message in (
+            (((20, 0x40),), "Constant descriptors overlap"), (((20, 0x4c),), "Constant descriptors overlap"),
+            (((20, 0x34),), "Constant descriptors overlap"), (((9, 0x20), (9, 0x2c)), "Constant descriptors overlap"),
+            (((20, 0),), "Texture and constant descriptors overlap"), (((20, 0x1c),), "Texture and constant descriptors overlap"),
+            (((24, 0x20),), "Invalid constant descriptor binding"), (((9, 0x22),), "Invalid constant descriptor binding"),
+            (((9, -4),), "Invalid constant descriptor binding"), (((106, 0),), "Invalid constant descriptor binding"),
+            (((-1, 0),), "Invalid constant descriptor binding"), (((9,),), "Invalid constant descriptor binding"),
+            (((9, 0x20, 0),), "Invalid constant descriptor binding"), (((9.0, 0x20),), "Invalid constant descriptor binding"),
+            (((True, 0x20),), "Invalid constant descriptor binding")):
+        expect_value_error(lambda p: bound(p, extra_constants=extra), program, message)
+    # Adjacent 16-byte descriptors on one table are distinct.
+    adjacent = changed("s_load_dwordx4 s[52:55], s[20:21], 0x60", "s_load_dwordx4 s[52:55], s[20:21], 0x50")
+    assert bound(adjacent, extra_constants=((20, 0x50), (9, 0x20))) == source
+
+
 def check_scalar_constant_reads() -> None:
     program = with_scalar_constant_reads()
     source = translate(program)
@@ -4444,6 +4597,7 @@ def check_controls(directory):
     check_mode_register_controls()
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
+    check_three_constant_buffers()
     check_affine_coordinates()
     check_scalar_helpers_with_vector_arithmetic()
     check_adapter_skip(directory)
@@ -5458,6 +5612,7 @@ def check_binary(directory, assembler, objcopy, library):
     check_program_extent(directory, library)
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
+                (with_three_constant_buffers(), translate_three_buffers),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate), (sopk_scalar(), translate), (sopk_cmpk_cmovk(), translate_int)]
     fixtures.append((rgb_sample(), translate))
@@ -6885,6 +7040,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
                            capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Reading the neighboring constant word escaped detection")
+    check_three_buffer_draw(directory, compiler, renderer, backend)
 
     check_affine_lod_draw(directory, compiler, renderer, backend)
     program = with_scalar_pair_reads()
