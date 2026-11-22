@@ -2181,7 +2181,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_x87_fldcw x87_fldcw)
     # The checked translation and ten mutated controls that the check requires to mismatch.
     set(x87_fldcw_control_files "")
-    foreach(variant IN ITEMS lifted rcnearest pc53 fistnearest constnearest rawword nounmasked pc01 noreturn onereturn deferred)
+    foreach(variant IN ITEMS lifted rcnearest pc53 fistnearest constnearest rawword nounmasked pc01 noreturn onereturn fninitword fninitsw deferred)
         set(x87_fldcw_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_fldcw_${variant}.cpp")
         add_custom_command(OUTPUT "${x87_fldcw_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fldcw.py"
