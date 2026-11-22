@@ -958,6 +958,16 @@ Measured at commit `f847956`, Windows 11 build 26300, debug layer enabled:
 
 Before `f847956`, the interior block's search tried only the 256 MB directly below the first allocation. That search found no free block in about 1 of 40 hardware runs, and the test failed in setup ("region below the first allocation").
 
+Measured at commit `21a65e5`, Windows 11 build 26300, debug layer enabled:
+- The full suite passed: 149 tests, with the same 3 capability skips.
+- `era_title_gpu_alloc` handled 6 failing allocations in a first `track` and 2 in a later one. It passed 50 of 50 repeated runs.
+- `gpu_alias_registry_hardware` passed 100 of 100 repeated runs on the RTX 3070, and `gpu_alias_registry_warp` passed 50 of 50.
+- Four mutants fail `era_title_gpu_alloc`:
+  - creating the registry with a throwing `new`: `abort()`, exit 3;
+  - building `shader_view`'s empty result by construction, which allocates under the debug STL: `abort()`, exit 3;
+  - a `counts` that creates the registry: exit 1;
+  - a `track` that keeps the `era_query` registration after a failed insertion: exit 1.
+
 ### Windows 10 with the app-local Agility SDK and WARP
 
 The Windows 10 22H2 in-box runtime caps an RTX 3060 at SM 6.5 and the in-box WARP (10.0.19041) at SM 6.2 with no DXR, so the `cs_6_5` BVH fixtures, the DXR checks and forced wave64 skip there. Without Graphics Tools, the debug layer reports `DXGI_ERROR_SDK_COMPONENT_MISSING` even when the SDK layers are app-local. The Agility build therefore continues with `debug_layer=unavailable` for that one result, and other debug-layer failures still stop the test. Capabilities reported on Windows 10 19045.6466:
