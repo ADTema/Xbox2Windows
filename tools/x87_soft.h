@@ -369,3 +369,18 @@ static inline X87Value x87_rndint(X87Value v) {
     const int lead = x87_clz(magnitude);
     return {magnitude << lead, static_cast<uint16_t>(sign | (16383 + 63 - lead))};
 }
+
+// FXTRACT: the significand of v, with v's sign and biased exponent 16383 (a value in [1, 2)), and in
+// `exponent` the unbiased exponent as an exact value. A denormal is normalized first. A zero keeps its
+// sign and gives an exponent of -inf (the masked divide-by-zero response); an infinity keeps its sign
+// and gives +inf. A NaN is quieted into both results, and an unsupported encoding gives the indefinite
+// in both. The precision control does not apply.
+static inline X87Value x87_xtract(X87Value v, X87Value& exponent) {
+    if (x87_unsupported(v)) { exponent = x87_indefinite; return x87_indefinite; }
+    if (x87_is_nan(v)) { exponent = x87_quiet(v); return exponent; }
+    if (x87_is_inf(v)) { exponent = {x87_integer_bit, 0x7fff}; return v; }
+    if (x87_is_zero(v)) { exponent = {x87_integer_bit, 0xffff}; return v; }  // xtract zero
+    const X87Unpacked u = x87_unpack(v);
+    exponent = x87_from_integer(u.e);
+    return {u.sig, static_cast<uint16_t>((u.sign ? 0x8000 : 0) | 16383)};
+}

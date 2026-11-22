@@ -1044,6 +1044,25 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_rndint COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_rndint.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_rndint>"
         "$<TARGET_FILE:cpu_x87_rndint_lifted>" ${x87_rndint_control_files})
+    cpu_asm_fixture(cpu_x87_xtract x87_xtract)
+    # The lifted DLL and six mutated controls that the check requires to mismatch.
+    set(x87_xtract_control_files "")
+    foreach(variant IN ITEMS lifted zeroexp denormal biased unsigned snan order)
+        set(x87_xtract_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_xtract_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_xtract_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_xtract.py"
+                emit "$<TARGET_FILE:cpu_x87_xtract>" "${x87_xtract_fixture}" ${variant}
+            DEPENDS cpu_x87_xtract tests/cpu/x87_xtract.py tests/cpu/x87_integers.py tests/cpu/x87_moves.py tests/cpu/x87_sub.py
+                tests/cpu/x87_div.py tests/cpu/x87_mul.py tests/cpu/x87_add.py tools/ffx_version_query.py
+                tools/x87_lower.py tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_xtract_${variant} SHARED "${x87_xtract_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_xtract_control_files "$<TARGET_FILE:cpu_x87_xtract_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_xtract COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_xtract.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_xtract>"
+        "$<TARGET_FILE:cpu_x87_xtract_lifted>" ${x87_xtract_control_files})
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
