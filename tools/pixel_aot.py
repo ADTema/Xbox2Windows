@@ -1459,9 +1459,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     interpolated = False
     region = None
     seen_skip = False
-    offset_index = {element[0]: j for j, element in enumerate(instructions) if isinstance(element, tuple)}
+    offset_index = {element[0]: j for j, element in enumerate(instructions)
+                    if isinstance(element, tuple) and len(element) == 2}
     for i, element in enumerate(instructions):
-        offset, line = element if isinstance(element, tuple) else (None, element)
+        if isinstance(element, tuple):
+            if len(element) != 2 or not isinstance(element[0], int) or not isinstance(element[1], str):
+                raise ValueError("Invalid (offset, text) instruction pair")
+            offset, line = element
+        elif isinstance(element, str):
+            offset, line = None, element
+        else:
+            raise ValueError("Invalid instruction element")
         vector.reads.clear()
         conditional = set(vector.conditional)
 

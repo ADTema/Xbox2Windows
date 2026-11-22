@@ -4330,7 +4330,18 @@ def check_masked_controls():
     inside = region.index(save) + 1
     source = translate(region)
     assert "cmp" in source and " ? " in source
+    assert "precise float alu" in source
     assert "cmp" in translate(masked_skip()) and "cmp" in translate(masked_complementary())
+    # An aligned SGPR pair holding a tracked comparison is a valid mask source too.
+    pair_source = translate(uncompressed_export([
+        "v_cmp_lt_f32_e64 s[52:53], v12, s44",
+        "s_and_saveexec_b64 s[60:61], s[52:53]", "v_mov_b32_e32 v13, s45", restore]))
+    assert " ? " in pair_source
+    # A register written twice inside still merges against its value at the save.
+    double = translate(uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save,
+        "v_mov_b32_e32 v13, s45", "v_add_f32_e32 v13, v13, s46", restore]))
+    assert "_v13 = (cmp" in double and "sample16.y" in double.split("_v13")[1][:80]
     # A bare skip line carries no offset; only pair input can place it.
     must_reject(translate, [line for _, line in masked_skip()])
     for extra in (
@@ -4423,12 +4434,12 @@ def check_masked_controls():
     last = next(o for o, line in reversed(pairs) if line == restore)
     pairs[cbr] = (pairs[cbr][0], f"s_cbranch_execz {(last - pairs[cbr][0] - 4) // 4}")
     must_reject(translate, pairs)
-    # The skip must sit immediately after the save; a mid-region placement rejects.
-    pairs = masked_skip()
-    pos = next(i for i, (_, line) in enumerate(pairs) if line.startswith("s_cbranch_execz"))
-    moved = pairs.pop(pos)
-    pairs.insert(pos + 1, moved)
-    must_reject(translate, pairs)
+    # The skip must sit immediately after the save; a mid-region placement rejects even
+    # when its displacement still names the matching restore.
+    mid = uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v13, s45",
+        "s_cbranch_execz 1", "v_mov_b32_e32 v14, s46", restore])
+    expect_value_error(translate, offset_pairs(mid), "Instruction cannot run in a masked region")
     # A second skip anywhere in the program rejects, even in a later region.
     two_skips = uncompressed_export([
         "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "s_cbranch_execz 1",
@@ -4461,6 +4472,13 @@ def check_masked_controls():
         "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, s45", restore,
         "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, s46", restore,
         "v_add_f32_e32 v12, v12, v30"]), "Read of a register defined only on the masked path")
+    # A conditional register may not read-modify-write itself either.
+    expect_value_error(translate, uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, s45", restore,
+        "v_add_f32_e32 v30, v30, 1.0"]), "Read of a register defined only on the masked path")
+    # Pair elements must be (int offset, str text); anything else is a clean rejection.
+    for bad in ([(0, 42)], [("x", "s_nop 0")], [()], [[0, "s_nop 0"]], [42]):
+        must_reject(translate, bad)
 
 
 def check_controls(directory):
