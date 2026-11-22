@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_sign_ext_adc
 ; Source-owned differential fixture for baseline x64 sign-extension and ADC instructions:
 ; CBW, CWDE, CDQE, CQO, MOVSX (8/16 -> 16/32/64), and ADC (32/64-bit with carry-in/out).
 .code
