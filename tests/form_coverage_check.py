@@ -293,7 +293,11 @@ def check_shader_records():
         ("VOP2", "v_lshrrev_b32"), ("VOP2", "v_ashrrev_i32"), ("VOP2", "v_lshlrev_b32"),
         ("VOP2", "v_and_b32"), ("VOP2", "v_or_b32"), ("VOP2", "v_xor_b32"),
         ("VOP2", "v_add_nc_u32"), ("VOP2", "v_sub_nc_u32"), ("VOP2", "v_subrev_nc_u32"),
+        ("VOP2", "v_xnor_b32"),
     }
+    e64_integer_forms = {("VOP3", f"{form}_e64") for form in (
+        "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_not_b32",
+        "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_cvt_f32_ubyte2")}
     mul24_forms = {
         ("VOP2", "v_mul_i32_i24"), ("VOP3", "v_mul_i32_i24_e64"),
         ("VOP2", "v_mul_u32_u24"), ("VOP3", "v_mul_u32_u24_e64"),
@@ -315,6 +319,7 @@ def check_shader_records():
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
         assert sopc_forms <= covered, (name, sopc_forms - covered)
         assert vop2_forms <= covered, (name, vop2_forms - covered)
+        assert e64_integer_forms <= covered, (name, e64_integer_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
     # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit

@@ -4249,6 +4249,78 @@ def nc_integer_group(group):
     return ["v_mov_b32_e32 v18, s45", *NC_INT_BODIES[group]]
 
 
+# Integer VOP3 (e64) encodings that the translator accepted with no fixture drawing them, and v_xnor_b32 in
+# both encodings. Bodies for uncompressed_export(): A, B and C are the constants in s44, s45 and s46, v18 = B,
+# and each channel v12..v15 holds its own result. The shift and bitwise groups take both sources from SGPRs,
+# which the VOP2 (e32) encoding cannot express for the second source.
+E64_INT_BODIES = {
+    "shift": ["v_lshlrev_b32_e64 v12, s44, s45", "v_lshrrev_b32_e64 v13, s44, s45",
+              "v_ashrrev_i32_e64 v14, s44, s45", "v_not_b32_e64 v15, s45"],
+    "bitwise": ["v_and_b32_e64 v12, s44, s45", "v_or_b32_e64 v13, s44, s45",
+                "v_xor_b32_e64 v14, s44, s45", "v_xnor_b32_e64 v15, s44, s45"],
+    "xnor_byte": ["v_xnor_b32_e32 v12, s44, v18", "v_cvt_f32_ubyte2_e64 v13, s46",
+                  "v_cvt_f32_ubyte2_e64 v14, v18", "v_cvt_f32_ubyte2_e64 v15, s46 clamp"],
+}
+E64_INT_OPS = tuple(sorted({line.split()[0] for body in E64_INT_BODIES.values() for line in body}))
+
+
+def _f32_word(value):
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def _sar32(word, count):
+    return ((word - (1 << 32) if word & 0x80000000 else word) >> count) & 0xffffffff
+
+
+def _byte(word, index):
+    return (word >> (8 * index)) & 0xff
+
+
+# Reference words by group. The reversed shifts move src1 (B) by the low five bits of src0 (A).
+E64_INT_RESULTS = {
+    "shift": lambda a, b, c: (b << (a & 31), b >> (a & 31), _sar32(b, a & 31), ~b),
+    "bitwise": lambda a, b, c: (a & b, a | b, a ^ b, ~(a ^ b)),
+    "xnor_byte": lambda a, b, c: (~(a ^ b), _f32_word(float(_byte(c, 2))), _f32_word(float(_byte(b, 2))),
+                                  _f32_word(min(float(_byte(c, 2)), 1.0))),
+}
+# Negative controls by group: (channel, word a wrong lowering would give, what went wrong). Each is drawn on
+# the first row of the group and must report a mismatch.
+E64_INT_WRONG = {
+    "shift": (
+        (0, lambda a, b, c: a << (b & 31), "shift operands swapped"),
+        (0, lambda a, b, c: 0, "left-shift count not reduced modulo 32"),
+        (1, lambda a, b, c: _sar32(b, a & 31), "arithmetic shift for logical"),
+        (2, lambda a, b, c: b >> (a & 31), "logical shift for arithmetic"),
+        (3, lambda a, b, c: b, "not dropped"),
+    ),
+    "bitwise": (
+        (0, lambda a, b, c: a | b, "or for and"),
+        (1, lambda a, b, c: a & b, "and for or"),
+        (2, lambda a, b, c: ~(a ^ b), "xnor for xor"),
+        (3, lambda a, b, c: a ^ b, "xor for xnor"),
+    ),
+    "xnor_byte": (
+        (0, lambda a, b, c: a ^ b, "xor for xnor"),
+        (1, lambda a, b, c: _f32_word(float(_byte(c, 1))), "byte 1 for byte 2"),
+        (1, lambda a, b, c: _f32_word(float(_byte(c, 3))), "byte 3 for byte 2"),
+        (2, lambda a, b, c: _f32_word(float(_byte(c, 2))), "wrong source register"),
+        (3, lambda a, b, c: _f32_word(float(_byte(c, 2))), "clamp dropped"),
+    ),
+}
+# (A, B, C) as binary32 words; the inputs and every right result are normal numbers or zero (asserted at the
+# draw). The shift counts 0x3f800024 and 0x40000023 exceed 31, so only their low five bits (4 and 3) may count;
+# B is negative in the first shift row and positive in the second. The four bytes of each C differ.
+E64_INT_ROWS = {
+    "shift": ((0x3F800024, 0xC1700000, 0), (0x40000023, 0x4C003A00, 0)),
+    "bitwise": ((0x40D10000, 0xC0250000, 0), (0x3E270000, 0xBF620000, 0)),
+    "xnor_byte": ((0x40D10000, 0xC0250000, 0x40C32A11), (0x3E270000, 0xBF620000, 0x3F00FF80)),
+}
+
+
+def e64_integer_group(group):
+    return ["v_mov_b32_e32 v18, s45", *E64_INT_BODIES[group]]
+
+
 def sop2_lshl_add_group() -> list[str]:
     return with_constants([
         "s_lshl1_add_u32 s60, s44, s45",
@@ -4518,6 +4590,49 @@ def check_f16_denorm_controls():
     assert "widen16(" in body and "pack16_rne(" in body, body
 
 
+def check_e64_integer_lowering():
+    """Static checks for the integer e64 forms of e64_integer_group() and for v_xnor_b32 in both encodings."""
+    # v18 is written by the mov at index 20 and the four group instructions follow at 21..24.
+    a, b, c, v = "asuint(params[0].w)", "asuint(params[1].x)", "asuint(params[1].y)", "asuint(alu20)"
+    expected = {
+        "shift": (f"asfloat({b} << ({a} & 31u))", f"asfloat({b} >> ({a} & 31u))",
+                  f"asfloat(asuint(asint({b}) >> ({a} & 31u)))", f"asfloat(~{b})"),
+        "bitwise": (f"asfloat({a} & {b})", f"asfloat({a} | {b})", f"asfloat({a} ^ {b})", f"asfloat(~({a} ^ {b}))"),
+        "xnor_byte": (f"asfloat(~({a} ^ {v}))", f"float(({c} >> 16u) & 0xffu)", f"float(({v} >> 16u) & 0xffu)",
+                      f"saturate(float(({c} >> 16u) & 0xffu))"),
+    }
+    assert expected.keys() == E64_INT_BODIES.keys() == E64_INT_RESULTS.keys() == E64_INT_WRONG.keys() == E64_INT_ROWS.keys()
+    for group, expressions in expected.items():
+        program = uncompressed_export(e64_integer_group(group))
+        assert program.index("v_mov_b32_e32 v18, s45") == 20, group
+        source = translate_int(program)
+        for offset, expression in enumerate(expressions, start=21):
+            statement = f"    precise float alu{offset} = {expression};"
+            assert statement in source.splitlines(), (group, statement)
+    assert set(E64_INT_OPS) <= ACCEPTED, set(E64_INT_OPS) - ACCEPTED
+    assert len(E64_INT_OPS) == 10
+    # v_xnor_b32 takes the operand shapes of v_xor_b32 and nothing else: no float modifier, no clamp, two
+    # sources, a written register, and no SDWA spelling.
+    for good, bad in (
+        ("v_xnor_b32_e32 v12, s44, v18", "v_xnor_b32_e32 v12, s44, |v18|"),
+        ("v_xnor_b32_e32 v12, s44, v18", "v_xnor_b32_e32 v12, s44, -v18"),
+        ("v_xnor_b32_e64 v12, s44, v18", "v_xnor_b32_e64 v12, abs(s44), v18"),
+        ("v_xnor_b32_e64 v12, s44, v18", "v_xnor_b32_e64 v12, s44, v18 clamp"),
+        ("v_xnor_b32_e64 v12, 64, v18", "v_xnor_b32_e64 v12, s44"),
+        ("v_xnor_b32_e64 v12, v18, s44", "v_xnor_b32_e64 v12, s44, v18, s45"),
+        ("v_xnor_b32_e32 v12, s44, v18", "v_xnor_b32_e32 v12, s44, v106"),
+        ("v_xnor_b32_e32 v12, s44, v18",
+         "v_xnor_b32_sdwa v12, v18, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"),
+    ):
+        translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    xnor_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_xnor_b32_e64 v12, s44, v18"]))
+    xor_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_xor_b32_e64 v12, s44, v18"]))
+    assert xnor_source != xor_source
+    # A float modifier on the byte conversion stays refused in the e64 spelling as well.
+    must_reject(translate_int, uncompressed_export(["v_cvt_f32_ubyte2_e64 v12, -s46"]))
+
+
 def check_nc_integer_lowering():
     """Static checks for the 32-bit no-carry add/sub forms of nc_integer_group(1..3)."""
     # v18 is written by the mov at index 20, and the four group instructions follow at 21..24. A and B are
@@ -4654,6 +4769,7 @@ def check_controls(directory):
     ):
         must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop2]))
     check_nc_integer_lowering()
+    check_e64_integer_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
     assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED
     for expected in (
@@ -5689,6 +5805,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(cvt_float_body(0x3fc00000, 0xc0300000)), translate_int))
     fixtures.extend((uncompressed_export(nc_integer_group(group)), translate_int) for group in (1, 2, 3))
     fixtures.append((uncompressed_export(f16_compares()), translate_int))
+    fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
@@ -5999,6 +6116,49 @@ def check_integer_nc_draws(directory, compiler, renderer, backend):
             run_pixel_batch(renderer, backend, shader, cases)
         else:
             subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[0][0]], check=True)
+    return 0
+
+
+def check_e64_integer_draws(directory, compiler, renderer, backend):
+    """Draw the integer e64 forms and v_xnor_b32 through the integer readback target and compare the words.
+
+    Each group of E64_INT_BODIES is compiled once and drawn in one renderer batch: every row of E64_INT_ROWS
+    with the right words, and the first row once per E64_INT_WRONG entry with one channel replaced by the word
+    a wrong lowering would give, which must report a mismatch. On a desktop GPU the draws establish that the
+    translated shader computes the stated operation, not what the console does.
+    """
+    source = directory / "e64_integer.hlsl"
+    shader = directory / "e64_integer.cso"
+
+    def add_case(cases, row, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<3I", constants, 12, *row)
+        case = directory / f"e64_integer-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+
+    for group, rows in E64_INT_ROWS.items():
+        source.write_text(translate_int(uncompressed_export(e64_integer_group(group))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for index, row in enumerate(rows):
+            words = tuple(word & 0xffffffff for word in E64_INT_RESULTS[group](*row))
+            # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+            assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (group, [hex(w) for w in (*row, *words)])
+            add_case(cases, row, words, "pass")
+            if index:
+                continue
+            for channel, wrong, reason in E64_INT_WRONG[group]:
+                wrong_words = list(words)
+                wrong_words[channel] = wrong(*row) & 0xffffffff
+                assert wrong_words[channel] != words[channel], (group, reason)
+                add_case(cases, row, wrong_words, "mismatch")
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
     return 0
 
 
@@ -7697,11 +7857,12 @@ def main():
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc", "draw-bfm"):
+        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc", "draw-bfm", "draw-e64-integer"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
+                        "draw-e64-integer": check_e64_integer_draws,
                         "draw-bfm": check_bfm_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
