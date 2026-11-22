@@ -60,6 +60,7 @@ CPU_FIXTURES = {
     "address_size": "cpu_aot_address_size",
     "call_pair": "cpu_aot_call_pair",
     "bmi1": "cpu_aot_bmi1",
+    "rotates_shifts": "cpu_aot_rotates_shifts",
     "register_probe": None,  # measurement harness
     "two_imports": None,     # mapped and run unchanged by pe_map
     "exe_start": None,       # mapped and run unchanged by pe_map
