@@ -426,9 +426,11 @@ class ResourceChecks(unittest.TestCase):
 
     def test_invalid_segments(self):
         packet = zlib.compress(b"page")
-        for payload, count in ((packet[:-1], 4), (packet + b"extra", 4), (packet, 2), (packet, 8)):
+        intact_reader = PagedResource(io.BytesIO(packet), [Segment(0, len(packet), 4, "zlib")])
+        self.assertEqual(intact_reader.read(0, 4), b"page")
+        for payload, count in ((packet[:-1], 4), (packet + b"extra", 4), (packet, 2), (packet, 8), (b"not zlib", 4)):
             reader = PagedResource(io.BytesIO(payload), [Segment(0, len(payload), count, "zlib")])
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "Invalid compressed segment or decoded extent"):
                 reader.read(0, 1)
         for seg in (Segment(0, 1, 2, "raw"), Segment(2, 1, 1, "raw"), Segment(-1, 1, 1, "raw")):
             with self.assertRaises(ValueError):
