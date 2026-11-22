@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 
 import pefile
-from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
+from iced_x86 import Decoder, EncodingKind, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -58,7 +58,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
     # Unaligned YMM copies and VEX zeroing in the descriptor builder need
     # only byte storage on the desktop host.
     wide = {R.YMM0: "wide0", R.YMM1: "wide1", R.YMM2: "wide2"}
-    has_wide = any(i.mnemonic == M.VMOVUPS for i in body)
+    wide_xmm = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
+    wide_any = {**wide, **wide_xmm}
+    avx_int_ops = {
+        M.VPADDB, M.VPADDW, M.VPADDQ, M.VPSUBB, M.VPSUBW, M.VPSUBD, M.VPSUBQ,
+        M.VPAND, M.VPANDN, M.VPOR,
+        M.VPCMPEQB, M.VPCMPEQW, M.VPCMPEQD, M.VPCMPEQQ,
+        M.VPCMPGTB, M.VPCMPGTW, M.VPCMPGTD, M.VPCMPGTQ,
+        M.VPABSB, M.VPABSW, M.VPABSD, M.VPSIGNB, M.VPSIGNW, M.VPSIGND, M.VPSHUFB, M.VPALIGNR,
+    }
+    has_wide = any(i.mnemonic == M.VMOVUPS or i.mnemonic in avx_int_ops for i in body)
     if has_wide:
         if has_xmm_math:
             raise ValueError("mixed vector arithmetic and wide descriptor copies are unsupported")
@@ -210,6 +219,68 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = (f"{{ auto input = {src}; {dst} = {{}}; for (size_t n=0; n<16; n+=4) {{ "
                     f"auto v = load<uint32_t>(reinterpret_cast<word>(input.data()+n)) {operation}; "
                     f"memcpy({dst}.data()+n, &v, 4); }} }}")
+        elif op in avx_int_ops and i.encoding == EncodingKind.VEX and has_wide and i.op0_register in wide_any:
+            dst = wide_any[i.op0_register]
+            nbytes = 32 if i.op0_register in wide else 16
+            zero_hi = f" memset({dst}.data()+16, 0, 16);" if nbytes == 16 else ""
+            if op in (M.VPABSB, M.VPABSW, M.VPABSD):
+                lane_size = {M.VPABSB: 1, M.VPABSW: 2, M.VPABSD: 4}[op]
+                stype, utype = {1: ("int8_t", "uint8_t"), 2: ("int16_t", "uint16_t"), 4: ("int32_t", "uint32_t")}[lane_size]
+                s_init = (f"auto rhs = {wide_any[i.op1_register]};" if i.op1_kind == K.REGISTER
+                          else f"std::array<uint8_t,32> rhs{{}}; memcpy(rhs.data(), reinterpret_cast<const void*>({address()}), {nbytes});")
+                stmt = (f"{{ {s_init} for (size_t n=0; n<{nbytes}; n+={lane_size}) {{ "
+                        f"{stype} a; memcpy(&a, rhs.data()+n, {lane_size}); "
+                        f"const {utype} u = static_cast<{utype}>(a); const {utype} v = a < 0 ? static_cast<{utype}>({utype}(0) - u) : u; "
+                        f"memcpy({dst}.data()+n, &v, {lane_size}); }}{zero_hi} }}")
+            else:
+                src1 = wide_any[i.op1_register]
+                s2_init = (f"auto rhs = {wide_any[i.op2_register]};" if i.op2_kind == K.REGISTER
+                           else f"std::array<uint8_t,32> rhs{{}}; memcpy(rhs.data(), reinterpret_cast<const void*>({address()}), {nbytes});")
+                if op in (M.VPADDB, M.VPADDW, M.VPADDQ, M.VPSUBB, M.VPSUBW, M.VPSUBD, M.VPSUBQ):
+                    lane_size = {M.VPADDB: 1, M.VPSUBB: 1, M.VPADDW: 2, M.VPSUBW: 2,
+                                 M.VPSUBD: 4, M.VPADDQ: 8, M.VPSUBQ: 8}[op]
+                    utype = UINT[lane_size]
+                    sign = "+" if op in (M.VPADDB, M.VPADDW, M.VPADDQ) else "-"
+                    stmt = (f"{{ auto lhs = {src1}; {s2_init} for (size_t n=0; n<{nbytes}; n+={lane_size}) {{ "
+                            f"{utype} a, b; memcpy(&a, lhs.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                            f"const {utype} v = static_cast<{utype}>(a {sign} b); memcpy({dst}.data()+n, &v, {lane_size}); }}{zero_hi} }}")
+                elif op in (M.VPAND, M.VPANDN, M.VPOR):
+                    expr = {M.VPAND: "a & b", M.VPANDN: "(~a) & b", M.VPOR: "a | b"}[op]
+                    stmt = (f"{{ auto lhs = {src1}; {s2_init} for (size_t n=0; n<{nbytes}; ++n) {{ "
+                            f"const uint8_t a = lhs[n], b = rhs[n]; {dst}[n] = static_cast<uint8_t>({expr}); }}{zero_hi} }}")
+                elif op in (M.VPCMPEQB, M.VPCMPEQW, M.VPCMPEQD, M.VPCMPEQQ):
+                    lane_size = {M.VPCMPEQB: 1, M.VPCMPEQW: 2, M.VPCMPEQD: 4, M.VPCMPEQQ: 8}[op]
+                    utype = UINT[lane_size]
+                    stmt = (f"{{ auto lhs = {src1}; {s2_init} for (size_t n=0; n<{nbytes}; n+={lane_size}) {{ "
+                            f"{utype} a, b; memcpy(&a, lhs.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                            f"const {utype} v = a == b ? static_cast<{utype}>(~{utype}(0)) : {utype}(0); "
+                            f"memcpy({dst}.data()+n, &v, {lane_size}); }}{zero_hi} }}")
+                elif op in (M.VPCMPGTB, M.VPCMPGTW, M.VPCMPGTD, M.VPCMPGTQ):
+                    lane_size = {M.VPCMPGTB: 1, M.VPCMPGTW: 2, M.VPCMPGTD: 4, M.VPCMPGTQ: 8}[op]
+                    stype, utype = {1: ("int8_t", "uint8_t"), 2: ("int16_t", "uint16_t"),
+                                    4: ("int32_t", "uint32_t"), 8: ("int64_t", "uint64_t")}[lane_size]
+                    stmt = (f"{{ auto lhs = {src1}; {s2_init} for (size_t n=0; n<{nbytes}; n+={lane_size}) {{ "
+                            f"{stype} a, b; memcpy(&a, lhs.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                            f"const {utype} v = a > b ? static_cast<{utype}>(~{utype}(0)) : {utype}(0); "
+                            f"memcpy({dst}.data()+n, &v, {lane_size}); }}{zero_hi} }}")
+                elif op in (M.VPSIGNB, M.VPSIGNW, M.VPSIGND):
+                    lane_size = {M.VPSIGNB: 1, M.VPSIGNW: 2, M.VPSIGND: 4}[op]
+                    stype, utype = {1: ("int8_t", "uint8_t"), 2: ("int16_t", "uint16_t"), 4: ("int32_t", "uint32_t")}[lane_size]
+                    stmt = (f"{{ auto lhs = {src1}; {s2_init} for (size_t n=0; n<{nbytes}; n+={lane_size}) {{ "
+                            f"{stype} a, b; memcpy(&a, lhs.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                            f"const {utype} u = static_cast<{utype}>(a); "
+                            f"const {utype} v = b < 0 ? static_cast<{utype}>({utype}(0) - u) : (b == 0 ? {utype}(0) : u); "
+                            f"memcpy({dst}.data()+n, &v, {lane_size}); }}{zero_hi} }}")
+                elif op == M.VPSHUFB:
+                    stmt = (f"{{ auto lhs = {src1}; {s2_init} for (size_t l=0; l<{nbytes}; l+=16) {{ "
+                            f"for (size_t k=0; k<16; ++k) {{ const uint8_t m = rhs[l+k]; "
+                            f"{dst}[l+k] = (m & 0x80u) ? 0u : lhs[l+(m & 0xfu)]; }} }}{zero_hi} }}")
+                else:  # M.VPALIGNR
+                    imm = i.immediate(3)
+                    stmt = (f"{{ auto lhs = {src1}; {s2_init} for (size_t l=0; l<{nbytes}; l+=16) {{ "
+                            f"uint8_t cat[32]; memcpy(cat, rhs.data()+l, 16); memcpy(cat+16, lhs.data()+l, 16); "
+                            f"for (size_t k=0; k<16; ++k) {{ const size_t idx = {imm}u + k; "
+                            f"{dst}[l+k] = idx < 32u ? cat[idx] : 0u; }} }}{zero_hi} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
