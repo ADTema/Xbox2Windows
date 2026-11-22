@@ -49,6 +49,29 @@ bool registered(const void* address)
 
 std::uint64_t address(const void* pointer) { return reinterpret_cast<std::uint64_t>(pointer); }
 
+// Commits the highest free 64 KB block below `limit`. Walks down region by region and skips each
+// allocation through its AllocationBase, so a large reservation just below `limit` (a driver's, for
+// example) does not end the search. A block taken by another thread meanwhile is skipped.
+void* commit_below(std::uint64_t limit)
+{
+    constexpr std::uint64_t granule = 0x10000;
+    for (std::uint64_t top = limit & ~(granule - 1); top >= 2 * granule;) {
+        const std::uint64_t start = top - granule;
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<void*>(start), &info, sizeof(info)) != sizeof(info)) return nullptr;
+        if (info.State != MEM_FREE) {
+            top = address(info.AllocationBase) & ~(granule - 1);
+            continue;
+        }
+        if (info.RegionSize >= granule)
+            if (void* block = VirtualAlloc(reinterpret_cast<void*>(start), granule, MEM_RESERVE | MEM_COMMIT,
+                                           PAGE_READWRITE))
+                return block;
+        top = start;
+    }
+    return nullptr;
+}
+
 void fill(const Graphics& g, Word seed)
 {
     auto* words = static_cast<Word*>(g.base);
@@ -124,10 +147,7 @@ bool check_gpu_alias_registry(ID3D12Device* device)
     Graphics first(256 * 1024), second(64 * 1024);
     // A trackable block that is not the base of an allocation, so it can never be aliased. Its region
     // is placed below `first`, so attach meets this failure before an allocation it must still alias.
-    void* below = nullptr;
-    for (std::uint64_t step = 1; step < 4096 && !below; ++step)
-        below = VirtualAlloc(reinterpret_cast<void*>(first.begin() - step * 0x10000), 0x10000,
-                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* below = commit_below(first.begin());
     expect(below != nullptr && address(below) < first.begin(), "region below the first allocation");
     void* heap_block = static_cast<char*>(below) + 0x1000;
 
