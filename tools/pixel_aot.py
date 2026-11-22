@@ -173,6 +173,14 @@ float frexp_mant32(float value) {
     }
     return asfloat(sign | 0x3f000000u | mant);
 }
+// v_frexp_exp_i32_f32 returns the signed exponent of the normalized significand.
+int frexp_exp32(float value) {
+    uint magnitude = asuint(value) & 0x7fffffffu;
+    uint exp = magnitude >> 23;
+    if (magnitude == 0u || exp == 0xffu) return 0;
+    if (exp == 0u) return (int)firstbithigh(magnitude) - 148;
+    return (int)exp - 126;
+}
 // v_ldexp_f32: exact binary32 scaling by 2^delta, preserving +/-0, +/-Inf and NaN.
 float ldexp32(float value, int delta) {
     uint bits = asuint(value);
@@ -395,14 +403,18 @@ def lane_mask(token):
     return [token]
 
 
-def fp_operand(token, scalar, vector, pending, sample_pending, *, quad_values: dict[str, bool] | None = None):
+def fp_operand(token, scalar, vector, pending, sample_pending, *,
+               quad_values: dict[str, bool] | None = None, ignore_sign=False):
     if re.fullmatch(r"-\d+", token):
         return f"asfloat({int(token) & 0xffffffff}u)"
     if token.startswith("-"):
-        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_pending, quad_values=quad_values) + ")"
+        inner = fp_operand(token[1:], scalar, vector, pending, sample_pending,
+                           quad_values=quad_values, ignore_sign=ignore_sign)
+        return inner if ignore_sign else f"(-{inner})"
     if absolute := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
-        inner = absolute.group(1) or absolute.group(2)
-        return f"abs({fp_operand(inner, scalar, vector, pending, sample_pending, quad_values=quad_values)})"
+        inner = fp_operand(absolute.group(1) or absolute.group(2), scalar, vector, pending, sample_pending,
+                           quad_values=quad_values, ignore_sign=ignore_sign)
+        return inner if ignore_sign else f"abs({inner})"
     if re.fullmatch(r"[vs]\d+", token):
         if token in pending:
             raise ValueError("Constant read before load completion")
@@ -756,6 +768,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"{fn}({fn}({values[0]}, {values[1]}), {values[2]})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({expression});")
+
+        elif m := match(r"v_frexp_exp_i32_f32(?:_e32|_e64)? (v\d+), ([^,]+)"):
+            dst, src = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            # Only the magnitude bits matter. Float sign operations can flush subnormal inputs.
+            value = fp_operand(src, scalar, vector, pending, sample_pending, ignore_sign=True)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat(frexp_exp32({value}));")
 
         elif m := match(r"v_ldexp_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+?)( clamp)?"):
             dst, src0, src1, clamp = m.groups()

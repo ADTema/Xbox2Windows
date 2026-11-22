@@ -434,6 +434,20 @@ def frexp_mant_values():
     ])
 
 
+def frexp_exp_values():
+    # Compare the integer exponent before the binary16 pixel export.
+    return with_constants([
+        "v_frexp_exp_i32_f32_e32 v18, s44",
+        "v_frexp_exp_i32_f32_e64 v19, -|s46|",
+        "v_mov_b32_e32 v15, 1.0",
+        "v_cmp_eq_i32_e32 vcc_lo, s45, v18",
+        "v_cndmask_b32_e32 v12, 0, v15, vcc_lo",
+        "v_cmp_eq_i32_e32 vcc_lo, s47, v19",
+        "v_cndmask_b32_e32 v13, 0, v15, vcc_lo",
+        "v_mov_b32_e32 v14, 0",
+    ])
+
+
 def ldexp_values():
     return with_constants([
         "v_mov_b32_e32 v18, s44",
@@ -1799,6 +1813,13 @@ def check_controls(directory):
     assert "frexp_mant32(params[0].w)" in frexp_body, frexp_body
     assert "frexp_mant32((-abs(params[1].x)))" in frexp_body, frexp_body
     assert "saturate(frexp_mant32(params[1].z))" in frexp_body, frexp_body
+    frexp_exp_body = translate(frexp_exp_values()).split("float4 main", 1)[1]
+    assert "asfloat(frexp_exp32(params[0].w))" in frexp_exp_body, frexp_exp_body
+    assert "asfloat(frexp_exp32(params[1].y))" in frexp_exp_body, frexp_exp_body
+    must_reject(translate, [
+        line + " clamp" if line.startswith("v_frexp_exp_i32_f32_e64 ") else line
+        for line in frexp_exp_values()
+    ])
     ldexp_body = translate(ldexp_values()).split("float4 main", 1)[1]
     assert "ldexp32(alu20, asint(params[1].x))" in ldexp_body, ldexp_body
     assert "ldexp32((-abs(params[0].w)), asint(2u))" in ldexp_body, ldexp_body
@@ -1832,7 +1853,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (scalar64(), translate)]
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((fract_values(), translate))
-    fixtures.extend([(frexp_mant_values(), translate), (ldexp_values(), translate)])
+    fixtures.extend((program(), translate) for program in (frexp_mant_values, frexp_exp_values, ldexp_values))
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((int_predicate_group(kind, encoding, first), translate)
                     for kind in ("i32", "u32") for encoding in ("e32", "e64") for first in (0, 4))
@@ -2033,6 +2054,40 @@ def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
         raise AssertionError("Inverting the v_ldexp_f32 exponent sign escaped detection")
 
 
+# Powers of two, subnormal endpoints, the largest finite value, and special inputs.
+FREXP_EXP_CASES = (
+    (0x3F800000, 1, 0xBE800000, -1),
+    (0x00000001, -148, 0x007FFFFF, -126),
+    (0x00800000, -125, 0x7F7FFFFF, 128),
+    (0x00000000, 0, 0x80000000, 0),
+    (0x7F800000, 0, 0xFF800000, 0),
+    (0x7FC12345, 0, 0xFFC12345, 0),
+)
+
+
+def check_frexp_exp_draws(directory, compiler, renderer, backend):
+    source = directory / "frexp_exp.hlsl"
+    shader = directory / "frexp_exp.cso"
+    case = directory / "frexp_exp.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(frexp_exp_values()), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+
+    def set_case(a, exponent_a, b, exponent_b):
+        constants = bytearray(256)
+        struct.pack_into("<IiIi", constants, 12, a, exponent_a, b, exponent_b)
+        case.write_bytes(constants + struct.pack("<4f", 1.0, 1.0, 0.0, 1.0) * 64)
+
+    for values in FREXP_EXP_CASES:
+        set_case(*values)
+        subprocess.run(draw, check=True)
+    a, exponent_a, b, exponent_b = FREXP_EXP_CASES[1]
+    set_case(a, exponent_a + 1, b, exponent_b)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("The draw accepted an incorrect subnormal exponent")
+
+
 def check_render(directory, compiler, renderer, backend):
     for swap in (False, True):
         source = directory / "fixture.hlsl"
@@ -2192,6 +2247,7 @@ def check_render(directory, compiler, renderer, backend):
     check_int_minmax_draws(directory, compiler, renderer, backend)
 
     check_frexp_ldexp_draws(directory, compiler, renderer, backend)
+    check_frexp_exp_draws(directory, compiler, renderer, backend)
 
     program = scalar64()
     source.write_text(translate(program), encoding="ascii")
