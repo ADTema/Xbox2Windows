@@ -8,6 +8,7 @@ from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Registe
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
+import x87_lower
 
 
 LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
@@ -45,11 +46,13 @@ def region(pe, start, end):
     return ins
 
 
-def lower(body, initial, globals_, calls, exits, *, host_ops=None):
+def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
     allowed = {i.ip for i in body} | set(exits)
+    # The x87 profile checks every x87 instruction of the body before any of it is lowered.
+    x87_depth = x87_lower.depths(body, exits) if x87 and any(map(x87_lower.is_x87, body)) else None
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
     has_xmm_math = any(i.mnemonic in (M.VMOVDQU, M.VPSRLDQ, M.VMOVD)
                        or (i.mnemonic == M.VPADDD and i.op2_kind != K.MEMORY) for i in body)
@@ -245,6 +248,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = f"rax = (rax & ~0xffull) | load<uint8_t>({table});"
         elif op == M.RET:
             stmt = "return rax;"
+        elif x87_depth is not None and op in x87_lower.X87_OPS:
+            stmt = x87_lower.statement(i, x87_depth[i.ip], address)
         else:
             raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
         lines.append(f"block_{i.ip:x}: {stmt}")
@@ -253,6 +258,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             if i.next_ip not in allowed:
                 raise ValueError(f"unbound fallthrough at {i.ip:#x}")
             lines.append(f"goto block_{i.next_ip:x};")
+    if x87_depth is not None:
+        lines.insert(3, x87_lower.DECLARATION)
     lines.extend(f"block_{target:x}: {statement}" for target, statement in exits.items())
     return "\n".join("    " + line for line in lines)
 

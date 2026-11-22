@@ -667,6 +667,26 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
     add_library(cpu_destroy_provider SHARED tests/cpu/destroy_provider.cpp)
+    cpu_asm_fixture(cpu_x87_harness x87_harness)
+    cpu_asm_fixture(cpu_x87_add x87_add)
+    # The lifted DLL and six mutated controls that the check requires to mismatch.
+    set(x87_add_controls pc64 double m80double nosticky nanorder signedzero)
+    set(x87_add_control_files "")
+    foreach(variant IN ITEMS lifted ${x87_add_controls})
+        set(x87_add_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_add_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_add_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_add.py"
+                emit "$<TARGET_FILE:cpu_x87_add>" "${x87_add_fixture}" ${variant}
+            DEPENDS cpu_x87_add tests/cpu/x87_add.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_add_${variant} SHARED "${x87_add_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_add_control_files "$<TARGET_FILE:cpu_x87_add_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_add COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_add.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_add>"
+        "$<TARGET_FILE:cpu_x87_add_lifted>" ${x87_add_control_files})
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
