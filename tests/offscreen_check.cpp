@@ -33,6 +33,16 @@ void check(HRESULT hr, const char* stage)
     }
 }
 
+HRESULT check_feature(ID3D12Device* device, D3D12_FEATURE feature, void* data, UINT size)
+{
+#if defined(OFFSCREEN_AGILITY_620) && defined(__ID3D12Device16_INTERFACE_DEFINED__)
+    ComPtr<ID3D12Device16> versioned;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&versioned))))
+        return versioned->CheckFeatureSupport1(feature, data, size, D3D12SDKVersion);
+#endif
+    return device->CheckFeatureSupport(feature, data, size);
+}
+
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
     const size_t length = std::wcslen(part);
@@ -341,7 +351,7 @@ bool needs_cs_6_5(std::string_view operation)
 bool supports_cs_6_5(ID3D12Device* device)
 {
     D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_5};
-    check(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query fixture shader model");
+    check(check_feature(device, D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query fixture shader model");
     std::printf("shader_model_capped_at_6_5=0x%x\n", model.HighestShaderModel);
     return model.HighestShaderModel >= D3D_SHADER_MODEL_6_5;
 }
@@ -350,8 +360,12 @@ int main(int argc, char** argv)
 {
     if (argc < 3) return 2;
     const std::string_view operation = argv[2];
-    if (operation == "--check-bc7-tail") {
-        if (argc < 6 || argc > 16) return 2;
+    if (operation == "--check-pixel-quad-lod") {
+        if (argc != 4) return 2;
+    } else if (operation == "--check-bc7-tail") {
+        if (argc < 6) return 2;
+    } else if (operation == "--compute-root-file") {
+        if (argc != 4) return 2;
     } else {
         if (argc != 3 && argc != 5 && argc != 6) return 2;
         if (argc == 6 && operation != "--check-bc7" && operation != "--check-bc7-mip1") return 2;
@@ -365,8 +379,11 @@ int main(int argc, char** argv)
 #ifdef OFFSCREEN_AGILITY_620
         ComPtr<ID3D12DeviceFactory> device_factory;
         check(D3D12GetInterface(CLSID_D3D12DeviceFactory, IID_PPV_ARGS(&device_factory)), "Load device factory");
-        check(device_factory->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&debug)),
-              "Load app-local debug layer");
+        // Without Graphics Tools (for example on a default Windows 10 install) the debug layer reports
+        // DXGI_ERROR_SDK_COMPONENT_MISSING even with the SDK layers app-local. The runtime itself still
+        // loads, so continue without the layer and report it as unavailable. Other failures stay fatal.
+        const HRESULT debug_hr = device_factory->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&debug));
+        if (debug_hr != DXGI_ERROR_SDK_COMPONENT_MISSING) check(debug_hr, "Load app-local debug layer");
 #else
         D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
 #endif
@@ -398,6 +415,8 @@ int main(int argc, char** argv)
         if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
+        } else if (argc == 4 && operation == "--compute-root-file") {
+            check_compute_file(device.Get(), argv[3]);
         } else if (argc == 3 && operation == "--ffx-device-init") {
             check_ffx_device_init(device.Get());
         } else if (argc == 3 && operation == "--ffx-provider-loop") {
@@ -414,6 +433,8 @@ int main(int argc, char** argv)
             check_dual_pixel(device.Get(), argv[3], argv[4], operation == "--dual-pixel-swapped");
         } else if (argc == 5 && operation == "--check-pixel-case") {
             check_translated_pixel(device.Get(), argv[3], false, argv[4]);
+        } else if (operation == "--check-pixel-quad-lod") {
+            check_pixel_quad_lod(device.Get(), argv[3]);
         } else if (operation == "--check-pixel") {
             if (argc != 5 || (std::string_view(argv[4]) != "rgba" && std::string_view(argv[4]) != "bgra"))
                 throw std::runtime_error("Expected --check-pixel <pixel.cso> rgba|bgra");
@@ -442,12 +463,21 @@ int main(int argc, char** argv)
             check_bvh_reads(device.Get());
         } else if (argc == 3 && (operation == "--bvh-waves" || operation == "--bvh-wave64")) {
             if (!check_bvh_waves(device.Get(), operation == "--bvh-wave64")) return 77;
+        } else if (argc == 3 && operation == "--gpu-alias") {
+            if (!check_gpu_alias(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--gpu-alias-lookup") {
+            if (!check_gpu_alias_lookup(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--gpu-alias-lookup-writes") {
+            if (!check_gpu_alias_lookup_writes(device.Get())) return 77;
         } else if (argc == 3 && operation == "--buffer-ops") {
             check_buffer_ops(device.Get());
         } else if (argc == 3 && operation == "--ray-query") {
             if (!check_ray_query(device.Get())) return 77;
         } else if (argc == 3 && operation == "--wave-shuffle") {
             if (!check_wave_shuffle(device.Get())) return 77;
+        } else if (operation.substr(0, 2) == "--") {
+            std::fprintf(stderr, "Unknown GPU operation or invalid arguments: %s\n", argv[2]);
+            return 2;
         } else {
             draw(device.Get(), argv[2], argc == 5 ? argv + 3 : nullptr);
         }

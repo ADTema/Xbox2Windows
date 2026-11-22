@@ -42,4 +42,42 @@ have_stride:
     mov eax, 1
     ret
 group_append ENDP
+; RCX = frame table, EDX = frame index, R8 = pitch pair, R9 = request observer.
+plane_request MACRO field, pitch_offset, height_offset
+LOCAL skip_plane
+    mov rcx, [rsp+32]
+    cmp dword ptr [rcx+field+8], 0
+    je skip_plane
+    mov r10, [rsp+40]
+    mov edx, [r10+pitch_offset]
+    mov r10, [rsp+48]
+    imul edx, dword ptr [r10+height_offset]
+    add rcx, field
+    mov r9, [rsp+56]
+    call r9
+    mov rcx, [rsp+32]
+    mov r10, [rsp+40]
+    mov eax, [r10+pitch_offset]
+    mov [rcx+field+12], eax
+skip_plane:
+ENDM
+
+frame_planes PROC FRAME
+    sub rsp, 72
+    .allocstack 72
+    .endprolog
+    mov [rsp+48], rcx
+    imul edx, edx, 80
+    lea rax, [rcx+rdx+24]
+    mov [rsp+32], rax
+    mov [rsp+40], r8
+    mov [rsp+56], r9
+    plane_request 0, 0, 8
+    plane_request 16, 4, 16
+    plane_request 32, 4, 16
+    plane_request 48, 0, 8
+    plane_request 64, 0, 8
+    add rsp, 72
+    ret
+frame_planes ENDP
 END

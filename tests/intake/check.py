@@ -16,7 +16,7 @@ import pefile
 TOOLS = Path(__file__).resolve().parents[2] / "tools"
 sys.path.insert(0, str(TOOLS))
 from intake_exe import main as intake_main
-from pe_inventory import scan
+from pe_inventory import exports, scan
 
 
 def check(folder, fixture, provider):
@@ -163,6 +163,29 @@ def check(folder, fixture, provider):
         pe.set_qword_at_rva(table_va - pe.OPTIONAL_HEADER.ImageBase, 1)
         pe.write(str(bad_tls))
     assert "RVA" in run(2, bad_tls)["error"]
+    # Windows locates the TLS directory by VirtualAddress alone and ignores Size.
+    for size in (0, 39):
+        small_tls = folder / f"tls-size-{size}.exe"
+        with pefile.PE(str(fixture), fast_load=True) as pe:
+            pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = size
+            pe.write(str(small_tls))
+        small_report = run(0, small_tls)
+        assert small_report["pe"]["tls"] == report["pe"]["tls"]
+        assert small_report["pe"]["startup"]["locations"] == locations
+    zero_tls_addr = folder / "tls-zero-addr.exe"
+    with pefile.PE(str(fixture), fast_load=True) as pe:
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = 0
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 40
+        pe.write(str(zero_tls_addr))
+    zero_tls_report = run(0, zero_tls_addr)
+    assert zero_tls_report["pe"]["tls"] is None
+    assert [loc["role"] for loc in zero_tls_report["pe"]["startup"]["locations"]] == ["entry"]
+    oob_tls = folder / "tls-oob.exe"
+    with pefile.PE(str(fixture), fast_load=True) as pe:
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = pe.OPTIONAL_HEADER.SizeOfImage - 16
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 0
+        pe.write(str(oob_tls))
+    assert "RVA" in run(2, oob_tls)["error"]
     staged = root / "incoming.exe"
     shutil.copyfile(fixture, staged)
     assert run(0, staged)["diff"]["added_images"] == [slot]
@@ -172,7 +195,88 @@ def check(folder, fixture, provider):
     assert "occupies" in run(2, fixture)["error"]
     torrent.write_bytes(b"different")
     assert "Torrent hash differs" in run(2)["error"]
+    # pefile stops reading export names at the first one outside its character set and lists the
+    # rest as bare ordinals. A same-length rename of the first name must leave named_value bound.
+    rejected = folder / "rejected-export"
+    rejected.mkdir()
+    shutil.copyfile(fixture, rejected / slot)
+    with pefile.PE(str(provider)) as pe:
+        stored = {s.name: s.ordinal for s in pe.DIRECTORY_ENTRY_EXPORT.symbols}
+        alias, = [s for s in pe.DIRECTORY_ENTRY_EXPORT.symbols if s.name == b"named_alias"]
+        pe.set_bytes_at_offset(alias.name_offset, b"named alias")
+        pe.write(str(rejected / provider.name))
+    inventory = scan(rejected)
+    assert {(e["ordinal"], e["name"]) for e in inventory["images"][provider.name]["exports"]} == {
+        (stored[b"named_alias"], "named alias"), (stored[b"named_value"], "named_value"), (77, None)}
+    named, = [r for r in inventory["imports"] if r["symbol"] == "named_value"]
+    assert named["bundle_exports_in"] == [provider.name]
+    check_export_reads(folder, provider)
     check_modified_directory(folder, fixture, provider)
+
+
+def check_export_reads(folder, provider):
+    """A name, forwarder or table outside section file data stops the scan with its RVA."""
+
+    def patched(name, change):
+        target = folder / f"export-{name}"
+        target.mkdir()
+        with pefile.PE(str(provider)) as pe:
+            d = pe.DIRECTORY_ENTRY_EXPORT.struct
+            rva = change(pe, d, pe.get_section_by_rva(d.AddressOfNames))
+            pe.write(str(target / provider.name))
+        return target, rva
+
+    def outside(pe, d, section):
+        rva = pe.OPTIONAL_HEADER.SizeOfImage + 0x100
+        pe.set_dword_at_rva(d.AddressOfNames, rva)
+        return rva
+
+    def unterminated(pe, d, section):
+        # The last byte of the section's file data, followed by no NUL.
+        rva = section.VirtualAddress + section.SizeOfRawData - 1
+        section.Misc_VirtualSize = section.SizeOfRawData
+        pe.set_bytes_at_rva(rva, b"x")
+        pe.set_dword_at_rva(d.AddressOfNames + 4 * (d.NumberOfNames - 1), rva)
+        return rva
+
+    def short_names(pe, d, section):
+        d.NumberOfNames = (section.VirtualAddress + section.SizeOfRawData - d.AddressOfNames) // 4 + 1
+        return d.AddressOfNames
+
+    def forwarder(pe, d, section):
+        directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]
+        rva = pe.OPTIONAL_HEADER.SizeOfImage + 0x100
+        directory.Size = rva + 0x100 - directory.VirtualAddress
+        pe.set_dword_at_rva(d.AddressOfFunctions + 4 * (77 - d.Base), rva)
+        return rva
+
+    def directory_edge(pe, d, section, include_nul):
+        value = b"fixture.target\0"
+        rva = section.VirtualAddress + section.SizeOfRawData - len(value)
+        section.Misc_VirtualSize = section.SizeOfRawData
+        pe.set_bytes_at_rva(rva, value)
+        pe.set_dword_at_rva(d.AddressOfFunctions + 4 * (77 - d.Base), rva)
+        directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]
+        directory.Size = rva + len(value) - directory.VirtualAddress - int(not include_nul)
+        return rva
+
+    valid, _ = patched("last-byte", lambda *args: directory_edge(*args, include_nul=True))
+    with pefile.PE(str(valid / provider.name)) as pe:
+        assert any(row["ordinal"] == 77 and row["forwarder"] == "fixture.target" for row in exports(pe))
+
+    for name, change, message in (
+            ("past-end", lambda *args: directory_edge(*args, include_nul=False), "Unterminated export forwarder at RVA {:#x}"),
+            ("outside", outside, "Export name at RVA {:#x} is outside the file's sections"),
+            ("unterminated", unterminated, "Unterminated export name at RVA {:#x}"),
+            ("short-names", short_names, "Export name pointer table at RVA {:#x} is outside the file's sections"),
+            ("forwarder", forwarder, "Export forwarder at RVA {:#x} is outside the file's sections")):
+        target, rva = patched(name, change)
+        try:
+            scan(target)
+        except ValueError as error:
+            assert str(error) == message.format(rva), (name, error)
+        else:
+            raise AssertionError(f"{name}: the scan accepted an unreadable export")
 
 
 def check_modified_directory(folder, fixture, provider):

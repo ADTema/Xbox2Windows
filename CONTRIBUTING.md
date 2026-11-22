@@ -7,14 +7,14 @@ Visit [GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions) an
 ## Find and claim a task
 
 1. Search the [issue tracker](https://github.com/R0Y00/Xbox2Windows/issues) for the test name or observed behavior. Issues labeled **good first issue** have a small first step. **help wanted** marks work that can proceed independently.
-2. For an existing task, comment with the part you plan to test and your environment. Multiple adapters can be tested in parallel. For a new investigation, open a research task with a question, reproducible inputs and a completion condition. Small fixes can start with a PR.
+2. For an existing task, comment with the part you plan to test and your environment. If you expect to change a shared interface, name it in your claim and link any issue or PR you depend on or overlap with. For example, two changes to the same call translator can share a fixture and agree which lands first. Multiple adapters can be tested in parallel. For a new investigation, open a research task with a question, reproducible inputs and a completion condition. Small fixes can start with a PR.
 3. If another contributor takes over, leave the commit, last command, observed result and next unanswered question on the issue. A maintainer can use the assignee field to record ownership of a patch.
 
 ## Build and test
 
 Hardware reporters can use the [standalone package](tools/gpu-check/README.md). Paste the generated Markdown into the [ongoing hardware thread](https://github.com/R0Y00/Xbox2Windows/issues/1). Maintainers verify each incoming result, link the source report in the README coverage table, and record repeated runs on the same adapter as follow-ups.
 
-The [first independent clean build](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821) records the toolchain and three smoke-test outcomes. If a clean build fails on your machine, open a [build bug report](https://github.com/R0Y00/Xbox2Windows/issues/new?template=bug_report.md) with the commit, toolchain, first failing command and diagnostic. Link a feedback-driven fix to its report and ask the reporter to verify the change.
+The [first independent clean build](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821) records the toolchain and three smoke-test outcomes. If a clean build fails on your machine, open a [build bug report](https://github.com/R0Y00/Xbox2Windows/issues/new?template=bug_report.yml) with the commit, toolchain, first failing command and diagnostic. Link a feedback-driven fix to its report and ask the reporter to verify the change.
 
 Start with the [first build](README.md#first-build). Create the Python environment before configuring to include the script-path host and Python-driven script, texture, shader and PE checks. List the tests registered in your environment with `ctest --preset dev -N`, then run the closest group from the [experiment table](README.md#choose-an-experiment). Use `--no-tests=error` when checking a new filter so an empty selection fails.
 
@@ -29,6 +29,12 @@ The Windows job builds the C++ and HLSL, runs the CPU, Python and WARP tests, an
 
 ## Share a reproducible finding
 
+To register a new translated CPU fixture for the coverage dashboard, put
+`; coverage: source cpu_your_test` on the first line of its MASM file. Name the
+CTest that actually compares the translation. For macro-generated instructions,
+use `; coverage: record cpu_your_test` and have the test emit the decoded forms
+through `FORM_COVERAGE_RECORD`. Existing registrations still work.
+
 Use original source, synthetic inputs or a public sample with its revision and license. Store local inputs in `game-files/` and generated output in `out/`. Keep game files, distribution links, SDK redistributables and dumps out of issues, PRs and Git. Remove personal paths and credentials from logs.
 
 State what the test measured and which behavior remains a hypothesis. For example, a BVH report can identify the first differing ray and give the CPU, shader and DXR hit distances. If several primitives coincide, describe which IDs are valid. Claims about the inspected build should identify their source. A passing fixture supports the behavior under test; full-game startup requires its own execution evidence.
@@ -37,7 +43,7 @@ For findings from a local installation, share a limited observation such as a co
 
 ## Submit and review a patch
 
-Create a topic branch from current `main` in your fork. Keep a PR focused on one reviewable behavior, include the exact test command and result, and link any related issue with `Refs #123`. Use `Fixes #123` when the patch meets that issue's completion condition. Submit original contributions under the [MIT License](LICENSE) and preserve applicable third-party notices.
+Create a topic branch from current `main` in your fork. In the PR description, say which task or milestone the change advances, or which independent problem it solves. Link related issues with `Refs #123` and name any PR that must land first. Use `Fixes #123` when the patch meets that issue's completion condition. Keep the PR focused on one reviewable behavior and include the exact test command and result. Submit original contributions under the [MIT License](LICENSE) and preserve applicable third-party notices.
 
 Use `<area>: <summary>` for new pull request titles. Keep the area lowercase and write the summary in the imperative. The areas are `cpu`, `gpu`, `shader`, `ffx`, `textures`, `script`, `pe`, `runtime`, `tooling`, `docs`, `ci`, `build` and `meta`. For example:
 

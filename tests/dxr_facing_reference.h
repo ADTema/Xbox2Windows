@@ -45,6 +45,8 @@ inline std::vector<Instance> instances() {
         // Mirroring z keeps the world-space winding but reverses the facing.
         {6, {1.5f, 1, -2}, 48, false, false, "BFFB"},
         {7, {1, -1, 1}, 56, true, true, "BFFB"},
+        // The z direction in object space is +/-2/3 for a unit world direction.
+        {8, {1, 1, 1.5f}, 64, false, false, "FBBF"},
     };
 }
 constexpr std::uint32_t rayFlags[]{0, cullBack, cullFront};
@@ -79,8 +81,9 @@ inline Hit closest(const std::vector<Vertex>& mesh, const std::vector<Instance>&
         Vec origin, direction;
         for (int axis = 0; axis < 3; ++axis) {
             const double translate = axis == 0 ? instance.translateX : 0;
-            origin[axis] = (ray.origin[axis] - translate) / instance.scale[axis];
-            direction[axis] = ray.direction[axis] / instance.scale[axis];
+            const double scale = instance.scale[axis];
+            origin[axis] = (ray.origin[axis] - translate) / scale;
+            direction[axis] = ray.direction[axis] / scale;
         }
         for (std::uint32_t primitive = 0; primitive < mesh.size() / 3; ++primitive) {
             Vec v[3];
@@ -92,8 +95,9 @@ inline Hit closest(const std::vector<Vertex>& mesh, const std::vector<Instance>&
             const Vec delta = sub(origin, v[0]), q = cross(delta, direction);
             const double t = -dot(delta, normal) / facing;
             const double u = -dot(e2, q) / facing, w = dot(e1, q) / facing;
-            // Fixture rays stay inside the open distance interval and the triangle interior.
-            if (!(t > ray.nearT && t < ray.farT && u > 0 && w > 0 && u + w < 1)) continue;
+            // Include both geometric candidates at a shared edge. At equal distances
+            // this reference keeps the first primitive; DXR may choose either neighbor.
+            if (!(t > ray.nearT && t < ray.farT && u >= 0 && w >= 0 && u + w <= 1)) continue;
             // Clockwise from the ray origin in a left-handed frame is front facing.
             const bool front = (facing < 0) != instance.counterclockwise;
             if (!instance.cullDisable && (ray.flags & (front ? cullFront : cullBack))) continue;

@@ -101,7 +101,8 @@ def tree_arrays(fields):
                    struct.iter_unpack("<IIBBHI", schema[pos:end])}
         schemas[kind] = size, members
         pos = end
-    if (joaat("attributes"), 0, 0x5c) not in schemas.get(root_kind, (0, set()))[1]:
+    root_size, root_members = schemas.get(root_kind, (0, set()))
+    if root_size != len(root) or (joaat("attributes"), 0, 0x5c) not in root_members:
         return None
 
     def array(slot, stride, required):
@@ -151,6 +152,17 @@ def verified_camera(values, vectors):
     return verified
 
 
+def state_ids(rows):
+    """Return a state's id digests, rejecting any id that is not label-kind (5) as resolve_script_path does."""
+    ids = []
+    for key, digest, _, kind, _, _ in rows:
+        if key == joaat("id"):
+            if kind != 5:
+                raise ValueError("Non-label state ID attribute")
+            ids.append(digest)
+    return ids
+
+
 def inspect_tree(nodes, attrs, vectors, state_id, record_index=0):
     counts = Counter()
     candidates = {}
@@ -164,8 +176,7 @@ def inspect_tree(nodes, attrs, vectors, state_id, record_index=0):
         if name == joaat("state"):
             counts["state_nodes"] += 1
             states.add(index)
-            ids = [digest for key, digest, _, kind, _, _ in attrs[first:first + count]
-                   if key == joaat("id") and kind == 5]
+            ids = state_ids(attrs[first:first + count])
             if len(ids) > 1:
                 raise ValueError("Duplicate state ID attribute")
             if ids and ids[0] == state_id:
