@@ -14,11 +14,17 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 from spirv_sampler_split import split_comparison_sampler
+from spirv_sampler_views import split_sampler_views
 
 ORDINARY_BINDING = 5
 SHARED = Path(__file__).with_name("shared_sampler.spvasm").read_text(encoding="utf-8")
 # 0.25 <= 0.5 passes, 0.75 <= 0.5 fails, ordinary sample of 0.375; the other 13 words are guards.
 EXPECTED = [0x3f800000, 0x00000000, 0x3ec00000] + [0xc5c5c5c5] * 13
+
+
+def substitute(text, old, new):
+    assert text.count(old) == 1, old
+    return text.replace(old, new)
 
 
 def rejected(assembly, binding, reason):
@@ -33,14 +39,37 @@ def rejected(assembly, binding, reason):
 def controls(directory):
     lowered, mapping = split_comparison_sampler(SHARED, ORDINARY_BINDING)
     assert mapping == {"descriptor_set": 0, "comparison_binding": 2, "ordinary_binding": ORDINARY_BINDING}, mapping
-    # Already-separated input: the ordinary sample uses its own sampler, so the module is unchanged.
-    separated = SHARED.replace("%41 = OpLoad %type_sampler %cmpSampler", "%41 = OpLoad %type_sampler %plainSampler")
-    assert separated != SHARED and split_comparison_sampler(separated, ORDINARY_BINDING) == (separated, None)
+    # Modules without a mixed standalone sampler come back byte-for-byte, whatever else they contain.
+    separated = substitute(SHARED, "%41 = OpLoad %type_sampler %cmpSampler", "%41 = OpLoad %type_sampler %plainSampler")
+    separated_lod = substitute(separated, "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0",
+                               "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0_25")
+    table = Path(__file__).with_name("sampler.spvasm").read_text(encoding="utf-8")  # #676 indexed table
+    for name, module in (("already separated", separated), ("unrelated nonzero LOD", separated_lod),
+                         ("indexed sampler table", table), ("split sampler views", split_sampler_views(table))):
+        assert split_comparison_sampler(module, ORDINARY_BINDING) == (module, None), name
+
+    # An unrelated ordinary sample at nonzero LOD on another sampler does not block the split.
+    unrelated = substitute(SHARED, "%44 = OpCompositeExtract %float %43 0",
+                           "%44 = OpCompositeExtract %float %43 0\n"
+                           "%u1 = OpLoad %type_sampler %plainSampler\n"
+                           "%u2 = OpSampledImage %type_sampled_image %40 %u1\n"
+                           "%u3 = OpImageSampleExplicitLod %v4float %u2 %15 Lod %float_0_25")
+    split, mapping = split_comparison_sampler(unrelated, ORDINARY_BINDING)
+    assert mapping["ordinary_binding"] == ORDINARY_BINDING
+    assert "%u2 = OpSampledImage %type_sampled_image %40 %u1" in split
+
+    # Unsupported uses of the sampler being split are still rejected.
     for binding in (2, 3, 4):
         rejected(SHARED, binding, f"binding {binding} is occupied in set 0")
-    nonzero = SHARED.replace("%float_0_75 Lod %float_0", "%float_0_75 Lod %float_0_25")
-    assert nonzero != SHARED
-    rejected(nonzero, ORDINARY_BINDING, "requires a constant LOD of zero")
+    rejected(substitute(SHARED, "%float_0_75 Lod %float_0", "%float_0_75 Lod %float_0_25"),
+             ORDINARY_BINDING, "requires a constant LOD of zero")
+    rejected(substitute(SHARED, "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0",
+                        "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0_25"),
+             ORDINARY_BINDING, "requires a constant LOD of zero")
+    rejected(substitute(SHARED, "%33 = OpLoad %type_sampler %cmpSampler",
+                        "%copy = OpCopyObject %_ptr_UniformConstant_type_sampler %cmpSampler\n"
+                        "%33 = OpLoad %type_sampler %cmpSampler"),
+             ORDINARY_BINDING, "only direct loads are supported")
 
     tool = [sys.executable, "-B", str(ROOT / "tools" / "spirv_sampler_split.py")]
     source = directory / "shared.spvasm"

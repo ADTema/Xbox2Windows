@@ -3001,11 +3001,14 @@ above is handled by the sampler views. For a standalone sampler, the opt-in
 only the ordinary uses to a new sampler at a binding the host supplies with
 `--ordinary-binding`. That binding must be free in the same descriptor set. The pass
 prints the `descriptor_set`, `comparison_binding` and `ordinary_binding` mapping for
-the host. Modules without a mixed sampler are returned unchanged.
+the host.
 
-The profile covers direct, non-array float32 `Texture2D` sampling in one compute entry
-point at a constant LOD of zero. Other forms, an occupied binding, a nonzero LOD and
-more than one mixed sampler are rejected with a specific diagnostic.
+The pass first looks for a directly loaded standalone sampler that feeds both kinds of
+sampling. Modules without one are returned byte-for-byte unchanged. That includes the
+indexed table above and unrelated samples on other samplers. For the sampler it splits,
+the profile covers direct, non-array float32 `Texture2D` sampling in one compute entry
+point at a constant LOD of zero. Other uses of that sampler, an occupied binding, a
+nonzero LOD and more than one mixed sampler are rejected with a specific diagnostic.
 
 The [source-built fixture](../tests/spirv_window/shared_sampler.spvasm) compares
 references 0.25 and 0.75 against depth 0.5 with point-clamp `LESS_EQUAL`, and
