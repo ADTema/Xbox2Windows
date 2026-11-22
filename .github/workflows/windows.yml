@@ -44,9 +44,12 @@ jobs:
       - name: Run Python checks
         run: |
           python -B tests/script_state_check.py
+          python -B tests/resource_root_check.py
           python -B tests/bcpack_check.py
+          python -B tests/bc7_blocks_check.py
           python -B tests/form_coverage_check.py
           python -B tests/resource_ranges_check.py
+          python -B tests/awc_metadata_check.py
           python -B tests/sgd5_effects_check.py
           python -B tests/dxcontainer_part_offsets_check.py
           python -B tests/layout_chunks_check.py
@@ -56,6 +59,7 @@ jobs:
           python -B tests/dxil_retarget_check.py
           python -B tests/rdna2_tools_check.py
           python -B tests/pso_readiness_check.py
+          python -B tests/xmem_attribute_scan_check.py
           python -B tests/docs_links_check.py
           python -B tests/bidi_controls_check.py
   build-and-test:
@@ -84,7 +88,20 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build --preset dev
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ctest --preset dev --no-tests=error -E '_hardware$'
+          ctest --preset dev --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
+      - name: Draw the coverage dashboard
+        shell: pwsh
+        run: |
+          ./out/pe-env/Scripts/python.exe -B tools/form_coverage.py out/test-results.xml --json out/coverage/coverage.json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./out/pe-env/Scripts/python.exe -B tools/coverage_svg.py out/coverage/coverage.json out/coverage/dashboard.svg `
+            --source "$($env:GITHUB_SHA.Substring(0, 7)), GitHub Actions windows-2025, WARP"
+      - name: Upload coverage dashboard
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-dashboard
+          path: out/coverage/dashboard.svg
+          if-no-files-found: error
       - name: Build and smoke-test the standalone GPU check
         shell: pwsh
         run: .\tools\package-gpu-check.ps1
