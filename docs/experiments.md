@@ -1693,6 +1693,8 @@ Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
 
 #### BCPack decoding by BC format
 
+The [synthetic decoder checks](bcpack-decoder-tests.md) record the construction of the test streams, all twelve checks, six complete input/output byte pairs and an archived copy of the runnable test sources.
+
 The RDS5 reader selects the decoder with `codec = (entry >> 26) & 15` from a little-endian 64-bit chunk-table entry. The tag column shows those bits in the archive's fourth byte, masked with `0x3c`. Each lane emits one symbol per eight decoded bytes. The texture descriptor supplies the DXGI format and layout for assembling the resulting 4 × 4 blocks into a DDS. [Pinned decoder and lane tables](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tools/bcpack.py) · [Pinned archive reader and exporter](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tools/ttpf_mips.py)
 
 | Output format | Tag / codec | Bytes per 4 × 4 block | Lane widths in stream order (bits) | Output block fields |
