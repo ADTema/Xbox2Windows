@@ -64,6 +64,7 @@ CPU_FIXTURES = {
     "working_set_delta": "cpu_working_set_delta",
     "xlatb": "cpu_aot_xlatb",
     "exe_entry": "cpu_aot_exe_entry",
+    "xchg": "cpu_aot_xchg",
     "address_size": "cpu_aot_address_size",
     "call_pair": "cpu_aot_call_pair",
     "movbe": "cpu_aot_movbe",

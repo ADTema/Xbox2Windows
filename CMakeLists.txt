@@ -709,6 +709,20 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_version_query_lifted>")
     add_test(NAME cpu_lower_prefixes COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/lower_prefixes_check.py")
+    cpu_asm_fixture(cpu_xchg xchg)
+    # The lifted DLL and two mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted plain oneway)
+        set(xchg_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_xchg_${variant}.cpp")
+        add_custom_command(OUTPUT "${xchg_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xchg.py"
+                emit "$<TARGET_FILE:cpu_xchg>" "${xchg_fixture}" ${variant}
+            DEPENDS cpu_xchg tests/cpu/xchg.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_xchg_${variant} SHARED "${xchg_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_xchg COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xchg.py"
+        check "$<TARGET_FILE:cpu_xchg>" "$<TARGET_FILE:cpu_xchg_lifted>"
+        "$<TARGET_FILE:cpu_xchg_plain>" "$<TARGET_FILE:cpu_xchg_oneway>")
     cpu_asm_fixture(cpu_address_size address_size)
     set(address_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_address_size_lifted.cpp")
     add_custom_command(OUTPUT "${address_fixture}"
