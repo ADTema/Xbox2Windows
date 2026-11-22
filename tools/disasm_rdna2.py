@@ -129,6 +129,7 @@ SOP2_OPS = {
     0x08: ("s_max_i32", "Scalar maximum signed 32-bit"),
     0x09: ("s_max_u32", "Scalar maximum unsigned 32-bit"),
     0x0a: ("s_cselect_b32", "Scalar conditional select 32-bit"),
+    0x0b: ("s_cselect_b64", "Scalar conditional select 64-bit"),
     0x0e: ("s_and_b32", "Scalar bitwise AND 32-bit"),
     0x0f: ("s_and_b64", "Scalar bitwise AND 64-bit"),
     0x10: ("s_or_b32", "Scalar bitwise OR 32-bit"),
@@ -1129,6 +1130,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_info = SOP1_OPS.get(op, (f"s_sop1_{op:02x}", "Unknown SOP1"))
         op_name, comment = op_info
         length = 4
+        is_64 = op_name.endswith(("_b64", "_u64", "_i64"))
         if ssrc0 == 255:
             if offset + 8 > len(data):
                 return (4, "sop1_truncated", f"{op_name} <truncated>", "Incomplete SOP1 literal")
@@ -1136,8 +1138,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             src0_str = f"0x{literal:x}"
             length = 8
         else:
-            src0_str = decode_s_reg(ssrc0)
-        asm = f"{op_name} {decode_s_reg(sdst)}, {src0_str}"
+            src0_str = decode_s_reg64(ssrc0) if is_64 else decode_s_reg(ssrc0)
+        sdst_str = decode_s_reg64(sdst) if is_64 else decode_s_reg(sdst)
+        asm = f"{op_name} {sdst_str}, {src0_str}"
         return (length, op_name, asm, comment)
 
     # SOPC: [31:23] == 0b101111110 (0xbf000000)
@@ -1200,9 +1203,13 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 return (4, "sop2_truncated", f"{op_name} <truncated>", "Incomplete SOP2 literal")
             literal, = struct.unpack_from("<I", data, offset + 4)
             length = 8
-        src0_str = f"0x{literal:x}" if ssrc0 == 255 and literal is not None else decode_s_reg(ssrc0)
-        src1_str = f"0x{literal:x}" if ssrc1 == 255 and literal is not None else decode_s_reg(ssrc1)
-        asm = f"{op_name} {decode_s_reg(sdst)}, {src0_str}, {src1_str}"
+        is_64 = op_name.endswith(("_b64", "_u64", "_i64"))
+        src0_wide = is_64 and not op_name.startswith("s_bfm_")
+        src0_str = f"0x{literal:x}" if ssrc0 == 255 and literal is not None else (decode_s_reg64(ssrc0) if src0_wide else decode_s_reg(ssrc0))
+        src1_wide = is_64 and not op_name.startswith(("s_lshl_", "s_lshr_", "s_ashr_", "s_bfe_", "s_bfm_"))
+        src1_str = f"0x{literal:x}" if ssrc1 == 255 and literal is not None else (decode_s_reg64(ssrc1) if src1_wide else decode_s_reg(ssrc1))
+        sdst_str = decode_s_reg64(sdst) if is_64 else decode_s_reg(sdst)
+        asm = f"{op_name} {sdst_str}, {src0_str}, {src1_str}"
         return (length, op_name, asm, comment)
 
     # 5. VOP1: [31:25] == 0b0111111 (0x7e000000)
