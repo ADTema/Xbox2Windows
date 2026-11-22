@@ -65,8 +65,9 @@ to the caller's own entry and any call cycle are refused, and a caller is
 refused when any callee is. A callee records how many low bytes of each argument
 register it may read before writing it, and the caller must define them at the
 call. After a call RAX holds the callee's return width of defined bytes; the
-other volatile registers, the flags and the callee's 32-byte home space at RSP
-are undefined, and the nonvolatile registers and the rest of the frame,
+other volatile registers, the flags and every frame byte below RSP + 32 at the
+call (the return address, the callee's frame and its home space) are undefined,
+and the nonvolatile registers and the rest of the frame,
 including the caller's own home space above entry RSP, are kept. RSP must be 8
 mod 16 from entry at a call, with the callee's home space below the return
 address. A tail jump is checked as a RET and contributes the callee's return
@@ -889,10 +890,12 @@ def prove_frame(function, order, effects, frame):
 
     def step(ip, status, data):
         if ip in function.calls:
-            # The callee may write its home space, the 32 bytes at RSP; the rest of the frame,
+            # The CALL writes its return address below RSP, the callee's frame lies below that, and the
+            # callee may write its home space, the 32 bytes at RSP. All of these bytes are undefined
+            # after the call, even when RSP later falls back over them; the rest of the frame,
             # including this function's own home space above entry RSP, is kept.
             index = frame.offsets[ip] - frame.start
-            return status, data[:index] + bytes(HOME_SIZE) + data[index + HOME_SIZE:]
+            return status, bytes(index + HOME_SIZE) + data[index + HOME_SIZE:]
         status, restored = dict(zip(NONVOLATILE, status)), None
         if ip in frame.accesses:
             offset, width, reads, writes = frame.accesses[ip]

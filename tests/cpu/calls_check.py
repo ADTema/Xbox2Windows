@@ -124,6 +124,16 @@ def layout(pe, export_rva):
     return rvas
 
 
+def check_below_call(probe_path, original_path):
+    """Natively, below_call's reload returns the CALL's return address, not the stored argument."""
+    probe = register_probe(probe_path)
+    function = ctypes.cast(ctypes.CDLL(str(original_path)).below_call, ctypes.c_void_p).value
+    values = {observe(probe, function, x, y)[0] for x, y in inputs()[:64]}
+    if len(values) != 1 or values & {x for x, _ in inputs()[:64]}:
+        raise AssertionError(f"below_call returned {sorted(map(hex, values))[:4]}, expected one return address")
+    print(f"below_call natively returns {values.pop():#x} for every input: the CALL overwrote the stored slot")
+
+
 def check_structure(original_path):
     pefile, export_rva, aot = tools()
     source, functions = aot.translate(original_path, list(EXPORTS))
@@ -198,6 +208,9 @@ CONTROLS = [
     ("chain3", [("chain3", 0x01, "48 83 ec 20", "90 90 90 90"), ("chain3", 0x11, "48 83 c4 20", "90 90 90 90")],
      "call without an aligned home space at entry RSP-0x8"),
     ("tail_after_frame", [("tail_after_frame", 0x0b, "5b", "90")], "stack not balanced at tail jump"),
+    # As built: a slot below the call-time RSP, which the CALL's return address overwrites, reloaded
+    # after RSP falls back over it.
+    ("below_call", [], "undefined stack byte at entry RSP-0x40"),
     ("tail_call", [("tail_call", 0x00, "48 83 c1 05", "48 8b d9 90")],
      "nonvolatile register rbx is not restored on every path to the tail jump"),
 ]
@@ -264,6 +277,7 @@ def check_rejections(original_path):
 if __name__ == "__main__":
     if len(sys.argv) == 5 and sys.argv[1] == "check":
         check(*sys.argv[2:])
+        check_below_call(sys.argv[2], sys.argv[3])
         check_structure(sys.argv[3])
         check_rejections(sys.argv[3])
     else:

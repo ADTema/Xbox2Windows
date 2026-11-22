@@ -128,4 +128,20 @@ home_save_call PROC FRAME
     add rsp, 28h
     ret
 home_save_call ENDP
+
+; A regression control, not translated by the build: x is stored at entry RSP-0x40, RSP rises
+; to entry RSP-0x38 for the call, whose return address then overwrites that slot, and RSP falls
+; back before the reload. Natively the reload returns the return address, not x.
+below_call PROC FRAME
+    sub rsp, 58h
+    .allocstack 58h
+    .endprolog
+    mov qword ptr [rsp+18h], rcx
+    add rsp, 20h
+    call leaf_mix
+    sub rsp, 20h
+    mov rax, qword ptr [rsp+18h]
+    add rsp, 58h
+    ret
+below_call ENDP
 END
