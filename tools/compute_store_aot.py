@@ -163,6 +163,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
                 raise ValueError("Unverified dispatch byte offset")
             vector[dst] = ("thread_bytes", tag[1], shift)
+        elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), v(\d+), (\d+), v(\d+)", line):
+            dst, row, shift, column = map(int, m.groups())
+            row_tag, column_tag = vector.get(row), vector.get(column)
+            # (row index << shift) + column byte offset, from two different dispatch axes.
+            # The plane and element checks at the store bound both shifts.
+            if (dst > 255 or not (isinstance(row_tag, tuple) and row_tag[0] == "thread")
+                    or not (isinstance(column_tag, tuple) and column_tag[0] == "thread_bytes")
+                    or row_tag[1] == column_tag[1]):
+                raise ValueError("Unverified plane byte offset")
+            vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
         elif m := re.fullmatch(r"buffer_store_dword(?:x([234]))? (v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), "
                                r"s\[(\d+):(\d+)\], 0( idxen)?( offen)?(?: offset:(\d+))?", line):
             count = int(m[1] or 1)
@@ -179,12 +189,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             tags = [vector.get(reg) for reg in addr_regs]
             if (m[3] == "off" and not m[6] and not m[7] and dims == (1, 1, 1) and stride is None):
                 store_layout = ("fixed",)
+                covered = set()
             elif (stride is not None and m[6] and not m[7] and len(addr_regs) == 1
                     and isinstance(tags[0], tuple) and tags[0][0] == "thread" and offset + 4 * count <= stride):
                 # One index axis: every other group dimension must be one, so no two
                 # invocations of a group share an address.
                 index = tags[0][1]
                 store_layout = ("index", index)
+                covered = {index}
                 address = f"tid.{AXES[index]} * {stride}u + {offset}u"
             elif (stride is not None and m[6] and m[7] and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
                     and all(isinstance(tag, tuple) for tag in tags)
@@ -194,10 +206,23 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 if (offset + 4 * count > 1 << shift or dims[column] << shift > stride):
                     raise ValueError("Store leaves its element or row")
                 store_layout = ("index_offset", index, column, shift)
+                covered = {index, column}
                 address = f"tid.{AXES[index]} * {stride}u + (tid.{AXES[column]} << {shift}u) + {offset}u"
+            elif (stride is not None and m[6] and m[7] and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
+                    and all(isinstance(tag, tuple) for tag in tags)
+                    and tags[0][0] == "thread" and tags[1][0] == "plane_bytes"
+                    and tags[0][1] not in (tags[1][1], tags[1][3])):
+                # Three axes: index * stride + (row << row_shift) + (column << shift) + instruction offset.
+                (_, index), (_, row, row_shift, column, shift) = tags
+                if (offset + 4 * count > 1 << shift or dims[column] << shift > 1 << row_shift
+                        or dims[row] << row_shift > stride):
+                    raise ValueError("Store leaves its element, row or plane")
+                store_layout = ("index_plane", index, row, row_shift, column, shift)
+                covered = {index, row, column}
+                address = (f"tid.{AXES[index]} * {stride}u + (tid.{AXES[row]} << {row_shift}u)"
+                           f" + (tid.{AXES[column]} << {shift}u) + {offset}u")
             else:
                 raise ValueError("Unsupported store address")
-            covered = {store_layout[1], *store_layout[2:3]} if store_layout[0] != "fixed" else set()
             if any(dims[axis] > 1 for axis in range(3) if axis not in covered):
                 raise ValueError("Store address does not separate every invocation of the group")
             if layout not in (None, store_layout):

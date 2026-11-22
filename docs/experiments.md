@@ -1757,12 +1757,17 @@ it. For an original program this is still a caller assumption.
 
 A dispatch index is `v_lshl_add_u32` of a group ID and the local ID of the
 same axis, shifted by log2 of a power-of-two group dimension. An indexed store
-takes one of two forms:
+takes one of three forms:
 
 - one `idxen` axis, when every other group dimension is one;
 - a row axis through `idxen` and a column axis through `offen`, with a
   `v_lshlrev_b32` byte offset. The store must fit in one element, and one
   group's row must fit in the stride.
+- a plane axis through `idxen` and an `offen` byte offset that folds a row
+  axis and a column axis: `v_lshl_add_u32` of the row dispatch index, a shift
+  and the column's `v_lshlrev_b32` byte offset. The three axes must differ.
+  The store must fit in one element, one group's columns in one row
+  (`1 << shift`), and one group's rows in the stride.
 
 All stores in a program use one layout, so no two invocations of a group write
 the same bytes. A dispatch-thread index can also be stored as data. The
@@ -1774,7 +1779,7 @@ other ALU forms, for example a `v_mad_u32_u24` row pitch, are still rejected.
 python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-reg 8 --descriptor-offset 0 --group-reg 10 --group-reg-y 11 --stride 72 --output out/tile.hlsl
 ```
 
-The Windows fixture covers four group shapes, each with a full 320-word
+The Windows fixture covers five group shapes, each with a full 320-word
 readback:
 
 | Group | Dispatches |
@@ -1783,6 +1788,11 @@ readback:
 | 4×1×8 | 1×1×1 and 1×1×2 |
 | 4×4×1 | 1×1×1 and 3×2×1 |
 | 256×1×1 | 1×1×1 |
+| 4×4×4 | 1×1×1 and 1×2×2 |
+
+The 4×4×4 kernel stores dispatch Z at `tid.z * 132 + (tid.y << 4) + (tid.x << 2)`.
+Its 132-byte stride covers both groups' rows in Y and leaves one guard word per
+plane.
 
 The expected words come from an independent per-invocation model. For each
 shape, the following must fail on the adapter:
@@ -1790,7 +1800,7 @@ shape, the following must fail on the adapter:
 - a flipped guard word;
 - the first group count against the larger reference;
 - recompiled HLSL with swapped axes;
-- recompiled HLSL that ignores Z (4×1×8 only);
+- recompiled HLSL that ignores Z (4×1×8 and 4×4×4);
 - recompiled HLSL with half the group X size.
 
 The CPU controls reject:
@@ -1801,7 +1811,12 @@ The CPU controls reject:
 - duplicate or missing group registers;
 - an element or row overflow;
 - an index and a byte offset taken from the same axis;
-- two stores with transposed layouts.
+- two stores with transposed layouts;
+- a plane offset whose row and column, or whose index and row, share an axis;
+- a plane offset built from a raw local ID or from an index instead of a byte
+  offset;
+- a group's columns overflowing a row, or its rows overflowing the stride;
+- a plane offset stored without its `idxen` index, or stored as data.
 
 `tools/shader_profile_audit.py` passes the PSV0 size and tries the next one or
 two SGPRs after the group-X candidate for group Y and Z. A CPU control in
