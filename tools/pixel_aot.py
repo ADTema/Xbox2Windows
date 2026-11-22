@@ -1139,6 +1139,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     result_type = "uint4" if integer_export else "float4"
     lines.append(f"{result_type} main(float2 uv : TEXCOORD0) : SV_Target0 {{")
     attribute_input = False
+    interpolated = False
     for i, line in enumerate(instructions):
         def match(pattern):
             return re.fullmatch(pattern, line)
@@ -1393,6 +1394,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if phase == "1" and vector.get(src) == "bary_i":
                 vector[dst] = ("partial", component, mask)
             elif phase == "2" and vector.get(src) == "bary_j" and vector.get(dst) == ("partial", component, mask):
+                interpolated = True
                 if entry_interp:
                     attribute_input = True
                     vector[dst] = f"alu{i}"
@@ -1913,8 +1915,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
                 raise ValueError("Unsupported export")
             args = [f"export16({v})" for pair in pairs for v in pair]
-            input_type = "float4" if attribute_input else "float2"
-            lines[entry_line] = f"float{len(args)} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
+            inputs = "float4 uv : TEXCOORD0" if attribute_input else "float2 uv : TEXCOORD0"
+            if not bindings and not interpolated:
+                inputs = ""
+            lines[entry_line] = f"float{len(args)} main({inputs}) : SV_Target0 {{"
             lines.append(f"    return float{len(args)}({', '.join(args)});")
             exported = True
         elif m := match(r"exp mrt0,? (v\d+), (v\d+), (v\d+), (v\d+) done vm"):
