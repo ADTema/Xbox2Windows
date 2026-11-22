@@ -4544,6 +4544,8 @@ def check_controls(directory):
         "v_alignbit_b32 v12, s44, v18, 4, 5",
         "v_alignbyte_b32 v12, s44, v18",
         "v_alignbyte_b32 v12, s44, v18, 1, 2",
+        "v_alignbit_b32_e32 v12, s44, v18, 4",
+        "v_alignbyte_b32_e32 v12, s44, v18, 1",
         "v_alignbit_b32 v256, s44, v18, 4",
         "v_alignbyte_b32 v256, s44, v18, 1",
         "v_alignbit_b32 v12, abs(s44), v18, 4",

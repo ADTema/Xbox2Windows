@@ -2072,12 +2072,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(rf"v_({'|'.join(INTEGER)})(?:_e32|_e64)? (v\d+), (.+)"):
-            op, dst, sources = m.groups()
+        elif m := match(rf"v_({'|'.join(INTEGER)})(?:_(e32|e64))? (v\d+), (.+)"):
+            op, encoding, dst, sources = m.groups()
             tokens = sources.split(", ")
             arity, template = INTEGER[op]
             if mask != "entry" or int(dst[1:]) > 255 or dst in sample_dest or len(tokens) != arity:
                 raise ValueError("Invalid integer operation")
+            if arity > 2 and encoding == "e32":
+                raise ValueError(f"Three-operand operation does not support e32 encoding: v_{op}")
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
             if op in MUL24_HELPERS:
                 helpers.update(MUL24_HELPERS[op])
