@@ -414,6 +414,24 @@ A 67h address-size prefix selects 32-bit addressing. The lowering wraps base + i
 
 XLATB replaces AL with the byte at RBX + AL. AL is zero-extended, and bits 8 to 63 of RAX and the flags are unchanged. With a 67h prefix the base is EBX and the sum wraps at 32 bits, so the upper half of RBX is ignored. A REX.W prefix (`48 d7`) does not change the operation. `cpu_aot_xlatb` builds four exports from [MASM source](../tests/cpu/xlatb.asm): the plain, REX.W and 67h forms, and two lookups in a row. Each export runs on a 256-byte permutation table in a page committed below 4 GiB. The check compares RAX and ZF/CF for every AL value, with noise in the upper bits of RAX and, for the 67h form, in the upper half of RBX, against the native DLL and an independent reference. Three controls mutate the generated C++ and must mismatch: `signed` sign-extends AL, `noaddr32` keeps the upper half of RBX in the 67h sum (whose reads fault), and `clear` writes the loaded byte over all of RAX. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_xlatb$' -V`.
 
+The RCX-counted branches `loop`, `loope`, `loopne` and `jrcxz` lower to a decrement and a conditional `goto`, and so do their 67h forms, which count in ECX. The behaviour is as follows:
+- None of them changes a flag.
+- `loope` and `loopne` test ZF after the decrement.
+- `jrcxz` and `jecxz` only test the count.
+- The ECX forms decrement ECX as a 32-bit write, which clears the upper half of RCX. The native fixture confirms this on the cases with noise in the upper half.
+
+`cpu_aot_rcx_branches` builds eight exports from MASM source (`tests/cpu/rcx_branches.asm`) and compares 7712 cases against the native DLL, the translation and a Python reference. Each case records RAX, RCX, the final pointer and ZF/CF. The exports are:
+- iteration counts with each ZF/CF preset, which must survive `loop`;
+- byte scans under `loope` and `loopne` guarded by `jrcxz`, which exit on the first element, a later one or at count exhaustion;
+- `jrcxz` and `jecxz` on counts that differ only in the upper half of RCX.
+
+Three mutated translations must each mismatch:
+- the ECX decrement keeping the upper half of RCX, with `jecxz` testing all of RCX;
+- `loope` and `loopne` ignoring ZF;
+- `jrcxz` inverted.
+
+Run `ctest --preset dev --no-tests=error -R '^cpu_aot_rcx_branches$' -V`.
+
 An immediate SHL, SHR or SAR whose masked count is zero leaves the flags unchanged, but a 32-bit destination is still written and its upper half clears. This covers `shl eax, 0` and `shl eax, 32`, because the count is masked to five bits. The lowering keeps the flags and emits the zero-extending write. A 64-bit destination keeps every bit. `cpu_aot_shift_count` builds these forms from MASM source, together with a nonzero control. It compares the native and translated images with a reference and checks that `sete` after a zero-count shift still observes the preceding compare. Before this change the translation returned `0xdeadbeef12345678` for `shl_zero(0xdeadbeef12345678)` where the hardware returns `0x12345678`. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_shift_count$' -V`.
 
 The shared lowering also handles 32-bit and 64-bit BMI1 bit-manipulation forms (`andn`, `bextr`, `blsi`, `blsmsk`, `blsr`, `tzcnt`), including their zero-extending 32-bit writes and ZF/CF updates. `cpu_aot_bmi1` probes CPUID leaf 7 EBX bit 3 (`BMI1`) before invoking the native fixture and exits 77 (capability skip) on hosts without BMI1; on BMI1-capable hosts it builds all twelve 32-bit and 64-bit exports from MASM source (`tests/cpu/bmi1.asm`), translates them, compares both values and observed ZF/CF flags against the native DLL and an independent reference, and checks that 16-bit `tzcnt` is rejected. Run `cmake --build --preset dev --target cpu_bmi1_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_bmi1$' -V`.

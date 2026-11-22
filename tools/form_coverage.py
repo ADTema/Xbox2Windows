@@ -37,6 +37,7 @@ RECORDS = ROOT / "out" / "build" / "dev" / "form_coverage"  # CMakePresets.json 
 # map to None: their forms are known but never covered. An unlisted .asm is reported as unclassified.
 CPU_FIXTURES = {
     "branch": "cpu_leaf_aot_branches",
+    "rcx_branches": "cpu_aot_rcx_branches",
     "direct": "cpu_aot_direct_call",
     "chained": "cpu_aot_chained_ranges",
     "callback": "cpu_aot_object_callback",

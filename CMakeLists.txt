@@ -605,6 +605,21 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(cpu_heap_layout_lifted SHARED "${heap_fixture}")
     add_test(NAME cpu_aot_heap_layout COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/heap_layout.py"
         check "$<TARGET_FILE:cpu_heap_layout>" "$<TARGET_FILE:cpu_heap_layout_lifted>")
+    cpu_asm_fixture(cpu_rcx_branches rcx_branches)
+    # The lifted DLL and three mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted noecx nozf jrcxz)
+        set(rcx_branches_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_rcx_branches_${variant}.cpp")
+        add_custom_command(OUTPUT "${rcx_branches_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rcx_branches.py"
+                emit "$<TARGET_FILE:cpu_rcx_branches>" "${rcx_branches_fixture}" ${variant}
+            DEPENDS cpu_rcx_branches tests/cpu/rcx_branches.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_rcx_branches_${variant} SHARED "${rcx_branches_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_rcx_branches COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rcx_branches.py"
+        check "$<TARGET_FILE:cpu_rcx_branches>" "$<TARGET_FILE:cpu_rcx_branches_lifted>"
+        "$<TARGET_FILE:cpu_rcx_branches_noecx>" "$<TARGET_FILE:cpu_rcx_branches_nozf>"
+        "$<TARGET_FILE:cpu_rcx_branches_jrcxz>")
     cpu_asm_fixture(cpu_shift_count shift_count)
     set(shift_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_shift_count_lifted.cpp")
     add_custom_command(OUTPUT "${shift_fixture}"

@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 
 import pefile
-from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
+from iced_x86 import Code as C, Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -123,6 +123,20 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             cond = {M.JE: "if (zero) ", M.JNE: "if (!zero) ", M.JAE: "if (!carry) ",
                     M.JA: "if (!carry && !zero) ", M.JB: "if (carry) ", M.JBE: "if (carry || zero) ", M.JMP: ""}[op]
             stmt = f"{cond}goto block_{target:x};"
+        elif op in (M.LOOP, M.LOOPE, M.LOOPNE, M.JRCXZ, M.JECXZ):
+            # RCX-counted branches. A 67h prefix selects ECX (loopd, jecxz). None of them changes a flag;
+            # LOOPE and LOOPNE test ZF after the decrement.
+            target = i.near_branch_target
+            if target not in allowed:
+                raise ValueError(f"unbound branch at {i.ip:#x}")
+            ecx = i.code in (C.LOOP_REL8_64_ECX, C.LOOPE_REL8_64_ECX, C.LOOPNE_REL8_64_ECX, C.JECXZ_REL8_64)
+            count = "static_cast<uint32_t>(rcx)" if ecx else "rcx"
+            if op in (M.JRCXZ, M.JECXZ):
+                stmt = f"if ({count} == 0) goto block_{target:x};"
+            else:
+                decrement = "rcx = static_cast<uint32_t>(rcx - 1);" if ecx else "--rcx;"
+                condition = {M.LOOP: "", M.LOOPE: " && zero", M.LOOPNE: " && !zero"}[op]
+                stmt = f"{decrement} if ({count} != 0{condition}) goto block_{target:x};"
         elif op in (M.MOV, M.MOVZX):
             stmt = write(operand(1))
         elif op == M.MOVSXD:
