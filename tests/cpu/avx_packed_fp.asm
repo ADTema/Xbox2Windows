@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_avx_packed_fp
 ; Source-owned differential fixture for 31 AVX 256-bit packed floating-point instructions.
 .code
 
