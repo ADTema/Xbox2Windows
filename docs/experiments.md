@@ -1088,6 +1088,8 @@ The table repeats `root_probe`'s two calls with the `dxcompiler.dll` and `dxil.d
 | 1.8.2502 | 1.8.2502.8 | 1.8 | Status 0 |
 | 1.8.2505, 1.8.2505.1, 1.9.2602, 1.9.2602.24, 1.9.2607, 1.9.2609 | 1.x | 1.9 | Status 0 |
 
+The SDK's own validator depends on its servicing level. On native Windows 11 build 26200.9974, Windows SDK 10.0.26100.8249 installs `dxcompiler.dll` and `dxil.dll` 1.8.2502.11 under `bin/10.0.26100.0/x64`. CMake selected that `dxc.exe` by default, and `shader_metadata_probe` passed with `module_only=validated`. Which servicing update first shipped 1.8.2502 is untested.
+
 To check another release on Windows, configure a separate build directory with its compiler, then run the test:
 
 ```powershell
