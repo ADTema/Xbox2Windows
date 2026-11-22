@@ -46,44 +46,62 @@ def status_table(lowered=()):
     return status_of
 
 
-def decide(inventory, status_of=None):
-    """Refuse a module while it still calls xbox.*, whatever any adapter reports.
+def reaches_xbox(inventory):
+    """True when the module reaches an xbox.* symbol, by calling it or by holding it."""
+    return bool(inventory["calls"] or inventory.get("references"))
 
-    Every call blocks. `status_of` is advisory: it fills `advisory` on each blocking entry so a
-    report can show what an adapter claims, and the verdict ignores it.
+
+def decide(inventory, status_of=None):
+    """Refuse a module while it still calls or references xbox.*, whatever any adapter reports.
+
+    A call blocks, and so does every other form that keeps the symbol reachable: an alias, a
+    stored pointer, a bitcast, a global initializer or a call operand. Each blocking entry names
+    its form, so a refusal says how the module still reaches the builtin. `status_of` is
+    advisory: it fills `advisory` on each entry so a report can show what an adapter claims, and
+    the verdict ignores it.
     """
     status_of = status_of or default_status_of
+    references = inventory.get("references") or {}
     blocking = []
-    for symbol in sorted(inventory["calls"]):
+    for symbol in sorted(set(inventory["calls"]) | set(references)):
         builtin = symbol[len(XBOX_PREFIX):] if symbol.startswith(XBOX_PREFIX) else symbol
         advisory, unblocks = status_of(builtin)
-        blocking.append({
+        entry = {
             "name": symbol,
             "builtin": builtin,
-            "sites": inventory["calls"][symbol],
             "status": UNRESOLVED,
             "unblocks": unblocks,
             "advisory": advisory,
-        })
+        }
+        if symbol in inventory["calls"]:
+            entry["form"] = "call"
+            entry["sites"] = inventory["calls"][symbol]
+        else:
+            entry["form"] = ", ".join(references[symbol]["kinds"])
+            entry["sites"] = references[symbol]["sites"]
+        blocking.append(entry)
     verdict = REJECT if blocking else ALLOW
     names = [entry["name"] for entry in blocking]
     if verdict == REJECT:
-        message = f"REJECT: {len(names)} executable xbox.* call(s): {', '.join(names)}"
+        listed = ", ".join(f"{entry['name']} ({entry['form']})" for entry in blocking)
+        message = f"REJECT: {len(names)} executable xbox.* reference(s): {listed}"
         claimed = [entry["builtin"] for entry in blocking if entry["advisory"] == LOWERED]
         if claimed:
-            message += f" (advisory reports LOWERED for {', '.join(claimed)}; the module still calls them)"
+            message += (f" (advisory reports LOWERED for {', '.join(claimed)};"
+                        " the module still reaches them)")
     else:
         message = (
-            f"ALLOW: no executable xbox.* calls "
+            f"ALLOW: no executable xbox.* calls or references "
             f"(declarations={len(inventory['declarations'])}, metadata_only={len(inventory['metadata_only'])})"
         )
     return {
         "verdict": verdict,
-        "reason": "executable-xbox-calls" if blocking else "no-executable-xbox-calls",
+        "reason": "executable-xbox-references" if blocking else "no-executable-xbox-references",
         "message": message,
         "calls": inventory["calls"],
         "declarations": inventory["declarations"],
         "metadata_only": inventory["metadata_only"],
+        "references": references,
         "blocking": blocking,
         "reported_names": names,
         "checked": True,
