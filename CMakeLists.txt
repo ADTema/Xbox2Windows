@@ -128,6 +128,14 @@ add_custom_target(triangle_headers DEPENDS
     "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs_flip.h"
     "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps_flip.h")
 add_dependencies(offscreen_check triangle_headers)
+foreach(stage IN ITEMS vs ps)
+    string(TOUPPER "${stage}" entry)
+    set(tex_header "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_${stage}.h")
+    add_custom_command(OUTPUT "${tex_header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${stage}_6_0 -E ${entry}Main -Vn tex_quad_${stage}
+                -Fh "${tex_header}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/tex_quad.hlsl"
+        DEPENDS tests/tex_quad.hlsl VERBATIM)
+endforeach()
 set(ray_header "${CMAKE_CURRENT_BINARY_DIR}/ray_query.h")
 set(pixel_vs "${CMAKE_CURRENT_BINARY_DIR}/pixel_aot_vs.h")
 add_custom_command(OUTPUT "${pixel_vs}" COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E main
@@ -2263,8 +2271,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_include_directories(cpu_shim_compute PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_features(cpu_shim_compute PRIVATE cxx_std_17)
     target_link_libraries(cpu_shim_compute PRIVATE xmem_shim dxgi d3d12)
+    set(tex_tables "${CMAKE_CURRENT_BINARY_DIR}/tex_tables.h")
+    add_custom_command(OUTPUT "${tex_tables}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/tex_gen.py" "${tex_tables}"
+        DEPENDS tests/cpu/tex_gen.py tests/bc7_draw_check.py tools/bc7_blocks.py tools/bc7_tiles.py VERBATIM)
     add_library(cpu_shim_draw SHARED tests/cpu/shim_draw_provider.cpp tests/cpu/shim_draw_gpu.cpp
-        tests/cpu/shim_chain_gpu.cpp tests/desktop_gpu.cpp tests/mesh_shadow_draw.cpp)
+        tests/cpu/shim_chain_gpu.cpp tests/cpu/shim_tex_gpu.cpp tests/desktop_gpu.cpp
+        tests/mesh_shadow_draw.cpp)
     set(shim_draw_color_header "${CMAKE_CURRENT_BINARY_DIR}/shim_draw_color.h")
     add_custom_command(OUTPUT "${shim_draw_color_header}"
         COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E main -Fh "${shim_draw_color_header}" -Vn shim_draw_color
@@ -2292,7 +2305,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.h"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.h"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs_flip.h"
-        "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps_flip.h")
+        "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps_flip.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_vs.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_ps.h"
+        "${tex_tables}")
     target_include_directories(cpu_shim_draw PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_features(cpu_shim_draw PRIVATE cxx_std_17)
     target_link_libraries(cpu_shim_draw PRIVATE dxgi d3d12 d3d12_xs_shim)
@@ -2342,6 +2358,17 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
     endforeach()
     set_tests_properties(cpu_shim_draw_hardware cpu_shim_texture_reuse_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    # Uploaded RGBA8 and BC7 textures sampled through a vertex-buffer quad from the same EXE entry.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME cpu_shim_upload_texture_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_tex_check.py"
+            "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_shim_startup>" "$<TARGET_FILE:cpu_shim_startup_lifted>"
+            "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:xmem_shim>"
+            "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE:cpu_shim_draw>")
+        set_tests_properties(cpu_shim_upload_texture_${adapter} PROPERTIES TIMEOUT 180
+            ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
+    endforeach()
+    set_tests_properties(cpu_shim_upload_texture_hardware PROPERTIES SKIP_RETURN_CODE 77)
     # The translated compute -> mesh -> pixel chain (#658) from the same EXE entry (#671).
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME cpu_shim_chain_${adapter} COMMAND "${INTAKE_PYTHON}" -B

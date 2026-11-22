@@ -43,6 +43,8 @@ draw_phase:
     call qword ptr [__imp_draw_request]
     test eax, eax
     jz success
+    cmp eax, 20
+    jae draw_upload
     cmp eax, 14
     jae draw_single
     cmp eax, 10
@@ -66,6 +68,12 @@ draw_two:
     call qword ptr [__imp_draw_frame]
     cmp eax, -1
     je bad_second_draw
+    test eax, eax
+    jnz bad_draw
+    jmp success
+draw_upload:
+    mov ecx, eax
+    call qword ptr [__imp_draw_frame]
     test eax, eax
     jnz bad_draw
     jmp success

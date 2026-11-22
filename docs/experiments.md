@@ -194,6 +194,26 @@ skip. `XBOX2WINDOWS_ADAPTER` selects the hardware adapter by part of its name.
 ctest --preset dev --no-tests=error -R '^cpu_shim_chain_(warp|hardware)$' -V
 ```
 
+The same provider also renders a textured quad from the same EXE entry. The
+8x8 RGBA8 table is an original asymmetric rule (64/64 distinct texels); the
+8x8 BC7 texture reuses the repository's own mode-6 block builder and decoded
+reference, and the fixture proves the 4 KiB standard-swizzle tiled-to-linear
+conversion on the way in. The textured path uses a real vertex buffer, a D3D12
+texture with an SRV, a point-clamp static sampler, upload footprints, resource
+transitions and the same fence-waited readback. The `tex` and `bc7` cases exit
+42 with frames that match the CPU rules byte for byte (`8f9271e5`, `b2d756a4`);
+a half-texel UV shift (`texuv`), a corrupted upload (`texbad`) and a two-draw
+RGBA8+BC7 scene (`scene`, `d54d504f`) exercise the negative and multi-draw
+controls. Passing `tex`, `bc7` and `scene` frames are saved as BMPs (see below).
+
+Reproduce with:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_shim_upload_texture_(warp|hardware)$' -V
+```
+
+The `_hardware` variant returns 77 (capability skip) when no physical adapter exists. Set `X2W_SHIM_DRAW_OUT` to choose where the BMPs go.
+
 ## Source-built EXE entry to a DLL import
 
 MSVC assembles a small CRT-free [EXE entry body](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) takes the fixture's `native_entry` export through `--entry-export`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
