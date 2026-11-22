@@ -817,6 +817,38 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/scalar_float_check.py"
         "$<TARGET_FILE:cpu_float_original>" "$<TARGET_FILE:cpu_float_original_lifted>"
         "$<TARGET_FILE:cpu_float_swapped>" "$<TARGET_FILE:cpu_float_swapped_lifted>")
+    set(cpu_fma3_exports
+        "op_vfmadd132ps_xmm,op_vfmadd132ps_ymm,op_vfmadd132pd_xmm,op_vfmadd132pd_ymm,op_vfmadd132ss,op_vfmadd132sd,"
+        "op_vfmadd213ps_xmm,op_vfmadd213ps_ymm,op_vfmadd213pd_xmm,op_vfmadd213pd_ymm,op_vfmadd213ss,op_vfmadd213sd,"
+        "op_vfmadd231ps_xmm,op_vfmadd231ps_ymm,op_vfmadd231pd_xmm,op_vfmadd231pd_ymm,op_vfmadd231ss,op_vfmadd231sd,"
+        "op_vfmsub132ps_xmm,op_vfmsub132ps_ymm,op_vfmsub132pd_xmm,op_vfmsub132pd_ymm,op_vfmsub132ss,op_vfmsub132sd,"
+        "op_vfmsub213ps_xmm,op_vfmsub213ps_ymm,op_vfmsub213pd_xmm,op_vfmsub213pd_ymm,op_vfmsub213ss,op_vfmsub213sd,"
+        "op_vfmsub231ps_xmm,op_vfmsub231ps_ymm,op_vfmsub231pd_xmm,op_vfmsub231pd_ymm,op_vfmsub231ss,op_vfmsub231sd,"
+        "op_vfnmadd132ps_xmm,op_vfnmadd132ps_ymm,op_vfnmadd132pd_xmm,op_vfnmadd132pd_ymm,op_vfnmadd132ss,op_vfnmadd132sd,"
+        "op_vfnmadd213ps_xmm,op_vfnmadd213ps_ymm,op_vfnmadd213pd_xmm,op_vfnmadd213pd_ymm,op_vfnmadd213ss,op_vfnmadd213sd,"
+        "op_vfnmadd231ps_xmm,op_vfnmadd231ps_ymm,op_vfnmadd231pd_xmm,op_vfnmadd231pd_ymm,op_vfnmadd231ss,op_vfnmadd231sd,"
+        "op_vfnmsub132ps_xmm,op_vfnmsub132ps_ymm,op_vfnmsub132pd_xmm,op_vfnmsub132pd_ymm,op_vfnmsub132ss,op_vfnmsub132sd,"
+        "op_vfnmsub213ps_xmm,op_vfnmsub213ps_ymm,op_vfnmsub213pd_xmm,op_vfnmsub213pd_ymm,op_vfnmsub213ss,op_vfnmsub213sd,"
+        "op_vfnmsub231ps_xmm,op_vfnmsub231ps_ymm,op_vfnmsub231pd_xmm,op_vfnmsub231pd_ymm,op_vfnmsub231ss,op_vfnmsub231sd,"
+        "op_vfmaddsub132ps_xmm,op_vfmaddsub132ps_ymm,op_vfmaddsub132pd_xmm,op_vfmaddsub132pd_ymm,"
+        "op_vfmaddsub213ps_xmm,op_vfmaddsub213ps_ymm,op_vfmaddsub213pd_xmm,op_vfmaddsub213pd_ymm,"
+        "op_vfmaddsub231ps_xmm,op_vfmaddsub231ps_ymm,op_vfmaddsub231pd_xmm,op_vfmaddsub231pd_ymm,"
+        "op_vfmsubadd132ps_xmm,op_vfmsubadd132ps_ymm,op_vfmsubadd132pd_xmm,op_vfmsubadd132pd_ymm,"
+        "op_vfmsubadd213ps_xmm,op_vfmsubadd213ps_ymm,op_vfmsubadd213pd_xmm,op_vfmsubadd213pd_ymm,"
+        "op_vfmsubadd231ps_xmm,op_vfmsubadd231ps_ymm,op_vfmsubadd231pd_xmm,op_vfmsubadd231pd_ymm,"
+        "op_mem_vfmadd132ss,op_mem_vfmsub213sd,op_mem_vfnmadd231ps_xmm,op_mem_vfnmsub132ps_ymm,"
+        "op_mem_vfmaddsub213pd_xmm,op_mem_vfmsubadd231pd_ymm")
+    string(CONCAT cpu_fma3_exports ${cpu_fma3_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_fma3_leaf_${variant} fma3_leaf)
+        cpu_translation(cpu_fma3_leaf_${variant} cpu_avx2_aot "${cpu_fma3_exports}")
+    endforeach()
+    target_compile_definitions(cpu_fma3_leaf_altered PRIVATE ALTER_FMA)
+    add_test(NAME cpu_aot_fma3 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/fma3_leaf_check.py"
+        "$<TARGET_FILE:cpu_fma3_leaf_original>"
+        "$<TARGET_FILE:cpu_fma3_leaf_original_lifted>"
+        "$<TARGET_FILE:cpu_fma3_leaf_altered_lifted>")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)
