@@ -32,9 +32,9 @@ and RDX without naming them. Products of up to 32-bit factors are computed in
 std::uint64_t; 64-bit products and all quotients use the MSVC intrinsics
 _umul128, _mul128, _udiv64, _div64, _udiv128 and _div128. The divide
 intrinsics execute DIV or IDIV, so a zero divisor or a quotient that does not
-fit raises the same divide error. An optimizing build removes a divide whose
-quotient and remainder are both unused, as it removes an unused load, and the
-error is then not raised. 8- and 16-bit divides are rejected, and so is a flag
+fit raises the same divide error. The quotient is also stored to a volatile
+local, so the divide is performed, and its error raised, when the function
+overwrites RAX and RDX without reading them. 8- and 16-bit divides are rejected, and so is a flag
 consumer after a multiply or divide.
 
 A forward pass records how many low bytes (0, 1, 2 or 8) of each register every
@@ -930,6 +930,9 @@ class Lifter:
                              f"{self.reg(DATA[4])}) << 32) | {accumulator});",
                              f"const {kind} divisor = static_cast<{kind}>({source});",
                              f"{kind} remainder;", f"const {kind} quotient = {call}64(dividend, divisor, &remainder);"]
+                # Reaching the divide raises its error even when RAX and RDX are overwritten unread: the store
+                # to a volatile local makes the compiler compute the quotient, which only the divide can do.
+                lines.append(f"volatile {kind} performed = quotient; static_cast<void>(performed);")
                 low, high = "quotient", "remainder"
             elif width == 8:
                 kind = signed(8) if sign else unsigned(8)
