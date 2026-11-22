@@ -149,6 +149,7 @@ SOPK_OPS = {
     0x05: ("s_cmpk_gt_i32", "Scalar compare greater immediate"),
     0x0f: ("s_addk_i32", "Scalar add immediate"),
     0x10: ("s_mulk_i32", "Scalar multiply immediate"),
+    0x15: ("s_setreg_imm32_b32", "Write a hardware register field from a 32-bit literal"),
     0x17: ("s_waitcnt_vscnt", "Wait for vector store counter"),
     0x18: ("s_waitcnt_vmcnt", "Wait for vector memory counter"),
     0x19: ("s_waitcnt_expcnt", "Wait for export counter"),
@@ -473,6 +474,8 @@ VOP2_OPS = {
     0x1b: ("v_and_b32_e32", "Vector bitwise AND"),
     0x1c: ("v_or_b32_e32", "Vector bitwise OR"),
     0x1d: ("v_xor_b32_e32", "Vector bitwise XOR"),
+    0x20: ("v_madmk_f32", "Vector multiply-add (non-fused) with literal multiplier"),
+    0x21: ("v_madak_f32", "Vector multiply-add (non-fused) with literal addend"),
     0x25: ("v_add_nc_u32_e32", "Vector add uint32 without carry"),
     0x26: ("v_sub_nc_u32_e32", "Vector sub uint32 without carry"),
     0x27: ("v_subrev_nc_u32_e32", "Vector reverse sub uint32 without carry"),
@@ -480,6 +483,8 @@ VOP2_OPS = {
     0x2c: ("v_fmamk_f32", "Vector fused multiply-add with literal multiplier"),
     0x2d: ("v_fmaak_f32", "Vector fused multiply-add with literal addend"),
     0x2f: ("v_cvt_pkrtz_f16_f32_e32", "Convert two float32 to packed float16 (round to zero)"),
+    0x37: ("v_fmamk_f16", "Vector fused multiply-add float16 with literal multiplier"),
+    0x38: ("v_fmaak_f16", "Vector fused multiply-add float16 with literal addend"),
 }
 
 VOP3P_OPS = {
@@ -702,6 +707,23 @@ MTBUF_FORMATS = {
     76: "BUF_FMT_32_32_32_32_SINT",
     77: "BUF_FMT_32_32_32_32_FLOAT",
 }
+
+
+# VOP1 and VOP2 SRC0 codes that announce a second instruction dword instead of naming an operand:
+# DPP8 (233, or 234 with FI set), SDWA (249) and DPP16 (250). The dword holds the real SRC0 and
+# the lane or sub-dword controls.
+VOP_EXTENSION_FORMS = {233: "DPP8", 234: "DPP8", 249: "SDWA", 250: "DPP16"}
+
+
+def _vop_extension(data: bytes, offset: int, encoding: str, op_name: str, src0: int) -> tuple[int, str, str, str]:
+    """Consume a DPP8, DPP16 or SDWA instruction as one 8-byte record; its operands are not decoded."""
+    form = VOP_EXTENSION_FORMS[src0]
+    if offset + 8 > len(data):
+        return (4, f"{encoding}_truncated", f"{op_name} <truncated>", f"Incomplete {encoding.upper()} {form}")
+    base = op_name[:-4] if op_name.endswith("_e32") else op_name
+    mnemonic = f"{base}_sdwa" if form == "SDWA" else f"{base}_dpp"
+    return (8, f"{encoding}_{form.lower()}", f"{mnemonic} <unsupported {form}>",
+            f"{encoding.upper()} {form} is not decoded")
 
 
 def _format_vgpr_range(reg: int, width: int) -> str:
@@ -954,9 +976,13 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         elif op_name == "s_nop":
             asm = f"s_nop {simm}"
         elif op_name == "s_waitcnt":
-            vm = (simm >> 4) & 0xf
-            lgkm = (simm >> 8) & 0x3f
-            asm = f"s_waitcnt vmcnt({vm}) lgkmcnt({lgkm})"
+            # GFX10 split: vmcnt is simm16[3:0] plus [15:14], expcnt [6:4], lgkmcnt [13:8].
+            # Like LLVM, omit counters at their "no wait" maximum unless all three are.
+            counters = (("vmcnt", (simm & 0xf) | ((simm >> 10) & 0x30), 0x3f),
+                        ("expcnt", (simm >> 4) & 0x7, 0x7),
+                        ("lgkmcnt", (simm >> 8) & 0x3f, 0x3f))
+            waits = [f"{name}({value})" for name, value, limit in counters if value != limit]
+            asm = "s_waitcnt " + " ".join(waits or (f"{name}({value})" for name, value, _ in counters))
         elif op_name.startswith("s_cbranch") or op_name == "s_branch":
             target = offset + 4 + signed_simm * 4
             asm = f"{op_name} label_0x{target:x}"
@@ -1019,6 +1045,12 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         signed_simm = simm if simm < 0x8000 else simm - 0x10000
         op_info = SOPK_OPS.get(op, (f"s_sopk_{op:02x}", "Unknown SOPK"))
         op_name, comment = op_info
+        if op_name == "s_setreg_imm32_b32":
+            # The only SOPK form followed by a literal dword; SDST is unused.
+            if offset + 8 > len(data):
+                return (4, "sopk_truncated", f"{op_name} <truncated>", "Incomplete SOPK literal")
+            literal, = struct.unpack_from("<I", data, offset + 4)
+            return (8, op_name, f"{op_name} 0x{simm:x}, 0x{literal:x}", comment)
         asm = f"{op_name} {decode_s_reg(sdst)}, 0x{simm:x}"
         return (4, op_name, asm, comment)
 
@@ -1049,6 +1081,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0 = w0 & 0x1ff
         op_info = VOP1_OPS.get(op, (f"v_vop1_{op:02x}", "Unknown VOP1"))
         op_name, comment = op_info
+        if src0 in VOP_EXTENSION_FORMS:
+            return _vop_extension(data, offset, "vop1", op_name, src0)
         length = 4
         if src0 == 255:
             if offset + 8 > len(data):
@@ -1111,7 +1145,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0 = w0 & 0x1ff
         op_info = VOP2_OPS.get(op, (f"v_vop2_{op:02x}", "Unknown VOP2"))
         op_name, comment = op_info
-        has_literal = src0 == 255 or op in (0x2c, 0x2d)
+        if src0 in VOP_EXTENSION_FORMS:
+            return _vop_extension(data, offset, "vop2", op_name, src0)
+        has_literal = src0 == 255 or op in (0x20, 0x21, 0x2c, 0x2d, 0x37, 0x38)
         length = 4
         literal = None
         if has_literal:
@@ -1122,9 +1158,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0_str = f"0x{literal:x}" if src0 == 255 and literal is not None else decode_v_reg(src0)
         if op_name == "v_cndmask_b32_e32":
             asm = f"{op_name} v{vdst}, {src0_str}, v{vsrc1}, vcc_lo"
-        elif op == 0x2c:
+        elif op in (0x20, 0x2c, 0x37):
             asm = f"{op_name} v{vdst}, {src0_str}, 0x{literal:x}, v{vsrc1}"
-        elif op == 0x2d:
+        elif op in (0x21, 0x2d, 0x38):
             asm = f"{op_name} v{vdst}, {src0_str}, v{vsrc1}, 0x{literal:x}"
         else:
             asm = f"{op_name} v{vdst}, {src0_str}, v{vsrc1}"
