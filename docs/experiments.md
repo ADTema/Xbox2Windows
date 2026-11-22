@@ -1912,6 +1912,17 @@ draw each. These three suites
 go from 108 device creations to 23, and DXC compiles one shader fewer, because
 the signed/unsigned control now reuses the group's compiled shader.
 
+The remaining multi-case `--check-pixel-case` loops across `draw-core`,
+`draw-predicate-rounding`, `draw-blend-scalar`, `draw-e64`, `draw-integer-nc`,
+`draw-bfm`, `three-way` and the full-RGBA `buffer-color` pass now group cases
+per compiled shader through `run_pixel_batch()`, preserving every reference case
+and expected mismatch control (`--check-pixel`, `--check-pixel-quad-lod`,
+`--dual-pixel` and `--check-pixel-case-rg` keep their single-draw paths).
+Across all eight modes, total renderer launches per backend drop from 494 to
+263 (`draw-core`: 127 to 65; `draw-predicate-rounding`: 147 to 74;
+`draw-blend-scalar`: 126 to 61; `draw-e64`: 57 to 50; `draw-integer-nc`: 12 to
+3; `draw-bfm`: 15 to 3; `three-way`: 4 to 3; `buffer-color`: 6 to 4).
+
 #The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.
 
 ## Pixel color without a texture sample
