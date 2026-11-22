@@ -1977,6 +1977,23 @@ def check_scalar_select64_draw(directory, compiler, renderer, backend):
     compile_shader(compiler, source, shader)
     run_pixel_batch(renderer, backend, shader, [(case, "mismatch") for case in cases])
 
+    # s_cselect_b64 does not write SCC: capture SCC after a select that picks a zero pair.
+    program = scalar_select64()
+    pos = program.index("s_cselect_b64 s[48:49], 0, -1")
+    program[pos + 1:pos + 1] = ["s_cselect_b32 s50, 1, 0"]
+    program[program.index("v_mov_b32_e32 v14, s48")] = "v_mov_b32_e32 v14, s50"
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    scc_cases = []
+    for i, (lo, hi) in enumerate(((0, 0), (0x89abcdef, 0x12345678))):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, lo, hi, *other)
+        expected = (*other, 0, 0xffffffff) if lo else (lo, hi, 1, 0)
+        case = directory / f"scalar-select64-scc-{i}.case"
+        write_case(case, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+        scc_cases.append((case, "pass"))
+    run_pixel_batch(renderer, backend, shader, scc_cases)
+
 
 SCALAR64_SETS = (
     # (a_lo, a_hi, b_lo, b_hi, sh_lo, sh_hi, bfm_w, bfm_off, bfe_src, bfe_ctrl_a, bfe_ctrl_b, alt)
@@ -2362,7 +2379,8 @@ def check_scalar_carry_chain_draw(directory, compiler, renderer, backend):
         source.write_text(translate_int(program), encoding="ascii")
         compile_shader(compiler, source, shader)
         pairs = ((0, 0), (0x100000000, 1), (0, 0x100000000), (0, 1),
-                 (0, 0xffffffff00000001), (0xffffffff00000000, 0xffffffff00000001)) if subtract else (
+                 (0, 0xffffffff00000001), (0x0002000000000000, 0x0001000000000001),
+                 (0xffffffff00000000, 0xffffffff00000001)) if subtract else (
                      (0, 0), (0xffffffff, 1), (0xffffffff00000000, 0x100000000),
                      (0xffffffffffffffff, 1))
         for a, b in pairs:
@@ -2382,6 +2400,19 @@ def check_scalar_carry_chain_draw(directory, compiler, renderer, backend):
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Dropping SCC from {old} escaped detection")
+
+    program = scalar_carry_chain(False)
+    program[program.index("s_addc_u32 s45, s45, s47")] = "s_addc_u32 s45, s45, 0xffffffff"
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    # Carry in is set in both rows. With high A = 1 the first addition wraps.
+    # With high A = 0 only the addition of carry in wraps.
+    for high_a in (1, 0):
+        constants = bytearray(256)
+        struct.pack_into("<QQ", constants, 12, (high_a << 32) | 0xffffffff, 1)
+        words = (0, high_a, 1, 1)
+        write_case(case, constants, tuple(as_float(w) for w in words), integer_rt=True)
+        subprocess.run(draw, check=True)
 
 
 def scalar_leading_bit_values(width):
