@@ -1234,6 +1234,74 @@ def check_controls(directory):
         assert expected in source, expected
     # Existing programs without shifts/bfm/bfe emit none of the scalar helper functions.
     assert "uint2 s_lshl_b64(" not in translate(assembly(False))
+    # Existing programs without DPP extra ops emit none of the DPP helper functions or quad intrinsics.
+    plain_hlsl = translate(assembly(False))
+    for sym in ("dpp_frexp_mant_f32(", "dpp_frexp_exp_i32_f32(", "dpp_dot4c_i32_i8(", "QuadRead"):
+        assert sym not in plain_hlsl, sym
+
+    # Quad-local DPP16/DPP8 extra f32, carry-in/carry-out, and dot-accumulate controls.
+    extra_prog = with_constants(DPP_EXTRA_BODY)
+    extra_hlsl = translate(extra_prog)
+    for sym in ("round(", "6.283185307179586f", "dpp_frexp_mant_f32(", "dpp_frexp_exp_i32_f32(",
+                "QuadReadAcrossX(", "QuadReadAcrossY(", "QuadReadAcrossDiagonal(",
+                "QuadReadLaneAt(", "WaveGetLaneIndex() & 3u"):
+        assert sym in extra_hlsl, sym
+    dotc_prog = with_constants(DPP_DOTC_BODY)
+    dotc_hlsl = translate(dotc_prog)
+    for sym in ("dpp_dot4c_i32_i8(", "0x7fff7fffu", "0x80008000u",
+                "QuadReadAcrossX(", "QuadReadAcrossY(", "QuadReadAcrossDiagonal(",
+                "QuadReadLaneAt(", "WaveGetLaneIndex() & 3u"):
+        assert sym in dotc_hlsl, sym
+    # DPP16 optional bound_ctrl/fi and DPP8 optional fi, plus wave64 vcc spelling.
+    assert "round(" in translate(with_constants([
+        "v_rndne_f32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1 fi:0",
+    ]))
+    assert "round(" in translate(with_constants([
+        "v_rndne_f32_dpp v12, v12 dpp8:[1,0,3,2,5,4,7,6] fi:1",
+    ]))
+    assert "cmp" in translate(with_constants([
+        "v_cmp_f_f32_e32 vcc, v12, v12",
+        "v_add_co_ci_u32_dpp v12, vcc, v12, v13, vcc quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    ]))
+    # Negative controls: modifiers on DPP8 or integer ops, cross-quad DPP8, row/wave DPP,
+    # partial masks, non-VGPR operands, uninitialized accumulator, untracked/mismatched vcc,
+    # WQM, and vmcnt hazards.
+    for bad in (
+        "v_rndne_f32_dpp v12, -v12 dpp8:[1,0,3,2,5,4,7,6]",
+        "v_mac_f32_dpp v12, |v12|, v13 dpp8:[1,0,3,2,5,4,7,6]",
+        "v_dot2c_f32_f16_dpp v12, -v12, v13 dpp8:[1,0,3,2,5,4,7,6]",
+        "v_dot4c_i32_i8_dpp v12, -v12, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_dot4c_i32_i8_dpp v12, |v12|, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_rndne_f32_dpp v12, v12 dpp8:[4,5,6,7,0,1,2,3]",
+        "v_rndne_f32_dpp v12, v12 dpp8:[0,1,2,3,4,5,6,6]",
+        "v_rndne_f32_dpp v12, v12 row_shl:1 row_mask:0xf bank_mask:0xf",
+        "v_rndne_f32_dpp v12, v12 wave_shl:1 row_mask:0xf bank_mask:0xf",
+        "v_rndne_f32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xe bank_mask:0xf",
+        "v_rndne_f32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0x7",
+        "v_rndne_f32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf",
+        "v_rndne_f32_dpp v12, s44 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_rndne_f32_dpp v12, 1.0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_mac_f32_dpp v30, v12, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_dot2c_f32_f16_dpp v30, v12, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_dot4c_i32_i8_dpp v30, v12, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_co_ci_u32_dpp v12, vcc_lo, v12, v13, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_sub_co_ci_u32_dpp v12, vcc_lo, v12, v13, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_subrev_co_ci_u32_dpp v12, vcc_lo, v12, v13, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    ):
+        must_reject(translate, with_constants([bad]))
+    for bad_co in (
+        "v_add_co_ci_u32_dpp v12, vcc_lo, -v12, v13, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_co_ci_u32_dpp v12, vcc_lo, v12, v13, vcc quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_co_ci_u32_dpp v12, s52, v12, v13, s52 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    ):
+        must_reject(translate, with_constants(["v_cmp_f_f32_e32 vcc_lo, v12, v12", bad_co]))
+    # WQM and vmcnt hazards.
+    base_dpp = assembly(False)
+    wqm_at = base_dpp.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, base_dpp[:wqm_at] + ["v_rndne_f32_dpp v20, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + base_dpp[wqm_at:])
+    wait_at = base_dpp.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, base_dpp[:wait_at] + ["v_rndne_f32_dpp v20, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + base_dpp[wait_at:])
+    must_reject(translate, base_dpp[:wait_at] + ["v_rndne_f32_dpp v12, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + base_dpp[wait_at:])
     # Verify 32-bit hex literal sign-extension for s_ashr_i64 vs zero-extension for b64 ops.
     ashr_pos = program.index("s_ashr_i64 s[72:73], s[52:53], s56")
     signed_lit = translate(program[:ashr_pos] + ["s_ashr_i64 s[72:73], 0x80000000, 4"] + program[ashr_pos+1:])
@@ -1320,19 +1388,23 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
-    for index, (instructions, lower_fixture) in enumerate(fixtures):
+    fixtures.append((with_constants(DPP_EXTRA_BODY), translate, "gfx1013"))
+    fixtures.append((with_constants(DPP_DOTC_BODY), translate, "gfx1030"))
+    for index, entry in enumerate(fixtures):
+        instructions, lower_fixture = entry[:2]
+        cpu = entry[2] if len(entry) == 3 else "gfx1013"
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
         binary = directory / "fixture.bin"
         source.write_text("\n".join(instructions) + "\n", encoding="ascii")
-        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013",
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", f"-mcpu={cpu}",
                         "-filetype=obj", source, "-o", obj], check=True)
         subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
         archive = directory / "fixture.rpf"
         archive.write_bytes(envelope(binary.read_bytes()))
         _, native = native_program(archive, "fixture")
         assert native == binary.read_bytes()
-        assert lower_fixture(disassemble(native, library)) == lower_fixture(instructions)
+        assert lower_fixture(disassemble(native, library, cpu=cpu.encode())) == lower_fixture(instructions)
         if index == 0:
             check_container_selector(directory, native, library)
 
@@ -1365,9 +1437,326 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing ceiling with floor escaped detection")
 
 
+# Quad-local DPP16/DPP8 extra f32 (rndne, sin, cos, rcp_iflag, frexp_mant, frexp_exp, mac) and
+# carry-in/carry-out u32 (add/sub/subrev_co_ci) fixture on gfx1013. Derives 4-lane quad ID {0,1,2,3}
+# from uv.x/uv.y (64x64 RT), exercises non-symmetric quad swizzles and carry/borrow boundaries, and
+# broadcasts lane 0 at the end of each channel so every pixel in a quad matches the texel reference.
+DPP_EXTRA_SETS = (
+    (1.5, 0.25, 4.0, 1.0),
+    (2.5, -0.25, 8.0, 2.0),
+)
+DPP_EXTRA_BODY = [
+    # Derive qx (v22), qy (v23), and quad lane id (v20 = qx + 2*qy in {0, 1, 2, 3}) from uv.x/uv.y.
+    "v_mov_b32_e32 v20, 0",
+    "v_mov_b32_e32 v21, 0",
+    "v_mov_b32_e32 v22, 0x42800000",
+    "v_mac_f32_dpp v20, v8, v22 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_mac_f32_dpp v21, v9, v22 dpp8:[0,1,2,3,4,5,6,7]",
+    "v_floor_f32_e32 v22, v20",
+    "v_mul_f32_e32 v24, 0.5, v22",
+    "v_floor_f32_e32 v24, v24",
+    "v_sub_f32_e32 v22, v22, v24",
+    "v_sub_f32_e32 v22, v22, v24",
+    "v_floor_f32_e32 v23, v21",
+    "v_mul_f32_e32 v24, 0.5, v23",
+    "v_floor_f32_e32 v24, v24",
+    "v_sub_f32_e32 v23, v23, v24",
+    "v_sub_f32_e32 v23, v23, v24",
+    "v_fma_f32 v20, 2.0, v23, v22",
+    # Channel R (v12): v_rndne_f32_dpp (half-integer ties), v_rcp_iflag_f32_dpp (powers of 2), v_mac_f32_dpp.
+    "v_add_f32_e32 v21, s44, v20",
+    "v_rndne_f32_dpp v24, -v21 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_exp_f32_e32 v25, v20",
+    "v_rcp_iflag_f32_dpp v26, |v25| quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_rcp_iflag_f32_dpp v26, v26 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_mov_b32_e32 v27, s46",
+    "v_mac_f32_dpp v27, -v24, v26 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_mac_f32_dpp v27, v27, v25 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_rndne_f32_dpp v12, v27 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    # Channel G (v13): v_sin_f32_dpp (exact quarter turns) and v_cos_f32_dpp (exact half turns).
+    "v_sub_f32_e32 v26, v22, v23",
+    "v_mul_f32_e32 v26, s45, v26",
+    "v_sin_f32_dpp v27, -v26 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_sin_f32_dpp v28, v26 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_mul_f32_e32 v29, 0.5, v22",
+    "v_cos_f32_dpp v30, |v29| quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_cos_f32_dpp v31, v29 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_fma_f32 v31, 2.0, v30, v31",
+    "v_fma_f32 v31, 4.0, v28, v31",
+    "v_fma_f32 v31, 0x41000000, v27, v31",
+    "v_rndne_f32_dpp v13, v31 dpp8:[0,0,0,0,4,4,4,4]",
+    # Channel B (v14): v_frexp_mant_f32_dpp & v_frexp_exp_i32_f32_dpp, biasing signed exp via v_add_co_ci_u32_dpp.
+    "v_add_f32_e32 v32, 1.0, v20",
+    "v_mul_f32_e32 v32, 0x3ec00000, v32",
+    "v_mul_f32_e32 v32, s47, v32",
+    "v_frexp_mant_f32_dpp v33, -v32 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_frexp_exp_i32_f32_dpp v34, v32 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_cmp_f_f32_e32 vcc_lo, v12, v12",
+    "v_mov_b32_e32 v35, 0x200",
+    "v_add_co_ci_u32_dpp v34, vcc_lo, v34, v35, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f32_f16_e32 v35, v34",
+    "v_mul_f32_e32 v35, 0x4b800000, v35",
+    "v_fma_f32 v33, 0x41800000, v33, v35",
+    "v_rndne_f32_dpp v14, v33 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    # Channel A (v15): chained v_add_co_ci_u32_dpp / v_sub_co_ci_u32_dpp / v_subrev_co_ci_u32_dpp carry & borrow.
+    "v_mov_b32_e32 v36, -2",
+    "v_mov_b32_e32 v37, 1",
+    "v_add_co_ci_u32_dpp v38, vcc_lo, v36, v37, vcc_lo dpp8:[1,0,3,2,5,4,7,6]",
+    "v_mov_b32_e32 v39, 10",
+    "v_sub_co_ci_u32_dpp v40, vcc_lo, v38, v39, vcc_lo quad_perm:[1,2,3,0] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v41, -12",
+    "v_subrev_co_ci_u32_dpp v42, vcc_lo, v40, v41, vcc_lo quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v43, 20",
+    "v_subrev_co_ci_u32_dpp v44, vcc_lo, v42, v43, vcc_lo dpp8:[0,1,2,3,4,5,6,7]",
+    "v_sub_co_ci_u32_dpp v45, vcc_lo, v44, v43, vcc_lo dpp8:[0,1,2,3,4,5,6,7]",
+    "v_mov_b32_e32 v46, 0x42c80000",
+    "v_mov_b32_e32 v47, 0x43480000",
+    "v_cndmask_b32_e32 v46, v46, v47, vcc_lo",
+    "v_cvt_f32_f16_e32 v44, v44",
+    "v_mul_f32_e32 v44, 0x4b800000, v44",
+    "v_add_f32_e32 v46, v46, v44",
+    "v_rndne_f32_dpp v15, v46 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+]
+
+
+def dpp_extra_reference(c0, c1, c2, c3):
+    """Independent 4-lane quad reference for DPP_EXTRA_BODY."""
+    m32 = 0xffffffff
+    qx = [0.0, 1.0, 0.0, 1.0]
+    qy = [0.0, 0.0, 1.0, 1.0]
+    lane = [0.0, 1.0, 2.0, 3.0]
+    perm = lambda arr, p: [arr[i] for i in p]
+    # R: rndne, rcp_iflag, mac
+    v21 = [c0 + l for l in lane]
+    v24 = [float(round(-x)) for x in perm(v21, (1, 0, 3, 2))]
+    v25 = [2.0 ** l for l in lane]
+    v26 = [1.0 / abs(x) for x in perm(v25, (2, 3, 0, 1))]
+    v26 = [1.0 / x for x in perm(v26, (1, 2, 3, 0))]
+    v27 = [(-a) * b + c2 for a, b in zip(perm(v24, (3, 2, 1, 0)), v26)]
+    v27 = [a * b + c for a, b, c in zip(perm(v27, (1, 2, 3, 0)), v25, v27)]
+    r = float(round(v27[0]))
+    # G: sin, cos (exact quarter/half turns)
+    v26 = [c1 * (x - y) for x, y in zip(qx, qy)]
+    v27 = [round(math.sin((-x) * 2.0 * math.pi)) for x in perm(v26, (1, 0, 3, 2))]
+    v28 = [round(math.sin(x * 2.0 * math.pi)) for x in perm(v26, (2, 3, 0, 1))]
+    v29 = [0.5 * x for x in qx]
+    v30 = [round(math.cos(abs(x) * 2.0 * math.pi)) for x in perm(v29, (1, 0, 3, 2))]
+    v31 = [round(math.cos(x * 2.0 * math.pi)) for x in perm(v29, (2, 3, 0, 1))]
+    g = float(8.0 * v27[0] + 4.0 * v28[0] + 2.0 * v30[0] + v31[0])
+    # B: frexp_mant, frexp_exp + add_co_ci
+    v32 = [c3 * 0.375 * (1.0 + l) for l in lane]
+    v33 = [math.frexp(-x)[0] for x in perm(v32, (2, 3, 0, 1))]
+    v34 = [math.frexp(x)[1] & m32 for x in perm(v32, (1, 0, 3, 2))]
+    vcc = [0, 0, 0, 0]
+    add_res, new_vcc = [], []
+    for a, ci in zip(perm(v34, (1, 0, 3, 2)), vcc):
+        s = a + 512 + ci
+        add_res.append(s & m32)
+        new_vcc.append(1 if s > m32 else 0)
+    v34, vcc = add_res, new_vcc
+    b = 16.0 * v33[0] + float(v34[0] & 0x3ff)
+    # A: add_co_ci, sub_co_ci, subrev_co_ci chain
+    v38, new_vcc = [], []
+    for a, ci in zip([0xfffffffe] * 4, vcc):
+        s = a + 1 + ci
+        v38.append(s & m32)
+        new_vcc.append(1 if s > m32 else 0)
+    vcc = new_vcc
+    v40, new_vcc = [], []
+    for a, bi in zip(perm(v38, (1, 2, 3, 0)), vcc):
+        d = a - 10 - bi
+        v40.append(d & m32)
+        new_vcc.append(1 if d < 0 else 0)
+    vcc = new_vcc
+    v42, new_vcc = [], []
+    for a, bi in zip(perm(v40, (3, 2, 1, 0)), vcc):
+        d = 0xfffffff4 - a - bi
+        v42.append(d & m32)
+        new_vcc.append(1 if d < 0 else 0)
+    vcc = new_vcc
+    v44, new_vcc = [], []
+    for a, bi in zip(v42, vcc):
+        d = 20 - a - bi
+        v44.append(d & m32)
+        new_vcc.append(1 if d < 0 else 0)
+    vcc = new_vcc
+    new_vcc = []
+    for a, bi in zip(v44, vcc):
+        new_vcc.append(1 if a - 20 - bi < 0 else 0)
+    vcc = new_vcc
+    a = (200.0 if vcc[0] else 100.0) + float(v44[0] & 0x3ff)
+    expected = (r, g, b, a)
+    for x in expected:
+        assert single(x) == x == half_rtz(x), x
+    return expected
+
+
+def check_dpp_extra_draw(directory, compiler, renderer, backend):
+    program = with_constants(DPP_EXTRA_BODY)
+    source = directory / "dpp_extra.hlsl"
+    shader = directory / "dpp_extra.cso"
+    case = directory / "dpp_extra.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_cmd = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run(compile_cmd, check=True)
+    for vals in DPP_EXTRA_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, *vals)
+        expected = dpp_extra_reference(*vals)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    # Mutations checked against Set 1.
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, *DPP_EXTRA_SETS[0])
+    case.write_bytes(constants + struct.pack("<4f", *dpp_extra_reference(*DPP_EXTRA_SETS[0])) * 64)
+    for old, new, label in (
+        ("v_rndne_f32_dpp v24, -v21 quad_perm:[1,0,3,2]", "v_rndne_f32_dpp v24, -v21 quad_perm:[2,3,0,1]", "AcrossX vs AcrossY"),
+        ("v_rcp_iflag_f32_dpp v26, v26 dpp8:[1,2,3,0,5,6,7,4]", "v_rcp_iflag_f32_dpp v26, v26 dpp8:[2,3,0,1,6,7,4,5]", "cyclic dpp8 rotation"),
+        ("v_sin_f32_dpp v27, -v26 quad_perm:[1,0,3,2]", "v_sin_f32_dpp v27, v26 quad_perm:[1,0,3,2]", "DPP16 neg on sin"),
+        ("v_sub_co_ci_u32_dpp v45, vcc_lo, v44, v43, vcc_lo", "v_subrev_co_ci_u32_dpp v45, vcc_lo, v44, v43, vcc_lo", "sub vs subrev carry"),
+        ("v_frexp_mant_f32_dpp v33, -v32 quad_perm:[2,3,0,1]", "v_frexp_mant_f32_dpp v33, v32 quad_perm:[2,3,0,1]", "DPP16 neg on frexp_mant"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_cmd, check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
+# Quad-local DPP16/DPP8 dot-accumulate fixture (gfx1030): v_dot2c_f32_f16_dpp & v_dot4c_i32_i8_dpp.
+DPP_DOTC_SETS = (
+    (0x40003c00, 0xbc004200, 0xfc03fe05, 0x06fd04ff),
+    (0x4400b800, 0x3800c000, 0x02f907fc, 0xfb05fa03),
+)
+DPP_DOTC_BODY = [
+    # Derive qx (v22) and qy (v23) via bit-exact v_add_co_ci_u32_dpp copies of uv.x/uv.y.
+    "v_cmp_f_f32_e32 vcc_lo, v12, v12",
+    "v_mov_b32_e32 v24, 0",
+    "v_add_co_ci_u32_dpp v20, vcc_lo, v8, v24, vcc_lo quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_co_ci_u32_dpp v21, vcc_lo, v9, v24, vcc_lo dpp8:[0,1,2,3,4,5,6,7]",
+    "v_mul_f32_e32 v20, 0x42800000, v20",
+    "v_mul_f32_e32 v21, 0x42800000, v21",
+    "v_floor_f32_e32 v22, v20",
+    "v_mul_f32_e32 v24, 0.5, v22",
+    "v_floor_f32_e32 v24, v24",
+    "v_sub_f32_e32 v22, v22, v24",
+    "v_sub_f32_e32 v22, v22, v24",
+    "v_floor_f32_e32 v23, v21",
+    "v_mul_f32_e32 v24, 0.5, v23",
+    "v_floor_f32_e32 v24, v24",
+    "v_sub_f32_e32 v23, v23, v24",
+    "v_sub_f32_e32 v23, v23, v24",
+    # Populate 4 distinct packed f16x2 lanes in v25 and 4 distinct packed i8x4 lanes in v26.
+    "v_cmp_lt_f32_e32 vcc_lo, 0.5, v22",
+    "v_mov_b32_e32 v25, s45",
+    "v_cndmask_b32_e32 v25, s44, v25, vcc_lo",
+    "v_mov_b32_e32 v27, 0xc0003800",
+    "v_cndmask_b32_e32 v27, 0x42003c00, v27, vcc_lo",
+    "v_mov_b32_e32 v26, s47",
+    "v_cndmask_b32_e32 v26, s46, v26, vcc_lo",
+    "v_mov_b32_e32 v31, 0x04fd02ff",
+    "v_cndmask_b32_e32 v31, 0xfe03fc05, v31, vcc_lo",
+    "v_cmp_lt_f32_e32 vcc_lo, 0.5, v23",
+    "v_cndmask_b32_e32 v25, v25, v27, vcc_lo",
+    "v_cndmask_b32_e32 v26, v26, v31, vcc_lo",
+    # Right-hand operands: v27 = f16x2(2.0, -0.5), v31 = i8x4(+3, -2, +4, -5).
+    "v_mov_b32_e32 v27, 0xb8004000",
+    "v_mov_b32_e32 v31, 0xfb04fe03",
+    # Channel R (v12): v_dot2c_f32_f16_dpp (DPP16 AcrossX with -src0 and |src1|, plus AcrossY).
+    "v_cmp_f_f32_e32 vcc_lo, v12, v12",
+    "v_mov_b32_e32 v24, 0",
+    "v_mov_b32_e32 v28, 0x41200000",
+    "v_dot2c_f32_f16_dpp v28, -v25, |v27| quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_dot2c_f32_f16_dpp v28, v25, v27 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_add_co_ci_u32_dpp v12, vcc_lo, v28, v24, vcc_lo quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    # Channel G (v13): v_dot2c_f32_f16_dpp (DPP8 cyclic rotation + diagonal).
+    "v_mov_b32_e32 v29, 4.0",
+    "v_dot2c_f32_f16_dpp v29, v25, v27 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_dot2c_f32_f16_dpp v29, v25, v27 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_add_co_ci_u32_dpp v13, vcc_lo, v29, v24, vcc_lo dpp8:[0,0,0,0,4,4,4,4]",
+    # Channel B (v14): v_dot4c_i32_i8_dpp (DPP16 AcrossX + AcrossY, biased at 512).
+    "v_mov_b32_e32 v30, 0x200",
+    "v_dot4c_i32_i8_dpp v30, v26, v31 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_dot4c_i32_i8_dpp v30, v26, v31 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f32_f16_e32 v30, v30",
+    "v_mul_f32_e32 v30, 0x4b800000, v30",
+    "v_rndne_f32_dpp v14, v30 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    # Channel A (v15): v_dot4c_i32_i8_dpp (DPP8 cyclic + diagonal, biased at 512).
+    "v_mov_b32_e32 v32, 0x200",
+    "v_dot4c_i32_i8_dpp v32, v26, v31 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_dot4c_i32_i8_dpp v32, v26, v31 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_cvt_f32_f16_e32 v32, v32",
+    "v_mul_f32_e32 v32, 0x4b800000, v32",
+    "v_rndne_f32_dpp v15, v32 dpp8:[0,0,0,0,4,4,4,4]",
+]
+
+
+def dpp_dotc_reference(w0, w1, w2, w3):
+    """Independent 4-lane quad reference for DPP_DOTC_BODY."""
+    def unpack_f16x2(word):
+        return struct.unpack("<2e", struct.pack("<I", word))
+
+    def unpack_i8x4(word):
+        return struct.unpack("<4b", struct.pack("<I", word))
+
+    f_lanes = [unpack_f16x2(w) for w in (w0, w1, 0x42003c00, 0xc0003800)]
+    i_lanes = [unpack_i8x4(w) for w in (w2, w3, 0xfe03fc05, 0x04fd02ff)]
+    f_rhs = unpack_f16x2(0xb8004000)
+    i_rhs = unpack_i8x4(0xfb04fe03)
+    dot2 = lambda a, b: a[0] * b[0] + a[1] * b[1]
+    dot4 = lambda a, b: sum(x * y for x, y in zip(a, b))
+    r = 10.0 + dot2((-f_lanes[1][0], -f_lanes[1][1]), (abs(f_rhs[0]), abs(f_rhs[1]))) + dot2(f_lanes[2], f_rhs)
+    g = 4.0 + dot2(f_lanes[1], f_rhs) + dot2(f_lanes[3], f_rhs)
+    b = float((512 + dot4(i_lanes[1], i_rhs) + dot4(i_lanes[2], i_rhs)) & 0x3ff)
+    a = float((512 + dot4(i_lanes[1], i_rhs) + dot4(i_lanes[3], i_rhs)) & 0x3ff)
+    expected = (r, g, b, a)
+    for x in expected:
+        assert single(x) == x == half_rtz(x), x
+    return expected
+
+
+def check_dpp_dotc_draw(directory, compiler, renderer, backend):
+    program = with_constants(DPP_DOTC_BODY)
+    source = directory / "dpp_dotc.hlsl"
+    shader = directory / "dpp_dotc.cso"
+    case = directory / "dpp_dotc.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_cmd = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run(compile_cmd, check=True)
+    for words in DPP_DOTC_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        expected = dpp_dotc_reference(*words)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    # Mutations checked against Set 1.
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *DPP_DOTC_SETS[0])
+    case.write_bytes(constants + struct.pack("<4f", *dpp_dotc_reference(*DPP_DOTC_SETS[0])) * 64)
+    for old, new, label in (
+        ("v_dot2c_f32_f16_dpp v28, -v25, |v27|", "v_dot2c_f32_f16_dpp v28, v25, |v27|", "DPP16 neg on dot2c"),
+        ("v_dot2c_f32_f16_dpp v28, -v25, |v27|", "v_dot2c_f32_f16_dpp v28, -v25, v27", "DPP16 abs on dot2c"),
+        ("v_dot2c_f32_f16_dpp v29, v25, v27 dpp8:[1,2,3,0,5,6,7,4]", "v_dot2c_f32_f16_dpp v29, v25, v27 dpp8:[2,3,0,1,6,7,4,5]", "dot2c dpp8 rotation"),
+        ("v_dot4c_i32_i8_dpp v30, v26, v31 quad_perm:[1,0,3,2]", "v_dot4c_i32_i8_dpp v30, v26, v31 quad_perm:[2,3,0,1]", "dot4c AcrossX vs AcrossY"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_cmd, check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
+    check_dpp_extra_draw(directory, compiler, renderer, backend)
+    check_dpp_dotc_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"
