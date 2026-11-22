@@ -225,6 +225,11 @@ foreach(layout IN ITEMS root tables)
     endforeach()
     set_tests_properties(compute_${layout}_hardware PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
+# XBOX2WINDOWS_ADAPTER selects a hardware adapter by part of its name. A name no adapter has must fail.
+add_test(NAME adapter_selection_unmatched COMMAND offscreen_check hardware --dual-uav)
+set_tests_properties(adapter_selection_unmatched PROPERTIES TIMEOUT 45
+    ENVIRONMENT "XBOX2WINDOWS_ADAPTER=no adapter has this name"
+    PASS_REGULAR_EXPRESSION "No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=no adapter has this name")
 add_executable(pso_root_check tests/pso_root_check.cpp)
 target_compile_features(pso_root_check PRIVATE cxx_std_17)
 target_include_directories(pso_root_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -450,6 +455,19 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_switch_original>" "$<TARGET_FILE:cpu_switch_original_lifted>"
         "$<TARGET_FILE:cpu_switch_swapped_lifted>")
+    cpu_asm_fixture(cpu_flag_conditions flag_conditions)
+    set(flag_conditions_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_flag_conditions_lifted.cpp")
+    add_custom_command(OUTPUT "${flag_conditions_lifted}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/flag_conditions_check.py"
+            emit "$<TARGET_FILE:cpu_flag_conditions>" "${flag_conditions_lifted}"
+        DEPENDS cpu_flag_conditions tests/cpu/flag_conditions_check.py tools/cpu_switch_aot.py
+            tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_flag_conditions_lifted SHARED "${flag_conditions_lifted}")
+    add_test(NAME cpu_aot_flag_conditions COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/flag_conditions_check.py" check
+        "$<TARGET_FILE:cpu_flag_conditions>" "$<TARGET_FILE:cpu_flag_conditions_lifted>")
+    set_tests_properties(cpu_aot_flag_conditions PROPERTIES
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_flag_conditions.txt")
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_translation(cpu_switch_addr32 cpu_switch_aot lea_wrap,lea_back,load_back,store_ahead)
     add_test(NAME cpu_aot_switch_addr32 COMMAND "${INTAKE_PYTHON}" -B
@@ -639,6 +657,21 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(cpu_heap_layout_lifted SHARED "${heap_fixture}")
     add_test(NAME cpu_aot_heap_layout COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/heap_layout.py"
         check "$<TARGET_FILE:cpu_heap_layout>" "$<TARGET_FILE:cpu_heap_layout_lifted>")
+    cpu_asm_fixture(cpu_rcx_branches rcx_branches)
+    # The lifted DLL and three mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted noecx nozf jrcxz)
+        set(rcx_branches_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_rcx_branches_${variant}.cpp")
+        add_custom_command(OUTPUT "${rcx_branches_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rcx_branches.py"
+                emit "$<TARGET_FILE:cpu_rcx_branches>" "${rcx_branches_fixture}" ${variant}
+            DEPENDS cpu_rcx_branches tests/cpu/rcx_branches.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_rcx_branches_${variant} SHARED "${rcx_branches_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_rcx_branches COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rcx_branches.py"
+        check "$<TARGET_FILE:cpu_rcx_branches>" "$<TARGET_FILE:cpu_rcx_branches_lifted>"
+        "$<TARGET_FILE:cpu_rcx_branches_noecx>" "$<TARGET_FILE:cpu_rcx_branches_nozf>"
+        "$<TARGET_FILE:cpu_rcx_branches_jrcxz>")
     cpu_asm_fixture(cpu_shift_count shift_count)
     set(shift_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_shift_count_lifted.cpp")
     add_custom_command(OUTPUT "${shift_fixture}"
@@ -649,6 +682,21 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(cpu_shift_count_lifted SHARED "${shift_fixture}")
     add_test(NAME cpu_aot_shift_count COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/shift_count.py"
         check "$<TARGET_FILE:cpu_shift_count>" "$<TARGET_FILE:cpu_shift_count_lifted>")
+    cpu_asm_fixture(cpu_carry_rotates carry_rotates)
+    # The lifted DLL and three mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted nomask nocarry stc)
+        set(carry_rotates_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_carry_rotates_${variant}.cpp")
+        add_custom_command(OUTPUT "${carry_rotates_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/carry_rotates.py"
+                emit "$<TARGET_FILE:cpu_carry_rotates>" "${carry_rotates_fixture}" ${variant}
+            DEPENDS cpu_carry_rotates tests/cpu/carry_rotates.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_carry_rotates_${variant} SHARED "${carry_rotates_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_carry_rotates COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/carry_rotates.py"
+        check "$<TARGET_FILE:cpu_carry_rotates>" "$<TARGET_FILE:cpu_carry_rotates_lifted>"
+        "$<TARGET_FILE:cpu_carry_rotates_nomask>" "$<TARGET_FILE:cpu_carry_rotates_nocarry>"
+        "$<TARGET_FILE:cpu_carry_rotates_stc>")
     set(query_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_version_query_lifted.cpp")
     add_custom_command(OUTPUT "${query_fixture}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/version_query_fixture.py"
@@ -764,6 +812,25 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_mul COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_mul.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_mul>"
         "$<TARGET_FILE:cpu_x87_mul_lifted>" ${x87_mul_control_files})
+    cpu_asm_fixture(cpu_x87_div x87_div)
+    # The lifted DLL and seven mutated controls that the check requires to mismatch.
+    set(x87_div_control_files "")
+    foreach(variant IN ITEMS lifted pc64 double nosticky divzero reverse zerosign memquiet)
+        set(x87_div_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_div_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_div_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_div.py"
+                emit "$<TARGET_FILE:cpu_x87_div>" "${x87_div_fixture}" ${variant}
+            DEPENDS cpu_x87_div tests/cpu/x87_div.py tests/cpu/x87_mul.py tests/cpu/x87_add.py
+                tools/ffx_version_query.py tools/x87_lower.py tools/x87_soft.h tools/cpu_ranges.py
+                tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_div_${variant} SHARED "${x87_div_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_div_control_files "$<TARGET_FILE:cpu_x87_div_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_div COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_div.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_div>"
+        "$<TARGET_FILE:cpu_x87_div_lifted>" ${x87_div_control_files})
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"

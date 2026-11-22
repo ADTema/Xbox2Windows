@@ -604,6 +604,29 @@ def check_half_draw(directory, compiler, renderer, backend):
         if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
             raise AssertionError(f"A wrong half conversion escaped detection in channel {k}")
 
+    # A separate export observes the literal and two scalar results as half encodings.
+    body = [
+        "v_cvt_f32_f16_e32 v12, 0x3c00",
+        "s_ashr_i64 s[72:73], 0xf000, 2",
+        "v_cvt_f32_f16_e32 v13, s72",
+        "s_bfm_b64 s[72:73], 16, 0",
+        "s_and_b64 s[72:73], s[72:73], 0x3c00",
+        "v_cvt_f32_f16_e32 v14, s72",
+        *HALF_BODY[3:],
+    ]
+    source.write_text(translate(with_constants(body)), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    scalars = [half_value(0x3c00), half_value(0xf000 // 4), half_value((2**16 - 1) & 0x3c00), fourth * 2.0 ** 24]
+    assert scalars == [1.0, 1.0, 1.0, 1.0]
+    case.write_bytes(constants + struct.pack("<4f", *scalars) * 64)
+    subprocess.run(draw, check=True)
+    # A shift by zero leaves 0xf000 (-8192.0) in green.
+    wrong_values = [scalars[0], half_value(0xf000), *scalars[2:]]
+    case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+        raise AssertionError("A wrong s_ashr_i64 count escaped detection in channel 1")
+
 
 def arithmetic():
     """Add, multiply, reversed subtraction and moves on the sample and constant words 8 to 11."""
@@ -933,12 +956,31 @@ def scalar64():
     capture_scc(9)
     mix_acc("s[72:73]")
 
-    # Fold all 64 bits of acc into bits [29:0] of s64, then export 4 x 10-bit fields as 1 + k/1024.
+    # s_nand_b64, s_nor_b64 and s_xnor_b64: the register pair, then an SCC probe. Channel 3 exports
+    # only SCC bits 0-9, so each probe's SCC reaches acc through s_cmov_b64 of a distinct literal.
+    # nand(-1, -1) and nor(alt, -1) are zero, and xnor(alt, -1) = alt is zero only in Set 2.
+    for op, probe, marker in (("s_nand_b64", "-1, -1", "0x2468ace0"),
+                              ("s_nor_b64", "s[82:83], -1", "0x13579bdf"),
+                              ("s_xnor_b64", "s[82:83], -1", "0x0fedcba9")):
+        body.append(f"{op} s[72:73], s[52:53], s[54:55]")
+        mix_acc("s[72:73]")
+        body.extend([
+            "s_mov_b32 s78, 0",
+            "s_mov_b32 s79, 0",
+            f"{op} s[72:73], {probe}",
+            f"s_cmov_b64 s[78:79], {marker}",
+        ])
+        mix_acc("s[72:73]")
+        mix_acc("s[78:79]")
+
+    # Fold all 64 bits of acc into bits [29:0] of s64: acc ^ (acc >> 30) ^ (acc >> 60), both shifts of the
+    # original acc, so every bit reaches the export. Repeating x ^= x >> 30 instead gives x ^ (x >> 60)
+    # and drops bits 30-59. Then export 4 x 10-bit fields as 1 + k/1024.
     body.extend([
         "s_lshr_b64 s[68:69], s[64:65], 30",
+        "s_lshr_b64 s[70:71], s[64:65], 60",
         "s_xor_b64 s[64:65], s[64:65], s[68:69]",
-        "s_lshr_b64 s[68:69], s[64:65], 30",
-        "s_xor_b64 s[64:65], s[64:65], s[68:69]",
+        "s_xor_b64 s[64:65], s[64:65], s[70:71]",
     ])
     for channel, (src, ctrl) in enumerate((("s64", "0xa0000"), ("s64", "0xa000a"),
                                            ("s64", "0xa0014"), ("s66", "0xa0000"))):
@@ -1010,6 +1052,11 @@ def scalar64_reference(program, words):
             scc = v != 0
         elif op == "s_orn2_b64":
             v = read64(ops[1]) | (~read64(ops[2]) & mask64)
+            write64(ops[0], v)
+            scc = v != 0
+        elif op in ("s_nand_b64", "s_nor_b64", "s_xnor_b64"):
+            a, b = read64(ops[1]), read64(ops[2])
+            v = ~{"s_nand_b64": a & b, "s_nor_b64": a | b, "s_xnor_b64": a ^ b}[op] & mask64
             write64(ops[0], v)
             scc = v != 0
         elif op == "s_not_b64":
@@ -1463,9 +1510,6 @@ def check_controls(directory):
         "s_cselect_b64 s[70:71], s[52:53], s[54:55]",
         "s_bfe_u64 s[70:71], s[52:53], s61",
         "s_bfe_i64 s[70:71], s[52:53], s61",
-        "s_nand_b64 s[70:71], s[52:53], s[54:55]",
-        "s_nor_b64 s[70:71], s[52:53], s[54:55]",
-        "s_xnor_b64 s[70:71], s[52:53], s[54:55]",
         "s_cmp_eq_u64 s[52:53], s[54:55]",
         "s_bitcmp1_b64 s[52:53], 0",
         "s_bfm_b32 s70, 4, 8",
@@ -1761,6 +1805,14 @@ def check_render(directory, compiler, renderer, backend):
         case = scalar64_case(directory, values)
         draw = [renderer, backend, "--check-pixel-case", shader, case]
         subprocess.run(draw, check=True)
+    # Keep the original two sets for the SCC toggle checks and add a draw-only case.
+    _, _, *middle, _, alt = SCALAR64_SETS[0]
+    a = 0x11234567 << 32 | 0xffffffff
+    b = middle[1] << 32 | middle[0]
+    # s_not_b64 of a | b sets only bit 63, so its SCC depends on the high word alone.
+    assert ~(a | b) & (2**64 - 1) == 1 << 63
+    case = scalar64_case(directory, (0xffffffff, 0x11234567, *middle, 0x00400018, alt))
+    subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
     # Mutations verified against Set 1 (where negative signed values and SCC=1 paths are active).
     set1_case = scalar64_case(directory, SCALAR64_SETS[0])
     draw = [renderer, backend, "--check-pixel-case", shader, set1_case]
@@ -1769,6 +1821,10 @@ def check_render(directory, compiler, renderer, backend):
         ("s_bfe_i32 s72, s60, s61", "s_bfe_u32 s72, s60, s61", "signed bitfield extract"),
         ("s_andn2_b64 s[72:73], s[52:53], s[54:55]", "s_and_b64 s[72:73], s[52:53], s[54:55]", "andn2 inversion"),
         ("s_cmov_b64 s[78:79], -1", "s_cmov_b64 s[78:79], 0", "conditional move"),
+        ("s_nand_b64 s[72:73], s[52:53], s[54:55]", "s_and_b64 s[72:73], s[52:53], s[54:55]", "nand inversion"),
+        ("s_nor_b64 s[72:73], s[52:53], s[54:55]", "s_or_b64 s[72:73], s[52:53], s[54:55]", "nor inversion"),
+        ("s_xnor_b64 s[72:73], s[52:53], s[54:55]", "s_xor_b64 s[72:73], s[52:53], s[54:55]", "xnor inversion"),
+        ("s_nor_b64 s[72:73], s[82:83], -1", "s_nor_b64 s[72:73], s[82:83], 0", "nor SCC probe"),
     ):
         mutated = [line.replace(old, new) for line in program]
         assert mutated != program, label

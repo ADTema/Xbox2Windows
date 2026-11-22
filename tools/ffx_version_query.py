@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 
 import pefile
-from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
+from iced_x86 import Code as C, Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -123,6 +123,20 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             cond = {M.JE: "if (zero) ", M.JNE: "if (!zero) ", M.JAE: "if (!carry) ",
                     M.JA: "if (!carry && !zero) ", M.JB: "if (carry) ", M.JBE: "if (carry || zero) ", M.JMP: ""}[op]
             stmt = f"{cond}goto block_{target:x};"
+        elif op in (M.LOOP, M.LOOPE, M.LOOPNE, M.JRCXZ, M.JECXZ):
+            # RCX-counted branches. A 67h prefix selects ECX (loopd, jecxz). None of them changes a flag;
+            # LOOPE and LOOPNE test ZF after the decrement.
+            target = i.near_branch_target
+            if target not in allowed:
+                raise ValueError(f"unbound branch at {i.ip:#x}")
+            ecx = i.code in (C.LOOP_REL8_64_ECX, C.LOOPE_REL8_64_ECX, C.LOOPNE_REL8_64_ECX, C.JECXZ_REL8_64)
+            count = "static_cast<uint32_t>(rcx)" if ecx else "rcx"
+            if op in (M.JRCXZ, M.JECXZ):
+                stmt = f"if ({count} == 0) goto block_{target:x};"
+            else:
+                decrement = "rcx = static_cast<uint32_t>(rcx - 1);" if ecx else "--rcx;"
+                condition = {M.LOOP: "", M.LOOPE: " && zero", M.LOOPNE: " && !zero"}[op]
+                stmt = f"{decrement} if ({count} != 0{condition}) goto block_{target:x};"
         elif op in (M.MOV, M.MOVZX):
             stmt = write(operand(1))
         elif op == M.MOVSXD:
@@ -164,6 +178,30 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = {lhs} {shift} {count}; "
                     f"carry = ((a >> {last}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else \
                 write(operand(0))  # A masked zero count keeps the flags but still zero-extends a 32-bit destination.
+        elif op in (M.RCL, M.RCR):
+            # The 9-, 17-, 33- or 65-bit rotation through CF, one bit per step as in the SDM pseudocode.
+            # Counts mask to five bits (six for 64-bit). Reducing 8- and 16-bit counts modulo 9 and 17 only
+            # bounds the loop, since those rotations repeat with that period.
+            # A zero step count keeps CF; ZF is never affected. OF (count 1) is not modelled here.
+            size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            count = f"(static_cast<unsigned>({operand(1)}) & {0x3f if size == 8 else 0x1f}u)"
+            if size < 4:
+                count = f"({count} % {bits + 1}u)"
+            if op == M.RCL:
+                step = (f"const bool out = ((v >> {bits - 1}) & 1) != 0; "
+                        f"v = static_cast<{width}>((v << 1) | {width}(c));")
+            else:
+                step = (f"const bool out = (v & 1) != 0; "
+                        f"v = static_cast<{width}>((v >> 1) | ({width}(c) << {bits - 1}));")
+            stmt = (f"{{ {width} v = {operand(0)}; bool c = carry; "
+                    f"for (unsigned n = {count}; n != 0; --n) {{ {step} c = out; }} carry = c; {write('v')} }}")
+        elif op == M.CLC:
+            stmt = "carry = false;"
+        elif op == M.STC:
+            stmt = "carry = true;"
+        elif op == M.CMC:
+            stmt = "carry = !carry;"
         elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.DEC, M.SUB, M.SBB):
             operator = {M.ADD: "+", M.INC: "+", M.DEC: "-", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]
             rhs = "1" if op in (M.INC, M.DEC) else operand(1)
