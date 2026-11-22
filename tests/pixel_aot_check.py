@@ -1076,6 +1076,167 @@ def check_scheduling_hints():
     must_reject(translate, plain[:-1] + ["s_setprio 0", plain[-1]])
 
 
+def f16_word(value, high=0):
+    lo = struct.unpack("<H", struct.pack("<e", value))[0]
+    return lo | ((high & 0xffff) << 16)
+
+
+# Quad-local DPP16 and DPP8 binary16 fixture covering all 23 f16 VOP1/VOP2 DPP forms
+# (including v_cvt_f16_f32_dpp, arithmetic, rounding, trig/transcendentals, frexp and ldexp).
+DPP_F16_BODY = [
+    "v_mov_b32_e32 v18, 0",
+    "v_mov_b32_e32 v19, 0",
+    "v_mov_b32_e32 v20, 0",
+    "v_mov_b32_e32 v21, 0",
+    "v_mov_b32_e32 v22, 0",
+    "v_mov_b32_e32 v23, 0",
+    "v_mov_b32_e32 v24, 0",
+    "v_mov_b32_e32 v25, 0",
+    "v_mov_b32_e32 v26, 0",
+    "v_mov_b32_e32 v48, 6",
+    "v_mov_b32_e32 v49, 7",
+    "v_cvt_f16_f32_dpp v18, v8 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f16_f32_dpp v20, v8 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_f16_dpp v18, v20, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f16_f32_dpp v19, v9 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f16_f32_dpp v21, v9 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_subrev_f16_dpp v19, v19, v21 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_ldexp_f16_dpp v18, v18, v48 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_ldexp_f16_dpp v19, v19, v49 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_f16_dpp v20, v18, v19 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_f16_dpp v22, v20, v20 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_mul_f16_dpp v22, |v22|, |v22| quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_f16_dpp v23, v20, v20 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_max_f16_dpp v23, |v23|, v23 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_add_f16_dpp v24, v20, v20 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_sub_f16_dpp v25, v20, v20 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_min_f16_dpp v26, v25, v25 quad_perm:[3,3,3,3] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v27, v24",
+    "v_fmac_f16_dpp v27, v22, v23 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_mov_b32_e32 v28, s44",
+    "v_add_f16_dpp v27, v27, -v26 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_f16_dpp v27, v27, v28 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f32_f16_e32 v12, v27",
+    "v_mov_b32_e32 v29, s45",
+    "v_mov_b32_e32 v30, s46",
+    "v_mov_b32_e32 v31, s47",
+    "v_mov_b32_e32 v32, 0",
+    "v_mov_b32_e32 v33, 0",
+    "v_mov_b32_e32 v34, 0",
+    "v_mov_b32_e32 v35, 0",
+    "v_mov_b32_e32 v36, 0",
+    "v_floor_f16_dpp v32, v31 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_ceil_f16_dpp v33, v31 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_trunc_f16_dpp v34, v31 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_rndne_f16_dpp v35, v31 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_fract_f16_dpp v36, v31 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_cvt_f32_f16_e32 v32, v32",
+    "v_cvt_f32_f16_e32 v33, v33",
+    "v_cvt_f32_f16_e32 v34, v34",
+    "v_cvt_f32_f16_e32 v35, v35",
+    "v_cvt_f32_f16_e32 v36, v36",
+    "v_fma_f32 v13, 2.0, v33, v32",
+    "v_fma_f32 v13, 4.0, v34, v13",
+    "v_fma_f32 v13, 0x41000000, v35, v13",
+    "v_add_f32_e32 v13, v13, v36",
+    "v_mov_b32_e32 v37, 0",
+    "v_mov_b32_e32 v38, 0",
+    "v_mov_b32_e32 v39, 0",
+    "v_mov_b32_e32 v40, 0",
+    "v_mov_b32_e32 v41, 0",
+    "v_mov_b32_e32 v42, 0",
+    "v_mov_b32_e32 v43, 0",
+    "v_log_f16_dpp v37, v29 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_exp_f16_dpp v38, v37 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_rcp_f16_dpp v39, v38 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_sqrt_f16_dpp v40, v29 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_rsq_f16_dpp v41, v29 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_sin_f16_dpp v42, v30 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_cos_f16_dpp v43, v30 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_cvt_f32_f16_e32 v37, v37",
+    "v_cvt_f32_f16_e32 v38, v38",
+    "v_cvt_f32_f16_e32 v39, v39",
+    "v_cvt_f32_f16_e32 v40, v40",
+    "v_cvt_f32_f16_e32 v41, v41",
+    "v_cvt_f32_f16_e32 v42, v42",
+    "v_cvt_f32_f16_e32 v43, v43",
+    "v_add_f32_e32 v14, v37, v38",
+    "v_fma_f32 v14, 0x41800000, v39, v14",
+    "v_add_f32_e32 v14, v14, v40",
+    "v_fma_f32 v14, 4.0, v41, v14",
+    "v_add_f32_e32 v14, v14, v42",
+    "v_fma_f32 v14, 2.0, v43, v14",
+    "v_mov_b32_e32 v44, 0",
+    "v_mov_b32_e32 v45, 0",
+    "v_mov_b32_e32 v46, 0",
+    "v_frexp_mant_f16_dpp v44, v31 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_frexp_exp_i16_f16_dpp v45, v31 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_ldexp_f16_dpp v46, v44, v45 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f32_f16_e32 v44, v44",
+    "v_cvt_f32_f16_e32 v46, v46",
+    "v_add_f32_e32 v15, v44, v46",
+]
+
+DPP_F16_SETS = (
+    # (a_f16, b_pow2_f16, turns_f16, c_f16) — high 16 bits hold junk to verify low-half reads.
+    (f16_word(1.5, 0xbeef), f16_word(4.0, 0xcafe), f16_word(0.0, 0x1234), f16_word(2.5, 0x5678)),
+    (f16_word(-1.75, 0xdead), f16_word(16.0, 0xface), f16_word(0.25, 0x4321), f16_word(-1.5, 0x8765)),
+)
+
+
+def dpp_f16_reference(a_w, b_w, t_w, c_w):
+    def f16(w):
+        return struct.unpack("<e", struct.pack("<H", w & 0xffff))[0]
+
+    a, b, t, c = f16(a_w), f16(b_w), f16(t_w), f16(c_w)
+    ch0 = 8.0 + a
+    ch1 = math.floor(c) + 2.0 * math.ceil(c) + 4.0 * math.trunc(c) + 8.0 * round(c) + (c - math.floor(c))
+    log_b = math.log2(b)
+    sin_t = 1.0 if t == 0.25 else 0.0
+    cos_t = 0.0 if t == 0.25 else 1.0
+    ch2 = log_b + (2.0 ** log_b) + 16.0 / (2.0 ** log_b) + math.sqrt(b) + 4.0 / math.sqrt(b) + sin_t + 2.0 * cos_t
+    mant, exp = math.frexp(c)
+    ch3 = mant + math.ldexp(mant, exp)
+    return (half_rtz(ch0), half_rtz(ch1), half_rtz(ch2), half_rtz(ch3))
+
+
+def check_dpp_f16_draw(directory, compiler, renderer, backend):
+    program = with_constants(DPP_F16_BODY)
+    source = directory / "dpp_f16.hlsl"
+    shader = directory / "dpp_f16.cso"
+    case = directory / "dpp_f16.case"
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for values in DPP_F16_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = dpp_f16_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    for set_idx, old, new, label in (
+        (0, "v_sub_f16_dpp v22, v20, v20 quad_perm:[1,0,3,2]",
+         "v_sub_f16_dpp v22, v20, v20 quad_perm:[2,3,0,1]", "AcrossX vs AcrossY"),
+        (0, "dpp8:[1,2,3,0,5,6,7,4]", "dpp8:[3,0,1,2,7,4,5,6]", "cyclic dpp8 rotation"),
+        (0, "v_rndne_f16_dpp v35, v31", "v_ceil_f16_dpp v35, v31", "rndne tie-to-even"),
+        (1, "v_sin_f16_dpp v42, v30", "v_cos_f16_dpp v42, v30", "sin vs cos turns"),
+        (0, "v_add_f16_dpp v27, v27, -v26", "v_add_f16_dpp v27, v27, v26", "DPP16 neg modifier"),
+    ):
+        values = DPP_F16_SETS[set_idx]
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = dpp_f16_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
 def check_controls(directory):
     check_scheduling_hints()
     check_constant_descriptor_bounds()
@@ -1307,6 +1468,34 @@ def check_controls(directory):
     cnd_pos = sel.index("v_cndmask_b32_e64 v13, v13, s46, s[52:53]")
     must_reject(translate, sel[:cnd_pos] + ["s_not_b64 s[52:53], 0"] + sel[cnd_pos:])
 
+    # Quad-local f16 DPP16 and DPP8 controls.
+    dpp_f16 = with_constants(DPP_F16_BODY)
+    source = translate(dpp_f16)
+    for expected in ("uint pack16_rne(", "float min16_num(", "float max16_num(", "float fract16(",
+                     "uint dpp_ldexp_f16(", "uint dpp_frexp_mant_f16(", "uint dpp_frexp_exp_f16(",
+                     "& 0xffff0000u;"):
+        assert expected in source, expected
+    assert "uint pack16_rne(" not in translate(assembly(False))
+    for bad in (
+        "v_add_f16_dpp v25, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",  # uninitialized vdst high-half
+        "v_add_f16_dpp v18, v18, v19 dpp8:[4,5,6,7,0,1,2,3]",  # cross-quad DPP8
+        "v_add_f16_dpp v18, v18, v19 row_shr:1 row_mask:0xf bank_mask:0xf",
+        "v_add_f16_dpp v18, v18, v19 quad_perm:[1,0,3,2] row_mask:0xe bank_mask:0xf",
+        "v_add_f16_dpp v18, -v18, v19 dpp8:[1,0,3,2,5,4,7,6]",  # neg on DPP8
+        "v_ldexp_f16_dpp v18, v18, -v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",  # neg on i16 exp
+        "v_add_f16_dpp v18, s44, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_f16_dpp v18, 1.0, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_floor_f16_dpp v18, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_f16_dpp v256, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_f32_dpp v18, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    ):
+        must_reject(translate, with_constants(["v_mov_b32_e32 v18, s44", "v_mov_b32_e32 v19, s45", bad]))
+    wait_vm = dpp_f16.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, dpp_f16[:wait_vm] + ["v_cvt_f16_f32_dpp v12, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + dpp_f16[wait_vm:])
+    must_reject(translate, dpp_f16[:wait_vm] + ["v_mov_b32_e32 v22, 0", "v_cvt_f16_f32_dpp v22, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + dpp_f16[wait_vm:])
+    wqm_idx = dpp_f16.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, dpp_f16[:wqm_idx] + ["v_cvt_f16_f32_dpp v22, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + dpp_f16[wqm_idx:])
+
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
@@ -1320,6 +1509,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
+    fixtures.append((with_constants(DPP_F16_BODY), translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -1368,6 +1558,7 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
+    check_dpp_f16_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"
