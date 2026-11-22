@@ -182,7 +182,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_wqm_b32", "s_wqm_b64", "s_swappc_b64", "s_setpc_b64", "s_rfe_b64",
     "s_and_saveexec_b64", "s_or_saveexec_b64", "s_xor_saveexec_b64",
     # SOP2
-    "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_addc_u32", "s_subb_u32",
+    "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_absdiff_i32", "s_addc_u32", "s_subb_u32",
     "s_min_i32", "s_min_u32", "s_max_i32", "s_max_u32", "s_cselect_b32", "s_cselect_b64",
     "s_and_b32", "s_and_b64", "s_or_b32", "s_or_b64", "s_xor_b32", "s_xor_b64",
     "s_andn2_b32", "s_andn2_b64", "s_orn2_b32", "s_orn2_b64", "s_nand_b32", "s_nand_b64",

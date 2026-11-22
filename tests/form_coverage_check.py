@@ -308,10 +308,14 @@ def check_shader_records():
         ("SOP2", "s_lshl1_add_u32"), ("SOP2", "s_lshl2_add_u32"),
         ("SOP2", "s_lshl3_add_u32"), ("SOP2", "s_lshl4_add_u32"),
     }
+    sop2_absdiff_forms = {
+        ("SOP2", "s_absdiff_i32"),
+    }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "v_mul_i32_i24_sdwa",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
+        "s_absdiff_i64", "s_absdiff_u32",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
     for name in ("gfx1013.tsv", "rdna2.tsv"):
@@ -322,6 +326,7 @@ def check_shader_records():
         assert e64_integer_forms <= covered, (name, e64_integer_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
+        assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)
         # v_mac_f32 is in the gfx1013 list only.
         approx_e64_forms = {("VOP3", "v_exp_f32_e64"), ("VOP3", "v_log_f32_e64")}
         approx_e64_forms |= {("VOP3", "v_mac_f32_e64")} if name == "gfx1013.tsv" else set()
