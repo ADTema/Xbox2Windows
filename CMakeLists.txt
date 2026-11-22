@@ -1008,6 +1008,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/pso_readiness_check.py")
     add_test(NAME dxcontainer_part_offsets COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxcontainer_part_offsets_check.py")
+    # #369: the built cs_6_0 array-atomics probe keeps nonUniformIndex on its atomic's handle.
+    add_test(NAME array_atomics_dxil COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/array_atomics_dxil_check.py" "${DXC_EXECUTABLE}"
+        "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.cso" "${CMAKE_SOURCE_DIR}/tests/gpu_alias_writes.hlsl"
+        "${CMAKE_SOURCE_DIR}/src")
     foreach(adapter IN ITEMS hardware warp)
         add_test(NAME cpu_native_frame_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/cpu/native_frame_check.py" "$<TARGET_FILE:cpu_frame_guest>"
