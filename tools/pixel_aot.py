@@ -1869,8 +1869,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({high} | narrow16({value}));")
         elif m := match(r"v_cvt_f32_(u32|i32)_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|-?\d+)"):
-            # Integer to binary32, plain e32 only: modifiers, clamp and omod belong to e64, and
-            # DPP or SDWA variants must not slip through the anchored operand list.
+            # Integer to binary32, plain e32 only: the e32 encoding carries no modifiers, so clamp
+            # or omod suffixes and DPP or SDWA variants must not slip through the anchored operand
+            # list; the e64 branch below carries clamp.
             op, dst, src = m.groups()
             if mask != "entry":
                 raise ValueError("Invalid conversion")
@@ -1878,6 +1879,22 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Write overlaps an outstanding sample")
             source = fp_operand(src, scalar, vector, pending, sample_dest)
             expression = f"float(asuint({source}))" if op == "u32" else f"float(asint({source}))"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"v_cvt_f32_(u32|i32)_e64 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|-?\d+)( clamp)?"):
+            # The e64 encoding of the same conversion adds clamp. omod stays refused in every
+            # spelling: the LLVM 15 assembler rejects it on these forms, so it cannot round-trip;
+            # abs/neg on the integer source are refused by the assembler too, and DPP or SDWA
+            # variants must not slip through the anchored operand list.
+            op, dst, src, clamp = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid conversion")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            source = fp_operand(src, scalar, vector, pending, sample_dest)
+            expression = f"float(asuint({source}))" if op == "u32" else f"float(asint({source}))"
+            if clamp:
+                expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
