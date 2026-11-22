@@ -14,7 +14,7 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from disasm_rdna2 import disasm_rdna2, decode_instruction, disassemble_binary
-from extract_shaders import extract_shaders, extract_native_rdna2_code
+from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
 from pixel_aot import native_program
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
@@ -119,7 +119,7 @@ class TestRdna2Disasm(unittest.TestCase):
             ("000080bf", "s_nop", "s_nop 0"),
             ("000081bf", "s_endpgm", "s_endpgm"),
             ("000082bf", "s_branch", "s_branch label_0x4"),
-            ("7f008cbf", "s_waitcnt", "s_waitcnt vmcnt(7) lgkmcnt(0)"),
+            ("7f008cbf", "s_waitcnt", "s_waitcnt vmcnt(15) lgkmcnt(0)"),
             ("000382be", "s_mov_b32", "s_mov_b32 s2, s0"),
             ("000482be", "s_mov_b64", "s_mov_b64 s2, s0"),
             ("00008080", "s_sub_u32", "s_sub_u32 s0, s0, s0"),
@@ -127,7 +127,22 @@ class TestRdna2Disasm(unittest.TestCase):
             ("007d8080", "s_sub_u32", "s_sub_u32 s0, s0, null"),
             ("006c8080", "s_sub_u32", "s_sub_u32 s0, s0, ttmp0"),
             # GFX10 / RDNA 2 opcode numbers, encodings as in LLVM's gfx10 MC tests
+            ("01020080", "s_add_u32", "s_add_u32 s0, s1, s2"),
+            ("01028080", "s_sub_u32", "s_sub_u32 s0, s1, s2"),
+            ("01020081", "s_add_i32", "s_add_i32 s0, s1, s2"),
+            ("01028081", "s_sub_i32", "s_sub_i32 s0, s1, s2"),
             ("01020083", "s_min_i32", "s_min_i32 s0, s1, s2"),
+            ("01028083", "s_min_u32", "s_min_u32 s0, s1, s2"),
+            ("01020084", "s_max_i32", "s_max_i32 s0, s1, s2"),
+            ("01028084", "s_max_u32", "s_max_u32 s0, s1, s2"),
+            ("01020085", "s_cselect_b32", "s_cselect_b32 s0, s1, s2"),
+            ("01020087", "s_and_b32", "s_and_b32 s0, s1, s2"),
+            ("01020088", "s_or_b32", "s_or_b32 s0, s1, s2"),
+            ("01020089", "s_xor_b32", "s_xor_b32 s0, s1, s2"),
+            ("0102008a", "s_andn2_b32", "s_andn2_b32 s0, s1, s2"),
+            ("0102008f", "s_lshl_b32", "s_lshl_b32 s0, s1, s2"),
+            ("01020090", "s_lshr_b32", "s_lshr_b32 s0, s1, s2"),
+            ("01020091", "s_ashr_i32", "s_ashr_i32 s0, s1, s2"),
             ("01020093", "s_mul_i32", "s_mul_i32 s0, s1, s2"),
             ("341281b1", "s_cmpk_eq_i32", "s_cmpk_eq_i32 s1, 0x1234"),
             # SOPC: [31:23] == 0b101111110. These encodings were previously
@@ -175,6 +190,9 @@ class TestRdna2Disasm(unittest.TestCase):
             # VOP2 mandatory literal FMA forms
             ("01070a5841312111", "v_fmamk_f32", "v_fmamk_f32 v5, v1, 0x11213141, v3"),
             ("01050a5a41312111", "v_fmaak_f32", "v_fmaak_f32 v5, v1, v2, 0x11213141"),
+            # Non-fused literal forms (encodings from LLVM 15 llvm-mc -mcpu=gfx1013 -show-encoding)
+            ("01070a4041312111", "v_madmk_f32", "v_madmk_f32 v5, v1, 0x11213141, v3"),
+            ("01050a4241312111", "v_madak_f32", "v_madak_f32 v5, v1, v2, 0x11213141"),
             # VINTRP: attr is [15:10], chan is [9:8]
             ("000004c8", "v_interp_p1_f32_e32", "v_interp_p1_f32_e32 v1, v0, attr0.x"),
             ("000108c8", "v_interp_p1_f32_e32", "v_interp_p1_f32_e32 v2, v0, attr0.y"),
@@ -211,6 +229,54 @@ class TestRdna2Disasm(unittest.TestCase):
             ("1a8012cc18e10118", "v_pk_max_f16", "v_pk_max_f16 v26, v24, 0.5 clamp"),
             ("0c4013cc12275a1c", "v_dot2_f32_f16", "v_dot2_f32_f16 v12, v18, v19, v22"),
             ("0c0020cc2c265204", "v_fma_mix_f32", "v_fma_mix_f32 v12, s44, v19, v20"),
+            # MUBUF: untyped, format, d16, atomics, cache invalidation, and buffer modifiers
+            ("000030e000050203", "buffer_load_dword", "buffer_load_dword v5, off, s[8:11], s3"),
+            ("40d030e000054203", "buffer_load_dword", "buffer_load_dword v5, v0, s[8:11], s3 offen offset:64 glc slc dlc"),
+            ("ff3f30e000050280", "buffer_load_dword", "buffer_load_dword v5, v[0:1], s[8:11], 0 idxen offen offset:4095"),
+            ("000031e000000203", "buffer_load_dword", "buffer_load_dword off, s[8:11], s3 lds"),
+            ("000030e00005827d", "buffer_load_dword", "buffer_load_dword v5, off, s[8:11], null tfe"),
+            ("000030e000051b03", "buffer_load_dword", "buffer_load_dword v5, off, ttmp[0:3], s3"),
+            ("102038e00008037c", "buffer_load_dwordx4", "buffer_load_dwordx4 v[8:11], v0, s[12:15], m0 idxen offset:16"),
+            ("00000ce200050280", "buffer_load_format_d16_xyzw", "buffer_load_format_d16_xyzw v[5:6], off, s[8:11], 0"),
+            ("0c1070e000050203", "buffer_store_dword", "buffer_store_dword v5, v0, s[8:11], s3 offen offset:12"),
+            ("001078e004000280", "buffer_store_dwordx4", "buffer_store_dwordx4 v[0:3], v4, s[8:11], 0 offen"),
+            ("000010e200050203", "buffer_store_format_d16_x", "buffer_store_format_d16_x v5, off, s[8:11], s3"),
+            ("0050c8e000050203", "buffer_atomic_add", "buffer_atomic_add v5, v0, s[8:11], s3 offen glc"),
+            ("0010c4e000050203", "buffer_atomic_cmpswap", "buffer_atomic_cmpswap v[5:6], v0, s[8:11], s3 offen"),
+            ("005044e100050280", "buffer_atomic_cmpswap_x2", "buffer_atomic_cmpswap_x2 v[5:8], v0, s[8:11], 0 offen glc"),
+            ("0000c4e100000000", "buffer_gl0_inv", "buffer_gl0_inv"),
+            ("0000c8e100000000", "buffer_gl1_inv", "buffer_gl1_inv"),
+            # MTBUF: typed buffer loads/stores and format field decoding
+            ("0000b0e800050203", "tbuffer_load_format_x", "tbuffer_load_format_x v5, off, s[8:11], s3 format:[BUF_FMT_32_FLOAT]"),
+            ("40d06bea00054203", "tbuffer_load_format_xyzw", "tbuffer_load_format_xyzw v[5:8], v0, s[8:11], s3 format:[BUF_FMT_32_32_32_32_FLOAT] offen offset:64 glc slc dlc"),
+            ("0030ede800052280", "tbuffer_store_format_d16_xy", "tbuffer_store_format_d16_xy v5, v[0:1], s[8:11], 0 format:[BUF_FMT_16_16_FLOAT] idxen offen"),
+            ("000008e800050203", "tbuffer_load_format_x", "tbuffer_load_format_x v5, off, s[8:11], s3"),
+            ("0000f8eb00050203", "tbuffer_load_format_x", "tbuffer_load_format_x v5, off, s[8:11], s3 format:127"),
+            # FLAT, GLOBAL, and SCRATCH memory instructions
+            ("000030dc02007d04", "flat_load_dword", "flat_load_dword v4, v[2:3]"),
+            ("ff173bdc02007d04", "flat_load_dwordx4", "flat_load_dwordx4 v[4:7], v[2:3] offset:2047 glc slc dlc"),
+            ("100088dc02007d04", "flat_load_sbyte_d16", "flat_load_sbyte_d16 v4, v[2:3] offset:16"),
+            ("100070dc02087d00", "flat_store_dword", "flat_store_dword v[2:3], v8 offset:16"),
+            ("00007cdc02087d00", "flat_store_dwordx3", "flat_store_dwordx3 v[2:3], v[8:10]"),
+            ("0000c8dc02087d00", "flat_atomic_add", "flat_atomic_add v[2:3], v8"),
+            ("0000c9dc02087d04", "flat_atomic_add", "flat_atomic_add v4, v[2:3], v8 glc"),
+            ("2000c5dc02087d04", "flat_atomic_cmpswap", "flat_atomic_cmpswap v4, v[2:3], v[8:9] offset:32 glc"),
+            ("000045dd02087d04", "flat_atomic_cmpswap_x2", "flat_atomic_cmpswap_x2 v[4:5], v[2:3], v[8:11] glc"),
+            ("008030dc02007d04", "global_load_dword", "global_load_dword v4, v[2:3], off"),
+            ("f09f33dc01000204", "global_load_dword", "global_load_dword v4, v1, s[2:3] offset:-16 glc slc dlc"),
+            ("00a030dc02007d00", "global_load_dword", "global_load_dword v[2:3], off lds"),
+            ("00a030dc01000200", "global_load_dword", "global_load_dword v1, s[2:3] lds"),
+            ("ff8770dc02087d00", "global_store_dword", "global_store_dword v[2:3], v8, off offset:2047"),
+            ("008864dc01080200", "global_store_byte_d16_hi", "global_store_byte_d16_hi v1, v8, s[2:3] offset:-2048"),
+            ("0080c8dc01080200", "global_atomic_add", "global_atomic_add v1, v8, s[2:3]"),
+            ("0080c9dc01080204", "global_atomic_add", "global_atomic_add v4, v1, v8, s[2:3] glc"),
+            ("008045dd02087d04", "global_atomic_cmpswap_x2", "global_atomic_cmpswap_x2 v[4:5], v[2:3], v[8:11], off glc"),
+            ("104030dc01007d04", "scratch_load_dword", "scratch_load_dword v4, v1, off offset:16"),
+            ("f05f33dc00000204", "scratch_load_dword", "scratch_load_dword v4, off, s2 offset:-16 glc slc dlc"),
+            ("106030dc00000200", "scratch_load_dword", "scratch_load_dword off, s2 offset:16 lds"),
+            ("004020dc00007c04", "scratch_load_ubyte", "scratch_load_ubyte v4, off, m0"),
+            ("104070dc01087d00", "scratch_store_dword", "scratch_store_dword v1, v8, off offset:16"),
+            ("e04f74dc00080200", "scratch_store_dwordx2", "scratch_store_dwordx2 off, v[8:9], s2 offset:-32"),
         ]
         for hex_str, expected_op, expected_asm in vectors:
             raw = bytes.fromhex(hex_str)
@@ -233,6 +299,31 @@ class TestRdna2Disasm(unittest.TestCase):
                 self.assertEqual(len(records), 1)
                 self.assertEqual(records[0]["assembly"],
                                  f"exp mrt0 {registers} done compr vm en:{mask:#x}")
+
+    def test_waitcnt_uses_gfx10_counter_fields(self):
+        # GFX10 s_waitcnt simm16: vmcnt [3:0] and [15:14], expcnt [6:4], lgkmcnt [13:8].
+        vectors = [
+            # Printed by LLVM 15.0.7 (MC/Disassembler/AMDGPU/gfx10_dasm_all.txt).
+            ("00008cbf", "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)"),
+            ("34128cbf", "s_waitcnt vmcnt(4) expcnt(3) lgkmcnt(18)"),
+            ("51c18cbf", "s_waitcnt vmcnt(49) expcnt(5) lgkmcnt(1)"),
+            # Encoded by LLVM 15.0.7 (MC/AMDGPU/gfx10_asm_sop.s); bit 7 is unused.
+            ("d1c18cbf", "s_waitcnt vmcnt(49) expcnt(5) lgkmcnt(1)"),
+            # One counter each; the others at their maximum are omitted.
+            ("703f8cbf", "s_waitcnt vmcnt(0)"),
+            ("707f8cbf", "s_waitcnt vmcnt(16)"),
+            ("7f3f8cbf", "s_waitcnt vmcnt(15)"),
+            ("0fff8cbf", "s_waitcnt expcnt(0)"),
+            ("7fc08cbf", "s_waitcnt lgkmcnt(0)"),
+            ("7fff8cbf", "s_waitcnt vmcnt(63) expcnt(7) lgkmcnt(63)"),
+        ]
+        for hex_str, expected in vectors:
+            with self.subTest(encoding=hex_str):
+                records = disasm_rdna2(bytes.fromhex(hex_str + "000081bf"))
+                self.assertEqual([(r["opcode"], r["length"]) for r in records],
+                                 [("s_waitcnt", 4), ("s_endpgm", 4)])
+                self.assertEqual(records[0]["assembly"], expected)
+                self.assertTrue(is_instruction_supported(expected))
 
     def test_literal_operands_keep_stream_aligned(self):
         # SOP1, SOP2, VOP1, VOP2 (src0 == 255) and v_fmaak_f32 each consume a trailing 32-bit literal.
@@ -284,6 +375,39 @@ class TestRdna2Disasm(unittest.TestCase):
                 ("s_endpgm", 4, "s_endpgm"),
             ],
         )
+
+    def test_second_dword_forms_keep_the_stream_aligned(self):
+        # Independent GFX10 encodings from LLVM MC 15.0.7 test/MC/AMDGPU (gfx10_asm_vop1.s,
+        # gfx10_asm_vop2.s, gfx10_asm_dpp8.s, gfx10_asm_sop.s). Each is one 8-byte instruction.
+        endpgm = bytes.fromhex("000081bf")
+        cases = (
+            ("f9160a7e01060600", "vop1_sdwa", "v_cvt_f32_f16_sdwa <unsupported SDWA>"),
+            ("fa020a7e01e40000", "vop1_dpp16", "v_mov_b32_dpp <unsupported DPP16>"),
+            ("e9020a7e0188c6fa", "vop1_dpp8", "v_mov_b32_dpp <unsupported DPP8>"),
+            ("ea020a7e0188c6fa", "vop1_dpp8", "v_mov_b32_dpp <unsupported DPP8>"),  # fi:1
+            ("f9040a0601060606", "vop2_sdwa", "v_add_f32_sdwa <unsupported SDWA>"),
+            ("fa040a1001e40000", "vop2_dpp16", "v_mul_f32_dpp <unsupported DPP16>"),
+            ("e9040a060188c6fa", "vop2_dpp8", "v_add_f32_dpp <unsupported DPP8>"),
+            ("01070a6e21110000", "v_fmamk_f16", "v_fmamk_f16 v5, v1, 0x1121, v3"),
+            ("01050a7021110000", "v_fmaak_f16", "v_fmaak_f16 v5, v1, v2, 0x1121"),
+            ("341280ba41312111", "s_setreg_imm32_b32", "s_setreg_imm32_b32 0x1234, 0x11213141"),
+        )
+        for raw, opcode, assembly in cases:
+            with self.subTest(raw=raw):
+                insns = disasm_rdna2(bytes.fromhex(raw) + endpgm)
+                self.assertEqual([(i["offset"], i["length"], i["opcode"]) for i in insns],
+                                 [(0, 8, opcode), (8, 4, "s_endpgm")])
+                self.assertEqual(insns[0]["assembly"], assembly)
+                truncated = disasm_rdna2(bytes.fromhex(raw)[:4])
+                self.assertEqual(len(truncated), 1)
+                self.assertEqual(truncated[0]["length"], 4)
+                self.assertTrue(truncated[0]["opcode"].endswith("_truncated"), truncated[0]["opcode"])
+
+        # Control: SRC0 codes next to the extension codes name an operand and stay one dword.
+        for src0 in (232, 235, 248, 251, 256):
+            with self.subTest(src0=src0):
+                insns = disasm_rdna2(struct.pack("<I", 0x7e0a0200 | src0) + endpgm)
+                self.assertEqual([(i["length"], i["opcode"]) for i in insns], [(4, "v_mov_b32_e32"), (4, "s_endpgm")])
 
     def test_sopc_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import SOPC_OPS
@@ -349,6 +473,18 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertTrue(is_opcode_recognized("v_cmpx_gt_i32_e32"))
         self.assertEqual(classify_isa_category("v_cmp_lt_f32_e32"), "VOPC (Vector Compare)")
         self.assertEqual(classify_isa_category("v_cmpx_gt_i32_e32"), "VOPC (Vector Compare)")
+
+    def test_sop2_lshl_add_opcode_table_synthetic_forms(self):
+        from disasm_rdna2 import SOP2_OPS
+        target_ops = {0x2e, 0x2f, 0x30, 0x31}
+        for op in target_ops:
+            expected_name, _ = SOP2_OPS[op]
+            w0 = 0x80000000 | (op << 23) | (2 << 16) | (1 << 8) | 0
+            raw = struct.pack("<I", w0)
+            insns = disasm_rdna2(raw)
+            self.assertEqual(len(insns), 1, f"Failed decoding SOP2 op 0x{op:02x}")
+            self.assertEqual(insns[0]["opcode"], expected_name)
+            self.assertEqual(insns[0]["length"], 4)
 
     def test_vop2_integer_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import VOP2_OPS
@@ -489,6 +625,208 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(res_rec["opcode"], "v_pk_add_u16_unsupported")
             self.assertIn("<unsupported_reserved_bits>", res_rec["assembly"])
 
+    def test_mubuf_opcode_table_synthetic_forms(self):
+        """Every GFX1013 MUBUF opcode must decode with exact width, scanner recognition, and 8-byte alignment."""
+        from disasm_rdna2 import MUBUF_OPS
+
+        self.assertEqual(len(MUBUF_OPS), 72)
+        for op, (expected_name, width, _) in MUBUF_OPS.items():
+            with self.subTest(op=op, name=expected_name):
+                w0 = 0xe0000000 | (op << 18)
+                w1 = 0 if width == 0 else ((3 << 24) | (2 << 16) | (8 << 8))
+                raw = struct.pack("<2I", w0, w1)
+                insns = disasm_rdna2(raw)
+                self.assertEqual(len(insns), 1)
+                self.assertEqual(insns[0]["opcode"], expected_name)
+                self.assertEqual(insns[0]["length"], 8)
+                if width == 0:
+                    self.assertEqual(insns[0]["assembly"], expected_name)
+                else:
+                    vdata = "v8" if width == 1 else f"v[8:{8 + width - 1}]"
+                    self.assertEqual(insns[0]["assembly"], f"{expected_name} {vdata}, off, s[8:11], s3")
+                self.assertTrue(is_opcode_recognized(expected_name))
+                self.assertEqual(classify_isa_category(expected_name), "VMEM (Vector Memory / Buffer)")
+
+        # Truncated MUBUF header reports mubuf_truncated instead of crashing or misdecoding.
+        trunc = disasm_rdna2(struct.pack("<I", 0xe0300000))
+        self.assertEqual(len(trunc), 1)
+        self.assertEqual(trunc[0]["opcode"], "mubuf_truncated")
+        self.assertIn("<truncated>", trunc[0]["assembly"])
+
+        # Unknown MUBUF opcodes keep 8-byte alignment so subsequent instructions decode cleanly.
+        stream = struct.pack("<3I", 0xe0000000 | (0x10 << 18), (3 << 24) | (2 << 16) | (8 << 8), 0xbf810000)
+        decoded = disasm_rdna2(stream)
+        self.assertEqual([(r["opcode"], r["length"]) for r in decoded], [("buffer_mubuf_10", 8), ("s_endpgm", 4)])
+
+    def test_mtbuf_opcode_table_synthetic_forms(self):
+        """Every GFX1013 MTBUF opcode and format identifier must decode accurately and stay aligned."""
+        from disasm_rdna2 import MTBUF_FORMATS, MTBUF_OPS
+
+        self.assertEqual(len(MTBUF_OPS), 16)
+        for op, (expected_name, width, _) in MTBUF_OPS.items():
+            with self.subTest(op=op, name=expected_name):
+                op_lo = op & 0x7
+                op_hi = (op >> 3) & 1
+                w0 = 0xe8000000 | (22 << 19) | (op_lo << 16)
+                w1 = (3 << 24) | (op_hi << 21) | (2 << 16) | (8 << 8)
+                insns = disasm_rdna2(struct.pack("<2I", w0, w1))
+                self.assertEqual(len(insns), 1)
+                self.assertEqual(insns[0]["opcode"], expected_name)
+                self.assertEqual(insns[0]["length"], 8)
+                vdata = "v8" if width == 1 else f"v[8:{8 + width - 1}]"
+                self.assertEqual(
+                    insns[0]["assembly"],
+                    f"{expected_name} {vdata}, off, s[8:11], s3 format:[BUF_FMT_32_FLOAT]",
+                )
+                self.assertTrue(is_opcode_recognized(expected_name))
+                self.assertEqual(classify_isa_category(expected_name), "VMEM (Vector Memory / Buffer)")
+
+        # Format 1 is LLVM's omitted default; named formats print in brackets; >=78 print numerically.
+        for fmt, expected_suffix in [
+            (0, " format:[BUF_FMT_INVALID]"),
+            (1, ""),
+            *[(code, f" format:[{name}]") for code, name in MTBUF_FORMATS.items() if code != 0],
+            (78, " format:78"),
+            (127, " format:127"),
+        ]:
+            w0 = 0xe8000000 | (fmt << 19)
+            w1 = (3 << 24) | (2 << 16) | (5 << 8)
+            asm = disasm_rdna2(struct.pack("<2I", w0, w1))[0]["assembly"]
+            self.assertEqual(asm, f"tbuffer_load_format_x v5, off, s[8:11], s3{expected_suffix}")
+
+        # Truncated MTBUF reports mtbuf_truncated and full instructions keep stream alignment.
+        trunc = disasm_rdna2(struct.pack("<I", 0xe8b00000))
+        self.assertEqual(len(trunc), 1)
+        self.assertEqual(trunc[0]["opcode"], "mtbuf_truncated")
+        self.assertIn("<truncated>", trunc[0]["assembly"])
+
+        aligned = disasm_rdna2(struct.pack("<3I", 0xe8b00000, (3 << 24) | (2 << 16) | (5 << 8), 0xbf810000))
+        self.assertEqual([(r["opcode"], r["length"]) for r in aligned], [("tbuffer_load_format_x", 8), ("s_endpgm", 4)])
+
+    def test_mubuf_mtbuf_distinguishes_modifiers(self):
+        """Buffer addressing, cache, LDS, TFE, and format modifiers must produce distinct disassembly."""
+        base_w0 = 0xe0000000 | (0x0c << 18)  # buffer_load_dword
+        base_w1 = (3 << 24) | (2 << 16) | (5 << 8) | 1
+        variants = {
+            "base": disasm_rdna2(struct.pack("<2I", base_w0, base_w1))[0]["assembly"],
+            "offen": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 12), base_w1))[0]["assembly"],
+            "idxen": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 13), base_w1))[0]["assembly"],
+            "idxen+offen": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 12) | (1 << 13), base_w1))[0]["assembly"],
+            "offset": disasm_rdna2(struct.pack("<2I", base_w0 | 64, base_w1))[0]["assembly"],
+            "glc": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 14), base_w1))[0]["assembly"],
+            "slc": disasm_rdna2(struct.pack("<2I", base_w0, base_w1 | (1 << 22)))[0]["assembly"],
+            "dlc": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 15), base_w1))[0]["assembly"],
+            "lds": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 16), base_w1))[0]["assembly"],
+            "tfe": disasm_rdna2(struct.pack("<2I", base_w0, base_w1 | (1 << 23)))[0]["assembly"],
+            "soffset_m0": disasm_rdna2(struct.pack("<2I", base_w0, (124 << 24) | (2 << 16) | (5 << 8) | 1))[0]["assembly"],
+        }
+        self.assertEqual(len(set(variants.values())), len(variants))
+        self.assertEqual(variants["idxen+offen"], "buffer_load_dword v5, v[1:2], s[8:11], s3 idxen offen")
+        self.assertEqual(variants["lds"], "buffer_load_dword off, s[8:11], s3 lds")
+        self.assertEqual(variants["tfe"], "buffer_load_dword v5, off, s[8:11], s3 tfe")
+        self.assertEqual(variants["soffset_m0"], "buffer_load_dword v5, off, s[8:11], m0")
+
+        # Atomics suppress tfe, matching LLVM AMDGPU disassembly.
+        atomic_asm = disasm_rdna2(struct.pack("<2I", 0xe0000000 | (0x32 << 18), base_w1 | (1 << 23)))[0]["assembly"]
+        self.assertEqual(atomic_asm, "buffer_atomic_add v5, off, s[8:11], s3")
+
+        # Trap-handler temporary buffer descriptors (srsrc idx 27..30 -> ttmp[0:3]..ttmp[12:15]).
+        for srsrc_idx, t in ((27, 0), (28, 4), (29, 8), (30, 12)):
+            ttmp_w1 = (3 << 24) | (srsrc_idx << 16) | (5 << 8)
+            ttmp_asm = disasm_rdna2(struct.pack("<2I", base_w0, ttmp_w1))[0]["assembly"]
+            self.assertEqual(ttmp_asm, f"buffer_load_dword v5, off, ttmp[{t}:{t + 3}], s3")
+
+    def test_flat_global_scratch_opcode_tables_synthetic_forms(self):
+        """All 130 GFX1013 FLAT, GLOBAL, and SCRATCH forms must decode cleanly and keep stream alignment."""
+        from disasm_rdna2 import FLAT_OPS, GLOBAL_OPS, SCRATCH_OPS
+
+        self.assertEqual(len(FLAT_OPS), 54)
+        self.assertEqual(len(GLOBAL_OPS), 54)
+        self.assertEqual(len(SCRATCH_OPS), 22)
+
+        def fmt_v(reg: int, width: int) -> str:
+            return f"v{reg}" if width == 1 else f"v[{reg}:{reg + width - 1}]"
+
+        for seg, ops_table in ((0, FLAT_OPS), (2, GLOBAL_OPS), (1, SCRATCH_OPS)):
+            for op, (expected_name, kind, vdst_w, vdata_w, _) in ops_table.items():
+                with self.subTest(seg=seg, op=op, name=expected_name):
+                    w0 = 0xdc000000 | (op << 18) | (seg << 14)
+                    w1 = (4 << 24) | (0x7d << 16) | (8 << 8) | 2
+                    insns = disasm_rdna2(struct.pack("<2I", w0, w1))
+                    self.assertEqual(len(insns), 1)
+                    self.assertEqual(insns[0]["opcode"], expected_name)
+                    self.assertEqual(insns[0]["length"], 8)
+
+                    vaddr = "v[2:3]" if seg in (0, 2) else "v2"
+                    if kind == "load":
+                        expected_ops = [fmt_v(4, vdst_w), vaddr]
+                    elif kind == "store":
+                        expected_ops = [vaddr, fmt_v(8, vdata_w)]
+                    else:
+                        expected_ops = [vaddr, fmt_v(8, vdata_w)]
+                    if seg in (1, 2):
+                        expected_ops.append("off")
+                    self.assertEqual(insns[0]["assembly"], f"{expected_name} {', '.join(expected_ops)}")
+                    self.assertTrue(is_opcode_recognized(expected_name))
+                    self.assertEqual(classify_isa_category(expected_name), "VMEM (Vector Memory / Buffer)")
+
+        # Truncated FLAT header reports flat_truncated instead of crashing.
+        trunc = disasm_rdna2(struct.pack("<I", 0xdc300000))
+        self.assertEqual(len(trunc), 1)
+        self.assertEqual(trunc[0]["opcode"], "flat_truncated")
+        self.assertIn("<truncated>", trunc[0]["assembly"])
+
+        # Reserved segment=3 and unsupported scratch atomic keep 8-byte alignment before s_endpgm.
+        for w0 in (0xdc30c000, 0xdcc84000):
+            stream = struct.pack("<3I", w0, (0x7d << 16) | 2, 0xbf810000)
+            decoded = disasm_rdna2(stream)
+            self.assertEqual([r["length"] for r in decoded], [8, 4])
+            self.assertEqual(decoded[1]["opcode"], "s_endpgm")
+
+    def test_flat_global_scratch_distinguishes_modifiers_and_addressing(self):
+        """Atomic glc return-value form, signed vs unsigned offsets, saddr, and LDS must stay distinct."""
+        # Atomic glc=0 vs glc=1 controls whether vdst is emitted.
+        for seg, base_w0, expected_no_rtn, expected_rtn in [
+            (0, 0xdc000000 | (0x32 << 18), "flat_atomic_add v[2:3], v8", "flat_atomic_add v4, v[2:3], v8 glc"),
+            (2, 0xdc000000 | (0x32 << 18) | (2 << 14), "global_atomic_add v[2:3], v8, off", "global_atomic_add v4, v[2:3], v8, off glc"),
+        ]:
+            w1 = (4 << 24) | (0x7d << 16) | (8 << 8) | 2
+            no_rtn = disasm_rdna2(struct.pack("<2I", base_w0, w1))[0]["assembly"]
+            rtn = disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 16), w1))[0]["assembly"]
+            self.assertEqual(no_rtn, expected_no_rtn)
+            self.assertEqual(rtn, expected_rtn)
+
+        # FLAT offset is 12-bit unsigned while GLOBAL/SCRATCH offsets are 12-bit signed.
+        w1_off = (4 << 24) | (0x7d << 16) | 2
+        self.assertEqual(disasm_rdna2(struct.pack("<2I", 0xdc300800, w1_off))[0]["assembly"], "flat_load_dword v4, v[2:3] offset:2048")
+        self.assertEqual(disasm_rdna2(struct.pack("<2I", 0xdc308800, w1_off))[0]["assembly"], "global_load_dword v4, v[2:3], off offset:-2048")
+        self.assertEqual(disasm_rdna2(struct.pack("<2I", 0xdc304fff, w1_off))[0]["assembly"], "scratch_load_dword v4, v2, off offset:-1")
+
+        # Global saddr forms: off vs s[2:3] vs vcc vs ttmp[0:1], plus lds/slc/dlc/glc.
+        global_variants = {
+            "off": disasm_rdna2(struct.pack("<2I", 0xdc308000, (4 << 24) | (0x7d << 16) | 2))[0]["assembly"],
+            "s2": disasm_rdna2(struct.pack("<2I", 0xdc308000, (4 << 24) | (2 << 16) | 1))[0]["assembly"],
+            "vcc": disasm_rdna2(struct.pack("<2I", 0xdc308000, (4 << 24) | (106 << 16) | 1))[0]["assembly"],
+            "ttmp0": disasm_rdna2(struct.pack("<2I", 0xdc308000, (4 << 24) | (108 << 16) | 1))[0]["assembly"],
+            "lds": disasm_rdna2(struct.pack("<2I", 0xdc30a000, (0 << 24) | (2 << 16) | 1))[0]["assembly"],
+            "slc_dlc": disasm_rdna2(struct.pack("<2I", 0xdc329010, (4 << 24) | (2 << 16) | 1))[0]["assembly"],
+        }
+        self.assertEqual(len(set(global_variants.values())), len(global_variants))
+        self.assertEqual(global_variants["vcc"], "global_load_dword v4, v1, vcc")
+        self.assertEqual(global_variants["ttmp0"], "global_load_dword v4, v1, ttmp[0:1]")
+        self.assertEqual(global_variants["lds"], "global_load_dword v1, s[2:3] lds")
+        self.assertEqual(global_variants["slc_dlc"], "global_load_dword v4, v1, s[2:3] offset:16 slc dlc")
+
+        # Scratch saddr vs vaddr addressing.
+        self.assertEqual(
+            disasm_rdna2(struct.pack("<2I", 0xdc304000, (4 << 24) | (2 << 16) | 1))[0]["assembly"],
+            "scratch_load_dword v4, off, s2",
+        )
+        self.assertEqual(
+            disasm_rdna2(struct.pack("<2I", 0xdc306010, (0 << 24) | (2 << 16) | 0))[0]["assembly"],
+            "scratch_load_dword off, s2 offset:16 lds",
+        )
+
     def test_cli_hex_entry_point(self):
         script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
         res = subprocess.run(
@@ -574,6 +912,37 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_cmp_lt_f32_e32 vcc_lo, v1, v2",
             "v_cmp_eq_u32_e32 vcc_lo, s1, v2",
             "v_cmpx_gt_i32_e32 v1, v2",
+            "buffer_load_dword v5, off, s[8:11], s3",
+            "buffer_load_dword v5, v[0:1], s[8:11], 0 idxen offen offset:4095 glc slc dlc",
+            "buffer_load_dword off, s[8:11], s3 lds",
+            "buffer_load_dword v5, off, s[8:11], null tfe",
+            "buffer_load_dword v5, off, ttmp[0:3], s3",
+            "buffer_load_format_d16_xyzw v[5:6], off, s[8:11], 0",
+            "buffer_store_dwordx4 v[0:3], v4, s[8:11], 0 offen",
+            "buffer_atomic_add v5, v0, s[8:11], s3 offen glc",
+            "buffer_atomic_cmpswap_x2 v[5:8], v0, s[8:11], 0 offen glc",
+            "buffer_gl0_inv",
+            "buffer_gl1_inv",
+            "tbuffer_load_format_x v5, off, s[8:11], s3 format:[BUF_FMT_32_FLOAT]",
+            "tbuffer_load_format_xyzw v[5:8], v0, s[8:11], s3 format:[BUF_FMT_32_32_32_32_FLOAT] offen offset:64 glc slc dlc",
+            "tbuffer_store_format_d16_xy v5, v[0:1], s[8:11], 0 format:[BUF_FMT_16_16_FLOAT] idxen offen",
+            "tbuffer_load_format_x v5, off, s[8:11], s3",
+            "tbuffer_load_format_x v5, off, s[8:11], s3 format:127",
+            "flat_load_dword v4, v[2:3]",
+            "flat_load_dwordx4 v[4:7], v[2:3] offset:2047 glc slc dlc",
+            "flat_store_dword v[2:3], v8 offset:16",
+            "flat_atomic_add v[2:3], v8",
+            "flat_atomic_cmpswap_x2 v[4:5], v[2:3], v[8:11] glc",
+            "global_load_dword v4, v[2:3], off",
+            "global_load_dword v4, v1, s[2:3] offset:-16 glc slc dlc",
+            "global_load_dword v1, s[2:3] lds",
+            "global_store_byte_d16_hi v1, v8, s[2:3] offset:-2048",
+            "global_atomic_add v1, v8, s[2:3]",
+            "global_atomic_add v4, v1, v8, s[2:3] glc",
+            "scratch_load_dword v4, v1, off offset:16",
+            "scratch_load_dword v4, off, s2 offset:-16 glc slc dlc",
+            "scratch_load_dword off, s2 offset:16 lds",
+            "scratch_store_dwordx2 off, v[8:9], s2 offset:-32",
             "s_endpgm",
         ]
 
@@ -628,7 +997,7 @@ class TestRdna2Disasm(unittest.TestCase):
                 rdna2_op, llvm_op,
                 f"Instruction {i}: disasm_rdna2 opcode '{rdna2_op}' does not match LLVM opcode '{llvm_op}'"
             )
-            if orig_op.startswith(("v_", "exp", "image_")):
+            if orig_op.startswith(("v_", "exp", "image_", "buffer_", "tbuffer_", "flat_", "global_", "scratch_")):
                 self.assertEqual(
                     " ".join(rdna2_rec["assembly"].lower().split()),
                     " ".join(llvm_line.lower().split()),
@@ -720,6 +1089,34 @@ class TestRdna2Extractor(unittest.TestCase):
             self.assertTrue((output_dir / "pixel" / "PS_CliTest.bin").is_file())
             self.assertEqual((output_dir / "pixel" / "PS_CliTest.bin").read_bytes(), known_code)
             self.assertTrue((output_dir / "manifest.json").is_file())
+
+    def test_cli_limit_must_be_positive(self):
+        """A limit below one is rejected instead of extracting a record anyway."""
+        records = [envelope(bytes.fromhex("000080bf 000081bf"), b"PS_First"),
+                   envelope(bytes.fromhex("000382be 000081bf"), b"PS_Second")]
+        script = Path(__file__).resolve().parents[1] / "tools" / "extract_shaders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "limit.rpf"
+            archive.write_bytes(b"RPF\0" + b"".join(records))
+            for limit in ("0", "-1"):
+                output_dir = tmp_path / f"limit_{limit}"
+                res = subprocess.run(
+                    [sys.executable, "-B", str(script), str(archive), "--output-dir", str(output_dir),
+                     "--stage", "pixel", "--limit", limit],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn("--limit", res.stderr)
+                self.assertFalse(output_dir.exists(), "no output may be written for a rejected limit")
+            output_dir = tmp_path / "limit_1"
+            subprocess.run(
+                [sys.executable, "-B", str(script), str(archive), "--output-dir", str(output_dir),
+                 "--stage", "pixel", "--limit", "1"],
+                capture_output=True, text=True, check=True,
+            )
+            manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 1)
 
     def test_extracted_names_round_trip_length_prefixed_records(self) -> None:
         code = bytes.fromhex("000080bf 000081bf")
@@ -862,6 +1259,33 @@ class TestRdna2Extractor(unittest.TestCase):
             self.assertEqual(len({p.casefold() for p in paths}), 4, f"Colliding output paths: {paths}")
             for entry, expected in zip(manifest["shaders"], codes):
                 self.assertEqual((out_path / entry["native_file"]).read_bytes(), expected)
+
+    def test_overlong_record_names_get_bounded_distinct_files(self):
+        """A record name near the one-byte length limit must not make the output name unwritable."""
+        codes = [bytes.fromhex("000080bf 000081bf"), bytes.fromhex("000382be 000081bf")]
+        names = [b"PS_" + b"a" * 250 + b"1", b"PS_" + b"a" * 250 + b"2"]
+        records = [envelope(code, name) for code, name in zip(codes, names)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "long.rpf"
+            archive.write_bytes(b"RPF\0" + b"".join(records))
+
+            out_path, manifest_file = extract_shaders(archive, tmp_path / "extracted_long", target_stages={"pixel"})
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 2)
+            self.assertEqual([entry["name"] for entry in manifest["shaders"]],
+                             [name.decode("ascii") for name in names])
+            paths = [entry["native_file"] for entry in manifest["shaders"]]
+            self.assertEqual(len({p.casefold() for p in paths}), 2, f"Colliding output paths: {paths}")
+            for path in paths:
+                self.assertLessEqual(len(Path(path).name.encode("utf-8")), 160, path)
+            for path, expected in zip(paths, codes):
+                self.assertEqual((out_path / path).read_bytes(), expected)
+        # Truncation counts bytes and never splits a multi-byte character.
+        for name in ("é" * 200, "a€" * 100):
+            stem = sanitize_filename(name)
+            self.assertTrue(name.startswith(stem) and 0 < len(stem.encode("utf-8")) <= 128, stem)
 
     def test_empty_archive_produces_empty_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1050,6 +1474,15 @@ class TestRdna2Scanner(unittest.TestCase):
                      "s_addk_i32 s50, -2"):
             self.assertTrue(is_instruction_supported(line), line)
         self.assertFalse(is_instruction_supported("s_mulk_i32 v50, 0x3"))
+
+    def test_literal_mad_forms_take_four_operands(self):
+        """v_madak_f32 and v_madmk_f32 are supported with four operands; e64 and a missing operand are not."""
+        for line in ("v_madak_f32 v5, v1, v2, 0x11213141", "v_madmk_f32 v5, v1, 0x11213141, v3"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_madak_f32_e64 v5, v1, v2, 0x11213141", "v_madmk_f32 v5, v1, 0x11213141",
+                     "v_madak_f32_dpp v5, v1, v2, 0x11213141 quad_perm:[0,1,2,3]",
+                     "v_madak_f32 v5, v1, v2, v3", "v_madmk_f32 v5, v1, v2, v3"):
+            self.assertFalse(is_instruction_supported(line), line)
 
     def test_float_to_word_conversions_are_plain_e32_only(self):
         """v_cvt_u32_f32 and v_cvt_i32_f32 are supported as e32 with a register or hex literal source."""
@@ -1320,7 +1753,26 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(is_instruction_supported("v_nop v0"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e32 v1, v2, v3"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e64 v1, v2, v3 clamp"))
-        self.assertTrue(is_instruction_supported("v_subrev_nc_u32_e32 v1, v2, v3"))
+        # The 32-bit no-carry family. The INTEGER_SOURCE class is coarser than the translator, so this
+        # pins the spellings and the refused modifiers, not the operand ranges.
+        for line in (
+            "v_add_nc_u32_e32 v1, v2, v3", "v_sub_nc_u32 v1, s2, 64", "v_subrev_nc_u32_e32 v1, v2, v3",
+            "v_add_nc_u32_e64 v1, s2, v3", "v_sub_nc_u32_e64 v1, s2, 64", "v_subrev_nc_u32_e64 v1, v2, s3",
+            "v_add_nc_i32 v1, s2, v3", "v_sub_nc_i32 v1, 64, v3",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_add_nc_u32_e64 v1, s2, v3 clamp", "v_subrev_nc_u32_e64 v1, s2, v3 clamp",
+            "v_add_nc_i32 v1, s2, v3 clamp", "v_sub_nc_i32 v1, s2, v3 clamp",
+            "v_add_nc_i32_e64 v1, s2, v3", "v_sub_nc_i32_e64 v1, s2, v3",
+            "v_subrev_nc_i32 v1, s2, v3",
+            "v_subrev_nc_u32_dpp v1, v2, v3 row_shl:1 row_mask:0xf bank_mask:0xf",
+            "v_subrev_nc_u32_sdwa v1, v2, v3 src0_sel:DWORD src1_sel:DWORD",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_add_nc_i32", "v_sub_nc_i32", "v_subrev_nc_u32_e64"):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
+        self.assertFalse(is_opcode_recognized("v_subrev_nc_i32"))
         self.assertTrue(is_opcode_recognized("v_mov_b32_sdwa"))
         self.assertTrue(is_opcode_recognized("v_cvt_f32_f16_sdwa"))
         self.assertTrue(is_opcode_recognized("v_pk_add_f16"))
@@ -1332,6 +1784,12 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_instruction_supported("s_nand_b32 s1, s2, s3"))
         self.assertTrue(is_instruction_supported("s_nor_b32 s1, s2, s3"))
         self.assertTrue(is_instruction_supported("s_xnor_b32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl1_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl2_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl3_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl4_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_bfm_b32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_bfm_b32 s1, 4, 8"))
         for unsupported in ("v_cvt_f32_i32 v1, v2",
                             "v_cvt_f32_i32_e32 v1, v2 clamp",
                             "v_cvt_f32_u32_e64 v1, -v2",
@@ -1340,7 +1798,11 @@ class TestRdna2Scanner(unittest.TestCase):
                             "s_nand_b32 s1, s2",
                             "s_nor_b32 s1, s2",
                             "s_xnor_b32 s1, s2",
-                            "s_nand_b32 v1, s2, s3"):
+                            "s_nand_b32 v1, s2, s3",
+                            "s_bfm_b32 s1, s2",
+                            "s_bfm_b32 v1, s2, s3",
+                            "s_bfm_b32 s1, v2, s3",
+                            "s_bfm_b32 s[2:3], s2, s3"):
             self.assertFalse(is_instruction_supported(unsupported), unsupported)
 
         # Verify unsupported operands or spellings are rejected by scanner
@@ -1353,8 +1815,16 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(is_instruction_supported("s_waitcnt_expcnt null, invalid"))
         self.assertFalse(is_instruction_supported("s_waitcnt expcnt(8)"))
         self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(64)"))
-        self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(7) lgkmcnt(0)"))
+        self.assertFalse(is_instruction_supported("s_waitcnt lgkmcnt(64)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(7) lgkmcnt(0)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(7) lgkmcnt(63)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt 0"))
+        self.assertTrue(is_instruction_supported("s_waitcnt 0x0"))
         self.assertFalse(is_instruction_supported("s_waitcnt foo"))
+        self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(0) lgkmcnt(0) vmcnt(1)"))
+        self.assertFalse(is_instruction_supported("s_waitcnt lgkmcnt(0)lgkmcnt(1)"))
+        self.assertFalse(is_instruction_supported("s_waitcnt expcnt(0) expcnt(1)"))
 
     def test_gfx1013_waitcnt_expcnt_decode_and_lower(self):
         """Assemble/decode GFX1013 s_waitcnt_expcnt binary bytes and lower with pixel_aot."""
