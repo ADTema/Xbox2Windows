@@ -751,6 +751,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    return float4(0.0f, 0.0f, {', '.join(args)});")
             channel_mask = 0xC
             exported = True
+        elif m := match(r"exp mrt0,? ((?:v\d+|off), (?:v\d+|off), (?:v\d+|off), (?:v\d+|off)) done compr vm"):
+            # LLVM 15 prints every raw four-bit EN value, but reassembly keeps a packed pair only
+            # when its first operand is enabled: the duplicated high-half operand never enables
+            # its pair, so raw 0x2 and 0xa re-encode to 0x0 and raw 0x5 to 0xf. Masks that do not
+            # enable whole pairs are refused instead of silently re-encoded.
+            raise ValueError(f"Unsupported compressed export enable mask: {m[1]} does not enable whole packed pairs")
         elif m := match(r"exp mrt0,? (v\d+), (v\d+), (v\d+), (v\d+) done vm"):
             # Four distinct registers of computed or sampled values, exported as raw binary32.
             values = [vector[v] for v in m.groups()]
