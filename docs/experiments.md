@@ -2067,6 +2067,26 @@ ctest --preset dev --no-tests=error -R '^compute_to_pixel_(warp|hardware)$' -V
 
 ## Offline pixel shader recompilation
 
+The 64-bit scalar set and clear forms are s_bitset0_b64 and s_bitset1_b64.
+They read the destination SGPR pair, mask the source index to six bits and
+clear or set that bit while preserving the other 63 bits and SCC. The fixture
+exports both words and SCC at indices 0, 31, 32, 63 and 64 with both incoming
+SCC values. It also carries the exact all-ones NaN-shaped pair from #680 at
+index 31, where setting the bit must retain 0xFFFFFFFF, and reads the index
+from either destination word. A wrong reference that applies index 31 to the
+high word, and a reference that re-reads an aliased index after the destination
+write, must both report pixel_mismatch. TomBox executes both 64-bit forms over
+boundary indices, and Leonida's 64-bit value and GPU suite covers SCC and word
+selection. Run
+ctest --preset dev --no-tests=error -R '^pixel_aot_blend_scalar_(warp|hardware)$' -V.
+On Windows build 26300.10075, the 30 positive draws and three negative controls
+passed on WARP 10.0.26100.10068 and an AMD Radeon RX 9060 XT (driver
+32.0.32029.2010), with all 4,096 pixels matching on every positive case. No
+NVIDIA adapter was available locally. The D3D12 debug layer was unavailable.
+[Leonida scalar validation](https://github.com/ItsNotRexed/Leonida/blob/4eb6155d/docs/shader_validation.md#L265) ·
+[TomBox SOP1 execution](https://github.com/omonkeyz/xbox-emulator/blob/2be7211/crates/tombox-xshader/tests/exec.rs#L932-L936) ·
+[AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
 The floating-point predicate draw uses one `--check-pixel-batch` process per
 compiled shader group. All 20 reference draws still run. For the final group,
 the finite-instead-of-NaN control produces a mismatch inside the batch and the
