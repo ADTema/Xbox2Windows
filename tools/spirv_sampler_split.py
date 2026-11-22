@@ -141,7 +141,8 @@ def split_comparison_sampler(assembly, ordinary_binding):
     binding_line, comparison_binding = bindings[sampler]
     descriptor_set = descriptor_sets[sampler]
     for variable, (_, slot) in bindings.items():
-        if descriptor_sets.get(variable) == descriptor_set and slot == ordinary_binding:
+        # A Binding without a DescriptorSet decoration is counted as set 0, so it cannot hide.
+        if descriptor_sets.get(variable, 0) == descriptor_set and slot == ordinary_binding:
             raise ValueError(f"Ordinary sampler binding {ordinary_binding} is occupied in set "
                              f"{descriptor_set} by {variable}")
     if any(word.startswith(PREFIX) for words in parsed for word in words):

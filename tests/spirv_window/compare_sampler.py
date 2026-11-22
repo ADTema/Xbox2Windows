@@ -61,6 +61,13 @@ def controls(directory):
     # Unsupported uses of the sampler being split are still rejected.
     for binding in (2, 3, 4):
         rejected(SHARED, binding, f"binding {binding} is occupied in set 0")
+    # A binding declared without a DescriptorSet decoration still occupies set 0.
+    rejected(substitute(SHARED, "OpDecorate %plainSampler DescriptorSet 0\n", ""), 3,
+             "binding 3 is occupied in set 0 by %plainSampler")
+    # The ordinary sample may not reuse the comparison's sampled image.
+    rejected(substitute(SHARED, "%43 = OpImageSampleExplicitLod %v4float %42 ",
+                        "%43 = OpImageSampleExplicitLod %v4float %34 "),
+             ORDINARY_BINDING, "one sampled image is used for both sampling kinds")
     rejected(substitute(SHARED, "%float_0_75 Lod %float_0", "%float_0_75 Lod %float_0_25"),
              ORDINARY_BINDING, "requires a constant LOD of zero")
     rejected(substitute(SHARED, "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0",
