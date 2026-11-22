@@ -2457,12 +2457,17 @@ def scalar_bit_count_values(width):
 
 def check_scalar_bit_count_draw(directory, compiler, renderer, backend):
     source, shader = directory / "bit-count.hlsl", directory / "bit-count.cso"
-    for width in (32, 64):
+    register_rows = ((0, 0), (0xffffffff, 0xffffffff), (0x1234abcd, 0x5678ef90), (0, 0x80000000))
+    # Keep the high-word-only register case last for the mismatch control below.
+    for width, rows in (
+        (32, ((0xfffffffe, 0), (1, 0)) + register_rows),
+        (64, ((1, 1),) + register_rows),
+    ):
         program = scalar_bit_count_values(width)
         source.write_text(translate(program), encoding="ascii")
         compile_shader(compiler, source, shader, ieee=False)
         cases = []
-        for idx, (lo, hi) in enumerate(((0, 0), (0xffffffff, 0xffffffff), (0x1234abcd, 0x5678ef90), (0, 0x80000000))):
+        for idx, (lo, hi) in enumerate(rows):
             word = lo if width == 32 else lo | (hi << 32)
             ones = word.bit_count()
             zeros = width - ones
@@ -2503,7 +2508,7 @@ def check_scalar_mul_hi_draw(directory, compiler, renderer, backend):
     source.write_text(translate(scalar_mul_hi_values()), encoding="ascii")
     compile_shader(compiler, source, shader, ieee=False)
     cases = []
-    for idx, (a, b) in enumerate(((0, 0x80000000), (0x7fffffff, 0x7fffffff), (0x80000000, 3),
+    for idx, (a, b) in enumerate(((1, 0), (0, 0x80000000), (0x7fffffff, 0x7fffffff), (0x80000000, 3),
                                   (3, 0x80000000), (0x1234abcd, 0x5678ef90), (0xffffffff, 0xffffffff))):
         signed_a, signed_b = struct.unpack("<ii", struct.pack("<II", a, b))
         constants = bytearray(256)
