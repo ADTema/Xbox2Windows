@@ -468,6 +468,8 @@ int main(int argc, char** argv)
             if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5])) return 77;
         } else if (argc == 3 && operation == "--dxr-facing") {
             if (!check_dxr_facing(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--dxr-opacity") {
+            if (!check_dxr_opacity(device.Get(), mode == "warp")) return 77;
         } else if (argc == 3 && operation == "--bvh-packed") {
             check_bvh_packed(device.Get());
         } else if (argc == 3 && operation == "--bvh-numeric") {
