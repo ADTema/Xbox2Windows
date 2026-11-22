@@ -230,6 +230,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                        or (i.mnemonic == M.VPADDD and i.op2_kind != K.MEMORY) for i in body)
     if has_xmm_math:
         lines.append("__m128i xmm0{}, xmm1{}, xmm2{};")
+    sse2_int_ops = {
+        M.PADDB, M.PADDW, M.PADDD, M.PADDQ, M.PSUBB, M.PSUBW, M.PSUBD, M.PSUBQ,
+        M.PAND, M.PANDN, M.POR, M.PXOR,
+        M.PCMPEQB, M.PCMPEQW, M.PCMPEQD, M.PCMPGTB, M.PCMPGTW, M.PCMPGTD,
+    }
     # Unaligned YMM copies and VEX zeroing in the descriptor builder need
     # only byte storage on the desktop host.
     wide = {R.YMM0: "wide0", R.YMM1: "wide1", R.YMM2: "wide2"}
@@ -259,6 +264,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
+    has_wide |= any(i.mnemonic in sse2_int_ops for i in body)
     if has_wide:
         if has_xmm_math:
             raise ValueError("mixed vector arithmetic and wide descriptor copies are unsupported")
@@ -962,6 +968,39 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             neg_c = "true" if kind in ("msub", "nmsub") else "false"
             stmt = (f"{{ const {ftype} r = fma_x86<{ftype}, {utype}>({s0}, {s1}, {s2}, {order}, {neg_p}, {neg_c}); "
                     f"auto keep = {dst}; {dst} = {{}}; memcpy({dst}.data(), keep.data(), 16); memcpy({dst}.data(), &r, {sz}); }}")
+        elif op in sse2_int_ops and i.encoding == EncodingKind.LEGACY and i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and has_wide:
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                src_init = f"std::array<uint8_t,16> rhs; memcpy(rhs.data(), {wide_xmm[i.op1_register]}.data(), 16);"
+            else:
+                raise ValueError(f"unsupported SSE2 integer source at {i.ip:#x}: {i}")
+            if op in (M.PADDB, M.PADDW, M.PADDD, M.PADDQ, M.PSUBB, M.PSUBW, M.PSUBD, M.PSUBQ):
+                lane_size = {M.PADDB: 1, M.PSUBB: 1, M.PADDW: 2, M.PSUBW: 2,
+                             M.PADDD: 4, M.PSUBD: 4, M.PADDQ: 8, M.PSUBQ: 8}[op]
+                utype = UINT[lane_size]
+                sign = "+" if op in (M.PADDB, M.PADDW, M.PADDD, M.PADDQ) else "-"
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{utype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const {utype} v = static_cast<{utype}>(a {sign} b); memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
+            elif op in (M.PAND, M.PANDN, M.POR, M.PXOR):
+                expr = {M.PAND: "a & b", M.PANDN: "(~a) & b", M.POR: "a | b", M.PXOR: "a ^ b"}[op]
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; ++n) {{ "
+                        f"const uint8_t a = {dst}[n], b = rhs[n]; {dst}[n] = static_cast<uint8_t>({expr}); }} }}")
+            elif op in (M.PCMPEQB, M.PCMPEQW, M.PCMPEQD):
+                lane_size = {M.PCMPEQB: 1, M.PCMPEQW: 2, M.PCMPEQD: 4}[op]
+                utype = UINT[lane_size]
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{utype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const {utype} v = a == b ? static_cast<{utype}>(~{utype}(0)) : {utype}(0); "
+                        f"memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
+            else:  # M.PCMPGTB, M.PCMPGTW, M.PCMPGTD
+                lane_size = {M.PCMPGTB: 1, M.PCMPGTW: 2, M.PCMPGTD: 4}[op]
+                stype = {1: "int8_t", 2: "int16_t", 4: "int32_t"}[lane_size]
+                utype = UINT[lane_size]
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{stype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const {utype} v = a > b ? static_cast<{utype}>(~{utype}(0)) : {utype}(0); "
+                        f"memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
