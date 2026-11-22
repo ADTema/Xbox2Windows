@@ -476,6 +476,103 @@ define void @main() {
     inventory = xbox_intrinsic_inventory(ordinary)
     assert inventory == dict(calls={}, declarations=[], metadata_only=[]), inventory
 
+    # 7. Submission gate: the final module is checked and a refused module is never submitted.
+    import xbox_intrinsic_gate as gate
+
+    class RecordingSubmit:
+        """Submission stub: a refused module must reach it zero times."""
+
+        def __init__(self):
+            self.batches = []
+
+        def __call__(self, module_text):
+            self.batches.append(module_text)
+
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(called), called, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert decision["submitted"] is False, decision
+    assert stub.batches == [], "a refused module reached the submission callable"
+    assert decision["reported_names"] == ["xbox.V_ALIGNBYTE_B32"], decision
+
+    for label, module_text in (("declared only", declared), ("metadata only", metadata),
+                               ("ordinary module", ordinary)):
+        stub = RecordingSubmit()
+        decision = gate.gate_submission(gate.check_text(module_text), module_text, stub)
+        assert decision["verdict"] == gate.ALLOW, (label, decision)
+        assert len(stub.batches) == 1, (label, stub.batches)
+
+    # A verified lowering admits the call; the adapter owns that proof and the default table has none.
+    stub = RecordingSubmit()
+    lowered = gate.status_table(["V_ALIGNBYTE_B32"])
+    decision = gate.gate_submission(gate.check_text(called, lowered), called, stub)
+    assert decision["verdict"] == gate.ALLOW, decision
+    assert [entry["builtin"] for entry in decision["resolved"]] == ["V_ALIGNBYTE_B32"], decision
+    assert len(stub.batches) == 1, decision
+    assert gate.check_text(called)["verdict"] == gate.REJECT, "the default table lowered a call"
+
+    # A metadata string that spells a call is not an instruction: it must not refuse the module.
+    spelled_call = '!0 = !{!"call void @xbox.text()"}'
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(spelled_call), spelled_call, stub)
+    assert decision["verdict"] == gate.ALLOW, decision
+    assert decision["metadata_only"] == ["xbox.text"], decision
+    assert len(stub.batches) == 1, decision
+
+    # A ';' inside a metadata string does not start a comment.
+    decision = gate.check_text('!0 = !{!"xbox.a;xbox.b"}')
+    assert decision["metadata_only"] == ["xbox.a", "xbox.b"], decision
+    assert decision["verdict"] == gate.ALLOW, decision
+
+    # The submission boundary: a refused module never starts the probe process.
+    with patch.object(rt.subprocess, "run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["dev", "--compute-pso", "--warp-only"], 0, b'{"warp_pso":"0x00000000"}\n', b"")
+        refused = rt.check_compute_pso(
+            Path("dev"), synth_dxbc, warp_only=True,
+            intrinsics=dict(calls={"xbox.BFI": 1}, declarations=[], metadata_only=[]))
+        assert mock_run.call_count == 0, "a refused module started a submission"
+        assert refused["gate"]["verdict"] == gate.REJECT, refused
+        assert refused["gate"]["submitted"] is False, refused
+        assert refused["gate"]["reported_names"] == ["xbox.BFI"], refused
+        allowed = rt.check_compute_pso(
+            Path("dev"), synth_dxbc, warp_only=True,
+            intrinsics=dict(calls={}, declarations=[], metadata_only=[]))
+        assert mock_run.call_count == 1, "an allowed module did not submit exactly once"
+        assert allowed["warp_pso"] == "0x00000000", allowed
+        assert allowed["gate"]["submitted"] is True, allowed
+
+    # A module nobody disassembled must not be submitted, and the decision has to stay visible.
+    unchecked = gate.not_checked("module-not-disassembled")
+    assert unchecked["verdict"] == gate.NOT_CHECKED, unchecked
+    assert unchecked["verdict"] != gate.ALLOW and unchecked["checked"] is False, unchecked
+    assert unchecked["reported_names"] == [] and unchecked["calls"] == {}, unchecked
+    stub = RecordingSubmit()
+    gate.gate_submission(unchecked, called, stub)
+    assert stub.batches == [], "an unexamined module reached the submission callable"
+
+    # --pso-probe without --probe: no disassembly, so the CLI records NOT_CHECKED and submits nothing.
+    tool = Path(__file__).resolve().parents[1] / "tools" / "dxil_retarget.py"
+    with TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        in_file = tmp_dir / "in.dxbc"
+        out_file = tmp_dir / "out.dxbc"
+        absent_probe = tmp_dir / "absent_probe.exe"
+        in_file.write_bytes(synth_dxbc)
+        ungated = subprocess.run(
+            [sys.executable, "-B", str(tool), str(in_file), str(out_file), "--pso-probe", str(absent_probe)],
+            capture_output=True, text=True)
+        assert ungated.returncode == 0, ungated.stderr
+        pso = json.loads(ungated.stdout)["pso"]
+        assert pso["gate"]["verdict"] == gate.NOT_CHECKED, pso
+        assert pso["gate"]["reason"] == "module-not-disassembled", pso
+        assert "warp_pso" not in pso and "hardware_pso" not in pso, pso
+        assert "--probe" in ungated.stderr, ungated.stderr
+
+    print("submission gate controls: unresolved call refused with 0 submissions; declared only, "
+          "metadata only, ordinary and adapter-lowered modules submit once; a metadata string that "
+          "spells a call and a ';' inside a metadata string still pass; without --probe the CLI "
+          "records NOT_CHECKED and submits nothing")
     print("pure-python dxil_retarget controls: ok")
 
 
