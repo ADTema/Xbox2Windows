@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_avx_int_minmax_mul
 ; Source-owned differential fixture for 33 VEX AVX packed saturating, min/max, avg, multiply, and sad instructions.
 .code
 
