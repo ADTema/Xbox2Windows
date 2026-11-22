@@ -358,6 +358,9 @@ add_test(NAME offscreen_invalid_operation_warp COMMAND "${CMAKE_COMMAND}"
     "-DRENDERER=$<TARGET_FILE:offscreen_check>" -P "${CMAKE_SOURCE_DIR}/tests/offscreen_invalid_operation.cmake")
 set_tests_properties(offscreen_invalid_operation_warp PROPERTIES TIMEOUT 45)
 
+add_test(NAME offscreen_capability_table_self_test COMMAND offscreen_check --self-test)
+set_tests_properties(offscreen_capability_table_self_test PROPERTIES TIMEOUT 45)
+
 set(SIMPLE_TRIANGLE_DIR "${CMAKE_SOURCE_DIR}/out/reference/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/IntroGraphics/SimpleTriangle"
     CACHE PATH "Microsoft SimpleTriangle sample directory")
 if(EXISTS "${SIMPLE_TRIANGLE_DIR}/VertexShader.hlsl")
