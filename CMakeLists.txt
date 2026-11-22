@@ -727,12 +727,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         if(variant STREQUAL "inverted")
             target_compile_definitions(${native} PRIVATE FLIP_SELECTOR)
         endif()
-        target_link_options(${native} PRIVATE /ENTRY:native_entry /NODEFAULTLIB /INCREMENTAL:NO)
+        target_sources(${native} PRIVATE tests/cpu/exe_startup.asm)
+        target_link_options(${native} PRIVATE /ENTRY:native_startup /EXPORT:native_entry /NODEFAULTLIB /INCREMENTAL:NO)
         set(source "${CMAKE_CURRENT_BINARY_DIR}/${lifted}.cpp")
         add_custom_command(OUTPUT "${source}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_exe_aot.py"
                 "$<TARGET_FILE:${native}>" "$<TARGET_FILE:cpu_exe_io>"
-                "$<TARGET_FILE:cpu_import_provider>" "${source}"
+                "$<TARGET_FILE:cpu_import_provider>" "${source}" --entry-export native_entry
             DEPENDS ${native} cpu_exe_io cpu_import_provider tools/cpu_exe_aot.py
                 tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py tools/ffx_version_query.py
             VERBATIM)
@@ -762,6 +763,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_exe_original>" "$<TARGET_FILE:cpu_exe_original_lifted>"
         "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>")
     target_compile_features(pe_map PRIVATE cxx_std_17)
+    add_test(NAME cpu_native_exe_termination COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/exe_termination_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_original>" "$<TARGET_FILE:cpu_exe_original_lifted>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>")
     add_test(NAME cpu_native_map COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_map_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_register_probe>"

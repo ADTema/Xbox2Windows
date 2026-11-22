@@ -30,7 +30,7 @@ Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepend
 
 ## Source-built EXE entry to a DLL import
 
-MSVC assembles a small CRT-free [EXE entry](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) starts at the PE's `AddressOfEntryPoint`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
+MSVC assembles a small CRT-free [EXE entry body](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) takes the fixture's `native_entry` export through `--entry-export`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
 
 The [Windows test](../tests/cpu/exe_entry_check.py) sends one byte to each child. The provider records its two incoming integers and writes the computed word through its third argument. The I/O DLL sends the recorded integers to stderr and the eight output bytes to stdout. The test reads both pipes and the process exit code.
 
@@ -50,11 +50,13 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_exe_entry$' -V
 
 `cpu_native_exe_chain` gives the original EXE and its AOT build the same selector byte as above. A third child maps that exact original EXE, binds its ordinary imports to the two source-built Windows DLLs and calls `pe_map_run`. The child passes the guest's returned DWORD back as its process exit code. All three paths produce the same 16 argument bytes, eight output bytes and exit codes in the table.
 
-The first host dependency appears during IAT binding, before any guest instruction runs. On the tested MSVC build, an empty binding table stops at `cpu_exe_io.dll!emit_trace`; supplying just the I/O DLL stops at `cpu_import_provider.dll!mix_args`. The first import invoked at runtime is `read_selector`. With both DLLs bound, the entry and its internal caller execute unchanged. This measures the source-built Windows fixture and its providers.
+The first host dependency appears during IAT binding, before any guest instruction runs. Before the startup wrapper was added, the tested MSVC build with an empty binding table stopped at `cpu_exe_io.dll!emit_trace`. Supplying just the I/O DLL stops at `cpu_import_provider.dll!mix_args`. The first import invoked at runtime is `read_selector`.
+
+The PE entry points to a [startup wrapper](../tests/cpu/exe_startup.asm). It calls the same return-based body in both cases. After it returns, the I/O DLL compares the fixture's mapped base with the main process module. A native process exits with the body's DWORD via `ExitProcess`. A host mapping returns that DWORD to `pe_map_run`. The regression starts a worker that signals readiness and stays alive. It checks process termination, both pipe EOFs and exact output and exit status for both selectors and empty input. A separate marker proves that the host gets control back after running the exact same image. A temporary copy with its startup RVA set directly to the body is the negative control, whose live worker and open pipes are sampled before cleanup. [Issue #281](https://github.com/R0Y00/Xbox2Windows/issues/281)
 
 ```powershell
 cmake --build --preset dev --target pe_map cpu_exe_original_lifted
-ctest --preset dev --no-tests=error -R '^cpu_native_exe_chain$' -V
+ctest --preset dev --no-tests=error -R '^cpu_native_exe_(chain|termination)$' -V
 ```
 
 ## Pipeline readiness from shader manifests
