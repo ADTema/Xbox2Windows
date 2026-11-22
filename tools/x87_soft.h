@@ -258,3 +258,14 @@ static inline X87Value x87_div(X87Value a, X87Value b) {
 }
 // FDIVR: the same division with the operands exchanged.
 static inline X87Value x87_divr(X87Value a, X87Value b) { return x87_div(b, a); }
+
+// FSUB: a - b as a + (-b). A NaN or invalid operand is selected before the negation, so a NaN result keeps
+// its own sign; x - x is +0, as x + (-x) is.
+static inline X87Value x87_sub(X87Value a, X87Value b) {
+    X87Value out;
+    if (x87_special_operands(a, b, &out)) return out;
+    b.se ^= 0x8000;
+    return x87_add(a, b);
+}
+// FSUBR: the same subtraction with the operands exchanged.
+static inline X87Value x87_subr(X87Value a, X87Value b) { return x87_sub(b, a); }
