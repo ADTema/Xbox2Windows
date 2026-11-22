@@ -2095,6 +2095,15 @@ Across all eight modes, total renderer launches per backend drop from 494 to
 `draw-blend-scalar`: 126 to 61; `draw-e64`: 57 to 50; `draw-integer-nc`: 12 to
 3; `draw-bfm`: 15 to 3; `three-way`: 4 to 3; `buffer-color`: 6 to 4).
 
+The first raw buffer_load_dword path remains a proposal while
+[issue #319](https://github.com/R0Y00/Xbox2Windows/issues/319) is open. The
+[binding contract](pixel_mubuf_contract.md) records the separate DW0/DW1
+address masks, the 14-bit stride field, OOB_SELECT = 3 whole-DWORD bounds, a
+bounded space1 title-lookup table for ps_6_0 and a separately observable host
+binding failure for an unmapped title address. The tests keep an aligned
+partial tail apart from rejected unaligned inputs. The gfx1013 bounds rule
+remains open. No vector memory instruction is accepted by this change.
+
 #The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.
 
 The scalar quad reduction forms are s_quadmask_b32 and s_quadmask_b64. Each
