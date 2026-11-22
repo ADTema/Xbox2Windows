@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_avx_packed_int
 ; Source-owned differential fixture for 26 VEX AVX packed integer ALU instructions.
 .code
 
