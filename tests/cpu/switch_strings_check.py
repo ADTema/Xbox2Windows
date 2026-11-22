@@ -137,7 +137,7 @@ def differential(probe_path, native_path, *lifted_paths):
         functions = [getattr(lib, ('' if n == 0 else 'lifted_') + name) for n, lib in enumerate(libraries)]
         for count in (0, 1, 2, 3, 7, 16, 31):
             for delta in (None, 'odd', -7, -1, 0, 1, 7, 8):
-                for fill in (0, 0x80ff7f0100ff0180, MASK):
+                for fill in (0, 0x80ff7f0100ff0180, MASK, 0x0100):
                     for backwards in ((False, True) if name == 'branch_direction' else (False,)):
                         source, target = (256, 640) if delta is None else (257, 640) if delta == 'odd' else (512, 512+delta)
                         expected, left, source_end, target_end, flag = reference(initial, source, target, fill, count, name, backwards)
@@ -176,6 +176,31 @@ def differential(probe_path, native_path, *lifted_paths):
                 cases += 1
     finally:
         if not kernel.VirtualFree(inaccessible, 0, 0x8000):
+            raise C.WinError(C.get_last_error())
+    # A non-null VirtualAlloc reservation starts on a 64 KiB boundary.
+    size = 0x10000
+    for high in range(1, 65):
+        boundary = high << 32
+        region = kernel.VirtualAlloc(boundary - size, size, 0x3000, 0x04)
+        if region:
+            break
+    else:
+        raise C.WinError(C.get_last_error())
+    try:
+        assert region == boundary - size, (region, boundary)
+        edge = C.c_ubyte.from_address(boundary - 1)
+        context = (WORD * 4)(0, boundary - 1, 0x6c, 0)
+        for n, lib in enumerate(libraries):
+            function = getattr(lib, ('' if n == 0 else 'lifted_') + 'rep_stosb_forward')
+            edge.value = 0xa5
+            trace, observed = (WORD * 4)(MASK, MASK, MASK, MASK), (WORD * 3)()
+            result = probe(function, C.addressof(context), 1, trace, observed)
+            assert (edge.value, result, tuple(trace), tuple(observed)) == (
+                0x6c, 0, (0, 0, boundary, 1), SENTINELS
+            ), (n, hex(boundary), edge.value, result, tuple(trace), tuple(observed))
+            cases += 1
+    finally:
+        if not kernel.VirtualFree(region, 0, 0x8000):
             raise C.WinError(C.get_last_error())
     print(f'{cases} native/AOT/reference cases passed: bytes, guards, remaining count, pointers, CF, RSI/RDI and DF')
 
@@ -232,6 +257,21 @@ def faults(guard_path, native_path, *lifted_paths):
                     key = (suffix, access)
                     assert written == split_element_results.setdefault(key, written), (key, written)
                     count += 1
+            edge = C.c_ubyte.from_address(page + 4095)
+            for suffix, destination, repetitions, expected_edge in (
+                ('b', page + 4096, 1 << 32, 0xa5),  # RCX is nonzero with ECX zero.
+                ('b', page + 4095, 2, 0x6c),       # The first byte completes before the fault.
+                ('w', page + 4095, 1, 0xa5),       # The fault is within the first word.
+            ):
+                edge.value = 0xa5
+                function = getattr(lib, prefix + 'rep_stos' + suffix + '_forward')
+                context = (WORD * 4)(0, destination, 0x126c, 0)
+                trace, result = (WORD * 4)(MASK, MASK, MASK, MASK), WORD()
+                code = guarded(function, C.addressof(context), repetitions, trace, C.byref(result))
+                assert (code, tuple(trace), edge.value) == (0xc0000005, (MASK,) * 4, expected_edge), (
+                    path, suffix, destination, repetitions, hex(code), tuple(trace), edge.value
+                )
+                count += 1
             # Three byte iterations complete before a source page fault. The trace
             # follows REP, so no trace store may move before the faulting instruction.
             C.memmove(page+4093, b'abc', 3)

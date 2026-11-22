@@ -1375,12 +1375,12 @@ ctest --test-dir out/native --no-tests=error -R '^cpu_aot_switch_strings$' -V
 ```
 
 Windows 11 build 26300.9974, MSVC/ML64 19.44.35230 and Python 3.12.8:
-38 exports, 18,192 native/AOT/reference comparisons and 84 access-violation
+38 exports, 24,243 native/AOT/reference comparisons and 93 access-violation
 comparisons passed, including the `/O2` translation. Compiled incorrect
 implementations must fail the comparison: a bulk `memmove` on destructive overlap
 and a truncated repeat count, plus ignored backwards direction.
 The comparison includes inaccessible addresses with a zero count, and a read that
-copies three bytes before faulting at a protected page; no later trace store executes. The same fault must occur with a repeat count of 2^32 + 1, so the full 64-bit RCX is used. Non-overlapping copies run from an even and an odd source address, and an overlapping copy runs with the destination 8 bytes past the source. It also compares native and translated memory effects when a word, dword or qword straddles the protected page.
+copies three bytes before faulting at a protected page; no later trace store executes. The same fault must occur with a repeat count of 2^32 + 1, so the full 64-bit RCX is used. Non-overlapping copies run from an even and an odd source address, and an overlapping copy runs with the destination 8 bytes past the source. `rep stos` also runs with a nonzero fill whose low byte is zero, with RCX = 2^32 (zero ECX) at a protected destination, with a two-byte `rep stosb` from the last writable byte (the first byte is stored before the fault), with a word that straddles a protected page (nothing is stored), and with a one-byte store just below a 4 GiB boundary, so RDI must carry into its upper half. It also compares native and translated memory effects when a word, dword or qword straddles the protected page.
 No title startup result is claimed.
 
 The Windows ABI boundary follows [Microsoft's direction-flag convention](https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions).
