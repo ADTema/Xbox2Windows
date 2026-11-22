@@ -78,6 +78,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     rf"s_(?:lshl_b64|lshr_b64|ashr_i64)\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"s_bfm_b64\s+s\[\d+:\d+\],\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"(?:s_bfe_u32|s_bfe_i32)\s+s\d+,\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
+    rf"(?:s_bfe_u64|s_bfe_i64)\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"(?:s_cmp_eq_u64|s_cmp_lg_u64)\s+{SCALAR64_SOURCE},\s+{SCALAR64_SOURCE}",
     rf"(?:s_bitcmp0_b64|s_bitcmp1_b64)\s+{SCALAR64_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"(?:s_bitcmp0_b32|s_bitcmp1_b32)\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
@@ -243,7 +244,7 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {entry[0] for entry in SCRATCH_OPS.values()}
     | (set(pixel_aot.HINT_LIMITS) if pixel_aot is not None else set())
     | {
-        "s_brev_b64", "s_bfm_b64", "s_bfe_u32", "s_bfe_i32",
+        "s_brev_b64", "s_bfm_b64", "s_bfe_u32", "s_bfe_i32", "s_bfe_u64", "s_bfe_i64",
         "s_cmp_eq_u64", "s_cmp_lg_u64",
         "s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64",
         "s_cmp_eq_i32", "s_cmp_lg_i32", "s_cmp_gt_i32", "s_cmp_ge_i32", "s_cmp_lt_i32", "s_cmp_le_i32",
