@@ -513,6 +513,12 @@ OperationResult run_compute_store_case(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_spirv_sampler_views(const OperationContext& ctx)
+{
+    check_sampler_views(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_spirv_address_window(const OperationContext& ctx)
 {
     check_spirv_window(ctx.device, ctx.argv[3]);
@@ -809,6 +815,10 @@ constexpr CapabilityGate kGateWaveShuffle{
     D3D_SHADER_MODEL_6_5, false, true, 0,
     "skip: wave shuffle fixture requires SM 6.5 and WaveOps",
     CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateSm66SamplerViews{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "skip: sampler fixture requires SM 6.6",
+    CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_6, true, false, 0,
     "skip: address window fixture requires SM 6.6 and 64-bit shader integer operations",
@@ -824,6 +834,7 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--spirv-sampler-views", 4, 4, nullptr, kGateSm66SamplerViews, run_spirv_sampler_views},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--ffx-device-init", 3, 3, nullptr, kNoGate, run_ffx_device_init},
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
@@ -1046,6 +1057,8 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --dual-uav")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--compute-root-file"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --compute-root-file")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-sampler-views"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --spirv-sampler-views")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "invalid"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,
