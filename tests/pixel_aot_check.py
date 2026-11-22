@@ -4878,6 +4878,10 @@ def check_controls(directory):
         high = "4294967295u" if signed else "0u"
         literal = translate_int(scalar_bfe64(op, "0x80000000"))
         assert f"s_bfe64(uint2(2147483648u, {high})," in literal
+        imm_ctrl = translate_int(scalar_bfe64(op, control="0x200020"))
+        assert ", 2097184u," in imm_ctrl
+        must_reject(translate_int, scalar_bfe64(op, "0x8123456789abcdef"))
+        must_reject(translate_int, scalar_bfe64(op, "0x100000000"))
         pos = bfe.index(f"{op} s[44:45], s[44:45], s46")
         for operands in ("s[45:46], s[44:45], s46", "exec, s[44:45], s46",
                          "s[44:45], exec, s46", "s[44:45], s[44:45], s[46:47]"):
@@ -4885,6 +4889,7 @@ def check_controls(directory):
         wait = bfe.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc") + 1
         for operands in ("s[44:45], 0, 0", "s[50:51], s[44:45], 0", "s[50:51], 0, s46"):
             must_reject(translate_int, bfe[:wait] + [f"{op} {operands}"] + bfe[wait:])
+    assert set(SCALAR_BFE64_OPS) <= ACCEPTED
     select64 = scalar_select64()
     translate_int(select64)
     selected = select64.index(S_CSELECT_B64)
@@ -4945,6 +4950,10 @@ def check_controls(directory):
         "s_bfm_b32 s[70:71], 4, 8",  # pair destination
         "s_bfm_b32 s70, 4",  # missing operand
         "s_bfm_b32 s70, s90, 8",  # unset source
+        "s_bfm_b64 s70, 4, 8",  # single destination
+        "s_bfm_b64 s[70:71], v12, 8",  # VGPR source
+        "s_bfm_b64 s[70:71], 4",  # missing operand
+        "s_bfm_b64 s[106:107], 4, 8",  # out-of-range SGPR pair
         "s_cselect_b32 s70, s56, s57",
     ):
         must_reject(translate, program[:body_start] + [bad] + program[body_start:])
