@@ -28,6 +28,8 @@ Download the [Windows x64 GPU check and SHA-256](https://github.com/R0Y00/Xbox2W
 .\Run-GpuCheck.ps1
 ```
 
+With a package built from current source, use `.\Run-GpuCheck.ps1 -Adapter Radeon` to select a hardware adapter by part of its name. For source builds, set `XBOX2WINDOWS_ADAPTER` before running CTest.
+
 Review `gpu-report-hardware.md` and paste its full contents as a comment on the [hardware coverage thread (#1)](https://github.com/R0Y00/Xbox2Windows/issues/1). Do not open a new GitHub issue. Reports with a failure or capability skip are welcome. [Package instructions](tools/gpu-check/README.md)
 
 ### Hardware coverage

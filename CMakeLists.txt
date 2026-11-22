@@ -225,6 +225,11 @@ foreach(layout IN ITEMS root tables)
     endforeach()
     set_tests_properties(compute_${layout}_hardware PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
+# XBOX2WINDOWS_ADAPTER selects a hardware adapter by part of its name. A name no adapter has must fail.
+add_test(NAME adapter_selection_unmatched COMMAND offscreen_check hardware --dual-uav)
+set_tests_properties(adapter_selection_unmatched PROPERTIES TIMEOUT 45
+    ENVIRONMENT "XBOX2WINDOWS_ADAPTER=no adapter has this name"
+    PASS_REGULAR_EXPRESSION "No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=no adapter has this name")
 add_executable(pso_root_check tests/pso_root_check.cpp)
 target_compile_features(pso_root_check PRIVATE cxx_std_17)
 target_include_directories(pso_root_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
