@@ -2552,8 +2552,9 @@ def check_scalar_leading_bit_draw(directory, compiler, renderer, backend):
         source.write_text(translate(scalar_leading_bit_values(width)), encoding="ascii")
         compile_shader(compiler, source, shader, ieee=False)
         cases = []
-        for idx, (lo, hi) in enumerate(((0, 0), (0xffffffff, 0xffffffff), (0x80000000, 0x80000000),
-                                        (0, 1), (0x80000000, 0), (1, 0), (0xfffffffe, 0xffffffff))):
+        extra_rows = ((0x40000000, 0), (0x00010000, 0)) if width == 32 else ((0, 0x40000000),)
+        for idx, (lo, hi) in enumerate(extra_rows + ((0, 0), (0xffffffff, 0xffffffff), (0x80000000, 0x80000000),
+                                                     (0, 1), (0x80000000, 0), (1, 0), (0xfffffffe, 0xffffffff))):
             word = lo if width == 32 else lo | (hi << 32)
             bits = f"{word:0{width}b}"
             unsigned = bits.find("1")
@@ -2572,6 +2573,17 @@ def check_scalar_leading_bit_draw(directory, compiler, renderer, backend):
                            capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Unsigned leading-bit scan matched the signed reference")
+
+    # s_flbit does not write SCC: seed it false before each scan of a zero pair.
+    program = [line.replace("s_cmp_eq_u32 s44, s45", "s_cmp_lg_u32 s44, s45")
+               for line in scalar_leading_bit_values(64)]
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, 0, 0, 0xffffffff, 0xffffffff)
+    case = directory / "leading-bit-scc.case"
+    case.write_bytes(constants + struct.pack("<4f", 1, 1, 0, 0) * 64)
+    run_pixel_batch(renderer, backend, shader, [(case, "pass")])
 
 
 def scalar_bit_count_values(width):
