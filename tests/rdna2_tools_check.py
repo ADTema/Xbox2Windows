@@ -1657,6 +1657,8 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_instruction_supported("s_lshl2_add_u32 s1, s2, s3"))
         self.assertTrue(is_instruction_supported("s_lshl3_add_u32 s1, s2, s3"))
         self.assertTrue(is_instruction_supported("s_lshl4_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_bfm_b32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_bfm_b32 s1, 4, 8"))
         for unsupported in ("v_cvt_f32_i32 v1, v2",
                             "v_cvt_f32_i32_e32 v1, v2 clamp",
                             "v_cvt_f32_u32_e64 v1, -v2",
@@ -1665,7 +1667,11 @@ class TestRdna2Scanner(unittest.TestCase):
                             "s_nand_b32 s1, s2",
                             "s_nor_b32 s1, s2",
                             "s_xnor_b32 s1, s2",
-                            "s_nand_b32 v1, s2, s3"):
+                            "s_nand_b32 v1, s2, s3",
+                            "s_bfm_b32 s1, s2",
+                            "s_bfm_b32 v1, s2, s3",
+                            "s_bfm_b32 s1, v2, s3",
+                            "s_bfm_b32 s[2:3], s2, s3"):
             self.assertFalse(is_instruction_supported(unsupported), unsupported)
 
         # Verify unsupported operands or spellings are rejected by scanner
