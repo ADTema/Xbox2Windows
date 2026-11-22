@@ -2192,6 +2192,42 @@ With the entry execution mask restored, `image_sample` also accepts `dmask:0x7` 
 
 For a single 2D RGBA sample, `image_sample_lz` lowers to `SampleLevel` at level 0 of the bound texture view. Both halves of an interpolation must execute under the same tracked mask. Entry-mask interpolation supplies the covered lanes for explicit LOD, while implicit sampling requires whole-quad coordinates. The BC7 fixture draws an 8×8 texture into a 4×4 viewport with different colors at mip levels 0 and 1. On WARP and RTX 5080, the explicit sample matched level 0 across 16 pixels and 64 channels. The implicit sample chose level 1 and failed the level-0 reference at (0, 0). [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
 
+Depth-comparison sampling covers one form: `image_sample_c_lz vD, v[a:a+2], ... dmask:0x1 dim:SQ_RSRC_IMG_2D` and its NSA spelling `[vR, vU, vV]`. In RDNA 2 the reference comes before the coordinates. The result lowers to `tex.SampleCmpLevelZero(samp, float2(u, v), reference)` on `Texture2D<float> tex : register(t0)` and `SamplerComparisonState samp : register(s0)`. The four sampler words must still match the caller binding. `comparison_sampler_state()` decodes them, and the generated HLSL names the desktop state it needs in a comment. The compare function comes from word 0 bits 14:12, in the same order as `D3D12_COMPARISON_FUNC` minus one, and the result is `reference OP texel`. One point or bilinear XY filter maps to `D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT` or `..._MIN_MAG_LINEAR_MIP_POINT`. Other values are refused, each with its own message:
+- X/Y addressing other than `CLAMP_LAST_TEXEL`;
+- anisotropy, unnormalized coordinates, `MC_COORD_TRUNC` or `FORCE_DEGAMMA`;
+- a min/max filter mode;
+- a non-zero `MIN_LOD` or LOD bias;
+- different min and mag filters;
+- mip filter 3 or word 2 bits 28–31;
+- word 3 bits 12–29, unnamed on gfx10 (bit 29 is `UPGRADED_DEPTH` on GFX8).
+
+Fields that cannot change a 2D LOD-zero result under this profile are not read: `CLAMP_Z`, `DISABLE_CUBE_WRAP`, `Z_FILTER`, the anisotropy threshold and bias, `MAX_LOD`, `PERF_MIP`/`PERF_Z`, the border colour and word 0 bit 31. `TRUNC_COORD` is reported but not applied. A program that mixes comparison and ordinary sampling, or uses a second texture, is refused, because both would need `s0`. Field positions follow `SQ_IMG_SAMP_WORD0`…`3` in Mesa [`src/amd/registers/gfx10-rsrc.json`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-23.3.6/src/amd/registers/gfx10-rsrc.json), and the enum values follow Linux `navi10_enum.h` (`SQ_TEX_DEPTH_COMPARE`, `SQ_TEX_CLAMP`, `SQ_TEX_XY_FILTER`). [HLSL SampleCmpLevelZero](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplecmplevelzero)
+
+The fixed root signature of `tests/pixel_aot_vs.hlsl` has one ordinary static sampler, so `offscreen_check --check-pixel-compare` uses its own root signature with a descriptor-heap sampler. The case file supplies the filter and compare function from the decoded state. `tests/pixel_compare_check.py` draws an 8×8 `R32_FLOAT` texture into a 16×16 target, so bilinear weights are 1/4 and 3/4 and the expected results are exact multiples of 1/16. Three source-built programs cover all eight compare functions with both filters:
+- the reference from constant word 0, equal to some texels, so `EQUAL` and the `LESS`/`LESS_EQUAL` split are visible;
+- the reference interpolated from `attr0.x`, which varies per pixel and is never equal to a texel;
+- the reference computed by `v_fma_f32` from constants, in the NSA form.
+
+The expected images come from an independent CPU model: compare each texel, clamp to the edge, then weight bilinearly. The sampler words are written from the field layout in the test, not by the decoder.
+
+On Windows 11 build 26200.9974 with the D3D12 debug layer enabled, NVIDIA GeForce RTX 3070 (driver 621.01) and WARP each matched all 48 draws (256 pixels, four channels, bitwise) with no debug messages. On each adapter, all 13 negative controls failed at pixel comparison:
+- expected images for `GREATER` and `GREATER_EQUAL` (and `LESS_EQUAL` for the constant reference) against a `LESS` descriptor;
+- bilinear depths compared once instead of compared texels filtered (192 and 159 of 256 pixels differ);
+- a point sampler in place of bilinear;
+- recompiled HLSL that ignores the reference;
+- recompiled HLSL that swaps u and v.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_compare_' -V
+```
+
+```bash
+python3 -B tests/pixel_compare_check.py
+python3 -B tests/pixel_compare_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+Not covered: implicit-LOD `image_sample_c`, `_c_l`, `_c_b`, `_c_o`, `_c_d`, `image_gather4_c*`, cube and array shadow maps, border-colour addressing, references outside [0, 1] and texels on exact filter boundaries with `TRUNC_COORD` 0. How many archive records use these forms has not been measured.
+
 For a shader that reads constants, pass `--constant-descriptor OFFSET` to identify its four-word descriptor in the same table as the texture descriptor. The desktop test binds 256 bytes at `b0`. A four-word read may span two HLSL constant vectors. Arithmetic support includes log2, exp2, reciprocal, rounding up (`v_ceil_f32`) and to nearest even (`v_rndne_f32`, lowered to HLSL `round`, which DXC emits as `Round_ne`), two-operand min/max, three-operand minimum, maximum and median (`v_min3_f32`, `v_max3_f32`, `v_med3_f32`), addition, multiplication, subtraction in either operand order, legacy zero-preserving multiplication, multiply-add, destination accumulation and saturation. The three-operand forms are emitted as nested HLSL `min` and `max`, with the median as `max(min(a, b), min(max(a, b), c))`. Each result is one of its operands, so finite inputs involve no rounding; NaN operands are not measured and may differ from the hardware's NaN rules. `v_mov_b32` copies a sample component, a loaded constant, an earlier result or an inline or literal constant, and rejects interpolation state, packed values and source modifiers. The lowerer rejects moves and floating-point arithmetic writes to the destination registers of an outstanding sample until its result is ready. With two samples in flight, `vmcnt(1)` permits moving the older result while all four destination registers of the newer sample remain protected. The dual-texture fixture uses that move in the rendered blend. As in the other operands, an integer inline constant is a bit pattern, not a converted value. Ordered and unordered `v_cmp_*_f32` comparisons, including the always-false and always-true predicates, but excluding class and exec-writing forms, become HLSL booleans, and `v_cndmask_b32` selects between two numeric operands with one. The lowerer accepts a mask in `vcc` or a scalar register under either wavefront-width spelling and rejects a select whose mask it did not see a comparison write. For `nlg`, equality or an explicit NaN check on either operand preserves the unordered case in DXIL. The earlier ordered comparisons produced a mismatch on the [reported RX 9070 XT driver](https://github.com/R0Y00/Xbox2Windows/issues/179). The pixel draw checks cover all 16 truth tables with less-than, signed-zero equality, greater-than and a quiet NaN on either side. Replacing a NaN with an equal finite operand must fail against the saved unordered reference. Compile arithmetic shaders with DXC `-Gis`. Transcendental precision and multiply-add rounding may vary by device. [AMD RDNA instruction reference](https://gpuopen.com/wp-content/uploads/2019/08/RDNA_Shader_ISA_5August2019.pdf) · [HLSL mad precision](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/mad)
 
 `s_movk_i32` sign-extends its 16-bit immediate, and the translator folds the result. One draw checks the rule end to end on the GPU. It moves 0x8000 and 0x7fff, extracts bytes 1 and 3 of each with `s_bfe_u32`, and widens each byte as a binary16 subnormal scaled by 2^24 to the exact integer, so the draw exports 255, 128, 127 and 0. A reference for zero extension (byte 3 of 0x8000 as 0), and one for treating 0x7fff as negative (byte 3 as 255), must each report a mismatch.
