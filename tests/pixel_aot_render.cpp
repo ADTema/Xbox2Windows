@@ -47,6 +47,7 @@ struct PixelInput {
     std::vector<Word> constants = std::vector<Word>(64);
     bool integerRT = false;      // bit 0 of the optional case-trailer flags byte
     std::vector<BYTE> nanMask;   // 64 per-texel NaN-class mask bytes, empty without a trailer
+    UINT writeMask = 0xF;        // high nibble of the trailer flags byte; 0 selects all channels
 };
 
 struct MipDraw {
@@ -86,7 +87,7 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_ZERO;
     blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     blend.LogicOp = D3D12_LOGIC_OP_NOOP;
-    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    blend.RenderTargetWriteMask = static_cast<UINT8>(input.writeMask);
     desc.SampleMask = UINT_MAX;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = desc.SampleDesc.Count = 1;
@@ -101,7 +102,14 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     const UINT residentCount = static_cast<UINT>(levels.size());
     srcDesc.MipLevels = static_cast<UINT16>(firstResident + residentCount);
     auto texture = resource(device, srcDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    const D3D12_CLEAR_VALUE clear{desc.RTVFormats[0], {-1, -1, -1, -1}};
+    // A partial write mask leaves the disabled channels unwritten by the draw, so the target is
+    // cleared to the documented sentinel (-1, 2, -3, 4); a full mask keeps the usual all -1 clear.
+    const std::array<float, 4> clearColor = input.writeMask == D3D12_COLOR_WRITE_ENABLE_ALL
+                                                ? std::array<float, 4>{-1, -1, -1, -1}
+                                                : std::array<float, 4>{-1, 2, -3, 4};
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = desc.RTVFormats[0];
+    std::copy(clearColor.begin(), clearColor.end(), clear.Color);
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(residentCount);
     UINT64 sourceBytes = 0;
     std::vector<UINT> rows(residentCount);
@@ -345,9 +353,15 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
         if (file.peek() != std::char_traits<char>::eof()) {
             BYTE flags = 0;
             file.read(reinterpret_cast<char*>(&flags), 1);
-            if (flags & 0xfeu)
+            if (flags & 0x0eu)
                 throw std::runtime_error("Unknown case trailer flag bits");
             input.integerRT = (flags & 1u) != 0;
+            // Bits 4 to 7 hold the RT0 write mask; 0 keeps the default all-channel mask.
+            input.writeMask = flags >> 4;
+            if (input.writeMask == 0 || input.writeMask == D3D12_COLOR_WRITE_ENABLE_ALL)
+                input.writeMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            else if (input.writeMask != 0x3 && input.writeMask != 0xC)
+                throw std::runtime_error("Case trailer write-mask nibble must be 0, 0x3, 0xC or 0xF");
             if (file.peek() != std::char_traits<char>::eof()) {
                 input.nanMask.resize(64);
                 file.read(reinterpret_cast<char*>(input.nanMask.data()),

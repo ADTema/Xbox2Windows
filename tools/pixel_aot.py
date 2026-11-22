@@ -385,7 +385,7 @@ def int_operand(token, scalar, vector, pending, sample_pending, *, signed):
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
-          second_texture_offset=None, integer_export=False):
+          second_texture_offset=None, integer_export=False, return_write_mask=False):
     """Track descriptor provenance, interpolation and packed or uncompressed exports."""
     if (texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105
             or len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
@@ -420,6 +420,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     sample_dest = set()
     exported = False
     ended = False
+    channel_mask = None
     for i, line in enumerate(instructions):
         def match(pattern):
             return re.fullmatch(pattern, line)
@@ -722,6 +723,34 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             args = [f"export16({v})" for pair in pairs for v in pair]
             lines.append(f"    return float4({', '.join(args)});")
             exported = True
+            channel_mask = 0xF
+        elif m := match(r"exp mrt0,? (v\d+), \1, off, off done compr vm"):
+            # EN=0x3: the high packed pair is disabled. LLVM 15 prints only normalized pairs, so
+            # the distinguishable compressed masks in disassembly text are 0x3, 0xC and 0xF.
+            if integer_export:
+                raise ValueError("Integer export requires the uncompressed export form")
+            pair = vector[m[1]]
+            if mask != "entry" or exported or not (isinstance(pair, tuple) and len(pair) == 2 and
+                    all(v.startswith(("sample", "alu")) for v in pair)):
+                raise ValueError("Unsupported export")
+            args = [f"export16({v})" for v in pair]
+            lines.append("    // The PSO write mask prevents these writes; the disabled-channel values are immaterial.")
+            lines.append(f"    return float4({', '.join(args)}, 0.0f, 0.0f);")
+            channel_mask = 0x3
+            exported = True
+        elif m := match(r"exp mrt0,? off, off, (v\d+), \1 done compr vm"):
+            # EN=0xC: the low packed pair is disabled.
+            if integer_export:
+                raise ValueError("Integer export requires the uncompressed export form")
+            pair = vector[m[1]]
+            if mask != "entry" or exported or not (isinstance(pair, tuple) and len(pair) == 2 and
+                    all(v.startswith(("sample", "alu")) for v in pair)):
+                raise ValueError("Unsupported export")
+            args = [f"export16({v})" for v in pair]
+            lines.append("    // The PSO write mask prevents these writes; the disabled-channel values are immaterial.")
+            lines.append(f"    return float4(0.0f, 0.0f, {', '.join(args)});")
+            channel_mask = 0xC
+            exported = True
         elif m := match(r"exp mrt0,? (v\d+), (v\d+), (v\d+), (v\d+) done vm"):
             # Four distinct registers of computed or sampled values, exported as raw binary32.
             values = [vector[v] for v in m.groups()]
@@ -731,6 +760,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             args = [f"asuint({v})" for v in values] if integer_export else values
             lines.append(f"    return {'uint4' if integer_export else 'float4'}({', '.join(args)});")
             exported = True
+            channel_mask = 0xF
         elif line == "s_endpgm" and exported:
             ended = True
         else:
@@ -741,7 +771,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
         pos = lines.index(preamble)
         lines[pos:pos] = defs
-    return "\n".join([*lines, "}",""])
+    source = "\n".join([*lines, "}",""])
+    return (source, channel_mask) if return_write_mask else source
 
 
 def main():

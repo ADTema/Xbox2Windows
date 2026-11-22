@@ -156,28 +156,35 @@ def flush_ftz(value):
     return value
 
 
-def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False):
+def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, write_mask=None):
     """Write a renderer case: 256 constant bytes, then 64 expected float4 rows in row-major order.
 
     A single float4 broadcasts to every texel. The optional trailer appends one flags byte, whose
-    bit 0 selects the lossless R32G32B32A32_UINT readback target, followed by 64 per-texel mask
-    bytes whose bit ch accepts a NaN of any sign or payload on that channel. Cases written without
-    integer_rt or nan_mask keep the original 1280-byte format exactly.
+    bit 0 selects the lossless R32G32B32A32_UINT readback target and whose high nibble carries
+    the RT0 channel write mask (0x3, 0xC or 0xF; 0 keeps the default all channels), followed by
+    64 per-texel mask bytes whose bit ch accepts a NaN of any sign or payload on that channel.
+    Cases written without integer_rt, nan_mask or write_mask keep the original 1280-byte format
+    exactly.
     """
+    if write_mask is not None:
+        if write_mask not in (0x3, 0xC, 0xF):
+            raise ValueError("The RT0 write mask must be 0x3, 0xC or 0xF")
+        if integer_rt:
+            raise ValueError("An integer readback target cannot combine with an RT0 write mask")
     rows = [pixels] * 64 if len(pixels) == 4 and not isinstance(pixels[0], (list, tuple)) else list(pixels)
     if len(rows) != 64 or any(len(row) != 4 for row in rows):
         raise ValueError("A case needs 64 float4 expectations")
     data = bytearray(bytes(constants))
     for row in rows:
         data += struct.pack("<4f", *row)
-    if integer_rt or nan_mask is not None:
+    if integer_rt or nan_mask is not None or write_mask is not None:
         if isinstance(nan_mask, int):
             nan_mask = bytes([nan_mask]) * 64
         elif nan_mask is None:
             nan_mask = bytes(64)
         elif len(nan_mask) != 64:
             raise ValueError("The NaN-class mask needs exactly 64 texel bytes")
-        data.append(1 if integer_rt else 0)
+        data.append((write_mask << 4 if write_mask is not None else 0) | (1 if integer_rt else 0))
         data += nan_mask
     Path(path).write_bytes(data)
     return Path(path)
@@ -257,6 +264,11 @@ def translate(instructions):
     return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64)
 
 
+def translate_masked(instructions):
+    """Lower with return_write_mask=True, returning (source, 4-bit RT0 channel mask)."""
+    return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, return_write_mask=True)
+
+
 def with_constants(body):
     """Load constant words 3 to 6 into s44 to s47, then run body on the sample in v12 to v15."""
     program = assembly(False)
@@ -316,6 +328,18 @@ def uncompressed_export(body):
     program = with_constants(body)
     pos = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
     program[pos:] = ["exp mrt0 v12, v13, v14, v15 done vm", "s_endpgm"]
+    return program
+
+
+def compr_export(body, mask):
+    """Run body on the sample, pack v12 to v15 into v16 and v17, then export with a compressed enable mask."""
+    program = with_constants(body)
+    pos = program.index("exp mrt0 v16, v16, v17, v17 done compr vm")
+    program[pos:] = [{
+        0x3: "exp mrt0 v16, v16, off, off done compr vm",
+        0xC: "exp mrt0 off, off, v17, v17 done compr vm",
+        0xF: "exp mrt0 v16, v16, v17, v17 done compr vm",
+    }[mask], "s_endpgm"]
     return program
 
 
@@ -1356,6 +1380,29 @@ def check_controls(directory):
     must_reject(translate, program[:export] + ["exp mrt0 v12, v12, v13, v14 done vm"] + program[export+1:])
     must_reject(translate, program[:export+1] + ["v_mov_b32_e32 v20, 1.0"] + program[export+1:])
 
+    # Compressed exports with a partial enable mask still return float4; the disabled channels'
+    # zeros are unwritten through the pipeline's RenderTargetWriteMask, which the caller derives
+    # from the mask reported by return_write_mask. EN=0, non-normalized operand text and off in
+    # the uncompressed form are refused, as is a partial mask combined with an integer export.
+    sub_body = [f"v_sub_f32_e64 v{12 + i}, s{44 + i}, 0" for i in range(4)]
+    assert translate_masked(uncompressed_export(sub_body))[1] == 0xF
+    for mask in (0x3, 0xC, 0xF):
+        masked = compr_export(sub_body, mask)
+        modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in masked]
+        assert translate(modern) == translate(masked)
+        assert translate_masked(masked)[1] == mask
+    partial = compr_export(sub_body, 0x3)
+    must_reject(lower, partial, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True)
+    export = partial.index("exp mrt0 v16, v16, off, off done compr vm")
+    for bad in (
+        "exp mrt0 off, off, off, off done compr vm",  # EN=0
+        "exp mrt0 v16, v16, v17, off done compr vm",  # non-normalized pair text
+        "exp mrt0 v16, off, off, off done compr vm",  # a 0x1 half pair only exists normalized
+        "exp mrt0 off, off, v17, off done compr vm",  # a 0x4 half pair only exists normalized
+        "exp mrt0 v12, off, v14, v15 done vm",        # off inside the uncompressed form
+    ):
+        must_reject(translate, partial[:export] + [bad] + partial[export+1:])
+
     # The literal of v_fmaak_f32 is its last operand and that of v_fmamk_f32 its second; a register there is refused.
     body = translate(with_constants(LITERAL_FMA_BODY)).split("float4 main", 1)[1]
     assert body.count("mad(") == 4 and "asfloat(1048576000u)" in body, body
@@ -1619,6 +1666,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
+    sub_body = [f"v_sub_f32_e64 v{12 + i}, s{44 + i}, 0" for i in range(4)]
+    fixtures.extend((compr_export(sub_body, mask), translate) for mask in (0x3, 0xC, 0xF))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -1785,6 +1834,45 @@ def check_integer_readback_draw(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("A corrupted expected word escaped the integer readback")
+
+
+# Channels disabled by a partial RT0 write mask keep this clear color: finite, exact in binary32
+# and binary16, and distinct from every enabled-channel expectation of the mask checks.
+SENTINEL = (-1.0, 2.0, -3.0, 4.0)
+
+
+def check_exp_mask_draw(directory, compiler, renderer, backend):
+    """Draw compressed exports whose enable mask disables one packed channel pair."""
+    source = directory / "exp_mask.hlsl"
+    shader = directory / "exp_mask.cso"
+    case = directory / "exp_mask.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    values = (0.5, 1.5, -2.5, 3.5)
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, *values)
+    body = [f"v_sub_f32_e64 v{12 + i}, s{44 + i}, 0" for i in range(4)]
+    expected = tuple(map(half_rtz, values))
+    for mask in (0x3, 0xC):
+        program = compr_export(body, mask)
+        assert translate_masked(program)[1] == mask
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        pixels = (*expected[:2], *SENTINEL[2:]) if mask == 0x3 else (*SENTINEL[:2], *expected[2:])
+        write_case(case, constants, pixels, write_mask=mask)
+        subprocess.run(draw, check=True)
+    # Both negative controls use the EN=0x3 shader. Under an all-channel write mask the pipeline
+    # writes the immaterial zeros into the disabled channels, so the sentinel-expecting reference
+    # must fail on every backend.
+    source.write_text(translate(compr_export(body, 0x3)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    write_case(case, constants, (*expected[:2], *SENTINEL[2:]), write_mask=0xF)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("An all-channel write mask accepted the immaterial disabled-channel zeros")
+    write_case(case, constants, (expected[0] + 0.25, expected[1], *SENTINEL[2:]), write_mask=0x3)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A wrong enabled-channel reference escaped detection")
 
 
 def check_render(directory, compiler, renderer, backend):
@@ -1955,6 +2043,7 @@ def check_render(directory, compiler, renderer, backend):
     check_denorm_mode_draw(directory, compiler, renderer, backend)
     check_nan_class_draw(directory, compiler, renderer, backend)
     check_integer_readback_draw(directory, compiler, renderer, backend)
+    check_exp_mask_draw(directory, compiler, renderer, backend)
     return 0
 
 
