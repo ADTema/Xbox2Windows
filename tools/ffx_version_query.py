@@ -228,7 +228,6 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     if parity:
         lines[2] = "bool zero=false, carry=false, overflow=false, parity=false;"
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
-    has_xmm_math = any(i.mnemonic == M.VMOVDQU and i.op1_kind == K.MEMORY for i in body) and any(i.mnemonic == M.VMOVD for i in body)
     sse2_int_ops = {
         M.PADDB, M.PADDW, M.PADDD, M.PADDQ, M.PSUBB, M.PSUBW, M.PSUBD, M.PSUBQ,
         M.PAND, M.PANDN, M.POR, M.PXOR,
@@ -291,9 +290,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         M.VSHUFPS, M.VUNPCKHPS, M.VUNPCKLPS, M.VSHUFPD, M.VUNPCKHPD, M.VUNPCKLPD,
         M.VPSHUFD, M.VPSHUFHW, M.VPSHUFLW, M.VMOVHLPS, M.VMOVLHPS, M.VMOVMSKPS, M.VMOVMSKPD,
         M.VMOVAPS, M.VMOVAPD, M.VMOVDQA, M.VPMOVMSKB, M.VRCPPS, M.VRCPSS, M.VRSQRTPS, M.VRSQRTSS,
-        M.VPSLLDQ, M.VPSRLDQ, M.VPUNPCKHQDQ, M.VPUNPCKLQDQ,
+        M.VPSLLDQ, M.VPUNPCKHQDQ, M.VPUNPCKLQDQ,
     }
     has_wide |= any(i.mnemonic in shuffle_ops for i in body)
+    has_wide |= any(i.mnemonic == M.VMOVDQU and
+                    (i.op0_register in wide or i.op1_register in wide) for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
@@ -301,8 +302,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                      M.VPERM2I128, M.VPERMD, M.VPERMPS, M.VPERMQ, M.VPERMPD)
     has_wide |= any(i.mnemonic in avx2_perm_ops for i in body)
     has_wide |= any(i.mnemonic in sse2_int_ops for i in body)
-    if has_xmm_math:
-        has_wide = False
+    needs_xmm_math = any(i.mnemonic == M.VMOVD or
+                        (i.mnemonic == M.VPADDD and i.op2_kind == K.REGISTER) for i in body)
+    if has_wide and needs_xmm_math:
+        raise ValueError("mixed vector arithmetic and wide descriptor copies are unsupported")
+    has_xmm_math = not has_wide and (needs_xmm_math or any(
+        i.mnemonic in (M.VMOVDQU, M.VPSRLDQ) for i in body
+    ))
     if has_wide:
         lines.append("std::array<uint8_t,32> wide0{}, wide1{}, wide2{};")
     if has_xmm_math:
@@ -1454,16 +1460,20 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             is_rsqrt = op in (M.RSQRTPS, M.VRSQRTPS)
             dst = wide_xmm[i.op0_register]
             src = wide_xmm[i.op1_register]
-            fn = "[](float x) { return 1.0f / std::sqrt(x); }" if is_rsqrt else "[](float x) { return 1.0f / x; }"
-            stmt = f"{{ float s[4], r[4]; memcpy(s, {src}.data(), 16); for(int k=0; k<4; ++k) r[k] = {fn}(s[k]); memcpy({dst}.data(), r, 16); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}"
+            fn = "_mm_rsqrt_ps" if is_rsqrt else "_mm_rcp_ps"
+            stmt = (f"{{ __m128 s; memcpy(&s, {src}.data(), sizeof s); const __m128 r = {fn}(s); "
+                    f"memcpy({dst}.data(), &r, sizeof r); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
         elif op in (M.RCPSS, M.VRCPSS, M.RSQRTSS, M.VRSQRTSS) and has_wide:
             is_vex = i.encoding == EncodingKind.VEX
             is_rsqrt = op in (M.RSQRTSS, M.VRSQRTSS)
             dst = wide_xmm[i.op0_register]
             src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
             src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
-            fn = "[](float x) { return 1.0f / std::sqrt(x); }" if is_rsqrt else "[](float x) { return 1.0f / x; }"
-            stmt = f"{{ float b; memcpy(&b, {src2}.data(), 4); const float r = {fn}(b); std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), 16); memcpy(res.data(), &r, 4); memcpy({dst}.data(), res.data(), 16); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}"
+            fn = "_mm_rsqrt_ss" if is_rsqrt else "_mm_rcp_ss"
+            stmt = (f"{{ __m128 s; memcpy(&s, {src2}.data(), sizeof s); const __m128 r = {fn}(s); "
+                    f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), res.size()); "
+                    f"memcpy(res.data(), &r, sizeof(float)); memcpy({dst}.data(), res.data(), res.size()); "
+                    f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
@@ -1476,13 +1486,14 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}[i.op0_register] + " = {};"
         elif op == M.VZEROUPPER:
             stmt = " ".join(f"memset({v}.data()+16, 0, 16);" for v in wide.values()) if has_wide else ";"
-        elif op == M.VMOVDQU and i.op1_kind == K.MEMORY:
+        elif has_xmm_math and op == M.VMOVDQU and i.op1_kind == K.MEMORY and i.op0_register in xmm:
             stmt = f"{xmm[i.op0_register]} = load<__m128i>({address()});"
-        elif op == M.VPSRLDQ:
+        elif has_xmm_math and op == M.VPSRLDQ and i.op0_register in xmm and i.op1_register in xmm:
             stmt = f"{xmm[i.op0_register]} = _mm_srli_si128({xmm[i.op1_register]}, {i.immediate(2)});"
-        elif op == M.VPADDD:
+        elif (has_xmm_math and op == M.VPADDD
+              and all(reg in xmm for reg in (i.op0_register, i.op1_register, i.op2_register))):
             stmt = f"{xmm[i.op0_register]} = _mm_add_epi32({xmm[i.op1_register]}, {xmm[i.op2_register]});"
-        elif op == M.VMOVD and i.op1_register in xmm:
+        elif has_xmm_math and op == M.VMOVD and i.op1_register in xmm:
             stmt = write(f"_mm_cvtsi128_si32({xmm[i.op1_register]})")
         elif op == M.XCHG and i.op_count == 2 and i.op0_kind == i.op1_kind == K.REGISTER:
             # Both values are read before either write; 32-bit forms zero-extend both registers, so

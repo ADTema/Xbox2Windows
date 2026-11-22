@@ -1,11 +1,11 @@
 """Compare native and translated shuffle, unpacking, and vector move instructions."""
 import ctypes
-import math
 from pathlib import Path
 import struct
 import sys
 
 import pefile
+from iced_x86 import Decoder
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_leaf_aot import export_rva
@@ -56,6 +56,20 @@ def aligned_buffer(data_bytes):
 
 
 def check(native_path, lifted_path):
+    # A legacy XMM load without VMOVD still needs an XMM declaration.
+    old_load = list(Decoder(64, bytes.fromhex("c5 fa 6f 01 31 c0 c3")))
+    source = lower(old_load, [], {}, {}, {})
+    assert "__m128i xmm0" in source and "xmm0 = load<__m128i>" in source, source
+
+    # Aligned memory moves require evidence that this profile does not have.
+    for raw in ("66 0f 28 01 c3", "c5 f9 7f 01 c3"):
+        try:
+            lower(list(Decoder(64, bytes.fromhex(raw))), [], {}, {}, {})
+        except ValueError as error:
+            assert "unsupported" in str(error), error
+        else:
+            raise AssertionError(f"accepted aligned memory move {raw}")
+
     native, lifted = load_lib(native_path), load_lib(lifted_path)
 
     sentinel_a = b"\x5a" * 16
@@ -66,10 +80,9 @@ def check(native_path, lifted_path):
     p3 = struct.pack("<4I", 0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00) + sentinel_a
     p4 = struct.pack("<4I", 0x80808080, 0x01010101, 0x8f8f8f8f, 0x00000000) + sentinel_b
 
-    patterns = [(p1, p2), (p3, p4), (p1, p3), (p2, p4)]
-
-    rcp_rsqrt_ops = {"rcpps_op", "rcpss_op", "rsqrtps_op", "rsqrtss_op",
-                     "vrcpps_op", "vrcpss_op", "vrsqrtps_op", "vrsqrtss_op"}
+    p5 = struct.pack("<4I", 0x00000001, 0x80000001, 0x00000000, 0x80000000) + sentinel_a
+    p6 = struct.pack("<4I", 0x80000001, 0x7f800000, 0xff800000, 0x7fc12345) + sentinel_b
+    patterns = [(p1, p2), (p3, p4), (p1, p3), (p2, p4), (p5, p6), (p6, p5)]
 
     mask_ops = {"movmskps_op", "movmskpd_op", "pmovmskb_op",
                 "vmovmskps_op", "vmovmskpd_op", "vpmovmskb_op"}
@@ -92,18 +105,6 @@ def check(native_path, lifted_path):
                 res_l = ctypes.string_at(ptr_out_l, 4)
                 if res_n != res_l:
                     raise AssertionError(f"{name}: native mask {res_n.hex()} != lifted {res_l.hex()}")
-            elif name in rcp_rsqrt_ops:
-                res_n = ctypes.string_at(ptr_out_n, 32)
-                res_l = ctypes.string_at(ptr_out_l, 32)
-                fn_floats_n = struct.unpack("<4f", res_n[:16])
-                fn_floats_l = struct.unpack("<4f", res_l[:16])
-                for fn, fl in zip(fn_floats_n, fn_floats_l):
-                    if math.isnan(fn) and math.isnan(fl):
-                        continue
-                    if not math.isclose(fn, fl, rel_tol=0.01, abs_tol=1e-4):
-                        raise AssertionError(f"{name}: approx mismatch native {fn} != lifted {fl}")
-                if res_n[16:32] != res_l[16:32]:
-                    raise AssertionError(f"{name}: high vector bits mismatch native {res_n[16:32].hex()} != lifted {res_l[16:32].hex()}")
             else:
                 res_n = ctypes.string_at(ptr_out_n, 32)
                 res_l = ctypes.string_at(ptr_out_l, 32)
@@ -129,9 +130,6 @@ def check(native_path, lifted_path):
         if name in mask_ops:
             if ctypes.string_at(ptr_out_n, 4) != ctypes.string_at(ptr_out_l, 4):
                 raise AssertionError(f"{name}: aliased mask mismatch")
-        elif name in rcp_rsqrt_ops:
-            if ctypes.string_at(ptr_out_n, 32)[16:32] != ctypes.string_at(ptr_out_l, 32)[16:32]:
-                raise AssertionError(f"{name}: aliased high vector mismatch")
         else:
             if ctypes.string_at(ptr_out_n, 32) != ctypes.string_at(ptr_out_l, 32):
                 raise AssertionError(f"{name}: aliased 256-bit vector mismatch")
