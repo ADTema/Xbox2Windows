@@ -64,6 +64,65 @@ def api_sets(system):
     return _parsed_api_sets(str(schema), _file_digest(schema))
 
 
+def known_dlls():
+    """Return the section names in the host's \\KnownDlls object directory.
+
+    The loader maps these names from System32 before it searches the application directory. The
+    directory can name more modules than the KnownDLLs registry value. ntdll.dll is mapped into every
+    process before any import is resolved, so a package copy never replaces it either.
+    """
+    from ctypes import wintypes
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [("Length", wintypes.ULONG), ("RootDirectory", wintypes.HANDLE),
+                    ("ObjectName", ctypes.POINTER(UnicodeString)), ("Attributes", wintypes.ULONG),
+                    ("SecurityDescriptor", ctypes.c_void_p), ("SecurityQualityOfService", ctypes.c_void_p)]
+
+    class DirectoryEntry(ctypes.Structure):
+        _fields_ = [("Name", UnicodeString), ("TypeName", UnicodeString)]
+
+    def text(value):
+        return ctypes.wstring_at(value.Buffer, value.Length // 2)
+
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtOpenDirectoryObject.restype = ntdll.NtQueryDirectoryObject.restype = ctypes.c_long
+    ntdll.NtOpenDirectoryObject.argtypes = [ctypes.POINTER(wintypes.HANDLE), wintypes.ULONG,
+                                            ctypes.POINTER(ObjectAttributes)]
+    ntdll.NtQueryDirectoryObject.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG, wintypes.BOOLEAN,
+                                             wintypes.BOOLEAN, ctypes.POINTER(wintypes.ULONG),
+                                             ctypes.POINTER(wintypes.ULONG)]
+    path = ctypes.create_unicode_buffer("\\KnownDlls")
+    name = UnicodeString(2 * (len(path) - 1), 2 * len(path), ctypes.cast(path, ctypes.c_void_p))
+    attributes = ObjectAttributes(ctypes.sizeof(ObjectAttributes), None, ctypes.pointer(name),
+                                  0x40, None, None)  # OBJ_CASE_INSENSITIVE
+    handle = wintypes.HANDLE()
+    status = ntdll.NtOpenDirectoryObject(ctypes.byref(handle), 1, ctypes.byref(attributes))  # DIRECTORY_QUERY
+    if status < 0:
+        raise OSError(f"NtOpenDirectoryObject(\\KnownDlls) failed with NTSTATUS {status & 0xFFFFFFFF:#010x}")
+    names = {"ntdll.dll"}
+    try:
+        buffer = ctypes.create_string_buffer(4096)
+        context, returned = wintypes.ULONG(), wintypes.ULONG()
+        first = True
+        while True:
+            status = ntdll.NtQueryDirectoryObject(handle, buffer, len(buffer), True, first,
+                                                  ctypes.byref(context), ctypes.byref(returned))
+            first = False
+            if status & 0xFFFFFFFF == 0x8000001A:  # STATUS_NO_MORE_ENTRIES
+                break
+            if status < 0:
+                raise OSError(f"NtQueryDirectoryObject(\\KnownDlls) failed with NTSTATUS {status & 0xFFFFFFFF:#010x}")
+            entry = DirectoryEntry.from_buffer(buffer)
+            if text(entry.TypeName) == "Section":
+                names.add(text(entry.Name).lower())
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+    return frozenset(names)
+
+
 def exports(pe):
     """Read the export directory and its tables as stored.
 
@@ -101,17 +160,21 @@ def export_keys(rows):
     return keys
 
 
-def resolve_desktop(dll, symbol, importer, contracts, system_exports, package_exports=None):
+def resolve_desktop(dll, symbol, importer, contracts, system_exports, package_exports=None, known_dlls=()):
     """Follow export forwarders without loading any DLL.
 
     package_exports, when given, maps a plain module name to its package paths and export table.
-    Package images then take precedence over System32. API-set contracts always select System32 hosts.
+    Package images then take precedence over System32. API-set contracts always select System32 hosts,
+    and so do known_dlls: the loader maps those names from System32 before it searches the
+    application directory.
     """
     chain = []
     seen = set()
     while True:
         aliases = contracts.get(dll.rpartition("-")[0]) if dll.startswith(("api-", "ext-")) else None
-        packaged, table = package_exports(dll) if package_exports and aliases is None else ((), None)
+        known = aliases is None and dll in known_dlls
+        packaged, table = (package_exports(dll) if package_exports and aliases is None and not known
+                           else ((), None))
         if len(packaged) == 1:
             host = packaged[0]
         else:
@@ -119,6 +182,8 @@ def resolve_desktop(dll, symbol, importer, contracts, system_exports, package_ex
         step = dict(dll=dll, provider=host or None, symbol=symbol)
         if package_exports:
             step["package"] = bool(packaged)
+            if known:
+                step["known_dll"] = True
         chain.append(step)
         if len(packaged) > 1:
             step["provider"] = None
@@ -261,6 +326,7 @@ def scan(root, *, extra_image=None, system=None):
     if process.value != 0 or native.value != 0x8664:
         raise ValueError("Use a native x64 Windows Python for the desktop comparison")
     contracts = api_sets(system)
+    known = known_dlls()
     system_images = {p.name.lower(): p for p in system.glob("*.dll")}
 
     @cache
@@ -309,14 +375,16 @@ def scan(root, *, extra_image=None, system=None):
             "bundle_exports_in": sorted(p for p, keys in bundled[dll] if symbol in keys),
             "desktop_provider": first["provider"], "desktop_export": status, "desktop_candidate": candidate,
             "desktop_resolution": resolution,
-            # Follow forwarders in a packaged provider. Absent when the package lacks the module.
+            # A KnownDLL forwarder may lead into the package even without a same-name package file.
             "package_resolution": resolve_desktop(dll, symbol, importer, contracts, system_exports,
-                                                  package_exports) if bundled[dll] else None,
+                                                  package_exports, known)
+                                  if bundled[dll] or (dll in known and "forwarder" in first) else None,
         })
     # A packaged forwarder satisfies an edge only when its chain reaches a terminal export.
     unresolved = [r for r in rows if r["desktop_resolution"]["status"] != "export_present"
-                  and not (r["bundle_exports_in"] and r["package_resolution"]["status"]
-                           in {"export_present", "ambiguous_package_basename"})]
+                  and not (r["package_resolution"] and
+                           (r["package_resolution"]["status"] == "export_present" or
+                            (r["bundle_exports_in"] and r["package_resolution"]["status"] == "ambiguous_package_basename")))]
     return {
         "schema": 1, "host_windows_build": sys.getwindowsversion().build, "pefile": pefile.__version__,
         "behavior": "Scarlett behavior unverified for every import. Static export matches include forwarders.",
@@ -336,7 +404,7 @@ def scan(root, *, extra_image=None, system=None):
         },
         "unresolved_edges": [dict(r, desktop_experiment=EXPERIMENTS.get((r["dll"], r["symbol"])))
                              for r in unresolved],
-        "images": images, "imports": rows,
+        "known_dlls": sorted(known), "images": images, "imports": rows,
     }
 
 
