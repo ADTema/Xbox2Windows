@@ -132,11 +132,33 @@ def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):
 
 PREAMBLE = """Texture2D<float4> tex : register(t0);
 SamplerState samp : register(s0);
+// v_cmp_class_f32: the ten binary32 classes of LLVM SIInstrFlags::ClassFlags, from the raw encoding:
+// signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
+uint class32(float value) {
+    uint bits = asuint(value);
+    uint magnitude = bits & 0x7fffffffu;
+    bool negative = bits >= 0x80000000u;
+    if (magnitude > 0x7f800000u) return (bits & 0x00400000u) != 0u ? 0x2u : 0x1u;
+    if (magnitude == 0x7f800000u) return negative ? 0x4u : 0x200u;
+    if (magnitude >= 0x00800000u) return negative ? 0x8u : 0x100u;
+    if (magnitude != 0u) return negative ? 0x10u : 0x80u;
+    return negative ? 0x20u : 0x40u;
+}
 // v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
 // D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
 float fract32(float value) {
     float f = frac(value);
     return f >= 1.0f ? asfloat(0x3f7fffffu) : f;
+}
+// v_mad_f32 and v_mac_f32 round the product before the add and do not support binary32 denormals.
+// Flush each operand, the product and the sum to signed zero; NaN fails the comparison and propagates.
+float ftz32(float value) {
+    return abs(value) < asfloat(0x00800000u) ? asfloat(asuint(value) & 0x80000000u) : value;
+}
+float mad32(float a, float b, float c) {
+    precise float product = ftz32(ftz32(a) * ftz32(b));
+    precise float sum = product + ftz32(c);
+    return ftz32(sum);
 }
 // v_frexp_mant_f32: normalized significand in (-1, -0.5] U [0.5, 1), preserving +/-0, +/-Inf and NaN.
 float frexp_mant32(float value) {
@@ -209,6 +231,8 @@ def registers(first, last, count):
     return range(first, last+1)
 
 
+HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
+
 ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
     "sqrt": (1, "sqrt({0})"), "rsq": (1, "rsqrt({0})"),
@@ -219,6 +243,7 @@ ALU = {
     "subrev": (2, "({1} - {0})"),
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
+    "mad": (3, "mad32({0}, {1}, {2})"), "mac": (3, "mad32({0}, {1}, {2})"),
 }
 # N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
@@ -230,6 +255,10 @@ COMPARE = {
     "ngt": "({0} <= {1} || isnan({0}) || isnan({1}))", "nle": "({0} > {1} || isnan({0}) || isnan({1}))",
     "neq": "!({0} == {1})", "nlt": "({0} >= {1} || isnan({0}) || isnan({1}))",
 }
+INT_COMPARE = {
+    "f": "false", "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}",
+    "gt": "{0} > {1}", "ne": "{0} != {1}", "ge": "{0} >= {1}", "t": "true",
+}
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
     "and": "uint2({0} & {2}, {1} & {3})",
@@ -237,6 +266,9 @@ SALU_BIT64 = {
     "xor": "uint2({0} ^ {2}, {1} ^ {3})",
     "andn2": "uint2({0} & ~{2}, {1} & ~{3})",
     "orn2": "uint2({0} | ~{2}, {1} | ~{3})",
+    "nand": "uint2(~({0} & {2}), ~({1} & {3}))",
+    "nor": "uint2(~({0} | {2}), ~({1} | {3}))",
+    "xnor": "uint2(~({0} ^ {2}), ~({1} ^ {3}))",
 }
 SALU_HELPERS = {
     "s_lshl_b64": (
@@ -363,23 +395,26 @@ def lane_mask(token):
     return [token]
 
 
-def fp_operand(token, scalar, vector, pending, sample_pending):
+def fp_operand(token, scalar, vector, pending, sample_pending, *, quad_values: dict[str, bool] | None = None):
     if re.fullmatch(r"-\d+", token):
         return f"asfloat({int(token) & 0xffffffff}u)"
     if token.startswith("-"):
-        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_pending) + ")"
+        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_pending, quad_values=quad_values) + ")"
     if absolute := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
         inner = absolute.group(1) or absolute.group(2)
-        return f"abs({fp_operand(inner, scalar, vector, pending, sample_pending)})"
+        return f"abs({fp_operand(inner, scalar, vector, pending, sample_pending, quad_values=quad_values)})"
     if re.fullmatch(r"[vs]\d+", token):
         if token in pending:
             raise ValueError("Constant read before load completion")
         value = (vector if token.startswith("v") else scalar)[token]
+        if quad_values is not None and token.startswith("v") and value not in quad_values:
+            raise ValueError("Operand lacks a helper-lane definition")
         if isinstance(value, int):
             return f"asfloat({value}u)"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return f"asfloat({value[1]})"
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not (value.startswith(("sample", "alu", "params["))
+                or (quad_values is not None and value in quad_values)):
             raise ValueError("Expected a numeric register")
         if sample_pending and value.startswith("sample"):
             raise ValueError("Sample used before vmcnt wait")
@@ -412,6 +447,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Invalid scalar inputs or sampler descriptor words")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
     vector = {"v0": "bary_i", "v1": "bary_j"}
+    # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
+    # The boolean records whether the quad value depends on interpolated coordinates.
+    quad_values = {"uv.x": True, "uv.y": True}
     lines = [PREAMBLE]
     if constant_descriptor is not None:
         if constant_descriptor < 0 or constant_descriptor % 4:
@@ -444,6 +482,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if exported and line != "s_endpgm":
             raise ValueError("Unexpected instruction after color export")
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
+            continue
+        # Scheduling hints with no effect on results. Each operand is limited to the width
+        # of its RDNA 2 field: clause length minus one, wave priority and sleep duration.
+        if m := match(r"(s_clause|s_setprio|s_sleep) (0x[0-9a-f]+|\d+)"):
+            if int(m[2], 0) > HINT_LIMITS[m[1]]:
+                raise ValueError(f"Invalid {m[1]} operand")
             continue
         if line == "s_waitcnt lgkmcnt(0)":
             pending.clear()
@@ -544,14 +588,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dst):
                 scalar[f"s{n}"] = (bindings[offset], j)
                 pending.add(f"s{n}")
-        elif m := match(r"(?:(s_load_dwordx4|s_buffer_load_dwordx4) s\[(\d+):(\d+)\]|s_buffer_load_dword s(\d+))"
+        elif m := match(r"(?:(s_load_dwordx4|s_buffer_load_dwordx[24]) s\[(\d+):(\d+)\]|s_buffer_load_dword s(\d+))"
                         r", s\[(\d+):(\d+)\], (0x[0-9a-f]+|null)"):
             op, first, last, single, low, high, imm = m.groups()
             offset = 0 if imm == "null" else int(imm, 16)
             descriptor = op == "s_load_dwordx4"
-            if single is not None and (int(single) > 105 or int(low) % 4 or int(high) > 105):
+            width = 1 if single is not None else 2 if op == "s_buffer_load_dwordx2" else 4
+            if single is not None:
+                first = last = single
+            # LLVM names a 64-bit scalar destination only as an even-aligned pair.
+            if width < 4 and (int(last) > 105 or int(first) % width or int(low) % 4 or int(high) > 105):
                 raise ValueError("Invalid scalar buffer registers")
-            dst = registers(single, single, 1) if single is not None else registers(first, last, 4)
+            dst = registers(first, last, width)
             base = [f"s{n}" for n in registers(low, high, 2 if descriptor else 4)]
             expected = ["texture_ptr", 0] if descriptor else [("cbv", n) for n in range(4)]
             if constant_descriptor is None or pending.intersection(base) or [scalar.get(r) for r in base] != expected:
@@ -610,7 +658,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
             uv = [vector[f"v{n}"] for n in coords]
-            if any(v not in ("uv.x", "uv.y") for v in uv):
+            if any(v not in quad_values for v in uv):
                 raise ValueError("Unsupported texture coordinate")
             lines.append(f"    float4 sample{i} = {texture}.Sample(samp, float2({', '.join(uv)}));")
             samples += 1
@@ -638,22 +686,77 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_pending)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
-        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
-            if op == "fmac":
+            if op in ("fmac", "mac"):
                 tokens.append(dst)
             arity, template = ALU[op]
-            if mask != "entry" or len(tokens) != arity:
+            quad = mask == "quad"
+            if (mask not in ("entry", "quad") or len(tokens) != arity
+                    or (quad and (samples or second_texture_offset is not None
+                                  or op not in ("add", "fma", "mul_legacy")))):
                 raise ValueError("Invalid arithmetic operation")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            if quad and (clamp or any("|" in t or "abs(" in t for t in tokens)):
+                raise ValueError("Whole-quad coordinate arithmetic must be affine")
+            provenance = quad_values if quad else None
+            values = [fp_operand(t, scalar, vector, pending, sample_pending, quad_values=provenance) for t in tokens]
+            if quad:
+                varying = [quad_values.get(vector.get(t.lstrip("-"), ""), False) for t in tokens]
+                if op != "add" and all(varying[:2]):
+                    raise ValueError("Whole-quad coordinate arithmetic must be affine")
+                quad_values[f"alu{i}"] = any(varying)
             expression = template.format(*values)
             if clamp:
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            dst, value, classes = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+                bits = f"{int(classes, 0) & 0xffffffff}u"
+            elif re.fullmatch(r"[vs]\d+", classes):
+                bits = f"asuint({fp_operand(classes, scalar, vector, pending, sample_pending)})"
+            else:
+                raise ValueError("Unsupported class mask")
+            operand = fp_operand(value, scalar, vector, pending, sample_pending)
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
+
+        elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+                      for t in tokens]
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({op}({values[0]}, {values[1]}));")
+        elif m := match(r"v_(min3|max3|med3)_(i32|u32)(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+                      for t in tokens]
+            if op == "med3":
+                vec_type = "int3" if kind == "i32" else "uint3"
+                lines.append(f"    {vec_type} med{i} = {vec_type}({values[0]}, {values[1]}, {values[2]});")
+                expression = f"max(min(med{i}.x, med{i}.y), min(max(med{i}.x, med{i}.y), med{i}.z))"
+            else:
+                fn = op[:-1]
+                expression = f"{fn}({fn}({values[0]}, {values[1]}), {values[2]})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({expression});")
+
         elif m := match(r"v_ldexp_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+?)( clamp)?"):
             dst, src0, src1, clamp = m.groups()
             if mask != "entry":
@@ -676,6 +779,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+        elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32)(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+                      for t in tokens]
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {INT_COMPARE[op].format(*values)};")
         elif m := match(rf"v_cndmask_b32(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+), {LANE_MASK}"):
             dst, unset, chosen, source = m.groups()
             regs = lane_mask(source)
