@@ -489,6 +489,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fourth_arg>" "$<TARGET_FILE:cpu_fourth_arg_lifted>"
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_fourth_arg_lifted.cpp"
         "$<TARGET_FILE:cpu_narrow>" "$<TARGET_FILE:cpu_narrow_lifted>")
+    cpu_asm_fixture(cpu_frame frame)
+    # frame_bound is translated and compiled but never called.
+    cpu_translation(cpu_frame cpu_switch_aot
+        push_loop,spill_widths,home_save,home_args,two_paths,home_spill,loop_counter,realloc_slot,frame_bound)
+    add_test(NAME cpu_aot_stack_frames COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/frame_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_frame>" "$<TARGET_FILE:cpu_frame_lifted>"
+        "${CMAKE_CURRENT_BINARY_DIR}/cpu_frame_lifted.cpp")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)

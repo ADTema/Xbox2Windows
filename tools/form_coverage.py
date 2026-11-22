@@ -67,6 +67,7 @@ CPU_FIXTURES = {
     "call_pair": "cpu_aot_call_pair",
     "movbe": "cpu_aot_movbe",
     "bmi1": "cpu_aot_bmi1",
+    "frame": "cpu_aot_stack_frames",
     "rotates_shifts": "cpu_aot_rotates_shifts",
     "register_probe": None,  # measurement harness
     "two_imports": None,     # mapped and run unchanged by pe_map
