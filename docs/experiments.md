@@ -947,9 +947,13 @@ Eight mutants of the registry each fail the test:
 - reversing the shader view's buffers;
 - skipping the `era_query` registration.
 
-Measured at commit `d52905d`, Windows 11 build 26300, debug layer unavailable:
-- `gpu_alias_registry_warp` passed on WARP 10.0.26100.9818, with attach reporting `0x80070057` for the interior block and mismatches 0. It passed 5 of 5 repeated runs.
-- `gpu_alias_registry_hardware` passed on an NVIDIA GeForce RTX 3070 Laptop GPU (driver 32.0.16.1088), with the same results. It passed 10 of 10 repeated runs, and each of the eight mutants also fails there.
+Measured at commit `f847956`, Windows 11 build 26300, debug layer enabled:
+- `gpu_alias_registry_warp` passed on WARP 10.0.26100.9818, with attach reporting `0x80070057` for the interior block, mismatches 0 and `debug_errors=0`. It passed 100 of 100 repeated runs.
+- `gpu_alias_registry_hardware` passed on an NVIDIA GeForce RTX 3070 Laptop GPU (driver 32.0.16.1088), with the same results. It passed 200 of 200 repeated runs.
+- The full suite passed: 148 tests, with 3 capability skips (`bvh_wave64_hardware`, `bvh_wave64_warp`, `wave_shuffle_warp`).
+- The stop-at-first-failure mutant failed 20 of 20 runs on each adapter ("two of three aliased"). All eight mutants were first measured at `d52905d`, on the RTX 3070 with the debug layer unavailable.
+
+Before `f847956`, the interior block's search tried only the 256 MB directly below the first allocation. That search found no free block in about 1 of 40 hardware runs, and the test failed in setup ("region below the first allocation").
 
 ### Windows 10 with the app-local Agility SDK and WARP
 
