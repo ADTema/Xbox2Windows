@@ -269,3 +269,8 @@ static inline X87Value x87_sub(X87Value a, X87Value b) {
 }
 // FSUBR: the same subtraction with the operands exchanged.
 static inline X87Value x87_subr(X87Value a, X87Value b) { return x87_sub(b, a); }
+
+// FCHS and FABS change only the sign bit, of every encoding: NaNs stay signaling or quiet, and unnormals
+// and pseudo-denormals keep their bits.
+static inline X87Value x87_chs(X87Value v) { v.se ^= 0x8000; return v; }
+static inline X87Value x87_abs(X87Value v) { v.se &= 0x7fff; return v; }

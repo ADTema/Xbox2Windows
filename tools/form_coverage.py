@@ -47,6 +47,7 @@ CPU_FIXTURES = {
     "x87_mul": "cpu_aot_x87_mul",
     "x87_div": "cpu_aot_x87_div",
     "x87_sub": "cpu_aot_x87_sub",
+    "x87_moves": "cpu_aot_x87_moves",
     "x87_harness": None,  # native x87 entry and exit state for x87_add
     "destroy": "cpu_aot_destroy_contract",
     "create_context": "cpu_aot_context_lifecycle",
