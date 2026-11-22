@@ -364,9 +364,13 @@ def check_pure_python_controls() -> None:
         mock_run.return_value = subprocess.CompletedProcess(
             ["dev", "--compute-pso", "--warp-only"], 0, b'{"warp_pso":"0x00000000"}\n', b""
         )
-        assert rt.check_compute_pso(Path("dev"), signed_synth, warp_only=True) == {"warp_pso": "0x00000000"}
+        cleared_inventory = dict(calls={}, declarations=[], metadata_only=[])
+        warp_pso = rt.check_compute_pso(Path("dev"), signed_synth, warp_only=True,
+                                        intrinsics=cleared_inventory)
+        assert warp_pso["warp_pso"] == "0x00000000", warp_pso
+        assert warp_pso["gate"]["verdict"] == "ALLOW", warp_pso
         assert mock_run.call_args[0][0] == ["dev", "--compute-pso", "--warp-only"]
-        rt.check_compute_pso(Path("dev"), signed_synth, warp_only=False)
+        rt.check_compute_pso(Path("dev"), signed_synth, warp_only=False, intrinsics=cleared_inventory)
         assert mock_run.call_args[0][0] == ["dev", "--compute-pso"]
 
         # Hardware backend probe helper: exit 5 ("no hardware adapter") maps to None (skip 77),
@@ -374,20 +378,26 @@ def check_pure_python_controls() -> None:
         mock_run.return_value = subprocess.CompletedProcess(
             ["dev", "--compute-pso"], 0, b'{"hardware_pso":"0x00000000"}\n', b""
         )
-        assert _probe_compute_pso(Path("dev"), signed_synth, backend="hardware") == {"hardware_pso": "0x00000000"}
+        cleared = dict(calls={}, declarations=[], metadata_only=[])
+        hardware_result = _probe_compute_pso(Path("dev"), signed_synth, backend="hardware",
+                                             intrinsics=cleared)
+        assert hardware_result["hardware_pso"] == "0x00000000", hardware_result
+        assert hardware_result["gate"]["verdict"] == "ALLOW", hardware_result
+        assert hardware_result["gate"]["submitted"] is True, hardware_result
         assert mock_run.call_args[0][0] == ["dev", "--compute-pso"]
 
         mock_run.side_effect = subprocess.CalledProcessError(5, ["dev", "--compute-pso"])
-        assert _probe_compute_pso(Path("dev"), signed_synth, backend="hardware") is None
+        assert _probe_compute_pso(Path("dev"), signed_synth, backend="hardware",
+                                  intrinsics=cleared) is None
         try:
-            _probe_compute_pso(Path("dev"), signed_synth, backend="warp")
+            _probe_compute_pso(Path("dev"), signed_synth, backend="warp", intrinsics=cleared)
         except subprocess.CalledProcessError:
             pass
         else:
             raise AssertionError("_probe_compute_pso swallowed exit 5 on warp backend")
         mock_run.side_effect = subprocess.CalledProcessError(6, ["dev", "--compute-pso"])
         try:
-            _probe_compute_pso(Path("dev"), signed_synth, backend="hardware")
+            _probe_compute_pso(Path("dev"), signed_synth, backend="hardware", intrinsics=cleared)
         except subprocess.CalledProcessError:
             pass
         else:
@@ -502,14 +512,19 @@ define void @main() {
         assert decision["verdict"] == gate.ALLOW, (label, decision)
         assert len(stub.batches) == 1, (label, stub.batches)
 
-    # A verified lowering admits the call; the adapter owns that proof and the default table has none.
+    # An adapter status is advisory: a call the module still executes blocks whatever it claims.
     stub = RecordingSubmit()
-    lowered = gate.status_table(["V_ALIGNBYTE_B32"])
-    decision = gate.gate_submission(gate.check_text(called, lowered), called, stub)
-    assert decision["verdict"] == gate.ALLOW, decision
-    assert [entry["builtin"] for entry in decision["resolved"]] == ["V_ALIGNBYTE_B32"], decision
-    assert len(stub.batches) == 1, decision
-    assert gate.check_text(called)["verdict"] == gate.REJECT, "the default table lowered a call"
+    claims_lowered = gate.status_table(["V_ALIGNBYTE_B32"])
+    decision = gate.gate_submission(gate.check_text(called, claims_lowered), called, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert decision["reported_names"] == ["xbox.V_ALIGNBYTE_B32"], decision
+    assert decision["blocking"][0]["advisory"] == gate.LOWERED, decision["blocking"][0]
+    assert "advisory reports LOWERED" in decision["message"], decision["message"]
+    assert stub.batches == [], "an advisory status cleared a call the module still executes"
+    # The same module clears once the call is gone from the instructions.
+    stub = RecordingSubmit()
+    removed = gate.gate_submission(gate.check_text(declared), declared, stub)
+    assert removed["verdict"] == gate.ALLOW and len(stub.batches) == 1, removed
 
     # A metadata string that spells a call is not an instruction: it must not refuse the module.
     spelled_call = '!0 = !{!"call void @xbox.text()"}'
@@ -542,6 +557,23 @@ define void @main() {
         assert allowed["warp_pso"] == "0x00000000", allowed
         assert allowed["gate"]["submitted"] is True, allowed
 
+    # The helper itself is fail closed: no inventory means no probe process at all.
+    with patch.object(rt.subprocess, "run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["dev", "--compute-pso"], 0, b'{"warp_pso":"0x00000000"}\n', b"")
+        no_inventory = rt.check_compute_pso(Path("dev"), synth_dxbc)
+        assert mock_run.call_count == 0, "a module with no inventory started a submission"
+        assert no_inventory["gate"]["verdict"] == gate.NOT_CHECKED, no_inventory
+        assert no_inventory["gate"]["reason"] == "module-not-disassembled", no_inventory
+        assert no_inventory["gate"]["submitted"] is False, no_inventory
+        advisory_only = rt.check_compute_pso(
+            Path("dev"), synth_dxbc,
+            intrinsics=dict(calls={"xbox.BFI": 1}, declarations=[], metadata_only=[]),
+            status_of=gate.status_table(["BFI"]))
+        assert mock_run.call_count == 0, "an advisory status started a submission"
+        assert advisory_only["gate"]["verdict"] == gate.REJECT, advisory_only
+        assert advisory_only["gate"]["blocking"][0]["advisory"] == gate.LOWERED, advisory_only
+
     # A module nobody disassembled must not be submitted, and the decision has to stay visible.
     unchecked = gate.not_checked("module-not-disassembled")
     assert unchecked["verdict"] == gate.NOT_CHECKED, unchecked
@@ -569,17 +601,20 @@ define void @main() {
         assert "warp_pso" not in pso and "hardware_pso" not in pso, pso
         assert "--probe" in ungated.stderr, ungated.stderr
 
-    print("submission gate controls: unresolved call refused with 0 submissions; declared only, "
-          "metadata only, ordinary and adapter-lowered modules submit once; a metadata string that "
-          "spells a call and a ';' inside a metadata string still pass; without --probe the CLI "
-          "records NOT_CHECKED and submits nothing")
+    print("submission gate controls: executable call refused with 0 submissions; declared only, "
+          "metadata only and ordinary modules submit once; an advisory LOWERED status still refuses "
+          "while the call remains and clears once the call is gone; missing inventory starts 0 probe "
+          "processes; a metadata string that spells a call and a ';' inside a metadata string still "
+          "pass; without --probe the CLI records NOT_CHECKED and submits nothing")
     print("pure-python dxil_retarget controls: ok")
 
 
-def _probe_compute_pso(device_probe: Path, blob: bytes, *, backend: str) -> dict | None:
+def _probe_compute_pso(device_probe: Path, blob: bytes, *, backend: str,
+                       intrinsics: dict | None = None) -> dict | None:
     """Run root_device_probe --compute-pso; return None on hardware backend exit 5 (no GPU)."""
     try:
-        return rt.check_compute_pso(device_probe, blob, warp_only=(backend == "warp"))
+        return rt.check_compute_pso(device_probe, blob, warp_only=(backend == "warp"),
+                                    intrinsics=intrinsics)
     except subprocess.CalledProcessError as exc:
         if backend == "hardware" and exc.returncode == 5:
             return None
@@ -680,7 +715,8 @@ def check_validator_fixtures(
             unsigned_pso = None
             if device_probe is not None:
                 # Negative control 4: unsigned (zero-digest) retargeted DXBC must fail CreateComputePipelineState.
-                unsigned_pso = _probe_compute_pso(device_probe, retargeted_blob, backend=backend)
+                unsigned_pso = _probe_compute_pso(device_probe, retargeted_blob, backend=backend,
+                                                  intrinsics=after["ir"]["xbox_intrinsics"])
                 if unsigned_pso is None:
                     print("No compatible D3D12 hardware adapter visible; skipping hardware DXIL retarget check.")
                     return SKIP
@@ -708,7 +744,8 @@ def check_validator_fixtures(
 
                     # Negative control 5: flipping one bit in the digest must fail CreateComputePipelineState.
                     tampered_blob = signed_blob[:4] + bytes([signed_blob[4] ^ 1]) + signed_blob[5:]
-                    tampered_pso = _probe_compute_pso(device_probe, tampered_blob, backend=backend)
+                    tampered_pso = _probe_compute_pso(device_probe, tampered_blob, backend=backend,
+                                                      intrinsics=after["ir"]["xbox_intrinsics"])
                     assert tampered_pso is not None and tampered_pso[pso_key] != "0x00000000", tampered_pso
                     pso_summary = (
                         f"{backend}:unsigned={unsigned_pso[pso_key]} "

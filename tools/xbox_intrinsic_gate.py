@@ -2,12 +2,12 @@
 
 The gate reads the read-only inventory from `probe_roots.xbox_intrinsic_inventory()` and keeps
 the three groups apart on purpose: a symbol a module only declares, or one that only metadata
-mentions, is not a call and does not block submission. What blocks is a call the adapter cannot
-resolve. A refused module never reaches the submission callable.
+mentions, is not a call and does not block submission. What blocks is a call the module still
+executes. A refused module never reaches the submission callable.
 
-The default status table lowers nothing: this repository ships no verified lowering, so an
-unresolved call is refused rather than guessed at. An adapter injects its own `status_of(name)`
-and reports LOWERED only for a builtin whose lowering it validated.
+A lowering counts only when it is visible in the transformed module: the call is gone from the
+instructions, so the inventory no longer reports it. An adapter status table is advisory and
+never clears a call the module still emits.
 """
 
 import argparse
@@ -30,51 +30,61 @@ def default_status_of(name):
 
 
 def status_table(lowered=()):
-    """Build an adapter status table; the caller owns the proof for each name it lowers."""
+    """Build an advisory status table: it reports what an adapter claims, nothing more.
+
+    A lowering counts only when it is visible in the transformed module, as a call that is
+    gone. What an adapter says about a call it still emits cannot clear that call, so this
+    table never reaches the verdict; it only annotates the report.
+    """
     lowered = frozenset(lowered)
 
     def status_of(name):
         if name in lowered:
-            return LOWERED, "verified-by-adapter"
+            return LOWERED, "reported-by-adapter"
         return default_status_of(name)
 
     return status_of
 
 
 def decide(inventory, status_of=None):
-    """Turn a module's inventory into ALLOW or REJECT, naming the calls that block."""
+    """Refuse a module while it still calls xbox.*, whatever any adapter reports.
+
+    Every call blocks. `status_of` is advisory: it fills `advisory` on each blocking entry so a
+    report can show what an adapter claims, and the verdict ignores it.
+    """
     status_of = status_of or default_status_of
-    blocking, resolved = [], []
+    blocking = []
     for symbol in sorted(inventory["calls"]):
         builtin = symbol[len(XBOX_PREFIX):] if symbol.startswith(XBOX_PREFIX) else symbol
-        status, unblocks = status_of(builtin)
-        entry = {"name": symbol, "builtin": builtin, "sites": inventory["calls"][symbol]}
-        if status == LOWERED:
-            resolved.append(entry)
-        else:
-            entry["status"] = status
-            entry["unblocks"] = unblocks
-            blocking.append(entry)
+        advisory, unblocks = status_of(builtin)
+        blocking.append({
+            "name": symbol,
+            "builtin": builtin,
+            "sites": inventory["calls"][symbol],
+            "status": UNRESOLVED,
+            "unblocks": unblocks,
+            "advisory": advisory,
+        })
     verdict = REJECT if blocking else ALLOW
     names = [entry["name"] for entry in blocking]
     if verdict == REJECT:
-        message = f"REJECT: {len(names)} unresolved xbox.* call(s): {', '.join(names)}"
-    elif resolved:
-        message = "ALLOW: verified lowering for " + ", ".join(entry["builtin"] for entry in resolved)
+        message = f"REJECT: {len(names)} executable xbox.* call(s): {', '.join(names)}"
+        claimed = [entry["builtin"] for entry in blocking if entry["advisory"] == LOWERED]
+        if claimed:
+            message += f" (advisory reports LOWERED for {', '.join(claimed)}; the module still calls them)"
     else:
         message = (
-            f"ALLOW: no unresolved xbox.* calls "
+            f"ALLOW: no executable xbox.* calls "
             f"(declarations={len(inventory['declarations'])}, metadata_only={len(inventory['metadata_only'])})"
         )
     return {
         "verdict": verdict,
-        "reason": "unresolved-xbox-calls" if blocking else "no-unresolved-xbox-calls",
+        "reason": "executable-xbox-calls" if blocking else "no-executable-xbox-calls",
         "message": message,
         "calls": inventory["calls"],
         "declarations": inventory["declarations"],
         "metadata_only": inventory["metadata_only"],
         "blocking": blocking,
-        "resolved": resolved,
         "reported_names": names,
         "checked": True,
     }
@@ -96,7 +106,6 @@ def not_checked(reason):
         "declarations": [],
         "metadata_only": [],
         "blocking": [],
-        "resolved": [],
         "reported_names": [],
     }
 
@@ -129,25 +138,20 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command")
     text = sub.add_parser("check-text", help="Gate a module given as disassembly text")
     text.add_argument("path", type=Path, help="Disassembly text file ('-' for standard input)")
-    text.add_argument("--lowered", action="append", default=None,
-                      help="Builtin the adapter reports as LOWERED (repeatable)")
     shader = sub.add_parser("check", help="Gate a DXBC container through a validator probe")
     shader.add_argument("input", type=Path, help="DXBC container")
     shader.add_argument("--probe", type=Path, help="root_probe.exe path")
-    shader.add_argument("--lowered", action="append", default=None,
-                        help="Builtin the adapter reports as LOWERED (repeatable)")
     args = parser.parse_args()
 
     if args.command not in ("check-text", "check"):
         parser.print_help(sys.stderr)
         return 2
 
-    status_of = status_table(args.lowered) if args.lowered else None
     try:
         if args.command == "check-text":
             body = (sys.stdin.read() if str(args.path) == "-"
                     else args.path.read_text(encoding="utf-8", errors="replace"))
-            decision = check_text(body, status_of)
+            decision = check_text(body)
         else:
             if not args.probe:
                 parser.error("check requires --probe")
@@ -157,8 +161,7 @@ def main() -> int:
             sections = parts(raw)
             if b"DXIL" not in sections:
                 raise ValueError("DXBC container has no DXIL part")
-            decision = check_container(args.probe.resolve(strict=True), raw, sections[b"DXIL"],
-                                       status_of)
+            decision = check_container(args.probe.resolve(strict=True), raw, sections[b"DXIL"])
     except (ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

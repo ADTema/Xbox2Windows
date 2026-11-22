@@ -615,28 +615,29 @@ def check_compute_pso(device_probe: Path, blob: bytes, *, warp_only: bool = Fals
                       intrinsics: dict | None = None, status_of=None) -> dict:
     """Test CreateRootSignature and CreateComputePipelineState via root_device_probe --compute-pso.
 
-    When `intrinsics` carries the final module's xbox.* inventory, the submission gate runs first.
-    A module with an unresolved xbox.* call returns the decision and the probe is never started,
-    so no submission happens for it.
+    `intrinsics` carries the inventory of the module that would be submitted, and the gate is
+    mandatory: a module that still executes an xbox.* call, or one whose inventory is missing,
+    is decided without starting the probe process, so it produces no submission at all.
     """
     if len(blob) < 32 or blob[:4] != b"DXBC":
         raise ValueError("Cannot create compute PSO from non-DXBC input")
-    gate = None
-    if intrinsics is not None:
-        from xbox_intrinsic_gate import ALLOW, decide
+    from xbox_intrinsic_gate import ALLOW, decide, not_checked
 
-        gate = decide(intrinsics, status_of)
-        if gate["verdict"] != ALLOW:
-            gate["submitted"] = False
-            return {"gate": gate}
+    if intrinsics is None:
+        gate = not_checked("module-not-disassembled")
+        gate["submitted"] = False
+        return {"gate": gate}
+    gate = decide(intrinsics, status_of)
+    if gate["verdict"] != ALLOW:
+        gate["submitted"] = False
+        return {"gate": gate}
     command = [str(device_probe), "--compute-pso"]
     if warp_only:
         command.append("--warp-only")
     run = subprocess.run(command, input=blob, capture_output=True, check=True, timeout=30)
     pso = json.loads(run.stdout)
-    if gate is not None:
-        gate["submitted"] = True
-        pso["gate"] = gate
+    gate["submitted"] = True
+    pso["gate"] = gate
     return pso
 
 
@@ -914,24 +915,24 @@ def main() -> int:
             info["validation"] = {"module": rec}
 
     if args.pso_probe:
-        # The gate needs the module's disassembly, which only --probe produces. Without it nothing
-        # is submitted: an unexamined module must not read as a cleared one.
-        final_intrinsics = (info.get("validation") or {}).get("ir", {}).get("xbox_intrinsics")
-        if final_intrinsics is None:
-            from xbox_intrinsic_gate import not_checked
+        from xbox_intrinsic_gate import NOT_CHECKED
 
-            info["pso"] = {"gate": not_checked("module-not-disassembled")}
+        # The gate needs the module's disassembly, which only --probe produces. The helper refuses
+        # to submit without it; say why instead of leaving a silent NOT_CHECKED in the report.
+        final_intrinsics = (info.get("validation") or {}).get("ir", {}).get("xbox_intrinsics")
+        # Resolve the probe only when it will actually be used: without an inventory nothing runs.
+        probe_path = args.pso_probe.resolve(strict=True) if final_intrinsics is not None else args.pso_probe
+        info["pso"] = check_compute_pso(
+            probe_path,
+            result_bytes,
+            warp_only=args.warp_only,
+            intrinsics=final_intrinsics,
+        )
+        if info["pso"]["gate"]["verdict"] == NOT_CHECKED:
             print(
                 "warning: --pso-probe needs --probe to gate the final module; "
-                "no module was disassembled, so nothing was submitted",
+                "the module was not disassembled, so nothing was submitted",
                 file=sys.stderr,
-            )
-        else:
-            info["pso"] = check_compute_pso(
-                args.pso_probe.resolve(strict=True),
-                result_bytes,
-                warp_only=args.warp_only,
-                intrinsics=final_intrinsics,
             )
 
     print(json.dumps(info, indent=2))
