@@ -1352,6 +1352,14 @@ python -B tools/section_probe.py --first PSIN --last CHKS "game-files/<build-dir
 ctest --preset dev -R resource_range_controls -V
 ```
 
+### AWC sound-effect format metadata
+
+Run `python -B tools/awc_metadata.py <archive> --offset <byte-offset> --size <byte-count>` with a known ADAT bank range. The offset and size accept decimal or `0x` hexadecimal integers. The tool reads the stream table and each stream's tag descriptors, checks their extents against the supplied range, and reads the first 32 bytes of each format tag. Its JSON groups streams by numeric codec ID and sample rate. The sample count in each group is the sum of the counts in its format tags. Container discovery and playback require separate evidence.
+
+The reader supports little-endian version 1 sound-effect banks with flag words `0xff000001` or `0xff020001`, at most 4,096 streams, and nonoverlapping tags. Each stream must have one nonempty data tag (`0x55`) and one format tag (`0x76`). The stream's high three bits give its tag count. Each 64-bit tag descriptor encodes its type, byte count and bank-relative offset. [Public AWC format reader](https://github.com/vgmstream/vgmstream/blob/24ffd6ce3e1f34fdebf9f5316d18ad2e162838ce/src/meta/awc.c)
+
+Three locally inspected banks contained 563, 603 and 176 streams. All 1,342 format tags recorded 48,000 Hz and codec ID 11. The source-built fixture uses two rates and two codec IDs, verifies grouping when format and audio tags are out of physical order, and fails on any read outside the metadata. Run `ctest --preset dev --no-tests=error -R '^audio_awc_metadata$' -V`.
+
 ### Source-built binding, wave and texture checks
 
 `dual_uav` dispatches through two root UAVs with a count supplied as a root constant. The CPU checks the input, active output and unwritten tail over seven counts. Decreasing the count from 129 to 128 leaves word 128 untouched. The wave tests compare a full-group mirror with a half-local mirror at lanes 31 and 32 and check an inclusive sum across both halves. With native wave64 support they also check a native mirror using the lane assignment returned by the GPU.
