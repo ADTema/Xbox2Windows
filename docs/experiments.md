@@ -1539,6 +1539,12 @@ python -B tools/script_path_replay.py path/to/script.rpf --host out/build/dev/sc
 
 Bare paths begin at the record's `states` container. A leading `./` starts at the active node and `../` moves to its parent. Each input is supplied by the experiment. The native host walks the stored first-child and sibling links, checks reverse links and selects a unique matching child ID. It reports a state whose `id` attribute is not label-kind as malformed; the replay rejects such a record before calling the host. A second lookup uses parent indices to verify the resulting node. A missing or ambiguous input leaves the test host at its last selection. The local motorbike record yields distinct front and rear camera bounds and restores the original bounds on returning to the front. The runtime event that supplies the state ID remains unresolved.
 
+### One synthetic BCPack mode-6 block
+
+The [fixture supplied in #442](https://github.com/R0Y00/Xbox2Windows/issues/442) pins 104 packed bytes and the expected 16-byte BC7 block in `tests/bcpack_mode6_vector.py`. The optional [Leonida reference decoder](https://github.com/timelery/Leonida/tree/03d1e118a676d73aba66b1793cf033f6ad23b2b2/tools) reproduces all 16 bytes in strict mode with an empty provisional set. To repeat the packed-byte comparison, point `BCPACK_REFERENCE_TOOLS` at that revision's local tools directory and run `python -B tests/bc7_blocks_check.py -v`. The normal suite requires no external decoder.
+
+The CPU block test and the D3D12 BC7 draw tests check all 16 RGBA texels against fixed expected bytes. Changing the last selector from 15 to 0 selects the opposite endpoint only for the final texel. This covers a single zero-history synthetic vector. The local BCPack probe does not decode arbitrary BC7 streams.
+
 ### Drawing BC7 textures with a recompiled pixel shader
 
 `linearize_4k_s_tail(tile, width, height, tail_level)` reads a single BC7 level from a shared GFX10 4 KiB mip-tail tile. Supply the decoded tile, the requested pixel dimensions and its zero-based position within the tail. Whole-tile storage and per-slot bounds are checked before reading. [AMD mip-tail address calculation](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10addrlib.cpp)
