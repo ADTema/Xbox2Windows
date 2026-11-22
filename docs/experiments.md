@@ -3272,20 +3272,21 @@ ctest --preset dev --no-tests=error -R '^spirv_compare_sampler_' -V
 
 ## Independent bit and byte alignment readback
 
-The `pixel_aot_integer_nc_warp` and `pixel_aot_integer_nc_hardware` fixtures also
-run separate `v_alignbit_b32` and `v_alignbyte_b32` programs. Both are included in
-the source-built binary round trip. Each exports four observable UINT channels;
-the variable-count instruction aliases its second source and destination.
+The `pixel_aot_align_warp` and `pixel_aot_align_hardware` fixtures run dedicated
+`v_alignbit_b32` and `v_alignbyte_b32` programs. Both are included in the
+source-built binary round trip. Each exports four observable UINT channels; the
+variable-count instruction aliases its second source and destination.
 
 Each operation has 24 input/reference cases from three asymmetric word pairs
-and eight counts, including zero, the largest masked shift and wrapped counts.
-References use Python's 64-bit concatenation and shift. Input and output words
-avoid NaN and subnormal encodings so float register transport cannot obscure the
-instruction comparison. A wrong expected word is surrounded by correct cases;
-a separately compiled shader with reversed inputs must fail every reference.
+and eight counts, including zero, bit counts 31 and 32, byte counts 3 and 4,
+and wrapped counts. References use Python's 64-bit concatenation and shift.
+Input and output words avoid NaN and subnormal encodings so float register
+transport cannot obscure the instruction comparison. A wrong expected word is
+surrounded by correct cases; a separately compiled shader with reversed inputs
+must fail every reference.
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^pixel_aot_integer_nc_(warp|hardware)$' -V
+ctest --preset dev --no-tests=error -R '^pixel_aot_align_(warp|hardware)$' -V
 ```
 
 Python-only controls check explicit reference words and translator acceptance.

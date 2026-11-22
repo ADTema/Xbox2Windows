@@ -4522,6 +4522,17 @@ def check_controls(directory):
         "v_and_b32_e32 v12, s44, v106",
     ):
         must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop2]))
+    A, B = 0x12345678, 0x9abcdef0
+    assert align_reference(A, B, 0)[3] == B
+    assert align_reference(A, B, 0, True)[3] == B
+    assert align_reference(A, B, 31)[3] == 0x2468acf1
+    assert align_reference(A, B, 32)[3] == B
+    assert align_reference(A, B, 32)[3] != A
+    assert align_reference(A, B, 3, True)[3] == 0x3456789a
+    assert align_reference(A, B, 4, True)[3] == B
+    assert align_reference(A, B, 4, True)[3] != A
+    assert align_reference(A, B, 4) != align_reference(B, A, 4)
+    assert align_reference(A, B, 1, True) != align_reference(B, A, 1, True)
     assert align_reference(0x12345678, 0x9abcdef0, 32) == (
         0x89abcdef, 0x9abcdef0, 0x2468acf1, 0x9abcdef0)
     assert align_reference(0x12345678, 0x9abcdef0, 4, True) == (
@@ -5901,7 +5912,6 @@ def check_integer_nc_draws(directory, compiler, renderer, backend):
         assert all(binary32_normal_or_zero(word) for word in (a, b, *words)), (group, hex(a), hex(b))
         return words
 
-    check_align_draws(directory, compiler, renderer, backend)
     for group, rows in ((1, NC_INT_ROWS), (2, NC_INT_ROWS), (3, NC_INT_ROWS[2:3])):
         source.write_text(translate_int(uncompressed_export(nc_integer_group(group))), encoding="ascii")
         compile_shader(compiler, source, shader)
@@ -7625,12 +7635,13 @@ def main():
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc", "draw-bfm"):
+        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc", "draw-bfm", "draw-align"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
-                        "draw-bfm": check_bfm_draw}[mode]
+                        "draw-bfm": check_bfm_draw,
+                        "draw-align": check_align_draws}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
