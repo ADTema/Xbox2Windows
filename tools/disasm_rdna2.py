@@ -956,9 +956,13 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         elif op_name == "s_nop":
             asm = f"s_nop {simm}"
         elif op_name == "s_waitcnt":
-            vm = (simm >> 4) & 0xf
-            lgkm = (simm >> 8) & 0x3f
-            asm = f"s_waitcnt vmcnt({vm}) lgkmcnt({lgkm})"
+            # GFX10 split: vmcnt is simm16[3:0] plus [15:14], expcnt [6:4], lgkmcnt [13:8].
+            # Like LLVM, omit counters at their "no wait" maximum unless all three are.
+            counters = (("vmcnt", (simm & 0xf) | ((simm >> 10) & 0x30), 0x3f),
+                        ("expcnt", (simm >> 4) & 0x7, 0x7),
+                        ("lgkmcnt", (simm >> 8) & 0x3f, 0x3f))
+            waits = [f"{name}({value})" for name, value, limit in counters if value != limit]
+            asm = "s_waitcnt " + " ".join(waits or (f"{name}({value})" for name, value, _ in counters))
         elif op_name.startswith("s_cbranch") or op_name == "s_branch":
             target = offset + 4 + signed_simm * 4
             asm = f"{op_name} label_0x{target:x}"
