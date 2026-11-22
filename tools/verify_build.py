@@ -184,7 +184,10 @@ def main():
     parser.add_argument("directory", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    root = args.directory.resolve(strict=True)
+    try:
+        root = args.directory.resolve(strict=True)
+    except OSError as exc:
+        parser.error(f"cannot read {args.directory}: {exc.strerror or exc}")
     destination = args.output or Path(__file__).resolve().parents[1] / "out" / "integrity" / (root.name + ".json")
     if destination.resolve().is_relative_to(root):
         parser.error("Choose an output outside the input directory")
@@ -198,13 +201,19 @@ def main():
     torrent = manifest("*.torrent")
     layout = manifest("layout*.xml")
     start = datetime.now(timezone.utc)
-    raw = torrent.read_bytes()
-    info = decode_torrent(raw)[b"info"]
-    entries = [{"path": "/".join(s.decode("utf-8") for s in f[b"path"]), "bytes": f[b"length"]}
-               for f in info[b"files"]]
-    payload = {row["path"] for row in entries}
-    if len(payload) != len(entries) or any(row["bytes"] < 0 for row in entries) or info[b"piece length"] <= 0:
-        raise ValueError("Invalid torrent file list or piece length")
+    try:
+        raw = torrent.read_bytes()
+        info = decode_torrent(raw)[b"info"]
+        entries = [{"path": "/".join(s.decode("utf-8") for s in f[b"path"]), "bytes": f[b"length"]}
+                   for f in info[b"files"]]
+        payload = {row["path"] for row in entries}
+        piece_length, hashes = info[b"piece length"], info[b"pieces"]
+        if not isinstance(hashes, bytes):
+            raise ValueError("Invalid torrent piece hashes")
+        if len(payload) != len(entries) or any(row["bytes"] < 0 for row in entries) or not isinstance(piece_length, int) or piece_length <= 0:
+            raise ValueError("Invalid torrent file list or piece length")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        parser.error(f"{torrent.name} is not a readable multi-file torrent: {type(exc).__name__}: {exc}")
     before = inventory(root)
     sizes = {p: stat[0] for p, stat in before.items()}
     missing = sorted(payload - sizes.keys())
@@ -219,7 +228,10 @@ def main():
         "layout": compare_layout(layout, payload, sizes.keys()), "torrent_order": entries,
     }
     print(json.dumps({k: report[k] for k in ("payload_count", "payload_bytes", "missing", "size_mismatches", "layout")}), flush=True)
-    report["pieces"] = verify_pieces(root, entries, sizes, info[b"piece length"], info[b"pieces"])
+    try:
+        report["pieces"] = verify_pieces(root, entries, sizes, piece_length, hashes)
+    except ValueError as exc:
+        parser.error(f"{torrent.name} is not a readable multi-file torrent: {exc}")
     after = inventory(root)
     changed = sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
     report["changed_during_verification"] = changed
