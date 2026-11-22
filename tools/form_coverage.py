@@ -51,6 +51,7 @@ CPU_FIXTURES = {
     "bink_heap": "cpu_aot_bink_heap",
     "heap_layout": "cpu_aot_heap_layout",
     "shift_count": "cpu_aot_shift_count",
+    "carry_rotates": "cpu_aot_carry_rotates",
     "version_query": "cpu_aot_version_query",
     "bink_descriptors": "cpu_bink_descriptors",
     "switch": "cpu_aot_jump_tables",
