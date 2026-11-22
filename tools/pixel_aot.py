@@ -568,10 +568,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
 
         if ended:
             raise ValueError("Instruction follows program end")
-        if exported and line != "s_endpgm":
-            raise ValueError("Unexpected instruction after color export")
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
             continue
+        if match(r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])"):
+            continue
+        if match(r"s_waitcnt\s+expcnt\([0-7]\)"):
+            continue
+        if exported and line != "s_endpgm":
+            raise ValueError("Unexpected instruction after color export")
         # Scheduling hints with no effect on results. Each operand is limited to the width
         # of its RDNA 2 field: clause length minus one, wave priority and sleep duration.
         if m := match(r"(s_clause|s_setprio|s_sleep) (0x[0-9a-f]+|\d+)"):
@@ -587,6 +591,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # Only the newest limit samples can remain outstanding. Filtering
             # the current set also preserves guarantees made by earlier waits.
             sample_dest = {reg: issue for reg, issue in sample_dest.items() if issue > samples - limit}
+        elif match(r"s_waitcnt (?:vmcnt\(0\) lgkmcnt\(0\)|lgkmcnt\(0\) vmcnt\(0\))"):
+            pending.clear()
+            sample_dest.clear()
         elif m := match(r"s_mov_b64 s\[(\d+):(\d+)\], exec"):
             regs = registers(*m.groups(), 2)
             for n in regs:
