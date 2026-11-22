@@ -7,7 +7,7 @@ import pefile
 from iced_x86 import MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
 
 from cpu_call_aot import lift_body, resolve_import
-from cpu_leaf_aot import bounded_code
+from cpu_leaf_aot import bounded_code, export_rva
 from ffx_version_query import INTEGER_HEADER, lower, region
 
 
@@ -47,7 +47,7 @@ def require_local_pointer(previous, register, call, jump_targets):
         raise ValueError(f"expected aligned local trace pointer before call at {call.ip:#x}")
 
 
-def translate(image, io_provider, mix_provider, extra_providers=()):
+def translate(image, io_provider, mix_provider, extra_providers=(), *, entry_export=None, frame_selector=False):
     providers = {"mix_args": mix_provider}
     for provider, symbol in extra_providers:
         validate_provider_symbol(symbol, providers)
@@ -61,7 +61,8 @@ def translate(image, io_provider, mix_provider, extra_providers=()):
         directories = pe.OPTIONAL_HEADER.DATA_DIRECTORY
         if len(directories) > 9 and directories[9].VirtualAddress:
             raise ValueError("TLS startup is outside this entry profile")
-        entry = pe.OPTIONAL_HEADER.AddressOfEntryPoint
+        entry = (export_rva(pe, entry_export) if entry_export
+                 else pe.OPTIONAL_HEADER.AddressOfEntryPoint)
         body = region(pe, entry, entry + len(bounded_code(pe, entry)))
         if len(body) < 3:
             raise ValueError("incomplete entry stack frame")
@@ -95,7 +96,10 @@ def translate(image, io_provider, mix_provider, extra_providers=()):
         io_calls = {b"read_selector": "rax = read_selector();",
                     b"emit_trace": "rax = emit_trace(reinterpret_cast<const word*>(rcx));"}
         bindings = {}
-        callee = None
+        callees = {}
+        selector_rva = export_rva(pe, "call_bare") if frame_selector else None
+        saw_selector = False
+        intervals = [(entry, ret.next_ip)]
         jump_targets = {ins.near_branch_target for ins in body if ins.op0_kind == K.NEAR_BRANCH64
                         and ins.mnemonic != M.CALL}
         for index, ins in enumerate(body[1:-2], start=1):
@@ -103,17 +107,24 @@ def translate(image, io_provider, mix_provider, extra_providers=()):
                 if ins.op0_kind == K.NEAR_BRANCH64:
                     require_local_pointer(body[index - 1], R.R8, ins, jump_targets)
                     target = ins.near_branch_target
-                    if callee is not None or entry <= target < ret.next_ip:
-                        raise ValueError("expected a single separate internal callee")
-                    native = bounded_code(pe, target)
-                    if target < entry < target + len(native):
-                        raise ValueError("overlapping entry and internal callee")
-                    callee, edge = lift_body(target, native, caller=True,
-                                             bind_import=bind_provider,
-                                             allow_distinct_imports=True)
-                    if edge[0] != "import" or "mix_args" not in bound_symbols:
-                        raise ValueError("internal callee must reach the named provider")
-                    bindings[ins.ip] = "rax = lifted(rcx, rdx, reinterpret_cast<word*>(r8));"
+                    if target == selector_rva:
+                        bindings[ins.ip] = "rax = lifted_call_bare(rcx, rdx, r8);"
+                        saw_selector = True
+                        continue
+                    if target not in callees:
+                        native = bounded_code(pe, target)
+                        end = target + len(native)
+                        if any(target < stop and begin < end for begin, stop in intervals):
+                            raise ValueError(f"overlapping internal call target at {target:#x}")
+                        name = "lifted" if not callees else f"lifted_{target:x}"
+                        source, edge = lift_body(target, native, caller=True, name=name,
+                                                 bind_import=bind_provider, allow_distinct_imports=True)
+                        if edge[0] != "import" or "mix_args" not in bound_symbols:
+                            raise ValueError("internal callee must reach the named provider")
+                        callees[target] = (name, source)
+                        intervals.append((target, end))
+                    name = callees[target][0]
+                    bindings[ins.ip] = f"rax = {name}(rcx, rdx, reinterpret_cast<word*>(r8));"
                 elif ins.is_ip_rel_memory_operand:
                     slot = ins.ip_rel_memory_address
                     item = imports.get(slot)
@@ -137,25 +148,33 @@ def translate(image, io_provider, mix_provider, extra_providers=()):
                 if (ins.memory_base != R.RSP or ins.memory_index != R.NONE
                         or offset < 32 or offset + width > 72):
                     raise ValueError("entry operand outside local frame")
-        if callee is None:
+        if not callees:
             raise ValueError("expected an internal call in the entry profile")
+        if frame_selector and not saw_selector:
+            raise ValueError("expected a direct call to the frame selector")
         code = lower(body, [], {}, bindings, {}, host_ops={prologue.ip: ";", epilogue.ip: ";"})
     declarations = "".join(f'extern "C" __declspec(dllimport) word {symbol}(word, word, word*);\n'
                            for symbol in bound_symbols)
-    return INTEGER_HEADER + """
+    selector_decl = 'extern "C" word lifted_call_bare(word, word, word);\n' if frame_selector else ""
+    return INTEGER_HEADER + selector_decl + """
 extern "C" __declspec(dllimport) uint32_t read_selector();
 extern "C" __declspec(dllimport) uint32_t emit_trace(const word*);
-""" + declarations + callee + '\nint main() {\n' + code + '\n}\n'
+""" + declarations + "\n".join(source for _, source in callees.values()) + '\nint main() {\n' + code + '\n}\n'
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("image", "io_provider", "mix_provider", "output"):
         parser.add_argument(name, type=Path)
+    parser.add_argument("--entry-export", help="translate this return-based export instead of the PE startup")
+    parser.add_argument("--frame-selector", action="store_true",
+                        help="bind the fixture's call_bare export to its separately translated definition")
     parser.add_argument("--provider", action="append", nargs=2, default=[], metavar=("DLL", "SYMBOL"),
                         help="authorize an additional named import with the same trace ABI")
     args = parser.parse_args()
     if args.output.suffix.lower() != ".cpp":
         parser.error("choose a .cpp output")
     providers = [(Path(path), symbol) for path, symbol in args.provider]
-    args.output.write_text(translate(args.image, args.io_provider, args.mix_provider, providers), encoding="ascii")
+    source = translate(args.image, args.io_provider, args.mix_provider, providers, entry_export=args.entry_export,
+                       frame_selector=args.frame_selector)
+    args.output.write_text(source, encoding="ascii")

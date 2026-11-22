@@ -11,8 +11,12 @@ from native_map_check import Mapper, STATUS
 
 
 def mapped_child(mapper_path, image, *libraries):
-    mapper = Mapper(mapper_path)
     providers = {p.name.lower(): ctypes.CDLL(str(p)) for p in libraries}
+    return run_mapped(mapper_path, image, providers)
+
+
+def run_mapped(mapper_path, image, providers):
+    mapper = Mapper(mapper_path)
     base, status, detail, _ = mapper(image, providers)
     if not base or status != STATUS["ok"]:
         raise AssertionError(f"mapping {image.name}: {status}, {detail}")
@@ -27,13 +31,13 @@ def mapped_child(mapper_path, image, *libraries):
         mapper.release(base)
 
 
-def run_mapped(mapper_path, native, data, *libraries):
+def run_mapped_child(mapper_path, native, data, *libraries):
     child = subprocess.run([sys.executable, "-B", __file__, "--child", mapper_path,
                             native, *libraries], input=data, capture_output=True, timeout=15)
     return Observation(child.stderr, child.stdout, child.returncode)
 
 
-def compare(mapper_path, native, lifted, io, mix):
+def compare(mapper_path, native, lifted, io, mix, bypass=None):
     mapper = Mapper(mapper_path)
     for bindings in ({}, {io.name.lower(): ctypes.CDLL(str(io))}):
         base, status, detail, requests = mapper(native, bindings)
@@ -54,8 +58,15 @@ def compare(mapper_path, native, lifted, io, mix):
         original = run(native, data)
         check("native trace length", len(original.arguments), 16)
         check("native output length", len(original.output), 8)
+        if bypass:
+            # The nested leaf reverses the zero/nonzero branch for selectors 0 and 1.
+            check("frame-selected branch", original, run(bypass, bytes([1 - selector])))
+            skipped = run(bypass, data)
+            for field in Observation._fields:
+                if getattr(skipped, field) == getattr(original, field):
+                    raise AssertionError(f"selector {selector}: {field} missed the bypassed frame")
         check("translated EXE", run(lifted, data), original)
-        check("mapped EXE", run_mapped(mapper_path, native, data, io, mix), original)
+        check("mapped EXE", run_mapped_child(mapper_path, native, data, io, mix), original)
         print(f"selector={selector} arguments={original.arguments.hex()} "
               f"output={original.output.hex()} exit={original.exit_code:#x}")
 
@@ -74,7 +85,7 @@ def compare_two_providers(mapper_path, native, lifted, io, mix, second):
     check("missing second provider diagnostic", detail, diagnostic)
     for extra in ((), ((mix, "accumulate_args"),)):
         try:
-            translate(native, io, mix, extra)
+            translate(native, io, mix, extra, entry_export="native_entry")
         except ValueError as exc:
             if f"unbound import {dll}!{symbol}" not in str(exc):
                 raise
@@ -86,7 +97,7 @@ def compare_two_providers(mapper_path, native, lifted, io, mix, second):
                        "lifted", "lifted_callee2", "word", "store", "uint64_t", "mix_args")
     for invalid in invalid_symbols:
         try:
-            translate(native, io, mix, ((second, invalid),))
+            translate(native, io, mix, ((second, invalid),), entry_export="native_entry")
         except ValueError as exc:
             if "import symbol" not in str(exc) or repr(invalid) not in str(exc):
                 raise
@@ -105,7 +116,7 @@ def compare_two_providers(mapper_path, native, lifted, io, mix, second):
         data = bytes([selector])
         check("native EXE", run(native, data), expected)
         check("translated EXE", run(lifted, data), expected)
-        check("mapped EXE", run_mapped(mapper_path, native, data, io, mix, second), expected)
+        check("mapped EXE", run_mapped_child(mapper_path, native, data, io, mix, second), expected)
         print(f"selector={selector} first={first_args} second={second_args} "
               f"output={expected.output.hex()} exit={expected.exit_code:#x}")
 
