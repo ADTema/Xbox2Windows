@@ -92,9 +92,11 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     # SOPK wait forms: only null as the SGPR (reads as 0) and a count of 0..63, as in pixel_aot.
     r"s_waitcnt_(?:vmcnt|lgkmcnt|vscnt)\s+null,\s*(?:0x(?:0?[0-9a-f]|[1-3][0-9a-f])|[0-9]|[1-5][0-9]|6[0-3])",
     rf"s_waitcnt\s+(?:{WAIT_COUNTER}(?:\s+{WAIT_COUNTER}){{0,2}}|0(?:x0)?)",
-    r"s_mov_b64\s+s\[\d+:\d+\],\s+exec",
-    r"s_wqm_b64\s+exec,\s+exec",
-    r"s_and_b64\s+exec,\s+exec,\s+s\[\d+:\d+\]",
+    r"s_mov_b64\s+(?:(?:s\[\d+:\d+\]|s\d+),\s+(?:exec|exec_lo)|(?:exec|exec_lo),\s+(?:s\[\d+:\d+\]|s\d+))",
+    r"s_mov_b32\s+(?:s\d+,\s+(?:exec|exec_lo)|(?:exec|exec_lo),\s+s\d+)",
+    r"s_wqm_(?:b64|b32)\s+(?:exec|exec_lo),\s+(?:exec|exec_lo)",
+    r"s_and_b64\s+(?:exec|exec_lo),\s+(?:exec|exec_lo),\s+(?:s\[\d+:\d+\]|s\d+)",
+    r"s_and_b32\s+(?:exec|exec_lo),\s+(?:exec|exec_lo),\s+s\d+",
     rf"s_(?:cmov|not|brev)_b64\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE}",
     rf"s_(?:lshl_b64|lshr_b64|ashr_i64)\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"s_bfm_b64\s+s\[\d+:\d+\],\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
@@ -108,7 +110,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_cmpk_(?:eq|lg|gt|ge|lt|le)_u32\s+s\d+,\s+(?:\d+|0x[0-9a-f]+)",
     rf"s_cselect_b32\s+s\d+,\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"s_(?:cmov|bitset0|bitset1)_b32\s+s\d+,\s+{SCALAR32_SOURCE}",
-    r"(?:s_mov_b32|s_movk_i32)\s+(?:s\d+|m0),\s+.*",
+    rf"(?:s_mov_b32|s_movk_i32)\s+(?:s\d+|m0),\s+(?:{SCALAR32_SOURCE}|exec|exec_lo)",
     r"(?:s_addk_i32|s_mulk_i32|s_cmovk_i32)\s+s\d+,\s+(?:-?\d+|0x[0-9a-f]+)",
     r"s_load_dwordx8\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
     r"(?:s_load_dwordx4|s_buffer_load_dwordx[24])\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
@@ -482,12 +484,15 @@ def is_instruction_supported(instruction_line: str) -> bool:
     return True
 
 
-def analyze_shader_instructions(shader_name: str, instructions: list[str]) -> dict:
+def analyze_shader_instructions(shader_name: str, instructions: list[str], *,
+                                wave_size: int | None = None) -> dict:
     """
     Analyze a list of RDNA 2 assembly instructions.
     Distinguishes:
       1. Opcode recognition: whether every instruction opcode is known to the RDNA 2 ISA scanner.
       2. Translator acceptance: whether pixel_aot.lower() actually accepts the shader sequence.
+    wave_size names the guest execution width (32 or 64). Low-only execution mask operations
+    require a validated guest wave32 profile (wave_size=32).
     """
     total = 0
     unrecognized_opcodes = Counter()
@@ -529,7 +534,8 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str]) -> di
                 texture_sgpr=20,
                 interp_sgpr=24,
                 sampler=[1, 2, 3, 4],
-                constant_descriptor=None
+                constant_descriptor=None,
+                wave_size=wave_size,
             )
             lower_status = "passed"
         except Exception as e:
