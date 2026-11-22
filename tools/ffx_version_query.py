@@ -293,6 +293,29 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         M.VPSLLDQ, M.VPUNPCKHQDQ, M.VPUNPCKLQDQ,
     }
     has_wide |= any(i.mnemonic in shuffle_ops for i in body)
+    packed_float_ops = {
+        M.ADDPS: ("ps", "_mm_add_ps"), M.SUBPS: ("ps", "_mm_sub_ps"), M.MULPS: ("ps", "_mm_mul_ps"),
+        M.DIVPS: ("ps", "_mm_div_ps"), M.MAXPS: ("ps", "_mm_max_ps"), M.MINPS: ("ps", "_mm_min_ps"),
+        M.ANDPS: ("ps", "_mm_and_ps"), M.ANDNPS: ("ps", "_mm_andnot_ps"), M.ORPS: ("ps", "_mm_or_ps"),
+        M.XORPS: ("ps", "_mm_xor_ps"), M.SQRTPS: ("sqrt_ps", "_mm_sqrt_ps"),
+        M.MAXSS: ("ss", "_mm_max_ss"), M.MINSS: ("ss", "_mm_min_ss"), M.SQRTSS: ("sqrt_ss", "_mm_sqrt_ss"),
+        M.ADDPD: ("pd", "_mm_add_pd"), M.SUBPD: ("pd", "_mm_sub_pd"), M.MULPD: ("pd", "_mm_mul_pd"),
+        M.DIVPD: ("pd", "_mm_div_pd"), M.MAXPD: ("pd", "_mm_max_pd"), M.MINPD: ("pd", "_mm_min_pd"),
+        M.ANDPD: ("pd", "_mm_and_pd"), M.ANDNPD: ("pd", "_mm_andnot_pd"), M.ORPD: ("pd", "_mm_or_pd"),
+        M.XORPD: ("pd", "_mm_xor_pd"), M.SQRTPD: ("sqrt_pd", "_mm_sqrt_pd"),
+        M.MAXSD: ("sd", "_mm_max_sd"), M.MINSD: ("sd", "_mm_min_sd"), M.SQRTSD: ("sqrt_sd", "_mm_sqrt_sd"),
+        M.VADDPS: ("ps", "_mm_add_ps"), M.VSUBPS: ("ps", "_mm_sub_ps"), M.VMULPS: ("ps", "_mm_mul_ps"),
+        M.VDIVPS: ("ps", "_mm_div_ps"), M.VMAXPS: ("ps", "_mm_max_ps"), M.VMINPS: ("ps", "_mm_min_ps"),
+        M.VANDPS: ("ps", "_mm_and_ps"), M.VANDNPS: ("ps", "_mm_andnot_ps"), M.VORPS: ("ps", "_mm_or_ps"),
+        M.VXORPS: ("ps", "_mm_xor_ps"), M.VSQRTPS: ("sqrt_ps", "_mm_sqrt_ps"),
+        M.VADDPD: ("pd", "_mm_add_pd"), M.VSUBPD: ("pd", "_mm_sub_pd"), M.VMULPD: ("pd", "_mm_mul_pd"),
+        M.VDIVPD: ("pd", "_mm_div_pd"), M.VMAXPD: ("pd", "_mm_max_pd"), M.VMINPD: ("pd", "_mm_min_pd"),
+        M.VANDPD: ("pd", "_mm_and_pd"), M.VANDNPD: ("pd", "_mm_andnot_pd"), M.VORPD: ("pd", "_mm_or_pd"),
+        M.VXORPD: ("pd", "_mm_xor_pd"), M.VSQRTPD: ("sqrt_pd", "_mm_sqrt_pd"),
+        M.VMAXSS: ("ss", "_mm_max_ss"), M.VMINSS: ("ss", "_mm_min_ss"), M.VSQRTSS: ("sqrt_ss", "_mm_sqrt_ss"),
+        M.VMAXSD: ("sd", "_mm_max_sd"), M.VMINSD: ("sd", "_mm_min_sd"), M.VSQRTSD: ("sqrt_sd", "_mm_sqrt_sd"),
+    }
+    has_wide |= any(i.mnemonic in packed_float_ops for i in body)
     has_wide |= any(i.mnemonic == M.VMOVDQU and
                     (i.op0_register in wide or i.op1_register in wide) for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
@@ -1474,6 +1497,44 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                     f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), res.size()); "
                     f"memcpy(res.data(), &r, sizeof(float)); memcpy({dst}.data(), res.data(), res.size()); "
                     f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+        elif op in packed_float_ops and has_wide:
+            is_vex = i.encoding == EncodingKind.VEX
+            kind, fn = packed_float_ops[op]
+            dst = wide_xmm[i.op0_register]
+            if kind == "sqrt_ps":
+                src = wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128 s; memcpy(&s, {src}.data(), sizeof s); const __m128 r = {fn}(s); "
+                        f"memcpy({dst}.data(), &r, sizeof r); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind == "sqrt_pd":
+                src = wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128d s; memcpy(&s, {src}.data(), sizeof s); const __m128d r = {fn}(s); "
+                        f"memcpy({dst}.data(), &r, sizeof r); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind == "sqrt_ss":
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128 s; memcpy(&s, {src2}.data(), sizeof s); const __m128 r = {fn}(s); "
+                        f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), res.size()); "
+                        f"memcpy(res.data(), &r, sizeof(float)); memcpy({dst}.data(), res.data(), res.size()); "
+                        f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind == "sqrt_sd":
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128d s; memcpy(&s, {src2}.data(), sizeof s); const __m128d r = {fn}(s, s); "
+                        f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), res.size()); "
+                        f"memcpy(res.data(), &r, sizeof(double)); memcpy({dst}.data(), res.data(), res.size()); "
+                        f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind in ("ps", "ss"):
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128 a, b; memcpy(&a, {src1}.data(), sizeof a); memcpy(&b, {src2}.data(), sizeof b); "
+                        f"const __m128 r = {fn}(a, b); memcpy({dst}.data(), &r, sizeof r); "
+                        f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            else:
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128d a, b; memcpy(&a, {src1}.data(), sizeof a); memcpy(&b, {src2}.data(), sizeof b); "
+                        f"const __m128d r = {fn}(a, b); memcpy({dst}.data(), &r, sizeof r); "
+                        f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
