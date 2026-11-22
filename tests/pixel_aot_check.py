@@ -2857,11 +2857,14 @@ def check_dpp_f16_draw(directory, compiler, renderer, backend):
     case = directory / "dpp_f16.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     source.write_text(translate(program), encoding="ascii")
-    compile_shader(compiler, source, shader)
+    # Uses log2/exp2/rcp like curve and dpp; record mode="any" (avoiding the NVIDIA Blackwell
+    # -denorm preserve PSO E_OUTOFMEMORY) and assert flushing leaves every expected word unchanged.
+    compile_shader(compiler, source, shader, mode="any")
     for values in DPP_F16_SETS:
         constants = bytearray(256)
         struct.pack_into("<4I", constants, 12, *values)
         expected = dpp_f16_reference(*values)
+        assert all(flush_ftz(word) == word for word in expected), expected
         case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
         subprocess.run(draw, check=True)
     for set_idx, old, new, label in (
@@ -2880,7 +2883,7 @@ def check_dpp_f16_draw(directory, compiler, renderer, backend):
         mutated = [line.replace(old, new) for line in program]
         assert mutated != program, label
         source.write_text(translate(mutated), encoding="ascii")
-        compile_shader(compiler, source, shader)
+        compile_shader(compiler, source, shader, mode="any")
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
