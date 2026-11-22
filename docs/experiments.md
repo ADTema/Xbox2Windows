@@ -138,6 +138,35 @@ cmake --build --preset dev --target cpu_shim_startup cpu_shim_startup_lifted pe_
 ctest --preset dev --no-tests=error -R '^cpu_shim_draw_warp$' -V
 ```
 
+The same draw contract also runs the translated compute, mesh and pixel chain
+from the [compute-to-mesh texture fixture](#single-group-mesh-entry-specialization).
+The draw cases `chain0`, `chain1` and `chain-stale` send the frame to
+[`shim_chain_gpu.cpp`](../tests/cpu/shim_chain_gpu.cpp). On one direct queue it
+dispatches translated gfx1013 producers that write two packed RGBA8 rows to a
+raw UAV, copies them into a 2x2 texture, and draws with the translated indexed
+mesh and `image_sample_lz` pixel stages into a 32x32 target. The EXE, the AOT
+import table and the `draw_request`/`draw_frame` signatures are unchanged. The
+provider publishes all 4,096 RGBA bytes and the 80-byte mesh export trace, and
+the guest exits 42 only when both match the case reference.
+[The check](../tests/cpu/shim_chain_check.py) builds the shaders and references
+from the generators that `compute_mesh_texture_check.py` uses. It requires the
+native EXE, `pe_map` and the AOT build to agree on the shim bindings, the exit
+status and all 4,176 published bytes, and compares them with the Python
+reference.
+
+| Case | Producers dispatched | Bound texture | Exit | Published bytes |
+|---|---|---|---|---|
+| `chain0` | palette A | A | 42 | match A's reference |
+| `chain1` | A, then B | B | 42 | match B's reference |
+| `chain-stale` | A, then B | A | 20 | equal to A's frame; against B's reference, 276 covered pixels differ, while all 748 clear pixels and the trace match |
+
+Mesh shader tier 1 is required. Without it the test exits 77, reported as a
+skip. `XBOX2WINDOWS_ADAPTER` selects the hardware adapter by part of its name.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_shim_chain_(warp|hardware)$' -V
+```
+
 ## Source-built EXE entry to a DLL import
 
 MSVC assembles a small CRT-free [EXE entry body](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) takes the fixture's `native_entry` export through `--entry-export`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
@@ -263,6 +292,47 @@ The profile tables in this document divide by the 26,503 accepted archive record
 The 21,522 cache entries sit on the other side of the archive. The last named record ends 170,812 B before the cache begins, and the two disk ranges do not overlap. 21,044 was the earlier extractor result. It was revised because that scan assumed a fixed 40-byte `S_CODE_END` tail and a terminating `S_ENDPGM`, and 478 of the entries fell outside that scan's assumptions: 419 carry the standard 8-byte gate and a normal `S_ENDPGM` yet 407 of them end with a 20-byte tail and 12 carry no `S_CODE_END` fill at all, 58 begin directly with the program body without the gate, and one has no terminator. A further 4,485 programs are not aligned to any old record at all: each starts in the gap between two old records and its tail runs on into the next old record, so the record that follows it is bounded wrongly at both ends. Boundaries now come from the index, which gives 21,522 programs. 26,091 is the number of `S_ENDPGM` instructions in the code area and is not a count of records.
 
 The 218 re-detections are suffix aliases. Each one starts inside the name of the previous record, at a byte whose value equals its distance to the name's terminating NUL, and shares that record's terminator, header and payload. The count does not change either way, because de-duplication keeps the earlier start whenever the end offset and the digest match.
+
+### Reporting shader census populations
+
+`tools/shader_census.py` reports accepted record occurrences, distinct header
+digests and full-container SHA-256 counts without running LLVM or changing
+`shader_profile_audit.py` output. It reuses the same `scene_records` acceptance
+and scan order as the profile audit. With an already decoded cache from the
+same build, it also reports index entries, distinct `(code_offset,
+allocation_size)` spans and alias counts. The supported cache profile starts
+with bytes `50 53 00 09`; the four u32 counts at byte 80 describe 0x70-byte,
+0x18-byte, 8-byte and index-entry tables following a 128-byte header. Each index entry is
+a little-endian offset and size pair, relative to a caller-established code-area
+base. The tool does not guess that base or decompress cache streams.
+
+```powershell
+python -B tools/shader_census.py local.archive
+python -B tools/shader_census.py local.archive --cache-blob out/decoded.cache --code-base 0x2100000
+ctest --preset dev --no-tests=error -R 'shader_metadata|dxcontainer_part_offsets' -V
+```
+
+The base in the example is illustrative: replace it with the independently
+established offset for that cache. Missing cache input reports `null`, not zero.
+The parser checks table extents, a limit of 1,048,576 index entries, nonzero
+in-range allocations, 16-byte relative offset alignment and distinct-span
+overlaps. Exact aliases remain separate index entries. It does not validate the
+programs inside allocations or prove that two supplied inputs share a build.
+
+Run `python -B tests/shader_census_check.py` without local archives or a GPU.
+Its source-built framing fixture has four accepted records, two deliberately
+colliding header digests, three complete-container hashes and five cache index
+entries. It is not executable DXIL. Rejection controls cover malformed cache
+tables, allocation bounds and overlaps, invalid archive framing and CLI input.
+Separate controls verify alias accounting, missing-cache output and that the
+unchanged profile audit still counts all four occurrences while classifying
+only the three full-container hashes.
+
+Observed with Python 3.14.4 on Linux: all seven census test methods and all
+seven DXContainer controls passed. On Windows 11 build 26300.9974, MSVC
+19.44.35230 and Python 3.12.8, the CTest filter above passed 4/4 tests, including
+the existing native metadata probe, with no skips. No archive totals were
+remeasured for this change.
 
 ### Fixed-profile archive rescan
 
@@ -432,6 +502,14 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_chained_ranges$' -V
 ```
 
 The source-owned fixture has a primary interval, two levels of chaining and a neighboring export, built in `JE`, `JNE`, self-`XOR` zeroing, general 32-bit immediate (`edx`/`r8d`), and 32-bit immediate stack-frame (`sub`/`add rsp, 136`) variants. Both null inputs return 7 (or 0 in the `XOR`-zeroing variant), and two non-null inputs return 21. A Windows probe compares native returns with the generated result, physical RBX/RSI, and guards. A patched copy verifies version-2 chained header resolution. Negative controls cover broken and cyclic parent links, unsupported chained header versions and combined flags, an unsupported conditional branch after `TEST`, a non-self `XOR`, clobbering an unsaved callee-saved register with a 32-bit immediate, a stack frame exceeding 4096 bytes, jumps into a neighbor or instruction interior, and an indirect call.
+
+The translator reads each `MOV` memory operand once, in guest order, into a local declared at that point, through a `volatile` load: the original faults on an inaccessible operand even when the value is overwritten before use, and with an ordinary load an optimized MSVC build drops such a read. A load whose value nothing uses is written as the declaration followed by `static_cast<void>(...)`. Reads of the modelled stack slots are not emitted, and the table and allocator words that a bound callback or destroy call compares keep their ordinary read, since the comparison uses the value.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_aot_chained_dead_reads$' -V
+```
+
+The [dead-read fixture](../tests/cpu/chained_dead_read.asm) exports `read_dead` (a load overwritten by `MOV RAX, RDX`), `disp_dead` (a load at RCX + 8 into a register nothing reads), `pair_dead` (two loads, neither used), `read_skip` (a load skipped when y is zero) and the control `read_live`, which returns the value read. Each export is translated on its own and built by the project's build and again by a separate `cl /O2` command. `cpu_aot_chained_dead_reads` calls the original and both translations inside `__try` on a fresh page followed by an inaccessible page, and compares the structured exception code and the result. A readable operand returns the reference. A null operand, and an operand whose last read crosses one byte into the inaccessible page, raise an access violation in the original and in both translations; reads that end exactly at the page boundary return. On the path that skips the read, the same inaccessible addresses return normally. A source control checks that each memory operand is read once through the `volatile` load. An unoptimized build performs an ordinary load as well, so the `/O2` builds are the ones that show the difference.
 
 For the local FidelityFX loader, run `cpu_chained_aot.py <loader.dll> ffxDestroyContext out/local_context.cpp --partial` using the Python dev environment. Compile the generated C++ as a Windows x64 DLL. Its `try_lifted(first, second, output)` returns 1 and writes the guest result for a completed path. Status 0 leaves the output untouched at an unsupported indirect call. Pointer arguments must reference readable fixture storage on paths that dereference them. The local inspection recovered four owned intervals. Running the generated code produced 6 for a null first argument and for a pointer to a null context. A valid non-null control stopped at the first indirect call with its output sentinel intact. The original package DLL was inspected as a file. Native differential results above are from the repository fixture. [Callback follow-up](https://github.com/R0Y00/Xbox2Windows/issues/29)
 
@@ -827,7 +905,7 @@ The shared lowering also handles 128-bit legacy `movdqu` and 14 SSSE3 integer ve
 
 Baseline 128-bit SSE2 packed shifts, packs, unpacks, shuffles, and movemask forms (`movdqu`, `psllw`/`d`/`q`, `psrlw`/`d`/`q`, `psraw`/`d`, `pslldq`, `psrldq`, `packsswb`, `packssdw`, `packuswb`, `punpcklbw`/`lwd`/`ldq`/`lqdq`, `punpckhbw`/`hwd`/`hdq`/`hqdq`, `pshufd`, `pshuflw`, `pshufhw`, `pmovmskb`) are also lowered for legacy XMM encodings while preserving upper YMM bytes. The new operations support register and immediate operands and reject legacy memory sources until their alignment requirements are modeled. `movdqu` retains its existing unaligned move semantics. `cpu_aot_sse2_shifts_pack` builds all 37 exports from MASM source (`tests/cpu/sse2_shifts_pack.asm`), translates them, compares outputs against the native DLL and an independent reference across immediate, in-range, boundary, and out-of-range shift counts, and checks that MMX `packsswb` and memory forms of `packsswb`, `psllw`, and `pshufd` are rejected. Run `cmake --build --preset dev --target cpu_sse2_shifts_pack_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_sse2_shifts_pack$' -V`.
 
-The shared lowering also handles all 36 VEX-encoded packed FMA3 instructions (`vfmadd`/`vfmsub`/`vfnmadd`/`vfnmsub`/`vfmaddsub`/`vfmsubadd` × `132`/`213`/`231` × `ps`/`pd`) in 128-bit and 256-bit forms using single-rounding `std::fmaf`/`std::fma` and rejecting EVEX forms. `cpu_aot_fma_packed` probes CPUID (`OSXSAVE`, `XCR0` YMM state, and leaf 1 ECX bit 12 `FMA`) before invoking the native fixture and exits 77 (capability skip) on unsupported hosts; on FMA3-capable hosts it builds all 38 exports from MASM source (`tests/cpu/fma_packed.asm`), translates them, and compares raw result bits with the native DLL across finite inputs, quiet and signaling NaNs, and pairs or triples with distinct NaN signs and payloads. The NaN result follows the arithmetic operand order for that encoding before any sign change. Extra cases cover 128-bit writes clearing the high YMM half and a 256-bit memory source. These comparisons check result bytes under the host's default masked floating-point environment. Run `cmake --build --preset dev --target cpu_fma_packed_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_fma_packed$' -V`.
+The shared lowering also handles all 36 VEX-encoded packed FMA3 instructions (`vfmadd`/`vfmsub`/`vfnmadd`/`vfnmsub`/`vfmaddsub`/`vfmsubadd` × `132`/`213`/`231` × `ps`/`pd`) in 128-bit and 256-bit forms using single-rounding `std::fmaf`/`std::fma` and rejecting EVEX forms. `cpu_aot_fma_packed` probes CPUID (`OSXSAVE`, `XCR0` YMM state, and leaf 1 ECX bit 12 `FMA`) before invoking the native fixture and exits 77 (capability skip) on unsupported hosts; on FMA3-capable hosts it builds all 44 exports from MASM source (`tests/cpu/fma_packed.asm`), translates them, and compares raw result bits with the native DLL across finite inputs, quiet and signaling NaNs, and pairs or triples with distinct NaN signs and payloads. The NaN result follows the arithmetic operand order for that encoding before any sign change. Extra cases cover 128-bit writes clearing the high YMM half and a 256-bit memory source. Finite-operand cases add a `132` memory form, 128-bit `vfnmadd`, `vfmaddsub` and `pd` forms, a destination that is also the first source, and a `vfmadd132pd` whose single rounding gives -2^-104 where separate rounding gives 0. These comparisons check result bytes under the host's default masked floating-point environment. Run `cmake --build --preset dev --target cpu_fma_packed_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_fma_packed$' -V`.
 
 ## Recompiling a direct x64 call
 
@@ -1267,9 +1345,9 @@ Sixteen mutations of the translator each fail the test:
 
 Only the alias checks catch the last two.
 
-## Direction-aware repeated memory transfers and fills in the control-flow CPU lifter
+## String memory transfers in the control-flow CPU lifter
 
-`tools/cpu_switch_aot.py` now lowers rep movs and rep stos copy and fill 1-, 2-, 4- and 8-byte elements in either direction. These instructions
+`tools/cpu_switch_aot.py` lowers MOVS and STOS, with and without REP, to copy and fill 1-, 2-, 4- and 8-byte elements in either direction. These instructions
 can occur inside branches, loops and translated callees; they use the existing
 register-definedness and nonvolatile-save proofs. A zero REP count touches no memory
 and leaves the pointers unchanged. The loop updates RSI/RDI and RCX at their architectural widths.
@@ -1278,7 +1356,7 @@ Each element is read before it is written. Forward overlapping copies deliberate
 observe bytes written by preceding iterations, unlike `memmove`. Volatile guest
 reads and writes preserve access faults and iteration order under `/O2`. Multi-byte accesses allow unaligned addresses and keep the original element width.
 Arithmetic flags survive a transfer and remain available to the existing bounded
-flag-consumer proof. STD/CLD are represented by a local direction flag. A control-flow proof requires DF clear on every path to calls, tail jumps and returns, including joins with different direction states. The backwards path clears DF before leaving its copy region. Non-repeated string instructions remain rejected.
+flag-consumer proof. STD/CLD are represented by a local direction flag. A control-flow proof requires DF clear on every path to calls, tail jumps and returns, including joins with different direction states. The backwards path clears DF before leaving its copy region. Non-repeated forms preserve RCX.
 Address-size overrides, segment prefixes, REPNE, LODS, CMPS and SCAS remain rejected
 in this control-flow profile. The shared straight-line translator has its separate
 string-instruction coverage. Guest exception resumption, native REP register values
@@ -1297,12 +1375,12 @@ ctest --test-dir out/native --no-tests=error -R '^cpu_aot_switch_strings$' -V
 ```
 
 Windows 11 build 26300.9974, MSVC/ML64 19.44.35230 and Python 3.12.8:
-19 exports, 7,608 native/AOT/reference comparisons and 63 access-violation
+38 exports, 18,192 native/AOT/reference comparisons and 84 access-violation
 comparisons passed, including the `/O2` translation. Compiled incorrect
 implementations must fail the comparison: a bulk `memmove` on destructive overlap
 and a truncated repeat count, plus ignored backwards direction.
 The comparison includes inaccessible addresses with a zero count, and a read that
-copies three bytes before faulting at a protected page; no later trace store executes. It also compares native and translated memory effects when a word, dword or qword straddles the protected page.
+copies three bytes before faulting at a protected page; no later trace store executes. The same fault must occur with a repeat count of 2^32 + 1, so the full 64-bit RCX is used. Non-overlapping copies run from an even and an odd source address, and an overlapping copy runs with the destination 8 bytes past the source. It also compares native and translated memory effects when a word, dword or qword straddles the protected page.
 No title startup result is claimed.
 
 The Windows ABI boundary follows [Microsoft's direction-flag convention](https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions).
@@ -1350,7 +1428,9 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_flag_conditions$' -V
 
 The supported functions take three integer words in RCX, RDX and R8 and return RAX, of which only the low bytes described below are compared. An entry can instead be translated with a fourth integer word in R9, as described below. Stack arguments (the fifth and later) and floating-point arguments are not supported. A leaf function without a `.pdata` entry is bounded by its executable section. Its walk may not enter an interval owned by another function's unwind entry.
 
-The [source fixture](../tests/cpu/switch.asm) exports six functions. `select_rva` uses the MSVC layout, and `select_rel` computes the same function through the LLVM layout. Both have seven cases, including two selectors that share a target, a case that falls through into the next, and a default path. `run_ops` runs a byte program in a loop and dispatches every byte through a five-entry table. It stops at the first opcode above 4. Through the register probe, the test compares each original export with the matching lifted function, a reference written in Python, and RBX/RSI sentinels. It runs 600 selector and operand pairs per layout and 138 programs. Half of the pairs carry nonzero upper register halves that must not reach the table index. A control assembles the same source with two entries swapped in each table, and its translation must follow the swapped reference. `shift_narrow` dispatches through a six-entry LLVM-layout table to byte and word `SHL`, `SHR` and `SAR` of a memory destination by `CL`. x86 masks the count to five bits for 8- and 16-bit operands as well, so counts of 8 to 31 still shift (a byte holding 1 shifted left by 8 becomes 0). The translator performs these shifts in 64 bits and truncates the stored result; 4,608 inputs, covering every count from 0 to 31 and count bytes above 31, match the original and the reference. `flag_select` dispatches through an eight-entry LLVM-layout table to `SETL`, `SETBE`, `SETG` into a memory byte, `SETNE` after a 16-bit compare, and `CMOVA`, `CMOVNS` (64-bit, after `TEST`), `CMOVGE` from memory with a `MOV` between compare and consumer, and `CMOVE` after `TEST` with an immediate. It compares EDX with bits 32 to 63 of RDX and returns RAX whole. A 32-bit `CMOVcc` therefore shows that it clears bits 32 to 63 even when the condition is false, and a byte `SETcc` shows that it keeps them. The translation reads a memory source of `CMOVcc` on both outcomes, as the processor does. 4,000 inputs at the signed, unsigned and 16-bit boundaries must match the original and the reference. The swapped-table build exchanges the `SETL` and `CMOVA` entries and must follow the swapped reference. `cmov_read` executes `CMOVNE` after `CMP ECX, ECX`, which never moves but still reads its memory source: called with a null R8 it must fault in the original and in the translation. The translator therefore performs every read of guest memory through a `volatile` load; with an ordinary load, an optimized MSVC Release build drops a read whose value is unused and the null call returns. Each instruction's memory operand is read once, at its own width, into a local declared before the rest of the statement, and every use of the operand names that local: an `ADD` whose result and flags both come from one operand performs one read. Reads of the function's own frame array, which cannot fault, stay ordinary loads. The [dead-read fixture](../tests/cpu/dead_read.asm) stores 1 to the trace before each read and 2 after it. Its exports read a value that is overwritten, compare memory with flags that are never read, read one byte, read two operands whose sum is cleared, return the value read, skip the read on a branch, and take a sum and its zero flag from one read, into a register and in place. `cpu_aot_dead_reads` builds the translation with the project's build and again with a separate `cl /O2` command, calls the original and each translation inside `__try` with fresh trace words and a fresh page, and compares the structured exception code, the return value, the trace and the page. For a readable operand all three return the reference. For a null operand, and for an operand whose read crosses into an inaccessible page, the original raises an access violation after the first marker and before the second, and both translations must do the same; an operand that ends exactly at the page boundary returns, at each width, and the second read of the pair faults when only the first is readable. On the branch that skips the read, the same inaccessible addresses return normally with the first and third markers written. A source control checks that each memory operand is read once through the `volatile` load and that the shared reads are used twice. An unoptimized build performs an ordinary load as well, so the `/O2` builds are the ones that show the difference. Stores are unchanged.
+The [source fixture](../tests/cpu/switch.asm) exports seven functions. `select_rva` uses the MSVC layout, and `select_rel` computes the same function through the LLVM layout. Both have seven cases, including two selectors that share a target, a case that falls through into the next, and a default path. `run_ops` runs a byte program in a loop and dispatches every byte through a five-entry table. It stops at the first opcode above 4. Through the register probe, the test compares each original export with the matching lifted function, a reference written in Python, and RBX/RSI sentinels. It runs 600 selector and operand pairs per layout and 138 programs. Half of the pairs carry nonzero upper register halves that must not reach the table index. A control assembles the same source with two entries swapped in each table, and its translation must follow the swapped reference. `shift_narrow` dispatches through a six-entry LLVM-layout table to byte and word `SHL`, `SHR` and `SAR` of a memory destination by `CL`. x86 masks the count to five bits for 8- and 16-bit operands as well, so counts of 8 to 31 still shift (a byte holding 1 shifted left by 8 becomes 0). The translator performs these shifts in 64 bits and truncates the stored result; 4,608 inputs, covering every count from 0 to 31 and count bytes above 31, match the original and the reference. `flag_select` dispatches through an eight-entry LLVM-layout table to `SETL`, `SETBE`, `SETG` into a memory byte, `SETNE` after a 16-bit compare, and `CMOVA`, `CMOVNS` (64-bit, after `TEST`), `CMOVGE` from memory with a `MOV` between compare and consumer, and `CMOVE` after `TEST` with an immediate. It compares EDX with bits 32 to 63 of RDX and returns RAX whole. A 32-bit `CMOVcc` therefore shows that it clears bits 32 to 63 even when the condition is false, and a byte `SETcc` shows that it keeps them. The translation reads a memory source of `CMOVcc` on both outcomes, as the processor does. 4,000 inputs at the signed, unsigned and 16-bit boundaries must match the original and the reference. The swapped-table build exchanges the `SETL` and `CMOVA` entries and must follow the swapped reference. `cmov_read` executes `CMOVNE` after `CMP ECX, ECX`, which never moves but still reads its memory source: called with a null R8 it must fault in the original and in the translation. The translator therefore performs every read of guest memory through a `volatile` load; with an ordinary load, an optimized MSVC Release build drops a read whose value is unused and the null call returns. Each instruction's memory operand is read once, at its own width, into a local declared before the rest of the statement, and every use of the operand names that local: an `ADD` whose result and flags both come from one operand performs one read. Reads of the function's own frame array, which cannot fault, stay ordinary loads. The [dead-read fixture](../tests/cpu/dead_read.asm) stores 1 to the trace before each read and 2 after it. Its exports read a value that is overwritten, compare memory with flags that are never read, read one byte, read two operands whose sum is cleared, return the value read, skip the read on a branch, and take a sum and its zero flag from one read, into a register and in place. `cpu_aot_dead_reads` builds the translation with the project's build and again with a separate `cl /O2` command, calls the original and each translation inside `__try` with fresh trace words and a fresh page, and compares the structured exception code, the return value, the trace and the page. For a readable operand all three return the reference. For a null operand, and for an operand whose read crosses into an inaccessible page, the original raises an access violation after the first marker and before the second, and both translations must do the same; an operand that ends exactly at the page boundary returns, at each width, and the second read of the pair faults when only the first is readable. On the branch that skips the read, the same inaccessible addresses return normally with the first and third markers written. A source control checks that each memory operand is read once through the `volatile` load and that the shared reads are used twice. An unoptimized build performs an ordinary load as well, so the `/O2` builds are the ones that show the difference. Stores are unchanged.
+
+`select_rel_edges` bounds a three-entry LLVM-layout table with `JAE`, places its default before the guard, maps all three entries to one target placed more than 32 KiB before the table, and leaves a zero DWORD after the table. Selectors 0 to 2 must return the operand and selector 3 its complement, in the original, the translation and the swapped-table build.
 
 On a copy of the linked DLL, the test patches the code, the table or `.pdata`, and expects each change below to be rejected:
 
@@ -1362,6 +1442,7 @@ On a copy of the linked DLL, the test patches the code, the table or `.pdata`, a
 - an undefined register, a read of a nonvolatile register's entry value, or an unsupported instruction;
 - a leaf whose walk reaches another function's unwind interval;
 - in `flag_select`, a `SETcc` into `AH`, a flag-writing `NEG` between a compare and its `CMOVGE`, and a second entry that reaches a `SETBE` with another path's flags.
+- a `JGE` bound on `select_rva`, a 64-bit load of its 32-bit table entries, and a `select_rel_edges` table load whose base register differs from the register the entry is added to.
 
 When `.pdata` no longer covers `select_rva`, the translation must stay unchanged.
 
@@ -3022,3 +3103,23 @@ readbacks matched 128 output words and 192 guards. Exchanging expected positions
 
 With SPIRV-Tools and SPIRV-Cross available at configure time, run
 `ctest --preset dev --no-tests=error -R spirv_ballot_extract -V`.
+
+### Ordinary and comparison sampler views in the SPIR-V bridge
+
+The named profile can use one indexed sampler table for ordinary samples and
+depth-reference operations. In mixed modules SPIRV-Cross infers one comparison
+type for that table. The bridge keeps ordinary accesses at set 0, binding 1.
+For each depth-reference use it loads the same descriptor index from set 3,
+binding 1. The host must populate both views from the guest sampler descriptors,
+using ordinary filters in the first and comparison filters and the guest
+comparison function in the second. Both operations retain their texture and
+coordinates. Set 3 must be free. The supported path has a direct access chain,
+sampler load and sampled image. Decorated sampler paths require separate support.
+
+Run `ctest --preset dev --no-tests=error -R spirv_sampler_views -V` with
+SPIRV-Tools and SPIRV-Cross installed. The source-built PS uses implicit LOD,
+the CS uses explicit LOD, and both compare against a depth reference. The CS
+readback on RTX 4060 Laptop and WARP sampled 0.25 and 0.75 and compared them to
+0.5, yielding 0 and 1. Reversing the ordinary wrap/clamp descriptors exchanged
+only the sampled values. Reversing the comparison descriptors exchanged only
+the two comparison results.

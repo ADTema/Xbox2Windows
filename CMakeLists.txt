@@ -73,7 +73,7 @@ find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp)
-target_sources(offscreen_check PRIVATE tests/spirv_window/readback.cpp)
+target_sources(offscreen_check PRIVATE tests/spirv_window/readback.cpp tests/spirv_window/sampler_readback.cpp)
 target_compile_features(offscreen_check PRIVATE cxx_std_17)
 target_link_libraries(offscreen_check PRIVATE d3d12 dxgi dxguid)
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -442,6 +442,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             add_test(NAME spirv_address_window_${adapter} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_SOURCE_DIR}/tests/spirv_window/draw.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
                 "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
+            add_test(NAME spirv_sampler_views_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/spirv_window/sampler.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
+                "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(spirv_sampler_views_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
             add_test(NAME spirv_ballot_extract_${adapter} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_SOURCE_DIR}/tests/spirv_window/ballot.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
                 "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -537,7 +541,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_register_probe register_probe)
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_switch_${variant} switch)
-        cpu_translation(cpu_switch_${variant} cpu_switch_aot select_rva,select_rel,run_ops,shift_narrow,flag_select,cmov_read)
+        cpu_translation(cpu_switch_${variant} cpu_switch_aot select_rva,select_rel,run_ops,shift_narrow,flag_select,cmov_read,select_rel_edges)
     endforeach()
     target_compile_definitions(cpu_switch_swapped PRIVATE SWAP_TABLE)
     add_test(NAME cpu_aot_jump_tables COMMAND "${INTAKE_PYTHON}" -B
@@ -896,6 +900,21 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_chained_frame chained)
     target_compile_definitions(cpu_chained_frame PRIVATE USE_LARGE_FRAME)
     cpu_translation(cpu_chained_frame cpu_chained_aot choose_value)
+    # One translation per export (the translator lifts one entry), each also built with /O2, where the
+    # compiler removes a read that the generated C++ lets it remove.
+    cpu_asm_fixture(cpu_chained_dead_read chained_dead_read)
+    set(chained_dead_read_files)
+    foreach(entry IN ITEMS read_dead disp_dead pair_dead read_skip read_live)
+        set(name cpu_chained_dead_read_${entry})
+        cpu_translation(cpu_chained_dead_read cpu_chained_aot ${entry} NAME ${name})
+        set(optimized "${CMAKE_CURRENT_BINARY_DIR}/${name}_o2.dll")
+        add_custom_command(OUTPUT "${optimized}"
+            COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/${name}.cpp"
+                "/Fo${CMAKE_CURRENT_BINARY_DIR}/${name}_o2.obj" "/Fe${optimized}"
+            DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/${name}.cpp" VERBATIM)
+        add_custom_target(${name}_o2 ALL DEPENDS "${optimized}")
+        list(APPEND chained_dead_read_files "${entry}=$<TARGET_FILE:${name}>" "${entry}=${optimized}")
+    endforeach()
     cpu_asm_fixture(cpu_callback callback)
     cpu_asm_fixture(cpu_version_query version_query)
     cpu_asm_fixture(cpu_heap_layout heap_layout)
@@ -1786,6 +1805,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_chained_zero>" "$<TARGET_FILE:cpu_chained_zero_lifted>"
         "$<TARGET_FILE:cpu_chained_imm>" "$<TARGET_FILE:cpu_chained_imm_lifted>"
         "$<TARGET_FILE:cpu_chained_frame>" "$<TARGET_FILE:cpu_chained_frame_lifted>")
+    add_test(NAME cpu_aot_chained_dead_reads COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/chained_dead_read_check.py" "$<TARGET_FILE:cpu_guarded_call>"
+        "$<TARGET_FILE:cpu_chained_dead_read>" ${chained_dead_read_files})
     add_test(NAME cpu_aot_direct_call COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/direct_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_call_original>" "$<TARGET_FILE:cpu_call_original_lifted>"
@@ -2026,7 +2048,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_include_directories(cpu_shim_compute PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_features(cpu_shim_compute PRIVATE cxx_std_17)
     target_link_libraries(cpu_shim_compute PRIVATE xmem_shim dxgi d3d12)
-    add_library(cpu_shim_draw SHARED tests/cpu/shim_draw_provider.cpp tests/cpu/shim_draw_gpu.cpp)
+    add_library(cpu_shim_draw SHARED tests/cpu/shim_draw_provider.cpp tests/cpu/shim_draw_gpu.cpp
+        tests/cpu/shim_chain_gpu.cpp)
     add_dependencies(cpu_shim_draw triangle_headers)
     target_sources(cpu_shim_draw PRIVATE
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.h"
@@ -2075,6 +2098,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
     endforeach()
     set_tests_properties(cpu_shim_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    # The translated compute -> mesh -> pixel chain (#658) from the same EXE entry (#671).
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME cpu_shim_chain_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_chain_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_shim_startup>" "$<TARGET_FILE:cpu_shim_startup_lifted>"
+            "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:xmem_shim>"
+            "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE:cpu_shim_draw>")
+        set_tests_properties(cpu_shim_chain_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
+    endforeach()
 
     add_test(NAME cpu_native_exe_chain COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"
@@ -2455,6 +2488,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.cso" "${DXC_BIN_DIR}/dxil.dll")
     set_tests_properties(shader_metadata_probe PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME shader_metadata_controls COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/shader_probe_check.py")
+    add_test(NAME shader_metadata_census COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/shader_census_check.py")
     # Keep both shader-model profiles in the retarget probe even though the draw fixture uses SM 6.0.
     set(retarget_copy_blocks "${CMAKE_CURRENT_BINARY_DIR}/CopyBlocksSM65.cso")
     add_custom_command(OUTPUT "${retarget_copy_blocks}"

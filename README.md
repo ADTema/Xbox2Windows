@@ -72,7 +72,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
 | PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 
-The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#direction-aware-repeated-memory-transfers-and-fills-in-the-control-flow-cpu-lifter). REP MOVS and REP STOS copy and fill 1-, 2-, 4- and 8-byte elements in either direction.
+The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#string-memory-transfers-in-the-control-flow-cpu-lifter). MOVS and STOS, with and without REP, copy and fill 1-, 2-, 4- and 8-byte elements in either direction.
 
 ### Tests by area
 
@@ -85,6 +85,7 @@ The control-flow CPU translator supports [source-built string memory transfers](
 | Audio metadata | Inventory stream counts, codec IDs and sample rates in a bounded [AWC sound-effect bank](docs/experiments.md#awc-sound-effect-format-metadata). | `ctest --preset dev --no-tests=error -R '^audio_awc_metadata$' -V` |
 | Compute shader recompilation | Translate fixed and indexed raw UAV stores, including an optional runtime constant buffer, and compare the complete buffer on D3D12. [Bindings and commands](docs/experiments.md#compute-uav-stores-from-a-native-container) | `ctest --preset dev --no-tests=error -R '^compute_store_aot_'` |
 | Static shader recompilation | Translate pixel shader fixtures to desktop DXIL and check the output, including all 32 bits of an unsigned conversion. Select a local record by name and, for duplicate names, by decoded DXBC SHA-256. [Supported instructions and bindings](docs/experiments.md#offline-pixel-shader-recompilation) · [64-bit scalar bit-set checks](docs/experiments.md#scalar-64-bit-bit-set-instructions) · [Float-to-uint readback and entry inputs](docs/experiments.md#unsigned-pixel-conversion-and-entry-inputs) | `ctest --preset dev -R '^pixel_aot_' -V` |
+| Shader census | [Distinguish archive records, header digests and cache-index entries](docs/experiments.md#reporting-shader-census-populations) before choosing a coverage denominator. | `ctest --preset dev --no-tests=error -R "^shader_metadata_census$" -V` |
 | Shader effect metadata | Inventory the [candidate programs for a named SGD5 effect](docs/experiments.md#candidate-programs-for-a-named-sgd5-effect) using independently located archive ranges. | `ctest --preset dev --no-tests=error -R "^sgd5_effect_candidates$" -V` |
 | Pipeline readiness | Join explicit pipeline references to the native shader manifest and identify blockers for PSO creation. [Inputs and WARP control](docs/experiments.md#pipeline-readiness-from-shader-manifests) | `ctest --preset dev -R '^pso_' -V` |
 | D3D12 and ray tracing | Compare the CPU reference, custom BVH shader and DXR on another adapter. Record the driver and native wave width. | `ctest --preset dev -R '^bvh_(differential\|wave64)_hardware$' -V` |
