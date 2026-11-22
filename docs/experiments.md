@@ -1293,14 +1293,16 @@ On the local `XboxBvhBuilder.dll` (SHA-256 `99f803ac22c01ef329dddb1d40be67238d2a
 - With `--keep-root-flags`, all 9 passed `ModuleOnly` (`0x00000000`, zero diagnostics) and all 9 failed container validation with `0x80aa0013` (`Unsupported bit-flag set (root signature flags 0x3000000)`).
 - With default container retargeting (clearing `0x03000000`), all 9 passed both `ModuleOnly` and container validation (`0x00000000`, zero diagnostics).
 
-The other 43 BVH modules still fail validation after retargeting because of direct `xbox.*` calls and aggregate `insertvalue`/`extractvalue` instructions used with those intrinsics. The 29 AMD upscaler containers carry `RTS0` and `ACCC` without a `DXIL` part. Re-signing containers for live `CreateComputePipelineState` execution remains separate work.
+The other 43 BVH modules still fail validation after retargeting because of direct `xbox.*` calls and aggregate `insertvalue`/`extractvalue` instructions used with those intrinsics. The 29 AMD upscaler containers carry `RTS0` and `ACCC` without a `DXIL` part.
 
-Public CI tests pure-Python bitcode/container controls (`dxil_retarget_controls`) and source-built `compute_root.cso` and `CopyBlocks.cso` shaders synthetically injected with `dxil-ms-xb2`, `xbox.compiler.options`, `BitcodeOffset=112` and `RTS0` flags `0x03000000` (`dxil_retarget_probe`), including negative controls for unmodified xb2, `--target-triple dxil-ms` and `--keep-root-flags`.
+Passing `--sign` to `tools/dxil_retarget.py` (with `--probe root_probe.exe`) re-signs retargeted DXBC containers in place through `dxil.dll` (`IDxcValidator::Validate` with `DxcValidatorFlags_InPlaceEdit`). Adding `--pso-probe root_device_probe.exe` (and optional `--warp-only`) tests `CreateRootSignature` and `CreateComputePipelineState` on desktop D3D12 against the re-signed container.
+
+Public CI tests pure-Python bitcode/container/signing controls (`dxil_retarget_controls`) and source-built `compute_root.cso` and `CopyBlocks.cso` shaders synthetically injected with `dxil-ms-xb2`, `xbox.compiler.options`, `BitcodeOffset=112` and `RTS0` flags `0x03000000` (`dxil_retarget_probe`). Negative controls verify that unmodified `xb2`, `--target-triple dxil-ms` and `--keep-root-flags` fail both validation and `--sign`, and that unsigned (zero-digest) and tampered-digest containers fail `CreateComputePipelineState` on WARP. Re-signed retargeted containers pass `CreateComputePipelineState` on WARP (for `compute_root.cso`, and for `CopyBlocks.cso` when WARP reports SM 6.5 or newer), and the re-signed `compute_root.cso` executes on WARP with CPU-checked readback through `offscreen_check warp --compute-root-file`.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^dxil_retarget_' -V
-# Local validation of the 9 modules without xbox.* calls:
-.\out\pe-env\Scripts\python.exe -B tools/dxil_retarget.py --pe "game-files/<build-directory>/XboxBvhBuilder.dll" --only-without-xbox-calls --probe out/build/dev/root_probe.exe --report out/calls/dxil-retarget.json
+# Local validation, re-signing and compute PSO check of the 9 modules without xbox.* calls:
+.\out\pe-env\Scripts\python.exe -B tools/dxil_retarget.py --pe "game-files/<build-directory>/XboxBvhBuilder.dll" --only-without-xbox-calls --sign --probe out/build/dev/root_probe.exe --pso-probe out/build/dev/root_device_probe.exe --output-dir out/calls/dxil-signed --report out/calls/dxil-retarget.json
 ```
 
 ### BVH reads and cross-lane operations
