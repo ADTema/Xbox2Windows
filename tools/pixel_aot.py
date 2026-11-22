@@ -829,10 +829,10 @@ def scalar_u64(token, scalar, pending, *, signed=False):
 
 def lane_mask(token):
     """Name the registers of a per-lane condition for either wavefront width."""
-    if token.startswith("vcc"):
+    if token in ("vcc", "vcc_lo"):
         return ["vcc"]
     if m := re.fullmatch(r"s\[(\d+):(\d+)\]", token):
-        return [f"s{n}" for n in registers(*m.groups(), 2)]
+        return sgpr_pair(token)
     return [token]
 
 
@@ -1380,6 +1380,38 @@ def sdwa_dest(result, sel, unused, old):
 # Exact arithmetic with SDWA forms on gfx1013 (docs/coverage/gfx1013.tsv).
 SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", "ceil", "fract", "trunc")
 
+MISSING = object()
+
+# Inside an exec-masked region only pure per-lane vector-register work is legal. Anything
+# not starting with v_ is scalar-unit, memory, control-flow, wait or export work. The
+# listed v_ forms write scalar masks, produce scalar outputs or read or write other
+# lanes' state, which a per-lane model cannot merge.
+REGION_DENIED = re.compile(
+    r"^(?!v_)|^v_(?:cmp|interp|readfirstlane|readlane|writelane|permlane)|_dpp\b")
+
+
+class TrackedVector(dict):
+    """Vector register names that record reads, so a conditionally-written register can be refused."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reads = []
+        self.masked = False
+        self.conditional = set()
+
+    def __getitem__(self, key):
+        self.reads.append(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self.reads.append(key)
+        return super().get(key, default)
+
+    def __setitem__(self, key, value):
+        if not self.masked:
+            self.conditional.discard(key)
+        super().__setitem__(key, value)
+
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           second_texture_offset=None, integer_export=False, texcoord_components=2):
@@ -1391,7 +1423,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if texcoord_components not in (2, 4):
         raise ValueError("Expected two or four TEXCOORD components")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
-    vector = {"v0": "bary_i", "v1": "bary_j"}
+    vector = TrackedVector({"v0": "bary_i", "v1": "bary_j"})
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
     # The boolean records whether the quad value depends on interpolated coordinates.
     quad_values = {"uv.x": True, "uv.y": True}
@@ -1425,12 +1457,32 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     lines.append(f"{result_type} main(float2 uv : TEXCOORD0) : SV_Target0 {{")
     attribute_input = False
     interpolated = False
-    for i, line in enumerate(instructions):
+    region = None
+    seen_skip = False
+    offset_index = {element[0]: j for j, element in enumerate(instructions) if isinstance(element, tuple)}
+    for i, element in enumerate(instructions):
+        offset, line = element if isinstance(element, tuple) else (None, element)
+        vector.reads.clear()
+        conditional = set(vector.conditional)
+
         def match(pattern):
             return re.fullmatch(pattern, line)
 
         if ended:
             raise ValueError("Instruction follows program end")
+        rstate = None
+        if region is not None:
+            if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]", line):
+                pass
+            elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
+                    and i == region["start"] + 1 and region["skip"] is None):
+                pass
+            elif REGION_DENIED.search(line):
+                raise ValueError(f"Instruction cannot run in a masked region: {line}")
+            else:
+                rstate = (dict(scalar), dict(vector), scc, set(pending), dict(sample_dest),
+                          exported, ended, mask, attribute_input, interpolated,
+                          dict(quad_values), samples)
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
             continue
         if match(r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])"):
@@ -1493,6 +1545,57 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "quad" or [scalar.get(f"s{n}") for n in pair] != [("entry",0),("entry",1)]:
                 raise ValueError("Unsupported execution mask")
             mask = "entry"
+            scc = None
+        elif m := match(r"s_and_saveexec_b64 (s\[\d+:\d+\]), (vcc|s\[\d+:\d+\])"):
+            # A masked-if from a known full entry mask: the source must hold a tracked
+            # comparison, whose lanes select which registers the region may rewrite.
+            pair = sgpr_pair(m[1])
+            regs = lane_mask(m[2])
+            condition = scalar.get(regs[0])
+            if (region is not None or mask != "entry" or pending.intersection(pair)
+                    or not isinstance(condition, tuple) or condition[0] != "condition"
+                    or [scalar.get(r) for r in regs]
+                        != [(*condition[:2], j, len(regs)) for j in range(len(regs))]):
+                raise ValueError("Unsupported execution mask save")
+            scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
+            region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i}
+            vector.masked = True
+            scc = None
+        elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
+            # The whole-wave empty-mask skip may sit right after the save; its target must be
+            # the matching restore exactly. Offsets count from the next instruction.
+            if (region is None or offset is None or i != region["start"] + 1
+                    or region["skip"] is not None or seen_skip):
+                raise ValueError("Unsupported execution skip")
+            imm = int(m[1], 0)
+            if not -0x8000 <= imm <= 0x7fff:
+                raise ValueError("Execution skip displacement out of range")
+            restore = offset_index.get(offset + 4 + imm * 4)
+            if restore is None or restore <= i:
+                raise ValueError("Execution skip targets no instruction boundary")
+            target = instructions[restore][1] if isinstance(instructions[restore], tuple) else instructions[restore]
+            if not (rm := re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)) \
+                    or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
+                raise ValueError("Execution skip does not target the matching restore")
+            region["skip"] = restore
+            seen_skip = True
+        elif m := match(r"s_or_b64 exec, exec, (s\[\d+:\d+\])"):
+            pair = sgpr_pair(m[1])
+            if (region is None or pair != region["save"]
+                    or (region["skip"] is not None and region["skip"] != i)):
+                raise ValueError("Unexpected execution mask restore")
+            for dst, outer in region["written"].items():
+                if outer is MISSING or dst in vector.conditional:
+                    vector.conditional.add(dst)
+                    continue
+                if not isinstance(outer, str) or outer in ("bary_i", "bary_j"):
+                    raise ValueError("Masked region rewrites a register without a numeric value")
+                inner = vector[dst]
+                lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
+                vector[dst] = f"alu{i}_{dst}"
+            region = None
+            vector.masked = False
+            vector.reads.clear()
             scc = None
         elif m := match(r"s_(cmov|not|brev)_b64 (s\[\d+:\d+\]), ([^,]+)"):
             op, dst, src = m.groups()
@@ -1862,7 +1965,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             word = f"asuint({fp_operand(src, scalar, vector, pending, sample_dest)})"
-            result = sdwa_dest(sdwa_source(word, src_sel, bool(sext)), dst_sel, unused, vector.get(dst))
+            keep_old = SDWA_SEL[dst_sel][1] != 32 and unused == "UNUSED_PRESERVE"
+            result = sdwa_dest(sdwa_source(word, src_sel, bool(sext)), dst_sel,
+                               unused, vector.get(dst) if keep_old else None)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({result});")
         elif m := match(r"v_cvt_f32_f16_sdwa (v\d+), (-?)(?:\|([vs]\d+)\||([vs]\d+))( clamp)? dst_sel:DWORD dst_unused:UNUSED_(?:PAD|PRESERVE) src0_sel:(WORD_[01])"):
@@ -1896,7 +2001,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if clamp:
                 expression = f"saturate({expression})"
             if dst_sel != "DWORD":
-                expression = f"asfloat({sdwa_dest(f'asuint({expression})', dst_sel, unused, vector.get(dst))})"
+                expression = f"asfloat({sdwa_dest(f'asuint({expression})', dst_sel, unused, vector.get(dst) if unused == 'UNUSED_PRESERVE' else None)})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_mov_b32(?:_e32|_e64)? (v\d+), (-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)"):
@@ -2444,6 +2549,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             ended = True
         else:
             raise ValueError(f"Unsupported instruction {i}: {line}")
+        if rstate is not None:
+            (old_scalar, old_vector, old_scc, old_pending, old_sample_dest, old_exported,
+             old_ended, old_mask, old_attribute, old_interpolated, old_quad, old_samples) = rstate
+            writes = {k for k in set(vector) | set(old_vector)
+                      if old_vector.get(k, MISSING) != dict.get(vector, k, MISSING)}
+            if (scalar != old_scalar or scc != old_scc or pending != old_pending
+                    or sample_dest != old_sample_dest or exported != old_exported
+                    or ended != old_ended or mask != old_mask
+                    or attribute_input != old_attribute or interpolated != old_interpolated
+                    or quad_values != old_quad or samples != old_samples or not writes
+                    or any(not isinstance(dict.get(vector, k), str) for k in writes)):
+                raise ValueError(f"Unsupported masked-region operation {i}: {line}")
+            for k in writes:
+                region["written"].setdefault(k, old_vector.get(k, MISSING))
+        if conditional.intersection(vector.reads):
+            raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
+    if region is not None:
+        raise ValueError("Program ends inside a masked region")
     if not ended or samples != len(bindings):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
@@ -2476,7 +2599,7 @@ def main():
         parser.error("Choose an HLSL destination distinct from the input")
     try:
         blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256, llvm=args.llvm)
-        instructions = disassemble(code, args.llvm)
+        instructions = disassemble(code, args.llvm, offsets=True)
         source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor, second_texture_offset=args.second_texture_offset)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")
