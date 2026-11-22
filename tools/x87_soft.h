@@ -337,6 +337,44 @@ static inline uint64_t x87_to_integer(X87Value v, int bits, bool chop, uint16_t 
     return (x87_sign(v) ? 0 - magnitude : magnitude) & mask;
 }
 
+// FBSTP: ST(0) rounded to an integer in the direction of the rounding control, as 18 packed BCD digits
+// in bytes 0 to 8 (low and high, two digits a byte, the lower digit in the low nibble) and the sign of
+// ST(0) in bit 7 of byte 9, which a negative value that rounds to zero keeps. A NaN, an infinity, an
+// unsupported encoding or a rounded magnitude of 10^18 or more gives the packed BCD indefinite (bytes 7 to
+// 9 0xc0, 0xff and 0xff), the masked invalid-operation response. The precision control does not apply.
+static inline void x87_to_bcd(X87Value v, uint16_t cw, uint64_t& low, uint16_t& high) {
+    const uint64_t r = x87_to_integer(v, 64, false, cw);  // two's complement, or 2^63 for the indefinite
+    uint64_t n = x87_sign(v) ? 0 - r : r;
+    if (r == 1ull << 63 || n >= 1000000000000000000ull) {  // bcd range
+        low = 0xc000000000000000ull;
+        high = 0xffff;
+        return;
+    }
+    const uint16_t sign = x87_sign(v) ? 0x8000 : 0;  // bcd sign
+    low = 0;
+    for (int k = 0; k < 16; ++k, n /= 10) low |= (n % 10) << (4 * k);
+    high = static_cast<uint16_t>(sign | (n / 10) << 4 | n % 10);
+}
+
+// FBLD: the 18 packed BCD digits of bytes 0 to 8 (low and high), converted exactly, with the sign in bit
+// 7 of byte 9; the other bits of that byte are ignored, and a zero keeps its sign. False for a digit
+// above 9, whose result the SDM leaves undefined.
+static inline bool x87_from_bcd(uint64_t low, uint16_t high, X87Value& out) {
+    uint64_t n = 0;
+    for (int k = 17; k >= 0; --k) {
+        const uint64_t digit = ((k >= 16 ? high : low) >> (4 * (k & 15))) & 15;  // bcd digit
+        if (digit > 9) return false;
+        n = n * 10 + digit;
+    }
+    const bool negative = (high & 0x8000) != 0;  // bcd sign bit
+    if (n == 0) {
+        out = {0, static_cast<uint16_t>(negative ? 0x8000 : 0)};
+        return true;
+    }
+    out = x87_from_integer(negative ? -static_cast<int64_t>(n) : static_cast<int64_t>(n));
+    return true;
+}
+
 // FCOMI, FUCOMI and their P forms: 0 if a < b, 1 if equal, 2 if a > b and 3 if unordered (a NaN or an
 // unsupported encoding; with the invalid operation masked, FCOMI and FUCOMI give the same result). The
 // comparison uses all 64 significand bits, +0 equals -0, and a pseudo-denormal equals the normal value
