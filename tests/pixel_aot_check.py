@@ -28,7 +28,7 @@ SOPC_OPS = (
 VOP2_INT_OPS = (
     "v_lshrrev_b32_e32", "v_ashrrev_i32_e32", "v_lshlrev_b32_e32",
     "v_and_b32_e32", "v_or_b32_e32", "v_xor_b32_e32",
-    "v_add_nc_u32_e32", "v_sub_nc_u32_e32",
+    "v_add_nc_u32_e32", "v_sub_nc_u32_e32", "v_subrev_nc_u32_e32",
 )
 
 
@@ -3178,6 +3178,7 @@ def vop2_integer_group() -> list[str]:
         "v_xor_b32_e32 v13, s44, v18",
         "v_add_nc_u32_e32 v14, s44, v18",
         "v_sub_nc_u32_e32 v15, s44, v18",
+        "v_subrev_nc_u32_e32 v16, s44, v18",
     ])
 def pack_f16_pair(lo, hi):
     lo_b = struct.unpack("<H", struct.pack("<e", lo))[0]
@@ -3505,12 +3506,15 @@ def check_controls(directory):
         "(asuint(params[0].w) ^ asuint(alu20))",
         "(asuint(params[0].w) + asuint(alu20))",
         "(asuint(params[0].w) - asuint(alu20))",
+        "(asuint(alu20) - asuint(params[0].w))",
     ):
         assert expected in vop2_source, expected
     for bad_vop2 in (
         "v_add_nc_u32_e64 v12, s44, v18",
         "v_sub_nc_u32_e64 v12, s44, v18",
+        "v_subrev_nc_u32_e64 v12, s44, v18",
         "v_sub_nc_u32_e32 v12, abs(v18), v18",
+        "v_subrev_nc_u32_e32 v12, abs(v18), v18",
         "v_and_b32_e32 v12, -v18, v18",
         "v_and_b32_e32 v12, abs(v18), v18",
         "v_and_b32_e32 v12, v106, v18",
@@ -4531,6 +4535,34 @@ def check_integer_readback_draw(directory, compiler, renderer, backend):
         raise AssertionError("A corrupted expected word escaped the integer readback")
 
 
+def check_subrev_u32_draw(directory, compiler, renderer, backend):
+    source = directory / "subrev_u32.hlsl"
+    shader = directory / "subrev_u32.cso"
+    program = uncompressed_export([
+        "v_mov_b32_e32 v18, s45",
+        "v_subrev_nc_u32_e32 v12, s44, v18",
+        "v_sub_nc_u32_e32 v13, s44, v18",
+        "v_mov_b32_e32 v14, 0",
+        "v_mov_b32_e32 v15, 0",
+    ])
+    source.write_text(lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                            integer_export=True), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    # Check normal subtraction and unsigned wrap with exact RGBA32_UINT readback.
+    for name, inputs, words, status in (
+        ("forward-oracle", (1, 0), (1, 0xffffffff), "mismatch"),
+        ("wrap", (1, 0), (0xffffffff, 1), "pass"),
+        ("normal", (3, 7), (4, 0xfffffffc), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<2I", constants, 12, *inputs)
+        case = directory / f"subrev-u32-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words, 0, 0) * 64 + b"\x01")
+        cases.append((case, status))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+
 # v_cvt_f32_u32_e32 and v_cvt_f32_i32_e32 convert one 32-bit word to binary32, reading it unsigned
 # or two's-complement. The inputs are shader literals moved through v_mov_b32 bit copies, not
 # constant-buffer words (#360): the pairs cover zero and one, the last exactly representable integer
@@ -5453,6 +5485,7 @@ def check_e64_render(directory, compiler, renderer, backend):
     check_f16_denorm_draw(directory, compiler, renderer, backend)
     check_nan_class_draw(directory, compiler, renderer, backend)
     check_integer_readback_draw(directory, compiler, renderer, backend)
+    check_subrev_u32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend)
     check_cvt_float_int_draw(directory, compiler, renderer, backend)
