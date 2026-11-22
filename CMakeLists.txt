@@ -1168,6 +1168,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_sign_ext_adc COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sign_ext_adc.py"
         check "$<TARGET_FILE:cpu_sign_ext_adc>" "$<TARGET_FILE:cpu_sign_ext_adc_lifted>")
 
+    cpu_asm_fixture(cpu_fences_hints fences_hints)
+    set(fences_hints_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_fences_hints_lifted.cpp")
+    add_custom_command(OUTPUT "${fences_hints_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/fences_hints.py"
+            emit "$<TARGET_FILE:cpu_fences_hints>" "${fences_hints_fixture}"
+        DEPENDS cpu_fences_hints tests/cpu/fences_hints.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_fences_hints_lifted SHARED "${fences_hints_fixture}")
+    add_test(NAME cpu_aot_fences_hints COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/fences_hints.py"
+        check "$<TARGET_FILE:cpu_fences_hints>" "$<TARGET_FILE:cpu_fences_hints_lifted>")
+    set_tests_properties(cpu_aot_fences_hints PROPERTIES SKIP_RETURN_CODE 77)
+
     cpu_asm_fixture(cpu_bmi2 bmi2)
     set(bmi2_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_bmi2_lifted.cpp")
     add_custom_command(OUTPUT "${bmi2_fixture}"
