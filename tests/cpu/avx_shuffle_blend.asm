@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_avx_shuffle_blend
 ; Source-owned differential fixture for 26 AVX broadcast, extract/insert, permute, shuffle, blend, dot, round, and zeroall instructions.
 .code
 
