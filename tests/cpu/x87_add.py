@@ -364,19 +364,61 @@ class Runner:
     """Calls an export through the native harness with guarded input and output buffers."""
 
     def __init__(self, harness_path, path):
-        self.call = ctypes.CDLL(str(Path(harness_path).resolve())).x87_call
+        self.harness = ctypes.CDLL(str(Path(harness_path).resolve()))
+        self.call = self.harness.x87_call
         self.call.argtypes, self.call.restype = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint64
+        self.seeded = self.harness.x87_seeded
+        self.seeded.argtypes, self.seeded.restype = [ctypes.c_void_p] * 4, ctypes.c_uint64
         self.lib = ctypes.CDLL(str(Path(path).resolve()))
 
-    def __call__(self, name, data):
+    def _buffers(self, data):
         guard = b"\xa5" * GUARD
         source = (ctypes.c_uint8 * (INPUT + 2 * GUARD)).from_buffer_copy(guard + data + guard)
         target = (ctypes.c_uint8 * (OUTPUT + 2 * GUARD)).from_buffer_copy(guard + b"\xcc" * OUTPUT + guard)
-        function = ctypes.cast(getattr(self.lib, name), ctypes.c_void_p).value
-        state = self.call(function, ctypes.addressof(source) + GUARD, ctypes.addressof(target) + GUARD)
+        return guard, source, target
+
+    def _output(self, name, data, guard, source, target):
         if bytes(source) != guard + data + guard or bytes(target[:GUARD]) + bytes(target[-GUARD:]) != guard * 2:
             raise AssertionError(f"{name} wrote outside its output block")
-        return bytes(target[GUARD:GUARD + OUTPUT]), state
+        return bytes(target[GUARD:GUARD + OUTPUT])
+
+    def __call__(self, name, data):
+        guard, source, target = self._buffers(data)
+        function = ctypes.cast(getattr(self.lib, name), ctypes.c_void_p).value
+        state = self.call(function, ctypes.addressof(source) + GUARD, ctypes.addressof(target) + GUARD)
+        return self._output(name, data, guard, source, target), state
+
+    def with_live_value(self, harness, name, data):
+        """Run name through the harness export `harness` from x87_seeded, which enters it with SEED_VALUE
+        in ST(0) and SEED_CONTROL loaded. Returns the output block, the harness state, the value popped
+        afterwards (10 bytes) and the 28-byte environment seen before that pop."""
+        guard, source, target = self._buffers(data)
+        probe = (ctypes.c_uint8 * 80).from_buffer_copy(
+            m80_bytes(SEED_VALUE)[:10] + b"\0" * 6 + SEED_CONTROL.to_bytes(2, "little") + b"\0" * 62)
+        io = (ctypes.c_uint64 * 2)(ctypes.addressof(source) + GUARD, ctypes.addressof(target) + GUARD)
+        state = self.seeded(ctypes.cast(getattr(self.harness, harness), ctypes.c_void_p).value,
+                            ctypes.cast(getattr(self.lib, name), ctypes.c_void_p).value,
+                            ctypes.addressof(io), ctypes.addressof(probe))
+        return self._output(name, data, guard, source, target), state, bytes(probe[32:42]), bytes(probe[48:76])
+
+
+# A caller value the harness must preserve: pi with all 64 significand bits, under a control word that
+# differs from the profile's in precision and rounding (64 bits, toward zero).
+SEED_VALUE = (0xC90FDAA22168C235, 0x4000)
+SEED_CONTROL = 0x0F7F
+
+
+def entry_state_ok(state):
+    return (state & 0xFFFF, (state >> 32) & 0xFFFF, (state >> 16) & 0x3800) == (0x027F, 0xFFFF, 0)
+
+
+def preserved(run, harness, name, data, want):
+    """Whether a run with a live caller value gave the expected output from the profile's entry state
+    and returned the caller's value bytes, control word, TOP 7 and the single valid tag."""
+    got, state, value, env = run.with_live_value(harness, name, data)
+    control, status, tags = (int.from_bytes(env[k:k + 2], "little") for k in (0, 4, 8))
+    return (got == want and entry_state_ok(state) and value == m80_bytes(SEED_VALUE)[:10]
+            and (control, (status >> 11) & 7, tags) == (SEED_CONTROL, 7, 0x3FFF))
 
 
 def check(harness_path, native_path, lifted_path, *control_paths):
@@ -400,6 +442,22 @@ def check(harness_path, native_path, lifted_path, *control_paths):
     print(f"{len(expected)} cases over {len(SEQUENCES)} exports (output block and guards) matched the reference "
           "in native and translated DLLs; each export returned with control 0x027f and an empty stack")
     print(f"processor: {platform.processor()}")
+    # The harness itself: a caller value in the register each export reuses must survive the call.
+    first = {}
+    for name, data, want in expected:
+        first.setdefault(name, (data, want))
+    for label, path in (("native", native_path), ("lifted", lifted_path)):
+        run = Runner(harness_path, path)
+        failed = [name for name, (data, want) in first.items() if not preserved(run, "x87_call", name, data, want)]
+        if failed:
+            raise AssertionError(f"x87_call lost a live caller value or control word around {label} {failed}")
+    envonly = sum(1 for name, (data, want) in first.items()
+                  if not preserved(Runner(harness_path, native_path), "x87_call_envonly", name, data, want))
+    print(f"x87_call kept a live caller ST(0) value and control word {SEED_CONTROL:#06x} around all "
+          f"{len(first)} native and translated exports; control envonly (FNSTENV/FLDENV): "
+          f"{envonly}/{len(first)} lost it")
+    if envonly != len(first):
+        raise AssertionError("control envonly preserved the caller value")
     for path in control_paths:
         control = Path(path).stem.rsplit("_", 1)[-1]
         run = Runner(harness_path, path)
