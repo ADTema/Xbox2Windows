@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_avx_int_shifts_pack
 ; Source-owned differential fixture for 34 VEX AVX packed shifts, packs, unpacks, shuffles, blends, movemask, and insert/extract instructions.
 .code
 
