@@ -3081,3 +3081,40 @@ readback on RTX 4060 Laptop and WARP sampled 0.25 and 0.75 and compared them to
 0.5, yielding 0 and 1. Reversing the ordinary wrap/clamp descriptors exchanged
 only the sampled values. Reversing the comparison descriptors exchanged only
 the two comparison results.
+
+### Standalone comparison-sampler split in the SPIR-V bridge
+
+When one standalone SPIR-V sampler variable feeds both depth-comparison and ordinary
+sampling, SPIRV-Cross declares a `SamplerComparisonState` and passes it to
+`SampleLevel`, which DXC rejects with
+`no matching member function for call to 'SampleLevel'`. The indexed sampler table
+above is handled by the sampler views. For a standalone sampler, the opt-in
+`tools/spirv_sampler_split.py` keeps the comparison sampler at its binding and moves
+only the ordinary uses to a new sampler at a binding the host supplies with
+`--ordinary-binding`. That binding must be free in the same descriptor set. The pass
+prints the `descriptor_set`, `comparison_binding` and `ordinary_binding` mapping for
+the host.
+
+The pass first looks for a directly loaded standalone sampler that feeds both kinds of
+sampling. Modules without one are returned byte-for-byte unchanged. That includes the
+indexed table above and unrelated samples on other samplers. For the sampler it splits,
+the profile covers direct, non-array float32 `Texture2D` sampling in one compute entry
+point at a constant LOD of zero. Other uses of that sampler, an occupied binding, a
+nonzero LOD and more than one mixed sampler are rejected with a specific diagnostic.
+
+The [source-built fixture](../tests/spirv_window/shared_sampler.spvasm) compares
+references 0.25 and 0.75 against depth 0.5 with point-clamp `LESS_EQUAL`, and
+samples an ordinary texel of 0.375. The test first checks that DXC rejects the
+unsplit module. It then splits the module to ordinary binding 5, validates it for
+Vulkan 1.2, cross-compiles it and compiles it as `cs_6_6`. On RX 9070 XT and WARP,
+both readbacks returned 1.0, 0.0 and 0.375 and left all 13 guard words unchanged.
+A reference claiming that the second comparison passed produced exactly one
+mismatch, at word 1, on each adapter. Two descriptor controls change one static
+sampler at a time. Switching s2 to `GREATER` exchanged only the two comparison
+results. Clamping the ordinary sampler to `MinLOD` 1 changed only the ordinary
+sample, to 0.625 from the value texture's second mip. The occupied-binding,
+nonzero-LOD, already-separated and passthrough controls run without a GPU.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^spirv_compare_sampler_' -V
+```
