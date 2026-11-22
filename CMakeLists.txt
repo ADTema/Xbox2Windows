@@ -1238,6 +1238,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_avx2_shifts>" "$<TARGET_FILE:cpu_avx2_shifts_lifted>")
     set_tests_properties(cpu_aot_avx2_shifts PROPERTIES SKIP_RETURN_CODE 77)
 
+    cpu_asm_fixture(cpu_avx2_permutes avx2_permutes)
+    set(avx2_permutes_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx2_permutes_lifted.cpp")
+    add_custom_command(OUTPUT "${avx2_permutes_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx2_permutes.py"
+            emit "$<TARGET_FILE:cpu_avx2_permutes>" "${avx2_permutes_fixture}"
+        DEPENDS cpu_avx2_permutes tests/cpu/avx2_permutes.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_avx2_permutes_lifted SHARED "${avx2_permutes_fixture}")
+    add_test(NAME cpu_aot_avx2_permutes COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx2_permutes.py"
+        check "$<TARGET_FILE:cpu_avx2_permutes>" "$<TARGET_FILE:cpu_avx2_permutes_lifted>")
+    set_tests_properties(cpu_aot_avx2_permutes PROPERTIES SKIP_RETURN_CODE 77)
+
     cpu_asm_fixture(cpu_sse41_int sse41_int)
     set(sse41_int_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse41_int_lifted.cpp")
     add_custom_command(OUTPUT "${sse41_int_fixture}"
