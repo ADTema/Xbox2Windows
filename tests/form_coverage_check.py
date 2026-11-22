@@ -317,15 +317,17 @@ def check_shader_records():
         assert vop2_forms <= covered, (name, vop2_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
-    # Integer comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit predicate the
-    # translator lowers; the rejected exec-writing, 64-bit and f16 class neighbours stay out.
+    # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit
+    # predicate the translator lowers; the rejected exec-writing and 64-bit neighbours stay out.
     int_compares = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
                     for kind in ("i16", "u16", "i32", "u32")}
     int_compares |= {f"v_cmp_{op}_{kind}" for op in ("f", "t") for kind in ("i32", "u32")}
-    compare_forms = {("VOPC", form) for form in int_compares} | {("VOP3", f"{form}_e64") for form in int_compares}
-    assert len(compare_forms) == 56
+    f16_compares = {f"v_cmp_{op}_f16" for op in pixel.PREDICATES} | {"v_cmp_class_f16"}
+    compare_forms = ({("VOPC", form) for form in int_compares | f16_compares}
+                     | {("VOP3", f"{form}_e64") for form in int_compares | f16_compares})
+    assert len(compare_forms) == 90
     compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_i32", "v_cmp_lt_i64", "v_cmp_lt_u64",
-                          "v_cmp_class_f16", "v_cmp_lt_f16"}
+                          "v_cmp_class_f64", "v_cmp_lt_f64"}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert compare_forms | {("VOPC", n) for n in compare_neighbours} <= reference, name

@@ -226,6 +226,18 @@ uint class32(float value) {
     if (magnitude != 0u) return negative ? 0x10u : 0x80u;
     return negative ? 0x20u : 0x40u;
 }
+// v_cmp_class_f16: the ten binary16 classes of LLVM SIInstrFlags::ClassFlags, from bits [15:0]:
+// signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
+uint class16(uint bits) {
+    uint h = bits & 0xffffu;
+    uint magnitude = h & 0x7fffu;
+    bool negative = h >= 0x8000u;
+    if (magnitude > 0x7c00u) return (h & 0x0200u) != 0u ? 0x2u : 0x1u;
+    if (magnitude == 0x7c00u) return negative ? 0x4u : 0x200u;
+    if (magnitude >= 0x0400u) return negative ? 0x8u : 0x100u;
+    if (magnitude != 0u) return negative ? 0x10u : 0x80u;
+    return negative ? 0x20u : 0x40u;
+}
 // v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
 // D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
 float fract32(float value) {
@@ -1067,6 +1079,37 @@ def vop3p_f16_word(token, scalar, vector, pending, sample_dest):
             raise ValueError(f"Unsupported packed integer inline constant {token}")
         return f"{value & 0xffffffff}u"
     raise ValueError(f"Unsupported packed operand {token}")
+
+
+def f16_cmp_operand(token, scalar, vector, pending, sample_dest, *, allow_mods, as_bits):
+    """Return one binary16 comparison source as low-16-bit uint bits or a widened float."""
+    neg = False
+    use_abs = False
+    if token not in INLINE_F16 and not re.fullmatch(r"-\d+", token):
+        if token.startswith("-"):
+            neg = True
+            token = token[1:]
+        if m := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
+            use_abs = True
+            token = m.group(1) or m.group(2)
+        if (neg or use_abs) and not allow_mods:
+            raise ValueError("Input modifiers require VOP3 encoding")
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", token) and int(token, 16) > 0xffff:
+        raise ValueError(f"16-bit literal out of range: {token}")
+    word = vop3p_f16_word(token, scalar, vector, pending, sample_dest)
+    if as_bits:
+        expr = f"({word} & 0xffffu)"
+        if use_abs:
+            expr = f"({expr} & 0x7fffu)"
+        if neg:
+            expr = f"({expr} ^ 0x8000u)"
+        return expr
+    expr = f"widen16({word})"
+    if use_abs:
+        expr = f"abs({expr})"
+    if neg:
+        expr = f"(-{expr})"
+    return expr
 
 
 def parse_vop3p_f16(rest, arity):
@@ -1962,6 +2005,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
+        elif m := match(rf"v_cmp_class_f16(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            enc, dst, value, classes = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+                bits = f"{int(classes, 0) & 0xffffffff}u"
+            elif re.fullmatch(r"[vs]\d+", classes):
+                bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
+            else:
+                raise ValueError("Unsupported class mask")
+            operand = f16_cmp_operand(
+                value, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=True
+            )
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = (class16({operand}) & {bits}) != 0u;")
 
         elif m := (match(r"v_(add|sub|subrev)_nc_u32(?:_e32|_e64)? (v\d+), ([^,\s]+), ([^,\s]+)")
                    or match(r"v_(add|sub)_nc_i32 (v\d+), ([^,\s]+), ([^,\s]+)")):
@@ -2022,6 +2082,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
             values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+        elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f16(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            op, enc, dst, *tokens = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            values = [
+                f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=False)
+                for t in tokens
+            ]
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")

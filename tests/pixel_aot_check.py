@@ -5009,8 +5009,8 @@ def check_controls(directory):
         "v_cmpx_lt_i32_e32 s44, v18",
         "v_cmp_lt_i64_e64 s52, s[44:45], v[18:19]",
         "v_cmp_lt_u64_e32 vcc_lo, s[44:45], v[18:19]",
-        "v_cmp_class_f16_e32 vcc_lo, s44, v18",
-        "v_cmp_lt_f16_e64 s52, s44, v18",
+        "v_cmp_class_f64_e32 vcc_lo, s[44:45], v18",
+        "v_cmp_lt_f64_e64 s52, s[44:45], v[18:19]",
     ):
         changed = [line.replace(target, bad) for line in base16]
         assert changed != base16
@@ -5022,6 +5022,42 @@ def check_controls(directory):
     must_reject(translate, base16[:pos] + ["v_cmp_eq_i16_e32 vcc_lo, s44, 0"] + base16[pos:])
     pos = base16.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base16[:pos] + ["v_cmp_eq_i16_e32 vcc_lo, 0, 0"] + base16[pos:])
+
+    f16_hlsl = translate_int(uncompressed_export(f16_compares()))
+    assert "uint class16(uint bits)" in f16_hlsl and "float widen16(uint word)" in f16_hlsl
+    for words in F16_COMPARE_SETS:
+        expected_words = f16_compares_reference(words)
+        assert all((word & 0x7f800000) == 0 for word in expected_words), expected_words
+        assert expected_words != f16_compares_reference((words[0] ^ 0x8000, words[1], words[2] ^ 0x8000, words[3] ^ 0x3ff))
+    f16_program = uncompressed_export(f16_compares())
+    for bad in (
+        "v_cmp_lt_f16_e32 vcc_lo, -s44, v18",
+        "v_cmp_lt_f16_e32 vcc_lo, |s44|, v18",
+        "v_cmp_lt_f16_e32 vcc_lo, abs(s44), v18",
+        "v_cmp_class_f16_e32 vcc_lo, -s44, v18",
+        "v_cmp_class_f16_e32 vcc_lo, |s44|, v18",
+        "v_cmp_class_f16_e32 vcc_lo, abs(s44), v18",
+        "v_cmp_lt_f16_e32 vcc_lo, 0x10000, v18",
+        "v_cmp_lt_f16_e64 s52, 0x10000, v18",
+        "v_cmp_class_f16_e32 vcc_lo, 0x10000, v18",
+        "v_cmp_lt_f16_e64 s52, s44, v18 clamp",
+        "v_cmp_class_f16_e64 s52, s44, v18 clamp",
+        "v_cmp_lt_f16_e64 s52, s44, v18 op_sel:[1,0,0]",
+        "v_cmpx_lt_f16_e32 s44, v18",
+        "v_cmpx_lt_f16_e64 s52, s44, v18",
+        "v_cmpx_class_f16_e32 s44, v18",
+        "v_cmpx_class_f16_e64 s52, s44, v18",
+        "v_cmp_class_f16_e64 s52, s44, -s45",
+        "v_cmp_class_f16_e64 s52, s44, |s45|",
+        "v_cmp_class_f16_e64 s52, s44, 1.0",
+    ):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    pos = f16_program.index("s_waitcnt vmcnt(0)")
+    must_reject(translate_int, f16_program[:pos] + ["v_cmp_eq_f16_e32 vcc_lo, v12, v13"] + f16_program[pos:])
+    load = next(i for i, line in enumerate(f16_program) if line.startswith("s_buffer_load_dwordx4"))
+    pos = f16_program.index("s_waitcnt lgkmcnt(0)", load)
+    must_reject(translate_int, f16_program[:pos] + ["v_cmp_eq_f16_e32 vcc_lo, s44, v16"] + f16_program[pos:])
+    must_reject(translate_int, f16_program[:pos] + ["v_cmp_class_f16_e32 vcc_lo, s44, v16"] + f16_program[pos:])
 
     # 32-bit integer min/max/min3/max3/med3 controls and rejections.
     pair_src = translate(int_minmax_pair("e32"))
@@ -5264,6 +5300,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True, clamp=True)), translate))
     fixtures.append((uncompressed_export(cvt_float_body(0x3fc00000, 0xc0300000)), translate_int))
     fixtures.extend((uncompressed_export(nc_integer_group(group)), translate_int) for group in (1, 2, 3))
+    fixtures.append((uncompressed_export(f16_compares()), translate_int))
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
@@ -6674,6 +6711,268 @@ def check_sopk_cmpk_cmovk_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutating {label} escaped detection")
 
 
+F16_COMPARE_SETS = (
+    (0xdead3c00, 0xbeef4000, 0x12343c00, 0x100),
+    (0xffffbc00, 0xffff3c00, 0xffffbc00, 0x008),
+    (0x00008000, 0x00000000, 0x00008000, 0x020),
+    (0x00000000, 0x00008000, 0x00000000, 0x040),
+    (0x00000001, 0x00000001, 0x00000001, 0x080),
+    (0x00008001, 0x00003800, 0x00008001, 0x010),
+    (0x00007c00, 0x0000fc00, 0x0000fc00, 0x004),
+    (0x0000fc00, 0x00007c00, 0x00007c00, 0x200),
+    (0x00007e00, 0x00003c00, 0x00007c01, 0x001),
+    (0x00004000, 0x0000fe00, 0x0000fe00, 0x002),
+    (0x0000c400, 0x0000c400, 0x00003118, 0x101),
+    (0x00003118, 0x00003119, 0x0000b800, 0x008),
+    (0x0000bc00, 0x0000c000, 0x00004400, 0x000),
+    (0x0000bc00, 0x00004400, 0x00004000, 0x3ff),
+)
+
+
+def f16_compares() -> list[str]:
+    """Build a shader testing all 16 binary16 predicates and v_cmp_class_f16 across e32 and e64."""
+    body = [
+        "v_mov_b32_e32 v12, 0",
+        "v_mov_b32_e32 v13, 0",
+        "v_mov_b32_e32 v14, 0",
+        "v_mov_b32_e32 v15, 0",
+        "v_mov_b32_e32 v16, s45",
+        "v_mov_b32_e32 v18, s44",
+        "v_mov_b32_e32 v20, s46",
+        "v_mov_b32_e32 v21, s47",
+    ]
+
+    def emit_flag(acc: str, bit: int, cond: str, insn: str) -> None:
+        body.append(insn)
+        body.append(f"v_cndmask_b32_e64 v17, 0, 1, {cond}")
+        if bit:
+            body.append(f"v_lshlrev_b32_e32 v17, {bit}, v17")
+        body.append(f"v_or_b32_e32 {acc}, {acc}, v17")
+
+    for bit, pred in enumerate(PREDICATES):
+        emit_flag("v12", bit, "vcc_lo", f"v_cmp_{pred}_f16_e32 vcc_lo, s44, v16")
+    for bit, insn in (
+        (16, "v_cmp_lt_f16_e32 vcc_lo, v18, v16"),
+        (17, "v_cmp_eq_f16_e32 vcc_lo, 1.0, v16"),
+        (18, "v_cmp_eq_f16_e32 vcc_lo, 1, v16"),
+        (19, "v_cmp_lt_f16_e32 vcc_lo, -0.5, v16"),
+        (20, "v_cmp_lt_f16_e32 vcc_lo, 0.15915494, v16"),
+        (21, "v_cmp_lt_f16_e32 vcc_lo, 0xc000, v16"),
+    ):
+        emit_flag("v12", bit, "vcc_lo", insn)
+
+    for bit, pred in enumerate(PREDICATES):
+        emit_flag("v13", bit, "s52", f"v_cmp_{pred}_f16_e64 s52, -s44, |s45|")
+    for bit, cond, insn in (
+        (16, "s53", "v_cmp_lt_f16_e64 s53, v18, s45"),
+        (17, "vcc_lo", "v_cmp_le_f16_e64 vcc_lo, -|s44|, 2.0"),
+        (18, "s52", "v_cmp_gt_f16_e64 s52, s44, -1.0"),
+        (19, "s52", "v_cmp_eq_f16_e64 s52, -4.0, v16"),
+        (20, "s52", "v_cmp_lt_f16_e64 s52, |v18|, 0x3800"),
+    ):
+        emit_flag("v13", bit, cond, insn)
+
+    for cls in range(10):
+        body.append(f"v_mov_b32_e32 v19, {1 << cls}")
+        emit_flag("v14", cls, "vcc_lo", "v_cmp_class_f16_e32 vcc_lo, s46, v19")
+    for bit, cond, insn in (
+        (10, "vcc_lo", "v_cmp_class_f16_e32 vcc_lo, s46, v21"),
+        (11, "s52", "v_cmp_class_f16_e64 s52, s46, s47"),
+        (12, "vcc_lo", "v_cmp_class_f16_e64 vcc_lo, -s46, s47"),
+        (13, "s53", "v_cmp_class_f16_e64 s53, |s46|, s47"),
+        (14, "s52", "v_cmp_class_f16_e64 s52, -|v20|, s47"),
+        (15, "s52", "v_cmp_class_f16_e64 s52, -s46, 0x3ff"),
+        (16, "s52", "v_cmp_class_f16_e64 s52, 0.5, s47"),
+        (17, "s52", "v_cmp_class_f16_e64 s52, -1, 2"),
+        (18, "s52", "v_cmp_class_f16_e64 s52, 1, 0x80"),
+        (19, "vcc_lo", "v_cmp_class_f16_e32 vcc_lo, 0x7c01, v21"),
+        (20, "vcc_lo", "v_cmp_class_f16_e32 vcc_lo, -0.5, v21"),
+    ):
+        emit_flag("v14", bit, cond, insn)
+
+    for bit, cond, insn in (
+        (0, "s52", "v_cmp_eq_f16_e64 s52, s44, v16"),
+        (1, "s52", "v_cmp_lt_f16_e64 s52, |v18|, |v16|"),
+        (2, "s52", "v_cmp_eq_f16_e64 s52, -v18, -s45"),
+        (3, "s52", "v_cmp_o_f16_e64 s52, s44, -|v16|"),
+        (4, "s52", "v_cmp_u_f16_e64 s52, s44, s45"),
+        (5, "vcc_lo", "v_cmp_neq_f16_e32 vcc_lo, 0.5, v16"),
+        (6, "vcc_lo", "v_cmp_ge_f16_e32 vcc_lo, -2.0, v16"),
+        (7, "vcc_lo", "v_cmp_gt_f16_e32 vcc_lo, 4.0, v16"),
+        (8, "vcc_lo", "v_cmp_le_f16_e32 vcc_lo, -4.0, v16"),
+        (9, "vcc_lo", "v_cmp_eq_f16_e32 vcc_lo, 2.0, v16"),
+        (10, "vcc_lo", "v_cmp_eq_f16_e32 vcc_lo, 0, v16"),
+        (11, "s52", "v_cmp_class_f16_e64 s52, v20, 4"),
+        (12, "vcc_lo", "v_cmp_class_f16_e32 vcc_lo, v20, v21"),
+        (13, "vcc_lo", "v_cmp_eq_f16_e32 vcc_lo, -1, v16"),
+    ):
+        emit_flag("v15", bit, cond, insn)
+
+    return body
+
+
+def f16_compares_reference(words: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Compute the exact 4 uint bitmasks expected from f16_compares()."""
+    def half_float(bits: int) -> float:
+        return struct.unpack("<e", struct.pack("<H", bits & 0xffff))[0]
+
+    def half_class(bits: int) -> int:
+        h = bits & 0xffff
+        mag = h & 0x7fff
+        neg = h >= 0x8000
+        if mag > 0x7c00:
+            return 0x2 if (h & 0x0200) else 0x1
+        if mag == 0x7c00:
+            return 0x4 if neg else 0x200
+        if mag >= 0x0400:
+            return 0x8 if neg else 0x100
+        if mag != 0:
+            return 0x10 if neg else 0x80
+        return 0x20 if neg else 0x40
+
+    def cmp_pred(pred: str, a: float, b: float) -> bool:
+        ordered = (not math.isnan(a)) and (not math.isnan(b))
+        table = {
+            "f": False,
+            "lt": ordered and a < b,
+            "eq": ordered and a == b,
+            "le": ordered and a <= b,
+            "gt": ordered and a > b,
+            "lg": ordered and a != b,
+            "ge": ordered and a >= b,
+            "o": ordered,
+            "u": not ordered,
+            "nge": not (ordered and a >= b),
+            "nlg": not (ordered and a != b),
+            "ngt": not (ordered and a > b),
+            "nle": not (ordered and a <= b),
+            "neq": not (ordered and a == b),
+            "nlt": not (ordered and a < b),
+            "tru": True,
+        }
+        return table[pred]
+
+    lhs_h, rhs_h, cls_h = words[0] & 0xffff, words[1] & 0xffff, words[2] & 0xffff
+    cls_mask = words[3] & 0xffffffff
+    lhs = half_float(lhs_h)
+    rhs = half_float(rhs_h)
+    sub_min = half_float(0x0001)
+    inv2pi = half_float(0x3118)
+    nan_val = half_float(0xffff)
+
+    w0 = 0
+    for bit, pred in enumerate(PREDICATES):
+        if cmp_pred(pred, lhs, rhs):
+            w0 |= 1 << bit
+    for bit, cond in (
+        (16, cmp_pred("lt", lhs, rhs)),
+        (17, cmp_pred("eq", 1.0, rhs)),
+        (18, cmp_pred("eq", sub_min, rhs)),
+        (19, cmp_pred("lt", -0.5, rhs)),
+        (20, cmp_pred("lt", inv2pi, rhs)),
+        (21, cmp_pred("lt", -2.0, rhs)),
+    ):
+        if cond:
+            w0 |= 1 << bit
+
+    w1 = 0
+    for bit, pred in enumerate(PREDICATES):
+        if cmp_pred(pred, -lhs, abs(rhs)):
+            w1 |= 1 << bit
+    for bit, cond in (
+        (16, cmp_pred("lt", lhs, rhs)),
+        (17, cmp_pred("le", -abs(lhs), 2.0)),
+        (18, cmp_pred("gt", lhs, -1.0)),
+        (19, cmp_pred("eq", -4.0, rhs)),
+        (20, cmp_pred("lt", abs(lhs), 0.5)),
+    ):
+        if cond:
+            w1 |= 1 << bit
+
+    w2 = 0
+    for cls in range(10):
+        if (half_class(cls_h) & (1 << cls)) != 0:
+            w2 |= 1 << cls
+    for bit, cond in (
+        (10, (half_class(cls_h) & cls_mask) != 0),
+        (11, (half_class(cls_h) & cls_mask) != 0),
+        (12, (half_class(cls_h ^ 0x8000) & cls_mask) != 0),
+        (13, (half_class(cls_h & 0x7fff) & cls_mask) != 0),
+        (14, (half_class((cls_h & 0x7fff) ^ 0x8000) & cls_mask) != 0),
+        (15, (half_class(cls_h ^ 0x8000) & 0x3ff) != 0),
+        (16, (half_class(0x3800) & cls_mask) != 0),
+        (17, (half_class(0xffff) & 2) != 0),
+        (18, (half_class(0x0001) & 0x80) != 0),
+        (19, (half_class(0x7c01) & cls_mask) != 0),
+        (20, (half_class(0xb800) & cls_mask) != 0),
+    ):
+        if cond:
+            w2 |= 1 << bit
+
+    w3 = 0
+    for bit, cond in (
+        (0, cmp_pred("eq", lhs, rhs)),
+        (1, cmp_pred("lt", abs(lhs), abs(rhs))),
+        (2, cmp_pred("eq", -lhs, -rhs)),
+        (3, cmp_pred("o", lhs, -abs(rhs))),
+        (4, cmp_pred("u", lhs, rhs)),
+        (5, cmp_pred("neq", 0.5, rhs)),
+        (6, cmp_pred("ge", -2.0, rhs)),
+        (7, cmp_pred("gt", 4.0, rhs)),
+        (8, cmp_pred("le", -4.0, rhs)),
+        (9, cmp_pred("eq", 2.0, rhs)),
+        (10, cmp_pred("eq", 0.0, rhs)),
+        (11, (half_class(cls_h) & 4) != 0),
+        (12, (half_class(cls_h) & cls_mask) != 0),
+        (13, cmp_pred("eq", nan_val, rhs)),
+    ):
+        if cond:
+            w3 |= 1 << bit
+
+    return (w0, w1, w2, w3)
+
+
+def check_f16_compare_draws(directory, compiler, renderer, backend):
+    source = directory / "f16-compare.hlsl"
+    shader = directory / "f16-compare.cso"
+    program = uncompressed_export(f16_compares())
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for index, words in enumerate(F16_COMPARE_SETS):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        expected = tuple(as_float(w) for w in f16_compares_reference(words))
+        path = write_case(directory / f"f16-cmp-{index}.case", constants, expected, integer_rt=True)
+        cases.append((path, "pass"))
+        if index < 4:
+            wrong_words = list(f16_compares_reference(words))
+            wrong_words[index] ^= 1 << index
+            wrong_path = write_case(
+                directory / f"f16-cmp-bad-{index}.case",
+                constants,
+                tuple(as_float(w) for w in wrong_words),
+                integer_rt=True,
+            )
+            cases.append((wrong_path, "mismatch"))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+    mutated_shader = directory / "f16-compare-mutated.cso"
+    for label, old, new, case_index in (
+        ("f16 e32 predicate", "v_cmp_lt_f16_e32 vcc_lo, s44, v16", "v_cmp_le_f16_e32 vcc_lo, s44, v16", 4),
+        ("f16 e64 neg", "v_cmp_lt_f16_e64 s52, -s44, |s45|", "v_cmp_lt_f16_e64 s52, s44, |s45|", 1),
+        ("f16 class neg", "v_cmp_class_f16_e64 vcc_lo, -s46, s47", "v_cmp_class_f16_e64 vcc_lo, s46, s47", 2),
+    ):
+        mutated = [new if line == old else line for line in program]
+        assert mutated != program
+        source.write_text(translate_int(mutated), encoding="ascii")
+        compile_shader(compiler, source, mutated_shader)
+        draw = [renderer, backend, "--check-pixel-case", mutated_shader, directory / f"f16-cmp-{case_index}.case"]
+        result = subprocess.run(draw, capture_output=True, text=True)
+        if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+
 def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     source = directory / "fixture.hlsl"
     shader = directory / "fixture.cso"
@@ -6709,6 +7008,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
         raise AssertionError("Changing the sopk multiply escaped detection")
 
     check_sopk_cmpk_cmovk_draw(directory, compiler, renderer, backend)
+    check_f16_compare_draws(directory, compiler, renderer, backend)
 
     source.write_text(translate(rounding()), encoding="ascii")
     compile_shader(compiler, source, shader)
