@@ -102,7 +102,7 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
 }
 
 static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE shader,
-                        D3D12_SHADER_BYTECODE rootBytes)
+                        D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false)
 {
     ComPtr<ID3D12RootSignature> signature;
     check(device->CreateRootSignature(0, rootBytes.pShaderBytecode, rootBytes.BytecodeLength, IID_PPV_ARGS(&signature)),
@@ -142,13 +142,17 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
     const auto* words = static_cast<const UINT*>(mapped);
     UINT mismatches = 0;
     constexpr UINT key = constants[13] + 3 * constants[14] + 5 * constants[15];
+    if (conversion_pair)
+        std::printf("immediate_uint=0x%08x immediate_int=0x%08x\n", words[0], words[1]);
+    const UINT active = conversion_pair ? 2 : count;
     for (UINT i = 0; i < capacity; ++i) {
-        const UINT expected = i < count ? (input_word(i) * 33u) ^ (key + i * constants[1]) : sentinel;
+        const UINT expected = i >= active ? sentinel : conversion_pair ? (i == 0 ? 0xffffffffu : 0x7fffffffu)
+            : (input_word(i) * 33u) ^ (key + i * constants[1]);
         if (words[i] != expected) ++mismatches;
     }
     readback->Unmap(0, &no_writes);
     std::printf("layout=%s output_words=%u guard_words=%u mismatches=%u\n",
-                tables ? "tables" : "root", count, capacity - count, mismatches);
+                tables ? "tables" : "root", active, capacity - active, mismatches);
     if (mismatches) throw std::runtime_error("Compute readback differs from CPU reference");
 }
 
@@ -159,7 +163,7 @@ void check_compute(ID3D12Device* device, bool tables)
     run_compute(device, tables, shader, shader);
 }
 
-void check_compute_file(ID3D12Device* device, const char* path)
+void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair)
 {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error(std::string("Could not open compute shader: ") + path);
@@ -170,7 +174,7 @@ void check_compute_file(ID3D12Device* device, const char* path)
     if (!file.read(bytes.data(), static_cast<std::streamsize>(bytes.size())))
         throw std::runtime_error(std::string("Could not read compute shader: ") + path);
     const D3D12_SHADER_BYTECODE shader{bytes.data(), bytes.size()};
-    run_compute(device, false, shader, shader);
+    run_compute(device, false, shader, shader, conversion_pair);
 }
 
 void check_bvh_root_roundtrip(ID3D12Device* device)
