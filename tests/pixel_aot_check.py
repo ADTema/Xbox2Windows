@@ -3654,9 +3654,12 @@ DPP_BODY = [
     "v_add_f32_e32 v26, 4.0, v25",
     "v_cmp_gt_f32_e32 vcc_lo, 0, v25",
     "v_cndmask_b32_dpp v27, v25, v26, vcc_lo quad_perm:[1,2,0,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_f32_dpp v49, v20, v20 quad_perm:[1,2,3,2] row_mask:0xf bank_mask:0xf",
+    "v_max_f32_dpp v50, |v49|, v49 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
     "v_add_f32_e32 v12, v21, v22",
     "v_add_f32_e32 v12, v12, v23",
     "v_add_f32_e32 v12, v12, v27",
+    "v_add_f32_e32 v12, v12, v50",
     # DPP16 neg on src1: v23 is 3 in every lane, so v45 = 3 + -3 = 0 and leaves channel 0 unchanged;
     # a dropped src1 neg gives 6.
     "v_add_f32_dpp v45, v23, -v23 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
@@ -3671,6 +3674,8 @@ DPP_BODY = [
     "v_cvt_f32_f16_dpp v34, -|v29| quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
     "v_mov_b32_e32 v13, v32",
     "v_fmac_f32_dpp v13, v33, v34 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_cvt_f32_f16_dpp v51, v29 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_add_f32_e32 v13, v13, v51",
     "v_add_f32_e32 v35, s44, v30",
     "v_floor_f32_dpp v36, v35 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
     "v_ceil_f32_dpp v37, v35 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
@@ -3688,6 +3693,8 @@ DPP_BODY = [
     "v_fma_f32 v15, 0x41800000, v42, v15",
     "v_add_f32_e32 v15, v15, v43",
     "v_fma_f32 v15, 4.0, v44, v15",
+    "v_exp_f32_dpp v52, v30 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_fma_f32 v15, 4.0, v52, v15",
     "v_add_f32_e32 v15, 0.5, v15",
     "v_floor_f32_e32 v15, v15",
 ]
@@ -3701,12 +3708,17 @@ DPP_SETS = (
 
 def dpp_reference(a, b, h_bits, c):
     h = struct.unpack("<e", struct.pack("<H", h_bits & 0xffff))[0]
-    ch0 = 8.0 + a
-    ch1 = 3.0 * b * abs(h)
+    # quad_perm:[1,2,3,2] read of the lane id, minus the lane id, through max(|s|, s): 1 in every lane.
+    perm = (1, 2, 3, 2)
+    quad_terms = {max(abs(perm[lane] - lane), perm[lane] - lane) for lane in range(4)}
+    assert len(quad_terms) == 1, quad_terms
+    ch0 = 8.0 + a + quad_terms.pop()
+    ch1 = 3.0 * b * abs(h) + h
     x = a + c
     ch2 = math.floor(x) + 2.0 * math.ceil(x) + 4.0 * math.trunc(x) + (x - math.floor(x))
     log_b = math.log2(b)
-    ch3 = math.floor(log_b + (2.0 ** log_b) + 16.0 / (2.0 ** log_b) + math.sqrt(b) + 4.0 / math.sqrt(b) + 0.5)
+    ch3 = math.floor(log_b + (2.0 ** log_b) + 16.0 / (2.0 ** log_b) + math.sqrt(b) + 4.0 / math.sqrt(b)
+                     + 4.0 * (2.0 ** c) + 0.5)
     return (half_rtz(ch0), half_rtz(ch1), half_rtz(ch2), half_rtz(ch3))
 
 
@@ -3740,6 +3752,10 @@ def check_dpp_draw(directory, compiler, renderer, backend):
         (0, "v_min_f32_dpp v33, -v31, v30", "v_min_f32_dpp v33, v31, v30", "DPP16 neg modifier"),
         (0, "v_add_f32_dpp v45, v23, -v23", "v_add_f32_dpp v45, v23, v23", "DPP16 src1 neg modifier"),
         (1, "v_floor_f32_dpp v36, v35", "v_ceil_f32_dpp v36, v35", "floor vs ceil DPP"),
+        (0, "quad_perm:[1,2,3,2]", "quad_perm:[1,2,3,0]", "generic quad_perm lane 3"),
+        (0, "v_max_f32_dpp v50, |v49|, v49", "v_max_f32_dpp v50, v49, v49", "DPP16 abs on max"),
+        (1, "v_cvt_f32_f16_dpp v51, v29", "v_cvt_f32_f16_dpp v51, |v29|", "cvt_f32_f16 DPP sign"),
+        (0, "v_exp_f32_dpp v52, v30", "v_exp_f32_dpp v52, v38", "exp of fractional DPP input"),
     ):
         a, b, h_bits, c = DPP_SETS[set_idx]
         constants = bytearray(256)
