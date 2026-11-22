@@ -109,6 +109,7 @@ def _check_two_exits(code, llvm):
                   or op in ("s_nop", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
                             "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
                             "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
+                            "s_bitreplicate_b64_b32",
                             "s_setreg_imm32_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
@@ -483,6 +484,34 @@ uint mul_hi_i32(uint a, uint b) {
         "    return uint2(asuint(asint(v.y) >> (s - 32u)), asuint(asint(v.y) >> 31));\n"
         "}"
     ),
+    "s_quadmask_b32": """uint s_quadmask_b32(uint value) {
+    uint result = 0u;
+    [unroll]
+    for (uint group = 0u; group < 8u; ++group) {
+        if ((value & (0xfu << (group * 4u))) != 0u) result |= 1u << group;
+    }
+    return result;
+}
+""",
+    "s_quadmask_b64": """uint2 s_quadmask_b64(uint2 value) {
+    uint result = s_quadmask_b32(value.x) | (s_quadmask_b32(value.y) << 8u);
+    return uint2(result, 0u);
+}
+""",
+    "s_bitreplicate_b64_b32": """uint2 s_bitreplicate_b64_b32(uint value) {
+    uint low = value & 0xffffu;
+    uint high = value >> 16u;
+    low = (low | (low << 8u)) & 0x00ff00ffu;
+    high = (high | (high << 8u)) & 0x00ff00ffu;
+    low = (low | (low << 4u)) & 0x0f0f0f0fu;
+    high = (high | (high << 4u)) & 0x0f0f0f0fu;
+    low = (low | (low << 2u)) & 0x33333333u;
+    high = (high | (high << 2u)) & 0x33333333u;
+    low = (low | (low << 1u)) & 0x55555555u;
+    high = (high | (high << 1u)) & 0x55555555u;
+    return uint2(low | (low << 1u), high | (high << 1u));
+}
+""",
     "s_bfm_b64": (
         "uint2 s_bfm_b64(uint width, uint offset) {\n"
         "    uint w = width & 63u;\n"
@@ -1800,6 +1829,35 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             expr = f"({prev} & ~(1u << ({bit} & 31u)))" if op == "s_bitset0_b32" else f"({prev} | (1u << ({bit} & 31u)))"
             lines.append(f"    uint salu{i} = {expr};")
             scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"(s_quadmask_b32) (s\d+), ([^,]+)"):
+            op, dst, src = m.groups()
+            sgpr_name(dst)
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            value = scalar_u32(src, scalar, pending)
+            helpers.add(op)
+            lines.append(f"    uint salu{i} = {op}({value});")
+            scalar[dst] = ("uint", f"salu{i}")
+            scc = f"(salu{i} != 0u)"
+        elif m := match(r"(s_quadmask_b64) (s\[\d+:\d+\]), ([^,]+)"):
+            op, dst, src = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            low, high = scalar_u64(src, scalar, pending)
+            helpers.update(("s_quadmask_b32", op))
+            lines.append(f"    uint2 salu{i} = {op}(uint2({low}, {high}));")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
+            scc = f"((salu{i}.x | salu{i}.y) != 0u)"
+        elif m := match(r"(s_bitreplicate_b64_b32) (s\[\d+:\d+\]), ([^,]+)"):
+            op, dst, src = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            value = scalar_u32(src, scalar, pending)
+            helpers.add(op)
+            lines.append(f"    uint2 salu{i} = {op}({value});")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
         elif m := match(r"(s_addk_i32|s_mulk_i32) (s\d+), (-?\d+|0x[0-9a-f]+)"):
             op, dst, imm = m.groups()
             operand = scalar_u32(dst, scalar, pending)

@@ -2097,6 +2097,23 @@ Across all eight modes, total renderer launches per backend drop from 494 to
 
 #The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.
 
+The scalar quad reduction forms are s_quadmask_b32 and s_quadmask_b64. Each
+output bit is the OR of one four-bit group. The b64 result has sixteen quad
+bits in the low word and zero in the high word, and both widths set SCC from
+the complete result. s_bitreplicate_b64_b32 expands every source bit into two
+adjacent destination bits and preserves SCC. The fixture covers sparse and
+alternating groups, the null word, bits 0 and 31 and SCC in both incoming
+states. Negative references cover an AND-within-group, a missing second copy,
+the wrong source word, a quad in the high destination word and recomputed SCC.
+Run ctest --preset dev --no-tests=error -R '^pixel_aot_blend_scalar_(warp|hardware)$' -V.
+On Windows build 26300.10075, the 37-case fixture passed on WARP
+10.0.26100.10068 and an AMD Radeon RX 9060 XT (driver 32.0.32029.2010)
+with all 4,096 pixels matching on every positive case and every negative
+control mismatching. The D3D12 debug layer was unavailable.
+[Leonida scalar semantics](https://github.com/ItsNotRexed/Leonida/blob/4eb6155d/tests/semantic/test_salu_quadmask_bitreplicate.py) ·
+[Leonida RDNA2 measurements](https://github.com/ItsNotRexed/Leonida/pull/1685) ·
+[AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.

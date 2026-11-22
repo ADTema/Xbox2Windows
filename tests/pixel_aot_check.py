@@ -1948,6 +1948,140 @@ def check_scalar_bfe64_draw(directory, compiler, renderer, backend):
         run_pixel_batch(renderer, backend, shader, [*cases[op], (wrong_case, "mismatch")])
 
 
+QUADMASK_BITREPLICATE_INSTRUCTIONS = {
+    "s_quadmask_b32": "s_quadmask_b32 s44, s44",
+    "s_quadmask_b64": "s_quadmask_b64 s[44:45], s[44:45]",
+    "s_bitreplicate_b64_b32": "s_bitreplicate_b64_b32 s[44:45], s44",
+}
+
+QUADMASK_BITREPLICATE_WORDS = {
+    "sparse-quads": (0x81020408, 0x80010001),
+    "high-only": (0, 0x80000000),
+    "split-bits-15-16": (0x80000000, 0x00018000),
+    "alternating-even": (0xaaaaaaaa, 0x55555555),
+    "alternating-odd": (0x55555555, 0xaaaaaaaa),
+    "all-set": (0xffffffff, 0xffffffff),
+    "all-zero": (0, 0),
+}
+
+def quadmask_bitreplicate_program(op):
+    return uncompressed_export([
+        "s_cmp_lg_u32 s47, 0",
+        QUADMASK_BITREPLICATE_INSTRUCTIONS[op],
+        "s_cselect_b32 s48, 1, 0",
+        "v_mov_b32_e32 v12, s44",
+        "v_mov_b32_e32 v13, s45",
+        "v_mov_b32_e32 v14, s48",
+        "v_mov_b32_e32 v15, 0",
+    ])
+
+
+def quadmask32(word):
+    return sum((((word >> (4 * group)) & 0xf) != 0) << group for group in range(8))
+
+
+def quadmask64(lo, hi):
+    # Measured on RDNA2: the sixteen quad bits are contiguous in the low word.
+    return quadmask32(lo) | (quadmask32(hi) << 8)
+
+
+def bitreplicate16(word):
+    value = word & 0xffff
+    value = (value | (value << 8)) & 0x00ff00ff
+    value = (value | (value << 4)) & 0x0f0f0f0f
+    value = (value | (value << 2)) & 0x33333333
+    value = (value | (value << 1)) & 0x55555555
+    return value | (value << 1)
+
+
+def bitreplicate(word):
+    return bitreplicate16(word), bitreplicate16(word >> 16)
+
+
+def quadmask_bitreplicate_reference(op, lo, hi, initial_scc):
+    if op == "s_quadmask_b32":
+        result = quadmask32(lo)
+        return result, hi, int(result != 0), 0
+    if op == "s_quadmask_b64":
+        result = quadmask64(lo, hi)
+        return result, 0, int(result != 0), 0
+    assert op == "s_bitreplicate_b64_b32", op
+    result_lo, result_hi = bitreplicate(lo)
+    return result_lo, result_hi, initial_scc, 0
+
+
+def run_quadmask_bitreplicate(directory, compiler, renderer, backend):
+    for op in QUADMASK_BITREPLICATE_INSTRUCTIONS:
+        source = directory / f"{op}.hlsl"
+        shader = directory / f"{op}.cso"
+        source.write_text(translate_int(quadmask_bitreplicate_program(op)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+
+        def add_case(name, words, initial_scc, expected, status):
+            constants = bytearray(256)
+            expected_scc = expected[2]
+            seed = initial_scc if op == "s_bitreplicate_b64_b32" else int(not expected_scc)
+            struct.pack_into("<4I", constants, 12, words[0], words[1], 0, seed)
+            path = directory / f"{op}-{name}.case"
+            write_case(path, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+            cases.append((path, status))
+
+        cases = []
+        for name, words in QUADMASK_BITREPLICATE_WORDS.items():
+            seeds = (0, 1) if op == "s_bitreplicate_b64_b32" else (0,)
+            for seed in seeds:
+                expected = quadmask_bitreplicate_reference(op, *words, seed)
+                add_case(f"{name}-scc{seed}", words, seed, expected, "pass")
+
+        lo, hi = QUADMASK_BITREPLICATE_WORDS["sparse-quads"]
+        if op == "s_quadmask_b32":
+            expected = quadmask_bitreplicate_reference(op, lo, hi, 0)
+            # AND within each quad is zero for the sparse input.
+            add_case("and-within-group", (lo, hi), 0, (expected[0] ^ 0xd5, *expected[1:]),
+                     "mismatch")
+            expected = quadmask_bitreplicate_reference(op, *QUADMASK_BITREPLICATE_WORDS["all-set"], 0)
+            add_case("old-scc", QUADMASK_BITREPLICATE_WORDS["all-set"], 0,
+                     (expected[0], expected[1], 0, 0), "mismatch")
+        elif op == "s_quadmask_b64":
+            expected = quadmask_bitreplicate_reference(op, lo, hi, 0)
+            wrong_low = sum((((lo >> (4 * group)) & 0xf) == 0xf) << group for group in range(8))
+            wrong_low |= sum((((hi >> (4 * group)) & 0xf) == 0xf) << (group + 8)
+                             for group in range(8))
+            add_case("and-within-group", (lo, hi), 0, (wrong_low, 0, expected[2], 0),
+                     "mismatch")
+            expected = quadmask_bitreplicate_reference(
+                op, *QUADMASK_BITREPLICATE_WORDS["high-only"], 0)
+            add_case("ignore-high-word", QUADMASK_BITREPLICATE_WORDS["high-only"], 0,
+                     (quadmask32(0), 0, expected[2], 0), "mismatch")
+            add_case("quad-in-high-word", QUADMASK_BITREPLICATE_WORDS["high-only"], 0,
+                     (expected[0], 0x80000000, expected[2], 0), "mismatch")
+            expected = quadmask_bitreplicate_reference(
+                op, *QUADMASK_BITREPLICATE_WORDS["all-set"], 0)
+            add_case("old-scc", QUADMASK_BITREPLICATE_WORDS["all-set"], 0,
+                     (expected[0], expected[1], 0, 0), "mismatch")
+        else:
+            lo, hi = QUADMASK_BITREPLICATE_WORDS["split-bits-15-16"]
+            expected = quadmask_bitreplicate_reference(op, lo, hi, 0)
+            duplicate_lo, duplicate_hi = 0x00018001, 0x80010001
+            duplicate_expected = quadmask_bitreplicate_reference(
+                op, duplicate_lo, duplicate_hi, 0)
+            duplicate_low_half = duplicate_lo & 0xffff
+            wrong_stride = ((duplicate_low_half | (duplicate_low_half << 8)) & 0x00ff00ff)
+            wrong_stride = (wrong_stride | (wrong_stride << 4)) & 0x0f0f0f0f
+            wrong_stride = (wrong_stride | (wrong_stride << 2)) & 0x33333333
+            wrong_stride = (wrong_stride | (wrong_stride << 1)) & 0x55555555
+            add_case("omit-second-copy", (duplicate_lo, duplicate_hi), 0,
+                     (wrong_stride, duplicate_expected[1], 0, 0), "mismatch")
+            source_hi = bitreplicate(hi)
+            add_case("source-high-word", (lo, hi), 0, (*source_hi, 0, 0), "mismatch")
+            add_case("recomputed-scc", (lo, hi), 1, (expected[0], expected[1], 0, 0),
+                     "mismatch")
+
+        for path, status in cases:
+            print(f"quadmask-bitreplicate {op}: {path.stem} expected={status}", flush=True)
+        run_pixel_batch(renderer, backend, shader, cases)
+
+
 S_CSELECT_B64 = "s_cselect_b64 s[44:45], s[44:45], s[46:47]"
 
 
@@ -2807,7 +2941,7 @@ def check_scalar_controls():
     for new in ("s_absdiff_i32 s62, s44, s45",
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
                 "s_bfe_u32 s62, v12, s45", "s_lshl5_add_u32 s62, s44, s45",
-                "s_quadmask_b32 s62, s44", "s_bitset0_b64 s[62:63], s44",
+                "s_bitreplicate_b64_b32 s[62:63], v12", "s_bitset0_b64 s[62:63], s44",
                 "s_brev_b32 s62, s44", "s_and_b64 s[62:63], s[44:46], s[46:47]",
                 "s_add_u32 s62, s[44:45], s45", "s_add_u32 s62, s44", "s_add_u32 s62, s44, s45, s46",
                 "s_add_u32 s62, -s44, s45", "s_add_u32 s62, s28, s45", "s_add_u32 s62, s20, s45",
@@ -2897,6 +3031,31 @@ def check_scalar_controls():
                      ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s90, s45")):
         changed = [line.replace(old, new) for line in bfm_program]
         assert changed != bfm_program, new
+        must_reject(translate_int, changed)
+
+    quadmask_source = translate_int(quadmask_bitreplicate_program("s_quadmask_b32"))
+    assert "s_quadmask_b32(" in quadmask_source, quadmask_source
+    quadmask64_source = translate_int(quadmask_bitreplicate_program("s_quadmask_b64"))
+    assert "uint2 s_quadmask_b64(uint2 value)" in quadmask64_source, quadmask64_source
+    bitreplicate_source = translate_int(quadmask_bitreplicate_program("s_bitreplicate_b64_b32"))
+    assert "uint2 s_bitreplicate_b64_b32(uint value)" in bitreplicate_source, bitreplicate_source
+    # A bitreplicate leaves the seeded SCC available to the following select.
+    assert re.search(r"=?\s*scc\d+ \? 1u : 0u", bitreplicate_source), bitreplicate_source
+    for bad in ("s_quadmask_b32 s62, v12",
+                "s_quadmask_b32 s62, s[44:45]",
+                "s_quadmask_b64 s44, s[44:45]",
+                "s_quadmask_b64 s[44:46], s[44:45]",
+                "s_bitreplicate_b64_b32 s[62:63], v12",
+                "s_bitreplicate_b64_b32 s62, s44",
+                "s_bitreplicate_b64_b32 s[62:63], s[44:45]"):
+        changed = [line.replace(QUADMASK_BITREPLICATE_INSTRUCTIONS[
+                     "s_quadmask_b32" if "quadmask_b32" in bad else
+                     "s_quadmask_b64" if "quadmask_b64" in bad else
+                     "s_bitreplicate_b64_b32"], bad)
+                   for line in quadmask_bitreplicate_program(
+                       "s_quadmask_b32" if "quadmask_b32" in bad else
+                       "s_quadmask_b64" if "quadmask_b64" in bad else
+                       "s_bitreplicate_b64_b32")]
         must_reject(translate_int, changed)
 
 
@@ -5290,6 +5449,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((sext_values(), translate))
     fixtures.append((sop1_scalar_ops(), translate_int))
     fixtures.append((bfm_scalar_ops(), translate_int))
+    fixtures.extend((quadmask_bitreplicate_program(op), translate_int)
+                    for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
     fixtures.append((scalar_select64(), translate_int))
     for op in SCALAR_BFE64_OPS:
         fixtures.extend((program, translate_int) for program in (
@@ -7200,6 +7361,7 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
 
     check_frexp_ldexp_draws(directory, compiler, renderer, backend)
     check_mul24_draws(directory, compiler, renderer, backend)
+    run_quadmask_bitreplicate(directory, compiler, renderer, backend)
     check_scalar_select64_draw(directory, compiler, renderer, backend)
     check_scalar_bfe64_draw(directory, compiler, renderer, backend)
 
