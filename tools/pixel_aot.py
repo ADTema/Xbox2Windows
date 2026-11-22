@@ -763,10 +763,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}"
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"image_sample v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0xf dim:SQ_RSRC_IMG_2D"):
-            operands = m.groups()
+        elif m := match(r"image_sample(_lz|_l|_b)? v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0xf dim:SQ_RSRC_IMG_2D"):
+            variant, *operands = m.groups()
+            coord_width = 3 if variant in ("_l", "_b") else 2
             dest, coords, image, state = [registers(*operands[k:k+2], width)
-                                          for k, width in zip((0,2,4,6), (4,2,8,4))]
+                                          for k, width in zip((0, 2, 4, 6), (4, coord_width, 8, 4))]
             if any(f"v{n}" in sample_dest for n in dest):
                 raise ValueError("Write overlaps an outstanding sample")
             descriptor = [scalar.get(f"s{n}") for n in image]
@@ -775,10 +776,32 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or texture is None
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
-            uv = [vector[f"v{n}"] for n in coords]
-            if any(v not in quad_values for v in uv):
-                raise ValueError("Unsupported texture coordinate")
-            lines.append(f"    float4 sample{i} = {texture}.Sample(samp, float2({', '.join(uv)}));")
+            coord_regs = [f"v{n}" for n in coords]
+            def sample_coord(reg):
+                if reg not in vector:
+                    raise ValueError("Unsupported texture coordinate")
+                value = vector[reg]
+                if value in ("uv.x", "uv.y"):
+                    return value
+                return fp_operand(reg, scalar, vector, pending, sample_dest)
+            if variant == "_b":
+                bias = sample_coord(coord_regs[0])
+                uv = [vector.get(r) for r in coord_regs[1:]]
+                if any(v not in quad_values for v in uv):
+                    raise ValueError("Unsupported texture coordinate")
+                call = f"{texture}.SampleBias(samp, float2({', '.join(uv)}), {bias})"
+            elif variant == "_l":
+                u, v, lod = (sample_coord(r) for r in coord_regs)
+                call = f"{texture}.SampleLevel(samp, float2({u}, {v}), {lod})"
+            elif variant == "_lz":
+                u, v = (sample_coord(r) for r in coord_regs)
+                call = f"{texture}.SampleLevel(samp, float2({u}, {v}), 0.0f)"
+            else:
+                uv = [vector.get(r) for r in coord_regs]
+                if any(v not in quad_values for v in uv):
+                    raise ValueError("Unsupported texture coordinate")
+                call = f"{texture}.Sample(samp, float2({', '.join(uv)}))"
+            lines.append(f"    float4 sample{i} = {call};")
             samples += 1
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
