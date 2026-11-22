@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_avx_scalar_fp
 ; Source-owned differential fixture for 28 VEX AVX scalar FP, half-register move, extract/insert, and compare instructions.
 .code
 
