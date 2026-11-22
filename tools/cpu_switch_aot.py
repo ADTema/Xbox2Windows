@@ -57,8 +57,10 @@ frame layout is not reproduced.
 A direct CALL, and a direct JMP that leaves the function for another function's
 entry (a tail jump), are translated by RVA into the same source: each callee
 once, as a static function named fn_<rva> that takes RCX, RDX, R8 and R9,
-defined before its first caller. A target must be the first byte of an
-unchained runtime function or a local export, in an executable section; a call
+defined before its first caller. A target must be the first byte of a verified
+primary runtime function (unchained, version 1 or 2 unwind data, executable) or
+a non-forwarded code export that no other function's interval holds; chained
+ranges, interior labels, forwarded and data exports are refused. A call
 to the caller's own entry and any call cycle are refused, and a caller is
 refused when any callee is. A callee records how many low bytes of each argument
 register it may read before writing it, and the caller must define them at the
@@ -159,29 +161,106 @@ def owned_ranges(pe, entry):
     return [(section.VirtualAddress, end)], records
 
 
-def function_entries(pe):
-    """RVAs that may be called: the first byte of each unchained runtime function and each local export."""
-    entries = set()
-    table = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
-    records = image_bytes(pe, table.VirtualAddress, table.Size - table.Size % 12) if table.Size >= 12 else b""
-    for begin, _, info in struct.iter_unpack("<III", records):
-        try:
-            header = image_bytes(pe, info, 4)
-        except ValueError:
-            continue
-        if not header[0] >> 3 & 4:
-            entries.add(begin)
-    pe.parse_data_directories(directories=[0])
-    exports = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
-    entries.update(e.address for e in (exports.symbols if exports else ()) if e.address and not e.forwarder)
-    return entries
+def executable(pe, rva):
+    section = pe.get_section_by_rva(rva)
+    return bool(section and section.Characteristics & 0x20000000)
+
+
+class Entries:
+    """The RVAs of this image that a direct call or tail jump may treat as a function.
+
+    An entry is the first byte of a verified primary runtime function (an unchained record with a
+    version 1 or 2 unwind header, a non-empty interval and executable code) or a non-forwarded code
+    export (an export outside the export directory, in an executable section and not inside any
+    runtime-function interval except at a primary start). Chained secondary ranges, interior labels,
+    forwarded exports and data exports are not entries."""
+
+    MAX_CHAIN = 32
+
+    def __init__(self, pe):
+        table = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+        data = image_bytes(pe, table.VirtualAddress, table.Size - table.Size % 12) if table.Size >= 12 else b""
+        self.records = list(struct.iter_unpack("<III", data))
+        self.primary = set()
+        self.unverified = set()  # unchained records whose unwind header or interval fails the check
+        self.parents = {}  # begin of a chained record -> begin of the record it continues
+        for begin, end, info in self.records:
+            try:
+                header = image_bytes(pe, info, 4)
+            except ValueError:
+                self.unverified.add(begin)
+                continue
+            version, flags = header[0] & 7, header[0] >> 3
+            if flags & 4:
+                trailer = info + 4 + ((header[2] + 1) & ~1) * 2
+                try:
+                    self.parents[begin] = struct.unpack("<III", image_bytes(pe, trailer, 12))[0]
+                except ValueError:
+                    self.parents[begin] = None
+            elif version in (1, 2) and begin < end and executable(pe, begin):
+                self.primary.add(begin)
+            else:
+                self.unverified.add(begin)
+        pe.parse_data_directories(directories=[0])
+        directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]
+        exports = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
+        self.exports = {}
+        for symbol in (exports.symbols if exports else ()):
+            rva = symbol.address
+            if not rva:
+                continue
+            if symbol.forwarder or directory.VirtualAddress <= rva < directory.VirtualAddress + directory.Size:
+                kind = "forward"
+            elif not executable(pe, rva):
+                kind = "data"
+            else:
+                kind = "code"
+            # A forwarder or data kind wins over code for the same RVA.
+            if self.exports.get(rva) in (None, "code"):
+                self.exports[rva] = kind
+        self.entries = set(self.primary)
+        self.entries.update(rva for rva, kind in self.exports.items()
+                            if kind == "code" and self.owner(rva) is None)
+
+    def root(self, begin):
+        for _ in range(self.MAX_CHAIN):
+            if begin not in self.parents or self.parents[begin] is None:
+                return begin
+            begin = self.parents[begin]
+        return begin
+
+    def owner(self, rva):
+        """The primary function whose runtime-function interval holds rva, or None."""
+        for begin, end, _ in self.records:
+            if begin <= rva < end:
+                return self.root(begin)
+        return None
+
+    def __contains__(self, rva):
+        return rva in self.entries
+
+    def why_not(self, rva):
+        kind = self.exports.get(rva)
+        if kind == "forward":
+            return "a forwarded export"
+        if kind == "data":
+            return "a data export in a non-executable section"
+        if rva in self.parents:
+            return f"the start of a chained range of the function at {self.root(rva):#x}"
+        if rva in self.unverified:
+            return "a runtime function whose unwind data is not version 1 or 2 in executable code"
+        owner = self.owner(rva)
+        if owner is not None:
+            label = "an exported label" if kind else "an address"
+            return f"{label} inside the function at {owner:#x}"
+        return "no runtime-function entry or export"
 
 
 class Function:
-    def __init__(self, pe, entry, entries=frozenset()):
+    def __init__(self, pe, entry, entries=None):
         self.pe = pe
         self.entry = entry
-        self.entries = entries
+        self.entries = entries if entries is not None else Entries(pe)
         ranges, self.foreign = owned_ranges(pe, entry)
         self.ranges = [(begin, end, image_bytes(pe, begin, end - begin, executable=True))
                        for begin, end in ranges]
@@ -193,6 +272,18 @@ class Function:
         # Direct calls and tail jumps to other functions, by the RVA of the CALL or JMP.
         self.calls = {}
         self.tails = {}
+
+    def leaves_for(self, ins):
+        """Whether a JMP out of this function is a tail jump. A target the image names as a function
+        start (a runtime-function record or an export) that is not an entry is refused here."""
+        target = ins.near_branch_target
+        if target in self.entries:
+            return True
+        named = target in self.entries.exports or any(begin == target for begin, _, _ in self.entries.records)
+        if named and target != self.entry:
+            raise ValueError(f"jump target {target:#x} is not a function entry ({self.entries.why_not(target)}) "
+                             f"at RVA {ins.ip:#x}")
+        return False
 
     def owns(self, ip):
         return (any(begin <= ip < end for begin, end, _ in self.ranges)
@@ -206,13 +297,15 @@ class Function:
         if not 0 <= target < self.pe.OPTIONAL_HEADER.SizeOfImage:
             raise ValueError(f"call target outside the image at RVA {ins.ip:#x}")
         section = self.pe.get_section_by_rva(target)
+        if target not in self.entries and self.entries.exports.get(target) in ("forward", "data"):
+            raise ValueError(f"call target {target:#x} is not a function entry ({self.entries.why_not(target)}) "
+                             f"at RVA {ins.ip:#x}")
         if not section or not section.Characteristics & 0x20000000:
             raise ValueError(f"call target {target:#x} is not in an executable section at RVA {ins.ip:#x}")
         if target not in self.entries:
             # A leaf without unwind data or an import thunk has no entry that the image records.
-            owner = [begin for begin, end in runtime_functions(self.pe) if begin <= target < end]
-            why = f"inside the function at {owner[0]:#x}" if owner else "no runtime-function entry or export"
-            raise ValueError(f"call target {target:#x} is not a function entry ({why}) at RVA {ins.ip:#x}")
+            raise ValueError(f"call target {target:#x} is not a function entry ({self.entries.why_not(target)}) "
+                             f"at RVA {ins.ip:#x}")
         return target
 
     def decode(self, ip):
@@ -258,7 +351,7 @@ class Function:
             elif flow == FlowControl.CONDITIONAL_BRANCH and ins.is_jcc_short_or_near:
                 targets = [ins.near_branch_target, ins.next_ip]
             elif (flow == FlowControl.UNCONDITIONAL_BRANCH and ins.is_jmp_short_or_near
-                  and not self.owns(ins.near_branch_target) and ins.near_branch_target in self.entries):
+                  and not self.owns(ins.near_branch_target) and self.leaves_for(ins)):
                 # A jump to another function's entry outside this one is a tail call.
                 self.tails[ip] = ins.near_branch_target
                 targets = []
@@ -896,7 +989,7 @@ class Program:
 
     def __init__(self, pe):
         self.pe = pe
-        self.entries = function_entries(pe)
+        self.entries = Entries(pe)
         self.active = []
         self.callees = {}
         self.refused = {}

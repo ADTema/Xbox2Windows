@@ -58,6 +58,7 @@ CPU_FIXTURES = {
     "bmi1": "cpu_aot_bmi1",
     "frame": "cpu_aot_stack_frames",
     "calls": "cpu_aot_direct_calls",
+    "call_entries": "cpu_aot_call_entries",
     "register_probe": None,  # measurement harness
     "two_imports": None,     # mapped and run unchanged by pe_map
     "exe_start": None,       # mapped and run unchanged by pe_map
