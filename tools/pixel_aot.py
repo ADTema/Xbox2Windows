@@ -109,6 +109,7 @@ def _check_two_exits(code, llvm):
                   or op in ("s_nop", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
                             "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
                             "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
+                            "s_bitset0_b64", "s_bitset1_b64",
                             "s_setreg_imm32_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
@@ -1364,6 +1365,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Invalid sampler descriptor words")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
     vector = {"v0": "bary_i", "v1": "bary_j"}
+    # Immutable value identities, rather than VGPR names: a later overwrite must
+    # not reuse the old raw bits. Keep scalar bit copies out of float intermediates
+    # when exporting to a UINT target (including NaN-shaped integer words).
+    raw_export_bits = {}
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
     # The boolean records whether the quad value depends on interpolated coordinates.
     quad_values = {"uv.x": True, "uv.y": True}
@@ -1371,7 +1376,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if constant_descriptor is not None:
         if constant_descriptor < 0 or constant_descriptor % 4:
             raise ValueError("Invalid constant descriptor offset")
-        lines.insert(0, "cbuffer Constants : register(b0) { float4 params[16]; };")
+        constant_type = "uint4" if integer_export else "float4"
+        lines.insert(0, f"cbuffer Constants : register(b0) {{ {constant_type} params[16]; }};")
     bindings = {} if sampler is None else {0: "tex"}
     if second_texture_offset is not None:
         if sampler is None:
@@ -1608,6 +1614,22 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             val = scalar_u32(src, scalar, pending)
             lines.append(f"    uint salu{i} = {scc} ? {val} : {prev};")
             scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"(s_bitset[01]_b64) (s\[\d+:\d+\]), ([^,]+)"):
+            op, dst, src = m.groups()
+            low, high = sgpr_pair(dst)
+            # This is a read/modify/write of both destination words. Resolve all
+            # operands before replacing either binding, including an aliased index.
+            lo, hi = scalar_u64(dst, scalar, pending)
+            bit = scalar_u32(src, scalar, pending)
+            lines.append(f"    uint bit{i} = {bit} & 63u;")
+            operation = "& ~" if op == "s_bitset0_b64" else "| "
+            for word, previous, upper in (("lo", lo, False), ("hi", hi, True)):
+                select = ">=" if upper else "<"
+                bit_mask = f"(bit{i} {select} 32u ? (1u << (bit{i} & 31u)) : 0u)"
+                lines.append(f"    uint salu{i}_{word} = {previous} {operation}{bit_mask};")
+            scalar[low] = ("uint", f"salu{i}_lo")
+            scalar[high] = ("uint", f"salu{i}_hi")
+            # S_BITSET does not modify SCC.
         elif m := match(r"(s_bitset[01]_b32) (s\d+), ([^,]+)"):
             op, dst, src = m.groups()
             prev = scalar_u32(dst, scalar, pending)
@@ -1660,7 +1682,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 if f"s{n}" in pending:
                     raise ValueError("Write overlaps an outstanding scalar load")
                 word = offset // 4 + j
-                scalar[f"s{n}"] = ("cbv", j) if descriptor else f"params[{word // 4}].{'xyzw'[word % 4]}"
+                value = f"params[{word // 4}].{'xyzw'[word % 4]}"
+                scalar[f"s{n}"] = (("cbv", j) if descriptor else
+                                    ("uint", value) if integer_export else value)
                 pending.add(f"s{n}")
         elif m := match(r"v_cube(id|sc|tc|ma)_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+?)( clamp)?"):
             # LLVM ConstantFoldAMDGCNCubeIntrinsic: z, then y, then x is the major axis; a face is negative
@@ -1798,8 +1822,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             value = fp_operand(src, scalar, vector, pending, sample_dest)
+            raw_bits = (scalar_u32(src, scalar, pending) if src.startswith("s")
+                        else raw_export_bits.get(vector.get(src))) if integer_export else None
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
+            if raw_bits is not None:
+                raw_export_bits[f"alu{i}"] = raw_bits
         elif m := match(rf"v_({'|'.join(ALU)})_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
@@ -2325,7 +2353,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or any(reg in sample_dest for reg in export_regs)
                     or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in values)):
                 raise ValueError("Unsupported export")
-            args = [f"asuint({v})" for v in values] if integer_export else values
+            args = [raw_export_bits.get(v, f"asuint({v})") for v in values] if integer_export else values
             input_type = "float4" if attribute_input else "float2"
             lines[entry_line] = f"{result_type} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
             lines.append(f"    return {result_type}({', '.join(args)});")

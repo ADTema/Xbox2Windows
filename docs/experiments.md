@@ -1800,6 +1800,59 @@ ctest --preset dev --no-tests=error -R '^pixel_aot_buffer_color_' -V
 
 A local audit against the 3310cb8 baseline retained the four sampled profiles and added six zero-sample profiles (entry table register 8 or 9, interpolation register 24, and no constant descriptor or a descriptor at byte 0 or 32). Of 26,503 records, 334 pixel records compiled with DXC `-Gis -T ps_6_0` and created D3D12 pipelines, up from 2. These represent 333 distinct containers and 21 distinct native instruction streams. Of the 332 additional records, 315 exported immediate values and 17 read the constant buffer; 298 wrote RG and 34 wrote RGBA. Each was drawn on an RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818). Reference colors for the new records were computed from the decoded operands, test buffer words and truncation to binary16. Two buffer inputs per constant-buffer record plus the original copy and day/night cases gave 352 draws per adapter. Each draw matched all 4,096 float4 pixels. These results use controlled buffers and render-target masks.
 
+### Scalar 64-bit bit-set instructions
+
+`tools/pixel_aot.py` lowers `s_bitset0_b64` and `s_bitset1_b64` on initialized,
+even-aligned SGPR pairs. The old pair is read before either half is replaced,
+including when the 32-bit index comes from the low or high destination word.
+The low six index bits select a bit to clear or set; the other 63 bits and SCC
+remain unchanged. HLSL uses two uint words and shifts by at most 31, without
+requiring native 64-bit shader arithmetic. The unsupported-shader scanner
+recognizes the same operand syntax. For UINT exports, scalar-to-vector bit copies
+and their vector copies retain an integer expression through the final return.
+The integer-export profile also declares the constant buffer as uint4, so its
+loads do not acquire float provenance. This preserves NaN-shaped words; subsequent float writes
+replace the earlier value identity. Copy and overwrite controls check both paths.
+[AMD RDNA 2 bit-wise instructions](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_scalar_bitset64_' -V
+```
+
+`tests/scalar_bitset64_check.py` supplies original source-built programs and a
+Python integer reference operating on one complete 64-bit value. For each
+backend it compares 458 positive draws through the lossless UINT render target,
+including indices 0/31/32/63/64/127 and 0xffffffff, both prior SCC values,
+aliased indices, inline constants, zero/full/patterned pairs and signaling-NaN
+bit patterns. Four wrong references per source/op combination and two swapped
+clear/set shader mutations must produce pixel mismatches: 66 negative controls
+per backend. Batching preserves separate per-case outcomes. Missing capabilities
+return 77 and remain skips. Accepted instruction records are tied to the draw
+CTest result; a passing run adds two SOP1 forms in each gfx1013/gfx1030 reference
+list. This is fixture coverage, not a title execution result.
+
+```sh
+python -B tests/scalar_bitset64_check.py
+python -B tests/scalar_bitset64_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+The binary mode checks 34 assemble/disassemble/lower round trips: 32 across both
+architectures and eight source choices per operation, plus two transport controls. Rejection controls cover
+undefined old halves, outstanding scalar reads/writes, malformed or odd register
+pairs, special registers, vector/pair indices, source modifiers and oversized
+immediates. A select after bit-set also fails when no prior instruction defined
+SCC; bit-set cannot manufacture a flag.
+
+Observed on Windows 11 build 26300.9974, MSVC 19.44.35230: both CTests passed
+without skips, on an RTX 3060 (driver 32.0.16.2101) and WARP 10.0.26100.9818.
+The debug layer was unavailable. Each backend matched all 458 valid draws and
+detected all 66 negative controls. Before the integer constant-buffer and export
+path, setting bit 31 on a NaN-shaped word produced `0x7fffffff` instead of
+`0xffffffff` on this NVIDIA driver; the exact-bit controls retain that case.
+Existing WARP blend/scalar, bit-field-mask, no-carry integer and float-to-uint
+conversion checks also passed. Linux Python 3.14.4 with LLVM 18 passed the full
+pixel binary round trip, form-coverage controls and the 34 focused round trips.
+
 ### Pixel programs with two exits
 
 For FSSM version 0x101 the pixel extractor reads the 64-bit code offset, byte count and section end at 0xC0, 0xC8 and 0xE8. Instructions start 40 bytes after the code offset. The end must agree with offset plus count. For the unset end sentinel the extractor also checks for four padding words at the computed end. It strips aligned trailing `s_code_end` words inside that extent and requires a terminal `s_endpgm`. A marker in the following metadata cannot extend or terminate the code. The field interpretation agrees with the [independent FSSM cross-check](https://github.com/ItsNotRexed/Leonida/blob/dcd8ecf10b138566d567020562b7afd853a89024/docs/fssm_crosscheck.md).

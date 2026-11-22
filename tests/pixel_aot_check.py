@@ -2562,7 +2562,7 @@ def check_scalar_controls():
 
     sop1_program = sop1_scalar_ops()
     sop1_source = translate_int(sop1_program)
-    for expected in ("(asint(asuint(params[0].w)) < 0 ? (0u - asuint(params[0].w)) : asuint(params[0].w))",
+    for expected in ("(asint(params[0].w) < 0 ? (0u - params[0].w) : params[0].w)",
                      "& ~(1u << (", "| (1u << (31u & 31u))", "? 305419896u :"):
         assert expected in sop1_source, expected
     sop1_refs = [sop1_scalar_ops_reference(words) for words in SOP1_WORDS]
@@ -2594,7 +2594,7 @@ def check_scalar_controls():
     # s_bfm_b32: the lowering masks both counts to five bits and leaves SCC untouched.
     bfm_program = bfm_scalar_ops()
     bfm_source = translate_int(bfm_program)
-    assert ("= ((1u << (asuint(params[0].w) & 31u)) - 1u) << (asuint(params[1].x) & 31u);" in bfm_source), bfm_source
+    assert ("= ((1u << (params[0].w & 31u)) - 1u) << (params[1].x & 31u);" in bfm_source), bfm_source
     assert "s_bfm_b64(" in bfm_source
     refs = [bfm_scalar_ops_reference(words) for words in BFM_WORDS]
     # Counts 0, 1, 31, 32 and 33 for b32 and 63 and 64 for b64 are all covered with distinct results.
@@ -2607,7 +2607,7 @@ def check_scalar_controls():
     at = scc_program.index("v_mov_b32_e32 v12, s50")
     scc_program[at:at] = with_scc + ["s_bfm_b32 s54, 4, 8", "s_cselect_b32 s55, s44, s45"]
     scc_source = translate_int(scc_program)
-    assert re.search(r"= scc\d+ \? asuint\(params\[0\]\.w\) : asuint\(params\[1\]\.x\);", scc_source), scc_source
+    assert re.search(r"= scc\d+ \? params\[0\]\.w : params\[1\]\.x;", scc_source), scc_source
     # Without a tracked SCC the select is rejected even after s_bfm_b32 (it does not create one).
     at = bfm_program.index("v_mov_b32_e32 v12, s50")
     must_reject(translate_int, bfm_program[:at] + ["s_bfm_b32 s54, 4, 8", "s_cselect_b32 s55, s44, s45"] + bfm_program[at:])
@@ -3824,7 +3824,7 @@ def check_nc_integer_lowering():
     """Static checks for the 32-bit no-carry add/sub forms of nc_integer_group(1..3)."""
     # v18 is written by the mov at index 20, and the four group instructions follow at 21..24. A and B are
     # s44 (params[0].w) and s45. sub is src0 - src1; subrev swaps the operands and is src1 - src0.
-    a, b = "asuint(params[0].w)", "asuint(alu20)"
+    a, b = "params[0].w", "asuint(alu20)"
     expected = {
         1: (f"{a} + {b}", f"{a} - {b}", f"{b} - {a}", f"{b} - {a}"),
         2: (f"{a} + {b}", f"{a} - {b}", f"{a} + {b}", f"{a} - {b}"),
@@ -4173,7 +4173,8 @@ def check_controls(directory):
     source = translate(program)
     assert "return float4(alu" in source and "export16(" not in source.split("float4 main", 1)[1]
     integral = lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True)
-    assert "uint4 main" in integral and "return uint4(asuint(" in integral
+    assert "uint4 params[16]" in integral and "uint4 main" in integral
+    assert "return uint4(params[0].w, params[1].x, params[1].y, params[1].z);" in integral
     must_reject(lower, with_constants([]), 20, 24, [1, 2, 3, 4],
                 constant_descriptor=64, integer_export=True)
     export = program.index("exp mrt0 v12, v13, v14, v15 done vm")
@@ -4252,8 +4253,8 @@ def check_controls(directory):
 
     cmpk_program = sopk_cmpk_cmovk()
     cmpk_source = translate_int(cmpk_program)
-    for expected in ("(asint(asuint(params[0].w)) < asint(4294934528u))",
-                     "(asuint(params[1].x) < 32768u)",
+    for expected in ("(asint(params[0].w) < asint(4294934528u))",
+                     "(params[1].x < 32768u)",
                      "? 4294967294u : ",
                      "? 32767u : "):
         assert expected in cmpk_source, expected
@@ -6480,9 +6481,9 @@ def check_bfm_draw(directory, compiler, renderer, backend):
         write_words(words)
         subprocess.run(draw, check=True)
     # Controls on the generated HLSL: a narrower count mask and swapped count/offset. Words 1 and 4 distinguish both.
-    for old, new, label in (("(1u << (asuint(params[0].w) & 31u))", "(1u << (asuint(params[0].w) & 15u))", "b32 count mask"),
-                            ("((1u << (asuint(params[0].w) & 31u)) - 1u) << (asuint(params[1].x) & 31u)",
-                             "((1u << (asuint(params[1].x) & 31u)) - 1u) << (asuint(params[0].w) & 31u)", "b32 operand order")):
+    for old, new, label in (("(1u << (params[0].w & 31u))", "(1u << (params[0].w & 15u))", "b32 count mask"),
+                            ("((1u << (params[0].w & 31u)) - 1u) << (params[1].x & 31u)",
+                             "((1u << (params[1].x & 31u)) - 1u) << (params[0].w & 31u)", "b32 operand order")):
         mutated = lowered.replace(old, new)
         assert mutated != lowered, label
         source.write_text(mutated, encoding="ascii")
