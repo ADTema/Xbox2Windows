@@ -1899,6 +1899,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"v_cvt_i32_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8})"):
+            dst, src = m.groups()
+            if int(dst[1:]) > 255 or (src.startswith(("v", "s")) and
+                    int(src[1:]) > (255 if src.startswith("v") else 105)):
+                raise ValueError("Invalid signed conversion register")
+            if mask != "entry":
+                raise ValueError("Invalid conversion")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if src.startswith("v") and src not in vector:
+                raise ValueError(f"Unbound pixel input {src} at v_cvt_i32_f32_e32")
+            operand = fp_operand(src, scalar, vector, pending, sample_dest)
+            helpers.add("cvt_i32_f32")
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat(cvt_i32_f32(asuint({operand})));")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             if dst in sample_dest:
@@ -1942,7 +1957,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
-        if "cvt_u32_f32" in helpers:
+        if helpers & {"cvt_u32_f32", "cvt_i32_f32"}:
             defs.append((Path(__file__).resolve().parents[1] / "src/ffx_float_to_int.hlsli").read_text())
         lines[:0] = defs
     return "\n".join([*lines, "}",""])
