@@ -67,11 +67,12 @@ def indexed_fixture(case, point_depth=0.0625, matrix_depth=0.125):
     return fallback_fixture(constants, positions, pixels)
 
 
-def draw(renderer, adapter, directory, shaders, label, data, *, bad_pixels=None, bad_export=None):
+def draw(renderer, adapter, directory, shaders, label, data, *, bad_pixels=None, bad_export=None, textured=False):
     path = directory / (label + ".case")
     path.write_bytes(data)
     print(label, flush=True)
-    command = [renderer, adapter, "--mesh-indexed-fallback", *shaders, path]
+    operation = "--mesh-textured-fallback" if textured else "--mesh-indexed-fallback"
+    command = [renderer, adapter, operation, *shaders, path]
     if bad_pixels is None:
         result = subprocess.run(command)
         if result.returncode == 77:
