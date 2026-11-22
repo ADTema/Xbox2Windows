@@ -40,6 +40,11 @@ float expected_channel(UINT byte)
 }
 using Color = std::array<float, 4>;
 
+// Aliased buffers bound after the title range table for flat and global loads; tools/pixel_aot.py
+// TITLE_ALIAS_SLOTS declares the same count.
+constexpr UINT titleAliasSlots = 8;
+constexpr size_t titleRangeWords = 6;  // TitleRange in src/title_va_lookup.hlsli
+
 struct PixelInput {
     UINT width, height, scale;
     DXGI_FORMAT format;
@@ -52,7 +57,81 @@ struct PixelInput {
     bool integerRT = false;      // bit 0 of the optional case-trailer flags byte
     std::vector<BYTE> nanMask;   // 64 per-texel NaN-class mask bytes, empty without a trailer
     std::optional<D3D12_VIEWPORT> viewport;
+    std::vector<Word> titleRanges;                // TitleRange records, empty without title memory
+    std::vector<std::vector<Word>> titleAliases;  // one buffer per alias slot
 };
+
+// Flag bit 2 of the case trailer: the range count and the slot count (titleAliasSlots), the ranges,
+// then for each slot its length in words followed by the words.
+void read_title_memory(std::istream& file, PixelInput& input)
+{
+    std::array<Word, 2> counts{};
+    file.read(reinterpret_cast<char*>(counts.data()), sizeof(counts));
+    const auto [rangeCount, slotCount] = counts;
+    if (!file || !rangeCount || rangeCount > 4096 || slotCount != titleAliasSlots)
+        throw std::runtime_error("Invalid title memory counts");
+    input.titleRanges.resize(size_t(rangeCount) * titleRangeWords);
+    file.read(reinterpret_cast<char*>(input.titleRanges.data()),
+              static_cast<std::streamsize>(input.titleRanges.size() * sizeof(Word)));
+    for (size_t range = 0; file && range < rangeCount; ++range) {
+        const Word* fields = input.titleRanges.data() + range * titleRangeWords;
+        if (fields[4] >= slotCount || fields[5])
+            throw std::runtime_error("Invalid title range slot");
+    }
+    for (UINT slot = 0; file && slot < slotCount; ++slot) {
+        Word words = 0;
+        file.read(reinterpret_cast<char*>(&words), sizeof(words));
+        if (!file || !words || words > (1u << 22))
+            throw std::runtime_error("Invalid title alias length");
+        auto& alias = input.titleAliases.emplace_back(words);
+        file.read(reinterpret_cast<char*>(alias.data()), static_cast<std::streamsize>(alias.size() * sizeof(Word)));
+    }
+    if (!file) throw std::runtime_error("Truncated title memory");
+}
+
+// pixel_aot_vs's root signature followed by a pixel-visible table of the title range table (t0, space1)
+// and the aliased buffers (t1, space1 onwards).
+ComPtr<ID3D12RootSignature> title_root_signature(ID3D12Device* device)
+{
+    const D3D12_DESCRIPTOR_RANGE ranges[2]{
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1 + titleAliasSlots, 0, 1, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+    };
+    D3D12_ROOT_PARAMETER parameters[3]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[0].DescriptorTable.pDescriptorRanges = &ranges[0];
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters[1].Descriptor.ShaderRegister = 0;
+    parameters[1].Descriptor.RegisterSpace = 0;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[2].DescriptorTable.pDescriptorRanges = &ranges[1];
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    // The static sampler of tests/pixel_aot_vs.hlsl, with the HLSL defaults for the fields it leaves out.
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxAnisotropy = 16;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    signature.NumParameters = 3;
+    signature.pParameters = parameters;
+    signature.NumStaticSamplers = 1;
+    signature.pStaticSamplers = &sampler;
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+          "Serialize title memory root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "Title memory root");
+    return root;
+}
 
 struct MipDraw {
     UINT sampledLevel;
@@ -82,8 +161,12 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     std::ifstream file(path, std::ios::binary);
     std::vector<char> ps{std::istreambuf_iterator<char>(file), {}};
     if (ps.empty() || file.bad()) throw std::runtime_error("Cannot read compiled pixel shader");
+    const bool titleMemory = !input.titleRanges.empty();
     ComPtr<ID3D12RootSignature> root;
-    check(device->CreateRootSignature(0, pixel_aot_vs, sizeof(pixel_aot_vs), IID_PPV_ARGS(&root)), "Pixel root");
+    if (titleMemory)
+        root = title_root_signature(device);
+    else
+        check(device->CreateRootSignature(0, pixel_aot_vs, sizeof(pixel_aot_vs), IID_PPV_ARGS(&root)), "Pixel root");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root.Get();
     desc.VS = {pixel_aot_vs, sizeof(pixel_aot_vs)};
@@ -143,7 +226,7 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     ComPtr<ID3D12DescriptorHeap> rtvs, srvs;
     check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&rtvs)), "Pixel target heap");
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heapDesc.NumDescriptors = 2;
+    heapDesc.NumDescriptors = titleMemory ? 3 + titleAliasSlots : 2;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srvs)), "Pixel texture heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
@@ -157,6 +240,32 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     auto secondHandle = srvs->GetCPUDescriptorHandleForHeapStart();
     secondHandle.ptr += device->GetDescriptorHandleIncrementSize(heapDesc.Type);
     device->CreateShaderResourceView(secondTexture.Get(), &view, secondHandle);
+    // Title memory follows the two textures: the range table, then one raw view per alias slot.
+    const UINT srvIncrement = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
+    std::vector<ComPtr<ID3D12Resource>> titleBuffers;
+    if (titleMemory) {
+        auto handle = secondHandle;
+        handle.ptr += srvIncrement;
+        titleBuffers.push_back(upload(device, input.titleRanges));
+        D3D12_SHADER_RESOURCE_VIEW_DESC table{};
+        table.Format = DXGI_FORMAT_UNKNOWN;
+        table.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        table.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        table.Buffer.NumElements = static_cast<UINT>(input.titleRanges.size() / titleRangeWords);
+        table.Buffer.StructureByteStride = static_cast<UINT>(titleRangeWords * sizeof(Word));
+        device->CreateShaderResourceView(titleBuffers.back().Get(), &table, handle);
+        for (const auto& alias : input.titleAliases) {
+            handle.ptr += srvIncrement;
+            titleBuffers.push_back(upload(device, alias));
+            D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
+            raw.Format = DXGI_FORMAT_R32_TYPELESS;
+            raw.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            raw.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            raw.Buffer.NumElements = static_cast<UINT>(alias.size());
+            raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            device->CreateShaderResourceView(titleBuffers.back().Get(), &raw, handle);
+        }
+    }
 
     bool textureUploaded = false;
     for (const auto& req : draws) {
@@ -202,6 +311,11 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->SetGraphicsRootSignature(root.Get());
         list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
         list->SetGraphicsRootConstantBufferView(1, gpuConstants->GetGPUVirtualAddress());
+        if (titleMemory) {
+            auto titleTable = srvs->GetGPUDescriptorHandleForHeapStart();
+            titleTable.ptr += 2 * UINT64(srvIncrement);
+            list->SetGraphicsRootDescriptorTable(2, titleTable);
+        }
         // WARP and hardware can use either the rounded SRV extent or the
         // unrounded base extent for implicit LOD. Their geometric mean is
         // within half a mip of both, since rounding discards less than one texel.
@@ -431,7 +545,7 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
         if (file.peek() != std::char_traits<char>::eof()) {
             BYTE flags = 0;
             file.read(reinterpret_cast<char*>(&flags), 1);
-            if (flags & 0xfcu)
+            if (flags & 0xf8u)
                 throw std::runtime_error("Unknown case trailer flag bits");
             input.integerRT = (flags & 1u) != 0;
             if (flags & 2u) {
@@ -445,6 +559,7 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
                 input.scale = 1;
                 input.viewport = D3D12_VIEWPORT{float(left), float(top), float(width), float(height), 0, 1};
             }
+            if (flags & 4u) read_title_memory(file, input);
             if (file.peek() != std::char_traits<char>::eof()) {
                 if (input.integerRT)
                     throw std::runtime_error("NaN-class masks require a floating-point render target");

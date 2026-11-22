@@ -362,8 +362,37 @@ HALF_ROUNDING = {"0": "nearest even", "3": "toward zero"}
 # mode: the widening is exact and the pack always truncates.
 HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32")
 # FLAT_SCR_LO and FLAT_SCR_HI hold the scratch base address. Only scratch_* and flat_* memory instructions and
-# s_getreg_b32 can observe it, and none of them is lowered, so a whole-register write changes no result.
+# s_getreg_b32 can observe it. scratch_* and s_getreg_b32 are not lowered, and the one lowered flat form,
+# flat_load_dword, reads only through the title ranges below (no private aperture), so a whole-register write
+# changes no result.
 FLAT_SCRATCH = ("HW_REG_FLAT_SCR_LO", "HW_REG_FLAT_SCR_HI")
+
+# flat_load_dword and global_load_dword with `off` read one DWORD at a 64-bit title address: the address pair
+# plus the instruction offset, sign-extended to 64 bits with the carry or borrow taken into the high word.
+# TitleLookup (src/title_va_lookup.hlsli) finds the range holding the whole DWORD; the load then reads that
+# range's aliased buffer at the byte offset. An address in no range, a DWORD that does not lie inside a single
+# range and a misaligned address read TITLE_MISS instead of zero. The range count is fixed at translation time
+# (lower(title_ranges=...)), and TITLE_ALIAS_SLOTS bounds the aliased descriptors; a slot past it also reads
+# TITLE_MISS. LLVM 15 assembles gfx1013 flat offsets as 11-bit unsigned and global offsets as 12-bit signed.
+TITLE_ALIAS_SLOTS = 8
+TITLE_MISS = 0xdeadbeef
+TITLE_OFFSETS = {"flat": range(0, 2048), "global": range(-2048, 2048)}
+TITLE_MEMORY = """StructuredBuffer<TitleRange> TitleRanges : register(t0, space1);
+ByteAddressBuffer TitleAliases[{slots}] : register(t1, space1);
+static const uint TITLE_RANGE_COUNT = {count}u;
+// The DWORD at base + offset, where offset is the instruction offset sign-extended to 64 bits.
+uint title_load_dword(uint2 base, uint2 offset)
+{{
+    const uint low = base.x + offset.x;
+    const uint2 address = uint2(low, base.y + offset.y + (low < base.x ? 1u : 0u));
+    uint slot;
+    uint byteOffset;
+    if (!TitleLookup(TitleRanges, TITLE_RANGE_COUNT, address, 4, slot, byteOffset) || slot >= {slots}u) {{
+        return {miss:#x}u;
+    }}
+    return TitleAliases[NonUniformResourceIndex(slot)].Load(byteOffset);
+}}
+"""
 
 ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
@@ -1382,8 +1411,15 @@ SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", 
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
-          second_texture_offset=None, integer_export=False, texcoord_components=2):
-    """Track descriptor provenance, interpolation and packed or uncompressed exports."""
+          second_texture_offset=None, integer_export=False, texcoord_components=2, title_ranges=None):
+    """Track descriptor provenance, interpolation and packed or uncompressed exports.
+
+    title_ranges is the number of title ranges bound at t0, space1 for flat and global loads; without it
+    those loads are refused.
+    """
+    if title_ranges is not None and (isinstance(title_ranges, bool) or not isinstance(title_ranges, int)
+                                     or not 1 <= title_ranges <= 0xffffffff):
+        raise ValueError("Invalid title range count")
     if texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105:
         raise ValueError("Invalid scalar inputs")
     if sampler is not None and (len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
@@ -1417,7 +1453,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     half_rounding = HALF_ROUNDING["0"]
     mask = "entry"
     samples = 0
-    sample_dest = {}  # VGPR -> issue number of its outstanding image_sample
+    vector_loads = 0  # image samples and title loads issued, in vmcnt order
+    title_loads = False
+    sample_dest = {}  # VGPR -> issue number of its outstanding image_sample or title load
     exported = False
     ended = False
     entry_line = len(lines)
@@ -1487,7 +1525,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                         else:
                             # Only the newest limit samples can remain outstanding. Filtering
                             # the current set also preserves guarantees made by earlier waits.
-                            sample_dest = {reg: issue for reg, issue in sample_dest.items() if issue > samples - limit}
+                            sample_dest = {reg: issue for reg, issue in sample_dest.items() if issue > vector_loads - limit}
                     elif lgkm_match := re.fullmatch(r"lgkmcnt\((\d+)\)", token):
                         if has_lgkm:
                             raise ValueError(f"Duplicate lgkmcnt in waitcnt: {line}")
@@ -1870,9 +1908,30 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             call = f"SampleLevel(samp, {coordinate}, 0.0f)" if lod_zero else f"Sample(samp, {coordinate})"
             lines.append(f"    float4 sample{i} = {texture}.{call};")
             samples += 1
+            vector_loads += 1
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
-                sample_dest[f"v{n}"] = samples
+                sample_dest[f"v{n}"] = vector_loads
+        elif m := match(r"(flat|global)_load_dword (v\d+), v\[(\d+):(\d+)\](, off)?(?: offset:(-?\d+))?"):
+            # One DWORD through a 64-bit title address. Cache-policy bits, the global saddr form and
+            # every other width or direction are refused by the fall-through.
+            segment, dst, first, last, off, imm = m.groups()
+            offset = int(imm or 0)
+            if (segment == "global") != (off is not None) or offset not in TITLE_OFFSETS[segment]:
+                raise ValueError(f"Unsupported {segment} load form")
+            if title_ranges is None:
+                raise ValueError("Title memory is not bound")
+            if mask != "entry" or int(dst[1:]) > 255 or int(last) > 255 or dst in sample_dest:
+                raise ValueError("Invalid title memory load")
+            low, high = [int_operand(f"v{n}", scalar, vector, pending, sample_dest, signed=False)
+                         for n in registers(first, last, 2)]
+            extended = offset & 0xffffffffffffffff
+            lines.append(f"    precise float alu{i} = asfloat(title_load_dword(uint2({low}, {high}), "
+                         f"uint2({extended & 0xffffffff:#x}u, {extended >> 32:#x}u)));")
+            title_loads = True
+            vector_loads += 1
+            vector[dst] = f"alu{i}"
+            sample_dest[dst] = vector_loads
         elif m := match(r"v_(fmaak|fmamk|madak|madmk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
             # The mad forms use the unfused, denormal-flushing helper; the fma forms are fused.
             op, dst, *tokens = m.groups()
@@ -2480,6 +2539,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if helpers & {"cvt_u32_f32", "cvt_i32_f32"}:
             defs.append((Path(__file__).resolve().parents[1] / "src/ffx_float_to_int.hlsli").read_text())
         lines[:0] = defs
+    if title_loads:
+        lookup = (Path(__file__).resolve().parents[1] / "src/title_va_lookup.hlsli").read_text()
+        lines[:0] = [lookup, TITLE_MEMORY.format(slots=TITLE_ALIAS_SLOTS, count=title_ranges, miss=TITLE_MISS)]
     return "\n".join([*lines, "}",""])
 
 
