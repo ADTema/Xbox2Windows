@@ -132,6 +132,18 @@ def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):
 
 PREAMBLE = """Texture2D<float4> tex : register(t0);
 SamplerState samp : register(s0);
+// v_cmp_class_f32: the ten binary32 classes of LLVM SIInstrFlags::ClassFlags, from the raw encoding:
+// signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
+uint class32(float value) {
+    uint bits = asuint(value);
+    uint magnitude = bits & 0x7fffffffu;
+    bool negative = bits >= 0x80000000u;
+    if (magnitude > 0x7f800000u) return (bits & 0x00400000u) != 0u ? 0x2u : 0x1u;
+    if (magnitude == 0x7f800000u) return negative ? 0x4u : 0x200u;
+    if (magnitude >= 0x00800000u) return negative ? 0x8u : 0x100u;
+    if (magnitude != 0u) return negative ? 0x10u : 0x80u;
+    return negative ? 0x20u : 0x40u;
+}
 // v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
 // D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
 float fract32(float value) {
@@ -213,6 +225,9 @@ SALU_BIT64 = {
     "xor": "uint2({0} ^ {2}, {1} ^ {3})",
     "andn2": "uint2({0} & ~{2}, {1} & ~{3})",
     "orn2": "uint2({0} | ~{2}, {1} | ~{3})",
+    "nand": "uint2(~({0} & {2}), ~({1} & {3}))",
+    "nor": "uint2(~({0} | {2}), ~({1} | {3}))",
+    "xnor": "uint2(~({0} ^ {2}), ~({1} ^ {3}))",
 }
 SALU_HELPERS = {
     "s_lshl_b64": (
@@ -532,14 +547,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dst):
                 scalar[f"s{n}"] = (bindings[offset], j)
                 pending.add(f"s{n}")
-        elif m := match(r"(?:(s_load_dwordx4|s_buffer_load_dwordx4) s\[(\d+):(\d+)\]|s_buffer_load_dword s(\d+))"
+        elif m := match(r"(?:(s_load_dwordx4|s_buffer_load_dwordx[24]) s\[(\d+):(\d+)\]|s_buffer_load_dword s(\d+))"
                         r", s\[(\d+):(\d+)\], (0x[0-9a-f]+|null)"):
             op, first, last, single, low, high, imm = m.groups()
             offset = 0 if imm == "null" else int(imm, 16)
             descriptor = op == "s_load_dwordx4"
-            if single is not None and (int(single) > 105 or int(low) % 4 or int(high) > 105):
+            width = 1 if single is not None else 2 if op == "s_buffer_load_dwordx2" else 4
+            if single is not None:
+                first = last = single
+            # LLVM names a 64-bit scalar destination only as an even-aligned pair.
+            if width < 4 and (int(last) > 105 or int(first) % width or int(low) % 4 or int(high) > 105):
                 raise ValueError("Invalid scalar buffer registers")
-            dst = registers(single, single, 1) if single is not None else registers(first, last, 4)
+            dst = registers(first, last, width)
             base = [f"s{n}" for n in registers(low, high, 2 if descriptor else 4)]
             expected = ["texture_ptr", 0] if descriptor else [("cbv", n) for n in range(4)]
             if constant_descriptor is None or pending.intersection(base) or [scalar.get(r) for r in base] != expected:
@@ -653,6 +672,49 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            dst, value, classes = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+                bits = f"{int(classes, 0) & 0xffffffff}u"
+            elif re.fullmatch(r"[vs]\d+", classes):
+                bits = f"asuint({fp_operand(classes, scalar, vector, pending, sample_pending)})"
+            else:
+                raise ValueError("Unsupported class mask")
+            operand = fp_operand(value, scalar, vector, pending, sample_pending)
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
+
+        elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+                      for t in tokens]
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({op}({values[0]}, {values[1]}));")
+        elif m := match(r"v_(min3|max3|med3)_(i32|u32)(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+                      for t in tokens]
+            if op == "med3":
+                vec_type = "int3" if kind == "i32" else "uint3"
+                lines.append(f"    {vec_type} med{i} = {vec_type}({values[0]}, {values[1]}, {values[2]});")
+                expression = f"max(min(med{i}.x, med{i}.y), min(max(med{i}.x, med{i}.y), med{i}.z))"
+            else:
+                fn = op[:-1]
+                expression = f"{fn}({fn}({values[0]}, {values[1]}), {values[2]})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({expression});")
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, dst, *tokens = m.groups()
             regs = lane_mask(dst)

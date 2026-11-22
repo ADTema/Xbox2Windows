@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_image_data
 ; RIP-relative data for the jump-table translator's --image-data option: globals in the writable
 ; section, one of them in its zero-filled tail, and a read-only table, read, written, compared, stored
 ; and returned through RIP-relative operands. Every export takes RCX, RDX and R8 = address of three
