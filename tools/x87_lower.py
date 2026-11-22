@@ -3,7 +3,7 @@
 The profile accepts:
 - FLD and FSTP with an m32, m64 or m80 operand, and FST with an m32 or m64 operand;
 - FLD, FST, FSTP and FXCH with ST(i), FCHS and FABS, FSQRT and FRNDINT;
-- FXTRACT, which replaces ST(0) by its exponent and pushes its significand;
+- FXTRACT, which replaces ST(0) by its exponent and pushes its significand, and FSCALE;
 - the constant loads FLD1, FLDZ, FLDPI, FLDL2T, FLDL2E, FLDLG2 and FLDLN2;
 - FILD, FISTP and FISTTP with an m16, m32 or m64 integer operand, and FIST with m16 or m32;
 - FCOMI, FCOMIP, FUCOMI and FUCOMIP ST(0), ST(i), which set ZF and CF for the integer lowering (PF is
@@ -26,7 +26,7 @@ from iced_x86 import Code as C, FlowControl, MemorySize as S, Mnemonic as M, OpK
 
 X87_HEADER = Path(__file__).with_name("x87_soft.h").read_text(encoding="ascii")
 X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FLD1, M.FLDZ, M.FLDPI, M.FLDL2T, M.FLDL2E,
-                     M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FCOMI,
+                     M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP})
 DECLARATION = "X87Value x87_slot[8]{};"
@@ -98,6 +98,10 @@ def _effect(i, depth):
         if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth if op == M.FIST else depth - 1
+    if op == M.FSCALE:  # ST(0) scaled by ST(1); both stay on the stack
+        if depth < 2:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth
     if op == M.FXTRACT:
         if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
@@ -206,6 +210,8 @@ def statement(i, depth, address):
         chop = "true" if op == M.FISTTP else "false"
         return (f"{{ const word a = {address()}; "
                 f"store<{unsigned}>(a, static_cast<{unsigned}>(x87_to_integer(x87_slot[{top}], {bits}, {chop}))); }}")
+    if op == M.FSCALE:
+        return f"x87_slot[{top}] = x87_scale(x87_slot[{top}], x87_slot[{top - 1}]);"
     if op == M.FXTRACT:  # ST(1) becomes the exponent and the pushed ST(0) the significand
         return (f"{{ X87Value e; const X87Value s = x87_xtract(x87_slot[{top}], e); "
                 f"x87_slot[{top}] = e; x87_slot[{depth}] = s; }}  // fxtract")
