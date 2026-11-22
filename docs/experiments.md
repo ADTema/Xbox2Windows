@@ -1742,6 +1742,73 @@ compares all 320 output words each time. The stale reference fails on exactly
 eight stored words. The binding is limited to unsigned 32-bit words and fixed
 byte offsets.
 
+### Two- and three-dimensional thread groups
+
+The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits
+(x and y up to 1024, z up to 64, x·y·z up to 1024). The translator emits it
+unchanged, so an 8×8 group stays 8×8. On gfx10, compute waves receive local X,
+Y and Z in separate registers `v0`, `v1` and `v2`. LLVM 15 packs the three IDs
+into `v0` only for targets with `FeaturePackedTID` (gfx90a, gfx940 and gfx11), and
+`FeatureISAVersion10_1_3` does not have it. `v1` and `v2` are bound only when
+that group dimension is larger than one. `--group-reg-y` and `--group-reg-z`
+name the group-ID SGPRs in the same way as `--group-reg`. LLVM allocates them
+as consecutive system SGPRs in X, Y, Z order, each only when the program reads
+it. For an original program this is still a caller assumption.
+
+A dispatch index is `v_lshl_add_u32` of a group ID and the local ID of the
+same axis, shifted by log2 of a power-of-two group dimension. An indexed store
+takes one of two forms:
+
+- one `idxen` axis, when every other group dimension is one;
+- a row axis through `idxen` and a column axis through `offen`, with a
+  `v_lshlrev_b32` byte offset. The store must fit in one element, and one
+  group's row must fit in the stride.
+
+All stores in a program use one layout, so no two invocations of a group write
+the same bytes. A dispatch-thread index can also be stored as data. The
+translator does not model out-of-range behavior for structured buffers: the
+caller's stride and dispatch must keep every row in range. Addresses that need
+other ALU forms, for example a `v_mad_u32_u24` row pitch, are still rejected.
+
+```sh
+python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-reg 8 --descriptor-offset 0 --group-reg 10 --group-reg-y 11 --stride 72 --output out/tile.hlsl
+```
+
+The Windows fixture covers four group shapes, each with a full 320-word
+readback:
+
+| Group | Dispatches |
+|---|---|
+| 8×8×1 | 1×1×1 and 1×2×1 |
+| 4×1×8 | 1×1×1 and 1×1×2 |
+| 4×4×1 | 1×1×1 and 3×2×1 |
+| 256×1×1 | 1×1×1 |
+
+The expected words come from an independent per-invocation model. For each
+shape, the following must fail on the adapter:
+
+- a flipped guard word;
+- the first group count against the larger reference;
+- recompiled HLSL with swapped axes;
+- recompiled HLSL that ignores Z (4×1×8 only);
+- recompiled HLSL with half the group X size.
+
+The CPU controls reject:
+
+- swapped local or group axes;
+- a non-power-of-two size whose shift still matches;
+- `v1` in a group whose Y is one;
+- duplicate or missing group registers;
+- an element or row overflow;
+- an index and a byte offset taken from the same axis;
+- two stores with transposed layouts.
+
+`tools/shader_profile_audit.py` passes the PSV0 size and tries the next one or
+two SGPRs after the group-X candidate for group Y and Z. A CPU control in
+`compute_store_check.py` checks that a 4×1×8 kernel reading group Z from the
+SGPR after group X is accepted, and one reading it two SGPRs later is not. Its
+record counts have not been remeasured after this change.
+
 A local scan of 2,689 compute records accepted 12 records (10 distinct instruction streams). Ten use one-thread groups and fixed addresses. Two use 32- and 64-thread groups and indexed addresses. Tested table bindings used s4 or s5 with descriptor offsets of 0, 32 or 64. The indexed bindings used strides of 4, 8, 12 or 16 bytes, selecting the first compatible profile. On RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), each record compiled to desktop DXIL and dispatched. Each adapter completed 14 full-buffer comparisons with zero mismatches, including two different group counts for both indexed records.
 ## AVX2 leaf recompilation
 
