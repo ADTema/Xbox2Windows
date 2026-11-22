@@ -494,9 +494,16 @@ The host contract supplies a read-only raw SRV at `t0, space1` containing the or
 
 The [source-built compute shader](../tests/spirv_window/subtract.spvasm) reads two distinct addresses, subtracts their words and writes to a third. Windows checks all 16 words of the arena, including guards, for eight cases. Swapping the two reads reverses the result; moving the store changes which guard is replaced. High addresses, misalignment, 64-bit index overflow and a write past the actual descriptor exercise the window bounds.
 
-With SPIRV-Tools and SPIRV-Cross on the Windows PATH, reconfigure to register the optional GPU tests:
+The SPIR-V bridge GPU tests (`spirv_{address_window,sampler_views,ballot_extract,compare_sampler}_{hardware,warp}`)
+need `spirv-as`, `spirv-val` and `spirv-cross`. `tools/setup-spirv-tools.ps1` builds them from pinned
+SPIRV-Tools, SPIRV-Headers and SPIRV-Cross revisions into `out/tools/spirv/bin`, where CMake looks
+first. It also searches `PATH` and `$env:VULKAN_SDK\Bin`. Without the tools, the tests are still
+registered and report a skip. Both Windows CI jobs build the pinned tools, cached by revision and MSVC
+toolset, and set `X2W_REQUIRE_SPIRV_TOOLS=1`, which turns a missing tool or a skip into a failure.
+A separate step then requires all four `_warp` tests to have passed. Physical-GPU runs stay manual.
 
 ```powershell
+.\tools\setup-spirv-tools.ps1
 cmake --preset dev
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^spirv_address_window_' -V
