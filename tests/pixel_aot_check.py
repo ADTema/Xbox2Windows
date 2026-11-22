@@ -2692,6 +2692,115 @@ def check_three_way_templates():
                                    {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
                 assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
                                 "med3": sorted((a, b, c))[1]}, (a, b, c)
+# Quad-local DPP16 (quad_perm) and DPP8 (dpp8) fixture covering all 20 supported VOP1/VOP2 DPP forms.
+# Derives per-quad lane ID {0, 1, 2, 3} from interpolated uv.x (v8) and uv.y (v9) so every 2x2 quad
+# carries 4 distinct values across all 4,096 pixels while exporting uniform exact binary16 results.
+DPP_BODY = [
+    "v_subrev_f32_dpp v18, v8, v8 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_subrev_f32_dpp v19, v9, v9 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_mul_f32_e32 v18, 0x42800000, v18",
+    "v_fma_f32 v20, 0x43000000, v19, v18",
+    "v_sub_f32_dpp v21, v20, v20 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_add_f32_dpp v21, |v21|, |v21| quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_f32_dpp v22, v20, v20 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_max_f32_dpp v22, |v22|, v22 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_add_f32_dpp v23, v20, v20 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_dpp v24, v20 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_sub_f32_e32 v25, v24, v20",
+    "v_add_f32_e32 v26, 4.0, v25",
+    "v_cmp_gt_f32_e32 vcc_lo, 0, v25",
+    "v_cndmask_b32_dpp v27, v25, v26, vcc_lo quad_perm:[1,2,0,3] row_mask:0xf bank_mask:0xf",
+    "v_add_f32_e32 v12, v21, v22",
+    "v_add_f32_e32 v12, v12, v23",
+    "v_add_f32_e32 v12, v12, v27",
+    "v_add_f32_e32 v12, s44, v12",
+    "v_mov_b32_e32 v28, s45",
+    "v_mov_b32_e32 v29, s46",
+    "v_mov_b32_e32 v30, s47",
+    "v_mul_f32_dpp v31, v20, v28 quad_perm:[3,3,3,3] row_mask:0xf bank_mask:0xf",
+    "v_mul_legacy_f32_dpp v32, v20, v28 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_min_f32_dpp v33, -v31, v30 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f32_f16_dpp v34, -|v29| quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v13, v32",
+    "v_fmac_f32_dpp v13, v33, v34 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_add_f32_e32 v35, s44, v30",
+    "v_floor_f32_dpp v36, v35 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_ceil_f32_dpp v37, v35 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_trunc_f32_dpp v38, v35 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_fract_f32_dpp v39, v35 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_fma_f32 v14, 2.0, v37, v36",
+    "v_fma_f32 v14, 4.0, v38, v14",
+    "v_add_f32_e32 v14, v14, v39",
+    "v_log_f32_dpp v40, v28 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_exp_f32_dpp v41, v40 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_rcp_f32_dpp v42, v41 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_sqrt_f32_dpp v43, v28 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_rsq_f32_dpp v44, v28 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_add_f32_e32 v15, v40, v41",
+    "v_fma_f32 v15, 0x41800000, v42, v15",
+    "v_add_f32_e32 v15, v15, v43",
+    "v_fma_f32 v15, 4.0, v44, v15",
+    "v_add_f32_e32 v15, 0.5, v15",
+    "v_floor_f32_e32 v15, v15",
+]
+
+DPP_SETS = (
+    # (a: f32, b: power-of-2 f32, h_bits: packed f16 in low half, c: f32)
+    (0.25, 4.0, 0x4000, 1.5),
+    (-2.25, 16.0, 0xbe00, 0.5),
+)
+
+
+def dpp_reference(a, b, h_bits, c):
+    h = struct.unpack("<e", struct.pack("<H", h_bits & 0xffff))[0]
+    ch0 = 8.0 + a
+    ch1 = 3.0 * b * abs(h)
+    x = a + c
+    ch2 = math.floor(x) + 2.0 * math.ceil(x) + 4.0 * math.trunc(x) + (x - math.floor(x))
+    log_b = math.log2(b)
+    ch3 = math.floor(log_b + (2.0 ** log_b) + 16.0 / (2.0 ** log_b) + math.sqrt(b) + 4.0 / math.sqrt(b) + 0.5)
+    return (half_rtz(ch0), half_rtz(ch1), half_rtz(ch2), half_rtz(ch3))
+
+
+def check_dpp_draw(directory, compiler, renderer, backend):
+    program = with_constants(DPP_BODY)
+    source = directory / "dpp.hlsl"
+    shader = directory / "dpp.cso"
+    case = directory / "dpp.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    for a, b, h_bits, c in DPP_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<2fIf", constants, 12, a, b, h_bits, c)
+        expected = dpp_reference(a, b, h_bits, c)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    for set_idx, old, new, label in (
+        (0, "v_sub_f32_dpp v21, v20, v20 quad_perm:[1,0,3,2]",
+         "v_sub_f32_dpp v21, v20, v20 quad_perm:[2,3,0,1]", "AcrossX vs AcrossY"),
+        (0, "v_sub_f32_dpp v22, v20, v20 quad_perm:[2,3,0,1]",
+         "v_sub_f32_dpp v22, v20, v20 quad_perm:[1,0,3,2]", "AcrossY vs AcrossX"),
+        (0, "dpp8:[1,2,3,0,5,6,7,4]", "dpp8:[3,0,1,2,7,4,5,6]", "cyclic dpp8 rotation"),
+        (0, "v_mul_f32_dpp v31, v20, v28 quad_perm:[3,3,3,3]",
+         "v_mul_f32_dpp v31, v20, v28 quad_perm:[1,1,1,1]", "lane broadcast"),
+        (0, "v_min_f32_dpp v33, -v31, v30", "v_min_f32_dpp v33, v31, v30", "DPP16 neg modifier"),
+        (1, "v_floor_f32_dpp v36, v35", "v_ceil_f32_dpp v36, v35", "floor vs ceil DPP"),
+    ):
+        a, b, h_bits, c = DPP_SETS[set_idx]
+        constants = bytearray(256)
+        struct.pack_into("<2fIf", constants, 12, a, b, h_bits, c)
+        expected = dpp_reference(a, b, h_bits, c)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
 def pack_f16_pair(lo, hi):
     lo_b = struct.unpack("<H", struct.pack("<e", lo))[0]
     hi_b = struct.unpack("<H", struct.pack("<e", hi))[0]
@@ -3057,6 +3166,10 @@ def check_pk_int16_draw(directory, compiler, renderer, backend):
 
 
 def check_controls(directory):
+    # A syntactically valid DPP VGPR must already have a tracked numeric value.
+    must_reject(translate, with_constants([
+        "v_mov_b32_dpp v12, v255 dpp8:[1,2,3,0,5,6,7,4]",
+    ]))
     program = bitwise_program()
     for before, after in (("s44, v18", "s44, |v18|"), ("20, v19", "20, v19 clamp"),
                           ("0x00700000, v18, v19", "0x00700000, v18")):
@@ -3896,6 +4009,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
+    fixtures.append((with_constants(DPP_BODY), translate))
     fixtures.extend((with_constants(body), translate) for body, *_ in SDWA_ARITH)
     fixtures.append((with_constants(PK_INT16_BODY), translate))
     fixtures.extend((with_constants(body), translate) for body in (SDWA_PRESERVE_BODY, SDWA_PAD_BODY))
@@ -4701,6 +4815,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
             wrong = subprocess.run([*draw, "rgba"], capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("The renderer failed to detect the changed channel order")
+    check_dpp_draw(directory, compiler, renderer, backend)
     check_vop3p_draw(directory, compiler, renderer, backend)
     check_bitwise_draw(directory, compiler, renderer, backend)
     check_fma_mix_draw(directory, compiler, renderer, backend)
