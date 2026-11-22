@@ -2145,8 +2145,16 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_tls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_tls_check.py" "$<TARGET_FILE:cpu_tls_original>"
         "$<TARGET_FILE:cpu_tls_refuse>" "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:pe_map>")
+    # Implicit TLS data: initialized, zero-filled, aligned, relocated and dynamically initialized
+    # thread-locals seen from the loading thread, an existing thread and a new thread.
+    add_library(cpu_tls_data SHARED tests/cpu/tls_data.cpp)
+    set_target_properties(cpu_tls_data PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreaded)
+    target_link_options(cpu_tls_data PRIVATE /INCREMENTAL:NO)
+    add_test(NAME cpu_native_tls_data COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_tls_data_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_tls_data>")
     # Implicit-TLS differential: one __declspec(thread) value read in the TLS callback
-    # on the main and worker threads. pe_map rejects the non-empty TLS template.
+    # on the main and worker threads, under the Windows loader and under pe_map.
     add_library(cpu_tls_value SHARED tests/cpu/tls_value.cpp)
     set_target_properties(cpu_tls_value PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreaded)
     target_link_options(cpu_tls_value PRIVATE /INCREMENTAL:NO)
