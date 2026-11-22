@@ -65,10 +65,12 @@ to the caller's own entry and any call cycle are refused, and a caller is
 refused when any callee is. A callee records how many low bytes of each argument
 register it may read before writing it, and the caller must define them at the
 call. After a call RAX holds the callee's return width of defined bytes; the
-other volatile registers, the flags and every frame byte below RSP + 32 at the
-call (the return address, the callee's frame and its home space) are undefined,
-and the nonvolatile registers and the rest of the frame,
-including the caller's own home space above entry RSP, are kept. RSP must be 8
+other volatile registers, the flags and the callee's 32-byte home space at RSP
+are undefined, and the nonvolatile registers and the rest of the frame,
+including the caller's own home space above entry RSP, are kept. The return
+address and the callee's frame lie below RSP, where every byte is already
+undefined because the frame proof forgets the bytes that ADD RSP and POP leave
+below RSP. RSP must be 8
 mod 16 from entry at a call, with the callee's home space below the return
 address. A tail jump is checked as a RET and contributes the callee's return
 width. The callee's frame is its own array, so no frame address crosses a call,
@@ -864,12 +866,13 @@ class Frame:
     """RSP as entry RSP + a constant at each instruction, and the stack bytes each instruction accesses.
 
     offsets: RVA -> RSP - entry RSP before the instruction. accesses: RVA -> (offset of the first byte from entry
-    RSP, width, reads, writes). The frame array starts at entry RSP + start, the lowest offset rounded down to
+    RSP, width, reads, writes). released: RVA -> (RSP before, RSP after) for an ADD RSP or POP, which leaves
+    those bytes below RSP, where their contents may change. The frame array starts at entry RSP + start, the lowest offset rounded down to
     8 mod 16: with RSP + 8 a multiple of 16 at entry, as the ABI requires, every array byte then has the address
     residue mod 16 of the stack byte it stands for. It ends with the home space at entry RSP + 40."""
 
     def __init__(self, function):
-        self.offsets, self.accesses, self.adjustments = {function.entry: 0}, {}, set()
+        self.offsets, self.accesses, self.adjustments, self.released = {function.entry: 0}, {}, set(), {}
         work = [function.entry]
         while work:
             ip = work.pop()
@@ -878,6 +881,8 @@ class Frame:
                 after = self.offsets[ip]
             else:
                 after = self.step(function.instructions[ip], self.offsets[ip])
+                if after > self.offsets[ip]:
+                    self.released[ip] = (self.offsets[ip], after)
             for successor in function.successors[ip]:
                 if successor not in self.offsets:
                     self.offsets[successor] = after
@@ -959,7 +964,9 @@ def prove_frame(function, order, effects, frame):
 
     Per stack byte: 1 once a store writes it; 2 + 8 * i + k while it holds byte k of the entry value of
     NONVOLATILE[i], saved by PUSH or MOV [RSP+d] while that register holds its entry value; 0 when not
-    written on some path. Per nonvolatile register: "entry", "written" since entry or the last restore, or
+    written on some path, or released since: when ADD RSP or POP raises RSP, the bytes it leaves below RSP
+    become 0 after the POP has read its source, because their contents may change before a later allocation
+    brings them back into the frame. Per nonvolatile register: "entry", "written" since entry or the last restore, or
     None when paths disagree. A join keeps what both sides agree on. A save is not a read of the entry value
     as data, so its register read is removed from effects before the register pass."""
     instructions = function.instructions
@@ -967,12 +974,12 @@ def prove_frame(function, order, effects, frame):
 
     def step(ip, status, data):
         if ip in function.calls:
-            # The CALL writes its return address below RSP, the callee's frame lies below that, and the
-            # callee may write its home space, the 32 bytes at RSP. All of these bytes are undefined
-            # after the call, even when RSP later falls back over them; the rest of the frame,
-            # including this function's own home space above entry RSP, is kept.
+            # The callee may write its home space, the 32 bytes at RSP. The CALL's return address and the
+            # callee's frame lie below RSP, where every byte is already 0: no access is below RSP, and the
+            # bytes that ADD RSP and POP leave below RSP become 0. The rest of the frame, including this
+            # function's own home space above entry RSP, is kept.
             index = frame.offsets[ip] - frame.start
-            return status, bytes(index + HOME_SIZE) + data[index + HOME_SIZE:]
+            return status, data[:index] + bytes(HOME_SIZE) + data[index + HOME_SIZE:]
         status, restored = dict(zip(NONVOLATILE, status)), None
         if ip in frame.accesses:
             offset, width, reads, writes = frame.accesses[ip]
@@ -982,6 +989,9 @@ def prove_frame(function, order, effects, frame):
             if writes:
                 value = saved[register] if register is not None and status[register] == "entry" else b"\1" * width
                 data = data[:index] + value + data[index + width:]
+        if ip in frame.released:
+            low, high = (offset - frame.start for offset in frame.released[ip])
+            data = data[:low] + bytes(high - low) + data[high:]
         for register in (*effects[ip][1], *effects[ip][2]):
             if register in status:
                 status[register] = "entry" if register == restored else "written"

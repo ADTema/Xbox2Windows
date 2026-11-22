@@ -18,10 +18,10 @@ from direct_check import GUARDS, MASK, SENTINELS, input_pairs, observe, register
 
 # The export list of cpu_translation(cpu_frame ...) in CMakeLists.txt. frame_bound is translated and never called.
 ENTRIES = ("push_loop", "spill_widths", "home_save", "home_args", "two_paths", "home_spill", "loop_counter",
-           "frame_bound")
+           "realloc_slot", "frame_bound")
 # Bytes of each frame array: from the lowest RSP, rounded down to 8 mod 16, to entry RSP + 40.
 SIZES = {"push_loop": 64, "spill_widths": 64, "home_save": 80, "home_args": 64, "two_paths": 64, "home_spill": 48,
-         "loop_counter": 64, "frame_bound": MAX_FRAME}
+         "loop_counter": 64, "realloc_slot": 64, "frame_bound": MAX_FRAME}
 
 
 def signed(value, bits):
@@ -82,6 +82,9 @@ def reference(name, x, y):
             rax = (rax * 3 + x) & MASK
         trace[0] = trace[1] = count
         path = "loop runs" if count else "loop skipped"
+    elif name == "realloc_slot":
+        rax = trace[0] = (x + y) & MASK
+        path = "straight line"
     return rax, (GUARDS[0], *trace, GUARDS[1]), path
 
 
@@ -163,13 +166,17 @@ PATCHES = [
     ("spill_widths", [("mov eax,[rsp+4]", 0, "8b 44 24 fc")], "stack access below RSP"),
     ("frame_bound", [("sub rsp,0FD8h", 0, "48 81 ec e8 0f 00 00"), ("add rsp,0FD8h", 0, "48 81 c4 e8 0f 00 00")],
      f"exceeds the {MAX_FRAME}-byte bound"),
+    # Without the store into the second allocation, ADD RAX, [RSP] would read what the first one left there.
+    ("realloc_slot", [("mov [rsp],rdx", 0, "0f 1f 40 00")], "undefined stack byte at entry RSP-0x18"),
     ("push_loop", [("mov rbx,rcx", 0, "48 03 d9")], "nonvolatile register rbx may hold the caller's value"),
     ("push_loop", [("push rbx", 0, "50")], "unsupported push or pop"),
     ("push_loop", [("and esi,1Fh", 0, "6a 05 90")], "unsupported push or pop"),
 ]
 # Exports that only exist to be rejected. guest_spill is refused at its store: a register byte that may hold a
 # guest address is never defined, and a store reads its source register.
-EXPORTS = [("guest_spill", "undefined register rax"),
+EXPORTS = [("stale_save", "undefined stack byte at entry RSP-0x8"),
+           ("stale_pop", "undefined stack byte at entry RSP-0x10"),
+           ("guest_spill", "undefined register rax"),
            ("split_restore", "hold the saved rbx"),
            ("partial_push", "undefined register rbx"),
            ("reuse_restored", "nonvolatile register rbx may hold the caller's value")]
