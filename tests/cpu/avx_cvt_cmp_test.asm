@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_avx_cvt_cmp_test
 ; Source-owned differential fixture for 28 AVX conversion, compare, flag-test, and aligned/streaming move instructions.
 .code
 
