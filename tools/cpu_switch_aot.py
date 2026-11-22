@@ -35,6 +35,17 @@ defined bytes and does not establish a source-language type. It is None when no
 RET is reachable, which describes the reachable control flow and makes no
 termination claim. The generated source states the width unless it is 8.
 
+RIP-relative data is refused unless the invoker passes --image-data
+(image_data=True). The translation then addresses a live mapping of the input
+image that the host binds at run time through lifted_bind_image, which checks
+that the mapping is that image; the translated functions keep their signatures.
+A RIP-relative memory operand becomes a load or store at base + RVA. Its whole
+width must lie inside one section's virtual extent (VirtualSize, zero-filled
+past the file-backed bytes); a read needs a readable section and a write a
+writable, non-executable one. A RIP-relative LEA yields base + RVA for any RVA
+inside the image, except one that loads a recognised jump-table base: that stays
+a guest address, which the switch replaces, and never needs the mapping. The
+generated source states the binding contract.
 A function may use its stack. A forward pass gives RSP at
 every instruction as entry RSP plus a constant that must agree at joins and be
 0 at every RET. PUSH and POP of a nonvolatile register and SUB or ADD RSP by a
@@ -135,6 +146,10 @@ CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.L: "l", CC.GE: "ge", CC.LE: "le", CC.G: "g", CC.S: "s", CC.NS: "ns"}
 MAX_CASES = 1024
 MAX_INSTRUCTIONS = 4096
+SCN_EXECUTE, SCN_READ, SCN_WRITE = 0x20000000, 0x40000000, 0x80000000
+READS = {OpAccess.READ, OpAccess.COND_READ, OpAccess.READ_WRITE, OpAccess.READ_COND_WRITE}
+WRITES = {OpAccess.WRITE, OpAccess.COND_WRITE, OpAccess.READ_WRITE, OpAccess.READ_COND_WRITE}
+INFO = InstructionInfoFactory()
 
 
 def unsigned(width):
@@ -609,10 +624,46 @@ class Function:
             raise ValueError(f"jump-table index {NAMES[index]} is not the bounded value at RVA {ip:#x}")
 
 
+def extent(section):
+    """Bytes that a mapping gives a section, as Windows and tools/pe_map.cpp map it: VirtualSize, or
+    SizeOfRawData when VirtualSize is 0. Bytes past the file-backed part are zero-filled."""
+    return section.Misc_VirtualSize or section.SizeOfRawData
+
+
+def image_target(pe, ins):
+    """The RVA that a RIP-relative operand addresses in the bound mapping, checked against the image."""
+    rva = ins.ip_rel_memory_address
+    if rva >= pe.OPTIONAL_HEADER.SizeOfImage:
+        raise ValueError(f"RIP-relative target {rva:#x} outside the image at RVA {ins.ip:#x}")
+    if ins.mnemonic == M.LEA:
+        # An address, not an access: it may name any byte of the image, such as __ImageBase in the headers.
+        return rva
+    width = _memory_width(ins)
+    section = next((s for s in pe.sections if s.VirtualAddress <= rva < s.VirtualAddress + extent(s)), None)
+    if section is None:
+        raise ValueError(f"RIP-relative target {rva:#x} outside every section at RVA {ins.ip:#x}")
+    name = section.Name.rstrip(b"\0").decode("ascii", "replace")
+    if rva + width > section.VirtualAddress + extent(section):
+        raise ValueError(f"RIP-relative access of {width} bytes at {rva:#x} crosses the end of section {name} "
+                         f"at RVA {ins.ip:#x}")
+    access = INFO.info(ins).op_access(next(n for n in range(ins.op_count) if ins.op_kind(n) == OpKind.MEMORY))
+    flags = section.Characteristics
+    if access in READS and not flags & SCN_READ:
+        raise ValueError(f"RIP-relative read from section {name} without read access at RVA {ins.ip:#x}")
+    # The translation was made from the original code bytes and cannot follow a write into code.
+    if access in WRITES and (not flags & SCN_WRITE or flags & SCN_EXECUTE):
+        kind = "executable" if flags & SCN_WRITE else "read-only"
+        raise ValueError(f"RIP-relative write to {kind} section {name} at RVA {ins.ip:#x}")
+    return rva
+
+
 class Lifter:
-    def __init__(self):
+    def __init__(self, image=None):
         self.used = set()
         self.flags = False
+        # The input image when RIP-relative operands address the bound mapping, and whether one does.
+        self.image = image
+        self.image_used = False
         self.frame = {}  # RVA -> index into the frame array of the stack bytes it accesses (from Frame)
         self.adjustments = set()  # RVAs of SUB or ADD RSP, imm
 
@@ -630,6 +681,9 @@ class Lifter:
         return name if width == 8 else f"static_cast<{unsigned(width)}>({name})"
 
     def address(self, ins):
+        if ins.memory_base == R.RIP and self.image is not None and not ins.has_segment_prefix:
+            self.image_used = True
+            return f"(image + {image_target(self.image, ins):#x}ull)"
         if ins.memory_base == R.RSP and ins.ip in self.frame:
             # A constant index into the frame array: RSP itself never becomes a C++ value.
             return self.slot(ins)
@@ -753,8 +807,7 @@ class Lifter:
                     read(ins.op_register(number))
                 elif kind == OpKind.MEMORY:
                     for register in (ins.memory_base, ins.memory_index):
-                        # A frame access uses RSP's constant offset, not its value (address() rejects the rest).
-                        if register not in (R.NONE, R.RSP):
+                        if register not in (R.NONE, R.RSP) and (register != R.RIP or self.image is None):
                             read(register)
 
         if ins.op_count and ins.op0_kind == OpKind.REGISTER:
@@ -1088,14 +1141,14 @@ def check_call_sites(function, offsets):
             raise ValueError(f"call without an aligned home space at entry RSP{offsets[ip]:+#x} at RVA {ip:#x}")
 
 
-def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None):
+def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=False):
     """Translate one export that takes the given number of integer arguments, 3 or 4.
 
     Functions it reaches through direct calls and tail jumps are translated into program."""
     if not isinstance(arguments, int) or arguments not in ARGUMENT_COUNTS:
         raise ValueError(f"unsupported argument count {arguments!r} for export {name}: expected 3 or 4")
     entry = export_rva(pe, name)
-    program = program or Program(pe)
+    program = program or Program(pe, image_data=image_data)
     return program.lift(entry, f"lifted_{name}", ARGUMENT_REGISTERS[:arguments])
 
 
@@ -1103,8 +1156,9 @@ class Program:
     """The functions of one image reached from the requested exports through direct calls and tail
     jumps. Each callee is translated once, in internal mode, and its source precedes its callers'."""
 
-    def __init__(self, pe, bindings=None):
+    def __init__(self, pe, bindings=None, *, image_data=False):
         self.pe = pe
+        self.image_data = image_data
         self.entries = Entries(pe, bindings)
         self.active = []
         self.callees = {}
@@ -1183,7 +1237,10 @@ def lift_function(program, entry, symbol, arguments, internal):
             raise ValueError(f"bound function {function.bound[2]} at RVA {entry:#x} is an import thunk "
                              "(an indirect jump through memory)")
     edges = function.explore()
-    lifter = Lifter()
+    image_data = program.image_data
+    lifter = Lifter(pe if image_data else None)
+    # A RIP-relative LEA that loads a recognised table base stays a guest address, with or without image data.
+    bases = {(base, anchor) for *_, (_, _, base, anchor) in function.dispatches.values()}
     order = sorted(function.instructions)
     instructions = function.instructions
     frame = Frame(function)
@@ -1239,7 +1296,8 @@ def lift_function(program, entry, symbol, arguments, internal):
         elif ip in skipped:
             # The table load reads the 64-bit index; it and the add leave guest addresses behind.
             effects[ip] = ({loads[ip]: 8} if ip in loads else {}, {}, {full(ins.op0_register)})
-        elif ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register):
+        elif (ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register)
+              and (not image_data or (ins.op0_register, ins.ip_rel_memory_address) in bases)):
             # A guest address is only usable as a jump-table base, which the switch replaces.
             effects[ip] = ({}, {}, {full(ins.op0_register)})
         else:
@@ -1309,6 +1367,10 @@ def lift_function(program, entry, symbol, arguments, internal):
             labels.add(ins.next_ip)
     locals_ = sorted((lifter.used | {R.RAX}) - set(function.arguments), key=lambda r: NAMES[r])
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
+    function.image_data = lifter.image_used
+    if lifter.image_used:
+        # Read once at entry: a call while nothing is bound fails here, before any access.
+        declarations.insert(0, "const word image = bound_image();")
     if lifter.flags:
         declarations.append("word fa = 0, fb = 0;")
     if lifter.frame:
@@ -1359,6 +1421,102 @@ template <class T> static void store(word address, T value) {
 """
 
 
+IMAGE_DATA = """
+// RIP-relative data addresses a live mapping of the input image, bound at run time (--image-data).
+// lifted_bind_image(base) binds the mapping at base and returns 0 only when its headers and read-only
+// contents match the input image. It returns 1 for a null base, 2 when the headers differ and 3 when the
+// read-only contents differ, and a refused bind leaves the current binding in place. base must be null or
+// the start of a live image mapping. lifted_unbind_image() ends the binding. While nothing is bound, a
+// translated function that addresses image data raises the noncontinuable structured exception 0xE0494D47
+// at entry, before any access. An address that a translated function returns or stores is valid only while
+// that mapping stays bound and mapped; a later bind does not move it. Bind and unbind must not run
+// concurrently with each other or with a translated function.
+extern "C" __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long, unsigned long,
+                                                               const unsigned long long*);
+static word image_base = 0;
+static inline word bound_image() {
+    if (!image_base) RaiseException(0xE0494D47ul, 1ul /* EXCEPTION_NONCONTINUABLE */, 0ul, nullptr);
+    return image_base;
+}
+// FNV-1a over the mapped bytes [begin, end) of each span, compared with the value computed from the file.
+template <std::size_t N> static std::uint64_t image_hash(word base, const std::uint32_t (&spans)[N][2]) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto& span : spans)
+        for (word rva = span[0]; rva < span[1]; ++rva)
+            hash = (hash ^ load<std::uint8_t>(base + rva)) * 0x100000001b3ull;
+    return hash;
+}
+// The DOS signature and e_lfanew, the PE signature and file header (TimeDateStamp included), SizeOfImage,
+// CheckSum and the section table. A loader rewrites ImageBase, which is not included.
+static const std::uint32_t image_headers[][2] = {%s};
+// The file-backed bytes of every readable, non-writable section, except the slots that DIR64 relocations
+// rewrite and the import address table.
+static const std::uint32_t image_contents[][2] = {%s};
+extern "C" __declspec(dllexport) int lifted_bind_image(word base) {
+    if (!base) return 1;
+    if (image_hash(base, image_headers) != %#xull) return 2;
+    if (image_hash(base, image_contents) != %#xull) return 3;
+    image_base = base;
+    return 0;
+}
+extern "C" __declspec(dllexport) void lifted_unbind_image() { image_base = 0; }
+"""
+
+
+def relocated(pe):
+    """RVAs of the 8-byte slots that DIR64 base relocations rewrite when the image is mapped elsewhere."""
+    directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[5]
+    data = pe.get_data(directory.VirtualAddress, directory.Size) if directory.Size else b""
+    slots, offset = [], 0
+    while offset + 8 <= len(data):
+        page, size = struct.unpack_from("<II", data, offset)
+        if size < 8 or offset + size > len(data):
+            raise ValueError(f"invalid base relocation block at RVA {directory.VirtualAddress + offset:#x}")
+        for (entry,) in struct.iter_unpack("<H", data[offset + 8:offset + size - size % 2]):
+            if entry >> 12 == 10:  # IMAGE_REL_BASED_DIR64
+                slots.append(page + (entry & 0xfff))
+            elif entry >> 12:  # anything but IMAGE_REL_BASED_ABSOLUTE padding
+                raise ValueError(f"unsupported base relocation type {entry >> 12} in page {page:#x}")
+        offset += size
+    return slots
+
+
+def image_block(pe):
+    """The binding code of IMAGE_DATA, with the identity of this image computed from its file."""
+    header = pe.DOS_HEADER.e_lfanew
+    optional = header + 24
+    table = optional + pe.FILE_HEADER.SizeOfOptionalHeader
+    headers = [(0, 2), (0x3c, 0x40), (header, optional), (optional + 56, optional + 60),
+               (optional + 64, optional + 68), (table, table + 40 * len(pe.sections))]
+    iat = pe.OPTIONAL_HEADER.DATA_DIRECTORY[12]
+    skip = sorted([(slot, slot + 8) for slot in relocated(pe)] + [(iat.VirtualAddress, iat.VirtualAddress + iat.Size)])
+    contents = []
+    for section in pe.sections:
+        if section.Characteristics & SCN_READ and not section.Characteristics & SCN_WRITE:
+            begin = section.VirtualAddress
+            end = begin + min(extent(section), section.SizeOfRawData)
+            for low, high in skip:
+                if low < end and high > begin:
+                    if low > begin:
+                        contents.append((begin, low))
+                    begin = max(begin, high)
+            if begin < end:
+                contents.append((begin, end))
+
+    def fnv(spans):
+        value = 0xcbf29ce484222325
+        for begin, end in spans:
+            data = pe.get_data(begin, end - begin)
+            if len(data) != end - begin:
+                raise ValueError(f"truncated image bytes at RVA {begin:#x}")
+            for byte in data:
+                value = (value ^ byte) * 0x100000001b3 & ((1 << 64) - 1)
+        return value
+
+    text = lambda spans: ", ".join(f"{{{begin:#x}, {end:#x}}}" for begin, end in spans or [(0, 0)])
+    return IMAGE_DATA % (text(headers), text(contents), fnv(headers), fnv(contents))
+
+
 def parse_entry(spec):
     """Split an export-list item, "name" or "name:N", into the name and its integer argument count."""
     name, colon, count = spec.partition(":")
@@ -1386,19 +1544,21 @@ def load_bindings(source):
     return {"image_sha256": digest, "functions": functions}
 
 
-def translate_pe(pe, names, bindings=None):
+def translate_pe(pe, names, bindings=None, *, image_data=False):
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
-    program = Program(pe, None if bindings is None else load_bindings(bindings))
+    if image_data and {"bind_image", "unbind_image"} & {parse_entry(name)[0] for name in names}:
+        raise ValueError("an export named bind_image or unbind_image collides with the image binding functions")
+    program = Program(pe, None if bindings is None else load_bindings(bindings), image_data=image_data)
     functions = [lift(pe, *parse_entry(name), program=program) for name in names]
     # Callees precede every caller, so each internal function is defined before its first use.
     sources = program.sources + [source for source, _ in functions]
-    return PRELUDE + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
+    return PRELUDE + (image_block(pe) if image_data else "") + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
 
 
-def translate(image, names, bindings=None):
+def translate(image, names, bindings=None, *, image_data=False):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names, bindings)
+        return translate_pe(pe, names, bindings, image_data=image_data)
 
 
 if __name__ == "__main__":
@@ -1407,11 +1567,14 @@ if __name__ == "__main__":
     parser.add_argument("exports", help='comma-separated export names; "name:4" translates that export with a '
                                         "fourth integer argument in R9, and the host must pass four")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--image-data", action="store_true",
+                        help="translate RIP-relative data against a live mapping of the image that the host "
+                             "binds at run time with lifted_bind_image; the generated source states the contract")
     parser.add_argument("--bind-ranges", type=Path, metavar="MANIFEST",
                         help="trusted [start, end) ranges of functions without unwind data, bound to this image's sha256")
     args = parser.parse_args()
     try:
-        source, functions = translate(args.image, args.exports.split(","), args.bind_ranges)
+        source, functions = translate(args.image, args.exports.split(","), args.bind_ranges, image_data=args.image_data)
         args.output.write_text(source, encoding="utf-8")
         for function in functions:
             print(f"RVA {function.entry:#x}: {len(function.instructions)} instructions, "

@@ -403,7 +403,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         target_link_options(${image} PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO)
     endfunction()
     function(cpu_translation image translator entry)
-        cmake_parse_arguments(BIND "FFX_DESTROY" "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;RANGES" "" ${ARGN})
+        cmake_parse_arguments(BIND "FFX_DESTROY;IMAGE_DATA" "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;RANGES" "" ${ARGN})
         set(binding)
         if(BIND_FFX_DESTROY)
             list(APPEND binding --ffx-destroy)
@@ -419,6 +419,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             if(BIND_LINK_NAME)
                 list(APPEND binding --link-name "${BIND_LINK_NAME}")
             endif()
+        endif()
+        if(BIND_IMAGE_DATA)
+            list(APPEND binding --image-data)
         endif()
         set(lifted "${CMAKE_CURRENT_BINARY_DIR}/${image}_lifted.cpp")
         add_custom_command(OUTPUT "${lifted}"
@@ -509,6 +512,15 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fourth_arg>" "$<TARGET_FILE:cpu_fourth_arg_lifted>"
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_fourth_arg_lifted.cpp"
         "$<TARGET_FILE:cpu_narrow>" "$<TARGET_FILE:cpu_narrow_lifted>")
+    cpu_asm_fixture(cpu_image_data image_data)
+    # IMAGE_DATA: RIP-relative data addresses a mapping of the image that the test binds at run time.
+    cpu_translation(cpu_image_data cpu_switch_aot
+        read_counter,bump_counter,counter_address,load_counter_ptr,is_counter,set_vtable,vtable_entry,swap_scratch,load_through,switch_count,switch_only
+        IMAGE_DATA)
+    add_test(NAME cpu_aot_image_data COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/image_data_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_register_probe>" "$<TARGET_FILE:cpu_image_data>" "$<TARGET_FILE:cpu_image_data_lifted>")
+
     cpu_asm_fixture(cpu_frame frame)
     # frame_bound is translated and compiled but never called.
     cpu_translation(cpu_frame cpu_switch_aot
