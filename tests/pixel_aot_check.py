@@ -161,14 +161,15 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, writ
 
     A single float4 broadcasts to every texel. The optional trailer appends one flags byte, whose
     bit 0 selects the lossless R32G32B32A32_UINT readback target and whose high nibble carries
-    the RT0 channel write mask (0x3, 0xC or 0xF; 0 keeps the default all channels), followed by
-    64 per-texel mask bytes whose bit ch accepts a NaN of any sign or payload on that channel.
-    Cases written without integer_rt, nan_mask or write_mask keep the original 1280-byte format
-    exactly.
+    the RT0 channel write mask — any nonzero nibble; compressed exports only produce 0x3, 0xC or
+    0xF while uncompressed ones carry any per-channel mask, and 0 keeps the default all channels —
+    followed by 64 per-texel mask bytes whose bit ch accepts a NaN of any sign or payload on that
+    channel. Cases written without integer_rt, nan_mask or write_mask keep the original 1280-byte
+    format exactly.
     """
     if write_mask is not None:
-        if write_mask not in (0x3, 0xC, 0xF):
-            raise ValueError("The RT0 write mask must be 0x3, 0xC or 0xF")
+        if not 0x1 <= write_mask <= 0xF:
+            raise ValueError("The RT0 write mask must be a nonzero nibble")
         if integer_rt:
             raise ValueError("An integer readback target cannot combine with an RT0 write mask")
     rows = [pixels] * 64 if len(pixels) == 4 and not isinstance(pixels[0], (list, tuple)) else list(pixels)
@@ -323,11 +324,15 @@ def check_movk_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"A wrong s_movk_i32 extension escaped detection in channel {channel}")
 
 
-def uncompressed_export(body):
-    """Run body on the sample, then export v12 to v15 as four uncompressed binary32 channels."""
+def uncompressed_export(body, mask=0xF):
+    """Run body on the sample, then export v12 to v15 as uncompressed binary32 channels.
+
+    Bit ch of mask enables v{12+ch}; a disabled channel prints off, which LLVM 15 round-trips.
+    """
     program = with_constants(body)
     pos = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
-    program[pos:] = ["exp mrt0 v12, v13, v14, v15 done vm", "s_endpgm"]
+    operands = [f"v{12 + channel}" if mask >> channel & 1 else "off" for channel in range(4)]
+    program[pos:] = [f"exp mrt0 {', '.join(operands)} done vm", "s_endpgm"]
     return program
 
 
@@ -1382,8 +1387,8 @@ def check_controls(directory):
 
     # Compressed exports with a partial enable mask still return float4; the disabled channels'
     # zeros are unwritten through the pipeline's RenderTargetWriteMask, which the caller derives
-    # from the mask reported by return_write_mask. EN=0, non-normalized operand text and off in
-    # the uncompressed form are refused, as is a partial mask combined with an integer export.
+    # from the mask reported by return_write_mask. EN=0, non-normalized operand text and half-pair
+    # text are refused, as is a partial mask combined with an integer export.
     sub_body = [f"v_sub_f32_e64 v{12 + i}, s{44 + i}, 0" for i in range(4)]
     assert translate_masked(uncompressed_export(sub_body))[1] == 0xF
     for mask in (0x3, 0xC, 0xF):
@@ -1396,12 +1401,29 @@ def check_controls(directory):
     export = partial.index("exp mrt0 v16, v16, off, off done compr vm")
     for bad in (
         "exp mrt0 off, off, off, off done compr vm",  # EN=0
-        "exp mrt0 v16, v16, v17, off done compr vm",  # non-normalized pair text
+        "exp mrt0 v16, v16, v17, off done compr vm",  # off inside a compressed export
         "exp mrt0 v16, off, off, off done compr vm",  # a 0x1 half pair only exists normalized
         "exp mrt0 off, off, v17, off done compr vm",  # a 0x4 half pair only exists normalized
-        "exp mrt0 v12, off, v14, v15 done vm",        # off inside the uncompressed form
     ):
         must_reject(translate, partial[:export] + [bad] + partial[export+1:])
+
+    # The uncompressed form takes per-channel off text, which LLVM 15 round-trips verbatim; the
+    # enabled channels report their own write mask. An all-off export and a partial mask combined
+    # with an integer export are refused.
+    for mask in (0x1, 0x8, 0x5, 0xA, 0xF):
+        masked = uncompressed_export(sub_body, mask)
+        modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in masked]
+        assert translate(modern) == translate(masked)
+        assert translate_masked(masked)[1] == mask
+    must_reject(lower, uncompressed_export(sub_body, 0x5), 20, 24, [1, 2, 3, 4],
+                constant_descriptor=64, integer_export=True)
+    partial_uncompressed = uncompressed_export(sub_body, 0x5)
+    export = partial_uncompressed.index("exp mrt0 v12, off, v14, off done vm")
+    for bad in (
+        "exp mrt0 off, off, off, off done vm",       # every channel disabled
+        "exp mrt0 v12, off, v12, off done vm",       # one register behind two enabled channels
+    ):
+        must_reject(translate, partial_uncompressed[:export] + [bad] + partial_uncompressed[export+1:])
 
     # The literal of v_fmaak_f32 is its last operand and that of v_fmamk_f32 its second; a register there is refused.
     body = translate(with_constants(LITERAL_FMA_BODY)).split("float4 main", 1)[1]
@@ -1668,6 +1690,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((scheduling_hints(), translate))
     sub_body = [f"v_sub_f32_e64 v{12 + i}, s{44 + i}, 0" for i in range(4)]
     fixtures.extend((compr_export(sub_body, mask), translate) for mask in (0x3, 0xC, 0xF))
+    fixtures.extend((uncompressed_export(sub_body, mask), translate) for mask in (0x1, 0x8, 0x5, 0xA))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -1875,6 +1898,43 @@ def check_exp_mask_draw(directory, compiler, renderer, backend):
         raise AssertionError("A wrong enabled-channel reference escaped detection")
 
 
+def check_exp_mask_uncompressed_draw(directory, compiler, renderer, backend):
+    """Draw uncompressed exports whose enable mask disables individual binary32 channels."""
+    source = directory / "exp_mask_uncompressed.hlsl"
+    shader = directory / "exp_mask_uncompressed.cso"
+    case = directory / "exp_mask_uncompressed.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    values = (0.5, 1.5, -2.5, 3.5)
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, *values)
+    body = [f"v_sub_f32_e64 v{12 + i}, s{44 + i}, 0" for i in range(4)]
+    for mask in (0x1, 0x8, 0x5, 0xA, 0xF):
+        program = uncompressed_export(body, mask)
+        assert translate_masked(program)[1] == mask
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        # Uncompressed channels keep the raw binary32 bits through the R32G32B32A32 target, so
+        # the enabled channels compare exactly with the constant word; the disabled ones, which
+        # the shader fills with immaterial zeros, must keep the sentinel clear color.
+        pixels = tuple(values[channel] if mask >> channel & 1 else SENTINEL[channel]
+                       for channel in range(4))
+        write_case(case, constants, pixels, write_mask=mask)
+        subprocess.run(draw, check=True)
+    # Both negative controls use the EN=0x5 shader. Under an all-channel write mask the pipeline
+    # writes the immaterial zeros into the disabled channels, so the sentinel-expecting reference
+    # must fail on every backend.
+    source.write_text(translate(uncompressed_export(body, 0x5)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    write_case(case, constants, (values[0], SENTINEL[1], values[2], SENTINEL[3]), write_mask=0xF)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("An all-channel write mask accepted the immaterial disabled-channel zeros")
+    write_case(case, constants, (values[0] + 0.25, SENTINEL[1], values[2], SENTINEL[3]), write_mask=0x5)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A wrong enabled-channel reference escaped detection")
+
+
 def check_render(directory, compiler, renderer, backend):
     for swap in (False, True):
         source = directory / "fixture.hlsl"
@@ -2044,6 +2104,7 @@ def check_render(directory, compiler, renderer, backend):
     check_nan_class_draw(directory, compiler, renderer, backend)
     check_integer_readback_draw(directory, compiler, renderer, backend)
     check_exp_mask_draw(directory, compiler, renderer, backend)
+    check_exp_mask_uncompressed_draw(directory, compiler, renderer, backend)
     return 0
 
 

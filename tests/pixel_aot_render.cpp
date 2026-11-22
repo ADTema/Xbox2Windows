@@ -356,12 +356,12 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
             if (flags & 0x0eu)
                 throw std::runtime_error("Unknown case trailer flag bits");
             input.integerRT = (flags & 1u) != 0;
-            // Bits 4 to 7 hold the RT0 write mask; 0 keeps the default all-channel mask.
+            // Bits 4 to 7 hold the RT0 write mask; 0 keeps the default all-channel mask and any
+            // nonzero nibble is a valid per-channel mask (compressed exports produce only pair
+            // masks 0x3, 0xC and 0xF; uncompressed ones any combination of single channels).
             input.writeMask = flags >> 4;
-            if (input.writeMask == 0 || input.writeMask == D3D12_COLOR_WRITE_ENABLE_ALL)
+            if (input.writeMask == 0)
                 input.writeMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-            else if (input.writeMask != 0x3 && input.writeMask != 0xC)
-                throw std::runtime_error("Case trailer write-mask nibble must be 0, 0x3, 0xC or 0xF");
             if (file.peek() != std::char_traits<char>::eof()) {
                 input.nanMask.resize(64);
                 file.read(reinterpret_cast<char*>(input.nanMask.data()),

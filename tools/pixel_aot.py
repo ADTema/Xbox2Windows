@@ -751,16 +751,29 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    return float4(0.0f, 0.0f, {', '.join(args)});")
             channel_mask = 0xC
             exported = True
-        elif m := match(r"exp mrt0,? (v\d+), (v\d+), (v\d+), (v\d+) done vm"):
-            # Four distinct registers of computed or sampled values, exported as raw binary32.
-            values = [vector[v] for v in m.groups()]
-            if (mask != "entry" or exported or len(set(m.groups())) != 4 or not all(
+        elif m := match(r"exp mrt0,? (v\d+|off), (v\d+|off), (v\d+|off), (v\d+|off) done vm"):
+            # Uncompressed binary32 export, one 32-bit channel per operand. LLVM 15 prints a
+            # disabled channel as off and assembles that text back unchanged, so each off marks
+            # one clear enable bit; the enabled channels form the RT0 write mask.
+            tokens = m.groups()
+            channel_mask = sum(1 << channel for channel, token in enumerate(tokens) if token != "off")
+            values = [vector[token] for token in tokens if token != "off"]
+            if (mask != "entry" or exported or channel_mask == 0 or len(values) != len(set(
+                    token for token in tokens if token != "off")) or not all(
                     isinstance(v, str) and v.startswith(("sample", "alu")) for v in values)):
                 raise ValueError("Unsupported export")
-            args = [f"asuint({v})" for v in values] if integer_export else values
+            if integer_export and channel_mask != 0xF:
+                raise ValueError("Integer export requires all four channels enabled")
+            args = []
+            for token in tokens:
+                if token == "off":
+                    args.append("0.0f")
+                else:
+                    args.append(f"asuint({vector[token]})" if integer_export else vector[token])
+            if channel_mask != 0xF:
+                lines.append("    // The PSO write mask prevents these writes; the disabled-channel values are immaterial.")
             lines.append(f"    return {'uint4' if integer_export else 'float4'}({', '.join(args)});")
             exported = True
-            channel_mask = 0xF
         elif line == "s_endpgm" and exported:
             ended = True
         else:
