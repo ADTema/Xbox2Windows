@@ -828,6 +828,8 @@ To supply a reference for another arithmetic program, run `offscreen_check.exe h
 
 Before a single sample, whole-quad addition, FMA and legacy multiplication can compute affine coordinates from paired interpolation and ready uniform constants. Each coordinate used for implicit LOD must have a value defined on helper lanes. An entry-only write results in a value without that proof, and multiplication of two varying operands, absolute value and saturation fall outside the affine subset. The source-built draw checks a partial triangle on an 8×8 target with two solid-color mips. WARP and RTX 5080 select mip 1 at every covered pixel and preserve clear color outside the triangle. Replacing helper coordinates with the quad's top-left coordinates changes the first mismatched pixel at (6, 0) to mip 0 on both adapters.
 
+`v_cmp_class_f32` is true when the class of S0 is in the 10-bit mask S1, with the bits of LLVM's `SIInstrFlags::ClassFlags`: signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal and +inf. The lowering classifies the raw binary32 encoding, so desktop denormal handling does not change the class. The mask may be an inline constant, a literal or a register. The draw classifies +inf against the +inf bit, a quiet NaN against both NaN bits, -0 against the +0 bit and the smallest positive denormal against its bit, and selects 1.0 or 0 for each. A reference with any single result flipped must report a mismatch. Signaling NaN inputs are not drawn, and whether Scarlett classifies a denormal input without flushing it first is not measured.
+
 ```powershell
 ctest --preset dev -R '^pixel_aot_' -V
 ```
