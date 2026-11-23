@@ -268,6 +268,8 @@ def check_shader_records():
         without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(trig)
     # Count the supported 64-bit SOP1/SOP2 and BFE forms in both gfx1013 and rdna2.
+    masked_forms = {("SOP1", "s_and_saveexec_b64"), ("SOPP", "s_cbranch_execz")}
+    assert masked_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
     scalar64_forms = {
         ("SOP1", "s_cmov_b64"), ("SOP1", "s_not_b64"), ("SOP1", "s_brev_b64"),
         ("SOP2", "s_and_b64"), ("SOP2", "s_or_b64"), ("SOP2", "s_xor_b64"),
@@ -322,11 +324,13 @@ def check_shader_records():
         ("SOP2", "s_absdiff_i32"),
     }
     rejected_forms = {
-        "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
+        "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
         "v_mul_i32_i24_sdwa",
         "v_cvt_pk_u8_f32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
         "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
+        "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz",
+        "s_cbranch_scc0", "s_cbranch_scc1",
         "s_absdiff_i64", "s_absdiff_u32",
         "v_sad_u8", "v_sad_u16", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_mqsad_u32_u8",
     }
@@ -470,7 +474,7 @@ def check_int16_vop3_forms():
             pixel.translate_int(pixel.int16_vop3_ops(group))
         forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_INT16}
         assert len(forms) == 12
-        neighbours = {("VOP3", "v_add_f16_e64"), ("VOP3", "v_cvt_f16_u16_e64")}
+        neighbours = {("VOP3", "v_min_f16_e64"), ("VOP3", "v_cvt_f16_u16_e64")}
         for name in ("gfx1013.tsv", "rdna2.tsv"):
             reference = fc.load_reference(name)
             assert forms <= reference, (name, forms - reference)
@@ -484,6 +488,36 @@ def check_int16_vop3_forms():
     finally:
         pixel.ACCEPTED.clear()
         pixel.ACCEPTED.update(saved)
+def check_f16_arith_forms():
+    """The eight plain binary16 VOP2 forms (e32 and e64 spellings of add, sub, subrev and mul) count as covered once the
+    translator accepts their fixtures; min, max, fmac, ldexp and the DPP and SDWA spellings stay uncovered."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for key in pixel.F16_ARITH_PROGRAMS:
+            pixel.translate_f16(pixel.f16_arith_program(*key))
+        ops = ("add", "sub", "subrev", "mul")
+        forms = {("VOP2", f"v_{op}_f16") for op in ops} | {("VOP3", f"v_{op}_f16_e64") for op in ops}
+        neighbours = {("VOP2", "v_min_f16"), ("VOP2", "v_max_f16"), ("VOP2", "v_fmac_f16"), ("VOP2", "v_ldexp_f16"),
+                      ("VOP3", "v_min_f16_e64"), ("SDWA", "v_add_f16_sdwa"), ("DPP16", "v_add_f16_dpp"),
+                      ("DPP8", "v_add_f16_dpp")}
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not neighbours & covered, (name, neighbours & covered)
+        # Without the binary16 fixtures none of the eight forms is covered.
+        pixel.ACCEPTED.clear()
+        pixel.translate_int(pixel.int16_vop3_ops(0))
+        assert not forms & fc.gfx_forms(pixel.ACCEPTED, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 def check_int16_ternary_forms():
     """The 8 three-operand 16-bit integer VOP3 forms count as covered once the translator accepts their fixtures; the
     nearby VOP3 forms that stay rejected (v_mad_u32_u16, v_mad_i32_i16, v_sad_u16, f16 ops) stay uncovered."""
@@ -497,7 +531,7 @@ def check_int16_ternary_forms():
         forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_INT16_TERNARY}
         assert len(forms) == 8
         neighbours = {("VOP3", "v_mad_u32_u16"), ("VOP3", "v_mad_i32_i16"), ("VOP3", "v_sad_u16"),
-                      ("VOP3", "v_add_f16_e64")}
+                      ("VOP3", "v_min_f16_e64")}
         for name in ("gfx1013.tsv", "rdna2.tsv"):
             reference = fc.load_reference(name)
             assert forms <= reference, (name, forms - reference)
@@ -884,6 +918,61 @@ def check_avx_move_regs():
         assert only_fail["blocked_by_skip"] == []
 
 
+def check_sse2_regs():
+    """sse2_regs.asm covers 23 SSE2 forms in docs/coverage/x64_zen2.tsv group SSE2."""
+    expected_sse2 = {
+        "cmppd",
+        "cvtdq2pd", "cvtdq2ps", "cvtpd2dq", "cvtpd2ps", "cvtpi2pd",
+        "cvtps2dq", "cvtps2pd", "cvtsd2si",
+        "cvttpd2dq", "cvttps2dq",
+        "lfence", "mfence",
+        "maxsd", "minsd", "sqrtsd",
+        "movapd", "movdqa", "movhpd", "movlpd",
+        "movntdq", "movnti", "movntpd",
+    }
+    rejected_sse2 = {
+        # ABI-infeasible task forms: MMX register operands or implicit RDI addressing.
+        "cvtpd2pi", "cvttpd2pi", "movdq2q", "movq2dq", "maskmovdqu",
+        # Reserved for sibling translators.
+        "addpd", "addsd", "andnpd", "andpd", "comisd",
+        "cvtsi2sd", "cvttsd2si", "cvtss2sd", "cvtsd2ss",
+        "divpd", "divsd", "maxpd", "minpd", "movdqu", "movmskpd", "movupd",
+        "mulpd", "mulsd", "orpd",
+        "pmuludq", "pshufd", "pshufhw", "pshuflw", "pslldq", "psrldq",
+        "psubq", "punpckhqdq", "punpcklqdq",
+        "shufpd", "sqrtpd", "subpd", "subsd",
+        "ucomisd", "unpckhpd", "unpcklpd", "xorpd",
+    }
+    assert len(expected_sse2) == 23 and len(rejected_sse2) == 41
+    reference = fc.load_reference("x64_zen2.tsv")
+    all_sse2 = {form for group, form in reference if group == "SSE2"}
+    assert expected_sse2 | rejected_sse2 == all_sse2 and len(all_sse2) == 64
+
+    asm_text = (fc.ROOT / "tests" / "cpu" / "sse2_regs.asm").read_text(encoding="utf-8")
+    found = fc.masm_mnemonics(asm_text)
+    assert expected_sse2 <= found, expected_sse2 - found
+    assert rejected_sse2.isdisjoint(found), rejected_sse2 & found
+    # Exactly the 23 implemented SSE2 forms appear; rejected and reserved forms stay out.
+    assert (found & all_sse2) == expected_sse2, (found & all_sse2) ^ expected_sse2
+
+    passed = fc.measure({"cpu_aot_sse2_regs": "pass"})
+    assert passed["fixtures"]["sse2_regs.asm"] == "pass"
+    assert "sse2_regs.asm" not in passed["unclassified"]
+    assert passed["x64_zen2"]["groups"]["SSE2"]["covered"] == len(expected_sse2)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"sse2_regs": asm_text})
+        only_pass = fc.measure({"cpu_aot_sse2_regs": "pass"}, root)["x64_zen2"]
+        only_skip = fc.measure({"cpu_aot_sse2_regs": "skip"}, root)["x64_zen2"]
+        only_fail = fc.measure({"cpu_aot_sse2_regs": "fail"}, root)["x64_zen2"]
+        assert only_pass["groups"]["SSE2"]["covered"] == len(expected_sse2)
+        assert only_pass["fixture_forms_not_in_reference"] == []
+        assert only_skip["groups"]["SSE2"]["covered"] == 0
+        for form in expected_sse2:
+            assert f"SSE2 {form}" in only_skip["blocked_by_skip"]
+        assert only_fail["groups"]["SSE2"]["covered"] == 0
+        assert only_fail["blocked_by_skip"] == []
+
+
 def check_fma3_leaf():
     """fma3_leaf.asm covers all 60 FMA forms in docs/coverage/x64_zen2.tsv group FMA."""
     reference = fc.load_reference("x64_zen2.tsv")
@@ -945,6 +1034,7 @@ if __name__ == "__main__":
     check_plain_bitscan_forms()
     check_int16_vop3_forms()
     check_int16_ternary_forms()
+    check_f16_arith_forms()
     check_swap_coverage()
     check_sopk_wait_forms()
     check_s_version_form()
@@ -955,5 +1045,6 @@ if __name__ == "__main__":
     check_avx2_regs()
     check_avx_int_regs()
     check_avx_move_regs()
+    check_sse2_regs()
     check_fma3_leaf()
     print("form coverage checks passed")

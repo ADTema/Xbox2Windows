@@ -1,6 +1,7 @@
 """Offline lowering for a straight-line, texture-sampling gfx1013 pixel shader."""
 import argparse
 import ctypes as C
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -439,6 +440,58 @@ uint narrow16(float value) {
 """
 
 
+DIV_FMAS_HELPERS = """// v_div_fmas_f32: fused multiply-add with conditional 2^32 scale when condition is true.
+// Double-precision 2Sum tracks which side of a binary32 midpoint the finite sum lies on.
+// Scaling is applied before conversion to binary32.
+float div_fmas32_core(float s0, float s1, float s2, bool cond, bool clamp_res) {
+    precise double p = (double)s0 * (double)s1;
+    precise double s = p + (double)s2;
+    precise double v = s - p;
+    precise double err = (p - (s - v)) + ((double)s2 - v);
+
+    double scale = cond ? 4294967296.0 : 1.0;
+    precise double s_sc = s * scale;
+    precise double err_sc = err * scale;
+
+    uint u0, u1;
+    asuint(s_sc, u0, u1);
+    uint exp = (u1 >> 20) & 0x7ffu;
+    // Binary32 subnormals retain a fixed 2^-149 spacing. The guard may
+    // move into the high word or become the implicit bit at 2^-150.
+    bool midpoint = false;
+    if (exp >= 873u && exp <= 1150u) {
+        uint discarded = exp < 897u ? 926u - exp : 29u;
+        if (discarded <= 32u) {
+            uint guard = 1u << (discarded - 1u);
+            midpoint = (u0 & (guard | (guard - 1u))) == guard;
+        } else {
+            uint guard = 1u << (discarded - 33u);
+            uint significand_hi = (u1 & 0x000fffffu) | 0x00100000u;
+            midpoint = u0 == 0u && (significand_hi & (guard | (guard - 1u))) == guard;
+        }
+    }
+    if (midpoint && err_sc != 0.0) {
+        if ((s_sc > 0.0 && err_sc > 0.0) || (s_sc < 0.0 && err_sc < 0.0)) {
+            if (++u0 == 0u) ++u1;
+        } else {
+            if (u0-- == 0u) --u1;
+        }
+        s_sc = asdouble(u0, u1);
+    }
+    if (clamp_res) {
+        s_sc = clamp(s_sc, 0.0, 1.0);
+    }
+    return (float)s_sc;
+}
+float div_fmas32(float s0, float s1, float s2, bool cond) {
+    return div_fmas32_core(s0, s1, s2, cond, false);
+}
+float div_fmas32_clamp(float s0, float s1, float s2, bool cond) {
+    return div_fmas32_core(s0, s1, s2, cond, true);
+}
+"""
+
+
 def registers(first, last, count):
     first, last = int(first), int(last)
     if last - first + 1 != count:
@@ -456,6 +509,12 @@ HALF_ROUNDING = {"0": "nearest even", "3": "toward zero"}
 # Under round toward zero no rounding binary16 or binary64 form has a lowering. These two do not depend on the
 # mode: the widening is exact and the pack always truncates.
 HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32")
+# MODE[7:6] (FP_DENORM_DP/16) value 3 keeps binary16 and binary64 inputs and results denormal. The state is not
+# tracked: the caller declares it for the shader entry with lower(half_denorm="preserve"), taking it from validated
+# guest state. None (the default) means unknown, and the plain binary16 arithmetic forms are then refused. Every
+# MODE write other than the rounding field is refused above, so a declared entry state cannot change in the program.
+# The lowering itself never reads MODE; the declaration only scopes the claim to preserved denormals.
+HALF_DENORM_PRESERVE = "preserve"
 # FLAT_SCR_LO and FLAT_SCR_HI hold the scratch base address. Only scratch_* and flat_* memory instructions and
 # s_getreg_b32 can observe it. scratch_* and s_getreg_b32 are not lowered, and the one lowered flat form,
 # flat_load_dword, reads only through the title ranges below (no private aperture), so a whole-register write
@@ -1085,10 +1144,10 @@ def scalar_u64(token, scalar, pending, *, signed=False):
 
 def lane_mask(token):
     """Name the registers of a per-lane condition for either wavefront width."""
-    if token.startswith("vcc"):
+    if token in ("vcc", "vcc_lo"):
         return ["vcc"]
     if m := re.fullmatch(r"s\[(\d+):(\d+)\]", token):
-        return [f"s{n}" for n in registers(*m.groups(), 2)]
+        return sgpr_pair(token)
     return [token]
 
 
@@ -1159,6 +1218,118 @@ def parse_cvt_f32_e64_source(token):
     if not re.fullmatch(r"[vs]\d+|0x[0-9a-f]{1,8}", token):
         return None
     return token, has_abs, neg
+
+
+# Plain non-fused binary16 VOP2 arithmetic (issue #839): llvm-mc mnemonic -> operand expression. v_subrev_f16 computes
+# src1 - src0 (LLVM 15 VOP2Instructions.td revOp naming and the translator's binary32 convention).
+VOP2_F16 = {"add": "{0} + {1}", "sub": "{0} - {1}", "subrev": "{1} - {0}", "mul": "{0} * {1}"}
+
+
+def f16_vop2_result(name, a, b):
+    """Exact binary16 result bits of one VOP2_F16 op on two finite operands, or None when it overflows.
+
+    Integer arithmetic on exact rationals followed by one round to nearest even on the binary16 grid. It is used at
+    translation time, so that an overflowing program is refused and a chained result stays a proven value.
+    """
+    def value(bits):
+        sign = -1 if bits & 0x8000 else 1
+        exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+        if exponent == 0:
+            return sign * Fraction(mantissa, 1 << 24)
+        return sign * Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25)
+
+    negative_a, negative_b = bool(a & 0x8000), bool(b & 0x8000)
+    x, y = value(a), value(b)
+    if name == "mul":
+        exact, zero_negative = x * y, negative_a != negative_b
+    else:
+        # A sum is -0 only when both addends are -0 (round to nearest even); a subtraction negates one addend.
+        exact, zero_negative = {"add": (x + y, negative_a and negative_b),
+                                "sub": (x - y, negative_a and not negative_b),
+                                "subrev": (y - x, negative_b and not negative_a)}[name]
+    magnitude = abs(exact)
+    if magnitude == 0:
+        # Exact zero: a product keeps the XOR of the signs.
+        return 0x8000 if zero_negative else 0
+    if magnitude >= 65520:  # halfway between 65504 and 2^16: ties to even rounds up to infinity
+        return None
+    exponent = max(magnitude.numerator.bit_length() - magnitude.denominator.bit_length(), -14)
+    while magnitude < Fraction(2) ** exponent and exponent > -14:
+        exponent -= 1
+    while magnitude >= Fraction(2) ** (exponent + 1):
+        exponent += 1
+    scaled = magnitude / Fraction(2) ** (exponent - 10)
+    count = scaled.numerator // scaled.denominator
+    remainder = scaled - count
+    if remainder > Fraction(1, 2) or (remainder == Fraction(1, 2) and count & 1):
+        count += 1
+    if count >= 0x800:
+        count, exponent = 0x400, exponent + 1
+    sign = 0x8000 if (exact < 0) else 0
+    if count < 0x400:  # subnormal (exponent is -14 here), or a rounded-to-zero result keeping the exact sign
+        return sign | count
+    return sign | ((exponent + 15) << 10) | (count - 0x400)
+
+
+def half16_name(token, vector):
+    """Return the HLSL variable of a VGPR that holds a binary16 arithmetic result, else None.
+
+    The plain binary16 VOP2 ops store ("half16", name): bits 15:0 are the result and bits 31:16 are unspecified.
+    The tag is distinct from ("low16", name), so that no 16-bit integer reader can observe a binary16 result and no
+    binary16 reader a 16-bit integer one. Its first element must not start with "sample" or "alu", which the
+    compressed export and the pack checks accept for string pairs. Only the readers named in the lowering read it.
+    """
+    value = vector.get(token) if re.fullmatch(r"v\d+", token) else None
+    if isinstance(value, tuple) and len(value) == 2 and value[0] == "half16":
+        return value[1]
+    return None
+
+
+def half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_bits, known_half):
+    """Return (HLSL word expression, binary16 bits) of one source of a plain binary16 VOP2 op.
+
+    Only a source whose low half is statically known and finite is accepted: a binary16 inline constant, a 16-bit
+    literal, a tracked SGPR integer, a VGPR copied from a known constant, or the result of an earlier accepted op.
+    Everything else (constant-buffer words, samples, interpolants) lacks the finite proof and is refused. Integer
+    inline constants other than 0 are refused: LLVM prints a literal of 0x0001..0x0040 or 0xfff0..0xffff as an integer
+    and the hardware reading of such an inline constant on a binary16 operand is not established.
+    """
+    if token in INLINE_F16:
+        bits = INLINE_F16[token]
+        return f"{bits}u", bits
+    if token == "0":
+        return "0u", 0
+    if re.fullmatch(r"-?\d+", token):
+        raise ValueError(f"Unsupported binary16 integer inline constant {token}")
+    if token.startswith(("-", "|", "abs(", "neg(")):
+        raise ValueError(f"Unsupported binary16 source modifier {token}")
+    if re.fullmatch(r"0x[0-9a-f]+", token):
+        bits = int(token, 16)
+        if bits > 0xffff:
+            raise ValueError(f"16-bit literal out of range: {token}")
+        word = f"{bits}u"
+    elif m := re.fullmatch(r"([vs])(\d+)", token):
+        if not 0 <= int(m.group(2)) <= (255 if m.group(1) == "v" else 105):
+            raise ValueError(f"Register out of range: {token}")
+        if token in pending:
+            raise ValueError("Constant read before load completion")
+        if token in sample_dest:
+            raise ValueError("Sample used before vmcnt wait")
+        value = (vector if m.group(1) == "v" else scalar).get(token)
+        if isinstance(value, int) and m.group(1) == "s":
+            bits, word = value & 0xffff, f"{value & 0xffffffff}u"
+        elif m.group(1) == "v" and isinstance(value, str) and value in known_ssa_bits:
+            bits, word = known_ssa_bits[value] & 0xffff, f"asuint({value})"
+        elif half16_name(token, vector) in known_half:
+            name = half16_name(token, vector)
+            bits, word = known_half[name], f"asuint({name})"
+        else:
+            raise ValueError(f"binary16 operand lacks a finite proof: {token}")
+    else:
+        raise ValueError(f"Unsupported binary16 operand {token}")
+    if (bits >> 10) & 0x1f == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {token}")
+    return word, bits
 
 
 def require_proven_i32_f32_range(base, has_abs, has_neg, scalar, vector, known_ssa_bits, kind):
@@ -1594,6 +1765,23 @@ def parse_fma_mix(rest):
     if any(hi and not f16 for f16, hi in zip(op_sel, op_sel_hi)):
         raise ValueError("High-half selection requires an f16 operand")
     return operands, op_sel, op_sel_hi, clamp
+
+
+def parse_div_fmas(rest):
+    parts_ = rest.split(", ")
+    if len(parts_) != 3:
+        raise ValueError("Invalid div_fmas operand count")
+    last_op, _, mod_text = parts_[-1].partition(" ")
+    operands = [*parts_[:-1], last_op]
+    clamp = False
+    for mod in mod_text.split():
+        if mod == "clamp":
+            if clamp:
+                raise ValueError("Duplicate clamp modifier")
+            clamp = True
+        else:
+            raise ValueError(f"Unsupported div_fmas modifier {mod}")
+    return operands, clamp
 def dot_word(token, scalar, vector, pending, sample_dest, *, allow_f16=False):
     """Return a 32-bit uint HLSL expression for one VOP3P dot-product source operand."""
     if allow_f16 and token in INLINE_F16:
@@ -1828,10 +2016,39 @@ class VectorRegisters(dict):
     def is_uniform(self, reg):
         return reg in self.uniform
 
+MISSING = object()
+
+# Only operations with per-lane, safe speculative evaluation enter the region.
+REGION_ALU = re.compile(
+    r"v_(?:mov_b32|(?:add|sub|subrev|mul|min|max)_f32)(?:_e32|_e64)? ")
+
+
+class TrackedVector(VectorRegisters):
+    """Vector register names that record reads, so a conditionally-written register can be refused."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reads = []
+        self.masked = False
+        self.conditional = set()
+
+    def __getitem__(self, key):
+        self.reads.append(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self.reads.append(key)
+        return super().get(key, default)
+
+    def __setitem__(self, key, value):
+        if not self.masked:
+            self.conditional.discard(key)
+        super().__setitem__(key, value)
+
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
-          title_ranges=None, flat_global_only=False, return_write_mask=False, wave_size=None):
+          title_ranges=None, flat_global_only=False, return_write_mask=False, wave_size=None, half_denorm=None):
     """Track descriptor provenance, interpolation and packed or uncompressed exports.
 
     texture_offset is the aligned byte offset of t0 in the texture descriptor table.
@@ -1847,6 +2064,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     (s_mov_b32 save of exec_lo, s_wqm_b32, and s_and_b32/s_mov_b32 restore) require a validated
     guest wave32 profile (wave_size=32); native Scarlett/GFX10 wave64 operations remain independent
     of guest profile declarations.
+    half_denorm declares the binary16 denormal state at shader entry (MODE[7:6]). Only "preserve" is accepted; None
+    means unknown, and the plain binary16 VOP2 arithmetic forms are then refused. The caller takes it from validated
+    guest state; the translator does not measure or track it.
     """
     if title_ranges is not None and (isinstance(title_ranges, bool) or not isinstance(title_ranges, int)
                                      or not 1 <= title_ranges <= 0xffffffff):
@@ -1864,9 +2084,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if wave_size is not None and (not isinstance(wave_size, int) or wave_size not in (32, 64)):
         raise ValueError(f"Invalid guest wave size: {wave_size}")
     guest_wave32 = wave_size == 32
+    if half_denorm not in (None, HALF_DENORM_PRESERVE):
+        raise ValueError(f"Invalid binary16 denormal entry state: {half_denorm}")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
-    vector = VectorRegisters({"v0": "bary_i", "v1": "bary_j"})
+    vector = TrackedVector({"v0": "bary_i", "v1": "bary_j"})
     known_ssa_bits: dict[str, int] = {}
+    known_half: dict[str, int] = {}  # half16 result name -> proven binary16 bits
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
     # The boolean records whether the quad value depends on interpolated coordinates.
     quad_values = {"uv.x": True, "uv.y": True}
@@ -1923,7 +2146,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     lines.append(f"{result_type} main(float2 uv : TEXCOORD0) : SV_Target0 {{")
     attribute_input = False
     interpolated = False
-    for i, line in enumerate(instructions):
+    region = None
+    seen_skip = False
+    instructions = tuple(instructions)
+    if any(isinstance(element, tuple) for element in instructions):
+        offset_index = {}
+        previous_offset = -1
+        for index, element in enumerate(instructions):
+            if (not isinstance(element, tuple) or len(element) != 2
+                    or type(element[0]) is not int or not isinstance(element[1], str)):
+                raise ValueError("Invalid (offset, text) instruction pair")
+            offset = element[0]
+            if offset <= previous_offset or offset % 4:
+                raise ValueError("Instruction offsets must be strictly increasing and DWORD aligned")
+            offset_index[offset] = index
+            previous_offset = offset
+        positioned = instructions
+    else:
+        if not all(isinstance(element, str) for element in instructions):
+            raise ValueError("Invalid instruction element")
+        offset_index = {}
+        positioned = ((None, line) for line in instructions)
+    for i, (offset, line) in enumerate(positioned):
+        vector.reads.clear()
+        conditional = set(vector.conditional)
+
         def match(pattern):
             return re.fullmatch(pattern, line)
 
@@ -1933,6 +2180,19 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if line != "s_waitcnt lgkmcnt(0)":
                 raise ValueError("ds_swizzle_b32 requires an immediate s_waitcnt lgkmcnt(0)")
             ds_needs_wait = False
+        rstate = None
+        if region is not None:
+            if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]", line):
+                pass
+            elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
+                    and i == region["start"] + 1 and region["skip"] is None):
+                pass
+            elif not REGION_ALU.match(line):
+                raise ValueError(f"Instruction cannot run in a masked region: {line}")
+            else:
+                rstate = (dict(scalar), dict(vector), scc, set(pending), dict(sample_dest),
+                          exported, ended, mask, attribute_input, interpolated,
+                          dict(quad_values), samples)
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
             continue
         # SOPK s_version K (gfx10+) has no destination and does not write SCC: a marker with no effect.
@@ -1947,6 +2207,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             continue
         if exported and line != "s_endpgm":
             raise ValueError("Unexpected instruction after color export")
+        # The operandless DS NOP leaves registers and memory untouched in either EXEC region.
+        if line == "ds_nop":
+            continue
         # v_nop_e64 is the VOP3 encoding of the same no-op; LLVM 15 prints both encodings as v_nop.
         if line in ("v_nop", "v_nop_e64"):
             if mask != "entry":
@@ -2122,6 +2385,57 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Unsupported execution mask")
             mask = "entry"
             wqm_width = None
+            scc = None
+        elif m := match(r"s_and_saveexec_b64 (s\[\d+:\d+\]), (vcc|s\[\d+:\d+\])"):
+            # A masked-if from a known full entry mask: the source must hold a tracked
+            # comparison, whose lanes select which registers the region may rewrite.
+            pair = sgpr_pair(m[1])
+            regs = lane_mask(m[2])
+            condition = scalar.get(regs[0])
+            if (region is not None or mask != "entry" or pending.intersection(pair)
+                    or not isinstance(condition, tuple) or condition[0] != "condition"
+                    or [scalar.get(r) for r in regs]
+                        != [(*condition[:2], j, len(regs)) for j in range(len(regs))]):
+                raise ValueError("Unsupported execution mask save")
+            scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
+            region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i}
+            vector.masked = True
+            scc = None
+        elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
+            # The whole-wave empty-mask skip may sit right after the save; its target must be
+            # the matching restore exactly. Offsets count from the next instruction.
+            if (region is None or offset is None or i != region["start"] + 1
+                    or region["skip"] is not None or seen_skip):
+                raise ValueError("Unsupported execution skip")
+            imm = int(m[1], 0)
+            if not -0x8000 <= imm <= 0x7fff:
+                raise ValueError("Execution skip displacement out of range")
+            restore = offset_index.get(offset + 4 + imm * 4)
+            if restore is None or restore <= i:
+                raise ValueError("Execution skip targets no instruction boundary")
+            target = instructions[restore][1] if isinstance(instructions[restore], tuple) else instructions[restore]
+            if not (rm := re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)) \
+                    or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
+                raise ValueError("Execution skip does not target the matching restore")
+            region["skip"] = restore
+            seen_skip = True
+        elif m := match(r"s_or_b64 exec, exec, (s\[\d+:\d+\])"):
+            pair = sgpr_pair(m[1])
+            if (region is None or pair != region["save"]
+                    or (region["skip"] is not None and region["skip"] != i)):
+                raise ValueError("Unexpected execution mask restore")
+            for dst, outer in region["written"].items():
+                if outer is MISSING or dst in vector.conditional:
+                    vector.conditional.add(dst)
+                    continue
+                if not isinstance(outer, str) or outer in ("bary_i", "bary_j"):
+                    raise ValueError("Masked region rewrites a register without a numeric value")
+                inner = vector[dst]
+                lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
+                vector[dst] = f"alu{i}_{dst}"
+            region = None
+            vector.masked = False
+            vector.reads.clear()
             scc = None
         elif m := match(r"s_(cmov|not|brev)_b64 (s\[\d+:\d+\]), ([^,]+)"):
             op, dst, src = m.groups()
@@ -2662,11 +2976,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 if src_sel not in ("WORD_0", "BYTE_0", "BYTE_1"):
                     raise ValueError("Reads the undefined high half of a 16-bit result")
                 word = f"asuint({src_name})"
+            elif (half_name := half16_name(src, vector)) is not None:
+                # A binary16 result is read through WORD_0 only (BYTE selections are for integer results).
+                if src_sel != "WORD_0" or sext:
+                    raise ValueError("Reads the undefined high half of a 16-bit result")
+                word = f"asuint({half_name})"
             else:
                 word = f"asuint({fp_operand(src, scalar, vector, pending, sample_dest)})"
-            if unused == "UNUSED_PRESERVE" and isinstance(vector.get(dst), tuple) and vector[dst][0] == "low16":
+            keep_old = SDWA_SEL[dst_sel][1] != 32 and unused == "UNUSED_PRESERVE"
+            old_value = vector.get(dst) if keep_old else None
+            if isinstance(old_value, tuple) and old_value[0] in ("low16", "half16"):
                 raise ValueError("Reads the undefined high half of a 16-bit result")
-            result = sdwa_dest(sdwa_source(word, src_sel, bool(sext)), dst_sel, unused, vector.get(dst))
+            result = sdwa_dest(sdwa_source(word, src_sel, bool(sext)), dst_sel, unused, old_value)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({result});")
         elif m := match(r"v_cvt_f32_f16_sdwa (v\d+), (-?)(?:\|([vs]\d+)\||([vs]\d+))( clamp)? dst_sel:DWORD dst_unused:UNUSED_(?:PAD|PRESERVE) src0_sel:(WORD_[01])"):
@@ -2676,7 +2997,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid conversion")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            word = f"asuint({fp_operand(bars or plain, scalar, vector, pending, sample_dest)})"
+            if (half_name := half16_name(bars or plain, vector)) is not None:
+                if src_sel != "WORD_0":
+                    raise ValueError("Reads the undefined high half of a 16-bit result")
+                if negate or bars or clamp:
+                    raise ValueError("Modifiers on a binary16 arithmetic result are not lowered")
+                word = f"asuint({half_name})"
+            else:
+                word = f"asuint({fp_operand(bars or plain, scalar, vector, pending, sample_dest)})"
             expression = f"widen16({sdwa_source(word, src_sel, False)})"
             if bars:
                 expression = f"abs({expression})"
@@ -2700,7 +3028,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if clamp:
                 expression = f"saturate({expression})"
             if dst_sel != "DWORD":
-                expression = f"asfloat({sdwa_dest(f'asuint({expression})', dst_sel, unused, vector.get(dst))})"
+                expression = f"asfloat({sdwa_dest(f'asuint({expression})', dst_sel, unused, vector.get(dst) if unused == 'UNUSED_PRESERVE' else None)})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_mov_b32(?:_e32|_e64)? (v\d+), (-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)"):
@@ -3068,7 +3396,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             source = bars or call or plain
-            if re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", source):
+            if (half_name := half16_name(source, vector)) is not None:
+                # A binary16 arithmetic result defines bits 15:0, which widen16 reads; modifiers are not lowered.
+                if negate or bars or call or clamp:
+                    raise ValueError("Modifiers on a binary16 arithmetic result are not lowered")
+                word = f"asuint({half_name})"
+            elif re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", source):
                 word = f"{int(source, 0) & 0xffffffff}u"
             else:
                 word = f"asuint({fp_operand(source, scalar, vector, pending, sample_dest)})"
@@ -3262,6 +3595,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     packed = f"(mix{i}_p & 0x0000ffffu) | (pack16_rne(mix{i}) << 16)"
                 vector[dst] = f"alu{i}"
                 lines.append(f"    precise float alu{i} = asfloat({packed});")
+        elif re.fullmatch(r"v_fma_f16(?:_e64)? .+", line):
+            raise ValueError("Unverified v_fma_f16 binary16 FMA semantics")
+        elif re.fullmatch(r"v_div_scale_f32(?:_e64)? .+", line):
+            raise ValueError("Unverified v_div_scale_f32 prescaling and VCC semantics")
+        elif m := match(r"v_div_fmas_f32(?:_e64)? (v\d+), (.+)"):
+            dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid div_fmas operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, clamp = parse_div_fmas(rest)
+            condition = scalar.get("vcc")
+            if condition is None:
+                condition = scalar.get("vcc_lo")
+            if condition is None or not isinstance(condition, tuple) or condition[0] != "condition":
+                raise ValueError("Divide FMA requires a tracked VCC condition")
+            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
+            helpers.add("div_fmas32")
+            func = "div_fmas32_clamp" if clamp else "div_fmas32"
+            expr = f"{func}({values[0]}, {values[1]}, {values[2]}, {condition[1]})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expr};")
         elif m := match(r"(v_dot2_f32_f16|v_dot2_i32_i16|v_dot2_u32_u16|v_dot4_i32_i8|v_dot4_u32_u8|v_dot8_i32_i4|v_dot8_u32_u4) (v\d+), (.+)"):
             op, dst, rest = m.groups()
             if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
@@ -3367,6 +3722,35 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             expr = pk_int16_lane_expr({**VOP3_INT16, **VOP3_INT16_TERNARY}[name], word_vars, [0] * len(word_vars), False)
             vector[dst] = ("low16", f"alu{i}")
             lines.append(f"    precise float alu{i} = asfloat({expr});")
+        elif m := match(rf"v_({'|'.join(VOP2_F16)})_f16(_e32|_e64)? (v\d+), ([^,\s]+), ([^,\s]+)"):
+            # Plain non-fused binary16 VOP2 arithmetic. Both sources must have a statically known finite low half
+            # and the result must not overflow, so the lowering needs no NaN, infinity or overflow rule. Each half
+            # is widened exactly and one binary32 operation is rounded once to binary16 by narrow16 (11-bit
+            # significands: the product is exact in binary32, and a sum rounded to 24 bits first is innocuous
+            # because 24 >= 2 * 11 + 2). The result is ("half16", alu): only bits 15:0 are defined.
+            name, encoding, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 arithmetic operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if encoding != "_e64" and not re.fullmatch(r"v\d+", tokens[1]):
+                raise ValueError("Binary16 e32 src1 must be a VGPR")
+            words, proven = zip(*(half16_arith_source(tok, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+                                  for tok in tokens))
+            result = f16_vop2_result(name, *proven)
+            if result is None:
+                raise ValueError(f"binary16 result overflows: v_{name}_f16")
+            for k, word in enumerate(words):
+                lines.append(f"    uint hf{i}_{k} = ({word}) & 0xffffu;")
+            expression = VOP2_F16[name].format(f"widen16(hf{i}_0)", f"widen16(hf{i}_1)")
+            lines.append(f"    precise float hs{i} = {expression};")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
         elif m := match(r"v_cvt_off_f32_i4(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
             # Bits 3:0 of the source as a signed nibble in units of 1/16, so 0x7 gives 0.4375
             # and 0x8 gives -0.5. The source is read as bits, so float modifiers do not apply.
@@ -3540,10 +3924,30 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             ended = True
         else:
             raise ValueError(f"Unsupported instruction {i}: {line}")
+        if rstate is not None:
+            (old_scalar, old_vector, old_scc, old_pending, old_sample_dest, old_exported,
+             old_ended, old_mask, old_attribute, old_interpolated, old_quad, old_samples) = rstate
+            writes = {k for k in set(vector) | set(old_vector)
+                      if old_vector.get(k, MISSING) != dict.get(vector, k, MISSING)}
+            if (scalar != old_scalar or scc != old_scc or pending != old_pending
+                    or sample_dest != old_sample_dest or exported != old_exported
+                    or ended != old_ended or mask != old_mask
+                    or attribute_input != old_attribute or interpolated != old_interpolated
+                    or quad_values != old_quad or samples != old_samples or not writes
+                    or any(not isinstance(dict.get(vector, k), str) for k in writes)):
+                raise ValueError(f"Unsupported masked-region operation {i}: {line}")
+            for k in writes:
+                region["written"].setdefault(k, old_vector.get(k, MISSING))
+        if conditional.intersection(vector.reads):
+            raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
+    if region is not None:
+        raise ValueError("Program ends inside a masked region")
     if not ended or samples != len(bindings):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
+        if "div_fmas32" in helpers:
+            defs.append(DIV_FMAS_HELPERS)
         if helpers & {"cvt_u32_f32", "cvt_i32_f32"}:
             defs.append((Path(__file__).resolve().parents[1] / "src/ffx_float_to_int.hlsli").read_text())
         lines[:0] = defs
@@ -3574,6 +3978,8 @@ def main():
     parser.add_argument("--extra-constant", type=lambda s: int(s, 0), nargs=2, action="append", default=[],
                         metavar=("SGPR", "OFFSET"),
                         help="Entry register and byte offset of a further descriptor; repeat for b1, b2 and onward")
+    parser.add_argument("--half-denorm", choices=[HALF_DENORM_PRESERVE],
+                        help="Declare the binary16 denormal state at shader entry; the plain binary16 VOP2 forms need it")
     parser.add_argument("--second-texture-offset", type=lambda s: int(s, 0), help="Byte offset of the t1 descriptor for a two-sample shader")
     args = parser.parse_args()
     dest = args.output.resolve()
@@ -3581,10 +3987,11 @@ def main():
         parser.error("Choose an HLSL destination distinct from the input")
     try:
         blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256, llvm=args.llvm)
-        instructions = disassemble(code, args.llvm)
+        instructions = disassemble(code, args.llvm, offsets=True)
         source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor,
                        texture_offset=args.texture_offset, second_texture_offset=args.second_texture_offset,
-                       extra_constants=[tuple(entry) for entry in args.extra_constant])
+                       extra_constants=[tuple(entry) for entry in args.extra_constant],
+                       half_denorm=args.half_denorm)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")
     dest.parent.mkdir(parents=True, exist_ok=True)
