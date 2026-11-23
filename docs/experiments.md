@@ -1383,7 +1383,7 @@ The four x87 fixtures reported in [#592](https://github.com/R0Y00/Xbox2Windows/p
 |---|---:|---:|---:|
 | `cpu_aot_x87_compare` | 12,230 | 12 | 7 |
 | `cpu_aot_x87_fcmov` | 13,290 | 16 | 8 |
-| `cpu_aot_x87_iarith` | 28,512 | 15 | 6 |
+| `cpu_aot_x87_iarith` | 28,513 | 16 | 6 |
 | `cpu_aot_x87_fnstcw` | 1,776 | 6 | 4 |
 
 The native and recompiled DLLs matched the reference for the output blocks and guards in all 55,808 cases. Every checked export returned with control word `0x027F` and an empty x87 stack. CTest reported four passes and no skips.
