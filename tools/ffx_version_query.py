@@ -571,11 +571,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         M.VHADDPD: ("__m128d", "_mm_hadd_pd"),
         M.VHSUBPS: ("__m128", "_mm_hsub_ps"),
         M.VHSUBPD: ("__m128d", "_mm_hsub_pd"),
+        M.VADDSUBPS: ("__m128", "_mm_addsub_ps"),
+        M.VADDSUBPD: ("__m128d", "_mm_addsub_pd"),
     }
     has_wide |= any(i.mnemonic in avx_horiz_fp_ops for i in body)
 
     def lower_avx_horiz_fp(insn, vec_reader):
-        """Lower VEX-encoded 128/256-bit horizontal FP add/sub using 128-bit SSE3 intrinsics per lane."""
+        """Lower VEX-encoded 128/256-bit SSE3 FP add/sub (horizontal and alternating) using 128-bit intrinsics per lane."""
         dest = insn.op0_register
         valid_regs = wide if dest in wide else wide_xmm
         nbytes = 32 if dest in wide else 16
@@ -585,7 +587,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                 or insn.op2_kind not in (K.REGISTER, K.MEMORY)
                 or (insn.op2_kind == K.REGISTER and insn.op2_register not in valid_regs)
                 or (insn.op2_kind == K.MEMORY and MemorySizeExt.size(insn.memory_size) != nbytes)):
-            raise ValueError(f"unsupported AVX horizontal FP operation at {insn.ip:#x}: {insn}")
+            raise ValueError(f"unsupported AVX SSE3 FP operation at {insn.ip:#x}: {insn}")
         vtype, fn = avx_horiz_fp_ops[insn.mnemonic]
         dst, src1 = wide_any[dest], wide_any[insn.op1_register]
         rhs = wide_any[insn.op2_register] if insn.op2_kind == K.REGISTER else vec_reader(nbytes)

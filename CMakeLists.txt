@@ -2039,6 +2039,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_avx_horiz_fp>" "$<TARGET_FILE:cpu_avx_horiz_fp_lifted>")
     set_tests_properties(cpu_aot_avx_horiz_fp PROPERTIES SKIP_RETURN_CODE 77)
 
+    cpu_asm_fixture(cpu_avx_addsub_fp avx_addsub_fp)
+    set(avx_addsub_fp_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_addsub_fp_lifted.cpp")
+    add_custom_command(OUTPUT "${avx_addsub_fp_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_addsub_fp.py"
+            emit "$<TARGET_FILE:cpu_avx_addsub_fp>" "${avx_addsub_fp_fixture}"
+        DEPENDS cpu_avx_addsub_fp tests/cpu/avx_addsub_fp.py tests/cpu/avx_horiz_fp.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_avx_addsub_fp_lifted SHARED "${avx_addsub_fp_fixture}")
+    add_test(NAME cpu_aot_avx_addsub_fp COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_addsub_fp.py"
+        check "$<TARGET_FILE:cpu_avx_addsub_fp>" "$<TARGET_FILE:cpu_avx_addsub_fp_lifted>")
+    set_tests_properties(cpu_aot_avx_addsub_fp PROPERTIES SKIP_RETURN_CODE 77)
+
     cpu_asm_fixture(cpu_avx_int_shifts_pack avx_int_shifts_pack)
     set(avx_int_shifts_pack_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_int_shifts_pack_lifted.cpp")
     add_custom_command(OUTPUT "${avx_int_shifts_pack_fixture}"
