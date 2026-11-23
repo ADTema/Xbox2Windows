@@ -1047,6 +1047,18 @@ SDWA_SEL_NAMES = ("BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "D
 SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES = range(209, 235)
 
 
+def _format_sdwa_float_modifiers(val: str, scalar_code: int | None, is_abs: int, is_neg: int) -> str:
+    """Wrap a float SDWA source in abs/neg modifiers as LLVM 15 prints them.
+
+    neg without abs on an inline constant (scalar codes 128-208 and 240-248) is printed `neg(c)`, as LLVM 15
+    does: `-1` would name the inline constant -1 (0xffffffff), not 1 with its sign bit flipped (0x80000001).
+    """
+    inline_constant = scalar_code is not None and (128 <= scalar_code <= 208 or 240 <= scalar_code <= 248)
+    if inline_constant and is_neg and not is_abs:
+        return f"neg({val})"
+    return _format_operand_modifiers(val, is_abs, is_neg)
+
+
 def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
     """Decode a GFX10 VOP_SDWA9Be (VOPC SDWA) 8-byte instruction."""
     if op_name.startswith("v_vopc_") or op_name.endswith(("_f64_e32", "_i64_e32", "_u64_e32")):
@@ -1092,11 +1104,11 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
     src1_str = decode_s_reg(vsrc1) if src1_sgpr else f"v{vsrc1}"
 
     if src0_is_float:
-        src0_str = _format_operand_modifiers(src0_str, src0_abs, src0_neg)
+        src0_str = _format_sdwa_float_modifiers(src0_str, src0_raw if src0_sgpr else None, src0_abs, src0_neg)
     elif src0_sext:
         src0_str = f"sext({src0_str})"
     if src1_is_float:
-        src1_str = _format_operand_modifiers(src1_str, src1_abs, src1_neg)
+        src1_str = _format_sdwa_float_modifiers(src1_str, vsrc1 if src1_sgpr else None, src1_abs, src1_neg)
     elif src1_sext:
         src1_str = f"sext({src1_str})"
 

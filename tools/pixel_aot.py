@@ -1747,6 +1747,9 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *,
 
 
 
+SDWA_NEG_DECIMAL = re.compile(r"^neg\((-?\d+\.\d+)\)$")
+
+
 def f32_comparison(op, tokens, scalar, vector, pending, sample_dest):
     values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
     predicate = COMPARE[op].format(*values)
@@ -4065,6 +4068,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
+            # The decoder prints the explicit modifier. Retain the existing decimal
+            # float path; an integer inline constant names bits and is a distinct form.
+            tokens = [SDWA_NEG_DECIMAL.sub(r"-\1", token) for token in tokens]
             expr = f32_comparison(op, tokens, scalar, vector, pending, sample_dest)
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
