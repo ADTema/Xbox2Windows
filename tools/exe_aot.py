@@ -98,12 +98,16 @@ def convert(image, out_dir, *, entry_export=None, cxx=None, compile_exe=True):
     out_dir.mkdir(parents=True, exist_ok=True)
     source = out_dir / f"{image.stem}_aot.cpp"
     exe = out_dir / f"{image.stem}_aot.exe"
-    if image in (source, exe):
+    report_path = out_dir / "report.json"
+    artifacts = (source, exe, *(exe.with_suffix(suffix) for suffix in (".obj", ".lib", ".exp")))
+    if any(path == image or (path.exists() and image.samefile(path)) for path in (*artifacts, report_path)):
         raise ValueError(f"output would overwrite the input {image}")
-    for stale in (source, exe, *(exe.with_suffix(suffix) for suffix in (".obj", ".lib", ".exp"))):
+    if report_path.is_symlink():
+        raise ValueError(f"report path is a symbolic link: {report_path}")
+    data = image.read_bytes()
+    for stale in artifacts:
         stale.unlink(missing_ok=True)
 
-    data = image.read_bytes()
     report = {"input": str(image), "sha256": hashlib.sha256(data).hexdigest(), "entry_export": entry_export}
     try:
         report["header"], imports = read_header(data)
@@ -128,7 +132,7 @@ def convert(image, out_dir, *, entry_export=None, cxx=None, compile_exe=True):
     except Refusal as refusal:
         report["status"] = "refused"
         report["refusal"] = {"stage": refusal.stage, "message": str(refusal), **refusal.details}
-    (out_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
 

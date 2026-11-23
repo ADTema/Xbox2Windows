@@ -114,6 +114,22 @@ def main(cxx, crc, castagnoli, trace, io_dll):
         text.write_bytes(b"not a PE image\n")
         check_refused(text, root / "text", "header", {})
 
+        # Reject an input that is also an output, before touching its bytes.
+        report_input = root / "collision" / "report.json"
+        report_input.parent.mkdir()
+        sentinel = b'{"sentinel":"caller input"}\n'
+        report_input.write_bytes(sentinel)
+        result, _ = convert(report_input, report_input.parent, "--no-build")
+        check("report collision exit", result.returncode, 2)
+        check("report collision diagnostic", "output would overwrite the input" in result.stderr, True)
+        check("report collision preserves input", report_input.read_bytes(), sentinel)
+
+        aliased_input = root / "input.json"
+        aliased_input.hardlink_to(report_input)
+        result, _ = convert(aliased_input, report_input.parent, "--no-build")
+        check("report hard link exit", result.returncode, 2)
+        check("report hard link preserves input", aliased_input.read_bytes(), sentinel)
+
         # An unsupported instruction in the entry body. Converting into the directory that holds the earlier
         # successful conversion must also remove that stale EXE.
         patched = root / "patched" / crc.name
