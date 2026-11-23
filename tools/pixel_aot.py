@@ -986,6 +986,13 @@ VOP3_INT16 = {
     "mul_lo_u16": "mul_lo_u16",
     "lshlrev_b16": "lshlrev_b16", "lshrrev_b16": "lshrrev_b16", "ashrrev_i16": "ashrrev_i16",
 }
+# Three-operand forms of the same contract (LLVM 15 VOP3Instructions.td: V_MAD_{U,I}16 are Ternary_i16_Pats<mul, add>,
+# V_{MIN3,MAX3,MED3}_{I,U}16 are AMDGPU{s,u}{min3,max3,med3}). clamp and op_sel are not modelled and are refused.
+VOP3_INT16_TERNARY = {
+    "mad_u16": "mad_u16", "mad_i16": "mad_i16",
+    "min3_i16": "min3_i16", "min3_u16": "min3_u16", "max3_i16": "max3_i16", "max3_u16": "max3_u16",
+    "med3_i16": "med3_i16", "med3_u16": "med3_u16",
+}
 
 
 def sgpr_name(token):
@@ -1695,6 +1702,12 @@ def pk_int16_lane_expr(op, word_vars, sel, clamp):
     if op == "mad_u16":
         r = f"({u16(word_vars[0], sel[0])} * {u16(word_vars[1], sel[1])} + {u16(word_vars[2], sel[2])})"
         return f"min({r}, 65535u)" if clamp else f"({r} & 0xffffu)"
+    if op in ("min3_i16", "max3_i16", "med3_i16", "min3_u16", "max3_u16", "med3_u16"):
+        kind = op[-3:]
+        a, b, c = ((i16 if kind == "i16" else u16)(w, hi) for w, hi in zip(word_vars, sel))
+        r = {"min3": f"min(min({a}, {b}), {c})", "max3": f"max(max({a}, {b}), {c})",
+             "med3": f"max(min({a}, {b}), min(max({a}, {b}), {c}))"}[op[:4]]
+        return f"(asuint({r}) & 0xffffu)" if kind == "i16" else r
     if op == "lshlrev_b16":
         return f"(({u16(word_vars[1], sel[1])} << ({u16(word_vars[0], sel[0])} & 15u)) & 0xffffu)"
     if op == "lshrrev_b16":
@@ -3134,7 +3147,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint pki{i}_l1 = {hi_expr};")
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat(pki{i}_l0 | (pki{i}_l1 << 16));")
-        elif m := match(rf"v_({'|'.join(VOP3_INT16)})(?:_e64)? (v\d+), ([^,\s]+), ([^,\s]+)"):
+        elif m := match(rf"v_({'|'.join([*VOP3_INT16, *VOP3_INT16_TERNARY])})(?:_e64)? (v\d+), ([^,\s]+), ([^,\s]+)(?:, ([^,\s]+))?"):
             # Non-packed 16-bit integer VOP3 ops. The result is tracked as ("low16", alu): only bits 15:0
             # are defined. The HLSL variable holds the zero-extended result, but its upper half is an
             # implementation detail that no accepted reader observes (16-bit ops, 16-bit compares and
@@ -3142,8 +3155,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # high half is not measured here, so the destination may hold anything and nothing is merged.
             # Modifiers, op_sel, clamp, DPP and SDWA never match the anchored operands.
             name, dst, *sources = m.groups()
+            sources = [tok for tok in sources if tok is not None]
             if mask != "entry":
                 raise ValueError("Invalid 16-bit integer operation")
+            if len(sources) != (3 if name in VOP3_INT16_TERNARY else 2):
+                raise ValueError(f"Wrong 16-bit integer operand count for v_{name}")
             if not 0 <= int(dst[1:]) <= 255:
                 raise ValueError(f"Register out of range: {dst}")
             if dst in sample_dest:
@@ -3163,7 +3179,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     bits = int_operand(tok, scalar, vector, pending, sample_dest, signed=False)
                 lines.append(f"    uint i16s{i}_{k} = {bits};")
                 word_vars.append(f"i16s{i}_{k}")
-            expr = pk_int16_lane_expr(VOP3_INT16[name], word_vars, [0, 0], False)
+            expr = pk_int16_lane_expr({**VOP3_INT16, **VOP3_INT16_TERNARY}[name], word_vars, [0] * len(word_vars), False)
             vector[dst] = ("low16", f"alu{i}")
             lines.append(f"    precise float alu{i} = asfloat({expr});")
         elif m := match(r"v_cvt_off_f32_i4(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
