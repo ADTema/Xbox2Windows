@@ -304,6 +304,7 @@ def controls():
     grid_controls()
     guard_controls()
     read_controls()
+    alu_controls()
 
 
 def grid_controls():
@@ -685,6 +686,40 @@ READ_CASES = [
     ("read_index", READ_INDEX, 32, READ_BINDING | dict(source_stride=8)),
 ]
 READ_LOADS = {"read_copy": "inputData.Load((tid.x << 2u) + 0u)", "read_index": "inputData.Load(tid.x * 8u + 4u)"}
+# Read-compute-write (#721), unchanged LLVM 15 code generator output of an original amdgpu_cs
+# source as for the reads, with the same bindings:
+#   if (gid < n) {
+#       v = source word gid (byte offset gid * 4);
+#       store umin((v & 0xffff) * (v >> 16) + gid, cap) at element gid;    // cap = params[0].y
+#   }
+READ_COMPUTE = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[4:7], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s2, vcc_lo",
+    "s_cbranch_execz .LBB0_2",
+    "s_load_dwordx8 s[8:15], s[0:1], 0x0",
+    "v_lshlrev_b32_e32 v1, 2, v0",
+    "s_buffer_load_dword s0, s[4:7], 0x4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_load_dword v1, v1, s[12:15], 0 offen",
+    "s_waitcnt vmcnt(0)",
+    "v_and_b32_e32 v2, 0xffff, v1",
+    "v_lshrrev_b32_e32 v1, 16, v1",
+    "v_mad_u32_u24 v1, v2, v1, v0",
+    "v_min_u32_e32 v1, s0, v1",
+    "buffer_store_dword v1, v0, s[8:11], 0 idxen",
+    ".LBB0_2:",
+    "s_endpgm",
+]
+ALU_CASES = [("read_compute", READ_COMPUTE, 32, READ_BINDING)]
+ALU_WORD = ("min(params[0].y, ((((0x0000ffffu & {0}) & 0xffffffu) * (({0} >> (0x00000010u & 31u)) & 0xffffffu))"
+            " + tid.x))").format(READ_LOADS["read_copy"])
 
 
 def variant(lines, *changes):
@@ -891,6 +926,83 @@ def read_controls():
             ("s_endpgm", "s_waitcnt vmcnt(0)\n" + late), stride=8)
 
 
+def alu_controls():
+    """Read-compute-write: exact output, then one rejection per instruction or operand outside the subset."""
+    def alu(*changes, **binding):
+        _, lines, width, bound = ALU_CASES[0]
+        return aot.lower(variant(lines, *changes), width, **(bound | binding)).splitlines()
+
+    lines = alu()
+    assert lines[:3] == ["cbuffer Constants : register(b0) { uint4 params[4]; };",
+                         "ByteAddressBuffer inputData : register(t0);",
+                         "RWByteAddressBuffer outputData : register(u0);"], lines
+    assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, {ALU_WORD});", "    }", "}"], lines
+    # A copy of a result is the same program. Literal, negative inline and SGPR sources keep their order.
+    mad = "v_mad_u32_u24 v1, v2, v1, v0"
+    assert alu(("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v3, s0, v1\nv_mov_b32_e32 v1, v3")) == lines
+    load = READ_LOADS["read_copy"]
+    assert (f"min(params[0].y, (((0x0000012cu & 0xffffffu) * ((0xfffffff0u & {load}) & 0xffffffu)) + params[0].y)"
+            in alu(("0xffff, v1", "-16, v1"), (mad, "v_mad_u32_u24 v1, 0x12c, v2, s0"))[-3])
+    unsupported, operand = "Unsupported compute instruction: ", "Unverified ALU operand"
+    compare = "Unverified lane guard compare"
+    # The x8 descriptor load moved before the guard, so only the result is written under it.
+    early = (("s_load_dwordx8 s[8:15], s[0:1], 0x0", ""),
+             ("s_and_saveexec_b32 s2, vcc_lo", "s_load_dwordx8 s[8:15], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
+                                               "s_and_saveexec_b32 s2, vcc_lo"))
+    for message, changes in (
+        # Wrong opcodes: signed or other operations, and a carry form that would write vcc.
+        (unsupported + "v_min_i32_e32", (("v_min_u32_e32", "v_min_i32_e32"),)),
+        (unsupported + "v_max_u32_e32", (("v_min_u32_e32", "v_max_u32_e32"),)),
+        (unsupported + "v_ashrrev_i32_e32", (("v_lshrrev_b32_e32", "v_ashrrev_i32_e32"),)),
+        (unsupported + "v_or_b32_e32", (("v_and_b32_e32", "v_or_b32_e32"),)),
+        (unsupported + "v_mad_i32_i24", ((mad, "v_mad_i32_i24 v1, v2, v1, v0"),)),
+        (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
+        # Wrong operand widths: 16-bit, 64-bit and sub-dword (SDWA) forms, and a register range.
+        (unsupported + "v_min_u16_e32", (("v_min_u32_e32", "v_min_u16_e32"),)),
+        (unsupported + "v_mad_u32_u16", ((mad, "v_mad_u32_u16 v1, v2, v1, v0"),)),
+        (unsupported + "v_lshrrev_b64", (("v_lshrrev_b32_e32 v1, 16, v1", "v_lshrrev_b64 v[1:2], 16, v[1:2]"),)),
+        (unsupported + "v_mad_u64_u32", ((mad, "v_mad_u64_u32 v[1:2], s4, v2, v1, v[0:1]"),)),
+        (unsupported + "v_and_b32_sdwa", (("v_and_b32_e32 v2, 0xffff, v1", "v_and_b32_sdwa v2, v1, v1 dst_sel:DWORD "
+                                           "dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD"),)),
+        (unsupported + "v_and_b32_e32", (("0xffff, v1", "0xffff, v[1:2]"),)),
+        # An SGPR as the VOP2 src1, and an output modifier.
+        (unsupported + "v_min_u32_e32", (("s0, v1", "v1, s0"),)),
+        (unsupported + "v_mad_u32_u24", ((mad, mad + " clamp"),)),
+        # Sources that are not known words: an unknown, pending, descriptor or exec-mask SGPR, an
+        # unknown VGPR, a literal wider than 32 bits, a byte offset, and a word read before its wait.
+        # Also a destination past v255.
+        (operand, (("s0, v1", "s20, v1"),)),
+        (operand, (("s_buffer_load_dword s0, s[4:7], 0x4", ""),
+                   ("v_and_b32_e32", "s_buffer_load_dword s0, s[4:7], 0x4\nv_and_b32_e32"))),
+        (operand, (("s0, v1", "s8, v1"),)),
+        (operand, (("s0, v1", "s2, v1"),)),
+        (operand, (("16, v1", "16, v5"),)),
+        (operand, (("0xffff, v1", "0x1ffffffff, v1"),)),
+        (operand, (("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v256, s0, v1"),)),
+        (operand, (("v_and_b32_e32 v2, 0xffff, v1", "v_lshlrev_b32_e32 v3, 2, v0\nv_and_b32_e32 v2, 0xffff, v3"),)),
+        ("Unverified row pitch byte offset", ((mad, "v_lshlrev_b32_e32 v3, 2, v0\nv_mad_u32_u24 v1, v2, v1, v3"),)),
+        ("Vector load result used or overwritten before s_waitcnt vmcnt(0)", (("s_waitcnt vmcnt(0)", ""),)),
+        # A result or a word read used as an address or as a guard operand.
+        ("Unsupported store address", (("v1, v0, s[8:11]", "v0, v1, s[8:11]"),)),
+        ("Unsupported read address", (("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v1, s0, v1\n"
+                                       "buffer_load_dword v3, v1, s[12:15], 0 offen"),)),
+        (compare, (("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v1, s0, v1\nv_cmp_gt_u32_e32 vcc_lo, s3, v1"),)),
+        (compare, (("v_and_b32_e32", "v_cmp_gt_u32_e32 vcc_lo, s3, v1\nv_and_b32_e32"),)),
+        # Expressions are inline, so a result that keeps doubling is rejected.
+        ("ALU expression too large", (("v_min_u32_e32 v1, s0, v1",
+                                       "v_min_u32_e32 v1, s0, v1" + "\nv_and_b32_e32 v1, v1, v1" * 4),)),
+    ):
+        rejects(message, alu, *changes)
+    # A result computed under the guard is unknown after the restore; a word set after it is known.
+    restored = (*early, ("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", ""),
+                ("buffer_store_dword v1, v0, s[8:11], 0 idxen", "buffer_store_dword v0, v0, s[8:11], 0 idxen\n"
+                 "s_or_b32 exec_lo, exec_lo, s2\nbuffer_store_dword v1, v0, s[8:11], 0 idxen offset:4"))
+    rejects("Store data is not a known word", alu, *restored, stride=8)
+    assert alu(*restored, ("s_or_b32 exec_lo, exec_lo, s2", "s_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v1, 9"),
+               stride=8)[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
+                                  "    outputData.Store(tid.x * 8u + 4u, 0x00000009u);", "}"]
+
+
 def assemble(directory, assembler, objcopy, lines):
     src, obj, raw = [directory / x for x in ("exit.s", "exit.o", "exit.bin")]
     src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -1000,7 +1112,7 @@ def store_container(code, dims):
 
 def binary(directory, assembler, objcopy, library):
     two_exits(directory, assembler, objcopy, library)
-    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES:
+    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
         subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
@@ -1258,6 +1370,76 @@ def draw_read(directory, compiler, cmd, case, name):
     return 0
 
 
+# cap = params[0].y clamps about half of the lanes of the largest dispatch; the other constant words
+# differ from it, so a translation that reads another word fails.
+ALU_CAP = 0x45000000
+
+
+def alu_word(gid, *, low=0xffff, shift=16, pick=min):
+    """Independent CPU reference of the read_compute result for one lane."""
+    word = source_word(gid)
+    return pick(((word & low) * (word >> shift) + gid) & 0xffffffff, ALU_CAP)
+
+
+def alu_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = alu_word(gid, **reference)
+    return words
+
+
+def alu_mutations(source):
+    """Translations that a wrong opcode or operand would produce; each must fail on the GPU."""
+    yield "max for min", source.replace("min(params", "max(params")
+    yield "shift by 15", source.replace(">> (0x00000010u", ">> (0x0000000fu")
+    yield "24-bit mask for 16-bit", source.replace("(0x0000ffffu &", "(0x00ffffffu &")
+    yield "addend dropped", source.replace(" + tid.x))", "))")
+    yield "cap from another word", source.replace("min(params[0].y", "min(params[0].z")
+
+
+def draw_alu(directory, compiler, cmd, case, name):
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = ALU_CAP
+
+    def write(groups, bound, words=None):
+        case.write_bytes(struct.pack("<337I", groups, *(words or alu_words(groups, bound)), bound,
+                                     *constants[1:]))
+
+    for groups, bound in READ_RUNS:
+        write(groups, bound)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    groups, bound = READ_RUNS[-1]
+    expected = alu_words(groups, bound)
+    assert 0 < sum(word == ALU_CAP for word in expected) < bound, "the cap must clamp some lanes, not all"
+    # Reference controls: a CPU reference that disagrees with the program in one word, in the
+    # operation, the shift or the mask, or in the bound.
+    off = list(expected)
+    off[bound - 1] ^= 1
+    for label, reference in (("one word off", off), ("max for min", alu_words(groups, bound, pick=max)),
+                             ("shift by 15", alu_words(groups, bound, shift=15)),
+                             ("24-bit mask", alu_words(groups, bound, low=0xffffff)),
+                             ("lane past the bound", alu_words(groups, bound + 1))):
+        word = next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b)
+        write(groups, bound, reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(groups, bound)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, mutated in alu_mutations(source):
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection with groups={groups} bound={bound}")
+    return 0
+
+
 def draw(directory, compiler, renderer, backend, cases=None):
     for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
@@ -1265,7 +1447,8 @@ def draw(directory, compiler, renderer, backend, cases=None):
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
         if name.startswith(("guard_", "read_")):
-            result = (draw_guard if name.startswith("guard_") else draw_read)(directory, compiler, cmd, case, name)
+            result = (draw_guard if name.startswith("guard_") else draw_alu if name == "read_compute"
+                      else draw_read)(directory, compiler, cmd, case, name)
             if result:
                 return result
             continue
@@ -1316,5 +1499,5 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
-                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES)}
+                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))
