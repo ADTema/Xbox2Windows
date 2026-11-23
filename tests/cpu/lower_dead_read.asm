@@ -75,4 +75,35 @@ fld_dead PROC FRAME
     mov rax, rdx
     ret
 fld_dead ENDP
+
+; Reads sixteen bytes at RCX, then writes a new value to XMM0 without using the read.
+read_vector_dead PROC FRAME
+.endprolog
+    mov QWORD PTR [r8], 1
+    movdqu xmm0, XMMWORD PTR [rcx]
+    pxor xmm0, xmm0
+    mov QWORD PTR [r8+8], 2
+    mov rax, rdx
+    ret
+read_vector_dead ENDP
+
+; RCX is the source and RDX the byte count. Use the third trace word as destination.
+; Preserve the actual Windows nonvolatile registers on either return or unwind.
+copy_bytes PROC FRAME
+    push rsi
+    .pushreg rsi
+    push rdi
+    .pushreg rdi
+.endprolog
+    mov QWORD PTR [r8], 1
+    mov rsi, rcx
+    lea rdi, [r8+16]
+    mov rcx, rdx
+    rep movsb
+    mov QWORD PTR [r8+8], 2
+    mov rax, rdx
+    pop rdi
+    pop rsi
+    ret
+copy_bytes ENDP
 END

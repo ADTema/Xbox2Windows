@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 import pefile
+from iced_x86 import Decoder, Mnemonic
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_leaf_aot import export_rva
@@ -22,29 +23,47 @@ ACCESS_VIOLATION = 0xC0000005
 # Export: the read it performs, as (width in bytes, the template argument of its volatile read).
 READS = {"read_dead": (8, "uint64_t"), "cmp_dead": (4, "uint32_t"), "test_dead": (1, "uint8_t"),
          "cmov_dead": (8, "uint64_t"), "add_in_place": (4, "uint32_t"), "read_live": (8, "uint64_t"),
-         "fld_dead": (8, "uint64_t")}
+         "fld_dead": (8, "uint64_t"), "read_vector_dead": (16, "std::array<uint8_t,16>"),
+         "copy_bytes": (1, "uint8_t")}
 X87 = ("fld_dead",)
+INITIAL = ["rcx = a; rdx = b; r8 = reinterpret_cast<word>(trace);"]
+
+
+def lift_export(pe, name):
+    (bounds,) = function_ranges(pe, export_rva(pe, name))
+    body = region(pe, *bounds)
+    # The translated function uses local variables for RSI/RDI. Their native
+    # save and restore are supplied by the host ABI.
+    host_ops = {i.ip: ";" for i in body if name == "copy_bytes" and i.mnemonic in
+                (Mnemonic.PUSH, Mnemonic.POP)}
+    return lower(body, INITIAL, {}, {}, {}, host_ops=host_ops, x87=name in X87)
 
 
 def emit(image, output):
     parts = [INTEGER_HEADER, X87_HEADER]
     with pefile.PE(str(image), fast_load=True) as pe:
         for name in READS:
-            (bounds,) = function_ranges(pe, export_rva(pe, name))
-            code = lower(region(pe, *bounds), ["rcx = a; rdx = b; r8 = reinterpret_cast<word>(trace);"],
-                         {}, {}, {}, x87=name in X87)
+            code = lift_export(pe, name)
             parts.append(f'extern "C" __declspec(dllexport) word lifted_{name}(word a, word b, word* trace) {{\n'
                          f'{code}\n}}\n')
     output.write_text("".join(parts), encoding="ascii")
+
+
+def check_frame_read():
+    # NOP; MOV RAX,[RSP+16]; RET. A host replacement can invalidate the
+    # private-frame proof even though the decoded instruction was a NOP.
+    body = list(Decoder(64, bytes.fromhex("90 48 8b 44 24 10 c3"), ip=0x1000))
+    fixed = lower(body, [], {}, {}, {})
+    replaced = lower(body, [], {}, {}, {}, host_ops={0x1000: "rsp = rcx;"})
+    if "load<" not in fixed or "load_always<" in fixed or replaced.count("load_always<") != 1:
+        raise AssertionError("private-frame load escaped its address provenance")
 
 
 def check_source(image):
     """Each export's one memory operand is read once, at its width, through the volatile load."""
     with pefile.PE(str(image), fast_load=True) as pe:
         for name, (width, ctype) in READS.items():
-            (bounds,) = function_ranges(pe, export_rva(pe, name))
-            body = lower(region(pe, *bounds), ["rcx = a; rdx = b; r8 = reinterpret_cast<word>(trace);"],
-                         {}, {}, {}, x87=name in X87)
+            body = lift_export(pe, name)
             reads = body.count("load_always<")
             if reads != 1 or f"load_always<{ctype}>(" not in body or "load<" in body:
                 raise AssertionError(f"{name}: {reads} volatile read(s), expected one {ctype} read:\n{body}")
@@ -128,6 +147,8 @@ def check(guard_path, original_path, lifted_path, optimized_path):
         print(f"{name}, {case}: the original and both translations {outcome}")
 
     for name in READS:
+        if name == "copy_bytes":
+            continue
         # The second y makes the low 32 bits of VALUE + y wrap to zero, so add_in_place sets ZF.
         for y in (5, (1 << 32) - (VALUE & 0xffffffff)):
             compare(name, base, y, f"readable operand, y = {y:#x}", reference(name, y, 0))
@@ -141,11 +162,24 @@ def check(guard_path, original_path, lifted_path, optimized_path):
             compare(name, base + PAGE - width + 1, 5, f"{width}-byte operand crossing into an inaccessible page", None)
 
 
+    # A zero count may use an inaccessible source. A partial copy makes the
+    # first completed write visible before the next read faults.
+    unchanged = (VALUE,) * len(words)
+    low_byte = (MASK & ~0xff) | (VALUE >> 56)
+    compare("copy_bytes", base + PAGE, 0, "REP MOVSB with zero count",
+            (0, 0, (1, 2, MASK), unchanged))
+    compare("copy_bytes", base + PAGE - 1, 1, "REP MOVSB last readable byte",
+            (0, 1, (1, 2, low_byte), unchanged))
+    compare("copy_bytes", base + PAGE - 1, 2, "REP MOVSB second iteration faults",
+            (ACCESS_VIOLATION, None, (1, MASK, low_byte), unchanged))
+
+
 if __name__ == "__main__":
     mode = sys.argv[1]
     if mode == "emit":
         emit(Path(sys.argv[2]), Path(sys.argv[3]))
     elif mode == "check":
+        check_frame_read()
         check_source(sys.argv[3])
         check(*sys.argv[2:])
     else:
