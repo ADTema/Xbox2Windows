@@ -89,6 +89,17 @@ def decode_v_reg64(reg_id: int) -> str:
     return decode_s_reg64(reg_id)
 
 
+def _format_operand_modifiers(val: str, is_abs: int, is_neg: int) -> str:
+    """Wrap a disassembled operand with inline abs (`|...|`) and neg (`-`) modifiers."""
+    if is_abs and is_neg:
+        return f"-|{val}|"
+    if is_abs:
+        return f"|{val}|"
+    if is_neg:
+        return f"-{val}"
+    return val
+
+
 # Instruction Opcode Tables
 SOPP_OPS = {
     0x00: ("s_nop", "No operation (wait cycles)"),
@@ -129,6 +140,7 @@ SOP2_OPS = {
     0x08: ("s_max_i32", "Scalar maximum signed 32-bit"),
     0x09: ("s_max_u32", "Scalar maximum unsigned 32-bit"),
     0x0a: ("s_cselect_b32", "Scalar conditional select 32-bit"),
+    0x0b: ("s_cselect_b64", "Scalar conditional select 64-bit"),
     0x0e: ("s_and_b32", "Scalar bitwise AND 32-bit"),
     0x0f: ("s_and_b64", "Scalar bitwise AND 64-bit"),
     0x10: ("s_or_b32", "Scalar bitwise OR 32-bit"),
@@ -143,6 +155,7 @@ SOP2_OPS = {
     0x21: ("s_lshr_b64", "Scalar logical shift right 64-bit"),
     0x22: ("s_ashr_i32", "Scalar arithmetic shift right 32-bit"),
     0x26: ("s_mul_i32", "Scalar multiply signed 32-bit"),
+    0x2c: ("s_absdiff_i32", "Scalar absolute difference signed 32-bit"),
     0x2e: ("s_lshl1_add_u32", "Scalar shift left 1 and add 32-bit"),
     0x2f: ("s_lshl2_add_u32", "Scalar shift left 2 and add 32-bit"),
     0x30: ("s_lshl3_add_u32", "Scalar shift left 3 and add 32-bit"),
@@ -1129,6 +1142,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_info = SOP1_OPS.get(op, (f"s_sop1_{op:02x}", "Unknown SOP1"))
         op_name, comment = op_info
         length = 4
+        is_64 = op_name.endswith(("_b64", "_u64", "_i64"))
         if ssrc0 == 255:
             if offset + 8 > len(data):
                 return (4, "sop1_truncated", f"{op_name} <truncated>", "Incomplete SOP1 literal")
@@ -1136,8 +1150,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             src0_str = f"0x{literal:x}"
             length = 8
         else:
-            src0_str = decode_s_reg(ssrc0)
-        asm = f"{op_name} {decode_s_reg(sdst)}, {src0_str}"
+            src0_str = decode_s_reg64(ssrc0) if is_64 else decode_s_reg(ssrc0)
+        sdst_str = decode_s_reg64(sdst) if is_64 else decode_s_reg(sdst)
+        asm = f"{op_name} {sdst_str}, {src0_str}"
         return (length, op_name, asm, comment)
 
     # SOPC: [31:23] == 0b101111110 (0xbf000000)
@@ -1200,9 +1215,13 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 return (4, "sop2_truncated", f"{op_name} <truncated>", "Incomplete SOP2 literal")
             literal, = struct.unpack_from("<I", data, offset + 4)
             length = 8
-        src0_str = f"0x{literal:x}" if ssrc0 == 255 and literal is not None else decode_s_reg(ssrc0)
-        src1_str = f"0x{literal:x}" if ssrc1 == 255 and literal is not None else decode_s_reg(ssrc1)
-        asm = f"{op_name} {decode_s_reg(sdst)}, {src0_str}, {src1_str}"
+        is_64 = op_name.endswith(("_b64", "_u64", "_i64"))
+        src0_wide = is_64 and not op_name.startswith("s_bfm_")
+        src0_str = f"0x{literal:x}" if ssrc0 == 255 and literal is not None else (decode_s_reg64(ssrc0) if src0_wide else decode_s_reg(ssrc0))
+        src1_wide = is_64 and not op_name.startswith(("s_lshl_", "s_lshr_", "s_ashr_", "s_bfe_", "s_bfm_"))
+        src1_str = f"0x{literal:x}" if ssrc1 == 255 and literal is not None else (decode_s_reg64(ssrc1) if src1_wide else decode_s_reg(ssrc1))
+        sdst_str = decode_s_reg64(sdst) if is_64 else decode_s_reg(sdst)
+        asm = f"{op_name} {sdst_str}, {src0_str}, {src1_str}"
         return (length, op_name, asm, comment)
 
     # 5. VOP1: [31:25] == 0b0111111 (0x7e000000)
@@ -1228,6 +1247,11 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         else:
             src0_str = decode_v_reg(src0)
         dst_str = f"v[{vdst}:{vdst + 1}]" if wide_dst and vdst < 255 else (f"<invalid VGPR pair>" if wide_dst else f"v{vdst}")
+        if op_name == "v_readfirstlane_b32":
+            # This VOP1 instruction writes an SGPR: its vdst field is an SGPR
+            # number even though the mnemonic starts with "v_". LLVM 21 for
+            # gfx1013 prints s2 for the encoding 0005047e.
+            dst_str = decode_s_reg(vdst)
         if op_name == "v_nop":
             asm = "v_nop"
         else:
@@ -1462,35 +1486,41 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if not is_3src and (src2 != 0 or ((w0 >> 10) & 1) or ((w0 >> 13) & 1) or ((w1 >> 31) & 1)):
             return (length, f"{op_name}_unsupported", f"{op_name} <unsupported_reserved_bits>", "Reserved bitfields set in 2-source VOP3P encoding")
 
-        def vop3p_operand(reg_id: int) -> str:
-            if reg_id == 255 and literal is not None:
-                return f"0x{literal:x}"
-            return decode_v_reg(reg_id)
+        is_fma_mix = op_name.startswith("v_fma_mix")
 
-        if is_3src:
-            asm = f"{op_name} v{vdst}, {vop3p_operand(src0)}, {vop3p_operand(src1)}, {vop3p_operand(src2)}"
-            op_sel = [(w0 >> 11) & 1, (w0 >> 12) & 1, (w0 >> 13) & 1]
-            op_sel_hi = [(w1 >> 27) & 1, (w1 >> 28) & 1, (w0 >> 14) & 1]
-            neg_lo = [(w1 >> 29) & 1, (w1 >> 30) & 1, (w1 >> 31) & 1]
-            neg_hi = [(w0 >> 8) & 1, (w0 >> 9) & 1, (w0 >> 10) & 1]
+        def vop3p_operand(reg_id: int, is_abs: int = 0, is_neg: int = 0) -> str:
+            if reg_id == 255 and literal is not None:
+                val = f"0x{literal:x}"
+            else:
+                val = decode_v_reg(reg_id)
+            return _format_operand_modifiers(val, is_abs, is_neg)
+
+        op_sel = [(w0 >> 11) & 1, (w0 >> 12) & 1, (w0 >> 13) & 1][:arity]
+        op_sel_hi = [(w1 >> 27) & 1, (w1 >> 28) & 1, (w0 >> 14) & 1][:arity]
+        neg_lo = [(w1 >> 29) & 1, (w1 >> 30) & 1, (w1 >> 31) & 1][:arity]
+        neg_hi = [(w0 >> 8) & 1, (w0 >> 9) & 1, (w0 >> 10) & 1][:arity]
+
+        if is_fma_mix:
+            # Mixed-precision FMA repurposes VOP3P w0[10:8] as abs and w1[31:29] as neg.
+            abs_bits = neg_hi
+            neg_bits = neg_lo
+            neg_lo = []
+            neg_hi = []
         else:
-            asm = f"{op_name} v{vdst}, {vop3p_operand(src0)}, {vop3p_operand(src1)}"
-            op_sel = [(w0 >> 11) & 1, (w0 >> 12) & 1]
-            op_sel_hi = [(w1 >> 27) & 1, (w1 >> 28) & 1]
-            neg_lo = [(w1 >> 29) & 1, (w1 >> 30) & 1]
-            neg_hi = [(w0 >> 8) & 1, (w0 >> 9) & 1]
+            abs_bits = [0] * arity
+            neg_bits = [0] * arity
+
+        raw_srcs = [src0, src1, src2][:arity]
+        src_strs = [vop3p_operand(raw_srcs[i], abs_bits[i], neg_bits[i]) for i in range(arity)]
+        asm = f"{op_name} v{vdst}, {', '.join(src_strs)}"
 
         # Architectural defaults:
         # Standard packed instructions (v_pk_*, v_dot*): default op_sel is all 0, op_sel_hi is all 1, neg_lo/neg_hi all 0.
         # Mixed-precision FMA (v_fma_mix*): default op_sel and op_sel_hi are all 0 (f32, low half).
-        if op_name.startswith("v_fma_mix"):
-            default_op_sel = [0] * arity
-            default_op_sel_hi = [0] * arity
-        else:
-            default_op_sel = [0] * arity
-            default_op_sel_hi = [1] * arity
-        default_neg_lo = [0] * arity
-        default_neg_hi = [0] * arity
+        default_op_sel = [0] * arity
+        default_op_sel_hi = [0 if is_fma_mix else 1] * arity
+        default_neg_lo = [0] * len(neg_lo)
+        default_neg_hi = [0] * len(neg_hi)
 
         if op_sel != default_op_sel:
             asm += f" op_sel:[{','.join(str(b) for b in op_sel)}]"
@@ -1649,6 +1679,16 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             dst_width = 1
             src_widths = (1, 1, 1)
 
+        if op_name == "v_readfirstlane_b32":
+            # gfx1013 assembles this operation only as the 32-bit VOP1: llvm-mc
+            # rejects the e64 spelling and reports this VOP3A word as an invalid
+            # instruction encoding.  Report a distinct unsupported-encoding
+            # record instead of a lowerable instruction, and keep the eight-byte
+            # record boundary so the next instruction starts at +8.
+            return (8, "v_readfirstlane_b32_unsupported",
+                    "v_readfirstlane_b32 <unsupported VOP3A encoding>",
+                    "VOP3A encoding of v_readfirstlane_b32 is not available on gfx1013")
+
         if op_name == "v_nop":
             return (8, "v_nop", "v_nop", "Vector no-op (VOP3A)")
 
@@ -1677,13 +1717,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 val = decode_v_reg64(reg_id)
             else:
                 val = decode_v_reg(reg_id)
-            if is_abs and is_neg:
-                return f"-|{val}|"
-            if is_abs:
-                return f"|{val}|"
-            if is_neg:
-                return f"-{val}"
-            return val
+            return _format_operand_modifiers(val, is_abs, is_neg)
 
         raw_srcs = [src0, src1, src2][:arity]
         src_strs = [vop3_operand(raw_srcs[i], abs_bits[i], neg[i], src_widths[i]) for i in range(arity)]

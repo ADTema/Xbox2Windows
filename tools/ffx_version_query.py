@@ -25,12 +25,22 @@ STRING_OPS = {
     C.CMPSB_M8_M8: ("cmps", 1), C.CMPSW_M16_M16: ("cmps", 2), C.CMPSD_M32_M32: ("cmps", 4), C.CMPSQ_M64_M64: ("cmps", 8),
 }
 
+# Memory-ordering fences and PAUSE, and the cache hints with one memory operand, by the MSVC intrinsic
+# that emits the same instruction.
+FENCES = {M.LFENCE: "_mm_lfence();", M.MFENCE: "_mm_mfence();", M.SFENCE: "_mm_sfence();", M.PAUSE: "_mm_pause();"}
+CACHE_HINTS = {
+    M.PREFETCHT0: "prefetch_t0", M.PREFETCHT1: "prefetch_t1", M.PREFETCHT2: "prefetch_t2",
+    M.PREFETCHNTA: "prefetch_nta", M.PREFETCH: "prefetch_amd", M.PREFETCHW: "_m_prefetchw",
+    M.CLFLUSH: "_mm_clflush", M.CLFLUSHOPT: "_mm_clflushopt", M.CLWB: "_mm_clwb",
+}
+
 INTEGER_HEADER = """#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <intrin.h>
 #include <emmintrin.h>
+#include <immintrin.h>
 using std::memcpy;
 using std::memset;
 using word = uint64_t;
@@ -38,6 +48,11 @@ static_assert(sizeof(void*) == sizeof(word));
 template<class T> T load(word address) {
     T v; memcpy(&v, reinterpret_cast<const void*>(address), sizeof v); return v;
 }
+static inline void prefetch_t0(const char* p) { _mm_prefetch(p, _MM_HINT_T0); }
+static inline void prefetch_t1(const char* p) { _mm_prefetch(p, _MM_HINT_T1); }
+static inline void prefetch_t2(const char* p) { _mm_prefetch(p, _MM_HINT_T2); }
+static inline void prefetch_nta(const char* p) { _mm_prefetch(p, _MM_HINT_NTA); }
+static inline void prefetch_amd(const char* p) { _m_prefetch(const_cast<char*>(p)); }
 template<class T> T load_always(word address) {
     T v;
     const volatile auto* p = reinterpret_cast<const volatile uint8_t*>(address);
@@ -165,6 +180,97 @@ template<class F, class U> static F fma_x86(F s0, F s1, F s2, int order, bool ne
     if (std::isnan(c)) return quiet_nan<F, U>(c);
     return std::fma(neg_p ? -a : a, b, neg_c ? -c : c);
 }
+struct PcmpResult {
+    uint16_t mask;
+    uint32_t index;
+    bool carry;
+    bool zero;
+    bool overflow;
+};
+static inline uint32_t pcmp_explicit_len(int32_t raw, uint32_t limit) {
+    const uint32_t mag = raw < 0 ? (0u - static_cast<uint32_t>(raw)) : static_cast<uint32_t>(raw);
+    return mag < limit ? mag : limit;
+}
+static inline int32_t pcmp_elem(const uint8_t p[16], uint32_t idx, bool is_word, bool is_signed) {
+    if (is_word) {
+        uint16_t u;
+        memcpy(&u, p + idx * 2u, 2);
+        return is_signed ? int32_t(static_cast<int16_t>(u)) : int32_t(u);
+    }
+    return is_signed ? int32_t(static_cast<int8_t>(p[idx])) : int32_t(p[idx]);
+}
+static inline PcmpResult pcmp_str(const uint8_t a[16], const uint8_t b[16],
+                                  uint8_t imm, bool is_explicit, int32_t raw_la, int32_t raw_lb) {
+    const bool is_word = (imm & 1u) != 0;
+    const bool is_signed = (imm & 2u) != 0;
+    const uint32_t limit = is_word ? 8u : 16u;
+    const uint32_t agg = (imm >> 2) & 3u;
+    const uint32_t pol = (imm >> 4) & 3u;
+    const bool high_sel = (imm & 0x40u) != 0;
+    uint32_t len1 = 0, len2 = 0;
+    if (is_explicit) {
+        len1 = pcmp_explicit_len(raw_la, limit);
+        len2 = pcmp_explicit_len(raw_lb, limit);
+    } else {
+        while (len1 < limit && pcmp_elem(a, len1, is_word, is_signed) != 0) ++len1;
+        while (len2 < limit && pcmp_elem(b, len2, is_word, is_signed) != 0) ++len2;
+    }
+    uint16_t int_res1 = 0;
+    for (uint32_t i = 0; i < limit; ++i) {
+        bool bit = false;
+        if (agg == 0u) {
+            if (i < len2) {
+                const int32_t bv = pcmp_elem(b, i, is_word, is_signed);
+                for (uint32_t j = 0; j < len1; ++j) {
+                    if (pcmp_elem(a, j, is_word, is_signed) == bv) { bit = true; break; }
+                }
+            }
+        } else if (agg == 1u) {
+            if (i < len2) {
+                const int32_t bv = pcmp_elem(b, i, is_word, is_signed);
+                for (uint32_t j = 0; j + 1u < len1; j += 2u) {
+                    if (bv >= pcmp_elem(a, j, is_word, is_signed) &&
+                        bv <= pcmp_elem(a, j + 1u, is_word, is_signed)) { bit = true; break; }
+                }
+            }
+        } else if (agg == 2u) {
+            if (i < len1 && i < len2) bit = pcmp_elem(a, i, is_word, is_signed) == pcmp_elem(b, i, is_word, is_signed);
+            else if (i >= len1 && i >= len2) bit = true;
+        } else {
+            bit = true;
+            for (uint32_t j = 0; j < len1 && i + j < limit; ++j) {
+                if (i + j >= len2 || pcmp_elem(a, j, is_word, is_signed) != pcmp_elem(b, i + j, is_word, is_signed)) {
+                    bit = false;
+                    break;
+                }
+            }
+        }
+        if (bit) int_res1 = static_cast<uint16_t>(int_res1 | (1u << i));
+    }
+    const uint16_t all_mask = static_cast<uint16_t>((1u << limit) - 1u);
+    uint16_t int_res2 = int_res1;
+    if (pol == 1u) int_res2 = static_cast<uint16_t>(int_res1 ^ all_mask);
+    else if (pol == 3u) int_res2 = static_cast<uint16_t>(int_res1 ^ static_cast<uint16_t>((1u << len2) - 1u));
+    uint32_t index = limit;
+    if (int_res2 != 0u) {
+        if (!high_sel) { index = 0u; while (((int_res2 >> index) & 1u) == 0u) ++index; }
+        else { index = limit - 1u; while (((int_res2 >> index) & 1u) == 0u) --index; }
+    }
+    return {int_res2, index, int_res2 != 0u, len2 < limit, (int_res2 & 1u) != 0u};
+}
+static inline void pcmp_write_mask(uint8_t out[16], uint16_t mask, uint8_t imm) {
+    memset(out, 0, 16);
+    if ((imm & 0x40u) == 0u) {
+        memcpy(out, &mask, 2);
+    } else if ((imm & 1u) == 0u) {
+        for (uint32_t k = 0; k < 16u; ++k) out[k] = ((mask >> k) & 1u) ? 0xffu : 0x00u;
+    } else {
+        for (uint32_t k = 0; k < 8u; ++k) {
+            const uint16_t v = ((mask >> k) & 1u) ? 0xffffu : 0x0000u;
+            memcpy(out + 2u * k, &v, 2);
+        }
+    }
+}
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
 
@@ -263,6 +369,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         M.PEXTRB, M.PEXTRW, M.PEXTRD, M.PEXTRQ,
         M.PINSRB, M.PINSRW, M.PINSRD, M.PINSRQ,
         M.PMADDUBSW, M.PMULHRSW, M.PHMINPOSUW, M.PTEST, M.MPSADBW, M.PCMPGTQ,
+        M.PCMPESTRI, M.PCMPESTRM, M.PCMPISTRI, M.PCMPISTRM,
     }
     has_wide |= any(i.mnemonic in sse41_42_misc_ops for i in body)
     ssse3_ops = {
@@ -293,6 +400,58 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         M.VPSLLDQ, M.VPUNPCKHQDQ, M.VPUNPCKLQDQ,
     }
     has_wide |= any(i.mnemonic in shuffle_ops for i in body)
+    packed_float_ops = {
+        M.ADDPS: ("ps", "_mm_add_ps", False), M.SUBPS: ("ps", "_mm_sub_ps", False), M.MULPS: ("ps", "_mm_mul_ps", False),
+        M.DIVPS: ("ps", "_mm_div_ps", False), M.MAXPS: ("ps", "_mm_max_ps", False), M.MINPS: ("ps", "_mm_min_ps", False),
+        M.ANDPS: ("ps", "_mm_and_ps", False), M.ANDNPS: ("ps", "_mm_andnot_ps", False), M.ORPS: ("ps", "_mm_or_ps", False),
+        M.XORPS: ("ps", "_mm_xor_ps", False), M.SQRTPS: ("sqrt_ps", "_mm_sqrt_ps", False),
+        M.MAXSS: ("ss", "_mm_max_ss", False), M.MINSS: ("ss", "_mm_min_ss", False), M.SQRTSS: ("sqrt_ss", "_mm_sqrt_ss", False),
+        M.ADDPD: ("pd", "_mm_add_pd", False), M.SUBPD: ("pd", "_mm_sub_pd", False), M.MULPD: ("pd", "_mm_mul_pd", False),
+        M.DIVPD: ("pd", "_mm_div_pd", False), M.MAXPD: ("pd", "_mm_max_pd", False), M.MINPD: ("pd", "_mm_min_pd", False),
+        M.ANDPD: ("pd", "_mm_and_pd", False), M.ANDNPD: ("pd", "_mm_andnot_pd", False), M.ORPD: ("pd", "_mm_or_pd", False),
+        M.XORPD: ("pd", "_mm_xor_pd", False), M.SQRTPD: ("sqrt_pd", "_mm_sqrt_pd", False),
+        M.MAXSD: ("sd", "_mm_max_sd", False), M.MINSD: ("sd", "_mm_min_sd", False), M.SQRTSD: ("sqrt_sd", "_mm_sqrt_sd", False),
+        M.VADDPS: ("ps", "_mm_add_ps", True), M.VSUBPS: ("ps", "_mm_sub_ps", True), M.VMULPS: ("ps", "_mm_mul_ps", True),
+        M.VDIVPS: ("ps", "_mm_div_ps", True), M.VMAXPS: ("ps", "_mm_max_ps", True), M.VMINPS: ("ps", "_mm_min_ps", True),
+        M.VANDPS: ("ps", "_mm_and_ps", True), M.VANDNPS: ("ps", "_mm_andnot_ps", True), M.VORPS: ("ps", "_mm_or_ps", True),
+        M.VXORPS: ("ps", "_mm_xor_ps", True), M.VSQRTPS: ("sqrt_ps", "_mm_sqrt_ps", True),
+        M.VADDPD: ("pd", "_mm_add_pd", True), M.VSUBPD: ("pd", "_mm_sub_pd", True), M.VMULPD: ("pd", "_mm_mul_pd", True),
+        M.VDIVPD: ("pd", "_mm_div_pd", True), M.VMAXPD: ("pd", "_mm_max_pd", True), M.VMINPD: ("pd", "_mm_min_pd", True),
+        M.VANDPD: ("pd", "_mm_and_pd", True), M.VANDNPD: ("pd", "_mm_andnot_pd", True), M.VORPD: ("pd", "_mm_or_pd", True),
+        M.VXORPD: ("pd", "_mm_xor_pd", True), M.VSQRTPD: ("sqrt_pd", "_mm_sqrt_pd", True),
+        M.VMAXSS: ("ss", "_mm_max_ss", True), M.VMINSS: ("ss", "_mm_min_ss", True), M.VSQRTSS: ("sqrt_ss", "_mm_sqrt_ss", True),
+        M.VMAXSD: ("sd", "_mm_max_sd", True), M.VMINSD: ("sd", "_mm_min_sd", True), M.VSQRTSD: ("sqrt_sd", "_mm_sqrt_sd", True),
+    }
+    has_wide |= any(i.mnemonic in packed_float_ops for i in body)
+    conversion_ops = {
+        M.CVTDQ2PS: ("packed", "_mm_cvtepi32_ps", "__m128i", "__m128", False),
+        M.VCVTDQ2PS: ("packed", "_mm_cvtepi32_ps", "__m128i", "__m128", True),
+        M.CVTDQ2PD: ("packed", "_mm_cvtepi32_pd", "__m128i", "__m128d", False),
+        M.VCVTDQ2PD: ("packed", "_mm_cvtepi32_pd", "__m128i", "__m128d", True),
+        M.CVTPS2DQ: ("packed", "_mm_cvtps_epi32", "__m128", "__m128i", False),
+        M.VCVTPS2DQ: ("packed", "_mm_cvtps_epi32", "__m128", "__m128i", True),
+        M.CVTTPS2DQ: ("packed", "_mm_cvttps_epi32", "__m128", "__m128i", False),
+        M.VCVTTPS2DQ: ("packed", "_mm_cvttps_epi32", "__m128", "__m128i", True),
+        M.CVTPS2PD: ("packed", "_mm_cvtps_pd", "__m128", "__m128d", False),
+        M.VCVTPS2PD: ("packed", "_mm_cvtps_pd", "__m128", "__m128d", True),
+        M.CVTPD2PS: ("packed", "_mm_cvtpd_ps", "__m128d", "__m128", False),
+        M.VCVTPD2PS: ("packed", "_mm_cvtpd_ps", "__m128d", "__m128", True),
+        M.CVTPD2DQ: ("packed", "_mm_cvtpd_epi32", "__m128d", "__m128i", False),
+        M.VCVTPD2DQ: ("packed", "_mm_cvtpd_epi32", "__m128d", "__m128i", True),
+        M.CVTTPD2DQ: ("packed", "_mm_cvttpd_epi32", "__m128d", "__m128i", False),
+        M.VCVTTPD2DQ: ("packed", "_mm_cvttpd_epi32", "__m128d", "__m128i", True),
+        M.VCVTPH2PS: ("packed", "_mm_cvtph_ps", "__m128i", "__m128", True),
+        M.VCVTPS2PH: ("f16c_pack", "_mm_cvtps_ph", True),
+        M.CVTSS2SD: ("ss2sd", False), M.VCVTSS2SD: ("ss2sd", True),
+        M.CVTSD2SS: ("sd2ss", False), M.VCVTSD2SS: ("sd2ss", True),
+        M.CVTSI2SS: ("si2ss", False), M.VCVTSI2SS: ("si2ss", True),
+        M.CVTSI2SD: ("si2sd", False), M.VCVTSI2SD: ("si2sd", True),
+        M.CVTSS2SI: ("xmm2gpr", False, False, False), M.VCVTSS2SI: ("xmm2gpr", False, False, True),
+        M.CVTTSS2SI: ("xmm2gpr", True, False, False), M.VCVTTSS2SI: ("xmm2gpr", True, False, True),
+        M.CVTSD2SI: ("xmm2gpr", False, True, False), M.VCVTSD2SI: ("xmm2gpr", False, True, True),
+        M.CVTTSD2SI: ("xmm2gpr", True, True, False), M.VCVTTSD2SI: ("xmm2gpr", True, True, True),
+    }
+    has_wide |= any(i.mnemonic in conversion_ops for i in body)
     has_wide |= any(i.mnemonic == M.VMOVDQU and
                     (i.op0_register in wide or i.op1_register in wide) for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
@@ -371,6 +530,12 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = "direction = false;"
         elif op == M.STD:
             stmt = "direction = true;"
+        elif op in FENCES:
+            # The intrinsics also keep the compiler from moving loads and stores across them.
+            stmt = FENCES[op]
+        elif op in CACHE_HINTS:
+            # Prefetches never fault; the flushes fault like a one-byte load of the same address.
+            stmt = f"{CACHE_HINTS[op]}(reinterpret_cast<const char*>({address()}));"
         elif op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP):
             target = i.near_branch_target
             if target not in allowed:
@@ -452,6 +617,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = "rax = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(rax)));"
         elif op == M.CQO:
             stmt = "rdx = static_cast<uint64_t>(static_cast<int64_t>(rax) >> 63);"
+        elif op == M.RDTSC:
+            # The host time-stamp counter, passed through unscaled: EDX:EAX, upper halves zeroed, flags kept.
+            # The volatile result keeps the read when the guest overwrites it; without it /O2 removes the read.
+            stmt = "{ const volatile uint64_t tsc = __rdtsc(); rax = static_cast<uint32_t>(tsc); rdx = tsc >> 32; }"
+        elif op == M.RDTSCP:
+            stmt = ("{ unsigned int aux; const volatile uint64_t tsc = __rdtscp(&aux); "
+                    "rax = static_cast<uint32_t>(tsc); rdx = tsc >> 32; rcx = aux; }")
         elif op in (M.SHL, M.SHR, M.SAR) and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
             size = RegisterExt.size(i.op0_register)
             bits = 8 * size
@@ -1168,6 +1340,22 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+=8) {{ "
                         f"int64_t a, b; memcpy(&a, {dst}.data()+n, 8); memcpy(&b, rhs.data()+n, 8); "
                         f"const uint64_t v = a > b ? ~0ull : 0ull; memcpy({dst}.data()+n, &v, 8); }} }}")
+        elif op in (M.PCMPESTRI, M.PCMPESTRM, M.PCMPISTRI, M.PCMPISTRM) and has_wide:
+            if (i.encoding != EncodingKind.LEGACY or i.op_count != 3
+                    or i.op0_kind != K.REGISTER or i.op0_register not in wide_xmm
+                    or i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm
+                    or i.op2_kind != K.IMMEDIATE8):
+                raise ValueError(f"unsupported packed string compare form at {i.ip:#x}: {i}")
+            src1, src2 = wide_xmm[i.op0_register], wide_xmm[i.op1_register]
+            imm = i.immediate(2) & 0xff
+            is_explicit = "true" if op in (M.PCMPESTRI, M.PCMPESTRM) else "false"
+            is_mask = op in (M.PCMPESTRM, M.PCMPISTRM)
+            out_stmt = (f"pcmp_write_mask(wide0.data(), r.mask, {imm}u);" if is_mask
+                        else "rcx = static_cast<uint64_t>(r.index);")
+            parity_stmt = " parity = false;" if parity else ""
+            stmt = (f"{{ const PcmpResult r = pcmp_str({src1}.data(), {src2}.data(), {imm}u, {is_explicit}, "
+                    f"static_cast<int32_t>(rax), static_cast<int32_t>(rdx)); "
+                    f"{out_stmt} carry = r.carry; zero = r.zero; overflow = r.overflow;{parity_stmt} }}")
         elif i.encoding == EncodingKind.LEGACY and i.op0_register in wide_xmm and op in ssse3_ops:
             if i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm:
                 raise ValueError(f"unsupported SSSE3 source at {i.ip:#x}: {i}")
@@ -1474,6 +1662,152 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                     f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), res.size()); "
                     f"memcpy(res.data(), &r, sizeof(float)); memcpy({dst}.data(), res.data(), res.size()); "
                     f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+        elif op in packed_float_ops:
+            kind, fn, is_vex = packed_float_ops[op]
+            expected_encoding = EncodingKind.VEX if is_vex else EncodingKind.LEGACY
+            expected_ops = 2 if (kind in ("sqrt_ps", "sqrt_pd") or not is_vex) else 3
+            if (i.encoding != expected_encoding or
+                i.op_count != expected_ops or
+                any(i.op_kind(n) != K.REGISTER or i.op_register(n) not in wide_xmm
+                    for n in range(i.op_count))):
+                raise ValueError(f"unsupported float packed operation at {i.ip:#x}: {i}")
+            dst = wide_xmm[i.op0_register]
+            if kind == "sqrt_ps":
+                src = wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128 s; memcpy(&s, {src}.data(), sizeof s); const __m128 r = {fn}(s); "
+                        f"memcpy({dst}.data(), &r, sizeof r); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind == "sqrt_pd":
+                src = wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128d s; memcpy(&s, {src}.data(), sizeof s); const __m128d r = {fn}(s); "
+                        f"memcpy({dst}.data(), &r, sizeof r); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind == "sqrt_ss":
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128 s; memcpy(&s, {src2}.data(), sizeof s); const __m128 r = {fn}(s); "
+                        f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), res.size()); "
+                        f"memcpy(res.data(), &r, sizeof(float)); memcpy({dst}.data(), res.data(), res.size()); "
+                        f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind == "sqrt_sd":
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128d s; memcpy(&s, {src2}.data(), sizeof s); const __m128d r = {fn}(s, s); "
+                        f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), res.size()); "
+                        f"memcpy(res.data(), &r, sizeof(double)); memcpy({dst}.data(), res.data(), res.size()); "
+                        f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind in ("ps", "ss"):
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128 a, b; memcpy(&a, {src1}.data(), sizeof a); memcpy(&b, {src2}.data(), sizeof b); "
+                        f"const __m128 r = {fn}(a, b); memcpy({dst}.data(), &r, sizeof r); "
+                        f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            else:
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128d a, b; memcpy(&a, {src1}.data(), sizeof a); memcpy(&b, {src2}.data(), sizeof b); "
+                        f"const __m128d r = {fn}(a, b); memcpy({dst}.data(), &r, sizeof r); "
+                        f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+        elif op in conversion_ops:
+            entry = conversion_ops[op]
+            kind = entry[0]
+            is_vex = entry[-1]
+            expected_encoding = EncodingKind.VEX if is_vex else EncodingKind.LEGACY
+            if i.encoding != expected_encoding:
+                raise ValueError(f"unsupported conversion encoding at {i.ip:#x}: {i}")
+            if kind == "packed":
+                if (i.op_count != 2 or
+                    i.op0_kind != K.REGISTER or i.op1_kind != K.REGISTER or
+                    i.op0_register not in wide_xmm or i.op1_register not in wide_xmm):
+                    raise ValueError(f"unsupported packed conversion at {i.ip:#x}: {i}")
+                _, fn, in_type, out_type, _ = entry
+                dst, src = wide_xmm[i.op0_register], wide_xmm[i.op1_register]
+                stmt = (f"{{ {in_type} s; memcpy(&s, {src}.data(), 16); const {out_type} r = {fn}(s); "
+                        f"memcpy({dst}.data(), &r, 16); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind == "f16c_pack":
+                if (i.op_count != 3 or
+                    i.op0_kind != K.REGISTER or i.op1_kind != K.REGISTER or
+                    i.op0_register not in wide_xmm or i.op1_register not in wide_xmm or
+                    i.op2_kind != K.IMMEDIATE8 or i.immediate8 != 0):
+                    raise ValueError(f"unsupported f16c pack at {i.ip:#x}: {i}")
+                dst, src = wide_xmm[i.op0_register], wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128 s; memcpy(&s, {src}.data(), 16); const __m128i r = _mm_cvtps_ph(s, 0); "
+                        f"std::array<uint8_t, 16> res{{}}; memcpy(res.data(), &r, 8); memcpy({dst}.data(), res.data(), 16); "
+                        f"memset({dst}.data()+16, 0, 16); }}")
+            elif kind == "ss2sd":
+                expected_ops = 3 if is_vex else 2
+                if (i.op_count != expected_ops or
+                    any(i.op_kind(n) != K.REGISTER or i.op_register(n) not in wide_xmm for n in range(i.op_count))):
+                    raise ValueError(f"unsupported ss2sd at {i.ip:#x}: {i}")
+                dst = wide_xmm[i.op0_register]
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128 s; memcpy(&s, {src2}.data(), sizeof s); const __m128d r = _mm_cvtss_sd(_mm_setzero_pd(), s); "
+                        f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), 16); memcpy(res.data(), &r, 8); "
+                        f"memcpy({dst}.data(), res.data(), 16); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind == "sd2ss":
+                expected_ops = 3 if is_vex else 2
+                if (i.op_count != expected_ops or
+                    any(i.op_kind(n) != K.REGISTER or i.op_register(n) not in wide_xmm for n in range(i.op_count))):
+                    raise ValueError(f"unsupported sd2ss at {i.ip:#x}: {i}")
+                dst = wide_xmm[i.op0_register]
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                src2 = wide_xmm[i.op2_register] if is_vex else wide_xmm[i.op1_register]
+                stmt = (f"{{ __m128d s; memcpy(&s, {src2}.data(), sizeof s); const __m128 r = _mm_cvtsd_ss(_mm_setzero_ps(), s); "
+                        f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), 16); memcpy(res.data(), &r, 4); "
+                        f"memcpy({dst}.data(), res.data(), 16); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind == "si2ss":
+                expected_ops = 3 if is_vex else 2
+                gpr_op = 2 if is_vex else 1
+                if (i.op_count != expected_ops or
+                    i.op0_kind != K.REGISTER or i.op0_register not in wide_xmm or
+                    (is_vex and (i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm)) or
+                    i.op_kind(gpr_op) != K.REGISTER or
+                    RegisterExt.full_register(i.op_register(gpr_op)) not in REGS or
+                    RegisterExt.size(i.op_register(gpr_op)) not in (4, 8)):
+                    raise ValueError(f"unsupported si2ss at {i.ip:#x}: {i}")
+                gpr_reg = reg(i.op_register(gpr_op))
+                gpr_size = RegisterExt.size(i.op_register(gpr_op))
+                fn = "_mm_cvtsi64_ss" if gpr_size == 8 else "_mm_cvtsi32_ss"
+                cast_type = "int64_t" if gpr_size == 8 else "int32_t"
+                dst = wide_xmm[i.op0_register]
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                stmt = (f"{{ const __m128 r = {fn}(_mm_setzero_ps(), static_cast<{cast_type}>({gpr_reg})); "
+                        f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), 16); memcpy(res.data(), &r, 4); "
+                        f"memcpy({dst}.data(), res.data(), 16); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            elif kind == "si2sd":
+                expected_ops = 3 if is_vex else 2
+                gpr_op = 2 if is_vex else 1
+                if (i.op_count != expected_ops or
+                    i.op0_kind != K.REGISTER or i.op0_register not in wide_xmm or
+                    (is_vex and (i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm)) or
+                    i.op_kind(gpr_op) != K.REGISTER or
+                    RegisterExt.full_register(i.op_register(gpr_op)) not in REGS or
+                    RegisterExt.size(i.op_register(gpr_op)) not in (4, 8)):
+                    raise ValueError(f"unsupported si2sd at {i.ip:#x}: {i}")
+                gpr_reg = reg(i.op_register(gpr_op))
+                gpr_size = RegisterExt.size(i.op_register(gpr_op))
+                fn = "_mm_cvtsi64_sd" if gpr_size == 8 else "_mm_cvtsi32_sd"
+                cast_type = "int64_t" if gpr_size == 8 else "int32_t"
+                dst = wide_xmm[i.op0_register]
+                src1 = wide_xmm[i.op1_register] if is_vex else wide_xmm[i.op0_register]
+                stmt = (f"{{ const __m128d r = {fn}(_mm_setzero_pd(), static_cast<{cast_type}>({gpr_reg})); "
+                        f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), 16); memcpy(res.data(), &r, 8); "
+                        f"memcpy({dst}.data(), res.data(), 16); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+            else:
+                if (i.op_count != 2 or
+                    i.op0_kind != K.REGISTER or
+                    RegisterExt.full_register(i.op0_register) not in REGS or
+                    RegisterExt.size(i.op0_register) not in (4, 8) or
+                    i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm):
+                    raise ValueError(f"unsupported xmm2gpr at {i.ip:#x}: {i}")
+                _, is_trunc, is_sd, _ = entry
+                gpr_size = RegisterExt.size(i.op0_register)
+                in_type = "__m128d" if is_sd else "__m128"
+                fn_base = "_mm_cvtt" if is_trunc else "_mm_cvt"
+                fn_type = "sd_si" if is_sd else "ss_si"
+                fn_bits = "64" if gpr_size == 8 else "32"
+                fn = f"{fn_base}{fn_type}{fn_bits}"
+                src = wide_xmm[i.op1_register]
+                stmt = f"{{ {in_type} s; memcpy(&s, {src}.data(), sizeof s); {write(f'{fn}(s)')} }}"
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
