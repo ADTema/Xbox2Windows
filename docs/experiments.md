@@ -1055,6 +1055,8 @@ Baseline 128-bit SSE2 packed shifts, packs, unpacks, shuffles, and movemask form
 
 The shared lowering also handles all 36 VEX-encoded packed FMA3 instructions (`vfmadd`/`vfmsub`/`vfnmadd`/`vfnmsub`/`vfmaddsub`/`vfmsubadd` × `132`/`213`/`231` × `ps`/`pd`) in 128-bit and 256-bit forms using single-rounding `std::fmaf`/`std::fma` and rejecting EVEX forms. `cpu_aot_fma_packed` probes CPUID (`OSXSAVE`, `XCR0` YMM state, and leaf 1 ECX bit 12 `FMA`) before invoking the native fixture and exits 77 (capability skip) on unsupported hosts; on FMA3-capable hosts it builds all 44 exports from MASM source (`tests/cpu/fma_packed.asm`), translates them, and compares raw result bits with the native DLL across finite inputs, quiet and signaling NaNs, and pairs or triples with distinct NaN signs and payloads. The NaN result follows the arithmetic operand order for that encoding before any sign change. Extra cases cover 128-bit writes clearing the high YMM half and a 256-bit memory source. Finite-operand cases add a `132` memory form, 128-bit `vfnmadd`, `vfmaddsub` and `pd` forms, a destination that is also the first source, and a `vfmadd132pd` whose single rounding gives -2^-104 where separate rounding gives 0. These comparisons check result bytes under the host's default masked floating-point environment. Run `cmake --build --preset dev --target cpu_fma_packed_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_fma_packed$' -V`.
 
+The shared lowerer accepts register-only VEX.256 `vminps` and `vmaxps` in its existing YMM0–YMM2 storage. With masked SIMD exceptions it uses two ordered host 128-bit operations, which retain second-operand selection for signed zeros, NaNs and denormals under DAZ. The MASM fixture compares both operand orders lane by lane against an integer bit reference for MXCSR 0x1f80 and 0x1fc0. Memory-source, untracked-register and EVEX forms are rejected. Run `cmake --build --preset dev --target cpu_avx_packed_fp_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_packed_fp$' -V`.
+
 Baseline 128-bit SSE3 and SSE4.1 floating-point forms (`addsubps`, `addsubpd`, `haddps`, `haddpd`, `hsubps`, `hsubpd`, `movddup`, `movsldup`, `movshdup`, `lddqu`, `roundps`, `roundpd`, `roundss`, `roundsd`, `dpps`, `dppd`, `blendps`, `blendpd`, `blendvps`, `blendvpd`, `insertps`, `extractps`) are also lowered for legacy XMM register and memory encodings (and 32-bit GPR/memory destinations for `extractps`) while preserving upper YMM bytes and rejecting 64-bit MMX, VEX, and untracked XMM forms. `cpu_aot_sse34_fp` probes CPUID leaf 1 ECX bits 0 (`SSE3`) and 19 (`SSE4.1`) before invoking the native fixture and exits 77 on hosts without those features; on capable hosts it builds all exports from MASM source (`tests/cpu/sse34_fp.asm`), translates them, verifies bit-exact agreement against both the native DLL and an independent Python IEEE-754 reference (for `dpps`/`dppd` the result must match the native DLL bit-for-bit and lie in the set of pairwise reduction operand orders, because the chosen NaN is vendor-defined when multiple products are NaN) across NaN payloads, signed zeros, denormals, mixed-sign operands, unaligned `lddqu` and narrow memory operands (`movddup` `m64`, `roundss`/`insertps`/`extractps` `m32`, `roundsd` `m64`), all four rounding modes plus MXCSR and precision-suppression immediates, all lane-select immediates for `blendps`/`blendpd`/`insertps`/`extractps`, all 16 `dppd` and 18 representative `dpps` masks, and mutated lifted negative controls that must mismatch, while checking that MMX, VEX, untracked XMM, and `movntdqa` encodings stay rejected. Run `cmake --build --preset dev --target cpu_sse34_fp_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_sse34_fp$' -V`.
 
 Legacy packed m128 sources in this profile require 16-byte alignment. Four source-built misalignment cases use readable storage at +4 and compare the Windows read-access violation and untouched output. LDDQU and the existing narrow memory forms retain their unaligned behavior. The DPPS/DPPD reference checks each enabled lane against the independently computed set of permitted words, with exact native and lifted words and exact zero in all disabled lanes.
@@ -2129,12 +2131,29 @@ or replaces the thread's word, `ds_read_b32` returns it in full, and
 `ds_read_u16` zero-extends the low or high half at offset 0 or 2. This
 footprint has no inter-thread aliasing, so the translator can retain the
 written value as a per-invocation expression. Reads require initialization.
+
+`ds_write_b8` and `ds_write_b16` replace the selected byte or halfword with
+low source bits while preserving the rest of the initialized word.
+`ds_read_u8` zero-extends a byte, and `ds_read_i8` and `ds_read_i16`
+sign-extend their results to 32 bits. Byte offsets are 0 through 3 and
+halfword offsets are 0 or 2. Subword accesses use the same address, LDS
+allocation, full EXEC and immediate wait checks as full-word accesses.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
 mismatch at word 2 (`0x000089ab` expected, `0x0000fff0` observed).
+
+Six subword variants cover all supported offsets. Each compares the updated
+word, the unsigned extraction and the signed extraction, with values on both
+sides of the sign boundary. Two successive partial writes check that the
+second preserves the earlier change. The fixture overwrites the source VGPR
+after the subword write and overwrites the LDS word again before export to
+check that earlier reads retain their values. Each dispatch checks the entire
+320-word UAV, including the untouched tail. Replacing the partial write with a full
+write must mismatch at word 0. Replacing sign extension with zero extension
+must mismatch at word 50, the signed result of lane 16.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check

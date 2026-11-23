@@ -2074,6 +2074,18 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                     f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), res.size()); "
                     f"memcpy(res.data(), &r, sizeof(float)); memcpy({dst}.data(), res.data(), res.size()); "
                     f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+        elif op in (M.VMINPS, M.VMAXPS) and i.op0_register in wide:
+            if (i.encoding != EncodingKind.VEX or i.op_count != 3 or
+                any(i.op_kind(n) != K.REGISTER or i.op_register(n) not in wide for n in range(3))):
+                raise ValueError(f"unsupported 256-bit packed float min/max at {i.ip:#x}: {i}")
+            _, fn, _ = packed_float_ops[op]
+            dst, src1, src2 = (wide[i.op_register(n)] for n in range(3))
+            # The packed operation has independent lanes. Keep instructions in
+            # source order so MINPS/MAXPS return the correct second operand
+            # under DAZ, including signed zero and NaN payload selection.
+            stmt = (f"{{ for (size_t n=0; n<32; n+=16) {{ "
+                    f"__m128 a, b; memcpy(&a, {src1}.data()+n, 16); memcpy(&b, {src2}.data()+n, 16); "
+                    f"const __m128 r = {fn}(a, b); memcpy({dst}.data()+n, &r, 16); }} }}")
         elif op in packed_float_ops:
             kind, fn, is_vex = packed_float_ops[op]
             expected_encoding = EncodingKind.VEX if is_vex else EncodingKind.LEGACY
