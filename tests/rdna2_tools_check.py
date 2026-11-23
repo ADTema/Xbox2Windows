@@ -27,6 +27,7 @@ from scan_unsupported_shaders import (
     generate_progress_dashboard,
     disassemble_binary_shader,
     make_failed_shader_record,
+    KNOWN_RDNA2_BASE_OPCODES,
 )
 try:
     from pixel_aot import disassemble as llvm_disassemble
@@ -2420,6 +2421,22 @@ class TestRdna2Scanner(unittest.TestCase):
         result = analyze_shader_instructions("sopk_wait", decoded)
         self.assertEqual((result["supported_instructions"], result["unsupported_count"]), (4, 0))
         result = analyze_shader_instructions("sopk_wait_sgpr", ["s_waitcnt_vmcnt s5, 0x1", "s_endpgm"])
+        self.assertEqual(result["unsupported_count"], 1)
+
+    def test_sopk_s_version(self):
+        """s_version with a 16-bit immediate is supported and known; larger, negative and register operands are not."""
+        for operand in ("0x0", "0x1004", "0xffff", "0x00ff", "0", "1", "4100", "9999", "10000", "65535", "59999",
+                        "65000", "65529"):
+            self.assertTrue(is_instruction_supported(f"s_version {operand}"), operand)
+        for operand in ("0x10000", "0xfffff", "65536", "65540", "99999", "100000", "4294967295", "-1", "-0x1",
+                        "s0", "null", "v0", "0, 0", "0x1004 0x1", "007", "0x", "1.0", "abc", ""):
+            self.assertFalse(is_instruction_supported(f"s_version {operand}".rstrip()), operand)
+        self.assertIn("s_version", KNOWN_RDNA2_BASE_OPCODES)
+        decoded = disassemble_binary_shader(bytes.fromhex("041080b0" "000080b0" "ffff80b0" "000081bf"))
+        self.assertEqual(decoded, ["s_version 0x1004", "s_version 0x0", "s_version 0xffff", "s_endpgm"])
+        result = analyze_shader_instructions("s_version", decoded)
+        self.assertEqual((result["supported_instructions"], result["unsupported_count"]), (4, 0))
+        result = analyze_shader_instructions("s_version_wide", ["s_version 0x10000", "s_endpgm"])
         self.assertEqual(result["unsupported_count"], 1)
 
     def test_gfx1013_waitcnt_expcnt_decode_and_lower(self):

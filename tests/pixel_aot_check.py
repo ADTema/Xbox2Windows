@@ -6008,6 +6008,58 @@ def check_sopk_waitcnt(program):
     must_reject(translate, ["s_waitcnt_depctr 0x0"] + program)
 
 
+def s_version_program():
+    """The cmpk/cselect program (SCC, a pending sample and descriptor loads in flight) with s_version markers,
+    one of them after the color export."""
+    program = sopk_cmpk_cmovk()
+    program.insert(program.index("s_cmpk_eq_i32 s47, 0xffff") + 1, "s_version 0x1004")
+    program.insert(program.index("s_cselect_b32 s63, 1, 0"), "s_version 0")
+    program.insert(program.index("image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D") + 1,
+                   "s_version 0xffff")
+    program.insert(len(program) - 1, "s_version 4100")
+    return program
+
+
+def check_s_version():
+    """SOPK s_version K is a marker with no destination that leaves SCC, the pending sample and the loads alone."""
+    plain = sopk_cmpk_cmovk()
+    base = translate_int(plain)
+    export = next(i for i, line in enumerate(plain) if line.startswith("exp "))
+
+    # HLSL temporaries are named after the defining instruction index, so an insertion shifts later names.
+    def renumbered(source):
+        names = {}
+        return re.sub(r"\b(sample|alu|salu|scc)(\d+)\b", lambda m: names.setdefault(m[0], f"{m[1]}#{len(names)}"), source)
+
+    assert re.search(r"\b(?:sample|alu|salu|scc)\d+\b", base), "no renumberable names, the control would be vacuous"
+    for form in ("s_version 0x1004", "s_version 0", "s_version 0x0", "s_version 0xffff", "s_version 65535",
+                 "s_version 4100", "s_version 0x00ff"):
+        # Between every pair of instructions up to the export, including between s_cmpk and s_cselect and
+        # between the image_sample and its wait: the HLSL is the one of the program without the marker.
+        for at in range(export + 1):
+            assert renumbered(translate_int(plain[:at] + [form] + plain[at:])) == renumbered(base), (form, at)
+        # After the color export it is accepted exactly like s_nop, and the output is byte-identical.
+        assert translate_int(plain[:export + 1] + [form] + plain[export + 1:]) == base, form
+        assert translate_int(plain[:export + 1] + ["s_nop 0"] + plain[export + 1:]) == base
+    assert translate_int(plain[:export + 1] + ["s_version 0x1004", "s_nop 0"] + plain[export + 1:]) == base
+    # The marker must not repair state: dropping the wait before the sample is used is still refused.
+    wait = plain.index("s_waitcnt vmcnt(0)")
+    must_reject(translate_int, plain[:wait] + ["s_version 0"] + plain[wait + 1:])
+    # Another instruction after the export is still refused, with or without a marker before it.
+    must_reject(translate_int, plain[:export + 1] + ["s_version 0", "s_mov_b32 s50, 0"] + plain[export + 1:])
+    # The marker also works for the compressed-export and float programs.
+    sampled = assembly(False)
+    assert renumbered(translate(sampled[:-3] + ["s_version 0x1004"] + sampled[-3:])) == renumbered(translate(sampled))
+    # Refusals, with exact messages.
+    for bad in ("s_version 0x10000", "s_version 65536", "s_version 0xfffff", "s_version 4294967295",
+                "s_version -1", "s_version -0x1", "s_version s0", "s_version s5", "s_version null", "s_version v0",
+                "s_version vcc_lo", "s_version 0, 0", "s_version 0 0", "s_version 0x1004, 0x1", "s_version",
+                "s_version ", "s_version 0x", "s_version 1.0", "s_version 007", "s_version abc", "s_version 0X1"):
+        for source in (plain[:export] + [bad], plain[:export + 1] + [bad] + plain[export + 1:]):
+            expect_value_error(translate_int, source, "Invalid s_version operand")
+    assert renumbered(translate_int(s_version_program())) == renumbered(base)
+
+
 def check_controls(directory):
     # A syntactically valid DPP VGPR must already have a tracked numeric value.
     must_reject(translate, with_constants([
@@ -6616,6 +6668,7 @@ def check_controls(directory):
     must_reject(translate, ["s_waitcnt_expcnt null, invalid"] + program)
     must_reject(translate, ["s_waitcnt expcnt(8)"] + program)
     check_sopk_waitcnt(program)
+    check_s_version()
 
     wait = program.index("s_waitcnt vmcnt(0)")
     overwrite = "v_floor_f32_e32 v13, 1.0"
@@ -7244,6 +7297,7 @@ def check_binary(directory, assembler, objcopy, library):
     exp_sync_program = ["s_waitcnt_expcnt null, 0"] + assembly(False)[:-1] + ["s_waitcnt_expcnt null, 0", "s_endpgm"]
     fixtures.append((exp_sync_program, translate))
     fixtures.append((sopk_wait_program(), translate))
+    fixtures.append((s_version_program(), translate_int))
     fixtures.append((with_constants(DOT_BODY), translate, "gfx1030"))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000)), translate))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True)), translate))

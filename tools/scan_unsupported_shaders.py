@@ -65,6 +65,7 @@ WAIT_COUNTER = r"(?:vmcnt\((?:[0-9]|[1-5][0-9]|6[0-3])\)|lgkmcnt\((?:[0-9]|[1-5]
 SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_inst_prefetch\s+.*",
     r"s_nop\s+.*",
+    r"s_version\s+(?:0x0*[0-9a-f]{1,4}|0|[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d\d|655[0-2]\d|6553[0-5])",
     r"v_nop(?:_e64)?",
     r"s_clause\s+(?:0x[0-3]?[0-9a-f]|[0-5]?[0-9]|6[0-3])",
     r"s_setprio\s+(?:0x[0-3]|[0-3])",
@@ -211,7 +212,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_ashr_i32", "s_ashr_i64", "s_mul_i32",
     "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
     # SOPK
-    "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork",
+    "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork", "s_version",
     # VOP1
     "v_nop", "v_mov_b32", "v_swap_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",
