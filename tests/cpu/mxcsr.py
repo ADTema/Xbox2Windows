@@ -220,6 +220,10 @@ def lifted_violation(host, native, lib, label):
     if not page:
         raise OSError(ctypes.get_last_error(), "VirtualAlloc")
     try:
+        state = fresh_state()
+        lib.mxcsr_fault(page, 0x11F80, 0, ctypes.addressof(state))
+        if status(lib, "mxcsr_fault") != MXCSR_STATUS["reserved"]:
+            return f"{label} mxcsr_fault did not record the reserved-bit refusal before the fault control"
         for name in ("mxcsr_badload", "mxcsr_fault"):
             state = fresh_state()
             host.set(CALLER)
@@ -231,6 +235,8 @@ def lifted_violation(host, native, lib, label):
                 return f"{label} {name} returned from an inaccessible load"
             if host.get() != CALLER:
                 return f"{label} {name}: MXCSR {host.get():#x} after the fault ({fault}), expected {CALLER:#x}"
+            if status(lib, name) != 0:
+                return f"{label} {name}: stale refusal status after the fault ({fault})"
     finally:
         kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
         kernel32.VirtualFree(ctypes.c_void_p(page), 0, 0x8000)

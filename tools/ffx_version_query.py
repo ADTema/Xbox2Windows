@@ -373,8 +373,10 @@ def mxcsr_entry(name, inner):
             f'extern "C" __declspec(dllexport) int {name}_status() {{ return {name}_last_status; }}\n'
             f'extern "C" __declspec(dllexport) word {name}(word a, word b, word c, word state) {{\n'
             f"    const unsigned int caller_mxcsr = _mm_getcsr(); word result = 0; int status = 0;\n"
-            f"    __try {{ result = {inner}(a, b, c, state, &status); }} __finally {{ _mm_setcsr(caller_mxcsr); }}\n"
-            f"    {name}_last_status = status;\n"
+            f"    __try {{ result = {inner}(a, b, c, state, &status); }} __finally {{\n"
+            f"        _mm_setcsr(caller_mxcsr);\n"
+            f"        {name}_last_status = status;\n"
+            f"    }}\n"
             f"    return result;\n}}\n")
 
 
