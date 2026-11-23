@@ -5624,6 +5624,15 @@ clamps). Translated and direct HLSL agreed in every case.
 [Measurement](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7097414235),
 [Windows 11 report](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7095165499)
 
+An RDNA 4 adapter repeated the five-clamp sweep at `ps_6_0` with both forms
+reported separately (`0f0c3eb`, Windows 11 build 26300.10075, DXC 1.9.2602.17,
+debug layer unavailable). An RX 9060 XT (32.0.32029.2010) and in-box WARP
+10.0.26100.10068 read mips 1, 2, 2, 2 and 3 at 0.5625, 1.5, 1.5625, 1.75 and
+2.5625, for `MinLod` and for explicit `SampleLevel`. Exactly one mip matched
+all 64 pixels at every clamp, and translated and direct HLSL agreed in every
+case. Neither adapter shows the Windows 10 in-box WARP behavior.
+[RX 9060 XT report](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7111499476)
+
 Mip-linear results (`MIN_MAG_POINT_MIP_LINEAR`, `ps_6_6`, debug layer): WARP
 1.0.22 and the RTX on Windows 10 build 19045 with Agility SDK 1.620.2 and DXC
 1.9.2609; the Radeon and in-box WARP on Windows 11 build 26200.9974 with DXC
@@ -5659,6 +5668,18 @@ shaders matched at every point.
 WARP rounds to the nearest 1/256 with ties to even; the RTX truncates and
 stores step k as `k·256/65535`, which gives the offset of up to 7.6e-6.
 [Half-step sweep](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7095572305)
+
+The RX 9060 XT (32.0.32029.2010) and in-box WARP 10.0.26100.10068 gave the
+WARP 1.0.22 column at `ps_6_0` (`0f0c3eb`, Windows 11 build 26300.10075, DXC
+1.9.2602.17, debug layer unavailable). That sweep had 22 points: 76/256 to
+77/256 in 1/16 steps, 76.5 ± 1/4096, 77 − 1/4096, and the ties at 75.5 and
+77.5. The ties read 76, 76 and 78 on both, 76.50024 already reads 77, and the
+blue words are exact `k/256` values with no RTX-style offset, so this Radeon
+rounds to the nearest 1/256 with ties to even. The raw words are from pixel
+(0, 0), where both shaders and both adapters matched at every point; the
+other 63 pixels are covered by the fixture's 1/128 comparison, not by a
+bit-for-bit one.
+[RX 9060 XT sweep](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7111499476)
 
 ## Quad-local DS swizzle in pixel shaders
 
