@@ -72,6 +72,9 @@ CPU_FIXTURES = {
     "rdrand": "cpu_aot_rdrand",
     "rdseed": "cpu_aot_rdseed",
     "rdrand_harness": None,  # native CPUID and RFLAGS reads
+    "cpuid": "cpu_aot_cpuid",
+    "xgetbv": "cpu_aot_xgetbv",
+    "cpuid_harness": None,  # native CPUID, OSXSAVE and XGETBV reads
     "exe_entry": "cpu_aot_exe_entry",
     "xchg": "cpu_aot_xchg",
     "address_size": "cpu_aot_address_size",
