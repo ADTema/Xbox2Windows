@@ -1378,6 +1378,51 @@ LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING),
 ]
 
 
+LDS_D16_READS = {
+    "ds_read_u8_d16": (1, False, False),
+    "ds_read_u8_d16_hi": (1, False, True),
+    "ds_read_i8_d16": (1, True, False),
+    "ds_read_u16_d16": (2, False, False),
+    "ds_read_u16_d16_hi": (2, False, True),
+}
+LDS_D16_DESTINATIONS = (0xa53172be, 0xe8ba23f1, 0x64c139a7)
+
+
+def lds_d16_offsets(size):
+    return (0, 1, 3) if size == 1 else (0, 2, 0)
+
+
+def lds_d16_program(op):
+    size, _, _ = LDS_D16_READS[op]
+    lines = DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mad_u32_u24 v6, 1, v8, 0x887f80f0",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+    ]
+    for dst, value, offset in zip(range(10, 13), LDS_D16_DESTINATIONS, lds_d16_offsets(size)):
+        suffix = f" offset:{offset}" if offset else ""
+        lines += [f"v_mov_b32_e32 v{dst}, 0x{value:08x}", f"{op} v{dst}, v5{suffix}", "s_waitcnt lgkmcnt(0)"]
+    return lines + ["buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen", "s_endpgm"]
+
+
+def lds_d16_reference(op, groups):
+    size, signed, high = LDS_D16_READS[op]
+    words = []
+    start = 2 if high else 0
+    for lane in range(groups * 32):
+        data = (0x887f80f0 + lane).to_bytes(4, "little")
+        for initial, offset in zip(LDS_D16_DESTINATIONS, lds_d16_offsets(size)):
+            field = int.from_bytes(data[offset:offset + size], "little", signed=signed)
+            result = bytearray(initial.to_bytes(4, "little"))
+            result[start:start + 2] = (field & 0xffff).to_bytes(2, "little")
+            words.append(int.from_bytes(result, "little"))
+    return words
+
+
+LDS_CASES += [(op, lds_d16_program(op), LDS_BINDING) for op in LDS_D16_READS]
+
+
 def lds_subword_reference(width, offset, groups):
     expected = []
     size = width // 8
@@ -1514,6 +1559,23 @@ def lds_controls():
                         variant(lines, (update, f"{update} {modifier}")), 32, **LDS_BINDING)
 
 
+    lines = lds_d16_program("ds_read_u16_d16_hi")
+    read = "ds_read_u16_d16_hi v10, v5"
+    for bad, message in (
+        (read.replace("v10", "v254"), "Unverified D16 destination word"),
+        (read.replace("v10", "v5"), "Unverified D16 destination word"),
+        (read + " offset:1", "Unverified private LDS read"),
+        (read + " offset:4", "Unsupported compute instruction"),
+        (read + " gds", "Unsupported compute instruction"),
+        (read.replace("u16", "b32"), "Unsupported compute instruction"),
+        (read.replace("u16", "i8"), "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (read, bad)), 32, **LDS_BINDING)
+    i = lines.index(read)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+
+
 def ds_binary(directory, assembler, objcopy, library):
     for name, lines, binding in DS_CASES + LDS_CASES:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
@@ -1566,6 +1628,12 @@ def ds_mutants(name, lines, binding, source):
         changed = variant(lines, (f"ds_read_i{width} v12, v5{suffix}", f"ds_read_u{width} v12, v5{suffix}"))
         # Lane 16 is the first to set the sign bit. The signed read is its third word.
         yield aot.lower(changed, 32, **binding), 16 * 3 + 2
+    elif name in LDS_D16_READS:
+        changed = variant(lines, (f"v_mov_b32_e32 v10, 0x{LDS_D16_DESTINATIONS[0]:08x}", "v_mov_b32_e32 v10, 0"))
+        yield aot.lower(changed, 32, **binding), 0
+        if name == "ds_read_i8_d16":
+            changed = variant(lines, ("ds_read_i8_d16 v10, v5", "ds_read_u8_d16 v10, v5"))
+            yield aot.lower(changed, 32, **binding), 0
     elif name == "lds_overlap":
         no_halfword = variant(lines, ("ds_write_b16 v5, v7", "s_nop 0"))
         yield aot.lower(no_halfword, 32, **binding), 1
@@ -1596,6 +1664,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
                 words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
             elif name in LDS_SUBWORDS:
                 words = lds_subword_reference(*LDS_SUBWORDS[name], groups)
+            elif name in LDS_D16_READS:
+                words = lds_d16_reference(name, groups)
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)
             elif private:

@@ -2241,6 +2241,14 @@ sign-extend their results to 32 bits. Byte offsets are 0 through 3 and
 halfword offsets are 0 or 2. Subword accesses use the same address, LDS
 allocation, full EXEC and immediate wait checks as full-word accesses.
 
+`ds_read_u8_d16`, `ds_read_i8_d16` and `ds_read_u16_d16` replace the low
+half of a known destination VGPR. `ds_read_u8_d16_hi` and `ds_read_u16_d16_hi`
+replace the high half. The other half keeps its previous bits. The byte
+forms extend to 16 bits before insertion. The fixtures use different
+initial destination words and LDS offsets and compare the entire 320-word
+UAV after one and three groups. Zeroing the preserved half or changing the
+signed byte read to unsigned must mismatch at word 0.
+
 The no-return forms `ds_add_u32`, `ds_sub_u32`, `ds_and_b32`, `ds_or_b32`
 and `ds_xor_b32` update the same initialized word in place at offset 0.
 Addition and subtraction wrap modulo 2^32, with subtraction taking the
