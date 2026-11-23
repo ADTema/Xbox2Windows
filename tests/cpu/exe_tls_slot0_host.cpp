@@ -335,13 +335,14 @@ extern "C" int host_entry() {
     const int argc = split(GetCommandLineW(), argv, 8);
     if (argc != 4)
         ExitProcess(fail_setup("usage: host <pe_map.dll> <image> main|alive|exited|untracked|paused|plain|probe|"
-                               "enroll_refused|install_failed"));
+                               "enroll_refused|install_failed|cancelled"));
     const wchar_t* scenario = argv[3];
     const bool plain = same(scenario, L"plain");
     const bool alive = same(scenario, L"alive"), exited = same(scenario, L"exited"),
                untracked = same(scenario, L"untracked"), paused = same(scenario, L"paused");
     const bool enroll_refused = same(scenario, L"enroll_refused"), install_failed = same(scenario, L"install_failed");
-    const bool probe = enroll_refused || install_failed || same(scenario, L"probe");
+    const bool cancelled = same(scenario, L"cancelled");
+    const bool probe = enroll_refused || install_failed || cancelled || same(scenario, L"probe");
     if (!plain && !alive && !exited && !untracked && !paused && !probe && !same(scenario, L"main"))
         ExitProcess(fail_setup("scenario"));
     HANDLE paused_event = nullptr, resume_event = nullptr, ok_event = nullptr, bad_event = nullptr;
@@ -388,6 +389,29 @@ extern "C" int host_entry() {
     std::uint32_t exit_code = 0xdeadbeef;
     const int started = run(base, &exit_code);
     const bool installed_main = holds_image_block();
+
+    // More than one table's worth of workers can end without ever entering their start routine.
+    if (cancelled && started) {
+        const auto create = reinterpret_cast<decltype(&CreateThread)>(g_create_thread);
+        volatile LONG started_workers = 0;
+        auto start = +[](void* arg) -> DWORD {
+            InterlockedIncrement(static_cast<volatile LONG*>(arg));
+            return 0;
+        };
+        for (int i = 0; i < 65; ++i) {
+            HANDLE worker = create(nullptr, 0, start, const_cast<LONG*>(&started_workers), CREATE_SUSPENDED, nullptr);
+            if (!worker) {
+                put("cancelled: creation failed at iteration ");
+                put_number(i + 1, false);
+                put("\n");
+                ExitProcess(fail_setup("cancelled thread create"));
+            }
+            if (!TerminateThread(worker, 0) || WaitForSingleObject(worker, 10000) != WAIT_OBJECT_0)
+                ExitProcess(fail_setup("cancelled thread exit"));
+            CloseHandle(worker);
+        }
+        if (started_workers) ExitProcess(fail_setup("cancelled thread reached start routine"));
+    }
 
     // A host thread created after the start: never a participant.
     LONG before_late[4], after_late[4];

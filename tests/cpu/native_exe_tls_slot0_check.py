@@ -42,6 +42,9 @@ cpu_exe_tls_slot0_enroll, whose probe worker p touches a global sentinel first i
   ERROR_NOT_ENOUGH_MEMORY, no thread exists, the sentinel stays 0 and the refusal is counted.
 - install_failed: the installation on p is made to fail. p ends with 0xE0000201 before its start routine,
   the sentinel stays 0, the guest gets no callback for p and the failure is counted.
+- cancelled: the host creates and cancels 65 suspended enrolled workers, one at a time. Every worker
+  exits without running its start routine, the table keeps admitting workers, and cleanup accounts for
+  all 65 exits without changing the participating callback totals.
 In both failure cases the guest's later workers are enrolled as usual, the host survives and prints its
 report, and every other check (reader, late thread, release, cleanup) holds.
 """
@@ -91,6 +94,9 @@ ENROLL = {
     "install_failed": {"stats": [4, 4, 0, 0, 0, 0, 1, 0, 0, 1], "refused": None, "participant": True,
                        "resumed": None, "late": 0, "callbacks": "2,2", "log": EXPECTED,
                        "probe": [0, 1, 0, ENROLL_FAILED_EXIT]},
+    "cancelled": {"stats": [5, 5, 0, 0, 0, 0, 1, 0, 0, 65], "refused": None, "participant": True,
+                  "resumed": None, "late": 0, "callbacks": "3,3", "log": PROBED,
+                  "probe": [1, 1, 0, 0]},
 }
 
 

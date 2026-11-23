@@ -1662,6 +1662,8 @@ A refused release returns 0 with the refusal reported. The accepted release is t
 
 In both failure scenarios the sentinel stayed 0, the guest received no callback for p, workers a and b were enrolled as usual, and the host process survived to print its report and exit 0.
 
+The `cancelled` control creates and ends 65 suspended enrolled workers in succession. None reaches its start routine or adds a guest callback. Their signaled handles let the mapper reclaim enrollment slots before admitting later workers, and the final release accounts for all 65 exits.
+
 Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release`:
 
 - **Guest log.** It equals the Windows launch in every `pe_map_run_main` scenario. In `paused` it adds `c2=yy c:yyyy`.

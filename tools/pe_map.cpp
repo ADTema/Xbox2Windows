@@ -790,6 +790,16 @@ void free_entry(Enrollment& entry) {
     InterlockedDecrement(&g_enrolling);
 }
 
+// A suspended worker can be cancelled before the wrapper gets a chance to consume its entry.
+// Caller holds slot_lock. Keep live (including still-suspended) workers registered.
+void reap_ended_enrollments(MainImage& main) {
+    for (auto& entry : main.enrolling) {
+        if (!entry.handle || WaitForSingleObject(entry.handle, 0) != WAIT_OBJECT_0) continue;
+        ++main.enroll_failed;
+        free_entry(entry);
+    }
+}
+
 // Installs the image's block in the calling thread's slot 0. Caller holds slot_lock, main.base is set.
 // Nothing here allocates: the table is fixed and the TLS slots are below TLS_MINIMUM_AVAILABLE.
 bool install_current(MainImage& main) {
@@ -851,7 +861,8 @@ void install_enrolled_thread() {
     auto& main = main_image();
     const DWORD self = GetCurrentThreadId();
     for (auto& entry : main.enrolling) {
-        if (entry.state != Enrollment::READY || entry.thread != self) continue;
+        if (entry.state != Enrollment::READY || entry.thread != self ||
+            WaitForSingleObject(entry.handle, 0) != WAIT_TIMEOUT) continue;
         const bool installed = main.base && !take_fault(main, 2) && install_current(main);
         entry.state = installed ? Enrollment::INSTALLED : Enrollment::FAILED;
         return;
@@ -920,8 +931,7 @@ bool end_main(std::uint8_t* base) {
         CloseHandle(handle);
         handle = nullptr;
     }
-    for (auto& entry : main.enrolling)
-        if (entry.state != Enrollment::FREE) free_entry(entry);  // ended before its start routine
+    reap_ended_enrollments(main);
     main.base = nullptr;
     g_main_base = nullptr;
     main.last_release = 1;
@@ -1673,6 +1683,7 @@ extern "C" __declspec(dllexport) HANDLE WINAPI pe_map_main_create_thread(LPSECUR
         const SlotLock hold;
         auto& main = main_image();
         if (main.base) {
+            reap_ended_enrollments(main);
             if (!take_fault(main, 1)) {
                 for (int i = 0; i < MAIN_ENROLLING && slot < 0; ++i)
                     if (main.enrolling[i].state == Enrollment::FREE) slot = i;
