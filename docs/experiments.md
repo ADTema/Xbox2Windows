@@ -2305,6 +2305,16 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 ```
 
 
+A separate private LDS layout uses `local_x << 4` and at least 512 bytes of
+allocation. Each lane owns a 16-byte record. This layout supports
+`ds_write_b64` and `ds_read_b64` at offset 0 or 8, `ds_write_b96` and
+`ds_read_b96` at offset 0, and `ds_read2_b32` with independently ordered
+dword offsets within the record. Each read requires all referenced dwords to
+have been written. The profile rejects mixing the two LDS address strides
+because their per-lane regions can overlap. The fixtures compare every UAV
+word and detect a wrong qword offset, a missing data word, or reversed dual
+read offsets at word 0.
+
 An optional `--constant-descriptor BYTE_OFFSET` binds a second table entry to
 b0. It must be distinct from the 16-byte u0 descriptor. The translator accepts
 aligned immediate `s_buffer_load_dword`, `s_buffer_load_dwordx2`, and
