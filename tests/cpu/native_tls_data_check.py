@@ -14,7 +14,8 @@ after release, and that the carrier a process leaves when it ends without releas
 by the next process that maps a TLS image there.
 
 Two failure controls run beside carrier-like files of another process: one where Windows refuses
-to load the carrier after it was written (the child accepts only Microsoft-signed images), and one
+to load the carrier after it was written (the child's temporary directory carries a low integrity
+label that new files inherit, and the child refuses images with that label), and one
 where the carrier was loaded and the guest's entry point refuses the process attach. Each failed map
 must remove its own carrier and leave the other files as they were.
 """
@@ -38,7 +39,8 @@ from native_map_check import Mapper, Resolver, STATUS
 
 TIMEOUT = 60
 WAIT_MS = 10000
-ERROR_BAD_EXE_FORMAT, ERROR_NOACCESS, ERROR_INVALID_IMAGE_HASH, ERROR_DLL_INIT_FAILED = 193, 998, 577, 1114
+ERROR_BAD_EXE_FORMAT, ERROR_NOACCESS, ERROR_DLL_INIT_FAILED = 193, 998, 1114
+ERROR_ACCESS_DENIED = 5  # a low-label image under NoLowMandatoryLabelImages
 MAP_MEMORY = 3  # MapStatus in tools/pe_map.cpp; the carrier's failures are reported with it
 CARRIER = "pe_map_tls_"
 ALIGN_MASK, ALIGN_4096 = 0x00F00000, 0x00D00000
@@ -59,7 +61,9 @@ kernel.CloseHandle.argtypes = [ctypes.c_void_p]
 kernel.GetTempPathW.argtypes = [ctypes.c_uint32, ctypes.c_wchar_p]
 kernel.GetEnvironmentVariableW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
 kernel.SetProcessMitigationPolicy.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
-PROCESS_SIGNATURE_POLICY, MICROSOFT_SIGNED_ONLY = 8, 1  # PROCESS_MITIGATION_POLICY, its first flag
+# ProcessImageLoadPolicy in PROCESS_MITIGATION_POLICY and its NoLowMandatoryLabelImages flag. Only images
+# with a low integrity label are refused, so nothing else the child loads is affected.
+PROCESS_IMAGE_LOAD_POLICY, NO_LOW_LABEL_IMAGES = 10, 2
 kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
                                ctypes.c_uint32, ctypes.c_void_p]
 kernel.CreateFileW.restype = ctypes.c_void_p
@@ -248,14 +252,15 @@ def run(target, mapper_path, image, second, leave="release"):
 def fail_run(target, mapper_path, image, kind):
     """Child: a map or load that fails after the carrier was written or after it was loaded.
 
-    signed-only: the process accepts only Microsoft-signed images from here on, so Windows refuses
-    the carrier that pe_map wrote. refuse: image is the refusing fixture, whose entry point records
+    low-label: the temporary directory has a low integrity label that new files inherit, and from
+    here on the process refuses images with that label, so Windows refuses the carrier pe_map wrote.
+    no-policy: the same load without the policy, the control for low-label. refuse: image is the refusing fixture, whose entry point records
     what its thread-locals hold and fails the process attach.
     """
     loader = Loader(target, mapper_path)
-    if kind == "signed-only":
-        flags = ctypes.c_uint32(MICROSOFT_SIGNED_ONLY)
-        if not kernel.SetProcessMitigationPolicy(PROCESS_SIGNATURE_POLICY, ctypes.byref(flags), 4):
+    if kind == "low-label":
+        flags = ctypes.c_uint32(NO_LOW_LABEL_IMAGES)
+        if not kernel.SetProcessMitigationPolicy(PROCESS_IMAGE_LOAD_POLICY, ctypes.byref(flags), 4):
             emit({"failure": ["policy", ctypes.get_last_error()]})
     module, failure = loader.load(image)
     seen = ctypes.create_unicode_buffer(64)
@@ -297,6 +302,14 @@ def decoys(folder):
         (folder / relative).parent.mkdir(exist_ok=True)
         (folder / relative).write_bytes(data)
     return files
+
+
+def low_label(folder):
+    """Give folder a low integrity label that files and directories created in it inherit."""
+    result = subprocess.run(["icacls", str(folder), "/setintegritylevel", "(OI)(CI)low"], capture_output=True,
+                            text=True, timeout=TIMEOUT)
+    if result.returncode:
+        raise AssertionError(f"icacls could not label {folder}: {result.stdout} {result.stderr}")
 
 
 def check_decoys(label, folder, files, report):
@@ -429,13 +442,27 @@ def check(mapper, fixture, refuse):
 
         # Failure controls: each failed map removes its own carrier and nothing else.
         controls = {}
-        temp = folder / "temp_signed_only"
+        temp = folder / "temp_low_label"
         files = decoys(temp)
-        report = child("mapped", mapper, fixture, None, temp=temp, fail="signed-only")
-        expected_failure = [MAP_MEMORY, f"Windows cannot load the TLS carrier (error {ERROR_INVALID_IMAGE_HASH})"]
+        low_label(temp)
+        # Control: a copy of the fixture in that directory carries the label, and Windows refuses it.
+        labeled = temp / "labeled_copy" / "tls_data.dll"
+        labeled.parent.mkdir()
+        shutil.copy2(fixture, labeled)
+        plain = child("native", mapper, labeled, None, temp=temp, fail="no-policy")
+        native = child("native", mapper, labeled, None, temp=temp, fail="low-label")
+        shutil.rmtree(labeled.parent)
+        if not plain["loaded"]:
+            raise AssertionError(f"low-label: the labeled copy does not load without the policy: {plain}")
+        if native["failure"] != ERROR_ACCESS_DENIED:
+            raise AssertionError(f"low-label: Windows gave {native['failure']} for a labeled copy, "
+                                 f"expected error {ERROR_ACCESS_DENIED}")
+        report = child("mapped", mapper, fixture, None, temp=temp, fail="low-label")
+        expected_failure = [MAP_MEMORY, f"Windows cannot load the TLS carrier (error {ERROR_ACCESS_DENIED})"]
         if report["failure"] != expected_failure:
-            raise AssertionError(f"signed-only: expected {expected_failure}, got {report}")
-        check_decoys("signed-only", temp, files, report)
+            raise AssertionError(f"low-label: expected {expected_failure}, got {report}")
+        report["listing"] = [name for name in report["listing"] if not name.startswith("labeled_copy")]
+        check_decoys("low-label", temp, files, report)
         controls["the carrier was written and Windows refused it"] = report["failure"][1]
         native = child("native", mapper, refuse, None, temp=folder / "temp_refuse_native", fail="refuse")
         if native["failure"] != ERROR_DLL_INIT_FAILED or native["attach"] != "7 1":
