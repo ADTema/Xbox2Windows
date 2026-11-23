@@ -157,6 +157,17 @@ def read_results(junit):
     """CTest JUnit status per test (pass, fail or skip; CTest writes skips as status="notrun"), and the
     run's (start, end) in seconds since the epoch. CTest writes the start as local time in whole seconds."""
     suite = ET.parse(junit).getroot()
+    if suite.tag != "testsuite":
+        # Records are matched to the run's time window, so a file merging several runs cannot be used.
+        raise ValueError(f"expected one CTest <testsuite> root, found <{suite.tag}>")
+    try:
+        start = datetime.fromisoformat(suite.get("timestamp")).timestamp()
+    except (TypeError, ValueError):
+        raise ValueError(f"<testsuite> timestamp {suite.get('timestamp')!r} is not an ISO date and time") from None
+    try:
+        duration = float(suite.get("time"))
+    except (TypeError, ValueError):
+        raise ValueError(f"<testsuite> time {suite.get('time')!r} is not a number of seconds") from None
     status = {"run": "pass", "fail": "fail", "notrun": "skip"}
     results = {}
     for case in suite.iter("testcase"):
@@ -166,8 +177,7 @@ def read_results(junit):
         elif state == "pass" and case.find("skipped") is not None:
             state = "skip"
         results[case.get("name")] = state
-    start = datetime.fromisoformat(suite.get("timestamp")).timestamp()
-    return results, (start - 1, start + float(suite.get("time")) + 2)
+    return results, (start - 1, start + duration + 2)
 
 
 def read_records(directory, window):
@@ -277,7 +287,11 @@ def main(argv):
     parser.add_argument("--gaps", choices=("x64_zen2", "gfx1013", "gfx1030"),
                         help="print uncovered forms for one architecture as tab-separated group, form and evidence")
     args = parser.parse_args(argv)
-    results, window = read_results(args.junit)
+    try:
+        results, window = read_results(args.junit)
+    except (OSError, ET.ParseError, ValueError) as error:
+        print(f"form_coverage: {args.junit}: {error}", file=sys.stderr)
+        return 2
     m = measure(results, records=read_records(args.records, window), gaps_for=args.gaps)
     if args.gaps:
         gaps = m[args.gaps].pop("gaps")
@@ -290,7 +304,8 @@ def main(argv):
             print("\t".join(row))
     else:
         print(report(m))
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    raise SystemExit(main(sys.argv[1:]))
