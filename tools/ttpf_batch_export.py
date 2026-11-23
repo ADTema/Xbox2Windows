@@ -2,15 +2,16 @@
 
 Accepts an RDS5/ETPF texture pool archive and a range of texture indices. Tries
 strict export by default and optionally retries with provisional history
-calibration when --allow-provisional is specified. Writes each new export to a
+or an explicit local calibration profile. Writes each new export to a
 temporary path and publishes it only on successful completion. Records index,
-dimensions, codec, strict/provisional status, failure reason, and output DDS
+dimensions, codec, export mode, failure reason, and output DDS
 SHA-256 in a structured JSON manifest.
 """
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -89,10 +90,27 @@ def load_tools(tools_path: Path | None = None):
         return None
 
 
+def require_rust_backend(ttpf):
+    """Check the native library used by the selected decoder before starting a batch."""
+    native = getattr(getattr(ttpf, "bcpack", None), "_native", None)
+    if native is None:
+        raise RuntimeError("The selected Leonida tools do not include the optional Rust BCPack backend.")
+    try:
+        library = native.library()
+        for kernel in ("unpack_lanes", "decode_strict_bc1", "decode_strict_mode6", "rebuild_calibrated_bc1"):
+            getattr(library, kernel)
+    except (OSError, AttributeError) as exc:
+        raise RuntimeError(
+            "Could not load the Rust BCPack kernels. Build the selected Leonida "
+            "tools/bcpack_calibration crate in release mode."
+        ) from exc
+
+
 def export_texture_entry(pool, index: int, out_dir: Path,
                          allow_provisional: bool = False,
                          history: dict | None = None,
-                         ttpf_module=None) -> dict:
+                         ttpf_module=None,
+                         fitted_decoder=None) -> dict:
     """Export one texture entry from the pool to a DDS file and return its manifest entry.
 
     Writes to a temporary file first and publishes to dds_path only upon success.
@@ -155,43 +173,53 @@ def export_texture_entry(pool, index: int, out_dir: Path,
             "height": h,
         }
 
+    details = {
+        "index": index,
+        "format": fmt,
+        "format_name": FORMAT_NAMES.get(fmt, f"Format {fmt}"),
+        "width": w,
+        "height": h,
+    }
     try:
-        # 1. Try strict export first (default)
         mode_used = "strict"
         ret = export_fn(pool, index, str(temp_path), allow_provisional=False)
 
-        # 2. Retry with provisional history only when explicitly opted in
-        if ret != 0 and allow_provisional:
+        if ret == 2 and fitted_decoder is not None:
+            mode_used = "fitted"
+            decoder = fitted_decoder(pool)
+            try:
+                data = decoder.dds(index)
+            finally:
+                decoder.read_chunk.cache_clear()
+            temp_path.write_bytes(data)
+            ret = 0
+        elif ret != 0 and allow_provisional:
             mode_used = "provisional"
+            temp_path.unlink(missing_ok=True)
             ret = export_fn(pool, index, str(temp_path), allow_provisional=True, history=history)
 
         if ret != 0 or not temp_path.exists():
             return {
-                "index": index,
+                **details,
                 "status": "failed",
-                "format": fmt,
-                "format_name": FORMAT_NAMES.get(fmt, str(fmt)),
-                "width": w,
-                "height": h,
                 "reason": f"export returned exit code {ret}",
             }
 
         # Atomic publish: move temporary file to final published path
+        data = temp_path.read_bytes()
+        sha256 = hashlib.sha256(data).hexdigest()
         os.replace(temp_path, dds_path)
-        data = dds_path.read_bytes()
         return {
-            "index": index,
+            **details,
             "status": "success",
             "mode": mode_used,
-            "format": fmt,
-            "format_name": FORMAT_NAMES.get(fmt, f"Format {fmt}"),
-            "width": w,
-            "height": h,
             "mips": mips,
             "dds_size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "sha256": sha256,
             "file": dds_name,
         }
+    except (OSError, KeyError, IndexError, TypeError, ValueError) as exc:
+        return {**details, "status": "failed", "reason": str(exc)}
     finally:
         if temp_path.exists():
             try:
@@ -207,11 +235,37 @@ def batch_export(pool_path: Path, out_dir: Path,
                  history_path: Path | None = None,
                  threads: int = 4,
                  manifest_path: Path | None = None,
-                 tools_path: Path | None = None) -> dict:
+                 tools_path: Path | None = None,
+                 require_rust: bool = False,
+                 calibration_path: Path | None = None) -> dict:
     """Run batch export over a range of texture pool indices and write manifest.json."""
     ttpf = load_tools(tools_path)
     if ttpf is None:
         raise RuntimeError("Could not find ttpf_mips module. Provide --tools-path or set TTPF_TOOLS_DIR.")
+    if require_rust:
+        require_rust_backend(ttpf)
+
+    fitted_decoder = None
+    if calibration_path is not None:
+        if allow_provisional or history_path is not None:
+            raise ValueError("--calibration cannot be combined with --allow-provisional or --history")
+        try:
+            calibrated = importlib.import_module("calibrated_texture")
+            if (calibrated.ttpf is not ttpf
+                    or Path(calibrated.__file__).resolve().parent != Path(ttpf.__file__).resolve().parent):
+                raise ImportError("calibrated_texture and ttpf_mips must come from the same tools directory")
+            calibrated.native()
+        except (ImportError, AttributeError, OSError) as exc:
+            raise RuntimeError(
+                f"Cannot load the fitted decoder from the selected Leonida tools: {exc}. "
+                "Install NumPy and build tools/bcpack_calibration in release mode."
+            ) from exc
+        calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+        if not isinstance(calibration, dict) or calibration.get("version") != 1:
+            raise ValueError("Unsupported calibration version (expected version 1)")
+
+        def fitted_decoder(pool):
+            return calibrated.LocalDecoder(pool, calibration)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     if manifest_path is None:
@@ -224,8 +278,12 @@ def batch_export(pool_path: Path, out_dir: Path,
         except Exception as e:
             print(f"Warning: could not read calibration history from {history_path}: {e}", file=sys.stderr)
 
+    start_time = time.perf_counter()
     pool = ttpf.Pool(str(pool_path))
-    total_textures = pool.textures
+    try:
+        total_textures = pool.textures
+    finally:
+        pool.close()
 
     if indices is None:
         start_idx = max(0, start)
@@ -234,9 +292,10 @@ def batch_export(pool_path: Path, out_dir: Path,
     else:
         target_indices = [i for i in indices if 0 <= i < total_textures]
 
-    start_time = time.time()
     manifest_entries: list[dict] = []
     stats = {"strict": 0, "provisional": 0, "failed": 0, "skipped": 0}
+    if fitted_decoder is not None:
+        stats["fitted"] = 0
 
     def _worker(idx: int) -> dict:
         local_pool = ttpf.Pool(str(pool_path))
@@ -244,7 +303,8 @@ def batch_export(pool_path: Path, out_dir: Path,
             return export_texture_entry(local_pool, idx, out_dir,
                                         allow_provisional=allow_provisional,
                                         history=history_dict,
-                                        ttpf_module=ttpf)
+                                        ttpf_module=ttpf,
+                                        fitted_decoder=fitted_decoder)
         finally:
             local_pool.close()
 
@@ -256,21 +316,15 @@ def batch_export(pool_path: Path, out_dir: Path,
             manifest_entries.append(res)
             st = res.get("status")
             if st == "success":
-                mode = res.get("mode")
-                if mode == "strict":
-                    stats["strict"] += 1
-                elif mode == "provisional":
-                    stats["provisional"] += 1
+                stats[res["mode"]] += 1
             elif st in ("no_layout", "uncompressed", "unsupported_codec"):
                 stats["skipped"] += 1
             else:
                 stats["failed"] += 1
 
-    pool.close()
-
     manifest_entries.sort(key=lambda x: x.get("index", 0))
     manifest_path.write_text(json.dumps(manifest_entries, indent=2), encoding="utf-8")
-    elapsed = time.time() - start_time
+    elapsed = time.perf_counter() - start_time
 
     return {
         "pool": str(pool_path),
@@ -302,6 +356,10 @@ def main():
                         help="Output path for JSON manifest (default: <out>/manifest.json)")
     parser.add_argument("--tools-path", type=Path, default=None,
                         help="Path to directory containing ttpf_mips.py and bcpack.py")
+    parser.add_argument("--require-rust", action="store_true",
+                        help="Require the optional Rust BCPack library to load before exporting")
+    parser.add_argument("--calibration", type=Path,
+                        help="Retry strict failures with a local version-1 Leonida calibration profile")
     args = parser.parse_args()
 
     if not args.pool.exists():
@@ -309,18 +367,23 @@ def main():
 
     indices = parse_indices(args.indices) if args.indices else None
 
-    summary = batch_export(
-        pool_path=args.pool,
-        out_dir=args.out,
-        indices=indices,
-        start=args.start,
-        count=args.count,
-        allow_provisional=args.allow_provisional,
-        history_path=args.history,
-        threads=args.threads,
-        manifest_path=args.manifest,
-        tools_path=args.tools_path,
-    )
+    try:
+        summary = batch_export(
+            pool_path=args.pool,
+            out_dir=args.out,
+            indices=indices,
+            start=args.start,
+            count=args.count,
+            allow_provisional=args.allow_provisional,
+            history_path=args.history,
+            threads=args.threads,
+            manifest_path=args.manifest,
+            tools_path=args.tools_path,
+            require_rust=args.require_rust,
+            calibration_path=args.calibration,
+        )
+    except (RuntimeError, OSError, ValueError) as exc:
+        parser.error(str(exc))
 
     print(json.dumps(summary, indent=2))
 
