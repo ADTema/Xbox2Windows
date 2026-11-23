@@ -47,6 +47,7 @@ struct PixelInput {
     std::vector<Color> expected;
     std::vector<BYTE> secondRows;
     std::vector<Word> constants = std::vector<Word>(64);
+    std::vector<Word> extraConstants;   // 128 words for b1 then b2, empty unless trailer flag bit 3 is set
     UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     std::vector<BYTE> coverage;
     bool integerRT = false;      // bit 0 of the optional case-trailer flags byte
@@ -78,6 +79,14 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     if (!gpuConstants) {
         uploadedConstants = upload(device, input.constants);
         gpuConstants = uploadedConstants.Get();
+    }
+    // b1 and b2 are bound only for a case that supplies them. No other fixture shader declares them.
+    std::array<ComPtr<ID3D12Resource>, 2> extraConstants;
+    if (!input.extraConstants.empty()) {
+        if (input.extraConstants.size() != 128) throw std::runtime_error("Expected two 256-byte extra constant buffers");
+        for (size_t i = 0; i < extraConstants.size(); ++i)
+            extraConstants[i] = upload(device, std::vector<Word>(input.extraConstants.begin() + 64 * i,
+                                                                 input.extraConstants.begin() + 64 * (i + 1)));
     }
     std::ifstream file(path, std::ios::binary);
     std::vector<char> ps{std::istreambuf_iterator<char>(file), {}};
@@ -202,6 +211,9 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->SetGraphicsRootSignature(root.Get());
         list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
         list->SetGraphicsRootConstantBufferView(1, gpuConstants->GetGPUVirtualAddress());
+        for (UINT i = 0; i < extraConstants.size(); ++i)
+            if (extraConstants[i])
+                list->SetGraphicsRootConstantBufferView(2 + i, extraConstants[i]->GetGPUVirtualAddress());
         // WARP and hardware can use either the rounded SRV extent or the
         // unrounded base extent for implicit LOD. Their geometric mean is
         // within half a mip of both, since rounding discards less than one texel.
@@ -431,7 +443,7 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
         if (file.peek() != std::char_traits<char>::eof()) {
             BYTE flags = 0;
             file.read(reinterpret_cast<char*>(&flags), 1);
-            if (flags & 0xfcu)
+            if (flags & 0xf4u)
                 throw std::runtime_error("Unknown case trailer flag bits");
             input.integerRT = (flags & 1u) != 0;
             if (flags & 2u) {
@@ -444,6 +456,13 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
                 // Explicit viewport cases provide one reference color per target pixel.
                 input.scale = 1;
                 input.viewport = D3D12_VIEWPORT{float(left), float(top), float(width), float(height), 0, 1};
+            }
+            if (flags & 8u) {
+                input.extraConstants.resize(128);
+                file.read(reinterpret_cast<char*>(input.extraConstants.data()),
+                          static_cast<std::streamsize>(input.extraConstants.size() * sizeof(Word)));
+                if (!file)
+                    throw std::runtime_error("Expected two 256-byte constant buffers for b1 and b2");
             }
             if (file.peek() != std::char_traits<char>::eof()) {
                 if (input.integerRT)

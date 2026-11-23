@@ -421,6 +421,7 @@ INT_COMPARE = {
 # 32-bit integer operations on register bits. Shift counts use their low five bits, as on the target.
 INTEGER = {
     "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
+    "xnor_b32": (2, "~({0} ^ {1})"),
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
     "alignbit_b32": (3, "(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))"),
     "alignbyte_b32": (3, "(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - (({2} & 3u) * 8u)))))"),
@@ -828,7 +829,7 @@ def scalar_u32(token, scalar, pending):
             return f"{value}u"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return value[1]
-        if isinstance(value, str) and value.startswith("params["):
+        if isinstance(value, str) and value.startswith("params"):
             return f"asuint({value})"
         raise ValueError(f"Expected a numeric scalar register: {token}")
     if re.fullmatch(r"-?\d+", token):
@@ -942,7 +943,7 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict
             return f"asfloat({value}u)"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return f"asfloat({value[1]})"
-        if not isinstance(value, str) or not (value.startswith(("sample", "alu", "params["))
+        if not isinstance(value, str) or not (value.startswith(("sample", "alu", "params"))
                 or (quad_values is not None and value in quad_values)):
             raise ValueError("Expected a numeric register")
         if token in sample_dest:
@@ -958,7 +959,7 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict
 def int_operand(token, scalar, vector, pending, sample_dest, *, signed):
     if re.fullmatch(r"v\d+", token):
         value = vector[token]
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
             raise ValueError("Expected a numeric register")
         if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
@@ -1101,7 +1102,7 @@ def vop3p_f16_word(token, scalar, vector, pending, sample_dest):
             return f"{value}u"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return value[1]
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
             raise ValueError("Expected a numeric register")
         if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
@@ -1183,7 +1184,7 @@ def fma_mix_reg(token, scalar, vector, pending, sample_dest):
         return f"asfloat({value}u)", f"{value}u"
     if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
         return f"asfloat({value[1]})", value[1]
-    if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+    if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
         raise ValueError("Expected a numeric register")
     if token in sample_dest:
         raise ValueError("Sample used before vmcnt wait")
@@ -1281,7 +1282,7 @@ def dot_word(token, scalar, vector, pending, sample_dest, *, allow_f16=False):
             return f"{value}u"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return value[1]
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
             raise ValueError("Expected a numeric register")
         if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
@@ -1346,7 +1347,7 @@ def vop3p_int_word(token, scalar, vector, pending, sample_dest):
             return f"{value}u"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return value[1]
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
             raise ValueError("Expected a numeric register")
         if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
@@ -1451,7 +1452,7 @@ def sdwa_dest(result, sel, unused, old):
     if unused == "UNUSED_PAD":
         return field
     # The kept bits must come from a tracked numeric value; hardware would keep whatever an untracked register holds.
-    if not (isinstance(old, str) and old.startswith(("sample", "alu", "params["))):
+    if not (isinstance(old, str) and old.startswith(("sample", "alu", "params"))):
         raise ValueError("UNUSED_PRESERVE needs a tracked numeric destination")
     keep = ~(((1 << width) - 1) << offset) & 0xffffffff
     return f"((asuint({old}) & {keep:#x}u) | {field})"
@@ -1460,8 +1461,14 @@ SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", 
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
-          second_texture_offset=None, integer_export=False, texcoord_components=2):
-    """Track descriptor provenance, interpolation and packed or uncompressed exports."""
+          second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=()):
+    """Track descriptor provenance, interpolation and packed or uncompressed exports.
+
+    constant_descriptor is the byte offset, on the texture table, of the descriptor mapped to b0.
+    Each extra_constants entry is an (entry SGPR, byte offset) pair naming one further 16-byte
+    descriptor; the entries map in order to b1 onward. The SGPR may be the texture table or another
+    entry register that holds the low word of a table address.
+    """
     if texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105:
         raise ValueError("Invalid scalar inputs")
     if sampler is not None and (len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
@@ -1489,6 +1496,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if constant_descriptor is not None and any(
             start < constant_descriptor + 16 and constant_descriptor < start + 32 for start in bindings):
         raise ValueError("Texture and constant descriptors overlap")
+    # (table marker, descriptor byte offset) -> HLSL array. A table other than the texture table
+    # is an entry SGPR whose only accepted use is the low address word of a descriptor load.
+    constants = {} if constant_descriptor is None else {("texture_ptr", constant_descriptor): "params"}
+    for slot, entry in enumerate(extra_constants, 1):
+        if (len(entry) != 2 or any(type(word) is not int for word in entry) or not 0 <= entry[0] <= 105
+                or entry[0] == interp_sgpr or entry[1] < 0 or entry[1] % 4):
+            raise ValueError("Invalid constant descriptor binding")
+        table = "texture_ptr" if entry[0] == texture_sgpr else ("constant_table", entry[0])
+        if any(other == table and abs(start - entry[1]) < 16 for other, start in constants):
+            raise ValueError("Constant descriptors overlap")
+        if table == "texture_ptr" and any(start < entry[1] + 16 and entry[1] < start + 32 for start in bindings):
+            raise ValueError("Texture and constant descriptors overlap")
+        constants[table, entry[1]] = f"params{slot}"
+        scalar[f"s{entry[0]}"] = table
+        lines.insert(0, f"cbuffer Constants{slot} : register(b{slot}) {{ float4 params{slot}[16]; }};")
     pending = set()
     scc = None
     helpers = set()
@@ -1894,18 +1916,26 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid scalar buffer registers")
             dst = registers(first, last, width)
             base = [f"s{n}" for n in registers(low, high, 2 if descriptor else 4)]
-            expected = ["texture_ptr", 0] if descriptor else [("cbv", n) for n in range(4)]
-            if constant_descriptor is None or pending.intersection(base) or [scalar.get(r) for r in base] != expected:
+            source = [scalar.get(r) for r in base]
+            table = source[0]
+            if descriptor:
+                resolved = (source[1] == 0
+                            and (table == "texture_ptr" or isinstance(table, tuple) and table[0] == "constant_table"))
+            else:
+                resolved = (isinstance(table, tuple) and table[0] == "cbv"
+                            and source == [("cbv", table[1], n) for n in range(4)])
+            if not constants or pending.intersection(base) or not resolved:
                 raise ValueError("Unresolved constant buffer binding")
-            if descriptor and offset != constant_descriptor:
+            if descriptor and (table, offset) not in constants:
                 raise ValueError("Constant descriptor differs from binding contract")
+            params = constants[table, offset] if descriptor else table[1]
             if not descriptor and (offset % 4 or offset + 4 * len(dst) > 256):
                 raise ValueError("Constant read exceeds binding or is unaligned")
             for j, n in enumerate(dst):
                 if f"s{n}" in pending:
                     raise ValueError("Write overlaps an outstanding scalar load")
                 word = offset // 4 + j
-                scalar[f"s{n}"] = ("cbv", j) if descriptor else f"params[{word // 4}].{'xyzw'[word % 4]}"
+                scalar[f"s{n}"] = ("cbv", params, j) if descriptor else f"{params}[{word // 4}].{'xyzw'[word % 4]}"
                 pending.add(f"s{n}")
         elif m := match(r"v_cube(id|sc|tc|ma)_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+?)( clamp)?"):
             # LLVM ConstantFoldAMDGCNCubeIntrinsic: z, then y, then x is the major axis; a face is negative
@@ -2537,7 +2567,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             old = vector.get(dst)
-            if old is not None and not (isinstance(old, str) and old.startswith(("sample", "alu", "params["))):
+            if old is not None and not (isinstance(old, str) and old.startswith(("sample", "alu", "params"))):
                 raise ValueError("Unsupported conversion destination")
             # fp_operand reads modifiers and inline constants, so -1 stays the bit pattern 0xffffffff.
             value = fp_operand(src, scalar, vector, pending, sample_dest)
@@ -2653,6 +2683,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="Destination .hlsl in a local output directory")
     parser.add_argument("--constant-descriptor", type=lambda s: int(s, 0),
                         help="Byte offset of a descriptor mapped to the 256-byte desktop buffer b0")
+    parser.add_argument("--extra-constant", type=lambda s: int(s, 0), nargs=2, action="append", default=[],
+                        metavar=("SGPR", "OFFSET"),
+                        help="Entry register and byte offset of a further descriptor; repeat for b1, b2 and onward")
     parser.add_argument("--second-texture-offset", type=lambda s: int(s, 0), help="Byte offset of the t1 descriptor for a two-sample shader")
     args = parser.parse_args()
     dest = args.output.resolve()
@@ -2661,7 +2694,8 @@ def main():
     try:
         blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256, llvm=args.llvm)
         instructions = disassemble(code, args.llvm)
-        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor, second_texture_offset=args.second_texture_offset)
+        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor, second_texture_offset=args.second_texture_offset,
+                       extra_constants=[tuple(entry) for entry in args.extra_constant])
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")
     dest.parent.mkdir(parents=True, exist_ok=True)
