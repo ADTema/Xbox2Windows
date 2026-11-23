@@ -7133,6 +7133,246 @@ def check_three_way_templates():
                                    {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
                 assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
                                 "med3": sorted((a, b, c))[1]}, (a, b, c)
+
+
+# Quad-local DPP16 and DPP8 binary32-to-binary16 conversion (v_cvt_f16_f32_dpp) under the shared
+# low-16-only destination contract (#732/#881) and explicit half_denorm="preserve" / RNE mode.
+# DPP_F16_CVT_LANES derives per-quad lane IDs {0, 1, 2, 3} from uv.x/uv.y, routes {1, 2, 3, 4}
+# through DPP16 AcrossX negation and DPP8 cyclic rotation with preloaded high-half sentinels,
+# gathers all four lanes under injective base-4 weights (1, 4, 16, 64) via v_cvt_f32_f16_e32,
+# and extracts raw WORD_0 SDWA bit patterns.
+DPP_F16_CVT_LANES = [
+    "v_mov_b32_dpp v18, v8 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_dpp v19, v9 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_dpp v20, v8 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_dpp v21, v9 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_f32_e32 v18, v20, v18",
+    "v_sub_f32_e32 v19, v21, v19",
+    "v_mul_f32_e32 v18, 0x42800000, v18",
+    "v_fma_f32 v20, 0x43000000, v19, v18",
+    "v_add_f32_e32 v21, 1.0, v20",
+    "v_mov_b32_e32 v22, 0x3f400000",
+    "v_cvt_f16_f32_dpp v22, -v21 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v24, 0xdeadbeef",
+    "v_cvt_f16_f32_dpp v24, v21 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_cvt_f32_f16_e32 v23, v22",
+    "v_cvt_f32_f16_e32 v25, v24",
+    *[f"v_mov_b32_dpp v{26 + lane}, v23 quad_perm:[{lane},{lane},{lane},{lane}] row_mask:0xf bank_mask:0xf"
+      for lane in range(4)],
+    *[f"v_mov_b32_dpp v{30 + lane}, v25 quad_perm:[{lane},{lane},{lane},{lane}] row_mask:0xf bank_mask:0xf"
+      for lane in range(4)],
+    "v_fma_f32 v34, 4.0, v27, v26",
+    "v_fma_f32 v34, 0x41800000, v28, v34",
+    "v_fma_f32 v34, 0x42800000, v29, v34",
+    "v_cvt_i32_f32_e32 v12, v34",
+    "v_fma_f32 v35, 4.0, v31, v30",
+    "v_fma_f32 v35, 0x41800000, v32, v35",
+    "v_fma_f32 v35, 0x42800000, v33, v35",
+    "v_cvt_u32_f32_e32 v13, v35",
+    "v_mov_b32_sdwa v36, v22 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    "v_mov_b32_dpp v14, v36 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_sdwa v37, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    "v_mov_b32_dpp v15, v37 quad_perm:[3,3,3,3] row_mask:0xf bank_mask:0xf",
+]
+
+# Raw low-16 bit-exact word readback for v_cvt_f16_f32_dpp across DPP16 (identity, AcrossX + neg,
+# AcrossY + abs) and DPP8 cyclic rotation, with preloaded high-half sentinels in v24 and v25.
+DPP_F16_CVT_WORDS = [
+    "v_mov_b32_e32 v20, s44",
+    "v_mov_b32_e32 v21, s45",
+    "v_mov_b32_e32 v22, s46",
+    "v_mov_b32_e32 v23, s47",
+    "v_mov_b32_e32 v24, 0x3f400000",
+    "v_mov_b32_e32 v25, 0xdeadbeef",
+    "v_cvt_f16_f32_dpp v24, v20 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f16_f32_dpp v25, -v21 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f16_f32_dpp v26, |v22| quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f16_f32_dpp v27, v23 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    "v_mov_b32_sdwa v13, v25 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    "v_mov_b32_sdwa v14, v26 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    "v_mov_b32_sdwa v15, v27 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+]
+
+
+def dpp_f16_narrow16_ref(bits):
+    """Exact IEEE-754 binary32-to-binary16 RNE reference matching tools/pixel_aot.py narrow16()."""
+    sign = (bits >> 16) & 0x8000
+    exponent = (bits >> 23) & 0xff
+    mantissa = bits & 0x7fffff
+    if exponent == 0xff:
+        return sign | 0x7c00 | (0x200 | (mantissa >> 13) if mantissa else 0)
+    if exponent < 102:
+        return sign
+    full = mantissa | 0x800000
+    if exponent < 113:
+        shift = 126 - exponent
+        return sign | ((full + (1 << (shift - 1)) - 1 + ((full >> shift) & 1)) >> shift)
+    if exponent > 142:
+        return sign | 0x7c00
+    rounded = (full + 0xfff + ((full >> 13) & 1)) >> 13
+    return sign | min(((exponent - 113) << 10) + rounded, 0x7c00)
+
+
+def check_dpp_f16_contract_controls():
+    """Positive and negative controls for v_cvt_f16_f32_dpp (mode, low-16-only contract, DPP refusals)."""
+    identity = "quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf"
+    sdwa = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:"
+    # Preload a sentinel into v22 before writing v_cvt_f16_f32_dpp: low-half widening succeeds,
+    # while WORD_1 and whole-word reads/exports must still reject.
+    produced = [
+        "v_mov_b32_e32 v20, s44",
+        "v_mov_b32_e32 v22, 0x3f400000",
+        f"v_cvt_f16_f32_dpp v22, v20 {identity}",
+    ]
+    for good in (
+        "v_cvt_f32_f16_e32 v12, v22",
+        "v_cvt_f32_f16_e64 v12, v22",
+        f"v_cvt_f32_f16_sdwa v12, v22 {sdwa}WORD_0",
+        f"v_mov_b32_sdwa v12, v22 {sdwa}WORD_0",
+    ):
+        translate_f16(uncompressed_export([*produced, good]))
+    for bad, message in (
+        (f"v_mov_b32_sdwa v12, v22 {sdwa}WORD_1", "Reads the undefined high half of a 16-bit result"),
+        (f"v_cvt_f32_f16_sdwa v12, v22 {sdwa}WORD_1", "Reads the undefined high half of a 16-bit result"),
+        (f"v_mov_b32_sdwa v12, v22 {sdwa}BYTE_0", "Reads the undefined high half of a 16-bit result"),
+        ("v_mov_b32_e32 v12, v22", "Expected a numeric register"),
+        ("v_add_f32_e32 v12, v22, v20", "Expected a numeric register"),
+        (f"v_cvt_f16_f32_dpp v23, v22 {identity}", "Expected a numeric VGPR in DPP, got v22"),
+        ("v_add_f16_e32 v23, v22, v22", "binary16 operand lacks a finite proof: v22"),
+    ):
+        expect_value_error(translate_f16, uncompressed_export([*produced, bad]), message)
+    # Direct whole-word export of a v_cvt_f16_f32_dpp destination rejects even with the preloaded sentinel.
+    export = uncompressed_export(produced)
+    export[next(i for i, line in enumerate(export) if line.startswith("exp ")):] = [
+        "exp mrt0 v22, v13, v14, v15 done vm", "s_endpgm"]
+    expect_value_error(translate_f16, export, "Unsupported export")
+    # Explicit entry denormal mode and HW_REG_MODE binary16 rounding controls.
+    valid = uncompressed_export([*produced, f"v_mov_b32_sdwa v12, v22 {sdwa}WORD_0"])
+    expect_value_error(translate_int, valid, "binary16 denormal mode unknown at entry")
+    for state in ("flush", "ftz", "", False):
+        expect_value_error(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                                           half_denorm=state), valid, "Invalid binary16 denormal entry state")
+    expect_value_error(translate_f16, [HALF_RTZ, *valid], "under round toward zero: v_cvt_f16_f32_dpp")
+    assert translate_f16([HALF_RTZ, HALF_RNE, *valid]) == translate_f16(["s_nop 0", "s_nop 0", *valid])
+    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
+                           ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write")):
+        expect_value_error(translate_f16, [write, *valid], message)
+    # DPP encoding refusals and out-of-slice binary16 DPP opcodes (including FMAC and transcendentals).
+    for bad, message in (
+        ("v_cvt_f16_f32_dpp v23, v20 row_shl:1 row_mask:0xf bank_mask:0xf", "Unsupported DPP control row_shl:1"),
+        ("v_cvt_f16_f32_dpp v23, v20 quad_perm:[0,1,2,3] row_mask:0x7 bank_mask:0xf", "Unsupported DPP16 modifier row_mask:0x7"),
+        (f"v_cvt_f16_f32_dpp v23, v20 {identity} bound_ctrl:1", "Unsupported DPP16 modifier bound_ctrl:1"),
+        (f"v_cvt_f16_f32_dpp v23, v20 {identity} fi:1", "Unsupported DPP16 modifier fi:1"),
+        ("v_cvt_f16_f32_dpp v23, v20 dpp8:[4,5,6,7,0,1,2,3]", "Cross-quad DPP8 permutation is unsupported"),
+        ("v_cvt_f16_f32_dpp v23, v20 dpp8:[1,0,3,2,4,5,6,7]", "DPP8 permutation must repeat the same quad selection in both halves"),
+        ("v_cvt_f16_f32_dpp v23, -v20 dpp8:[1,2,3,0,5,6,7,4]", "Source modifiers are not allowed on -v20"),
+        (f"v_cvt_f16_f32_dpp v23, v70 {identity}", "DPP operand v70 is read before it is written"),
+        (f"v_cvt_f16_f32_dpp v256, v20 {identity}", "Invalid f16 DPP operation"),
+        (f"v_fmac_f16_dpp v20, v20, v20 {identity}", "Unsupported instruction"),
+        (f"v_add_f16_dpp v23, v20, v20 {identity}", "Unsupported instruction"),
+        (f"v_sin_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
+        (f"v_cos_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
+        (f"v_floor_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
+    ):
+        expect_value_error(translate_f16, uncompressed_export(["v_mov_b32_e32 v20, s44", bad]), message)
+    # Scheduling: outstanding sample and non-entry EXEC mask must refuse.
+    base = uncompressed_export([])
+    sample = next(i for i, line in enumerate(base) if line.startswith("image_sample"))
+    expect_value_error(translate_f16, base[:sample + 1] + [f"v_cvt_f16_f32_dpp v12, v8 {identity}"] + base[sample + 1:],
+                       "Write overlaps an outstanding sample")
+    expect_value_error(translate_f16, base[:sample + 1] + [f"v_cvt_f16_f32_dpp v24, v12 {identity}"] + base[sample + 1:],
+                       "Sample used before vmcnt wait")
+    masked = base.index("s_wqm_b64 exec, exec") + 1
+    expect_value_error(translate_f16, base[:masked] + [f"v_cvt_f16_f32_dpp v24, v8 {identity}"] + base[masked:],
+                       "Invalid f16 DPP operation")
+
+
+def check_dpp_f16_draw(directory, compiler, renderer, backend):
+    check_dpp_f16_contract_controls()
+    # 1. Lane-routing witness (DPP16 AcrossX + neg, DPP8 cyclic rotation, preloaded sentinels).
+    lanes_program = uncompressed_export(DPP_F16_CVT_LANES)
+    lanes_src = directory / "dpp_f16_lanes.hlsl"
+    lanes_shader = directory / "dpp_f16_lanes.cso"
+    lanes_case = directory / "dpp_f16_lanes.case"
+    lanes_src.write_text(translate_f16(lanes_program), encoding="ascii")
+    compile_shader(compiler, lanes_src, lanes_shader)
+    # ch0: (-2)*1 + (-1)*4 + (-4)*16 + (-3)*64 = -262 (0xfffffefa)
+    # ch1: 2*1 + 3*4 + 4*16 + 1*64 = 142 (0x8e)
+    # ch2: lane 0 of v22 = f16(-2.0) = 0xc000; ch3: lane 3 of v24 = f16(1.0) = 0x3c00
+    lanes_expected = (0xfffffefa, 142, 0xc000, 0x3c00)
+    lanes_case.write_bytes(bytes(256) + struct.pack("<4I", *lanes_expected) * 64 + b"\x01")
+    run_pixel_batch(renderer, backend, lanes_shader, [(lanes_case, "pass")])
+    for old, new in (
+        ("quad_perm:[1,0,3,2]", "quad_perm:[2,3,0,1]"),
+        ("dpp8:[1,2,3,0,5,6,7,4]", "dpp8:[3,0,1,2,7,4,5,6]"),
+        ("v_cvt_f16_f32_dpp v22, -v21", "v_cvt_f16_f32_dpp v22, v21"),
+    ):
+        mutated = [line.replace(old, new) for line in lanes_program]
+        assert mutated != lanes_program, old
+        lanes_src.write_text(translate_f16(mutated), encoding="ascii")
+        compile_shader(compiler, lanes_src, lanes_shader)
+        run_pixel_batch(renderer, backend, lanes_shader, [(lanes_case, "mismatch")])
+
+    # 2. Raw low-16 bit-exact word readback: in-range RNE vs RTZ & ties-to-even discriminators,
+    # binary16 subnormals and underflow ties, max finite / overflow, signed zeros, infinities, qNaN.
+    words_program = uncompressed_export(DPP_F16_CVT_WORDS)
+    words_src = directory / "dpp_f16_words.hlsl"
+    words_shader = directory / "dpp_f16_words.cso"
+    words_hlsl = translate_f16(words_program)
+    words_src.write_text(words_hlsl, encoding="ascii")
+    compile_shader(compiler, words_src, words_shader)
+    input_rows = (
+        # In-range ties: 1+2^-11 -> 0x3c00 (ties-to-even), -(1+3*2^-11) -> 0xbc02 (RNE vs RTZ),
+        # |-(1+2^-11+2^-23)| -> 0x3c01, 1+3*2^-11 (DPP8) -> 0x3c02.
+        (0x3f801000, 0x3f803000, 0xbf801001, 0x3f803000),
+        # Binary16 subnormals & underflow ties: 2^-25 -> 0x0000, -(2^-25+eps) -> 0x8001, |-2^-15| -> 0x0200, 2^-14 -> 0x0400.
+        (0x33000000, 0x33000001, 0xb8000000, 0x38800000),
+        # Max finite 65504 -> 0x7bff, -65520 -> -Inf (0xfc00), |-0.0| -> 0x0000, -0.0 -> 0x8000.
+        (0x477fe000, 0x477ff000, 0x80000000, 0x80000000),
+        # Infinities & quiet NaNs: +Inf -> 0x7c00, -(-Inf) -> 0x7c00, |-qNaN| -> 0x7e01, qNaN -> 0x7e01.
+        (0x7f800000, 0xff800000, 0xffc02000, 0x7fc02000),
+    )
+    cases = []
+    for index, (w0, w1, w2, w3) in enumerate(input_rows):
+        expected = (
+            dpp_f16_narrow16_ref(w0),
+            dpp_f16_narrow16_ref(w1 ^ 0x80000000),
+            dpp_f16_narrow16_ref(w2 & 0x7fffffff),
+            dpp_f16_narrow16_ref(w3),
+        )
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, w0, w1, w2, w3)
+        path = directory / f"dpp_f16_words_{index}.case"
+        path.write_bytes(bytes(constants) + struct.pack("<4I", *expected) * 64 + b"\x01")
+        cases.append((path, "pass"))
+    # Wrong-word control: RTZ output 0x3c01 instead of RNE 0x3c02 on 1 + 3*2^-11 must mismatch.
+    wrong_path = directory / "dpp_f16_words_rtz.case"
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *input_rows[0])
+    wrong_path.write_bytes(bytes(constants) + struct.pack("<4I", 0x3c00, 0xbc02, 0x3c01, 0x3c01) * 64 + b"\x01")
+    run_pixel_batch(renderer, backend, words_shader, [*cases, (wrong_path, "mismatch")])
+    # Program-level modifier mutations and narrow16 rounding mutations (truncate, ties-away) must mismatch.
+    for old, new in (
+        ("v_cvt_f16_f32_dpp v25, -v21", "v_cvt_f16_f32_dpp v25, v21"),
+        ("v_cvt_f16_f32_dpp v26, |v22|", "v_cvt_f16_f32_dpp v26, v22"),
+    ):
+        mutated = [line.replace(old, new) for line in words_program]
+        assert mutated != words_program, old
+        words_src.write_text(translate_f16(mutated), encoding="ascii")
+        compile_shader(compiler, words_src, words_shader)
+        run_pixel_batch(renderer, backend, words_shader, [(cases[0][0], "mismatch")])
+    for name in ("truncate", "ties_away"):
+        mutated_hlsl = words_hlsl
+        for old, new in F16_ARITH_TEXT_EDITS[name]:
+            assert old in mutated_hlsl, (name, old)
+            mutated_hlsl = mutated_hlsl.replace(old, new, 1)
+        words_src.write_text(mutated_hlsl, encoding="ascii")
+        compile_shader(compiler, words_src, words_shader)
+        run_pixel_batch(renderer, backend, words_shader, [(cases[0][0], "mismatch")])
+    return 0
+
+
 # Quad-local DPP16 and DPP8 integer/bitwise/shift/bit-scan fixture covering 23 VOP1/VOP2 DPP forms.
 # Derives integer quad lane ID {0, 1, 2, 3} from interpolated uv.x/uv.y (v8/v9), verifies quad
 # swizzles across lanes, folds all 23 ops into a 32-bit accumulator, and exports all 4 bytes as
@@ -10879,6 +11119,7 @@ def check_f16_cvt_int_controls():
 
 
 def check_controls(directory):
+    check_dpp_f16_contract_controls()
     check_smem_pointer_controls()
     check_masked_controls()
     check_cmpx_controls()
@@ -12772,6 +13013,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
+    fixtures.append((uncompressed_export(DPP_F16_CVT_LANES), translate_f16))
+    fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
     fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
     fixtures.append((with_constants(DPP_EXTRA_BODY), translate, "gfx1013"))
@@ -17492,7 +17735,7 @@ def main():
                     "draw-uncompressed-integer-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-region-body", "draw-region-waits", "draw-div-fmas", "draw-cmp64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers",
-                    "draw-dpp-extra", "draw-pk-fmac"):
+                    "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-extra": check_dpp_extra_draws,
@@ -17531,7 +17774,8 @@ def main():
                         "draw-shift64": check_shift64_draw,
                         "draw-pk-fmac": check_pk_fmac_draw,
                         "draw-flat-scratch": check_flat_scratch_draws,
-                        "draw-smem-pointers": check_smem_pointer_draw}[mode]
+                        "draw-smem-pointers": check_smem_pointer_draw,
+                        "draw-dpp-f16": check_dpp_f16_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):

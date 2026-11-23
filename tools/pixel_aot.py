@@ -4243,6 +4243,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             quad_values[result] = quad_values[value]
             lines.append(f"    precise float {result} = asfloat({bits});")
             ds_needs_wait = True
+        elif m := match(r"v_cvt_f16_f32_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 binary32-to-binary16 conversion under the shared low-16-only
+            # contract (#732/#881): bits 15:0 are defined and tagged ("half16", alu); bits 31:16
+            # are unspecified, so no previous high half is merged and whole-word / WORD_1 readers
+            # reject the destination. Uses the existing narrow16 nearest-even helper and requires
+            # explicit half_denorm="preserve" (with HW_REG_MODE RNE enforced above).
+            dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid f16 DPP operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 1)
+            src0_val, abs0, neg0 = dpp_vgpr(tokens[0], vector, sample_dest, allow_mods=not is_dpp8)
+            bits = emit_quad_swizzle_u32(lines, i, src0_val, perm)
+            if abs0:
+                bits = f"({bits} & 0x7fffffffu)"
+            if neg0:
+                bits = f"({bits} ^ 0x80000000u)"
+            vector[dst] = ("half16", f"alu{i}")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(asfloat({bits})));")
         elif m := match(rf"v_({'|'.join(DPP_INT32)})_dpp (v\d+), (.+)"):
             op, dst, rest = m.groups()
             arity, template, helper = DPP_INT32[op]
