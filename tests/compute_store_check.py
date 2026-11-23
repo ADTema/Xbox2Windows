@@ -1553,6 +1553,48 @@ def lds_reference(groups):
     return words
 
 
+LDS_STRIDED_PROGRAMS = {
+    "lds_st64_b32": DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
+        "ds_write2st64_b32 v5, v6, v7 offset0:2 offset1:3", "s_waitcnt lgkmcnt(0)",
+        "ds_read2st64_b32 v[10:11], v5 offset0:3 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
+    ],
+    "lds_st64_b64": DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 3, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
+        "v_mov_b32_e32 v10, 0x12345678", "v_mov_b32_e32 v11, 0x9abcdef0",
+        "ds_write2st64_b64 v5, v[6:7], v[10:11] offset0:1 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "ds_read2st64_b64 v[10:13], v5 offset0:2 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
+    ],
+    "lds_st64_xchg": DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
+        "ds_write2st64_b32 v5, v6, v7 offset0:2 offset1:3", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v10, 0x12345678", "v_mov_b32_e32 v11, 0x9abcdef0",
+        "ds_wrxchg2st64_rtn_b32 v[10:11], v5, v10, v11 offset0:3 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "ds_read2st64_b32 v[12:13], v5 offset0:2 offset1:3", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
+    ],
+}
+LDS_STRIDED_CASES = [(name, lines, LDS_BINDING | {"lds_bytes": 1280, "stride": 8 if name.endswith("b32") else 16})
+                     for name, lines in LDS_STRIDED_PROGRAMS.items()]
+
+
+def lds_strided_reference(name, groups):
+    words = []
+    for lane in range(groups * 32):
+        first = 0x76543210 + lane
+        if name == "lds_st64_b32":
+            words.extend((0x89abcdef, first))
+        elif name == "lds_st64_b64":
+            words.extend((0x12345678, 0x9abcdef0, first, 0x89abcdef))
+        else:
+            words.extend((0x89abcdef, first, 0x9abcdef0, 0x12345678))
+    return words
+
+
+
+
 LDS_WIDE_BINDING = LDS_BINDING | {"lds_bytes": 512}
 LDS_WIDE_SETUP = DS_PREFIX + [
     "v_lshlrev_b32_e32 v5, 4, v0",
@@ -1669,6 +1711,20 @@ def lds_controls():
     rejects("Unverified private LDS write", aot.lower,
             variant(high, ("ds_write_b32 v5, v6", "s_nop 0")), 32, **LDS_BINDING)
 
+    name, lines, binding = LDS_STRIDED_CASES[1]
+    assert name == "lds_st64_b64"
+    for before, after, message in (
+        ("offset0:1 offset1:2", "offset0:1 offset1:1", "Unverified private strided LDS access"),
+        ("offset0:1 offset1:2", "offset0:0 offset1:2", "Unverified private strided LDS access"),
+        ("offset0:1 offset1:2", "offset0:1 offset1:3", "Unverified private strided LDS access"),
+        ("v[10:11] offset0:1", "v[10:12] offset0:1", "Unverified private strided LDS source range"),
+        ("v[10:13], v5", "v[10:12], v5", "Unverified private strided LDS destination range"),
+        ("ds_write2st64_b64 v5, v[6:7], v[10:11] offset0:1 offset1:2", "s_nop 0",
+         "Uninitialized private strided LDS plane"),
+        ("offset0:2 offset1:1", "offset0:2 offset1:1 gds", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (before, after)), 32, **binding)
+    rejects("Unverified private strided LDS access", aot.lower, lines, 32, **(binding | {"lds_bytes": 1279}))
     wide = lds_wide_program("lds_b96")
     rejects("Unverified dispatch byte offset", aot.lower, wide, 32, **LDS_BINDING)
     for old, bad, message in (
@@ -1825,7 +1881,7 @@ def lds_controls():
 
 
 def ds_binary(directory, assembler, objcopy, library):
-    cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES
+    cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES + LDS_STRIDED_CASES
     for name, lines, binding in cases:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -1918,6 +1974,13 @@ def ds_mutants(name, lines, binding, source):
         no_update = "ds_read_b32 v10, v5" if "_rtn_" in name else "s_nop 0"
         changed = variant(lines, (lds_counter_instruction(name), no_update))
         yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_STRIDED_PROGRAMS:
+        change = {
+            "lds_st64_b32": ("offset0:3 offset1:2", "offset0:2 offset1:3"),
+            "lds_st64_b64": ("offset0:2 offset1:1", "offset0:1 offset1:2"),
+            "lds_st64_xchg": ("offset0:3 offset1:2", "offset0:2 offset1:3"),
+        }[name]
+        yield aot.lower(variant(lines, change), 32, **binding), 0
     elif name == "private":
         yield source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)"), 2
     else:
@@ -1940,7 +2003,7 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
         compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
-        for groups in (1, 3):
+        for groups in (1, 2) if name in LDS_STRIDED_PROGRAMS else (1, 3):
             if name in LDS_UPDATES or name in LDS_RETURN_UPDATES:
                 words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
             elif name in LDS_SUBWORDS:
@@ -1959,6 +2022,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = lds_wide_reference(name, groups)
             elif name in LDS_COUNTERS:
                 words = lds_counter_reference(name, groups)
+            elif name in LDS_STRIDED_PROGRAMS:
+                words = lds_strided_reference(name, groups)
             elif private:
                 words = lds_reference(groups)
             else:
@@ -2451,6 +2516,7 @@ if __name__ == "__main__":
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
                  "draw-ds-route": ds_draw,
+                 "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),
                  "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
                  "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
