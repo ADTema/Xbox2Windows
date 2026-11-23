@@ -29,14 +29,12 @@ ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
 # Template operands are the old LDS word and the source VGPR, both HLSL uints.
-LDS_RMW_RETURN = {
+LDS_RMW = {
     "ds_add_u32": "({0} + {1})",
     "ds_sub_u32": "({0} - {1})",
     "ds_and_b32": "({0} & {1})",
     "ds_or_b32": "({0} | {1})",
     "ds_xor_b32": "({0} ^ {1})",
-}
-LDS_RMW_NO_RETURN = LDS_RMW_RETURN | {
     "ds_rsub_u32": "({1} - {0})",
     "ds_min_i32": "asuint(min(asint({0}), asint({1})))",
     "ds_max_i32": "asuint(max(asint({0}), asint({1})))",
@@ -453,7 +451,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             ds_wait = True
         elif ((m := re.fullmatch(r"(ds_[a-z]+)(?P<ret>_rtn)?(_[iub]32) "
                                  r"(?(ret)v(\d+), )v(\d+), v(\d+)(?: offset:0)?", line))
-              and (template := (LDS_RMW_RETURN if m["ret"] else LDS_RMW_NO_RETURN).get(m[1] + m[3]))):
+              and (template := LDS_RMW.get(m[1] + m[3]))):
             dst = int(m[4]) if m[4] is not None else None
             addr, src = int(m[5]), int(m[6])
             value = vector.get(src)
@@ -469,8 +467,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 vector[dst] = lds_word
             lds_word = ("alu", expression)
             ds_wait = True
-        elif m := re.fullmatch(r"ds_read_(b32|[ui](?:8|16)) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
-            op, dst, addr, offset = m[1], int(m[2]), int(m[3]), int(m[4] or 0)
+        elif m := re.fullmatch(r"ds_read_(b32|[ui](?:8|16))(?P<d16>_d16(?P<hi>_hi)?)? "
+                               r"v(?P<dst>\d+), v(?P<addr>\d+)(?: offset:(?P<offset>[0-3]))?", line):
+            op, dst, addr, offset = m[1], int(m["dst"]), int(m["addr"]), int(m["offset"] or 0)
+            d16, high = m["d16"], m["hi"]
+            if d16 and (op not in ("u8", "i8", "u16") or (op == "i8" and high)):
+                raise ValueError("Unsupported compute instruction: " + line)
             width = int(op[1:])
             if (not lds_enabled or guard_span is not None or max(dst, addr) > 255
                     or vector.get(addr) != ("lds_address",) or lds_word is None or offset % (width // 8)):
@@ -485,6 +487,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     expression = f"asuint(asint({shifted} << {extend}u) >> {extend}u)"
                 else:
                     expression = f"({shifted} & 0x{(1 << width) - 1:x}u)"
+                if d16:
+                    previous = vector.get(dst)
+                    if not is_word(previous):
+                        raise ValueError("Unverified D16 destination word")
+                    keep, shift = ("0x0000ffffu", 16) if high else ("0xffff0000u", 0)
+                    expression = f"(({hlsl_word(previous)} & {keep}) | (({expression} & 0xffffu) << {shift}u))"
                 if len(expression) > ALU_EXPRESSION_LIMIT:
                     raise ValueError("LDS expression exceeds the profile limit")
                 vector[dst] = ("alu", expression)

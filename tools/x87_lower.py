@@ -25,7 +25,7 @@ The profile accepts:
 A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status word, and
 must return with the stack empty. The stack depth before every instruction is fixed at translation
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
-instruction outside the profile (including FLDCW, FNINIT, FNSTSW with a memory operand, environment access, a
+instruction outside the profile (including FLDCW, FNINIT, FBLD, FNSTSW with a memory operand, environment access, a
 popping form with ST(0) as the destination, and the undocumented FSTP, FXCH, FCOM and FCOMP alias
 encodings), a stack overflow or underflow, a depth that differs where control flow joins, an x87
 instruction it cannot reach from the entry through direct edges, and x87 state that is live at a call, a
@@ -66,6 +66,14 @@ The checked entry also accepts FNINIT (and FINIT, which is WAIT and FNINIT). It 
 is masked, no exception is pending and WAIT does nothing. The function must then restore 0x027F before
 it returns, and it counts as loading the control word for the call and edge rule.
 
+FBSTP m80bcd stores ST(0), rounded to an integer by the rounding control, as 18 packed BCD digits and
+the sign of ST(0) (also for a value that rounds to zero), then pops. A NaN, an infinity, an unsupported
+encoding or a rounded magnitude of 10^18 or more stores the packed BCD indefinite, the masked
+invalid-operation response (x87_to_bcd in x87_soft.h). The checked entry also accepts FBLD m80bcd, which
+pushes the 18 digits exactly, with the sign from bit 7 of byte 9 and the other bits of that byte
+ignored. The SDM leaves the result undefined for a digit above 9, and the function leaves with status
+"bcddigit" there. The fixed profile rejects FBLD.
+
 The checked entry also accepts FPREM and FPREM1, which replace ST(0) by its remainder by ST(1) with the
 quotient truncated (FPREM) or rounded to nearest-even (FPREM1), and set C0, C3 and C1 to bits 2, 1 and 0
 of the quotient and C2 to 0 (x87_prem in x87_soft.h). Neither reads the control word. When the exponent
@@ -93,7 +101,7 @@ X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FR
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT, M.FLDCW, M.FCOM,
                      M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW, M.FTST, M.FICOM, M.FICOMP,
-                     M.FXAM, M.FNOP, M.FNCLEX, M.FPREM, M.FPREM1, M.FNINIT})
+                     M.FXAM, M.FNOP, M.FNCLEX, M.FPREM, M.FPREM1, M.FNINIT, M.FBLD, M.FBSTP})
 # Comparisons into C0, C2 and C3 of the status word; FCOMPP and FUCOMPP pop twice, the other P forms once.
 STATUS_COMPARES = frozenset({M.FCOM, M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP})
 STATUS_POPS = {M.FCOM: 0, M.FCOMP: 1, M.FCOMPP: 2, M.FUCOM: 0, M.FUCOMP: 1, M.FUCOMPP: 2}
@@ -115,7 +123,7 @@ CHECKED_DECLARATION = "X87Value x87_slot[8]{}; uint16_t x87_cw = 0x027f;"
 # operand with the reserved precision control 01, a return with a control word other than 0x027F, an FPREM
 # or FPREM1 that reduces only partially, and an FPREM or FPREM1 with a NaN result in a function that reads
 # the status word.
-STATUS = {"unmasked": 1, "precision": 2, "unrestored": 3, "partial": 4, "nanremainder": 5}
+STATUS = {"unmasked": 1, "precision": 2, "unrestored": 3, "partial": 4, "nanremainder": 5, "bcddigit": 6}
 # The checked entry's partial remainders.
 REMAINDERS = frozenset({M.FPREM, M.FPREM1})
 
@@ -318,6 +326,16 @@ def _effect(i, depth, checked=None):
         return depth
     if op in POPPING and i.op_count == 2 and i.op1_register == R.ST0 and i.op0_register != R.ST0:
         if depth <= i.op0_register - R.ST0 or depth < 2:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth - 1
+    if op == M.FBSTP or (op == M.FBLD and checked is not None):  # packed BCD m80
+        if i.op0_kind != K.MEMORY or i.memory_size != S.BCD:
+            raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
+        if op == M.FBLD:
+            if depth == 8:
+                raise ValueError(f"x87 stack overflow at {i.ip:#x}: {i}")
+            return depth + 1
+        if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth - 1
     raise ValueError(f"unsupported x87 operation at {i.ip:#x}: {i}")
@@ -657,6 +675,13 @@ def _statement(i, depth, address, checked, parity, status_word=False):
         chop = "true" if op == M.FISTTP else "false"
         return (f"{{ const word a = {address()}; "
                 f"store<{unsigned}>(a, static_cast<{unsigned}>(x87_to_integer(x87_slot[{top}], {bits}, {chop}, x87_cw))); }}")
+    if op == M.FBLD:  # only the checked entry reaches this; a digit above 9 leaves the function
+        return (f"{{ const word a = {address()}; if (!x87_from_bcd(load<uint64_t>(a), load<uint16_t>(a + 8), "
+                f"x87_slot[{depth}])) {checked.leave('bcddigit')} }}  // fbld")
+    if op == M.FBSTP:
+        return (f"{{ const word a = {address()}; uint64_t low; uint16_t high; "
+                f"x87_to_bcd(x87_slot[{top}], x87_cw, low, high); store<uint64_t>(a, low); "
+                "store<uint16_t>(a + 8, high); }  // fbstp")
     if op in IARITHMETIC:  # ST(0) = ST(0) op integer, the integer converted exactly as for FILD
         signed, unsigned, bits = INTEGERS[i.memory_size]
         name = next(n for n, v in vars(M).items() if v == op).lower()

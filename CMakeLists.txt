@@ -2295,6 +2295,25 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_parity COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_parity.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_parity>"
         "$<TARGET_FILE:cpu_x87_parity_lifted>" ${x87_parity_control_files})
+    cpu_asm_fixture(cpu_x87_bcd x87_bcd)
+    # The lifted DLL and nine mutated controls that the check requires to mismatch.
+    set(x87_bcd_control_files "")
+    foreach(variant IN ITEMS lifted rcnearest rangebefore threshold zerosign indefinite bstpnibbles bldnibbles
+            signbits nodigitcheck)
+        set(x87_bcd_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_bcd_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_bcd_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_bcd.py"
+                emit "$<TARGET_FILE:cpu_x87_bcd>" "${x87_bcd_fixture}" ${variant}
+            DEPENDS cpu_x87_bcd tests/cpu/x87_bcd.py tests/cpu/x87_add.py tools/ffx_version_query.py
+                tools/x87_lower.py tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_bcd_${variant} SHARED "${x87_bcd_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_bcd_control_files "$<TARGET_FILE:cpu_x87_bcd_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_bcd COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_bcd.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_bcd>"
+        "$<TARGET_FILE:cpu_x87_bcd_lifted>" ${x87_bcd_control_files})
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
@@ -2895,6 +2914,26 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_xmem_physical_original>" "$<TARGET_FILE:cpu_xmem_physical_full_count>"
         "$<TARGET_FILE:cpu_xmem_physical_skip_release>" "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_xmem_physical_pair PROPERTIES TIMEOUT 120)
+    # An EXE that imports XMemAllocDefault and XMemFreeDefault by name (#875, exports from #879), started
+    # by Windows and by pe_map. SKIP_GPU_FREE, SKIP_HEAP_FREE and UNINDUCED are negative controls.
+    add_library(cpu_heap_probe SHARED tests/cpu/heap_probe.cpp)
+    foreach(variant IN ITEMS original skip_gpu_free skip_heap_free uninduced)
+        add_executable(cpu_xmem_default_${variant} tests/cpu/xmem_default_pair.asm tests/cpu/exe_startup.asm)
+        set_target_properties(cpu_xmem_default_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_xmem_default_${variant} PRIVATE /ENTRY:native_startup
+            /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_xmem_default_${variant} PRIVATE xmem_shim cpu_exe_io cpu_heap_probe kernel32)
+    endforeach()
+    target_compile_definitions(cpu_xmem_default_skip_gpu_free PRIVATE SKIP_GPU_FREE)
+    target_compile_definitions(cpu_xmem_default_skip_heap_free PRIVATE SKIP_HEAP_FREE)
+    target_compile_definitions(cpu_xmem_default_uninduced PRIVATE UNINDUCED)
+    add_test(NAME cpu_native_xmem_default_pair COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xmem_default_pair_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_xmem_default_original>" "$<TARGET_FILE:cpu_xmem_default_skip_gpu_free>"
+        "$<TARGET_FILE:cpu_xmem_default_skip_heap_free>" "$<TARGET_FILE:cpu_xmem_default_uninduced>"
+        "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_heap_probe>")
+    set_tests_properties(cpu_native_xmem_default_pair PROPERTIES TIMEOUT 180)
+
     foreach(variant IN ITEMS original returning no_worker)
         add_executable(cpu_exe_worker_alive_${variant} tests/cpu/worker_alive_entry.asm)
         set_target_properties(cpu_exe_worker_alive_${variant} PROPERTIES LINKER_LANGUAGE CXX)
@@ -3228,6 +3267,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_brev_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_brev_${adapter}.txt")
+        add_test(NAME pixel_aot_smem_pointers_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-smem-pointers "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_smem_pointers_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_smem_pointers_${adapter}.txt")
         add_test(NAME pixel_aot_cmp64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-cmp64 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
