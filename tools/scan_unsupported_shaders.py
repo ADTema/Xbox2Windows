@@ -177,7 +177,8 @@ if PIXEL_VOP3P_INT16:
     )
 
 for name, (arity, _) in PIXEL_INTEGER.items():
-    encoding = r"(?:_e32|_e64)?" if arity <= 2 else r"(?:_e64)?"
+    vop3_only = arity > 2 or name in getattr(pixel_aot, "INTEGER_VOP3_ONLY", ())
+    encoding = r"(?:_e64)?" if vop3_only else r"(?:_e32|_e64)?"
     SUPPORTED_INSTRUCTIONS_REGEX.append(rf"v_{name}{encoding}\s+v\d+" + rf",\s*{INTEGER_SOURCE}" * arity)
 
 # SDWA forms of the 32-bit integer operations: register sources, optionally under sext(), every field printed,

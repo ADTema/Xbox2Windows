@@ -503,6 +503,12 @@ INTEGER = {
     "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
     "xnor_b32": (2, "~({0} ^ {1})"),
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
+    # Saturating packs: src0 gives the low and src1 the high 16 bits (AMD RDNA 2 ISA reference, VOP3 opcodes
+    # 874 and 875). The ISA text does not define its conversion functions; the bounds are the clamp Mesa
+    # documents for the NIR operations its ACO backend selects these instructions for.
+    "cvt_pk_u16_u32": (2, "min({0}, 65535u) | (min({1}, 65535u) << 16u)"),
+    "cvt_pk_i16_i32": (2, "(asuint(clamp(asint({0}), -32768, 32767)) & 0xffffu) | "
+                          "(asuint(clamp(asint({1}), -32768, 32767)) << 16u)"),
     "alignbit_b32": (3, "(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))"),
     "alignbyte_b32": (3, "(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - (({2} & 3u) * 8u)))))"),
     "add3_u32": (3, "({0} + {1} + {2})"),
@@ -538,6 +544,8 @@ MUL24_HELPERS = {
     "mul_hi_u32_u24": ("mul24_hi_u32",),
     "mul_hi_i32_i24": ("mul24_hi_u32", "mul24_hi_i32"),
 }
+# Two-source integer operations that exist in the VOP3 encoding only on gfx10.
+INTEGER_VOP3_ONLY = ("cvt_pk_u16_u32", "cvt_pk_i16_i32")
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
     "and": "uint2({0} & {2}, {1} & {3})",
@@ -2371,6 +2379,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid integer operation")
             if arity > 2 and encoding == "e32":
                 raise ValueError(f"Three-operand operation does not support e32 encoding: v_{op}")
+            if op in INTEGER_VOP3_ONLY and encoding == "e32":
+                raise ValueError(f"VOP3-only operation does not support e32 encoding: v_{op}")
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
             if op in MUL24_HELPERS:
                 helpers.update(MUL24_HELPERS[op])

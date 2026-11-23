@@ -312,6 +312,7 @@ def check_shader_records():
         ("VOP2", "v_mul_hi_i32_i24"), ("VOP3", "v_mul_hi_i32_i24_e64"),
         ("VOP2", "v_mul_hi_u32_u24"), ("VOP3", "v_mul_hi_u32_u24_e64"),
     }
+    pack_int16_forms = {("VOP3", "v_cvt_pk_u16_u32"), ("VOP3", "v_cvt_pk_i16_i32")}
     sop2_lshl_add_forms = {
         ("SOP2", "s_lshl1_add_u32"), ("SOP2", "s_lshl2_add_u32"),
         ("SOP2", "s_lshl3_add_u32"), ("SOP2", "s_lshl4_add_u32"),
@@ -322,6 +323,8 @@ def check_shader_records():
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "v_mul_i32_i24_sdwa",
+        "v_cvt_pk_u8_f32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
+        "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
         "s_absdiff_i64", "s_absdiff_u32",
     }
@@ -340,6 +343,7 @@ def check_shader_records():
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)
+        assert pack_int16_forms <= covered, (name, pack_int16_forms - covered)
         # v_mac_f32 is in the gfx1013 list only.
         approx_e64_forms = {("VOP3", "v_exp_f32_e64"), ("VOP3", "v_log_f32_e64")}
         approx_e64_forms |= {("VOP3", "v_mac_f32_e64")} if name == "gfx1013.tsv" else set()
