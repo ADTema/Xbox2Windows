@@ -727,13 +727,23 @@ class TestRdna2Disasm(unittest.TestCase):
         insns = disasm_rdna2(bytes.fromhex("f904887d01860686"))
         self.assertEqual(insns[0]["assembly"], "v_cmp_gt_u32_sdwa s6, v1, s2 src0_sel:DWORD src1_sel:DWORD")
 
-        # Negative and boundary controls: 64-bit VOPC has no SDWA form, sel == 7 is invalid,
+        # Negative and boundary controls: encodings LLVM 15 refuses stay 8-byte vopc_sdwa records,
         # and a 4-byte SDWA prefix returns vopc_truncated.
-        for bad_hex in (
+        refused = (
             "f904427c01000606",  # v_cmp_lt_f64_e32 with src0=249 (64-bit compare)
             "f904887d01000706",  # src0_sel == 7 (invalid)
             "f904887d01000607",  # src1_sel == 7 (invalid)
-        ):
+            "f904887d01864606",  # reserved Inst{54} set
+            "f904887d01860646",  # reserved Inst{62} set
+            "f904027c01860e06",  # float compare with src0_sext set
+            "f904027c0186060e",  # float compare with src1_sext set
+            "f904887d01861606",  # integer compare with src0_neg set
+            "f904887d01860626",  # integer compare with src1_abs set
+            "f904107d01860616",  # v_cmp_class_f32_sdwa with src1_neg set
+            "f904247c01860606",  # v_cmpx_eq_f32_sdwa with sdst_en set
+            "f904887dff868606",  # src0_sgpr=1 with literal tag 255
+        )
+        for bad_hex in refused:
             bad = disasm_rdna2(bytes.fromhex(bad_hex) + bytes.fromhex("000081bf"))
             self.assertEqual([i["opcode"] for i in bad], ["vopc_sdwa", "s_endpgm"], bad_hex)
             self.assertEqual(bad[0]["length"], 8, bad_hex)
@@ -797,6 +807,24 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
         # All 33 SDWA lines are 8 bytes each and must produce 33 distinct encodings.
         self.assertEqual(len({emitted[i:i + 8] for i in range(0, 33 * 8, 8)}), 33)
+        # Verify LLVM 15 itself refuses every reserved/wrong-type SDWA bit pattern we reject.
+        for bad_hex in (
+            "f904427c01000606",
+            "f904887d01000706",
+            "f904887d01000607",
+            "f904887d01864606",
+            "f904887d01860646",
+            "f904027c01860e06",
+            "f904027c0186060e",
+            "f904887d01861606",
+            "f904887d01860626",
+            "f904107d01860616",
+            "f904247c01860606",
+            "f904887dff868606",
+        ):
+            with self.subTest(llvm_refused=bad_hex):
+                with self.assertRaises(ValueError):
+                    llvm_disassemble(bytes.fromhex(bad_hex), resolved_lib)
 
     def test_sop2_absdiff_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import SOP2_OPS

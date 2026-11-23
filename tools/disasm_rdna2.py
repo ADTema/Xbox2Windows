@@ -965,6 +965,9 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
     src1_sel = (w1 >> 24) & 0x7
     if src0_sel >= len(SDWA_SEL_NAMES) or src1_sel >= len(SDWA_SEL_NAMES):
         return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA selector")
+    # Reserved bits Inst{54} and Inst{62} must be 0 in VOP_SDWA9e.
+    if w1 & ((1 << 22) | (1 << 30)):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Reserved VOPC SDWA bit set")
 
     sdwa_name = f"{op_name[:-4]}_sdwa" if op_name.endswith("_e32") else f"{op_name}_sdwa"
     src0_raw = w1 & 0xff
@@ -979,22 +982,36 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
     src1_abs = (w1 >> 29) & 1
     src1_sgpr = (w1 >> 31) & 1
 
-    src0_str = decode_s_reg(src0_raw) if src0_sgpr else f"v{src0_raw}"
-    src1_str = decode_s_reg(vsrc1) if src1_sgpr else f"v{vsrc1}"
+    is_cmpx = op_name.startswith("v_cmpx_")
+    if is_cmpx and sdst_en:
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "VOPCX SDWA forbids sdst_en")
+    if (src0_sgpr and src0_raw in (249, 250, 255)) or (src1_sgpr and vsrc1 in (249, 250, 255)):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA scalar operand")
 
     is_float = op_name.endswith(("_f32_e32", "_f16_e32"))
     is_class = "_class_" in op_name
-    if is_float:
+    src0_is_float = is_float
+    src1_is_float = is_float and not is_class
+    # Reject modifier bits disallowed by VOP_SDWA9e for the operand type (LLVM 15 refuses these).
+    if (src0_is_float and src0_sext) or (not src0_is_float and (src0_neg or src0_abs)):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA src0 modifier")
+    if (src1_is_float and src1_sext) or (not src1_is_float and (src1_neg or src1_abs)):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA src1 modifier")
+
+    src0_str = decode_s_reg(src0_raw) if src0_sgpr else f"v{src0_raw}"
+    src1_str = decode_s_reg(vsrc1) if src1_sgpr else f"v{vsrc1}"
+
+    if src0_is_float:
         src0_str = _format_operand_modifiers(src0_str, src0_abs, src0_neg)
     elif src0_sext:
         src0_str = f"sext({src0_str})"
-    if is_float and not is_class:
+    if src1_is_float:
         src1_str = _format_operand_modifiers(src1_str, src1_abs, src1_neg)
     elif src1_sext:
         src1_str = f"sext({src1_str})"
 
     sels = f"src0_sel:{SDWA_SEL_NAMES[src0_sel]} src1_sel:{SDWA_SEL_NAMES[src1_sel]}"
-    if op_name.startswith("v_cmpx_"):
+    if is_cmpx:
         asm = f"{sdwa_name} {src0_str}, {src1_str} {sels}"
     else:
         dst_str = decode_s_reg(sdst) if sdst_en else "vcc_lo"
