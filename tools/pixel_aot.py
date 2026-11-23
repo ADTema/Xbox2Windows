@@ -2335,6 +2335,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             raise ValueError("Invalid instruction element")
         offset_index = {}
         positioned = ((None, line) for line in instructions)
+
+    def close_region(i, pair):
+        """Merge every register the open region rewrote with a per-lane select on its condition."""
+        if (region is None or pair != region["save"]
+                or (region["skip"] is not None and region["skip"] != i)):
+            raise ValueError("Unexpected execution mask restore")
+        for dst, outer in region["written"].items():
+            if outer is MISSING or dst in vector.conditional:
+                vector.conditional.add(dst)
+                continue
+            if not isinstance(outer, str) or outer in ("bary_i", "bary_j"):
+                raise ValueError("Masked region rewrites a register without a numeric value")
+            inner = vector[dst]
+            lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
+            vector[dst] = f"alu{i}_{dst}"
+        vector.masked = False
+        vector.reads.clear()
+
     for i, (offset, line) in enumerate(positioned):
         vector.reads.clear()
         conditional = set(vector.conditional)
@@ -2350,6 +2368,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         rstate = None
         if region is not None:
             if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]", line):
+                pass
+            elif region["opener"] == "cmpx" and re.fullmatch(r"s_mov_b64 exec, s\[\d+:\d+\]", line):
                 pass
             elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
                     and i == region["start"] + 1 and region["skip"] is None):
@@ -2527,6 +2547,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             mask = "entry"
             wqm_width = None
             scc = None
+        elif region is not None and (m := match(r"s_mov_b64 exec, (s\[\d+:\d+\])")):
+            # The v_cmpx region closes with an exact copy of the saved mask. Unlike s_or_b64 it leaves SCC.
+            if region["opener"] != "cmpx":
+                raise ValueError("Unexpected execution mask restore")
+            close_region(i, sgpr_pair(m[1]))
+            region = None
         elif m := match(r"s_mov_b64 (?:exec|exec_lo), (s\[\d+:\d+\])"):
             lo, hi = sgpr_pair(m.group(1))
             if mask != "quad" or wqm_width != 64 or [scalar.get(lo), scalar.get(hi)] != [("entry", 0), ("entry", 1)]:
@@ -2565,9 +2591,38 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                         != [(*condition[:2], j, len(regs)) for j in range(len(regs))]):
                 raise ValueError("Unsupported execution mask save")
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
-            region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i}
+            region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i,
+                      "opener": "saveexec"}
             vector.masked = True
             scc = None
+        elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32))_e32 "
+                        r"([^,]+), ([^,]+)"):
+            # A masked-if opened by a VOPC e32 compare that writes EXEC (issue #932). It must directly
+            # follow `s_mov_b64 s[a:b], exec` of the known entry mask, so EXEC becomes the entry mask
+            # intersected with the comparison, as after s_and_saveexec_b64. v_cmpx writes neither VCC nor
+            # SCC, so both keep their tracked values; the region closes with s_mov_b64 or s_or_b64.
+            fop, iop, kind, src0, src1 = m.groups()
+            previous = instructions[i - 1] if i else ""
+            previous = previous[1] if isinstance(previous, tuple) else previous
+            saved = re.fullmatch(r"s_mov_b64 (s\[\d+:\d+\]), exec", previous)
+            pair = sgpr_pair(saved[1]) if saved else None
+            if (region is not None or mask != "entry" or pair is None
+                    or [scalar.get(r) for r in pair] != [("entry", 0), ("entry", 1)]):
+                raise ValueError("Unsupported v_cmpx execution mask save")
+            # VOPC e32 encodes VSRC1 as a VGPR and carries no source modifiers.
+            if not re.fullmatch(r"v\d+", src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0):
+                raise ValueError(f"Invalid VOPC e32 operands: {line}")
+            if fop is not None:
+                expr = f32_comparison(fop, [src0, src1], scalar, vector, pending, sample_dest)
+            else:
+                values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
+                          for t in (src0, src1)]
+                expr = INT_COMPARE[iop].format(*values)
+            lines.append(f"    bool cmp{i} = {expr};")
+            scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
+            region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i,
+                      "opener": "cmpx"}
+            vector.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
             # The whole-wave empty-mask skip may sit right after the save; its target must be
             # the matching restore exactly. Offsets count from the next instruction.
@@ -2581,28 +2636,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if restore is None or restore <= i:
                 raise ValueError("Execution skip targets no instruction boundary")
             target = instructions[restore][1] if isinstance(instructions[restore], tuple) else instructions[restore]
-            if not (rm := re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)) \
-                    or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
+            rm = re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)
+            if rm is None and region["opener"] == "cmpx":
+                rm = re.fullmatch(r"s_mov_b64 exec, s\[(\d+):(\d+)\]", target)
+            if rm is None or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
                 raise ValueError("Execution skip does not target the matching restore")
             region["skip"] = restore
             seen_skip = True
         elif m := match(r"s_or_b64 exec, exec, (s\[\d+:\d+\])"):
-            pair = sgpr_pair(m[1])
-            if (region is None or pair != region["save"]
-                    or (region["skip"] is not None and region["skip"] != i)):
-                raise ValueError("Unexpected execution mask restore")
-            for dst, outer in region["written"].items():
-                if outer is MISSING or dst in vector.conditional:
-                    vector.conditional.add(dst)
-                    continue
-                if not isinstance(outer, str) or outer in ("bary_i", "bary_j"):
-                    raise ValueError("Masked region rewrites a register without a numeric value")
-                inner = vector[dst]
-                lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
-                vector[dst] = f"alu{i}_{dst}"
+            close_region(i, sgpr_pair(m[1]))
             region = None
-            vector.masked = False
-            vector.reads.clear()
+            # s_or_b64 writes SCC from the restored mask, a wave property the per-lane model cannot compute.
             scc = None
         elif m := match(r"s_(cmov|not|brev)_b64 (s\[\d+:\d+\]), ([^,]+)"):
             op, dst, src = m.groups()

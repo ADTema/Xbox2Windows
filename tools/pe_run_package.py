@@ -28,8 +28,6 @@ def plan(report):
         terminal = chain[-1]
         if terminal.get("package") and terminal["provider"] == image:
             raise ValueError(f"{image}: self import needs deferred DLL attachment")
-        if terminal.get("package") and terminal["symbol"].startswith("#"):
-            raise ValueError(f"{image}: bundled ordinal exports require a mapper ordinal lookup")
         old = routes[image].setdefault(name, terminal)
         if old != terminal:
             raise ValueError(f"{image}: conflicting bindings for {name[0]}!{name[1]}")
@@ -100,6 +98,14 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                 raise ValueError(f"{image}: file changed after inventory")
 
         lib = C.WinDLL(str(mapper), winmode=0x900)
+        ordinal_routes = any(terminal.get("package") and terminal["symbol"].startswith("#")
+                             for bindings in routes.values() for terminal in bindings.values())
+        export_ordinal = None
+        if ordinal_routes:
+            try:
+                export_ordinal = prototype(lib, "pe_map_export_ordinal", [C.c_void_p, C.c_uint32], C.c_void_p)
+            except AttributeError as exc:
+                raise ValueError("bundled ordinal imports require a mapper with pe_map_export_ordinal") from exc
         for name in sorted(pin_shims):
             module = modules.get(name)
             if not module:
@@ -124,7 +130,11 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                 symbol = terminal["symbol"]
                 if terminal.get("package"):
                     provider = terminal["provider"]
-                    imports[key] = export(mapped[provider], symbol.encode("ascii"))
+                    imports[key] = (export_ordinal(mapped[provider], int(symbol[1:]))
+                                    if symbol.startswith("#") else
+                                    export(mapped[provider], symbol.encode("ascii")))
+                    if not imports[key]:
+                        raise ValueError(f"{image}: mapped export {provider}!{symbol} unavailable")
                 else:
                     imports[key] = addresses[terminal["dll"].casefold(), symbol]
 
