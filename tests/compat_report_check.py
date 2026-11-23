@@ -22,6 +22,10 @@ POSITIVE_IMPORTS = [
     ("normal", "kernel32.dll", "ExitProcess"),
     ("normal", "xmem.dll", "XMemAlloc"),
     ("normal", "xmem.dll", 7),
+    # Synthetic ordinal: no checked-in xmem export table is consulted.
+    ("normal", "xmem.dll", 65535),
+    # Synthetic API-set name: the prefix alone selects the candidate route.
+    ("normal", "api-ms-win-fixture-l1-1-0.dll", "FabricatedApi"),
     ("delay", "xgameruntime.dll", "XUserGetId"),
     ("delay", "xg_xs.dll", 3),
 ]
@@ -140,6 +144,13 @@ def build_image(imports, *, tls=True, seh=True, load_config=True):
     return bytes(buf)
 
 
+def patch_machine(image_bytes, machine):
+    """Patch the PE COFF machine field; the fixture is otherwise unchanged."""
+    data = bytearray(image_bytes)
+    struct.pack_into("<H", data, 0x84, machine)
+    return bytes(data)
+
+
 def run_tool(image, out_dir, stem):
     json_path = Path(out_dir) / f"{stem}.json"
     markdown_path = Path(out_dir) / f"{stem}.md"
@@ -163,6 +174,8 @@ def check_policy():
     assert classify("xaudio2_9.dll") == ("windows", "Windows system DLL")
     assert classify("kernel32.dll")[0] == "windows"
     assert classify("api-ms-win-core-file-l1-1-0.dll")[0] == "windows"
+    assert classify("api-ms-win-fixture-l1-1-0.dll") == (
+        "windows", "Windows API-set contract")
     assert classify("ext-ms-win-ntuser-window-l1-1-0.dll")[0] == "windows"
     assert classify("mystery.dll") == ("unsupported", "no matching policy entry")
 
@@ -191,25 +204,61 @@ def check_positive():
 
         routing = report["sections"]["import_routing"]
         assert routing["policy_version"] == POLICY_VERSION
+        assert "candidate" in routing["scope"].lower()
+        assert "does not resolve" in routing["scope"].lower()
+        assert "prove a provider" in routing["scope"].lower()
         assert routing["summary"] == {
             "images": 1,
-            "imports": 5,
-            "normal": 3,
+            "imports": 7,
+            "normal": 5,
             "delay": 2,
-            "by_ordinal": 2,
-            "routes": {"hle": 2, "windows": 1, "stub": 2, "unsupported": 0},
+            "by_ordinal": 3,
+            "routes": {"hle": 3, "windows": 2, "stub": 2, "unsupported": 0},
+            "route_kind": "candidate",
+            "resolution": "not_checked",
+            "stub_rows": 2,
+            "stub_providers": 0,
             "unknown": 0,
         }
         rows = [(row["kind"], row["module"], row["symbol"], row["route"])
                 for row in routing["imports"]]
         assert rows == [
+            ("normal", "api-ms-win-fixture-l1-1-0.dll", "FabricatedApi", "windows"),
             ("normal", "kernel32.dll", "ExitProcess", "windows"),
             ("normal", "xmem.dll", "#7", "hle"),
+            ("normal", "xmem.dll", "#65535", "hle"),
             ("normal", "xmem.dll", "XMemAlloc", "hle"),
             ("delay", "xg_xs.dll", "#3", "stub"),
             ("delay", "xgameruntime.dll", "XUserGetId", "stub"),
         ]
         assert routing["unknown"] == []
+
+        for row in routing["imports"]:
+            assert row["route_kind"] == "candidate"
+            assert row["resolution"] == "not_checked"
+            assert row["provider"] is None
+            assert row["stub"] == (row["route"] == "stub")
+            if row["route"] == "hle":
+                assert row["candidate_provider"] == row["module"]
+            else:
+                assert row["candidate_provider"] is None
+
+        absent_ordinal = next(row for row in routing["imports"]
+                              if row["module"] == "xmem.dll" and row["symbol"] == "#65535")
+        assert absent_ordinal["route"] == "hle"
+        assert absent_ordinal["resolution"] == "not_checked"
+        assert absent_ordinal["candidate_provider"] == "xmem.dll"
+
+        fabricated_api = next(row for row in routing["imports"]
+                              if row["module"] == "api-ms-win-fixture-l1-1-0.dll")
+        assert fabricated_api["route"] == "windows"
+        assert fabricated_api["resolution"] == "not_checked"
+        assert fabricated_api["provider"] is None
+        assert fabricated_api["candidate_provider"] is None
+
+        stub_rows = [row for row in routing["imports"] if row["stub"]]
+        assert len(stub_rows) == 2
+        assert all(row["provider"] is None for row in stub_rows)
 
         features = routing["features"]["positive.exe"]
         assert features["machine"] == "IMAGE_FILE_MACHINE_AMD64"
@@ -222,6 +271,9 @@ def check_positive():
         markdown = markdown1.read_text(encoding="utf-8")
         assert "## Unknown imports" in markdown
         assert "None." in markdown
+        assert "Resolution: not checked" in markdown
+        assert "Stub providers: 0" in markdown
+        assert "| Stub rows | 2 |" in markdown
         assert str(root) not in markdown
 
         second, json2, markdown2 = run_tool(image, root / "out" / "second", "compat-report")
@@ -251,6 +303,11 @@ def check_negative():
             "symbol": "MissingExport",
             "route": "unsupported",
             "reason": "no matching policy entry",
+            "route_kind": "candidate",
+            "resolution": "not_checked",
+            "provider": None,
+            "stub": False,
+            "candidate_provider": None,
         }
         assert markdown_path.exists()
         assert "mystery.dll" in markdown_path.read_text(encoding="utf-8")
@@ -275,11 +332,27 @@ def check_read_errors():
         assert not json_path.exists() and not markdown_path.exists()
 
 
+def check_machine_scope():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for machine, name in ((0xAA64, "IMAGE_FILE_MACHINE_ARM64"),
+                              (0x14C, "IMAGE_FILE_MACHINE_I386")):
+            image = root / f"machine-{machine:x}.exe"
+            image.write_bytes(patch_machine(build_image(POSITIVE_IMPORTS), machine))
+            process, json_path, markdown_path = run_tool(
+                image, root / "out" / f"machine-{machine:x}", "compat-report")
+            assert process.returncode == 2, (machine, process.stdout, process.stderr)
+            assert name in process.stderr
+            assert hex(machine) in process.stderr
+            assert not json_path.exists() and not markdown_path.exists()
+
+
 def main():
     check_policy()
     check_positive()
     check_negative()
     check_read_errors()
+    check_machine_scope()
     print("compat report synthetic checks passed")
 
 

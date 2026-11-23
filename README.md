@@ -66,7 +66,7 @@ out/source-built-package app.exe --output out/pe-package-report.json` reports di
 imports, package export/forwarder closure and external providers that could not be
 verified on the host, without loading an EXE or DLL. [Scope and synthetic tests](docs/experiments.md#offline-package-pe-import-closure).
 
-**Inspect one PE image's import routing offline:** `python -B tools/compat_report.py <image.exe> --json out/compat-report.json --markdown out/compat-report.md` classifies each normal and delay import as HLE, Windows, stub or unsupported from an explicit policy, and reports TLS, SEH and load-config directory presence. It reads the image without loading or executing it. This is an offline routing report, not a runtime measurement.
+**Inspect one AMD64 PE image's import routing offline:** `python -B tools/compat_report.py <image.exe> --json out/compat-report.json --markdown out/compat-report.md` labels each normal and delay import as a candidate HLE, Windows, stub or unsupported module route from an explicit policy; the labels do not resolve exports or prove a provider. It also reports TLS, SEH and load-config directory presence. It reads the image without loading or executing it. This is an offline routing report, not a runtime measurement.
 
 ### Windows build notes
 

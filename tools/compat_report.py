@@ -1,7 +1,7 @@
 """Offline PE import-routing report for Xbox2Windows.
 
-Read one PE image, classify every normal and delay import against an explicit
-routing policy, and write deterministic JSON and Markdown. The image is never
+Read one AMD64 PE image, classify candidate module routes for every normal and
+delay import, and write deterministic JSON and Markdown. The image is never
 loaded or executed.
 """
 
@@ -19,6 +19,13 @@ from pe_inventory import import_tables
 SCHEMA = "xbox2windows.report/1"
 TOOL_VERSION = 1
 POLICY_VERSION = 1
+AMD64 = 0x8664
+ROUTE_KIND = "candidate"
+RESOLUTION = "not_checked"
+SCOPE = (
+    "Candidate module routes from PE import module names. "
+    "The report does not resolve exports or prove a provider, and does not load or execute the image."
+)
 
 KIND_ORDER = {"normal": 0, "delay": 1}
 ROUTES = ("hle", "windows", "stub", "unsupported")
@@ -108,13 +115,14 @@ def _feature(pe, index):
     }
 
 
-def image_features(pe):
+def image_features(pe, machine):
     tls = _feature(pe, 9)
     load_config = _feature(pe, 10)
     seh = _feature(pe, 3)
-    seh["entry_size"] = 12
-    seh["entries"] = seh["size"] // 12 if seh["present"] else 0
-    seh["trailing_bytes"] = seh["size"] % 12 if seh["present"] else 0
+    if machine == AMD64:
+        seh["entry_size"] = 12
+        seh["entries"] = seh["size"] // 12 if seh["present"] else 0
+        seh["trailing_bytes"] = seh["size"] % 12 if seh["present"] else 0
     return {
         "machine": pefile.MACHINE_TYPE.get(pe.FILE_HEADER.Machine, hex(pe.FILE_HEADER.Machine)),
         "tls": tls,
@@ -141,12 +149,19 @@ def _row_key(row):
 
 def build_report(image_bytes, image_name):
     with pefile.PE(data=image_bytes, fast_load=True) as pe:
+        machine = pe.FILE_HEADER.Machine
+        if machine != AMD64:
+            name = pefile.MACHINE_TYPE.get(machine, hex(machine))
+            raise ValueError(
+                f"unsupported machine {name} ({hex(machine)}); "
+                "expected IMAGE_FILE_MACHINE_AMD64")
         imports = import_tables(pe, image_name)
-        features = image_features(pe)
+        features = image_features(pe, machine)
 
     rows = []
     for kind, module, symbol in imports:
         route, reason = classify(module)
+        stub = route == "stub"
         rows.append({
             "image": image_name,
             "kind": kind,
@@ -154,6 +169,11 @@ def build_report(image_bytes, image_name):
             "symbol": symbol,
             "route": route,
             "reason": reason,
+            "route_kind": ROUTE_KIND,
+            "resolution": RESOLUTION,
+            "provider": None,
+            "stub": stub,
+            "candidate_provider": module if route == "hle" else None,
         })
     rows.sort(key=_row_key)
     unknown = [dict(row) for row in rows if row["route"] == "unsupported"]
@@ -169,6 +189,10 @@ def build_report(image_bytes, image_name):
         "delay": sum(row["kind"] == "delay" for row in rows),
         "by_ordinal": sum(row["symbol"].startswith("#") and row["symbol"][1:].isdigit() for row in rows),
         "routes": route_counts,
+        "route_kind": ROUTE_KIND,
+        "resolution": RESOLUTION,
+        "stub_rows": sum(row["stub"] for row in rows),
+        "stub_providers": 0,
         "unknown": len(unknown),
     }
 
@@ -182,7 +206,7 @@ def build_report(image_bytes, image_name):
         },
         "sections": {
             "import_routing": {
-                "scope": "Static PE directory data only. The image is not loaded or executed.",
+                "scope": SCOPE,
                 "policy_version": POLICY_VERSION,
                 "summary": summary,
                 "features": {image_name: features},
@@ -213,6 +237,8 @@ def markdown_report(report):
         "",
         "The image is read as PE directory data. It is not loaded or executed.",
         "",
+        "Resolution: not checked. Route labels are candidate module routes and do not prove that an import resolves. Stub providers: 0.",
+        "",
         "## Summary",
         "",
         "| Metric | Value |",
@@ -222,6 +248,10 @@ def markdown_report(report):
         f"| Normal imports | {routing['summary']['normal']} |",
         f"| Delay imports | {routing['summary']['delay']} |",
         f"| By ordinal | {routing['summary']['by_ordinal']} |",
+        f"| Route kind | {routing['summary']['route_kind']} |",
+        f"| Resolution | {routing['summary']['resolution']} |",
+        f"| Stub rows | {routing['summary']['stub_rows']} |",
+        f"| Stub providers | {routing['summary']['stub_providers']} |",
     ]
     for route in ROUTES:
         lines.append(f"| Route {route} | {routing['summary']['routes'][route]} |")
@@ -251,17 +281,19 @@ def markdown_report(report):
     ])
     if routing["imports"]:
         lines.extend([
-            "| Image | Kind | Module | Symbol | Route | Reason |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "| Image | Kind | Module | Symbol | Route | Resolution | Stub | Reason |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ])
         for row in routing["imports"]:
             lines.append(
-                "| {} | {} | {} | {} | {} | {} |".format(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
                     _md_cell(row["image"]),
                     _md_cell(row["kind"]),
                     _md_cell(row["module"]),
                     _md_cell(row["symbol"]),
                     _md_cell(row["route"]),
+                    _md_cell(row["resolution"]),
+                    "yes" if row["stub"] else "no",
                     _md_cell(row["reason"]),
                 )
             )
@@ -274,16 +306,17 @@ def markdown_report(report):
     ])
     if routing["unknown"]:
         lines.extend([
-            "| Image | Kind | Module | Symbol | Reason |",
-            "| --- | --- | --- | --- | --- |",
+            "| Image | Kind | Module | Symbol | Resolution | Reason |",
+            "| --- | --- | --- | --- | --- | --- |",
         ])
         for row in routing["unknown"]:
             lines.append(
-                "| {} | {} | {} | {} | {} |".format(
+                "| {} | {} | {} | {} | {} | {} |".format(
                     _md_cell(row["image"]),
                     _md_cell(row["kind"]),
                     _md_cell(row["module"]),
                     _md_cell(row["symbol"]),
+                    _md_cell(row["resolution"]),
                     _md_cell(row["reason"]),
                 )
             )
