@@ -72,8 +72,11 @@ if ($built) {
     Set-Content -LiteralPath $stamp -Value $expected -Encoding ascii
 }
 
-& (Join-Path $bin 'spirv-as.exe') --version | Select-Object -First 1
+# Let each native process finish before truncating its output for the log.
+$asVersion = & (Join-Path $bin 'spirv-as.exe') --version
 if ($LASTEXITCODE -ne 0) { throw 'spirv-as does not run.' }
-& (Join-Path $bin 'spirv-cross.exe') --revision | Select-Object -First 1
+$asVersion | Select-Object -First 1
+$crossRevision = & (Join-Path $bin 'spirv-cross.exe') --revision
 if ($LASTEXITCODE -ne 0) { throw 'spirv-cross does not run.' }
+$crossRevision | Select-Object -First 1
 Write-Output $bin
