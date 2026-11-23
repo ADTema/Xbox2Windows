@@ -365,7 +365,8 @@ def check_virtual_tail_tls(folder, fixture, run):
                        for s in pe.sections if s.VirtualAddress != section_va)
     callback_rva = callback_va - image_base
 
-    def write_variant(name, tail_size, *, callback_table=False, directory_rva=None, zero_raw_slot=False):
+    def write_variant(name, tail_size, *, callback_table=False, directory_rva=None,
+                      zero_raw_slot=False, no_raw_pointer=False):
         path = folder / name
         with pefile.PE(str(fixture)) as pe:
             if tail_size is not None:
@@ -379,6 +380,9 @@ def check_virtual_tail_tls(folder, fixture, run):
             if directory_rva is not None:
                 pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = directory_rva
                 pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 0
+            if no_raw_pointer:
+                section = next(s for s in pe.sections if s.VirtualAddress == section_va)
+                section.PointerToRawData = 0
             pe.write(str(path))
         return path
 
@@ -392,10 +396,14 @@ def check_virtual_tail_tls(folder, fixture, run):
 
     # The directory itself lies in uninitialized memory: zero bytes past raw data are a valid
     # empty directory, whether the read starts in the tail or crosses into it from raw data.
-    for label, directory_rva, zero_raw_slot in (("tail", tail_rva, False),
-                                               ("crossing", tail_rva - 8, True)):
+    for label, directory_rva, zero_raw_slot, no_raw_pointer in (
+        ("tail", tail_rva, False, False),
+        ("crossing", tail_rva - 8, True, False),
+        ("no-raw-pointer", section_va, False, True),
+    ):
         report = run(0, write_variant(f"tls-{label}-directory.exe", 0x40,
-                                      directory_rva=directory_rva, zero_raw_slot=zero_raw_slot))
+                                      directory_rva=directory_rva, zero_raw_slot=zero_raw_slot,
+                                      no_raw_pointer=no_raw_pointer))
         assert report["pe"]["tls"] == dict(
             directory_rva=directory_rva, template_start_va=0, template_end_va=0, index_va=0,
             callback_table_va=0, callbacks_rva=[], zero_fill=0, characteristics=0)

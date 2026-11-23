@@ -95,8 +95,9 @@ def inspect_executable(path):
         def read_rva(rva, length):
             section = section_for(rva, length)
             offset = rva - section.VirtualAddress
-            # The loader zero-fills everything a section maps past its raw data.
-            file_backed = min(length, max(0, section.SizeOfRawData - offset))
+            # A zero raw pointer leaves the entire section zero-filled, as in pe_map.
+            raw_size = section.SizeOfRawData if section.PointerToRawData else 0
+            file_backed = min(length, max(0, raw_size - offset))
             data = section.get_data(rva, file_backed) if file_backed else b""
             if len(data) != file_backed:
                 raise ValueError(f"Truncated data at RVA {rva:#x}")
