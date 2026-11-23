@@ -888,9 +888,9 @@ constexpr CapabilityGate kGateSm60SamplerViews{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: sampler fixture requires SM 6.0",
     CapsDiagnostic::none};
-constexpr CapabilityGate kGateSm66CompareSampler{
-    D3D_SHADER_MODEL_6_6, false, false, 0,
-    "skip: comparison-sampler fixture requires SM 6.6",
+constexpr CapabilityGate kGateSm60CompareSampler{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: comparison-sampler fixture requires SM 6.0",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_6, true, false, 0,
@@ -925,7 +925,7 @@ const OperationSpec kOperations[] = {
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
-    {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm66CompareSampler, run_spirv_compare_sampler},
+    {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
     {"--spirv-compaction", 4, 4, nullptr, kGateSm60Compaction, run_spirv_compaction},
@@ -1261,6 +1261,16 @@ int run_self_test()
         if (!require(out.find("skip: mesh fallback requires SM 6.0") != std::string::npos,
                      "--mesh-depth-pair-fallback must print its skip reason")) return 1;
 
+        const OperationSpec* compare_sampler = find_operation("--spirv-compare-sampler");
+        if (!require(compare_sampler != nullptr, "--spirv-compare-sampler operation")) return 1;
+        const AdapterCaps sm60_caps{D3D_SHADER_MODEL_6_0};
+        if (!require(evaluate_gate(compare_sampler->gate, sm60_caps), "comparison sampler accepts SM 6.0"))
+            return 1;
+        out.clear();
+        if (!require(!evaluate_gate(compare_sampler->gate, sm51_caps, {&out, &err}) &&
+                     out.find("skip: comparison-sampler fixture requires SM 6.0") != std::string::npos,
+                     "comparison sampler requires SM 6.0 and prints its skip reason")) return 1;
+
         // The ballot fixture skips on a runtime capped at SM 6.5, as the Windows 10 in-box runtime is (#751).
         const OperationSpec* ballot = find_operation("--spirv-ballot");
         if (!require(ballot != nullptr, "--spirv-ballot operation")) return 1;
@@ -1316,7 +1326,6 @@ int run_self_test()
         char* quad_argv[]{prog, mode, quad_op, dxil};
         const OperationSpec* quad = find_operation(quad_op);
         if (!require(quad != nullptr, "MinLod smoke operation")) return 1;
-        const AdapterCaps sm60_caps{D3D_SHADER_MODEL_6_0};
         if (!require(evaluate_gate(quad->gate, sm60_caps), "MinLod smoke draw must accept SM 6.0")) return 1;
         OperationContext qctx{nullptr, nullptr, sm51_caps, "warp", 4, quad_argv, nullptr};
         out.clear();
