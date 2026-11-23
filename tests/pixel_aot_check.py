@@ -283,8 +283,9 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
     for row in rows:
         data += struct.pack("<4f", *row)
     if write_mask is not None:
-        if write_mask not in (0x3, 0xC, 0xF) or integer_rt or nan_mask is not None or extra_constants is not None or title_memory is not None:
-            raise ValueError("An explicit pair write mask requires a plain floating-point render target")
+        if (not 0 < write_mask <= 0xF or integer_rt or
+                any(item is not None for item in (nan_mask, extra_constants, title_memory))):
+            raise ValueError("An explicit write mask requires a nonzero nibble and a plain floating-point render target")
         data.append(write_mask << 4)
     else:
         if extra_constants is not None and (integer_rt or nan_mask is not None or title_memory is not None):
@@ -458,11 +459,12 @@ def check_movk_draw(directory, compiler, renderer, backend):
     run_pixel_batch(renderer, backend, shader, cases)
 
 
-def uncompressed_export(body):
-    """Run body on the sample, then export v12 to v15 as four uncompressed binary32 channels."""
+def uncompressed_export(body, mask=0xF):
+    """Run body on the sample, then export the enabled v12 to v15 binary32 channels."""
     program = with_constants(body)
     pos = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
-    program[pos:] = ["exp mrt0 v12, v13, v14, v15 done vm", "s_endpgm"]
+    operands = [f"v{12 + ch}" if mask & (1 << ch) else "off" for ch in range(4)]
+    program[pos:] = [f"exp mrt0 {', '.join(operands)} done vm", "s_endpgm"]
     return program
 
 
@@ -6685,9 +6687,19 @@ def check_controls(directory):
     for invalid in ("exp mrt0 off, off, off, off done compr vm",
                     "exp mrt0 v16, v16, v17, off done compr vm",
                     "exp mrt0 v16, off, off, off done compr vm",
-                    "exp mrt0 off, off, v17, off done compr vm",
-                    "exp mrt0 v12, off, v14, v15 done vm"):
+                    "exp mrt0 off, off, v17, off done compr vm"):
         must_reject(translate_masked, partial[:export] + [invalid] + partial[export + 1:])
+    for mask in (0x1, 0x8, 0x5, 0xA, 0xF):
+        program = uncompressed_export([], mask)
+        modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
+        assert translate_masked(program) == translate_masked(modern)
+        assert translate_masked(program)[1] == mask
+        if mask != 0xF:
+            must_reject(translate, program)
+            must_reject(translate_int, program)
+    must_reject(translate_masked, uncompressed_export([], 0))
+    duplicate = uncompressed_export([], 0x5)
+    must_reject(translate_masked, [line.replace("v12, off, v14", "v12, off, v12") for line in duplicate])
     # A syntactically valid DPP VGPR must already have a tracked numeric value.
     must_reject(translate, with_constants([
         "v_mov_b32_dpp v12, v255 dpp8:[1,2,3,0,5,6,7,4]",
@@ -7980,6 +7992,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((compressed_export(mask), translate_masked) for mask in (0x3, 0xC, 0xF))
+    fixtures.extend((uncompressed_export([], mask), translate_masked) for mask in (0x1, 0x8, 0x5, 0xA))
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
@@ -8073,18 +8086,29 @@ def check_exp_en_decoding(directory, assembler, objcopy, library):
 
 
 def check_compressed_export_draw(directory, compiler, renderer, backend):
+    return check_float_export_masks(directory, compiler, renderer, backend, (0x3, 0xC, 0xF),
+                                    compressed_export, (0.5, 1.5, -2.5, 3.5), half_rtz)
+
+
+def check_uncompressed_export_draw(directory, compiler, renderer, backend):
+    body = [f"v_sub_f32_e64 v{12 + i}, s{44 + i}, 0" for i in range(4)]
+    values = tuple(value + 2**-20 for value in (0.5, 1.5, -2.5, 3.5))
+    return check_float_export_masks(directory, compiler, renderer, backend, (0x1, 0x8, 0x5, 0xA, 0xF),
+                                    lambda mask: uncompressed_export(body, mask), values, float)
+
+
+def check_float_export_masks(directory, compiler, renderer, backend, masks, program, values, channel_value):
     sentinel = (-1.0, 2.0, -3.0, 4.0)
-    values = (0.5, 1.5, -2.5, 3.5)
     constants = bytearray(256)
     struct.pack_into("<4f", constants, 12, *values)
-    source = directory / "compressed-export.hlsl"
-    shader = directory / "compressed-export.cso"
-    for requested in (0x3, 0xC, 0xF):
-        hlsl, mask = translate_masked(compressed_export(requested))
+    source = directory / "masked-export.hlsl"
+    shader = directory / "masked-export.cso"
+    for requested in masks:
+        hlsl, mask = translate_masked(program(requested))
         assert mask == requested
         source.write_text(hlsl, encoding="ascii")
         compile_shader(compiler, source, shader)
-        expected = tuple(half_rtz(value) if requested & (1 << ch) else sentinel[ch]
+        expected = tuple(channel_value(value) if requested & (1 << ch) else sentinel[ch]
                          for ch, value in enumerate(values))
         good = write_case(directory / "masked.case", constants, expected, write_mask=mask)
         cases = [(good, "pass")]
@@ -10862,7 +10886,8 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-int16-vop3", "draw-compressed-export", "draw-title-loads", "draw-cmp64"):
+                    "draw-mac-legacy", "draw-int16-vop3", "draw-compressed-export",
+                    "draw-uncompressed-export", "draw-title-loads", "draw-cmp64"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -10878,6 +10903,7 @@ def main():
                         "draw-mac-legacy": check_mac_legacy_draws,
                         "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-compressed-export": check_compressed_export_draw,
+                        "draw-uncompressed-export": check_uncompressed_export_draw,
                         "draw-title-loads": check_title_load_draws,
                         "draw-cmp64": check_cmp64_draw}[mode]
                 return draw(directory, *args)
