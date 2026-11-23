@@ -527,6 +527,11 @@ INTEGER = {
     "mul_hi_i32_i24": (2, "mul24_hi_i32({0}, {1})"),
     "bfrev_b32": (1, "reversebits({0})"), "ffbl_b32": (1, "firstbitlow({0})"),
     "ffbh_u32": (1, "dpp_ffbh_u32({0})"), "ffbh_i32": (1, "dpp_ffbh_i32({0})"),
+    # Sums of absolute differences, all unsigned and modulo 2^32 (AMD RDNA 2 ISA reference, VOP3 opcodes 347,
+    # 349 and 369). src1 is the reference: v_msad_u8 leaves out each byte lane whose src1 byte is zero.
+    "sad_hi_u8": (3, "(sad4_u8({0}, {1}, false) << 16u) + {2}"),
+    "sad_u32": (3, "(max({0}, {1}) - min({0}, {1})) + {2}"),
+    "msad_u8": (3, "sad4_u8({0}, {1}, true) + {2}"),
 }
 # The ffbh helpers are the ones the DPP spellings use (DPP_INT32); the definitions live in SALU_HELPERS.
 INTEGER_HELPERS = {"ffbh_u32": ("dpp_ffbh_u32",), "ffbh_i32": ("dpp_ffbh_i32",)}
@@ -546,6 +551,7 @@ MUL24_HELPERS = {
 }
 # Two-source integer operations that exist in the VOP3 encoding only on gfx10.
 INTEGER_VOP3_ONLY = ("cvt_pk_u16_u32", "cvt_pk_i16_i32")
+SAD_HELPERS = {"sad_hi_u8": ("sad4_u8",), "msad_u8": ("sad4_u8",)}
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
     "and": "uint2({0} & {2}, {1} & {3})",
@@ -818,6 +824,17 @@ uint mul_hi_i32(uint a, uint b) {
         "    }\n"
         "    uint2 s = dot_u64_add(uint2(c, 0u), sum);\n"
         "    return sat ? dot_u64_sat(s) : s.x;\n"
+        "}"
+    ),
+    "sad4_u8": (
+        "uint sad4_u8(uint a, uint b, bool masked) {\n"
+        "    uint sum = 0u;\n"
+        "    for (uint k = 0u; k < 32u; k += 8u) {\n"
+        "        uint x = (a >> k) & 0xffu;\n"
+        "        uint y = (b >> k) & 0xffu;\n"
+        "        if (!masked || y != 0u) sum += x > y ? x - y : y - x;\n"
+        "    }\n"
+        "    return sum;\n"
         "}"
     ),
     "mul24_u32": (
@@ -2385,6 +2402,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if op in MUL24_HELPERS:
                 helpers.update(MUL24_HELPERS[op])
             helpers.update(INTEGER_HELPERS.get(op, ()))
+            helpers.update(SAD_HELPERS.get(op, ()))
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):

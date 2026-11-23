@@ -5610,6 +5610,74 @@ CARRY_OUT_WRONG = {
         (2, 1, lambda a, b, c, d: c, "borrow dropped"),
     ),
 }
+# Sums of absolute differences (v_sad_hi_u8, v_sad_u32, v_msad_u8). Bodies for uncompressed_export(): s44 = A,
+# s45 = B and s46 = C from the constants, v18 = B, and each channel v12..v15 holds its own result. The second
+# source is the reference of v_msad_u8, here once a register and once a literal whose byte 2 is zero. No
+# instruction uses more than two scalar registers and literals, the gfx10 constant bus limit LLVM 15 enforces.
+SAD_LITERAL = 0x7f00ff01
+SAD_BODIES = {
+    "bytes": ["v_sad_hi_u8 v12, s44, v18, s46", "v_sad_hi_u8 v13, v18, s44, 0",
+              "v_msad_u8 v14, s44, v18, s46", "v_msad_u8 v15, v18, s44, s46"],
+    "dword": ["v_sad_u32 v12, s44, v18, s46", "v_sad_u32 v13, v18, s44, 64",
+              f"v_msad_u8 v14, s44, {SAD_LITERAL:#x}, v18", "v_sad_hi_u8 v15, s45, s44, v18"],
+}
+SAD_OPS = tuple(sorted({line.split()[0] for body in SAD_BODIES.values() for line in body}))
+
+
+def _sad4(a, b, masked=False, lanes=4, signed=False):
+    """Sum of |a.byte[k] - b.byte[k]| over the low lanes; masked leaves out lanes whose b byte is zero."""
+    def lane(word, k):
+        value = _byte(word, k)
+        return value - 256 if signed and value >= 128 else value
+    return sum(abs(lane(a, k) - lane(b, k)) for k in range(lanes) if not masked or _byte(b, k))
+
+
+def _signed_absdiff32(a, b):
+    return abs((a - (1 << 32) if a & 0x80000000 else a) - (b - (1 << 32) if b & 0x80000000 else b))
+
+
+# Reference words by group, from the definitions in the AMD RDNA 2 ISA reference (see docs/experiments.md).
+SAD_RESULTS = {
+    "bytes": lambda a, b, c: ((_sad4(a, b) << 16) + c, _sad4(b, a) << 16, _sad4(a, b, True) + c, _sad4(b, a, True) + c),
+    "dword": lambda a, b, c: (abs(a - b) + c, abs(b - a) + 64, _sad4(a, SAD_LITERAL, True) + b, (_sad4(b, a) << 16) + b),
+}
+# Negative controls by group: (channel, word a wrong lowering would give, what went wrong). Each is drawn on
+# the first row of the group and must report a mismatch.
+SAD_WRONG = {
+    "bytes": (
+        (0, lambda a, b, c: _sad4(a, b) + c, "sum not moved to the high half"),
+        (0, lambda a, b, c: (_sad4(a, b, True) << 16) + c, "v_sad_hi_u8 masked like v_msad_u8"),
+        (0, lambda a, b, c: (_sad4(a, b, signed=True) << 16) + c, "signed byte lanes"),
+        (0, lambda a, b, c: (_sad4(a, b, lanes=3) << 16) + c, "top byte lane dropped"),
+        (0, lambda a, b, c: _sad4(a, b) << 16, "accumulator dropped"),
+        (1, lambda a, b, c: (_sad4(b, a) << 16) + c, "s46 read for the inline zero accumulator"),
+        (2, lambda a, b, c: _sad4(a, b) + c, "zero reference bytes not left out"),
+        (2, lambda a, b, c: _sad4(b, a, True) + c, "mask taken from src0"),
+        (2, lambda a, b, c: (_sad4(a, b, True) << 16) + c, "v_msad_u8 moved to the high half"),
+        (3, lambda a, b, c: _sad4(a, b, True) + c, "operands not swapped"),
+    ),
+    "dword": (
+        (0, lambda a, b, c: _signed_absdiff32(a, b) + c, "signed comparison"),
+        (0, lambda a, b, c: abs(a - b), "accumulator dropped"),
+        (0, lambda a, b, c: _sad4(a, b) + c, "byte lanes for the dword difference"),
+        (1, lambda a, b, c: abs(a - b) + c, "s46 read for the inline accumulator"),
+        (2, lambda a, b, c: _sad4(a, SAD_LITERAL) + b, "zero byte of the literal reference not left out"),
+        (2, lambda a, b, c: _sad4(SAD_LITERAL, a, True) + b, "mask taken from src0"),
+        (2, lambda a, b, c: _sad4(a, SAD_LITERAL, True) + c, "s46 read for the register accumulator"),
+        (3, lambda a, b, c: (_sad4(b, a) << 16) + c, "wrong accumulator register"),
+    ),
+}
+# (A, B, C) as binary32 words; the inputs and every right result are normal numbers or zero (asserted at the
+# draw). In the first bytes row A and B each have one zero byte in a different lane and lanes on both sides of
+# 0x80; in the first dword row A and B differ in the sign bit and the sum with C passes 2^32.
+SAD_ROWS = {
+    "bytes": ((0xC1007F90, 0x40C30011, 0x3F80FFFF), (0x3E0027FF, 0xBF62FF00, 0x40000000)),
+    "dword": ((0xC1700000, 0x3F800024, 0x7F000000), (0x40000023, 0x4C003A00, 0x3F800000)),
+}
+
+
+def sad_group(group):
+    return ["v_mov_b32_e32 v18, s45", *SAD_BODIES[group]]
 
 
 def sop2_lshl_add_group() -> list[str]:
@@ -6135,6 +6203,67 @@ def check_carry_out_lowering():
     assert len(set(sources.values())) == 3
 
 
+def check_sad_lowering():
+    """Static checks for v_sad_hi_u8, v_sad_u32 and v_msad_u8 in the programs of sad_group()."""
+    # v18 is written by the mov at index 20 and the four group instructions follow at 21..24.
+    a, b, c, v = "asuint(params[0].w)", "asuint(params[1].x)", "asuint(params[1].y)", "asuint(alu20)"
+    expected = {
+        "bytes": (f"(sad4_u8({a}, {v}, false) << 16u) + {c}", f"(sad4_u8({v}, {a}, false) << 16u) + 0u",
+                  f"sad4_u8({a}, {v}, true) + {c}", f"sad4_u8({v}, {a}, true) + {c}"),
+        "dword": (f"(max({a}, {v}) - min({a}, {v})) + {c}", f"(max({v}, {a}) - min({v}, {a})) + 64u",
+                  f"sad4_u8({a}, {SAD_LITERAL}u, true) + {v}", f"(sad4_u8({b}, {a}, false) << 16u) + {v}"),
+    }
+    assert expected.keys() == SAD_BODIES.keys() == SAD_RESULTS.keys() == SAD_WRONG.keys() == SAD_ROWS.keys()
+    for group, expressions in expected.items():
+        program = uncompressed_export(sad_group(group))
+        assert program.index("v_mov_b32_e32 v18, s45") == 20, group
+        source = translate_int(program)
+        for offset, expression in enumerate(expressions, start=21):
+            statement = f"    precise float alu{offset} = asfloat({expression});"
+            assert statement in source.splitlines(), (group, statement)
+        # The byte-lane helper is emitted once, and only for a program that uses it.
+        assert source.count("uint sad4_u8(uint a, uint b, bool masked)") == 1, group
+    only_dword = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_sad_u32 v12, s44, v18, s46"]))
+    assert "sad4_u8" not in only_dword
+    assert set(SAD_OPS) <= ACCEPTED, set(SAD_OPS) - ACCEPTED
+    assert SAD_OPS == ("v_msad_u8", "v_sad_hi_u8", "v_sad_u32")
+    # The Python references agree with the worked values of the first rows.
+    assert _sad4(0xC1007F90, 0x40C30011) == 0x242 and _sad4(0xC1007F90, 0x40C30011, True) == 0x1C3
+    assert _sad4(0x40C30011, 0xC1007F90, True) == 0x17F
+    assert SAD_RESULTS["dword"](*SAD_ROWS["dword"][0])[0] & 0xffffffff == 0x00EFFFDC
+    # Three sources in the VOP3 encoding and nothing else: no e32 spelling, no clamp (LLVM 15 assembles the
+    # bit, but the ISA text gives it no meaning for an integer result), no float modifier, an in-range
+    # destination, written registers and 32-bit literals only.
+    good = "v_sad_u32 v12, s44, v18, s46"
+    for bad in (
+        "v_sad_u32_e32 v12, s44, v18, s46",
+        "v_sad_u32 v12, s44, v18, s46 clamp",
+        "v_sad_u32 v12, s44, v18",
+        "v_sad_u32 v12, s44, v18, s46, s46",
+        "v_sad_u32 v12, s44, -v18, s46",
+        "v_sad_hi_u8 v12, |v18|, s44, s46",
+        "v_sad_hi_u8_e32 v12, s44, v18, s46",
+        "v_sad_hi_u8 v12, s44, v18, s46 clamp",
+        "v_msad_u8_e32 v12, s44, v18, s46",
+        "v_msad_u8 v12, s44, v18, s46 clamp",
+        "v_msad_u8 v12, s44, abs(v18), s46",
+        "v_msad_u8 v256, s44, v18, s46",
+        "v_msad_u8 v12, s44, 0x100000000, s46",
+        "v_msad_u8 v12, s44, v106, s46",
+    ):
+        translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    # The neighbours stay unsupported: the 8- and 16-bit lane sums without a shift, and the wide packed forms.
+    for neighbour in (
+        "v_sad_u8 v12, s44, v18, s46",
+        "v_sad_u16 v12, s44, v18, s46",
+        "v_qsad_pk_u16_u8 v[12:13], v[18:19], s44, v[20:21]",
+        "v_mqsad_pk_u16_u8 v[12:13], v[18:19], s44, v[20:21]",
+        "v_mqsad_u32_u8 v[12:15], v[18:19], s44, v[20:23]",
+    ):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", neighbour]))
+
+
 def check_nc_integer_lowering():
     """Static checks for the 32-bit no-carry add/sub forms of nc_integer_group(1..3)."""
     # v18 is written by the mov at index 20, and the four group instructions follow at 21..24. A and B are
@@ -6478,6 +6607,7 @@ def check_controls(directory):
     check_carry_out_lowering()
     check_sdwa_integer_lowering()
     check_pack_int16_lowering()
+    check_sad_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
     assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED
     for expected in (
@@ -7567,6 +7697,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(carry_out_group(op)), translate_int) for op in CARRY_OUT_OPS)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
+    fixtures.extend((uncompressed_export(sad_group(group)), translate_int) for group in SAD_BODIES)
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
@@ -8091,6 +8222,52 @@ def check_carry_out_draws(directory, compiler, renderer, backend):
             wrong_words[channel] = wrong(*rows[index]) & 0xffffffff
             assert wrong_words[channel] != right[index][channel], (op, reason)
             add_case(cases, rows[index], wrong_words, "mismatch")
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+def check_sad_draws(directory, compiler, renderer, backend):
+    """Draw v_sad_hi_u8, v_sad_u32 and v_msad_u8 through the integer readback target and compare the words.
+
+    Each group of SAD_BODIES is compiled once and drawn in one renderer batch: every row of SAD_ROWS with the
+    right words, and the first row once per SAD_WRONG entry with one channel replaced by the word a wrong
+    lowering would give, which must report a mismatch. On a desktop GPU the draws establish that the
+    translated shader computes the stated operation, not what the console does.
+    """
+    source = directory / "sad.hlsl"
+    shader = directory / "sad.cso"
+
+    def add_case(cases, row, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<3I", constants, 12, *row)
+        case = directory / f"sad-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+
+    for group, rows in SAD_ROWS.items():
+        source.write_text(translate_int(uncompressed_export(sad_group(group))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for index, row in enumerate(rows):
+            words = tuple(word & 0xffffffff for word in SAD_RESULTS[group](*row))
+            # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+            assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (group, [hex(w) for w in (*row, *words)])
+            add_case(cases, row, words, "pass")
+            if index:
+                continue
+            seen = set()
+            for channel, wrong, reason in SAD_WRONG[group]:
+                wrong_words = list(words)
+                wrong_words[channel] = wrong(*row) & 0xffffffff
+                assert wrong_words[channel] != words[channel], (group, reason)
+                assert (channel, wrong_words[channel]) not in seen, (group, reason)
+                seen.add((channel, wrong_words[channel]))
+                add_case(cases, row, wrong_words, "mismatch")
         try:
             run_pixel_batch(renderer, backend, shader, cases)
         except subprocess.CalledProcessError as error:
@@ -10041,7 +10218,7 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-carry-out", "draw-pack-int16"):
+                    "draw-mac-legacy", "draw-carry-out", "draw-pack-int16", "draw-sad"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -10056,7 +10233,8 @@ def main():
                         "draw-vop3-ternary-int": check_vop3_ternary_int_draws,
                         "draw-swap": check_swap_draw,
                         "draw-mac-legacy": check_mac_legacy_draws,
-                        "draw-pack-int16": check_pack_int16_draws}[mode]
+                        "draw-pack-int16": check_pack_int16_draws,
+                        "draw-sad": check_sad_draws}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
