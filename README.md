@@ -18,6 +18,8 @@ Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to 
 | **Mesh shaders** | A specialized entry fetched indexed vertices from a GPU buffer. Two position sets covered 1,024 and 276 pixels on a 32×32 target, matching the CPU reference on hardware and WARP. A compute and vertex fallback also draws the source-built indexed triangle on GTX 1060 and Windows 10 in-box WARP. [Mesh draw and specialization limits](docs/experiments.md#single-group-mesh-entry-specialization) · [SM 6.0 fallback](docs/experiments.md#mesh-draw-fallback) |
 | **Windows runtime** | Bink frame-buffer allocations reach the Windows heap through the shared provider. The FidelityFX experiment follows scratch writes from two passes through the RCAS output on an 8×4 tile. [Allocation, failure and retry](docs/experiments.md#frame-buffers-through-the-shared-windows-heap) · [Upscaler pixel comparison](docs/experiments.md#last-writers-of-the-pass-26-scratch-reads) |
 
+The pixel translator also supports [vector bitfield extraction, bit scans, reversal and population counts](docs/experiments.md#vector-bit-operations-in-pixel-shaders), checked by twelve source-built instruction forms.
+
 ### Instruction coverage
 
 The chart counts instruction forms exercised by passing source-built fixtures. The experiments above measure program outputs and package shader records.

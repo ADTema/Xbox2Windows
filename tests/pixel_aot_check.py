@@ -5116,6 +5116,130 @@ def check_adapter_skip(directory: Path) -> None:
         assert check_render(work, compiler, renderer, "hardware") == 77
 
 
+# Bit operations are observed as four exact byte-valued output channels. Half
+# widening converts a byte's raw bits to byte * 2^-24; scaling avoids relying on
+# another integer-to-float instruction under development in a separate PR.
+BIT_OPERATIONS = ("v_bfe_u32", "v_bfe_i32", "v_bfm_b32", "v_bcnt_u32_b32", *(
+    op + suffix for op in ("v_bfrev_b32", "v_ffbh_u32", "v_ffbh_i32", "v_ffbl_b32")
+    for suffix in ("_e32", "_e64")))
+BIT_CASES = (
+    (0, 0, 0), (0xffffffff, 0, 0), (0x80000000, 31, 1),
+    (0x7fffffff, 28, 31), (0xdeadbeef, 4, 8), (0x89abcdef, 36, 40),
+    (0xfedcba98, 63, 31), (0xffffffff, 0xffffffff, 0xffffffff),
+    (0x80000001, 1, 31), (0x12345678, 16, 16), (0x01010101, 63, 32),
+    (0x7f00ff00, 8, 9), (1, 0xffffffff, 33), (0xfffffffe, 32, 63),
+    (0x40000000, 2, 30), (0x00010000, 31, 31),
+)
+
+
+def bit_program(op):
+    base = op.removesuffix("_e32").removesuffix("_e64")
+    arity = pixel_aot.INTEGER[base[2:]][0]
+    body = [f"v_mov_b32_e32 v{20+i}, s{44+i}" for i in range(3)]
+    body.append(f"{op} v18, " + ", ".join(f"v{20+i}" for i in range(arity)))
+    for channel in range(4):
+        dst = f"v{12+channel}"
+        body += [f"v_bfe_u32 {dst}, v18, {8*channel}, 8",
+                 f"v_cvt_f32_f16_e32 {dst}, {dst}",
+                 f"v_mul_f32_e32 {dst}, 0x4b800000, {dst}"]
+    return with_constants(body)
+
+
+def bit_reference(op, a, b, c):
+    op = op.removesuffix("_e32").removesuffix("_e64")
+    if op in ("v_bfe_u32", "v_bfe_i32"):
+        offset, width = b % 32, c % 32
+        if not width:
+            return 0
+        field = 0
+        for i in range(width):
+            pos = offset + i
+            bit = (a >> pos) & 1 if pos < 32 else (a >> 31 if op == "v_bfe_i32" else 0)
+            field |= bit << i
+        if op == "v_bfe_i32" and field & (1 << (width-1)):
+            field -= 1 << width
+        return field & 0xffffffff
+    if op == "v_bfm_b32":
+        return sum(1 << i for i in range(b % 32, b % 32 + a % 32) if i < 32)
+    if op == "v_bcnt_u32_b32":
+        return (sum((a >> i) & 1 for i in range(32)) + b) & 0xffffffff
+    if op == "v_bfrev_b32":
+        return sum(((a >> i) & 1) << (31-i) for i in range(32))
+    positions = range(32) if op == "v_ffbl_b32" else range(31, -1, -1)
+    sought = 0 if op == "v_ffbh_i32" and a >> 31 else 1
+    for i in positions:
+        if ((a >> i) & 1) == sought:
+            return i if op == "v_ffbl_b32" else 31-i
+    return 0xffffffff
+
+
+def check_bit_controls():
+    # Acceptance controls run in every test mode. Only the binary/draw fixtures
+    # below record these forms, so an unrelated successful draw cannot cover them.
+    from scan_unsupported_shaders import is_instruction_supported
+
+    def validate(program):
+        return pixel_aot.lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64)
+    for op in BIT_OPERATIONS:
+        program = bit_program(op)
+        source = validate(program)
+        assert "asfloat(" in source
+        for bad in (op + "_sdwa", op + "_dpp"):
+            must_reject(validate, [line.replace(op + " v18", bad + " v18") for line in program])
+        for old, replacement in (("v18, v20", "v18, -v20"),
+                                 ("v18, v20", "v18, |v20|"),
+                                 ("v18, v20", "v18, v0")):
+            must_reject(validate, [line.replace(old, replacement) if line.startswith(op + " ") else line
+                                    for line in program])
+        must_reject(validate, [line + " clamp" if line.startswith(op + " ") else line for line in program])
+        must_reject(validate, [line.replace("s_waitcnt lgkmcnt(0)", "s_nop 0") for line in program])
+        wait = program.index("s_waitcnt vmcnt(0)")
+        operation = next(line for line in program if line.startswith(op + " "))
+        assert is_instruction_supported(operation), operation
+        must_reject(validate, program[:wait] + [operation.replace("v18,", "v13,")] + program[wait:])
+        must_reject(validate, program[:wait] + [operation.replace("v20", "v12")] + program[wait:])
+        wqm = program.index("s_and_b64 exec, exec, s[50:51]")
+        must_reject(validate, program[:wqm] + [operation] + program[wqm:])
+    # Masked lane counts require wave state, which these lane-local operations do not introduce.
+    must_reject(validate, with_constants(["v_mbcnt_lo_u32_b32 v12, 0, 0"]))
+    for invalid in ("v_bfe_u32_e32 v12, 0, 0, 0", "v_bfm_b32_e32 v12, 0, 0",
+                    "v_bcnt_u32_b32_e32 v12, 0, 0"):
+        must_reject(validate, with_constants([invalid]))
+        assert not is_instruction_supported(invalid), invalid
+    assert bit_reference("v_ffbh_i32", 0x80000000, 0, 0) == 1
+    assert bit_reference("v_ffbh_i32", 0xffffffff, 0, 0) == 0xffffffff
+    assert bit_reference("v_bfe_i32", 0x80000000, 31, 31) == 0xffffffff
+
+
+def check_bit_draws(directory, compiler, renderer, backend):
+    source, shader = (directory / name for name in ("bits.hlsl", "bits.cso"))
+    for op in BIT_OPERATIONS:
+        source.write_text(translate(bit_program(op)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        cases = []
+        for index, (a, b, c) in enumerate(BIT_CASES):
+            constants = bytearray(256)
+            struct.pack_into("<3I", constants, 12, a, b, c)
+            result = bit_reference(op, a, b, c)
+            rgba = tuple(float((result >> (8 * i)) & 255) for i in range(4))
+            assert all(half_rtz(x) == x for x in rgba)
+            path = write_case(directory / f"bits_{index}.case", constants, rgba)
+            cases.append((path, "pass"))
+        # Reuse the last draw and flip one byte in its reference.
+        wrong = (float(int(rgba[0]) ^ 1), *rgba[1:])
+        path = write_case(directory / "bits_wrong.case", constants, wrong)
+        cases.append((path, "mismatch"))
+        batch = run_pixel_batch(renderer, backend, shader, cases)
+        if "pixel_mismatch x=0 y=0" not in batch.stderr:
+            raise AssertionError(f"{op}: wrong reference did not report the first changed pixel")
+        if op == BIT_OPERATIONS[0]:
+            for line in batch.stdout.splitlines():
+                if line.startswith(("backend=", "adapter=", "driver=")):
+                    print(line)
+        print(f"vector_bits={op} cases={len(BIT_CASES)} matched", flush=True)
+    return 0
+
+
 def attribute_color(rg):
     code = ["s_mov_b32 s30, s14", "s_mov_b32 m0, s30"]
     for phase in (1, 2):
@@ -7115,6 +7239,7 @@ def check_controls(directory):
     must_reject(lambda p: lower(p, 20, 24, None), assembly(False))
     must_reject(translate_buffer_color, [s for s in program if s != "s_waitcnt lgkmcnt(0)"])
     must_reject(translate_buffer_color, [s.replace("off, off", "off, v26") for s in program])
+    check_bit_controls()
     check_scheduling_hints()
     check_mode_register_controls()
     check_constant_descriptor_bounds()
@@ -8355,6 +8480,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
+    fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
     fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
     fixtures.append((with_constants(DPP_INT32_BODY), translate))
     fixtures.append((with_constants(DPP_BODY), translate))
@@ -11485,6 +11611,8 @@ def main():
         try:
             if mode == "binary":
                 check_binary(directory, *args)
+            elif mode == "bits":
+                return check_bit_draws(directory, *args)
             elif mode in ("draw", "draw-core"):
                 return check_render(directory, *args, core_only=mode == "draw-core")
             elif mode == "three-way":

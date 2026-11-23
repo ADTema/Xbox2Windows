@@ -2259,6 +2259,68 @@ offers a stride for groups larger than one thread. Its
 record counts have not been remeasured after this change.
 
 A local scan of 2,689 compute records accepted 12 records (10 distinct instruction streams). Ten use one-thread groups and fixed addresses. Two use 32- and 64-thread groups and indexed addresses. Tested table bindings used s4 or s5 with descriptor offsets of 0, 32 or 64. The indexed bindings used strides of 4, 8, 12 or 16 bytes, selecting the first compatible profile. On RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), each record compiled to desktop DXIL and dispatched. Each adapter completed 14 full-buffer comparisons with zero mismatches, including two different group counts for both indexed records.
+
+## Vector bit operations in pixel shaders
+
+`pixel_aot.py` adds vector bitfield extraction (`v_bfe_u32`, `v_bfe_i32`),
+mask construction (`v_bfm_b32`) and population count plus accumulator
+(`v_bcnt_u32_b32`) through the shared integer lowering. The fixture also
+checks the existing bit reversal (`v_bfrev_b32`) and first-bit searches
+(`v_ffbh_u32`, `v_ffbh_i32`, `v_ffbl_b32`) in e32 and e64, for twelve
+forms on gfx1013 and gfx1030.
+Offset and width use their low five bits, including width 32 becoming zero.
+Signed extracts preserve sign when a field crosses bit 31; scans preserve the
+all-bits-set sentinel. Integer results remain raw VGPR bits through bitcasts.
+
+The semantics follow the [AMD RDNA2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+and [LLVM's constant BFE folding](https://llvm.org/doxygen/AMDGPUInstCombineIntrinsic_8cpp_source.html).
+Bit scans map to [HLSL first-bit intrinsics](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/firstbithigh),
+with the required leading-count conversion and signed input normalization.
+No SDWA/DPP modifiers, lane-mask counts, floating input modifiers or clamp are
+accepted by this lane-local profile. Existing pending-load, pending-sample and
+execution-mask checks still apply.
+
+The original source fixtures run each form on sixteen constant triples. Each
+32-bit result is exported as four exact byte values using BFE, half widening
+and power-of-two scaling. The Python reference uses explicit bit-position loops,
+signed fields and masked operand widths. Each backend performs 192 positive
+draws and twelve deliberately wrong references that must report pixel mismatch.
+Each form uses one renderer batch with its sixteen inputs and one wrong
+reference. The renderer reuses its device and pipeline within the batch.
+The acceptance-only controls do not add forms to other draw tests' records.
+`tests/form_coverage_check.py` requires precisely the twelve forms in both GPU
+reference lists and leaves them uncovered for failed or skipped tests.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_bits_(hardware|warp)$' -V
+```
+
+Before switching to the batched renderer, on Windows 11 build 26300.9974, MSVC 19.44.35230 and Windows SDK
+10.0.26100 DXC, based on main `6ee2406` plus this change: both new CTests
+passed, without capability skips, with zero pixel error. NVIDIA GeForce RTX 3060
+(10de:2503), driver 32.0.16.2101, completed in 113.72 seconds; WARP
+10.0.26100.9818 completed in 8.46 seconds. The debug layer was unavailable.
+The earlier serial hardware matrix exceeded its 180-second suite deadline;
+completed draws matched. Bounded parallel device initialization completed the
+same matrix within that budget. The existing `pixel_aot_warp` also passed;
+the legacy `pixel_aot_hardware` reached its separate 60-second timeout and is
+not counted as a pass. No full-suite success is claimed.
+
+The batched fixture passed all 192 inputs and 12 wrong-reference controls per
+adapter on Windows 11 build 26200.9974 with Windows SDK 10.0.26100 DXC. WARP
+10.0.26100.9818 took 5.7 seconds and the RTX 4060 Laptop (32.0.16.1656) took
+19.3 seconds, with the debug layer enabled on both. These timings cover the
+dedicated test command, including compilation.
+
+The native AMDGPU binary round trip is also part of `pixel_aot_check.py binary`;
+LLVM 18 assembled and disassembled all twelve forms for gfx1013 and the generated
+HLSL matched source lowering. The tests and implementation are original MIT code.
+During this work, Leonida's independently implemented SPIR-V semantic tests were
+reviewed at revision `67204bf8c0471335d9046890288b33e8d5e2875b`; no Leonida source
+was incorporated into this translator.
+
+
 ## AVX2 leaf recompilation
 
 [The AVX2 leaf translator](../tools/cpu_avx2_aot.py) lifts bounded straight-line Windows x64 leaf functions covering all 28 AVX2 forms in `docs/coverage/x64_zen2.tsv` group `AVX2`:
