@@ -25,10 +25,8 @@ import json
 import mmap
 import os
 from pathlib import Path
-import struct
 import sys
 import tempfile
-import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from extract_shaders import STAGE_NAMES, extract_native_rdna2_code
@@ -84,11 +82,8 @@ def _form_parts(text: str) -> tuple[str, str, str] | None:
 
 
 def _native_code(program: bytes) -> bytes | None:
-    """Use the extractor's native-code path; malformed programs have no stream."""
-    try:
-        return extract_native_rdna2_code(program)
-    except Exception:
-        return None
+    """Use the extractor's native-code path; None means absent or refused code."""
+    return extract_native_rdna2_code(program)
 
 
 def _cache_report(blob: bytes | None, name: str | None, code_base: int | None) -> dict | None:
@@ -446,11 +441,15 @@ def main(argv: list[str] | None = None) -> int:
         if corpus["totals"]["records"] == 0:
             print("shader corpus: no accepted records", file=sys.stderr)
             return 1
-        _write_atomic(args.output_dir / "report.json",
-                      json.dumps(document, sort_keys=True, indent=2, ensure_ascii=True) + "\n")
-        _write_atomic(args.output_dir / "report.md", render_markdown(document))
-    except (OSError, ValueError, TypeError, struct.error, zlib.error) as exc:
+        report_json = json.dumps(document, sort_keys=True, indent=2, ensure_ascii=True) + "\n"
+        report_markdown = render_markdown(document)
+        _write_atomic(args.output_dir / "report.json", report_json)
+        _write_atomic(args.output_dir / "report.md", report_markdown)
+    except OSError as exc:
         print(f"shader corpus: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"shader corpus: unexpected failure: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     totals = corpus["totals"]
     print(f"shader corpus: {totals['records']} records, {totals['programs']} programs, "

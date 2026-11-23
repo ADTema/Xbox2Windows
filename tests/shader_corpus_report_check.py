@@ -1,5 +1,7 @@
 """Check the deterministic shader corpus report on owned framing fixtures."""
+import contextlib
 import hashlib
+import io
 import json
 from pathlib import Path
 import struct
@@ -7,10 +9,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
+import shader_corpus_report as report_module
 from shader_corpus_report import STAGE_ORDER, DecodeResult, build_document, render_markdown
 
 
@@ -286,6 +290,38 @@ class CorpusReportChecks(unittest.TestCase):
             )
             self.assertEqual(failed.returncode, 2)
             self.assertFalse(usage.exists())
+
+    def test_native_extractor_failure_is_not_silent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "fixture.archive"
+            archive.write_bytes(fixture_archive())
+            with patch.object(
+                report_module, "extract_native_rdna2_code",
+                side_effect=RuntimeError("owned extractor failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "owned extractor failure"):
+                    build_document(archive, decoder=decoder)
+
+    def test_main_reports_unexpected_failure_without_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "fixture.archive"
+            archive.write_bytes(fixture_archive())
+            output = root / "unexpected-out"
+            stderr = io.StringIO()
+            with patch.object(
+                report_module, "build_document",
+                side_effect=RuntimeError("owned extractor failure"),
+            ):
+                with contextlib.redirect_stderr(stderr):
+                    code = report_module.main([str(archive), "--output-dir", str(output)])
+            self.assertEqual(code, 1)
+            self.assertIn(
+                "shader corpus: unexpected failure: RuntimeError: owned extractor failure",
+                stderr.getvalue(),
+            )
+            self.assertFalse((output / "report.json").exists())
+            self.assertFalse((output / "report.md").exists())
 
 
 if __name__ == "__main__":
