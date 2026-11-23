@@ -1258,8 +1258,8 @@ def draw_read(directory, compiler, cmd, case, name):
     return 0
 
 
-def draw(directory, compiler, renderer, backend):
-    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES:
+def draw(directory, compiler, renderer, backend, cases=None):
+    for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
@@ -1314,4 +1314,7 @@ if __name__ == "__main__":
     controls()
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
-        sys.exit({"binary": binary, "draw": draw}[mode](Path(tmp), *args))
+        # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
+        modes = {"binary": binary, "draw": draw,
+                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES)}
+        sys.exit(modes[mode](Path(tmp), *args))
