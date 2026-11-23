@@ -355,25 +355,34 @@ MXCSR_HEADER = "#pragma fenv_access(on)\n"
 
 class Mxcsr:
     """The host-MXCSR profile's error channel. reject is a format string with a {status} field: C++ that leaves
-    the lowered function and hands the status to the caller, as for x87_lower.Checked."""
+    the lowered function and hands the status to the caller, as for x87_lower.Checked. With denormals, LDMXCSR
+    also accepts FTZ and DAZ where the host's MXCSR_MASK has the bit; the lowered body then takes the mask that
+    mxcsr_entry(..., denormals=True) probes as its mxcsr_mask parameter."""
 
-    def __init__(self, reject):
+    def __init__(self, reject, denormals=False):
         self.reject = reject
+        self.denormals = denormals
 
     def leave(self, name):
         return self.reject.format(status=MXCSR_STATUS[name])
 
 
-def mxcsr_entry(name, inner):
+def mxcsr_entry(name, inner, denormals=False):
     """The exported boundary of a function lowered with the host-MXCSR profile. inner(a, b, c, state, &status) is
     the lowered body. The boundary saves the caller's whole MXCSR and restores it on a normal return, after a
     refusal and when a structured exception such as a guest memory fault leaves inner. <name>_status() returns the
-    refusal status of the calling thread's last call, 0 when none."""
+    refusal status of the calling thread's last call, 0 when none. With denormals, every entry first reads
+    the host's MXCSR_MASK from a 16-byte-aligned 512-byte FXSAVE area (a stored 0 means the architectural default
+    0xFFBF) and passes it to inner as a sixth argument."""
+    probe = ("    alignas(16) unsigned char fxsave_area[512] = {}; _fxsave64(fxsave_area); uint32_t mxcsr_mask = 0;\n"
+             "    memcpy(&mxcsr_mask, fxsave_area + 28, 4); if (!mxcsr_mask) mxcsr_mask = 0xFFBFu;\n") if denormals else ""
+    mask_argument = ", mxcsr_mask" if denormals else ""
     return (f"static thread_local int {name}_last_status = 0;\n"
             f'extern "C" __declspec(dllexport) int {name}_status() {{ return {name}_last_status; }}\n'
             f'extern "C" __declspec(dllexport) word {name}(word a, word b, word c, word state) {{\n'
             f"    const unsigned int caller_mxcsr = _mm_getcsr(); word result = 0; int status = 0;\n"
-            f"    __try {{ result = {inner}(a, b, c, state, &status); }} __finally {{\n"
+            f"{probe}"
+            f"    __try {{ result = {inner}(a, b, c, state, &status{mask_argument}); }} __finally {{\n"
             f"        _mm_setcsr(caller_mxcsr);\n"
             f"        {name}_last_status = status;\n"
             f"    }}\n"
@@ -885,7 +894,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             stmt = (f"{{ const uint32_t want = {guest('uint32_t')}; "
                     f"if (want & 0xffff0000u) {host_mxcsr.leave('reserved')} "
                     f"if ((want & 0x1f80u) != 0x1f80u) {host_mxcsr.leave('unmasked')} "
-                    f"if (want & 0x8040u) {host_mxcsr.leave('unsupported')} "
+                    f"if (want & {'~mxcsr_mask' if host_mxcsr.denormals else '0x8040u'}) "
+                    f"{host_mxcsr.leave('unsupported')} "
                     f"_mm_setcsr(want); }}")
         elif op == M.STMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             stmt = f"store<uint32_t>({address()}, _mm_getcsr());"

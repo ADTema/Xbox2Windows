@@ -2349,6 +2349,32 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_mxcsr COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
         check "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr>" "$<TARGET_FILE:cpu_mxcsr_lifted>"
         ${mxcsr_controls} "${mxcsr_o2}")
+    # FTZ and DAZ in the profile's denormals opt-in: the lifted DLL, the sim variant that must keep every rule,
+    # the noftz, nodaz and nomask controls that must break one, and an /O2 build of the translation.
+    cpu_asm_fixture(cpu_mxcsr_denormals mxcsr_denormals)
+    set(mxcsr_denormals_extras)
+    foreach(variant IN ITEMS lifted noftz nodaz sim nomask)
+        set(den_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_${variant}.cpp")
+        add_custom_command(OUTPUT "${den_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr_denormals.py"
+                emit "$<TARGET_FILE:cpu_mxcsr_denormals>" "${den_fixture}" ${variant}
+            DEPENDS cpu_mxcsr_denormals tests/cpu/mxcsr_denormals.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_mxcsr_denormals_${variant} SHARED "${den_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND mxcsr_denormals_extras "$<TARGET_FILE:cpu_mxcsr_denormals_${variant}>")
+        endif()
+    endforeach()
+    set(den_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_lifted_o2.dll")
+    add_custom_command(OUTPUT "${den_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /EHsc /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_lifted_o2.obj" "/Fe${den_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_mxcsr_denormals_lifted_o2 ALL DEPENDS "${den_o2}")
+    add_test(NAME cpu_aot_mxcsr_denormals COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr_denormals.py"
+        check "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr_denormals>"
+        "$<TARGET_FILE:cpu_mxcsr_denormals_lifted>" ${mxcsr_denormals_extras} "${den_o2}")
+    set_tests_properties(cpu_aot_mxcsr_denormals PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
