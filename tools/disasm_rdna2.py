@@ -251,12 +251,79 @@ SOPK_OPS = {
     0x05: ("s_cmpk_gt_i32", "Scalar compare greater immediate"),
     0x0f: ("s_addk_i32", "Scalar add immediate"),
     0x10: ("s_mulk_i32", "Scalar multiply immediate"),
+    0x12: ("s_getreg_b32", "Read a hardware register field into an SGPR"),
+    0x13: ("s_setreg_b32", "Write a hardware register field from an SGPR"),
     0x15: ("s_setreg_imm32_b32", "Write a hardware register field from a 32-bit literal"),
     0x17: ("s_waitcnt_vscnt", "Wait for vector store counter"),
     0x18: ("s_waitcnt_vmcnt", "Wait for vector memory counter"),
     0x19: ("s_waitcnt_expcnt", "Wait for export counter"),
     0x1a: ("s_waitcnt_lgkmcnt", "Wait for LDS/GDS/K/M counter"),
 }
+
+# Hardware register IDs that LLVM 15 prints by name for gfx1013 (hwreg ID field, SIMM16[5:0]).
+# Every other ID prints as a decimal number, e.g. ID 4 (HW_REG_HW_ID before gfx10) as hwreg(4).
+HWREG_NAMES = {
+    1: "HW_REG_MODE",
+    2: "HW_REG_STATUS",
+    3: "HW_REG_TRAPSTS",
+    5: "HW_REG_GPR_ALLOC",
+    6: "HW_REG_LDS_ALLOC",
+    7: "HW_REG_IB_STS",
+    15: "HW_REG_SH_MEM_BASES",
+    16: "HW_REG_TBA_LO",
+    17: "HW_REG_TBA_HI",
+    18: "HW_REG_TMA_LO",
+    19: "HW_REG_TMA_HI",
+    20: "HW_REG_FLAT_SCR_LO",
+    21: "HW_REG_FLAT_SCR_HI",
+    22: "HW_REG_XNACK_MASK",
+    23: "HW_REG_HW_ID1",
+    24: "HW_REG_HW_ID2",
+    25: "HW_REG_POPS_PACKER",
+}
+
+# 32-bit patterns LLVM prints as inline floating-point values when they appear as a literal.
+INLINE_FLOAT_LITERALS = {
+    0x3f000000: "0.5",
+    0xbf000000: "-0.5",
+    0x3f800000: "1.0",
+    0xbf800000: "-1.0",
+    0x40000000: "2.0",
+    0xc0000000: "-2.0",
+    0x40800000: "4.0",
+    0xc0800000: "-4.0",
+    0x3e22f983: "0.15915494",
+}
+
+
+def format_hwreg(simm16: int) -> str:
+    """Format a SOPK hwreg operand as LLVM 15 prints it.
+
+    SIMM16 holds the register ID in bits 5:0, the bit offset in bits 10:6 and the field size minus
+    one in bits 15:11. A whole-register field (offset 0, size 32) prints as hwreg(ID).
+    """
+    reg = simm16 & 0x3f
+    offset = (simm16 >> 6) & 0x1f
+    size = ((simm16 >> 11) & 0x1f) + 1
+    name = HWREG_NAMES.get(reg, str(reg))
+    if offset == 0 and size == 32:
+        return f"hwreg({name})"
+    return f"hwreg({name}, {offset}, {size})"
+
+
+def format_literal32(value: int) -> str:
+    """Format a 32-bit literal operand as LLVM 15 prints it.
+
+    Values that equal an inline integer (-16 to 64) or an inline float print in that form;
+    every other value prints in hex.
+    """
+    signed = value - (1 << 32) if value & 0x80000000 else value
+    if -16 <= signed <= 64:
+        return str(signed)
+    if value in INLINE_FLOAT_LITERALS:
+        return INLINE_FLOAT_LITERALS[value]
+    return f"0x{value:x}"
+
 
 SOPC_OPS = {
     # GFX10 / RDNA 2 opcode numbers, as in LLVM SOPC_Real_gfx10 definitions
@@ -1446,6 +1513,58 @@ def _decode_ds(w0: int, w1: int) -> tuple[int, str, str, str]:
     return (8, op_name, asm, comment)
 
 
+# VOP3 16-bit interpolation (issue #938, step 2). As LLVM 15 encodes them for gfx1013, SRC0 holds the
+# attribute number (bits 5:0), the channel (bits 7:6) and the high-half select (bit 8); SRC1 and SRC2 are
+# the data sources. LLVM prints `vdst, src1, attrN.c[, src2][ high][ clamp][ mul:2|mul:4|div:2]`.
+INTERP_F16_OPS = {
+    0x342: ("v_interp_p1ll_f16", False, "Interpolate binary16 P1, low half, two-pass (VOP3)"),
+    0x343: ("v_interp_p1lv_f16", True, "Interpolate binary16 P1, low half, with a P0 source (VOP3)"),
+    0x35a: ("v_interp_p2_f16", True, "Interpolate binary16 P2 (VOP3)"),
+}
+INTERP_OMOD = ("", " mul:2", " mul:4", " div:2")
+# Source codes LLVM 15 refuses in these forms (no literal, no 209-234/249/250), and the inline constants it
+# accepts but prints as `/*invalid immediate*/`. Both were measured against LLVMDisasmInstruction for gfx1013.
+INTERP_F16_REFUSED_SOURCES = frozenset([*range(209, 235), 249, 250, 255])
+INTERP_F16_IMMEDIATES = frozenset([*range(128, 209), *range(240, 249)])
+
+
+def _decode_interp_f16(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
+    name, has_src2, comment = INTERP_F16_OPS[op]
+    abs_bits = (w0 >> 8) & 0x7
+    clamp = (w0 >> 15) & 1
+    attribute = w1 & 0x1ff
+    src1, src2, omod = (w1 >> 9) & 0x1ff, (w1 >> 18) & 0x1ff, (w1 >> 27) & 0x3
+    neg_bits = (w1 >> 29) & 0x7
+    # Encodings LLVM 15 refuses keep their eight-byte record but are not reported as the instruction:
+    # a modifier on the attribute operand, an unused p1ll third source, an output modifier on p2, or a
+    # refused source code. op_sel bits are ignored, as LLVM ignores them.
+    if ((abs_bits | neg_bits) & 1 or (not has_src2 and (src2 or (abs_bits | neg_bits) & 4))
+            or (op == 0x35a and omod) or src1 in INTERP_F16_REFUSED_SOURCES
+            or (has_src2 and src2 in INTERP_F16_REFUSED_SOURCES)):
+        return (8, f"{name}_unsupported", f"{name} <unsupported VOP3 encoding>",
+                f"LLVM 15 refuses this {name} encoding for gfx1013")
+
+    def source(code: int, index: int) -> str:
+        is_abs, is_neg = (abs_bits >> index) & 1, (neg_bits >> index) & 1
+        if code in INTERP_F16_IMMEDIATES:
+            # LLVM spells a lone negation of a numeric operand as neg(...), so that it is not read as a sign.
+            if is_neg and not is_abs:
+                return "neg(/*invalid immediate*/)"
+            return _format_operand_modifiers("/*invalid immediate*/", is_abs, is_neg)
+        return _format_operand_modifiers(decode_v_reg(code), is_abs, is_neg)
+
+    operands = [f"v{w0 & 0xff}", source(src1, 1), f"attr{attribute & 0x3f}.{'xyzw'[(attribute >> 6) & 3]}"]
+    if has_src2:
+        operands.append(source(src2, 2))
+    asm = f"{name} {', '.join(operands)}"
+    if attribute >> 8:
+        asm += " high"
+    if clamp:
+        asm += " clamp"
+    asm += INTERP_OMOD[omod]
+    return (8, name, asm, comment)
+
+
 def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
     """
     Decode one RDNA 2 instruction at given offset.
@@ -1552,7 +1671,12 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             if offset + 8 > len(data):
                 return (4, "sopk_truncated", f"{op_name} <truncated>", "Incomplete SOPK literal")
             literal, = struct.unpack_from("<I", data, offset + 4)
-            return (8, op_name, f"{op_name} 0x{simm:x}, 0x{literal:x}", comment)
+            return (8, op_name, f"{op_name} {format_hwreg(simm)}, {format_literal32(literal)}", comment)
+        if op_name == "s_getreg_b32":
+            return (4, op_name, f"{op_name} {decode_s_reg(sdst)}, {format_hwreg(simm)}", comment)
+        if op_name == "s_setreg_b32":
+            # The SDST field names the source SGPR.
+            return (4, op_name, f"{op_name} {format_hwreg(simm)}, {decode_s_reg(sdst)}", comment)
         if op_name == "s_version":
             # No destination operand; the SDST field is not printed.
             return (4, op_name, f"{op_name} 0x{simm:x}", comment)
@@ -1967,6 +2091,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src2 = (w1 >> 18) & 0x1ff
         omod = (w1 >> 27) & 0x3
         neg = [(w1 >> 29) & 1, (w1 >> 30) & 1, (w1 >> 31) & 1]
+
+        if op in INTERP_F16_OPS:
+            return _decode_interp_f16(op, w0, w1)
 
         is_vopc = False
         is_vop3b = False

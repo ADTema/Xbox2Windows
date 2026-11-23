@@ -14,8 +14,9 @@
 // Convention vs Evidence:
 // - Windows runtime evidence: export binding of XCRDAPI!DStorageGetFactory and
 //   cpu_exe_io!finish_exe; execution under Windows native loader and pe_map.
-// - Public DirectStorage evidence: PC IDStorageFactory refusal (E_NOINTERFACE, *ppv untouched),
-//   delayed submission until explicit Submit(), and half-capacity auto-submission threshold.
+// - Public DirectStorage evidence: PC IDStorageFactory IID, explicit submission, and the
+//   documented half-capacity threshold. Refusal of that IID and preservation of *ppv
+//   are recorder behavior.
 // - Recorder convention: fresh fixture-owned interface identifiers (IID_FixtureFactory and
 //   IID_FixtureQueue) and the adapter vtable layout (slots 0..3, 6, 8 matching the recorder
 //   convention and public dstorage.h slots). A public source would be needed before a fixture

@@ -27,6 +27,7 @@ def main(path):
     contiguous = bind(library, "XMemMapPhysicalPages", [pointer, number, C.POINTER(number)], pointer)
     scatter = bind(library, "XMemMapPhysicalPagesScatter", [C.POINTER(pointer), number, C.POINTER(number)], C.c_int)
     dword = C.c_ulong
+    reserve_startup = bind(library, "XMemVirtualAlloc", [pointer, number, dword, number, dword], pointer)
     reserve = bind(kernel, "VirtualAlloc2", [pointer, pointer, number, dword, dword, pointer, dword], pointer)
     free = bind(kernel, "VirtualFree", [pointer, number, dword], C.c_int)
     reserved = []
@@ -77,6 +78,22 @@ def main(path):
         assert not release(2, invalid)
         assert release(2, pages)
         assert contiguous(base, 2, pages) is None, "released IDs were still accepted"
+        for size, attributes, protection in ((16 << 30, 0x21, 4), (24 << 30, 3, 0x801)):
+            whole = reserve_startup(None, size, 0x20402000, attributes, protection)
+            assert whole
+            count, token = number(1), number()
+            assert allocate(PHYSICAL_64K, C.byref(count), C.byref(token))
+            interior = whole + PAGE_BYTES
+            assert contiguous(interior, 1, C.byref(token)) == interior, C.get_last_error()
+            value(interior).value = 0x8142
+            assert contiguous(interior, 1, None) == interior
+            assert contiguous(interior, 1, C.byref(token)) == interior
+            assert value(interior).value == 0x8142
+            assert contiguous(interior, 1, None) == interior
+            assert release(1, C.byref(token))
+            assert free(whole, 0, WIN_RELEASE), C.get_last_error()
+            assert reserve(pointer(-1), whole, size, WIN_RESERVE, NOACCESS, None, 0) == whole
+            assert free(whole, 0, WIN_RELEASE)
     finally:
         for address in reserved:
             free(address, 0, WIN_RELEASE)

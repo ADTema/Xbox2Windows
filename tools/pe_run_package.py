@@ -28,8 +28,6 @@ def plan(report):
         terminal = chain[-1]
         if terminal.get("package") and terminal["provider"] == image:
             raise ValueError(f"{image}: self import needs deferred DLL attachment")
-        if terminal.get("package") and terminal["symbol"].startswith("#"):
-            raise ValueError(f"{image}: bundled ordinal exports require a mapper ordinal lookup")
         old = routes[image].setdefault(name, terminal)
         if old != terminal:
             raise ValueError(f"{image}: conflicting bindings for {name[0]}!{name[1]}")
@@ -53,14 +51,17 @@ def prototype(lib, name, args, result):
     return function
 
 
-def run(root, report, mapper, shims, system, *, preflight_only=False):
+def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=()):
     order, routes = plan(report)
     callback = C.WINFUNCTYPE(C.c_void_p, C.c_char_p, C.c_char_p, C.c_uint32)
     kernel = C.WinDLL("kernel32", use_last_error=True)
     load = prototype(kernel, "LoadLibraryExW", [W.LPCWSTR, W.HANDLE, W.DWORD], W.HMODULE)
     release_host = prototype(kernel, "FreeLibrary", [W.HMODULE], W.BOOL)
     find = prototype(kernel, "GetProcAddress", [W.HMODULE, C.c_void_p], C.c_void_p)
+    pin_module = prototype(kernel, "GetModuleHandleExW", [W.DWORD, C.c_void_p, C.POINTER(W.HMODULE)], W.BOOL)
     modules, addresses = {}, {}
+    if set(pin_shims) - shims.keys():
+        raise ValueError("Pinned providers must be named with --shim")
     with ExitStack() as stack:
         missing = []
         for image in order:
@@ -97,6 +98,26 @@ def run(root, report, mapper, shims, system, *, preflight_only=False):
                 raise ValueError(f"{image}: file changed after inventory")
 
         lib = C.WinDLL(str(mapper), winmode=0x900)
+        ordinal_routes = any(terminal.get("package") and terminal["symbol"].startswith("#")
+                             for bindings in routes.values() for terminal in bindings.values())
+        export_ordinal = None
+        if ordinal_routes:
+            try:
+                export_ordinal = prototype(lib, "pe_map_export_ordinal", [C.c_void_p, C.c_uint32], C.c_void_p)
+            except AttributeError as exc:
+                raise ValueError("bundled ordinal imports require a mapper with pe_map_export_ordinal") from exc
+        for name in sorted(pin_shims):
+            module = modules.get(name)
+            if not module:
+                raise ValueError(f"{name}: pinned provider is not in the resolved import plan")
+        # Provider workers may outlive guest return. Balance LoadLibrary normally
+        # but retain these modules until the isolated process itself exits.
+        pin_from_address = 0x1 | 0x4  # GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+        for name in sorted(pin_shims):
+            handle = W.HMODULE()
+            if not pin_module(pin_from_address, modules[name], C.byref(handle)):
+                raise ValueError(f"{name}: cannot pin provider ({C.get_last_error()})")
+            release_host(handle)
         map_image = prototype(lib, "pe_map_image",
                               [W.LPCWSTR, callback, C.POINTER(C.c_uint32), C.c_char_p, C.c_size_t], C.c_void_p)
         export = prototype(lib, "pe_map_export", [C.c_void_p, C.c_char_p], C.c_void_p)
@@ -109,7 +130,11 @@ def run(root, report, mapper, shims, system, *, preflight_only=False):
                 symbol = terminal["symbol"]
                 if terminal.get("package"):
                     provider = terminal["provider"]
-                    imports[key] = export(mapped[provider], symbol.encode("ascii"))
+                    imports[key] = (export_ordinal(mapped[provider], int(symbol[1:]))
+                                    if symbol.startswith("#") else
+                                    export(mapped[provider], symbol.encode("ascii")))
+                    if not imports[key]:
+                        raise ValueError(f"{image}: mapped export {provider}!{symbol} unavailable")
                 else:
                     imports[key] = addresses[terminal["dll"].casefold(), symbol]
 
@@ -138,6 +163,8 @@ def main():
     parser.add_argument("package", type=Path)
     parser.add_argument("entry")
     parser.add_argument("--shim", action="append", nargs=2, default=[], metavar=("DLL", "PATH"))
+    parser.add_argument("--pin-shim", action="append", default=[], metavar="DLL",
+                        help="keep a named external shim loaded until this process exits")
     parser.add_argument("--system", action="append", default=[], metavar="DLL")
     parser.add_argument("--preflight-only", action="store_true")
     options = parser.parse_args()
@@ -149,7 +176,8 @@ def main():
             raise ValueError("System providers must be DLL basenames")
         report = inspect(root, options.entry)
         result = run(root, report, options.mapper.resolve(), shims, system,
-                     preflight_only=options.preflight_only)
+                     preflight_only=options.preflight_only,
+                     pin_shims={name.casefold() for name in options.pin_shim})
     except (ValueError, OSError) as exc:
         parser.exit(1, f"{exc}\n")
     print(json.dumps(result, indent=2))
