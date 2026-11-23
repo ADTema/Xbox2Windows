@@ -5,9 +5,12 @@ cbuffer Update : register(b0) { uint partial; };
 [numthreads(2, 2, 1)]
 void main(uint3 lane : SV_DispatchThreadID)
 {
-    const uint colors[4] = { 0xff0000ff, 0xff00ff00, 0xffff0000, 0xff00ffff };
+    // A select chain, not an indexed constant array: the Windows 10 in-box
+    // WARP (10.0.19041) compiler crashes on the array when creating the PSO.
+    const uint texel = 2 * lane.y + lane.x;
     if (!partial)
-        pixels[lane.xy] = colors[2 * lane.y + lane.x];
+        pixels[lane.xy] = texel == 0 ? 0xff0000ff : texel == 1 ? 0xff00ff00
+                        : texel == 2 ? 0xffff0000 : 0xff00ffff;
     else if (all(lane.xy == uint2(1, 0)))
         pixels[lane.xy] = 0xffff00ff;
 }
