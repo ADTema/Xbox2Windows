@@ -7556,25 +7556,51 @@ def check_controls(directory):
     expect_value_error(translate_int, program[:wait] + ["v_cvt_u32_f32_e32 v19, s45"] + program[wait:],
                        "Constant read before load completion")
     for bad in ("v_cvt_u32_f32_e64 v12, s44 clamp", "v_cvt_i32_f32_e64 v12, s44 omod:2",
+                "v_cvt_flr_i32_f32_e64 v12, s44 clamp", "v_cvt_rpi_i32_f32_e64 v12, s44 omod:2",
                 "v_cvt_u32_f32_dpp v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
                 "v_cvt_i32_f32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD",
+                "v_cvt_flr_i32_f32_dpp v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                "v_cvt_rpi_i32_f32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD",
                 "v_cvt_u32_f32_e32 v12, 0.5", "v_cvt_u32_f32_e32 v12, 1", "v_cvt_i32_f32_e32 v12, -1",
+                "v_cvt_flr_i32_f32_e32 v12, 0.5", "v_cvt_rpi_i32_f32_e32 v12, -1",
                 "v_cvt_u32_f32_e64 v12, 0.5", "v_cvt_u32_f32_e64 v12, 1", "v_cvt_i32_f32_e64 v12, -1",
+                "v_cvt_flr_i32_f32_e64 v12, 0.5", "v_cvt_rpi_i32_f32_e64 v12, 1",
                 "v_cvt_i32_f32_e64 v12, -0x40400000", "v_cvt_u32_f32_e64 v12, |-s44|",
-                "v_cvt_i32_f32_e64 v12, --s44",
-                "v_cvt_rpi_i32_f32_e32 v12, v13", "v_cvt_flr_i32_f32_e32 v12, v13",
-                "v_cvt_rpi_i32_f32_e64 v12, -v13", "v_cvt_flr_i32_f32_e64 v12, |v13|"):
+                "v_cvt_flr_i32_f32_e64 v12, -0x40400000", "v_cvt_rpi_i32_f32_e64 v12, |-s44|",
+                "v_cvt_i32_f32_e64 v12, --s44", "v_cvt_flr_i32_f32_e64 v12, --s44"):
         expect_value_error(translate, with_constants([bad]), "Unsupported instruction")
     for inst, diagnostic in (("v_cvt_i32_f32_e32 v256, s44", "Invalid signed conversion register"),
                              ("v_cvt_i32_f32_e32 v12, v255", "Unbound pixel input v255"),
+                             ("v_cvt_flr_i32_f32_e32 v256, s44", "Invalid signed conversion register"),
+                             ("v_cvt_rpi_i32_f32_e32 v12, v255", "Unbound pixel input v255"),
                              ("v_cvt_u32_f32_e64 v256, |s44|", "Invalid unsigned conversion register"),
                              ("v_cvt_i32_f32_e64 v12, -s106", "Invalid signed conversion register"),
+                             ("v_cvt_flr_i32_f32_e64 v256, |s44|", "Invalid signed conversion register"),
+                             ("v_cvt_rpi_i32_f32_e64 v12, -s106", "Invalid signed conversion register"),
+                             ("v_cvt_flr_i32_f32_e64 v12, -|v255|", "Unbound pixel input v255"),
                              ("v_cvt_u32_f32_e64 v12, -|v255|", "Unbound pixel input v255")):
         expect_value_error(translate, with_constants([inst]), diagnostic)
-    # Positive control: plain e32 and e64 lower identically through the shared src/ffx_float_to_int.hlsli helpers.
-    for good in ("v_cvt_u32_f32_e32 v12, s44", "v_cvt_i32_f32_e32 v12, s44", "v_cvt_u32_f32_e32 v12, 0x40400000"):
+    # Positive control: plain e32 and e64 lower identically through their shared/lazy helpers.
+    for good in ("v_cvt_u32_f32_e32 v12, s44", "v_cvt_i32_f32_e32 v12, s44",
+                 "v_cvt_flr_i32_f32_e32 v12, s44", "v_cvt_rpi_i32_f32_e32 v12, s44",
+                 "v_cvt_u32_f32_e32 v12, 0x40400000", "v_cvt_flr_i32_f32_e32 v12, 0x40400000",
+                 "v_cvt_rpi_i32_f32_e32 v12, 0xbf000000"):
         e32_hlsl = translate(with_constants([good]))
         assert translate(with_constants([good.replace("_e32", "_e64")])) == e32_hlsl
+    flr_rpi_hlsl = translate_int(uncompressed_export(CVT_FLR_RPI_E32_BODY))
+    assert flr_rpi_hlsl.count("uint cvt_flr_i32_f32(uint bits)") == 1
+    assert flr_rpi_hlsl.count("uint cvt_rpi_i32_f32(uint bits)") == 1
+    assert "uint cvt_i32_f32(uint bits)" not in flr_rpi_hlsl
+    flr_mod_hlsl = translate_int(uncompressed_export(CVT_FLR_RPI_E64_FLR_MOD_BODY))
+    assert flr_mod_hlsl.count("uint cvt_flr_i32_f32(uint bits)") == 1
+    assert "uint cvt_rpi_i32_f32(uint bits)" not in flr_mod_hlsl
+    assert "(asuint(params[0].w) & 0x7fffffffu)" in flr_mod_hlsl
+    assert "(asuint(params[1].x) ^ 0x80000000u)" in flr_mod_hlsl
+    assert "((asuint(params[1].y) & 0x7fffffffu) ^ 0x80000000u)" in flr_mod_hlsl
+    assert translate(with_constants(["v_cvt_flr_i32_f32_e64 v12, abs(s44)"])) == translate(with_constants(["v_cvt_flr_i32_f32_e64 v12, |s44|"]))
+    assert translate(with_constants(["v_cvt_rpi_i32_f32_e64 v12, neg(s44)"])) == translate(with_constants(["v_cvt_rpi_i32_f32_e64 v12, -s44"]))
+    for alt in ("-abs(s44)", "neg(abs(s44))", "neg(|s44|)"):
+        assert translate(with_constants([f"v_cvt_rpi_i32_f32_e64 v12, {alt}"])) == translate(with_constants(["v_cvt_rpi_i32_f32_e64 v12, -|s44|"]))
     # e64 source modifiers apply bitwise sign-bit ops before the shared helper, never FP abs/neg.
     e64_mod_hlsl = translate_int(uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY))
     assert e64_mod_hlsl.count("uint cvt_i32_f32(uint bits)") == 1
@@ -7600,7 +7626,7 @@ def check_controls(directory):
                        "Constant read before load completion")
     # Guards: the destination may not overlap an outstanding image_sample, and the lowering needs the entry mask.
     sample = next(i for i, line in enumerate(with_constants([])) if line.startswith("image_sample"))
-    for op in ("u32", "i32"):
+    for op in ("u32", "i32", "flr_i32", "rpi_i32"):
         for suffix, src in (("_e32", "0x40400000"), ("_e64", "-|0x40400000|")):
             overlap = with_constants([])
             overlap.insert(sample + 1, f"v_cvt_{op}_f32{suffix} v12, {src}")
@@ -7608,7 +7634,7 @@ def check_controls(directory):
             ok = with_constants([])
             ok.insert(sample + 1, f"v_cvt_{op}_f32{suffix} v20, {src}")
             translate(ok)
-            if op == "i32" or suffix == "_e64":
+            if op != "u32" or suffix == "_e64":
                 quad = with_constants([])
                 quad.insert(quad.index("s_wqm_b64 exec, exec") + 1, f"v_cvt_{op}_f32{suffix} v20, {src}")
                 expect_value_error(translate, quad, "Invalid conversion")
@@ -7618,6 +7644,9 @@ def check_controls(directory):
     pending_src = with_constants([])
     pending_src.insert(sample + 1, "v_cvt_u32_f32_e64 v20, |v12|")
     expect_value_error(translate, pending_src, "Sample used before vmcnt wait")
+    pending_flr = with_constants([])
+    pending_flr.insert(sample + 1, "v_cvt_flr_i32_f32_e64 v20, -|v12|")
+    expect_value_error(translate, pending_flr, "Sample used before vmcnt wait")
     # v_cvt_f32_u32 and v_cvt_f32_i32 reject float modifiers, float literals, out-of-range immediates and bad registers.
     body = translate(with_constants([
         "v_cvt_f32_i32_e32 v12, -42",
@@ -8574,6 +8603,10 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_PLAIN_BODY), translate_int))
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_U32_MOD_BODY), translate_int))
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY), translate_int))
+    fixtures.append((uncompressed_export(CVT_FLR_RPI_E32_BODY), translate_int))
+    fixtures.append((uncompressed_export(CVT_FLR_RPI_E64_PLAIN_BODY), translate_int))
+    fixtures.append((uncompressed_export(CVT_FLR_RPI_E64_FLR_MOD_BODY), translate_int))
+    fixtures.append((uncompressed_export(CVT_FLR_RPI_E64_RPI_MOD_BODY), translate_int))
     fixtures.append((uncompressed_export(f16_compares()), translate_int))
     fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
     fixtures.extend((uncompressed_export(carry_out_group(op)), translate_int) for op in CARRY_OUT_OPS)
@@ -10005,6 +10038,173 @@ def check_cvt_float_int_e64_draw(directory, compiler, renderer, backend):
                                    capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError(f"Modifier mutation ({label}) escaped detection")
+
+
+def cvt_flr_i32_ref(word):
+    """Reference for v_cvt_flr_i32_f32: floor(x) saturated to signed 32-bit int, NaN -> 0."""
+    x = struct.unpack("<f", struct.pack("<I", word))[0]
+    if math.isnan(x):
+        return 0
+    if x <= -2.0**31:
+        return 0x80000000
+    if x >= 2.0**31:
+        return 0x7FFFFFFF
+    return math.floor(x) & 0xFFFFFFFF
+
+
+def cvt_rpi_i32_ref(word):
+    """Reference for v_cvt_rpi_i32_f32: floor(x + 0.5) saturated to signed 32-bit int, NaN -> 0."""
+    x = struct.unpack("<f", struct.pack("<I", word))[0]
+    if math.isnan(x):
+        return 0
+    if x <= -2.0**31:
+        return 0x80000000
+    if x >= 2.0**31:
+        return 0x7FFFFFFF
+    return math.floor(x + 0.5) & 0xFFFFFFFF
+
+
+CVT_FLR_RPI_E32_BODY = [
+    "v_mov_b32_e32 v18, s45",
+    "v_cvt_flr_i32_f32_e32 v12, s44",
+    "v_cvt_rpi_i32_f32_e32 v13, s44",
+    "v_cvt_flr_i32_f32_e32 v14, v18",
+    "v_cvt_rpi_i32_f32_e32 v15, v18",
+]
+
+CVT_FLR_RPI_E64_PLAIN_BODY = [
+    "v_mov_b32_e32 v18, s45",
+    "v_cvt_flr_i32_f32_e64 v12, s44",
+    "v_cvt_rpi_i32_f32_e64 v13, s44",
+    "v_cvt_flr_i32_f32_e64 v14, v18",
+    "v_cvt_rpi_i32_f32_e64 v15, v18",
+]
+
+CVT_FLR_RPI_E64_FLR_MOD_BODY = [
+    "v_mov_b32_e32 v18, s47",
+    "v_cvt_flr_i32_f32_e64 v12, |s44|",
+    "v_cvt_flr_i32_f32_e64 v13, -s45",
+    "v_cvt_flr_i32_f32_e64 v14, -|s46|",
+    "v_cvt_flr_i32_f32_e64 v15, -v18",
+]
+
+CVT_FLR_RPI_E64_RPI_MOD_BODY = [
+    "v_mov_b32_e32 v18, s47",
+    "v_cvt_rpi_i32_f32_e64 v12, |s44|",
+    "v_cvt_rpi_i32_f32_e64 v13, -s45",
+    "v_cvt_rpi_i32_f32_e64 v14, -|s46|",
+    "v_cvt_rpi_i32_f32_e64 v15, -v18",
+]
+
+# Pairs of binary32 bit patterns covering zeros, positive/negative fractions and halves,
+# single-ULP half boundaries (0x3effffff = 0.5-2^-25, 0xbf000001 = -0.5-2^-24, 0xbeffffff = -0.5+2^-25),
+# large odd integer 2^23+1 (0x4b000001 = 8388609.0), negative min subnormal (0x80000001 -> flr=-1, rpi=0),
+# signed saturation endpoints, infinities, and quiet/signaling NaNs.
+CVT_FLR_RPI_PAIRS = (
+    (0x00000000, 0x80000000),  # +0.0, -0.0
+    (0x3f000000, 0xbf000000),  # +0.5, -0.5
+    (0x3fc00000, 0xbfc00000),  # +1.5, -1.5
+    (0x40200000, 0xc0200000),  # +2.5, -2.5
+    (0x3e800000, 0xbe800000),  # +0.25, -0.25
+    (0x3f400000, 0xbf400000),  # +0.75, -0.75
+    (0x3effffff, 0xbf000001),  # 0.5 - 2^-25 (rpi=0), -0.5 - 2^-24 (rpi=-1)
+    (0xbeffffff, 0x4b000001),  # -0.5 + 2^-25 (rpi=0, flr=-1), 2^23 + 1 = 8388609.0
+    (0x80000001, 0x00000001),  # -min_subnormal (flr=-1, rpi=0), +min_subnormal (flr=0, rpi=0)
+    (0x4effffff, 0x4f000000),  # 2^31 - 128, 2^31
+    (0xcf000000, 0xcf000001),  # -2^31, next binary32 below -2^31
+    (0x7f800000, 0xff800000),  # +inf, -inf
+    (0x7fc00000, 0xff800001),  # +qNaN, -sNaN
+)
+
+CVT_FLR_RPI_MOD_SETS = (
+    (0xc0200000, 0x3fc00000, 0xc0300000, 0xbf400000),  # -2.5, +1.5, -2.75, -0.75
+    (0xbf000000, 0x3effffff, 0xbf000001, 0x4b000001),  # -0.5, 0.5-2^-25, -0.5-2^-24, 8388609.0
+    (0xcf000000, 0x4f000000, 0x4effffff, 0x80000001),  # -2^31, +2^31, 2^31-128, -min_subnormal
+    (0xff800000, 0x7f800000, 0x7fc00000, 0xffc00001),  # -inf, +inf, +qNaN, -qNaN
+)
+
+
+def check_cvt_flr_rpi_draw(directory, compiler, renderer, backend):
+    assert F32_DENORM_MODE == "preserve"
+    source = directory / "cvt_flr_rpi.hlsl"
+    shader = directory / "cvt_flr_rpi.cso"
+
+    def make_case(name, input_words, expected_words):
+        path = directory / f"cvt_flr_rpi_{name}.case"
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *input_words)
+        for word in expected_words:
+            assert struct.unpack("<I", struct.pack("<f", as_float(word)))[0] == word, hex(word)
+        write_case(path, bytes(constants), tuple(as_float(word) for word in expected_words), integer_rt=True)
+        return path
+
+    # Plain e32 and e64 across all 13 pairs (26 binary32 inputs through SGPR and VGPR).
+    for tag, body in (("e32", CVT_FLR_RPI_E32_BODY), ("e64", CVT_FLR_RPI_E64_PLAIN_BODY)):
+        source.write_text(translate_int(uncompressed_export(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for idx, (w0, w1) in enumerate(CVT_FLR_RPI_PAIRS):
+            expected = (cvt_flr_i32_ref(w0), cvt_rpi_i32_ref(w0), cvt_flr_i32_ref(w1), cvt_rpi_i32_ref(w1))
+            cases.append((make_case(f"{tag}_{idx}", (w0, w1, 0, 0), expected), "pass"))
+        # Bitwise negative control: flipping bit 0 on (0.5-2^-25, -0.5-2^-24) must mismatch.
+        w0, w1 = CVT_FLR_RPI_PAIRS[6]
+        bad_exp = (cvt_flr_i32_ref(w0) ^ 1, cvt_rpi_i32_ref(w0), cvt_flr_i32_ref(w1), cvt_rpi_i32_ref(w1))
+        cases.append((make_case(f"{tag}_bitflip", (w0, w1, 0, 0), bad_exp), "mismatch"))
+        run_pixel_batch(renderer, backend, shader, cases)
+
+    # Shader-mutation controls: swapping flr/rpi and replacing flr with truncating i32 must fail.
+    ref_case = make_case("swap_ref", (0x3f000000, 0xbf000000, 0, 0),
+                         (cvt_flr_i32_ref(0x3f000000), cvt_rpi_i32_ref(0x3f000000),
+                          cvt_flr_i32_ref(0xbf000000), cvt_rpi_i32_ref(0xbf000000)))
+    for label, mutated in (
+        ("swap flr and rpi e32", [line.replace("v_cvt_flr_i32_f32_e32", "TMP")
+                                  .replace("v_cvt_rpi_i32_f32_e32", "v_cvt_flr_i32_f32_e32")
+                                  .replace("TMP", "v_cvt_rpi_i32_f32_e32") for line in CVT_FLR_RPI_E32_BODY]),
+        ("replace flr with trunc i32 e32", [line.replace("v_cvt_flr_i32_f32_e32", "v_cvt_i32_f32_e32")
+                                            for line in CVT_FLR_RPI_E32_BODY]),
+    ):
+        source.write_text(translate_int(uncompressed_export(mutated)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, ref_case],
+                               capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation ({label}) escaped detection")
+
+    # Source abs/neg modifier draws and modifier-drop mutations for both flr and rpi e64.
+    chan_mods = ((True, False), (False, True), (True, True), (False, True))
+    mutations = (
+        ("|s44|", "s44", "drop abs on SGPR"),
+        ("-s45", "s45", "drop neg on SGPR"),
+        ("-|s46|", "|s46|", "drop neg on -|SGPR|"),
+        ("-|s46|", "-s46", "drop abs on -|SGPR|"),
+        ("-v18", "v18", "drop neg on VGPR"),
+    )
+    for kind, body, ref_fn in (
+        ("flr", CVT_FLR_RPI_E64_FLR_MOD_BODY, cvt_flr_i32_ref),
+        ("rpi", CVT_FLR_RPI_E64_RPI_MOD_BODY, cvt_rpi_i32_ref),
+    ):
+        source.write_text(translate_int(uncompressed_export(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        batch = []
+        set0_expected = None
+        for idx, words in enumerate(CVT_FLR_RPI_MOD_SETS):
+            expected = tuple(ref_fn(apply_f32_mod(w, abs_mod=a, neg_mod=n)) for w, (a, n) in zip(words, chan_mods))
+            if idx == 0:
+                set0_expected = expected
+            batch.append((make_case(f"{kind}_mod_{idx}", words, expected), "pass"))
+        flipped = (set0_expected[0] ^ 1, *set0_expected[1:])
+        batch.append((make_case(f"{kind}_mod_bitflip", CVT_FLR_RPI_MOD_SETS[0], flipped), "mismatch"))
+        run_pixel_batch(renderer, backend, shader, batch)
+        set0_case = make_case(f"{kind}_mut_ref", CVT_FLR_RPI_MOD_SETS[0], set0_expected)
+        for old, new, label in mutations:
+            mutated = [line.replace(old, new) for line in body]
+            assert mutated != body, label
+            source.write_text(translate_int(uncompressed_export(mutated)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, set0_case],
+                                   capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                raise AssertionError(f"{kind} modifier mutation ({label}) escaped detection")
 
 
 def check_int_minmax_draws(directory, compiler, renderer, backend):
@@ -11680,6 +11880,13 @@ def main():
         if mode == "draw-cvt-float-int-e64":
             try:
                 return check_cvt_float_int_e64_draw(directory, *args)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
+                    return 77
+                raise
+        if mode == "draw-cvt-flr-rpi":
+            try:
+                return check_cvt_flr_rpi_draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
                     return 77

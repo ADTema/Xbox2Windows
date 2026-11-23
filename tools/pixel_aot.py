@@ -929,6 +929,23 @@ uint mul_hi_i32(uint a, uint b) {
         "    return hi;\n"
         "}"
     ),
+    "cvt_flr_i32_f32": (
+        "uint cvt_flr_i32_f32(uint bits) {\n"
+        "    float x = asfloat((bits & 0x7fffffffu) > 0x7f800000u ? 0u : bits);\n"
+        "    float f = floor(x);\n"
+        "    float finite = clamp(f, -2147483648.0f, 2147483520.0f);\n"
+        "    return f >= 2147483648.0f ? 0x7fffffffu : asuint(int(finite));\n"
+        "}"
+    ),
+    "cvt_rpi_i32_f32": (
+        "uint cvt_rpi_i32_f32(uint bits) {\n"
+        "    float x = asfloat((bits & 0x7fffffffu) > 0x7f800000u ? 0u : bits);\n"
+        "    float f = floor(x);\n"
+        "    float r = f + ((x - f) >= 0.5f ? 1.0f : 0.0f);\n"
+        "    float finite = clamp(r, -2147483648.0f, 2147483520.0f);\n"
+        "    return r >= 2147483648.0f ? 0x7fffffffu : asuint(int(finite));\n"
+        "}"
+    ),
 }
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
@@ -3228,8 +3245,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(r"v_cvt_i32_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8})"):
-            dst, src = m.groups()
+        elif m := match(r"v_cvt_(i32|flr_i32|rpi_i32)_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8})"):
+            kind, dst, src = m.groups()
             if int(dst[1:]) > 255 or (src.startswith(("v", "s")) and
                     int(src[1:]) > (255 if src.startswith("v") else 105)):
                 raise ValueError("Invalid signed conversion register")
@@ -3238,17 +3255,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             if src.startswith("v") and src not in vector:
-                raise ValueError(f"Unbound pixel input {src} at v_cvt_i32_f32_e32")
+                raise ValueError(f"Unbound pixel input {src} at v_cvt_{kind}_f32_e32")
             operand = fp_operand(src, scalar, vector, pending, sample_dest)
-            helpers.add("cvt_i32_f32")
+            helper = f"cvt_{kind}_f32"
+            helpers.add(helper)
             vector[dst] = f"alu{i}"
-            lines.append(f"    precise float alu{i} = asfloat(cvt_i32_f32(asuint({operand})));")
-        elif (m := match(r"v_cvt_(u32|i32)_f32_e64 (v\d+), ([^,\s]+)")) and (
+            lines.append(f"    precise float alu{i} = asfloat({helper}(asuint({operand})));")
+        elif (m := match(r"v_cvt_(u32|i32|flr_i32|rpi_i32)_f32_e64 (v\d+), ([^,\s]+)")) and (
                 parsed := parse_cvt_f32_e64_source(m.group(3))):
-            # VOP3 truncating float-to-int with optional bitwise source abs/neg modifiers.
-            # Apply abs then neg on the raw IEEE-754 word before passing it to the shared
-            # src/ffx_float_to_int.hlsli helper; clamp, omod, decimal/float literals and
-            # FLR/RPI variants remain rejected.
+            # VOP3 float-to-int (truncate, floor, round-to-+inf) with optional bitwise source
+            # abs/neg modifiers applied on the raw IEEE-754 word before conversion; clamp, omod,
+            # decimal/float literals, DPP and SDWA variants remain rejected.
             kind, dst, _ = m.groups()
             base, has_abs, has_neg = parsed
             if int(dst[1:]) > 255 or (base.startswith(("v", "s")) and
