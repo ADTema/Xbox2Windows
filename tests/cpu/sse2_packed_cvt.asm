@@ -87,8 +87,7 @@ cmpps_unord_op ENDP
 cmppd_le_op PROC FRAME
     .endprolog
     movapd xmm0, xmmword ptr [rcx]
-    movapd xmm1, xmmword ptr [rdx]
-    cmppd xmm0, xmm1, 2
+    cmppd xmm0, xmmword ptr [rdx], 2
     movapd xmmword ptr [r8], xmm0
     ret
 cmppd_le_op ENDP

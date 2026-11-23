@@ -10,6 +10,7 @@
 #include "era_title_va.h"
 #include "LookupTitleAddresses.h"
 #include "ProbeArrayAtomics.h"
+#include "ProbeArrayAtomicsWaterfall.h"
 #include "WriteTitleAddresses.h"
 
 #include <algorithm>
@@ -194,10 +195,10 @@ Word float_bits(float value)
 // aliases under test. 256 threads each add 1 to word 0 of one of four zeroed buffers, 64 threads
 // per buffer. Prints the expected and actual counts. The in-box WARP of Windows 10 (10.0.19041)
 // applies each such add four times, which is a wrong result, not a missing capability.
-bool array_atomics_exact(ID3D12Device* device)
+bool array_atomics_exact(ID3D12Device* device, D3D12_SHADER_BYTECODE shader, const char* name)
 {
     constexpr UINT targets = 4, threads = 256;
-    Kernel kernel(device, {ProbeArrayAtomics, sizeof(ProbeArrayAtomics)});
+    Kernel kernel(device, shader);
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptor_count,
                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     ComPtr<ID3D12DescriptorHeap> heap;
@@ -242,12 +243,16 @@ bool array_atomics_exact(ID3D12Device* device)
     cmd.submit_and_wait(device);
     const auto counts = read(back.Get(), targets);
     const Word expected = threads / targets;
-    std::printf("array_atomics threads=%u buffers=%u expected=%u actual=%u,%u,%u,%u\n", threads, targets, expected,
+    std::printf("%s threads=%u buffers=%u expected=%u actual=%u,%u,%u,%u\n", name, threads, targets, expected,
                 counts[0], counts[1], counts[2], counts[3]);
     return std::all_of(counts.begin(), counts.end(), [=](Word count) { return count == expected; });
 }
 }
-
+bool check_gpu_alias_atomic_waterfall(ID3D12Device* device)
+{
+    return array_atomics_exact(device, {ProbeArrayAtomicsWaterfall, sizeof(ProbeArrayAtomicsWaterfall)},
+                               "array_atomics_waterfall");
+}
 bool check_gpu_alias_lookup(ID3D12Device* device)
 {
     AliasFixture fixture;
@@ -312,7 +317,8 @@ bool check_gpu_alias_lookup_writes(ID3D12Device* device)
     if (!fixture.open(device)) return false;
     // Measured first and always printed. Wrong counts fail the test at the end, after the whole
     // fixture has run, so the output separates the add and sub words from every other check.
-    const bool atomics_exact = array_atomics_exact(device);
+    const bool atomics_exact = array_atomics_exact(device, {ProbeArrayAtomics, sizeof(ProbeArrayAtomics)},
+                                                   "array_atomics");
     enum : Word { Store = 0, Add = 1, Sub = 2, MinFloat = 3, MaxFloat = 4 };
     struct Record {
         std::uint64_t address;

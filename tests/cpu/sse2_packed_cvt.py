@@ -36,14 +36,14 @@ def emit(native_dll: Path, output_cpp: Path) -> None:
 
 
 def check_controls() -> None:
-    # VEX vcvtdq2ps xmm0, xmm1 (C5 F8 5B C1) followed by ret must be rejected.
-    vex = list(Decoder(64, b"\xc5\xf8\x5b\xc1\xc3", ip=0x1000))
+    # CMPPD xmm6, xmm1, 2 is outside the shared lowerer's volatile XMM profile.
+    nonvolatile = list(Decoder(64, b"\x66\x0f\xc2\xf1\x02\xc3", ip=0x1000))
     try:
-        lower(vex, [], {}, {}, {})
-    except ValueError:
-        pass
+        lower(nonvolatile, [], {}, {}, {})
+    except ValueError as exc:
+        assert "unsupported packed SSE compare destination" in str(exc), exc
     else:
-        raise AssertionError("expected VEX vcvtdq2ps to be rejected")
+        raise AssertionError("expected CMPPD writing XMM6 to be rejected")
 
 
 def aligned_buf(data: bytes):
