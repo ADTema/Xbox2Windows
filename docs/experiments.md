@@ -4076,6 +4076,23 @@ cmake --build --preset dev --target xmem_committed_memory_check
 ctest --preset dev --no-tests=error -R '^xmem_committed_memory$' -V
 ```
 
+### Second commit and protection comparison
+
+`xmem_commit_protection` ([`tests/xmem_commit_protection_check.cpp`](../tests/xmem_commit_protection_check.cpp)) is a source-built x64 check for [#870](https://github.com/R0Y00/Xbox2Windows/issues/870) using synthetic 64 KiB page patterns. Its scope is separate from the first-commit alignment/zero-fill/rounding check (`xmem_committed_memory`), the reserve-only profile in [#888](https://github.com/R0Y00/Xbox2Windows/pull/888), and the device/queue work in [#874](https://github.com/R0Y00/Xbox2Windows/issues/874).
+
+The fixture compares two proposed desktop policies on Windows 10 Pro (build 19045, MSVC VS2022 x64, `dev` and `release` presets):
+
+- **Ordinary committed pages (`MEM_PRIVATE` via `VirtualAlloc`)**: CPU read/write and `VirtualProtect` transitions (`PAGE_READWRITE` -> `PAGE_READONLY` -> `PAGE_NOACCESS` -> `PAGE_READWRITE`) work across 64 KiB pages. Negative controls verify that writes to `PAGE_READONLY` and reads/writes to `PAGE_NOACCESS` raise `EXCEPTION_ACCESS_VIOLATION` via SEH while leaving stored bytes unchanged. Invalid protection flags (`0`, `PAGE_READWRITE | PAGE_READONLY`, error `87`), cross-boundary protection into an uncommitted page (error `487`), and over-committing past the reservation boundary (error `487`) all fail while leaving the committed page's bytes and protection intact. `VirtualAlloc(..., MEM_COMMIT, PAGE_READWRITE)` is idempotent, and `VirtualFree(..., MEM_DECOMMIT)` returns the page to `MEM_RESERVE`.
+- **Live shared-page view (`MEM_MAPPED` via `xmem.dll` `XMemAllocatePhysicalPages` and `XMemMapPhysicalPages` / `XMemMapPhysicalPagesScatter`)**: two aliased views of one 64 KiB physical grant share bytes live, with per-view `VirtualProtect` isolation. Protecting view 1 to `PAGE_READONLY` blocks writes through view 1 (`EXCEPTION_ACCESS_VIOLATION`) while view 2 remains `PAGE_READWRITE` and writes live updates visible through view 1; protecting view 1 to `PAGE_NOACCESS` faults reads and writes on view 1 while view 2 stays accessible. Failed reprotection (error `87` for `0`, error `487` across an unmapped placeholder), refused `XMemVirtualAlloc` second-commit combinations (`ERROR_INVALID_PARAMETER`, `87`), refused remap over a live view (`87`), and refused `XMemFreePhysicalPages` while mapped (`87`) all leave both live views, their bytes, and their protections intact. Bytes survive unmapping both views and remapping the grant.
+- **First observable discrepancy**: ordinary committed pages report `MEM_PRIVATE` (`0x20000`), accept `VirtualFree(..., MEM_DECOMMIT)`, and cannot alias a second VA; live shared-page views report `MEM_MAPPED` (`0x40000`), refuse `VirtualFree(..., MEM_DECOMMIT)` with `ERROR_INVALID_PARAMETER` (`87`) without disturbing the live view, support live VA aliasing with independent per-view protection, and preserve bytes across unmap/remap. Whether a console caller requires a live shared-page view or ordinary committed pages for a given second-commit site remains a console-side question.
+
+```powershell
+cmake --build --preset dev --target xmem_commit_protection_check
+ctest --preset dev --no-tests=error -R '^xmem_commit_protection$' -V
+cmake --build --preset release --target xmem_commit_protection_check
+ctest --preset release --no-tests=error -R '^xmem_commit_protection$' -V
+```
+
 ### Tools-memory availability fixture
 
 The source-built caller ([`tools_mem_caller.asm`](../tests/cpu/tools_mem_caller.asm)) imports `XMemIsToolsMemAvailable` by name. It queries twice and checks the recorded count before choosing a path. The controlled recording provider ([`tools_mem_provider.cpp`](../tests/cpu/tools_mem_provider.cpp)) returns FALSE for the fallback path (exit 42) or TRUE for the tools-memory path (exit 84). The same EXE exits with a live test worker under the Windows loader and returns its result to the host under `pe_map`. Withholding the query export stops mapping at import resolution before entry, with the trace provider still available.
