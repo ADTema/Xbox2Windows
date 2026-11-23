@@ -13,6 +13,8 @@ Families, each changing one property:
   samples_N        N additional independent SampleLevel stores, flat control flow
   branches_B       B additional if/else regions with observable stores
   samplebranch_N   one SampleLevel inside each of N divergent regions
+  condstore_N      N conditional raw UAV stores, no additional sampling
+  stores_N         the same N stores without their branches (condstore twin)
 
 The tool needs only the Python standard library and an external DXC executable.
 It runs a fixed command (target cs_6_6, entry main, native 16-bit types allowed,
@@ -94,11 +96,16 @@ void main(SPIRV_Cross_Input stage_input)
 SAMPLE_SIZES = (1, 4, 16, 64, 256, 1024, 4096, 16384)
 BRANCH_SIZES = (1, 4, 16, 64, 256, 1024, 4096, 16384)
 SAMPLEBRANCH_SIZES = (64, 256, 1024, 2048, 4096, 6144, 8192, 12288, 16384)
+CONDSTORE_SIZES = (64, 256, 1024, 2048, 4096, 8192, 16384)
 
-VARIANT_RE = re.compile(r"(samples|branches|samplebranch)_([1-9][0-9]*)")
+VARIANT_RE = re.compile(r"(samples|branches|samplebranch|condstore|stores)_([1-9][0-9]*)")
+# LLVM's timer report prints User, System, User+System and Wall columns, but
+# omits the System column when every pass has zero system time (common for
+# small inputs). The last two columns are always User+System and Wall.
+FTIME_COLUMN = r"([\d.]+)\s+\(\s*[\d.]+%\)\s+"
 FTIME_RE = re.compile(
-    r"^\s*;\s+([\d.]+)\s+\(\s*[\d.]+%\)\s+([\d.]+)\s+\(\s*[\d.]+%\)\s+"
-    r"([\d.]+)\s+\(\s*[\d.]+%\)\s+([\d.]+)\s+\(\s*[\d.]+%\)\s+(.+?)\s*$")
+    r"^\s*;\s+" + FTIME_COLUMN + r"(?:" + FTIME_COLUMN + r")?" + FTIME_COLUMN + FTIME_COLUMN
+    + r"(.+?)\s*$")
 
 CSV_FIELDS = (
     "variant", "family", "size", "hlsl_bytes", "dxil_bytes", "reps",
@@ -166,6 +173,34 @@ def samplebranch_source(n):
     return _wrap(FIXTURE_HEADER, "".join(lines) + CONTROL_STORES)
 
 
+def _store_region(k, conditional):
+    """One raw UAV store clear of the control words, optionally behind a divergent branch.
+
+    The branch condition is the samplebranch_N condition. The stored value is
+    not sampled, so the family has no sample operation beyond the two control
+    stores.
+    """
+    store = f"_4.Store({65536 + 4 * k}u, gl_WorkGroupID.y);"
+    if not conditional:
+        return f"    {store}\n"
+    return (f"    if (((gl_WorkGroupID.x + {k}u) & 1u) != 0u)\n"
+            f"    {{\n"
+            f"        {store}\n"
+            f"    }}\n")
+
+
+def condstore_source(n):
+    """N conditional stores to the UAV, the minimal shape that keeps the GVN cost."""
+    return _wrap(FIXTURE_HEADER, "".join(_store_region(k, True) for k in range(n))
+                 + CONTROL_STORES)
+
+
+def stores_source(n):
+    """The condstore_N stores with their branches removed; nothing else changes."""
+    return _wrap(FIXTURE_HEADER, "".join(_store_region(k, False) for k in range(n))
+                 + CONTROL_STORES)
+
+
 def variant_info(name):
     """Return (family, size, source) for a generated variant name."""
     if name == "control":
@@ -173,12 +208,14 @@ def variant_info(name):
     match = VARIANT_RE.fullmatch(name)
     if not match:
         raise ValueError(
-            f"unknown variant {name!r}; use control, samples_N, branches_N or samplebranch_N")
+            f"unknown variant {name!r}; use control, samples_N, branches_N, "
+            "samplebranch_N, condstore_N or stores_N")
     family, size = match.group(1), int(match.group(2))
     if size > MAX_SIZE:
         raise ValueError(f"variant size {size} exceeds the {MAX_SIZE} guard")
     source = {"samples": samples_source, "branches": branches_source,
-              "samplebranch": samplebranch_source}[family](size)
+              "samplebranch": samplebranch_source, "condstore": condstore_source,
+              "stores": stores_source}[family](size)
     return family, size, source
 
 
@@ -187,7 +224,9 @@ def standard_variants():
     return (["control"]
             + [f"samples_{size}" for size in SAMPLE_SIZES]
             + [f"branches_{size}" for size in BRANCH_SIZES]
-            + [f"samplebranch_{size}" for size in SAMPLEBRANCH_SIZES])
+            + [f"samplebranch_{size}" for size in SAMPLEBRANCH_SIZES]
+            + [f"condstore_{size}" for size in CONDSTORE_SIZES]
+            + [f"stores_{size}" for size in CONDSTORE_SIZES])
 
 
 if os.name == "nt":
@@ -319,7 +358,7 @@ def parse_ftime(text):
         match = FTIME_RE.match(line)
         if not match:
             continue
-        _user, _system, combined, wall, name = match.groups()
+        _user, _system, combined, wall, name = match.groups()  # _system may be None
         row = {"name": name, "combined_s": float(combined), "wall_s": float(wall)}
         if name == "Total":
             total = row
@@ -475,8 +514,9 @@ def main(argv=None):
     parser.add_argument("--entry", default=DEFAULT_ENTRY,
                         help=f"entry point passed to DXC (default: {DEFAULT_ENTRY})")
     parser.add_argument("--variants", default=DEFAULT_VARIANTS,
-                        help="comma-separated variant names; control, samples_N, branches_N "
-                             f"or samplebranch_N (default: {DEFAULT_VARIANTS})")
+                        help="comma-separated variant names; control, samples_N, branches_N, "
+                             "samplebranch_N, condstore_N or stores_N "
+                             f"(default: {DEFAULT_VARIANTS})")
     parser.add_argument("--repeat", type=int, default=1,
                         help="measured DXC runs per variant; the median is recorded "
                              "(default: 1)")

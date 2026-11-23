@@ -1096,6 +1096,8 @@ VEX 128-bit and 256-bit AVX packed sign/zero-extend, horizontal integer add/sub,
 
 VEX 128-bit and 256-bit AVX packed shifts, saturating packs, unpacks, shuffles, integer blends, `vpmovmskb`, and `vpextr*`/`vpinsr*` forms (`vpsllw`/`d`/`q`, `vpsrlw`/`q`, `vpsraw`/`d`, `vpslldq`, `vpacksswb`/`dw`, `vpackuswb`/`dw`, `vpunpckl*`/`h*`, `vpshufd`/`lw`/`hw`, `vpblendw`, `vpblendvb`, `vpmovmskb`, `vpextrb`/`w`/`d`/`q`, `vpinsrb`/`w`/`d`/`q`) are also lowered for `EncodingKind.VEX` while zeroing upper YMM bytes for 128-bit destinations and rejecting EVEX encodings. `cpu_aot_avx_int_shifts_pack` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it compares the 34 XMM cases in `tests/cpu/avx_int_shifts_pack.asm` against native 32-byte and scalar outputs and rejects EVEX and unmodeled registers. Its `vpsrlw` memory-count control uses the low 64 bits of a readable 128-bit operand and requires a fault before writing output when the higher eight bytes cross into an inaccessible page. On AVX2 hosts a YMM memory `vpshufd` checks the two 128-bit lanes against distinct expected bytes. Run `cmake --build --preset dev --target cpu_avx_int_shifts_pack_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_int_shifts_pack$' -V`.
 
+VEX 128-bit and 256-bit AVX broadcast, lane extract/insert, permute, shuffle, unpack, blend, dot-product, round, and `vzeroall` forms (`vbroadcastss`/`sd`/`f128`, `vextractf128`, `vinsertf128`, `vperm2f128`, `vpermilps`/`pd`, `vshufps`/`pd`, `vunpcklps`/`hps`/`lpd`/`hpd`, `vmovddup`/`sldup`/`shdup`, `vblendps`/`pd`/`vps`/`vpd`, `vdpps`/`pd`, `vroundps`/`pd`, `vzeroall`) are also lowered for `EncodingKind.VEX` while rejecting MXCSR rounding mode (`imm8 & 4 != 0`). `cpu_aot_avx_shuffle_blend` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it builds all 27 exports from MASM source (`tests/cpu/avx_shuffle_blend.asm`), translates them, compares exact 32-byte outputs against the native DLL, and checks that MXCSR-mode `vroundps` is rejected. The XMM memory form of `vmovddup` is also run with exactly eight readable bytes before a guard page. The `vdpps` cancellation case checks pairwise rounding. For multiple NaN inputs the selected lanes must be NaN, while the other lanes are compared bit for bit. Run `cmake --build --preset dev --target cpu_avx_shuffle_blend_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_shuffle_blend$' -V`.
+
 ## Recompiling a direct x64 call
 
 The [caller and callee](../tests/cpu/direct.asm) each accept two unsigned 64-bit integers and an output pointer. The [translator](../tools/cpu_call_aot.py) starts at the caller export, follows the signed displacement in its E8 call and reads the target's runtime-function interval. It generates two C++ functions from the linked machine code. MSVC emits a separate x64 DLL with a non-inlined call. The Windows test checks the relative call against the two export addresses in both the input and output DLLs.
@@ -1437,7 +1439,7 @@ ctest --preset dev --no-tests=error -R '^cpu_native_tls$' -V
 
 Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release` presets: on every notification (process attach and detach on the main thread, thread attach and detach on both workers) both loaders call caller 1, then caller 3, then the entry point. Every thread starts from the template, each thread's writes stay in its own copy, and the template in the loaded image is unchanged at the end. The two workers exit in either order, so only the per-thread sequences are compared between loaders. Two negative controls patch copies of the built DLL and must be rejected under both loaders: swapping the two callback table entries is reported as a callback order failure (`[3, 1, 2]` on process attach), and zeroing the template from its first page boundary on is reported as a template failure (array words differ on the main thread). See [issue #870](https://github.com/R0Y00/Xbox2Windows/issues/870).
 
-Until `pe_map` gained the TLS carrier described in the next section, this test pinned the opposite result: `pe_map_image` rejected the image with `MAP_UNSUPPORTED` ("TLS data"). `pe_map_run` still sends no thread notifications to an EXE (`notify` returns early for non-DLL images, so only `DLL_PROCESS_ATTACH` runs on the calling thread). This DLL test addresses the thread-local-value part of #165; it does not cover EXE startup: an EXE's TLS callbacks on a second worker thread under `pe_map_run`, C-runtime startup in a mapped EXE, `GetModuleHandle(NULL)`, and the PEB remain untested and unsupported. [Issue #165](https://github.com/R0Y00/Xbox2Windows/issues/165)
+Until `pe_map` gained the TLS carrier described in the next section, this test pinned the opposite result: `pe_map_image` rejected the image with `MAP_UNSUPPORTED` ("TLS data"). An EXE's own TLS template and callbacks under `pe_map_run`, including thread notifications, are covered in [An EXE's own TLS template and callbacks](#an-exes-own-tls-template-and-callbacks). This DLL test addresses the thread-local-value part of #165; it does not cover C-runtime startup in a mapped EXE, `GetModuleHandle(NULL)`, and the PEB remain untested and unsupported. [Issue #165](https://github.com/R0Y00/Xbox2Windows/issues/165)
 
 ```powershell
 cmake --build --preset dev --target pe_map cpu_tls_value cpu_tls_original cpu_tls_sink
@@ -1509,6 +1511,32 @@ Not covered: `DLL_PROCESS_DETACH` ordering at exit, DLLs built with the C runtim
 ```powershell
 cmake --build --preset dev --target pe_map cpu_startup_exe cpu_startup_a cpu_startup_a_alt cpu_startup_b cpu_startup_b_noinit cpu_startup_exe_timeout cpu_startup_exe_create
 ctest --preset dev --no-tests=error -R '^cpu_native_startup$' -V
+```
+
+### An EXE's own TLS template and callbacks
+
+`cpu_exe_tls` is a CRT-free, source-built EXE whose own image holds the implicit TLS data and the two TLS callbacks of `cpu_tls_value`: an int (`7`) and an 8 KiB array of distinct words in one initialized template that spans a 4 KiB page boundary, with callbacks in `.CRT$XLB` (caller 1) and `.CRT$XLM` (caller 3). The EXE supplies the TLS directory the C runtime would otherwise provide (`_tls_used`, `_tls_index`, the `.tls` markers and the `.CRT$XLA`/`.CRT$XLZ` bounds). Each callback records `observe()`: the int in the low 16 bits and the number of changed array words above them, so a fresh block reports 7. The entry point writes 20 to the main thread's copy and starts two workers. Worker A writes 50 and waits. Worker B starts after A's write, writes 60 and waits. A is then released and joined, then B, so every notification comes in a fixed order. The EXE prints one ordered startup log and returns the main thread's final `observe()` as its exit code.
+
+`cpu_native_exe_tls` checks the template layout and callback table with `pefile`, launches the EXE with Windows, and in a child process maps it with `pe_map_image` and starts it with `pe_map_run`. Both runs must print this log and exit code:
+
+```text
+LOG:m11=7 m13=7 E mf=7 mw=20014 a21=7 a23=7 af=7 aw=20032 b21=7 b23=7 bf=7 bw=2003c al=20032 a31=20032 a33=20032 bl=2003c b31=2003c b33=2003c ml=20014 X=20014
+exit 0x20014
+```
+
+`m11` is the main thread, reason 1 (process attach), caller 1. `a2`/`a3` and `b2`/`b3` are thread attach and detach of workers A and B. `E` is the entry point, and `f`, `w` and `l` are a thread's own first, written and last observations. Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release` presets:
+
+- Under both loaders both callbacks run in table order on process attach and on thread attach and detach of both workers. Every thread starts from the template, and each thread's writes stay in its own copy, including the values the detach callbacks see.
+- Before this test, `pe_map_run` called the EXE's callbacks only for process attach: `notify` returns early for an image without `IMAGE_FILE_DLL`, so a started EXE received no thread notifications. Against that mapper the test fails with `notifications for ['m1']`. Now `pe_map_run` marks the EXE as started once every process-attach callback has returned, before it calls the entry point. From then until `pe_map_release`, `pe_map.dll`'s thread notifications call the EXE's TLS callbacks with `DLL_THREAD_ATTACH` and `DLL_THREAD_DETACH`, never its entry point. Release sends the EXE no process detach.
+- Eligibility: `cpu_exe_tls_early` starts and joins a probe thread from its first process-attach callback. Under `pe_map` the probe runs (`pf=7` between the two process-attach callbacks) but receives no EXE notification. A mapper that marks the EXE as started before the process-attach callbacks fails with `notifications for [..., 'p2', 'p3']`. Threads that attach during the process-attach callbacks, whether a callback or the host started them, are outside the guarantee: Windows holds such a thread until process initialization ends, which `pe_map` does not reproduce, so this variant is not launched natively.
+- The child binds only `kernel32.dll`, to the host's kernel32, and gives the callbacks per-reason counters (`exe_tls_mirror`) that it reads after release. A started run counts 2 process attaches, 4 thread attaches, 4 thread detaches and 0 process detaches. An EXE that is mapped but never started, and one whose `pe_map_run` is refused (a null exit code), count 0 for every reason while two host threads attach and detach and through release.
+- Negative controls patch copies of the built EXE with the `cpu_native_tls_value` helpers. Both loaders reject both: a swapped callback table as `callback order: m1 ran callers ['3', '1']`, and a template zeroed from its first page boundary as a template mismatch on the first callback.
+
+Not covered: process detach at exit (the log is written before the entry point returns), C-runtime startup in a mapped EXE, `GetModuleHandle(NULL)` and the PEB. [Issue #165](https://github.com/R0Y00/Xbox2Windows/issues/165), [issue #870](https://github.com/R0Y00/Xbox2Windows/issues/870)
+
+```powershell
+cmake --build --preset dev --target pe_map cpu_exe_tls cpu_exe_tls_early
+ctest --preset dev --no-tests=error -R '^cpu_native_exe_tls$' -V
 ```
 
 ### Lifecycle of two DLLs with the static C runtime
@@ -2266,6 +2294,15 @@ Each comparison stores the selected operand's 32-bit pattern in the private
 LDS word. Their returning forms `ds_rsub_rtn_u32`, `ds_min_rtn_i32`,
 `ds_max_rtn_i32`, `ds_min_rtn_u32` and `ds_max_rtn_u32` also write the
 pre-update word to the destination VGPR.
+
+`ds_inc_u32` and `ds_dec_u32` update the private word using an unsigned
+limit from a VGPR. Increment resets to zero at or above the limit.
+Decrement resets to the limit when the old value is zero or exceeds it.
+`ds_wrap_rtn_b32` subtracts the limit at or above it and adds a second
+VGPR otherwise. The three returning forms copy the old word into their
+destination. The fixtures compare old and new words around zero and the
+limit and with high-bit values. Replacing the update with a read or no-op
+must mismatch at word 1.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The source-built wave32 fixture reads the full word and both halves after
@@ -3921,11 +3958,36 @@ ctest --preset dev --no-tests=error -R '^(xmem_shim_(exports|physical_pages)|era
 
 The source-built caller ([`tools_mem_caller.asm`](../tests/cpu/tools_mem_caller.asm)) imports `XMemIsToolsMemAvailable` by name. It queries twice and checks the recorded count before choosing a path. The controlled recording provider ([`tools_mem_provider.cpp`](../tests/cpu/tools_mem_provider.cpp)) returns FALSE for the fallback path (exit 42) or TRUE for the tools-memory path (exit 84). The same EXE exits with a live test worker under the Windows loader and returns its result to the host under `pe_map`. Withholding the query export stops mapping at import resolution before entry, with the trace provider still available.
 
-The paired outcomes describe the synthetic caller. Actual console ordering and the production desktop shim behavior remain open. [Independent recording fixture and results](https://github.com/R0Y00/Xbox2Windows/pull/900)
+The paired outcomes describe the synthetic caller. The desktop `xmem.dll` has no devkit tools-memory partition, so its named query reports FALSE. `xmem_shim_tools_memory` checks successive queries against the desktop shim. Actual console availability and the runtime behavior of individual callers remain separate questions. [Independent recording fixture and results](https://github.com/R0Y00/Xbox2Windows/pull/900)
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_tools_mem$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_tools_mem$' -V
+```
+
+### Physical-page mapping caller and recorder
+
+This fixture exercises proposed contiguous and scatter call shapes. The names and signatures in public reimplementations are independent reference material. [SlimEra declaration](https://github.com/XWine1/SlimEra/blob/397807a9563f62b56cf7aaea9809b6fa635ba651/era.h)
+
+A source-built caller ([`map_pages_caller.asm`](../tests/cpu/map_pages_caller.asm)) imports both functions from `xmem.dll` by name and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled recording provider ([`map_pages_provider.cpp`](../tests/cpu/map_pages_provider.cpp)), it exercises ten checks:
+- **Step 1**: Contiguous mapping to a 64 KiB aligned virtual address, returning the base address.
+- **Step 2**: Contiguous unmapping (`NULL` page array), returning the base address.
+- **Step 3**: Scatter mapping across an array of 64 KiB aligned virtual addresses, returning `TRUE` (`1`).
+- **Step 4**: Scatter unmapping (`NULL` page array), returning `TRUE` (`1`).
+- **Step 5–7**: Negative controls for unaligned virtual address, null virtual address, and null scatter array, each returning `0`.
+- **Step 8**: Changed-argument control with wrong page IDs (`[999, 888]`), returning `NULL`.
+- **Step 9**: Changed-argument control with swapped scatter destinations (`[0x10010000, 0x10000000]`), returning `0`.
+- **Step 10**: Internal verification of provider call counters and mismatch counts directly within the caller process.
+
+The specific fixture inputs tested (`VirtualAddress = 0x10000000`, `cPages = 2`, `rgPages = [1, 2]`, and scatter destinations `[0x10000000, 0x10010000]`) are synthetic fixture inputs chosen for this test. The provider's recorded trace validates the expected count, page IDs and ordered scatter destinations.
+
+On success, the caller exits with the success sentinel `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return. The two loaders consuming the controlled provider verify caller contracts and error propagation; they do not establish console return types, that `NULL` unmaps, that 64 KiB alignment is required, or that virtual address reservations survive unmapping. These remain proposed desktop policies and hypotheses under investigation. Production XMem behavior and physical page registry tracking remain separate (#892).
+
+Two independent negative controls confirm that withholding either `XMemMapPhysicalPages` or `XMemMapPhysicalPagesScatter` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_map_pages$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_map_pages$' -V
 ```
 
 ### Grouped allocation descriptor builders
@@ -4755,6 +4817,113 @@ about 0.02 s and the worst measured case below 0.5 MB is 2.54 s. On a separate
 entered `loop-rotate`. That trace locates the observed stall under instrumentation.
 Uninstrumented pass-time totals and attribution across the replay cohort remain open.
 The GPU check above covers the public fixture's four control words. [Archive trace](https://github.com/R0Y00/Xbox2Windows/issues/775)
+
+#### Minimal pair: conditional UAV stores without sampling
+
+Reducing `samplebranch_N` one element at a time showed that neither the sampler views
+nor the sample operations are needed for the GVN cost. Removing the samples, the else
+arm, the static `gl_WorkGroupID` reads or the shared condition operand left the
+superlinear growth in place, and so did wrapping the regions in a loop or a
+`for (;;) switch` state machine (the loop forms are slower again; they are not part of
+the tool). Making the stores unconditional removed it. The tool has two families for
+this pair, and the source of each differs from the other only by the branches:
+
+- `condstore_N`: N stores `if (((gl_WorkGroupID.x + k) & 1u) != 0u) _4.Store(...)`
+  into the raw UAV, with the samplebranch condition and no sampling beyond the two
+  control stores;
+- `stores_N`: the same N stores without their `if`.
+
+Measured on 2026-11-23 with two pinned DXC builds, on a Ryzen 7 3700X (8C/16T, 32 GiB)
+running Windows 10 build 19045, one compile at a time. The first build is DXC
+1.7.2308.16 (`52da17e29`) from Windows SDK 10.0.26100. The second is DXC 1.9.0.5512
+(`01b62ad47`) from LunarG Vulkan SDK 1.4.363.0. The maintainer's
+1.8.2502.11 build was not available on this machine. The flags are the same as the
+baseline above. Every row reports the compiler only. There was no dispatch or PSO
+creation.
+
+```powershell
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants control,stores_1024,stores_4096,stores_16384,condstore_1024,condstore_2048,condstore_4096 --repeat 3 --timeout 90 --out out\dxc-blowup\family.json
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants condstore_8192,condstore_16384 --timeout 90 --out out\dxc-blowup\policy.json
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants condstore_16384 --timeout 900 --out out\dxc-blowup\raised.json
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants condstore_4096,condstore_16384 --extra-arg=-opt-disable --extra-arg=gvn --timeout 300 --out out\dxc-blowup\nogvn.json
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants stores_4096,condstore_4096 --ftime-report --timeout 300 --out out\dxc-blowup\passes.json
+```
+
+Rows with three repetitions give the median wall time. Every other row is a single run.
+
+| variant | setting | HLSL bytes | 1.7.2308 wall s | 1.7.2308 peak MiB | 1.7.2308 outcome | 1.9.0.5512 wall s | 1.9.0.5512 peak MiB | 1.9.0.5512 outcome |
+|---|---|---:|---:|---:|---|---:|---:|---|
+| control | default | 685 | 0.027 | 13.9 | DXIL | 0.022 | 15.1 | DXIL |
+| stores_1024 | default | 41,645 | 0.170 | 18.9 | DXIL | 0.130 | 20.4 | DXIL |
+| stores_4096 | default | 164,525 | 0.712 | 33.3 | DXIL | 0.583 | 35.2 | DXIL |
+| stores_16384 | default | 663,813 | 2.598 | 90.2 | DXIL | 2.519 | 91.4 | DXIL |
+| condstore_1024 | default | 107,095 | 0.948 | 51.5 | DXIL | 1.278 | 54.2 | DXIL |
+| condstore_2048 | default | 214,615 | 3.259 | 141.2 | DXIL | 5.045 | 145.8 | DXIL |
+| condstore_4096 | default | 429,655 | 12.993 | 480.1 | DXIL | 23.906 | 485.3 | DXIL |
+| condstore_8192 | default, 90 s policy | 859,735 | 68.794 | 1,806.0 | DXIL | 90.093 | 1,807.8 | timeout |
+| condstore_16384 | default, 90 s policy | 1,734,047 | 90.269 | 2,548.6 | timeout | 90.261 | 2,735.4 | timeout |
+| condstore_16384 | default, 900 s limit | 1,734,047 | 382.221 | 6,917.9 | DXIL | 645.364 | 6,918.6 | DXIL |
+| condstore_4096 | `-opt-disable gvn` | 429,655 | 1.394 | 68.5 | DXIL | 1.411 | 72.2 | DXIL |
+| condstore_16384 | `-opt-disable gvn` | 1,734,047 | 7.138 | 221.3 | DXIL | 6.351 | 228.7 | DXIL |
+
+Wall time and peak working set grow about fourfold per doubling of `condstore_N` from
+2048 upwards: 3.5-4.7x in time and 3.4x in memory. `stores_N` grows linearly. The
+policy timeout is reached at 0.86-1.73 MB of HLSL, against 2.9-3.9 MB for
+`samplebranch_N` above. `condstore_16384` peaks at 6.9 GB. In the `-ftime-report`
+diagnostic run of `condstore_4096`, Global Value Numbering takes 93.1 % of the
+reported pass time on 1.7.2308 (12.84 of 13.80 s, one instance) and 95.3 % on
+1.9.0.5512 (19.47 of 20.44 s, two instances). For `stores_4096` the largest pass is
+instruction combining (34.9 % and 47.0 %), and GVN is not among the top two passes.
+DXC's `-opt-disable gvn` toggle compiles `condstore_16384` in 6.4-7.1 s instead of
+382-645 s and keeps peak memory near 225 MiB. This is a separately labelled
+diagnostic setting. Its DXIL has not been checked on a GPU, and it is not proposed as
+a replay flag.
+
+The merged `samplebranch_N` variants were rerun on the same machine with the same two
+builds, as an independent timing of the table above. The default rows are medians of
+three runs under the 90 s policy. The `-opt-disable gvn` rows are single runs on the
+same generated inputs, with a 300 s limit.
+
+| variant | setting | HLSL bytes | 1.7.2308 wall s | 1.7.2308 peak MiB | 1.9.0.5512 wall s | 1.9.0.5512 peak MiB | outcome |
+|---|---|---:|---:|---:|---:|---:|---|
+| control | default | 685 | 0.021 | 14.0 | 0.023 | 15.1 | DXIL |
+| samplebranch_4096 | default | 968,577 | 7.720 | 154.6 | 10.602 | 170.4 | DXIL |
+| samplebranch_8192 | default | 1,946,457 | 25.481 | 290.2 | 25.283 | 322.3 | DXIL |
+| samplebranch_4096 | `-opt-disable gvn` | 968,577 | 6.650 | 137.6 | 5.181 | 142.4 | DXIL |
+| samplebranch_8192 | `-opt-disable gvn` | 1,946,457 | 13.247 | 257.2 | 7.883 | 266.0 | DXIL |
+| samplebranch_16384 | `-opt-disable gvn` | 3,915,833 | 28.021 | 496.5 | 17.951 | 511.4 | DXIL |
+
+Disabling GVN alone brings `samplebranch_16384`, which timed out above, to 18-28 s.
+That is still slower than `-Od` above, so other passes contribute at this size.
+
+`-print-before gvn` (1.9.0.5512 only; 1.7.2308 rejects the option) on `condstore_4`
+shows the shape GVN receives. Each conditional block re-creates the UAV handle with
+`dx.op.createHandleForLib` and `dx.op.annotateHandle` before its `rawBufferStore`,
+and the join blocks between them hold no memory operation. A plausible mechanism is
+that each handle call starts a non-local memory-dependence query that walks back
+through every earlier join block, with the results cached. That would be quadratic in
+time and memory. This mechanism is a hypothesis about DXC internals. The measured
+facts are the GVN share, the `-opt-disable gvn` collapse and the growth rates.
+
+`ctest --preset dev --no-tests=error -R '^dxc_compile_time_gvn$' -V` runs the
+compile-only check (`tests/dxc_compile_time_check.py`) with the configured DXC. It
+uses no wall-time threshold. It checks that the two families differ only by the
+branches and keep the fixture's declarations and control stores. It pins the recorded
+source sizes and checks that the `-ftime-report` parser also reads the three-column
+table that LLVM prints when no pass records system time. It also checks the DXIL
+outcome of control, `condstore_256` and `stores_256`, with two negative controls: a
+forced 1 ms timeout must be recorded as `timeout` and an invalid profile as
+`diagnostic`. Finally it checks the GVN share of the reported pass wall time. That
+share must be at least 50 % for `condstore_1024`, below 25 % for `stores_1024`, and
+absent with `-opt-disable gvn`. On the machine above, the shares were 76.9 % / 5.3 % /
+0 on 1.7.2308 and 87.3 % / 7.7 % / 0 on 1.9.0.5512. A DXC that no longer shows this
+profile makes the check exit 77 (skip), because the compiler has changed rather than
+this repository.
+
+This narrows the source-built cost to conditional UAV stores under default
+optimization. It does not attribute the archive cohort. The archive trace's
+`loop-rotate` stall and Jump Threading profile are different passes, and the 695
+replay timeouts remain unattributed.
 
 ### Mesh shader -Od pipeline creation across adapters
 
