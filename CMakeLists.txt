@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.21)
 project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
+add_executable(guest_content_root_check tests/guest_content_root_check.cpp)
+target_compile_features(guest_content_root_check PRIVATE cxx_std_17)
+add_test(NAME startup_content_root COMMAND guest_content_root_check "${CMAKE_CURRENT_BINARY_DIR}")
+set_tests_properties(startup_content_root PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(root_probe tools/root_probe.cpp)
 target_compile_features(root_probe PRIVATE cxx_std_17)
 target_link_libraries(root_probe PRIVATE d3d12)
