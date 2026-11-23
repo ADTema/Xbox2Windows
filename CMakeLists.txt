@@ -541,7 +541,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     endfunction()
     function(cpu_translation image translator entry)
         cmake_parse_arguments(BIND "FFX_DESTROY;IMAGE_DATA"
-            "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;IMPORT_ARGUMENTS;RETURN_BYTES;NAME;RANGES;SECOND_PROVIDER;SECOND_SYMBOL;SECOND_LINK_NAME;SECOND_IMPORT_ARGUMENTS;SECOND_RETURN_BYTES" "" ${ARGN})
+            "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;IMPORT_ARGUMENTS;RETURN_BYTES;NAME;RANGES;SECOND_PROVIDER;SECOND_SYMBOL;SECOND_LINK_NAME;SECOND_IMPORT_ARGUMENTS;SECOND_RETURN_BYTES" "STACK_OUTPUT" ${ARGN})
         if(NOT BIND_NAME)
             set(BIND_NAME ${image}_lifted)
         endif()
@@ -562,6 +562,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             endif()
             if(DEFINED BIND_IMPORT_ARGUMENTS)
                 list(APPEND binding --import-arguments "${BIND_IMPORT_ARGUMENTS}" --return-bytes "${BIND_RETURN_BYTES}")
+            endif()
+            if(BIND_STACK_OUTPUT)
+                list(APPEND binding --stack-output ${BIND_STACK_OUTPUT})
             endif()
         endif()
         # A second ordinary import binding, given as its own --bind group after the first.
@@ -1036,6 +1039,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_import_calls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/import_calls_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_guarded_call>" ${icall_files})
+    add_library(cpu_stack_output_provider SHARED tests/cpu/stack_output_provider.cpp)
+    cpu_asm_fixture(cpu_stack_output stack_output)
+    target_link_libraries(cpu_stack_output PRIVATE cpu_stack_output_provider)
+    cpu_translation(cpu_stack_output cpu_switch_aot from_frame NAME cpu_stack_output_status
+        PROVIDER cpu_stack_output_provider SYMBOL write_result IMPORT_ARGUMENTS 2 RETURN_BYTES 4 STACK_OUTPUT 1 8)
+    cpu_translation(cpu_stack_output cpu_switch_aot from_rsp NAME cpu_stack_output_void
+        PROVIDER cpu_stack_output_provider SYMBOL write_constant IMPORT_ARGUMENTS 1 RETURN_BYTES 0 STACK_OUTPUT 1 8)
+    add_test(NAME cpu_aot_stack_output COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/stack_output_check.py" "$<TARGET_FILE:cpu_stack_output>"
+        "$<TARGET_FILE:cpu_stack_output_provider>" "$<TARGET_FILE:cpu_stack_output_status>"
+        "$<TARGET_FILE:cpu_stack_output_void>")
     # Two ordinary imports from two providers in one translation: mix3 from the tail-jump providers and fold4 from
     # slot_provider.cpp. One caller per provider pair: both named, mix3 altered, fold4 altered, and mix3 imported by
     # ordinal #3 (bound with the link name mix3) next to the named fold4. Each is translated once with mix3 bound with
