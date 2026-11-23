@@ -3883,14 +3883,22 @@ The [source-built fixture](../tests/spirv_window/shared_sampler.spvasm) compares
 references 0.25 and 0.75 against depth 0.5 with point-clamp `LESS_EQUAL`, and
 samples an ordinary texel of 0.375. The test first checks that DXC rejects the
 unsplit module. It then splits the module to ordinary binding 5, validates it for
-Vulkan 1.2, cross-compiles it and compiles it as `cs_6_6`. On RX 9070 XT and WARP,
-both readbacks returned 1.0, 0.0 and 0.375 and left all 13 guard words unchanged.
+Vulkan 1.2, cross-compiles for SM 6.0 and compiles it as `cs_6_0`. The original
+`cs_6_6` readbacks on RX 9070 XT and WARP returned 1.0, 0.0 and 0.375 and left
+all 13 guard words unchanged.
 A reference claiming that the second comparison passed produced exactly one
 mismatch, at word 1, on each adapter. Two descriptor controls change one static
 sampler at a time. Switching s2 to `GREATER` exchanged only the two comparison
 results. Clamping the ordinary sampler to `MinLOD` 1 changed only the ordinary
 sample, to 0.625 from the value texture's second mip. The occupied-binding,
 nonzero-LOD, already-separated and passthrough controls run without a GPU.
+
+On Windows 10 build 19045.6456, the GTX 1060 (32.0.15.6094), in-box WARP
+(10.0.19041.5794) and app-local WARP (1.0.22) matched all 16 words in each
+SM 6.0 reference case. The wrong reference, flipped comparison and ordinary
+mip clamp produced the expected differences at word 1, words 0–1 and word 2,
+respectively. All runs reported zero D3D12 warnings and errors. App-local WARP
+returned the same words with the original SM 6.6 build.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^spirv_compare_sampler_' -V
