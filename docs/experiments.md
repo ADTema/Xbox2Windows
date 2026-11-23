@@ -3126,6 +3126,8 @@ Not covered by this experiment: the 36 reserved SSE2 forms, MMX-domain operands 
 
 [The MMX/SSE2 bridge translator](../tools/cpu_mmx_sse2_aot.py) lifts bounded straight-line Windows x64 leaf functions covering `cvtpd2pi`, `cvttpd2pi`, `movdq2q`, `movq2dq` (`SSE2`) and `emms` (`MMX`), alongside `movdqa`, `movdqu`, `movq` (between `mm`, volatile scratch `r64` `rax`/`r9`/`r10`/`r11`, and flat `[rcx|rdx|r8]` memory) and `ret`.
 
+Call with an empty x87 stack, no live MMX values, and default MXCSR controls (round-to-nearest-even, all exceptions masked, DAZ and FTZ off). The leaf ABI compares the output bytes. Floating-point status flags and physical x87 tag transitions are outside this profile. The caller provides valid buffers and a 16-byte-aligned base for each aligned memory operand.
+
 - `XMM0`..`XMM5` are modeled as `Vec128` (`std::uint64_t q[2]`) and `MM0`..`MM7` as `std::uint64_t mm[8]`.
 - `mmx_active` is tracked across the function; any `MM` register touch activates it, `emms` clears it (and invalidates prior `MM` definitions) unconditionally, and `ret` rejects if `mmx_active` remains true.
 - `cvtpd2pi` (round-to-nearest-even) and `cvttpd2pi` (truncate toward zero) lower to portable `<cmath>`/`<cstdint>`/`<cstring>` helpers returning `0x80000000` on NaN, `+/-Inf`, or out-of-`int32_t` range after rounding. `movq2dq` zeroes `xmm[127:64]`.

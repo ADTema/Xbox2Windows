@@ -14,6 +14,10 @@ Supported instructions:
     mm/scratch-r64/[rcx|rdx|r8]), and terminal ret
 
 MMX state policy:
+  - Call with an empty x87 stack, no live MMX values, and default MXCSR
+    controls (round-to-nearest-even, exceptions masked, DAZ and FTZ off).
+    Floating-point status flags and physical x87 tag transitions are outside
+    the ABI. The exported result is the caller's output bytes.
   - mmx_active starts false and becomes true whenever any MM0..MM7 register is
     touched; ret rejects while mmx_active is true.
   - emms clears mmx_active and invalidates active MM register definitions, and
