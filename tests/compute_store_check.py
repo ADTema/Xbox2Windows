@@ -302,6 +302,7 @@ def controls():
         early[slot] = "s_waitcnt vmcnt(0)"
         must_reject(lambda: aot.lower(early, 1, **RUNTIME_BINDING))
     grid_controls()
+    guard_controls()
 
 
 def grid_controls():
@@ -579,6 +580,169 @@ LANE_EXIT = [
     ".Lend:",
     "s_endpgm",
 ]
+# Per-lane guards (#721), unchanged LLVM 15 output (-mtriple=amdgcn--amdpal -mcpu=gfx1013 -O2) of
+# original amdgpu_cs sources with a 32-bit table pointer and the group X ID as SGPR arguments, a
+# group of 32, u0 at table byte 0 and b0 at byte 32:
+#   gid = group.x * 32 + local.x;
+#   if (gid < n) store gid at element gid;        // n = params[0].x
+# The guard stays open to the exit; the u0 descriptor load is sunk under it.
+GUARD_END = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[4:7], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s2, vcc_lo",
+    "s_cbranch_execz .LBB0_2",
+    "s_load_dwordx4 s[0:3], s[0:1], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v0, v0, s[0:3], 0 idxen",
+    ".LBB0_2:",
+    "s_endpgm",
+]
+# The same guard, then a store outside it, so exec is restored before the second store:
+#   if (gid < n) store gid at element gid, word 0;
+#   store 0x600d at element gid, word 1;
+GUARD_JOIN = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[8:11], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[8:11], 0x0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s0, vcc_lo",
+    "s_cbranch_execz .LBB1_2",
+    "buffer_store_dword v0, v0, s[4:7], 0 idxen",
+    ".LBB1_2:",
+    "s_waitcnt_depctr 0xffe3",
+    "s_or_b32 exec_lo, exec_lo, s0",
+    "v_mov_b32_e32 v1, 0x600d",
+    "buffer_store_dword v1, v0, s[4:7], 0 idxen offset:4",
+    "s_endpgm",
+]
+GUARD_BINDING = dict(table_reg=0, descriptor_offset=0, constant_descriptor=32, group_reg=1, stride=4)
+GUARD_CASES = [
+    ("guard_end", GUARD_END, 32, GUARD_BINDING),
+    ("guard_join", GUARD_JOIN, 32, GUARD_BINDING | dict(stride=8)),
+]
+GUARD_IF = "    if (params[0].x > tid.x) {"
+
+
+def variant(lines, *changes):
+    """Apply (old, new) to the one line containing old; a newline in new inserts lines, "" deletes it."""
+    for old, new in changes:
+        assert sum(old in line for line in lines) == 1, old
+        lines = [part for line in lines for part in ((line.replace(old, new).split("\n") if new else [])
+                                                     if old in line else [line])]
+    return lines
+
+
+def guard_controls():
+    """Per-lane guards: exact output, then one rejection per broken control-flow assumption."""
+    def guard(name, *changes):
+        _, lines, width, binding = dict((case[0], case) for case in GUARD_CASES)[name]
+        return aot.lower(variant(lines, *changes), width, **binding).splitlines()
+
+    end, join = guard("guard_end"), guard("guard_join")
+    assert end[-4:] == [GUARD_IF, "        outputData.Store(tid.x * 4u + 0u, tid.x);", "    }", "}"], end
+    assert join[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
+                         "    outputData.Store(tid.x * 8u + 4u, 0x0000600du);", "}"], join
+    # The compare picks the operator and operand order; an immediate bound is a literal.
+    for op, symbol in (("gt", ">"), ("lt", "<"), ("ge", ">="), ("le", "<=")):
+        assert f"    if (params[0].x {symbol} tid.x) {{" in guard("guard_join", ("v_cmp_gt_u32", f"v_cmp_{op}_u32"))
+    assert "    if (0x00000028u > tid.x) {" in guard("guard_join", ("vcc_lo, s3, v0", "vcc_lo, 40, v0"))
+    # Without the restore and the branch, exec stays masked to the exit: both stores are guarded.
+    unrestored = guard("guard_join", ("s_cbranch_execz", ""), (".LBB1_2:", ""), ("s_or_b32", ""))
+    assert unrestored[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);",
+                               "        outputData.Store(tid.x * 8u + 4u, 0x0000600du);", "    }", "}"], unrestored
+    # A load waited for only under the guard is pending again after the restore, unless waited for.
+    late_load = (("s_load_dwordx4 s[4:7], s[0:1], 0x0", ""),
+                 ("vcc_lo, s3, v0", "vcc_lo, s3, v0\ns_load_dwordx4 s[4:7], s[0:1], 0x0"),
+                 ("s_cbranch_execz .LBB1_2", "s_cbranch_execz .LBB1_2\ns_waitcnt lgkmcnt(0)"))
+    assert guard("guard_join", *late_load, ("v1, 0x600d", "v1, 0x600d\ns_waitcnt lgkmcnt(0)")) == join
+    saved_s12 = (("saveexec_b32 s0", "saveexec_b32 s12"), ("exec_lo, exec_lo, s0", "exec_lo, exec_lo, s12"))
+    assert guard("guard_join", *saved_s12) == join
+    # A later compare does not change the guard.
+    assert guard("guard_join", ("v1, 0x600d", "v1, 0x600d\nv_cmp_lt_u32_e32 vcc_lo, s3, v0")) == join
+    # A copy of the saved mask restores it too.
+    assert guard("guard_join", ("s_cbranch_execz .LBB1_2", "s_mov_b32 s12, s0\ns_cbranch_execz .LBB1_2"),
+                 ("exec_lo, exec_lo, s0", "exec_lo, exec_lo, s12")) == join
+    restore, reach, target = ("Unverified lane guard restore", "Lane guard branch does not reach its restore",
+                              "Unverified branch target")
+    compare, repeated = "Unverified lane guard compare", "Unverified or repeated lane guard"
+    # Each control names its diagnostic, so it cannot pass for an unrelated reason.
+    for message, changes in (
+        # The exec mask is not restored before the store outside the guard, a register that
+        # does not hold the saved mask restores it, or a register overwrites it under the guard.
+        (reach, (("s_or_b32", ""),)),
+        (restore, (("exec_lo, exec_lo, s0", "exec_lo, exec_lo, s3"),)),
+        (restore, (("buffer_store_dword v0, v0", "s_mov_b32 s0, 0\nbuffer_store_dword v0, v0"),)),
+        # A copy made only inside the block that the branch skips holds the mask on one path only.
+        (restore, (("buffer_store_dword v0, v0", "s_mov_b32 s12, s0\nbuffer_store_dword v0, v0"),
+                   ("exec_lo, exec_lo, s0", "exec_lo, exec_lo, s12"))),
+        # The branch lands past the restore, inside the guarded block, or nowhere; a label
+        # that no branch names; a second branch to another label.
+        (restore, ((".LBB1_2:", ""), ("s_or_b32 exec_lo, exec_lo, s0", "s_or_b32 exec_lo, exec_lo, s0\n.LBB1_2:"))),
+        (reach, ((".LBB1_2:", ""), ("buffer_store_dword v0, v0", ".LBB1_2:\nbuffer_store_dword v0, v0"))),
+        (restore, ((".LBB1_2:", ""),)),
+        (target, (("s_cbranch_execz .LBB1_2", ""),)),
+        (target, (("s_cbranch_execz .LBB1_2", "s_cbranch_execz .LBB1_2\ns_cbranch_execz .LBB1_3"),)),
+        ("Unsupported compute instruction: s_cbranch_execnz", (("s_cbranch_execz", "s_cbranch_execnz"),)),
+        # No compare, a compare of a pending, unknown or non-word operand, or a mask from another source.
+        (repeated, (("v_cmp_gt_u32_e32 vcc_lo, s3, v0", ""),)),
+        (compare, (("vcc_lo, s3, v0", "vcc_lo, s12, v0"),)),
+        (compare, (("v_cmp_gt_u32_e32 vcc_lo, s3, v0", "s_buffer_load_dword s12, s[8:11], 0x4\n"
+                                                       "v_cmp_gt_u32_e32 vcc_lo, s12, v0"),)),
+        (compare, (("vcc_lo, s3, v0", "vcc_lo, s3, v1"),)),
+        (compare, (("vcc_lo, s3, v0", "vcc_lo, s2, v0"),)),
+        (compare, (("vcc_lo, s3, v0", "vcc_lo, s0, v0"),)),
+        ("Unsupported compute instruction: s_and_saveexec_b32 s0, s3",
+         (("s_and_saveexec_b32 s0, vcc_lo", "s_and_saveexec_b32 s0, s3"),)),
+        ("Unsupported compute instruction: s_and_saveexec_b64",
+         (("s_and_saveexec_b32 s0, vcc_lo", "s_and_saveexec_b64 s[0:1], vcc"),)),
+        # A second or nested guard.
+        (repeated, (("buffer_store_dword v0, v0", "v_cmp_gt_u32_e32 vcc_lo, s3, v0\n"
+                                                  "s_and_saveexec_b32 s12, vcc_lo\nbuffer_store_dword v0, v0"),)),
+        (repeated, (("v_mov_b32_e32 v1, 0x600d", "v_cmp_gt_u32_e32 vcc_lo, s3, v0\n"
+                                                 "s_and_saveexec_b32 s12, vcc_lo\nv_mov_b32_e32 v1, 0x600d"),)),
+        # A guard around no store.
+        ("Expected a store under the lane guard", (("buffer_store_dword v0, v0, s[4:7], 0 idxen", ""),)),
+        # A load waited for only under the guard, then used after the restore.
+        ("Unverified raw UAV store", late_load),
+        # A vector or scalar register written under the guard, read after the restore.
+        ("Store data is not a known word",
+         (("v_mov_b32_e32 v1, 0x600d", ""), ("buffer_store_dword v0, v0", "v_mov_b32_e32 v1, 0x600d\n"
+                                                                          "buffer_store_dword v0, v0"))),
+        ("Unverified raw UAV store",
+         (("s_load_dwordx4 s[4:7], s[0:1], 0x0", ""), *saved_s12,
+          ("buffer_store_dword v0, v0", "s_load_dwordx4 s[4:7], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
+                                        "buffer_store_dword v0, v0"))),
+        # The saved mask stored as data.
+        ("Unresolved scalar move source", (("v_mov_b32_e32 v1, 0x600d", "v_mov_b32_e32 v1, s0"),)),
+    ):
+        rejects(message, guard, "guard_join", *changes)
+    # A restore with no guard.
+    rejects(restore, aot.lower, WIDE[:-1] + ["s_or_b32 exec_lo, exec_lo, s4", "s_endpgm"], 256, **WIDE_BINDING)
+    # The open guard of guard_end: its branch must reach a label, and only no-ops may follow the
+    # label before the exit.
+    rejects(target, guard, "guard_end", (".LBB0_2:", ""))
+    rejects(reach, guard, "guard_end", (".LBB0_2:", ""),
+            ("s[0:3], 0 idxen", "s[0:3], 0 idxen\n.LBB0_2:\ns_nop 0\nv_mov_b32_e32 v1, 0"))
+    # Branch labels come from decoded offsets: forward, at an instruction start, inside the span.
+    decoded = [(0, "v_cmp_gt_u32_e32 vcc_lo, s3, v0"), (4, "s_and_saveexec_b32 s0, vcc_lo"),
+               (8, "s_cbranch_execz 2"), (12, "buffer_store_dword v0, v0, s[4:7], 0 idxen"),
+               (20, "s_or_b32 exec_lo, exec_lo, s0"), (24, "s_endpgm")]
+    assert aot.labelled(decoded) == [line for _, line in decoded[:2]] + [
+        "s_cbranch_execz .L20", decoded[3][1], ".L20:", *(line for _, line in decoded[4:])]
+    for distance in ("1", "5", "65535", "-1"):
+        rejects("Branch outside decoded instruction boundaries",
+                aot.labelled, decoded[:2] + [(8, f"s_cbranch_execz {distance}")] + decoded[3:])
 
 
 def assemble(directory, assembler, objcopy, lines):
@@ -677,32 +841,59 @@ def two_exits(directory, assembler, objcopy, library):
         rejects("Branch outside decoded instruction boundaries", extract, retarget(literal, target))
 
 
+def store_container(code, dims):
+    padded = code + bytes.fromhex("00009fbf") * (4 - (len(code) // 4 + 10) % 4)
+    payload = envelope(padded, directory_end=(40 + len(padded), 288 + len(padded)), compute_width=dims[0])
+    blob = bytearray(_read_named_container(payload, 1 + len(b"fixture") + 1))
+    # The shared envelope writes X only; set Y and Z in the PSV0 runtime info.
+    struct.pack_into("<2I", blob, blob.index(b"PSV0") + 8 + 44, *dims[1:])
+    return bytes(blob)
+
+
 def binary(directory, assembler, objcopy, library):
     two_exits(directory, assembler, objcopy, library)
-    for _, lines, width, binding in CASES:
+    for name, lines, width, binding in CASES + GUARD_CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
         subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
         subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
         code = raw.read_bytes()
-        padded = code + bytes.fromhex("00009fbf") * (4 - (len(code) // 4 + 10) % 4)
         dims = aot.checked_group(width)
-        payload = envelope(padded, directory_end=(40 + len(padded), 288 + len(padded)), compute_width=dims[0])
-        blob = bytearray(_read_named_container(payload, 1 + len(b"fixture") + 1))
-        # The shared envelope writes X only; set Y and Z in the PSV0 runtime info.
-        struct.pack_into("<2I", blob, blob.index(b"PSV0") + 8 + 44, *dims[1:])
-        blob = bytes(blob)
+        blob = store_container(code, dims)
         sections = parts(blob)
         assert aot.group_size(sections[b"PSV0"]) == dims
         assert aot.container_code(sections[b"DXIL"], stage=5) == code
         must_reject(lambda: aot.container_code(sections[b"DXIL"], stage=0))
-        assert aot.lower(disassemble(code, library), width, **binding) == aot.lower(lines, width, **binding)
+        decoded = aot.labelled(disassemble(code, library, offsets=True))
+        assert aot.lower(decoded, width, **binding) == aot.lower(lines, width, **binding)
         container, output = directory / "input.dxbc", directory / "cli.hlsl"
         container.write_bytes(blob)
         options = [item for key, value in binding.items() for item in ("--" + key.replace("_", "-"), str(value))]
-        subprocess.run([sys.executable, "-B", str(Path(aot.__file__)), container, "--output", output,
-                        "--llvm", library, *options], check=True)
+        cli = [sys.executable, "-B", str(Path(aot.__file__)), container, "--output", output,
+               "--llvm", library, *options]
+        subprocess.run(cli, check=True)
         assert output.read_text() == aot.lower(lines, width, **binding)
+        if name in {case[0] for case in GUARD_CASES}:
+            # The decoded branch lands where the guarded store ends. Retarget it to the store (inside
+            # the guarded block), into the store's second word, and past the restore or the exit.
+            offsets = dict((line, pc) for pc, line in disassemble(code, library, offsets=True))
+            pc, store = offsets[next(line for line in offsets if line.startswith("s_cbranch"))], max(
+                pc for line, pc in offsets.items() if line.startswith("buffer_store") and "v0, v0" in line)
+            after = offsets.get("v_mov_b32_e32 v1, 0x600d", len(code))
+            if name == "guard_join":
+                # Landing on the restore itself, past the hazard wait, is the same program.
+                accepted = code[:pc] + struct.pack("<h", (offsets["s_or_b32 exec_lo, exec_lo, s0"] - pc - 4) // 4)
+                container.write_bytes(store_container(accepted + code[pc + 2:], dims))
+                subprocess.run(cli, check=True)
+                assert output.read_text() == aot.lower(lines, width, **binding)
+            for target, message in ((store, "Lane guard branch does not reach its restore"),
+                                    (store + 4, "Branch outside decoded instruction boundaries"),
+                                    (after, "Unverified lane guard restore" if name == "guard_join"
+                                     else "Branch outside decoded instruction boundaries")):
+                wrong = code[:pc] + struct.pack("<h", (target - pc - 4) // 4) + code[pc + 2:]
+                container.write_bytes(store_container(wrong, dims))
+                bad = subprocess.run(cli, capture_output=True, text=True)
+                assert bad.returncode == 1 and message in bad.stderr, (name, target, bad.stderr)
 
 
 def draw_runtime(cmd, case):
@@ -789,12 +980,86 @@ def draw_grid(directory, compiler, cmd, case, name):
     return 0
 
 
+def guard_words(name, groups, bound):
+    """Independent expected readback: lanes at or past the bound leave guarded words untouched."""
+    words = [SENTINEL] * 320
+    for gid in range(32 * groups):
+        if name == "guard_end" and gid < bound:
+            words[gid] = gid
+        elif name == "guard_join":
+            if gid < bound:
+                words[2 * gid] = gid
+            words[2 * gid + 1] = 0x600d
+    return words
+
+
+# (groups, bound): no lane, one group split, exactly one group; one lane, the third group split,
+# exactly the dispatch, past the dispatch. Mutations run on the largest dispatch with a split group.
+GUARD_RUNS = ((1, 0), (1, 17), (1, 32), (3, 1), (3, 70), (3, 96), (3, 200))
+GUARD_MUTATION_RUN = (3, 70)
+
+
+def guard_mutations(source, name):
+    """Translations that a guard mistake would produce; each must fail on the GPU."""
+    lines = source.splitlines()
+    at = lines.index(GUARD_IF)
+    close = lines.index("    }", at)
+    yield "guard inverted", source.replace(GUARD_IF, "    if (!(params[0].x > tid.x)) {")
+    yield "bound off by one", source.replace(GUARD_IF, "    if (params[0].x >= tid.x) {")
+    yield "guard ignored", "\n".join(lines[:at] + [line[4:] for line in lines[at + 1:close]] + lines[close + 1:]) + "\n"
+    if name == "guard_join":
+        # The exec restore ignored: the store after it stays under the guard.
+        moved = lines[:close] + ["    " + lines[close + 1], "    }"] + lines[close + 2:]
+        yield "restore ignored", "\n".join(moved) + "\n"
+
+
+def draw_guard(directory, compiler, cmd, case, name):
+    # params[0].x is the bound; the other words differ so that reading another word fails.
+    constants = [0x5eed0000 + i for i in range(16)]
+
+    def write(groups, bound, words=None):
+        case.write_bytes(struct.pack("<337I", groups, *(words or guard_words(name, groups, bound)), bound,
+                                     *constants[1:]))
+
+    for groups, bound in GUARD_RUNS:
+        write(groups, bound)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    groups, bound = GUARD_MUTATION_RUN
+    # Reference controls: the words of the first lane past the bound, and of the last lane under it.
+    for gid, wrong in ((bound, bound + 1), (bound - 1, bound - 1)):
+        reference = guard_words(name, groups, wrong)
+        write(groups, bound, reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        word = gid * (1 if name == "guard_end" else 2)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: a reference with bound {wrong} escaped detection\n{bad.stderr}")
+    write(groups, bound)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, mutated in guard_mutations(source, name):
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection with groups={groups} bound={bound}")
+    return 0
+
+
 def draw(directory, compiler, renderer, backend):
-    for name, lines, width, binding in CASES:
+    for name, lines, width, binding in CASES + GUARD_CASES:
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
+        if name.startswith("guard_"):
+            result = draw_guard(directory, compiler, cmd, case, name)
+            if result:
+                return result
+            continue
         if name == "runtime" or name in GRID_DISPATCHES:
             result = draw_runtime(cmd, case) if name == "runtime" else draw_grid(directory, compiler, cmd, case, name)
             if result:
