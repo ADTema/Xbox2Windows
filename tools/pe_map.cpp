@@ -661,8 +661,8 @@ std::vector<Mapped*>& mapped_images() {
 // in slot 0 of each thread that runs its code. Only participating threads get it, and every thread swaps
 // its own slot 0, never another thread's:
 // - the thread that calls pe_map_run_main, until pe_map_release on that thread;
-// - threads the image starts (Windows start address inside the image), from their DLL_THREAD_ATTACH,
-//   before any image is notified, to their DLL_THREAD_DETACH, after every image was notified;
+// - threads enrolled through pe_map_main_create_thread, from their DLL_THREAD_ATTACH, before any image
+//   is notified, to their DLL_THREAD_DETACH, after every image was notified;
 // - host threads between their own pe_map_main_thread_enter and pe_map_main_thread_leave.
 // A participant keeps its previous slot 0 in a pe_map TLS slot reserved at the start (TlsAlloc below
 // TLS_MINIMUM_AVAILABLE, so setting it never allocates) and gets it back on leave, detach or release.
@@ -680,16 +680,37 @@ std::vector<Mapped*>& mapped_images() {
 // main image's TLS callbacks receive DLL_THREAD_ATTACH and DLL_THREAD_DETACH only on participating
 // threads (a /GA callback on another thread would read the host's block). Other images, and EXEs
 // started with pe_map_run, are notified as before.
-// A new thread whose start address cannot be read, or an image thread whose block cannot be installed,
-// cannot be run safely either way: as a guest thread it would reach guest code with the host's block,
-// and treated as one, host code would read the image's block. pe_map then ends the process with
-// __fastfail before the thread runs, rather than let it proceed with the wrong block. On a participating thread the host's own index-0 code reads the
-// image's block, so a host that owns slot 0 must not touch its thread-locals there.
+// Guest threads are enrolled explicitly; no thread is classified by inspecting it. The host binds the main
+// image's CreateThread imports to pe_map_main_create_thread, which reserves an entry in a fixed enrollment
+// table, creates the thread suspended at a pe_map start routine and records its thread ID before the thread
+// can run. Only a thread found in that table installs the image's block at its DLL_THREAD_ATTACH; every
+// other thread, whatever its start address, is left alone and never ends the process. Enrollment fails
+// without guest code running: when no entry can be reserved or the thread cannot be watched,
+// pe_map_main_create_thread returns null with the last error set and no thread exists; when the block
+// cannot be installed on the new thread, the pe_map start routine returns ENROLL_FAILED_EXIT without
+// calling the guest's start routine, and the main image's callbacks were not notified because the thread
+// does not participate. Both are counted in pe_map_main_tls_stats. An enrolled thread that has not yet
+// passed its start routine counts as one that may run the image's code, so release refuses while it lives.
+// Not enrolled, and so running with the host's slot 0: threads the image creates by any other route (a
+// CreateThread address it looked up itself, CreateRemoteThread(Ex), NtCreateThreadEx, thread-pool work, a
+// CRT's _beginthreadex in another DLL), and host threads that call the image without entering.
+// On a participating thread the host's own index-0 code reads the image's block, so a host that owns
+// slot 0 must not touch its thread-locals there.
 // Rule and measurements: MoonYueya on #870.
 constexpr std::size_t TEB_TLS_POINTER = 0x58;  // TEB.ThreadLocalStoragePointer on x64
 constexpr int MAIN_TRACKED = 64;
 constexpr ULONG_PTR UNTRACKED = 0x10000;   // participation value of an installed thread without a handle
-constexpr ULONG THREAD_START_ADDRESS = 9;  // ThreadQuerySetWin32StartAddress
+constexpr int MAIN_ENROLLING = 64;
+constexpr DWORD ENROLL_FAILED_EXIT = 0xE0000201u;  // exit code of an enrolled thread whose block could not be installed
+
+// A thread enrolled by pe_map_main_create_thread, until its pe_map start routine has passed it on.
+struct Enrollment {
+    enum State { FREE, RESERVED, READY, INSTALLED, FAILED } state = FREE;
+    DWORD thread = 0;         // its thread ID, recorded before it can run
+    HANDLE handle = nullptr;  // SYNCHRONIZE, to tell an enrolled thread that ended before its start routine
+    LPTHREAD_START_ROUTINE start = nullptr;
+    void* parameter = nullptr;
+};
 
 struct MainImage {
     std::uint8_t* base = nullptr;  // the image started as the main image, or null
@@ -699,6 +720,10 @@ struct MainImage {
     std::int64_t untracked = 0;  // installed participants without a handle
     std::int64_t installed = 0, restored = 0, exited = 0, refusals = 0;
     std::int64_t last_release = -1;  // -1 none yet, 1 accepted, 2 refused (participants may still run the image)
+    Enrollment enrolling[MAIN_ENROLLING];
+    std::int64_t enroll_refused = 0;  // pe_map_main_create_thread returned null: no thread was created
+    std::int64_t enroll_failed = 0;   // an enrolled thread ended without the guest's start routine
+    int inject = 0;                   // pe_map_main_tls_inject: the next enrollment (1) or installation (2) fails
 };
 
 // Guards main_image(). Taken without mapped_lock held, and mapped_lock is never taken under it.
@@ -718,6 +743,10 @@ MainImage& main_image() {
 
 // The main image's base while it is started, read without slot_lock by the notification path.
 std::uint8_t* volatile g_main_base = nullptr;
+
+// Entries in main_image().enrolling that are not FREE, read without slot_lock by DLL_THREAD_ATTACH. An entry
+// becomes READY before its thread is resumed, so the thread itself always sees a nonzero count.
+volatile LONG g_enrolling = 0;
 
 // pe_map's own TLS slots: the calling thread's participation (0 none, 1..MAIN_TRACKED its table entry,
 // UNTRACKED) and its saved slot 0. Allocated once under slot_lock and never freed.
@@ -743,7 +772,22 @@ void** current_slots() {
 std::int64_t pending(const MainImage& main) {
     std::int64_t count = main.untracked;
     for (HANDLE handle : main.tracked) count += handle != nullptr;
+    for (const auto& entry : main.enrolling) count += entry.state != Enrollment::FREE;
     return count;
+}
+
+// Takes a one-shot injected fault (pe_map_main_tls_inject). Caller holds slot_lock.
+bool take_fault(MainImage& main, int fault) {
+    if (main.inject != fault) return false;
+    main.inject = 0;
+    return true;
+}
+
+// Caller holds slot_lock.
+void free_entry(Enrollment& entry) {
+    if (entry.handle) CloseHandle(entry.handle);
+    entry = {};
+    InterlockedDecrement(&g_enrolling);
 }
 
 // Installs the image's block in the calling thread's slot 0. Caller holds slot_lock, main.base is set.
@@ -798,21 +842,40 @@ bool participates() {
     return g_participation != TLS_OUT_OF_INDEXES && TlsGetValue(g_participation) != nullptr;
 }
 
-// DLL_THREAD_ATTACH: a thread the image started participates. A thread that cannot be classified, or an
-// image thread whose block cannot be installed, ends the process (see "Main-image TLS slot 0").
-void install_current_thread() {
+// DLL_THREAD_ATTACH: a thread enrolled by pe_map_main_create_thread participates. Any other thread returns
+// at once and is never touched. A failed installation only marks the entry; the thread's pe_map start
+// routine then ends it without running guest code.
+void install_enrolled_thread() {
+    if (!InterlockedCompareExchange(&g_enrolling, 0, 0)) return;
     const SlotLock hold;
     auto& main = main_image();
-    if (!main.base) return;
-    using Query = LONG(NTAPI*)(HANDLE, ULONG, void*, ULONG, ULONG*);
-    static const auto query =
-        reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
-    void* start = nullptr;
-    if (!query || query(GetCurrentThread(), THREAD_START_ADDRESS, &start, sizeof(start), nullptr) < 0)
-        __fastfail(FAST_FAIL_FATAL_APP_EXIT);
-    const auto* address = static_cast<std::uint8_t*>(start);
-    if (address < main.base || address >= main.base + main.size) return;
-    if (!install_current(main)) __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+    const DWORD self = GetCurrentThreadId();
+    for (auto& entry : main.enrolling) {
+        if (entry.state != Enrollment::READY || entry.thread != self) continue;
+        const bool installed = main.base && !take_fault(main, 2) && install_current(main);
+        entry.state = installed ? Enrollment::INSTALLED : Enrollment::FAILED;
+        return;
+    }
+}
+
+// The start routine of every enrolled thread: runs the guest's start routine only on a thread whose slot 0
+// was installed at its attach.
+DWORD WINAPI enrolled_thread_start(void* parameter) {
+    LPTHREAD_START_ROUTINE start = nullptr;
+    void* guest_parameter = nullptr;
+    {
+        const SlotLock hold;
+        auto& main = main_image();
+        auto& entry = main.enrolling[reinterpret_cast<ULONG_PTR>(parameter)];
+        if (entry.state == Enrollment::INSTALLED) {
+            start = entry.start;
+            guest_parameter = entry.parameter;
+        } else {
+            ++main.enroll_failed;  // FAILED, or a thread whose attach pe_map never saw
+        }
+        free_entry(entry);
+    }
+    return start ? start(guest_parameter) : ENROLL_FAILED_EXIT;
 }
 
 // DLL_THREAD_DETACH, after every image was notified.
@@ -839,6 +902,12 @@ bool end_main(std::uint8_t* base) {
         if (main.tracked[i] && static_cast<ULONG_PTR>(i) + 1 != self)
             live = WaitForSingleObject(main.tracked[i], 0) != WAIT_OBJECT_0;
     }
+    // An enrolled thread that has not passed its start routine may still call into the image.
+    for (int i = 0; i < MAIN_ENROLLING && !live; ++i) {
+        const auto& entry = main.enrolling[i];
+        if (entry.state != Enrollment::FREE)
+            live = !entry.handle || WaitForSingleObject(entry.handle, 0) != WAIT_OBJECT_0;
+    }
     if (live) {
         ++main.refusals;
         main.last_release = 2;
@@ -851,6 +920,8 @@ bool end_main(std::uint8_t* base) {
         CloseHandle(handle);
         handle = nullptr;
     }
+    for (auto& entry : main.enrolling)
+        if (entry.state != Enrollment::FREE) free_entry(entry);  // ended before its start routine
     main.base = nullptr;
     g_main_base = nullptr;
     main.last_release = 1;
@@ -935,12 +1006,12 @@ void notify_thread(DWORD reason) {
 }
 }  // namespace
 
-// A thread the main image started gets the image's block in slot 0 before any image is notified of
+// A thread enrolled for the main image gets the image's block in slot 0 before any image is notified of
 // its attach, and every participant gets its saved slot 0 back after every image was notified of its
 // detach (see "Main-image TLS slot 0").
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason == DLL_THREAD_ATTACH) {
-        install_current_thread();
+        install_enrolled_thread();
         notify_thread(reason);
     } else if (reason == DLL_THREAD_DETACH) {
         notify_thread(reason);
@@ -1533,8 +1604,8 @@ extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exi
 
 // pe_map_run for the image the host treats as its main executable (see "Main-image TLS slot 0"): the
 // image's TLS block goes into the calling thread's slot 0 before the process-attach callbacks, into the
-// slot 0 of each thread the image starts, and into that of host threads that call
-// pe_map_main_thread_enter. Same preconditions and results as pe_map_run, and in addition returns 0
+// slot 0 of each thread enrolled through pe_map_main_create_thread (the host binds the image's
+// CreateThread imports to it), and into that of host threads that call pe_map_main_thread_enter. Same preconditions and results as pe_map_run, and in addition returns 0
 // without running anything when another image is started as the main image, when a participant of an
 // earlier one is still pending, or when pe_map's own TLS slots cannot be reserved. An image without a TLS
 // template has no block to install and simply starts.
@@ -1585,10 +1656,87 @@ extern "C" __declspec(dllexport) int pe_map_main_thread_leave() {
     return restore_current(main_image()) ? 1 : 0;
 }
 
+// CreateThread for the main image: the host binds the image's CreateThread imports here. Same parameters,
+// results and last error as CreateThread. While an image is started as the main image the new thread is
+// enrolled: it is created suspended at a pe_map start routine, its thread ID is recorded before it can run,
+// it gets the image's block in slot 0 at its DLL_THREAD_ATTACH, and only then is the guest's start routine
+// called; it is resumed here unless flags has CREATE_SUSPENDED. Returns null with ERROR_NOT_ENOUGH_MEMORY and
+// creates no thread when the enrollment table is full or the thread cannot be watched. When the block
+// cannot be installed, the thread ends with ENROLL_FAILED_EXIT (0xE0000201) without running the guest's start
+// routine. Both failures are counted in pe_map_main_tls_stats. With no main image it is CreateThread.
+extern "C" __declspec(dllexport) HANDLE WINAPI pe_map_main_create_thread(LPSECURITY_ATTRIBUTES attributes,
+                                                                          SIZE_T stack, LPTHREAD_START_ROUTINE start,
+                                                                          LPVOID parameter, DWORD flags,
+                                                                          LPDWORD thread_id) {
+    int slot = -1;
+    {
+        const SlotLock hold;
+        auto& main = main_image();
+        if (main.base) {
+            if (!take_fault(main, 1)) {
+                for (int i = 0; i < MAIN_ENROLLING && slot < 0; ++i)
+                    if (main.enrolling[i].state == Enrollment::FREE) slot = i;
+            }
+            if (slot < 0) {
+                ++main.enroll_refused;
+                SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                return nullptr;
+            }
+            auto& entry = main.enrolling[slot];
+            entry.state = Enrollment::RESERVED;
+            entry.start = start;
+            entry.parameter = parameter;
+            InterlockedIncrement(&g_enrolling);
+        }
+    }
+    if (slot < 0) return CreateThread(attributes, stack, start, parameter, flags, thread_id);
+    DWORD id = 0;
+    HANDLE thread = CreateThread(attributes, stack, enrolled_thread_start,
+                                 reinterpret_cast<void*>(static_cast<ULONG_PTR>(slot)), flags | CREATE_SUSPENDED, &id);
+    DWORD error = thread ? ERROR_SUCCESS : GetLastError();
+    HANDLE watch = nullptr;
+    if (thread && !DuplicateHandle(GetCurrentProcess(), thread, GetCurrentProcess(), &watch, SYNCHRONIZE, FALSE, 0)) {
+        // Never resumed, so it has run nothing; without a handle release could not tell when it ends.
+        error = ERROR_NOT_ENOUGH_MEMORY;
+        TerminateThread(thread, ENROLL_FAILED_EXIT);
+        CloseHandle(thread);
+        thread = nullptr;
+    }
+    {
+        const SlotLock hold;
+        auto& main = main_image();
+        auto& entry = main.enrolling[slot];
+        if (!thread) {
+            free_entry(entry);
+            ++main.enroll_refused;
+        } else {
+            entry.thread = id;
+            entry.handle = watch;
+            entry.state = Enrollment::READY;
+        }
+    }
+    if (!thread) {
+        SetLastError(error);
+        return nullptr;
+    }
+    if (!(flags & CREATE_SUSPENDED)) ResumeThread(thread);
+    if (thread_id) *thread_id = id;
+    return thread;
+}
+
+// Test-only fault injection for the main-image enrollment: 1 makes the next pe_map_main_create_thread fail
+// to enroll, 2 makes the next installation on an enrolled thread fail, 0 clears. One shot.
+extern "C" __declspec(dllexport) void pe_map_main_tls_inject(int fault) {
+    const SlotLock hold;
+    main_image().inject = fault;
+}
+
 // Main-image slot 0 counters since the process started, for tests: out[0] installs, out[1] restores,
-// out[2] participants confirmed exited at a release, out[3] refused releases, out[4] participants still
-// pending, out[5] 1 while an image is started as the main image, out[6] the last release (-1 none, 1
-// accepted, 2 refused), out[7] installed participants without a handle.
+// out[2] participants confirmed exited at a release, out[3] refused releases, out[4] participants and
+// enrolled threads still pending, out[5] 1 while an image is started as the main image, out[6] the last
+// release (-1 none, 1 accepted, 2 refused), out[7] installed participants without a handle, out[8]
+// enrollments refused (no thread created), out[9] enrolled threads ended without the guest's start routine.
+// out must hold 10 entries.
 extern "C" __declspec(dllexport) void pe_map_main_tls_stats(std::int64_t* out) {
     if (!out) return;
     const SlotLock hold;
@@ -1601,4 +1749,6 @@ extern "C" __declspec(dllexport) void pe_map_main_tls_stats(std::int64_t* out) {
     out[5] = main.base != nullptr;
     out[6] = main.last_release;
     out[7] = main.untracked;
+    out[8] = main.enroll_refused;
+    out[9] = main.enroll_failed;
 }

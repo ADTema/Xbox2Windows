@@ -20,7 +20,7 @@ thread's attach and detach still reach the guest, as before. A refused release r
 API reporting the refusal; the accepted release is the only one that returns 1.
 - main: pe_map_run_main; the guest log equals the Windows log; a host thread enters and leaves; release
   is accepted once.
-- alive: a host participant is still entered at the first release, which returns 2 and changes nothing;
+- alive: a host participant is still entered at the first release, which returns 0 and changes nothing;
   after it leaves, the second release is accepted.
 - exited: a host participant is ended with TerminateThread. Release confirms the exit from its thread
   handle and is accepted.
@@ -32,7 +32,18 @@ API reporting the refusal; the accepted release is the only one that returns 1.
   then resumes, finds its own block and values, returns, and the second release is accepted.
 - plain (negative control): pe_map_run leaves the host's block in slot 0, so every slot-0 check fails.
 Every accepted release must leave the image freed, its unwind data gone and its carrier unloaded, and a
-further release must return 0.
+further release must return 0. Under pe_map_run_main the host binds the guest's CreateThread import to
+pe_map_main_create_thread, so the guest's workers are enrolled explicitly.
+
+enroll: guest-thread enrollment failures, each in its own child host process with
+cpu_exe_tls_slot0_enroll, whose probe worker p touches a global sentinel first in its start routine.
+- probe (control): p is enrolled, touches the sentinel and passes every check.
+- enroll_refused: p's enrollment is made to fail. The guest's CreateThread returns null with
+  ERROR_NOT_ENOUGH_MEMORY, no thread exists, the sentinel stays 0 and the refusal is counted.
+- install_failed: the installation on p is made to fail. p ends with 0xE0000201 before its start routine,
+  the sentinel stays 0, the guest gets no callback for p and the failure is counted.
+In both failure cases the guest's later workers are enrolled as usual, the host survives and prints its
+report, and every other check (reader, late thread, release, cleanup) holds.
 """
 
 import argparse
@@ -48,23 +59,38 @@ EXPECTED = "m1=yy m:yyyy a2=yy a:yyyy a3=y- b2=yy b:yyyy b3=y- X=0"
 PLAIN = "m1=n- m:n--- a2=n- a:n--- a3=n- b2=n- b:n--- b3=n- X=8"
 MAIN_TRACKED = 64
 PAUSED = EXPECTED.replace(" X=0", " c2=yy c:yyyy X=0")
-# stats: installed, restored, exited, refused releases, pending, active, last release (1 accepted), untracked.
+PROBED = EXPECTED.replace(" a2=", " p2=yy p:yyyy p3=y- a2=")
+ERROR_NOT_ENOUGH_MEMORY = 8
+ENROLL_FAILED_EXIT = 0xE0000201
+# stats: installed, restored, exited, refused releases, pending, active, last release (1 accepted), untracked,
+# enrollments refused (no thread created), enrolled threads ended without the guest's start routine.
 # Participants: the starting thread, the guest's workers (a, b and, paused, c) and the host's participants.
 # late: the guest's thread callbacks during the late thread's life; callbacks: the guest's thread-attach and
 # thread-detach totals before the accepted release (its own workers only, plus the late thread under plain).
 SCENARIOS = {
-    "main": {"stats": [4, 4, 0, 0, 0, 0, 1, 0], "refused": None, "participant": True, "resumed": None,
+    "main": {"stats": [4, 4, 0, 0, 0, 0, 1, 0, 0, 0], "refused": None, "participant": True, "resumed": None,
              "late": 0, "callbacks": "2,2"},
-    "alive": {"stats": [4, 4, 0, 1, 0, 0, 1, 0], "refused": True, "participant": True, "resumed": None,
+    "alive": {"stats": [4, 4, 0, 1, 0, 0, 1, 0, 0, 0], "refused": True, "participant": True, "resumed": None,
               "late": 0, "callbacks": "2,2"},
-    "exited": {"stats": [4, 3, 1, 0, 0, 0, 1, 0], "refused": None, "participant": True, "resumed": None,
+    "exited": {"stats": [4, 3, 1, 0, 0, 0, 1, 0, 0, 0], "refused": None, "participant": True, "resumed": None,
                "late": 0, "callbacks": "2,2"},
-    "untracked": {"stats": [3 + MAIN_TRACKED, 3 + MAIN_TRACKED, 0, 1, 0, 0, 1, 0], "refused": True,
+    "untracked": {"stats": [3 + MAIN_TRACKED, 3 + MAIN_TRACKED, 0, 1, 0, 0, 1, 0, 0, 0], "refused": True,
                   "participant": True, "resumed": None, "late": 0, "callbacks": "2,2"},
-    "paused": {"stats": [5, 5, 0, 1, 0, 0, 1, 0], "refused": True, "participant": True, "resumed": True,
+    "paused": {"stats": [5, 5, 0, 1, 0, 0, 1, 0, 0, 0], "refused": True, "participant": True, "resumed": True,
                "late": 0, "callbacks": "3,3"},
-    "plain": {"stats": [0, 0, 0, 0, 0, 0, -1, 0], "refused": None, "participant": None, "resumed": None,
+    "plain": {"stats": [0, 0, 0, 0, 0, 0, -1, 0, 0, 0], "refused": None, "participant": None, "resumed": None,
               "late": 2, "callbacks": "3,3"},
+}
+# probe: sentinel, CreateThread returned a handle, its last error, p's exit code.
+ENROLL = {
+    "probe": {"stats": [5, 5, 0, 0, 0, 0, 1, 0, 0, 0], "refused": None, "participant": True, "resumed": None,
+              "late": 0, "callbacks": "3,3", "log": PROBED, "probe": [1, 1, 0, 0]},
+    "enroll_refused": {"stats": [4, 4, 0, 0, 0, 0, 1, 0, 1, 0], "refused": None, "participant": True,
+                       "resumed": None, "late": 0, "callbacks": "2,2", "log": EXPECTED,
+                       "probe": [0, 0, ERROR_NOT_ENOUGH_MEMORY, 0]},
+    "install_failed": {"stats": [4, 4, 0, 0, 0, 0, 1, 0, 0, 1], "refused": None, "participant": True,
+                       "resumed": None, "late": 0, "callbacks": "2,2", "log": EXPECTED,
+                       "probe": [0, 1, 0, ENROLL_FAILED_EXIT]},
 }
 
 
@@ -97,56 +123,78 @@ def windows(exe):
           "template intact, whole-array writes read back, heap valid")
 
 
+def check(mapper, image, host, scenario, want):
+    result = run([str(host), str(mapper), str(image), scenario])
+    print(f"{scenario}: LOG:{result['log']}")
+    print(f"{scenario}: {result['host']}")
+    # A host that died (for example on a guest-thread failure) prints no report and exits nonzero.
+    if "fields" not in result or result["exit"] or result["stderr"]:
+        raise AssertionError(f"{scenario}: host failed: {result}")
+    fields = result["fields"]
+    problems = []
+    log = want["log"]
+    if result["log"] != log:
+        problems.append(f"guest log {result['log']!r}, expected {log!r}")
+    if fields["started"] != "1" or int(fields["exit"], 16) != (8 if scenario == "plain" else 0):
+        problems.append(f"started {fields['started']}, guest exit {fields['exit']}")
+    if flag(fields, "installed_main") != (scenario != "plain"):
+        problems.append(f"installed_main {fields['installed_main']}")
+    if not flag(fields, "reader_untouched"):
+        problems.append("the non-participating reader saw its slot 0 or sentinel change")
+    if flag(fields, "participant") != want["participant"]:
+        problems.append(f"participant {fields['participant']}")
+    if not flag(fields, "host_tls") or not flag(fields, "heap_valid"):
+        problems.append(f"host_tls {fields['host_tls']}, heap_valid {fields['heap_valid']}")
+    if flag(fields, "refused") != want["refused"] or flag(fields, "intact_on_refusal") != want["refused"]:
+        problems.append(f"refused {fields['refused']}, intact_on_refusal {fields['intact_on_refusal']}: "
+                        f"expected {'a refusal with image, unwind data and carrier intact' if want['refused'] else 'none'}")
+    if flag(fields, "resumed") != want["resumed"]:
+        problems.append(f"resumed {fields['resumed']}")
+    if not flag(fields, "late_untouched"):
+        problems.append("the late host thread saw its slot 0 or sentinel change")
+    if int(fields["late_callbacks"]) != want["late"]:
+        problems.append(f"the guest received {fields['late_callbacks']} thread callbacks for the late host "
+                        f"thread, expected {want['late']}")
+    if fields["callbacks"] != want["callbacks"]:
+        problems.append(f"guest thread-attach,thread-detach callbacks {fields['callbacks']}, "
+                        f"expected {want['callbacks']}")
+    if not flag(fields, "cleaned") or not flag(fields, "second_release"):
+        problems.append(f"cleaned {fields['cleaned']}, second_release {fields['second_release']}: expected one "
+                        "final cleanup (image freed, unwind data gone, carrier unloaded) and a further release 0")
+    if result["stats"] != want["stats"]:
+        problems.append(f"counters {result['stats']} != {want['stats']} (installed, restored, exited, "
+                        "refused, pending, active, last release, untracked, enrollments refused, "
+                        "enrolled threads failed)")
+    if "probe" in want:
+        probe = None
+        if "probe" in fields:
+            probe = [int(v, 16) if i == 3 else int(v) for i, v in enumerate(fields["probe"].split(","))]
+        if probe != want["probe"]:
+            problems.append(f"probe {fields.get('probe')} (sentinel, created, last error, exit code), "
+                            f"expected {want['probe'][:3]} and {want['probe'][3]:#x}")
+    if problems:
+        raise AssertionError(f"{scenario}: " + "; ".join(problems))
+
+
 def mapped(mapper, exe, host, paused_exe):
     for scenario, want in SCENARIOS.items():
-        image = paused_exe if scenario == "paused" else exe
-        result = run([str(host), str(mapper), str(image), scenario])
-        print(f"{scenario}: LOG:{result['log']}")
-        print(f"{scenario}: {result['host']}")
-        if "fields" not in result or result["exit"] or result["stderr"]:
-            raise AssertionError(f"{scenario}: host failed: {result}")
-        fields = result["fields"]
-        problems = []
-        log = {"plain": PLAIN, "paused": PAUSED}.get(scenario, EXPECTED)
-        if result["log"] != log:
-            problems.append(f"guest log {result['log']!r}, expected {log!r}")
-        if fields["started"] != "1" or int(fields["exit"], 16) != (8 if scenario == "plain" else 0):
-            problems.append(f"started {fields['started']}, guest exit {fields['exit']}")
-        if flag(fields, "installed_main") != (scenario != "plain"):
-            problems.append(f"installed_main {fields['installed_main']}")
-        if not flag(fields, "reader_untouched"):
-            problems.append("the non-participating reader saw its slot 0 or sentinel change")
-        if flag(fields, "participant") != want["participant"]:
-            problems.append(f"participant {fields['participant']}")
-        if not flag(fields, "host_tls") or not flag(fields, "heap_valid"):
-            problems.append(f"host_tls {fields['host_tls']}, heap_valid {fields['heap_valid']}")
-        if flag(fields, "refused") != want["refused"] or flag(fields, "intact_on_refusal") != want["refused"]:
-            problems.append(f"refused {fields['refused']}, intact_on_refusal {fields['intact_on_refusal']}: "
-                            f"expected {'a refusal with image, unwind data and carrier intact' if want['refused'] else 'none'}")
-        if flag(fields, "resumed") != want["resumed"]:
-            problems.append(f"resumed {fields['resumed']}")
-        if not flag(fields, "late_untouched"):
-            problems.append("the late host thread saw its slot 0 or sentinel change")
-        if int(fields["late_callbacks"]) != want["late"]:
-            problems.append(f"the guest received {fields['late_callbacks']} thread callbacks for the late host "
-                            f"thread, expected {want['late']}")
-        if fields["callbacks"] != want["callbacks"]:
-            problems.append(f"guest thread-attach,thread-detach callbacks {fields['callbacks']}, "
-                            f"expected {want['callbacks']}")
-        if not flag(fields, "cleaned") or not flag(fields, "second_release"):
-            problems.append(f"cleaned {fields['cleaned']}, second_release {fields['second_release']}: expected one "
-                            "final cleanup (image freed, unwind data gone, carrier unloaded) and a further release 0")
-        if result["stats"] != want["stats"]:
-            problems.append(f"counters {result['stats']} != {want['stats']} (installed, restored, exited, "
-                            "refused, pending, active, last release, untracked)")
-        if problems:
-            raise AssertionError(f"{scenario}: " + "; ".join(problems))
+        want = {**want, "log": {"plain": PLAIN, "paused": PAUSED}.get(scenario, EXPECTED)}
+        check(mapper, paused_exe if scenario == "paused" else exe, host, scenario, want)
     print("mapped: the guest log equals the Windows log under pe_map_run_main; the non-participating reader's "
           "and the late thread's slot 0 and sentinel never changed, and the guest's callbacks never ran for the late "
           "thread; a participant still entered, without a handle, or paused inside the image made the first release "
           "return 0 with the refusal reported and the image, unwind data and carrier intact; once it left, one "
           "release returned 1 and freed everything and a further release returned 0; an exited participant was "
           "confirmed from its handle; plain pe_map_run fails every slot-0 check and still notifies the late thread")
+
+
+def enroll(mapper, exe, host):
+    for scenario, want in ENROLL.items():
+        check(mapper, exe, host, scenario, want)
+    print("enroll: a refused enrollment made the guest's CreateThread return null with no thread created, and a "
+          "failed installation ended the thread with 0xE0000201 before its start routine; in both the sentinel the "
+          "start routine touches first stayed 0, the guest got no callback for the thread, the failure was counted, "
+          "later workers were enrolled as usual and the host process survived; the control touched the sentinel")
 
 
 if __name__ == "__main__":
@@ -158,9 +206,15 @@ if __name__ == "__main__":
     m.add_argument("exe", type=Path)
     m.add_argument("host", type=Path)
     m.add_argument("paused_exe", type=Path, help="the fixture built with PAUSED_WORKER")
+    e = sub.add_parser("enroll")
+    e.add_argument("mapper", type=Path)
+    e.add_argument("exe", type=Path, help="the fixture built with ENROLL_PROBE")
+    e.add_argument("host", type=Path)
     arguments = parser.parse_args()
     if arguments.mode == "windows":
         windows(arguments.exe)
+    elif arguments.mode == "enroll":
+        enroll(arguments.mapper, arguments.exe, arguments.host)
     else:
         mapped(arguments.mapper, arguments.exe, arguments.host, arguments.paused_exe)
     sys.exit(0)

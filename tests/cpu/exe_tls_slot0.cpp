@@ -29,6 +29,12 @@
 // event Local\xbw_slot0_<pid>_paused and waits on ..._resume. Resumed, it checks that slot 0 still
 // holds its block with the values it wrote and sets ..._ok or ..._bad before it returns. The entry
 // point returns while c is paused, so this variant is only run under a host that resumes it.
+//
+// Built with ENROLL_PROBE (cpu_exe_tls_slot0_enroll), the entry point first starts probe worker p, whose
+// start routine touches a global sentinel before anything else and then runs the same check. A failed
+// CreateThread does not end the process here: the entry point records the result, and workers a and b
+// follow as usual. exe_slot0_probe reports the sentinel, whether CreateThread returned a handle, its last
+// error and p's exit code, for a host that makes p's enrollment or installation fail.
 #include <windows.h>
 #include <intrin.h>
 
@@ -105,7 +111,7 @@ struct Event {
 
 Event g_events[32];
 volatile LONG g_count;
-DWORD g_threads[4];  // initial thread, worker A, worker B, paused worker C
+DWORD g_threads[5];  // initial thread, worker A, worker B, paused worker C, probe worker P
 volatile LONG g_failures;
 
 char yes_no(bool value) {
@@ -121,7 +127,7 @@ void record(char kind, char a, char b, char c, char d) {
 
 bool own_thread() {
     const DWORD thread = GetCurrentThreadId();
-    return thread == g_threads[1] || thread == g_threads[2] || thread == g_threads[3];
+    return thread == g_threads[1] || thread == g_threads[2] || thread == g_threads[3] || thread == g_threads[4];
 }
 
 volatile LONG g_callback_counts[4];  // every call of the TLS callback, by reason, on any thread
@@ -172,10 +178,35 @@ unsigned g_length;
 void put(char c) { g_line[g_length++] = c; }
 
 char thread_name(DWORD thread) {
-    for (int i = 0; i < 4; ++i)
-        if (g_threads[i] == thread) return "mabc"[i];
+    for (int i = 0; i < 5; ++i)
+        if (g_threads[i] == thread) return "mabcp"[i];
     return 0;
 }
+
+#ifdef ENROLL_PROBE
+constexpr unsigned char PROBE_TAG = 0x55;
+volatile LONG g_probe[4];  // sentinel, CreateThread returned a handle, its last error, p's exit code
+
+DWORD WINAPI probe_worker(void*) {
+    InterlockedIncrement(&g_probe[0]);  // first: before slot 0 or the image's thread-locals are read
+    check(PROBE_TAG);
+    return 0;
+}
+
+void run_probe() {
+    SetLastError(ERROR_SUCCESS);
+    HANDLE thread = CreateThread(nullptr, 0, probe_worker, nullptr, CREATE_SUSPENDED, &g_threads[4]);
+    g_probe[1] = thread != nullptr;
+    g_probe[2] = static_cast<LONG>(thread ? ERROR_SUCCESS : GetLastError());
+    if (!thread) return;
+    ResumeThread(thread);
+    if (WaitForSingleObject(thread, WAIT_MS) != WAIT_OBJECT_0) ExitProcess(WAIT_FAILED_CODE);
+    DWORD code = 0;
+    GetExitCodeThread(thread, &code);
+    g_probe[3] = static_cast<LONG>(code);
+    CloseHandle(thread);
+}
+#endif
 
 #ifdef PAUSED_WORKER
 constexpr unsigned char PAUSED_TAG = 0x44;
@@ -212,9 +243,19 @@ DWORD WINAPI paused_worker(void*) {
 #endif
 }  // namespace
 
+#ifdef ENROLL_PROBE
+// The probe's result for the host: sentinel, CreateThread returned a handle (1/0), its last error, p's exit code.
+extern "C" __declspec(dllexport) void exe_slot0_probe(LONG* out) {
+    for (int i = 0; i < 4; ++i) out[i] = g_probe[i];
+}
+#endif
+
 extern "C" DWORD WINAPI exe_entry(void*) {
     g_threads[0] = GetCurrentThreadId();
     check(0x11);
+#ifdef ENROLL_PROBE
+    run_probe();
+#endif
     for (int i = 0; i < 2; ++i) {
         // Suspended, so the thread ID is known before its attach callback runs.
         HANDLE thread = CreateThread(nullptr, 0, worker, reinterpret_cast<void*>(static_cast<ULONG_PTR>(0x22 + i * 0x11)),

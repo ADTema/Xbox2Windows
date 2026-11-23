@@ -1581,7 +1581,7 @@ Code compiled with `/GA` assumes that its EXE owns TLS index 0. It reads a threa
 `pe_map_run_main` is `pe_map_run` for the image the host treats as its main executable. Only participating threads get the image's block in slot 0, and each thread swaps its own slot, never another thread's. The participants are:
 
 - the thread that calls `pe_map_run_main`, from before the process-attach callbacks until `pe_map_release` on that thread;
-- threads the image starts, recognised by a Windows start address inside the image, from their `DLL_THREAD_ATTACH` (before any image is notified) until their `DLL_THREAD_DETACH` (after every image was notified, and before ntdll frees the thread's blocks);
+- guest threads enrolled through `pe_map_main_create_thread`, from their `DLL_THREAD_ATTACH` (before any image is notified) until their `DLL_THREAD_DETACH` (after every image was notified, and before ntdll frees the thread's blocks);
 - host threads between their own `pe_map_main_thread_enter` and `pe_map_main_thread_leave`.
 
 A participant keeps its previous slot 0 in a pe_map TLS slot reserved at the start. The slot index is below `TLS_MINIMUM_AVAILABLE`, so setting it never allocates. Its thread handle goes into a fixed table of 64 entries.
@@ -1597,7 +1597,29 @@ An accepted release, checked and committed under one lock so that no participant
 
 **Notifications.** Threads that do not participate are never touched, and that includes their notifications. The main image's TLS callbacks receive `DLL_THREAD_ATTACH` and `DLL_THREAD_DETACH` only on participating threads, because a `/GA` callback on another thread would read the host's block. Other images, and EXEs started with `pe_map_run`, are notified as before.
 
-**Classification failure.** A new thread whose start address cannot be read, or an image thread whose block cannot be installed, cannot be run safely either way. As a guest thread it would reach guest code with the host's block. Treated as a guest thread, host code would read the image's block. `pe_map` then ends the process with `__fastfail` before the thread runs, rather than let it proceed with the wrong block.
+**Explicit guest-thread enrollment.** No thread is classified by inspecting it, and no thread notification ends the process. The host binds the main image's `CreateThread` imports to `pe_map_main_create_thread`, which has the same parameters and results. While an image is started as the main image, it works as follows:
+
+1. It reserves an entry in a fixed enrollment table of 64 entries.
+2. It creates the thread suspended at a pe_map start routine and records the thread's ID and a `SYNCHRONIZE` handle before the thread can run.
+3. It resumes the thread unless the caller asked for `CREATE_SUSPENDED`.
+
+At its `DLL_THREAD_ATTACH`, only a thread found in that table installs the image's block. Any other thread, whatever its start address, returns at once untouched. The pe_map start routine calls the guest's start routine only if the installation succeeded. Enrollment can fail in two ways, and neither runs guest code:
+
+- **No entry or no handle.** If no entry can be reserved or the thread cannot be watched, `pe_map_main_create_thread` returns null with `ERROR_NOT_ENOUGH_MEMORY` and no thread exists. The guest's caller sees an ordinary `CreateThread` failure.
+- **The block cannot be installed.** If the block cannot be installed on the new thread, the pe_map start routine returns `0xE0000201` without calling the guest's start routine. The main image's callbacks are not notified, because the thread does not participate.
+
+`pe_map_main_tls_stats` counts both. An enrolled thread that has not yet passed its start routine counts as one that may run the image's code, so release refuses while it lives. `pe_map_main_tls_inject` makes the next enrollment (1) or installation (2) fail, for tests.
+
+Supported thread entries are these three:
+
+- the thread that calls `pe_map_run_main`;
+- threads the image creates through a `CreateThread` import that the host bound to `pe_map_main_create_thread`;
+- host threads between `pe_map_main_thread_enter` (which returns 0 when it cannot install) and `pe_map_main_thread_leave`.
+
+Not supported, and running with the host's slot 0:
+
+- threads the image creates by any other route: a `CreateThread` address it looked up itself, `CreateRemoteThread(Ex)`, `NtCreateThreadEx`, thread-pool work, or a C runtime's `_beginthreadex` in another DLL;
+- host threads that call into the image without entering.
 
 On a participating thread, the host's own index-0 code reads the image's block, so a host that owns slot 0 must not touch its thread-locals there. This rules out a Python host: in Python 3.13, `python313.dll` carries static TLS.
 
@@ -1609,7 +1631,7 @@ On a participating thread, the host's own index-0 code reads the image's block, 
 LOG:m1=yy m:yyyy a2=yy a:yyyy a3=y- b2=yy b:yyyy b3=y- X=0
 ```
 
-`cpu_native_exe_tls_slot0` runs `cpu_exe_tls_slot0_host`, a CRT-free host whose own TLS block owns slot 0. It binds only `kernel32.dll` and runs one scenario per process. Each scenario has two non-participating threads:
+`cpu_native_exe_tls_slot0` runs `cpu_exe_tls_slot0_host`, a CRT-free host whose own TLS block owns slot 0. It binds only `kernel32.dll` and runs one scenario per process. Under `pe_map_run_main` it binds the guest's `CreateThread` to `pe_map_main_create_thread`, so the guest's workers are enrolled. Under `pe_map_run` it binds kernel32's `CreateThread`. Each scenario has two non-participating threads:
 
 - a reader that samples its own slot 0 and sentinel from before the map until after release;
 - a late thread created after the start, which checks its own slot 0 and sentinel.
@@ -1619,16 +1641,26 @@ Neither may ever see a change. The guest exports its TLS callback counts by reas
 - Under `pe_map_run_main`, the callback must not run during the late thread's life, and its thread-attach and thread-detach totals must count only the guest's own workers.
 - Under `pe_map_run`, the late thread's attach and detach still reach the guest.
 
-A refused release returns 0 with the refusal reported. The accepted release is the only one that returns 1. Every accepted release must leave the image no longer committed, `RtlLookupFunctionEntry` finding nothing for its entry point, and the carrier unloaded. A further release must then return 0. Counters are installed, restored, exited, refused releases, pending, active, last release and untracked:
+A refused release returns 0 with the refusal reported. The accepted release is the only one that returns 1. Every accepted release must leave the image no longer committed, `RtlLookupFunctionEntry` finding nothing for its entry point, and the carrier unloaded. A further release must then return 0. Counters are installed, restored, exited, refused releases, pending, active, last release, untracked, enrollments refused and enrolled threads failed:
 
 | Scenario | First release | Then | Guest thread callbacks (attach, detach); for the late thread | Counters |
 |---|---|---|---|---|
-| `main`: a host thread enters and leaves | 1 | one cleanup | `2,2`; 0 | `4,4,0,0,0,0,1,0` |
-| `alive`: a host participant is still entered | 0, refused, image, unwind data and carrier intact | it leaves; 1, one cleanup | `2,2`; 0 | `4,4,0,1,0,0,1,0` |
-| `exited`: a host participant is ended with `TerminateThread` | 1, exit confirmed | one cleanup | `2,2`; 0 | `4,3,1,0,0,0,1,0` |
-| `untracked`: 64 host participants, the last finds the table full | 0, refused (cannot inspect), intact | it leaves; 1, one cleanup | `2,2`; 0 | `67,67,0,1,0,0,1,0` |
-| `paused`: worker c paused inside the image's code | 0, refused, intact | c resumes, finds its block, returns; 1, one cleanup | `3,3`; 0 | `5,5,0,1,0,0,1,0` |
-| `plain`: `pe_map_run` (negative control), every slot-0 check `n`, `X=8` | 1 | one cleanup | `3,3`; 2 | `0,0,0,0,0,0,-1,0` |
+| `main`: a host thread enters and leaves | 1 | one cleanup | `2,2`; 0 | `4,4,0,0,0,0,1,0,0,0` |
+| `alive`: a host participant is still entered | 0, refused, image, unwind data and carrier intact | it leaves; 1, one cleanup | `2,2`; 0 | `4,4,0,1,0,0,1,0,0,0` |
+| `exited`: a host participant is ended with `TerminateThread` | 1, exit confirmed | one cleanup | `2,2`; 0 | `4,3,1,0,0,0,1,0,0,0` |
+| `untracked`: 64 host participants, the last finds the table full | 0, refused (cannot inspect), intact | it leaves; 1, one cleanup | `2,2`; 0 | `67,67,0,1,0,0,1,0,0,0` |
+| `paused`: worker c paused inside the image's code | 0, refused, intact | c resumes, finds its block, returns; 1, one cleanup | `3,3`; 0 | `5,5,0,1,0,0,1,0,0,0` |
+| `plain`: `pe_map_run` (negative control), every slot-0 check `n`, `X=8` | 1 | one cleanup | `3,3`; 2 | `0,0,0,0,0,0,-1,0,0,0` |
+
+`cpu_native_exe_tls_slot0_enroll` checks enrollment failures, each in its own child host process. It uses `cpu_exe_tls_slot0_enroll`, whose probe worker p touches a global sentinel as the first statement of its start routine, and which records a failed `CreateThread` instead of ending the process. The host also enters and leaves once, and every reader, late-thread, release and cleanup check applies:
+
+| Scenario | Guest log | Probe: sentinel, created, last error, exit code | Callbacks | Counters |
+|---|---|---|---|---|
+| `probe` (control): p enrolled | adds `p2=yy p:yyyy p3=y-` | `1,1,0,0` | `3,3` | `5,5,0,0,0,0,1,0,0,0` |
+| `enroll_refused`: p's enrollment fails | as Windows | `0,0,8,0`: `CreateThread` returned null, no thread | `2,2` | `4,4,0,0,0,0,1,0,1,0` |
+| `install_failed`: installation on p fails | as Windows | `0,1,0,e0000201`: p ended before its start routine | `2,2` | `4,4,0,0,0,0,1,0,0,1` |
+
+In both failure scenarios the sentinel stayed 0, the guest received no callback for p, workers a and b were enrolled as usual, and the host process survived to print its report and exit 0.
 
 Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release`:
 
@@ -1637,16 +1669,18 @@ Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release`:
 - **Mutations (not committed).** Each of these fails the test:
   - With a `pe_map_release` that never refuses, `alive` fails because the release cleans up while a participant is live, and `paused` crashes with `0xC0000005`, because worker c resumes in the freed image.
   - Without the notification gate, `main` fails because the guest receives the late thread's attach and detach, and its totals become `4,4`.
+  - If the pe_map start routine calls the guest's start routine after a failed installation, `install_failed` fails: the sentinel becomes 1 and p's own check sees the host's block (`p:n---`, `X=1`).
+  - If a failed installation ends the process with `__fastfail` (the previous model), `install_failed` fails: the child host dies with `0xC0000409` before it prints a report.
 
 Not covered:
 
 - CRT EXEs and the exit path. A CRT EXE that returns from `main` calls `ExitProcess`, so slot 0 has to be given back from a hook on the image's own `ExitProcess` import, and its CRT's thread-detach callback frees what it finds in slot 0 (MoonYueya, #870).
-- Threads that start in host code and then call into the image without entering.
+- Threads that start in host code and then call into the image without entering, and the other unsupported thread entries above.
 - More than one main image per process.
 
 ```powershell
-cmake --build --preset dev --target pe_map cpu_exe_tls_slot0 cpu_exe_tls_slot0_pause cpu_exe_tls_slot0_host
-ctest --preset dev --no-tests=error -R '^cpu_native_exe_tls_slot0(_windows)?$' -V
+cmake --build --preset dev --target pe_map cpu_exe_tls_slot0 cpu_exe_tls_slot0_pause cpu_exe_tls_slot0_enroll cpu_exe_tls_slot0_host
+ctest --preset dev --no-tests=error -R '^cpu_native_exe_tls_slot0(_windows|_enroll)?$' -V
 ```
 
 ### Lifecycle of two DLLs with the static C runtime

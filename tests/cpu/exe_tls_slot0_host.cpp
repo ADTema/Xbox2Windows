@@ -16,6 +16,13 @@
 //              release must be refused with the image, its unwind data and its carrier intact; c then
 //              resumes, checks its block, returns, and the second release is accepted
 //   plain      start the image with pe_map_run (control): slot 0 keeps the host's block
+//   probe            <image> is cpu_exe_tls_slot0_enroll: its probe worker p is enrolled and runs (control)
+//   enroll_refused   the same, with p's enrollment made to fail (pe_map_main_tls_inject(1)): the guest's
+//                    CreateThread returns null and no thread is created
+//   install_failed   the same, with the installation on p made to fail (pe_map_main_tls_inject(2)): p ends
+//                    with 0xE0000201 without its start routine
+// Under pe_map_run_main the guest's CreateThread import is bound to pe_map_main_create_thread, so the guest's
+// workers are enrolled; under pe_map_run it is bound to kernel32's CreateThread.
 // In every scenario a reader thread that never participates samples its own slot 0 and sentinel from
 // before the map until after release, and a late thread created after the start checks its own slot 0
 // and sentinel while the guest's TLS callback counts (exe_slot0_callback_counts) are read before and
@@ -26,7 +33,9 @@
 //         reader_samples=<n> participant=<y/n|-> refused=<y/n|-> intact_on_refusal=<y/n|->
 //         resumed=<y/n|-> late_untouched=<y/n> late_callbacks=<n> callbacks=<ta>,<td> host_tls=<y/n>
 //         cleaned=<y/n> second_release=<y/n> heap_valid=<y/n>
-//         stats=<installed>,<restored>,<exited>,<refusals>,<pending>,<active>,<last release>,<untracked>
+//         stats=<installed>,<restored>,<exited>,<refusals>,<pending>,<active>,<last release>,<untracked>,
+//               <enrollments refused>,<enrolled threads failed>
+//         [probe=<sentinel>,<created 1/0>,<last error>,<exit code hex>]   probe scenarios only
 // installed_main: after the start, the starting thread's slot 0 holds the image's block.
 // participant: the host participant(s) saw the image's block after entering and their own block and
 // sentinel after leaving ('-' when the scenario has none).
@@ -43,6 +52,8 @@
 // cleaned: after the accepted release the image is no longer committed, its unwind data is gone and
 // the carrier is unloaded; it is the only pe_map_release that returned 1. second_release: a further
 // pe_map_release returns 0 (one cleanup only).
+// probe: the guest's sentinel (touched first by p's start routine), whether its CreateThread returned a
+// handle, the last error it saw and p's exit code; the host process reaching this line shows it survived.
 // Exit code 0 when the host could run every step, 2 for a usage or setup failure.
 #include <windows.h>
 #include <intrin.h>
@@ -74,6 +85,7 @@ __declspec(thread) std::uint64_t t_host_sentinel = 0x0123456789abcdefull;
 namespace {
 constexpr std::uint64_t SENTINEL = 0x0123456789abcdefull;
 constexpr int MAIN_TRACKED = 64;  // the participant table size in tools/pe_map.cpp
+constexpr int STATS = 10;         // pe_map_main_tls_stats entries
 
 using Resolver = void*(__cdecl*)(const char* dll, const char* name, std::uint32_t ordinal);
 using MapImage = void*(__cdecl*)(const wchar_t*, Resolver, std::uint32_t*, char*, std::size_t);
@@ -83,8 +95,10 @@ using Join = int(__cdecl*)();
 using Stats = void(__cdecl*)(std::int64_t*);
 using Export = void*(__cdecl*)(void*, const char*);
 using Counts = void(__cdecl*)(LONG*);
+using Inject = void(__cdecl*)(int);
 
 HMODULE g_kernel;
+void* g_create_thread;  // what the guest's CreateThread import is bound to
 Join g_enter, g_leave;
 DWORD g_index;  // the image's TLS index (the carrier's)
 char g_detail[256];
@@ -102,6 +116,7 @@ int ascii_equal(const char* a, const char* b) {
 // Binds kernel32.dll only; any other import stays unresolved and fails the map.
 void* __cdecl resolve(const char* dll, const char* name, std::uint32_t) {
     if (!name || !ascii_equal(dll, "kernel32.dll")) return nullptr;
+    if (ascii_equal(name, "CreateThread")) return g_create_thread;
     return reinterpret_cast<void*>(GetProcAddress(g_kernel, name));
 }
 
@@ -319,12 +334,15 @@ extern "C" int host_entry() {
     wchar_t* argv[8];
     const int argc = split(GetCommandLineW(), argv, 8);
     if (argc != 4)
-        ExitProcess(fail_setup("usage: host <pe_map.dll> <image> main|alive|exited|untracked|paused|plain"));
+        ExitProcess(fail_setup("usage: host <pe_map.dll> <image> main|alive|exited|untracked|paused|plain|probe|"
+                               "enroll_refused|install_failed"));
     const wchar_t* scenario = argv[3];
     const bool plain = same(scenario, L"plain");
     const bool alive = same(scenario, L"alive"), exited = same(scenario, L"exited"),
                untracked = same(scenario, L"untracked"), paused = same(scenario, L"paused");
-    if (!plain && !alive && !exited && !untracked && !paused && !same(scenario, L"main"))
+    const bool enroll_refused = same(scenario, L"enroll_refused"), install_failed = same(scenario, L"install_failed");
+    const bool probe = enroll_refused || install_failed || same(scenario, L"probe");
+    if (!plain && !alive && !exited && !untracked && !paused && !probe && !same(scenario, L"main"))
         ExitProcess(fail_setup("scenario"));
     HANDLE paused_event = nullptr, resume_event = nullptr, ok_event = nullptr, bad_event = nullptr;
     if (paused) {
@@ -342,7 +360,10 @@ extern "C" int host_entry() {
     auto mapped_export = reinterpret_cast<Export>(GetProcAddress(mapper, "pe_map_export"));
     g_enter = reinterpret_cast<Join>(GetProcAddress(mapper, "pe_map_main_thread_enter"));
     g_leave = reinterpret_cast<Join>(GetProcAddress(mapper, "pe_map_main_thread_leave"));
-    if (!map || !run || !release || !stats || !mapped_export || !g_enter || !g_leave)
+    auto inject = reinterpret_cast<Inject>(GetProcAddress(mapper, "pe_map_main_tls_inject"));
+    g_create_thread = plain ? reinterpret_cast<void*>(GetProcAddress(g_kernel, "CreateThread"))
+                            : reinterpret_cast<void*>(GetProcAddress(mapper, "pe_map_main_create_thread"));
+    if (!map || !run || !release || !stats || !mapped_export || !g_enter || !g_leave || !inject || !g_create_thread)
         ExitProcess(fail_setup("missing pe_map export"));
 
     const bool sentinel_before = t_host_sentinel == SENTINEL;  // the last host TLS access until release
@@ -359,6 +380,10 @@ extern "C" int host_entry() {
 
     auto counts = reinterpret_cast<Counts>(mapped_export(base, "exe_slot0_callback_counts"));
     if (!counts) ExitProcess(fail_setup("guest callback counts"));
+    auto probe_result = reinterpret_cast<Counts>(probe ? mapped_export(base, "exe_slot0_probe") : nullptr);
+    if (probe && !probe_result) ExitProcess(fail_setup("guest probe"));
+    if (enroll_refused) inject(1);
+    if (install_failed) inject(2);
 
     std::uint32_t exit_code = 0xdeadbeef;
     const int started = run(base, &exit_code);
@@ -400,7 +425,7 @@ extern "C" int host_entry() {
     if (paused && WaitForSingleObject(paused_event, 10000) != WAIT_OBJECT_0) ExitProcess(fail_setup("paused worker"));
     if (stay >= 0 || paused) {
         const int first = release(base);
-        std::int64_t status_now[8];
+        std::int64_t status_now[STATS];
         stats(status_now);
         refused = first == 0 && status_now[6] == 2;
         intact = committed(base) && has_unwind(entry_point) && carrier_loaded() && holds_image_block();
@@ -409,7 +434,7 @@ extern "C" int host_entry() {
             SetEvent(resume_event);
             HANDLE results[2] = {ok_event, bad_event};
             resumed = WaitForMultipleObjects(2, results, FALSE, 10000) == WAIT_OBJECT_0;
-            std::int64_t now[8];
+            std::int64_t now[STATS];
             for (int i = 0; i < 500; ++i) {  // c's detach removes it from the participants
                 stats(now);
                 if (now[4] == 1) break;
@@ -421,6 +446,8 @@ extern "C" int host_entry() {
 
     LONG final_counts[4];
     counts(final_counts);
+    LONG probe_out[4] = {};
+    if (probe) probe_result(probe_out);  // the guest's export, read while the image is still mapped
     const int released = release(base);
     const bool cleaned = released == 1 && !committed(base) && !has_unwind(entry_point) && !carrier_loaded();
     const bool second_release = release(base) == 0;
@@ -431,7 +458,7 @@ extern "C" int host_entry() {
     WaitForSingleObject(reader_thread, 10000);
     const bool reader_untouched = g_reader_bad == 0 && g_reader_samples > 0;
     const bool heap_valid = HeapValidate(GetProcessHeap(), 0, nullptr) != FALSE;
-    std::int64_t counters[8];
+    std::int64_t counters[STATS];
     stats(counters);
 
     put("HOST: scenario=");
@@ -460,9 +487,17 @@ extern "C" int host_entry() {
     put_flag("second_release", second_release);
     put_flag("heap_valid", heap_valid);
     put(" stats=");
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < STATS; ++i) {
         if (i) put(',');
         put_number(counters[i], false);
+    }
+    if (probe) {
+        put(" probe=");
+        for (int i = 0; i < 3; ++i) {
+            put_number(probe_out[i], false);
+            put(',');
+        }
+        put_number(static_cast<std::uint32_t>(probe_out[3]), true);
     }
     put('\n');
     flush();
