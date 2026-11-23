@@ -345,16 +345,21 @@ def check_shader_records():
         sdwa_unary_forms = {("SDWA", f"v_{op}_f32_sdwa") for op in (
             "exp", "log", "rcp", "rcp_iflag", "rsq", "sqrt", "sin", "cos", "rndne", "frexp_mant")}
         assert sdwa_unary_forms <= covered, (name, sdwa_unary_forms - covered)
-    # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit
-    # predicate the translator lowers; the rejected exec-writing and 64-bit neighbours stay out.
-    int_compares = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
-                    for kind in ("i16", "u16", "i32", "u32")}
-    int_compares |= {f"v_cmp_{op}_{kind}" for op in ("f", "t") for kind in ("i32", "u32")}
+    # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16-, 32- and 64-bit
+    # predicate the translator lowers; the rejected exec-writing neighbours stay out.
+    narrow_int = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
+                  for kind in ("i16", "u16", "i32", "u32")}
+    narrow_int |= {f"v_cmp_{op}_{kind}" for op in ("f", "t") for kind in ("i32", "u32")}
+    ops64 = ("f", "lt", "eq", "le", "gt", "ne", "ge", "t")
+    int64 = {f"v_cmp_{op}_{kind}" for op in ops64 for kind in ("i64", "u64")}
+    assert len(int64) == len(ops64) * 2, sorted(int64)
+    int_compares = narrow_int | int64
     f16_compares = {f"v_cmp_{op}_f16" for op in pixel.PREDICATES} | {"v_cmp_class_f16"}
     compare_forms = ({("VOPC", form) for form in int_compares | f16_compares}
                      | {("VOP3", f"{form}_e64") for form in int_compares | f16_compares})
-    assert len(compare_forms) == 90
-    compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_i32", "v_cmp_lt_i64", "v_cmp_lt_u64",
+    # Each name is counted once as VOPC and once as VOP3; the three sets must not share a name.
+    assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares)), len(compare_forms)
+    compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_i32", "v_cmpx_lt_i64", "v_cmpx_lt_u64",
                           "v_cmp_class_f64", "v_cmp_lt_f64"}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)

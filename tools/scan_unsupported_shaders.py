@@ -170,6 +170,12 @@ if PIXEL_INT_COMPARE:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{icmp_ops})_(?:i32|u32|i16|u16)(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
     )
+    # 64-bit comparisons are checked by supports_int64_compare() below: the pair and inline ranges are numeric.
+    INT64_COMPARE_PATTERN = re.compile(
+        rf"v_cmp_(?:{icmp_ops})_(?:i64|u64)(_e32|_e64)?\s+(vcc(?:_lo)?|s\d+|s\[\d+:\d+\]),\s+(\S+),\s+(\S+)"
+    )
+else:
+    INT64_COMPARE_PATTERN = None
 if PIXEL_VOP3P_F16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_pk_(?:{'|'.join(map(re.escape, PIXEL_VOP3P_F16))})_f16\s+v\d+,\s+.+"
@@ -408,12 +414,45 @@ def extract_opcode(instruction_line: str) -> str:
     return tokens[0] if tokens else ""
 
 
+def supports_int64_compare(clean: str) -> bool:
+    """Mirror pixel_aot.int64_operand and the 64-bit comparison destination rules."""
+    if INT64_COMPARE_PATTERN is None or not (m := INT64_COMPARE_PATTERN.fullmatch(clean)):
+        return False
+    enc, dst, *sources = m.groups()
+    enc = enc or "_e32"
+    if enc == "_e32" and dst not in ("vcc", "vcc_lo"):
+        return False
+    if (p := re.fullmatch(r"s\[(\d+):(\d+)\]", dst)) and not _sgpr_pair_ok(p):
+        return False
+    if re.fullmatch(r"s\d+", dst) and int(dst[1:]) > 105:
+        return False
+    for position, token in enumerate(sources):
+        if (p := re.fullmatch(r"v\[(0|[1-9]\d*):(0|[1-9]\d*)\]", token)):
+            if int(p[2]) != int(p[1]) + 1 or int(p[1]) > 254:
+                return False
+        elif enc == "_e32" and position == 1:
+            return False
+        elif p := re.fullmatch(r"s\[(\d+):(\d+)\]", token):
+            if not _sgpr_pair_ok(p):
+                return False
+        elif not (re.fullmatch(r"0|-?[1-9]\d*", token) and -16 <= int(token) <= 64):
+            return False
+    return True
+
+
+def _sgpr_pair_ok(pair: "re.Match") -> bool:
+    first, last = int(pair[1]), int(pair[2])
+    return last == first + 1 and first % 2 == 0 and last <= 105
+
+
 def is_instruction_supported(instruction_line: str) -> bool:
     """Check if instruction is supported by pixel_aot regex patterns."""
     clean = instruction_line.strip()
     clean = re.split(r"//|[;#]", clean)[0].strip()
     if not clean:
         return True
+    if clean.startswith("v_cmp_") and re.search(r"_[iu]64(?:_e32|_e64)?\s", clean):
+        return supports_int64_compare(clean)
     if not any(pattern.match(clean) for pattern in COMPILED_SUPPORTED_PATTERNS):
         return False
     if wait := re.fullmatch(r"s_waitcnt\s+(.*)", clean):
