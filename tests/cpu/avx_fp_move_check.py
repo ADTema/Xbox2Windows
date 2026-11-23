@@ -191,8 +191,8 @@ def check_discarded_read(native_path: Path, lifted_path: Path) -> None:
                 )
 
 
-def check_vmaskmovdqu_page_edge(native_path: Path, lifted_path: Path) -> int:
-    """Verify native/lifted agreement when [r8..r8+15] abuts or crosses a PAGE_NOACCESS / PAGE_READONLY guard page."""
+def check_vmaskmovdqu_page_edge(native_path: Path, lifted_path: Path):
+    """Compare native/lifted on page-abutting writable vectors (k=16) and observe native k<16 page-edge faults."""
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.VirtualAlloc.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
     k32.VirtualAlloc.restype = ctypes.c_void_p
@@ -215,7 +215,9 @@ def check_vmaskmovdqu_page_edge(native_path: Path, lifted_path: Path) -> int:
     src_bytes = bytes(range(0x10, 0x30))
     buf_src, ptr_src, _, _, _ = alloc_aligned_buffer(src_bytes)
 
-    cases = 0
+    abutting_cases = 0
+    native_obs_cases = 0
+    sparse_mask = bytes(0x80 if i in (0, 7, 15) else (0x7F if i % 2 else 0x00) for i in range(16)) + b"\x00" * 16
     for guard_prot in (PAGE_NOACCESS, PAGE_READONLY):
         base = k32.VirtualAlloc(None, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
         if not base:
@@ -225,59 +227,51 @@ def check_vmaskmovdqu_page_edge(native_path: Path, lifted_path: Path) -> int:
             if not k32.VirtualProtect(base + 4096, 4096, guard_prot, ctypes.byref(old_prot)):
                 raise ctypes.WinError(ctypes.get_last_error())
 
-            for k in (16, 15, 8, 7, 1, 0):
+            # Page-abutting writable case (k=16): both native and lifted must succeed and match.
+            ptr_dst = base + 4096 - 16
+            for mask_name, mask_bytes in (
+                ("full_mask", b"\x80" * 16 + b"\x00" * 16),
+                ("all_zero_mask", b"\x7F" * 16 + b"\x00" * 16),
+                ("sparse_mask", sparse_mask),
+            ):
+                buf_mask, ptr_mask, _, _, _ = alloc_aligned_buffer(mask_bytes)
+                want = ref_vmaskmovdqu(src_bytes[:16], mask_bytes[:16], b"\x5A" * 16)
+                for label, fn in (("native", native_fns["op_vmaskmovdqu"]), ("lifted", lifted_fns["op_vmaskmovdqu"])):
+                    ctypes.memset(base + 4096 - 32, 0x5A, 32)
+                    fn(ptr_src, ptr_mask, ptr_dst)
+                    after = bytes((ctypes.c_ubyte * 16).from_address(ptr_dst))
+                    assert after == want, (
+                        f"{label} k=16 page-abutting mismatch ({mask_name}): {after.hex()} != {want.hex()}"
+                    )
+                    abutting_cases += 1
+                _ = buf_mask
+
+            # Partial-vector page-edge probe (k<16): strictly native observation (implementation-dependent).
+            for k in (15, 8, 7, 1, 0):
                 ptr_dst = base + 4096 - k
-                masks = [
+                masks = (
                     ("only_writable_masked", bytes(0x80 if i < k else 0x7F for i in range(16)) + b"\x00" * 16),
                     ("all_zero_mask", b"\x7F" * 16 + b"\x00" * 16),
-                ]
-                if k < 16:
-                    masks.append(
-                        ("edge_byte_masked", bytes(0x80 if i in (0, k) else 0x00 for i in range(16)) + b"\x00" * 16)
-                    )
-
+                    ("edge_byte_masked", bytes(0x80 if i in (0, k) else 0x00 for i in range(16)) + b"\x00" * 16),
+                )
                 for mask_name, mask_bytes in masks:
                     buf_mask, ptr_mask, _, _, _ = alloc_aligned_buffer(mask_bytes)
-                    for label, fn in (("native", native_fns["op_vmaskmovdqu"]), ("lifted", lifted_fns["op_vmaskmovdqu"])):
-                        ctypes.memset(base + 4096 - 32, 0x5A, 32)
-                        try:
-                            fn(ptr_src, ptr_mask, ptr_dst)
-                        except OSError as error:
-                            assert k < 16 and "access violation" in str(error).lower(), (
-                                label, guard_prot, k, mask_name, error
-                            )
-                            if k > 0:
-                                after = bytes((ctypes.c_ubyte * k).from_address(ptr_dst))
-                                if label == "lifted":
-                                    assert after == b"\x5A" * k, (
-                                        f"{label} modified writable prefix bytes before page-edge fault "
-                                        f"(prot={guard_prot:#x}, k={k}, mask={mask_name}): {after.hex()}"
-                                    )
-                                else:
-                                    for i, byte_val in enumerate(after):
-                                        allowed = {0x5A}
-                                        if mask_bytes[i] & 0x80:
-                                            allowed.add(src_bytes[i])
-                                        assert byte_val in allowed, (
-                                            f"native wrote unexpected byte at offset {i} before page-edge fault "
-                                            f"(prot={guard_prot:#x}, k={k}, mask={mask_name}): {after.hex()}"
-                                        )
-                        else:
-                            assert k == 16, (
-                                f"{label} unexpectedly succeeded across non-writable page edge "
-                                f"(prot={guard_prot:#x}, k={k}, mask={mask_name})"
-                            )
-                            after = bytes((ctypes.c_ubyte * 16).from_address(ptr_dst))
-                            want = ref_vmaskmovdqu(src_bytes[:16], mask_bytes[:16], b"\x5A" * 16)
-                            assert after == want, (
-                                f"{label} k=16 page-abutting mismatch ({mask_name}): {after.hex()} != {want.hex()}"
-                            )
-                        cases += 1
+                    ctypes.memset(base + 4096 - 32, 0x5A, 32)
+                    try:
+                        native_fns["op_vmaskmovdqu"](ptr_src, ptr_mask, ptr_dst)
+                    except OSError as error:
+                        assert "access violation" in str(error).lower(), (guard_prot, k, mask_name, error)
+                    else:
+                        raise AssertionError(
+                            f"native unexpectedly succeeded across non-writable page edge "
+                            f"(prot={guard_prot:#x}, k={k}, mask={mask_name})"
+                        )
+                    native_obs_cases += 1
                     _ = buf_mask
         finally:
             k32.VirtualFree(base, 0, MEM_RELEASE)
     _ = buf_src
-    return cases
+    return abutting_cases, native_obs_cases
 
 
 def check_differential(native_path: Path, lifted_path: Path, altered_path: Path) -> None:
@@ -288,7 +282,7 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
         raise SystemExit(77)
 
     check_discarded_read(native_path, lifted_path)
-    page_edge_cases = check_vmaskmovdqu_page_edge(native_path, lifted_path)
+    abutting_cases, native_obs_cases = check_vmaskmovdqu_page_edge(native_path, lifted_path)
 
     _, native = bind_exports(native_path)
     _, altered = bind_exports(altered_path, "lifted_")
@@ -332,7 +326,7 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
 
     print(
         f"{total} native/lifted/reference AVX move cases across {len(EXPORTS)} exports matched bit-for-bit; "
-        f"{page_edge_cases} native/lifted page-edge checks passed; "
+        f"{abutting_cases} k=16 page-abutting checks and {native_obs_cases} native k<16 page-edge fault observations passed; "
         f"ALTER_OP diverged on {diverged}; dead-read and output mutation controls passed"
     )
 

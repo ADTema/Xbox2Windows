@@ -6098,12 +6098,15 @@ flat buffers and returns `void`. `YMM0`..`YMM5` use the portable `Vec256` model
 (`std::uint64_t q[4]`), `VEX.128` writes zero `[255:128]` (`vmovups`/`vmovaps`/
 `vmovdqu`/`vmovdqa` XMM) or `[255:64]` (`vmovq` XMM), and volatile scratch GPRs
 (`rax`, `r9`, `r10`, `r11`) become unavailable to ordinary consumers after saving `rdi`
-while remaining valid for `rdi` restoration. Native `VirtualAlloc` + `PAGE_NOACCESS` /
-`PAGE_READONLY` page-edge testing showed that `vmaskmovdqu` requires the entire 16-byte
-destination `[rdi..rdi+15]` to be writable (faulting even when all mask MSBs are clear; on
-unaligned page-crossing writes, native hardware may commit a writable 8-byte prefix before
-faulting on the guard page), so the lowered helper probes both 16-byte endpoints before
-writing masked bytes. Transport and ABI glue covers `vmovups`, `vmovaps`,
+while remaining valid for `rdi` restoration. For this portable first slice, `vmaskmovdqu`
+requires the entire 16-byte destination `[rdi..rdi+15]` to be writable ordinary memory and
+touches only the bytes selected by `(mask[i] & 0x80) != 0` (never reading or writing
+unselected bytes). In a separate native `VirtualAlloc` + `PAGE_NOACCESS` / `PAGE_READONLY`
+page-edge observation, native `vmaskmovdqu` faulted whenever `k < 16` bytes lay in the
+writable page (even with all mask MSBs clear, and on `k = 15` could commit a writable 8-byte
+prefix before faulting); per Intel SDM, all-zero-mask faulting and partial-fault progress
+are implementation-dependent and outside this portable slice. Transport and ABI glue covers
+`vmovups`, `vmovaps`,
 `vmovdqu`, `vmovdqa`, `vzeroupper`, 64-bit `mov` and terminal `ret`. The translator
 rejects legacy SSE encodings (`movq`, `maskmovdqu`), EVEX encodings, FP arithmetic
 (`vaddsubps`, `vaddsubpd`), nonvolatile registers (`XMM6`..`15`, `YMM6`..`15`,
@@ -6127,11 +6130,13 @@ chained `vzeroupper` pipeline, and two dead-read fault-ordering controls
 when CPUID/XCR0 lacks AVX and otherwise verifies 134 cases across the 7 differential
 exports bit-for-bit against both the native MASM DLL and an independent Python reference
 model with 32-byte pre/post buffer guards across `dev` and `release` (`/O2`) builds,
-plus 68 native/lifted `VirtualAlloc` + `PAGE_NOACCESS` / `PAGE_READONLY` page-edge checks,
-dead-read fault ordering (`op_discarded_read`, `op_discarded_read64`), 3 `ALTER_OP`
+plus 12 native/lifted `k=16` page-abutting writable checks (full, zero, and sparse masks
+against `PAGE_NOACCESS` and `PAGE_READONLY` guard pages), 30 native-only `k<16` page-edge
+fault observations, dead-read fault ordering (`op_discarded_read`, `op_discarded_read64`), 3 `ALTER_OP`
 divergence controls (`14`, `12`, `30`), an output-mutation comparator control, 8
 alternate-encoding lift checks, 38 unit rejection controls (including the `RDI`-save
 definedness leak control), and 9 end-to-end PE-patched DLL rejection controls.
 
-Not covered by this experiment: non-temporal cache hints on `vmaskmovdqu`, control flow,
-nonvolatile `xmm6`..`xmm15` prologues, and title CPU code execution.
+Not covered by this experiment: non-temporal cache hints or implementation-dependent
+partial-page fault progress on `vmaskmovdqu`, control flow, nonvolatile `xmm6`..`xmm15`
+prologues, and title CPU code execution.

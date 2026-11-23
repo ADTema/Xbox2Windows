@@ -14,7 +14,11 @@ Supported AVX instructions (docs/coverage/x64_zen2.tsv group AVX):
     VEX_VMOVQ_RM64_XMM) covering all 5 operand shapes (xmm<-xmm, xmm<-m64,
     m64<-xmm, xmm<-r64, r64<-xmm)
   - Conditional byte store: vmaskmovdqu (VEX.128 xmm1, xmm2 to implicit [rdi],
-    requiring rdi save/restore via a volatile scratch GPR around mov rdi, r8)
+    requiring rdi save/restore via a volatile scratch GPR around mov rdi, r8).
+    Precondition for this portable slice: the entire 16-byte destination
+    [rdi..rdi+15] is writable ordinary memory; the lifted helper touches only
+    bytes whose mask MSB is set ((mask[i] & 0x80) != 0) and does not model
+    implementation-dependent partial-fault or all-zero-mask page-edge faults.
 
 Transport/ABI glue: vmovups, vmovaps, vmovdqu, vmovdqa (128/256-bit load, store
 and register copy), vzeroupper, 64-bit mov (volatile GPR <-> [base + disp],
@@ -189,14 +193,8 @@ static inline void op_vmaskmovdqu(word address, const Vec256& src, const Vec256&
     std::memcpy(src_bytes, src.q, 16);
     std::memcpy(mask_bytes, mask.q, 16);
     auto* dst = reinterpret_cast<volatile std::uint8_t*>(address);
-    // Native vmaskmovdqu faults if any byte of the 16-byte destination is outside
-    // writable memory (even when all mask MSBs are clear), leaving writable prefix
-    // bytes unmodified. Probe both 16-byte endpoints before any masked byte write.
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-    const std::uint8_t first = dst[0];
-    const std::uint8_t last = dst[15];
-    dst[0] = first;
-    dst[15] = last;
+    // Portable first slice: require [address..address+15] to be writable ordinary
+    // memory and touch only bytes selected by mask MSB ((mask[i] & 0x80) != 0).
     for (unsigned i = 0; i < 16u; ++i) {
         if ((mask_bytes[i] & 0x80u) != 0u) {
             std::atomic_signal_fence(std::memory_order_seq_cst);
