@@ -356,4 +356,111 @@ cwd_op PROC FRAME
     ret
 cwd_op ENDP
 
+; --- Mixed-producer SF regression cases ---
+
+xadd_sets PROC FRAME
+    .endprolog
+    xor eax, eax
+    mov rax, rcx
+    xadd rax, rdx
+    sets al
+    movzx eax, al
+    ret
+xadd_sets ENDP
+
+xadd_jl PROC FRAME
+    .endprolog
+    xor eax, eax
+    mov rax, rcx
+    xadd rax, rdx
+    jl short xadd_jl_taken
+    mov eax, 0
+    ret
+xadd_jl_taken:
+    mov eax, 1
+    ret
+xadd_jl ENDP
+
+cmpxchg_sets PROC FRAME
+    .endprolog
+    xor r9d, r9d
+    mov rax, rcx
+    mov r9, rdx
+    cmpxchg r9, r8
+    sets al
+    movzx eax, al
+    ret
+cmpxchg_sets ENDP
+
+shld_sets PROC FRAME
+    .endprolog
+    xor eax, eax
+    mov rax, rcx
+    mov rcx, r8
+    shld rax, rdx, cl
+    sets al
+    movzx eax, al
+    ret
+shld_sets ENDP
+
+shrd_sets PROC FRAME
+    .endprolog
+    xor eax, eax
+    mov rax, rcx
+    mov rcx, r8
+    shrd rax, rdx, cl
+    sets al
+    movzx eax, al
+    ret
+shrd_sets ENDP
+
+shld_c0_sets PROC FRAME
+    .endprolog
+    mov rax, -1
+    test rax, rax
+    mov rax, rcx
+    mov rcx, 0
+    shld rax, rdx, cl
+    sets al
+    movzx eax, al
+    ret
+shld_c0_sets ENDP
+
+andn_sets PROC FRAME
+    .endprolog
+    xor eax, eax
+    andn rax, rcx, rdx
+    sets al
+    movzx eax, al
+    ret
+andn_sets ENDP
+
+blsi_sets PROC FRAME
+    .endprolog
+    xor eax, eax
+    blsi rax, rcx
+    sets al
+    movzx eax, al
+    ret
+blsi_sets ENDP
+
+bzhi_sets PROC FRAME
+    .endprolog
+    xor eax, eax
+    bzhi rax, rcx, rdx
+    sets al
+    movzx eax, al
+    ret
+bzhi_sets ENDP
+
+popcnt_sets PROC FRAME
+    .endprolog
+    mov rax, -1
+    test rax, rax
+    popcnt rax, rcx
+    sets al
+    movzx eax, al
+    ret
+popcnt_sets ENDP
+
 END

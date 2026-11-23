@@ -19,7 +19,11 @@ CMOV_EXPORTS = tuple(f"cmov{s}{b}" for s in COND_SUFFIXES for b in (32, 64))
 SET_EXPORTS = tuple(f"set{s}_op" for s in COND_SUFFIXES)
 BRANCH_EXPORTS = tuple(f"j{s}_branch" for s in COND_SUFFIXES)
 NEG_EXPORTS = ("neg32", "neg64")
-ALL_EXPORTS = CMOV_EXPORTS + SET_EXPORTS + BRANCH_EXPORTS + NEG_EXPORTS + ("cwd_op",)
+MIXED_PRODUCER_2ARG = ("xadd_sets", "xadd_jl", "shld_c0_sets", "andn_sets", "bzhi_sets")
+MIXED_PRODUCER_3ARG = ("cmpxchg_sets", "shld_sets", "shrd_sets")
+MIXED_PRODUCER_1ARG = ("blsi_sets", "popcnt_sets")
+MIXED_EXPORTS = MIXED_PRODUCER_2ARG + MIXED_PRODUCER_3ARG + MIXED_PRODUCER_1ARG
+ALL_EXPORTS = CMOV_EXPORTS + SET_EXPORTS + BRANCH_EXPORTS + NEG_EXPORTS + ("cwd_op",) + MIXED_EXPORTS
 
 
 def emit(image, output):
@@ -49,6 +53,21 @@ def emit(image, output):
         body = region(pe, *bounds)
         code = lower(body, ["rcx = a;"], {}, {}, {})
         parts.append(f'extern "C" __declspec(dllexport) word cwd_op(word a) {{\n{code}\n}}\n')
+        for name in MIXED_PRODUCER_2ARG:
+            (bounds,) = function_ranges(pe, export_rva(pe, name))
+            body = region(pe, *bounds)
+            code = lower(body, ["rcx = a; rdx = b;"], {}, {}, {})
+            parts.append(f'extern "C" __declspec(dllexport) word {name}(word a, word b) {{\n{code}\n}}\n')
+        for name in MIXED_PRODUCER_3ARG:
+            (bounds,) = function_ranges(pe, export_rva(pe, name))
+            body = region(pe, *bounds)
+            code = lower(body, ["rcx = a; rdx = b; r8 = c;"], {}, {}, {})
+            parts.append(f'extern "C" __declspec(dllexport) word {name}(word a, word b, word c) {{\n{code}\n}}\n')
+        for name in MIXED_PRODUCER_1ARG:
+            (bounds,) = function_ranges(pe, export_rva(pe, name))
+            body = region(pe, *bounds)
+            code = lower(body, ["rcx = a;"], {}, {}, {})
+            parts.append(f'extern "C" __declspec(dllexport) word {name}(word a) {{\n{code}\n}}\n')
     output.write_text("".join(parts), encoding="ascii")
 
 
@@ -67,6 +86,15 @@ def load_lib(path):
         fn = getattr(lib, name)
         fn.argtypes, fn.restype = [U64, ctypes.POINTER(U64)], U64
     lib.cwd_op.argtypes, lib.cwd_op.restype = [U64], U64
+    for name in MIXED_PRODUCER_2ARG:
+        fn = getattr(lib, name)
+        fn.argtypes, fn.restype = [U64, U64], U64
+    for name in MIXED_PRODUCER_3ARG:
+        fn = getattr(lib, name)
+        fn.argtypes, fn.restype = [U64, U64, U64], U64
+    for name in MIXED_PRODUCER_1ARG:
+        fn = getattr(lib, name)
+        fn.argtypes, fn.restype = [U64], U64
     return lib
 
 
@@ -201,7 +229,125 @@ def check(native_path, lifted_path):
                 raise AssertionError(f"{label} cwd_op({a:#x}) = {got:#x}, expected {want:#x}")
         cases += 1
 
-    print(f"{cases} signed condition and flag-op cases (CMOVcc, SETcc, Jcc, NEG, CWD) matched native and translated DLLs")
+    # 6. Mixed-producer regression cases (SF updated or preserved across producers)
+    # xadd_sets & xadd_jl
+    for a in vals:
+        for b in vals:
+            sum_v = (a + b) & 0xffffffffffffffff
+            sf = (sum_v >> 63) & 1
+            of = ((~(a ^ b) & (a ^ sum_v)) >> 63) & 1
+            want_sets = sf
+            want_jl = 1 if sf != of else 0
+            for lib, label in both:
+                got = lib.xadd_sets(a, b)
+                if got != want_sets:
+                    raise AssertionError(f"{label} xadd_sets({a:#x}, {b:#x}) = {got:#x}, expected {want_sets:#x}")
+                got = lib.xadd_jl(a, b)
+                if got != want_jl:
+                    raise AssertionError(f"{label} xadd_jl({a:#x}, {b:#x}) = {got:#x}, expected {want_jl:#x}")
+            cases += 2
+
+    # cmpxchg_sets
+    for a in vals:
+        for b in vals:
+            diff = (a - b) & 0xffffffffffffffff
+            want = (diff >> 63) & 1
+            for lib, label in both:
+                got = lib.cmpxchg_sets(a, b, 0)
+                if got != want:
+                    raise AssertionError(f"{label} cmpxchg_sets({a:#x}, {b:#x}) = {got:#x}, expected {want:#x}")
+            cases += 1
+
+    # shld_sets & shrd_sets
+    for a, b, c in (
+        (0x4000000000000000, 0, 1),
+        (0x4000000000000000, 0, 2),
+        (0x8000000000000000, 0, 0),
+        (0, 0x8000000000000000, 1),
+        (0, 1, 63),
+    ):
+        cnt = c & 0x3f
+        if cnt != 0:
+            shld_res = ((a << cnt) | (b >> (64 - cnt))) & 0xffffffffffffffff
+            want_shld = (shld_res >> 63) & 1
+        else:
+            want_shld = 0  # prior SF was 0
+        for lib, label in both:
+            got = lib.shld_sets(a, b, c)
+            if got != want_shld:
+                raise AssertionError(f"{label} shld_sets({a:#x}, {b:#x}, {c}) = {got:#x}, expected {want_shld:#x}")
+        cases += 1
+
+    for a, b, c in (
+        (0, 1, 1),
+        (0, 0, 1),
+        (0x8000000000000000, 0, 1),
+        (0x0000000000000001, 0, 1),
+    ):
+        cnt = c & 0x3f
+        if cnt != 0:
+            shrd_res = ((a >> cnt) | (b << (64 - cnt))) & 0xffffffffffffffff
+            want_shrd = (shrd_res >> 63) & 1
+        else:
+            want_shrd = 0
+        for lib, label in both:
+            got = lib.shrd_sets(a, b, c)
+            if got != want_shrd:
+                raise AssertionError(f"{label} shrd_sets({a:#x}, {b:#x}, {c}) = {got:#x}, expected {want_shrd:#x}")
+        cases += 1
+
+    # shld_c0_sets (count 0 preserves prior SF = 1)
+    for a, b in ((0, 0), (1, 2), (0x7fffffffffffffff, 0x8000000000000000)):
+        want = 1
+        for lib, label in both:
+            got = lib.shld_c0_sets(a, b)
+            if got != want:
+                raise AssertionError(f"{label} shld_c0_sets({a:#x}, {b:#x}) = {got:#x}, expected {want:#x}")
+        cases += 1
+
+    # andn_sets
+    for a in vals:
+        for b in (0, 1, 0x8000000000000000, 0xffffffffffffffff):
+            res = ((~a) & b) & 0xffffffffffffffff
+            want = (res >> 63) & 1
+            for lib, label in both:
+                got = lib.andn_sets(a, b)
+                if got != want:
+                    raise AssertionError(f"{label} andn_sets({a:#x}, {b:#x}) = {got:#x}, expected {want:#x}")
+            cases += 1
+
+    # blsi_sets
+    for a in vals:
+        res = ((0 - a) & a) & 0xffffffffffffffff
+        want = (res >> 63) & 1
+        for lib, label in both:
+            got = lib.blsi_sets(a)
+            if got != want:
+                raise AssertionError(f"{label} blsi_sets({a:#x}) = {got:#x}, expected {want:#x}")
+        cases += 1
+
+    # bzhi_sets
+    for a in (0, 1, 0x7fffffffffffffff, 0x8000000000000000, 0xffffffffffffffff):
+        for b in (0, 1, 63, 64, 65):
+            idx = b & 0xff
+            res = a if idx >= 64 else (a & ((1 << idx) - 1))
+            want = (res >> 63) & 1
+            for lib, label in both:
+                got = lib.bzhi_sets(a, b)
+                if got != want:
+                    raise AssertionError(f"{label} bzhi_sets({a:#x}, {b}) = {got:#x}, expected {want:#x}")
+            cases += 1
+
+    # popcnt_sets (POPCNT unconditionally clears SF to 0, despite prior SF = 1)
+    for a in vals:
+        want = 0
+        for lib, label in both:
+            got = lib.popcnt_sets(a)
+            if got != want:
+                raise AssertionError(f"{label} popcnt_sets({a:#x}) = {got:#x}, expected {want:#x}")
+        cases += 1
+
+    print(f"{cases} signed condition and flag-op cases (CMOVcc, SETcc, Jcc, NEG, CWD, mixed producers) matched native and translated DLLs")
 
 
 def check_negative_controls():

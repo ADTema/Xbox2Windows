@@ -34,3 +34,13 @@ EXPORTS
     neg32
     neg64
     cwd_op
+    xadd_sets
+    xadd_jl
+    cmpxchg_sets
+    shld_sets
+    shrd_sets
+    shld_c0_sets
+    andn_sets
+    blsi_sets
+    bzhi_sets
+    popcnt_sets
