@@ -4046,6 +4046,23 @@ ctest --preset dev --no-tests=error -R '^cpu_native_transfer_mem$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_transfer_mem$' -V
 ```
 
+### DirectStorage factory and queue adapter
+
+This fixture exercises the console DirectStorage initialization sequence. The source-built caller ([`dstorage_caller.asm`](../tests/cpu/dstorage_caller.asm)) imports `DStorageGetFactory` by name from `xcrdapi.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled adapter provider ([`dstorage_provider.cpp`](../tests/cpu/dstorage_provider.cpp)), it verifies the factory interface, staging buffer configuration, queue creation, and submission behaviors:
+
+- **Case 1 (Success path reaches submit)**: `DStorageGetFactory` queries the console factory interface `IDStorageFactoryX` (`{62959d11-d45f-4884-a0a3-f7862ea243ae}`), configures a 32 MiB staging buffer via `SetStagingBufferSize(0x2000000)` (vtable slot 8), creates a console queue with descriptor `DSTORAGE_QUEUE_DESC` via `CreateQueue` (vtable slot 10) under `IDStorageQueueX` (`{3c02cb0c-c050-4195-99a1-a1ce94ba33c5}`), enqueues a request, verifies the delayed-submit negative control, explicitly submits via `Submit()` (vtable slot 6), releases objects, and exits with code `0x870`.
+- **Case 2 (Factory failure refusal)**: When factory acquisition fails or is refused, the sequence aborts with exit code `0x301` leaving queues uncreated.
+- **Case 3 (Queue failure refusal)**: When queue creation fails, the sequence aborts with exit code `0x303` with staging buffer configuration preserved.
+- **Delayed-submit negative control**: Confirms that staged requests below the queue's half-capacity threshold remain pending and completion is not signaled prior to explicit `Submit()`. Calling `Submit()` completes the staged request and sets completion.
+- **Changed-IID patch control**: Patching the requested factory interface in the caller binary causes `DStorageGetFactory` to fail with `E_NOINTERFACE`, exiting with `0x301` under both loaders.
+
+On success, the caller exits with `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process cleanly with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return across all cases. An independent negative control confirms that withholding `DStorageGetFactory` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_dstorage$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_dstorage$' -V
+```
+
 ### Grouped allocation descriptor builders
 
 In the inspected Bink image, the function interval beginning at RVA `0x67c0` contains direct calls to the group initializer (`0x25b80`), append helper (`0x25b20`) and grouped allocator (`0x25a40`). The initializer places two adjacent arrays after a 64-byte header. Each successful append records a destination and a padded stride. With five available slots, requests of 0, 33, 1, 1025 and 32 bytes produced strides of 32, 64, 128, 1280 and 512 bytes in order. The stride in 32-byte units is congruent to the previous total in units plus one, modulo 32. All five stored strides were even. These helpers do not establish who produces odd tagged entries.
