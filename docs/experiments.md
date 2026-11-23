@@ -3404,6 +3404,23 @@ This covers only the two root-signature imports observed in the pre-executable D
 | `d3d12_xs_shim_deserialize` | Round-trips a sanitized blob from `d3d12_xs.dll` and reads the embedded `RTS0` part of `pso_compute_embedded`; rejects `pso_compute_stripped` and empty/null buffers with `E_INVALIDARG`. |
 | `d3d12_xs_shim_warp_root` | Serializes a v1.1 `SRV(t0),UAV(u0),RootConstants(16,b0)` descriptor tagged with `0x03000000` through `d3d12_xs.dll` (verified rejected by desktop `d3d12.dll`), creates a WARP `ID3D12RootSignature`, and builds a compute PSO with `pso_compute_stripped`. |
 
+#### D3D12ConfigureVirtualMemoryX call shape (#874)
+
+The main executable imports `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` and calls it once, before the D3D12 device is created. A static read of the call site shows:
+- one pointer argument to a 32-byte block, zero-filled except for the DWORD at `+4`, which holds 3 or 4;
+- the HRESULT checked with `SUCCEEDED`;
+- two `XMemVirtualAlloc(NULL, size, 0x20402000, …)` reservations afterwards, whatever the result was. `size` is 16 GiB for the sample 3 and 24 GiB for 4.
+
+The meaning of the DWORD, the purpose of the other 28 bytes and the effect the call must have are open. `d3d12_xs.dll` therefore does not export it yet.
+
+`tests/cpu/configure_vm.asm` reproduces that call shape in two source-built EXEs, one per sample. It surrounds the block with canaries and returns the configuration HRESULT if the call fails. Recording stand-ins named `d3d12_xs.dll` and `xmem.dll` (`tests/cpu/configure_vm_recorder.cpp`, in the build's `configure_vm` directory) only log each call and return a chosen HRESULT.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `cpu_native_configure_vm` | Each EXE imports exactly `D3D12ConfigureVirtualMemoryX` and `XMemVirtualAlloc` by name. With either stand-in missing, `pe_map` stops at that import before the entry point. Under the Windows loader and `pe_map`, both EXEs log the same three calls in order: the 32-byte snapshot, then both reservations with their size, type and the two remaining argument words. A success returns 0. A stand-in failure (`0x8007000E`) reaches the exit code unchanged after both reservations. A stand-in write inside or after the block exits with 1 or 2. |
+
+Run `ctest --preset dev --no-tests=error -R '^cpu_native_configure_vm$' -V`.
+
 ### Attribute words at xmem call sites
 
 `tools/xmem_attribute_scan.py` reads a PE image without loading or running it. It reports the attribute word at each call or tail jump into `xmem.dll`'s `XMemAlloc` or `XMemFree`, from a normal or delay-load import. It finds sites reached through the IAT slot, through an import thunk, or through a register loaded from the slot.

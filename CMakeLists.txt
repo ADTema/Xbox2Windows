@@ -2580,6 +2580,28 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>")
     set_tests_properties(cpu_native_shim_startup PROPERTIES TIMEOUT 100
         ENVIRONMENT "X2W_SHIM_COMPUTE_CASE=;X2W_SHIM_DRAW_CASE=")
+    # Recording stand-ins for the main executable's D3D12ConfigureVirtualMemoryX call (#874).
+    # They keep the d3d12_xs.dll and xmem.dll names in their own directory, next to the fixture EXEs.
+    set(configure_vm_dir "${CMAKE_CURRENT_BINARY_DIR}/configure_vm")
+    foreach(provider IN ITEMS d3d12_xs xmem)
+        add_library(cpu_configure_vm_${provider} SHARED tests/cpu/configure_vm_recorder.cpp
+            tests/cpu/configure_vm_${provider}.def)
+        set_target_properties(cpu_configure_vm_${provider} PROPERTIES OUTPUT_NAME ${provider}
+            MSVC_RUNTIME_LIBRARY MultiThreaded
+            RUNTIME_OUTPUT_DIRECTORY "${configure_vm_dir}" ARCHIVE_OUTPUT_DIRECTORY "${configure_vm_dir}")
+    endforeach()
+    foreach(sample IN ITEMS 3 4)
+        add_executable(cpu_configure_vm_${sample} tests/cpu/configure_vm.asm)
+        target_compile_definitions(cpu_configure_vm_${sample} PRIVATE SAMPLE=${sample})
+        set_target_properties(cpu_configure_vm_${sample} PROPERTIES LINKER_LANGUAGE CXX
+            RUNTIME_OUTPUT_DIRECTORY "${configure_vm_dir}")
+        target_link_options(cpu_configure_vm_${sample} PRIVATE
+            /ENTRY:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(cpu_configure_vm_${sample} PRIVATE cpu_configure_vm_d3d12_xs cpu_configure_vm_xmem)
+    endforeach()
+    add_test(NAME cpu_native_configure_vm COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/configure_vm_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_configure_vm_3>" "$<TARGET_FILE:cpu_configure_vm_4>")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME cpu_shim_compute_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_compute_check.py"
