@@ -2189,6 +2189,10 @@ and `ds_xor_b32` update the same initialized word in place at offset 0.
 Addition and subtraction wrap modulo 2^32, with subtraction taking the
 old word minus the VGPR value. Each lane has exclusive use of its own word,
 so the updates can use per-invocation arithmetic in HLSL.
+The corresponding `ds_add_rtn_u32`, `ds_sub_rtn_u32`, `ds_and_rtn_b32`,
+`ds_or_rtn_b32` and `ds_xor_rtn_b32` forms also copy the word's value before
+the update into the destination VGPR. They capture the inputs before writing
+that destination, which may overlap the address or data VGPR.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The source-built wave32 fixture reads the full word and both halves after
@@ -2211,6 +2215,12 @@ updates with different operands. The inputs cover wraparound, underflow and
 high-bit operands. Each variant compares all 320 UAV words after one-group
 and three-group dispatches. Replacing the first update with a full-word
 write must mismatch at word 1.
+
+For each returning update, the first destination overlaps the data VGPR and
+the second overlaps the address VGPR. Both returned values and the final LDS
+word are compared across the entire UAV for one and three groups. Returning
+the updated word from the first operation must mismatch at word 0. Omitting
+the second update while preserving its return value must mismatch at word 2.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check

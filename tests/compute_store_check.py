@@ -1215,6 +1215,36 @@ def lds_update_reference(op, groups):
     return words
 
 
+LDS_RETURN_UPDATES = {
+    "ds_add_rtn_u32": "ds_add_u32",
+    "ds_sub_rtn_u32": "ds_sub_u32",
+    "ds_and_rtn_b32": "ds_and_b32",
+    "ds_or_rtn_b32": "ds_or_b32",
+    "ds_xor_rtn_b32": "ds_xor_b32",
+}
+
+
+def lds_return_update_program(op):
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_lshlrev_b32_e32 v11, 2, v0",
+        "v_mad_u32_u24 v6, 1, v8, 0xfffffff0",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        # First alias the data VGPR, then alias a copy of the address VGPR.
+        "v_mad_u32_u24 v10, 1, v8, 0x40000021",
+        f"{op} v10, v5, v10",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mad_u32_u24 v9, 1, v8, 0x80000003",
+        f"{op} v11, v11, v9",
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v12, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
 LDS_PROGRAM = DS_PREFIX + [
     "v_lshlrev_b32_e32 v5, 2, v0",
     "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
@@ -1292,7 +1322,9 @@ LDS_OVERLAP_PROGRAM = DS_PREFIX + [
 LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING),
              ("lds_overlap", LDS_OVERLAP_PROGRAM, LDS_BINDING)] + [
     (name, lds_subword_program(*layout), LDS_BINDING) for name, layout in LDS_SUBWORDS.items()
-] + [(op, lds_update_program(op), LDS_BINDING) for op in LDS_UPDATES]
+] + [(op, lds_update_program(op), LDS_BINDING) for op in LDS_UPDATES] + [
+    (op, lds_return_update_program(op), LDS_BINDING) for op in LDS_RETURN_UPDATES
+]
 
 
 def lds_subword_reference(width, offset, groups):
@@ -1382,7 +1414,7 @@ def lds_controls():
         ("ds_add_u32 v5, v254", "Unverified private LDS update"),
         ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
         ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
-        ("ds_add_rtn_u32 v10, v5, v6", "Unsupported compute instruction"),
+        ("ds_rsub_rtn_u32 v10, v5, v6", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
     i = lines.index(update)
@@ -1393,6 +1425,32 @@ def lds_controls():
     pair = [update, "s_waitcnt lgkmcnt(0)"]
     rejects("LDS expression exceeds the profile limit", aot.lower,
             lines[:i] + pair * 32 + lines[i:], 32, **LDS_BINDING)
+
+
+    update = "ds_add_rtn_u32 v10, v5, v10"
+    lines = lds_return_update_program("ds_add_rtn_u32")
+    expected = aot.lower(lines, 32, **LDS_BINDING)
+    assert aot.lower(variant(lines, (update, update + " offset:0")), 32, **LDS_BINDING) == expected
+    no_init = variant(lines, ("ds_write_b32 v5, v6", "s_nop 0"))
+    rejects("Unverified private LDS update", aot.lower, no_init, 32, **LDS_BINDING)
+    for bad, message in (
+        ("ds_add_rtn_u32 v256, v5, v10", "Unverified private LDS update"),
+        ("ds_add_rtn_u32 v10, v8, v10", "Unverified private LDS update"),
+        ("ds_add_rtn_u32 v10, v5, v254", "Unverified private LDS update"),
+        ("ds_add_rtn_u32 v10, v5, v10 offset:4", "Unsupported compute instruction"),
+        ("ds_add_rtn_u32 v10, v5, v10 gds", "Unsupported compute instruction"),
+        ("ds_add_rtn_u32 v5, v10", "Unsupported compute instruction"),
+        ("ds_add_u32 v10, v5, v10", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
+    # The result in v11 replaces its address tag.
+    rejects("Unverified private LDS read", aot.lower,
+            variant(lines, ("ds_read_b32 v12, v5", "ds_read_b32 v12, v11")), 32, **LDS_BINDING)
+    i = lines.index(update)
+    masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+    rejects("Unverified private LDS update", aot.lower, masked, 32, **LDS_BINDING)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
 def ds_binary(directory, assembler, objcopy, library):
@@ -1421,6 +1479,13 @@ def ds_mutants(name, lines, binding, source):
     if name in LDS_UPDATES:
         changed = variant(lines, (f"{name} v5, v6", "ds_write_b32 v5, v6"))
         yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_RETURN_UPDATES:
+        op = LDS_RETURN_UPDATES[name]
+        return_new = f"{op} v5, v10\ns_waitcnt lgkmcnt(0)\nds_read_b32 v10, v5"
+        changed = variant(lines, (f"{name} v10, v5, v10", return_new))
+        yield aot.lower(changed, 32, **binding), 0
+        changed = variant(lines, (f"{name} v11, v11, v9", "ds_read_b32 v11, v11"))
+        yield aot.lower(changed, 32, **binding), 2
     elif name in LDS_SUBWORDS:
         width, offset = LDS_SUBWORDS[name]
         suffix = f" offset:{offset}" if offset else ""
@@ -1455,8 +1520,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
         for groups in (1, 3):
-            if name in LDS_UPDATES:
-                words = lds_update_reference(name, groups)
+            if name in LDS_UPDATES or name in LDS_RETURN_UPDATES:
+                words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
             elif name in LDS_SUBWORDS:
                 words = lds_subword_reference(*LDS_SUBWORDS[name], groups)
             elif name == "lds_overlap":
