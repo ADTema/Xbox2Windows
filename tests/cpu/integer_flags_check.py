@@ -594,6 +594,15 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
         else:
             raise AssertionError(f"{label}: translator unexpectedly accepted rejected control")
 
+    bound_writer = list(Decoder(64, bytes.fromhex("83c0019fc3"), ip=0x1000))
+    try:
+        lower(bound_writer, ["rax = 0xf;"], {}, {}, {}, host_ops={0x1000: ";"})
+    except ValueError as exc:
+        if "host binding at 0x1000" not in str(exc):
+            raise AssertionError(f"wrong diagnostic for replaced LAHF flag writer: {exc}") from exc
+    else:
+        raise AssertionError("LAHF accepted the flags from a replaced ADD")
+
     # End-to-end PE patching controls on a copy of the built native DLL.
     pe_bytes = original_path.read_bytes()
     with pefile.PE(data=pe_bytes, fast_load=True) as pe:

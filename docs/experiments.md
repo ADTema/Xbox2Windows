@@ -6434,8 +6434,8 @@ independent Python reference model with 32-byte pre/post buffer guards across `d
 `op_sub32_imm_lahf`: `30`, `op_cmp64_imm_lahf`: `26`), 6 mutated-C++ controls (`ctrl_af_bit4`:
 `7`, `ctrl_pf_full_width`: `9`, `ctrl_lahf_bit1_cleared`: `30`, `ctrl_lahf_clobber_rax`:
 `30`, `ctrl_lahf_keep_old_ah`: `22`, `ctrl_lahf_clobber_flags`: `30`), an output-mutation
-control, 4 alternate-encoding lift checks, 38 unit rejection controls, and 11 end-to-end
-PE-patched DLL rejection controls.
+control, 4 alternate-encoding lift checks, 38 unit rejection controls, one rejected host
+binding that replaces the flag writer, and 11 end-to-end PE-patched DLL rejection controls.
 
 Not covered by this experiment: `sahf`, `inc`/`dec`/`neg`/`adc`/`sbb`, `pushf`/`popf`/
 `pushfq`/`popfq`, cross-block flag flow into `lahf`, and title CPU code execution.

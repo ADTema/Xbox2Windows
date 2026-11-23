@@ -387,11 +387,12 @@ LAHF_FLAGS = F.SF | F.ZF | F.AF | F.PF | F.CF
 LAHF_WRITERS = frozenset({M.ADD, M.SUB, M.CMP})
 
 
-def lahf_sources(body):
+def lahf_sources(body, host_ops):
     """The ips of the instructions whose flags a LAHF of body reads. Each LAHF must follow, in the same
     straight-line block, a register ADD, SUB or CMP (register or immediate source) that is the last writer of
     any status flag before it. A function entry, a branch target, a branch, a call or any other flag writer
-    between the two is refused, so every flag LAHF reads is defined by that writer at the use."""
+    between the two is refused, so every flag LAHF reads is defined by that writer at the use. Host
+    bindings replace instructions with opaque emitted code and cannot establish a flag source."""
     if not any(i.mnemonic == M.LAHF for i in body):
         return set()
     targets = {i.near_branch_target for i in body
@@ -399,7 +400,7 @@ def lahf_sources(body):
     indirect = any(i.flow_control == FlowControl.INDIRECT_BRANCH for i in body)
     sources = set()
     for k, i in enumerate(body):
-        if i.mnemonic != M.LAHF:
+        if i.mnemonic != M.LAHF or i.ip in host_ops:
             continue
         where = f"unsupported query operation at {i.ip:#x}: {i}"
         if indirect:
@@ -410,6 +411,8 @@ def lahf_sources(body):
             prev = body[j]
             if prev.next_ip != body[j + 1].ip:
                 raise ValueError(f"{where} after a gap in the function body at {prev.ip:#x}")
+            if prev.ip in host_ops:
+                raise ValueError(f"{where} reads flags across a host binding at {prev.ip:#x}")
             if prev.flow_control != FlowControl.NEXT:
                 raise ValueError(f"{where} reads flags across {prev} at {prev.ip:#x}")
             if prev.rflags_modified & LAHF_FLAGS:
@@ -445,7 +448,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
     if parity:
         lines[2] = "bool zero=false, carry=false, overflow=false, sign=false, parity=false;"
     # A register ADD, SUB or CMP that a LAHF reads also assigns AF and PF (lahf_sources).
-    lahf_from = lahf_sources(body)
+    lahf_from = lahf_sources(body, host_ops or {})
     if lahf_from:
         lines[2] = lines[2][:-1] + ("" if parity else ", parity=false") + ", aux=false;"
     # FNSTSW is the only reader of the x87 status word (x87_lower.statement).
