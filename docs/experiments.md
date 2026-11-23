@@ -2319,6 +2319,19 @@ the old word to the destination VGPR. The fixtures compare old and new words
 and exercise successful and unsuccessful comparisons. Reversing the comparison
 operands, masking the OR operand or omitting the exchange must mismatch at word 1.
 
+The private LDS f32 profile requires `--lds-f32-mode normal-rne` as a
+caller guarantee that interpreted operands and results are normal binary32
+or positive zero and that the native arithmetic uses round-to-nearest-even.
+It lowers add, returning add, min, max and compare-and-store at byte offset
+zero. Each add emits a separate `precise float` operation. Min/max copy the
+selected word and compare-and-store copies the replacement on equality.
+The fixture uses exact results for normal inputs. NaNs, signed zero and
+subnormal arithmetic require a separate profile.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_f32_(warp|hardware)$' -V
+```
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must

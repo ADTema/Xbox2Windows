@@ -117,7 +117,7 @@ def labelled(decoded):
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
-          source_stride=None, cpu="gfx1013", lds_bytes=0):
+          source_stride=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
@@ -428,6 +428,36 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 vector[regs[0]] = lds_word
             lds_word = new_word
             ds_wait = True
+        elif m := re.fullmatch(r"ds_(add|add_rtn|min|max|cmpst)_f32 (v\d+(?:, v\d+){1,2})(?: offset:0)?", line):
+            op = m[1]
+            regs = [int(reg[1:]) for reg in m[2].split(", ")]
+            if lds_f32_mode != "normal-rne":
+                raise ValueError("Unverified private LDS floating-point mode")
+            expected = 3 if op in ("add_rtn", "cmpst") else 2
+            if len(regs) != expected:
+                raise ValueError("Unverified private LDS floating-point operands")
+            addr, data = regs[1:] if op == "add_rtn" else regs[:2]
+            value = vector.get(data)
+            replacement = vector.get(regs[-1]) if op == "cmpst" else value
+            if (guard_span is not None or max(regs) > 255 or vector.get(addr) != ("lds_address",)
+                    or not all(map(is_word, (lds_word, value, replacement)))):
+                raise ValueError("Unverified private LDS floating-point access")
+            old, src = map(hlsl_word, (lds_word, value))
+            if op.startswith("add"):
+                if len(ds_steps) >= 64:
+                    raise ValueError("Too many private LDS floating-point steps")
+                name = f"ds_f32_{len(ds_steps)}"
+                ds_steps.append((None, f"    precise float {name} = asfloat({old}) + asfloat({src});"))
+                expression = f"asuint({name})"
+                if op == "add_rtn":
+                    vector[regs[0]] = lds_word
+            else:
+                condition = {"min": "<", "max": ">", "cmpst": "=="}[op]
+                expression = f"((asfloat({src}) {condition} asfloat({old})) ? {hlsl_word(replacement)} : {old})"
+                if len(expression) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("LDS expression exceeds the profile limit")
+            lds_word = ("alu", expression)
+            ds_wait = True
         elif m := re.fullmatch(r"ds_write_b(8|16|32) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
             width, addr, src = map(int, m.groups()[:3])
             offset = int(m[4] or 0)
@@ -695,9 +725,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
     local = ""
     if ds_steps:
-        cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot, _ in ds_steps)
+        shared = [slot for slot, _ in ds_steps if slot is not None]
+        cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot in shared)
         body = "\n".join([*(step for _, step in ds_steps), body])
-        local = ", uint3 local : SV_GroupThreadID"
+        if shared:
+            local = ", uint3 local : SV_GroupThreadID"
     return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 
@@ -708,6 +740,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--llvm", required=True)
     parser.add_argument("--cpu", choices=("gfx1013", "gfx1030"), default="gfx1013")
+    parser.add_argument("--lds-f32-mode", choices=("normal-rne",),
+                        help="Private LDS f32 inputs and outputs are normal or +0, with round-to-nearest-even")
     parser.add_argument("--lds-bytes", type=int, default=0, help="Known native group LDS allocation")
     parser.add_argument("--table-reg", type=int, required=True)
     parser.add_argument("--descriptor-offset", type=lambda n: int(n, 0), required=True)
@@ -732,7 +766,8 @@ def main():
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
-                   source_stride=args.source_stride, cpu=args.cpu, lds_bytes=args.lds_bytes)
+                   source_stride=args.source_stride, cpu=args.cpu, lds_bytes=args.lds_bytes,
+                   lds_f32_mode=args.lds_f32_mode)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
