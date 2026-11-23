@@ -395,7 +395,7 @@ def check_container_selector(directory: Path, code: bytes, library: str | None =
         summary = json.loads(result.stdout)
         assert summary["container_sha256"] == digest
         assert summary["native_sha256"] == hashlib.sha256(code).hexdigest()
-        assert summary["rt0_write_mask"] == 0xF
+        assert "rt0_write_mask" not in summary
         assert output.read_text(encoding="utf-8") == lower(assembly(False), 20, 24, [1, 2, 3, 4])
     wrong = subprocess.run([*command, "--container-sha256", "0" * 64], capture_output=True, text=True)
     assert wrong.returncode == 1 and "No record matches the name and container SHA-256" in wrong.stderr
@@ -11298,17 +11298,25 @@ def check_cli_partial_export(directory, assembler, objcopy, library):
     archive = directory / "partial.rpf"
     archive.write_bytes(envelope(assembled("\n".join(program) + "\n")))
     output = directory / "partial.hlsl"
-    result = subprocess.run(
-        [sys.executable, "-B", str(Path(pixel_aot.__file__)), str(archive), "fixture",
-         "--llvm", library, "--texture-sgpr", "20", "--interp-sgpr", "24",
-         "--sampler-words", "1", "2", "3", "4", "--constant-descriptor", "64",
-         "--output", str(output)],
-        check=True, capture_output=True, text=True)
+    cmd = [sys.executable, "-B", str(Path(pixel_aot.__file__)), str(archive), "fixture",
+           "--llvm", library, "--texture-sgpr", "20", "--interp-sgpr", "24",
+           "--sampler-words", "1", "2", "3", "4", "--constant-descriptor", "64",
+           "--output", str(output)]
+    refused = subprocess.run(cmd, capture_output=True, text=True)
+    assert refused.returncode == 1 and "requires an explicit RT0 write mask" in refused.stderr, refused
+    assert not output.exists()
+    result = subprocess.run([*cmd, "--rt0-write-mask"], check=True, capture_output=True, text=True)
     summary = json.loads(result.stdout)
     expected, mask = translate_masked(program)
     assert mask == 0x5
     assert summary["rt0_write_mask"] == mask
     assert output.read_text(encoding="utf-8") == expected
+
+    output.unlink()
+    archive.write_bytes(envelope(assembled("\n".join(assembly(False)) + "\n")))
+    compressed = subprocess.run([*cmd, "--rt0-write-mask"], capture_output=True, text=True)
+    assert compressed.returncode == 1 and "only supports uncompressed exports" in compressed.stderr, compressed
+    assert not output.exists()
 
 
 def check_f16_cvt_int16_binary(directory, assembler, objcopy, library):
