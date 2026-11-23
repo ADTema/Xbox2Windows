@@ -3574,6 +3574,23 @@ The meaning of the DWORD, the purpose of the other 28 bytes and the effect the c
 
 Run `ctest --preset dev --no-tests=error -R '^cpu_native_configure_vm$' -V`.
 
+#### CPU/GPU range translation against a desktop D3D12 heap (#874)
+
+A static read of the main executable shows that, after device creation, it keeps the first reservation as a CPU range A and the second as a range B of the same size. It translates by offset: `gpu = cpu - A + B`, and a GPU address inside `[B, B + size)` maps back to `gpu - B + A`. Other addresses pass through unchanged. One helper applies the reverse direction to an `ID3D12Resource`'s GPU virtual address. Without a device, the executable releases both reservations and uses one range for A and B.
+
+`tests/vm_translation_check.cpp` mirrors both helpers against desktop D3D12. On the device path, a committed 64 MiB `VirtualAlloc` range is opened with `ID3D12Device3::OpenExistingHeapFromAddress`, and one cross-adapter buffer is placed over all of it. That buffer's GPU virtual address is used as B. The compute shader (`tests/vm_translation.hlsl`) receives only root UAV addresses.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `vm_translation_shared_range` | No device. A and B are one range, so both directions are the identity inside it, and addresses just outside pass through. |
+| `vm_translation_device_warp`, `vm_translation_device_hardware` | A reserve-only range and an address inside the allocation both fail to open as a heap. A dispatch addressed by `p - A + B` reads 1,024 CPU-written words and writes 1,024 words the CPU reads back. A second buffer placed at `+0x200000` reports GPU address `B + 0x200000`. That address translates to `A + 0x200000`, and GPU writes through it are visible there. An unrelated committed buffer's GPU address lies outside `[B, B + size)` and passes through. A B shifted by 64 KiB misses all 1,024 destination words. Skips (77) without the adapter or `ID3D12Device3`. |
+
+On Windows 10 19045 with D3D12 10.0.19041.7291, both device cases passed on in-box WARP 10.0.19041.7811 and on an RTX 3080 Ti (driver 32.0.16.1047). The second placed buffer's address following `B + offset` is observed on these adapters; D3D12 does not document it for placed resources.
+
+Because reserve-only ranges and addresses inside an allocation cannot be opened, this layout needs all of A committed and wrapped once. A 16 or 24 GiB range would be committed in full, and separately opened pieces would each get their own GPU base. The `D3D12ConfigureVirtualMemoryX` shim remains unimplemented.
+
+Run `ctest --preset dev --no-tests=error -R '^vm_translation_' -V`.
+
 ### Attribute words at xmem call sites
 
 `tools/xmem_attribute_scan.py` reads a PE image without loading or running it. It reports the attribute word at each call or tail jump into `xmem.dll`'s `XMemAlloc` or `XMemFree`, from a normal or delay-load import. It finds sites reached through the IAT slot, through an import thunk, or through a register loaded from the slot.

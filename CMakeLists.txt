@@ -369,6 +369,21 @@ target_compile_features(d3d12_xs_shim_check PRIVATE cxx_std_17)
 foreach(scenario IN ITEMS exports serialize deserialize warp_root)
     add_test(NAME d3d12_xs_shim_${scenario} COMMAND d3d12_xs_shim_check ${scenario})
 endforeach()
+# The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
+set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
+add_custom_command(OUTPUT "${vm_translation_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main -Vn vm_translation_cs -Fh "${vm_translation_header}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/vm_translation.hlsl"
+    DEPENDS tests/vm_translation.hlsl VERBATIM)
+add_executable(vm_translation_check tests/vm_translation_check.cpp "${vm_translation_header}")
+target_include_directories(vm_translation_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" tests)
+target_compile_features(vm_translation_check PRIVATE cxx_std_17)
+target_link_libraries(vm_translation_check PRIVATE d3d12 dxgi)
+add_test(NAME vm_translation_shared_range COMMAND vm_translation_check shared_range)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME vm_translation_device_${adapter} COMMAND vm_translation_check device_${adapter})
+    set_tests_properties(vm_translation_device_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+endforeach()
 foreach(adapter IN ITEMS hardware warp)
     add_test(NAME offscreen_${adapter} COMMAND offscreen_check ${adapter} triangle_${adapter}.bmp)
     add_test(NAME ffx_provider_loop_${adapter} COMMAND offscreen_check ${adapter} --ffx-provider-loop)
