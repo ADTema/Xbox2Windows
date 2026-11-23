@@ -15,6 +15,21 @@ import struct
 import sys
 
 # Register decode helpers
+
+# Source operand codes that name hardware values rather than SGPRs (LLVM spellings).
+SPECIAL_SRC_OPERANDS = {
+    235: "src_shared_base",
+    236: "src_shared_limit",
+    237: "src_private_base",
+    238: "src_private_limit",
+    239: "src_pops_exiting_wave_id",
+    251: "src_vccz",
+    252: "src_execz",
+    253: "src_scc",
+    254: "src_lds_direct",
+}
+
+
 def decode_s_reg(reg_id: int) -> str:
     """Decode scalar register or scalar constant code."""
     if reg_id <= 105:
@@ -53,6 +68,10 @@ def decode_s_reg(reg_id: int) -> str:
         return "4.0"
     if reg_id == 247:
         return "-4.0"
+    if reg_id == 248:
+        return "0.15915494"
+    if reg_id in SPECIAL_SRC_OPERANDS:
+        return SPECIAL_SRC_OPERANDS[reg_id]
     if reg_id == 255:
         return "literal"
     return f"s{reg_id}"
@@ -71,6 +90,8 @@ def decode_s_reg64(reg_id: int) -> str:
         return "null"
     if reg_id == 126:
         return "exec"
+    if reg_id == 248:
+        return "0.15915494309189532"
     return decode_s_reg(reg_id)
 
 

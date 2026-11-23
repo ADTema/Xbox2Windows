@@ -43,6 +43,17 @@ cmake --build --preset dev --target archive_reader_lifted pe_map
 ctest --preset dev --no-tests=error -R '^cpu_native_archive_reader$' -V
 ```
 
+### Publishing a texture from each complete archive record
+
+The [texture reader](../tests/cpu/archive/texture_reader.zig) selects a different publisher in the same Zig record loop. Each successful decode supplies one tightly packed 4×4 RGBA8 image to [consume_archive_texture](../tests/cpu/archive/texture.hpp). At pixel `(x, y)` the red channel cycles through the decoded bytes in row-major order, green is `85*x`, blue is `85*y`, and alpha is 255. Rows occupy 16 bytes. The consumer can use or copy the pixels during the call and returns zero on success. The fixture consumer writes those bytes to stdout.
+
+The [comparison](../tests/cpu/archive_texture_check.py) checks native Windows, the mapped reader and decoder, and the AOT reader and decoder against the known red samples and coordinate ramps. Two valid records produce 128 bytes. Reusing the first texture for the second would change nine red samples. With the second input truncated, blast emits one tentative byte internally. Only the first 64-byte texture reaches the consumer, both records are freed, and all three processes exit 2. GPU upload and frame readback are the next step in [#830](https://github.com/R0Y00/Xbox2Windows/issues/830).
+
+```powershell
+cmake --build --preset release --target archive_texture_lifted pe_map
+ctest --preset release --no-tests=error -R '^cpu_archive_texture_publication$' -V
+```
+
 ### Recompiling the blast decoder
 
 The `cpu_native_archive_blast` test starts from the same archive reader and builds the unmodified blast 1.3 C file into a separate scalar x64 DLL with MSVC /Od. The [fixture translator](../tests/cpu/archive/translate_blast.py) follows direct calls from its PE export through the bit reader, Huffman table construction, symbol decoder and decompression loop. It reuses the x64 instruction lifter and frame analysis. Only generated C++ is compiled into the translated decoder. Its initialized data, including relocated table pointers, is separate from the native module. This profile uses per-thread tables, a bounded invocation stack, the six-argument blast ABI and two typed callback targets. The host supplies setjmp/longjmp semantics for a single active recovery point. The file I/O and allocation callbacks remain native.
@@ -80,7 +91,8 @@ against the desktop `xmem.dll` and `d3d12_xs.dll`. The DLL checks that its
 process attach ran once before the call. It allocates, writes, queries and frees
 a page-backed XMem block, then checks that the freed range is no longer committed
 or registered as graphics memory under the desktop policy. It also checks the
-unsupported working-set reply and round-trips a tagged root signature. The
+unsupported working-set reply for a selector the callers do not pass
+(`0x20000002`) and round-trips a tagged root signature. The
 resulting descriptor retains its root constants and the desktop flag.
 
 `cpu_native_shim_startup` runs the same EXE and companion under Windows and
@@ -509,6 +521,19 @@ ctest --preset dev --no-tests=error -R '^pixel_aot_u32_from_f32_' -V
 With the previous fixed bindings and the `--cb-reads` command above, all 530 records (459 distinct native streams) reached the conversion with an unbound source on the `92e80ed` base plus this change. The first conversion reads v3 in 447 records and v2 in 83. **Zero advanced past that instruction and zero completed.** All 530 input signatures report reads of both X and Y of `SV_Position`. The signature identifies logical inputs; assigning either component to a native VGPR still requires entry-layout evidence. In a separate diagnostic, supplying two distinct quad-defined fixture values let all 530 cross both conversions. Their next missing scalar inputs were s17 (505), s15 (23) and s14 (2).
 
 The fixed-profile full scan covered 26,503 records. Output-verified totals stayed at 851 PS, 12 CS, 2 MS, 0 VS and 0 GS (865 overall). All 988 previous profile/container files, including selector variants, recurred. Of those, 616 had identical generated source; recompiling the remaining 372 old/new pairs with the same DXC produced identical desktop DXIL. The existing pipeline and readback results apply to the same binaries. The new conversion draws are counted as source-built fixtures.
+
+### Exec-masked pixel regions
+
+`tools/pixel_aot.py` lowers a single forward masked-if from a known entry mask, the narrow form described in issue #338. A supported `v_cmp` (or integer comparison) records a lane condition, `s_and_saveexec_b64` saves the entry exec mask into an even SGPR pair while intersecting execution with that condition, and the matching `s_or_b64 exec, exec, s[a:b]` closes the region. The region can only contain supported per-lane moves and basic binary32 add, subtract, multiply, min and max: anything that writes scalar state, waits, samples, interpolates, accesses memory, exports, rewrites EXEC or produces scalar reads is rejected while the region is open. On restore every rewritten register merges with a per-lane select between the inner value and the value it held at the save, so outer values are preserved exactly on lanes where the condition is false. A register first defined inside the region is marked conditional; reading it after the merge is refused until an unconditional write defines it on every path.
+
+The optional whole-wave empty-mask skip `s_cbranch_execz` is accepted only as `(offset, text)` pair input: the signed displacement from the next instruction must land exactly on the matching restore, and it must sit immediately after the save. The translator skips no instruction: the skip is elided and the region body lowers unconditionally, which is valid because every allowed body operation is safe to speculate on every lane. `scc` is untracked after both the save and the restore, since the saved mask's emptiness is a wave property a per-lane model cannot compute; `s_cselect`-style readers of it reject. Nesting, additional skips, wrong targets, pending-load overlap with the saved pair, scalar or mask writes inside the region, and programs ending inside an open region all reject.
+
+The source-built fixtures render an 8x8 ramp through three programs: a masked region rewriting two channels, a second region on the complementary predicate covering every lane, and the first program with the skip encoded. Threshold constants 0.5, 10 and -1 exercise mixed, full and empty masks per draw. On Windows 11 build 26300.10075 with the D3D12 debug layer enabled and zero debug errors, `pixel_aot_exec_regions_warp` matched the expected ramp at all 64 pixels in each of the nine cases, and `pixel_aot_exec_regions_hardware` matched identically on a GeForce RTX 5070 (driver 32.0.16.2135). Each adapter also caught a reversed predicate mutant and a mask-free mutant on the mixed threshold. LLVM 15 assembles and disassembles all three fixture binaries in the binary regression, including the labelled branch form.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_exec_regions_(warp|hardware)$' -V
+```
 
 ### SPIR-V physical addresses in a D3D12 buffer window
 
@@ -2740,6 +2765,8 @@ python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15
 
 `tools/pixel_aot.py` extracts one named pixel program from a local archive, decodes gfx1013 instructions with LLVM and emits HLSL. DXC compiles the result to desktop DXIL before the draw. The lowerer tracks register writes across whole-quad interpolation of attribute 0, a scalar texture-descriptor load, a 2D RGBA sample, packed round-toward-zero binary16 conversions and one compressed color export, or an uncompressed export of four distinct computed or sampled registers whose result may instead be returned as `uint4` for a lossless integer readback. Unknown instructions, mismatched bindings and reads before the required wait cause translation to fail. [LLVM disassembler API](https://llvm.org/docs/doxygen/group__LLVMCDisassembler.html) · [Leonida public format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/fssm_unpack.py)
 
+The integer readback profile declares the primary constant buffer as `uint4`. Integer consumers read its words directly, and floating-point consumers reinterpret the same bits. The byte layout is unchanged. The constant-index bitset draw checks copying `0xffffffff` through a VGPR and overwriting the destination with a floating-point result. On RTX 4060 Laptop (driver 32.0.16.1656), the previous float-typed load returned `0x7fffffff` for the immediate-index-31 copy; the integer load preserves `0xffffffff`. [Original report and independent reproduction](https://github.com/R0Y00/Xbox2Windows/pull/680#issuecomment-7099515543)
+
 For normalized compressed whole-pair exports, the Python API can return `(source, mask)` via `return_write_mask=True`. The caller applies the returned RT0 mask (RG = `0x3`, BA = `0xC`, RGBA = `0xF`) in the PSO. Disabled components in the emitted `float4` are placeholders. The regular API still returns `float2` for its existing RG form and rejects a BA-only export. Because disassembly text can hide raw enable-bit differences, this API requires known whole-pair input. The draw fixture uses distinct clear sentinels and checks that a full PSO mask or incorrect enabled-channel values fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_compressed_export_(warp|hardware)$' -V`.
 
 The LLVM 15 binary fixture for #361 changes only the four EN bits of an assembled gfx1013 export and checks all 16 raw values. Reassembling the printed text keeps a packed pair when its first printed operand is enabled: raw 0x2 and 0xA reassemble as 0x0, and 0x5 reassembles as 0xF. Fully disabled source fields reassemble as zero. The normal lowering accepts 0x3, 0xC and 0xF through its explicit RT0-mask API. Other masks are rejected. These checks characterize the encoding and LLVM 15 behavior; they establish no gfx1013 channel-write semantics for non-pair masks.
@@ -2937,7 +2964,7 @@ The carry-out add and subtracts `v_add_co_u32`, `v_sub_co_u32` and `v_subrev_co_
 
 To supply a reference for another arithmetic program, run `offscreen_check.exe hardware --check-pixel-case shader.cso reference.case`. The case contains 256 bytes of constants followed by 64 expected RGBA colors in row-major little-endian binary32, one for each texel of the test texture. Generate the expected colors after round-toward-zero half export and widening back to float.
 
-Every draw fixture compiles its translated shader under an explicit binary32 denormal mode: DXC runs with `-denorm preserve` at `ps_6_2`, the minimum shader model that accepts `-denorm`, matching CPU references built from Python floats, which keep binary32 subnormals. The Scarlett pipeline's `FLOAT_MODE` is unmeasured, so preserve is the harness's recorded assumption rather than a claim about the console. A dedicated control draws one program with `v_min_f32` and `v_max_f32` against 1.0 and -1.0, and a `v_mul_f32` by 1.0, under both `-denorm preserve` and `-denorm ftz` with mode-matched references: the least subnormal `0x00000001` survives min and max under preserve and exports zero under ftz, while the multiply by 1.0 folds to a move and must export identical raw bits in both modes; the preserve-compiled shader has to mismatch the ftz reference. Binary16 and binary64 denormal behavior is established by separate fixtures, not by this control. The curve fixture records its mode as `any`: an RTX 5060 Ti (driver 32.0.16.2124) refuses PSO creation for that one program under `-denorm preserve` (`E_OUTOFMEMORY`), while WARP and the RX 9060 XT accept it; the curve rows contain no binary32 subnormals, so the mode cannot change their exported bits, and the fixture asserts that flushing leaves every expected word unchanged.
+Every draw fixture compiles its translated shader under an explicit binary32 denormal mode: DXC runs with `-denorm preserve` at `ps_6_2`, the minimum shader model that accepts `-denorm`, matching CPU references built from Python floats, which keep binary32 subnormals. The Scarlett pipeline's `FLOAT_MODE` is unmeasured, so preserve is the harness's recorded assumption rather than a claim about the console. A dedicated control draws one program with `v_min_f32` and `v_max_f32` against 1.0 and -1.0, and a `v_mul_f32` by 1.0, under both `-denorm preserve` and `-denorm ftz` with mode-matched references: the least subnormal `0x00000001` survives min and max under preserve and exports zero under ftz, while the multiply by 1.0 folds to a move and must export identical raw bits in both modes; the preserve-compiled shader has to mismatch the ftz reference. Binary16 and binary64 denormal behavior is established by separate fixtures, not by this control. The curve fixture records its mode as `any`: an RTX 5060 Ti (driver 32.0.16.2124) refuses PSO creation for that one program under `-denorm preserve` (`E_OUTOFMEMORY`), while WARP and the RX 9060 XT accept it; the curve rows contain no binary32 subnormals, so the mode cannot change their exported bits, and the fixture asserts that flushing leaves every expected word unchanged. The `e64_approx` program and `sdwa_unary_exp`, the first `SDWA_UNARY` program, also record `any`: on an RTX 5080 (drivers 32.0.16.2101 and 32.0.16.2124) `CreateGraphicsPipelineState` returns `E_OUTOFMEMORY` for any pixel shader that uses `log2` under `-denorm preserve`, while `ftz` and `any` are accepted, and WARP and an AMD Radeon integrated GPU accept `preserve` ([#828](https://github.com/R0Y00/Xbox2Windows/issues/828)). The mode switches only for translated programs that contain `log2`, and each such fixture asserts that no input, intermediate result, expected value or wrong reference is a binary32 subnormal, so the mode cannot change what they compute or export; `sdwa_unary_root` and `sdwa_unary_exact` keep `preserve`. With the change, `pixel_aot_e64_approx_hardware` and `pixel_aot_sdwa_unary_hardware` pass on the RTX 5080 (driver 32.0.16.2124), including every wrong reference, and still pass on WARP.
 
 The binary16 denormal mode is recorded as `preserve` and holds by construction rather than by a compile flag. DXIL has no binary16 denormal attribute: `-denorm` only sets `fp32-denorm-mode`. The packed f16 lowering widens each half from its encoding, computes in binary32 and narrows in integer arithmetic, and every binary16 subnormal, and every product or sum of two, is a binary32 normal, so a binary32 flush cannot reach it. The packed result is held as binary32 bits; packed f16 consumers and the export only reinterpret it, which the draw below checks with a word that is a binary32 subnormal. A CPU-side control checks that the lowered `v_pk_*_f16` body uses neither driver conversions (`f32tof16`, `f16tof32`) nor native half types. A draw runs `v_pk_add_f16` on two normal inputs whose sum is the subnormal `0x8001` (the required row: DXIL's `fadd` FTZ text requires such a result to flush), and as supplementary rows `v_pk_max_f16` on the least and largest binary16 subnormals, `v_pk_mul_f16` that makes the subnormal `0x0200` from normal inputs, and `v_pk_fma_f16` whose halves round to nearest even. It reads the packed words back through the integer target, because one of them (`0x80000200`) is a binary32 subnormal as a word. The same preserve reference must pass under both `-denorm preserve` and `-denorm ftz`, and a reference that flushes binary16 subnormals must fail. This shows that the harness's f16 results do not depend on the f32 flag. It says nothing about the Scarlett `FLOAT_MODE` f16 bits, which remain unmeasured, and the compressed-export path, which narrows through the driver's `f32tof16`, is not covered by this control.
 
@@ -3102,7 +3129,7 @@ The handler therefore fills that byte by a desktop policy, not by a confirmed Sc
 - the policy applies only to queries of the current process;
 - a buffer shorter than 48 bytes fails with `ERROR_BAD_LENGTH`, as `VirtualQueryEx` does.
 
-With registration, the callers' predicates accept GPU-intended memory and reject everything else. What the console's tail byte means, and what sets it, remain open. The selector `0x20000001` and the output units of `XMemGetWorkingSetStatistics` have no public reference either; the desktop `xmem.dll` below reports that call as unsupported.
+With registration, the callers' predicates accept GPU-intended memory and reject everything else. What the console's tail byte means, and what sets it, remain open. The selector `0x20000001` of `XMemGetWorkingSetStatistics` has no public reference either. Its callers use the value at `+8` as a byte count of GPU memory (see the call evidence below); the desktop `xmem.dll` below returns this process's DXGI GPU memory usage there.
 
 | CTest case | Inputs and checks |
 |---|---|
@@ -3120,18 +3147,29 @@ With registration, the callers' predicates accept GPU-intended memory and reject
 | `XMemAlloc` | Size and attribute word (Bink and AMD callers). | `era_heap::allocate`. Graphics memory types are also tracked by `era_title_gpu`, which registers them with `era_query` so they count as GPU-intended, and gives them desktop GPU addresses once a D3D12 device is attached (see below). |
 | `XMemFree` | Allocation and the same attribute word. | Untracks graphics allocations, dropping any alias and the `era_query` registration, then `era_heap::release_with_attributes`. |
 | `XMemVirtualQuery` | The four BVH callers pass the process in `rcx`, the address in `rdx` and a 64-byte buffer in `r8`; `r9` is not set, so there is no length argument. They test the 32-bit result in `eax`. | `era_query::query` on the 64-byte buffer; returns `TRUE` when it succeeds. |
-| `XMemGetWorkingSetStatistics` | The seven AMD callers pass `0x20000001` in `ecx` and an output address in `rdx` and test the 32-bit result. On failure each uses zero instead of the 64-bit value at `+8`. | Returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the output untouched. |
+| `XMemGetWorkingSetStatistics` | The seven AMD callers pass `0x20000001` in `ecx` and a 128-byte stack buffer in `rdx` and test the 32-bit result. On failure each uses zero instead of the 64-bit value at `+8`. They use only the difference of that value around GPU heap and committed-resource creation and release. | For `0x20000001`, writes the qword at `+8` with this process's GPU memory in bytes and returns `TRUE`; no other byte is written. The value is DXGI `QueryVideoMemoryInfo` `CurrentUsage`, local plus non-local on every node of an adapter LUID, combined by the aggregation rules below. A LUID's nodes are its linked physical adapters: DXGI enumerates a linked set as one adapter, and `QueryVideoMemoryInfo` takes the physical adapter index as its node. The shim reads their count with D3DKMT (`KMTQAITYPE_PHYSICALADAPTERCOUNT`). `dxgi.dll` and `gdi32.dll` (D3DKMT) are delay-loaded on the first call. When the rules give no total (including when the adapter list cannot be stored), or for other selectors, the call returns `FALSE` with `ERROR_NOT_SUPPORTED`; a null output returns `ERROR_INVALID_PARAMETER`. A failed call leaves the whole output untouched. |
 
-The registration of graphics memory and the unsupported working-set call are desktop policies, not confirmed Scarlett behavior.
+Windows can list one device under several LUIDs, and each view reports the same allocations. Without a GPU, Windows Server 2025 lists the Microsoft Basic Render Driver with flags 0 and as a software adapter. A hybrid laptop on Windows build 26200 (RTX 4060 Laptop, driver 32.0.16.1656) listed its NVIDIA GPU twice with flags 0. In that case both local counters moved from 7,294,976 to 74,403,840 bytes on one 64 MiB heap, so a plain sum reported 2x. Matching vendor and device IDs, or equal readings, do not show that two LUIDs are one device: separate adapters of the same model must each be counted. The shim therefore identifies each LUID by the PnP hardware registry keys of its physical adapters, which contain the device instance path, read with D3DKMT (`src/adapter_identity.cpp`), and `src/xmem_gpu_usage.h` publishes a total only when it is complete and non-duplicated:
+
+- an incomplete enumeration, no adapters, an adapter whose node count cannot be read, any failed reading, or an overflowing sum gives no total;
+- registry key names are not case sensitive, so keys are compared ordinally ignoring case (`CompareStringOrdinal` with the operating system's uppercase table);
+- LUIDs with the same keys count once and must report the same value; LUIDs with different keys are summed;
+- LUIDs that share some but not all keys give no total;
+- an adapter whose keys cannot be read, including a key query whose reported length is not a nonempty terminated string inside the buffer, may report usage only when no other adapter does;
+- a total of zero is valid.
+
+The registration of graphics memory and the working-set value are desktop policies, not confirmed Scarlett behavior. The console value's scope and what it counts besides GPU allocations remain open; the callers depend only on its differences.
 
 A local scan of the inspected package's 16 DLLs together with this `xmem.dll` (`tools/pe_inventory.py`) resolved all six xmem import edges to it. The unresolved edges dropped from eight to two, both `d3d12_xs.dll` root-signature functions. The scan reads the images and runs no package code.
 
 | CTest case | Inputs and checks |
 |---|---|
-| `xmem_shim_exports` | The four names resolve through `GetProcAddress`, and the test's named imports bind to the same module. |
+| `xmem_shim_exports` | The four names resolve through `GetProcAddress`, and the test's named imports bind to the same module. Neither `d3d12.dll` nor `dxgi.dll` is loaded (the test executable delay-loads both for its GPU cases). |
 | `xmem_shim_allocation` | The Bink word returns 32-byte-aligned, zeroed heap memory. The AMD word returns committed read/write memory on a 64 KiB boundary that `XMemFree` releases (`MEM_FREE`). Zero size, a reserved bit and a physical memory type return null, and freeing null is a no-op for both memory types. |
 | `xmem_shim_query` | Graphics memory from `XMemAlloc` passes both BVH predicates and keeps the sentinel after `+0x30`, through the pseudo-handle and a real handle. After `XMemFree` the address reads as `MEM_FREE` with a clear tail. Heap memory fails the tail check, and an address outside user space returns `FALSE` without touching the buffer. |
-| `xmem_shim_working_set` | Returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the output untouched, so the callers' value is zero. |
+| `xmem_shim_working_set` | Selector `0x20000001` returns `TRUE` and writes only the qword at `+8` of a 128-byte buffer. Selector `0x20000002` returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the buffer untouched; a null output returns `ERROR_INVALID_PARAMETER`. |
+| `xmem_shim_working_set_aggregation` | Synthetic readings for the aggregation rules. Regression reference: the laptop readings above give no total when the two LUIDs have no identity, and a 64 MiB difference when both carry the same key. Also covered: Basic Render Driver aliases count once, distinct adapters of the same model with equal readings are summed, a genuine zero is published, and an all-failed, partly failed or incomplete enumeration, disagreeing aliases, an active adapter of unknown identity next to another active adapter, partly overlapping linked adapters and an overflowing sum give no total. Keys that differ only in case count once, must agree, and still give no total when they partly overlap. Malformed key query output (nothing written, an empty key, a length past the buffer, no terminator, an embedded terminator) gives no key. Per-node readings: usage only on node 1 of a linked pair is counted, and an unknown node count, a segment query that fails after a successful one (on the same node or a later node) and an overflow between segments or nodes give no total. |
+| `xmem_shim_working_set_warp`, `xmem_shim_working_set_hardware` | As the callers do, reads `+8` (zero on failure) before and after creating and releasing 64 MiB DEFAULT, UPLOAD and READBACK heaps and a 32 MiB committed buffer on a new device. Each creation must add at least the allocation size (`GetResourceAllocationInfo` for the buffer) and at most 4 MiB more, and each release must remove as much. Negative control: with the former `ERROR_NOT_SUPPORTED` stub every difference is 0 and both cases fail. Prints each DXGI adapter with its LUID, node count and PnP keys. The hardware case measures the first D3D12 adapter in high-performance order, or the first whose description contains `XBOX2WINDOWS_ADAPTER` (ignoring case; no match fails), and prints it. Skips (77) without the adapter or a D3D12 device. |
 
 ### Desktop d3d12_xs.dll
 
@@ -3401,7 +3439,15 @@ Build `cpu_bink_heap_lifted` and run `ctest --preset dev --no-tests=error -R '^c
 
 Immediately after the statistics calls at RVAs `0x74d2` and `0x75b1`, both paths add the new sample minus the previous sample to a 64-bit counter. A zero status substitutes zero for the new sample even if the supplied output word is nonzero. With starting counters 11 and 101, a previous sample of 23, a new sample of 70, successful status and flag 256, creation produces 58 and 148. Release produces 58 and 101 because it reads only the low flag byte. Both counters wrap modulo 2^64.
 
-Build `cpu_working_set_delta_lifted` and run `ctest --preset dev --no-tests=error -R '^cpu_working_set_delta$'` for the source-built assembly control and its translation. With `FFX_UPSCALER_IMAGE` set to the fingerprinted local upscaler, build `ffx_package_working_set_delta` and run its namesake test for the two translated instruction ranges. The test supplies the status, samples and flags at the point where the query returns. The Xbox statistics provider, measurement units and real sample values remain unverified.
+Build `cpu_working_set_delta_lifted` and run `ctest --preset dev --no-tests=error -R '^cpu_working_set_delta$'` for the source-built assembly control and its translation. With `FFX_UPSCALER_IMAGE` set to the fingerprinted local upscaler, build `ffx_package_working_set_delta` and run its namesake test for the two translated instruction ranges. The test supplies the status, samples and flags at the point where the query returns. The Xbox statistics provider and real sample values remain unverified. The call evidence below gives the samples as bytes of GPU memory, and the [desktop `xmem.dll`](#desktop-xmemdll) supplies them from DXGI.
+
+`ffx_package_working_set_xmem_warp` and `ffx_package_working_set_xmem_hardware`, defined with the same image, feed the two translated ranges with samples from the desktop `xmem.dll` taken around creating and releasing a 64 MiB D3D12 heap, once with the aliasable flag clear and once set. The total counter must grow by the heap size and the aliasable counter by the heap size only when the flag is set, and release must restore both. The test substitutes zero for a failed earlier sample as the caller does at `0x7475` and `0x7577`, outside the translated ranges. Negative control: with the former `ERROR_NOT_SUPPORTED` stub both counters stay unchanged and both cases fail. The hardware case selects its adapter as `xmem_shim_working_set_hardware` does. The resource creation and release pairs (`0x2ea1`/`0x39a9`, `0x3b40`) are not translated.
+
+```powershell
+cmake --preset dev -B out/build/pkg "-DFFX_UPSCALER_IMAGE=<upscaler DLL>"
+cmake --build out/build/pkg --target ffx_package_working_set_xmem
+ctest --test-dir out/build/pkg --no-tests=error -R '^ffx_package_working_set_'
+```
 
 ## Six API call sites
 
@@ -3417,7 +3463,7 @@ After loading the toolchain, inspect three local DLLs. `out/calls/six-apis.json`
 | `XMemAlloc` | At `0x25c35`, Bink's fallback requests the length plus 64 with attributes `0x05e50000` and checks for null. It advances the base by `64 - (base & 31)` bytes (33–64), giving a 32-byte-aligned user pointer. The two preceding bytes hold the offset at `[-1]` and a tag at `[-2]`. At `0x565d`, AMD rounds the nonzero request up to a multiple of 256, reads attributes at `0x6eee0` (on-disk initial value `0xa8004000`) and checks for null. Under the ERA layout the alignment fields give 32 and 256 bytes, matching this caller arithmetic. `era_heap_observed_words` checks the desktop handling of both words; allocator-ID and GPU-visibility semantics remain unconfirmed. |
 | `XMemFree` | At `0x25be4`, Bink uses the saved offset to recover the allocation base and passes the same attributes. Custom allocations use a matching callback. AMD cleanup at `0x5712` and release at `0x5921` both use the allocation's attribute slot. The latter also clears the stored pointer. No observed caller consumes the return value. |
 | `XMemVirtualQuery` | Four BVH callers pass the current process, target address and a zeroed 64-byte buffer. Each checks a nonzero return, bit `0x1000` of the word at `+0x20` and either low bit of the byte at `+0x30`. Source acceleration structure validation at `0x19c69` also requires the byte at `+0x24` to intersect mask `6`. Destination acceleration structure (`0x19ccb`), index buffer (`0x19d9d`) and vertex buffer (`0x19df9`) use the common checks. Diagnostics describe the whole check. The individual tail bits have no confirmed meaning. |
-| `XMemGetWorkingSetStatistics` | Seven AMD calls pass selector `0x20000001` and a local output address. At `0x26b3` and elsewhere a zero return contributes zero to a calculation. Success uses the 64-bit value at `+8`. Code near `0x74d2/75b1` uses a before/after difference to update a counter. The units, scope and selector meaning remain open. |
+| `XMemGetWorkingSetStatistics` | Seven AMD calls pass selector `0x20000001` and a 128-byte stack buffer (`0x2690`: `rsp+0x20` up to the cookie at `rsp+0xa0`). A zero return contributes zero; success uses the 64-bit value at `+8`. The calls bracket four operations, and only `after - before` is used: resource creation `0x2ea1`/`0x39a9` and heap creation `0x7452`/`0x74d2` (`ID3D12Device::CreateHeap`, vtable `+0xe0`) add it, and resource release (getter `0x26b3`, called twice from `0x3b40`) and heap release `0x7568`/`0x75b1` subtract it. The targets are two qwords at `+0x40` and `+0x48` of 96-byte per-effect records; the second changes only for aliasable resources and heaps. This matches the per-effect `vramUsage` (`totalUsageInBytes`, `aliasableUsageInBytes`) of the public FidelityFX SDK DX12 backend: v2.3.0, whose FSR upscaling version 4.1.1 is the version string in this DLL, `Kits/FidelityFX/backend/dx12/ffx_dx12.cpp`, MIT-licensed per `docs/license.md`. That backend adds known allocation sizes at the same four points, with the same callback argument shapes. The value at `+8` is therefore used as a byte count of GPU memory. Its scope and the selector's meaning remain open. |
 | `D3D12SerializeVersionedRootSignature` | At `0xc2d0` the BVH code copies a caller's 48-byte descriptor and adds flags `0x03000000` at `+0x28`. At `0xc32f` it passes the descriptor, a blob output pointer and a null error output. Negative HRESULT enters diagnostics. Success uses the blob length and data pointer. A synthetic v1.1 descriptor returned `S_OK` with baseline flags and `E_INVALIDARG` with the two added bits. |
 | `D3D12CreateRootSignatureDeserializer` | At `0x4f88`, AMD reads a byte pointer and a 32-bit length from record offsets `+0/+8`, then supplies an interface IID and object output address. A negative HRESULT or null object triggers partial cleanup. Success retrieves the descriptor via the object. Desktop code read the root signature from a complete Microsoft sample shader and returned `E_INVALIDARG` for a synthetic shader without one. |
 
@@ -3969,7 +4015,7 @@ After building, use the source-built pixel shader as a known DXIL control.
 python -B tools/resource_inventory.py "game-files/<build-directory>" --shader-control out/build/dev/triangle_ps.cso
 ```
 
-`out/resources/<build-directory>.json` records install chunks, flags, byte counts and missing layout destinations. It records file-header signatures for the build and scans all raw bytes in `appdata0.rpf`, `common.rpf` and `shaders.rpf` for format markers. Candidate DXBC containers are checked for length, section boundaries and DXIL program headers. The synthetic `dxcontainer_part_offsets` regression verifies that part-table entries can be enumerated independently of the physical layout, while rejecting overlapping, out-of-bounds, or duplicate-FourCC part ranges. Both the part map and DXIL scanner reject repeated FourCC tags even when those parts are physically separate; the regression includes a valid framed DXIL control to distinguish duplicate tags from missing shader payloads. It checks structural framing, not shader execution. `sample_streams` covers at most eight qualifying zlib streams per file within the first 4 MiB. Plaintext stays in memory. The sample cannot characterize the rest of the archive. Installation order and runtime I/O need independent checks. [DXIL container format](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst) · [RPF9 observation source](https://gtamodx.com/columns/eXk_fiBUaYta)
+`out/resources/<build-directory>.json` records install chunks, flags, byte counts and missing layout destinations. It records file-header signatures for the build and scans all raw bytes in `appdata0.rpf`, `common.rpf` and `shaders.rpf` for format markers. Candidate DXBC containers are checked for length, section boundaries and DXIL program headers. The synthetic `dxcontainer_part_offsets` regression verifies that part-table entries can be enumerated independently of the physical layout, while rejecting overlapping, out-of-bounds, or duplicate-FourCC part ranges. Both the part map and DXIL scanner reject repeated FourCC tags even when those parts are physically separate; the regression includes a valid framed DXIL control to distinguish duplicate tags from missing shader payloads. It checks structural framing, not shader execution. `sample_streams` covers at most eight qualifying zlib streams per file within the first 4 MiB. Plaintext stays in memory. The sample cannot characterize the rest of the archive. Installation order and runtime I/O need independent checks. [DXIL container format](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst)
 
 ### Ballot bit extraction in the named SPIR-V bridge
 
@@ -4170,6 +4216,99 @@ entered `loop-rotate`. That trace locates the observed stall under instrumentati
 Uninstrumented pass-time totals and attribution across the replay cohort remain open.
 The GPU check above covers the public fixture's four control words. [Archive trace](https://github.com/R0Y00/Xbox2Windows/issues/775)
 
+### Mesh shader -Od pipeline creation across adapters
+
+[#810](https://github.com/R0Y00/Xbox2Windows/issues/810) asks whether mesh shader DXIL
+compiled with `-Od` reaches pipeline creation and the expected draw on more than one
+adapter. The [mesh -Od tool](../tools/mesh_od_pipeline.py) generates a source-built mesh
+shader with a known draw: threads 0-2 emit one triangle that covers the 32x32 target.
+Every thread first runs a generated integer computation on a constant-buffer seed, and
+the vertex depth stays inside the clip volume only when the result equals the value the
+tool computes in Python. The draw therefore matches the green reference only if the
+compiled computation is correct. The families grow that computation and keep the
+expected image:
+
+- `control`: no extra computation.
+- `chain_N`: N dependent multiply/xor/add steps.
+- `branches_N`: N divergent if/else regions that depend on the group thread.
+- `loops_N`: N loops whose trip count is a constant-buffer word plus `(thread + k) & 3`.
+
+The tool compiles each variant twice with the same DXC and target (`ms_6_5`, default
+optimization and `-Od`) and records compile time, peak working set and outcome. Each
+DXIL blob that compiles goes unchanged to `offscreen_check <adapter> --mesh-entry`, so
+both blobs use the same root signature, pixel shader, pipeline stream and draw. The
+renderer prints the duration of the mesh `CreatePipelineState` call as
+`mesh_pipeline_ms` and flushes it, so the tool records pipeline time separately from
+the process wall time and peak working set, and places a crash or timeout before or
+after pipeline creation. Two negative controls run on every blob that draws the
+reference: the seed with one bit flipped, and a reference image with the triangle
+missing. Both must report a draw mismatch. Use a fresh `--seed` to vary the expected
+constants and the DXIL between runs. Repeated draws use the same blob. The harness
+records first and repeated pipeline times without inspecting driver cache state.
+
+`ctest` runs the small variants (`control`, `chain_64`, `branches_64`, `loops_16`) with
+`--check` on the default hardware adapter and on WARP. It fails if a blob does not
+compile, does not draw the reference, misses either control, or the renderer prints no
+pipeline time, and it exits 77 when the adapter has no mesh shader tier.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^mesh_od_pipeline_' -V
+# measurement run; timeouts are local policy values, not defaults
+$env:XBOX2WINDOWS_ADAPTER = 'RTX 5080'
+out\pe-env\Scripts\python.exe -B tools\mesh_od_pipeline.py --dxc <path-to-dxc.exe> --renderer out\build\dev\offscreen_check.exe --adapter hardware --variants control,chain_4096,branches_4096,loops_1024,loops_4096,loops_8192 --repeat 3 --seed 0x5eed0201 --compile-timeout 300 --pipeline-timeout 300 --out out\mesh-od\nvidia.json
+```
+
+Measured on 2026-11-23 at `523d9ac` plus this change, Windows 11 build 26300.9974,
+Ryzen 7 9800X3D, 31.1 GiB, DXC 1.9.2602.17 from Windows SDK 10.0.26100, debug layer
+unavailable, one process at a time. Seeds were `0x5eed0201` (RTX 5080), `0x5eed0202`
+(Radeon) and `0x5eed0303` (WARP, run after the flush was added). Adapters: NVIDIA
+GeForce RTX 5080 (`10de:2c02`, 32.0.16.2124), the AMD Radeon integrated GPU of the same
+CPU (`1002:13c0`, 32.0.11034.2) and WARP (`1414:008c`, 10.0.26100.9818). DXC times are
+from the RTX 5080 run. In the other runs, times below 2 s differ by at most 0.25 s and
+larger times by up to 18 %. Pipeline times are the first creation with a fresh seed; peak is the
+largest renderer working set.
+
+| variant | DXC default / -Od s | DXIL default / -Od B | RTX 5080 default / -Od | Radeon default / -Od | WARP default / -Od |
+|---|---:|---:|---|---|---|
+| control | 0.02 / 0.02 | 4,160 / 4,224 | 0.03 / 0.02 s | 0.05 / 0.01 s | 0.0005 / 0.0005 s |
+| chain_4096 | 0.32 / 0.15 | 73,796 / 90,616 | 0.90 / 1.03 s | 0.30 / 0.32 s | 0.005 / 0.007 s |
+| branches_4096 | 0.42 / 1.46 | 105,288 / 351,588 | 2.04 / 3.93 s | 0.36 / 3.25 s | 0.005 s / 3.63 s, crash |
+| loops_1024 | 1.35 / 0.60 | 127,332 / 179,488 | 5.35 / 5.16 s | 8.67 / 1.28 s | 0.36 s, crash / 0.37 s, mismatch |
+| loops_4096 | 19.79 / 8.07 | 525,848 / 762,564 | 83.9 / 79.0 s, 3.1 / 3.2 GiB | timeout, 3.1 GiB / 17.6 s, 4.7 GiB | 6.3 / 6.4 s, crash |
+| loops_8192 | 79.53 / 34.32 | 1,073,872 / 1,563,332 | timeout, 11.6 / 11.6 GiB | timeout, 10.6 GiB / 75.2 s, 15.4 GiB | 28.5 / 28.4 s, crash, 6.6 GiB |
+
+Every blob that drew the reference on an adapter also failed both controls there.
+`timeout` is the 300 s policy expiring inside pipeline creation; the process was
+killed. On WARP, `crash` is the renderer exiting with NTSTATUS `0xc0000005`
+(`branches_4096 -Od` gave `0xc0000374` in two of three runs), after `CreatePipelineState` returned and before
+the readback; `mismatch` means the draw completed with all 1024 pixels wrong. No
+HRESULT failure, compiler diagnostic or unsupported mesh tier occurred.
+
+What the measurements show:
+
+- On the RTX 5080, `-Od` changed pipeline time by less than 15 % on the loop variants
+  and doubled it for `branches_4096`. Both blobs of `loops_8192` exceeded 300 s with
+  about 11.6 GiB of working set. Repeated creations of the same blob took 1-32 ms.
+- On the Radeon, `-Od` turned the default timeouts of `loops_4096` and `loops_8192`
+  into completed pipelines that drew the reference. It cost more for `branches_4096`
+  (0.36 to 3.25 s).
+- On WARP, pipeline creation returned for every blob (at most 28.5 s), and no blob
+  from `branches_4096 -Od`, `loops_768` or larger drew the reference. `loops_768` gave a
+  mismatch at both optimization levels in two runs, while `loops_512` and `loops_640`
+  matched. `loops_1024` gave a mismatch in some runs and an access violation in
+  others, so the outcome there is not deterministic.
+  In an ad hoc run outside the tool, `loops_768` with trip-count base 0, 5 or 20 still
+  mismatched and a single loop of 1,000,000 iterations matched, so the observed boundary
+  follows the number of loops in the shader rather than the iteration count. The RTX
+  5080 and the Radeon drew the reference with the same `loops_1024` blobs. The cause on
+  WARP is not established here.
+
+This covers source-built mesh shaders, one seed per run and the listed adapters. It
+does not replay archive records, does not change any watchdog, memory or host stack
+setting, and does not establish that a default and an `-Od` blob are equivalent for
+other inputs. The archive-wide follow-up remains with the aggregate acceptance run.
+
 ### Minimum LOD in the SPIR-V bridge
 
 The pinned Windows SPIRV-Cross build maps the SPIR-V `MinLod` operand to the
@@ -4214,22 +4353,94 @@ blue mip 2 on that adapter. Linear mip filtering gave the expected blend
 (G=0.4375, B=0.5625). The translated `ps_6_0` sample and a direct HLSL clamp
 agreed. [Direct3D rules for per-sample clamping and mip selection](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm)
 
-The detailed fixture results below used Windows 10 build 19045, Agility SDK
-1.620.2, DXC 1.9.2609 and the debug layer.
+A `ps_6_0` probe of the point-filtered case (`MIN_MAG_MIP_POINT`, gate lowered
+locally, `929e659`) compared the translated `Sample` with `MinLod`, a direct
+HLSL clamp and a direct `SampleLevel` at the same value. Each cell is the mip
+that filled all 64 pixels; clamps 1, 1.25 and 1.4375 read mip 1 everywhere.
+Windows 10 build 19045, DXC 1.9.2609.
 
-| Clamp | Exact green, blue | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 |
-|---|---|---|---|
-| 1.25 | 0.75, 0.25 | exact | 0.7499962, 0.2500038 |
-| 1.3 | 0.7, 0.3 | 0.6992188, 0.3007813 | 0.7031205, 0.2968795 |
-| 1.001953125 | 0.9980469, 0.0019531 | 1, 0 | 1, 0 |
+| Clamp | `SampleLevel`, all | In-box WARP 10.0.19041.7811, `ps_6_0` | RTX 3080 Ti 32.0.16.1047, in-box runtime, `ps_6_0` | WARP 1.0.22 and RTX, Agility SDK 1.620.2, `ps_6_0` and `ps_6_6` |
+|---|---|---|---|---|
+| 0.5625 | 1 | 0 | 1 | 1 |
+| 1.5 | 2 | 1 | 2 | 2 |
+| 1.5625 | 2 | 1 | 2 | 2 |
+| 1.75 | 2 | 1 | 2 | 2 |
+| 2.5625 | 3 | 2 | 3 | 3 |
 
-Both adapters quantize the blend weight to 1/256. At 1.3, WARP rounds the
-weight to 77/256 and the RTX truncates it to 76/256. The RTX values also
-differ from those steps by up to 7.6e-6. In this fixture the translated and
-control results were identical on each adapter, so the measured differences
-come from the adapter's mip filtering. The 1/128 tolerance was chosen from these
-measurements, not from a specified precision. Whether this explains the
-archive differences is not established. [Issue](https://github.com/R0Y00/Xbox2Windows/issues/809)
+Only the Windows 10 in-box WARP reads the mip below a `MinLod` clamp, so the
+difference follows the WARP build, not the runtime or shader model. On Windows
+11 build 26200.9974, in-box WARP 10.0.26100.9818 and an RX 7900 XTX
+(32.0.32029.2010) read the nearest mip at 1.5 and 1.5625 (`ps_6_6`, no other
+clamps). Translated and direct HLSL agreed in every case.
+[Measurement](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7097414235),
+[Windows 11 report](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7095165499)
+
+Mip-linear results (`MIN_MAG_POINT_MIP_LINEAR`, `ps_6_6`, debug layer): WARP
+1.0.22 and the RTX on Windows 10 build 19045 with Agility SDK 1.620.2 and DXC
+1.9.2609; the Radeon and in-box WARP on Windows 11 build 26200.9974 with DXC
+1.8.2502.11.
+
+| Clamp | Exact green, blue | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 | RX 7900 XTX and in-box WARP 10.0.26100.9818 |
+|---|---|---|---|---|
+| 1.25 | 0.75, 0.25 | exact | 0.7499962, 0.2500038 | exact |
+| 1.3 | 0.7, 0.3 | 0.6992188, 0.3007813 | 0.7031205, 0.2968795 | 0.6992188, 0.3007813 |
+| 1.001953125 | 0.9980469, 0.0019531 | 1, 0 | 1, 0 | 1, 0 |
+
+All adapters quantize the blend weight to 1/256. At 1.3 the RTX truncates it
+to 76/256 and the others give 77/256. Translated and control results were
+bit-identical on each adapter, so the differences come from mip filtering. The
+1/128 tolerance was chosen from these measurements, not from a specified
+precision. Whether this explains the archive differences is not established.
+[Issue](https://github.com/R0Y00/Xbox2Windows/issues/809)
+
+A sweep of the blue weight from 76/256 to 77/256 in 1/4096 steps, plus the ties
+at 75.5, 76.5 and 77.5 (`6cd0f15`), separates rounding from truncation. Each
+cell is the observed weight × 256 and the blue word; all 64 pixels and both
+shaders matched at every point.
+
+| Requested weight × 256 | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 |
+|---|---|---|
+| 75.5 (tie) | 76 (`3e980000`) | 75 (`3e960096`) |
+| 76.0 to 76.49976 | 76 (`3e980000`) | 76 (`3e980098`) |
+| 76.5 (tie) | 76 (`3e980000`) | 76 (`3e980098`) |
+| 76.50024 to 76.99976 | 77 (`3e9a0000`) | 76 (`3e980098`) |
+| 77.0 | 77 (`3e9a0000`) | 77 (`3e9a009a`) |
+| 77.5 (tie) | 78 (`3e9c0000`) | 77 (`3e9a009a`) |
+
+WARP rounds to the nearest 1/256 with ties to even; the RTX truncates and
+stores step k as `k·256/65535`, which gives the offset of up to 7.6e-6.
+[Half-step sweep](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7095572305)
+
+## Quad-local DS swizzle in pixel shaders
+
+The pixel profile lowers `ds_swizzle_b32` with the LLVM `QUAD_PERM` spelling.
+Each of the four two-bit selectors picks the source lane for the corresponding
+lane in the same quad. The profile requires a verified whole-quad execution
+region, a VGPR defined for the whole quad, and an immediate
+`s_waitcnt lgkmcnt(0)`. The generated HLSL reads the source as `uint` through
+quad intrinsics before restoring the bits to the VGPR value. GDS, bit-mask
+mode and other DS operations remain outside this profile.
+[AMD cross-lane instruction semantics](https://gpuopen.com/learn/amd-gcn-assembly-cross-lane-operations/)
+
+The source-built fixture assembles for `gfx1030` with wave64 in the LLVM 15
+binary round trip. On Windows it compares 256 `R32G32B32A32_UINT` channel words
+from an 8×8 draw to a CPU reference derived from pixel centers. The four
+exports exercise a mixed permutation on X and Y, a horizontal swap, and a
+broadcast. Changing the swap to identity must report a mismatch at (0, 0) in
+blue (`0x3e400000` expected, `0x3d800000` observed). The lowering controls reject
+missing or insufficient waits, non-quad execution, GDS, an out-of-range
+selector, an undefined source, an out-of-range VGPR and a cross-quad mode.
+
+Measured on the patch based on `e97090a` with Windows 11 25H2 build 26200.9974,
+Windows SDK DXC 1.8.2502.11 and the D3D12 debug layer enabled. Microsoft Basic
+Render Driver (WARP 10.0.26100.9818) and Radeon RX 7900 XTX (32.0.32029.2010)
+both matched every channel bit and caught the negative control. Neither test
+skipped. This measures the desktop translation against the reference.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_ds_swizzle_(warp|hardware)$' -V
+```
 
 ## Independent bit and byte alignment readback
 
@@ -4360,15 +4571,18 @@ and destination high-half preservation remains unmeasured without a source-built
 native RDNA readback.
 
 `v_div_fmas_f32` evaluates `div_fmas32(src0, src1, src2, vcc)` using double precision
-with Knuth 2Sum remainder tracking to guarantee strict single-rounding across WARP and
-desktop hardware targets, avoiding double-rounding midpoint tie errors and preventing
-premature float32 underflow before scaling by 2^32 (`4294967296.0`) when VCC is true.
-An offscreen draw through the integer readback target (`check_valu_div_fmas_draw`) with
-runtime constant-buffer inputs tests both VCC conditions and clamping across five cases:
+with Knuth 2Sum remainder tracking for finite inputs. Scaling by 2^32 when VCC is true
+happens before conversion to binary32. The helper is emitted only for shaders using this
+operation and requires double-precision shader arithmetic. The integer-readback fixture
+(`pixel_aot_div_fmas_warp` and `pixel_aot_div_fmas_hardware`) checks both VCC conditions
+and clamping with runtime inputs under the preserve denormal mode:
 - Midpoint single-rounding: `(0x3f800001, 0x3fc00000, 0x8d800000)` produces exact sum
   1.5 + 3*2^-24 - 2^-100 strictly below the midpoint, rounding down to `0x3fc00001`
   (`0x4fc00001` scaled by 2^32), whereas uncorrected double rounding rounds to even
   (`0x3fc00002` / `0x4fc00002`);
+- Subnormal midpoints: adding an exact product of 2^-150 minus 2^-196 to
+  `0x00400001` or `0x00040001` must keep the original unscaled word. The guard bit
+  lies in different binary64 words in these two cases.
 - Cancellation: `(0x3f800001, 0x3f7ffffe, 0xbf800000)` produces exact product + addend
   -2^-46 (`0xa8800000` unscaled, `0xb8800000` scaled by 2^32), where unfused float32 `mad`
   rounds `1 - 2^-46` prematurely to 1.0 yielding zero;
