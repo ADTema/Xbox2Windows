@@ -17,6 +17,10 @@ class FormatGroup:
     samples: int = 0
 
 
+# Sound format tags: minimum length (bytes read) and codec byte offset, as in the public reader's 0x76 and 0xFA cases.
+FORMAT_TAGS = {0x76: (32, 0x1c), 0xFA: (0x14, 0x13)}
+
+
 @dataclass
 class MusicHeader:
     channels: int
@@ -54,7 +58,7 @@ def read_formats(stream: BinaryIO, offset: int, size: int) -> list[FormatGroup]:
     if table + table_bytes > header_size:
         raise ValueError("AWC tag table outside declared header")
     tags = struct.iter_unpack("<Q", bank.read(table, table_bytes))
-    formats: list[int] = []
+    formats: list[tuple[int, int]] = []
     spans: list[tuple[int, int]] = []
     for entry in entries:
         data_tags = 0
@@ -70,12 +74,12 @@ def read_formats(stream: BinaryIO, offset: int, size: int) -> list[FormatGroup]:
                 spans.append((start, start + length))
             if kind == 0x55 and length:
                 data_tags += 1
-            elif kind == 0x76:
-                if length < 32:
+            elif kind in FORMAT_TAGS:
+                if length < FORMAT_TAGS[kind][0]:
                     raise ValueError("Truncated AWC sound format tag")
-                format_offsets.append(start)
+                format_offsets.append((start, kind))
         if data_tags != 1 or len(format_offsets) != 1:
-            raise ValueError("Expected one data tag and one 0x76 format tag per sound")
+            raise ValueError("Expected one data tag and one 0x76 or 0xFA format tag per sound")
         formats.append(format_offsets[0])
 
     # Establish that every format range is separate from data before reading it.
@@ -83,11 +87,12 @@ def read_formats(stream: BinaryIO, offset: int, size: int) -> list[FormatGroup]:
     if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
         raise ValueError("Overlapping AWC tag extents")
     groups: dict[tuple[int, int], FormatGroup] = {}
-    for start in formats:
-        header = bank.read(start, 32)
+    for start, kind in formats:
+        length, codec_offset = FORMAT_TAGS[kind]
+        header = bank.read(start, length)
         samples, = struct.unpack_from("<I", header)
         rate, = struct.unpack_from("<H", header, 8)
-        codec = header[28]
+        codec = header[codec_offset]
         key = rate, codec
         if key not in groups:
             groups[key] = FormatGroup(rate, codec)
