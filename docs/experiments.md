@@ -4012,6 +4012,28 @@ ctest --preset dev --no-tests=error -R '^cpu_native_map_pages$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_map_pages$' -V
 ```
 
+### Memory transfer caller and recorder
+
+This fixture exercises the proposed `XMemTransferMemory` contract under test-provider policies. The source-built caller ([`transfer_mem_caller.asm`](../tests/cpu/transfer_mem_caller.asm)) imports `XMemTransferMemory` by name from `xmem.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled recording provider ([`transfer_mem_provider.cpp`](../tests/cpu/transfer_mem_provider.cpp)), it exercises seven checks:
+- **Step 1**: Valid 2 MiB transfer under test-provider policy partition 1 (`rcx = 1`, `rdx = 0x200000`), returning `TRUE` (`1`).
+- **Step 2**: Valid 16 MiB transfer under test-provider policy partition 1 (`rcx = 1`, `rdx = 0x1000000`), returning `TRUE` (`1`).
+- **Step 3**: Rejection control with invalid partition (`rcx = 0`), returning `FALSE` (`0`).
+- **Step 4**: Rejection control with zero byte count (`rdx = 0`), returning `FALSE` (`0`).
+- **Step 5**: Rejection control with unaligned byte count (not 2 MiB aligned under test-provider policy, `rdx = 0x200100`), returning `FALSE` (`0`).
+- **Step 6**: Rejection control with oversized byte count exceeding the 16 MiB policy maximum (`rdx = 0x2000000`), returning `FALSE` (`0`).
+- **Step 7**: Internal verification of provider call counters, rejection counts, and the ordered trace of calls directly within the caller process.
+
+The specific fixture inputs tested (`partition = 1`, `byte_count = 0x200000` and `0x1000000`) are synthetic fixture inputs chosen for this test. Partition selector 1, 2 MiB alignment, the 16 MiB maximum boundary, and `BOOL` return semantics are labeled as test-provider policy throughout; native console transfer semantics and partition effects remain open. The provider's recorded trace validates all six ordered argument pairs and call outcomes.
+
+A changed-first-call control patches the first 2 MiB request in the caller binary to 4 MiB: under both the Windows native loader and `pe_map`, the caller's internal trace check rejects the modification with exit code `0xF0B`, and the recorded trace reflects the changed 4 MiB argument in call 0.
+
+On success, the caller exits with the success sentinel `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return. An independent negative control confirms that withholding `XMemTransferMemory` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_transfer_mem$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_transfer_mem$' -V
+```
+
 ### Grouped allocation descriptor builders
 
 In the inspected Bink image, the function interval beginning at RVA `0x67c0` contains direct calls to the group initializer (`0x25b80`), append helper (`0x25b20`) and grouped allocator (`0x25a40`). The initializer places two adjacent arrays after a 64-byte header. Each successful append records a destination and a padded stride. With five available slots, requests of 0, 33, 1, 1025 and 32 bytes produced strides of 32, 64, 128, 1280 and 512 bytes in order. The stride in 32-byte units is congruent to the previous total in units plus one, modulo 32. All five stored strides were even. These helpers do not establish who produces odd tagged entries.
