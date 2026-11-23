@@ -1436,7 +1436,7 @@ ctest --preset dev --no-tests=error -R '^cpu_native_tls$' -V
 
 Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release` presets: on every notification (process attach and detach on the main thread, thread attach and detach on both workers) both loaders call caller 1, then caller 3, then the entry point. Every thread starts from the template, each thread's writes stay in its own copy, and the template in the loaded image is unchanged at the end. The two workers exit in either order, so only the per-thread sequences are compared between loaders. Two negative controls patch copies of the built DLL and must be rejected under both loaders: swapping the two callback table entries is reported as a callback order failure (`[3, 1, 2]` on process attach), and zeroing the template from its first page boundary on is reported as a template failure (array words differ on the main thread). See [issue #870](https://github.com/R0Y00/Xbox2Windows/issues/870).
 
-Until `pe_map` gained the TLS carrier described in the next section, this test pinned the opposite result: `pe_map_image` rejected the image with `MAP_UNSUPPORTED` ("TLS data"). `pe_map_run` still sends no thread notifications to an EXE (`notify` returns early for non-DLL images, so only `DLL_PROCESS_ATTACH` runs on the calling thread). This DLL test addresses the thread-local-value part of #165; it does not cover EXE startup: an EXE's TLS callbacks on a second worker thread under `pe_map_run`, C-runtime startup in a mapped EXE, `GetModuleHandle(NULL)`, and the PEB remain untested and unsupported. [Issue #165](https://github.com/R0Y00/Xbox2Windows/issues/165)
+Until `pe_map` gained the TLS carrier described in the next section, this test pinned the opposite result: `pe_map_image` rejected the image with `MAP_UNSUPPORTED` ("TLS data"). An EXE's own TLS template and callbacks under `pe_map_run`, including thread notifications, are covered in [An EXE's own TLS template and callbacks](#an-exes-own-tls-template-and-callbacks). This DLL test addresses the thread-local-value part of #165; it does not cover C-runtime startup in a mapped EXE, `GetModuleHandle(NULL)`, and the PEB remain untested and unsupported. [Issue #165](https://github.com/R0Y00/Xbox2Windows/issues/165)
 
 ```powershell
 cmake --build --preset dev --target pe_map cpu_tls_value cpu_tls_original cpu_tls_sink
@@ -1508,6 +1508,30 @@ Not covered: `DLL_PROCESS_DETACH` ordering at exit, DLLs built with the C runtim
 ```powershell
 cmake --build --preset dev --target pe_map cpu_startup_exe cpu_startup_a cpu_startup_a_alt cpu_startup_b cpu_startup_b_noinit cpu_startup_exe_timeout cpu_startup_exe_create
 ctest --preset dev --no-tests=error -R '^cpu_native_startup$' -V
+```
+
+### An EXE's own TLS template and callbacks
+
+`cpu_exe_tls` is a CRT-free, source-built EXE whose own image holds the implicit TLS data and the two TLS callbacks of `cpu_tls_value`: an int (`7`) and an 8 KiB array of distinct words in one initialized template that spans a 4 KiB page boundary, with callbacks in `.CRT$XLB` (caller 1) and `.CRT$XLM` (caller 3). The EXE supplies the TLS directory the C runtime would otherwise provide (`_tls_used`, `_tls_index`, the `.tls` markers and the `.CRT$XLA`/`.CRT$XLZ` bounds). Each callback records `observe()`: the int in the low 16 bits and the number of changed array words above them, so a fresh block reports 7. The entry point writes 20 to the main thread's copy and starts two workers. Worker A writes 50 and waits. Worker B starts after A's write, writes 60 and waits. A is then released and joined, then B, so every notification comes in a fixed order. The EXE prints one ordered startup log and returns the main thread's final `observe()` as its exit code.
+
+`cpu_native_exe_tls` checks the template layout and callback table with `pefile`, launches the EXE with Windows, and in a child process maps it with `pe_map_image` and starts it with `pe_map_run`. Both runs must print this log and exit code:
+
+```text
+LOG:m11=7 m13=7 E mf=7 mw=20014 a21=7 a23=7 af=7 aw=20032 b21=7 b23=7 bf=7 bw=2003c al=20032 a31=20032 a33=20032 bl=2003c b31=2003c b33=2003c ml=20014 X=20014
+exit 0x20014
+```
+
+`m11` is the main thread, reason 1 (process attach), caller 1. `a2`/`a3` and `b2`/`b3` are thread attach and detach of workers A and B. `E` is the entry point, and `f`, `w` and `l` are a thread's own first, written and last observations. Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release` presets:
+
+- Under both loaders both callbacks run in table order on process attach and on thread attach and detach of both workers. Every thread starts from the template, and each thread's writes stay in its own copy, including the values the detach callbacks see.
+- Before this test, `pe_map_run` called the EXE's callbacks only for process attach: `notify` returns early for an image without `IMAGE_FILE_DLL`, so a started EXE received no thread notifications. Against that mapper the test fails with `notifications for ['m1']`. Now `pe_map_run` marks the EXE as started, and from then until `pe_map_release`, `pe_map.dll`'s thread notifications call the EXE's TLS callbacks with `DLL_THREAD_ATTACH` and `DLL_THREAD_DETACH`, never its entry point. A mapped but unstarted EXE still receives nothing, as under `LoadLibrary`.
+- Negative controls patch copies of the built EXE with the `cpu_native_tls_value` helpers. Both loaders reject both: a swapped callback table as `callback order: m1 ran callers ['3', '1']`, and a template zeroed from its first page boundary as a template mismatch on the first callback.
+
+Not covered: process detach at exit (the log is written before the entry point returns), C-runtime startup in a mapped EXE, `GetModuleHandle(NULL)` and the PEB. [Issue #165](https://github.com/R0Y00/Xbox2Windows/issues/165), [issue #870](https://github.com/R0Y00/Xbox2Windows/issues/870)
+
+```powershell
+cmake --build --preset dev --target pe_map cpu_exe_tls
+ctest --preset dev --no-tests=error -R '^cpu_native_exe_tls$' -V
 ```
 
 ### Lifecycle of two DLLs with the static C runtime
