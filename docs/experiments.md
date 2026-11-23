@@ -1603,12 +1603,13 @@ An accepted release, checked and committed under one lock so that no participant
 2. It creates the thread suspended at a pe_map start routine and records the thread's ID and a `SYNCHRONIZE` handle before the thread can run.
 3. It resumes the thread unless the caller asked for `CREATE_SUSPENDED`.
 
-At its `DLL_THREAD_ATTACH`, only a thread found in that table installs the image's block. Any other thread, whatever its start address, returns at once untouched. The pe_map start routine calls the guest's start routine only if the installation succeeded. Enrollment can fail in two ways, and neither runs guest code:
+At its `DLL_THREAD_ATTACH`, only a thread found in that table installs the image's block. Any other thread, whatever its start address, returns at once untouched. The pe_map start routine calls the guest's start routine only if the installation succeeded. Enrollment can fail in three ways, and none runs guest code:
 
 - **No entry or no handle.** If no entry can be reserved or the thread cannot be watched, `pe_map_main_create_thread` returns null with `ERROR_NOT_ENOUGH_MEMORY` and no thread exists. The guest's caller sees an ordinary `CreateThread` failure.
+- **The resume fails.** If `ResumeThread` returns `DWORD(-1)`, `pe_map_main_create_thread` returns null with `ResumeThread`'s last error and never hands out the suspended handle. The thread, still suspended at the pe_map start routine, is ended. Its entry and watch handle stay reserved until the handle is signaled, so release keeps refusing and the slot is not reused while the thread could still exist.
 - **The block cannot be installed.** If the block cannot be installed on the new thread, the pe_map start routine returns `0xE0000201` without calling the guest's start routine. The main image's callbacks are not notified, because the thread does not participate.
 
-`pe_map_main_tls_stats` counts both. An enrolled thread that has not yet passed its start routine counts as one that may run the image's code, so release refuses while it lives. `pe_map_main_tls_inject` makes the next enrollment (1) or installation (2) fail, for tests.
+`pe_map_main_tls_stats` counts all three: the first two as refused enrollments (null returned), the last as a failed enrolled thread. An enrolled thread that has not yet passed its start routine counts as one that may run the image's code, so release refuses while it lives. `pe_map_main_tls_inject` makes the next enrollment (1), installation (2) or resume (3, as `ERROR_ACCESS_DENIED`) fail, for tests.
 
 Supported thread entries are these three:
 
@@ -1659,8 +1660,10 @@ A refused release returns 0 with the refusal reported. The accepted release is t
 | `probe` (control): p enrolled | adds `p2=yy p:yyyy p3=y-` | `1,1,0,0` | `3,3` | `5,5,0,0,0,0,1,0,0,0` |
 | `enroll_refused`: p's enrollment fails | as Windows | `0,0,8,0`: `CreateThread` returned null, no thread | `2,2` | `4,4,0,0,0,0,1,0,1,0` |
 | `install_failed`: installation on p fails | as Windows | `0,1,0,e0000201`: p ended before its start routine | `2,2` | `4,4,0,0,0,0,1,0,0,1` |
+| `resume_failed`: the resume of p fails | as Windows | `0,0,5,0`: `CreateThread` returned null with `ResumeThread`'s error, p ended suspended | `2,2` | `4,4,0,0,0,0,1,0,1,0` |
+| `cancelled`: 65 suspended workers ended in turn, then p | adds `p2=yy p:yyyy p3=y-` | `1,1,0,0` | `3,3` | `5,5,0,0,0,0,1,0,0,65` |
 
-In both failure scenarios the sentinel stayed 0, the guest received no callback for p, workers a and b were enrolled as usual, and the host process survived to print its report and exit 0.
+The probe worker is created without `CREATE_SUSPENDED`, so the bound `CreateThread` resumes it itself. In every failure scenario the sentinel stayed 0, the guest received no callback for p, workers a and b were enrolled as usual, and the host process survived to print its report and exit 0.
 
 The `cancelled` control creates and ends 65 suspended enrolled workers in succession. None reaches its start routine or adds a guest callback. Their signaled handles let the mapper reclaim enrollment slots before admitting later workers, and the final release accounts for all 65 exits.
 
@@ -1673,6 +1676,7 @@ Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release`:
   - Without the notification gate, `main` fails because the guest receives the late thread's attach and detach, and its totals become `4,4`.
   - If the pe_map start routine calls the guest's start routine after a failed installation, `install_failed` fails: the sentinel becomes 1 and p's own check sees the host's block (`p:n---`, `X=1`).
   - If a failed installation ends the process with `__fastfail` (the previous model), `install_failed` fails: the child host dies with `0xC0000409` before it prints a report.
+  - If `pe_map_main_create_thread` ignores a failed resume and returns the handle, `resume_failed` fails: the guest waits on a thread that never runs, and the child exits with `0xE0000003`.
 
 Not covered:
 

@@ -21,6 +21,8 @@
 //                    CreateThread returns null and no thread is created
 //   install_failed   the same, with the installation on p made to fail (pe_map_main_tls_inject(2)): p ends
 //                    with 0xE0000201 without its start routine
+//   resume_failed    the same, with the resume of p made to fail (pe_map_main_tls_inject(3)): the guest's
+//                    CreateThread returns null with ERROR_ACCESS_DENIED and p is ended before it runs
 // Under pe_map_run_main the guest's CreateThread import is bound to pe_map_main_create_thread, so the guest's
 // workers are enrolled; under pe_map_run it is bound to kernel32's CreateThread.
 // In every scenario a reader thread that never participates samples its own slot 0 and sentinel from
@@ -335,14 +337,14 @@ extern "C" int host_entry() {
     const int argc = split(GetCommandLineW(), argv, 8);
     if (argc != 4)
         ExitProcess(fail_setup("usage: host <pe_map.dll> <image> main|alive|exited|untracked|paused|plain|probe|"
-                               "enroll_refused|install_failed|cancelled"));
+                               "enroll_refused|install_failed|resume_failed|cancelled"));
     const wchar_t* scenario = argv[3];
     const bool plain = same(scenario, L"plain");
     const bool alive = same(scenario, L"alive"), exited = same(scenario, L"exited"),
                untracked = same(scenario, L"untracked"), paused = same(scenario, L"paused");
     const bool enroll_refused = same(scenario, L"enroll_refused"), install_failed = same(scenario, L"install_failed");
-    const bool cancelled = same(scenario, L"cancelled");
-    const bool probe = enroll_refused || install_failed || cancelled || same(scenario, L"probe");
+    const bool cancelled = same(scenario, L"cancelled"), resume_failed = same(scenario, L"resume_failed");
+    const bool probe = enroll_refused || install_failed || resume_failed || cancelled || same(scenario, L"probe");
     if (!plain && !alive && !exited && !untracked && !paused && !probe && !same(scenario, L"main"))
         ExitProcess(fail_setup("scenario"));
     HANDLE paused_event = nullptr, resume_event = nullptr, ok_event = nullptr, bad_event = nullptr;
@@ -385,6 +387,7 @@ extern "C" int host_entry() {
     if (probe && !probe_result) ExitProcess(fail_setup("guest probe"));
     if (enroll_refused) inject(1);
     if (install_failed) inject(2);
+    if (resume_failed) inject(3);
 
     std::uint32_t exit_code = 0xdeadbeef;
     const int started = run(base, &exit_code);

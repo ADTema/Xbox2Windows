@@ -705,7 +705,9 @@ constexpr DWORD ENROLL_FAILED_EXIT = 0xE0000201u;  // exit code of an enrolled t
 
 // A thread enrolled by pe_map_main_create_thread, until its pe_map start routine has passed it on.
 struct Enrollment {
-    enum State { FREE, RESERVED, READY, INSTALLED, FAILED } state = FREE;
+    // CANCELLED: pe_map_main_create_thread refused the thread after creating it (ResumeThread failed) and is
+    // ending it; the entry stays until its handle is signaled.
+    enum State { FREE, RESERVED, READY, INSTALLED, FAILED, CANCELLED } state = FREE;
     DWORD thread = 0;         // its thread ID, recorded before it can run
     HANDLE handle = nullptr;  // SYNCHRONIZE, to tell an enrolled thread that ended before its start routine
     LPTHREAD_START_ROUTINE start = nullptr;
@@ -795,7 +797,8 @@ void free_entry(Enrollment& entry) {
 void reap_ended_enrollments(MainImage& main) {
     for (auto& entry : main.enrolling) {
         if (!entry.handle || WaitForSingleObject(entry.handle, 0) != WAIT_OBJECT_0) continue;
-        ++main.enroll_failed;
+        // A cancelled thread was already counted as a refused enrollment when the guest got null.
+        if (entry.state != Enrollment::CANCELLED) ++main.enroll_failed;
         free_entry(entry);
     }
 }
@@ -1671,7 +1674,9 @@ extern "C" __declspec(dllexport) int pe_map_main_thread_leave() {
 // enrolled: it is created suspended at a pe_map start routine, its thread ID is recorded before it can run,
 // it gets the image's block in slot 0 at its DLL_THREAD_ATTACH, and only then is the guest's start routine
 // called; it is resumed here unless flags has CREATE_SUSPENDED. Returns null with ERROR_NOT_ENOUGH_MEMORY and
-// creates no thread when the enrollment table is full or the thread cannot be watched. When the block
+// creates no thread when the enrollment table is full or the thread cannot be watched. When ResumeThread
+// fails, it returns null with ResumeThread's last error, never a suspended handle: the thread is ended before
+// it ran anything, and its entry stays reserved until the thread has exited. When the block
 // cannot be installed, the thread ends with ENROLL_FAILED_EXIT (0xE0000201) without running the guest's start
 // routine. Both failures are counted in pe_map_main_tls_stats. With no main image it is CreateThread.
 extern "C" __declspec(dllexport) HANDLE WINAPI pe_map_main_create_thread(LPSECURITY_ATTRIBUTES attributes,
@@ -1730,13 +1735,43 @@ extern "C" __declspec(dllexport) HANDLE WINAPI pe_map_main_create_thread(LPSECUR
         SetLastError(error);
         return nullptr;
     }
-    if (!(flags & CREATE_SUSPENDED)) ResumeThread(thread);
-    if (thread_id) *thread_id = id;
-    return thread;
+    if (thread_id) *thread_id = id;  // before the thread can run, as the entry's thread ID
+    if (flags & CREATE_SUSPENDED) return thread;
+    DWORD resumed = DWORD(-1);
+    {
+        const SlotLock hold;
+        if (take_fault(main_image(), 3))
+            SetLastError(ERROR_ACCESS_DENIED);  // as if ResumeThread had failed
+        else
+            resumed = 0;
+    }
+    if (resumed == 0) resumed = ResumeThread(thread);
+    if (resumed != DWORD(-1)) return thread;
+    // The thread is still suspended at the pe_map start routine and has run nothing, guest code included.
+    // Refuse the creation: end the thread and keep its entry and watch handle until the handle is signaled,
+    // so release keeps refusing and the slot is not reused while the thread could still exist.
+    error = GetLastError();
+    {
+        const SlotLock hold;
+        auto& main = main_image();
+        main.enrolling[slot].state = Enrollment::CANCELLED;
+        ++main.enroll_refused;
+    }
+    TerminateThread(thread, ENROLL_FAILED_EXIT);
+    WaitForSingleObject(watch, 10000);
+    CloseHandle(thread);
+    {
+        const SlotLock hold;
+        reap_ended_enrollments(main_image());  // frees the entry now if the thread has ended
+    }
+    if (thread_id) *thread_id = 0;
+    SetLastError(error);
+    return nullptr;
 }
 
 // Test-only fault injection for the main-image enrollment: 1 makes the next pe_map_main_create_thread fail
-// to enroll, 2 makes the next installation on an enrolled thread fail, 0 clears. One shot.
+// to enroll, 2 makes the next installation on an enrolled thread fail, 3 makes the next ResumeThread in
+// pe_map_main_create_thread fail with ERROR_ACCESS_DENIED, 0 clears. One shot.
 extern "C" __declspec(dllexport) void pe_map_main_tls_inject(int fault) {
     const SlotLock hold;
     main_image().inject = fault;
@@ -1746,7 +1781,8 @@ extern "C" __declspec(dllexport) void pe_map_main_tls_inject(int fault) {
 // out[2] participants confirmed exited at a release, out[3] refused releases, out[4] participants and
 // enrolled threads still pending, out[5] 1 while an image is started as the main image, out[6] the last
 // release (-1 none, 1 accepted, 2 refused), out[7] installed participants without a handle, out[8]
-// enrollments refused (no thread created), out[9] enrolled threads ended without the guest's start routine.
+// enrollments refused (null returned to the caller), out[9] enrolled threads ended without the guest's
+// start routine.
 // out must hold 10 entries.
 extern "C" __declspec(dllexport) void pe_map_main_tls_stats(std::int64_t* out) {
     if (!out) return;

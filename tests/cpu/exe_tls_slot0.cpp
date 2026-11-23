@@ -34,7 +34,7 @@
 // start routine touches a global sentinel before anything else and then runs the same check. A failed
 // CreateThread does not end the process here: the entry point records the result, and workers a and b
 // follow as usual. exe_slot0_probe reports the sentinel, whether CreateThread returned a handle, its last
-// error and p's exit code, for a host that makes p's enrollment or installation fail.
+// error and p's exit code, for a host that makes p's enrollment, its resume or its installation fail.
 #include <windows.h>
 #include <intrin.h>
 
@@ -195,11 +195,12 @@ DWORD WINAPI probe_worker(void*) {
 
 void run_probe() {
     SetLastError(ERROR_SUCCESS);
-    HANDLE thread = CreateThread(nullptr, 0, probe_worker, nullptr, CREATE_SUSPENDED, &g_threads[4]);
+    // Not suspended: the CreateThread the host bound resumes it itself, so a failed resume is reported here.
+    // That binding records the thread ID before the thread can run.
+    HANDLE thread = CreateThread(nullptr, 0, probe_worker, nullptr, 0, &g_threads[4]);
     g_probe[1] = thread != nullptr;
     g_probe[2] = static_cast<LONG>(thread ? ERROR_SUCCESS : GetLastError());
     if (!thread) return;
-    ResumeThread(thread);
     if (WaitForSingleObject(thread, WAIT_MS) != WAIT_OBJECT_0) ExitProcess(WAIT_FAILED_CODE);
     DWORD code = 0;
     GetExitCodeThread(thread, &code);

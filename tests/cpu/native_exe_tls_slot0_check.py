@@ -42,10 +42,13 @@ cpu_exe_tls_slot0_enroll, whose probe worker p touches a global sentinel first i
   ERROR_NOT_ENOUGH_MEMORY, no thread exists, the sentinel stays 0 and the refusal is counted.
 - install_failed: the installation on p is made to fail. p ends with 0xE0000201 before its start routine,
   the sentinel stays 0, the guest gets no callback for p and the failure is counted.
+- resume_failed: the resume of p inside the bound CreateThread is made to fail. The guest's CreateThread
+  returns null with ResumeThread's error (ERROR_ACCESS_DENIED), never a suspended handle; p is ended before
+  it runs, the sentinel stays 0, the refusal is counted, and workers a and b are enrolled afterwards.
 - cancelled: the host creates and cancels 65 suspended enrolled workers, one at a time. Every worker
   exits without running its start routine, the table keeps admitting workers, and cleanup accounts for
   all 65 exits without changing the participating callback totals.
-In both failure cases the guest's later workers are enrolled as usual, the host survives and prints its
+In every failure case the guest's later workers are enrolled as usual, the host survives and prints its
 report, and every other check (reader, late thread, release, cleanup) holds.
 """
 
@@ -65,6 +68,7 @@ PAUSED = EXPECTED.replace(" X=0", " c2=yy c:yyyy X=0")
 PROBED = EXPECTED.replace(" a2=", " p2=yy p:yyyy p3=y- a2=")
 ERROR_NOT_ENOUGH_MEMORY = 8
 ENROLL_FAILED_EXIT = 0xE0000201
+ERROR_ACCESS_DENIED = 5
 # stats: installed, restored, exited, refused releases, pending, active, last release (1 accepted), untracked,
 # enrollments refused (no thread created), enrolled threads ended without the guest's start routine.
 # Participants: the starting thread, the guest's workers (a, b and, paused, c) and the host's participants.
@@ -94,6 +98,9 @@ ENROLL = {
     "install_failed": {"stats": [4, 4, 0, 0, 0, 0, 1, 0, 0, 1], "refused": None, "participant": True,
                        "resumed": None, "late": 0, "callbacks": "2,2", "log": EXPECTED,
                        "probe": [0, 1, 0, ENROLL_FAILED_EXIT]},
+    "resume_failed": {"stats": [4, 4, 0, 0, 0, 0, 1, 0, 1, 0], "refused": None, "participant": True,
+                      "resumed": None, "late": 0, "callbacks": "2,2", "log": EXPECTED,
+                      "probe": [0, 0, ERROR_ACCESS_DENIED, 0]},
     "cancelled": {"stats": [5, 5, 0, 0, 0, 0, 1, 0, 0, 65], "refused": None, "participant": True,
                   "resumed": None, "late": 0, "callbacks": "3,3", "log": PROBED,
                   "probe": [1, 1, 0, 0]},
@@ -197,10 +204,12 @@ def mapped(mapper, exe, host, paused_exe):
 def enroll(mapper, exe, host):
     for scenario, want in ENROLL.items():
         check(mapper, exe, host, scenario, want)
-    print("enroll: a refused enrollment made the guest's CreateThread return null with no thread created, and a "
-          "failed installation ended the thread with 0xE0000201 before its start routine; in both the sentinel the "
-          "start routine touches first stayed 0, the guest got no callback for the thread, the failure was counted, "
-          "later workers were enrolled as usual and the host process survived; the control touched the sentinel")
+    print("enroll: a refused enrollment made the guest's CreateThread return null with no thread created, a failed "
+          "resume made it return null with ResumeThread's error after ending the suspended thread, and a failed "
+          "installation ended the thread with 0xE0000201 before its start routine; in each the sentinel the start "
+          "routine touches first stayed 0, the guest got no callback for the thread, the failure was counted, later "
+          "workers were enrolled as usual and the host process survived; the control touched the sentinel; 65 "
+          "cancelled suspended workers were all reclaimed")
 
 
 if __name__ == "__main__":
