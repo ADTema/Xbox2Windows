@@ -3269,6 +3269,22 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_exe_tls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_tls_check.py" "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_exe_tls>"
         "$<TARGET_FILE:cpu_exe_tls_early>")
+    # Main-image TLS slot 0: a CRT-free /GA EXE whose thread-locals are read through slot 0, launched by
+    # Windows and started by a CRT-free host that owns slot 0 itself, with pe_map_run_main and, as the
+    # control, pe_map_run (Refs #870, #165).
+    add_executable(cpu_exe_tls_slot0 tests/cpu/exe_tls_slot0.cpp)
+    target_compile_options(cpu_exe_tls_slot0 PRIVATE /GS- /Zl /GA)
+    target_link_options(cpu_exe_tls_slot0 PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
+        /INCREMENTAL:NO)
+    target_link_libraries(cpu_exe_tls_slot0 PRIVATE kernel32)
+    add_executable(cpu_exe_tls_slot0_host tests/cpu/exe_tls_slot0_host.cpp)
+    target_compile_options(cpu_exe_tls_slot0_host PRIVATE /GS- /Zl)
+    target_link_options(cpu_exe_tls_slot0_host PRIVATE /ENTRY:host_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
+        /DYNAMICBASE /INCREMENTAL:NO)
+    target_link_libraries(cpu_exe_tls_slot0_host PRIVATE kernel32)
+    add_test(NAME cpu_native_exe_tls_slot0 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_tls_slot0_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_tls_slot0>" "$<TARGET_FILE:cpu_exe_tls_slot0_host>")
     # Lifecycle fixtures: two DLLs with the static MSVC runtime (B imports A) and a CRT-free event sink.
     add_library(cpu_life_sink SHARED tests/cpu/life_sink.cpp)
     target_compile_options(cpu_life_sink PRIVATE /GS- /Zl)

@@ -8,6 +8,7 @@
 
 #include <bcrypt.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <sddl.h>
 
 #include <cstdint>
@@ -288,7 +289,8 @@ BOOL notify(const Image& image, const IMAGE_NT_HEADERS64* nt, const std::vector<
 //
 // Differences from a Windows load of the guest: the template is copied once, when the image is
 // mapped, so a later write to the template in the image does not reach threads created afterwards;
-// and code that assumes index 0 without reading AddressOfIndex cannot be served.
+// and code that assumes index 0 without reading AddressOfIndex (/GA) is served only when the image is
+// started as the main image (pe_map_run_main), which puts its block in slot 0 of every thread.
 constexpr std::uint64_t MAX_TLS_TEMPLATE = 16ull << 20;
 
 // One map call's carrier and everything it owns. Nothing else is ever deleted: cleanup goes through
@@ -633,6 +635,7 @@ struct Mapped {
     volatile LONG released;  // set by pe_map_release; notifiers skip the image from then on
     TlsCarrier carrier;      // holds the image's implicit TLS blocks; empty without a template
     volatile LONG started = 0;  // set by pe_map_run for an EXE; its TLS callbacks then see thread notifications
+    volatile LONG keep_carrier = 0;  // a main image's block could not be taken back from a live thread
 };
 
 struct SharedLock {
@@ -652,6 +655,182 @@ struct ExclusiveLock {
 std::vector<Mapped*>& mapped_images() {
     static std::vector<Mapped*> images;
     return images;
+}
+
+// Main-image TLS slot 0 (pe_map_run_main). Code compiled with /GA reads an EXE's thread-locals
+// through slot 0 of ThreadLocalStoragePointer without loading _tls_index, because Windows gives the
+// process's EXE index 0. An EXE started as the main image therefore needs its block, which Windows
+// keeps at the carrier's index, in slot 0 of every thread. For each thread pe_map saves what slot 0
+// held (the host's block, or null), puts the image's block there and records the pair under the
+// thread ID and TEB: at the start for the calling thread and a sweep of the threads that already
+// exist, and on DLL_THREAD_ATTACH for threads created later. A thread ID is unique only among live
+// threads, so a record left by a thread that ended without a detach (TerminateThread) is dropped when
+// its ID attaches again. On DLL_THREAD_DETACH slot 0 gets the saved block back after the image's own
+// callbacks for that detach, and before ntdll frees the thread's blocks, which would otherwise free
+// the image's block twice (as slot 0's and as the carrier's) and leak the host's. pe_map_release
+// restores every recorded thread that is still alive; when one cannot be restored, the carrier stays
+// loaded so that its block is never freed while a thread can still reach it.
+// While the image is installed, the host's own code that reaches index 0 reads the image's block, so
+// a host that owns slot 0 must not touch its own thread-locals between the start and the release.
+// Rule and measurements: MoonYueya on #870.
+struct SlotRecord {
+    DWORD thread;
+    void* teb;
+    void* host;  // what slot 0 held before the image's block was installed
+};
+
+struct MainImage {
+    std::uint8_t* base = nullptr;  // the image started as the main image, or null
+    DWORD index = 0;               // the carrier's TLS index, read from the image's AddressOfIndex
+    std::vector<SlotRecord> records;
+    std::int64_t installed = 0, restored = 0, stale = 0, mismatched = 0;
+};
+
+// Guards main_image(). Taken without mapped_lock held, and mapped_lock is never taken under it.
+SRWLOCK slot_lock = SRWLOCK_INIT;
+
+struct SlotLock {
+    SlotLock() { AcquireSRWLockExclusive(&slot_lock); }
+    ~SlotLock() { ReleaseSRWLockExclusive(&slot_lock); }
+    SlotLock(const SlotLock&) = delete;
+    SlotLock& operator=(const SlotLock&) = delete;
+};
+
+MainImage& main_image() {
+    static MainImage image;
+    return image;
+}
+
+constexpr std::size_t TEB_TLS_POINTER = 0x58;   // TEB.ThreadLocalStoragePointer on x64
+constexpr std::size_t TEB_SAME_FLAGS = 0x17EE;  // TEB.SameTebFlags on x64 Windows 10 and 11
+constexpr USHORT SKIP_THREAD_ATTACH = 1u << 3, LOADER_WORKER = 1u << 13;
+
+void** tls_slots(void* teb) { return *reinterpret_cast<void***>(static_cast<std::uint8_t*>(teb) + TEB_TLS_POINTER); }
+
+void* thread_teb(HANDLE thread) {
+    using Query = LONG(NTAPI*)(HANDLE, ULONG, void*, ULONG, ULONG*);
+    static const auto query =
+        reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    struct {
+        LONG exit_status;
+        void* teb;
+        void* client_id[2];
+        ULONG_PTR affinity;
+        LONG priority, base_priority;
+    } info{};  // THREAD_BASIC_INFORMATION
+    return query && query(thread, 0 /* ThreadBasicInformation */, &info, sizeof(info), nullptr) >= 0 ? info.teb
+                                                                                                       : nullptr;
+}
+
+// Installs the image's block in slot 0 of one thread. Caller holds slot_lock. May throw bad_alloc.
+void install_slot(MainImage& main, DWORD thread, void* teb) {
+    void** slots = tls_slots(teb);
+    if (!slots) return;
+    void* const block = slots[main.index];
+    auto& records = main.records;
+    for (auto it = records.begin(); it != records.end();) {
+        if (it->thread != thread) {
+            ++it;
+        } else if (it->teb == teb && slots[0] == block) {
+            return;  // already installed (the sweep and the thread's own attach)
+        } else {
+            it = records.erase(it);  // a thread that ended without a detach had this ID
+            ++main.stale;
+        }
+    }
+    records.push_back({thread, teb, slots[0]});
+    slots[0] = block;
+    ++main.installed;
+}
+
+// Puts the saved block back in slot 0 if the image's block is still there. Caller holds slot_lock.
+bool restore_slot(MainImage& main, const SlotRecord& record) {
+    void** slots = tls_slots(record.teb);
+    if (!slots || slots[0] != slots[main.index]) {
+        ++main.mismatched;
+        return false;
+    }
+    slots[0] = record.host;
+    ++main.restored;
+    return true;
+}
+
+void install_current_thread() {
+    const SlotLock hold;
+    auto& main = main_image();
+    if (!main.base) return;
+    try {
+        install_slot(main, GetCurrentThreadId(), NtCurrentTeb());
+    } catch (const std::bad_alloc&) {
+        // Not recorded, so not installed: slot 0 keeps the host's block on this thread.
+    }
+}
+
+void restore_current_thread() {
+    const SlotLock hold;
+    auto& main = main_image();
+    if (!main.base) return;
+    const DWORD thread = GetCurrentThreadId();
+    void* const teb = NtCurrentTeb();
+    for (auto it = main.records.begin(); it != main.records.end(); ++it) {
+        if (it->thread == thread && it->teb == teb) {
+            restore_slot(main, *it);
+            main.records.erase(it);
+            return;
+        }
+    }
+}
+
+// Installs the image's block on every other thread of the process that exists now and receives
+// thread notifications. Threads that skip them (ntdll's loader workers) are left alone: no detach
+// would give their slot 0 back. Caller holds slot_lock. May throw bad_alloc.
+void sweep_threads(MainImage& main) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{sizeof(entry)};
+    const DWORD process = GetCurrentProcessId(), self = GetCurrentThreadId();
+    for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
+        HANDLE thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+        if (!thread) continue;
+        DWORD code = 0;
+        void* const teb = GetExitCodeThread(thread, &code) && code == STILL_ACTIVE ? thread_teb(thread) : nullptr;
+        if (teb) {
+            const USHORT flags = *reinterpret_cast<const USHORT*>(static_cast<std::uint8_t*>(teb) + TEB_SAME_FLAGS);
+            if (!(flags & (SKIP_THREAD_ATTACH | LOADER_WORKER))) install_slot(main, entry.th32ThreadID, teb);
+        }
+        CloseHandle(thread);
+    }
+    CloseHandle(snapshot);
+}
+
+// Ends main-image mode for base: gives slot 0 back to every recorded thread that is still alive.
+// Returns false when a live thread's slot 0 could not be restored.
+bool release_main(std::uint8_t* base) {
+    const SlotLock hold;
+    auto& main = main_image();
+    if (main.base != base) return true;
+    bool restored_all = true;
+    const DWORD self = GetCurrentThreadId();
+    for (const auto& record : main.records) {
+        if (record.thread == self && record.teb == NtCurrentTeb()) {
+            restored_all = restore_slot(main, record) && restored_all;
+            continue;
+        }
+        HANDLE thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, record.thread);
+        DWORD code = 0;
+        const bool alive = thread && GetExitCodeThread(thread, &code) && code == STILL_ACTIVE &&
+                           thread_teb(thread) == record.teb;
+        if (alive) {
+            restored_all = restore_slot(main, record) && restored_all;
+        } else {
+            ++main.stale;  // the thread ended without a detach; its blocks are gone with it
+        }
+        if (thread) CloseHandle(thread);
+    }
+    main.records.clear();
+    main.base = nullptr;
+    return restored_all;
 }
 
 // Notify a mapped image, re-reading its callback list as Windows does; if the list was
@@ -686,7 +865,8 @@ void finalize(Mapped* record) {
     notify_mapped(base, DLL_PROCESS_DETACH);
     const auto& pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
     if (pdata.Size) RtlDeleteFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(base + pdata.VirtualAddress));
-    unload(record->carrier);
+    // A main image's block that a live thread may still reach stays allocated, so its carrier stays loaded.
+    if (!InterlockedCompareExchange(&record->keep_carrier, 0, 0)) unload(record->carrier);
     VirtualFree(base, 0, MEM_RELEASE);
 }
 
@@ -698,15 +878,16 @@ void drop_reference(Mapped* record) {
 
 }  // namespace
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
-    if (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) {
+namespace {
+void notify_thread(DWORD reason) {
+    {
         std::vector<Mapped*> snapshot;
         {
             const SharedLock hold;
             try {
                 snapshot.reserve(mapped_images().size());
             } catch (const std::bad_alloc&) {
-                return TRUE;  // no references were taken, so nothing is left pending
+                return;  // no references were taken, so nothing is left pending
             }
             for (auto* record : mapped_images()) {
                 InterlockedIncrement(&record->references);
@@ -725,6 +906,19 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         } else {
             for (auto it = snapshot.rbegin(); it != snapshot.rend(); ++it) notify_one(*it);
         }
+    }
+}
+}  // namespace
+
+// A main image's block goes into slot 0 before any image is notified of the attach, and the host's
+// block comes back after every image has been notified of the detach.
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+    if (reason == DLL_THREAD_ATTACH) {
+        install_current_thread();
+        notify_thread(reason);
+    } else if (reason == DLL_THREAD_DETACH) {
+        notify_thread(reason);
+        restore_current_thread();
     }
     return TRUE;
 }
@@ -1246,6 +1440,7 @@ extern "C" __declspec(dllexport) int pe_map_release(void* mapped) {
     }
     if (!record) return 0;
     InterlockedExchange(&record->released, 1);
+    if (!release_main(record->base)) InterlockedExchange(&record->keep_carrier, 1);
     drop_reference(record);
     return 1;
 }
@@ -1275,14 +1470,13 @@ extern "C" __declspec(dllexport) int pe_map_release(void* mapped) {
 // process-attach callbacks is not notified, whoever started it; Windows instead holds such a thread until
 // process initialization ends, which pe_map does not reproduce. Release sends the EXE no process detach.
 // Measured on Windows 10 build 19045 with tests/cpu/exe_tls.cpp.
-extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exit_code) {
-    auto* base = static_cast<std::uint8_t*>(mapped);
-    const auto* nt = Image{base, 0}.headers();
-    if (!exit_code || (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) || !nt->OptionalHeader.AddressOfEntryPoint)
-        return 0;
-    const Image image{base, nt->OptionalHeader.SizeOfImage};
-    std::vector<PIMAGE_TLS_CALLBACK> callbacks;
-    if (tls_callbacks(image, nt, callbacks)) return 0;
+namespace {
+bool startable(const IMAGE_NT_HEADERS64* nt, const std::uint32_t* exit_code) {
+    return exit_code && !(nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && nt->OptionalHeader.AddressOfEntryPoint;
+}
+
+int start_exe(std::uint8_t* base, const IMAGE_NT_HEADERS64* nt, std::vector<PIMAGE_TLS_CALLBACK>& callbacks,
+              std::uint32_t* exit_code) {
     for (auto callback : callbacks) callback(base, DLL_PROCESS_ATTACH, nullptr);
     {
         // Thread notifications become eligible only now: after every process-attach callback has
@@ -1295,4 +1489,75 @@ extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exi
     using Entry = DWORD(WINAPI*)(void*);
     *exit_code = reinterpret_cast<Entry>(base + nt->OptionalHeader.AddressOfEntryPoint)(nullptr);
     return 1;
+}
+}  // namespace
+
+extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exit_code) {
+    auto* base = static_cast<std::uint8_t*>(mapped);
+    const auto* nt = Image{base, 0}.headers();
+    if (!startable(nt, exit_code)) return 0;
+    const Image image{base, nt->OptionalHeader.SizeOfImage};
+    std::vector<PIMAGE_TLS_CALLBACK> callbacks;
+    if (tls_callbacks(image, nt, callbacks)) return 0;
+    return start_exe(base, nt, callbacks, exit_code);
+}
+
+// pe_map_run for the image the host treats as its main executable: before the process-attach
+// callbacks, the image's TLS block goes into slot 0 of the calling thread and of every other thread
+// that exists and receives thread notifications, and from then until pe_map_release into slot 0 of
+// each thread that attaches (see install_slot). Each thread gets its saved slot 0 back on its detach,
+// after the image's callbacks; pe_map_release gives it back to the threads still alive. Same
+// preconditions and results as pe_map_run, and in addition returns 0 without running anything when
+// another image is already started as the main image or the records cannot be allocated. An image
+// without a TLS template has no block to install and simply starts. Writing another thread's slot 0
+// during the sweep races with that thread only if it is reading its own slot 0 at that moment, which
+// a host that started no guest code yet does not do for the image's index.
+extern "C" __declspec(dllexport) int pe_map_run_main(void* mapped, std::uint32_t* exit_code) {
+    auto* base = static_cast<std::uint8_t*>(mapped);
+    const auto* nt = Image{base, 0}.headers();
+    if (!startable(nt, exit_code)) return 0;
+    const Image image{base, nt->OptionalHeader.SizeOfImage};
+    std::vector<PIMAGE_TLS_CALLBACK> callbacks;
+    if (tls_callbacks(image, nt, callbacks)) return 0;
+    bool carrier = false;
+    {
+        const SharedLock hold;
+        for (auto* record : mapped_images())
+            if (record->base == base) carrier = record->carrier.module != nullptr;
+    }
+    if (carrier) {
+        const SlotLock hold;
+        auto& main = main_image();
+        if (main.base) return 0;
+        const auto& tls = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
+        const auto* t = image.at<IMAGE_TLS_DIRECTORY64>(tls.VirtualAddress);
+        std::memcpy(&main.index, reinterpret_cast<const void*>(t->AddressOfIndex), sizeof(main.index));
+        main.base = base;
+        try {
+            install_slot(main, GetCurrentThreadId(), NtCurrentTeb());
+            sweep_threads(main);
+        } catch (const std::bad_alloc&) {
+            for (const auto& record : main.records) restore_slot(main, record);
+            main.records.clear();
+            main.base = nullptr;
+            return 0;
+        }
+    }
+    return start_exe(base, nt, callbacks, exit_code);
+}
+
+// Main-image slot 0 counters since the process started, for tests: out[0] installs, out[1] restores,
+// out[2] stale records dropped (an ID reused or a thread gone at release), out[3] restores refused
+// because slot 0 no longer held the image's block, out[4] live records, out[5] 1 while an image is
+// started as the main image.
+extern "C" __declspec(dllexport) void pe_map_main_tls_stats(std::int64_t* out) {
+    if (!out) return;
+    const SlotLock hold;
+    const auto& main = main_image();
+    out[0] = main.installed;
+    out[1] = main.restored;
+    out[2] = main.stale;
+    out[3] = main.mismatched;
+    out[4] = static_cast<std::int64_t>(main.records.size());
+    out[5] = main.base != nullptr;
 }
