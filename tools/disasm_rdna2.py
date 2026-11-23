@@ -1041,6 +1041,22 @@ MTBUF_FORMATS = {
 # the lane or sub-dword controls.
 VOP_EXTENSION_FORMS = {233: "DPP8", 234: "DPP8", 249: "SDWA", 250: "DPP16"}
 SDWA_SEL_NAMES = ("BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD")
+# Scalar source codes 209-234 are outside the supported LLVM 15 decoder subset for GFX10 SDWA: LLVM 15
+# refuses every VOPC SDWA record that names one as src0 or src1. This records LLVM 15's behaviour; it is
+# not a claim about the ISA.
+SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES = range(209, 235)
+
+
+def _format_sdwa_float_modifiers(val: str, scalar_code: int | None, is_abs: int, is_neg: int) -> str:
+    """Wrap a float SDWA source in abs/neg modifiers as LLVM 15 prints them.
+
+    neg without abs on an inline constant (scalar codes 128-208 and 240-248) is printed `neg(c)`, as LLVM 15
+    does: `-1` would name the inline constant -1 (0xffffffff), not 1 with its sign bit flipped (0x80000001).
+    """
+    inline_constant = scalar_code is not None and (128 <= scalar_code <= 208 or 240 <= scalar_code <= 248)
+    if inline_constant and is_neg and not is_abs:
+        return f"neg({val})"
+    return _format_operand_modifiers(val, is_abs, is_neg)
 
 
 def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
@@ -1069,6 +1085,10 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
         return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "VOPCX SDWA forbids sdst_en")
     if (src0_sgpr and src0_raw in (249, 250, 255)) or (src1_sgpr and vsrc1 in (249, 250, 255)):
         return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA scalar operand")
+    if ((src0_sgpr and src0_raw in SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES)
+            or (src1_sgpr and vsrc1 in SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES)):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>",
+                "VOPC SDWA scalar operand outside the supported LLVM 15 decoder subset")
 
     is_float = op_name.endswith(("_f32_e32", "_f16_e32"))
     is_class = "_class_" in op_name
@@ -1084,11 +1104,11 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
     src1_str = decode_s_reg(vsrc1) if src1_sgpr else f"v{vsrc1}"
 
     if src0_is_float:
-        src0_str = _format_operand_modifiers(src0_str, src0_abs, src0_neg)
+        src0_str = _format_sdwa_float_modifiers(src0_str, src0_raw if src0_sgpr else None, src0_abs, src0_neg)
     elif src0_sext:
         src0_str = f"sext({src0_str})"
     if src1_is_float:
-        src1_str = _format_operand_modifiers(src1_str, src1_abs, src1_neg)
+        src1_str = _format_sdwa_float_modifiers(src1_str, vsrc1 if src1_sgpr else None, src1_abs, src1_neg)
     elif src1_sext:
         src1_str = f"sext({src1_str})"
 

@@ -871,6 +871,14 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             stmt = ("{ int cpu_regs[4]; __cpuidex(cpu_regs, static_cast<int>(rax), static_cast<int>(rcx)); "
                     "rax = static_cast<uint32_t>(cpu_regs[0]); rbx = static_cast<uint32_t>(cpu_regs[1]); "
                     "rcx = static_cast<uint32_t>(cpu_regs[2]); rdx = static_cast<uint32_t>(cpu_regs[3]); }")
+        elif i.code == C.INT3:
+            # INT3 (CC) raises the host's EXCEPTION_BREAKPOINT, as the original does; guest stores before it stay
+            # done. The exception address and registers are the host's. Other INT, INT1, INTO and fast-fail
+            # encodings stay refused.
+            stmt = "__debugbreak();"
+        elif i.code == C.UD2:
+            # UD2 (0F 0B) raises the host's STATUS_ILLEGAL_INSTRUCTION; UD0 and UD1 stay refused.
+            stmt = "__ud2();"
         elif op == M.LDMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             # The opt-in host-MXCSR profile: the requested word is checked before it reaches the host register,
             # so a refused word changes nothing and no later guest instruction runs.

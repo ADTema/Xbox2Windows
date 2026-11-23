@@ -906,6 +906,91 @@ uint mul_hi_i32(uint a, uint b) {
         "    return sign | half_m;\n"
         "}"
     ),
+    "fma16_rne": (
+        "// Exact fused binary16 multiply-accumulate (a * b + c), rounding once to binary16 RNE.\n"
+        "// Operates on finite binary16 encodings in bits [15:0] using 32-bit integer arithmetic only,\n"
+        "// avoiding intermediate binary32 rounding and remaining independent of binary32 FTZ modes.\n"
+        "uint fma16_rne(uint a_bits, uint b_bits, uint c_bits) {\n"
+        "    uint a = a_bits & 0xffffu;\n"
+        "    uint b = b_bits & 0xffffu;\n"
+        "    uint c = c_bits & 0xffffu;\n"
+        "    uint sa = (a >> 15u) & 1u;\n"
+        "    uint ea_f = (a >> 10u) & 31u;\n"
+        "    uint ma = (a & 0x3ffu) | (ea_f != 0u ? 0x400u : 0u);\n"
+        "    int ea = ea_f != 0u ? (int)ea_f - 25 : -24;\n"
+        "    uint sb = (b >> 15u) & 1u;\n"
+        "    uint eb_f = (b >> 10u) & 31u;\n"
+        "    uint mb = (b & 0x3ffu) | (eb_f != 0u ? 0x400u : 0u);\n"
+        "    int eb = eb_f != 0u ? (int)eb_f - 25 : -24;\n"
+        "    uint sc = (c >> 15u) & 1u;\n"
+        "    uint ec_f = (c >> 10u) & 31u;\n"
+        "    uint mc = (c & 0x3ffu) | (ec_f != 0u ? 0x400u : 0u);\n"
+        "    int ec = ec_f != 0u ? (int)ec_f - 25 : -24;\n"
+        "    uint sp = sa ^ sb;\n"
+        "    uint mp = ma * mb;\n"
+        "    int ep = ea + eb;\n"
+        "    if (mp == 0u && mc == 0u) return (sp != 0u && sc != 0u) ? 0x8000u : 0u;\n"
+        "    if (mp == 0u) return c;\n"
+        "    uint norm;\n"
+        "    int res_exp;\n"
+        "    uint res_sign;\n"
+        "    if (mc == 0u) {\n"
+        "        uint top = firstbithigh(mp);\n"
+        "        norm = mp << (31u - top);\n"
+        "        res_exp = ep + (int)top;\n"
+        "        res_sign = sp;\n"
+        "    } else {\n"
+        "        uint bp = firstbithigh(mp);\n"
+        "        uint px = mp << (30u - bp);\n"
+        "        int ex = ep + (int)bp;\n"
+        "        uint bc = firstbithigh(mc);\n"
+        "        uint cx = mc << (30u - bc);\n"
+        "        int ey = ec + (int)bc;\n"
+        "        uint big_m, small_m, big_s, small_s;\n"
+        "        int big_e, small_e;\n"
+        "        if (ex > ey || (ex == ey && px >= cx)) {\n"
+        "            big_m = px; big_e = ex; big_s = sp;\n"
+        "            small_m = cx; small_e = ey; small_s = sc;\n"
+        "        } else {\n"
+        "            big_m = cx; big_e = ey; big_s = sc;\n"
+        "            small_m = px; small_e = ex; small_s = sp;\n"
+        "        }\n"
+        "        if (big_e == small_e && big_m == small_m && big_s != small_s) return 0u;\n"
+        "        uint diff_e = (uint)(big_e - small_e);\n"
+        "        uint y_main = 0u;\n"
+        "        uint y_sticky = 1u;\n"
+        "        if (diff_e < 30u) {\n"
+        "            y_main = (small_m >> diff_e) & 0xfffffffeu;\n"
+        "            y_sticky = (small_m & ((1u << (diff_e + 1u)) - 1u)) != 0u ? 1u : 0u;\n"
+        "        }\n"
+        "        res_sign = big_s;\n"
+        "        uint mag = big_s == small_s ? (big_m + y_main + y_sticky) : (big_m - y_main - y_sticky);\n"
+        "        uint top = firstbithigh(mag);\n"
+        "        norm = mag << (31u - top);\n"
+        "        res_exp = big_e + (int)top - 30;\n"
+        "    }\n"
+        "    if (res_exp >= -14) {\n"
+        "        uint sig = norm >> 21u;\n"
+        "        uint rem = norm & 0x001fffffu;\n"
+        "        if (rem > 0x00100000u || (rem == 0x00100000u && (sig & 1u) != 0u)) sig += 1u;\n"
+        "        if (sig == 0x800u) {\n"
+        "            sig = 0x400u;\n"
+        "            res_exp += 1;\n"
+        "        }\n"
+        "        if (res_exp > 15) return (res_sign << 15u) | 0x7c00u;\n"
+        "        return (res_sign << 15u) | ((uint)(res_exp + 15) << 10u) | (sig & 0x3ffu);\n"
+        "    }\n"
+        "    if (res_exp == -25) return (res_sign << 15u) | (norm > 0x80000000u ? 1u : 0u);\n"
+        "    if (res_exp < -25) return res_sign << 15u;\n"
+        "    uint shift = (uint)(7 - res_exp);\n"
+        "    uint sig = norm >> shift;\n"
+        "    uint half_bit = 1u << (shift - 1u);\n"
+        "    uint mask = (1u << shift) - 1u;\n"
+        "    uint rem = norm & mask;\n"
+        "    if (rem > half_bit || (rem == half_bit && (sig & 1u) != 0u)) sig += 1u;\n"
+        "    return (res_sign << 15u) | sig;\n"
+        "}"
+    ),
     "min16_num": (
         "float min16_num(float a, float b) {\n"
         "    return isnan(a) ? b : (isnan(b) ? a : min(a, b));\n"
@@ -1354,6 +1439,103 @@ def f16_vop2_result(name, a, b):
     return sign | ((exponent + 15) << 10) | (count - 0x400)
 
 
+def f16_pk_fmac_lane_result(a, b, c):
+    """Exact fused binary16 result bits of a * b + c on three finite operands, or None when it overflows.
+
+    Evaluates a * b + c in exact rationals (fractions.Fraction) and rounds once to nearest even on the
+    binary16 grid, preserving subnormals. Used at translation time to reject overflowing results and keep
+    chained v_pk_fmac_f16 operands statically proven.
+    """
+    def value(bits):
+        sign = -1 if bits & 0x8000 else 1
+        exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+        if exponent == 0:
+            return sign * Fraction(mantissa, 1 << 24)
+        return sign * Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25)
+
+    exact = value(a) * value(b) + value(c)
+    magnitude = abs(exact)
+    if magnitude == 0:
+        prod_zero = (a & 0x7fff) == 0 or (b & 0x7fff) == 0
+        acc_zero = (c & 0x7fff) == 0
+        if prod_zero and acc_zero:
+            prod_neg = bool((a ^ b) & 0x8000)
+            acc_neg = bool(c & 0x8000)
+            return 0x8000 if (prod_neg and acc_neg) else 0
+        return 0
+    if magnitude >= 65520:  # halfway between 65504 and 2^16: ties to even rounds up to infinity
+        return None
+    exponent = max(magnitude.numerator.bit_length() - magnitude.denominator.bit_length(), -14)
+    while magnitude < Fraction(2) ** exponent and exponent > -14:
+        exponent -= 1
+    while magnitude >= Fraction(2) ** (exponent + 1):
+        exponent += 1
+    scaled = magnitude / Fraction(2) ** (exponent - 10)
+    count = scaled.numerator // scaled.denominator
+    remainder = scaled - count
+    if remainder > Fraction(1, 2) or (remainder == Fraction(1, 2) and count & 1):
+        count += 1
+    if count >= 0x800:
+        count, exponent = 0x400, exponent + 1
+    sign = 0x8000 if exact < 0 else 0
+    if count < 0x400:
+        return sign | count
+    return sign | ((exponent + 15) << 10) | (count - 0x400)
+
+
+def pk_fmac_f16_source(token, scalar, vector, pending, sample_dest, known_ssa_bits):
+    """Return (HLSL uint word expression, 32-bit packed bits) for one v_pk_fmac_f16 source operand.
+
+    Both binary16 halves must be statically proven finite (exponent != 0x1f). Inline f16 float constants
+    occupy bits [15:0] with bits [31:16] zeroed (+0.0), matching gfx1013 hardware. Unproven runtime values
+    (constant-buffer words, samples, interpolants, scalar half16/low16 results) and non-finite halves are
+    refused.
+    """
+    if token in INLINE_F16:
+        bits = INLINE_F16[token]
+        return f"{bits}u", bits
+    if token == "0":
+        return "0u", 0
+    if re.fullmatch(r"-?\d+", token):
+        raise ValueError(f"Unsupported binary16 integer inline constant {token}")
+    if token.startswith(("-", "|", "abs(", "neg(")):
+        raise ValueError(f"Unsupported binary16 source modifier {token}")
+    if re.fullmatch(r"0x[0-9a-f]+", token):
+        bits = int(token, 16)
+        if bits > 0xffffffff:
+            raise ValueError(f"32-bit literal out of range: {token}")
+        word = f"{bits}u"
+    elif m := re.fullmatch(r"([vs])(\d+)", token):
+        limit = 255 if m.group(1) == "v" else 105
+        if not 0 <= int(m.group(2)) <= limit:
+            raise ValueError(f"Register out of range: {token}")
+        if token in pending:
+            raise ValueError("Constant read before load completion")
+        if token in sample_dest:
+            raise ValueError("Sample used before vmcnt wait")
+        if m.group(1) == "s":
+            if token not in scalar:
+                raise ValueError(f"Unbound scalar input {token} at v_pk_fmac_f16")
+            value = scalar[token]
+            if isinstance(value, int):
+                bits, word = value & 0xffffffff, f"{value & 0xffffffff}u"
+            else:
+                raise ValueError(f"binary16 operand lacks a finite proof: {token}")
+        else:
+            if token not in vector:
+                raise ValueError(f"Unbound pixel input {token} at v_pk_fmac_f16")
+            value = vector[token]
+            if isinstance(value, str) and value in known_ssa_bits:
+                bits, word = known_ssa_bits[value] & 0xffffffff, f"asuint({value})"
+            else:
+                raise ValueError(f"binary16 operand lacks a finite proof: {token}")
+    else:
+        raise ValueError(f"Unsupported binary16 operand {token}")
+    if (bits & 0x7c00) == 0x7c00 or ((bits >> 16) & 0x7c00) == 0x7c00:
+        raise ValueError(f"binary16 operand is not finite: {token}")
+    return word, bits
+
+
 # Plain binary16 VOP1 rounding (issue #839): llvm-mc mnemonic -> binary32 HLSL call. LLVM 15.0.7 VOP1Instructions.td
 # L449-452 selects ffloor, fceil, ftrunc and frint for them; frint is round to nearest even under the default
 # rounding mode, and HLSL round is round-half-to-even in DXIL (the binary32 rndne entry of ALU relies on it).
@@ -1565,6 +1747,9 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *,
 
 
 
+SDWA_NEG_DECIMAL = re.compile(r"^neg\((-?\d+\.\d+)\)$")
+
+
 def f32_comparison(op, tokens, scalar, vector, pending, sample_dest):
     values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
     predicate = COMPARE[op].format(*values)
@@ -1750,7 +1935,12 @@ def emit_quad_swizzle_u32(lines, idx, base_expr, perm):
         lines.append(f"    uint {lv} = QuadReadLaneAt(dpp{idx}_in, {lane});")
         lane_vars[lane] = lv
     l0, l1, l2, l3 = (lane_vars[p] for p in perm)
-    lines.append(f"    uint {svar} = (dpp{idx}_q == 0u ? {l0} : (dpp{idx}_q == 1u ? {l1} : (dpp{idx}_q == 2u ? {l2} : {l3})));")
+    # Select with bits so the quad reads stay outside divergent branch arms (#1024).
+    even, top = f"dpp{idx}_even", f"dpp{idx}_top"
+    lines.append(f"    uint {even} = (dpp{idx}_q & 1u) - 1u;")
+    lines.append(f"    uint {top} = (dpp{idx}_q >> 1u) - 1u;")
+    lines.append(f"    uint {svar} = ((({l0} & {even}) | ({l1} & ~{even})) & {top}) | "
+                 f"((({l2} & {even}) | ({l3} & ~{even})) & ~{top});")
     return svar
 
 
@@ -2197,6 +2387,27 @@ REGION_ALU = re.compile(
     r"v_(?:mov_b32|(?:add|sub|subrev|mul|min|max)_f32)(?:_e32|_e64)? "
     r"|v_(?:fmac|mac|rcp|rsq|sqrt)_f32_e32 |v_cvt_f32_ubyte[0-3]_e32 |v_mul_legacy_f32_e(?:32|64) "
     r"|v_(?:fma|mad|med3)_f32 ")
+# Stage 1 of issue #987: scalar instructions that leave every tracked register and counter unchanged may also sit
+# in a region, because skipping them with the whole wave (s_cbranch_execz) or running them changes nothing.
+REGION_NOP = re.compile(r"s_nop (?:0x[0-9a-f]+|\d+)")
+WAIT_COUNTERS = {"vmcnt": "vm", "lgkmcnt": "lgkm", "expcnt": "exp", "vscnt": "vs"}
+
+
+def wait_counters(line):
+    """The counters a wait instruction names, or None when line is not a wait.
+
+    Only the names are read here. The main wait handler still validates operands and field widths and refuses
+    every form it does not model, so a malformed wait is rejected there.
+    """
+    if m := re.fullmatch(r"s_waitcnt_(vmcnt|lgkmcnt|expcnt|vscnt)(?:\s.*)?", line):
+        return {WAIT_COUNTERS[m[1]]}
+    if m := re.fullmatch(r"s_waitcnt\s+(.*)", line):
+        payload = m[1].strip()
+        if payload in ("0", "0x0"):
+            return {"vm", "lgkm", "exp"}
+        return {WAIT_COUNTERS[token.split("(", 1)[0]] for token in payload.split()
+                if token.split("(", 1)[0] in WAIT_COUNTERS}
+    return None
 
 
 class TrackedVector(VectorRegisters):
@@ -2423,6 +2634,22 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
                     and i == region["start"] + 1 and region["skip"] is None):
                 pass
+            elif REGION_NOP.fullmatch(line):
+                pass
+            elif (counters := wait_counters(line)) is not None:
+                if re.match(r"s_waitcnt_expcnt\s+s\d+,", line):
+                    raise ValueError(f"Unsupported s_waitcnt_expcnt SGPR operand in a masked region: {line}")
+                # A wait is admitted only if every counter it names is already satisfied in the tracked state, so
+                # it resolves nothing whether the wave runs or skips it. Loads leave sample_dest and pending only
+                # through a wait, and overwriting an outstanding destination is refused, so empty means nothing is
+                # outstanding. No export can be outstanding (only s_endpgm may follow one). Scratch stores are
+                # not tracked on the store counter, so vscnt is unknown once any store has been lowered.
+                busy = sorted(name for name, outstanding in (("vm", sample_dest), ("lgkm", pending))
+                              if name in counters and outstanding)
+                if busy:
+                    raise ValueError(f"Wait would resolve outstanding {'/'.join(busy)} work in a masked region: {line}")
+                if "vs" in counters and scratch_written:
+                    raise ValueError(f"Store counter state is unknown after a scratch store in a masked region: {line}")
             elif not REGION_ALU.match(line):
                 raise ValueError(f"Instruction cannot run in a masked region: {line}")
             else:
@@ -3841,6 +4068,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
+            # The decoder prints the explicit modifier. Retain the existing decimal
+            # float path; an integer inline constant names bits and is a distinct form.
+            tokens = [SDWA_NEG_DECIMAL.sub(r"-\1", token) for token in tokens]
             expr = f32_comparison(op, tokens, scalar, vector, pending, sample_dest)
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
@@ -4086,6 +4316,46 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expr = DPP_ALU[base_op][1].format(*args)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expr};")
+        elif m := match(r"v_pk_fmac_f16(?:_e32)? (v\d+), ([^,\s]+), ([^,\s]+)"):
+            # VOP2 packed binary16 fused multiply-accumulate (AMD RDNA 2 ISA §12.11, opcode 60 / 0x3c;
+            # LLVM 15 VOP2Instructions.td: V_PK_FMAC_F16):
+            # D.f16[0] = fma(S0.f16[0], S1.f16[0], D.f16[0]),
+            # D.f16[1] = fma(S0.f16[1], S1.f16[1], D.f16[1]),
+            # rounded once to binary16 RNE under the finite preserve/RNE profile.
+            # Plain 32-bit VOP2 encoding only: src1 must be a VGPR, vdst is the implicit packed
+            # accumulator and must already be initialized, all six operand halves must be statically
+            # proven finite, both fused results must stay finite (overflow is refused), half_denorm
+            # must be declared as "preserve", and no modifiers or _e64/DPP/SDWA spellings are accepted.
+            dst, src0, src1 = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid packed operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if not re.fullmatch(r"v\d+", src1):
+                raise ValueError("v_pk_fmac_f16 src1 must be a VGPR")
+            if dst not in vector:
+                raise ValueError(f"Uninitialized packed accumulator {dst} at v_pk_fmac_f16")
+            words, proven = zip(*(pk_fmac_f16_source(t, scalar, vector, pending, sample_dest, known_ssa_bits)
+                                  for t in (src0, src1, dst)))
+            lo_res = f16_pk_fmac_lane_result(proven[0] & 0xffff, proven[1] & 0xffff, proven[2] & 0xffff)
+            hi_res = f16_pk_fmac_lane_result((proven[0] >> 16) & 0xffff, (proven[1] >> 16) & 0xffff, (proven[2] >> 16) & 0xffff)
+            if lo_res is None or hi_res is None:
+                raise ValueError("binary16 result overflows: v_pk_fmac_f16")
+            word_vars = []
+            for k, expr in enumerate(words):
+                wvar = f"pk{i}_{k}"
+                lines.append(f"    uint {wvar} = {expr};")
+                word_vars.append(wvar)
+            lines.append(f"    uint pk{i}_l0 = fma16_rne({word_vars[0]}, {word_vars[1]}, {word_vars[2]});")
+            lines.append(f"    uint pk{i}_l1 = fma16_rne({word_vars[0]} >> 16, {word_vars[1]} >> 16, {word_vars[2]} >> 16);")
+            helpers.add("fma16_rne")
+            vector[dst] = f"alu{i}"
+            known_ssa_bits[f"alu{i}"] = lo_res | (hi_res << 16)
+            lines.append(f"    precise float alu{i} = asfloat(pk{i}_l0 | (pk{i}_l1 << 16));")
         elif m := match(r"v_pk_(add|mul|min|max|fma)_f16 (v\d+), (.+)"):
             op, dst, rest = m.groups()
             arity, template = VOP3P_F16[op]
