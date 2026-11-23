@@ -4054,7 +4054,7 @@ This fixture exercises the sequence where a caller checks tools-memory availabil
 - **Case 2 (Tools-memory unavailable)**: When tools-memory query returns `FALSE` (the no-tools desktop policy established in #896), the sequence is blocked immediately. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x101`.
 - **Case 3 (Working-set statistics failure)**: When `XMemGetWorkingSetStatistics` returns `FALSE` or fails, the sequence is aborted immediately. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x102`.
 - **Case 4 (Zero available budget)**: When working-set statistics reports zero available budget (`total <= used`), transfer is skipped. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x103`.
-- **Case 5 (Transfer failure isolation)**: When `XMemTransferMemory` returns `FALSE`, the failure is isolated and prior state remains intact. The provider records the transfer attempt (`transfer_calls == 1`) without reporting successful ownership transfer, returning exit code `0x104`.
+- **Case 5 (Transfer failure isolation)**: The provider records one rejected 16 MiB request and the caller returns exit code `0x104`. The recording provider has no backing-page or ownership state.
 
 The specific fixture inputs tested (`selector = 0x2000000A`, `partition = 1`, 2 MiB alignment rounding, 16 MiB clamp) are synthetic fixture inputs chosen for this test. Partition selector 1, alignment, and maximum bounds are test-provider policy behaviors; native console transfer semantics remain open.
 

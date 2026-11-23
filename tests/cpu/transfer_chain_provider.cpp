@@ -1,9 +1,9 @@
 // Controlled provider for testing the memory transfer prerequisite and failure paths.
 // Simulates tools-memory query availability, working-set statistics, and transfer memory calls:
 // - Verifies prerequisite query blocks transfer when tools memory is unavailable (no-tools desktop policy).
-// - Verifies failed working-set statistics queries leave transfer uncalled and prior state intact.
+// - Verifies failed working-set statistics queries leave transfer uncalled.
 // - Verifies zero available budget skips transfer.
-// - Verifies transfer failure is isolated and does not report ownership transfer without backing.
+// - Records transfer arguments and returns the configured result without transferring pages.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -40,18 +40,18 @@ volatile uint32_t transferred_partition = 0;
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
-        char buf[32];
-        if (GetEnvironmentVariableA("XMEM_TEST_TOOLS_MEM_AVAILABLE", buf, sizeof(buf)) && buf[0] == '0') {
+        char buf[2];
+        if (GetEnvironmentVariableA("XMEM_TEST_TOOLS_MEM_AVAILABLE", buf, sizeof(buf)) == 1 && buf[0] == '0') {
             cfg_tools_mem_available = 0;
         }
-        if (GetEnvironmentVariableA("XMEM_TEST_WORKING_SET_SUCCESS", buf, sizeof(buf)) && buf[0] == '0') {
+        if (GetEnvironmentVariableA("XMEM_TEST_WORKING_SET_SUCCESS", buf, sizeof(buf)) == 1 && buf[0] == '0') {
             cfg_working_set_success = 0;
         }
-        if (GetEnvironmentVariableA("XMEM_TEST_ZERO_BUDGET", buf, sizeof(buf)) && buf[0] == '1') {
+        if (GetEnvironmentVariableA("XMEM_TEST_ZERO_BUDGET", buf, sizeof(buf)) == 1 && buf[0] == '1') {
             cfg_budget_total = 0x1000000;
             cfg_budget_used = 0x1000000;
         }
-        if (GetEnvironmentVariableA("XMEM_TEST_TRANSFER_SUCCESS", buf, sizeof(buf)) && buf[0] == '0') {
+        if (GetEnvironmentVariableA("XMEM_TEST_TRANSFER_SUCCESS", buf, sizeof(buf)) == 1 && buf[0] == '0') {
             cfg_transfer_success = 0;
         }
     }

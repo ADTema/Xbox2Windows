@@ -5,7 +5,7 @@ Exercises the prerequisite, query, and transfer failure isolation contracts unde
 - Prerequisite blocking: tools-memory unavailable (FALSE) blocks sequence; transfer is never called (exit 0x101).
 - Working-set failure: failed statistics query aborts sequence; transfer is never called (exit 0x102).
 - Zero budget: when working set reports zero available budget, transfer is skipped (exit 0x103).
-- Transfer failure: failed transfer is isolated and prior state remains intact (exit 0x104).
+- Transfer failure: the provider records the attempted request, and the caller distinguishes failure (exit 0x104).
 - Changed-selector patch control: modifying selector 0x2000000a to 0x2000000b fails statistics query and aborts (exit 0x102).
 - Clean exit: verified with live worker thread under CPU_CRC_TEST_LIVE_WORKER.
 - Mapped return: verifies mapped return to host under pe_map.
@@ -25,6 +25,10 @@ import pefile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mapped_exe_chain_check import run_mapped
 from native_map_check import Mapper, STATUS
+
+
+FIXTURE_ENV = ("CPU_CRC_TEST_LIVE_WORKER", "XMEM_TEST_TOOLS_MEM_AVAILABLE", "XMEM_TEST_WORKING_SET_SUCCESS",
+               "XMEM_TEST_ZERO_BUDGET", "XMEM_TEST_TRANSFER_SUCCESS")
 
 
 def imports_by_dll(image):
@@ -50,6 +54,8 @@ def run_native(exe, provider_dll, io_dll, *, live_worker=False, extra_env=None):
         shutil.copyfile(provider_dll, temp_xmem)
         shutil.copyfile(io_dll, temp_io)
         env = dict(os.environ)
+        for name in FIXTURE_ENV:
+            env.pop(name, None)
         if live_worker:
             env["CPU_CRC_TEST_LIVE_WORKER"] = "1"
         if extra_env:
@@ -126,8 +132,8 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     check("mapped chain tools-mem calls", prov_lib.get_chain_tools_mem_calls(), 1)
     check("mapped chain working-set calls", prov_lib.get_chain_working_set_calls(), 1)
     check("mapped chain transfer calls", prov_lib.get_chain_transfer_calls(), 1)
-    check("mapped chain transferred bytes", prov_lib.get_chain_transferred_bytes(), 0x1000000)
-    print("case 1 (success reaches transfer): exit 0x870, 16 MiB transferred")
+    check("mapped chain requested bytes", prov_lib.get_chain_transferred_bytes(), 0x1000000)
+    print("case 1 (success reaches transfer): exit 0x870, 16 MiB request accepted by the recorder")
 
     # 3. Case 2: Tools-memory query blocks sequence (exit 0x101)
     # Native execution
@@ -193,7 +199,8 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     check("transfer failure tools-mem calls", prov_lib.get_chain_tools_mem_calls(), 1)
     check("transfer failure working-set calls", prov_lib.get_chain_working_set_calls(), 1)
     check("transfer failure transfer calls", prov_lib.get_chain_transfer_calls(), 1)
-    print("case 5 (transfer failure isolated): exit 0x104, prior state intact")
+    check("transfer failure requested bytes", prov_lib.get_chain_transferred_bytes(), 0x1000000)
+    print("case 5 (transfer failure isolated): exit 0x104 after one rejected 16 MiB request")
 
     # 7. Changed-selector patch control: patch 0x2000000a to 0x2000000b
     # mov ecx, 2000000Ah is encoded as b9 0a 00 00 20
@@ -216,6 +223,7 @@ def compare(mapper_path, exe_path, provider_path, io_path):
         print("changed-selector patch control: exit 0x102, transfer uncalled")
 
     # 8. Withholding negative controls
+    prov_lib.reset_chain_records()
     mapper = Mapper(mapper_path)
     io_lib = ctypes.WinDLL(str(io_dll))
 
@@ -261,6 +269,9 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     check("withheld XMemTransferMemory status", status, STATUS["unresolved"])
     check("withheld XMemTransferMemory detail", detail, "unresolved import xmem.dll!XMemTransferMemory")
     print(f"withheld transfer control: {detail}")
+    check("withheld providers leave an empty trace",
+          (prov_lib.get_chain_tools_mem_calls(), prov_lib.get_chain_working_set_calls(),
+           prov_lib.get_chain_transfer_calls()), (0, 0, 0))
 
 
 if __name__ == "__main__":
