@@ -906,82 +906,6 @@ uint mul_hi_i32(uint a, uint b) {
         "    return sign | half_m;\n"
         "}"
     ),
-    "pack16_rtz": (
-        "uint pack16_rtz(float value) {\n"
-        "    uint bits = asuint(value);\n"
-        "    uint sign = (bits >> 16) & 0x8000u;\n"
-        "    uint abs_bits = bits & 0x7fffffffu;\n"
-        "    if (abs_bits > 0x7f800000u) return 0x7e00u;\n"
-        "    if (abs_bits >= 0x47800000u) return sign | 0x7c00u;\n"
-        "    if (abs_bits >= 0x38800000u) return sign | ((abs_bits - 0x38000000u) >> 13);\n"
-        "    if (abs_bits < 0x33800000u) return sign;\n"
-        "    uint sig = 0x00800000u | (abs_bits & 0x007fffffu);\n"
-        "    uint shift = 126u - (abs_bits >> 23);\n"
-        "    return sign | (sig >> shift);\n"
-        "}"
-    ),
-    "dpp_cvt_i32_f32": (
-        "uint dpp_cvt_i32_f32(float x) {\n"
-        "    if (isnan(x)) return 0u;\n"
-        "    if (x >= 2147483648.0f) return 0x7fffffffu;\n"
-        "    if (x <= -2147483648.0f) return 0x80000000u;\n"
-        "    return asuint(int(x));\n"
-        "}"
-    ),
-    "dpp_cvt_rpi_i32_f32": (
-        "uint dpp_cvt_rpi_i32_f32(float x) {\n"
-        "    if (isnan(x)) return 0u;\n"
-        "    float f = floor(x);\n"
-        "    float r = f + ((x - f) >= 0.5f ? 1.0f : 0.0f);\n"
-        "    if (r >= 2147483648.0f) return 0x7fffffffu;\n"
-        "    if (r <= -2147483648.0f) return 0x80000000u;\n"
-        "    return asuint(int(r));\n"
-        "}"
-    ),
-    "dpp_cvt_u32_f32": (
-        "uint dpp_cvt_u32_f32(float x) {\n"
-        "    if (isnan(x) || x <= 0.0f) return 0u;\n"
-        "    if (x >= 4294967296.0f) return 0xffffffffu;\n"
-        "    return uint(x);\n"
-        "}"
-    ),
-    "dpp_cvt_i16_f16": (
-        "uint dpp_cvt_i16_f16(float x) {\n"
-        "    if (isnan(x)) return 0u;\n"
-        "    if (x >= 32767.0f) return 32767u;\n"
-        "    if (x <= -32768.0f) return 0x8000u;\n"
-        "    return asuint(int(trunc(x))) & 0xffffu;\n"
-        "}"
-    ),
-    "dpp_cvt_u16_f16": (
-        "uint dpp_cvt_u16_f16(float x) {\n"
-        "    if (isnan(x) || x <= 0.0f) return 0u;\n"
-        "    if (x >= 65535.0f) return 65535u;\n"
-        "    return uint(trunc(x)) & 0xffffu;\n"
-        "}"
-    ),
-    "dpp_cvt_norm_i16_f16": (
-        "uint dpp_cvt_norm_i16_f16(float x) {\n"
-        "    if (isnan(x)) return 0u;\n"
-        "    float c = clamp(x, -1.0f, 1.0f);\n"
-        "    return asuint(int(round(c * 32767.0f))) & 0xffffu;\n"
-        "}"
-    ),
-    "dpp_cvt_norm_u16_f16": (
-        "uint dpp_cvt_norm_u16_f16(float x) {\n"
-        "    if (isnan(x)) return 0u;\n"
-        "    return uint(round(saturate(x) * 65535.0f)) & 0xffffu;\n"
-        "}"
-    ),
-    "dpp_sat_pk_u8_i16": (
-        "uint dpp_sat_pk_u8_i16(uint w) {\n"
-        "    int lo = asint(w << 16) >> 16;\n"
-        "    int hi = asint(w) >> 16;\n"
-        "    uint blo = uint(clamp(lo, 0, 255));\n"
-        "    uint bhi = uint(clamp(hi, 0, 255));\n"
-        "    return blo | (bhi << 8);\n"
-        "}"
-    ),
     "min16_num": (
         "float min16_num(float a, float b) {\n"
         "    return isnan(a) ? b : (isnan(b) ? a : min(a, b));\n"
@@ -1147,28 +1071,17 @@ uint mul_hi_i32(uint a, uint b) {
         "}"
     ),
 }
-# (arity, fp_src_kind, dst16, expr_template, required_helpers)
-# fp_src_kind: None (int), "f32", or "f16"
+# (bit/float source, expression, shared conversion helper)
 DPP_CVT = {
-    "cvt_f32_i32": (1, None, False, "float(asint({0}))", ()),
-    "cvt_f32_u32": (1, None, False, "float({0})", ()),
-    "cvt_f32_ubyte0": (1, None, False, "float({0} & 0xffu)", ()),
-    "cvt_f32_ubyte1": (1, None, False, "float(({0} >> 8) & 0xffu)", ()),
-    "cvt_f32_ubyte2": (1, None, False, "float(({0} >> 16) & 0xffu)", ()),
-    "cvt_f32_ubyte3": (1, None, False, "float(({0} >> 24) & 0xffu)", ()),
-    "cvt_off_f32_i4": (1, None, False, "(float(asint({0} << 28) >> 28) * 0.0625f)", ()),
-    "cvt_i32_f32": (1, "f32", False, "asfloat(dpp_cvt_i32_f32({0}))", ("dpp_cvt_i32_f32",)),
-    "cvt_u32_f32": (1, "f32", False, "asfloat(dpp_cvt_u32_f32({0}))", ("dpp_cvt_u32_f32",)),
-    "cvt_flr_i32_f32": (1, "f32", False, "asfloat(dpp_cvt_i32_f32(floor({0})))", ("dpp_cvt_i32_f32",)),
-    "cvt_rpi_i32_f32": (1, "f32", False, "asfloat(dpp_cvt_rpi_i32_f32({0}))", ("dpp_cvt_rpi_i32_f32",)),
-    "cvt_f16_i16": (1, None, True, "pack16_rne(float(asint({0} << 16) >> 16))", ("pack16_rne",)),
-    "cvt_f16_u16": (1, None, True, "pack16_rne(float({0} & 0xffffu))", ("pack16_rne",)),
-    "cvt_i16_f16": (1, "f16", True, "dpp_cvt_i16_f16({0})", ("dpp_cvt_i16_f16",)),
-    "cvt_u16_f16": (1, "f16", True, "dpp_cvt_u16_f16({0})", ("dpp_cvt_u16_f16",)),
-    "cvt_norm_i16_f16": (1, "f16", True, "dpp_cvt_norm_i16_f16({0})", ("dpp_cvt_norm_i16_f16",)),
-    "cvt_norm_u16_f16": (1, "f16", True, "dpp_cvt_norm_u16_f16({0})", ("dpp_cvt_norm_u16_f16",)),
-    "sat_pk_u8_i16": (1, None, True, "dpp_sat_pk_u8_i16({0})", ("dpp_sat_pk_u8_i16",)),
-    "cvt_pkrtz_f16_f32": (2, "f32", False, "asfloat(pack16_rtz({0}) | (pack16_rtz({1}) << 16))", ("pack16_rtz",)),
+    "cvt_f32_i32": (False, "float(asint({0}))", None),
+    "cvt_f32_u32": (False, "float({0})", None),
+    "cvt_f32_ubyte0": (False, "float({0} & 0xffu)", None),
+    "cvt_f32_ubyte1": (False, "float(({0} >> 8) & 0xffu)", None),
+    "cvt_f32_ubyte2": (False, "float(({0} >> 16) & 0xffu)", None),
+    "cvt_f32_ubyte3": (False, "float(({0} >> 24) & 0xffu)", None),
+    "cvt_off_f32_i4": (False, "(float(asint({0} << 28) >> 28) * 0.0625f)", None),
+    "cvt_i32_f32": (True, "asfloat(cvt_i32_f32({0}))", "cvt_i32_f32"),
+    "cvt_u32_f32": (True, "asfloat(cvt_u32_f32({0}))", "cvt_u32_f32"),
 }
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
@@ -3974,44 +3887,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(rf"v_({'|'.join(DPP_CVT)})_dpp (v\d+), (.+)"):
             op, dst, rest = m.groups()
-            arity, fp_kind, dst16, template, req_helpers = DPP_CVT[op]
+            float_source, template, helper = DPP_CVT[op]
             if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
                 raise ValueError("Invalid conversion DPP operation")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            prev_val = None
-            if dst16:
-                prev_val, _, _ = dpp_vgpr(dst, vector, sample_dest, allow_mods=False)
-            tokens, perm, is_dpp8 = parse_dpp(rest, arity)
-            allow_mods = (not is_dpp8) and (fp_kind is not None)
-            src0_val, abs0, neg0 = dpp_vgpr(tokens[0], vector, sample_dest, allow_mods=allow_mods)
-            swz_bits = emit_quad_swizzle_u32(lines, i, src0_val, perm)
-            if fp_kind is None:
-                s0 = swz_bits
-            else:
-                s0 = f"asfloat({swz_bits})" if fp_kind == "f32" else f"widen16({swz_bits})"
-                if abs0:
-                    s0 = f"abs({s0})"
-                if neg0:
-                    s0 = f"(-{s0})"
-            args = [s0]
-            if arity == 2:
-                src1_val, abs1, neg1 = dpp_vgpr(tokens[1], vector, sample_dest, allow_mods=allow_mods)
-                s1 = src1_val
-                if abs1:
-                    s1 = f"abs({s1})"
-                if neg1:
-                    s1 = f"(-{s1})"
-                args.append(s1)
-            helpers.update(req_helpers)
-            if dst16:
-                lines.append(f"    uint dpp{i}_hi = asuint({prev_val}) & 0xffff0000u;")
-                lines.append(f"    uint dpp{i}_lo = {template.format(*args)};")
-                vector[dst] = f"alu{i}"
-                lines.append(f"    precise float alu{i} = asfloat(dpp{i}_hi | dpp{i}_lo);")
-            else:
-                vector[dst] = f"alu{i}"
-                lines.append(f"    precise float alu{i} = {template.format(*args)};")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 1)
+            value, absolute, negate = dpp_vgpr(
+                tokens[0], vector, sample_dest, allow_mods=float_source and not is_dpp8
+            )
+            bits = emit_quad_swizzle_u32(lines, i, value, perm)
+            if absolute:
+                bits = f"({bits} & 0x7fffffffu)"
+            if negate:
+                bits = f"({bits} ^ 0x80000000u)"
+            if helper:
+                helpers.add(helper)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {template.format(bits)};")
         elif m := match(rf"({'|'.join(DPP_EXTRA)}) (v\d+), (.+)"):
             op, dst, rest = m.groups()
             if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
