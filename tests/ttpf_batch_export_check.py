@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -162,7 +163,8 @@ class MockTtpfModule:
                 return 0
             return 2
         elif index == 5:
-            # Always fails
+            # Fail after writing partial output to exercise temporary cleanup.
+            target.write_bytes(b"PARTIAL_DDS")
             return 2
         return 0
 
@@ -220,6 +222,22 @@ class BatchExportTests(unittest.TestCase):
             self.assertFalse((out_dir / "tex_00005.dds").exists())
             # No temporary file leaked
             self.assertEqual(len(list(out_dir.glob(".tmp_*"))), 0)
+
+    def test_analysis_failure_preserves_existing_dds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            existing_dds = out_dir / "tex_00000.dds"
+            original_bytes = b"PREVIOUS_DDS"
+            existing_dds.write_bytes(original_bytes)
+            with (
+                patch.object(MockTtpfModule, "analyze", side_effect=ValueError("invalid descriptor")),
+                patch.object(MockTtpfModule, "export") as export,
+            ):
+                result = batch.export_texture_entry(MockPool("mock.ttpf"), 0, out_dir,
+                                                    ttpf_module=MockTtpfModule)
+            export.assert_not_called()
+            self.assertEqual(result, {"index": 0, "status": "failed", "reason": "invalid descriptor"})
+            self.assertEqual(existing_dds.read_bytes(), original_bytes)
 
     def test_export_texture_entry_uncompressed_and_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -306,9 +324,12 @@ class BatchExportTests(unittest.TestCase):
 
                 self.assertEqual(tex1_file.read_bytes(), fitted)
                 manifest2 = json.loads(manifest_file.read_text(encoding="utf-8"))
-                self.assertEqual(manifest2[1]["status"], "failed")
-                self.assertNotIn("file", manifest2[1])
-                self.assertNotIn("sha256", manifest2[1])
+                failed_entry = manifest2[1]
+                self.assertEqual(failed_entry["index"], 1)
+                self.assertEqual(failed_entry["status"], "failed")
+                self.assertEqual(failed_entry["reason"], "export returned exit code 2")
+                self.assertNotIn("file", failed_entry)
+                self.assertNotIn("sha256", failed_entry)
             finally:
                 batch.load_tools = orig_load
 
