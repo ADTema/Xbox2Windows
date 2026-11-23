@@ -11,12 +11,13 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from pe_package_preflight import inspect, main, summarize  # noqa: E402
+from pe_run_package import plan  # noqa: E402
 
 
-def info(name, entries=(), imports=()):
+def info(name, entries=(), imports=(), machine="IMAGE_FILE_MACHINE_AMD64"):
     exports = [dict(name=symbol, ordinal=i + 1, forwarder=forward)
                for i, (symbol, forward) in enumerate(entries)]
-    return dict(machine="IMAGE_FILE_MACHINE_AMD64", sha256=name + "-fixture", exports=exports,
+    return dict(machine=machine, sha256=name + "-fixture", exports=exports,
                 parse_warnings=[]), imports
 
 
@@ -90,6 +91,56 @@ class OfflinePreflightChecks(unittest.TestCase):
         one = summarize(self.package, "main.exe")
         two = summarize(dict(reversed(list(self.package.items()))), "main.exe")
         assert json.dumps(one, sort_keys=True) == json.dumps(two, sort_keys=True)
+
+    def test_mixed_x86_machines_do_not_satisfy_matching_exports(self):
+        for importer, provider in [("AMD64", "I386"), ("I386", "AMD64")]:
+            with self.subTest(importer=importer, provider=provider):
+                package = {
+                    "app.exe": info("app", imports=[("normal", "shim.dll", "Start")],
+                                    machine="IMAGE_FILE_MACHINE_" + importer),
+                    "shim.dll": info("shim", entries=[("Start", None)],
+                                     machine="IMAGE_FILE_MACHINE_" + provider),
+                }
+                result = summarize(package, "app.exe")
+                row = result["imports"][0]
+                self.assertEqual(row["status"], "bundled_machine_mismatch")
+                self.assertEqual(row["resolution_status"], "machine_mismatch")
+                self.assertEqual(row["chain"][0]["importer_machine"], "IMAGE_FILE_MACHINE_" + importer)
+                self.assertEqual(row["chain"][0]["provider_machine"], "IMAGE_FILE_MACHINE_" + provider)
+                self.assertEqual(result["summary"]["bundled_failures"], 1)
+                with self.assertRaisesRegex(ValueError, "bundled_machine_mismatch"):
+                    plan(result)  # The package runner must refuse this before mapping or attachment.
+                # The same exported name is a valid symbolic binding at the matching machine type.
+                package["shim.dll"][0]["machine"] = "IMAGE_FILE_MACHINE_" + importer
+                self.assertEqual(summarize(package, "app.exe")["imports"][0]["status"],
+                                 "bundled_export_present")
+
+    def test_forwarder_stops_at_incompatible_packaged_machine(self):
+        package = {
+            "app.exe": info("app", imports=[("delay", "shim.dll", "Start")]),
+            "shim.dll": info("shim", entries=[("Start", "wrong.Next")]),
+            "wrong.dll": info("wrong", entries=[("Next", "external.Result")],
+                              machine="IMAGE_FILE_MACHINE_I386"),
+        }
+        result = summarize(package, "app.exe")
+        row = result["imports"][0]
+        self.assertEqual(row["status"], "bundled_machine_mismatch")
+        self.assertEqual([step["provider"] for step in row["chain"]], ["shim.dll", "wrong.dll"])
+        self.assertEqual(result["summary"]["external_unverified"], 0)
+        self.assertTrue(result["reachable"]["wrong.dll"]["conditional"])
+
+    def test_unreachable_or_hybrid_machines_do_not_fail_x86_check(self):
+        package = {
+            "app.exe": info("app", imports=[("normal", "shim.dll", "Start")]),
+            "shim.dll": info("shim", entries=[("Start", None)]),
+            "unused.dll": info("unused", entries=[("Unused", None)],
+                               machine="IMAGE_FILE_MACHINE_I386"),
+        }
+        self.assertEqual(summarize(package, "app.exe")["summary"]["bundled_failures"], 0)
+        for machine in ("IMAGE_FILE_MACHINE_ARM64EC", "IMAGE_FILE_MACHINE_ARM64X", "0xffff"):
+            package["shim.dll"][0]["machine"] = machine
+            self.assertEqual(summarize(package, "app.exe")["imports"][0]["status"],
+                             "bundled_export_present")  # Other machine combinations remain unverified.
 
     def test_normal_forwarder_precedes_a_direct_delay_import(self):
         metadata, imports = self.package["main.exe"]
