@@ -620,6 +620,51 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(directed, "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1")
         self.assertFalse(is_instruction_supported(directed), directed)
 
+    def test_hwreg_truncated_literal_and_endpgm_boundaries(self):
+        """Issue #938 follow-up: SOPK hwreg truncation and s_endpgm boundary controls."""
+        # 4-byte truncated s_setreg_imm32_b32 (missing literal dword) emits sopk_truncated cleanly.
+        trunc4 = disasm_rdna2(bytes.fromhex("810880ba"))
+        self.assertEqual(
+            [(i["offset"], i["length"], i["opcode"], i["assembly"]) for i in trunc4],
+            [(0, 4, "sopk_truncated", "s_setreg_imm32_b32 <truncated>")],
+        )
+        # 6-byte stream (partial second dword) still flags sopk_truncated and emits the remaining 2 bytes as data.
+        trunc6 = disasm_rdna2(bytes.fromhex("810880ba0300"))
+        self.assertEqual(
+            [(i["offset"], i["length"], i["opcode"], i["assembly"]) for i in trunc6],
+            [
+                (0, 4, "sopk_truncated", "s_setreg_imm32_b32 <truncated>"),
+                (4, 2, "data", ".byte 0300"),
+            ],
+        )
+        # Mid-stream truncation after a valid 4-byte s_getreg_b32 keeps the first record intact.
+        mid_trunc = disasm_rdna2(bytes.fromhex("01f804b9" + "810880ba"))
+        self.assertEqual(
+            [(i["offset"], i["length"], i["opcode"], i["assembly"]) for i in mid_trunc],
+            [
+                (0, 4, "s_getreg_b32", "s_getreg_b32 s4, hwreg(HW_REG_MODE)"),
+                (4, 4, "sopk_truncated", "s_setreg_imm32_b32 <truncated>"),
+            ],
+        )
+        # Boundary control: a 32-bit literal equal to s_endpgm (0xbf810000) must be consumed as the
+        # s_setreg_imm32_b32 literal rather than ending the stream early, while the real s_endpgm still
+        # terminates disassembly before trailing bytes.
+        stream = bytes.fromhex(
+            "810880ba000081bf"  # s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0xbf810000
+            "01f804b9"          # s_getreg_b32 s4, hwreg(HW_REG_MODE)
+            "000081bf"          # s_endpgm
+            "810884b9"          # trailing s_setreg_b32 after s_endpgm (must not be decoded)
+        )
+        insns = disasm_rdna2(stream)
+        self.assertEqual(
+            [(i["offset"], i["length"], i["opcode"], i["assembly"]) for i in insns],
+            [
+                (0, 8, "s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0xbf810000"),
+                (8, 4, "s_getreg_b32", "s_getreg_b32 s4, hwreg(HW_REG_MODE)"),
+                (12, 4, "s_endpgm", "s_endpgm"),
+            ],
+        )
+
     def test_second_dword_forms_keep_the_stream_aligned(self):
         # Independent GFX10 encodings from LLVM MC 15.0.7 test/MC/AMDGPU (gfx10_asm_vop1.s,
         # gfx10_asm_vop2.s, gfx10_asm_dpp8.s, gfx10_asm_sop.s). Each is one 8-byte instruction.
@@ -2759,10 +2804,108 @@ class TestRdna2Scanner(unittest.TestCase):
         res = results["ps_hwreg.bin"]
         self.assertEqual((res["total_instructions"], res["supported_instructions"], res["unsupported_count"]),
                          (5, 5, 0), res.get("unsupported_details"))
+        self.assertTrue(res["opcodes_recognized"])
+        self.assertEqual(res["unsupported_opcodes"], {})
         control = results["ps_hwreg_directed.bin"]
+        self.assertTrue(control["opcodes_recognized"])
+        self.assertEqual(control["unsupported_opcodes"], {})
+        self.assertFalse(control["translator_accepted"])
+        self.assertEqual(control["compatibility_category"], "opcode_recognized_translator_rejected")
         self.assertEqual(control["unsupported_count"], 1)
         self.assertEqual([d["raw"] for d in control["unsupported_details"]],
                          ["s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1"])
+
+    def test_binary_scan_hwreg_recognition_stays_separate_from_translation_support(self):
+        """Issue #938 follow-up: hwreg SOPK opcodes are recognized ISA opcodes while s_getreg/s_setreg stay unlowered."""
+        for op in ("s_getreg_b32", "s_setreg_b32", "s_setreg_imm32_b32"):
+            self.assertTrue(is_opcode_recognized(op), op)
+
+        # Accepted end-to-end pixel shader with supported s_setreg_imm32_b32 forms: now classified as accepted
+        # rather than unsupported_opcodes.
+        base_pixel_tail = [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        accepted_hwreg = analyze_shader_instructions(
+            "ps_hwreg_accepted",
+            [
+                "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0",
+                "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400",
+                "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3",
+                "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0",
+                *base_pixel_tail,
+            ],
+        )
+        self.assertTrue(accepted_hwreg["opcodes_recognized"])
+        self.assertEqual(accepted_hwreg["unsupported_opcodes"], {})
+        self.assertTrue(accepted_hwreg["translator_accepted"], accepted_hwreg.get("lower_error"))
+        self.assertEqual(accepted_hwreg["compatibility_category"], "accepted")
+        self.assertTrue(accepted_hwreg["is_fully_supported"])
+
+        # Recognition remains separate from translation support for s_getreg_b32 and s_setreg_b32:
+        # both in a binary scan and when embedded in an otherwise accepted pixel shader.
+        for label, line in (
+            ("getreg", "s_getreg_b32 s4, hwreg(HW_REG_MODE)"),
+            ("setreg", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s4"),
+        ):
+            with self.subTest(form=label):
+                self.assertFalse(is_instruction_supported(line), line)
+                rejected = analyze_shader_instructions(f"ps_{label}", [line, *base_pixel_tail])
+                self.assertTrue(rejected["opcodes_recognized"])
+                self.assertEqual(rejected["unsupported_opcodes"], {})
+                self.assertFalse(rejected["translator_accepted"])
+                self.assertFalse(rejected["is_fully_supported"])
+                self.assertEqual(rejected["compatibility_category"], "opcode_recognized_translator_rejected")
+                self.assertEqual(rejected["unsupported_count"], 1)
+                self.assertEqual([d["raw"] for d in rejected["unsupported_details"]], [line])
+
+        hwreg_sgpr = bytes.fromhex(
+            "01f804b9"  # s_getreg_b32 s4, hwreg(HW_REG_MODE)
+            "810884b9"  # s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s4
+            "000081bf"  # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "ps_hwreg_sgpr.bin").write_bytes(hwreg_sgpr)
+            results = {r["shader_name"]: r for r in scan_directory_or_files([tmp_path])}
+        res = results["ps_hwreg_sgpr.bin"]
+        self.assertTrue(res["opcodes_recognized"])
+        self.assertEqual(res["unsupported_opcodes"], {})
+        self.assertEqual(res["compatibility_category"], "opcode_recognized_translator_rejected")
+        self.assertFalse(res["translator_accepted"])
+        self.assertEqual(res["unsupported_count"], 2)
+        self.assertEqual(
+            [d["raw"] for d in res["unsupported_details"]],
+            [
+                "s_getreg_b32 s4, hwreg(HW_REG_MODE)",
+                "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s4",
+            ],
+        )
+
+        # Negative control: an unknown opcode is still flagged as unrecognized.
+        unknown = analyze_shader_instructions("ps_unknown", ["s_not_a_real_hwreg_op s0", "s_endpgm"])
+        self.assertFalse(unknown["opcodes_recognized"])
+        self.assertEqual(unknown["unsupported_opcodes"], {"s_not_a_real_hwreg_op": 1})
+        self.assertEqual(unknown["compatibility_category"], "unsupported_opcodes")
 
     def test_binary_shader_scanning(self):
         """Verify scanning raw .bin files directly with disasm_rdna2 without LLVM."""
