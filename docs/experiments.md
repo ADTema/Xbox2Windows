@@ -3950,8 +3950,9 @@ control on the same adapter.
 - Clamp 1 checked against mip 2, and clamp 1.25 checked against the 1.5 blend,
   must fail at pixel (0, 0).
 
-The `^spirv_minlod_` command above also runs these tests. Shader Model 6.6 is
-required; the Windows 10 in-box runtime reports a skip. Results on Windows 10
+The `^spirv_minlod_` command above also runs these tests. All MinLod draws
+check for Shader Model 6.6 before creating the pipeline and skip (77) without
+it, as on the Windows 10 in-box runtime. Results on Windows 10
 build 19045 with the Agility SDK 1.620.2, DXC 1.9.2609 and the debug layer on:
 
 | Clamp | Exact green, blue | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 |
