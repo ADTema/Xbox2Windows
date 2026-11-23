@@ -3463,14 +3463,15 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                                       encoding="e64", position=1)
             lines.append(f"    uint sh{i} = {count} & 63u;")
             lines.append(f"    uint sb{i} = sh{i} & 31u;")
+            lines.append(f"    uint sc{i} = (32u - sb{i}) & 31u;")
             lines.append(f"    uint lo{i} = {low};")
             lines.append(f"    uint hi{i} = {high};")
             if op == "lshlrev_b64":
-                lines.append(f"    uint cy{i} = sb{i} == 0u ? 0u : (lo{i} >> (32u - sb{i}));")
+                lines.append(f"    uint cy{i} = sb{i} == 0u ? 0u : (lo{i} >> sc{i});")
                 result_lo = f"(sh{i} < 32u ? (lo{i} << sb{i}) : 0u)"
                 result_hi = f"(sh{i} < 32u ? ((hi{i} << sb{i}) | cy{i}) : (lo{i} << sb{i}))"
             else:
-                lines.append(f"    uint cy{i} = sb{i} == 0u ? 0u : (hi{i} << (32u - sb{i}));")
+                lines.append(f"    uint cy{i} = sb{i} == 0u ? 0u : (hi{i} << sc{i});")
                 if op == "lshrrev_b64":
                     shifted_hi, fill = f"(hi{i} >> sb{i})", "0u"
                 else:

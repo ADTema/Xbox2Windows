@@ -2438,7 +2438,8 @@ def check_shift64_controls():
             main = source[source.index(" main("):]
             # The amount keeps six bits, and every 32-bit HLSL shift count is below 32.
             assert main.count(" & 63u;") == 2, (op, name)
-            counts = re.findall(r"(?:<<|>>) (\(32u - sb\d+\)|sb\d+|31u)\)", main)
+            assert len(re.findall(r"uint sc(\d+) = \(32u - sb\1\) & 31u;", main)) == 2, (op, name, main)
+            counts = re.findall(r"(?:<<|>>) (?:s[bc]\d+|31u)\)", main)
             assert len(counts) == len(re.findall(r"<<|>>", main)), (op, name, main)
             assert ("asint(" in main) == (op == "ashrrev_i64"), (op, name)
     # In place: both source words are read into temporaries before the destination pair is written.
