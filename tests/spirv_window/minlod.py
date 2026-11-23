@@ -22,7 +22,7 @@ def main(assembler, validator, cross, dxc, renderer, adapter):
             asm.write_text(source.replace("@sample@", instruction), encoding="ascii")
             subprocess.run([assembler, "--target-env", "vulkan1.2", asm, "-o", module], check=True)
             subprocess.run([validator, "--target-env", "vulkan1.2", module], check=True)
-            translated = subprocess.run([cross, module, "--hlsl", "--shader-model", "66", "--output", hlsl],
+            translated = subprocess.run([cross, module, "--hlsl", "--shader-model", "60", "--output", hlsl],
                                         capture_output=True, text=True)
             if translated.returncode:
                 print(translated.stderr, file=sys.stderr, flush=True)
@@ -30,7 +30,7 @@ def main(assembler, validator, cross, dxc, renderer, adapter):
                     print("skip: SPIRV-Cross lacks MinLod support; run tools/setup-spirv-tools.ps1")
                     return 77
                 translated.check_returncode()
-            subprocess.run([dxc, "-T", "ps_6_6", "-E", "main", "-Fo", dxil, hlsl], check=True)
+            subprocess.run([dxc, "-T", "ps_6_0", "-E", "main", "-Fo", dxil, hlsl], check=True)
             draw = subprocess.run([renderer, adapter, "--spirv-minlod-quad-lod", dxil],
                                   capture_output=True, text=True)
             print(f"{name}\n{draw.stdout}{draw.stderr}", flush=True)

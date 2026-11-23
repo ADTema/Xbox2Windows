@@ -1,5 +1,7 @@
 """Check the single-store compute profile with original synthetic kernels."""
 from pathlib import Path
+import operator
+import os
 import struct
 import subprocess
 import sys
@@ -304,6 +306,7 @@ def controls():
     grid_controls()
     guard_controls()
     read_controls()
+    alu_controls()
 
 
 def grid_controls():
@@ -685,6 +688,39 @@ READ_CASES = [
     ("read_index", READ_INDEX, 32, READ_BINDING | dict(source_stride=8)),
 ]
 READ_LOADS = {"read_copy": "inputData.Load((tid.x << 2u) + 0u)", "read_index": "inputData.Load(tid.x * 8u + 4u)"}
+# Read-compute-write (#721), unchanged LLVM 15 code generator output of an original amdgpu_cs
+# source as for the reads, with the same bindings:
+#   if (gid < n) {
+#       v = source word gid (byte offset gid * 4);
+#       store umin((v & 0xffff) * (v >> 16) + gid, cap) at element gid;    // cap = params[0].y
+#   }
+READ_COMPUTE = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[4:7], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s2, vcc_lo",
+    "s_cbranch_execz .LBB0_2",
+    "s_load_dwordx8 s[8:15], s[0:1], 0x0",
+    "v_lshlrev_b32_e32 v1, 2, v0",
+    "s_buffer_load_dword s0, s[4:7], 0x4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_load_dword v1, v1, s[12:15], 0 offen",
+    "s_waitcnt vmcnt(0)",
+    "v_and_b32_e32 v2, 0xffff, v1",
+    "v_lshrrev_b32_e32 v1, 16, v1",
+    "v_mad_u32_u24 v1, v2, v1, v0",
+    "v_min_u32_e32 v1, s0, v1",
+    "buffer_store_dword v1, v0, s[8:11], 0 idxen",
+    ".LBB0_2:",
+    "s_endpgm",
+]
+ALU_WORD = ("min(params[0].y, ((((0x0000ffffu & {0}) & 0xffffffu) * (({0} >> (0x00000010u & 31u)) & 0xffffffu))"
+            " + tid.x))").format(READ_LOADS["read_copy"])
 
 
 def variant(lines, *changes):
@@ -694,6 +730,28 @@ def variant(lines, *changes):
         lines = [part for line in lines for part in ((line.replace(old, new).split("\n") if new else [])
                                                      if old in line else [line])]
     return lines
+
+
+# Leave a different bit above bit 23 set in each multiplicand. The ordinary
+# codegen fixture above limits both inputs to 16 bits.
+READ_MAD24 = variant(
+    READ_COMPUTE,
+    ("v_and_b32_e32 v2, 0xffff, v1", "v_and_b32_e32 v2, 0x1ffffff, v1"),
+    ("v_lshrrev_b32_e32 v1, 16, v1", "v_and_b32_e32 v1, 0x2ffffff, v1"),
+)
+# Keep the same guarded read and write. Use the entire source and constant words.
+READ_MUL_LO = variant(
+    READ_COMPUTE,
+    ("v_and_b32_e32 v2, 0xffff, v1", ""),
+    ("v_lshrrev_b32_e32 v1, 16, v1", ""),
+    ("v_mad_u32_u24 v1, v2, v1, v0", "v_mul_lo_u32 v1, s0, v1"),
+    ("v_min_u32_e32 v1, s0, v1", ""),
+)
+ALU_CASES = [
+    ("read_compute", READ_COMPUTE, 32, READ_BINDING),
+    ("read_mad24", READ_MAD24, 32, READ_BINDING),
+    ("read_mul_lo", READ_MUL_LO, 32, READ_BINDING),
+]
 
 
 def guard_controls():
@@ -891,6 +949,91 @@ def read_controls():
             ("s_endpgm", "s_waitcnt vmcnt(0)\n" + late), stride=8)
 
 
+def alu_controls():
+    """Read-compute-write: exact output, then one rejection per instruction or operand outside the subset."""
+    def alu(*changes, **binding):
+        _, lines, width, bound = ALU_CASES[0]
+        return aot.lower(variant(lines, *changes), width, **(bound | binding)).splitlines()
+
+    lines = alu()
+    assert lines[:3] == ["cbuffer Constants : register(b0) { uint4 params[4]; };",
+                         "ByteAddressBuffer inputData : register(t0);",
+                         "RWByteAddressBuffer outputData : register(u0);"], lines
+    assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, {ALU_WORD});", "    }", "}"], lines
+    # A copy of a result is the same program. Literal, negative inline and SGPR sources keep their order.
+    mad = "v_mad_u32_u24 v1, v2, v1, v0"
+    assert alu(("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v3, s0, v1\nv_mov_b32_e32 v1, v3")) == lines
+    load = READ_LOADS["read_copy"]
+    assert (f"min(params[0].y, (((0x0000012cu & 0xffffffu) * ((0xfffffff0u & {load}) & 0xffffffu)) + params[0].y)"
+            in alu(("0xffff, v1", "-16, v1"), (mad, "v_mad_u32_u24 v1, 0x12c, v2, s0"))[-3])
+    mul = "v_mul_lo_u32 v1, s0, v1"
+    lines = aot.lower(READ_MUL_LO, 32, **READ_BINDING).splitlines()
+    assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, (params[0].y * {load}));",
+                         "    }", "}"], lines
+    rejects("Unverified ALU operand", aot.lower, variant(READ_MUL_LO, (mul, mul.replace("s0", "v255"))),
+            32, **READ_BINDING)
+    rejects("Unsupported compute instruction: v_mul_lo_u32", aot.lower, variant(READ_MUL_LO, (mul, mul + " clamp")),
+            32, **READ_BINDING)
+    unsupported, operand = "Unsupported compute instruction: ", "Unverified ALU operand"
+    compare = "Unverified lane guard compare"
+    # The x8 descriptor load moved before the guard, so only the result is written under it.
+    early = (("s_load_dwordx8 s[8:15], s[0:1], 0x0", ""),
+             ("s_and_saveexec_b32 s2, vcc_lo", "s_load_dwordx8 s[8:15], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
+                                               "s_and_saveexec_b32 s2, vcc_lo"))
+    for message, changes in (
+        # Wrong opcodes: signed or other operations, and a carry form that would write vcc.
+        (unsupported + "v_min_i32_e32", (("v_min_u32_e32", "v_min_i32_e32"),)),
+        (unsupported + "v_max_u32_e32", (("v_min_u32_e32", "v_max_u32_e32"),)),
+        (unsupported + "v_ashrrev_i32_e32", (("v_lshrrev_b32_e32", "v_ashrrev_i32_e32"),)),
+        (unsupported + "v_or_b32_e32", (("v_and_b32_e32", "v_or_b32_e32"),)),
+        (unsupported + "v_mad_i32_i24", ((mad, "v_mad_i32_i24 v1, v2, v1, v0"),)),
+        (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
+        # Wrong operand widths: 16-bit, 64-bit and sub-dword (SDWA) forms, and a register range.
+        (unsupported + "v_min_u16_e32", (("v_min_u32_e32", "v_min_u16_e32"),)),
+        (unsupported + "v_mad_u32_u16", ((mad, "v_mad_u32_u16 v1, v2, v1, v0"),)),
+        (unsupported + "v_lshrrev_b64", (("v_lshrrev_b32_e32 v1, 16, v1", "v_lshrrev_b64 v[1:2], 16, v[1:2]"),)),
+        (unsupported + "v_mad_u64_u32", ((mad, "v_mad_u64_u32 v[1:2], s4, v2, v1, v[0:1]"),)),
+        (unsupported + "v_and_b32_sdwa", (("v_and_b32_e32 v2, 0xffff, v1", "v_and_b32_sdwa v2, v1, v1 dst_sel:DWORD "
+                                           "dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD"),)),
+        (unsupported + "v_and_b32_e32", (("0xffff, v1", "0xffff, v[1:2]"),)),
+        # An SGPR as the VOP2 src1, and an output modifier.
+        (unsupported + "v_min_u32_e32", (("s0, v1", "v1, s0"),)),
+        (unsupported + "v_mad_u32_u24", ((mad, mad + " clamp"),)),
+        # Sources that are not known words: an unknown, pending, descriptor or exec-mask SGPR, an
+        # unknown VGPR, a literal wider than 32 bits, a byte offset, and a word read before its wait.
+        # Also a destination past v255.
+        (operand, (("s0, v1", "s20, v1"),)),
+        (operand, (("s_buffer_load_dword s0, s[4:7], 0x4", ""),
+                   ("v_and_b32_e32", "s_buffer_load_dword s0, s[4:7], 0x4\nv_and_b32_e32"))),
+        (operand, (("s0, v1", "s8, v1"),)),
+        (operand, (("s0, v1", "s2, v1"),)),
+        (operand, (("16, v1", "16, v5"),)),
+        (operand, (("0xffff, v1", "0x1ffffffff, v1"),)),
+        (operand, (("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v256, s0, v1"),)),
+        (operand, (("v_and_b32_e32 v2, 0xffff, v1", "v_lshlrev_b32_e32 v3, 2, v0\nv_and_b32_e32 v2, 0xffff, v3"),)),
+        ("Unverified row pitch byte offset", ((mad, "v_lshlrev_b32_e32 v3, 2, v0\nv_mad_u32_u24 v1, v2, v1, v3"),)),
+        ("Vector load result used or overwritten before s_waitcnt vmcnt(0)", (("s_waitcnt vmcnt(0)", ""),)),
+        # A result or a word read used as an address or as a guard operand.
+        ("Unsupported store address", (("v1, v0, s[8:11]", "v0, v1, s[8:11]"),)),
+        ("Unsupported read address", (("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v1, s0, v1\n"
+                                       "buffer_load_dword v3, v1, s[12:15], 0 offen"),)),
+        (compare, (("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v1, s0, v1\nv_cmp_gt_u32_e32 vcc_lo, s3, v1"),)),
+        (compare, (("v_and_b32_e32", "v_cmp_gt_u32_e32 vcc_lo, s3, v1\nv_and_b32_e32"),)),
+        # Expressions are inline, so a result that keeps doubling is rejected.
+        ("ALU expression too large", (("v_min_u32_e32 v1, s0, v1",
+                                       "v_min_u32_e32 v1, s0, v1" + "\nv_and_b32_e32 v1, v1, v1" * 4),)),
+    ):
+        rejects(message, alu, *changes)
+    # A result computed under the guard is unknown after the restore; a word set after it is known.
+    restored = (*early, ("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", ""),
+                ("buffer_store_dword v1, v0, s[8:11], 0 idxen", "buffer_store_dword v0, v0, s[8:11], 0 idxen\n"
+                 "s_or_b32 exec_lo, exec_lo, s2\nbuffer_store_dword v1, v0, s[8:11], 0 idxen offset:4"))
+    rejects("Store data is not a known word", alu, *restored, stride=8)
+    assert alu(*restored, ("s_or_b32 exec_lo, exec_lo, s2", "s_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v1, 9"),
+               stride=8)[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
+                                  "    outputData.Store(tid.x * 8u + 4u, 0x00000009u);", "}"]
+
+
 def assemble(directory, assembler, objcopy, lines):
     src, obj, raw = [directory / x for x in ("exit.s", "exit.o", "exit.bin")]
     src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -998,9 +1141,564 @@ def store_container(code, dims):
     return bytes(blob)
 
 
+
+DS_BINDING = dict(table_reg=7, descriptor_offset=0x30, group_reg=11, stride=4, cpu="gfx1030")
+DS_FEATURES = "+wavefrontsize32,-wavefrontsize64"
+DS_PREFIX = INDEXED[:4] + ["s_waitcnt lgkmcnt(0)"]
+DS_OPS = ("ds_bpermute_b32", "ds_permute_b32")
+
+
+def ds_program(op, bias):
+    return DS_PREFIX + [
+        f"v_add_nc_u32_e32 v5, {bias}, v0",
+        "v_and_b32_e32 v5, 31, v5",
+        "v_lshlrev_b32_e32 v5, 2, v5",
+        # Alias the byte address to prove that the result can replace its input.
+        f"{op} v5, v5, v8",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dword v5, v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+DS_CASES = [(op, ds_program(op, 5), DS_BINDING) for op in DS_OPS]
+
+
+def ds_reference(op, groups):
+    bias = 5 if op == "ds_bpermute_b32" else -5
+    return [lane // 32 * 32 + ((lane % 32 + bias) % 32) for lane in range(groups * 32)]
+
+
+def ds_controls():
+    for op, lines, binding in DS_CASES:
+        expected_bias = 5 if op == "ds_bpermute_b32" else 27
+        assert f"[(local.x + {expected_bias}u) & 31u]" in aot.lower(lines, 32, **binding)
+        valid = f"{op} v5, v5, v8"
+        for operands in ("v5, v8, v8", "v5, v5, v255"):
+            rejects("Unverified DS lane routing", aot.lower, variant(lines, (valid, f"{op} {operands}")),
+                    32, **binding)
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(lines, (valid, valid + " offset:4")), 32, **binding)
+        i = lines.index(valid)
+        masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+        rejects("Unverified DS lane routing", aot.lower, masked, 32, **binding)
+        rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+                lines[:i + 1] + lines[i + 2:], 32, **binding)
+
+
+LDS_BINDING = DS_BINDING | {"stride": 12, "lds_bytes": 128}
+
+
+def signed_order(word):
+    # Flipping the sign bit places negatives before nonnegatives in an unsigned comparison.
+    return word ^ 0x80000000
+
+
+LDS_UPDATES = {
+    "ds_add_u32": operator.add,
+    "ds_sub_u32": operator.sub,
+    "ds_and_b32": operator.and_,
+    "ds_or_b32": operator.or_,
+    "ds_xor_b32": operator.xor,
+    "ds_rsub_u32": lambda old, value: value - old,
+    "ds_min_i32": lambda old, value: min(old, value, key=signed_order),
+    "ds_max_i32": lambda old, value: max(old, value, key=signed_order),
+    "ds_min_u32": min,
+    "ds_max_u32": max,
+}
+LDS_ORDER_MUTANTS = {
+    "ds_rsub_u32": "ds_sub_u32",
+    "ds_min_i32": "ds_min_u32",
+    "ds_max_i32": "ds_max_u32",
+    "ds_min_u32": "ds_min_i32",
+    "ds_max_u32": "ds_max_i32",
+}
+
+
+def lds_update_inputs(op):
+    # Each pair is (scale, base) for a lane-dependent 32-bit word.
+    if op in LDS_ORDER_MUTANTS:
+        return (1, 0x7ffffff0), (1, 0xfffffff8), (4, 0xfffffff0)
+    return (1, 0xfffffff0), (1, 0x40000021), (1, 0x80000003)
+
+
+def lds_update_program(op):
+    (init_scale, init_base), (first_scale, first_base), (second_scale, second_base) = lds_update_inputs(op)
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        f"v_mad_u32_u24 v6, {init_scale}, v8, 0x{init_base:08x}",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v10, v5",
+        "s_waitcnt lgkmcnt(0)",
+        f"v_mad_u32_u24 v6, {first_scale}, v8, 0x{first_base:08x}",
+        f"{op} v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 0",
+        "ds_read_b32 v11, v5",
+        "s_waitcnt lgkmcnt(0)",
+        f"v_mad_u32_u24 v9, {second_scale}, v8, 0x{second_base:08x}",
+        f"{op} v5, v9",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v9, 0",
+        "ds_read_b32 v12, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+def lds_update_reference(op, groups):
+    update = LDS_UPDATES[op]
+    inputs = lds_update_inputs(op)
+    words = []
+    for lane in range(groups * 32):
+        initial, src1, src2 = ((scale * lane + base) & 0xffffffff for scale, base in inputs)
+        first = update(initial, src1) & 0xffffffff
+        second = update(first, src2) & 0xffffffff
+        words.extend((initial, first, second))
+    return words
+
+
+LDS_RETURN_UPDATES = {
+    "ds_add_rtn_u32": "ds_add_u32",
+    "ds_sub_rtn_u32": "ds_sub_u32",
+    "ds_and_rtn_b32": "ds_and_b32",
+    "ds_or_rtn_b32": "ds_or_b32",
+    "ds_xor_rtn_b32": "ds_xor_b32",
+    "ds_rsub_rtn_u32": "ds_rsub_u32",
+    "ds_min_rtn_i32": "ds_min_i32",
+    "ds_max_rtn_i32": "ds_max_i32",
+    "ds_min_rtn_u32": "ds_min_u32",
+    "ds_max_rtn_u32": "ds_max_u32",
+}
+
+
+def lds_return_update_program(op):
+    (init_scale, init_base), (first_scale, first_base), (second_scale, second_base) = lds_update_inputs(LDS_RETURN_UPDATES[op])
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_lshlrev_b32_e32 v11, 2, v0",
+        f"v_mad_u32_u24 v6, {init_scale}, v8, 0x{init_base:08x}",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        # First alias the data VGPR, then alias a copy of the address VGPR.
+        f"v_mad_u32_u24 v10, {first_scale}, v8, 0x{first_base:08x}",
+        f"{op} v10, v5, v10",
+        "s_waitcnt lgkmcnt(0)",
+        f"v_mad_u32_u24 v9, {second_scale}, v8, 0x{second_base:08x}",
+        f"{op} v11, v11, v9",
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v12, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+LDS_PROGRAM = DS_PREFIX + [
+    "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
+    "ds_write_b32 v5, v6",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v6, 0",
+    "ds_read_b32 v10, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u16 v11, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u16 v12, v5 offset:2",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+    "s_endpgm",
+]
+LDS_SUBWORDS = {f"subword_{width}_{offset}": (width, offset)
+                for width, offsets in ((8, range(4)), (16, (0, 2))) for offset in offsets}
+
+
+def lds_subword_program(width, offset):
+    suffix = f" offset:{offset}" if offset else ""
+    base = 0x12340070 if width == 8 else 0x12347ff0
+    neighbor = "" if offset else " offset:3"
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mov_b32_e32 v6, 0x89abcdef",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        # A second partial write must preserve this change as well as untouched bytes.
+        "v_mov_b32_e32 v9, 0x42",
+        f"ds_write_b8 v5, v9{neighbor}",
+        "s_waitcnt lgkmcnt(0)",
+        f"v_mad_u32_u24 v6, 1, v8, 0x{base:08x}",
+        f"ds_write_b{width} v5, v6{suffix}",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 0",
+        "ds_read_b32 v10, v5",
+        "s_waitcnt lgkmcnt(0)",
+        f"ds_read_u{width} v11, v5{suffix}",
+        "s_waitcnt lgkmcnt(0)",
+        f"ds_read_i{width} v12, v5{suffix}",
+        "s_waitcnt lgkmcnt(0)",
+        # Reading captures the value before this overwrite, even though export comes later.
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+# Capture the same byte before and after a halfword write, then overwrite
+# that byte alone and read the complete word.
+LDS_OVERLAP_PROGRAM = DS_PREFIX + [
+    "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
+    "ds_write_b32 v5, v6",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u8 v10, v5 offset:1",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v7, 0x1234",
+    "ds_write_b16 v5, v7",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u8 v11, v5 offset:1",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v7, 0x5a",
+    "ds_write_b8 v5, v7 offset:1",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v12, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+    "s_endpgm",
+]
+
+
+LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING),
+             ("lds_overlap", LDS_OVERLAP_PROGRAM, LDS_BINDING)] + [
+    (name, lds_subword_program(*layout), LDS_BINDING) for name, layout in LDS_SUBWORDS.items()
+] + [(op, lds_update_program(op), LDS_BINDING) for op in LDS_UPDATES] + [
+    (op, lds_return_update_program(op), LDS_BINDING) for op in LDS_RETURN_UPDATES
+]
+
+
+LDS_D16_READS = {
+    "ds_read_u8_d16": (1, False, False),
+    "ds_read_u8_d16_hi": (1, False, True),
+    "ds_read_i8_d16": (1, True, False),
+    "ds_read_u16_d16": (2, False, False),
+    "ds_read_u16_d16_hi": (2, False, True),
+}
+LDS_D16_DESTINATIONS = (0xa53172be, 0xe8ba23f1, 0x64c139a7)
+
+
+def lds_d16_offsets(size):
+    return (0, 1, 3) if size == 1 else (0, 2, 0)
+
+
+def lds_d16_program(op):
+    size, _, _ = LDS_D16_READS[op]
+    lines = DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mad_u32_u24 v6, 1, v8, 0x887f80f0",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+    ]
+    for dst, value, offset in zip(range(10, 13), LDS_D16_DESTINATIONS, lds_d16_offsets(size)):
+        suffix = f" offset:{offset}" if offset else ""
+        lines += [f"v_mov_b32_e32 v{dst}, 0x{value:08x}", f"{op} v{dst}, v5{suffix}", "s_waitcnt lgkmcnt(0)"]
+    return lines + ["buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen", "s_endpgm"]
+
+
+def lds_d16_reference(op, groups):
+    size, signed, high = LDS_D16_READS[op]
+    words = []
+    start = 2 if high else 0
+    for lane in range(groups * 32):
+        data = (0x887f80f0 + lane).to_bytes(4, "little")
+        for initial, offset in zip(LDS_D16_DESTINATIONS, lds_d16_offsets(size)):
+            field = int.from_bytes(data[offset:offset + size], "little", signed=signed)
+            result = bytearray(initial.to_bytes(4, "little"))
+            result[start:start + 2] = (field & 0xffff).to_bytes(2, "little")
+            words.append(int.from_bytes(result, "little"))
+    return words
+
+
+LDS_CASES += [(op, lds_d16_program(op), LDS_BINDING) for op in LDS_D16_READS]
+
+
+def lds_subword_reference(width, offset, groups):
+    expected = []
+    size = width // 8
+    for lane in range(groups * 32):
+        value = (0x70 if width == 8 else 0x7ff0) + lane
+        data = value.to_bytes(size, "little")
+        word = bytearray.fromhex("ef cd ab 89")
+        word[0 if offset else 3] = 0x42
+        word[offset:offset + size] = data
+        expected.extend((int.from_bytes(word, "little"), value,
+                         int.from_bytes(data, "little", signed=True) & 0xffffffff))
+    return expected
+
+
+def lds_overlap_reference(groups):
+    words = []
+    for lane in range(groups * 32):
+        data = bytearray((0x89abfff0 + lane).to_bytes(4, "little"))
+        pre = data[1]
+        data[0:2] = b"\x34\x12"
+        middle = data[1]
+        data[1] = 0x5a
+        words.extend((pre, middle, int.from_bytes(data, "little")))
+    return words
+
+
+def lds_reference(groups):
+    words = []
+    for lane in range(groups * 32):
+        word = 0x89abfff0 + lane
+        words.extend((word, word & 0xffff, word >> 16))
+    return words
+
+
+def lds_controls():
+    lines = LDS_PROGRAM
+    assert " >> 16u) & 0xffffu)" in aot.lower(lines, 32, **LDS_BINDING)
+    for old, new, message in (
+        ("ds_write_b32 v5, v6", "s_nop 0", "Unverified private LDS read"),
+        ("ds_write_b32 v5, v6", "ds_write_b32 v8, v6", "Unverified private LDS write"),
+        ("ds_read_b32 v10, v5", "ds_read_b32 v10, v5 offset:2", "Unverified private LDS read"),
+        ("ds_read_u16 v12, v5 offset:2", "ds_read_u16 v12, v5 offset:1", "Unverified private LDS read"),
+    ):
+        rejects(message, aot.lower, variant(lines, (old, new)), 32, **LDS_BINDING)
+    i = lines.index("ds_write_b32 v5, v6")
+    masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+    rejects("Unverified private LDS write", aot.lower, masked, 32, **LDS_BINDING)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+    rejects("Unverified dispatch byte offset", aot.lower, lines, 32, **(LDS_BINDING | {"lds_bytes": 127}))
+
+
+    lines = lds_subword_program(16, 2)
+    write = "ds_write_b16 v5, v6 offset:2"
+    read = "ds_read_i16 v12, v5 offset:2"
+    for old, new, message in (
+        ("ds_write_b32 v5, v6", "s_nop 0", "Unverified private LDS write"),
+        (write, "ds_write_b16 v5, v6 offset:1", "Unverified private LDS write"),
+        (write, "ds_write_b16 v5, v6 offset:3", "Unverified private LDS write"),
+        (write, "ds_write_b16 v5, v6 offset:2 gds", "Unsupported compute instruction"),
+        (write, "ds_write_b8 v5, v6 offset:4", "Unsupported compute instruction"),
+        (read, "ds_read_i16 v12, v5 offset:1", "Unverified private LDS read"),
+        (read, "ds_read_i16 v12, v8 offset:2", "Unverified private LDS read"),
+        (read, "ds_read_i8 v12, v5 offset:4", "Unsupported compute instruction"),
+        (read, "ds_read_u8 v12, v5 offset:2 gds", "Unsupported compute instruction"),
+    ):
+        # Only omit the first full-word write in the initialization control.
+        mutated = lines.copy()
+        mutated[mutated.index(old)] = new
+        rejects(message, aot.lower, mutated, 32, **LDS_BINDING)
+    i = lines.index(write)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+    pair = ["ds_write_b8 v5, v6", "s_waitcnt lgkmcnt(0)"]
+    rejects("LDS expression exceeds the profile limit", aot.lower,
+            lines[:i] + pair * 32 + lines[i:], 32, **LDS_BINDING)
+
+
+    update = "ds_add_u32 v5, v6"
+    lines = lds_update_program("ds_add_u32")
+    no_init = variant(lines, ("ds_write_b32 v5, v6", "s_nop 0"), ("ds_read_b32 v10, v5", "s_nop 0"))
+    rejects("Unverified private LDS update", aot.lower, no_init, 32, **LDS_BINDING)
+    for bad, message in (
+        ("ds_add_u32 v8, v6", "Unverified private LDS update"),
+        ("ds_add_u32 v5, v254", "Unverified private LDS update"),
+        ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
+        ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
+        ("ds_inc_rtn_u32 v10, v5, v6", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
+    i = lines.index(update)
+    masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+    rejects("Unverified private LDS update", aot.lower, masked, 32, **LDS_BINDING)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+    pair = [update, "s_waitcnt lgkmcnt(0)"]
+    rejects("LDS expression exceeds the profile limit", aot.lower,
+            lines[:i] + pair * 32 + lines[i:], 32, **LDS_BINDING)
+
+
+    update = "ds_add_rtn_u32 v10, v5, v10"
+    lines = lds_return_update_program("ds_add_rtn_u32")
+    expected = aot.lower(lines, 32, **LDS_BINDING)
+    assert aot.lower(variant(lines, (update, update + " offset:0")), 32, **LDS_BINDING) == expected
+    no_init = variant(lines, ("ds_write_b32 v5, v6", "s_nop 0"))
+    rejects("Unverified private LDS update", aot.lower, no_init, 32, **LDS_BINDING)
+    for bad, message in (
+        ("ds_add_rtn_u32 v256, v5, v10", "Unverified private LDS update"),
+        ("ds_add_rtn_u32 v10, v8, v10", "Unverified private LDS update"),
+        ("ds_add_rtn_u32 v10, v5, v254", "Unverified private LDS update"),
+        ("ds_add_rtn_u32 v10, v5, v10 offset:4", "Unsupported compute instruction"),
+        ("ds_add_rtn_u32 v10, v5, v10 gds", "Unsupported compute instruction"),
+        ("ds_add_rtn_u32 v5, v10", "Unsupported compute instruction"),
+        ("ds_add_u32 v10, v5, v10", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
+    # The result in v11 replaces its address tag.
+    rejects("Unverified private LDS read", aot.lower,
+            variant(lines, ("ds_read_b32 v12, v5", "ds_read_b32 v12, v11")), 32, **LDS_BINDING)
+    i = lines.index(update)
+    masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+    rejects("Unverified private LDS update", aot.lower, masked, 32, **LDS_BINDING)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+
+
+    for ret, op in LDS_RETURN_UPDATES.items():
+        if op not in LDS_ORDER_MUTANTS:
+            continue
+        for lines, update in ((lds_update_program(op), f"{op} v5, v6"),
+                              (lds_return_update_program(ret), f"{ret} v10, v5, v10")):
+            for modifier in ("offset:4", "gds"):
+                rejects("Unsupported compute instruction", aot.lower,
+                        variant(lines, (update, f"{update} {modifier}")), 32, **LDS_BINDING)
+
+
+    lines = lds_d16_program("ds_read_u16_d16_hi")
+    read = "ds_read_u16_d16_hi v10, v5"
+    for bad, message in (
+        (read.replace("v10", "v254"), "Unverified D16 destination word"),
+        (read.replace("v10", "v5"), "Unverified D16 destination word"),
+        (read + " offset:1", "Unverified private LDS read"),
+        (read + " offset:4", "Unsupported compute instruction"),
+        (read + " gds", "Unsupported compute instruction"),
+        (read.replace("u16", "b32"), "Unsupported compute instruction"),
+        (read.replace("u16", "i8"), "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (read, bad)), 32, **LDS_BINDING)
+    i = lines.index(read)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+
+
+def ds_binary(directory, assembler, objcopy, library):
+    for name, lines, binding in DS_CASES + LDS_CASES:
+        src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
+        src.write_text("\n".join(lines) + "\n", encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1030", f"-mattr={DS_FEATURES}",
+                        "-filetype=obj", src, "-o", obj], check=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+        code = raw.read_bytes()
+        decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=b"gfx1030",
+                                          features=DS_FEATURES.encode()))
+        assert [line for line in decoded if line.startswith("ds_")] == [
+            line for line in lines if line.startswith("ds_")]
+        expected = aot.lower(lines, 32, **binding)
+        assert aot.lower(decoded, 32, **binding) == expected
+        container, output = directory / "ds.dxbc", directory / "ds-cli.hlsl"
+        container.write_bytes(store_container(code, (32, 1, 1)))
+        options = [item for key, value in binding.items() for item in ("--" + key.replace("_", "-"), str(value))]
+        subprocess.run([sys.executable, "-B", aot.__file__, container, "--output", output,
+                        "--llvm", library, *options], check=True)
+        assert output.read_text() == expected
+
+
+def ds_mutants(name, lines, binding, source):
+    if name in LDS_ORDER_MUTANTS:
+        changed = variant(lines, (f"{name} v5, v6", f"{LDS_ORDER_MUTANTS[name]} v5, v6"))
+        yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_UPDATES:
+        changed = variant(lines, (f"{name} v5, v6", "ds_write_b32 v5, v6"))
+        yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_RETURN_UPDATES:
+        op = LDS_RETURN_UPDATES[name]
+        return_new = f"{op} v5, v10\ns_waitcnt lgkmcnt(0)\nds_read_b32 v10, v5"
+        changed = variant(lines, (f"{name} v10, v5, v10", return_new))
+        words = lds_update_reference(op, 3)
+        # At some lanes a min/max update keeps the old value. Find the first changed lane.
+        first = next(i for i in range(0, len(words), 3) if words[i] != words[i + 1])
+        yield aot.lower(changed, 32, **binding), first
+        changed = variant(lines, (f"{name} v11, v11, v9", "ds_read_b32 v11, v11"))
+        second = next(i for i in range(2, len(words), 3) if words[i - 1] != words[i])
+        yield aot.lower(changed, 32, **binding), second
+        if op in LDS_ORDER_MUTANTS:
+            wrong_op = next(ret for ret, base in LDS_RETURN_UPDATES.items() if base == LDS_ORDER_MUTANTS[op])
+            changed = variant(lines, (f"{name} v10, v5, v10", f"{wrong_op} v10, v5, v10"))
+            yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_SUBWORDS:
+        width, offset = LDS_SUBWORDS[name]
+        suffix = f" offset:{offset}" if offset else ""
+        changed = variant(lines, (f"ds_write_b{width} v5, v6{suffix}", "ds_write_b32 v5, v6"))
+        yield aot.lower(changed, 32, **binding), 0
+        changed = variant(lines, (f"ds_read_i{width} v12, v5{suffix}", f"ds_read_u{width} v12, v5{suffix}"))
+        # Lane 16 is the first to set the sign bit. The signed read is its third word.
+        yield aot.lower(changed, 32, **binding), 16 * 3 + 2
+    elif name in LDS_D16_READS:
+        changed = variant(lines, (f"v_mov_b32_e32 v10, 0x{LDS_D16_DESTINATIONS[0]:08x}", "v_mov_b32_e32 v10, 0"))
+        yield aot.lower(changed, 32, **binding), 0
+        if name == "ds_read_i8_d16":
+            changed = variant(lines, ("ds_read_i8_d16 v10, v5", "ds_read_u8_d16 v10, v5"))
+            yield aot.lower(changed, 32, **binding), 0
+    elif name == "lds_overlap":
+        no_halfword = variant(lines, ("ds_write_b16 v5, v7", "s_nop 0"))
+        yield aot.lower(no_halfword, 32, **binding), 1
+        no_byte = variant(lines, ("ds_write_b8 v5, v7 offset:1", "s_nop 0"))
+        yield aot.lower(no_byte, 32, **binding), 2
+    elif name == "private":
+        yield source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)"), 2
+    else:
+        bias = 5 if name == "ds_bpermute_b32" else 27
+        yield source.replace(f"local.x + {bias}u", f"local.x + {32 - bias}u"), 0
+
+
+def ds_draw(directory, compiler, renderer, backend, *, private=False):
+    if private:
+        lds_controls()
+    else:
+        ds_controls()
+    accepted = set()
+    for name, lines, binding in (LDS_CASES if private else DS_CASES):
+        source = aot.lower(lines, 32, **binding)
+        src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        src.write_text(source, encoding="ascii")
+        compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        subprocess.run(compile, check=True)
+        run = [renderer, backend, "--compute-store-case", cso, case]
+        for groups in (1, 3):
+            if name in LDS_UPDATES or name in LDS_RETURN_UPDATES:
+                words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
+            elif name in LDS_SUBWORDS:
+                words = lds_subword_reference(*LDS_SUBWORDS[name], groups)
+            elif name in LDS_D16_READS:
+                words = lds_d16_reference(name, groups)
+            elif name == "lds_overlap":
+                words = lds_overlap_reference(groups)
+            elif private:
+                words = lds_reference(groups)
+            else:
+                words = ds_reference(name, groups)
+            words += [SENTINEL] * (320 - len(words))
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            execution = subprocess.run(run)
+            if execution.returncode:
+                return execution.returncode
+        for mutated, mismatched_word in ds_mutants(name, lines, binding, source):
+            assert mutated != source
+            src.write_text(mutated, encoding="ascii")
+            subprocess.run(compile, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
+                raise AssertionError(f"{name}: DS mutation escaped detection\n{bad.stderr}")
+            print(bad.stderr, end="")
+        accepted.update(line.split()[0] for line in lines)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in sorted(accepted)), encoding="utf-8")
+    return 0
+
+
 def binary(directory, assembler, objcopy, library):
+    ds_controls()
+    lds_controls()
+    ds_binary(directory, assembler, objcopy, library)
     two_exits(directory, assembler, objcopy, library)
-    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES:
+    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
         subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
@@ -1258,14 +1956,159 @@ def draw_read(directory, compiler, cmd, case, name):
     return 0
 
 
+# cap = params[0].y clamps about half of the lanes of the largest dispatch; the other constant words
+# differ from it, so a translation that reads another word fails.
+ALU_CAP = 0x45000000
+
+
+def alu_word(gid, *, low=0xffff, shift=16, pick=min):
+    """Independent CPU reference of the read_compute result for one lane."""
+    word = source_word(gid)
+    return pick(((word & low) * (word >> shift) + gid) & 0xffffffff, ALU_CAP)
+
+
+def alu_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = alu_word(gid, **reference)
+    return words
+
+
+def alu_mutations(source):
+    """Translations that a wrong opcode or operand would produce; each must fail on the GPU."""
+    yield "max for min", source.replace("min(params", "max(params")
+    yield "shift by 15", source.replace(">> (0x00000010u", ">> (0x0000000fu")
+    yield "24-bit mask for 16-bit", source.replace("(0x0000ffffu &", "(0x00ffffffu &")
+    yield "addend dropped", source.replace(" + tid.x))", "))")
+    yield "cap from another word", source.replace("min(params[0].y", "min(params[0].z")
+
+
+def draw_alu(directory, compiler, cmd, case, name):
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = ALU_CAP
+
+    def write(groups, bound, words=None):
+        case.write_bytes(struct.pack("<337I", groups, *(words or alu_words(groups, bound)), bound,
+                                     *constants[1:]))
+
+    for groups, bound in READ_RUNS:
+        write(groups, bound)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    groups, bound = READ_RUNS[-1]
+    expected = alu_words(groups, bound)
+    assert 0 < sum(word == ALU_CAP for word in expected) < bound, "the cap must clamp some lanes, not all"
+    # Reference controls: a CPU reference that disagrees with the program in one word, in the
+    # operation, the shift or the mask, or in the bound.
+    off = list(expected)
+    off[bound - 1] ^= 1
+    for label, reference in (("one word off", off), ("max for min", alu_words(groups, bound, pick=max)),
+                             ("shift by 15", alu_words(groups, bound, shift=15)),
+                             ("24-bit mask", alu_words(groups, bound, low=0xffffff)),
+                             ("lane past the bound", alu_words(groups, bound + 1))):
+        word = next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b)
+        write(groups, bound, reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(groups, bound)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, mutated in alu_mutations(source):
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection with groups={groups} bound={bound}")
+    return 0
+
+
+def draw_mad24(directory, compiler, cmd, case):
+    # Dispatch one group, enable only lane zero and leave all 319 other words
+    # at their sentinel. With cap = UINT_MAX the entire multiply is observable.
+    word = source_word(0)
+    low = word % (1 << 24)
+    assert word & (3 << 24) == 3 << 24 and low & 1
+    expected = (low * low) % (1 << 32)
+    values = [expected] + [SENTINEL] * 319
+    case.write_bytes(struct.pack("<337I", 1, *values, 1, 0xffffffff, *([0] * 14)))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    src, cso = directory / "mad24-mutant.hlsl", directory / "mad24-mutant.cso"
+    for removed_bit in (24, 25):
+        # Remove the lowerer's u24 truncation from exactly one source.
+        prepared = f"(0x{((1 << removed_bit) | 0xffffff):08x}u & {READ_LOADS['read_copy']})"
+        truncated = f"({prepared} & 0xffffffu)"
+        assert source.count(truncated) == 1
+        src.write_text(source.replace(truncated, prepared), encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        actual = (low * (low + (1 << removed_bit))) % (1 << 32)
+        mismatch = f"word=0 expected={expected:08x} actual={actual:08x}"
+        if bad.returncode != 1 or mismatch not in bad.stderr:
+            raise AssertionError(f"MAD24 bit {removed_bit} mutation escaped detection\n{bad.stderr}")
+        print(mismatch)
+    return 0
+
+
+def draw_mul_lo(cmd, case):
+    factor = 0x01000003
+    modulus = 1 << 32
+
+    def write(groups, bound, words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, factor, *([0] * 14)))
+
+    for groups, bound in READ_RUNS:
+        words = [SENTINEL] * 320
+        for gid in range(bound):
+            words[gid] = (source_word(gid) * factor) % modulus
+        write(groups, bound, words)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+
+    assert source_word(0) * factor >= modulus
+    controls = ((0, (source_word(0) * (factor & 0xffffff)) % modulus),
+                (0, ((source_word(0) & 0xffffff) * factor) % modulus),
+                (bound, (source_word(bound) * factor) % modulus))
+    for gid, wrong in controls:
+        assert wrong != words[gid]
+        stale = words.copy()
+        stale[gid] = wrong
+        write(groups, bound, stale)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        mismatch = f"word={gid} expected={wrong:08x} actual={words[gid]:08x}"
+        if bad.returncode != 1 or mismatch not in bad.stderr:
+            raise AssertionError(f"read_mul_lo: expected {mismatch}\n{bad.stderr}")
+        print(mismatch)
+    return 0
+
+
 def draw(directory, compiler, renderer, backend, cases=None):
     for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
+        if name == "read_mul_lo":
+            result = draw_mul_lo(cmd, case)
+            if result:
+                return result
+            continue
+        if name == "read_mad24":
+            result = draw_mad24(directory, compiler, cmd, case)
+            if result:
+                return result
+            continue
         if name.startswith(("guard_", "read_")):
-            result = (draw_guard if name.startswith("guard_") else draw_read)(directory, compiler, cmd, case, name)
+            result = (draw_guard if name.startswith("guard_") else draw_alu if name == "read_compute"
+                      else draw_read)(directory, compiler, cmd, case, name)
             if result:
                 return result
             continue
@@ -1316,5 +2159,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
-                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES)}
+                 "draw-ds-route": ds_draw,
+                 "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
+                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))

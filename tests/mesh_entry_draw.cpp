@@ -1,6 +1,7 @@
 #include "desktop_gpu.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -210,7 +211,13 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
         D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
         ComPtr<ID3D12Device2> device2;
         check(device->QueryInterface(IID_PPV_ARGS(&device2)), "Query mesh pipeline device");
-        check(device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pipeline)), "Create mesh pipeline");
+        // tools/mesh_od_pipeline.py reads this line to separate pipeline creation from the process time.
+        const auto pipeline_start = std::chrono::steady_clock::now();
+        const HRESULT created = device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        const std::chrono::duration<double, std::milli> pipeline_time = std::chrono::steady_clock::now() - pipeline_start;
+        std::printf("mesh_pipeline_ms=%.3f\n", pipeline_time.count());
+        std::fflush(stdout);  // Keep the line if the process dies after pipeline creation.
+        check(created, "Create mesh pipeline");
     }
     D3D12_RESOURCE_DESC texture{};
     texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;

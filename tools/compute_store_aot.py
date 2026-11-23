@@ -6,7 +6,7 @@ import re
 import struct
 from pathlib import Path
 
-from pixel_aot import container_code, disassemble
+from pixel_aot import INTEGER, container_code, disassemble
 from resource_inventory import parts
 
 
@@ -14,6 +14,33 @@ CONSTANT_WORDS = 16
 AXES = "xyz"
 # Unsigned VOPC compares a lane guard may use: v_cmp_<op>_u32 a, b is (a <op> b) per lane.
 GUARD_COMPARES = {"gt": ">", "lt": "<", "ge": ">=", "le": "<="}
+# The data ALU subset: the unsigned 32-bit operations the LLVM 15 code generator emits for the
+# read-compute-write fixture, on known words only. v_and_b32 and v_lshrrev_b32 (src1 >> src0[4:0])
+# reuse the pixel profile's integer templates, as does v_mul_lo_u32. v_mad_u32_u24 is
+# src0[23:0] * src1[23:0] + src2, modulo 2^32. None of them writes vcc, so the guard compare stays valid.
+ALU = {
+    "v_and_b32_e32": f"({INTEGER['and_b32'][1]})",
+    "v_lshrrev_b32_e32": f"({INTEGER['lshrrev_b32'][1]})",
+    "v_min_u32_e32": "min({0}, {1})",
+    "v_mul_lo_u32": INTEGER["mul_lo_u32"][1],
+    "v_mad_u32_u24": "((({0} & 0xffffffu) * ({1} & 0xffffffu)) + {2})",
+}
+ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
+# Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
+ALU_EXPRESSION_LIMIT = 1024
+# Template operands are the old LDS word and the source VGPR, both HLSL uints.
+LDS_RMW = {
+    "ds_add_u32": "({0} + {1})",
+    "ds_sub_u32": "({0} - {1})",
+    "ds_and_b32": "({0} & {1})",
+    "ds_or_b32": "({0} | {1})",
+    "ds_xor_b32": "({0} ^ {1})",
+    "ds_rsub_u32": "({1} - {0})",
+    "ds_min_i32": "asuint(min(asint({0}), asint({1})))",
+    "ds_max_i32": "asuint(max(asint({0}), asint({1})))",
+    "ds_min_u32": "min({0}, {1})",
+    "ds_max_u32": "max({0}, {1})",
+}
 
 
 def checked_group(group):
@@ -33,7 +60,8 @@ def group_size(psv):
 
 
 def is_word(value):
-    return isinstance(value, int) or (isinstance(value, tuple) and value[0] in ("constant_word", "thread", "source"))
+    return isinstance(value, int) or (isinstance(value, tuple)
+                                      and value[0] in ("constant_word", "thread", "source", "alu"))
 
 
 def hlsl_word(value):
@@ -42,7 +70,21 @@ def hlsl_word(value):
     if value[0] == "source":
         # The source binding is read-only, so the read may sit where the word is used.
         return f"inputData.Load({value[1]})"
+    if value[0] == "alu":
+        return value[1]
     return f"tid.{AXES[value[1]]}" if value[0] == "thread" else f"params[{value[1] // 4}].{'xyzw'[value[1] % 4]}"
+
+
+def alu_word(token, scalar, vector, pending):
+    """The known word an ALU source names, or None: a VGPR, a loaded SGPR, an inline constant or a literal."""
+    if token[0] == "v":
+        value = vector.get(int(token[1:]))
+    elif token[0] == "s":
+        n = int(token[1:])
+        value = scalar.get(n) if n <= 105 and n not in pending else None
+    else:
+        value = int(token, 0) & 0xffffffff if -(1 << 31) <= int(token, 0) <= 0xffffffff else None
+    return value if is_word(value) else None
 
 
 def vector_operands(line):
@@ -75,7 +117,7 @@ def labelled(decoded):
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
-          source_stride=None):
+          source_stride=None, cpu="gfx1013", lds_bytes=0):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
@@ -83,6 +125,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     source t0; source_stride is the t0 byte stride that indexed reads use.
     """
     dims = checked_group(group)
+    if cpu not in ("gfx1013", "gfx1030"):
+        raise ValueError("Unsupported compute target")
+    ds_group = cpu == "gfx1030" and dims == (32, 1, 1)
     if not 0 <= table_reg <= 105 or not 0 <= descriptor_offset < 1 << 20 or descriptor_offset % 4:
         raise ValueError("Invalid table or thread group binding")
     descriptor_bindings = {descriptor_offset: "uav"}
@@ -114,6 +159,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
+    ds_steps = []
+    lds_enabled = ds_group and 128 <= lds_bytes <= 65536
+    lds_word = None
+    ds_wait = False
     written_spans = []
     layout = None
     # One per-lane guard: v_cmp into vcc_lo, s_and_saveexec_b32, the stores under the mask, then
@@ -125,6 +174,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         raise ValueError("Missing final program exit")
 
     for line in instructions[:-1]:
+        if ds_wait:
+            if line != "s_waitcnt lgkmcnt(0)":
+                raise ValueError("Expected immediate s_waitcnt lgkmcnt(0) after DS")
+            ds_wait = False
         if m := re.fullmatch(r"(\.L\w+):", line):
             if guard is None or guard["label"] != m[1] or guard["at_label"]:
                 raise ValueError("Unverified branch target")
@@ -161,7 +214,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             else:
                 value = int(src, 0)
                 left = value & 0xffffffff if -(1 << 31) <= value <= 0xffffffff else None
-            if not is_word(left) or right > 255 or not is_word(vector.get(right)):
+            # A word read or computed in the program is not a verified guard operand.
+            if (right > 255 or not all(is_word(word) and not (isinstance(word, tuple) and word[0] in ("source", "alu"))
+                                       for word in (left, vector.get(right)))):
                 raise ValueError("Unverified lane guard compare")
             vcc = (op, left, vector[right])
         elif m := re.fullmatch(r"s_and_saveexec_b32 s(\d+), vcc_lo", line):
@@ -301,13 +356,117 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or vector.get(local) != ("local", tag[1])):
                 raise ValueError("Unverified dispatch byte offset")
             vector[dst] = ("thread_bytes", tag[1], shift)
+        elif (ds_group and (m := re.fullmatch(r"v_add_nc_u32_e32 v(\d+), (\d+), v(\d+)", line))
+              and vector.get(int(m[3])) == ("local", 0)):
+            dst, rotation, _ = map(int, m.groups())
+            if dst > 255 or rotation > 31:
+                raise ValueError("Unverified DS lane bias")
+            vector[dst] = ("ds_biased_lane", rotation)
+        elif (ds_group and (m := re.fullmatch(r"v_and_b32_e32 v(\d+), 31, v(\d+)", line))
+              and (tag := vector.get(int(m[2]))) and isinstance(tag, tuple) and tag[0] == "ds_biased_lane"):
+            dst = int(m[1])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            vector[dst] = ("ds_lane", tag[1])
         elif m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line):
             dst, shift, src = map(int, m.groups())
             tag = vector.get(src)
+            if ds_group and dst <= 255 and shift == 2 and isinstance(tag, tuple) and tag[0] == "ds_lane":
+                vector[dst] = ("ds_address", tag[1])
+                continue
+            if lds_enabled and dst <= 255 and shift == 2 and tag == ("local", 0):
+                vector[dst] = ("lds_address",)
+                continue
             # The element and row checks at the store bound the shift.
             if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
                 raise ValueError("Unverified dispatch byte offset")
             vector[dst] = ("thread_bytes", tag[1], shift)
+        elif m := re.fullmatch(r"ds_(b?permute)_b32 v(\d+), v(\d+), v(\d+)", line):
+            op, dst, addr, src = m[1], *map(int, m.groups()[1:])
+            address = vector.get(addr)
+            value = vector.get(src)
+            if (not ds_group or guard_span is not None or max(dst, addr, src) > 255
+                    or not isinstance(address, tuple) or address[0] != "ds_address" or not is_word(value)
+                    or len(ds_steps) >= 64):
+                raise ValueError("Unverified DS lane routing")
+            # The bijective address is (local X + bias) mod 32. Scatter reads from its inverse.
+            bias = address[1] if op == "bpermute" else (-address[1]) % 32
+            slot = f"ds_stage_{len(ds_steps)}"
+            result = f"ds_result_{len(ds_steps)}"
+            ds_steps.append((slot, f"    {slot}[local.x] = {hlsl_word(value)};\n"
+                                   f"    GroupMemoryBarrierWithGroupSync();\n"
+                                   f"    uint {result} = {slot}[(local.x + {bias}u) & 31u];"))
+            vector[dst] = ("alu", result)
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_write_b(8|16|32) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
+            width, addr, src = map(int, m.groups()[:3])
+            offset = int(m[4] or 0)
+            value = vector.get(src)
+            if (not lds_enabled or guard_span is not None or max(addr, src) > 255
+                    or vector.get(addr) != ("lds_address",) or not is_word(value)
+                    or offset % (width // 8) or (width < 32 and lds_word is None)):
+                raise ValueError("Unverified private LDS write")
+            # Every lane owns one disjoint word. Capture values even if their VGPRs are overwritten.
+            if width == 32:
+                lds_word = value
+            else:
+                shift = offset * 8
+                mask = (1 << width) - 1
+                keep = 0xffffffff ^ (mask << shift)
+                expression = (f"(({hlsl_word(lds_word)} & 0x{keep:08x}u) | "
+                              f"(({hlsl_word(value)} & 0x{mask:x}u) << {shift}u))")
+                if len(expression) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("LDS expression exceeds the profile limit")
+                lds_word = ("alu", expression)
+            ds_wait = True
+        elif ((m := re.fullmatch(r"(ds_[a-z]+)(?P<ret>_rtn)?(_[iub]32) "
+                                 r"(?(ret)v(\d+), )v(\d+), v(\d+)(?: offset:0)?", line))
+              and (template := LDS_RMW.get(m[1] + m[3]))):
+            dst = int(m[4]) if m[4] is not None else None
+            addr, src = int(m[5]), int(m[6])
+            value = vector.get(src)
+            if (not lds_enabled or guard_span is not None or max(addr, src) > 255
+                    or (dst is not None and dst > 255) or vector.get(addr) != ("lds_address",)
+                    or lds_word is None or not is_word(value)):
+                raise ValueError("Unverified private LDS update")
+            expression = template.format(hlsl_word(lds_word), hlsl_word(value))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("LDS expression exceeds the profile limit")
+            # Capture the inputs before assigning the old word to a possibly overlapping VGPR.
+            if dst is not None:
+                vector[dst] = lds_word
+            lds_word = ("alu", expression)
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_read_(b32|[ui](?:8|16))(?P<d16>_d16(?P<hi>_hi)?)? "
+                               r"v(?P<dst>\d+), v(?P<addr>\d+)(?: offset:(?P<offset>[0-3]))?", line):
+            op, dst, addr, offset = m[1], int(m["dst"]), int(m["addr"]), int(m["offset"] or 0)
+            d16, high = m["d16"], m["hi"]
+            if d16 and (op not in ("u8", "i8", "u16") or (op == "i8" and high)):
+                raise ValueError("Unsupported compute instruction: " + line)
+            width = int(op[1:])
+            if (not lds_enabled or guard_span is not None or max(dst, addr) > 255
+                    or vector.get(addr) != ("lds_address",) or lds_word is None or offset % (width // 8)):
+                raise ValueError("Unverified private LDS read")
+            if width == 32:
+                vector[dst] = lds_word
+            else:
+                shifted = f"({hlsl_word(lds_word)} >> {offset * 8}u)"
+                if op.startswith("i"):
+                    # Shifting to the sign bit discards any higher neighbors before the arithmetic shift.
+                    extend = 32 - width
+                    expression = f"asuint(asint({shifted} << {extend}u) >> {extend}u)"
+                else:
+                    expression = f"({shifted} & 0x{(1 << width) - 1:x}u)"
+                if d16:
+                    previous = vector.get(dst)
+                    if not is_word(previous):
+                        raise ValueError("Unverified D16 destination word")
+                    keep, shift = ("0x0000ffffu", 16) if high else ("0xffff0000u", 0)
+                    expression = f"(({hlsl_word(previous)} & {keep}) | (({expression} & 0xffffu) << {shift}u))"
+                if len(expression) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("LDS expression exceeds the profile limit")
+                vector[dst] = ("alu", expression)
+            ds_wait = True
         elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), v(\d+), (\d+), v(\d+)", line):
             dst, row, shift, column = map(int, m.groups())
             row_tag, column_tag = vector.get(row), vector.get(column)
@@ -318,6 +477,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
+        elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
+              or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_mad_u32_u24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
+              and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
+            # VOP2 takes a VGPR as src1. A v_mad_u32_u24 with an address operand is a row pitch below.
+            op, dst = m[1], int(m[2])
+            words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            if dst > 255 or None in words:
+                raise ValueError("Unverified ALU operand")
+            expression = ALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(r"v_mad_u32_u24 v(\d+), (v\d+|-?\d+|0x[0-9a-f]+), (v\d+|-?\d+|0x[0-9a-f]+), v(\d+)", line):
             dst, column = int(m[1]), int(m[4])
             # The literal pitch may be either multiplicand; LLVM 15 places it in src0.
@@ -444,6 +616,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
         else:
             raise ValueError(f"Unsupported compute instruction: {line}")
+    if ds_wait:
+        raise ValueError("Expected immediate s_waitcnt lgkmcnt(0) after DS")
     if not stores:
         raise ValueError("Expected at least one observable store")
     if guard is not None and guard["label"] is not None and not guard["at_label"]:
@@ -461,8 +635,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                if constant_descriptor is not None else "")
     if source_descriptor is not None:
         cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
+    local = ""
+    if ds_steps:
+        cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot, _ in ds_steps)
+        body = "\n".join([*(step for _, step in ds_steps), body])
+        local = ", uint3 local : SV_GroupThreadID"
     return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
-            f"void main(uint3 tid : SV_DispatchThreadID) {{\n{body}\n}}\n")
+            f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 
 
 def main():
@@ -470,6 +649,8 @@ def main():
     parser.add_argument("container", type=Path, help="Local extracted DXBC container")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--llvm", required=True)
+    parser.add_argument("--cpu", choices=("gfx1013", "gfx1030"), default="gfx1013")
+    parser.add_argument("--lds-bytes", type=int, default=0, help="Known native group LDS allocation")
     parser.add_argument("--table-reg", type=int, required=True)
     parser.add_argument("--descriptor-offset", type=lambda n: int(n, 0), required=True)
     parser.add_argument("--constant-descriptor", type=lambda n: int(n, 0), help="Table byte offset bound to b0")
@@ -487,11 +668,13 @@ def main():
     chunks = parts(blob)
     group = group_size(chunks.get(b"PSV0", b""))
     code = container_code(chunks.get(b"DXIL", b""), stage=5, llvm=args.llvm)
-    source = lower(labelled(disassemble(code, args.llvm, offsets=True)), group, table_reg=args.table_reg,
+    features = b"+wavefrontsize32,-wavefrontsize64" if args.cpu == "gfx1030" else b""
+    decoded = disassemble(code, args.llvm, offsets=True, cpu=args.cpu.encode(), features=features)
+    source = lower(labelled(decoded), group, table_reg=args.table_reg,
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
-                   source_stride=args.source_stride)
+                   source_stride=args.source_stride, cpu=args.cpu, lds_bytes=args.lds_bytes)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),

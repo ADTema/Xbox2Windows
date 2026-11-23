@@ -20,9 +20,9 @@ otherwise.
 
 - Never add game files, dumps, DLLs, EXEs, torrents, distribution links or
   credentials to the repository, issues or pull requests.
-- The GitHub repository description and the opening paragraph of README.md may
-  name the case-study title when describing static recompilation research. Keep
-  other public wording title-neutral. Do not claim that a game runs.
+- Keep public project wording title-neutral, including the repository
+  description and README. Describe results in terms of the platform, component
+  or fixture tested. Do not claim that a game runs.
 - Use only source-built fixtures, synthetic inputs or public samples with a
   known revision and license.
 - Keep generated output under `out/` and local inputs under `game-files/`.
@@ -112,6 +112,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/dxcontainer_part_offsets_check.py
 ./out/pe-env/bin/python -B tests/layout_chunks_check.py
 ./out/pe-env/bin/python -B tests/dependency_paths_check.py
+./out/pe-env/bin/python -B tests/pe_package_preflight_check.py
 ./out/pe-env/bin/python -B tests/intake/paths_check.py
 ./out/pe-env/bin/python -B tests/shader_probe_check.py
 ./out/pe-env/bin/python -B tests/shader_census_check.py
