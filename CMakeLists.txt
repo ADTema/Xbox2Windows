@@ -3511,6 +3511,37 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_exe_tls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_tls_check.py" "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_exe_tls>"
         "$<TARGET_FILE:cpu_exe_tls_early>")
+    # Main-image TLS slot 0: a CRT-free /GA EXE whose thread-locals are read through slot 0, launched by
+    # Windows and started by a CRT-free host that owns slot 0 itself, with pe_map_run_main and explicit
+    # participants and, as the control, pe_map_run (Refs #870, #165).
+    # The _pause variant leaves a worker paused inside the image for the release refusal (mapped only). The
+    # _enroll variant starts a probe worker whose enrollment or installation the host makes fail.
+    foreach(target IN ITEMS cpu_exe_tls_slot0 cpu_exe_tls_slot0_pause cpu_exe_tls_slot0_enroll)
+        add_executable(${target} tests/cpu/exe_tls_slot0.cpp)
+        target_compile_options(${target} PRIVATE /GS- /Zl /GA)
+        target_link_options(${target} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
+            /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE kernel32)
+    endforeach()
+    target_compile_definitions(cpu_exe_tls_slot0_pause PRIVATE PAUSED_WORKER)
+    target_compile_definitions(cpu_exe_tls_slot0_enroll PRIVATE ENROLL_PROBE)
+    add_executable(cpu_exe_tls_slot0_host tests/cpu/exe_tls_slot0_host.cpp)
+    target_compile_options(cpu_exe_tls_slot0_host PRIVATE /GS- /Zl)
+    target_link_options(cpu_exe_tls_slot0_host PRIVATE /ENTRY:host_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
+        /DYNAMICBASE /INCREMENTAL:NO)
+    target_link_libraries(cpu_exe_tls_slot0_host PRIVATE kernel32)
+    # Separate evidence: the Windows launch, and the pe_map scenarios with explicit participants.
+    add_test(NAME cpu_native_exe_tls_slot0_windows COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_tls_slot0_check.py" windows "$<TARGET_FILE:cpu_exe_tls_slot0>")
+    add_test(NAME cpu_native_exe_tls_slot0 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_tls_slot0_check.py" mapped "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_tls_slot0>" "$<TARGET_FILE:cpu_exe_tls_slot0_host>"
+        "$<TARGET_FILE:cpu_exe_tls_slot0_pause>")
+    # Guest-thread enrollment failures, one child host process each: the probe worker's start routine must
+    # never run, and the host must survive.
+    add_test(NAME cpu_native_exe_tls_slot0_enroll COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_tls_slot0_check.py" enroll "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_tls_slot0_enroll>" "$<TARGET_FILE:cpu_exe_tls_slot0_host>")
     # Lifecycle fixtures: two DLLs with the static MSVC runtime (B imports A) and a CRT-free event sink.
     add_library(cpu_life_sink SHARED tests/cpu/life_sink.cpp)
     target_compile_options(cpu_life_sink PRIVATE /GS- /Zl)
