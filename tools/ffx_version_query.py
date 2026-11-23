@@ -180,6 +180,97 @@ template<class F, class U> static F fma_x86(F s0, F s1, F s2, int order, bool ne
     if (std::isnan(c)) return quiet_nan<F, U>(c);
     return std::fma(neg_p ? -a : a, b, neg_c ? -c : c);
 }
+struct PcmpResult {
+    uint16_t mask;
+    uint32_t index;
+    bool carry;
+    bool zero;
+    bool overflow;
+};
+static inline uint32_t pcmp_explicit_len(int32_t raw, uint32_t limit) {
+    const uint32_t mag = raw < 0 ? (0u - static_cast<uint32_t>(raw)) : static_cast<uint32_t>(raw);
+    return mag < limit ? mag : limit;
+}
+static inline int32_t pcmp_elem(const uint8_t p[16], uint32_t idx, bool is_word, bool is_signed) {
+    if (is_word) {
+        uint16_t u;
+        memcpy(&u, p + idx * 2u, 2);
+        return is_signed ? int32_t(static_cast<int16_t>(u)) : int32_t(u);
+    }
+    return is_signed ? int32_t(static_cast<int8_t>(p[idx])) : int32_t(p[idx]);
+}
+static inline PcmpResult pcmp_str(const uint8_t a[16], const uint8_t b[16],
+                                  uint8_t imm, bool is_explicit, int32_t raw_la, int32_t raw_lb) {
+    const bool is_word = (imm & 1u) != 0;
+    const bool is_signed = (imm & 2u) != 0;
+    const uint32_t limit = is_word ? 8u : 16u;
+    const uint32_t agg = (imm >> 2) & 3u;
+    const uint32_t pol = (imm >> 4) & 3u;
+    const bool high_sel = (imm & 0x40u) != 0;
+    uint32_t len1 = 0, len2 = 0;
+    if (is_explicit) {
+        len1 = pcmp_explicit_len(raw_la, limit);
+        len2 = pcmp_explicit_len(raw_lb, limit);
+    } else {
+        while (len1 < limit && pcmp_elem(a, len1, is_word, is_signed) != 0) ++len1;
+        while (len2 < limit && pcmp_elem(b, len2, is_word, is_signed) != 0) ++len2;
+    }
+    uint16_t int_res1 = 0;
+    for (uint32_t i = 0; i < limit; ++i) {
+        bool bit = false;
+        if (agg == 0u) {
+            if (i < len2) {
+                const int32_t bv = pcmp_elem(b, i, is_word, is_signed);
+                for (uint32_t j = 0; j < len1; ++j) {
+                    if (pcmp_elem(a, j, is_word, is_signed) == bv) { bit = true; break; }
+                }
+            }
+        } else if (agg == 1u) {
+            if (i < len2) {
+                const int32_t bv = pcmp_elem(b, i, is_word, is_signed);
+                for (uint32_t j = 0; j + 1u < len1; j += 2u) {
+                    if (bv >= pcmp_elem(a, j, is_word, is_signed) &&
+                        bv <= pcmp_elem(a, j + 1u, is_word, is_signed)) { bit = true; break; }
+                }
+            }
+        } else if (agg == 2u) {
+            if (i < len1 && i < len2) bit = pcmp_elem(a, i, is_word, is_signed) == pcmp_elem(b, i, is_word, is_signed);
+            else if (i >= len1 && i >= len2) bit = true;
+        } else {
+            bit = true;
+            for (uint32_t j = 0; j < len1 && i + j < limit; ++j) {
+                if (i + j >= len2 || pcmp_elem(a, j, is_word, is_signed) != pcmp_elem(b, i + j, is_word, is_signed)) {
+                    bit = false;
+                    break;
+                }
+            }
+        }
+        if (bit) int_res1 = static_cast<uint16_t>(int_res1 | (1u << i));
+    }
+    const uint16_t all_mask = static_cast<uint16_t>((1u << limit) - 1u);
+    uint16_t int_res2 = int_res1;
+    if (pol == 1u) int_res2 = static_cast<uint16_t>(int_res1 ^ all_mask);
+    else if (pol == 3u) int_res2 = static_cast<uint16_t>(int_res1 ^ static_cast<uint16_t>((1u << len2) - 1u));
+    uint32_t index = limit;
+    if (int_res2 != 0u) {
+        if (!high_sel) { index = 0u; while (((int_res2 >> index) & 1u) == 0u) ++index; }
+        else { index = limit - 1u; while (((int_res2 >> index) & 1u) == 0u) --index; }
+    }
+    return {int_res2, index, int_res2 != 0u, len2 < limit, (int_res2 & 1u) != 0u};
+}
+static inline void pcmp_write_mask(uint8_t out[16], uint16_t mask, uint8_t imm) {
+    memset(out, 0, 16);
+    if ((imm & 0x40u) == 0u) {
+        memcpy(out, &mask, 2);
+    } else if ((imm & 1u) == 0u) {
+        for (uint32_t k = 0; k < 16u; ++k) out[k] = ((mask >> k) & 1u) ? 0xffu : 0x00u;
+    } else {
+        for (uint32_t k = 0; k < 8u; ++k) {
+            const uint16_t v = ((mask >> k) & 1u) ? 0xffffu : 0x0000u;
+            memcpy(out + 2u * k, &v, 2);
+        }
+    }
+}
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
 
@@ -278,6 +369,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         M.PEXTRB, M.PEXTRW, M.PEXTRD, M.PEXTRQ,
         M.PINSRB, M.PINSRW, M.PINSRD, M.PINSRQ,
         M.PMADDUBSW, M.PMULHRSW, M.PHMINPOSUW, M.PTEST, M.MPSADBW, M.PCMPGTQ,
+        M.PCMPESTRI, M.PCMPESTRM, M.PCMPISTRI, M.PCMPISTRM,
     }
     has_wide |= any(i.mnemonic in sse41_42_misc_ops for i in body)
     ssse3_ops = {
@@ -1241,6 +1333,22 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+=8) {{ "
                         f"int64_t a, b; memcpy(&a, {dst}.data()+n, 8); memcpy(&b, rhs.data()+n, 8); "
                         f"const uint64_t v = a > b ? ~0ull : 0ull; memcpy({dst}.data()+n, &v, 8); }} }}")
+        elif op in (M.PCMPESTRI, M.PCMPESTRM, M.PCMPISTRI, M.PCMPISTRM) and has_wide:
+            if (i.encoding != EncodingKind.LEGACY or i.op_count != 3
+                    or i.op0_kind != K.REGISTER or i.op0_register not in wide_xmm
+                    or i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm
+                    or i.op2_kind != K.IMMEDIATE8):
+                raise ValueError(f"unsupported packed string compare form at {i.ip:#x}: {i}")
+            src1, src2 = wide_xmm[i.op0_register], wide_xmm[i.op1_register]
+            imm = i.immediate(2) & 0xff
+            is_explicit = "true" if op in (M.PCMPESTRI, M.PCMPESTRM) else "false"
+            is_mask = op in (M.PCMPESTRM, M.PCMPISTRM)
+            out_stmt = (f"pcmp_write_mask(wide0.data(), r.mask, {imm}u);" if is_mask
+                        else "rcx = static_cast<uint64_t>(r.index);")
+            parity_stmt = " parity = false;" if parity else ""
+            stmt = (f"{{ const PcmpResult r = pcmp_str({src1}.data(), {src2}.data(), {imm}u, {is_explicit}, "
+                    f"static_cast<int32_t>(rax), static_cast<int32_t>(rdx)); "
+                    f"{out_stmt} carry = r.carry; zero = r.zero; overflow = r.overflow;{parity_stmt} }}")
         elif i.encoding == EncodingKind.LEGACY and i.op0_register in wide_xmm and op in ssse3_ops:
             if i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm:
                 raise ValueError(f"unsupported SSSE3 source at {i.ip:#x}: {i}")
