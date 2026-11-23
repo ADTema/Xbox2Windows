@@ -133,7 +133,12 @@ set(pixel_vs "${CMAKE_CURRENT_BINARY_DIR}/pixel_aot_vs.h")
 add_custom_command(OUTPUT "${pixel_vs}" COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E main
     -Fh "${pixel_vs}" -Vn pixel_aot_vs "${CMAKE_CURRENT_SOURCE_DIR}/tests/pixel_aot_vs.hlsl"
     DEPENDS tests/pixel_aot_vs.hlsl VERBATIM)
-target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp tests/pixel_compare_render.cpp "${pixel_vs}")
+set(pixel_vs_linear "${CMAKE_CURRENT_BINARY_DIR}/pixel_aot_vs_linear.h")
+add_custom_command(OUTPUT "${pixel_vs_linear}" COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E main -D PIXEL_MIP_LINEAR=1
+    -Fh "${pixel_vs_linear}" -Vn pixel_aot_vs_linear "${CMAKE_CURRENT_SOURCE_DIR}/tests/pixel_aot_vs.hlsl"
+    DEPENDS tests/pixel_aot_vs.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp tests/pixel_compare_render.cpp "${pixel_vs}"
+    "${pixel_vs_linear}")
 target_sources(offscreen_check PRIVATE tests/desktop_gpu.cpp tests/mesh_entry_draw.cpp tests/mesh_shadow_draw.cpp)
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp tests/ffx_recurrent_views.cpp)
 target_sources(offscreen_check PRIVATE tests/ffx_rcas_views.cpp)
@@ -447,7 +452,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # tests silently disappearing. Hosted CI sets X2W_REQUIRE_SPIRV_TOOLS=1 to turn skips into failures.
     foreach(adapter IN ITEMS hardware warp)
         foreach(bridge IN ITEMS address_window:draw sampler_views:sampler ballot_extract:ballot
-                                compaction:compaction compare_sampler:compare_sampler minlod:minlod)
+                                compaction:compaction compare_sampler:compare_sampler minlod:minlod
+                                minlod_levels:minlod_levels)
             string(REPLACE ":" ";" bridge "${bridge}")
             list(GET bridge 0 name)
             list(GET bridge 1 driver)

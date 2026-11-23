@@ -1,6 +1,7 @@
 #include "bvh_fixture.h"
 #include "desktop_gpu.h"
 #include "pixel_aot_vs.h"
+#include "pixel_aot_vs_linear.h"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -61,6 +62,8 @@ struct PixelInput {
     std::optional<D3D12_VIEWPORT> viewport;
     std::vector<Word> titleRanges;                // TitleRange records, empty without title memory
     std::vector<std::vector<Word>> titleAliases;  // one buffer per alias slot
+    bool linearMips = false;     // sample through the MIN_MAG_POINT_MIP_LINEAR root signature
+    float tolerance = 0;         // per-channel absolute error; 0 compares bit for bit
 };
 
 // Flag bit 2 of the case trailer: the range count and the slot count (titleAliasSlots), the ranges,
@@ -175,13 +178,19 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     if (ps.empty() || file.bad()) throw std::runtime_error("Cannot read compiled pixel shader");
     const bool titleMemory = !input.titleRanges.empty();
     ComPtr<ID3D12RootSignature> root;
+    const D3D12_SHADER_BYTECODE vs = input.linearMips
+        ? D3D12_SHADER_BYTECODE{pixel_aot_vs_linear, sizeof(pixel_aot_vs_linear)}
+        : D3D12_SHADER_BYTECODE{pixel_aot_vs, sizeof(pixel_aot_vs)};
+    // The title root signature has its own point sampler.
+    if (titleMemory && input.linearMips)
+        throw std::runtime_error("The mip-linear sampler is not available with title memory");
     if (titleMemory)
         root = title_root_signature(device);
     else
-        check(device->CreateRootSignature(0, pixel_aot_vs, sizeof(pixel_aot_vs), IID_PPV_ARGS(&root)), "Pixel root");
+        check(device->CreateRootSignature(0, vs.pShaderBytecode, vs.BytecodeLength, IID_PPV_ARGS(&root)), "Pixel root");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root.Get();
-    desc.VS = {pixel_aot_vs, sizeof(pixel_aot_vs)};
+    desc.VS = vs;
     desc.PS = {ps.data(), ps.size()};
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -405,6 +414,8 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
             std::printf("covered_samples=%u checked_pixels=%zu\n", sum, input.coverage.size());
         }
         auto words = read(back.Get(), resultBytes/4);
+        float maxError = 0;
+        std::array<UINT, 4> firstBits{};
         std::vector<BYTE> image;
         if (capture) image.reserve(size_t(width) * height * 4);
         for (UINT y = 0; y < height; ++y) {
@@ -429,8 +440,10 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                 // bitwise. A masked channel accepts a NaN against an expected NaN of any sign or
                 // payload and still logs both raw words; masking a channel whose expected word is
                 // not NaN is a case-format error.
+                float pixelError = 0;
                 const auto matches_at = [&](size_t index) {
                     const auto& reference = sampled.expected[index];
+                    float candidateError = 0;
                     const BYTE mask = index < sampled.nanMask.size() ? sampled.nanMask[index] : BYTE{0};
                     for (size_t c = 0; c < actual.size(); ++c) {
                         const UINT expected_bits = bits(reference[c]);
@@ -442,9 +455,13 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                                         x, y, c, expected_bits, actual_bits);
                             if (!is_nan_bits(actual_bits)) return false;
                         } else if (expected_bits != actual_bits) {
-                            return false;
+                            if (!input.tolerance) return false;
+                            const float error = std::fabs(actual[c] - reference[c]);
+                            if (!(error <= input.tolerance)) return false;   // NaN fails too
+                            candidateError = (std::max)(candidateError, error);
                         }
                     }
+                    pixelError = candidateError;
                     return true;
                 };
                 bool matched = matches_at(sampleY * sampled.width + sampleX);
@@ -478,18 +495,24 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                                      c, expected[c], actual[c], bits(expected[c]), bits(actual[c]));
                     throw PixelMismatch();
                 }
+                maxError = (std::max)(maxError, pixelError);
+                if (!x && !y)
+                    for (size_t c = 0; c < actual.size(); ++c) firstBits[c] = bits(actual[c]);
                 if (capture) {
                     for (float value : actual) image.push_back(static_cast<BYTE>(std::lround(value * 255)));
                 }
             }
         }
+        // Filtered results may differ by adapter within the tolerance; the raw bits let callers compare them.
+        if (input.tolerance)
+            std::printf("first_pixel_bits=%08x,%08x,%08x,%08x\n", firstBits[0], firstBits[1], firstBits[2], firstBits[3]);
         if (capture) {
             std::ofstream output(capture, std::ios::binary);
             output.write(reinterpret_cast<const char*>(image.data()), image.size());
             output.close();
             if (!output) throw std::runtime_error("Cannot save GPU readback");
         }
-        std::printf("pixels=%u channels=%u max_absolute_error=0\n", width * height, width * height * 4);
+        std::printf("pixels=%u channels=%u max_absolute_error=%g\n", width * height, width * height * 4, maxError);
     }
 }
 
@@ -640,6 +663,54 @@ void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
     MipDraw draw{0, 1};
     draw.partialQuad = true;
     draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr);
+}
+
+namespace {
+// One solid color per mip, so the color alone identifies the level a sample read.
+constexpr std::array<std::array<BYTE, 4>, 4> kMipColors{{
+    {255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {255, 255, 0, 255}}};
+
+std::vector<PixelInput> solid_mips()
+{
+    std::vector<PixelInput> levels;
+    for (UINT level = 0; level < kMipColors.size(); ++level) {
+        PixelInput input{8u >> level, 8u >> level, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
+        for (UINT texel = 0; texel < input.width * input.height; ++texel)
+            input.rows.insert(input.rows.end(), kMipColors[level].begin(), kMipColors[level].end());
+        levels.push_back(std::move(input));
+    }
+    return levels;
+}
+}
+
+void check_pixel_mip_clamp(ID3D12Device* device, const char* shader, UINT expectedLevel)
+{
+    if (expectedLevel >= kMipColors.size()) throw std::runtime_error("Expected a mip level from 0 to 3");
+    auto levels = solid_mips();
+    const auto& rgba = kMipColors[expectedLevel];
+    const Color expected{expected_channel(rgba[0]), expected_channel(rgba[1]),
+                         expected_channel(rgba[2]), expected_channel(rgba[3])};
+    levels.front().expected.assign(64, expected);
+    draw_verified(device, shader, levels, {8, 8}, 0, {MipDraw{0, 1}}, nullptr);
+}
+
+void check_pixel_mip_blend(ID3D12Device* device, const char* shader, float clamp, float tolerance)
+{
+    if (!(clamp >= 0 && clamp <= 8) || !(tolerance > 0 && tolerance < 0.5f))
+        throw std::runtime_error("Expected a clamp from 0 to 8 and a tolerance below 0.5");
+    // The constant coordinate has no derivatives, so the LOD is the clamp, limited to the last mip.
+    const float lod = (std::min)(clamp, float(kMipColors.size() - 1));
+    const UINT low = UINT(lod);
+    const UINT high = (std::min)(low + 1, UINT(kMipColors.size() - 1));
+    const float weight = lod - float(low);
+    Color expected{};
+    for (size_t c = 0; c < expected.size(); ++c)
+        expected[c] = (1 - weight) * (kMipColors[low][c] / 255.0f) + weight * (kMipColors[high][c] / 255.0f);
+    auto levels = solid_mips();
+    levels.front().expected.assign(64, expected);
+    levels.front().linearMips = true;
+    levels.front().tolerance = tolerance;
+    draw_verified(device, shader, levels, {8, 8}, 0, {MipDraw{0, 1}}, nullptr);
 }
 
 void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg)

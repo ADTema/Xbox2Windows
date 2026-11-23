@@ -3,6 +3,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cwchar>
 #include <fstream>
@@ -616,6 +617,28 @@ OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_check_pixel_mip_clamp(const OperationContext& ctx)
+{
+    const std::string_view level = ctx.argv[4];
+    if (level.size() != 1 || level[0] < '0' || level[0] > '3')
+        throw std::runtime_error("Expected a mip level from 0 to 3");
+    check_pixel_mip_clamp(ctx.device, ctx.argv[3], unsigned(level[0] - '0'));
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_mip_blend(const OperationContext& ctx)
+{
+    const auto number = [](std::string_view text) {
+        float value = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (error != std::errc{} || end != text.data() + text.size())
+            throw std::runtime_error("Expected a decimal clamp and tolerance");
+        return value;
+    };
+    check_pixel_mip_blend(ctx.device, ctx.argv[3], number(ctx.argv[4]), number(ctx.argv[5]));
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_check_pixel(const OperationContext& ctx)
 {
     check_translated_pixel(ctx.device, ctx.argv[3], std::string_view(ctx.argv[4]) == "bgra");
@@ -885,6 +908,8 @@ const OperationSpec kOperations[] = {
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
     {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--check-pixel-mip-clamp", 5, 5, nullptr, kNoGate, run_check_pixel_mip_clamp},
+    {"--check-pixel-mip-blend", 6, 6, nullptr, kNoGate, run_check_pixel_mip_blend},
     {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},

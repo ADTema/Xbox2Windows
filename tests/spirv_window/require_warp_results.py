@@ -9,7 +9,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 REQUIRED = [f"spirv_{name}_warp" for name in ("address_window", "sampler_views", "ballot_extract",
-                                               "compaction", "compare_sampler", "minlod")]
+                                               "compaction", "compare_sampler", "minlod", "minlod_levels")]
 
 
 def statuses(junit):
