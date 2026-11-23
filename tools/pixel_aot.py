@@ -565,6 +565,7 @@ INTEGER = {
     "mul_i32_i24": (2, "mul24_i32({0}, {1})"),
     "mul_hi_u32_u24": (2, "mul24_hi_u32({0}, {1})"),
     "mul_hi_i32_i24": (2, "mul24_hi_i32({0}, {1})"),
+    "mul_lo_u32": (2, "({0} * {1})"),
     "bfrev_b32": (1, "reversebits({0})"), "ffbl_b32": (1, "firstbitlow({0})"),
     "ffbh_u32": (1, "dpp_ffbh_u32({0})"), "ffbh_i32": (1, "dpp_ffbh_i32({0})"),
     "bfe_u32": (3, "(({0} >> ({1} & 31u)) & ((1u << ({2} & 31u)) - 1u))"),
