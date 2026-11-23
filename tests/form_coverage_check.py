@@ -320,6 +320,9 @@ def check_shader_records():
         assert sopc_forms <= covered, (name, sopc_forms - covered)
         assert vop2_forms <= covered, (name, vop2_forms - covered)
         assert e64_integer_forms <= covered, (name, e64_integer_forms - covered)
+        # The VOP3 spellings of the interpolation pair and of v_nop.
+        e64_spelling_forms = {("VOP3", "v_interp_p1_f32_e64"), ("VOP3", "v_interp_p2_f32_e64"), ("VOP3", "v_nop_e64")}
+        assert e64_spelling_forms <= covered, (name, e64_spelling_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         # v_mac_f32 is in the gfx1013 list only.
