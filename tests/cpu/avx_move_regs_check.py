@@ -977,6 +977,14 @@ def check_guard_page_fault_suppression(native_mem, lifted_mem):
         page0_data = bytes((i * 73 + 19) & 0xFF for i in range(page_size))
         ctypes.memmove(base, page0_data, page_size)
         page1 = base + page_size
+        name = "op_broadcastss_ymm_mem7"
+        src = page1 - 32
+        native_out = ctypes.create_string_buffer(32)
+        lifted_out = ctypes.create_string_buffer(32)
+        native_mem[name](src, src, ctypes.addressof(native_out))
+        lifted_mem[name](src, src, ctypes.addressof(lifted_out))
+        assert_equal_output("guard-broadcast", name, 0, lifted_out.raw, native_out.raw)
+
         init_dest = bytes(range(0xA1, 0xC1))
 
         for name, elem_bits, wide, _ in MASKMOV_LOAD_SPECS:
@@ -1053,6 +1061,12 @@ def check_differential(native_path, lifted_path, altered_path):
                 assert_equal_output(f"native-unaligned+{shift}", name, idx, got_n, want)
                 assert_equal_output(f"lifted-unaligned+{shift}", name, idx, got_l, want)
                 unalign_total += 1
+
+    name = "op_movapd_store128"
+    a, b = bytes(range(32)), bytes(32)
+    got_n = invoke_std(native[name], a, b, unalign_shift=16)
+    got_l = invoke_std(lifted[name], a, b, unalign_shift=16)
+    assert_equal_output("lifted-align16", name, 0, got_l, got_n)
 
     # Negative displacements ([rcx - 32] vector load, [rdx - 8] GPR load).
     neg_total = 0
@@ -1352,10 +1366,11 @@ def check_alt_encodings_and_rejections(original_path):
         *((lbl, (ld_ymm0, ld_ymm1, ld_ymm2, ins, ret_ins), "unsupported instruction")
           for lbl, ins in out_of_scope_cases),
         *other_cases,
+        ("rep_ret", b"\xf3\xc3", "unsupported instruction prefix"),
     ]
 
     for label, seq, expected_reason in all_unit:
-        raw = encode_seq(*seq)
+        raw = seq if isinstance(seq, bytes) else encode_seq(*seq)
         try:
             lift_code(label, 0x1000, raw)
         except ValueError as exc:
@@ -1413,7 +1428,7 @@ def check_alt_encodings_and_rejections(original_path):
 
     print(f"{len(alt_accept)} alternate-encoding lift checks, {len(all_unit)} unit rejection controls "
           f"({len(reg_only_mem_cases)} register-domain memory, {len(carved_out_cases)} carved-out, "
-          f"{len(out_of_scope_cases)} out-of-scope, {len(other_cases)} EVEX/ABI/state/addressing), "
+          f"{len(out_of_scope_cases)} out-of-scope, {len(other_cases) + 1} EVEX/ABI/state/addressing/prefixes), "
           f"and {len(pe_patches)} PE-patched rejection controls passed")
 
 
