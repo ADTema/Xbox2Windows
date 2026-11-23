@@ -939,6 +939,34 @@ def check_sse2_regs():
         assert only_fail["blocked_by_skip"] == []
 
 
+def check_fma3_leaf():
+    """fma3_leaf.asm covers all 60 FMA forms in docs/coverage/x64_zen2.tsv group FMA."""
+    reference = fc.load_reference("x64_zen2.tsv")
+    all_fma = {form for group, form in reference if group == "FMA"}
+    assert len(all_fma) == 60, len(all_fma)
+
+    asm_text = (fc.ROOT / "tests" / "cpu" / "fma3_leaf.asm").read_text(encoding="utf-8")
+    found = fc.masm_mnemonics(asm_text)
+    assert all_fma <= found, all_fma - found
+
+    passed = fc.measure({"cpu_aot_fma3": "pass"})
+    assert passed["fixtures"]["fma3_leaf.asm"] == "pass"
+    assert "fma3_leaf.asm" not in passed["unclassified"]
+    assert passed["x64_zen2"]["groups"]["FMA"] == {"covered": 60, "total": 60}
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"fma3_leaf": asm_text})
+        only_pass = fc.measure({"cpu_aot_fma3": "pass"}, root)["x64_zen2"]
+        only_skip = fc.measure({"cpu_aot_fma3": "skip"}, root)["x64_zen2"]
+        only_fail = fc.measure({"cpu_aot_fma3": "fail"}, root)["x64_zen2"]
+        assert only_pass["groups"]["FMA"] == {"covered": 60, "total": 60}
+        assert only_pass["fixture_forms_not_in_reference"] == []
+        assert only_skip["groups"]["FMA"] == {"covered": 0, "total": 60}
+        for form in all_fma:
+            assert f"FMA {form}" in only_skip["blocked_by_skip"]
+        assert only_fail["groups"]["FMA"] == {"covered": 0, "total": 60}
+        assert only_fail["blocked_by_skip"] == []
+
+
 def check_swap_coverage():
     """v_swap_b32 is VOP1 in both references and counts as covered only through the accepted spelling.
     The _e64, DPP and SDWA spellings reach only rejections, and the neighbouring v_swaprel_b32 stays uncovered."""
@@ -983,4 +1011,5 @@ if __name__ == "__main__":
     check_avx_int_regs()
     check_avx_move_regs()
     check_sse2_regs()
+    check_fma3_leaf()
     print("form coverage checks passed")
