@@ -12280,6 +12280,76 @@ def check_controls(directory):
     for sym in ("dpp_frexp_mant_f32(", "dpp_frexp_exp_i32_f32(", "dpp_dot4c_i32_i8(", "QuadRead"):
         assert sym not in plain_hlsl, sym
 
+    # Quad-local DPP16/DPP8 v_movrel* controls (static and bounded dynamic m0).
+    movrel_prog = with_constants(DPP_MOVREL_BODY)
+    movrel_hlsl = translate(movrel_prog)
+    for sym in ("QuadReadAcrossX(", "QuadReadAcrossY(", "QuadReadAcrossDiagonal(",
+                "QuadReadLaneAt(", "WaveGetLaneIndex() & 3u", "dpp_soff", "dpp_doff"):
+        assert sym in movrel_hlsl, sym
+    # Overlapping src/dst banks in dynamic v_movrelsd_2_b32_dpp are allowed when all reachable slots exist.
+    assert "dpp_doff" in translate(with_constants([
+        "s_mov_b32 s64, s44",
+        "s_mov_b32 s65, 0",
+        "s_and_b64 s[64:65], s[64:65], 0x30003",
+        "s_mov_b32 m0, s64",
+        "v_movrelsd_2_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    ]))
+    # Negative controls: m0 still interp_base, unbounded dynamic m0, overwritten scalar mask,
+    # dynamic m0 > 16 fan-out, uninitialized reachable source/dest slot, static out-of-range m0,
+    # source modifiers, unproved bound_ctrl/fi, cross-quad/non-repeated DPP8, row/wave DPP,
+    # partial/duplicate masks, non-VGPR operands, WQM, and vmcnt hazards.
+    for bad_seq, message in (
+        # m0 still holds interp_base from interpolation prologue.
+        (["v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Unsupported m0 value"),
+        # Raw CBV word in m0 is unbounded / non-uint.
+        (["s_mov_b32 m0, s44", "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Unsupported m0 value"),
+        # Overwriting a bounded SGPR with an untracked scalar op clears its bitmask.
+        (["s_bfe_u32 s60, s44, 0x20000", "s_add_u32 s60, s60, s44", "s_mov_b32 m0, s60",
+          "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Dynamic m0 offset is unbounded"),
+        # 5-bit BFE (32 offsets > 16 limit) is rejected.
+        (["s_bfe_u32 s60, s44, 0x50000", "s_mov_b32 m0, s60",
+          "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "exceeds supported bound"),
+        # Dynamic read reaches uninitialized v16 (only v12..v15 initialized).
+        (["s_bfe_u32 s60, s44, 0x30000", "s_mov_b32 m0, s60",
+          "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Expected a numeric VGPR at v16"),
+        # Dynamic write reaches uninitialized v20..v23 (untouched slots cannot preserve undefined values).
+        (["s_bfe_u32 s60, s44, 0x20000", "s_mov_b32 m0, s60",
+          "v_movreld_b32_dpp v20, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Expected a numeric VGPR at v20"),
+        # Static m0 exceeding 255 or pushing VGPR past 255.
+        (["s_mov_b32 m0, 256", "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Static m0 offset out of range"),
+        (["s_mov_b32 m0, 250", "v_movreld_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Indexed VGPR exceeds 255"),
+        # Split mask 0x30003 is valid for v_movrelsd_2_b32_dpp but exceeds 255 for v_movrelsd_b32_dpp.
+        (["s_mov_b32 s64, s44", "s_mov_b32 s65, 0", "s_and_b64 s[64:65], s[64:65], 0x30003", "s_mov_b32 m0, s64",
+          "v_movrelsd_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "exceeds supported bound"),
+        # Static m0 pointing at uninitialized source.
+        (["s_mov_b32 m0, 4", "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Expected a numeric VGPR at v16"),
+        # Modifiers, non-VGPR operands, unproved bound_ctrl/fi, cross-quad/non-repeated DPP8, row/wave DPP, partial/duplicate masks.
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, -v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Expected two VGPR operands without modifiers"),
+        (["s_mov_b32 m0, 0", "v_movreld_b32_dpp v12, |v12| quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Expected two VGPR operands without modifiers"),
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, s44 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], "Expected two VGPR operands without modifiers"),
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1"], "Unsupported DPP16 modifier"),
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf fi:0"], "Unsupported DPP16 modifier"),
+        (["s_mov_b32 m0, 0", "v_movreld_b32_dpp v12, v12 dpp8:[1,0,3,2,5,4,7,6] fi:1"], "Unsupported DPP8 modifier"),
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, v12 dpp8:[4,5,6,7,0,1,2,3]"], "Cross-quad DPP8 permutation"),
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, v12 dpp8:[0,1,2,3,4,5,6,6]"], "repeat the same quad selection"),
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, v12 row_shl:1 row_mask:0xf bank_mask:0xf"], "Unsupported DPP control"),
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, v12 wave_shl:1 row_mask:0xf bank_mask:0xf"], "Unsupported DPP control"),
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xe bank_mask:0xf"], "Unsupported DPP16 modifier"),
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0x7"], "Unsupported DPP16 modifier"),
+        (["s_mov_b32 m0, 0", "v_movrels_b32_dpp v12, v12 quad_perm:[1,0,3,2] row_mask:0xf row_mask:0xf"], "Duplicate DPP16 modifier"),
+    ):
+        expect_value_error(translate, with_constants(bad_seq), message)
+    # WQM and vmcnt hazards (including dynamic write overlapping sample_dest).
+    base_mr = assembly(False)
+    wqm_at = base_mr.index("s_wqm_b64 exec, exec") + 1
+    expect_value_error(translate, base_mr[:wqm_at] + ["s_mov_b32 m0, 0", "v_movrels_b32_dpp v20, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + base_mr[wqm_at:],
+                       "Invalid DPP movrel outside entry mask")
+    wait_at = base_mr.index("s_waitcnt vmcnt(0)")
+    expect_value_error(translate, base_mr[:wait_at] + ["s_mov_b32 m0, 0", "v_movrels_b32_dpp v20, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + base_mr[wait_at:],
+                       "Sample used before vmcnt wait")
+    expect_value_error(translate, base_mr[:wait_at] + ["s_mov_b32 m0, 1", "v_movreld_b32_dpp v12, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + base_mr[wait_at:],
+                       "Write overlaps an outstanding sample")
+
     # Quad-local DPP16/DPP8 extra f32, carry-in/carry-out, and dot-accumulate controls.
     extra_prog = with_constants(DPP_EXTRA_BODY)
     extra_hlsl = translate(extra_prog)
@@ -13133,6 +13203,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
+    fixtures.append((with_constants(DPP_MOVREL_BODY), translate))
     fixtures.append((uncompressed_export(DPP_F16_CVT_LANES), translate_f16))
     fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
@@ -15546,6 +15617,165 @@ def check_buffer_color_draw(directory, compiler, renderer, backend):
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError("Wrong buffer color escaped detection")
+# Quad-local DPP16/DPP8 v_movrel* fixture (v_movrels, v_movreld, v_movrelsd, v_movrelsd_2).
+# Exercises both runtime-dynamic m0 (changing across two constant sets on one compiled shader)
+# and static m0 offsets, with 4-lane quad swizzling derived from uv.x/uv.y.
+DPP_MOVREL_SETS = (
+    (1, 2, 3, (1 << 16) | 2),
+    (2, 0, 1, (3 << 16) | 0),
+)
+DPP_MOVREL_BODY = [
+    # Derive quad lane id (v20 in {0, 1, 2, 3}) from uv.x/uv.y via identity v_movrels_b32_dpp.
+    "s_mov_b32 m0, 0",
+    "v_movrels_b32_dpp v20, v8 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_movrels_b32_dpp v21, v9 dpp8:[0,1,2,3,4,5,6,7]",
+    "v_mul_f32_e32 v20, 0x42800000, v20",
+    "v_mul_f32_e32 v21, 0x42800000, v21",
+    "v_floor_f32_e32 v22, v20",
+    "v_mul_f32_e32 v24, 0.5, v22",
+    "v_floor_f32_e32 v24, v24",
+    "v_sub_f32_e32 v22, v22, v24",
+    "v_sub_f32_e32 v22, v22, v24",
+    "v_floor_f32_e32 v23, v21",
+    "v_mul_f32_e32 v24, 0.5, v23",
+    "v_floor_f32_e32 v24, v24",
+    "v_sub_f32_e32 v23, v23, v24",
+    "v_sub_f32_e32 v23, v23, v24",
+    "v_fma_f32 v20, 2.0, v23, v22",
+    # Populate 4-VGPR lane-distinct source bank v24..v27.
+    "v_add_f32_e32 v24, 0x41200000, v20",
+    "v_fma_f32 v25, 2.0, v20, 0x41a00000",
+    "v_mul_f32_e32 v26, 0x40400000, v20",
+    "v_add_f32_e32 v26, 0x42200000, v26",
+    "v_fma_f32 v27, 4.0, v20, 0x42a00000",
+    # Channel R (v12): v_movrels_b32_dpp (dynamic m0 + DPP16 AcrossX, static m0=2 + DPP8 cyclic).
+    "s_bfe_u32 s60, s44, 0x20000",
+    "s_mov_b32 m0, s60",
+    "v_movrels_b32_dpp v32, v24 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "s_mov_b32 m0, 2",
+    "v_movrels_b32_dpp v33, v24 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_add_f32_e32 v32, v32, v33",
+    "s_mov_b32 m0, 0",
+    "v_movrels_b32_dpp v12, v32 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    # Channel G (v13): v_movreld_b32_dpp (dynamic m0 + DPP16 AcrossY, static m0=1 + DPP8 AcrossDiag).
+    "v_mov_b32_e32 v28, 1.0",
+    "v_mov_b32_e32 v29, 2.0",
+    "v_mov_b32_e32 v30, 0x40400000",
+    "v_mov_b32_e32 v31, 4.0",
+    "s_bfe_u32 s61, s45, 0x20000",
+    "s_mov_b32 m0, s61",
+    "v_movreld_b32_dpp v28, v25 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "s_mov_b32 m0, 1",
+    "v_movreld_b32_dpp v28, v24 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_fma_f32 v34, 2.0, v29, v28",
+    "v_fma_f32 v34, 4.0, v30, v34",
+    "v_fma_f32 v34, 0x41000000, v31, v34",
+    "s_mov_b32 m0, 0",
+    "v_movrels_b32_dpp v13, v34 dpp8:[0,0,0,0,4,4,4,4]",
+    # Channel B (v14): v_movrelsd_b32_dpp (dynamic m0 + DPP16 AcrossDiag, static m0=2 + DPP8 AcrossX).
+    "v_mov_b32_e32 v36, 1.0",
+    "v_mov_b32_e32 v37, 2.0",
+    "v_mov_b32_e32 v38, 0x40400000",
+    "v_mov_b32_e32 v39, 4.0",
+    "s_bfe_u32 s62, s46, 0x20000",
+    "s_mov_b32 m0, s62",
+    "v_movrelsd_b32_dpp v36, v24 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "s_mov_b32 m0, 2",
+    "v_movrelsd_b32_dpp v36, v24 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_fma_f32 v35, 2.0, v37, v36",
+    "v_fma_f32 v35, 4.0, v38, v35",
+    "v_fma_f32 v35, 0x41000000, v39, v35",
+    "s_mov_b32 m0, 0",
+    "v_movrels_b32_dpp v14, v35 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    # Channel A (v15): v_movrelsd_2_b32_dpp (dynamic split m0[9:0]/m0[25:16] + DPP16 cyclic, static + DPP8 AcrossY).
+    "v_mov_b32_e32 v40, 1.0",
+    "v_mov_b32_e32 v41, 2.0",
+    "v_mov_b32_e32 v42, 0x40400000",
+    "v_mov_b32_e32 v43, 4.0",
+    "s_mov_b32 s64, s47",
+    "s_mov_b32 s65, 0",
+    "s_and_b64 s[64:65], s[64:65], 0x30003",
+    "s_mov_b32 m0, s64",
+    "v_movrelsd_2_b32_dpp v40, v24 quad_perm:[1,2,3,0] row_mask:0xf bank_mask:0xf",
+    "s_mov_b32 m0, 0x20001",
+    "v_movrelsd_2_b32_dpp v40, v24 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_fma_f32 v44, 2.0, v41, v40",
+    "v_fma_f32 v44, 4.0, v42, v44",
+    "v_fma_f32 v44, 0x41000000, v43, v44",
+    "s_mov_b32 m0, 0",
+    "v_movrels_b32_dpp v15, v44 dpp8:[0,0,0,0,4,4,4,4]",
+]
+
+
+def dpp_movrel_reference(w0, w1, w2, w3):
+    """Independent 4-lane quad reference for DPP_MOVREL_BODY."""
+    lanes = (0.0, 1.0, 2.0, 3.0)
+    src = [
+        [10.0 + l for l in lanes],
+        [20.0 + 2.0 * l for l in lanes],
+        [40.0 + 3.0 * l for l in lanes],
+        [80.0 + 4.0 * l for l in lanes],
+    ]
+    perm = lambda arr, p: [arr[i] for i in p]
+    weighted = lambda bank: bank[0][0] + 2.0 * bank[1][0] + 4.0 * bank[2][0] + 8.0 * bank[3][0]
+    # R: v_movrels
+    r = perm(src[w0 & 3], (1, 0, 3, 2))[0] + perm(src[2], (1, 2, 3, 0))[0]
+    # G: v_movreld
+    g_bank = [[float(k + 1)] * 4 for k in range(4)]
+    g_bank[w1 & 3] = perm(src[1], (2, 3, 0, 1))
+    g_bank[1] = perm(src[0], (3, 2, 1, 0))
+    g = weighted(g_bank)
+    # B: v_movrelsd
+    b_bank = [[float(k + 1)] * 4 for k in range(4)]
+    b_bank[w2 & 3] = perm(src[w2 & 3], (3, 2, 1, 0))
+    b_bank[2] = perm(src[2], (1, 0, 3, 2))
+    b = weighted(b_bank)
+    # A: v_movrelsd_2
+    a_bank = [[float(k + 1)] * 4 for k in range(4)]
+    a_bank[(w3 >> 16) & 3] = perm(src[w3 & 3], (1, 2, 3, 0))
+    a_bank[2] = perm(src[1], (2, 3, 0, 1))
+    a = weighted(a_bank)
+    expected = (r, g, b, a)
+    for x in expected:
+        assert single(x) == x == half_rtz(x), x
+    return expected
+
+
+def check_dpp_movrel_draw(directory, compiler, renderer, backend):
+    program = with_constants(DPP_MOVREL_BODY)
+    source = directory / "dpp_movrel.hlsl"
+    shader = directory / "dpp_movrel.cso"
+    case = directory / "dpp_movrel.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    for words in DPP_MOVREL_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        expected = dpp_movrel_reference(*words)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    # Mutations checked against Set 1.
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *DPP_MOVREL_SETS[0])
+    case.write_bytes(constants + struct.pack("<4f", *dpp_movrel_reference(*DPP_MOVREL_SETS[0])) * 64)
+    for old, new, label in (
+        ("v_movrels_b32_dpp v32, v24 quad_perm:[1,0,3,2]", "v_movrels_b32_dpp v32, v24 quad_perm:[2,3,0,1]", "movrels AcrossX vs AcrossY"),
+        ("v_movreld_b32_dpp v28, v25 quad_perm:[2,3,0,1]", "v_movreld_b32_dpp v28, v25 quad_perm:[1,0,3,2]", "movreld AcrossY vs AcrossX"),
+        ("v_movrelsd_b32_dpp v36, v24 quad_perm:[3,2,1,0]", "v_movrelsd_b32_dpp v36, v24 quad_perm:[1,0,3,2]", "movrelsd AcrossDiag vs AcrossX"),
+        ("v_movrelsd_2_b32_dpp v40, v24 quad_perm:[1,2,3,0]", "v_movrelsd_2_b32_dpp v40, v24 quad_perm:[2,3,0,1]", "movrelsd_2 cyclic vs AcrossY"),
+        ("s_mov_b32 m0, 0x20001", "s_mov_b32 m0, 0x10002", "movrelsd_2 static src/dst swap"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+    return 0
+
+
 # Quad-local DPP16/DPP8 extra f32 (rndne, sin, cos, rcp_iflag, frexp_mant, frexp_exp, mac) and
 # carry-in/carry-out u32 (add/sub/subrev_co_ci) fixture on gfx1013. Derives 4-lane quad ID {0,1,2,3}
 # from uv.x/uv.y (64x64 RT), exercises non-symmetric quad swizzles and carry/borrow boundaries, and
@@ -17862,10 +18092,11 @@ def main():
                     "draw-uncompressed-integer-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-region-body", "draw-region-waits", "draw-div-fmas", "draw-cmp64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers",
-                    "draw-dpp-cvt", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
+                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-cvt": check_dpp_cvt_draw,
+                        "draw-dpp-movrel": check_dpp_movrel_draw,
                         "draw-dpp-extra": check_dpp_extra_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
