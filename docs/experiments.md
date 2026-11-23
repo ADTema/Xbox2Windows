@@ -2062,6 +2062,34 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 
 Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`.
 
+### Private gfx1030 LDS word access
+
+The `gfx1030` compute profile lowers a thread-private LDS word in a full
+wave32 with a 32×1×1 group. The caller supplies `--lds-bytes` for the native
+allocation. The profile requires at least 128 bytes, a verified
+`local_x << 2` address and an immediate
+`s_waitcnt lgkmcnt(0)` after every DS operation. `ds_write_b32` initializes
+or replaces the thread's word, `ds_read_b32` returns it in full, and
+`ds_read_u16` zero-extends the low or high half at offset 0 or 2. This
+footprint has no inter-thread aliasing, so the translator can retain the
+written value as a per-invocation expression. Reads require initialization.
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+The source-built wave32 fixture reads the full word and both halves after
+reassigning the source VGPR. It compares 320 UAV words for dispatches of one
+and three groups. Selecting the low half for the high-half read must
+mismatch at word 2 (`0x000089ab` expected, `0x0000fff0` observed).
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_private_(warp|hardware)$' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+
 An optional `--constant-descriptor BYTE_OFFSET` binds a second table entry to
 b0. It must be distinct from the 16-byte u0 descriptor. The translator accepts
 aligned immediate `s_buffer_load_dword`, `s_buffer_load_dwordx2`, and

@@ -103,7 +103,7 @@ def labelled(decoded):
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
-          source_stride=None):
+          source_stride=None, cpu="gfx1013", lds_bytes=0):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
@@ -111,6 +111,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     source t0; source_stride is the t0 byte stride that indexed reads use.
     """
     dims = checked_group(group)
+    if cpu not in ("gfx1013", "gfx1030"):
+        raise ValueError("Unsupported compute target")
+    ds_group = cpu == "gfx1030" and dims == (32, 1, 1)
     if not 0 <= table_reg <= 105 or not 0 <= descriptor_offset < 1 << 20 or descriptor_offset % 4:
         raise ValueError("Invalid table or thread group binding")
     descriptor_bindings = {descriptor_offset: "uav"}
@@ -142,6 +145,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
+    lds_enabled = ds_group and 128 <= lds_bytes <= 65536
+    lds_word = None
+    ds_wait = False
     written_spans = []
     layout = None
     # One per-lane guard: v_cmp into vcc_lo, s_and_saveexec_b32, the stores under the mask, then
@@ -153,6 +159,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         raise ValueError("Missing final program exit")
 
     for line in instructions[:-1]:
+        if ds_wait:
+            if line != "s_waitcnt lgkmcnt(0)":
+                raise ValueError("Expected immediate s_waitcnt lgkmcnt(0) after DS")
+            ds_wait = False
         if m := re.fullmatch(r"(\.L\w+):", line):
             if guard is None or guard["label"] != m[1] or guard["at_label"]:
                 raise ValueError("Unverified branch target")
@@ -334,10 +344,36 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         elif m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line):
             dst, shift, src = map(int, m.groups())
             tag = vector.get(src)
+            if lds_enabled and dst <= 255 and shift == 2 and tag == ("local", 0):
+                vector[dst] = ("lds_address",)
+                continue
             # The element and row checks at the store bound the shift.
             if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
                 raise ValueError("Unverified dispatch byte offset")
             vector[dst] = ("thread_bytes", tag[1], shift)
+        elif m := re.fullmatch(r"ds_write_b32 v(\d+), v(\d+)", line):
+            addr, src = map(int, m.groups())
+            value = vector.get(src)
+            if (not lds_enabled or guard_span is not None or max(addr, src) > 255
+                    or vector.get(addr) != ("lds_address",) or not is_word(value)):
+                raise ValueError("Unverified private LDS write")
+            # Every lane owns one disjoint word. Capture the written value even if the source is overwritten.
+            lds_word = value
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_read_(b32|u16) v(\d+), v(\d+)(?: offset:(2))?", line):
+            op, dst, addr, offset = m[1], int(m[2]), int(m[3]), m[4]
+            if (not lds_enabled or guard_span is not None or max(dst, addr) > 255
+                    or vector.get(addr) != ("lds_address",) or lds_word is None or (op == "b32" and offset)):
+                raise ValueError("Unverified private LDS read")
+            if op == "b32":
+                vector[dst] = lds_word
+            else:
+                shift = 16 if offset else 0
+                expression = f"(({hlsl_word(lds_word)} >> {shift}u) & 0xffffu)"
+                if len(expression) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("LDS expression exceeds the profile limit")
+                vector[dst] = ("alu", expression)
+            ds_wait = True
         elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), v(\d+), (\d+), v(\d+)", line):
             dst, row, shift, column = map(int, m.groups())
             row_tag, column_tag = vector.get(row), vector.get(column)
@@ -486,6 +522,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
         else:
             raise ValueError(f"Unsupported compute instruction: {line}")
+    if ds_wait:
+        raise ValueError("Expected immediate s_waitcnt lgkmcnt(0) after DS")
     if not stores:
         raise ValueError("Expected at least one observable store")
     if guard is not None and guard["label"] is not None and not guard["at_label"]:
@@ -512,6 +550,8 @@ def main():
     parser.add_argument("container", type=Path, help="Local extracted DXBC container")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--llvm", required=True)
+    parser.add_argument("--cpu", choices=("gfx1013", "gfx1030"), default="gfx1013")
+    parser.add_argument("--lds-bytes", type=int, default=0, help="Known native group LDS allocation")
     parser.add_argument("--table-reg", type=int, required=True)
     parser.add_argument("--descriptor-offset", type=lambda n: int(n, 0), required=True)
     parser.add_argument("--constant-descriptor", type=lambda n: int(n, 0), help="Table byte offset bound to b0")
@@ -529,11 +569,13 @@ def main():
     chunks = parts(blob)
     group = group_size(chunks.get(b"PSV0", b""))
     code = container_code(chunks.get(b"DXIL", b""), stage=5, llvm=args.llvm)
-    source = lower(labelled(disassemble(code, args.llvm, offsets=True)), group, table_reg=args.table_reg,
+    features = b"+wavefrontsize32,-wavefrontsize64" if args.cpu == "gfx1030" else b""
+    decoded = disassemble(code, args.llvm, offsets=True, cpu=args.cpu.encode(), features=features)
+    source = lower(labelled(decoded), group, table_reg=args.table_reg,
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
-                   source_stride=args.source_stride)
+                   source_stride=args.source_stride, cpu=args.cpu, lds_bytes=args.lds_bytes)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
