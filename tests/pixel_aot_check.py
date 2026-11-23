@@ -7650,6 +7650,79 @@ def check_binary(directory, assembler, objcopy, library):
         assert lower_fixture(disassemble(native, library, cpu=cpu.encode())) == lower_fixture(instructions)
         if index == 0:
             check_container_selector(directory, native, library)
+    check_exp_en_decoding(directory, assembler, objcopy, library)
+
+
+# LLVM 15 disassembles any raw four-bit compressed-export EN value, but reassembling the printed
+# text keeps a packed pair only when its first operand is enabled; the duplicated high-half operand
+# never enables its pair. Measured on gfx1013 by patching only the EN nibble of the reference word.
+# The source VGPR field of a fully disabled pair re-encodes as zero, so those bits are excluded
+# from the preservation check instead of being treated as changed semantics.
+EXP_EN_REENCODE = (0x0, 0x3, 0x0, 0x3, 0xC, 0xF, 0xC, 0xF,
+                   0x0, 0x3, 0x0, 0x3, 0xC, 0xF, 0xC, 0xF)
+
+
+def check_exp_en_decoding(directory, assembler, objcopy, library):
+    """Issue #361: replace only the four EN bits of the assembled reference compressed export and
+    decode all 16 raw values through the normal binary -> disassembly -> lowering path."""
+    def assembled(text):
+        source = directory / "decoding.s"
+        obj = directory / "decoding.o"
+        binary = directory / "decoding.bin"
+        source.write_text(text, encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013",
+                        "-filetype=obj", source, "-o", obj], check=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+        return binary.read_bytes()
+
+    base = assembled("\n".join(compressed_export(0xF)) + "\n")
+    word = assembled("exp mrt0 v16, v16, v17, v17 done compr vm\ns_endpgm\n")[:8]
+    offset = base.find(word)
+    assert offset >= 0 and base.find(word, offset + 1) < 0, "the reference export occurs once"
+    base_lines = disassemble(base, library)
+    measured = {}
+    for en, reencoded in enumerate(EXP_EN_REENCODE):
+        patched = bytearray(base)
+        patched[offset] = patched[offset] & 0xF0 | en
+        lines = disassemble(bytes(patched), library)
+        changed = [a != b for a, b in zip(base_lines, lines)]
+        assert len(lines) == len(base_lines) and changed.count(True) == (en != 0xF)
+        text = next(line for line in lines if line.startswith("exp "))
+        operands = text.split("mrt0", 1)[1].lstrip(", ").split(" done compr vm", 1)[0].split(", ")
+        # The printed source registers are unchanged: each enabled channel names its packed source
+        # VGPR (v16 for channels 0/1, v17 for channels 2/3) and a disabled channel prints off.
+        printed = ["off"] * 4
+        for channel, register in enumerate(("v16", "v16", "v17", "v17")):
+            if en >> channel & 1:
+                printed[channel] = register
+        assert operands == printed, (hex(en), text)
+        reword = assembled(text + "\ns_endpgm\n")[:8]
+        measured[en] = reword[0] & 0xF
+        assert measured[en] == reencoded, (hex(en), reword.hex(" "))
+        # Every bit outside EN matches the reference word except the source VGPR field of a fully
+        # disabled pair, which the assembler encodes as zero.
+        assert reword[0] & 0xF0 == word[0] & 0xF0, (hex(en), reword.hex(" "))
+        assert reword[1:4] == word[1:4] and reword[6:] == word[6:], (hex(en), reword.hex(" "))
+        assert reword[4] == (0x10 if reencoded & 0x3 else 0x0), (hex(en), reword.hex(" "))
+        assert reword[5] == (0x11 if reencoded & 0xC else 0x0), (hex(en), reword.hex(" "))
+        if en in (0x3, 0xC, 0xF):
+            # The normalized pair masks lower from the patched word exactly as from the fixture
+            # program, disabled-pair source bits and all, and report their enable mask.
+            assert translate_masked(lines) == translate_masked(compressed_export(en))
+        else:
+            # EN=0x0 round-trips byte-wise but enables no pair, and every non-pair mask is
+            # explicitly rejected rather than silently re-encoded to its normalized form.
+            try:
+                translate_masked(lines)
+            except ValueError as error:
+                assert "whole packed pairs" in str(error), error
+            else:
+                raise AssertionError(f"lowering accepted raw compressed EN {en:#04x}")
+    # The rule is pair-first-operand presence, not an OR over the pair: 0x2 and 0xa enable only
+    # the duplicated high-half operand and lose their pair (OR would mispredict 0x3 and 0xF),
+    # while 0x5 enables both first operands and keeps both pairs.
+    assert measured[0x2] == 0x0 and measured[0xA] == 0x0 and measured[0x5] == 0xF
+
 
 
 def check_compressed_export_draw(directory, compiler, renderer, backend):

@@ -3022,7 +3022,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Integer export requires the uncompressed export form")
             low, high = m.groups()
             if low == "off" and high == "off":
-                raise ValueError("Unsupported export")
+                raise ValueError("Unsupported compressed export: enable mask must select whole packed pairs")
             if low == "off" and not return_write_mask:
                 raise ValueError("High-pair compressed export requires an explicit RT0 write mask")
             regs = [reg for reg in (low, high) if reg != "off"]
@@ -3047,6 +3047,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines[entry_line] = f"float{len(args)} main({inputs}) : SV_Target0 {{"
             lines.append(f"    return float{len(args)}({', '.join(args)});")
             exported = True
+        elif match(r"exp mrt0,? (?:v\d+|off), (?:v\d+|off), (?:v\d+|off), (?:v\d+|off) done compr vm"):
+            raise ValueError("Unsupported compressed export: enable mask must select whole packed pairs")
         elif m := match(r"exp mrt0,? (v\d+), (v\d+), (v\d+), (v\d+) done vm"):
             # Four distinct, ready registers of computed or sampled values.
             export_regs = m.groups()
