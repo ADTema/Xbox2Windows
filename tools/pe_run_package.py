@@ -28,8 +28,6 @@ def plan(report):
         terminal = chain[-1]
         if terminal.get("package") and terminal["provider"] == image:
             raise ValueError(f"{image}: self import needs deferred DLL attachment")
-        if terminal.get("package") and terminal["symbol"].startswith("#"):
-            raise ValueError(f"{image}: bundled ordinal exports require a mapper ordinal lookup")
         old = routes[image].setdefault(name, terminal)
         if old != terminal:
             raise ValueError(f"{image}: conflicting bindings for {name[0]}!{name[1]}")
@@ -100,6 +98,7 @@ def run(root, report, mapper, shims, system, *, preflight_only=False):
         map_image = prototype(lib, "pe_map_image",
                               [W.LPCWSTR, callback, C.POINTER(C.c_uint32), C.c_char_p, C.c_size_t], C.c_void_p)
         export = prototype(lib, "pe_map_export", [C.c_void_p, C.c_char_p], C.c_void_p)
+        export_ordinal = prototype(lib, "pe_map_export_ordinal", [C.c_void_p, C.c_uint32], C.c_void_p)
         unmap = prototype(lib, "pe_map_release", [C.c_void_p], C.c_int)
         start = prototype(lib, "pe_map_run", [C.c_void_p, C.POINTER(C.c_uint32)], C.c_int)
         mapped = {}
@@ -109,7 +108,11 @@ def run(root, report, mapper, shims, system, *, preflight_only=False):
                 symbol = terminal["symbol"]
                 if terminal.get("package"):
                     provider = terminal["provider"]
-                    imports[key] = export(mapped[provider], symbol.encode("ascii"))
+                    imports[key] = (export_ordinal(mapped[provider], int(symbol[1:]))
+                                    if symbol.startswith("#") else
+                                    export(mapped[provider], symbol.encode("ascii")))
+                    if not imports[key]:
+                        raise ValueError(f"{image}: mapped export {provider}!{symbol} unavailable")
                 else:
                     imports[key] = addresses[terminal["dll"].casefold(), symbol]
 

@@ -1162,6 +1162,28 @@ bool find_export(const Image& image, const IMAGE_NT_HEADERS64* nt, const char* n
 
 }  // namespace
 
+// Return an address from the export address table by its public ordinal, including
+// NONAME entries. An ordinal is Base + address-table index, not a name index.
+// Like pe_map_export, this deliberately refuses forwarders and holes; the package
+// runner resolves forwarder chains before asking the mapper for their final target.
+extern "C" __declspec(dllexport) void* pe_map_export_ordinal(void* mapped, std::uint32_t ordinal) {
+    const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();
+    const Image image{static_cast<std::uint8_t*>(mapped), nt->OptionalHeader.SizeOfImage};
+    const auto& exports = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
+    if (!ordinal || ordinal > 65535 || exports.Size < sizeof(IMAGE_EXPORT_DIRECTORY)
+        || !inside(exports.VirtualAddress, exports.Size, image.size)) return nullptr;
+    const auto* dir = image.at<IMAGE_EXPORT_DIRECTORY>(exports.VirtualAddress);
+    if (!dir || !readable(dir, sizeof(*dir)) || ordinal < dir->Base) return nullptr;
+    const std::uint64_t index = std::uint64_t{ordinal} - dir->Base;
+    if (index >= dir->NumberOfFunctions || dir->NumberOfFunctions > image.size / sizeof(DWORD)) return nullptr;
+    const auto* functions = image.at<DWORD>(dir->AddressOfFunctions, dir->NumberOfFunctions);
+    if (!functions || !readable(functions, sizeof(DWORD) * dir->NumberOfFunctions)) return nullptr;
+    const DWORD rva = functions[index];
+    if (!rva || rva >= image.size ||
+        (rva >= exports.VirtualAddress && rva - exports.VirtualAddress < exports.Size)) return nullptr;
+    return accessible(image.base + rva) ? image.base + rva : nullptr;
+}
+
 // Only valid for a base returned by pe_map_image, whose headers were validated and are read-only.
 extern "C" __declspec(dllexport) void* pe_map_export(void* mapped, const char* name) {
     const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();

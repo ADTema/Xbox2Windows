@@ -3124,6 +3124,32 @@ if(EXISTS "${INTAKE_PYTHON}")
             /DYNAMICBASE /INCREMENTAL:NO)
         target_link_libraries(cpu_startup_exe_${control} PRIVATE kernel32 cpu_startup_a cpu_startup_b)
     endforeach()
+    # Source-built CRT-free package: import the mapped DLL only by ordinal @77,
+    # compare its native entry with pe_run_package, and reject a DLL exporting @78.
+    foreach(variant IN ITEMS provider altered wrong)
+        if(variant STREQUAL "wrong")
+            set(ord_def tests/cpu/package_ordinal_provider_wrong.def)
+        else()
+            set(ord_def tests/cpu/package_ordinal_provider.def)
+        endif()
+        add_library(cpu_package_ordinal_${variant} SHARED tests/cpu/package_ordinal_provider.cpp ${ord_def})
+        target_compile_options(cpu_package_ordinal_${variant} PRIVATE /GS- /Zl)
+        target_link_options(cpu_package_ordinal_${variant} PRIVATE /ENTRY:ordinal_provider_entry
+            /NODEFAULTLIB /INCREMENTAL:NO)
+    endforeach()
+    target_compile_definitions(cpu_package_ordinal_altered PRIVATE ALTER_RETURN)
+    add_executable(cpu_package_ordinal_exe tests/cpu/package_ordinal_exe.cpp)
+    target_compile_options(cpu_package_ordinal_exe PRIVATE /GS- /Zl)
+    target_link_options(cpu_package_ordinal_exe PRIVATE /ENTRY:ordinal_exe_entry
+        /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+    target_link_libraries(cpu_package_ordinal_exe PRIVATE cpu_package_ordinal_provider)
+    add_test(NAME cpu_native_package_ordinal_startup COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/package_ordinal_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_package_ordinal_exe>" "$<TARGET_FILE:cpu_package_ordinal_provider>"
+        "$<TARGET_FILE:cpu_package_ordinal_altered>" "$<TARGET_FILE:cpu_package_ordinal_wrong>")
+    set_tests_properties(cpu_native_package_ordinal_startup PROPERTIES TIMEOUT 90)
+    add_test(NAME pe_package_ordinal_plan COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pe_package_ordinal_plan_check.py")
     add_test(NAME cpu_native_startup COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_startup_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_startup_exe>" "$<TARGET_FILE:cpu_startup_a>" "$<TARGET_FILE:cpu_startup_b>"
