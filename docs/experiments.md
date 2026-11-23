@@ -1903,6 +1903,28 @@ The CPU controls reject a missing or wrong restore, a saved mask overwritten und
 
 `shader_profile_audit.py` is unchanged. It does not bind b0, so it does not try guards that read their bound from a constant, and it does not label branches.
 
+### Vector reads from a second raw buffer
+
+The store profile can copy one word per read from a second, read-only raw buffer to the store. The caller binds it with `--source-descriptor`, the table byte offset of its four-word descriptor, which becomes `ByteAddressBuffer inputData : register(t0)`. `--source-stride` gives its byte stride for indexed reads. The descriptor may come from its own `s_load_dwordx4` or from one `s_load_dwordx8` with a neighbouring bound descriptor, which is how the LLVM 15 code generator loads u0 and the source together. No values are computed yet: the word read is only stored or copied with `v_mov_b32`.
+
+The accepted subset is small:
+
+- `buffer_load_dword vN, ..., s[a:a+3], 0` with a zero SGPR offset and an aligned instruction offset under 4096, from the t0 descriptor only. A read from the u0 descriptor is rejected, because it would have to be ordered against the stores of other invocations;
+- the address is a fixed `off` offset, an `offen` byte offset `dispatch index << shift` with a shift of at least 2, or an `idxen` dispatch index with `--source-stride`, where the instruction offset must stay inside one source element;
+- the loaded VGPR is unknown until `s_waitcnt vmcnt(0)`, alone or combined with `lgkmcnt(0)`. Reading or overwriting it before that wait is rejected, and so is a partial `vmcnt` count.
+
+Because t0 is read-only, the HLSL reads it where the word is used, inside the guard when the store is guarded. Loads follow the guard rules above. A load issued under the guard is unknown after the restore, and a load from before the guard that was waited for only under it is pending again after the restore. If a register written by an earlier load was overwritten under the guard, it is unknown after the restore.
+
+The two fixtures are unchanged LLVM 15 code generator output (`clang 15.0.7 -target amdgcn--amdpal -mcpu=gfx1013 -O2 -x ir -Xclang -disable-llvm-passes`, equivalent to `llc-15`) for original `amdgpu_cs` sources with a group of 32, `if (gid < n) out[gid] = src[...]`. One reads source byte offset `gid * 4` through `offen`. The other reads word 1 of an indexed source element through `idxen offset:4`. Its stride is a descriptor field, bound here as 8 bytes. Their bindings are the guard bindings with `--source-descriptor 16`, and `--source-stride 8` for the indexed read. With the full `-O2` IR pipeline, the code generator loads the two descriptors separately. That form is accepted and produces the same HLSL.
+
+The Windows fixture binds t0 to a buffer of 320 known words followed by 320 sentinel words, and u0 to 320 sentinel words. It reads back all 320 words of u0. It runs three dispatches per program: one group with `n` of 0 and 17, and five groups with `n = 150`, where every lane reads one of the known words. On the last dispatch, a reference with one copied word off by one bit, or with lane 150 also copying, must fail. So must recompiled HLSL that ignores the read index, reads the next source word, or reads u0 instead of t0.
+
+The CPU controls reject a read without its `vmcnt(0)` wait, with only an `lgkmcnt(0)` wait, or copied or overwritten before its wait. They also reject a read from the u0 descriptor or the constant buffer, a source bound at another or overlapping table slot or not bound at all, and a descriptor still pending. Further controls cover an address that is not the dispatch index or uses the other addressing mode, an indexed read without a stride, an unaligned, 4096-byte or out-of-element instruction offset, and a word read under the guard or overwritten there and then stored after the restore.
+
+```sh
+python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-reg 0 --descriptor-offset 0 --constant-descriptor 32 --group-reg 1 --stride 4 --source-descriptor 16 --output out/copy.hlsl
+```
+
 ### Two- and three-dimensional thread groups
 
 The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits

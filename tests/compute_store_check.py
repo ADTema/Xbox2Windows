@@ -303,6 +303,7 @@ def controls():
         must_reject(lambda: aot.lower(early, 1, **RUNTIME_BINDING))
     grid_controls()
     guard_controls()
+    read_controls()
 
 
 def grid_controls():
@@ -632,6 +633,58 @@ GUARD_CASES = [
     ("guard_join", GUARD_JOIN, 32, GUARD_BINDING | dict(stride=8)),
 ]
 GUARD_IF = "    if (params[0].x > tid.x) {"
+# Vector reads (#721), unchanged LLVM 15 code generator output (-mtriple=amdgcn--amdpal
+# -mcpu=gfx1013 -O2, no IR passes) of original amdgpu_cs sources as for the guards above, with a
+# second, read-only raw buffer at table byte 16 (t0). Both descriptors come from one x8 load.
+#   gid = group.x * 32 + local.x;
+#   if (gid < n) store source word gid (byte offset gid * 4) at element gid;
+READ_COPY = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[4:7], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s2, vcc_lo",
+    "s_cbranch_execz .LBB0_2",
+    "s_load_dwordx8 s[0:7], s[0:1], 0x0",
+    "v_lshlrev_b32_e32 v1, 2, v0",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_load_dword v1, v1, s[4:7], 0 offen",
+    "s_waitcnt vmcnt(0)",
+    "buffer_store_dword v1, v0, s[0:3], 0 idxen",
+    ".LBB0_2:",
+    "s_endpgm",
+]
+#   if (gid < n) store word 1 of indexed source element gid at element gid;
+# The source stride is a descriptor field, bound here as 8 bytes.
+READ_INDEX = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[4:7], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s2, vcc_lo",
+    "s_cbranch_execz .LBB1_2",
+    "s_load_dwordx8 s[0:7], s[0:1], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_load_dword v1, v0, s[4:7], 0 idxen offset:4",
+    "s_waitcnt vmcnt(0)",
+    "buffer_store_dword v1, v0, s[0:3], 0 idxen",
+    ".LBB1_2:",
+    "s_endpgm",
+]
+READ_BINDING = GUARD_BINDING | dict(source_descriptor=16)
+READ_CASES = [
+    ("read_copy", READ_COPY, 32, READ_BINDING),
+    ("read_index", READ_INDEX, 32, READ_BINDING | dict(source_stride=8)),
+]
+READ_LOADS = {"read_copy": "inputData.Load((tid.x << 2u) + 0u)", "read_index": "inputData.Load(tid.x * 8u + 4u)"}
 
 
 def variant(lines, *changes):
@@ -745,6 +798,99 @@ def guard_controls():
                 aot.labelled, decoded[:2] + [(8, f"s_cbranch_execz {distance}")] + decoded[3:])
 
 
+def read_controls():
+    """Vector reads: exact output, then one rejection per broken read assumption."""
+    def read(name, *changes, **binding):
+        _, lines, width, bound = dict((case[0], case) for case in READ_CASES)[name]
+        return aot.lower(variant(lines, *changes), width, **(bound | binding)).splitlines()
+
+    for name in ("read_copy", "read_index"):
+        lines = read(name)
+        assert lines[:3] == ["cbuffer Constants : register(b0) { uint4 params[4]; };",
+                             "ByteAddressBuffer inputData : register(t0);",
+                             "RWByteAddressBuffer outputData : register(u0);"], lines
+        assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, {READ_LOADS[name]});",
+                              "    }", "}"], lines
+    copy = read("read_copy")
+    # The same program with both descriptors loaded apart, as the full -O2 pipeline emits it.
+    assert read("read_copy", ("s_load_dwordx8 s[0:7], s[0:1], 0x0", "s_load_dwordx4 s[4:7], s[0:1], 0x10"),
+                ("v_lshlrev_b32_e32 v1, 2, v0", "v_lshlrev_b32_e32 v1, 2, v0\ns_load_dwordx4 s[0:3], s[0:1], 0x0")) == copy
+    # A combined wait, and a copy of the word read, are the same program.
+    assert read("read_copy", ("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(0) lgkmcnt(0)")) == copy
+    assert read("read_copy", ("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(0)\nv_mov_b32_e32 v2, v1"),
+                ("buffer_store_dword v1, v0", "buffer_store_dword v2, v0")) == copy
+    # A fixed read address.
+    assert "        outputData.Store(tid.x * 4u + 0u, inputData.Load(8u));" in read(
+        "read_copy", ("v1, v1, s[4:7], 0 offen", "v1, off, s[4:7], 0 offset:8"))
+    wait = "Vector load result used or overwritten before s_waitcnt vmcnt(0)"
+    descriptor, address = "Unverified buffer read descriptor", "Unsupported read address"
+    for name, message, changes, binding in (
+        # The word read is stored, copied or overwritten before its wait, or only a scalar wait follows.
+        ("read_copy", wait, (("s_waitcnt vmcnt(0)", ""),), {}),
+        ("read_copy", wait, (("s_waitcnt vmcnt(0)", "s_waitcnt lgkmcnt(0)"),), {}),
+        ("read_copy", wait, (("s_waitcnt vmcnt(0)", "v_mov_b32_e32 v2, v1\ns_waitcnt vmcnt(0)"),), {}),
+        ("read_copy", wait, (("s_waitcnt vmcnt(0)", "v_mov_b32_e32 v1, 7\ns_waitcnt vmcnt(0)"),), {}),
+        ("read_index", wait, (("s_waitcnt vmcnt(0)", ""),), {}),
+        # A partial count does not say which load completed.
+        ("read_copy", "Unsupported compute instruction: s_waitcnt vmcnt(1)",
+         (("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(1)"),), {}),
+        # The read uses the store target, the constant buffer, an unbound slot, or a pending descriptor.
+        ("read_copy", "Reads from the stored UAV are not supported", (("v1, v1, s[4:7]", "v1, v1, s[0:3]"),), {}),
+        ("read_copy", "Unresolved compute descriptor load", (), dict(source_descriptor=48)),
+        ("read_copy", "Unresolved compute descriptor load", (), dict(source_descriptor=None)),
+        ("read_copy", descriptor, (("s_load_dwordx8 s[0:7], s[0:1], 0x0",
+                                    "s_load_dwordx4 s[8:11], s[0:1], 0x20\ns_load_dwordx4 s[0:3], s[0:1], 0x0"),
+                                   ("v1, v1, s[4:7]", "v1, v1, s[8:11]")), {}),
+        ("read_copy", descriptor, (("buffer_load_dword v1, v1, s[4:7], 0 offen", ""),
+                                   ("v_lshlrev_b32_e32 v1, 2, v0",
+                                    "v_lshlrev_b32_e32 v1, 2, v0\nbuffer_load_dword v1, v1, s[4:7], 0 offen")), {}),
+        # The index or byte offset is not the dispatch index, or the read uses the other addressing.
+        ("read_copy", address, (("v_lshlrev_b32_e32 v1, 2, v0", ""),), {}),
+        ("read_copy", address, (("v_lshlrev_b32_e32 v1, 2, v0", "v_mov_b32_e32 v1, 0"),), {}),
+        ("read_copy", address, (("v_lshlrev_b32_e32 v1, 2, v0", "v_lshlrev_b32_e32 v1, 1, v0"),), {}),
+        ("read_copy", address, (("v1, v1, s[4:7], 0 offen", "v1, v1, s[4:7], 0 idxen"),), dict(source_stride=4)),
+        ("read_index", address, (("v1, v0, s[4:7], 0 idxen", "v1, v0, s[4:7], 0 offen"),), {}),
+        ("read_index", address, (), dict(source_stride=None)),
+        ("read_index", address, (("v1, v0, s[4:7]", "v1, v2, s[4:7]"),), {}),
+        # The instruction offset is unaligned, leaves the source element, or leaves the 12-bit field.
+        ("read_copy", "Unverified read offset", (("s[4:7], 0 offen", "s[4:7], 0 offen offset:2"),), {}),
+        ("read_index", "Read leaves its source element", (("offset:4", "offset:8"),), {}),
+        ("read_copy", "Unverified read offset", (("s[4:7], 0 offen", "s[4:7], 0 offen offset:4096"),), {}),
+        # A load under the guard is unknown after the restore, even once waited for.
+        ("read_copy", "Store data is not a known word",
+         (("s_load_dwordx8 s[0:7], s[0:1], 0x0", ""),
+          ("s_and_saveexec_b32 s2, vcc_lo", "s_load_dwordx8 s[0:7], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
+                                            "s_and_saveexec_b32 s12, vcc_lo"),
+          ("s_waitcnt vmcnt(0)", "s_or_b32 exec_lo, exec_lo, s12\ns_waitcnt vmcnt(0)"),
+          ("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", "")), {}),
+        # Binding errors: overlapping or unaligned slots, a stride without a source.
+        ("read_copy", "Invalid or overlapping source descriptor binding", (), dict(source_descriptor=24)),
+        ("read_copy", "Invalid or overlapping source descriptor binding", (), dict(source_descriptor=18)),
+        ("read_index", "Indexed reads require a source binding and aligned stride", (), dict(source_stride=10)),
+        ("read_index", "Indexed reads require a source binding and aligned stride", (),
+         dict(source_descriptor=None)),
+    ):
+        rejects(message, read, name, *changes, **binding)
+    # A read issued before the guard and waited for only under it is pending again after the
+    # restore; waited for again, it keeps its word.
+    early = (("s_load_dwordx8 s[0:7], s[0:1], 0x0", ""), ("v_lshlrev_b32_e32 v1, 2, v0", ""),
+             ("buffer_load_dword v1, v1, s[4:7], 0 offen", ""),
+             ("s_and_saveexec_b32 s2, vcc_lo", "s_load_dwordx8 s[8:15], s[0:1], 0x0\nv_lshlrev_b32_e32 v1, 2, v0\n"
+              "s_waitcnt lgkmcnt(0)\nbuffer_load_dword v1, v1, s[12:15], 0 offen\ns_and_saveexec_b32 s2, vcc_lo"),
+             ("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", ""),
+             ("buffer_store_dword v1, v0, s[0:3], 0 idxen",
+              "buffer_store_dword v0, v0, s[8:11], 0 idxen\ns_or_b32 exec_lo, exec_lo, s2"))
+    late = "buffer_store_dword v1, v0, s[8:11], 0 idxen offset:4\ns_endpgm"
+    rejects(wait, read, "read_copy", *early, ("s_endpgm", late), stride=8)
+    assert read("read_copy", *early, ("s_endpgm", "s_waitcnt vmcnt(0)\n" + late), stride=8)[-5:] == [
+        GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
+        "    outputData.Store(tid.x * 8u + 4u, inputData.Load((tid.x << 2u) + 0u));", "}"]
+    # Overwritten under the guard after its wait, the word read is unknown after the restore.
+    rejects("Store data is not a known word", read, "read_copy", *early,
+            ("s_or_b32 exec_lo", "v_mov_b32_e32 v1, 5\ns_or_b32 exec_lo"),
+            ("s_endpgm", "s_waitcnt vmcnt(0)\n" + late), stride=8)
+
+
 def assemble(directory, assembler, objcopy, lines):
     src, obj, raw = [directory / x for x in ("exit.s", "exit.o", "exit.bin")]
     src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -767,6 +913,8 @@ def rejects(message, function, *args, **kwargs):
         function(*args, **kwargs)
     except ValueError as error:
         assert message in str(error), error
+    except Exception as error:
+        raise AssertionError(f"Expected rejection: {message}, got {type(error).__name__}: {error}") from error
     else:
         raise AssertionError(f"Expected rejection: {message}")
 
@@ -852,7 +1000,7 @@ def store_container(code, dims):
 
 def binary(directory, assembler, objcopy, library):
     two_exits(directory, assembler, objcopy, library)
-    for name, lines, width, binding in CASES + GUARD_CASES:
+    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
         subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
@@ -1049,14 +1197,75 @@ def draw_guard(directory, compiler, cmd, case, name):
     return 0
 
 
+def source_word(i):
+    """t0 as the harness fills it: 320 known words, then 320 sentinel words."""
+    return (0x8b02a7f1 + i * 0x413b1) & 0xffffffff if i < 320 else SENTINEL
+
+
+def read_words(name, groups, bound):
+    """Independent expected readback: each lane under the bound copies its source word."""
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = source_word(gid if name == "read_copy" else 2 * gid + 1)
+    return words
+
+
+# (groups, bound): no lane passes, a split wave, and the largest dispatch the harness allows with its
+# fifth group split. Every lane reads one of the 320 known source words. Mutations run on the last.
+READ_RUNS = ((1, 0), (1, 17), (5, 150))
+
+
+def read_mutations(source, name):
+    """Translations that a read mistake would produce; each must fail on the GPU."""
+    load = READ_LOADS[name]
+    yield "index ignored", source.replace(load, "inputData.Load(4u)")
+    yield "next source word", source.replace(load, load.replace(" + ", " + 4u + "))
+    yield "read from the store target", source.replace(load, load.replace("inputData", "outputData"))
+
+
+def draw_read(directory, compiler, cmd, case, name):
+    constants = [0x5eed0000 + i for i in range(16)]
+
+    def write(groups, bound, words=None):
+        case.write_bytes(struct.pack("<337I", groups, *(words or read_words(name, groups, bound)), bound,
+                                     *constants[1:]))
+
+    for groups, bound in READ_RUNS:
+        write(groups, bound)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    groups, bound = READ_RUNS[-1]
+    # Reference controls: one source word off, and the first lane past the bound copying too.
+    off = read_words(name, groups, bound)
+    off[bound - 1] ^= 1
+    for word, reference in ((bound - 1, off), (bound, read_words(name, groups, bound + 1))):
+        write(groups, bound, reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: a wrong reference word {word} escaped detection\n{bad.stderr}")
+    write(groups, bound)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, mutated in read_mutations(source, name):
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection with groups={groups} bound={bound}")
+    return 0
+
+
 def draw(directory, compiler, renderer, backend):
-    for name, lines, width, binding in CASES + GUARD_CASES:
+    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES:
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
-        if name.startswith("guard_"):
-            result = draw_guard(directory, compiler, cmd, case, name)
+        if name.startswith(("guard_", "read_")):
+            result = (draw_guard if name.startswith("guard_") else draw_read)(directory, compiler, cmd, case, name)
             if result:
                 return result
             continue
