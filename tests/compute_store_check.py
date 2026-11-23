@@ -1112,11 +1112,52 @@ def store_container(code, dims):
 
 
 
-DS_BINDING = dict(table_reg=7, descriptor_offset=0x30, group_reg=11, stride=12, cpu="gfx1030", lds_bytes=128)
+DS_BINDING = dict(table_reg=7, descriptor_offset=0x30, group_reg=11, stride=4, cpu="gfx1030")
 DS_FEATURES = "+wavefrontsize32,-wavefrontsize64"
 DS_PREFIX = INDEXED[:4] + ["s_waitcnt lgkmcnt(0)"]
-DS_OPS = ("ds_write_b32", "ds_read_b32", "ds_read_u16")
-DS_PROGRAM = DS_PREFIX + [
+DS_OPS = ("ds_bpermute_b32", "ds_permute_b32")
+
+
+def ds_program(op, bias):
+    return DS_PREFIX + [
+        f"v_add_nc_u32_e32 v5, {bias}, v0",
+        "v_and_b32_e32 v5, 31, v5",
+        "v_lshlrev_b32_e32 v5, 2, v5",
+        # Alias the byte address to prove that the result can replace its input.
+        f"{op} v5, v5, v8",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dword v5, v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+DS_CASES = [(op, ds_program(op, 5), DS_BINDING) for op in DS_OPS]
+
+
+def ds_reference(op, groups):
+    bias = 5 if op == "ds_bpermute_b32" else -5
+    return [lane // 32 * 32 + ((lane % 32 + bias) % 32) for lane in range(groups * 32)]
+
+
+def ds_controls():
+    for op, lines, binding in DS_CASES:
+        expected_bias = 5 if op == "ds_bpermute_b32" else 27
+        assert f"[(local.x + {expected_bias}u) & 31u]" in aot.lower(lines, 32, **binding)
+        valid = f"{op} v5, v5, v8"
+        for operands in ("v5, v8, v8", "v5, v5, v255"):
+            rejects("Unverified DS lane routing", aot.lower, variant(lines, (valid, f"{op} {operands}")),
+                    32, **binding)
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(lines, (valid, valid + " offset:4")), 32, **binding)
+        i = lines.index(valid)
+        masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+        rejects("Unverified DS lane routing", aot.lower, masked, 32, **binding)
+        rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+                lines[:i + 1] + lines[i + 2:], 32, **binding)
+
+
+LDS_BINDING = DS_BINDING | {"stride": 12, "lds_bytes": 128}
+LDS_PROGRAM = DS_PREFIX + [
     "v_lshlrev_b32_e32 v5, 2, v0",
     "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
     "ds_write_b32 v5, v6",
@@ -1131,10 +1172,10 @@ DS_PROGRAM = DS_PREFIX + [
     "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
     "s_endpgm",
 ]
-DS_CASES = [("private", DS_PROGRAM)]
+LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING)]
 
 
-def ds_reference(_name, groups):
+def lds_reference(groups):
     words = []
     for lane in range(groups * 32):
         word = 0x89abfff0 + lane
@@ -1142,26 +1183,26 @@ def ds_reference(_name, groups):
     return words
 
 
-def ds_controls():
-    lines = DS_PROGRAM
-    assert " >> 16u) & 0xffffu)" in aot.lower(lines, 32, **DS_BINDING)
+def lds_controls():
+    lines = LDS_PROGRAM
+    assert " >> 16u) & 0xffffu)" in aot.lower(lines, 32, **LDS_BINDING)
     for old, new, message in (
         ("ds_write_b32 v5, v6", "s_nop 0", "Unverified private LDS read"),
         ("ds_write_b32 v5, v6", "ds_write_b32 v8, v6", "Unverified private LDS write"),
         ("ds_read_b32 v10, v5", "ds_read_b32 v10, v5 offset:2", "Unverified private LDS read"),
         ("ds_read_u16 v12, v5 offset:2", "ds_read_u16 v12, v5 offset:1", "Unsupported compute instruction"),
     ):
-        rejects(message, aot.lower, variant(lines, (old, new)), 32, **DS_BINDING)
+        rejects(message, aot.lower, variant(lines, (old, new)), 32, **LDS_BINDING)
     i = lines.index("ds_write_b32 v5, v6")
     masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
-    rejects("Unverified private LDS write", aot.lower, masked, 32, **DS_BINDING)
+    rejects("Unverified private LDS write", aot.lower, masked, 32, **LDS_BINDING)
     rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
-            lines[:i + 1] + lines[i + 2:], 32, **DS_BINDING)
-    rejects("Unverified dispatch byte offset", aot.lower, lines, 32, **(DS_BINDING | {"lds_bytes": 127}))
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+    rejects("Unverified dispatch byte offset", aot.lower, lines, 32, **(LDS_BINDING | {"lds_bytes": 127}))
 
 
 def ds_binary(directory, assembler, objcopy, library):
-    for name, lines in DS_CASES:
+    for name, lines, binding in DS_CASES + LDS_CASES:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
         subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1030", f"-mattr={DS_FEATURES}",
@@ -1172,39 +1213,47 @@ def ds_binary(directory, assembler, objcopy, library):
                                           features=DS_FEATURES.encode()))
         assert [line for line in decoded if line.startswith("ds_")] == [
             line for line in lines if line.startswith("ds_")]
-        expected = aot.lower(lines, 32, **DS_BINDING)
-        assert aot.lower(decoded, 32, **DS_BINDING) == expected
+        expected = aot.lower(lines, 32, **binding)
+        assert aot.lower(decoded, 32, **binding) == expected
         container, output = directory / "ds.dxbc", directory / "ds-cli.hlsl"
         container.write_bytes(store_container(code, (32, 1, 1)))
-        options = [item for key, value in DS_BINDING.items() for item in ("--" + key.replace("_", "-"), str(value))]
+        options = [item for key, value in binding.items() for item in ("--" + key.replace("_", "-"), str(value))]
         subprocess.run([sys.executable, "-B", aot.__file__, container, "--output", output,
                         "--llvm", library, *options], check=True)
         assert output.read_text() == expected
 
 
-def ds_draw(directory, compiler, renderer, backend):
-    ds_controls()
+def ds_draw(directory, compiler, renderer, backend, *, private=False):
+    if private:
+        lds_controls()
+    else:
+        ds_controls()
     accepted = set()
-    for name, lines in DS_CASES:
-        source = aot.lower(lines, 32, **DS_BINDING)
+    for name, lines, binding in (LDS_CASES if private else DS_CASES):
+        source = aot.lower(lines, 32, **binding)
         src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
         src.write_text(source, encoding="ascii")
         compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
         for groups in (1, 3):
-            words = ds_reference(name, groups)
+            words = lds_reference(groups) if private else ds_reference(name, groups)
             words += [SENTINEL] * (320 - len(words))
             case.write_bytes(struct.pack("<321I", groups, *words))
             execution = subprocess.run(run)
             if execution.returncode:
                 return execution.returncode
-        mutated = source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)")
+        if name == "private":
+            mutated = source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)")
+        else:
+            bias = 5 if name == "ds_bpermute_b32" else 27
+            mutated = source.replace(f"local.x + {bias}u", f"local.x + {32 - bias}u")
         assert mutated != source
         src.write_text(mutated, encoding="ascii")
         subprocess.run(compile, check=True)
         bad = subprocess.run(run, capture_output=True, text=True)
-        if bad.returncode != 1 or "word=2 expected=" not in bad.stderr:
+        mismatched_word = 2 if name == "private" else 0
+        if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
             raise AssertionError(f"{name}: DS mutation escaped detection\n{bad.stderr}")
         print(bad.stderr, end="")
         accepted.update(line.split()[0] for line in lines)
@@ -1217,6 +1266,7 @@ def ds_draw(directory, compiler, renderer, backend):
 
 def binary(directory, assembler, objcopy, library):
     ds_controls()
+    lds_controls()
     ds_binary(directory, assembler, objcopy, library)
     two_exits(directory, assembler, objcopy, library)
     for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES:
@@ -1606,6 +1656,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
-                 "draw-lds-private": ds_draw,
+                 "draw-ds-route": ds_draw,
+                 "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))

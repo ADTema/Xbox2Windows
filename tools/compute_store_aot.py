@@ -145,6 +145,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
+    ds_steps = []
     lds_enabled = ds_group and 128 <= lds_bytes <= 65536
     lds_word = None
     ds_wait = False
@@ -341,9 +342,24 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or vector.get(local) != ("local", tag[1])):
                 raise ValueError("Unverified dispatch byte offset")
             vector[dst] = ("thread_bytes", tag[1], shift)
+        elif (ds_group and (m := re.fullmatch(r"v_add_nc_u32_e32 v(\d+), (\d+), v(\d+)", line))
+              and vector.get(int(m[3])) == ("local", 0)):
+            dst, rotation, _ = map(int, m.groups())
+            if dst > 255 or rotation > 31:
+                raise ValueError("Unverified DS lane bias")
+            vector[dst] = ("ds_biased_lane", rotation)
+        elif (ds_group and (m := re.fullmatch(r"v_and_b32_e32 v(\d+), 31, v(\d+)", line))
+              and (tag := vector.get(int(m[2]))) and isinstance(tag, tuple) and tag[0] == "ds_biased_lane"):
+            dst = int(m[1])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            vector[dst] = ("ds_lane", tag[1])
         elif m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line):
             dst, shift, src = map(int, m.groups())
             tag = vector.get(src)
+            if ds_group and dst <= 255 and shift == 2 and isinstance(tag, tuple) and tag[0] == "ds_lane":
+                vector[dst] = ("ds_address", tag[1])
+                continue
             if lds_enabled and dst <= 255 and shift == 2 and tag == ("local", 0):
                 vector[dst] = ("lds_address",)
                 continue
@@ -351,6 +367,23 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
                 raise ValueError("Unverified dispatch byte offset")
             vector[dst] = ("thread_bytes", tag[1], shift)
+        elif m := re.fullmatch(r"ds_(b?permute)_b32 v(\d+), v(\d+), v(\d+)", line):
+            op, dst, addr, src = m[1], *map(int, m.groups()[1:])
+            address = vector.get(addr)
+            value = vector.get(src)
+            if (not ds_group or guard_span is not None or max(dst, addr, src) > 255
+                    or not isinstance(address, tuple) or address[0] != "ds_address" or not is_word(value)
+                    or len(ds_steps) >= 64):
+                raise ValueError("Unverified DS lane routing")
+            # The bijective address is (local X + bias) mod 32. Scatter reads from its inverse.
+            bias = address[1] if op == "bpermute" else (-address[1]) % 32
+            slot = f"ds_stage_{len(ds_steps)}"
+            result = f"ds_result_{len(ds_steps)}"
+            ds_steps.append((slot, f"    {slot}[local.x] = {hlsl_word(value)};\n"
+                                   f"    GroupMemoryBarrierWithGroupSync();\n"
+                                   f"    uint {result} = {slot}[(local.x + {bias}u) & 31u];"))
+            vector[dst] = ("alu", result)
+            ds_wait = True
         elif m := re.fullmatch(r"ds_write_b32 v(\d+), v(\d+)", line):
             addr, src = map(int, m.groups())
             value = vector.get(src)
@@ -541,8 +574,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                if constant_descriptor is not None else "")
     if source_descriptor is not None:
         cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
+    local = ""
+    if ds_steps:
+        cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot, _ in ds_steps)
+        body = "\n".join([*(step for _, step in ds_steps), body])
+        local = ", uint3 local : SV_GroupThreadID"
     return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
-            f"void main(uint3 tid : SV_DispatchThreadID) {{\n{body}\n}}\n")
+            f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 
 
 def main():

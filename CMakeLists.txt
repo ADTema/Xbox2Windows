@@ -209,6 +209,14 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.h" COMM
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_alias_writes.hlsl" DEPENDS tests/gpu_alias_writes.hlsl src/title_va_lookup.hlsli
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.cso" VERBATIM)
 target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.h")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
+    -E ProbeArrayAtomicsWaterfall -Vn ProbeArrayAtomicsWaterfall
+    -Fh "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.h"
+    -Fo "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.cso"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_alias_atomic_waterfall.hlsl"
+    DEPENDS tests/gpu_alias_atomic_waterfall.hlsl
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.cso" VERBATIM)
+target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.h")
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
     -E AliasTransform -Vn AliasTransform -Fh "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h"
@@ -2824,6 +2832,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-guard-read "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_guard_read_${adapter} PROPERTIES TIMEOUT 45)
+        add_test(NAME compute_store_aot_ds_route_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-ds-route "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_ds_route_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_ds_route_${adapter}.txt")
         add_test(NAME compute_store_aot_lds_private_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-lds-private "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2941,6 +2954,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-int16-ternary "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_int16_ternary_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME pixel_aot_f16_arith_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-arith "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_f16_arith_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_swap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-swap "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3090,6 +3107,8 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_int16_vop3_${adapter}.txt")
         set_tests_properties(pixel_aot_int16_ternary_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_int16_ternary_${adapter}.txt")
+        set_tests_properties(pixel_aot_f16_arith_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_arith_${adapter}.txt")
         set_tests_properties(pixel_aot_vop3_ternary_int_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_vop3_ternary_int_${adapter}.txt")
     endforeach()
