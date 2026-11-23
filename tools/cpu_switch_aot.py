@@ -1311,6 +1311,8 @@ class Frame:
         if mnemonic == M.RET:
             return rsp, anchor
         if mnemonic == M.LEAVE:
+            if ins.code != Code.LEAVEQ:
+                raise ValueError(f"unsupported LEAVE operand size at RVA {ip:#x}")
             # RSP becomes the anchor and RBP is popped from it, so only a proven anchor gives the new RSP.
             # __init__ then releases every byte from the old RSP through anchor + 8, the pop slot included.
             if anchor is None:

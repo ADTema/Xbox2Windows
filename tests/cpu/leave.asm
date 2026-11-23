@@ -164,4 +164,15 @@ enter_frame PROC FRAME
     ret
 enter_frame ENDP
 
+; Static rejection control. The operand-size prefix selects a 2-byte pop.
+leave_word PROC FRAME
+    push rbp
+    .pushreg rbp
+    mov rbp, rsp
+    .setframe rbp, 0
+    .endprolog
+    db 66h, 0c9h
+    ret
+leave_word ENDP
+
 END

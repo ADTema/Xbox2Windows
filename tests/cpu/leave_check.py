@@ -95,7 +95,8 @@ EXPORTS = [("leave_split", "frame pointer differs at join"),
            ("leave_lowers", "LEAVE with the frame anchor below RSP"),
            ("leave_above", "LEAVE would raise RSP above entry RSP"),
            ("mov_rsp_frame", "dynamic frame"),
-           ("enter_frame", "dynamic frame")]
+           ("enter_frame", "dynamic frame"),
+           ("leave_word", "unsupported LEAVE operand size")]
 
 
 def check_rejections(original_path):
