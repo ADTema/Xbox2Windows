@@ -5974,3 +5974,50 @@ and 10 end-to-end PE-patched DLL rejection controls.
 Not covered by this experiment: non-default MXCSR modes (FTZ/DAZ or unmasked exceptions),
 non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
+
+## AVX alternating FP add/sub and quadword/masked-byte moves
+
+[The AVX FP and move translator](../tools/cpu_avx_fp_move_aot.py) lifts bounded
+straight-line Windows x64 leaf functions covering four `VEX` forms from
+`docs/coverage/x64_zen2.tsv` group `AVX`:
+
+- Packed alternating subtract/add: `vaddsubps` (`xmm` and `ymm`, register and flat `m128`/`m256`) and `vaddsubpd` (`xmm` and `ymm`, register and flat `m128`/`m256`), preserving x86 `src1`-first NaN quieting/precedence, real-indefinite QNaN on invalid operations, signed zeros, infinities and subnormals under default MXCSR.
+- Quadword / GPR moves: `vmovq` across all five `VEX.128` operand shapes (`xmm, xmm`; `xmm, m64`; `m64, xmm`; `xmm, r64`; `r64, xmm`), zeroing `YMM[255:64]` on `XMM` writes.
+- Conditional byte store: `vmaskmovdqu` (`VEX.128` `xmm1, xmm2` to implicit `[rdi]`), requiring nonvolatile `rdi` save/restore via a volatile scratch GPR around `mov rdi, r8`.
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned
+flat buffers and returns `void`. `YMM0`..`YMM5` use the portable `Vec256` model
+(`std::uint64_t q[4]`) without `/arch:AVX`; `VEX.128` writes zero `[255:128]`
+(`vaddsubps`/`vaddsubpd` XMM, `vmovups`/`vmovaps`/`vmovdqu`/`vmovdqa` XMM) or
+`[255:64]` (`vmovq` XMM). Transport and ABI glue covers `vmovups`, `vmovaps`,
+`vmovdqu`, `vmovdqa`, `vzeroupper`, 64-bit `mov` and terminal `ret`. The translator
+rejects legacy SSE encodings (`addsubps`, `addsubpd`, `movq`, `maskmovdqu`), EVEX
+encodings, nonvolatile registers (`XMM6`..`15`, `YMM6`..`15`, `RBX`/`RBP`/`RSI`/
+`R12`..`R15`/`RSP`, and unrestored or non-`r8` `RDI`), non-argument memory bases,
+stores outside `r8`, unaligned `vmovaps`/`vmovdqa` operands, prefixes,
+RIP-relative addressing, undefined registers, missing `ret` and trailing bytes
+after `ret`.
+
+```powershell
+cmake --build --preset dev --target cpu_avx_fp_move_original cpu_avx_fp_move_original_lifted cpu_avx_fp_move_altered cpu_avx_fp_move_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_avx_fp_move$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/avx_fp_move.asm) exports 22 functions covering
+`vaddsubps` and `vaddsubpd` (`xmm`/`ymm`, register, memory, `+1` unaligned and
+self-aliased), all five `vmovq` operand shapes (`+1`/`+9` unaligned),
+`vmaskmovdqu` with `rdi` save/restore, a chained `vzeroupper` pipeline, and two
+dead-read fault-ordering controls (`op_discarded_read` and `op_discarded_read64`).
+[The differential check](../tests/cpu/avx_fp_move_check.py) skips with exit code 77
+when CPUID/XCR0 lacks AVX and otherwise verifies 257 cases across the 20
+functional exports bit-for-bit against both the native MASM DLL and an
+independent Python IEEE-754 reference model with 32-byte pre/post buffer guards,
+dead-read fault ordering across Debug and Release (`/O2`) builds, 5 `ALTER_OP`
+divergence controls, an output-mutation comparator control, 7 alternate-encoding
+lift checks, 37 unit rejection controls, and 8 end-to-end PE-patched DLL
+rejection controls.
+
+Not covered by this experiment: non-default MXCSR modes, control flow,
+nonvolatile `xmm6`..`xmm15` prologues, and title CPU code execution.

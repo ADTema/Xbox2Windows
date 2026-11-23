@@ -1152,6 +1152,25 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_fp_original>"
         "$<TARGET_FILE:cpu_sse_fp_original_lifted>"
         "$<TARGET_FILE:cpu_sse_fp_altered_lifted>")
+    set(cpu_avx_fp_move_exports
+        "op_vaddsubps_xmm_reg,op_vaddsubps_xmm_mem,op_vaddsubps_xmm_mem_plus1,"
+        "op_vaddsubps_ymm_reg,op_vaddsubps_ymm_mem,op_vaddsubps_ymm_mem_plus1,op_vaddsubps_self,"
+        "op_vaddsubpd_xmm_reg,op_vaddsubpd_xmm_mem,op_vaddsubpd_xmm_mem_plus1,"
+        "op_vaddsubpd_ymm_reg,op_vaddsubpd_ymm_mem,op_vaddsubpd_ymm_mem_plus1,"
+        "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
+        "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64")
+    string(CONCAT cpu_avx_fp_move_exports ${cpu_avx_fp_move_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_fp_move_${variant} avx_fp_move)
+        cpu_translation(cpu_avx_fp_move_${variant} cpu_avx_fp_move_aot "${cpu_avx_fp_move_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_fp_move_altered PRIVATE ALTER_OP)
+    add_test(NAME cpu_aot_avx_fp_move COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_fp_move_check.py"
+        "$<TARGET_FILE:cpu_avx_fp_move_original>"
+        "$<TARGET_FILE:cpu_avx_fp_move_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_fp_move_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_fp_move PROPERTIES SKIP_RETURN_CODE 77)
     # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
     # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
     set(tail_files)
