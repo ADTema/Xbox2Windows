@@ -346,7 +346,8 @@ def string_op(i):
     return f"{{ const word step = direction ? 0ull - {size}ull : {size}ull; {body} }}"
 
 
-def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, host_entropy=False):
+def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, host_entropy=False,
+          host_cpu=False):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = [f"word frame[{FRAME_WORDS}]{{}};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false, overflow=false, sign=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
@@ -825,6 +826,17 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         elif op == M.RDTSCP:
             stmt = ("{ unsigned int aux; const volatile uint64_t tsc = __rdtscp(&aux); "
                     "rax = static_cast<uint32_t>(tsc); rdx = tsc >> 32; rcx = aux; }")
+        elif op == M.CPUID and host_cpu:
+            # The opt-in host-CPU profile: the host's CPUID for the guest EAX leaf and ECX subleaf, all four
+            # results zero-extended, flags kept. These are host values; no guest CPU table is applied.
+            stmt = ("{ int cpu_regs[4]; __cpuidex(cpu_regs, static_cast<int>(rax), static_cast<int>(rcx)); "
+                    "rax = static_cast<uint32_t>(cpu_regs[0]); rbx = static_cast<uint32_t>(cpu_regs[1]); "
+                    "rcx = static_cast<uint32_t>(cpu_regs[2]); rdx = static_cast<uint32_t>(cpu_regs[3]); }")
+        elif op == M.XGETBV and host_cpu:
+            # The host's extended control register ECX into EDX:EAX, flags kept; an invalid index faults on the
+            # host as it does natively. The volatile result keeps a discarded read; without it /O2 removes it.
+            stmt = ("{ const volatile uint64_t xcr = _xgetbv(static_cast<uint32_t>(rcx)); "
+                    "rax = static_cast<uint32_t>(xcr); rdx = xcr >> 32; }")
         elif op in (M.RDRAND, M.RDSEED) and host_entropy:
             # The opt-in host-entropy profile: one host RDRAND or RDSEED per guest execution. CF is the
             # intrinsic's result; on CF=0 the destination gets zero at its width, and the guest decides whether
