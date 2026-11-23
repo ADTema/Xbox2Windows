@@ -8648,6 +8648,386 @@ def check_f16_arith_controls():
     expect_value_error(float_f16, export, "Unsupported export")
 
 
+# Plain binary16 VOP1 rounding (issue #839): v_floor_f16, v_ceil_f16, v_trunc_f16 and v_rndne_f16, e32 and e64, under the
+# rules of the binary16 VOP2 arithmetic above (statically proven finite source, declared entry denormal state, audited
+# readers only, no modifier, clamp or omod). LLVM 15.0.7 VOP1Instructions.td L449-452: ffloor, fceil, ftrunc, frint.
+F16_ROUND_OPS = ("floor", "ceil", "trunc", "rndne")
+# 42 finite binary16 values. Value index i carries junk F16_ARITH_JUNK[i % 4] in bits 31:16 of its source word.
+F16_ROUND_VALUES = (
+    0x0000, 0x8000,                                                   # +0 and -0
+    0xb800, 0xb4cd, 0xb666, 0x34cd, 0x3666, 0x399a, 0xb99a, 0x3800,   # -0.5, -0.3, -0.4, 0.3, 0.4, 0.7, -0.7, 0.5
+    0x3801, 0x37ff, 0xb801,                                           # 0.5 + ulp, 0.5 - ulp, -0.5 - ulp
+    0x3c00, 0xbc00, 0x3e00, 0xbe00, 0x4100, 0xc100, 0x4300, 0xc300,   # 1, -1, 1.5, -1.5, 2.5, -2.5, 3.5, -3.5
+    0x7bff, 0xfbff,                                                   # +-65504
+    0x0001, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x8400,                   # subnormals and the smallest normals
+    0x63fd, 0x63ff, 0xe3ff, 0xe3fd,                                   # +-1022.5 and +-1023.5: ulp 0.5, halfway cases
+    0x6400, 0x6401, 0xe401, 0x67ff, 0xe7ff,                           # >= 1024: ulp 1, already integers
+    0x6800, 0x6801, 0x6bff, 0xebff,                                   # >= 2048: ulp 2
+)
+# Four inputs read through the four audited readers; reader r of program j reads the result of op (r + j) % 4.
+F16_ROUND_READER_VALUES = (0xb800, 0x4100, 0xb4cd, 0x8001)
+# Chains: v24 = mul(a, b), v25 = trunc(v24), v26 = rndne(v24), v27 = sub(v24, v25): an arithmetic result is the source
+# of a rounding op and a rounding result the source of an arithmetic op.
+F16_ROUND_CHAINS = ((0x4500, 0x3800), (0xc700, 0x3800))
+F16_ROUND_MUTATIONS = ("floor_ceil_swap", "trunc_as_floor", "rndne_half_away", "neg_zero_lost", "src_high")
+F16_ROUND_READERS = ("v_cvt_f32_f16_e32 v12, v{}", "v_cvt_f32_f16_e64 v13, v{}",
+                     "v_cvt_f32_f16_sdwa v14, v{} dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                     "v_mov_b32_sdwa v15, v{} dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0")
+
+
+def f16_round_reference(op, word, *, mutation=None):
+    """Binary16 result bits of one rounding op on the low half of a source word, from the semantics only.
+
+    The operand is an integer in units of 2^-24, floor, ceiling, truncation and ties-to-even are integer arithmetic on
+    it, and the integer result (at most 65504, so representable) is encoded without rounding. An exact zero keeps the
+    sign of the operand. No pixel_aot import. mutation models a deliberate deviation of the draw's mutated shaders.
+    """
+    op = {"floor_ceil_swap": {"floor": "ceil", "ceil": "floor"}, "trunc_as_floor": {"trunc": "floor"}}.get(
+        mutation, {}).get(op, op)
+    half = (word >> 16 if mutation == "src_high" else word) & 0xffff
+    sign, exponent, mantissa = half >> 15, (half >> 10) & 31, half & 1023
+    assert exponent != 31, hex(half)
+    units = mantissa if exponent == 0 else (mantissa | 1024) << (exponent - 1)
+    value = -units if sign else units
+    one = 1 << 24
+    low = value // one                  # floor
+    high = -((-value) // one)           # ceiling
+    if op == "floor":
+        result = low
+    elif op == "ceil":
+        result = high
+    elif op == "trunc":
+        result = low if value >= 0 else high
+    else:
+        remainder = value - low * one
+        if remainder * 2 != one:
+            result = low if remainder * 2 < one else high
+        elif mutation == "rndne_half_away":
+            result = high if value > 0 else low
+        else:
+            result = low if low % 2 == 0 else high
+    if result == 0:
+        bits = sign << 15
+    else:
+        count = abs(result)
+        top = count.bit_length() - 1
+        if top <= 10:
+            mantissa_bits = (count << (10 - top)) & 1023
+        else:
+            assert count % (1 << (top - 10)) == 0, (op, hex(half))
+            mantissa_bits = (count >> (top - 10)) & 1023
+        bits = (1 << 15 if result < 0 else 0) | ((top + 15) << 10) | mantissa_bits
+    if mutation == "neg_zero_lost" and bits == 0x8000:
+        return 0
+    return bits
+
+
+def f16_round_word(index):
+    """The 32-bit source word of F16_ROUND_VALUES[index]: the binary16 value in bits 15:0, junk in bits 31:16."""
+    return (F16_ARITH_JUNK[index % 4] << 16) | F16_ROUND_VALUES[index]
+
+
+def f16_round_program(kind, index):
+    """One draw program. Kinds: main (two values, four ops each, two results packed per word), reader (one value read
+    through the four readers) and chain (four chained results widened with v_cvt_f32_f16)."""
+    pack = "v_mov_b32_sdwa v{dst}, v{src} dst_sel:{sel} dst_unused:{unused} src0_sel:WORD_0"
+    body = []
+    if kind == "main":
+        for slot in (0, 1):
+            value = 2 * index + slot
+            word = f16_round_word(value)
+            reg, sgpr = 18 + slot, 60 + slot
+            body += [f"v_mov_b32_e32 v{reg}, {word:#x}", f"s_mov_b32 s{sgpr}, {word:#x}"]
+            literal = f16_arith_token(word & 0xffff)
+            for k, op in enumerate(F16_ROUND_OPS):
+                dst, form = 24 + 4 * slot + k, (value + k) % 4
+                if form == 3 and literal is None:
+                    form = 0
+                body.append([f"v_{op}_f16_e32 v{dst}, v{reg}", f"v_{op}_f16_e64 v{dst}, v{reg}",
+                             f"v_{op}_f16_e64 v{dst}, s{sgpr}", f"v_{op}_f16_e32 v{dst}, {literal}"][form])
+        for word in range(4):
+            body.append(pack.format(dst=12 + word, src=24 + 2 * word, sel="WORD_0", unused="UNUSED_PAD"))
+            body.append(pack.format(dst=12 + word, src=25 + 2 * word, sel="WORD_1", unused="UNUSED_PRESERVE"))
+    elif kind == "reader":
+        word = (F16_ARITH_JUNK[index] << 16) | F16_ROUND_READER_VALUES[index]
+        body += [f"v_mov_b32_e32 v18, {word:#x}", "v_floor_f16_e32 v24, v18", "v_ceil_f16_e64 v25, v18",
+                 "v_trunc_f16_e32 v26, v18", "v_rndne_f16_e64 v27, v18"]
+        body += [line.format(24 + (r + index) % 4) for r, line in enumerate(F16_ROUND_READERS)]
+    else:
+        word_a, word_b = ((F16_ARITH_JUNK[k] << 16) | half for k, half in enumerate(F16_ROUND_CHAINS[index]))
+        body += [f"v_mov_b32_e32 v18, {word_a:#x}", f"v_mov_b32_e32 v19, {word_b:#x}",
+                 "v_mul_f16_e32 v24, v18, v19", "v_trunc_f16_e32 v25, v24", "v_rndne_f16_e64 v26, v24",
+                 "v_sub_f16_e32 v27, v24, v25"]
+        body += [f"v_cvt_f32_f16_e32 v{12 + k}, v{24 + k}" for k in range(4)]
+    return uncompressed_export(body)
+
+
+def f16_round_source_halves(kind, index):
+    """The binary16 source encodings of one draw program."""
+    if kind == "main":
+        return list(F16_ROUND_VALUES[2 * index:2 * index + 2])
+    return [F16_ROUND_READER_VALUES[index]] if kind == "reader" else list(F16_ROUND_CHAINS[index])
+
+
+def f16_round_expected(kind, index, mutation=None):
+    """The four exported words of f16_round_program(kind, index)."""
+    def result(op, word):
+        return f16_round_reference(op, word, mutation=mutation)
+
+    if kind == "main":
+        results = []
+        for slot in (0, 1):
+            results += [result(op, f16_round_word(2 * index + slot)) for op in F16_ROUND_OPS]
+        return tuple(results[2 * w] | results[2 * w + 1] << 16 for w in range(4))
+    if kind == "reader":
+        word = (F16_ARITH_JUNK[index] << 16) | F16_ROUND_READER_VALUES[index]
+        results = [result(op, word) for op in F16_ROUND_OPS]
+        chosen = [results[(r + index) % 4] for r in range(4)]
+        return (*(f16_widen_word(bits) for bits in chosen[:3]), chosen[3])
+    word_a, word_b = ((F16_ARITH_JUNK[k] << 16) | half for k, half in enumerate(F16_ROUND_CHAINS[index]))
+    product = f16_arith_reference("mul", word_a, word_b)
+    chain = [product, result("trunc", product), result("rndne", product)]
+    chain.append(f16_arith_reference("sub", product, chain[1]))
+    return tuple(f16_widen_word(bits) for bits in chain)
+
+
+F16_ROUND_PROGRAMS = (*(("main", i) for i in range(len(F16_ROUND_VALUES) // 2)),
+                      *(("reader", i) for i in range(len(F16_ROUND_READER_VALUES))),
+                      *(("chain", i) for i in range(len(F16_ROUND_CHAINS))))
+
+
+def f16_round_mutated(mutation, program):
+    """The lowered source of program (instruction lines) with one deviation applied."""
+    text = translate_f16(program)
+    if mutation == "floor_ceil_swap":
+        mutated = re.sub(r"(hs\d+ = )(floor|ceil)\(", lambda m: m[1] + {"floor": "ceil", "ceil": "floor"}[m[2]] + "(", text)
+    elif mutation == "trunc_as_floor":
+        mutated = re.sub(r"(hs\d+ = )trunc\(", r"\1floor(", text)
+    elif mutation == "rndne_half_away":
+        mutated = re.sub(r"(hs\d+ = )round\((widen16\(hf\d+_0\))\);",
+                         r"\1asfloat(asuint(floor(abs(\2) + 0.5f)) | (asuint(\2) & 0x80000000u));", text)
+    elif mutation == "neg_zero_lost":
+        mutated = re.sub(r"(precise float hs\d+ = )((?:floor|ceil|trunc|round)\(widen16\(hf\d+_0\)\));", r"\1\2 + 0.0f;", text)
+    else:
+        mutated = re.sub(r"uint (hf\d+_0) = \((.+)\) & 0xffffu;", r"uint \1 = ((\2) >> 16u) & 0xffffu;", text)
+    assert mutated != text, mutation
+    return mutated
+
+
+def f16_round_detecting_program(mutation):
+    """The first program whose expected words the modelled mutation changes."""
+    for kind, index in F16_ROUND_PROGRAMS:
+        if f16_round_expected(kind, index, mutation) != f16_round_expected(kind, index):
+            return kind, index
+    raise AssertionError(f"No program separates {mutation}")
+
+
+def check_f16_round_reference():
+    """The Python side of the draw: the reference against pinned rows, an independent float route over every finite
+    binary16 value, and the translator's own copy."""
+    assert len(F16_ROUND_VALUES) == 42 and len(set(F16_ROUND_VALUES)) == 42
+    assert all((half >> 10) & 31 != 31 for half in F16_ROUND_VALUES)
+    # Pinned rows, worked by hand: (op, half, result).
+    for op, half, expected in (
+            ("floor", 0x8000, 0x8000), ("floor", 0x0000, 0x0000), ("ceil", 0x8000, 0x8000),
+            ("trunc", 0xb800, 0x8000), ("ceil", 0xb4cd, 0x8000), ("rndne", 0xb666, 0x8000),     # negative to -0
+            ("floor", 0xb4cd, 0xbc00), ("ceil", 0x34cd, 0x3c00), ("floor", 0x34cd, 0x0000),
+            ("trunc", 0xb99a, 0x8000), ("trunc", 0xbe00, 0xbc00), ("trunc", 0x3e00, 0x3c00),
+            ("rndne", 0x3800, 0x0000), ("rndne", 0x3e00, 0x4000), ("rndne", 0x4100, 0x4000),    # halfway: to even
+            ("rndne", 0xc100, 0xc000), ("rndne", 0x4300, 0x4400), ("rndne", 0xbe00, 0xc000),
+            ("rndne", 0x3801, 0x3c00), ("rndne", 0x37ff, 0x0000), ("rndne", 0xb801, 0xbc00),   # just past and before 0.5
+            ("rndne", 0x63fd, 0x63fc), ("rndne", 0x63ff, 0x6400), ("rndne", 0xe3ff, 0xe400),   # 1022.5, 1023.5
+            ("floor", 0x63ff, 0x63fe), ("ceil", 0x63ff, 0x6400), ("trunc", 0xe3ff, 0xe3fe),
+            ("floor", 0x7bff, 0x7bff), ("ceil", 0xfbff, 0xfbff), ("rndne", 0x7bff, 0x7bff),   # +-65504
+            ("floor", 0x0001, 0x0000), ("floor", 0x8001, 0xbc00), ("ceil", 0x8001, 0x8000),
+            ("ceil", 0x0001, 0x3c00), ("trunc", 0x83ff, 0x8000), ("rndne", 0x03ff, 0x0000),    # subnormals
+            ("floor", 0x6401, 0x6401), ("ceil", 0x67ff, 0x67ff), ("rndne", 0x6bff, 0x6bff)):   # already integers
+        assert f16_round_reference(op, 0x1234_0000 | half) == expected, (op, hex(half), hex(expected))
+    # An independent route over every finite value: decode with struct 'e', round with math (Python round is
+    # half-even), compare numerically with the sign of zero, and compare with the translator's copy. The junk in the
+    # high half must not matter.
+    for half in range(0x10000):
+        if (half >> 10) & 31 == 31:
+            continue
+        value = struct.unpack("<e", struct.pack("<H", half))[0]
+        for op, rounded in zip(F16_ROUND_OPS, (math.floor(value), math.ceil(value), math.trunc(value), round(value))):
+            expected = math.copysign(0.0, -1.0 if half & 0x8000 else 1.0) if rounded == 0 else float(rounded)
+            bits = f16_round_reference(op, 0xa5c3_0000 | half)
+            got = struct.unpack("<e", struct.pack("<H", bits))[0]
+            assert got == expected and math.copysign(1.0, got) == math.copysign(1.0, expected), (op, hex(half), hex(bits))
+            assert bits == pixel_aot.f16_round_result(op, half), (op, hex(half))
+    assert len(pixel_aot.VOP1_F16_ROUND) == 4
+
+
+def check_f16_round_mutation_coverage():
+    """Every deviation changes at least one expected word of some program, so the draw can detect it."""
+    for kind, index in F16_ROUND_PROGRAMS:
+        assert len(f16_round_expected(kind, index)) == 4, (kind, index)
+    for mutation in F16_ROUND_MUTATIONS:
+        f16_round_detecting_program(mutation)
+
+    def differs(mutation, op, half):
+        word = 0xa5c30000 | half
+        return f16_round_reference(op, word, mutation=mutation) != f16_round_reference(op, word)
+
+    assert differs("floor_ceil_swap", "floor", 0x34cd) and differs("floor_ceil_swap", "ceil", 0x34cd)
+    assert differs("trunc_as_floor", "trunc", 0xbe00) and differs("rndne_half_away", "rndne", 0x3800)
+    assert differs("rndne_half_away", "rndne", 0xc100) and differs("neg_zero_lost", "trunc", 0xb800)
+    assert differs("neg_zero_lost", "floor", 0x8000) and differs("src_high", "floor", 0x34cd)
+    # A mutation must not move rows it should leave alone (negative controls for the model itself).
+    assert not differs("floor_ceil_swap", "floor", 0x3c00) and not differs("trunc_as_floor", "trunc", 0x3e00)
+    assert not differs("rndne_half_away", "rndne", 0x3801) and not differs("rndne_half_away", "rndne", 0x4300)
+    assert not differs("neg_zero_lost", "floor", 0x0000) and not differs("neg_zero_lost", "floor", 0xb4cd)
+
+
+def check_f16_round_controls():
+    """Lowering, spelling, input proof, mode, modifier and reader refusals of the plain binary16 VOP1 rounding forms."""
+    check_f16_round_reference()
+    check_f16_round_mutation_coverage()
+    prefix = ["v_mov_b32_e32 v18, 0x35553c00", "v_mov_b32_e32 v19, 0xd1a74000", "s_mov_b32 s60, 0x3555c000"]
+    calls = {"floor": "floor", "ceil": "ceil", "trunc": "trunc", "rndne": "round"}
+
+    def program(*lines):
+        return uncompressed_export([*prefix, *lines])
+
+    def refuse(line, message, translator=translate_f16):
+        expect_value_error(translator, program(line), message)
+
+    # Lowering and spelling: the bare, _e32 and _e64 spellings are one lowering.
+    for op in F16_ROUND_OPS:
+        spelled = [translate_f16(program(f"v_{op}_f16{suffix} v24, v18")) for suffix in ("", "_e32", "_e64")]
+        assert spelled[0] == spelled[1] == spelled[2], op
+        body = spelled[0].split("uint4 main", 1)[1]
+        assert re.search(rf"precise float hs\d+ = {calls[op]}\(widen16\(hf\d+_0\)\);", body), (op, body)
+        assert "narrow16(" in body, op
+        for forbidden in ("f32tof16", "f16tof32", "float16_t", "half ", "0xffff0000u"):
+            assert forbidden not in body, (op, forbidden)
+    # Operand kinds: VGPR, SGPR (also on e32), every inline constant, 0 and 16-bit literals.
+    for token, bits in (*pixel_aot.INLINE_F16.items(), ("0", 0), ("0x3555", 0x3555), ("0x8000", 0x8000), ("0x7bff", 0x7bff)):
+        for encoding in ("_e32", "_e64"):
+            assert f"_0 = ({bits}u) & 0xffffu;" in translate_f16(program(f"v_floor_f16{encoding} v24, {token}")), token
+    for line in ("v_floor_f16_e64 v24, s60", "v_ceil_f16_e32 v24, s60", "v_trunc_f16_e32 v24, v18"):
+        translate_f16(program(line))
+    # A VGPR copy of a proven constant keeps the proof; a result keeps it too, with its exact value: floor(65504) is
+    # 65504, and 65504 + 15.99 is accepted where 65504 + 16 overflows. A rounding result feeds every audited reader.
+    translate_f16(program("v_mov_b32_e32 v20, v18", "v_rndne_f16 v24, v20"))
+    translate_f16(program("s_mov_b32 s61, s60", "v_floor_f16_e64 v24, s61"))
+    translate_f16(program("v_floor_f16 v24, 0x7bff", "v_add_f16_e64 v25, v24, 0x4bff"))
+    expect_value_error(translate_f16, program("v_floor_f16 v24, 0x7bff", "v_add_f16_e64 v25, v24, 0x4c00"),
+                       "binary16 result overflows: v_add_f16")
+    translate_f16(program("v_ceil_f16 v24, 0xb4cd", "v_mul_f16 v25, v24, v24", "v_trunc_f16 v26, v25",
+                          "v_cvt_f32_f16 v12, v26"))
+    # Entry profile: unknown or an unsupported declaration refuses every spelling; the other forms are unaffected.
+    for op in F16_ROUND_OPS:
+        for suffix in ("", "_e32", "_e64"):
+            expect_value_error(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True),
+                               program(f"v_{op}_f16{suffix} v24, v18"), "binary16 denormal mode unknown at entry")
+    for state in ("flush", "ftz", "", False):
+        expect_value_error(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                                           half_denorm=state), program("v_floor_f16 v24, v18"),
+                           "Invalid binary16 denormal entry state")
+    # No finite proof: a constant-buffer word, an uninitialized register, a sample, a copy without provenance.
+    for line, token in (("v_floor_f16_e64 v24, s44", "s44"), ("v_ceil_f16 v24, v30", "v30"),
+                        ("v_trunc_f16_e64 v24, s70", "s70"), ("v_rndne_f16 v24, v12", "v12")):
+        refuse(line, f"binary16 operand lacks a finite proof: {token}")
+    expect_value_error(translate_f16, program("v_mov_b32_e32 v20, s44", "v_floor_f16 v24, v20"),
+                       "binary16 operand lacks a finite proof: v20")
+    expect_value_error(translate_f16, program("v_add_nc_u16 v25, v18, v19", "v_floor_f16 v24, v25"),
+                       "binary16 operand lacks a finite proof: v25")
+    # NaN and infinity are refused wherever the proof finds them; the largest finite values and subnormals are not.
+    for op in F16_ROUND_OPS:
+        for token in ("0x7c00", "0xfc00", "0x7e00", "0x7c01", "0xffff"):
+            refuse(f"v_{op}_f16_e64 v24, {token}", f"binary16 operand is not finite: {token}")
+            refuse(f"v_{op}_f16_e32 v24, {token}", f"binary16 operand is not finite: {token}")
+        for token in ("0x7bff", "0xfbff", "0x0001", "0x8001", "0x0400", "-2.0", "-0.5", "0"):
+            translate_f16(program(f"v_{op}_f16_e64 v24, {token}"))
+    expect_value_error(translate_f16, program("v_mov_b32_e32 v20, 0x7e00", "v_mov_b32_e32 v21, v20", "v_ceil_f16 v24, v21"),
+                       "binary16 operand is not finite: v21")
+    expect_value_error(translate_f16, program("s_mov_b32 s61, 0xdead7c00", "v_trunc_f16_e64 v24, s61"),
+                       "binary16 operand is not finite: s61")
+    translate_f16(program("v_mov_b32_e32 v20, 0x7c003c00", "v_floor_f16 v24, v20"))  # only the low half is a source
+    # Source modifiers (a leading minus is a negative inline constant first), integers, floats and other operands.
+    for token in ("-v18", "|v18|", "abs(v18)", "neg(v18)", "-|v18|", "-s60", "-3.0"):
+        refuse(f"v_floor_f16_e64 v24, {token}", f"Unsupported binary16 source modifier {token}")
+        refuse(f"v_rndne_f16_e32 v24, {token}", f"Unsupported binary16 source modifier {token}")
+    for token in ("1", "64", "-1", "-16", "5", "-0"):
+        refuse(f"v_ceil_f16_e64 v24, {token}", f"Unsupported binary16 integer inline constant {token}")
+    for token in ("3.0", "0.25", "vcc_lo", "m0", "exec_lo", "null", "v[18:19]"):
+        refuse(f"v_trunc_f16_e64 v24, {token}", f"Unsupported binary16 operand {token}")
+    refuse("v_floor_f16_e64 v24, 0x10000", "16-bit literal out of range: 0x10000")
+    refuse("v_floor_f16_e64 v256, 1.0", "Register out of range: v256")
+    refuse("v_floor_f16_e64 v24, v256", "Register out of range: v256")
+    refuse("v_floor_f16_e64 v24, s106", "Register out of range: s106")
+    # clamp and omod assemble on the e64 form (LLVM 15) and are refused with the rest of the forms the lowering does
+    # not accept; so are a second source, DPP, SDWA and the neighbouring binary16 ops.
+    for line in ("v_floor_f16_e64 v24, v18 clamp", "v_ceil_f16_e64 v24, v18 clamp", "v_trunc_f16_e64 v24, v18 mul:2",
+                 "v_rndne_f16_e64 v24, v18 div:2", "v_rndne_f16_e64 v24, v18 mul:4", "v_floor_f16_e64 v24, v18 op_sel:[0,1]",
+                 "v_floor_f16_e64 v24, -v18 clamp", "v_floor_f16_e32 v24, v18 clamp",
+                 "v_floor_f16_dpp v24, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                 "v_floor_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_floor_f16 v24, v18, v19", "v_floor_f16 v24", "v_fract_f16_e32 v24, v18", "v_rcp_f16_e32 v24, v18",
+                 "v_sqrt_f16_e64 v24, v18", "v_fract_f16_e64 v24, v18"):
+        refuse(line, "Unsupported instruction")
+
+    # Scheduling around the load and the samples: a pending SGPR, an outstanding sample, a non-entry mask.
+    def float_f16(instructions):
+        return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, half_denorm=pixel_aot.HALF_DENORM_PRESERVE)
+
+    base = with_constants([])
+    load = next(i for i, line in enumerate(base) if line.startswith("s_buffer_load_dwordx4"))
+    expect_value_error(float_f16, base[:load + 1] + ["v_floor_f16_e64 v24, s44"] + base[load + 1:],
+                       "Constant read before load completion")
+    sample = next(i for i, line in enumerate(base) if line.startswith("image_sample"))
+    expect_value_error(float_f16, base[:sample + 1] + ["v_floor_f16_e64 v12, 1.0"] + base[sample + 1:],
+                       "Write overlaps an outstanding sample")
+    expect_value_error(float_f16, base[:sample + 1] + ["v_floor_f16_e64 v24, v12"] + base[sample + 1:],
+                       "Sample used before vmcnt wait")
+    float_f16(base[:sample + 1] + ["v_floor_f16_e64 v20, 1.0"] + base[sample + 1:])
+    masked = base.index("s_wqm_b64 exec, exec") + 1
+    expect_value_error(float_f16, base[:masked] + ["v_floor_f16_e64 v24, 1.0"] + base[masked:],
+                       "Invalid binary16 rounding operation")
+    # Mode: every spelling is refused under round toward zero, a restored mode lowers like no write at all, and every
+    # instruction that could change the denormal state stays refused before and after the op.
+    for spelling in (f"v_{op}_f16{suffix}" for op in F16_ROUND_OPS for suffix in ("_e32", "_e64")):
+        line = f"{spelling} v24, v18"
+        expect_value_error(translate_f16, uncompressed_export([HALF_RTZ, *prefix, line]),
+                           f"under round toward zero: {spelling}")
+        assert translate_f16(uncompressed_export([HALF_RTZ, HALF_RNE, *prefix, line])) == translate_f16(
+            uncompressed_export(["s_nop 0", "s_nop 0", *prefix, line]))
+    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
+                           ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write")):
+        for lines in ([write, *prefix, "v_floor_f16 v24, v18"], [*prefix, "v_floor_f16 v24, v18", write]):
+            expect_value_error(translate_f16, uncompressed_export(lines), message)
+    # Readers. The audited ones read a rounding result; every other reader of the tag refuses it.
+    produced = [*prefix, "v_floor_f16_e32 v24, v18", "v_add_nc_u16 v25, v18, v19"]
+
+    def reader(line):
+        return uncompressed_export([*produced, line])
+
+    for line in ("v_cvt_f32_f16_e32 v12, v24", "v_cvt_f32_f16_e64 v12, v24",
+                 "v_cvt_f32_f16_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_add_f16_e32 v13, v24, v18"):
+        if line.startswith("v_add_f16"):
+            expect_value_error(translate_f16, reader(line), "Unsupported export")  # a chained op writes v13: not exportable
+        else:
+            translate_f16(reader(line))
+    sdwa = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:"
+    undefined = "Reads the undefined high half of a 16-bit result"
+    for line, message in (
+            ("v_mov_b32_e32 v12, v24", "Expected a numeric register"), ("v_add_nc_u16 v12, v24, v18", "Expected a numeric register"),
+            ("v_add_nc_u32_e32 v12, v24, v18", "Expected a numeric register"),
+            (f"v_cvt_f32_f16_sdwa v12, v24 {sdwa}WORD_1", undefined), (f"v_mov_b32_sdwa v12, v24 {sdwa}BYTE_0", undefined),
+            ("v_cvt_f32_f16_e64 v12, -v24", "Modifiers on a binary16 arithmetic result are not lowered"),
+            ("v_cvt_f16_f32_e32 v24, v18", "Unsupported conversion destination")):
+        expect_value_error(translate_f16, reader(line), message)
+    for registers in ("v24, v13, v14, v15", "v12, v13, v14, v24"):
+        export = uncompressed_export(produced)
+        export[next(i for i, line in enumerate(export) if line.startswith("exp ")):] = [
+            f"exp mrt0 {registers} done vm", "s_endpgm"]
+        expect_value_error(translate_f16, export, "Unsupported export")
+
+
 def check_controls(directory):
     check_masked_controls()
     check_title_load_controls()
@@ -9341,9 +9721,9 @@ def check_controls(directory):
     for expected in ("= ceil(alu", "= round(alu", "= round(params[1].x);", "= ceil((-params[1].y));"):
         assert expected in source, expected
     # Neighbouring forms: other widths, output modifiers, a second source and the IEEE-flag reciprocal.
-    for old, new in (("v_ceil_f32_e32 v12, v18", "v_ceil_f16_e32 v12, v18"),
+    for old, new in (("v_ceil_f32_e32 v12, v18", "v_fract_f16_e32 v12, v18"),
                      ("v_ceil_f32_e32 v12, v18", "v_ceil_f64_e32 v[12:13], v[18:19]"),
-                     ("v_rndne_f32_e32 v13, v19", "v_rndne_f16_e32 v13, v19"),
+                     ("v_rndne_f32_e32 v13, v19", "v_rcp_f16_e32 v13, v19"),
                      ("v_rndne_f32_e32 v13, v19", "v_rndne_f32_e32 v13, v19, v18"),
                      ("v_rndne_f32_e64 v14, s45", "v_rndne_f32_e64 v14, s45 mul:2"),
                      ("v_ceil_f32_e64 v15, -s46", "v_ceil_f32_e64 v15, -s46 div:2"),
@@ -10195,6 +10575,7 @@ def check_controls(directory):
     check_int16_vop3_controls()
     check_int16_ternary_controls()
     check_f16_arith_controls()
+    check_f16_round_controls()
 
 
 def check_program_extent(directory, library):
@@ -10244,9 +10625,46 @@ def check_f16_literal_fold(directory, assembler, objcopy, library):
         "v_add_f16_e32 v5, 0, v3", "v_add_f16_e32 v6, 1.0, v3"]
 
 
+def check_f16_round_binary(directory, assembler, objcopy, library):
+    """LLVM 15 gfx1013 encodings of the binary16 VOP1 rounding forms, the integer folding of a 16-bit literal, and the
+    clamp, omod and modifier spellings that assemble on e64 and that the lowering must refuse."""
+    source, obj, binary = directory / "round.s", directory / "round.o", directory / "round.bin"
+
+    def assemble(line):
+        source.write_text(line + chr(10) + "s_endpgm" + chr(10), encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", source, "-o", obj], check=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+        code = binary.read_bytes()
+        return code[:-4], disassemble(code, library)[0]
+
+    for line, encoded, text in (
+            ("v_floor_f16_e32 v1, v2", "02b7027e", "v_floor_f16_e32 v1, v2"),
+            ("v_ceil_f16_e64 v1, v2", "0100dcd502010000", "v_ceil_f16_e64 v1, v2"),
+            ("v_trunc_f16_e32 v1, 1.0", "f2ba027e", "v_trunc_f16_e32 v1, 1.0"),
+            ("v_rndne_f16_e32 v1, v2", "02bd027e", "v_rndne_f16_e32 v1, v2"),
+            ("v_ceil_f16_e32 v1, 0x3555", "ffb8027e55350000", "v_ceil_f16_e32 v1, 0x3555"),
+            ("v_floor_f16 v1, 0x0001", "81b6027e", "v_floor_f16_e32 v1, 1"),  # a literal that folds to an integer
+            ("v_floor_f16_e64 v1, v2 clamp", "0180dbd502010000", "v_floor_f16_e64 v1, v2 clamp"),
+            ("v_trunc_f16_e64 v1, v2 mul:2", "0100ddd502010008", "v_trunc_f16_e64 v1, v2 mul:2"),
+            ("v_rndne_f16_e64 v1, -v2", "0100ded502010020", "v_rndne_f16_e64 v1, -v2")):
+        code, decoded = assemble(line)
+        assert (code.hex(), decoded) == (encoded, text), (line, code.hex(), decoded)
+    # The decoded clamp, omod and modifier spellings are refused, and so is an integer-folded literal (the proof of
+    # the VOP2 arithmetic refuses integer inline constants other than 0).
+    body = ["v_mov_b32_e32 v18, 0x35553c00"]
+    for text in ("v_floor_f16_e64 v1, v2 clamp", "v_trunc_f16_e64 v1, v2 mul:2"):
+        expect_value_error(translate_f16, uncompressed_export([*body, text.replace("v1, v2", "v24, v18")]),
+                           "Unsupported instruction")
+    expect_value_error(translate_f16, uncompressed_export([*body, "v_rndne_f16_e64 v24, -v18"]),
+                       "Unsupported binary16 source modifier -v18")
+    expect_value_error(translate_f16, uncompressed_export([*body, "v_floor_f16_e32 v24, 1"]),
+                       "Unsupported binary16 integer inline constant 1")
+
+
 def check_binary(directory, assembler, objcopy, library):
     check_program_extent(directory, library)
     check_f16_literal_fold(directory, assembler, objcopy, library)
+    check_f16_round_binary(directory, assembler, objcopy, library)
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (with_three_constant_buffers(), translate_three_buffers),
@@ -10270,6 +10688,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((int16_vop3_ops(group), translate_int) for group in range(4))
     fixtures.extend((int16_ternary_ops(group), translate_int) for group in range(5))
     fixtures.extend((f16_arith_program(*key), translate_f16) for key in F16_ARITH_PROGRAMS)
+    fixtures.extend((f16_round_program(*key), translate_f16) for key in F16_ROUND_PROGRAMS)
     fixtures.extend((scalar_bitset64(op, str(index)), translate_int)
                     for op in SCALAR_BITSET64_OPS for index in (0, 31, 32, 63, 64))
     fixtures.append((scalar_select64(), translate_int))
@@ -14311,6 +14730,54 @@ def check_f16_arith_draw(directory, compiler, renderer, backend):
     expect_value_error(translate_f16, refused, "Reads the undefined high half of a 16-bit result")
 
 
+def check_f16_round_draw(directory, compiler, renderer, backend):
+    """The four binary16 rounding ops against the Python reference: 42 baked values (signed zeros, negatives that round
+    to -0, halfway cases, +-65504, subnormals, values at and above 1024), every accepted reader and two chains, all
+    through the lossless R32G32B32A32_UINT readback. Then a binary32 -denorm ftz build of the programs with subnormal
+    operands, which must still pass, and five deviations of the lowering that must each mismatch (one batch per
+    mutation; the statuses are printed).
+
+    Only the zero-extended low half of each result is observed. Whether hardware keeps or zeroes the destination's
+    high half is not measured here; a source read from bits 31:16 is the high-half control.
+    """
+    check_f16_round_mutation_coverage()
+    source = directory / "f16_round.hlsl"
+    shader = directory / "f16_round.cso"
+    constants = bytes(256)
+
+    def build(text, mode=F32_DENORM_MODE):
+        source.write_text(text, encoding="ascii")
+        compile_shader(compiler, source, shader, mode=mode)
+
+    def case(kind, index, tag):
+        path = directory / f"f16_round-{tag}-{kind}-{index}.case"
+        write_case(path, constants, tuple(as_float(word) for word in f16_round_expected(kind, index)), integer_rt=True)
+        return path
+
+    programs = {key: f16_round_program(*key) for key in F16_ROUND_PROGRAMS}
+    for key in F16_ROUND_PROGRAMS:
+        build(translate_f16(programs[key]))
+        run_pixel_batch(renderer, backend, shader, [(case(*key, "ref"), "pass")])
+    # Binary32 flushing cannot reach binary16 values: every widened half is a binary32 normal.
+    subnormal = [key for key in F16_ROUND_PROGRAMS if any(
+        half & 0x7c00 == 0 and half & 0x3ff for half in f16_round_source_halves(*key))]
+    assert subnormal and len(subnormal) < len(F16_ROUND_PROGRAMS), subnormal
+    for key in subnormal:
+        build(translate_f16(programs[key]), mode="ftz")
+        run_pixel_batch(renderer, backend, shader, [(case(*key, "ftz"), "pass")])
+    for mutation in F16_ROUND_MUTATIONS:
+        key = f16_round_detecting_program(mutation)
+        build(f16_round_mutated(mutation, programs[key]))
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, [case(*key, "mut")])
+        print(f"f16_round mutation {mutation}: program {key} statuses {statuses}")
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {mutation} escaped detection")
+    # A widening that selects WORD_1 reads the undefined high half and must be refused at lowering.
+    refused = [line.replace("src0_sel:WORD_0", "src0_sel:WORD_1") for line in programs["reader", 0]]
+    assert refused != programs["reader", 0]
+    expect_value_error(translate_f16, refused, "Reads the undefined high half of a 16-bit result")
+
+
 def check_e64_render(directory, compiler, renderer, backend):
     """The e64 draw cases on their own, so they run as a separate CTest entry per backend. A renderer that reports an
     unavailable adapter (exit 77) makes this a skip, as for the other pixel draws."""
@@ -14349,7 +14816,7 @@ def main():
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64",
-                    "draw-f16-arith", "draw-flat-scratch"):
+                    "draw-f16-arith", "draw-f16-round", "draw-flat-scratch"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -14370,6 +14837,7 @@ def main():
                         "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-int16-ternary": check_int16_ternary_draw,
                         "draw-f16-arith": check_f16_arith_draw,
+                        "draw-f16-round": check_f16_round_draw,
                         "draw-compressed-export": check_compressed_export_draw,
                         "draw-uncompressed-export": check_uncompressed_export_draw,
                         "draw-title-loads": check_title_load_draws,
