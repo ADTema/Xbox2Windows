@@ -108,6 +108,33 @@ cmake --build --preset dev --target cpu_crc_line_lifted cpu_crc_castagnoli_lifte
 ctest --preset dev --no-tests=error -R '^cpu_native_crc_line$' -V
 ```
 
+### Converting an EXE with one command
+
+[`tools/exe_aot.py`](../tools/exe_aot.py) converts one PE32+ x64 EXE into a recompiled Windows EXE, or stops and reports why it cannot. It runs four stages in order. **header** requires an AMD64 PE32+ executable image. **imports** picks the profile that leaves the fewest imports unbound and lists every unbound import. **translate** runs that profile's translator and records the first refused RVA from the lifter message. **build** compiles the generated C++ with `cl /O2 /MT`. The only profile so far is `console-stdio`, which is the [console translator](../tools/cpu_stdio_exe_aot.py) with its `getchar`, `putchar` and `fflush` bindings. A program outside that profile is refused at a named stage, not partly converted. Each run writes `report.json` with the input SHA-256, the import list, the profile and either the generated paths or the refusal. Before each run the tool removes stale `<stem>_aot.*` outputs, so a refusal never leaves an EXE from an earlier conversion.
+
+```powershell
+.\tools\dev.ps1
+.\out\pe-env\Scripts\python.exe -B tools\exe_aot.py out\build\dev\cpu_crc_line.exe out\convert --entry-export native_entry
+```
+
+`cpu_exe_aot_convert` runs the tool at test time on both CRC programs. The generated C++ must equal the console translator's output byte for byte. The EXE must embed the input SHA-256 and must not import `cpu_exe_io.dll`. It must match the native EXE's stdout and exit status for a line, a final line without a newline, an empty line and EOF. The standard and Castagnoli programs print `CBF43926\r\n` and `E3069283\r\n` respectively. Six negative controls must exit 1, name the expected stage and leave no `_aot` EXE:
+
+| Input | Stage | Reported |
+|---|---|---|
+| `cpu_exe_original` with its fixture trace imports | imports | `cpu_exe_io.dll!emit_trace`, `read_selector` and `cpu_import_provider.dll!mix_args` |
+| `cpu_crc_line` lifted from the PE entry instead of `native_entry` | imports | `cpu_exe_io.dll!finish_exe` from the startup wrapper |
+| `cpu_exe_io.dll` | header | not an executable image |
+| A text file named `.exe` | header | not a PE image |
+| `cpu_crc_line` with `xor esi, esi` patched to `cpuid` | translate | the patched RVA, `0x103b` with MSVC 19.51. It also removes the EXE left by an earlier successful conversion in the same directory |
+| A compiler path that does not exist | build | The C++ is kept and no EXE is written |
+
+On Windows 11 build 26300 with MSVC 19.51 (Visual Studio 18), the test passed in the `dev` build. A passing conversion means the program fits the `console-stdio` profile. It says nothing about programs with other imports, TLS, delay imports or unsupported instructions.
+
+```powershell
+cmake --build --preset dev --target cpu_crc_line cpu_crc_castagnoli cpu_exe_original cpu_exe_io
+ctest --preset dev --no-tests=error -R '^cpu_exe_aot_convert$' -V
+```
+
 ## EXE startup through the desktop runtime shims
 
 The source-built `cpu_shim_startup` EXE calls a companion DLL that links
