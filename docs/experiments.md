@@ -1386,7 +1386,7 @@ The four x87 fixtures reported in [#592](https://github.com/R0Y00/Xbox2Windows/p
 | `cpu_aot_x87_iarith` | 28,513 | 16 | 6 |
 | `cpu_aot_x87_fnstcw` | 1,776 | 6 | 4 |
 
-The native and recompiled DLLs matched the reference for the output blocks and guards in all 55,808 cases. Every checked export returned with control word `0x027F` and an empty x87 stack. CTest reported four passes and no skips.
+The native and recompiled DLLs matched the reference for the output blocks and guards in all 55,809 cases. Every checked export returned with control word `0x027F` and an empty x87 stack. CTest reported four passes and no skips.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_aot_x87_(compare|fcmov|iarith|fnstcw)$' -V
