@@ -6918,6 +6918,113 @@ CARRY_OUT_WRONG = {
         (2, 1, lambda a, b, c, d: c, "borrow dropped"),
     ),
 }
+# v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32: the carry-out add and subtracts above, plus the carry or
+# borrow of each lane read from a lane mask. Bodies for uncompressed_export(): A, B, C and D are the constants in
+# s44 to s47, v18 = B and v19 = D. The carry-out form of the same operation leaves the carry of op(A, B) in vcc_lo
+# and that of op(A, D) in s60; its results in v16 and v17 are not exported. v12 = op(C, D, vcc_lo) in the VOP2
+# (e32) encoding, whose masks are always VCC, and v14 = op(D, C, s60) in the VOP3 (e64) encoding with its carry-out
+# in s61. v13 and v15 are 1.0 where the carry-out is set and 0.5 where it is clear. 2.0 (0x40000000) is then added
+# to v12 and v14: a bijection modulo 2^32, so no bit is lost, and it moves the all-ones word that a borrow taken
+# only from the borrow-in gives (C = D) to a normal number.
+CARRY_IN_OPS = ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32")
+_CARRY_IN_OFFSET = 0x40000000
+_CARRY_IN_SELECT = (0x3F000000, 0x3F800000)
+
+
+def carry_in_group(op):
+    base = op.replace("_co_ci_", "_co_")
+    return ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v19, s47",
+            f"{base} v16, vcc_lo, s44, v18", f"{base} v17, s60, s44, v19",
+            f"{op}_e32 v12, vcc_lo, s46, v19, vcc_lo", f"{op}_e64 v14, s61, v19, s46, s60",
+            "v_cndmask_b32_e64 v13, 0.5, 1.0, vcc_lo", "v_cndmask_b32_e64 v15, 0.5, 1.0, s61",
+            "v_add_nc_u32_e32 v12, 2.0, v12", "v_add_nc_u32_e32 v14, 2.0, v14"]
+
+
+def _carry_in(op, src0, src1, carry):
+    """The 32-bit result and the carry-out, from unbounded integers: op(src0, src1) plus or minus the carry-in."""
+    wide = {"v_add_co_ci_u32": src0 + src1 + carry, "v_sub_co_ci_u32": src0 - src1 - carry,
+            "v_subrev_co_ci_u32": src1 - src0 - carry}[op]
+    return wide & 0xffffffff, not 0 <= wide <= 0xffffffff
+
+
+def carry_in_masks(op, a, b, c, d):
+    """The carry-in of each channel: the carry-out of op(A, B) in vcc_lo and of op(A, D) in s60."""
+    base = op.replace("_co_ci_", "_co_")
+    return _carry_out(base, a, b)[1], _carry_out(base, a, d)[1]
+
+
+def carry_in_words(op, a, b, c, d):
+    first_in, second_in = carry_in_masks(op, a, b, c, d)
+    first, first_carry = _carry_in(op, c, d, first_in)
+    second, second_carry = _carry_in(op, d, c, second_in)
+    low, high = _CARRY_IN_SELECT
+    return ((first + _CARRY_IN_OFFSET) & 0xffffffff, high if first_carry else low,
+            (second + _CARRY_IN_OFFSET) & 0xffffffff, high if second_carry else low)
+
+
+# (A, B, C, D) as binary32 words; the inputs, every result before and after the offset (except the all-ones word
+# of a borrow taken only from the borrow-in) and every exported word are normal numbers or zero (asserted at the
+# draw). Row 0 sets both carry-ins and makes the carry-out of both channels come from the carry-in alone (C + D
+# is 0xffffffff, or C = D). Row 1 clears both carry-ins and carries or borrows from the operands. Rows 2 and 3 set
+# only one carry-in, vcc_lo in row 2 and s60 in row 3, so a carry-in read from the other mask changes a word.
+CARRY_IN_ROWS = {
+    "v_add_co_ci_u32": ((0xC0000000, 0x40000000, 0x7F7FFFFF, 0x80800000),
+                        (0x7F7FFFFF, 0x3F000000, 0xC1700000, 0x40D10000),
+                        (0x3F800000, 0xC1700000, 0x40000000, 0x40D10000),
+                        (0x7F7FFFFF, 0x01000000, 0x00800000, 0xC0250000)),
+    "v_sub_co_ci_u32": ((0x01000000, 0x7F000000, 0x3F800000, 0x3F800000),
+                        (0x7F7FFFFF, 0x3F800024, 0x3F800000, 0x40D10000),
+                        (0x3F800024, 0x80000000, 0x40800000, 0x3F800000),
+                        (0x3F800000, 0x3F800000, 0x3F800000, 0x7F000000)),
+    "v_subrev_co_ci_u32": ((0x7F7FFFFF, 0x40000000, 0x00800000, 0x00800000),
+                           (0x01000000, 0xBF620000, 0xC0000000, 0x80000000),
+                           (0x7F000000, 0x3F800024, 0x7F7FFFFF, 0xC0000000),
+                           (0x3F800000, 0x3F800000, 0x3F800000, 0x01000000)),
+}
+
+
+def _offset(word):
+    return (word + _CARRY_IN_OFFSET) & 0xffffffff
+
+
+# Negative controls by operation: (row, channel, word a wrong lowering would give, what went wrong). Each must
+# report a mismatch. Channels 1 and 3 give the word for a carry-out that is clear (0.5) or set (1.0).
+_CLEAR, _SET = _CARRY_IN_SELECT
+CARRY_IN_WRONG = {
+    "v_add_co_ci_u32": (
+        (0, 0, lambda a, b, c, d: _offset(c + d), "carry-in dropped from the sum"),
+        (0, 1, lambda a, b, c, d: _CLEAR, "carry-out without the carry-in term"),
+        (0, 3, lambda a, b, c, d: _CLEAR, "carry-out without the carry-in term on the SGPR masks"),
+        (1, 1, lambda a, b, c, d: _CLEAR, "carry-out of the operands dropped"),
+        (1, 0, lambda a, b, c, d: _offset(c + d + 1), "carry-in read as set"),
+        (2, 0, lambda a, b, c, d: _offset(c - d - 1), "subtract for add"),
+        (2, 2, lambda a, b, c, d: _offset(d + c + 1), "carry-in of the e64 form read from vcc_lo"),
+        (3, 0, lambda a, b, c, d: _offset(c + d + 1), "carry-in of the e32 form read from s60"),
+        (3, 2, lambda a, b, c, d: _offset(d + c), "carry-in of the e64 form dropped"),
+    ),
+    "v_sub_co_ci_u32": (
+        (0, 0, lambda a, b, c, d: _offset(c - d), "borrow-in dropped"),
+        (0, 1, lambda a, b, c, d: _CLEAR, "borrow-out without the borrow-in term"),
+        (0, 3, lambda a, b, c, d: _CLEAR, "borrow-out without the borrow-in term on the SGPR masks"),
+        (1, 1, lambda a, b, c, d: _CLEAR, "borrow-out of the operands dropped"),
+        (2, 0, lambda a, b, c, d: _offset(d - c - 1), "operands reversed"),
+        (2, 0, lambda a, b, c, d: _offset(c + d + 1), "add for subtract"),
+        (2, 0, lambda a, b, c, d: _offset(c - d + 1), "borrow-in added"),
+        (2, 2, lambda a, b, c, d: _offset(d - c - 1), "borrow-in of the e64 form read from vcc_lo"),
+        (3, 0, lambda a, b, c, d: _offset(c - d - 1), "borrow-in of the e32 form read from s60"),
+        (3, 3, lambda a, b, c, d: _SET, "borrow-out of the reversed operands"),
+    ),
+    "v_subrev_co_ci_u32": (
+        (0, 0, lambda a, b, c, d: _offset(d - c), "borrow-in dropped"),
+        (0, 1, lambda a, b, c, d: _CLEAR, "borrow-out without the borrow-in term"),
+        (0, 3, lambda a, b, c, d: _CLEAR, "borrow-out without the borrow-in term on the SGPR masks"),
+        (1, 1, lambda a, b, c, d: _CLEAR, "borrow-out of the operands dropped"),
+        (2, 0, lambda a, b, c, d: _offset(c - d - 1), "subtract for reverse subtract"),
+        (2, 2, lambda a, b, c, d: _offset(c - d - 1), "borrow-in of the e64 form read from vcc_lo"),
+        (3, 0, lambda a, b, c, d: _offset(d - c - 1), "borrow-in of the e32 form read from s60"),
+        (3, 3, lambda a, b, c, d: _SET, "borrow-out of the unreversed subtract"),
+    ),
+}
 # Sums of absolute differences (v_sad_hi_u8, v_sad_u32, v_msad_u8). Bodies for uncompressed_export(): s44 = A,
 # s45 = B and s46 = C from the constants, v18 = B, and each channel v12..v15 holds its own result. The second
 # source is the reference of v_msad_u8, here once a register and once a literal whose byte 2 is zero. No
@@ -7509,6 +7616,73 @@ def check_carry_out_lowering():
     assert f"    precise float alu23 = cmp22 ? asfloat(params[1].z) : {c};" in replaced, replaced
     sources = {op: translate_int(uncompressed_export(carry_out_group(op))) for op in CARRY_OUT_OPS}
     assert len(set(sources.values())) == 3
+
+
+def check_carry_in_lowering():
+    """Static checks for v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32 as written by carry_in_group()."""
+    # v18 and v19 are written by the movs at 20 and 21, the carry-out forms at 22 (vcc_lo) and 23 (s60) write the
+    # carry-ins, the e32 form is 24, the e64 form 25 and the selects 26 and 27.
+    c, d = "params[1].y", "asuint(alu21)"
+    expected = {
+        "v_add_co_ci_u32": (f"{c} + {d}", f"{d} + {c}", "cp{0} + ci{0}", "cp{0} < {1} || co{0} < cp{0}"),
+        "v_sub_co_ci_u32": (f"{c} - {d}", f"{d} - {c}", "cp{0} - ci{0}", "{2} > {1} || ci{0} > cp{0}"),
+        "v_subrev_co_ci_u32": (f"{d} - {c}", f"{c} - {d}", "cp{0} - ci{0}", "{1} > {2} || ci{0} > cp{0}"),
+    }
+    assert set(expected) == set(CARRY_IN_OPS) == set(CARRY_IN_ROWS) == set(CARRY_IN_WRONG)
+    for op, (first, second, result, carry) in expected.items():
+        program = uncompressed_export(carry_in_group(op))
+        assert program.index("v_mov_b32_e32 v18, s45") == 20, op
+        source = translate_int(program).splitlines()
+        for index, partial, cin, src0, src1 in ((24, first, "cmp22", c, d), (25, second, "cmp23", d, c)):
+            for statement in (f"    uint ci{index} = {cin} ? 1u : 0u;", f"    uint cp{index} = {partial};",
+                              f"    uint co{index} = {result.format(index)};",
+                              f"    bool cmp{index} = {carry.format(index, src0, src1)};",
+                              f"    precise float alu{index} = asfloat(co{index});"):
+                assert statement in source, (op, statement)
+        assert any(line.startswith("    precise float alu26 = cmp24 ?") for line in source), (op, source)
+        assert any(line.startswith("    precise float alu27 = cmp25 ?") for line in source), (op, source)
+    carry_in_mnemonics = {f"{op}_{encoding}" for op in CARRY_IN_OPS for encoding in ("e32", "e64")}
+    assert carry_in_mnemonics <= ACCEPTED, carry_in_mnemonics - ACCEPTED
+    sources = {op: translate_int(uncompressed_export(carry_in_group(op))) for op in CARRY_IN_OPS}
+    assert len(set(sources.values())) == 3
+    # The e32 form takes vcc or vcc_lo for both masks and a VGPR as src1, which is all its encoding has room for.
+    # The e64 form takes vcc, vcc_lo, one SGPR or an SGPR pair for each mask, both of the same width. Both sources
+    # take a register, an inline constant or a literal. The carry-in must be a lane mask the translator tracks.
+    setup = ["v_mov_b32_e32 v18, s45", "v_add_co_u32 v16, vcc_lo, s44, v18", "v_add_co_u32 v17, s60, s44, v18",
+             "v_add_co_u32 v20, s[62:63], s44, v18"]
+    for op in CARRY_IN_OPS:
+        for good in (f"{op}_e32 v12, vcc_lo, s44, v18, vcc_lo", f"{op}_e32 v12, vcc, v18, v18, vcc",
+                     f"{op}_e32 v12, vcc_lo, 0x12345678, v18, vcc_lo", f"{op}_e32 v12, vcc_lo, -16, v18, vcc_lo",
+                     f"{op}_e64 v12, s61, v18, s44, s60", f"{op}_e64 v12, s60, 64, v18, s60",
+                     f"{op}_e64 v12, vcc_lo, s44, v18, vcc_lo", f"{op}_e64 v12, s[64:65], s44, v18, s[62:63]",
+                     f"{op}_e64 v12, vcc_lo, v18, 0x12345678, s60", f"{op}_e64 v12, s61, 2.0, v18, vcc_lo"):
+            translate_int(uncompressed_export([*setup, good]))
+        for bad in (f"{op} v12, vcc_lo, s44, v18, vcc_lo", f"{op}_e32 v12, vcc_lo, v18, s44, vcc_lo",
+                    f"{op}_e32 v12, s61, s44, v18, vcc_lo", f"{op}_e32 v12, vcc_lo, s44, v18, s60",
+                    f"{op}_e64 v12, s61, v18, s44, s60 clamp", f"{op}_e64 v12, s61, -v18, s44, s60",
+                    f"{op}_e64 v12, s61, v18, |s44|, s60", f"{op}_e64 v12, exec_lo, v18, s44, s60",
+                    f"{op}_e64 v12, s61, v18, s44, exec_lo", f"{op}_e64 v12, v13, v18, s44, s60",
+                    f"{op}_e64 v12, s61, v18, s44, v13", f"{op}_e64 v12, s61, v18, s44",
+                    f"{op}_e64 v12, s61, v18, s44, s60, s60", f"{op}_e64 v12, s61, v18, v106, s60",
+                    f"{op}_e64 v12, s[64:65], v18, s44, s60", f"{op}_e64 v12, s61, v18, s44, s[62:63]",
+                    f"{op}_e64 v12, s61, v18, s44, s58", f"{op}_e64 v12, s61, v18, s44, s61",
+                    f"{op}_dpp v12, vcc_lo, v18, v18, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                    f"{op}_sdwa v12, vcc_lo, v18, v18, vcc_lo dst_sel:DWORD dst_unused:UNUSED_PAD "
+                    "src0_sel:DWORD src1_sel:DWORD"):
+            must_reject(translate_int, uncompressed_export([*setup, bad]))
+    # A carry-in that is no lane mask at all: vcc before anything writes it, and an SGPR holding a constant.
+    for op in CARRY_IN_OPS:
+        must_reject(translate_int, uncompressed_export(
+            ["v_mov_b32_e32 v18, s45", f"{op}_e32 v12, vcc_lo, s44, v18, vcc_lo"]))
+        must_reject(translate_int, uncompressed_export(
+            ["v_mov_b32_e32 v18, s45", f"{op}_e64 v12, s61, v18, s44, s46"]))
+    # The carry-out replaces the mask it writes: a select on that mask reads the new carry, and a later carry-in
+    # from the same register reads it too.
+    chained = translate_int(uncompressed_export(
+        [*setup, "v_add_co_ci_u32_e32 v12, vcc_lo, s44, v18, vcc_lo", "v_add_co_ci_u32_e32 v13, vcc_lo, s44, v18, vcc_lo",
+         "v_cndmask_b32_e64 v14, s46, s47, vcc_lo"])).splitlines()
+    assert "    uint ci25 = cmp24 ? 1u : 0u;" in chained, chained
+    assert any(line.startswith("    precise float alu26 = cmp25 ?") for line in chained), chained
 
 
 def check_sad_lowering():
@@ -8665,6 +8839,7 @@ def check_controls(directory):
     check_nc_integer_lowering()
     check_e64_integer_lowering()
     check_carry_out_lowering()
+    check_carry_in_lowering()
     check_sdwa_integer_lowering()
     check_pack_int16_lowering()
     check_sad_lowering()
@@ -10158,6 +10333,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(f16_compares()), translate_int))
     fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
     fixtures.extend((uncompressed_export(carry_out_group(op)), translate_int) for op in CARRY_OUT_OPS)
+    fixtures.extend((uncompressed_export(carry_in_group(op)), translate_int) for op in CARRY_IN_OPS)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
     fixtures.extend((uncompressed_export(sad_group(group)), translate_int) for group in SAD_BODIES)
@@ -10827,6 +11003,61 @@ def check_carry_out_draws(directory, compiler, renderer, backend):
         for channel in (1, 3):
             assert {words[channel] for words in right} == set(_CARRY_SELECT), (op, channel)
         for index, channel, wrong, reason in CARRY_OUT_WRONG[op]:
+            wrong_words = list(right[index])
+            wrong_words[channel] = wrong(*rows[index]) & 0xffffffff
+            assert wrong_words[channel] != right[index][channel], (op, reason)
+            add_case(cases, rows[index], wrong_words, "mismatch")
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+def check_carry_in_draws(directory, compiler, renderer, backend):
+    """Draw v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32 through the integer readback target.
+
+    Each program of carry_in_group() is compiled once and drawn in one renderer batch: every row of
+    CARRY_IN_ROWS with the right words, then one draw per CARRY_IN_WRONG entry with one channel of its row
+    replaced by the word a wrong lowering would give, which must report a mismatch. The carry-out is observed
+    through v_cndmask_b32. On a desktop GPU the draws establish that the translated shader computes the stated
+    operation, not what the console does.
+    """
+    source = directory / "carry_in.hlsl"
+    shader = directory / "carry_in.cso"
+
+    def add_case(cases, row, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *row)
+        case = directory / f"carry_in-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+
+    for op in CARRY_IN_OPS:
+        source.write_text(translate_int(uncompressed_export(carry_in_group(op))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        rows = CARRY_IN_ROWS[op]
+        right = [carry_in_words(op, *row) for row in rows]
+        cases = []
+        for row, words in zip(rows, right):
+            first_in, second_in = carry_in_masks(op, *row)
+            raw = (_carry_in(op, row[2], row[3], first_in)[0], _carry_in(op, row[3], row[2], second_in)[0])
+            # Integer export carries any pattern, but normal words keep the draw independent of NaN and denormal
+            # handling. The only other word is the all-ones result of a borrow taken from the borrow-in alone.
+            assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (op, [hex(w) for w in (*row, *words)])
+            assert all(binary32_normal_or_zero(word) or word == 0xffffffff for word in raw), (op, [hex(w) for w in raw])
+            add_case(cases, row, words, "pass")
+        # Each carry-in mask is set and clear on some row, and so is each carry-out, so a constant mask cannot pass.
+        assert {carry_in_masks(op, *row) for row in rows} >= {(True, True), (False, False), (True, False), (False, True)}, op
+        for channel in (1, 3):
+            assert {words[channel] for words in right} == set(_CARRY_IN_SELECT), (op, channel)
+        # Row 0 carries or borrows only because of the carry-in, on both channels.
+        c, d = rows[0][2], rows[0][3]
+        assert not _carry_in(op, c, d, 0)[1] and not _carry_in(op, d, c, 0)[1], op
+        assert right[0][1] == right[0][3] == _CARRY_IN_SELECT[1], op
+        for index, channel, wrong, reason in CARRY_IN_WRONG[op]:
             wrong_words = list(right[index])
             wrong_words[channel] = wrong(*rows[index]) & 0xffffffff
             assert wrong_words[channel] != right[index][channel], (op, reason)
@@ -13717,7 +13948,7 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-carry-out", "draw-pack-int16", "draw-sad",
+                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64", "draw-f16-arith"):
             try:
@@ -13726,6 +13957,7 @@ def main():
                         "draw-integer-nc": check_integer_nc_draws,
                         "draw-e64-integer": check_e64_integer_draws,
                         "draw-carry-out": check_carry_out_draws,
+                        "draw-carry-in": check_carry_in_draws,
                         "draw-sdwa-integer": check_sdwa_integer_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-brev": check_brev_draw,

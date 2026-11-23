@@ -2896,10 +2896,36 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_add_co_u32 v1, vcc, v2, v3 clamp",
             "v_sub_co_u32 v1, vcc, -v2, v3",
             "v_add_co_u32 v1, vcc, v2",
-            "v_add_co_ci_u32_e64 v1, vcc, v2, v3, vcc",
+            "v_add_co_ci_u32_e64 v1, vcc, v2, v3, vcc, vcc",
         ):
             self.assertFalse(is_instruction_supported(line), line)
         for opcode in ("v_add_co_u32", "v_sub_co_u32", "v_subrev_co_u32"):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
+        for line in (
+            "v_add_co_ci_u32_e32 v1, vcc_lo, s2, v3, vcc_lo",
+            "v_sub_co_ci_u32_e32 v1, vcc, 0x12345678, v3, vcc",
+            "v_subrev_co_ci_u32_e32 v1, vcc_lo, -16, v3, vcc_lo",
+            "v_add_co_ci_u32_e64 v1, vcc, v2, v3, vcc",
+            "v_sub_co_ci_u32_e64 v1, s5, s2, 7, s6",
+            "v_subrev_co_ci_u32_e64 v1, s[4:5], v2, 2.0, s[6:7]",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_add_co_ci_u32 v1, vcc_lo, v2, v3, vcc_lo",
+            "v_add_co_ci_u32_e32 v1, vcc_lo, v2, s3, vcc_lo",
+            "v_sub_co_ci_u32_e32 v1, s5, v2, v3, vcc_lo",
+            "v_subrev_co_ci_u32_e32 v1, vcc_lo, v2, v3, s6",
+            "v_add_co_ci_u32_e64 v1, s5, v2, v3, s6 clamp",
+            "v_sub_co_ci_u32_e64 v1, s5, -v2, v3, s6",
+            "v_subrev_co_ci_u32_e64 v1, exec_lo, v2, v3, s6",
+            "v_add_co_ci_u32_e64 v1, s5, v2, v3, v6",
+            "v_add_co_ci_u32_e64 v1, s5, v2, v3",
+            "v_add_co_ci_u32_dpp v1, vcc_lo, v2, v3, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+            "v_add_co_ci_u32_sdwa v1, vcc_lo, v2, v3, vcc_lo dst_sel:DWORD dst_unused:UNUSED_PAD "
+            "src0_sel:DWORD src1_sel:DWORD",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
         for line in (
             "v_cvt_pk_u16_u32 v1, v2, v3",
