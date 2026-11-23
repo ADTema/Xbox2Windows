@@ -511,6 +511,8 @@ def is_instruction_supported(instruction_line: str) -> bool:
         return True
     if clean.startswith("v_cmp_") and re.search(r"_[iu]64(?:_e32|_e64)?\s", clean):
         return supports_int64_compare(clean)
+    if re.match(r"v_cmp_\w+_f32_sdwa\s", clean) and re.search(r"\bneg\(-?\d+\)", clean):
+        return False
     if not any(pattern.match(clean) for pattern in COMPILED_SUPPORTED_PATTERNS):
         return False
     if wait := re.fullmatch(r"s_waitcnt\s+(.*)", clean):
