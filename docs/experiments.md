@@ -518,6 +518,13 @@ The host contract supplies a read-only raw SRV at `t0, space1` containing the or
 
 The [source-built compute shader](../tests/spirv_window/subtract.spvasm) reads two distinct addresses, subtracts their words and writes to a third. Windows checks all 16 words of the arena, including guards, for eight cases. Swapping the two reads reverses the result; moving the store changes which guard is replaced. High addresses, misalignment, 64-bit index overflow and a write past the actual descriptor exercise the window bounds.
 
+The GPU fixture targets `cs_6_0` and requires `Int64ShaderOps`. On Windows 10
+22H2 build 19045.6456, the GTX 1060 (32.0.15.6094), in-box WARP (10.0.19041.5794)
+and app-local WARP (1.0.22) matched all 128 words across the eight cases in
+Debug and Release with zero D3D12 warnings and errors. The original `cs_6_6`
+fixture skipped on both in-box adapters and passed the same cases on app-local
+WARP.
+
 The SPIR-V bridge GPU tests (`spirv_{address_window,sampler_views,ballot_extract,compaction,compare_sampler}_{hardware,warp}`)
 need `spirv-as`, `spirv-val` and `spirv-cross`. `tools/setup-spirv-tools.ps1` builds them from pinned
 SPIRV-Tools, SPIRV-Headers and SPIRV-Cross revisions into `out/tools/spirv/bin`, where CMake looks
@@ -533,7 +540,7 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^spirv_address_window_' -V
 ```
 
-With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. This also validates a combined fixture where a lowered ballot bit controls the value stored through the address window. The adapter reserves `%x2w_` identifiers in the input and gives address and ballot temporaries separate prefixes. The GPU check can also use WSL tools: generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 66 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_6 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
+With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. This also validates a combined fixture where a lowered ballot bit controls the value stored through the address window. The adapter reserves `%x2w_` identifiers in the input and gives address and ballot temporaries separate prefixes. To use WSL tools for the GPU check, generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 60 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_0 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
 
 ### SPIR-V subgroup compaction across lane widths
 
