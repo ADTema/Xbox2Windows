@@ -30,6 +30,9 @@ SOPC_OPS = (
 SOP2_LSHL_ADD_OPS = (
     "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
 )
+SOP2_ABSDIFF_OPS = (
+    "s_absdiff_i32",
+)
 VOP2_INT_OPS = (
     "v_lshrrev_b32_e32", "v_ashrrev_i32_e32", "v_lshlrev_b32_e32",
     "v_and_b32_e32", "v_or_b32_e32", "v_xor_b32_e32",
@@ -3196,7 +3199,7 @@ def check_scalar_controls():
     first = "s_add_u32 s62, s44, s45"
     for subtract in (False, True):
         must_reject(translate_int, scalar_carry_chain(subtract, initialize_scc=False))
-    for new in ("s_absdiff_i32 s62, s44, s45",
+    for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45",
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
                 "s_bfe_u32 s62, v12, s45", "s_lshl5_add_u32 s62, s44, s45",
                 "s_bitreplicate_b64_b32 s[62:63], v12", "s_bitset0_b64 s[62:63], s44",
@@ -5014,6 +5017,17 @@ def sop2_lshl_add_group() -> list[str]:
     ])
 
 
+def sop2_absdiff_group() -> list[str]:
+    return with_constants([
+        "s_absdiff_i32 s60, s44, s45",
+        "s_cselect_b32 s71, 1, 0",
+        "v_mov_b32_e32 v12, s60",
+        "v_mov_b32_e32 v13, s71",
+        "v_mov_b32_e32 v14, 0",
+        "v_mov_b32_e32 v15, 0",
+    ])
+
+
 def pack_f16_pair(lo, hi):
     lo_b = struct.unpack("<H", struct.pack("<e", lo))[0]
     hi_b = struct.unpack("<H", struct.pack("<e", hi))[0]
@@ -5599,6 +5613,20 @@ def check_controls(directory):
         "s_lshl1_add_u32 v12, s44, s45",
     ):
         must_reject(translate, with_constants([bad_lshl_add]))
+    absdiff_source = translate(sop2_absdiff_group())
+    assert set(SOP2_ABSDIFF_OPS) <= ACCEPTED
+    assert "asuint(abs(asint(asuint(params[0].w)) - asint(asuint(params[1].x))))" in absdiff_source, absdiff_source
+    assert "!= 0u) ? 1u : 0u;" in absdiff_source, absdiff_source
+    for bad_absdiff in (
+        "s_absdiff_i64 s[62:63], s[44:45], s[46:47]",
+        "s_absdiff_u32 s62, s44, s45",
+        "s_absdiff_i32 s62, s44",
+        "s_absdiff_i32 s62, s44, s45, s46",
+        "s_absdiff_i32 s62, v12, s45",
+        "s_absdiff_i32 s62, s44, v13",
+        "s_absdiff_i32 v12, s44, s45",
+    ):
+        must_reject(translate, with_constants([bad_absdiff]))
     rgb = rgb_sample()
     translate(rgb)
     for old, new in (("v[12:14]", "v[12:15]"), ("dmask:0x7", "dmask:0xb")):
@@ -7100,6 +7128,42 @@ def check_lshl_add_u32_draw(directory, compiler, renderer, backend):
         case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
         scc_cases.append((case, status))
     run_pixel_batch(renderer, backend, scc_shader, scc_cases)
+
+
+def check_absdiff_i32_draw(directory, compiler, renderer, backend):
+    source = directory / "absdiff_i32.hlsl"
+    shader = directory / "absdiff_i32.cso"
+    program = uncompressed_export([
+        "s_absdiff_i32 s60, s44, s45",
+        "s_cselect_b32 s71, 1, 0",
+        "v_mov_b32_e32 v12, s60",
+        "v_mov_b32_e32 v13, s71",
+        "v_mov_b32_e32 v14, 0",
+        "v_mov_b32_e32 v15, 0",
+    ])
+    source.write_text(lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                            integer_export=True), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    # Check normal difference, reversed difference, zero diff (scc=0), negative operands, INT_MIN boundary,
+    # and (2^31, 2^32) overflow-wrap cases.
+    for name, inputs, words, status in (
+        ("oracle-mismatch", (10, 4), (6, 0, 0, 0), "mismatch"),
+        ("positive-diff", (10, 4), (6, 1, 0, 0), "pass"),
+        ("negative-diff", (4, 10), (6, 1, 0, 0), "pass"),
+        ("zero-diff", (7, 7), (0, 0, 0, 0), "pass"),
+        ("both-negative", (0xfffffff6, 0xfffffffc), (6, 1, 0, 0), "pass"),
+        ("mixed-signs", (0xfffffffb, 8), (13, 1, 0, 0), "pass"),
+        ("int-min-zero", (0x80000000, 0), (0x80000000, 1, 0, 0), "pass"),
+        ("overflow-wrap-max-min", (0x7fffffff, 0x80000000), (1, 1, 0, 0), "pass"),
+        ("overflow-wrap-min-pos", (0x80000000, 1), (0x7fffffff, 1, 0, 0), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<2I", constants, 12, *inputs)
+        case = directory / f"absdiff-i32-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+    run_pixel_batch(renderer, backend, shader, cases)
 
 
 # v_cvt_f32_u32_e32 and v_cvt_f32_i32_e32 convert one 32-bit word to binary32, reading it unsigned
@@ -8760,6 +8824,7 @@ def check_e64_render(directory, compiler, renderer, backend):
     check_integer_readback_draw(directory, compiler, renderer, backend)
     check_subrev_u32_draw(directory, compiler, renderer, backend)
     check_lshl_add_u32_draw(directory, compiler, renderer, backend)
+    check_absdiff_i32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend)
     check_cvt_float_int_draw(directory, compiler, renderer, backend)

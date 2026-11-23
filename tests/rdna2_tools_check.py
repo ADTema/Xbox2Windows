@@ -509,6 +509,21 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(classify_isa_category("v_cmp_lt_f32_e32"), "VOPC (Vector Compare)")
         self.assertEqual(classify_isa_category("v_cmpx_gt_i32_e32"), "VOPC (Vector Compare)")
 
+    def test_sop2_absdiff_opcode_table_synthetic_forms(self):
+        from disasm_rdna2 import SOP2_OPS
+        expected_name, _ = SOP2_OPS[0x2c]
+        self.assertEqual(expected_name, "s_absdiff_i32")
+        w0 = 0x80000000 | (0x2c << 23) | (2 << 16) | (1 << 8) | 0
+        raw = struct.pack("<I", w0)
+        insns = disasm_rdna2(raw)
+        self.assertEqual(len(insns), 1, "Failed decoding SOP2 op 0x2c")
+        self.assertEqual(insns[0]["opcode"], "s_absdiff_i32")
+        self.assertEqual(insns[0]["length"], 4)
+        self.assertEqual(insns[0]["assembly"], "s_absdiff_i32 s2, s0, s1")
+
+        self.assertTrue(is_opcode_recognized("s_absdiff_i32"))
+        self.assertEqual(classify_isa_category("s_absdiff_i32"), "SALU (Scalar ALU)")
+
     def test_sop2_lshl_add_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import SOP2_OPS
         target_ops = {0x2e, 0x2f, 0x30, 0x31}
