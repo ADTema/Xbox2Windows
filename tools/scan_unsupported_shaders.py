@@ -55,6 +55,7 @@ PIXEL_VOP3P_F16 = pixel_aot.VOP3P_F16 if pixel_aot is not None else {}
 PIXEL_VOP3P_INT16 = pixel_aot.VOP3P_INT16 if pixel_aot is not None else {}
 PIXEL_VOP3_INT16 = pixel_aot.VOP3_INT16 if pixel_aot is not None else {}
 PIXEL_VCC = r"(?:vcc(?:_lo)?)"
+PIXEL_VOP3_INT16_TERNARY = pixel_aot.VOP3_INT16_TERNARY if pixel_aot is not None else {}
 PIXEL_LANE_MASK = pixel_aot.LANE_MASK if pixel_aot is not None else r"(?:vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 # Explicit _e32 VOPC writes VCC only; suffix-less and _e64 may name an SGPR destination.
 PIXEL_VOPC_DST = rf"(?:_e32\s+{PIXEL_VCC}|(?:_e64)?\s+{PIXEL_LANE_MASK})"
@@ -201,6 +202,11 @@ if PIXEL_VOP3_INT16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP3_INT16))})(?:_e64)?\s+{INT16_VGPR},\s+{INT16_SOURCE},\s+{INT16_SOURCE}"
     )
+if PIXEL_VOP3_INT16_TERNARY:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP3_INT16_TERNARY))})(?:_e64)?\s+{INT16_VGPR},"
+        rf"\s+{INT16_SOURCE},\s+{INT16_SOURCE},\s+{INT16_SOURCE}"
+    )
 
 for name, (arity, _) in PIXEL_INTEGER.items():
     vop3_only = arity > 2 or name in getattr(pixel_aot, "INTEGER_VOP3_ONLY", ())
@@ -290,6 +296,7 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"v_pk_{name}_f16" for name in PIXEL_VOP3P_F16}
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16}
+    | {f"v_{name}" for name in PIXEL_VOP3_INT16_TERNARY}
     | {name for name, _, _ in MUBUF_OPS.values()}
     | {name for name, _, _ in MTBUF_OPS.values()}
     | {entry[0] for entry in FLAT_OPS.values()}
