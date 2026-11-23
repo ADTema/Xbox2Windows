@@ -12588,6 +12588,7 @@ F32_COMPARE_SETS = (
     (0x7fc00000, 0x3f800000, 0x00000000, 0x00000000),  # NaN, 1.0, 0, 0
     # 5: infinite and extreme finite
     (0x7f800000, 0xff800000, 0x7f7fffff, 0xff7fffff),  # +inf, -inf, max_flt, min_flt
+    (0x7f800001, 0x40000000, 0x00000000, 0x80000000),  # signaling NaN, 2.0, +0, -0
 )
 
 
@@ -12701,9 +12702,10 @@ def f32_compares_reference(words: tuple[int, int, int, int]) -> tuple[int, int, 
     for bit, cond in (
         (16, cmp_pred("lt", lhs, rhs)),
         (17, cmp_pred("eq", 1.0, rhs)),
-        (18, cmp_pred("eq", 1.0, rhs)),
+        # Integer immediates are interpreted as binary32 bits, not converted.
+        (18, cmp_pred("eq", word_to_float(1), rhs)),
         (19, cmp_pred("lt", -0.5, rhs)),
-        (20, cmp_pred("lt", 0.15915494, rhs)),
+        (20, cmp_pred("lt", word_to_float(0x3e22f983), rhs)),
         (21, cmp_pred("lt", 1.0, rhs)),
     ):
         if cond:
@@ -12743,7 +12745,7 @@ def f32_compares_reference(words: tuple[int, int, int, int]) -> tuple[int, int, 
         (10, cmp_pred("eq", 0.0, rhs)),
         (11, cmp_pred("gt", extra_a, 0.0)),
         (12, cmp_pred("lt", extra_a, extra_b)),
-        (13, cmp_pred("eq", -1.0, rhs)),
+        (13, cmp_pred("eq", word_to_float(-1), rhs)),
     ):
         if cond:
             w3 |= 1 << bit
@@ -12778,8 +12780,8 @@ def check_f32_compare_draws(directory, compiler, renderer, backend):
 
     mutated_shader = directory / "f32-compare-mutated.cso"
     for label, old, new, case_index in (
-        ("f32 e32 predicate", "v_cmp_lt_f32_e32 vcc_lo, s44, v16", "v_cmp_le_f32_e32 vcc_lo, s44, v16", 0),
-        ("f32 e64 neg", "v_cmp_lt_f32_e64 s52, -s44, |s45|", "v_cmp_lt_f32_e64 s52, s44, |s45|", 1),
+        ("f32 e32 predicate", "v_cmp_lt_f32_e32 vcc_lo, s44, v16", "v_cmp_le_f32_e32 vcc_lo, s44, v16", 3),
+        ("f32 e64 neg", "v_cmp_lt_f32_e64 s52, -s44, |s45|", "v_cmp_lt_f32_e64 s52, s44, |s45|", 2),
     ):
         mutated = [new if line == old else line for line in program]
         assert mutated != program
