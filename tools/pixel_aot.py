@@ -1644,8 +1644,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if (half_rounding != HALF_ROUNDING["0"] and re.match(r"v_\w*_f(?:16|64)", line)
                 and not line.startswith(HALF_ROUNDING_EXEMPT)):
             raise ValueError(f"Unsupported binary16 or binary64 operation under round {half_rounding}: {line.split()[0]}")
-        if m := match(r"s_waitcnt\s+(.*)"):
-            payload = m[1].strip()
+        # gfx10 SOPK wait forms: `s_waitcnt_<counter> <sgpr|null>, <simm16>`. Only null is modelled, since it
+        # reads as 0 and the count is then the immediate; an SGPR value would add to or replace it.
+        # vmcnt and lgkmcnt act exactly like the vmcnt(K) and lgkmcnt(K) tokens of s_waitcnt. vscnt is a no-op:
+        # this translator lowers no vector memory stores, so nothing is outstanding on the store counter.
+        sopk_wait = None
+        if m := match(r"s_waitcnt_(vmcnt|lgkmcnt|vscnt)(?:\s+(.*))?"):
+            counter = m[1]
+            label = {"vmcnt": "VM", "lgkmcnt": "LGKM", "vscnt": "VS"}[counter]
+            operands = [part.strip() for part in (m[2] or "").split(",")]
+            if len(operands) != 2 or not re.fullmatch(r"0x[0-9a-f]+|0|[1-9]\d*", operands[1]):
+                raise ValueError(f"Malformed s_waitcnt_{counter} operands: {line}")
+            if operands[0] != "null":
+                raise ValueError(f"Unsupported s_waitcnt_{counter} SGPR operand (only null is modelled): {line}")
+            count = int(operands[1], 0)
+            if count > 63:
+                raise ValueError(f"{label} wait count exceeds the gfx10 six-bit field")
+            if counter == "vscnt":
+                continue
+            sopk_wait = f"{counter}({count})"
+        wait_match = match(r"s_waitcnt\s+(.*)")
+        if sopk_wait is not None or wait_match:
+            payload = sopk_wait if sopk_wait is not None else wait_match[1].strip()
             if payload in ("0", "0x0"):
                 pending.clear()
                 sample_dest.clear()

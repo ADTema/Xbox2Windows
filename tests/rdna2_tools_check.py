@@ -2161,6 +2161,23 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(is_instruction_supported("s_waitcnt lgkmcnt(0)lgkmcnt(1)"))
         self.assertFalse(is_instruction_supported("s_waitcnt expcnt(0) expcnt(1)"))
 
+    def test_sopk_waitcnt_forms(self):
+        """null with a count of 0..63 is supported for the three SOPK wait forms; an SGPR or larger count is not."""
+        for op in ("s_waitcnt_vmcnt", "s_waitcnt_lgkmcnt", "s_waitcnt_vscnt"):
+            for count in ("0x0", "0x3", "0x3f", "0", "1", "9", "10", "63"):
+                self.assertTrue(is_instruction_supported(f"{op} null, {count}"), (op, count))
+            for unsupported in ("s5, 0x1", "s0, 0x0", "vcc_lo, 0x0", "0x1", "null", "null, 0x40", "null, 64",
+                                "null, 0xffff", "null, 0x400", "null, -1", "null, invalid", "null,"):
+                self.assertFalse(is_instruction_supported(f"{op} {unsupported}"), (op, unsupported))
+        self.assertFalse(is_instruction_supported("s_waitcnt_depctr null, 0x0"))
+        decoded = disassemble_binary_shader(bytes.fromhex("00007dbc" "00007dbd" "0000fdbb" "000081bf"))
+        self.assertEqual(decoded, ["s_waitcnt_vmcnt null, 0x0", "s_waitcnt_lgkmcnt null, 0x0",
+                                   "s_waitcnt_vscnt null, 0x0", "s_endpgm"])
+        result = analyze_shader_instructions("sopk_wait", decoded)
+        self.assertEqual((result["supported_instructions"], result["unsupported_count"]), (4, 0))
+        result = analyze_shader_instructions("sopk_wait_sgpr", ["s_waitcnt_vmcnt s5, 0x1", "s_endpgm"])
+        self.assertEqual(result["unsupported_count"], 1)
+
     def test_gfx1013_waitcnt_expcnt_decode_and_lower(self):
         """Assemble/decode GFX1013 s_waitcnt_expcnt binary bytes and lower with pixel_aot."""
         from pixel_aot import lower
