@@ -50,10 +50,22 @@ target_compile_features(era_title_gpu_alloc_check PRIVATE cxx_std_20)
 add_test(NAME era_title_gpu_alloc COMMAND era_title_gpu_alloc_check)
 set_tests_properties(era_title_gpu_alloc PROPERTIES TIMEOUT 30)
 
-# Desktop xmem.dll for the package DLLs' four named xmem imports.
+# Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp
     src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
+# LINK uses explicit export ordinals in the generated import library. Keep
+# those ordinals in the DLL and build the consumer library with names.
+set(xmem_export_def "${CMAKE_CURRENT_SOURCE_DIR}/src/xmem_shim.def")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${xmem_export_def}")
+file(READ "${xmem_export_def}" xmem_named_exports)
+string(REGEX REPLACE "(=[A-Za-z0-9_]+)? +@[0-9]+" "" xmem_named_exports "${xmem_named_exports}")
+set(xmem_named_def "${CMAKE_CURRENT_BINARY_DIR}/xmem_named_imports.def")
+file(GENERATE OUTPUT "${xmem_named_def}" CONTENT "${xmem_named_exports}")
+set_property(TARGET xmem_shim APPEND PROPERTY LINK_DEPENDS "${xmem_named_def}")
+add_custom_command(TARGET xmem_shim POST_BUILD
+    COMMAND "${CMAKE_AR}" /nologo /machine:x64 "/def:${xmem_named_def}" "/out:$<TARGET_LINKER_FILE:xmem_shim>"
+    VERBATIM)
 target_include_directories(xmem_shim PRIVATE src)
 target_compile_features(xmem_shim PRIVATE cxx_std_20)
 # Delay-loaded: only XMemGetWorkingSetStatistics uses DXGI and D3DKMT (gdi32).
@@ -66,7 +78,7 @@ target_link_options(xmem_shim_check PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi
 target_include_directories(xmem_shim_check PRIVATE src)
 target_compile_features(xmem_shim_check PRIVATE cxx_std_17)
 # working_set_aggregation feeds synthetic adapter readings to src/xmem_gpu_usage.h.
-foreach(scenario IN ITEMS exports allocation query working_set working_set_aggregation)
+foreach(scenario IN ITEMS exports allocation default_allocation query working_set working_set_aggregation)
     add_test(NAME xmem_shim_${scenario} COMMAND xmem_shim_check ${scenario})
 endforeach()
 # XMemGetWorkingSetStatistics differences around D3D12 heap and committed-resource lifetimes.
