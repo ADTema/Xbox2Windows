@@ -2969,6 +2969,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_load_cookie COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/load_cookie_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_cookie_dll>" "$<TARGET_FILE:cpu_cookie_exe>" "$<TARGET_FILE:cpu_exe_io>")
+    add_test(NAME cpu_package_shim_lifetime COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/package_shim_lifetime_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_cookie_exe>" "$<TARGET_FILE:cpu_exe_io>")
     foreach(variant IN ITEMS original no_tls)
         add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)
