@@ -1589,6 +1589,42 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_${part}_lifted>" ${tsc_controls})
     endforeach()
     set_tests_properties(cpu_aot_rdtscp PROPERTIES SKIP_RETURN_CODE 77)
+    cpu_asm_fixture(cpu_rdrand_harness rdrand_harness)
+    # The opt-in host-entropy profile. RDRAND and RDSEED have their own fixtures and tests, each exiting 77 when
+    # the host lacks the instruction. Each part has the lifted DLL, deterministic succeed and fail variants that
+    # must pass, mutated controls that must break a rule, and /O2 builds; plain removes volatile and is built
+    # only at /O2.
+    foreach(part IN ITEMS rdrand rdseed)
+        cpu_asm_fixture(cpu_${part} ${part})
+        set(entropy_extras)
+        foreach(variant IN ITEMS lifted succeed fail constant nocarry noext wide16 flags nozero plain)
+            set(entropy_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp")
+            add_custom_command(OUTPUT "${entropy_fixture}"
+                COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rdrand.py"
+                    emit ${part} "$<TARGET_FILE:cpu_${part}>" "${entropy_fixture}" ${variant}
+                DEPENDS cpu_${part} tests/cpu/rdrand.py tools/ffx_version_query.py tools/x87_lower.py
+                    tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+            if(NOT variant STREQUAL "plain")
+                add_library(cpu_${part}_${variant} SHARED "${entropy_fixture}")
+                if(NOT variant STREQUAL "lifted")
+                    list(APPEND entropy_extras "$<TARGET_FILE:cpu_${part}_${variant}>")
+                endif()
+            endif()
+        endforeach()
+        foreach(variant IN ITEMS lifted plain)
+            set(entropy_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}_o2.dll")
+            add_custom_command(OUTPUT "${entropy_o2}"
+                COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp"
+                    "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}_o2.obj" "/Fe${entropy_o2}"
+                DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp" VERBATIM)
+            add_custom_target(cpu_${part}_${variant}_o2 ALL DEPENDS "${entropy_o2}")
+            list(APPEND entropy_extras "${entropy_o2}")
+        endforeach()
+        add_test(NAME cpu_aot_${part} COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rdrand.py"
+            check ${part} "$<TARGET_FILE:cpu_rdrand_harness>" "$<TARGET_FILE:cpu_${part}>"
+            "$<TARGET_FILE:cpu_${part}_lifted>" ${entropy_extras})
+        set_tests_properties(cpu_aot_${part} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
