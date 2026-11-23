@@ -3821,6 +3821,8 @@ def check_int16_vop3_mutation_coverage():
 #   group 2: v24 = med3_i16 / v25 = med3_u16 of (w0, w1, w2)  v26 = med3_i16 s46, v21, 4     v27 = med3_u16 v21, -2, s46
 #   group 3: v24 = add_nc_u16 v18, v19 (a 12-op result)       v25 = mad_u16 v24, v20, v21 (low16 source)
 #            v26 = med3_i16 v24, v25, v18                     v27 = max3_u16 v25, v26, v24
+#   group 4: v24 = sub_nc_u16 v18, v19 (a low16 producer)     v25 = med3_u16 v24, v20, v21 (low16 into unsigned med3)
+#            v26 = med3_i16 v24, v25, s46                     v27 = min3_i16 v25, v26, v24
 INT16_TERNARY_GROUPS = (
     (("mad_u16", "v18", "v19", "v20"), ("mad_i16", "v21", "v18", "s44"),
      ("mad_u16", "v20", "0x1234", "v19"), ("mad_i16", "s47", "-3", "v21")),
@@ -3831,10 +3833,12 @@ INT16_TERNARY_GROUPS = (
 )
 INT16_TERNARY_CHAIN = ("v_add_nc_u16 v24, v18, v19", "v_mad_u16 v25, v24, v20, v21",
                        "v_med3_i16 v26, v24, v25, v18", "v_max3_u16 v27, v25, v26, v24")
-# Six word sets. Set 0: 0x7fff / 0x8000 / 1 / 2 (signed order differs from unsigned order). Set 1: 0xffff, 1, 0, 0xffff.
-# Set 2: small positives (3 * 4 + 5). Set 3: the wrapping mad 0x1234 * 0x0567 + 0xffff. Set 4: 0x8000, 0x7fff, 0xfffe, 1
-# (the median is a different word signed and unsigned). Set 5: 2, 0xffff, 0x0010, 0x8001. Every high half differs from
-# its low half.
+INT16_TERNARY_MED_CHAIN = ("v_sub_nc_u16 v24, v18, v19", "v_med3_u16 v25, v24, v20, v21",
+                           "v_med3_i16 v26, v24, v25, s46", "v_min3_i16 v27, v25, v26, v24")
+# Twelve word sets covering all six strict (w0, w1, w2) orderings for both signed and unsigned comparisons plus all four
+# tie shapes (a == b, b == c, a == c, a == b == c). Sets 0..5 exercise signed/unsigned splits and wrapping mad; sets
+# 6..7 complete the missing strict permutations (signed c < a < b and unsigned b < c < a); sets 8..11 exercise ties at
+# the signed/unsigned boundary. Every high half differs from its low half.
 INT16_TERNARY_WORDS = (
     (0xdead7fff, 0x12348000, 0xbeef0001, 0x5a5a0002),
     (0x1111ffff, 0x22220001, 0x33330000, 0x4444ffff),
@@ -3842,6 +3846,12 @@ INT16_TERNARY_WORDS = (
     (0xf00f1234, 0x801f0567, 0x8000ffff, 0x9999fffe),
     (0x00008000, 0xffff7fff, 0x0000fffe, 0xc0de0001),
     (0xfffe0002, 0x0001ffff, 0x80000010, 0x7ffe8001),
+    (0x13570010, 0x24687fff, 0x35798000, 0x468a0003),
+    (0x24688001, 0x35790002, 0x468a7fff, 0x579b0004),
+    (0xaa558000, 0x55aa8000, 0x11227fff, 0x3344fffe),
+    (0x66770001, 0x7788ffff, 0x8899ffff, 0x99aa8000),
+    (0xbabe7fff, 0xcafe8000, 0xdead7fff, 0xfeed7fff),
+    (0x11118001, 0x22228001, 0x33338001, 0x44448001),
 )
 
 
@@ -3851,8 +3861,10 @@ def int16_ternary_ops(group):
     body += [f"v_mov_b32_e32 v{24 + k}, {word:#x}" for k, word in enumerate(INT16_VOP3_SENTINELS)]
     if group < 3:
         body += [f"v_{op} v{24 + k}, {a}, {b}, {c}" for k, (op, a, b, c) in enumerate(INT16_TERNARY_GROUPS[group])]
-    else:
+    elif group == 3:
         body += INT16_TERNARY_CHAIN
+    else:
+        body += INT16_TERNARY_MED_CHAIN
     body += [INT16_VOP3_WIDEN.format(dst=12 + k, src=24 + k) for k in range(4)]
     return uncompressed_export(body)
 
@@ -3885,6 +3897,12 @@ def int16_ternary_reference(group, words, *, mutation=None):
         r25 = compute("mad_u16", r24, w2, w3)
         r26 = compute("med3_i16", r24, r25, w0)
         return (r24, r25, r26, compute("max3_u16", r25, r26, r24))
+    if group == 4:
+        w0, w1, w2, w3 = (w & 0xffff for w in words)
+        r24 = (w0 - w1) & 0xffff
+        r25 = compute("med3_u16", r24, w2, w3)
+        r26 = compute("med3_i16", r24, r25, w2)
+        return (r24, r25, r26, compute("min3_i16", r25, r26, r24))
 
     def operand(token):
         if token[0] == "v":
@@ -3906,7 +3924,9 @@ def int16_ternary_reference(group, words, *, mutation=None):
 INT16_TERNARY_MUTATIONS = {
     "signed_as_unsigned": ((1,), (0, 2)),
     "signed_as_unsigned_med3": ((2,), (0, 2)),
+    "signed_as_unsigned_med_chain": ((4,), (2, 3)),
     "med3_as_min3": ((2,), (0, 1, 2, 3)),
+    "med3_as_min3_chain": ((4,), (1, 2)),
     "mad_no_addend": ((0,), (0, 1, 2, 3)),
     "source_high": ((0, 1), (0, 1, 2, 3)),
 }
@@ -3915,7 +3935,8 @@ INT16_TERNARY_MUTATIONS = {
 def check_int16_ternary_mutation_coverage():
     """Every mutation must change the affected lanes for some word set, so the draw can detect it."""
     for mutation, (groups, lanes) in INT16_TERNARY_MUTATIONS.items():
-        model = "signed_as_unsigned" if mutation.startswith("signed_as_unsigned") else mutation
+        model = ("signed_as_unsigned" if mutation.startswith("signed_as_unsigned")
+                 else "med3_as_min3" if mutation.startswith("med3_as_min3") else mutation)
         for group in groups:
             for lane in lanes:
                 assert any(int16_ternary_reference(group, words, mutation=model)[lane]
@@ -3926,12 +3947,31 @@ def check_int16_ternary_mutation_coverage():
         for words in INT16_TERNARY_WORDS:
             assert (int16_ternary_reference(group, words, mutation="signed_as_unsigned")[1]
                     == int16_ternary_reference(group, words)[1])
+    for words in INT16_TERNARY_WORDS:
+        assert (int16_ternary_reference(4, words, mutation="signed_as_unsigned")[:2]
+                == int16_ternary_reference(4, words)[:2])
+    # All six strict (w0, w1, w2) orderings are exercised for both signed and unsigned comparisons, plus all four tie
+    # shapes (a == b, b == c, a == c, and a == b == c).
+    strict_perms = {(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)}
+    signed_perms, unsigned_perms, tie_shapes = set(), set(), set()
+    for words in INT16_TERNARY_WORDS:
+        a, b, c = (w & 0xffff for w in words[:3])
+        sa, sb, sc = (x - 0x10000 if x & 0x8000 else x for x in (a, b, c))
+        if len({a, b, c}) == 3:
+            unsigned_perms.add(tuple(sorted((a, b, c)).index(x) for x in (a, b, c)))
+            signed_perms.add(tuple(sorted((sa, sb, sc)).index(x) for x in (sa, sb, sc)))
+        else:
+            tie_shapes.add((a == b, b == c, a == c))
+    assert signed_perms == strict_perms, signed_perms
+    assert unsigned_perms == strict_perms, unsigned_perms
+    assert tie_shapes == {(True, False, False), (False, True, False), (False, False, True), (True, True, True)}, \
+        tie_shapes
     # mad_i16 and mad_u16 give the same low half, so a signed/unsigned mad mutation would be unobservable by design.
     for words in INT16_TERNARY_WORDS:
         a, b, c = (w & 0xffff for w in words[:3])
         sa, sb, sc = (x - 0x10000 if x & 0x8000 else x for x in (a, b, c))
         assert (a * b + c) & 0xffff == (sa * sb + sc) & 0xffff
-    assert len(INT16_TERNARY_WORDS) >= 5 and all(len(words) == 4 for words in INT16_TERNARY_WORDS)
+    assert len(INT16_TERNARY_WORDS) >= 12 and all(len(words) == 4 for words in INT16_TERNARY_WORDS)
 
 
 def check_int16_ternary_controls():
@@ -3939,7 +3979,7 @@ def check_int16_ternary_controls():
     check_int16_ternary_mutation_coverage()
     assert {op for group in INT16_TERNARY_GROUPS for op, *_ in group} == set(pixel_aot.VOP3_INT16_TERNARY)
     assert not set(pixel_aot.VOP3_INT16) & set(pixel_aot.VOP3_INT16_TERNARY)
-    for group in range(4):
+    for group in range(5):
         lowered = translate_int(int16_ternary_ops(group))
         body = lowered.split("uint4 main", 1)[1]
         assert "0xffff0000u" not in body and "asfloat(0u | " not in body, group
@@ -4003,6 +4043,8 @@ def check_int16_ternary_controls():
     chain = translate_int(uncompressed_export([*low, "v_mad_u16 v25, v24, v20, v21"]))
     assert f"uint i16s{add_index + 1}_0 = asuint(alu{add_index});" in chain, chain
     translate_int(uncompressed_export([*low, "v_med3_i16 v25, v18, v24, v19"]))
+    med_u16_chain = translate_int(uncompressed_export([*low, "v_med3_u16 v25, v24, v20, v21"]))
+    assert f"uint i16s{add_index + 1}_0 = asuint(alu{add_index});" in med_u16_chain, med_u16_chain
     mad = [*prefix, "v_mad_u16 v24, v18, v19, v20"]
     mad_index = with_constants(mad).index("v_mad_u16 v24, v18, v19, v20")
     back = translate_int(uncompressed_export([*mad, "v_add_nc_u16 v25, v24, v18"]))
@@ -4012,8 +4054,9 @@ def check_int16_ternary_controls():
     for selection in ("WORD_0", "BYTE_0", "BYTE_1"):
         translate_int(uncompressed_export([*mad, "v_mov_b32_sdwa v25, v24 dst_sel:DWORD "
                                            f"dst_unused:UNUSED_PAD src0_sel:{selection}"]))
-    # Full-word readers stay refused for the results of both a mad and a med3.
-    for producer in ("v_mad_u16 v24, v18, v19, v20", "v_med3_i16 v24, v18, v19, v20"):
+    # Full-word readers stay refused for the results of mad and both signed/unsigned med3.
+    for producer in ("v_mad_u16 v24, v18, v19, v20", "v_med3_i16 v24, v18, v19, v20",
+                     "v_med3_u16 v24, v18, v19, v20"):
         expect_value_error(translate_int, uncompressed_export([*prefix, producer, "v_add_nc_u32 v25, v24, v18"]),
                            "Expected a numeric register")
         expect_value_error(translate_int, uncompressed_export(
@@ -8920,7 +8963,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((quadmask_bitreplicate_program(op), translate_int)
                     for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
     fixtures.extend((int16_vop3_ops(group), translate_int) for group in range(4))
-    fixtures.extend((int16_ternary_ops(group), translate_int) for group in range(4))
+    fixtures.extend((int16_ternary_ops(group), translate_int) for group in range(5))
     fixtures.extend((scalar_bitset64(op, str(index)), translate_int)
                     for op in SCALAR_BITSET64_OPS for index in (0, 31, 32, 63, 64))
     fixtures.append((scalar_select64(), translate_int))
@@ -12340,20 +12383,22 @@ def check_int16_ternary_draw(directory, compiler, renderer, backend):
         if "mismatch" not in statuses:
             raise AssertionError(f"Mutating {label} escaped detection")
 
-    programs = [int16_ternary_ops(group) for group in range(4)]
+    programs = [int16_ternary_ops(group) for group in range(5)]
     lowered = [translate_int(program) for program in programs]
-    for group in range(4):
+    for group in range(5):
         build(lowered[group])
         run_pixel_batch(renderer, backend, shader, [(path, "pass") for path in cases(group, "ref")])
     # (a) signed treated as unsigned: every sign-extension of a source half becomes a zero-extension.
-    for group, label in ((1, "min3/max3 signed as unsigned"), (2, "med3 signed as unsigned")):
+    for group, label in ((1, "min3/max3 signed as unsigned"), (2, "med3 signed as unsigned"),
+                         (4, "med3 chain signed as unsigned")):
         mutated = re.sub(r"\(asint\((i16s\d+_\d) << 16\) >> 16\)", r"(\1 & 0xffffu)", lowered[group])
         assert mutated != lowered[group] and "<< 16) >> 16" not in mutated, label
         detected(group, label, mutated)
     # (b) med3 replaced by min3.
-    mutated_program = [line.replace("v_med3_", "v_min3_") for line in programs[2]]
-    assert mutated_program != programs[2], "med3 as min3"
-    detected(2, "med3 replaced by min3", translate_int(mutated_program))
+    for group, label in ((2, "med3 replaced by min3"), (4, "chained med3 replaced by min3")):
+        mutated_program = [line.replace("v_med3_", "v_min3_") for line in programs[group]]
+        assert mutated_program != programs[group], label
+        detected(group, label, translate_int(mutated_program))
     # (c) the mad addend dropped: v_mad_* x, a, b, c becomes v_mul_lo_u16 x, a, b.
     mutated_program = [re.sub(r"v_mad_[ui]16 (v\d+, [^,]+, [^,]+), [^,]+$", r"v_mul_lo_u16 \1", line)
                        for line in programs[0]]
