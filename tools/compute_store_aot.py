@@ -27,6 +27,13 @@ ALU = {
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
+LDS_RMW_OPERATORS = {
+    "ds_add_u32": "+",
+    "ds_sub_u32": "-",
+    "ds_and_b32": "&",
+    "ds_or_b32": "|",
+    "ds_xor_b32": "^",
+}
 
 
 def checked_group(group):
@@ -404,6 +411,20 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 if len(expression) > ALU_EXPRESSION_LIMIT:
                     raise ValueError("LDS expression exceeds the profile limit")
                 lds_word = ("alu", expression)
+            ds_wait = True
+        elif ((m := re.fullmatch(r"(ds_\w+) v(\d+), v(\d+)(?: offset:0)?", line))
+              and m[1] in LDS_RMW_OPERATORS):
+            addr, src = int(m[2]), int(m[3])
+            value = vector.get(src)
+            if (not lds_enabled or guard_span is not None or max(addr, src) > 255
+                    or vector.get(addr) != ("lds_address",) or lds_word is None or not is_word(value)):
+                raise ValueError("Unverified private LDS update")
+            # Both operands are HLSL uints. Addition and subtraction wrap at 32 bits.
+            op = LDS_RMW_OPERATORS[m[1]]
+            expression = f"({hlsl_word(lds_word)} {op} {hlsl_word(value)})"
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("LDS expression exceeds the profile limit")
+            lds_word = ("alu", expression)
             ds_wait = True
         elif m := re.fullmatch(r"ds_read_(b32|[ui](?:8|16)) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
             op, dst, addr, offset = m[1], int(m[2]), int(m[3]), int(m[4] or 0)
