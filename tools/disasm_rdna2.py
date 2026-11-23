@@ -2367,8 +2367,16 @@ def disassemble_binary(data: bytes, shader_name: str = "shader") -> list[dict]:
             "opcode": op_name,
             "assembly": asm,
             "comment": comment,
+            "after_endpgm": True,
         })
         offset += length
+        if op_name == "s_endpgm":
+            # Mark the post-endpgm boundary.  Callers that need to stop
+            # there (e.g. scan_unsupported_shaders) may use this field.
+            # The decoder itself matches LLVM 15 by continuing past the
+            # terminator so every byte in the binary is decoded.
+            for entry in instructions:
+                entry["after_endpgm"] = False
     return instructions
 
 
