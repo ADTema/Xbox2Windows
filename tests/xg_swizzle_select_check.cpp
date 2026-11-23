@@ -27,7 +27,7 @@
 // request forbids every non-linear block.
 //
 // Returns 0 on pass, 1 on failure, and 77 (skip) when built without addrlib (XBOX2WINDOWS_ADDRLIB_DIR unset).
-// With --mutate-linear-fallback the provider under test falls back to linear and the run must fail.
+// With --mutate-linear-fallback the comparison must detect all nine mismatches.
 #include <cstdint>
 #include <cstdio>
 
@@ -270,10 +270,15 @@ int run(bool mutate_linear_fallback)
         char line[200];
         std::snprintf(line, sizeof line, "%s selects %s with %u-byte base alignment", row.request.name,
                       mode_name(row.mode), row.base_align);
-        expect(matches(s, row), line);
+        const bool expected_match = !mutate_linear_fallback || row.mode == ADDR_SW_LINEAR;
+        if (mutate_linear_fallback && !expected_match) {
+            std::snprintf(line, sizeof line, "linear fallback mismatches %s", row.request.name);
+        }
+        expect(matches(s, row) == expected_match, line);
         tiled_rows += row.mode != ADDR_SW_LINEAR;
     }
-    expect(table_mismatches(lib, under_test) == 0, "the provider under test matches every reference row");
+    const unsigned expected_mismatches = mutate_linear_fallback ? 9 : 0;
+    expect(table_mismatches(lib, under_test) == expected_mismatches, "the comparison finds the expected mismatch count");
 
     // 2. Linear-fallback control: a provider that sends each request to addrlib with only the linear block allowed
     //    goes through the same comparison and must be caught. It agrees only on the reference's own LINEAR row;
@@ -354,8 +359,7 @@ int run(bool mutate_linear_fallback)
 }
 }  // namespace
 
-// --mutate-linear-fallback swaps the provider under test for the linear-fallback provider. CTest registers that run
-// as xg_swizzle_select_mutation with WILL_FAIL, so the comparison must reject it.
+// The mutation passes only if the comparison detects the expected fallback mismatches.
 int main(int argc, char** argv)
 {
     const bool mutate = argc == 2 && std::strcmp(argv[1], "--mutate-linear-fallback") == 0;
