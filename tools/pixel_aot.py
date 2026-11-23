@@ -2168,7 +2168,6 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     seen_skip = False
     has_scratch = False
     scratch_written = set()
-    scratch_pending = set()
     instructions = tuple(instructions)
     if any(isinstance(element, tuple) for element in instructions):
         offset_index = {}
@@ -2296,7 +2295,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                             raise ValueError("VM wait count exceeds the gfx10 six-bit field")
                         if limit == 0:
                             sample_dest.clear()
-                        else:
+                        elif None not in sample_dest.values():
                             # Only the newest limit samples can remain outstanding. Filtering
                             # the current set also preserves guarantees made by earlier waits.
                             sample_dest = {reg: issue for reg, issue in sample_dest.items() if issue > vector_loads - limit}
@@ -2893,7 +2892,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                         raise ValueError(f"Scratch load from unwritten address: {addr_byte + 4 * comp}")
                     if reg in sample_dest:
                         raise ValueError("Write overlaps an outstanding sample")
-                    sample_dest[reg] = 0
+                    # A scratch result requires a full VM drain. Keep mixed loads
+                    # pending on partial waits because their relative order is unproven.
+                    sample_dest[reg] = None
                     offset_term = f" + {comp}u" if comp else ""
                     tag = f"alu{i}_{comp}" if count > 1 else f"alu{i}"
                     vector[reg] = tag

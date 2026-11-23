@@ -13723,12 +13723,15 @@ def check_flat_scratch_controls():
     # 3. Read without defining store (load before store)
     expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_load_dword v12, off, s48 offset:16"]), "unwritten address")
     # 4. Consumer before matching waitcnt
-    expect_value_error(translate, with_constants([
+    pending = [
         "s_mov_b32 s48, 0",
         "scratch_store_dword off, v12, s48 offset:16",
         "scratch_load_dword v13, off, s48 offset:16",
-        "v_mov_b32_e32 v14, v13",
-    ]), "Sample used before vmcnt wait")
+    ]
+    consumer = ["v_mov_b32_e32 v14, v13"]
+    for partial in ([], ["s_waitcnt vmcnt(1)"], ["s_waitcnt_vmcnt null, 1"]):
+        expect_value_error(translate, with_constants(pending + partial + consumer), "Sample used before vmcnt wait")
+    translate(with_constants(pending + ["s_waitcnt_vmcnt null, 0"] + consumer))
     # 5. Invalid registers, widths, spans, modifiers
     expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dword off, v256, s48"]), "range")
     expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_load_dword v12, off, s106"]), "Invalid saddr register")
