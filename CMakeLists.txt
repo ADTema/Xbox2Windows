@@ -230,6 +230,12 @@ add_custom_command(OUTPUT "${pixel_vs_linear}" COMMAND "${DXC_EXECUTABLE}" -T vs
 target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp tests/pixel_compare_render.cpp "${pixel_vs}"
     "${pixel_vs_linear}")
 target_sources(offscreen_check PRIVATE tests/desktop_gpu.cpp tests/mesh_entry_draw.cpp tests/mesh_shadow_draw.cpp)
+set(descriptor_window_cs "${CMAKE_CURRENT_BINARY_DIR}/descriptor_window_submissions_cs.h")
+add_custom_command(OUTPUT "${descriptor_window_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main
+    -Vn descriptor_window_submissions_cs -Fh "${descriptor_window_cs}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/descriptor_window_submissions.hlsl"
+    DEPENDS tests/descriptor_window_submissions.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE tests/descriptor_window_submissions.cpp "${descriptor_window_cs}")
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp tests/ffx_recurrent_views.cpp)
 target_sources(offscreen_check PRIVATE tests/ffx_rcas_views.cpp)
 foreach(storage IN ITEMS Native Packed)
@@ -478,6 +484,12 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME ffx_device_init_${adapter} COMMAND offscreen_check ${adapter} --ffx-device-init)
     add_test(NAME ffx_recurrent_${adapter} COMMAND offscreen_check ${adapter} --ffx-recurrent)
     add_test(NAME dual_uav_${adapter} COMMAND offscreen_check ${adapter} --dual-uav)
+    add_test(NAME descriptor_window_submissions_${adapter} COMMAND offscreen_check ${adapter} --descriptor-window-submissions)
+    add_test(NAME descriptor_window_stale_${adapter} COMMAND offscreen_check ${adapter} --descriptor-window-stale)
+    set_tests_properties(descriptor_window_submissions_${adapter} descriptor_window_stale_${adapter}
+        PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    set_tests_properties(descriptor_window_stale_${adapter}
+        PROPERTIES FAIL_REGULAR_EXPRESSION "descriptor_windows submit=2 slot=[1-9]")
     add_test(NAME texture_mips_${adapter} COMMAND offscreen_check ${adapter} --texture-mips)
     set_tests_properties(dual_uav_${adapter} texture_mips_${adapter} PROPERTIES TIMEOUT 45)
     add_test(NAME dxr_query_${adapter} COMMAND offscreen_check ${adapter} --ray-query)
