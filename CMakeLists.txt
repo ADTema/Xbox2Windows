@@ -802,6 +802,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/frame_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_frame>" "$<TARGET_FILE:cpu_frame_lifted>"
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_frame_lifted.cpp")
+    cpu_asm_fixture(cpu_leave leave)
+    # LEAVE on a proven RBP anchor; the other exports of leave.asm exist only to be rejected.
+    cpu_translation(cpu_leave cpu_switch_aot leave_frame,leave_lea,leave_join)
+    add_test(NAME cpu_aot_leave COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/leave_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_leave>" "$<TARGET_FILE:cpu_leave_lifted>"
+        "${CMAKE_CURRENT_BINARY_DIR}/cpu_leave_lifted.cpp")
     cpu_asm_fixture(cpu_calls calls)
     cpu_translation(cpu_calls cpu_switch_aot call_leaf,chain3,narrow_call,narrow_tail,tail_call,tail_after_frame,home_save_call)
     add_test(NAME cpu_aot_direct_calls COMMAND "${INTAKE_PYTHON}" -B
