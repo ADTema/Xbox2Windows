@@ -3663,6 +3663,21 @@ Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
 python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --indices 0,8253 --allow-provisional --history "$out/history.json" --tools-path "$out/Leonida/tools"
 ```
 
+The batch exporter uses the native BCPack kernels when the selected Leonida tools provide them. The commands below stage the measured revision separately from the reference checkout above. Pass `--require-rust` to check that the library loads before the batch starts. Individual chunks can still use the reference decoder. [Leonida native backend](https://github.com/ItsNotRexed/Leonida/pull/5116)
+
+```powershell
+$rustCheckout = "$out/Leonida-rust"
+$rustCommit = 'ff5f36bae141b0eb5df4a0029f6fc3a7d4cb111e'
+git init "$rustCheckout"
+git -C "$rustCheckout" fetch --depth=1 https://github.com/ItsNotRexed/Leonida.git $rustCommit
+git -C "$rustCheckout" checkout --detach $rustCommit
+$rustTools = "$rustCheckout/tools"
+cargo build --release --locked --offline --manifest-path "$rustTools/bcpack_calibration/Cargo.toml" --target-dir "$rustTools/bcpack_calibration/target"
+python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --tools-path "$rustTools" --require-rust
+```
+
+Add `--calibration path/to/profile.json` to retry strict decode failures using a local version-1 Leonida profile. This option requires NumPy and the calibration library. Use it by itself or with `--require-rust`. The separate legacy history mode uses `--allow-provisional --history`. Output produced by the local profile has `"mode": "fitted"` in the manifest.
+
 ### Drawing BC7 textures with a recompiled pixel shader
 
 `linearize_4k_s_tail(tile, width, height, tail_level)` reads a single BC7 level from a shared GFX10 4 KiB mip-tail tile. Supply the decoded tile, the requested pixel dimensions and its zero-based position within the tail. Whole-tile storage and per-slot bounds are checked before reading. [AMD mip-tail address calculation](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10addrlib.cpp)
