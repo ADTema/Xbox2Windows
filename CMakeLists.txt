@@ -3999,10 +3999,12 @@ endif()
 
 add_executable(vm_copy_queue_check tests/vm_copy_queue_check.cpp)
 target_compile_features(vm_copy_queue_check PRIVATE cxx_std_17)
-target_link_libraries(vm_copy_queue_check PRIVATE d3d12 dxgi)
+target_link_libraries(vm_copy_queue_check PRIVATE d3d12 dxgi OneCore)
 foreach(adapter IN ITEMS warp hardware)
     add_test(NAME vm_copy_queue_${adapter} COMMAND vm_copy_queue_check ${adapter})
-    set_tests_properties(vm_copy_queue_${adapter} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    add_test(NAME vm_page_provenance_${adapter} COMMAND vm_copy_queue_check provenance_${adapter})
+    set_tests_properties(vm_copy_queue_${adapter} vm_page_provenance_${adapter}
+        PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
 
 if(EXISTS "${INTAKE_PYTHON}")
