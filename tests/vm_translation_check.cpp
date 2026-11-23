@@ -36,6 +36,18 @@ struct RangePair {
     std::uint64_t to_cpu(std::uint64_t va) const { return va >= b && va - b < size ? va - b + a : va; }
 };
 
+// Owns a VirtualAlloc range. Objects that use the range are declared after it, so they are released first.
+struct VirtualRange {
+    std::uint8_t* base = nullptr;
+    explicit VirtualRange(void* p) : base(static_cast<std::uint8_t*>(p)) {}
+    VirtualRange(const VirtualRange&) = delete;
+    VirtualRange& operator=(const VirtualRange&) = delete;
+    ~VirtualRange()
+    {
+        if (base) VirtualFree(base, 0, MEM_RELEASE);
+    }
+};
+
 unsigned failures = 0;
 void expect(bool ok, const char* what)
 {
@@ -106,6 +118,18 @@ struct Gpu {
         pso.pRootSignature = root.Get();
         pso.CS = {vm_translation_cs, sizeof(vm_translation_cs)};
         return SUCCEEDED(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&pipeline)));
+    }
+
+    // Waits for all submitted work, whether or not the last dispatch completed its own wait.
+    void wait_idle()
+    {
+        if (!queue || !fence) return;
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (event && SUCCEEDED(queue->Signal(fence.Get(), ++value)) &&
+            SUCCEEDED(fence->SetEventOnCompletion(value, event))) {
+            WaitForSingleObject(event, INFINITE);
+        }
+        if (event) CloseHandle(event);
     }
 
     // One dispatch with both root UAVs given as raw GPU addresses.
@@ -179,32 +203,45 @@ int device_checks(bool warp)
 
     // Refusals: a reserve-only range, and an address inside an allocation.
     {
-        void* reserved = VirtualAlloc(nullptr, range_size, MEM_RESERVE, PAGE_READWRITE);
-        ComPtr<ID3D12Heap> heap;
-        const HRESULT hr = gpu.device->OpenExistingHeapFromAddress(reserved, IID_PPV_ARGS(&heap));
+        const VirtualRange reserved(VirtualAlloc(nullptr, range_size, MEM_RESERVE, PAGE_READWRITE));
+        if (!reserved.base) {
+            std::puts("setup error: reserve-only VirtualAlloc failed");
+            return 1;
+        }
+        ComPtr<ID3D12Heap> refused;
+        const HRESULT hr = gpu.device->OpenExistingHeapFromAddress(reserved.base, IID_PPV_ARGS(&refused));
         std::printf("reserve-only range hr=0x%08lx\n", static_cast<unsigned long>(hr));
         expect(FAILED(hr), "a reserve-only range cannot be opened as a heap");
-        VirtualFree(reserved, 0, MEM_RELEASE);
     }
-    auto* a = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, range_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    if (!a) return 1;
+    const VirtualRange range(VirtualAlloc(nullptr, range_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!range.base) {
+        std::puts("setup error: committed VirtualAlloc failed");
+        return 1;
+    }
+    std::uint8_t* const a = range.base;
     {
-        ComPtr<ID3D12Heap> heap;
-        const HRESULT hr = gpu.device->OpenExistingHeapFromAddress(a + range_size / 2, IID_PPV_ARGS(&heap));
+        ComPtr<ID3D12Heap> refused;
+        const HRESULT hr = gpu.device->OpenExistingHeapFromAddress(a + range_size / 2, IID_PPV_ARGS(&refused));
         std::printf("interior address hr=0x%08lx\n", static_cast<unsigned long>(hr));
         expect(FAILED(hr), "an address inside the allocation cannot be opened as a heap");
     }
 
-    // Device path: wrap all of A once and place one buffer over it. Its GPU address is B.
+    // Everything below that uses A is declared after `range`. On every return, `idle` waits for
+    // submitted work first, then these are released, and only then does `range` free A.
     ComPtr<ID3D12Heap> heap;
+    ComPtr<ID3D12Resource> whole, part, other;
+    struct Idle {
+        Gpu& gpu;
+        ~Idle() { gpu.wait_idle(); }
+    } idle{gpu};
+
+    // Device path: wrap all of A once and place one buffer over it. Its GPU address is B.
     HRESULT hr = gpu.device->OpenExistingHeapFromAddress(a, IID_PPV_ARGS(&heap));
     std::printf("committed range hr=0x%08lx\n", static_cast<unsigned long>(hr));
     if (hr == E_NOTIMPL || hr == DXGI_ERROR_UNSUPPORTED) {
         std::puts("OpenExistingHeapFromAddress unsupported on this adapter");
-        VirtualFree(a, 0, MEM_RELEASE);
         return 77;
     }
-    ComPtr<ID3D12Resource> whole;
     const auto whole_desc = buffer_desc(range_size, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
                                                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     if (SUCCEEDED(hr)) {
@@ -212,10 +249,7 @@ int device_checks(bool warp)
                                               IID_PPV_ARGS(&whole));
     }
     expect(SUCCEEDED(hr), "wrap the committed range and place one buffer over it");
-    if (FAILED(hr)) {
-        VirtualFree(a, 0, MEM_RELEASE);
-        return 1;
-    }
+    if (FAILED(hr)) return 1;
     const RangePair pair{reinterpret_cast<std::uintptr_t>(a), whole->GetGPUVirtualAddress(), range_size};
     std::printf("B != A: %d\n", pair.b != pair.a);
 
@@ -230,7 +264,6 @@ int device_checks(bool warp)
     // GPU -> CPU: a live resource's own GPU address, translated back with va - B + A.
     {
         constexpr std::uint64_t offset = 0x200000;
-        ComPtr<ID3D12Resource> part;
         const auto part_desc = buffer_desc(0x10000, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
                                                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         hr = gpu.device->CreatePlacedResource(heap.Get(), offset, &part_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
@@ -256,7 +289,6 @@ int device_checks(bool warp)
 
     // Mismatched ranges: an address from another resource passes through, and a wrong B misplaces data.
     {
-        ComPtr<ID3D12Resource> other;
         D3D12_HEAP_PROPERTIES props{};
         props.Type = D3D12_HEAP_TYPE_DEFAULT;
         const auto other_desc = buffer_desc(0x10000, D3D12_RESOURCE_FLAG_NONE);
@@ -284,7 +316,6 @@ int device_checks(bool warp)
         expect(ran && bad == words && untouched, "a B off by one 64 KiB page misses the intended words");
     }
 
-    VirtualFree(a, 0, MEM_RELEASE);
     std::printf("device failures=%u\n", failures);
     return failures ? 1 : 0;
 }
