@@ -3622,6 +3622,19 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_apu_address_provider_faulty>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_apu_address PROPERTIES TIMEOUT 60)
 
+    add_library(cpu_acphal_hal_provider SHARED tests/cpu/acphal_hal_provider.cpp tests/cpu/acphal_hal_provider.def)
+    add_library(cpu_acphal_hal_provider_faulty SHARED tests/cpu/acphal_hal_provider.cpp tests/cpu/acphal_hal_provider.def)
+    target_compile_definitions(cpu_acphal_hal_provider_faulty PRIVATE ACPHAL_TEST_FAULTY)
+    add_executable(cpu_acphal_hal_caller tests/cpu/acphal_hal_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_acphal_hal_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_acphal_hal_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_acphal_hal_caller PRIVATE cpu_acphal_hal_provider cpu_exe_io)
+    add_test(NAME cpu_native_acphal_hal COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/acphal_hal_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_acphal_hal_caller>" "$<TARGET_FILE:cpu_acphal_hal_provider>"
+        "$<TARGET_FILE:cpu_acphal_hal_provider_faulty>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_acphal_hal PROPERTIES TIMEOUT 60)
+
     add_library(cpu_dstorage_provider SHARED tests/cpu/dstorage_provider.cpp tests/cpu/dstorage_provider.def)
     add_executable(cpu_dstorage_caller tests/cpu/dstorage_caller.asm tests/cpu/exe_startup.asm)
     set_target_properties(cpu_dstorage_caller PROPERTIES LINKER_LANGUAGE CXX)
