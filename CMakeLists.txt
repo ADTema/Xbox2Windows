@@ -117,6 +117,27 @@ target_include_directories(xmem_commit_protection_check PRIVATE src)
 target_compile_features(xmem_commit_protection_check PRIVATE cxx_std_20)
 add_test(NAME xmem_commit_protection COMMAND xmem_commit_protection_check)
 set_tests_properties(xmem_commit_protection PROPERTIES TIMEOUT 30)
+# Mutation controls: each run flips one expected value and passes only when the
+# named check reports it. An unknown mutation name or an overall PASS fails.
+foreach(mutation_and_check
+        "xva_positive_refused|check_failed: xva_accepted_pair"
+        "xva_commit_accepted|check_failed: xva_commit_bit"
+        "xva_readonly_accepted|check_failed: xva_protection"
+        "xva_state_dependent|check_failed: xva_address_state_independent"
+        "private_second_va_aliases|check_failed: private_second_va_independent.*failing_fields=private_second_va\n"
+        "private_type_mapped|check_failed: private_type.*failing_fields=private_type\n"
+        "mapped_decommit_succeeds|check_failed: mapped_decommit.*failing_fields=mapped_decommit\n")
+  string(FIND "${mutation_and_check}" "|" split)
+  string(SUBSTRING "${mutation_and_check}" 0 ${split} mutation)
+  math(EXPR expected_start "${split} + 1")
+  string(SUBSTRING "${mutation_and_check}" ${expected_start} -1 expected_output)
+  add_test(NAME xmem_commit_protection_mutate_${mutation}
+           COMMAND xmem_commit_protection_check --mutate ${mutation})
+  set_tests_properties(xmem_commit_protection_mutate_${mutation} PROPERTIES
+    TIMEOUT 30
+    PASS_REGULAR_EXPRESSION "${expected_output}"
+    FAIL_REGULAR_EXPRESSION "unknown mutation|xmem_commit_protection: PASS")
+endforeach()
 
 add_executable(windows_placeholder_partition_check tests/windows_placeholder_partition_check.cpp)
 target_compile_features(windows_placeholder_partition_check PRIVATE cxx_std_17)
