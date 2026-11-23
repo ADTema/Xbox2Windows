@@ -3769,6 +3769,25 @@ nonzero-LOD, already-separated and passthrough controls run without a GPU.
 ctest --preset dev --no-tests=error -R '^spirv_compare_sampler_' -V
 ```
 
+### Minimum LOD in the SPIR-V bridge
+
+The pinned Windows SPIRV-Cross build maps the SPIR-V `MinLod` operand to the
+HLSL sampling clamp. The bridge supports non-projected `Sample`, `SampleBias`,
+`SampleGrad` and implicit-LOD `SampleCmp` forms at Shader Model 5 and above.
+It preserves a supplied texel offset and inserts zero when the HLSL overload
+requires one. Cube samplers take the clamp without an offset.
+
+```powershell
+.\tools\setup-spirv-tools.ps1
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^spirv_minlod_' -V
+```
+
+The source-built draw runs three samples against distinct red and green mips.
+Each sample must reach the green mip and match the 64-pixel reference.
+Removing the clamp selects the red mip and must fail at pixel (0, 0).
+
 ## Independent bit and byte alignment readback
 
 The `pixel_aot_align_warp` and `pixel_aot_align_hardware` fixtures run dedicated
