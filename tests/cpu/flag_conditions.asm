@@ -9,6 +9,8 @@ symbol PROC FRAME
         operation lhs
     ELSEIFIDNI <operation>, <dec>
         operation lhs
+    ELSEIFIDNI <operation>, <neg>
+        operation lhs
     ELSE
         operation lhs, rhs
     ENDIF
@@ -196,4 +198,151 @@ FLAG_CASE flags_add_64_e, add, rax, rdx, e
 FLAG_CASE flags_add_64_ne, add, rax, rdx, ne
 FLAG_CASE flags_add_64_s, add, rax, rdx, s
 FLAG_CASE flags_add_64_ns, add, rax, rdx, ns
+FLAG_CASE flags_add_8_b, add, al, dl, b
+FLAG_CASE flags_add_8_ae, add, al, dl, ae
+FLAG_CASE flags_add_8_be, add, al, dl, be
+FLAG_CASE flags_add_8_a, add, al, dl, a
+FLAG_CASE flags_add_8_l, add, al, dl, l
+FLAG_CASE flags_add_8_ge, add, al, dl, ge
+FLAG_CASE flags_add_8_le, add, al, dl, le
+FLAG_CASE flags_add_8_g, add, al, dl, g
+FLAG_CASE flags_add_16_b, add, ax, dx, b
+FLAG_CASE flags_add_16_ae, add, ax, dx, ae
+FLAG_CASE flags_add_16_be, add, ax, dx, be
+FLAG_CASE flags_add_16_a, add, ax, dx, a
+FLAG_CASE flags_add_16_l, add, ax, dx, l
+FLAG_CASE flags_add_16_ge, add, ax, dx, ge
+FLAG_CASE flags_add_16_le, add, ax, dx, le
+FLAG_CASE flags_add_16_g, add, ax, dx, g
+FLAG_CASE flags_add_32_b, add, eax, edx, b
+FLAG_CASE flags_add_32_ae, add, eax, edx, ae
+FLAG_CASE flags_add_32_be, add, eax, edx, be
+FLAG_CASE flags_add_32_a, add, eax, edx, a
+FLAG_CASE flags_add_32_l, add, eax, edx, l
+FLAG_CASE flags_add_32_ge, add, eax, edx, ge
+FLAG_CASE flags_add_32_le, add, eax, edx, le
+FLAG_CASE flags_add_32_g, add, eax, edx, g
+FLAG_CASE flags_add_64_b, add, rax, rdx, b
+FLAG_CASE flags_add_64_ae, add, rax, rdx, ae
+FLAG_CASE flags_add_64_be, add, rax, rdx, be
+FLAG_CASE flags_add_64_a, add, rax, rdx, a
+FLAG_CASE flags_add_64_l, add, rax, rdx, l
+FLAG_CASE flags_add_64_ge, add, rax, rdx, ge
+FLAG_CASE flags_add_64_le, add, rax, rdx, le
+FLAG_CASE flags_add_64_g, add, rax, rdx, g
+FLAG_CASE flags_inc_8_l, inc, al, dl, l
+FLAG_CASE flags_inc_8_ge, inc, al, dl, ge
+FLAG_CASE flags_inc_8_le, inc, al, dl, le
+FLAG_CASE flags_inc_8_g, inc, al, dl, g
+FLAG_CASE flags_inc_16_l, inc, ax, dx, l
+FLAG_CASE flags_inc_16_ge, inc, ax, dx, ge
+FLAG_CASE flags_inc_16_le, inc, ax, dx, le
+FLAG_CASE flags_inc_16_g, inc, ax, dx, g
+FLAG_CASE flags_inc_32_l, inc, eax, edx, l
+FLAG_CASE flags_inc_32_ge, inc, eax, edx, ge
+FLAG_CASE flags_inc_32_le, inc, eax, edx, le
+FLAG_CASE flags_inc_32_g, inc, eax, edx, g
+FLAG_CASE flags_inc_64_l, inc, rax, rdx, l
+FLAG_CASE flags_inc_64_ge, inc, rax, rdx, ge
+FLAG_CASE flags_inc_64_le, inc, rax, rdx, le
+FLAG_CASE flags_inc_64_g, inc, rax, rdx, g
+FLAG_CASE flags_dec_8_l, dec, al, dl, l
+FLAG_CASE flags_dec_8_ge, dec, al, dl, ge
+FLAG_CASE flags_dec_8_le, dec, al, dl, le
+FLAG_CASE flags_dec_8_g, dec, al, dl, g
+FLAG_CASE flags_dec_16_l, dec, ax, dx, l
+FLAG_CASE flags_dec_16_ge, dec, ax, dx, ge
+FLAG_CASE flags_dec_16_le, dec, ax, dx, le
+FLAG_CASE flags_dec_16_g, dec, ax, dx, g
+FLAG_CASE flags_dec_32_l, dec, eax, edx, l
+FLAG_CASE flags_dec_32_ge, dec, eax, edx, ge
+FLAG_CASE flags_dec_32_le, dec, eax, edx, le
+FLAG_CASE flags_dec_32_g, dec, eax, edx, g
+FLAG_CASE flags_dec_64_l, dec, rax, rdx, l
+FLAG_CASE flags_dec_64_ge, dec, rax, rdx, ge
+FLAG_CASE flags_dec_64_le, dec, rax, rdx, le
+FLAG_CASE flags_dec_64_g, dec, rax, rdx, g
+FLAG_CASE flags_neg_8_o, neg, al, dl, o
+FLAG_CASE flags_neg_8_no, neg, al, dl, no
+FLAG_CASE flags_neg_8_p, neg, al, dl, p
+FLAG_CASE flags_neg_8_np, neg, al, dl, np
+FLAG_CASE flags_neg_8_e, neg, al, dl, e
+FLAG_CASE flags_neg_8_ne, neg, al, dl, ne
+FLAG_CASE flags_neg_8_s, neg, al, dl, s
+FLAG_CASE flags_neg_8_ns, neg, al, dl, ns
+FLAG_CASE flags_neg_8_b, neg, al, dl, b
+FLAG_CASE flags_neg_8_ae, neg, al, dl, ae
+FLAG_CASE flags_neg_8_be, neg, al, dl, be
+FLAG_CASE flags_neg_8_a, neg, al, dl, a
+FLAG_CASE flags_neg_8_l, neg, al, dl, l
+FLAG_CASE flags_neg_8_ge, neg, al, dl, ge
+FLAG_CASE flags_neg_8_le, neg, al, dl, le
+FLAG_CASE flags_neg_8_g, neg, al, dl, g
+FLAG_CASE flags_neg_16_o, neg, ax, dx, o
+FLAG_CASE flags_neg_16_no, neg, ax, dx, no
+FLAG_CASE flags_neg_16_p, neg, ax, dx, p
+FLAG_CASE flags_neg_16_np, neg, ax, dx, np
+FLAG_CASE flags_neg_16_e, neg, ax, dx, e
+FLAG_CASE flags_neg_16_ne, neg, ax, dx, ne
+FLAG_CASE flags_neg_16_s, neg, ax, dx, s
+FLAG_CASE flags_neg_16_ns, neg, ax, dx, ns
+FLAG_CASE flags_neg_16_b, neg, ax, dx, b
+FLAG_CASE flags_neg_16_ae, neg, ax, dx, ae
+FLAG_CASE flags_neg_16_be, neg, ax, dx, be
+FLAG_CASE flags_neg_16_a, neg, ax, dx, a
+FLAG_CASE flags_neg_16_l, neg, ax, dx, l
+FLAG_CASE flags_neg_16_ge, neg, ax, dx, ge
+FLAG_CASE flags_neg_16_le, neg, ax, dx, le
+FLAG_CASE flags_neg_16_g, neg, ax, dx, g
+FLAG_CASE flags_neg_32_o, neg, eax, edx, o
+FLAG_CASE flags_neg_32_no, neg, eax, edx, no
+FLAG_CASE flags_neg_32_p, neg, eax, edx, p
+FLAG_CASE flags_neg_32_np, neg, eax, edx, np
+FLAG_CASE flags_neg_32_e, neg, eax, edx, e
+FLAG_CASE flags_neg_32_ne, neg, eax, edx, ne
+FLAG_CASE flags_neg_32_s, neg, eax, edx, s
+FLAG_CASE flags_neg_32_ns, neg, eax, edx, ns
+FLAG_CASE flags_neg_32_b, neg, eax, edx, b
+FLAG_CASE flags_neg_32_ae, neg, eax, edx, ae
+FLAG_CASE flags_neg_32_be, neg, eax, edx, be
+FLAG_CASE flags_neg_32_a, neg, eax, edx, a
+FLAG_CASE flags_neg_32_l, neg, eax, edx, l
+FLAG_CASE flags_neg_32_ge, neg, eax, edx, ge
+FLAG_CASE flags_neg_32_le, neg, eax, edx, le
+FLAG_CASE flags_neg_32_g, neg, eax, edx, g
+FLAG_CASE flags_neg_64_o, neg, rax, rdx, o
+FLAG_CASE flags_neg_64_no, neg, rax, rdx, no
+FLAG_CASE flags_neg_64_p, neg, rax, rdx, p
+FLAG_CASE flags_neg_64_np, neg, rax, rdx, np
+FLAG_CASE flags_neg_64_e, neg, rax, rdx, e
+FLAG_CASE flags_neg_64_ne, neg, rax, rdx, ne
+FLAG_CASE flags_neg_64_s, neg, rax, rdx, s
+FLAG_CASE flags_neg_64_ns, neg, rax, rdx, ns
+FLAG_CASE flags_neg_64_b, neg, rax, rdx, b
+FLAG_CASE flags_neg_64_ae, neg, rax, rdx, ae
+FLAG_CASE flags_neg_64_be, neg, rax, rdx, be
+FLAG_CASE flags_neg_64_a, neg, rax, rdx, a
+FLAG_CASE flags_neg_64_l, neg, rax, rdx, l
+FLAG_CASE flags_neg_64_ge, neg, rax, rdx, ge
+FLAG_CASE flags_neg_64_le, neg, rax, rdx, le
+FLAG_CASE flags_neg_64_g, neg, rax, rdx, g
+flags_neg_mem_32_b PROC FRAME
+    .endprolog
+    mov DWORD PTR [r8+8], ecx
+    neg DWORD PTR [r8+8]
+    mov rax, 0
+    mov rdx, 0
+    nop
+    setb BYTE PTR [r8]
+    mov eax, 42
+    mov r10d, 17
+    cmovb eax, r10d
+    mov DWORD PTR [r8+4], eax
+    jb neg_mem_taken
+    mov eax, 0
+    ret
+neg_mem_taken:
+    mov eax, 1
+    ret
+flags_neg_mem_32_b ENDP
 END
