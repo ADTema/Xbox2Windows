@@ -3129,6 +3129,75 @@ class TestRdna2Scanner(unittest.TestCase):
         with self.assertRaises(ValueError):
             lower(with_v_nop_after_exp, 20, 24, [1, 2, 3, 4])
 
+    def test_valu_3operand_float_math_scanner(self):
+        """Test scanning v_div_fmas_f32 in scan_unsupported_shaders and rejecting v_fma_f16 / v_div_scale_f32."""
+        valid_insns = [
+            "v_div_fmas_f32 v0, v1, v2, v3",
+            "v_div_fmas_f32_e64 v0, v1, v2, v3",
+            "v_div_fmas_f32 v0, v1, v2, v3 clamp",
+        ]
+        for insn in valid_insns:
+            self.assertTrue(is_instruction_supported(insn), f"Expected supported: {insn}")
+
+        invalid_insns = [
+            "v_fma_f16 v0, v1, v2, v3",
+            "v_fma_f16_e64 v0, v1, v2, v3",
+            "v_fma_f16 v0, v1, v2, v3 clamp",
+            "v_fma_f16 v0, v1, v2, v3 op_sel:[1,0,1]",
+            "v_fma_f16 v0, v1, v2, v3 op_sel:[1,0,1] clamp",
+            "v_fma_f16 v0, v1, v2, v3 clamp op_sel:[1,0,1]",
+            "v_fma_f16 v0, -v1, |v2|, 0.5 op_sel:[0,1,0]",
+            "v_div_scale_f32 v0, vcc_lo, v1, v2, v3",
+            "v_div_scale_f32_e64 v0, vcc, v1, v2, v3",
+            "v_div_scale_f32 v0, s52, v1, v2, v3",
+            "v_fma_f16 v0, v1, v2",
+            "v_fma_f16 v0, v1, v2, v3 omod:2",
+            "v_div_scale_f32 v0, v1, v2, v3",
+            "v_div_fmas_f32 v0, v1, v2",
+            "v_div_fmas_f32 v0, v1, v2, v3 omod:2",
+        ]
+        for insn in invalid_insns:
+            self.assertFalse(is_instruction_supported(insn), f"Expected unsupported: {insn}")
+
+    def test_valu_3operand_float_math_lower(self):
+        """Test lowering v_div_fmas_f32 and rejecting unverified v_fma_f16 and v_div_scale_f32."""
+        div_shader = [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cmp_lt_f32 vcc_lo, 0, 1.0",
+            "v_div_fmas_f32 v14, 1.0, 2.0, 3.0",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        hlsl = lower(div_shader, 20, 24, [1, 2, 3, 4])
+        self.assertIn("div_fmas32(", hlsl)
+        self.assertIn("4294967296.0", hlsl)
+
+        # Negative control: v_fma_f16 must be rejected
+        with self.assertRaises(ValueError):
+            lower(["v_fma_f16 v22, v19, v20, v21", *div_shader], 20, 24, [1, 2, 3, 4])
+
+        # Negative control: v_div_scale_f32 must be rejected
+        with self.assertRaises(ValueError):
+            lower(["v_div_scale_f32 v12, vcc_lo, v19, v19, v20", *div_shader], 20, 24, [1, 2, 3, 4])
+
 
 if __name__ == "__main__":
     unittest.main()

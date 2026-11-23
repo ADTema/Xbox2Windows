@@ -4345,3 +4345,39 @@ ctest --preset dev --no-tests=error -R '^pixel_aot_(warp|hardware)$' -V
 
 Python-only controls check HLSL wave-intrinsic translation, register tracking,
 and scanner recognition without requiring a GPU.
+
+## Vector float math division FMA and unverified prescaling
+
+`pixel_aot` rejects `v_div_scale_f32` and `v_fma_f16` (including explicit `_e64`
+spellings). Both instructions remain recognized by the scanner, but are not
+reported as supported lowerings until verified by source-built native RDNA
+readbacks. For `v_div_scale_f32`, a denominator-only threshold cannot reproduce its
+numerator-dependent result and VCC flag (e.g., denominator 1 with numerator 2^100
+takes the RDNA 2 opcode 365 exponent-gap branch scaling by 2^64 with VCC set).
+For `v_fma_f16`, the halfway case `0x3c69 * 0x3faa + 0x89d1` distinguishes single
+rounding to binary16 (`0x4039`) from intermediate rounding through float32 (`0x403a`),
+and destination high-half preservation remains unmeasured without a source-built
+native RDNA readback.
+
+`v_div_fmas_f32` evaluates `div_fmas32(src0, src1, src2, vcc)` using double precision
+with Knuth 2Sum remainder tracking to guarantee strict single-rounding across WARP and
+desktop hardware targets, avoiding double-rounding midpoint tie errors and preventing
+premature float32 underflow before scaling by 2^32 (`4294967296.0`) when VCC is true.
+An offscreen draw through the integer readback target (`check_valu_div_fmas_draw`) with
+runtime constant-buffer inputs tests both VCC conditions and clamping across five cases:
+- Midpoint single-rounding: `(0x3f800001, 0x3fc00000, 0x8d800000)` produces exact sum
+  1.5 + 3*2^-24 - 2^-100 strictly below the midpoint, rounding down to `0x3fc00001`
+  (`0x4fc00001` scaled by 2^32), whereas uncorrected double rounding rounds to even
+  (`0x3fc00002` / `0x4fc00002`);
+- Cancellation: `(0x3f800001, 0x3f7ffffe, 0xbf800000)` produces exact product + addend
+  -2^-46 (`0xa8800000` unscaled, `0xb8800000` scaled by 2^32), where unfused float32 `mad`
+  rounds `1 - 2^-46` prematurely to 1.0 yielding zero;
+- Pre-scale underflow: `(0x00800000, 0x33000000, 0)` produces 2^-151 before scale, which
+  would underflow float32 to zero if rounded early, but scales to 2^-119 (`0x04000000`);
+- Denormal scale boundary: 2^-126 * 0.5 = 2^-127 (`0x00400000`) before scaling by 2^32 to
+  2^-95 (`0x10000000`);
+- Normal arithmetic: 2.0 * 0.5 + 1.0 = 2.0 (`0x40000000` unscaled, `0x50000000` scaled,
+  `0x3f800000` clamped).
+Four negative controls verify that omitting the 2^32 scale, substituting unfused `mad`,
+omitting the 2Sum midpoint correction (double-rounding), or flushing intermediate
+subnormals (`ftz`) report pixel mismatches under `--check-pixel-case`.
