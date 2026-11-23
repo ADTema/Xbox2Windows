@@ -672,6 +672,12 @@ OperationResult run_mesh_indexed(const OperationContext& ctx)
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true));
 }
 
+OperationResult run_mesh_indexed_fallback(const OperationContext& ctx)
+{
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_mesh_entry_table(const OperationContext& ctx)
 {
     const auto binding = ctx.argc == 7 ? MeshConstantBinding::swapped_table : MeshConstantBinding::table;
@@ -839,6 +845,10 @@ constexpr CapabilityGate kGateWaveShuffle{
     D3D_SHADER_MODEL_6_5, false, true, 0,
     "skip: wave shuffle fixture requires SM 6.5 and WaveOps",
     CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateSm60MeshFallback{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: indexed mesh fallback requires SM 6.0",
+    CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm60SamplerViews{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: sampler fixture requires SM 6.0",
@@ -894,6 +904,7 @@ const OperationSpec kOperations[] = {
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
+    {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
     {"--mesh-textured", 6, 6, nullptr, kNoGate, run_mesh_textured},
     {"--compute-mesh-texture", 7, 9, validate_compute_mesh_texture_args, kNoGate, run_compute_mesh_texture},
@@ -1107,6 +1118,8 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-entry")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-indexed-fallback")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry-table", "a", "b", "c", "--bad"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-entry-table")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--compute-mesh-texture", "a", "b", "c", "d", "e", "--bad"},
@@ -1117,6 +1130,8 @@ int run_self_test()
     if (!check_cli({"offscreen_check", "warp", "out.bmp"}, CliAction::draw)) return 1;
     if (!check_cli({"offscreen_check", "hardware", "out.bmp", "vs.cso", "ps.cso"}, CliAction::draw)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "bgra"}, CliAction::operation)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps", "fixture"},
+                   CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin"},
                    CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-ballot", "a.dxil", "case.bin"}, CliAction::operation)) return 1;

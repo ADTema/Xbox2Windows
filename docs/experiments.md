@@ -867,6 +867,8 @@ A 67h address-size prefix selects 32-bit addressing. The lowering wraps base + i
 
 XLATB replaces AL with the byte at RBX + AL. AL is zero-extended, and bits 8 to 63 of RAX and the flags are unchanged. With a 67h prefix the base is EBX and the sum wraps at 32 bits, so the upper half of RBX is ignored. A REX.W prefix (`48 d7`) does not change the operation. `cpu_aot_xlatb` builds four exports from [MASM source](../tests/cpu/xlatb.asm): the plain, REX.W and 67h forms, and two lookups in a row. Each export runs on a 256-byte permutation table in a page committed below 4 GiB. The check compares RAX and ZF/CF for every AL value, with noise in the upper bits of RAX and, for the 67h form, in the upper half of RBX, against the native DLL and an independent reference. Three controls mutate the generated C++ and must mismatch: `signed` sign-extends AL, `noaddr32` keeps the upper half of RBX in the 67h sum (whose reads fault), and `clear` writes the loaded byte over all of RAX. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_xlatb$' -V`.
 
+RDTSC and RDTSCP use an explicit host TSC profile: they supply host ticks and, for RDTSCP, the host IA32_TSC_AUX, with no guarantee of a guest TSC frequency or of a virtual-CPU number. The counter passes through unscaled: EAX holds the low 32 bits and EDX the high 32 bits, with the upper halves of RAX and RDX zeroed and the flags unchanged. RDTSCP also writes TSC_AUX to ECX, zero-extending RCX. The lowering calls `__rdtsc()` and `__rdtscp()`, so each keeps its own instruction, with no fence added to the generated code. It stores the result in a `volatile` local, so a read stays in the code even when the guest overwrites its result; without it, MSVC `/O2` removes such an RDTSC. Because the counter changes between reads, the checks test properties rather than bytes. The [RDTSC source](../tests/cpu/rdtsc.asm) has one RDTSC and two RDTSC in a row, and the [RDTSCP source](../tests/cpu/rdtscp.asm) one RDTSCP, each after `add r8, r8` sets ZF and CF from one of four presets; each file also has one read without a preset whose result is overwritten with 7. The single reads first fill RAX and RDX, and RDTSCP also RCX, with all ones. A [native harness](../tests/cpu/rdtsc_harness.asm), never translated, supplies CPUID and the measurement reads. The checks pin the thread to one logical processor and confirm that it runs there before reading. For the single RDTSC and the RDTSCP they require that the translated read lies between two native reads, each serialized by LFENCE before and after. For every read with a preset they require that the upper halves of the results are zero and that ZF and CF keep their preset. The second of two RDTSC must not be earlier than the first and must differ from it in at least one of the 2,000 rounds. RDTSCP must return the TSC_AUX of the pinned processor, which the RDTSCP check chooses as the highest of the affinity mask with a nonzero TSC_AUX. The exports with overwritten results must return 7. Controls mutate the generated C++ and must break a property: `constant` returns a zero RDTSC counter, `swap` exchanges the halves, `noext` leaves the whole counter in RAX, `noaux` drops TSC_AUX, `stale` keeps the value of each RDTSC's first call, and `flags` and `pflags` flip ZF and CF after RDTSC and RDTSCP. The translation is also built with `cl /O2`. A walk that follows every branch from each export must find every RDTSC and RDTSCP of the source, including the overwritten ones, and the `/O2` build must keep the properties above. The `plain` control removes `volatile` and is built only at `/O2`; there the walk must find the overwritten RDTSC missing. `cpu_aot_rdtsc` checks RDTSC with `constant`, `swap`, `noext`, `stale`, `flags` and both `/O2` builds, and runs on every host. `cpu_aot_rdtscp` checks RDTSCP with `swap`, `noext`, `noaux`, `pflags` and the translated `/O2` build. Each source counts toward coverage only through its own test. `cpu_aot_rdtscp` exits 77 on a host without RDTSCP (CPUID 80000000h reports no leaf 80000001h, or its EDX bit 27 is clear). It also exits 77, after its other checks, on a host whose TSC_AUX is 0 on every processor of the affinity mask, where `noaux` cannot fail. Guest code that converts ticks with its own frequency will see host time; whether a guest-frequency profile belongs in the runtime is open in [#739](https://github.com/R0Y00/Xbox2Windows/issues/739). Run `ctest --preset dev --no-tests=error -R '^cpu_aot_rdtscp?$' -V`.
+
 The RCX-counted branches `loop`, `loope`, `loopne` and `jrcxz` lower to a decrement and a conditional `goto`, and so do their 67h forms, which count in ECX. The behaviour is as follows:
 - None of them changes a flag.
 - `loope` and `loopne` test ZF after the decrement.
@@ -1471,6 +1473,13 @@ cmake --build --preset dev --target cpu_flag_conditions_lifted
 ctest --preset dev --no-tests=error -R '^cpu_aot_flag_conditions$' -V
 ```
 
+`ROL` and `ROR` on 8-, 16-, 32- and 64-bit register and memory operands with counts `1`, `imm8` and `CL` lower through the shared `rotate_bits` helper in `PRELUDE`, masking the count to `bits - 1` (with count `0` as a no-op), zero-extending 32-bit register destinations, and preserving upper bytes on 8- and 16-bit writes. Like shifts, rotates are excluded from `FLAG_NEUTRAL` and `FLAG_PRODUCERS`, so any `Jcc`, `SETcc` or `CMOVcc` reading flags produced by or across `ROL`/`ROR` is rejected. `cpu_aot_switch_rotates` builds [`switch_rotates.asm`](../tests/cpu/switch_rotates.asm) and runs 8,363 differential comparisons across all four widths, register and memory operands, count `0`, counts `>= width * 8`, upper-byte preservation and a narrow 1-byte return, together with 12 rejection controls.
+
+```powershell
+cmake --build --preset dev --target cpu_switch_rotates_lifted cpu_register_probe
+ctest --preset dev --no-tests=error -R '^cpu_aot_switch_rotates$' -V
+```
+
 The supported functions take three integer words in RCX, RDX and R8 and return RAX, of which only the low bytes described below are compared. An entry can instead be translated with a fourth integer word in R9, as described below. Stack arguments (the fifth and later) and floating-point arguments are not supported. A leaf function without a `.pdata` entry is bounded by its executable section. Its walk may not enter an interval owned by another function's unwind entry.
 
 The [source fixture](../tests/cpu/switch.asm) exports seven functions. `select_rva` uses the MSVC layout, and `select_rel` computes the same function through the LLVM layout. Both have seven cases, including two selectors that share a target, a case that falls through into the next, and a default path. `run_ops` runs a byte program in a loop and dispatches every byte through a five-entry table. It stops at the first opcode above 4. Through the register probe, the test compares each original export with the matching lifted function, a reference written in Python, and RBX/RSI sentinels. It runs 600 selector and operand pairs per layout and 138 programs. Half of the pairs carry nonzero upper register halves that must not reach the table index. A control assembles the same source with two entries swapped in each table, and its translation must follow the swapped reference. `shift_narrow` dispatches through a six-entry LLVM-layout table to byte and word `SHL`, `SHR` and `SAR` of a memory destination by `CL`. x86 masks the count to five bits for 8- and 16-bit operands as well, so counts of 8 to 31 still shift (a byte holding 1 shifted left by 8 becomes 0). The translator performs these shifts in 64 bits and truncates the stored result; 4,608 inputs, covering every count from 0 to 31 and count bytes above 31, match the original and the reference. `flag_select` dispatches through an eight-entry LLVM-layout table to `SETL`, `SETBE`, `SETG` into a memory byte, `SETNE` after a 16-bit compare, and `CMOVA`, `CMOVNS` (64-bit, after `TEST`), `CMOVGE` from memory with a `MOV` between compare and consumer, and `CMOVE` after `TEST` with an immediate. It compares EDX with bits 32 to 63 of RDX and returns RAX whole. A 32-bit `CMOVcc` therefore shows that it clears bits 32 to 63 even when the condition is false, and a byte `SETcc` shows that it keeps them. The translation reads a memory source of `CMOVcc` on both outcomes, as the processor does. 4,000 inputs at the signed, unsigned and 16-bit boundaries must match the original and the reference. The swapped-table build exchanges the `SETL` and `CMOVA` entries and must follow the swapped reference. `cmov_read` executes `CMOVNE` after `CMP ECX, ECX`, which never moves but still reads its memory source: called with a null R8 it must fault in the original and in the translation. The translator therefore performs every read of guest memory through a `volatile` load; with an ordinary load, an optimized MSVC Release build drops a read whose value is unused and the null call returns. Each instruction's memory operand is read once, at its own width, into a local declared before the rest of the statement, and every use of the operand names that local: an `ADD` whose result and flags both come from one operand performs one read. Reads of the function's own frame array, which cannot fault, stay ordinary loads. The [dead-read fixture](../tests/cpu/dead_read.asm) stores 1 to the trace before each read and 2 after it. Its exports read a value that is overwritten, compare memory with flags that are never read, read one byte, read two operands whose sum is cleared, return the value read, skip the read on a branch, and take a sum and its zero flag from one read, into a register and in place. `cpu_aot_dead_reads` builds the translation with the project's build and again with a separate `cl /O2` command, calls the original and each translation inside `__try` with fresh trace words and a fresh page, and compares the structured exception code, the return value, the trace and the page. For a readable operand all three return the reference. For a null operand, and for an operand whose read crosses into an inaccessible page, the original raises an access violation after the first marker and before the second, and both translations must do the same; an operand that ends exactly at the page boundary returns, at each width, and the second read of the pair faults when only the first is readable. On the branch that skips the read, the same inaccessible addresses return normally with the first and third markers written. A source control checks that each memory operand is read once through the `volatile` load and that the shared reads are used twice. An unoptimized build performs an ordinary load as well, so the `/O2` builds are the ones that show the difference. Stores are unchanged.
@@ -1587,6 +1596,39 @@ ctest --preset dev --no-tests=error -R "^sgd5_effect_candidates$" -V
 The report follows the effect's stored list order. Each entry gives its stored group, zero-based program index, name, numeric DXIL shader kind and decoded-container SHA-256. Check the DXIL kind when interpreting a group label. A stored VS group can contain a mesh shader (kind 13).
 
 Two independently located local effects yielded 5 and 81 candidates across all groups. Their pixel lists contained 2 and 41 candidates respectively, and every pixel-container digest matched an independent decode. Identifying which candidate a draw uses still requires evidence of pass selection.
+
+## Mesh draw fallback
+
+The bounded mesh translator can emit `cs_6_0` entry `main` and `vs_6_0` entry
+`vertex_main` from the same validated three-vertex, one-primitive program using
+`tools/mesh_entry_aot.py --compute-fallback`. The compute stage keeps the
+original constant buffers and indexed vertex SRV. It writes counts, positions,
+primitive indices and optional PARAM0 to a 128-byte buffer. The runner transitions
+the buffer from UAV to vertex SRV and issues a triangle-list draw. The vertex stage
+uses `SV_VertexID` to follow the generated indices and passes PARAM0 to the
+translated pixel stage as `TEXCOORD0`.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^mesh_indexed_fallback_(hardware|warp)$' -V
+```
+
+On Windows 10 22H2 build 19045.6456, the GTX 1060 6 GB (32.0.15.6094) and in-box
+WARP (10.0.19041.5794) both matched all 128 output bytes and all 1,024 pixels for
+the full and partial triangles, two partial draws with independent changes to
+the compute constant buffers, and both vertex-color gradients. The controls
+required a clean debug layer when available. They detected a changed guard
+at byte 76 with zero pixel differences, a collapsed index at byte 72 with 276
+pixel differences, and a stale palette with 992 pixel differences and matching
+exports. DXC 1.9.2602.17 compiled all stages
+at Shader Model 6.0. The debug layer reported zero errors and warnings.
+All seven native and fallback mesh tests also passed on app-local WARP 1.0.22
+with Agility SDK 1.620.2.
+
+This fallback covers the single-group specialization below. The supported
+shape has three vertices, one triangle and optional PARAM0. The hardware's
+native wave width is not involved because the translator specializes the
+guest wave behavior offline for this shape.
 
 ## Single-group mesh entry specialization
 
@@ -2584,6 +2626,8 @@ The e64 draws use `offscreen_check <backend> --check-pixel-batch <shader.cso> <c
 `v_mad_f32` and `v_mac_f32` round the product to binary32 before the add; they are not fused. LLVM 15's AMDGPU backend selects them for an unfused multiply-add only when binary32 denormals are flushed: `SITargetLowering::isFMADLegal` notes that they do not support denormals. Both go through a helper that flushes each operand, the product and the sum to signed zero and keeps the two roundings with `precise`; `v_mac_f32` accumulates into its destination. The draw checks 4097 × 4097 − 16785408 for both instructions, which is 0 unfused and 1.0 fused, and 2^-127 × 2^126 + 0.5, which is 0.5 with the denormal input flushed and 1.0 without. References that expect the fused or the denormal-preserving result must report a mismatch. At commit d311159 the draw matched on an RTX 4070 Ti (driver 32.0.16.1088) and on WARP 10.0.26100.9818, and all three wrong references were detected. Whether Scarlett also flushes a denormal product or sum, as the helper does, is not measured.
 
 `v_frexp_mant_f32` (in e32 and e64 encodings) and `v_ldexp_f32` lower through explicit IEEE-754 binary32 bit helpers (`frexp_mant32` and `ldexp32`) so subnormals, signed zero, infinity, NaN, and large exponent shifts stay independent of desktop driver flush-to-zero modes. `v_ldexp_f32` accepts float source modifiers on `src0` and `clamp`, while decoding `src1` as a signed 32-bit integer and rejecting float modifiers on the exponent. Binary and draw fixtures check normal values, signed zero, source negation and absolute value, runtime scalar exponents, negative exponents, and output clamping; replacing `v_frexp_mant_f32` with `v_mov_b32` or inverting a `v_ldexp_f32` exponent sign must report a pixel mismatch.
+
+`v_frexp_exp_i32_f32` in e32 and e64 encodings returns a signed 32-bit exponent. The binary32 bit helper handles normal and subnormal inputs and returns zero for signed zeros, infinities and NaNs. Source negation and absolute value leave the magnitude unchanged, so the lowerer can omit float sign operations that could flush subnormals. The lowerer keeps the result as integer bits in the destination register. The synthetic draw compares those bits before pixel export for 12 input words, including the smallest and largest subnormals. A reference with an exponent one too large for the smallest subnormal must report a pixel mismatch. Run the dedicated cases with `ctest --preset dev --no-tests=error -R '^pixel_aot_frexp_exp_'`.
 
 Quad-local `DPP16` (`quad_perm` with `row_mask:0xf bank_mask:0xf`) and `DPP8` (`dpp8` repeating the same 2×2 quad permutation on lanes 0–3 and 4–7) lower across 23 32-bit integer, 24-bit multiply, bitwise, shift and bit-scan `VOP1`/`VOP2` forms (`add_nc_u32`, `sub_nc_u32`, `subrev_nc_u32`, `min`/`max` `i32`/`u32`, `mul`/`mul_hi` `i24`/`u24`, `and`/`or`/`xor`/`xnor`/`not_b32`, `lshlrev`/`lshrrev_b32`, `ashrrev_i32`, `bfrev_b32`, `ffbl_b32` and `ffbh_u32`/`ffbh_i32`) via SM 6.0 quad intrinsics, emitting 12-bit-split `dpp_mul_hi_{u,i}24` and MSB-indexed `dpp_ffbh_{u,i}32` helpers only when used. The `dpp_int32` fixture derives integer quad lane ID `{0, 1, 2, 3}` from `uv.x`/`uv.y`, tests all 23 forms across three constant sets (including negative/extreme `i24` products, zero/all-ones bit scans and shift counts `>= 32`), exports all four bytes of the 32-bit accumulator as exact `[0, 255]` integers, and checks five mutations (`AcrossX` vs `AcrossY`, cyclic `dpp8` rotation, `ashrrev` vs `lshrrev`, signed vs unsigned `mul_hi` and `ffbh`) that must each report a mismatch. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
@@ -3646,6 +3690,37 @@ must fail every reference.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^pixel_aot_align_(warp|hardware)$' -V
+```
+
+Python-only controls check explicit reference words and translator acceptance.
+Those controls do not establish GPU execution; the command above must pass on
+the named backend before recording readback evidence.
+
+## Independent VOP3 ternary integer ALU readback
+
+The `pixel_aot_vop3_ternary_int_warp` and `pixel_aot_vop3_ternary_int_hardware` fixtures run
+dedicated 3-operand integer ALU programs covering 8 instructions:
+- `v_add3_u32`: `(src0 + src1 + src2)`
+- `v_or3_b32`: `(src0 | src1 | src2)`
+- `v_xor3_b32`: `(src0 ^ src1 ^ src2)`
+- `v_and_or_b32`: `((src0 & src1) | src2)`
+- `v_xad_u32`: `((src0 ^ src1) + src2)`
+- `v_lshl_or_b32`: `((src0 << (src1 & 31)) | src2)`
+- `v_lshl_add_u32`: `((src0 << (src1 & 31)) + src2)`
+- `v_add_lshl_u32`: `((src0 + src1) << (src2 & 31))`
+
+All 8 instructions are included in the source-built binary round trip. Each exports four
+observable UINT channels; the fourth instruction in each program aliases its second source
+and destination register.
+
+Each group has 30 input/reference cases from three asymmetric word pairs and ten shift/add
+counts (0, 1, 2, 3, 4, 8, 16, 24, 31, 32). References use 32-bit integer arithmetic.
+Input and output words avoid NaN and subnormal encodings so float register transport
+cannot obscure the instruction comparison. A wrong expected word is surrounded by correct
+cases; a separately compiled shader with mutated operations must fail every reference.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_vop3_ternary_int_(warp|hardware)$' -V
 ```
 
 Python-only controls check explicit reference words and translator acceptance.
