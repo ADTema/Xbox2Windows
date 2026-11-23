@@ -5435,3 +5435,18 @@ suite checks forwarded exports and ordinals, missing symbols, forwarder cycles,
 ambiguous local basenames, delay-import reachability, deterministic JSON output,
 path escapes, symlinks, hard-linked outputs and malformed PE CLI rejection. All tests use synthetic
 metadata and fake local files; no title files or binary fixtures are checked in.
+
+### Paired exchanges and a full-wave LDS counter
+
+The compute profile lowers the returning dword exchange within a 16-byte
+private record and the returning stride-64 qword exchange in two initialized
+planes. The destination receives both pre-exchange values, including when its
+registers overlap both inputs. `ds_append` and `ds_consume` use the counter at
+LDS byte zero with zero M0 and a full wave32. The lane-zero word must already
+be initialized. Each instruction broadcasts the old word and changes the
+counter by 32 modulo 2^32. Other private words retain their values.
+
+The `compute_store_aot_lds_private` and `compute_store_aot_lds_strided`
+fixtures check exchange ordering, operand aliasing, counter broadcast,
+wraparound and group isolation. Their mutations reverse exchange offsets or
+counter direction. The binary fixture round-trips the four forms with LLVM 15.
