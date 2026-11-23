@@ -18,7 +18,7 @@ POLICY = {
         "d3d12_xs.dll": "Xbox2Windows builds src/d3d12_xs_shim.cpp as d3d12_xs.dll",
     },
     "stub": {
-        "xgameruntime.dll": "GDK runtime module; no Xbox2Windows shim in this tree",
+        "xgameruntime.dll": "GDK runtime module; no implemented Xbox2Windows provider in this tree",
         "xg_xs.dll": "GDK console GPU module; no Xbox2Windows shim in this tree",
     },
     "windows": frozenset({
