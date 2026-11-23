@@ -630,7 +630,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     foreach(adapter IN ITEMS hardware warp)
         foreach(bridge IN ITEMS address_window:draw sampler_views:sampler ballot_extract:ballot
                                 compaction:compaction compare_sampler:compare_sampler minlod:minlod
-                                minlod_levels:minlod_levels minlod_fractional:minlod_fractional)
+                                minlod_exact:minlod_exact minlod_levels:minlod_levels
+                                minlod_fractional:minlod_fractional)
             string(REPLACE ":" ";" bridge "${bridge}")
             list(GET bridge 0 name)
             list(GET bridge 1 driver)
