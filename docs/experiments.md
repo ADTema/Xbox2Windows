@@ -4046,6 +4046,27 @@ ctest --preset dev --no-tests=error -R '^cpu_native_transfer_mem$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_transfer_mem$' -V
 ```
 
+### Memory transfer prerequisite and failure chain
+
+This fixture exercises the sequence where a caller checks tools-memory availability, queries working-set statistics, evaluates available memory budget, and transfers memory under partition 1. The source-built caller ([`transfer_chain_caller.asm`](../tests/cpu/transfer_chain_caller.asm)) imports `XMemIsToolsMemAvailable`, `XMemGetWorkingSetStatistics`, and `XMemTransferMemory` by name from `xmem.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled test provider ([`transfer_chain_provider.cpp`](../tests/cpu/transfer_chain_provider.cpp)), it verifies the prerequisite and failure isolation paths:
+
+- **Case 1 (Success reaches transfer)**: Tools-memory query returns `TRUE`, `XMemGetWorkingSetStatistics` with selector `0x2000000A` reports total and used budget (32 MiB total, 16 MiB used; difference 16 MiB), and transfer memory transfers 16 MiB under test-provider policy partition 1. Returns milestone exit code `0x870`.
+- **Case 2 (Tools-memory unavailable)**: When tools-memory query returns `FALSE` (the no-tools desktop policy established in #896), the sequence is blocked immediately. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x101`.
+- **Case 3 (Working-set statistics failure)**: When `XMemGetWorkingSetStatistics` returns `FALSE` or fails, the sequence is aborted immediately. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x102`.
+- **Case 4 (Zero available budget)**: When working-set statistics reports zero available budget (`total <= used`), transfer is skipped. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x103`.
+- **Case 5 (Transfer failure isolation)**: When `XMemTransferMemory` returns `FALSE`, the failure is isolated and prior state remains intact. The provider records the transfer attempt (`transfer_calls == 1`) without reporting successful ownership transfer, returning exit code `0x104`.
+
+The specific fixture inputs tested (`selector = 0x2000000A`, `partition = 1`, 2 MiB alignment rounding, 16 MiB clamp) are synthetic fixture inputs chosen for this test. Partition selector 1, alignment, and maximum bounds are test-provider policy behaviors; native console transfer semantics remain open.
+
+A changed-selector patch control alters `0x2000000A` to `0x2000000B` in the caller binary: under both the Windows native loader and `pe_map`, the provider rejects the unrecognized selector, the query fails, and the caller exits with `0x102` with transfer uncalled.
+
+On success, the caller exits with `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process cleanly with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return across all cases. Independent negative controls confirm that withholding any of `XMemIsToolsMemAvailable`, `XMemGetWorkingSetStatistics`, or `XMemTransferMemory` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_transfer_chain$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_transfer_chain$' -V
+```
+
 ### Grouped allocation descriptor builders
 
 In the inspected Bink image, the function interval beginning at RVA `0x67c0` contains direct calls to the group initializer (`0x25b80`), append helper (`0x25b20`) and grouped allocator (`0x25a40`). The initializer places two adjacent arrays after a 64-byte header. Each successful append records a destination and a padded stride. With five available slots, requests of 0, 33, 1, 1025 and 32 bytes produced strides of 32, 64, 128, 1280 and 512 bytes in order. The stride in 32-byte units is congruent to the previous total in units plus one, modulo 32. All five stored strides were even. These helpers do not establish who produces odd tagged entries.
