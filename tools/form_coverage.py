@@ -26,6 +26,7 @@ Python standard library only.
 import argparse
 from datetime import datetime
 import json
+import math
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -59,14 +60,28 @@ CPU_FIXTURES = {
     "bink_descriptors": "cpu_bink_descriptors",
     "switch": "cpu_aot_jump_tables",
     "flag_conditions": "cpu_aot_flag_conditions",
+    "dead_read": "cpu_aot_dead_reads",
     "switch_addr32": "cpu_aot_switch_addr32",
     "fourth_arg": "cpu_aot_fourth_argument",
     "repeat_call": "cpu_aot_repeated_call",
     "working_set_delta": "cpu_working_set_delta",
     "xlatb": "cpu_aot_xlatb",
+    "rdtsc": "cpu_aot_rdtsc",
+    "rdtscp": "cpu_aot_rdtscp",
+    "rdtsc_harness": None,  # native CPUID and serialized reads
+    "rdrand": "cpu_aot_rdrand",
+    "rdseed": "cpu_aot_rdseed",
+    "rdrand_harness": None,  # native CPUID and RFLAGS reads
+    "cpuid": "cpu_aot_cpuid",
+    "xgetbv": "cpu_aot_xgetbv",
+    "cpuid_harness": None,  # native CPUID, OSXSAVE and XGETBV reads
+    "mxcsr_harness": None,  # native MXCSR reads and writes
     "exe_entry": "cpu_aot_exe_entry",
     "xchg": "cpu_aot_xchg",
     "address_size": "cpu_aot_address_size",
+    "avx2_regs": "cpu_aot_avx2_regs",
+    "avx_int_regs": "cpu_aot_avx_int_regs",
+    "avx_move_regs": "cpu_aot_avx_move_regs",
     "call_pair": "cpu_aot_call_pair",
     "movbe": "cpu_aot_movbe",
     "bmi1": "cpu_aot_bmi1",
@@ -117,8 +132,21 @@ def masm_mnemonics(text):
             words = words[1:]
         if not words:
             continue
+        if words[0] == "int" and len(words) > 1 and masm_integer(words[1]) == 3:
+            # ML64 has no INT3 mnemonic and encodes INT 3 (also written 3h or 03h) as the one-byte CC form,
+            # the reference's int3.
+            found.add("int3")
+            continue
         found.add(x64_canonical(words[0]))
     return found
+
+
+def masm_integer(token):
+    """A MASM integer literal (decimal, or hexadecimal with an h suffix), or None."""
+    try:
+        return int(token[:-1], 16) if token.endswith("h") else int(token, 10)
+    except ValueError:
+        return None
 
 
 def x64_canonical(mnemonic):
@@ -147,6 +175,19 @@ def read_results(junit):
     """CTest JUnit status per test (pass, fail or skip; CTest writes skips as status="notrun"), and the
     run's (start, end) in seconds since the epoch. CTest writes the start as local time in whole seconds."""
     suite = ET.parse(junit).getroot()
+    if suite.tag != "testsuite":
+        # Records are matched to the run's time window, so a file merging several runs cannot be used.
+        raise ValueError(f"expected one CTest <testsuite> root, found <{suite.tag}>")
+    try:
+        start = datetime.fromisoformat(suite.get("timestamp")).timestamp()
+    except (TypeError, ValueError):
+        raise ValueError(f"<testsuite> timestamp {suite.get('timestamp')!r} is not an ISO date and time") from None
+    try:
+        duration = float(suite.get("time"))
+    except (TypeError, ValueError):
+        raise ValueError(f"<testsuite> time {suite.get('time')!r} is not a number of seconds") from None
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError(f"<testsuite> time {suite.get('time')!r} must be finite and nonnegative")
     status = {"run": "pass", "fail": "fail", "notrun": "skip"}
     results = {}
     for case in suite.iter("testcase"):
@@ -156,8 +197,7 @@ def read_results(junit):
         elif state == "pass" and case.find("skipped") is not None:
             state = "skip"
         results[case.get("name")] = state
-    start = datetime.fromisoformat(suite.get("timestamp")).timestamp()
-    return results, (start - 1, start + float(suite.get("time")) + 2)
+    return results, (start - 1, start + duration + 2)
 
 
 def read_records(directory, window):
@@ -175,7 +215,7 @@ def fixture_status(results, tests):
     return "skip" if "skip" in states else "fail" if "fail" in states else "absent"
 
 
-def summarize(reference, fixtures, select):
+def summarize(reference, fixtures, select, *, include_gaps=False):
     """fixtures: {name: (mnemonics, status)}. Returns covered/known counts and per-group detail."""
     covered = set().union(set(), *(select(m, reference) for m, s in fixtures.values() if s == "pass"))
     skipped = set().union(set(), *(select(m, reference) for m, s in fixtures.values() if s == "skip")) - covered
@@ -187,12 +227,23 @@ def summarize(reference, fixtures, select):
         g["covered"] += (group, form) in covered
     unmatched = sorted(m for m in set().union(set(), *(m for m, _ in fixtures.values()))
                        if not select({m}, reference))
-    return {"covered": len(covered), "total": len(reference), "known_in_fixtures": len(known),
+    result = {"covered": len(covered), "total": len(reference), "known_in_fixtures": len(known),
             "blocked_by_skip": sorted(f"{g} {f}" for g, f in skipped), "groups": groups,
             "fixture_forms_not_in_reference": unmatched}
+    if include_gaps:
+        gaps = []
+        for form in sorted(reference - covered):
+            evidence = "unobserved"
+            if form in skipped:
+                evidence = "skipped"
+            elif form in known:
+                evidence = "observed_without_pass"
+            gaps.append((*form, evidence))
+        result["gaps"] = gaps
+    return result
 
 
-def measure(results, root=ROOT, records=None):
+def measure(results, root=ROOT, records=None, *, gaps_for=None):
     """results: {test: status}. root: the repository whose tests/cpu is scanned (the check passes a
     temporary one). records: {test: accepted gfx mnemonics} from read_records."""
     cpu = {}
@@ -226,9 +277,9 @@ def measure(results, root=ROOT, records=None):
         "fixtures": fixtures,
         "unclassified": sorted(name for name, status in fixtures.items() if status == "unclassified"),
         "shader_records": sorted(shaders),
-        "x64_zen2": summarize(x64, cpu, x64_forms),
-        "gfx1013": summarize(load_reference("gfx1013.tsv"), shaders, gfx_forms),
-        "gfx1030": summarize(load_reference("rdna2.tsv"), shaders, gfx_forms),
+        "x64_zen2": summarize(x64, cpu, x64_forms, include_gaps=gaps_for == "x64_zen2"),
+        "gfx1013": summarize(load_reference("gfx1013.tsv"), shaders, gfx_forms, include_gaps=gaps_for == "gfx1013"),
+        "gfx1030": summarize(load_reference("rdna2.tsv"), shaders, gfx_forms, include_gaps=gaps_for == "gfx1030"),
     }
 
 
@@ -253,14 +304,28 @@ def main(argv):
     parser.add_argument("--records", type=Path, default=RECORDS,
                         help="directory of shader translation records (default: %(default)s)")
     parser.add_argument("--json", type=Path, help="also write the full result, per group, as JSON")
+    parser.add_argument("--gaps", choices=("x64_zen2", "gfx1013", "gfx1030"),
+                        help="print uncovered forms for one architecture as tab-separated group, form and evidence")
     args = parser.parse_args(argv)
-    results, window = read_results(args.junit)
-    m = measure(results, records=read_records(args.records, window))
+    try:
+        results, window = read_results(args.junit)
+    except (OSError, ET.ParseError, ValueError) as error:
+        print(f"form_coverage: {args.junit}: {error}", file=sys.stderr)
+        return 2
+    m = measure(results, records=read_records(args.records, window), gaps_for=args.gaps)
+    if args.gaps:
+        gaps = m[args.gaps].pop("gaps")
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(m, indent=1) + "\n", encoding="utf-8")
-    print(report(m))
+    if args.gaps:
+        print("group\tform\tevidence")
+        for row in gaps:
+            print("\t".join(row))
+    else:
+        print(report(m))
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    raise SystemExit(main(sys.argv[1:]))

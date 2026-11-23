@@ -20,7 +20,7 @@ EXPERIMENTS = {
     ("xmem.dll", "XMemAlloc"): "era_heap_allocation, era_heap_failure, era_heap_concurrency, era_heap_observed_words, era_heap_large_alignment, xmem_shim_allocation",
     ("xmem.dll", "XMemFree"): "era_heap_allocation, era_heap_concurrency, era_heap_observed_words, era_heap_large_alignment, xmem_shim_allocation",
     ("xmem.dll", "XMemVirtualQuery"): "desktop_memory_query, era_query_fields, era_query_tail, xmem_shim_query: Windows page states; tail byte is a desktop policy; Scarlett ABI unverified",
-    ("xmem.dll", "XMemGetWorkingSetStatistics"): "desktop_memory_query, xmem_shim_working_set: desktop xmem.dll reports unsupported; Scarlett scope and units unverified",
+    ("xmem.dll", "XMemGetWorkingSetStatistics"): "desktop_memory_query, xmem_shim_working_set_*: desktop xmem.dll returns DXGI GPU memory usage in bytes for selector 0x20000001; Scarlett scope unverified",
     ("d3d12_xs.dll", "D3D12SerializeVersionedRootSignature"): "desktop_root_signature",
     ("d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer"): "desktop_root_signature",
 }
@@ -160,6 +160,20 @@ def export_keys(rows):
     return keys
 
 
+def _parse_forwarded_ordinal(digits):
+    """Parse a forwarded ordinal as an ASCII decimal integer in 1..65535, or return None."""
+    if not digits:
+        return None
+    value = 0
+    for ch in digits:
+        if ch < "0" or ch > "9":
+            return None
+        value = value * 10 + (ord(ch) - ord("0"))
+        if value > 0xFFFF:
+            return None
+    return value if value >= 1 else None
+
+
 def resolve_desktop(dll, symbol, importer, contracts, system_exports, package_exports=None, known_dlls=()):
     """Follow export forwarders without loading any DLL.
 
@@ -212,6 +226,12 @@ def resolve_desktop(dll, symbol, importer, contracts, system_exports, package_ex
         if not separator or not module or not name:
             status = "invalid_forwarder"
             break
+        if name.startswith("#"):
+            ordinal = _parse_forwarded_ordinal(name[1:])
+            if ordinal is None:
+                status = "invalid_forwarder"
+                break
+            name = f"#{ordinal}"
         dll, symbol, importer = module.lower() + ".dll", name, Path(host).name.lower()
     return dict(status=status, chain=chain)
 
