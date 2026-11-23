@@ -87,3 +87,16 @@ extern "C" BOOL WINAPI XMemIsToolsMemAvailable()
     // The desktop runtime has no devkit tools-memory partition.
     return FALSE;
 }
+
+// Desktop policy (docs/experiments.md): on a no-tools desktop runtime without devkit
+// tools-memory backing (XMemIsToolsMemAvailable() == FALSE per #896), transfer memory
+// returns FALSE with ERROR_NOT_SUPPORTED and leaves memory and accounting state unchanged.
+// Without independent evidence of runtime parameter validation returning 87
+// (ERROR_INVALID_PARAMETER), all calls take this narrow refusal.
+extern "C" BOOL WINAPI XMemTransferMemory(UINT32 partition, UINT64 byte_count)
+{
+    (void)partition;
+    (void)byte_count;
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
+}
