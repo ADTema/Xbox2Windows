@@ -20,6 +20,7 @@ from pe_inventory import _export_table, parse_image, resolve_desktop
 MAX_IMAGES = 1024
 MAX_IMAGE_BYTES = 512 * 1024 * 1024
 MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+X86_MACHINES = {"IMAGE_FILE_MACHINE_I386", "IMAGE_FILE_MACHINE_AMD64"}
 
 
 def _relative(root, path):
@@ -67,6 +68,25 @@ def _classify(resolution):
     return "bundled_" + status
 
 
+def _check_x86_machines(resolution, importer_machine, images):
+    """A matching export cannot bind an I386 image to an AMD64 DLL or vice versa.
+
+    Other machine combinations are outside this check: hybrid ARM64EC/ARM64X
+    images cannot be classified by an equality comparison of COFF machine tags.
+    """
+    if importer_machine not in X86_MACHINES:
+        return resolution
+    for index, step in enumerate(resolution["chain"]):
+        if not step.get("package") or step["provider"] not in images:
+            continue
+        machine = images[step["provider"]][0]["machine"]
+        if machine in X86_MACHINES and machine != importer_machine:
+            chain = resolution["chain"][:index] + [dict(step,
+                importer_machine=importer_machine, provider_machine=machine)]
+            return dict(status="machine_mismatch", chain=chain)
+    return resolution
+
+
 def summarize(images, entry):
     """Resolve packaged imports using the existing strict PE export/forwarder reader.
 
@@ -89,6 +109,7 @@ def summarize(images, entry):
         for kind, dll, symbol in sorted(set(rows)):
             resolution = resolve_desktop(dll.casefold(), symbol, Path(path).name.casefold(),
                                          {}, lambda _dll: None, packaged)
+            resolution = _check_x86_machines(resolution, images[path][0]["machine"], images)
             per_image[path].append(dict(image=path, kind=kind, dll=dll, symbol=symbol,
                                         status=_classify(resolution),
                                         resolution_status=resolution["status"],
@@ -125,7 +146,8 @@ def summarize(images, entry):
                          if status in fatal or (status.startswith("bundled_") and status != "bundled_export_present"))
     return dict(schema=1, entry=entry,
                 scope="Static package import/export evidence only. External imports, Windows API sets, "
-                      "KnownDLLs, runtime ABI behavior, dynamic loads, and executable startup are unverified.",
+                      "KnownDLLs, runtime ABI behavior, dynamic loads, and executable startup are unverified. "
+                      "I386/AMD64 machine mismatches are checked; other machine combinations are unverified.",
                 images={name: dict(machine=info["machine"], sha256=info["sha256"],
                                    exports=len(info["exports"]), warnings=len(info["parse_warnings"]))
                         for name, (info, _) in sorted(images.items())},

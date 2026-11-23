@@ -5778,6 +5778,14 @@ subnormals (`ftz`) report pixel mismatches under `--check-pixel-case`.
 resolver, but **does not query host Windows DLLs** or load/execute any image.
 The JSON output records direct versus delay imports, resolved package exports,
 forwarder chains, ambiguous package basenames, and unresolved local exports.
+An I386 importer cannot bind an AMD64 package DLL, or the reverse, even when its
+export name matches. Such an edge is `bundled_machine_mismatch`; its final chain
+step records the importer and provider machine tags, and traversal of that
+forwarder chain stops there. The check applies to direct and delayed imports and
+to intermediate forwarders. It does not reject an unrelated DLL that is not
+reachable. Other machine combinations, including ARM64EC/ARM64X hybrids, remain
+unverified rather than being classified by tag equality.
+This follows the [Windows in-process 32/64-bit DLL restriction](https://learn.microsoft.com/en-us/windows/win32/winprog64/process-interoperability).
 It follows static package providers reachable from the chosen EXE, preserving
 intermediate forwarders and preferring unconditional paths. Images not reached by that analysis are listed
 separately. External providers (including Windows system DLLs) are recorded as
@@ -5802,11 +5810,18 @@ under `out/` and must not contain private package data in a public PR.
 
 On a separate, source-built Win64 diagnostic executable, a Linux smoke test
 reported 46 static imports as external/unverified and zero bundled failures:
-no DLLs were included in that diagnostic directory. The self-contained eight-test
+no DLLs were included in that diagnostic directory. The self-contained eleven-test
 suite checks forwarded exports and ordinals, missing symbols, forwarder cycles,
 ambiguous local basenames, delay-import reachability, deterministic JSON output,
-path escapes, symlinks, hard-linked outputs and malformed PE CLI rejection. All tests use synthetic
+path escapes, symlinks, hard-linked outputs, I386/AMD64 import and forwarder mismatches,
+and malformed PE CLI rejection. All tests use synthetic
 metadata and fake local files; no title files or binary fixtures are checked in.
+
+An additional source-built smoke comparison used Clang/LLD 21.1.8 on Linux: an
+AMD64 EXE imports `Start` from `shim.dll`, built once as AMD64 and once as I386
+from the same C function. The matching pair reports one bundled export and zero
+failures; replacing only the DLL with the I386 build reports one machine mismatch.
+Before this check, both packages reported zero failures. Neither image was executed.
 
 
 ### Starting source-built packages with ordinal-only DLL exports
