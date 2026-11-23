@@ -474,7 +474,7 @@ def check_int16_vop3_forms():
             pixel.translate_int(pixel.int16_vop3_ops(group))
         forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_INT16}
         assert len(forms) == 12
-        neighbours = {("VOP3", "v_add_f16_e64"), ("VOP3", "v_cvt_f16_u16_e64")}
+        neighbours = {("VOP3", "v_min_f16_e64"), ("VOP3", "v_cvt_f16_u16_e64")}
         for name in ("gfx1013.tsv", "rdna2.tsv"):
             reference = fc.load_reference(name)
             assert forms <= reference, (name, forms - reference)
@@ -488,6 +488,36 @@ def check_int16_vop3_forms():
     finally:
         pixel.ACCEPTED.clear()
         pixel.ACCEPTED.update(saved)
+def check_f16_arith_forms():
+    """The eight plain binary16 VOP2 forms (e32 and e64 spellings of add, sub, subrev and mul) count as covered once the
+    translator accepts their fixtures; min, max, fmac, ldexp and the DPP and SDWA spellings stay uncovered."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for key in pixel.F16_ARITH_PROGRAMS:
+            pixel.translate_f16(pixel.f16_arith_program(*key))
+        ops = ("add", "sub", "subrev", "mul")
+        forms = {("VOP2", f"v_{op}_f16") for op in ops} | {("VOP3", f"v_{op}_f16_e64") for op in ops}
+        neighbours = {("VOP2", "v_min_f16"), ("VOP2", "v_max_f16"), ("VOP2", "v_fmac_f16"), ("VOP2", "v_ldexp_f16"),
+                      ("VOP3", "v_min_f16_e64"), ("SDWA", "v_add_f16_sdwa"), ("DPP16", "v_add_f16_dpp"),
+                      ("DPP8", "v_add_f16_dpp")}
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not neighbours & covered, (name, neighbours & covered)
+        # Without the binary16 fixtures none of the eight forms is covered.
+        pixel.ACCEPTED.clear()
+        pixel.translate_int(pixel.int16_vop3_ops(0))
+        assert not forms & fc.gfx_forms(pixel.ACCEPTED, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 def check_int16_ternary_forms():
     """The 8 three-operand 16-bit integer VOP3 forms count as covered once the translator accepts their fixtures; the
     nearby VOP3 forms that stay rejected (v_mad_u32_u16, v_mad_i32_i16, v_sad_u16, f16 ops) stay uncovered."""
@@ -501,7 +531,7 @@ def check_int16_ternary_forms():
         forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_INT16_TERNARY}
         assert len(forms) == 8
         neighbours = {("VOP3", "v_mad_u32_u16"), ("VOP3", "v_mad_i32_i16"), ("VOP3", "v_sad_u16"),
-                      ("VOP3", "v_add_f16_e64")}
+                      ("VOP3", "v_min_f16_e64")}
         for name in ("gfx1013.tsv", "rdna2.tsv"):
             reference = fc.load_reference(name)
             assert forms <= reference, (name, forms - reference)
@@ -949,6 +979,7 @@ if __name__ == "__main__":
     check_plain_bitscan_forms()
     check_int16_vop3_forms()
     check_int16_ternary_forms()
+    check_f16_arith_forms()
     check_swap_coverage()
     check_sopk_wait_forms()
     check_s_version_form()
