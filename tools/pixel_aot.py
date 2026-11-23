@@ -1156,6 +1156,18 @@ uint mul_hi_i32(uint a, uint b) {
         "}"
     ),
 }
+# (bit/float source, expression, shared conversion helper)
+DPP_CVT = {
+    "cvt_f32_i32": (False, "float(asint({0}))", None),
+    "cvt_f32_u32": (False, "float({0})", None),
+    "cvt_f32_ubyte0": (False, "float({0} & 0xffu)", None),
+    "cvt_f32_ubyte1": (False, "float(({0} >> 8) & 0xffu)", None),
+    "cvt_f32_ubyte2": (False, "float(({0} >> 16) & 0xffu)", None),
+    "cvt_f32_ubyte3": (False, "float(({0} >> 24) & 0xffu)", None),
+    "cvt_off_f32_i4": (False, "(float(asint({0} << 28) >> 28) * 0.0625f)", None),
+    "cvt_i32_f32": (True, "asfloat(cvt_i32_f32({0}))", "cvt_i32_f32"),
+    "cvt_u32_f32": (True, "asfloat(cvt_u32_f32({0}))", "cvt_u32_f32"),
+}
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
     "bfrev_b32": (1, "reversebits({0})", None),
@@ -4113,6 +4125,26 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_({'|'.join(DPP_CVT)})_dpp (v\d+), (.+)"):
+            op, dst, rest = m.groups()
+            float_source, template, helper = DPP_CVT[op]
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid conversion DPP operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 1)
+            value, absolute, negate = dpp_vgpr(
+                tokens[0], vector, sample_dest, allow_mods=float_source and not is_dpp8
+            )
+            bits = emit_quad_swizzle_u32(lines, i, value, perm)
+            if absolute:
+                bits = f"({bits} & 0x7fffffffu)"
+            if negate:
+                bits = f"({bits} ^ 0x80000000u)"
+            if helper:
+                helpers.add(helper)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {template.format(bits)};")
         elif m := match(rf"({'|'.join(DPP_EXTRA)}) (v\d+), (.+)"):
             op, dst, rest = m.groups()
             if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
