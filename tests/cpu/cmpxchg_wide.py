@@ -4,9 +4,10 @@ Each export loads RAX, RDX, RBX and RCX from a block, runs the instruction on an
 block and stores RAX, RDX, ZF and CF back. The cases cover equal operands, either half differing, upper
 register halves that CMPXCHG8B must ignore or clear, and both CF values, which neither instruction
 changes. A CMPXCHG16B operand that is not 16-byte aligned must fault with the same exception code in
-both DLLs.
+both DLLs. A read-only operand must fault on the write cycle even on a compare mismatch.
 """
 import ctypes
+import mmap
 from pathlib import Path
 import struct
 import sys
@@ -84,6 +85,42 @@ def run(lib, name, offset, memory, rax, rdx, rbx, rcx, cf):
     return bytes(block[offset:offset + len(memory)]), out_rax, out_rdx, block[64], block[65]
 
 
+def check_readonly(native, lifted):
+    protect = ctypes.WinDLL("kernel32", use_last_error=True).VirtualProtect
+    protect.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32,
+                        ctypes.POINTER(ctypes.c_uint32))
+    protect.restype = ctypes.c_int
+    page = mmap.PAGESIZE
+    with mmap.mmap(-1, 2 * page) as block:
+        base = ctypes.addressof(ctypes.c_char.from_buffer(block))
+        target = base + page
+        old = ctypes.c_uint32()
+        if not protect(target, page, 0x02, ctypes.byref(old)):  # PAGE_READONLY
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            for name in EXPORTS:
+                for compare in (0, 1):
+                    struct.pack_into("<QQQQ", block, 16, compare, 0, 1, 2)
+                    for label, lib in (("native", native), ("lifted", lifted)):
+                        sentinels = b"\xcc" * 18
+                        block[48:66] = sentinels
+                        try:
+                            getattr(lib, name)(base, page, 0)
+                        except OSError as error:
+                            prefix = "exception: access violation writing "
+                            message = str(error)
+                            if not message.startswith(prefix) or int(message[len(prefix):], 16) != target:
+                                raise AssertionError(f"{label} {name} compare={compare}: {error}") from error
+                        else:
+                            raise AssertionError(f"{label} {name} compare={compare} did not fault")
+                        if block[48:66] != sentinels:
+                            raise AssertionError(f"{label} {name} wrote results after the fault")
+        finally:
+            if not protect(target, page, old.value, ctypes.byref(ctypes.c_uint32())):
+                raise ctypes.WinError(ctypes.get_last_error())
+    print("read-only CMPXCHG8B and CMPXCHG16B faulted on write for equal and unequal operands")
+
+
 def check(native_path, lifted_path):
     native, lifted = load_lib(native_path), load_lib(lifted_path)
     count = 0
@@ -112,6 +149,7 @@ def check(native_path, lifted_path):
             raise AssertionError(f"offset {offset}: native {faults[('native', offset)]!r}, "
                                  f"lifted {faults[('lifted', offset)]!r}")
     print(f"a CMPXCHG16B operand at offset 4 or 8 raised {faults[('native', 4)]!r} in both DLLs")
+    check_readonly(native, lifted)
     rejections()
 
 

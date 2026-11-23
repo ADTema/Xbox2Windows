@@ -103,6 +103,10 @@ extern "C" __declspec(dllimport) void __stdcall RaiseException(unsigned long, un
     RaiseException(0xc0000005ul, 0, 2, info);
     __assume(0);
 }
+static void cmpxchg_writeback(word address, uint64_t value) {
+    // A failed compare writes the old value back. Preserve the access under optimization.
+    *reinterpret_cast<volatile uint64_t __unaligned*>(address) = value;
+}
 static inline uint8_t aes_gf_mul(uint8_t a, uint8_t b) {
     uint8_t p = 0;
     for (int i = 0; i < 8; ++i) {
@@ -911,15 +915,17 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             if op == M.CMPXCHG8B:
                 stmt = (f"{{ const word addr = {address()}; const uint64_t d = load<uint64_t>(addr), "
                         "acc = (static_cast<uint64_t>(static_cast<uint32_t>(rdx)) << 32) | static_cast<uint32_t>(rax); "
-                        "zero = acc == d; if (zero) store<uint64_t>(addr, "
-                        "(static_cast<uint64_t>(static_cast<uint32_t>(rcx)) << 32) | static_cast<uint32_t>(rbx)); "
-                        "else { rax = static_cast<uint32_t>(d); rdx = d >> 32; } }")
+                        "zero = acc == d; const uint64_t replacement = "
+                        "(static_cast<uint64_t>(static_cast<uint32_t>(rcx)) << 32) | static_cast<uint32_t>(rbx); "
+                        "cmpxchg_writeback(addr, zero ? replacement : d); "
+                        "if (!zero) { rax = static_cast<uint32_t>(d); rdx = d >> 32; } }")
             else:
                 stmt = (f"{{ const word addr = {address()}; if (addr & 15u) raise_cmpxchg16b_alignment(); "
                         "const uint64_t lo = load<uint64_t>(addr), hi = load<uint64_t>(addr + 8); "
                         "zero = lo == rax && hi == rdx; "
-                        "if (zero) { store<uint64_t>(addr, rbx); store<uint64_t>(addr + 8, rcx); } "
-                        "else { rax = lo; rdx = hi; } }")
+                        "cmpxchg_writeback(addr, zero ? rbx : lo); "
+                        "cmpxchg_writeback(addr + 8, zero ? rcx : hi); "
+                        "if (!zero) { rax = lo; rdx = hi; } }")
         elif op in (M.VMOVQ, M.VMOVSD, M.VMOVHPD) and has_wide:
             lanes = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
             if i.op1_kind == K.MEMORY and op != M.VMOVHPD:
