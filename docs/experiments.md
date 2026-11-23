@@ -3648,16 +3648,19 @@ The desktop shim exports `XMemAllocDefault(size, attributes)` and `XMemFreeDefau
 
 ### Physical-page mapping contracts (contiguous and scatter)
 
-Following physical-page allocation, titles map physical pages into a reserved virtual address space using `XMemMapPhysicalPages` (contiguous) and `XMemMapPhysicalPagesScatter` (scatter-gather). The calls require 64 KiB address alignment (`VirtualAddress % 65536 == 0`), a positive page count, and an array of physical page numbers; passing a null page array unbinds the physical pages while leaving the virtual address reservation intact.
+Following physical-page allocation, titles map physical pages into reserved virtual address spaces using `XMemMapPhysicalPages` (contiguous) and `XMemMapPhysicalPagesScatter` (scatter-gather). Public reimplementations and SDK headers declare these entry points ([SlimEra era.h](https://github.com/XWine1/SlimEra/blob/397807a9563f62b56cf7aaea9809b6fa635ba651/era.h), [WinDurango kernelx.h](https://github.com/WinDurango/WinDurango/blob/master/kernelx/kernelx.h)).
 
-A source-built caller ([`map_pages_caller.asm`](../tests/cpu/map_pages_caller.asm)) imports both functions from `xmem.dll` by name and executes seven verification steps through a controlled recording provider ([`map_pages_provider.cpp`](../tests/cpu/map_pages_provider.cpp)):
+A source-built caller ([`map_pages_caller.asm`](../tests/cpu/map_pages_caller.asm)) imports both functions from `xmem.dll` by name and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled recording provider ([`map_pages_provider.cpp`](../tests/cpu/map_pages_provider.cpp)), it exercises eight contract validation steps:
 - **Step 1**: Contiguous mapping to a 64 KiB aligned virtual address, returning the base address.
 - **Step 2**: Contiguous unmapping (`NULL` page array), returning the base address.
 - **Step 3**: Scatter mapping across an array of 64 KiB aligned virtual addresses, returning `TRUE` (`1`).
 - **Step 4**: Scatter unmapping (`NULL` page array), returning `TRUE` (`1`).
 - **Step 5–7**: Negative controls for unaligned virtual address, null virtual address, and null scatter array, each returning `0`.
+- **Step 8**: Internal verification of provider call counters directly within the caller process.
 
-On success, the caller exits with milestone status `0x870`. Both the native Windows loader and `pe_map` produce identical results. When `xmem.dll` is missing, `pe_map` stops at map time before entry with `STATUS["unresolved"]` naming the missing export. Run:
+On success, the caller exits with milestone status `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return. The two loaders consuming the controlled provider verify caller contracts and error propagation; they do not establish console return types, that `NULL` unmaps, that 64 KiB alignment is required, or that virtual address reservations survive unmapping. These remain proposed desktop policies and hypotheses under investigation. Production XMem behavior and physical page registry tracking remain separate (#892).
+
+Two independent negative controls confirm that withholding either `XMemMapPhysicalPages` or `XMemMapPhysicalPagesScatter` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_map_pages$' -V

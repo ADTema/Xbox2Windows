@@ -1,5 +1,10 @@
 EXTERN __imp_XMemMapPhysicalPages:QWORD
 EXTERN __imp_XMemMapPhysicalPagesScatter:QWORD
+EXTERN __imp_get_map_pages_call_count:QWORD
+EXTERN __imp_get_map_pages_unmap_count:QWORD
+EXTERN __imp_get_scatter_map_call_count:QWORD
+EXTERN __imp_get_scatter_unmap_count:QWORD
+PUBLIC native_entry
 
 .data
 aligned_addr    dq 010000000h
@@ -69,6 +74,23 @@ native_entry PROC FRAME
     test eax, eax
     jnz fail_step_7
 
+    ; Step 8: Verify provider call counters directly in caller process
+    call qword ptr [__imp_get_map_pages_call_count]
+    cmp eax, 1
+    jne fail_counters
+
+    call qword ptr [__imp_get_map_pages_unmap_count]
+    cmp eax, 1
+    jne fail_counters
+
+    call qword ptr [__imp_get_scatter_map_call_count]
+    cmp eax, 1
+    jne fail_counters
+
+    call qword ptr [__imp_get_scatter_unmap_count]
+    cmp eax, 1
+    jne fail_counters
+
     ; All checks passed: return milestone status 0x870
     mov eax, 0870h
     jmp done
@@ -93,6 +115,9 @@ fail_step_6:
     jmp done
 fail_step_7:
     mov eax, 0F07h
+    jmp done
+fail_counters:
+    mov eax, 0F08h
     jmp done
 
 done:
