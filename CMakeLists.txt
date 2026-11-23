@@ -2175,24 +2175,27 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(blast_lifted SHARED "${blast_cpp}" "${archive_src}/blast.def")
     target_include_directories(blast_lifted PRIVATE "${archive_src}")
 
-    add_library(archive_codec_lifted SHARED "${archive_src}/codec.cpp")
+    add_library(archive_codec_lifted SHARED "${archive_src}/codec.cpp" "${archive_src}/texture_stdout.cpp")
     target_link_libraries(archive_codec_lifted PRIVATE blast_lifted)
     set_target_properties(archive_codec_lifted PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
-    add_library(archive_codec SHARED "${archive_src}/codec.cpp")
+    add_library(archive_codec SHARED "${archive_src}/codec.cpp" "${archive_src}/texture_stdout.cpp")
     target_link_libraries(archive_codec PRIVATE blast_source)
     set_target_properties(archive_codec PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+    function(build_archive_reader entry exe cpp)
+        add_custom_command(OUTPUT "${exe}"
+            COMMAND "${INTAKE_PYTHON}" -m ziglang build-exe "${entry}"
+                "-L$<TARGET_LINKER_FILE_DIR:archive_codec>" -target x86_64-windows-gnu
+                -O ReleaseSmall -fsingle-threaded -funwind-tables "-femit-bin=${exe}"
+            DEPENDS archive_codec "${entry}" ${ARGN} VERBATIM)
+        add_custom_command(OUTPUT "${cpp}"
+            COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools"
+                "${INTAKE_PYTHON}" -B "${archive_src}/translate_reader.py" "${exe}" "${cpp}"
+            DEPENDS "${exe}" "${archive_src}/translate_reader.py" tools/cpu_stdio_exe_aot.py
+                tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    endfunction()
     set(archive_exe "${CMAKE_CURRENT_BINARY_DIR}/archive_reader.exe")
-    add_custom_command(OUTPUT "${archive_exe}"
-        COMMAND "${INTAKE_PYTHON}" -m ziglang build-exe "${archive_src}/reader.zig"
-            "-L$<TARGET_LINKER_FILE_DIR:archive_codec>" -target x86_64-windows-gnu
-            -O ReleaseSmall -fsingle-threaded -funwind-tables "-femit-bin=${archive_exe}"
-        DEPENDS archive_codec "${archive_src}/reader.zig" VERBATIM)
     set(archive_cpp "${CMAKE_CURRENT_BINARY_DIR}/archive_reader_lifted.cpp")
-    add_custom_command(OUTPUT "${archive_cpp}"
-        COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools"
-            "${INTAKE_PYTHON}" -B "${archive_src}/translate_reader.py" "${archive_exe}" "${archive_cpp}"
-        DEPENDS "${archive_exe}" "${archive_src}/translate_reader.py" tools/cpu_stdio_exe_aot.py
-            tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    build_archive_reader("${archive_src}/reader.zig" "${archive_exe}" "${archive_cpp}")
     add_executable(archive_reader_lifted "${archive_cpp}")
     target_link_libraries(archive_reader_lifted PRIVATE archive_codec ntdll)
     add_test(NAME cpu_native_archive_reader COMMAND "${INTAKE_PYTHON}" -B
@@ -2205,6 +2208,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_check.py" "$<TARGET_FILE:pe_map>"
         "${archive_exe}" "$<TARGET_FILE:archive_all_lifted>" "$<TARGET_FILE:archive_codec>"
         "$<TARGET_FILE:blast_source>" "$<TARGET_FILE:blast_lifted>" "$<TARGET_FILE:archive_codec_lifted>")
+
+    set(texture_exe "${CMAKE_CURRENT_BINARY_DIR}/archive_texture_reader.exe")
+    set(texture_cpp "${CMAKE_CURRENT_BINARY_DIR}/archive_texture_reader_lifted.cpp")
+    build_archive_reader("${archive_src}/texture_reader.zig" "${texture_exe}" "${texture_cpp}"
+        "${archive_src}/reader.zig")
+    add_executable(archive_texture_lifted "${texture_cpp}")
+    target_link_libraries(archive_texture_lifted PRIVATE archive_codec_lifted ntdll)
+    add_test(NAME cpu_archive_texture_publication COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_texture_check.py" "$<TARGET_FILE:pe_map>"
+        "${texture_exe}" "$<TARGET_FILE:archive_texture_lifted>" "$<TARGET_FILE:archive_codec>"
+        "$<TARGET_FILE:blast_source>")
 
     function(crc_line_program target polynomial)
         # Use the same CRC object optimization flags in Debug and Release.
