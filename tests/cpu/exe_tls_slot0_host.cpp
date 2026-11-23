@@ -7,24 +7,33 @@
 //
 // Usage: cpu_exe_tls_slot0_host <pe_map.dll> <image> <scenario>
 //   main       start the image, let a host thread enter and leave, release on the starting thread
-//   alive      as main, but a host participant is still inside the image at release (uncertain)
-//   exited     as main, but a host participant is ended with TerminateThread before release
-//   untracked  as main, but after the start MAIN_TRACKED host threads enter; the last finds the
-//              participant table full, so release cannot inspect it (uncertain)
+//   alive      a host participant is still entered at the first release, which must be refused; it
+//              then leaves and the second release is accepted
+//   exited     a host participant is ended with TerminateThread; release confirms the exit
+//   untracked  after the start MAIN_TRACKED host threads enter; the last finds the participant table
+//              full and has no handle, so the first release must be refused until it leaves
+//   paused     <image> is cpu_exe_tls_slot0_pause: its worker c pauses inside the image's code; the first
+//              release must be refused with the image, its unwind data and its carrier intact; c then
+//              resumes, checks its block, returns, and the second release is accepted
 //   plain      start the image with pe_map_run (control): slot 0 keeps the host's block
 // In every scenario a reader thread that never participates samples its own slot 0 and sentinel from
 // before the map until after release.
 //
 // After the guest's own LOG line, the host prints one line:
 //   HOST: scenario=<s> started=<0|1> exit=<hex> installed_main=<y/n> reader_untouched=<y/n>
-//         reader_samples=<n> participant=<y/n|-> host_tls=<y/n> carrier_after_release=<y/n>
-//         heap_valid=<y/n> stats=<installed>,<restored>,<exited>,<uncertain>,<pending>,<active>,
-//         <last release>,<untracked>
+//         reader_samples=<n> participant=<y/n|-> refused=<y/n|-> intact_on_refusal=<y/n|->
+//         resumed=<y/n|-> host_tls=<y/n> cleaned=<y/n> second_release=<y/n> heap_valid=<y/n>
+//         stats=<installed>,<restored>,<exited>,<refusals>,<pending>,<active>,<last release>,<untracked>
 // installed_main: after the start, the starting thread's slot 0 holds the image's block.
 // participant: the host participant(s) saw the image's block after entering and their own block and
-// sentinel after leaving ('-' when the scenario has none that leaves).
-// host_tls: after release the starting thread's slot 0 and sentinel are the host's again.
-// carrier_after_release: the TLS carrier is still loaded right after pe_map_release.
+// sentinel after leaving ('-' when the scenario has none).
+// refused / intact_on_refusal: the first pe_map_release returned 2, and right after it the image was
+// still committed, RtlLookupFunctionEntry still found its entry point, the carrier was loaded and the
+// starting thread's slot 0 still held the image's block ('-' where no refusal is expected).
+// resumed: the paused worker found its own block and values after the refusal.
+// host_tls: after the accepted release the starting thread's slot 0 and sentinel are the host's again.
+// cleaned: after the accepted release the image is no longer committed, its unwind data is gone and
+// the carrier is unloaded. second_release: a further pe_map_release returns 0 (one cleanup only).
 // Exit code 0 when the host could run every step, 2 for a usage or setup failure.
 #include <windows.h>
 #include <intrin.h>
@@ -244,6 +253,35 @@ DWORD tls_index_of(void* base) {
     return *reinterpret_cast<const DWORD*>(tls->AddressOfIndex);
 }
 
+DWORD entry_rva(void* base) {
+    auto* bytes = static_cast<std::uint8_t*>(base);
+    return reinterpret_cast<const IMAGE_NT_HEADERS64*>(bytes + reinterpret_cast<IMAGE_DOS_HEADER*>(bytes)->e_lfanew)
+        ->OptionalHeader.AddressOfEntryPoint;
+}
+
+bool committed(void* base) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(base, &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT;
+}
+
+bool has_unwind(DWORD64 address) {
+    DWORD64 image_base = 0;
+    return RtlLookupFunctionEntry(address, &image_base, nullptr) != nullptr;
+}
+
+// Local\xbw_slot0_<pid in hex>_<suffix>: the events the paused worker opens (tests/cpu/exe_tls_slot0.cpp).
+HANDLE host_event(const wchar_t* suffix) {
+    wchar_t name[64];
+    unsigned n = 0;
+    for (const wchar_t* p = L"Local\\xbw_slot0_"; *p; ++p) name[n++] = *p;
+    const DWORD pid = GetCurrentProcessId();
+    for (int shift = 28; shift >= 0; shift -= 4) name[n++] = L"0123456789abcdef"[(pid >> shift) & 15];
+    name[n++] = L'_';
+    for (const wchar_t* p = suffix; *p; ++p) name[n++] = *p;
+    name[n] = 0;
+    return CreateEventW(nullptr, TRUE, FALSE, name);
+}
+
 bool same(const wchar_t* a, const wchar_t* b) {
     for (; *a && *a == *b; ++a, ++b) {
     }
@@ -255,12 +293,20 @@ extern "C" int host_entry() {
     g_kernel = GetModuleHandleW(L"kernel32.dll");
     wchar_t* argv[8];
     const int argc = split(GetCommandLineW(), argv, 8);
-    if (argc != 4) ExitProcess(fail_setup("usage: host <pe_map.dll> <image> main|alive|exited|untracked|plain"));
+    if (argc != 4)
+        ExitProcess(fail_setup("usage: host <pe_map.dll> <image> main|alive|exited|untracked|paused|plain"));
     const wchar_t* scenario = argv[3];
     const bool plain = same(scenario, L"plain");
     const bool alive = same(scenario, L"alive"), exited = same(scenario, L"exited"),
-               untracked = same(scenario, L"untracked");
-    if (!plain && !alive && !exited && !untracked && !same(scenario, L"main")) ExitProcess(fail_setup("scenario"));
+               untracked = same(scenario, L"untracked"), paused = same(scenario, L"paused");
+    if (!plain && !alive && !exited && !untracked && !paused && !same(scenario, L"main"))
+        ExitProcess(fail_setup("scenario"));
+    HANDLE paused_event = nullptr, resume_event = nullptr, ok_event = nullptr, bad_event = nullptr;
+    if (paused) {
+        paused_event = host_event(L"paused"), resume_event = host_event(L"resume");
+        ok_event = host_event(L"ok"), bad_event = host_event(L"bad");
+        if (!paused_event || !resume_event || !ok_event || !bad_event) ExitProcess(fail_setup("events"));
+    }
 
     HMODULE mapper = LoadLibraryW(argv[1]);
     if (!mapper) ExitProcess(fail_setup("cannot load pe_map"));
@@ -282,6 +328,7 @@ extern "C" int host_entry() {
     void* base = map(argv[2], resolve, &status, g_detail, sizeof(g_detail));
     if (!base) ExitProcess(fail_setup(g_detail[0] ? g_detail : "map failed"));
     g_index = tls_index_of(base);
+    const DWORD64 entry_point = reinterpret_cast<DWORD64>(base) + entry_rva(base);
 
     std::uint32_t exit_code = 0xdeadbeef;
     const int started = run(base, &exit_code);
@@ -302,19 +349,39 @@ extern "C" int host_entry() {
             count = 0;
         }
     }
-    // In alive and untracked, the last participant stays inside the image across the release.
+    // In alive and untracked the last participant stays entered across the first release; in paused the
+    // guest's worker c stays inside the image's code.
     const int stay = (alive || untracked) && count ? count - 1 : -1;
     bool leave_ok = true;
     for (int i = 0; i < count; ++i)
         if (i != stay) leave_ok = finish_participant(i) && leave_ok;
 
-    const int released = release(base);
-    const bool carrier_after_release = carrier_loaded();
-    if (stay >= 0) leave_ok = finish_participant(stay) && leave_ok;
+    int refused = -1, intact = -1, resumed = -1;
+    if (paused && WaitForSingleObject(paused_event, 10000) != WAIT_OBJECT_0) ExitProcess(fail_setup("paused worker"));
+    if (stay >= 0 || paused) {
+        refused = release(base) == 2;
+        intact = committed(base) && has_unwind(entry_point) && carrier_loaded() && holds_image_block();
+        if (stay >= 0) leave_ok = finish_participant(stay) && leave_ok;
+        if (paused) {
+            SetEvent(resume_event);
+            HANDLE results[2] = {ok_event, bad_event};
+            resumed = WaitForMultipleObjects(2, results, FALSE, 10000) == WAIT_OBJECT_0;
+            std::int64_t now[8];
+            for (int i = 0; i < 500; ++i) {  // c's detach removes it from the participants
+                stats(now);
+                if (now[4] == 1) break;
+                Sleep(10);
+            }
+        }
+    }
     if (count) participant_ok = leave_ok;
 
+    const int released = release(base);
+    const bool cleaned = released == 1 && !committed(base) && !has_unwind(entry_point) && !carrier_loaded();
+    const bool second_release = release(base) == 0;
     // From here on the starting thread has the host's block back, so the host may read its thread-locals.
-    const bool host_tls = released == 1 && my_slot0() == my_host_block && sentinel_before && t_host_sentinel == SENTINEL;
+    const bool host_tls =
+        released == 1 && my_slot0() == my_host_block && sentinel_before && t_host_sentinel == SENTINEL;
     InterlockedExchange(&g_stop_reader, 1);
     WaitForSingleObject(reader_thread, 10000);
     const bool reader_untouched = g_reader_bad == 0 && g_reader_samples > 0;
@@ -333,8 +400,12 @@ extern "C" int host_entry() {
     put(" reader_samples=");
     put_number(g_reader_samples, false);
     put_flag("participant", participant_ok);
+    put_flag("refused", refused);
+    put_flag("intact_on_refusal", intact);
+    put_flag("resumed", resumed);
     put_flag("host_tls", host_tls);
-    put_flag("carrier_after_release", carrier_after_release);
+    put_flag("cleaned", cleaned);
+    put_flag("second_release", second_release);
     put_flag("heap_valid", heap_valid);
     put(" stats=");
     for (int i = 0; i < 8; ++i) {

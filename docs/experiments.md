@@ -1584,19 +1584,20 @@ Code compiled with `/GA` assumes that its EXE owns TLS index 0. It reads a threa
 - threads the image starts, recognised by a Windows start address inside the image, from their `DLL_THREAD_ATTACH` (before any image is notified) until their `DLL_THREAD_DETACH` (after every image was notified, and before ntdll frees the thread's blocks);
 - host threads between their own `pe_map_main_thread_enter` and `pe_map_main_thread_leave`.
 
-How each participant is handled:
+A participant keeps its previous slot 0 in a pe_map TLS slot reserved at the start. The slot index is below `TLS_MINIMUM_AVAILABLE`, so setting it never allocates. Its thread handle goes into a fixed table of 64 entries.
 
-- **Saving slot 0.** A participant keeps its previous slot 0 in a pe_map TLS slot reserved at the start. The slot index is below `TLS_MINIMUM_AVAILABLE`, so setting it never allocates.
-- **Tracking.** Its thread handle goes into a fixed table of 64 entries.
-- **At release**, every participant ends up in one of three states:
-  - restored;
-  - confirmed exited (its handle is signaled, and its blocks went with the thread);
-  - uncertain: still running, untracked (the table was full or the handle could not be duplicated), an attaching thread whose start address could not be read, or a slot 0 that no longer held the image's block.
-- **When anything is uncertain**, release reports an incomplete release (`pe_map_main_tls_stats`, last release 0) and keeps the carrier loaded, so the block stays allocated. The participant's own later leave or detach still restores its slot. Another main image is refused while such a participant is pending.
+**Release is a retryable refusal.** `pe_map_release` returns 2 and changes nothing while any participant other than the calling thread may still run the image's code. That covers a participant whose handle is not signaled or cannot be waited on, a participant without a handle (the table was full or the handle could not be duplicated), and an attaching thread whose start address could not be read. While refused, the image stays registered and mapped, its unwind data stays registered, its carrier stays loaded, and every participant keeps its slot. The caller retries once those participants have left or exited.
+
+An accepted release, checked and committed under one lock so that no participant can join in between, does four things in order:
+
+1. gives the calling thread its saved slot 0 back;
+2. counts participants whose handle is signaled as exited (they ended without a detach, and their blocks went with them);
+3. ends the mode;
+4. unregisters and frees the image exactly once, as for any image.
 
 Threads that do not participate are never touched. On a participating thread, the host's own index-0 code reads the image's block, so a host that owns slot 0 must not touch its thread-locals there. This rules out a Python host: in Python 3.13, `python313.dll` carries static TLS.
 
-`cpu_exe_tls_slot0` is a CRT-free `/GA` EXE. Its template holds an int (7) and a `0x1400`-byte array of `0xFF`. Its TLS callback and each of its threads (the initial thread and two workers) check whether slot 0 equals the entry at `_tls_index`. Only when it does, a thread checks its template copy, writes the whole array, reads it back and calls `HeapValidate`. Two tests keep the evidence separate.
+`cpu_exe_tls_slot0` is a CRT-free `/GA` EXE. Its template holds an int (7) and a `0x1400`-byte array of `0xFF`. Its TLS callback and each of its threads (the initial thread and two workers) check whether slot 0 equals the entry at `_tls_index`. Only when it does, a thread checks its template copy, writes the whole array, reads it back and calls `HeapValidate`. `cpu_exe_tls_slot0_pause` adds worker c, which runs the same check and then pauses inside the image's code on an event before checking its block again. Two tests keep the evidence separate.
 
 `cpu_native_exe_tls_slot0_windows` launches the EXE with Windows, where it owns index 0:
 
@@ -1604,21 +1605,22 @@ Threads that do not participate are never touched. On a participating thread, th
 LOG:m1=yy m:yyyy a2=yy a:yyyy a3=y- b2=yy b:yyyy b3=y- X=0
 ```
 
-`cpu_native_exe_tls_slot0` runs `cpu_exe_tls_slot0_host`, a CRT-free host whose own TLS block owns slot 0. It binds only `kernel32.dll` and runs one scenario per process. In every scenario, a reader thread that never participates samples its own slot 0 and its sentinel from before the map until after release, and must never see either change. Counters are installed, restored, exited, uncertain, pending, active, last release and untracked:
+`cpu_native_exe_tls_slot0` runs `cpu_exe_tls_slot0_host`, a CRT-free host whose own TLS block owns slot 0. It binds only `kernel32.dll` and runs one scenario per process. In every scenario, a reader thread that never participates samples its own slot 0 and its sentinel from before the map until after release, and must never see either change. Every accepted release must leave the image no longer committed, `RtlLookupFunctionEntry` finding nothing for its entry point, and the carrier unloaded. A further release must then return 0. Counters are installed, restored, exited, refused releases, pending, active, last release and untracked:
 
-| Scenario | Guest log | Release | Carrier after release | Counters |
-|---|---|---|---|---|
-| `main`: a host thread enters and leaves | as Windows | complete | unloaded | `4,4,0,0,0,0,1,0` |
-| `alive`: a host participant is inside the image at release | as Windows | uncertain | kept | `4,4,0,1,0,0,0,0` |
-| `exited`: a host participant is ended with `TerminateThread` | as Windows | complete, exit confirmed | unloaded | `4,3,1,0,0,0,1,0` |
-| `untracked`: 64 host participants, the last finds the table full | as Windows | uncertain (cannot inspect) | kept | `67,67,0,1,0,0,0,0` |
-| `plain`: `pe_map_run` (negative control) | every slot-0 check `n`, `X=8` | none | unloaded | `0,0,0,0,0,0,-1,0` |
+| Scenario | First release | Then | Counters |
+|---|---|---|---|
+| `main`: a host thread enters and leaves | accepted | one cleanup | `4,4,0,0,0,0,1,0` |
+| `alive`: a host participant is still entered | 2, image, unwind data and carrier intact | it leaves; accepted, one cleanup | `4,4,0,1,0,0,1,0` |
+| `exited`: a host participant is ended with `TerminateThread` | accepted, exit confirmed | one cleanup | `4,3,1,0,0,0,1,0` |
+| `untracked`: 64 host participants, the last finds the table full | 2 (cannot inspect), intact | it leaves; accepted, one cleanup | `67,67,0,1,0,0,1,0` |
+| `paused`: worker c paused inside the image's code | 2, intact | c resumes, finds its block, returns; accepted, one cleanup | `5,5,0,1,0,0,1,0` |
+| `plain`: `pe_map_run` (negative control), every slot-0 check `n`, `X=8` | accepted | one cleanup | `0,0,0,0,0,0,-1,0` |
 
 Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release`:
 
-- In every scenario the reader's slot 0 and sentinel stayed unchanged over millions of samples. The starting thread had the host's block and sentinel back after release, and the heap validated.
-- The participants saw the image's block after entering, and their own block and sentinel after leaving, including a participant that left after an uncertain release.
-- Two mutations, not committed, both fail the test because the carrier is unloaded and the release is reported complete: counting a still-running participant as exited, and ignoring untracked participants.
+- **Guest log.** It equals the Windows launch in every `pe_map_run_main` scenario. In `paused` it adds `c2=yy c:yyyy`.
+- **Reader and host thread.** The reader's slot 0 and sentinel never changed. The starting thread had the host's block and sentinel back after the accepted release, and the heap validated.
+- **Mutation (not committed).** With a `pe_map_release` that never refuses, `alive` fails because the release cleans up while a participant is live. `paused` then crashes with `0xC0000005`, because worker c resumes in the freed image.
 
 Not covered:
 
@@ -1627,7 +1629,7 @@ Not covered:
 - More than one main image per process.
 
 ```powershell
-cmake --build --preset dev --target pe_map cpu_exe_tls_slot0 cpu_exe_tls_slot0_host
+cmake --build --preset dev --target pe_map cpu_exe_tls_slot0 cpu_exe_tls_slot0_pause cpu_exe_tls_slot0_host
 ctest --preset dev --no-tests=error -R '^cpu_native_exe_tls_slot0(_windows)?$' -V
 ```
 

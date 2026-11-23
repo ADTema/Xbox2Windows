@@ -634,7 +634,6 @@ struct Mapped {
     volatile LONG released;  // set by pe_map_release; notifiers skip the image from then on
     TlsCarrier carrier;      // holds the image's implicit TLS blocks; empty without a template
     volatile LONG started = 0;  // set by pe_map_run for an EXE; its TLS callbacks then see thread notifications
-    volatile LONG keep_carrier = 0;  // a main-image participant may still reach the block (release_main)
 };
 
 struct SharedLock {
@@ -669,13 +668,15 @@ std::vector<Mapped*>& mapped_images() {
 // TLS_MINIMUM_AVAILABLE, so setting it never allocates) and gets it back on leave, detach or release.
 // The detach restore precedes ntdll's freeing of the thread's blocks, which would otherwise free the
 // image's block twice (as slot 0's and as the carrier's). Each participant's thread handle goes into a
-// fixed table. At release every participant is restored, confirmed exited (its handle is signaled; its
-// blocks went with it), or uncertain: still running, untracked (the table was full or its handle could
-// not be duplicated), an image thread whose start address could not be read, or a slot 0 that no longer
-// held the image's block. Any uncertain participant fails the release (pe_map_main_tls_stats) and keeps
-// the carrier loaded, so a block it may still reach stays allocated; its own later leave or detach still
-// restores its slot. Another main image is refused while such a participant is pending. Threads that do
-// not participate are never touched. On a participating thread the host's own index-0 code reads the
+// fixed table. pe_map_release refuses the main image, returning 2 and changing nothing, while any
+// participant other than the calling thread may still run the image's code: its handle is not signaled,
+// it has no handle (the table was full or the handle could not be duplicated), or an attaching thread's
+// start address could not be read. The image, its unwind data, its carrier and every participant's slot
+// stay as they are, and the caller may retry once those participants have left or exited. A release that
+// is accepted gives the calling thread its saved slot 0 back, counts participants whose handle is
+// signaled as exited (they ended without a detach; their blocks went with them), ends the mode so that
+// no thread joins any more, and then unregisters and frees the image once, as for any image. Threads
+// that do not participate are never touched. On a participating thread the host's own index-0 code reads the
 // image's block, so a host that owns slot 0 must not touch its thread-locals there.
 // Rule and measurements: MoonYueya on #870.
 constexpr std::size_t TEB_TLS_POINTER = 0x58;  // TEB.ThreadLocalStoragePointer on x64
@@ -690,8 +691,8 @@ struct MainImage {
     HANDLE tracked[MAIN_TRACKED] = {};
     std::int64_t untracked = 0;  // installed participants without a handle
     std::int64_t faults = 0;     // attaching threads whose start address could not be read
-    std::int64_t installed = 0, restored = 0, exited = 0, uncertain = 0;
-    std::int64_t last_release = -1;  // -1 none yet, 0 uncertain, 1 every participant restored or exited
+    std::int64_t installed = 0, restored = 0, exited = 0, refusals = 0;
+    std::int64_t last_release = -1;  // -1 none yet, 1 accepted, 2 refused (participants may still run the image)
 };
 
 // Guards main_image(). Taken without mapped_lock held, and mapped_lock is never taken under it.
@@ -710,8 +711,7 @@ MainImage& main_image() {
 }
 
 // pe_map's own TLS slots: the calling thread's participation (0 none, 1..MAIN_TRACKED its table entry,
-// UNTRACKED) and its saved slot 0. Allocated once under slot_lock and never freed, since a participant
-// left uncertain by a release may restore itself later.
+// UNTRACKED) and its saved slot 0. Allocated once under slot_lock and never freed.
 DWORD g_participation = TLS_OUT_OF_INDEXES, g_saved = TLS_OUT_OF_INDEXES;
 
 bool reserve_slots() {
@@ -762,8 +762,8 @@ bool install_current(MainImage& main) {
     return true;
 }
 
-// Gives the calling thread its saved slot 0 back if it participates. Caller holds slot_lock. Also runs
-// after release for a participant that release left uncertain; the carrier is kept loaded for it.
+// Gives the calling thread its saved slot 0 back if it participates. Caller holds slot_lock. A slot 0
+// that no longer holds the image's block is left as it is and the thread still stops participating.
 bool restore_current(MainImage& main) {
     if (g_participation == TLS_OUT_OF_INDEXES) return false;
     const auto participation = reinterpret_cast<ULONG_PTR>(TlsGetValue(g_participation));
@@ -773,8 +773,6 @@ bool restore_current(MainImage& main) {
     if (holds) {
         slots[0] = TlsGetValue(g_saved);
         ++main.restored;
-    } else {
-        ++main.uncertain;  // slot 0 changed under the thread; left as it is
     }
     if (participation == UNTRACKED) {
         --main.untracked;
@@ -796,7 +794,7 @@ void install_current_thread() {
         reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
     void* start = nullptr;
     if (!query || query(GetCurrentThread(), THREAD_START_ADDRESS, &start, sizeof(start), nullptr) < 0) {
-        ++main.faults;  // cannot tell whether this thread runs the image: release fails closed
+        ++main.faults;  // cannot tell whether this thread runs the image: release is refused
         return;
     }
     const auto* address = static_cast<std::uint8_t*>(start);
@@ -811,28 +809,38 @@ void restore_current_thread() {
     restore_current(main_image());
 }
 
-// Ends main-image mode for base. Returns true when every participant was restored or confirmed exited.
-bool release_main(std::uint8_t* base) {
+// Ends main-image mode for base before pe_map_release unregisters it, or refuses: returns false and
+// changes nothing while a participant other than the calling thread may still run the image's code (a
+// handle that is not signaled or cannot be waited on, a participant without a handle, or an attaching
+// thread whose start address could not be read). Checking and ending under one slot_lock hold means no
+// participant can join in between. Returns true for any other pointer.
+bool end_main(std::uint8_t* base) {
     const SlotLock hold;
     auto& main = main_image();
     if (main.base != base) return true;
-    const std::int64_t before = main.uncertain;
-    restore_current(main);  // the releasing thread, normally the one that started the image
+    const auto self = g_participation == TLS_OUT_OF_INDEXES
+                          ? ULONG_PTR{0}
+                          : reinterpret_cast<ULONG_PTR>(TlsGetValue(g_participation));
+    bool live = main.faults != 0 || main.untracked > (self == UNTRACKED ? 1 : 0);
+    for (int i = 0; i < MAIN_TRACKED && !live; ++i) {
+        if (main.tracked[i] && static_cast<ULONG_PTR>(i) + 1 != self)
+            live = WaitForSingleObject(main.tracked[i], 0) != WAIT_OBJECT_0;
+    }
+    if (live) {
+        ++main.refusals;
+        main.last_release = 2;
+        return false;
+    }
+    restore_current(main);
     for (HANDLE& handle : main.tracked) {
         if (!handle) continue;
-        if (WaitForSingleObject(handle, 0) == WAIT_OBJECT_0) {
-            ++main.exited;  // ended without a detach; its blocks went with it
-            CloseHandle(handle);
-            handle = nullptr;
-        } else {
-            ++main.uncertain;  // still running, or not inspectable: it may still reach the block
-        }
+        ++main.exited;  // ended without a detach; its blocks went with it
+        CloseHandle(handle);
+        handle = nullptr;
     }
-    main.uncertain += main.untracked + main.faults;
-    main.faults = 0;
     main.base = nullptr;
-    main.last_release = main.uncertain == before;
-    return main.uncertain == before;
+    main.last_release = 1;
+    return true;
 }
 
 // Notify a mapped image, re-reading its callback list as Windows does; if the list was
@@ -867,8 +875,7 @@ void finalize(Mapped* record) {
     notify_mapped(base, DLL_PROCESS_DETACH);
     const auto& pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
     if (pdata.Size) RtlDeleteFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(base + pdata.VirtualAddress));
-    // A main image's block that a live thread may still reach stays allocated, so its carrier stays loaded.
-    if (!InterlockedCompareExchange(&record->keep_carrier, 0, 0)) unload(record->carrier);
+    unload(record->carrier);
     VirtualFree(base, 0, MEM_RELEASE);
 }
 
@@ -1428,7 +1435,10 @@ extern "C" __declspec(dllexport) void* pe_map_export_resolved(void* mapped, cons
 // Returns 1 after unregistering an image that pe_map_image returned, and 0 for null, for any
 // other pointer and for a second release. Process detach and unmapping follow the protocol above:
 // at once if no thread notification for the image is in flight, otherwise when the last one ends.
+// Returns 2 without changing anything for the image started with pe_map_run_main while another
+// participant may still run its code (see end_main); the caller may retry later.
 extern "C" __declspec(dllexport) int pe_map_release(void* mapped) {
+    if (!end_main(static_cast<std::uint8_t*>(mapped))) return 2;
     Mapped* record = nullptr;
     {
         const ExclusiveLock hold;
@@ -1443,7 +1453,6 @@ extern "C" __declspec(dllexport) int pe_map_release(void* mapped) {
     }
     if (!record) return 0;
     InterlockedExchange(&record->released, 1);
-    if (!release_main(record->base)) InterlockedExchange(&record->keep_carrier, 1);
     drop_reference(record);
     return 1;
 }
@@ -1553,16 +1562,16 @@ extern "C" __declspec(dllexport) int pe_map_main_thread_enter() {
 }
 
 // The calling thread leaves the main image. Returns 1 when its saved slot 0 was put back, 0 when it did
-// not participate or slot 0 no longer held the image's block (counted as uncertain, slot left alone).
+// not participate or slot 0 no longer held the image's block (slot left alone; the thread stops participating).
 extern "C" __declspec(dllexport) int pe_map_main_thread_leave() {
     const SlotLock hold;
     return restore_current(main_image()) ? 1 : 0;
 }
 
 // Main-image slot 0 counters since the process started, for tests: out[0] installs, out[1] restores,
-// out[2] participants confirmed exited at a release, out[3] uncertain outcomes, out[4] participants still
-// pending, out[5] 1 while an image is started as the main image, out[6] the last release (-1 none, 0
-// uncertain and the carrier kept, 1 complete), out[7] installed participants without a handle.
+// out[2] participants confirmed exited at a release, out[3] refused releases, out[4] participants still
+// pending, out[5] 1 while an image is started as the main image, out[6] the last release (-1 none, 1
+// accepted, 2 refused), out[7] installed participants without a handle.
 extern "C" __declspec(dllexport) void pe_map_main_tls_stats(std::int64_t* out) {
     if (!out) return;
     const SlotLock hold;
@@ -1570,7 +1579,7 @@ extern "C" __declspec(dllexport) void pe_map_main_tls_stats(std::int64_t* out) {
     out[0] = main.installed;
     out[1] = main.restored;
     out[2] = main.exited;
-    out[3] = main.uncertain;
+    out[3] = main.refusals;
     out[4] = pending(main);
     out[5] = main.base != nullptr;
     out[6] = main.last_release;

@@ -22,6 +22,12 @@
 // Workers a and b run one after the other, so the order is fixed. Threads the EXE did not start
 // are left out. A failed setup ends the process with 0xE0000002 (CreateThread), 0xE0000003 (wait)
 // or 0xE0000006 (event log overflow).
+//
+// Built with PAUSED_WORKER (cpu_exe_tls_slot0_pause), the entry point then starts worker c, which runs
+// its check (logged before the log is written) and then pauses inside the image: it sets the host's
+// event Local\xbw_slot0_<pid>_paused and waits on ..._resume. Resumed, it checks that slot 0 still
+// holds its block with the values it wrote and sets ..._ok or ..._bad before it returns. The entry
+// point returns while c is paused, so this variant is only run under a host that resumes it.
 #include <windows.h>
 #include <intrin.h>
 
@@ -98,7 +104,7 @@ struct Event {
 
 Event g_events[32];
 volatile LONG g_count;
-DWORD g_threads[3];  // initial thread, worker A, worker B
+DWORD g_threads[4];  // initial thread, worker A, worker B, paused worker C
 volatile LONG g_failures;
 
 char yes_no(bool value) {
@@ -114,7 +120,7 @@ void record(char kind, char a, char b, char c, char d) {
 
 bool own_thread() {
     const DWORD thread = GetCurrentThreadId();
-    return thread == g_threads[1] || thread == g_threads[2];
+    return thread == g_threads[1] || thread == g_threads[2] || thread == g_threads[3];
 }
 
 void NTAPI callback(PVOID, DWORD reason, PVOID) {
@@ -156,10 +162,44 @@ unsigned g_length;
 void put(char c) { g_line[g_length++] = c; }
 
 char thread_name(DWORD thread) {
-    for (int i = 0; i < 3; ++i)
-        if (g_threads[i] == thread) return "mab"[i];
+    for (int i = 0; i < 4; ++i)
+        if (g_threads[i] == thread) return "mabc"[i];
     return 0;
 }
+
+#ifdef PAUSED_WORKER
+constexpr unsigned char PAUSED_TAG = 0x44;
+HANDLE g_checked;
+
+// Local\xbw_slot0_<pid in hex>_<suffix>, the names the host created.
+HANDLE open_host_event(const wchar_t* suffix) {
+    wchar_t name[64];
+    unsigned n = 0;
+    for (const wchar_t* p = L"Local\\xbw_slot0_"; *p; ++p) name[n++] = *p;
+    const DWORD pid = GetCurrentProcessId();
+    for (int shift = 28; shift >= 0; shift -= 4) name[n++] = L"0123456789abcdef"[(pid >> shift) & 15];
+    name[n++] = L'_';
+    for (const wchar_t* p = suffix; *p; ++p) name[n++] = *p;
+    name[n] = 0;
+    return OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, name);
+}
+
+DWORD WINAPI paused_worker(void*) {
+    check(PAUSED_TAG);
+    SetEvent(g_checked);
+    HANDLE paused = open_host_event(L"paused"), resume = open_host_event(L"resume"), ok = open_host_event(L"ok"),
+           bad = open_host_event(L"bad");
+    if (!paused || !resume || !ok || !bad) ExitProcess(WAIT_FAILED_CODE);
+    SetEvent(paused);
+    // Paused inside the image's code while the host asks for the release.
+    if (WaitForSingleObject(resume, 60000) != WAIT_OBJECT_0) ExitProcess(WAIT_FAILED_CODE);
+    bool intact = in_slot0() && t_value == PAUSED_TAG;
+    for (unsigned i = 0; intact && i < ARRAY_BYTES; ++i) intact = t_array.bytes[i] == PAUSED_TAG;
+    SetEvent(intact ? ok : bad);
+    CloseHandle(paused), CloseHandle(resume), CloseHandle(ok), CloseHandle(bad);
+    return 0;
+}
+#endif
 }  // namespace
 
 extern "C" DWORD WINAPI exe_entry(void*) {
@@ -174,6 +214,14 @@ extern "C" DWORD WINAPI exe_entry(void*) {
         if (WaitForSingleObject(thread, WAIT_MS) != WAIT_OBJECT_0) ExitProcess(WAIT_FAILED_CODE);
         CloseHandle(thread);
     }
+#ifdef PAUSED_WORKER
+    g_checked = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE paused = CreateThread(nullptr, 0, paused_worker, nullptr, CREATE_SUSPENDED, &g_threads[3]);
+    if (!g_checked || !paused) ExitProcess(CREATE_FAILED);
+    ResumeThread(paused);
+    if (WaitForSingleObject(g_checked, WAIT_MS) != WAIT_OBJECT_0) ExitProcess(WAIT_FAILED_CODE);
+    CloseHandle(paused);  // keeps running, paused inside the image
+#endif
     const DWORD failures = static_cast<DWORD>(g_failures);
 
     put('L'), put('O'), put('G'), put(':');
