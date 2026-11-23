@@ -162,6 +162,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     ds_steps = []
     lds_enabled = ds_group and 128 <= lds_bytes <= 65536
     lds_word = None
+    lds_wide_words = {}
+    lds_address_shift = None
     ds_wait = False
     written_spans = []
     layout = None
@@ -374,8 +376,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if ds_group and dst <= 255 and shift == 2 and isinstance(tag, tuple) and tag[0] == "ds_lane":
                 vector[dst] = ("ds_address", tag[1])
                 continue
-            if lds_enabled and dst <= 255 and shift == 2 and tag == ("local", 0):
-                vector[dst] = ("lds_address",)
+            if (lds_enabled and dst <= 255 and tag == ("local", 0)
+                    and (shift == 2 or (shift == 4 and lds_bytes >= 512))):
+                if lds_address_shift is not None and shift != lds_address_shift:
+                    raise ValueError("Mixed private LDS address strides")
+                lds_address_shift = shift
+                vector[dst] = ("lds_address",) if shift == 2 else ("lds_wide_address",)
                 continue
             # The element and row checks at the store bound the shift.
             if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
@@ -427,6 +433,43 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if returns:
                 vector[regs[0]] = lds_word
             lds_word = new_word
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_(write|read)_b(64|96) (v\[\d+:\d+\]|v\d+), "
+                               r"(v\[\d+:\d+\]|v\d+)(?: offset:(0|8))?", line):
+            write = m[1] == "write"
+            count = int(m[2]) // 32
+            addr_text, regs_text = (m[3], m[4]) if write else (m[4], m[3])
+            addr = re.fullmatch(r"v(\d+)", addr_text)
+            regs = re.fullmatch(r"v\[(\d+):(\d+)\]", regs_text)
+            first_slot = int(m[5] or 0) // 4
+            if (guard_span is not None or not addr or not regs or int(addr[1]) > 255
+                    or vector.get(int(addr[1])) != ("lds_wide_address",) or first_slot + count > 4):
+                raise ValueError("Unverified private wide LDS access")
+            first, last = map(int, regs.groups())
+            if last > 255 or last - first + 1 != count:
+                raise ValueError("Unverified private wide LDS register range")
+            slots = range(first_slot, first_slot + count)
+            registers = range(first, last + 1)
+            if write:
+                words = [vector.get(reg) for reg in registers]
+                if not all(map(is_word, words)):
+                    raise ValueError("Unverified private wide LDS source")
+                lds_wide_words.update(zip(slots, words))
+            else:
+                if not all(slot in lds_wide_words for slot in slots):
+                    raise ValueError("Uninitialized private wide LDS word")
+                vector.update(zip(registers, (lds_wide_words[slot] for slot in slots)))
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_read2_b32 v\[(\d+):(\d+)\], v(\d+)"
+                               r"(?: offset0:([0-3]))?(?: offset1:([0-3]))?", line):
+            first, last, addr = map(int, m.groups()[:3])
+            slots = tuple(int(offset or 0) for offset in m.groups()[3:])
+            if (guard_span is not None or max(last, addr) > 255 or last != first + 1
+                    or vector.get(addr) != ("lds_wide_address",)):
+                raise ValueError("Unverified private wide LDS access")
+            if not all(slot in lds_wide_words for slot in slots):
+                raise ValueError("Uninitialized private wide LDS word")
+            vector.update(zip(range(first, last + 1), (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
         elif m := re.fullmatch(r"ds_write_b(8|16|32) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
             width, addr, src = map(int, m.groups()[:3])

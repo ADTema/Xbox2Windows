@@ -844,6 +844,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/frame_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_frame>" "$<TARGET_FILE:cpu_frame_lifted>"
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_frame_lifted.cpp")
+    cpu_asm_fixture(cpu_leave leave)
+    # LEAVE on a proven RBP anchor; the other exports of leave.asm exist only to be rejected.
+    cpu_translation(cpu_leave cpu_switch_aot leave_frame,leave_lea,leave_join)
+    add_test(NAME cpu_aot_leave COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/leave_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_leave>" "$<TARGET_FILE:cpu_leave_lifted>"
+        "${CMAKE_CURRENT_BINARY_DIR}/cpu_leave_lifted.cpp")
     cpu_asm_fixture(cpu_calls calls)
     cpu_translation(cpu_calls cpu_switch_aot call_leaf,chain3,narrow_call,narrow_tail,tail_call,tail_after_frame,home_save_call)
     add_test(NAME cpu_aot_direct_calls COMMAND "${INTAKE_PYTHON}" -B
@@ -1910,6 +1917,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_avx_cvt_cmp_test COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_cvt_cmp_test.py"
         check "$<TARGET_FILE:cpu_avx_cvt_cmp_test>" "$<TARGET_FILE:cpu_avx_cvt_cmp_test_lifted>")
     set_tests_properties(cpu_aot_avx_cvt_cmp_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    cpu_asm_fixture(cpu_avx_scalar_fp avx_scalar_fp)
+    set(avx_scalar_fp_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_scalar_fp_lifted.cpp")
+    add_custom_command(OUTPUT "${avx_scalar_fp_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_scalar_fp.py"
+            emit "$<TARGET_FILE:cpu_avx_scalar_fp>" "${avx_scalar_fp_fixture}"
+        DEPENDS cpu_avx_scalar_fp tests/cpu/avx_scalar_fp.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_avx_scalar_fp_lifted SHARED "${avx_scalar_fp_fixture}")
+    add_test(NAME cpu_aot_avx_scalar_fp COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_scalar_fp.py"
+        check "$<TARGET_FILE:cpu_avx_scalar_fp>" "$<TARGET_FILE:cpu_avx_scalar_fp_lifted>")
+    set_tests_properties(cpu_aot_avx_scalar_fp PROPERTIES SKIP_RETURN_CODE 77)
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
@@ -2981,6 +3000,50 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_load_cookie COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/load_cookie_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_cookie_dll>" "$<TARGET_FILE:cpu_cookie_exe>" "$<TARGET_FILE:cpu_exe_io>")
+    foreach(variant IN ITEMS present absent alternate)
+        add_executable(cpu_load_dispatch_${variant} tests/cpu/load_config_dispatch.asm tests/cpu/exe_startup.asm)
+        set_target_properties(cpu_load_dispatch_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_load_dispatch_${variant} PRIVATE
+            /ENTRY:native_startup /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_load_dispatch_${variant} PRIVATE cpu_exe_io)
+        if(variant STREQUAL absent)
+            target_compile_options(cpu_load_dispatch_${variant} PRIVATE /DDISPATCH_ABSENT)
+        elseif(variant STREQUAL alternate)
+            target_compile_options(cpu_load_dispatch_${variant} PRIVATE /DDISPATCH_ALTERNATE)
+        endif()
+    endforeach()
+    add_test(NAME cpu_native_load_dispatch COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/load_config_dispatch_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_load_dispatch_present>" "$<TARGET_FILE:cpu_load_dispatch_absent>"
+        "$<TARGET_FILE:cpu_load_dispatch_alternate>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_load_dispatch PROPERTIES TIMEOUT 30)
+    # A typed callback called through the linker-produced load-config dispatch slot (#903). The same
+    # objects are linked without and with /guard:cf. OTHER is the negative control; INVALID calls a
+    # target inside a function. Based on denn0x's pe/load-config-callback reference branch.
+    foreach(variant IN ITEMS record other invalid cfg_record cfg_invalid)
+        add_executable(cpu_load_callback_${variant} tests/cpu/load_config_callback.asm
+            tests/cpu/load_config_callback.cpp tests/cpu/exe_startup.asm)
+        set_target_properties(cpu_load_callback_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_compile_options(cpu_load_callback_${variant} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/guard:cf /GS- /Zl>)
+        target_link_options(cpu_load_callback_${variant} PRIVATE /ENTRY:native_startup
+            /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_load_callback_${variant} PRIVATE cpu_exe_io)
+        if(variant MATCHES "^cfg_")
+            target_link_options(cpu_load_callback_${variant} PRIVATE /guard:cf)
+        endif()
+        if(variant MATCHES "other")
+            target_compile_definitions(cpu_load_callback_${variant} PRIVATE OTHER)
+        elseif(variant MATCHES "invalid")
+            target_compile_definitions(cpu_load_callback_${variant} PRIVATE INVALID)
+        endif()
+    endforeach()
+    add_test(NAME cpu_native_load_config_callback COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/load_config_callback_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_load_callback_record>"
+        "$<TARGET_FILE:cpu_load_callback_other>" "$<TARGET_FILE:cpu_load_callback_invalid>"
+        "$<TARGET_FILE:cpu_load_callback_cfg_record>" "$<TARGET_FILE:cpu_load_callback_cfg_invalid>")
+    set_tests_properties(cpu_native_load_config_callback PROPERTIES TIMEOUT 120)
     foreach(variant IN ITEMS original no_tls)
         add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)
@@ -3154,6 +3217,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_map_pages_caller>" "$<TARGET_FILE:cpu_map_pages_provider>"
         "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_map_pages PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_transfer_mem_provider SHARED tests/cpu/transfer_mem_provider.cpp tests/cpu/transfer_mem_provider.def)
+    add_executable(cpu_transfer_mem_caller tests/cpu/transfer_mem_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_transfer_mem_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_transfer_mem_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_transfer_mem_caller PRIVATE cpu_transfer_mem_provider cpu_exe_io)
+    add_test(NAME cpu_native_transfer_mem COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/transfer_mem_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_transfer_mem_caller>" "$<TARGET_FILE:cpu_transfer_mem_provider>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_transfer_mem PROPERTIES TIMEOUT 60)
     add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")

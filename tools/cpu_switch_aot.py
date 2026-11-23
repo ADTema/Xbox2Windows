@@ -59,9 +59,10 @@ a guest address, which the switch replaces, and never needs the mapping. The
 generated source states the binding contract.
 A function may use its stack. A forward pass gives RSP at
 every instruction as entry RSP plus a constant that must agree at joins and be
-0 at every RET. PUSH and POP of a nonvolatile register and SUB or ADD RSP by a
-multiple of 8 are the only changes of RSP accepted; any other write of RSP is a
-dynamic frame, and any use of RSP as a value (MOV RAX, RSP or LEA RAX, [RSP+8])
+0 at every RET. PUSH and POP of a nonvolatile register, SUB or ADD RSP by a
+multiple of 8, and LEAVE where the RBP anchor is proven are the only changes of
+RSP accepted. LEAVE sets RSP to the anchor and pops RBP from it. ENTER, MOV RSP,
+RBP and any other write of RSP is a dynamic frame, and any use of RSP as a value (MOV RAX, RSP or LEA RAX, [RSP+8])
 would let the frame's address escape. Both are rejected. The frame becomes one
 byte array per call, from the lowest RSP up to the end of the caller's 32-byte
 home space at entry RSP + 40, at most MAX_FRAME bytes, and each RSP-based
@@ -92,8 +93,8 @@ other volatile registers, the flags and the callee's 32-byte home space at RSP
 are undefined, and the nonvolatile registers and the rest of the frame,
 including the caller's own home space above entry RSP, are kept. The return
 address and the callee's frame lie below RSP, where every byte is already
-undefined because the frame proof forgets the bytes that ADD RSP and POP leave
-below RSP. RSP must be 8
+undefined because the frame proof forgets the bytes that ADD RSP, POP and LEAVE
+leave below RSP. RSP must be 8
 mod 16 from entry at a call, with the callee's home space below the return
 address. A tail jump is checked as a RET and contributes the callee's return
 width. The callee's frame is its own array, so no frame address crosses a call,
@@ -198,7 +199,7 @@ STRING_TRANSFERS = {
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
 FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
-                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD}
+                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
 FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
@@ -1037,6 +1038,9 @@ class Lifter:
                 note(0)
                 return f"store<std::uint64_t>({self.slot(ins)}, {self.reg(ins.op0_register)});", reads, {}
             return self.write(ins, 8, f"load<std::uint64_t>({self.slot(ins)})"), {}, writes
+        if mnemonic == M.LEAVE:
+            # Frame proved the anchor: RSP stays a constant offset, and RBP is reloaded from the anchor slot.
+            return self.write(ins, 8, f"load<std::uint64_t>({self.slot(ins)})", R.RBP), {}, {R.RBP: 8}
         if ins.ip in self.adjustments:
             # SUB or ADD RSP, imm: Frame knows RSP as a constant offset, so nothing is computed.
             if sets_flags:
@@ -1220,7 +1224,7 @@ class Frame:
     """RSP as entry RSP + a constant at each instruction, and the stack bytes each instruction accesses.
 
     offsets: RVA -> RSP - entry RSP before the instruction. accesses: RVA -> (offset of the first byte from entry
-    RSP, width, reads, writes). released: RVA -> (RSP before, RSP after) for an ADD RSP or POP, which leaves
+    RSP, width, reads, writes). released: RVA -> (RSP before, RSP after) for an ADD RSP, POP or LEAVE, which leaves
     those bytes below RSP, where their contents may change. The frame array starts at entry RSP + start, the lowest offset rounded down to
     8 mod 16: with RSP + 8 a multiple of 16 at entry, as the ABI requires, every array byte then has the address
     residue mod 16 of the stack byte it stands for. It ends with the home space at entry RSP + 40."""
@@ -1306,6 +1310,21 @@ class Frame:
         ip, mnemonic = ins.ip, ins.mnemonic
         if mnemonic == M.RET:
             return rsp, anchor
+        if mnemonic == M.LEAVE:
+            if ins.code != Code.LEAVEQ:
+                raise ValueError(f"unsupported LEAVE operand size at RVA {ip:#x}")
+            # RSP becomes the anchor and RBP is popped from it, so only a proven anchor gives the new RSP.
+            # __init__ then releases every byte from the old RSP through anchor + 8, the pop slot included.
+            if anchor is None:
+                raise ValueError(f"LEAVE without a proven frame anchor at RVA {ip:#x}")
+            if anchor < rsp:
+                raise ValueError(f"LEAVE with the frame anchor below RSP at RVA {ip:#x}: "
+                                 f"anchor entry RSP{anchor:+#x}, RSP entry RSP{rsp:+#x}")
+            if anchor + 8 > 0:
+                raise ValueError(f"LEAVE would raise RSP above entry RSP at RVA {ip:#x}: "
+                                 f"anchor entry RSP{anchor:+#x}")
+            self.access(ins, rsp, anchor, 8, True, False)
+            return anchor + 8, None
         if ins.op0_kind == OpKind.REGISTER and ins.op0_register == R.RBP:
             if mnemonic == M.MOV and ins.op1_kind == OpKind.REGISTER and ins.op1_register == R.RSP:
                 self.set_anchor.add(ip)
@@ -1377,6 +1396,8 @@ def slot_register(ins):
     """The nonvolatile register that PUSH, POP or a 64-bit MOV copies whole to or from the frame, else None."""
     if ins.mnemonic in (M.PUSH, M.POP):
         return ins.op0_register
+    if ins.mnemonic == M.LEAVE:
+        return R.RBP
     if ins.mnemonic == M.MOV and ins.memory_base in (R.RSP, R.RBP):
         for number in (0, 1):
             if ins.op_kind(number) == OpKind.REGISTER and ins.op_register(number) in NONVOLATILE:
@@ -1390,7 +1411,7 @@ def prove_frame(function, order, effects, frame):
 
     Per stack byte: 1 once a store writes it; 2 + 8 * i + k while it holds byte k of the entry value of
     NONVOLATILE[i], saved by PUSH or MOV [RSP+d] while that register holds its entry value; 0 when not
-    written on some path, or released since: when ADD RSP or POP raises RSP, the bytes it leaves below RSP
+    written on some path, or released since: when ADD RSP, POP or LEAVE raises RSP, the bytes it leaves below RSP
     become 0 after the POP has read its source, because their contents may change before a later allocation
     brings them back into the frame. Per nonvolatile register: "entry", "written" since entry or the last restore, or
     None when paths disagree. A join keeps what both sides agree on. A save is not a read of the entry value
