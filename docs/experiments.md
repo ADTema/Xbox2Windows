@@ -4705,6 +4705,12 @@ ctest --preset dev --no-tests=error -R '^dxil_retarget_' -V
 .\out\pe-env\Scripts\python.exe -B tools/dxil_retarget.py --pe "game-files/<build-directory>/XboxBvhBuilder.dll" --only-without-xbox-calls --sign --probe out/build/dev/root_probe.exe --pso-probe out/build/dev/root_device_probe.exe --output-dir out/calls/dxil-signed --report out/calls/dxil-retarget.json
 ```
 
+Add `--catalogue-dir out/calls/compute-catalogue` to the signed PE scan to export
+desktop compute containers with embedded root signatures. The filename is the
+SHA-256 of the original DXBC bytes, with a `.dxil` extension. Entries require a
+signature, both DXIL validation checks to pass, and no unsupported reachable Xbox
+intrinsics. Use `--pso-probe` separately to measure driver pipeline creation.
+
 ### BVH reads and cross-lane operations
 
 In `out/calls/desktop-roots.json`, `static_operands` from `tools/probe_roots.py` groups functions by module count, call site and operand form. The counts below describe static instructions across the 52 BVH programs. Runtime frequency is unknown.
