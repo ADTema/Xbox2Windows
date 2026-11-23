@@ -733,8 +733,6 @@ class TestRdna2Disasm(unittest.TestCase):
             "f904427c01000606",  # v_cmp_lt_f64_e32 with src0=249 (64-bit compare)
             "f904887d01000706",  # src0_sel == 7 (invalid)
             "f904887d01000607",  # src1_sel == 7 (invalid)
-            "f904887d01864606",  # reserved Inst{54} set
-            "f904887d01860646",  # reserved Inst{62} set
             "f904027c01860e06",  # float compare with src0_sext set
             "f904027c0186060e",  # float compare with src1_sext set
             "f904887d01861606",  # integer compare with src0_neg set
@@ -811,8 +809,6 @@ class TestRdna2Disasm(unittest.TestCase):
         # (src0_sel/src1_sel == 7 is intentionally omitted here: LLVM 15's printSDWASel hits llvm_unreachable.)
         for bad_hex in (
             "f904427c01000606",
-            "f904887d01864606",
-            "f904887d01860646",
             "f904027c01860e06",
             "f904027c0186060e",
             "f904887d01861606",

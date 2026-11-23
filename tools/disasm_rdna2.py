@@ -965,10 +965,6 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
     src1_sel = (w1 >> 24) & 0x7
     if src0_sel >= len(SDWA_SEL_NAMES) or src1_sel >= len(SDWA_SEL_NAMES):
         return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA selector")
-    # Reserved bits Inst{54} and Inst{62} must be 0 in VOP_SDWA9e.
-    if w1 & ((1 << 22) | (1 << 30)):
-        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Reserved VOPC SDWA bit set")
-
     sdwa_name = f"{op_name[:-4]}_sdwa" if op_name.endswith("_e32") else f"{op_name}_sdwa"
     src0_raw = w1 & 0xff
     sdst = (w1 >> 8) & 0x7f
