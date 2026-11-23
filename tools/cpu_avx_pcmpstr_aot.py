@@ -188,35 +188,31 @@ struct PcmpResult {
 };
 
 static std::uint32_t load32(word address) {
-    std::uint32_t val = 0u;
-    std::memcpy(&val, reinterpret_cast<const void*>(address), 4);
-    return val;
+    return *reinterpret_cast<const volatile std::uint32_t __unaligned*>(address);
 }
 
 static std::uint64_t load64(word address) {
-    std::uint64_t val = 0ull;
-    std::memcpy(&val, reinterpret_cast<const void*>(address), 8);
-    return val;
+    return *reinterpret_cast<const volatile std::uint64_t __unaligned*>(address);
 }
 
-static Vec256 load128(word address) {
+template<unsigned Bytes> static Vec256 load_vector(word address) {
+    // The guest reads the full operand even if the result is discarded.
     Vec256 v{};
-    std::memcpy(v.q, reinterpret_cast<const void*>(address), 16);
+    const auto* src = reinterpret_cast<const volatile std::uint8_t*>(address);
+    auto* dst = reinterpret_cast<std::uint8_t*>(v.q);
+    for (unsigned i = 0; i < Bytes; ++i) dst[i] = src[i];
     return v;
 }
 
-static Vec256 load256(word address) {
-    Vec256 v{};
-    std::memcpy(v.q, reinterpret_cast<const void*>(address), 32);
-    return v;
-}
+static Vec256 load128(word address) { return load_vector<16>(address); }
+static Vec256 load256(word address) { return load_vector<32>(address); }
 
 static void store32(word address, std::uint32_t val) {
-    std::memcpy(reinterpret_cast<void*>(address), &val, 4);
+    *reinterpret_cast<volatile std::uint32_t __unaligned*>(address) = val;
 }
 
 static void store64(word address, std::uint64_t val) {
-    std::memcpy(reinterpret_cast<void*>(address), &val, 8);
+    *reinterpret_cast<volatile std::uint64_t __unaligned*>(address) = val;
 }
 
 static void store128(word address, const Vec256& v) {
@@ -484,6 +480,8 @@ def lift_code(name, start, raw):
 
         mnemonic = ins.mnemonic
         if ins.code == Code.RETNQ:
+            if "rax" not in defined_gpr:
+                raise ValueError(f"return with undefined RAX at RVA {ins.ip:#x}")
             statements.append("return rax;")
             returned = True
         elif ins.code == Code.VEX_VZEROUPPER:

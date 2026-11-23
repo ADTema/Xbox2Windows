@@ -22,3 +22,4 @@ EXPORTS
     vpcmpistrm_uw_ranges_mpos_bit
     vpcmpistrm_sb_eqord_neg_bit
     vpcmpistrm_mem_ub_eqord_exp
+    vpcmpistrm_discarded_read

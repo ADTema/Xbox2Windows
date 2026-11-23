@@ -343,4 +343,15 @@ vpcmpistrm_mem_ub_eqord_exp PROC FRAME
     PACK_FLAGS
 vpcmpistrm_mem_ub_eqord_exp ENDP
 
+vpcmpistrm_discarded_read PROC FRAME
+    .endprolog
+    vmovdqu xmm1, XMMWORD PTR [rcx]
+    mov eax, 11223344h
+    mov DWORD PTR [r8], eax
+    vpcmpistrm xmm1, XMMWORD PTR [rdx], 00h
+    mov eax, 55667788h
+    mov DWORD PTR [r8], eax
+    ret
+vpcmpistrm_discarded_read ENDP
+
 END

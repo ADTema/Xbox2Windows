@@ -2918,6 +2918,8 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_avx_pcmpstr$' -V
 
 The [MASM fixture](../tests/cpu/avx_pcmpstr.asm) builds 22 exports covering `vpcmpestri`, `vpcmpestrm`, `vpcmpistri`, and `vpcmpistrm` across `xmm` and `m128` operands, all four element formats (`ub`, `uw`, `sb`, `sw`), all four aggregation modes, all four polarity modes, LSB/MSB and bitmask/byte-word mask outputs, ignored `imm8[7]`, `xmm0` self-aliasing, `xmm1` preservation, `RCX` 32-bit zero-extension, `RAX`/`RDX` upper-32-bit ignoring, `PF` clearing, and `YMM0[255:128]` zeroing. [The Windows test](../tests/cpu/avx_pcmpstr.py) skips with exit code 77 when CPUID/XCR0 lacks AVX and otherwise verifies 1,028 differential cases (including unaligned `[rdx]` offsets `+1` and `+3`, zero/negative/`>16`/`INT32_MIN` explicit lengths, and embedded NUL implicit lengths) with 16-byte pre/post guards against both native MASM DLLs and an independent Python reference model, plus 4 `ALTER_IMM` divergence controls, 1 output-mutation comparator control, 30 unit rejection controls, and 5 PE-patched DLL rejection controls.
 
+A separate memory-source fixture discards the compare result. Windows native and translated execution still report a read fault on an inaccessible operand after the first output store and before the second. The valid operand executes both stores. The verifier also rejects a return with undefined RAX.
+
 Not covered by this experiment: `VEX.W=1` 64-bit length forms (`vpcmpestri64`, `vpcmpestrm64`), control flow or calls mixed with AVX state, nonvolatile save/restore prologues, and title CPU code execution.
 
 ## Scalar SSE and SSE2 leaf functions

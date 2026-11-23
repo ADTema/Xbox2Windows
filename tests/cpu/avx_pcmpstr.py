@@ -44,7 +44,7 @@ SPECS = (
     ("vpcmpistrm_mem_ub_eqord_exp", 0x4C, None, False, True, False, False, False, True),
 )
 
-ALL_EXPORTS = tuple(row[0] for row in SPECS)
+ALL_EXPORTS = tuple(row[0] for row in SPECS) + ("vpcmpistrm_discarded_read",)
 
 BYTE_PAIRS = (
     (b"aeiou\x00xxxxxxxxxx", b"hello world!\x00xyz"),
@@ -229,6 +229,22 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
     _, native = bind_exports(native_path)
     _, altered = bind_exports(altered_path, "lifted_")
 
+    for label, functions in (("native", native), ("lifted", lifted)):
+        fn = functions["vpcmpistrm_discarded_read"]
+        source = ctypes.create_string_buffer(16)
+        result = ctypes.c_uint32()
+        ptr = ctypes.addressof(source)
+        assert fn(ptr, ptr, ctypes.addressof(result)) == 0x55667788
+        assert result.value == 0x55667788
+        result.value = 0
+        try:
+            fn(ptr, 0, ctypes.addressof(result))
+        except OSError as error:
+            assert "access violation reading" in str(error).lower(), (label, error)
+        else:
+            raise AssertionError(f"{label} discarded the faulting memory compare")
+        assert result.value == 0x11223344, (label, result.value)
+
     total = 0
     for name, imm, _, is_exp, is_mask, is_word, is_alias, check_xmm1, check_unaligned in SPECS:
         vec_pairs = WORD_PAIRS if is_word else BYTE_PAIRS
@@ -284,7 +300,7 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
         raise AssertionError("mutated output was not caught by comparator")
 
     print(
-        f"{total} VEX.128 AVX packed string compare cases across {len(ALL_EXPORTS)} exports matched native and reference; "
+        f"{total} VEX.128 AVX packed string compare cases across {len(SPECS)} exports matched native and reference; "
         f"ALTER_IMM diverged on {diverged}; output mutation control caught"
     )
 
@@ -315,6 +331,7 @@ def check_rejections(original_path: Path) -> None:
     seg_ins.segment_prefix = R.GS
 
     unit_cases = [
+        ("undefined_rax", ret_bytes, "return with undefined RAX"),
         # Invalid VEX.256 (L=1) pcpm*str* encodings (#UD in x86-64)
         ("vex256_vpcmpestri", ld_preamble + bytes.fromhex("c4e37d61ca00") + ret_bytes, "invalid instruction"),
         ("vex256_vpcmpestrm", ld_preamble + bytes.fromhex("c4e37d60ca00") + ret_bytes, "invalid instruction"),
@@ -387,7 +404,7 @@ def check_rejections(original_path: Path) -> None:
         ("out_of_scope_jmp", encode_seq(Instruction.create_branch(Code.JMP_REL8_64, 0x1020), ret_ins),
          "unsupported instruction"),
         ("missing_ret", encode_seq(ld_xmm0), "missing terminal ret"),
-        ("after_ret", encode_seq(ret_ins, ld_xmm0), "unreachable instruction after ret"),
+        ("after_ret", encode_seq(ld_eax, ret_ins, ld_xmm0), "unreachable instruction after ret"),
     ]
 
     for label, raw, expected_reason in unit_cases:
