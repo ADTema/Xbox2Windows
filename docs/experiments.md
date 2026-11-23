@@ -3839,6 +3839,33 @@ Run `ctest --preset dev --no-tests=error -R '^vm_copy_queue_' -V`.
 
 Run `ctest --preset dev --no-tests=error -R '^vm_page_provenance_' -V`.
 
+#### Xbox frame events and token wait semantics (#874)
+
+The source-built frame events fixture (`tests/cpu/frame_events_caller.asm`, `tests/cpu/frame_events_provider.cpp`, `tests/cpu/frame_events_check.py`, CTest `cpu_native_frame_events`) models the scheduling and wait semantics of the Xbox frame-pacing extensions in `d3d12_xs.dll`:
+- `SetFrameIntervalX(output, interval, period, flags)`: configures frame cadence.
+- `ScheduleFrameEventX(event_type, offset_us, event_handle, flags)`: registers frame event scheduling.
+- `WaitFrameEventX(event_type, timeout_ms, event_handle, flags, out_token)`: waits for frame pacing milestones and produces a 64-bit frame pipeline token (`D3D12XBOX_FRAME_PIPELINE_TOKEN`).
+
+The supported call sequence follows Microsoft's public Xbox sample ([`DeviceResources.cpp`](https://github.com/microsoft/Xbox-GDK-Samples/blob/41b5942c4fba910332123070e51827761f6040fd/Samples/Live/InGameStore/DeviceResources.cpp)):
+1. `SetFrameIntervalX` initializes cadence.
+2. `ScheduleFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 0, nullptr, 0)` registers the frame origin once.
+3. `WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, ...)` waits each frame and retrieves the frame token. Passing the token to `PresentX` is a cited follow-up (this caller verifies token delivery but does not call `PresentX`).
+
+Contract boundaries and fixture choices:
+- **Established call shape**: `SetFrameIntervalX → ScheduleFrameEventX(ORIGIN) once → WaitFrameEventX(ORIGIN) each frame` with `nullptr` event handle and token delivery.
+- **Fixture choices (labeled as requiring separate evidence)**:
+  - Exposing these methods as PE imports from `d3d12_xs.dll` is a fixture choice (the GDK sample invokes device methods).
+  - Passing a null output to `SetFrameIntervalX` is a fixture choice (the sample passes an actual `IDXGIOutput*`).
+  - Numeric constants (e.g. 60) and seeded token representation (monotonically advancing 64-bit integer 1, 2, ...).
+  - Unused `HANDLE` signaling was dropped per review feedback.
+  - Controlled tick driver: registration injects two scheduled ticks from an internal thread, exercising real blocked waiters with an explicit witness (`get_frame_events_blocked_waits() == 2`) without wall-clock drift.
+  - Bounded timeout before tick leaves the output sentinel unchanged and returns `WAIT_TIMEOUT` (`0x00000102`).
+  - Unrepresented event refusal: event types other than `D3D12XBOX_FRAME_EVENT_ORIGIN` (value 0) return `E_INVALIDARG` (`0x80070057`) leaving the output sentinel intact.
+  - Separate fault controls: `cpu_frame_events_provider_clobber` tests refusal sentinel overwrite (specific exit `0xE03`), and `cpu_frame_events_provider_early` tests premature release before tick (specific exit `0xE04`).
+- **Loaders and withholding**: The fixture runs under native Windows (with and without a live worker thread) and under `pe_map`. Withholding `d3d12_xs.dll` halts `pe_map` at import resolution with `STATUS["unresolved"]`.
+
+Run `ctest --preset dev --no-tests=error -R '^cpu_native_frame_events$' -V`.
+
 ### Attribute words at xmem call sites
 
 `tools/xmem_attribute_scan.py` reads a PE image without loading or running it. It reports the attribute word at each call or tail jump into `xmem.dll`'s `XMemAlloc` or `XMemFree`, from a normal or delay-load import. It finds sites reached through the IAT slot, through an import thunk, or through a register loaded from the slot.
