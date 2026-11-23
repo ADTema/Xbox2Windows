@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -186,7 +187,7 @@ def check(folder, fixture, provider):
         pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 0
         pe.write(str(oob_tls))
     assert "RVA" in run(2, oob_tls)["error"]
-    check_virtual_tail_tls(folder, fixture, run)
+    check_virtual_tail_tls(folder, fixture, report, run)
     staged = root / "incoming.exe"
     shutil.copyfile(fixture, staged)
     assert run(0, staged)["diff"]["added_images"] == [slot]
@@ -337,20 +338,26 @@ def check_modified_directory(folder, fixture, provider):
     assert second_edges["delay", "intake_delay.dll", "delayed_value"]["bundle_exports_in"] == ["intake_delay.dll"]
 
 
-def check_virtual_tail_tls(folder, fixture, run):
-    """Place TLS data in a section's zero-filled virtual tail.
+def check_virtual_tail_tls(folder, fixture, baseline_report, run):
+    """Place TLS data in a section's zero-filled virtual tail and verify span bounds.
 
     The Windows loader maps Misc_VirtualSize bytes for each section and zero-fills the range
-    after SizeOfRawData. The last section's VirtualSize is extended past its raw data so the
+    after SizeOfRawData. The source-built .data section already has a raw prefix followed by a
+    virtual tail, and the last section's VirtualSize is also extended past its raw data so the
     tail exists for every linker layout. A callback table terminator, a TLS directory wholly
     inside the tail and a directory crossing from raw data into the tail must all read the tail
-    as zero, while reads that leave the section's virtual span are still rejected.
+    as zero, while reads that leave the section's virtual span or image are still rejected.
     """
+    tls_info = baseline_report["pe"]["tls"]
+    image_base = baseline_report["pe"]["image_base"]
     with pefile.PE(str(fixture)) as pe:
-        image_base = pe.OPTIONAL_HEADER.ImageBase
+        assert image_base == pe.OPTIONAL_HEADER.ImageBase
         tls_rva = pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress
         assert tls_rva and pe.DIRECTORY_ENTRY_TLS
         callback_va = pe.get_qword_at_rva(pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks - image_base)
+        data_section = next(s for s in pe.sections if s.Name.rstrip(b"\0") == b".data")
+        assert data_section.PointerToRawData and data_section.SizeOfRawData >= 0x200
+        assert data_section.Misc_VirtualSize > data_section.SizeOfRawData
         section = next((s for s in reversed(pe.sections) if s.SizeOfRawData >= 8 and
                         s.VirtualAddress + s.SizeOfRawData + 0x40 <= pe.OPTIONAL_HEADER.SizeOfImage), None)
         assert section is not None and callback_va
@@ -365,13 +372,19 @@ def check_virtual_tail_tls(folder, fixture, run):
                        for s in pe.sections if s.VirtualAddress != section_va)
     callback_rva = callback_va - image_base
 
-    def write_variant(name, tail_size, *, callback_table=False, directory_rva=None,
-                      zero_raw_slot=False, no_raw_pointer=False):
+    def write_pe(name, change):
         path = folder / name
         with pefile.PE(str(fixture)) as pe:
+            change(pe)
+            pe.write(str(path))
+        return path
+
+    def write_variant(name, tail_size, *, callback_table=False, directory_rva=None,
+                      zero_raw_slot=False, no_raw_pointer=False):
+        def apply(pe):
             if tail_size is not None:
-                section = next(s for s in pe.sections if s.VirtualAddress == section_va)
-                section.Misc_VirtualSize = section.SizeOfRawData + tail_size
+                sec = next(s for s in pe.sections if s.VirtualAddress == section_va)
+                sec.Misc_VirtualSize = sec.SizeOfRawData + tail_size
             if zero_raw_slot:
                 pe.set_qword_at_rva(table_rva, 0)
             if callback_table:
@@ -381,10 +394,13 @@ def check_virtual_tail_tls(folder, fixture, run):
                 pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = directory_rva
                 pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 0
             if no_raw_pointer:
-                section = next(s for s in pe.sections if s.VirtualAddress == section_va)
-                section.PointerToRawData = 0
-            pe.write(str(path))
-        return path
+                sec = next(s for s in pe.sections if s.VirtualAddress == section_va)
+                sec.PointerToRawData = 0
+        return write_pe(name, apply)
+
+    def write_data_variant(name, change):
+        return write_pe(name, lambda pe: change(
+            pe, next(s for s in pe.sections if s.Name.rstrip(b"\0") == b".data")))
 
     # A raw-backed callback followed by the tail's implicit zero slots terminates the table.
     report = run(0, write_variant("tls-tail-callbacks.exe", 0x40, callback_table=True))
@@ -409,15 +425,112 @@ def check_virtual_tail_tls(folder, fixture, run):
             callback_table_va=0, callbacks_rva=[], zero_fill=0, characteristics=0)
         assert [loc["role"] for loc in report["pe"]["startup"]["locations"]] == ["entry"]
 
-    # Negative control: a directory that starts in the tail but leaves the section's span.
+    # Source-built .data raw prefix (with Misc_VirtualSize > SizeOfRawData): both directory and
+    # callback table inside the raw prefix, plus a populated directory crossing into the zero tail.
+    def set_raw_prefix_tls(pe, sec):
+        cb_table_rva = sec.VirtualAddress + sec.SizeOfRawData - 16
+        dir_rva = sec.VirtualAddress + sec.SizeOfRawData - 56
+        pe.set_bytes_at_offset(sec.PointerToRawData + sec.SizeOfRawData - 16, struct.pack("<2Q", callback_va, 0))
+        pe.set_bytes_at_offset(
+            sec.PointerToRawData + sec.SizeOfRawData - 56,
+            struct.pack("<4Q2I", tls_info["template_start_va"], tls_info["template_end_va"],
+                        tls_info["index_va"], image_base + cb_table_rva,
+                        tls_info["zero_fill"], tls_info["characteristics"]))
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = dir_rva
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 40
+
+    raw_prefix_report = run(0, write_data_variant("tls-raw-prefix.exe", set_raw_prefix_tls))
+    assert raw_prefix_report["pe"]["tls"]["callbacks_rva"] == [callback_rva]
+    assert raw_prefix_report["pe"]["startup"]["locations"][0]["role"] == "tls_callback"
+
+    def set_populated_crossing_dir(pe, sec):
+        dir_rva = sec.VirtualAddress + sec.SizeOfRawData - 32
+        pe.set_bytes_at_offset(
+            sec.PointerToRawData + sec.SizeOfRawData - 32,
+            struct.pack("<4Q", tls_info["template_start_va"], tls_info["template_end_va"],
+                        tls_info["index_va"], tls_info["callback_table_va"]))
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = dir_rva
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 40
+
+    crossing_pop = run(0, write_data_variant("tls-dir-crossing-populated.exe", set_populated_crossing_dir))
+    assert crossing_pop["pe"]["tls"]["callbacks_rva"] == [callback_rva]
+    assert crossing_pop["pe"]["tls"]["zero_fill"] == 0 and crossing_pop["pe"]["tls"]["characteristics"] == 0
+
+    # Misc_VirtualSize == 0 falls back to SizeOfRawData.
+    zero_vsize_report = run(0, write_pe("tls-zero-vsize.exe", lambda pe: setattr(
+        pe.get_section_by_rva(tls_info["directory_rva"]), "Misc_VirtualSize", 0)))
+    assert zero_vsize_report["pe"]["tls"] == tls_info
+    assert zero_vsize_report["pe"]["startup"]["locations"] == baseline_report["pe"]["startup"]["locations"]
+
+    # Negative controls:
+    # 1. A directory that starts in the tail but leaves the section's span.
     overrun_rva = tail_end - 16
     report = run(2, write_variant("tls-tail-overrun.exe", 0x40, directory_rva=overrun_rva))
     assert report["error"] == f"Unmapped or unsuitable RVA {overrun_rva:#x}"
 
-    # Negative control: the same raw-backed callback is unterminated once VirtualSize stops
-    # claiming a tail, so an accepted table must not be an artifact of file-trailing bytes.
+    # 2. The same raw-backed callback is unterminated once VirtualSize stops claiming a tail,
+    # so an accepted table must not be an artifact of file-trailing bytes.
     report = run(2, write_variant("tls-tail-unbounded.exe", 0, callback_table=True))
     assert report["error"] == "Unterminated TLS callback table or inspection limit reached"
+
+    # 3. Unterminated callback table reaching Misc_VirtualSize < SizeOfRawData, despite zeros in file padding.
+    def set_unterminated_vsize(pe, sec):
+        sec.Misc_VirtualSize = 0x20
+        pe.set_bytes_at_offset(sec.PointerToRawData, b"\0" * 0x40)
+        pe.set_bytes_at_offset(sec.PointerToRawData, struct.pack("<4Q", *([callback_va] * 4)))
+        pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks = image_base + sec.VirtualAddress
+
+    report = run(2, write_data_variant("tls-unterminated-vsize.exe", set_unterminated_vsize))
+    assert report["error"] == "Unterminated TLS callback table or inspection limit reached"
+
+    # 4. Partial 4-byte TLS callback slot hitting Misc_VirtualSize (both as table tail and table start).
+    def set_partial_vsize_slot(pe, sec):
+        sec.Misc_VirtualSize = 0x14
+        pe.set_bytes_at_offset(sec.PointerToRawData, struct.pack("<2Q", callback_va, callback_va) + b"\0" * 16)
+        pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks = image_base + sec.VirtualAddress
+
+    report = run(2, write_data_variant("tls-partial-vsize-slot.exe", set_partial_vsize_slot))
+    assert report["error"] == "Unterminated TLS callback table or inspection limit reached"
+
+    def set_partial_vsize_start(pe, sec):
+        sec.Misc_VirtualSize = 0x14
+        pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks = image_base + sec.VirtualAddress + 0x10
+
+    assert "RVA" in run(2, write_data_variant("tls-partial-vsize-start.exe", set_partial_vsize_start))["error"]
+
+    # 5. TLS callback slot straddling SizeOfRawData into zero tail reads invalid low-32 VA.
+    def set_slot_straddle(pe, sec):
+        cb_table_rva = sec.VirtualAddress + sec.SizeOfRawData - 4
+        pe.set_bytes_at_offset(sec.PointerToRawData + sec.SizeOfRawData - 4, struct.pack("<I", 0xffffffff))
+        pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks = image_base + cb_table_rva
+
+    assert "RVA" in run(2, write_data_variant("tls-slot-straddle.exe", set_slot_straddle))["error"]
+
+    # 6. TLS directory read past Misc_VirtualSize even when SizeOfRawData is larger.
+    def set_past_vsize(pe, sec):
+        sec.Misc_VirtualSize = 0x40
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = sec.VirtualAddress + 0x20
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 40
+
+    assert "RVA" in run(2, write_data_variant("tls-past-vsize.exe", set_past_vsize))["error"]
+
+    # 7. Non-executable callback entry inside raw prefix pointing to .data virtual tail.
+    def set_nonexec_cb(pe, sec):
+        cb_table_rva = sec.VirtualAddress + sec.SizeOfRawData - 16
+        pe.set_bytes_at_offset(sec.PointerToRawData + sec.SizeOfRawData - 16,
+                               struct.pack("<2Q", image_base + sec.VirtualAddress + sec.SizeOfRawData, 0))
+        pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks = image_base + cb_table_rva
+
+    assert "RVA" in run(2, write_data_variant("tls-nonexec-tail-cb.exe", set_nonexec_cb))["error"]
+
+    # 8. Misc_VirtualSize extending beyond SizeOfImage stays clamped to SizeOfImage.
+    def set_past_image(pe):
+        last = pe.sections[-1]
+        last.Misc_VirtualSize = max(last.Misc_VirtualSize, pe.OPTIONAL_HEADER.SizeOfImage - last.VirtualAddress) + 0x1000
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = pe.OPTIONAL_HEADER.SizeOfImage - 16
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 40
+
+    assert "RVA" in run(2, write_pe("tls-past-image.exe", set_past_image))["error"]
 
 
 if __name__ == "__main__":

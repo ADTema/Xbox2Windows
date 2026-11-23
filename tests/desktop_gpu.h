@@ -44,6 +44,8 @@ void check_compute_to_pixel(ID3D12Device* device, const char* compute, const cha
                             const char* reference, const char* previous);
 void check_pixel_quad_lod(ID3D12Device* device, const char* shader);
 void check_pixel_compare(ID3D12Device* device, const char* shader, const char* reference);
+bool check_mesh_shadow_draw(ID3D12Device*, const char* mesh, const char* receiver, const char* caster,
+                            const char* fixture, bool stale);
 void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* input,
                      const char* capture, const char* mip1 = nullptr);
 void check_bc7_tail(ID3D12Device* device, const char* shader, const char* firstMip, int count, char** paths);

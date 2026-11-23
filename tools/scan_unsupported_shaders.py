@@ -72,6 +72,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\),\s+(?:-?\d+|0x[0-9a-f]{1,8})",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_MODE, 2, 2\),\s+[03]",
     r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])",
+    # SOPK wait forms: only null as the SGPR (reads as 0) and a count of 0..63, as in pixel_aot.
+    r"s_waitcnt_(?:vmcnt|lgkmcnt|vscnt)\s+null,\s*(?:0x(?:0?[0-9a-f]|[1-3][0-9a-f])|[0-9]|[1-5][0-9]|6[0-3])",
     rf"s_waitcnt\s+(?:{WAIT_COUNTER}(?:\s+{WAIT_COUNTER}){{0,2}}|0(?:x0)?)",
     r"s_mov_b64\s+s\[\d+:\d+\],\s+exec",
     r"s_wqm_b64\s+exec,\s+exec",
@@ -201,7 +203,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_wqm_b32", "s_wqm_b64", "s_swappc_b64", "s_setpc_b64", "s_rfe_b64",
     "s_and_saveexec_b64", "s_or_saveexec_b64", "s_xor_saveexec_b64",
     # SOP2
-    "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_addc_u32", "s_subb_u32",
+    "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_absdiff_i32", "s_addc_u32", "s_subb_u32",
     "s_min_i32", "s_min_u32", "s_max_i32", "s_max_u32", "s_cselect_b32", "s_cselect_b64",
     "s_and_b32", "s_and_b64", "s_or_b32", "s_or_b64", "s_xor_b32", "s_xor_b64",
     "s_andn2_b32", "s_andn2_b64", "s_orn2_b32", "s_orn2_b64", "s_nand_b32", "s_nand_b64",

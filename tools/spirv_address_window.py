@@ -18,7 +18,8 @@ POINTER = re.compile(rf"({ID}) = OpTypePointer (\w+) ({ID})")
 
 def word_pointer(dst, base, index):
     """Select the last DWORD offset for an unaligned or unrepresentable address."""
-    name = "%x2w_" + dst[1:]
+    # Keep address temporaries separate from the generated x2w_ballot_ IDs.
+    name = "%x2w_address_" + dst[1:]
     lines = []
     addr = base
     if index:
@@ -74,7 +75,8 @@ def lower(assembly):
     model = "OpMemoryModel PhysicalStorageBuffer64 GLSL450"
     if model not in lines or lines.count("%user_data = OpVariable %_ptr_PC_UserData PushConstant") != 1:
         raise ValueError("expected a physical-address module with the named user-data block")
-    if any("%x2w_" in line or re.fullmatch(rf"OpDecorate {ID} DescriptorSet [12]", line) for line in lines):
+    # Ballot lowering also emits x2w_ IDs, so check the namespace on the original input.
+    if "%x2w_" in assembly or any(re.fullmatch(rf"OpDecorate {ID} DescriptorSet [12]", line) for line in lines):
         raise ValueError("address window needs unused identifier prefix x2w_ and descriptor sets 1 and 2")
     if sum(line.startswith("OpEntryPoint ") for line in lines) != 1:
         raise ValueError("expected one shader entry point")

@@ -494,6 +494,14 @@ INTEGER = {
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
     "alignbit_b32": (3, "(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))"),
     "alignbyte_b32": (3, "(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - (({2} & 3u) * 8u)))))"),
+    "add3_u32": (3, "({0} + {1} + {2})"),
+    "or3_b32": (3, "({0} | {1} | {2})"),
+    "xor3_b32": (3, "({0} ^ {1} ^ {2})"),
+    "and_or_b32": (3, "(({0} & {1}) | {2})"),
+    "xad_u32": (3, "(({0} ^ {1}) + {2})"),
+    "lshl_or_b32": (3, "(({0} << ({1} & 31u)) | {2})"),
+    "lshl_add_u32": (3, "(({0} << ({1} & 31u)) + {2})"),
+    "add_lshl_u32": (3, "(({0} + {1}) << ({2} & 31u))"),
     "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
     "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
     "mul_u32_u24": (2, "mul24_u32({0}, {1})"),
@@ -973,6 +981,7 @@ SCALAR = {
     "sext_i32_i8": (1, "asuint(asint({0} << 24) >> 24)", None),
     "sext_i32_i16": (1, "asuint(asint({0} << 16) >> 16)", None),
     "abs_i32": (1, "(asint({0}) < 0 ? (0u - {0}) : {0})", NONZERO),
+    "absdiff_i32": (2, "asuint(abs(asint({0}) - asint({1})))", NONZERO),
     "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),
     "add_i32": (2, "{0} + {1}", "(~({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
     "sub_i32": (2, "{0} - {1}", "(({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
@@ -987,6 +996,8 @@ SCALAR = {
     "xnor_b32": (2, "~({0} ^ {1})", NONZERO),
     # SCC is not written. Both counts are masked to five bits, so every shift stays below 32.
     "bfm_b32": (2, "((1u << ({0} & 31u)) - 1u) << ({1} & 31u)", None),
+    # Like s_brev_b64, SCC is not written; reversebits reverses all 32 bits.
+    "brev_b32": (1, "reversebits({0})", None),
     "lshl_b32": (2, "{0} << ({1} & 31u)", NONZERO), "lshr_b32": (2, "{0} >> ({1} & 31u)", NONZERO),
     "ashr_i32": (2, "asuint(asint({0}) >> ({1} & 31u))", NONZERO),
     "lshl1_add_u32": (2, "({0} << 1u) + {1}", "({0} >> 31u != 0u) || ({r} < {1})"),
@@ -1661,8 +1672,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if (half_rounding != HALF_ROUNDING["0"] and re.match(r"v_\w*_f(?:16|64)", line)
                 and not line.startswith(HALF_ROUNDING_EXEMPT)):
             raise ValueError(f"Unsupported binary16 or binary64 operation under round {half_rounding}: {line.split()[0]}")
-        if m := match(r"s_waitcnt\s+(.*)"):
-            payload = m[1].strip()
+        # gfx10 SOPK wait forms: `s_waitcnt_<counter> <sgpr|null>, <simm16>`. Only null is modelled, since it
+        # reads as 0 and the count is then the immediate; an SGPR value would add to or replace it.
+        # vmcnt and lgkmcnt act exactly like the vmcnt(K) and lgkmcnt(K) tokens of s_waitcnt. vscnt is a no-op:
+        # this translator lowers no vector memory stores, so nothing is outstanding on the store counter.
+        sopk_wait = None
+        if m := match(r"s_waitcnt_(vmcnt|lgkmcnt|vscnt)(?:\s+(.*))?"):
+            counter = m[1]
+            label = {"vmcnt": "VM", "lgkmcnt": "LGKM", "vscnt": "VS"}[counter]
+            operands = [part.strip() for part in (m[2] or "").split(",")]
+            if len(operands) != 2 or not re.fullmatch(r"0x[0-9a-f]+|0|[1-9]\d*", operands[1]):
+                raise ValueError(f"Malformed s_waitcnt_{counter} operands: {line}")
+            if operands[0] != "null":
+                raise ValueError(f"Unsupported s_waitcnt_{counter} SGPR operand (only null is modelled): {line}")
+            count = int(operands[1], 0)
+            if count > 63:
+                raise ValueError(f"{label} wait count exceeds the gfx10 six-bit field")
+            if counter == "vscnt":
+                continue
+            sopk_wait = f"{counter}({count})"
+        wait_match = match(r"s_waitcnt\s+(.*)")
+        if sopk_wait is not None or wait_match:
+            payload = sopk_wait if sopk_wait is not None else wait_match[1].strip()
             if payload in ("0", "0x0"):
                 pending.clear()
                 sample_dest.clear()

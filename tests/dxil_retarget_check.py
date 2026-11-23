@@ -454,7 +454,8 @@ define void @main() {
 
     # A metadata description that looks like a call still contains no instruction.
     inventory = xbox_intrinsic_inventory('!0 = !{!"call void @xbox.inventory_example("}')
-    assert inventory == dict(calls={}, declarations=[], metadata_only=["xbox.inventory_example"]), inventory
+    assert inventory == dict(calls={}, declarations=[], metadata_only=["xbox.inventory_example"],
+                            references={}), inventory
     inventory = xbox_intrinsic_inventory('  %"call result" = tail call i32 @"xbox.inventory_example"()')
     assert inventory["calls"] == {"xbox.inventory_example": 1}, inventory
 
@@ -468,7 +469,7 @@ define void @main() {
 !1 = !{!"__XBOX_ENABLE_WAVE32=1"}
 """
     inventory = xbox_intrinsic_inventory(named_metadata)
-    assert inventory == dict(calls={}, declarations=[], metadata_only=[]), inventory
+    assert inventory == dict(calls={}, declarations=[], metadata_only=[], references={}), inventory
 
     # (d) Ordinary module: dx.op calls and unrelated metadata report three empty groups.
     ordinary = """
@@ -484,7 +485,7 @@ define void @main() {
 !0 = !{i32 2, !"DXC version", !"1.8.2407"}
 """
     inventory = xbox_intrinsic_inventory(ordinary)
-    assert inventory == dict(calls={}, declarations=[], metadata_only=[]), inventory
+    assert inventory == dict(calls={}, declarations=[], metadata_only=[], references={}), inventory
 
     # 7. Submission gate: the final module is checked and a refused module is never submitted.
     import xbox_intrinsic_gate as gate
@@ -525,6 +526,133 @@ define void @main() {
     stub = RecordingSubmit()
     removed = gate.gate_submission(gate.check_text(declared), declared, stub)
     assert removed["verdict"] == gate.ALLOW and len(stub.batches) == 1, removed
+
+    # Every form that keeps an xbox.* symbol reachable blocks, and the refusal names the form.
+    alias_module = "@alias_bfi = alias i32 (i32), ptr @xbox.BFI\n"
+    store_module = ("define void @main() {\n"
+                    "  store ptr @xbox.global_store_dword_with_cache, ptr %slot\n"
+                    "  ret void\n}\n")
+    indirect_module = ("define void @main() {\n"
+                       "  %fp = bitcast ptr @xbox.foo to ptr\n"
+                       "  call void %fp(i32 1)\n"
+                       "  ret void\n}\n")
+    bitcast_call_module = ("define void @main() {\n"
+                           "  call void bitcast (void (i32)* @xbox.foo to void (i64)*)(i64 5)\n"
+                           "  ret void\n}\n")
+    global_initializer_module = "@table = global ptr @xbox.Med3_F32\n"
+    # A function pointer: the symbol goes into a global, the call goes through the loaded pointer.
+    function_pointer_module = ("@slot = global ptr null\n"
+                               "define void @main() {\n"
+                               "  store ptr @xbox.foo, ptr @slot\n"
+                               "  %fp = load ptr, ptr @slot\n"
+                               "  call void %fp(i32 1)\n"
+                               "  ret void\n}\n")
+    # An ordinary callee that receives the symbol as an argument — not a debug intrinsic.
+    call_operand_module = ("declare void @consume(ptr)\n"
+                           "define void @main() {\n"
+                           "  call void @consume(ptr @xbox.foo)\n"
+                           "  ret void\n}\n")
+    for label, module_text, form in (
+        ("alias", alias_module, "alias"),
+        ("store", store_module, "store"),
+        ("indirect call through a bitcast", indirect_module, "bitcast"),
+        ("function pointer in a global initializer", global_initializer_module, "global-initializer"),
+        ("function pointer in a slot", function_pointer_module, "store"),
+        ("call operand of an ordinary callee", call_operand_module, "call-operand"),
+        ("bitcast-spelled direct call", bitcast_call_module, "call"),
+    ):
+        stub = RecordingSubmit()
+        decision = gate.gate_submission(gate.check_text(module_text), module_text, stub)
+        assert decision["verdict"] == gate.REJECT, (label, decision)
+        assert stub.batches == [], (label, "a reachable symbol was submitted")
+        assert decision["blocking"][0]["form"] == form, (label, decision["blocking"])
+        assert form in decision["message"], (label, decision["message"])
+    # The bitcast-spelled call is a call site, not merely a reference.
+    assert gate.check_text(bitcast_call_module)["calls"] == {"xbox.foo": 1}, gate.check_text(bitcast_call_module)
+    # A referenced name is not metadata-only.
+    assert gate.check_text(alias_module)["metadata_only"] == [], gate.check_text(alias_module)
+
+    # A debug intrinsic carries the symbol only as metadata the runtime never reads: allowed.
+    debug_only_module = ("declare void @llvm.dbg.value(metadata, i64, metadata, metadata)\n"
+                         "define void @main() {\n"
+                         "  call void @llvm.dbg.value(metadata ptr @xbox.foo, i64 0,"
+                         " metadata !0, metadata !1)\n"
+                         "  ret void\n}\n"
+                         "!0 = !{}\n"
+                         "!1 = !{}\n")
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(debug_only_module), debug_only_module, stub)
+    assert decision["verdict"] == gate.ALLOW, decision
+    assert decision["calls"] == {} and decision["blocking"] == [], decision
+    assert decision["debug_only"] == ["xbox.foo"], decision
+    assert "debug-only" in decision["message"], decision["message"]
+    assert len(stub.batches) == 1, decision
+    # The same symbol stops being debug-only once an ordinary callee receives it.
+    assert gate.check_text(call_operand_module)["verdict"] == gate.REJECT
+
+    # Only the callee decides: an ordinary callee whose argument happens to mention a debug
+    # intrinsic is still an executable call, so the symbol must block.
+    trap_module = ("declare void @consume(ptr, ptr)\n"
+                   "define void @main() {\n"
+                   "  call void @consume(ptr @xbox.foo, ptr bitcast (void()* @llvm.dbg.value to i8*))\n"
+                   "  ret void\n}\n")
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(trap_module), trap_module, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert stub.batches == [], "a call mentioning a debug intrinsic was submitted"
+    assert decision["blocking_references"][0]["form"] == "call-operand", decision
+    assert decision["debug_only"] == [], decision
+
+    # The other debug intrinsics are debug-only uses as well.
+    for intrinsic, signature in (("llvm.dbg.declare", "metadata, metadata, metadata"),
+                                 ("llvm.dbg.assign", "metadata, metadata, metadata, metadata, metadata, metadata")):
+        module_text = (f"declare void @{intrinsic}({signature})\n"
+                       "define void @main() {\n"
+                       f"  call void @{intrinsic}(metadata ptr @xbox.foo, metadata !0, metadata !1"
+                       f"{', metadata !0, metadata !1, metadata !0' if 'assign' in intrinsic else ''})\n"
+                       "  ret void\n}\n"
+                       "!0 = !{}\n"
+                       "!1 = !{}\n")
+        stub = RecordingSubmit()
+        decision = gate.gate_submission(gate.check_text(module_text), module_text, stub)
+        assert decision["verdict"] == gate.ALLOW, (intrinsic, decision)
+        assert decision["debug_only"] == ["xbox.foo"], (intrinsic, decision)
+        assert len(stub.batches) == 1, (intrinsic, decision)
+
+    # sites counts executable uses only; a debug-only use is counted apart.
+    debug_inventory = xbox_intrinsic_inventory(debug_only_module)
+    assert debug_inventory["references"]["xbox.foo"]["sites"] == 0, debug_inventory
+    assert debug_inventory["references"]["xbox.foo"]["debug_sites"] == 1, debug_inventory
+    # The archive filter counts anything reachable, debug-only included: skipping is conservative.
+    assert gate.reaches_xbox(debug_inventory) is True, debug_inventory
+
+    # An advisory status cannot clear a reference the module still holds.
+    stub = RecordingSubmit()
+    claims = gate.status_table(["BFI"])
+    decision = gate.gate_submission(gate.check_text(alias_module, claims), alias_module, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert decision["blocking_references"][0]["advisory"] == gate.LOWERED, decision
+    assert stub.batches == [], "an advisory status cleared a reference"
+
+    # The same rule at the backend boundary: a reference-only inventory starts no probe process.
+    with patch.object(rt.subprocess, "run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["dev", "--compute-pso"], 0, b'{"warp_pso":"0x00000000"}\n', b"")
+        reference_only = rt.check_compute_pso(
+            Path("dev"), synth_dxbc,
+            intrinsics=dict(calls={}, declarations=[], metadata_only=[],
+                            references={"xbox.BFI": {"sites": 1, "kinds": ["alias"]}}))
+        assert mock_run.call_count == 0, "a reference-only module started a submission"
+        assert reference_only["gate"]["verdict"] == gate.REJECT, reference_only
+        assert reference_only["gate"]["blocking_references"][0]["form"] == "alias", reference_only
+
+    # --only-without-xbox-calls keeps one meaning: no form reaches an xbox.* symbol.
+    reached = xbox_intrinsic_inventory(alias_module)
+    assert gate.reaches_xbox(reached) is True, reached
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(called)) is True
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(declared)) is False
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(metadata)) is False
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(ordinary)) is False
 
     # A metadata string that spells a call is not an instruction: it must not refuse the module.
     spelled_call = '!0 = !{!"call void @xbox.text()"}'
@@ -604,7 +732,15 @@ define void @main() {
     print("submission gate controls: executable call refused with 0 submissions; declared only, "
           "metadata only and ordinary modules submit once; an advisory LOWERED status still refuses "
           "while the call remains and clears once the call is gone; missing inventory starts 0 probe "
-          "processes; a metadata string that spells a call and a ';' inside a metadata string still "
+          "processes; an alias, a store, an indirect call through a bitcast, a function pointer in a "
+          "global initializer, a function pointer in a slot, a call operand of an ordinary callee and a "
+          "bitcast-spelled direct call each refused with their form named in 0 submissions, with calls "
+          "and references listed apart; a debug intrinsic that only carries the symbol as metadata is "
+          "allowed and reported as debug-only, and so are llvm.dbg.declare and llvm.dbg.assign; an "
+          "ordinary call that merely mentions a debug intrinsic in an argument still blocks as "
+          "call-operand; an advisory LOWERED status clears neither a call nor a reference; sites counts "
+          "executable uses only while the archive filter treats every reachable form as reaching an "
+          "intrinsic; a metadata string that spells a call and a ';' inside a metadata string still "
           "pass; without --probe the CLI records NOT_CHECKED and submits nothing")
     print("pure-python dxil_retarget controls: ok")
 

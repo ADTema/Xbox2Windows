@@ -155,6 +155,7 @@ SOP2_OPS = {
     0x21: ("s_lshr_b64", "Scalar logical shift right 64-bit"),
     0x22: ("s_ashr_i32", "Scalar arithmetic shift right 32-bit"),
     0x26: ("s_mul_i32", "Scalar multiply signed 32-bit"),
+    0x2c: ("s_absdiff_i32", "Scalar absolute difference signed 32-bit"),
     0x2e: ("s_lshl1_add_u32", "Scalar shift left 1 and add 32-bit"),
     0x2f: ("s_lshl2_add_u32", "Scalar shift left 2 and add 32-bit"),
     0x30: ("s_lshl3_add_u32", "Scalar shift left 3 and add 32-bit"),
@@ -1246,6 +1247,11 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         else:
             src0_str = decode_v_reg(src0)
         dst_str = f"v[{vdst}:{vdst + 1}]" if wide_dst and vdst < 255 else (f"<invalid VGPR pair>" if wide_dst else f"v{vdst}")
+        if op_name == "v_readfirstlane_b32":
+            # This VOP1 instruction writes an SGPR: its vdst field is an SGPR
+            # number even though the mnemonic starts with "v_". LLVM 21 for
+            # gfx1013 prints s2 for the encoding 0005047e.
+            dst_str = decode_s_reg(vdst)
         if op_name == "v_nop":
             asm = "v_nop"
         else:
@@ -1672,6 +1678,16 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             arity = 3
             dst_width = 1
             src_widths = (1, 1, 1)
+
+        if op_name == "v_readfirstlane_b32":
+            # gfx1013 assembles this operation only as the 32-bit VOP1: llvm-mc
+            # rejects the e64 spelling and reports this VOP3A word as an invalid
+            # instruction encoding.  Report a distinct unsupported-encoding
+            # record instead of a lowerable instruction, and keep the eight-byte
+            # record boundary so the next instruction starts at +8.
+            return (8, "v_readfirstlane_b32_unsupported",
+                    "v_readfirstlane_b32 <unsupported VOP3A encoding>",
+                    "VOP3A encoding of v_readfirstlane_b32 is not available on gfx1013")
 
         if op_name == "v_nop":
             return (8, "v_nop", "v_nop", "Vector no-op (VOP3A)")
