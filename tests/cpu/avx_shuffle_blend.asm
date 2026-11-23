@@ -141,6 +141,15 @@ vmovddup_op PROC FRAME
     ret
 vmovddup_op ENDP
 
+; The XMM memory encoding reads exactly eight bytes and clears upper YMM.
+vmovddup_m64_op PROC FRAME
+    .endprolog
+    vmovddup xmm0, qword ptr [rcx]
+    vmovups ymmword ptr [r8], ymm0
+    vzeroupper
+    ret
+vmovddup_m64_op ENDP
+
 vmovsldup_op PROC FRAME
     .endprolog
     vmovups ymm1, ymmword ptr [rcx]
