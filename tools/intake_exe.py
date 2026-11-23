@@ -81,6 +81,9 @@ def inspect_executable(path):
         def section_span(s):
             return min(s.Misc_VirtualSize or s.SizeOfRawData, max(0, hdr.SizeOfImage - s.VirtualAddress))
 
+        def raw_span(s):
+            return min(section_span(s), s.SizeOfRawData) if s.PointerToRawData else 0
+
         def section_for(rva, length, *, executable=False):
             for s in pe.sections:
                 offset = rva - s.VirtualAddress
@@ -93,12 +96,12 @@ def inspect_executable(path):
         def read_rva(rva, length):
             section = section_for(rva, length)
             offset = rva - section.VirtualAddress
-            raw_size = section.SizeOfRawData if section.PointerToRawData else 0
-            backed = min(length, max(0, raw_size - offset))
-            data = section.get_data(rva, backed) if backed else b""
-            if len(data) != backed:
+            if offset + length > raw_span(section):
+                raise ValueError(f"Unbacked or truncated data at RVA {rva:#x}")
+            data = section.get_data(rva, length) if length else b""
+            if len(data) != length:
                 raise ValueError(f"Truncated data at RVA {rva:#x}")
-            return data + b"\0" * (length - backed)
+            return data
 
         entry = hdr.AddressOfEntryPoint
         entry_section = section_for(entry, 1, executable=True) if entry else None
@@ -112,9 +115,17 @@ def inspect_executable(path):
                 if callbacks:
                     table = callbacks - hdr.ImageBase
                     section = section_for(table, 8)
-                    slots = (section.VirtualAddress + section_span(section) - table) // 8
-                    for i in range(min(slots, 65536)):
-                        va, = struct.unpack("<Q", read_rva(table + i * 8, 8))
+                    raw_end = section.VirtualAddress + raw_span(section)
+                    virt_end = section.VirtualAddress + section_span(section)
+                    for i in range(65536):
+                        slot_rva = table + i * 8
+                        if slot_rva + 8 > virt_end:
+                            if slot_rva < virt_end:
+                                raise ValueError(f"Truncated TLS callback slot at RVA {slot_rva:#x}")
+                            raise ValueError("Unterminated TLS callback table")
+                        if slot_rva + 8 > raw_end:
+                            raise ValueError(f"Truncated or unbacked TLS callback slot at RVA {slot_rva:#x}")
+                        va, = struct.unpack("<Q", read_rva(slot_rva, 8))
                         if not va:
                             break
                         rva = va - hdr.ImageBase
