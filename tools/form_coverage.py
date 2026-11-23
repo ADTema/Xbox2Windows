@@ -75,6 +75,8 @@ CPU_FIXTURES = {
     "cpuid": "cpu_aot_cpuid",
     "xgetbv": "cpu_aot_xgetbv",
     "cpuid_harness": None,  # native CPUID, OSXSAVE and XGETBV reads
+    "mxcsr": "cpu_aot_mxcsr",
+    "mxcsr_harness": None,  # native MXCSR reads and writes
     "exe_entry": "cpu_aot_exe_entry",
     "xchg": "cpu_aot_xchg",
     "address_size": "cpu_aot_address_size",

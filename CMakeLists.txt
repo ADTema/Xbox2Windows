@@ -2174,6 +2174,32 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_${part}_lifted>" ${host_cpu_extras})
         set_tests_properties(cpu_aot_${part} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
+    # The opt-in host-MXCSR profile: the lifted DLL, the noload and fixed controls that must break a rule, and
+    # an /O2 build of the translation.
+    cpu_asm_fixture(cpu_mxcsr_harness mxcsr_harness)
+    cpu_asm_fixture(cpu_mxcsr mxcsr)
+    set(mxcsr_controls)
+    foreach(variant IN ITEMS lifted noload fixed)
+        set(mxcsr_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_${variant}.cpp")
+        add_custom_command(OUTPUT "${mxcsr_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
+                emit "$<TARGET_FILE:cpu_mxcsr>" "${mxcsr_fixture}" ${variant}
+            DEPENDS cpu_mxcsr tests/cpu/mxcsr.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_mxcsr_${variant} SHARED "${mxcsr_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND mxcsr_controls "$<TARGET_FILE:cpu_mxcsr_${variant}>")
+        endif()
+    endforeach()
+    set(mxcsr_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_lifted_o2.dll")
+    add_custom_command(OUTPUT "${mxcsr_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /EHsc /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_lifted_o2.obj" "/Fe${mxcsr_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_mxcsr_lifted_o2 ALL DEPENDS "${mxcsr_o2}")
+    add_test(NAME cpu_aot_mxcsr COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
+        check "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr>" "$<TARGET_FILE:cpu_mxcsr_lifted>"
+        ${mxcsr_controls} "${mxcsr_o2}")
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
