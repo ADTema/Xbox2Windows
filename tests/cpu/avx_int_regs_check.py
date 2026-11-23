@@ -62,10 +62,10 @@ EXPORTS = (
     "op_palignr_69", "op_mpsadbw_6", "op_pshuflw_1b", "op_psllq_imm_129",
     "op_pextrw_reg_2", "op_pextrd_reg_2", "op_pinsrb_reg_upper", "op_pinsrw_reg_3",
     "op_zeroupper_ymm1", "op_movdqu_load128",
+    "op_palignr_255", "op_pmovsxbq_wide_src", "op_zeroupper_ymm2",
 )
 
-NATIVE_ONLY_EXPORTS = ("op_palignr_255", "op_pmovsxbq_wide_src", "op_zeroupper_ymm2")
-ALL_EXPORTS = EXPORTS + NATIVE_ONLY_EXPORTS + ("op_zeroall",)
+ALL_EXPORTS = EXPORTS + ("op_zeroall",)
 
 
 # --- Independent Python ISA reference model ---
@@ -424,6 +424,10 @@ def reference(name, a, b, altered=False):
         return a[:16] + ZERO16
     if name == "op_movdqu_load128":
         return a[:16] + ZERO16
+    if name == "op_palignr_255": return ref_palignr(a, b, 255)
+    if name == "op_pmovsxbq_wide_src": return pack_s64(s8s(a)[:2])
+    if name == "op_zeroupper_ymm2":
+        return a[:16] + ZERO16
     raise ValueError(f"unknown export {name}")
 
 
@@ -634,13 +638,6 @@ def check_differential(native_path, lifted_path, altered_path):
             assert_equal_output("native", name, idx, got_native, want)
             assert_equal_output("lifted", name, idx, got_lifted, want)
             total += 1
-
-    a, b = general_pairs()[0]
-    for name in NATIVE_ONLY_EXPORTS:
-        got_native = invoke(native[name], a, b)
-        got_lifted = invoke(lifted[name], a, b)
-        assert_equal_output("lifted", name, 0, got_lifted, got_native)
-        total += 1
 
     # Dedicated 192-byte check for vzeroall across all six modeled YMM registers.
     want_zeroall = b"\x00" * 192
