@@ -522,6 +522,19 @@ With the previous fixed bindings and the `--cb-reads` command above, all 530 rec
 
 The fixed-profile full scan covered 26,503 records. Output-verified totals stayed at 851 PS, 12 CS, 2 MS, 0 VS and 0 GS (865 overall). All 988 previous profile/container files, including selector variants, recurred. Of those, 616 had identical generated source; recompiling the remaining 372 old/new pairs with the same DXC produced identical desktop DXIL. The existing pipeline and readback results apply to the same binaries. The new conversion draws are counted as source-built fixtures.
 
+### Exec-masked pixel regions
+
+`tools/pixel_aot.py` lowers a single forward masked-if from a known entry mask, the narrow form described in issue #338. A supported `v_cmp` (or integer comparison) records a lane condition, `s_and_saveexec_b64` saves the entry exec mask into an even SGPR pair while intersecting execution with that condition, and the matching `s_or_b64 exec, exec, s[a:b]` closes the region. The region can only contain supported per-lane moves and basic binary32 add, subtract, multiply, min and max: anything that writes scalar state, waits, samples, interpolates, accesses memory, exports, rewrites EXEC or produces scalar reads is rejected while the region is open. On restore every rewritten register merges with a per-lane select between the inner value and the value it held at the save, so outer values are preserved exactly on lanes where the condition is false. A register first defined inside the region is marked conditional; reading it after the merge is refused until an unconditional write defines it on every path.
+
+The optional whole-wave empty-mask skip `s_cbranch_execz` is accepted only as `(offset, text)` pair input: the signed displacement from the next instruction must land exactly on the matching restore, and it must sit immediately after the save. The translator skips no instruction: the skip is elided and the region body lowers unconditionally, which is valid because every allowed body operation is safe to speculate on every lane. `scc` is untracked after both the save and the restore, since the saved mask's emptiness is a wave property a per-lane model cannot compute; `s_cselect`-style readers of it reject. Nesting, additional skips, wrong targets, pending-load overlap with the saved pair, scalar or mask writes inside the region, and programs ending inside an open region all reject.
+
+The source-built fixtures render an 8x8 ramp through three programs: a masked region rewriting two channels, a second region on the complementary predicate covering every lane, and the first program with the skip encoded. Threshold constants 0.5, 10 and -1 exercise mixed, full and empty masks per draw. On Windows 11 build 26300.10075 with the D3D12 debug layer enabled and zero debug errors, `pixel_aot_exec_regions_warp` matched the expected ramp at all 64 pixels in each of the nine cases, and `pixel_aot_exec_regions_hardware` matched identically on a GeForce RTX 5070 (driver 32.0.16.2135). Each adapter also caught a reversed predicate mutant and a mask-free mutant on the mixed threshold. LLVM 15 assembles and disassembles all three fixture binaries in the binary regression, including the labelled branch form.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_exec_regions_(warp|hardware)$' -V
+```
+
 ### SPIR-V physical addresses in a D3D12 buffer window
 
 An optional offline experiment accepts validated Vulkan 1.2 SPIR-V assembly with the named user-data and physical DWORD pointer types emitted by [Leonida at `f85582e`](https://github.com/ItsNotRexed/Leonida/blob/f85582e23d4ab9e19acbf694358f137d6b8531b1/tools/rdna2spirv.py). [SPIRV-Cross at `57e4efc`](https://github.com/KhronosGroup/SPIRV-Cross/tree/57e4efcc84112abcd426dc5ec248b5339bee04f2) rejects the physical addressing model on its HLSL path. The [window adapter](../tools/spirv_address_window.py) converts direct DWORD loads, stores and array element addresses to logical storage-buffer accesses. It validates the input and the result before publishing the output module.
@@ -2386,7 +2399,7 @@ was incorporated into this translator.
 - Indexed gathers (VSIB): `vgatherdps`, `vgatherdpd`, `vgatherqps`, `vgatherqpd`, `vpgatherdd`, `vpgatherdq`, `vpgatherqd`, `vpgatherqq` (all 16 VEX encodings across `vm32x`, `vm32y`, `vm64x`, `vm64y` and XMM/YMM widths)
 - Masked loads and stores: `vpmaskmovd`, `vpmaskmovq` (all 8 VEX encodings across XMM/YMM load and store forms)
 
-Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers and returns `void`. For transport and ABI glue the translator accepts `vmovdqu` (128- and 256-bit flat loads, stores and register copies), `vzeroupper` and terminal `ret`.
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers with 16-byte-aligned bases and returns `void`. The caller supplies live buffers for the whole invocation and keeps them private to the executing thread. This fixture uses the default MXCSR controls (masked exceptions, round-to-nearest-even, DAZ and FTZ disabled) and compares result bytes. Memory forms using a full 128-bit operand require a displacement divisible by 16. For transport and ABI glue the translator accepts `vmovdqu` (128- and 256-bit flat loads, stores and register copies), `vzeroupper` and terminal `ret`.
 
 ### State model, memory semantics and explicit rejections
 
@@ -2543,7 +2556,7 @@ Not covered by this experiment: the 28 packed-integer forms carved out to `cpu_v
 - Vector and scalar moves: `vmovapd`, `vmovupd` (128/256-bit load, store and register copy), `vlddqu`, `vmovntdq`, `vmovntdqa`, `vmovntpd`, `vmovntps`, `vmovddup`, `vmovshdup`, `vmovsldup`, `vmovhlps`, `vmovlhps`, `vmovhpd`, `vmovhps`, `vmovlpd`, `vmovlps`, `vmovsd`, `vmovss`, `vmovmskpd`, `vmovmskps`
 - Masked loads and stores: `vmaskmovpd`, `vmaskmovps` (all 8 VEX encodings across XMM/YMM load and store forms)
 
-Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers and returns `void`. For transport and ABI glue the translator accepts `vmovdqu` (128/256-bit flat load, store and register copy), flat argument-rooted 32/64-bit `mov` between volatile scratch GPRs (`rax`/`eax`, `r9`/`r9d`, `r10`/`r10d`, `r11`/`r11d`) and `[base + disp]`, `vzeroupper`, and terminal `ret`.
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers with 16-byte-aligned bases and returns `void`. The caller supplies live buffers for the whole invocation and keeps them private to the executing thread. This fixture uses the default MXCSR controls (masked exceptions, round-to-nearest-even, DAZ and FTZ disabled) and compares result bytes. Memory forms using a full 128-bit operand require a displacement divisible by 16. For transport and ABI glue the translator accepts `vmovdqu` (128/256-bit flat load, store and register copy), flat argument-rooted 32/64-bit `mov` between volatile scratch GPRs (`rax`/`eax`, `r9`/`r9d`, `r10`/`r10d`, `r11`/`r11d`) and `[base + disp]`, `vzeroupper`, and terminal `ret`.
 
 ### State model, bit-transparent semantics and explicit rejections
 
@@ -2597,6 +2610,45 @@ On a copy of the linked DLL, the test patches one instruction at a time and expe
 Not covered: RIP-relative constants, packed operations, `SQRT`, `MIN` and `MAX`, the rounding conversions, stack frames and calls.
 
 On Linux, `llvm-ml` assembled the fixture and `lld-link` linked it. The original machine code ran in-process through a Windows-ABI trampoline that loads each slot into both its integer and its XMM register. It matched the lifted C++ built with clang at `-O0`, `-O2` and `-O3` on every call, for both builds, and all rejection controls passed. The generated sources compile without warnings under clang-cl `/W4 /WX`. A Windows run of `cpu_aot_scalar_float` with ML64 and MSVC has not been recorded yet.
+
+## Legacy SSE2 leaf recompilation
+
+[The SSE2 leaf translator](../tools/cpu_sse2_aot.py) lifts bounded straight-line Windows x64 leaf functions covering 23 of the 64 forms in `docs/coverage/x64_zen2.tsv` group `SSE2`:
+
+- Packed compare: `cmppd` (all eight `imm8` predicates, `xmm` and `m128` sources)
+- Packed converts: `cvtdq2pd`, `cvtdq2ps`, `cvtpd2dq`, `cvtpd2ps`, `cvtps2dq`, `cvtps2pd`, `cvttpd2dq`, `cvttps2dq`
+- MMX-domain source convert: `cvtpi2pd` (flat `m64` memory source only)
+- Scalar convert: `cvtsd2si` (`r32`/`r64` destinations, `xmm` or `m64` source)
+- Scalar double ops: `maxsd`, `minsd`, `sqrtsd` (merge into the destination's low qword)
+- Fences: `lfence`, `mfence`
+- Aligned moves: `movapd`, `movdqa` (register copies, loads, stores)
+- Half-qword moves: `movhpd`, `movlpd` (`m64` load merge and `m64` store)
+- Non-temporal stores: `movntdq`, `movntpd`, `movnti` (`r32` and `r64`)
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers with 16-byte-aligned bases and returns `void`. The caller supplies live buffers for the whole invocation and keeps them private to the executing thread. This fixture uses the default MXCSR controls (masked exceptions, round-to-nearest-even, DAZ and FTZ disabled) and compares result bytes. Memory forms using a full 128-bit operand require a displacement divisible by 16. For transport and ABI glue the translator accepts 32/64-bit `mov` between the volatile scratch GPRs (`rax`, `r9`, `r10`, `r11`) and flat `[base + disp]` memory rooted in an argument, plus terminal `ret`.
+
+### State model and explicit rejections
+
+XMM registers `xmm0`..`xmm5` are represented as a portable C++ value struct (`struct Vec128 { std::uint64_t q[2]; }`) rather than MSVC intrinsics, so the generated C++ compiles under default x64 flags. Moves and compares transfer raw bits. The packed-conversion helpers use host floating-point operations and reproduce the SSE2 rounding and truncation rules written out in the code: `cvtpd2dq`/`cvtps2dq`/`cvtsd2si` round to nearest even, `cvttpd2dq`/`cvttps2dq` truncate, NaN or out-of-range results return the integer indefinite value (`0x80000000` or `0x8000000000000000`), `maxsd`/`minsd` return the second source on ties and unordered inputs, and `sqrtsd` returns the quieted source NaN or the real indefinite for negative inputs. `lfence` and `mfence` emit the corresponding host x64 SSE2 fence. All memory operands must be flat `[base + disp]` rooted in `rcx`, `rdx` or `r8`.
+
+The translator explicitly rejects:
+
+- the 36 SSE2-group forms reserved for sibling translators (`addpd`, `movdqu`, `pshufd`, `ucomisd` and the others in the fixture check), so each SSE2 form has a single owner;
+- the five task forms that cannot be expressed through the leaf ABI: `cvtpd2pi`, `cvttpd2pi`, `movdq2q` and `movq2dq` use MMX register operands, and `maskmovdqu` stores through implicit `DS:rdi`;
+- the `mm`-register source of `cvtpi2pd`, `cmppd` immediates above 7, non-legacy (VEX/EVEX) encodings, `lock`/`rep`/segment prefixes, nonvolatile vector registers (`xmm6`..`xmm15`), nonvolatile or argument GPR destinations, undefined registers, non-flat memory operands, missing terminal `ret` and instructions after `ret`.
+
+```powershell
+cmake --build --preset dev --target cpu_sse2_regs_original cpu_sse2_regs_original_lifted cpu_sse2_regs_altered cpu_sse2_regs_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_sse2_regs$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/sse2_regs.asm) builds 57 exports covering all 23 forms: eight `cmppd` predicate exports plus an `m128`-source case, register and memory forms of every scalar op and convert, with the six upper-zeroing converts run on dirty-seeded destinations so zeroing versus merging is observable, `cvtpi2pd` from memory, aligned load/store and register copies, `movhpd`/`movlpd` merges including unaligned `+1` memory loads and `+1` stores, unaligned `+1` `m64` sources for `maxsd` and `cvtsd2si`, non-temporal stores and a chained `op_pipeline` export. [The Windows test](../tests/cpu/sse2_regs_check.py) ran 1,168 differential cases across the 57 exports against both the native MASM DLL and an independent Python reference model, covering IEEE-754 specials (signed zero, subnormals, infinities, sNaN and qNaN with distinct payloads), integer-indefinite boundaries at 2^31 and 2^63, boundary conversion values and random patterns, with 32-byte pre/post guards on every buffer.
+
+An `ALTER_IMM` variant changes the `cmppd` predicates of `op_cmppd_1` (1 to 5), `op_cmppd_3` (3 to 7) and `op_cmppd_6` (6 to 2); the altered translation must match the altered reference while diverging from the unmodified reference, which it did on 28 cases each. An output-mutation negative control flips one bit of `op_pipeline` and confirms the comparator fails. Rejection controls cover 10 alternate-encoding lift checks (non-`rax` `cvtsd2si`/`movnti` operands, displaced memory forms, standalone fences), 69 unit cases (36 reserved SSE2 forms, 7 MMX/implicit-address encodings, 1 `cmppd` immediate, 4 VEX/EVEX encodings, 21 ABI/state/addressing/prefix violations) and 12 end-to-end PE-patched DLL cases. In `tools/form_coverage.py`, `sse2_regs.asm` accounts for exactly its 23 SSE2 forms, advancing x64 Zen 2 `SSE2` group coverage from 14/64 to 37/64 and total x64 Zen 2 coverage from 549/948 to 572/948 (+23).
+
+Not covered by this experiment: the 36 reserved SSE2 forms, MMX-domain operands and `maskmovdqu`, control flow or calls mixed with SSE2 state, nonvolatile `XMM6`..`XMM15` save/restore prologues, faults caused by violating the aligned-base or valid-buffer preconditions, and non-temporal caching effects, and title CPU code execution.
 
 ## D3D12 pixel-position inputs
 
@@ -2951,7 +3003,7 @@ The carry-out add and subtracts `v_add_co_u32`, `v_sub_co_u32` and `v_subrev_co_
 
 To supply a reference for another arithmetic program, run `offscreen_check.exe hardware --check-pixel-case shader.cso reference.case`. The case contains 256 bytes of constants followed by 64 expected RGBA colors in row-major little-endian binary32, one for each texel of the test texture. Generate the expected colors after round-toward-zero half export and widening back to float.
 
-Every draw fixture compiles its translated shader under an explicit binary32 denormal mode: DXC runs with `-denorm preserve` at `ps_6_2`, the minimum shader model that accepts `-denorm`, matching CPU references built from Python floats, which keep binary32 subnormals. The Scarlett pipeline's `FLOAT_MODE` is unmeasured, so preserve is the harness's recorded assumption rather than a claim about the console. A dedicated control draws one program with `v_min_f32` and `v_max_f32` against 1.0 and -1.0, and a `v_mul_f32` by 1.0, under both `-denorm preserve` and `-denorm ftz` with mode-matched references: the least subnormal `0x00000001` survives min and max under preserve and exports zero under ftz, while the multiply by 1.0 folds to a move and must export identical raw bits in both modes; the preserve-compiled shader has to mismatch the ftz reference. Binary16 and binary64 denormal behavior is established by separate fixtures, not by this control. The curve fixture records its mode as `any`: an RTX 5060 Ti (driver 32.0.16.2124) refuses PSO creation for that one program under `-denorm preserve` (`E_OUTOFMEMORY`), while WARP and the RX 9060 XT accept it; the curve rows contain no binary32 subnormals, so the mode cannot change their exported bits, and the fixture asserts that flushing leaves every expected word unchanged.
+Every draw fixture compiles its translated shader under an explicit binary32 denormal mode: DXC runs with `-denorm preserve` at `ps_6_2`, the minimum shader model that accepts `-denorm`, matching CPU references built from Python floats, which keep binary32 subnormals. The Scarlett pipeline's `FLOAT_MODE` is unmeasured, so preserve is the harness's recorded assumption rather than a claim about the console. A dedicated control draws one program with `v_min_f32` and `v_max_f32` against 1.0 and -1.0, and a `v_mul_f32` by 1.0, under both `-denorm preserve` and `-denorm ftz` with mode-matched references: the least subnormal `0x00000001` survives min and max under preserve and exports zero under ftz, while the multiply by 1.0 folds to a move and must export identical raw bits in both modes; the preserve-compiled shader has to mismatch the ftz reference. Binary16 and binary64 denormal behavior is established by separate fixtures, not by this control. The curve fixture records its mode as `any`: an RTX 5060 Ti (driver 32.0.16.2124) refuses PSO creation for that one program under `-denorm preserve` (`E_OUTOFMEMORY`), while WARP and the RX 9060 XT accept it; the curve rows contain no binary32 subnormals, so the mode cannot change their exported bits, and the fixture asserts that flushing leaves every expected word unchanged. The `e64_approx` program and `sdwa_unary_exp`, the first `SDWA_UNARY` program, also record `any`: on an RTX 5080 (drivers 32.0.16.2101 and 32.0.16.2124) `CreateGraphicsPipelineState` returns `E_OUTOFMEMORY` for any pixel shader that uses `log2` under `-denorm preserve`, while `ftz` and `any` are accepted, and WARP and an AMD Radeon integrated GPU accept `preserve` ([#828](https://github.com/R0Y00/Xbox2Windows/issues/828)). The mode switches only for translated programs that contain `log2`, and each such fixture asserts that no input, intermediate result, expected value or wrong reference is a binary32 subnormal, so the mode cannot change what they compute or export; `sdwa_unary_root` and `sdwa_unary_exact` keep `preserve`. With the change, `pixel_aot_e64_approx_hardware` and `pixel_aot_sdwa_unary_hardware` pass on the RTX 5080 (driver 32.0.16.2124), including every wrong reference, and still pass on WARP.
 
 The binary16 denormal mode is recorded as `preserve` and holds by construction rather than by a compile flag. DXIL has no binary16 denormal attribute: `-denorm` only sets `fp32-denorm-mode`. The packed f16 lowering widens each half from its encoding, computes in binary32 and narrows in integer arithmetic, and every binary16 subnormal, and every product or sum of two, is a binary32 normal, so a binary32 flush cannot reach it. The packed result is held as binary32 bits; packed f16 consumers and the export only reinterpret it, which the draw below checks with a word that is a binary32 subnormal. A CPU-side control checks that the lowered `v_pk_*_f16` body uses neither driver conversions (`f32tof16`, `f16tof32`) nor native half types. A draw runs `v_pk_add_f16` on two normal inputs whose sum is the subnormal `0x8001` (the required row: DXIL's `fadd` FTZ text requires such a result to flush), and as supplementary rows `v_pk_max_f16` on the least and largest binary16 subnormals, `v_pk_mul_f16` that makes the subnormal `0x0200` from normal inputs, and `v_pk_fma_f16` whose halves round to nearest even. It reads the packed words back through the integer target, because one of them (`0x80000200`) is a binary32 subnormal as a word. The same preserve reference must pass under both `-denorm preserve` and `-denorm ftz`, and a reference that flushes binary16 subnormals must fail. This shows that the harness's f16 results do not depend on the f32 flag. It says nothing about the Scarlett `FLOAT_MODE` f16 bits, which remain unmeasured, and the compressed-export path, which narrows through the driver's `f32tof16`, is not covered by this control.
 
@@ -4340,22 +4392,63 @@ blue mip 2 on that adapter. Linear mip filtering gave the expected blend
 (G=0.4375, B=0.5625). The translated `ps_6_0` sample and a direct HLSL clamp
 agreed. [Direct3D rules for per-sample clamping and mip selection](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm)
 
-The detailed fixture results below used Windows 10 build 19045, Agility SDK
-1.620.2, DXC 1.9.2609 and the debug layer.
+A `ps_6_0` probe of the point-filtered case (`MIN_MAG_MIP_POINT`, gate lowered
+locally, `929e659`) compared the translated `Sample` with `MinLod`, a direct
+HLSL clamp and a direct `SampleLevel` at the same value. Each cell is the mip
+that filled all 64 pixels; clamps 1, 1.25 and 1.4375 read mip 1 everywhere.
+Windows 10 build 19045, DXC 1.9.2609.
 
-| Clamp | Exact green, blue | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 |
-|---|---|---|---|
-| 1.25 | 0.75, 0.25 | exact | 0.7499962, 0.2500038 |
-| 1.3 | 0.7, 0.3 | 0.6992188, 0.3007813 | 0.7031205, 0.2968795 |
-| 1.001953125 | 0.9980469, 0.0019531 | 1, 0 | 1, 0 |
+| Clamp | `SampleLevel`, all | In-box WARP 10.0.19041.7811, `ps_6_0` | RTX 3080 Ti 32.0.16.1047, in-box runtime, `ps_6_0` | WARP 1.0.22 and RTX, Agility SDK 1.620.2, `ps_6_0` and `ps_6_6` |
+|---|---|---|---|---|
+| 0.5625 | 1 | 0 | 1 | 1 |
+| 1.5 | 2 | 1 | 2 | 2 |
+| 1.5625 | 2 | 1 | 2 | 2 |
+| 1.75 | 2 | 1 | 2 | 2 |
+| 2.5625 | 3 | 2 | 3 | 3 |
 
-Both adapters quantize the blend weight to 1/256. At 1.3, WARP rounds the
-weight to 77/256 and the RTX truncates it to 76/256. The RTX values also
-differ from those steps by up to 7.6e-6. In this fixture the translated and
-control results were identical on each adapter, so the measured differences
-come from the adapter's mip filtering. The 1/128 tolerance was chosen from these
-measurements, not from a specified precision. Whether this explains the
-archive differences is not established. [Issue](https://github.com/R0Y00/Xbox2Windows/issues/809)
+Only the Windows 10 in-box WARP reads the mip below a `MinLod` clamp, so the
+difference follows the WARP build, not the runtime or shader model. On Windows
+11 build 26200.9974, in-box WARP 10.0.26100.9818 and an RX 7900 XTX
+(32.0.32029.2010) read the nearest mip at 1.5 and 1.5625 (`ps_6_6`, no other
+clamps). Translated and direct HLSL agreed in every case.
+[Measurement](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7097414235),
+[Windows 11 report](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7095165499)
+
+Mip-linear results (`MIN_MAG_POINT_MIP_LINEAR`, `ps_6_6`, debug layer): WARP
+1.0.22 and the RTX on Windows 10 build 19045 with Agility SDK 1.620.2 and DXC
+1.9.2609; the Radeon and in-box WARP on Windows 11 build 26200.9974 with DXC
+1.8.2502.11.
+
+| Clamp | Exact green, blue | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 | RX 7900 XTX and in-box WARP 10.0.26100.9818 |
+|---|---|---|---|---|
+| 1.25 | 0.75, 0.25 | exact | 0.7499962, 0.2500038 | exact |
+| 1.3 | 0.7, 0.3 | 0.6992188, 0.3007813 | 0.7031205, 0.2968795 | 0.6992188, 0.3007813 |
+| 1.001953125 | 0.9980469, 0.0019531 | 1, 0 | 1, 0 | 1, 0 |
+
+All adapters quantize the blend weight to 1/256. At 1.3 the RTX truncates it
+to 76/256 and the others give 77/256. Translated and control results were
+bit-identical on each adapter, so the differences come from mip filtering. The
+1/128 tolerance was chosen from these measurements, not from a specified
+precision. Whether this explains the archive differences is not established.
+[Issue](https://github.com/R0Y00/Xbox2Windows/issues/809)
+
+A sweep of the blue weight from 76/256 to 77/256 in 1/4096 steps, plus the ties
+at 75.5, 76.5 and 77.5 (`6cd0f15`), separates rounding from truncation. Each
+cell is the observed weight × 256 and the blue word; all 64 pixels and both
+shaders matched at every point.
+
+| Requested weight × 256 | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 |
+|---|---|---|
+| 75.5 (tie) | 76 (`3e980000`) | 75 (`3e960096`) |
+| 76.0 to 76.49976 | 76 (`3e980000`) | 76 (`3e980098`) |
+| 76.5 (tie) | 76 (`3e980000`) | 76 (`3e980098`) |
+| 76.50024 to 76.99976 | 77 (`3e9a0000`) | 76 (`3e980098`) |
+| 77.0 | 77 (`3e9a0000`) | 77 (`3e9a009a`) |
+| 77.5 (tie) | 78 (`3e9c0000`) | 77 (`3e9a009a`) |
+
+WARP rounds to the nearest 1/256 with ties to even; the RTX truncates and
+stores step k as `k·256/65535`, which gives the offset of up to 7.6e-6.
+[Half-step sweep](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7095572305)
 
 ## Quad-local DS swizzle in pixel shaders
 

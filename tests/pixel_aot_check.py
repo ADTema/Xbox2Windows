@@ -55,7 +55,9 @@ NC_INT_OPS = (
 
 def lower(instructions, *args, **kwargs):
     source = pixel_aot.lower(instructions, *args, **kwargs)
-    ACCEPTED.update(line.split()[0] for line in instructions if line.strip())
+    ACCEPTED.update((line[1] if isinstance(line, tuple) else line).split()[0]
+                    for line in instructions
+                    if (line[1] if isinstance(line, tuple) else line).strip())
     return source
 
 
@@ -264,6 +266,22 @@ def flush_ftz(value):
     return value
 
 
+# The NVIDIA driver (RTX 5080, drivers 32.0.16.2101 and 32.0.16.2124) refuses PSO creation for a pixel shader
+# that uses log2 under -denorm preserve (E_OUTOFMEMORY, issue #828). The approximate programs that contain
+# log2 record their mode as any, and assert that no input, intermediate or expected value is a binary32
+# subnormal, so the mode cannot change what they compute or export. Every other program keeps preserve.
+LOG2_DENORM_MODE = "any"
+
+
+def log2_denorm_mode(label, hlsl, *values):
+    """Mode for one translated program: any exactly when it contains log2, after checking values for subnormals."""
+    if "log2(" not in hlsl:
+        return F32_DENORM_MODE
+    for value in values:
+        assert flush_ftz(value) == value, (label, value)
+    return LOG2_DENORM_MODE
+
+
 def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extra_constants=None,
                title_memory=None, write_mask=None):
     """Write a renderer case: 256 constant bytes, then 64 expected float4 rows in row-major order.
@@ -466,6 +484,107 @@ def uncompressed_export(body, mask=0xF):
     operands = [f"v{12 + ch}" if mask & (1 << ch) else "off" for ch in range(4)]
     program[pos:] = [f"exp mrt0 {', '.join(operands)} done vm", "s_endpgm"]
     return program
+
+
+def masked_region_body():
+    return [
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44",
+        "s_and_saveexec_b64 s[60:61], vcc",
+        "v_mov_b32_e32 v13, s45",
+        "v_mov_b32_e32 v14, s46",
+        "s_or_b64 exec, exec, s[60:61]",
+    ]
+
+
+def masked_region():
+    """A single forward masked-if: while sample.x is below s44, overwrite v13 and v14."""
+    return uncompressed_export(masked_region_body())
+
+
+def masked_complementary():
+    """Two adjacent regions on complementary predicates, so exactly one writes v13 per lane."""
+    return uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44",
+        "s_and_saveexec_b64 s[60:61], vcc",
+        "v_mov_b32_e32 v13, s45",
+        "s_or_b64 exec, exec, s[60:61]",
+        "v_cmp_nlt_f32_e64 vcc_lo, v12, s44",
+        "s_and_saveexec_b64 s[58:59], vcc",
+        "v_mov_b32_e32 v13, s46",
+        "s_or_b64 exec, exec, s[58:59]",
+    ])
+
+
+# Eight-byte encodings in the masked fixtures: SMEM and sample loads, VOP3 (e64) and exp.
+def offset_pairs(program):
+    pairs, offset = [], 0
+    for line in program:
+        pairs.append((offset, line))
+        wide = line.startswith(("s_load_", "s_buffer_load_", "image_sample", "exp ")) or "_e64" in line
+        offset += 8 if wide else 4
+    return pairs
+
+
+def masked_skip():
+    """The masked region with its whole-wave empty-mask skip, as (offset, text) pairs."""
+    program = masked_region()
+    program.insert(program.index("s_and_saveexec_b64 s[60:61], vcc") + 1, "s_cbranch_execz 2")
+    return offset_pairs(program)
+
+
+def masked_skip_asm():
+    """The skip program as assembler text: the branch names its restore label instead."""
+    program = [line for _, line in masked_skip()]
+    program[program.index("s_cbranch_execz 2")] = "s_cbranch_execz .Lmask_restore"
+    program.insert(program.index("s_or_b64 exec, exec, s[60:61]"), ".Lmask_restore:")
+    return program
+
+
+MASKED_RAMP = RAMP
+
+
+def masked_pixels(threshold, inner, complementary):
+    pixels = []
+    for g in MASKED_RAMP:
+        for r in MASKED_RAMP:
+            cond = single(r / 255) < threshold
+            if complementary:
+                pixels.append((single(r / 255), inner[0] if cond else inner[1], single(128 / 255), 1))
+            else:
+                pixels.append((single(r / 255), inner[0] if cond else single(g / 255),
+                               inner[1] if cond else single(128 / 255), 1))
+    return pixels
+
+
+def check_masked_draw(directory, compiler, renderer, backend):
+    """Draw masked regions on WARP or hardware: threshold 0.5 mixes the mask across the ramp."""
+    source = directory / "masked.hlsl"
+    shader = directory / "masked.cso"
+    constants = bytearray(256)
+    for label, program, complementary in (
+            ("region", masked_region(), False), ("skip", masked_skip(), False),
+            ("complementary", masked_complementary(), True)):
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for threshold in (0.5, 10.0, -1.0):
+            struct.pack_into("<4f", constants, 12, threshold, 0.25, 0.75, 0.0)
+            case = directory / f"masked-{label}-{len(cases)}.case"
+            write_case(case, constants, masked_pixels(threshold, (0.25, 0.75), complementary))
+            cases.append((case, "pass"))
+        run_pixel_batch(renderer, backend, shader, cases)
+    struct.pack_into("<4f", constants, 12, 0.5, 0.25, 0.75, 0.0)
+    expected = masked_pixels(0.5, (0.25, 0.75), False)
+    unmasked = [line for line in masked_region()
+                if line not in ("s_and_saveexec_b64 s[60:61], vcc", "s_or_b64 exec, exec, s[60:61]")]
+    for mutant in (("reversed", [line.replace("v_cmp_lt_f32_e64", "v_cmp_ge_f32_e64")
+                                 for line in masked_region()]),
+                   ("unmasked", unmasked)):
+        source.write_text(translate(mutant[1]), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        case = directory / f"masked-{mutant[0]}.case"
+        write_case(case, constants, expected)
+        run_pixel_batch(renderer, backend, shader, [(case, "mismatch")])
 
 
 def with_scalar_constant_reads() -> list[str]:
@@ -1304,8 +1423,17 @@ def check_e64_approx_draws(directory, compiler, renderer, backend):
     """
     source = directory / "e64_approx.hlsl"
     shader = directory / "e64_approx.cso"
-    source.write_text(translate(with_constants(APPROX_E64_BODY)), encoding="ascii")
-    compile_shader(compiler, source, shader)
+    hlsl = translate(with_constants(APPROX_E64_BODY))
+    source.write_text(hlsl, encoding="ascii")
+    values = [APPROX_E64_ACCUMULATOR]
+    for a, b, c, d in APPROX_E64_ROWS:
+        exp, log, product, square = 2.0 ** -a, math.log2(abs(b)), single(-a * abs(b)), single(d * d)
+        values += [a, b, c, d, -a, abs(b), -d, exp, exp + 0.5, log, log + 0.5, product, square,
+                   *approx_e64_reference(a, b, c, d)]
+        values += [float(wrong(a, b, c, d)) for _, wrong, _ in APPROX_E64_WRONG]
+    mode = log2_denorm_mode("e64_approx", hlsl, *values)
+    assert mode == LOG2_DENORM_MODE
+    compile_shader(compiler, source, shader, mode=mode)
     cases = []
 
     def add_case(row, values, status):
@@ -4879,6 +5007,13 @@ SDWA_UNARY = (
 )
 
 
+# Raw results of the operations, before rounding, of the one SDWA_UNARY program that contains log2.
+SDWA_UNARY_RAW = {
+    "sdwa_unary_exp": lambda a, b, c, d: (-a, abs(b), -abs(d), 2.0 ** -a, math.log2(abs(b)), 1.0 / c,
+                                          1.0 / -abs(d)),
+}
+
+
 def sdwa_unary_inputs(row):
     """Constants of a row as floats; an int is a binary32 bit pattern."""
     return tuple(struct.unpack("<f", struct.pack("<I", v))[0] if isinstance(v, int) else v for v in row)
@@ -4925,8 +5060,18 @@ def check_sdwa_unary_draws(directory, compiler, renderer, backend):
     for name, body, rows, reference, wrongs in SDWA_UNARY:
         source = directory / f"{name}.hlsl"
         shader = directory / f"{name}.cso"
-        source.write_text(translate(with_constants(body)), encoding="ascii")
-        compile_shader(compiler, source, shader)
+        hlsl = translate(with_constants(body))
+        source.write_text(hlsl, encoding="ascii")
+        values = []
+        for index, row in enumerate(rows):
+            inputs = sdwa_unary_inputs(row)
+            raw = SDWA_UNARY_RAW[name](*inputs) if name in SDWA_UNARY_RAW else ()
+            values += [*inputs, *raw, *(value + 0.5 for value in raw), *reference(*inputs)]
+            values += [float(wrong(*inputs)) for wrong_row, _, wrong, _ in wrongs if wrong_row == index]
+        mode = log2_denorm_mode(name, hlsl, *values)
+        # Only sdwa_unary_exp contains log2; sdwa_unary_root and sdwa_unary_exact stay under preserve.
+        assert (mode == LOG2_DENORM_MODE) == (name in SDWA_UNARY_RAW), (name, mode)
+        compile_shader(compiler, source, shader, mode=mode)
         cases = []
 
         def add_case(row, values, status):
@@ -7458,6 +7603,175 @@ def check_nc_integer_lowering():
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
 
 
+def check_masked_controls():
+    """Exec-masked regions (#338): one forward masked-if, merged with per-lane selects."""
+    save = "s_and_saveexec_b64 s[60:61], vcc"
+    restore = "s_or_b64 exec, exec, s[60:61]"
+    region = masked_region()
+    inside = region.index(save) + 1
+    source = translate(region)
+    assert "cmp" in source and " ? " in source
+    assert "precise float alu" in source
+    assert "cmp" in translate(masked_skip()) and "cmp" in translate(masked_complementary())
+    # An aligned SGPR pair holding a tracked comparison is a valid mask source too.
+    pair_source = translate(uncompressed_export([
+        "v_cmp_lt_f32_e64 s[52:53], v12, s44",
+        "s_and_saveexec_b64 s[60:61], s[52:53]", "v_mov_b32_e32 v13, s45", restore]))
+    assert " ? " in pair_source
+    # A register written twice inside still merges against its value at the save.
+    double = translate(uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save,
+        "v_mov_b32_e32 v13, s45", "v_add_f32_e32 v13, v13, s46", restore]))
+    assert "_v13 = (cmp" in double and "sample16.y" in double.split("_v13")[1][:80]
+    # A bare skip line carries no offset; only pair input can place it.
+    must_reject(translate, [line for _, line in masked_skip()])
+    for extra in (
+            "s_mov_b32 s62, 1", "s_waitcnt lgkmcnt(0)", "s_and_saveexec_b64 s[58:59], vcc",
+            "s_buffer_load_dword s70, s[44:47], 0x10", "exp mrt0 v12, v13, v14, v15 done vm",
+            "image_sample v[16:19], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "v_cmp_eq_f32_e64 vcc_lo, v12, v13", "v_interp_p1_f32_e32 v17, v0, attr0.x",
+            "v_readfirstlane_b32 s62, v12", "v_readlane_b32 s62, v12, 0",
+            "v_writelane_b32 v12, s45, 3", "v_permlane_b32 v13, v12, s60",
+            "v_mov_b32_dpp v13, v12 dpp8:[1,2,3,0,5,6,7,4]",
+            "s_and_b64 exec, exec, s[50:51]", "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13"):
+        must_reject(translate, region[:inside] + [extra] + region[inside:])
+    unclosed = [line for line in region if line != restore]
+    for variant in (
+            unclosed[:unclosed.index("exp mrt0 v12, v13, v14, v15 done vm")],
+            [line if line != save else "s_and_saveexec_b64 s[58:59], vcc" for line in region],
+            ["s_and_saveexec_b64 s[60:61], s[50:51]" if line == save else line for line in region],
+            [line.replace("s[60:61]", "s[61:62]") if line == save else line for line in region],
+            uncompressed_export(["v_cmp_lt_f32_e64 vcc_lo, v12, s44", save,
+                                 "v_mov_b32_e32 v13, s45", "s_and_saveexec_b64 s[58:59], vcc",
+                                 "v_mov_b32_e32 v14, s46", restore, restore]),
+    ):
+        must_reject(translate, variant)
+    # A pending scalar load may not overlap the saved pair.
+    expect_value_error(translate, uncompressed_export([
+        "s_load_dwordx4 s[60:63], s[20:21], 0x40",
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, restore]),
+        "Unsupported execution mask save")
+    # A register defined only inside the region may not be read afterwards...
+    undefined = uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, 1.0", restore,
+        "v_add_f32_e32 v12, v12, v30"])
+    must_reject(translate, undefined)
+    # ...but an unconditional write makes it defined on every path.
+    translate(uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, 1.0", restore,
+        "v_mov_b32_e32 v30, s47", "v_add_f32_e32 v12, v12, v30"]))
+    # An empty region lowers to the untouched program.
+    empty = uncompressed_export(["v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, restore])
+    assert translate(empty)
+    # SCC after a restore is unknown: a consumer works without the region but rejects after it.
+    translate(uncompressed_export(["s_cmp_eq_u32 s44, s45", "s_cmov_b64 s[44:45], s[46:47]"]))
+    expect_value_error(translate, uncompressed_export([
+        "s_cmp_eq_u32 s44, s45", "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, restore,
+        "s_cmov_b64 s[44:45], s[46:47]"]), "Conditional move requires a tracked SCC")
+    # Skip-branch displacement variants, all on pair input.
+    pairs = masked_skip()
+    branch = next(i for i, (_, line) in enumerate(pairs) if line.startswith("s_cbranch_execz"))
+    for imm, why in ((1, "target lands mid-region"), (3, "target is the export"), (40, "no boundary")):
+        wrong = [(o, "s_cbranch_execz %d" % imm if j == branch else line)
+                 for j, (o, line) in enumerate(pairs)]
+        must_reject(translate, wrong)
+    two = masked_region()
+    pos = two.index(save) + 1
+    two[pos:pos] = ["s_cbranch_execz 3", "s_cbranch_execz 2"]
+    must_reject(translate, offset_pairs(two))
+    # Multiple independently closed regions may follow each other with vector work between.
+    translate(uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v13, s45", restore,
+        "v_add_f32_e32 v14, 1.0, v14",
+        "v_cmp_ge_f32_e64 vcc_lo, v13, s45", save, "v_mov_b32_e32 v14, s46", restore]))
+    # A conditional register left by an earlier region does not taint later region writes.
+    translate(uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, s45", restore,
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v13, s45", restore]))
+    # A register whose outer value is not an emitted name cannot be merged.
+    must_reject(translate, uncompressed_export([
+        "v_interp_p1_f32_e32 v10, v0, attr0.x",
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v10, s45", restore]))
+    must_reject(translate, uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v0, s45", restore]))
+    # The skip only points forward: a negative displacement onto an earlier restore rejects.
+    backward = uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v13, s45", restore,
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "s_cbranch_execz 0", "v_mov_b32_e32 v14, s45", restore])
+    pairs = offset_pairs(backward)
+    cbr = next(i for i, (_, line) in enumerate(pairs) if line == "s_cbranch_execz 0")
+    target = next(o for o, line in pairs if line == restore)
+    imm = (target - pairs[cbr][0] - 4) // 4
+    pairs[cbr] = (pairs[cbr][0], f"s_cbranch_execz {imm}")
+    assert imm < 0
+    must_reject(translate, pairs)
+    # Nor may it land on a later restore of the same pair: the close must be the target.
+    two_same = uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "s_cbranch_execz 0",
+        "v_mov_b32_e32 v13, s45", restore,
+        "v_cmp_ge_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v14, s46", restore])
+    pairs = offset_pairs(two_same)
+    cbr = next(i for i, (_, line) in enumerate(pairs) if line == "s_cbranch_execz 0")
+    last = next(o for o, line in reversed(pairs) if line == restore)
+    pairs[cbr] = (pairs[cbr][0], f"s_cbranch_execz {(last - pairs[cbr][0] - 4) // 4}")
+    must_reject(translate, pairs)
+    # The skip must sit immediately after the save; a mid-region placement rejects even
+    # when its displacement still names the matching restore.
+    mid = uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v13, s45",
+        "s_cbranch_execz 1", "v_mov_b32_e32 v14, s46", restore])
+    expect_value_error(translate, offset_pairs(mid), "Instruction cannot run in a masked region")
+    # A second skip anywhere in the program rejects, even in a later region.
+    two_skips = uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "s_cbranch_execz 1",
+        "v_mov_b32_e32 v13, s45", restore,
+        "v_cmp_ge_f32_e64 vcc_lo, v12, s44", save, "s_cbranch_execz 1",
+        "v_mov_b32_e32 v14, s46", restore])
+    expect_value_error(translate, offset_pairs(two_skips), "Unsupported execution skip")
+    # The displacement is a signed 16-bit immediate.
+    pairs = masked_skip()
+    pos = next(i for i, (_, line) in enumerate(pairs) if line.startswith("s_cbranch_execz"))
+    pairs[pos] = (pairs[pos][0], "s_cbranch_execz 0x8000")
+    expect_value_error(translate, pairs, "Execution skip displacement out of range")
+    # A 64-bit save needs a 64-bit mask source: vcc or an aligned pair, nothing else.
+    for dst_cmp, src in (("s62", "s62"), ("vcc_lo", "vcc_lo")):
+        must_reject(translate, uncompressed_export([
+            f"v_cmp_lt_f32_e64 {dst_cmp}, v12, s44",
+            f"s_and_saveexec_b64 s[60:61], {src}", "v_mov_b32_e32 v13, s45", restore]))
+    expect_value_error(translate, uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44",
+        "s_and_saveexec_b64 s[60:61], s[61:62]", "v_mov_b32_e32 v13, s45", restore]),
+        "Invalid 64-bit scalar register pair")
+    # A register still conditional from an earlier region stays conditional when a later
+    # region overwrites it; no merge is emitted against the stale inner value.
+    cond2 = uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, s45", restore,
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, s46", restore])
+    source2 = translate(cond2)
+    assert "_v30" not in source2
+    expect_value_error(translate, uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, s45", restore,
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, s46", restore,
+        "v_add_f32_e32 v12, v12, v30"]), "Read of a register defined only on the masked path")
+    # A conditional register may not read-modify-write itself either.
+    expect_value_error(translate, uncompressed_export([
+        "v_cmp_lt_f32_e64 vcc_lo, v12, s44", save, "v_mov_b32_e32 v30, s45", restore,
+        "v_add_f32_e32 v30, v30, 1.0"]), "Read of a register defined only on the masked path")
+    # All positions in a branch-bearing program must come from one ordered stream.
+    positioned = masked_skip()
+    branch = next(i for i, (_, line) in enumerate(positioned) if line.startswith("s_cbranch_execz"))
+    duplicate = positioned[:]
+    duplicate[branch + 1] = (duplicate[branch][0], duplicate[branch + 1][1])
+    unaligned = positioned[:]
+    unaligned[branch + 1] = (unaligned[branch + 1][0] + 1, unaligned[branch + 1][1])
+    for invalid in (duplicate, unaligned, positioned[:branch] + [positioned[branch][1]] + positioned[branch + 1:]):
+        must_reject(translate, invalid)
+    assert translate(iter(positioned)) == translate(positioned)
+    # Pair elements must be (int offset, str text); anything else is a clean rejection.
+    for bad in ([(0, 42)], [("x", "s_nop 0")], [()], [[0, "s_nop 0"]], [42]):
+        must_reject(translate, bad)
+
+
 def sopk_wait_program():
     """The sampled program with every wait spelled as a gfx10 SOPK wait, plus a store-counter wait."""
     spelled = {"s_waitcnt lgkmcnt(0)": "s_waitcnt_lgkmcnt null, 0x0", "s_waitcnt vmcnt(0)": "s_waitcnt_vmcnt null, 0x0"}
@@ -7611,6 +7925,7 @@ def check_vopc_e32_destination():
 
 
 def check_controls(directory):
+    check_masked_controls()
     check_title_load_controls()
     check_ds_swizzle_controls()
     check_ds_nop_controls()
@@ -9173,10 +9488,14 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(sad_group(group)), translate_int) for group in SAD_BODIES)
     fixtures.extend((compressed_export(mask), translate_masked) for mask in (0x3, 0xC, 0xF))
     fixtures.extend((uncompressed_export([], mask), translate_masked) for mask in (0x1, 0x8, 0x5, 0xA))
+    fixtures.append((masked_region(), translate))
+    fixtures.append((masked_complementary(), translate))
+    fixtures.append((masked_skip_asm(), translate, "gfx1013", "", masked_skip()))
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
         features = entry[3] if len(entry) > 3 else ""
+        reference = entry[4] if len(entry) > 4 else instructions
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
         binary = directory / "fixture.bin"
@@ -9189,11 +9508,12 @@ def check_binary(directory, assembler, objcopy, library):
         archive.write_bytes(envelope(binary.read_bytes()))
         _, native = native_program(archive, "fixture")
         assert native == binary.read_bytes()
-        decoded = disassemble(native, library, cpu=cpu.encode(), features=features.encode())
+        offsets = isinstance(reference[0], tuple)
+        decoded = disassemble(native, library, cpu=cpu.encode(), offsets=offsets, features=features.encode())
         if "ds_nop" in instructions:
             assert native.startswith(bytes.fromhex("000050d8 00000000"))
             assert decoded.count("ds_nop") == instructions.count("ds_nop")
-        assert lower_fixture(decoded) == lower_fixture(instructions)
+        assert lower_fixture(decoded) == lower_fixture(reference)
         if index == 0:
             check_container_selector(directory, native, library)
     check_wave32_mask_binary(directory, assembler, objcopy, library)
@@ -12574,7 +12894,7 @@ def main():
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
                     "draw-mac-legacy", "draw-carry-out", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-cmp64"):
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmp64"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -12597,6 +12917,7 @@ def main():
                         "draw-uncompressed-export": check_uncompressed_export_draw,
                         "draw-title-loads": check_title_load_draws,
                         "draw-ds-swizzle": check_ds_swizzle_draw,
+                        "draw-exec-regions": check_masked_draw,
                         "draw-cmp64": check_cmp64_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
