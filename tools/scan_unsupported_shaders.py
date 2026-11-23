@@ -42,6 +42,7 @@ except ImportError:
 # Known supported instructions and patterns in pixel_aot.py
 # Tables are imported from pixel_aot so the scanner stays aligned with the translator.
 PIXEL_ALU_NAMES = tuple(pixel_aot.ALU) if pixel_aot is not None else ()
+PIXEL_SDWA_ALU = tuple(pixel_aot.SDWA_ALU) if pixel_aot is not None else ()
 SUPPORTED_ALU = {f"v_{name}_f32" for name in PIXEL_ALU_NAMES}
 PIXEL_INTEGER = pixel_aot.INTEGER if pixel_aot is not None else {}
 PIXEL_SCALAR = pixel_aot.SCALAR if pixel_aot is not None else {}
@@ -128,6 +129,13 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
 if PIXEL_ALU_NAMES:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         r"v_(?:" + "|".join(map(re.escape, PIXEL_ALU_NAMES)) + r")_f32(?:_e32|_e64)?\s+v\d+,\s+.*"
+    )
+if PIXEL_SDWA_ALU:
+    # Whole-dword sources only, as pixel_aot requires. This pins the spelling, not the operand count.
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        r"v_(?:" + "|".join(map(re.escape, PIXEL_SDWA_ALU)) + r")_f32_sdwa\s+v\d+,\s+.+?(?:\s+clamp)?"
+        rf"\s+dst_sel:{SDWA_SEL_PATTERN}\s+dst_unused:(?:UNUSED_PAD|UNUSED_PRESERVE)"
+        r"\s+src0_sel:DWORD(?:\s+src1_sel:DWORD)?"
     )
 if PIXEL_SALU_BIT64:
     SUPPORTED_INSTRUCTIONS_REGEX.append(

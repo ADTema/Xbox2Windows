@@ -329,6 +329,10 @@ def check_shader_records():
         approx_e64_forms = {("VOP3", "v_exp_f32_e64"), ("VOP3", "v_log_f32_e64")}
         approx_e64_forms |= {("VOP3", "v_mac_f32_e64")} if name == "gfx1013.tsv" else set()
         assert approx_e64_forms <= covered, (name, approx_e64_forms - covered)
+        # SDWA forms of the unary binary32 operations, whole-dword sources only.
+        sdwa_unary_forms = {("SDWA", f"v_{op}_f32_sdwa") for op in (
+            "exp", "log", "rcp", "rcp_iflag", "rsq", "sqrt", "sin", "cos", "rndne", "frexp_mant")}
+        assert sdwa_unary_forms <= covered, (name, sdwa_unary_forms - covered)
     # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit
     # predicate the translator lowers; the rejected exec-writing and 64-bit neighbours stay out.
     int_compares = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
