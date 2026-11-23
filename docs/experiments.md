@@ -4168,6 +4168,10 @@ The desktop XMem shim can map live 64 KiB physical grants into caller-owned, 64 
 
 The reserve-only desktop cases from [#888](https://github.com/R0Y00/Xbox2Windows/pull/888) use 16 or 24 GiB Windows placeholder ranges. The page mapper splits out a 64 KiB destination on demand and coalesces the reservation after its last view is unmapped. The same test writes and reads one interior page after remapping, releases the entire reservation and reserves the same range again. Other allocation modes remain outside this profile.
 
+`windows_placeholder_partition` tests the Windows APIs directly. A single `VirtualFree` call with `MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER` isolates an interior allocation unit. `VirtualQuery` observes both neighbors and the middle as three independent reservations. An aligned request crossing two reservations fails and preserves all three. A pagefile-backed view replaces only the middle, and unmapping restores its placeholder. Releasing the middle and then the left preserves their remaining neighbors. [Windows placeholder flags](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree)
+
+Run `ctest --preset dev --no-tests=error -R '^windows_placeholder_partition$' -V`.
+
 ### Aligned committed CPU memory
 
 `xmem_committed_memory` reserves three ordinary host pages at each guest base alignment (64 KiB and
