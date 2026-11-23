@@ -105,6 +105,14 @@ foreach(adapter IN ITEMS warp hardware)
     set_tests_properties(xmem_shim_working_set_${adapter} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
 
+# Second commit/protection check (#870): ordinary committed pages vs live shared-page views.
+add_executable(xmem_commit_protection_check tests/xmem_commit_protection_check.cpp)
+target_link_libraries(xmem_commit_protection_check PRIVATE xmem_shim OneCore)
+target_include_directories(xmem_commit_protection_check PRIVATE src)
+target_compile_features(xmem_commit_protection_check PRIVATE cxx_std_20)
+add_test(NAME xmem_commit_protection COMMAND xmem_commit_protection_check)
+set_tests_properties(xmem_commit_protection PROPERTIES TIMEOUT 30)
+
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
 add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12_xs_shim.def)
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
