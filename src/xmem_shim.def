@@ -8,3 +8,4 @@ EXPORTS
     XMemGetWorkingSetStatistics @3
     XMemAllocatePhysicalPages @7
     XMemFreePhysicalPages @8
+    XMemIsToolsMemAvailable @9

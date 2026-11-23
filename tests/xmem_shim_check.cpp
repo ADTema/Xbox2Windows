@@ -32,6 +32,7 @@ extern "C" __declspec(dllimport) void XMemFreeDefault(void* allocation, ULONGLON
 extern "C" __declspec(dllimport) BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR flags, PULONG_PTR count,
                                                                      PULONG_PTR pages);
 extern "C" __declspec(dllimport) BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages);
+extern "C" __declspec(dllimport) BOOL WINAPI XMemIsToolsMemAvailable();
 extern "C" __declspec(dllimport) BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer);
 extern "C" __declspec(dllimport) BOOL XMemGetWorkingSetStatistics(UINT32 selector, void* statistics);
 
@@ -72,11 +73,13 @@ bool export_checks()
     unsigned found = 0;
     for (const char* name : {"XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
                              "XMemVirtualQuery", "XMemGetWorkingSetStatistics",
-                             "XMemAllocatePhysicalPages", "XMemFreePhysicalPages"}) {
+                             "XMemAllocatePhysicalPages", "XMemFreePhysicalPages", "XMemIsToolsMemAvailable"}) {
         if (!GetProcAddress(module, name)) return false;
         ++found;
     }
-    const char* existing[] = {"XMemAlloc", "XMemFree", "XMemGetWorkingSetStatistics", "XMemVirtualQuery"};
+    const char* existing[] = {"XMemAlloc", "XMemFree", "XMemGetWorkingSetStatistics", "XMemVirtualQuery",
+                              "XMemAllocDefault", "XMemFreeDefault", "XMemAllocatePhysicalPages",
+                              "XMemFreePhysicalPages", "XMemIsToolsMemAvailable"};
     for (WORD ordinal = 1; ordinal <= std::size(existing); ++ordinal) {
         if (GetProcAddress(module, MAKEINTRESOURCEA(ordinal)) != GetProcAddress(module, existing[ordinal - 1]))
             return false;
@@ -592,6 +595,8 @@ int main(int argc, char** argv)
         passed = allocation_checks(XMemAllocDefault, XMemFreeDefault);
     } else if (scenario == "physical_pages"sv) {
         passed = physical_page_checks();
+    } else if (scenario == "tools_memory"sv) {
+        passed = XMemIsToolsMemAvailable() == FALSE && XMemIsToolsMemAvailable() == FALSE;
     } else if (scenario == "query"sv) {
         passed = query_checks();
     } else if (scenario == "working_set"sv) {

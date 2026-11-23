@@ -3831,7 +3831,7 @@ ctest --preset dev --no-tests=error -R '^(xmem_shim_(exports|physical_pages)|era
 
 The source-built caller ([`tools_mem_caller.asm`](../tests/cpu/tools_mem_caller.asm)) imports `XMemIsToolsMemAvailable` by name. It queries twice and checks the recorded count before choosing a path. The controlled recording provider ([`tools_mem_provider.cpp`](../tests/cpu/tools_mem_provider.cpp)) returns FALSE for the fallback path (exit 42) or TRUE for the tools-memory path (exit 84). The same EXE exits with a live test worker under the Windows loader and returns its result to the host under `pe_map`. Withholding the query export stops mapping at import resolution before entry, with the trace provider still available.
 
-The paired outcomes describe the synthetic caller. Actual console ordering and the production desktop shim behavior remain open. [Independent recording fixture and results](https://github.com/R0Y00/Xbox2Windows/pull/900)
+The paired outcomes describe the synthetic caller. The desktop `xmem.dll` has no devkit tools-memory partition, so its named query reports FALSE. `xmem_shim_tools_memory` checks successive queries against the desktop shim. Actual console availability and the runtime behavior of individual callers remain separate questions. [Independent recording fixture and results](https://github.com/R0Y00/Xbox2Windows/pull/900)
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_tools_mem$' -V
