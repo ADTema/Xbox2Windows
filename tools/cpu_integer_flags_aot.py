@@ -1,32 +1,31 @@
-"""Lift bounded Windows x64 leaf functions with integer flag and stack-flag forms to C++.
+"""Lift bounded Windows x64 leaf functions for same-block ADD/SUB/CMP -> LAHF to C++.
 
 Each export uses the leaf ABI void fn(word rcx, word rdx, word r8), where rcx,
 rdx and r8 carry flat host pointers to caller-owned buffers (rcx and rdx are
 inputs, r8 is the output). Volatile GPRs (rax, rcx, rdx, r8, r9, r10, r11) are
 modeled across 8-, 16-, 32- and 64-bit views (including high-byte ah/ch/dh),
-along with a bounded 256-byte local stack and RFLAGS (CF, PF, AF, ZF, SF, OF,
-DF, ID, plus fixed bit 1 and ring-3 IF = 0x0202).
+along with per-flag definedness tracking for CF, PF, AF, ZF, SF and OF.
 
-Supported uncovered Integer forms (5 forms from docs/coverage/x64_zen2.tsv):
-  - lahf: write (SF<<7)|(ZF<<6)|(AF<<4)|(PF<<2)|0x02|CF to AH, preserving AL and RAX[63:16]
-  - pushf / popf: 2-byte stack stride (RSP -/+ 2) for low 16-bit FLAGS
-  - pushfq / popfq: 8-byte stack stride (RSP -/+ 8) for 64-bit RFLAGS (including ID bit 21)
+Supported uncovered Integer form (docs/coverage/x64_zen2.tsv):
+  - lahf: write (SF<<7)|(ZF<<6)|(AF<<4)|(PF<<2)|0x02|CF to AH, preserving AL
+    and RAX[63:16] without modifying any flags
 
-Support instructions: sahf, clc, stc, cmc, cld, std, push/pop (16/64-bit
-volatile GPRs), mov (8/16/32/64-bit volatile GPRs, immediates, flat [rcx/rdx/r8
-+ disp] reads, [r8 + disp] writes, and initialized [rsp + disp] local stack
-reads), add, adc, sub, sbb, cmp, inc, dec, neg, and, or, xor, test, and
-terminal ret.
+Supported instructions:
+  - Register-destination ADD, SUB and CMP at 8, 16, 32 and 64 bits (register or
+    immediate source), defining CF, PF, AF, ZF, SF and OF
+  - LAHF in the same basic block (requires CF, PF, AF, ZF, SF and RAX defined)
+  - SETcc live flag consumers to 8-bit volatile GPR or [r8 + disp] (requires
+    each consumed flag to be defined)
+  - MOV (8/16/32/64-bit volatile GPRs, immediates, flat [rcx/rdx/r8 + disp]
+    reads with dead-read ordering, and [r8 + disp] writes)
+  - Terminal RET (RETNQ)
 
-Policy and rejections:
-  - Definedness tracking on all GPRs, local stack bytes, and individual flags:
-    logical ops (and/or/xor/test) leave AF undefined, inc/dec preserve CF, sahf
-    leaves OF/DF/ID unchanged, popf leaves ID unchanged; reading an undefined
-    flag or GPR rejects.
-  - Stack pointer must stay within [-256, 0] and balance back to 0 at ret.
-  - Direction flag DF starts 0 at entry and must be statically 0 (cld) at ret.
-  - Nonvolatile GPRs, direct RSP arithmetic, branches/calls, prefixes, VEX/EVEX,
-    RIP-relative/indexed addressing, non-r8 stores, and trailing bytes reject.
+Out-of-scope / rejected:
+  - PUSHF, POPF, PUSHFQ, POPFQ, SAHF, INC, DEC, NEG, ADC, SBB, CLC/STC/CMC,
+    AND/OR/XOR/TEST, shifts, multiplies, nonvolatile GPRs, RSP/stack ops,
+    branches, calls, instruction prefixes, VEX/EVEX/XOP encodings, non-r8
+    stores, RIP-relative/indexed addressing, undefined flag/GPR reads, and
+    trailing/missing-ret streams.
 """
 
 import argparse
@@ -47,7 +46,6 @@ from iced_x86 import (
 from cpu_leaf_aot import bounded_code, export_rva
 
 
-LOCAL_STACK_BYTES = 256
 ARGUMENTS = {R.RCX: "rcx", R.RDX: "rdx", R.R8: "r8"}
 
 # (base_name, bits, shift, mask)
@@ -109,14 +107,39 @@ IMMEDIATE_KINDS = {
     OpKind.IMMEDIATE32TO64,
 }
 
-ARITH_BINARY = {M.ADD, M.ADC, M.SUB, M.SBB, M.CMP}
-LOGIC_BINARY = {M.AND, M.OR, M.XOR, M.TEST}
-ARITH_UNARY = {M.INC, M.DEC, M.NEG}
+ARITH_PRODUCERS = {M.ADD, M.SUB, M.CMP}
+
+SETCC_SPECS = {
+    Code.SETO_RM8: (("of",), "of"),
+    Code.SETNO_RM8: (("of",), "!of"),
+    Code.SETB_RM8: (("cf",), "cf"),
+    Code.SETAE_RM8: (("cf",), "!cf"),
+    Code.SETE_RM8: (("zf",), "zf"),
+    Code.SETNE_RM8: (("zf",), "!zf"),
+    Code.SETBE_RM8: (("cf", "zf"), "cf || zf"),
+    Code.SETA_RM8: (("cf", "zf"), "!cf && !zf"),
+    Code.SETS_RM8: (("sf",), "sf"),
+    Code.SETNS_RM8: (("sf",), "!sf"),
+    Code.SETP_RM8: (("pf",), "pf"),
+    Code.SETNP_RM8: (("pf",), "!pf"),
+    Code.SETL_RM8: (("sf", "of"), "sf != of"),
+    Code.SETGE_RM8: (("sf", "of"), "sf == of"),
+    Code.SETLE_RM8: (("zf", "sf", "of"), "zf || (sf != of)"),
+    Code.SETG_RM8: (("zf", "sf", "of"), "!zf && (sf == of)"),
+}
 
 PRELUDE = """#include <atomic>
-#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <intrin.h>
+
+extern "C" __declspec(dllexport) std::uint32_t host_has_lahf() {
+    int regs[4]{};
+    __cpuid(regs, static_cast<int>(0x80000000u));
+    if (static_cast<std::uint32_t>(regs[0]) < 0x80000001u) return 0u;
+    __cpuid(regs, static_cast<int>(0x80000001u));
+    return (static_cast<std::uint32_t>(regs[2]) & 1u) != 0u ? 1u : 0u;
+}
 
 using word = std::uint64_t;
 
@@ -133,37 +156,6 @@ static inline T load_mem(word address) {
 template <class T>
 static inline void store_mem(word address, T value) {
     std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(T));
-}
-
-template <class T>
-static inline T stack_load(const std::uint8_t* stack, std::size_t off) {
-    T value{};
-    std::memcpy(&value, stack + off, sizeof(T));
-    return value;
-}
-
-static inline void push_u16(std::uint8_t* stack, std::size_t& sp, std::uint16_t val) {
-    sp -= 2u;
-    std::memcpy(stack + sp, &val, 2);
-}
-
-static inline std::uint16_t pop_u16(const std::uint8_t* stack, std::size_t& sp) {
-    std::uint16_t val = 0u;
-    std::memcpy(&val, stack + sp, 2);
-    sp += 2u;
-    return val;
-}
-
-static inline void push_u64(std::uint8_t* stack, std::size_t& sp, std::uint64_t val) {
-    sp -= 8u;
-    std::memcpy(stack + sp, &val, 8);
-}
-
-static inline std::uint64_t pop_u64(const std::uint8_t* stack, std::size_t& sp) {
-    std::uint64_t val = 0ull;
-    std::memcpy(&val, stack + sp, 8);
-    sp += 8u;
-    return val;
 }
 
 static inline bool calc_pf(std::uint64_t val) {
@@ -184,65 +176,18 @@ static inline std::uint8_t pack_lahf(bool cf, bool pf, bool af, bool zf, bool sf
         (cf ? 0x01u : 0u));
 }
 
-static inline std::uint16_t pack_flags16(
-        bool cf, bool pf, bool af, bool zf, bool sf, bool df, bool of) {
-    return static_cast<std::uint16_t>(
-        (of ? 0x0800u : 0u) |
-        (df ? 0x0400u : 0u) |
-        0x0202u |
-        (sf ? 0x0080u : 0u) |
-        (zf ? 0x0040u : 0u) |
-        (af ? 0x0010u : 0u) |
-        (pf ? 0x0004u : 0u) |
-        (cf ? 0x0001u : 0u));
-}
-
-static inline std::uint64_t pack_flags64(
-        bool cf, bool pf, bool af, bool zf, bool sf, bool df, bool of, bool id) {
-    return static_cast<std::uint64_t>(pack_flags16(cf, pf, af, zf, sf, df, of)) |
-           (id ? 0x00200000ull : 0ull);
-}
-
-static inline void unpack_lahf(std::uint8_t ah, bool& cf, bool& pf, bool& af, bool& zf, bool& sf) {
-    cf = (ah & 0x01u) != 0u;
-    pf = (ah & 0x04u) != 0u;
-    af = (ah & 0x10u) != 0u;
-    zf = (ah & 0x40u) != 0u;
-    sf = (ah & 0x80u) != 0u;
-}
-
-static inline void unpack_flags16(
-        std::uint16_t f, bool& cf, bool& pf, bool& af, bool& zf, bool& sf, bool& df, bool& of) {
-    cf = (f & 0x0001u) != 0u;
-    pf = (f & 0x0004u) != 0u;
-    af = (f & 0x0010u) != 0u;
-    zf = (f & 0x0040u) != 0u;
-    sf = (f & 0x0080u) != 0u;
-    df = (f & 0x0400u) != 0u;
-    of = (f & 0x0800u) != 0u;
-}
-
-static inline void unpack_flags64(
-        std::uint64_t f, bool& cf, bool& pf, bool& af, bool& zf, bool& sf, bool& df, bool& of, bool& id) {
-    unpack_flags16(static_cast<std::uint16_t>(f), cf, pf, af, zf, sf, df, of);
-    id = (f & 0x00200000ull) != 0ull;
-}
-
 static inline std::uint64_t width_mask(unsigned bits) {
     return bits == 64u ? ~0ull : ((1ull << bits) - 1ull);
 }
 
 static inline std::uint64_t op_add_flags(
-        unsigned bits, std::uint64_t a, std::uint64_t b, bool cin,
+        unsigned bits, std::uint64_t a, std::uint64_t b,
         bool& cf, bool& pf, bool& af, bool& zf, bool& sf, bool& of) {
     const std::uint64_t m = width_mask(bits);
     const std::uint64_t ua = a & m;
     const std::uint64_t ub = b & m;
-    const std::uint64_t s1 = (ua + ub) & m;
-    const bool c1 = s1 < ua;
-    const std::uint64_t res = (s1 + (cin ? 1ull : 0ull)) & m;
-    const bool c2 = res < s1;
-    cf = c1 || c2;
+    const std::uint64_t res = (ua + ub) & m;
+    cf = res < ua;
     af = ((ua ^ ub ^ res) & 0x10ull) != 0ull;
     pf = calc_pf(res);
     zf = res == 0ull;
@@ -252,35 +197,19 @@ static inline std::uint64_t op_add_flags(
 }
 
 static inline std::uint64_t op_sub_flags(
-        unsigned bits, std::uint64_t a, std::uint64_t b, bool bin,
+        unsigned bits, std::uint64_t a, std::uint64_t b,
         bool& cf, bool& pf, bool& af, bool& zf, bool& sf, bool& of) {
     const std::uint64_t m = width_mask(bits);
     const std::uint64_t ua = a & m;
     const std::uint64_t ub = b & m;
-    const std::uint64_t d1 = (ua - ub) & m;
-    const bool b1 = ua < ub;
-    const std::uint64_t res = (d1 - (bin ? 1ull : 0ull)) & m;
-    const bool b2 = d1 < (bin ? 1ull : 0ull);
-    cf = b1 || b2;
+    const std::uint64_t res = (ua - ub) & m;
+    cf = ua < ub;
     af = ((ua ^ ub ^ res) & 0x10ull) != 0ull;
     pf = calc_pf(res);
     zf = res == 0ull;
     sf = ((res >> (bits - 1u)) & 1ull) != 0ull;
     of = ((((ua ^ ub) & (ua ^ res)) >> (bits - 1u)) & 1ull) != 0ull;
     return res;
-}
-
-static inline std::uint64_t op_logic_flags(
-        unsigned bits, std::uint64_t res,
-        bool& cf, bool& pf, bool& zf, bool& sf, bool& of) {
-    const std::uint64_t m = width_mask(bits);
-    const std::uint64_t r = res & m;
-    cf = false;
-    of = false;
-    pf = calc_pf(r);
-    zf = r == 0ull;
-    sf = ((r >> (bits - 1u)) & 1ull) != 0ull;
-    return r;
 }
 """
 
@@ -296,22 +225,8 @@ def reg_info(register, ins):
     raise ValueError(f"unsupported register {register} at RVA {ins.ip:#x}: {ins}")
 
 
-def signed_disp64(ins):
-    raw = ins.memory_displacement & ((1 << 64) - 1)
-    return raw - (1 << 64) if raw >= (1 << 63) else raw
-
-
 def c_type_for_bits(bits):
     return {8: "std::uint8_t", 16: "std::uint16_t", 32: "std::uint32_t", 64: "std::uint64_t"}[bits]
-
-
-def operand_size_bits(ins, op_index):
-    kind = ins.op_kind(op_index)
-    if kind == OpKind.REGISTER:
-        return GPR_SPECS[ins.op_register(op_index)][1] if ins.op_register(op_index) in GPR_SPECS else RegisterExt.size(ins.op_register(op_index)) * 8
-    if kind == OpKind.MEMORY:
-        return MemorySizeExt.size(ins.memory_size) * 8
-    raise ValueError(f"cannot determine width for operand {op_index} at RVA {ins.ip:#x}: {ins}")
 
 
 def imm_value(ins, op_index, bits):
@@ -338,7 +253,7 @@ def imm_value(ins, op_index, bits):
 
 
 def lift_code(name, start, raw):
-    """Decode and lift one bounded straight-line integer-flags leaf function."""
+    """Decode and lift one bounded straight-line ADD/SUB/CMP -> LAHF leaf function."""
     instructions = list(Decoder(64, raw, ip=start))
     if not instructions or instructions[-1].next_ip != start + len(raw):
         raise ValueError(f"truncated instruction stream in {name} at RVA {start:#x}")
@@ -350,12 +265,7 @@ def lift_code(name, start, raw):
     used_gpr = set()
     clobbered_ptrs = set()
 
-    sp_offset = 0
-    stack_init = set()
-    used_stack = False
-
-    defined_flags = {"df"}
-    df_state = "zero"  # "zero", "one", or "dynamic"
+    defined_flags = set()
     used_flags = set()
 
     statements = []
@@ -395,7 +305,7 @@ def lift_code(name, start, raw):
         base = ins.memory_base
         if (
             ins.is_ip_rel_memory_operand
-            or base in (R.NONE, R.RIP, R.EIP, R.ESP)
+            or base in (R.NONE, R.RIP, R.EIP, R.RSP, R.ESP)
             or ins.memory_index != R.NONE
             or not RegisterExt.is_gpr64(base)
         ):
@@ -403,19 +313,6 @@ def lift_code(name, start, raw):
         nbytes = MemorySizeExt.size(ins.memory_size)
         if nbytes not in (1, 2, 4, 8):
             raise ValueError(f"unsupported memory width {nbytes} at RVA {ins.ip:#x}: {ins}")
-        bits = nbytes * 8
-        ctype = c_type_for_bits(bits)
-        if base == R.RSP:
-            if write:
-                raise ValueError(f"unsupported direct write to local stack operand at RVA {ins.ip:#x}: {ins}")
-            disp = signed_disp64(ins)
-            if disp < 0 or sp_offset + disp + nbytes > 0 or sp_offset + disp < -LOCAL_STACK_BYTES:
-                raise ValueError(f"stack read out of local bounds at RVA {ins.ip:#x}: {ins}")
-            if any((sp_offset + disp + b) not in stack_init for b in range(nbytes)):
-                raise ValueError(f"uninitialized local stack read at RVA {ins.ip:#x}: {ins}")
-            nonlocal used_stack
-            used_stack = True
-            return "stack", f"stack_load<{ctype}>(stack, sp + {disp}u)", bits, ctype
         if base in NONVOLATILE_GPRS:
             raise ValueError(f"nonvolatile GPR base {base} in memory operand at RVA {ins.ip:#x}: {ins}")
         if base not in ARGUMENTS:
@@ -427,9 +324,9 @@ def lift_code(name, start, raw):
         disp = ins.memory_displacement & ((1 << 64) - 1)
         name_base = ARGUMENTS[base]
         addr = f"({name_base} + {disp:#x}ull)" if disp else name_base
-        return "arg", addr, bits, ctype
+        return addr, nbytes * 8, c_type_for_bits(nbytes * 8)
 
-    def read_operand(ins, op_index, bits):
+    def read_operand(ins, op_index, bits, *, allow_mem=True):
         kind = ins.op_kind(op_index)
         if kind == OpKind.REGISTER:
             expr, reg_bits = read_reg(ins.op_register(op_index), ins)
@@ -437,10 +334,12 @@ def lift_code(name, start, raw):
                 raise ValueError(f"operand width mismatch at RVA {ins.ip:#x}: {ins}")
             return expr
         if kind == OpKind.MEMORY:
-            loc, arg, mem_bits, ctype = mem_access(ins, write=False)
+            if not allow_mem:
+                raise ValueError(f"unsupported arithmetic memory operand at RVA {ins.ip:#x}: {ins}")
+            addr, mem_bits, ctype = mem_access(ins, write=False)
             if mem_bits != bits:
                 raise ValueError(f"memory width mismatch at RVA {ins.ip:#x}: {ins}")
-            return arg if loc == "stack" else f"load_mem<{ctype}>({arg})"
+            return f"load_mem<{ctype}>({addr})"
         if kind in IMMEDIATE_KINDS:
             return f"{imm_value(ins, op_index, bits):#x}ull"
         raise ValueError(f"unsupported operand {op_index} at RVA {ins.ip:#x}: {ins}")
@@ -450,26 +349,6 @@ def lift_code(name, start, raw):
             if flag not in defined_flags:
                 raise ValueError(f"undefined flag {flag} read at RVA {ins.ip:#x}: {ins}")
             used_flags.add(flag)
-
-    def push_bytes(nbytes, ins):
-        nonlocal sp_offset, used_stack
-        if sp_offset - nbytes < -LOCAL_STACK_BYTES:
-            raise ValueError(f"local stack overflow at RVA {ins.ip:#x}: {ins}")
-        for b in range(sp_offset - nbytes, sp_offset):
-            stack_init.add(b)
-        sp_offset -= nbytes
-        used_stack = True
-
-    def pop_bytes(nbytes, ins):
-        nonlocal sp_offset, used_stack
-        if sp_offset + nbytes > 0:
-            raise ValueError(f"local stack underflow at RVA {ins.ip:#x}: {ins}")
-        if any(b not in stack_init for b in range(sp_offset, sp_offset + nbytes)):
-            raise ValueError(f"uninitialized stack read at RVA {ins.ip:#x}: {ins}")
-        for b in range(sp_offset, sp_offset + nbytes):
-            stack_init.discard(b)
-        sp_offset += nbytes
-        used_stack = True
 
     for ins in instructions:
         if returned:
@@ -482,10 +361,6 @@ def lift_code(name, start, raw):
         mnemonic = ins.mnemonic
 
         if ins.code == Code.RETNQ:
-            if sp_offset != 0:
-                raise ValueError(f"unbalanced stack pointer at ret RVA {ins.ip:#x}: offset {sp_offset}")
-            if df_state != "zero":
-                raise ValueError(f"direction flag may be non-zero at ret RVA {ins.ip:#x}: {ins}")
             statements.append("return;")
             returned = True
 
@@ -498,150 +373,42 @@ def lift_code(name, start, raw):
                 "rax = (rax & ~0xff00ull) | (static_cast<word>(pack_lahf(cf, pf, af, zf, sf)) << 8u);"
             )
 
-        elif ins.code == Code.SAHF:
-            if "rax" not in defined_gpr:
-                raise ValueError(f"undefined GPR rax at RVA {ins.ip:#x}: {ins}")
-            used_gpr.add("rax")
-            used_flags.update(("cf", "pf", "af", "zf", "sf"))
-            defined_flags.update(("cf", "pf", "af", "zf", "sf"))
-            statements.append("unpack_lahf(static_cast<std::uint8_t>(rax >> 8u), cf, pf, af, zf, sf);")
-
-        elif ins.code == Code.PUSHFW:
-            require_flags(("cf", "pf", "af", "zf", "sf", "df", "of"), ins)
-            push_bytes(2, ins)
-            statements.append("push_u16(stack, sp, pack_flags16(cf, pf, af, zf, sf, df, of));")
-
-        elif ins.code == Code.POPFW:
-            pop_bytes(2, ins)
-            used_flags.update(("cf", "pf", "af", "zf", "sf", "df", "of"))
-            defined_flags.update(("cf", "pf", "af", "zf", "sf", "df", "of"))
-            df_state = "dynamic"
-            statements.append("unpack_flags16(pop_u16(stack, sp), cf, pf, af, zf, sf, df, of);")
-
-        elif ins.code == Code.PUSHFQ:
-            require_flags(("cf", "pf", "af", "zf", "sf", "df", "of", "id"), ins)
-            push_bytes(8, ins)
-            statements.append("push_u64(stack, sp, pack_flags64(cf, pf, af, zf, sf, df, of, id));")
-
-        elif ins.code == Code.POPFQ:
-            pop_bytes(8, ins)
-            used_flags.update(("cf", "pf", "af", "zf", "sf", "df", "of", "id"))
-            defined_flags.update(("cf", "pf", "af", "zf", "sf", "df", "of", "id"))
-            df_state = "dynamic"
-            statements.append("unpack_flags64(pop_u64(stack, sp), cf, pf, af, zf, sf, df, of, id);")
-
-        elif ins.code == Code.CLC:
-            used_flags.add("cf")
-            defined_flags.add("cf")
-            statements.append("cf = false;")
-
-        elif ins.code == Code.STC:
-            used_flags.add("cf")
-            defined_flags.add("cf")
-            statements.append("cf = true;")
-
-        elif ins.code == Code.CMC:
-            require_flags(("cf",), ins)
-            statements.append("cf = !cf;")
-
-        elif ins.code == Code.CLD:
-            used_flags.add("df")
-            defined_flags.add("df")
-            df_state = "zero"
-            statements.append("df = false;")
-
-        elif ins.code == Code.STD:
-            used_flags.add("df")
-            defined_flags.add("df")
-            df_state = "one"
-            statements.append("df = true;")
-
-        elif mnemonic == M.PUSH:
-            if ins.op0_kind != OpKind.REGISTER:
-                raise ValueError(f"unsupported push operand at RVA {ins.ip:#x}: {ins}")
-            expr, bits = read_reg(ins.op0_register, ins)
-            if bits == 64:
-                push_bytes(8, ins)
-                statements.append(f"push_u64(stack, sp, {expr});")
-            elif bits == 16:
-                push_bytes(2, ins)
-                statements.append(f"push_u16(stack, sp, static_cast<std::uint16_t>({expr}));")
+        elif ins.code in SETCC_SPECS:
+            req_flags, cond_expr = SETCC_SPECS[ins.code]
+            require_flags(req_flags, ins)
+            val_expr = f"(({cond_expr}) ? 1u : 0u)"
+            if ins.op0_kind == OpKind.REGISTER:
+                statements.append(write_reg_stmt(ins.op0_register, val_expr, ins))
+            elif ins.op0_kind == OpKind.MEMORY:
+                addr, mem_bits, ctype = mem_access(ins, write=True)
+                if mem_bits != 8:
+                    raise ValueError(f"expected 8-bit destination for {ins} at RVA {ins.ip:#x}")
+                statements.append(f"store_mem<{ctype}>({addr}, static_cast<{ctype}>({val_expr}));")
             else:
-                raise ValueError(f"unsupported push width at RVA {ins.ip:#x}: {ins}")
-
-        elif mnemonic == M.POP:
-            if ins.op0_kind != OpKind.REGISTER:
-                raise ValueError(f"unsupported pop operand at RVA {ins.ip:#x}: {ins}")
-            _, bits, _, _ = reg_info(ins.op0_register, ins)
-            if bits == 64:
-                pop_bytes(8, ins)
-                stmt = write_reg_stmt(ins.op0_register, "pop_u64(stack, sp)", ins)
-            elif bits == 16:
-                pop_bytes(2, ins)
-                stmt = write_reg_stmt(ins.op0_register, "pop_u16(stack, sp)", ins)
-            else:
-                raise ValueError(f"unsupported pop width at RVA {ins.ip:#x}: {ins}")
-            statements.append(stmt)
+                raise ValueError(f"unsupported setcc destination at RVA {ins.ip:#x}: {ins}")
 
         elif mnemonic == M.MOV and ins.op_count == 2:
             if ins.op0_kind == OpKind.REGISTER:
-                bits = GPR_SPECS[ins.op0_register][1] if ins.op0_register in GPR_SPECS else reg_info(ins.op0_register, ins)[1]
-                rhs = read_operand(ins, 1, bits)
+                bits = reg_info(ins.op0_register, ins)[1]
+                rhs = read_operand(ins, 1, bits, allow_mem=True)
                 statements.append(write_reg_stmt(ins.op0_register, rhs, ins))
             elif ins.op0_kind == OpKind.MEMORY:
-                loc, addr, bits, ctype = mem_access(ins, write=True)
-                assert loc == "arg"
-                rhs = read_operand(ins, 1, bits)
+                addr, bits, ctype = mem_access(ins, write=True)
+                rhs = read_operand(ins, 1, bits, allow_mem=False)
                 statements.append(f"store_mem<{ctype}>({addr}, static_cast<{ctype}>({rhs}));")
             else:
                 raise ValueError(f"unsupported mov operands at RVA {ins.ip:#x}: {ins}")
 
-        elif mnemonic in ARITH_BINARY and ins.op_count == 2:
+        elif mnemonic in ARITH_PRODUCERS and ins.op_count == 2:
             if ins.op0_kind != OpKind.REGISTER:
                 raise ValueError(f"unsupported arithmetic destination at RVA {ins.ip:#x}: {ins}")
-            if mnemonic in (M.ADC, M.SBB):
-                require_flags(("cf",), ins)
             lhs, bits = read_reg(ins.op0_register, ins)
-            rhs = read_operand(ins, 1, bits)
+            rhs = read_operand(ins, 1, bits, allow_mem=False)
             used_flags.update(("cf", "pf", "af", "zf", "sf", "of"))
             defined_flags.update(("cf", "pf", "af", "zf", "sf", "of"))
-            helper = "op_add_flags" if mnemonic in (M.ADD, M.ADC) else "op_sub_flags"
-            carry_arg = "cf" if mnemonic in (M.ADC, M.SBB) else "false"
-            call = f"{helper}({bits}u, {lhs}, {rhs}, {carry_arg}, cf, pf, af, zf, sf, of)"
+            helper = "op_add_flags" if mnemonic == M.ADD else "op_sub_flags"
+            call = f"{helper}({bits}u, {lhs}, {rhs}, cf, pf, af, zf, sf, of)"
             if mnemonic == M.CMP:
-                statements.append(f"(void){call};")
-            else:
-                statements.append(write_reg_stmt(ins.op0_register, call, ins))
-
-        elif mnemonic in ARITH_UNARY and ins.op_count == 1:
-            if ins.op0_kind != OpKind.REGISTER:
-                raise ValueError(f"unsupported unary arithmetic operand at RVA {ins.ip:#x}: {ins}")
-            lhs, bits = read_reg(ins.op0_register, ins)
-            if mnemonic == M.NEG:
-                used_flags.update(("cf", "pf", "af", "zf", "sf", "of"))
-                defined_flags.update(("cf", "pf", "af", "zf", "sf", "of"))
-                call = f"op_sub_flags({bits}u, 0ull, {lhs}, false, cf, pf, af, zf, sf, of)"
-            else:
-                used_flags.update(("pf", "af", "zf", "sf", "of"))
-                defined_flags.update(("pf", "af", "zf", "sf", "of"))
-                helper = "op_add_flags" if mnemonic == M.INC else "op_sub_flags"
-                statements.append("{ bool unused_cf = false;")
-                call = f"{helper}({bits}u, {lhs}, 1ull, false, unused_cf, pf, af, zf, sf, of)"
-                statements.append(write_reg_stmt(ins.op0_register, call, ins) + " (void)unused_cf; }")
-                continue
-            statements.append(write_reg_stmt(ins.op0_register, call, ins))
-
-        elif mnemonic in LOGIC_BINARY and ins.op_count == 2:
-            if ins.op0_kind != OpKind.REGISTER:
-                raise ValueError(f"unsupported logical destination at RVA {ins.ip:#x}: {ins}")
-            lhs, bits = read_reg(ins.op0_register, ins)
-            rhs = read_operand(ins, 1, bits)
-            used_flags.update(("cf", "pf", "zf", "sf", "of"))
-            defined_flags.update(("cf", "pf", "zf", "sf", "of"))
-            defined_flags.discard("af")
-            op_sym = {M.AND: "&", M.OR: "|", M.XOR: "^", M.TEST: "&"}[mnemonic]
-            call = f"op_logic_flags({bits}u, static_cast<word>({lhs}) {op_sym} static_cast<word>({rhs}), cf, pf, zf, sf, of)"
-            if mnemonic == M.TEST:
                 statements.append(f"(void){call};")
             else:
                 statements.append(write_reg_stmt(ins.op0_register, call, ins))
@@ -656,12 +423,9 @@ def lift_code(name, start, raw):
     for gpr in ("rax", "r9", "r10", "r11"):
         if gpr in used_gpr:
             decls.append(f"    word {gpr} = 0ull;")
-    for flag in ("cf", "pf", "af", "zf", "sf", "df", "of", "id"):
+    for flag in ("cf", "pf", "af", "zf", "sf", "of"):
         if flag in used_flags:
             decls.append(f"    bool {flag} = false;")
-    if used_stack:
-        decls.append(f"    alignas(16) std::uint8_t stack[{LOCAL_STACK_BYTES}]{{}};")
-        decls.append(f"    std::size_t sp = {LOCAL_STACK_BYTES}u;")
     body = [f"    {stmt}" for stmt in statements]
     lines = [
         f'extern "C" __declspec(dllexport) void lifted_{name}(word rcx, word rdx, word r8) {{',

@@ -1190,10 +1190,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_mmx_original_lifted>"
         "$<TARGET_FILE:cpu_sse_mmx_altered_lifted>")
     set(cpu_integer_flags_exports
-        "op_lahf_preserve,op_lahf_add,op_lahf_sub,op_lahf_adc_sbb,"
-        "op_lahf_inc_dec_neg,op_lahf_cmp_clc_cmc,op_pushf_flags,"
-        "op_pushf_stride,op_popf_stride,op_popfq_pushfq_roundtrip,"
-        "op_pipeline,op_discarded_read")
+        "op_add8_lahf,op_add16_lahf,op_add32_lahf,op_add64_lahf,"
+        "op_sub8_lahf,op_sub16_lahf,op_sub32_lahf,op_sub64_lahf,"
+        "op_cmp8_lahf,op_cmp16_lahf,op_cmp32_lahf,op_cmp64_lahf,"
+        "op_add8_al_lahf,op_add32_imm_lahf,op_sub32_imm_lahf,op_cmp64_imm_lahf,"
+        "op_discarded_read")
     string(CONCAT cpu_integer_flags_exports ${cpu_integer_flags_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_integer_flags_${variant} integer_flags)
@@ -1213,6 +1214,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_integer_flags_original_lifted>"
         "$<TARGET_FILE:cpu_integer_flags_altered_lifted>"
         "$<TARGET_FILE:cpu_integer_flags_controls>")
+    set_tests_properties(cpu_aot_integer_flags PROPERTIES SKIP_RETURN_CODE 77)
     # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
     # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
     set(tail_files)
