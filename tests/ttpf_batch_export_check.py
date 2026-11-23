@@ -266,6 +266,52 @@ class BatchExportTests(unittest.TestCase):
             finally:
                 batch.load_tools = orig_load
 
+    def test_export_fitted_then_strict_reused_directory(self):
+        """A reused output directory must not leave last run's fitted DDS when strict export fails."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "reused_dds"
+            manifest_file = out_dir / "manifest.json"
+            dummy_pool = Path(tmp) / "test.ttpf"
+            dummy_pool.write_bytes(b"DUMMY_POOL")
+            tex1_file = out_dir / "tex_00001.dds"
+
+            orig_load = batch.load_tools
+            try:
+                batch.load_tools = lambda *args, **kwargs: MockTtpfModule
+
+                # 1. First run: provisional opt-in produces fitted DDS
+                summary1 = batch.batch_export(
+                    pool_path=dummy_pool,
+                    out_dir=out_dir,
+                    indices=[0, 1],
+                    allow_provisional=True,
+                    manifest_path=manifest_file,
+                )
+                self.assertEqual(summary1["stats"]["strict"], 1)
+                self.assertEqual(summary1["stats"]["provisional"], 1)
+                self.assertTrue(tex1_file.exists())
+                manifest1 = json.loads(manifest_file.read_text(encoding="utf-8"))
+                self.assertEqual(manifest1[1]["mode"], "provisional")
+
+                # 2. Second run: strict-by-default on the same directory
+                summary2 = batch.batch_export(
+                    pool_path=dummy_pool,
+                    out_dir=out_dir,
+                    indices=[0, 1],
+                    allow_provisional=False,
+                    manifest_path=manifest_file,
+                )
+                self.assertEqual(summary2["stats"]["strict"], 1)
+                self.assertEqual(summary2["stats"]["failed"], 1)
+
+                # The failed strict run must purge the stale fitted DDS from disk
+                self.assertFalse(tex1_file.exists(), "Stale provisional DDS remained on disk after failed strict run")
+                # Manifest is the sole authority
+                manifest2 = json.loads(manifest_file.read_text(encoding="utf-8"))
+                self.assertEqual(manifest2[1]["status"], "failed")
+            finally:
+                batch.load_tools = orig_load
+
     @unittest.skipUnless(os.environ.get("BCPACK_REFERENCE_TOOLS") or os.environ.get("TTPF_TOOLS_DIR") or
                          (ROOT / "out" / "Leonida" / "tools").is_dir(),
                          "optional local ttpf tools directory")

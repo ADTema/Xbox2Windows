@@ -96,10 +96,20 @@ def export_texture_entry(pool, index: int, out_dir: Path,
     """Export one texture entry from the pool to a DDS file and return its manifest entry.
 
     Writes to a temporary file first and publishes to dds_path only upon success.
+    If the export does not succeed, any existing stale dds_path from a prior run
+    is removed so that the manifest remains the sole authority for valid outputs.
     """
     dds_name = f"tex_{index:05d}.dds"
     dds_path = out_dir / dds_name
     temp_path = out_dir / f".tmp_{index}_{os.getpid()}_{time.time_ns()}.dds"
+
+    def fail(entry: dict) -> dict:
+        if dds_path.exists():
+            try:
+                dds_path.unlink()
+            except OSError:
+                pass
+        return entry
 
     if ttpf_module is None:
         ttpf_module = load_tools()
@@ -113,18 +123,18 @@ def export_texture_entry(pool, index: int, out_dir: Path,
     try:
         a = analyze_fn(pool, index)
     except Exception as exc:
-        return {
+        return fail({
             "index": index,
             "status": "failed",
             "reason": str(exc),
-        }
+        })
 
     if "layout" not in a or "available" not in a:
-        return {
+        return fail({
             "index": index,
             "status": "no_layout",
             "reason": a.get("blocked", "layout unavailable"),
-        }
+        })
 
     d = a.get("descriptor", {})
     shape = a.get("shape", "2d")
@@ -133,7 +143,7 @@ def export_texture_entry(pool, index: int, out_dir: Path,
     mips = d.get("mips", 0)
 
     if shape != "volume" and fmt not in bc_formats:
-        return {
+        return fail({
             "index": index,
             "status": "uncompressed",
             "format": fmt,
@@ -141,17 +151,17 @@ def export_texture_entry(pool, index: int, out_dir: Path,
             "shape": shape,
             "width": w,
             "height": h,
-        }
+        })
 
     if not a.get("full_chain", False):
-        return {
+        return fail({
             "index": index,
             "status": "unsupported_codec",
             "format": fmt,
             "format_name": FORMAT_NAMES.get(fmt, str(fmt)),
             "width": w,
             "height": h,
-        }
+        })
 
     try:
         # 1. Try strict export first (default)
@@ -164,7 +174,7 @@ def export_texture_entry(pool, index: int, out_dir: Path,
             ret = export_fn(pool, index, str(temp_path), allow_provisional=True, history=history)
 
         if ret != 0 or not temp_path.exists():
-            return {
+            return fail({
                 "index": index,
                 "status": "failed",
                 "format": fmt,
@@ -172,7 +182,7 @@ def export_texture_entry(pool, index: int, out_dir: Path,
                 "width": w,
                 "height": h,
                 "reason": f"export returned exit code {ret}",
-            }
+            })
 
         # Atomic publish: move temporary file to final published path
         os.replace(temp_path, dds_path)
