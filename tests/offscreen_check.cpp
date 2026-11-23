@@ -496,6 +496,12 @@ OperationResult run_spirv_sampler_views(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_raw_uav_dump(const OperationContext& ctx)
+{
+    dump_raw_uav(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_spirv_address_window(const OperationContext& ctx)
 {
     check_spirv_window(ctx.device, ctx.argv[3]);
@@ -903,6 +909,10 @@ constexpr CapabilityGate kGateSm60CompareSampler{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: comparison-sampler fixture requires SM 6.0",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60RawUavDump{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: raw UAV dump requires SM 6.0",
+    CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_0, true, false, 0,
     "skip: address window fixture requires SM 6.0 and 64-bit shader integer operations",
@@ -943,6 +953,8 @@ const OperationSpec kOperations[] = {
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
+    // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
+    {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
