@@ -471,11 +471,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Uninitialized private wide LDS word")
             vector.update(zip(range(first, last + 1), (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
-        elif ((m := re.fullmatch(r"ds_(add|sub|rsub|and|or)(?P<ret>_rtn)?(_[ub]64) "
+        elif ((m := re.fullmatch(r"ds_(add|sub|rsub|and|or|inc|dec|condxchg32)(?P<ret>_rtn)?(_[ub]64) "
                                  r"(?(ret)v\[(?P<dst_first>\d+):(?P<dst_last>\d+)\], )"
                                  r"v(?P<addr>\d+), v\[(?P<src_first>\d+):(?P<src_last>\d+)\]"
                                  r"(?: offset:(?P<offset>0|8))?", line))
-              and (op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64")):
+              and ((op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64",
+                                            "inc_u64", "dec_u64") or op == "condxchg32_b64" and m["ret"])):
             addr, first, last = (int(m[key]) for key in ("addr", "src_first", "src_last"))
             destination = tuple(int(m[key]) for key in ("dst_first", "dst_last")) if m["ret"] else None
             slot = int(m["offset"] or 0) // 4
@@ -488,7 +489,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             left, right = (source, previous) if op == "rsub_u64" else (previous, source)
             lo, hi = map(hlsl_word, left)
             rhs_lo, rhs_hi = map(hlsl_word, right)
-            if op in ("and_b64", "or_b64"):
+            if op == "inc_u64":
+                reset = f"({hi} > {rhs_hi} || ({hi} == {rhs_hi} && {lo} >= {rhs_lo}))"
+                low = f"({reset} ? 0u : ({lo} + 1u))"
+                high = f"({reset} ? 0u : ({hi} + uint({lo} == 0xffffffffu)))"
+            elif op == "dec_u64":
+                reset = f"(({hi} | {lo}) == 0u || {hi} > {rhs_hi} || ({hi} == {rhs_hi} && {lo} > {rhs_lo}))"
+                low = f"({reset} ? {rhs_lo} : ({lo} - 1u))"
+                high = f"({reset} ? {rhs_hi} : ({hi} - uint({lo} == 0u)))"
+            elif op == "condxchg32_b64":
+                low = f"(({rhs_lo} & 0x80000000u) != 0u ? {rhs_lo} : {lo})"
+                high = f"(({rhs_hi} & 0x80000000u) != 0u ? {rhs_hi} : {hi})"
+            elif op in ("and_b64", "or_b64"):
                 symbol = "&" if op == "and_b64" else "|"
                 low = f"({lo} {symbol} {rhs_lo})"
                 high = f"({hi} {symbol} {rhs_hi})"
