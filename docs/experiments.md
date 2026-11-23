@@ -1102,6 +1102,8 @@ VEX 128-bit and 256-bit AVX packed shifts, saturating packs, unpacks, shuffles, 
 
 VEX 128-bit and 256-bit AVX broadcast, lane extract/insert, permute, shuffle, unpack, blend, dot-product, round, and `vzeroall` forms (`vbroadcastss`/`sd`/`f128`, `vextractf128`, `vinsertf128`, `vperm2f128`, `vpermilps`/`pd`, `vshufps`/`pd`, `vunpcklps`/`hps`/`lpd`/`hpd`, `vmovddup`/`sldup`/`shdup`, `vblendps`/`pd`/`vps`/`vpd`, `vdpps`/`pd`, `vroundps`/`pd`, `vzeroall`) are also lowered for `EncodingKind.VEX` while rejecting MXCSR rounding mode (`imm8 & 4 != 0`). `cpu_aot_avx_shuffle_blend` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it builds all 27 exports from MASM source (`tests/cpu/avx_shuffle_blend.asm`), translates them, compares exact 32-byte outputs against the native DLL, and checks that MXCSR-mode `vroundps` is rejected. The XMM memory form of `vmovddup` is also run with exactly eight readable bytes before a guard page. The `vdpps` cancellation case checks pairwise rounding. For multiple NaN inputs the selected lanes must be NaN, while the other lanes are compared bit for bit. Run `cmake --build --preset dev --target cpu_avx_shuffle_blend_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_shuffle_blend$' -V`.
 
+VEX AVX scalar floating-point, half-register move, `vinsertps`/`vextractps`, and `vcomiss`/`vucomiss`/`vcomisd`/`vucomisd` forms (`vaddss`/`sd`, `vsubss`/`sd`, `vmulss`/`sd`, `vdivss`/`sd`, `vsqrtss`/`sd`, `vminss`/`sd`, `vmaxss`/`sd`, `vroundss`/`sd`, `vmovss`, `vmovhlps`/`lhps`/`lps`/`hps`/`lpd`, `vinsertps`, `vextractps`, `vcomiss`/`sd`, `vucomiss`/`sd`) are also lowered for `EncodingKind.VEX` while zeroing upper YMM bytes and rejecting EVEX encodings and MXCSR rounding mode. `cpu_aot_avx_scalar_fp` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it builds all 27 exports from MASM source (`tests/cpu/avx_scalar_fp.asm`), translates them, compares exact 32-byte/scalar outputs and all four ordering outcomes (`<`, `==`, `>`, unordered) against the native DLL, and checks that EVEX `vaddss` is rejected. Separate raw-bit checks cover quieting signaling NaNs for scalar round and the effect of DAZ on scalar min/max and round-down. In masked mode the COMI and UCOMI checks compare the MXCSR invalid flag for signaling and quiet NaNs. Run `cmake --build --preset dev --target cpu_avx_scalar_fp_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_scalar_fp$' -V`.
+
 ## Recompiling a direct x64 call
 
 The [caller and callee](../tests/cpu/direct.asm) each accept two unsigned 64-bit integers and an output pointer. The [translator](../tools/cpu_call_aot.py) starts at the caller export, follows the signed displacement in its E8 call and reads the target's runtime-function interval. It generates two C++ functions from the linked machine code. MSVC emits a separate x64 DLL with a non-inlined call. The Windows test checks the relative call against the two export addresses in both the input and output DLLs.
@@ -1422,6 +1424,18 @@ startup or use of this relocation by a particular title is established.
 `cpu_native_load_cookie` uses a CRT-free DLL and EXE to observe the load-config cookie before either entry can initialize it. On Windows 11, the native loader replaces the default x64 cookie with a nonzero, non-default 48-bit value when the load-config sizes reach the 0x70-byte prefix. `pe_map` seeds the same case with the system random generator after relocation and before guest callbacks or entry. The fixture compares the behavior and value bounds across the two loaders. It checks the size boundary from both fields, the unused-cookie flag, and a preinitialized cookie. A read-only target must be rejected by the mapper before entry.
 
 `ctest --preset release --no-tests=error -R '^cpu_native_load_cookie$' -V`
+
+### Load-config callback field convention
+
+`cpu_load_dispatch_present`, `_absent` and `_alternate` share a hand-written 0x138-byte `_load_config_used`. This fixture treats the field at +0x78 (`GuardCFDispatchFunctionPointer`) as its own direct callback pointer, not the real Windows guard-dispatch ABI: the field is in read-only `.rdata` and has a DIR64 relocation. `native_entry` loads it, calls it with `ECX=0x1234` when non-null, and encodes the callback count, argument and return through the existing `finish_exe` wrapper. The test inspects each image's own PE for the directory and structure sizes, the slot RVA and value, the read-only section and the DIR64 relocation, then runs the same image under Windows and `pe_map` with the same `cpu_exe_io.dll` provider.
+
+Absent makes zero calls (exit `0xb211`); present calls once with `0x1234` and return `0x5a` (`0xb111`); alternate uses a different callback return (`0xb151`) so a wrong binding is visible. Native and mapped match for all three. A hand-built `GuardFlags=0x100` image without a check pointer or function table was refused by the local loader and hung the CI runner; a specific refusal code is not portable, so that image is not part of the test or an acceptance condition.
+
+### Linker-produced CFG callback
+
+`cpu_native_load_config_callback` builds a C++ caller with `/guard:cf`. The linker supplies the guard slots, function table and flags; the caller calls a read-only relocated callback table through `__guard_dispatch_icall_fptr`. The `record`, `other` (different callback) and `invalid` (target inside a function) images link without CFG and match across Windows and `pe_map`. With CFG, Windows replaces both guard slots (`0x30055` versus the callback's `0x55`) and ends the invalid target before it writes output; `pe_map` currently keeps the image's own slots, runs the valid callback (`0x55`) and runs the invalid target (`0x77`). The test records the unchecked mapped result as the current observation. It also accepts an explicit unsupported-CFG diagnostic before dispatch. An unrelated load error or missing output cannot establish CFG behavior. The local refusal code is printed but not asserted. The fixture is based on denn0x's `pe/load-config-callback` reference branch.
+
+`ctest --preset dev --no-tests=error -R '^cpu_native_load_(dispatch|config_callback)$' -V`
 
 ### TLS callbacks and the entry point
 
@@ -1794,7 +1808,7 @@ The same translator follows direct calls and tail jumps to other functions of th
 
 On a Release (`/O2`) build of this change with MSVC 19.50, every `.pdata` entry of the 96 readable non-generated images was translated with four arguments, each unique function body once. Of 2,343 unique functions, 78 translated with the frame translator before this change and 97 after it, and none was lost. Of the 19 new ones, 8 are in `calls.asm`, 2 in `call_entries.asm`, 8 are callers in the other MASM call fixtures and 1 is MSVC output, a tail jump in `cpu_life_a.dll`, which is translated but not run. The most common first refusals are now a call target with no unwind entry or export (806 functions), mostly MSVC leaves without `.pdata` and import thunks, and a refused callee (299). Among refused callees, the innermost reason is an indirect transfer (`unsupported control flow`) in 186 and again a target with no unwind entry in 102. A frame address passed to a callee is the first refusal of 32.
 
-The fixed-frame proof also accepts `MOV RBP, RSP` and `LEA RBP, [RSP+disp]` as frame anchors. Both stack bases address the same checked frame array. Incoming paths must agree on the anchor at each join. An anchored RBP is usable only for a bounded stack access or register restoration. An ordinary import can receive a pointer into the frame under the explicit output contract below. The `anchored_frame` export in `cpu_aot_stack_frames` compares both paths of a shared slot written through RBP and updated through RSP. Its controls change the anchor on one path, turn a load into a frame-address LEA, and read an unwritten slot.
+The fixed-frame proof also accepts `MOV RBP, RSP` and `LEA RBP, [RSP+disp]` as frame anchors. Both stack bases address the same checked frame array. Incoming paths must agree on the anchor at each join. An anchored RBP is usable only for a bounded stack access or register restoration. An ordinary import can receive a pointer into the frame under the explicit output contract below. The `anchored_frame` export in `cpu_aot_stack_frames` compares both paths of a shared slot written through RBP and updated through RSP. Its controls change the anchor on one path, turn a load into a frame-address LEA, and read an unwritten slot. `LEAVE` with the 64-bit operand size is accepted as the epilogue of such a frame: only where the anchor is proven on every path, not below RSP, and low enough that RSP stays at or below entry RSP, it sets RSP to the anchor and pops RBP from it, and the frame proof releases every byte from the old RSP through anchor + 8, the pop slot included. It writes no flags. The pop reuses the saved-register proof, so RBP counts as restored only when the slot still holds the saved RBP. `ENTER` and a separate `MOV RSP, RBP` stay rejected as dynamic frames. `cpu_aot_leave` ([source](../tests/cpu/leave.asm)) compares three anchored frames with native execution: `MOV RBP, RSP` with flags that cross `LEAVE`, `LEA RBP, [RSP+20h]`, and a join where both paths keep the anchor. It also checks that the translation reloads RBP from the slot `PUSH RBP` wrote. The register probe samples RBX and RSI, so the RBP restore is shown by that proof rather than by execution. Its controls remove the anchor, let the anchors differ at a join, leave the anchor slot unwritten, overwrite the saved RBP with ordinary data, read a local that `LEAVE` released, put the anchor below RSP, put it where RSP would rise above entry RSP, and use `MOV RSP, RBP`, `ENTER`, and 16-bit `LEAVE`.
 
 An ordinary import binding can use `--stack-output ARG WIDTH` for one synchronous output argument. `ARG` is its 1-based position. The provider must write exactly `WIDTH` bytes before returning and must neither read their initial contents nor retain their address. The translator proves that a single `LEA` from RSP or an anchored RBP supplies the argument in the same basic block. The slot must be naturally aligned, inside the verified frame, and outside the callee's home space. The call initializes only the declared bytes. Tail calls and other uses of frame pointers remain outside the profile. Import bindings accept zero through four register arguments and can declare zero, one, two, four or eight defined return bytes.
 
@@ -2364,6 +2378,16 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_private_(warp|har
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+
+A separate private LDS layout uses `local_x << 4` and at least 512 bytes of
+allocation. Each lane owns a 16-byte record. This layout supports
+`ds_write_b64` and `ds_read_b64` at offset 0 or 8, `ds_write_b96` and
+`ds_read_b96` at offset 0, and `ds_read2_b32` with independently ordered
+dword offsets within the record. Each read requires all referenced dwords to
+have been written. The profile rejects mixing the two LDS address strides
+because their per-lane regions can overlap. The fixtures compare every UAV
+word and detect a wrong qword offset, a missing data word, or reversed dual
+read offsets at word 0.
 
 An optional `--constant-descriptor BYTE_OFFSET` binds a second table entry to
 b0. It must be distinct from the 16-byte u0 descriptor. The translator accepts
@@ -4000,6 +4024,28 @@ Two independent negative controls confirm that withholding either `XMemMapPhysic
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_map_pages$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_map_pages$' -V
+```
+
+### Memory transfer caller and recorder
+
+This fixture exercises the proposed `XMemTransferMemory` contract under test-provider policies. The source-built caller ([`transfer_mem_caller.asm`](../tests/cpu/transfer_mem_caller.asm)) imports `XMemTransferMemory` by name from `xmem.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled recording provider ([`transfer_mem_provider.cpp`](../tests/cpu/transfer_mem_provider.cpp)), it exercises seven checks:
+- **Step 1**: Valid 2 MiB transfer under test-provider policy partition 1 (`rcx = 1`, `rdx = 0x200000`), returning `TRUE` (`1`).
+- **Step 2**: Valid 16 MiB transfer under test-provider policy partition 1 (`rcx = 1`, `rdx = 0x1000000`), returning `TRUE` (`1`).
+- **Step 3**: Rejection control with invalid partition (`rcx = 0`), returning `FALSE` (`0`).
+- **Step 4**: Rejection control with zero byte count (`rdx = 0`), returning `FALSE` (`0`).
+- **Step 5**: Rejection control with unaligned byte count (not 2 MiB aligned under test-provider policy, `rdx = 0x200100`), returning `FALSE` (`0`).
+- **Step 6**: Rejection control with oversized byte count exceeding the 16 MiB policy maximum (`rdx = 0x2000000`), returning `FALSE` (`0`).
+- **Step 7**: Internal verification of provider call counters, rejection counts, and the ordered trace of calls directly within the caller process.
+
+The specific fixture inputs tested (`partition = 1`, `byte_count = 0x200000` and `0x1000000`) are synthetic fixture inputs chosen for this test. Partition selector 1, 2 MiB alignment, the 16 MiB maximum boundary, and `BOOL` return semantics are labeled as test-provider policy throughout; native console transfer semantics and partition effects remain open. The provider's recorded trace validates all six ordered argument pairs and call outcomes.
+
+A changed-first-call control patches the first 2 MiB request in the caller binary to 4 MiB: under both the Windows native loader and `pe_map`, the caller's internal trace check rejects the modification with exit code `0xF0B`, and the recorded trace reflects the changed 4 MiB argument in call 0.
+
+On success, the caller exits with the success sentinel `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return. An independent negative control confirms that withholding `XMemTransferMemory` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_transfer_mem$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_transfer_mem$' -V
 ```
 
 ### Audio-side import inventory
