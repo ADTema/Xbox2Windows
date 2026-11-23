@@ -1686,6 +1686,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_sse34_fp>" "$<TARGET_FILE:cpu_sse34_fp_lifted>")
     set_tests_properties(cpu_aot_sse34_fp PROPERTIES SKIP_RETURN_CODE 77)
 
+    cpu_asm_fixture(cpu_avx_packed_int avx_packed_int)
+    set(avx_packed_int_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_packed_int_lifted.cpp")
+    add_custom_command(OUTPUT "${avx_packed_int_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_packed_int.py"
+            emit "$<TARGET_FILE:cpu_avx_packed_int>" "${avx_packed_int_fixture}"
+        DEPENDS cpu_avx_packed_int tests/cpu/avx_packed_int.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_avx_packed_int_lifted SHARED "${avx_packed_int_fixture}")
+    add_test(NAME cpu_aot_avx_packed_int COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_packed_int.py"
+        check "$<TARGET_FILE:cpu_avx_packed_int>" "$<TARGET_FILE:cpu_avx_packed_int_lifted>")
+    set_tests_properties(cpu_aot_avx_packed_int PROPERTIES SKIP_RETURN_CODE 77)
+
     cpu_asm_fixture(cpu_avx_packed_fp avx_packed_fp)
     set(avx_packed_fp_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_packed_fp_lifted.cpp")
     add_custom_command(OUTPUT "${avx_packed_fp_fixture}"
