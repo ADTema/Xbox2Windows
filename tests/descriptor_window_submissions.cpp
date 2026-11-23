@@ -17,6 +17,21 @@ constexpr UINT word_bytes = sizeof(std::uint32_t);
 constexpr UINT input_stride_words = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT / word_bytes;
 using Words = std::array<std::uint32_t, 2>;
 
+// This fixture owns the record format. The record bytes contain an ID, not a D3D12 descriptor.
+struct BindingRecord {
+    std::uint32_t id;
+    std::array<std::uint32_t, 7> reserved{};
+};
+static_assert(sizeof(BindingRecord) == 32);
+constexpr std::array<BindingRecord, 2> records{BindingRecord{0x41}, BindingRecord{0x72}};
+
+D3D12_CPU_DESCRIPTOR_HANDLE cpu_slot(ID3D12DescriptorHeap* heap, UINT index, UINT stride)
+{
+    auto handle = heap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += SIZE_T{index} * stride;
+    return handle;
+}
+
 ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device)
 {
     const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
@@ -45,10 +60,25 @@ void compare_words(UINT64 fence_value, const Words& actual, const Words& expecte
                 fence_value, actual[0], actual[1], expected[0], expected[1]);
     if (actual != expected) throw std::runtime_error("Descriptor-window readback differs from reference");
 }
+
+Words read_words(ID3D12Resource* readback)
+{
+    Words actual{};
+    void* mapped = nullptr;
+    const D3D12_RANGE read_range{0, sizeof(actual)};
+    const D3D12_RANGE no_write{0, 0};
+    check(readback->Map(0, &read_range, &mapped), "Map descriptor-window readback");
+    std::memcpy(actual.data(), mapped, sizeof(actual));
+    readback->Unmap(0, &no_write);
+    return actual;
+}
 }
 
-void check_descriptor_window_submissions(ID3D12Device* device, bool stale)
+void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowCase scenario)
 {
+    const bool stale_window = scenario == DescriptorWindowCase::stale_window;
+    const bool stale_record = scenario == DescriptorWindowCase::stale_record;
+    const bool use_records = scenario != DescriptorWindowCase::direct && !stale_window;
     const auto root = create_root(device);
     D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc{};
     pipeline_desc.pRootSignature = root.Get();
@@ -85,6 +115,13 @@ void check_descriptor_window_submissions(ID3D12Device* device, bool stale)
     const auto readback = make_buffer(device, sizeof(Words), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     constexpr std::array<UINT, 2> windows{0, descriptor_count - 1};
+    ComPtr<ID3D12DescriptorHeap> staging;
+    if (use_records) {
+        D3D12_DESCRIPTOR_HEAP_DESC staging_desc{};
+        staging_desc.Type = heap_desc.Type;
+        staging_desc.NumDescriptors = static_cast<UINT>(records.size());
+        check(device->CreateDescriptorHeap(&staging_desc, IID_PPV_ARGS(&staging)), "Create CPU descriptor staging heap");
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = DXGI_FORMAT_R32_TYPELESS;
     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -92,10 +129,27 @@ void check_descriptor_window_submissions(ID3D12Device* device, bool stale)
     srv.Buffer.NumElements = 1;
     srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     for (UINT i = 0; i < windows.size(); ++i) {
-        auto handle = heap->GetCPUDescriptorHandleForHeapStart();
-        handle.ptr += SIZE_T{windows[i]} * stride;
         srv.Buffer.FirstElement = i * input_stride_words;
-        device->CreateShaderResourceView(upload.Get(), &srv, handle);
+        const auto dst = use_records ? cpu_slot(staging.Get(), i, stride) : cpu_slot(heap.Get(), windows[i], stride);
+        device->CreateShaderResourceView(upload.Get(), &srv, dst);
+    }
+
+    unsigned descriptor_copies = 0;
+    auto materialize = [&](const BindingRecord& record, UINT dst) {
+        for (UINT i = 0; i < records.size(); ++i) {
+            if (record.id != records[i].id) continue;
+            device->CopyDescriptorsSimple(1, cpu_slot(heap.Get(), dst, stride), cpu_slot(staging.Get(), i, stride),
+                                          heap_desc.Type);
+            ++descriptor_copies;
+            std::printf("descriptor_records materialize slot=%u id=%08x copies=%u\n", dst, record.id, descriptor_copies);
+            return true;
+        }
+        return false;
+    };
+    BindingRecord live_second = records[0];
+    const BindingRecord cached_second = live_second;
+    if (use_records && (!materialize(records[0], windows[0]) || !materialize(live_second, windows[1]))) {
+        throw std::runtime_error("Failed to seed descriptor records");
     }
 
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
@@ -103,14 +157,38 @@ void check_descriptor_window_submissions(ID3D12Device* device, bool stale)
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create descriptor-window fence");
     auto* list = commands.list.Get();
     list->CopyBufferRegion(output.Get(), 0, upload.Get(), guard_index * word_bytes, sizeof(Words));
-    const std::array<Words, 2> expected{Words{first_word, untouched}, Words{first_word, stale ? first_word : second_word}};
+    const auto second_expected = stale_window || stale_record ? first_word : second_word;
+    const std::array<Words, 2> expected{Words{first_word, untouched}, Words{first_word, second_expected}};
+    unsigned submissions = 0;
     auto before = D3D12_RESOURCE_STATE_COPY_DEST;
     for (UINT i = 0; i < windows.size(); ++i) {
+        if (i != 0) {
+            if (use_records) {
+                if (scenario == DescriptorWindowCase::unknown_record) {
+                    const BindingRecord unknown{0xff};
+                    std::memcpy(&live_second, &unknown, sizeof(live_second));
+                    if (materialize(live_second, windows[1]) || descriptor_copies != 2 ||
+                        submissions != 1 || fence->GetCompletedValue() != 1 || read_words(readback.Get()) != expected[0]) {
+                        throw std::runtime_error("Unknown descriptor record changed state before retry");
+                    }
+                    std::puts("descriptor_records rejected id=000000ff copies=2 submissions=1 fence=1 readback=preserved");
+                }
+                std::memcpy(&live_second, &records[1], sizeof(live_second));
+                std::printf("descriptor_records copied id=%08x\n", live_second.id);
+                if (live_second.id != records[1].id ||
+                    !materialize(stale_record ? cached_second : live_second, windows[1]) || descriptor_copies != 3) {
+                    throw std::runtime_error("Failed to materialize copied descriptor record");
+                }
+            }
+            check(commands.allocator->Reset(), "Reset descriptor-window allocator");
+            check(list->Reset(commands.allocator.Get(), pipeline.Get()), "Reset descriptor-window list");
+            before = D3D12_RESOURCE_STATE_COMMON;
+        }
         transition(list, output.Get(), before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         list->SetComputeRootSignature(root.Get());
         ID3D12DescriptorHeap* heaps[]{heap.Get()};
         list->SetDescriptorHeaps(1, heaps);
-        const UINT slot = windows[stale ? 0 : i];
+        const UINT slot = windows[stale_window ? 0 : i];
         auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
         gpu.ptr += UINT64{slot} * stride;
         list->SetComputeRootDescriptorTable(0, gpu);
@@ -126,21 +204,12 @@ void check_descriptor_window_submissions(ID3D12Device* device, bool stale)
         check(list->Close(), "Close descriptor-window list");
         ID3D12CommandList* submitted[]{list};
         commands.queue->ExecuteCommandLists(1, submitted);
+        ++submissions;
         check(commands.queue->Signal(fence.Get(), fence_value), "Signal descriptor-window fence");
         check(fence->SetEventOnCompletion(fence_value, nullptr), "Wait for descriptor-window fence");
         check(device->GetDeviceRemovedReason(), "Complete descriptor-window submission");
         if (fence->GetCompletedValue() != fence_value) throw std::runtime_error("Unexpected descriptor-window fence value");
 
-        Words actual{};
-        const D3D12_RANGE read_range{0, sizeof(actual)};
-        check(readback->Map(0, &read_range, &mapped), "Map descriptor-window readback");
-        std::memcpy(actual.data(), mapped, sizeof(actual));
-        readback->Unmap(0, &no_read);
-        compare_words(fence_value, actual, expected[i]);
-        if (i + 1 < windows.size()) {
-            check(commands.allocator->Reset(), "Reset descriptor-window allocator");
-            check(list->Reset(commands.allocator.Get(), pipeline.Get()), "Reset descriptor-window list");
-            before = D3D12_RESOURCE_STATE_COMMON;
-        }
+        compare_words(fence_value, read_words(readback.Get()), expected[i]);
     }
 }

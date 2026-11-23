@@ -547,13 +547,29 @@ OperationResult run_dual_uav(const OperationContext& ctx)
 
 OperationResult run_descriptor_window_submissions(const OperationContext& ctx)
 {
-    check_descriptor_window_submissions(ctx.device, false);
+    check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::direct);
     return {OutcomeKind::pass, nullptr};
 }
 
 OperationResult run_descriptor_window_stale(const OperationContext& ctx)
 {
-    check_descriptor_window_submissions(ctx.device, true);
+    check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::stale_window);
+    return {OutcomeKind::pass, nullptr};
+}
+
+bool validate_descriptor_record_args(int, char** argv)
+{
+    const std::string_view scenario = argv[3];
+    return scenario == "live" || scenario == "stale" || scenario == "unknown";
+}
+
+OperationResult run_descriptor_record_copy(const OperationContext& ctx)
+{
+    const std::string_view scenario = ctx.argv[3];
+    auto test = DescriptorWindowCase::copied_record;
+    if (scenario == "stale") test = DescriptorWindowCase::stale_record;
+    if (scenario == "unknown") test = DescriptorWindowCase::unknown_record;
+    check_descriptor_window_submissions(ctx.device, test);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -978,6 +994,7 @@ const OperationSpec kOperations[] = {
     {"--dual-uav", 3, 3, nullptr, kNoGate, run_dual_uav},
     {"--descriptor-window-submissions", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_submissions},
     {"--descriptor-window-stale", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_stale},
+    {"--descriptor-record-copy", 4, 4, validate_descriptor_record_args, kGateSm60BufferOps, run_descriptor_record_copy},
     {"--texture-mips", 3, 3, nullptr, kNoGate, run_texture_mips},
     {"--check-bc7-tail", 6, kUnboundedArgc, nullptr, kNoGate, run_check_bc7_tail},
     {"--check-bc7-mip1", 6, 6, nullptr, kNoGate, run_check_bc7_mip1},
@@ -1209,6 +1226,9 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --bvh-wave")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--dual-uav", "extra"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --dual-uav")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--descriptor-record-copy", "invalid"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --descriptor-record-copy")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--descriptor-record-copy", "unknown"}, CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--compute-root-file"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --compute-root-file")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-sampler-views"}, CliAction::usage_error,
