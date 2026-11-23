@@ -8368,6 +8368,147 @@ def check_controls(directory):
     cnd_pos = sel.index("v_cndmask_b32_e64 v13, v13, s46, s[52:53]")
     must_reject(translate, sel[:cnd_pos] + ["s_not_b64 s[52:53], 0"] + sel[cnd_pos:])
 
+    # Wave32 execution mask lifecycle: save, WQM, restore (via s_and_b64, s_mov_b64, s_and_b32, s_mov_b32)
+    # and rejections for mismatched registers, wrong mask state, and SCC invalidation.
+    base_wave32 = list(assembly(False))
+    save_idx = base_wave32.index("s_mov_b64 s[50:51], exec")
+    wqm_idx = base_wave32.index("s_wqm_b64 exec, exec")
+    restore_idx = base_wave32.index("s_and_b64 exec, exec, s[50:51]")
+
+    w32_and = list(base_wave32)
+    w32_and[save_idx] = "s_mov_b64 s14, exec_lo"
+    w32_and[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+    w32_and[restore_idx] = "s_and_b64 exec_lo, exec_lo, s14"
+    assert translate(w32_and) == translate(base_wave32)
+
+    w32_mov = list(base_wave32)
+    w32_mov[save_idx] = "s_mov_b64 s14, exec_lo"
+    w32_mov[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+    w32_mov[restore_idx] = "s_mov_b64 exec_lo, s14"
+    assert translate(w32_mov) == translate(base_wave32)
+
+    w32_b32 = list(base_wave32)
+    w32_b32[save_idx] = "s_mov_b32 s14, exec_lo"
+    w32_b32[wqm_idx] = "s_wqm_b32 exec_lo, exec_lo"
+    w32_b32[restore_idx] = "s_and_b32 exec_lo, exec_lo, s14"
+    assert lower(w32_b32, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=32) == translate(base_wave32)
+    must_reject(translate, w32_b32)
+    must_reject(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=64), w32_b32)
+
+    w32_b32_mov = list(base_wave32)
+    w32_b32_mov[save_idx] = "s_mov_b32 s14, exec_lo"
+    w32_b32_mov[wqm_idx] = "s_wqm_b32 exec_lo, exec_lo"
+    w32_b32_mov[restore_idx] = "s_mov_b32 exec_lo, s14"
+    assert lower(w32_b32_mov, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=32) == translate(base_wave32)
+    must_reject(translate, w32_b32_mov)
+    must_reject(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=64), w32_b32_mov)
+
+    must_reject(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=16), base_wave32)
+    must_reject(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=32.0), w32_b32)
+    invalid_save = w32_b32[:save_idx] + ["s_mov_b32 s106, exec_lo"] + w32_b32[save_idx + 1:]
+    invalid_save[restore_idx] = "s_and_b32 exec_lo, exec_lo, s106"
+    must_reject(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=32), invalid_save)
+    must_reject(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size="wave32"), base_wave32)
+
+    w64_mov = list(base_wave32)
+    w64_mov[restore_idx] = "s_mov_b64 exec, s[50:51]"
+    assert translate(w64_mov) == translate(base_wave32)
+
+    w32_disasm_pair = list(base_wave32)
+    w32_disasm_pair[save_idx] = "s_mov_b64 s50, exec_lo"
+    w32_disasm_pair[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+    w32_disasm_pair[restore_idx] = "s_and_b64 exec, exec, s[50:51]"
+    assert translate(w32_disasm_pair) == translate(base_wave32)
+
+    w32_disasm_mov_pair = list(base_wave32)
+    w32_disasm_mov_pair[save_idx] = "s_mov_b64 s50, exec_lo"
+    w32_disasm_mov_pair[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+    w32_disasm_mov_pair[restore_idx] = "s_mov_b64 exec, s[50:51]"
+    assert translate(w32_disasm_mov_pair) == translate(base_wave32)
+
+    w32_b32_pair_reject = list(base_wave32)
+    w32_b32_pair_reject[save_idx] = "s_mov_b32 s50, exec_lo"
+    w32_b32_pair_reject[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+    w32_b32_pair_reject[restore_idx] = "s_and_b64 exec, exec, s[50:51]"
+    must_reject(translate, w32_b32_pair_reject)
+
+    w32_unaligned = list(base_wave32)
+    w32_unaligned[save_idx] = "s_mov_b64 s51, exec_lo"
+    must_reject(translate, w32_unaligned)
+
+    w64_odd_pair = list(base_wave32)
+    w64_odd_pair[save_idx] = "s_mov_b64 s[49:50], exec"
+    must_reject(translate, w64_odd_pair)
+
+    w64_oob_pair = list(base_wave32)
+    w64_oob_pair[save_idx] = "s_mov_b64 s[105:106], exec"
+    must_reject(translate, w64_oob_pair)
+
+    must_reject(translate, base_wave32[:restore_idx] + ["s_and_b64 exec, exec, s[49:50]"] + base_wave32[restore_idx+1:])
+    must_reject(translate, base_wave32[:restore_idx] + ["s_and_b64 exec, exec, s[105:106]"] + base_wave32[restore_idx+1:])
+
+    w32_sym_and = list(base_wave32)
+    w32_sym_and[save_idx] = "s_mov_b64 s50, exec_lo"
+    w32_sym_and[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+    w32_sym_and[restore_idx] = "s_and_b64 exec, exec, s50"
+    assert translate(w32_sym_and) == translate(base_wave32)
+
+    w32_sym_mov = list(base_wave32)
+    w32_sym_mov[save_idx] = "s_mov_b64 s50, exec_lo"
+    w32_sym_mov[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+    w32_sym_mov[restore_idx] = "s_mov_b64 exec, s50"
+    assert translate(w32_sym_mov) == translate(base_wave32)
+
+    must_reject(translate, w32_and[:restore_idx] + ["s_and_b64 exec_lo, exec_lo, s15"] + w32_and[restore_idx+1:])
+    must_reject(translate, w32_mov[:restore_idx] + ["s_mov_b64 exec_lo, s15"] + w32_mov[restore_idx+1:])
+    must_reject(translate, ["s_mov_b64 s14, exec_lo", "s_and_b64 exec_lo, exec_lo, s14"] + w32_and[wqm_idx:])
+    must_reject(translate, ["s_mov_b64 s14, exec_lo", "s_mov_b64 exec_lo, s14"] + w32_and[wqm_idx:])
+    must_reject(translate, w32_and[:restore_idx+1] + ["s_and_b64 exec_lo, exec_lo, s14"] + w32_and[restore_idx+1:])
+    must_reject(translate, w32_and[:wqm_idx+1] + ["s_wqm_b64 exec_lo, exec_lo"] + w32_and[wqm_idx+1:])
+    prefix_scc = ["s_mov_b32 s90, 0", "s_mov_b32 s91, 0", "s_not_b64 s[92:93], 0"]
+    must_reject(translate, w32_and[:wqm_idx] + prefix_scc + [w32_and[wqm_idx], "s_cmov_b64 s[90:91], s[92:93]"] + w32_and[wqm_idx+1:])
+    must_reject(translate, w32_and[:restore_idx] + prefix_scc + [w32_and[restore_idx], "s_cmov_b64 s[90:91], s[92:93]"] + w32_and[restore_idx+1:])
+    must_reject(translate, w32_mov[:restore_idx] + prefix_scc + [w32_mov[restore_idx], "s_cmov_b64 s[90:91], s[92:93]"] + w32_mov[restore_idx+1:])
+
+    # Full-width restore requires both saved halves intact; clobbering the high SGPR must be rejected.
+    clobbered_mov = list(base_wave32)
+    clobbered_mov[save_idx] = "s_mov_b64 s50, exec_lo"
+    clobbered_mov[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+    clobbered_mov.insert(restore_idx, "s_mov_b32 s51, 0")
+    clobbered_mov[restore_idx + 1] = "s_mov_b64 exec, s50"
+    must_reject(translate, clobbered_mov)
+
+    clobbered_and = list(base_wave32)
+    clobbered_and[save_idx] = "s_mov_b64 s50, exec_lo"
+    clobbered_and[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+    clobbered_and.insert(restore_idx, "s_mov_b32 s51, 0")
+    clobbered_and[restore_idx + 1] = "s_and_b64 exec, exec, s50"
+    must_reject(translate, clobbered_and)
+
+    clobbered_pair = list(base_wave32)
+    clobbered_pair.insert(restore_idx, "s_mov_b32 s51, 0")
+    must_reject(translate, clobbered_pair)
+
+    # A b64 expansion followed by a low-only restore without wave32 precondition leaves the upper half unrestored.
+    b64_low_restore_and = list(base_wave32)
+    b64_low_restore_and[restore_idx] = "s_and_b32 exec_lo, exec_lo, s50"
+    must_reject(translate, b64_low_restore_and)
+
+    b64_low_restore_mov = list(base_wave32)
+    b64_low_restore_mov[restore_idx] = "s_mov_b32 exec_lo, s50"
+    must_reject(translate, b64_low_restore_mov)
+
+    b64_low_save_and = list(base_wave32)
+    b64_low_save_and[save_idx] = "s_mov_b32 s50, exec_lo"
+    b64_low_save_and[restore_idx] = "s_and_b32 exec_lo, exec_lo, s50"
+    must_reject(translate, b64_low_save_and)
+
+    b32_high_restore = list(base_wave32)
+    b32_high_restore[save_idx] = "s_mov_b32 s14, exec_lo"
+    b32_high_restore[wqm_idx] = "s_wqm_b32 exec_lo, exec_lo"
+    b32_high_restore[restore_idx] = "s_and_b64 exec, exec, s14"
+    must_reject(translate, b32_high_restore)
+
     # 32-bit integer comparisons: signed vs unsigned casts, wave64 spelling, inline constants, and rejections.
     i32_source = translate(int_predicate_group("i32", "e32", 0))
     u32_source = translate(int_predicate_group("u32", "e64", 4))
@@ -8809,7 +8950,31 @@ def check_binary(directory, assembler, objcopy, library):
         assert lower_fixture(disassemble(native, library, cpu=cpu.encode())) == lower_fixture(instructions)
         if index == 0:
             check_container_selector(directory, native, library)
+    check_wave32_mask_binary(directory, assembler, objcopy, library)
     check_exp_en_decoding(directory, assembler, objcopy, library)
+
+
+def check_wave32_mask_binary(directory, assembler, objcopy, library):
+    reference = assembly(False)
+    save = reference.index("s_mov_b64 s[50:51], exec")
+    wqm = reference.index("s_wqm_b64 exec, exec")
+    restore = reference.index("s_and_b64 exec, exec, s[50:51]")
+    program = list(reference)
+    program[save] = "s_mov_b32 s14, exec_lo"
+    program[wqm] = "s_wqm_b32 exec_lo, exec_lo"
+    source = directory / "wave32_mask.s"
+    obj = directory / "wave32_mask.o"
+    binary = directory / "wave32_mask.bin"
+    features = "+wavefrontsize32,-wavefrontsize64"
+    for operation in ("s_and_b32 exec_lo, exec_lo, s14", "s_mov_b32 exec_lo, s14"):
+        program[restore] = operation
+        source.write_text("\n".join(program) + "\n", encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", f"-mattr={features}",
+                        "-filetype=obj", source, "-o", obj], check=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+        decoded = disassemble(binary.read_bytes(), library, features=features.encode("ascii"))
+        assert lower(decoded, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=32) == translate(reference)
+        must_reject(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=64), decoded)
 
 
 # LLVM 15 disassembles any raw four-bit compressed-export EN value, but reassembling the printed

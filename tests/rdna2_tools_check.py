@@ -1954,6 +1954,237 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(res["compatibility_category"], "accepted")
         self.assertTrue(res["is_fully_supported"])
 
+    def test_accepted_full_shader_wave32(self):
+        """Wave32 pixel shader accepted by pixel_aot translator and recognized by scanner."""
+        wave32_shader = [
+            "s_mov_b64 s14, exec_lo",
+            "s_wqm_b64 exec_lo, exec_lo",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec_lo, exec_lo, s14",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        res = analyze_shader_instructions("canonical_ps_wave32", wave32_shader)
+        self.assertTrue(res["opcodes_recognized"])
+        self.assertTrue(res["translator_accepted"])
+        self.assertEqual(res["compatibility_category"], "accepted")
+        self.assertTrue(res["is_fully_supported"])
+
+    def test_accepted_full_shader_wave32_direct_restore(self):
+        """Wave32 pixel shader with direct exec_lo restore via s_mov_b64."""
+        wave32_shader = [
+            "s_mov_b64 s14, exec_lo",
+            "s_wqm_b64 exec_lo, exec_lo",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_mov_b64 exec_lo, s14",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        res = analyze_shader_instructions("canonical_ps_wave32_direct", wave32_shader)
+        self.assertTrue(res["opcodes_recognized"])
+        self.assertTrue(res["translator_accepted"])
+        self.assertEqual(res["compatibility_category"], "accepted")
+        self.assertTrue(res["is_fully_supported"])
+
+    def test_accepted_full_shader_wave32_b32_lifecycle(self):
+        """Native Wave32 pixel shader with 32-bit save, WQM and restore operations."""
+        wave32_shader = [
+            "s_mov_b32 s14, exec_lo",
+            "s_wqm_b32 exec_lo, exec_lo",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b32 exec_lo, exec_lo, s14",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        res = analyze_shader_instructions("canonical_ps_wave32_b32", wave32_shader, wave_size=32)
+        self.assertTrue(res["opcodes_recognized"])
+        self.assertTrue(res["translator_accepted"])
+        self.assertEqual(res["compatibility_category"], "accepted")
+        self.assertTrue(res["is_fully_supported"])
+
+        # Low-only lifecycle rejected without validated wave32 profile
+        res_default = analyze_shader_instructions("canonical_ps_wave32_b32", wave32_shader)
+        self.assertFalse(res_default["translator_accepted"])
+        self.assertIn("requires a validated wave32 guest profile", res_default["lower_error"])
+
+        res_w64 = analyze_shader_instructions("canonical_ps_wave32_b32", wave32_shader, wave_size=64)
+        self.assertFalse(res_w64["translator_accepted"])
+        self.assertIn("requires a validated wave32 guest profile", res_w64["lower_error"])
+
+        res_invalid = analyze_shader_instructions("canonical_ps_wave32_b32", wave32_shader, wave_size=16)
+        self.assertFalse(res_invalid["translator_accepted"])
+        self.assertIn("Invalid guest wave size: 16", res_invalid["lower_error"])
+
+    def test_exec_mask_scanner_translator_agreement(self):
+        """Scanner instruction support matches pixel_aot translator acceptance for exec mask ops."""
+        from pixel_aot import lower
+        from pixel_aot_check import assembly
+        from pixel_cb_read import scalar_writes
+
+        base = list(assembly(False))
+        save_idx = base.index("s_mov_b64 s[50:51], exec")
+        wqm_idx = base.index("s_wqm_b64 exec, exec")
+        restore_idx = base.index("s_and_b64 exec, exec, s[50:51]")
+
+        def translator_accepts_save(line):
+            shader = list(base)
+            shader[save_idx] = line
+            wave_size = None
+            if line.startswith("s_mov_b32"):
+                shader[wqm_idx] = "s_wqm_b32 exec_lo, exec_lo"
+                shader[restore_idx] = "s_and_b32 exec_lo, exec_lo, s50"
+                wave_size = 32
+            elif "s50" in line:
+                shader[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+                shader[restore_idx] = "s_and_b64 exec_lo, exec_lo, s50"
+            try:
+                lower(shader, 20, 24, [1, 2, 3, 4], wave_size=wave_size)
+                return True
+            except Exception:
+                return False
+
+        def translator_accepts_restore(line):
+            shader = list(base)
+            wave_size = None
+            if line.startswith(("s_mov_b32", "s_and_b32")):
+                shader[save_idx] = "s_mov_b32 s50, exec_lo"
+                shader[wqm_idx] = "s_wqm_b32 exec_lo, exec_lo"
+                wave_size = 32
+            elif "50" in line or "exec_lo" in line or "s14" in line:
+                shader[save_idx] = "s_mov_b64 s50, exec_lo" if "50" in line else "s_mov_b64 s14, exec_lo"
+                shader[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+            shader[restore_idx] = line
+            try:
+                lower(shader, 20, 24, [1, 2, 3, 4], wave_size=wave_size)
+                return True
+            except Exception:
+                return False
+
+        save_cases = [
+            ("s_mov_b64 s[50:51], exec", True),
+            ("s_mov_b64 s[50:51], exec_lo", True),
+            ("s_mov_b64 s50, exec_lo", True),
+            ("s_mov_b64 s50, exec", True),
+            ("s_mov_b32 s50, exec_lo", True),
+            ("s_mov_b32 s50, exec", True),
+            ("s_mov_b32 s[50:51], exec", False),
+            ("s_mov_b32 s[50:51], exec_lo", False),
+            ("s_mov_b32 s50, exec_hi", False),
+        ]
+
+        restore_cases = [
+            ("s_mov_b64 exec, s[50:51]", True),
+            ("s_mov_b64 exec_lo, s[50:51]", True),
+            ("s_mov_b64 exec, s50", True),
+            ("s_mov_b64 exec_lo, s50", True),
+            ("s_mov_b32 exec, s50", True),
+            ("s_mov_b32 exec_lo, s50", True),
+            ("s_mov_b32 exec, s[50:51]", False),
+            ("s_mov_b32 exec_lo, s[50:51]", False),
+            ("s_and_b64 exec, exec, s[50:51]", True),
+            ("s_and_b64 exec_lo, exec_lo, s[50:51]", True),
+            ("s_and_b64 exec, exec, s50", True),
+            ("s_and_b64 exec_lo, exec_lo, s50", True),
+            ("s_and_b32 exec, exec, s50", True),
+            ("s_and_b32 exec_lo, exec_lo, s50", True),
+            ("s_and_b32 exec, exec, s[50:51]", False),
+            ("s_and_b32 exec_lo, exec_lo, s[50:51]", False),
+            ("s_and_b64 exec, exec, s14", True),
+        ]
+
+        for line, expected in save_cases:
+            self.assertEqual(is_instruction_supported(line), expected, f"scanner mismatch on {line}")
+            self.assertEqual(translator_accepts_save(line), expected, f"translator mismatch on save {line}")
+
+        for line, expected in restore_cases:
+            self.assertEqual(is_instruction_supported(line), expected, f"scanner mismatch on {line}")
+            self.assertEqual(translator_accepts_restore(line), expected, f"translator mismatch on restore {line}")
+
+        self.assertEqual(scalar_writes("s_mov_b64 s50, exec_lo"), range(50, 52))
+        self.assertEqual(scalar_writes("s_mov_b64 s[50:51], exec"), range(50, 52))
+        self.assertEqual(scalar_writes("s_mov_b32 s50, exec_lo"), range(50, 51))
+        self.assertEqual(scalar_writes("s_mov_b64 exec, s[50:51]"), ())
+        self.assertEqual(scalar_writes("s_mov_b32 exec_lo, s50"), ())
+
+        # Mixed-width stream: 64-bit WQM expansion followed by 32-bit low-only restore must be rejected
+        mixed_shader = list(base)
+        mixed_shader[save_idx] = "s_mov_b64 s50, exec_lo"
+        mixed_shader[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+        mixed_shader[restore_idx] = "s_and_b32 exec_lo, exec_lo, s50"
+        with self.assertRaises(ValueError):
+            lower(mixed_shader, 20, 24, [1, 2, 3, 4])
+
+        # Clobbered high SGPR: full-width restore must verify both halves intact
+        clobbered_shader = list(base)
+        clobbered_shader[save_idx] = "s_mov_b64 s50, exec_lo"
+        clobbered_shader[wqm_idx] = "s_wqm_b64 exec_lo, exec_lo"
+        clobbered_shader.insert(restore_idx, "s_mov_b32 s51, 0")
+        clobbered_shader[restore_idx + 1] = "s_mov_b64 exec, s50"
+        with self.assertRaises(ValueError):
+            lower(clobbered_shader, 20, 24, [1, 2, 3, 4])
+
+        # Wave32 32-bit execution mask stream rejected without validated wave32 profile
+        b32_shader = list(base)
+        b32_shader[save_idx] = "s_mov_b32 s50, exec_lo"
+        b32_shader[wqm_idx] = "s_wqm_b32 exec_lo, exec_lo"
+        b32_shader[restore_idx] = "s_and_b32 exec_lo, exec_lo, s50"
+        with self.assertRaises(ValueError):
+            lower(b32_shader, 20, 24, [1, 2, 3, 4])
+        with self.assertRaises(ValueError):
+            lower(b32_shader, 20, 24, [1, 2, 3, 4], wave_size=64)
+        with self.assertRaises(ValueError):
+            lower(b32_shader, 20, 24, [1, 2, 3, 4], wave_size=16)
+        with self.assertRaises(ValueError):
+            lower(b32_shader, 20, 24, [1, 2, 3, 4], wave_size="wave32")
+        with self.assertRaises(TypeError):
+            lower(b32_shader, 20, 24, [1, 2, 3, 4], wave_profile="wave32")
+        self.assertIsNotNone(lower(b32_shader, 20, 24, [1, 2, 3, 4], wave_size=32))
+
     def test_rounding_instructions_accepted(self):
         """v_ceil_f32 and v_rndne_f32 are known RDNA 2 opcodes that pixel_aot lowers."""
         canonical = [

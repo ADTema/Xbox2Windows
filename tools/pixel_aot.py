@@ -1785,7 +1785,7 @@ class VectorRegisters(dict):
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
-          title_ranges=None, flat_global_only=False, return_write_mask=False):
+          title_ranges=None, flat_global_only=False, return_write_mask=False, wave_size=None):
     """Track descriptor provenance, interpolation and packed or uncompressed exports.
 
     texture_offset is the aligned byte offset of t0 in the texture descriptor table.
@@ -1797,6 +1797,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     requires every flat address to be global and excludes the scratch and LDS apertures.
     return_write_mask returns (source, RT0 mask). For partial compressed exports the caller
     must supply normalized whole-pair instructions and apply the returned mask in the PSO.
+    wave_size names the guest execution width (32 or 64). Low-only execution mask operations
+    (s_mov_b32 save of exec_lo, s_wqm_b32, and s_and_b32/s_mov_b32 restore) require a validated
+    guest wave32 profile (wave_size=32); native Scarlett/GFX10 wave64 operations remain independent
+    of guest profile declarations.
     """
     if title_ranges is not None and (isinstance(title_ranges, bool) or not isinstance(title_ranges, int)
                                      or not 1 <= title_ranges <= 0xffffffff):
@@ -1811,6 +1815,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Texture offset requires a sampler")
     if texcoord_components not in (2, 4):
         raise ValueError("Expected two or four TEXCOORD components")
+    if wave_size is not None and (not isinstance(wave_size, int) or wave_size not in (32, 64)):
+        raise ValueError(f"Invalid guest wave size: {wave_size}")
+    guest_wave32 = wave_size == 32
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
     vector = VectorRegisters({"v0": "bary_i", "v1": "bary_j"})
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
@@ -1853,6 +1860,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     helpers = set()
     half_rounding = HALF_ROUNDING["0"]
     mask = "entry"
+    wqm_width = None
     samples = 0
     sample_kind = None  # "plain" or "comparison": both would need s0
     vector_loads = 0  # image samples and title loads issued, in vmcnt order
@@ -1976,20 +1984,91 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                         raise ValueError(f"Unsupported s_waitcnt token: {token}")
                 if not (has_vm or has_lgkm or has_exp):
                     raise ValueError(f"Empty or unsupported s_waitcnt: {line}")
-        elif m := match(r"s_mov_b64 s\[(\d+):(\d+)\], exec"):
-            regs = registers(*m.groups(), 2)
-            for n in regs:
-                if f"s{n}" in pending:
+        elif m := match(r"s_mov_b64 (s\[\d+:\d+\]), (?:exec|exec_lo)"):
+            lo, hi = sgpr_pair(m.group(1))
+            if lo in pending or hi in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            scalar[lo] = (mask, 0)
+            scalar[hi] = (mask, 1)
+        elif m := match(r"(s_mov_b64|s_mov_b32) (s\d+), (?:exec|exec_lo)"):
+            op, reg = m.groups()
+            if reg in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            if op == "s_mov_b64":
+                n = int(reg[1:])
+                if n % 2 != 0 or n + 1 > 105:
+                    raise ValueError(f"Invalid 64-bit scalar register pair: {reg}")
+                if f"s{n+1}" in pending:
                     raise ValueError("Write overlaps an outstanding scalar load")
-                scalar[f"s{n}"] = (mask, n-regs.start)
-        elif line == "s_wqm_b64 exec, exec" and mask == "entry":
+                scalar[reg] = (mask, 0)
+                scalar[f"s{n+1}"] = (mask, 1)
+            else:
+                if not guest_wave32:
+                    raise ValueError("32-bit execution mask save requires a validated wave32 guest profile")
+                scalar[sgpr_name(reg)] = (mask, "w32")
+        elif (line in ("s_wqm_b64 exec, exec", "s_wqm_b64 exec_lo, exec_lo")
+              and mask == "entry"):
             mask = "quad"
+            wqm_width = 64
             scc = None
-        elif m := match(r"s_and_b64 exec, exec, s\[(\d+):(\d+)\]"):
-            pair = registers(*m.groups(), 2)
-            if mask != "quad" or [scalar.get(f"s{n}") for n in pair] != [("entry",0),("entry",1)]:
+        elif (line in ("s_wqm_b32 exec_lo, exec_lo", "s_wqm_b32 exec, exec")
+              and mask == "entry"):
+            if not guest_wave32:
+                raise ValueError("32-bit whole-quad mask requires a validated wave32 guest profile")
+            mask = "quad"
+            wqm_width = 32
+            scc = None
+        elif m := match(r"s_and_b64 (?:exec|exec_lo), (?:exec|exec_lo), (s\[\d+:\d+\])"):
+            lo, hi = sgpr_pair(m.group(1))
+            if mask != "quad" or wqm_width != 64 or [scalar.get(lo), scalar.get(hi)] != [("entry", 0), ("entry", 1)]:
                 raise ValueError("Unsupported execution mask")
             mask = "entry"
+            wqm_width = None
+            scc = None
+        elif m := match(r"s_and_b64 (?:exec|exec_lo), (?:exec|exec_lo), (s\d+)"):
+            reg = m.group(1)
+            n = int(reg[1:])
+            if n % 2 != 0 or n + 1 > 105:
+                raise ValueError(f"Invalid 64-bit scalar register pair: {reg}")
+            if mask != "quad" or wqm_width != 64 or [scalar.get(reg), scalar.get(f"s{n+1}")] != [("entry", 0), ("entry", 1)]:
+                raise ValueError("Unsupported execution mask")
+            mask = "entry"
+            wqm_width = None
+            scc = None
+        elif m := match(r"s_and_b32 (?:exec|exec_lo), (?:exec|exec_lo), (s\d+)"):
+            if not guest_wave32:
+                raise ValueError("32-bit execution mask restore requires a validated wave32 guest profile")
+            reg = m.group(1)
+            if mask != "quad" or wqm_width != 32 or scalar.get(reg) != ("entry", "w32"):
+                raise ValueError("Unsupported execution mask")
+            mask = "entry"
+            wqm_width = None
+            scc = None
+        elif m := match(r"s_mov_b64 (?:exec|exec_lo), (s\[\d+:\d+\])"):
+            lo, hi = sgpr_pair(m.group(1))
+            if mask != "quad" or wqm_width != 64 or [scalar.get(lo), scalar.get(hi)] != [("entry", 0), ("entry", 1)]:
+                raise ValueError("Unsupported execution mask")
+            mask = "entry"
+            wqm_width = None
+            scc = None
+        elif m := match(r"s_mov_b64 (?:exec|exec_lo), (s\d+)"):
+            reg = m.group(1)
+            n = int(reg[1:])
+            if n % 2 != 0 or n + 1 > 105:
+                raise ValueError(f"Invalid 64-bit scalar register pair: {reg}")
+            if mask != "quad" or wqm_width != 64 or [scalar.get(reg), scalar.get(f"s{n+1}")] != [("entry", 0), ("entry", 1)]:
+                raise ValueError("Unsupported execution mask")
+            mask = "entry"
+            wqm_width = None
+            scc = None
+        elif m := match(r"s_mov_b32 (?:exec|exec_lo), (s\d+)"):
+            if not guest_wave32:
+                raise ValueError("32-bit execution mask restore requires a validated wave32 guest profile")
+            reg = m.group(1)
+            if mask != "quad" or wqm_width != 32 or scalar.get(reg) != ("entry", "w32"):
+                raise ValueError("Unsupported execution mask")
+            mask = "entry"
+            wqm_width = None
             scc = None
         elif m := match(r"s_(cmov|not|brev)_b64 (s\[\d+:\d+\]), ([^,]+)"):
             op, dst, src = m.groups()
