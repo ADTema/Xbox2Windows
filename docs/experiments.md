@@ -2249,7 +2249,9 @@ At offset 0, `ds_rsub_u32` stores the source VGPR minus the old word modulo
 2^32. `ds_min_i32` and `ds_max_i32` compare the operands as signed 32-bit
 integers. `ds_min_u32` and `ds_max_u32` compare them as unsigned integers.
 Each comparison stores the selected operand's 32-bit pattern in the private
-LDS word. These five forms have no destination VGPR.
+LDS word. Their returning forms `ds_rsub_rtn_u32`, `ds_min_rtn_i32`,
+`ds_max_rtn_i32`, `ds_min_rtn_u32` and `ds_max_rtn_u32` also write the
+pre-update word to the destination VGPR.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The source-built wave32 fixture reads the full word and both halves after
@@ -2283,7 +2285,10 @@ The reverse subtract and min/max fixtures read the initialized word and the
 results of two consecutive updates. Operands cross the sign bit and wrap to
 zero at different lanes. All 320 UAV words are compared for dispatches of one
 and three groups. Swapping the subtraction operands or changing a comparison's
-signedness must mismatch at word 1.
+signedness must mismatch at word 1. The returning fixtures exercise both
+destination aliases and compare both old words and the final LDS word.
+Returning the updated word or omitting a write must also cause a mismatch
+at the first lane affected by each mutation.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check

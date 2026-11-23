@@ -1249,21 +1249,27 @@ LDS_RETURN_UPDATES = {
     "ds_and_rtn_b32": "ds_and_b32",
     "ds_or_rtn_b32": "ds_or_b32",
     "ds_xor_rtn_b32": "ds_xor_b32",
+    "ds_rsub_rtn_u32": "ds_rsub_u32",
+    "ds_min_rtn_i32": "ds_min_i32",
+    "ds_max_rtn_i32": "ds_max_i32",
+    "ds_min_rtn_u32": "ds_min_u32",
+    "ds_max_rtn_u32": "ds_max_u32",
 }
 
 
 def lds_return_update_program(op):
+    (init_scale, init_base), (first_scale, first_base), (second_scale, second_base) = lds_update_inputs(LDS_RETURN_UPDATES[op])
     return DS_PREFIX + [
         "v_lshlrev_b32_e32 v5, 2, v0",
         "v_lshlrev_b32_e32 v11, 2, v0",
-        "v_mad_u32_u24 v6, 1, v8, 0xfffffff0",
+        f"v_mad_u32_u24 v6, {init_scale}, v8, 0x{init_base:08x}",
         "ds_write_b32 v5, v6",
         "s_waitcnt lgkmcnt(0)",
         # First alias the data VGPR, then alias a copy of the address VGPR.
-        "v_mad_u32_u24 v10, 1, v8, 0x40000021",
+        f"v_mad_u32_u24 v10, {first_scale}, v8, 0x{first_base:08x}",
         f"{op} v10, v5, v10",
         "s_waitcnt lgkmcnt(0)",
-        "v_mad_u32_u24 v9, 1, v8, 0x80000003",
+        f"v_mad_u32_u24 v9, {second_scale}, v8, 0x{second_base:08x}",
         f"{op} v11, v11, v9",
         "s_waitcnt lgkmcnt(0)",
         "ds_read_b32 v12, v5",
@@ -1442,7 +1448,7 @@ def lds_controls():
         ("ds_add_u32 v5, v254", "Unverified private LDS update"),
         ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
         ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
-        ("ds_rsub_rtn_u32 v10, v5, v6", "Unsupported compute instruction"),
+        ("ds_inc_rtn_u32 v10, v5, v6", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
     i = lines.index(update)
@@ -1481,12 +1487,14 @@ def lds_controls():
             lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
-    for op in LDS_ORDER_MUTANTS:
-        lines = lds_update_program(op)
-        update = f"{op} v5, v6"
-        prefix, suffix = op.rsplit("_", 1)
-        for bad in (update + " offset:4", update + " gds", f"{prefix}_rtn_{suffix} v11, v5, v6"):
-            rejects("Unsupported compute instruction", aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
+    for ret, op in LDS_RETURN_UPDATES.items():
+        if op not in LDS_ORDER_MUTANTS:
+            continue
+        for lines, update in ((lds_update_program(op), f"{op} v5, v6"),
+                              (lds_return_update_program(ret), f"{ret} v10, v5, v10")):
+            for modifier in ("offset:4", "gds"):
+                rejects("Unsupported compute instruction", aot.lower,
+                        variant(lines, (update, f"{update} {modifier}")), 32, **LDS_BINDING)
 
 
 def ds_binary(directory, assembler, objcopy, library):
@@ -1522,9 +1530,17 @@ def ds_mutants(name, lines, binding, source):
         op = LDS_RETURN_UPDATES[name]
         return_new = f"{op} v5, v10\ns_waitcnt lgkmcnt(0)\nds_read_b32 v10, v5"
         changed = variant(lines, (f"{name} v10, v5, v10", return_new))
-        yield aot.lower(changed, 32, **binding), 0
+        words = lds_update_reference(op, 3)
+        # At some lanes a min/max update keeps the old value. Find the first changed lane.
+        first = next(i for i in range(0, len(words), 3) if words[i] != words[i + 1])
+        yield aot.lower(changed, 32, **binding), first
         changed = variant(lines, (f"{name} v11, v11, v9", "ds_read_b32 v11, v11"))
-        yield aot.lower(changed, 32, **binding), 2
+        second = next(i for i in range(2, len(words), 3) if words[i - 1] != words[i])
+        yield aot.lower(changed, 32, **binding), second
+        if op in LDS_ORDER_MUTANTS:
+            wrong_op = next(ret for ret, base in LDS_RETURN_UPDATES.items() if base == LDS_ORDER_MUTANTS[op])
+            changed = variant(lines, (f"{name} v10, v5, v10", f"{wrong_op} v10, v5, v10"))
+            yield aot.lower(changed, 32, **binding), 1
     elif name in LDS_SUBWORDS:
         width, offset = LDS_SUBWORDS[name]
         suffix = f" offset:{offset}" if offset else ""
