@@ -88,6 +88,7 @@ API void release(Record* record) {
 }
 
 API void completed(unsigned count) {
+    finish_archive_textures();
     std::fprintf(stderr, "completed %u\n", count);
     std::fflush(stdout);
     std::fflush(stderr);

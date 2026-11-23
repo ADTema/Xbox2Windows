@@ -718,7 +718,6 @@ READ_COMPUTE = [
     ".LBB0_2:",
     "s_endpgm",
 ]
-ALU_CASES = [("read_compute", READ_COMPUTE, 32, READ_BINDING)]
 ALU_WORD = ("min(params[0].y, ((((0x0000ffffu & {0}) & 0xffffffu) * (({0} >> (0x00000010u & 31u)) & 0xffffffu))"
             " + tid.x))").format(READ_LOADS["read_copy"])
 
@@ -730,6 +729,19 @@ def variant(lines, *changes):
         lines = [part for line in lines for part in ((line.replace(old, new).split("\n") if new else [])
                                                      if old in line else [line])]
     return lines
+
+
+# Leave a different bit above bit 23 set in each multiplicand. The ordinary
+# codegen fixture above limits both inputs to 16 bits.
+READ_MAD24 = variant(
+    READ_COMPUTE,
+    ("v_and_b32_e32 v2, 0xffff, v1", "v_and_b32_e32 v2, 0x1ffffff, v1"),
+    ("v_lshrrev_b32_e32 v1, 16, v1", "v_and_b32_e32 v1, 0x2ffffff, v1"),
+)
+ALU_CASES = [
+    ("read_compute", READ_COMPUTE, 32, READ_BINDING),
+    ("read_mad24", READ_MAD24, 32, READ_BINDING),
+]
 
 
 def guard_controls():
@@ -1172,24 +1184,44 @@ LDS_PROGRAM = DS_PREFIX + [
     "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
     "s_endpgm",
 ]
+LDS_SUBWORDS = {f"subword_{width}_{offset}": (width, offset)
+                for width, offsets in ((8, range(4)), (16, (0, 2))) for offset in offsets}
 
-LDS_SIGNED_PROGRAM = DS_PREFIX + [
-    "v_lshlrev_b32_e32 v5, 2, v0",
-    "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
-    "ds_write_b32 v5, v6",
-    "s_waitcnt lgkmcnt(0)",
-    "v_mov_b32_e32 v6, 0",
-    "ds_read_i16 v10, v5",
-    "s_waitcnt lgkmcnt(0)",
-    "ds_read_i16 v11, v5 offset:2",
-    "s_waitcnt lgkmcnt(0)",
-    "ds_read_i8 v12, v5 offset:3",
-    "s_waitcnt lgkmcnt(0)",
-    "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
-    "s_endpgm",
-]
 
-LDS_SUBWRITE_PROGRAM = DS_PREFIX + [
+def lds_subword_program(width, offset):
+    suffix = f" offset:{offset}" if offset else ""
+    base = 0x12340070 if width == 8 else 0x12347ff0
+    neighbor = "" if offset else " offset:3"
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mov_b32_e32 v6, 0x89abcdef",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        # A second partial write must preserve this change as well as untouched bytes.
+        "v_mov_b32_e32 v9, 0x42",
+        f"ds_write_b8 v5, v9{neighbor}",
+        "s_waitcnt lgkmcnt(0)",
+        f"v_mad_u32_u24 v6, 1, v8, 0x{base:08x}",
+        f"ds_write_b{width} v5, v6{suffix}",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 0",
+        "ds_read_b32 v10, v5",
+        "s_waitcnt lgkmcnt(0)",
+        f"ds_read_u{width} v11, v5{suffix}",
+        "s_waitcnt lgkmcnt(0)",
+        f"ds_read_i{width} v12, v5{suffix}",
+        "s_waitcnt lgkmcnt(0)",
+        # Reading captures the value before this overwrite, even though export comes later.
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+# Capture the same byte before and after a halfword write, then overwrite
+# that byte alone and read the complete word.
+LDS_OVERLAP_PROGRAM = DS_PREFIX + [
     "v_lshlrev_b32_e32 v5, 2, v0",
     "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
     "ds_write_b32 v5, v6",
@@ -1199,71 +1231,100 @@ LDS_SUBWRITE_PROGRAM = DS_PREFIX + [
     "v_mov_b32_e32 v7, 0x1234",
     "ds_write_b16 v5, v7",
     "s_waitcnt lgkmcnt(0)",
+    "ds_read_u8 v11, v5 offset:1",
+    "s_waitcnt lgkmcnt(0)",
     "v_mov_b32_e32 v7, 0x5a",
-    "ds_write_b8 v5, v7 offset:3",
+    "ds_write_b8 v5, v7 offset:1",
     "s_waitcnt lgkmcnt(0)",
-    "ds_read_b32 v11, v5",
-    "s_waitcnt lgkmcnt(0)",
-    "ds_read_u8 v12, v5 offset:3",
+    "ds_read_b32 v12, v5",
     "s_waitcnt lgkmcnt(0)",
     "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
     "s_endpgm",
 ]
 
-LDS_CASES = [
-    ("private", LDS_PROGRAM, LDS_BINDING),
-    ("lds_signed", LDS_SIGNED_PROGRAM, LDS_BINDING),
-    ("lds_subwrite", LDS_SUBWRITE_PROGRAM, LDS_BINDING),
+
+LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING),
+             ("lds_overlap", LDS_OVERLAP_PROGRAM, LDS_BINDING)] + [
+    (name, lds_subword_program(*layout), LDS_BINDING) for name, layout in LDS_SUBWORDS.items()
 ]
 
 
-def lds_reference(groups, name="private"):
+def lds_subword_reference(width, offset, groups):
+    expected = []
+    size = width // 8
+    for lane in range(groups * 32):
+        value = (0x70 if width == 8 else 0x7ff0) + lane
+        data = value.to_bytes(size, "little")
+        word = bytearray.fromhex("ef cd ab 89")
+        word[0 if offset else 3] = 0x42
+        word[offset:offset + size] = data
+        expected.extend((int.from_bytes(word, "little"), value,
+                         int.from_bytes(data, "little", signed=True) & 0xffffffff))
+    return expected
+
+
+def lds_overlap_reference(groups):
+    words = []
+    for lane in range(groups * 32):
+        data = bytearray((0x89abfff0 + lane).to_bytes(4, "little"))
+        pre = data[1]
+        data[0:2] = b"\x34\x12"
+        middle = data[1]
+        data[1] = 0x5a
+        words.extend((pre, middle, int.from_bytes(data, "little")))
+    return words
+
+
+def lds_reference(groups):
     words = []
     for lane in range(groups * 32):
         word = 0x89abfff0 + lane
-        if name == "private":
-            words.extend((word, word & 0xffff, word >> 16))
-        elif name == "lds_signed":
-            i16_lo = (word & 0xffff) if (word & 0x8000) == 0 else (word & 0xffff) | 0xffff0000
-            i16_hi = (word >> 16) if (word & 0x80000000) == 0 else (word >> 16) | 0xffff0000
-            i8_hi = (word >> 24) if (word & 0x80000000) == 0 else (word >> 24) | 0xffffff00
-            words.extend((i16_lo, i16_hi, i8_hi))
-        elif name == "lds_subwrite":
-            u8_b1 = (word >> 8) & 0xff
-            updated = (word & 0xffff0000) | 0x1234
-            updated = (updated & 0x00ffffff) | (0x5a << 24)
-            u8_b3 = 0x5a
-            words.extend((u8_b1, updated, u8_b3))
+        words.extend((word, word & 0xffff, word >> 16))
     return words
 
 
 def lds_controls():
     lines = LDS_PROGRAM
     assert " >> 16u) & 0xffffu)" in aot.lower(lines, 32, **LDS_BINDING)
-    assert "asuint(asint(" in aot.lower(LDS_SIGNED_PROGRAM, 32, **LDS_BINDING)
-    assert " & ~0xffffu)" in aot.lower(LDS_SUBWRITE_PROGRAM, 32, **LDS_BINDING)
     for old, new, message in (
         ("ds_write_b32 v5, v6", "s_nop 0", "Unverified private LDS read"),
         ("ds_write_b32 v5, v6", "ds_write_b32 v8, v6", "Unverified private LDS write"),
-        ("ds_read_b32 v10, v5", "ds_read_b32 v10, v5 offset:2", "Unverified private LDS read offset"),
-        ("ds_read_u16 v12, v5 offset:2", "ds_read_u16 v12, v5 offset:1", "Unverified private LDS read offset"),
-        ("ds_read_u16 v12, v5 offset:2", "ds_read_i16 v12, v5 offset:1", "Unverified private LDS read offset"),
-        ("ds_read_u16 v12, v5 offset:2", "ds_read_u8 v12, v5 offset:4", "Unverified private LDS read offset"),
-        ("ds_read_u16 v12, v5 offset:2", "ds_read_i8 v12, v5 offset:4", "Unverified private LDS read offset"),
-        ("ds_write_b32 v5, v6", "ds_write_b16 v5, v6 offset:1", "Unverified private LDS write"),
-        ("ds_write_b32 v5, v6", "ds_write_b8 v5, v6 offset:4", "Unverified private LDS write"),
+        ("ds_read_b32 v10, v5", "ds_read_b32 v10, v5 offset:2", "Unverified private LDS read"),
+        ("ds_read_u16 v12, v5 offset:2", "ds_read_u16 v12, v5 offset:1", "Unverified private LDS read"),
     ):
         rejects(message, aot.lower, variant(lines, (old, new)), 32, **LDS_BINDING)
-    rejects("Unverified private LDS write", aot.lower,
-            ["v_lshlrev_b32_e32 v5, 2, v0", "ds_write_b16 v5, v6", "s_waitcnt lgkmcnt(0)", "s_endpgm"], 32, **LDS_BINDING)
-    rejects("Unverified private LDS write", aot.lower,
-            ["v_lshlrev_b32_e32 v5, 2, v0", "ds_write_b8 v5, v6", "s_waitcnt lgkmcnt(0)", "s_endpgm"], 32, **LDS_BINDING)
     i = lines.index("ds_write_b32 v5, v6")
     masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
     rejects("Unverified private LDS write", aot.lower, masked, 32, **LDS_BINDING)
     rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
             lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
     rejects("Unverified dispatch byte offset", aot.lower, lines, 32, **(LDS_BINDING | {"lds_bytes": 127}))
+
+
+    lines = lds_subword_program(16, 2)
+    write = "ds_write_b16 v5, v6 offset:2"
+    read = "ds_read_i16 v12, v5 offset:2"
+    for old, new, message in (
+        ("ds_write_b32 v5, v6", "s_nop 0", "Unverified private LDS write"),
+        (write, "ds_write_b16 v5, v6 offset:1", "Unverified private LDS write"),
+        (write, "ds_write_b16 v5, v6 offset:3", "Unverified private LDS write"),
+        (write, "ds_write_b16 v5, v6 offset:2 gds", "Unsupported compute instruction"),
+        (write, "ds_write_b8 v5, v6 offset:4", "Unsupported compute instruction"),
+        (read, "ds_read_i16 v12, v5 offset:1", "Unverified private LDS read"),
+        (read, "ds_read_i16 v12, v8 offset:2", "Unverified private LDS read"),
+        (read, "ds_read_i8 v12, v5 offset:4", "Unsupported compute instruction"),
+        (read, "ds_read_u8 v12, v5 offset:2 gds", "Unsupported compute instruction"),
+    ):
+        # Only omit the first full-word write in the initialization control.
+        mutated = lines.copy()
+        mutated[mutated.index(old)] = new
+        rejects(message, aot.lower, mutated, 32, **LDS_BINDING)
+    i = lines.index(write)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+    pair = ["ds_write_b8 v5, v6", "s_waitcnt lgkmcnt(0)"]
+    rejects("LDS expression exceeds the profile limit", aot.lower,
+            lines[:i] + pair * 32 + lines[i:], 32, **LDS_BINDING)
 
 
 def ds_binary(directory, assembler, objcopy, library):
@@ -1288,6 +1349,27 @@ def ds_binary(directory, assembler, objcopy, library):
         assert output.read_text() == expected
 
 
+def ds_mutants(name, lines, binding, source):
+    if name in LDS_SUBWORDS:
+        width, offset = LDS_SUBWORDS[name]
+        suffix = f" offset:{offset}" if offset else ""
+        changed = variant(lines, (f"ds_write_b{width} v5, v6{suffix}", "ds_write_b32 v5, v6"))
+        yield aot.lower(changed, 32, **binding), 0
+        changed = variant(lines, (f"ds_read_i{width} v12, v5{suffix}", f"ds_read_u{width} v12, v5{suffix}"))
+        # Lane 16 is the first to set the sign bit. The signed read is its third word.
+        yield aot.lower(changed, 32, **binding), 16 * 3 + 2
+    elif name == "lds_overlap":
+        no_halfword = variant(lines, ("ds_write_b16 v5, v7", "s_nop 0"))
+        yield aot.lower(no_halfword, 32, **binding), 1
+        no_byte = variant(lines, ("ds_write_b8 v5, v7 offset:1", "s_nop 0"))
+        yield aot.lower(no_byte, 32, **binding), 2
+    elif name == "private":
+        yield source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)"), 2
+    else:
+        bias = 5 if name == "ds_bpermute_b32" else 27
+        yield source.replace(f"local.x + {bias}u", f"local.x + {32 - bias}u"), 0
+
+
 def ds_draw(directory, compiler, renderer, backend, *, private=False):
     if private:
         lds_controls()
@@ -1302,32 +1384,27 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
         for groups in (1, 3):
-            words = lds_reference(groups, name=name) if private else ds_reference(name, groups)
+            if name in LDS_SUBWORDS:
+                words = lds_subword_reference(*LDS_SUBWORDS[name], groups)
+            elif name == "lds_overlap":
+                words = lds_overlap_reference(groups)
+            elif private:
+                words = lds_reference(groups)
+            else:
+                words = ds_reference(name, groups)
             words += [SENTINEL] * (320 - len(words))
             case.write_bytes(struct.pack("<321I", groups, *words))
             execution = subprocess.run(run)
             if execution.returncode:
                 return execution.returncode
-        if name == "private":
-            mutated = source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)")
-            mismatched_word = 2
-        elif name == "lds_signed":
-            mutated = source.replace(">> 16)", ">> 0)")
-            mismatched_word = 0
-        elif name == "lds_subwrite":
-            mutated = source.replace("0x00001234u", "0x00004321u")
-            mismatched_word = 1
-        else:
-            bias = 5 if name == "ds_bpermute_b32" else 27
-            mutated = source.replace(f"local.x + {bias}u", f"local.x + {32 - bias}u")
-            mismatched_word = 0
-        assert mutated != source
-        src.write_text(mutated, encoding="ascii")
-        subprocess.run(compile, check=True)
-        bad = subprocess.run(run, capture_output=True, text=True)
-        if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
-            raise AssertionError(f"{name}: DS mutation escaped detection\n{bad.stderr}")
-        print(bad.stderr, end="")
+        for mutated, mismatched_word in ds_mutants(name, lines, binding, source):
+            assert mutated != source
+            src.write_text(mutated, encoding="ascii")
+            subprocess.run(compile, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
+                raise AssertionError(f"{name}: DS mutation escaped detection\n{bad.stderr}")
+            print(bad.stderr, end="")
         accepted.update(line.split()[0] for line in lines)
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
         path = Path(record)
@@ -1669,12 +1746,48 @@ def draw_alu(directory, compiler, cmd, case, name):
     return 0
 
 
+def draw_mad24(directory, compiler, cmd, case):
+    # Dispatch one group, enable only lane zero and leave all 319 other words
+    # at their sentinel. With cap = UINT_MAX the entire multiply is observable.
+    word = source_word(0)
+    low = word % (1 << 24)
+    assert word & (3 << 24) == 3 << 24 and low & 1
+    expected = (low * low) % (1 << 32)
+    values = [expected] + [SENTINEL] * 319
+    case.write_bytes(struct.pack("<337I", 1, *values, 1, 0xffffffff, *([0] * 14)))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    src, cso = directory / "mad24-mutant.hlsl", directory / "mad24-mutant.cso"
+    for removed_bit in (24, 25):
+        # Remove the lowerer's u24 truncation from exactly one source.
+        prepared = f"(0x{((1 << removed_bit) | 0xffffff):08x}u & {READ_LOADS['read_copy']})"
+        truncated = f"({prepared} & 0xffffffu)"
+        assert source.count(truncated) == 1
+        src.write_text(source.replace(truncated, prepared), encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        actual = (low * (low + (1 << removed_bit))) % (1 << 32)
+        mismatch = f"word=0 expected={expected:08x} actual={actual:08x}"
+        if bad.returncode != 1 or mismatch not in bad.stderr:
+            raise AssertionError(f"MAD24 bit {removed_bit} mutation escaped detection\n{bad.stderr}")
+        print(mismatch)
+    return 0
+
+
 def draw(directory, compiler, renderer, backend, cases=None):
     for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
+        if name == "read_mad24":
+            result = draw_mad24(directory, compiler, cmd, case)
+            if result:
+                return result
+            continue
         if name.startswith(("guard_", "read_")):
             result = (draw_guard if name.startswith("guard_") else draw_alu if name == "read_compute"
                       else draw_read)(directory, compiler, cmd, case, name)
