@@ -2062,6 +2062,33 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 
 Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`.
 
+### Bounded gfx1030 DS lane routing
+
+The `gfx1030` compute profile lowers `ds_bpermute_b32` (gather) and
+`ds_permute_b32` (scatter) for a full wave32 in a 32×1×1 group. It requires
+a proven `((local_x + bias) & 31) << 2` byte address, zero DS offset and
+an immediate `s_waitcnt lgkmcnt(0)`. The bijective address
+proves a single writer per destination for scatter. HLSL stages words in
+thread-group shared memory and synchronizes the group. The gather reads the
+forward rotation and the scatter reads its inverse. This uses group-thread
+IDs for routing, so the desktop adapter's wave width is irrelevant.
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+Source-built gfx1030 wave32 fixtures exercise both directions, wraparound,
+and address/destination aliasing. They read 320 UAV words after dispatches of
+one and three groups. Reversing the expected routing in HLSL must mismatch at
+word 0 (5 vs. 27 for gather and 27 vs. 5 for scatter).
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_ds_route_(warp|hardware)$' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+
 An optional `--constant-descriptor BYTE_OFFSET` binds a second table entry to
 b0. It must be distinct from the 16-byte u0 descriptor. The translator accepts
 aligned immediate `s_buffer_load_dword`, `s_buffer_load_dwordx2`, and

@@ -1,5 +1,6 @@
 """Check the single-store compute profile with original synthetic kernels."""
 from pathlib import Path
+import os
 import struct
 import subprocess
 import sys
@@ -1110,7 +1111,110 @@ def store_container(code, dims):
     return bytes(blob)
 
 
+
+DS_BINDING = dict(table_reg=7, descriptor_offset=0x30, group_reg=11, stride=4, cpu="gfx1030")
+DS_FEATURES = "+wavefrontsize32,-wavefrontsize64"
+DS_PREFIX = INDEXED[:4] + ["s_waitcnt lgkmcnt(0)"]
+DS_OPS = ("ds_bpermute_b32", "ds_permute_b32")
+
+
+def ds_program(op, bias):
+    return DS_PREFIX + [
+        f"v_add_nc_u32_e32 v5, {bias}, v0",
+        "v_and_b32_e32 v5, 31, v5",
+        "v_lshlrev_b32_e32 v5, 2, v5",
+        # Alias the byte address to prove that the result can replace its input.
+        f"{op} v5, v5, v8",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dword v5, v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+DS_CASES = [(op, ds_program(op, 5)) for op in DS_OPS]
+
+
+def ds_reference(op, groups):
+    bias = 5 if op == "ds_bpermute_b32" else -5
+    return [lane // 32 * 32 + ((lane % 32 + bias) % 32) for lane in range(groups * 32)]
+
+
+def ds_controls():
+    for op, lines in DS_CASES:
+        expected_bias = 5 if op == "ds_bpermute_b32" else 27
+        assert f"[(local.x + {expected_bias}u) & 31u]" in aot.lower(lines, 32, **DS_BINDING)
+        valid = f"{op} v5, v5, v8"
+        for operands in ("v5, v8, v8", "v5, v5, v255"):
+            rejects("Unverified DS lane routing", aot.lower, variant(lines, (valid, f"{op} {operands}")),
+                    32, **DS_BINDING)
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(lines, (valid, valid + " offset:4")), 32, **DS_BINDING)
+        i = lines.index(valid)
+        masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+        rejects("Unverified DS lane routing", aot.lower, masked, 32, **DS_BINDING)
+        rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+                lines[:i + 1] + lines[i + 2:], 32, **DS_BINDING)
+
+
+def ds_binary(directory, assembler, objcopy, library):
+    for name, lines in DS_CASES:
+        src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
+        src.write_text("\n".join(lines) + "\n", encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1030", f"-mattr={DS_FEATURES}",
+                        "-filetype=obj", src, "-o", obj], check=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+        code = raw.read_bytes()
+        decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=b"gfx1030",
+                                          features=DS_FEATURES.encode()))
+        assert [line for line in decoded if line.startswith("ds_")] == [
+            line for line in lines if line.startswith("ds_")]
+        expected = aot.lower(lines, 32, **DS_BINDING)
+        assert aot.lower(decoded, 32, **DS_BINDING) == expected
+        container, output = directory / "ds.dxbc", directory / "ds-cli.hlsl"
+        container.write_bytes(store_container(code, (32, 1, 1)))
+        options = [item for key, value in DS_BINDING.items() for item in ("--" + key.replace("_", "-"), str(value))]
+        subprocess.run([sys.executable, "-B", aot.__file__, container, "--output", output,
+                        "--llvm", library, *options], check=True)
+        assert output.read_text() == expected
+
+
+def ds_draw(directory, compiler, renderer, backend):
+    ds_controls()
+    accepted = set()
+    for name, lines in DS_CASES:
+        source = aot.lower(lines, 32, **DS_BINDING)
+        src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        src.write_text(source, encoding="ascii")
+        compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        subprocess.run(compile, check=True)
+        run = [renderer, backend, "--compute-store-case", cso, case]
+        for groups in (1, 3):
+            words = ds_reference(name, groups)
+            words += [SENTINEL] * (320 - len(words))
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            execution = subprocess.run(run)
+            if execution.returncode:
+                return execution.returncode
+        bias = 5 if name == "ds_bpermute_b32" else 27
+        mutated = source.replace(f"local.x + {bias}u", f"local.x + {32 - bias}u")
+        assert mutated != source
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run(compile, check=True)
+        bad = subprocess.run(run, capture_output=True, text=True)
+        if bad.returncode != 1 or "word=0 expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: DS mutation escaped detection\n{bad.stderr}")
+        print(bad.stderr, end="")
+        accepted.update(line.split()[0] for line in lines)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in sorted(accepted)), encoding="utf-8")
+    return 0
+
+
 def binary(directory, assembler, objcopy, library):
+    ds_controls()
+    ds_binary(directory, assembler, objcopy, library)
     two_exits(directory, assembler, objcopy, library)
     for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
@@ -1499,5 +1603,6 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
+                 "draw-ds-route": ds_draw,
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))
