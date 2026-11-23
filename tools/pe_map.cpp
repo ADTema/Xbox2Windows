@@ -657,7 +657,8 @@ std::vector<Mapped*>& mapped_images() {
 // Notify a mapped image, re-reading its callback list as Windows does; if the list was
 // overwritten or made unreadable, the entry point is still notified. An EXE is notified only after
 // pe_map_run started it (`started`), and only its TLS callbacks receive thread attach and detach, as
-// under a Windows launch where the EXE's entry point is the program and is never called again.
+// under a Windows launch where the EXE's entry point is the program and is never called again. An EXE
+// never receives process detach here, so its release (finalize) calls none of its code.
 void notify_mapped(std::uint8_t* base, DWORD reason, bool started = false) {
     const auto* nt = Image{base, 0}.headers();
     const Image image{base, nt->OptionalHeader.SizeOfImage};
@@ -1244,9 +1245,12 @@ extern "C" __declspec(dllexport) int pe_map_release(void* mapped) {
 // an entry point, for a null exit_code and for an unreadable TLS callback list. The PEB argument that
 // Windows passes to the entry point is not forwarded, and no process-detach notification follows because
 // the process goes on.
-// From the start until pe_map_release, threads that attach or detach call the EXE's TLS callbacks with
-// DLL_THREAD_ATTACH or DLL_THREAD_DETACH, never its entry point, as under a Windows launch. Measured on
-// Windows 10 build 19045 with tests/cpu/exe_tls.cpp.
+// Once the process-attach callbacks have returned, and until pe_map_release, threads that attach or detach
+// call the EXE's TLS callbacks with DLL_THREAD_ATTACH or DLL_THREAD_DETACH, never its entry point, as under
+// a Windows launch. That covers the threads the entry point starts. A thread that attaches during the
+// process-attach callbacks is not notified, whoever started it; Windows instead holds such a thread until
+// process initialization ends, which pe_map does not reproduce. Release sends the EXE no process detach.
+// Measured on Windows 10 build 19045 with tests/cpu/exe_tls.cpp.
 extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exit_code) {
     auto* base = static_cast<std::uint8_t*>(mapped);
     const auto* nt = Image{base, 0}.headers();
@@ -1255,14 +1259,15 @@ extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exi
     const Image image{base, nt->OptionalHeader.SizeOfImage};
     std::vector<PIMAGE_TLS_CALLBACK> callbacks;
     if (tls_callbacks(image, nt, callbacks)) return 0;
+    for (auto callback : callbacks) callback(base, DLL_PROCESS_ATTACH, nullptr);
     {
-        // From here on, threads that attach or detach notify the EXE's TLS callbacks (see notify_mapped),
-        // including the threads its callbacks and entry point start.
+        // Thread notifications become eligible only now: after every process-attach callback has
+        // returned and before the entry point runs (see notify_mapped). A thread that attaches while
+        // the process-attach callbacks run, whether a callback or the host started it, is not notified.
         const SharedLock hold;
         for (auto* record : mapped_images())
             if (record->base == base) InterlockedExchange(&record->started, 1);
     }
-    for (auto callback : callbacks) callback(base, DLL_PROCESS_ATTACH, nullptr);
     using Entry = DWORD(WINAPI*)(void*);
     *exit_code = reinterpret_cast<Entry>(base + nt->OptionalHeader.AddressOfEntryPoint)(nullptr);
     return 1;

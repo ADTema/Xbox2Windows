@@ -21,6 +21,15 @@
 //   X=<exit code>
 // Notifications from threads the EXE did not start (a host's own threads) are left out.
 //
+// exe_tls_mirror lets a host that maps the image give the callbacks four counters, one per
+// notification reason, which it can still read after the image is released.
+//
+// Built with EARLY_THREAD (cpu_exe_tls_early), the first callback on process attach starts a probe
+// thread p and waits for it; p records its own first observation. Under pe_map, p attaches while the
+// process-attach callbacks run, before thread notifications are eligible, so the log must show pf but
+// no notification for p. Under Windows, p's initialization waits for process initialization, so this
+// variant is only run mapped.
+//
 // A failed setup ends the process with 0xE0000002 (CreateThread), 0xE0000003 (a wait did not
 // complete) or 0xE0000006 (event log overflow).
 #include <windows.h>
@@ -93,7 +102,8 @@ struct Event {
 
 Event g_events[64];
 volatile LONG g_count;
-DWORD g_threads[3];  // initial thread, worker A, worker B; filled before each thread starts
+DWORD g_threads[4];  // initial thread, worker A, worker B, probe; filled before each thread starts
+volatile LONG* g_mirror;  // per-reason counters owned by a host, or null
 
 void record(char kind, char caller, DWORD value) {
     const LONG index = InterlockedIncrement(&g_count) - 1;
@@ -101,9 +111,40 @@ void record(char kind, char caller, DWORD value) {
     g_events[index] = {GetCurrentThreadId(), kind, caller, value};
 }
 
-void NTAPI callback_first(PVOID, DWORD reason, PVOID) { record(static_cast<char>('0' + reason), '1', observe()); }
-void NTAPI callback_second(PVOID, DWORD reason, PVOID) { record(static_cast<char>('0' + reason), '3', observe()); }
+void mirror(DWORD reason) {
+    if (g_mirror && reason < 4) InterlockedIncrement(&g_mirror[reason]);
+}
+
+#ifdef EARLY_THREAD
+DWORD WINAPI probe(void*) {
+    record('f', ' ', observe());
+    return 0;
+}
+
+// Starts p from the first process-attach callback and waits until it has fully exited.
+void run_probe() {
+    HANDLE thread = CreateThread(nullptr, 0, probe, nullptr, CREATE_SUSPENDED, &g_threads[3]);
+    if (!thread) ExitProcess(CREATE_FAILED);
+    ResumeThread(thread);
+    if (WaitForSingleObject(thread, WAIT_MS) != WAIT_OBJECT_0) ExitProcess(WAIT_FAILED_CODE);
+    CloseHandle(thread);
+}
+#endif
+
+void NTAPI callback_first(PVOID, DWORD reason, PVOID) {
+    mirror(reason);
+    record(static_cast<char>('0' + reason), '1', observe());
+#ifdef EARLY_THREAD
+    if (reason == DLL_PROCESS_ATTACH) run_probe();
+#endif
+}
+void NTAPI callback_second(PVOID, DWORD reason, PVOID) {
+    mirror(reason);
+    record(static_cast<char>('0' + reason), '3', observe());
+}
 }  // namespace
+
+extern "C" __declspec(dllexport) void exe_tls_mirror(volatile LONG* counts) { g_mirror = counts; }
 
 #pragma section(".CRT$XLB", read)
 #pragma section(".CRT$XLM", read)
@@ -149,8 +190,8 @@ void put_hex(DWORD value) {
 }
 
 char thread_name(DWORD thread) {
-    for (int i = 0; i < 3; ++i)
-        if (g_threads[i] == thread) return "mab"[i];
+    for (int i = 0; i < 4; ++i)
+        if (g_threads[i] == thread) return "mabp"[i];
     return 0;
 }
 
