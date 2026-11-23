@@ -493,7 +493,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if writes:
                 lds_strided_words.update(zip(offsets, pairs))
             ds_wait = True
-        elif m := re.fullmatch(r"ds_(write|read)_b(64|96) (v\[\d+:\d+\]|v\d+), "
+        elif m := re.fullmatch(r"ds_(write|read)_b(64|96|128) (v\[\d+:\d+\]|v\d+), "
                                r"(v\[\d+:\d+\]|v\d+)(?: offset:(0|8))?", line):
             write = m[1] == "write"
             count = int(m[2]) // 32
@@ -519,16 +519,39 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("Uninitialized private wide LDS word")
                 vector.update(zip(registers, (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
-        elif m := re.fullmatch(r"ds_read2_b32 v\[(\d+):(\d+)\], v(\d+)"
-                               r"(?: offset0:([0-3]))?(?: offset1:([0-3]))?", line):
-            first, last, addr = map(int, m.groups()[:3])
-            slots = tuple(int(offset or 0) for offset in m.groups()[3:])
-            if (guard_span is not None or max(last, addr) > 255 or last != first + 1
-                    or vector.get(addr) != ("lds_wide_address",)):
-                raise ValueError("Unverified private wide LDS access")
-            if not all(slot in lds_wide_words for slot in slots):
-                raise ValueError("Uninitialized private wide LDS word")
-            vector.update(zip(range(first, last + 1), (lds_wide_words[slot] for slot in slots)))
+        elif m := re.fullmatch(
+                r"ds_(read|write)2_b(32|64) (v\[\d+:\d+\]|v\d+), (v\[\d+:\d+\]|v\d+)"
+                r"(?:, (v\[\d+:\d+\]|v\d+))?(?: offset0:([0-3]))?(?: offset1:([0-3]))?", line):
+            write = m[1] == "write"
+            width = int(m[2]) // 32
+            addr_text = m[3] if write else m[4]
+            addr = re.fullmatch(r"v(\d+)", addr_text)
+            offsets = tuple(int(offset or 0) * width for offset in m.groups()[5:])
+            slots = tuple(slot for offset in offsets for slot in range(offset, offset + width))
+            if (guard_span is not None or not addr or vector.get(int(addr[1])) != ("lds_wide_address",)
+                    or max(slots) >= 4 or write != (m[5] is not None) or write and offsets[0] == offsets[1]):
+                raise ValueError("Unverified private paired LDS access")
+            operands = (m[4], m[5]) if write else (m[3],)
+            count = width if write else 2 * width
+            registers = []
+            for operand in operands:
+                match = re.fullmatch(r"v(\d+)" if count == 1 else r"v\[(\d+):(\d+)\]", operand)
+                if not match:
+                    raise ValueError("Unverified private paired LDS register range")
+                first = int(match[1])
+                last = first if count == 1 else int(match[2])
+                if last > 255 or last - first + 1 != count:
+                    raise ValueError("Unverified private paired LDS register range")
+                registers.extend(range(first, last + 1))
+            if write:
+                words = [vector.get(reg) for reg in registers]
+                if not all(map(is_word, words)):
+                    raise ValueError("Unverified private wide LDS source")
+                lds_wide_words.update(zip(slots, words))
+            else:
+                if not all(slot in lds_wide_words for slot in slots):
+                    raise ValueError("Uninitialized private wide LDS word")
+                vector.update(zip(registers, (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
         elif m := re.fullmatch(r"ds_(write|read)_addtid_b32 v(\d+)(?: offset:0)?", line):
             op, reg = m[1], int(m[2])

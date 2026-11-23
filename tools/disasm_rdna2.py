@@ -1513,6 +1513,58 @@ def _decode_ds(w0: int, w1: int) -> tuple[int, str, str, str]:
     return (8, op_name, asm, comment)
 
 
+# VOP3 16-bit interpolation (issue #938, step 2). As LLVM 15 encodes them for gfx1013, SRC0 holds the
+# attribute number (bits 5:0), the channel (bits 7:6) and the high-half select (bit 8); SRC1 and SRC2 are
+# the data sources. LLVM prints `vdst, src1, attrN.c[, src2][ high][ clamp][ mul:2|mul:4|div:2]`.
+INTERP_F16_OPS = {
+    0x342: ("v_interp_p1ll_f16", False, "Interpolate binary16 P1, low half, two-pass (VOP3)"),
+    0x343: ("v_interp_p1lv_f16", True, "Interpolate binary16 P1, low half, with a P0 source (VOP3)"),
+    0x35a: ("v_interp_p2_f16", True, "Interpolate binary16 P2 (VOP3)"),
+}
+INTERP_OMOD = ("", " mul:2", " mul:4", " div:2")
+# Source codes LLVM 15 refuses in these forms (no literal, no 209-234/249/250), and the inline constants it
+# accepts but prints as `/*invalid immediate*/`. Both were measured against LLVMDisasmInstruction for gfx1013.
+INTERP_F16_REFUSED_SOURCES = frozenset([*range(209, 235), 249, 250, 255])
+INTERP_F16_IMMEDIATES = frozenset([*range(128, 209), *range(240, 249)])
+
+
+def _decode_interp_f16(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
+    name, has_src2, comment = INTERP_F16_OPS[op]
+    abs_bits = (w0 >> 8) & 0x7
+    clamp = (w0 >> 15) & 1
+    attribute = w1 & 0x1ff
+    src1, src2, omod = (w1 >> 9) & 0x1ff, (w1 >> 18) & 0x1ff, (w1 >> 27) & 0x3
+    neg_bits = (w1 >> 29) & 0x7
+    # Encodings LLVM 15 refuses keep their eight-byte record but are not reported as the instruction:
+    # a modifier on the attribute operand, an unused p1ll third source, an output modifier on p2, or a
+    # refused source code. op_sel bits are ignored, as LLVM ignores them.
+    if ((abs_bits | neg_bits) & 1 or (not has_src2 and (src2 or (abs_bits | neg_bits) & 4))
+            or (op == 0x35a and omod) or src1 in INTERP_F16_REFUSED_SOURCES
+            or (has_src2 and src2 in INTERP_F16_REFUSED_SOURCES)):
+        return (8, f"{name}_unsupported", f"{name} <unsupported VOP3 encoding>",
+                f"LLVM 15 refuses this {name} encoding for gfx1013")
+
+    def source(code: int, index: int) -> str:
+        is_abs, is_neg = (abs_bits >> index) & 1, (neg_bits >> index) & 1
+        if code in INTERP_F16_IMMEDIATES:
+            # LLVM spells a lone negation of a numeric operand as neg(...), so that it is not read as a sign.
+            if is_neg and not is_abs:
+                return "neg(/*invalid immediate*/)"
+            return _format_operand_modifiers("/*invalid immediate*/", is_abs, is_neg)
+        return _format_operand_modifiers(decode_v_reg(code), is_abs, is_neg)
+
+    operands = [f"v{w0 & 0xff}", source(src1, 1), f"attr{attribute & 0x3f}.{'xyzw'[(attribute >> 6) & 3]}"]
+    if has_src2:
+        operands.append(source(src2, 2))
+    asm = f"{name} {', '.join(operands)}"
+    if attribute >> 8:
+        asm += " high"
+    if clamp:
+        asm += " clamp"
+    asm += INTERP_OMOD[omod]
+    return (8, name, asm, comment)
+
+
 def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
     """
     Decode one RDNA 2 instruction at given offset.
@@ -2039,6 +2091,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src2 = (w1 >> 18) & 0x1ff
         omod = (w1 >> 27) & 0x3
         neg = [(w1 >> 29) & 1, (w1 >> 30) & 1, (w1 >> 31) & 1]
+
+        if op in INTERP_F16_OPS:
+            return _decode_interp_f16(op, w0, w1)
 
         is_vopc = False
         is_vop3b = False

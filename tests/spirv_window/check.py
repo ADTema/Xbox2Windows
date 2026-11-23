@@ -13,6 +13,18 @@ original = fixture.read_text(encoding="utf-8")
 adapted = window.lower(original)
 assert "OpMemoryModel Logical GLSL450" in adapted
 assert "OpConvertUToPtr" not in adapted and "OpUGreaterThanEqual" in adapted
+# The range check applies to the indexed address, with a strict bound.
+assert "%x2w_address_p0_range = OpULessThan %bool %x2w_address_p0_address %x2w_end" in adapted.splitlines()
+
+# A direct word cast is checked from its own address.
+direct = original.replace(
+    "%v1 = OpConvertUToPtr %_ptr_PSB_arr %a1\n"
+    "%p1 = OpAccessChain %_ptr_PSB_uint %v1 %c0",
+    "%p1 = OpConvertUToPtr %_ptr_PSB_uint %a1",
+)
+assert direct != original
+assert "%x2w_address_p1_low = OpBitwiseAnd %ulong %a1 %x2w_mask" in window.lower(direct).splitlines()
+
 # Add a ballot read whose bit controls the value written through the physical address.
 combined = (original
     .replace("OpCapability Shader\n", "OpCapability Shader\nOpCapability GroupNonUniformBallot\n", 1)
@@ -35,6 +47,18 @@ for source, reason in (
      "physical word pointer"),
     (original.replace("OpTypePointer PhysicalStorageBuffer %uint", "OpTypePointer PhysicalStorageBuffer %ulong"),
      "scalar layout"),
+    (original.replace("OpDecorate %UserData Block",
+                      "OpDecorate %user_data DescriptorSet 1\nOpDecorate %UserData Block"),
+     "descriptor sets"),
+    (original.replace('OpEntryPoint GLCompute %main "main" %user_data',
+                      'OpEntryPoint GLCompute %main "main" %user_data\n'
+                      'OpEntryPoint GLCompute %main "other" %user_data'),
+     "expected one shader entry point"),
+    (original.replace("OpDecorate %rt_uint ArrayStride 4", "OpDecorate %rt_uint ArrayStride 8"),
+     "scalar layout"),
+    (original.replace("%main = OpFunction",
+                      "%unexpected_pc = OpTypePointer PushConstant %uint\n%main = OpFunction"),
+     "unrecognized push-constant declaration"),
 ):
     try:
         window.lower(source)
@@ -57,7 +81,7 @@ with tempfile.TemporaryDirectory() as directory:
     # This input name previously overlapped the temporaries for %ballot_bit.
     renamed = combined.replace("%p2 ", "%ballot_ballot_bit ")
     assert renamed != combined
-    for label, source in (("combined", combined), ("renamed_pointer", renamed)):
+    for label, source in (("combined", combined), ("renamed_pointer", renamed), ("direct", direct)):
         mixed = Path(directory) / f"{label}.spvasm"
         mixed.write_text(source, encoding="utf-8")
         mixed_target = Path(directory) / f"{label}.spv"
