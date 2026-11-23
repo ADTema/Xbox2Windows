@@ -525,6 +525,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = "rax = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(rax)));"
         elif op == M.CQO:
             stmt = "rdx = static_cast<uint64_t>(static_cast<int64_t>(rax) >> 63);"
+        elif op == M.RDTSC:
+            # The host time-stamp counter, passed through unscaled: EDX:EAX, upper halves zeroed, flags kept.
+            # The volatile result keeps the read when the guest overwrites it; without it /O2 removes the read.
+            stmt = "{ const volatile uint64_t tsc = __rdtsc(); rax = static_cast<uint32_t>(tsc); rdx = tsc >> 32; }"
+        elif op == M.RDTSCP:
+            stmt = ("{ unsigned int aux; const volatile uint64_t tsc = __rdtscp(&aux); "
+                    "rax = static_cast<uint32_t>(tsc); rdx = tsc >> 32; rcx = aux; }")
         elif op in (M.SHL, M.SHR, M.SAR) and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
             size = RegisterExt.size(i.op0_register)
             bits = 8 * size

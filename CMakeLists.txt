@@ -683,6 +683,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_wide_arithmetic COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/wide_arith_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_wide_arith>" "$<TARGET_FILE:cpu_wide_arith_lifted>")
+    cpu_asm_fixture(cpu_switch_rotates switch_rotates)
+    cpu_translation(cpu_switch_rotates cpu_switch_aot
+        rot_reg_cl_8,rot_reg_cl_16,rot_reg_cl_32,rot_reg_cl_64,rot_imm_1,rot_imm_edge,rot_mem_cl_8_16,rot_mem_cl_32_64,rot_mem_imm,rot_narrow_ret)
+    add_test(NAME cpu_aot_switch_rotates COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_rotates_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_rotates>" "$<TARGET_FILE:cpu_switch_rotates_lifted>")
     # Divides whose results are unused: the translation is also built with /O2, where the compiler would remove a
     # divide that the generated C++ let it remove, and both builds are compared with the original's exception codes.
     cpu_asm_fixture(cpu_dead_div dead_div)
@@ -1487,6 +1493,48 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_xlatb COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xlatb.py"
         check "$<TARGET_FILE:cpu_xlatb>" "$<TARGET_FILE:cpu_xlatb_lifted>"
         "$<TARGET_FILE:cpu_xlatb_signed>" "$<TARGET_FILE:cpu_xlatb_noaddr32>" "$<TARGET_FILE:cpu_xlatb_clear>")
+    cpu_asm_fixture(cpu_rdtsc_harness rdtsc_harness)
+    # RDTSC runs on every host. RDTSCP has its own fixture and test, which exits 77 on a host without it. Each
+    # part has a lifted DLL, mutated controls that its check requires to break a property, and /O2 builds;
+    # plain removes volatile and is built only at /O2.
+    foreach(part IN ITEMS rdtsc rdtscp)
+        cpu_asm_fixture(cpu_${part} ${part})
+        if(part STREQUAL "rdtsc")
+            set(tsc_variants lifted constant swap noext stale flags plain)
+            set(tsc_o2_variants lifted plain)
+        else()
+            set(tsc_variants lifted swap noext noaux pflags)
+            set(tsc_o2_variants lifted)
+        endif()
+        set(tsc_controls)
+        foreach(variant IN LISTS tsc_variants)
+            set(tsc_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp")
+            add_custom_command(OUTPUT "${tsc_fixture}"
+                COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rdtsc.py"
+                    emit ${part} "$<TARGET_FILE:cpu_${part}>" "${tsc_fixture}" ${variant}
+                DEPENDS cpu_${part} tests/cpu/rdtsc.py tools/ffx_version_query.py tools/x87_lower.py
+                    tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+            if(NOT variant STREQUAL "plain")
+                add_library(cpu_${part}_${variant} SHARED "${tsc_fixture}")
+                if(NOT variant STREQUAL "lifted")
+                    list(APPEND tsc_controls "$<TARGET_FILE:cpu_${part}_${variant}>")
+                endif()
+            endif()
+        endforeach()
+        foreach(variant IN LISTS tsc_o2_variants)
+            set(tsc_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}_o2.dll")
+            add_custom_command(OUTPUT "${tsc_o2}"
+                COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp"
+                    "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}_o2.obj" "/Fe${tsc_o2}"
+                DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp" VERBATIM)
+            add_custom_target(cpu_${part}_${variant}_o2 ALL DEPENDS "${tsc_o2}")
+            list(APPEND tsc_controls "${tsc_o2}")
+        endforeach()
+        add_test(NAME cpu_aot_${part} COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rdtsc.py"
+            check ${part} "$<TARGET_FILE:cpu_rdtsc_harness>" "$<TARGET_FILE:cpu_${part}>"
+            "$<TARGET_FILE:cpu_${part}_lifted>" ${tsc_controls})
+    endforeach()
+    set_tests_properties(cpu_aot_rdtscp PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
@@ -2455,6 +2503,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/mesh_descriptor_swap_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(mesh_descriptor_swap_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME mesh_indexed_fallback_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_fallback_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_indexed_fallback_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME mesh_indexed_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_indexed_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2599,6 +2651,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_e64_spellings_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_e64_spellings_${adapter}.txt")
+        add_test(NAME pixel_aot_frexp_exp_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-frexp-exp "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_frexp_exp_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_frexp_exp_${adapter}.txt")
         add_test(NAME pixel_aot_rndne_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_rndne_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

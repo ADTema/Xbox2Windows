@@ -35,6 +35,21 @@ EXPECTED = [
 ]
 
 
+def sfx_bank(streams, length=512) -> bytes:
+    # Sound-effect bank: one tag list (type, length, offset) per stream, ids 11, 12, ...
+    count = len(streams)
+    tags = [tag for stream in streams for tag in stream]
+    awc = bytearray(length)
+    struct.pack_into("<4sIII", awc, 0, b"ADAT", 0xff020001, count, 16 + 4 * count + 8 * len(tags))
+    for index, stream in enumerate(streams):
+        struct.pack_into("<I", awc, 16 + 4 * index, len(stream) << 29 | 11 + index)
+    for index, (kind, size, offset) in enumerate(tags):
+        struct.pack_into("<Q", awc, 16 + 4 * count + 8 * index, kind << 56 | size << 28 | offset)
+        if kind == 0x55:
+            awc[offset:offset + size] = b"\xa5" * size
+    return awc
+
+
 DEFAULT_WORDS = (2 << 29 | 0, 0 << 29 | 0x101, 1 << 29 | 0x102)
 DEFAULT_TAGS = ((0x55, 64, 160), (0x48, 76, 64), (0xBD, 16, 144))
 DEFAULT_RECORDS = ((0x101, 1000, 48000, 11), (0x102, 990, 48000, 11),
@@ -129,6 +144,39 @@ class MetadataChecks(unittest.TestCase):
                 awc = bytearray(fixture())
                 struct.pack_into(fmt, awc, offset, value)
                 with self.assertRaises(ValueError):
+                    read_formats(io.BytesIO(awc), 0, len(awc))
+
+    def test_fa_format_tags(self) -> None:
+        from awc_metadata import read_formats
+
+        def bank(fa=(0xFA, 20, 96), extra=()) -> bytes:
+            awc = sfx_bank([[(0x55, 16, 128), fa, *extra], [(0x76, 32, 160), (0x55, 16, 200)]])
+            struct.pack_into("<I", awc, 96, 300)
+            struct.pack_into("<H", awc, 104, 22050)
+            awc[96 + 0x13] = 4
+            awc[96 + 28] = 9  # would be the codec if 0xFA were read like 0x76
+            struct.pack_into("<I", awc, 160, 700)
+            struct.pack_into("<H", awc, 168, 48000)
+            awc[160 + 28] = 11
+            return bytes(awc)
+
+        class MetadataOnly(io.BytesIO):
+            def read(self, size: int = -1, /) -> bytes:
+                start = self.tell()
+                if not any(low <= start <= start + size <= high for low, high in ((0, 56), (96, 116), (160, 192))):
+                    raise AssertionError("Read outside an AWC metadata range")
+                return super().read(min(size, 3))
+
+        expected = [{"sample_rate_hz": 22050, "codec_id": 4, "streams": 1, "samples": 300},
+                    {"sample_rate_hz": 48000, "codec_id": 11, "streams": 1, "samples": 700}]
+        self.assertEqual([asdict(g) for g in read_formats(MetadataOnly(bank()), 0, 512)], expected)
+        for label, awc, message in (
+            ("truncated 0xFA", bank(fa=(0xFA, 19, 96)), "Truncated AWC sound format tag"),
+            ("0xFA and 0x76 on one sound", bank(extra=((0x76, 32, 224),)), "one 0x76 or 0xFA format tag"),
+            ("two 0xFA on one sound", bank(extra=((0xFA, 20, 224),)), "one 0x76 or 0xFA format tag"),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, message):
                     read_formats(io.BytesIO(awc), 0, len(awc))
 
     def test_music_command(self) -> None:
