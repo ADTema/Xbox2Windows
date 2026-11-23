@@ -1940,6 +1940,8 @@ def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
                     raise ValueError(f"call or tail jump through a second IAT slot RVA {slot:#x}")
                 index = 0
             else:
+                if slot not in imported:
+                    raise ValueError(f"RIP-relative target RVA {slot:#x} is not an ordinary IAT slot")
                 dll, name = imported[slot]
                 index = by_import.get((dll.casefold(), name))
                 if index is None:

@@ -231,6 +231,8 @@ def check_rejections(builds, sites):
     for label, name, image, bound, reason in controls:
         reject(image, name, bound, label, reason)
     controls = [
+        ("RIP-relative jump outside the IAT", "jump_non_import", bindings(providers),
+         "is not an ordinary IAT slot"),
         ("only the mix3 binding", "route2", Binding(first, "mix3", None, 3, 8),
          f"call or tail jump through a second IAT slot RVA {sites['fold4']:#x}"),
         ("two bindings of one slot", "route2", (Binding(first, "mix3", None, 3, 8), Binding(first, "mix3", None, 3, 1)),

@@ -2,3 +2,4 @@ EXPORTS
     route2
     call_both
     call_second
+    jump_non_import

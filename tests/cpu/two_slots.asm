@@ -8,6 +8,8 @@ EXTERN __imp_mix3:QWORD
 EXTERN __imp_fold4:QWORD
 EXTERN fold4:PROC
 EXTERN __ImageBase:BYTE
+.data
+ordinary_data_slot QWORD 0
 .code
 
 ; Selects by x AND 3 through an MSVC jump table, with x kept in RBX:
@@ -100,4 +102,10 @@ call_second PROC FRAME
     add rsp, 28h
     ret
 call_second ENDP
+
+; Rejection control only: a RIP-relative jump through ordinary data, outside the IAT.
+jump_non_import PROC FRAME
+    .endprolog
+    jmp QWORD PTR [ordinary_data_slot]
+jump_non_import ENDP
 END
