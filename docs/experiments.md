@@ -4022,6 +4022,27 @@ The [fixture supplied in #442](https://github.com/R0Y00/Xbox2Windows/issues/442)
 
 The CPU block test and the D3D12 BC7 draw tests check all 16 RGBA texels against fixed expected bytes. Changing the last selector from 15 to 0 selects the opposite endpoint only for the final texel. This covers a single zero-history synthetic vector. The local BCPack probe does not decode arbitrary BC7 streams.
 
+### Two synthetic BCPack mode-6 blocks
+
+`tests/bc7_mode6_multiblock_check.py` uses the [132-byte synthetic stream supplied by stan495 for #769](https://github.com/stan495/Xbox2Windows/blob/5e1af1695674866a784a80720426a0a5384263b1/tests/bcpack_mode6_multiblock_vector.py). The test builds the expected blocks from two sets of mode-6 endpoints and selectors. It strictly decodes the stream without external history, requires the exact 32 BC7 bytes in left-to-right order and uploads those decoded bytes. The translated copy shader samples the resulting 8×4 texture. The test compares the entire RGBA8 capture with the independent CPU reference derived from the expected blocks.
+
+Use the same pinned Leonida tools as for the single-block check. From the repository root with the Python environment set up:
+
+```powershell
+. .\tools\dev.ps1
+git init out/Leonida
+git -C out/Leonida fetch --depth=1 https://github.com/timelery/Leonida.git 03d1e118a676d73aba66b1793cf033f6ad23b2b2
+git -C out/Leonida checkout --detach FETCH_HEAD
+$env:BCPACK_REFERENCE_TOOLS = (Resolve-Path 'out/Leonida/tools').Path
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^(bc7_mode6_multiblock_(warp|hardware)|bc7_draw_(warp|hardware)|bc7_block_reference|bcpack_rans_symbols)$' -V
+```
+
+The two `bc7_mode6_multiblock_*` tests report a skip when `BCPACK_REFERENCE_TOOLS` is unset. To select a physical adapter by name, set `XBOX2WINDOWS_ADAPTER` before running CTest.
+
+On Windows 11 build 26200.9974 with the debug layer enabled, WARP (Microsoft Basic Render Driver 10.0.26100.9818) and Radeon RX 7900 XTX (32.0.32029.2010) matched all 32 texels with zero channel error, debug errors or debug warnings. The first mismatches were `(0, 0)` after swapping the two blocks and `(7, 3)` after changing the right block's last selector from 15 to 0. Truncation to 131, 66 or 32 bytes failed before upload. The 131-byte case first reported that lane 10 ran out of input at byte 131. The GPU runs used the test change on base `1e8c6a6`.
+
 ### Exporting two TTPF entries to DDS
 
 These measurements use Leonida's Python exporter on Windows with Python 3.14.2. Both indices are zero-based and refer to the same local `ttdb_ui.ttpf` pool, 845,115,648 bytes, SHA-256 `dc983ed7f6b78d1693fa5757f17c03bafb790e851594fdf4d412579b61d867f6`. The SHA-256 values in the table cover each complete DDS, including its header. Original pixel colours and coverage across the full set remain unverified. [Measurement request](https://github.com/R0Y00/Xbox2Windows/issues/458#issuecomment-7074603775)
