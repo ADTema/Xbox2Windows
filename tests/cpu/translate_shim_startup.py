@@ -21,10 +21,14 @@ IMPORTS = {
     (COMPUTE, b"compute_free"): HostImport("host_free", (8, 8), 4),
     (DRAW, b"draw_request"): HostImport("draw_request", (), 4),
     (DRAW, b"draw_frame"): HostImport("host_draw_frame", (4,), 4),
+    (DRAW, b"shadow_device_request"): HostImport("host_shadow_device_request", (4,), 8),
+    ("d3d12_xs.dll", b"D3D12XboxCreateDevice"): HostImport("host_xbox_create_device", (8, 8, 8, 8), 4),
+    (DRAW, b"shadow_draw_result"): HostImport("host_shadow_draw_result", (8, 4), 4),
 }
 
 HOST = r"""
 #include <windows.h>
+#include <unknwn.h>
 extern "C" __declspec(dllimport) DWORD run_startup_shims();
 extern "C" __declspec(dllimport) DWORD finish_exe(const void*, DWORD);
 extern "C" __declspec(dllimport) SIZE_T compute_request();
@@ -33,6 +37,9 @@ extern "C" __declspec(dllimport) DWORD compute_dispatch(void*, unsigned, unsigne
 extern "C" __declspec(dllimport) DWORD compute_free(void*, ULONGLONG);
 extern "C" __declspec(dllimport) DWORD draw_request();
 extern "C" __declspec(dllimport) DWORD draw_frame(DWORD);
+extern "C" __declspec(dllimport) void* shadow_device_request(DWORD);
+extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+extern "C" __declspec(dllimport) DWORD shadow_draw_result(void*, HRESULT);
 
 static word bound_image() { return reinterpret_cast<word>(GetModuleHandleW(nullptr)); }
 static word host_alloc(word size, word attr) { return reinterpret_cast<word>(compute_alloc(size, attr)); }
@@ -41,6 +48,16 @@ static word host_dispatch(word addr, word seed, word count) {
 }
 static word host_free(word addr, word attr) { return compute_free(reinterpret_cast<void*>(addr), attr); }
 static word host_draw_frame(word mode) { return draw_frame(static_cast<DWORD>(mode)); }
+static word host_shadow_device_request(word mode) {
+    return reinterpret_cast<word>(shadow_device_request(static_cast<DWORD>(mode)));
+}
+static word host_xbox_create_device(word adapter, word parameters, word iid, word output) {
+    return static_cast<DWORD>(D3D12XboxCreateDevice(reinterpret_cast<IUnknown*>(adapter),
+        reinterpret_cast<const void*>(parameters), *reinterpret_cast<const IID*>(iid), reinterpret_cast<void**>(output)));
+}
+static word host_shadow_draw_result(word request, word result) {
+    return shadow_draw_result(reinterpret_cast<void*>(request), static_cast<HRESULT>(result));
+}
 static word host_finish(word base, word code) { return finish_exe(reinterpret_cast<void*>(base), static_cast<DWORD>(code)); }
 """
 
@@ -68,7 +85,7 @@ def emit(image, output):
         functions = [root, *program.callees.values()]
         used = {call for fn in functions for call in fn.host_calls.values()}
         if root.return_width is None or root.return_width < 4 or used != set(IMPORTS.values()):
-            raise ValueError("incomplete startup or compute import path")
+            raise ValueError("incomplete shim startup import path")
         # Only the identity argument to finish_exe is relocated to the AOT process.
         # No original image bytes are mapped in the generated executable.
         for fn in functions:

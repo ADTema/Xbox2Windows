@@ -55,6 +55,8 @@ def run(directory, dxc, mapper, exe, lifted, companion, io, xmem, d3d12):
             diagnostics = [*markers, "mapped host returned"] if runner == "pe_map" else []
             if case == "shadow-reject":
                 diagnostics.append("Xbox device rejected: no device, released adapter and factory")
+            else:
+                diagnostics.append("Xbox device created: EXE import returned a desktop device")
             check(f"{case} {runner} diagnostics", sorted(lines), sorted(diagnostics))
             check(f"{case} {runner} exit", child.returncode, 20 if case == "shadow-reject" else 42)
             check(f"{case} {runner} startup", child.stdout[:len(EXPECTED.output)], EXPECTED.output)

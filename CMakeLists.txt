@@ -2331,11 +2331,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${tex_tables}")
     target_include_directories(cpu_shim_draw PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_features(cpu_shim_draw PRIVATE cxx_std_17)
-    target_link_libraries(cpu_shim_draw PRIVATE dxgi d3d12 d3d12_xs_shim)
+    target_link_libraries(cpu_shim_draw PRIVATE dxgi d3d12)
     add_executable(cpu_shim_startup tests/cpu/shim_startup.asm tests/cpu/exe_startup.asm)
     set_target_properties(cpu_shim_startup PROPERTIES LINKER_LANGUAGE CXX)
     target_link_options(cpu_shim_startup PRIVATE /ENTRY:native_startup /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
-    target_link_libraries(cpu_shim_startup PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw)
+    target_link_libraries(cpu_shim_startup PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw d3d12_xs_shim)
     set(shim_startup_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_shim_startup_lifted.cpp")
     add_custom_command(OUTPUT "${shim_startup_cpp}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/translate_shim_startup.py"
@@ -2344,7 +2344,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
     add_executable(cpu_shim_startup_lifted "${shim_startup_cpp}")
     target_compile_features(cpu_shim_startup_lifted PRIVATE cxx_std_17)
-    target_link_libraries(cpu_shim_startup_lifted PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw)
+    target_link_libraries(cpu_shim_startup_lifted PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw d3d12_xs_shim)
     add_test(NAME cpu_native_shim_startup COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/shim_startup_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_shim_startup>" "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>"

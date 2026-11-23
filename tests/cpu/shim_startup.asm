@@ -7,6 +7,9 @@ EXTERN __imp_compute_dispatch:QWORD
 EXTERN __imp_compute_free:QWORD
 EXTERN __imp_draw_request:QWORD
 EXTERN __imp_draw_frame:QWORD
+EXTERN __imp_shadow_device_request:QWORD
+EXTERN __imp_D3D12XboxCreateDevice:QWORD
+EXTERN __imp_shadow_draw_result:QWORD
 
 .code
 native_entry PROC FRAME
@@ -46,7 +49,7 @@ draw_phase:
     cmp eax, 20
     jae draw_upload
     cmp eax, 14
-    jae draw_single
+    jae draw_shadow
     cmp eax, 10
     jae draw_texture
     cmp eax, 6
@@ -74,6 +77,23 @@ draw_two:
 draw_upload:
     mov ecx, eax
     call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    jmp success
+draw_shadow:
+    mov ecx, eax
+    call qword ptr [__imp_shadow_device_request]
+    test rax, rax
+    jz bad_draw
+    mov [rsp+40], rax
+    mov rcx, [rax]
+    xor edx, edx
+    mov r8, [rax+8]
+    lea r9, [rax+16]
+    call qword ptr [__imp_D3D12XboxCreateDevice]
+    mov edx, eax
+    mov rcx, [rsp+40]
+    call qword ptr [__imp_shadow_draw_result]
     test eax, eax
     jnz bad_draw
     jmp success

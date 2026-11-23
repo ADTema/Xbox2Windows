@@ -4153,9 +4153,11 @@ second color frame and is checked against its own reference.
 
 Run `ctest --preset release --no-tests=error -R '^cpu_shim_shadow_(warp|hardware)$' -V`.
 
-The EXE shadow path selects an adapter in the host and calls the
-`d3d12_xs.dll!D3D12XboxCreateDevice` shim to create the actual device at feature
-level 12.0. The fixture uses a null parameter block and the desktop
+The host selects an adapter, and the EXE calls the
+`d3d12_xs.dll!D3D12XboxCreateDevice` shim through its own PE import. The mapper
+resolves that import to the same shim, and the AOT binding passes the four
+arguments and 32-bit HRESULT from the lifted call site. The shim creates a
+device at feature level 12.0. The fixture uses a null parameter block and the desktop
 `ID3D12Device` interface. A non-null Xbox parameter block or unsupported
 interface is rejected. The negative case supplies an unsupported IID after
 adapter selection. It checks the cleared device output, release of the adapter
