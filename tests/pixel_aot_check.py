@@ -5123,7 +5123,7 @@ def check_scalar_controls():
     source = translate(program)
     for expected in ("= asuint(params[0].w) + asuint(params[1].x);", " < asuint(params[0].w)) ? 1u : 0u;",
                      "= (asuint(params[1].y) < asuint(params[1].z)) ? 2u : 0u;",
-                     "= ((~(asuint(params[1].y) ^ asuint(params[1].x)) & (asuint(params[1].y) ^ salu",
+                     "= (((asuint(params[1].y) ^ salu32) & (asuint(params[1].x) ^ salu32)) >> 31 != 0u)",
                      "= asuint(min(asint(asuint(params[0].w)), asint(asuint(params[1].x))));",
                      "= (asint(asuint(params[1].x)) > asint(asuint(params[0].w)));", "? 8192u : 0u;",
                      "= (asint(asuint(params[1].z)) == asint(4294967295u));", "? 2097152u : 0u;",
