@@ -26,6 +26,11 @@ target_compile_features(memory_query_check PRIVATE cxx_std_17)
 target_link_libraries(memory_query_check PRIVATE psapi)
 add_test(NAME desktop_memory_query COMMAND memory_query_check)
 
+add_executable(xmem_committed_memory_check tests/xmem_committed_memory_check.cpp)
+target_compile_features(xmem_committed_memory_check PRIVATE cxx_std_17)
+target_link_libraries(xmem_committed_memory_check PRIVATE OneCore)
+add_test(NAME xmem_committed_memory COMMAND xmem_committed_memory_check)
+
 add_executable(era_query_check tests/era_query_check.cpp src/era_query.cpp)
 target_include_directories(era_query_check PRIVATE src)
 target_compile_features(era_query_check PRIVATE cxx_std_17)
