@@ -99,6 +99,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Invalid scalar destination or movk immediate")
             signed = value - 0x10000 if value >= 0x8000 else value
             scalar[dst] = signed & 0xffffffff
+        elif m := re.fullmatch(r"s_lshl_b32 s(\d+), s(\d+), (\d+)", line):
+            dst, group, shift = map(int, m.groups())
+            tag = scalar.get(group)
+            axis = tag[1] if isinstance(tag, tuple) and tag[0] == "group" else None
+            # A group's first dispatch index, group * size, only for a power-of-two size.
+            if (dst in pending or dst > 105 or axis is None or dims[axis] & (dims[axis] - 1)
+                    or shift != dims[axis].bit_length() - 1):
+                raise ValueError("Unverified group base")
+            scalar[dst] = ("group_base", axis)
         elif m := re.fullmatch(r"s_load_dwordx4 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)", line):
             dest, last, base, high = map(int, m.groups()[:4])
             offset = 0 if m[5] == "null" else int(m[5], 16)
@@ -156,6 +165,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or shift != dims[axis].bit_length() - 1 or vector.get(local) != ("local", axis)):
                 raise ValueError("Unverified dispatch index")
             vector[dst] = ("thread", axis)
+        elif m := re.fullmatch(r"v_add_lshl_u32 v(\d+), s(\d+), v(\d+), (\d+)", line):
+            dst, base, local, shift = map(int, m.groups())
+            tag = scalar.get(base)
+            # (group base + local ID of the same axis) << shift: the byte offset of a dispatch
+            # index, as from v_lshlrev_b32. The store checks bound the shift.
+            if (dst > 255 or not (isinstance(tag, tuple) and tag[0] == "group_base")
+                    or vector.get(local) != ("local", tag[1])):
+                raise ValueError("Unverified dispatch byte offset")
+            vector[dst] = ("thread_bytes", tag[1], shift)
         elif m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line):
             dst, shift, src = map(int, m.groups())
             tag = vector.get(src)
