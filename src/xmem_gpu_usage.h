@@ -1,7 +1,9 @@
 // This process's GPU memory in bytes, the value XMemGetWorkingSetStatistics publishes.
-// process_bytes() reads DXGI; total() combines the readings without OS calls, so
+// process_bytes() reads DXGI; total() combines the readings without querying adapters, so
 // tests/xmem_shim_check.cpp can feed it synthetic ones.
 #pragma once
+
+#include "adapter_identity.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -27,11 +29,24 @@ inline bool add(std::uint64_t& sum, std::uint64_t bytes) noexcept
     return true;
 }
 
+// Keys are compared with adapter_identity::same_device, so case variants of one key match.
+inline bool has_device(const Domain& domain, const std::wstring& device) noexcept
+{
+    return std::any_of(domain.devices.begin(), domain.devices.end(),
+                       [&](const std::wstring& other) { return adapter_identity::same_device(other, device); });
+}
+
 inline bool overlap(const Domain& a, const Domain& b) noexcept
 {
-    return std::any_of(a.devices.begin(), a.devices.end(), [&](const std::wstring& device) {
-        return std::binary_search(b.devices.begin(), b.devices.end(), device);
-    });
+    return std::any_of(a.devices.begin(), a.devices.end(), [&](const std::wstring& d) { return has_device(b, d); });
+}
+
+inline bool same_devices(const Domain& a, const Domain& b) noexcept
+{
+    const auto within = [](const Domain& x, const Domain& y) {
+        return std::all_of(x.devices.begin(), x.devices.end(), [&](const std::wstring& d) { return has_device(y, d); });
+    };
+    return within(a, b) && within(b, a);
 }
 
 // Whether `domain` is the first view of its devices: false for an alias of an earlier domain,
@@ -40,7 +55,7 @@ inline std::optional<bool> first_view(const Domain* begin, const Domain& domain)
 {
     if (domain.devices.empty()) return true;
     for (const Domain* other = begin; other != &domain; ++other) {
-        if (other->devices == domain.devices) {
+        if (same_devices(*other, domain)) {
             if (other->bytes != domain.bytes) return std::nullopt;
             return false;
         }

@@ -1,6 +1,7 @@
 #include "adapter_identity.h"
 
-#include <algorithm>
+#include <climits>
+#include <cwchar>
 #include <iterator>
 #include <new>
 
@@ -39,19 +40,31 @@ Identity query(const LUID& luid) noexcept
         UINT length = static_cast<UINT>(std::size(key));
         D3DKMT_QUERY_PHYSICAL_ADAPTER_PNP_KEY pnp{i, D3DKMT_PNP_KEY_HARDWARE, key, &length};
         query = {open.hAdapter, KMTQAITYPE_PHYSICALADAPTERPNPKEY, &pnp, sizeof(pnp)};
-        complete = D3DKMTQueryAdapterInfo(&query) == 0 && key[0];
+        const std::size_t chars =
+            D3DKMTQueryAdapterInfo(&query) == 0 ? key_length(key, static_cast<UINT>(std::size(key)), length) : 0;
+        complete = chars != 0;
         try {
-            if (complete) devices.emplace_back(key, wcsnlen(key, std::size(key)));
+            if (complete) devices.emplace_back(key, chars);
         } catch (const std::bad_alloc&) {
             devices.clear();
             return identity;
         }
     }
-    if (!complete) {
-        devices.clear();
-    } else {
-        std::sort(devices.begin(), devices.end());
-    }
+    if (!complete) devices.clear();
     return identity;
+}
+
+std::size_t key_length(const wchar_t* buffer, std::uint32_t capacity, std::uint32_t written) noexcept
+{
+    if (written < 2 || written > capacity || buffer[written - 1] != L'\0') return 0;
+    const std::size_t length = written - 1;
+    return wcsnlen(buffer, length) == length ? length : 0;
+}
+
+bool same_device(const std::wstring& a, const std::wstring& b) noexcept
+{
+    return a.size() <= INT_MAX && b.size() <= INT_MAX &&
+           CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()), TRUE) ==
+               CSTR_EQUAL;
 }
 }

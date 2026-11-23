@@ -192,6 +192,39 @@ bool working_set_checks()
            null_error == ERROR_INVALID_PARAMETER;
 }
 
+// Synthetic PnP key query output for adapter_identity::key_length. `written` counts the terminator;
+// anything malformed gives 0, which leaves the LUID's identity unknown.
+bool key_checks()
+{
+    const std::wstring key = LR"(PCI\VEN_10DE&DEV_28E0\4&1&0&0008)";
+    const std::wstring terminated = key + L'\0';
+    const auto size = static_cast<std::uint32_t>(terminated.size());
+    struct Case {
+        const char* name;
+        std::wstring buffer;
+        std::uint32_t capacity;
+        std::uint32_t written;
+        std::size_t expected;
+    };
+    const Case cases[] = {
+        {"key_well_formed", terminated, size + 8, size, key.size()},
+        {"key_fills_buffer", terminated, size, size, key.size()},
+        {"key_nothing_written", terminated, size, 0, 0},
+        {"key_empty", L"\0"s, 1, 1, 0},
+        {"key_past_buffer", terminated + L'\0', size, size + 1, 0},
+        {"key_unterminated", key, size - 1, size - 1, 0},
+        {"key_embedded_terminator", L"PCI\0VEN_10DE\0"s, 13, 13, 0},
+    };
+    bool passed = true;
+    for (const auto& c : cases) {
+        const auto length = adapter_identity::key_length(c.buffer.data(), c.capacity, c.written);
+        const bool ok = length == c.expected;
+        passed &= ok;
+        std::printf("%s length=%zu %s\n", c.name, length, ok ? "ok" : "MISMATCH");
+    }
+    return passed;
+}
+
 // Synthetic QueryVideoMemoryInfo results for xmem_gpu_usage::domain_bytes, one LUID's share of the
 // value at +8, passed on to total() as the shim does.
 bool node_checks()
@@ -252,6 +285,7 @@ bool aggregation_checks()
     const std::wstring gpu_b = LR"(PCI\VEN_10DE&DEV_28E0\4&2&0&0010)";
     const std::wstring igpu = LR"(PCI\VEN_8086&DEV_A7A0\3&1&0&0010)";
     const std::wstring basic = LR"(ROOT\BasicRender\0000)";
+    const std::wstring gpu_a_lower = LR"(pci\ven_10de&dev_28e0\4&1&0&0008)";
     const auto domain = [](std::uint64_t bytes, std::vector<std::wstring> devices = {}) {
         return Domain{true, bytes, std::move(devices)};
     };
@@ -296,6 +330,12 @@ bool aggregation_checks()
         {"unidentified_with_active", {domain(64 * mib, {gpu_a}), domain(64 * mib)}, true, std::nullopt},
         {"linked_partial_overlap", {domain(64 * mib, {gpu_a, gpu_b}), domain(64 * mib, {gpu_a})}, true, std::nullopt},
         {"overflow", {domain(UINT64_MAX, {gpu_a}), domain(1, {gpu_b})}, true, std::nullopt},
+        // Registry keys match ignoring case, so a case variant of a key is the same device.
+        {"mixed_case_alias", {domain(64 * mib, {gpu_a}), domain(64 * mib, {gpu_a_lower})}, true, 64 * mib},
+        {"mixed_case_alias_disagrees", {domain(64 * mib, {gpu_a}), domain(32 * mib, {gpu_a_lower})}, true,
+         std::nullopt},
+        {"mixed_case_partial_overlap", {domain(64 * mib, {gpu_a, gpu_b}), domain(64 * mib, {gpu_a_lower})}, true,
+         std::nullopt},
     };
     bool passed = !before && !after && alias_before == 7294976ull && alias_after == 74403840ull &&
                   *alias_after - *alias_before == 64 * mib;
@@ -311,7 +351,9 @@ bool aggregation_checks()
             std::printf("%s declined %s\n", c.name, ok ? "ok" : "MISMATCH");
         }
     }
-    return node_checks() && passed;
+    const bool nodes = node_checks();
+    const bool keys = key_checks();
+    return nodes && keys && passed;
 }
 
 // Lists the DXGI adapters with the identity the shim aggregates by, for GPU reports.
