@@ -1725,6 +1725,60 @@ python3 -B tests/mesh_lit_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.
 ctest --preset dev --no-tests=error -R "^mesh_lit_draw_" -V
 ```
 
+The shadow fixture (`tests/mesh_shadow_check.py`, `offscreen_check
+--mesh-shadow`) adds a depth pass and a comparison sample to the lit fixture.
+All draws use the PARAM0 mesh program of the textured fixture on a 64×64 target.
+The scene is orthographic with depth z. A directional light projects (x, y, z)
+to (x − z/2, y + z/2) with depth z. Every vertex lies on the pixel grid in both
+views, so each receiver pixel center samples a texel center of the map.
+
+- **Light pass:** the caster triangle at depth 1/4 and a second triangle at
+  depth 7/8 go into an `R32_TYPELESS` texture through a `D32_FLOAT` view. The
+  depth test is `LESS` and the map is cleared to 1. The pixel program is the
+  caster's, with color writes masked. On WARP (10.0.26100.9818), a mesh
+  pipeline without a pixel shader removed the device in this fixture.
+- **Camera pass:** a receiver plane at depth 3/4 covers the target. Its
+  source-built pixel program interpolates the map coordinate from attr0.xy and
+  loads its light-space depth from b0 at byte 0x90. It compares that depth
+  against the map with `image_sample_c_lz` (point, `LESS`, through the #718
+  path, `SampleCmpLevelZero` on an `R32_FLOAT` view with a static comparison
+  sampler from the decoded words). It exports 1/4 + result/2 as the plane color.
+  The caster is then drawn at depth 1/4 with the #749 N·L program, reading its
+  normal from attr0.xyz. The normal's z is 17/32, so N·L at every pixel center
+  is an odd multiple of 1/128 and no result exports as 1/2. The ambient term is
+  1/4 + 2^-17, as in the lit fixture.
+
+The CPU reference rasterizes both views exactly with `Fraction` and asserts that
+no pixel or texel center lies on an edge. It evaluates N·L at each caster pixel
+and applies the comparison, `CLAMP` addressing and the 8-bit target. It does not
+use D3D12. Every RGBA byte, every texel of the current map (576 at 1/4, 176 at
+7/8, the rest 1) and the mesh trace of each of the five draws are compared. On
+RTX 3070 and WARP with the debug layer, the base scene matches, with 342 plane
+pixels in shadow. The second triangle is behind the plane: its 176 texels are in
+the map, and the plane pixels that sample them stay lit. The scene does not tell
+`CLAMP` from `WRAP`: the texels a wrapped coordinate would reach are clear or
+behind the plane. Negative controls:
+
+- **`GREATER` for `LESS`** (translated program and host sampler): every one of
+  the 3,520 plane pixels flips. The draw matches its own `GREATER` reference.
+- **Stale map:** the camera pass binds the map drawn in the same command list
+  for a previous light, (x + z/2, y + z/2). 356 pixels differ. The draw matches
+  its own reference for that map.
+- **Ignored map:** a receiver program that exports the lit color without
+  sampling gives 342 mismatches. It matches its own unshadowed reference.
+- **Coverage instead of depth:** a reference where any written texel shadows
+  differs at 52 pixels, the plane pixels that sample the triangle behind the
+  plane.
+- **Map without the second triangle:** the map readback differs at its 176
+  texels.
+
+![Shadow scene reference and the light-space depth map](mesh-shadow-reference.png)
+
+```sh
+python3 -B tests/mesh_shadow_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_shadow_draw_" -V
+```
+
 A separate draw binds two immutable constant buffers through a shader-visible
 D3D12 table. The translated mesh reads depth from b0 and a horizontal offset
 from b1. The translated pixel stage reads a packed color from b0. Both draws
