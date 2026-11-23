@@ -5899,6 +5899,75 @@ def dpp_int32_reference(a, b, c, shift):
     return tuple(float((acc >> (8 * k)) & 0xff) for k in range(4))
 
 
+def ds_swizzle_program():
+    # Keep interpolation and the DS instructions inside the verified whole-quad region.
+    program = assembly(False)[:7]
+    for op in (
+        "ds_swizzle_b32 v12, v8 offset:swizzle(QUAD_PERM,2,0,3,1)",
+        "ds_swizzle_b32 v13, v9 offset:swizzle(QUAD_PERM,2,0,3,1)",
+        "ds_swizzle_b32 v14, v8 offset:swizzle(QUAD_PERM,1,0,3,2)",
+        "ds_swizzle_b32 v15, v9 offset:swizzle(QUAD_PERM,2,2,2,2)",
+    ):
+        program.extend((op, "s_waitcnt lgkmcnt(0)"))
+    return program + ["s_and_b64 exec, exec, s[50:51]", "exp mrt0 v12, v13, v14, v15 done vm", "s_endpgm"]
+
+
+def translate_ds_swizzle(program):
+    return lower(program, 20, 24, None, integer_export=True, wave_size=64)
+
+
+def check_ds_swizzle_controls():
+    program = ds_swizzle_program()
+    source = translate_ds_swizzle(program)
+    assert "QuadReadAcrossX" in source and "QuadReadLaneAt" in source
+    i = next(i for i, line in enumerate(program) if line.startswith("ds_swizzle_b32 "))
+    op = program[i]
+    for wrong in (op + " gds", op.replace("2,0,3,1", "4,0,3,1"),
+                  op.replace("swizzle(QUAD_PERM,2,0,3,1)", "swizzle(SWAP,16)"),
+                  op.replace("v8", "v255"), op.replace("v12", "v256")):
+        must_reject(translate_ds_swizzle, program[:i] + [wrong] + program[i + 1:])
+    for wait in ([], ["s_waitcnt lgkmcnt(1)"], ["s_waitcnt vmcnt(0)"]):
+        expect_value_error(translate_ds_swizzle, program[:i + 1] + wait + program[i + 2:],
+                           "ds_swizzle_b32 requires an immediate s_waitcnt lgkmcnt(0)")
+    restore = program[-3]
+    must_reject(translate_ds_swizzle, program[:i] + [restore] + program[i:-3] + program[-2:])
+
+
+def check_ds_swizzle_draw(directory, compiler, renderer, backend):
+    program = ds_swizzle_program()
+    source, shader = directory / "ds_swizzle.hlsl", directory / "ds_swizzle.cso"
+    case = directory / "ds_swizzle.case"
+    pixels = []
+    for y in range(8):
+        for x in range(8):
+            # Pixel centers for the oversized triangle in pixel_aot_vs.hlsl.
+            lane = (y % 2) * 2 + x % 2
+            shuffled = (2, 0, 3, 1)[lane]
+            quad_x, quad_y = x & ~1, y & ~1
+            floats = ((quad_x + shuffled % 2 + 0.5) / 8,
+                      (quad_y + shuffled // 2 + 0.5) / 8,
+                      ((x ^ 1) + 0.5) / 8,
+                      (quad_y + 1.5) / 8)
+            pixels.append(floats)
+    # Existing case trailer bits select UINT output and an explicit 8x8 viewport.
+    case.write_bytes(bytes(256) + b"".join(struct.pack("<4f", *pixel) for pixel in pixels)
+                     + struct.pack("<B4I", 3, 0, 0, 8, 8))
+    source.write_text(translate_ds_swizzle(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    subprocess.run(draw, check=True)
+
+    # Remove the horizontal swap from only the blue channel.
+    wrong = [line.replace("QUAD_PERM,1,0,3,2", "QUAD_PERM,0,1,2,3") for line in program]
+    source.write_text(translate_ds_swizzle(wrong), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if (result.returncode != 1 or "pixel_mismatch x=0 y=0" not in result.stderr
+            or "channel=2 expected=0.1875 actual=0.0625" not in result.stderr):
+        raise AssertionError(f"Expected the identity mutation to differ at (0, 0): {result.stderr}")
+    print(result.stderr, end="")
+
+
 def check_dpp_int32_draw(directory, compiler, renderer, backend):
     program = with_constants(DPP_INT32_BODY)
     source = directory / "dpp_int32.hlsl"
@@ -7500,6 +7569,7 @@ def check_vopc_e32_destination():
 
 def check_controls(directory):
     check_title_load_controls()
+    check_ds_swizzle_controls()
     for mask in (0x3, 0xC, 0xF):
         program = compressed_export(mask)
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
@@ -9036,6 +9106,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((sopk_wait_program(), translate))
     fixtures.append((s_version_program(), translate_int))
     fixtures.append((with_constants(DOT_BODY), translate, "gfx1030"))
+    fixtures.append((ds_swizzle_program(), translate_ds_swizzle, "gfx1030", "+wavefrontsize64,-wavefrontsize32"))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000)), translate))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True)), translate))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True, clamp=True)), translate))
@@ -9060,18 +9131,21 @@ def check_binary(directory, assembler, objcopy, library):
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
+        features = entry[3] if len(entry) > 3 else ""
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
         binary = directory / "fixture.bin"
         source.write_text("\n".join(instructions) + "\n", encoding="ascii")
         subprocess.run([assembler, "-triple=amdgcn--amdpal", f"-mcpu={cpu}",
+                        *([f"-mattr={features}"] if features else []),
                         "-filetype=obj", source, "-o", obj], check=True)
         subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
         archive = directory / "fixture.rpf"
         archive.write_bytes(envelope(binary.read_bytes()))
         _, native = native_program(archive, "fixture")
         assert native == binary.read_bytes()
-        assert lower_fixture(disassemble(native, library, cpu=cpu.encode())) == lower_fixture(instructions)
+        decoded = disassemble(native, library, cpu=cpu.encode(), features=features.encode())
+        assert lower_fixture(decoded) == lower_fixture(instructions)
         if index == 0:
             check_container_selector(directory, native, library)
     check_wave32_mask_binary(directory, assembler, objcopy, library)
@@ -12452,7 +12526,7 @@ def main():
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
                     "draw-mac-legacy", "draw-carry-out", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
-                    "draw-title-loads", "draw-cmp64"):
+                    "draw-title-loads", "draw-ds-swizzle", "draw-cmp64"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -12474,6 +12548,7 @@ def main():
                         "draw-compressed-export": check_compressed_export_draw,
                         "draw-uncompressed-export": check_uncompressed_export_draw,
                         "draw-title-loads": check_title_load_draws,
+                        "draw-ds-swizzle": check_ds_swizzle_draw,
                         "draw-cmp64": check_cmp64_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
