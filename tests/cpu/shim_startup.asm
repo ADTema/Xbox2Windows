@@ -5,6 +5,8 @@ EXTERN __imp_compute_request:QWORD
 EXTERN __imp_compute_alloc:QWORD
 EXTERN __imp_compute_dispatch:QWORD
 EXTERN __imp_compute_free:QWORD
+EXTERN __imp_draw_request:QWORD
+EXTERN __imp_draw_frame:QWORD
 
 .code
 native_entry PROC FRAME
@@ -16,7 +18,7 @@ native_entry PROC FRAME
     jne done
     call qword ptr [__imp_compute_request]
     test rax, rax
-    jz success
+    jz draw_phase
     mov [rsp+32], rax
     mov rcx, rax
     mov edx, 0a8004000h
@@ -37,6 +39,48 @@ native_entry PROC FRAME
     jz bad_release
     cmp dword ptr [rsp+48], 0
     je bad_dispatch
+draw_phase:
+    call qword ptr [__imp_draw_request]
+    test eax, eax
+    jz success
+    cmp eax, 10
+    jae draw_texture
+    cmp eax, 6
+    jae draw_two
+    mov ecx, eax
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    jmp success
+draw_two:
+    mov dword ptr [rsp+48], eax
+    mov ecx, 6
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    mov ecx, dword ptr [rsp+48]
+    add ecx, 1
+    call qword ptr [__imp_draw_frame]
+    cmp eax, -1
+    je bad_second_draw
+    test eax, eax
+    jnz bad_draw
+    jmp success
+draw_texture:
+    mov dword ptr [rsp+48], eax
+    mov ecx, 10
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    mov ecx, dword ptr [rsp+48]
+    add ecx, 1
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    mov ecx, 12
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
 success:
     mov eax, 42
     jmp done
@@ -48,6 +92,12 @@ bad_release:
     jmp done
 bad_dispatch:
     mov eax, 19
+    jmp done
+bad_draw:
+    mov eax, 20
+    jmp done
+bad_second_draw:
+    mov eax, 24
 done:
     add rsp, 56
     ret
