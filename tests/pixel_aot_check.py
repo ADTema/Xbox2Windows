@@ -264,6 +264,22 @@ def flush_ftz(value):
     return value
 
 
+# The NVIDIA driver (RTX 5080, drivers 32.0.16.2101 and 32.0.16.2124) refuses PSO creation for a pixel shader
+# that uses log2 under -denorm preserve (E_OUTOFMEMORY, issue #828). The approximate programs that contain
+# log2 record their mode as any, and assert that no input, intermediate or expected value is a binary32
+# subnormal, so the mode cannot change what they compute or export. Every other program keeps preserve.
+LOG2_DENORM_MODE = "any"
+
+
+def log2_denorm_mode(label, hlsl, *values):
+    """Mode for one translated program: any exactly when it contains log2, after checking values for subnormals."""
+    if "log2(" not in hlsl:
+        return F32_DENORM_MODE
+    for value in values:
+        assert flush_ftz(value) == value, (label, value)
+    return LOG2_DENORM_MODE
+
+
 def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extra_constants=None,
                title_memory=None, write_mask=None):
     """Write a renderer case: 256 constant bytes, then 64 expected float4 rows in row-major order.
@@ -1304,8 +1320,17 @@ def check_e64_approx_draws(directory, compiler, renderer, backend):
     """
     source = directory / "e64_approx.hlsl"
     shader = directory / "e64_approx.cso"
-    source.write_text(translate(with_constants(APPROX_E64_BODY)), encoding="ascii")
-    compile_shader(compiler, source, shader)
+    hlsl = translate(with_constants(APPROX_E64_BODY))
+    source.write_text(hlsl, encoding="ascii")
+    values = [APPROX_E64_ACCUMULATOR]
+    for a, b, c, d in APPROX_E64_ROWS:
+        exp, log, product, square = 2.0 ** -a, math.log2(abs(b)), single(-a * abs(b)), single(d * d)
+        values += [a, b, c, d, -a, abs(b), -d, exp, exp + 0.5, log, log + 0.5, product, square,
+                   *approx_e64_reference(a, b, c, d)]
+        values += [float(wrong(a, b, c, d)) for _, wrong, _ in APPROX_E64_WRONG]
+    mode = log2_denorm_mode("e64_approx", hlsl, *values)
+    assert mode == LOG2_DENORM_MODE
+    compile_shader(compiler, source, shader, mode=mode)
     cases = []
 
     def add_case(row, values, status):
@@ -4859,6 +4884,13 @@ SDWA_UNARY = (
 )
 
 
+# Raw results of the operations, before rounding, of the one SDWA_UNARY program that contains log2.
+SDWA_UNARY_RAW = {
+    "sdwa_unary_exp": lambda a, b, c, d: (-a, abs(b), -abs(d), 2.0 ** -a, math.log2(abs(b)), 1.0 / c,
+                                          1.0 / -abs(d)),
+}
+
+
 def sdwa_unary_inputs(row):
     """Constants of a row as floats; an int is a binary32 bit pattern."""
     return tuple(struct.unpack("<f", struct.pack("<I", v))[0] if isinstance(v, int) else v for v in row)
@@ -4905,8 +4937,18 @@ def check_sdwa_unary_draws(directory, compiler, renderer, backend):
     for name, body, rows, reference, wrongs in SDWA_UNARY:
         source = directory / f"{name}.hlsl"
         shader = directory / f"{name}.cso"
-        source.write_text(translate(with_constants(body)), encoding="ascii")
-        compile_shader(compiler, source, shader)
+        hlsl = translate(with_constants(body))
+        source.write_text(hlsl, encoding="ascii")
+        values = []
+        for index, row in enumerate(rows):
+            inputs = sdwa_unary_inputs(row)
+            raw = SDWA_UNARY_RAW[name](*inputs) if name in SDWA_UNARY_RAW else ()
+            values += [*inputs, *raw, *(value + 0.5 for value in raw), *reference(*inputs)]
+            values += [float(wrong(*inputs)) for wrong_row, _, wrong, _ in wrongs if wrong_row == index]
+        mode = log2_denorm_mode(name, hlsl, *values)
+        # Only sdwa_unary_exp contains log2; sdwa_unary_root and sdwa_unary_exact stay under preserve.
+        assert (mode == LOG2_DENORM_MODE) == (name in SDWA_UNARY_RAW), (name, mode)
+        compile_shader(compiler, source, shader, mode=mode)
         cases = []
 
         def add_case(row, values, status):
