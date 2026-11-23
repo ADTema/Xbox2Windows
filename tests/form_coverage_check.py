@@ -268,6 +268,10 @@ def check_shader_records():
         without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(trig)
     # Count the supported 64-bit SOP1/SOP2 and BFE forms in both gfx1013 and rdna2.
+    # The 64-bit VOP3 shifts (issue #928) count once each, in VOP3 only; LLVM prints them without a suffix.
+    shift64_forms = {("VOP3", "v_lshlrev_b64"), ("VOP3", "v_lshrrev_b64"), ("VOP3", "v_ashrrev_i64")}
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        assert shift64_forms <= fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name)), name
     masked_forms = {("SOP1", "s_and_saveexec_b64"), ("SOPP", "s_cbranch_execz")}
     assert masked_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
     scalar64_forms = {
@@ -379,14 +383,23 @@ def check_shader_records():
                      | {("VOP3", f"{form}_e64") for form in all_compares})
     # Each name is counted once as VOPC and once as VOP3; the four sets must not share a name.
     assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares) + len(f32_compares)), len(compare_forms)
-    compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_i32", "v_cmpx_lt_i64", "v_cmpx_lt_u64",
-                          "v_cmpx_lt_f32", "v_cmp_class_f64", "v_cmp_lt_f64"}
+    # Issue #932 moved the VOPC e32 v_cmpx forms on binary32 and 32-bit integers (v_cmpx_lt_f32, v_cmpx_lt_i32)
+    # out of this set; the exec-writing compares of the other kinds stay rejected.
+    compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_f16", "v_cmpx_class_f32", "v_cmpx_lt_i64", "v_cmpx_lt_u64",
+                          "v_cmp_class_f64", "v_cmp_lt_f64"}
+    # v_cmpx regions (issue #932): every binary32 and 32-bit integer predicate counts in VOPC (e32) only.
+    cmpx_forms = ({("VOPC", f"v_cmpx_{op}_f32") for op in pixel.PREDICATES}
+                  | {("VOPC", f"v_cmpx_{op}_{kind}") for op in pixel.INT_PREDICATES for kind in ("i32", "u32")})
+    assert len(cmpx_forms) == 32, len(cmpx_forms)
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert compare_forms | {("VOPC", n) for n in compare_neighbours} <= reference, name
         covered = fc.gfx_forms(pixel.ACCEPTED, reference)
         assert compare_forms <= covered, (name, sorted(compare_forms - covered))
         assert not {form for _, form in covered} & (compare_neighbours | {f"{n}_e64" for n in compare_neighbours})
+        assert cmpx_forms <= reference and cmpx_forms <= covered, (name, sorted(cmpx_forms - covered))
+        assert not {("VOP3", f"{form}_e64") for _, form in cmpx_forms} & covered, name
+        assert {form for _, form in covered if form.startswith("v_cmpx_")} == {form for _, form in cmpx_forms}, name
     # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
     # reject (s_addc_u32, s_cmp_lt_u64, s_getreg_b32) stay out.
     scalar = {"s_movk_i32", "s_cmovk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32",

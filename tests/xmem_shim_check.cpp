@@ -73,13 +73,15 @@ bool export_checks()
     unsigned found = 0;
     for (const char* name : {"XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
                              "XMemVirtualQuery", "XMemGetWorkingSetStatistics",
-                             "XMemAllocatePhysicalPages", "XMemFreePhysicalPages", "XMemIsToolsMemAvailable"}) {
+                             "XMemAllocatePhysicalPages", "XMemFreePhysicalPages", "XMemIsToolsMemAvailable",
+                             "XMemMapPhysicalPages", "XMemMapPhysicalPagesScatter", "XMemVirtualAlloc"}) {
         if (!GetProcAddress(module, name)) return false;
         ++found;
     }
     const char* existing[] = {"XMemAlloc", "XMemFree", "XMemGetWorkingSetStatistics", "XMemVirtualQuery",
                               "XMemAllocDefault", "XMemFreeDefault", "XMemAllocatePhysicalPages",
-                              "XMemFreePhysicalPages", "XMemIsToolsMemAvailable"};
+                              "XMemFreePhysicalPages", "XMemIsToolsMemAvailable", "XMemMapPhysicalPages",
+                              "XMemMapPhysicalPagesScatter", "XMemVirtualAlloc"};
     for (WORD ordinal = 1; ordinal <= std::size(existing); ++ordinal) {
         if (GetProcAddress(module, MAKEINTRESOURCEA(ordinal)) != GetProcAddress(module, existing[ordinal - 1]))
             return false;

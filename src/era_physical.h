@@ -27,6 +27,7 @@ enum class Status { ok, invalid, exhausted };
 // null) and leaves pages untouched. The count and array must be disjoint, valid caller buffers.
 Status allocate(std::uint64_t flags, std::uint64_t* count, std::uint64_t* pages) noexcept;
 Status release(std::uint64_t count, const std::uint64_t* pages) noexcept;
+bool owns(std::uint64_t page) noexcept;
 // Pages currently granted, for tests.
 std::uint64_t granted_pages() noexcept;
 }

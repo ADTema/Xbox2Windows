@@ -215,9 +215,19 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     const UINT residentCount = static_cast<UINT>(levels.size());
     srcDesc.MipLevels = static_cast<UINT16>(firstResident + residentCount);
     auto texture = resource(device, srcDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    const D3D12_CLEAR_VALUE clear{
-        desc.RTVFormats[0], {-1, input.maskedCase ? 2.0f : -1.0f,
-                                 input.maskedCase ? -3.0f : -1.0f, input.maskedCase ? 4.0f : -1.0f}};
+    D3D12_CLEAR_VALUE clear{desc.RTVFormats[0], {}};
+    if (input.integerRT) {
+        // Integer masked cases use distinct nonzero words so a wrong PSO mask is visible.
+        clear.Color[0] = 1.0f;
+        clear.Color[1] = 2.0f;
+        clear.Color[2] = 3.0f;
+        clear.Color[3] = 4.0f;
+    } else {
+        clear.Color[0] = -1.0f;
+        clear.Color[1] = input.maskedCase ? 2.0f : -1.0f;
+        clear.Color[2] = input.maskedCase ? -3.0f : -1.0f;
+        clear.Color[3] = input.maskedCase ? 4.0f : -1.0f;
+    }
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(residentCount);
     UINT64 sourceBytes = 0;
     std::vector<UINT> rows(residentCount);
@@ -590,8 +600,6 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
             input.integerRT = (flags & 1u) != 0;
             const UINT8 caseMask = flags >> 4;
             if (caseMask) {
-                if (input.integerRT)
-                    throw std::runtime_error("Invalid floating-point case write mask");
                 input.maskedCase = true;
                 input.writeMask = caseMask;
             }
