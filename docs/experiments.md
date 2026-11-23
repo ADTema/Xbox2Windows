@@ -34,6 +34,25 @@ ordinal, using `pe_map_export_ordinal` on the mapped provider. `cpu_native_start
 
 External providers with process-lifetime workers can use `--pin-shim DLL` alongside `--shim DLL PATH`. This pins the provider immediately before the first guest image loads, and only in execution mode. Run packages in a child process when using pinned providers. The guest must still join its own workers and quiesce any host calls into guest code before returning. `cpu_package_shim_lifetime` verifies that the selected provider remains loaded after the entry returns and the ordinary provider unloads.
 
+### Scoped content root on Windows
+
+`startup_content_root` creates generated archive bytes in a package directory and different bytes
+in a save/config directory. The source-built EXE selects a free drive letter and resolves its
+root-level synthetic archive names through a process-local mapping. It opens the package archive
+read-only and checks the exact bytes. A file that exists only in save/config returns
+`ERROR_FILE_NOT_FOUND` through the content mapping, and a write to the content handle is refused.
+
+An occupied host letter returns `ERROR_ALREADY_ASSIGNED`. After both the successful open and the
+missing-file case, the scope releases the mapping and the same drive path returns
+`ERROR_INVALID_DRIVE`. The EXE checks that the Windows drive mask is unchanged and removes its
+generated files. A host with all drive letters occupied returns skip code 77. This fixture is
+independent of the package loader. [Windows drive mask](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getlogicaldrives) · [File open behavior](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+
+```powershell
+cmake --build --preset dev --target guest_content_root_check
+ctest --preset dev --no-tests=error -R '^startup_content_root$' -V
+```
+
 ## Two-record archive reader from standard startup
 
 The [archive reader](../tests/cpu/archive/reader.zig) uses Zig 0.13.0's standard single-threaded Windows console startup. From the linked entry the translator follows the call into the record loop and the final call to RtlExitUserProcess. It recognizes six-byte linker jump thunks for explicitly bound IAT slots, models termination without fallthrough and propagates a narrow return value through a wider register copy. A control changes the startup to consume EAX instead of AL and must fail translation.
