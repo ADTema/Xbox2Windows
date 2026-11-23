@@ -3484,6 +3484,47 @@ A local scan of the inspected package's 16 DLLs together with this `xmem.dll` (`
 | `xmem_shim_working_set_aggregation` | Synthetic readings for the aggregation rules. Regression reference: the laptop readings above give no total when the two LUIDs have no identity, and a 64 MiB difference when both carry the same key. Also covered: Basic Render Driver aliases count once, distinct adapters of the same model with equal readings are summed, a genuine zero is published, and an all-failed, partly failed or incomplete enumeration, disagreeing aliases, an active adapter of unknown identity next to another active adapter, partly overlapping linked adapters and an overflowing sum give no total. Keys that differ only in case count once, must agree, and still give no total when they partly overlap. Malformed key query output (nothing written, an empty key, a length past the buffer, no terminator, an embedded terminator) gives no key. Per-node readings: usage only on node 1 of a linked pair is counted, and an unknown node count, a segment query that fails after a successful one (on the same node or a later node) and an overflow between segments or nodes give no total. |
 | `xmem_shim_working_set_warp`, `xmem_shim_working_set_hardware` | As the callers do, reads `+8` (zero on failure) before and after creating and releasing 64 MiB DEFAULT, UPLOAD and READBACK heaps and a 32 MiB committed buffer on a new device. Each creation must add at least the allocation size (`GetResourceAllocationInfo` for the buffer) and at most 4 MiB more, and each release must remove as much. Negative control: with the former `ERROR_NOT_SUPPORTED` stub every difference is 0 and both cases fail. Prints each DXGI adapter with its LUID, node count and PnP keys. The hardware case measures the first D3D12 adapter in high-performance order, or the first whose description contains `XBOX2WINDOWS_ADAPTER` (ignoring case; no match fails), and prints it. Skips (77) without the adapter or a D3D12 device. |
 
+### Default allocation pair under the Windows loader and pe_map
+
+Refs #875, #879 and #870. This is a test of the exports #879 added (see [Default allocation imports](#default-allocation-imports)), not a change to them. `cpu_native_xmem_default_pair` builds `tests/cpu/xmem_default_pair.asm` into four x64 EXEs that start through `exe_startup.asm`. Each imports by name:
+
+- `XMemAllocDefault` and `XMemFreeDefault` from `xmem.dll`;
+- `VirtualQuery`, `SetLastError` and `GetLastError` from `kernel32.dll`;
+- `heap_block_busy` from `cpu_heap_probe.dll`;
+- `finish_exe` from `cpu_exe_io.dll`.
+
+The test stages each EXE with its DLLs, launches it normally, then maps it in a child process and starts it with `pe_map_run`. The body returns `0x875` when its 21 steps pass, or `0xF00` plus the first failing step. The test prints one line per named check:
+
+| Check | Steps and evidence |
+|---|---|
+| `pe_import_names` | `pefile` reads each EXE's import table. `xmem.dll` must be imported for exactly `XMemAllocDefault` and `XMemFreeDefault`, by name. |
+| `mapped_resolver_names` | The `pe_map` resolver callback records every request. It must ask for both names and the five other imports, and nothing else. |
+| `heap_block` | 1–5. `XMemAllocDefault(257, 0x05e50000)` returns a block that is 32-byte aligned and zero-filled, and takes writes. `heap_block_busy` finds a busy heap entry containing it. |
+| `graphics_block` | 6–9. `XMemAllocDefault(4096, 0xa8004000)` returns a block that is 64 KiB aligned and zero-filled, and takes writes. |
+| `rejected_inputs` | 10–14. Reserved bit 33, a zero size, page size 3 and memory type 15 each return null. The last-error value set to 0 before these calls is still 0, so no system allocator ran. |
+| `induced_failure` | 15–18. A valid graphics word with 2^46 bytes returns null with a nonzero last-error value set by `VirtualAlloc`. A valid heap word with 2^46 bytes returns null. The same graphics word with 4096 bytes then succeeds, and that block is freed. |
+| `graphics_release_virtualquery` | 19–20. After `XMemFreeDefault` on both blocks and on null, `VirtualQuery` reports the graphics address as `MEM_FREE`. |
+| `heap_release_ownership` | 21. No busy heap entry contains the heap block any more. A freed CRT block normally stays inside committed heap memory, so `VirtualQuery` cannot show its release. `tests/cpu/heap_probe.cpp` instead locks each process heap and walks it with `HeapWalk`. |
+
+| Variant | Windows launch | `pe_map` | First failing check |
+|---|---|---|---|
+| `original` | `0x875` | `0x875` | none |
+| `skip_gpu_free` | `0xf14` | `0xf14` | `graphics_release_virtualquery` |
+| `skip_heap_free` | `0xf15` | `0xf15` | `heap_release_ownership` |
+| `uninduced` (4096 bytes at step 15) | `0xf0f` | `0xf0f` | `induced_failure` |
+
+A provider that binds only one of the pair stops the mapping before the entry point. The diagnostic is `unresolved import xmem.dll!XMemAllocDefault` or `unresolved import xmem.dll!XMemFreeDefault`.
+
+What this establishes, and what it does not:
+
+- **ABI.** [SlimEra `era.h` at 912bb11](https://github.com/XWine1/SlimEra/blob/912bb1123e84f32023af6685989ac5d6747d767a/era.h) declares `PVOID WINAPI XMemAllocDefault(SIZE_T, ULONGLONG)` and `void WINAPI XMemFreeDefault(PVOID, ULONGLONG)`. This is an independent reimplementation's declaration, not console evidence. The fixture calls the pair with that shape.
+- **Desktop behavior.** The steps record what the desktop shim does: alignment, zero fill, null on rejected input or allocation failure, and release with the matching word. The last-error results distinguish the two failure kinds on the desktop only. Console failure, alignment and release behavior remain unverified.
+
+```powershell
+cmake --build --preset dev --target pe_map cpu_exe_io cpu_heap_probe cpu_xmem_default_original cpu_xmem_default_skip_gpu_free cpu_xmem_default_skip_heap_free cpu_xmem_default_uninduced
+ctest --preset dev --no-tests=error -R '^cpu_native_xmem_default_pair$' -V
+```
+
 ### Desktop d3d12_xs.dll
 
 `src/d3d12_xs_shim.cpp` builds `d3d12_xs.dll`, exporting the two root-signature functions that remained unresolved across the 16 package DLLs after `xmem.dll`:
