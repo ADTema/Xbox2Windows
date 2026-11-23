@@ -16,23 +16,30 @@ AXES = "xyz"
 GUARD_COMPARES = {"gt": ">", "lt": "<", "ge": ">=", "le": "<="}
 # The data ALU subset: the unsigned 32-bit operations the LLVM 15 code generator emits for the
 # read-compute-write fixture, on known words only. v_and_b32 and v_lshrrev_b32 (src1 >> src0[4:0])
-# reuse the pixel profile's integer templates, which have the same semantics. v_mad_u32_u24 is
+# reuse the pixel profile's integer templates, as does v_mul_lo_u32. v_mad_u32_u24 is
 # src0[23:0] * src1[23:0] + src2, modulo 2^32. None of them writes vcc, so the guard compare stays valid.
 ALU = {
     "v_and_b32_e32": f"({INTEGER['and_b32'][1]})",
     "v_lshrrev_b32_e32": f"({INTEGER['lshrrev_b32'][1]})",
     "v_min_u32_e32": "min({0}, {1})",
+    "v_mul_lo_u32": INTEGER["mul_lo_u32"][1],
     "v_mad_u32_u24": "((({0} & 0xffffffu) * ({1} & 0xffffffu)) + {2})",
 }
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
-LDS_RMW_OPERATORS = {
-    "ds_add_u32": "+",
-    "ds_sub_u32": "-",
-    "ds_and_b32": "&",
-    "ds_or_b32": "|",
-    "ds_xor_b32": "^",
+# Template operands are the old LDS word and the source VGPR, both HLSL uints.
+LDS_RMW = {
+    "ds_add_u32": "({0} + {1})",
+    "ds_sub_u32": "({0} - {1})",
+    "ds_and_b32": "({0} & {1})",
+    "ds_or_b32": "({0} | {1})",
+    "ds_xor_b32": "({0} ^ {1})",
+    "ds_rsub_u32": "({1} - {0})",
+    "ds_min_i32": "asuint(min(asint({0}), asint({1})))",
+    "ds_max_i32": "asuint(max(asint({0}), asint({1})))",
+    "ds_min_u32": "min({0}, {1})",
+    "ds_max_u32": "max({0}, {1})",
 }
 
 
@@ -412,9 +419,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("LDS expression exceeds the profile limit")
                 lds_word = ("alu", expression)
             ds_wait = True
-        elif ((m := re.fullmatch(r"(ds_[a-z]+)(?P<ret>_rtn)?(_[ub]32) "
+        elif ((m := re.fullmatch(r"(ds_[a-z]+)(?P<ret>_rtn)?(_[iub]32) "
                                  r"(?(ret)v(\d+), )v(\d+), v(\d+)(?: offset:0)?", line))
-              and (op := LDS_RMW_OPERATORS.get(m[1] + m[3])) is not None):
+              and (template := LDS_RMW.get(m[1] + m[3]))):
             dst = int(m[4]) if m[4] is not None else None
             addr, src = int(m[5]), int(m[6])
             value = vector.get(src)
@@ -422,8 +429,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or (dst is not None and dst > 255) or vector.get(addr) != ("lds_address",)
                     or lds_word is None or not is_word(value)):
                 raise ValueError("Unverified private LDS update")
-            # Both operands are HLSL uints. Addition and subtraction wrap at 32 bits.
-            expression = f"({hlsl_word(lds_word)} {op} {hlsl_word(value)})"
+            expression = template.format(hlsl_word(lds_word), hlsl_word(value))
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("LDS expression exceeds the profile limit")
             # Capture the inputs before assigning the old word to a possibly overlapping VGPR.
@@ -431,8 +437,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 vector[dst] = lds_word
             lds_word = ("alu", expression)
             ds_wait = True
-        elif m := re.fullmatch(r"ds_read_(b32|[ui](?:8|16)) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
-            op, dst, addr, offset = m[1], int(m[2]), int(m[3]), int(m[4] or 0)
+        elif m := re.fullmatch(r"ds_read_(b32|[ui](?:8|16))(?P<d16>_d16(?P<hi>_hi)?)? "
+                               r"v(?P<dst>\d+), v(?P<addr>\d+)(?: offset:(?P<offset>[0-3]))?", line):
+            op, dst, addr, offset = m[1], int(m["dst"]), int(m["addr"]), int(m["offset"] or 0)
+            d16, high = m["d16"], m["hi"]
+            if d16 and (op not in ("u8", "i8", "u16") or (op == "i8" and high)):
+                raise ValueError("Unsupported compute instruction: " + line)
             width = int(op[1:])
             if (not lds_enabled or guard_span is not None or max(dst, addr) > 255
                     or vector.get(addr) != ("lds_address",) or lds_word is None or offset % (width // 8)):
@@ -447,6 +457,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     expression = f"asuint(asint({shifted} << {extend}u) >> {extend}u)"
                 else:
                     expression = f"({shifted} & 0x{(1 << width) - 1:x}u)"
+                if d16:
+                    previous = vector.get(dst)
+                    if not is_word(previous):
+                        raise ValueError("Unverified D16 destination word")
+                    keep, shift = ("0x0000ffffu", 16) if high else ("0xffff0000u", 0)
+                    expression = f"(({hlsl_word(previous)} & {keep}) | (({expression} & 0xffffu) << {shift}u))"
                 if len(expression) > ALU_EXPRESSION_LIMIT:
                     raise ValueError("LDS expression exceeds the profile limit")
                 vector[dst] = ("alu", expression)
@@ -462,6 +478,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
+              or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
               and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
             # VOP2 takes a VGPR as src1. A v_mad_u32_u24 with an address operand is a row pitch below.

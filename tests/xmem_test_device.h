@@ -1,5 +1,5 @@
 // D3D12 device for the xmem working-set tests (tests/xmem_shim_check.cpp,
-// tests/cpu/working_set_xmem_check.cpp).
+// tests/cpu/working_set_xmem_check.cpp) and the range translation check (tests/vm_translation_check.cpp).
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN

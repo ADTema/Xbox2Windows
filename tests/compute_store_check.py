@@ -739,9 +739,18 @@ READ_MAD24 = variant(
     ("v_and_b32_e32 v2, 0xffff, v1", "v_and_b32_e32 v2, 0x1ffffff, v1"),
     ("v_lshrrev_b32_e32 v1, 16, v1", "v_and_b32_e32 v1, 0x2ffffff, v1"),
 )
+# Keep the same guarded read and write. Use the entire source and constant words.
+READ_MUL_LO = variant(
+    READ_COMPUTE,
+    ("v_and_b32_e32 v2, 0xffff, v1", ""),
+    ("v_lshrrev_b32_e32 v1, 16, v1", ""),
+    ("v_mad_u32_u24 v1, v2, v1, v0", "v_mul_lo_u32 v1, s0, v1"),
+    ("v_min_u32_e32 v1, s0, v1", ""),
+)
 ALU_CASES = [
     ("read_compute", READ_COMPUTE, 32, READ_BINDING),
     ("read_mad24", READ_MAD24, 32, READ_BINDING),
+    ("read_mul_lo", READ_MUL_LO, 32, READ_BINDING),
 ]
 
 
@@ -957,6 +966,14 @@ def alu_controls():
     load = READ_LOADS["read_copy"]
     assert (f"min(params[0].y, (((0x0000012cu & 0xffffffu) * ((0xfffffff0u & {load}) & 0xffffffu)) + params[0].y)"
             in alu(("0xffff, v1", "-16, v1"), (mad, "v_mad_u32_u24 v1, 0x12c, v2, s0"))[-3])
+    mul = "v_mul_lo_u32 v1, s0, v1"
+    lines = aot.lower(READ_MUL_LO, 32, **READ_BINDING).splitlines()
+    assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, (params[0].y * {load}));",
+                         "    }", "}"], lines
+    rejects("Unverified ALU operand", aot.lower, variant(READ_MUL_LO, (mul, mul.replace("s0", "v255"))),
+            32, **READ_BINDING)
+    rejects("Unsupported compute instruction: v_mul_lo_u32", aot.lower, variant(READ_MUL_LO, (mul, mul + " clamp")),
+            32, **READ_BINDING)
     unsupported, operand = "Unsupported compute instruction: ", "Unverified ALU operand"
     compare = "Unverified lane guard compare"
     # The x8 descriptor load moved before the guard, so only the result is written under it.
@@ -1170,30 +1187,57 @@ def ds_controls():
 
 
 LDS_BINDING = DS_BINDING | {"stride": 12, "lds_bytes": 128}
+
+
+def signed_order(word):
+    # Flipping the sign bit places negatives before nonnegatives in an unsigned comparison.
+    return word ^ 0x80000000
+
+
 LDS_UPDATES = {
     "ds_add_u32": operator.add,
     "ds_sub_u32": operator.sub,
     "ds_and_b32": operator.and_,
     "ds_or_b32": operator.or_,
     "ds_xor_b32": operator.xor,
+    "ds_rsub_u32": lambda old, value: value - old,
+    "ds_min_i32": lambda old, value: min(old, value, key=signed_order),
+    "ds_max_i32": lambda old, value: max(old, value, key=signed_order),
+    "ds_min_u32": min,
+    "ds_max_u32": max,
+}
+LDS_ORDER_MUTANTS = {
+    "ds_rsub_u32": "ds_sub_u32",
+    "ds_min_i32": "ds_min_u32",
+    "ds_max_i32": "ds_max_u32",
+    "ds_min_u32": "ds_min_i32",
+    "ds_max_u32": "ds_max_i32",
 }
 
 
+def lds_update_inputs(op):
+    # Each pair is (scale, base) for a lane-dependent 32-bit word.
+    if op in LDS_ORDER_MUTANTS:
+        return (1, 0x7ffffff0), (1, 0xfffffff8), (4, 0xfffffff0)
+    return (1, 0xfffffff0), (1, 0x40000021), (1, 0x80000003)
+
+
 def lds_update_program(op):
+    (init_scale, init_base), (first_scale, first_base), (second_scale, second_base) = lds_update_inputs(op)
     return DS_PREFIX + [
         "v_lshlrev_b32_e32 v5, 2, v0",
-        "v_mad_u32_u24 v6, 1, v8, 0xfffffff0",
+        f"v_mad_u32_u24 v6, {init_scale}, v8, 0x{init_base:08x}",
         "ds_write_b32 v5, v6",
         "s_waitcnt lgkmcnt(0)",
         "ds_read_b32 v10, v5",
         "s_waitcnt lgkmcnt(0)",
-        "v_mad_u32_u24 v6, 1, v8, 0x40000021",
+        f"v_mad_u32_u24 v6, {first_scale}, v8, 0x{first_base:08x}",
         f"{op} v5, v6",
         "s_waitcnt lgkmcnt(0)",
         "v_mov_b32_e32 v6, 0",
         "ds_read_b32 v11, v5",
         "s_waitcnt lgkmcnt(0)",
-        "v_mad_u32_u24 v9, 1, v8, 0x80000003",
+        f"v_mad_u32_u24 v9, {second_scale}, v8, 0x{second_base:08x}",
         f"{op} v5, v9",
         "s_waitcnt lgkmcnt(0)",
         "v_mov_b32_e32 v9, 0",
@@ -1206,11 +1250,12 @@ def lds_update_program(op):
 
 def lds_update_reference(op, groups):
     update = LDS_UPDATES[op]
+    inputs = lds_update_inputs(op)
     words = []
     for lane in range(groups * 32):
-        initial = (lane - 16) & 0xffffffff
-        first = update(initial, 0x40000021 + lane) & 0xffffffff
-        second = update(first, 0x80000003 + lane) & 0xffffffff
+        initial, src1, src2 = ((scale * lane + base) & 0xffffffff for scale, base in inputs)
+        first = update(initial, src1) & 0xffffffff
+        second = update(first, src2) & 0xffffffff
         words.extend((initial, first, second))
     return words
 
@@ -1221,21 +1266,27 @@ LDS_RETURN_UPDATES = {
     "ds_and_rtn_b32": "ds_and_b32",
     "ds_or_rtn_b32": "ds_or_b32",
     "ds_xor_rtn_b32": "ds_xor_b32",
+    "ds_rsub_rtn_u32": "ds_rsub_u32",
+    "ds_min_rtn_i32": "ds_min_i32",
+    "ds_max_rtn_i32": "ds_max_i32",
+    "ds_min_rtn_u32": "ds_min_u32",
+    "ds_max_rtn_u32": "ds_max_u32",
 }
 
 
 def lds_return_update_program(op):
+    (init_scale, init_base), (first_scale, first_base), (second_scale, second_base) = lds_update_inputs(LDS_RETURN_UPDATES[op])
     return DS_PREFIX + [
         "v_lshlrev_b32_e32 v5, 2, v0",
         "v_lshlrev_b32_e32 v11, 2, v0",
-        "v_mad_u32_u24 v6, 1, v8, 0xfffffff0",
+        f"v_mad_u32_u24 v6, {init_scale}, v8, 0x{init_base:08x}",
         "ds_write_b32 v5, v6",
         "s_waitcnt lgkmcnt(0)",
         # First alias the data VGPR, then alias a copy of the address VGPR.
-        "v_mad_u32_u24 v10, 1, v8, 0x40000021",
+        f"v_mad_u32_u24 v10, {first_scale}, v8, 0x{first_base:08x}",
         f"{op} v10, v5, v10",
         "s_waitcnt lgkmcnt(0)",
-        "v_mad_u32_u24 v9, 1, v8, 0x80000003",
+        f"v_mad_u32_u24 v9, {second_scale}, v8, 0x{second_base:08x}",
         f"{op} v11, v11, v9",
         "s_waitcnt lgkmcnt(0)",
         "ds_read_b32 v12, v5",
@@ -1327,6 +1378,51 @@ LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING),
 ]
 
 
+LDS_D16_READS = {
+    "ds_read_u8_d16": (1, False, False),
+    "ds_read_u8_d16_hi": (1, False, True),
+    "ds_read_i8_d16": (1, True, False),
+    "ds_read_u16_d16": (2, False, False),
+    "ds_read_u16_d16_hi": (2, False, True),
+}
+LDS_D16_DESTINATIONS = (0xa53172be, 0xe8ba23f1, 0x64c139a7)
+
+
+def lds_d16_offsets(size):
+    return (0, 1, 3) if size == 1 else (0, 2, 0)
+
+
+def lds_d16_program(op):
+    size, _, _ = LDS_D16_READS[op]
+    lines = DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mad_u32_u24 v6, 1, v8, 0x887f80f0",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+    ]
+    for dst, value, offset in zip(range(10, 13), LDS_D16_DESTINATIONS, lds_d16_offsets(size)):
+        suffix = f" offset:{offset}" if offset else ""
+        lines += [f"v_mov_b32_e32 v{dst}, 0x{value:08x}", f"{op} v{dst}, v5{suffix}", "s_waitcnt lgkmcnt(0)"]
+    return lines + ["buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen", "s_endpgm"]
+
+
+def lds_d16_reference(op, groups):
+    size, signed, high = LDS_D16_READS[op]
+    words = []
+    start = 2 if high else 0
+    for lane in range(groups * 32):
+        data = (0x887f80f0 + lane).to_bytes(4, "little")
+        for initial, offset in zip(LDS_D16_DESTINATIONS, lds_d16_offsets(size)):
+            field = int.from_bytes(data[offset:offset + size], "little", signed=signed)
+            result = bytearray(initial.to_bytes(4, "little"))
+            result[start:start + 2] = (field & 0xffff).to_bytes(2, "little")
+            words.append(int.from_bytes(result, "little"))
+    return words
+
+
+LDS_CASES += [(op, lds_d16_program(op), LDS_BINDING) for op in LDS_D16_READS]
+
+
 def lds_subword_reference(width, offset, groups):
     expected = []
     size = width // 8
@@ -1414,7 +1510,7 @@ def lds_controls():
         ("ds_add_u32 v5, v254", "Unverified private LDS update"),
         ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
         ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
-        ("ds_rsub_rtn_u32 v10, v5, v6", "Unsupported compute instruction"),
+        ("ds_inc_rtn_u32 v10, v5, v6", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
     i = lines.index(update)
@@ -1453,6 +1549,33 @@ def lds_controls():
             lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
+    for ret, op in LDS_RETURN_UPDATES.items():
+        if op not in LDS_ORDER_MUTANTS:
+            continue
+        for lines, update in ((lds_update_program(op), f"{op} v5, v6"),
+                              (lds_return_update_program(ret), f"{ret} v10, v5, v10")):
+            for modifier in ("offset:4", "gds"):
+                rejects("Unsupported compute instruction", aot.lower,
+                        variant(lines, (update, f"{update} {modifier}")), 32, **LDS_BINDING)
+
+
+    lines = lds_d16_program("ds_read_u16_d16_hi")
+    read = "ds_read_u16_d16_hi v10, v5"
+    for bad, message in (
+        (read.replace("v10", "v254"), "Unverified D16 destination word"),
+        (read.replace("v10", "v5"), "Unverified D16 destination word"),
+        (read + " offset:1", "Unverified private LDS read"),
+        (read + " offset:4", "Unsupported compute instruction"),
+        (read + " gds", "Unsupported compute instruction"),
+        (read.replace("u16", "b32"), "Unsupported compute instruction"),
+        (read.replace("u16", "i8"), "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (read, bad)), 32, **LDS_BINDING)
+    i = lines.index(read)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+
+
 def ds_binary(directory, assembler, objcopy, library):
     for name, lines, binding in DS_CASES + LDS_CASES:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
@@ -1476,16 +1599,27 @@ def ds_binary(directory, assembler, objcopy, library):
 
 
 def ds_mutants(name, lines, binding, source):
-    if name in LDS_UPDATES:
+    if name in LDS_ORDER_MUTANTS:
+        changed = variant(lines, (f"{name} v5, v6", f"{LDS_ORDER_MUTANTS[name]} v5, v6"))
+        yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_UPDATES:
         changed = variant(lines, (f"{name} v5, v6", "ds_write_b32 v5, v6"))
         yield aot.lower(changed, 32, **binding), 1
     elif name in LDS_RETURN_UPDATES:
         op = LDS_RETURN_UPDATES[name]
         return_new = f"{op} v5, v10\ns_waitcnt lgkmcnt(0)\nds_read_b32 v10, v5"
         changed = variant(lines, (f"{name} v10, v5, v10", return_new))
-        yield aot.lower(changed, 32, **binding), 0
+        words = lds_update_reference(op, 3)
+        # At some lanes a min/max update keeps the old value. Find the first changed lane.
+        first = next(i for i in range(0, len(words), 3) if words[i] != words[i + 1])
+        yield aot.lower(changed, 32, **binding), first
         changed = variant(lines, (f"{name} v11, v11, v9", "ds_read_b32 v11, v11"))
-        yield aot.lower(changed, 32, **binding), 2
+        second = next(i for i in range(2, len(words), 3) if words[i - 1] != words[i])
+        yield aot.lower(changed, 32, **binding), second
+        if op in LDS_ORDER_MUTANTS:
+            wrong_op = next(ret for ret, base in LDS_RETURN_UPDATES.items() if base == LDS_ORDER_MUTANTS[op])
+            changed = variant(lines, (f"{name} v10, v5, v10", f"{wrong_op} v10, v5, v10"))
+            yield aot.lower(changed, 32, **binding), 1
     elif name in LDS_SUBWORDS:
         width, offset = LDS_SUBWORDS[name]
         suffix = f" offset:{offset}" if offset else ""
@@ -1494,6 +1628,12 @@ def ds_mutants(name, lines, binding, source):
         changed = variant(lines, (f"ds_read_i{width} v12, v5{suffix}", f"ds_read_u{width} v12, v5{suffix}"))
         # Lane 16 is the first to set the sign bit. The signed read is its third word.
         yield aot.lower(changed, 32, **binding), 16 * 3 + 2
+    elif name in LDS_D16_READS:
+        changed = variant(lines, (f"v_mov_b32_e32 v10, 0x{LDS_D16_DESTINATIONS[0]:08x}", "v_mov_b32_e32 v10, 0"))
+        yield aot.lower(changed, 32, **binding), 0
+        if name == "ds_read_i8_d16":
+            changed = variant(lines, ("ds_read_i8_d16 v10, v5", "ds_read_u8_d16 v10, v5"))
+            yield aot.lower(changed, 32, **binding), 0
     elif name == "lds_overlap":
         no_halfword = variant(lines, ("ds_write_b16 v5, v7", "s_nop 0"))
         yield aot.lower(no_halfword, 32, **binding), 1
@@ -1524,6 +1664,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
                 words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
             elif name in LDS_SUBWORDS:
                 words = lds_subword_reference(*LDS_SUBWORDS[name], groups)
+            elif name in LDS_D16_READS:
+                words = lds_d16_reference(name, groups)
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)
             elif private:
@@ -1915,12 +2057,50 @@ def draw_mad24(directory, compiler, cmd, case):
     return 0
 
 
+def draw_mul_lo(cmd, case):
+    factor = 0x01000003
+    modulus = 1 << 32
+
+    def write(groups, bound, words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, factor, *([0] * 14)))
+
+    for groups, bound in READ_RUNS:
+        words = [SENTINEL] * 320
+        for gid in range(bound):
+            words[gid] = (source_word(gid) * factor) % modulus
+        write(groups, bound, words)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+
+    assert source_word(0) * factor >= modulus
+    controls = ((0, (source_word(0) * (factor & 0xffffff)) % modulus),
+                (0, ((source_word(0) & 0xffffff) * factor) % modulus),
+                (bound, (source_word(bound) * factor) % modulus))
+    for gid, wrong in controls:
+        assert wrong != words[gid]
+        stale = words.copy()
+        stale[gid] = wrong
+        write(groups, bound, stale)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        mismatch = f"word={gid} expected={wrong:08x} actual={words[gid]:08x}"
+        if bad.returncode != 1 or mismatch not in bad.stderr:
+            raise AssertionError(f"read_mul_lo: expected {mismatch}\n{bad.stderr}")
+        print(mismatch)
+    return 0
+
+
 def draw(directory, compiler, renderer, backend, cases=None):
     for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
+        if name == "read_mul_lo":
+            result = draw_mul_lo(cmd, case)
+            if result:
+                return result
+            continue
         if name == "read_mad24":
             result = draw_mad24(directory, compiler, cmd, case)
             if result:
