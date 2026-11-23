@@ -2096,7 +2096,7 @@ The CPU controls reject a missing or wrong restore, a saved mask overwritten und
 
 ### Vector reads from a second raw buffer
 
-The store profile can copy one word per read from a second, read-only raw buffer to the store. The caller binds it with `--source-descriptor`, the table byte offset of its four-word descriptor, which becomes `ByteAddressBuffer inputData : register(t0)`. `--source-stride` gives its byte stride for indexed reads. The descriptor may come from its own `s_load_dwordx4` or from one `s_load_dwordx8` with a neighbouring bound descriptor, which is how the LLVM 15 code generator loads u0 and the source together. No values are computed yet: the word read is only stored or copied with `v_mov_b32`.
+The store profile can copy one word per read from a second, read-only raw buffer to the store. The caller binds it with `--source-descriptor`, the table byte offset of its four-word descriptor, which becomes `ByteAddressBuffer inputData : register(t0)`. `--source-stride` gives its byte stride for indexed reads. The descriptor may come from its own `s_load_dwordx4` or from one `s_load_dwordx8` with a neighbouring bound descriptor, which is how the LLVM 15 code generator loads u0 and the source together. The word read is stored, copied with `v_mov_b32`, or used by the small integer ALU subset of the next subsection.
 
 The accepted subset is small:
 
@@ -2115,6 +2115,40 @@ The CPU controls reject a read without its `vmcnt(0)` wait, with only an `lgkmcn
 ```sh
 python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-reg 0 --descriptor-offset 0 --constant-descriptor 32 --group-reg 1 --stride 4 --source-descriptor 16 --output out/copy.hlsl
 ```
+
+### Integer ALU between a read and a store
+
+The store profile accepts four unsigned 32-bit vector operations on known words. Each one is what the LLVM 15 code generator emits for the read–compute–write fixture below:
+
+| Instruction | Result |
+|---|---|
+| `v_and_b32_e32 vD, a, vB` | `a & b` |
+| `v_lshrrev_b32_e32 vD, a, vB` | `b >> (a & 31)`, logical |
+| `v_mad_u32_u24 vD, a, b, c` | `(a & 0xffffff) * (b & 0xffffff) + c`, modulo 2^32 |
+| `v_min_u32_e32 vD, a, vB` | unsigned minimum |
+
+A source is a VGPR, an SGPR that holds a known word, an integer inline constant or a 32-bit literal. The VOP2 forms take a VGPR as the second source. A known word is a literal, a constant-buffer word, a dispatch index, a word read from t0, or an earlier result. The result becomes an inline HLSL expression of its sources. An expression longer than 1024 characters is rejected. `v_mad_u32_u24` with a byte offset as an operand is still the row pitch of a store address, as before.
+
+Results are data only. They can be stored or copied, but they cannot form a store or read address. A result or a word read from t0 is also rejected as a lane-guard compare operand. None of the four instructions writes `vcc`, so the guard compare stays valid. A result written under the guard is unknown after the restore, like any other register.
+
+Anything else stops the lowering at that instruction, with the instruction in the error. This includes signed and other operations (`v_min_i32`, `v_max_u32`, `v_ashrrev_i32`, `v_or_b32`, `v_mad_i32_i24`), carry forms that write `vcc` (`v_add_co_u32`), 16-bit, 64-bit and SDWA forms, register ranges, an SGPR as a VOP2 second source, and output modifiers such as `clamp`.
+
+The fixture is unchanged LLVM 15 code generator output for an original `amdgpu_cs` source, with the read bindings and `cap = params[0].y`:
+
+```c
+if (gid < n) {
+    uint v = src[gid];
+    out[gid] = umin((v & 0xffff) * (v >> 16) + gid, cap);
+}
+```
+
+```hlsl
+if (params[0].x > tid.x) {
+    outputData.Store(tid.x * 4u + 0u, min(params[0].y, ((((0x0000ffffu & inputData.Load((tid.x << 2u) + 0u)) & 0xffffffu) * ((inputData.Load((tid.x << 2u) + 0u) >> (0x00000010u & 31u)) & 0xffffffu)) + tid.x)));
+}
+```
+
+The Windows fixture uses the read harness and its three dispatches, with `cap = 0x45000000`, which clamps about half of the lanes. The expected words come from a CPU model of the source. On five groups with `n = 150`, each of these must fail: a reference with one word off by one bit, with `max` instead of `min`, a shift of 15, a 24-bit instead of a 16-bit mask, or lane 150 also writing. So must recompiled HLSL with `max` for `min`, a shift of 15, a 24-bit mask, the `+ gid` dropped, or the cap read from `params[0].z`. The operands of `v_mad_u32_u24` stay below 2^16 in this fixture, so the 24-bit masks are checked by the exact output and not on the GPU.
 
 ### Two- and three-dimensional thread groups
 
