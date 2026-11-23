@@ -1252,27 +1252,26 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_mmx_original>"
         "$<TARGET_FILE:cpu_sse_mmx_original_lifted>"
         "$<TARGET_FILE:cpu_sse_mmx_altered_lifted>")
-    set(cpu_integer_flags_exports
-        "op_add8_lahf,op_add16_lahf,op_add32_lahf,op_add64_lahf,"
-        "op_sub8_lahf,op_sub16_lahf,op_sub32_lahf,op_sub64_lahf,"
-        "op_cmp8_lahf,op_cmp16_lahf,op_cmp32_lahf,op_cmp64_lahf,"
-        "op_add8_al_lahf,op_add32_imm_lahf,op_sub32_imm_lahf,op_cmp64_imm_lahf,"
-        "op_discarded_read")
-    string(CONCAT cpu_integer_flags_exports ${cpu_integer_flags_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_integer_flags_${variant} integer_flags)
-        cpu_translation(cpu_integer_flags_${variant} cpu_integer_flags_aot "${cpu_integer_flags_exports}")
+        set(cpu_integer_flags_${variant}_lifted_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_integer_flags_${variant}_lifted.cpp")
+        add_custom_command(OUTPUT "${cpu_integer_flags_${variant}_lifted_cpp}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py"
+                emit "$<TARGET_FILE:cpu_integer_flags_${variant}>" "${cpu_integer_flags_${variant}_lifted_cpp}"
+            DEPENDS cpu_integer_flags_${variant} tests/cpu/integer_flags_check.py tools/ffx_version_query.py
+                tools/x87_lower.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_integer_flags_${variant}_lifted SHARED "${cpu_integer_flags_${variant}_lifted_cpp}")
     endforeach()
     target_compile_definitions(cpu_integer_flags_altered PRIVATE ALTER_IMM)
     set(cpu_integer_flags_controls_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_integer_flags_controls.cpp")
     add_custom_command(OUTPUT "${cpu_integer_flags_controls_cpp}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py"
             emit-controls "$<TARGET_FILE:cpu_integer_flags_original>" "${cpu_integer_flags_controls_cpp}"
-        DEPENDS cpu_integer_flags_original tests/cpu/integer_flags_check.py
-            tools/cpu_integer_flags_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+        DEPENDS cpu_integer_flags_original tests/cpu/integer_flags_check.py tools/ffx_version_query.py
+            tools/x87_lower.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
     add_library(cpu_integer_flags_controls SHARED "${cpu_integer_flags_controls_cpp}")
     add_test(NAME cpu_aot_integer_flags COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py"
+        "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py" check
         "$<TARGET_FILE:cpu_integer_flags_original>"
         "$<TARGET_FILE:cpu_integer_flags_original_lifted>"
         "$<TARGET_FILE:cpu_integer_flags_altered_lifted>"

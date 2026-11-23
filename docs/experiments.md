@@ -6391,29 +6391,29 @@ prologues, and title CPU code execution.
 
 ## Integer LAHF status transfer slice
 
-[The integer-flags leaf translator](../tools/cpu_integer_flags_aot.py) lifts bounded
-straight-line Windows x64 leaf functions for the same-block `ADD`/`SUB`/`CMP` -> `LAHF`
-slice covering `lahf` from `docs/coverage/x64_zen2.tsv` group `Integer`:
+[The shared query translator](../tools/ffx_version_query.py) lowers `lahf` from
+`docs/coverage/x64_zen2.tsv` group `Integer` when its flags come from a same-block
+register-destination `add`, `sub`, or `cmp` (register or immediate source) earlier in the
+same straight-line basic block (`lahf_sources`):
 
 - Flag producers: register-destination `add`, `sub`, and `cmp` at 8, 16, 32, and 64 bits
-  (register or immediate source), defining `CF`, `PF`, `AF`, `ZF`, `SF`, and `OF`
+  (register or immediate source) tracked in `lahf_sources`, assigning `aux` (`AF`) and
+  `parity` (`PF`) in addition to `CF`, `ZF`, `SF`, and `OF`
 - Status byte transfer: `lahf` (`AH = (SF<<7)|(ZF<<6)|(AF<<4)|(PF<<2)|0x02|CF`) in the same
-  basic block, requiring `RAX` to be previously defined in the function so `AL` and
-  `RAX[63:16]` are preserved without modifying any flags (`lahf` at entry with undefined
-  `RAX` is rejected)
-- Live flag consumers: `setcc` (`setb`/`setp`/`sete`/`sets`/`seto`/etc.) after `lahf`,
-  requiring every consumed flag to be defined
+  basic block, replacing bits `15:8` of `RAX` while preserving `AL` and `RAX[63:16]` without
+  modifying any flags
+- Live flag consumers: `setcc` (`setb`, `setl`, `sete`, `sets`, `seto`, etc.) after `lahf`,
+  verifying that `lahf` preserves status flags for downstream consumers
 
-Each lifted export uses the leaf ABI `void fn(word rcx, word rdx, word r8)` (`rcx`/`rdx`
-inputs, `r8` output), modeling volatile GPRs `rax`/`rcx`/`rdx`/`r8`/`r9`/`r10`/`r11` across
-8-, 16-, 32-, and 64-bit views (including high-byte `ah`/`ch`/`dh`) and per-flag
-definedness tracking. Dead-read fault ordering uses `std::atomic_signal_fence` with
-volatile reads. The lifted DLL exports `host_has_lahf()` to gate native `lahf` execution on
-`CPUID.80000001H:ECX[0]` (returning exit code 77 when absent). Out-of-scope flag ops
-(`pushf`/`popf`/`pushfq`/`popfq`/`sahf`/`inc`/`dec`/`neg`/`adc`/`sbb`/`clc`/`stc`/`cmc`/
-`and`/`or`/`xor`/`test`/shifts/multiplies), undefined flag/GPR reads, memory arithmetic
-operands, nonvolatile GPRs, `rsp`/stack operations, branches/calls, prefixes, VEX/EVEX/XOP
-encodings, and non-`r8` stores reject.
+[The differential harness](../tests/cpu/integer_flags_check.py) lowers each export of the
+MASM fixture through `ffx_version_query.lower` with `host_has_lahf()` exported to gate
+native `lahf` execution on `CPUID.80000001H:ECX[0]` (returning exit code 77 when absent).
+`lahf_sources` refuses `lahf` at function entry, at a branch target, across a branch, call,
+or branch target between the writer and `lahf`, in functions with indirect branches, and
+after any other flag writer (`inc`/`dec`/`neg`/`adc`/`sbb`/`clc`/`stc`/`cmc`/`and`/`or`/
+`xor`/`test`/shifts/`imul`, or memory-operand `add`/`cmp`); `sahf` outside the x87 profile,
+`pushf`/`popf`/`pushfq`/`popfq`, `setp`, disallowed prefixes, EVEX forms, and EIP-relative
+operands also reject.
 
 ```powershell
 cmake --build --preset dev --target cpu_integer_flags_original cpu_integer_flags_original_lifted cpu_integer_flags_altered cpu_integer_flags_altered_lifted cpu_integer_flags_controls
@@ -6424,19 +6424,18 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_integer_flags$' -V
 
 The [MASM fixture](../tests/cpu/integer_flags.asm) exports 17 functions covering `add`,
 `sub`, and `cmp` across 8-, 16-, 32-, and 64-bit register/immediate forms before `lahf` and
-five live `setcc` consumers (`setb`, `setp`, `sete`, `sets`, `seto`), plus a discarded-read
+five live `setcc` consumers (`setb`, `setl`, `sete`, `sets`, `seto`), plus a discarded-read
 fault-ordering control (`op_discarded_read`). [The differential check](../tests/cpu/integer_flags_check.py)
-verifies 460 cases across the 16 differential exports bit-for-bit (full `RAX` and live
-`setcc` flag consumers) against both the native MASM DLL and an independent Python reference
-model with 32-byte pre/post buffer guards across `dev` and `release` (`/O2`) builds,
-alongside dead-read fault ordering (`op_discarded_read`), 4 `ALTER_IMM` divergence controls
-(`op_add8_al_lahf`: `25`, `op_add32_imm_lahf`: `24`, `op_sub32_imm_lahf`: `30`,
-`op_cmp64_imm_lahf`: `26`), 6 mutated-C++ controls (`ctrl_af_bit4`: `7`,
-`ctrl_pf_full_width`: `9`, `ctrl_lahf_bit1_cleared`: `30`, `ctrl_lahf_clobber_rax`: `30`,
-`ctrl_lahf_keep_old_ah`: `22`, `ctrl_lahf_clobber_flags`: `30`), an output-mutation control,
-3 alternate-encoding lift checks, 48 unit rejection controls, and 10 end-to-end PE-patched
-DLL rejection controls.
+verifies 460 cases across the 16 differential exports bit-for-bit (full `RAX` in memory and
+return register plus live `setcc` flag consumers) against both the native MASM DLL and an
+independent Python reference model with 32-byte pre/post buffer guards across `dev` and
+`release` (`/O2`) builds, alongside dead-read fault ordering (`op_discarded_read`), 4
+`ALTER_IMM` divergence controls (`op_add8_al_lahf`: `25`, `op_add32_imm_lahf`: `24`,
+`op_sub32_imm_lahf`: `30`, `op_cmp64_imm_lahf`: `26`), 6 mutated-C++ controls (`ctrl_af_bit4`:
+`7`, `ctrl_pf_full_width`: `9`, `ctrl_lahf_bit1_cleared`: `30`, `ctrl_lahf_clobber_rax`:
+`30`, `ctrl_lahf_keep_old_ah`: `22`, `ctrl_lahf_clobber_flags`: `30`), an output-mutation
+control, 4 alternate-encoding lift checks, 38 unit rejection controls, and 11 end-to-end
+PE-patched DLL rejection controls.
 
 Not covered by this experiment: `sahf`, `inc`/`dec`/`neg`/`adc`/`sbb`, `pushf`/`popf`/
-`pushfq`/`popfq`, cross-block control flow, nonvolatile GPR prologues, and title CPU code
-execution.
+`pushfq`/`popfq`, cross-block flag flow into `lahf`, and title CPU code execution.

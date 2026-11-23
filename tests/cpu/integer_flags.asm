@@ -11,7 +11,7 @@ LAHF_STORE_AND_CONSUME MACRO
     lahf
     mov QWORD PTR [r8], rax
     setb BYTE PTR [r8+8]
-    setp BYTE PTR [r8+9]
+    setl BYTE PTR [r8+9]
     sete BYTE PTR [r8+10]
     sets BYTE PTR [r8+11]
     seto BYTE PTR [r8+12]

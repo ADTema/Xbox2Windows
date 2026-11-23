@@ -1,4 +1,4 @@
-"""Differential checks, mutated-C++ controls, ALTER_IMM controls, and rejection controls for LAHF AOT."""
+"""Differential checks, mutated-C++ controls, ALTER_IMM controls, and rejection controls for LAHF via ffx_version_query."""
 
 import ctypes
 from pathlib import Path
@@ -12,8 +12,9 @@ import pefile
 from iced_x86 import Code, Decoder, Encoder, Instruction, MemoryOperand, Register as R
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-from cpu_integer_flags_aot import PRELUDE, lift_code, translate
-from cpu_leaf_aot import bounded_code, export_rva
+from cpu_leaf_aot import export_rva
+from cpu_ranges import function_ranges
+from ffx_version_query import INTEGER_HEADER, lower, region
 
 MASK64 = 0xFFFFFFFFFFFFFFFF
 GUARD_PRE = bytes(0xA0 + (i % 16) for i in range(32))
@@ -40,6 +41,7 @@ DIFF_SPECS = {
 }
 
 EXPORTS = tuple(DIFF_SPECS.keys())
+ALL_EXPORTS = EXPORTS + ("op_discarded_read",)
 ALTERED_EXPORTS = (
     "op_add8_al_lahf",
     "op_add32_imm_lahf",
@@ -47,8 +49,20 @@ ALTERED_EXPORTS = (
     "op_cmp64_imm_lahf",
 )
 
+# LAHF/SAHF in 64-bit mode: CPUID.80000001H:ECX[0].
+CPUID_HELPER = """#include <intrin.h>
+
+extern "C" __declspec(dllexport) uint32_t host_has_lahf() {
+    int regs[4]{};
+    __cpuid(regs, static_cast<int>(0x80000000u));
+    if (static_cast<uint32_t>(regs[0]) < 0x80000001u) return 0u;
+    __cpuid(regs, static_cast<int>(0x80000001u));
+    return (static_cast<uint32_t>(regs[2]) & 1u) != 0u ? 1u : 0u;
+}
+"""
+
 EXTRA_CONTROL_HELPERS = """
-static inline bool calc_pf_full(std::uint64_t val) {
+static inline bool calc_pf_full(uint64_t val) {
     val ^= val >> 32u;
     val ^= val >> 16u;
     val ^= val >> 8u;
@@ -57,74 +71,59 @@ static inline bool calc_pf_full(std::uint64_t val) {
     val ^= val >> 1u;
     return (val & 1ull) == 0ull;
 }
-
-static inline std::uint8_t pack_lahf_no_bit1(bool cf, bool pf, bool af, bool zf, bool sf) {
-    return static_cast<std::uint8_t>(
-        (sf ? 0x80u : 0u) |
-        (zf ? 0x40u : 0u) |
-        (af ? 0x10u : 0u) |
-        (pf ? 0x04u : 0u) |
-        (cf ? 0x01u : 0u));
-}
-
-static inline std::uint64_t op_add_flags_bit4(
-        unsigned bits, std::uint64_t a, std::uint64_t b,
-        bool& cf, bool& pf, bool& af, bool& zf, bool& sf, bool& of) {
-    const std::uint64_t m = width_mask(bits);
-    const std::uint64_t ua = a & m;
-    const std::uint64_t ub = b & m;
-    const std::uint64_t res = (ua + ub) & m;
-    cf = res < ua;
-    af = ((ua ^ ub ^ res) & 0x20ull) != 0ull;
-    pf = calc_pf(res);
-    zf = res == 0ull;
-    sf = ((res >> (bits - 1u)) & 1ull) != 0ull;
-    of = ((((ua ^ res) & (ub ^ res)) >> (bits - 1u)) & 1ull) != 0ull;
-    return res;
-}
-
-static inline std::uint64_t op_sub_flags_full_pf(
-        unsigned bits, std::uint64_t a, std::uint64_t b,
-        bool& cf, bool& pf, bool& af, bool& zf, bool& sf, bool& of) {
-    const std::uint64_t m = width_mask(bits);
-    const std::uint64_t ua = a & m;
-    const std::uint64_t ub = b & m;
-    const std::uint64_t res = (ua - ub) & m;
-    cf = ua < ub;
-    af = ((ua ^ ub ^ res) & 0x10ull) != 0ull;
-    pf = calc_pf_full(res);
-    zf = res == 0ull;
-    sf = ((res >> (bits - 1u)) & 1ull) != 0ull;
-    of = ((((ua ^ ub) & (ua ^ res)) >> (bits - 1u)) & 1ull) != 0ull;
-    return res;
-}
 """
+
+PARITY_V_RE = re.compile(
+    r"parity = \(\(0x6996u >> \(\(static_cast<unsigned>\(static_cast<uint8_t>\(v\)\) \^ "
+    r"\(static_cast<unsigned>\(static_cast<uint8_t>\(v\)\) >> 4\)\) & 0xfu\)\) & 1u\) == 0;"
+)
 
 # Mutated-C++ negative controls: (base_export, control_name, regex, replacement)
 CPP_MUTATIONS = (
-    ("op_add32_lahf", "ctrl_af_bit4", re.compile(r"\bop_add_flags\("), "op_add_flags_bit4("),
-    ("op_sub32_lahf", "ctrl_pf_full_width", re.compile(r"\bop_sub_flags\("), "op_sub_flags_full_pf("),
-    ("op_cmp32_lahf", "ctrl_lahf_bit1_cleared", re.compile(r"\bpack_lahf\("), "pack_lahf_no_bit1("),
-    (
-        "op_add32_lahf",
-        "ctrl_lahf_clobber_rax",
-        re.compile(r"rax = \(rax & ~0xff00ull\) \| \(static_cast<word>\(pack_lahf\(cf, pf, af, zf, sf\)\) << 8u\);"),
-        "rax = (static_cast<word>(pack_lahf(cf, pf, af, zf, sf)) << 8u);",
-    ),
-    (
-        "op_sub64_lahf",
-        "ctrl_lahf_keep_old_ah",
-        re.compile(r"rax = \(rax & ~0xff00ull\) \| \(static_cast<word>\(pack_lahf\(cf, pf, af, zf, sf\)\) << 8u\);"),
-        "rax = rax | (static_cast<word>(pack_lahf(cf, pf, af, zf, sf)) << 8u);",
-    ),
+    ("op_add32_lahf", "ctrl_af_bit4", re.compile(r"& 0x10u\) != 0;"), "& 0x20u) != 0;"),
+    ("op_sub32_lahf", "ctrl_pf_full_width", PARITY_V_RE, "parity = calc_pf_full(v);"),
+    ("op_cmp32_lahf", "ctrl_lahf_bit1_cleared", re.compile(r" \| 0x200ull"), ""),
+    ("op_add32_lahf", "ctrl_lahf_clobber_rax", re.compile(r"\(rax & ~0xff00ull\) \| "), ""),
+    ("op_sub64_lahf", "ctrl_lahf_keep_old_ah", re.compile(r"\(rax & ~0xff00ull\)"), "rax"),
     (
         "op_cmp64_lahf",
         "ctrl_lahf_clobber_flags",
-        re.compile(r"rax = \(rax & ~0xff00ull\) \| \(static_cast<word>\(pack_lahf\(cf, pf, af, zf, sf\)\) << 8u\);"),
-        "rax = (rax & ~0xff00ull) | (static_cast<word>(pack_lahf(cf, pf, af, zf, sf)) << 8u); "
-        "cf = !cf; pf = !pf; zf = !zf; sf = !sf; of = !of;",
+        re.compile(r"\(word\(carry\) << 8\);"),
+        "(word(carry) << 8); carry = !carry; zero = !zero; sign = !sign; overflow = !overflow;",
     ),
 )
+
+
+def _wrap(symbol: str, code: str) -> str:
+    return f'extern "C" __declspec(dllexport) word {symbol}(word a, word b, word c) {{\n{code}\n}}'
+
+
+def _lower_export(pe: pefile.PE, name: str) -> str:
+    ranges = function_ranges(pe, export_rva(pe, name))
+    body = [ins for lo, hi in ranges for ins in region(pe, lo, hi)]
+    return lower(body, ["rcx = a; rdx = b; r8 = c;"], {}, {}, {})
+
+
+def emit(native_path: Path, output_path: Path) -> None:
+    """Lower all fixture exports through tools/ffx_version_query.py."""
+    parts = [INTEGER_HEADER, CPUID_HELPER]
+    with pefile.PE(str(native_path), fast_load=True) as pe:
+        for name in ALL_EXPORTS:
+            parts.append(_wrap(f"lifted_{name}", _lower_export(pe, name)))
+    output_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+
+
+def emit_controls(original_path: Path, output_path: Path) -> None:
+    """Emit mutated-C++ negative control exports into output_path."""
+    parts = [INTEGER_HEADER, EXTRA_CONTROL_HELPERS]
+    with pefile.PE(str(original_path), fast_load=True) as pe:
+        for base_name, ctrl_name, pattern, replacement in CPP_MUTATIONS:
+            src = _lower_export(pe, base_name)
+            mutated, count = pattern.subn(replacement, src)
+            if count != 1:
+                raise AssertionError(f"mutation {ctrl_name} changed {count} occurrences in {base_name}, expected 1")
+            parts.append(_wrap(ctrl_name, mutated))
+    output_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
 
 
 # --- Independent Python ISA reference model ---
@@ -173,10 +172,10 @@ def apply_lahf(rax: int, flags) -> int:
 
 
 def pack_lahf_and_flags(rax: int, flags) -> bytes:
-    cf, pf, af, zf, sf, of = flags
+    cf, _pf, _af, zf, sf, of = flags
     out = bytearray(FILL)
     struct.pack_into("<Q", out, 0, apply_lahf(rax, flags) & MASK64)
-    out[8:13] = bytes((cf, pf, zf, sf, of))
+    out[8:13] = bytes((cf, int(sf != of), zf, sf, of))
     return bytes(out)
 
 
@@ -195,7 +194,7 @@ def pack_out(*qwords) -> bytes:
     return bytes(out)
 
 
-def reference(name: str, a_bytes: bytes, b_bytes: bytes, altered: bool = False) -> bytes:
+def reference(name: str, a_bytes: bytes, b_bytes: bytes, altered: bool = False):
     a0, _, _, _ = u64s(a_bytes)
     b0, b1, _, _ = u64s(b_bytes)
     kind, bits, imm_spec = DIFF_SPECS[name]
@@ -203,13 +202,13 @@ def reference(name: str, a_bytes: bytes, b_bytes: bytes, altered: bool = False) 
         rhs = imm_spec if altered else (b0 & 0xFF)
         al_res, flags = add_flags(8, a0, rhs)
         rax = (a0 & ~0xFF) | al_res
-        return pack_lahf_and_flags(rax, flags)
+        return pack_lahf_and_flags(rax, flags), flags
     rhs = (imm_spec[1] if altered else imm_spec[0]) if imm_spec is not None else b1
     if kind == "add":
         _, flags = add_flags(bits, b0, rhs)
     else:
         _, flags = sub_flags(bits, b0, rhs)
-    return pack_lahf_and_flags(a0, flags)
+    return pack_lahf_and_flags(a0, flags), flags
 
 
 # --- Test vectors ---
@@ -297,19 +296,23 @@ def check_guards_and_read(buf, pre_off: int, payload_off: int, post_off: int, la
     return raw[payload_off:post_off]
 
 
-def invoke(fn, a: bytes, b: bytes) -> bytes:
+def invoke(fn, a: bytes, b: bytes):
     buf_a, ptr_a, a_pre, a_off, a_post = alloc_aligned_buffer(a)
     buf_b, ptr_b, b_pre, b_off, b_post = alloc_aligned_buffer(b)
     buf_out, ptr_out, o_pre, o_off, o_post = alloc_aligned_buffer(FILL)
-    fn(ptr_a, ptr_b, ptr_out)
+    ret_rax = fn(ptr_a, ptr_b, ptr_out)
     check_guards_and_read(buf_a, a_pre, a_off, a_post, "input_a")
     check_guards_and_read(buf_b, b_pre, b_off, b_post, "input_b")
-    return check_guards_and_read(buf_out, o_pre, o_off, o_post, "output")
+    return ret_rax, check_guards_and_read(buf_out, o_pre, o_off, o_post, "output")
 
 
-def assert_equal_output(label: str, name: str, idx, got: bytes, want: bytes) -> None:
+def assert_equal_output(label: str, name: str, idx, got: bytes, want: bytes, got_rax: int | None = None) -> None:
     if got != want:
         raise AssertionError(f"{label} {name} case {idx}: got {got.hex()} != expected {want.hex()}")
+    if got_rax is not None:
+        want_rax = struct.unpack_from("<Q", want, 0)[0]
+        if got_rax != want_rax:
+            raise AssertionError(f"{label} {name} case {idx}: returned RAX {got_rax:#018x} != {want_rax:#018x}")
 
 
 def bind_exports(dll_path: Path, prefix: str = "", names=EXPORTS):
@@ -318,24 +321,9 @@ def bind_exports(dll_path: Path, prefix: str = "", names=EXPORTS):
     for name in names:
         fn = getattr(lib, prefix + name)
         fn.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
-        fn.restype = None
+        fn.restype = ctypes.c_uint64
         funcs[name] = fn
     return lib, funcs
-
-
-def emit_controls(original_path: Path, output_path: Path) -> None:
-    """Emit mutated-C++ negative control exports into output_path."""
-    parts = [PRELUDE, EXTRA_CONTROL_HELPERS]
-    with pefile.PE(str(original_path), fast_load=True) as pe:
-        for base_name, ctrl_name, pattern, replacement in CPP_MUTATIONS:
-            entry = export_rva(pe, base_name)
-            src, _ = lift_code(base_name, entry, bounded_code(pe, entry))
-            mutated, count = pattern.subn(replacement, src)
-            if count == 0:
-                raise AssertionError(f"mutation {ctrl_name} matched 0 occurrences in {base_name}")
-            mutated = mutated.replace(f"lifted_{base_name}", ctrl_name, 1)
-            parts.append(mutated)
-    output_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
 
 
 def check_discarded_read(native_path: Path, lifted_path: Path) -> None:
@@ -346,15 +334,21 @@ def check_discarded_read(native_path: Path, lifted_path: Path) -> None:
         source, ptr, _, _, _ = alloc_aligned_buffer(payload)
         for readable in (True, False):
             result, result_ptr, pre, off, post = alloc_aligned_buffer(FILL)
+            ret_rax = None
             try:
-                fn(ptr, ptr if readable else 0, result_ptr)
+                ret_rax = fn(ptr, ptr if readable else 0, result_ptr)
             except OSError as error:
                 assert not readable and "access violation reading" in str(error).lower(), (label, error)
             else:
                 assert readable, f"{label} op_discarded_read discarded a faulting read"
             expected = pack_out(0x1122334455667788, 0x1122334455667788) if readable else pack_out(0x1122334455667788)
             assert_equal_output(
-                label, "op_discarded_read", readable, check_guards_and_read(result, pre, off, post, label), expected
+                label,
+                "op_discarded_read",
+                readable,
+                check_guards_and_read(result, pre, off, post, label),
+                expected,
+                ret_rax if readable else None,
             )
         _ = source
 
@@ -374,24 +368,31 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path,
     _, controls = bind_exports(controls_path, "", tuple(c[1] for c in CPP_MUTATIONS))
 
     total = 0
+    seen = {name: set() for name in ("CF", "PF", "AF", "ZF", "SF", "OF")}
     for name in EXPORTS:
         for idx, (a, b) in enumerate(inputs_for(name)):
-            want = reference(name, a, b)
-            got_n = invoke(native[name], a, b)
-            got_l = invoke(lifted[name], a, b)
-            assert_equal_output("native", name, idx, got_n, want)
-            assert_equal_output("lifted", name, idx, got_l, want)
+            want, flags = reference(name, a, b)
+            rax_n, got_n = invoke(native[name], a, b)
+            rax_l, got_l = invoke(lifted[name], a, b)
+            assert_equal_output("native", name, idx, got_n, want, rax_n)
+            assert_equal_output("lifted", name, idx, got_l, want, rax_l)
+            for key, bit in zip(("CF", "PF", "AF", "ZF", "SF", "OF"), flags):
+                seen[key].add(bool(bit))
             total += 1
+
+    for key, vals in seen.items():
+        if vals != {False, True}:
+            raise AssertionError(f"flag {key} never took both values: {vals}")
 
     # ALTER_IMM controls
     diverged = {}
     for name in ALTERED_EXPORTS:
         diffs = 0
         for idx, (a, b) in enumerate(inputs_for(name)):
-            want_alt = reference(name, a, b, altered=True)
-            want_orig = reference(name, a, b)
-            got_alt = invoke(altered[name], a, b)
-            assert_equal_output("altered", name, idx, got_alt, want_alt)
+            want_alt, _ = reference(name, a, b, altered=True)
+            want_orig, _ = reference(name, a, b)
+            rax_alt, got_alt = invoke(altered[name], a, b)
+            assert_equal_output("altered", name, idx, got_alt, want_alt, rax_alt)
             if got_alt != want_orig:
                 diffs += 1
         if not diffs:
@@ -403,8 +404,8 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path,
     for base_name, ctrl_name, _, _ in CPP_MUTATIONS:
         diffs = 0
         for a, b in inputs_for(base_name):
-            want_orig = reference(base_name, a, b)
-            got_ctrl = invoke(controls[ctrl_name], a, b)
+            want_orig, _ = reference(base_name, a, b)
+            _, got_ctrl = invoke(controls[ctrl_name], a, b)
             if got_ctrl != want_orig:
                 diffs += 1
         if not diffs:
@@ -413,7 +414,7 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path,
 
     # Output mutation negative control
     sample_a, sample_b = inputs_for("op_add32_lahf")[0]
-    expected = reference("op_add32_lahf", sample_a, sample_b)
+    expected, _ = reference("op_add32_lahf", sample_a, sample_b)
     mutated = bytearray(expected)
     mutated[1] ^= 0x10
     try:
@@ -424,7 +425,8 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path,
         raise AssertionError("mutated output was not caught by comparator")
 
     print(
-        f"{total} native/lifted/reference LAHF cases across {len(EXPORTS)} exports matched bit-for-bit; "
+        f"{total} native/lifted/reference LAHF cases across {len(EXPORTS)} exports matched bit-for-bit "
+        f"(full RAX + live SETcc, with CF/PF/AF/ZF/SF/OF each seen both ways); "
         f"ALTER_IMM diverged on {diverged}; C++ mutations diverged on {ctrl_diverged}; "
         f"dead-read and output mutation controls passed"
     )
@@ -470,138 +472,122 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
             st_r8_rax,
             Instruction.create_mem(Code.SETG_RM8, MemoryOperand(R.R8, displ=8, displ_size=1)),
             ret_ins)),
+        ("lahf_moves_between", (
+            ld_rax,
+            Instruction.create_reg_reg(Code.SUB_R64_RM64, R.RCX, R.RDX),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R9, R.RCX),
+            Instruction.create_reg_mem(Code.LEA_R64_M, R.R10, MemoryOperand(R.RCX, displ=1, displ_size=1)),
+            Instruction.create(Code.LAHF),
+            st_r8_rax,
+            ret_ins)),
     ]
     alt_expected = {
-        "add_ah_imm8_lahf": "op_add_flags(8u,",
-        "mov_neg_disp_r8_read": "load_mem<std::uint64_t>((r8 + 0xfffffffffffffff8ull))",
-        "cmp_al_imm8_setg": "((!zf && (sf == of)) ? 1u : 0u)",
+        "add_ah_imm8_lahf": "aux = ((a ^ b ^ v) & 0x10u) != 0;",
+        "mov_neg_disp_r8_read": "load_always<uint64_t>(r8 + 18446744073709551608ull)",
+        "cmp_al_imm8_setg": "(!zero && (sign == overflow))",
+        "lahf_moves_between": "(word(aux) << 12)",
     }
     for label, seq in alt_accept:
         raw = encode_seq(*seq)
         decoded = list(Decoder(64, raw, ip=0x1000))
         assert len(decoded) == len(seq) and not any(ins.is_invalid for ins in decoded), label
-        src, count = lift_code(label, 0x1000, raw)
-        assert f"lifted_{label}" in src and count == len(seq), (label, count)
+        src = lower(decoded, ["rcx = a; rdx = b; r8 = c;"], {}, {}, {})
         if alt_expected[label] not in src:
-            raise AssertionError(f"{label}: expected {alt_expected[label]!r} in generated C++")
+            raise AssertionError(f"{label}: expected {alt_expected[label]!r} in generated C++:\n{src}")
 
     seg_mov = Instruction.create_reg_mem(Code.MOV_R64_RM64, R.RAX, MemoryOperand(R.RCX))
     seg_mov.segment_prefix = R.GS
 
     unit_cases = [
-        # Out-of-scope flag-stack and other integer flag instructions
-        ("out_of_scope_pushf", encode_seq(Instruction.create(Code.PUSHFW), ret_ins), "unsupported instruction"),
-        ("out_of_scope_popf", encode_seq(Instruction.create(Code.POPFW), ret_ins), "unsupported instruction"),
-        ("out_of_scope_pushfq", encode_seq(Instruction.create(Code.PUSHFQ), ret_ins), "unsupported instruction"),
-        ("out_of_scope_popfq", encode_seq(Instruction.create(Code.POPFQ), ret_ins), "unsupported instruction"),
+        # Out-of-scope flag-stack and flag-mutating instructions
+        ("out_of_scope_pushf", encode_seq(Instruction.create(Code.PUSHFW), ret_ins), "unsupported query operation"),
+        ("out_of_scope_popf", encode_seq(Instruction.create(Code.POPFW), ret_ins), "unsupported query operation"),
+        ("out_of_scope_pushfq", encode_seq(Instruction.create(Code.PUSHFQ), ret_ins), "unsupported query operation"),
+        ("out_of_scope_popfq", encode_seq(Instruction.create(Code.POPFQ), ret_ins), "unsupported query operation"),
         ("out_of_scope_sahf", encode_seq(ld_rax, Instruction.create(Code.SAHF), Instruction.create(Code.LAHF), ret_ins),
-         "unsupported instruction"),
-        ("out_of_scope_inc", encode_seq(ld_rax, Instruction.create_reg(Code.INC_RM32, R.EAX),
-                                        Instruction.create(Code.LAHF), ret_ins), "unsupported instruction"),
-        ("out_of_scope_dec", encode_seq(ld_rax, Instruction.create_reg(Code.DEC_RM32, R.EAX),
-                                        Instruction.create(Code.LAHF), ret_ins), "unsupported instruction"),
-        ("out_of_scope_neg", encode_seq(ld_rax, Instruction.create_reg(Code.NEG_RM32, R.EAX),
-                                        Instruction.create(Code.LAHF), ret_ins), "unsupported instruction"),
-        ("out_of_scope_adc", encode_seq(ld_rax, Instruction.create_reg_i32(Code.ADC_EAX_IMM32, R.EAX, 1),
-                                        Instruction.create(Code.LAHF), ret_ins), "unsupported instruction"),
-        ("out_of_scope_sbb", encode_seq(ld_rax, Instruction.create_reg_i32(Code.SBB_EAX_IMM32, R.EAX, 1),
-                                        Instruction.create(Code.LAHF), ret_ins), "unsupported instruction"),
-        ("out_of_scope_clc", encode_seq(ld_rax, Instruction.create(Code.CLC), Instruction.create(Code.LAHF), ret_ins),
-         "unsupported instruction"),
-        ("out_of_scope_stc", encode_seq(ld_rax, Instruction.create(Code.STC), Instruction.create(Code.LAHF), ret_ins),
-         "unsupported instruction"),
-        ("out_of_scope_cmc", encode_seq(ld_rax, Instruction.create(Code.CMC), Instruction.create(Code.LAHF), ret_ins),
-         "unsupported instruction"),
+         "unsupported query operation"),
         ("out_of_scope_push_rax", encode_seq(ld_rax, Instruction.create_reg(Code.PUSH_R64, R.RAX), ret_ins),
-         "unsupported instruction"),
+         "unsupported query operation"),
         ("out_of_scope_pop_rax", encode_seq(Instruction.create_reg(Code.POP_R64, R.RAX), ret_ins),
-         "unsupported instruction"),
-        # Refusal controls per #1022: AND, XOR, TEST, SHL, IMUL before LAHF
+         "unsupported query operation"),
+        ("out_of_scope_setp", encode_seq(
+            ld_rax, Instruction.create_reg_i32(Code.ADD_EAX_IMM32, R.EAX, 1), Instruction.create(Code.LAHF),
+            Instruction.create_mem(Code.SETP_RM8, MemoryOperand(R.R8)), ret_ins),
+         "unsupported query operation"),
+        # #1022 LAHF source-discipline rejections (after other flag writers / memory arith / entry / control flow)
+        ("refuse_lahf_after_inc", encode_seq(
+            ld_rax, Instruction.create_reg(Code.INC_RM32, R.EAX), Instruction.create(Code.LAHF), ret_ins),
+         "unsupported query operation"),
+        ("refuse_lahf_after_dec", encode_seq(
+            ld_rax, Instruction.create_reg(Code.DEC_RM32, R.EAX), Instruction.create(Code.LAHF), ret_ins),
+         "unsupported query operation"),
+        ("refuse_lahf_after_neg", encode_seq(
+            ld_rax, Instruction.create_reg(Code.NEG_RM32, R.EAX), Instruction.create(Code.LAHF), ret_ins),
+         "unsupported query operation"),
+        ("refuse_lahf_after_adc", encode_seq(
+            ld_rax, Instruction.create_reg_i32(Code.ADC_EAX_IMM32, R.EAX, 1), Instruction.create(Code.LAHF), ret_ins),
+         "unsupported query operation"),
+        ("refuse_lahf_after_sbb", encode_seq(
+            ld_rax, Instruction.create_reg_i32(Code.SBB_EAX_IMM32, R.EAX, 1), Instruction.create(Code.LAHF), ret_ins),
+         "unsupported query operation"),
+        ("refuse_lahf_after_clc", encode_seq(
+            ld_rax, Instruction.create(Code.CLC), Instruction.create(Code.LAHF), ret_ins),
+         "unsupported query operation"),
+        ("refuse_lahf_after_stc", encode_seq(
+            ld_rax, Instruction.create(Code.STC), Instruction.create(Code.LAHF), ret_ins),
+         "unsupported query operation"),
+        ("refuse_lahf_after_cmc", encode_seq(
+            ld_rax, Instruction.create(Code.CMC), Instruction.create(Code.LAHF), ret_ins),
+         "unsupported query operation"),
         ("refuse_lahf_after_and", encode_seq(
             ld_rax, ld_r9, Instruction.create_reg_reg(Code.AND_R64_RM64, R.RAX, R.R9),
-            Instruction.create(Code.LAHF), ret_ins), "unsupported instruction"),
+            Instruction.create(Code.LAHF), ret_ins), "unsupported query operation"),
+        ("refuse_lahf_after_or", encode_seq(
+            ld_rax, ld_r9, Instruction.create_reg_reg(Code.OR_R64_RM64, R.RAX, R.R9),
+            Instruction.create(Code.LAHF), ret_ins), "unsupported query operation"),
         ("refuse_lahf_after_xor", encode_seq(
             ld_rax, Instruction.create_reg_reg(Code.XOR_R32_RM32, R.EAX, R.EAX),
-            Instruction.create(Code.LAHF), ret_ins), "unsupported instruction"),
+            Instruction.create(Code.LAHF), ret_ins), "unsupported query operation"),
         ("refuse_lahf_after_test", encode_seq(
             ld_rax, ld_r9, Instruction.create_reg_reg(Code.TEST_RM64_R64, R.RAX, R.R9),
-            Instruction.create(Code.LAHF), ret_ins), "unsupported instruction"),
+            Instruction.create(Code.LAHF), ret_ins), "unsupported query operation"),
         ("refuse_lahf_after_shl", encode_seq(
             ld_rax, Instruction.create_reg_i32(Code.SHL_RM32_IMM8, R.EAX, 1),
-            Instruction.create(Code.LAHF), ret_ins), "unsupported instruction"),
+            Instruction.create(Code.LAHF), ret_ins), "unsupported query operation"),
         ("refuse_lahf_after_imul", encode_seq(
             ld_rax, ld_r9, Instruction.create_reg_reg(Code.IMUL_R64_RM64, R.RAX, R.R9),
-            Instruction.create(Code.LAHF), ret_ins), "unsupported instruction"),
-        # Undefined flags / GPRs
-        ("undef_lahf_entry", encode_seq(ld_rax, Instruction.create(Code.LAHF), ret_ins), "undefined flag cf"),
-        ("undef_setb_entry", encode_seq(st_r8_8_setb, ret_ins), "undefined flag cf"),
-        ("undef_setg_entry", encode_seq(
-            Instruction.create_mem(Code.SETG_RM8, MemoryOperand(R.R8, displ=8, displ_size=1)), ret_ins),
-         "undefined flag zf"),
-        ("undef_lahf_rax", encode_seq(
-            Instruction.create_reg_reg(Code.CMP_R64_RM64, R.RCX, R.RDX), Instruction.create(Code.LAHF), ret_ins),
-         "undefined GPR rax"),
-        ("partial_write_undef_rax", encode_seq(
-            Instruction.create_reg_i32(Code.MOV_R8_IMM8, R.AL, 1), ret_ins),
-         "partial write to undefined GPR rax"),
-        ("partial_setb_undef_r9", encode_seq(
-            ld_rax, Instruction.create_reg_i32(Code.ADD_EAX_IMM32, R.EAX, 1),
-            Instruction.create_reg(Code.SETB_RM8, R.R9L), ret_ins),
-         "partial write to undefined GPR r9"),
-        # Memory operands in ADD/SUB/CMP (register-only arithmetic slice)
-        ("arith_mem_dst", encode_seq(
-            ld_rax, Instruction.create_mem_reg(Code.ADD_RM64_R64, MemoryOperand(R.R8), R.RAX), ret_ins),
-         "unsupported arithmetic destination"),
-        ("arith_mem_src", encode_seq(
-            ld_rax, Instruction.create_reg_mem(Code.ADD_R64_RM64, R.RAX, MemoryOperand(R.RDX)), ret_ins),
-         "unsupported arithmetic memory operand"),
-        # Prefixes, VEX, nonvolatile GPRs, RSP arithmetic, non-leaf branches/calls/joins, addressing, stream
+            Instruction.create(Code.LAHF), ret_ins), "unsupported query operation"),
+        ("refuse_lahf_after_add_mem_dst", bytes.fromhex("48011a9fc3"), "unsupported query operation"),
+        ("refuse_lahf_after_cmp_mem_src", bytes.fromhex("483b0a9fc3"), "unsupported query operation"),
+        ("refuse_lahf_entry", bytes.fromhex("9fc3"), "unsupported query operation"),
+        ("refuse_lahf_after_mov_only", encode_seq(ld_rax, Instruction.create(Code.LAHF), ret_ins),
+         "unsupported query operation"),
+        ("refuse_lahf_across_call", bytes.fromhex("4801d1e8000000009fc3"), "unsupported query operation"),
+        ("refuse_lahf_at_branch_target", bytes.fromhex("4801d174009fc3"), "unsupported query operation"),
+        ("refuse_lahf_across_branch_target", bytes.fromhex("4801d14889c89f75fac3"), "unsupported query operation"),
+        ("refuse_lahf_across_cond_branch", bytes.fromhex("4801d174019f90c3"), "unsupported query operation"),
+        ("refuse_lahf_indirect_branch", encode_seq(
+            ld_rax, Instruction.create_reg_reg(Code.ADD_R64_RM64, R.RCX, R.RDX),
+            Instruction.create(Code.LAHF), Instruction.create_reg(Code.JMP_RM64, R.RAX)),
+         "unsupported query operation"),
+        # Prefixes, VEX, addressing, and stream-boundary rejections
         ("segment_prefix", encode_seq(seg_mov, ret_ins), "unsupported instruction prefix"),
         ("lock_prefix", bytes.fromhex("f00fb109") + encode_seq(ret_ins), "unsupported instruction prefix"),
-        ("rep_prefix", bytes.fromhex("f3a4") + encode_seq(ret_ins), "unsupported instruction prefix"),
-        ("vex_vzeroupper", encode_seq(Instruction.create(Code.VEX_VZEROUPPER), ret_ins),
-         "unsupported vector-encoded instruction"),
-        ("nonvolatile_rbx", encode_seq(Instruction.create_reg_mem(
-            Code.MOV_R64_RM64, R.RBX, MemoryOperand(R.RCX)), ret_ins), "nonvolatile GPR"),
-        ("nonvolatile_rdi", encode_seq(Instruction.create_reg_reg(
-            Code.MOV_R64_RM64, R.RDI, R.RCX), ret_ins), "nonvolatile GPR"),
-        ("direct_rsp_add", encode_seq(Instruction.create_reg_i32(Code.ADD_RM64_IMM8, R.RSP, 8), ret_ins),
-         "unsupported stack pointer operand"),
-        ("branch_jmp", encode_seq(Instruction.create_branch(Code.JMP_REL8_64, 0x1010), ret_ins),
-         "unsupported instruction"),
-        ("branch_je_join", encode_seq(
-            ld_rax, Instruction.create_reg_reg(Code.CMP_R64_RM64, R.RCX, R.RDX),
-            Instruction.create_branch(Code.JE_REL8_64, 0x1010),
-            Instruction.create_reg_i32(Code.ADD_EAX_IMM32, R.EAX, 1),
-            Instruction.create(Code.LAHF), ret_ins),
-         "unsupported instruction"),
-        ("call_then_lahf", encode_seq(
-            ld_rax, Instruction.create_branch(Code.CALL_REL32_64, 0x1020),
-            Instruction.create(Code.LAHF), ret_ins),
-         "unsupported instruction"),
-        ("store_outside_r8", encode_seq(ld_rax, Instruction.create_mem_reg(
-            Code.MOV_RM64_R64, MemoryOperand(R.RCX), R.RAX), ret_ins), "non-r8 store memory operand"),
-        ("write_r8", encode_seq(ld_rax, Instruction.create_reg_reg(
-            Code.MOV_R64_RM64, R.R8, R.RAX), ret_ins), "unsupported write to output buffer pointer r8"),
-        ("clobbered_rcx_read", encode_seq(
-            Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.ECX, 1), ld_rax, ret_ins),
-         "clobbered pointer rcx"),
-        ("rip_rel_mem", encode_seq(Instruction.create_reg_mem(
-            Code.MOV_R64_RM64, R.RAX, MemoryOperand(R.RIP, displ=0x1020, displ_size=1)), ret_ins),
-         "unsupported memory operand"),
-        ("indexed_mem", encode_seq(Instruction.create_reg_mem(
-            Code.MOV_R64_RM64, R.RAX, MemoryOperand(R.RCX, R.RDX, 4)), ret_ins),
-         "unsupported memory operand"),
-        ("ret_imm16", encode_seq(Instruction.create_i32(Code.RETNQ_IMM16, 8)), "unsupported instruction"),
-        ("missing_ret", encode_seq(ld_rax), "missing terminal ret"),
-        ("trailing_after_ret", encode_seq(ld_rax, ret_ins, ld_r9), "unreachable instruction after ret"),
-        ("empty_stream", b"", "truncated instruction stream"),
-        ("invalid_bytes", bytes.fromhex("fffe") + encode_seq(ret_ins), "invalid instruction"),
+        ("repne_prefix", bytes.fromhex("f2a4") + encode_seq(ret_ins), "unsupported REPNE string prefix"),
+        ("evex_vaddps", bytes.fromhex("62f17c4858c2") + encode_seq(ret_ins), "unsupported"),
+        ("eip_rel_mem", encode_seq(Instruction.create_reg_mem(
+            Code.MOV_R64_RM64, R.RAX, MemoryOperand(R.EIP, displ=0x1020, displ_size=4)), ret_ins),
+         "unsupported EIP-relative operand"),
+        ("retf_far", encode_seq(Instruction.create(Code.RETFQ)), "unsupported query operation"),
+        ("missing_ret", encode_seq(ld_rax), "unbound fallthrough"),
     ]
 
     for label, raw, expected_reason in unit_cases:
+        body = list(Decoder(64, raw, ip=0x1000))
+        if not body or any(ins.is_invalid for ins in body):
+            raise AssertionError(f"{label}: invalid test encoding {raw.hex()}")
         try:
-            lift_code(label, 0x1000, raw)
+            lower(body, [], {}, {}, {})
         except ValueError as exc:
             if expected_reason not in str(exc):
                 raise AssertionError(f"{label}: expected {expected_reason!r}, got {exc!r}") from exc
@@ -625,16 +611,17 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
 
     unit_map = {lbl: raw for lbl, raw, _ in unit_cases}
     pe_patches = [
-        ("pe_out_of_scope_pushf", unit_map["out_of_scope_pushf"], "unsupported instruction"),
-        ("pe_out_of_scope_popfq", unit_map["out_of_scope_popfq"], "unsupported instruction"),
-        ("pe_refuse_test_lahf", unit_map["refuse_lahf_after_test"], "unsupported instruction"),
-        ("pe_refuse_inc_lahf", unit_map["out_of_scope_inc"], "unsupported instruction"),
-        ("pe_undef_lahf_entry", unit_map["undef_lahf_entry"], "undefined flag cf"),
-        ("pe_nonvolatile_rbx", unit_map["nonvolatile_rbx"], "nonvolatile GPR"),
-        ("pe_branch_je_join", unit_map["branch_je_join"], "unsupported instruction"),
-        ("pe_call_then_lahf", unit_map["call_then_lahf"], "unsupported instruction"),
-        ("pe_store_outside_r8", unit_map["store_outside_r8"], "non-r8 store memory operand"),
-        ("pe_trailing_after_ret", unit_map["trailing_after_ret"], "unreachable instruction after ret"),
+        ("pe_out_of_scope_pushf", unit_map["out_of_scope_pushf"], "unsupported query operation"),
+        ("pe_out_of_scope_popfq", unit_map["out_of_scope_popfq"], "unsupported query operation"),
+        ("pe_refuse_test_lahf", unit_map["refuse_lahf_after_test"], "unsupported query operation"),
+        ("pe_refuse_inc_lahf", unit_map["refuse_lahf_after_inc"], "unsupported query operation"),
+        ("pe_refuse_and_lahf", unit_map["refuse_lahf_after_and"], "unsupported query operation"),
+        ("pe_refuse_entry_lahf", unit_map["refuse_lahf_entry"], "unsupported query operation"),
+        ("pe_refuse_add_mem_dst_lahf", unit_map["refuse_lahf_after_add_mem_dst"], "unsupported query operation"),
+        ("pe_refuse_cmp_mem_src_lahf", unit_map["refuse_lahf_after_cmp_mem_src"], "unsupported query operation"),
+        ("pe_refuse_branch_target_lahf", unit_map["refuse_lahf_at_branch_target"], "unsupported query operation"),
+        ("pe_refuse_call_lahf", unit_map["refuse_lahf_across_call"], "unsupported query operation"),
+        ("pe_invalid_bytes", bytes.fromhex("fffe") + encode_seq(ret_ins), "instruction boundary"),
     ]
     with TemporaryDirectory() as folder:
         patched_path = Path(folder) / "patched.dll"
@@ -646,7 +633,8 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
             struct.pack_into("<I", damaged, pdata_end_off, entry + len(patch))
             patched_path.write_bytes(damaged)
             try:
-                translate(patched_path, ["op_add64_lahf"])
+                with pefile.PE(str(patched_path), fast_load=True) as pe:
+                    _lower_export(pe, "op_add64_lahf")
             except ValueError as exc:
                 if expected_reason not in str(exc):
                     raise AssertionError(f"{label}: expected {expected_reason!r}, got {exc!r}") from exc
@@ -660,9 +648,14 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "emit-controls":
+    mode = sys.argv[1]
+    if mode == "emit":
+        emit(Path(sys.argv[2]), Path(sys.argv[3]))
+    elif mode == "emit-controls":
         emit_controls(Path(sys.argv[2]), Path(sys.argv[3]))
-    else:
-        orig, lifted, alt, ctrls = (Path(p) for p in sys.argv[1:5])
+    elif mode == "check":
+        orig, lifted, alt, ctrls = (Path(p) for p in sys.argv[2:6])
         check_alt_encodings_and_rejections(orig)
         check_differential(orig, lifted, alt, ctrls)
+    else:
+        raise SystemExit(f"unknown mode {mode}")
