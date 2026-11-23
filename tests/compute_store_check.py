@@ -2,6 +2,7 @@
 from pathlib import Path
 import operator
 import os
+import re
 import operator
 import struct
 import subprocess
@@ -1565,6 +1566,10 @@ LDS_QWORD_UPDATES = {
 }
 
 
+LDS_QWORD_COMPARISONS = {
+    "ds_min_i64": min, "ds_max_i64": max, "ds_min_u64": min, "ds_max_u64": max,
+    "ds_xor_b64": operator.xor,
+}
 LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in LDS_QWORD_UPDATES
                      for stem, width in [op.rsplit("_", 1)]}
 
@@ -1572,10 +1577,13 @@ LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in LDS_QWORD_UPDATES
 def lds_qword_program(op):
     returns = op in LDS_QWORD_RETURNS
     ret_operand = "v[18:19], " if returns else ""
-    return LDS_WIDE_SETUP + [
-        "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
-        "v_mov_b32_e32 v17, 0xfffffff1",
-        "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x0000000e",
+    if op in LDS_QWORD_COMPARISONS:
+        operands = ["v_mad_u32_u24 v16, 1, v8, 0xfffffff0", "v_mad_u32_u24 v17, 1, v8, 0x7ffffff0",
+                    "v_mov_b32_e32 v18, 0x00000008", "v_mov_b32_e32 v19, 0x80000000"]
+    else:
+        operands = ["v_mad_u32_u24 v16, 1, v8, 0xfffffff0", "v_mov_b32_e32 v17, 0xfffffff1",
+                    "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x0000000e"]
+    return LDS_WIDE_SETUP + operands + [
         "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
         f"{op} {ret_operand}v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
         "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
@@ -1587,8 +1595,17 @@ def lds_qword_program(op):
 def lds_qword_reference(op, groups):
     words = []
     for lane in range(groups * 32):
-        previous = (0xfffffff1 << 32) | ((0xfffffff0 + lane) & 0xffffffff)
-        current = LDS_QWORD_UPDATES[LDS_QWORD_RETURNS.get(op, op)](previous, 0x0000000e00000018)
+        if op in LDS_QWORD_COMPARISONS:
+            previous = ((0x7ffffff0 + lane) << 32) | ((0xfffffff0 + lane) & 0xffffffff)
+            data = 0x8000000000000008
+            if op.endswith("i64"):
+                signed = lambda value: int.from_bytes(value.to_bytes(8, "little"), "little", signed=True)
+                current = LDS_QWORD_COMPARISONS[op]((previous, data), key=signed)
+            else:
+                current = LDS_QWORD_COMPARISONS[op](previous, data)
+        else:
+            previous = (0xfffffff1 << 32) | ((0xfffffff0 + lane) & 0xffffffff)
+            current = LDS_QWORD_UPDATES[LDS_QWORD_RETURNS.get(op, op)](previous, 0x0000000e00000018)
         words.extend((current & 0xffffffff, (current >> 32) & 0xffffffff))
         if op in LDS_QWORD_RETURNS:
             words.extend((previous & 0xffffffff, previous >> 32))
@@ -1637,6 +1654,7 @@ LDS_QWORD_BINDING = LDS_WIDE_BINDING | {"stride": 8}
 LDS_QWORD_CASES = [(op, lds_qword_program(op), LDS_QWORD_BINDING) for op in LDS_QWORD_UPDATES]
 LDS_QWORD_RETURN_BINDING = LDS_WIDE_BINDING | {"stride": 16}
 LDS_QWORD_CASES += [(op, lds_qword_program(op), LDS_QWORD_RETURN_BINDING) for op in LDS_QWORD_RETURNS]
+LDS_QWORD_CASES += [(op, lds_qword_program(op), LDS_QWORD_BINDING) for op in LDS_QWORD_COMPARISONS]
 
 
 def lds_controls():
@@ -1893,6 +1911,20 @@ def ds_mutants(name, lines, binding, source):
         ref = lds_qword_reference(name, 2)
         word = next(i for i in range(len(ref)) if i % 4 >= 2 and ref[i] != ref[i - 2])
         yield aot.lower(changed, 32, **binding), word
+    elif name in LDS_QWORD_COMPARISONS:
+        if name == "ds_xor_b64":
+            yield aot.lower(variant(lines, (name, "ds_or_b64")), 32, **binding), 16
+        else:
+            alternate = name.replace("_i64", "_u64") if name.endswith("i64") else name.replace("_u64", "_i64")
+            yield aot.lower(variant(lines, (name, alternate)), 32, **binding), 0
+            # Ignoring the low word on a high-word tie changes lane 16.
+            wrong = re.sub(r" \|\| \(.*? && .*?\)(?=\) \?)", "", source)
+            if "min_" in name:
+                # Lane 16 has the smaller low word already. Force choosing the data on ties.
+                wrong = wrong.replace(" < ", " <= ")
+                yield wrong, 32
+            else:
+                yield wrong, 32
     elif name in LDS_QWORD_UPDATES:
         if name == "ds_add_u64":
             wrong = source.replace(" + uint(", " + 0u * uint(")
@@ -1955,7 +1987,7 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = lds_replacement_reference(name, groups)
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)
-            elif name in LDS_QWORD_UPDATES or name in LDS_QWORD_RETURNS:
+            elif name in LDS_QWORD_UPDATES or name in LDS_QWORD_RETURNS or name in LDS_QWORD_COMPARISONS:
                 words = lds_qword_reference(name, groups)
             elif name in LDS_WIDE_PROGRAMS:
                 words = lds_wide_reference(name, groups)

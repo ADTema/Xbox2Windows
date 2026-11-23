@@ -471,11 +471,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Uninitialized private wide LDS word")
             vector.update(zip(range(first, last + 1), (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
-        elif ((m := re.fullmatch(r"ds_(add|sub|rsub|and|or)(?P<ret>_rtn)?(_[ub]64) "
+        elif ((m := re.fullmatch(r"ds_(add|sub|rsub|and|or|min|max|xor)(?P<ret>_rtn)?(_[iub]64) "
                                  r"(?(ret)v\[(?P<dst_first>\d+):(?P<dst_last>\d+)\], )"
                                  r"v(?P<addr>\d+), v\[(?P<src_first>\d+):(?P<src_last>\d+)\]"
                                  r"(?: offset:(?P<offset>0|8))?", line))
-              and (op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64")):
+              and ((op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64")
+                   or not m["ret"] and op in ("min_i64", "max_i64", "min_u64", "max_u64", "xor_b64"))):
             addr, first, last = (int(m[key]) for key in ("addr", "src_first", "src_last"))
             destination = tuple(int(m[key]) for key in ("dst_first", "dst_last")) if m["ret"] else None
             slot = int(m["offset"] or 0) // 4
@@ -488,8 +489,17 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             left, right = (source, previous) if op == "rsub_u64" else (previous, source)
             lo, hi = map(hlsl_word, left)
             rhs_lo, rhs_hi = map(hlsl_word, right)
-            if op in ("and_b64", "or_b64"):
-                symbol = "&" if op == "and_b64" else "|"
+            if op.startswith(("min_", "max_")):
+                compare = "<" if op.startswith("min_") else ">"
+                high_left, high_right = hi, rhs_hi
+                if op.endswith("i64"):
+                    high_left, high_right = f"asint({hi})", f"asint({rhs_hi})"
+                use_data = (f"({high_right} {compare} {high_left} || "
+                            f"({hi} == {rhs_hi} && {rhs_lo} {compare} {lo}))")
+                low = f"({use_data} ? {rhs_lo} : {lo})"
+                high = f"({use_data} ? {rhs_hi} : {hi})"
+            elif op in ("and_b64", "or_b64", "xor_b64"):
+                symbol = {"and_b64": "&", "or_b64": "|", "xor_b64": "^"}[op]
                 low = f"({lo} {symbol} {rhs_lo})"
                 high = f"({hi} {symbol} {rhs_hi})"
             elif op == "add_u64":

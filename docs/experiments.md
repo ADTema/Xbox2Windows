@@ -2331,6 +2331,11 @@ old pair into the destination. The fixture aliases the destination with
 the data pair and exports all four dwords for one and two groups. Replacing
 the returned pair with the post-update pair must fail the CPU comparison.
 
+The four qword min/max forms compare the high dword with the requested
+signedness, then the low dword as unsigned on a tie. `ds_xor_b64` updates
+both dwords by bit pattern. The fixture crosses the high-word sign boundary
+and includes an equal high-word case with different low words.
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
