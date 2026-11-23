@@ -708,6 +708,25 @@ def check_avx_move_regs():
         assert only_fail["blocked_by_skip"] == []
 
 
+def check_swap_coverage():
+    """v_swap_b32 is VOP1 in both references and counts as covered only through the accepted spelling.
+    The _e64, DPP and SDWA spellings reach only rejections, and the neighbouring v_swaprel_b32 stays uncovered."""
+    import pixel_aot_check as pixel
+    pixel.ACCEPTED.clear()
+    with tempfile.TemporaryDirectory() as tmp:
+        pixel.check_controls(Path(tmp))
+    assert "v_swap_b32" in pixel.ACCEPTED
+    assert not {"v_swap_b32_e64", "v_swap_b32_dpp", "v_swap_b32_sdwa", "v_swaprel_b32"} & pixel.ACCEPTED
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert ("VOP1", "v_swap_b32") in reference, name
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert ("VOP1", "v_swap_b32") in covered, name
+        assert ("VOP1", "v_swaprel_b32") not in covered, name
+        # Control: without the accepted word the form is not covered.
+        assert ("VOP1", "v_swap_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"v_swap_b32"}, reference), name
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -719,6 +738,7 @@ if __name__ == "__main__":
     check_shader_records()
     check_scalar_brev()
     check_plain_bitscan_forms()
+    check_swap_coverage()
     check_sopk_wait_forms()
     check_parsing()
     check_gaps()

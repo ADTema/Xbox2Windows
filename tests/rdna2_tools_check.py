@@ -2360,6 +2360,20 @@ class TestRdna2Scanner(unittest.TestCase):
                             "s_bfm_b32 s[2:3], s2, s3"):
             self.assertFalse(is_instruction_supported(unsupported), unsupported)
 
+        for line in ("v_swap_b32 v1, v2", "v_swap_b32_e32 v1, v2", "v_swap_b32 v1, v1", "v_swap_b32 v255, v254"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_swap_b32 v1, s2",
+                     "v_swap_b32 s1, v2",
+                     "v_swap_b32_e64 v1, v2",
+                     "v_swap_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                     "v_swap_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+                     "v_swap_b32 v1, v2 clamp",
+                     "v_swap_b32 v1, -v2",
+                     "v_swap_b32 v1",
+                     "v_swaprel_b32 v1, v2"):
+            self.assertFalse(is_instruction_supported(line), line)
+        self.assertTrue(is_opcode_recognized("v_swap_b32"))
+
         # Verify unsupported operands or spellings are rejected by scanner
         self.assertFalse(is_opcode_recognized("v_imaginary_opcode_sdwa"))
         self.assertFalse(is_instruction_supported("s_waitcnt_expcnt null, 0x8"))
