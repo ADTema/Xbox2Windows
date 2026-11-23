@@ -511,8 +511,9 @@ ALU = {
     "min3": (3, "min(min({0}, {1}), {2})"), "max3": (3, "max(max({0}, {1}), {2})"),
     "med3": (3, "max(min({0}, {1}), min(max({0}, {1}), {2}))"),
 }
-# LLVM 15 sets HasExtDPP = 0 for v_mac_legacy_f32, so it has no DPP form.
-DPP_ALU = {k: v for k, v in ALU.items() if k not in ("fma", "mac_legacy")}
+# LLVM 15 sets HasExtDPP = 0 for v_mac_legacy_f32, and fma, mad, mad_legacy, min3, max3 and med3 are VOP3-only, so
+# none of them has a DPP form (llvm-mc for gfx1013: "dpp variant of this instruction is not supported").
+DPP_ALU = {k: v for k, v in ALU.items() if k not in ("fma", "mac_legacy", "mad", "mad_legacy", "min3", "max3", "med3")}
 # N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
     "f": "false", "tru": "true",
@@ -1636,7 +1637,7 @@ SDWA_INT_OPERANDS = re.compile(
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
-          title_ranges=None, flat_global_only=False):
+          title_ranges=None, flat_global_only=False, return_write_mask=False):
     """Track descriptor provenance, interpolation and packed or uncompressed exports.
 
     constant_descriptor is the byte offset, on the texture table, of the descriptor mapped to b0.
@@ -1645,6 +1646,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     entry register that holds the low word of a table address.
     title_ranges is the bound range count at t0, space1. flat_global_only
     requires every flat address to be global and excludes the scratch and LDS apertures.
+    return_write_mask returns (source, RT0 mask). For partial compressed exports the caller
+    must supply normalized whole-pair instructions and apply the returned mask in the PSO.
     """
     if title_ranges is not None and (isinstance(title_ranges, bool) or not isinstance(title_ranges, int)
                                      or not 1 <= title_ranges <= 0xffffffff):
@@ -1702,6 +1705,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     title_loads = False
     sample_dest = {}  # VGPR -> issue number of its outstanding image_sample or title load
     exported = False
+    channel_mask = 0xF
     ended = False
     entry_line = len(lines)
     result_type = "uint4" if integer_export else "float4"
@@ -3004,14 +3008,29 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or lo in sample_dest or hi in sample_dest or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
-        elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+|off), \2 done compr vm"):
+        elif m := match(r"exp mrt0,? (v\d+|off), \1, (v\d+|off), \2 done compr vm"):
             if integer_export:
                 raise ValueError("Integer export requires the uncompressed export form")
-            pairs = [vector[v] for v in m.groups() if v != "off"]
-            if mask != "entry" or exported or not all(isinstance(p, tuple) and len(p)==2 and
-                    all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
+            low, high = m.groups()
+            if low == "off" and high == "off":
                 raise ValueError("Unsupported export")
-            args = [f"export16({v})" for pair in pairs for v in pair]
+            if low == "off" and not return_write_mask:
+                raise ValueError("High-pair compressed export requires an explicit RT0 write mask")
+            regs = [reg for reg in (low, high) if reg != "off"]
+            pairs = [vector.get(reg) for reg in regs]
+            if (mask != "entry" or exported or any(reg in sample_dest for reg in regs)
+                    or not all(isinstance(pair, tuple) and len(pair) == 2
+                               and all(isinstance(value, str) and value.startswith(("sample", "alu"))
+                                       for value in pair) for pair in pairs)):
+                raise ValueError("Unsupported export")
+            args = [f"export16({value})" for pair in pairs for value in pair]
+            if low == "off":
+                channel_mask = 0xC
+                args[:0] = ["0.0f", "0.0f"]
+            elif high == "off":
+                channel_mask = 0x3
+                if return_write_mask:
+                    args.extend(["0.0f", "0.0f"])
             components = 4 if attribute_input else texcoord_components
             inputs = f"float{components} uv : TEXCOORD0"
             if not bindings and not interpolated:
@@ -3046,7 +3065,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if title_loads:
         lookup = (Path(__file__).resolve().parents[1] / "src/title_va_lookup.hlsli").read_text()
         lines[:0] = [lookup, TITLE_MEMORY.format(slots=TITLE_ALIAS_SLOTS, count=title_ranges, miss=TITLE_MISS)]
-    return "\n".join([*lines, "}",""])
+    source = "\n".join([*lines, "}", ""])
+    return (source, channel_mask) if return_write_mask else source
 
 
 def main():

@@ -1322,6 +1322,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_mul_div COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mul_div.py"
         check "$<TARGET_FILE:cpu_mul_div>" "$<TARGET_FILE:cpu_mul_div_lifted>")
 
+    cpu_asm_fixture(cpu_cmpxchg_wide cmpxchg_wide)
+    set(cmpxchg_wide_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_cmpxchg_wide_lifted.cpp")
+    add_custom_command(OUTPUT "${cmpxchg_wide_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/cmpxchg_wide.py"
+            emit "$<TARGET_FILE:cpu_cmpxchg_wide>" "${cmpxchg_wide_fixture}"
+        DEPENDS cpu_cmpxchg_wide tests/cpu/cmpxchg_wide.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_cmpxchg_wide_lifted SHARED "${cmpxchg_wide_fixture}")
+    add_test(NAME cpu_aot_cmpxchg_wide COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/cmpxchg_wide.py"
+        check "$<TARGET_FILE:cpu_cmpxchg_wide>" "$<TARGET_FILE:cpu_cmpxchg_wide_lifted>")
+
     cpu_asm_fixture(cpu_cmov_setcc cmov_setcc)
     set(cmov_setcc_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_cmov_setcc_lifted.cpp")
     add_custom_command(OUTPUT "${cmov_setcc_fixture}"
@@ -2618,6 +2629,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-core "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_compressed_export_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-compressed-export "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_compressed_export_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_position_centers_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_position_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

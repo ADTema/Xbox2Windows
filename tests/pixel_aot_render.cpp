@@ -54,6 +54,7 @@ struct PixelInput {
     std::vector<Word> constants = std::vector<Word>(64);
     std::vector<Word> extraConstants;   // 128 words for b1 then b2, empty unless trailer flag bit 3 is set
     UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    bool maskedCase = false;
     std::vector<BYTE> coverage;
     bool integerRT = false;      // bit 0 of the optional case-trailer flags byte
     std::vector<BYTE> nanMask;   // 64 per-texel NaN-class mask bytes, empty without a trailer
@@ -205,7 +206,9 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     const UINT residentCount = static_cast<UINT>(levels.size());
     srcDesc.MipLevels = static_cast<UINT16>(firstResident + residentCount);
     auto texture = resource(device, srcDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    const D3D12_CLEAR_VALUE clear{desc.RTVFormats[0], {-1, -1, -1, -1}};
+    const D3D12_CLEAR_VALUE clear{
+        desc.RTVFormats[0], {-1, input.maskedCase ? 2.0f : -1.0f,
+                                 input.maskedCase ? -3.0f : -1.0f, input.maskedCase ? 4.0f : -1.0f}};
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(residentCount);
     UINT64 sourceBytes = 0;
     std::vector<UINT> rows(residentCount);
@@ -559,9 +562,17 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
         if (file.peek() != std::char_traits<char>::eof()) {
             BYTE flags = 0;
             file.read(reinterpret_cast<char*>(&flags), 1);
-            if (flags & 0xf0u)
+            if ((flags & 4u) && (flags & 0xF0u))
                 throw std::runtime_error("Unknown case trailer flag bits");
             input.integerRT = (flags & 1u) != 0;
+            const UINT8 caseMask = flags >> 4;
+            if (caseMask) {
+                if (input.integerRT || (caseMask != 0x3 && caseMask != 0xC &&
+                                        caseMask != D3D12_COLOR_WRITE_ENABLE_ALL))
+                    throw std::runtime_error("Invalid floating-point case write mask");
+                input.maskedCase = true;
+                input.writeMask = caseMask;
+            }
             if (flags & 2u) {
                 std::array<UINT, 4> rect{};
                 file.read(reinterpret_cast<char*>(rect.data()), sizeof(rect));

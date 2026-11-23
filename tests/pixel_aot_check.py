@@ -265,7 +265,7 @@ def flush_ftz(value):
 
 
 def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extra_constants=None,
-               title_memory=None):
+               title_memory=None, write_mask=None):
     """Write a renderer case: 256 constant bytes, then 64 expected float4 rows in row-major order.
 
     A single float4 broadcasts to every texel. The optional trailer appends one flags byte, whose
@@ -274,6 +274,7 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
     integer_rt or nan_mask keep the original 1280-byte format exactly. extra_constants sets bit 3 of
     the flags byte and stores 512 bytes after it: the 256-byte buffers bound to b1 and b2.
     Bit 2 carries the title ranges and aliased buffers before any extra constants.
+    The high nibble can hold an explicit RT0 mask for a floating-point case.
     """
     rows = [pixels] * 64 if len(pixels) == 4 and not isinstance(pixels[0], (list, tuple)) else list(pixels)
     if len(rows) != 64 or any(len(row) != 4 for row in rows):
@@ -281,25 +282,30 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
     data = bytearray(bytes(constants))
     for row in rows:
         data += struct.pack("<4f", *row)
-    if extra_constants is not None and (integer_rt or nan_mask is not None or title_memory is not None):
-        raise ValueError("Extra constant buffers are not combined with other trailer fields")
-    if extra_constants is not None and len(extra_constants) != 512:
-        raise ValueError("The b1 and b2 buffers need exactly 512 bytes")
-    if integer_rt and nan_mask is not None:
-        raise ValueError("NaN-class masks require a floating-point render target")
-    flags = int(integer_rt) | (4 if title_memory is not None else 0) | (8 if extra_constants is not None else 0)
-    if flags or nan_mask is not None:
-        data.append(flags)
-        if title_memory is not None:
-            data += title_memory
-        if extra_constants is not None:
-            data += extra_constants
-        if nan_mask is not None:
-            if isinstance(nan_mask, int):
-                nan_mask = bytes([nan_mask]) * 64
-            elif len(nan_mask) != 64:
-                raise ValueError("The NaN-class mask needs exactly 64 texel bytes")
-            data += nan_mask
+    if write_mask is not None:
+        if write_mask not in (0x3, 0xC, 0xF) or integer_rt or nan_mask is not None or extra_constants is not None or title_memory is not None:
+            raise ValueError("An explicit pair write mask requires a plain floating-point render target")
+        data.append(write_mask << 4)
+    else:
+        if extra_constants is not None and (integer_rt or nan_mask is not None or title_memory is not None):
+            raise ValueError("Extra constant buffers are not combined with other trailer fields")
+        if extra_constants is not None and len(extra_constants) != 512:
+            raise ValueError("The b1 and b2 buffers need exactly 512 bytes")
+        if integer_rt and nan_mask is not None:
+            raise ValueError("NaN-class masks require a floating-point render target")
+        flags = int(integer_rt) | (4 if title_memory is not None else 0) | (8 if extra_constants is not None else 0)
+        if flags or nan_mask is not None:
+            data.append(flags)
+            if title_memory is not None:
+                data += title_memory
+            if extra_constants is not None:
+                data += extra_constants
+            if nan_mask is not None:
+                if isinstance(nan_mask, int):
+                    nan_mask = bytes([nan_mask]) * 64
+                elif len(nan_mask) != 64:
+                    raise ValueError("The NaN-class mask needs exactly 64 texel bytes")
+                data += nan_mask
     Path(path).write_bytes(data)
     return Path(path)
 
@@ -378,6 +384,10 @@ def translate(instructions):
     return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64)
 
 
+def translate_masked(instructions):
+    return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, return_write_mask=True)
+
+
 def translate_int(instructions):
     """translate() for a program that exports through the bit-exact R32G32B32A32_UINT target."""
     return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True)
@@ -395,6 +405,17 @@ def with_constants(body):
     ]
     pos = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
     program[pos:pos] = body
+    return program
+
+
+def compressed_export(mask):
+    program = with_constants([f"v_sub_f32_e64 v{12 + i}, s{44 + i}, 0" for i in range(4)])
+    pos = program.index("exp mrt0 v16, v16, v17, v17 done compr vm")
+    program[pos] = {
+        0x3: "exp mrt0 v16, v16, off, off done compr vm",
+        0xC: "exp mrt0 off, off, v17, v17 done compr vm",
+        0xF: "exp mrt0 v16, v16, v17, v17 done compr vm",
+    }[mask]
     return program
 
 
@@ -1140,6 +1161,17 @@ def check_e64_approx_lowering():
     # v_mac_f32 reads its destination, so an unwritten one is refused, as is a third source.
     must_reject(translate, with_constants(["v_mac_f32_e64 v20, -s44, |s45|"]))
     must_reject(translate, with_constants(["v_mov_b32_e32 v14, s46", "v_mac_f32_e64 v14, -s44, |s45|, v14"]))
+
+
+def check_dpp_vop3_only_refused():
+    """VOP3-only ALU ops have no DPP spelling; lowering one is a clean refusal, not a crash in the DPP path."""
+    body = list(DPP_BODY)
+    at = next(k for k, line in enumerate(body) if line.startswith("v_add_f32_dpp v23"))
+    for op in ("mad", "mad_legacy", "min3", "max3", "med3"):
+        assert op in ALU and op not in pixel_aot.DPP_ALU, op
+        line = f"v_{op}_f32_dpp v23, v20, v20, v20 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf"
+        program = with_constants(body[:at] + [line] + body[at + 1:])
+        expect_value_error(translate, program, f"Unsupported instruction {program.index(line)}: {line}")
 
 
 def check_mac_legacy_lowering():
@@ -6070,6 +6102,24 @@ def check_s_version():
 
 def check_controls(directory):
     check_title_load_controls()
+    for mask in (0x3, 0xC, 0xF):
+        program = compressed_export(mask)
+        modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
+        source, actual = translate_masked(program)
+        assert actual == mask and source == translate_masked(modern)[0]
+        assert "float4 main(" in source
+    partial = compressed_export(0x3)
+    assert "float2 main(" in translate(partial)
+    assert translate_masked(uncompressed_export([]))[1] == 0xF
+    must_reject(translate, compressed_export(0xC))
+    must_reject(translate_int, partial)
+    export = partial.index("exp mrt0 v16, v16, off, off done compr vm")
+    for invalid in ("exp mrt0 off, off, off, off done compr vm",
+                    "exp mrt0 v16, v16, v17, off done compr vm",
+                    "exp mrt0 v16, off, off, off done compr vm",
+                    "exp mrt0 off, off, v17, off done compr vm",
+                    "exp mrt0 v12, off, v14, v15 done vm"):
+        must_reject(translate_masked, partial[:export] + [invalid] + partial[export + 1:])
     # A syntactically valid DPP VGPR must already have a tracked numeric value.
     must_reject(translate, with_constants([
         "v_mov_b32_dpp v12, v255 dpp8:[1,2,3,0,5,6,7,4]",
@@ -6806,6 +6856,7 @@ def check_controls(directory):
     must_reject(translate, with_constants(["v_mac_f32_e32 v14, s44, v15, v14"]))
     check_e64_approx_lowering()
     check_mac_legacy_lowering()
+    check_dpp_vop3_only_refused()
     # v_madak_f32 and v_madmk_f32 use the same helper. The literal is the last operand of madak and the
     # second of madmk; a register there, a missing operand, and the e64, DPP and SDWA spellings are refused.
     body = translate(with_constants(MAD_LITERAL_BODY)).split("float4 main", 1)[1]
@@ -7353,6 +7404,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(f16_compares()), translate_int))
     fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
+    fixtures.extend((compressed_export(mask), translate_masked) for mask in (0x3, 0xC, 0xF))
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
@@ -7370,6 +7422,31 @@ def check_binary(directory, assembler, objcopy, library):
         assert lower_fixture(disassemble(native, library, cpu=cpu.encode())) == lower_fixture(instructions)
         if index == 0:
             check_container_selector(directory, native, library)
+
+
+def check_compressed_export_draw(directory, compiler, renderer, backend):
+    sentinel = (-1.0, 2.0, -3.0, 4.0)
+    values = (0.5, 1.5, -2.5, 3.5)
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, *values)
+    source = directory / "compressed-export.hlsl"
+    shader = directory / "compressed-export.cso"
+    for requested in (0x3, 0xC, 0xF):
+        hlsl, mask = translate_masked(compressed_export(requested))
+        assert mask == requested
+        source.write_text(hlsl, encoding="ascii")
+        compile_shader(compiler, source, shader)
+        expected = tuple(half_rtz(value) if requested & (1 << ch) else sentinel[ch]
+                         for ch, value in enumerate(values))
+        good = write_case(directory / "masked.case", constants, expected, write_mask=mask)
+        cases = [(good, "pass")]
+        if requested != 0xF:
+            wrong_mask = write_case(directory / "wrong-mask.case", constants, expected, write_mask=0xF)
+            wrong_values = tuple(value + 0.25 if mask & (1 << ch) else value
+                                 for ch, value in enumerate(expected))
+            wrong = write_case(directory / "wrong-value.case", constants, wrong_values, write_mask=mask)
+            cases.extend([(wrong_mask, "mismatch"), (wrong, "mismatch"), (good, "pass")])
+        run_pixel_batch(renderer, backend, shader, cases)
 
 
 def check_ceiling_draws(directory, compiler, renderer, backend):
@@ -10067,7 +10144,7 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-title-loads"):
+                    "draw-mac-legacy", "draw-compressed-export", "draw-title-loads"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -10081,6 +10158,7 @@ def main():
                         "draw-vop3-ternary-int": check_vop3_ternary_int_draws,
                         "draw-swap": check_swap_draw,
                         "draw-mac-legacy": check_mac_legacy_draws,
+                        "draw-compressed-export": check_compressed_export_draw,
                         "draw-title-loads": check_title_load_draws}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
