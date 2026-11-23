@@ -7483,6 +7483,10 @@ def pack_b32_group():
     return [*PACK_B32_PREFIX, *PACK_B32_BODY]
 
 
+def pack_b32_inline_group():
+    return [*PACK_B32_PREFIX, *PACK_B32_BODY, "v_pack_b32_f16 v12, 1.0, v19"]
+
+
 def pack_b32(lo, hi):
     return (lo & 0xffff) | ((hi & 0xffff) << 16)
 
@@ -12114,6 +12118,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
     fixtures.append((uncompressed_export(pack_b32_group()), translate_int))
+    fixtures.append((uncompressed_export(pack_b32_inline_group()), translate_int))
     fixtures.extend((uncompressed_export(sad_group(group)), translate_int) for group in SAD_BODIES)
     fixtures.extend((compressed_export(mask), translate_masked) for mask in (0x3, 0xC, 0xF))
     fixtures.extend((uncompressed_export([], mask), translate_masked) for mask in (0x1, 0x8, 0x5, 0xA))
@@ -12790,10 +12795,10 @@ def check_pack_int16_draws(directory, compiler, renderer, backend):
 def check_pack_b32_draw(directory, compiler, renderer, backend):
     """Draw v_pack_b32_f16 through the integer readback target and compare the words.
 
-    The one program of pack_b32_group() is compiled once and drawn in one renderer batch: every row of
+    The register program is compiled once and drawn in one renderer batch: every row of
     PACK_B32_ROWS with the right words, and the first row once per PACK_B32_WRONG entry with one channel replaced
-    by the word a wrong lowering would give, which must report a mismatch. On a desktop GPU the draw establishes
-    that the translated shader copies the stated halves, not what the console does.
+    by the word a wrong lowering would give. A separate inline program replaces one source with binary16 1.0
+    and uses the old binary32 low-half result as a mismatch control.
     """
     source = directory / "pack_b32.hlsl"
     shader = directory / "pack_b32.cso"
@@ -12823,6 +12828,21 @@ def check_pack_b32_draw(directory, compiler, renderer, backend):
             cases.append((wrong_case, "mismatch"))
     try:
         run_pixel_batch(renderer, backend, shader, cases)
+        inline_source = directory / "pack_b32_inline.hlsl"
+        inline_shader = directory / "pack_b32_inline.cso"
+        inline_source.write_text(translate_int(uncompressed_export(pack_b32_inline_group())), encoding="ascii")
+        compile_shader(compiler, inline_source, inline_shader)
+        a, b = PACK_B32_ROWS[0]
+        original_word = pack_b32(a, b)
+        inline_cases = []
+        for status, low_half in (("pass", 0x3C00), ("mismatch", 0)):
+            words = (pack_b32(low_half, b), original_word, original_word, original_word)
+            constants = bytearray(256)
+            struct.pack_into("<2I", constants, 12, a, b)
+            case = directory / f"pack_b32-inline-{status}.case"
+            case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+            inline_cases.append((case, status))
+        run_pixel_batch(renderer, backend, inline_shader, inline_cases)
     except subprocess.CalledProcessError as error:
         if error.returncode == 77:
             return 77
