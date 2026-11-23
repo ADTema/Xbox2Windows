@@ -42,6 +42,7 @@ except ImportError:
 # Known supported instructions and patterns in pixel_aot.py
 # Tables are imported from pixel_aot so the scanner stays aligned with the translator.
 PIXEL_ALU_NAMES = tuple(pixel_aot.ALU) if pixel_aot is not None else ()
+PIXEL_SDWA_ALU = tuple(pixel_aot.SDWA_ALU) if pixel_aot is not None else ()
 SUPPORTED_ALU = {f"v_{name}_f32" for name in PIXEL_ALU_NAMES}
 PIXEL_INTEGER = pixel_aot.INTEGER if pixel_aot is not None else {}
 PIXEL_SDWA_INT = pixel_aot.SDWA_INT if pixel_aot is not None else {}
@@ -64,7 +65,7 @@ WAIT_COUNTER = r"(?:vmcnt\((?:[0-9]|[1-5][0-9]|6[0-3])\)|lgkmcnt\((?:[0-9]|[1-5]
 SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_inst_prefetch\s+.*",
     r"s_nop\s+.*",
-    r"v_nop",
+    r"v_nop(?:_e64)?",
     r"s_clause\s+(?:0x[0-3]?[0-9a-f]|[0-5]?[0-9]|6[0-3])",
     r"s_setprio\s+(?:0x[0-3]|[0-3])",
     r"s_sleep\s+(?:0x[0-7]?[0-9a-f]|[0-9]|[1-9][0-9]|1[01][0-9]|12[0-7])",
@@ -93,7 +94,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_load_dwordx8\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
     r"(?:s_load_dwordx4|s_buffer_load_dwordx[24])\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
     r"s_buffer_load_dword\s+s\d+,\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
-    r"v_interp_p[12]_f32_e32\s+v\d+,\s+v\d+,\s+attr0\.[xyzw]",
+    r"v_interp_p[12]_f32_e(?:32|64)\s+v\d+,\s+v\d+,\s+attr0\.[xyzw]",
     r"image_sample\s+v\[\d+:\d+\],\s+v\[\d+:\d+\],\s+s\[\d+:\d+\],\s+s\[\d+:\d+\]\s+dmask:0x[7f]\s+dim:SQ_RSRC_IMG_2D",
     r"v_cube(?:id|sc|tc|ma)_f32(?:_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+,\s+[^,]+?(?:\s+clamp)?",
     r"v_(?:fmaak|fmamk)_f32\s+v\d+,\s+[^,]+,\s+[^,]+,\s+[^,]+",
@@ -129,6 +130,13 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
 if PIXEL_ALU_NAMES:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         r"v_(?:" + "|".join(map(re.escape, PIXEL_ALU_NAMES)) + r")_f32(?:_e32|_e64)?\s+v\d+,\s+.*"
+    )
+if PIXEL_SDWA_ALU:
+    # Whole-dword sources only, as pixel_aot requires. This pins the spelling, not the operand count.
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        r"v_(?:" + "|".join(map(re.escape, PIXEL_SDWA_ALU)) + r")_f32_sdwa\s+v\d+,\s+.+?(?:\s+clamp)?"
+        rf"\s+dst_sel:{SDWA_SEL_PATTERN}\s+dst_unused:(?:UNUSED_PAD|UNUSED_PRESERVE)"
+        r"\s+src0_sel:DWORD(?:\s+src1_sel:DWORD)?"
     )
 if PIXEL_SALU_BIT64:
     SUPPORTED_INSTRUCTIONS_REGEX.append(

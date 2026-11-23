@@ -152,12 +152,26 @@ def check_fixture(path):
     attributes("partial_write", "computed")
     passthrough = attributes("exported_passthrough", "argument", exported=True)
     check(passthrough["callers"] == [], f"exported_passthrough: {passthrough}")
+    # Entry-register propagation: the callee copies R8 into RDX, while the caller also sets RDX to
+    # a different word. The site must be resolved from the caller's R8, not from the default RDX.
+    copied = attributes("caller_copy", "argument")
+    check("exported" not in copied and copied["register"] == "R8" and len(copied["callers"]) == 1,
+          f"caller_copy must resolve from R8: {copied}")
+    check(copied["callers"][0]["word"] == AMD_WORD, f"caller_copy caller word: {copied['callers']}")
+    check("truncated" not in copied, f"caller_copy is a 64-bit copy: {copied}")
+    # Negative control: this copy is 32-bit, so the caller's R8=0x1a8004000 must be truncated to
+    # 0xa8004000. The untruncated word sets bit 32, which makes memory type 13 and classifies as
+    # null.
+    low = attributes("caller_copy_low", "argument")
+    check(low["register"] == "R8" and low.get("truncated") is True and len(low["callers"]) == 1,
+          f"caller_copy_low must be truncated from R8: {low}")
+    check(low["callers"][0]["word"] == AMD_WORD, f"caller_copy_low caller word: {low['callers']}")
     for name in ("forward_free", "set_word"):
         check(name not in by_export, f"{name} has no xmem call site")
-    check(len(report["sites"]) == 23, f"expected 23 sites, found {len(report['sites'])}")
+    check(len(report["sites"]) == 25, f"expected 25 sites, found {len(report['sites'])}")
 
     summary = report["summary"]
-    check(summary["sites"] == 23, "summary site count")
+    check(summary["sites"] == 25, "summary site count")
     check(sorted(summary["null_words"]) == ["0x2a8004000", "0xe0000000"], f"null words {summary['null_words']}")
     # --fail-on-unresolved exits with 1 exactly when this list is not empty.
     unresolved = {int(s, 16) for s in summary["sites_not_fully_constant"]}
@@ -169,7 +183,7 @@ def check_fixture(path):
     check(set(words) == {"0x0", "0x1", "0x5e50000", "0xa8004000", "0x20004000", "0xe0000000", "0x2a8004000"},
           f"distinct words {sorted(words)}")
     # Not counted: data_unwritten and pointer_written, whose 0xa8004000 is only an initial value.
-    check(len(words["0xa8004000"]["sites"]) == 4, f"0xa8004000 sites {words['0xa8004000']['sites']}")
+    check(len(words["0xa8004000"]["sites"]) == 6, f"0xa8004000 sites {words['0xa8004000']['sites']}")
 
     for flag, code in ((None, 0), ("--fail-on-null", 1), ("--fail-on-unresolved", 1)):
         command = [sys.executable, "-B", str(TOOL), str(path), "--output", str(Path(path).with_suffix(".scan.json"))]

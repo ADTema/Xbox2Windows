@@ -327,12 +327,19 @@ def check_shader_records():
         assert vop2_forms <= covered, (name, vop2_forms - covered)
         assert e64_integer_forms <= covered, (name, e64_integer_forms - covered)
         assert sdwa_integer_forms <= covered, (name, sdwa_integer_forms - covered)
+        # The VOP3 spellings of the interpolation pair and of v_nop.
+        e64_spelling_forms = {("VOP3", "v_interp_p1_f32_e64"), ("VOP3", "v_interp_p2_f32_e64"), ("VOP3", "v_nop_e64")}
+        assert e64_spelling_forms <= covered, (name, e64_spelling_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         # v_mac_f32 is in the gfx1013 list only.
         approx_e64_forms = {("VOP3", "v_exp_f32_e64"), ("VOP3", "v_log_f32_e64")}
         approx_e64_forms |= {("VOP3", "v_mac_f32_e64")} if name == "gfx1013.tsv" else set()
         assert approx_e64_forms <= covered, (name, approx_e64_forms - covered)
+        # SDWA forms of the unary binary32 operations, whole-dword sources only.
+        sdwa_unary_forms = {("SDWA", f"v_{op}_f32_sdwa") for op in (
+            "exp", "log", "rcp", "rcp_iflag", "rsq", "sqrt", "sin", "cos", "rndne", "frexp_mant")}
+        assert sdwa_unary_forms <= covered, (name, sdwa_unary_forms - covered)
     # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit
     # predicate the translator lowers; the rejected exec-writing and 64-bit neighbours stay out.
     int_compares = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
@@ -373,6 +380,27 @@ def check_shader_records():
         covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": set(pixel.ACCEPTED)})
         without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(rounding)
+
+
+def check_plain_bitscan_forms():
+    """The two plain bitscan fixtures cover VOP1 v_bfrev_b32, v_ffbh_u32, v_ffbh_i32, v_ffbl_b32 and VOP2
+    v_xnor_b32 in both reference lists; a form neither fixture uses stays uncovered."""
+    import pixel_aot_check as pixel
+    wanted = {("VOP1", "v_bfrev_b32"), ("VOP1", "v_ffbh_u32"), ("VOP1", "v_ffbh_i32"), ("VOP1", "v_ffbl_b32"),
+              ("VOP2", "v_xnor_b32")}
+    e64 = {("VOP3", "v_bfrev_b32_e64"), ("VOP3", "v_ffbh_u32_e64"), ("VOP3", "v_xnor_b32_e64")}
+    untouched = {("VOP3", "v_ffbl_b32_e64"), ("VOP3", "v_ffbh_i32_e64")}
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert wanted | e64 | untouched <= reference, name
+        pixel.ACCEPTED.clear()
+        assert not wanted & fc.gfx_forms(pixel.ACCEPTED, reference)  # nothing lowered, nothing covered
+        for second in (False, True):
+            pixel.translate_int(pixel.plain_bitscan_ops(second))
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert wanted | e64 <= covered, (name, sorted((wanted | e64) - covered))
+        assert not untouched & covered, name
+    pixel.ACCEPTED.clear()
 
 
 def check_parsing():
@@ -650,6 +678,7 @@ if __name__ == "__main__":
     check_local_cpu_registration()
     check_cpu_records()
     check_shader_records()
+    check_plain_bitscan_forms()
     check_parsing()
     check_gaps()
     check_dashboard()

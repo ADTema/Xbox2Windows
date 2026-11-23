@@ -99,6 +99,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Invalid scalar destination or movk immediate")
             signed = value - 0x10000 if value >= 0x8000 else value
             scalar[dst] = signed & 0xffffffff
+        elif m := re.fullmatch(r"s_lshl_b32 s(\d+), s(\d+), (\d+)", line):
+            dst, group, shift = map(int, m.groups())
+            tag = scalar.get(group)
+            axis = tag[1] if isinstance(tag, tuple) and tag[0] == "group" else None
+            # A group's first dispatch index, group * size, only for a power-of-two size.
+            if (dst in pending or dst > 105 or axis is None or dims[axis] & (dims[axis] - 1)
+                    or shift != dims[axis].bit_length() - 1):
+                raise ValueError("Unverified group base")
+            scalar[dst] = ("group_base", axis)
         elif m := re.fullmatch(r"s_load_dwordx4 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)", line):
             dest, last, base, high = map(int, m.groups()[:4])
             offset = 0 if m[5] == "null" else int(m[5], 16)
@@ -156,6 +165,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or shift != dims[axis].bit_length() - 1 or vector.get(local) != ("local", axis)):
                 raise ValueError("Unverified dispatch index")
             vector[dst] = ("thread", axis)
+        elif m := re.fullmatch(r"v_add_lshl_u32 v(\d+), s(\d+), v(\d+), (\d+)", line):
+            dst, base, local, shift = map(int, m.groups())
+            tag = scalar.get(base)
+            # (group base + local ID of the same axis) << shift: the byte offset of a dispatch
+            # index, as from v_lshlrev_b32. The store checks bound the shift.
+            if (dst > 255 or not (isinstance(tag, tuple) and tag[0] == "group_base")
+                    or vector.get(local) != ("local", tag[1])):
+                raise ValueError("Unverified dispatch byte offset")
+            vector[dst] = ("thread_bytes", tag[1], shift)
         elif m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line):
             dst, shift, src = map(int, m.groups())
             tag = vector.get(src)
@@ -173,6 +191,20 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
+        elif m := re.fullmatch(r"v_mad_u32_u24 v(\d+), (v\d+|-?\d+|0x[0-9a-f]+), (v\d+|-?\d+|0x[0-9a-f]+), v(\d+)", line):
+            dst, column = int(m[1]), int(m[4])
+            # The literal pitch may be either multiplicand; LLVM 15 places it in src0.
+            row, pitch = (m[2], m[3]) if m[2].startswith("v") else (m[3], m[2])
+            row_tag = vector.get(int(row[1:])) if row.startswith("v") else None
+            column_tag = vector.get(column)
+            # (bits [23:0] of the row index) * pitch + column byte offset. The row check at the store
+            # bounds the column shift against the pitch.
+            if (dst > 255 or pitch.startswith("v") or not 4 <= int(pitch, 0) < 1 << 24 or int(pitch, 0) % 4
+                    or not (isinstance(row_tag, tuple) and row_tag[0] == "thread")
+                    or not (isinstance(column_tag, tuple) and column_tag[0] == "thread_bytes")
+                    or row_tag[1] == column_tag[1]):
+                raise ValueError("Unverified row pitch byte offset")
+            vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
         elif m := re.fullmatch(r"buffer_store_dword(?:x([234]))? (v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), "
                                r"s\[(\d+):(\d+)\], 0( idxen)?( offen)?(?: offset:(\d+))?", line):
             count = int(m[1] or 1)
@@ -221,6 +253,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 covered = {index, row, column}
                 address = (f"tid.{AXES[index]} * {stride}u + (tid.{AXES[row]} << {row_shift}u)"
                            f" + (tid.{AXES[column]} << {shift}u) + {offset}u")
+            elif (m[7] and not m[6] and len(addr_regs) == 1
+                    and isinstance(tags[0], tuple) and tags[0][0] == "pitch_bytes"):
+                # offen only: (row & 0xffffff) * pitch + (column << shift) + instruction offset.
+                # Without idxen the descriptor stride is not used, so the stride binding is ignored.
+                _, row, pitch, column, shift = tags[0]
+                # A group's rows start on a 24-bit-aligned power-of-two boundary, so masking keeps them
+                # consecutive; their pitches must not wrap the 32-bit address onto each other.
+                if (offset + 4 * count > 1 << shift or dims[column] << shift > pitch
+                        or dims[row] * pitch > 1 << 32):
+                    raise ValueError("Store leaves its element or row")
+                store_layout = ("pitch", row, pitch, column, shift)
+                covered = {row, column}
+                address = f"(tid.{AXES[row]} & 0xffffffu) * {pitch}u + (tid.{AXES[column]} << {shift}u) + {offset}u"
             else:
                 raise ValueError("Unsupported store address")
             if any(dims[axis] > 1 for axis in range(3) if axis not in covered):
