@@ -303,6 +303,24 @@ def bind_exports(dll_path, prefix="", names=EXPORTS):
     return funcs
 
 
+def check_discarded_read(native_path, lifted_path):
+    payload = bytes(range(32))
+    for label, dll, prefix in (("native", native_path, ""), ("lifted", lifted_path, "lifted_")):
+        name = "op_discarded_read"
+        fn = bind_exports(dll, prefix, (name,))[name]
+        source, ptr, _, _, _ = alloc_aligned_buffer(payload)
+        for readable in (True, False):
+            result, result_ptr, pre, off, post = alloc_aligned_buffer(FILL)
+            try:
+                fn(ptr, ptr if readable else 0, result_ptr)
+            except OSError as error:
+                assert not readable and "access violation reading" in str(error).lower(), (label, error)
+            else:
+                assert readable, f"{label} discarded a faulting MOVAPS read"
+            expected = payload[:16] + (payload[:16] if readable else FILL[16:])
+            assert_equal_output(label, name, readable, check_guards_and_read(result, pre, off, post, label), expected)
+
+
 def check_differential(native_path, lifted_path, altered_path):
     native = bind_exports(native_path)
     lifted = bind_exports(lifted_path, "lifted_")
@@ -613,5 +631,6 @@ def check_alt_encodings_and_rejections(original_path):
 
 
 if __name__ == "__main__":
+    check_discarded_read(*sys.argv[1:3])
     check_differential(*sys.argv[1:4])
     check_alt_encodings_and_rejections(sys.argv[1])

@@ -5729,6 +5729,11 @@ and an independent Python IEEE-754 single-precision reference model under defaul
 controls (including signed zeros, infinities, quiet and signaling NaNs with distinct
 payloads, subnormals, and 32-byte pre/post buffer guards).
 
+A separate leaf stores one vector, executes a 16-byte load whose result is unused, and then stores
+another vector. Both native and translated code perform both stores when the source is readable.
+An inaccessible source must fault after the first store and leave the second vector unchanged,
+including in the Release preset.
+
 An `ALTER_IMM` variant flips predicates on `op_cmpps_1` (`1` to `5`), `op_cmpps_3`
 (`3` to `7`), `op_cmpps_6` (`6` to `2`), `op_cmpss_1` (`1` to `5`), `op_cmpss_3` (`3` to `7`),
 and `op_cmpss_6` (`6` to `2`); the altered lifted DLL matched the altered reference and

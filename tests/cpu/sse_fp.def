@@ -32,4 +32,5 @@ EXPORTS
     op_movntps
     op_movntps_disp16
     op_movaps_reg
+    op_discarded_read
     op_pipeline

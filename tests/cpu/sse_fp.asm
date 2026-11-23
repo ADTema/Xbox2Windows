@@ -316,6 +316,16 @@ op_movaps_reg PROC FRAME
     ret
 op_movaps_reg ENDP
 
+; The MOVAPS source must be read even though xmm5 is dead after this instruction.
+op_discarded_read PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps XMMWORD PTR [r8], xmm0
+    movaps xmm5, XMMWORD PTR [rdx]
+    movaps XMMWORD PTR [r8+16], xmm0
+    ret
+op_discarded_read ENDP
+
 op_pipeline PROC FRAME
     .endprolog
     movaps xmm0, XMMWORD PTR [rcx]

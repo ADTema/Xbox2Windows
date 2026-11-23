@@ -57,7 +57,8 @@ ALLOWED_CODES = {
     Code.MOVDQU_XMMM128_XMM,
 }
 
-PRELUDE = """#include <cstdint>
+PRELUDE = """#include <atomic>
+#include <cstdint>
 #include <cstring>
 
 using word = std::uint64_t;
@@ -66,16 +67,20 @@ struct Vec128 {
     std::uint64_t q[2];
 };
 
+// Guest reads can fault even when the translated result is dead. Keep surrounding guest
+// writes on their original side of the read when the compiler inlines these helpers.
 static inline std::uint32_t load32(word address) {
-    std::uint32_t val = 0u;
-    std::memcpy(&val, reinterpret_cast<const void*>(address), 4);
-    return val;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto value = *reinterpret_cast<const volatile std::uint32_t __unaligned*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return value;
 }
 
 static inline std::uint64_t load64(word address) {
-    std::uint64_t val = 0ull;
-    std::memcpy(&val, reinterpret_cast<const void*>(address), 8);
-    return val;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto value = *reinterpret_cast<const volatile std::uint64_t __unaligned*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return value;
 }
 
 static inline void store64(word address, std::uint64_t val) {
@@ -83,9 +88,12 @@ static inline void store64(word address, std::uint64_t val) {
 }
 
 static inline Vec128 load128(word address) {
-    Vec128 v{};
-    std::memcpy(v.q, reinterpret_cast<const void*>(address), 16);
-    return v;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    Vec128 value;
+    std::memcpy(value.q, reinterpret_cast<const void*>(address), sizeof(value.q));
+    const volatile Vec128 observed = value;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return {{observed.q[0], observed.q[1]}};
 }
 
 static inline void store128(word address, const Vec128& v) {

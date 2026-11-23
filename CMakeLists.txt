@@ -1084,7 +1084,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "op_cmpss_mem,op_cmpss_mem_plus1,op_cmpss_self,"
         "op_movlps_load,op_movlps_store,op_movhps_load,op_movhps_store,"
         "op_movlps_load_plus1,op_movhps_load_plus1,op_movlps_store_plus1,op_movhps_store_plus1,"
-        "op_movntps,op_movntps_disp16,op_movaps_reg,op_pipeline")
+        "op_movntps,op_movntps_disp16,op_movaps_reg,op_pipeline,op_discarded_read")
     string(CONCAT cpu_sse_fp_exports ${cpu_sse_fp_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_sse_fp_${variant} sse_fp)
