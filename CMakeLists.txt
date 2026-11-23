@@ -2549,6 +2549,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-bfm "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_bfm_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME pixel_aot_brev_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-brev "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_brev_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_brev_${adapter}.txt")
         add_test(NAME pixel_aot_plain_bitscan_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-plain-bitscan "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
