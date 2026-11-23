@@ -2326,6 +2326,11 @@ borrow, or interchanging the bitwise operations, must change the readback.
 Run these variants with `ctest --preset dev --no-tests=error -R
 '^compute_store_aot_lds_qword_(warp|hardware)$' -V`.
 
+The five returning qword operations use the same updates and copy the
+old pair into the destination. The fixture aliases the destination with
+the data pair and exports all four dwords for one and two groups. Replacing
+the returned pair with the post-update pair must fail the CPU comparison.
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must

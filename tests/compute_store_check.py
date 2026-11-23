@@ -1565,24 +1565,33 @@ LDS_QWORD_UPDATES = {
 }
 
 
+LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in LDS_QWORD_UPDATES
+                     for stem, width in [op.rsplit("_", 1)]}
+
+
 def lds_qword_program(op):
+    returns = op in LDS_QWORD_RETURNS
+    ret_operand = "v[18:19], " if returns else ""
     return LDS_WIDE_SETUP + [
         "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
         "v_mov_b32_e32 v17, 0xfffffff1",
         "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x0000000e",
         "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
-        f"{op} v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+        f"{op} {ret_operand}v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
         "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
-        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
-    ]
+    ] + (["v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v13, v19",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
 
 
 def lds_qword_reference(op, groups):
     words = []
     for lane in range(groups * 32):
         previous = (0xfffffff1 << 32) | ((0xfffffff0 + lane) & 0xffffffff)
-        current = LDS_QWORD_UPDATES[op](previous, 0x0000000e00000018)
+        current = LDS_QWORD_UPDATES[LDS_QWORD_RETURNS.get(op, op)](previous, 0x0000000e00000018)
         words.extend((current & 0xffffffff, (current >> 32) & 0xffffffff))
+        if op in LDS_QWORD_RETURNS:
+            words.extend((previous & 0xffffffff, previous >> 32))
     return words
 
 
@@ -1626,6 +1635,8 @@ def lds_wide_reference(name, groups):
 LDS_CASES += [(name, lds_wide_program(name), LDS_WIDE_BINDING) for name in LDS_WIDE_PROGRAMS]
 LDS_QWORD_BINDING = LDS_WIDE_BINDING | {"stride": 8}
 LDS_QWORD_CASES = [(op, lds_qword_program(op), LDS_QWORD_BINDING) for op in LDS_QWORD_UPDATES]
+LDS_QWORD_RETURN_BINDING = LDS_WIDE_BINDING | {"stride": 16}
+LDS_QWORD_CASES += [(op, lds_qword_program(op), LDS_QWORD_RETURN_BINDING) for op in LDS_QWORD_RETURNS]
 
 
 def lds_controls():
@@ -1638,6 +1649,13 @@ def lds_controls():
         (cmpst.replace("v7", "v254"), "Unverified private LDS replacement"),
     ):
         rejects(message, aot.lower, variant(lines, (cmpst, bad)), 32, **LDS_BINDING)
+
+    ret = lds_qword_program("ds_add_rtn_u64")
+    instruction = "ds_add_rtn_u64 v[18:19], v5, v[18:19] offset:8"
+    for bad in (instruction.replace("v[18:19], v5", "v[18:20], v5"),
+                instruction.replace("v[18:19], v5", "v[255:256], v5")):
+        rejects("Unverified private wide LDS update", aot.lower, variant(ret, (instruction, bad)), 32,
+                **LDS_QWORD_RETURN_BINDING)
 
     quad = lds_qword_program("ds_add_u64")
     op = "ds_add_u64 v5, v[18:19] offset:8"
@@ -1868,6 +1886,13 @@ def ds_mutants(name, lines, binding, source):
         if name == "ds_read_i8_d16":
             changed = variant(lines, ("ds_read_i8_d16 v10, v5", "ds_read_u8_d16 v10, v5"))
             yield aot.lower(changed, 32, **binding), 0
+    elif name in LDS_QWORD_RETURNS:
+        # Substitute the post-update word pair for the returned pre-update pair.
+        changed = variant(lines, ("v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v12, v10"),
+                          ("v_mov_b32_e32 v13, v19", "v_mov_b32_e32 v13, v11"))
+        ref = lds_qword_reference(name, 2)
+        word = next(i for i in range(len(ref)) if i % 4 >= 2 and ref[i] != ref[i - 2])
+        yield aot.lower(changed, 32, **binding), word
     elif name in LDS_QWORD_UPDATES:
         if name == "ds_add_u64":
             wrong = source.replace(" + uint(", " + 0u * uint(")
@@ -1919,7 +1944,7 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
         compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
-        for groups in (1, 3):
+        for groups in (1, 2) if name in LDS_QWORD_RETURNS else (1, 3):
             if name in LDS_UPDATES or name in LDS_RETURN_UPDATES:
                 words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
             elif name in LDS_SUBWORDS:
@@ -1930,7 +1955,7 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = lds_replacement_reference(name, groups)
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)
-            elif name in LDS_QWORD_UPDATES:
+            elif name in LDS_QWORD_UPDATES or name in LDS_QWORD_RETURNS:
                 words = lds_qword_reference(name, groups)
             elif name in LDS_WIDE_PROGRAMS:
                 words = lds_wide_reference(name, groups)

@@ -471,15 +471,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Uninitialized private wide LDS word")
             vector.update(zip(range(first, last + 1), (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
-        elif m := re.fullmatch(r"ds_(add_u64|sub_u64|rsub_u64|and_b64|or_b64) v(\d+), "
-                               r"v\[(\d+):(\d+)\](?: offset:(0|8))?", line):
-            op = m[1]
-            addr, first, last = map(int, m.groups()[1:4])
-            slot = int(m[5] or 0) // 4
+        elif ((m := re.fullmatch(r"ds_(add|sub|rsub|and|or)(?P<ret>_rtn)?(_[ub]64) "
+                                 r"(?(ret)v\[(?P<dst_first>\d+):(?P<dst_last>\d+)\], )"
+                                 r"v(?P<addr>\d+), v\[(?P<src_first>\d+):(?P<src_last>\d+)\]"
+                                 r"(?: offset:(?P<offset>0|8))?", line))
+              and (op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64")):
+            addr, first, last = (int(m[key]) for key in ("addr", "src_first", "src_last"))
+            destination = tuple(int(m[key]) for key in ("dst_first", "dst_last")) if m["ret"] else None
+            slot = int(m["offset"] or 0) // 4
             source = (vector.get(first), vector.get(last))
             previous = (lds_wide_words.get(slot), lds_wide_words.get(slot + 1))
             if (guard_span is not None or vector.get(addr) != ("lds_wide_address",)
-                    or last > 255 or last != first + 1 or not all(map(is_word, previous + source))):
+                    or last > 255 or last != first + 1 or not all(map(is_word, previous + source))
+                    or destination and (destination[1] > 255 or destination[1] != destination[0] + 1)):
                 raise ValueError("Unverified private wide LDS update")
             left, right = (source, previous) if op == "rsub_u64" else (previous, source)
             lo, hi = map(hlsl_word, left)
@@ -498,6 +502,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("LDS expression exceeds the profile limit")
             lds_wide_words[slot] = ("alu", low)
             lds_wide_words[slot + 1] = ("alu", high)
+            if destination is not None:
+                vector.update(zip(destination, previous))
             ds_wait = True
         elif m := re.fullmatch(r"ds_write_b(8|16|32) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
             width, addr, src = map(int, m.groups()[:3])
