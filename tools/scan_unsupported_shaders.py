@@ -55,6 +55,7 @@ PIXEL_VOP3P_F16 = pixel_aot.VOP3P_F16 if pixel_aot is not None else {}
 PIXEL_VOP3P_INT16 = pixel_aot.VOP3P_INT16 if pixel_aot is not None else {}
 PIXEL_VOP3_INT16 = pixel_aot.VOP3_INT16 if pixel_aot is not None else {}
 PIXEL_VCC = r"(?:vcc(?:_lo)?)"
+PIXEL_VOP3_INT16_TERNARY = pixel_aot.VOP3_INT16_TERNARY if pixel_aot is not None else {}
 PIXEL_LANE_MASK = pixel_aot.LANE_MASK if pixel_aot is not None else r"(?:vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 # Explicit _e32 VOPC writes VCC only; suffix-less and _e64 may name an SGPR destination.
 PIXEL_VOPC_DST = rf"(?:_e32\s+{PIXEL_VCC}|(?:_e64)?\s+{PIXEL_LANE_MASK})"
@@ -124,6 +125,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_madmk_f32\s+v\d+,\s+[^,]+,\s+0x[0-9a-f]{1,8},\s+[^,]+",
     r"v_mov_b32(?:_e32|_e64)?\s+v\d+,\s+(?:-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)",
     r"v_swap_b32(?:_e32)?\s+v\d+,\s+v\d+",
+    rf"v_readfirstlane_b32(?:_e32)?\s+s\d+,\s+{INTEGER_SOURCE}",
     rf"v_mov_b32_sdwa\s+v\d+,\s+(?:sext\((?:[vs]\d+|-?\d+(?:\.\d+)?)\)|[vs]\d+|-?\d+(?:\.\d+)?)\s+dst_sel:{SDWA_SEL_PATTERN}\s+dst_unused:(?:UNUSED_PAD|UNUSED_PRESERVE)\s+src0_sel:{SDWA_SEL_PATTERN}",
     r"v_cvt_f32_f16(?:_e32|_e64)?\s+v\d+,\s+-?(?:\|(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\((?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_f32_f16_sdwa\s+v\d+,\s+-?(?:\|[vs]\d+\||[vs]\d+)(?:\s+clamp)?\s+dst_sel:DWORD\s+dst_unused:UNUSED_(?:PAD|PRESERVE)\s+src0_sel:WORD_[01]",
@@ -202,6 +204,11 @@ if PIXEL_VOP3P_INT16:
 if PIXEL_VOP3_INT16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP3_INT16))})(?:_e64)?\s+{INT16_VGPR},\s+{INT16_SOURCE},\s+{INT16_SOURCE}"
+    )
+if PIXEL_VOP3_INT16_TERNARY:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP3_INT16_TERNARY))})(?:_e64)?\s+{INT16_VGPR},"
+        rf"\s+{INT16_SOURCE},\s+{INT16_SOURCE},\s+{INT16_SOURCE}"
     )
 
 for name, (arity, _) in PIXEL_INTEGER.items():
@@ -292,6 +299,7 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"v_pk_{name}_f16" for name in PIXEL_VOP3P_F16}
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16}
+    | {f"v_{name}" for name in PIXEL_VOP3_INT16_TERNARY}
     | {name for name, _, _ in MUBUF_OPS.values()}
     | {name for name, _, _ in MTBUF_OPS.values()}
     | {entry[0] for entry in FLAT_OPS.values()}

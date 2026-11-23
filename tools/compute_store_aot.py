@@ -6,7 +6,7 @@ import re
 import struct
 from pathlib import Path
 
-from pixel_aot import container_code, disassemble
+from pixel_aot import INTEGER, container_code, disassemble
 from resource_inventory import parts
 
 
@@ -14,6 +14,19 @@ CONSTANT_WORDS = 16
 AXES = "xyz"
 # Unsigned VOPC compares a lane guard may use: v_cmp_<op>_u32 a, b is (a <op> b) per lane.
 GUARD_COMPARES = {"gt": ">", "lt": "<", "ge": ">=", "le": "<="}
+# The data ALU subset: the unsigned 32-bit operations the LLVM 15 code generator emits for the
+# read-compute-write fixture, on known words only. v_and_b32 and v_lshrrev_b32 (src1 >> src0[4:0])
+# reuse the pixel profile's integer templates, which have the same semantics. v_mad_u32_u24 is
+# src0[23:0] * src1[23:0] + src2, modulo 2^32. None of them writes vcc, so the guard compare stays valid.
+ALU = {
+    "v_and_b32_e32": f"({INTEGER['and_b32'][1]})",
+    "v_lshrrev_b32_e32": f"({INTEGER['lshrrev_b32'][1]})",
+    "v_min_u32_e32": "min({0}, {1})",
+    "v_mad_u32_u24": "((({0} & 0xffffffu) * ({1} & 0xffffffu)) + {2})",
+}
+ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
+# Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
+ALU_EXPRESSION_LIMIT = 1024
 
 
 def checked_group(group):
@@ -33,7 +46,8 @@ def group_size(psv):
 
 
 def is_word(value):
-    return isinstance(value, int) or (isinstance(value, tuple) and value[0] in ("constant_word", "thread", "source"))
+    return isinstance(value, int) or (isinstance(value, tuple)
+                                      and value[0] in ("constant_word", "thread", "source", "alu"))
 
 
 def hlsl_word(value):
@@ -42,7 +56,21 @@ def hlsl_word(value):
     if value[0] == "source":
         # The source binding is read-only, so the read may sit where the word is used.
         return f"inputData.Load({value[1]})"
+    if value[0] == "alu":
+        return value[1]
     return f"tid.{AXES[value[1]]}" if value[0] == "thread" else f"params[{value[1] // 4}].{'xyzw'[value[1] % 4]}"
+
+
+def alu_word(token, scalar, vector, pending):
+    """The known word an ALU source names, or None: a VGPR, a loaded SGPR, an inline constant or a literal."""
+    if token[0] == "v":
+        value = vector.get(int(token[1:]))
+    elif token[0] == "s":
+        n = int(token[1:])
+        value = scalar.get(n) if n <= 105 and n not in pending else None
+    else:
+        value = int(token, 0) & 0xffffffff if -(1 << 31) <= int(token, 0) <= 0xffffffff else None
+    return value if is_word(value) else None
 
 
 def vector_operands(line):
@@ -161,7 +189,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             else:
                 value = int(src, 0)
                 left = value & 0xffffffff if -(1 << 31) <= value <= 0xffffffff else None
-            if not is_word(left) or right > 255 or not is_word(vector.get(right)):
+            # A word read or computed in the program is not a verified guard operand.
+            if (right > 255 or not all(is_word(word) and not (isinstance(word, tuple) and word[0] in ("source", "alu"))
+                                       for word in (left, vector.get(right)))):
                 raise ValueError("Unverified lane guard compare")
             vcc = (op, left, vector[right])
         elif m := re.fullmatch(r"s_and_saveexec_b32 s(\d+), vcc_lo", line):
@@ -318,6 +348,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
+        elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
+              or (m := re.fullmatch(rf"(v_mad_u32_u24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
+              and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
+            # VOP2 takes a VGPR as src1. A v_mad_u32_u24 with an address operand is a row pitch below.
+            op, dst = m[1], int(m[2])
+            words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            if dst > 255 or None in words:
+                raise ValueError("Unverified ALU operand")
+            expression = ALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(r"v_mad_u32_u24 v(\d+), (v\d+|-?\d+|0x[0-9a-f]+), (v\d+|-?\d+|0x[0-9a-f]+), v(\d+)", line):
             dst, column = int(m[1]), int(m[4])
             # The literal pitch may be either multiplicand; LLVM 15 places it in src0.

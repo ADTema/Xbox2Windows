@@ -265,7 +265,12 @@ add_custom_command(OUTPUT "${candidates_header}"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CSMain -Vn ray_candidates -Fh "${candidates_header}"
             -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_candidates.hlsl"
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.cso" DEPENDS tests/ray_candidates.hlsl VERBATIM)
-target_sources(offscreen_check PRIVATE "${ray_header}" "${ray_pipeline_header}" "${candidates_header}"
+set(candidates_pipeline_header "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates_pipeline.h")
+add_custom_command(OUTPUT "${candidates_pipeline_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T lib_6_3 -D DXR_PIPELINE=1 -Vn ray_candidates_pipeline -Fh "${candidates_pipeline_header}"
+            -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates_pipeline.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_candidates.hlsl"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates_pipeline.cso" DEPENDS tests/ray_candidates.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE "${ray_header}" "${ray_pipeline_header}" "${candidates_header}" "${candidates_pipeline_header}"
     tests/dxr_facing.cpp tests/dxr_opacity.cpp)
 foreach(layout IN ITEMS root tables)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/compute_${layout}.h")
@@ -333,9 +338,11 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME dxr_update_pipeline_${adapter} COMMAND offscreen_check ${adapter} --dxr-update-pipeline)
     set_tests_properties(dxr_update_${adapter} dxr_update_pipeline_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME dxr_facing_${adapter} COMMAND offscreen_check ${adapter} --dxr-facing)
-    set_tests_properties(dxr_facing_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    add_test(NAME dxr_facing_pipeline_${adapter} COMMAND offscreen_check ${adapter} --dxr-facing-pipeline)
+    set_tests_properties(dxr_facing_${adapter} dxr_facing_pipeline_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME dxr_opacity_${adapter} COMMAND offscreen_check ${adapter} --dxr-opacity)
-    set_tests_properties(dxr_opacity_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    add_test(NAME dxr_opacity_pipeline_${adapter} COMMAND offscreen_check ${adapter} --dxr-opacity-pipeline)
+    set_tests_properties(dxr_opacity_${adapter} dxr_opacity_pipeline_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_buffer_ops_${adapter} COMMAND offscreen_check ${adapter} --buffer-ops)
     add_test(NAME gpu_alias_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias)
     add_test(NAME gpu_alias_lookup_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-lookup)
@@ -2330,11 +2337,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${tex_tables}")
     target_include_directories(cpu_shim_draw PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_features(cpu_shim_draw PRIVATE cxx_std_17)
-    target_link_libraries(cpu_shim_draw PRIVATE dxgi d3d12 d3d12_xs_shim)
+    target_link_libraries(cpu_shim_draw PRIVATE dxgi d3d12)
     add_executable(cpu_shim_startup tests/cpu/shim_startup.asm tests/cpu/exe_startup.asm)
     set_target_properties(cpu_shim_startup PROPERTIES LINKER_LANGUAGE CXX)
     target_link_options(cpu_shim_startup PRIVATE /ENTRY:native_startup /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
-    target_link_libraries(cpu_shim_startup PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw)
+    target_link_libraries(cpu_shim_startup PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw d3d12_xs_shim)
     set(shim_startup_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_shim_startup_lifted.cpp")
     add_custom_command(OUTPUT "${shim_startup_cpp}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/translate_shim_startup.py"
@@ -2343,7 +2350,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
     add_executable(cpu_shim_startup_lifted "${shim_startup_cpp}")
     target_compile_features(cpu_shim_startup_lifted PRIVATE cxx_std_17)
-    target_link_libraries(cpu_shim_startup_lifted PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw)
+    target_link_libraries(cpu_shim_startup_lifted PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw d3d12_xs_shim)
     add_test(NAME cpu_native_shim_startup COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/shim_startup_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_shim_startup>" "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>"
@@ -2766,6 +2773,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_attribute_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_attribute_${adapter} PROPERTIES TIMEOUT 45)
+        add_test(NAME pixel_aot_dmask_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_dmask_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_dmask_${adapter} PROPERTIES TIMEOUT 45)
         add_test(NAME pixel_aot_three_way_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" three-way "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2774,6 +2785,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-predicate-rounding "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_predicate_rounding_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_comparisons_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-comparisons "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_comparisons_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_comparisons_${adapter}.txt")
         add_test(NAME pixel_aot_blend_scalar_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-blend-scalar "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2800,6 +2816,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-int16-vop3 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_int16_vop3_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME pixel_aot_int16_ternary_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-int16-ternary "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_int16_ternary_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_swap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-swap "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2906,6 +2926,14 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(bc7_draw_${adapter} PROPERTIES TIMEOUT 60)
     endforeach()
+    foreach(adapter IN ITEMS hardware warp)
+        add_test(NAME pixel_aot_bits_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" bits "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_bits_${adapter} PROPERTIES TIMEOUT 180
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_bits_${adapter}.txt")
+    endforeach()
+    set_tests_properties(pixel_aot_bits_hardware PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(cpu_native_frame_hardware pixel_aot_hardware pixel_aot_buffer_color_hardware
         pixel_aot_three_way_hardware pixel_aot_e64_hardware pixel_aot_blend_scalar_hardware pixel_aot_predicate_rounding_hardware bc7_draw_hardware
         pixel_aot_integer_nc_hardware pixel_aot_align_hardware pixel_aot_vop3_ternary_int_hardware
@@ -2929,10 +2957,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_align_${adapter}.txt")
         set_tests_properties(pixel_aot_int16_vop3_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_int16_vop3_${adapter}.txt")
+        set_tests_properties(pixel_aot_int16_ternary_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_int16_ternary_${adapter}.txt")
         set_tests_properties(pixel_aot_vop3_ternary_int_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_vop3_ternary_int_${adapter}.txt")
     endforeach()
     set_tests_properties(pixel_aot_attribute_hardware pixel_aot_rndne_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(pixel_aot_dmask_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compressed_scene_metadata COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/scene_records_check.py" "${CMAKE_CURRENT_BINARY_DIR}/DualUav.cso"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.cso" "$<TARGET_FILE:root_probe>")

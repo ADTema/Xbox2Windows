@@ -518,6 +518,13 @@ The host contract supplies a read-only raw SRV at `t0, space1` containing the or
 
 The [source-built compute shader](../tests/spirv_window/subtract.spvasm) reads two distinct addresses, subtracts their words and writes to a third. Windows checks all 16 words of the arena, including guards, for eight cases. Swapping the two reads reverses the result; moving the store changes which guard is replaced. High addresses, misalignment, 64-bit index overflow and a write past the actual descriptor exercise the window bounds.
 
+The GPU fixture targets `cs_6_0` and requires `Int64ShaderOps`. On Windows 10
+22H2 build 19045.6456, the GTX 1060 (32.0.15.6094), in-box WARP (10.0.19041.5794)
+and app-local WARP (1.0.22) matched all 128 words across the eight cases in
+Debug and Release with zero D3D12 warnings and errors. The original `cs_6_6`
+fixture skipped on both in-box adapters and passed the same cases on app-local
+WARP.
+
 The SPIR-V bridge GPU tests (`spirv_{address_window,sampler_views,ballot_extract,compaction,compare_sampler}_{hardware,warp}`)
 need `spirv-as`, `spirv-val` and `spirv-cross`. `tools/setup-spirv-tools.ps1` builds them from pinned
 SPIRV-Tools, SPIRV-Headers and SPIRV-Cross revisions into `out/tools/spirv/bin`, where CMake looks
@@ -533,7 +540,7 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^spirv_address_window_' -V
 ```
 
-With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. This also validates a combined fixture where a lowered ballot bit controls the value stored through the address window. The adapter reserves `%x2w_` identifiers in the input and gives address and ballot temporaries separate prefixes. The GPU check can also use WSL tools: generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 66 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_6 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
+With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. This also validates a combined fixture where a lowered ballot bit controls the value stored through the address window. The adapter reserves `%x2w_` identifiers in the input and gives address and ballot temporaries separate prefixes. To use WSL tools for the GPU check, generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 60 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_0 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
 
 ### SPIR-V subgroup compaction across lane widths
 
@@ -541,7 +548,11 @@ An optional experiment starts from the optional bridge fixture and compares a so
 
 Two deterministic masks are injected into the fixture constants. Every 4-bit nibble of both masks has one bit set, so every wave of every supported width (4, 8, 16, 32 and 64) has an active lane. The negative controls flip the predicate bit selection and shift the compaction write index by one; the first divergent word must be the wave-0 ballot word (65) and the first compacted payload (257) respectively, otherwise the test fails.
 
-Measured with SPIRV-Tools 2025.5 (`262bdab`), SPIRV-Cross `57e4efc`, DXC 1.9.2609.5 and MSVC 19.50 on Windows 11 build 26300, debug layer unavailable: the RTX 4060 (driver 32.0.16.2124) reports a 32-lane wave and WARP 10.0.26100.10068 reports a 4-lane wave (`D3D12_OPTIONS1.WaveLaneCountMin/Max` are 4/4). Each adapter matched its own width-aware CPU reference in all 328 words for both masks, on both the bridge and the direct-HLSL path, and both negative controls were caught at the predicted first word. The first difference between the adapters is output word 4 (the lane index each group thread observed): the RTX 4060 wrote 4 where WARP wrote 0, and 259 words differ in total. A CPU reference computed at width 32 reports the same word 4 as the first mismatch against the WARP readback, so the difference is the subgroup width the shader runs at, not WARP ballot or compaction arithmetic. Neither adapter exposes a 64-lane wave here, so an intra-wave 31/32 ballot-word boundary is a capability skip; the 31/32 mask-bit boundary is still exercised across the two 32-lane waves.
+The original SM 6.6 fixture was measured with SPIRV-Tools 2025.5 (`262bdab`), SPIRV-Cross `57e4efc`, DXC 1.9.2609.5 and MSVC 19.50 on Windows 11 build 26300, debug layer unavailable: the RTX 4060 (driver 32.0.16.2124) reports a 32-lane wave and WARP 10.0.26100.10068 reports a 4-lane wave (`D3D12_OPTIONS1.WaveLaneCountMin/Max` are 4/4). Each adapter matched its own width-aware CPU reference in all 328 words for both masks, on both the bridge and the direct-HLSL path, and both negative controls were caught at the predicted first word. The first difference between the adapters is output word 4 (the lane index each group thread observed): the RTX 4060 wrote 4 where WARP wrote 0, and 259 words differ in total. A CPU reference computed at width 32 reports the same word 4 as the first mismatch against the WARP readback, so the difference is the subgroup width the shader runs at, not WARP ballot or compaction arithmetic. Neither adapter exposes a 64-lane wave here, so an intra-wave 31/32 ballot-word boundary is a capability skip; the 31/32 mask-bit boundary is still exercised across the two 32-lane waves.
+
+Both compute shaders now target SM 6.0. The compaction command requires SM 6.0 and WaveOps, and reports a capability skip (77) when either is unavailable. The 64-thread fixture also skips a reported 128-lane wave. A wrong lane index at a supported width fails the CPU comparison. Each negative control checks all 328 words, including guards, against its mutated reference before checking the first divergence from the original reference.
+
+On Windows 10 22H2 build 19045.6456, the GTX 1060 (32.0.15.6094) ran at 32 lanes, in-box WARP (10.0.19041.5794) ran at four, and app-local WARP 1.0.22 with Agility 1.620.2 ran at eight. Debug and Release each matched the CPU model in both shader paths for both masks on all three backends. Repeats were identical, both controls diverged at words 65 and 257 as expected, and every dispatch reported zero D3D12 debug warnings and errors. No 64-lane wave was observed, so the intra-wave 31/32 boundary remains untested in these runs. [Wave operations](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/shader-model-6-0) · [Original replay follow-up](https://github.com/R0Y00/Xbox2Windows/issues/768)
 
 ```powershell
 .\tools\setup-spirv-tools.ps1
@@ -2085,7 +2096,7 @@ The CPU controls reject a missing or wrong restore, a saved mask overwritten und
 
 ### Vector reads from a second raw buffer
 
-The store profile can copy one word per read from a second, read-only raw buffer to the store. The caller binds it with `--source-descriptor`, the table byte offset of its four-word descriptor, which becomes `ByteAddressBuffer inputData : register(t0)`. `--source-stride` gives its byte stride for indexed reads. The descriptor may come from its own `s_load_dwordx4` or from one `s_load_dwordx8` with a neighbouring bound descriptor, which is how the LLVM 15 code generator loads u0 and the source together. No values are computed yet: the word read is only stored or copied with `v_mov_b32`.
+The store profile can copy one word per read from a second, read-only raw buffer to the store. The caller binds it with `--source-descriptor`, the table byte offset of its four-word descriptor, which becomes `ByteAddressBuffer inputData : register(t0)`. `--source-stride` gives its byte stride for indexed reads. The descriptor may come from its own `s_load_dwordx4` or from one `s_load_dwordx8` with a neighbouring bound descriptor, which is how the LLVM 15 code generator loads u0 and the source together. The word read is stored, copied with `v_mov_b32`, or used by the small integer ALU subset of the next subsection.
 
 The accepted subset is small:
 
@@ -2104,6 +2115,40 @@ The CPU controls reject a read without its `vmcnt(0)` wait, with only an `lgkmcn
 ```sh
 python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-reg 0 --descriptor-offset 0 --constant-descriptor 32 --group-reg 1 --stride 4 --source-descriptor 16 --output out/copy.hlsl
 ```
+
+### Integer ALU between a read and a store
+
+The store profile accepts four unsigned 32-bit vector operations on known words. Each one is what the LLVM 15 code generator emits for the read–compute–write fixture below:
+
+| Instruction | Result |
+|---|---|
+| `v_and_b32_e32 vD, a, vB` | `a & b` |
+| `v_lshrrev_b32_e32 vD, a, vB` | `b >> (a & 31)`, logical |
+| `v_mad_u32_u24 vD, a, b, c` | `(a & 0xffffff) * (b & 0xffffff) + c`, modulo 2^32 |
+| `v_min_u32_e32 vD, a, vB` | unsigned minimum |
+
+A source is a VGPR, an SGPR that holds a known word, an integer inline constant or a 32-bit literal. The VOP2 forms take a VGPR as the second source. A known word is a literal, a constant-buffer word, a dispatch index, a word read from t0, or an earlier result. The result becomes an inline HLSL expression of its sources. An expression longer than 1024 characters is rejected. `v_mad_u32_u24` with a byte offset as an operand is still the row pitch of a store address, as before.
+
+Results are data only. They can be stored or copied, but they cannot form a store or read address. A result or a word read from t0 is also rejected as a lane-guard compare operand. None of the four instructions writes `vcc`, so the guard compare stays valid. A result written under the guard is unknown after the restore, like any other register.
+
+Anything else stops the lowering at that instruction, with the instruction in the error. This includes signed and other operations (`v_min_i32`, `v_max_u32`, `v_ashrrev_i32`, `v_or_b32`, `v_mad_i32_i24`), carry forms that write `vcc` (`v_add_co_u32`), 16-bit, 64-bit and SDWA forms, register ranges, an SGPR as a VOP2 second source, and output modifiers such as `clamp`.
+
+The fixture is unchanged LLVM 15 code generator output for an original `amdgpu_cs` source, with the read bindings and `cap = params[0].y`:
+
+```c
+if (gid < n) {
+    uint v = src[gid];
+    out[gid] = umin((v & 0xffff) * (v >> 16) + gid, cap);
+}
+```
+
+```hlsl
+if (params[0].x > tid.x) {
+    outputData.Store(tid.x * 4u + 0u, min(params[0].y, ((((0x0000ffffu & inputData.Load((tid.x << 2u) + 0u)) & 0xffffffu) * ((inputData.Load((tid.x << 2u) + 0u) >> (0x00000010u & 31u)) & 0xffffffu)) + tid.x)));
+}
+```
+
+The Windows fixture uses the read harness and its three dispatches, with `cap = 0x45000000`, which clamps about half of the lanes. The expected words come from a CPU model of the source. On five groups with `n = 150`, each of these must fail: a reference with one word off by one bit, with `max` instead of `min`, a shift of 15, a 24-bit instead of a 16-bit mask, or lane 150 also writing. So must recompiled HLSL with `max` for `min`, a shift of 15, a 24-bit mask, the `+ gid` dropped, or the cap read from `params[0].z`. The operands of `v_mad_u32_u24` stay below 2^16 in this fixture, so the 24-bit masks are checked by the exact output and not on the GPU.
 
 ### Two- and three-dimensional thread groups
 
@@ -2255,6 +2300,68 @@ offers a stride for groups larger than one thread. Its
 record counts have not been remeasured after this change.
 
 A local scan of 2,689 compute records accepted 12 records (10 distinct instruction streams). Ten use one-thread groups and fixed addresses. Two use 32- and 64-thread groups and indexed addresses. Tested table bindings used s4 or s5 with descriptor offsets of 0, 32 or 64. The indexed bindings used strides of 4, 8, 12 or 16 bytes, selecting the first compatible profile. On RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), each record compiled to desktop DXIL and dispatched. Each adapter completed 14 full-buffer comparisons with zero mismatches, including two different group counts for both indexed records.
+
+## Vector bit operations in pixel shaders
+
+`pixel_aot.py` adds vector bitfield extraction (`v_bfe_u32`, `v_bfe_i32`),
+mask construction (`v_bfm_b32`) and population count plus accumulator
+(`v_bcnt_u32_b32`) through the shared integer lowering. The fixture also
+checks the existing bit reversal (`v_bfrev_b32`) and first-bit searches
+(`v_ffbh_u32`, `v_ffbh_i32`, `v_ffbl_b32`) in e32 and e64, for twelve
+forms on gfx1013 and gfx1030.
+Offset and width use their low five bits, including width 32 becoming zero.
+Signed extracts preserve sign when a field crosses bit 31; scans preserve the
+all-bits-set sentinel. Integer results remain raw VGPR bits through bitcasts.
+
+The semantics follow the [AMD RDNA2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+and [LLVM's constant BFE folding](https://llvm.org/doxygen/AMDGPUInstCombineIntrinsic_8cpp_source.html).
+Bit scans map to [HLSL first-bit intrinsics](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/firstbithigh),
+with the required leading-count conversion and signed input normalization.
+No SDWA/DPP modifiers, lane-mask counts, floating input modifiers or clamp are
+accepted by this lane-local profile. Existing pending-load, pending-sample and
+execution-mask checks still apply.
+
+The original source fixtures run each form on sixteen constant triples. Each
+32-bit result is exported as four exact byte values using BFE, half widening
+and power-of-two scaling. The Python reference uses explicit bit-position loops,
+signed fields and masked operand widths. Each backend performs 192 positive
+draws and twelve deliberately wrong references that must report pixel mismatch.
+Each form uses one renderer batch with its sixteen inputs and one wrong
+reference. The renderer reuses its device and pipeline within the batch.
+The acceptance-only controls do not add forms to other draw tests' records.
+`tests/form_coverage_check.py` requires precisely the twelve forms in both GPU
+reference lists and leaves them uncovered for failed or skipped tests.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_bits_(hardware|warp)$' -V
+```
+
+Before switching to the batched renderer, on Windows 11 build 26300.9974, MSVC 19.44.35230 and Windows SDK
+10.0.26100 DXC, based on main `6ee2406` plus this change: both new CTests
+passed, without capability skips, with zero pixel error. NVIDIA GeForce RTX 3060
+(10de:2503), driver 32.0.16.2101, completed in 113.72 seconds; WARP
+10.0.26100.9818 completed in 8.46 seconds. The debug layer was unavailable.
+The earlier serial hardware matrix exceeded its 180-second suite deadline;
+completed draws matched. Bounded parallel device initialization completed the
+same matrix within that budget. The existing `pixel_aot_warp` also passed;
+the legacy `pixel_aot_hardware` reached its separate 60-second timeout and is
+not counted as a pass. No full-suite success is claimed.
+
+The batched fixture passed all 192 inputs and 12 wrong-reference controls per
+adapter on Windows 11 build 26200.9974 with Windows SDK 10.0.26100 DXC. WARP
+10.0.26100.9818 took 5.7 seconds and the RTX 4060 Laptop (32.0.16.1656) took
+19.3 seconds, with the debug layer enabled on both. These timings cover the
+dedicated test command, including compilation.
+
+The native AMDGPU binary round trip is also part of `pixel_aot_check.py binary`;
+LLVM 18 assembled and disassembled all twelve forms for gfx1013 and the generated
+HLSL matched source lowering. The tests and implementation are original MIT code.
+During this work, Leonida's independently implemented SPIR-V semantic tests were
+reviewed at revision `67204bf8c0471335d9046890288b33e8d5e2875b`; no Leonida source
+was incorporated into this translator.
+
+
 ## AVX2 leaf recompilation
 
 [The AVX2 leaf translator](../tools/cpu_avx2_aot.py) lifts bounded straight-line Windows x64 leaf functions covering all 28 AVX2 forms in `docs/coverage/x64_zen2.tsv` group `AVX2`:
@@ -2561,6 +2668,18 @@ Across all eight modes, total renderer launches per backend drop from 494 to
 `draw-blend-scalar`: 126 to 61; `draw-e64`: 57 to 50; `draw-integer-nc`: 12 to
 3; `draw-bfm`: 15 to 3; `three-way`: 4 to 3; `buffer-color`: 6 to 4).
 
+`draw-predicate-rounding` grew back to 80 renderer launches and 284 cases.
+With the D3D12 debug layer on an RTX 3070, each launch costs about 0.25 s of
+start-up and each case about 0.03 s; the hardware entry took 31.6 to 33.2 s
+there on an idle machine (up to 45 s under load), and an RTX 3080 reached its
+60 s timeout
+([issue #448](https://github.com/R0Y00/Xbox2Windows/issues/448)). The
+comparison and class draws (`v_cmp_*` f16, i16, i32, u32 and SDWA groups and
+`v_cmp_class`) now run as their own mode, `draw-comparisons`, registered as
+`pixel_aot_comparisons_{hardware,warp}` with the same 60 s timeout. The cases,
+references and expected-mismatch controls are unchanged; only the CTest entry
+that runs them moved.
+
 The first raw buffer_load_dword path remains a proposal while
 [issue #319](https://github.com/R0Y00/Xbox2Windows/issues/319) is open. The
 [binding contract](pixel_mubuf_contract.md) records the separate DW0/DW1
@@ -2630,6 +2749,10 @@ The explicit RT0-mask API also accepts uncompressed binary32 exports with any no
 The caller identifies the entry registers for the texture address and interpolation base, and supplies the four sampler descriptor words to match. The generated pixel shader uses `TEXCOORD0`, texture `t0` and sampler `s0`. The test binds a point-clamp sampler, one mip and a full-screen triangle. These bindings are an explicit specialization. The test measures finite UNORM inputs under full pixel coverage. Execution with a title's original pipeline state, helper-lane behavior at triangle edges and other texture formats require separate validation.
 
 With the entry execution mask restored, `image_sample` also accepts `dmask:0x7` for a 2D RGB sample. It writes three consecutive VGPRs and preserves the following register. The LLVM 15 fixture presets that register to 0.5 and exports it as alpha alongside the sampled RGB. On WARP and RTX 5080, all four channels of 4,096 pixels matched the CPU reference bitwise. A reference that expects the sampled alpha of 1.0 instead fails first at (0, 0) on both adapters. [AMD RDNA 2 image instruction reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+For a guest shader whose execution width is known to be 32, the pixel lowerer accepts `wave_size=32` and tracks the low-half EXEC save, `s_wqm_b32`, and the matching `s_and_b32` or `s_mov_b32` restore. The caller supplies the width from the guest profile. The low-half forms are rejected with an unspecified width or `wave_size=64`. The LLVM 15 binary checks assemble and decode both restore forms and compare the emitted HLSL with the established full-width fixture.
+
+For ordinary 2D sampling, masks `0x1` through `0xf` place enabled channels into consecutive destination VGPRs in RGBA order. A one-channel mask names one VGPR. In the `0xb` draw, R, G and A go to three adjacent VGPRs while the next VGPR retains a 0.25 sentinel. A control that overwrites the sentinel must fail the same readback. The primary texture descriptor can move with `--texture-offset` (default 0, aligned to 32 bytes). It may sit next to the second texture descriptor, including with the second descriptor at offset zero. The translator rejects overlap with either texture or an active constant descriptor. The existing LOD-zero and comparison-sampling profiles retain their own mask requirements.
 
 For a single 2D RGBA sample, `image_sample_lz` lowers to `SampleLevel` at level 0 of the bound texture view. Both halves of an interpolation must execute under the same tracked mask. Entry-mask interpolation supplies the covered lanes for explicit LOD, while implicit sampling requires whole-quad coordinates. The BC7 fixture draws an 8×8 texture into a 4×4 viewport with different colors at mip levels 0 and 1. On WARP and RTX 5080, the explicit sample matched level 0 across 16 pixels and 64 channels. The implicit sample chose level 1 and failed the level-0 reference at (0, 0). [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
 
@@ -2734,13 +2857,15 @@ The SDWA forms of the exact arithmetic (`add`, `sub`, `subrev`, `mul`, `mul_lega
 
 The SDWA forms of the remaining unary binary32 operations (`v_exp_f32`, `v_log_f32`, `v_rcp_f32`, `v_rcp_iflag_f32`, `v_rsq_f32`, `v_sqrt_f32`, `v_sin_f32`, `v_cos_f32`, `v_rndne_f32` and `v_frexp_mant_f32`) go through the same path: each reuses its e32/e64 lowering unchanged, with `src0_sel:DWORD` only, and the result is placed with the SDWA move rules. The translator emits the same shader for the whole-dword SDWA spelling and the e32 spelling of each operation, and the controls assert that. A byte or word source, a `src1_sel`, a second operand, an output modifier, `UNUSED_SEXT` on a partial destination and `UNUSED_PRESERVE` over an untracked destination are refused for every one of the ten. Three programs are drawn with two constant rows each. D3D allows `exp2`, `log2`, a reciprocal, `rsqrt`, `sqrt`, `sin` and `cos` an error, so the first two programs choose inputs whose true result is an integer, add 0.5 and take the floor, which returns that integer for any result within 0.5 of it: exp of `-A`, log of `|B|`, rcp of C and rcp_iflag of `-|D|` give 8, 5, 8, -4 and then 16, 3, -2, -16; rsq of `|A|`, sqrt of B, sin of C and cos of `-D` (in revolutions) give 4, 7, 1, -1 and then 2, 3, -1, 1. That checks which operation ran and its source modifiers, not last-place accuracy. The third program is exact and is compared directly: `v_rndne_f32_sdwa` of the ties 2.5 and -3.5 (2 and -4), `v_frexp_mant_f32_sdwa` of `-B` with `clamp`, the low byte of a rounded tie kept in `BYTE_2` of 1.0 under `UNUSED_PRESERVE`, and the low byte of a significand padded into `BYTE_3`. 26 wrong references, each replacing one channel, must report `pixel_mismatch`: a neighbouring operation for each approximate one (natural exponential and logarithm, rsq for rcp, sqrt and rcp for rsq, rsq for sqrt, sin and cos swapped, radians for revolutions), a copied source, a dropped negation, ties rounded up or toward zero, a dropped clamp, padding for preserving, the neighbouring byte and an unplaced result. That is 32 draws from three compiles and three renderer launches. They run as their own tests, `pixel_aot_sdwa_unary_hardware` and `pixel_aot_sdwa_unary_warp` (`tests/pixel_aot_check.py draw-sdwa-unary`), with their own coverage record, and the LLVM 15 round trip covers the three programs. They passed on the NVIDIA GeForce RTX 3060 (driver 32.0.15.9636) and on WARP (Microsoft Basic Render Driver 10.0.19041.5794), Windows 10 (10.0.19045.6466), debug layer enabled with no errors or warnings. Not shown: last-place accuracy of the approximate operations on any adapter, a partial destination for an approximate result (its low bits have no single reference), inputs outside these rows (zero, negative arguments to log, rsq and sqrt, infinities, NaN, denormals), the integer-divide flag of `v_rcp_iflag_f32`, and what the console computes.
 
-Signed and unsigned 16-bit integer comparisons (`v_cmp_{eq,ne,lt,le,gt,ge}_{i16,u16}` in e32 and e64 encodings) compare only the low 16 bits of each source: the lowering sign-extends them with `asint(x << 16) >> 16` or masks them with `& 0xffff`, and the result feeds `v_cndmask_b32` through the same tracked lane mask as the other comparisons. A source may be a register, an integer inline constant from -16 to 64 or a literal up to `0xffff`. LLVM prints a float inline constant on a 16-bit integer operand as its binary16 literal (`1.0` as `0x3c00`), so float tokens, wider literals, source modifiers, `clamp` and `op_sel` are refused. The exec-writing `v_cmpx_*` forms stay rejected (the f16 comparisons and `v_cmp_class_f16` are lowered by their own branches in `tools/pixel_aot.py`), and `tests/form_coverage_check.py` asserts that all 24 16-bit forms, the 32 32-bit forms and the 32 64-bit forms (122 compare forms in all, with the binary16 ones) are counted while those neighbours are not. The binary fixtures cover the 24 forms, and the draws (`tests/pixel_aot_check.py draw-predicate-rounding`) evaluate all six predicates per kind and encoding on six word pairs. Each word is a normal binary32 value whose upper half differs from the lower one where a 32-bit comparison would disagree, and the pairs include `0x8000` against 0, equal low halves, -1 against 1, `0x7fff` against `0x8000` and both ends of the inline-constant range. Three references must report a pixel mismatch: a signed shader against the unsigned reference, `eq` replaced by `ne`, and a 32-bit comparison against the 16-bit reference on equal low halves.
+Signed and unsigned 16-bit integer comparisons (`v_cmp_{eq,ne,lt,le,gt,ge}_{i16,u16}` in e32 and e64 encodings) compare only the low 16 bits of each source: the lowering sign-extends them with `asint(x << 16) >> 16` or masks them with `& 0xffff`, and the result feeds `v_cndmask_b32` through the same tracked lane mask as the other comparisons. A source may be a register, an integer inline constant from -16 to 64 or a literal up to `0xffff`. LLVM prints a float inline constant on a 16-bit integer operand as its binary16 literal (`1.0` as `0x3c00`), so float tokens, wider literals, source modifiers, `clamp` and `op_sel` are refused. The exec-writing `v_cmpx_*` forms stay rejected (the f16 comparisons and `v_cmp_class_f16` are lowered by their own branches in `tools/pixel_aot.py`), and `tests/form_coverage_check.py` asserts that all 24 16-bit forms, the 32 32-bit forms and the 32 64-bit forms (122 compare forms in all, with the binary16 ones) are counted while those neighbours are not. The binary fixtures cover the 24 forms, and the draws (`tests/pixel_aot_check.py draw-comparisons`) evaluate all six predicates per kind and encoding on six word pairs. Each word is a normal binary32 value whose upper half differs from the lower one where a 32-bit comparison would disagree, and the pairs include `0x8000` against 0, equal low halves, -1 against 1, `0x7fff` against `0x8000` and both ends of the inline-constant range. Three references must report a pixel mismatch: a signed shader against the unsigned reference, `eq` replaced by `ne`, and a 32-bit comparison against the 16-bit reference on equal low halves.
 
 Signed and unsigned 64-bit integer comparisons (`v_cmp_{f,lt,eq,le,gt,ne,ge,t}_{i64,u64}` in e32, suffix-less and e64 spellings, [#794](https://github.com/R0Y00/Xbox2Windows/issues/794)) compare two words per source, so the HLSL needs no 64-bit type. Without a suffix the encoding is chosen as LLVM 15 does: e32 when the destination is `vcc`/`vcc_lo` and src1 is a VGPR pair, e64 otherwise. The high words decide unless they are equal, and then the low words, which always compare unsigned. A signed comparison reads only the high word as `int`. Every word is read as raw bits with `asuint` (`asint` for a signed high word), bound to a local before the comparison, and no arithmetic touches a float view. The result is a tracked lane condition like the other comparisons, so `v_cndmask_b32` consumes it unchanged. A source is a VGPR pair `v[a:a+1]` with `a` from 0 to 254 whose two registers hold tracked numbers, an even-aligned SGPR pair, or an integer inline constant from -16 to 64 sign-extended to 64 bits (`-1` is all ones). On e32 (VOPC) the destination must be `vcc_lo` or `vcc` and src1 must be a VGPR pair, because LLVM 15 rejects an SGPR there. On e64 the destination is `vcc_lo`, `vcc`, an SGPR or an aligned SGPR pair, as for the narrower comparisons, and the wave64 spellings (`vcc`, `s[52:53]`) lower to the same HLSL as the wave32 ones. Refused with a message that names the cause: 32-bit literals, float and hex tokens, constants outside -16..64, register ranges other than a pair, untracked or pending sources, an SGPR destination or SGPR src1 on e32, and misaligned or out-of-range SGPR pairs. Source modifiers, `clamp`, `op_sel`, the `v_cmpx_*` forms, f64 and the unsupported predicates, and the DPP and SDWA forms are refused with the generic `Unsupported instruction` message, which does not name the cause. The 32-bit literal extension rule is not sourced, so literals stay outside this change; refusing float inline constants (LLVM accepts `1.0`) is the translator's choice.
 
 Assumed, not sourced: LLVM 15 assembles unaligned VGPR pairs such as `v[3:4]` and `v[19:20]`, and the translator accepts them, but hardware legality is not shown. The sign extension of inline constants is the scalar b64 rule of this section applied to VOPC; the pairs against `-1` pin the translator's model only. Two SGPR pairs as the sources of one e64 comparison are accepted because LLVM assembles them, with the constant-bus limit unsourced. The controls (`tests/pixel_aot_check.py`, no GPU) translate all 32 forms, compare the exact HLSL, and check the refusals above, the overlap of `v[18:19]` with `v[19:20]` (one value of `v19`, read as the high word of one operand and the low word of the other) and each destination spelling. The draw (`tests/pixel_aot_check.py draw-cmp64`, tests `pixel_aot_cmp64_hardware` and `pixel_aot_cmp64_warp`, 60 s limit, capability skip 77) compiles eight programs, i64 and u64 by e32 and e64 by two groups of four predicates, with -denorm preserve. Each channel runs one predicate on one operand shape: two VGPR pairs, an SGPR pair, the overlapping pair, or inline `-1`. The 13 word pairs go through the constant buffer and `v_mov_b32` copies and include a high-word-only difference (`0x1_00000000` against `0x0_ffffffff`), identical high words with each order of the low words, `-1` against 0, `0x7fffffff_ffffffff` against `0x80000000_00000000`, high words that differ only in the sign bit, equal values, words that are not normal binary32 values (`0x00000001`, `0x7fc00000`, `0xffffffff`, `0x80000000`) and two pairs that make the overlapping operands equal. Six mutated shaders must each mismatch (the test enforces this): high and low words swapped, only the low words compared, only the high words compared, `lt` replaced with `le`, signed compared as unsigned, and the overlapping pair read as `v[20:21]`. The draw pins the translator's model on a desktop adapter; it is not evidence for gfx1013 hardware. The LLVM 15 round trip covers the eight programs. The scanner applies the translator's operand rules (inline decimals -16..64, VGPR pairs `v[a:a+1]` with `a` from 0 to 254, even-aligned SGPR pairs up to `s105`, a VGPR pair as e32 src1, `vcc`/`vcc_lo` only as the e32 destination) and `tests/rdna2_tools_check.py` pins the accepted and refused spellings. The VOPC e32 destination rule follows the same restriction as the narrower comparisons.
 
-The non-packed 16-bit integer `VOP3` ops (issue #669) `v_add_nc_u16`, `v_add_nc_i16`, `v_sub_nc_u16`, `v_sub_nc_i16`, `v_min_u16`, `v_max_u16`, `v_min_i16`, `v_max_i16`, `v_mul_lo_u16`, `v_lshlrev_b16`, `v_lshrrev_b16` and `v_ashrrev_i16` compute on the low 16 bits of two sources and reuse the lane arithmetic of the packed forms: results wrap modulo 2^16, signed min, max and shifts sign-extend the 16-bit value, and shift counts are masked to 4 bits (`& 15`, so a count of 16 shifts by 0). Only the low 16 bits of the result are defined and tracked: the lowering records the destination as `("low16", alu)`, a value whose HLSL variable holds the zero-extended result but whose upper half no accepted reader observes. The destination's previous value is not merged, so a destination may hold anything (a tracked value, an untracked register or another low16 result); a destination with an outstanding image sample is refused. The same applies to the unsuffixed and the `_e64` spelling. The readers that see a low16 value are the 12 ops themselves (a chain of two ops is accepted), the 16-bit integer compares `v_cmp_{eq,ne,lt,le,gt,ge}_{i16,u16}` and `v_mov_b32_sdwa` with `src0_sel:WORD_0`, `BYTE_0` or `BYTE_1` (also with `sext()`), which widens the low half into a fully defined word. Every whole-word or high-half reader is refused: 32-bit integer and float arithmetic, moves, `v_cndmask_b32` data operands, DPP, packed `VOP3P` forms, conversions (including `v_cvt_f32_f16`, which is out of scope for integer low16), dot products, class compares, packs, both export forms and image sample coordinates raise `Expected a numeric register`, `Expected a numeric VGPR in DPP`, `Unsupported pack operand`, `Unsupported export` or `Unsupported texture coordinate`; `v_cvt_f16_f32` into a low16 destination raises `Unsupported conversion destination`; and `v_mov_b32_sdwa` with `WORD_1`, `BYTE_2`, `BYTE_3` or `DWORD` on a low16 source, or with `dst_unused:UNUSED_PRESERVE` into a low16 destination, raises `Reads the undefined high half of a 16-bit result`. A source may be a VGPR in 0 to 255 that holds a tracked value, a tracked SGPR in 0 to 105, an integer inline constant from -16 to 64 or a literal up to `0xffff`. `op_sel`, `clamp`, source modifiers, DPP, SDWA, `v_mad_u16`, `v_mad_i16`, the f16 ops, float tokens, wider literals, inline integers outside -16 to 64 (llvm-mc would encode `-17` as the literal `0xffef`; the translator refuses it by policy, as for the 16-bit compares), an untracked source, a register out of range and a destination with an outstanding image sample are refused. `tests/form_coverage_check.py` asserts that the 12 unsuffixed forms are counted while `v_mad_u16`, `v_mad_i16` and the f16 neighbours are not. `tools/scan_unsupported_shaders.py` matches instructions syntactically and cannot see the low16 tags, so it can report a shader as supported that the translator then refuses at a whole-word reader. The binary fixtures (four programs; groups 0 to 2 widen all four results and group 3 its two low-half results with `v_mov_b32_sdwa ... src0_sel:WORD_0`) round-trip through LLVM 15.0.7, and the controls refuse every form above with its message. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_int16_vop3_"`: groups 0 to 2 preload `v24` to `v27` with a `0xa5c3xxxx` sentinel, run four ops on constant words, widen each result into `v12` to `v15` with SDWA `WORD_0` and export through the bit-exact `R32G32B32A32_UINT` target against a Python reference written from the semantics that contains only the zero-extended low halves; group 3 chains `v_add_nc_u16` into `v_mul_lo_u16` and selects between whole words with `v_cmp_lt_u16` and `v_cmp_lt_i16` on low16 results. Six word sets cover `0x7fff` against `0x8000`, `0xffff + 1`, `0 - 1`, shift counts 15, 16, 17 and 31, a negative operand under `ashrrev`, signed and unsigned min and max that disagree, the overflow `0x1234 * 0x0567`, and sources whose high half differs from the low half. Five mutations of the generated shader must each report a pixel mismatch (a source read from bits 31:16, a shift mask of 31 instead of 15, `v_min_i16` replaced by `v_min_u16`, and a `>> 16u` read of a low16 result by the chained op and by the first compare), and a widening that selects `WORD_1` instead of `WORD_0` must be refused at lowering. The sentinel preloads do not detect a high-half leak, because every accepted reader skips the high half; that half is guarded only by the refusal controls. The binary round trip disassembles through libLLVM; `tools/disasm_rdna2.py` decodes the same encodings. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+The non-packed 16-bit integer `VOP3` ops (issue #669) `v_add_nc_u16`, `v_add_nc_i16`, `v_sub_nc_u16`, `v_sub_nc_i16`, `v_min_u16`, `v_max_u16`, `v_min_i16`, `v_max_i16`, `v_mul_lo_u16`, `v_lshlrev_b16`, `v_lshrrev_b16` and `v_ashrrev_i16` compute on the low 16 bits of two sources and reuse the lane arithmetic of the packed forms: results wrap modulo 2^16, signed min, max and shifts sign-extend the 16-bit value, and shift counts are masked to 4 bits (`& 15`, so a count of 16 shifts by 0). Only the low 16 bits of the result are defined and tracked: the lowering records the destination as `("low16", alu)`, a value whose HLSL variable holds the zero-extended result but whose upper half no accepted reader observes. The destination's previous value is not merged, so a destination may hold anything (a tracked value, an untracked register or another low16 result); a destination with an outstanding image sample is refused. The same applies to the unsuffixed and the `_e64` spelling. The readers that see a low16 value are the 12 ops themselves (a chain of two ops is accepted), the 16-bit integer compares `v_cmp_{eq,ne,lt,le,gt,ge}_{i16,u16}` and `v_mov_b32_sdwa` with `src0_sel:WORD_0`, `BYTE_0` or `BYTE_1` (also with `sext()`), which widens the low half into a fully defined word. Every whole-word or high-half reader is refused: 32-bit integer and float arithmetic, moves, `v_cndmask_b32` data operands, DPP, packed `VOP3P` forms, conversions (including `v_cvt_f32_f16`, which is out of scope for integer low16), dot products, class compares, packs, both export forms and image sample coordinates raise `Expected a numeric register`, `Expected a numeric VGPR in DPP`, `Unsupported pack operand`, `Unsupported export` or `Unsupported texture coordinate`; `v_cvt_f16_f32` into a low16 destination raises `Unsupported conversion destination`; and `v_mov_b32_sdwa` with `WORD_1`, `BYTE_2`, `BYTE_3` or `DWORD` on a low16 source, or with `dst_unused:UNUSED_PRESERVE` into a low16 destination, raises `Reads the undefined high half of a 16-bit result`. A source may be a VGPR in 0 to 255 that holds a tracked value, a tracked SGPR in 0 to 105, an integer inline constant from -16 to 64 or a literal up to `0xffff`. `op_sel`, `clamp`, source modifiers, DPP, SDWA, the f16 ops, float tokens, wider literals, inline integers outside -16 to 64 (llvm-mc would encode `-17` as the literal `0xffef`; the translator refuses it by policy, as for the 16-bit compares), an untracked source, a register out of range and a destination with an outstanding image sample are refused. `tests/form_coverage_check.py` asserts that the 12 unsuffixed forms are counted while the f16 neighbours are not. `tools/scan_unsupported_shaders.py` matches instructions syntactically and cannot see the low16 tags, so it can report a shader as supported that the translator then refuses at a whole-word reader. The binary fixtures (four programs; groups 0 to 2 widen all four results and group 3 its two low-half results with `v_mov_b32_sdwa ... src0_sel:WORD_0`) round-trip through LLVM 15.0.7, and the controls refuse every form above with its message. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_int16_vop3_"`: groups 0 to 2 preload `v24` to `v27` with a `0xa5c3xxxx` sentinel, run four ops on constant words, widen each result into `v12` to `v15` with SDWA `WORD_0` and export through the bit-exact `R32G32B32A32_UINT` target against a Python reference written from the semantics that contains only the zero-extended low halves; group 3 chains `v_add_nc_u16` into `v_mul_lo_u16` and selects between whole words with `v_cmp_lt_u16` and `v_cmp_lt_i16` on low16 results. Six word sets cover `0x7fff` against `0x8000`, `0xffff + 1`, `0 - 1`, shift counts 15, 16, 17 and 31, a negative operand under `ashrrev`, signed and unsigned min and max that disagree, the overflow `0x1234 * 0x0567`, and sources whose high half differs from the low half. Five mutations of the generated shader must each report a pixel mismatch (a source read from bits 31:16, a shift mask of 31 instead of 15, `v_min_i16` replaced by `v_min_u16`, and a `>> 16u` read of a low16 result by the chained op and by the first compare), and a widening that selects `WORD_1` instead of `WORD_0` must be refused at lowering. The sentinel preloads do not detect a high-half leak, because every accepted reader skips the high half; that half is guarded only by the refusal controls. The binary round trip disassembles through libLLVM; `tools/disasm_rdna2.py` decodes the same encodings. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+The three-operand 16-bit integer `VOP3` ops (issue #669) `v_mad_u16`, `v_mad_i16`, `v_min3_i16`, `v_min3_u16`, `v_max3_i16`, `v_max3_u16`, `v_med3_i16` and `v_med3_u16` follow the same low-16-only contract as the paragraph above: the result is tagged `("low16", alu)`, the sources go through the low16-aware `int16_operand` (a register, an SGPR up to `s105`, an inline integer from -16 to 64 or a literal up to `0xffff`), and only the 16-bit ops, the 16-bit compares and `v_mov_b32_sdwa` with `WORD_0`, `BYTE_0` or `BYTE_1` read the result. The lowering is `pk_int16_lane_expr` with the keys the packed `v_pk_mad_*` ops already use plus the six min3, max3 and med3 keys. Semantics follow LLVM 15.0.7 `llvm/lib/Target/AMDGPU/VOP3Instructions.td`: `V_MAD_U16` and `V_MAD_I16` are `VOP3_Profile<VOP_I16_I16_I16_I16, VOP3_CLAMP>` with `Ternary_i16_Pats<mul, add>` (lines 318-319 and 392-393), so the result is `(a * b + c) mod 2^16` and the signed and unsigned forms have the same low half when `clamp` is not modelled; `V_{MIN3,MAX3,MED3}_{I,U}16` map to `AMDGPUsmin3`, `AMDGPUumin3` and the max3 and med3 equivalents (lines 520-529), so the signed forms sign-extend the low halves and med3 is the median. `clamp` and `op_sel` are accepted by llvm-mc for these forms (`v_mad_u16 v5, v1, v2, v3 clamp` encodes with bit 15 of the second dword, `op_sel:[0,0,0,1]` with bit 14) and are refused here with `Unsupported instruction` because they are not modelled; source modifiers, floats, wide literals, inline integers outside -16 to 64, an untracked source, a register out of range, a wrong operand count, DPP and SDWA are refused as for the two-operand forms. llvm-mc prints no `_e64` suffix for these ops (`v_mad_u16_e64` is parsed and printed as `v_mad_u16`); the translator accepts both spellings. The LLVM 15 gfx1013 encodings used by the fixtures use the VOP3 opcodes (bits 25:16 of the first dword) 0x340 for `v_mad_u16`, 0x35e for `v_mad_i16`, 0x353 for `v_min3_u16` and 0x358 for `v_med3_i16`; `v_mad_u16 v5, v1, v2, v3` encodes as `05 00 40 d7 01 05 0e 04`. Only one literal operand is allowed by the assembler. `tests/form_coverage_check.py` asserts that the 8 forms are counted in `gfx1013.tsv` and `rdna2.tsv` while `v_mad_u32_u16`, `v_mad_i32_i16`, `v_sad_u16` and `v_add_f16_e64` are not, and `tools/scan_unsupported_shaders.py` reports the forms as supported by syntax only (it cannot see the low16 tags). The binary fixtures (four programs, round-tripped through LLVM 15.0.7) and the controls cover each form, a chain from a two-operand result into `v_mad_u16`, a med3 and a max3, the refusals above with their messages and a full-word reader (`v_add_nc_u32`) of a mad and of a med3 result. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_int16_ternary_"`: groups 0 to 2 run four ops each on constant words with the destinations preloaded with a `0xa5c3xxxx` sentinel, widen the results with SDWA `WORD_0` into `v12` to `v15` and export them through `R32G32B32A32_UINT` against a Python reference written from the semantics; group 3 chains `v_add_nc_u16`, `v_mad_u16`, `v_med3_i16` and `v_max3_u16`. Six word sets separate signed from unsigned order (`0x7fff` against `0x8000`, `0xfffe` against 1), the median from the minimum and maximum, the wrap of `0x1234 * 0x0567 + 0xffff`, and sources whose high half differs from the low half. Five mutations must each report a pixel mismatch (signed min3 and max3 as unsigned, signed med3 as unsigned, med3 as min3, the mad addend dropped, and the first source read from bits 31:16), and a widening that selects `WORD_1` must be refused at lowering. As for the two-operand ops, the high half of the destination is not measured and the sentinels do not detect a leak.
 
 What a 16-bit result leaves in the high half of its destination is not measured and stays open. LLVM's `GCNSubtarget::zeroesHigh16BitsOfDest` ("on gfx10, all 16-bit instructions preserve the high bits", as cited in #669) is a hypothesis for RDNA 2, not a result, and the same question applies to `v_cvt_f16_f32`. A native control must separate preservation, zeroing and any other defined behavior before a reader of the high half can be lowered. Until then this lowering refuses every reader of that half.
 
@@ -3476,9 +3601,13 @@ ctest --preset dev -R 'bvh_packed|bvh_atomics|bvh_numeric|dxr_update|era_heap_ca
 
 ### Face culling under mirrored instances
 
-`dxr_facing` sends 96 inline queries at eight instances of one two-triangle BLAS. Each instance receives twelve rays: both triangles, both directions along world z, and ray flags `RAY_FLAG_NONE`, `RAY_FLAG_CULL_BACK_FACING_TRIANGLES` and `RAY_FLAG_CULL_FRONT_FACING_TRIANGLES`. The instances combine `D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_FRONT_COUNTERCLOCKWISE`, `D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE`, non-uniform scale and mirroring on x, y or z. The DXR specification defines a triangle as front facing when its vertices appear clockwise from the ray origin in a left-handed frame, evaluates that winding in object space so a negative-determinant instance transform leaves facing unchanged, and makes both cull flags inert on a cull-disabled instance. [Ray flags](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#ray-flags) · [Instance flags](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#d3d12_raytracing_instance_flags)
+`dxr_facing` and `dxr_facing_pipeline` each send 96 rays at eight instances of one two-triangle BLAS. Each instance receives twelve rays covering both triangles, both directions along world z, and ray flags `RAY_FLAG_NONE`, `RAY_FLAG_CULL_BACK_FACING_TRIANGLES` and `RAY_FLAG_CULL_FRONT_FACING_TRIANGLES`. The instances combine `D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_FRONT_COUNTERCLOCKWISE`, `D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE`, non-uniform scale and mirroring on x, y or z. The DXR specification defines a triangle as front facing when its vertices appear clockwise from the ray origin in a left-handed frame, evaluates that winding in object space so a negative-determinant instance transform leaves facing unchanged, and makes both cull flags inert on a cull-disabled instance. [Ray flags](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#ray-flags) · [Instance flags](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#d3d12_raytracing_instance_flags)
 
-The CPU reference in `tests/dxr_facing_reference.h` moves each ray into object space, intersects every triangle in double precision and applies those three rules. Before any GPU work the test compares it with a hand-derived table of front and back letters per instance. The reference expects 72 hits, 36 of them front facing, and 24 culled rays. A world-space winding test would disagree on 48 of the 96 rays, which all target the four mirrored instances. For each ray the shader reports hit status, `CommittedTriangleFrontFace`, instance ID, primitive index and distance. Status, facing, instance and primitive must match exactly. A hit distance of 2 or 3 may differ by 1e-5 relative, and a miss must leave all four words zero. Those 96 rays cross triangle interiors inside the distance interval. A separate CPU-only ray meets the z-scaled instance at the open upper endpoint of 2. Single-precision division in the inverse direction transform gave 1.9999999403953568 and incorrectly admitted the hit. The reference performs that division in double precision. A second fixture sends 12 rays through one identity instance of a square split into two consistently wound triangles in one BLAS geometry. Six rays cross its internal diagonal from opposite directions at three points. Each must commit a hit at distance 1 with the expected facing, and either incident primitive ID is valid. Four interior rays require a specific primitive and two rays outside the square must miss. The shader reports only the committed hit. Candidate multiplicity, silhouette edges, vertices and GPU distance endpoints remain unmeasured. [DXR shared-edge rules](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#fixed-function-ray-triangle-intersection-specification) The custom BVH shader has no facing rule and takes no part. The fixture skips below DXR tier 1.1 or Shader Model 6.5.
+The CPU reference in `tests/dxr_facing_reference.h` moves each ray into object space, intersects every triangle in double precision and applies those three rules. Before any GPU work the test compares it with a hand-derived table of front and back letters per instance. The reference expects 72 hits, 36 of them front facing, and 24 culled rays. A world-space winding test would disagree on 48 of the 96 rays, which all target the four mirrored instances. For each ray the shader reports hit status, facing, instance ID, primitive index and distance. Status, facing, instance and primitive must match exactly. A hit distance of 2 or 3 may differ by 1e-5 relative, and a miss must leave all four words zero. As a control, comparing the readback from the unculled ray for each primitive and direction with the reference for all three flag sets must produce exactly 24 hit-status mismatches. Those 96 rays cross triangle interiors inside the distance interval. A separate CPU-only ray meets the z-scaled instance at the open upper endpoint of 2. Single-precision division in the inverse direction transform gave 1.9999999403953568 and incorrectly admitted the hit. The reference performs that division in double precision.
+
+A second fixture sends 12 rays through one identity instance of a square split into two consistently wound triangles in one BLAS geometry. Six rays cross its internal diagonal from opposite directions at three points. Each must commit a hit at distance 1 with the expected facing, and either incident primitive ID is valid. Four interior rays require a specific primitive and two rays outside the square must miss. The shader reports only the committed hit. Candidate multiplicity, silhouette edges, vertices and GPU distance endpoints remain unmeasured. [DXR shared-edge rules](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#fixed-function-ray-triangle-intersection-specification)
+
+`dxr_facing` reads `CommittedTriangleFrontFace` on DXR Tier 1.1 with Shader Model 6.5. `dxr_facing_pipeline` uses `HitKind` in the existing `lib_6_3` DispatchRays pipeline on DXR Tier 1.0 or later. The GTX 1060 (32.0.15.6094, Windows 10 build 19045.6456) passed DispatchRays and skipped inline RayQuery. App-local WARP 1.0.22 with Agility SDK 1.620.2 passed both backends. Windows 10 in-box WARP exposed no DXR and skipped both tests. Every passing run had zero D3D12 debug warnings and errors. [DXR HitKind](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#hitkind)
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^dxr_facing_' -V
@@ -3498,8 +3627,18 @@ An RTX 5080 (driver 32.0.16.1692, DXR tier 1.2) matched all 126 rays in both run
 
 On an AMD RDNA 4 GPU, a run reported by denn0x in the review of #216 failed `dxr_opacity_hardware`. Every mismatch was a shader-committed hit with the correct instance and geometry, but its `CommittedRayT()` equalled the true distance plus TMin. The specification makes a committed non-opaque triangle the closest hit at the candidate's distance, and `CandidateTriangleRayT` and `CommittedRayT` both measure the distance from the ray origin, not from TMin. [TraceRayInline control flow](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#tracerayinline-control-flow) · [CommittedRayT](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#rayquery-committedrayt) · [CandidateTriangleRayT](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#rayquery-candidatetrianglerayt) All 126 rays use TMin 0.25, so the offset is visible at every hit distance. On the RX 9070 XT with driver 32.0.32015.7029 the reporter observed 43 affected rays. Each such ray increments both `committed_t_plus_tmin` and the committed-hit mismatch count, and the device test fails. The diagnostic identifies shader-committed hits with the expected identity and candidate distance whose committed distance differs by TMin. The same tolerance applies on every adapter. A synthetic control adds 0.25 to a known hit distance and requires the committed-hit check to reject it.
 
+### Opacity in DispatchRays
+
+`dxr_opacity_pipeline` traces the same 126 rays with a `lib_6_3` ray generation, any-hit, closest-hit and miss library. Each geometry selects its own hit group record using a TraceRay geometry multiplier of 1. The record provides the geometry index as a local root constant, so the shaders can identify the four geometries on Tier 1.0. AnyHit records each presented geometry and calls `IgnoreHit` when the accept mask rejects it. [Hit group table indexing](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#hit-group-table-indexing) · [Any hit shaders](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#any-hit-shaders)
+
+The CPU checks require the closest committable hit or a legal first hit, verify instance, geometry, primitive and distance, and compare the required and allowed any-hit geometry masks. The pipeline check also rejects another invocation after a shader-accepted first hit. The diagnostic for candidates after an automatic opaque commit is specific to inline RayQuery.
+
+The pipeline matched 94 hits and 32 misses on the GTX 1060 (driver 32.0.15.6094, Windows 10 build 19045.6456) and app-local WARP 1.0.22 with Agility SDK 1.620.2. Both reported zero D3D12 debug warnings and errors. App-local WARP also passed inline RayQuery with three instances of its known first-hit continuation. The GTX 1060 skipped inline RayQuery at Tier 1.0, and Windows 10 in-box WARP skipped both opacity tests because it has no DXR.
+
+Two local shader mutations confirmed that the check detects each failure independently. Accepting every non-opaque candidate changed the first ray from geometry 1 at distance 2 to geometry 0 at distance 1. Flipping the low bit of the geometry index read from the hit record changed that ray's reported geometry from 1 to 0 at distance 2. Both mutations failed on the GTX 1060 and app-local WARP.
+
 ```powershell
-ctest --preset dev --no-tests=error -R '^dxr_opacity_' -V
+ctest --preset dev --no-tests=error -R '^dxr_opacity_(pipeline_)?(hardware|warp)$' -V
 ```
 
 ### Desktop checks for the query tail and root flags
@@ -3658,6 +3797,21 @@ Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
 ```powershell
 python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --indices 0,8253 --allow-provisional --history "$out/history.json" --tools-path "$out/Leonida/tools"
 ```
+
+The batch exporter uses the native BCPack kernels when the selected Leonida tools provide them. The commands below stage the measured revision separately from the reference checkout above. Pass `--require-rust` to check that the library loads before the batch starts. Individual chunks can still use the reference decoder. [Leonida native backend](https://github.com/ItsNotRexed/Leonida/pull/5116)
+
+```powershell
+$rustCheckout = "$out/Leonida-rust"
+$rustCommit = 'ff5f36bae141b0eb5df4a0029f6fc3a7d4cb111e'
+git init "$rustCheckout"
+git -C "$rustCheckout" fetch --depth=1 https://github.com/ItsNotRexed/Leonida.git $rustCommit
+git -C "$rustCheckout" checkout --detach $rustCommit
+$rustTools = "$rustCheckout/tools"
+cargo build --release --locked --offline --manifest-path "$rustTools/bcpack_calibration/Cargo.toml" --target-dir "$rustTools/bcpack_calibration/target"
+python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --tools-path "$rustTools" --require-rust
+```
+
+Add `--calibration path/to/profile.json` to retry strict decode failures using a local version-1 Leonida profile. This option requires NumPy and the calibration library. Use it by itself or with `--require-rust`. The separate legacy history mode uses `--allow-provisional --history`. Output produced by the local profile has `"mode": "fitted"` in the manifest.
 
 ### Drawing BC7 textures with a recompiled pixel shader
 
@@ -3879,14 +4033,22 @@ The [source-built fixture](../tests/spirv_window/shared_sampler.spvasm) compares
 references 0.25 and 0.75 against depth 0.5 with point-clamp `LESS_EQUAL`, and
 samples an ordinary texel of 0.375. The test first checks that DXC rejects the
 unsplit module. It then splits the module to ordinary binding 5, validates it for
-Vulkan 1.2, cross-compiles it and compiles it as `cs_6_6`. On RX 9070 XT and WARP,
-both readbacks returned 1.0, 0.0 and 0.375 and left all 13 guard words unchanged.
+Vulkan 1.2, cross-compiles for SM 6.0 and compiles it as `cs_6_0`. The original
+`cs_6_6` readbacks on RX 9070 XT and WARP returned 1.0, 0.0 and 0.375 and left
+all 13 guard words unchanged.
 A reference claiming that the second comparison passed produced exactly one
 mismatch, at word 1, on each adapter. Two descriptor controls change one static
 sampler at a time. Switching s2 to `GREATER` exchanged only the two comparison
 results. Clamping the ordinary sampler to `MinLOD` 1 changed only the ordinary
 sample, to 0.625 from the value texture's second mip. The occupied-binding,
 nonzero-LOD, already-separated and passthrough controls run without a GPU.
+
+On Windows 10 build 19045.6456, the GTX 1060 (32.0.15.6094), in-box WARP
+(10.0.19041.5794) and app-local WARP (1.0.22) matched all 16 words in each
+SM 6.0 reference case. The wrong reference, flipped comparison and ordinary
+mip clamp produced the expected differences at word 1, words 0–1 and word 2,
+respectively. All runs reported zero D3D12 warnings and errors. App-local WARP
+returned the same words with the original SM 6.6 build.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^spirv_compare_sampler_' -V
@@ -4017,9 +4179,13 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^spirv_minlod_' -V
 ```
 
-The source-built draw runs three samples against distinct red and green mips.
-Each sample must reach the green mip and match the 64-pixel reference.
-Removing the clamp selects the red mip and must fail at pixel (0, 0).
+The source-built `spirv_minlod_*` smoke draw compiles at `ps_6_0` and skips on
+adapters below Shader Model 6.0. It runs `Sample`, `SampleBias` with an offset,
+and `SampleGrad` against distinct red and green mips. Each sample must reach
+the green mip and match the 64-pixel reference. Removing the clamp selects
+the red mip and must fail at pixel (0, 0). The GTX 1060 (32.0.15.6094),
+Windows 10 in-box WARP (10.0.19041.5794), and app-local WARP 1.0.22 passed on
+Windows 10 build 19045.6456 with zero D3D12 debug errors and warnings.
 
 `spirv_minlod_levels_*` varies the clamp of a plain `Sample` over an 8x8
 texture with four solid-color mips. The coordinate is constant, so the LOD is
@@ -4034,10 +4200,16 @@ control on the same adapter.
 - Clamp 1 checked against mip 2, and clamp 1.25 checked against the 1.5 blend,
   must fail at pixel (0, 0).
 
-The `^spirv_minlod_` command above also runs these tests. All MinLod draws
-check for Shader Model 6.6 before creating the pipeline and skip (77) without
-it, as on the Windows 10 in-box runtime. Results on Windows 10
-build 19045 with the Agility SDK 1.620.2, DXC 1.9.2609 and the debug layer on:
+The detailed level and blend draws use `ps_6_6` and skip (77) on the Windows 10
+in-box runtime. In separate `ps_6_0` and `ps_6_2` probes, in-box WARP
+10.0.19041.5794 selected green mip 1 for a per-sample clamp of 1.5625 under
+point mip filtering. An explicit `SampleLevel` at the same LOD selected
+blue mip 2 on that adapter. Linear mip filtering gave the expected blend
+(G=0.4375, B=0.5625). The translated `ps_6_0` sample and a direct HLSL clamp
+agreed. [Direct3D rules for per-sample clamping and mip selection](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm)
+
+The detailed fixture results below used Windows 10 build 19045, Agility SDK
+1.620.2, DXC 1.9.2609 and the debug layer.
 
 | Clamp | Exact green, blue | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 |
 |---|---|---|---|
@@ -4113,17 +4285,57 @@ The native, mapped and AOT runners use the existing translated shadow scene. The
 second frame shifts the caster four pixels while retaining the device, pipeline
 states, descriptor heap, camera depth and color target. Two light depth maps
 remain live so the second camera pass can deliberately select the first one.
-The fixture compares all 4,096 color pixels and 4,096 light-depth texels of each
-frame against the CPU reference, checks four owned surface releases after the
-GPU fence, and verifies exit code 42. The stale binding changes only the
-second color frame and is checked against its own reference.
+The EXE selects each frame and map slot and calls the test provider to record,
+submit and wait for each frame. One queue signals fence values 1 and 2. Frame
+data is published after its wait and contains 4,096 color pixels followed by
+4,096 light-depth texels. The check compares every byte to the CPU reference,
+checks the mesh export traces, verifies the ordered calls and four owned surface
+releases, and expects exit code 42. The stale binding changes only the second
+color frame, by 170 pixels, and is checked against its own reference.
+
+For the submission control the EXE records the second frame, then supplies an
+invalid frame index to submit. The fixture rejects that request with
+`E_INVALIDARG` before the queue is called. Only fence 1 and the first frame are
+published. The EXE takes its submit-error exit 24 after the unsubmitted list,
+four surfaces and device are released. The fixture provider implements the
+record, submit, wait and close imports for this source-built scene.
 
 Run `ctest --preset release --no-tests=error -R '^cpu_shim_shadow_(warp|hardware)$' -V`.
 
-The EXE shadow path selects an adapter in the host and calls the
-`d3d12_xs.dll!D3D12XboxCreateDevice` shim to create the actual device at feature
-level 12.0. The fixture uses a null parameter block and the desktop
+The host selects an adapter, and the EXE calls the
+`d3d12_xs.dll!D3D12XboxCreateDevice` shim through its own PE import. The mapper
+resolves that import to the same shim, and the AOT binding passes the four
+arguments and 32-bit HRESULT from the lifted call site. The shim creates a
+device at feature level 12.0. The fixture uses a null parameter block and the desktop
 `ID3D12Device` interface. A non-null Xbox parameter block or unsupported
 interface is rejected. The negative case supplies an unsupported IID after
 adapter selection. It checks the cleared device output, release of the adapter
 and factory references, zero frame bytes and exit code 20 on all three runners.
+
+## First-active-lane vector broadcast readback
+
+The `pixel_aot_warp` and `pixel_aot_hardware` fixtures include a dedicated
+`v_readfirstlane_b32` program, which is also included in the source-built
+binary round trip. `v_readfirstlane_b32` copies the value of a VGPR from the
+first active lane in the wavefront into an SGPR destination, lowered to HLSL SM 6.0
+`WaveReadLaneFirst()`. The destination scalar register is immediately tracked
+for downstream SALU arithmetic, VALU operands, and constant-buffer offset indexing.
+
+The lowerer enforces uniform-source extraction, where participating lanes
+hold the same value (as when broadcasting or scalarizing values copied from
+SGPRs, constant buffers, or immediate bit patterns). The draw fixture verifies
+broadcast scalar extraction across zero, normal, and high integer inputs against
+an exact bit pattern across 64 pixels, with a deliberate oracle mismatch case
+ensuring incorrect readbacks fail. Divergent per-lane source readback and
+non-zero first participating lane behavior remain unmeasured. Dedicated controls
+verify rejection of varying VGPR inputs (such as interpolated coordinates and
+barycentrics), non-entry execution masks (during whole-quad mode), VGPR destinations,
+out-of-range SGPR indices, unresolved scalar memory dependencies, and invalid modifiers,
+while uniform self-moves (`v_mov_b32_e32 v18, v18`) retain uniform provenance.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_(warp|hardware)$' -V
+```
+
+Python-only controls check HLSL wave-intrinsic translation, register tracking,
+and scanner recognition without requiring a GPU.

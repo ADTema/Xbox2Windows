@@ -807,12 +807,22 @@ OperationResult run_dxr_update_pipeline(const OperationContext& ctx)
 
 OperationResult run_dxr_facing(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_facing(ctx.device));
+    return skip_if_false(check_dxr_facing(ctx.device, false));
+}
+
+OperationResult run_dxr_facing_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_facing(ctx.device, true));
 }
 
 OperationResult run_dxr_opacity(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp"));
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", false));
+}
+
+OperationResult run_dxr_opacity_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", true));
 }
 
 OperationResult run_ray_query(const OperationContext& ctx)
@@ -883,21 +893,25 @@ constexpr CapabilityGate kGateSm60SamplerViews{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: sampler fixture requires SM 6.0",
     CapsDiagnostic::none};
-constexpr CapabilityGate kGateSm66CompareSampler{
-    D3D_SHADER_MODEL_6_6, false, false, 0,
-    "skip: comparison-sampler fixture requires SM 6.6",
+constexpr CapabilityGate kGateSm60CompareSampler{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: comparison-sampler fixture requires SM 6.0",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
-    D3D_SHADER_MODEL_6_6, true, false, 0,
-    "skip: address window fixture requires SM 6.6 and 64-bit shader integer operations",
+    D3D_SHADER_MODEL_6_0, true, false, 0,
+    "skip: address window fixture requires SM 6.0 and 64-bit shader integer operations",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66Ballot{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: ballot fixture requires SM 6.6",
     CapsDiagnostic::none};
-constexpr CapabilityGate kGateSm66Compaction{
-    D3D_SHADER_MODEL_6_6, false, false, 0,
-    "skip: subgroup compaction fixture requires SM 6.6",
+constexpr CapabilityGate kGateSm60Compaction{
+    D3D_SHADER_MODEL_6_0, false, true, 0,
+    "skip: subgroup compaction fixture requires SM 6.0 and WaveOps",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60MinLodSmoke{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: MinLod smoke fixture requires SM 6.0",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66MinLod{
     D3D_SHADER_MODEL_6_6, false, false, 0,
@@ -916,10 +930,10 @@ const OperationSpec kOperations[] = {
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
-    {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm66CompareSampler, run_spirv_compare_sampler},
+    {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
-    {"--spirv-compaction", 4, 4, nullptr, kGateSm66Compaction, run_spirv_compaction},
+    {"--spirv-compaction", 4, 4, nullptr, kGateSm60Compaction, run_spirv_compaction},
     {"--ffx-device-init", 3, 3, nullptr, kNoGate, run_ffx_device_init},
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
@@ -938,8 +952,8 @@ const OperationSpec kOperations[] = {
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
     {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
-    // The SPIR-V MinLod fixtures compile ps_6_6; these draws run behind an SM 6.6 gate.
-    {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm66MinLod, run_check_pixel_quad_lod},
+    {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm60MinLodSmoke, run_check_pixel_quad_lod},
+    // The detailed MinLod level and blend fixtures compile ps_6_6.
     {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},
     {"--check-pixel-mip-blend", 6, 6, nullptr, kGateSm66MinLod, run_check_pixel_mip_blend},
     {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
@@ -970,7 +984,9 @@ const OperationSpec kOperations[] = {
     {"--dxr-update", 3, 3, nullptr, kNoGate, run_dxr_update},
     {"--dxr-update-pipeline", 3, 3, nullptr, kNoGate, run_dxr_update_pipeline},
     {"--dxr-facing", 3, 3, nullptr, kNoGate, run_dxr_facing},
+    {"--dxr-facing-pipeline", 3, 3, nullptr, kNoGate, run_dxr_facing_pipeline},
     {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
+    {"--dxr-opacity-pipeline", 3, 3, nullptr, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
@@ -1251,6 +1267,16 @@ int run_self_test()
         if (!require(out.find("skip: mesh fallback requires SM 6.0") != std::string::npos,
                      "--mesh-depth-pair-fallback must print its skip reason")) return 1;
 
+        const OperationSpec* compare_sampler = find_operation("--spirv-compare-sampler");
+        if (!require(compare_sampler != nullptr, "--spirv-compare-sampler operation")) return 1;
+        const AdapterCaps sm60_caps{D3D_SHADER_MODEL_6_0};
+        if (!require(evaluate_gate(compare_sampler->gate, sm60_caps), "comparison sampler accepts SM 6.0"))
+            return 1;
+        out.clear();
+        if (!require(!evaluate_gate(compare_sampler->gate, sm51_caps, {&out, &err}) &&
+                     out.find("skip: comparison-sampler fixture requires SM 6.0") != std::string::npos,
+                     "comparison sampler requires SM 6.0 and prints its skip reason")) return 1;
+
         // The ballot fixture skips on a runtime capped at SM 6.5, as the Windows 10 in-box runtime is (#751).
         const OperationSpec* ballot = find_operation("--spirv-ballot");
         if (!require(ballot != nullptr, "--spirv-ballot operation")) return 1;
@@ -1266,16 +1292,44 @@ int run_self_test()
         if (!require(out.find("skip: ballot fixture requires SM 6.6") != std::string::npos,
                      "--spirv-ballot must print its skip reason")) return 1;
 
+        const OperationSpec* compaction = find_operation("--spirv-compaction");
+        if (!require(compaction != nullptr, "--spirv-compaction operation")) return 1;
+        const AdapterCaps sm60_waves{D3D_SHADER_MODEL_6_0, false, true, 4, 4};
+        const AdapterCaps sm60_no_waves{D3D_SHADER_MODEL_6_0, false, false, 0, 0};
+        const AdapterCaps sm51_waves{D3D_SHADER_MODEL_5_1, false, true, 32, 32};
+        if (!require(evaluate_gate(compaction->gate, sm60_waves), "compaction accepts SM 6.0 with WaveOps"))
+            return 1;
+        for (const AdapterCaps& unmet : {sm60_no_waves, sm51_waves}) {
+            out.clear();
+            if (!require(!evaluate_gate(compaction->gate, unmet, {&out, &err}) &&
+                         out.find("skip: subgroup compaction fixture requires SM 6.0 and WaveOps") != std::string::npos,
+                         "compaction requires both SM 6.0 and WaveOps"))
+                return 1;
+        }
+
+        const OperationSpec* address_window = find_operation("--spirv-address-window");
+        if (!require(address_window != nullptr, "--spirv-address-window operation")) return 1;
+        const AdapterCaps sm60_int64{D3D_SHADER_MODEL_6_0, true};
+        const AdapterCaps sm51_int64{D3D_SHADER_MODEL_5_1, true};
+        if (!require(evaluate_gate(address_window->gate, sm60_int64), "address window accepts SM 6.0 with Int64ShaderOps"))
+            return 1;
+        for (const AdapterCaps& unmet : {sm60_no_waves, sm51_int64}) {
+            out.clear();
+            if (!require(!evaluate_gate(address_window->gate, unmet, {&out, &err}) &&
+                         out.find("skip: address window fixture requires SM 6.0 and 64-bit shader integer operations") !=
+                             std::string::npos,
+                         "address window requires both SM 6.0 and Int64ShaderOps"))
+                return 1;
+        }
+
         // The MinLod draws skip the same way instead of failing at ps_6_6 pipeline creation.
-        char quad_op[] = "--spirv-minlod-quad-lod";
         char clamp_op[] = "--check-pixel-mip-clamp";
         char blend_op[] = "--check-pixel-mip-blend";
         char level[] = "1";
         char tolerance[] = "0.0078125";
-        char* quad_argv[]{prog, mode, quad_op, dxil};
         char* clamp_argv[]{prog, mode, clamp_op, dxil, level};
         char* blend_argv[]{prog, mode, blend_op, dxil, level, tolerance};
-        const struct { char** argv; int argc; } minlod_cases[]{{quad_argv, 4}, {clamp_argv, 5}, {blend_argv, 6}};
+        const struct { char** argv; int argc; } minlod_cases[]{{clamp_argv, 5}, {blend_argv, 6}};
         for (const auto& c : minlod_cases) {
             const OperationSpec* spec = find_operation(c.argv[2]);
             if (!require(spec != nullptr, "MinLod operation")) return 1;
@@ -1287,6 +1341,20 @@ int run_self_test()
             if (!require(out.find("skip: MinLod fixture requires SM 6.6") != std::string::npos,
                          "MinLod draw must print its skip reason")) return 1;
         }
+
+        // The MinLod smoke draw accepts SM 6.0 without wave or int64 operations.
+        char quad_op[] = "--spirv-minlod-quad-lod";
+        char* quad_argv[]{prog, mode, quad_op, dxil};
+        const OperationSpec* quad = find_operation(quad_op);
+        if (!require(quad != nullptr, "MinLod smoke operation")) return 1;
+        if (!require(evaluate_gate(quad->gate, sm60_caps), "MinLod smoke draw must accept SM 6.0")) return 1;
+        OperationContext qctx{nullptr, nullptr, sm51_caps, "warp", 4, quad_argv, nullptr};
+        out.clear();
+        err.clear();
+        if (!require(run_operation_spec(*quad, qctx, {&out, &err}) == 77,
+                     "MinLod smoke draw below SM 6.0 must exit 77")) return 1;
+        if (!require(out.find("skip: MinLod smoke fixture requires SM 6.0") != std::string::npos,
+                     "MinLod smoke draw must print its skip reason")) return 1;
     }
 
     // (c) Handler OutcomeKind::fail and thrown exception exit 1 (never 77); OutcomeKind::skip exits 77; pass exits 0.

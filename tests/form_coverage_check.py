@@ -457,7 +457,7 @@ def check_plain_bitscan_forms():
 def check_int16_vop3_forms():
     """The 12 non-packed 16-bit integer VOP3 forms count as covered once the translator accepts their fixtures.
     The unsuffixed spellings match the reference; the _e64 control does not count (gfx_forms keeps _e64 names), and
-    the nearby VOP3 forms that stay rejected (v_mad_u16, v_mad_i16, f16 ops) stay uncovered."""
+    the nearby VOP3 forms that stay rejected (f16 ops) stay uncovered."""
     import pixel_aot
     import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
     saved = set(pixel.ACCEPTED)
@@ -467,8 +467,7 @@ def check_int16_vop3_forms():
             pixel.translate_int(pixel.int16_vop3_ops(group))
         forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_INT16}
         assert len(forms) == 12
-        neighbours = {("VOP3", "v_mad_u16"), ("VOP3", "v_mad_i16"), ("VOP3", "v_add_f16_e64"),
-                      ("VOP3", "v_cvt_f16_u16_e64")}
+        neighbours = {("VOP3", "v_add_f16_e64"), ("VOP3", "v_cvt_f16_u16_e64")}
         for name in ("gfx1013.tsv", "rdna2.tsv"):
             reference = fc.load_reference(name)
             assert forms <= reference, (name, forms - reference)
@@ -482,6 +481,37 @@ def check_int16_vop3_forms():
     finally:
         pixel.ACCEPTED.clear()
         pixel.ACCEPTED.update(saved)
+def check_int16_ternary_forms():
+    """The 8 three-operand 16-bit integer VOP3 forms count as covered once the translator accepts their fixtures; the
+    nearby VOP3 forms that stay rejected (v_mad_u32_u16, v_mad_i32_i16, v_sad_u16, f16 ops) stay uncovered."""
+    import pixel_aot
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for group in range(3):
+            pixel.translate_int(pixel.int16_ternary_ops(group))
+        forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_INT16_TERNARY}
+        assert len(forms) == 8
+        neighbours = {("VOP3", "v_mad_u32_u16"), ("VOP3", "v_mad_i32_i16"), ("VOP3", "v_sad_u16"),
+                      ("VOP3", "v_add_f16_e64")}
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not neighbours & covered, (name, neighbours & covered)
+        # With only the unrelated two-operand fixtures accepted the ternary forms are not covered.
+        pixel.ACCEPTED.clear()
+        pixel.translate_int(pixel.int16_vop3_ops(0))
+        reference = fc.load_reference("gfx1013.tsv")
+        assert not forms & fc.gfx_forms(pixel.ACCEPTED, reference)
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 def check_sopk_wait_forms():
     """The SOPK wait forms count once a program using them lowers; a refused SGPR operand records nothing."""
     import pixel_aot_check as pixel
@@ -546,6 +576,49 @@ def check_parsing():
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
     unmatched = full["x64_zen2"]["fixture_forms_not_in_reference"]
     assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
+
+
+def check_junit_errors():
+    """An unusable JUnit file is reported as a one-line diagnostic with exit status 2, not a traceback.
+    The record window needs one CTest run, so a merged <testsuites> file is refused rather than guessed."""
+    import subprocess
+    tool = Path(fc.__file__)
+    valid = '<testsuite time="1" timestamp="2026-11-21T21:05:21"><testcase name="a" status="run"/></testsuite>'
+    cases = {
+        "missing.xml": (None, "No such file"),
+        "malformed.xml": ("not xml", "syntax error: line 1, column 0"),
+        "merged.xml": (f"<testsuites>{valid}</testsuites>", "expected one CTest <testsuite> root, found <testsuites>"),
+        "no_timestamp.xml": ('<testsuite time="1"><testcase name="a" status="run"/></testsuite>',
+                             "timestamp"),
+        "bad_time.xml": ('<testsuite time="soon" timestamp="2026-11-21T21:05:21"/>', "time"),
+        "valid.xml": (valid, None),
+    }
+    cases.update({
+        f"time_{value}.xml": (valid.replace('time="1"', f'time="{value}"'), "finite and nonnegative")
+        for value in ("nan", "inf", "-1")
+    })
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, (text, expected) in cases.items():
+            junit = Path(tmp) / name
+            if text is not None:
+                junit.write_text(text, encoding="utf-8")
+            if expected and text is not None and name != "malformed.xml":
+                try:
+                    fc.read_results(junit)
+                except ValueError as error:
+                    assert expected in str(error), (name, error)
+                else:
+                    raise AssertionError(f"{name}: read_results accepted an unusable JUnit file")
+            run = subprocess.run([sys.executable, "-B", str(tool), str(junit), "--records", tmp],
+                                 capture_output=True, text=True)
+            if expected is None:
+                assert run.returncode == 0, (name, run.returncode, run.stderr)
+                assert "Tests: 1 passed, 0 failed, 0 skipped." in run.stdout, run.stdout
+                continue
+            assert run.returncode == 2, (name, run.returncode, run.stderr)
+            assert "Traceback" not in run.stderr, (name, run.stderr)
+            assert run.stderr.startswith(f"form_coverage: {junit}: "), (name, run.stderr)
+            assert expected in run.stderr, (name, run.stderr)
 
 
 def check_gaps():
@@ -622,6 +695,33 @@ def check_cpu_records():
             report = fc.measure(results, root, {test: forms})
             assert report['x64_zen2']['covered'] == 0
             assert len(report['x64_zen2']['blocked_by_skip']) == (12 if state == 'skip' else 0)
+def check_vector_bit_forms():
+    import pixel_aot_check as pixel
+    recorded = set(pixel.ACCEPTED)
+    pixel.check_bit_controls()
+    assert pixel.ACCEPTED == recorded, 'acceptance controls leaked forms into unrelated GPU records'
+    unary = {'v_bfrev_b32', 'v_ffbh_u32', 'v_ffbh_i32', 'v_ffbl_b32'}
+    vop3 = {'v_bfe_u32', 'v_bfe_i32', 'v_bfm_b32', 'v_bcnt_u32_b32'}
+    expected = {('VOP1', op) for op in unary} | {('VOP3', op + '_e64') for op in unary}
+    expected |= {('VOP3', op) for op in vop3}
+    # Count actual accepted source programs, including both encodings of unary operations.
+    forms = set()
+    for op in pixel.BIT_OPERATIONS:
+        program = pixel.bit_program(op)
+        pixel.translate(program)
+        forms.update(line.split()[0] for line in program)
+    for name in ('gfx1013.tsv', 'rdna2.tsv'):
+        selected = fc.gfx_forms(forms, fc.load_reference(name))
+        assert expected <= selected and len(expected) == 12
+        assert not any(group in {'SDWA', 'DPP8', 'DPP16'} for group, _ in selected)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {})
+        for state, count in (('pass', 12), ('fail', 0), ('skip', 0)):
+            m = fc.measure({'pixel_aot_bits_warp': state}, root,
+                           {'pixel_aot_bits_warp': set(pixel.BIT_OPERATIONS)})
+            assert m['gfx1013']['covered'] == m['gfx1030']['covered'] == count
+
+
 def check_avx2_regs():
     """avx2_regs.asm covers all 28 AVX2 forms in docs/coverage/x64_zen2.tsv group AVX2."""
     expected_avx2 = {
@@ -809,13 +909,16 @@ if __name__ == "__main__":
     check_local_cpu_registration()
     check_cpu_records()
     check_shader_records()
+    check_vector_bit_forms()
     check_scalar_brev()
     check_plain_bitscan_forms()
     check_int16_vop3_forms()
+    check_int16_ternary_forms()
     check_swap_coverage()
     check_sopk_wait_forms()
     check_s_version_form()
     check_parsing()
+    check_junit_errors()
     check_gaps()
     check_dashboard()
     check_avx2_regs()
