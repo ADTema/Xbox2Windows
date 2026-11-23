@@ -590,8 +590,7 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
             input.integerRT = (flags & 1u) != 0;
             const UINT8 caseMask = flags >> 4;
             if (caseMask) {
-                if (input.integerRT || (caseMask != 0x3 && caseMask != 0xC &&
-                                        caseMask != D3D12_COLOR_WRITE_ENABLE_ALL))
+                if (input.integerRT)
                     throw std::runtime_error("Invalid floating-point case write mask");
                 input.maskedCase = true;
                 input.writeMask = caseMask;

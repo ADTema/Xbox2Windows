@@ -3249,15 +3249,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             exported = True
         elif match(r"exp mrt0,? (?:v\d+|off), (?:v\d+|off), (?:v\d+|off), (?:v\d+|off) done compr vm"):
             raise ValueError("Unsupported compressed export: enable mask must select whole packed pairs")
-        elif m := match(r"exp mrt0,? (v\d+), (v\d+), (v\d+), (v\d+) done vm"):
-            # Four distinct, ready registers of computed or sampled values.
-            export_regs = m.groups()
+        elif m := match(r"exp mrt0,? (v\d+|off), (v\d+|off), (v\d+|off), (v\d+|off) done vm"):
+            channels = m.groups()
+            export_regs = [reg for reg in channels if reg != "off"]
             values = [vector.get(reg) for reg in export_regs]
-            if (mask != "entry" or exported or len(set(export_regs)) != 4
+            if (mask != "entry" or exported or not export_regs or len(set(export_regs)) != len(export_regs)
                     or any(reg in sample_dest for reg in export_regs)
                     or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in values)):
                 raise ValueError("Unsupported export")
+            channel_mask = sum(1 << index for index, reg in enumerate(channels) if reg != "off")
+            if channel_mask != 0xF and (integer_export or not return_write_mask):
+                raise ValueError("Partial uncompressed export requires an explicit floating-point RT0 write mask")
             args = [f"asuint({v})" for v in values] if integer_export else values
+            for index, reg in enumerate(channels):
+                if reg == "off":
+                    args.insert(index, "0.0f")
             input_type = f"float{4 if attribute_input else texcoord_components}"
             lines[entry_line] = f"{result_type} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
             lines.append(f"    return {result_type}({', '.join(args)});")
