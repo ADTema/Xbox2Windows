@@ -528,6 +528,16 @@ INT_COMPARE = {
     "f": "false", "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}",
     "gt": "{0} > {1}", "ne": "{0} != {1}", "ge": "{0} >= {1}", "t": "true",
 }
+# 64-bit comparisons from the (low, high) words. The high words decide unless equal; a signed high word is an int.
+INT64_COMPARE = {
+    "f": "false", "t": "true",
+    "lt": "({h0} < {h1}) || ({h0} == {h1} && {l0} < {l1})",
+    "le": "({h0} < {h1}) || ({h0} == {h1} && {l0} <= {l1})",
+    "gt": "({h0} > {h1}) || ({h0} == {h1} && {l0} > {l1})",
+    "ge": "({h0} > {h1}) || ({h0} == {h1} && {l0} >= {l1})",
+    "eq": "{h0} == {h1} && {l0} == {l1}",
+    "ne": "!({h0} == {h1} && {l0} == {l1})",
+}
 # 32-bit integer operations on register bits. Shift counts use their low five bits, as on the target.
 INTEGER = {
     "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
@@ -1155,6 +1165,8 @@ def int_operand(token, scalar, vector, pending, sample_dest, *, signed):
     if signed and bits.startswith("asuint(") and bits.endswith(")"):
         return f"asint({bits[7:-1]})"
     return f"asint({bits})" if signed else bits
+
+
 def int16_operand(token, scalar, vector, pending, sample_dest, *, signed):
     """Return the low 16 bits of a 16-bit integer source as a sign- or zero-extended HLSL value.
 
@@ -1175,6 +1187,41 @@ def int16_operand(token, scalar, vector, pending, sample_dest, *, signed):
     else:
         bits = int_operand(token, scalar, vector, pending, sample_dest, signed=False)
     return f"(asint({bits} << 16) >> 16)" if signed else f"({bits} & 0xffffu)"
+
+
+def int64_operand(token, scalar, vector, pending, sample_dest, *, signed, encoding, position):
+    """Return the (low, high) HLSL words of a 64-bit integer comparison source.
+
+    Accepted: a VGPR pair v[a:a+1] (0 <= a <= 254, unaligned allowed: LLVM 15 assembles it; hardware legality is
+    assumed), an aligned SGPR pair s[a:a+1], and an integer inline constant from -16 to 64, sign-extended to 64 bits
+    (assumed to follow the scalar b64 rule, pinned by the -1 pairs of the draw). Literals, floats, hex and modifiers
+    are refused. Both words are raw bits; only the high word is signed, the low word always compares unsigned.
+    VOPC e32 takes a VGPR pair as src1 (position 1), because LLVM refuses an SGPR there.
+    """
+    invalid = ValueError(f"Invalid 64-bit comparison operand: {token}")
+    pair = re.fullmatch(r"v\[(0|[1-9]\d*):(0|[1-9]\d*)\]", token)
+    if encoding == "e32" and position == 1 and not pair:
+        raise ValueError("64-bit comparison e32 src1 must be a VGPR pair")
+    if pair:
+        first, last = int(pair.group(1)), int(pair.group(2))
+        if last != first + 1 or first > 254:
+            raise invalid
+        names = (f"v{first}", f"v{last}")
+        if any(name not in vector for name in names):
+            raise ValueError(f"Untracked 64-bit comparison source: {token}")
+        return (int_operand(names[0], scalar, vector, pending, sample_dest, signed=False),
+                int_operand(names[1], scalar, vector, pending, sample_dest, signed=signed))
+    if re.fullmatch(r"s\[\d+:\d+\]", token):
+        names = sgpr_pair(token)
+        if any(name not in pending and name not in scalar for name in names):
+            raise ValueError(f"Untracked 64-bit comparison source: {token}")
+        return (int_operand(names[0], scalar, vector, pending, sample_dest, signed=False),
+                int_operand(names[1], scalar, vector, pending, sample_dest, signed=signed))
+    if re.fullmatch(r"0|-?[1-9]\d*", token) and -16 <= int(token) <= 64:
+        value = int(token) & 0xffffffffffffffff
+        high = f"{value >> 32}u"
+        return f"{value & 0xffffffff}u", f"asint({high})" if signed else high
+    raise invalid
 
 
 def dpp_vgpr(token, vector, sample_dest, *, allow_mods):
@@ -2666,6 +2713,32 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {INT_COMPARE[op].format(*values)};")
+        elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i64|u64)(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            # 64-bit comparisons: the two words are compared separately, so no 64-bit HLSL type is needed.
+            op, kind, enc, dst, *tokens = m.groups()
+            # Without a suffix LLVM 15 picks e32 when the operands fit it (vcc destination, VGPR-pair src1) and
+            # e64 otherwise; its disassembly always prints the suffix.
+            if enc is None:
+                enc = "_e32" if dst in ("vcc", "vcc_lo") and re.fullmatch(r"v\[\d+:\d+\]", tokens[1]) else "_e64"
+            enc = enc[1:]
+            if enc == "e32" and dst not in ("vcc", "vcc_lo"):
+                raise ValueError("64-bit comparison e32 destination must be vcc")
+            regs = lane_mask(dst)
+            if dst.startswith("s["):
+                sgpr_pair(dst)
+            elif dst.startswith("s"):
+                sgpr_name(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            words = [int64_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i64",
+                                   encoding=enc, position=n) for n, t in enumerate(tokens)]
+            word_type = "int" if kind == "i64" else "uint"
+            names = [f"cmp{i}_l0", f"cmp{i}_h0", f"cmp{i}_l1", f"cmp{i}_h1"]
+            for name, value in zip(names, (words[0][0], words[0][1], words[1][0], words[1][1])):
+                lines.append(f"    {'uint' if name[-2] == 'l' else word_type} {name} = {value};")
+            lines.append(f"    bool cmp{i} = {INT64_COMPARE[op].format(l0=names[0], h0=names[1], l1=names[2], h1=names[3])};")
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32_sdwa {LANE_MASK}, ([^,]+), ([^,]+) src0_sel:DWORD src1_sel:DWORD"):
             # With whole-dword selections the SDWA comparison is the e32/e64 one; byte and word selections
             # would compare zero-extended fields as binary32 and are refused.

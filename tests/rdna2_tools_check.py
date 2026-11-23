@@ -2511,6 +2511,42 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertFalse(is_instruction_supported(line), line)
         for opcode in ("s_bfe_u64", "s_bfe_i64", "s_bfm_b64"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
+        # 64-bit integer comparisons: register pairs or an inline integer; VOPC writes VCC and takes a VGPR pair
+        # as src1. Literals, floats, modifiers, SGPR src1 or an SGPR destination on e32, and exec writers are refused.
+        for op in ("f", "lt", "eq", "le", "gt", "ne", "ge", "t"):
+            for kind in ("i64", "u64"):
+                for line in (f"v_cmp_{op}_{kind}_e32 vcc_lo, v[18:19], v[20:21]",
+                             f"v_cmp_{op}_{kind} vcc_lo, s[44:45], v[20:21]",
+                             f"v_cmp_{op}_{kind}_e32 vcc_lo, -1, v[20:21]",
+                             f"v_cmp_{op}_{kind}_e64 s52, v[18:19], v[19:20]",
+                             f"v_cmp_{op}_{kind}_e64 vcc_lo, s[44:45], s[46:47]",
+                             f"v_cmp_{op}_{kind}_e64 s[52:53], 64, v[20:21]",
+                             # Without a suffix LLVM 15 picks e64 when the operands need it.
+                             f"v_cmp_{op}_{kind} s[52:53], v[18:19], v[20:21]",
+                             f"v_cmp_{op}_{kind} vcc_lo, v[18:19], s[44:45]"):
+                    self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_cmp_lt_i64_e32 vcc_lo, v[18:19], s[44:45]",
+            "v_cmp_lt_i64_e32 vcc_lo, v[18:19], 64",
+            "v_cmp_lt_i64_e32 s52, v[18:19], v[20:21]",
+            "v_cmp_lt_u64_e64 s52, 0x12345678, v[20:21]",
+            "v_cmp_lt_u64_e64 s52, 1.0, v[20:21]",
+            "v_cmp_lt_u64_e64 s52, v[18:19], v[20:21] clamp",
+            "v_cmp_lt_u64_e64 s52, -v[18:19], v[20:21]",
+            "v_cmp_lt_u64_e64 s52, v18, v[20:21]",
+            "v_cmp_lt_u64_e64 exec, v[18:19], v[20:21]",
+            "v_cmpx_lt_i64_e32 v[18:19], v[20:21]",
+            "v_cmpx_lt_u64_e64 v[18:19], v[20:21]",
+            "v_cmp_lt_f64_e64 s52, v[18:19], v[20:21]",
+            "v_cmp_ngt_u64_e64 s52, v[18:19], v[20:21]",
+            "v_cmp_lt_u64_e64 s52, 65, v[20:21]",
+            "v_cmp_lt_u64_e64 s52, v[18:19], -17",
+            "v_cmp_lt_u64_e64 s52, v[255:256], v[20:21]",
+            "v_cmp_lt_u64_e64 s52, s[45:46], v[20:21]",
+            "v_cmp_lt_i64_e32 vcc_lo, s[45:46], v[20:21]",
+            "v_cmp_lt_u64_e64 s52, v[18:20], v[20:21]",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
         for line in (
             "v_alignbit_b32 v1, v2, v3, v4",
             "v_alignbit_b32_e64 v1, v2, v3, 4",

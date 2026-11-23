@@ -1011,6 +1011,86 @@ def int16_reference(kind, encoding, group, left, right):
     return [float(tests[op](value(a), value(b))) for op, a, b in INT16_GROUPS[encoding][group]]
 
 
+# 64-bit integer comparisons. The constant words s44..s47 hold two 64-bit values: A = (s44 low, s45 high) and
+# B = (s46 low, s47 high). v18..v21 copy them, so v[18:19] = A and v[20:21] = B, and v19 also starts the
+# overlapping pair v[19:20] = (s45, s46). Each group has four channels, and every channel selects 1.0 (v22) or 0.
+# Channel c of group g tests predicate CMP64_PREDICATES[4g + c] on operand shape CMP64_SHAPES[(c + g) % 4].
+CMP64_PREDICATES = ("lt", "eq", "le", "gt", "ne", "ge", "f", "t")
+CMP64_SHAPES = ("pairs", "sgpr", "overlap", "inline")
+
+
+def cmp64_sources(shape, encoding):
+    """src0 and src1 of one operand shape. An e32 src1 must be a VGPR pair, so its SGPR pair is src0."""
+    return {"pairs": ("v[18:19]", "v[20:21]"),
+            "sgpr": ("s[44:45]", "v[20:21]") if encoding == "e32" else ("v[18:19]", "s[46:47]"),
+            "overlap": ("v[18:19]", "v[19:20]"),
+            "inline": ("-1", "v[20:21]")}[shape]
+
+
+def cmp64_prefix():
+    return [f"v_mov_b32_e32 v{18 + n}, s{44 + n}" for n in range(4)] + ["v_mov_b32_e32 v22, 1.0"]
+
+
+def cmp64_program(body):
+    """body after the four word copies and v22 = 1.0, exported as four uncompressed channels."""
+    return uncompressed_export(cmp64_prefix() + body)
+
+
+def cmp64_group(kind, encoding, group, *, wave64=False):
+    dst = ("vcc" if wave64 else "vcc_lo") if encoding == "e32" else ("s[52:53]" if wave64 else "s52")
+    body = []
+    for channel in range(4):
+        op = CMP64_PREDICATES[4 * group + channel]
+        src0, src1 = cmp64_sources(CMP64_SHAPES[(channel + group) % 4], encoding)
+        body.extend([f"v_cmp_{op}_{kind}_{encoding} {dst}, {src0}, {src1}",
+                     f"v_cndmask_b32_{encoding} v{12 + channel}, 0, v22, {dst}"])
+    return cmp64_program(body)
+
+
+# Pairs (s44, s45, s46, s47). Each 32-bit half alone gets some of them wrong: high words decide the first and
+# fourth, low words the second and third; the fifth to seventh order differently signed and unsigned, and the sixth
+# and seventh have high words that differ only in the sign bit. Overlap makes (s45, s46) the second operand.
+CMP64_WORDS = (
+    (0x00000000, 0x00000001, 0xffffffff, 0x00000000),  # 0x1_00000000 against 0x0_ffffffff
+    (0x00000005, 0x12345678, 0x00000003, 0x12345678),  # identical high words, low words decide: A > B
+    (0x00000003, 0x12345678, 0x00000005, 0x12345678),  # identical high words, low words decide: A < B
+    (0xffffffff, 0xffffffff, 0x00000000, 0x00000000),  # -1 against 0
+    (0xffffffff, 0x7fffffff, 0x00000000, 0x80000000),  # 0x7fffffff_ffffffff against 0x80000000_00000000
+    (0x00000002, 0x00000001, 0x00000002, 0x80000001),  # high words differ only in the sign bit
+    (0xffffffff, 0x80000001, 0x00000000, 0x00000001),  # as above, with the low words the other way round
+    (0x89abcdef, 0x01234567, 0x89abcdef, 0x01234567),  # equal
+    (0x00000001, 0x7fc00000, 0xffffffff, 0x80000000),  # words that are not normal binary32 values
+    (0x80000000, 0x00000001, 0x7fc00000, 0x00000000),  # more non-normal bit patterns
+    (0x00000003, 0x00000007, 0x00000007, 0x00000000),  # overlap: (3, 7) against (7, 7)
+    (0x7fc00000, 0x7fc00000, 0x7fc00000, 0xffffffff),  # overlap: both operands are (0x7fc00000, 0x7fc00000)
+    (0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff),  # all ones: the inline -1 equals both operands
+)
+
+
+def cmp64_truth(op, signed, left, right):
+    """left and right are (low, high) word pairs."""
+    def value(words):
+        number = words[0] | words[1] << 32
+        return number - (1 << 64) if signed and number >> 63 else number
+
+    a, b = value(left), value(right)
+    return {"f": False, "t": True, "lt": a < b, "eq": a == b, "le": a <= b,
+            "gt": a > b, "ne": a != b, "ge": a >= b}[op]
+
+
+def cmp64_expected(kind, encoding, group, words):
+    """The four channels (float views of the exported words) of cmp64_group for one set of constant words."""
+    s44, s45, s46, s47 = words
+    channels = []
+    for channel in range(4):
+        shape = CMP64_SHAPES[(channel + group) % 4]
+        left, right = {"overlap": ((s44, s45), (s45, s46)),
+                       "inline": ((0xffffffff, 0xffffffff), (s46, s47))}.get(shape, ((s44, s45), (s46, s47)))
+        truth = cmp64_truth(CMP64_PREDICATES[4 * group + channel], kind == "i64", left, right)
+        channels.append(as_float(0x3f800000 if truth else 0))
+    return tuple(channels)
+
+
 # v_cmp_class_f32 is true when the class of S0 is in the mask S1 (LLVM SIInstrFlags::ClassFlags).
 # Each channel tests one property: +inf against its own bit, a quiet NaN against both NaN bits,
 # -0 against the +0 bit and a positive denormal against its bit, so neither the sign of zero
@@ -1688,6 +1768,242 @@ def check_int16_predicate_draws(directory, compiler, renderer, backend):
     widened = [line.replace("_u16_", "_u32_") for line in int16_group("u16", "e32", 0)]
     must_mismatch(widened, left, right, int16_reference("u16", "e32", 0, left, right),
                   "A 32-bit comparison matched the 16-bit reference")
+
+
+def check_cmp64_controls():
+    """64-bit integer comparisons: lowering, destinations, sources and the refused neighbours."""
+    forms = set()
+    for kind in ("i64", "u64"):
+        for encoding in ("e32", "e64"):
+            for group in (0, 1):
+                program = cmp64_group(kind, encoding, group)
+                translate_int(program)
+                forms.update(line.split()[0] for line in program if line.startswith("v_cmp_"))
+                # The wave64 spellings (vcc, s[52:53]) lower to the same HLSL as the wave32 ones.
+                assert translate_int(cmp64_group(kind, encoding, group, wave64=True)) == translate_int(program)
+    assert forms == {f"v_cmp_{op}_{kind}_{enc}" for op in INT_PREDICATES for kind in ("i64", "u64")
+                     for enc in ("e32", "e64")}, forms
+    # Without a suffix LLVM 15 picks e32 when the operands fit it and e64 otherwise (it always prints the suffix).
+    assert (translate_int(cmp64_program(["v_cmp_lt_u64 vcc_lo, v[18:19], v[20:21]"]))
+            == translate_int(cmp64_program(["v_cmp_lt_u64_e32 vcc_lo, v[18:19], v[20:21]"])))
+
+    def error(line, message, program=None):
+        expect_value_error(translate_int, cmp64_program([line]) if program is None else program, message)
+
+    # Raw words: each word is read with asuint (asint for a signed high word) and nothing else is applied.
+    signed_base = cmp64_group("i64", "e32", 0)
+    unsigned_base = cmp64_group("u64", "e32", 0)
+    signed_source = translate_int(signed_base)
+    unsigned_source = translate_int(unsigned_base)
+    first = signed_base.index("v_cmp_lt_i64_e32 vcc_lo, v[18:19], v[20:21]")
+    movs = [signed_base.index(f"v_mov_b32_e32 v{18 + n}, s{44 + n}") for n in range(4)]
+    for source, high in ((signed_source, "int"), (unsigned_source, "uint")):
+        convert = "asint" if high == "int" else "asuint"
+        for line in (f"uint cmp{first}_l0 = asuint(alu{movs[0]});", f"{high} cmp{first}_h0 = {convert}(alu{movs[1]});",
+                     f"uint cmp{first}_l1 = asuint(alu{movs[2]});", f"{high} cmp{first}_h1 = {convert}(alu{movs[3]});",
+                     f"bool cmp{first} = (cmp{first}_h0 < cmp{first}_h1) || "
+                     f"(cmp{first}_h0 == cmp{first}_h1 && cmp{first}_l0 < cmp{first}_l1);"):
+            assert "    " + line + "\n" in source, (high, line)
+    assert signed_source != unsigned_source
+    # The overlapping pair v[18:19] against v[19:20] reads v19 twice, as the high word of the first operand and as
+    # the low word of the second, and each read gets the register's single value.
+    overlap = signed_base.index("v_cmp_le_i64_e32 vcc_lo, v[18:19], v[19:20]")
+    for line in (f"int cmp{overlap}_h0 = asint(alu{movs[1]});", f"uint cmp{overlap}_l1 = asuint(alu{movs[1]});",
+                 f"uint cmp{overlap}_l0 = asuint(alu{movs[0]});", f"int cmp{overlap}_h1 = asint(alu{movs[2]});",
+                 f"bool cmp{overlap} = (cmp{overlap}_h0 < cmp{overlap}_h1) || "
+                 f"(cmp{overlap}_h0 == cmp{overlap}_h1 && cmp{overlap}_l0 <= cmp{overlap}_l1);"):
+        assert "    " + line + "\n" in signed_source, line
+    # The remaining predicates, from the same four words.
+    for op, expression in (("eq", "{h0} == {h1} && {l0} == {l1}"), ("ne", "!({h0} == {h1} && {l0} == {l1})"),
+                           ("gt", "({h0} > {h1}) || ({h0} == {h1} && {l0} > {l1})"),
+                           ("ge", "({h0} > {h1}) || ({h0} == {h1} && {l0} >= {l1})"), ("f", "false"), ("t", "true")):
+        line = f"v_cmp_{op}_u64_e64 s52, v[18:19], v[20:21]"
+        program = cmp64_program([line])
+        number = program.index(line)
+        names = {name: f"cmp{number}_{name}" for name in ("l0", "h0", "l1", "h1")}
+        assert f"    bool cmp{number} = {expression.format(**names)};\n" in translate_int(program), op
+
+    # Inline constants are sign-extended: -1 and -16 fill the high word, 0, 1 and 64 clear it.
+    for token, low, high in (("0", 0, 0), ("1", 1, 0), ("64", 64, 0), ("-1", 0xffffffff, 0xffffffff),
+                             ("-16", 0xfffffff0, 0xffffffff)):
+        line = f"v_cmp_lt_u64_e64 s52, {token}, v[20:21]"
+        program = cmp64_program([line])
+        number = program.index(line)
+        source = translate_int(program)
+        assert f"    uint cmp{number}_l0 = {low}u;\n" in source and f"    uint cmp{number}_h0 = {high}u;\n" in source, token
+        line = line.replace("u64", "i64")
+        program = cmp64_program([line])
+        number = program.index(line)
+        assert f"    int cmp{number}_h0 = asint({high}u);\n" in translate_int(program), token
+    # Destinations: vcc and vcc_lo on e32; vcc_lo, vcc, an SGPR or an aligned SGPR pair on e64.
+    for dst in ("vcc_lo", "vcc", "s0", "s52", "s105", "s[52:53]", "s[104:105]"):
+        translate_int(cmp64_program([f"v_cmp_ge_u64_e64 {dst}, v[18:19], v[20:21]"]))
+    for dst in ("vcc_lo", "vcc"):
+        translate_int(cmp64_program([f"v_cmp_ge_u64_e32 {dst}, v[18:19], v[20:21]"]))
+    # Sources: the top VGPR pair, two SGPR pairs on e64 (constant-bus legality is not sourced) and an inline src1.
+    translate_int(cmp64_program(["v_mov_b32_e32 v254, s44", "v_mov_b32_e32 v255, s45",
+                                 "v_cmp_lt_i64_e64 s52, v[254:255], v[19:20]"]))
+    translate_int(cmp64_program(["v_cmp_lt_i64_e64 s52, s[44:45], s[46:47]", "v_cmp_lt_i64_e64 s52, v[18:19], 64"]))
+
+    # Destination rules.
+    e32_destination = "64-bit comparison e32 destination must be vcc"
+    for dst in ("s52", "s[52:53]"):
+        error(f"v_cmp_lt_i64_e32 {dst}, v[18:19], v[20:21]", e32_destination)
+        assert (translate_int(cmp64_program([f"v_cmp_lt_u64 {dst}, v[18:19], v[20:21]"]))
+                == translate_int(cmp64_program([f"v_cmp_lt_u64_e64 {dst}, v[18:19], v[20:21]"]))), dst
+    error("v_cmp_lt_i64_e64 s[45:46], v[18:19], v[20:21]", "Invalid 64-bit scalar register pair: s[45:46]")
+    error("v_cmp_lt_i64_e64 s106, v[18:19], v[20:21]", "Scalar register out of range: s106")
+    error("v_cmp_lt_i64_e64 s[106:107], v[18:19], v[20:21]", "Invalid 64-bit scalar register pair: s[106:107]")
+    error("v_cmp_lt_i64_e64 s[52:54], v[18:19], v[20:21]", "Descriptor or vector width mismatch")
+    error("v_cmp_lt_i64_e64 exec, v[18:19], v[20:21]", "Unsupported instruction")
+    error("v_cmp_lt_i64_e64 vcc_hi, v[18:19], v[20:21]", "Unsupported instruction")
+    # Source rules.
+    invalid = "Invalid 64-bit comparison operand: "
+    for kind, encoding, dst in (("i64", "e64", "s52"), ("u64", "e32", "vcc_lo")):
+        for token in ("v[18:20]", "v[19:18]", "v[18:18]", "v[255:256]", "v[254:256]", "v[256:257]", "v[018:019]",
+                      "v18", "s44", "vcc", "exec", "1.0", "-4.0", "0x10", "0x12345678", "0x100000000", "65", "-17",
+                      "-0", "-v[18:19]", "|v[18:19]|", "abs(v[18:19])", "s44 clamp", "v[18:19] clamp"):
+            error(f"v_cmp_lt_{kind}_{encoding} {dst}, {token}, v[20:21]", invalid + token)
+    error("v_cmp_lt_i64_e64 s52, v[18:19], v[20:21] clamp", invalid + "v[20:21] clamp")
+    error("v_cmp_lt_i64_e64 s52, v[18:19], v[20:21] op_sel:[1,0,0]", "Unsupported instruction")
+    error("v_cmp_lt_i64_e64 s52, v[18:19], 1.0", invalid + "1.0")
+    error("v_cmp_lt_i64_e64 s52, v[18:19], 0x40", invalid + "0x40")
+    error("v_cmp_lt_i64_e64 s52, v[18:19], v[255:256]", invalid + "v[255:256]")
+    error("v_cmp_lt_i64_e64 s52, s[45:46], v[20:21]", "Invalid 64-bit scalar register pair: s[45:46]")
+    error("v_cmp_lt_i64_e64 s52, v[20:21], s[45:46]", "Invalid 64-bit scalar register pair: s[45:46]")
+    error("v_cmp_lt_i64_e64 s52, s[44:46], v[20:21]", "Descriptor or vector width mismatch")
+    src1 = "64-bit comparison e32 src1 must be a VGPR pair"
+    for token in ("s[44:45]", "64", "-1", "s44", "v18", "1.0", "0x10"):
+        error(f"v_cmp_lt_i64_e32 vcc_lo, v[18:19], {token}", src1)
+        if token in ("s[44:45]", "64", "-1"):  # valid e64 sources: the suffix-less spelling becomes e64
+            assert (translate_int(cmp64_program([f"v_cmp_lt_u64 vcc_lo, v[18:19], {token}"]))
+                    == translate_int(cmp64_program([f"v_cmp_lt_u64_e64 vcc_lo, v[18:19], {token}"]))), token
+        else:
+            error(f"v_cmp_lt_u64 vcc_lo, v[18:19], {token}", invalid + token)
+    # The exec-writing forms and the other compare families stay refused.
+    for line in ("v_cmpx_lt_i64_e32 v[18:19], v[20:21]", "v_cmpx_lt_u64_e64 v[18:19], v[20:21]",
+                 "v_cmpx_lt_i64_e64 s52, v[18:19], v[20:21]", "v_cmp_lt_f64_e64 s52, v[18:19], v[20:21]",
+                 "v_cmp_class_f64_e32 vcc_lo, v[18:19], v20", "v_cmp_lt_i64_sdwa vcc_lo, v[18:19], v[20:21]",
+                 "v_cmp_lt_i64_dpp vcc_lo, v[18:19], v[20:21] quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                 "v_cmp_ngt_i64_e64 s52, v[18:19], v[20:21]", "v_cmp_lg_u64_e64 s52, v[18:19], v[20:21]"):
+        error(line, "Unsupported instruction")
+    # Untracked sources, including a pair with one tracked half.
+    untracked = "Untracked 64-bit comparison source: "
+    for line, token in (("v_cmp_lt_u64_e64 s52, v[60:61], v[20:21]", "v[60:61]"),
+                        ("v_cmp_lt_u64_e64 s52, v[18:19], v[60:61]", "v[60:61]"),
+                        ("v_cmp_lt_u64_e64 s52, v[254:255], v[20:21]", "v[254:255]"),
+                        ("v_cmp_lt_u64_e32 vcc_lo, v[18:19], v[60:61]", "v[60:61]"),
+                        ("v_cmp_lt_u64_e64 s52, s[60:61], v[20:21]", "s[60:61]"),
+                        ("v_cmp_lt_u64_e64 s52, v[18:19], s[60:61]", "s[60:61]")):
+        error(line, untracked + token)
+    for tracked in ("v30", "v31"):
+        compare = "v_cmp_lt_u64_e64 s52, v[30:31], v[20:21]"
+        error("", untracked + "v[30:31]", cmp64_program([f"v_mov_b32_e32 {tracked}, s44", compare]))
+    # A scalar load still pending, a pending destination, an outstanding sample and a masked region.
+    base = cmp64_program(["v_cmp_lt_u64_e64 s52, v[18:19], v[20:21]"])
+    early = base.index("s_waitcnt lgkmcnt(0)", base.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    for line, message in (("v_cmp_lt_u64_e64 s52, s[44:45], -1", "Constant read before load completion"),
+                          ("v_cmp_lt_u64_e64 s52, -1, s[46:47]", "Constant read before load completion"),
+                          ("v_cmp_lt_u64_e64 s45, -1, 64", "Invalid comparison"),
+                          ("v_cmp_lt_u64_e64 s[44:45], -1, 64", "Invalid comparison"),
+                          ("v_cmp_lt_u64_e32 vcc_lo, -1, v[20:21]", untracked + "v[20:21]")):
+        error("", message, base[:early] + [line] + base[early:])
+    wait = base.index("s_waitcnt vmcnt(0)")
+    for line in ("v_cmp_lt_u64_e64 s52, v[12:13], v[14:15]", "v_cmp_lt_u64_e64 s52, v[14:15], 64",
+                 "v_cmp_lt_u64_e32 vcc_lo, -1, v[14:15]"):
+        error("", "Sample used before vmcnt wait", base[:wait] + [line] + base[wait:])
+    masked = base.index("s_wqm_b64 exec, exec") + 1
+    error("", "Invalid comparison", base[:masked] + ["v_cmp_lt_u64_e32 vcc_lo, -1, v[20:21]"] + base[masked:])
+
+    # Python pre-check: the word list separates each wrong implementation from the right one. That the GPU
+    # detects them is proven by the draw, which compares its output with these expected values.
+    for kind in ("i64", "u64"):
+        signed = kind == "i64"
+        rows = [(words[:2], words[2:]) for words in CMP64_WORDS]
+        for name, mutant in (("other signedness", lambda a, b: cmp64_truth("lt", not signed, a, b)),
+                             ("swapped words", lambda a, b: cmp64_truth("lt", signed, a[::-1], b[::-1])),
+                             ("low words only", lambda a, b: a[0] < b[0]),
+                             ("high words only", lambda a, b: cmp64_truth("lt", signed, (0, a[1]), (0, b[1]))),
+                             ("le", lambda a, b: cmp64_truth("le", signed, a, b))):
+            assert any(mutant(a, b) != cmp64_truth("lt", signed, a, b) for a, b in rows), (kind, name)
+    assert not cmp64_truth("lt", False, (0, 1), (0xffffffff, 0))
+    assert cmp64_truth("lt", True, (0xffffffff, 0xffffffff), (0, 0))
+    assert not cmp64_truth("lt", False, (0xffffffff, 0xffffffff), (0, 0))
+    assert cmp64_truth("lt", False, (0xffffffff, 0x7fffffff), (0, 0x80000000))
+    assert not cmp64_truth("lt", True, (0xffffffff, 0x7fffffff), (0, 0x80000000))
+    assert cmp64_truth("lt", False, (2, 1), (2, 0x80000001)) and not cmp64_truth("lt", True, (2, 1), (2, 0x80000001))
+
+
+def check_cmp64_draw(directory, compiler, renderer, backend):
+    """64-bit integer comparisons against the Python reference, then mutations that must mismatch.
+
+    The words travel through the constant buffer and v_mov_b32 copies and are compared as raw bits; they include
+    patterns that are not normal binary32 values. The draw is compiled with -denorm preserve like the other
+    bit-exact integer draws. It pins the translator's model on the desktop adapter; it is not evidence for gfx1013.
+    """
+    source = directory / "cmp64.hlsl"
+    shader = directory / "cmp64.cso"
+
+    def write_cases(kind, encoding, group, tag):
+        paths = []
+        for index, words in enumerate(CMP64_WORDS):
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *words)
+            path = directory / f"cmp64-{tag}-{index}.case"
+            write_case(path, bytes(constants), cmp64_expected(kind, encoding, group, words), integer_rt=True)
+            paths.append(path)
+        return paths
+
+    def build(text):
+        source.write_text(text, encoding="ascii")
+        compile_shader(compiler, source, shader)
+
+    for kind in ("i64", "u64"):
+        for encoding in ("e32", "e64"):
+            for group in (0, 1):
+                tag = f"{kind}-{encoding}-{group}"
+                build(translate_int(cmp64_group(kind, encoding, group)))
+                try:
+                    run_pixel_batch(renderer, backend, shader,
+                                    [(path, "pass") for path in write_cases(kind, encoding, group, tag)])
+                except AssertionError as error:
+                    error.add_note(f"64-bit comparison draw on {backend}, {kind} {encoding} group {group}")
+                    raise
+
+    # Mutations of the translated lt (channel 0 of the signed e32 group): each must fail the reference.
+    program = cmp64_group("i64", "e32", 0)
+    lowered = translate_int(program)
+    number = program.index("v_cmp_lt_i64_e32 vcc_lo, v[18:19], v[20:21]")
+    names = {name: f"cmp{number}_{name}" for name in ("l0", "h0", "l1", "h1")}
+    original = f"    bool cmp{number} = {pixel_aot.INT64_COMPARE['lt'].format(**names)};\n"
+    assert original in lowered
+    cases = write_cases("i64", "e32", 0, "mutant")
+
+    def mismatches(mutated, label):
+        assert mutated != lowered, label
+        build(mutated)
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, cases)
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+    def with_expression(expression):
+        return lowered.replace(original, f"    bool cmp{number} = {expression};\n")
+
+    swapped = dict(l0=names["h0"], h0=names["l0"], l1=names["h1"], h1=names["l1"])
+    mismatches(with_expression(pixel_aot.INT64_COMPARE["lt"].format(**swapped)), "high and low words swapped")
+    mismatches(with_expression(f"{names['l0']} < {names['l1']}"), "only the low words compared")
+    mismatches(with_expression(f"{names['h0']} < {names['h1']}"), "only the high words compared")
+    mismatches(with_expression(pixel_aot.INT64_COMPARE["le"].format(**names)), "lt replaced with le")
+    unsigned = lowered
+    for word in ("h0", "h1"):
+        unsigned = unsigned.replace(f"    int {names[word]} = ", f"    uint {names[word]} = ")
+    mismatches(unsigned, "signed compared as unsigned")
+    # An overlapping pair that reads the wrong register is detected as well.
+    overlap = program.index("v_cmp_le_i64_e32 vcc_lo, v[18:19], v[19:20]")
+    moved = [line.replace("v_cmp_le_i64_e32 vcc_lo, v[18:19], v[19:20]", "v_cmp_le_i64_e32 vcc_lo, v[18:19], v[20:21]")
+             for line in program]
+    assert moved != program and program[overlap].endswith("v[19:20]")
+    mismatches(translate_int(moved), "overlapping pair read as v[20:21]")
 
 
 # The SDWA comparisons with whole-dword selections repeat the 16-predicate draws, including NaN on either side.
@@ -7333,8 +7649,8 @@ def check_controls(directory):
         "v_cmpx_lt_i16_e64 s52, s44, v18",
         "v_cmpx_lt_i16_e32 s44, v18",
         "v_cmpx_lt_i32_e32 s44, v18",
-        "v_cmp_lt_i64_e64 s52, s[44:45], v[18:19]",
-        "v_cmp_lt_u64_e32 vcc_lo, s[44:45], v[18:19]",
+        "v_cmp_lt_i64_e64 s52, s[45:46], v[18:19]",
+        "v_cmp_lt_i64_e32 vcc_lo, v[18:19], s[44:45]",
         "v_cmp_class_f64_e32 vcc_lo, s[44:45], v18",
         "v_cmp_lt_f64_e64 s52, s[44:45], v[18:19]",
     ):
@@ -7348,6 +7664,8 @@ def check_controls(directory):
     must_reject(translate, base16[:pos] + ["v_cmp_eq_i16_e32 vcc_lo, s44, 0"] + base16[pos:])
     pos = base16.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base16[:pos] + ["v_cmp_eq_i16_e32 vcc_lo, 0, 0"] + base16[pos:])
+
+    check_cmp64_controls()
 
     f16_hlsl = translate_int(uncompressed_export(f16_compares()))
     assert "uint class16(uint bits)" in f16_hlsl and "float widen16(uint word)" in f16_hlsl
@@ -7603,6 +7921,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((unsigned_less_than(), translate))
     fixtures.extend((int16_group(kind, encoding, group), translate)
                     for kind in ("i16", "u16") for encoding in ("e32", "e64") for group in (0, 1))
+    fixtures.extend((cmp64_group(kind, encoding, group), translate_int)
+                    for kind in ("i64", "u64") for encoding in ("e32", "e64") for group in (0, 1))
 
     fixtures.extend((int_minmax_pair(encoding), translate) for encoding in ("e32", "e64"))
     fixtures.extend((int_minmax_triple(kind), translate) for kind in ("i32", "u32"))
@@ -10542,7 +10862,7 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-int16-vop3", "draw-compressed-export", "draw-title-loads"):
+                    "draw-mac-legacy", "draw-int16-vop3", "draw-compressed-export", "draw-title-loads", "draw-cmp64"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -10558,7 +10878,8 @@ def main():
                         "draw-mac-legacy": check_mac_legacy_draws,
                         "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-compressed-export": check_compressed_export_draw,
-                        "draw-title-loads": check_title_load_draws}[mode]
+                        "draw-title-loads": check_title_load_draws,
+                        "draw-cmp64": check_cmp64_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
