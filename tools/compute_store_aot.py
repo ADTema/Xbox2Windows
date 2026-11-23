@@ -103,7 +103,7 @@ def labelled(decoded):
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
-          source_stride=None):
+          source_stride=None, cpu="gfx1013"):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
@@ -111,6 +111,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     source t0; source_stride is the t0 byte stride that indexed reads use.
     """
     dims = checked_group(group)
+    if cpu not in ("gfx1013", "gfx1030"):
+        raise ValueError("Unsupported compute target")
+    ds_group = cpu == "gfx1030" and dims == (32, 1, 1)
     if not 0 <= table_reg <= 105 or not 0 <= descriptor_offset < 1 << 20 or descriptor_offset % 4:
         raise ValueError("Invalid table or thread group binding")
     descriptor_bindings = {descriptor_offset: "uav"}
@@ -142,6 +145,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
+    ds_steps = []
+    ds_wait = False
     written_spans = []
     layout = None
     # One per-lane guard: v_cmp into vcc_lo, s_and_saveexec_b32, the stores under the mask, then
@@ -153,6 +158,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         raise ValueError("Missing final program exit")
 
     for line in instructions[:-1]:
+        if ds_wait:
+            if line != "s_waitcnt lgkmcnt(0)":
+                raise ValueError("Expected immediate s_waitcnt lgkmcnt(0) after DS")
+            ds_wait = False
         if m := re.fullmatch(r"(\.L\w+):", line):
             if guard is None or guard["label"] != m[1] or guard["at_label"]:
                 raise ValueError("Unverified branch target")
@@ -331,13 +340,45 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or vector.get(local) != ("local", tag[1])):
                 raise ValueError("Unverified dispatch byte offset")
             vector[dst] = ("thread_bytes", tag[1], shift)
+        elif (ds_group and (m := re.fullmatch(r"v_add_nc_u32_e32 v(\d+), (\d+), v(\d+)", line))
+              and vector.get(int(m[3])) == ("local", 0)):
+            dst, rotation, _ = map(int, m.groups())
+            if dst > 255 or rotation > 31:
+                raise ValueError("Unverified DS lane bias")
+            vector[dst] = ("ds_biased_lane", rotation)
+        elif (ds_group and (m := re.fullmatch(r"v_and_b32_e32 v(\d+), 31, v(\d+)", line))
+              and (tag := vector.get(int(m[2]))) and isinstance(tag, tuple) and tag[0] == "ds_biased_lane"):
+            dst = int(m[1])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            vector[dst] = ("ds_lane", tag[1])
         elif m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line):
             dst, shift, src = map(int, m.groups())
             tag = vector.get(src)
+            if ds_group and dst <= 255 and shift == 2 and isinstance(tag, tuple) and tag[0] == "ds_lane":
+                vector[dst] = ("ds_address", tag[1])
+                continue
             # The element and row checks at the store bound the shift.
             if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
                 raise ValueError("Unverified dispatch byte offset")
             vector[dst] = ("thread_bytes", tag[1], shift)
+        elif m := re.fullmatch(r"ds_(b?permute)_b32 v(\d+), v(\d+), v(\d+)", line):
+            op, dst, addr, src = m[1], *map(int, m.groups()[1:])
+            address = vector.get(addr)
+            value = vector.get(src)
+            if (not ds_group or guard_span is not None or max(dst, addr, src) > 255
+                    or not isinstance(address, tuple) or address[0] != "ds_address" or not is_word(value)
+                    or len(ds_steps) >= 64):
+                raise ValueError("Unverified DS lane routing")
+            # The bijective address is (local X + bias) mod 32. Scatter reads from its inverse.
+            bias = address[1] if op == "bpermute" else (-address[1]) % 32
+            slot = f"ds_stage_{len(ds_steps)}"
+            result = f"ds_result_{len(ds_steps)}"
+            ds_steps.append((slot, f"    {slot}[local.x] = {hlsl_word(value)};\n"
+                                   f"    GroupMemoryBarrierWithGroupSync();\n"
+                                   f"    uint {result} = {slot}[(local.x + {bias}u) & 31u];"))
+            vector[dst] = ("alu", result)
+            ds_wait = True
         elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), v(\d+), (\d+), v(\d+)", line):
             dst, row, shift, column = map(int, m.groups())
             row_tag, column_tag = vector.get(row), vector.get(column)
@@ -486,6 +527,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
         else:
             raise ValueError(f"Unsupported compute instruction: {line}")
+    if ds_wait:
+        raise ValueError("Expected immediate s_waitcnt lgkmcnt(0) after DS")
     if not stores:
         raise ValueError("Expected at least one observable store")
     if guard is not None and guard["label"] is not None and not guard["at_label"]:
@@ -503,8 +546,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                if constant_descriptor is not None else "")
     if source_descriptor is not None:
         cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
+    local = ""
+    if ds_steps:
+        cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot, _ in ds_steps)
+        body = "\n".join([*(step for _, step in ds_steps), body])
+        local = ", uint3 local : SV_GroupThreadID"
     return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
-            f"void main(uint3 tid : SV_DispatchThreadID) {{\n{body}\n}}\n")
+            f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 
 
 def main():
@@ -512,6 +560,7 @@ def main():
     parser.add_argument("container", type=Path, help="Local extracted DXBC container")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--llvm", required=True)
+    parser.add_argument("--cpu", choices=("gfx1013", "gfx1030"), default="gfx1013")
     parser.add_argument("--table-reg", type=int, required=True)
     parser.add_argument("--descriptor-offset", type=lambda n: int(n, 0), required=True)
     parser.add_argument("--constant-descriptor", type=lambda n: int(n, 0), help="Table byte offset bound to b0")
@@ -529,11 +578,13 @@ def main():
     chunks = parts(blob)
     group = group_size(chunks.get(b"PSV0", b""))
     code = container_code(chunks.get(b"DXIL", b""), stage=5, llvm=args.llvm)
-    source = lower(labelled(disassemble(code, args.llvm, offsets=True)), group, table_reg=args.table_reg,
+    features = b"+wavefrontsize32,-wavefrontsize64" if args.cpu == "gfx1030" else b""
+    decoded = disassemble(code, args.llvm, offsets=True, cpu=args.cpu.encode(), features=features)
+    source = lower(labelled(decoded), group, table_reg=args.table_reg,
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
-                   source_stride=args.source_stride)
+                   source_stride=args.source_stride, cpu=args.cpu)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
