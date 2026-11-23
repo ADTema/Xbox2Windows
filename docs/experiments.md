@@ -4196,9 +4196,9 @@ renderer prints the duration of the mesh `CreatePipelineState` call as
 the process wall time and peak working set, and places a crash or timeout before or
 after pipeline creation. Two negative controls run on every blob that draws the
 reference: the seed with one bit flipped, and a reference image with the triangle
-missing. Both must report a draw mismatch. `--seed` changes every expected constant and
-therefore the DXIL, so the first draw of a run starts without a driver shader cache
-entry; later repetitions reuse it.
+missing. Both must report a draw mismatch. Use a fresh `--seed` to vary the expected
+constants and the DXIL between runs. Repeated draws use the same blob. The harness
+records first and repeated pipeline times without inspecting driver cache state.
 
 `ctest` runs the small variants (`control`, `chain_64`, `branches_64`, `loops_16`) with
 `--check` on the default hardware adapter and on WARP. It fails if a blob does not

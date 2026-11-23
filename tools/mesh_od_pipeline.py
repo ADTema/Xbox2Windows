@@ -44,6 +44,7 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import re
 import statistics
@@ -408,9 +409,8 @@ def main(argv=None):
     parser.add_argument("--pipeline-timeout", type=float, metavar="SECONDS",
                         help="wall timeout for one offscreen_check run; local policy, required")
     parser.add_argument("--seed", type=lambda text: int(text, 0), default=SEED,
-                        help="32-bit seed word; a new seed changes every expected constant and "
-                             "therefore the DXIL, so driver shader caches start cold "
-                             "(default: 0x9e3779b9)")
+                        help="32-bit seed word; a new seed varies the DXIL to limit reuse of "
+                             "identical shader blobs (default: 0x9e3779b9)")
     parser.add_argument("--check", action="store_true",
                         help="fail unless every blob compiles, draws the reference and fails "
                              "both controls; exit 77 without a mesh shader tier")
@@ -439,8 +439,8 @@ def main(argv=None):
             parser.error(f"--{option.replace('_', '-')} is required unless --list-variants is given")
     if args.repeat < 1:
         parser.error("--repeat must be at least 1")
-    if args.compile_timeout <= 0 or args.pipeline_timeout <= 0:
-        parser.error("timeouts must be positive")
+    if not all(math.isfinite(value) and value > 0 for value in (args.compile_timeout, args.pipeline_timeout)):
+        parser.error("timeouts must be finite and positive")
     for option in ("dxc", "renderer"):
         if not getattr(args, option).is_file():
             parser.error(f"--{option} not found: {getattr(args, option)}")
@@ -476,8 +476,9 @@ def main(argv=None):
         print(f"\nwrote {args.out}")
     if not args.check:
         return 0
-    draws = [draw for record in records for draw in record["draws"]]
-    if draws and all(draw["outcome"] == "unsupported" for draw in draws):
+    if records and all(record["compile_outcome"] == "dxil" and record["draws"]
+                       and all(draw["outcome"] == "unsupported" for draw in record["draws"])
+                       for record in records):
         print("mesh shaders unsupported on this adapter (capability skip)")
         return 77
     failures = check_failures(records)
