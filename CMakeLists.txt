@@ -2234,6 +2234,32 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_${part}_lifted>" ${host_cpu_extras})
         set_tests_properties(cpu_aot_${part} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
+    # INT3 and UD2: the lifted DLL, the drop, swap and nostore controls that must break a rule, an /O2 build,
+    # and the native SEH boundary that the check's child processes call through.
+    cpu_asm_fixture(cpu_trap trap)
+    add_library(cpu_trap_harness SHARED tests/cpu/trap_harness.cpp)
+    set(trap_controls)
+    foreach(variant IN ITEMS lifted drop swap nostore)
+        set(trap_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_${variant}.cpp")
+        add_custom_command(OUTPUT "${trap_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/trap.py"
+                emit "$<TARGET_FILE:cpu_trap>" "${trap_fixture}" ${variant}
+            DEPENDS cpu_trap tests/cpu/trap.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_trap_${variant} SHARED "${trap_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND trap_controls "$<TARGET_FILE:cpu_trap_${variant}>")
+        endif()
+    endforeach()
+    set(trap_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_lifted_o2.dll")
+    add_custom_command(OUTPUT "${trap_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /EHsc /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_lifted_o2.obj" "/Fe${trap_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_trap_lifted_o2 ALL DEPENDS "${trap_o2}")
+    add_test(NAME cpu_aot_trap COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/trap.py"
+        check "$<TARGET_FILE:cpu_trap_harness>" "$<TARGET_FILE:cpu_trap>" "$<TARGET_FILE:cpu_trap_lifted>"
+        ${trap_controls} "${trap_o2}")
     # The opt-in host-MXCSR profile: the lifted DLL, the noload and fixed controls that must break a rule, and
     # an /O2 build of the translation.
     cpu_asm_fixture(cpu_mxcsr_harness mxcsr_harness)

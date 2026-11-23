@@ -101,6 +101,10 @@ def check_example():
     """branch.asm -> eight x64 forms, counted only while cpu_leaf_aot_branches passes."""
     branch = fc.masm_mnemonics(BRANCH)
     assert branch == {"mov", "cmp", "jb", "jae", "add", "jmp", "sub", "ret"}, branch  # jae: INVERT_BRANCH build
+    # ML64 encodes INT 3, 3h and 03h as CC, the reference's int3; another interrupt vector stays int.
+    for spelling in ("3", "3h", "03h"):
+        assert fc.masm_mnemonics(f"    int {spelling}\n    ud2\n") == {"int3", "ud2"}, spelling
+    assert fc.masm_mnemonics("    int 29h\n") == {"int"}
     reference = fc.load_reference("x64_zen2.tsv")
     assert fc.x64_forms(branch, reference) == {("Integer", m) for m in branch}
 
