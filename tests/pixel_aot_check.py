@@ -732,6 +732,41 @@ def legacy_multiply_add():
     ])
 
 
+# v_mac_legacy_f32 is D = legacy_mul(S0, S1) + D, the destination being the accumulator (LLVM 15 VOP2Instructions.td:
+# VOP_MAC_LEGACY_F32 under Constraints = "$vdst = $src2"). A, B, C and D are the constants in s44 to s47. Each channel
+# starts as a copy of its accumulator: C, C, A and D. Channel 0 is the e32 form; channels 1 to 3 are e64 with a
+# negated source, an absolute-value source and clamp.
+MAC_LEGACY_BODY = [
+    "v_mov_b32_e32 v18, s45",
+    "v_mov_b32_e32 v19, s47",
+    "v_mov_b32_e32 v12, s46",
+    "v_mov_b32_e32 v13, s46",
+    "v_mov_b32_e32 v14, s44",
+    "v_mov_b32_e32 v15, s47",
+    "v_mac_legacy_f32_e32 v12, s44, v18",
+    "v_mac_legacy_f32_e64 v13, -v18, s44",
+    "v_mac_legacy_f32_e64 v14, |s46|, v19",
+    "v_mac_legacy_f32_e64 v15, s44, v18 clamp",
+]
+# The last set is (1 + 2^-23) * (1 - 2^-23) + -1: unfused it is 0, fused it is -2^-46.
+MAC_LEGACY_SETS = ((0.0, math.inf, 1.5, -2.0), (2.0, 3.0, 0.5, 0.25), (0.0, math.nan, -0.75, 4.0),
+                   (-1.5, 0.0, 2.0, 0.5), (3.0, -2.0, 1.0, -1.0), (1 + 2.0**-23, 1 - 2.0**-23, -1.0, 0.0))
+
+
+def mac_legacy_reference(a, b, c, d, *, fused_first_channel=False, accumulate=lambda x, y, acc: acc):
+    """The four exported values, from an independent model: a zero factor gives zero, then a rounded unfused add.
+    accumulate chooses the added operand from (x, y, acc); the default is the destination, as the instruction has."""
+    def legacy(x, y, acc):
+        product = 0.0 if x == 0 or y == 0 else x * y
+        return single(single(product) + accumulate(x, y, acc))
+
+    values = [legacy(a, b, c), legacy(-b, a, c), legacy(abs(c), d, a), min(1.0, max(0.0, legacy(a, b, d)))]
+    if fused_first_channel:
+        values[0] = single(a * b + c)
+    assert not any(math.isnan(v) for v in values), values
+    return tuple(values)
+
+
 def ceiling():
     return with_constants([
         "v_ceil_f32_e32 v12, s44",
@@ -1102,6 +1137,46 @@ def check_e64_approx_lowering():
     # v_mac_f32 reads its destination, so an unwritten one is refused, as is a third source.
     must_reject(translate, with_constants(["v_mac_f32_e64 v20, -s44, |s45|"]))
     must_reject(translate, with_constants(["v_mov_b32_e32 v14, s46", "v_mac_f32_e64 v14, -s44, |s45|, v14"]))
+
+
+def check_mac_legacy_lowering():
+    """Static checks for MAC_LEGACY_BODY and the forms LLVM 15 does not have for v_mac_legacy_f32."""
+    program = uncompressed_export(MAC_LEGACY_BODY)
+    body = translate(program).split("float4 main", 1)[1]
+    assert {"v_mac_legacy_f32_e32", "v_mac_legacy_f32_e64"} <= ACCEPTED, ACCEPTED
+    assert body.count("? 0.0f :") == 4 and body.count("saturate(") == 1 and "mad32(" not in body and " mad(" not in body, body
+    # Each product is added to the value the destination held before the instruction: the copies of C, C, A and D.
+    for line in ("alu26 = (((params[0].w == 0 || alu20 == 0) ? 0.0f : params[0].w * alu20) + alu22);",
+                 "alu27 = ((((-alu20) == 0 || params[0].w == 0) ? 0.0f : (-alu20) * params[0].w) + alu23);",
+                 "alu28 = (((abs(params[1].y) == 0 || alu21 == 0) ? 0.0f : abs(params[1].y) * alu21) + alu24);",
+                 "alu29 = saturate((((params[0].w == 0 || alu20 == 0) ? 0.0f : params[0].w * alu20) + alu25));"):
+        assert line in body, line
+    # No DPP form exists in LLVM 15 (HasExtDPP = 0), and the SDWA table is an explicit list without it.
+    assert "mac_legacy" in ALU and "mac_legacy" not in pixel_aot.DPP_ALU and "mac_legacy" not in pixel_aot.SDWA_ALU
+
+    def swap(old, new):
+        return [line.replace(old, new) for line in program]
+
+    pos = program.index("v_mac_legacy_f32_e32 v12, s44, v18")
+    for line in ("v_mac_legacy_f32_dpp v12, v18, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                 "v_mac_legacy_f32_sdwa v12, v18, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+                 "v_fmac_legacy_f32 v12, s44, v18"):
+        expect_value_error(translate, program[:pos] + [line] + program[pos + 1:], f"Unsupported instruction {pos}: {line}")
+    # Operands: the accumulator is implicit, so a third source or a missing second one is refused.
+    for old, new in (("v_mac_legacy_f32_e32 v12, s44, v18", "v_mac_legacy_f32_e32 v12, s44, v18, v12"),
+                     ("v_mac_legacy_f32_e32 v12, s44, v18", "v_mac_legacy_f32_e32 v12, s44"),
+                     ("v_mac_legacy_f32_e64 v15, s44, v18 clamp", "v_mac_legacy_f32_e64 v15, s44, v18, v15 clamp")):
+        changed = swap(old, new)
+        assert changed != program
+        expect_value_error(translate, changed, "Invalid arithmetic operation")
+    # The accumulator must hold a tracked value, as for v_mac_f32: v20 was never written.
+    changed = swap("v_mac_legacy_f32_e32 v12, s44, v18", "v_mac_legacy_f32_e32 v20, s44, v18")
+    try:
+        translate(changed)
+    except KeyError as error:
+        assert error.args == ("v20",), error
+    else:
+        raise AssertionError("An untracked accumulator was accepted")
 
 
 def check_e64_approx_draws(directory, compiler, renderer, backend):
@@ -2169,6 +2244,21 @@ def quadmask_bitreplicate_program(op):
     ])
 
 
+SCALAR_BITSET64_OPS = ("s_bitset0_b64", "s_bitset1_b64")
+
+
+def scalar_bitset64(op, index="s46"):
+    return uncompressed_export([
+        "s_cmp_lg_u32 s47, 0",
+        f"{op} s[44:45], {index}",
+        "s_cselect_b32 s48, 1, 0",
+        "v_mov_b32_e32 v12, s44",
+        "v_mov_b32_e32 v13, s45",
+        "v_mov_b32_e32 v14, s48",
+        "v_mov_b32_e32 v15, 0",
+    ])
+
+
 def quadmask32(word):
     return sum((((word >> (4 * group)) & 0xf) != 0) << group for group in range(8))
 
@@ -2274,6 +2364,98 @@ def run_quadmask_bitreplicate(directory, compiler, renderer, backend):
             print(f"quadmask-bitreplicate {op}: {path.stem} expected={status}", flush=True)
         run_pixel_batch(renderer, backend, shader, cases)
 
+def bitset64_reference(lo, hi, index, set_bit):
+    """Set or clear one bit in a 64-bit pair without changing the other word."""
+    bit = index & 63
+    mask = 1 << bit
+    value = (hi << 32) | lo
+    value = value | mask if set_bit else value & ~mask
+    return value & 0xffffffff, (value >> 32) & 0xffffffff
+
+
+def check_scalar_bitset64_draw(directory, compiler, renderer, backend):
+    source = directory / "scalar-bitset64.hlsl"
+    shader = directory / "scalar-bitset64.cso"
+    initial_lo, initial_hi = 0x81020408, 0x00010001
+
+    for op in SCALAR_BITSET64_OPS:
+        source.write_text(translate_int(scalar_bitset64(op)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for index in (0, 31, 32, 63, 64):
+            for initial_scc in (0, 1):
+                constants = bytearray(256)
+                struct.pack_into("<4I", constants, 12, initial_lo, initial_hi, index, initial_scc)
+                result_lo, result_hi = bitset64_reference(
+                    initial_lo, initial_hi, index, op == "s_bitset1_b64")
+                expected = (result_lo, result_hi, initial_scc, 0)
+                path = directory / f"{op}-{index}-scc{initial_scc}.case"
+                write_case(path, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+                cases.append((path, "pass"))
+        if op == "s_bitset1_b64":
+            # Exact all-ones NaN-shaped input from PR #680. Setting bit 31 must
+            # keep the full-width integer 0xffffffff instead of canonicalising it.
+            for initial_scc in (0, 1):
+                constants = bytearray(256)
+                struct.pack_into("<4I", constants, 12, 0xFFFFFFFF, 0xFFFFFFFF, 31, initial_scc)
+                expected = (0xFFFFFFFF, 0xFFFFFFFF, initial_scc, 0)
+                path = directory / f"{op}-nan-bit31-scc{initial_scc}.case"
+                write_case(path, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+                cases.append((path, "pass"))
+        run_pixel_batch(renderer, backend, shader, cases)
+
+        # At index 31, selecting the high destination word changes bit 63 instead of bit 31.
+        boundary = directory / f"{op}-boundary-word.case"
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, initial_lo, initial_hi, 31, 0)
+        wrong_value = (initial_hi << 32) | initial_lo
+        wrong_mask = 1 << 63
+        wrong_value = wrong_value | wrong_mask if op == "s_bitset1_b64" else wrong_value & ~wrong_mask
+        wrong_expected = (wrong_value & 0xffffffff, wrong_value >> 32, 0, 0)
+        write_case(boundary, constants, tuple(as_float(word) for word in wrong_expected),
+                   integer_rt=True)
+        run_pixel_batch(renderer, backend, shader, [(boundary, "mismatch")])
+
+        # The index may alias either destination word. The lowering must read
+        # the old pair before replacing it.
+        alias_inputs = {
+            "s_bitset1_b64": (("s44", 0x0000001F, 0xA5A5A5A5),
+                              ("s45", 0x12345678, 0x00000021)),
+            "s_bitset0_b64": (("s44", 0x8000001F, 0xA5A5A5A5),
+                              ("s45", 0x12345678, 0x0000082B)),
+        }
+        for alias_index, alias_lo, alias_hi in alias_inputs[op]:
+            alias_source = directory / f"{op}-{alias_index}.hlsl"
+            alias_shader = directory / f"{op}-{alias_index}.cso"
+            alias_source.write_text(translate_int(scalar_bitset64(op, alias_index)), encoding="ascii")
+            compile_shader(compiler, alias_source, alias_shader)
+            alias_cases = []
+            for initial_scc in (0, 1):
+                index = alias_lo if alias_index == "s44" else alias_hi
+                result_lo, result_hi = bitset64_reference(
+                    alias_lo, alias_hi, index, op == "s_bitset1_b64")
+                constants = bytearray(256)
+                struct.pack_into("<4I", constants, 12, alias_lo, alias_hi, 0, initial_scc)
+                expected = (result_lo, result_hi, initial_scc, 0)
+                path = directory / f"{op}-{alias_index}-scc{initial_scc}.case"
+                write_case(path, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+                alias_cases.append((path, "pass"))
+            run_pixel_batch(renderer, backend, alias_shader, alias_cases)
+
+        if op == "s_bitset1_b64":
+            # A read-after-write alias would take the index from 0x25 and set
+            # bit 37 instead of bit 5. The reference encodes that wrong result.
+            read_after_write = directory / "s_bitset1_b64-read-after-write.case"
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, 5, 0x11111111, 0, 0)
+            wrong_expected = (5, 0x11111131, 0, 0)
+            write_case(read_after_write, constants,
+                       tuple(as_float(word) for word in wrong_expected), integer_rt=True)
+            alias_source = directory / "s_bitset1_b64-s44.hlsl"
+            alias_shader = directory / "s_bitset1_b64-s44.cso"
+            alias_source.write_text(translate_int(scalar_bitset64(op, "s44")), encoding="ascii")
+            compile_shader(compiler, alias_source, alias_shader)
+            run_pixel_batch(renderer, backend, alias_shader, [(read_after_write, "mismatch")])
 
 S_CSELECT_B64 = "s_cselect_b64 s[44:45], s[44:45], s[46:47]"
 
@@ -3369,6 +3551,7 @@ def check_scalar_controls():
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
                 "s_bfe_u32 s62, v12, s45", "s_lshl5_add_u32 s62, s44, s45",
                 "s_bitreplicate_b64_b32 s[62:63], v12", "s_bitset0_b64 s[62:63], s44",
+                "s_quadmask_b32 s62, v12", "s_bitset0_b64 s[62:63], v12",
                 "s_brev_b32 s62, v12", "s_and_b64 s[62:63], s[44:46], s[46:47]",
                 "s_add_u32 s62, s[44:45], s45", "s_add_u32 s62, s44", "s_add_u32 s62, s44, s45, s46",
                 "s_add_u32 s62, -s44, s45", "s_add_u32 s62, s28, s45", "s_add_u32 s62, s20, s45",
@@ -6560,6 +6743,7 @@ def check_controls(directory):
     must_reject(translate, with_constants(["v_mad_f32 v12, s44, s45"]))
     must_reject(translate, with_constants(["v_mac_f32_e32 v14, s44, v15, v14"]))
     check_e64_approx_lowering()
+    check_mac_legacy_lowering()
     # v_madak_f32 and v_madmk_f32 use the same helper. The literal is the last operand of madak and the
     # second of madmk; a register there, a missing operand, and the e64, DPP and SDWA spellings are refused.
     body = translate(with_constants(MAD_LITERAL_BODY)).split("float4 main", 1)[1]
@@ -6592,6 +6776,16 @@ def check_controls(directory):
         for operands in ("s[44:45], 0, 0", "s[50:51], s[44:45], 0", "s[50:51], 0, s46"):
             must_reject(translate_int, bfe[:wait] + [f"{op} {operands}"] + bfe[wait:])
     assert set(SCALAR_BFE64_OPS) <= ACCEPTED
+    for op in SCALAR_BITSET64_OPS:
+        lowered = translate_int(scalar_bitset64(op))
+        assert "_bit = asuint(params[1].y) & 63u;" in lowered, lowered
+        for index in (0, 31, 32, 63, 64):
+            assert "salu" in translate_int(scalar_bitset64(op, str(index)))
+        for bad in ("v12", "s[46:47]"):
+            must_reject(translate_int, scalar_bitset64(op, bad))
+        untracked = [line.replace("s[44:45]", "s[60:61]")
+                     for line in scalar_bitset64(op)]
+        must_reject(translate_int, untracked)
     select64 = scalar_select64()
     translate_int(select64)
     selected = select64.index(S_CSELECT_B64)
@@ -7016,6 +7210,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((swap_ops(), translate_int))
     fixtures.extend((quadmask_bitreplicate_program(op), translate_int)
                     for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
+    fixtures.extend((scalar_bitset64(op, str(index)), translate_int)
+                    for op in SCALAR_BITSET64_OPS for index in (0, 31, 32, 63, 64))
     fixtures.append((scalar_select64(), translate_int))
     for op in SCALAR_BFE64_OPS:
         fixtures.extend((program, translate_int) for program in (
@@ -7066,6 +7262,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((reciprocal_iflag(), translate))
     fixtures.append((offset_nibbles(), translate))
     fixtures.append((legacy_multiply_add(), translate))
+    fixtures.append((uncompressed_export(MAC_LEGACY_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
@@ -8694,6 +8891,60 @@ def check_legacy_multiply_add_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing the legacy multiply-add lost the zero rule without detection")
 
 
+def check_mac_legacy_draws(directory, compiler, renderer, backend):
+    """Draw MAC_LEGACY_BODY on every constant set, then draw wrong lowerings and wrong references.
+
+    The right shader must match mac_legacy_reference on all sets. Each wrong lowering must mismatch on at
+    least one set, and a fused reference must mismatch on the last. A renderer that reports an unavailable
+    adapter (exit 77) makes this a skip. On a desktop GPU the draws establish what the translated shader
+    computes, not what the console does.
+    """
+    source = directory / "mac_legacy.hlsl"
+    shader = directory / "mac_legacy.cso"
+    program = uncompressed_export(MAC_LEGACY_BODY)
+
+    def write(path, values, expected):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, *values)
+        write_case(path, constants, expected)
+
+    cases = []
+    for idx, values in enumerate(MAC_LEGACY_SETS):
+        path = directory / f"mac_legacy-{idx}.case"
+        write(path, values, mac_legacy_reference(*values))
+        cases.append(path)
+    fused = directory / "mac_legacy-fused.case"
+    write(fused, MAC_LEGACY_SETS[-1], mac_legacy_reference(*MAC_LEGACY_SETS[-1], fused_first_channel=True))
+    assert mac_legacy_reference(*MAC_LEGACY_SETS[-1])[0] == 0.0 != mac_legacy_reference(
+        *MAC_LEGACY_SETS[-1], fused_first_channel=True)[0]
+
+    def statuses(body_template=None):
+        with patch.dict(ALU, {} if body_template is None else {"mac_legacy": (3, body_template)}):
+            source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        return run_pixel_batch_statuses(renderer, backend, shader, [*cases, fused])[0]
+
+    right = statuses()
+    if right != ["pass"] * len(cases) + ["mismatch"]:
+        raise AssertionError(f"Unexpected statuses for the legacy multiply-accumulate: {right}")
+    legacy = "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"
+    # A plain product of 0 and infinity is NaN, so the first set separates the lowering without the zero rule.
+    assert math.isnan(MAC_LEGACY_SETS[0][0] * MAC_LEGACY_SETS[0][1])
+    mutants = (
+        ("legacy zero rule removed", "(({0} * {1}) + {2})", None),
+        ("accumulator ignored", f"({legacy} + 0)", lambda x, y, acc: 0.0),
+        ("source 1 as accumulator", f"({legacy} + {{1}})", lambda x, y, acc: y),
+        ("source 0 as accumulator", f"({legacy} + {{0}})", lambda x, y, acc: x),
+    )
+    for label, template, accumulate in mutants:
+        if accumulate is not None:
+            # The Python model of the wrong lowering must differ from the right one, so the fixture can see it.
+            assert any(mac_legacy_reference(*values, accumulate=accumulate) != mac_legacy_reference(*values)
+                       for values in MAC_LEGACY_SETS if not any(map(math.isnan, values))), label
+        if "mismatch" not in statuses(template)[:len(cases)]:
+            raise AssertionError(f"The wrong lowering escaped detection: {label}")
+
+
 def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend: str) -> None:
     hlsl = directory / "rgb-sample.hlsl"
     shader = directory / "rgb-sample.cso"
@@ -9555,7 +9806,8 @@ def main():
         directory = Path(tmp)
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
-                    "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap"):
+                    "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
+                    "draw-mac-legacy"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -9567,7 +9819,8 @@ def main():
                         "draw-align": check_align_draws,
                         "draw-plain-bitscan": check_plain_bitscan_draw,
                         "draw-vop3-ternary-int": check_vop3_ternary_int_draws,
-                        "draw-swap": check_swap_draw}[mode]
+                        "draw-swap": check_swap_draw,
+                        "draw-mac-legacy": check_mac_legacy_draws}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
@@ -9583,6 +9836,13 @@ def main():
         if mode == "draw-cvt-float-int-e64":
             try:
                 return check_cvt_float_int_e64_draw(directory, *args)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
+                    return 77
+                raise
+        if mode == "draw-bitset64":
+            try:
+                return check_scalar_bitset64_draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
                     return 77

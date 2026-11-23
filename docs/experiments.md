@@ -2419,6 +2419,27 @@ ctest --preset dev --no-tests=error -R '^compute_to_pixel_(warp|hardware)$' -V
 
 ## Offline pixel shader recompilation
 
+The 64-bit scalar set and clear forms are s_bitset0_b64 and s_bitset1_b64.
+Run their standalone cases with `ctest --preset dev --no-tests=error -R '^pixel_aot_bitset64_'`.
+They read the destination SGPR pair, mask the source index to six bits and
+clear or set that bit while preserving the other 63 bits and SCC. The fixture
+exports both words and SCC at indices 0, 31, 32, 63 and 64 with both incoming
+SCC values. It also carries the exact all-ones NaN-shaped pair from #680 at
+index 31, where setting the bit must retain 0xFFFFFFFF, and reads the index
+from either destination word. A wrong reference that applies index 31 to the
+high word, and a reference that re-reads an aliased index after the destination
+write, must both report pixel_mismatch. TomBox executes both 64-bit forms over
+boundary indices, and Leonida's 64-bit value and GPU suite covers SCC and word
+selection. Run
+ctest --preset dev --no-tests=error -R '^pixel_aot_blend_scalar_(warp|hardware)$' -V.
+On Windows build 26300.10075, the 30 positive draws and three negative controls
+passed on WARP 10.0.26100.10068 and an AMD Radeon RX 9060 XT (driver
+32.0.32029.2010), with all 4,096 pixels matching on every positive case. No
+NVIDIA adapter was available locally. The D3D12 debug layer was unavailable.
+[Leonida scalar validation](https://github.com/ItsNotRexed/Leonida/blob/4eb6155d/docs/shader_validation.md#L265) ·
+[TomBox SOP1 execution](https://github.com/omonkeyz/xbox-emulator/blob/2be7211/crates/tombox-xshader/tests/exec.rs#L932-L936) ·
+[AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
 The floating-point predicate draw uses one `--check-pixel-batch` process per
 compiled shader group. All 20 reference draws still run. For the final group,
 the finite-instead-of-NaN control produces a mismatch inside the batch and the
@@ -2635,6 +2656,8 @@ The `v_rcp_iflag_f32` fixture lowers the reciprocal that compilers emit in integ
 The `v_cvt_off_f32_i4` fixture converts bits 3:0 of a source word, read as a signed nibble, to binary32 in units of 1/16, from -0.5 for 0x8 to 0.4375 for 0x7. The source is read as bits through `asuint`, so float modifiers do not apply and the translator does not accept them. Four draws present all 16 nibbles under the same upper bits, through e32 and e64 encodings, and the last lane uses clamp. Reading the nibble as unsigned must produce a pixel mismatch.
 
 The `v_mad_legacy_f32` fixture lowers the legacy multiply-add as the existing legacy multiply followed by an unfused add, so a zero factor gives zero even when the other factor is infinite or NaN. The constant sets pair a zero with +inf and with NaN, and also use finite values. A finite cancellation case uses uncompressed binary32 export and rejects a fused CPU reference. The draw tests measure the generated DXIL on desktop D3D12. The e64 negation, absolute-value and clamp modifiers are included. Replacing the instruction with `v_fma_f32` must produce a pixel mismatch, because 0 * inf is NaN there.
+
+`v_mac_legacy_f32` is the same legacy multiply-add with the destination as the accumulator: D = legacy multiply of the two sources, plus the old D, with an unfused add. LLVM 15.0.7 defines it in `VOP2Instructions.td` as `VOP_MAC_LEGACY_F32` (line 416, `HasExtDPP = 0, HasExt32BitDPP = 0`) and `defm V_MAC_LEGACY_F32` (line 630, `Constraints = "$vdst = $src2"`, `SubtargetPredicate = isGFX6GFX7GFX10`), so it has an e32 and an e64 encoding (e64 with `clamp` and source modifiers) and no DPP form. The lowerer takes two sources, reads the destination as the third operand, and refuses `v_mac_legacy_f32_dpp`, an SDWA spelling, a third source and a destination that holds no tracked value. `v_fmac_legacy_f32` is not supported on gfx1013 and stays refused. The fixture covers e32, and e64 with negation, absolute value and clamp, on constant sets that pair a zero with +inf and with NaN, use a non-zero accumulator, and cancel to a finite 0 where a fused reference gives -2^-46. A Python model computes the expected values. Removing the zero rule, dropping the accumulator, and using either source as the accumulator must each produce a pixel mismatch. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_mac_legacy_(warp|hardware)$' -V`. [LLVM 15.0.7 VOP2Instructions.td](https://github.com/llvm/llvm-project/blob/llvmorg-15.0.7/llvm/lib/Target/AMDGPU/VOP2Instructions.td)
 
 The translator accepts the gfx10 scheduling hints `s_clause`, `s_setprio` and `s_sleep`, which affect timing only, and lowers each exactly like `s_nop 0` at the same position. Each operand must fit its RDNA 2 field: 6 bits of clause length minus one, a 2-bit wave priority and a 7-bit sleep duration. A larger value is rejected. `s_code_end` stays rejected: the native program ends at `s_endpgm`, so padding after it never reaches the translator. Any instruction after `s_endpgm` and any hint between the color export and `s_endpgm` is rejected. The hinted program is part of the LLVM assemble and disassemble round trip.
 
