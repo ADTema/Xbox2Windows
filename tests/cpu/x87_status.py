@@ -518,6 +518,12 @@ def check_rejections():
         "a jump to an external edge with the status word in AX": (
             attempt(f"{fld} {fcom.replace('d1', 'd0')} {sw} dd d8 e9 00 01 00 00", exits={0x110d: "return rax;"}),
             "RAX holds unknown status-word bits 0x82ff at the external edge"),
+        "an AH store after a path skips masking AH": (status("", "e3 03 80 e4 45 88 22"),
+                                                      "reads AX bits 0x8200, " + ax),
+        "TEST EAX, EAX after writing AL": (status("", "b0 00 85 c0"), "reads AX bits 0x8200, " + ax),
+        "a direct call with the status word in AX": (
+            attempt(f"{two} {fcom} {sw} {pop2} e8 00 00 00 00 {clear}", calls={0x100c: ";"}),
+            "RAX holds unknown status-word bits 0x82ff at call"),
         # PF of the integer lowering.
         "FUCOMI and INC EAX, then JP": (attempt(f"{two} db e9 ff c0 7a 00 {pop2} {clear}"), parity),
         "CMP, then JP": (attempt(f"{two} 39 c0 7a 00 {pop2} {clear}"), parity),

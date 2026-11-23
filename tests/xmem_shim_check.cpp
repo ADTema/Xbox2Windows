@@ -35,6 +35,7 @@ extern "C" __declspec(dllimport) BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR cou
 extern "C" __declspec(dllimport) BOOL WINAPI XMemIsToolsMemAvailable();
 extern "C" __declspec(dllimport) BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer);
 extern "C" __declspec(dllimport) BOOL XMemGetWorkingSetStatistics(UINT32 selector, void* statistics);
+extern "C" __declspec(dllimport) BOOL WINAPI XMemTransferMemory(UINT32 partition, UINT64 byte_count);
 
 using namespace std::literals;
 using Byte = unsigned char;
@@ -74,14 +75,15 @@ bool export_checks()
     for (const char* name : {"XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
                              "XMemVirtualQuery", "XMemGetWorkingSetStatistics",
                              "XMemAllocatePhysicalPages", "XMemFreePhysicalPages", "XMemIsToolsMemAvailable",
-                             "XMemMapPhysicalPages", "XMemMapPhysicalPagesScatter"}) {
+                             "XMemMapPhysicalPages", "XMemMapPhysicalPagesScatter", "XMemVirtualAlloc",
+                             "XMemTransferMemory"}) {
         if (!GetProcAddress(module, name)) return false;
         ++found;
     }
     const char* existing[] = {"XMemAlloc", "XMemFree", "XMemGetWorkingSetStatistics", "XMemVirtualQuery",
                               "XMemAllocDefault", "XMemFreeDefault", "XMemAllocatePhysicalPages",
                               "XMemFreePhysicalPages", "XMemIsToolsMemAvailable", "XMemMapPhysicalPages",
-                              "XMemMapPhysicalPagesScatter"};
+                              "XMemMapPhysicalPagesScatter", "XMemVirtualAlloc", "XMemTransferMemory"};
     for (WORD ordinal = 1; ordinal <= std::size(existing); ++ordinal) {
         if (GetProcAddress(module, MAKEINTRESOURCEA(ordinal)) != GetProcAddress(module, existing[ordinal - 1]))
             return false;
@@ -580,6 +582,129 @@ int working_set_gpu_checks(bool warp)
     });
     return passed ? 0 : 1;
 }
+
+bool transfer_memory_checks()
+{
+    // Snapshot existing memory and accounting state before invoking caller sequence:
+    // 1. Existing heap allocation via XMemAlloc
+    auto* heap = static_cast<Byte*>(XMemAlloc(128, bink_word));
+    if (!heap) return false;
+    std::fill_n(heap, 128, Byte{0x42});
+
+    // 2. Existing graphics allocation registered with era_query
+    auto* gpu = static_cast<Byte*>(XMemAlloc(4096, amd_word));
+    if (!gpu) {
+        XMemFree(heap, bink_word);
+        return false;
+    }
+    std::fill_n(gpu, 4096, Byte{0x73});
+    QueryBuffer qbuf{};
+    if (!ask(gpu, qbuf) || qbuf.tail[0] != 1) {
+        XMemFree(gpu, amd_word);
+        XMemFree(heap, bink_word);
+        return false;
+    }
+
+    // 3. Existing physical page grant
+    Pages phys_pages;
+    if (!grant(2, phys_pages)) {
+        XMemFree(gpu, amd_word);
+        XMemFree(heap, bink_word);
+        return false;
+    }
+
+    // 4. Tools memory query is false
+    if (XMemIsToolsMemAvailable() != FALSE) {
+        freed(phys_pages);
+        XMemFree(gpu, amd_word);
+        XMemFree(heap, bink_word);
+        return false;
+    }
+
+    // 5. Working set statistics baseline (if query succeeds)
+    std::array<Byte, 128> stats_before{};
+    const BOOL stats_ok = XMemGetWorkingSetStatistics(amd_selector, stats_before.data());
+
+    // Execute caller sequence under narrow desktop refusal:
+    // #935 and #955 exercise partition 1, 2 MiB and 16 MiB counts.
+    // Without independent evidence of runtime parameter validation returning 87,
+    // all transfer calls on a no-tools desktop runtime return FALSE with ERROR_NOT_SUPPORTED.
+    const struct {
+        UINT32 partition;
+        UINT64 bytes;
+    } caller_cases[] = {
+        {1, 2 * 1024 * 1024},          // #935 2 MiB transfer
+        {1, 16 * 1024 * 1024},         // #935 / #955 16 MiB transfer
+        {1, 4 * 1024 * 1024},          // intermediate count
+        {0, 2 * 1024 * 1024},          // non-tools partition
+        {2, 2 * 1024 * 1024},          // non-tools partition
+        {1, 0},                        // zero count
+        {1, (2 * 1024 * 1024) + 4096}, // unaligned count
+        {1, 32 * 1024 * 1024},         // oversized count
+    };
+
+    for (const auto& c : caller_cases) {
+        SetLastError(ERROR_SUCCESS);
+        if (XMemTransferMemory(c.partition, c.bytes) != FALSE || GetLastError() != ERROR_NOT_SUPPORTED) {
+            freed(phys_pages);
+            XMemFree(gpu, amd_word);
+            XMemFree(heap, bink_word);
+            return false;
+        }
+    }
+
+    // Verify memory and accounting state remain completely unchanged:
+    // 1. Tools memory availability remains FALSE
+    if (XMemIsToolsMemAvailable() != FALSE) {
+        freed(phys_pages);
+        XMemFree(gpu, amd_word);
+        XMemFree(heap, bink_word);
+        return false;
+    }
+
+    // 2. Working set statistics unchanged
+    if (stats_ok) {
+        std::array<Byte, 128> stats_after{};
+        if (!XMemGetWorkingSetStatistics(amd_selector, stats_after.data()) ||
+            stats_before != stats_after) {
+            freed(phys_pages);
+            XMemFree(gpu, amd_word);
+            XMemFree(heap, bink_word);
+            return false;
+        }
+    }
+
+    // 3. Heap bytes unmodified and freeable
+    if (!std::all_of(heap, heap + 128, [](Byte b) { return b == 0x42; })) {
+        freed(phys_pages);
+        XMemFree(gpu, amd_word);
+        XMemFree(heap, bink_word);
+        return false;
+    }
+    XMemFree(heap, bink_word);
+
+    // 4. GPU bytes unmodified, query registration intact, and freeable
+    if (!std::all_of(gpu, gpu + 4096, [](Byte b) { return b == 0x73; })) {
+        freed(phys_pages);
+        XMemFree(gpu, amd_word);
+        return false;
+    }
+    QueryBuffer qbuf_after{};
+    if (!ask(gpu, qbuf_after) || qbuf_after.tail[0] != 1) {
+        freed(phys_pages);
+        XMemFree(gpu, amd_word);
+        return false;
+    }
+    XMemFree(gpu, amd_word);
+
+    // 5. Physical page grants remain allocated and release cleanly
+    if (!freed(phys_pages)) {
+        return false;
+    }
+
+    std::printf("transfer_memory: cases=%zu memory_accounting_intact=1\n", std::size(caller_cases));
+    return true;
+}
 }
 
 int main(int argc, char** argv)
@@ -599,6 +724,8 @@ int main(int argc, char** argv)
         passed = physical_page_checks();
     } else if (scenario == "tools_memory"sv) {
         passed = XMemIsToolsMemAvailable() == FALSE && XMemIsToolsMemAvailable() == FALSE;
+    } else if (scenario == "transfer_memory"sv) {
+        passed = transfer_memory_checks();
     } else if (scenario == "query"sv) {
         passed = query_checks();
     } else if (scenario == "working_set"sv) {
