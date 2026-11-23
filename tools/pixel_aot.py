@@ -2145,9 +2145,13 @@ class VectorRegisters(dict):
 
 MISSING = object()
 
-# Only operations with per-lane, safe speculative evaluation enter the region.
+# Only operations with per-lane, safe speculative evaluation enter the region. Stage 2 of issue #932 adds the
+# per-lane binary32 forms the translator already lowers outside regions, in the encodings measured in real
+# regions; each still passes the per-instruction check in lower() (only VGPRs may change).
 REGION_ALU = re.compile(
-    r"v_(?:mov_b32|(?:add|sub|subrev|mul|min|max)_f32)(?:_e32|_e64)? ")
+    r"v_(?:mov_b32|(?:add|sub|subrev|mul|min|max)_f32)(?:_e32|_e64)? "
+    r"|v_(?:fmac|mac|rcp|rsq|sqrt)_f32_e32 |v_cvt_f32_ubyte[0-3]_e32 |v_mul_legacy_f32_e(?:32|64) "
+    r"|v_(?:fma|mad|med3)_f32 ")
 
 
 class TrackedVector(VectorRegisters):
