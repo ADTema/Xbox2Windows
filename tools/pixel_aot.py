@@ -532,6 +532,14 @@ MUL24_HELPERS = {
     "mul_hi_i32_i24": ("mul24_hi_u32", "mul24_hi_i32"),
 }
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
+
+
+def check_vopc_e32_dst(enc, dst):
+    # VOPC e32 writes VCC only; LLVM rejects an SGPR destination on the explicit spelling.
+    if enc == "_e32" and dst not in ("vcc", "vcc_lo"):
+        raise ValueError("VOPC e32 destination must be vcc")
+
+
 SALU_BIT64 = {
     "and": "uint2({0} & {2}, {1} & {3})",
     "or": "uint2({0} | {2}, {1} | {3})",
@@ -2399,8 +2407,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             helpers.update(INTEGER_HELPERS.get(op, ()))
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
-        elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
-            dst, value, classes = m.groups()
+        elif m := match(rf"v_cmp_class_f32(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            enc, dst, value, classes = m.groups()
+            check_vopc_e32_dst(enc, dst)
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
@@ -2416,6 +2425,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
         elif m := match(rf"v_cmp_class_f16(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             enc, dst, value, classes = m.groups()
+            check_vopc_e32_dst(enc, dst)
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
@@ -2496,8 +2506,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
-            op, dst, *tokens = m.groups()
+        elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            op, enc, dst, *tokens = m.groups()
+            check_vopc_e32_dst(enc, dst)
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
@@ -2507,6 +2518,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f16(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, enc, dst, *tokens = m.groups()
+            check_vopc_e32_dst(enc, dst)
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
@@ -2534,8 +2546,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {expr};")
-        elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32)(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
-            op, kind, dst, *tokens = m.groups()
+        elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32)(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            op, kind, enc, dst, *tokens = m.groups()
+            check_vopc_e32_dst(enc, dst)
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
@@ -2544,9 +2557,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {INT_COMPARE[op].format(*values)};")
-        elif m := match(rf"v_cmp_(eq|ne|lt|le|gt|ge)_(i16|u16)(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+        elif m := match(rf"v_cmp_(eq|ne|lt|le|gt|ge)_(i16|u16)(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             # Only the low 16 bits of each source take part; gfx10 has no f/t forms at this width.
-            op, kind, dst, *tokens = m.groups()
+            op, kind, enc, dst, *tokens = m.groups()
+            check_vopc_e32_dst(enc, dst)
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")

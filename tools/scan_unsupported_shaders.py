@@ -53,7 +53,11 @@ PIXEL_COMPARE = tuple(pixel_aot.COMPARE) if pixel_aot is not None else ()
 PIXEL_INT_COMPARE = tuple(pixel_aot.INT_COMPARE) if pixel_aot is not None else ()
 PIXEL_VOP3P_F16 = pixel_aot.VOP3P_F16 if pixel_aot is not None else {}
 PIXEL_VOP3P_INT16 = pixel_aot.VOP3P_INT16 if pixel_aot is not None else {}
+PIXEL_VCC = r"(?:vcc(?:_lo)?)"
 PIXEL_LANE_MASK = pixel_aot.LANE_MASK if pixel_aot is not None else r"(?:vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
+# Explicit _e32 VOPC writes VCC only; suffix-less and _e64 may name an SGPR destination.
+PIXEL_VOPC_DST = rf"(?:_e32\s+{PIXEL_VCC}|(?:_e64)?\s+{PIXEL_LANE_MASK})"
+PIXEL_VOPC_E32_DST = rf"(?:_e32\s+{PIXEL_VCC}|\s+{PIXEL_LANE_MASK})"
 INTEGER_SOURCE = r"(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
 SCALAR32_SOURCE = r"(?:s\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
 SCALAR64_SOURCE = r"(?:s\[\d+:\d+\]|0x[0-9a-f]{1,8}|-?\d+)"
@@ -124,8 +128,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     rf"v_(?:(?:add|sub|subrev)_nc_u32(?:_e32|_e64)?|(?:add|sub)_nc_i32)\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:min|max)_(?:i32|u32)(?:_e32|_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:min3|max3|med3)_(?:i32|u32)(?:_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
-    rf"v_cmp_class_f32(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+[^,]+,\s+[^,]+",
-    rf"v_cmp_class_f16(?:_e32)?\s+{PIXEL_LANE_MASK},\s+{F16_PLAIN},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
+    rf"v_cmp_class_f32{PIXEL_VOPC_DST},\s+[^,]+,\s+[^,]+",
+    rf"v_cmp_class_f16{PIXEL_VOPC_E32_DST},\s+{F16_PLAIN},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
     rf"v_cmp_class_f16_e64\s+{PIXEL_LANE_MASK},\s+{F16_MOD},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
     rf"v_cndmask_b32(?:_e32|_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+,\s+{PIXEL_LANE_MASK}",
     r"v_fma_mix(?:_f32|lo_f16|hi_f16)\s+v\d+,\s+.+",
@@ -154,13 +158,13 @@ if PIXEL_SALU_BIT64:
 if PIXEL_COMPARE:
     cmp_ops = "|".join(map(re.escape, PIXEL_COMPARE))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_cmp_(?:{cmp_ops})_f32(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+[^,]+,\s+[^,]+"
+        rf"v_cmp_(?:{cmp_ops})_f32{PIXEL_VOPC_DST},\s+[^,]+,\s+[^,]+"
     )
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{cmp_ops})_f32_sdwa\s+{PIXEL_LANE_MASK},\s+[^,]+,\s+[^,]+\s+src0_sel:DWORD\s+src1_sel:DWORD"
     )
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_cmp_(?:{cmp_ops})_f16(?:_e32)?\s+{PIXEL_LANE_MASK},\s+{F16_PLAIN},\s+{F16_PLAIN}"
+        rf"v_cmp_(?:{cmp_ops})_f16{PIXEL_VOPC_E32_DST},\s+{F16_PLAIN},\s+{F16_PLAIN}"
     )
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{cmp_ops})_f16_e64\s+{PIXEL_LANE_MASK},\s+{F16_MOD},\s+{F16_MOD}"
@@ -168,7 +172,7 @@ if PIXEL_COMPARE:
 if PIXEL_INT_COMPARE:
     icmp_ops = "|".join(map(re.escape, PIXEL_INT_COMPARE))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_cmp_(?:{icmp_ops})_(?:i32|u32|i16|u16)(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
+        rf"v_cmp_(?:{icmp_ops})_(?:i32|u32|i16|u16){PIXEL_VOPC_DST},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
     )
 if PIXEL_VOP3P_F16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
