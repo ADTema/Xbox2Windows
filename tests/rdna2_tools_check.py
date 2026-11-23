@@ -130,6 +130,25 @@ class TestRdna2Disasm(unittest.TestCase):
             ("7e04b2be", "s_mov_b64", "s_mov_b64 s[50:51], exec"),
             ("7e0afebe", "s_wqm_b64", "s_wqm_b64 exec, exec"),
             ("7e32fe87", "s_and_b64", "s_and_b64 exec, exec, s[50:51]"),
+            ("000b82be", "s_brev_b32", "s_brev_b32 s2, s0"),
+            ("000c82be", "s_brev_b64", "s_brev_b64 s[2:3], s[0:1]"),
+            ("000d82be", "s_bcnt0_i32_b32", "s_bcnt0_i32_b32 s2, s0"),
+            ("000e82be", "s_bcnt0_i32_b64", "s_bcnt0_i32_b64 s2, s[0:1]"),
+            ("000f82be", "s_bcnt1_i32_b32", "s_bcnt1_i32_b32 s2, s0"),
+            ("001082be", "s_bcnt1_i32_b64", "s_bcnt1_i32_b64 s2, s[0:1]"),
+            ("001182be", "s_ff0_i32_b32", "s_ff0_i32_b32 s2, s0"),
+            ("001282be", "s_ff0_i32_b64", "s_ff0_i32_b64 s2, s[0:1]"),
+            ("001382be", "s_ff1_i32_b32", "s_ff1_i32_b32 s2, s0"),
+            ("001482be", "s_ff1_i32_b64", "s_ff1_i32_b64 s2, s[0:1]"),
+            ("001582be", "s_flbit_i32_b32", "s_flbit_i32_b32 s2, s0"),
+            ("001682be", "s_flbit_i32_b64", "s_flbit_i32_b64 s2, s[0:1]"),
+            ("001f80be", "s_getpc_b64", "s_getpc_b64 s[0:1]"),
+            ("002080be", "s_setpc_b64", "s_setpc_b64 s[0:1]"),
+            ("002280be", "s_rfe_b64", "s_rfe_b64 s[0:1]"),
+            ("0224febe", "s_and_saveexec_b64", "s_and_saveexec_b64 exec, s[2:3]"),
+            ("023afebe", "s_andn2_wrexec_b64", "s_andn2_wrexec_b64 exec, s[2:3]"),
+            ("013dfebe", "s_or_saveexec_b32", "s_or_saveexec_b32 exec_lo, s1"),
+            ("0147febe", "s_andn2_wrexec_b32", "s_andn2_wrexec_b32 exec_lo, s1"),
             ("00008080", "s_sub_u32", "s_sub_u32 s0, s0, s0"),
             # GFX10 scalar operand codes: 108-123 are ttmp0-15, 125 is null (SOP2 ssrc1)
             ("007d8080", "s_sub_u32", "s_sub_u32 s0, s0, null"),
@@ -152,6 +171,12 @@ class TestRdna2Disasm(unittest.TestCase):
             ("01020090", "s_lshr_b32", "s_lshr_b32 s0, s1, s2"),
             ("01020091", "s_ashr_i32", "s_ashr_i32 s0, s1, s2"),
             ("01020093", "s_mul_i32", "s_mul_i32 s0, s1, s2"),
+            ("01028093", "s_bfe_u32", "s_bfe_u32 s0, s1, s2"),
+            ("01020094", "s_bfe_i32", "s_bfe_i32 s0, s1, s2"),
+            ("02048094", "s_bfe_u64", "s_bfe_u64 s[0:1], s[2:3], s4"),
+            ("02040095", "s_bfe_i64", "s_bfe_i64 s[0:1], s[2:3], s4"),
+            ("0102809a", "s_mul_hi_u32", "s_mul_hi_u32 s0, s1, s2"),
+            ("0102009b", "s_mul_hi_i32", "s_mul_hi_i32 s0, s1, s2"),
             ("341281b1", "s_cmpk_eq_i32", "s_cmpk_eq_i32 s1, 0x1234"),
             # SOPC: [31:23] == 0b101111110. These encodings were previously
             # consumed by the SOPK prefix check (e.g. 000100bf as s_sopk_1e).
@@ -209,6 +234,11 @@ class TestRdna2Disasm(unittest.TestCase):
             ("0105064a", "v_add_nc_u32_e32", "v_add_nc_u32_e32 v3, v1, v2"),
             ("0105063e", "v_mac_f32_e32", "v_mac_f32_e32 v3, v1, v2"),
             ("01050656", "v_fmac_f32_e32", "v_fmac_f32_e32 v3, v1, v2"),
+            ("01050a12", "v_mul_i32_i24_e32", "v_mul_i32_i24_e32 v5, v1, v2"),
+            ("01050a14", "v_mul_hi_i32_i24_e32", "v_mul_hi_i32_i24_e32 v5, v1, v2"),
+            ("01050a16", "v_mul_u32_u24_e32", "v_mul_u32_u24_e32 v5, v1, v2"),
+            ("01050a18", "v_mul_hi_u32_u24_e32", "v_mul_hi_u32_u24_e32 v5, v1, v2"),
+            ("01050a3c", "v_xnor_b32_e32", "v_xnor_b32_e32 v5, v1, v2"),
             # VOP1 rounding and byte conversion ops (GFX10 / RDNA 2)
             ("01230a7e", "v_cvt_f32_ubyte0_e32", "v_cvt_f32_ubyte0_e32 v5, v1"),
             ("01250a7e", "v_cvt_f32_ubyte1_e32", "v_cvt_f32_ubyte1_e32 v5, v1"),
@@ -368,6 +398,8 @@ class TestRdna2Disasm(unittest.TestCase):
             ("1000c4da00000018", "ds_read_addtid_b32", "ds_read_addtid_b32 v24 offset:16"),
             ("200054da02000000", "ds_add_src2_f32", "ds_add_src2_f32 v2 offset:32"),
             ("0000f8d902080018", "ds_condxchg32_rtn_b64", "ds_condxchg32_rtn_b64 v[24:25], v2, v[8:9]"),
+            ("050060d701050002", "v_readlane_b32", "v_readlane_b32 s5, v1, s2"),
+            ("050061d780040002", "v_writelane_b32", "v_writelane_b32 v5, 0, s2"),
         ]
         for hex_str, expected_op, expected_asm in vectors:
             raw = bytes.fromhex(hex_str)
@@ -704,7 +736,10 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(len(insns), 1, f"Failed decoding VOP3 op 0x{op:03x}")
             self.assertEqual(insns[0]["opcode"], expected_name)
             self.assertEqual(insns[0]["length"], 8)
-            expected_dst = "v[1:2]" if dst_width == 2 else "v1"
+            if expected_name == "v_readlane_b32":
+                expected_dst = "s1"
+            else:
+                expected_dst = "v[1:2]" if dst_width == 2 else "v1"
             expected_srcs = []
             raw_regs = [2, 3, 4]
             for i in range(arity):
@@ -1492,6 +1527,38 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_interp_p2_f32_e32 v2, v1, attr1.y",
             "s_mov_b32 s2, 0x12345678",
             "s_and_saveexec_b32 s2, s0",
+            "s_or_saveexec_b32 exec_lo, s1",
+            "s_andn2_wrexec_b32 exec_lo, s1",
+            "s_and_saveexec_b64 exec, s[2:3]",
+            "s_andn2_wrexec_b64 exec, s[2:3]",
+            "s_brev_b32 s2, s0",
+            "s_brev_b64 s[2:3], s[0:1]",
+            "s_bcnt0_i32_b32 s2, s0",
+            "s_bcnt0_i32_b64 s2, s[0:1]",
+            "s_bcnt1_i32_b32 s2, s0",
+            "s_bcnt1_i32_b64 s2, s[0:1]",
+            "s_ff0_i32_b32 s2, s0",
+            "s_ff0_i32_b64 s2, s[0:1]",
+            "s_ff1_i32_b32 s2, s0",
+            "s_ff1_i32_b64 s2, s[0:1]",
+            "s_flbit_i32_b32 s2, s0",
+            "s_flbit_i32_b64 s2, s[0:1]",
+            "s_getpc_b64 s[0:1]",
+            "s_setpc_b64 s[0:1]",
+            "s_rfe_b64 s[0:1]",
+            "s_bfe_u32 s0, s1, s2",
+            "s_bfe_i32 s0, s1, s2",
+            "s_bfe_u64 s[0:1], s[2:3], s4",
+            "s_bfe_i64 s[0:1], s[2:3], s4",
+            "s_mul_hi_u32 s0, s1, s2",
+            "s_mul_hi_i32 s0, s1, s2",
+            "v_mul_i32_i24_e32 v5, v1, v2",
+            "v_mul_hi_i32_i24_e32 v5, v1, v2",
+            "v_mul_u32_u24_e32 v5, v1, v2",
+            "v_mul_hi_u32_u24_e32 v5, v1, v2",
+            "v_xnor_b32_e32 v5, v1, v2",
+            "v_readlane_b32 s5, v1, s2",
+            "v_writelane_b32 v5, 0, s2",
             "s_add_u32 s3, s2, 0x100",
             "s_load_dwordx8 s[20:27], s[2:3], 0x0",
             "s_buffer_load_dword s5, s[4:7], s0",
