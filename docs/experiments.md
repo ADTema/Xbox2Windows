@@ -1586,7 +1586,7 @@ Code compiled with `/GA` assumes that its EXE owns TLS index 0. It reads a threa
 
 A participant keeps its previous slot 0 in a pe_map TLS slot reserved at the start. The slot index is below `TLS_MINIMUM_AVAILABLE`, so setting it never allocates. Its thread handle goes into a fixed table of 64 entries.
 
-**Release is a retryable refusal.** `pe_map_release` returns 2 and changes nothing while any participant other than the calling thread may still run the image's code. That covers a participant whose handle is not signaled or cannot be waited on, a participant without a handle (the table was full or the handle could not be duplicated), and an attaching thread whose start address could not be read. While refused, the image stays registered and mapped, its unwind data stays registered, its carrier stays loaded, and every participant keeps its slot. The caller retries once those participants have left or exited.
+**Release is a retryable refusal.** `pe_map_release` keeps its 0/1 convention. It returns 0 and changes nothing while any participant other than the calling thread may still run the image's code. That covers a participant whose handle is not signaled or cannot be waited on, and a participant without a handle (the table was full or the handle could not be duplicated). `pe_map_main_tls_stats` then reports the last release as refused (2). While refused, the image stays registered and mapped, its unwind data stays registered, its carrier stays loaded, and every participant keeps its slot. The caller retries once those participants have left or exited.
 
 An accepted release, checked and committed under one lock so that no participant can join in between, does four things in order:
 
@@ -1595,7 +1595,11 @@ An accepted release, checked and committed under one lock so that no participant
 3. ends the mode;
 4. unregisters and frees the image exactly once, as for any image.
 
-Threads that do not participate are never touched. On a participating thread, the host's own index-0 code reads the image's block, so a host that owns slot 0 must not touch its thread-locals there. This rules out a Python host: in Python 3.13, `python313.dll` carries static TLS.
+**Notifications.** Threads that do not participate are never touched, and that includes their notifications. The main image's TLS callbacks receive `DLL_THREAD_ATTACH` and `DLL_THREAD_DETACH` only on participating threads, because a `/GA` callback on another thread would read the host's block. Other images, and EXEs started with `pe_map_run`, are notified as before.
+
+**Classification failure.** A new thread whose start address cannot be read, or an image thread whose block cannot be installed, cannot be run safely either way. As a guest thread it would reach guest code with the host's block. Treated as a guest thread, host code would read the image's block. `pe_map` then ends the process with `__fastfail` before the thread runs, rather than let it proceed with the wrong block.
+
+On a participating thread, the host's own index-0 code reads the image's block, so a host that owns slot 0 must not touch its thread-locals there. This rules out a Python host: in Python 3.13, `python313.dll` carries static TLS.
 
 `cpu_exe_tls_slot0` is a CRT-free `/GA` EXE. Its template holds an int (7) and a `0x1400`-byte array of `0xFF`. Its TLS callback and each of its threads (the initial thread and two workers) check whether slot 0 equals the entry at `_tls_index`. Only when it does, a thread checks its template copy, writes the whole array, reads it back and calls `HeapValidate`. `cpu_exe_tls_slot0_pause` adds worker c, which runs the same check and then pauses inside the image's code on an event before checking its block again. Two tests keep the evidence separate.
 
@@ -1605,22 +1609,34 @@ Threads that do not participate are never touched. On a participating thread, th
 LOG:m1=yy m:yyyy a2=yy a:yyyy a3=y- b2=yy b:yyyy b3=y- X=0
 ```
 
-`cpu_native_exe_tls_slot0` runs `cpu_exe_tls_slot0_host`, a CRT-free host whose own TLS block owns slot 0. It binds only `kernel32.dll` and runs one scenario per process. In every scenario, a reader thread that never participates samples its own slot 0 and its sentinel from before the map until after release, and must never see either change. Every accepted release must leave the image no longer committed, `RtlLookupFunctionEntry` finding nothing for its entry point, and the carrier unloaded. A further release must then return 0. Counters are installed, restored, exited, refused releases, pending, active, last release and untracked:
+`cpu_native_exe_tls_slot0` runs `cpu_exe_tls_slot0_host`, a CRT-free host whose own TLS block owns slot 0. It binds only `kernel32.dll` and runs one scenario per process. Each scenario has two non-participating threads:
 
-| Scenario | First release | Then | Counters |
-|---|---|---|---|
-| `main`: a host thread enters and leaves | accepted | one cleanup | `4,4,0,0,0,0,1,0` |
-| `alive`: a host participant is still entered | 2, image, unwind data and carrier intact | it leaves; accepted, one cleanup | `4,4,0,1,0,0,1,0` |
-| `exited`: a host participant is ended with `TerminateThread` | accepted, exit confirmed | one cleanup | `4,3,1,0,0,0,1,0` |
-| `untracked`: 64 host participants, the last finds the table full | 2 (cannot inspect), intact | it leaves; accepted, one cleanup | `67,67,0,1,0,0,1,0` |
-| `paused`: worker c paused inside the image's code | 2, intact | c resumes, finds its block, returns; accepted, one cleanup | `5,5,0,1,0,0,1,0` |
-| `plain`: `pe_map_run` (negative control), every slot-0 check `n`, `X=8` | accepted | one cleanup | `0,0,0,0,0,0,-1,0` |
+- a reader that samples its own slot 0 and sentinel from before the map until after release;
+- a late thread created after the start, which checks its own slot 0 and sentinel.
+
+Neither may ever see a change. The guest exports its TLS callback counts by reason (`exe_slot0_callback_counts`):
+
+- Under `pe_map_run_main`, the callback must not run during the late thread's life, and its thread-attach and thread-detach totals must count only the guest's own workers.
+- Under `pe_map_run`, the late thread's attach and detach still reach the guest.
+
+A refused release returns 0 with the refusal reported. The accepted release is the only one that returns 1. Every accepted release must leave the image no longer committed, `RtlLookupFunctionEntry` finding nothing for its entry point, and the carrier unloaded. A further release must then return 0. Counters are installed, restored, exited, refused releases, pending, active, last release and untracked:
+
+| Scenario | First release | Then | Guest thread callbacks (attach, detach); for the late thread | Counters |
+|---|---|---|---|---|
+| `main`: a host thread enters and leaves | 1 | one cleanup | `2,2`; 0 | `4,4,0,0,0,0,1,0` |
+| `alive`: a host participant is still entered | 0, refused, image, unwind data and carrier intact | it leaves; 1, one cleanup | `2,2`; 0 | `4,4,0,1,0,0,1,0` |
+| `exited`: a host participant is ended with `TerminateThread` | 1, exit confirmed | one cleanup | `2,2`; 0 | `4,3,1,0,0,0,1,0` |
+| `untracked`: 64 host participants, the last finds the table full | 0, refused (cannot inspect), intact | it leaves; 1, one cleanup | `2,2`; 0 | `67,67,0,1,0,0,1,0` |
+| `paused`: worker c paused inside the image's code | 0, refused, intact | c resumes, finds its block, returns; 1, one cleanup | `3,3`; 0 | `5,5,0,1,0,0,1,0` |
+| `plain`: `pe_map_run` (negative control), every slot-0 check `n`, `X=8` | 1 | one cleanup | `3,3`; 2 | `0,0,0,0,0,0,-1,0` |
 
 Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release`:
 
 - **Guest log.** It equals the Windows launch in every `pe_map_run_main` scenario. In `paused` it adds `c2=yy c:yyyy`.
-- **Reader and host thread.** The reader's slot 0 and sentinel never changed. The starting thread had the host's block and sentinel back after the accepted release, and the heap validated.
-- **Mutation (not committed).** With a `pe_map_release` that never refuses, `alive` fails because the release cleans up while a participant is live. `paused` then crashes with `0xC0000005`, because worker c resumes in the freed image.
+- **Reader, late thread and host thread.** The reader's and the late thread's slot 0 and sentinel never changed. The starting thread had the host's block and sentinel back after the accepted release, and the heap validated.
+- **Mutations (not committed).** Each of these fails the test:
+  - With a `pe_map_release` that never refuses, `alive` fails because the release cleans up while a participant is live, and `paused` crashes with `0xC0000005`, because worker c resumes in the freed image.
+  - Without the notification gate, `main` fails because the guest receives the late thread's attach and detach, and its totals become `4,4`.
 
 Not covered:
 

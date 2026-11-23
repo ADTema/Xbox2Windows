@@ -7,8 +7,8 @@
 //
 // Usage: cpu_exe_tls_slot0_host <pe_map.dll> <image> <scenario>
 //   main       start the image, let a host thread enter and leave, release on the starting thread
-//   alive      a host participant is still entered at the first release, which must be refused; it
-//              then leaves and the second release is accepted
+//   alive      a host participant is still entered at the first release, which must be refused (0, and
+//              the status API reports the refusal); it then leaves and the second release returns 1
 //   exited     a host participant is ended with TerminateThread; release confirms the exit
 //   untracked  after the start MAIN_TRACKED host threads enter; the last finds the participant table
 //              full and has no handle, so the first release must be refused until it leaves
@@ -17,23 +17,32 @@
 //              resumes, checks its block, returns, and the second release is accepted
 //   plain      start the image with pe_map_run (control): slot 0 keeps the host's block
 // In every scenario a reader thread that never participates samples its own slot 0 and sentinel from
-// before the map until after release.
+// before the map until after release, and a late thread created after the start checks its own slot 0
+// and sentinel while the guest's TLS callback counts (exe_slot0_callback_counts) are read before and
+// after its life.
 //
 // After the guest's own LOG line, the host prints one line:
 //   HOST: scenario=<s> started=<0|1> exit=<hex> installed_main=<y/n> reader_untouched=<y/n>
 //         reader_samples=<n> participant=<y/n|-> refused=<y/n|-> intact_on_refusal=<y/n|->
-//         resumed=<y/n|-> host_tls=<y/n> cleaned=<y/n> second_release=<y/n> heap_valid=<y/n>
+//         resumed=<y/n|-> late_untouched=<y/n> late_callbacks=<n> callbacks=<ta>,<td> host_tls=<y/n>
+//         cleaned=<y/n> second_release=<y/n> heap_valid=<y/n>
 //         stats=<installed>,<restored>,<exited>,<refusals>,<pending>,<active>,<last release>,<untracked>
 // installed_main: after the start, the starting thread's slot 0 holds the image's block.
 // participant: the host participant(s) saw the image's block after entering and their own block and
 // sentinel after leaving ('-' when the scenario has none).
-// refused / intact_on_refusal: the first pe_map_release returned 2, and right after it the image was
+// late_untouched: the late thread's slot 0 and sentinel never changed. late_callbacks: how many
+// thread-attach and thread-detach callbacks the guest received during the late thread's life (0 when the
+// image is the main image, since the late thread does not participate; 2 under pe_map_run). callbacks:
+// the guest's thread-attach and thread-detach callback totals just before the accepted release.
+// refused / intact_on_refusal: the first pe_map_release returned 0 with the status API reporting a
+// refusal (last release 2), and right after it the image was
 // still committed, RtlLookupFunctionEntry still found its entry point, the carrier was loaded and the
 // starting thread's slot 0 still held the image's block ('-' where no refusal is expected).
 // resumed: the paused worker found its own block and values after the refusal.
 // host_tls: after the accepted release the starting thread's slot 0 and sentinel are the host's again.
 // cleaned: after the accepted release the image is no longer committed, its unwind data is gone and
-// the carrier is unloaded. second_release: a further pe_map_release returns 0 (one cleanup only).
+// the carrier is unloaded; it is the only pe_map_release that returned 1. second_release: a further
+// pe_map_release returns 0 (one cleanup only).
 // Exit code 0 when the host could run every step, 2 for a usage or setup failure.
 #include <windows.h>
 #include <intrin.h>
@@ -72,6 +81,8 @@ using Run = int(__cdecl*)(void*, std::uint32_t*);
 using Release = int(__cdecl*)(void*);
 using Join = int(__cdecl*)();
 using Stats = void(__cdecl*)(std::int64_t*);
+using Export = void*(__cdecl*)(void*, const char*);
+using Counts = void(__cdecl*)(LONG*);
 
 HMODULE g_kernel;
 Join g_enter, g_leave;
@@ -136,6 +147,20 @@ DWORD WINAPI participant(void* parameter) {
     SetEvent(self->entered);
     WaitForSingleObject(self->cue, INFINITE);
     self->left_ok = g_leave() == 1 && my_slot0() == self->own && t_host_sentinel == SENTINEL;
+    return 0;
+}
+
+// Created after the start; never participates. Checks its slot 0 and sentinel while it lives.
+volatile LONG g_late_ok;
+
+DWORD WINAPI late_thread(void*) {
+    void* const own = my_slot0();
+    bool ok = t_host_sentinel == SENTINEL;
+    for (int i = 0; i < 1000 && ok; ++i) {
+        ok = my_slot0() == own && t_host_sentinel == SENTINEL;
+        SwitchToThread();
+    }
+    InterlockedExchange(&g_late_ok, ok ? 1 : 0);
     return 0;
 }
 
@@ -314,9 +339,11 @@ extern "C" int host_entry() {
     auto run = reinterpret_cast<Run>(GetProcAddress(mapper, plain ? "pe_map_run" : "pe_map_run_main"));
     auto release = reinterpret_cast<Release>(GetProcAddress(mapper, "pe_map_release"));
     auto stats = reinterpret_cast<Stats>(GetProcAddress(mapper, "pe_map_main_tls_stats"));
+    auto mapped_export = reinterpret_cast<Export>(GetProcAddress(mapper, "pe_map_export"));
     g_enter = reinterpret_cast<Join>(GetProcAddress(mapper, "pe_map_main_thread_enter"));
     g_leave = reinterpret_cast<Join>(GetProcAddress(mapper, "pe_map_main_thread_leave"));
-    if (!map || !run || !release || !stats || !g_enter || !g_leave) ExitProcess(fail_setup("missing pe_map export"));
+    if (!map || !run || !release || !stats || !mapped_export || !g_enter || !g_leave)
+        ExitProcess(fail_setup("missing pe_map export"));
 
     const bool sentinel_before = t_host_sentinel == SENTINEL;  // the last host TLS access until release
     void* const my_host_block = my_slot0();
@@ -330,9 +357,22 @@ extern "C" int host_entry() {
     g_index = tls_index_of(base);
     const DWORD64 entry_point = reinterpret_cast<DWORD64>(base) + entry_rva(base);
 
+    auto counts = reinterpret_cast<Counts>(mapped_export(base, "exe_slot0_callback_counts"));
+    if (!counts) ExitProcess(fail_setup("guest callback counts"));
+
     std::uint32_t exit_code = 0xdeadbeef;
     const int started = run(base, &exit_code);
     const bool installed_main = holds_image_block();
+
+    // A host thread created after the start: never a participant.
+    LONG before_late[4], after_late[4];
+    counts(before_late);
+    HANDLE late = CreateThread(nullptr, 0, late_thread, nullptr, 0, nullptr);
+    if (!late || WaitForSingleObject(late, 10000) != WAIT_OBJECT_0) ExitProcess(fail_setup("late thread"));
+    CloseHandle(late);
+    counts(after_late);
+    const bool late_untouched = g_late_ok == 1;
+    const LONG late_callbacks = (after_late[2] - before_late[2]) + (after_late[3] - before_late[3]);
 
     // Host participants.
     int participant_ok = -1;
@@ -359,7 +399,10 @@ extern "C" int host_entry() {
     int refused = -1, intact = -1, resumed = -1;
     if (paused && WaitForSingleObject(paused_event, 10000) != WAIT_OBJECT_0) ExitProcess(fail_setup("paused worker"));
     if (stay >= 0 || paused) {
-        refused = release(base) == 2;
+        const int first = release(base);
+        std::int64_t status_now[8];
+        stats(status_now);
+        refused = first == 0 && status_now[6] == 2;
         intact = committed(base) && has_unwind(entry_point) && carrier_loaded() && holds_image_block();
         if (stay >= 0) leave_ok = finish_participant(stay) && leave_ok;
         if (paused) {
@@ -376,6 +419,8 @@ extern "C" int host_entry() {
     }
     if (count) participant_ok = leave_ok;
 
+    LONG final_counts[4];
+    counts(final_counts);
     const int released = release(base);
     const bool cleaned = released == 1 && !committed(base) && !has_unwind(entry_point) && !carrier_loaded();
     const bool second_release = release(base) == 0;
@@ -403,6 +448,13 @@ extern "C" int host_entry() {
     put_flag("refused", refused);
     put_flag("intact_on_refusal", intact);
     put_flag("resumed", resumed);
+    put_flag("late_untouched", late_untouched);
+    put(" late_callbacks=");
+    put_number(late_callbacks, false);
+    put(" callbacks=");
+    put_number(final_counts[2], false);
+    put(',');
+    put_number(final_counts[3], false);
     put_flag("host_tls", host_tls);
     put_flag("cleaned", cleaned);
     put_flag("second_release", second_release);

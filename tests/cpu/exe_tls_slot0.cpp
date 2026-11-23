@@ -21,7 +21,8 @@
 //   X=<exit code>             the number of n results
 // Workers a and b run one after the other, so the order is fixed. Threads the EXE did not start
 // are left out. A failed setup ends the process with 0xE0000002 (CreateThread), 0xE0000003 (wait)
-// or 0xE0000006 (event log overflow).
+// or 0xE0000006 (event log overflow). exe_slot0_callback_counts reports how often the TLS callback ran
+// for each reason on any thread, including threads it does not log.
 //
 // Built with PAUSED_WORKER (cpu_exe_tls_slot0_pause), the entry point then starts worker c, which runs
 // its check (logged before the log is written) and then pauses inside the image: it sets the host's
@@ -123,7 +124,10 @@ bool own_thread() {
     return thread == g_threads[1] || thread == g_threads[2] || thread == g_threads[3];
 }
 
+volatile LONG g_callback_counts[4];  // every call of the TLS callback, by reason, on any thread
+
 void NTAPI callback(PVOID, DWORD reason, PVOID) {
+    if (reason < 4) InterlockedIncrement(&g_callback_counts[reason]);
     if (reason == DLL_PROCESS_DETACH) return;  // not logged: the log is written before the process ends
     // Thread notifications for threads the EXE did not start (a host's own threads) are not checked: those
     // threads do not run the EXE's code. Their IDs are never in g_threads, which is filled before a worker runs.
@@ -149,6 +153,12 @@ void check(unsigned char tag) {
 
 #pragma section(".CRT$XLB", read)
 extern "C" __declspec(allocate(".CRT$XLB")) PIMAGE_TLS_CALLBACK p_exe_slot0_callback = callback;
+
+// How often the TLS callback ran for each reason (process detach, process attach, thread attach, thread
+// detach), on any thread, for a host that maps the image (pe_map_export).
+extern "C" __declspec(dllexport) void exe_slot0_callback_counts(LONG* out) {
+    for (int i = 0; i < 4; ++i) out[i] = g_callback_counts[i];
+}
 
 namespace {
 DWORD WINAPI worker(void* tag) {
