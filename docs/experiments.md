@@ -3310,6 +3310,26 @@ Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer una
 - At commit `65492448` on Windows 10 22H2 (build 19045.6456, MSVC 19.44.35230.0, Windows SDK 10.0.26100.0 DXC, debug layer enabled on both backends), a GTX 1060 6 GB (driver 32.0.15.6094) reads 64 in all four probe buffers in 3/3 runs, and the in-box WARP 10.0.19041.5794 on the same host reproduces the Windows 10 behavior above: each buffer reads 256 in 3/3 runs, with the fixture reporting the shared add and sub words as the only two mismatches. Both backends matched all 1,047 per-record results and the other 147,454 words, with zero debug errors or warnings ([report](https://github.com/R0Y00/Xbox2Windows/issues/369#issuecomment-7071770464)).
 - At commit `185b9d6c` on Windows 11 build 26200 with the debug layer enabled, an RDNA 3 adapter reproduces the same probe failure: an AMD Radeon RX 7900 XTX (device `744c`, driver 32.0.32029.2010) reads 256 in each of the four buffers, with the title-address fixture recording zero mismatches across all 1,047 records and 147,454 checked words and zero D3D12 debug errors or warnings ([report](https://github.com/R0Y00/Xbox2Windows/issues/369)).
 
+- The [RX 6500 report](https://github.com/R0Y00/Xbox2Windows/pull/793) used
+  commit `a4ade3032fec08767ed411cc83834a3543c626f2`, driver 32.0.21045.29003,
+  Windows 11 build 26300 and the debug layer. The direct probe read
+  `256,256,256,256` instead of `64,64,64,64`; its title-address lookup/write
+  comparisons still matched. The separate wave diagnostic read
+  `64,64,64,64` in four runs on the RX 6500 and passed on WARP
+  10.0.26100.10068. These measurements leave the cause open.
+
+The wave diagnostic is run explicitly, with the same dispatch sizes, resource
+setup and readback as the direct probe. Run both from the build directory:
+
+```powershell
+.\offscreen_check.exe hardware --gpu-alias-lookup-writes
+.\offscreen_check.exe hardware --gpu-alias-atomic-waterfall
+.\offscreen_check.exe warp --gpu-alias-atomic-waterfall
+```
+
+An incorrect readback or setup failure fails the diagnostic. Exit 77 denotes
+an adapter without the required SM 6.0 or WaveOps capability.
+
 ## Offscreen rendering and readback
 
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
