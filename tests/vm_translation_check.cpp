@@ -3,14 +3,17 @@
 // gpu = cpu - A + B, and a GPU address inside [B, B + size) back to cpu = gpu - B + A
 // (anything else passes through unchanged). These checks ask whether a desktop D3D12
 // device can give A a GPU view that keeps that offset.
-//   shared_range      no device: A and B are one reservation, so both directions are the identity
-//   device_<adapter>  A is one committed allocation wrapped as a D3D12 heap with one buffer over it
+//   shared_range        no device: A and B are one reservation, so both directions are the identity
+//   device_<adapter>    A is one committed allocation wrapped as a D3D12 heap with one buffer over it
+//   sequence_<adapter>  the title's order through d3d12_xs.dll: configure, create the device, create
+//                       the first DIRECT queue, then the device_<adapter> checks on that queue
 // Returns 0 on pass, 1 on failure, 77 (skip) without the adapter or ID3D12Device3.
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +21,10 @@
 
 #include "vm_translation_cs.h"
 #include "xmem_test_device.h"
+
+extern "C" HRESULT WINAPI D3D12ConfigureVirtualMemoryX(const void* config);
+extern "C" HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters, REFIID iid,
+                                                void** device);
 
 using Microsoft::WRL::ComPtr;
 using namespace std::literals;
@@ -104,7 +111,7 @@ struct Gpu {
         }
         const D3D12_ROOT_SIGNATURE_DESC root_desc{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
         ComPtr<ID3DBlob> blob;
-        if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))) ||
+        if ((!queue && FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)))) ||
             FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
             FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
                                              IID_PPV_ARGS(&list))) ||
@@ -186,21 +193,9 @@ unsigned mismatches(const std::uint32_t* src, const std::uint32_t* dst)
     return bad;
 }
 
-int device_checks(bool warp)
+// The #912 checks on an initialized device and queue.
+int translation_checks(Gpu& gpu)
 {
-    bool unmatched = false;
-    const auto base = create_device(warp, unmatched);
-    if (unmatched) return 1;
-    Gpu gpu;
-    if (!base || FAILED(base.As(&gpu.device))) {
-        std::puts(warp ? "No ID3D12Device3 on WARP" : "No hardware adapter with ID3D12Device3");
-        return 77;
-    }
-    if (!gpu.init()) {
-        std::puts("compute setup failed");
-        return 1;
-    }
-
     // Refusals: a reserve-only range, and an address inside an allocation.
     {
         const VirtualRange reserved(VirtualAlloc(nullptr, range_size, MEM_RESERVE, PAGE_READWRITE));
@@ -319,6 +314,152 @@ int device_checks(bool warp)
     std::printf("device failures=%u\n", failures);
     return failures ? 1 : 0;
 }
+
+int device_checks(bool warp)
+{
+    bool unmatched = false;
+    const auto base = create_device(warp, unmatched);
+    if (unmatched) return 1;
+    Gpu gpu;
+    if (!base || FAILED(base.As(&gpu.device))) {
+        std::puts(warp ? "No ID3D12Device3 on WARP" : "No hardware adapter with ID3D12Device3");
+        return 77;
+    }
+    if (!gpu.init()) {
+        std::puts("compute setup failed");
+        return 1;
+    }
+    return translation_checks(gpu);
+}
+
+HRESULT create_xbox_device(IUnknown* adapter, REFIID iid, void** device)
+{
+    return D3D12XboxCreateDevice(adapter, nullptr, iid, device);
+}
+
+// The title's 32-byte configuration block between guard bytes, so a write next to it is caught too.
+struct ConfigBlock {
+    static constexpr std::size_t guard = 16;
+    std::array<unsigned char, guard + 32 + guard> bytes{};
+    unsigned char* block() { return bytes.data() + guard; }
+    void reset(std::uint32_t value)
+    {
+        bytes.fill(0xa5);
+        std::memset(block(), 0, 32);
+        std::memcpy(block() + 4, &value, sizeof(value));
+    }
+};
+
+void expect_configure(ConfigBlock& config, HRESULT expected, const char* what)
+{
+    const auto before = config.bytes;
+    const HRESULT hr = D3D12ConfigureVirtualMemoryX(config.block());
+    std::printf("configure hr=0x%08lx: ", static_cast<unsigned long>(hr));
+    expect(hr == expected && before == config.bytes, what);
+}
+
+// A refused queue request returns no queue.
+void expect_queue_refused(ID3D12Device* device, const D3D12_COMMAND_QUEUE_DESC& desc, const char* what)
+{
+    ID3D12CommandQueue* queue = reinterpret_cast<ID3D12CommandQueue*>(std::uintptr_t{1});
+    const HRESULT hr = device->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue));
+    std::printf("queue hr=0x%08lx: ", static_cast<unsigned long>(hr));
+    const bool refused = FAILED(hr) && (!queue || queue == reinterpret_cast<ID3D12CommandQueue*>(std::uintptr_t{1}));
+    if (SUCCEEDED(hr) && queue) queue->Release();
+    expect(refused, what);
+}
+
+int sequence_checks(bool warp)
+{
+    // 1. Configuration before any device, as the title calls it.
+    ConfigBlock config;
+    {
+        const HRESULT hr = D3D12ConfigureVirtualMemoryX(nullptr);
+        std::printf("configure hr=0x%08lx: ", static_cast<unsigned long>(hr));
+        expect(hr == E_POINTER, "a null block is refused");
+    }
+    for (std::uint32_t value : {0u, 1u, 2u, 5u, 0x80000003u, 0xffffffffu}) {
+        config.reset(value);
+        std::printf("value 0x%08x ", value);
+        expect_configure(config, E_INVALIDARG, "a value other than 3 or 4 is refused and the block is unchanged");
+    }
+    for (std::size_t offset : {0u, 3u, 8u, 31u}) {
+        config.reset(4);
+        config.block()[offset] = 1;
+        std::printf("byte +%zu ", offset);
+        expect_configure(config, E_INVALIDARG, "a non-zero byte outside +4 is refused and the block is unchanged");
+    }
+    config.reset(4);
+    expect_configure(config, S_OK, "the observed block (4 at +4) is accepted and left unchanged");
+    expect_configure(config, DXGI_ERROR_INVALID_CALL, "a second configuration is refused");
+    config.reset(3);
+    expect_configure(config, DXGI_ERROR_INVALID_CALL, "a second configuration with the other sample is refused");
+
+    // 2. The device through d3d12_xs.dll.
+    bool unmatched = false;
+    const auto base = create_device(warp, unmatched, create_xbox_device);
+    if (unmatched) return 1;
+    Gpu gpu;
+    if (!base || FAILED(base.As(&gpu.device))) {
+        std::puts(warp ? "No ID3D12Device3 on WARP" : "No hardware adapter with ID3D12Device3");
+        return 77;
+    }
+    {
+        ComPtr<IDXGIFactory4> factory;
+        ComPtr<IDXGIAdapter1> adapter;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+            FAILED(factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter)))) {
+            std::puts("setup error: adapter of the created device not found");
+            return 1;
+        }
+        const std::uint32_t parameters[16]{};
+        void* device = reinterpret_cast<void*>(std::uintptr_t{1});
+        HRESULT hr = D3D12XboxCreateDevice(adapter.Get(), parameters, __uuidof(ID3D12Device), &device);
+        std::printf("device hr=0x%08lx: ", static_cast<unsigned long>(hr));
+        expect(hr == E_INVALIDARG && !device, "a device request with a parameter block is refused");
+        device = reinterpret_cast<void*>(std::uintptr_t{1});
+        hr = D3D12XboxCreateDevice(adapter.Get(), nullptr, __uuidof(ID3D12Device3), &device);
+        std::printf("device hr=0x%08lx: ", static_cast<unsigned long>(hr));
+        expect(hr == E_NOINTERFACE && !device, "a device request for another interface is refused");
+    }
+    config.reset(4);
+    expect_configure(config, DXGI_ERROR_INVALID_CALL, "configuration after device creation is refused");
+
+    D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va{};
+    if (SUCCEEDED(gpu.device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va, sizeof(va)))) {
+        std::printf("adapter VA bits: per resource %u, per process %u\n", va.MaxGPUVirtualAddressBitsPerResource,
+                    va.MaxGPUVirtualAddressBitsPerProcess);
+    }
+
+    // 3. The first DIRECT queue with the default description, then refused requests.
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    HRESULT hr = gpu.device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&gpu.queue));
+    std::printf("queue hr=0x%08lx: ", static_cast<unsigned long>(hr));
+    expect(SUCCEEDED(hr), "the first DIRECT queue with the default description is created");
+    if (FAILED(hr)) return 1;
+    {
+        D3D12_COMMAND_QUEUE_DESC bad = queue_desc;
+        bad.Type = static_cast<D3D12_COMMAND_LIST_TYPE>(0x7fffffff);
+        expect_queue_refused(gpu.device.Get(), bad, "a queue of an unknown type is refused");
+        bad = queue_desc;
+        bad.Priority = 12345;
+        expect_queue_refused(gpu.device.Get(), bad, "a queue with an unknown priority is refused");
+        bad = queue_desc;
+        bad.NodeMask = 1u << 31;
+        expect_queue_refused(gpu.device.Get(), bad, "a queue on a node the adapter lacks is refused");
+    }
+    hr = gpu.device->GetDeviceRemovedReason();
+    std::printf("device removed reason hr=0x%08lx: ", static_cast<unsigned long>(hr));
+    expect(hr == S_OK, "the refusals leave the device in place");
+
+    // 4. The first queue and the configured device still run the range translation.
+    if (!gpu.init()) {
+        std::puts("compute setup failed");
+        return 1;
+    }
+    return translation_checks(gpu);
+}
 }
 
 int main(int argc, char** argv)
@@ -332,6 +473,10 @@ int main(int argc, char** argv)
         result = device_checks(true);
     } else if (scenario == "device_hardware"sv) {
         result = device_checks(false);
+    } else if (scenario == "sequence_warp"sv) {
+        result = sequence_checks(true);
+    } else if (scenario == "sequence_hardware"sv) {
+        result = sequence_checks(false);
     }
     std::printf("vm_translation %s: %s\n", argv[1], result == 0 ? "PASS" : result == 77 ? "SKIP" : "FAIL");
     return result;
