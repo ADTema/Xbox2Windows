@@ -466,35 +466,73 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 vector[regs[0]] = lds_word
             lds_word = ("alu", expression)
             ds_wait = True
-        elif m := re.fullmatch(r"ds_cmpst(?P<ret>_rtn)?_f64 "
-                               r"(?:(v\[\d+:\d+\]), )?v(\d+), (v\[\d+:\d+\]), (v\[\d+:\d+\])"
+        elif m := re.fullmatch(r"ds_(cmpst|min|max)(?P<ret>_rtn)?_f64 "
+                               r"(?:(v\[\d+:\d+\]), )?v(\d+), (v\[\d+:\d+\])(?:, (v\[\d+:\d+\]))?"
                                r"(?: offset:(0|8))?", line):
-            returns, dest, addr, compare, replacement, offset = m.groups()
+            op, returns, dest, addr, compare, replacement, offset = m.groups()
             if lds_f64_mode != "normal":
                 raise ValueError("Unverified private LDS binary64 mode")
             slot = int(offset or 0) // 4
             prev = tuple(lds_wide_words.get(i) for i in range(slot, slot + 2))
             if (guard_span is not None or vector.get(int(addr)) != ("lds_wide_address",)
-                    or bool(returns) != (dest is not None) or not all(map(is_word, prev))):
+                    or bool(returns) != (dest is not None) or (op == "cmpst") != (replacement is not None)
+                    or not all(map(is_word, prev))):
                 raise ValueError("Unverified private LDS binary64 access")
             ranges = []
-            for operand in (compare, replacement) + ((dest,) if dest else ()):
+            for operand in (operand for operand in (compare, replacement, dest) if operand is not None):
                 first, last = map(int, operand[2:-1].split(":"))
                 if last > 255 or last != first + 1:
                     raise ValueError("Unverified private LDS binary64 range")
                 ranges.append((first, last))
-            cmp_word, new_word = (tuple(vector.get(i) for i in regs) for regs in ranges[:2])
+            cmp_word = tuple(vector.get(i) for i in ranges[0])
+            new_word = tuple(vector.get(i) for i in ranges[1]) if replacement else cmp_word
             if not all(map(is_word, cmp_word + new_word)):
                 raise ValueError("Unverified private LDS binary64 source")
-            old_lo, old_hi = map(hlsl_word, prev)
-            cmp_lo, cmp_hi = map(hlsl_word, cmp_word)
-            condition = f"({old_lo} == {cmp_lo} && {old_hi} == {cmp_hi})"
-            update = [f"({condition} ? {hlsl_word(new)} : {hlsl_word(old)})" for new, old in zip(new_word, prev)]
-            if any(len(word) > ALU_EXPRESSION_LIMIT for word in update):
+            inputs = tuple(map(hlsl_word, prev + cmp_word + new_word))
+            if len(ds_steps) >= 64 or any(len(word) > ALU_EXPRESSION_LIMIT for word in inputs):
                 raise ValueError("LDS expression exceeds the profile limit")
+            prefix = f"ds_f64_{len(ds_steps)}"
+            old_lo, old_hi, cmp_lo, cmp_hi, new_lo, new_hi = (
+                f"{prefix}_{suffix}" for suffix in ("old_lo", "old_hi", "cmp_lo", "cmp_hi", "new_lo", "new_hi")
+            )
+            if op == "cmpst":
+                condition = f"({old_lo} == {cmp_lo} && {old_hi} == {cmp_hi})"
+            else:
+                # For equal signs, compare the full bit patterns in the
+                # opposite direction for negative numbers. Handle signs first.
+                below = f"({cmp_hi} < {old_hi} || ({cmp_hi} == {old_hi} && {cmp_lo} < {old_lo}))"
+                above = f"({cmp_hi} > {old_hi} || ({cmp_hi} == {old_hi} && {cmp_lo} > {old_lo}))"
+                opposite = f"(({cmp_hi} ^ {old_hi}) & 0x80000000u) != 0u"
+                negative = f"({cmp_hi} & 0x80000000u) != 0u"
+                if op == "min":
+                    condition = f"({opposite} ? ({negative}) : (({negative}) ? {above} : {below}))"
+                else:
+                    condition = f"({opposite} ? !({negative}) : (({negative}) ? {below} : {above}))"
+            names = (old_lo, old_hi, cmp_lo, cmp_hi, new_lo, new_hi)
+            take = f"{prefix}_take"
+            statements = [f"    uint {name} = {word};" for name, word in zip(names, inputs)]
+            statements.append(f"    bool {take} = {condition};")
+            ds_steps.append((None, "\n".join(statements)))
+            update = (f"({take} ? {new_lo} : {old_lo})", f"({take} ? {new_hi} : {old_hi})")
             if dest:
-                vector.update(zip(ranges[2], prev))
+                vector.update(zip(ranges[-1], prev))
             lds_wide_words.update((slot + i, ("alu", word)) for i, word in enumerate(update))
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_wrxchg2_rtn_b64 v\[(\d+):(\d+)\], v(\d+), "
+                               r"v\[(\d+):(\d+)\], v\[(\d+):(\d+)\]"
+                               r"(?: offset0:([01]))?(?: offset1:([01]))?", line):
+            dst, last, addr, first0, last0, first1, last1 = map(int, m.groups()[:7])
+            offsets = tuple(int(offset or 0) for offset in m.groups()[7:])
+            if (guard_span is not None or vector.get(addr) != ("lds_wide_address",) or offsets[0] == offsets[1]
+                    or max(last, last0, last1) > 255 or last != dst + 3 or last0 != first0 + 1 or last1 != first1 + 1):
+                raise ValueError("Unverified private paired qword exchange")
+            slots = [2 * offset + i for offset in offsets for i in range(2)]
+            previous = [lds_wide_words.get(slot) for slot in slots]
+            data = [vector.get(reg) for reg in (first0, last0, first1, last1)]
+            if not all(map(is_word, previous + data)):
+                raise ValueError("Uninitialized private paired qword exchange")
+            vector.update(zip(range(dst, last + 1), previous))
+            lds_wide_words.update(zip(slots, data))
             ds_wait = True
         elif m := re.fullmatch(r"ds_(write|read)_b(64|96) (v\[\d+:\d+\]|v\d+), "
                                r"(v\[\d+:\d+\]|v\d+)(?: offset:(0|8))?", line):
