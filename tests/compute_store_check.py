@@ -462,6 +462,10 @@ def pitch_controls():
     # Either multiplicand may carry the pitch; without idxen the stride binding does not change the output.
     assert aot.lower([s.replace("0x48, v4,", "v4, 0x48,") for s in PITCH], (4, 4, 1), **PITCH_BINDING) == pitch
     assert aot.lower(PITCH, (4, 4, 1), **(PITCH_BINDING | dict(stride=16))) == pitch
+    # The column byte offset may also come in the LLVM 15 group-base form.
+    group_base = [part for line in PITCH for part in line.replace(
+        "v_lshlrev_b32_e32 v5, 3, v3", "s_lshl_b32 s20, s10, 2\nv_add_lshl_u32 v5, s20, v0, 3").split("\n")]
+    assert len(group_base) == len(PITCH) + 1 and aot.lower(group_base, (4, 4, 1), **PITCH_BINDING) == pitch
     # An inline-constant pitch is printed in decimal.
     assert expected.replace("72u", "64u") in aot.lower(
         [s.replace("0x48", "64") for s in PITCH], (4, 4, 1), **PITCH_BINDING).splitlines()

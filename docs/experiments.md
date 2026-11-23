@@ -1966,7 +1966,8 @@ The CPU controls reject:
   store with another pitch.
 
 They also check that the pitch is accepted in either multiplicand, as a
-decimal inline constant, and with or without a stride binding.
+decimal inline constant, with or without a stride binding, and with a column
+byte offset in the LLVM 15 group-base form.
 
 `tools/shader_profile_audit.py` passes the PSV0 size and tries the next one or
 two SGPRs after the group-X candidate for group Y and Z. A CPU control in
