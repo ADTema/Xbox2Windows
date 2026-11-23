@@ -106,7 +106,7 @@ foreach(adapter IN ITEMS warp hardware)
 endforeach()
 
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
-add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12_xs_shim.def)
+add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12_xs_range.cpp src/d3d12_xs_shim.def)
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
@@ -381,13 +381,13 @@ add_custom_command(OUTPUT "${vm_translation_header}"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main -Vn vm_translation_cs -Fh "${vm_translation_header}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/vm_translation.hlsl"
     DEPENDS tests/vm_translation.hlsl VERBATIM)
-add_executable(vm_translation_check tests/vm_translation_check.cpp "${vm_translation_header}")
+add_executable(vm_translation_check tests/vm_translation_check.cpp src/d3d12_xs_range.cpp "${vm_translation_header}")
 target_include_directories(vm_translation_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" tests src)
 target_compile_features(vm_translation_check PRIVATE cxx_std_17)
 target_link_libraries(vm_translation_check PRIVATE d3d12_xs_shim d3d12 dxgi)
 add_test(NAME vm_translation_shared_range COMMAND vm_translation_check shared_range)
 foreach(adapter IN ITEMS warp hardware)
-    foreach(scenario IN ITEMS device sequence range_valid range_missing range_rejected)
+    foreach(scenario IN ITEMS device sequence range_valid range_missing range_rejected range_lifetime range_partial)
         add_test(NAME vm_translation_${scenario}_${adapter} COMMAND vm_translation_check ${scenario}_${adapter})
         set_tests_properties(vm_translation_${scenario}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     endforeach()

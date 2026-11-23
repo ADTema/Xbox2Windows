@@ -11,6 +11,11 @@
 //                       the same adapter, device requests and tile inputs after an accepted, absent or
 //                       refused configuration; only the accepted one gives the device a range whose
 //                       mapped tiles a dispatch reads (d3d12_xs_range.h)
+//   range_lifetime_<adapter>
+//                       configured create/release twice: the device is destroyed after the owner's
+//                       Close(), and a control without Close() shows the windows keep it alive
+//   range_partial_<adapter>
+//                       the range module with window creation failing at window 1 or 3
 // Returns 0 on pass, 1 on failure, 77 (skip) without the adapter or ID3D12Device3, or when a dispatch
 // cannot read a reserved buffer's copied tile.
 #include <windows.h>
@@ -756,6 +761,135 @@ int range_checks(bool warp, Configuration configuration)
     std::printf("range failures=%u\n", failures);
     return failures ? 1 : 0;
 }
+
+// ---- Range lifetime ----
+
+void CALLBACK count_destruction(void* count)
+{
+    ++*static_cast<unsigned*>(count);
+}
+
+bool watch_destruction(ID3D12Device* device, unsigned& count)
+{
+    ComPtr<ID3DDestructionNotifier> notifier;
+    UINT id = 0;
+    return SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&notifier))) &&
+           SUCCEEDED(notifier->RegisterDestructionCallback(count_destruction, &count, &id));
+}
+
+// Releases the last caller-owned reference and returns what Release reported.
+ULONG release_last(ComPtr<ID3D12Device>& device)
+{
+    return device.Detach()->Release();
+}
+
+// The configured device is destroyed once its owner closes the range, in two create/release rounds.
+// A control in the first round releases the device without Close() and shows the windows keep it.
+int range_lifetime_checks(bool warp)
+{
+    ConfigBlock config;
+    config.reset(4);
+    expect_configure(config, S_OK, "the observed block (4 at +4) is accepted");
+    for (int round = 0; round < 2; ++round) {
+        bool unmatched = false;
+        auto device = create_device(warp, unmatched, create_xbox_device);
+        if (unmatched) return 1;
+        if (!device) {
+            std::puts(warp ? "No WARP device" : "No hardware device");
+            return 77;
+        }
+        unsigned destroyed = 0;
+        if (!watch_destruction(device.Get(), destroyed)) {
+            std::puts("setup error: ID3DDestructionNotifier");
+            return 1;
+        }
+        HRESULT hr = S_OK;
+        auto range = device_range(device.Get(), hr);
+        std::printf("round %d: range hr=0x%08lx, %u windows\n", round, static_cast<unsigned long>(hr),
+                    range ? range->GetWindowCount() : 0u);
+        expect(range && range->GetWindowCount() > 0, "the configured device carries a range");
+        if (!range) return 1;
+
+        if (round == 0) {
+            // Control: without Close() the windows hold the device after its last caller reference.
+            range.Reset();
+            const ULONG left = release_last(device);
+            std::printf("release without Close: %lu references left, %u destruction callbacks\n", left, destroyed);
+            expect(left > 0 && destroyed == 0, "without Close the windows keep the device alive");
+            // D3D12 returns the same live device for the adapter; it still carries the same range.
+            device = create_device(warp, unmatched, create_xbox_device);
+            range = device ? device_range(device.Get(), hr) : nullptr;
+            expect(device && range && destroyed == 0, "the same device and its range are returned again");
+            if (!range) return 1;
+        }
+
+        range->Close();
+        expect(range->GetSize() == 0 && range->GetWindowCount() == 0 && range->GetGPUVirtualAddress(0, 4) == 0,
+               "Close empties the range");
+        range->Close();
+        expect(!device_range(device.Get(), hr) && hr == DXGI_ERROR_NOT_FOUND,
+               "Close removes the range from the device's private data");
+        range.Reset();
+        const ULONG left = release_last(device);
+        std::printf("round %d: release after Close: %lu references left, %u destruction callbacks\n", round, left,
+                    destroyed);
+        expect(left == 0 && destroyed == 1, "after Close the last release destroys the device");
+    }
+    std::printf("lifetime failures=%u\n", failures);
+    return failures ? 1 : 0;
+}
+
+// ---- Window creation failing part way ----
+
+unsigned window_calls = 0;
+unsigned fail_window = 0;
+
+HRESULT failing_window(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, ID3D12Resource** window)
+{
+    if (++window_calls == fail_window) return E_OUTOFMEMORY;
+    return device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(window));
+}
+
+// The range module (src/d3d12_xs_range.cpp) against a desktop device: a window creation failing at
+// window 1 or 3 returns its HRESULT, attaches nothing, and leaves no window holding the device.
+int range_partial_checks(bool warp)
+{
+    constexpr UINT64 size = 32ull << 30;
+    for (const unsigned fail_at : {1u, 3u}) {
+        for (const bool attach : {false, true}) {
+            bool unmatched = false;
+            auto device = create_device(warp, unmatched);
+            if (unmatched) return 1;
+            if (!device) {
+                std::puts(warp ? "No WARP device" : "No hardware device");
+                return 77;
+            }
+            unsigned destroyed = 0;
+            if (!watch_destruction(device.Get(), destroyed)) {
+                std::puts("setup error: ID3DDestructionNotifier");
+                return 1;
+            }
+            window_calls = 0;
+            fail_window = fail_at;
+            HRESULT hr = S_OK;
+            if (attach) {
+                hr = d3d12_xs_range::attach(device.Get(), size, failing_window);
+            } else {
+                IX2WGpuRange* range = reinterpret_cast<IX2WGpuRange*>(std::uintptr_t{1});
+                hr = d3d12_xs_range::create(device.Get(), size, &range, failing_window);
+                expect(!range, "a failed create returns no range");
+            }
+            std::printf("%s, window %u fails: hr=0x%08lx after %u calls\n", attach ? "attach" : "create", fail_at,
+                        static_cast<unsigned long>(hr), window_calls);
+            expect(hr == E_OUTOFMEMORY && window_calls == fail_at, "the failing window's HRESULT is returned");
+            expect(!d3d12_xs_range::attached(device.Get()), "nothing is attached to the device");
+            const ULONG left = release_last(device);
+            expect(left == 0 && destroyed == 1, "the windows created before the failure no longer hold the device");
+        }
+    }
+    std::printf("partial failures=%u\n", failures);
+    return failures ? 1 : 0;
+}
 }
 
 int main(int argc, char** argv)
@@ -782,6 +916,9 @@ int main(int argc, char** argv)
                 expected.append(name).append(warp ? "_warp" : "_hardware");
                 if (scenario == expected) result = range_checks(warp, configuration);
             }
+            const std::string suffix = warp ? "_warp" : "_hardware";
+            if (scenario == "range_lifetime" + suffix) result = range_lifetime_checks(warp);
+            if (scenario == "range_partial" + suffix) result = range_partial_checks(warp);
         }
     }
     std::printf("vm_translation %s: %s\n", argv[1], result == 0 ? "PASS" : result == 77 ? "SKIP" : "FAIL");
