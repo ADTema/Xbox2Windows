@@ -243,4 +243,82 @@ probe_below:
     ret
 probe_ss ENDP
 
+; unsigned neg_jcc(int32_t x)
+; Bit 0: -x != 0 (NZ after NEG). Bit 1: carry after NEG (inverted in control).
+; Bit 2: -x < 0 (SF after NEG). Bit 3: x == INT32_MIN (OF after NEG).
+neg_jcc PROC FRAME
+    .endprolog
+    xor eax, eax
+    mov edx, ecx
+    neg edx
+    je short nj_zero
+    or eax, 1
+nj_zero:
+    mov edx, ecx
+    neg edx
+IFDEF SWAP_OPERANDS
+    jae short nj_carry
+ELSE
+    jb short nj_carry
+ENDIF
+    jmp short nj_sign
+nj_carry:
+    or eax, 2
+nj_sign:
+    mov edx, ecx
+    neg edx
+    js short nj_neg
+    jmp short nj_ovf
+nj_neg:
+    or eax, 4
+nj_ovf:
+    mov edx, ecx
+    neg edx
+    jo short nj_overflow
+    ret
+nj_overflow:
+    or eax, 8
+    ret
+neg_jcc ENDP
+
+; uint64_t setcc_mix(uint64_t a, uint64_t b, uint8_t* out)
+; Seeds RAX so SETcc byte writes must retain bits 8..63, and records CMP/NEG flags to memory.
+setcc_mix PROC FRAME
+    .endprolog
+    mov rax, 123456789abcde00h
+    cmp ecx, edx
+    mov r9d, eax
+IFDEF SWAP_OPERANDS
+    setb al
+ELSE
+    setl al
+ENDIF
+    sete BYTE PTR [r8]
+    neg ecx
+    setb BYTE PTR [r8+1]
+    seto BYTE PTR [r8+2]
+    sete BYTE PTR [r8+3]
+    ret
+setcc_mix ENDP
+
+; uint64_t cmovcc_mix(uint64_t a, uint64_t b, const uint64_t* mem)
+; Covers 32-bit zero-extending CMOVcc and 64-bit CMOVcc after CMP and NEG.
+cmovcc_mix PROC FRAME
+    .endprolog
+    mov rax, 0fedcba9876543210h
+    cmp ecx, edx
+IFDEF SWAP_OPERANDS
+    cmovle eax, DWORD PTR [r8]
+ELSE
+    cmovg eax, DWORD PTR [r8]
+ENDIF
+    shl rax, 32
+    mov r9, 1122334455667788h
+    or rax, r9
+    neg rcx
+    cmovo rax, QWORD PTR [r8+8]
+    cmove rax, rdx
+    ret
+cmovcc_mix ENDP
+
 END
