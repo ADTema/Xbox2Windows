@@ -1,4 +1,4 @@
-// Desktop xmem.dll exporting the four functions the package DLLs import by name.
+// Desktop xmem.dll. The default allocation exports share the unhooked allocator.
 // Call shapes come from the observed call sites, not from a published header:
 //   XMemAlloc(size, attributes) and XMemFree(allocation, attributes): Bink and AMD callers.
 //   XMemVirtualQuery(process, address, buffer): the four BVH callers pass no length, supply a
