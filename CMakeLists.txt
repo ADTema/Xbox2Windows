@@ -474,7 +474,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     endfunction()
     function(cpu_translation image translator entry)
         cmake_parse_arguments(BIND "FFX_DESTROY;IMAGE_DATA"
-            "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;IMPORT_ARGUMENTS;RETURN_BYTES;NAME;RANGES" "" ${ARGN})
+            "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;IMPORT_ARGUMENTS;RETURN_BYTES;NAME;RANGES;SECOND_PROVIDER;SECOND_SYMBOL;SECOND_LINK_NAME;SECOND_IMPORT_ARGUMENTS;SECOND_RETURN_BYTES" "" ${ARGN})
         if(NOT BIND_NAME)
             set(BIND_NAME ${image}_lifted)
         endif()
@@ -497,6 +497,15 @@ if(EXISTS "${INTAKE_PYTHON}")
                 list(APPEND binding --import-arguments "${BIND_IMPORT_ARGUMENTS}" --return-bytes "${BIND_RETURN_BYTES}")
             endif()
         endif()
+        # A second ordinary import binding, given as its own --bind group after the first.
+        if(BIND_SECOND_PROVIDER)
+            list(APPEND binding --bind "$<TARGET_FILE:${BIND_SECOND_PROVIDER}>" "${BIND_SECOND_SYMBOL}")
+            if(BIND_SECOND_LINK_NAME)
+                list(APPEND binding --link-name "${BIND_SECOND_LINK_NAME}")
+            endif()
+            list(APPEND binding --import-arguments "${BIND_SECOND_IMPORT_ARGUMENTS}"
+                --return-bytes "${BIND_SECOND_RETURN_BYTES}")
+        endif()
         if(BIND_IMAGE_DATA)
             list(APPEND binding --image-data)
         endif()
@@ -504,11 +513,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_custom_command(OUTPUT "${lifted}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/${translator}.py"
                 "$<TARGET_FILE:${image}>" ${entry} "${lifted}" ${binding}
-            DEPENDS ${image} ${BIND_PROVIDER} ${BIND_RANGES} tools/${translator}.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
-                tools/cpu_call_aot.py VERBATIM)
+            DEPENDS ${image} ${BIND_PROVIDER} ${BIND_SECOND_PROVIDER} ${BIND_RANGES} tools/${translator}.py
+                tools/cpu_leaf_aot.py tools/cpu_ranges.py tools/cpu_call_aot.py VERBATIM)
         add_library(${BIND_NAME} SHARED "${lifted}")
         if(BIND_PROVIDER)
             target_link_libraries(${BIND_NAME} PRIVATE ${BIND_PROVIDER})
+        endif()
+        if(BIND_SECOND_PROVIDER)
+            target_link_libraries(${BIND_NAME} PRIVATE ${BIND_SECOND_PROVIDER})
         endif()
     endfunction()
     foreach(variant IN ITEMS original inverted)
@@ -878,6 +890,37 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_import_calls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/import_calls_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_guarded_call>" ${icall_files})
+    # Two ordinary imports from two providers in one translation: mix3 from the tail-jump providers and fold4 from
+    # slot_provider.cpp. One caller per provider pair: both named, mix3 altered, fold4 altered, and mix3 imported by
+    # ordinal #3 (bound with the link name mix3) next to the named fold4. Each is translated once with mix3 bound with
+    # three arguments and 8 guaranteed bytes and fold4 with four arguments and 2.
+    foreach(variant IN ITEMS named altered)
+        add_library(cpu_slot_${variant}_provider SHARED tests/cpu/slot_provider.cpp tests/cpu/slot_provider.def)
+    endforeach()
+    target_compile_definitions(cpu_slot_altered_provider PRIVATE ALTER_RETURN)
+    set(slot_files)
+    foreach(pair IN ITEMS "named;named;named" "first_altered;altered;named" "second_altered;named;altered"
+                          "ordinal;ordinal;named")
+        list(GET pair 0 variant)
+        list(GET pair 1 first)
+        list(GET pair 2 second)
+        if(first STREQUAL "ordinal")
+            set(mix3 SYMBOL "#3" LINK_NAME mix3)
+        else()
+            set(mix3 SYMBOL mix3)
+        endif()
+        cpu_asm_fixture(cpu_slots_${variant} two_slots)
+        target_link_libraries(cpu_slots_${variant} PRIVATE cpu_tail_${first}_provider cpu_slot_${second}_provider)
+        cpu_translation(cpu_slots_${variant} cpu_switch_aot route2,call_both,call_second NAME cpu_slots_${variant}_lifted
+            PROVIDER cpu_tail_${first}_provider ${mix3} IMPORT_ARGUMENTS 3 RETURN_BYTES 8
+            SECOND_PROVIDER cpu_slot_${second}_provider SECOND_SYMBOL fold4 SECOND_IMPORT_ARGUMENTS 4
+            SECOND_RETURN_BYTES 2)
+        list(APPEND slot_files "$<TARGET_FILE:cpu_slots_${variant}>" "$<TARGET_FILE:cpu_slots_${variant}_lifted>"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_slots_${variant}_lifted.cpp" "$<TARGET_FILE:cpu_tail_${first}_provider>"
+            "$<TARGET_FILE:cpu_slot_${second}_provider>")
+    endforeach()
+    add_test(NAME cpu_aot_two_slots COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/two_slots_check.py" "$<TARGET_FILE:cpu_register_probe>" ${slot_files})
 
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_float_${variant} scalar_float)
