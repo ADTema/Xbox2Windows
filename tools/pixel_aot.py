@@ -471,7 +471,9 @@ float div_fmas32_core(float s0, float s1, float s2, bool cond, bool clamp_res) {
         }
     }
     if (midpoint && err_sc != 0.0) {
-        if ((s_sc > 0.0 && err_sc > 0.0) || (s_sc < 0.0 && err_sc < 0.0)) {
+        // Both values are finite and nonzero here, so >= matches >. The Windows 10 in-box
+        // WARP faults on double ogt and ole comparisons; oge and olt run on every adapter.
+        if ((s_sc >= 0.0 && err_sc >= 0.0) || (s_sc < 0.0 && err_sc < 0.0)) {
             if (++u0 == 0u) ++u1;
         } else {
             if (u0-- == 0u) --u1;

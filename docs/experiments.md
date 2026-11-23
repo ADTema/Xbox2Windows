@@ -4759,7 +4759,9 @@ native RDNA readback.
 `v_div_fmas_f32` evaluates `div_fmas32(src0, src1, src2, vcc)` using double precision
 with Knuth 2Sum remainder tracking for finite inputs. Scaling by 2^32 when VCC is true
 happens before conversion to binary32. The helper is emitted only for shaders using this
-operation and requires double-precision shader arithmetic. The integer-readback fixture
+operation and requires double-precision shader arithmetic. Its double comparisons use
+only `<`, `>=`, `==` and `!=`: the Windows 10 in-box WARP (10.0.19041) faults at the
+first dispatch of a double `>` or `<=` (DXIL `fcmp ogt`/`ole`) ([#876](https://github.com/R0Y00/Xbox2Windows/issues/876)). The integer-readback fixture
 (`pixel_aot_div_fmas_warp` and `pixel_aot_div_fmas_hardware`) checks both VCC conditions
 and clamping with runtime inputs under the preserve denormal mode:
 - Midpoint single-rounding: `(0x3f800001, 0x3fc00000, 0x8d800000)` produces exact sum
