@@ -2381,7 +2381,7 @@ at the first lane affected by each mutation.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
-ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_private_(warp|hardware)$' -V
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_(private|packed|arithmetic|replacement)_(warp|hardware)$' -V
 ```
 
 ```sh

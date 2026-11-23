@@ -1373,7 +1373,8 @@ LDS_OVERLAP_PROGRAM = DS_PREFIX + [
 LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING),
              ("lds_overlap", LDS_OVERLAP_PROGRAM, LDS_BINDING)] + [
     (name, lds_subword_program(*layout), LDS_BINDING) for name, layout in LDS_SUBWORDS.items()
-] + [(op, lds_update_program(op), LDS_BINDING) for op in LDS_UPDATES] + [
+]
+LDS_ARITHMETIC_CASES = [(op, lds_update_program(op), LDS_BINDING) for op in LDS_UPDATES] + [
     (op, lds_return_update_program(op), LDS_BINDING) for op in LDS_RETURN_UPDATES
 ]
 
@@ -1482,7 +1483,7 @@ def lds_replacement_reference(op, groups):
     return words
 
 
-LDS_CASES += [(op, lds_replacement_program(op), LDS_BINDING) for op in LDS_REPLACEMENTS]
+LDS_REPLACEMENT_CASES = [(op, lds_replacement_program(op), LDS_BINDING) for op in LDS_REPLACEMENTS]
 
 
 def lds_overlap_reference(groups):
@@ -1541,7 +1542,7 @@ def lds_counter_reference(op, groups):
     return words
 
 
-LDS_CASES += [(op, lds_counter_program(op), LDS_BINDING) for op in LDS_COUNTERS]
+LDS_REPLACEMENT_CASES += [(op, lds_counter_program(op), LDS_BINDING) for op in LDS_COUNTERS]
 
 
 def lds_reference(groups):
@@ -1596,7 +1597,7 @@ def lds_wide_reference(name, groups):
     return words
 
 
-LDS_CASES += [(name, lds_wide_program(name), LDS_WIDE_BINDING) for name in LDS_WIDE_PROGRAMS]
+LDS_PACKED_CASES = [(name, lds_wide_program(name), LDS_WIDE_BINDING) for name in LDS_WIDE_PROGRAMS]
 
 
 LDS_HIGH_WRITES = {"ds_write_b8_d16_hi": (1, 1), "ds_write_b16_d16_hi": (2, 2)}
@@ -1638,8 +1639,8 @@ LDS_ADDTID_PROGRAM = DS_PREFIX + [
     "ds_read_addtid_b32 v11", "s_waitcnt lgkmcnt(0)",
     "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
 ]
-LDS_CASES += [(op, lds_high_write_program(op), LDS_BINDING | {"stride": 4}) for op in LDS_HIGH_WRITES]
-LDS_CASES += [("lds_addtid", LDS_ADDTID_PROGRAM, LDS_BINDING | {"stride": 8})]
+LDS_PACKED_CASES += [(op, lds_high_write_program(op), LDS_BINDING | {"stride": 4}) for op in LDS_HIGH_WRITES]
+LDS_PACKED_CASES += [("lds_addtid", LDS_ADDTID_PROGRAM, LDS_BINDING | {"stride": 8})]
 
 
 def lds_controls():
@@ -1824,7 +1825,8 @@ def lds_controls():
 
 
 def ds_binary(directory, assembler, objcopy, library):
-    for name, lines, binding in DS_CASES + LDS_CASES:
+    cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES
+    for name, lines, binding in cases:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
         subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1030", f"-mattr={DS_FEATURES}",
@@ -1923,13 +1925,15 @@ def ds_mutants(name, lines, binding, source):
         yield source.replace(f"local.x + {bias}u", f"local.x + {32 - bias}u"), 0
 
 
-def ds_draw(directory, compiler, renderer, backend, *, private=False):
+def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None):
     if private:
         lds_controls()
     else:
         ds_controls()
     accepted = set()
-    for name, lines, binding in (LDS_CASES if private else DS_CASES):
+    if cases is None:
+        cases = LDS_CASES if private else DS_CASES
+    for name, lines, binding in cases:
         source = aot.lower(lines, 32, **binding)
         src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
         src.write_text(source, encoding="ascii")
@@ -2448,5 +2452,8 @@ if __name__ == "__main__":
         modes = {"binary": binary, "draw": draw,
                  "draw-ds-route": ds_draw,
                  "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
+                 "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
+                 "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
+                 "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))
