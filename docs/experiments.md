@@ -28,7 +28,9 @@ dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 
 Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
-[`pe_run_package.py`](../tools/pe_run_package.py) starts a source-built x64 EXE with acyclic bundled DLL dependencies. Pass the path to `pe_map.dll`, a package directory and an EXE path relative to that directory. Use `--system kernel32.dll` or `--shim DLL PATH` for explicit external providers. `--preflight-only` resolves those external exports without mapping any guest image. In execution mode the runner attaches DLLs in dependency order, starts the EXE, and releases the images in reverse. A returning fixture must join any workers before it returns. The runner rejects cycles, self imports and bundled ordinal exports. `cpu_native_startup` checks the same two-DLL fixture under this runner and the Windows loader.
+[`pe_run_package.py`](../tools/pe_run_package.py) starts a source-built x64 EXE with acyclic bundled DLL dependencies. Pass the path to `pe_map.dll`, a package directory and an EXE path relative to that directory. Use `--system kernel32.dll` or `--shim DLL PATH` for explicit external providers. `--preflight-only` resolves those external exports without mapping any guest image. In execution mode the runner attaches DLLs in dependency order, starts the EXE, and releases the images in reverse. A returning fixture must join any workers before it returns. The runner rejects cycles and self imports. It now resolves bundled ordinal imports,
+including ordinal-only (`NONAME`) DLL exports and forwarder chains ending in an
+ordinal, using `pe_map_export_ordinal` on the mapped provider. `cpu_native_startup` checks the same two-DLL fixture under this runner and the Windows loader.
 
 External providers with process-lifetime workers can use `--pin-shim DLL` alongside `--shim DLL PATH`. This pins the provider immediately before the first guest image loads, and only in execution mode. Run packages in a child process when using pinned providers. The guest must still join its own workers and quiesce any host calls into guest code before returning. `cpu_package_shim_lifetime` verifies that the selected provider remains loaded after the entry returns and the ordinary provider unloads.
 
@@ -5622,3 +5624,37 @@ suite checks forwarded exports and ordinals, missing symbols, forwarder cycles,
 ambiguous local basenames, delay-import reachability, deterministic JSON output,
 path escapes, symlinks, hard-linked outputs and malformed PE CLI rejection. All tests use synthetic
 metadata and fake local files; no title files or binary fixtures are checked in.
+
+
+### Starting source-built packages with ordinal-only DLL exports
+
+`pe_run_package.py` can start a synthetic EXE importing `#77` from a bundled
+DLL whose export address table contains only an unnamed ordinal. The offline
+preflight resolves the package dependency as before. The mapper now exposes
+`pe_map_export_ordinal(mapped, ordinal)`, accepting an ordinal in 1..65535
+for a live mapping returned by `pe_map_image` with a non-forwarded export at
+that exact ordinal. A null mapping returns null. The runner requires this
+export from its mapper DLL only when a package actually needs an ordinal.
+It refuses holes, absent ordinals, out-of-range inputs and forwarder RVAs, rather
+than mistaking an export name-table index for an address-table index. Packages
+with a forwarded ordinal target are resolved by the existing package graph
+before looking up the terminal export in its mapped module.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_package_ordinal_startup$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_package_ordinal_startup$' -V
+python -B tests/pe_package_ordinal_plan_check.py -v
+```
+
+The CRT-free fixture's import table must contain exactly one ordinal import,
+`#77`, and its provider must export `mix_args @77 NONAME` (no export name).
+Under the native loader and the mapped package runner, the original provider
+returns 13 and the altered provider returns 14 after writing the same three
+words. A provider that instead exports `#78` must be refused before the guest
+entry, as must a missing provider; the direct mapper lookup also rejects six
+invalid ordinal values. The accompanying platform-independent tests check
+direct and forwarded ordinal routes and missing-symbol errors.
+
+This addresses **only static packaged ordinal binding**, not console ABI,
+DLL cycles, unknown runtime provider contracts, thread-local slot zero, or
+execution of any retail executable. The public tests contain no private binaries.
