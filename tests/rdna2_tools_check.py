@@ -578,6 +578,42 @@ class TestRdna2Disasm(unittest.TestCase):
             ],
         )
 
+    def test_interp_f16_uses_llvm_spelling(self):
+        """Issue #938 step 2: the VOP3 binary16 interpolation forms decode as LLVM 15 prints them for gfx1013.
+
+        Each expected string is llvm-mc 15.0.7's text for the same bytes. Encodings LLVM 15 refuses keep their
+        eight-byte record and are reported as unsupported instead of as the instruction.
+        """
+        endpgm = bytes.fromhex("000081bf")
+        cases = (
+            ("010042d700040200", "v_interp_p1ll_f16 v1, v2, attr0.x"),
+            ("010042d7c5050200", "v_interp_p1ll_f16 v1, v2, attr5.w high"),
+            ("018242d75f040058", "v_interp_p1ll_f16 v1, -|s2|, attr31.y clamp div:2"),
+            ("010043d741040e94", "v_interp_p1lv_f16 v1, v2, attr1.y, -v3 mul:4"),
+            ("01825ad7ff05fe07", "v_interp_p2_f16 v1, |v2|, attr63.w, v255 high clamp"),
+            ("ff005ad7a0d2f001", "v_interp_p2_f16 v255, s105, attr32.z, m0"),
+            # An inline constant source: LLVM 15 prints it as an invalid immediate, and a lone negation as neg().
+            ("010043d741020d04", "v_interp_p1lv_f16 v1, /*invalid immediate*/, attr1.y, v3"),
+            ("010043d741020d44", "v_interp_p1lv_f16 v1, neg(/*invalid immediate*/), attr1.y, v3"),
+        )
+        for raw, assembly in cases:
+            with self.subTest(raw=raw):
+                insns = disasm_rdna2(bytes.fromhex(raw) + endpgm)
+                self.assertEqual([(i["length"], i["assembly"]) for i in insns], [(8, assembly), (4, "s_endpgm")])
+                self.assertEqual(insns[0]["opcode"], assembly.split()[0])
+        refused = (
+            ("010042d700040e00", "v_interp_p1ll_f16"),  # p1ll with a third source
+            ("010142d700040200", "v_interp_p1ll_f16"),  # abs on the attribute operand
+            ("010043d741040e24", "v_interp_p1lv_f16"),  # neg on the attribute operand
+            ("01005ad782040e0c", "v_interp_p2_f16"),    # output modifier on p2
+            ("01005ad782fe0d04", "v_interp_p2_f16"),    # literal source
+        )
+        for raw, name in refused:
+            with self.subTest(refused=raw):
+                insns = disasm_rdna2(bytes.fromhex(raw) + endpgm)
+                self.assertEqual([(i["offset"], i["length"], i["opcode"]) for i in insns],
+                                 [(0, 8, f"{name}_unsupported"), (8, 4, "s_endpgm")])
+
     def test_hwreg_operands_use_llvm_spelling(self):
         """Issue #938: hwreg operands and s_setreg_imm32_b32 literals print as LLVM 15 prints them for gfx1013.
 
@@ -1798,6 +1834,48 @@ class TestRdna2Disasm(unittest.TestCase):
                     f"Instruction {i}: disasm_rdna2 '{rdna2_rec['assembly']}' does not match LLVM '{llvm_line}'"
                 )
 
+    def test_interp_f16_llvm_round_trip(self):
+        """Issue #938 step 2: the binary16 interpolation forms round-trip through LLVM 15 with every field intact.
+
+        Each line is assembled by llvm-mc, decoded by disasm_rdna2, compared with LLVM's text, and the decoded text
+        is assembled again and must give the same bytes. Neighbouring lines differ in one field (attribute,
+        channel, high, a source, a modifier, clamp or the output modifier), so a dropped or swapped field changes
+        the bytes. Inline-constant sources are left out: LLVM 15 prints them as `/*invalid immediate*/`, which it
+        cannot assemble again (test_interp_f16_uses_llvm_spelling pins that text).
+        """
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"interp round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        source = [
+            "v_interp_p1ll_f16 v1, v2, attr0.x",
+            "v_interp_p1ll_f16 v1, v2, attr1.x",          # attribute
+            "v_interp_p1ll_f16 v1, v2, attr1.y",          # channel
+            "v_interp_p1ll_f16 v1, v2, attr1.y high",     # high half
+            "v_interp_p1ll_f16 v1, s2, attr1.y high",     # SGPR source
+            "v_interp_p1ll_f16 v1, -|v2|, attr63.w clamp div:2",
+            "v_interp_p1lv_f16 v1, v2, attr1.y, v3",
+            "v_interp_p1lv_f16 v1, v3, attr1.y, v2",      # sources swapped
+            "v_interp_p1lv_f16 v1, v2, attr1.y, -v3 mul:4",
+            "v_interp_p1lv_f16 v255, |m0|, attr32.z, exec_lo high mul:2",
+            "v_interp_p2_f16 v1, v2, attr2.z, v3",
+            "v_interp_p2_f16 v1, v2, attr2.z, v3 high",
+            "v_interp_p2_f16 v1, -v2, attr2.z, |v3| clamp",
+            "v_interp_p2_f16 v200, vcc_lo, attr17.x, s105",
+            "s_endpgm",
+        ]
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        llvm_lines = llvm_disassemble(emitted, resolved_lib)
+        decoded = [rec["assembly"] for rec in disasm_rdna2(emitted)]
+        self.assertEqual(llvm_lines, source)
+        self.assertEqual(decoded, llvm_lines)
+        self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
+        records = [emitted[i:i + 8] for i in range(0, 8 * (len(source) - 1), 8)]
+        self.assertEqual(len(set(records)), len(records), "each line must encode differently")
+
     def test_hwreg_llvm_round_trip(self):
         """Issue #938: hwreg operands round-trip through LLVM 15 with register, offset and width intact.
 
@@ -2777,6 +2855,32 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(detect_shader_stage("cs_dispatch.bin"), "compute")
         self.assertEqual(detect_shader_stage("shaders/vertex/vs_main.s"), "vertex")
         self.assertEqual(detect_shader_stage("unknown_kernel.bin"), "other")
+
+    def test_binary_scan_recognizes_decoded_interp_f16(self):
+        """Issue #938 step 2: a scanned binary's binary16 interpolation forms reach the scanner by name.
+
+        The bytes are llvm-mc 15.0.7 (gfx1013) output for the commented lines. With the old `v_vop3_342`
+        spelling the scan reported unrecognized opcodes; now the opcodes are recognized and attributed to VINTRP,
+        and the program is a translator rejection, since pixel_aot does not lower these forms.
+        """
+        code = bytes.fromhex(
+            "010042d7c5050200"  # v_interp_p1ll_f16 v1, v2, attr5.w high
+            "010043d741040e94"  # v_interp_p1lv_f16 v1, v2, attr1.y, -v3 mul:4
+            "01825ad7ff05fe07"  # v_interp_p2_f16 v1, |v2|, attr63.w, v255 high clamp
+            "000081bf"          # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ps_interp_f16.bin"
+            path.write_bytes(code)
+            result, = scan_directory_or_files([path])
+        self.assertEqual(result["total_instructions"], 4)
+        self.assertTrue(result["opcodes_recognized"], result.get("unsupported_details"))
+        self.assertEqual(result["compatibility_category"], "opcode_recognized_translator_rejected")
+        self.assertFalse(any(name.startswith("v_vop3_") for name in result["opcode_distribution"]))
+        self.assertEqual({name for name in result["opcode_distribution"] if name.startswith("v_interp")},
+                         {"v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_interp_p2_f16"})
+        self.assertEqual({classify_isa_category(name) for name in ("v_interp_p1ll_f16", "v_interp_p2_f16")},
+                         {"VINTRP (Parameter Interpolation)"})
 
     def test_binary_scan_reports_decoded_hwreg_writes_as_supported(self):
         """Issue #938: a scanned binary's MODE rounding and FLAT_SCRATCH writes reach the scanner in LLVM's spelling.
