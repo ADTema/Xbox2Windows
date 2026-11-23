@@ -9,7 +9,7 @@ from spirv_sampler_views import split_sampler_views
 
 
 def check_sampler_rewrite(source):
-    # Use the fragment variant so the gather cases have implicit derivatives.
+    # Use the fragment variant: its ordinary sample is the implicit-LOD form.
     sample = "%raw = OpImageSampleImplicitLod %vec4 %si %uv"
     comparison = "%cmp = OpImageSampleDrefExplicitLod %float %si %uv %half Lod %lod"
     second = comparison.replace("%cmp =", "%cmp2 =")
@@ -28,6 +28,7 @@ def check_sampler_rewrite(source):
         assert ordinary in rewritten_lines, ordinary
         for instruction in comparisons:
             name = f"%bridge_cmp_{original_lines.index(instruction)}"
+            assert f"{name}_ptr = OpAccessChain %_ptr_UC_smp %bridge_cmp %i" in rewritten_lines, name
             expected = instruction.replace(" %si ", f" {name}_image ")
             assert expected in rewritten_lines, expected
             assert instruction not in rewritten_lines, instruction
