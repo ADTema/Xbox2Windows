@@ -107,7 +107,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: out/tools/spirv/bin
-          key: spirv-cli-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ hashFiles('tools/setup-spirv-tools.ps1') }}
+          key: spirv-cli-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ hashFiles('tools/setup-spirv-tools.ps1', 'tools/patches/spirv-cross-minlod.patch') }}
       - name: Build the pinned SPIR-V tools
         shell: pwsh
         run: .\tools\setup-spirv-tools.ps1
@@ -180,7 +180,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: out/tools/spirv/bin
-          key: spirv-cli-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ hashFiles('tools/setup-spirv-tools.ps1') }}
+          key: spirv-cli-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ hashFiles('tools/setup-spirv-tools.ps1', 'tools/patches/spirv-cross-minlod.patch') }}
       - name: Build the pinned SPIR-V tools
         shell: pwsh
         run: .\tools\setup-spirv-tools.ps1
