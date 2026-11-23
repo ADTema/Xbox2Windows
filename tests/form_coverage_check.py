@@ -548,6 +548,49 @@ def check_parsing():
     assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
 
 
+def check_junit_errors():
+    """An unusable JUnit file is reported as a one-line diagnostic with exit status 2, not a traceback.
+    The record window needs one CTest run, so a merged <testsuites> file is refused rather than guessed."""
+    import subprocess
+    tool = Path(fc.__file__)
+    valid = '<testsuite time="1" timestamp="2026-11-21T21:05:21"><testcase name="a" status="run"/></testsuite>'
+    cases = {
+        "missing.xml": (None, "No such file"),
+        "malformed.xml": ("not xml", "syntax error: line 1, column 0"),
+        "merged.xml": (f"<testsuites>{valid}</testsuites>", "expected one CTest <testsuite> root, found <testsuites>"),
+        "no_timestamp.xml": ('<testsuite time="1"><testcase name="a" status="run"/></testsuite>',
+                             "timestamp"),
+        "bad_time.xml": ('<testsuite time="soon" timestamp="2026-11-21T21:05:21"/>', "time"),
+        "valid.xml": (valid, None),
+    }
+    cases.update({
+        f"time_{value}.xml": (valid.replace('time="1"', f'time="{value}"'), "finite and nonnegative")
+        for value in ("nan", "inf", "-1")
+    })
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, (text, expected) in cases.items():
+            junit = Path(tmp) / name
+            if text is not None:
+                junit.write_text(text, encoding="utf-8")
+            if expected and text is not None and name != "malformed.xml":
+                try:
+                    fc.read_results(junit)
+                except ValueError as error:
+                    assert expected in str(error), (name, error)
+                else:
+                    raise AssertionError(f"{name}: read_results accepted an unusable JUnit file")
+            run = subprocess.run([sys.executable, "-B", str(tool), str(junit), "--records", tmp],
+                                 capture_output=True, text=True)
+            if expected is None:
+                assert run.returncode == 0, (name, run.returncode, run.stderr)
+                assert "Tests: 1 passed, 0 failed, 0 skipped." in run.stdout, run.stdout
+                continue
+            assert run.returncode == 2, (name, run.returncode, run.stderr)
+            assert "Traceback" not in run.stderr, (name, run.stderr)
+            assert run.stderr.startswith(f"form_coverage: {junit}: "), (name, run.stderr)
+            assert expected in run.stderr, (name, run.stderr)
+
+
 def check_gaps():
     reference = {("VOP1", "v_a"), ("VOP3", "v_a_e64"), ("VOP3", "v_b_e64"), ("VOP1", "v_c")}
     fixtures = {"passing": ({"v_a_e32"}, "pass"),
@@ -816,6 +859,7 @@ if __name__ == "__main__":
     check_sopk_wait_forms()
     check_s_version_form()
     check_parsing()
+    check_junit_errors()
     check_gaps()
     check_dashboard()
     check_avx2_regs()
