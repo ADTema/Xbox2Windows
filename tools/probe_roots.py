@@ -39,8 +39,9 @@ BITCAST_USE = re.compile(r'\bbitcast\b')
 GLOBAL_INITIALIZER = re.compile(
     r'^@(?:"[^"]+"|[\w.$-]+)\s*=\s*(?:global|constant|externally_initialized)\b')
 # Debug intrinsics take metadata operands that the runtime never reads, so an xbox.* symbol that
-# only appears inside one of these calls is not an executable use.
-DEBUG_INTRINSIC = re.compile(r'@llvm\.dbg\.(?:value|declare|assign|label)\b')
+# only appears inside one of these calls is not an executable use. Only the callee decides: a line
+# that merely mentions a debug intrinsic somewhere else is still an executable call.
+DEBUG_INTRINSIC = re.compile(r'llvm\.dbg\.(?:value|declare|assign|label)\b')
 XBOX_SYMBOL = re.compile(r"xbox\.[\w.$-]+")
 METADATA_STRING = re.compile(r'!"([^"]*)"')
 
@@ -105,14 +106,19 @@ def classify_line(line, calls, declarations, references):
         return
     is_call = CALL_INSTRUCTION.match(line) is not None
     operands_at = call_operand_paren(line) if is_call else -1
-    debug_call = is_call and DEBUG_INTRINSIC.search(line) is not None
-    callee_seen = False
+    callee_at = None
+    if is_call:
+        for match in CALLEE.finditer(line):
+            if operands_at < 0 or match.start() < operands_at:
+                callee_at = match.start()
+                callee_name = match.group(1) or match.group(2)
+                break
+    debug_call = callee_at is not None and DEBUG_INTRINSIC.match(callee_name) is not None
     for match in CALLEE.finditer(line):
         symbol = match.group(1) or match.group(2)
         if not symbol.startswith(XBOX_PREFIX):
             continue
-        if is_call and not callee_seen and (operands_at < 0 or match.start() < operands_at):
-            callee_seen = True
+        if match.start() == callee_at:
             calls[symbol] += 1
             continue
         if debug_call:
@@ -121,8 +127,12 @@ def classify_line(line, calls, declarations, references):
             kind = "call-operand"
         else:
             kind = reference_kind(line)
-        entry = references.setdefault(symbol, {"sites": 0, "kinds": set()})
-        entry["sites"] += 1
+        entry = references.setdefault(symbol, {"sites": 0, "debug_sites": 0, "kinds": set()})
+        # sites counts executable uses only; debug-only uses are counted apart.
+        if kind == "debug-only":
+            entry["debug_sites"] += 1
+        else:
+            entry["sites"] += 1
         entry["kinds"].add(kind)
 
 
@@ -151,7 +161,9 @@ def xbox_intrinsic_inventory(text):
         calls=dict(sorted(calls.items())),
         declarations=sorted(declarations),
         metadata_only=sorted(metadata_names - declarations - set(calls) - set(references)),
-        references={symbol: {"sites": item["sites"], "kinds": sorted(item["kinds"])}
+        references={symbol: {"sites": item["sites"],
+                              "debug_sites": item["debug_sites"],
+                              "kinds": sorted(item["kinds"])}
                     for symbol, item in sorted(references.items())},
     )
 

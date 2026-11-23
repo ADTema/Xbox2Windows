@@ -56,7 +56,9 @@ def decide(inventory, status_of=None):
 
     A call blocks, and so does every other form that keeps the symbol reachable: an alias, a
     stored pointer, a bitcast, a global initializer or a call operand. Each blocking entry names
-    its form, so a refusal says how the module still reaches the builtin. `status_of` is
+    its form, so a refusal says how the module still reaches the builtin. The one exception is
+    `debug-only`: a symbol carried solely by a debug intrinsic's metadata operands is not
+    executable use, so it is reported under `debug_only` and does not block. `status_of` is
     advisory: it fills `advisory` on each entry so a report can show what an adapter claims, and
     the verdict ignores it.
     """

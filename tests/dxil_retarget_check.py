@@ -590,6 +590,42 @@ define void @main() {
     # The same symbol stops being debug-only once an ordinary callee receives it.
     assert gate.check_text(call_operand_module)["verdict"] == gate.REJECT
 
+    # Only the callee decides: an ordinary callee whose argument happens to mention a debug
+    # intrinsic is still an executable call, so the symbol must block.
+    trap_module = ("declare void @consume(ptr, ptr)\n"
+                   "define void @main() {\n"
+                   "  call void @consume(ptr @xbox.foo, ptr bitcast (void()* @llvm.dbg.value to i8*))\n"
+                   "  ret void\n}\n")
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(trap_module), trap_module, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert stub.batches == [], "a call mentioning a debug intrinsic was submitted"
+    assert decision["blocking_references"][0]["form"] == "call-operand", decision
+    assert decision["debug_only"] == [], decision
+
+    # The other debug intrinsics are debug-only uses as well.
+    for intrinsic, signature in (("llvm.dbg.declare", "metadata, metadata, metadata"),
+                                 ("llvm.dbg.assign", "metadata, metadata, metadata, metadata, metadata, metadata")):
+        module_text = (f"declare void @{intrinsic}({signature})\n"
+                       "define void @main() {\n"
+                       f"  call void @{intrinsic}(metadata ptr @xbox.foo, metadata !0, metadata !1"
+                       f"{', metadata !0, metadata !1, metadata !0' if 'assign' in intrinsic else ''})\n"
+                       "  ret void\n}\n"
+                       "!0 = !{}\n"
+                       "!1 = !{}\n")
+        stub = RecordingSubmit()
+        decision = gate.gate_submission(gate.check_text(module_text), module_text, stub)
+        assert decision["verdict"] == gate.ALLOW, (intrinsic, decision)
+        assert decision["debug_only"] == ["xbox.foo"], (intrinsic, decision)
+        assert len(stub.batches) == 1, (intrinsic, decision)
+
+    # sites counts executable uses only; a debug-only use is counted apart.
+    debug_inventory = xbox_intrinsic_inventory(debug_only_module)
+    assert debug_inventory["references"]["xbox.foo"]["sites"] == 0, debug_inventory
+    assert debug_inventory["references"]["xbox.foo"]["debug_sites"] == 1, debug_inventory
+    # The archive filter counts anything reachable, debug-only included: skipping is conservative.
+    assert gate.reaches_xbox(debug_inventory) is True, debug_inventory
+
     # An advisory status cannot clear a reference the module still holds.
     stub = RecordingSubmit()
     claims = gate.status_table(["BFI"])
@@ -700,10 +736,12 @@ define void @main() {
           "global initializer, a function pointer in a slot, a call operand of an ordinary callee and a "
           "bitcast-spelled direct call each refused with their form named in 0 submissions, with calls "
           "and references listed apart; a debug intrinsic that only carries the symbol as metadata is "
-          "allowed and reported as debug-only; an advisory LOWERED status clears neither a call nor a "
-          "reference; the archive filter treats every form as reaching an intrinsic; a metadata string "
-          "that spells a call and a ';' inside a metadata string still pass; without --probe the CLI "
-          "records NOT_CHECKED and submits nothing")
+          "allowed and reported as debug-only, and so are llvm.dbg.declare and llvm.dbg.assign; an "
+          "ordinary call that merely mentions a debug intrinsic in an argument still blocks as "
+          "call-operand; an advisory LOWERED status clears neither a call nor a reference; sites counts "
+          "executable uses only while the archive filter treats every reachable form as reaching an "
+          "intrinsic; a metadata string that spells a call and a ';' inside a metadata string still "
+          "pass; without --probe the CLI records NOT_CHECKED and submits nothing")
     print("pure-python dxil_retarget controls: ok")
 
 
