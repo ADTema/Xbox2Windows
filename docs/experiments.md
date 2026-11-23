@@ -47,11 +47,35 @@ ctest --preset dev --no-tests=error -R '^cpu_native_archive_reader$' -V
 
 The [texture reader](../tests/cpu/archive/texture_reader.zig) selects a different publisher in the same Zig record loop. Each successful decode supplies one tightly packed 4×4 RGBA8 image to [consume_archive_texture](../tests/cpu/archive/texture.hpp). At pixel `(x, y)` the red channel cycles through the decoded bytes in row-major order, green is `85*x`, blue is `85*y`, and alpha is 255. Rows occupy 16 bytes. The consumer can use or copy the pixels during the call and returns zero on success. The fixture consumer writes those bytes to stdout.
 
-The [comparison](../tests/cpu/archive_texture_check.py) checks native Windows, the mapped reader and decoder, and the AOT reader and decoder against the known red samples and coordinate ramps. Two valid records produce 128 bytes. Reusing the first texture for the second would change nine red samples. With the second input truncated, blast emits one tentative byte internally. Only the first 64-byte texture reaches the consumer, both records are freed, and all three processes exit 2. GPU upload and frame readback are the next step in [#830](https://github.com/R0Y00/Xbox2Windows/issues/830).
+The [comparison](../tests/cpu/archive_texture_check.py) checks native Windows, the mapped reader and decoder, and the AOT reader and decoder against the known red samples and coordinate ramps. Two valid records produce 128 bytes. Reusing the first texture for the second would change nine red samples. With the second input truncated, blast emits one tentative byte internally. Only the first 64-byte texture reaches the consumer, both records are freed, and all three processes exit 2. [Drawing each record through D3D12](#drawing-each-archive-record-through-d3d12) adds GPU upload and frame readback.
 
 ```powershell
 cmake --build --preset release --target archive_texture_lifted pe_map
 ctest --preset release --no-tests=error -R '^cpu_archive_texture_publication$' -V
+```
+
+### Drawing each archive record through D3D12
+
+The same reader image also runs against a [GPU consumer](../tests/cpu/archive/texture_gpu.cpp) built as `archive_codec.dll` in `archive_gpu/`, next to copies of the reader and the blast DLL. The AOT reader links a GPU build of the codec with the translated decoder. On the first record the consumer creates one device, queue and pipeline. For each completed record it uploads the 4×4 texture, draws a full-target quad with a point-clamp sampler onto a 16×16 RGBA8 target, signals the next fence value, waits and writes the readback to stdout. After the last record, `completed()` calls `finish_archive_textures()`, which releases every object and reports the device's remaining references. The stdout consumer's version is empty, so the publication output above is unchanged. [`QuadFrames`](../tests/cpu/archive/quad_frames.hpp) holds the reusable device, pipeline and frame state. It accepts any copyable texture size and format and checks the source size against the copy footprint.
+
+The [comparison](../tests/cpu/archive_texture_gpu_check.py) runs native Windows, `pe_map` and AOT on WARP and on a physical adapter. Each pixel `(x, y)` must equal texel `(x/4, y/4)` of the independent texture reference. The stderr trace must contain the adapter and driver, which every run must report identically, the FNV-1a 64 hash of each staged texture, the completed fence values, the device references left after release, and the exit status. The three `X2W_ARCHIVE_TEXTURE_CASE` controls change only the second record.
+
+| Case | Frames | Trace and exit |
+|---|---|---|
+| Two valid records | Both match their references | Uploads of both textures, fences 1 and 2, `gpu release 0`, exit 0 |
+| Second record truncated | Only the first frame | One upload and fence 1. Both records are freed, the device is released once and the process exits 2 |
+| First record truncated | None | No device is created and nothing is released. The process exits 2 |
+| `stale`: the second upload is skipped | The second frame repeats the first and differs from its reference in 144 bytes (9 texels × 16 pixels) | `upload skipped`, fence 2, `gpu release 0`, exit 0 |
+| `fail`: the second texture is one byte short | Only the first frame | The copy-footprint check refuses the upload before any GPU work. The device is still released with no references left, and the consumer status reaches the exit as 4 |
+| `leak`: one more device object is never released | Both match their references | `gpu release 1`, which shows that the release count detects a leaked device object |
+
+The consumer and `QuadFrames` return errors instead of throwing C++ exceptions. In the mapped run, the codec DLL is mapped by `pe_map`. There, a C++ exception thrown and caught inside that DLL escaped the `catch` as `0xE06D7363`, while the same DLL loaded by Windows caught it. Structured exceptions are dispatched through the mapped image, as `cpu_native_seh` shows.
+
+On Windows 10 Pro 22H2 (build 19045) with MSVC 19.52, all 18 runs passed on the in-box WARP (driver 10.0.19041.7811) and on an NVIDIA GeForce RTX 3080 Ti (driver 32.0.16.1047), in the `dev` and `release` builds. The hardware test exits 77 without a physical D3D12 adapter.
+
+```powershell
+cmake --build --preset dev --target archive_texture_gpu_lifted archive_gpu_reader pe_map
+ctest --preset dev --no-tests=error -R '^cpu_archive_texture_gpu_(warp|hardware)$' -V
 ```
 
 ### Recompiling the blast decoder
