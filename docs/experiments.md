@@ -3897,6 +3897,32 @@ Contract boundaries and fixture choices:
 
 Run `ctest --preset dev --no-tests=error -R '^cpu_native_frame_events$' -V`.
 
+#### XG swizzle mode selection and texture computer (#870, #1032)
+
+The source-built XG swizzle fixture (`tests/cpu/xg_swizzle_caller.asm`, `tests/cpu/xg_swizzle_provider.cpp`, `tests/cpu/xg_swizzle_check.py`, CTest `cpu_native_xg_swizzle`) provides the PE loader, refusal sentinel and import-withholding test angle alongside #1032 (whose full 8-mip 21,845-texel layout reference uses pinned PC AddrLib from #979):
+- `XGSuggestSwizzleMode(desc, flags, out_layout)`: selects or validates the swizzle layout for a resource descriptor.
+- `XGCreateTextureComputer(desc, out_computer)`: instantiates a texture address computer (`IXGTextureComputer`) for subresource layout calculation, texel address mapping, and tiling/detiling copy operations.
+
+The supported call sequence reflects DirectXTex usage and public GDK issue references ([DirectXTex #498](https://github.com/microsoft/DirectXTex/issues/498)):
+1. `XGSuggestSwizzleMode` evaluates a `D3D12_RESOURCE_DESC` with an unknown input layout (`D3D12_TEXTURE_LAYOUT_UNKNOWN = 0`) and selector flag `0`.
+2. The caller exercises both a separate output pointer and an output pointer aliased to the descriptor's own `Layout` field (`&desc.Layout`), verifying both produce matching layout results (`0x105` per the fixture policy).
+3. The resulting descriptor is passed to `XGCreateTextureComputer`.
+4. `CopyIntoSubresource` uploads a generated 3-mip RGBA8 texture (28x4, 14x2, 7x1 = 147 texels) into tiled memory.
+5. `CopyFromSubresource` detiles all 147 texels back to linear memory with 100% round-trip fidelity.
+6. The small 147-texel Morton round-trip serves as an additional synthetic caller/provider check (disagreeing on 139 of 147 texels under Morton bit-interleaving and agreeing on 8). It is a caller/provider handshake check only, not an independent match to #979 and not evidence of console layout encoding.
+7. A linear control with `Layout = 1` (`ROW_MAJOR`) verifies 0 disagreements against linear layout.
+
+Contract boundaries and fixture choices:
+- **Established call shape**: `XGSuggestSwizzleMode(desc, 0, &out)` with separate and aliased output pointers, feeding the resulting layout into `XGCreateTextureComputer(desc, &comp)` for subresource copying.
+- **Fixture choices (explicitly labeled as fixture policy)**:
+  - Exposing these methods as PE imports from `xg_xs.dll` is a fixture choice.
+  - The hand-written layout values (`0x105`, `0x100`) and the Morton bit-order oracle are fixture policy for testing caller/provider interaction; see #1032 for the full texel reference using pinned PC AddrLib. Console-specific hardware encoding and non-zero flags require independent evidence before binding a production export.
+  - Invalid descriptor refusal: `Width == 0` returns `E_INVALIDARG` (`0x80070057`) leaving the output pointer/sentinel intact.
+  - Separate fault controls: `cpu_xg_swizzle_provider_clobber` tests refusal sentinel overwrite (specific exit `0xE01`), and `cpu_xg_swizzle_provider_linear` tests dummy linear fallback where tiled texels are copied without swizzling (specific exit `0xE04`).
+- **Loaders and withholding**: The fixture runs under native Windows (with and without a live worker thread) and under `pe_map`. Withholding `xg_xs.dll` halts `pe_map` at import resolution with `STATUS["unresolved"]`.
+
+Run `ctest --preset dev --no-tests=error -R '^cpu_native_xg_swizzle$' -V`.
+
 ### Attribute words at xmem call sites
 
 `tools/xmem_attribute_scan.py` reads a PE image without loading or running it. It reports the attribute word at each call or tail jump into `xmem.dll`'s `XMemAlloc` or `XMemFree`, from a normal or delay-load import. It finds sites reached through the IAT slot, through an import thunk, or through a register loaded from the slot.
