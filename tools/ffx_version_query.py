@@ -1610,11 +1610,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             elif kind == "f16c_pack":
                 if (i.op_count != 3 or
                     i.op0_kind != K.REGISTER or i.op1_kind != K.REGISTER or
-                    i.op0_register not in wide_xmm or i.op1_register not in wide_xmm):
+                    i.op0_register not in wide_xmm or i.op1_register not in wide_xmm or
+                    i.op2_kind != K.IMMEDIATE8 or i.immediate8 != 0):
                     raise ValueError(f"unsupported f16c pack at {i.ip:#x}: {i}")
-                imm = i.immediate(2)
                 dst, src = wide_xmm[i.op0_register], wide_xmm[i.op1_register]
-                stmt = (f"{{ __m128 s; memcpy(&s, {src}.data(), 16); const __m128i r = _mm_cvtps_ph(s, {imm}); "
+                stmt = (f"{{ __m128 s; memcpy(&s, {src}.data(), 16); const __m128i r = _mm_cvtps_ph(s, 0); "
                         f"std::array<uint8_t, 16> res{{}}; memcpy(res.data(), &r, 8); memcpy({dst}.data(), res.data(), 16); "
                         f"memset({dst}.data()+16, 0, 16); }}")
             elif kind == "ss2sd":

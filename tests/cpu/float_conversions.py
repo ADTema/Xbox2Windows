@@ -51,6 +51,10 @@ EXPORTS = (
 )
 EXPORT_NAMES = tuple(f"{op}_op" for op in EXPORTS)
 
+F16C_EXPORTS = {
+    "vcvtph2ps_op", "vcvtps2ph_op",
+}
+
 GPR_DEST_EXPORTS = {
     "cvtss2si_op", "cvtss2si_qword_op", "vcvtss2si_op", "vcvtss2si_qword_op",
     "cvttss2si_op", "cvttss2si_qword_op", "vcvttss2si_op", "vcvttss2si_qword_op",
@@ -65,7 +69,21 @@ GPR_SRC_EXPORTS = {
 
 
 def emit(image, output):
-    parts = [INTEGER_HEADER]
+    parts = [
+        INTEGER_HEADER,
+        'extern "C" __declspec(dllexport) int host_has_avx() {\n'
+        "    int regs[4]{};\n"
+        "    __cpuid(regs, 1);\n"
+        "    if ((regs[2] & (1 << 27)) == 0 || (regs[2] & (1 << 28)) == 0) return 0;\n"
+        "    return (_xgetbv(0) & 6ull) == 6ull;\n"
+        "}\n",
+        'extern "C" __declspec(dllexport) int host_has_f16c() {\n'
+        "    int regs[4]{};\n"
+        "    __cpuid(regs, 1);\n"
+        "    if ((regs[2] & (1 << 27)) == 0 || (regs[2] & (1 << 28)) == 0 || (regs[2] & (1 << 29)) == 0) return 0;\n"
+        "    return (_xgetbv(0) & 6ull) == 6ull;\n"
+        "}\n",
+    ]
     with pefile.PE(str(image), fast_load=True) as pe:
         for name in EXPORT_NAMES:
             (bounds,) = function_ranges(pe, export_rva(pe, name))
@@ -93,13 +111,14 @@ def aligned_buffer(data_bytes):
 
 
 def check(native_path, lifted_path):
-    # Rejection controls: reject YMM 256-bit width, memory operands, and untracked registers.
+    # Rejection controls: reject YMM 256-bit width, memory operands, untracked registers, and non-zero rounding mode immediates.
     unsupported_hex = (
-        "c5 fd 5b c1",  # vcvtps2dq ymm0, ymm1 (YMM 256-bit width)
-        "0f 5b 01",     # cvtdq2ps xmm0, [rcx] (memory operand)
-        "0f 5b c3",     # cvtdq2ps xmm0, xmm3 (untracked XMM register operand 1)
-        "0f 5b d8",     # cvtdq2ps xmm3, xmm0 (untracked XMM register destination)
-        "f3 0f 2d 01",  # cvtss2si eax, dword ptr [rcx] (memory operand on GPR dest)
+        "c5 fd 5b c1",     # vcvtps2dq ymm0, ymm1 (YMM 256-bit width)
+        "0f 5b 01",        # cvtdq2ps xmm0, [rcx] (memory operand)
+        "0f 5b c3",        # cvtdq2ps xmm0, xmm3 (untracked XMM register operand 1)
+        "0f 5b d8",        # cvtdq2ps xmm3, xmm0 (untracked XMM register destination)
+        "f3 0f 2d 01",     # cvtss2si eax, dword ptr [rcx] (memory operand on GPR dest)
+        "c4 e3 79 1d c8 01",  # vcvtps2ph xmm0, xmm1, 1 (non-zero rounding mode immediate rejected in first profile)
     )
     for raw in unsupported_hex:
         try:
@@ -109,7 +128,18 @@ def check(native_path, lifted_path):
         else:
             raise AssertionError(f"accepted unsupported instruction {raw}")
 
-    native, lifted = load_lib(native_path), load_lib(lifted_path)
+    lifted = load_lib(lifted_path)
+    lifted.host_has_avx.argtypes, lifted.host_has_avx.restype = [], ctypes.c_int
+    lifted.host_has_f16c.argtypes, lifted.host_has_f16c.restype = [], ctypes.c_int
+    if not lifted.host_has_avx():
+        print("Host CPU/OS lacks AVX (CPUID leaf 1 ECX bit 28 / XCR0 YMM); skipping native differential check.")
+        sys.exit(77)
+
+    has_f16c = bool(lifted.host_has_f16c())
+    if not has_f16c:
+        print("Host CPU lacks F16C (CPUID leaf 1 ECX bit 29); gating F16C exports, testing other conversions.")
+
+    native = load_lib(native_path)
 
     sentinel_a = b"\x5a" * 16
     sentinel_b = b"\xa5" * 16
@@ -156,6 +186,8 @@ def check(native_path, lifted_path):
 
         for name in EXPORT_NAMES:
             if name in GPR_SRC_EXPORTS:
+                continue
+            if name in F16C_EXPORTS and not has_f16c:
                 continue
             ctypes.memset(ptr_out_n, 0xaa, 32)
             ctypes.memset(ptr_out_l, 0x55, 32)
@@ -216,6 +248,8 @@ def check(native_path, lifted_path):
     raw_out_l, ptr_out_l = aligned_buffer(b"\x55" * 32)
     for name in EXPORT_NAMES:
         if name in GPR_SRC_EXPORTS:
+            continue
+        if name in F16C_EXPORTS and not has_f16c:
             continue
         ctypes.memset(ptr_out_n, 0xaa, 32)
         ctypes.memset(ptr_out_l, 0x55, 32)
