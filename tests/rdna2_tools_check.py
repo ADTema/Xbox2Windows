@@ -945,6 +945,79 @@ class TestRdna2Disasm(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     llvm_disassemble(bytes.fromhex(bad_hex), resolved_lib)
 
+    # Issue #938: VOPC SDWA scalar source codes 209-234 lie outside the supported LLVM 15 decoder subset.
+    # Accepted boundary records (codes 208 and 235), assembled by llvm-mc 15.0.7 for gfx1013 wave32.
+    SDWA_SCALAR_SUBSET_ACCEPTED = (
+        ("f904027cd0008606", "v_cmp_lt_f32_sdwa vcc_lo, -16, v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027ceb008606", "v_cmp_lt_f32_sdwa vcc_lo, src_shared_base, v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f9a0037c01000686", "v_cmp_lt_f32_sdwa vcc_lo, v1, -16 src0_sel:DWORD src1_sel:DWORD"),
+        ("f9d6037c01000686", "v_cmp_lt_f32_sdwa vcc_lo, v1, src_shared_base src0_sel:DWORD src1_sel:DWORD"),
+        ("f904887dd0868606", "v_cmp_gt_u32_sdwa s6, -16, v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f9d6a97d01000686", "v_cmpx_gt_u32_sdwa v1, src_shared_base src0_sel:DWORD src1_sel:DWORD"),
+    )
+    # The same records with the scalar code moved to 209 or 234 (no assembler spelling exists for these codes).
+    SDWA_SCALAR_SUBSET_REFUSED = (
+        "f904027cd1008606",  # v_cmp_lt_f32 SDWA, src0 = scalar code 209
+        "f904027cea008606",  # v_cmp_lt_f32 SDWA, src0 = scalar code 234
+        "f9a2037c01000686",  # v_cmp_lt_f32 SDWA, src1 = scalar code 209
+        "f9d4037c01000686",  # v_cmp_lt_f32 SDWA, src1 = scalar code 234
+        "f904887dd1868606",  # v_cmp_gt_u32 SDWA (sdst s6), src0 = scalar code 209
+        "f9d4a97d01000686",  # v_cmpx_gt_u32 SDWA, src1 = scalar code 234
+    )
+
+    def test_vopc_sdwa_scalar_codes_outside_llvm15_subset(self):
+        """Issue #938: refuse VOPC SDWA scalar codes 209-234 as 8-byte records and resync on the next dword."""
+        mov = bytes.fromhex("0403067e")  # v_mov_b32_e32 v3, v4
+        for raw_hex, expected in self.SDWA_SCALAR_SUBSET_ACCEPTED:
+            insns = disasm_rdna2(bytes.fromhex(raw_hex) + mov)
+            self.assertEqual(
+                [(i["offset"], i["length"], i["opcode"], i["assembly"]) for i in insns],
+                [(0, 8, expected.split()[0], expected), (8, 4, "v_mov_b32_e32", "v_mov_b32_e32 v3, v4")],
+                raw_hex,
+            )
+        subset_comment = "VOPC SDWA scalar operand outside the supported LLVM 15 decoder subset"
+        for raw_hex in self.SDWA_SCALAR_SUBSET_REFUSED:
+            insns = disasm_rdna2(bytes.fromhex(raw_hex) + mov)
+            self.assertEqual(
+                [(i["offset"], i["length"], i["opcode"]) for i in insns],
+                [(0, 8, "vopc_sdwa"), (8, 4, "v_mov_b32_e32")],
+                raw_hex,
+            )
+            self.assertIn("<unsupported SDWA>", insns[0]["assembly"], raw_hex)
+            self.assertEqual(insns[0]["comment"], subset_comment, raw_hex)
+            self.assertEqual(insns[1]["assembly"], "v_mov_b32_e32 v3, v4", raw_hex)
+
+        # Every code in 209-234 is refused as src0 and as src1, with or without input modifiers.
+        for code in range(209, 235):
+            for neg in (0, 1):
+                w1_src0 = code | (1 << 23) | (6 << 16) | (6 << 24) | (neg << 20)
+                w1_src1 = 1 | (1 << 31) | (6 << 16) | (6 << 24) | (neg << 28)
+                src0_record = struct.pack("<II", 0x7C0204F9, w1_src0)  # v_cmp_lt_f32 SDWA, vsrc1 = v2
+                src1_record = struct.pack("<II", 0x7C0200F9 | (code << 9), w1_src1)  # src0 = v1
+                for record in (src0_record, src1_record):
+                    insns = disasm_rdna2(record + mov)
+                    self.assertEqual(
+                        [(i["offset"], i["opcode"], i["comment"]) for i in insns],
+                        [(0, "vopc_sdwa", subset_comment), (8, "v_mov_b32_e32", insns[1]["comment"])],
+                        record.hex(),
+                    )
+                    self.assertEqual(insns[1]["assembly"], "v_mov_b32_e32 v3, v4", record.hex())
+
+    def test_vopc_sdwa_scalar_subset_matches_llvm(self):
+        """Issue #938: LLVM 15 decodes the boundary records and refuses scalar codes 209-234."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        mov = bytes.fromhex("0403067e")
+        for raw_hex, expected in self.SDWA_SCALAR_SUBSET_ACCEPTED:
+            with self.subTest(llvm_decoded=raw_hex):
+                self.assertEqual(llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib, offsets=True),
+                                 [(0, expected), (8, "v_mov_b32_e32 v3, v4")])
+        for raw_hex in self.SDWA_SCALAR_SUBSET_REFUSED:
+            with self.subTest(llvm_refused=raw_hex):
+                with self.assertRaisesRegex(ValueError, "at byte 0$"):
+                    llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib)
+
     def test_sop2_absdiff_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import SOP2_OPS
         expected_name, _ = SOP2_OPS[0x2c]
