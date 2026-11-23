@@ -4317,6 +4317,35 @@ ctest --preset dev --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
 ```
 
+### DirectStorage factory and queue adapter
+
+This fixture exercises the DirectStorage initialization sequence and submission controls. The source-built caller ([`dstorage_caller.asm`](../tests/cpu/dstorage_caller.asm)) imports `DStorageGetFactory` by name from `xcrdapi.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled adapter provider ([`dstorage_provider.cpp`](../tests/cpu/dstorage_provider.cpp)), it verifies factory acquisition, staging buffer configuration, queue creation, delayed submission, and exact readback:
+
+- **Public sources**:
+  - [Microsoft DirectStorage](https://github.com/microsoft/DirectStorage) (`include/dstorage.h`, MIT License) defines the public PC `IDStorageFactory` (`{6924ea0c-c3cd-4826-b10a-f64f4ed927c1}`), `IDStorageQueue` (`{cf90e079-90c1-4320-be50-b01ec69e0637}`), `DSTORAGE_QUEUE_DESC`, `DSTORAGE_REQUEST`, and public COM vtable slot orders.
+  - [Microsoft Learn GDK DirectStorage Overview](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/console/storage/directstorage/directstorage-overview) describes factory acquisition, staging buffer allocation, queue dispatch, delayed submit, and auto-submission thresholds.
+
+- **Convention vs Evidence**:
+  - **Public DirectStorage evidence**: the header identifies the PC `IDStorageFactory` interface. The GDK documentation describes explicit submission and the half-capacity auto-submission threshold. The recorder's PC IID refusal and unchanged output pointer are fixture behavior.
+  - **Recorder convention**: Fresh fixture-owned interface identifiers `IID_FixtureFactory` (`{ca891497-6f8f-4d03-b1a2-f239b4ce41af}`) and `IID_FixtureQueue` (`{82af1362-6445-4b96-9fbf-5d2d416b605e}`); mock provider structures; 32 MiB staging buffer configuration; and the adapter vtable layout (slot 3 `CreateQueue`, slot 8 `SetStagingBufferSize`, slot 3 `EnqueueRequest`, slot 6 `Submit` following the recorder convention). A public source would be needed before a fixture or production adapter presents other IDs or slots as a platform contract. Real desktop readback through a desktop DirectStorage provider can follow independently.
+  - **Windows runtime evidence**: Export binding of `xcrdapi.dll!DStorageGetFactory` and `cpu_exe_io.dll!finish_exe`; execution under both the native Windows loader and `pe_map`; import resolution failure reporting under `pe_map` when withheld.
+
+- **Verified cases**:
+  - **Case 1 (Success path reaches submit with exact readback)**: `DStorageGetFactory` queries `IID_FixtureFactory`, configures a 32 MiB staging buffer via `SetStagingBufferSize(0x2000000)` (vtable slot 8), creates a queue with descriptor `DSTORAGE_QUEUE_DESC` via `CreateQueue` (vtable slot 3) under `IID_FixtureQueue`, enqueues a memory request with destination buffer, verifies the delayed-submit negative control, explicitly submits via `Submit()` (vtable slot 6), verifies exact readback data transfer into destination buffer, releases objects, and exits with code `0x870`.
+  - **Case 2 (PC interface refusal)**: Requesting the public MIT DirectStorage PC `IDStorageFactory` interface (`{6924ea0c-c3cd-4826-b10a-f64f4ed927c1}`) returns `E_NOINTERFACE` and leaves the caller's output pointer untouched.
+  - **Case 3 (Factory failure refusal)**: When factory acquisition fails or is refused, the sequence aborts with exit code `0x301` leaving queues uncreated.
+  - **Case 4 (Queue failure refusal)**: When queue creation fails, the sequence aborts with exit code `0x303` with staging buffer configuration preserved.
+  - **Delayed-submit negative control**: Confirms that staged requests below the queue's half-capacity threshold remain pending and destination buffer bytes remain unmodified (`0xAA`) prior to explicit `Submit()`. Calling `Submit()` completes the staged request and sets completion.
+  - **Eager-provider negative control**: A faulty provider that completes prematurely on `EnqueueRequest` prior to `Submit()` is detected and rejected with exit code `0x304`.
+  - **Changed-IID patch control**: Patching the requested factory interface in the caller binary causes `DStorageGetFactory` to fail with `E_NOINTERFACE`, exiting with `0x301` under both loaders.
+
+On success, the caller exits with `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process cleanly with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return across all cases. An independent negative control confirms that withholding `DStorageGetFactory` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_dstorage$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_dstorage$' -V
+```
+
 ### Grouped allocation descriptor builders
 
 In the inspected Bink image, the function interval beginning at RVA `0x67c0` contains direct calls to the group initializer (`0x25b80`), append helper (`0x25b20`) and grouped allocator (`0x25a40`). The initializer places two adjacent arrays after a 64-byte header. Each successful append records a destination and a padded stride. With five available slots, requests of 0, 33, 1, 1025 and 32 bytes produced strides of 32, 64, 128, 1280 and 512 bytes in order. The stride in 32-byte units is congruent to the previous total in units plus one, modulo 32. All five stored strides were even. These helpers do not establish who produces odd tagged entries.
