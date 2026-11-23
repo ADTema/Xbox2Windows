@@ -2827,6 +2827,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_delay_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_delay_route>" "$<TARGET_FILE:cpu_delay_provider>"
         "$<TARGET_FILE:cpu_delay_provider_altered>")
+    add_library(cpu_tools_mem_provider SHARED tests/cpu/tools_mem_provider.cpp tests/cpu/tools_mem_provider.def)
+    add_library(cpu_tools_mem_provider_devkit SHARED tests/cpu/tools_mem_provider.cpp
+        tests/cpu/tools_mem_provider_devkit.def)
+    target_compile_definitions(cpu_tools_mem_provider_devkit PRIVATE TOOLS_PARTITION_PRESENT)
+    add_executable(cpu_tools_mem_caller tests/cpu/tools_mem_caller.asm)
+    set_target_properties(cpu_tools_mem_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_tools_mem_caller PRIVATE /ENTRY:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_tools_mem_caller PRIVATE cpu_tools_mem_provider)
+    add_test(NAME cpu_native_tools_mem COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/tools_mem_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_tools_mem_caller>" "$<TARGET_FILE:cpu_tools_mem_provider>"
+        "$<TARGET_FILE:cpu_tools_mem_provider_devkit>")
     add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")
