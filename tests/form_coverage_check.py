@@ -369,12 +369,14 @@ def check_shader_records():
     assert len(int64) == len(ops64) * 2, sorted(int64)
     int_compares = narrow_int | int64
     f16_compares = {f"v_cmp_{op}_f16" for op in pixel.PREDICATES} | {"v_cmp_class_f16"}
-    compare_forms = ({("VOPC", form) for form in int_compares | f16_compares}
-                     | {("VOP3", f"{form}_e64") for form in int_compares | f16_compares})
-    # Each name is counted once as VOPC and once as VOP3; the three sets must not share a name.
-    assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares)), len(compare_forms)
+    f32_compares = {f"v_cmp_{op}_f32" for op in pixel.PREDICATES} | {"v_cmp_class_f32"}
+    all_compares = int_compares | f16_compares | f32_compares
+    compare_forms = ({("VOPC", form) for form in all_compares}
+                     | {("VOP3", f"{form}_e64") for form in all_compares})
+    # Each name is counted once as VOPC and once as VOP3; the four sets must not share a name.
+    assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares) + len(f32_compares)), len(compare_forms)
     compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_i32", "v_cmpx_lt_i64", "v_cmpx_lt_u64",
-                          "v_cmp_class_f64", "v_cmp_lt_f64"}
+                          "v_cmpx_lt_f32", "v_cmp_class_f64", "v_cmp_lt_f64"}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert compare_forms | {("VOPC", n) for n in compare_neighbours} <= reference, name

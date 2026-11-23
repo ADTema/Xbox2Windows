@@ -1400,6 +1400,19 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *,
     raise ValueError(f"Unsupported arithmetic operand {token}")
 
 
+
+def f32_comparison(op, tokens, scalar, vector, pending, sample_dest):
+    values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
+    predicate = COMPARE[op].format(*values)
+    if op not in ("lt", "eq", "le", "gt", "lg", "ge"):
+        return predicate
+    # Inspect the original bits. The sign modifiers preserve NaN classification,
+    # but a backend can fold relations such as -abs(x) <= 2.0 even when x is NaN.
+    bits = [fp_operand(t, scalar, vector, pending, sample_dest, ignore_sign=True) for t in tokens]
+    ordered = " && ".join(f"((asuint({f}) & 0x7fffffffu) <= 0x7f800000u)" for f in bits)
+    return f"({ordered} && ({predicate}))"
+
+
 def low16_name(token, vector):
     """Return the HLSL variable of a VGPR that holds only a defined low half, else None.
 
@@ -3282,10 +3295,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
+            expr = f32_comparison(op, tokens, scalar, vector, pending, sample_dest)
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
-            lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+            lines.append(f"    bool cmp{i} = {expr};")
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f16(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, enc, dst, *tokens = m.groups()
             check_vopc_e32_dst(enc, dst)
@@ -3372,10 +3385,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
+            expr = f32_comparison(op, tokens, scalar, vector, pending, sample_dest)
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
-            lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+            lines.append(f"    bool cmp{i} = {expr};")
         elif m := match(rf"v_cndmask_b32(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+), {LANE_MASK}"):
             dst, unset, chosen, source = m.groups()
             regs = lane_mask(source)
