@@ -903,8 +903,10 @@ uint mul_hi_i32(uint a, uint b) {
         "        int y = asint(((b >> (k * 8u)) & 0xffu) << 24) >> 24;\n"
         "        sum += x * y;\n"
         "    }\n"
-        "    uint2 s = dot_i64_add(dot_i64_add(uint2(0u, 0u), asint(c)), sum);\n"
-        "    return sat ? dot_i64_sat(s) : s.x;\n"
+        "    uint r = c + asuint(sum);\n"
+        "    if (sat && asint(c) >= 0x40000000 && asint(r) < 0) return 0x7fffffffu;\n"
+        "    if (sat && asint(c) < -0x40000000 && asint(r) >= 0) return 0x80000000u;\n"
+        "    return r;\n"
         "}"
     ),
     "v_dot4_u32_u8": (
@@ -925,8 +927,10 @@ uint mul_hi_i32(uint a, uint b) {
         "        int y = asint(((b >> (k * 4u)) & 0xfu) << 28) >> 28;\n"
         "        sum += x * y;\n"
         "    }\n"
-        "    uint2 s = dot_i64_add(dot_i64_add(uint2(0u, 0u), asint(c)), sum);\n"
-        "    return sat ? dot_i64_sat(s) : s.x;\n"
+        "    uint r = c + asuint(sum);\n"
+        "    if (sat && asint(c) >= 0x40000000 && asint(r) < 0) return 0x7fffffffu;\n"
+        "    if (sat && asint(c) < -0x40000000 && asint(r) >= 0) return 0x80000000u;\n"
+        "    return r;\n"
         "}"
     ),
     "v_dot8_u32_u4": (
