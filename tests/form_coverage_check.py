@@ -308,6 +308,9 @@ def check_shader_records():
     assert len(sdwa_integer_forms) == 15
     # gfx10 encodes the carry-out add and subtracts as VOP3 only, under their plain names.
     carry_out_forms = {("VOP3", "v_add_co_u32"), ("VOP3", "v_sub_co_u32"), ("VOP3", "v_subrev_co_u32")}
+    # The carry-in add and subtracts in both the VOP2 (e32) and the VOP3 (e64) encoding.
+    carry_in_forms = {(group, f"v_{op}_co_ci_u32{suffix}") for op in ("add", "sub", "subrev")
+                      for group, suffix in (("VOP2", ""), ("VOP3", "_e64"))}
     sad_forms = {("VOP3", "v_sad_hi_u8"), ("VOP3", "v_sad_u32"), ("VOP3", "v_msad_u8")}
     mul24_forms = {
         ("VOP2", "v_mul_i32_i24"), ("VOP3", "v_mul_i32_i24_e64"),
@@ -346,6 +349,7 @@ def check_shader_records():
         e64_spelling_forms = {("VOP3", "v_interp_p1_f32_e64"), ("VOP3", "v_interp_p2_f32_e64"), ("VOP3", "v_nop_e64")}
         assert e64_spelling_forms <= covered, (name, e64_spelling_forms - covered)
         assert carry_out_forms <= covered, (name, carry_out_forms - covered)
+        assert carry_in_forms <= covered, (name, carry_in_forms - covered)
         assert sad_forms <= covered, (name, sad_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
@@ -369,12 +373,14 @@ def check_shader_records():
     assert len(int64) == len(ops64) * 2, sorted(int64)
     int_compares = narrow_int | int64
     f16_compares = {f"v_cmp_{op}_f16" for op in pixel.PREDICATES} | {"v_cmp_class_f16"}
-    compare_forms = ({("VOPC", form) for form in int_compares | f16_compares}
-                     | {("VOP3", f"{form}_e64") for form in int_compares | f16_compares})
-    # Each name is counted once as VOPC and once as VOP3; the three sets must not share a name.
-    assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares)), len(compare_forms)
+    f32_compares = {f"v_cmp_{op}_f32" for op in pixel.PREDICATES} | {"v_cmp_class_f32"}
+    all_compares = int_compares | f16_compares | f32_compares
+    compare_forms = ({("VOPC", form) for form in all_compares}
+                     | {("VOP3", f"{form}_e64") for form in all_compares})
+    # Each name is counted once as VOPC and once as VOP3; the four sets must not share a name.
+    assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares) + len(f32_compares)), len(compare_forms)
     compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_i32", "v_cmpx_lt_i64", "v_cmpx_lt_u64",
-                          "v_cmp_class_f64", "v_cmp_lt_f64"}
+                          "v_cmpx_lt_f32", "v_cmp_class_f64", "v_cmp_lt_f64"}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert compare_forms | {("VOPC", n) for n in compare_neighbours} <= reference, name

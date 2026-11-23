@@ -2309,19 +2309,33 @@ class TestRdna2Scanner(unittest.TestCase):
         """Vector compare opcodes with type suffixes must classify as VOPC, not VALU."""
         for opcode in ("v_cmp_lt_f32", "v_cmp_eq_u32", "v_cmp_gt_i32", "v_cmp_le_f16"):
             self.assertEqual(classify_isa_category(opcode), "VOPC (Vector Compare)", opcode)
+        for pred in ("f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru"):
+            self.assertEqual(classify_isa_category(f"v_cmp_{pred}_f32"), "VOPC (Vector Compare)")
         self.assertEqual(classify_isa_category("v_add_f32"), "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)")
 
     def test_vopc_e32_destination_must_be_vcc(self):
         """An explicit _e32 compare may only write vcc; suffix-less and _e64 may name an SGPR."""
-        families = [f"v_cmp_{op}_{kind}" for kind in ("f32", "f16", "i32", "u32", "i16", "u16")
+        families = [f"v_cmp_{op}_{kind}" for kind in ("f16", "i32", "u32", "i16", "u16")
                     for op in ("lt", "eq")] + ["v_cmp_class_f32", "v_cmp_class_f16"]
-        for name in families:
+        f32_predicates = [f"v_cmp_{op}_f32" for op in ("f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru")]
+        for name in set(families) | set(f32_predicates):
             for dst in ("s52", "s[52:53]"):
                 self.assertFalse(is_instruction_supported(f"{name}_e32 {dst}, s44, v18"), (name, dst))
                 self.assertTrue(is_instruction_supported(f"{name} {dst}, s44, v18"), (name, dst))
                 self.assertTrue(is_instruction_supported(f"{name}_e64 {dst}, s44, v18"), (name, dst))
             for dst in ("vcc", "vcc_lo"):
                 self.assertTrue(is_instruction_supported(f"{name}_e32 {dst}, s44, v18"), (name, dst))
+
+    def test_f32_vector_compares_recognition(self):
+        """All 16 binary32 vector compare predicates must be recognized in base opcodes and instruction forms."""
+        for op in ("f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru"):
+            base = f"v_cmp_{op}_f32"
+            self.assertTrue(is_opcode_recognized(base), f"Base opcode not recognized: {base}")
+            self.assertTrue(is_opcode_recognized(f"{base}_e32"), f"e32 not recognized: {base}_e32")
+            self.assertTrue(is_opcode_recognized(f"{base}_e64"), f"e64 not recognized: {base}_e64")
+            self.assertTrue(is_instruction_supported(f"{base}_e32 vcc_lo, s44, v18"))
+            self.assertTrue(is_instruction_supported(f"{base}_e64 s52, -s44, |v18|"))
+            self.assertTrue(is_instruction_supported(f"{base}_sdwa vcc_lo, s44, v18 src0_sel:DWORD src1_sel:DWORD"))
 
     def test_vop3p_classification(self):
         """Packed and mixed-precision opcodes must classify as VOP3P."""
@@ -2896,10 +2910,36 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_add_co_u32 v1, vcc, v2, v3 clamp",
             "v_sub_co_u32 v1, vcc, -v2, v3",
             "v_add_co_u32 v1, vcc, v2",
-            "v_add_co_ci_u32_e64 v1, vcc, v2, v3, vcc",
+            "v_add_co_ci_u32_e64 v1, vcc, v2, v3, vcc, vcc",
         ):
             self.assertFalse(is_instruction_supported(line), line)
         for opcode in ("v_add_co_u32", "v_sub_co_u32", "v_subrev_co_u32"):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
+        for line in (
+            "v_add_co_ci_u32_e32 v1, vcc_lo, s2, v3, vcc_lo",
+            "v_sub_co_ci_u32_e32 v1, vcc, 0x12345678, v3, vcc",
+            "v_subrev_co_ci_u32_e32 v1, vcc_lo, -16, v3, vcc_lo",
+            "v_add_co_ci_u32_e64 v1, vcc, v2, v3, vcc",
+            "v_sub_co_ci_u32_e64 v1, s5, s2, 7, s6",
+            "v_subrev_co_ci_u32_e64 v1, s[4:5], v2, 2.0, s[6:7]",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_add_co_ci_u32 v1, vcc_lo, v2, v3, vcc_lo",
+            "v_add_co_ci_u32_e32 v1, vcc_lo, v2, s3, vcc_lo",
+            "v_sub_co_ci_u32_e32 v1, s5, v2, v3, vcc_lo",
+            "v_subrev_co_ci_u32_e32 v1, vcc_lo, v2, v3, s6",
+            "v_add_co_ci_u32_e64 v1, s5, v2, v3, s6 clamp",
+            "v_sub_co_ci_u32_e64 v1, s5, -v2, v3, s6",
+            "v_subrev_co_ci_u32_e64 v1, exec_lo, v2, v3, s6",
+            "v_add_co_ci_u32_e64 v1, s5, v2, v3, v6",
+            "v_add_co_ci_u32_e64 v1, s5, v2, v3",
+            "v_add_co_ci_u32_dpp v1, vcc_lo, v2, v3, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+            "v_add_co_ci_u32_sdwa v1, vcc_lo, v2, v3, vcc_lo dst_sel:DWORD dst_unused:UNUSED_PAD "
+            "src0_sel:DWORD src1_sel:DWORD",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
         for line in (
             "v_cvt_pk_u16_u32 v1, v2, v3",

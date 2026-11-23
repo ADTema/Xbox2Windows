@@ -103,7 +103,7 @@ def labelled(decoded):
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
-          source_stride=None, cpu="gfx1013"):
+          source_stride=None, cpu="gfx1013", lds_bytes=0):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
@@ -146,6 +146,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     loading = {}
     stores = []
     ds_steps = []
+    lds_enabled = ds_group and 128 <= lds_bytes <= 65536
+    lds_word = None
     ds_wait = False
     written_spans = []
     layout = None
@@ -358,6 +360,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if ds_group and dst <= 255 and shift == 2 and isinstance(tag, tuple) and tag[0] == "ds_lane":
                 vector[dst] = ("ds_address", tag[1])
                 continue
+            if lds_enabled and dst <= 255 and shift == 2 and tag == ("local", 0):
+                vector[dst] = ("lds_address",)
+                continue
             # The element and row checks at the store bound the shift.
             if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
                 raise ValueError("Unverified dispatch byte offset")
@@ -378,6 +383,29 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                                    f"    GroupMemoryBarrierWithGroupSync();\n"
                                    f"    uint {result} = {slot}[(local.x + {bias}u) & 31u];"))
             vector[dst] = ("alu", result)
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_write_b32 v(\d+), v(\d+)", line):
+            addr, src = map(int, m.groups())
+            value = vector.get(src)
+            if (not lds_enabled or guard_span is not None or max(addr, src) > 255
+                    or vector.get(addr) != ("lds_address",) or not is_word(value)):
+                raise ValueError("Unverified private LDS write")
+            # Every lane owns one disjoint word. Capture the written value even if the source is overwritten.
+            lds_word = value
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_read_(b32|u16) v(\d+), v(\d+)(?: offset:(2))?", line):
+            op, dst, addr, offset = m[1], int(m[2]), int(m[3]), m[4]
+            if (not lds_enabled or guard_span is not None or max(dst, addr) > 255
+                    or vector.get(addr) != ("lds_address",) or lds_word is None or (op == "b32" and offset)):
+                raise ValueError("Unverified private LDS read")
+            if op == "b32":
+                vector[dst] = lds_word
+            else:
+                shift = 16 if offset else 0
+                expression = f"(({hlsl_word(lds_word)} >> {shift}u) & 0xffffu)"
+                if len(expression) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("LDS expression exceeds the profile limit")
+                vector[dst] = ("alu", expression)
             ds_wait = True
         elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), v(\d+), (\d+), v(\d+)", line):
             dst, row, shift, column = map(int, m.groups())
@@ -561,6 +589,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--llvm", required=True)
     parser.add_argument("--cpu", choices=("gfx1013", "gfx1030"), default="gfx1013")
+    parser.add_argument("--lds-bytes", type=int, default=0, help="Known native group LDS allocation")
     parser.add_argument("--table-reg", type=int, required=True)
     parser.add_argument("--descriptor-offset", type=lambda n: int(n, 0), required=True)
     parser.add_argument("--constant-descriptor", type=lambda n: int(n, 0), help="Table byte offset bound to b0")
@@ -584,7 +613,7 @@ def main():
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
-                   source_stride=args.source_stride, cpu=args.cpu)
+                   source_stride=args.source_stride, cpu=args.cpu, lds_bytes=args.lds_bytes)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
