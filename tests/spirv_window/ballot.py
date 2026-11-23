@@ -34,11 +34,16 @@ def emit(directory, assembler, validator, cross):
                .replace("%i =", "%lane =")
                .replace(" %i\n", " %lane\n")
                .replace("%zero", "%output_zero")
+               .replace("%one", "%output_one")
                .replace("%main = OpFunction", "%main =  OpFunction"))
     variant = directory / "ballot-renamed.spvasm"
     variant.write_text(renamed)
+    lowered = lower_ballot_extract(renamed)
+    # The variant is valid SPIR-V even unlowered, so check that the extraction was replaced.
+    assert "OpGroupNonUniformBallotBitExtract" not in lowered
+    assert "OpVectorExtractDynamic %uint %input_mask" in lowered
     variant_adapted = directory / "ballot-renamed-logical.spvasm"
-    variant_adapted.write_text(lower_ballot_extract(renamed))
+    variant_adapted.write_text(lowered)
 
     adapted = directory / "logical.spvasm"
     adapted.write_text(lower_ballot_extract(original))
