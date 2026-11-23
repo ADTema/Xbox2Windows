@@ -3483,6 +3483,49 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             result = sdwa_dest(f"({template.format(*args)})", dst_sel, unused, vector.get(dst))
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({result});")
+        elif m := match(r"v_(lshlrev_b64|lshrrev_b64|ashrrev_i64)(?:_e64)? (v\[\d+:\d+\]), ([^,\s]+), ([^,\s]+)"):
+            # VOP3 64-bit shifts (issue #928): D = S1 << S0[5:0], S1 >> S0[5:0], or signext(S1) >> S0[5:0]
+            # (AMD RDNA 2 ISA §12.12, opcodes 767-769). The 64-bit value is two 32-bit words. Both source words
+            # are read into temporaries before the destination pair is written, so the in-place form keeps the
+            # original value, and no 32-bit HLSL shift ever receives a count of 32 or more.
+            op, dst, amount, value = m.groups()
+            first, last = (int(n) for n in re.fullmatch(r"v\[(\d+):(\d+)\]", dst).groups())
+            names = (f"v{first}", f"v{last}")
+            if mask != "entry" or last != first + 1 or last > 255 or any(n in sample_dest for n in names):
+                raise ValueError(f"Invalid 64-bit shift destination: {line}")
+            if re.search(r"\||abs\(|neg\(|^-[vs]", amount) or re.search(r"\||abs\(|neg\(|^-[vs]", value):
+                raise ValueError(f"Source modifiers are not allowed on a 64-bit shift: {line}")
+            # The ISA allows one scalar broadcast constant: an SGPR, an SGPR pair or a literal.
+            scalar_like = [bool(re.fullmatch(r"s\d+|s\[\d+:\d+\]|0x[0-9a-f]+", t)) for t in (amount, value)]
+            if all(scalar_like):
+                raise ValueError(f"A 64-bit shift reads at most one scalar or literal source: {line}")
+            if not re.fullmatch(r"v\d+|s\d+|-?\d+|0x[0-9a-f]{1,8}", amount) or (
+                    re.fullmatch(r"-?\d+", amount) and not -16 <= int(amount) <= 64):
+                raise ValueError(f"Invalid 64-bit shift amount: {amount}")
+            count = int_operand(amount, scalar, vector, pending, sample_dest, signed=False)
+            low, high = int64_operand(value, scalar, vector, pending, sample_dest, signed=False,
+                                      encoding="e64", position=1)
+            lines.append(f"    uint sh{i} = {count} & 63u;")
+            lines.append(f"    uint sb{i} = sh{i} & 31u;")
+            lines.append(f"    uint sc{i} = (32u - sb{i}) & 31u;")
+            lines.append(f"    uint lo{i} = {low};")
+            lines.append(f"    uint hi{i} = {high};")
+            if op == "lshlrev_b64":
+                lines.append(f"    uint cy{i} = sb{i} == 0u ? 0u : (lo{i} >> sc{i});")
+                result_lo = f"(sh{i} < 32u ? (lo{i} << sb{i}) : 0u)"
+                result_hi = f"(sh{i} < 32u ? ((hi{i} << sb{i}) | cy{i}) : (lo{i} << sb{i}))"
+            else:
+                lines.append(f"    uint cy{i} = sb{i} == 0u ? 0u : (hi{i} << sc{i});")
+                if op == "lshrrev_b64":
+                    shifted_hi, fill = f"(hi{i} >> sb{i})", "0u"
+                else:
+                    shifted_hi, fill = f"asuint(asint(hi{i}) >> sb{i})", f"asuint(asint(hi{i}) >> 31u)"
+                result_lo = f"(sh{i} < 32u ? ((lo{i} >> sb{i}) | cy{i}) : {shifted_hi})"
+                result_hi = f"(sh{i} < 32u ? {shifted_hi} : {fill})"
+            lines.append(f"    precise float alu{i}_lo = asfloat({result_lo});")
+            lines.append(f"    precise float alu{i}_hi = asfloat({result_hi});")
+            vector[names[0]] = f"alu{i}_lo"
+            vector[names[1]] = f"alu{i}_hi"
         elif m := match(rf"v_({'|'.join(INTEGER)})(?:_(e32|e64))? (v\d+), (.+)"):
             op, encoding, dst, sources = m.groups()
             tokens = sources.split(", ")
