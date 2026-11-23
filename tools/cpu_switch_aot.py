@@ -192,7 +192,7 @@ STRING_TRANSFERS = {
 # which only read them.
 FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
                 M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -911,46 +911,51 @@ class Lifter:
         code = CONDITIONS.get(jcc.condition_code)
         width = self.width(producer)
         u, s = unsigned(width), signed(width)
+        a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
+        sign = f"{1 << (width * 8 - 1):#x}ull"
         if producer.mnemonic in (M.CMP, M.SUB):
-            a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
-            result = f"static_cast<{s}>(static_cast<{u}>({a} - {b}))"
+            flag_result = f"static_cast<{u}>({a} - {b})"
+            overflow = f"((({a} ^ {b}) & ({a} ^ {flag_result}) & {sign}) != 0)"
             table = {"e": f"{a} == {b}", "ne": f"{a} != {b}", "b": f"{a} < {b}", "ae": f"{a} >= {b}",
                      "be": f"{a} <= {b}", "a": f"{a} > {b}", "l": f"static_cast<{s}>({a}) < static_cast<{s}>({b})",
                      "ge": f"static_cast<{s}>({a}) >= static_cast<{s}>({b})",
                      "le": f"static_cast<{s}>({a}) <= static_cast<{s}>({b})",
                      "g": f"static_cast<{s}>({a}) > static_cast<{s}>({b})",
-                     "s": f"{result} < 0", "ns": f"{result} >= 0"}
+                     "s": f"static_cast<{s}>({flag_result}) < 0", "ns": f"static_cast<{s}>({flag_result}) >= 0"}
         else:
-            result = f"static_cast<{u}>(fa)"
-            table = {"e": f"{result} == 0", "ne": f"{result} != 0",
-                     "s": f"static_cast<{s}>({result}) < 0", "ns": f"static_cast<{s}>({result}) >= 0"}
+            if producer.mnemonic == M.ADD:
+                flag_result = f"static_cast<{u}>({a} + {b})"
+                overflow = f"((~({a} ^ {b}) & ({a} ^ {flag_result}) & {sign}) != 0)"
+            else:
+                flag_result = f"static_cast<{u}>(fa)"
+                if producer.mnemonic in (M.INC, M.NEG):
+                    overflow = f"{flag_result} == {sign}"
+                elif producer.mnemonic == M.DEC:
+                    overflow = f"{flag_result} == {((1 << (width * 8 - 1)) - 1):#x}ull"
+                else:
+                    overflow = "false"  # TEST, AND, OR and XOR clear OF.
+            s_cond = f"static_cast<{s}>({flag_result}) < 0"
+            ns_cond = f"static_cast<{s}>({flag_result}) >= 0"
+            table = {"e": f"{flag_result} == 0", "ne": f"{flag_result} != 0", "s": s_cond, "ns": ns_cond}
             if producer.mnemonic in (M.TEST, M.AND, M.OR, M.XOR):
                 # Logical operations clear CF and OF.
-                table.update({"b": "false", "ae": "true", "be": f"{result} == 0", "a": f"{result} != 0",
-                              "l": table["s"], "ge": table["ns"],
-                              "le": f"{result} == 0 || {table['s']}", "g": f"{result} != 0 && {table['ns']}"})
+                table.update({"b": "false", "ae": "true", "be": f"{flag_result} == 0", "a": f"{flag_result} != 0",
+                              "l": s_cond, "ge": ns_cond,
+                              "le": f"{flag_result} == 0 || {s_cond}", "g": f"{flag_result} != 0 && {ns_cond}"})
+            else:
+                # ADD, INC, DEC and NEG share SF != OF signed comparisons; only ADD and NEG define CF.
+                table.update({"l": f"({s_cond}) != ({overflow})", "ge": f"({s_cond}) == ({overflow})",
+                              "le": f"{flag_result} == 0 || ({s_cond}) != ({overflow})",
+                              "g": f"{flag_result} != 0 && ({s_cond}) == ({overflow})"})
+                if producer.mnemonic == M.ADD:
+                    table.update({"b": f"{flag_result} < {a}", "ae": f"{flag_result} >= {a}",
+                                  "be": f"{flag_result} < {a} || {flag_result} == 0",
+                                  "a": f"{flag_result} >= {a} && {flag_result} != 0"})
+                elif producer.mnemonic == M.NEG:
+                    table.update({"b": f"{flag_result} != 0", "ae": f"{flag_result} == 0",
+                                  "be": "true", "a": "false"})
         # PF is even parity of only the low result byte. OF is signed overflow,
         # independent of the host's signed arithmetic and its overflow rules.
-        a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
-        sign = f"{1 << (width * 8 - 1):#x}ull"
-        if producer.mnemonic in (M.CMP, M.SUB, M.ADD):
-            operator = "+" if producer.mnemonic == M.ADD else "-"
-            flag_result = f"static_cast<{u}>({a} {operator} {b})"
-            same_sign = f"~({a} ^ {b})" if producer.mnemonic == M.ADD else f"({a} ^ {b})"
-            overflow = f"(({same_sign} & ({a} ^ {flag_result}) & {sign}) != 0)"
-            if producer.mnemonic == M.ADD:
-                # ADD now snapshots its operands, rather than just its result.
-                table.update({"e": f"{flag_result} == 0", "ne": f"{flag_result} != 0",
-                              "s": f"static_cast<{s}>({flag_result}) < 0",
-                              "ns": f"static_cast<{s}>({flag_result}) >= 0"})
-        else:
-            flag_result = f"static_cast<{u}>(fa)"
-            if producer.mnemonic == M.INC:
-                overflow = f"{flag_result} == {sign}"
-            elif producer.mnemonic == M.DEC:
-                overflow = f"{flag_result} == {((1 << (width * 8 - 1)) - 1):#x}ull"
-            else:
-                overflow = "false"  # TEST, AND, OR and XOR clear OF.
         table.update({"o": overflow, "no": f"!({overflow})",
                       "p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
         if code not in table:
@@ -1070,7 +1075,7 @@ class Lifter:
             value = {M.INC: f"{a} + 1u", M.DEC: f"{a} - 1u", M.NEG: f"0u - {a}", M.NOT: f"~{a}"}[mnemonic]
             line = self.write(ins, width, value)
             if sets_flags:
-                if mnemonic not in (M.INC, M.DEC):
+                if mnemonic not in (M.INC, M.DEC, M.NEG):
                     raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
                 self.flags = True
                 line = f"fa = static_cast<{unsigned(width)}>({value}); " + line

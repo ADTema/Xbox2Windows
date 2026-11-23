@@ -254,13 +254,14 @@ def flush_ftz(value):
     return value
 
 
-def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False):
+def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extra_constants=None):
     """Write a renderer case: 256 constant bytes, then 64 expected float4 rows in row-major order.
 
     A single float4 broadcasts to every texel. The optional trailer appends one flags byte, whose
     bit 0 selects the lossless R32G32B32A32_UINT readback target. Floating-point cases may instead
     append a zero flags byte and 64 mask bytes for per-channel NaN-class checks. Cases written without
-    integer_rt or nan_mask keep the original 1280-byte format exactly.
+    integer_rt or nan_mask keep the original 1280-byte format exactly. extra_constants sets bit 3 of
+    the flags byte and stores 512 bytes after it: the 256-byte buffers bound to b1 and b2.
     """
     rows = [pixels] * 64 if len(pixels) == 4 and not isinstance(pixels[0], (list, tuple)) else list(pixels)
     if len(rows) != 64 or any(len(row) != 4 for row in rows):
@@ -268,7 +269,14 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False):
     data = bytearray(bytes(constants))
     for row in rows:
         data += struct.pack("<4f", *row)
-    if integer_rt:
+    if extra_constants is not None:
+        if integer_rt or nan_mask is not None:
+            raise ValueError("Extra constant buffers are not combined with other trailer fields")
+        if len(extra_constants) != 512:
+            raise ValueError("The b1 and b2 buffers need exactly 512 bytes")
+        data.append(8)
+        data += extra_constants
+    elif integer_rt:
         if nan_mask is not None:
             raise ValueError("NaN-class masks require a floating-point render target")
         data.append(1)
@@ -433,6 +441,33 @@ def with_scalar_constant_reads() -> list[str]:
         "s_buffer_load_dword s63, s[44:47], 0xfc",
     ]
     return program
+
+
+# Two further descriptors beside the b0 one: another slot of the texture table, and a slot of the
+# table whose low address word arrives in entry s9. Every read takes word 2, so only the buffer differs.
+THREE_BUFFERS = dict(constant_descriptor=64, extra_constants=[(20, 0x60), (9, 0x20)])
+
+
+def with_three_constant_buffers() -> list[str]:
+    program = with_constants(["v_mov_b32_e32 v12, s61", "v_mov_b32_e32 v13, s62", "v_mov_b32_e32 v14, s63"])
+    descriptor = program.index("s_load_dwordx4 s[44:47], s[20:21], 0x40")
+    program[descriptor + 1:descriptor + 1] = [
+        "s_load_dwordx4 s[52:55], s[20:21], 0x60",
+        "s_mov_b32 s64, s9",
+        "s_mov_b32 s65, 0",
+        "s_load_dwordx4 s[56:59], s[64:65], 0x20",
+    ]
+    load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc")
+    program[load:load + 1] = [
+        "s_buffer_load_dword s61, s[44:47], 0x8",
+        "s_buffer_load_dword s62, s[52:55], 0x8",
+        "s_buffer_load_dword s63, s[56:59], 0x8",
+    ]
+    return program
+
+
+def translate_three_buffers(instructions):
+    return lower(instructions, 20, 24, [1, 2, 3, 4], **THREE_BUFFERS)
 
 
 def affine_coordinates() -> list[str]:
@@ -991,6 +1026,102 @@ E64_ARITH = (
 )
 E64_ARITH_INPUTS = (2.5, 1.25, 3.0, -4.0)
 
+# VOP3 (e64) encodings of v_exp_f32, v_log_f32 and v_mac_f32, which the translator accepted with no fixture
+# drawing them. D3D allows exp2 and log2 a last-place error, so a raw result has no single binary32 reference:
+# each input makes the true result a small integer, and adding 0.5 then taking the floor returns that integer
+# for any result within 0.5 of it. That checks the operation and its source modifiers, which are what e64 adds
+# over e32, and not last-place accuracy. v_mac_f32 is exact and is compared directly: channel 2 accumulates a
+# product of modified sources, and channel 3 is the 4097 * 4097 case of MAD_BODY (0 unfused, 1.0 fused) with
+# both sources negated. A, B, C and D are the constants in s44 to s47.
+APPROX_E64_ACCUMULATOR = -16785408.0  # 0xcb801000, -(2**24 + 2**13)
+APPROX_E64_BODY = [
+    "v_exp_f32_e64 v12, -s44",
+    "v_log_f32_e64 v13, |s45|",
+    *[line for channel in (12, 13)
+      for line in (f"v_add_f32_e32 v{channel}, 0.5, v{channel}", f"v_floor_f32_e32 v{channel}, v{channel}")],
+    "v_mov_b32_e32 v14, s46",
+    "v_mac_f32_e64 v14, -s44, |s45|",
+    "v_mov_b32_e32 v15, 0xcb801000",
+    "v_mac_f32_e64 v15, -s47, -s47",
+]
+APPROX_E64_OPS = ("v_exp_f32_e64", "v_log_f32_e64", "v_mac_f32_e64")
+APPROX_E64_ROWS = ((-3.0, -32.0, 0.25, 4097.0), (-4.0, -8.0, 0.5, 4097.0))
+
+
+def approx_e64_reference(a, b, c, d):
+    """The four exported values: exp2(-A), log2(|B|), -A * |B| + C, and the unfused D * D + accumulator."""
+    return (2.0 ** -a, math.log2(abs(b)), single(single(-a * abs(b)) + c),
+            single(single(d * d) + APPROX_E64_ACCUMULATOR))
+
+
+# Negative controls: (channel, value a wrong lowering would export, what went wrong). Each is drawn on the
+# first row and must report a mismatch. The rounding step is applied to the wrong exp and log values as well.
+APPROX_E64_WRONG = (
+    (0, lambda a, b, c, d: math.floor(2.0 ** a + 0.5), "negation dropped on exp"),
+    (0, lambda a, b, c, d: math.floor(math.exp(-a) + 0.5), "natural exponential for exp2"),
+    (0, lambda a, b, c, d: math.floor(math.log2(-a) + 0.5), "log for exp"),
+    (1, lambda a, b, c, d: math.floor(math.log(abs(b)) + 0.5), "natural logarithm for log2"),
+    (1, lambda a, b, c, d: 2.0 ** abs(b), "exp for log"),
+    (2, lambda a, b, c, d: a * abs(b) + c, "negation dropped on mac"),
+    (2, lambda a, b, c, d: -a * abs(b), "accumulator dropped"),
+    (3, lambda a, b, c, d: single(d * d + APPROX_E64_ACCUMULATOR), "fused multiply-add"),
+)
+
+
+def check_e64_approx_lowering():
+    """Static checks for APPROX_E64_BODY: the modifiers reach exp2, log2 and the unfused helper."""
+    body = translate(with_constants(APPROX_E64_BODY)).split("float4 main", 1)[1]
+    assert set(APPROX_E64_OPS) <= ACCEPTED, set(APPROX_E64_OPS) - ACCEPTED
+    assert "exp2((-params[0].w))" in body and "log2(abs(params[1].x))" in body, body
+    assert "mad32((-params[0].w), abs(params[1].x), " in body and "mad32((-params[1].z), (-params[1].z), " in body, body
+    assert body.count("mad32(") == 2 and " mad(" not in body, body
+    # v_mac_f32 reads its destination, so an unwritten one is refused, as is a third source.
+    must_reject(translate, with_constants(["v_mac_f32_e64 v20, -s44, |s45|"]))
+    must_reject(translate, with_constants(["v_mov_b32_e32 v14, s46", "v_mac_f32_e64 v14, -s44, |s45|, v14"]))
+
+
+def check_e64_approx_draws(directory, compiler, renderer, backend):
+    """Draw APPROX_E64_BODY once per row of APPROX_E64_ROWS, and once per wrong reference on the first row.
+
+    One compile and one renderer batch. A renderer that reports an unavailable adapter (exit 77) makes this a
+    skip. On a desktop GPU the draws establish what the translated shader computes, not what the console does.
+    """
+    source = directory / "e64_approx.hlsl"
+    shader = directory / "e64_approx.cso"
+    source.write_text(translate(with_constants(APPROX_E64_BODY)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+
+    def add_case(row, values, status):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, *row)
+        path = directory / f"e64_approx-{len(cases)}.case"
+        path.write_bytes(bytes(constants) + struct.pack("<4f", *values) * 64)
+        cases.append((path, status))
+
+    for index, row in enumerate(APPROX_E64_ROWS):
+        right = approx_e64_reference(*row)
+        # The true exp2 and log2 results are integers, every right value survives the binary16 export
+        # unchanged, and the unfused sum is exactly zero where a fused one is 1.0.
+        assert right[0] == int(right[0]) and right[1] == int(right[1]) and right[3] == 0.0, right
+        assert tuple(map(half_rtz, right)) == right, right
+        add_case(row, right, "pass")
+        if index:
+            continue
+        for channel, wrong, reason in APPROX_E64_WRONG:
+            values = list(right)
+            values[channel] = float(wrong(*row))
+            assert values[channel] != right[channel], reason
+            add_case(row, values, "mismatch")
+    assert (cases[0][1], cases[-1][1]) == ("pass", "pass")
+    try:
+        run_pixel_batch(renderer, backend, shader, cases)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 77:
+            return 77
+        raise
+    return 0
+
 
 def predicate_group_e64(first):
     body = ["v_sub_f32_e64 v18, s45, 0", "v_sub_f32_e64 v19, s47, 0"]
@@ -1138,6 +1269,44 @@ MAD_BODY = [
     "v_mac_f32_e32 v14, s44, v15",
     "v_mad_f32 v15, 0.5, 4.0, 0.5",
 ]
+
+
+def check_three_buffer_draw(directory, compiler, renderer, backend):
+    """Each channel comes from word 2 of a different buffer; every other word holds a sentinel."""
+    source = directory / "three-buffers.hlsl"
+    shader = directory / "three-buffers.cso"
+    program = with_three_constant_buffers()
+    source.write_text(translate_three_buffers(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+
+    def buffers(values):
+        data = [bytearray(struct.pack("<f", 0.0625) * 64) for _ in values]
+        for buffer, value in zip(data, values, strict=True):
+            struct.pack_into("<f", buffer, 8, value)
+        return data[0], bytes(data[1] + data[2])
+
+    cases = []
+    for idx, (values, expected, status) in enumerate((
+            ((.25, -.5, .75), (.25, -.5, .75), "pass"),
+            ((-.125, .625, .875), (-.125, .625, .875), "pass"),
+            # The reference reads b1 and b2 exchanged, then b0 in place of b1.
+            ((.25, -.5, .75), (.25, .75, -.5), "mismatch"),
+            ((.25, -.5, .75), (.25, .25, .75), "mismatch"))):
+        first, extra = buffers(values)
+        case = write_case(directory / f"three-buffers-{idx}.case", first, (*expected, 1), extra_constants=extra)
+        cases.append((case, status))
+    run_pixel_batch(renderer, backend, shader, cases)
+    # Exchanging the two contract entries exchanges b1 and b2 in the translation.
+    exchanged = dict(THREE_BUFFERS, extra_constants=THREE_BUFFERS["extra_constants"][::-1])
+    source.write_text(lower(program, 20, 24, [1, 2, 3, 4], **exchanged), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    run_pixel_batch(renderer, backend, shader, [(cases[0][0], "mismatch"), (cases[2][0], "pass")])
+    # A truncated pair of extra buffers is a case-format error, not a draw.
+    short = directory / "three-buffers-short.case"
+    short.write_bytes(cases[0][0].read_bytes()[:-4])
+    broken = subprocess.run([renderer, backend, "--check-pixel-case", shader, short], capture_output=True, text=True)
+    if broken.returncode != 1 or "Expected two 256-byte constant buffers for b1 and b2" not in broken.stderr:
+        raise AssertionError(f"A short extra-constant case was accepted\n{broken.stdout}\n{broken.stderr}")
 
 
 def check_mad_draw(directory, compiler, renderer, backend):
@@ -3246,6 +3415,86 @@ def check_constant_descriptor_bounds() -> None:
                 raise AssertionError(f"Constant descriptor at {offset} overlaps texture 0")
 
 
+def check_three_constant_buffers() -> None:
+    program = with_three_constant_buffers()
+    source = translate_three_buffers(program)
+    for slot, name in enumerate(("params", "params1", "params2")):
+        suffix = str(slot) if slot else ""
+        assert f"cbuffer Constants{suffix} : register(b{slot}) {{ float4 {name}[16]; }};" in source
+        assert source.count(f"{name}[0].z") == 1
+
+    def bound(instructions, constant_descriptor=64, extra_constants=((20, 0x60), (9, 0x20))):
+        return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor, extra_constants=extra_constants)
+
+    def changed(old, new):
+        assert old in program
+        return [new if line == old else line for line in program]
+
+    def exchange(text, a, b):
+        return text.replace(a, "#").replace(b, a).replace("#", b)
+
+    # The contract order alone selects the register, and b0 is optional.
+    swapped = bound(program, extra_constants=((9, 0x20), (20, 0x60)))
+    assert swapped != source and swapped == exchange(source, "params1[0].z", "params2[0].z")
+    only_extra = bound(program, None, ((20, 0x40), (20, 0x60), (9, 0x20)))
+    assert "register(b0)" not in only_extra and "params3[0].z" in only_extra
+    # One offset on two tables names two descriptors.
+    same_offset = changed("s_load_dwordx4 s[56:59], s[64:65], 0x20", "s_load_dwordx4 s[56:59], s[64:65], 0x60")
+    assert bound(same_offset, extra_constants=((20, 0x60), (9, 0x60))) == source
+
+    # A descriptor the contract does not name is refused, on either table.
+    for old in ("s_load_dwordx4 s[52:55], s[20:21], 0x60", "s_load_dwordx4 s[56:59], s[64:65], 0x20"):
+        expect_value_error(bound, changed(old, old[:-2] + "70"), "Constant descriptor differs from binding contract")
+    expect_value_error(translate, program, "Constant descriptor differs from binding contract")
+    expect_value_error(lambda p: bound(p, extra_constants=((9, 0x20),)), program,
+                       "Constant descriptor differs from binding contract")
+    expect_value_error(lambda p: bound(p, None, ()), program, "Unresolved constant buffer binding")
+    # An entry register outside the contract stays unbound.
+    try:
+        bound(program, extra_constants=((20, 0x60),))
+    except KeyError as error:
+        assert error.args == ("s9",), error
+    else:
+        raise AssertionError("An unbound table register was accepted")
+    # The table address needs a zero high word, and its low word is not a number.
+    for high in ("s_mov_b32 s65, 1", "s_mov_b32 s65, s9", "s_mov_b32 s65, s20"):
+        expect_value_error(bound, changed("s_mov_b32 s65, 0", high), "Unresolved constant buffer binding")
+    expect_value_error(bound, changed("s_mov_b32 s64, s9", "s_add_i32 s64, s9, 4"),
+                       "Expected a numeric scalar register: s9")
+    # A texture descriptor is not read from a constant table.
+    expect_value_error(bound, changed("s_load_dwordx4 s[56:59], s[64:65], 0x20",
+                                      "s_load_dwordx8 s[56:63], s[64:65], 0x20"),
+                       "Unbound texture descriptor offset")
+    expect_value_error(lambda p: bound(p, extra_constants=((20, 0x60), (9, 0x20))),
+                       changed("s_load_dwordx4 s[56:59], s[64:65], 0x20", "s_load_dwordx8 s[56:63], s[64:65], null"),
+                       "Texture address differs from binding contract")
+    # Descriptor words from two buffers do not form one descriptor.
+    read = program.index("s_buffer_load_dword s62, s[52:55], 0x8")
+    wait = "s_waitcnt lgkmcnt(0)"
+    for mixed in ("s_mov_b32 s53, s57", "s_mov_b32 s52, s56", "s_mov_b32 s55, 0"):
+        expect_value_error(bound, program[:read] + [wait, mixed] + program[read:], "Unresolved constant buffer binding")
+    # A whole descriptor copied word by word keeps its buffer.
+    copied = program[:read] + [wait, *(f"s_mov_b32 s{52 + n}, s{56 + n}" for n in range(4))] + program[read:]
+    assert "params1" not in bound(copied).split("main(")[1] and bound(copied).count("params2[0].z") == 2
+    # A descriptor is read only after its load completes.
+    first_wait = program.index(wait)
+    must_reject(bound, program[:first_wait] + ["s_buffer_load_dword s62, s[52:55], 0x8"] + program[first_wait:])
+
+    for extra, message in (
+            (((20, 0x40),), "Constant descriptors overlap"), (((20, 0x4c),), "Constant descriptors overlap"),
+            (((20, 0x34),), "Constant descriptors overlap"), (((9, 0x20), (9, 0x2c)), "Constant descriptors overlap"),
+            (((20, 0),), "Texture and constant descriptors overlap"), (((20, 0x1c),), "Texture and constant descriptors overlap"),
+            (((24, 0x20),), "Invalid constant descriptor binding"), (((9, 0x22),), "Invalid constant descriptor binding"),
+            (((9, -4),), "Invalid constant descriptor binding"), (((106, 0),), "Invalid constant descriptor binding"),
+            (((-1, 0),), "Invalid constant descriptor binding"), (((9,),), "Invalid constant descriptor binding"),
+            (((9, 0x20, 0),), "Invalid constant descriptor binding"), (((9.0, 0x20),), "Invalid constant descriptor binding"),
+            (((True, 0x20),), "Invalid constant descriptor binding")):
+        expect_value_error(lambda p: bound(p, extra_constants=extra), program, message)
+    # Adjacent 16-byte descriptors on one table are distinct.
+    adjacent = changed("s_load_dwordx4 s[52:55], s[20:21], 0x60", "s_load_dwordx4 s[52:55], s[20:21], 0x50")
+    assert bound(adjacent, extra_constants=((20, 0x50), (9, 0x20))) == source
+
+
 def check_scalar_constant_reads() -> None:
     program = with_scalar_constant_reads()
     source = translate(program)
@@ -4096,6 +4345,78 @@ def nc_integer_group(group):
     return ["v_mov_b32_e32 v18, s45", *NC_INT_BODIES[group]]
 
 
+# Integer VOP3 (e64) encodings that the translator accepted with no fixture drawing them, and v_xnor_b32 in
+# both encodings. Bodies for uncompressed_export(): A, B and C are the constants in s44, s45 and s46, v18 = B,
+# and each channel v12..v15 holds its own result. The shift and bitwise groups take both sources from SGPRs,
+# which the VOP2 (e32) encoding cannot express for the second source.
+E64_INT_BODIES = {
+    "shift": ["v_lshlrev_b32_e64 v12, s44, s45", "v_lshrrev_b32_e64 v13, s44, s45",
+              "v_ashrrev_i32_e64 v14, s44, s45", "v_not_b32_e64 v15, s45"],
+    "bitwise": ["v_and_b32_e64 v12, s44, s45", "v_or_b32_e64 v13, s44, s45",
+                "v_xor_b32_e64 v14, s44, s45", "v_xnor_b32_e64 v15, s44, s45"],
+    "xnor_byte": ["v_xnor_b32_e32 v12, s44, v18", "v_cvt_f32_ubyte2_e64 v13, s46",
+                  "v_cvt_f32_ubyte2_e64 v14, v18", "v_cvt_f32_ubyte2_e64 v15, s46 clamp"],
+}
+E64_INT_OPS = tuple(sorted({line.split()[0] for body in E64_INT_BODIES.values() for line in body}))
+
+
+def _f32_word(value):
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def _sar32(word, count):
+    return ((word - (1 << 32) if word & 0x80000000 else word) >> count) & 0xffffffff
+
+
+def _byte(word, index):
+    return (word >> (8 * index)) & 0xff
+
+
+# Reference words by group. The reversed shifts move src1 (B) by the low five bits of src0 (A).
+E64_INT_RESULTS = {
+    "shift": lambda a, b, c: (b << (a & 31), b >> (a & 31), _sar32(b, a & 31), ~b),
+    "bitwise": lambda a, b, c: (a & b, a | b, a ^ b, ~(a ^ b)),
+    "xnor_byte": lambda a, b, c: (~(a ^ b), _f32_word(float(_byte(c, 2))), _f32_word(float(_byte(b, 2))),
+                                  _f32_word(min(float(_byte(c, 2)), 1.0))),
+}
+# Negative controls by group: (channel, word a wrong lowering would give, what went wrong). Each is drawn on
+# the first row of the group and must report a mismatch.
+E64_INT_WRONG = {
+    "shift": (
+        (0, lambda a, b, c: a << (b & 31), "shift operands swapped"),
+        (0, lambda a, b, c: 0, "left-shift count not reduced modulo 32"),
+        (1, lambda a, b, c: _sar32(b, a & 31), "arithmetic shift for logical"),
+        (2, lambda a, b, c: b >> (a & 31), "logical shift for arithmetic"),
+        (3, lambda a, b, c: b, "not dropped"),
+    ),
+    "bitwise": (
+        (0, lambda a, b, c: a | b, "or for and"),
+        (1, lambda a, b, c: a & b, "and for or"),
+        (2, lambda a, b, c: ~(a ^ b), "xnor for xor"),
+        (3, lambda a, b, c: a ^ b, "xor for xnor"),
+    ),
+    "xnor_byte": (
+        (0, lambda a, b, c: a ^ b, "xor for xnor"),
+        (1, lambda a, b, c: _f32_word(float(_byte(c, 1))), "byte 1 for byte 2"),
+        (1, lambda a, b, c: _f32_word(float(_byte(c, 3))), "byte 3 for byte 2"),
+        (2, lambda a, b, c: _f32_word(float(_byte(c, 2))), "wrong source register"),
+        (3, lambda a, b, c: _f32_word(float(_byte(c, 2))), "clamp dropped"),
+    ),
+}
+# (A, B, C) as binary32 words; the inputs and every right result are normal numbers or zero (asserted at the
+# draw). The shift counts 0x3f800024 and 0x40000023 exceed 31, so only their low five bits (4 and 3) may count;
+# B is negative in the first shift row and positive in the second. The four bytes of each C differ.
+E64_INT_ROWS = {
+    "shift": ((0x3F800024, 0xC1700000, 0), (0x40000023, 0x4C003A00, 0)),
+    "bitwise": ((0x40D10000, 0xC0250000, 0), (0x3E270000, 0xBF620000, 0)),
+    "xnor_byte": ((0x40D10000, 0xC0250000, 0x40C32A11), (0x3E270000, 0xBF620000, 0x3F00FF80)),
+}
+
+
+def e64_integer_group(group):
+    return ["v_mov_b32_e32 v18, s45", *E64_INT_BODIES[group]]
+
+
 def sop2_lshl_add_group() -> list[str]:
     return with_constants([
         "s_lshl1_add_u32 s60, s44, s45",
@@ -4365,6 +4686,49 @@ def check_f16_denorm_controls():
     assert "widen16(" in body and "pack16_rne(" in body, body
 
 
+def check_e64_integer_lowering():
+    """Static checks for the integer e64 forms of e64_integer_group() and for v_xnor_b32 in both encodings."""
+    # v18 is written by the mov at index 20 and the four group instructions follow at 21..24.
+    a, b, c, v = "asuint(params[0].w)", "asuint(params[1].x)", "asuint(params[1].y)", "asuint(alu20)"
+    expected = {
+        "shift": (f"asfloat({b} << ({a} & 31u))", f"asfloat({b} >> ({a} & 31u))",
+                  f"asfloat(asuint(asint({b}) >> ({a} & 31u)))", f"asfloat(~{b})"),
+        "bitwise": (f"asfloat({a} & {b})", f"asfloat({a} | {b})", f"asfloat({a} ^ {b})", f"asfloat(~({a} ^ {b}))"),
+        "xnor_byte": (f"asfloat(~({a} ^ {v}))", f"float(({c} >> 16u) & 0xffu)", f"float(({v} >> 16u) & 0xffu)",
+                      f"saturate(float(({c} >> 16u) & 0xffu))"),
+    }
+    assert expected.keys() == E64_INT_BODIES.keys() == E64_INT_RESULTS.keys() == E64_INT_WRONG.keys() == E64_INT_ROWS.keys()
+    for group, expressions in expected.items():
+        program = uncompressed_export(e64_integer_group(group))
+        assert program.index("v_mov_b32_e32 v18, s45") == 20, group
+        source = translate_int(program)
+        for offset, expression in enumerate(expressions, start=21):
+            statement = f"    precise float alu{offset} = {expression};"
+            assert statement in source.splitlines(), (group, statement)
+    assert set(E64_INT_OPS) <= ACCEPTED, set(E64_INT_OPS) - ACCEPTED
+    assert len(E64_INT_OPS) == 10
+    # v_xnor_b32 takes the operand shapes of v_xor_b32 and nothing else: no float modifier, no clamp, two
+    # sources, a written register, and no SDWA spelling.
+    for good, bad in (
+        ("v_xnor_b32_e32 v12, s44, v18", "v_xnor_b32_e32 v12, s44, |v18|"),
+        ("v_xnor_b32_e32 v12, s44, v18", "v_xnor_b32_e32 v12, s44, -v18"),
+        ("v_xnor_b32_e64 v12, s44, v18", "v_xnor_b32_e64 v12, abs(s44), v18"),
+        ("v_xnor_b32_e64 v12, s44, v18", "v_xnor_b32_e64 v12, s44, v18 clamp"),
+        ("v_xnor_b32_e64 v12, 64, v18", "v_xnor_b32_e64 v12, s44"),
+        ("v_xnor_b32_e64 v12, v18, s44", "v_xnor_b32_e64 v12, s44, v18, s45"),
+        ("v_xnor_b32_e32 v12, s44, v18", "v_xnor_b32_e32 v12, s44, v106"),
+        ("v_xnor_b32_e32 v12, s44, v18",
+         "v_xnor_b32_sdwa v12, v18, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"),
+    ):
+        translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    xnor_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_xnor_b32_e64 v12, s44, v18"]))
+    xor_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_xor_b32_e64 v12, s44, v18"]))
+    assert xnor_source != xor_source
+    # A float modifier on the byte conversion stays refused in the e64 spelling as well.
+    must_reject(translate_int, uncompressed_export(["v_cvt_f32_ubyte2_e64 v12, -s46"]))
+
+
 def check_nc_integer_lowering():
     """Static checks for the 32-bit no-carry add/sub forms of nc_integer_group(1..3)."""
     # v18 is written by the mov at index 20, and the four group instructions follow at 21..24. A and B are
@@ -4444,6 +4808,7 @@ def check_controls(directory):
     check_mode_register_controls()
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
+    check_three_constant_buffers()
     check_affine_coordinates()
     check_scalar_helpers_with_vector_arithmetic()
     check_adapter_skip(directory)
@@ -4500,6 +4865,7 @@ def check_controls(directory):
     ):
         must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop2]))
     check_nc_integer_lowering()
+    check_e64_integer_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
     assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED
     for expected in (
@@ -5025,6 +5391,7 @@ def check_controls(directory):
     assert body.count("mad32(") == 4 and " mad(" not in body, body
     must_reject(translate, with_constants(["v_mad_f32 v12, s44, s45"]))
     must_reject(translate, with_constants(["v_mac_f32_e32 v14, s44, v15, v14"]))
+    check_e64_approx_lowering()
     # v_madak_f32 and v_madmk_f32 use the same helper. The literal is the last operand of madak and the
     # second of madmk; a register there, a missing operand, and the e64, DPP and SDWA spellings are refused.
     body = translate(with_constants(MAD_LITERAL_BODY)).split("float4 main", 1)[1]
@@ -5458,6 +5825,7 @@ def check_binary(directory, assembler, objcopy, library):
     check_program_extent(directory, library)
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
+                (with_three_constant_buffers(), translate_three_buffers),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate), (sopk_scalar(), translate), (sopk_cmpk_cmovk(), translate_int)]
     fixtures.append((rgb_sample(), translate))
@@ -5507,6 +5875,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((mode_program(), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.extend((with_constants(body), translate) for body, *_ in E64_ARITH)
+    fixtures.append((with_constants(APPROX_E64_BODY), translate))
     fixtures.extend((predicate_group_e64(first), translate) for first in range(0, 16, 4))
     fixtures.append((scalar(), translate))
     fixtures.append((lod_zero_sample(), translate))
@@ -5534,6 +5903,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(cvt_float_body(0x3fc00000, 0xc0300000)), translate_int))
     fixtures.extend((uncompressed_export(nc_integer_group(group)), translate_int) for group in (1, 2, 3))
     fixtures.append((uncompressed_export(f16_compares()), translate_int))
+    fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
@@ -5844,6 +6214,49 @@ def check_integer_nc_draws(directory, compiler, renderer, backend):
             run_pixel_batch(renderer, backend, shader, cases)
         else:
             subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[0][0]], check=True)
+    return 0
+
+
+def check_e64_integer_draws(directory, compiler, renderer, backend):
+    """Draw the integer e64 forms and v_xnor_b32 through the integer readback target and compare the words.
+
+    Each group of E64_INT_BODIES is compiled once and drawn in one renderer batch: every row of E64_INT_ROWS
+    with the right words, and the first row once per E64_INT_WRONG entry with one channel replaced by the word
+    a wrong lowering would give, which must report a mismatch. On a desktop GPU the draws establish that the
+    translated shader computes the stated operation, not what the console does.
+    """
+    source = directory / "e64_integer.hlsl"
+    shader = directory / "e64_integer.cso"
+
+    def add_case(cases, row, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<3I", constants, 12, *row)
+        case = directory / f"e64_integer-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+
+    for group, rows in E64_INT_ROWS.items():
+        source.write_text(translate_int(uncompressed_export(e64_integer_group(group))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for index, row in enumerate(rows):
+            words = tuple(word & 0xffffffff for word in E64_INT_RESULTS[group](*row))
+            # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+            assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (group, [hex(w) for w in (*row, *words)])
+            add_case(cases, row, words, "pass")
+            if index:
+                continue
+            for channel, wrong, reason in E64_INT_WRONG[group]:
+                wrong_words = list(words)
+                wrong_words[channel] = wrong(*row) & 0xffffffff
+                assert wrong_words[channel] != words[channel], (group, reason)
+                add_case(cases, row, wrong_words, "mismatch")
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
     return 0
 
 
@@ -6885,6 +7298,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
                            capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Reading the neighboring constant word escaped detection")
+    check_three_buffer_draw(directory, compiler, renderer, backend)
 
     check_affine_lod_draw(directory, compiler, renderer, backend)
     program = with_scalar_pair_reads()
@@ -7541,11 +7955,12 @@ def main():
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc", "draw-bfm"):
+        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc", "draw-bfm", "draw-e64-integer"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
+                        "draw-e64-integer": check_e64_integer_draws,
                         "draw-bfm": check_bfm_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
@@ -7555,6 +7970,8 @@ def main():
         if mode == "draw-e64":
             # The controls already run in the binary and draw modes; this mode only draws.
             return check_e64_render(directory, *args)
+        if mode == "draw-e64-approx":
+            return check_e64_approx_draws(directory, *args)
         check_controls(directory)
         try:
             if mode == "binary":
