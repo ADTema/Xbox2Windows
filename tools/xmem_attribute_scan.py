@@ -26,9 +26,11 @@ definition of RDX, the attribute word argument:
   pointer can change the word before the call, and writes through pointers are not tracked. The
   report keeps the initial value and the RIP-relative writes found (written_at, possibly empty)
   as evidence only.
-- A register copy is followed.
-- Reaching the function entry means the caller supplies RDX. Direct calls and jumps to the entry
-  are then resolved, one level deep. Exported functions may also have callers outside the image.
+- A register copy is followed. A 32-bit copy keeps only the low 32 bits.
+- Reaching the function entry means the caller supplies the register being tracked. The entry
+  register and whether a 32-bit copy truncated it on the way are recorded, and direct calls and
+  jumps to the entry are resolved one level deep with that register. Exported functions may also
+  have callers outside the image.
 - Anything else (partial-register writes, arithmetic, loads through pointers, blocks reached only
   through jump tables, chained unwind fragments) is computed or unknown, never a constant.
 
@@ -50,6 +52,11 @@ from pathlib import Path
 import pefile
 from iced_x86 import (Decoder, FlowControl, InstructionInfoFactory, Mnemonic as M, OpAccess,
                       OpKind as K, Register as R, RegisterExt)
+
+# Full-register names for the report and back, from iced-x86's Register constant module.
+REGISTER_NAMES = {value: name for name, value in vars(R).items()
+                  if isinstance(value, int) and not name.startswith("_")}
+REGISTERS = {name: value for value, name in REGISTER_NAMES.items()}
 
 FORMAT = 2
 TARGETS = ("XMemAlloc", "XMemFree")
@@ -302,12 +309,12 @@ class Scan:
                 budget[0] -= 1
                 results.extend(self.walk(region, j, register, seen, budget, depth))
             if k == 0:
-                results.append(self.block_start(region, 0, depth))
+                results.append(self.block_start(region, 0, register, depth))
                 return results
             previous = region.ins[k - 1]
             if previous.flow_control in STOPS:
                 if not region.jumps_to.get(here):
-                    results.append(self.block_start(region, k, depth))
+                    results.append(self.block_start(region, k, register, depth))
                 return results
             if self.image.writes(previous, register):
                 results.append(self.describe(region, k - 1, register, seen, budget, depth))
@@ -318,12 +325,14 @@ class Scan:
                 return results
             k -= 1
 
-    def block_start(self, region, k, depth):
+    def block_start(self, region, k, register, depth):
         ip = region.ins[k].ip
         if region.kind == "fragment" and k == 0:
             return {"source": "unknown", "detail": "start of a chained unwind fragment", "at": hex(ip)}
         if ip in self.image.entries or (k == 0 and region.kind == "function"):
-            result = {"source": "argument", "function": hex(ip)}
+            # The caller supplies the register still being tracked, not always RDX: a copy such as
+            # `mov rdx, r8` is followed to the entry, and the callers must be read from R8.
+            result = {"source": "argument", "function": hex(ip), "register": REGISTER_NAMES[register]}
             if ip in self.image.exports:
                 result["exported"] = True
             if depth == 0:
@@ -401,6 +410,8 @@ class Scan:
             result["detail"] = "writable section: initial value only, writes through pointers are not tracked"
         if source == "argument" and result.get("callers", []) is None \
                 and int(result["function"], 16) in self.scanned_callers:
+            register = REGISTERS[result["register"]]
+            truncated = result.get("truncated", False)
             callers = []
             for ip in self.callers.get(int(result["function"], 16), []):
                 region = self.image.region(ip)
@@ -408,7 +419,10 @@ class Scan:
                     callers.append({"source": "unknown", "detail": "caller not on an instruction boundary",
                                     "call": hex(ip)})
                     continue
-                callers.append(dict(self.resolve(region, region.index[ip], depth=1), call=hex(ip)))
+                resolved = self.resolve(region, region.index[ip], register=register, depth=1)
+                if truncated:
+                    resolved = truncate(resolved)
+                callers.append(dict(resolved, call=hex(ip)))
             result["callers"] = callers
         for nested in result.get("paths", []) + (result.get("callers") or []):
             self.finish(nested)
@@ -416,11 +430,19 @@ class Scan:
 
 
 def truncate(result):
-    """A 32-bit register copy keeps only the low 32 bits of a constant."""
-    if result.get("source") == "constant":
+    """A 32-bit register copy keeps only the low 32 bits.
+
+    Constants are masked, and an entry register is marked so that Scan.finish truncates each
+    caller's resolved value the same way.
+    """
+    source = result.get("source")
+    if source == "constant":
         return dict(result, word=result["word"] & 0xffffffff)
-    if result.get("source") == "multiple":
+    if source == "multiple":
         return dict(result, paths=[truncate(p) for p in result["paths"]])
+    if source == "argument":
+        # Scan.finish applies this to each caller's resolved value.
+        return dict(result, truncated=True)
     return result
 
 
