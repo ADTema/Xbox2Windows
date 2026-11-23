@@ -3944,6 +3944,12 @@ cmake --build --preset dev --target xmem_shim_check era_physical_check pe_map cp
 ctest --preset dev --no-tests=error -R '^(xmem_shim_(exports|physical_pages)|era_physical_(controls|lifetime)|cpu_native_xmem_physical_pair)$' -V
 ```
 
+### Shared physical pages on Windows
+
+The desktop XMem shim can map live 64 KiB physical grants into caller-owned, 64 KiB Windows placeholders. Contiguous and scatter mappings share section backing by page number. Unmapping restores the placeholders and retains the bytes for later remapping. Releasing an entire grant remains subject to the allocation registry and is refused while any of its views is live. The caller must keep the placeholders alive and use the shim to unmap views. This desktop profile requires Windows placeholder reservations supplied by the caller. Console reservation flags and system-partition transfers remain open.
+
+`xmem_shim_mapped_pages` checks the shared values at two addresses, scatter order, readback after remapping, refusal of release while mapped, and rollback if a later destination has no placeholder.
+
 ### Tools-memory availability fixture
 
 The source-built caller ([`tools_mem_caller.asm`](../tests/cpu/tools_mem_caller.asm)) imports `XMemIsToolsMemAvailable` by name. It queries twice and checks the recorded count before choosing a path. The controlled recording provider ([`tools_mem_provider.cpp`](../tests/cpu/tools_mem_provider.cpp)) returns FALSE for the fallback path (exit 42) or TRUE for the tools-memory path (exit 84). The same EXE exits with a live test worker under the Windows loader and returns its result to the host under `pe_map`. Withholding the query export stops mapping at import resolution before entry, with the trace provider still available.
