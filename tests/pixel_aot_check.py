@@ -8277,6 +8277,8 @@ def check_pack_b32_lowering():
         "v_pack_b32_f16_e32 v12, s44, v18",
         f"{good} clamp",
         "v_pack_b32_f16 v12, s44, v18 op_sel:[1,0]",
+        "v_pack_b32_f16 v12, 3.0, v18",
+        "v_pack_b32_f16 v12, v18, 0.25",
         "v_pack_b32_f16 v12, s44, v18 op_sel:[0,1] op_sel_hi:[0,0]",
         "v_pack_b32_f16 v12, s44",
         "v_pack_b32_f16 v12, s44, v18, s46",
