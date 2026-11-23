@@ -3796,6 +3796,116 @@ nonzero-LOD, already-separated and passthrough controls run without a GPU.
 ctest --preset dev --no-tests=error -R '^spirv_compare_sampler_' -V
 ```
 
+### DXC compile time on a mixed-sampler compute shader
+
+The replay profile in [#676](https://github.com/R0Y00/Xbox2Windows/issues/676) compiles
+mixed-sampler compute shaders with DXC, and
+[#775](https://github.com/R0Y00/Xbox2Windows/issues/775) recorded compile timeouts under
+a 90 s policy. The [compile-time tool](../tools/dxc_compile_time.py) generates HLSL from
+the shape of the named sampler fixture and times one DXC run per variant. It uses only
+the Python standard library and an external DXC executable. It is not registered in CI
+and holds no timeout or threshold of its own: `--timeout` is supplied by the caller and
+is a local policy value.
+
+The generated sources keep the fixture's declarations and its two control stores
+verbatim, so words 0-3 of the UAV are identical in every variant. Each family changes
+one property:
+
+- `control`: the emitted fixture source unchanged (685 bytes with LF line ends, one
+  texture, both sampler views and a raw UAV).
+- `samples_N`: N additional independent `SampleLevel` stores with flat control flow.
+- `branches_B`: B extra if/else regions with observable stores; sample count fixed.
+- `samplebranch_N`: one `SampleLevel` inside each divergent region, the shape of the
+  blocked compute records.
+
+Measured on 2026-11-22 with DXC 1.9.2609.5 (`01b62ad47`), Windows 11 build 26300,
+Ryzen 5 5500 (6C/12T, 15.9 GiB) and one compile at a time. Baseline command, with the
+profile's SM 6.6 and native 16-bit settings (the fixture itself declares no 16-bit
+types):
+
+```powershell
+# representative family with the 90 s replay policy
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants control,samples_1024,branches_1024,samplebranch_4096,samplebranch_8192 --repeat 3 --timeout 90 --out out\dxc-compile-time\measurements.csv
+# pass attribution from a separate diagnostic run
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants samplebranch_4096,samplebranch_8192 --ftime-report --timeout 300 --out out\dxc-compile-time\passes.json
+# optimized-off twin of the timeout case
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants samplebranch_16384 --extra-arg=-Od --timeout 300 --out out\dxc-compile-time\od.csv
+```
+
+`--repeat` records the median of the completed runs. A variant that times out, crashes
+or reports a diagnostic stops repeating and is identified by its `outcome` column; the
+wall time of a timeout row is the moment the monitor killed DXC, not a compile time.
+`--out` writes CSV, or JSON when the file name ends in `.json`; the JSON record also
+holds the per-run values, the exact command and the DXC version. `--work-dir` keeps the
+generated HLSL and DXIL, and `--list-variants` prints the generated names and source
+sizes without compiling.
+
+Key measurements, wall medians:
+
+| variant | HLSL bytes | DXC wall s | peak MiB | outcome |
+|---|---:|---:|---:|---|
+| control | 685 | 0.023 | 16.6 | DXIL |
+| samples_1024 | 107,889 | 0.314 | 36.7 | DXIL |
+| samples_16384 | 1,735,137 | 7.804 | 313.0 | DXIL |
+| branches_1024 | 148,909 | 0.333 | 41.0 | DXIL |
+| branches_16384 | 2,465,494 | 13.904 | 369.1 | DXIL |
+| samplebranch_4096 | 968,577 | 8.083 | 171.3 | DXIL |
+| samplebranch_8192 | 1,946,457 | 33.726 | 325.2 | DXIL |
+| samplebranch_12288 | 2,929,337 | 90.044 | 438.3 | timeout (marginal) |
+| samplebranch_16384 | 3,915,833 | 90.046 | 625.8 | timeout |
+| samplebranch_16384, `-Od` | 3,915,833 | 9.604 | 442.6 | DXIL |
+
+Log-log slopes of wall time against HLSL bytes are 1.10 for `samples_N`, 1.21 for
+`branches_B` and 1.51 for `samplebranch_N` between 256 and 8192. The pair that separates
+compile from timeout is `samplebranch_8192` against `samplebranch_16384` with the same
+generator and command: the first compiled in every run (27.9-46.9 s across four runs,
+33.73 s in the repetition batch), the second exceeded 90 s every time and needed
+193.12 s with a raised limit. `samplebranch_12288` is the threshold bracket: 67.77 s in
+one session, 90.04 s timeout and 97.68 s with a raised limit in another. Times on the
+largest variants vary by 20-45 % across sessions, so an outcome near the threshold can
+change in either direction. A verification run of the tool on the recording machine
+regenerated the table's source sizes and the DXIL sizes of `control`,
+`samplebranch_1024` and `samplebranch_4096` byte for byte, and their wall times were
+0.024, 0.914 and 8.515 s.
+
+Where the time goes. `-ftime-report` from a separate diagnostic run with the same flags
+(its "Total" counts LLVM/DXIL passes only) puts 81.8 % of the pass time in the two
+"Global Value Numbering" instances at `samplebranch_8192` (14.94 + 7.42 of 27.34 s);
+the shares are 70.5 % at `samplebranch_4096` and 48.0 % at `branches_16384`, where "DXIL
+simple GVN hoist" adds 9.5 %. `-Od` removes 25 % (`samples_16384`), 64 %
+(`branches_16384`), 73 % (`samplebranch_4096`), 84 % (`samplebranch_8192`) and more
+than 95 % (`samplebranch_16384`, 9.60 s instead of 193.12 s) of the wall time, and `-Vd`
+saves 4 % at `samples_16384`; validation and the frontend are not the bottleneck. The
+measured observation is that the cost grows with the coexistence of many sample
+operations and many store-bearing control-flow regions in one function. Why the two GVN
+instances do not scale is a hypothesis about DXC internals and is not established here.
+
+Compiling and dispatching are separate checks; the tool only compiles. The existing
+oracle `offscreen_check <adapter> --spirv-sampler-views <cso>` was run on the compiled
+variants and compares their four control words with the fixture:
+
+- the RTX 4060 (driver 32.0.16.2124) passed for control, `samples_1024`,
+  `samples_16384`, `branches_1024`, `branches_16384` and
+  `samplebranch_1024/4096/8192`;
+- WARP (10.0.26100.10068) passed for the smaller subset: control, `samples_1024`,
+  `branches_1024` and `samplebranch_4096`;
+- a negative control with one UV constant changed failed on both adapters, and every
+  emitted CSO was accepted by the DXC validator from the same package.
+
+`samplebranch_12288` reached pipeline creation on the RTX 4060. The call did not return
+within about 9 minutes for its 2.77 MB DXIL, so there was no dispatch. This separate
+pipeline measurement is outside the DXC time above. The DXIL validates with `dxv`
+and keeps the control stores checked by the smaller variants.
+
+The archive-replay attribution in
+[#775](https://github.com/R0Y00/Xbox2Windows/issues/775) remains open. This family
+reaches the policy timeout only at multi-MB HLSL; the fixture-scale sources compile in
+about 0.02 s and the worst measured case below 0.5 MB is 2.54 s. On a separate
+17,188,611-byte archive-derived input, an instrumented default-optimization run last
+entered `loop-rotate`. That trace locates the observed stall under instrumentation.
+Uninstrumented pass-time totals and attribution across the replay cohort remain open.
+The GPU check above covers the public fixture's four control words. [Archive trace](https://github.com/R0Y00/Xbox2Windows/issues/775)
+
 ### Minimum LOD in the SPIR-V bridge
 
 The pinned Windows SPIRV-Cross build maps the SPIR-V `MinLod` operand to the
