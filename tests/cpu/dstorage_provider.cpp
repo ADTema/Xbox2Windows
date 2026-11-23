@@ -11,14 +11,15 @@
 //   Describes factory acquisition, staging buffer configuration, queue dispatch,
 //   delayed submit, and auto-submit thresholds.
 //
-// Policy vs Evidence:
+// Convention vs Evidence:
 // - Windows runtime evidence: export binding of XCRDAPI!DStorageGetFactory and
 //   cpu_exe_io!finish_exe; execution under Windows native loader and pe_map.
 // - Public DirectStorage evidence: PC IDStorageFactory refusal (E_NOINTERFACE, *ppv untouched),
-//   method vtable slot ordering (slots 0..3, 6, 8 matching dstorage.h), delayed submission.
-// - Test-provider policy: synthetic console interface GUIDs (a0000001-... and a0000002-...),
-//   used because console GUIDs are not published in public sources; MockFactory and
-//   MockQueue test objects; memory readback staging.
+//   delayed submission until explicit Submit(), and half-capacity auto-submission threshold.
+// - Recorder convention: fresh fixture-owned interface identifiers (IID_FixtureFactory and
+//   IID_FixtureQueue) and the adapter vtable layout (slots 0..3, 6, 8 matching the recorder
+//   convention and public dstorage.h slots). A public source would be needed before a fixture
+//   or production adapter presents other IDs or slots as a platform contract.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -32,15 +33,15 @@
 #include <cstring>
 
 namespace {
-// Explicit synthetic test-provider policy interface identifiers
-// IDStorageFactory_Test: {a0000001-0000-0000-0000-000000000001}
-const GUID IID_IDStorageFactory_Test = {
-    0xa0000001, 0x0000, 0x0000, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}
+// Fresh fixture-owned interface identifiers
+// IID_FixtureFactory: {ca891497-6f8f-4d03-b1a2-f239b4ce41af}
+const GUID IID_FixtureFactory = {
+    0xca891497, 0x6f8f, 0x4d03, {0xb1, 0xa2, 0xf2, 0x39, 0xb4, 0xce, 0x41, 0xaf}
 };
 
-// IDStorageQueue_Test: {a0000002-0000-0000-0000-000000000002}
-const GUID IID_IDStorageQueue_Test = {
-    0xa0000002, 0x0000, 0x0000, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02}
+// IID_FixtureQueue: {82af1362-6445-4b96-9fbf-5d2d416b605e}
+const GUID IID_FixtureQueue = {
+    0x82af1362, 0x6445, 0x4b96, {0x9f, 0xbf, 0x5d, 0x2d, 0x41, 0x6b, 0x60, 0x5e}
 };
 
 // Public MIT DirectStorage PC IDStorageFactory: {6924ea0c-c3cd-4826-b10a-f64f4ed927c1}
@@ -119,7 +120,7 @@ struct MockQueue {
     {
         if (!ppv) return E_POINTER;
         if (IsEqualGUID(riid, IID_IUnknown) ||
-            IsEqualGUID(riid, IID_IDStorageQueue_Test) ||
+            IsEqualGUID(riid, IID_FixtureQueue) ||
             IsEqualGUID(riid, IID_IDStorageQueue_PC))
         {
             AddRef(self);
@@ -232,7 +233,7 @@ struct MockFactory {
     static HRESULT WINAPI QueryInterface(MockFactory* self, const GUID& riid, void** ppv)
     {
         if (!ppv) return E_POINTER;
-        if (IsEqualGUID(riid, IID_IUnknown) || IsEqualGUID(riid, IID_IDStorageFactory_Test)) {
+        if (IsEqualGUID(riid, IID_IUnknown) || IsEqualGUID(riid, IID_FixtureFactory)) {
             AddRef(self);
             *ppv = self;
             return S_OK;
@@ -284,7 +285,7 @@ struct MockFactory {
             *ppv = nullptr;
             return E_FAIL;
         }
-        if (!IsEqualGUID(riid, IID_IDStorageQueue_Test) && !IsEqualGUID(riid, IID_IDStorageQueue_PC)) {
+        if (!IsEqualGUID(riid, IID_FixtureQueue) && !IsEqualGUID(riid, IID_IDStorageQueue_PC)) {
             *ppv = nullptr;
             return E_NOINTERFACE;
         }
@@ -305,7 +306,7 @@ void init_vtables()
         queue_vtable[i] = reinterpret_cast<void*>(&MockFactory::DummyMethod);
     }
 
-    // Public method slot ordering from MIT microsoft/DirectStorage (include/dstorage.h):
+    // Recorder convention vtable slot ordering:
     // IDStorageFactory:
     // Slot 0..2: IUnknown
     // Slot 3: CreateQueue
@@ -345,7 +346,7 @@ extern "C" __declspec(dllexport) HRESULT WINAPI DStorageGetFactory(const GUID& r
     InterlockedIncrement(&factory_calls);
     if (!ppv) return E_POINTER;
 
-    if (!IsEqualGUID(riid, IID_IDStorageFactory_Test)) {
+    if (!IsEqualGUID(riid, IID_FixtureFactory)) {
         // DirectStorage contract: on refusal (such as PC IID or unknown interface),
         // *ppv MUST be left untouched and not clobbered.
         return E_NOINTERFACE;

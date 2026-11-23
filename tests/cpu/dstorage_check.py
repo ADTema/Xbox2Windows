@@ -1,8 +1,8 @@
 """Compare the source-built DirectStorage factory and queue caller under Windows and pe_map.
 
-Exercises the typed factory adapter, console queue creation, and delayed-submit negative controls:
-- Case 1 (Success path): DStorageGetFactory acquires IDStorageFactory_Test ({a0000001-0000-0000-0000-000000000001}),
-  configures staging buffer size (32 MiB), creates IDStorageQueue_Test ({a0000002-0000-0000-0000-000000000002}),
+Exercises the typed factory adapter, queue creation, and delayed-submit negative controls:
+- Case 1 (Success path): DStorageGetFactory acquires IID_FixtureFactory ({ca891497-6f8f-4d03-b1a2-f239b4ce41af}),
+  configures staging buffer size (32 MiB), creates IID_FixtureQueue ({82af1362-6445-4b96-9fbf-5d2d416b605e}),
   enqueues request with destination buffer, verifies completion is withheld before Submit and destination
   buffer remains unmodified (0xAA), calls Submit, verifies exact readback transfer, and releases objects (exit 0x870).
 - Case 2 (PC interface refusal): PC IDStorageFactory ({6924ea0c-c3cd-4826-b10a-f64f4ed927c1}) is refused with
@@ -155,12 +155,12 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     check("eager provider rejected exit code", mapped_code, 0x304)
     print("case 4 (eager-provider negative control): premature completion caught with exit 0x304")
 
-    # 6. Changed-IID patch control: patch IID_IDStorageFactory_Test
+    # 6. Changed-IID patch control: patch IID_FixtureFactory
     target_iid_bytes = bytes([
-        0x01, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+        0x97, 0x14, 0x89, 0xca, 0x8f, 0x6f, 0x03, 0x4d, 0xb1, 0xa2, 0xf2, 0x39, 0xb4, 0xce, 0x41, 0xaf
     ])
     patched_iid_bytes = bytes([
-        0x02, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+        0x98, 0x14, 0x89, 0xca, 0x8f, 0x6f, 0x03, 0x4d, 0xb1, 0xa2, 0xf2, 0x39, 0xb4, 0xce, 0x41, 0xaf
     ])
     with TemporaryDirectory() as temp_patch_dir:
         patched_exe = Path(temp_patch_dir) / "patched_dstorage_caller.exe"

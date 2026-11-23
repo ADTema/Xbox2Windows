@@ -2,16 +2,16 @@ EXTERN __imp_DStorageGetFactory:QWORD
 PUBLIC native_entry
 
 .data
-; Explicit synthetic test-provider policy interface identifiers
-; IDStorageFactory_Test: {a0000001-0000-0000-0000-000000000001}
-IID_IDStorageFactory_Test db 01h, 00h, 00h, 0a0h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 01h
+; Fresh fixture-owned interface identifiers
+; IID_FixtureFactory: {ca891497-6f8f-4d03-b1a2-f239b4ce41af}
+IID_FixtureFactory    db 97h, 14h, 89h, 0cah, 8fh, 6fh, 03h, 4dh, 0b1h, 0a2h, 0f2h, 39h, 0b4h, 0ceh, 41h, 0afh
 
-; IDStorageQueue_Test: {a0000002-0000-0000-0000-000000000002}
-IID_IDStorageQueue_Test   db 02h, 00h, 00h, 0a0h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 02h
+; IID_FixtureQueue: {82af1362-6445-4b96-9fbf-5d2d416b605e}
+IID_FixtureQueue      db 62h, 13h, 0afh, 82h, 45h, 64h, 96h, 4bh, 9fh, 0bfh, 5dh, 2dh, 41h, 6bh, 60h, 5eh
 
 ; Public MIT DirectStorage PC IDStorageFactory: {6924ea0c-c3cd-4826-b10a-f64f4ed927c1}
 ; Source: https://github.com/microsoft/DirectStorage (include/dstorage.h, MIT license)
-IID_IDStorageFactory_PC   db 0ch, 0eah, 24h, 69h, 0cdh, 0c3h, 26h, 48h, 0b1h, 0ah, 0f6h, 4fh, 4eh, 0d9h, 27h, 0c1h
+IID_IDStorageFactory_PC db 0ch, 0eah, 24h, 69h, 0cdh, 0c3h, 26h, 48h, 0b1h, 0ah, 0f6h, 4fh, 4eh, 0d9h, 27h, 0c1h
 
 pFactory dq 0
 pQueue   dq 0
@@ -75,9 +75,9 @@ native_entry PROC FRAME
     cmp qword ptr [pFactory], 0DEADBEEFh
     jne fail_pc_clobber
 
-    ; Step 1: DStorageGetFactory(&IID_IDStorageFactory_Test, &pFactory)
+    ; Step 1: DStorageGetFactory(&IID_FixtureFactory, &pFactory)
     mov qword ptr [pFactory], 0
-    lea rcx, IID_IDStorageFactory_Test
+    lea rcx, IID_FixtureFactory
     lea rdx, pFactory
     call qword ptr [__imp_DStorageGetFactory]
     test eax, eax
@@ -86,18 +86,18 @@ native_entry PROC FRAME
     test rcx, rcx
     jz fail_factory
 
-    ; Step 2: factory->SetStagingBufferSize(0x2000000) (slot 8 = +0x40 in dstorage.h)
+    ; Step 2: factory->SetStagingBufferSize(0x2000000) (slot 8 = +0x40 per recorder convention)
     mov rax, qword ptr [rcx]
     mov edx, 2000000h
     call qword ptr [rax + 40h]
     test eax, eax
     js fail_staging_buffer
 
-    ; Step 3: factory->CreateQueue(&queue_desc, &IID_IDStorageQueue_Test, &pQueue) (slot 3 = +0x18 in dstorage.h)
+    ; Step 3: factory->CreateQueue(&queue_desc, &IID_FixtureQueue, &pQueue) (slot 3 = +0x18 per recorder convention)
     mov rcx, qword ptr [pFactory]
     mov rax, qword ptr [rcx]
     lea rdx, queue_desc
-    lea r8, IID_IDStorageQueue_Test
+    lea r8, IID_FixtureQueue
     lea r9, pQueue
     call qword ptr [rax + 18h]
     test eax, eax
@@ -106,7 +106,7 @@ native_entry PROC FRAME
     test rcx, rcx
     jz fail_create_queue
 
-    ; Step 4: queue->EnqueueRequest(&test_request) (slot 3 = +0x18 in dstorage.h)
+    ; Step 4: queue->EnqueueRequest(&test_request) (slot 3 = +0x18 per recorder convention)
     mov rcx, qword ptr [pQueue]
     mov rax, qword ptr [rcx]
     lea rdx, test_request
@@ -122,7 +122,7 @@ native_entry PROC FRAME
     cmp byte ptr [dest_buffer], 0AAh
     jne fail_delayed_submit
 
-    ; Step 6: queue->Submit() (slot 6 = +0x30 in dstorage.h)
+    ; Step 6: queue->Submit() (slot 6 = +0x30 per recorder convention)
     mov rcx, qword ptr [pQueue]
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 30h]
