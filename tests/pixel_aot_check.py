@@ -6331,36 +6331,69 @@ def check_controls(directory):
     wait = program.index("s_waitcnt lgkmcnt(0)", program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
     expect_value_error(translate_int, program[:wait] + ["v_cvt_u32_f32_e32 v19, s45"] + program[wait:],
                        "Constant read before load completion")
-    for bad in ("v_cvt_u32_f32_e64 v12, s44", "v_cvt_i32_f32_e64 v12, s44",
-                "v_cvt_u32_f32_e64 v12, |s44|", "v_cvt_i32_f32_e64 v12, -s44",
-                "v_cvt_u32_f32_e64 v12, s44 clamp", "v_cvt_i32_f32_e64 v12, s44 omod:2",
+    for bad in ("v_cvt_u32_f32_e64 v12, s44 clamp", "v_cvt_i32_f32_e64 v12, s44 omod:2",
                 "v_cvt_u32_f32_dpp v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
                 "v_cvt_i32_f32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD",
                 "v_cvt_u32_f32_e32 v12, 0.5", "v_cvt_u32_f32_e32 v12, 1", "v_cvt_i32_f32_e32 v12, -1",
-                "v_cvt_rpi_i32_f32_e32 v12, v13", "v_cvt_flr_i32_f32_e32 v12, v13"):
+                "v_cvt_u32_f32_e64 v12, 0.5", "v_cvt_u32_f32_e64 v12, 1", "v_cvt_i32_f32_e64 v12, -1",
+                "v_cvt_i32_f32_e64 v12, -0x40400000", "v_cvt_u32_f32_e64 v12, |-s44|",
+                "v_cvt_i32_f32_e64 v12, --s44",
+                "v_cvt_rpi_i32_f32_e32 v12, v13", "v_cvt_flr_i32_f32_e32 v12, v13",
+                "v_cvt_rpi_i32_f32_e64 v12, -v13", "v_cvt_flr_i32_f32_e64 v12, |v13|"):
         expect_value_error(translate, with_constants([bad]), "Unsupported instruction")
     for inst, diagnostic in (("v_cvt_i32_f32_e32 v256, s44", "Invalid signed conversion register"),
-                             ("v_cvt_i32_f32_e32 v12, v255", "Unbound pixel input v255")):
+                             ("v_cvt_i32_f32_e32 v12, v255", "Unbound pixel input v255"),
+                             ("v_cvt_u32_f32_e64 v256, |s44|", "Invalid unsigned conversion register"),
+                             ("v_cvt_i32_f32_e64 v12, -s106", "Invalid signed conversion register"),
+                             ("v_cvt_u32_f32_e64 v12, -|v255|", "Unbound pixel input v255")):
         expect_value_error(translate, with_constants([inst]), diagnostic)
-    # Positive control: the same harness accepts the plain forms, so the rejections above come from the form.
+    # Positive control: plain e32 and e64 lower identically through the shared src/ffx_float_to_int.hlsli helpers.
     for good in ("v_cvt_u32_f32_e32 v12, s44", "v_cvt_i32_f32_e32 v12, s44", "v_cvt_u32_f32_e32 v12, 0x40400000"):
-        translate(with_constants([good]))
+        e32_hlsl = translate(with_constants([good]))
+        assert translate(with_constants([good.replace("_e32", "_e64")])) == e32_hlsl
+    # e64 source modifiers apply bitwise sign-bit ops before the shared helper, never FP abs/neg.
+    e64_mod_hlsl = translate_int(uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY))
+    assert e64_mod_hlsl.count("uint cvt_i32_f32(uint bits)") == 1
+    assert "(asuint(params[0].w) & 0x7fffffffu)" in e64_mod_hlsl, e64_mod_hlsl
+    assert "(asuint(params[1].x) ^ 0x80000000u)" in e64_mod_hlsl, e64_mod_hlsl
+    assert "((asuint(params[1].y) & 0x7fffffffu) ^ 0x80000000u)" in e64_mod_hlsl, e64_mod_hlsl
+    assert "abs(" not in e64_mod_hlsl.split("uint4 main", 1)[1], e64_mod_hlsl
+    assert translate(with_constants(["v_cvt_u32_f32_e64 v12, abs(s44)"])) == translate(with_constants(["v_cvt_u32_f32_e64 v12, |s44|"]))
+    assert translate(with_constants(["v_cvt_i32_f32_e64 v12, neg(s44)"])) == translate(with_constants(["v_cvt_i32_f32_e64 v12, -s44"]))
+    for alt in ("-abs(s44)", "neg(abs(s44))", "neg(|s44|)"):
+        assert translate(with_constants([f"v_cvt_i32_f32_e64 v12, {alt}"])) == translate(with_constants(["v_cvt_i32_f32_e64 v12, -|s44|"]))
+    lit_e64 = translate_int(uncompressed_export([
+        "v_cvt_u32_f32_e64 v12, |0xc0300000|",
+        "v_cvt_i32_f32_e64 v13, neg(0x40400000)",
+        "v_cvt_i32_f32_e64 v14, -|0xc0300000|",
+        "v_cvt_u32_f32_e64 v15, 0x40400000",
+    ]))
+    assert "(asuint(asfloat(3224371200u)) & 0x7fffffffu)" in lit_e64
+    assert "(asuint(asfloat(1077936128u)) ^ 0x80000000u)" in lit_e64
+    assert "((asuint(asfloat(3224371200u)) & 0x7fffffffu) ^ 0x80000000u)" in lit_e64
+    e64_wait = program.index("s_waitcnt lgkmcnt(0)", program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    expect_value_error(translate_int, program[:e64_wait] + ["v_cvt_i32_f32_e64 v19, -|s45|"] + program[e64_wait:],
+                       "Constant read before load completion")
     # Guards: the destination may not overlap an outstanding image_sample, and the lowering needs the entry mask.
     sample = next(i for i, line in enumerate(with_constants([])) if line.startswith("image_sample"))
     for op in ("u32", "i32"):
-        overlap = with_constants([])
-        overlap.insert(sample + 1, f"v_cvt_{op}_f32_e32 v12, 0x40400000")
-        expect_value_error(translate, overlap, "Write overlaps an outstanding sample")
-        ok = with_constants([])
-        ok.insert(sample + 1, f"v_cvt_{op}_f32_e32 v20, 0x40400000")
-        translate(ok)
-        if op == "i32":
-            quad = with_constants([])
-            quad.insert(quad.index("s_wqm_b64 exec, exec") + 1, f"v_cvt_{op}_f32_e32 v20, 0x40400000")
-            expect_value_error(translate, quad, "Invalid conversion")
-        entry = with_constants([])
-        entry.insert(entry.index("s_and_b64 exec, exec, s[50:51]") + 1, f"v_cvt_{op}_f32_e32 v20, 0x40400000")
-        translate(entry)
+        for suffix, src in (("_e32", "0x40400000"), ("_e64", "-|0x40400000|")):
+            overlap = with_constants([])
+            overlap.insert(sample + 1, f"v_cvt_{op}_f32{suffix} v12, {src}")
+            expect_value_error(translate, overlap, "Write overlaps an outstanding sample")
+            ok = with_constants([])
+            ok.insert(sample + 1, f"v_cvt_{op}_f32{suffix} v20, {src}")
+            translate(ok)
+            if op == "i32" or suffix == "_e64":
+                quad = with_constants([])
+                quad.insert(quad.index("s_wqm_b64 exec, exec") + 1, f"v_cvt_{op}_f32{suffix} v20, {src}")
+                expect_value_error(translate, quad, "Invalid conversion")
+            entry = with_constants([])
+            entry.insert(entry.index("s_and_b64 exec, exec, s[50:51]") + 1, f"v_cvt_{op}_f32{suffix} v20, {src}")
+            translate(entry)
+    pending_src = with_constants([])
+    pending_src.insert(sample + 1, "v_cvt_u32_f32_e64 v20, |v12|")
+    expect_value_error(translate, pending_src, "Sample used before vmcnt wait")
     # v_cvt_f32_u32 and v_cvt_f32_i32 reject float modifiers, float literals, out-of-range immediates and bad registers.
     body = translate(with_constants([
         "v_cvt_f32_i32_e32 v12, -42",
@@ -7304,6 +7337,9 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True, clamp=True)), translate))
     fixtures.append((uncompressed_export(cvt_float_body(0x3fc00000, 0xc0300000)), translate_int))
     fixtures.extend((uncompressed_export(nc_integer_group(group)), translate_int) for group in (1, 2, 3))
+    fixtures.append((uncompressed_export(CVT_FLOAT_E64_PLAIN_BODY), translate_int))
+    fixtures.append((uncompressed_export(CVT_FLOAT_E64_U32_MOD_BODY), translate_int))
+    fixtures.append((uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY), translate_int))
     fixtures.append((uncompressed_export(f16_compares()), translate_int))
     fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
@@ -8130,6 +8166,142 @@ def check_cvt_float_int_draw(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapping the float-to-word conversions escaped detection")
+
+
+def apply_f32_mod(word, *, abs_mod=False, neg_mod=False):
+    if abs_mod:
+        word &= 0x7fffffff
+    if neg_mod:
+        word ^= 0x80000000
+    return word
+
+
+CVT_FLOAT_E64_PLAIN_BODY = [
+    "v_mov_b32_e32 v18, s45",
+    "v_cvt_u32_f32_e64 v12, s44",
+    "v_cvt_i32_f32_e64 v13, s44",
+    "v_cvt_u32_f32_e64 v14, v18",
+    "v_cvt_i32_f32_e64 v15, v18",
+]
+
+CVT_FLOAT_E64_U32_MOD_BODY = [
+    "v_mov_b32_e32 v18, s47",
+    "v_cvt_u32_f32_e64 v12, |s44|",
+    "v_cvt_u32_f32_e64 v13, -s45",
+    "v_cvt_u32_f32_e64 v14, -|s46|",
+    "v_cvt_u32_f32_e64 v15, |v18|",
+]
+
+CVT_FLOAT_E64_I32_MOD_BODY = [
+    "v_mov_b32_e32 v18, s47",
+    "v_cvt_i32_f32_e64 v12, |s44|",
+    "v_cvt_i32_f32_e64 v13, -s45",
+    "v_cvt_i32_f32_e64 v14, -|s46|",
+    "v_cvt_i32_f32_e64 v15, -v18",
+]
+
+CVT_FLOAT_E64_MOD_SETS = (
+    # Negative fractions: dropping any abs or neg modifier changes the output word.
+    (0xc0300000, 0xc0300000, 0xc0300000, 0xbfc00000),  # -2.75, -2.75, -2.75, -1.5
+    # Positive fractions and 2^31 saturation / near-limit boundaries.
+    (0x40200000, 0x4f000000, 0x4f000000, 0x4effffff),  # +2.5, +2^31, +2^31, +(2^31-128)
+    # Negative saturation boundaries and unsigned high range after abs/neg.
+    (0xcf7fffff, 0xcf000000, 0xcf800000, 0xcf800000),  # -(2^32-256), -2^31, -2^32, -2^32
+    # Signed infinities and negative zero.
+    (0xff800000, 0xff800000, 0x7f800000, 0x80000000),  # -inf, -inf, +inf, -0.0
+    # Quiet/signaling NaNs of both signs and smallest negative subnormal -> all 0.
+    (0x7fc00000, 0xffc00001, 0x7f800001, 0x80000001),
+)
+
+
+def check_cvt_float_int_e64_draw(directory, compiler, renderer, backend):
+    assert F32_DENORM_MODE == "preserve"
+    source = directory / "cvt_float_int_e64.hlsl"
+    shader = directory / "cvt_float_int_e64.cso"
+
+    def make_case(name, input_words, expected_words):
+        path = directory / f"cvt_e64_{name}.case"
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *input_words)
+        for word in expected_words:
+            assert struct.unpack("<I", struct.pack("<f", as_float(word)))[0] == word, hex(word)
+        write_case(path, bytes(constants), tuple(as_float(word) for word in expected_words), integer_rt=True)
+        return path
+
+    # Plain e64 parity on all 18 CVT_FLOAT_WORDS through SGPR (s44) and VGPR (v18).
+    source.write_text(translate_int(uncompressed_export(CVT_FLOAT_E64_PLAIN_BODY)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for idx, ((w0, u0, i0), (w1, u1, i1)) in enumerate(zip(CVT_FLOAT_WORDS[0::2], CVT_FLOAT_WORDS[1::2])):
+        cases.append((make_case(f"plain_{idx}", (w0, w1, 0, 0), (u0, i0, u1, i1)), "pass"))
+    # Bitwise negative control: flipping a single bit in an expected word must report mismatch.
+    cases.append((make_case("plain_bitflip", (0x4effffff, 0xc0300000, 0, 0),
+                            (0x7fffff81, 0x7fffff80, 0x00000000, 0xfffffffe)), "mismatch"))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+    # Swapping u32 and i32 in the plain e64 shader must fail on (-0.5, -1.0).
+    swapped = [
+        line.replace("v_cvt_u32_f32_e64", "TMP").replace("v_cvt_i32_f32_e64", "v_cvt_u32_f32_e64")
+        .replace("TMP", "v_cvt_i32_f32_e64")
+        for line in CVT_FLOAT_E64_PLAIN_BODY
+    ]
+    source.write_text(translate_int(uncompressed_export(swapped)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    swap_case = make_case("plain_swap", (0xbf000000, 0xbf800000, 0, 0), (0, 0, 0, 0xffffffff))
+    wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, swap_case], capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Swapping u32 and i32 on e64 float-to-word conversions escaped detection")
+
+    # Source abs/neg modifier draws and shader-mutation negative controls for both u32 and i32.
+    mod_specs = (
+        ("u32", CVT_FLOAT_E64_U32_MOD_BODY, cvt_u32_ref,
+         ((True, False), (False, True), (True, True), (True, False)),
+         (("|s44|", "s44", "drop abs on u32 SGPR"),
+          ("-s45", "s45", "drop neg on u32 SGPR"),
+          ("-|s46|", "|s46|", "drop neg on u32 -|SGPR|"),
+          ("-|s46|", "-s46", "drop abs on u32 -|SGPR|"),
+          ("|v18|", "v18", "drop abs on u32 VGPR"))),
+        ("i32", CVT_FLOAT_E64_I32_MOD_BODY, cvt_i32_ref,
+         ((True, False), (False, True), (True, True), (False, True)),
+         (("|s44|", "s44", "drop abs on i32 SGPR"),
+          ("-s45", "s45", "drop neg on i32 SGPR"),
+          ("-|s46|", "|s46|", "drop neg on i32 -|SGPR|"),
+          ("-|s46|", "-s46", "drop abs on i32 -|SGPR|"),
+          ("-v18", "v18", "drop neg on i32 VGPR"))),
+    )
+    for kind, body, ref_fn, chan_mods, mutations in mod_specs:
+        source.write_text(translate_int(uncompressed_export(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        batch = []
+        set0_expected = None
+        for idx, words in enumerate(CVT_FLOAT_E64_MOD_SETS):
+            expected = tuple(
+                ref_fn(apply_f32_mod(w, abs_mod=a, neg_mod=n))
+                for w, (a, n) in zip(words, chan_mods)
+            )
+            if idx == 0:
+                set0_expected = expected
+            batch.append((make_case(f"{kind}_mod_{idx}", words, expected), "pass"))
+        # Bitwise negative control on the saturation boundary set: flipping bit 0 must fail.
+        boundary_expected = tuple(
+            ref_fn(apply_f32_mod(w, abs_mod=a, neg_mod=n))
+            for w, (a, n) in zip(CVT_FLOAT_E64_MOD_SETS[2], chan_mods)
+        )
+        flipped = (boundary_expected[0] ^ 1, *boundary_expected[1:])
+        batch.append((make_case(f"{kind}_bitflip", CVT_FLOAT_E64_MOD_SETS[2], flipped), "mismatch"))
+        run_pixel_batch(renderer, backend, shader, batch)
+
+        # Shader-mutation negative controls against set 0 (-2.75, -2.75, -2.75, -1.5).
+        set0_case = make_case(f"{kind}_mut_ref", CVT_FLOAT_E64_MOD_SETS[0], set0_expected)
+        for old, new, label in mutations:
+            mutated = [line.replace(old, new) for line in body]
+            assert mutated != body, label
+            source.write_text(translate_int(uncompressed_export(mutated)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, set0_case],
+                                   capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                raise AssertionError(f"Modifier mutation ({label}) escaped detection")
 
 
 def check_int_minmax_draws(directory, compiler, renderer, backend):
@@ -9711,6 +9883,13 @@ def main():
         if mode == "draw-first-bit":
             try:
                 return check_scalar_first_bit_draw(directory, *args)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
+                    return 77
+                raise
+        if mode == "draw-cvt-float-int-e64":
+            try:
+                return check_cvt_float_int_e64_draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
                     return 77
