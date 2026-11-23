@@ -808,10 +808,9 @@ class TestRdna2Disasm(unittest.TestCase):
         # All 33 SDWA lines are 8 bytes each and must produce 33 distinct encodings.
         self.assertEqual(len({emitted[i:i + 8] for i in range(0, 33 * 8, 8)}), 33)
         # Verify LLVM 15 itself refuses every reserved/wrong-type SDWA bit pattern we reject.
+        # (src0_sel/src1_sel == 7 is intentionally omitted here: LLVM 15's printSDWASel hits llvm_unreachable.)
         for bad_hex in (
             "f904427c01000606",
-            "f904887d01000706",
-            "f904887d01000607",
             "f904887d01864606",
             "f904887d01860646",
             "f904027c01860e06",
