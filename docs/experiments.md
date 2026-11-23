@@ -4324,6 +4324,37 @@ come from the adapter's mip filtering. The 1/128 tolerance was chosen from these
 measurements, not from a specified precision. Whether this explains the
 archive differences is not established. [Issue](https://github.com/R0Y00/Xbox2Windows/issues/809)
 
+## Quad-local DS swizzle in pixel shaders
+
+The pixel profile lowers `ds_swizzle_b32` with the LLVM `QUAD_PERM` spelling.
+Each of the four two-bit selectors picks the source lane for the corresponding
+lane in the same quad. The profile requires a verified whole-quad execution
+region, a VGPR defined for the whole quad, and an immediate
+`s_waitcnt lgkmcnt(0)`. The generated HLSL reads the source as `uint` through
+quad intrinsics before restoring the bits to the VGPR value. GDS, bit-mask
+mode and other DS operations remain outside this profile.
+[AMD cross-lane instruction semantics](https://gpuopen.com/learn/amd-gcn-assembly-cross-lane-operations/)
+
+The source-built fixture assembles for `gfx1030` with wave64 in the LLVM 15
+binary round trip. On Windows it compares 256 `R32G32B32A32_UINT` channel words
+from an 8×8 draw to a CPU reference derived from pixel centers. The four
+exports exercise a mixed permutation on X and Y, a horizontal swap, and a
+broadcast. Changing the swap to identity must report a mismatch at (0, 0) in
+blue (`0x3e400000` expected, `0x3d800000` observed). The lowering controls reject
+missing or insufficient waits, non-quad execution, GDS, an out-of-range
+selector, an undefined source, an out-of-range VGPR and a cross-quad mode.
+
+Measured on the patch based on `e97090a` with Windows 11 25H2 build 26200.9974,
+Windows SDK DXC 1.8.2502.11 and the D3D12 debug layer enabled. Microsoft Basic
+Render Driver (WARP 10.0.26100.9818) and Radeon RX 7900 XTX (32.0.32029.2010)
+both matched every channel bit and caught the negative control. Neither test
+skipped. This measures the desktop translation against the reference.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_ds_swizzle_(warp|hardware)$' -V
+```
+
 ## Independent bit and byte alignment readback
 
 The `pixel_aot_align_warp` and `pixel_aot_align_hardware` fixtures run dedicated

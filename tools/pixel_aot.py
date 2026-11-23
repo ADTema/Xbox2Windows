@@ -1913,6 +1913,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     vector_loads = 0  # image samples and title loads issued, in vmcnt order
     title_loads = False
     sample_dest = {}  # VGPR -> issue number of its outstanding image_sample or title load
+    ds_needs_wait = False
     exported = False
     channel_mask = 0xF
     ended = False
@@ -1927,6 +1928,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
 
         if ended:
             raise ValueError("Instruction follows program end")
+        if ds_needs_wait:
+            if line != "s_waitcnt lgkmcnt(0)":
+                raise ValueError("ds_swizzle_b32 requires an immediate s_waitcnt lgkmcnt(0)")
+            ds_needs_wait = False
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
             continue
         # SOPK s_version K (gfx10+) has no destination and does not write SCC: a marker with no effect.
@@ -3071,6 +3076,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"ds_swizzle_b32 (v\d+), (v\d+) offset:swizzle\(QUAD_PERM,([0-3](?:,[0-3]){3})\)"):
+            dst, src, selectors = m.groups()
+            value = vector.get(src)
+            if (mask != "quad" or int(dst[1:]) > 255 or int(src[1:]) > 255
+                    or src in sample_dest or dst in sample_dest
+                    or not isinstance(value, str) or value not in quad_values):
+                raise ValueError(f"ds_swizzle_b32 requires a whole-quad VGPR source and destination: {line}")
+            perm = [int(selector) for selector in selectors.split(",")]
+            bits = emit_quad_swizzle_u32(lines, i, value, perm)
+            result = f"alu{i}"
+            vector[dst] = result
+            quad_values[result] = quad_values[value]
+            lines.append(f"    precise float {result} = asfloat({bits});")
+            ds_needs_wait = True
         elif m := match(rf"v_({'|'.join(DPP_INT32)})_dpp (v\d+), (.+)"):
             op, dst, rest = m.groups()
             arity, template, helper = DPP_INT32[op]
