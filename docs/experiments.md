@@ -1576,41 +1576,59 @@ ctest --preset dev --no-tests=error -R '^cpu_native_exe_tls$' -V
 
 ### Main-image TLS slot 0
 
-Code compiled with `/GA` assumes that its EXE owns TLS index 0. It reads a thread-local through `gs:[58h]` and then the first entry of that array (`mov rcx, gs:[58h]` / `mov rcx, [rcx]`) without loading `_tls_index`. Under a Windows launch the EXE does own index 0. `pe_map` serves an image's template through a carrier DLL with its own index, so a mapped `/GA` image would read and write whatever block the host keeps in slot 0. The rule, the per-thread method and the fixture shape come from MoonYueya's notes on [issue #870](https://github.com/R0Y00/Xbox2Windows/issues/870). The code here is this repository's own.
+Code compiled with `/GA` assumes that its EXE owns TLS index 0. It reads a thread-local through `gs:[58h]` and then the first entry of that array (`mov rcx, gs:[58h]` / `mov rcx, [rcx]`) without loading `_tls_index`. Under a Windows launch the EXE does own index 0. `pe_map` serves an image's template through a carrier DLL with its own index, so a mapped `/GA` image would read and write whatever block the host keeps in slot 0. The rule and the fixture shape come from MoonYueya's notes on [issue #870](https://github.com/R0Y00/Xbox2Windows/issues/870). The code here is this repository's own.
 
-`pe_map_run_main` is `pe_map_run` for the image the host treats as its main executable:
+`pe_map_run_main` is `pe_map_run` for the image the host treats as its main executable. Only participating threads get the image's block in slot 0, and each thread swaps its own slot, never another thread's. The participants are:
 
-- Before the process-attach callbacks, it saves slot 0 of the calling thread and of every other thread that receives thread notifications, and installs the image's block (the carrier's entry).
-- Until `pe_map_release`, it does the same for each thread on `DLL_THREAD_ATTACH`, before any image is notified.
-- Records are keyed by thread ID and TEB. A record left by a thread that ended without a detach is dropped when its ID attaches again, or at release.
-- On `DLL_THREAD_DETACH`, slot 0 gets the saved block back after the image's callbacks and before ntdll frees the thread's blocks. Otherwise ntdll would free the image's block twice, as slot 0's and as the carrier's.
-- `pe_map_release` restores every recorded thread that is still alive. If one cannot be restored, the carrier stays loaded so its block is never freed while a thread can reach it.
-- The sweep skips threads whose TEB marks them as skipping thread notifications or as loader workers, because no detach would give their slot back.
-- While the image is installed, the host's own index-0 code reads the image's block. A host that owns slot 0 therefore must not touch its own thread-locals until release. This rules out a Python host: in Python 3.13, `python313.dll` carries static TLS.
+- the thread that calls `pe_map_run_main`, from before the process-attach callbacks until `pe_map_release` on that thread;
+- threads the image starts, recognised by a Windows start address inside the image, from their `DLL_THREAD_ATTACH` (before any image is notified) until their `DLL_THREAD_DETACH` (after every image was notified, and before ntdll frees the thread's blocks);
+- host threads between their own `pe_map_main_thread_enter` and `pe_map_main_thread_leave`.
 
-`cpu_exe_tls_slot0` is a CRT-free `/GA` EXE. Its template holds an int (7) and a `0x1400`-byte array of `0xFF`. Its TLS callback and each of its threads (the initial thread and two workers) check whether slot 0 equals the entry at `_tls_index`. Only when it does, a thread checks its template copy, writes the whole array, reads it back and calls `HeapValidate`. `cpu_exe_tls_slot0_host` is a CRT-free host with its own TLS directory and a thread-local sentinel, so its block owns slot 0. It binds only `kernel32.dll`, maps the EXE and starts it. `cpu_native_exe_tls_slot0` compares three runs:
+How each participant is handled:
+
+- **Saving slot 0.** A participant keeps its previous slot 0 in a pe_map TLS slot reserved at the start. The slot index is below `TLS_MINIMUM_AVAILABLE`, so setting it never allocates.
+- **Tracking.** Its thread handle goes into a fixed table of 64 entries.
+- **At release**, every participant ends up in one of three states:
+  - restored;
+  - confirmed exited (its handle is signaled, and its blocks went with the thread);
+  - uncertain: still running, untracked (the table was full or the handle could not be duplicated), an attaching thread whose start address could not be read, or a slot 0 that no longer held the image's block.
+- **When anything is uncertain**, release reports an incomplete release (`pe_map_main_tls_stats`, last release 0) and keeps the carrier loaded, so the block stays allocated. The participant's own later leave or detach still restores its slot. Another main image is refused while such a participant is pending.
+
+Threads that do not participate are never touched. On a participating thread, the host's own index-0 code reads the image's block, so a host that owns slot 0 must not touch its thread-locals there. This rules out a Python host: in Python 3.13, `python313.dll` carries static TLS.
+
+`cpu_exe_tls_slot0` is a CRT-free `/GA` EXE. Its template holds an int (7) and a `0x1400`-byte array of `0xFF`. Its TLS callback and each of its threads (the initial thread and two workers) check whether slot 0 equals the entry at `_tls_index`. Only when it does, a thread checks its template copy, writes the whole array, reads it back and calls `HeapValidate`. Two tests keep the evidence separate.
+
+`cpu_native_exe_tls_slot0_windows` launches the EXE with Windows, where it owns index 0:
 
 ```text
-Windows launch:        LOG:m1=yy m:yyyy a2=yy a:yyyy a3=y- b2=yy b:yyyy b3=y- X=0
-pe_map_run_main:       LOG:m1=yy m:yyyy a2=yy a:yyyy a3=y- b2=yy b:yyyy b3=y- X=0
-  HOST: installed_main=y installed_existing=y host_tls=y existing_host_tls=y heap_valid=y stats=5,4,1,0,0,0
-pe_map_run (control):  LOG:m1=n- m:n--- a2=n- a:n--- a3=n- b2=n- b:n--- b3=n- X=8
+LOG:m1=yy m:yyyy a2=yy a:yyyy a3=y- b2=yy b:yyyy b3=y- X=0
 ```
+
+`cpu_native_exe_tls_slot0` runs `cpu_exe_tls_slot0_host`, a CRT-free host whose own TLS block owns slot 0. It binds only `kernel32.dll` and runs one scenario per process. In every scenario, a reader thread that never participates samples its own slot 0 and its sentinel from before the map until after release, and must never see either change. Counters are installed, restored, exited, uncertain, pending, active, last release and untracked:
+
+| Scenario | Guest log | Release | Carrier after release | Counters |
+|---|---|---|---|---|
+| `main`: a host thread enters and leaves | as Windows | complete | unloaded | `4,4,0,0,0,0,1,0` |
+| `alive`: a host participant is inside the image at release | as Windows | uncertain | kept | `4,4,0,1,0,0,0,0` |
+| `exited`: a host participant is ended with `TerminateThread` | as Windows | complete, exit confirmed | unloaded | `4,3,1,0,0,0,1,0` |
+| `untracked`: 64 host participants, the last finds the table full | as Windows | uncertain (cannot inspect) | kept | `67,67,0,1,0,0,0,0` |
+| `plain`: `pe_map_run` (negative control) | every slot-0 check `n`, `X=8` | none | unloaded | `0,0,0,0,0,0,-1,0` |
 
 Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release`:
 
-- **Guest log.** Under `pe_map_run_main` it equals the Windows launch. Slot 0 holds the image's block on process attach, on both workers' attach and detach callbacks, and in each thread's own check.
-- **Host threads.** After the start, slot 0 of the host's thread and of a host thread that existed before the start holds the image's block. After release, both threads have the host's block and sentinel back, and the heap validates.
-- **Counters.** Installed, restored, stale, mismatched, live records and active read `5,4,1,0,0,0`. A host thread that held the image's block is ended with `TerminateThread`, so it is never restored, and release drops its record as stale without writing to its freed TEB.
-- **ID reuse.** The host also searches up to 1000 new threads for one that reuses the dead thread's ID. That ID comes from a system-wide table that hands freed IDs out again only after other free IDs, so reuse cannot be forced. It was observed in 1 of more than 30 runs, where the record was dropped on that attach (counters `6,5,1,0,0,0`). The test accepts either outcome and checks the drop only when reuse is observed.
-- **Plain `pe_map_run` (negative control).** The host's block stays in slot 0 and every slot-0 check reports `n`. The guest skips its writes, which would otherwise land in the host's block.
-- **Mutation (not part of the test).** A `pe_map` that does not restore the releasing thread fails with `host_tls`.
+- In every scenario the reader's slot 0 and sentinel stayed unchanged over millions of samples. The starting thread had the host's block and sentinel back after release, and the heap validated.
+- The participants saw the image's block after entering, and their own block and sentinel after leaving, including a participant that left after an uncertain release.
+- Two mutations, not committed, both fail the test because the carrier is unloaded and the release is reported complete: counting a still-running participant as exited, and ignoring untracked participants.
 
-Not covered: CRT EXEs and the exit path. A CRT EXE that returns from `main` calls `ExitProcess`, so slot 0 has to be given back from a hook on the image's own `ExitProcess` import, and its CRT's thread-detach callback frees what it finds in slot 0 (MoonYueya, #870). Also not covered: a worker still alive at exit, threads that attach during the process-attach callbacks, and more than one main image per process (refused).
+Not covered:
+
+- CRT EXEs and the exit path. A CRT EXE that returns from `main` calls `ExitProcess`, so slot 0 has to be given back from a hook on the image's own `ExitProcess` import, and its CRT's thread-detach callback frees what it finds in slot 0 (MoonYueya, #870).
+- Threads that start in host code and then call into the image without entering.
+- More than one main image per process.
 
 ```powershell
 cmake --build --preset dev --target pe_map cpu_exe_tls_slot0 cpu_exe_tls_slot0_host
-ctest --preset dev --no-tests=error -R '^cpu_native_exe_tls_slot0$' -V
+ctest --preset dev --no-tests=error -R '^cpu_native_exe_tls_slot0(_windows)?$' -V
 ```
 
 ### Lifecycle of two DLLs with the static C runtime

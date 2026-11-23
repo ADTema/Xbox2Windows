@@ -1,25 +1,28 @@
-"""Check that a mapped EXE started as the main image owns TLS slot 0 in every thread.
+"""Main-image TLS slot 0: a /GA EXE under a Windows launch, and under pe_map_run_main with explicit participants.
 
 cpu_exe_tls_slot0 is a CRT-free EXE compiled with /GA, so its thread-local accesses read slot 0 of
-ThreadLocalStoragePointer without loading _tls_index (tests/cpu/exe_tls_slot0.cpp). Its template holds
-an int and a 0x1400-byte array of 0xFF. Each of its threads (the initial thread and two workers) and its
-TLS callback check whether slot 0 holds the image's block; when it does, the thread checks its template
-copy, writes the whole array, reads it back and validates the process heap. The rule and the fixture
-shape follow MoonYueya's notes on issue #870.
+ThreadLocalStoragePointer without loading _tls_index (tests/cpu/exe_tls_slot0.cpp). Its TLS callback and
+each of its threads (the initial thread and two workers) check whether slot 0 holds the image's block;
+only then does a thread check its template copy, write the whole 0x1400-byte array and validate the heap.
+The rule and the fixture shape follow MoonYueya's notes on issue #870.
 
-Runs:
-- Windows launch: the EXE owns index 0, so every check passes. This is the expected log.
-- cpu_exe_tls_slot0_host ... main: a CRT-free host that owns slot 0 itself (its own TLS directory and a
-  thread-local sentinel) maps the EXE and starts it with pe_map_run_main. The guest log must equal the
-  Windows log. The host checks that slot 0 of its own thread and of a thread that existed before the start
-  holds the image's block after the start; that a host thread ended with TerminateThread leaves a stale
-  record that pe_map drops, on the attach of a later thread with the same ID when the host observes such
-  reuse (it cannot be forced) and otherwise at release; and that after release slot 0 and the host's
-  sentinel are the host's again on both threads, with a valid heap. pe_map's counters must show every
-  install restored except the terminated thread's, one stale record and no mismatch.
-- cpu_exe_tls_slot0_host ... plain (negative control): the same host starts the EXE with pe_map_run,
-  which leaves the host's block in slot 0. Every slot-0 check must fail (tls_in_slot0=no) and nothing is
-  installed.
+Two modes, registered as two tests, keep the evidence separate:
+
+windows: the EXE launched by Windows, where it owns index 0. The log is the expected guest log.
+
+mapped: cpu_exe_tls_slot0_host, a CRT-free host whose own TLS block owns slot 0, maps the EXE and starts
+it in one process per scenario (tests/cpu/exe_tls_slot0_host.cpp). In every scenario a reader thread that
+never participates samples its own slot 0 and sentinel from before the map until after release and must
+never see them change.
+- main: pe_map_run_main; the guest log equals the Windows log; a host thread enters and leaves; every
+  participant is restored and release completes, unloading the carrier.
+- alive: a host participant is still inside the image at release. Release is uncertain: it reports an
+  incomplete release and keeps the carrier loaded; the participant's own later leave restores it.
+- exited: a host participant is ended with TerminateThread inside the image. Release confirms the exit
+  from its thread handle and completes.
+- untracked: MAIN_TRACKED host threads enter, so the last finds the participant table full and has no
+  handle. Release cannot inspect it: uncertain, carrier kept (the deterministic inspection-failure case).
+- plain (negative control): pe_map_run leaves the host's block in slot 0, so every slot-0 check fails.
 """
 
 import argparse
@@ -27,93 +30,101 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 
 TIMEOUT = 60
 EXPECTED = "m1=yy m:yyyy a2=yy a:yyyy a3=y- b2=yy b:yyyy b3=y- X=0"
-# pe_map_run leaves the host's block in slot 0: every slot-0 check fails and nothing else is checked.
 PLAIN = "m1=n- m:n--- a2=n- a:n--- a3=n- b2=n- b:n--- b3=n- X=8"
-# installed: initial thread, existing thread, two guest workers and the terminated thread, plus the thread
-# that reused its ID when reuse was observed. restored: every install but the terminated thread's.
-# stale: the terminated thread's record, dropped when its ID attached again or, without reuse, at release
-# (without writing to the dead thread's TEB). No mismatch, no live record and no active image afterwards.
-MAIN_STATS = {True: [6, 5, 1, 0, 0, 0], False: [5, 4, 1, 0, 0, 0]}
-HOST_FLAGS = ("installed_main", "installed_existing", "reuse", "stale_dropped_on_reuse", "host_tls",
-              "existing_host_tls", "heap_valid")
-REQUIRED = ("installed_main", "installed_existing", "host_tls", "existing_host_tls", "heap_valid")
+MAIN_TRACKED = 64
+# stats: installed, restored, exited, uncertain, pending, active, last release, untracked.
+# Participants: the starting thread, the guest's two workers and the host's participants.
+SCENARIOS = {
+    "main": {"stats": [4, 4, 0, 0, 0, 0, 1, 0], "carrier": False, "participant": True},
+    "alive": {"stats": [4, 4, 0, 1, 0, 0, 0, 0], "carrier": True, "participant": True},
+    "exited": {"stats": [4, 3, 1, 0, 0, 0, 1, 0], "carrier": False, "participant": True},
+    "untracked": {"stats": [3 + MAIN_TRACKED, 3 + MAIN_TRACKED, 0, 1, 0, 0, 0, 0], "carrier": True,
+                  "participant": True},
+    "plain": {"stats": [0, 0, 0, 0, 0, 0, -1, 0], "carrier": False, "participant": None},
+}
 
 
-def parse(done):
+def run(command):
+    done = subprocess.run(command, capture_output=True, timeout=TIMEOUT)
     text = done.stdout.decode(errors="replace")
-    log = next((line[4:].strip() for line in text.splitlines() if line.startswith("LOG:")), None)
-    host = next((line for line in text.splitlines() if line.startswith("HOST:")), None)
-    result = {"log": log, "exit": done.returncode & 0xffffffff, "stdout": text, "stderr": done.stderr.decode()}
-    if host and "setup failed" not in host:
-        fields = dict(re.findall(r"(\w+)=(\S+)", host))
-        result["host"] = {key: fields[key] == "y" for key in HOST_FLAGS}
-        result["started"] = int(fields["started"])
-        result["guest_exit"] = int(fields["exit"], 16)
+    result = {"exit": done.returncode & 0xffffffff, "stderr": done.stderr.decode(), "stdout": text,
+              "log": next((line[4:].strip() for line in text.splitlines() if line.startswith("LOG:")), None),
+              "host": next((line for line in text.splitlines() if line.startswith("HOST:")), None)}
+    if result["host"] and "setup failed" not in result["host"]:
+        fields = dict(re.findall(r"(\w+)=(\S+)", result["host"]))
+        result["fields"] = fields
         result["stats"] = [int(v) for v in fields["stats"].split(",")]
     return result
 
 
-def native(exe):
+def flag(fields, name):
+    return {"y": True, "n": False, "-": None}[fields[name]]
+
+
+def windows(exe):
     with TemporaryDirectory() as temp:
         copy = Path(temp) / Path(exe).name
         shutil.copy(exe, copy)
-        return parse(subprocess.run([str(copy)], capture_output=True, timeout=TIMEOUT))
+        result = run([str(copy)])
+    print(f"windows: LOG:{result['log']} exit {result['exit']:#x}")
+    if (result["log"], result["exit"], result["stderr"]) != (EXPECTED, 0, ""):
+        raise AssertionError(f"Windows launch: {result}")
+    print("windows: the EXE owns index 0, so slot 0 holds its block on every thread and callback; "
+          "template intact, whole-array writes read back, heap valid")
 
 
-def hosted(host, mapper, exe, mode):
-    return parse(subprocess.run([str(host), str(mapper), str(exe), mode], capture_output=True, timeout=TIMEOUT))
-
-
-def require(label, condition, result):
-    if not condition:
-        raise AssertionError(f"{label}: {result}")
-
-
-def check(mapper, exe, host):
-    nat = native(exe)
-    print(f"native: LOG:{nat['log']} exit {nat['exit']:#x}")
-    require("native launch", (nat["log"], nat["exit"], nat["stderr"]) == (EXPECTED, 0, ""), nat)
-
-    main = hosted(host, mapper, exe, "main")
-    print(f"main image: LOG:{main['log']}")
-    print(f"main image: {next(line for line in main['stdout'].splitlines() if line.startswith('HOST:'))}")
-    require("main image: host setup", "host" in main and main["exit"] == 0 and not main["stderr"], main)
-    require("main image: tls_in_slot0 on every thread and callback (guest log differs from Windows)",
-            main["log"] == EXPECTED and main["started"] == 1 and main["guest_exit"] == 0, main)
-    failed = [flag for flag in REQUIRED if not main["host"][flag]]
-    reuse = main["host"]["reuse"]
-    if reuse and not main["host"]["stale_dropped_on_reuse"]:
-        failed.append("stale_dropped_on_reuse")
-    require(f"main image: host checks failed: {failed}", not failed, main)
-    expected_stats = MAIN_STATS[reuse]
-    require(f"main image: pe_map counters {main['stats']} != {expected_stats} "
-            "(installed, restored, stale, mismatched, live records, active)", main["stats"] == expected_stats, main)
-    print("main image: the terminated thread's ID was " + ("reused, and its stale record was dropped on that attach"
-          if reuse else "not reused within the attempts (not forced; see the host); its stale record was dropped "
-          "at release without writing to the dead thread's TEB"))
-    print("main image: the guest log equals the Windows launch; slot 0 held the image's block on the initial "
-          "thread, a pre-existing thread, both guest workers and their callbacks; after release the host's block and sentinel were back on both "
-          f"host threads and the heap was valid; counters {main['stats']}")
-
-    plain = hosted(host, mapper, exe, "plain")
-    print(f"plain pe_map_run (control): LOG:{plain['log']}")
-    require("plain control: host setup", "host" in plain and plain["exit"] == 0, plain)
-    require("plain control: expected tls_in_slot0=no on every check", plain["log"] == PLAIN, plain)
-    require("plain control: slot 0 changed or counters moved",
-            not plain["host"]["installed_main"] and not plain["host"]["installed_existing"]
-            and plain["host"]["host_tls"] and plain["stats"] == [0, 0, 0, 0, 0, 0], plain)
-    print("plain pe_map_run (control): every slot-0 check reports no, so the guest's /GA accesses would reach "
-          "the host's block; the guest skipped its writes and the host's slot 0 was untouched")
+def mapped(mapper, exe, host):
+    for scenario, want in SCENARIOS.items():
+        result = run([str(host), str(mapper), str(exe), scenario])
+        print(f"{scenario}: LOG:{result['log']}")
+        print(f"{scenario}: {result['host']}")
+        if "fields" not in result or result["exit"] or result["stderr"]:
+            raise AssertionError(f"{scenario}: host failed: {result}")
+        fields = result["fields"]
+        problems = []
+        log = PLAIN if scenario == "plain" else EXPECTED
+        if result["log"] != log:
+            problems.append(f"guest log {result['log']!r}, expected {log!r}")
+        if fields["started"] != "1" or int(fields["exit"], 16) != (8 if scenario == "plain" else 0):
+            problems.append(f"started {fields['started']}, guest exit {fields['exit']}")
+        if flag(fields, "installed_main") != (scenario != "plain"):
+            problems.append(f"installed_main {fields['installed_main']}")
+        if not flag(fields, "reader_untouched"):
+            problems.append("the non-participating reader saw its slot 0 or sentinel change")
+        if flag(fields, "participant") != want["participant"]:
+            problems.append(f"participant {fields['participant']}")
+        if not flag(fields, "host_tls") or not flag(fields, "heap_valid"):
+            problems.append(f"host_tls {fields['host_tls']}, heap_valid {fields['heap_valid']}")
+        if flag(fields, "carrier_after_release") != want["carrier"]:
+            problems.append(f"carrier_after_release {fields['carrier_after_release']}, expected "
+                            f"{'kept' if want['carrier'] else 'unloaded'}")
+        if result["stats"] != want["stats"]:
+            problems.append(f"counters {result['stats']} != {want['stats']} (installed, restored, exited, "
+                            "uncertain, pending, active, last release, untracked)")
+        if problems:
+            raise AssertionError(f"{scenario}: " + "; ".join(problems))
+    print("mapped: the guest log equals the Windows log under pe_map_run_main; the non-participating reader's "
+          "slot 0 and sentinel never changed; a participant alive at release or without a handle made the release "
+          "uncertain and kept the carrier; an exited participant was confirmed from its handle; plain pe_map_run "
+          "fails every slot-0 check")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mapper", type=Path)
-    parser.add_argument("exe", type=Path)
-    parser.add_argument("host", type=Path)
+    sub = parser.add_subparsers(dest="mode", required=True)
+    sub.add_parser("windows").add_argument("exe", type=Path)
+    m = sub.add_parser("mapped")
+    m.add_argument("mapper", type=Path)
+    m.add_argument("exe", type=Path)
+    m.add_argument("host", type=Path)
     arguments = parser.parse_args()
-    check(arguments.mapper, arguments.exe, arguments.host)
+    if arguments.mode == "windows":
+        windows(arguments.exe)
+    else:
+        mapped(arguments.mapper, arguments.exe, arguments.host)
+    sys.exit(0)

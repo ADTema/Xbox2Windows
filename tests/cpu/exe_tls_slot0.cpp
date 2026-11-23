@@ -112,8 +112,16 @@ void record(char kind, char a, char b, char c, char d) {
     g_events[index] = {GetCurrentThreadId(), kind, {a, b, c, d}};
 }
 
+bool own_thread() {
+    const DWORD thread = GetCurrentThreadId();
+    return thread == g_threads[1] || thread == g_threads[2];
+}
+
 void NTAPI callback(PVOID, DWORD reason, PVOID) {
     if (reason == DLL_PROCESS_DETACH) return;  // not logged: the log is written before the process ends
+    // Thread notifications for threads the EXE did not start (a host's own threads) are not checked: those
+    // threads do not run the EXE's code. Their IDs are never in g_threads, which is filled before a worker runs.
+    if (reason != DLL_PROCESS_ATTACH && !own_thread()) return;
     const bool slot = in_slot0();
     // On thread detach the thread has already written its copy, so only slot 0 is checked.
     const char intact = slot && reason != DLL_THREAD_DETACH ? yes_no(template_intact()) : '-';
