@@ -5856,3 +5856,65 @@ direct and forwarded ordinal routes and missing-symbol errors.
 This addresses **only static packaged ordinal binding**, not console ABI,
 DLL cycles, unknown runtime provider contracts, thread-local slot zero, or
 execution of any retail executable. The public tests contain no private binaries.
+
+
+## Legacy SSE FP compares and partial/non-temporal moves
+
+[The SSE FP leaf translator](../tools/cpu_sse_fp_aot.py) lifts bounded straight-line
+Windows x64 leaf functions covering five uncovered forms from `docs/coverage/x64_zen2.tsv`
+group `SSE`:
+
+- Packed float compare: `cmpps` (all eight `imm8` predicates `0..7`, `xmm` and 16-byte aligned `m128` sources)
+- Scalar float compare: `cmpss` (all eight `imm8` predicates `0..7`, `xmm` and unaligned `m32` sources, preserving bits `127:32` of the destination)
+- Half-qword float moves: `movlps` and `movhps` (`m64` load-merge preserving the other 64 bits, and `m64` store)
+- Non-temporal store: `movntps` (16-byte aligned `m128` store)
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned
+flat buffers (`rcx` and `rdx` inputs, `r8` output) with 16-byte-aligned bases and
+returns `void`. Register state covers `xmm0`..`xmm5` modeled as `Vec128` (`std::uint64_t q[2]`).
+For transport and ABI glue, the translator accepts `movaps`, `movdqa`, `movdqu` and
+terminal `ret`. Memory stores (`movlps`, `movhps`, `movntps`, `movaps`, `movdqa`, `movdqu`)
+must target an `r8`-rooted flat `[r8 + disp]` address; full 128-bit aligned operands
+(`cmpps` `m128`, `movntps`, `movaps` `m128`, `movdqa` `m128`) require displacements
+divisible by 16.
+
+The translator explicitly rejects VEX/EVEX encodings, `cmpps`/`cmpss` predicates
+`imm8 >= 8`, nonvolatile vector registers (`xmm6`..`xmm15`), nonvolatile or non-argument
+memory base registers, non-`r8` store destinations, unaligned 16-byte memory operands,
+undefined register reads/merges, `lock`/`rep`/segment prefixes, unsupported instructions,
+missing terminal `ret`, and instructions after `ret`.
+
+```powershell
+cmake --build --preset dev --target cpu_sse_fp_original cpu_sse_fp_original_lifted cpu_sse_fp_altered cpu_sse_fp_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fp$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/sse_fp.asm) exports 34 functions covering all five
+forms: all eight `cmpps` predicates plus aligned `m128`, displaced `m128` and self-compare
+cases; all eight `cmpss` predicates plus `m32`, unaligned `+1` `m32` and self-compare
+cases; `movlps`/`movhps` loads and stores including unaligned `+1` addresses; `movntps`
+aligned stores at `+0` and `+16`; and a chained `op_pipeline` export. [The differential check](../tests/cpu/sse_fp_check.py)
+verified 720 cases across the 34 exports bit-for-bit against both the native MASM DLL
+and an independent Python IEEE-754 single-precision reference model under default MXCSR
+controls (including signed zeros, infinities, quiet and signaling NaNs with distinct
+payloads, subnormals, and 32-byte pre/post buffer guards).
+
+A separate leaf stores one vector, executes a 16-byte load whose result is unused, and then stores
+another vector. Both native and translated code perform both stores when the source is readable.
+An inaccessible source must fault after the first store and leave the second vector unchanged,
+including in the Release preset.
+
+An `ALTER_IMM` variant flips predicates on `op_cmpps_1` (`1` to `5`), `op_cmpps_3`
+(`3` to `7`), `op_cmpps_6` (`6` to `2`), `op_cmpss_1` (`1` to `5`), `op_cmpss_3` (`3` to `7`),
+and `op_cmpss_6` (`6` to `2`); the altered lifted DLL matched the altered reference and
+diverged from the original on 27 cases per export. An output-mutation control confirmed
+the comparator detects single-bit output mismatches. Byte-decoded and synthetic `iced_x86`
+controls passed 7 alternate-encoding lift checks, 60 unit rejection controls (9 VEX/EVEX,
+4 `imm8 >= 8`, 15 unsupported instructions, 32 ABI/state/addressing/prefix/stream violations),
+and 10 end-to-end PE-patched DLL rejection controls.
+
+Not covered by this experiment: non-default MXCSR modes (FTZ/DAZ or unmasked exceptions),
+non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
+prologues, and title CPU code execution.

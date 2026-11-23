@@ -1126,6 +1126,25 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse2_regs_original>"
         "$<TARGET_FILE:cpu_sse2_regs_original_lifted>"
         "$<TARGET_FILE:cpu_sse2_regs_altered_lifted>")
+    set(cpu_sse_fp_exports
+        "op_cmpps_0,op_cmpps_1,op_cmpps_2,op_cmpps_3,op_cmpps_4,op_cmpps_5,op_cmpps_6,op_cmpps_7,"
+        "op_cmpps_mem,op_cmpps_mem_disp,op_cmpps_self,"
+        "op_cmpss_0,op_cmpss_1,op_cmpss_2,op_cmpss_3,op_cmpss_4,op_cmpss_5,op_cmpss_6,op_cmpss_7,"
+        "op_cmpss_mem,op_cmpss_mem_plus1,op_cmpss_self,"
+        "op_movlps_load,op_movlps_store,op_movhps_load,op_movhps_store,"
+        "op_movlps_load_plus1,op_movhps_load_plus1,op_movlps_store_plus1,op_movhps_store_plus1,"
+        "op_movntps,op_movntps_disp16,op_movaps_reg,op_pipeline,op_discarded_read")
+    string(CONCAT cpu_sse_fp_exports ${cpu_sse_fp_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse_fp_${variant} sse_fp)
+        cpu_translation(cpu_sse_fp_${variant} cpu_sse_fp_aot "${cpu_sse_fp_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse_fp_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_sse_fp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fp_check.py"
+        "$<TARGET_FILE:cpu_sse_fp_original>"
+        "$<TARGET_FILE:cpu_sse_fp_original_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_altered_lifted>")
     # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
     # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
     set(tail_files)
