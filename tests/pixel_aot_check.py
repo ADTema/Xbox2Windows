@@ -5507,11 +5507,10 @@ def check_mode_register_controls():
                   "hwreg(HW_REG_STATUS), 0", "hwreg(HW_REG_TRAPSTS, 2, 2), 3", "hwreg(HW_REG_LDS_ALLOC), 0",
                   "hwreg(HW_REG_SHADER_CYCLES), 0", "hwreg(HW_REG_GPR_ALLOC), 0", "hwreg(HW_REG_IB_STS), 0"):
         expect_value_error(translate, [f"s_setreg_imm32_b32 {write}"] + plain, "Unsupported hardware register write")
-    # The scratch base stays unobservable: scratch_* and s_getreg_b32 are not lowered, and flat_load_dword reads
+    # The scratch base stays unobservable: s_getreg_b32 is not lowered, and flat_load_dword reads
     # only through the title ranges, so the writes translate like s_nop 0 before it.
-    for reader in ("scratch_load_dword v12, off, s48", "scratch_store_dword off, v12, s48 offset:16",
-                   "s_getreg_b32 s48, hwreg(HW_REG_FLAT_SCR_LO)"):
-        expect_value_error(translate, with_constants([*FLAT_SCRATCH_WRITES, reader]), "Unsupported instruction")
+    expect_value_error(translate, with_constants([*FLAT_SCRATCH_WRITES, "s_getreg_b32 s48, hwreg(HW_REG_FLAT_SCR_LO)"]),
+                       "Unsupported instruction")
     expect_value_error(translate, with_constants([*FLAT_SCRATCH_WRITES, "flat_load_dword v12, v[12:13]"]),
                        "Title memory is not bound")
     assert (translate_title(FLAT_SCRATCH_WRITES + title_program())
@@ -8719,6 +8718,7 @@ def check_controls(directory):
     check_adapter_skip(directory)
     check_scalar_pair_reads()
     check_readfirstlane_controls()
+    check_flat_scratch_controls()
     # Whole-dword SDWA comparisons lower exactly as the e32 forms; byte and word selections are refused.
     for first in range(0, 16, 4):
         assert translate(predicate_group(first, sdwa=True)) == translate(predicate_group(first)), first
@@ -10365,6 +10365,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((masked_region(), translate))
     fixtures.append((masked_complementary(), translate))
     fixtures.append((masked_skip_asm(), translate, "gfx1013", "", masked_skip()))
+    fixtures.append((uncompressed_export(flat_scratch_ops_group1()), translate_int))
+    fixtures.append((uncompressed_export(flat_scratch_ops_group2()), translate_int))
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
@@ -13974,7 +13976,6 @@ def check_swap_draw(directory, compiler, renderer, backend):
 
 
 
-
 def check_int16_vop3_draw(directory, compiler, renderer, backend):
     """The 12 non-packed 16-bit integer VOP3 ops, a low16 chain and 16-bit compares against the Python reference,
     then mutations that must mismatch (one batch per mutation; the statuses are printed) and one that must be refused.
@@ -14108,6 +14109,156 @@ def check_int16_ternary_draw(directory, compiler, renderer, backend):
     assert refused != programs[0]
     expect_value_error(translate_int, refused, "Reads the undefined high half of a 16-bit result")
 
+FLAT_SCRATCH_WORDS = (
+    (0x12345678, 0x9abcdef0, 0x00ff00ff, 0xaa55aa55),
+    (0x00000001, 0x80000000, 0x7fffffff, 0xffffffff),
+    (0x01020304, 0x05060708, 0x090a0b0c, 0x0d0e0f10),
+    (0xdeadbeef, 0xcafebabe, 0xfeedface, 0xbaadf00d),
+    (0x00000000, 0x11111111, 0x22222222, 0x33333333),
+)
+
+
+def flat_scratch_ops_group1():
+    return [
+        "s_mov_b32 s48, 0",
+        # 1-dword store & load
+        "v_mov_b32_e32 v10, s44",
+        "scratch_store_dword off, v10, s48 offset:16",
+        "scratch_load_dword v12, off, s48 offset:16",
+        # 2-dword store & load
+        "v_mov_b32_e32 v10, s45",
+        "v_mov_b32_e32 v11, s46",
+        "scratch_store_dwordx2 off, v[10:11], s48 offset:32 glc",
+        "scratch_load_dwordx2 v[13:14], off, s48 offset:32 slc",
+        # 1-dword store & load with saddr offset 64
+        "v_mov_b32_e32 v10, s47",
+        "scratch_store_dword off, v10, s48 offset:64",
+        "scratch_load_dword v15, off, s48 offset:64",
+        "s_waitcnt vmcnt(0)",
+    ]
+
+
+def flat_scratch_ops_group2():
+    return [
+        "s_mov_b32 s48, 0",
+        # 3-dword store & load
+        "v_mov_b32_e32 v10, s44",
+        "v_mov_b32_e32 v11, s45",
+        "v_mov_b32_e32 v12, s46",
+        "scratch_store_dwordx3 off, v[10:12], s48 offset:16 glc",
+        "scratch_load_dwordx3 v[20:22], off, s48 offset:16 dlc",
+        # 4-dword store & load
+        "v_mov_b32_e32 v13, s47",
+        "scratch_store_dwordx4 off, v[10:13], s48 offset:64",
+        "scratch_load_dwordx4 v[23:26], off, s48 offset:64",
+        "s_waitcnt vmcnt(0)",
+        "v_mov_b32_e32 v12, v23",
+        "v_mov_b32_e32 v13, v24",
+        "v_mov_b32_e32 v14, v21",
+        "v_mov_b32_e32 v15, v26",
+    ]
+
+
+def check_flat_scratch_controls():
+    """Scratch dword loads and stores validate addressing, alignments, register spans and modifiers."""
+    p1 = with_constants([
+        "s_mov_b32 s48, 0",
+        "scratch_store_dword off, v12, s48 offset:16",
+        "scratch_load_dword v13, off, s48 offset:16",
+        "s_waitcnt vmcnt(0)",
+    ])
+    src1 = translate(p1)
+    assert "uint scratch[256]" in src1
+    assert "scratch[4u] = asuint(" in src1
+    assert "precise float alu" in src1
+
+    p2 = with_constants([
+        "s_mov_b32 s48, 0",
+        "scratch_store_dwordx2 off, v[12:13], s48 offset:32",
+        "scratch_load_dwordx2 v[14:15], off, s48 offset:32",
+        "s_waitcnt vmcnt(0)",
+    ])
+    src2 = translate(p2)
+    assert "scratch[8u] = asuint(" in src2
+    assert "scratch[8u + 1u] = asuint(" in src2
+
+    # Rejection controls:
+    # 1. Address bounds and alignment
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dword off, v12, s48 offset:2048"]), "range")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dword off, v12, s48 offset:-2049"]), "range")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dword off, v12, s48 offset:5"]), "4-byte aligned")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dword off, v12, s48 offset:2"]), "4-byte aligned")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dword off, v12, s48 offset:-4"]), "Negative scratch address")
+    # 2. Dynamic or unproven access
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "v_mov_b32_e32 v1, 0", "scratch_load_dword v12, v1, off"]), "Dynamic or unproven scratch address")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "v_mov_b32_e32 v1, 0", "scratch_store_dword v1, v12, off"]), "Dynamic or unproven scratch address")
+    expect_value_error(translate, with_constants(["s_mov_b32 s4, s44", "scratch_load_dword v12, off, s4"]), "Dynamic or unproven scratch address")
+    expect_value_error(translate, with_constants(["scratch_load_dword v12, off, s60"]), "Uninitialized or pending scalar register")
+    # 3. Read without defining store (load before store)
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_load_dword v12, off, s48 offset:16"]), "unwritten address")
+    # 4. Consumer before matching waitcnt
+    pending = [
+        "s_mov_b32 s48, 0",
+        "scratch_store_dword off, v12, s48 offset:16",
+        "scratch_load_dword v13, off, s48 offset:16",
+    ]
+    consumer = ["v_mov_b32_e32 v14, v13"]
+    for partial in ([], ["s_waitcnt vmcnt(1)"], ["s_waitcnt_vmcnt null, 1"]):
+        expect_value_error(translate, with_constants(pending + partial + consumer), "Sample used before vmcnt wait")
+    translate(with_constants(pending + ["s_waitcnt_vmcnt null, 0"] + consumer))
+    # 5. Invalid registers, widths, spans, modifiers
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dword off, v256, s48"]), "range")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_load_dword v12, off, s106"]), "Invalid saddr register")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dwordx2 off, v[4:6], s48"]), "width")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dwordx4 off, v[4:6], s48"]), "width")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dwordx2 off, v4, s48"]), "span")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dword off, v12, s48 lds"]), "LDS")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_store_dword off, v12, s48 clamp"]), "modifier")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_load_dword v12, off"]), "3 operands")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_load_dword_e32 v12, off, s48"]), "Unsupported instruction")
+    expect_value_error(translate, with_constants(["s_mov_b32 s48, 0", "scratch_load_dword_e64 v12, off, s48"]), "Unsupported instruction")
+
+
+def check_flat_scratch_draws(directory, compiler, renderer, backend):
+    """Offscreen readback for scratch 1, 2, 3, 4 dword loads and stores across two fixtures."""
+    source = directory / "flat_scratch.hlsl"
+    shader = directory / "flat_scratch.cso"
+
+    def make_cases(group):
+        cases = []
+        for idx, words in enumerate(FLAT_SCRATCH_WORDS):
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *words)
+            case_path = directory / f"scratch-{group}-{idx}.case"
+            expected_words = words if group == 0 else (words[0], words[1], words[1], words[3])
+            expected = tuple(as_float(w) for w in expected_words)
+            write_case(case_path, bytes(constants), expected, integer_rt=True)
+            cases.append(case_path)
+        return cases
+
+    cases = [make_cases(0), make_cases(1)]
+    programs = [uncompressed_export(flat_scratch_ops_group1()), uncompressed_export(flat_scratch_ops_group2())]
+
+    for fixture, program in enumerate(programs):
+        source.write_text(translate_int(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases[fixture]])
+
+    for (old, new, label), fixture in (
+        (("v_mov_b32_e32 v10, s44", "v_mov_b32_e32 v10, s45", "v10 data s44->s45"), 0),
+        (("v_mov_b32_e32 v11, s46", "v_mov_b32_e32 v11, s45", "v11 data s46->s45"), 0),
+        (("scratch_store_dword off, v10, s48 offset:64", "scratch_store_dword off, v11, s48 offset:64", "v10->v11"), 0),
+        (("v_mov_b32_e32 v10, s44", "v_mov_b32_e32 v10, s45", "g2 v10 data s44->s45"), 1),
+        (("v_mov_b32_e32 v13, s47", "v_mov_b32_e32 v13, s44", "g2 v13 data s47->s44"), 1),
+    ):
+        mutated = [line.replace(old, new) for line in programs[fixture]]
+        assert mutated != programs[fixture], label
+        source.write_text(translate_int(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, cases[fixture])
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
 
 def check_f16_arith_draw(directory, compiler, renderer, backend):
     """The four plain binary16 VOP2 ops against the Python reference: 40 pairs of baked operands, every accepted
@@ -14193,7 +14344,8 @@ def main():
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64", "draw-f16-arith"):
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64",
+                    "draw-f16-arith", "draw-flat-scratch"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -14220,7 +14372,8 @@ def main():
                         "draw-ds-swizzle": check_ds_swizzle_draw,
                         "draw-exec-regions": check_masked_draw,
                         "draw-div-fmas": check_valu_div_fmas_draw,
-                        "draw-cmp64": check_cmp64_draw}[mode]
+                        "draw-cmp64": check_cmp64_draw,
+                        "draw-flat-scratch": check_flat_scratch_draws}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
