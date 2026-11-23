@@ -524,6 +524,14 @@ INTEGER = {
 }
 # The ffbh helpers are the ones the DPP spellings use (DPP_INT32); the definitions live in SALU_HELPERS.
 INTEGER_HELPERS = {"ffbh_u32": ("dpp_ffbh_u32",), "ffbh_i32": ("dpp_ffbh_i32",)}
+# v_add_co_u32, v_sub_co_u32 and v_subrev_co_u32 as (32-bit result, carry-out written to the lane mask).
+# The add carries when the 33-bit sum does not fit, which is when the wrapped sum {r} is below src0. The
+# subtracts borrow when the subtrahend is above the minuend; subrev computes src1 - src0.
+CARRY_OUT = {
+    "add": ("{0} + {1}", "{r} < {0}"),
+    "sub": ("{0} - {1}", "{1} > {0}"),
+    "subrev": ("{1} - {0}", "{0} > {1}"),
+}
 MUL24_HELPERS = {
     "mul_u32_u24": ("mul24_u32",),
     "mul_i32_i24": ("mul24_i32",),
@@ -2414,6 +2422,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             expression = {"add": f"{a} + {b}", "sub": f"{a} - {b}", "subrev": f"{b} - {a}"}[op]
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({expression});")
+        elif m := match(rf"v_(add|sub|subrev)_co_u32 (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+)"):
+            # 32-bit add or subtract that also writes the unsigned carry or borrow of each lane to a lane
+            # mask. gfx10 encodes these three as VOP3 only and LLVM 15 prints them without a suffix. A
+            # trailing clamp, an e32 or e64 suffix or an operand modifier is left to the fall-through.
+            op, dst, carry, src0, src1 = m.groups()
+            regs = lane_mask(carry)
+            if mask != "entry" or dst in sample_dest or int(dst[1:]) > 255 or pending.intersection(regs):
+                raise ValueError("Invalid carry-out operation")
+            a = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+            b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+            result, carry_out = CARRY_OUT[op]
+            lines.append(f"    uint co{i} = {result.format(a, b)};")
+            lines.append(f"    bool cmp{i} = {carry_out.format(a, b, r=f'co{i}')};")
+            lines.append(f"    precise float alu{i} = asfloat(co{i});")
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            vector[dst] = f"alu{i}"
         elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
             op, kind, dst, *tokens = m.groups()
             if mask != "entry":

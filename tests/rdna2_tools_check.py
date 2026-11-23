@@ -2492,6 +2492,25 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
             self.assertTrue(is_opcode_recognized(opcode), opcode)
         for line in (
+            "v_add_co_u32 v1, vcc_lo, s2, v3",
+            "v_sub_co_u32 v1, s[60:61], 64, v3",
+            "v_subrev_co_u32 v1, vcc, v2, 0x12345678",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_add_co_u32_e64 v1, vcc, v2, v3",
+            "v_sub_co_u32_e32 v1, vcc, v2, v3",
+            "v_subrev_co_u32 v1, exec, v2, v3",
+            "v_add_co_u32 v1, v4, v2, v3",
+            "v_add_co_u32 v1, vcc, v2, v3 clamp",
+            "v_sub_co_u32 v1, vcc, -v2, v3",
+            "v_add_co_u32 v1, vcc, v2",
+            "v_add_co_ci_u32_e64 v1, vcc, v2, v3, vcc",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_add_co_u32", "v_sub_co_u32", "v_subrev_co_u32"):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
+        for line in (
             "v_add3_u32 v1, v2, v3, v4",
             "v_add3_u32_e64 v1, s2, v3, 4",
             "v_or3_b32 v1, v2, v3, v4",

@@ -304,6 +304,8 @@ def check_shader_records():
         "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32",
         "v_min_i32", "v_max_i32", "v_min_u32", "v_max_u32")}
     assert len(sdwa_integer_forms) == 15
+    # gfx10 encodes the carry-out add and subtracts as VOP3 only, under their plain names.
+    carry_out_forms = {("VOP3", "v_add_co_u32"), ("VOP3", "v_sub_co_u32"), ("VOP3", "v_subrev_co_u32")}
     mul24_forms = {
         ("VOP2", "v_mul_i32_i24"), ("VOP3", "v_mul_i32_i24_e64"),
         ("VOP2", "v_mul_u32_u24"), ("VOP3", "v_mul_u32_u24_e64"),
@@ -334,6 +336,7 @@ def check_shader_records():
         # The VOP3 spellings of the interpolation pair and of v_nop.
         e64_spelling_forms = {("VOP3", "v_interp_p1_f32_e64"), ("VOP3", "v_interp_p2_f32_e64"), ("VOP3", "v_nop_e64")}
         assert e64_spelling_forms <= covered, (name, e64_spelling_forms - covered)
+        assert carry_out_forms <= covered, (name, carry_out_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)

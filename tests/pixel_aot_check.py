@@ -5470,6 +5470,71 @@ def sdwa_integer_cases(group):
     return cases
 
 
+# v_add_co_u32, v_sub_co_u32 and v_subrev_co_u32: a 32-bit add or subtract that also writes the unsigned carry
+# or borrow of each lane to a lane mask. Bodies for uncompressed_export(): A, B, C and D are the constants in
+# s44 to s47, v18 = B and v19 = D. v12 holds op(A, B) with its carry in vcc_lo and v14 holds op(B, A) with its
+# carry in an SGPR, in the Wave32 spelling LLVM 15 assembles for gfx1013. v13 and v15 select D where the carry
+# is set and C where it is clear; D is read from a VGPR because gfx10 allows two scalar operands at most.
+CARRY_OUT_OPS = ("v_add_co_u32", "v_sub_co_u32", "v_subrev_co_u32")
+
+
+def carry_out_group(op):
+    return ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v19, s47",
+            f"{op} v12, vcc_lo, s44, v18", "v_cndmask_b32_e64 v13, s46, v19, vcc_lo",
+            f"{op} v14, s60, v18, s44", "v_cndmask_b32_e64 v15, s46, v19, s60"]
+
+
+def _carry_out(op, src0, src1):
+    """The 32-bit result and the carry-out, from unbounded integers: bit 32 of the sum, or a negative difference."""
+    wide = {"v_add_co_u32": src0 + src1, "v_sub_co_u32": src0 - src1, "v_subrev_co_u32": src1 - src0}[op]
+    return wide & 0xffffffff, not 0 <= wide <= 0xffffffff
+
+
+def carry_out_words(op, a, b, c, d):
+    first, first_carry = _carry_out(op, a, b)
+    second, second_carry = _carry_out(op, b, a)
+    return first, d if first_carry else c, second, d if second_carry else c
+
+
+# (A, B) as binary32 words, drawn with C and D from _CARRY_SELECT; the inputs and every right result are normal
+# numbers or zero (asserted at the draw). Add: a carry, no carry, a zero addend (the sum equals src0 and must
+# not carry) and a sum that wraps to exactly zero (it must carry). Subtract: a borrow in one operand order and
+# none in the other, equal operands (no borrow in either order), and a row with the larger operand in A.
+_CARRY_SELECT = (0x3E270000, 0xBF620000)
+CARRY_OUT_ROWS = {
+    "v_add_co_u32": ((0xC1700000, 0x7F000000), (0x3F800024, 0x01000000), (0x40D10000, 0), (0xC0000000, 0x40000000)),
+    "v_sub_co_u32": ((0x3F800024, 0xC1700000), (0x40D10000, 0x40D10000), (0xC0250000, 0x3E270000)),
+    "v_subrev_co_u32": ((0x3F800024, 0xC1700000), (0x40D10000, 0x40D10000), (0xC0250000, 0x3E270000)),
+}
+# Negative controls by operation: (row, channel, word a wrong lowering would give, what went wrong). Each must
+# report a mismatch.
+CARRY_OUT_WRONG = {
+    "v_add_co_u32": (
+        (0, 0, lambda a, b, c, d: a - b, "subtract for add"),
+        (0, 1, lambda a, b, c, d: c, "carry dropped"),
+        (0, 3, lambda a, b, c, d: c, "carry dropped on the SGPR mask"),
+        (1, 1, lambda a, b, c, d: d, "carry without overflow"),
+        (2, 1, lambda a, b, c, d: d, "carry on a sum equal to src0"),
+        (3, 1, lambda a, b, c, d: c, "carry dropped when the sum wraps to zero"),
+    ),
+    "v_sub_co_u32": (
+        (0, 0, lambda a, b, c, d: b - a, "operands reversed"),
+        (0, 0, lambda a, b, c, d: a + b, "add for subtract"),
+        (0, 1, lambda a, b, c, d: c, "borrow dropped"),
+        (0, 3, lambda a, b, c, d: d, "borrow of the other operand order"),
+        (1, 1, lambda a, b, c, d: d, "borrow on equal operands"),
+        (2, 3, lambda a, b, c, d: c, "borrow dropped on the SGPR mask"),
+    ),
+    "v_subrev_co_u32": (
+        (0, 0, lambda a, b, c, d: a - b, "subtract for reverse subtract"),
+        (0, 1, lambda a, b, c, d: d, "borrow of the unreversed subtract"),
+        (0, 3, lambda a, b, c, d: c, "borrow dropped on the SGPR mask"),
+        (1, 1, lambda a, b, c, d: d, "borrow on equal operands"),
+        (2, 1, lambda a, b, c, d: c, "borrow dropped"),
+    ),
+}
+
+
 def sop2_lshl_add_group() -> list[str]:
     return with_constants([
         "s_lshl1_add_u32 s60, s44, s45",
@@ -5879,6 +5944,53 @@ def check_sdwa_integer_lowering():
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
 
 
+def check_carry_out_lowering():
+    """Static checks for v_add_co_u32, v_sub_co_u32 and v_subrev_co_u32 as written by carry_out_group()."""
+    # v18 and v19 are written by the movs at 20 and 21; the first operation is 22, its select 23, the second
+    # 24, its select 25.
+    a, v, c, d = "asuint(params[0].w)", "asuint(alu20)", "params[1].y", "alu21"
+    expected = {
+        "v_add_co_u32": ((f"{a} + {v}", f"co22 < {a}"), (f"{v} + {a}", f"co24 < {v}")),
+        "v_sub_co_u32": ((f"{a} - {v}", f"{v} > {a}"), (f"{v} - {a}", f"{a} > {v}")),
+        "v_subrev_co_u32": ((f"{v} - {a}", f"{a} > {v}"), (f"{a} - {v}", f"{v} > {a}")),
+    }
+    assert set(expected) == set(CARRY_OUT_OPS) == set(CARRY_OUT_ROWS) == set(CARRY_OUT_WRONG)
+    for op, pairs in expected.items():
+        program = uncompressed_export(carry_out_group(op))
+        assert program.index("v_mov_b32_e32 v18, s45") == 20, op
+        source = translate_int(program).splitlines()
+        for index, (result, carry) in zip((22, 24), pairs):
+            for statement in (f"    uint co{index} = {result};", f"    bool cmp{index} = {carry};",
+                              f"    precise float alu{index} = asfloat(co{index});",
+                              f"    precise float alu{index + 1} = cmp{index} ? {d} : {c};"):
+                assert statement in source, (op, statement)
+    assert set(CARRY_OUT_OPS) <= ACCEPTED, set(CARRY_OUT_OPS) - ACCEPTED
+    # The carry goes to vcc, vcc_lo, one SGPR or an SGPR pair, and both sources take a register, an inline
+    # constant or a literal. Nothing else is accepted: no suffix, clamp, float modifier, exec or VGPR as the
+    # mask, missing or extra operand, unwritten register, DPP controls, or the carry-in forms.
+    for op in CARRY_OUT_OPS:
+        for good in (f"{op} v12, vcc, s44, v18", f"{op} v12, vcc_lo, v18, s44", f"{op} v12, s60, v18, v18",
+                     f"{op} v12, s[60:61], 64, v18", f"{op} v12, vcc, v18, 0x12345678", f"{op} v12, vcc, -16, s45"):
+            translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
+        for bad in (f"{op} v12, vcc, s44, v18 clamp", f"{op}_e64 v12, vcc, s44, v18", f"{op}_e32 v12, vcc, s44, v18",
+                    f"{op} v12, s44, v18", f"{op} v12, exec, s44, v18", f"{op} v12, v13, s44, v18",
+                    f"{op} v12, vcc, -s44, v18", f"{op} v12, vcc, s44, |v18|", f"{op} v12, vcc, s44, v106",
+                    f"{op} v12, vcc, s44", f"{op} v12, vcc, s44, v18, vcc", f"{op} vcc, s44, v18",
+                    f"{op} v12, vcc, s44, v18 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                    f"{op.replace('_co_', '_co_ci_')}_e64 v12, vcc, s44, v18, vcc"):
+            must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    # The mask the operation wrote is the one a select reads: a select on another register is refused, and a
+    # later comparison into the same register replaces the carry.
+    must_reject(translate_int, uncompressed_export(
+        ["v_mov_b32_e32 v18, s45", "v_add_co_u32 v12, s[60:61], s44, v18", "v_cndmask_b32_e64 v13, s46, s47, s[62:63]"]))
+    replaced = translate_int(uncompressed_export(
+        ["v_mov_b32_e32 v18, s45", "v_add_co_u32 v12, vcc, s44, v18", "v_cmp_lt_u32_e64 vcc, s44, v18",
+         "v_cndmask_b32_e64 v13, s46, s47, vcc"])).splitlines()
+    assert f"    precise float alu23 = cmp22 ? params[1].z : {c};" in replaced, replaced
+    sources = {op: translate_int(uncompressed_export(carry_out_group(op))) for op in CARRY_OUT_OPS}
+    assert len(set(sources.values())) == 3
+
+
 def check_nc_integer_lowering():
     """Static checks for the 32-bit no-carry add/sub forms of nc_integer_group(1..3)."""
     # v18 is written by the mov at index 20, and the four group instructions follow at 21..24. A and B are
@@ -6219,6 +6331,7 @@ def check_controls(directory):
             must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop3]))
     check_nc_integer_lowering()
     check_e64_integer_lowering()
+    check_carry_out_lowering()
     check_sdwa_integer_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
     assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED
@@ -7306,6 +7419,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(nc_integer_group(group)), translate_int) for group in (1, 2, 3))
     fixtures.append((uncompressed_export(f16_compares()), translate_int))
     fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
+    fixtures.extend((uncompressed_export(carry_out_group(op)), translate_int) for op in CARRY_OUT_OPS)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
@@ -7739,6 +7853,52 @@ def check_sdwa_integer_draws(directory, compiler, renderer, backend):
             case = directory / f"sdwa_integer-{len(cases)}.case"
             case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
             cases.append((case, status))
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+def check_carry_out_draws(directory, compiler, renderer, backend):
+    """Draw v_add_co_u32, v_sub_co_u32 and v_subrev_co_u32 through the integer readback target, bit for bit.
+
+    Each program of carry_out_group() is compiled once and drawn in one renderer batch: every row of
+    CARRY_OUT_ROWS with the right words, then one draw per CARRY_OUT_WRONG entry with one channel of its row
+    replaced by the word a wrong lowering would give, which must report a mismatch. The carry is observed
+    through v_cndmask_b32. On a desktop GPU the draws establish that the translated shader computes the stated
+    operation, not what the console does.
+    """
+    source = directory / "carry_out.hlsl"
+    shader = directory / "carry_out.cso"
+
+    def add_case(cases, row, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *row)
+        case = directory / f"carry_out-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+
+    for op in CARRY_OUT_OPS:
+        source.write_text(translate_int(uncompressed_export(carry_out_group(op))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        rows = [(a, b, *_CARRY_SELECT) for a, b in CARRY_OUT_ROWS[op]]
+        right = [carry_out_words(op, *row) for row in rows]
+        cases = []
+        for row, words in zip(rows, right):
+            # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+            assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (op, [hex(w) for w in (*row, *words)])
+            add_case(cases, row, words, "pass")
+        # Both carry states are drawn for each mask register, so a constant mask cannot pass.
+        for channel in (1, 3):
+            assert {words[channel] for words in right} == set(_CARRY_SELECT), (op, channel)
+        for index, channel, wrong, reason in CARRY_OUT_WRONG[op]:
+            wrong_words = list(right[index])
+            wrong_words[channel] = wrong(*rows[index]) & 0xffffffff
+            assert wrong_words[channel] != right[index][channel], (op, reason)
+            add_case(cases, rows[index], wrong_words, "mismatch")
         try:
             run_pixel_batch(renderer, backend, shader, cases)
         except subprocess.CalledProcessError as error:
@@ -9689,12 +9849,13 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy"):
+                    "draw-mac-legacy", "draw-carry-out"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
                         "draw-e64-integer": check_e64_integer_draws,
+                        "draw-carry-out": check_carry_out_draws,
                         "draw-sdwa-integer": check_sdwa_integer_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-brev": check_brev_draw,
