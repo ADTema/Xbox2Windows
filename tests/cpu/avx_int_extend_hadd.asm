@@ -179,4 +179,21 @@ vphminposuw_op PROC FRAME
     ret
 vphminposuw_op ENDP
 
+vpmovsxbd_ymm_mem_op PROC FRAME
+    .endprolog
+    vpmovsxbd ymm0, qword ptr [rcx]
+    vmovups ymmword ptr [r8], ymm0
+    vzeroupper
+    ret
+vpmovsxbd_ymm_mem_op ENDP
+
+vphaddd_ymm_mem_op PROC FRAME
+    .endprolog
+    vmovups ymm1, ymmword ptr [rcx]
+    vphaddd ymm0, ymm1, ymmword ptr [rdx]
+    vmovups ymmword ptr [r8], ymm0
+    vzeroupper
+    ret
+vphaddd_ymm_mem_op ENDP
+
 END

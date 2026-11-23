@@ -18,3 +18,5 @@ EXPORTS
     vphsubd_op
     vphsubsw_op
     vphminposuw_op
+    vpmovsxbd_ymm_mem_op
+    vphaddd_ymm_mem_op
