@@ -180,6 +180,7 @@ add_custom_command(OUTPUT "${xgameruntime_import_lib}"
             "/out:${xgameruntime_import_lib}"
     DEPENDS tests/xgameruntime_import.def VERBATIM)
 add_executable(xgameruntime_preflight_exe tests/xgameruntime_preflight_exe.cpp)
+target_sources(xgameruntime_preflight_exe PRIVATE "${xgameruntime_import_lib}")
 target_link_libraries(xgameruntime_preflight_exe PRIVATE "${xgameruntime_import_lib}")
 target_compile_features(xgameruntime_preflight_exe PRIVATE cxx_std_17)
 target_compile_options(xgameruntime_preflight_exe PRIVATE /GS-)
