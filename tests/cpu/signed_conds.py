@@ -27,7 +27,24 @@ ALL_EXPORTS = CMOV_EXPORTS + SET_EXPORTS + BRANCH_EXPORTS + NEG_EXPORTS + ("cwd_
 
 
 def emit(image, output):
-    parts = ["#include <intrin.h>\n", INTEGER_HEADER]
+    parts = [INTEGER_HEADER, """
+extern "C" __declspec(dllexport) unsigned signed_conds_missing_features() {
+    int regs[4]{};
+    __cpuid(regs, 0);
+    const int max_leaf = regs[0];
+    unsigned missing = 7;
+    if (max_leaf >= 1) {
+        __cpuid(regs, 1);
+        if (regs[2] & (1 << 23)) missing &= ~4u;  // POPCNT
+    }
+    if (max_leaf >= 7) {
+        __cpuidex(regs, 7, 0);
+        if (regs[1] & (1 << 3)) missing &= ~1u;  // BMI1
+        if (regs[1] & (1 << 8)) missing &= ~2u;  // BMI2
+    }
+    return missing;
+}
+"""]
     with pefile.PE(str(image), fast_load=True) as pe:
         for name in CMOV_EXPORTS:
             (bounds,) = function_ranges(pe, export_rva(pe, name))
@@ -305,6 +322,14 @@ def check(native_path, lifted_path):
                 raise AssertionError(f"{label} shld_c0_sets({a:#x}, {b:#x}) = {got:#x}, expected {want:#x}")
         cases += 1
 
+    missing_features = lifted.signed_conds_missing_features
+    missing_features.argtypes, missing_features.restype = [], ctypes.c_uint
+    missing = missing_features()
+    if missing:
+        names = ", ".join(name for bit, name in enumerate(("BMI1", "BMI2", "POPCNT")) if missing & (1 << bit))
+        print(f"{cases} baseline cases passed. Optional mixed-producer checks require {names}.")
+        return 77
+
     # andn_sets
     for a in vals:
         for b in (0, 1, 0x8000000000000000, 0xffffffffffffffff):
@@ -348,6 +373,7 @@ def check(native_path, lifted_path):
         cases += 1
 
     print(f"{cases} signed condition and flag-op cases (CMOVcc, SETcc, Jcc, NEG, CWD, mixed producers) matched native and translated DLLs")
+    return 0
 
 
 def check_negative_controls():
@@ -374,6 +400,6 @@ if __name__ == "__main__":
         emit(Path(native), Path(other))
     elif mode == "check":
         check_negative_controls()
-        check(native, other)
+        sys.exit(check(native, other))
     else:
         raise ValueError(mode)
