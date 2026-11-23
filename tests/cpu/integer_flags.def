@@ -1,0 +1,14 @@
+LIBRARY cpu_integer_flags
+EXPORTS
+    op_lahf_preserve
+    op_lahf_add
+    op_lahf_sub
+    op_lahf_adc_sbb
+    op_lahf_inc_dec_neg
+    op_lahf_cmp_clc_cmc
+    op_pushf_flags
+    op_pushf_stride
+    op_popf_stride
+    op_popfq_pushfq_roundtrip
+    op_pipeline
+    op_discarded_read

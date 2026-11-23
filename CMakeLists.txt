@@ -1189,6 +1189,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_mmx_original>"
         "$<TARGET_FILE:cpu_sse_mmx_original_lifted>"
         "$<TARGET_FILE:cpu_sse_mmx_altered_lifted>")
+    set(cpu_integer_flags_exports
+        "op_lahf_preserve,op_lahf_add,op_lahf_sub,op_lahf_adc_sbb,"
+        "op_lahf_inc_dec_neg,op_lahf_cmp_clc_cmc,op_pushf_flags,"
+        "op_pushf_stride,op_popf_stride,op_popfq_pushfq_roundtrip,"
+        "op_pipeline,op_discarded_read")
+    string(CONCAT cpu_integer_flags_exports ${cpu_integer_flags_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_integer_flags_${variant} integer_flags)
+        cpu_translation(cpu_integer_flags_${variant} cpu_integer_flags_aot "${cpu_integer_flags_exports}")
+    endforeach()
+    target_compile_definitions(cpu_integer_flags_altered PRIVATE ALTER_IMM)
+    set(cpu_integer_flags_controls_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_integer_flags_controls.cpp")
+    add_custom_command(OUTPUT "${cpu_integer_flags_controls_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py"
+            emit-controls "$<TARGET_FILE:cpu_integer_flags_original>" "${cpu_integer_flags_controls_cpp}"
+        DEPENDS cpu_integer_flags_original tests/cpu/integer_flags_check.py
+            tools/cpu_integer_flags_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_integer_flags_controls SHARED "${cpu_integer_flags_controls_cpp}")
+    add_test(NAME cpu_aot_integer_flags COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py"
+        "$<TARGET_FILE:cpu_integer_flags_original>"
+        "$<TARGET_FILE:cpu_integer_flags_original_lifted>"
+        "$<TARGET_FILE:cpu_integer_flags_altered_lifted>"
+        "$<TARGET_FILE:cpu_integer_flags_controls>")
     # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
     # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
     set(tail_files)

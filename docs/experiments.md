@@ -6114,3 +6114,49 @@ instructions, 40 ABI/state/addressing/prefix/stream), and 10 PE-patched DLL reje
 
 Not covered by this experiment: non-default MXCSR rounding modes, non-temporal cache-bypass
 hints on `movntq`, x87/MMX aliasing across calls, control flow, and title CPU code execution.
+
+## Integer flag transfer and stack flag instructions
+
+[The integer-flags leaf translator](../tools/cpu_integer_flags_aot.py) lifts bounded
+straight-line Windows x64 leaf functions covering five uncovered forms from
+`docs/coverage/x64_zen2.tsv` group `Integer`:
+
+- Status byte transfer: `lahf` (`AH = (SF<<7)|(ZF<<6)|(AF<<4)|(PF<<2)|0x02|CF`), preserving `AL` and `RAX[63:16]`
+- 16-bit stack flag transfer: `pushf` / `popf` with 2-byte stack stride (`RSP -/+ 2`), modeling `CF`, `PF`, `AF`, `ZF`, `SF`, `DF`, `OF`, fixed bit 1, and ring-3 `IF` (`0x0202`) while leaving `ID` unchanged
+- 64-bit stack flag transfer: `pushfq` / `popfq` with 8-byte stack stride (`RSP -/+ 8`), additionally modeling `ID` (bit 21)
+
+Each lifted export uses the leaf ABI `void fn(word rcx, word rdx, word r8)` (`rcx`/`rdx`
+inputs, `r8` output), modeling volatile GPRs `rax`/`rcx`/`rdx`/`r8`/`r9`/`r10`/`r11` across
+8-, 16-, 32-, and 64-bit views (including high-byte `ah`/`ch`/`dh`), a bounded 256-byte local
+stack balanced to entry `rsp` at `ret`, and per-flag definedness tracking. Logical ops
+(`and`, `or`, `xor`, `test`) leave `AF` undefined, `inc`/`dec` preserve `CF`, `sahf` leaves
+`OF`/`DF`/`ID` unchanged, and `DF` must be statically `0` (`cld`) at `ret`. Dead-read fault
+ordering uses `std::atomic_signal_fence` with volatile reads. Unbalanced `rsp`, stack
+overflow/underflow, `DF != 0` at `ret`, undefined flag/GPR reads, nonvolatile GPRs, direct
+`rsp` arithmetic, non-leaf branches/calls, prefixes, VEX/EVEX encodings, and non-`r8` stores
+reject.
+
+```powershell
+cmake --build --preset dev --target cpu_integer_flags_original cpu_integer_flags_original_lifted cpu_integer_flags_altered cpu_integer_flags_altered_lifted cpu_integer_flags_controls
+ctest --preset dev --no-tests=error -R '^cpu_aot_integer_flags$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/integer_flags.asm) exports 12 functions exercising `lahf`
+(`AL`/`RAX[63:16]` preservation and `AF` across `add`, `sub`, `adc`, `sbb`, `inc`, `dec`,
+`neg`, `cmp`, `clc`, `stc`, `cmc`), `pushf`/`popf` 2-byte stack stride and flag bits,
+`pushfq`/`popfq` 8-byte stack stride and `ID=0`/`ID=1`/`DF=0`/`DF=1` round-trips, a chained
+`popfq`/`sahf`/`add`/`lahf`/`pushf`/`popf`/`pushfq` pipeline, and a discarded-read
+fault-ordering control. [The differential check](../tests/cpu/integer_flags_check.py) verifies
+216 cases across the 11 differential exports bit-for-bit against both the native MASM DLL
+and an independent Python reference model with 32-byte pre/post buffer guards across `dev`
+and `release` (`/O2`) builds, alongside dead-read fault ordering (`op_discarded_read`),
+5 `ALTER_IMM` divergence controls (`16`, `21`, `21`, `16`, `25`), 6 mutated-C++ controls
+(`ctrl_wrong_af`: `7`, `ctrl_wrong_pf`: `13`, `ctrl_wrong_if`: `16`,
+`ctrl_wrong_pushf_stride`: `21`, `ctrl_wrong_popf_stride`: `17`,
+`ctrl_lahf_clobber_rax`: `21`), an output-mutation control, 5 alternate-encoding lift
+checks, 41 unit rejection controls, and 10 end-to-end PE-patched DLL rejection controls.
+
+Not covered by this experiment: `TF`/`AC`/`NT` privilege or trap-flag side effects, control
+flow, nonvolatile GPR prologues, and title CPU code execution.
