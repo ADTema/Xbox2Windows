@@ -150,6 +150,18 @@ set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
 
+# Desktop xgameruntime.dll skeleton. Every exported thunk is generated from the
+# single X-macro table in xgameruntime_shim.cpp and returns E_NOTIMPL.
+add_library(xgameruntime_shim SHARED src/xgameruntime_shim.cpp src/xgameruntime_shim.def)
+set_target_properties(xgameruntime_shim PROPERTIES OUTPUT_NAME xgameruntime)
+target_compile_features(xgameruntime_shim PRIVATE cxx_std_17)
+
+add_executable(xgameruntime_shim_check tests/xgameruntime_thunks_check.cpp)
+add_dependencies(xgameruntime_shim_check xgameruntime_shim)
+target_compile_features(xgameruntime_shim_check PRIVATE cxx_std_17)
+add_test(NAME xgameruntime_thunks COMMAND xgameruntime_shim_check "$<TARGET_FILE:xgameruntime_shim>")
+set_tests_properties(xgameruntime_thunks PROPERTIES TIMEOUT 30)
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")

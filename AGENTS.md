@@ -123,6 +123,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/rdna2_tools_check.py
 ./out/pe-env/bin/python -B tests/pso_readiness_check.py
 ./out/pe-env/bin/python -B tests/xmem_attribute_scan_check.py
+./out/pe-env/bin/python -B tests/xgameruntime_table_check.py
 ./out/pe-env/bin/python -B tests/docs_links_check.py
 ./out/pe-env/bin/python -B tests/bidi_controls_check.py
 ./out/pe-env/bin/python -B tests/hardware_reports_check.py
