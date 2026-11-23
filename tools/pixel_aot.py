@@ -453,27 +453,27 @@ float div_fmas32_core(float s0, float s1, float s2, bool cond, bool clamp_res) {
     uint u0, u1;
     asuint(s_sc, u0, u1);
     uint exp = (u1 >> 20) & 0x7ffu;
-    if (exp >= 897u && exp <= 1150u) {
-        if ((u0 & 0x1fffffffu) == 0x10000000u && err_sc != 0.0) {
-            if ((s_sc > 0.0 && err_sc > 0.0) || (s_sc < 0.0 && err_sc < 0.0)) {
-                if (++u0 == 0u) ++u1;
-            } else {
-                if (u0-- == 0u) --u1;
-            }
-            s_sc = asdouble(u0, u1);
+    // Binary32 subnormals retain a fixed 2^-149 spacing. The guard may
+    // move into the high word or become the implicit bit at 2^-150.
+    bool midpoint = false;
+    if (exp >= 873u && exp <= 1150u) {
+        uint discarded = exp < 897u ? 926u - exp : 29u;
+        if (discarded <= 32u) {
+            uint guard = 1u << (discarded - 1u);
+            midpoint = (u0 & (guard | (guard - 1u))) == guard;
+        } else {
+            uint guard = 1u << (discarded - 33u);
+            uint significand_hi = (u1 & 0x000fffffu) | 0x00100000u;
+            midpoint = u0 == 0u && (significand_hi & (guard | (guard - 1u))) == guard;
         }
-    } else if (exp < 897u && exp >= 874u) {
-        uint shift = 897u - exp;
-        uint mask = (1u << (29u - shift)) - 1u;
-        uint guard = 1u << (28u - shift);
-        if ((u0 & mask) == guard && err_sc != 0.0) {
-            if ((s_sc > 0.0 && err_sc > 0.0) || (s_sc < 0.0 && err_sc < 0.0)) {
-                if (++u0 == 0u) ++u1;
-            } else {
-                if (u0-- == 0u) --u1;
-            }
-            s_sc = asdouble(u0, u1);
+    }
+    if (midpoint && err_sc != 0.0) {
+        if ((s_sc > 0.0 && err_sc > 0.0) || (s_sc < 0.0 && err_sc < 0.0)) {
+            if (++u0 == 0u) ++u1;
+        } else {
+            if (u0-- == 0u) --u1;
         }
+        s_sc = asdouble(u0, u1);
     }
     if (clamp_res) {
         s_sc = clamp(s_sc, 0.0, 1.0);

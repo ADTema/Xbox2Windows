@@ -10300,6 +10300,11 @@ def check_valu_div_fmas_draw(directory, compiler, renderer, backend):
         ("midpoint", (0x3f800001, 0x3fc00000, 0x8d800000), (0x3fc00001, 0x3f800000, 0x4fc00001, 0x3f800000), "pass"),
         # Cancellation: exact product plus addend is -2^-46
         ("cancel", (0x3f800001, 0x3f7ffffe, 0xbf800000), (0xa8800000, 0x00000000, 0xb8800000, 0x00000000), "pass"),
+        # An exact product of 2^-150 minus 2^-196 falls short of increasing the odd subnormal.
+        ("subnormal-low-word", (0x1a000001, 0x19fffffe, 0x00400001),
+         (0x00400001, 0x00400001, 0x10000003, 0x10000003), "pass"),
+        ("subnormal-high-word", (0x1a000001, 0x19fffffe, 0x00040001),
+         (0x00040001, 0x00040001, 0x0e000030, 0x0e000030), "pass"),
         # Pre-scale underflow: 2^-126 * 2^-25 = 2^-151 before scale, 2^-119 after scale
         ("underflow", (0x00800000, 0x33000000, 0x00000000), (0x00000000, 0x00000000, 0x04000000, 0x04000000), "pass"),
         # Scale boundary: 2^-126 * 0.5 = 2^-127 intermediate subnormal, 2^-95 after scale
@@ -10345,7 +10350,7 @@ def check_valu_div_fmas_draw(directory, compiler, renderer, backend):
     # Negative control 3: double rounding without 2Sum midpoint correction.
     mut_src3 = directory / "valu_div_fmas_mut_double_round.hlsl"
     mut_cso3 = directory / "valu_div_fmas_mut_double_round.cso"
-    mut_hlsl3 = hlsl_text.replace("if ((u0 & 0x1fffffffu) == 0x10000000u && err_sc != 0.0)", "if (false)")
+    mut_hlsl3 = hlsl_text.replace("if (midpoint && err_sc != 0.0)", "if (false)")
     assert mut_hlsl3 != hlsl_text
     mut_src3.write_text(mut_hlsl3, encoding="ascii")
     compile_shader(compiler, mut_src3, mut_cso3)
