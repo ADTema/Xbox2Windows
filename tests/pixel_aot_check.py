@@ -4848,6 +4848,155 @@ def e64_integer_group(group):
     return ["v_mov_b32_e32 v18, s45", *E64_INT_BODIES[group]]
 
 
+# SDWA forms of the 32-bit integer operations, four results per group in v12 to v15, with A, B, C and D in
+# s44 to s47 and B also in v18. Every form appears once; the selections cover each byte and word, zero and
+# sign extension on either source, a selected shift count, and results placed into a byte or word with
+# UNUSED_PAD and UNUSED_PRESERVE.
+SDWA_INT_BODIES = {
+    "bitwise": [
+        "v_and_b32_sdwa v12, s44, sext(s45) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:BYTE_1",
+        "v_or_b32_sdwa v13, s44, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1",
+        "v_xor_b32_sdwa v14, s44, s45 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:BYTE_2",
+        "v_xnor_b32_sdwa v15, sext(s44), s45 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD",
+    ],
+    "shift": [
+        "v_lshlrev_b32_sdwa v12, s44, s45 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD",
+        "v_lshrrev_b32_sdwa v13, s44, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD",
+        "v_ashrrev_i32_sdwa v14, s44, sext(s45) dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_2 src1_sel:WORD_1",
+        "v_mov_b32_e32 v15, s47",
+        "v_not_b32_sdwa v15, s46 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_2",
+    ],
+    "arith": [
+        "v_add_nc_u32_sdwa v12, s44, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:BYTE_3",
+        "v_sub_nc_u32_sdwa v13, s44, sext(v18) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:BYTE_0",
+        "v_subrev_nc_u32_sdwa v14, s44, s45 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD",
+        "v_mov_b32_e32 v15, s47",
+        "v_add_nc_u32_sdwa v15, s44, s45 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_0 src1_sel:BYTE_0",
+    ],
+    "minmax": [
+        "v_min_i32_sdwa v12, sext(s44), sext(s45) dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:WORD_0",
+        "v_max_i32_sdwa v13, sext(s44), v18 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:WORD_0",
+        "v_min_u32_sdwa v14, s44, s45 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:BYTE_1",
+        "v_max_u32_sdwa v15, s44, s45 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+    ],
+}
+SDWA_INT_OPS = tuple(sorted({line.split()[0] for body in SDWA_INT_BODIES.values() for line in body
+                             if line.split()[0].endswith("_sdwa")}))
+
+
+def _word(word, index):
+    return (word >> (16 * index)) & 0xffff
+
+
+def _sext(value, width):
+    """The width-bit field as a two's-complement Python integer."""
+    return value - (1 << width) if value >> (width - 1) & 1 else value
+
+
+def _s32(word):
+    return _sext(word & 0xffffffff, 32)
+
+
+# Reference words by group: the e32 operation on the selected fields, then the placement.
+SDWA_INT_RESULTS = {
+    "bitwise": lambda a, b, c, d: (
+        a & _sext(_byte(b, 1), 8), a | _word(b, 1), ((_byte(a, 0) ^ _byte(b, 2)) & 0xff) << 24,
+        ~(_sext(_word(a, 0), 16) ^ b)),
+    "shift": lambda a, b, c, d: (
+        b << (_byte(a, 1) & 31), b >> (_byte(a, 0) & 31),
+        ((_sext(_word(b, 1), 16) >> (_byte(a, 2) & 31)) & 0xffff) << 16,
+        (d & 0xffff0000) | (~_byte(c, 2) & 0xffff)),
+    "arith": lambda a, b, c, d: (
+        a + _byte(b, 3), a - _sext(_byte(b, 0), 8), b - _word(a, 0),
+        (d & 0xffff00ff) | (((_byte(a, 0) + _byte(b, 0)) & 0xff) << 8)),
+    "minmax": lambda a, b, c, d: (
+        (min(_sext(_word(a, 1), 16), _sext(_word(b, 0), 16)) & 0xffff) << 16,
+        (max(_sext(_word(a, 1), 16), _word(b, 0)) & 0xffff) << 16,
+        min(_byte(a, 3), _byte(b, 1)) << 24, max(a, b)),
+}
+# Negative controls by group: (row, channel, word a wrong lowering would give, what went wrong). Each must
+# report a mismatch.
+SDWA_INT_WRONG = {
+    "bitwise": (
+        (0, 0, lambda a, b, c, d: a & _byte(b, 1), "sign extension dropped on src1"),
+        (0, 0, lambda a, b, c, d: a & _sext(_byte(b, 0), 8), "BYTE_0 for BYTE_1"),
+        (0, 0, lambda a, b, c, d: a | _sext(_byte(b, 1), 8), "or for and"),
+        (0, 1, lambda a, b, c, d: a | _word(b, 0), "WORD_0 for WORD_1"),
+        (0, 1, lambda a, b, c, d: a | b, "src1 selection ignored"),
+        (0, 1, lambda a, b, c, d: a ^ _word(b, 1), "xor for or"),
+        (0, 2, lambda a, b, c, d: ((_byte(a, 2) ^ _byte(b, 0)) & 0xff) << 24, "source selections swapped"),
+        (0, 2, lambda a, b, c, d: ((_byte(a, 0) ^ _byte(b, 2)) & 0xff) << 16, "result placed in BYTE_2"),
+        (0, 2, lambda a, b, c, d: ((_byte(a, 0) | _byte(b, 2)) & 0xff) << 24, "or for xor"),
+        (0, 3, lambda a, b, c, d: ~(_word(a, 0) ^ b), "sign extension dropped on src0"),
+        (0, 3, lambda a, b, c, d: _sext(_word(a, 0), 16) ^ b, "xor for xnor"),
+    ),
+    "shift": (
+        (0, 0, lambda a, b, c, d: b << (_byte(a, 0) & 31), "count from BYTE_0 for BYTE_1"),
+        (0, 0, lambda a, b, c, d: 0, "count not reduced modulo 32"),
+        (0, 1, lambda a, b, c, d: _sar32(b, _byte(a, 0) & 31), "arithmetic shift for logical"),
+        (0, 1, lambda a, b, c, d: b >> (_byte(a, 1) & 31), "count from BYTE_1 for BYTE_0"),
+        (0, 2, lambda a, b, c, d: ((_word(b, 1) >> (_byte(a, 2) & 31)) & 0xffff) << 16, "sign extension dropped on src1"),
+        (0, 2, lambda a, b, c, d: (_sext(_word(b, 1), 16) >> (_byte(a, 2) & 31)) & 0xffff, "result placed in WORD_0"),
+        (0, 2, lambda a, b, c, d: ((_sext(_word(b, 0), 16) >> (_byte(a, 2) & 31)) & 0xffff) << 16, "WORD_0 for WORD_1"),
+        (0, 3, lambda a, b, c, d: ~_byte(c, 2) & 0xffff, "padding for UNUSED_PRESERVE"),
+        (0, 3, lambda a, b, c, d: (d & 0xffff0000) | _byte(c, 2), "not dropped"),
+        (0, 3, lambda a, b, c, d: (d & 0xffff0000) | (~_byte(c, 1) & 0xffff), "BYTE_1 for BYTE_2"),
+        (0, 3, lambda a, b, c, d: (d & 0xffff0000) | (~_byte(c, 2) & 0xff), "byte written for word"),
+    ),
+    "arith": (
+        (0, 0, lambda a, b, c, d: a + _byte(b, 2), "BYTE_2 for BYTE_3"),
+        (0, 0, lambda a, b, c, d: a - _byte(b, 3), "sub for add"),
+        (0, 1, lambda a, b, c, d: a - _byte(b, 0), "sign extension dropped on src1"),
+        (0, 1, lambda a, b, c, d: _sext(_byte(b, 0), 8) - a, "subrev order for sub"),
+        (0, 2, lambda a, b, c, d: _word(a, 0) - b, "sub order for subrev"),
+        (0, 2, lambda a, b, c, d: b - _word(a, 1), "WORD_1 for WORD_0"),
+        (0, 2, lambda a, b, c, d: b - _sext(_word(a, 0), 16), "sign extension added on src0"),
+        (0, 3, lambda a, b, c, d: (d & 0xffff00ff) | ((_byte(a, 0) + _byte(b, 0)) << 8), "carry leaves the byte"),
+        (0, 3, lambda a, b, c, d: ((_byte(a, 0) + _byte(b, 0)) & 0xff) << 8, "padding for UNUSED_PRESERVE"),
+        (0, 3, lambda a, b, c, d: (d & 0xffffff00) | ((_byte(a, 0) + _byte(b, 0)) & 0xff), "result placed in BYTE_0"),
+    ),
+    "minmax": (
+        (0, 0, lambda a, b, c, d: (min(_word(a, 1), _word(b, 0)) & 0xffff) << 16, "sign extension dropped on src0"),
+        (1, 0, lambda a, b, c, d: (min(_sext(_word(a, 1), 16), _word(b, 0)) & 0xffff) << 16, "sign extension dropped on src1"),
+        (0, 1, lambda a, b, c, d: (max(_word(a, 1), _word(b, 0)) & 0xffff) << 16, "sign extension dropped on src0"),
+        (1, 1, lambda a, b, c, d: (max(_sext(_word(a, 1), 16), _sext(_word(b, 0), 16)) & 0xffff) << 16, "sign extension added on src1"),
+        (0, 2, lambda a, b, c, d: max(_byte(a, 3), _byte(b, 1)) << 24, "max for min"),
+        (0, 2, lambda a, b, c, d: min(_byte(a, 3), _byte(b, 0)) << 24, "BYTE_0 for BYTE_1"),
+        (0, 3, lambda a, b, c, d: max(_s32(a), _s32(b)), "signed max for unsigned"),
+        (1, 3, lambda a, b, c, d: min(a, b), "min for max"),
+    ),
+}
+# (A, B, C, D) as binary32 words; the inputs and every right result are normal numbers or zero (asserted at
+# the draw). The selected bytes and words differ from their neighbours, the sign-extended fields are negative
+# in at least one row, and the shift counts (bytes of A in the shift group) exceed 31.
+SDWA_INT_ROWS = {
+    "bitwise": ((0x40D18A11, 0xC025B37E, 0, 0), (0x3E27F0C4, 0xBF62915A, 0, 0)),
+    "shift": ((0x3F232425, 0xC1700000, 0x40C32A11, 0x41A00000), (0x40214263, 0x4C003A00, 0x3F00FF80, 0xC2480000)),
+    "arith": ((0x40D18AF1, 0xC025B38E, 0, 0x41A00000), (0x3E27F0C4, 0xBF62915A, 0, 0xC2480000)),
+    "minmax": ((0xC0258A11, 0x40D13A00, 0, 0), (0x3E27F0C4, 0xBF62915A, 0, 0)),
+}
+
+
+def sdwa_integer_group(group):
+    return ["v_mov_b32_e32 v18, s45", *SDWA_INT_BODIES[group]]
+
+
+def sdwa_integer_cases(group):
+    """(row, expected words, status, reason) for every draw of a group: the right rows, then the controls."""
+    rows = SDWA_INT_ROWS[group]
+    right = [tuple(word & 0xffffffff for word in SDWA_INT_RESULTS[group](*row)) for row in rows]
+    cases = [(row, words, "pass", "") for row, words in zip(rows, right)]
+    for index, channel, wrong, reason in SDWA_INT_WRONG[group]:
+        words = list(right[index])
+        words[channel] = wrong(*rows[index]) & 0xffffffff
+        assert words[channel] != right[index][channel], (group, reason)
+        cases.append((rows[index], tuple(words), "mismatch", reason))
+    # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+    for row, words in zip(rows, right):
+        assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (group, [hex(w) for w in (*row, *words)])
+    return cases
+
+
 def sop2_lshl_add_group() -> list[str]:
     return with_constants([
         "s_lshl1_add_u32 s60, s44, s45",
@@ -5139,7 +5288,7 @@ def check_e64_integer_lowering():
     assert set(E64_INT_OPS) <= ACCEPTED, set(E64_INT_OPS) - ACCEPTED
     assert len(E64_INT_OPS) == 10
     # v_xnor_b32 takes the operand shapes of v_xor_b32 and nothing else: no float modifier, no clamp, two
-    # sources, a written register, and no SDWA spelling.
+    # sources, a written register, and no SDWA spelling without all of its fields.
     for good, bad in (
         ("v_xnor_b32_e32 v12, s44, v18", "v_xnor_b32_e32 v12, s44, |v18|"),
         ("v_xnor_b32_e32 v12, s44, v18", "v_xnor_b32_e32 v12, s44, -v18"),
@@ -5148,8 +5297,7 @@ def check_e64_integer_lowering():
         ("v_xnor_b32_e64 v12, 64, v18", "v_xnor_b32_e64 v12, s44"),
         ("v_xnor_b32_e64 v12, v18, s44", "v_xnor_b32_e64 v12, s44, v18, s45"),
         ("v_xnor_b32_e32 v12, s44, v18", "v_xnor_b32_e32 v12, s44, v106"),
-        ("v_xnor_b32_e32 v12, s44, v18",
-         "v_xnor_b32_sdwa v12, v18, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"),
+        ("v_xnor_b32_e32 v12, s44, v18", "v_xnor_b32_sdwa v12, v18, v18 src0_sel:DWORD src1_sel:DWORD"),
     ):
         translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
@@ -5158,6 +5306,93 @@ def check_e64_integer_lowering():
     assert xnor_source != xor_source
     # A float modifier on the byte conversion stays refused in the e64 spelling as well.
     must_reject(translate_int, uncompressed_export(["v_cvt_f32_ubyte2_e64 v12, -s46"]))
+
+
+def check_sdwa_integer_lowering():
+    """Static checks for the SDWA forms of the 32-bit integer operations in sdwa_integer_group()."""
+    assert SDWA_INT_BODIES.keys() == SDWA_INT_RESULTS.keys() == SDWA_INT_WRONG.keys() == SDWA_INT_ROWS.keys()
+    for group in SDWA_INT_BODIES:
+        translate_int(uncompressed_export(sdwa_integer_group(group)))
+        sdwa_integer_cases(group)
+    assert set(SDWA_INT_OPS) <= ACCEPTED, set(SDWA_INT_OPS) - ACCEPTED
+    assert len(SDWA_INT_OPS) == 15 and set(SDWA_INT_OPS) == {f"v_{op}_sdwa" for op in pixel_aot.SDWA_INT}
+
+    def statement(*body):
+        """The HLSL of the last instruction of body, with its own temporary renamed to `r`."""
+        program = uncompressed_export(["v_mov_b32_e32 v18, s45", *body])
+        index = program.index(body[-1])
+        lines = [line for line in translate_int(program).splitlines()
+                 if line.startswith(f"    precise float alu{index} = ")]
+        assert len(lines) == 1, (body, lines)
+        return lines[0].replace(f"alu{index} ", "r ", 1)
+
+    a, b, v = "asuint(params[0].w)", "asuint(params[1].x)", "asuint(alu20)"
+    sdwa = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"
+    # With whole-dword selections every form is its e32 statement, up to the parentheses of the placement.
+    for op, (arity, _) in pixel_aot.SDWA_INT.items():
+        if arity == 1:
+            plain = statement(f"v_{op}_e32 v12, v18")
+            whole = statement(f"v_{op}_sdwa v12, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD")
+        else:
+            plain = statement(f"v_{op}_e32 v12, s44, v18")
+            whole = statement(f"v_{op}_sdwa v12, s44, v18 {sdwa}")
+        inner = plain.removeprefix("    precise float r = asfloat(").removesuffix(");")
+        if op in ("min_i32", "max_i32"):
+            # The e32 statement converts the signed result directly; the SDWA one goes through its unsigned word.
+            inner = f"asuint({inner})".replace("asint(params[0].w)", f"asint({a})").replace("asint(alu20)", f"asint({v})")
+        assert whole == f"    precise float r = asfloat(({inner}));", (op, plain, whole)
+    # Selections: zero extension is a shift and a mask, sign extension an arithmetic shift pair, and the
+    # placement masks the result into its field.
+    assert statement("v_and_b32_sdwa v12, s44, sext(s45) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD "
+                     "src1_sel:BYTE_1") == f"    precise float r = asfloat(({a} & asuint(asint({b} << 16u) >> 24u)));"
+    assert statement("v_or_b32_sdwa v13, s44, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD "
+                     "src1_sel:WORD_1") == f"    precise float r = asfloat(({a} | (({v} >> 16u) & 0xffffu)));"
+    assert statement("v_xor_b32_sdwa v14, s44, s45 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:BYTE_0 "
+                     "src1_sel:BYTE_2") == (f"    precise float r = asfloat(((((({a} >> 0u) & 0xffu) ^ "
+                                            f"(({b} >> 16u) & 0xffu)) & 0xffu) << 24u));")
+    assert statement("v_mov_b32_e32 v15, s47", "v_not_b32_sdwa v15, s46 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE "
+                     "src0_sel:BYTE_2") == ("    precise float r = asfloat(((asuint(alu21) & 0xffff0000u) | "
+                                            "(((~((asuint(params[1].y) >> 16u) & 0xffu)) & 0xffffu) << 0u)));")
+    good = f"v_and_b32_sdwa v12, s44, v18 {sdwa}"
+    translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
+    for bad, message in (
+        # UNUSED_SEXT stays refused, as for the SDWA moves.
+        (good.replace("dst_sel:DWORD dst_unused:UNUSED_PAD", "dst_sel:WORD_0 dst_unused:UNUSED_SEXT"),
+         "UNUSED_SEXT is not lowered"),
+        # UNUSED_PRESERVE keeps bits of a tracked numeric destination only.
+        (f"v_and_b32_sdwa v20, s44, v18 {sdwa}".replace("dst_sel:DWORD dst_unused:UNUSED_PAD",
+                                                         "dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE"),
+         "UNUSED_PRESERVE needs a tracked numeric destination"),
+        (f"v_and_b32_sdwa v0, s44, v18 {sdwa}".replace("dst_sel:DWORD dst_unused:UNUSED_PAD",
+                                                        "dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE"),
+         "UNUSED_PRESERVE needs a tracked numeric destination"),
+        # clamp, inline constants, literals, float modifiers and incomplete or malformed fields.
+        (good.replace(" dst_sel", " clamp dst_sel"), "Unsupported SDWA integer operands"),
+        (good.replace("s44,", "64,"), "Unsupported SDWA integer operands"),
+        (good.replace("s44,", "1.0,"), "Unsupported SDWA integer operands"),
+        (good.replace("s44,", "0x12345,"), "Unsupported SDWA integer operands"),
+        (good.replace("s44,", "-s44,"), "Unsupported SDWA integer operands"),
+        (good.replace("v18 ", "|v18| "), "Unsupported SDWA integer operands"),
+        (good.replace("s44,", "sext(-s44),"), "Unsupported SDWA integer operands"),
+        ("v_and_b32_sdwa v12, s44, v18", "Unsupported SDWA integer operands"),
+        ("v_and_b32_sdwa v12, s44, v18 src0_sel:DWORD src1_sel:DWORD", "Unsupported SDWA integer operands"),
+        (good.replace("src0_sel:DWORD", "src0_sel:WORD_2"), "Unsupported SDWA integer operands"),
+        (good.replace("s44,", "sext(s44,"), "Unbalanced sext()"),
+        (good.replace("s44,", "s44),"), "Unbalanced sext()"),
+        # The source count and the selections must agree with the operation.
+        (good.replace(" src1_sel:DWORD", ""), "takes 2 source(s)"),
+        (good.replace("s44, v18", "v18"), "takes 2 source(s)"),
+        (f"v_not_b32_sdwa v12, s44, v18 {sdwa}", "takes 1 source(s)"),
+        (f"v_not_b32_sdwa v12, v18 {sdwa}", "takes 1 source(s)"),
+        # An unwritten register is not a numeric source.
+        (good.replace("v18", "v0"), "Expected a numeric register"),
+    ):
+        expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]), message)
+    must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", good.replace("v18", "v106")]))
+    # Operations outside the table keep their refusal in the SDWA spelling.
+    for bad in (f"v_bfi_b32_sdwa v12, s44, v18 {sdwa}", f"v_mul_u32_u24_sdwa v12, s44, v18 {sdwa}",
+                f"v_add_nc_i32_sdwa v12, s44, v18 {sdwa}", f"v_min3_u32_sdwa v12, s44, v18 {sdwa}"):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
 
 
 def check_nc_integer_lowering():
@@ -5340,6 +5575,7 @@ def check_controls(directory):
         must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_align]))
     check_nc_integer_lowering()
     check_e64_integer_lowering()
+    check_sdwa_integer_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
     assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED
     for expected in (
@@ -6383,6 +6619,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(nc_integer_group(group)), translate_int) for group in (1, 2, 3))
     fixtures.append((uncompressed_export(f16_compares()), translate_int))
     fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
+    fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
@@ -6757,6 +6994,36 @@ def check_e64_integer_draws(directory, compiler, renderer, backend):
                 wrong_words[channel] = wrong(*row) & 0xffffffff
                 assert wrong_words[channel] != words[channel], (group, reason)
                 add_case(cases, row, wrong_words, "mismatch")
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+def check_sdwa_integer_draws(directory, compiler, renderer, backend):
+    """Draw the SDWA forms of the 32-bit integer operations through the integer readback target.
+
+    Each group of SDWA_INT_BODIES is compiled once and drawn in one renderer batch: every row of
+    SDWA_INT_ROWS with the right words, then one draw per SDWA_INT_WRONG entry with one channel replaced by
+    the word a wrong selection, extension, placement or operation would give, which must report a mismatch.
+    On a desktop GPU the draws establish that the translated shader computes the stated words, not what the
+    console does.
+    """
+    source = directory / "sdwa_integer.hlsl"
+    shader = directory / "sdwa_integer.cso"
+    for group in SDWA_INT_BODIES:
+        source.write_text(translate_int(uncompressed_export(sdwa_integer_group(group))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for row, words, status, _ in sdwa_integer_cases(group):
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *row)
+            case = directory / f"sdwa_integer-{len(cases)}.case"
+            case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+            cases.append((case, status))
         try:
             run_pixel_batch(renderer, backend, shader, cases)
         except subprocess.CalledProcessError as error:
@@ -8508,12 +8775,13 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
-                    "draw-e64-integer", "draw-bfm", "draw-align", "draw-plain-bitscan"):
+                    "draw-e64-integer", "draw-bfm", "draw-align", "draw-sdwa-integer", "draw-plain-bitscan"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
                         "draw-e64-integer": check_e64_integer_draws,
+                        "draw-sdwa-integer": check_sdwa_integer_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-align": check_align_draws,
                         "draw-plain-bitscan": check_plain_bitscan_draw}[mode]

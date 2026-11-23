@@ -45,6 +45,7 @@ PIXEL_ALU_NAMES = tuple(pixel_aot.ALU) if pixel_aot is not None else ()
 PIXEL_SDWA_ALU = tuple(pixel_aot.SDWA_ALU) if pixel_aot is not None else ()
 SUPPORTED_ALU = {f"v_{name}_f32" for name in PIXEL_ALU_NAMES}
 PIXEL_INTEGER = pixel_aot.INTEGER if pixel_aot is not None else {}
+PIXEL_SDWA_INT = pixel_aot.SDWA_INT if pixel_aot is not None else {}
 PIXEL_SCALAR = pixel_aot.SCALAR if pixel_aot is not None else {}
 PIXEL_SALU_BIT64 = tuple(pixel_aot.SALU_BIT64) if pixel_aot is not None else ()
 PIXEL_COMPARE = tuple(pixel_aot.COMPARE) if pixel_aot is not None else ()
@@ -172,6 +173,15 @@ if PIXEL_VOP3P_INT16:
 for name, (arity, _) in PIXEL_INTEGER.items():
     encoding = r"(?:_e32|_e64)?" if arity <= 2 else r"(?:_e64)?"
     SUPPORTED_INSTRUCTIONS_REGEX.append(rf"v_{name}{encoding}\s+v\d+" + rf",\s*{INTEGER_SOURCE}" * arity)
+
+# SDWA forms of the 32-bit integer operations: register sources, optionally under sext(), every field printed,
+# and no UNUSED_SEXT. As for the moves, UNUSED_PRESERVE onto an untracked destination is refused by the translator only.
+SDWA_INT_SOURCE = r"(?:sext\([vs]\d+\)|[vs]\d+)"
+for name, (arity, _) in PIXEL_SDWA_INT.items():
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_{name}_sdwa\s+v\d+" + rf",\s+{SDWA_INT_SOURCE}" * arity
+        + rf"\s+dst_sel:{SDWA_SEL_PATTERN}\s+dst_unused:(?:UNUSED_PAD|UNUSED_PRESERVE)"
+        + "".join(rf"\s+src{index}_sel:{SDWA_SEL_PATTERN}" for index in range(arity)))
 
 for name, (arity, _, _) in PIXEL_SCALAR.items():
     SUPPORTED_INSTRUCTIONS_REGEX.append(rf"s_{name}\s+s\d+" + rf",\s*{SCALAR32_SOURCE}" * arity)

@@ -298,6 +298,12 @@ def check_shader_records():
     e64_integer_forms = {("VOP3", f"{form}_e64") for form in (
         "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_not_b32",
         "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_cvt_f32_ubyte2")}
+    sdwa_integer_forms = {("SDWA", f"{form}_sdwa") for form in (
+        "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_not_b32",
+        "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32",
+        "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32",
+        "v_min_i32", "v_max_i32", "v_min_u32", "v_max_u32")}
+    assert len(sdwa_integer_forms) == 15
     mul24_forms = {
         ("VOP2", "v_mul_i32_i24"), ("VOP3", "v_mul_i32_i24_e64"),
         ("VOP2", "v_mul_u32_u24"), ("VOP3", "v_mul_u32_u24_e64"),
@@ -320,6 +326,7 @@ def check_shader_records():
         assert sopc_forms <= covered, (name, sopc_forms - covered)
         assert vop2_forms <= covered, (name, vop2_forms - covered)
         assert e64_integer_forms <= covered, (name, e64_integer_forms - covered)
+        assert sdwa_integer_forms <= covered, (name, sdwa_integer_forms - covered)
         # The VOP3 spellings of the interpolation pair and of v_nop.
         e64_spelling_forms = {("VOP3", "v_interp_p1_f32_e64"), ("VOP3", "v_interp_p2_f32_e64"), ("VOP3", "v_nop_e64")}
         assert e64_spelling_forms <= covered, (name, e64_spelling_forms - covered)
