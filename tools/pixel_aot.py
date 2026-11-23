@@ -623,6 +623,9 @@ INTEGER = {
     "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
     "xnor_b32": (2, "~({0} ^ {1})"),
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
+    # Copies the low binary16 encoding of each source into one half of the destination, with no conversion,
+    # rounding or NaN handling (AMD RDNA ISA reference, VOP3OpSel: D[15:0].f16 = S0.f16, D[31:16].f16 = S1.f16).
+    "pack_b32_f16": (2, "({0} & 0xffffu) | (({1} & 0xffffu) << 16)"),
     # Saturating packs: src0 gives the low and src1 the high 16 bits (AMD RDNA 2 ISA reference, VOP3 opcodes
     # 874 and 875). The ISA text does not define its conversion functions; the bounds are the clamp Mesa
     # documents for the NIR operations its ACO backend selects these instructions for.
@@ -684,7 +687,7 @@ MUL24_HELPERS = {
     "mul_hi_i32_i24": ("mul24_hi_u32", "mul24_hi_i32"),
 }
 # Two-source integer operations that exist in the VOP3 encoding only on gfx10.
-INTEGER_VOP3_ONLY = ("cvt_pk_u16_u32", "cvt_pk_i16_i32", "bfm_b32", "bcnt_u32_b32")
+INTEGER_VOP3_ONLY = ("cvt_pk_u16_u32", "cvt_pk_i16_i32", "bfm_b32", "bcnt_u32_b32", "pack_b32_f16")
 SAD_HELPERS = {"sad_hi_u8": ("sad4_u8",), "msad_u8": ("sad4_u8",)}
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 
@@ -797,6 +800,37 @@ uint mul_hi_i32(uint a, uint b) {
         "    if (w == 0u) return 0u;\n"
         "    if (off + w < 32u) return asuint(asint(src << (32u - off - w)) >> (32u - w));\n"
         "    return asuint(asint(src) >> off);\n"
+        "}"
+    ),
+    "dpp_frexp_mant_f32": (
+        "float dpp_frexp_mant_f32(uint bits) {\n"
+        "    uint exp = (bits >> 23) & 0xffu;\n"
+        "    uint mant = bits & 0x7fffffu;\n"
+        "    if (exp == 0xffu || (exp == 0u && mant == 0u)) return asfloat(bits);\n"
+        "    uint sign = bits & 0x80000000u;\n"
+        "    if (exp == 0u) {\n"
+        "        uint shift = 23u - firstbithigh(mant);\n"
+        "        mant = (mant << shift) & 0x7fffffu;\n"
+        "    }\n"
+        "    return asfloat(sign | 0x3f000000u | mant);\n"
+        "}"
+    ),
+    "dpp_frexp_exp_i32_f32": (
+        "uint dpp_frexp_exp_i32_f32(uint bits) {\n"
+        "    uint exp = (bits >> 23) & 0xffu;\n"
+        "    uint mant = bits & 0x7fffffu;\n"
+        "    if (exp == 0xffu || (exp == 0u && mant == 0u)) return 0u;\n"
+        "    if (exp == 0u) return asuint(int(firstbithigh(mant)) - 148);\n"
+        "    return asuint(int(exp) - 126);\n"
+        "}"
+    ),
+    "dpp_dot4c_i32_i8": (
+        "uint dpp_dot4c_i32_i8(uint a, uint b, uint acc) {\n"
+        "    int s0 = (asint(a << 24) >> 24) * (asint(b << 24) >> 24);\n"
+        "    int s1 = (asint(a << 16) >> 24) * (asint(b << 16) >> 24);\n"
+        "    int s2 = (asint(a << 8) >> 24) * (asint(b << 8) >> 24);\n"
+        "    int s3 = (asint(a) >> 24) * (asint(b) >> 24);\n"
+        "    return acc + asuint(s0) + asuint(s1) + asuint(s2) + asuint(s3);\n"
         "}"
     ),
     "s_bfe64": (
@@ -1186,6 +1220,22 @@ VOP3_INT16_TERNARY = {
     "med3_i16": "med3_i16", "med3_u16": "med3_u16",
 }
 
+# Quad-local DPP16/DPP8 extra f32, carry-in/carry-out, and dot-accumulate ops.
+# Tuple fields: (kind, allow_fp_mods, helper_name)
+DPP_EXTRA = {
+    "v_rndne_f32_dpp": ("f32_unary", True, None),
+    "v_sin_f32_dpp": ("f32_unary", True, None),
+    "v_cos_f32_dpp": ("f32_unary", True, None),
+    "v_rcp_iflag_f32_dpp": ("f32_unary", True, None),
+    "v_frexp_mant_f32_dpp": ("frexp_mant", True, "dpp_frexp_mant_f32"),
+    "v_frexp_exp_i32_f32_dpp": ("frexp_exp", True, "dpp_frexp_exp_i32_f32"),
+    "v_mac_f32_dpp": ("mac_f32", True, None),
+    "v_add_co_ci_u32_dpp": ("co_ci", False, None),
+    "v_sub_co_ci_u32_dpp": ("co_ci", False, None),
+    "v_subrev_co_ci_u32_dpp": ("co_ci", False, None),
+    "v_dot4c_i32_i8_dpp": ("dot4c_i8", False, "dpp_dot4c_i32_i8"),
+}
+
 
 def sgpr_name(token):
     if not (m := re.fullmatch(r"s(\d+)", token)):
@@ -1289,7 +1339,7 @@ SCALAR = {
     "abs_i32": (1, "(asint({0}) < 0 ? (0u - {0}) : {0})", NONZERO),
     "absdiff_i32": (2, "asuint(abs(asint({0}) - asint({1})))", NONZERO),
     "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),
-    "add_i32": (2, "{0} + {1}", "(~({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
+    "add_i32": (2, "{0} + {1}", "(({0} ^ {r}) & ({1} ^ {r})) >> 31 != 0u"),
     "sub_i32": (2, "{0} - {1}", "(({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
     "mul_i32": (2, "{0} * {1}", None),
     "min_u32": (2, "min({0}, {1})", "{0} < {1}"), "max_u32": (2, "max({0}, {1})", "{0} > {1}"),
@@ -1812,7 +1862,9 @@ def dpp_vgpr(token, vector, sample_dest, *, allow_mods):
     m = re.fullmatch(r"v(\d+)", raw)
     if not m or not 0 <= int(m.group(1)) <= 255:
         raise ValueError(f"DPP operand must be a VGPR, got {token}")
-    value = vector.get(raw)
+    if raw not in vector:
+        raise ValueError(f"DPP operand {raw} is read before it is written")
+    value = vector[raw]
     if not isinstance(value, str) or not value.startswith(("sample", "alu", "uv.")):
         raise ValueError(f"Expected a numeric VGPR in DPP, got {raw}")
     if raw in sample_dest:
@@ -1832,25 +1884,18 @@ def parse_dpp(rest, operand_count):
         raise ValueError("Missing DPP control modifiers")
     if m := re.fullmatch(r"dpp8:\[([0-7](?:,[0-7]){7})\]", mods[0]):
         perm8 = [int(b) for b in m.group(1).split(",")]
-        seen_fi = False
-        for mod in mods[1:]:
-            if re.fullmatch(r"fi:[01]", mod) and not seen_fi:
-                seen_fi = True
-            else:
-                raise ValueError(f"Unsupported DPP8 modifier {mod}")
-        if not all(p < 4 for p in perm8[:4]) or perm8[4:] != [p + 4 for p in perm8[:4]]:
+        if mods[1:]:
+            raise ValueError(f"Unsupported DPP8 modifier {mods[1]}")
+        if not all(p < 4 for p in perm8[:4]):
             raise ValueError(f"Cross-quad DPP8 permutation is unsupported: {mods[0]}")
+        if perm8[4:] != [p + 4 for p in perm8[:4]]:
+            raise ValueError(f"DPP8 permutation must repeat the same quad selection in both halves: {mods[0]}")
         return operands, perm8[:4], True
     if m := re.fullmatch(r"quad_perm:\[([0-3],[0-3],[0-3],[0-3])\]", mods[0]):
         perm4 = [int(b) for b in m.group(1).split(",")]
         seen = set()
         for mod in mods[1:]:
             if mod in ("row_mask:0xf", "bank_mask:0xf"):
-                key = mod.split(":", 1)[0]
-                if key in seen:
-                    raise ValueError(f"Duplicate DPP16 modifier {mod}")
-                seen.add(key)
-            elif re.fullmatch(r"(bound_ctrl|fi):[01]", mod):
                 key = mod.split(":", 1)[0]
                 if key in seen:
                     raise ValueError(f"Duplicate DPP16 modifier {mod}")
@@ -2101,7 +2146,7 @@ def dot_word(token, scalar, vector, pending, sample_dest, *, allow_f16=False):
             raise ValueError(f"Register out of range: {token}")
         if token in pending:
             raise ValueError("Constant read before load completion")
-        value = (vector if m.group(1) == "v" else scalar)[token]
+        value = (vector if m.group(1) == "v" else scalar).get(token)
         if isinstance(value, int):
             return f"{value}u"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
@@ -4010,6 +4055,122 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"({'|'.join(DPP_EXTRA)}) (v\d+), (.+)"):
+            op, dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid DPP operation outside entry mask")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            kind, allow_fp_mods, helper_name = DPP_EXTRA[op]
+            operand_count = 4 if kind == "co_ci" else (1 if kind in ("f32_unary", "frexp_mant", "frexp_exp") else 2)
+            ops, perm, is_dpp8 = parse_dpp(rest, operand_count)
+            mods_ok = (not is_dpp8) and allow_fp_mods
+            if kind == "co_ci":
+                carry_out, src0, src1, carry_in = ops
+                if carry_out != carry_in or carry_in not in ("vcc", "vcc_lo"):
+                    raise ValueError(f"Unsupported carry mask for {op}")
+                condition = scalar.get("vcc")
+                if (pending.intersection(("vcc",)) or not isinstance(condition, tuple)
+                        or condition[0] != "condition" or condition[2:] != (0, 1)):
+                    raise ValueError("Carry mask is not a tracked condition")
+                s0_val, _, _ = dpp_vgpr(src0, vector, sample_dest, allow_mods=False)
+                s1_val, _, _ = dpp_vgpr(src1, vector, sample_dest, allow_mods=False)
+                s0_bits = emit_quad_swizzle_u32(lines, i, s0_val, perm)
+                lines.append(f"    uint dpp_a{i} = {s0_bits};")
+                lines.append(f"    uint dpp_b{i} = asuint({s1_val});")
+                lines.append(f"    uint dpp_ci{i} = {condition[1]} ? 1u : 0u;")
+                if op == "v_add_co_ci_u32_dpp":
+                    lines.append(f"    uint dpp_t{i} = dpp_a{i} + dpp_b{i};")
+                    lines.append(f"    uint dpp_r{i} = dpp_t{i} + dpp_ci{i};")
+                    lines.append(f"    bool cmp{i} = (dpp_t{i} < dpp_a{i}) || (dpp_r{i} < dpp_t{i});")
+                elif op == "v_sub_co_ci_u32_dpp":
+                    lines.append(f"    uint dpp_t{i} = dpp_a{i} - dpp_b{i};")
+                    lines.append(f"    uint dpp_r{i} = dpp_t{i} - dpp_ci{i};")
+                    lines.append(f"    bool cmp{i} = (dpp_a{i} < dpp_b{i}) || (dpp_t{i} < dpp_ci{i});")
+                else:
+                    lines.append(f"    uint dpp_t{i} = dpp_b{i} - dpp_a{i};")
+                    lines.append(f"    uint dpp_r{i} = dpp_t{i} - dpp_ci{i};")
+                    lines.append(f"    bool cmp{i} = (dpp_b{i} < dpp_a{i}) || (dpp_t{i} < dpp_ci{i});")
+                scalar["vcc"] = ("condition", f"cmp{i}", 0, 1)
+                vector[dst] = f"alu{i}"
+                lines.append(f"    precise float alu{i} = asfloat(dpp_r{i});")
+            elif kind in ("f32_unary", "frexp_mant", "frexp_exp"):
+                src0 = ops[0]
+                s0_val, abs0, neg0 = dpp_vgpr(src0, vector, sample_dest, allow_mods=mods_ok)
+                s0_bits = emit_quad_swizzle_u32(lines, i, s0_val, perm)
+                if kind in ("frexp_mant", "frexp_exp"):
+                    helpers.add(helper_name)
+                    bits = s0_bits
+                    if abs0:
+                        bits = f"({bits} & 0x7fffffffu)"
+                    if neg0:
+                        bits = f"({bits} ^ 0x80000000u)"
+                    if kind == "frexp_mant":
+                        expr = f"{helper_name}({bits})"
+                    else:
+                        expr = f"asfloat({helper_name}({bits}))"
+                else:
+                    val = f"asfloat({s0_bits})"
+                    if abs0:
+                        val = f"abs({val})"
+                    if neg0:
+                        val = f"(-{val})"
+                    expr = {
+                        "v_rndne_f32_dpp": f"round({val})",
+                        "v_sin_f32_dpp": f"sin32({val})",
+                        "v_cos_f32_dpp": f"cos32({val})",
+                        "v_rcp_iflag_f32_dpp": f"(1.0f / ({val}))",
+                    }[op]
+                vector[dst] = f"alu{i}"
+                lines.append(f"    precise float alu{i} = {expr};")
+            else:
+                src0, src1 = ops
+                acc_val, _, _ = dpp_vgpr(dst, vector, sample_dest, allow_mods=False)
+                s0_val, abs0, neg0 = dpp_vgpr(src0, vector, sample_dest, allow_mods=mods_ok)
+                s1_val, abs1, neg1 = dpp_vgpr(src1, vector, sample_dest, allow_mods=mods_ok)
+                s0_bits = emit_quad_swizzle_u32(lines, i, s0_val, perm)
+                if kind == "mac_f32":
+                    a = f"asfloat({s0_bits})"
+                    if abs0:
+                        a = f"abs({a})"
+                    if neg0:
+                        a = f"(-{a})"
+                    b = s1_val
+                    if abs1:
+                        b = f"abs({b})"
+                    if neg1:
+                        b = f"(-{b})"
+                    expr = f"mad32({a}, {b}, {acc_val})"
+                else:
+                    helpers.add(helper_name)
+                    expr = f"asfloat({helper_name}({s0_bits}, asuint({s1_val}), asuint({acc_val})))"
+                vector[dst] = f"alu{i}"
+                lines.append(f"    precise float alu{i} = {expr};")
+        elif m := match(r"(v_dot4c_i32_i8)(?:_e32)? (.+)"):
+            op, rest = m.groups()
+            parts_ = rest.split(", ")
+            if len(parts_) != 3:
+                raise ValueError("Invalid dot-accumulate operand count")
+            dst, src0, src1 = parts_
+            if mask != "entry":
+                raise ValueError("Invalid dot-accumulate operation")
+            if not (dm := re.fullmatch(r"v(\d+)", dst)) or not 0 <= int(dm.group(1)) <= 255:
+                raise ValueError(f"Invalid dot-accumulate destination {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if " " in src1:
+                raise ValueError(f"Unsupported modifier on {op}: {src1}")
+            if not (s1m := re.fullmatch(r"v(\d+)", src1)) or not 0 <= int(s1m.group(1)) <= 255:
+                raise ValueError(f"{op} e32 src1 must be a VGPR, got {src1}")
+            if re.fullmatch(r"-?(?:abs\([^)]+\)|\|[^|]+\|)|-[vs]\d+", src0):
+                raise ValueError(f"Source modifiers are not allowed on {op} e32: {src0}")
+            acc_val, _, _ = dpp_vgpr(dst, vector, sample_dest, allow_mods=False)
+            u0 = dot_word(src0, scalar, vector, pending, sample_dest)
+            u1 = dot_word(src1, scalar, vector, pending, sample_dest)
+            helpers.add("dpp_dot4c_i32_i8")
+            expr = f"asfloat(dpp_dot4c_i32_i8({u0}, {u1}, asuint({acc_val})))"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expr};")
         elif m := match(r"ds_swizzle_b32 (v\d+), (v\d+) offset:swizzle\(QUAD_PERM,([0-3](?:,[0-3]){3})\)"):
             dst, src, selectors = m.groups()
             value = vector.get(src)

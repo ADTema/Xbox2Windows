@@ -443,7 +443,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
     }
     has_wide |= any(i.mnemonic in sse34_fp_ops for i in body)
     shuffle_ops = {
-        M.SHUFPS, M.UNPCKHPS, M.UNPCKLPS, M.MOVHLPS, M.MOVLHPS, M.MOVMSKPS, M.MOVUPS,
+        M.SHUFPS, M.UNPCKHPS, M.UNPCKLPS, M.MOVHLPS, M.MOVLHPS, M.MOVMSKPS, M.MOVUPS, M.MOVAPS,
         M.RCPPS, M.RCPSS, M.RSQRTPS, M.RSQRTSS,
         M.SHUFPD, M.UNPCKHPD, M.UNPCKLPD, M.MOVMSKPD, M.MOVUPD, M.MOVAPD, M.MOVDQA,
         M.VSHUFPS, M.VUNPCKHPS, M.VUNPCKLPS, M.VSHUFPD, M.VUNPCKHPD, M.VUNPCKLPD,
@@ -577,6 +577,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
     }
     has_wide |= has_avx_shuffle
     avx_compare = {M.VCMPPS: "ps", M.VCMPPD: "pd", M.VCMPSS: "ss", M.VCMPSD: "sd"}
+    legacy_packed_compare = {M.CMPPS: ("ps", "__m128"), M.CMPPD: ("pd", "__m128d")}
+    legacy_half_move = {M.MOVLPS: 0, M.MOVLPD: 0, M.MOVHPS: 8, M.MOVHPD: 8}
+    has_wide |= any(i.mnemonic in legacy_packed_compare or i.mnemonic in legacy_half_move for i in body)
     avx_test = {M.VPTEST: 1, M.VTESTPS: 4, M.VTESTPD: 8}
     avx_wide_conversion = {
         M.VCVTDQ2PS: ("cvtepi32_ps", "__m256i", "__m256", 32, 32),
@@ -1230,6 +1233,22 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                     f"for (size_t n = {stride - 1}; n < {nbytes}; n += {stride}) {{ "
                     f"const unsigned a = {lhs}[n], b = rhs[n] & {mask}u; z |= a & b; c |= ~a & b; }} "
                     f"zero = z == 0; carry = c == 0; overflow = false; sign = false;{pf} }}")
+        elif op in legacy_packed_compare and i.encoding == EncodingKind.LEGACY:
+            suffix, fp_vector = legacy_packed_compare[op]
+            if i.op0_kind != K.REGISTER or i.op0_register not in wide_xmm:
+                raise ValueError(f"unsupported packed SSE compare destination at {i.ip:#x}: {i}")
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.MEMORY:
+                rhs = f"load_legacy_aligned_m128({address()})"
+            elif i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                rhs = wide_xmm[i.op1_register]
+            else:
+                raise ValueError(f"unsupported packed SSE compare source at {i.ip:#x}: {i}")
+            predicate = ("eq", "lt", "le", "unord", "neq", "nlt", "nle", "ord")[i.immediate(2) & 7]
+            stmt = (f"{{ {fp_vector} lhs, rhs; memcpy(&lhs, {dst}.data(), 16); "
+                    f"memcpy(&rhs, {rhs}.data(), 16); "
+                    f"const {fp_vector} result = _mm_cmp{predicate}_{suffix}(lhs, rhs); "
+                    f"memcpy({dst}.data(), &result, 16); }}")
         elif op in avx_compare:
             suffix = avx_compare[op]
             scalar = suffix in ("ss", "sd")
@@ -2330,6 +2349,25 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                 stmt = f"memset({dst}.data()+16, 0, 16);" if is_vex else ";"
             else:
                 stmt = f"{{ memcpy({dst}.data(), {src}.data(), 16); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}"
+        elif op in legacy_half_move and i.encoding == EncodingKind.LEGACY:
+            offset = legacy_half_move[op]
+            if i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and i.op1_kind == K.MEMORY:
+                stmt = (f"{{ const uint64_t value = {guest('uint64_t')}; "
+                        f"memcpy({wide_xmm[i.op0_register]}.data() + {offset}, &value, 8); }}")
+            elif i.op0_kind == K.MEMORY and i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                stmt = (f"{{ uint64_t value; memcpy(&value, {wide_xmm[i.op1_register]}.data() + {offset}, 8); "
+                        f"store<uint64_t>({address()}, value); }}")
+            else:
+                raise ValueError(f"unsupported SSE half move form at {i.ip:#x}: {i}")
+        elif op in (M.MOVAPS, M.MOVAPD, M.MOVDQA) and i.encoding == EncodingKind.LEGACY and has_wide:
+            if i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and i.op1_kind == K.MEMORY:
+                stmt = (f"{{ const auto bytes = load_legacy_aligned_m128({address()}); "
+                        f"memcpy({wide_xmm[i.op0_register]}.data(), bytes.data(), 16); }}")
+            elif i.op0_kind == K.MEMORY and i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                stmt = (f"{{ const word target = {address()}; if (target & 15u) raise_aligned_m128_fault(); "
+                        f"memcpy(reinterpret_cast<void*>(target), {wide_xmm[i.op1_register]}.data(), 16); }}")
+            else:
+                raise ValueError(f"unsupported aligned SSE move form at {i.ip:#x}: {i}")
         elif op in (M.MOVUPS, M.MOVUPD) and has_wide:
             is_vex = i.encoding == EncodingKind.VEX
             if i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and i.op1_kind == K.MEMORY:

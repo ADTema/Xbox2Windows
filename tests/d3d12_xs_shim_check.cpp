@@ -63,7 +63,8 @@ bool export_checks()
     if (!desktop.load()) return false;
 
     unsigned found = 0;
-    for (const char* name : {"D3D12SerializeVersionedRootSignature", "D3D12CreateRootSignatureDeserializer"}) {
+    for (const char* name : {"D3D12SerializeVersionedRootSignature", "D3D12CreateRootSignatureDeserializer",
+                             "D3D12ConfigureVirtualMemoryX"}) {
         FARPROC proc = GetProcAddress(shim, name);
         if (!proc) return false;
         HMODULE owner = nullptr;
