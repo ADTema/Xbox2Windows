@@ -477,7 +477,8 @@ def main():
     parser.add_argument("--group-reg-y", type=int, help="SGPR holding the group Y ID")
     parser.add_argument("--group-reg-z", type=int, help="SGPR holding the group Z ID")
     parser.add_argument("--stride", type=int, help="Indexed raw UAV byte stride")
-    parser.add_argument("--source-descriptor", type=lambda n: int(n, 0), help="Table byte offset bound to t0")
+    parser.add_argument("--source-descriptor", type=lambda n: int(n, 0),
+                        help="Table byte offset bound to stable read-only t0, with no overlap with u0")
     parser.add_argument("--source-stride", type=int, help="Indexed t0 byte stride")
     args = parser.parse_args()
     if args.output.suffix.lower() != ".hlsl" or args.output.resolve() == args.container.resolve():
