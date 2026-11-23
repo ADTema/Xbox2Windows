@@ -1748,7 +1748,7 @@ def check_cmp64_controls():
                 assert translate_int(cmp64_group(kind, encoding, group, wave64=True)) == translate_int(program)
     assert forms == {f"v_cmp_{op}_{kind}_{enc}" for op in INT_PREDICATES for kind in ("i64", "u64")
                      for enc in ("e32", "e64")}, forms
-    # The suffix-less mnemonic is the e32 form, which is how LLVM prints it after assembly.
+    # Without a suffix LLVM 15 picks e32 when the operands fit it and e64 otherwise (it always prints the suffix).
     assert (translate_int(cmp64_program(["v_cmp_lt_u64 vcc_lo, v[18:19], v[20:21]"]))
             == translate_int(cmp64_program(["v_cmp_lt_u64_e32 vcc_lo, v[18:19], v[20:21]"])))
 
@@ -1814,7 +1814,8 @@ def check_cmp64_controls():
     e32_destination = "64-bit comparison e32 destination must be vcc"
     for dst in ("s52", "s[52:53]"):
         error(f"v_cmp_lt_i64_e32 {dst}, v[18:19], v[20:21]", e32_destination)
-        error(f"v_cmp_lt_u64 {dst}, v[18:19], v[20:21]", e32_destination)
+        assert (translate_int(cmp64_program([f"v_cmp_lt_u64 {dst}, v[18:19], v[20:21]"]))
+                == translate_int(cmp64_program([f"v_cmp_lt_u64_e64 {dst}, v[18:19], v[20:21]"]))), dst
     error("v_cmp_lt_i64_e64 s[45:46], v[18:19], v[20:21]", "Invalid 64-bit scalar register pair: s[45:46]")
     error("v_cmp_lt_i64_e64 s106, v[18:19], v[20:21]", "Scalar register out of range: s106")
     error("v_cmp_lt_i64_e64 s[106:107], v[18:19], v[20:21]", "Invalid 64-bit scalar register pair: s[106:107]")
@@ -1839,7 +1840,11 @@ def check_cmp64_controls():
     src1 = "64-bit comparison e32 src1 must be a VGPR pair"
     for token in ("s[44:45]", "64", "-1", "s44", "v18", "1.0", "0x10"):
         error(f"v_cmp_lt_i64_e32 vcc_lo, v[18:19], {token}", src1)
-        error(f"v_cmp_lt_u64 vcc_lo, v[18:19], {token}", src1)
+        if token in ("s[44:45]", "64", "-1"):  # valid e64 sources: the suffix-less spelling becomes e64
+            assert (translate_int(cmp64_program([f"v_cmp_lt_u64 vcc_lo, v[18:19], {token}"]))
+                    == translate_int(cmp64_program([f"v_cmp_lt_u64_e64 vcc_lo, v[18:19], {token}"]))), token
+        else:
+            error(f"v_cmp_lt_u64 vcc_lo, v[18:19], {token}", invalid + token)
     # The exec-writing forms and the other compare families stay refused.
     for line in ("v_cmpx_lt_i64_e32 v[18:19], v[20:21]", "v_cmpx_lt_u64_e64 v[18:19], v[20:21]",
                  "v_cmpx_lt_i64_e64 s52, v[18:19], v[20:21]", "v_cmp_lt_f64_e64 s52, v[18:19], v[20:21]",

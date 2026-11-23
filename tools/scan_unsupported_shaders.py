@@ -419,7 +419,8 @@ def supports_int64_compare(clean: str) -> bool:
     if INT64_COMPARE_PATTERN is None or not (m := INT64_COMPARE_PATTERN.fullmatch(clean)):
         return False
     enc, dst, *sources = m.groups()
-    enc = enc or "_e32"
+    if enc is None:  # LLVM 15 picks e32 only when the operands fit it
+        enc = "_e32" if dst in ("vcc", "vcc_lo") and re.fullmatch(r"v\[\d+:\d+\]", sources[1].strip()) else "_e64"
     if enc == "_e32" and dst not in ("vcc", "vcc_lo"):
         return False
     if (p := re.fullmatch(r"s\[(\d+):(\d+)\]", dst)) and not _sgpr_pair_ok(p):

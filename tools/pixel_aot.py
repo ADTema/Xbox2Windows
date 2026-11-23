@@ -2600,7 +2600,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i64|u64)(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             # 64-bit comparisons: the two words are compared separately, so no 64-bit HLSL type is needed.
             op, kind, enc, dst, *tokens = m.groups()
-            enc = (enc or "_e32")[1:]
+            # Without a suffix LLVM 15 picks e32 when the operands fit it (vcc destination, VGPR-pair src1) and
+            # e64 otherwise; its disassembly always prints the suffix.
+            if enc is None:
+                enc = "_e32" if dst in ("vcc", "vcc_lo") and re.fullmatch(r"v\[\d+:\d+\]", tokens[1]) else "_e64"
+            enc = enc[1:]
             if enc == "e32" and dst not in ("vcc", "vcc_lo"):
                 raise ValueError("64-bit comparison e32 destination must be vcc")
             regs = lane_mask(dst)

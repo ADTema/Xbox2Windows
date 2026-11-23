@@ -2487,13 +2487,15 @@ class TestRdna2Scanner(unittest.TestCase):
                              f"v_cmp_{op}_{kind}_e32 vcc_lo, -1, v[20:21]",
                              f"v_cmp_{op}_{kind}_e64 s52, v[18:19], v[19:20]",
                              f"v_cmp_{op}_{kind}_e64 vcc_lo, s[44:45], s[46:47]",
-                             f"v_cmp_{op}_{kind}_e64 s[52:53], 64, v[20:21]"):
+                             f"v_cmp_{op}_{kind}_e64 s[52:53], 64, v[20:21]",
+                             # Without a suffix LLVM 15 picks e64 when the operands need it.
+                             f"v_cmp_{op}_{kind} s[52:53], v[18:19], v[20:21]",
+                             f"v_cmp_{op}_{kind} vcc_lo, v[18:19], s[44:45]"):
                     self.assertTrue(is_instruction_supported(line), line)
         for line in (
             "v_cmp_lt_i64_e32 vcc_lo, v[18:19], s[44:45]",
             "v_cmp_lt_i64_e32 vcc_lo, v[18:19], 64",
             "v_cmp_lt_i64_e32 s52, v[18:19], v[20:21]",
-            "v_cmp_lt_u64 s[52:53], v[18:19], v[20:21]",
             "v_cmp_lt_u64_e64 s52, 0x12345678, v[20:21]",
             "v_cmp_lt_u64_e64 s52, 1.0, v[20:21]",
             "v_cmp_lt_u64_e64 s52, v[18:19], v[20:21] clamp",
