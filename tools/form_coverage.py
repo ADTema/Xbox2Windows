@@ -68,6 +68,9 @@ CPU_FIXTURES = {
     "rdtsc": "cpu_aot_rdtsc",
     "rdtscp": "cpu_aot_rdtscp",
     "rdtsc_harness": None,  # native CPUID and serialized reads
+    "rdrand": "cpu_aot_rdrand",
+    "rdseed": "cpu_aot_rdseed",
+    "rdrand_harness": None,  # native CPUID and RFLAGS reads
     "exe_entry": "cpu_aot_exe_entry",
     "xchg": "cpu_aot_xchg",
     "address_size": "cpu_aot_address_size",

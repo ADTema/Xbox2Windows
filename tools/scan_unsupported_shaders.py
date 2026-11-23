@@ -53,12 +53,20 @@ PIXEL_COMPARE = tuple(pixel_aot.COMPARE) if pixel_aot is not None else ()
 PIXEL_INT_COMPARE = tuple(pixel_aot.INT_COMPARE) if pixel_aot is not None else ()
 PIXEL_VOP3P_F16 = pixel_aot.VOP3P_F16 if pixel_aot is not None else {}
 PIXEL_VOP3P_INT16 = pixel_aot.VOP3P_INT16 if pixel_aot is not None else {}
+PIXEL_VOP3_INT16 = pixel_aot.VOP3_INT16 if pixel_aot is not None else {}
 PIXEL_VCC = r"(?:vcc(?:_lo)?)"
 PIXEL_LANE_MASK = pixel_aot.LANE_MASK if pixel_aot is not None else r"(?:vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 # Explicit _e32 VOPC writes VCC only; suffix-less and _e64 may name an SGPR destination.
 PIXEL_VOPC_DST = rf"(?:_e32\s+{PIXEL_VCC}|(?:_e64)?\s+{PIXEL_LANE_MASK})"
 PIXEL_VOPC_E32_DST = rf"(?:_e32\s+{PIXEL_VCC}|\s+{PIXEL_LANE_MASK})"
 INTEGER_SOURCE = r"(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
+# 16-bit integer operand as pixel_aot.int16_operand accepts it: VGPR 0-255, SGPR 0-105, inline -16..64 or a
+# hex literal up to 0xffff (leading zeros allowed, up to 8 digits).
+INT16_VGPR = r"v(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])"
+INT16_SOURCE = (
+    rf"(?:{INT16_VGPR}|s(?:[0-9]|[1-9][0-9]|10[0-5])|0x0{{0,4}}[0-9a-f]{{1,4}}"
+    r"|-?(?:[0-9]|1[0-6])|(?:1[7-9]|[2-5][0-9]|6[0-4]))"
+)
 SCALAR32_SOURCE = r"(?:s\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
 SCALAR64_SOURCE = r"(?:s\[\d+:\d+\]|0x[0-9a-f]{1,8}|-?\d+)"
 F16_PLAIN = r"(?:-?(?:\d+\.\d+|\d+)|0x[0-9a-f]{1,4}|[vs]\d+)"
@@ -182,6 +190,10 @@ if PIXEL_VOP3P_INT16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_pk_(?:{'|'.join(map(re.escape, PIXEL_VOP3P_INT16))})\s+v\d+,\s+.+"
     )
+if PIXEL_VOP3_INT16:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP3_INT16))})(?:_e64)?\s+{INT16_VGPR},\s+{INT16_SOURCE},\s+{INT16_SOURCE}"
+    )
 
 for name, (arity, _) in PIXEL_INTEGER.items():
     encoding = r"(?:_e32|_e64)?" if arity <= 2 else r"(?:_e64)?"
@@ -269,6 +281,7 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"s_{name}_b64" for name in PIXEL_SALU_BIT64}
     | {f"v_pk_{name}_f16" for name in PIXEL_VOP3P_F16}
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
+    | {f"v_{name}" for name in PIXEL_VOP3_INT16}
     | {name for name, _, _ in MUBUF_OPS.values()}
     | {name for name, _, _ in MTBUF_OPS.values()}
     | {entry[0] for entry in FLAT_OPS.values()}

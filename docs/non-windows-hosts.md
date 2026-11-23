@@ -39,6 +39,7 @@ for t in \
   tests/bc7_blocks_check.py \
   tests/bc7_tiles_check.py \
   tests/resource_ranges_check.py \
+  tests/ttpf_batch_export_check.py \
   tests/awc_metadata_check.py \
   tests/sgd5_effects_check.py \
   tests/dxcontainer_part_offsets_check.py \
@@ -99,6 +100,7 @@ for t in \
   tests/bc7_tiles_check.py \
   tests/form_coverage_check.py \
   tests/resource_ranges_check.py \
+  tests/ttpf_batch_export_check.py \
   tests/awc_metadata_check.py \
   tests/sgd5_effects_check.py \
   tests/dxcontainer_part_offsets_check.py \
