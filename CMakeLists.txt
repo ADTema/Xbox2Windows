@@ -2254,6 +2254,41 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${texture_exe}" "$<TARGET_FILE:archive_texture_lifted>" "$<TARGET_FILE:archive_codec>"
         "$<TARGET_FILE:blast_source>")
 
+    # The same reader image drawing each completed record through D3D12 (#830). The GPU codec keeps
+    # the name archive_codec.dll in its own directory, next to copies of the reader and blast.
+    set(archive_gpu_dir "${CMAKE_CURRENT_BINARY_DIR}/archive_gpu")
+    set(archive_gpu_sources "${archive_src}/codec.cpp" "${archive_src}/texture_gpu.cpp"
+        "${archive_src}/quad_frames.cpp" "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_vs.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_ps.h")
+    add_library(archive_codec_gpu SHARED ${archive_gpu_sources})
+    target_link_libraries(archive_codec_gpu PRIVATE blast_source dxgi d3d12)
+    set_target_properties(archive_codec_gpu PROPERTIES OUTPUT_NAME archive_codec
+        RUNTIME_OUTPUT_DIRECTORY "${archive_gpu_dir}" ARCHIVE_OUTPUT_DIRECTORY "${archive_gpu_dir}")
+    add_library(archive_codec_gpu_lifted SHARED ${archive_gpu_sources})
+    target_link_libraries(archive_codec_gpu_lifted PRIVATE blast_lifted dxgi d3d12)
+    foreach(codec IN ITEMS archive_codec_gpu archive_codec_gpu_lifted)
+        target_include_directories(${codec} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_features(${codec} PRIVATE cxx_std_17)
+        set_target_properties(${codec} PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+    endforeach()
+    set(archive_gpu_reader "${archive_gpu_dir}/archive_texture_reader.exe")
+    add_custom_command(OUTPUT "${archive_gpu_reader}" "${archive_gpu_dir}/blast_source.dll"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${texture_exe}" "$<TARGET_FILE:blast_source>"
+            "${archive_gpu_dir}"
+        DEPENDS "${texture_exe}" blast_source VERBATIM)
+    add_custom_target(archive_gpu_reader ALL DEPENDS "${archive_gpu_reader}")
+    add_executable(archive_texture_gpu_lifted "${texture_cpp}")
+    target_link_libraries(archive_texture_gpu_lifted PRIVATE archive_codec_gpu_lifted ntdll)
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME cpu_archive_texture_gpu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_texture_gpu_check.py" "$<TARGET_FILE:pe_map>"
+            "${archive_gpu_reader}" "$<TARGET_FILE:archive_texture_gpu_lifted>"
+            "$<TARGET_FILE:archive_codec_gpu>" "$<TARGET_FILE:blast_source>")
+        set_tests_properties(cpu_archive_texture_gpu_${adapter} PROPERTIES TIMEOUT 180
+            ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter}")
+    endforeach()
+    set_tests_properties(cpu_archive_texture_gpu_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
     function(crc_line_program target polynomial)
         # Use the same CRC object optimization flags in Debug and Release.
         set(crc_object "${CMAKE_CURRENT_BINARY_DIR}/${target}_step.obj")
