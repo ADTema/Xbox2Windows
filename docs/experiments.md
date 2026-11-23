@@ -4305,9 +4305,9 @@ Binding probes on #870 leave 19 audio-side imports unresolved: 5 from `chad.dll`
 | `acphal.dll` | `ApuCreateHeap` | Named in a DirectXTK12 diagnostic as the heap that `ApuAlloc` draws from. No call site and no signature. | Process memory (proposed, untested) | needs evidence |
 | `acphal.dll` | `ApuAlloc` | Call sites at [SoundEffect.cpp L246](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L246), [WaveBankReader.cpp L799](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/WaveBankReader.cpp#L799) and [SoundStreamInstance.cpp L470](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundStreamInstance.cpp#L470) | Aligned process memory (proposed, fixture only) | partial call shape |
 | `acphal.dll` | `ApuFree` | Call sites at [SoundEffect.cpp L95](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L95) and [SoundStreamInstance.cpp L60](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundStreamInstance.cpp#L60) | Release of the block above (proposed, fixture only) | partial call shape |
-| `acphal.dll` | `ApuIsVirtualAddressValid` | None | None known | needs evidence |
-| `acphal.dll` | `ApuMapApuAddress` | None | None known | needs evidence |
-| `acphal.dll` | `ApuMapVirtualAddress` | None | None known | needs evidence |
+| `acphal.dll` | `ApuIsVirtualAddressValid` | Address validation per GDK index member page | Buffer validity query (proposed, fixture only) | partial call shape |
+| `acphal.dll` | `ApuMapApuAddress` | Address mapping per GDK index member page | APU address to CPU virtual address (proposed, fixture only) | partial call shape |
+| `acphal.dll` | `ApuMapVirtualAddress` | Address mapping per GDK index member page | CPU virtual address to APU address (proposed, fixture only) | partial call shape |
 
 No import has both a public signature and a usable desktop replacement. The 17 imports marked "needs evidence" stay unresolved, and this change adds no binding for any of them. Those calls cover the stream, command-queue and SHAPE context interfaces, which are console audio hardware with no desktop counterpart known. They need a public declaration or a source-built observation before any caller.
 
@@ -4341,6 +4341,32 @@ The fixture shows that the caller's success path, refusal path and release accou
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
+```
+
+### ACP address and memory mapping caller and recorder
+
+A source-built caller ([`apu_address_caller.asm`](../tests/cpu/apu_address_caller.asm)) imports the ACP address and memory mapping exports from `acphal.dll` by name (`ApuAlloc`, `ApuFree`, `ApuMapVirtualAddress`, `ApuMapApuAddress`, `ApuIsVirtualAddressValid`), plus `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). A test-only recording provider ([`apu_address_provider.cpp`](../tests/cpu/apu_address_provider.cpp)) serves the five exports from a 64 KiB arena with a synthetic APU device base address (`0x200000000`).
+
+- **Public evidence**:
+  - `ApuAlloc` and `ApuFree` call shapes from MIT Microsoft/DirectXTK12 call sites.
+  - Microsoft Learn GDK index confirms `acphal.dll` member APIs.
+- **Convention vs Evidence**:
+  - **Public/observed evidence**: allocation of audio buffer memory, linear address translation between CPU pointers and APU addresses, and validity query lifecycle.
+  - **Recorder convention**: the 64 KiB arena size, synthetic 64-bit APU device base address, 0 / null refusal sentinels on unmapped inputs, and `E_INVALIDARG` / `E_OUTOFMEMORY` HRESULTs are proposed desktop policy for this fixture.
+- **Verified cases**:
+  1. **Bidirectional mapping identity**: `ApuMapVirtualAddress` maps an active CPU virtual allocation to a device APU address, and `ApuMapApuAddress` maps that APU address back to the exact CPU pointer (`ApuMapApuAddress(ApuMapVirtualAddress(ptr)) == ptr`).
+  2. **Offset preservation**: `ApuMapVirtualAddress(ptr + offset) == apu_addr + offset` and `ApuMapApuAddress(apu_addr + offset) == ptr + offset`.
+  3. **Validity query lifecycle**: `ApuIsVirtualAddressValid` returns `TRUE` (`1`) for an active allocation, and returns `FALSE` (`0`) after `ApuFree`.
+  4. **Data access**: Memory written through the mapped pointer is verified byte-for-byte upon readback.
+  5. **Refusal controls**: Null pointer, stack pointer, and fabricated/out-of-range APU addresses are refused (`ApuIsVirtualAddressValid` returns `FALSE`, `ApuMapVirtualAddress` returns 0, `ApuMapApuAddress` returns `nullptr`).
+  6. **Faulty provider control**: A provider that returns null on inverse mapping (`APU_TEST_FAULTY`) is detected and causes the caller to abort at Step 4 (`0xF04`).
+  7. **Withholding negative controls**: Withholding any of `ApuMapVirtualAddress`, `ApuMapApuAddress`, or `ApuIsVirtualAddressValid` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]`.
+
+On success, the caller exits with `0x8A1`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process cleanly with code `0x8A1`. Under `pe_map`, `finish_exe` preserves the host return across all cases. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_apu_address$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_apu_address$' -V
 ```
 
 ### DirectStorage factory and queue adapter
