@@ -2732,7 +2732,7 @@ def check_scalar_carry_chain_draw(directory, compiler, renderer, backend):
         struct.pack_into("<QQ", constants, 12, (high_a << 32) | 0xffffffff, 1)
         words = (0, high_a, 1, 1)
         write_case(case, constants, tuple(as_float(w) for w in words), integer_rt=True)
-        subprocess.run(draw, check=True)
+        subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
 
 
 def scalar_leading_bit_values(width):
