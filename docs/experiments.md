@@ -1774,6 +1774,23 @@ export trace and all 748 clear pixels match.
 ctest --preset dev --no-tests=error -R '^compute_mesh_texture_(warp|hardware)$' -V
 ```
 
+The GPU-produced texture can also feed the SM 6.0 textured fallback on the
+same direct command list. The producer writes `u0` and copies its rows into
+the texture. The fallback then binds its own compute root to export geometry,
+and the vertex and pixel stages use the exported geometry and selected texture.
+The case file contains the export and image references and no texture upload
+payload.
+
+The GTX 1060 and Windows 10 in-box WARP matched all 128 export bytes and all
+1,024 pixels with one producer and with the second of two producers selected.
+Selecting the first texture against the second texture's reference changed
+exactly 276 pixels while the exports matched. The debug layer reported zero
+warnings and errors.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_mesh_texture_fallback_' -V
+```
+
 The mesh depth-pair fixture draws two partially overlapping indexed triangles
 with translated mesh and pixel stages. The two dispatches share one RGBA8
 target and one D32_FLOAT depth buffer with depth writes and LESS enabled.

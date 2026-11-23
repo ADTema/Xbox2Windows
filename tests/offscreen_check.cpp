@@ -427,6 +427,13 @@ bool validate_compute_mesh_texture_args(int argc, char** argv)
     return argc != 9 || std::string_view(argv[8]) == "--stale";
 }
 
+bool validate_compute_mesh_texture_fallback_args(int argc, char** argv)
+{
+    return std::string_view(argv[7]) != "--stale" &&
+           (argc < 9 || std::string_view(argv[8]) != "--stale") &&
+           (argc != 10 || std::string_view(argv[9]) == "--stale");
+}
+
 OperationResult run_check_pixel_batch(const OperationContext& ctx)
 {
     bool failed = false;
@@ -678,6 +685,13 @@ OperationResult run_compute_mesh_texture(const OperationContext& ctx)
                                                true, MeshConstantBinding::root, MeshDrawMode::textured, &producers));
 }
 
+OperationResult run_compute_mesh_texture_fallback(const OperationContext& ctx)
+{
+    const MeshTextureProducers producers{ctx.argv[7], ctx.argc >= 9 ? ctx.argv[8] : nullptr, ctx.argc == 10};
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6], true, &producers);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_mesh_depth_pair(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
@@ -895,6 +909,8 @@ const OperationSpec kOperations[] = {
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
     {"--mesh-textured", 6, 6, nullptr, kNoGate, run_mesh_textured},
     {"--compute-mesh-texture", 7, 9, validate_compute_mesh_texture_args, kNoGate, run_compute_mesh_texture},
+    {"--compute-mesh-texture-fallback", 8, 10, validate_compute_mesh_texture_fallback_args,
+     kGateSm60MeshFallback, run_compute_mesh_texture_fallback},
     {"--mesh-depth-pair", 6, 6, nullptr, kNoGate, run_mesh_depth_pair},
     {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
     {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},

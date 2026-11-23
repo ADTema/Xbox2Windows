@@ -476,8 +476,9 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* mesh, const char* p
 }
 
 void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const char* vertex,
-                              const char* pixel, const char* fixture, bool textured)
+                              const char* pixel, const char* fixture, bool textured,
+                              const MeshTextureProducers* producers)
 {
-    const auto mode = textured ? MeshDrawMode::textured : MeshDrawMode::color;
-    check_mesh_draw(device, compute, pixel, fixture, true, MeshConstantBinding::root, vertex, mode, nullptr);
+    const auto mode = textured || producers ? MeshDrawMode::textured : MeshDrawMode::color;
+    check_mesh_draw(device, compute, pixel, fixture, true, MeshConstantBinding::root, vertex, mode, producers);
 }
