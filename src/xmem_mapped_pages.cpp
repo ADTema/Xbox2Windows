@@ -22,6 +22,7 @@ struct PhysicalMemory {
     std::mutex mutex;
     std::map<ULONG_PTR, Backing> backings;
     std::map<ULONG_PTR, ULONG_PTR> views;
+    std::map<ULONG_PTR, SIZE_T> reservations;
 
     ~PhysicalMemory()
     {
@@ -68,16 +69,44 @@ HANDLE section_for(ULONG_PTR page)
     return section;
 }
 
+auto owned_reservation(ULONG_PTR address)
+{
+    auto it = memory.reservations.upper_bound(address);
+    if (it == memory.reservations.begin()) return memory.reservations.end();
+    --it;
+    return address - it->first < it->second ? it : memory.reservations.end();
+}
+
 bool map_view(ULONG_PTR address, HANDLE section)
 {
-    return MapViewOfFile3(section, GetCurrentProcess(), reinterpret_cast<void*>(address), 0,
-                          page_bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
+    auto* target = reinterpret_cast<void*>(address);
+    auto map = [&] {
+        return MapViewOfFile3(section, GetCurrentProcess(), target, 0,
+                              page_bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
+    };
+    if (map()) return true;
+    if (owned_reservation(address) == memory.reservations.end()) return false;
+    return VirtualFree(target, page_bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) && map();
 }
 
 bool unmap_view(ULONG_PTR address)
 {
     return UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(address),
                            MEM_PRESERVE_PLACEHOLDER) != FALSE;
+}
+
+void coalesce_unused(const std::map<ULONG_PTR, ULONG_PTR>& batch)
+{
+    auto previous = memory.reservations.end();
+    for (const auto& entry : batch) {
+        const auto reservation = owned_reservation(entry.first);
+        if (reservation == memory.reservations.end() || reservation == previous) continue;
+        previous = reservation;
+        const auto [base, size] = *reservation;
+        const auto view = memory.views.lower_bound(base);
+        if (view == memory.views.end() || view->first - base >= size)
+            VirtualFree(reinterpret_cast<void*>(base), size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+    }
 }
 
 // Destinations must be caller-owned, page-sized Windows placeholders. Live views
@@ -117,6 +146,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
                             next = position;
                         }
                     }
+                    coalesce_unused(batch);
                     SetLastError(error);
                     return FALSE;
                 }
@@ -144,6 +174,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
                 --memory.backings.at(page).views;
                 memory.views.erase(address);
             }
+            coalesce_unused(batch);
         }
     } catch (const std::bad_alloc&) {
         return physical_result(era_physical::Status::exhausted);
@@ -198,4 +229,39 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
 {
     if (!addresses) return physical_result(era_physical::Status::invalid);
     return map_pages(count, tokens, [=](ULONG_PTR i) { return reinterpret_cast<ULONG_PTR>(addresses[i]); });
+}
+
+// Reserve-only desktop profile from the source-built #888 comparison.
+extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allocation_type,
+                                        ULONGLONG attributes, DWORD protection)
+{
+    constexpr DWORD startup_reserve = 0x20402000;
+    constexpr SIZE_T gib = SIZE_T{1} << 30;
+    const bool supported = (attributes == 0x21 && protection == PAGE_READWRITE)
+                           || (attributes == 3 && protection == (0x800 | PAGE_NOACCESS));
+    if (address || (bytes != 16 * gib && bytes != 24 * gib) || allocation_type != startup_reserve || !supported) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    const std::lock_guard guard(memory.mutex);
+    // Callers release unused reservations with Win32. Drop entries for released
+    // ranges before another allocation can reuse those virtual addresses.
+    for (auto it = memory.reservations.begin(); it != memory.reservations.end();) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<void*>(it->first), &info, sizeof(info)) && info.State == MEM_FREE)
+            it = memory.reservations.erase(it);
+        else
+            ++it;
+    }
+    auto* reservation = VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                      PAGE_NOACCESS, nullptr, 0);
+    if (!reservation) return nullptr;
+    try {
+        memory.reservations.insert_or_assign(reinterpret_cast<ULONG_PTR>(reservation), bytes);
+    } catch (const std::bad_alloc&) {
+        VirtualFree(reservation, 0, MEM_RELEASE);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+    return reservation;
 }

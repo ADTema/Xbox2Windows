@@ -575,6 +575,23 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         M.VPUNPCKLQDQ, M.VPUNPCKHQDQ,
     }
     has_wide |= has_avx_shuffle
+    avx_scalar_fp = {
+        M.VADDSS: ("ss", "_mm_add_ss"), M.VADDSD: ("sd", "_mm_add_sd"),
+        M.VSUBSS: ("ss", "_mm_sub_ss"), M.VSUBSD: ("sd", "_mm_sub_sd"),
+        M.VMULSS: ("ss", "_mm_mul_ss"), M.VMULSD: ("sd", "_mm_mul_sd"),
+        M.VDIVSS: ("ss", "_mm_div_ss"), M.VDIVSD: ("sd", "_mm_div_sd"),
+        M.VSQRTSS: ("ss", "_mm_sqrt_ss"), M.VSQRTSD: ("sd", "_mm_sqrt_sd"),
+        M.VMINSS: ("ss", "_mm_min_ss"), M.VMINSD: ("sd", "_mm_min_sd"),
+        M.VMAXSS: ("ss", "_mm_max_ss"), M.VMAXSD: ("sd", "_mm_max_sd"),
+        M.VROUNDSS: ("ss", "_mm_round_ss"), M.VROUNDSD: ("sd", "_mm_round_sd"),
+    }
+    avx_scalar_ops = {
+        M.VADDSS, M.VSUBSS, M.VMULSS, M.VDIVSS, M.VSQRTSS, M.VMINSS, M.VMAXSS, M.VROUNDSS,
+        M.VADDSD, M.VSUBSD, M.VMULSD, M.VDIVSD, M.VSQRTSD, M.VMINSD, M.VMAXSD, M.VROUNDSD,
+        M.VMOVSS, M.VMOVHLPS, M.VMOVLHPS, M.VMOVLPS, M.VMOVHPS, M.VMOVLPD,
+        M.VINSERTPS, M.VEXTRACTPS, M.VCOMISS, M.VUCOMISS, M.VCOMISD, M.VUCOMISD,
+    }
+    has_wide |= any(i.mnemonic in avx_scalar_ops for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
@@ -1129,6 +1146,83 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             stmt = (f"{{ auto input = {src}; {dst} = {{}}; for (size_t n=0; n<16; n+=4) {{ "
                     f"auto v = load<uint32_t>(reinterpret_cast<word>(input.data()+n)) {operation}; "
                     f"memcpy({dst}.data()+n, &v, 4); }} }}")
+        elif op == M.VEXTRACTPS and i.encoding == EncodingKind.VEX and has_wide and i.op1_register in wide_xmm:
+            lane = i.immediate(2) & 3
+            stmt = f"{{ uint32_t v; memcpy(&v, {wide_xmm[i.op1_register]}.data()+{4 * lane}, 4); {write('v')} }}"
+        elif op in (M.VCOMISS, M.VUCOMISS, M.VCOMISD, M.VUCOMISD):
+            if (i.encoding != EncodingKind.VEX or i.op0_kind != K.REGISTER
+                    or i.op0_register not in wide_xmm or i.op1_kind not in (K.MEMORY, K.REGISTER)
+                    or (i.op1_kind == K.REGISTER and i.op1_register not in wide_xmm)):
+                raise ValueError(f"unsupported scalar AVX compare at {i.ip:#x}: {i}")
+            single = op in (M.VCOMISS, M.VUCOMISS)
+            bit_type, vec_type, size, suffix, abs_mask, inf_bits = (
+                ("uint32_t", "__m128", 4, "ss", "0x7fffffffu", "0x7f800000u") if single
+                else ("uint64_t", "__m128d", 8, "sd", "0x7fffffffffffffffull", "0x7ff0000000000000ull")
+            )
+            lhs = wide_xmm[i.op0_register]
+            rhs = (f"memcpy(&y, {wide_xmm[i.op1_register]}.data(), {size});" if i.op1_kind == K.REGISTER
+                   else f"y = {guest(bit_type)};")
+            cmp = "_mm_comi" if op in (M.VCOMISS, M.VCOMISD) else "_mm_ucomi"
+            pf = " parity = unordered;" if parity else ""
+            stmt = (f"{{ {bit_type} x, y; memcpy(&x, {lhs}.data(), {size}); {rhs} "
+                    f"{vec_type} a{{}}, b{{}}; memcpy(&a, &x, {size}); memcpy(&b, &y, {size}); "
+                    f"const bool eq = {cmp}eq_{suffix}(a, b) != 0, lt = {cmp}lt_{suffix}(a, b) != 0; "
+                    f"const bool unordered = (x & {abs_mask}) > {inf_bits} || (y & {abs_mask}) > {inf_bits}; "
+                    f"zero = eq | unordered; carry = lt | unordered; overflow = false; sign = false;{pf} }}")
+        elif op == M.VMOVSS and i.encoding == EncodingKind.VEX and has_wide:
+            if i.op_count == 2 and i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and i.op1_kind == K.MEMORY:
+                dst = wide_xmm[i.op0_register]
+                stmt = f"{{ const uint32_t s = {guest('uint32_t')}; {dst} = {{}}; memcpy({dst}.data(), &s, 4); }}"
+            elif i.op_count == 2 and i.op0_kind == K.MEMORY and i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                stmt = f"memcpy(reinterpret_cast<void*>({address()}), {wide_xmm[i.op1_register]}.data(), 4);"
+            elif i.op_count == 3 and i.op0_register in wide_xmm and i.op1_register in wide_xmm and i.op2_register in wide_xmm:
+                dst, s1, s2 = wide_xmm[i.op0_register], wide_xmm[i.op1_register], wide_xmm[i.op2_register]
+                stmt = f"{{ auto t = {s1}; uint8_t lo[4]; memcpy(lo, {s2}.data(), 4); {dst} = {{}}; memcpy({dst}.data(), t.data(), 16); memcpy({dst}.data(), lo, 4); }}"
+            else:
+                raise ValueError(f"unsupported VMOVSS form at {i.ip:#x}: {i}")
+        elif op in (M.VMOVLPS, M.VMOVHPS, M.VMOVLPD) and i.encoding == EncodingKind.VEX and has_wide:
+            off = 8 if op == M.VMOVHPS else 0
+            if i.op_count == 2 and i.op0_kind == K.MEMORY and i.op1_register in wide_xmm:
+                stmt = f"memcpy(reinterpret_cast<void*>({address()}), {wide_xmm[i.op1_register]}.data()+{off}, 8);"
+            elif i.op_count == 3 and i.op0_register in wide_xmm and i.op1_register in wide_xmm and i.op2_kind == K.MEMORY:
+                dst, s1 = wide_xmm[i.op0_register], wide_xmm[i.op1_register]
+                stmt = f"{{ const auto t = {s1}; const uint64_t s = {guest('uint64_t')}; {dst} = {{}}; memcpy({dst}.data(), t.data(), 16); memcpy({dst}.data()+{off}, &s, 8); }}"
+            else:
+                raise ValueError(f"unsupported {op} form at {i.ip:#x}: {i}")
+        elif op == M.VINSERTPS and i.encoding == EncodingKind.VEX and has_wide and i.op0_register in wide_xmm:
+            dst, s1 = wide_xmm[i.op0_register], wide_xmm[i.op1_register]
+            imm = i.immediate(3)
+            cs, cd, zm = (imm >> 6) & 3, (imm >> 4) & 3, imm & 0xf
+            s2_val = (f"uint8_t v[4]; memcpy(v, {wide_xmm[i.op2_register]}.data()+{4*cs}, 4);" if i.op2_kind == K.REGISTER
+                      else f"uint8_t v[4]; const uint32_t s = {guest('uint32_t')}; memcpy(v, &s, 4);")
+            zeros = " ".join(f"memset({dst}.data()+{4*k}, 0, 4);" for k in range(4) if (zm >> k) & 1)
+            stmt = f"{{ auto t = {s1}; {s2_val} {dst} = {{}}; memcpy({dst}.data(), t.data(), 16); memcpy({dst}.data()+{4*cd}, v, 4); {zeros} }}"
+        elif op in avx_scalar_fp:
+            if (i.encoding != EncodingKind.VEX or i.op0_kind != K.REGISTER
+                    or i.op0_register not in wide_xmm or i.op1_kind != K.REGISTER
+                    or i.op1_register not in wide_xmm
+                    or i.op2_kind not in (K.MEMORY, K.REGISTER)
+                    or (i.op2_kind == K.REGISTER and i.op2_register not in wide_xmm)):
+                raise ValueError(f"unsupported scalar AVX operation at {i.ip:#x}: {i}")
+            dst, src = wide_xmm[i.op0_register], wide_xmm[i.op1_register]
+            suffix, intrinsic = avx_scalar_fp[op]
+            bit_type, vec_type, size = (
+                ("uint32_t", "__m128", 4) if suffix == "ss"
+                else ("uint64_t", "__m128d", 8)
+            )
+            rhs = (f"memcpy(&b, {wide_xmm[i.op2_register]}.data(), {size});" if i.op2_kind == K.REGISTER
+                   else f"const {bit_type} raw = {guest(bit_type)}; memcpy(&b, &raw, {size});")
+            args = "a, b"
+            if op in (M.VROUNDSS, M.VROUNDSD):
+                imm = i.immediate(3)
+                if imm & 4:
+                    raise ValueError(f"unsupported MXCSR rounding mode in {op} at {i.ip:#x}: {i}")
+                args += f", {imm & 0x0b}"
+            elif op == M.VSQRTSS:
+                args = "b"
+            stmt = (f"{{ {vec_type} a, b{{}}; memcpy(&a, {src}.data(), 16); {rhs} "
+                    f"const {vec_type} result = {intrinsic}({args}); {dst} = {{}}; "
+                    f"memcpy({dst}.data(), &a, 16); memcpy({dst}.data(), &result, {size}); }}")
         elif op in avx_minmax_mul_ops:
             dest = i.op0_register
             valid_regs = wide if dest in wide else wide_xmm
