@@ -594,6 +594,167 @@ def check_masked_draw(directory, compiler, renderer, backend):
         run_pixel_batch(renderer, backend, shader, [(case, "mismatch")])
 
 
+# v_cmpx regions (issue #932): `s_mov_b64 s[a:b], exec` saves the entry mask, a VOPC e32 v_cmpx intersects EXEC
+# with its comparison, and `s_mov_b64 exec, s[a:b]` (or `s_or_b64 exec, exec, s[a:b]`) closes the region.
+CMPX_SAVE = "s_mov_b64 s[60:61], exec"
+CMPX_COMPARE = "v_cmpx_gt_f32_e32 s44, v12"
+CMPX_MOV_RESTORE = "s_mov_b64 exec, s[60:61]"
+CMPX_OR_RESTORE = "s_or_b64 exec, exec, s[60:61]"
+
+
+def cmpx_region(restore=CMPX_MOV_RESTORE, compare=CMPX_COMPARE):
+    """masked_region with the v_cmpx opener: while s44 > sample.x, overwrite v13 and v14."""
+    return uncompressed_export([CMPX_SAVE, compare, "v_mov_b32_e32 v13, s45", "v_mov_b32_e32 v14, s46", restore])
+
+
+def cmpx_skip():
+    """The v_cmpx region with its whole-wave empty-mask skip onto the s_mov_b64 restore, as (offset, text) pairs."""
+    program = cmpx_region()
+    program.insert(program.index(CMPX_COMPARE) + 1, "s_cbranch_execz 2")
+    return offset_pairs(program)
+
+
+def cmpx_skip_asm():
+    program = [line for _, line in cmpx_skip()]
+    program[program.index("s_cbranch_execz 2")] = "s_cbranch_execz .Lcmpx_restore"
+    program.insert(program.index(CMPX_MOV_RESTORE), ".Lcmpx_restore:")
+    return program
+
+
+def cmpx_predicate_group(kind, first):
+    """Four v_cmpx regions, one per predicate, each setting one channel to 1.0 where `s44 <op> v18` holds.
+
+    Mirrors predicate_group and int_predicate_group: v18 copies s45 and v19 copies s47 (1.0). The regions
+    alternate the s_mov_b64 and s_or_b64 restores, so both closes are drawn for every kind.
+    """
+    predicates = PREDICATES if kind == "f32" else INT_PREDICATES
+    copy = (["v_sub_f32_e64 v18, s45, 0", "v_sub_f32_e64 v19, s47, 0"] if kind == "f32"
+            else ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v19, s47"])
+    body = copy + [f"v_mov_b32_e32 v{12 + channel}, 0" for channel in range(4)]
+    for channel, op in enumerate(predicates[first:first + 4]):
+        body += [CMPX_SAVE, f"v_cmpx_{op}_{kind}_e32 s44, v18", f"v_mov_b32_e32 v{12 + channel}, v19",
+                 CMPX_MOV_RESTORE if channel % 2 == 0 else CMPX_OR_RESTORE]
+    return with_constants(body)
+
+
+CMPX_PREDICATE_GROUPS = tuple((kind, first) for kind, firsts in (("f32", (0, 4, 8, 12)), ("i32", (0, 4)),
+                                                                 ("u32", (0, 4))) for first in firsts)
+
+
+def cmpx_observables():
+    """VCC and SCC written before a v_cmpx region keep their values after the s_mov_b64 restore.
+
+    v13 is the region write (s45 while s44 > sample.x), v14 reads the earlier `0.25 < sample.x` VCC and v15
+    reads the earlier `s44 < s46` SCC. v_cmpx writes neither register and s_mov_b64 leaves SCC.
+    """
+    return uncompressed_export([
+        "v_cmp_lt_f32_e32 vcc_lo, s45, v12",
+        "s_cmp_lt_u32 s44, s46",
+        "v_mov_b32_e32 v20, 1.0",
+        CMPX_SAVE, CMPX_COMPARE, "v_mov_b32_e32 v13, s45", CMPX_MOV_RESTORE,
+        "v_cndmask_b32_e32 v14, 0, v20, vcc_lo",
+        "s_cselect_b32 s62, 1.0, 0",
+        "v_mov_b32_e32 v15, s62",
+    ])
+
+
+def cmpx_observable_pixels(threshold, *, vcc_from_cmpx=False, scc=None):
+    scc = struct.unpack("<I", struct.pack("<f", threshold))[0] < 0x3f400000 if scc is None else scc
+    pixels = []
+    for g in MASKED_RAMP:
+        for r in MASKED_RAMP:
+            x = single(r / 255)
+            inside = x < threshold
+            vcc = inside if vcc_from_cmpx else 0.25 < x
+            pixels.append((x, 0.25 if inside else single(g / 255), 1.0 if vcc else 0.0, 1.0 if scc else 0.0))
+    return pixels
+
+
+def check_cmpx_draw(directory, compiler, renderer, backend):
+    """Draw v_cmpx regions on WARP or hardware (issue #932)."""
+    source = directory / "cmpx.hlsl"
+    shader = directory / "cmpx.cso"
+    constants = bytearray(256)
+    # Mixed (0.5), full (10) and empty (-1) masks through each restore and the skip.
+    for label, program in (("mov", cmpx_region()), ("or", cmpx_region(CMPX_OR_RESTORE)), ("skip", cmpx_skip())):
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for threshold in (0.5, 10.0, -1.0):
+            struct.pack_into("<4f", constants, 12, threshold, 0.25, 0.75, 0.0)
+            case = directory / f"cmpx-{label}-{len(cases)}.case"
+            write_case(case, constants, masked_pixels(threshold, (0.25, 0.75), False))
+            cases.append((case, "pass"))
+        run_pixel_batch(renderer, backend, shader, cases)
+    struct.pack_into("<4f", constants, 12, 0.5, 0.25, 0.75, 0.0)
+    expected = masked_pixels(0.5, (0.25, 0.75), False)
+    unmasked = [line for line in cmpx_region() if line not in (CMPX_SAVE, CMPX_COMPARE, CMPX_MOV_RESTORE)]
+    for label, mutant in (("reversed", cmpx_region(compare="v_cmpx_le_f32_e32 s44, v12")), ("unmasked", unmasked)):
+        source.write_text(translate(mutant), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        case = directory / f"cmpx-{label}.case"
+        write_case(case, constants, expected)
+        run_pixel_batch(renderer, backend, shader, [(case, "mismatch")])
+    # VCC and SCC from before the region, on mixed, full and empty masks; SCC is 1 only for 0.5.
+    source.write_text(translate(cmpx_observables()), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for threshold in (0.5, 10.0, -1.0):
+        struct.pack_into("<4f", constants, 12, threshold, 0.25, 0.75, 0.0)
+        case = directory / f"cmpx-observables-{len(cases)}.case"
+        write_case(case, constants, cmpx_observable_pixels(threshold))
+        cases.append((case, "pass"))
+    # Wrong references: VCC taken from the v_cmpx comparison, and SCC inverted.
+    struct.pack_into("<4f", constants, 12, 0.5, 0.25, 0.75, 0.0)
+    for label, pixels in (("vcc-from-cmpx", cmpx_observable_pixels(0.5, vcc_from_cmpx=True)),
+                          ("scc-inverted", cmpx_observable_pixels(0.5, scc=False))):
+        case = directory / f"cmpx-observables-{label}.case"
+        write_case(case, constants, pixels)
+        cases.append((case, "mismatch"))
+    run_pixel_batch(renderer, backend, shader, cases)
+    # Every accepted predicate: relations less, equal, greater and (f32 only) unordered.
+    float_inputs = (("lt", -1, 1, 0), ("signed-zero", -0.0, 0.0, 1), ("gt", 1, -1, 2),
+                    ("left-nan", math.nan, 1, 3), ("right-nan", 1, math.nan, 3))
+    int_pairs = ((0x80000000, 0x00000000), (0xbf800000, 0xbf800000), (0x3f800000, 0xbf800000),
+                 (0xc0000000, 0xbf800000))
+    for kind, first in CMPX_PREDICATE_GROUPS:
+        source.write_text(translate(cmpx_predicate_group(kind, first)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        if kind == "f32":
+            for label, left, right, relation in float_inputs:
+                constants = bytearray(256)
+                struct.pack_into("<4f", constants, 12, left, right, 0, 1)
+                case = directory / f"cmpx-{kind}-{first}-{label}.case"
+                write_case(case, constants, tuple((op >> relation) & 1 for op in range(first, first + 4)))
+                cases.append((case, "pass"))
+        else:
+            for left, right in int_pairs:
+                lv, rv = left, right
+                if kind == "i32":
+                    lv, rv = (v - 0x100000000 if v & 0x80000000 else v for v in (left, right))
+                relation = 0 if lv < rv else (1 if lv == rv else 2)
+                constants = bytearray(256)
+                struct.pack_into("<IIff", constants, 12, left, right, 0.0, 1.0)
+                case = directory / f"cmpx-{kind}-{first}-{left:08x}-{right:08x}.case"
+                case.write_bytes(constants + struct.pack("<4f", *((op >> relation) & 1
+                                                                 for op in range(first, first + 4))) * 64)
+                cases.append((case, "pass"))
+        if (kind, first) == ("i32", 0):
+            # Wrong reference: the unsigned truth table for the signed shader on (0x80000000, 0x00000000).
+            constants = bytearray(256)
+            struct.pack_into("<IIff", constants, 12, 0x80000000, 0x00000000, 0.0, 1.0)
+            case = directory / "cmpx-i32-0-as-unsigned.case"
+            case.write_bytes(constants + struct.pack("<4f", *((op >> 2) & 1 for op in range(4))) * 64)
+            cases.append((case, "mismatch"))
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except AssertionError as error:
+            error.add_note(f"v_cmpx predicate draw on {backend}, kind={kind}, first={first}")
+            raise
+    return 0
+
+
 def with_scalar_constant_reads() -> list[str]:
     program = with_constants(["v_mov_b32_e32 v12, s61", "v_mov_b32_e32 v13, s62", "v_mov_b32_e32 v14, s63"])
     load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc")
@@ -8155,6 +8316,97 @@ def check_masked_controls():
         must_reject(translate, bad)
 
 
+def check_cmpx_controls():
+    """v_cmpx regions (#932): the s_mov_b64 exec save plus VOPC e32 v_cmpx opener on the #651 region."""
+    def selects(program):
+        """Per-lane region merges in the shader's main function."""
+        text = translate(program)
+        return text[text.index(" main("):].count(" ? ")
+
+    region = cmpx_region()
+    source = translate(region)
+    assert "bool cmp" in source and "precise float alu" in source
+    # Same merges as the s_and_saveexec_b64 region on the same comparison: one per rewritten register.
+    assert selects(region) == selects(masked_region()) == 2
+    for restore in (CMPX_MOV_RESTORE, CMPX_OR_RESTORE):
+        assert selects(cmpx_region(restore)) == 2
+    assert selects(cmpx_skip()) == 2
+    for kind, first in CMPX_PREDICATE_GROUPS:
+        assert selects(cmpx_predicate_group(kind, first)) == 4
+    # Each accepted comparison kind lowers like the v_cmp of the same kind.
+    for compare, plain in (("v_cmpx_lt_f32_e32 s44, v12", "v_cmp_lt_f32_e32 vcc_lo, s44, v12"),
+                           ("v_cmpx_ge_i32_e32 v13, v12", "v_cmp_ge_i32_e32 vcc_lo, v13, v12"),
+                           ("v_cmpx_ne_u32_e32 0x3f000000, v12", "v_cmp_ne_u32_e32 vcc_lo, 0x3f000000, v12"),
+                           ("v_cmpx_nlg_f32_e32 -1.0, v12", "v_cmp_nlg_f32_e32 vcc_lo, -1.0, v12")):
+        expr = next(line for line in translate(cmpx_region(compare=compare)).splitlines() if "bool cmp" in line)
+        reference = next(line for line in translate(uncompressed_export([plain])).splitlines() if "bool cmp" in line)
+        assert expr.split(" = ", 1)[1] == reference.split(" = ", 1)[1], (compare, expr, reference)
+    # v_cmpx writes neither VCC nor SCC, and s_mov_b64 leaves SCC: readers after the region see the earlier values.
+    observed = translate(cmpx_observables()).splitlines()
+    vcc = next(line for line in observed if "bool cmp" in line).split()[1]
+    scc = next(line for line in observed if "bool scc" in line).split()[1]
+    assert any(line.lstrip().startswith("precise float") and f" = {vcc} ? " in line for line in observed), observed
+    assert any(f"{scc} ? " in line for line in observed if "salu" in line), observed
+    # s_or_b64 writes SCC from the restored mask, which is not tracked: a later SCC reader rejects.
+    after_or = [CMPX_OR_RESTORE if line == CMPX_MOV_RESTORE else line for line in cmpx_observables()]
+    expect_value_error(translate, after_or, "Select condition is not a tracked scalar result")
+    # The save must directly precede the v_cmpx, be the 64-bit entry mask, and own the restored pair.
+    inside = region.index(CMPX_COMPARE)
+    for variant in (
+            [line for line in region if line != CMPX_SAVE],
+            region[:inside] + ["v_mov_b32_e32 v15, s47"] + region[inside:],
+            [line.replace("s[60:61]", "s[58:59]") if line == CMPX_SAVE else line for line in region],
+            [line.replace("s[60:61]", "s[58:59]") if line == CMPX_MOV_RESTORE else line for line in region],
+            ["s_mov_b32 s60, exec_lo" if line == CMPX_SAVE else line for line in region],
+            ["s_mov_b64 s[60:61], exec_lo" if line == CMPX_SAVE else line for line in region],
+    ):
+        must_reject(translate, variant)
+    expect_value_error(translate, [line for line in region if line != CMPX_SAVE],
+                       "Unsupported v_cmpx execution mask save")
+    # The save must hold the entry mask, not a whole-quad mask.
+    quad = assembly(False)
+    quad[quad.index("s_wqm_b64 exec, exec") + 1:quad.index("s_wqm_b64 exec, exec") + 1] = [CMPX_SAVE, CMPX_COMPARE]
+    must_reject(translate, quad)
+    # A pending scalar load may not overlap the saved pair.
+    must_reject(translate, uncompressed_export(["s_load_dwordx4 s[60:63], s[20:21], 0x40",
+                                                CMPX_SAVE, CMPX_COMPARE, CMPX_MOV_RESTORE]))
+    # Overwriting the saved pair, nesting, chaining and unsupported bodies are refused inside the region.
+    for extra in ("s_mov_b32 s60, 0", "s_mov_b64 s[60:61], exec", CMPX_SAVE.replace("60:61", "58:59"),
+                  "v_cmpx_lt_f32_e32 s44, v13", "s_and_saveexec_b64 s[58:59], vcc",
+                  "s_waitcnt lgkmcnt(0)", "s_buffer_load_dword s70, s[44:47], 0x10",
+                  "exp mrt0 v12, v13, v14, v15 done vm",
+                  "image_sample v[16:19], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+                  "v_cmp_eq_f32_e64 vcc_lo, v12, v13", "v_readfirstlane_b32 s62, v12",
+                  "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13", "s_andn2_b64 exec, s[60:61], exec"):
+        must_reject(translate, region[:inside + 1] + [extra] + region[inside + 1:])
+    # The s_mov_b64 restore closes only a v_cmpx region; the s_and_saveexec_b64 region keeps its s_or_b64 close.
+    must_reject(translate, [CMPX_MOV_RESTORE if line == "s_or_b64 exec, exec, s[60:61]" else line
+                            for line in masked_region()])
+    must_reject(translate, [line for line in region if line != CMPX_MOV_RESTORE])
+    # Out of scope for this stage: e64, SDWA, other widths and kinds, VSRC1 not a VGPR, and source modifiers.
+    for compare in ("v_cmpx_gt_f32_e64 s44, v12", "v_cmpx_gt_f32_sdwa s44, v12 src0_sel:DWORD src1_sel:DWORD",
+                    "v_cmpx_gt_f16_e32 s44, v12", "v_cmpx_gt_f64_e32 s[44:45], v[12:13]",
+                    "v_cmpx_gt_i16_e32 s44, v12", "v_cmpx_gt_u64_e32 s[44:45], v[12:13]",
+                    "v_cmpx_class_f32_e32 s44, v12", "v_cmpx_gt_f32_e32 v12, s44",
+                    "v_cmpx_gt_f32_e32 -v13, v12", "v_cmpx_gt_f32_e32 |v13|, v12",
+                    "v_cmpx_gt_f32 s44, v12", "v_cmpx_gt_f32_e32 s44"):
+        must_reject(translate, cmpx_region(compare=compare))
+    # Skip-branch targets: only the matching restore, right after the v_cmpx.
+    pairs = cmpx_skip()
+    branch = next(i for i, (_, line) in enumerate(pairs) if line.startswith("s_cbranch_execz"))
+    for imm in (0, 1, 3, 40, -2):
+        must_reject(translate, [(o, f"s_cbranch_execz {imm}" if j == branch else line)
+                                for j, (o, line) in enumerate(pairs)])
+    late = cmpx_region()
+    late.insert(late.index("v_mov_b32_e32 v14, s46"), "s_cbranch_execz 1")
+    expect_value_error(translate, offset_pairs(late), "Instruction cannot run in a masked region")
+    # A skip onto an s_mov_b64 restore of another pair rejects.
+    other = cmpx_region()
+    other[other.index(CMPX_MOV_RESTORE)] = "s_mov_b64 exec, s[58:59]"
+    other.insert(other.index(CMPX_COMPARE) + 1, "s_cbranch_execz 2")
+    must_reject(translate, offset_pairs(other))
+
+
 def sopk_wait_program():
     """The sampled program with every wait spelled as a gfx10 SOPK wait, plus a store-counter wait."""
     spelled = {"s_waitcnt lgkmcnt(0)": "s_waitcnt_lgkmcnt null, 0x0", "s_waitcnt vmcnt(0)": "s_waitcnt_vmcnt null, 0x0"}
@@ -9650,6 +9902,7 @@ def check_f16_cvt_int_controls():
 def check_controls(directory):
     check_smem_pointer_controls()
     check_masked_controls()
+    check_cmpx_controls()
     check_title_load_controls()
     check_ds_swizzle_controls()
     check_ds_nop_controls()
@@ -11489,6 +11742,10 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((masked_region(), translate))
     fixtures.append((masked_complementary(), translate))
     fixtures.append((masked_skip_asm(), translate, "gfx1013", "", masked_skip()))
+    fixtures.extend((program, translate) for program in (
+        cmpx_region(), cmpx_region(CMPX_OR_RESTORE), cmpx_observables(),
+        *(cmpx_predicate_group(kind, first) for kind, first in CMPX_PREDICATE_GROUPS)))
+    fixtures.append((cmpx_skip_asm(), translate, "gfx1013", "", cmpx_skip()))
     fixtures.append((uncompressed_export(flat_scratch_ops_group1()), translate_int))
     fixtures.append((uncompressed_export(flat_scratch_ops_group2()), translate_int))
     for index, entry in enumerate(fixtures):
@@ -15619,7 +15876,7 @@ def main():
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64",
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-div-fmas", "draw-cmp64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
@@ -15649,6 +15906,7 @@ def main():
                         "draw-title-loads": check_title_load_draws,
                         "draw-ds-swizzle": check_ds_swizzle_draw,
                         "draw-exec-regions": check_masked_draw,
+                        "draw-cmpx-regions": check_cmpx_draw,
                         "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw,
                         "draw-flat-scratch": check_flat_scratch_draws,

@@ -266,7 +266,8 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
     "s_mul_hi_u32", "s_mul_hi_i32",
     # SOPK
-    "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork", "s_version",
+    "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork",
+    "s_getreg_b32", "s_setreg_b32", "s_setreg_imm32_b32", "s_version",
     # VOP1
     "v_nop", "v_mov_b32", "v_swap_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",
