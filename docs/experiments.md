@@ -2134,6 +2134,12 @@ low source bits while preserving the rest of the initialized word.
 sign-extend their results to 32 bits. Byte offsets are 0 through 3 and
 halfword offsets are 0 or 2. Subword accesses use the same address, LDS
 allocation, full EXEC and immediate wait checks as full-word accesses.
+
+The no-return forms `ds_add_u32`, `ds_sub_u32`, `ds_and_b32`, `ds_or_b32`
+and `ds_xor_b32` update the same initialized word in place at offset 0.
+Addition and subtraction wrap modulo 2^32, with subtraction taking the
+old word minus the VGPR value. Each lane has exclusive use of its own word,
+so the updates can use per-invocation arithmetic in HLSL.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The source-built wave32 fixture reads the full word and both halves after
@@ -2150,6 +2156,12 @@ check that earlier reads retain their values. Each dispatch checks the entire
 320-word UAV, including the untouched tail. Replacing the partial write with a full
 write must mismatch at word 0. Replacing sign extension with zero extension
 must mismatch at word 50, the signed result of lane 16.
+
+Five update variants read the initial word and the results of two consecutive
+updates with different operands. The inputs cover wraparound, underflow and
+high-bit operands. Each variant compares all 320 UAV words after one-group
+and three-group dispatches. Replacing the first update with a full-word
+write must mismatch at word 1.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
