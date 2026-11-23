@@ -1,4 +1,4 @@
-﻿"""Compare a typed callback through a load-config dispatch slot under Windows and pe_map."""
+﻿"""Compare a callback pointer stored in the fixture's load-config field under Windows and pe_map."""
 
 import ctypes
 from pathlib import Path
@@ -17,7 +17,6 @@ EXPECTED = {
     "absent": 0xB211,
     "alternate": 0xB151,
 }
-CFG_REFUSAL = 0xC000003E  # STATUS_DATA_ERROR
 
 
 def check(label, actual, expected):
@@ -63,10 +62,10 @@ def describe(fields):
             f"relocated={fields['relocated']} guard_flags={fields['guard_flags']:#x}")
 
 
-def main(mapper_path, present, absent, alternate, cfg, io):
-    mapper_path, present, absent, alternate, cfg, io = map(
-        Path, (mapper_path, present, absent, alternate, cfg, io))
-    images = {"present": present, "absent": absent, "alternate": alternate, "cfg": cfg}
+def main(mapper_path, present, absent, alternate, io):
+    mapper_path, present, absent, alternate, io = map(
+        Path, (mapper_path, present, absent, alternate, io))
+    images = {"present": present, "absent": absent, "alternate": alternate}
     fields = {}
     for name, image in images.items():
         fields[name] = inspect(image)
@@ -81,9 +80,6 @@ def main(mapper_path, present, absent, alternate, cfg, io):
     check("absent relocation", fields["absent"]["relocated"], False)
     check("alternate slot", fields["alternate"]["slot_value"] != 0, True)
     check("alternate relocation", fields["alternate"]["relocated"], True)
-    check("cfg slot", fields["cfg"]["slot_value"] != 0, True)
-    check("cfg relocation", fields["cfg"]["relocated"], True)
-    check("cfg guard flags", fields["cfg"]["guard_flags"], 0x100)
 
     for name in ("present", "absent", "alternate"):
         native = native_code(images[name])
@@ -91,12 +87,6 @@ def main(mapper_path, present, absent, alternate, cfg, io):
         check(f"{name} native", native, EXPECTED[name])
         check(f"{name} mapped", mapped, EXPECTED[name])
         print(f"{name}: native and mapped {native:#x}; callback count/argument/return matched")
-
-    cfg_native = native_code(cfg)
-    cfg_mapped = mapped_code(mapper_path, cfg, io)
-    check("cfg Windows refusal", cfg_native, CFG_REFUSAL)
-    check("cfg mapped", cfg_mapped, EXPECTED["present"])
-    print(f"cfg: Windows refused before entry with {cfg_native:#x}; pe_map ignored GuardFlags and returned {cfg_mapped:#x}")
 
 
 if __name__ == "__main__":

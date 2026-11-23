@@ -22,11 +22,7 @@ dispatch_slot LABEL QWORD
     ENDIF
     QWORD 0
     QWORD 0
-    IFDEF DISPATCH_CFG
-    DWORD 100h
-    ELSE
     DWORD 0
-    ENDIF
     BYTE 0A4h DUP (0)
 
 .code
@@ -50,16 +46,9 @@ native_entry PROC FRAME
     sub rsp, 38h
     .allocstack 38h
     .endprolog
-    IFDEF DISPATCH_CFG
-    lea r11, dispatch_callback
-    ENDIF
     mov rax, qword ptr [dispatch_slot]
     test rax, rax
     jz absent
-    IFDEF DISPATCH_CFG
-    cmp rax, r11
-    jne replaced
-    ENDIF
     mov ecx, 1234h
     call rax
     mov r10d, eax
@@ -80,9 +69,6 @@ native_entry PROC FRAME
     ENDIF
     jne bad
     or eax, 100h
-    jmp done
-replaced:
-    mov eax, 0CF01h
     jmp done
 absent:
     mov eax, 0B200h

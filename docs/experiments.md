@@ -1415,13 +1415,17 @@ startup or use of this relocation by a particular title is established.
 
 `ctest --preset release --no-tests=error -R '^cpu_native_load_cookie$' -V`
 
-### Load-config dispatch slot
+### Load-config callback field convention
 
-`cpu_load_dispatch_present`, `_absent`, `_alternate` and `_cfg` share a hand-written 0x138-byte `_load_config_used`. The dispatch field at offset 0x78 (`GuardCFDispatchFunctionPointer`) is a typed callback pointer in read-only `.rdata`; the linker emits a DIR64 relocation at the field. `native_entry` loads the field, calls it with `ECX=0x1234` when non-null, and encodes the callback count, argument and return in its exit code through the existing `finish_exe` wrapper. The test inspects each image's own PE for the directory and structure sizes, the slot RVA and value, the read-only section and the DIR64 relocation, then runs the same image under Windows and `pe_map` with the same `cpu_exe_io.dll` provider.
+`cpu_load_dispatch_present`, `_absent` and `_alternate` share a hand-written 0x138-byte `_load_config_used`. This fixture treats the field at +0x78 (`GuardCFDispatchFunctionPointer`) as its own direct callback pointer, not the real Windows guard-dispatch ABI: the field is in read-only `.rdata` and has a DIR64 relocation. `native_entry` loads it, calls it with `ECX=0x1234` when non-null, and encodes the callback count, argument and return through the existing `finish_exe` wrapper. The test inspects each image's own PE for the directory and structure sizes, the slot RVA and value, the read-only section and the DIR64 relocation, then runs the same image under Windows and `pe_map` with the same `cpu_exe_io.dll` provider.
 
-The absent build makes zero calls (exit `0xb211`). The present build calls the callback once with `0x1234` and return `0x5a` (`0xb111`); the alternate callback changes the return and exit (`0xb151`) so a wrong binding is visible. Native and mapped results match for all three. The CFG-linked build sets `GuardFlags=0x100` on the same hand-built structure; Windows refuses it before entry with `STATUS_DATA_ERROR` (`0xc000003e`), while `pe_map` ignores `GuardFlags` and returns `0xb111`. That is a reported CFG gap, not a pass; a linker-emitted valid CFG load config remains a follow-up. The fixture does not establish title behavior.
+Absent makes zero calls (exit `0xb211`); present calls once with `0x1234` and return `0x5a` (`0xb111`); alternate uses a different callback return (`0xb151`) so a wrong binding is visible. Native and mapped match for all three. A hand-built `GuardFlags=0x100` image without a check pointer or function table was refused by the local loader and hung the CI runner; a specific refusal code is not portable, so that image is not part of the test or an acceptance condition.
 
-`ctest --preset dev --no-tests=error -R '^cpu_native_load_dispatch$' -V`
+### Linker-produced CFG callback
+
+`cpu_native_load_config_callback` builds a C++ caller with `/guard:cf`. The linker supplies the guard slots, function table and flags; the caller calls a read-only relocated callback table through `__guard_dispatch_icall_fptr`. The `record`, `other` (different callback) and `invalid` (target inside a function) images link without CFG and match across Windows and `pe_map`. With CFG, Windows replaces both guard slots (`0x30055` versus the callback's `0x55`) and ends the invalid target before it writes output; `pe_map` keeps the image's own slots, runs the valid callback (`0x55`) and runs the invalid target (`0x77`). The test records those as the current `pe_map` CFG support boundary; a loader-policy change updates it. The local refusal code is printed but not asserted. The fixture is based on denn0x's `pe/load-config-callback` reference branch.
+
+`ctest --preset dev --no-tests=error -R '^cpu_native_load_(dispatch|config_callback)$' -V`
 
 ### TLS callbacks and the entry point
 
