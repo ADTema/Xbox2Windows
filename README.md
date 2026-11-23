@@ -111,6 +111,7 @@ The control-flow CPU translator supports [source-built string memory transfers](
 | Upscaler memory accounting | Compare [post-query counter writes](docs/experiments.md#upscaler-working-set-counter-updates) on success and failure. | `ctest --preset dev --no-tests=error -R 'working_set_delta$'` |
 | Windows runtime | Add a source-built allocation case with a measurable Windows result. | `ctest --preset dev -R 'era_heap\|desktop_memory_query'` |
 | PE tooling | Reproduce an import-resolution edge case with a DLL or EXE built from source. | `ctest --preset dev --no-tests=error -R 'static_exe_intake\|conditional_import_paths\|bundled_export_forwarders'` |
+| Load-config dispatch | Compare a callback pointer stored in a read-only load-config field and a linker-produced CFG callback across Windows and `pe_map`. | `ctest --preset dev --no-tests=error -R '^cpu_native_load_(dispatch\|config_callback)$' -V` |
 | Build and documentation | Try the first build from a clean clone. Identify the first missing prerequisite or unclear instruction. | Use the three-test command above. |
 
 [Full experiment notes and reproduction commands](docs/experiments.md)

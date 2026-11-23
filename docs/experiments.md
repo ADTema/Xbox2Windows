@@ -1423,6 +1423,18 @@ startup or use of this relocation by a particular title is established.
 
 `ctest --preset release --no-tests=error -R '^cpu_native_load_cookie$' -V`
 
+### Load-config callback field convention
+
+`cpu_load_dispatch_present`, `_absent` and `_alternate` share a hand-written 0x138-byte `_load_config_used`. This fixture treats the field at +0x78 (`GuardCFDispatchFunctionPointer`) as its own direct callback pointer, not the real Windows guard-dispatch ABI: the field is in read-only `.rdata` and has a DIR64 relocation. `native_entry` loads it, calls it with `ECX=0x1234` when non-null, and encodes the callback count, argument and return through the existing `finish_exe` wrapper. The test inspects each image's own PE for the directory and structure sizes, the slot RVA and value, the read-only section and the DIR64 relocation, then runs the same image under Windows and `pe_map` with the same `cpu_exe_io.dll` provider.
+
+Absent makes zero calls (exit `0xb211`); present calls once with `0x1234` and return `0x5a` (`0xb111`); alternate uses a different callback return (`0xb151`) so a wrong binding is visible. Native and mapped match for all three. A hand-built `GuardFlags=0x100` image without a check pointer or function table was refused by the local loader and hung the CI runner; a specific refusal code is not portable, so that image is not part of the test or an acceptance condition.
+
+### Linker-produced CFG callback
+
+`cpu_native_load_config_callback` builds a C++ caller with `/guard:cf`. The linker supplies the guard slots, function table and flags; the caller calls a read-only relocated callback table through `__guard_dispatch_icall_fptr`. The `record`, `other` (different callback) and `invalid` (target inside a function) images link without CFG and match across Windows and `pe_map`. With CFG, Windows replaces both guard slots (`0x30055` versus the callback's `0x55`) and ends the invalid target before it writes output; `pe_map` currently keeps the image's own slots, runs the valid callback (`0x55`) and runs the invalid target (`0x77`). The test records the unchecked mapped result as the current observation. It also accepts an explicit unsupported-CFG diagnostic before dispatch. An unrelated load error or missing output cannot establish CFG behavior. The local refusal code is printed but not asserted. The fixture is based on denn0x's `pe/load-config-callback` reference branch.
+
+`ctest --preset dev --no-tests=error -R '^cpu_native_load_(dispatch|config_callback)$' -V`
+
 ### TLS callbacks and the entry point
 
 `tls_route` has an entry point and a TLS directory whose callback list holds one routine and whose data template is empty. Both routines report each call to `cpu_tls_sink.dll`, which outlives the image, so calls made during release stay visible. `cpu_native_tls` loads the image with `LoadLibraryW` and maps it with `pe_map`, each in its own child process, and compares the process notifications:
@@ -4030,6 +4042,28 @@ Two independent negative controls confirm that withholding either `XMemMapPhysic
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_map_pages$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_map_pages$' -V
+```
+
+### Memory transfer caller and recorder
+
+This fixture exercises the proposed `XMemTransferMemory` contract under test-provider policies. The source-built caller ([`transfer_mem_caller.asm`](../tests/cpu/transfer_mem_caller.asm)) imports `XMemTransferMemory` by name from `xmem.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled recording provider ([`transfer_mem_provider.cpp`](../tests/cpu/transfer_mem_provider.cpp)), it exercises seven checks:
+- **Step 1**: Valid 2 MiB transfer under test-provider policy partition 1 (`rcx = 1`, `rdx = 0x200000`), returning `TRUE` (`1`).
+- **Step 2**: Valid 16 MiB transfer under test-provider policy partition 1 (`rcx = 1`, `rdx = 0x1000000`), returning `TRUE` (`1`).
+- **Step 3**: Rejection control with invalid partition (`rcx = 0`), returning `FALSE` (`0`).
+- **Step 4**: Rejection control with zero byte count (`rdx = 0`), returning `FALSE` (`0`).
+- **Step 5**: Rejection control with unaligned byte count (not 2 MiB aligned under test-provider policy, `rdx = 0x200100`), returning `FALSE` (`0`).
+- **Step 6**: Rejection control with oversized byte count exceeding the 16 MiB policy maximum (`rdx = 0x2000000`), returning `FALSE` (`0`).
+- **Step 7**: Internal verification of provider call counters, rejection counts, and the ordered trace of calls directly within the caller process.
+
+The specific fixture inputs tested (`partition = 1`, `byte_count = 0x200000` and `0x1000000`) are synthetic fixture inputs chosen for this test. Partition selector 1, 2 MiB alignment, the 16 MiB maximum boundary, and `BOOL` return semantics are labeled as test-provider policy throughout; native console transfer semantics and partition effects remain open. The provider's recorded trace validates all six ordered argument pairs and call outcomes.
+
+A changed-first-call control patches the first 2 MiB request in the caller binary to 4 MiB: under both the Windows native loader and `pe_map`, the caller's internal trace check rejects the modification with exit code `0xF0B`, and the recorded trace reflects the changed 4 MiB argument in call 0.
+
+On success, the caller exits with the success sentinel `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return. An independent negative control confirms that withholding `XMemTransferMemory` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_transfer_mem$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_transfer_mem$' -V
 ```
 
 ### Grouped allocation descriptor builders
