@@ -65,7 +65,7 @@ endforeach()
 
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
-    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp)
+    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 # LINK uses explicit export ordinals in the generated import library. Keep
 # those ordinals in the DLL and build the consumer library with names.
@@ -82,7 +82,7 @@ add_custom_command(TARGET xmem_shim POST_BUILD
 target_include_directories(xmem_shim PRIVATE src)
 target_compile_features(xmem_shim PRIVATE cxx_std_20)
 # Delay-loaded: only XMemGetWorkingSetStatistics uses DXGI and D3DKMT (gdi32).
-target_link_libraries(xmem_shim PRIVATE dxgi gdi32 delayimp)
+target_link_libraries(xmem_shim PRIVATE dxgi gdi32 delayimp OneCore)
 target_link_options(xmem_shim PRIVATE /DELAYLOAD:dxgi.dll /DELAYLOAD:gdi32.dll)
 add_executable(xmem_shim_check tests/xmem_shim_check.cpp src/adapter_identity.cpp)
 # D3D12 and DXGI are delay-loaded so the exports scenario can check that xmem.dll loads neither.
@@ -111,7 +111,8 @@ get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp)
 target_sources(offscreen_check PRIVATE tests/spirv_window/readback.cpp tests/spirv_window/sampler_readback.cpp
-    tests/spirv_window/compaction_readback.cpp tests/spirv_window/compare_sampler.cpp)
+    tests/spirv_window/compaction_readback.cpp tests/spirv_window/compare_sampler.cpp
+    tests/spirv_window/raw_uav_dump.cpp)
 target_compile_features(offscreen_check PRIVATE cxx_std_17)
 target_link_libraries(offscreen_check PRIVATE d3d12 dxgi dxguid)
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -517,12 +518,21 @@ if(FFX_UPSCALER_IMAGE)
     endif()
 endif()
 if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME xmem_shim_mapped_pages COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_check.py" "$<TARGET_FILE:xmem_shim>")
     add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")
     # Compile-only: outcome classification and GVN pass shares, no wall-time threshold (#775).
     add_test(NAME dxc_compile_time_gvn COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxc_compile_time_check.py" "${DXC_EXECUTABLE}")
     set_tests_properties(dxc_compile_time_gvn PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    # Dispatch condstore_256 built with and without GVN; compare the whole raw UAV bit for bit (#775).
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME dxc_gvn_output_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/dxc_gvn_output_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(dxc_gvn_output_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     # tools/setup-spirv-tools.ps1 builds the pinned tools into out/tools/spirv/bin.
     set(spirv_tool_hints "${CMAKE_SOURCE_DIR}/out/tools/spirv/bin" "$ENV{VULKAN_SDK}/Bin")
     find_program(SPIRV_WINDOW_AS spirv-as HINTS ${spirv_tool_hints})
@@ -842,6 +852,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/frame_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_frame>" "$<TARGET_FILE:cpu_frame_lifted>"
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_frame_lifted.cpp")
+    cpu_asm_fixture(cpu_leave leave)
+    # LEAVE on a proven RBP anchor; the other exports of leave.asm exist only to be rejected.
+    cpu_translation(cpu_leave cpu_switch_aot leave_frame,leave_lea,leave_join)
+    add_test(NAME cpu_aot_leave COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/leave_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_leave>" "$<TARGET_FILE:cpu_leave_lifted>"
+        "${CMAKE_CURRENT_BINARY_DIR}/cpu_leave_lifted.cpp")
     cpu_asm_fixture(cpu_calls calls)
     cpu_translation(cpu_calls cpu_switch_aot call_leaf,chain3,narrow_call,narrow_tail,tail_call,tail_after_frame,home_save_call)
     add_test(NAME cpu_aot_direct_calls COMMAND "${INTAKE_PYTHON}" -B
@@ -1008,6 +1025,27 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_move_regs_original>"
         "$<TARGET_FILE:cpu_avx_move_regs_original_lifted>"
         "$<TARGET_FILE:cpu_avx_move_regs_altered_lifted>")
+    set(cpu_avx_pcmpstr_exports
+        "vpcmpestri_ub_eqany_pos_lsb,vpcmpestri_sw_ranges_neg_msb,vpcmpestri_sb_eqeach_mpos_msb,"
+        "vpcmpestri_uw_eqord_mneg_lsb,vpcmpestri_mem_ub_eqany_pos_lsb,vpcmpestri_alias_xmm0,"
+        "vpcmpestrm_ub_eqany_pos_bit,vpcmpestrm_sb_ranges_neg_exp,vpcmpestrm_uw_eqeach_mpos_exp,"
+        "vpcmpestrm_sw_eqord_mneg_bit,vpcmpestrm_mem_ub_eqany_exp,vpcmpestrm_xmm0_self,"
+        "vpcmpistri_ub_eqord_pos_lsb,vpcmpistri_sb_ranges_mneg_msb,vpcmpistri_uw_eqany_neg_msb,"
+        "vpcmpistri_sw_eqeach_mpos_lsb,vpcmpistri_mem_ub_eqany_pos_lsb,"
+        "vpcmpistrm_ub_eqeach_pos_exp,vpcmpistrm_sw_eqany_mneg_exp,vpcmpistrm_uw_ranges_mpos_bit,"
+        "vpcmpistrm_sb_eqord_neg_bit,vpcmpistrm_mem_ub_eqord_exp,vpcmpistrm_discarded_read")
+    string(CONCAT cpu_avx_pcmpstr_exports ${cpu_avx_pcmpstr_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_pcmpstr_${variant} avx_pcmpstr)
+        cpu_translation(cpu_avx_pcmpstr_${variant} cpu_avx_pcmpstr_aot "${cpu_avx_pcmpstr_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_pcmpstr_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_avx_pcmpstr COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_pcmpstr.py"
+        "$<TARGET_FILE:cpu_avx_pcmpstr_original>"
+        "$<TARGET_FILE:cpu_avx_pcmpstr_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_pcmpstr_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_pcmpstr PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_sse2_exports
         "op_cmppd_0,op_cmppd_1,op_cmppd_2,op_cmppd_3,op_cmppd_4,op_cmppd_5,op_cmppd_6,op_cmppd_7,"
         "op_cmppd_mem,"
@@ -1896,6 +1934,30 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_avx_shuffle_blend COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_shuffle_blend.py"
         check "$<TARGET_FILE:cpu_avx_shuffle_blend>" "$<TARGET_FILE:cpu_avx_shuffle_blend_lifted>")
     set_tests_properties(cpu_aot_avx_shuffle_blend PROPERTIES SKIP_RETURN_CODE 77)
+
+    cpu_asm_fixture(cpu_avx_cvt_cmp_test avx_cvt_cmp_test)
+    set(avx_cvt_cmp_test_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_cvt_cmp_test_lifted.cpp")
+    add_custom_command(OUTPUT "${avx_cvt_cmp_test_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_cvt_cmp_test.py"
+            emit "$<TARGET_FILE:cpu_avx_cvt_cmp_test>" "${avx_cvt_cmp_test_fixture}"
+        DEPENDS cpu_avx_cvt_cmp_test tests/cpu/avx_cvt_cmp_test.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_avx_cvt_cmp_test_lifted SHARED "${avx_cvt_cmp_test_fixture}")
+    add_test(NAME cpu_aot_avx_cvt_cmp_test COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_cvt_cmp_test.py"
+        check "$<TARGET_FILE:cpu_avx_cvt_cmp_test>" "$<TARGET_FILE:cpu_avx_cvt_cmp_test_lifted>")
+    set_tests_properties(cpu_aot_avx_cvt_cmp_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    cpu_asm_fixture(cpu_avx_scalar_fp avx_scalar_fp)
+    set(avx_scalar_fp_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_scalar_fp_lifted.cpp")
+    add_custom_command(OUTPUT "${avx_scalar_fp_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_scalar_fp.py"
+            emit "$<TARGET_FILE:cpu_avx_scalar_fp>" "${avx_scalar_fp_fixture}"
+        DEPENDS cpu_avx_scalar_fp tests/cpu/avx_scalar_fp.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_avx_scalar_fp_lifted SHARED "${avx_scalar_fp_fixture}")
+    add_test(NAME cpu_aot_avx_scalar_fp COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_scalar_fp.py"
+        check "$<TARGET_FILE:cpu_avx_scalar_fp>" "$<TARGET_FILE:cpu_avx_scalar_fp_lifted>")
+    set_tests_properties(cpu_aot_avx_scalar_fp PROPERTIES SKIP_RETURN_CODE 77)
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
@@ -2967,6 +3029,53 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_load_cookie COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/load_cookie_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_cookie_dll>" "$<TARGET_FILE:cpu_cookie_exe>" "$<TARGET_FILE:cpu_exe_io>")
+    add_test(NAME cpu_package_shim_lifetime COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/package_shim_lifetime_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_cookie_exe>" "$<TARGET_FILE:cpu_exe_io>")
+    foreach(variant IN ITEMS present absent alternate)
+        add_executable(cpu_load_dispatch_${variant} tests/cpu/load_config_dispatch.asm tests/cpu/exe_startup.asm)
+        set_target_properties(cpu_load_dispatch_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_load_dispatch_${variant} PRIVATE
+            /ENTRY:native_startup /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_load_dispatch_${variant} PRIVATE cpu_exe_io)
+        if(variant STREQUAL absent)
+            target_compile_options(cpu_load_dispatch_${variant} PRIVATE /DDISPATCH_ABSENT)
+        elseif(variant STREQUAL alternate)
+            target_compile_options(cpu_load_dispatch_${variant} PRIVATE /DDISPATCH_ALTERNATE)
+        endif()
+    endforeach()
+    add_test(NAME cpu_native_load_dispatch COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/load_config_dispatch_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_load_dispatch_present>" "$<TARGET_FILE:cpu_load_dispatch_absent>"
+        "$<TARGET_FILE:cpu_load_dispatch_alternate>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_load_dispatch PROPERTIES TIMEOUT 30)
+    # A typed callback called through the linker-produced load-config dispatch slot (#903). The same
+    # objects are linked without and with /guard:cf. OTHER is the negative control; INVALID calls a
+    # target inside a function. Based on denn0x's pe/load-config-callback reference branch.
+    foreach(variant IN ITEMS record other invalid cfg_record cfg_invalid)
+        add_executable(cpu_load_callback_${variant} tests/cpu/load_config_callback.asm
+            tests/cpu/load_config_callback.cpp tests/cpu/exe_startup.asm)
+        set_target_properties(cpu_load_callback_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_compile_options(cpu_load_callback_${variant} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/guard:cf /GS- /Zl>)
+        target_link_options(cpu_load_callback_${variant} PRIVATE /ENTRY:native_startup
+            /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_load_callback_${variant} PRIVATE cpu_exe_io)
+        if(variant MATCHES "^cfg_")
+            target_link_options(cpu_load_callback_${variant} PRIVATE /guard:cf)
+        endif()
+        if(variant MATCHES "other")
+            target_compile_definitions(cpu_load_callback_${variant} PRIVATE OTHER)
+        elseif(variant MATCHES "invalid")
+            target_compile_definitions(cpu_load_callback_${variant} PRIVATE INVALID)
+        endif()
+    endforeach()
+    add_test(NAME cpu_native_load_config_callback COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/load_config_callback_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_load_callback_record>"
+        "$<TARGET_FILE:cpu_load_callback_other>" "$<TARGET_FILE:cpu_load_callback_invalid>"
+        "$<TARGET_FILE:cpu_load_callback_cfg_record>" "$<TARGET_FILE:cpu_load_callback_cfg_invalid>")
+    set_tests_properties(cpu_native_load_config_callback PROPERTIES TIMEOUT 120)
     foreach(variant IN ITEMS original no_tls)
         add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)
@@ -3059,6 +3168,32 @@ if(EXISTS "${INTAKE_PYTHON}")
             /DYNAMICBASE /INCREMENTAL:NO)
         target_link_libraries(cpu_startup_exe_${control} PRIVATE kernel32 cpu_startup_a cpu_startup_b)
     endforeach()
+    # Source-built CRT-free package: import the mapped DLL only by ordinal @77,
+    # compare its native entry with pe_run_package, and reject a DLL exporting @78.
+    foreach(variant IN ITEMS provider altered wrong)
+        if(variant STREQUAL "wrong")
+            set(ord_def tests/cpu/package_ordinal_provider_wrong.def)
+        else()
+            set(ord_def tests/cpu/package_ordinal_provider.def)
+        endif()
+        add_library(cpu_package_ordinal_${variant} SHARED tests/cpu/package_ordinal_provider.cpp ${ord_def})
+        target_compile_options(cpu_package_ordinal_${variant} PRIVATE /GS- /Zl)
+        target_link_options(cpu_package_ordinal_${variant} PRIVATE /ENTRY:ordinal_provider_entry
+            /NODEFAULTLIB /INCREMENTAL:NO)
+    endforeach()
+    target_compile_definitions(cpu_package_ordinal_altered PRIVATE ALTER_RETURN)
+    add_executable(cpu_package_ordinal_exe tests/cpu/package_ordinal_exe.cpp)
+    target_compile_options(cpu_package_ordinal_exe PRIVATE /GS- /Zl)
+    target_link_options(cpu_package_ordinal_exe PRIVATE /ENTRY:ordinal_exe_entry
+        /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+    target_link_libraries(cpu_package_ordinal_exe PRIVATE cpu_package_ordinal_provider)
+    add_test(NAME cpu_native_package_ordinal_startup COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/package_ordinal_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_package_ordinal_exe>" "$<TARGET_FILE:cpu_package_ordinal_provider>"
+        "$<TARGET_FILE:cpu_package_ordinal_altered>" "$<TARGET_FILE:cpu_package_ordinal_wrong>")
+    set_tests_properties(cpu_native_package_ordinal_startup PROPERTIES TIMEOUT 90)
+    add_test(NAME pe_package_ordinal_plan COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pe_package_ordinal_plan_check.py")
     add_test(NAME cpu_native_startup COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_startup_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_startup_exe>" "$<TARGET_FILE:cpu_startup_a>" "$<TARGET_FILE:cpu_startup_b>"
@@ -3140,6 +3275,41 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_map_pages_caller>" "$<TARGET_FILE:cpu_map_pages_provider>"
         "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_map_pages PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_transfer_mem_provider SHARED tests/cpu/transfer_mem_provider.cpp tests/cpu/transfer_mem_provider.def)
+    add_executable(cpu_transfer_mem_caller tests/cpu/transfer_mem_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_transfer_mem_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_transfer_mem_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_transfer_mem_caller PRIVATE cpu_transfer_mem_provider cpu_exe_io)
+    add_test(NAME cpu_native_transfer_mem COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/transfer_mem_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_transfer_mem_caller>" "$<TARGET_FILE:cpu_transfer_mem_provider>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_transfer_mem PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_transfer_chain_provider SHARED tests/cpu/transfer_chain_provider.cpp tests/cpu/transfer_chain_provider.def)
+    add_executable(cpu_transfer_chain_caller tests/cpu/transfer_chain_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_transfer_chain_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_transfer_chain_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_transfer_chain_caller PRIVATE cpu_transfer_chain_provider cpu_exe_io)
+    add_test(NAME cpu_native_transfer_chain COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/transfer_chain_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_transfer_chain_caller>" "$<TARGET_FILE:cpu_transfer_chain_provider>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_transfer_chain PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_apu_alloc_provider SHARED tests/cpu/apu_alloc_provider.cpp tests/cpu/apu_alloc_provider.def)
+    add_library(cpu_apu_alloc_provider_lenient SHARED tests/cpu/apu_alloc_provider.cpp tests/cpu/apu_alloc_provider.def)
+    target_compile_definitions(cpu_apu_alloc_provider_lenient PRIVATE APU_TEST_LENIENT)
+    add_executable(cpu_apu_alloc_caller tests/cpu/apu_alloc_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_apu_alloc_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_apu_alloc_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_apu_alloc_caller PRIVATE cpu_apu_alloc_provider cpu_exe_io)
+    add_test(NAME cpu_native_apu_alloc_caller COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/apu_alloc_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_apu_alloc_caller>" "$<TARGET_FILE:cpu_apu_alloc_provider>"
+        "$<TARGET_FILE:cpu_apu_alloc_provider_lenient>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_apu_alloc_caller PROPERTIES TIMEOUT 60)
     add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")
@@ -3279,6 +3449,23 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_lds_private_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_lds_private_${adapter}.txt")
+        add_test(NAME compute_store_aot_lds_packed_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-lds-packed "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_lds_packed_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_lds_packed_${adapter}.txt")
+        foreach(lds_case IN ITEMS arithmetic replacement)
+            add_test(NAME compute_store_aot_lds_${lds_case}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-lds-${lds_case} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(compute_store_aot_lds_${lds_case}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
+                ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_lds_${lds_case}_${adapter}.txt")
+        endforeach()
+        add_test(NAME compute_store_aot_lds_strided_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-lds-strided "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_lds_strided_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_lds_strided_${adapter}.txt")
         add_test(NAME compute_store_aot_lds_wide_replacement_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-lds-wide-replacement "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3305,6 +3492,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-uncompressed-export "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_uncompressed_export_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME pixel_aot_uncompressed_integer_export_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-uncompressed-integer-export "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_uncompressed_integer_export_${adapter} PROPERTIES
+            TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_ds_swizzle_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-ds-swizzle "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3315,6 +3507,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_exec_regions_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_exec_regions_${adapter}.txt")
+        add_test(NAME pixel_aot_cmpx_regions_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-cmpx-regions "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_cmpx_regions_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_cmpx_regions_${adapter}.txt")
         add_test(NAME pixel_position_centers_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_position_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

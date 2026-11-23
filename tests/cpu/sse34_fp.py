@@ -564,7 +564,7 @@ def check_controls() -> None:
         ("VEX vroundps with dynamic MXCSR rounding", "c4 e3 79 08 c1 04 c3"),
         ("VEX vdpps with untracked source xmm4", "c4 e3 71 40 c4 f1 c3"),
         ("VEX vblendps with untracked source xmm4", "c4 e3 71 0c c4 05 c3"),
-        ("VEX vextractps eax, xmm0, 2", "c4 e3 79 17 c0 02 c3"),
+        ("VEX vextractps with untracked source xmm3", "c4 e3 79 17 d8 02 c3"),
         ("untracked dst addsubps xmm3, xmm0", "f2 0f d0 d8 c3"),
         ("untracked src addsubps xmm0, xmm3", "f2 0f d0 c3 c3"),
         ("untracked src extractps eax, xmm3, 0", "66 0f 3a 17 d8 00 c3"),
