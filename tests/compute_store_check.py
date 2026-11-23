@@ -718,7 +718,6 @@ READ_COMPUTE = [
     ".LBB0_2:",
     "s_endpgm",
 ]
-ALU_CASES = [("read_compute", READ_COMPUTE, 32, READ_BINDING)]
 ALU_WORD = ("min(params[0].y, ((((0x0000ffffu & {0}) & 0xffffffu) * (({0} >> (0x00000010u & 31u)) & 0xffffffu))"
             " + tid.x))").format(READ_LOADS["read_copy"])
 
@@ -730,6 +729,19 @@ def variant(lines, *changes):
         lines = [part for line in lines for part in ((line.replace(old, new).split("\n") if new else [])
                                                      if old in line else [line])]
     return lines
+
+
+# Leave a different bit above bit 23 set in each multiplicand. The ordinary
+# codegen fixture above limits both inputs to 16 bits.
+READ_MAD24 = variant(
+    READ_COMPUTE,
+    ("v_and_b32_e32 v2, 0xffff, v1", "v_and_b32_e32 v2, 0x1ffffff, v1"),
+    ("v_lshrrev_b32_e32 v1, 16, v1", "v_and_b32_e32 v1, 0x2ffffff, v1"),
+)
+ALU_CASES = [
+    ("read_compute", READ_COMPUTE, 32, READ_BINDING),
+    ("read_mad24", READ_MAD24, 32, READ_BINDING),
+]
 
 
 def guard_controls():
@@ -1597,12 +1609,48 @@ def draw_alu(directory, compiler, cmd, case, name):
     return 0
 
 
+def draw_mad24(directory, compiler, cmd, case):
+    # Dispatch one group, enable only lane zero and leave all 319 other words
+    # at their sentinel. With cap = UINT_MAX the entire multiply is observable.
+    word = source_word(0)
+    low = word % (1 << 24)
+    assert word & (3 << 24) == 3 << 24 and low & 1
+    expected = (low * low) % (1 << 32)
+    values = [expected] + [SENTINEL] * 319
+    case.write_bytes(struct.pack("<337I", 1, *values, 1, 0xffffffff, *([0] * 14)))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    src, cso = directory / "mad24-mutant.hlsl", directory / "mad24-mutant.cso"
+    for removed_bit in (24, 25):
+        # Remove the lowerer's u24 truncation from exactly one source.
+        prepared = f"(0x{((1 << removed_bit) | 0xffffff):08x}u & {READ_LOADS['read_copy']})"
+        truncated = f"({prepared} & 0xffffffu)"
+        assert source.count(truncated) == 1
+        src.write_text(source.replace(truncated, prepared), encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        actual = (low * (low + (1 << removed_bit))) % (1 << 32)
+        mismatch = f"word=0 expected={expected:08x} actual={actual:08x}"
+        if bad.returncode != 1 or mismatch not in bad.stderr:
+            raise AssertionError(f"MAD24 bit {removed_bit} mutation escaped detection\n{bad.stderr}")
+        print(mismatch)
+    return 0
+
+
 def draw(directory, compiler, renderer, backend, cases=None):
     for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
+        if name == "read_mad24":
+            result = draw_mad24(directory, compiler, cmd, case)
+            if result:
+                return result
+            continue
         if name.startswith(("guard_", "read_")):
             result = (draw_guard if name.startswith("guard_") else draw_alu if name == "read_compute"
                       else draw_read)(directory, compiler, cmd, case, name)

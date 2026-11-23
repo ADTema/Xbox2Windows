@@ -2225,6 +2225,12 @@ if (params[0].x > tid.x) {
 
 The Windows fixture uses the read harness and its three dispatches, with `cap = 0x45000000`, which clamps about half of the lanes. The expected words come from a CPU model of the source. On five groups with `n = 150`, each of these must fail: a reference with one word off by one bit, with `max` instead of `min`, a shift of 15, a 24-bit instead of a 16-bit mask, or lane 150 also writing. So must recompiled HLSL with `max` for `min`, a shift of 15, a 24-bit mask, the `+ gid` dropped, or the cap read from `params[0].z`. The operands of `v_mad_u32_u24` stay below 2^16 in this fixture, so the 24-bit masks are checked by the exact output and not on the GPU.
 
+The same check includes a separate MAD24 fixture that holds bit 24 in the
+first multiplicand and bit 25 in the second. It enables lane zero only and
+sets the cap to UINT_MAX. The full 320-word readback requires word 0 to be
+`0x0df050e1` with all other words unchanged. Removing source truncation
+individually yields `0xfef050e1` and `0xeff050e1`; each must fail at word 0.
+
 ### Two- and three-dimensional thread groups
 
 The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits
