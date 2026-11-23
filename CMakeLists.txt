@@ -1174,6 +1174,21 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_fp_original>"
         "$<TARGET_FILE:cpu_sse_fp_original_lifted>"
         "$<TARGET_FILE:cpu_sse_fp_altered_lifted>")
+    set(cpu_avx_fp_move_exports
+        "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
+        "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64")
+    string(CONCAT cpu_avx_fp_move_exports ${cpu_avx_fp_move_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_fp_move_${variant} avx_fp_move)
+        cpu_translation(cpu_avx_fp_move_${variant} cpu_avx_fp_move_aot "${cpu_avx_fp_move_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_fp_move_altered PRIVATE ALTER_OP)
+    add_test(NAME cpu_aot_avx_fp_move COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_fp_move_check.py"
+        "$<TARGET_FILE:cpu_avx_fp_move_original>"
+        "$<TARGET_FILE:cpu_avx_fp_move_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_fp_move_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_fp_move PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_sse_mmx_exports
         "op_cvtpi2ps_reg,op_cvtpi2ps_mem,op_cvtpi2ps_mem_plus1,"
         "op_cvtps2pi_reg,op_cvtps2pi_mem,op_cvtps2pi_mem_plus1,"

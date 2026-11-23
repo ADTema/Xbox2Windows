@@ -6126,7 +6126,6 @@ Not covered by this experiment: non-default MXCSR modes (FTZ/DAZ or unmasked exc
 non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
 
-
 ## Legacy SSE/MMX conversion, shuffle, and non-temporal store
 
 [The SSE/MMX leaf translator](../tools/cpu_sse_mmx_aot.py) lifts bounded straight-line
@@ -6178,3 +6177,61 @@ instructions, 40 ABI/state/addressing/prefix/stream), and 10 PE-patched DLL reje
 
 Not covered by this experiment: non-default MXCSR rounding modes, non-temporal cache-bypass
 hints on `movntq`, x87/MMX aliasing across calls, control flow, and title CPU code execution.
+
+## AVX quadword and masked-byte moves
+
+[The AVX quadword and masked-byte move translator](../tools/cpu_avx_fp_move_aot.py) lifts
+bounded straight-line Windows x64 leaf functions covering two `VEX` forms from
+`docs/coverage/x64_zen2.tsv` group `AVX`:
+
+- Quadword / GPR moves: `vmovq` across all four `VEX.128` `Code` encodings (`VEX_VMOVQ_XMM_XMMM64`, `VEX_VMOVQ_XMMM64_XMM`, `VEX_VMOVQ_XMM_RM64`, `VEX_VMOVQ_RM64_XMM`) and all five operand shapes (`xmm, xmm`; `xmm, m64`; `m64, xmm`; `xmm, r64`; `r64, xmm`), zeroing `YMM[255:64]` on `XMM` writes.
+- Conditional byte store: `vmaskmovdqu` (`VEX.128` `xmm1, xmm2` to implicit `[rdi]`), requiring nonvolatile `rdi` save/restore via a volatile scratch GPR around `mov rdi, r8`.
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned
+flat buffers and returns `void`. `YMM0`..`YMM5` use the portable `Vec256` model
+(`std::uint64_t q[4]`), `VEX.128` writes zero `[255:128]` (`vmovups`/`vmovaps`/
+`vmovdqu`/`vmovdqa` XMM) or `[255:64]` (`vmovq` XMM), and volatile scratch GPRs
+(`rax`, `r9`, `r10`, `r11`) become unavailable to ordinary consumers after saving `rdi`
+while remaining valid for `rdi` restoration. For this portable first slice, `vmaskmovdqu`
+requires the entire 16-byte destination `[rdi..rdi+15]` to be writable ordinary memory and
+touches only the bytes selected by `(mask[i] & 0x80) != 0` (never reading or writing
+unselected bytes). In a separate native `VirtualAlloc` + `PAGE_NOACCESS` / `PAGE_READONLY`
+page-edge observation, native `vmaskmovdqu` faulted whenever `k < 16` bytes lay in the
+writable page (even with all mask MSBs clear, and on `k = 15` could commit a writable 8-byte
+prefix before faulting); per Intel SDM, all-zero-mask faulting and partial-fault progress
+are implementation-dependent and outside this portable slice. Transport and ABI glue covers
+`vmovups`, `vmovaps`,
+`vmovdqu`, `vmovdqa`, `vzeroupper`, 64-bit `mov` and terminal `ret`. The translator
+rejects legacy SSE encodings (`movq`, `maskmovdqu`), EVEX encodings, FP arithmetic
+(`vaddsubps`, `vaddsubpd`), nonvolatile registers (`XMM6`..`15`, `YMM6`..`15`,
+`RBX`/`RBP`/`RSI`/`R12`..`R15`/`RSP`, and unrestored, non-`r8`, or leaked `RDI`),
+non-argument memory bases, stores outside `r8`, unaligned `vmovaps`/`vmovdqa` operands,
+prefixes, RIP-relative addressing, undefined registers, missing `ret` and trailing bytes
+after `ret`.
+
+```powershell
+cmake --build --preset dev --target cpu_avx_fp_move_original cpu_avx_fp_move_original_lifted cpu_avx_fp_move_altered cpu_avx_fp_move_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_avx_fp_move$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/avx_fp_move.asm) exports 9 functions covering all five
+`vmovq` operand shapes (`+1`/`+9` unaligned), `vmaskmovdqu` with `rdi` save/restore, a
+chained `vzeroupper` pipeline, and two dead-read fault-ordering controls
+(`op_discarded_read` and `op_discarded_read64`).
+[The differential check](../tests/cpu/avx_fp_move_check.py) skips with exit code 77
+when CPUID/XCR0 lacks AVX and otherwise verifies 134 cases across the 7 differential
+exports bit-for-bit against both the native MASM DLL and an independent Python reference
+model with 32-byte pre/post buffer guards across `dev` and `release` (`/O2`) builds,
+plus 12 native/lifted `k=16` page-abutting writable checks (full, zero, and sparse masks
+against `PAGE_NOACCESS` and `PAGE_READONLY` guard pages), 30 native-only `k<16` page-edge
+observations with fault status and writable prefix logged, dead-read fault ordering
+(`op_discarded_read`, `op_discarded_read64`), 3 `ALTER_OP`
+divergence controls (`14`, `12`, `30`), an output-mutation comparator control, 8
+alternate-encoding lift checks, 38 unit rejection controls (including the `RDI`-save
+definedness leak control), and 9 end-to-end PE-patched DLL rejection controls.
+
+Not covered by this experiment: non-temporal cache hints or implementation-dependent
+partial-page fault progress on `vmaskmovdqu`, control flow, nonvolatile `xmm6`..`xmm15`
+prologues, and title CPU code execution.
