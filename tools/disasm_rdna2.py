@@ -134,7 +134,7 @@ SOPP_OPS = {
     0x09: ("s_cbranch_execnz", "Branch if EXEC is non-zero"),
     0x0a: ("s_barrier", "Synchronize wavefronts in workgroup"),
     0x0c: ("s_waitcnt", "Wait for memory operations"),
-    0x14: ("s_code_end", "Code end marker"),
+    0x1f: ("s_code_end", "Code end marker"),
     0x20: ("s_inst_prefetch", "Instruction cache prefetch"),
     0x21: ("s_clause", "Begin hard clause"),
 }
@@ -1673,6 +1673,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         return (len(data) - offset, "data", f".byte {data[offset:].hex()}", "Trailing bytes")
 
     w0, = struct.unpack_from("<I", data, offset)
+
+    if w0 == 0:
+        return (4, "word_0x00000000", ".long 0x00000000", "Unrecognized RDNA 2 instruction encoding")
 
     # 1. SOPP: [31:23] == 0b101111111 (0xbf800000)
     if (w0 & 0xff800000) == 0xbf800000:

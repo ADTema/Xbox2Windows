@@ -119,7 +119,8 @@ class TestRdna2Disasm(unittest.TestCase):
             # (hex_bytes, expected_opcode, expected_mnemonic)
             ("000080bf", "s_nop", "s_nop 0"),
             ("000081bf", "s_endpgm", "s_endpgm"),
-            ("000094bf", "s_code_end", "s_code_end"),
+            ("00009fbf", "s_code_end", "s_code_end"),
+            ("00000000", "word_0x00000000", ".long 0x00000000"),
             ("000082bf", "s_branch", "s_branch label_0x4"),
             ("7f008cbf", "s_waitcnt", "s_waitcnt vmcnt(15) lgkmcnt(0)"),
             ("000382be", "s_mov_b32", "s_mov_b32 s2, s0"),
@@ -702,7 +703,7 @@ class TestRdna2Disasm(unittest.TestCase):
         )
 
     def test_s_code_end_is_recognized_but_not_translated(self):
-        instruction = disasm_rdna2(bytes.fromhex("000094bf"))[0]
+        instruction = disasm_rdna2(bytes.fromhex("00009fbf"))[0]
         self.assertEqual((instruction["opcode"], instruction["assembly"]), ("s_code_end", "s_code_end"))
         self.assertTrue(is_opcode_recognized(instruction["opcode"]))
         self.assertFalse(is_instruction_supported(instruction["assembly"]))
