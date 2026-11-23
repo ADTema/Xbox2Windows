@@ -5932,3 +5932,49 @@ and 10 end-to-end PE-patched DLL rejection controls.
 Not covered by this experiment: non-default MXCSR modes (FTZ/DAZ or unmasked exceptions),
 non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
+
+
+## Legacy SSE/MMX conversion, shuffle, and non-temporal store
+
+[The SSE/MMX leaf translator](../tools/cpu_sse_mmx_aot.py) lifts bounded straight-line
+Windows x64 leaf functions covering five uncovered forms from `docs/coverage/x64_zen2.tsv`
+group `SSE`:
+
+- Integer-to-float conversion: `cvtpi2ps` (`mm` and `m64` sources, preserving `xmm[127:64]`)
+- Float-to-integer conversions: `cvtps2pi` (round-to-nearest-even) and `cvttps2pi` (truncate toward zero) on `xmm` and `m64` sources, returning `0x80000000` on NaN, `+/-Inf`, or out-of-`int32_t` range after rounding
+- Word permutation: `pshufw` (`imm8` 16-bit word shuffle on `mm` and `m64` sources)
+- Non-temporal store: `movntq` (`m64` store to `[r8 + disp]`)
+
+Each lifted export uses the leaf ABI `void fn(word rcx, word rdx, word r8)` (`rcx`/`rdx`
+inputs, `r8` output), modeling `xmm0`..`xmm5` (`Vec128`), `mm0`..`mm7` (`std::uint64_t mm[8]`),
+and volatile scratch GPRs `rax`/`r9`/`r10`/`r11` for `movq` bridges alongside `movaps`/`movdqa`
+(16-byte aligned), `movdqu`, `emms`, and terminal `ret`. Touching any `mm` register sets
+`mmx_active`; `emms` clears it and invalidates `mm` definitions unconditionally, and `ret`
+rejects while `mmx_active` is true. Dead-read fault ordering uses `std::atomic_signal_fence`
+with volatile loads. Memory stores are restricted to `r8`-rooted flat `[r8 + disp]` operands,
+and VEX/EVEX encodings, nonvolatile registers, undefined reads/merges, prefixes, and
+unsupported instructions reject.
+
+```powershell
+cmake --build --preset dev --target cpu_sse_mmx_original cpu_sse_mmx_original_lifted cpu_sse_mmx_altered cpu_sse_mmx_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_sse_mmx$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/sse_mmx.asm) exports 19 functions covering register and
+displaced/unaligned `m64` forms of all five instructions, `movq` GPR bridges, `emms`
+re-entry, a discarded `cvtps2pi` fault-ordering read, and a chained pipeline.
+[The differential check](../tests/cpu/sse_mmx_check.py) verified 237 cases across the 18
+differential exports bit-for-bit against both the native MASM DLL and an independent Python
+reference model (including `+/-0.0`, subnormals, ties-to-even, `2147483520.0`, `2147483648.0`,
+`-2147483648.0`, `-2147483904.0`, `+/-Inf`, qNaN/sNaN, `xmm[127:64]` preservation, and
+`pshufw` `imm8` edge patterns), plus the discarded-read fault-ordering test on both `dev`
+and `release` (`/O2`) presets. An `ALTER_IMM` variant swaps `cvtps2pi`/`cvttps2pi` and
+changes `pshufw` `imm8` on four exports (diverging on 3, 3, 7, and 7 cases); an
+output-mutation control confirmed single-bit mismatch detection; and rejection controls
+passed 7 alternate-encoding lift checks, 59 unit rejections (7 VEX/EVEX, 12 unsupported
+instructions, 40 ABI/state/addressing/prefix/stream), and 10 PE-patched DLL rejections.
+
+Not covered by this experiment: non-default MXCSR rounding modes, non-temporal cache-bypass
+hints on `movntq`, x87/MMX aliasing across calls, control flow, and title CPU code execution.
