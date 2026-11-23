@@ -371,6 +371,22 @@ MIMG_OPS = {
     0x08: ("image_store", False, 0),
     0x09: ("image_store_mip", False, 1),
     0x0e: ("image_get_resinfo", False, 0),
+    0x0f: ("image_atomic_swap", False, 0),
+    0x10: ("image_atomic_cmpswap", False, 0),
+    0x11: ("image_atomic_add", False, 0),
+    0x12: ("image_atomic_sub", False, 0),
+    0x14: ("image_atomic_smin", False, 0),
+    0x15: ("image_atomic_umin", False, 0),
+    0x16: ("image_atomic_smax", False, 0),
+    0x17: ("image_atomic_umax", False, 0),
+    0x18: ("image_atomic_and", False, 0),
+    0x19: ("image_atomic_or", False, 0),
+    0x1a: ("image_atomic_xor", False, 0),
+    0x1b: ("image_atomic_inc", False, 0),
+    0x1c: ("image_atomic_dec", False, 0),
+    0x1d: ("image_atomic_fcmpswap", False, 0),
+    0x1e: ("image_atomic_fmin", False, 0),
+    0x1f: ("image_atomic_fmax", False, 0),
     0x20: ("image_sample", True, 0),
     0x21: ("image_sample_cl", True, 1),
     0x22: ("image_sample_d", True, 0),
@@ -673,6 +689,9 @@ VOP2_OPS = {
     0x25: ("v_add_nc_u32_e32", "Vector add uint32 without carry"),
     0x26: ("v_sub_nc_u32_e32", "Vector sub uint32 without carry"),
     0x27: ("v_subrev_nc_u32_e32", "Vector reverse sub uint32 without carry"),
+    0x28: ("v_add_co_ci_u32_e32", "Vector add with carry-in and carry-out uint32"),
+    0x29: ("v_sub_co_ci_u32_e32", "Vector sub with carry-in and carry-out uint32"),
+    0x2a: ("v_subrev_co_ci_u32_e32", "Vector reverse sub with carry-in and carry-out uint32"),
     0x2b: ("v_fmac_f32_e32", "Vector fused multiply-accumulate float32"),
     0x2c: ("v_fmamk_f32", "Vector fused multiply-add with literal multiplier"),
     0x2d: ("v_fmaak_f32", "Vector fused multiply-add with literal addend"),
@@ -1745,6 +1764,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0_str = f"0x{literal:x}" if src0 == 255 and literal is not None else decode_v_reg(src0)
         if op_name == "v_cndmask_b32_e32":
             asm = f"{op_name} v{vdst}, {src0_str}, v{vsrc1}, vcc_lo"
+        elif op in (0x28, 0x29, 0x2a):
+            asm = f"{op_name} v{vdst}, vcc_lo, {src0_str}, v{vsrc1}, vcc_lo"
         elif op in (0x20, 0x2c, 0x37):
             asm = f"{op_name} v{vdst}, {src0_str}, 0x{literal:x}, v{vsrc1}"
         elif op in (0x21, 0x2d, 0x38):

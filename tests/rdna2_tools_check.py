@@ -578,6 +578,96 @@ class TestRdna2Disasm(unittest.TestCase):
             ],
         )
 
+    def test_vop2_carry_and_mimg_atomic_encodings(self):
+        """Issue #938 step 3: VOP2 carry ops with implicit vcc_lo and GFX10 MIMG image_atomic_* match LLVM 15."""
+        endpgm = bytes.fromhex("000081bf")
+        # Golden encodings from LLVM 15.0.7 test/MC/AMDGPU/gfx10_asm_vop2.s and gfx10_asm_mimg.s.
+        cases = (
+            ("01050a50", "v_add_co_ci_u32_e32", "v_add_co_ci_u32_e32 v5, vcc_lo, v1, v2, vcc_lo"),
+            ("80040a50", "v_add_co_ci_u32_e32", "v_add_co_ci_u32_e32 v5, vcc_lo, 0, v2, vcc_lo"),
+            ("c1040a50", "v_add_co_ci_u32_e32", "v_add_co_ci_u32_e32 v5, vcc_lo, -1, v2, vcc_lo"),
+            ("ff040a5078563412", "v_add_co_ci_u32_e32", "v_add_co_ci_u32_e32 v5, vcc_lo, 0x12345678, v2, vcc_lo"),
+            ("01050a52", "v_sub_co_ci_u32_e32", "v_sub_co_ci_u32_e32 v5, vcc_lo, v1, v2, vcc_lo"),
+            ("01050a54", "v_subrev_co_ci_u32_e32", "v_subrev_co_ci_u32_e32 v5, vcc_lo, v1, v2, vcc_lo"),
+            ("10213cf020041800", "image_atomic_swap", "image_atomic_swap v4, v[32:34], s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_3D glc"),
+            ("122340f02004180001020000", "image_atomic_cmpswap", "image_atomic_cmpswap v[4:5], [v32, v1, v2], s[96:103] dmask:0x3 dim:SQ_RSRC_IMG_3D glc"),
+            ("1a2344f02004180001020000", "image_atomic_add", "image_atomic_add v[4:5], [v32, v1, v2], s[96:103] dmask:0x3 dim:SQ_RSRC_IMG_CUBE glc"),
+            ("222148f02004180001000000", "image_atomic_sub", "image_atomic_sub v4, [v32, v1], s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D_ARRAY glc"),
+            ("2a2150f02004180001020000", "image_atomic_smin", "image_atomic_smin v4, [v32, v1, v2], s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY glc"),
+            ("322154f02004180001020000", "image_atomic_umin", "image_atomic_umin v4, [v32, v1, v2], s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_2D_MSAA glc"),
+            ("3a2158f02004180001020300", "image_atomic_smax", "image_atomic_smax v4, [v32, v1, v2, v3], s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_2D_MSAA_ARRAY glc"),
+            ("0a215cf02004180001000000", "image_atomic_umax", "image_atomic_umax v4, [v32, v1], s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_2D glc"),
+            ("002160f020041800", "image_atomic_and", "image_atomic_and v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc"),
+            ("002164f020041800", "image_atomic_or", "image_atomic_or v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc"),
+            ("002168f020041800", "image_atomic_xor", "image_atomic_xor v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc"),
+            ("00216cf020041800", "image_atomic_inc", "image_atomic_inc v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc"),
+            ("002170f020041800", "image_atomic_dec", "image_atomic_dec v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc"),
+            ("002374f020041800", "image_atomic_fcmpswap", "image_atomic_fcmpswap v[4:5], v32, s[96:103] dmask:0x3 dim:SQ_RSRC_IMG_1D glc"),
+            ("002178f020041800", "image_atomic_fmin", "image_atomic_fmin v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc"),
+            ("00217cf020041800", "image_atomic_fmax", "image_atomic_fmax v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc"),
+        )
+        for raw, opcode, assembly in cases:
+            with self.subTest(raw=raw):
+                raw_bytes = bytes.fromhex(raw)
+                insns = disasm_rdna2(raw_bytes + endpgm)
+                self.assertEqual(
+                    [(i["offset"], i["length"], i["opcode"]) for i in insns],
+                    [(0, len(raw_bytes), opcode), (len(raw_bytes), 4, "s_endpgm")],
+                )
+                self.assertEqual(insns[0]["assembly"], assembly)
+
+        # Truncation controls: 4-byte truncated VOP2 carry literal and truncated MIMG atomic.
+        trunc_vop2 = disasm_rdna2(bytes.fromhex("ff040a50"))
+        self.assertEqual(
+            [(i["opcode"], i["assembly"]) for i in trunc_vop2],
+            [("vop2_truncated", "v_add_co_ci_u32_e32 <truncated>")],
+        )
+        trunc_mimg = disasm_rdna2(bytes.fromhex("0a215cf020041800"))  # nsize=1 expects 12 bytes
+        self.assertEqual(trunc_mimg[0]["opcode"], "mimg_truncated")
+
+    def test_vop2_carry_and_mimg_atomic_llvm_round_trip(self):
+        """Issue #938 step 3: VOP2 carry ops and GFX10 image_atomic_* round-trip through LLVM 15 on gfx1013."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(
+                f"carry/atomic round trip requires llvm-mc and llvm-objcopy "
+                f"(assembler={assembler}, objcopy={objcopy})"
+            )
+
+        source = [
+            "v_add_co_ci_u32_e32 v1, vcc_lo, v2, v3, vcc_lo",
+            "v_add_co_ci_u32_e32 v5, vcc_lo, 0x12345678, v2, vcc_lo",
+            "v_sub_co_ci_u32_e32 v1, vcc_lo, v2, v3, vcc_lo",
+            "v_subrev_co_ci_u32_e32 v1, vcc_lo, v2, v3, vcc_lo",
+            "image_atomic_swap v4, v[32:34], s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_3D glc",
+            "image_atomic_cmpswap v[4:5], [v32, v1, v2], s[96:103] dmask:0x3 dim:SQ_RSRC_IMG_3D glc",
+            "image_atomic_add v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_sub v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_smin v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_umin v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_smax v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_umax v1, v2, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_and v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_or v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_xor v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_inc v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_dec v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_fcmpswap v[4:5], v32, s[96:103] dmask:0x3 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_fmin v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "image_atomic_fmax v4, v32, s[96:103] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "s_endpgm",
+        ]
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        llvm_lines = llvm_disassemble(emitted, resolved_lib)
+        decoded = [rec["assembly"] for rec in disasm_rdna2(emitted)]
+        self.assertEqual(llvm_lines, source)
+        self.assertEqual(decoded, llvm_lines)
+        self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
+
     def test_hwreg_operands_use_llvm_spelling(self):
         """Issue #938: hwreg operands and s_setreg_imm32_b32 literals print as LLVM 15 prints them for gfx1013.
 
@@ -2725,6 +2815,48 @@ class TestRdna2Scanner(unittest.TestCase):
                 stream.write(".long 0\n")
             result = scan()
             self.assertIn("Full Shaders Accepted by Translator:       0", result.stdout)
+
+    def test_binary_scan_recognizes_vop2_carry_and_image_atomics(self):
+        """Issue #938 step 3: binary scan accepts decoded VOP2 carry ops and keeps image_atomic_* recognized-only."""
+        carry_bin = bytes.fromhex(
+            "01050a50"  # v_add_co_ci_u32_e32 v5, vcc_lo, v1, v2, vcc_lo
+            "01050a52"  # v_sub_co_ci_u32_e32 v5, vcc_lo, v1, v2, vcc_lo
+            "01050a54"  # v_subrev_co_ci_u32_e32 v5, vcc_lo, v1, v2, vcc_lo
+            "000081bf"  # s_endpgm
+        )
+        atomic_bin = bytes.fromhex(
+            "00215cf002010000"  # image_atomic_umax v1, v2, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_1D glc
+            "000081bf"          # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "ps_carry.bin").write_bytes(carry_bin)
+            (tmp_path / "ps_atomic.bin").write_bytes(atomic_bin)
+            results = {r["shader_name"]: r for r in scan_directory_or_files([tmp_path])}
+        carry = results["ps_carry.bin"]
+        self.assertEqual(
+            (carry["total_instructions"], carry["supported_instructions"], carry["unsupported_count"]),
+            (4, 4, 0),
+            carry.get("unsupported_details"),
+        )
+        self.assertTrue(carry["opcodes_recognized"])
+        self.assertEqual(carry["unsupported_opcodes"], {})
+
+        atomic = results["ps_atomic.bin"]
+        self.assertTrue(atomic["opcodes_recognized"])
+        self.assertEqual(atomic["unsupported_opcodes"], {})
+        self.assertFalse(atomic["translator_accepted"])
+        self.assertEqual(atomic["compatibility_category"], "opcode_recognized_translator_rejected")
+        self.assertEqual(atomic["unsupported_count"], 1)
+        self.assertEqual(
+            [d["raw"] for d in atomic["unsupported_details"]],
+            ["image_atomic_umax v1, v2, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_1D glc"],
+        )
+
+        # Negative control: the old unnamed VOP2 spellings failed both recognition and support.
+        for old_op in ("v_vop2_28", "v_vop2_29", "v_vop2_2a"):
+            self.assertFalse(is_opcode_recognized(old_op), old_op)
+            self.assertFalse(is_instruction_supported(f"{old_op} v5, v1, v2"), old_op)
 
     def test_report_generation(self):
         canonical_shader = [
