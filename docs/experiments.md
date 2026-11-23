@@ -2317,6 +2317,13 @@ the old word to the destination VGPR. The fixtures compare old and new words
 and exercise successful and unsuccessful comparisons. Reversing the comparison
 operands, masking the OR operand or omitting the exchange must mismatch at word 1.
 
+The same 16-byte record supports `ds_write_b128` and `ds_read_b128` at
+byte offset zero, `ds_write2_b32` at distinct dword offsets and
+`ds_write2_b64` and `ds_read2_b64` at qword offsets. Both elements must fit
+and a dual write must not overlap itself. The fixtures export four words
+per lane for one and two groups. Clearing the fourth source or swapping
+paired offsets must produce a readback mismatch.
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
