@@ -956,6 +956,7 @@ def check_region_wait_controls():
     for opener in REGION_WAIT_OPENERS:
         for body, message in (("s_waitcnt_vmcnt s5, 0x0", "Unsupported s_waitcnt_vmcnt SGPR operand"),
                               ("s_waitcnt_lgkmcnt s5, 0x0", "Unsupported s_waitcnt_lgkmcnt SGPR operand"),
+                              ("s_waitcnt_expcnt s5, 0x0", "Unsupported s_waitcnt_expcnt SGPR operand"),
                               ("s_waitcnt vmcnt(64)", "VM wait count exceeds the gfx10 six-bit field"),
                               ("s_waitcnt_depctr 0xfffe", "Instruction cannot run in a masked region"),
                               ("s_inst_prefetch 0x3", "Instruction cannot run in a masked region"),

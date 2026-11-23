@@ -2447,6 +2447,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             elif REGION_NOP.fullmatch(line):
                 pass
             elif (counters := wait_counters(line)) is not None:
+                if re.match(r"s_waitcnt_expcnt\s+s\d+,", line):
+                    raise ValueError(f"Unsupported s_waitcnt_expcnt SGPR operand in a masked region: {line}")
                 # A wait is admitted only if every counter it names is already satisfied in the tracked state, so
                 # it resolves nothing whether the wave runs or skips it. Loads leave sample_dest and pending only
                 # through a wait, and overwriting an outstanding destination is refused, so empty means nothing is
