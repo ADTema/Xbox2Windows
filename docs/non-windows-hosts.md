@@ -35,8 +35,9 @@ for t in \
   tests/script_state_check.py \
   tests/resource_root_check.py \
   tests/bcpack_check.py \
+  tests/bcpack_symbols_check.py \
   tests/bc7_blocks_check.py \
-  tests/form_coverage_check.py \
+  tests/bc7_tiles_check.py \
   tests/resource_ranges_check.py \
   tests/awc_metadata_check.py \
   tests/sgd5_effects_check.py \
@@ -45,15 +46,19 @@ for t in \
   tests/dependency_paths_check.py \
   tests/intake/paths_check.py \
   tests/shader_probe_check.py \
+  tests/shader_census_check.py \
   tests/dxil_retarget_check.py \
   tests/rdna2_tools_check.py \
   tests/pso_readiness_check.py \
   tests/docs_links_check.py \
   tests/bidi_controls_check.py \
+  tests/hardware_reports_check.py \
   tests/gpu_report_format_check.py; do
   ./out/pe-env/bin/python -B "$t"
 done
 ```
+
+`tests/form_coverage_check.py` and `tests/xmem_attribute_scan_check.py` import `iced-x86`, which pip builds from source on Apple Silicon, so this list leaves them out. Run them on Linux or Windows.
 
 Then run the three LLVM 15 `gfx1013` checks:
 
@@ -73,6 +78,13 @@ LLVM_LIB="$LLVM_PREFIX/lib/libLLVM-15.dylib" \
 
 The [CI workflow](../.github/workflows/windows.yml) runs the platform-independent Python suite on Ubuntu 24.04 with Python 3.12 (`python-linux`) and the `gfx1013` machine-code checks on Ubuntu 22.04 with LLVM 15 (`pixel-binary`).
 
+On Debian/Ubuntu, install `python3-venv` first. Without it, `python3 -m venv` fails with `ensurepip is not available`:
+
+```bash
+sudo apt-get update -q
+sudo apt-get install -y python3-venv
+```
+
 From the repository root, create `out/pe-env` (Python 3.11 or newer; CI uses 3.12), install dependencies, and run the platform-independent checks below:
 
 ```bash
@@ -82,7 +94,9 @@ for t in \
   tests/script_state_check.py \
   tests/resource_root_check.py \
   tests/bcpack_check.py \
+  tests/bcpack_symbols_check.py \
   tests/bc7_blocks_check.py \
+  tests/bc7_tiles_check.py \
   tests/form_coverage_check.py \
   tests/resource_ranges_check.py \
   tests/awc_metadata_check.py \
@@ -92,12 +106,14 @@ for t in \
   tests/dependency_paths_check.py \
   tests/intake/paths_check.py \
   tests/shader_probe_check.py \
+  tests/shader_census_check.py \
   tests/dxil_retarget_check.py \
   tests/rdna2_tools_check.py \
   tests/pso_readiness_check.py \
   tests/xmem_attribute_scan_check.py \
   tests/docs_links_check.py \
   tests/bidi_controls_check.py \
+  tests/hardware_reports_check.py \
   tests/gpu_report_format_check.py; do
   ./out/pe-env/bin/python -B "$t"
 done
@@ -145,8 +161,39 @@ Do not work around this by stubbing `cl`, MASM, D3D12, or WARP to make CMake con
 ## WSL and Linux translation layers
 
 - **WSL:** You can run the Linux Python and LLVM 15 checks inside WSL, while the CMake, MSVC, DXC, and D3D12 build still runs from Windows PowerShell as documented in [First build](../README.md#first-build).
-- **Linux GPU Check via Proton:** A contributor recorded a passing run of the standalone Windows GPU Check on CachyOS with an RTX 3060 through Proton and `vkd3d-proton` in [the hardware coverage thread](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064204388). If you report a translation-layer run of the standalone GPU Check in `#1`, include the commit or release tag, GPU model, Mesa or NVIDIA driver version, Proton and `vkd3d-proton` versions, and each subtest's output (including skips).
+- **Linux GPU Check via Proton and Wine:** Contributors have verified the standalone Windows GPU Check under Linux translation layers (Wine or Proton with `vkd3d-proton`). Mesa RADV reported native 64-lane waves and passed forced wave64 on an [AMD Ryzen 5 integrated GPU](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7067289597) and an [RX 9070 XT reported by @barbiscool](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7069870226). On the RX 9070 XT, RADV defaults to 32-lane waves (unlike Windows 64-lane defaults) and passes forced 64. NVIDIA runs on an [RTX 4070](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064884397), [RTX 5060 Ti](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7067186626) and [RTX 3060](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064204388) reported 32-lane maximums and completed all 408 BVH comparisons. Translation-layer caveats: `vkd3d-proton` is required (Wine's built-in D3D12 fails `bvh_waves` and skips differential checks), Wine DXGI reports placeholder driver versions (e.g. `35.0.65535.65535`), and `bvh_root_roundtrip_hardware` fails on `vkd3d-proton` due to its acceptance of undefined root flags (`0x03000000`) that Microsoft D3D12 rejects with `E_INVALIDARG`. If you report a translation-layer run of the standalone GPU Check in `#1`, include the commit or release tag, GPU model, Mesa or NVIDIA driver version, Proton/Wine and `vkd3d-proton` versions, and each subtest's output (including skips).
 - A native Linux runtime is outside the scope of this guide and remains a separate request from the x64 Windows target.
+
+### Compile check with msvc-wine
+
+[msvc-wine](https://github.com/mstorsjo/msvc-wine) runs the real MSVC toolchain and Windows SDK under Wine. This is not a stub, so you can use it to confirm that a C++ or HLSL change compiles with `cl` and DXC before Windows CI runs. Review the Visual Studio Build Tools license before using the unattended acceptance option below.
+
+```bash
+python3 vsdownload.py --accept-license --dest ~/.local/msvc
+./install.sh ~/.local/msvc
+```
+
+The SDK's `dxc.exe` is not wrapped. Save this script as `~/.local/msvc/bin/x64/dxc` and make it executable. It maps absolute Linux paths to Wine's `Z:` drive:
+
+```bash
+#!/bin/bash
+DXC="$HOME/.local/msvc/Windows Kits/10/bin/10.0.26100.0/x64/dxc.exe"
+args=()
+for a in "$@"; do
+  if [[ -e $a && $a == /* || $a == /*/* && -d ${a%/*} ]]; then args+=("z:${a//\//\\}"); else args+=("$a"); fi
+done
+WINEDEBUG=-all exec wine "$DXC" "${args[@]}"
+```
+
+Then configure with `CMAKE_SYSTEM_NAME=Windows`. Without it, CMake's compiler check fails to link with `LNK1181`.
+
+```bash
+export PATH="$HOME/.local/msvc/bin/x64:$PATH"
+cmake --preset release -DCMAKE_SYSTEM_NAME=Windows -DDXC_EXECUTABLE="$HOME/.local/msvc/bin/x64/dxc"
+cmake --build --preset release
+```
+
+The resulting test binaries run under Wine and `vkd3d`, not Windows D3D12 or WARP. Expect `desktop_memory_query`, the `d3d12_xs_shim_*` export and root checks, and `ffx_provider_loop_*` and `bvh_root_roundtrip_*` to fail there, and the DXR and BVH tests to skip. Treat a Wine run as a compile check only. Do not report Wine test results as Windows verification or hardware coverage.
 
 ## Troubleshooting
 

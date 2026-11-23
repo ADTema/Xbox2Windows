@@ -12,7 +12,7 @@ Visit [GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions) an
 
 ## Build and test
 
-Hardware reporters can use the [standalone package](tools/gpu-check/README.md). Paste the generated Markdown into the [ongoing hardware thread](https://github.com/R0Y00/Xbox2Windows/issues/1). Maintainers verify each incoming result, link the source report in the README coverage table, and record repeated runs on the same adapter as follow-ups.
+Hardware reporters can use the [standalone package](tools/gpu-check/README.md). Paste the generated Markdown into the [ongoing hardware thread](https://github.com/R0Y00/Xbox2Windows/issues/1). Maintainers verify each incoming result, link the source report in the README coverage table, and record repeated runs on the same adapter as follow-ups. To prepare a batch for the table, export the thread with `gh api --paginate repos/R0Y00/Xbox2Windows/issues/1/comments > out/issue-1-comments.json` and run `python -B tools/hardware_reports.py out/issue-1-comments.json`. It lists the reports that the README does not link yet with suggested cells, and notes where a result differs from the existing row.
 
 The [first independent clean build](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821) records the toolchain and three smoke-test outcomes. If a clean build fails on your machine, open a [build bug report](https://github.com/R0Y00/Xbox2Windows/issues/new?template=bug_report.yml) with the commit, toolchain, first failing command and diagnostic. Link a feedback-driven fix to its report and ask the reporter to verify the change.
 
@@ -34,6 +34,20 @@ To register a new translated CPU fixture for the coverage dashboard, put
 CTest that actually compares the translation. For macro-generated instructions,
 use `; coverage: record cpu_your_test` and have the test emit the decoded forms
 through `FORM_COVERAGE_RECORD`. Existing registrations still work.
+
+To find instruction forms without a passing fixture in a measured run, use its
+CTest JUnit file and matching records directory:
+
+```powershell
+python tools/form_coverage.py results.xml --records out/build/dev/form_coverage --gaps gfx1013
+```
+
+The TSV lists one row per uncovered reference form, sorted by group and mnemonic.
+Choose `gfx1013`, `gfx1030`, or `x64_zen2`. A `skipped` row has evidence from a
+skipped fixture. An `observed_without_pass` row appears in fixture evidence but
+has no passing or skipped fixture. An `unobserved` row has no matching evidence
+in the supplied measurement. A partial run can therefore list forms exercised
+elsewhere. Check current fixtures and open PRs before choosing a form to work on.
 
 Use original source, synthetic inputs or a public sample with its revision and license. Store local inputs in `game-files/` and generated output in `out/`. Keep game files, distribution links, SDK redistributables and dumps out of issues, PRs and Git. Remove personal paths and credentials from logs.
 

@@ -23,18 +23,6 @@ constexpr UINT sentinel = 0xc5c5c5c5u;
 constexpr std::array<UINT, 16> constants{count, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 23, 29};
 }
 
-ComPtr<ID3D12Resource> make_buffer(ID3D12Device* device, UINT64 length, D3D12_HEAP_TYPE heap,
-                                   D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags)
-{
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = length;
-    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    desc.Flags = flags;
-    return resource(device, desc, heap, state);
-}
-
 static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
 
 static void fill_upload(ID3D12Resource* upload)
@@ -52,15 +40,6 @@ static void fill_upload(ID3D12Resource* upload)
     std::memcpy(cb, constants.data(), sizeof(constants));
     for (UINT i = 1; i < 4; ++i) std::memcpy(cb + i * alignment, &constants[12 + i], sizeof(UINT));
     upload->Unmap(0, nullptr);
-}
-
-void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer,
-                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
-{
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition = {buffer, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
-    list->ResourceBarrier(1, &barrier);
 }
 
 static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
@@ -102,8 +81,15 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
 }
 
 struct StoreCase {
+    // Group counts: X in bits 0-7, Y in bits 8-15 and Z in bits 16-23; zero Y or Z means one.
     UINT groups;
     std::array<UINT, capacity> expected;
+    std::array<UINT, constants.size()> root_constants = constants;
+    UINT axis(UINT index) const
+    {
+        const UINT n = (groups >> (8 * index)) & 0xff;
+        return index && !n ? 1 : n;
+    }
 };
 
 static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE shader,
@@ -136,9 +122,11 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
     } else {
         list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
-        list->SetComputeRoot32BitConstants(2, static_cast<UINT>(constants.size()), constants.data(), 0);
+        const auto& words = store ? store->root_constants : constants;
+        list->SetComputeRoot32BitConstants(2, static_cast<UINT>(words.size()), words.data(), 0);
     }
-    list->Dispatch(store ? store->groups : capacity / 64, 1, 1);
+    if (store) list->Dispatch(store->axis(0), store->axis(1), store->axis(2));
+    else list->Dispatch(capacity / 64, 1, 1);
     transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
     commands.submit_and_wait(device);
@@ -161,7 +149,11 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
         }
     }
     readback->Unmap(0, &no_writes);
-    if (store) std::printf("groups=%u compared_words=%u mismatches=%u\n", store->groups, capacity, mismatches);
+    if (store && store->groups <= 0xff)
+        std::printf("groups=%u compared_words=%u mismatches=%u\n", store->groups, capacity, mismatches);
+    else if (store)
+        std::printf("groups=%ux%ux%u compared_words=%u mismatches=%u\n", store->axis(0), store->axis(1),
+                    store->axis(2), capacity, mismatches);
     else std::printf("layout=%s output_words=%u guard_words=%u mismatches=%u\n",
                 tables ? "tables" : "root", active, capacity - active, mismatches);
     if (mismatches) throw std::runtime_error("Compute readback differs from CPU reference");
@@ -190,8 +182,14 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
         std::ifstream file(reference, std::ios::binary);
         file.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
         file.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
-        if (!file || file.peek() != std::char_traits<char>::eof() || !store.groups || store.groups > 5)
+        if (!file || store.groups >> 24 || !store.axis(0) || store.axis(0) > 5 || store.axis(1) > 5 ||
+            store.axis(2) > 5)
             throw std::runtime_error("Invalid compute store reference");
+        if (file.peek() != std::char_traits<char>::eof()) {
+            file.read(reinterpret_cast<char*>(store.root_constants.data()), sizeof(store.root_constants));
+            if (!file || file.peek() != std::char_traits<char>::eof())
+                throw std::runtime_error("Invalid compute store constants");
+        }
         run_compute(device, false, shader, {compute_root, sizeof(compute_root)}, false, &store);
     } else {
         run_compute(device, false, shader, shader, conversion_pair);
@@ -228,26 +226,4 @@ void check_bvh_root_roundtrip(ID3D12Device* device)
         throw std::runtime_error("Normalized signature differs from independent control serialization");
     run_compute(device, false, shader, {roundtrip->GetBufferPointer(), roundtrip->GetBufferSize()});
     std::puts("normalized_signature=matched_control root_creation=passed pipeline_creation=passed dispatch=passed");
-}
-
-ComputeCommands::ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline, D3D12_COMMAND_LIST_TYPE type)
-{
-    D3D12_COMMAND_QUEUE_DESC desc{};
-    desc.Type = type;
-    check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "Create compute queue");
-    check(device->CreateCommandAllocator(desc.Type, IID_PPV_ARGS(&allocator)), "Create compute allocator");
-    check(device->CreateCommandList(0, desc.Type, allocator.Get(), pipeline, IID_PPV_ARGS(&list)),
-          "Create compute command list");
-}
-
-void ComputeCommands::submit_and_wait(ID3D12Device* device)
-{
-    check(list->Close(), "Close compute command list");
-    ComPtr<ID3D12Fence> fence;
-    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create compute fence");
-    ID3D12CommandList* submitted[]{list.Get()};
-    queue->ExecuteCommandLists(1, submitted);
-    check(queue->Signal(fence.Get(), 1), "Signal compute fence");
-    check(fence->SetEventOnCompletion(1, nullptr), "Wait for compute");
-    check(device->GetDeviceRemovedReason(), "Compute completion");
 }
