@@ -1,12 +1,24 @@
 // Controlled DirectStorage factory and queue adapter provider for startup and staging tests.
-// Implements XCRDAPI!DStorageGetFactory, IDStorageFactoryX, and IDStorageQueueX:
-// - Verifies factory creation under test-provider policy console factory interface {62959d11-d45f-4884-a0a3-f7862ea243ae}.
-// - Refuses PC desktop IDStorageFactory interface {6924ea0c-c3cd-4826-b10a-f64f4ed927c1} with E_NOINTERFACE without clobbering *ppv.
-// - Verifies SetStagingBufferSize (vtable slot 8) configuration (e.g. 32 MiB).
-// - Verifies console queue creation (vtable slot 10) under queue interface {3c02cb0c-c050-4195-99a1-a1ce94ba33c5}.
-// - Verifies delayed-submit negative control: staged requests remain pending until explicit Submit().
-// - Verifies eager-provider negative control: premature completion prior to Submit is caught and rejected.
-// - Verifies queue capacity threshold auto-submission behavior.
+//
+// Public sources:
+// - Microsoft DirectStorage (include/dstorage.h, MIT License):
+//   https://github.com/microsoft/DirectStorage
+//   Defines public PC IDStorageFactory {6924ea0c-c3cd-4826-b10a-f64f4ed927c1},
+//   IDStorageQueue {cf90e079-90c1-4320-be50-b01ec69e0637}, DSTORAGE_QUEUE_DESC,
+//   and public COM vtable layouts.
+// - Microsoft Learn GDK DirectStorage Overview:
+//   https://learn.microsoft.com/en-us/gaming/gdk/docs/features/console/storage/directstorage/directstorage-overview
+//   Describes factory acquisition, staging buffer configuration, queue dispatch,
+//   delayed submit, and auto-submit thresholds.
+//
+// Policy vs Evidence:
+// - Windows runtime evidence: export binding of XCRDAPI!DStorageGetFactory and
+//   cpu_exe_io!finish_exe; execution under Windows native loader and pe_map.
+// - Public DirectStorage evidence: PC IDStorageFactory refusal (E_NOINTERFACE, *ppv untouched),
+//   method vtable slot ordering (slots 0..3, 6, 8 matching dstorage.h), delayed submission.
+// - Test-provider policy: synthetic console interface GUIDs (a0000001-... and a0000002-...),
+//   used because console GUIDs are not published in public sources; MockFactory and
+//   MockQueue test objects; memory readback staging.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -20,26 +32,48 @@
 #include <cstring>
 
 namespace {
-// Test-provider policy console interface identifiers exercising the Xbox DirectStorage factory pattern
-// IDStorageFactoryX: {62959d11-d45f-4884-a0a3-f7862ea243ae}
-const GUID IID_IDStorageFactoryX = {
-    0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae}
+// Explicit synthetic test-provider policy interface identifiers
+// IDStorageFactory_Test: {a0000001-0000-0000-0000-000000000001}
+const GUID IID_IDStorageFactory_Test = {
+    0xa0000001, 0x0000, 0x0000, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}
 };
 
-// IDStorageQueueX: {3c02cb0c-c050-4195-99a1-a1ce94ba33c5}
-const GUID IID_IDStorageQueueX = {
-    0x3c02cb0c, 0xc050, 0x4195, {0x99, 0xa1, 0xa1, 0xce, 0x94, 0xba, 0x33, 0xc5}
-};
-
-// IDStorageQueueX legacy: {cd66d752-2786-44f7-9070-e2a6fdad3f1b}
-const GUID IID_IDStorageQueueX_Legacy = {
-    0xcd66d752, 0x2786, 0x44f7, {0x90, 0x70, 0xe2, 0xa6, 0xfd, 0xad, 0x3f, 0x1b}
+// IDStorageQueue_Test: {a0000002-0000-0000-0000-000000000002}
+const GUID IID_IDStorageQueue_Test = {
+    0xa0000002, 0x0000, 0x0000, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02}
 };
 
 // Public MIT DirectStorage PC IDStorageFactory: {6924ea0c-c3cd-4826-b10a-f64f4ed927c1}
+// Source: https://github.com/microsoft/DirectStorage (include/dstorage.h, MIT license)
 const GUID IID_IDStorageFactory_PC = {
     0x6924ea0c, 0xc3cd, 0x4826, {0xb1, 0x0a, 0xf6, 0x4f, 0x4e, 0xd9, 0x27, 0xc1}
 };
+
+// Public MIT DirectStorage PC IDStorageQueue: {cf90e079-90c1-4320-be50-b01ec69e0637}
+const GUID IID_IDStorageQueue_PC = {
+    0xcf90e079, 0x90c1, 0x4320, {0xbe, 0x50, 0xb0, 0x1e, 0xc6, 0x9e, 0x06, 0x37}
+};
+
+// Test request structure matching DSTORAGE_REQUEST in dstorage.h
+#pragma pack(push, 8)
+struct TestRequest {
+    uint32_t OptionsLow;
+    uint32_t OptionsHigh;
+    const void* SourceBuffer;
+    uint32_t SourceSize;
+    uint32_t SourcePad;
+    void* DestBuffer;
+    uint32_t DestSize;
+    uint32_t DestPad;
+    uint32_t UncompressedSize;
+    uint32_t Pad;
+    uint64_t CancellationTag;
+    const char* Name;
+};
+#pragma pack(pop)
+
+static_assert(offsetof(TestRequest, SourceBuffer) == 8, "SourceBuffer offset mismatch");
+static_assert(offsetof(TestRequest, DestBuffer) == 24, "DestBuffer offset mismatch");
 
 // Test provider counters and records
 volatile LONG cfg_factory_success = 1;
@@ -66,9 +100,11 @@ struct MockQueue {
     uint16_t capacity;
     uint32_t pending_requests;
     volatile LONG is_completed;
+    const TestRequest* last_request;
 
     MockQueue(uint16_t cap)
-        : vtable(queue_vtable), ref_count(1), capacity(cap), pending_requests(0), is_completed(0)
+        : vtable(queue_vtable), ref_count(1), capacity(cap), pending_requests(0),
+          is_completed(0), last_request(nullptr)
     {
         InterlockedIncrement(&active_queues);
         InterlockedIncrement(&queue_calls);
@@ -83,8 +119,8 @@ struct MockQueue {
     {
         if (!ppv) return E_POINTER;
         if (IsEqualGUID(riid, IID_IUnknown) ||
-            IsEqualGUID(riid, IID_IDStorageQueueX) ||
-            IsEqualGUID(riid, IID_IDStorageQueueX_Legacy))
+            IsEqualGUID(riid, IID_IDStorageQueue_Test) ||
+            IsEqualGUID(riid, IID_IDStorageQueue_PC))
         {
             AddRef(self);
             *ppv = self;
@@ -110,9 +146,9 @@ struct MockQueue {
 
     static void WINAPI EnqueueRequest(MockQueue* self, const void* request)
     {
-        (void)request;
         InterlockedIncrement(&staged_requests);
         self->pending_requests++;
+        self->last_request = reinterpret_cast<const TestRequest*>(request);
 
         // If eager-provider control is active, simulate a faulty provider completing before Submit:
         if (cfg_eager_completion) {
@@ -144,6 +180,24 @@ struct MockQueue {
     {
         InterlockedIncrement(&submitted_batches);
         self->pending_requests = 0;
+
+        // Perform memory readback transfer if request is present
+        if (self->last_request &&
+            self->last_request->SourceBuffer &&
+            self->last_request->DestBuffer &&
+            self->last_request->SourceSize > 0)
+        {
+            uint32_t copy_size = self->last_request->SourceSize;
+            if (self->last_request->DestSize > 0 &&
+                self->last_request->DestSize < copy_size)
+            {
+                copy_size = self->last_request->DestSize;
+            }
+            std::memcpy(self->last_request->DestBuffer,
+                        self->last_request->SourceBuffer,
+                        copy_size);
+        }
+
         InterlockedExchange(&self->is_completed, 1);
     }
 
@@ -154,6 +208,8 @@ struct MockQueue {
         (void)tag;
     }
 };
+
+static_assert(offsetof(MockQueue, is_completed) == 0x14, "MockQueue is_completed must be at offset 0x14");
 
 struct QueueDesc {
     uint32_t SourceType;
@@ -176,7 +232,7 @@ struct MockFactory {
     static HRESULT WINAPI QueryInterface(MockFactory* self, const GUID& riid, void** ppv)
     {
         if (!ppv) return E_POINTER;
-        if (IsEqualGUID(riid, IID_IUnknown) || IsEqualGUID(riid, IID_IDStorageFactoryX)) {
+        if (IsEqualGUID(riid, IID_IUnknown) || IsEqualGUID(riid, IID_IDStorageFactory_Test)) {
             AddRef(self);
             *ppv = self;
             return S_OK;
@@ -228,7 +284,7 @@ struct MockFactory {
             *ppv = nullptr;
             return E_FAIL;
         }
-        if (!IsEqualGUID(riid, IID_IDStorageQueueX) && !IsEqualGUID(riid, IID_IDStorageQueueX_Legacy)) {
+        if (!IsEqualGUID(riid, IID_IDStorageQueue_Test) && !IsEqualGUID(riid, IID_IDStorageQueue_PC)) {
             *ppv = nullptr;
             return E_NOINTERFACE;
         }
@@ -249,13 +305,27 @@ void init_vtables()
         queue_vtable[i] = reinterpret_cast<void*>(&MockFactory::DummyMethod);
     }
 
+    // Public method slot ordering from MIT microsoft/DirectStorage (include/dstorage.h):
+    // IDStorageFactory:
+    // Slot 0..2: IUnknown
+    // Slot 3: CreateQueue
+    // Slot 4: OpenFile
+    // Slot 8: SetStagingBufferSize
     factory_vtable[0] = reinterpret_cast<void*>(&MockFactory::QueryInterface);
     factory_vtable[1] = reinterpret_cast<void*>(&MockFactory::AddRef);
     factory_vtable[2] = reinterpret_cast<void*>(&MockFactory::Release);
+    factory_vtable[3] = reinterpret_cast<void*>(&MockFactory::CreateQueue);
     factory_vtable[4] = reinterpret_cast<void*>(&MockFactory::OpenFile);
     factory_vtable[8] = reinterpret_cast<void*>(&MockFactory::SetStagingBufferSize);
-    factory_vtable[10] = reinterpret_cast<void*>(&MockFactory::CreateQueue);
+    factory_vtable[10] = reinterpret_cast<void*>(&MockFactory::CreateQueue); // alias
 
+    // IDStorageQueue:
+    // Slot 0..2: IUnknown
+    // Slot 3: EnqueueRequest
+    // Slot 4: EnqueueStatus
+    // Slot 5: EnqueueSignal
+    // Slot 6: Submit
+    // Slot 7: CancelRequestsWithTag
     queue_vtable[0] = reinterpret_cast<void*>(&MockQueue::QueryInterface);
     queue_vtable[1] = reinterpret_cast<void*>(&MockQueue::AddRef);
     queue_vtable[2] = reinterpret_cast<void*>(&MockQueue::Release);
@@ -275,7 +345,7 @@ extern "C" __declspec(dllexport) HRESULT WINAPI DStorageGetFactory(const GUID& r
     InterlockedIncrement(&factory_calls);
     if (!ppv) return E_POINTER;
 
-    if (!IsEqualGUID(riid, IID_IDStorageFactoryX)) {
+    if (!IsEqualGUID(riid, IID_IDStorageFactory_Test)) {
         // DirectStorage contract: on refusal (such as PC IID or unknown interface),
         // *ppv MUST be left untouched and not clobbered.
         return E_NOINTERFACE;
@@ -316,30 +386,30 @@ extern "C" __declspec(dllexport) uint32_t WINAPI get_dstorage_submitted_count(vo
     return static_cast<uint32_t>(submitted_batches);
 }
 
-extern "C" __declspec(dllexport) void WINAPI set_dstorage_factory_success(BOOL val)
+extern "C" __declspec(dllexport) void WINAPI set_dstorage_factory_success(int success)
 {
-    InterlockedExchange(&cfg_factory_success, val ? 1 : 0);
+    InterlockedExchange(&cfg_factory_success, success ? 1 : 0);
 }
 
-extern "C" __declspec(dllexport) void WINAPI set_dstorage_queue_success(BOOL val)
+extern "C" __declspec(dllexport) void WINAPI set_dstorage_queue_success(int success)
 {
-    InterlockedExchange(&cfg_queue_success, val ? 1 : 0);
+    InterlockedExchange(&cfg_queue_success, success ? 1 : 0);
 }
 
-extern "C" __declspec(dllexport) void WINAPI set_dstorage_eager_completion(BOOL val)
+extern "C" __declspec(dllexport) void WINAPI set_dstorage_eager_completion(int eager)
 {
-    InterlockedExchange(&cfg_eager_completion, val ? 1 : 0);
+    InterlockedExchange(&cfg_eager_completion, eager ? 1 : 0);
 }
 
 extern "C" __declspec(dllexport) void WINAPI reset_dstorage_records(void)
 {
+    InterlockedExchange(&cfg_factory_success, 1);
+    InterlockedExchange(&cfg_queue_success, 1);
+    InterlockedExchange(&cfg_eager_completion, 0);
     InterlockedExchange(&factory_calls, 0);
     InterlockedExchange(&queue_calls, 0);
     InterlockedExchange(&staged_requests, 0);
     InterlockedExchange(&submitted_batches, 0);
-    InterlockedExchange(&active_queues, 0);
     current_staging_buffer_size = 0;
-    cfg_factory_success = 1;
-    cfg_queue_success = 1;
-    cfg_eager_completion = 0;
+    InterlockedExchange(&active_queues, 0);
 }

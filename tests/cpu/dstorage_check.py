@@ -1,9 +1,10 @@
 """Compare the source-built DirectStorage factory and queue caller under Windows and pe_map.
 
 Exercises the typed factory adapter, console queue creation, and delayed-submit negative controls:
-- Case 1 (Success path): DStorageGetFactory acquires IDStorageFactoryX ({62959d11-d45f-4884-a0a3-f7862ea243ae}),
-  configures staging buffer size (32 MiB), creates IDStorageQueueX ({3c02cb0c-c050-4195-99a1-a1ce94ba33c5}),
-  enqueues request, verifies completion is withheld before Submit, calls Submit, and releases objects (exit 0x870).
+- Case 1 (Success path): DStorageGetFactory acquires IDStorageFactory_Test ({a0000001-0000-0000-0000-000000000001}),
+  configures staging buffer size (32 MiB), creates IDStorageQueue_Test ({a0000002-0000-0000-0000-000000000002}),
+  enqueues request with destination buffer, verifies completion is withheld before Submit and destination
+  buffer remains unmodified (0xAA), calls Submit, verifies exact readback transfer, and releases objects (exit 0x870).
 - Case 2 (PC interface refusal): PC IDStorageFactory ({6924ea0c-c3cd-4826-b10a-f64f4ed927c1}) is refused with
   E_NOINTERFACE and leaves *ppv untouched.
 - Case 3 (Factory failure refusal): Failed factory creation aborts sequence (exit 0x301).
@@ -119,12 +120,12 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     prov_lib.reset_dstorage_records()
     mapped_code = run_mapped(mapper_path, exe, providers)
     check("mapped dstorage success exit code", mapped_code, 0x870)
-    check("mapped factory calls", prov_lib.get_dstorage_factory_calls(), 2) # step 0 (refusal) + step 1 (success)
+    check("mapped factory calls", prov_lib.get_dstorage_factory_calls(), 2)  # step 0 (refusal) + step 1 (success)
     check("mapped staging buffer size", prov_lib.get_dstorage_staging_buffer_size(), 0x2000000)
     check("mapped queue calls", prov_lib.get_dstorage_queue_calls(), 1)
     check("mapped staged requests", prov_lib.get_dstorage_staged_requests_count(), 1)
     check("mapped submitted batches", prov_lib.get_dstorage_submitted_count(), 1)
-    print("case 1 (success reaches submit): exit 0x870, 32 MiB buffer, delayed submit verified")
+    print("case 1 (success reaches submit): exit 0x870, 32 MiB buffer, delayed submit & readback verified")
 
     # 3. Case 2: Factory creation refusal (exit 0x301)
     prov_lib.reset_dstorage_records()
@@ -154,12 +155,12 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     check("eager provider rejected exit code", mapped_code, 0x304)
     print("case 4 (eager-provider negative control): premature completion caught with exit 0x304")
 
-    # 6. Changed-IID patch control: patch IID_IDStorageFactoryX
+    # 6. Changed-IID patch control: patch IID_IDStorageFactory_Test
     target_iid_bytes = bytes([
-        0x11, 0x9d, 0x95, 0x62, 0x5f, 0xd4, 0x84, 0x48, 0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae
+        0x01, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
     ])
     patched_iid_bytes = bytes([
-        0x12, 0x9d, 0x95, 0x62, 0x5f, 0xd4, 0x84, 0x48, 0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae
+        0x02, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
     ])
     with TemporaryDirectory() as temp_patch_dir:
         patched_exe = Path(temp_patch_dir) / "patched_dstorage_caller.exe"

@@ -2,15 +2,16 @@ EXTERN __imp_DStorageGetFactory:QWORD
 PUBLIC native_entry
 
 .data
-; Test-provider policy console IIDs exercising the Xbox DirectStorage factory pattern
-; IDStorageFactoryX: {62959d11-d45f-4884-a0a3-f7862ea243ae}
-IID_IDStorageFactoryX db 11h, 9dh, 95h, 62h, 5fh, 0d4h, 84h, 48h, 0a0h, 0a3h, 0f7h, 86h, 2eh, 0a2h, 43h, 0aeh
+; Explicit synthetic test-provider policy interface identifiers
+; IDStorageFactory_Test: {a0000001-0000-0000-0000-000000000001}
+IID_IDStorageFactory_Test db 01h, 00h, 00h, 0a0h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 01h
 
-; IDStorageQueueX: {3c02cb0c-c050-4195-99a1-a1ce94ba33c5}
-IID_IDStorageQueueX   db 0ch, 0cbh, 02h, 3ch, 50h, 0c0h, 95h, 41h, 99h, 0a1h, 0a1h, 0ceh, 94h, 0bah, 33h, 0c5h
+; IDStorageQueue_Test: {a0000002-0000-0000-0000-000000000002}
+IID_IDStorageQueue_Test   db 02h, 00h, 00h, 0a0h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h, 02h
 
 ; Public MIT DirectStorage PC IDStorageFactory: {6924ea0c-c3cd-4826-b10a-f64f4ed927c1}
-IID_IDStorageFactory_PC db 0ch, 0eah, 24h, 69h, 0cdh, 0c3h, 26h, 48h, 0b1h, 0ah, 0f6h, 4fh, 4eh, 0d9h, 27h, 0c1h
+; Source: https://github.com/microsoft/DirectStorage (include/dstorage.h, MIT license)
+IID_IDStorageFactory_PC   db 0ch, 0eah, 24h, 69h, 0cdh, 0c3h, 26h, 48h, 0b1h, 0ah, 0f6h, 4fh, 4eh, 0d9h, 27h, 0c1h
 
 pFactory dq 0
 pQueue   dq 0
@@ -23,16 +24,45 @@ dd 0                ; padding
 dw 16               ; Capacity = 16
 db 0                ; Priority = NORMAL (0)
 db 5 dup(0)         ; padding
-dq queue_name       ; Name
+pQueueName dq 0     ; Name pointer (initialized at runtime)
 
-dummy_request db 64 dup(0)
-dest_buffer   db 64 dup(0AAh)
+src_payload db "DSTORAGE_READBACK_TEST_DATA_32B!" ; exactly 32 bytes
+dest_buffer db 32 dup(0AAh)
+
+ALIGN 8
+test_request:
+; Options (8 bytes): SourceType=Memory(1) << 8, DestinationType=Memory(0)
+dd 00000100h        ; offset 0
+dd 0                ; offset 4
+; Source (16 bytes)
+pSource dq 0        ; offset 8: SourceBuffer (initialized at runtime)
+dd 32               ; offset 16: SourceSize
+dd 0                ; offset 20: SourcePad
+; Destination (16 bytes)
+pDest dq 0          ; offset 24: DestBuffer (initialized at runtime)
+dd 32               ; offset 32: DestSize
+dd 0                ; offset 36: DestPad
+; UncompressedSize (4 bytes)
+dd 32               ; offset 40: UncompressedSize
+dd 0                ; offset 44: Pad
+; CancellationTag (8 bytes)
+dq 12345678h        ; offset 48: CancellationTag
+; Name (8 bytes)
+dq 0                ; offset 56: Name
 
 .code
 native_entry PROC FRAME
     sub rsp, 38h
     .allocstack 38h
     .endprolog
+
+    ; Initialize runtime pointers to avoid 32-bit static relocations in 64-bit image
+    lea rax, queue_name
+    mov qword ptr [pQueueName], rax
+    lea rax, src_payload
+    mov qword ptr [pSource], rax
+    lea rax, dest_buffer
+    mov qword ptr [pDest], rax
 
     ; Step 0: Refusal control - request PC IDStorageFactory IID {6924ea0c-c3cd-4826-b10a-f64f4ed927c1}
     ; Must return E_NOINTERFACE (0x80004002) and leave *ppv untouched.
@@ -45,9 +75,9 @@ native_entry PROC FRAME
     cmp qword ptr [pFactory], 0DEADBEEFh
     jne fail_pc_clobber
 
-    ; Step 1: DStorageGetFactory(&IID_IDStorageFactoryX, &pFactory)
+    ; Step 1: DStorageGetFactory(&IID_IDStorageFactory_Test, &pFactory)
     mov qword ptr [pFactory], 0
-    lea rcx, IID_IDStorageFactoryX
+    lea rcx, IID_IDStorageFactory_Test
     lea rdx, pFactory
     call qword ptr [__imp_DStorageGetFactory]
     test eax, eax
@@ -56,30 +86,30 @@ native_entry PROC FRAME
     test rcx, rcx
     jz fail_factory
 
-    ; Step 2: factory->SetStagingBufferSize(0x2000000) (slot 8 = +0x40)
+    ; Step 2: factory->SetStagingBufferSize(0x2000000) (slot 8 = +0x40 in dstorage.h)
     mov rax, qword ptr [rcx]
     mov edx, 2000000h
     call qword ptr [rax + 40h]
     test eax, eax
     js fail_staging_buffer
 
-    ; Step 3: factory->CreateQueue(&queue_desc, &IID_IDStorageQueueX, &pQueue) (slot 10 = +0x50)
+    ; Step 3: factory->CreateQueue(&queue_desc, &IID_IDStorageQueue_Test, &pQueue) (slot 3 = +0x18 in dstorage.h)
     mov rcx, qword ptr [pFactory]
     mov rax, qword ptr [rcx]
     lea rdx, queue_desc
-    lea r8, IID_IDStorageQueueX
+    lea r8, IID_IDStorageQueue_Test
     lea r9, pQueue
-    call qword ptr [rax + 50h]
+    call qword ptr [rax + 18h]
     test eax, eax
     js fail_create_queue
     mov rcx, qword ptr [pQueue]
     test rcx, rcx
     jz fail_create_queue
 
-    ; Step 4: queue->EnqueueRequest(&dummy_request) (slot 3 = +0x18)
+    ; Step 4: queue->EnqueueRequest(&test_request) (slot 3 = +0x18 in dstorage.h)
     mov rcx, qword ptr [pQueue]
     mov rax, qword ptr [rcx]
-    lea rdx, dummy_request
+    lea rdx, test_request
     call qword ptr [rax + 18h]
 
     ; Step 5: Delayed-submit negative control:
@@ -92,17 +122,29 @@ native_entry PROC FRAME
     cmp byte ptr [dest_buffer], 0AAh
     jne fail_delayed_submit
 
-    ; Step 6: queue->Submit() (slot 6 = +0x30)
+    ; Step 6: queue->Submit() (slot 6 = +0x30 in dstorage.h)
     mov rcx, qword ptr [pQueue]
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 30h]
 
-    ; Step 7: Verification: completion flag must now be set
+    ; Step 7: Verification: completion flag must now be set and readback verified
     mov rcx, qword ptr [pQueue]
     cmp dword ptr [rcx + 14h], 1
-    jne fail_submit
+    jne fail_submit_flag
 
-    ; Step 8: Cleanup and release objects
+    ; Exact readback verification: dest_buffer must match src_payload exactly
+    lea r8, src_payload
+    lea r9, dest_buffer
+    xor eax, eax
+verify_loop:
+    mov dl, byte ptr [r8 + rax]
+    cmp byte ptr [r9 + rax], dl
+    jne fail_submit_readback
+    inc eax
+    cmp eax, 32
+    jl verify_loop
+
+    ; Step 8: Cleanup and release objects (slot 2 = +0x10 in IUnknown)
     mov rcx, qword ptr [pQueue]
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 10h] ; queue->Release()
@@ -131,7 +173,7 @@ fail_delayed_submit:
     mov eax, 0304h
     jmp done
 
-fail_submit:
+fail_submit_flag:
     mov eax, 0305h
     jmp done
 
@@ -141,6 +183,10 @@ fail_pc_refusal:
 
 fail_pc_clobber:
     mov eax, 0307h
+    jmp done
+
+fail_submit_readback:
+    mov eax, 0308h
     jmp done
 
 done:
