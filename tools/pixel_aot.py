@@ -1337,6 +1337,54 @@ def f16_round_result(name, bits):
     return sign | ((top + 15) << 10) | fraction
 
 
+def f16_cvt_int_result(signed, value):
+    """Exact binary16 result bits of v_cvt_f16_i16 (signed) or v_cvt_f16_u16 of the low 16 bits of value, or None when
+    the result overflows to infinity.
+
+    LLVM 15.0.7 VOP1Instructions.td L432-433 selects sint_to_fp and uint_to_fp, and the default rounding mode is round
+    to nearest even. Integer arithmetic with one rounding, used at translation time so that a proven source gives a
+    proven result. Zero is +0. Every i16 value is finite (at most 32768); a u16 value of 65520 or more ties to 2^16,
+    which rounds up to infinity, so the boundary is refused.
+    """
+    value &= 0xffff
+    if signed and value & 0x8000:
+        value -= 0x10000
+    sign = 0x8000 if value < 0 else 0
+    magnitude = abs(value)
+    if magnitude == 0:
+        return 0
+    top = magnitude.bit_length() - 1
+    if top <= 10:  # at most 11 significant bits: exact
+        return sign | ((top + 15) << 10) | ((magnitude << (10 - top)) & 0x3ff)
+    shift = top - 10
+    count, remainder, half = magnitude >> shift, magnitude & ((1 << shift) - 1), 1 << (shift - 1)
+    if remainder > half or (remainder == half and count & 1):
+        count += 1
+    if count == 0x800:
+        count, top = 0x400, top + 1
+    if top > 15:
+        return None
+    return sign | ((top + 15) << 10) | (count & 0x3ff)
+
+
+def int16_known_value(token, scalar, vector, known_ssa_bits):
+    """Low 16 bits of a 16-bit integer source whose value is statically known, else None.
+
+    Known: an integer inline constant, a literal, a tracked SGPR integer and a VGPR copied from a known constant.
+    A constant-buffer word, a sample, an interpolant and a 16-bit integer result are not. The token must already have
+    been accepted by int16_operand.
+    """
+    if re.fullmatch(r"-?\d+", token):
+        return int(token) & 0xffff
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", token):
+        return int(token, 16) & 0xffff
+    if token.startswith("s"):
+        value = scalar.get(token)
+        return value & 0xffff if isinstance(value, int) else None
+    value = vector.get(token)
+    return known_ssa_bits[value] & 0xffff if isinstance(value, str) and value in known_ssa_bits else None
+
+
 def half16_name(token, vector):
     """Return the HLSL variable of a VGPR that holds a binary16 arithmetic result, else None.
 
@@ -3981,6 +4029,46 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
             vector[dst] = ("half16", f"alu{i}")
             known_half[f"alu{i}"] = result
+        elif m := match(r"v_cvt_f16_(i16|u16)(_e32|_e64)? (v\d+), ([^,\s]+)"):
+            # Integer to binary16 (issue #839): LLVM 15.0.7 VOP1Instructions.td L432-433 selects sint_to_fp and uint_to_fp,
+            # round to nearest even. The source is the low 16 bits through the audited reader int16_operand (sign-
+            # extended for i16, zero-extended for u16, bits 31:16 never read). |x| <= 65535 < 2^24 converts to binary32
+            # exactly, and narrow16 rounds once, so the result is the exact nearest-even binary16. The result is
+            # ("half16", alu) under the rules of the VOP2 arithmetic above (declared entry profile, audited readers).
+            # Every i16 value is finite, so a runtime i16 source needs no proof, but its result carries no known value
+            # and cannot feed the binary16 arithmetic. A u16 source is accepted only when statically proven below 65520
+            # (65520 and above ties up to infinity); a runtime u16 source is refused. Modifiers, clamp and omod never
+            # match the anchored operands.
+            kind, encoding, dst, token = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 conversion operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            signed = kind == "i16"
+            if rm := re.fullmatch(r"([vs])(\d+)", token):
+                if not 0 <= int(rm.group(2)) <= (255 if rm.group(1) == "v" else 105):
+                    raise ValueError(f"Register out of range: {token}")
+                if token not in (vector if rm.group(1) == "v" else scalar):
+                    raise ValueError(f"Untracked 16-bit source: {token}")
+            word = int16_operand(token, scalar, vector, pending, sample_dest, signed=signed)
+            known = int16_known_value(token, scalar, vector, known_ssa_bits)
+            result = None
+            if known is not None:
+                result = f16_cvt_int_result(signed, known)
+                if result is None:
+                    raise ValueError(f"binary16 result overflows: v_cvt_f16_{kind}")
+            elif not signed:
+                raise ValueError(f"binary16 conversion source lacks a range proof: {token}")
+            lines.append(f"    {'int' if signed else 'uint'} cv{i}_0 = {word};")
+            lines.append(f"    precise float hs{i} = float(cv{i}_0);")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            if result is not None:
+                known_half[f"alu{i}"] = result
         elif m := match(r"v_cvt_off_f32_i4(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
             # Bits 3:0 of the source as a signed nibble in units of 1/16, so 0x7 gives 0.4375
             # and 0x8 gives -0.5. The source is read as bits, so float modifiers do not apply.
