@@ -1609,7 +1609,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             continue
         if exported and line != "s_endpgm":
             raise ValueError("Unexpected instruction after color export")
-        if line == "v_nop":
+        # v_nop_e64 is the VOP3 encoding of the same no-op; LLVM 15 prints both encodings as v_nop.
+        if line in ("v_nop", "v_nop_e64"):
             if mask != "entry":
                 raise ValueError("Unexpected v_nop with non-entry mask")
             continue
@@ -2030,7 +2031,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(r"v_interp_p([12])_f32_e32 (v\d+), (v\d+), attr0\.([xyzw])"):
+        # The VOP3 (e64) spelling is accepted only in the operand shape of the e32 form. Its source modifiers,
+        # clamp and output modifiers do not match here and stay unrecognised.
+        elif m := match(r"v_interp_p([12])_f32_e(?:32|64) (v\d+), (v\d+), attr0\.([xyzw])"):
             phase, dst, src, component = m.groups()
             entry_interp = mask == "entry" and sampler is None
             if ((not entry_interp and (mask not in ("entry", "quad") or component not in "xy"))

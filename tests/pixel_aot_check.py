@@ -3837,6 +3837,7 @@ def check_scheduling_hints():
     must_reject(translate, plain + ["v_nop"])
     must_reject(translate, plain[:-1] + ["s_setprio 0", plain[-1]])
     must_reject(translate, plain[:-1] + ["v_nop", plain[-1]])
+    check_e64_spelling_lowering()
 
 
 def check_adapter_skip(directory: Path) -> None:
@@ -3867,6 +3868,134 @@ def attribute_color(rg):
 
 def translate_attribute(code):
     return lower(code, 8, 14, None)
+
+
+# VOP3 (e64) spellings left over after the other e64 draws: v_interp_p1_f32_e64, v_interp_p2_f32_e64 and
+# v_nop_e64. LLVM defines each as a second encoding of the instruction already lowered, and the translator
+# accepts the interpolation pair only in the operand shape of the e32 form: a plain VGPR source and attr0, with
+# no source modifier, clamp or output modifier. e64_spellings rewrites the interpolation lines of a drawn
+# program and adds a v_nop_e64 at entry mask, so the translated shader must equal the e32 one.
+E64_SPELLING_OPS = ("v_interp_p1_f32_e64", "v_interp_p2_f32_e64", "v_nop_e64")
+
+
+def e64_spellings(program, *, phases=("p1", "p2"), nop_before=None):
+    """program with its v_interp_<phase>_f32 lines in the VOP3 spelling and one v_nop_e64 inserted.
+
+    The v_nop_e64 goes before the line nop_before, or before the first export when that is None.
+    """
+    spelled = [line.replace("_f32_e32", "_f32_e64") if line.startswith(tuple(f"v_interp_{p}_f32_e32" for p in phases))
+               else line for line in program]
+    at = (spelled.index(nop_before) if nop_before is not None
+          else next(i for i, line in enumerate(spelled) if line.startswith("v_cvt_pkrtz")))
+    return spelled[:at] + ["v_nop_e64"] + spelled[at:]
+
+
+def e64_spelling_programs():
+    """(name, program, translate function, the same program with e32 interpolation and s_nop 0)."""
+    programs = []
+    # Whole-quad interpolation of the texture coordinates. The second program mixes the encodings in each
+    # pair: e32 for p1 and e64 for p2.
+    for swap, phases in ((False, ("p1", "p2")), (True, ("p2",))):
+        program = e64_spellings(assembly(swap), phases=phases, nop_before="s_waitcnt vmcnt(0)")
+        programs.append((f"sampled-{'bgra' if swap else 'rgba'}", program, translate))
+    # Entry-mask interpolation of all four components.
+    programs.append(("attribute", e64_spellings(attribute_color(False)), translate_attribute))
+    return [(name, program, function,
+             [line.replace("_f32_e64", "_f32_e32") if line.startswith("v_interp_") else
+              "s_nop 0" if line == "v_nop_e64" else line for line in program])
+            for name, program, function in programs]
+
+
+def check_e64_spelling_lowering():
+    """Static checks: each e64 spelling lowers exactly like the e32 form, and nothing wider is accepted."""
+    for name, program, function, plain in e64_spelling_programs():
+        assert sum(line.startswith("v_interp_") and "_e64 " in line for line in program) in (2, 4, 8), name
+        assert program.count("v_nop_e64") == 1, name
+        assert function(program) == function(plain), name
+    assert set(E64_SPELLING_OPS) <= ACCEPTED, set(E64_SPELLING_OPS) - ACCEPTED
+    # The other mix, e64 for p1 and e32 for p2, is the same pair as well.
+    assert (translate_attribute(e64_spellings(attribute_color(True), phases=("p1",)))
+            == translate_attribute(e64_spellings(attribute_color(True), phases=())))
+    # The VOP3 encoding has source modifiers, clamp and output modifiers that the e32 one lacks. None is
+    # lowered, and neither is an SGPR source, another attribute, or an operand on v_nop_e64.
+    sampled = e64_spellings(assembly(False), nop_before="s_waitcnt vmcnt(0)")
+    attribute = e64_spellings(attribute_color(False))
+    first, second = "v_interp_p1_f32_e64 v8, v0, attr0.x", "v_interp_p2_f32_e64 v8, v1, attr0.x"
+    assert first in sampled and second in sampled
+    for old, new in ((first, "v_interp_p1_f32_e64 v8, -v0, attr0.x"),
+                     (first, "v_interp_p1_f32_e64 v8, |v0|, attr0.x"),
+                     (first, "v_interp_p1_f32_e64 v8, -|v0|, attr0.x"),
+                     (first, first + " clamp"),
+                     (first, first + " mul:2"),
+                     (first, "v_interp_p1_f32_e64 v8, s0, attr0.x"),
+                     (first, "v_interp_p1_f32_e64 v8, v0, attr1.x"),
+                     (first, "v_interp_p1_f32_e64 v8, v0"),
+                     (second, "v_interp_p2_f32_e64 v8, -v1, attr0.x"),
+                     (second, second + " clamp"),
+                     (second, second + " div:2"),
+                     (second, "v_interp_p2_f32_e64 v8, v1, attr1.x"),
+                     # Pairing rules are those of the e32 form: p2 needs the j barycentric and its own p1.
+                     (second, "v_interp_p2_f32_e64 v8, v0, attr0.x"),
+                     (second, "v_interp_p2_f32_e64 v8, v1, attr0.y"),
+                     ("v_nop_e64", "v_nop_e64 0"),
+                     ("v_nop_e64", "v_nop_e64 v0")):
+        assert old in sampled, old
+        must_reject(translate, [new if line == old else line for line in sampled])
+    must_reject(translate_attribute, [line.replace("v8, v1, attr0.w", "v8, v1, attr0.z") for line in attribute])
+    must_reject(translate_attribute, [line.replace("attr0.z", "attr1.z") for line in attribute])
+    # v_nop_e64 follows v_nop: refused after the export and under the whole-quad mask.
+    plain = assembly(False)
+    must_reject(translate, plain + ["v_nop_e64"])
+    must_reject(translate, plain[:-1] + ["v_nop_e64", plain[-1]])
+    must_reject(translate, plain[:3] + ["v_nop_e64"] + plain[3:])
+    must_reject(translate, plain[:3] + ["v_nop"] + plain[3:])
+
+
+def check_e64_spelling_draws(directory, compiler, renderer, backend):
+    """Draw the three programs of e64_spelling_programs against the references their e32 forms use.
+
+    The sampled programs use the renderer's texture reference, one per channel order; each checked against
+    the other order must report a mismatch. The attribute program uses a per-pixel CPU reference for all four
+    interpolated components; a zeroed channel at an interior pixel must report a mismatch there.
+    A renderer that reports an unavailable adapter (exit 77) makes this a skip. On a desktop GPU the draws
+    establish what the translated shader computes, not what the console does.
+    """
+    source = directory / "e64_spelling.hlsl"
+    shader = directory / "e64_spelling.cso"
+    for name, program, function, _ in e64_spelling_programs():
+        source.write_text(function(program), encoding="ascii")
+        if name.startswith("sampled"):
+            compile_shader(compiler, source, shader, ieee=False)
+            order = name.split("-")[1]
+            draw = [renderer, backend, "--check-pixel", shader]
+            result = subprocess.run([*draw, order])
+            if result.returncode:
+                return result.returncode
+            other = subprocess.run([*draw, "rgba" if order == "bgra" else "bgra"], capture_output=True, text=True)
+            if other.returncode != 1 or "pixel_mismatch" not in other.stderr:
+                raise AssertionError(f"{name}: the other channel order escaped detection")
+            continue
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        case = directory / "e64_spelling.case"
+        draw = [renderer, backend, "--check-pixel-attribute", shader, case]
+        data = bytearray(256)
+        for y in range(32):
+            for x in range(32):
+                u, v = (x + 0.5) / 32, (y + 0.5) / 32
+                data += struct.pack("<4f", 1 - v, 0.25 + 0.5 * u, u, v)
+        case.write_bytes(data)
+        result = subprocess.run(draw)
+        if result.returncode:
+            return result.returncode
+        # One interior pixel per channel: attr0.w, attr0.z, attr0.x and attr0.y.
+        for channel, (x, y) in enumerate(((17, 9), (5, 22), (26, 3), (11, 30))):
+            wrong = bytearray(data)
+            struct.pack_into("<f", wrong, 256 + (y * 32 + x) * 16 + channel * 4, 0)
+            case.write_bytes(wrong)
+            mismatch = subprocess.run(draw, capture_output=True, text=True)
+            if mismatch.returncode != 1 or f"pixel_mismatch x={x} y={y}" not in mismatch.stderr:
+                raise AssertionError(f"{name}: a wrong interpolated channel {channel} escaped detection")
+    return 0
 
 
 def buffer_color(rg):
@@ -5987,6 +6116,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
+    fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
     fixtures.append((with_constants(DPP_INT32_BODY), translate))
     fixtures.append((with_constants(DPP_BODY), translate))
     fixtures.extend((with_constants(body), translate) for body, *_ in SDWA_ARITH)
@@ -8094,6 +8224,8 @@ def main():
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
                     return 77
                 raise
+        if mode == "draw-e64-spellings":
+            return check_e64_spelling_draws(directory, *args)
         if mode == "draw-e64":
             # The controls already run in the binary and draw modes; this mode only draws.
             return check_e64_render(directory, *args)

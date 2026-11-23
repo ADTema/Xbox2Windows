@@ -1903,6 +1903,16 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_instruction_supported("v_nop"))
         self.assertFalse(is_instruction_supported("v_nop 0"))
         self.assertFalse(is_instruction_supported("v_nop v0"))
+        self.assertTrue(is_instruction_supported("v_nop_e64"))
+        self.assertFalse(is_instruction_supported("v_nop_e64 0"))
+        # The VOP3 interpolation spelling: only the operand shape of the e32 form.
+        for phase, source in ((1, "v0"), (2, "v1")):
+            line = f"v_interp_p{phase}_f32_e64 v8, {source}, attr0.x"
+            self.assertTrue(is_instruction_supported(line), line)
+            self.assertTrue(is_instruction_supported(line.replace("_e64", "_e32")), line)
+            for wrong in (line.replace(source, f"-{source}"), line.replace(source, f"|{source}|"), line + " clamp",
+                          line + " mul:2", line.replace("attr0", "attr1"), line.replace(source, "s0")):
+                self.assertFalse(is_instruction_supported(wrong), wrong)
         self.assertTrue(is_instruction_supported("v_subrev_f32_e32 v1, v2, v3"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e64 v1, v2, v3 clamp"))
         # The 32-bit no-carry family. The INTEGER_SOURCE class is coarser than the translator, so this
