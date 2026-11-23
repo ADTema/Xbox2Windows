@@ -7483,6 +7483,10 @@ def pack_b32_group():
     return [*PACK_B32_PREFIX, *PACK_B32_BODY]
 
 
+def pack_b32_inline_group():
+    return [*PACK_B32_PREFIX, *PACK_B32_BODY, "v_pack_b32_f16 v12, 1.0, v19"]
+
+
 def pack_b32(lo, hi):
     return (lo & 0xffff) | ((hi & 0xffff) << 16)
 
@@ -8259,6 +8263,17 @@ def check_pack_b32_lowering():
         assert wrong(*PACK_B32_ROWS[0]) & 0xffffffff != pack_b32_results(*PACK_B32_ROWS[0])[channel], reason
     # Two sources in the VOP3 encoding only: no e32 spelling, no clamp, no op_sel, no float modifier, an
     # in-range destination, written and in-range registers, 32-bit literals and no SDWA spelling.
+    # Inline float constants are binary16 operands here: 1.0 supplies 0x3c00 (15360), -0.5 0xb800 (47104) and
+    # 1/(2*pi) 0x3118 (12568), never the low half of their binary32 encodings (0x3f800000 would give 0).
+    inline = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_pack_b32_f16 v12, 1.0, v18",
+                                                "v_pack_b32_f16 v13, v18, -0.5",
+                                                "v_pack_b32_f16 v14, 0.15915494, v18"])).splitlines()
+    for statement in (
+        "    precise float alu21 = asfloat((15360u & 0xffffu) | ((asuint(alu20) & 0xffffu) << 16));",
+        "    precise float alu22 = asfloat((asuint(alu20) & 0xffffu) | ((47104u & 0xffffu) << 16));",
+        "    precise float alu23 = asfloat((12568u & 0xffffu) | ((asuint(alu20) & 0xffffu) << 16));",
+    ):
+        assert statement in inline, statement
     good = "v_pack_b32_f16 v12, s44, v18"
     translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
     translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_pack_b32_f16_e64 v12, s44, v18"]))
@@ -8266,6 +8281,8 @@ def check_pack_b32_lowering():
         "v_pack_b32_f16_e32 v12, s44, v18",
         f"{good} clamp",
         "v_pack_b32_f16 v12, s44, v18 op_sel:[1,0]",
+        "v_pack_b32_f16 v12, 3.0, v18",
+        "v_pack_b32_f16 v12, v18, 0.25",
         "v_pack_b32_f16 v12, s44, v18 op_sel:[0,1] op_sel_hi:[0,0]",
         "v_pack_b32_f16 v12, s44",
         "v_pack_b32_f16 v12, s44, v18, s46",
@@ -12191,6 +12208,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
     fixtures.append((uncompressed_export(pack_b32_group()), translate_int))
+    fixtures.append((uncompressed_export(pack_b32_inline_group()), translate_int))
     fixtures.extend((uncompressed_export(sad_group(group)), translate_int) for group in SAD_BODIES)
     fixtures.extend((compressed_export(mask), translate_masked) for mask in (0x3, 0xC, 0xF))
     fixtures.extend((uncompressed_export([], mask), translate_masked) for mask in (0x1, 0x8, 0x5, 0xA))
@@ -12867,10 +12885,10 @@ def check_pack_int16_draws(directory, compiler, renderer, backend):
 def check_pack_b32_draw(directory, compiler, renderer, backend):
     """Draw v_pack_b32_f16 through the integer readback target and compare the words.
 
-    The one program of pack_b32_group() is compiled once and drawn in one renderer batch: every row of
+    The register program is compiled once and drawn in one renderer batch: every row of
     PACK_B32_ROWS with the right words, and the first row once per PACK_B32_WRONG entry with one channel replaced
-    by the word a wrong lowering would give, which must report a mismatch. On a desktop GPU the draw establishes
-    that the translated shader copies the stated halves, not what the console does.
+    by the word a wrong lowering would give. A separate inline program replaces one source with binary16 1.0
+    and uses the old binary32 low-half result as a mismatch control.
     """
     source = directory / "pack_b32.hlsl"
     shader = directory / "pack_b32.cso"
@@ -12900,6 +12918,21 @@ def check_pack_b32_draw(directory, compiler, renderer, backend):
             cases.append((wrong_case, "mismatch"))
     try:
         run_pixel_batch(renderer, backend, shader, cases)
+        inline_source = directory / "pack_b32_inline.hlsl"
+        inline_shader = directory / "pack_b32_inline.cso"
+        inline_source.write_text(translate_int(uncompressed_export(pack_b32_inline_group())), encoding="ascii")
+        compile_shader(compiler, inline_source, inline_shader)
+        a, b = PACK_B32_ROWS[0]
+        original_word = pack_b32(a, b)
+        inline_cases = []
+        for status, low_half in (("pass", 0x3C00), ("mismatch", 0)):
+            words = (pack_b32(low_half, b), original_word, original_word, original_word)
+            constants = bytearray(256)
+            struct.pack_into("<2I", constants, 12, a, b)
+            case = directory / f"pack_b32-inline-{status}.case"
+            case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+            inline_cases.append((case, status))
+        run_pixel_batch(renderer, backend, inline_shader, inline_cases)
     except subprocess.CalledProcessError as error:
         if error.returncode == 77:
             return 77

@@ -3585,7 +3585,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError(f"Three-operand operation does not support e32 encoding: v_{op}")
             if op in INTEGER_VOP3_ONLY and encoding == "e32":
                 raise ValueError(f"VOP3-only operation does not support e32 encoding: v_{op}")
-            args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
+            if op == "pack_b32_f16":
+                # LLVM types the sources as binary16 and prints an inline float constant as a decimal float;
+                # its binary16 encoding is used (1.0 is 0x3c00), as for the packed VOP3P forms. Any other
+                # decimal float never names a valid operand here and is refused.
+                for t in tokens:
+                    if t not in INLINE_F16 and re.fullmatch(r"-?\d+\.\d+", t):
+                        raise ValueError(f"Unsupported binary16 operand {t}")
+                args = [f"{INLINE_F16[t]}u" if t in INLINE_F16
+                        else int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
+            else:
+                args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
             if op in MUL24_HELPERS:
                 helpers.update(MUL24_HELPERS[op])
             helpers.update(INTEGER_HELPERS.get(op, ()))
