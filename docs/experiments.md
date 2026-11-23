@@ -4928,3 +4928,42 @@ and clamping with runtime inputs under the preserve denormal mode:
 Four negative controls verify that omitting the 2^32 scale, substituting unfused `mad`,
 omitting the 2Sum midpoint correction (double-rounding), or flushing intermediate
 subnormals (`ftz`) report pixel mismatches under `--check-pixel-case`.
+
+
+## Offline package PE import closure
+
+`tools/pe_package_preflight.py` reads PE import and export tables from a
+**source-built** package on Linux, macOS or Windows. It reuses the strict
+`pe_inventory.parse_image` reader and the existing `resolve_desktop` forwarder
+resolver, but **does not query host Windows DLLs** or load/execute any image.
+The JSON output records direct versus delay imports, resolved package exports,
+forwarder chains, ambiguous package basenames, and unresolved local exports.
+It follows static package providers reachable from the chosen EXE, preserving
+intermediate forwarders and preferring unconditional paths. Images not reached by that analysis are listed
+separately. External providers (including Windows system DLLs) are recorded as
+`external_unverified`, **not as missing**, because no host exports or API-set
+mapping were consulted. Forwarders to external providers are likewise marked
+unverified. This is not a prediction that the image will start or run correctly.
+
+```sh
+python -B tools/pe_package_preflight.py out/source-built-package app.exe \
+    --output out/pe-package-report.json
+python -B tests/pe_package_preflight_check.py -v
+```
+
+The package root is scanned only for `.exe`/`.dll` files. Symlinked PE candidates,
+images over 512 MiB, packages with more than 1,024 PE images or over 2 GiB of
+PE images are refused, as are entries outside the package root. The tool does
+not inspect non-PE assets, dynamic `LoadLibrary`/`GetProcAddress` calls, Windows
+KnownDLLs, API-set redirections, shim ABI semantics, TLS execution or GPU state.
+Reports are written outside the inspected package. Replacing an existing report
+does not change any inspected input linked to the same file. Reports should remain
+under `out/` and must not contain private package data in a public PR.
+
+On a separate, source-built Win64 diagnostic executable, a Linux smoke test
+reported 46 static imports as external/unverified and zero bundled failures:
+no DLLs were included in that diagnostic directory. The self-contained eight-test
+suite checks forwarded exports and ordinals, missing symbols, forwarder cycles,
+ambiguous local basenames, delay-import reachability, deterministic JSON output,
+path escapes, symlinks, hard-linked outputs and malformed PE CLI rejection. All tests use synthetic
+metadata and fake local files; no title files or binary fixtures are checked in.

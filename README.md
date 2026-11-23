@@ -61,6 +61,11 @@ To build and test at /O2 as Windows CI also does, use the `release` preset in pl
 
 Contributing from macOS or Linux? See the [non-Windows host guide](docs/non-windows-hosts.md) for the platform-independent Python and LLVM 15 checks.
 
+**Inspect a source-built PE package offline:** `python -B tools/pe_package_preflight.py
+out/source-built-package app.exe --output out/pe-package-report.json` reports direct/delay
+imports, package export/forwarder closure and external providers that could not be
+verified on the host, without loading an EXE or DLL. [Scope and synthetic tests](docs/experiments.md#offline-package-pe-import-closure).
+
 ### Windows build notes
 
 - **DXC validation.** `shader_metadata_probe` skips when the validator lacks module-only validation. DXC 1.8.2502 is the first verified release that passes. To use a separate DXC installation, configure with `cmake --preset dev -DDXC_EXECUTABLE=C:/path/to/dxc/bin/x64/dxc.exe`. [Results by release](docs/experiments.md#module-only-validation-by-dxc-release) · [Original report](https://github.com/R0Y00/Xbox2Windows/issues/98) · [DXC download](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2502)
