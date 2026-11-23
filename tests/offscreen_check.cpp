@@ -3,6 +3,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cwchar>
 #include <fstream>
@@ -623,6 +624,28 @@ OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_check_pixel_mip_clamp(const OperationContext& ctx)
+{
+    const std::string_view level = ctx.argv[4];
+    if (level.size() != 1 || level[0] < '0' || level[0] > '3')
+        throw std::runtime_error("Expected a mip level from 0 to 3");
+    check_pixel_mip_clamp(ctx.device, ctx.argv[3], unsigned(level[0] - '0'));
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_mip_blend(const OperationContext& ctx)
+{
+    const auto number = [](std::string_view text) {
+        float value = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (error != std::errc{} || end != text.data() + text.size())
+            throw std::runtime_error("Expected a decimal clamp and tolerance");
+        return value;
+    };
+    check_pixel_mip_blend(ctx.device, ctx.argv[3], number(ctx.argv[4]), number(ctx.argv[5]));
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_check_pixel(const OperationContext& ctx)
 {
     check_translated_pixel(ctx.device, ctx.argv[3], std::string_view(ctx.argv[4]) == "bgra");
@@ -864,6 +887,10 @@ constexpr CapabilityGate kGateSm66Compaction{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: subgroup compaction fixture requires SM 6.6",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66MinLod{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "skip: MinLod fixture requires SM 6.6",
+    CapsDiagnostic::none};
 
 // Static argument shapes and unconditional adapter prerequisites for every named operation.
 // Scenario-dependent capability checks (such as DXR tier, mesh tier, or existing-heap support)
@@ -899,6 +926,10 @@ const OperationSpec kOperations[] = {
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
     {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
+    // The SPIR-V MinLod fixtures compile ps_6_6; these draws run behind an SM 6.6 gate.
+    {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm66MinLod, run_check_pixel_quad_lod},
+    {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},
+    {"--check-pixel-mip-blend", 6, 6, nullptr, kGateSm66MinLod, run_check_pixel_mip_blend},
     {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
@@ -1201,6 +1232,28 @@ int run_self_test()
             return 1;
         if (!require(out.find("skip: ballot fixture requires SM 6.6") != std::string::npos,
                      "--spirv-ballot must print its skip reason")) return 1;
+
+        // The MinLod draws skip the same way instead of failing at ps_6_6 pipeline creation.
+        char quad_op[] = "--spirv-minlod-quad-lod";
+        char clamp_op[] = "--check-pixel-mip-clamp";
+        char blend_op[] = "--check-pixel-mip-blend";
+        char level[] = "1";
+        char tolerance[] = "0.0078125";
+        char* quad_argv[]{prog, mode, quad_op, dxil};
+        char* clamp_argv[]{prog, mode, clamp_op, dxil, level};
+        char* blend_argv[]{prog, mode, blend_op, dxil, level, tolerance};
+        const struct { char** argv; int argc; } minlod_cases[]{{quad_argv, 4}, {clamp_argv, 5}, {blend_argv, 6}};
+        for (const auto& c : minlod_cases) {
+            const OperationSpec* spec = find_operation(c.argv[2]);
+            if (!require(spec != nullptr, "MinLod operation")) return 1;
+            OperationContext mctx{nullptr, nullptr, low_caps, "warp", c.argc, c.argv, nullptr};
+            out.clear();
+            err.clear();
+            if (!require(run_operation_spec(*spec, mctx, {&out, &err}) == 77, "MinLod draw below SM 6.6 must exit 77"))
+                return 1;
+            if (!require(out.find("skip: MinLod fixture requires SM 6.6") != std::string::npos,
+                         "MinLod draw must print its skip reason")) return 1;
+        }
     }
 
     // (c) Handler OutcomeKind::fail and thrown exception exit 1 (never 77); OutcomeKind::skip exits 77; pass exits 0.

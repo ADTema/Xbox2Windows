@@ -3978,6 +3978,38 @@ The source-built draw runs three samples against distinct red and green mips.
 Each sample must reach the green mip and match the 64-pixel reference.
 Removing the clamp selects the red mip and must fail at pixel (0, 0).
 
+`spirv_minlod_levels_*` varies the clamp of a plain `Sample` over an 8x8
+texture with four solid-color mips. The coordinate is constant, so the LOD is
+the clamp. Each clamp runs as the translated shader and as a direct HLSL
+control on the same adapter.
+
+- With point mip filtering, clamps 0 to 3, 1.4375, 1.5625 and 3.75 read the
+  nearest mip exactly. The 1.5 tie read mip 2 on both adapters below.
+- With `MIN_MAG_POINT_MIP_LINEAR`, nine clamps from 1 to 3.75 match the exact
+  mip blend within 1/128. The translated and control bits must be identical
+  on each adapter.
+- Clamp 1 checked against mip 2, and clamp 1.25 checked against the 1.5 blend,
+  must fail at pixel (0, 0).
+
+The `^spirv_minlod_` command above also runs these tests. All MinLod draws
+check for Shader Model 6.6 before creating the pipeline and skip (77) without
+it, as on the Windows 10 in-box runtime. Results on Windows 10
+build 19045 with the Agility SDK 1.620.2, DXC 1.9.2609 and the debug layer on:
+
+| Clamp | Exact green, blue | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 |
+|---|---|---|---|
+| 1.25 | 0.75, 0.25 | exact | 0.7499962, 0.2500038 |
+| 1.3 | 0.7, 0.3 | 0.6992188, 0.3007813 | 0.7031205, 0.2968795 |
+| 1.001953125 | 0.9980469, 0.0019531 | 1, 0 | 1, 0 |
+
+Both adapters quantize the blend weight to 1/256. At 1.3, WARP rounds the
+weight to 77/256 and the RTX truncates it to 76/256. The RTX values also
+differ from those steps by up to 7.6e-6. In this fixture the translated and
+control results were identical on each adapter, so the measured differences
+come from the adapter's mip filtering. The 1/128 tolerance was chosen from these
+measurements, not from a specified precision. Whether this explains the
+archive differences is not established. [Issue](https://github.com/R0Y00/Xbox2Windows/issues/809)
+
 ## Independent bit and byte alignment readback
 
 The `pixel_aot_align_warp` and `pixel_aot_align_hardware` fixtures run dedicated

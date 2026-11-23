@@ -31,7 +31,7 @@ def main(assembler, validator, cross, dxc, renderer, adapter):
                     return 77
                 translated.check_returncode()
             subprocess.run([dxc, "-T", "ps_6_6", "-E", "main", "-Fo", dxil, hlsl], check=True)
-            draw = subprocess.run([renderer, adapter, "--check-pixel-quad-lod", dxil],
+            draw = subprocess.run([renderer, adapter, "--spirv-minlod-quad-lod", dxil],
                                   capture_output=True, text=True)
             print(f"{name}\n{draw.stdout}{draw.stderr}", flush=True)
             if draw.returncode == 77:

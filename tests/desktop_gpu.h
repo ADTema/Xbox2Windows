@@ -48,6 +48,8 @@ void check_attribute_pixel(ID3D12Device* device, const char* shader, const char*
 void check_compute_to_pixel(ID3D12Device* device, const char* compute, const char* pixel,
                             const char* reference, const char* previous);
 void check_pixel_quad_lod(ID3D12Device* device, const char* shader);
+void check_pixel_mip_clamp(ID3D12Device* device, const char* shader, unsigned expectedLevel);
+void check_pixel_mip_blend(ID3D12Device* device, const char* shader, float clamp, float tolerance);
 void check_pixel_compare(ID3D12Device* device, const char* shader, const char* reference);
 bool check_mesh_shadow_draw(ID3D12Device*, const char* mesh, const char* receiver, const char* caster,
                             const char* fixture, bool stale, std::vector<unsigned char>* frames = nullptr);
