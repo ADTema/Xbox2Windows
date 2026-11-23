@@ -191,7 +191,7 @@ def check_discarded_read(native_path: Path, lifted_path: Path) -> None:
                 )
 
 
-def check_vmaskmovdqu_page_edge(native_path: Path, lifted_path: Path):
+def check_vmaskmovdqu_page_edge(native_path: Path, lifted_path: Path) -> tuple[int, int]:
     """Compare native/lifted on page-abutting writable vectors (k=16) and observe native k<16 page-edge faults."""
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.VirtualAlloc.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
@@ -257,15 +257,24 @@ def check_vmaskmovdqu_page_edge(native_path: Path, lifted_path: Path):
                 for mask_name, mask_bytes in masks:
                     buf_mask, ptr_mask, _, _, _ = alloc_aligned_buffer(mask_bytes)
                     ctypes.memset(base + 4096 - 32, 0x5A, 32)
+                    faulted = False
                     try:
                         native_fns["op_vmaskmovdqu"](ptr_src, ptr_mask, ptr_dst)
                     except OSError as error:
                         assert "access violation" in str(error).lower(), (guard_prot, k, mask_name, error)
-                    else:
-                        raise AssertionError(
-                            f"native unexpectedly succeeded across non-writable page edge "
-                            f"(prot={guard_prot:#x}, k={k}, mask={mask_name})"
+                        faulted = True
+                    selects_guard = any(byte & 0x80 for byte in mask_bytes[k:16])
+                    assert faulted or not selects_guard, (guard_prot, k, mask_name)
+                    after = bytes((ctypes.c_ubyte * k).from_address(ptr_dst))
+                    expected = ref_vmaskmovdqu(src_bytes[:16], mask_bytes[:16], b"\x5A" * 16)[:k]
+                    if faulted:
+                        assert all(actual in (0x5A, wanted) for actual, wanted in zip(after, expected)), (
+                            guard_prot, k, mask_name, after.hex(), expected.hex()
                         )
+                    else:
+                        assert after == expected, (guard_prot, k, mask_name, after.hex(), expected.hex())
+                    print(f"native page edge prot={guard_prot:#x} k={k} {mask_name}: "
+                          f"faulted={int(faulted)}, prefix={after.hex()}")
                     native_obs_cases += 1
                     _ = buf_mask
         finally:
@@ -326,7 +335,7 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
 
     print(
         f"{total} native/lifted/reference AVX move cases across {len(EXPORTS)} exports matched bit-for-bit; "
-        f"{abutting_cases} k=16 page-abutting checks and {native_obs_cases} native k<16 page-edge fault observations passed; "
+        f"{abutting_cases} k=16 page-abutting checks and {native_obs_cases} native k<16 page-edge observations; "
         f"ALTER_OP diverged on {diverged}; dead-read and output mutation controls passed"
     )
 

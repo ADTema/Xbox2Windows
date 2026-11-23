@@ -6132,7 +6132,8 @@ exports bit-for-bit against both the native MASM DLL and an independent Python r
 model with 32-byte pre/post buffer guards across `dev` and `release` (`/O2`) builds,
 plus 12 native/lifted `k=16` page-abutting writable checks (full, zero, and sparse masks
 against `PAGE_NOACCESS` and `PAGE_READONLY` guard pages), 30 native-only `k<16` page-edge
-fault observations, dead-read fault ordering (`op_discarded_read`, `op_discarded_read64`), 3 `ALTER_OP`
+observations with fault status and writable prefix logged, dead-read fault ordering
+(`op_discarded_read`, `op_discarded_read64`), 3 `ALTER_OP`
 divergence controls (`14`, `12`, `30`), an output-mutation comparator control, 8
 alternate-encoding lift checks, 38 unit rejection controls (including the `RDI`-save
 definedness leak control), and 9 end-to-end PE-patched DLL rejection controls.
