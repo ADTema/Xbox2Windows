@@ -11203,7 +11203,7 @@ def check_controls(directory):
         assert sym in extra_hlsl, sym
     dotc_prog = with_constants(DPP_DOTC_BODY)
     dotc_hlsl = translate(dotc_prog)
-    for sym in ("dpp_dot4c_i32_i8(", "0x7fff7fffu", "0x80008000u",
+    for sym in ("dpp_dot4c_i32_i8(",
                 "QuadReadAcrossX(", "QuadReadAcrossY(", "QuadReadAcrossDiagonal(",
                 "QuadReadLaneAt(", "WaveGetLaneIndex() & 3u"):
         assert sym in dotc_hlsl, sym
@@ -11213,7 +11213,6 @@ def check_controls(directory):
         "v_add_co_ci_u32_dpp v12, vcc, v12, v13, vcc quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
     ]))
     # Plain VOP2 e32 dot-accumulate forms (accepting both _e32 and bare mnemonic spellings).
-    assert translate(with_constants(["v_dot2c_f32_f16_e32 v12, 0.5, v13"])) == translate(with_constants(["v_dot2c_f32_f16 v12, 0.5, v13"]))
     assert translate(with_constants(["v_dot4c_i32_i8_e32 v12, -1, v13"])) == translate(with_constants(["v_dot4c_i32_i8 v12, -1, v13"]))
     # Negative controls with pinned ValueError diagnostics.
     for bad, message in (
@@ -11225,7 +11224,6 @@ def check_controls(directory):
         ("v_rndne_f32_dpp v12, v12 dpp8:[1,0,3,2,5,4,7,6] fi:1", "Unsupported DPP8 modifier"),
         ("v_rndne_f32_dpp v12, -v12 dpp8:[1,0,3,2,5,4,7,6]", "Source modifiers are not allowed"),
         ("v_mac_f32_dpp v12, |v12|, v13 dpp8:[1,0,3,2,5,4,7,6]", "Source modifiers are not allowed"),
-        ("v_dot2c_f32_f16_dpp v12, -v12, v13 dpp8:[1,0,3,2,5,4,7,6]", "Source modifiers are not allowed"),
         ("v_dot4c_i32_i8_dpp v12, -v12, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "Source modifiers are not allowed"),
         ("v_dot4c_i32_i8_dpp v12, |v12|, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "Source modifiers are not allowed"),
         ("v_rndne_f32_dpp v12, v12 dpp8:[4,5,6,7,0,1,2,3]", "Cross-quad DPP8 permutation"),
@@ -11237,20 +11235,19 @@ def check_controls(directory):
         ("v_rndne_f32_dpp v12, s44 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "DPP operand must be a VGPR"),
         ("v_rndne_f32_dpp v12, 1.0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "DPP operand must be a VGPR"),
         ("v_mac_f32_dpp v30, v12, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "DPP operand v30 is read before it is written"),
-        ("v_dot2c_f32_f16_dpp v30, v12, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "DPP operand v30 is read before it is written"),
+        ("v_dot2c_f32_f16_dpp v12, v12, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "Unsupported instruction"),
+        ("v_dot2c_f32_f16_dpp v12, v12, v13 dpp8:[1,0,3,2,5,4,7,6]", "Unsupported instruction"),
+        ("v_dot2c_f32_f16_e32 v12, v12, v13", "Unsupported instruction"),
         ("v_dot4c_i32_i8_dpp v30, v12, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "DPP operand v30 is read before it is written"),
         ("v_dot2c_f32_f16_e64 v12, v12, v13", "Unsupported instruction"),
         ("v_dot4c_i32_i8_e64 v12, v12, v13", "Unsupported instruction"),
-        ("v_dot2c_f32_f16_e32 v12, v12, v13 clamp", "Unsupported modifier on v_dot2c_f32_f16"),
         ("v_dot4c_i32_i8_e32 v12, v12, v13 clamp", "Unsupported modifier on v_dot4c_i32_i8"),
-        ("v_dot2c_f32_f16_e32 v12, -v12, v13", "Source modifiers are not allowed on v_dot2c_f32_f16 e32"),
-        ("v_dot2c_f32_f16_e32 v12, v12, |v13|", "v_dot2c_f32_f16 e32 src1 must be a VGPR"),
-        ("v_dot2c_f32_f16_e32 v12, v12, s44", "v_dot2c_f32_f16 e32 src1 must be a VGPR"),
-        ("v_dot2c_f32_f16_e32 v30, v12, v13", "DPP operand v30 is read before it is written"),
         ("v_dot4c_i32_i8_e32 v12, -v12, v13", "Source modifiers are not allowed on v_dot4c_i32_i8 e32"),
         ("v_dot4c_i32_i8_e32 v12, 0.5, v13", "Unsupported dot-product operand"),
         ("v_dot4c_i32_i8_e32 v12, v12, 1", "v_dot4c_i32_i8 e32 src1 must be a VGPR"),
         ("v_dot4c_i32_i8_e32 v30, v12, v13", "DPP operand v30 is read before it is written"),
+        ("v_dot4c_i32_i8_e32 v12, s99, v13", "Expected a numeric register"),
+        ("v_dot4c_i32_i8_e32 v12, v13, v30", "Expected a numeric register"),
         ("v_add_co_ci_u32_dpp v12, vcc_lo, v12, v13, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "Carry mask is not a tracked condition"),
         ("v_sub_co_ci_u32_dpp v12, vcc_lo, v12, v13, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "Carry mask is not a tracked condition"),
         ("v_subrev_co_ci_u32_dpp v12, vcc_lo, v12, v13, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "Carry mask is not a tracked condition"),
@@ -11268,7 +11265,7 @@ def check_controls(directory):
     wqm_at = base_dpp.index("s_wqm_b64 exec, exec") + 1
     expect_value_error(translate, base_dpp[:wqm_at] + ["v_rndne_f32_dpp v20, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + base_dpp[wqm_at:],
                        "Invalid DPP operation outside entry mask")
-    expect_value_error(translate, base_dpp[:wqm_at] + ["v_dot2c_f32_f16_e32 v8, v8, v9"] + base_dpp[wqm_at:],
+    expect_value_error(translate, base_dpp[:wqm_at] + ["v_dot4c_i32_i8_e32 v8, v8, v9"] + base_dpp[wqm_at:],
                        "Invalid dot-accumulate operation")
     wait_at = base_dpp.index("s_waitcnt vmcnt(0)")
     expect_value_error(translate, base_dpp[:wait_at] + ["v_rndne_f32_dpp v20, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + base_dpp[wait_at:],
@@ -14585,11 +14582,10 @@ def check_dpp_extra_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutation of {label} escaped detection")
 
 
-# Quad-local DPP16/DPP8 and plain VOP2 e32 dot-accumulate fixture (gfx1030):
-# v_dot2c_f32_f16_{dpp,e32} & v_dot4c_i32_i8_{dpp,e32}.
+# Quad-local DPP16/DPP8 and plain VOP2 e32 integer dot-accumulate fixture (gfx1030).
 DPP_DOTC_SETS = (
-    (0x40003c00, 0xbc004200, 0xfc03fe05, 0x06fd04ff),
-    (0x4400b800, 0x3800c000, 0x02f907fc, 0xfb05fa03),
+    (0xfc03fe05, 0x06fd04ff),
+    (0x02f907fc, 0xfb05fa03),
 )
 DPP_DOTC_BODY = [
     # Derive qx (v22) and qy (v23) via bit-exact v_add_co_ci_u32_dpp copies of uv.x/uv.y.
@@ -14609,37 +14605,18 @@ DPP_DOTC_BODY = [
     "v_floor_f32_e32 v24, v24",
     "v_sub_f32_e32 v23, v23, v24",
     "v_sub_f32_e32 v23, v23, v24",
-    # Populate 4 distinct packed f16x2 lanes in v25 and 4 distinct packed i8x4 lanes in v26.
+    # Populate four distinct packed i8x4 lanes in v26.
     "v_cmp_lt_f32_e32 vcc_lo, 0.5, v22",
-    "v_mov_b32_e32 v25, s45",
-    "v_cndmask_b32_e32 v25, s44, v25, vcc_lo",
-    "v_mov_b32_e32 v27, 0xc0003800",
-    "v_cndmask_b32_e32 v27, 0x42003c00, v27, vcc_lo",
     "v_mov_b32_e32 v26, s47",
     "v_cndmask_b32_e32 v26, s46, v26, vcc_lo",
     "v_mov_b32_e32 v31, 0x04fd02ff",
     "v_cndmask_b32_e32 v31, 0xfe03fc05, v31, vcc_lo",
     "v_cmp_lt_f32_e32 vcc_lo, 0.5, v23",
-    "v_cndmask_b32_e32 v25, v25, v27, vcc_lo",
     "v_cndmask_b32_e32 v26, v26, v31, vcc_lo",
-    # Right-hand operands: v27 = f16x2(2.0, -0.5), v31 = i8x4(+3, -2, +4, -5).
-    "v_mov_b32_e32 v27, 0xb8004000",
+    # Right-hand operand: i8x4(+3, -2, +4, -5).
     "v_mov_b32_e32 v31, 0xfb04fe03",
-    # Channel R (v12): v_dot2c_f32_f16_dpp (DPP16 AcrossX with -src0/|src1|, AcrossY) + plain e32 (SGPR).
-    "v_cmp_f_f32_e32 vcc_lo, v12, v12",
-    "v_mov_b32_e32 v24, 0",
-    "v_mov_b32_e32 v28, 0x41200000",
-    "v_dot2c_f32_f16_dpp v28, -v25, |v27| quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
-    "v_dot2c_f32_f16_dpp v28, v25, v27 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
-    "v_dot2c_f32_f16_e32 v28, s44, v27",
-    "v_add_co_ci_u32_dpp v12, vcc_lo, v28, v24, vcc_lo quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
-    # Channel G (v13): v_dot2c_f32_f16_dpp (DPP8 cyclic + diagonal) + plain e32 (literal + VGPR).
-    "v_mov_b32_e32 v29, 4.0",
-    "v_dot2c_f32_f16_dpp v29, v25, v27 dpp8:[1,2,3,0,5,6,7,4]",
-    "v_dot2c_f32_f16_dpp v29, v25, v27 dpp8:[3,2,1,0,7,6,5,4]",
-    "v_dot2c_f32_f16_e32 v29, 0x3c003800, v27",
-    "v_dot2c_f32_f16_e32 v29, v25, v27",
-    "v_add_co_ci_u32_dpp v13, vcc_lo, v29, v24, vcc_lo dpp8:[0,0,0,0,4,4,4,4]",
+    "v_mov_b32_e32 v12, 0",
+    "v_mov_b32_e32 v13, 0",
     # Channel B (v14): v_dot4c_i32_i8_dpp (DPP16 AcrossX + AcrossY) + plain e32 (SGPR), biased at 512.
     "v_mov_b32_e32 v30, 0x200",
     "v_dot4c_i32_i8_dpp v30, v26, v31 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
@@ -14660,28 +14637,18 @@ DPP_DOTC_BODY = [
 ]
 
 
-def dpp_dotc_reference(w0, w1, w2, w3):
+def dpp_dotc_reference(w2, w3):
     """Independent 4-lane quad reference for DPP_DOTC_BODY."""
-    def unpack_f16x2(word):
-        return struct.unpack("<2e", struct.pack("<I", word))
-
     def unpack_i8x4(word):
         return struct.unpack("<4b", struct.pack("<I", word))
 
-    f_lanes = [unpack_f16x2(w) for w in (w0, w1, 0x42003c00, 0xc0003800)]
     i_lanes = [unpack_i8x4(w) for w in (w2, w3, 0xfe03fc05, 0x04fd02ff)]
-    f_rhs = unpack_f16x2(0xb8004000)
     i_rhs = unpack_i8x4(0xfb04fe03)
-    dot2 = lambda a, b: a[0] * b[0] + a[1] * b[1]
     dot4 = lambda a, b: sum(x * y for x, y in zip(a, b))
-    r = (10.0 + dot2((-f_lanes[1][0], -f_lanes[1][1]), (abs(f_rhs[0]), abs(f_rhs[1])))
-         + dot2(f_lanes[2], f_rhs) + dot2(f_lanes[0], f_rhs))
-    g = (4.0 + dot2(f_lanes[1], f_rhs) + dot2(f_lanes[3], f_rhs)
-         + dot2(unpack_f16x2(0x3c003800), f_rhs) + dot2(f_lanes[0], f_rhs))
     b = float((512 + dot4(i_lanes[1], i_rhs) + dot4(i_lanes[2], i_rhs) + dot4(i_lanes[0], i_rhs)) & 0x3ff)
     a = float((512 + dot4(i_lanes[1], i_rhs) + dot4(i_lanes[3], i_rhs)
                + dot4(unpack_i8x4(0x0102fffe), i_rhs) + dot4(i_lanes[0], i_rhs)) & 0x3ff)
-    expected = (r, g, b, a)
+    expected = (0.0, 0.0, b, a)
     for x in expected:
         assert single(x) == x == half_rtz(x), x
     return expected
@@ -14697,20 +14664,17 @@ def check_dpp_dotc_draw(directory, compiler, renderer, backend):
     compile_shader(compiler, source, shader)
     for words in DPP_DOTC_SETS:
         constants = bytearray(256)
-        struct.pack_into("<4I", constants, 12, *words)
+        struct.pack_into("<2I", constants, 20, *words)  # s46:s47
         expected = dpp_dotc_reference(*words)
         case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
         subprocess.run(draw, check=True)
     # Mutations checked against Set 1.
     constants = bytearray(256)
-    struct.pack_into("<4I", constants, 12, *DPP_DOTC_SETS[0])
+    struct.pack_into("<2I", constants, 20, *DPP_DOTC_SETS[0])  # s46:s47
     case.write_bytes(constants + struct.pack("<4f", *dpp_dotc_reference(*DPP_DOTC_SETS[0])) * 64)
     for old, new, label in (
-        ("v_dot2c_f32_f16_dpp v28, -v25, |v27|", "v_dot2c_f32_f16_dpp v28, v25, |v27|", "DPP16 neg on dot2c"),
-        ("v_dot2c_f32_f16_dpp v28, -v25, |v27|", "v_dot2c_f32_f16_dpp v28, -v25, v27", "DPP16 abs on dot2c"),
-        ("v_dot2c_f32_f16_dpp v29, v25, v27 dpp8:[1,2,3,0,5,6,7,4]", "v_dot2c_f32_f16_dpp v29, v25, v27 dpp8:[2,3,0,1,6,7,4,5]", "dot2c dpp8 rotation"),
+        ("v_dot4c_i32_i8_dpp v32, v26, v31 dpp8:[1,2,3,0,5,6,7,4]", "v_dot4c_i32_i8_dpp v32, v26, v31 dpp8:[2,3,0,1,6,7,4,5]", "dot4c dpp8 rotation"),
         ("v_dot4c_i32_i8_dpp v30, v26, v31 quad_perm:[1,0,3,2]", "v_dot4c_i32_i8_dpp v30, v26, v31 quad_perm:[2,3,0,1]", "dot4c AcrossX vs AcrossY"),
-        ("v_dot2c_f32_f16_e32 v28, s44, v27", "v_dot2c_f32_f16_e32 v28, s45, v27", "v_dot2c_f32_f16_e32 SGPR src0"),
         ("v_dot4c_i32_i8_e32 v30, s46, v31", "v_dot4c_i32_i8_e32 v30, s47, v31", "v_dot4c_i32_i8_e32 SGPR src0"),
     ):
         mutated = [line.replace(old, new) for line in program]

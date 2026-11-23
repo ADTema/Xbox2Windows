@@ -1145,7 +1145,6 @@ DPP_EXTRA = {
     "v_add_co_ci_u32_dpp": ("co_ci", False, None),
     "v_sub_co_ci_u32_dpp": ("co_ci", False, None),
     "v_subrev_co_ci_u32_dpp": ("co_ci", False, None),
-    "v_dot2c_f32_f16_dpp": ("dot2c_f16", True, None),
     "v_dot4c_i32_i8_dpp": ("dot4c_i8", False, "dpp_dot4c_i32_i8"),
 }
 
@@ -1962,7 +1961,7 @@ def dot_word(token, scalar, vector, pending, sample_dest, *, allow_f16=False):
             raise ValueError(f"Register out of range: {token}")
         if token in pending:
             raise ValueError("Constant read before load completion")
-        value = (vector if m.group(1) == "v" else scalar)[token]
+        value = (vector if m.group(1) == "v" else scalar).get(token)
         if isinstance(value, int):
             return f"{value}u"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
@@ -3957,26 +3956,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     if neg1:
                         b = f"(-{b})"
                     expr = f"mad32({a}, {b}, {acc_val})"
-                elif kind == "dot2c_f16":
-                    u0 = s0_bits
-                    if abs0:
-                        u0 = f"({u0} & 0x7fff7fffu)"
-                    if neg0:
-                        u0 = f"({u0} ^ 0x80008000u)"
-                    u1 = f"asuint({s1_val})"
-                    if abs1:
-                        u1 = f"({u1} & 0x7fff7fffu)"
-                    if neg1:
-                        u1 = f"({u1} ^ 0x80008000u)"
-                    lines.append(f"    uint dpp_a{i} = {u0};")
-                    lines.append(f"    uint dpp_b{i} = {u1};")
-                    expr = f"mad(widen16(dpp_a{i} >> 16), widen16(dpp_b{i} >> 16), mad(widen16(dpp_a{i}), widen16(dpp_b{i}), {acc_val}))"
                 else:
                     helpers.add(helper_name)
                     expr = f"asfloat({helper_name}({s0_bits}, asuint({s1_val}), asuint({acc_val})))"
                 vector[dst] = f"alu{i}"
                 lines.append(f"    precise float alu{i} = {expr};")
-        elif m := match(r"(v_dot2c_f32_f16|v_dot4c_i32_i8)(?:_e32)? (.+)"):
+        elif m := match(r"(v_dot4c_i32_i8)(?:_e32)? (.+)"):
             op, rest = m.groups()
             parts_ = rest.split(", ")
             if len(parts_) != 3:
@@ -3995,16 +3980,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if re.fullmatch(r"-?(?:abs\([^)]+\)|\|[^|]+\|)|-[vs]\d+", src0):
                 raise ValueError(f"Source modifiers are not allowed on {op} e32: {src0}")
             acc_val, _, _ = dpp_vgpr(dst, vector, sample_dest, allow_mods=False)
-            is_f16 = op == "v_dot2c_f32_f16"
-            u0 = dot_word(src0, scalar, vector, pending, sample_dest, allow_f16=is_f16)
-            u1 = dot_word(src1, scalar, vector, pending, sample_dest, allow_f16=False)
-            if is_f16:
-                lines.append(f"    uint dotc{i}_a = {u0};")
-                lines.append(f"    uint dotc{i}_b = {u1};")
-                expr = f"mad(widen16(dotc{i}_a >> 16), widen16(dotc{i}_b >> 16), mad(widen16(dotc{i}_a), widen16(dotc{i}_b), {acc_val}))"
-            else:
-                helpers.add("dpp_dot4c_i32_i8")
-                expr = f"asfloat(dpp_dot4c_i32_i8({u0}, {u1}, asuint({acc_val})))"
+            u0 = dot_word(src0, scalar, vector, pending, sample_dest)
+            u1 = dot_word(src1, scalar, vector, pending, sample_dest)
+            helpers.add("dpp_dot4c_i32_i8")
+            expr = f"asfloat(dpp_dot4c_i32_i8({u0}, {u1}, asuint({acc_val})))"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expr};")
         elif m := match(r"ds_swizzle_b32 (v\d+), (v\d+) offset:swizzle\(QUAD_PERM,([0-3](?:,[0-3]){3})\)"):
