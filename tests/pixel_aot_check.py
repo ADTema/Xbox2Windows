@@ -5532,6 +5532,90 @@ def check_nc_integer_lowering():
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
 
 
+def sopk_wait_program():
+    """The sampled program with every wait spelled as a gfx10 SOPK wait, plus a store-counter wait."""
+    spelled = {"s_waitcnt lgkmcnt(0)": "s_waitcnt_lgkmcnt null, 0x0", "s_waitcnt vmcnt(0)": "s_waitcnt_vmcnt null, 0x0"}
+    program = [spelled.get(line, line) for line in assembly(False)]
+    program.insert(program.index("s_waitcnt_vmcnt null, 0x0") + 1, "s_waitcnt_vscnt null, 0x0")
+    return program
+
+
+def check_sopk_waitcnt(program):
+    """The gfx10 SOPK wait forms with null act like the s_waitcnt tokens; vscnt is a no-op."""
+    def same(function, old, token_line, new, source):
+        """The new spelling must give the same HLSL as the token form, or be rejected as it is."""
+        token = [token_line if line == old else line for line in source]
+        sopk = [new if line == old else line for line in source]
+        try:
+            expected = function(token)
+        except ValueError:
+            must_reject(function, sopk)
+            return None
+        assert function(sopk) == expected
+        return expected
+
+    for count in ("0", "1", "2", "63"):
+        for spelling in (f"s_waitcnt_vmcnt null, 0x{int(count):x}", f"s_waitcnt_vmcnt null, {count}"):
+            same(translate, "s_waitcnt vmcnt(0)", f"s_waitcnt vmcnt({count})", spelling, program)
+        for spelling in (f"s_waitcnt_lgkmcnt null, 0x{int(count):x}", f"s_waitcnt_lgkmcnt null, {count}"):
+            same(translate, "s_waitcnt lgkmcnt(0)", f"s_waitcnt lgkmcnt({count})", spelling, program)
+    # Full drain gives the baseline output; a partial count leaves the sample or the descriptor load
+    # outstanding, so the single-sample program refuses it (the dependent use is not covered).
+    base = translate(program)
+    assert same(translate, "s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(0)", "s_waitcnt_vmcnt null, 0x0", program) == base
+    assert same(translate, "s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(0)", "s_waitcnt_lgkmcnt null, 0x0", program) == base
+    must_reject(translate, [("s_waitcnt_vmcnt null, 0x1" if line == "s_waitcnt vmcnt(0)" else line) for line in program])
+    must_reject(translate, [("s_waitcnt_lgkmcnt null, 0x1" if line == "s_waitcnt lgkmcnt(0)" else line) for line in program])
+    # Partial counts with two outstanding samples behave like vmcnt(1).
+    partial = dual_program("partial")
+    wait = partial.index("s_waitcnt vmcnt(1)")
+    legal = same(translate_dual, "s_waitcnt vmcnt(1)", "s_waitcnt vmcnt(1)", "s_waitcnt_vmcnt null, 0x1", partial)
+    assert legal is not None and legal == translate_dual(partial)
+    for early_use in ("v_mov_b32_e32 v24, v20", "v_mov_b32_e32 v20, v12", "v_mov_b32_e32 v20, 0"):
+        changed = partial.copy()
+        changed[wait] = "s_waitcnt_vmcnt null, 0x1"
+        changed.insert(wait + 1, early_use)
+        must_reject(translate_dual, changed)
+    for count in ("0x2", "0x3f"):
+        changed = partial.copy()
+        changed[wait] = f"s_waitcnt_vmcnt null, {count}"
+        must_reject(translate_dual, changed)
+    # A later, larger wait after draining does not invalidate completed samples.
+    end_wait = partial.index("s_waitcnt vmcnt(0)")
+    translate_dual(partial[:end_wait + 1] + ["s_waitcnt_vmcnt null, 0x3f"] + partial[end_wait + 1:])
+    # vscnt: nothing is outstanding on the store counter, so it is accepted anywhere before the export
+    # and changes nothing.
+    export = next(i for i, line in enumerate(program) if line.startswith("exp "))
+    # HLSL temporaries are named after the index of the instruction defining them, so an insertion
+    # shifts later names; renumber by first appearance before comparing. After the last definition
+    # the output must be byte-identical.
+    def renumbered(source):
+        names = {}
+        return re.sub(r"\b(sample|alu)\d+\b", lambda m: names.setdefault(m[0], f"{m[1]}#{len(names)}"), source)
+
+    for form in ("s_waitcnt_vscnt null, 0x0", "s_waitcnt_vscnt null, 0", "s_waitcnt_vscnt null, 0x3f"):
+        for at in range(export + 1):
+            assert renumbered(translate(program[:at] + [form] + program[at:])) == renumbered(base), (form, at)
+        assert translate(program[:export] + [form] + program[export:]) == base, form
+    must_reject(translate, program + ["s_waitcnt_vscnt null, 0x0"])
+    assert translate(sopk_wait_program()) == base
+    # Refusals, with exact messages.
+    for counter, label in (("vmcnt", "VM"), ("lgkmcnt", "LGKM"), ("vscnt", "VS")):
+        for operand in ("s5", "s0", "vcc_lo", "m0", "0"):
+            expect_value_error(translate, [f"s_waitcnt_{counter} {operand}, 0x1"] + program,
+                               f"Unsupported s_waitcnt_{counter} SGPR operand (only null is modelled): "
+                               f"s_waitcnt_{counter} {operand}, 0x1")
+        for count in ("0x40", "64", "0xffff"):
+            expect_value_error(translate, [f"s_waitcnt_{counter} null, {count}"] + program,
+                               f"{label} wait count exceeds the gfx10 six-bit field")
+        for bad in (f"s_waitcnt_{counter}", f"s_waitcnt_{counter} null", f"s_waitcnt_{counter} null,",
+                    f"s_waitcnt_{counter} 0x1", f"s_waitcnt_{counter} null, null", f"s_waitcnt_{counter} null, -1",
+                    f"s_waitcnt_{counter} null, 05", f"s_waitcnt_{counter} null, 0x1, 0x2"):
+            expect_value_error(translate, [bad] + program, f"Malformed s_waitcnt_{counter} operands: {bad}")
+    # The neighbouring SOPK wait spelling stays unsupported.
+    must_reject(translate, ["s_waitcnt_depctr 0x0"] + program)
+
+
 def check_controls(directory):
     # A syntactically valid DPP VGPR must already have a tracked numeric value.
     must_reject(translate, with_constants([
@@ -6115,6 +6199,7 @@ def check_controls(directory):
     must_reject(translate, ["s_waitcnt_expcnt invalid"] + program)
     must_reject(translate, ["s_waitcnt_expcnt null, invalid"] + program)
     must_reject(translate, ["s_waitcnt expcnt(8)"] + program)
+    check_sopk_waitcnt(program)
 
     wait = program.index("s_waitcnt vmcnt(0)")
     overwrite = "v_floor_f32_e32 v13, 1.0"
@@ -6718,6 +6803,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((with_constants(body), translate) for body in (SDWA_PRESERVE_BODY, SDWA_PAD_BODY))
     exp_sync_program = ["s_waitcnt_expcnt null, 0"] + assembly(False)[:-1] + ["s_waitcnt_expcnt null, 0", "s_endpgm"]
     fixtures.append((exp_sync_program, translate))
+    fixtures.append((sopk_wait_program(), translate))
     fixtures.append((with_constants(DOT_BODY), translate, "gfx1030"))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000)), translate))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True)), translate))

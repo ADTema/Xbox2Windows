@@ -425,6 +425,23 @@ def check_plain_bitscan_forms():
     pixel.ACCEPTED.clear()
 
 
+def check_sopk_wait_forms():
+    """The SOPK wait forms count once a program using them lowers; a refused SGPR operand records nothing."""
+    import pixel_aot_check as pixel
+    forms = {("SOPK", "s_waitcnt_vmcnt"), ("SOPK", "s_waitcnt_lgkmcnt"), ("SOPK", "s_waitcnt_vscnt")}
+    program = pixel.sopk_wait_program()
+    pixel.ACCEPTED.clear()
+    pixel.must_reject(pixel.translate, [line.replace("null", "s5") for line in program])
+    assert not pixel.ACCEPTED
+    pixel.translate(program)
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert forms <= reference and ("SOPP", "s_waitcnt_depctr") in reference, name
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert forms <= covered, (name, forms - covered)
+        assert ("SOPP", "s_waitcnt_depctr") not in covered and ("SOPK", "s_waitcnt_expcnt") not in covered, name
+
+
 def check_parsing():
     with tempfile.TemporaryDirectory() as tmp:
         junit = Path(tmp) / "results.xml"
@@ -702,6 +719,7 @@ if __name__ == "__main__":
     check_shader_records()
     check_scalar_brev()
     check_plain_bitscan_forms()
+    check_sopk_wait_forms()
     check_parsing()
     check_gaps()
     check_dashboard()
