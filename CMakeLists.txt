@@ -519,6 +519,10 @@ endif()
 if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")
+    # Compile-only: outcome classification and GVN pass shares, no wall-time threshold (#775).
+    add_test(NAME dxc_compile_time_gvn COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/dxc_compile_time_check.py" "${DXC_EXECUTABLE}")
+    set_tests_properties(dxc_compile_time_gvn PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     # tools/setup-spirv-tools.ps1 builds the pinned tools into out/tools/spirv/bin.
     set(spirv_tool_hints "${CMAKE_SOURCE_DIR}/out/tools/spirv/bin" "$ENV{VULKAN_SDK}/Bin")
     find_program(SPIRV_WINDOW_AS spirv-as HINTS ${spirv_tool_hints})

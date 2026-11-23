@@ -4773,6 +4773,113 @@ entered `loop-rotate`. That trace locates the observed stall under instrumentati
 Uninstrumented pass-time totals and attribution across the replay cohort remain open.
 The GPU check above covers the public fixture's four control words. [Archive trace](https://github.com/R0Y00/Xbox2Windows/issues/775)
 
+#### Minimal pair: conditional UAV stores without sampling
+
+Reducing `samplebranch_N` one element at a time showed that neither the sampler views
+nor the sample operations are needed for the GVN cost. Removing the samples, the else
+arm, the static `gl_WorkGroupID` reads or the shared condition operand left the
+superlinear growth in place, and so did wrapping the regions in a loop or a
+`for (;;) switch` state machine (the loop forms are slower again; they are not part of
+the tool). Making the stores unconditional removed it. The tool has two families for
+this pair, and the source of each differs from the other only by the branches:
+
+- `condstore_N`: N stores `if (((gl_WorkGroupID.x + k) & 1u) != 0u) _4.Store(...)`
+  into the raw UAV, with the samplebranch condition and no sampling beyond the two
+  control stores;
+- `stores_N`: the same N stores without their `if`.
+
+Measured on 2026-11-23 with two pinned DXC builds, on a Ryzen 7 3700X (8C/16T, 32 GiB)
+running Windows 10 build 19045, one compile at a time. The first build is DXC
+1.7.2308.16 (`52da17e29`) from Windows SDK 10.0.26100. The second is DXC 1.9.0.5512
+(`01b62ad47`) from LunarG Vulkan SDK 1.4.363.0. The maintainer's
+1.8.2502.11 build was not available on this machine. The flags are the same as the
+baseline above. Every row reports the compiler only. There was no dispatch or PSO
+creation.
+
+```powershell
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants control,stores_1024,stores_4096,stores_16384,condstore_1024,condstore_2048,condstore_4096 --repeat 3 --timeout 90 --out out\dxc-blowup\family.json
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants condstore_8192,condstore_16384 --timeout 90 --out out\dxc-blowup\policy.json
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants condstore_16384 --timeout 900 --out out\dxc-blowup\raised.json
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants condstore_4096,condstore_16384 --extra-arg=-opt-disable --extra-arg=gvn --timeout 300 --out out\dxc-blowup\nogvn.json
+out\pe-env\Scripts\python.exe -B tools\dxc_compile_time.py --dxc <path-to-dxc.exe> --variants stores_4096,condstore_4096 --ftime-report --timeout 300 --out out\dxc-blowup\passes.json
+```
+
+Rows with three repetitions give the median wall time. Every other row is a single run.
+
+| variant | setting | HLSL bytes | 1.7.2308 wall s | 1.7.2308 peak MiB | 1.7.2308 outcome | 1.9.0.5512 wall s | 1.9.0.5512 peak MiB | 1.9.0.5512 outcome |
+|---|---|---:|---:|---:|---|---:|---:|---|
+| control | default | 685 | 0.027 | 13.9 | DXIL | 0.022 | 15.1 | DXIL |
+| stores_1024 | default | 41,645 | 0.170 | 18.9 | DXIL | 0.130 | 20.4 | DXIL |
+| stores_4096 | default | 164,525 | 0.712 | 33.3 | DXIL | 0.583 | 35.2 | DXIL |
+| stores_16384 | default | 663,813 | 2.598 | 90.2 | DXIL | 2.519 | 91.4 | DXIL |
+| condstore_1024 | default | 107,095 | 0.948 | 51.5 | DXIL | 1.278 | 54.2 | DXIL |
+| condstore_2048 | default | 214,615 | 3.259 | 141.2 | DXIL | 5.045 | 145.8 | DXIL |
+| condstore_4096 | default | 429,655 | 12.993 | 480.1 | DXIL | 23.906 | 485.3 | DXIL |
+| condstore_8192 | default, 90 s policy | 859,735 | 68.794 | 1,806.0 | DXIL | 90.093 | 1,807.8 | timeout |
+| condstore_16384 | default, 90 s policy | 1,734,047 | 90.269 | 2,548.6 | timeout | 90.261 | 2,735.4 | timeout |
+| condstore_16384 | default, 900 s limit | 1,734,047 | 382.221 | 6,917.9 | DXIL | 645.364 | 6,918.6 | DXIL |
+| condstore_4096 | `-opt-disable gvn` | 429,655 | 1.394 | 68.5 | DXIL | 1.411 | 72.2 | DXIL |
+| condstore_16384 | `-opt-disable gvn` | 1,734,047 | 7.138 | 221.3 | DXIL | 6.351 | 228.7 | DXIL |
+
+Wall time and peak working set grow about fourfold per doubling of `condstore_N` from
+2048 upwards: 3.5-4.7x in time and 3.4x in memory. `stores_N` grows linearly. The
+policy timeout is reached at 0.86-1.73 MB of HLSL, against 2.9-3.9 MB for
+`samplebranch_N` above. `condstore_16384` peaks at 6.9 GB. In the `-ftime-report`
+diagnostic run of `condstore_4096`, Global Value Numbering takes 93.1 % of the
+reported pass time on 1.7.2308 (12.84 of 13.80 s, one instance) and 95.3 % on
+1.9.0.5512 (19.47 of 20.44 s, two instances). For `stores_4096` the largest pass is
+instruction combining (34.9 % and 47.0 %), and GVN is not among the top two passes.
+DXC's `-opt-disable gvn` toggle compiles `condstore_16384` in 6.4-7.1 s instead of
+382-645 s and keeps peak memory near 225 MiB. This is a separately labelled
+diagnostic setting. Its DXIL has not been checked on a GPU, and it is not proposed as
+a replay flag.
+
+The merged `samplebranch_N` variants were rerun on the same machine with the same two
+builds, as an independent timing of the table above. The default rows are medians of
+three runs under the 90 s policy. The `-opt-disable gvn` rows are single runs on the
+same generated inputs, with a 300 s limit.
+
+| variant | setting | HLSL bytes | 1.7.2308 wall s | 1.7.2308 peak MiB | 1.9.0.5512 wall s | 1.9.0.5512 peak MiB | outcome |
+|---|---|---:|---:|---:|---:|---:|---|
+| control | default | 685 | 0.021 | 14.0 | 0.023 | 15.1 | DXIL |
+| samplebranch_4096 | default | 968,577 | 7.720 | 154.6 | 10.602 | 170.4 | DXIL |
+| samplebranch_8192 | default | 1,946,457 | 25.481 | 290.2 | 25.283 | 322.3 | DXIL |
+| samplebranch_4096 | `-opt-disable gvn` | 968,577 | 6.650 | 137.6 | 5.181 | 142.4 | DXIL |
+| samplebranch_8192 | `-opt-disable gvn` | 1,946,457 | 13.247 | 257.2 | 7.883 | 266.0 | DXIL |
+| samplebranch_16384 | `-opt-disable gvn` | 3,915,833 | 28.021 | 496.5 | 17.951 | 511.4 | DXIL |
+
+Disabling GVN alone brings `samplebranch_16384`, which timed out above, to 18-28 s.
+That is still slower than `-Od` above, so other passes contribute at this size.
+
+`-print-before gvn` (1.9.0.5512 only; 1.7.2308 rejects the option) on `condstore_4`
+shows the shape GVN receives. Each conditional block re-creates the UAV handle with
+`dx.op.createHandleForLib` and `dx.op.annotateHandle` before its `rawBufferStore`,
+and the join blocks between them hold no memory operation. A plausible mechanism is
+that each handle call starts a non-local memory-dependence query that walks back
+through every earlier join block, with the results cached. That would be quadratic in
+time and memory. This mechanism is a hypothesis about DXC internals. The measured
+facts are the GVN share, the `-opt-disable gvn` collapse and the growth rates.
+
+`ctest --preset dev --no-tests=error -R '^dxc_compile_time_gvn$' -V` runs the
+compile-only check (`tests/dxc_compile_time_check.py`) with the configured DXC. It
+uses no wall-time threshold. It checks that the two families differ only by the
+branches and keep the fixture's declarations and control stores. It pins the recorded
+source sizes and checks that the `-ftime-report` parser also reads the three-column
+table that LLVM prints when no pass records system time. It also checks the DXIL
+outcome of control, `condstore_256` and `stores_256`, with two negative controls: a
+forced 1 ms timeout must be recorded as `timeout` and an invalid profile as
+`diagnostic`. Finally it checks the GVN share of the reported pass wall time. That
+share must be at least 50 % for `condstore_1024`, below 25 % for `stores_1024`, and
+absent with `-opt-disable gvn`. On the machine above, the shares were 76.9 % / 5.3 % /
+0 on 1.7.2308 and 87.3 % / 7.7 % / 0 on 1.9.0.5512. A DXC that no longer shows this
+profile makes the check exit 77 (skip), because the compiler has changed rather than
+this repository.
+
+This narrows the source-built cost to conditional UAV stores under default
+optimization. It does not attribute the archive cohort. The archive trace's
+`loop-rotate` stall and Jump Threading profile are different passes, and the 695
+replay timeouts remain unattributed.
+
 ### Mesh shader -Od pipeline creation across adapters
 
 [#810](https://github.com/R0Y00/Xbox2Windows/issues/810) asks whether mesh shader DXIL
