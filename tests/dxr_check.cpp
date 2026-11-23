@@ -121,8 +121,13 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
         };
         if (usesAnotherHitGroup(instances) || (update && usesAnotherHitGroup(update->instances)))
             throw std::runtime_error("The DXR pipeline fixture has only hit group 0");
-        if (std::any_of(rays.begin(), rays.end(), [](const Ray& ray) { return ray.flags != 0; }))
-            throw std::runtime_error("The DXR pipeline fixture requires unflagged rays");
+        if (std::any_of(rays.begin(), rays.end(), [](const Ray& ray) {
+                constexpr UINT cullFlags = D3D12_RAY_FLAG_CULL_FRONT_FACING_TRIANGLES |
+                                           D3D12_RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+                return (ray.flags & ~(report_facing | cullFlags)) != 0 ||
+                       (ray.flags & cullFlags) == cullFlags;
+            }))
+            throw std::runtime_error("The DXR pipeline fixture accepts only facing readback and one face-cull flag");
     }
     std::puts(usePipeline ? "dxr_backend=dispatch_rays" : "dxr_backend=inline_ray_query");
     ComPtr<ID3D12Device5> dxr;
