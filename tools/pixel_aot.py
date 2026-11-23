@@ -2379,12 +2379,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"(image_sample(?:_lz)?) (?:v\[(\d+):(\d+)\]|v(\d+)), v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
+        elif m := match(r"(image_sample(?:_lz|_l|_b)?) (?:v\[(\d+):(\d+)\]|v(\d+)), v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
             op, dst_first, dst_last, dst_single, *rest, dmask_hex = m.groups()
             dmask = int(dmask_hex, 16)
-            lod_zero = op == "image_sample_lz"
-            if lod_zero and dmask != 0xf:
-                raise ValueError("LOD-zero sampling requires dmask:0xf")
+            if op != "image_sample" and dmask != 0xf:
+                raise ValueError(f"{op} requires dmask:0xf")
+            coord_width = 3 if op in ("image_sample_l", "image_sample_b") else 2
             channels = ["xyzw"[bit] for bit in range(4) if (dmask >> bit) & 1]
             if len(channels) == 1:
                 if dst_single is None:
@@ -2395,9 +2395,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError("Multi-channel image_sample requires a VGPR range destination")
                 dest = registers(dst_first, dst_last, len(channels))
             coords, image, state = [registers(*rest[k:k+2], width)
-                                    for k, width in zip((0, 2, 4), (2, 8, 4))]
+                                    for k, width in zip((0, 2, 4), (coord_width, 8, 4))]
             if dest.stop > 256:
                 raise ValueError("Texture sample destination VGPR out of range")
+            if coords.stop > 256:
+                raise ValueError("Texture sample coordinate VGPR out of range")
             if any(f"v{n}" in sample_dest for n in dest):
                 raise ValueError("Write overlaps an outstanding sample")
             descriptor = [scalar.get(f"s{n}") for n in image]
@@ -2409,15 +2411,35 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if sample_kind == "comparison":
                 raise ValueError("Comparison and ordinary sampling in one program")
             sample_kind = "plain"
-            uv = [vector[f"v{n}"] for n in coords]
-            if lod_zero:
-                if second_texture_offset is not None:
-                    raise ValueError("LOD-zero sampling requires a single texture sample")
-                uv = [f"uv.{v[1]}" if isinstance(v, tuple) and v[0] == "entry_uv" else v for v in uv]
-            if any(v not in quad_values for v in uv):
+            if op != "image_sample" and second_texture_offset is not None:
+                raise ValueError(f"{op} requires a single texture binding")
+            coord_regs = [f"v{n}" for n in coords]
+            if any(reg not in vector for reg in coord_regs):
                 raise ValueError("Unsupported texture coordinate")
-            coordinate = f"float2({', '.join(uv)})"
-            call = f"SampleLevel(samp, {coordinate}, 0.0f)" if lod_zero else f"Sample(samp, {coordinate})"
+
+            def sample_coord(reg):
+                value = vector[reg]
+                if isinstance(value, tuple) and value[0] == "entry_uv":
+                    return f"uv.{value[1]}"
+                if value in ("uv.x", "uv.y"):
+                    return value
+                return fp_operand(reg, scalar, vector, pending, sample_dest)
+
+            if op in ("image_sample_lz", "image_sample_l"):
+                u, v = [sample_coord(reg) for reg in coord_regs[:2]]
+                lod = sample_coord(coord_regs[2]) if op == "image_sample_l" else "0.0f"
+                call = f"SampleLevel(samp, float2({u}, {v}), {lod})"
+            else:
+                # RDNA2 places bias before the UV pair. Only UV contributes derivatives.
+                uv = [vector[reg] for reg in coord_regs[-2:]]
+                if any(value not in quad_values for value in uv):
+                    raise ValueError("Unsupported texture coordinate")
+                coordinate = f"float2({', '.join(uv)})"
+                if op == "image_sample_b":
+                    bias = sample_coord(coord_regs[0])
+                    call = f"SampleBias(samp, {coordinate}, {bias})"
+                else:
+                    call = f"Sample(samp, {coordinate})"
             lines.append(f"    float4 sample{i} = {texture}.{call};")
             samples += 1
             vector_loads += 1
