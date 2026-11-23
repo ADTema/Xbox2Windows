@@ -1709,6 +1709,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_bmi2>" "$<TARGET_FILE:cpu_bmi2_lifted>")
     set_tests_properties(cpu_aot_bmi2 PROPERTIES SKIP_RETURN_CODE 77)
 
+    cpu_asm_fixture(cpu_sse2_packed_cvt sse2_packed_cvt)
+    target_sources(cpu_sse2_packed_cvt PRIVATE tests/cpu/sse2_mxcsr_test.asm)
+    set(sse2_packed_cvt_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse2_packed_cvt_lifted.cpp")
+    add_custom_command(OUTPUT "${sse2_packed_cvt_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse2_packed_cvt.py"
+            emit "$<TARGET_FILE:cpu_sse2_packed_cvt>" "${sse2_packed_cvt_fixture}"
+        DEPENDS cpu_sse2_packed_cvt tests/cpu/sse2_packed_cvt.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_sse2_packed_cvt_lifted SHARED "${sse2_packed_cvt_fixture}")
+    add_test(NAME cpu_aot_sse2_packed_cvt COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse2_packed_cvt.py"
+        check "$<TARGET_FILE:cpu_sse2_packed_cvt>" "$<TARGET_FILE:cpu_sse2_packed_cvt_lifted>")
     cpu_asm_fixture(cpu_crypto_sha crypto_sha)
     set(crypto_sha_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_crypto_sha_lifted.cpp")
     add_custom_command(OUTPUT "${crypto_sha_fixture}"
