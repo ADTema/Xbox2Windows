@@ -21,12 +21,12 @@ XCL can show that a title requests a service, a GPU object or a shader form. Tha
 
 ## Licence boundary
 
-XCL is **GPL-2.0-only**; Xbox2Windows is **MIT**. A combined distributed work cannot satisfy both licences. GPL-2.0-only code is also incompatible with the GPL-3.0 projects around this workspace.
+XCL is **GPL-2.0-only**. Xbox2Windows contributions are **MIT**. This project uses XCL's public observations as references and develops its own implementation and test fixtures under the repository's licence.
 
 What may be observed:
 
 - Public README, HANDOFF, issues, pull requests and design notes.
-- Local behaviour on synthetic input or the operator's own copy: counts, slot numbers, return values, call order, first failure and timings.
+- Synthetic observations: counts, return values, call order, first failure and timings. Keep results from private inputs local except for the limited observations allowed by the contribution guide.
 - A public or local compatibility report as a checklist of requested services, stages or slots. Record the shape and counts; do not copy its tables.
 
 What may not be copied, linked or shipped:
@@ -36,7 +36,7 @@ What may not be copied, linked or shipped:
 - XCL-generated files used as inputs to an Xbox2Windows test.
 - Game files, dumps, title logs, shader bytes or distribution links.
 
-If reuse ever becomes necessary, the clean options are a separate GPL-2.0-only process or tool that exchanges data across a documented boundary, or a deliberate relicence of the affected Xbox2Windows component. Both are project decisions, not implementation shortcuts.
+Any proposal to reuse code or change project licensing requires a separate project decision.
 
 ## Provenance note
 
@@ -54,8 +54,8 @@ Use the full 40-character commit. The note records influence; it does not grant 
 ## Public references
 
 - [Pinned commit](https://github.com/ivall/xcl/commit/38b05b7b6954cfa5bd21cec72f68823603ca2227)
-- [XCL README](https://github.com/ivall/xcl#readme)
-- [XCL HANDOFF](https://github.com/ivall/xcl/blob/main/HANDOFF.md)
+- [XCL README at the pin](https://github.com/ivall/xcl/blob/38b05b7b6954cfa5bd21cec72f68823603ca2227/README.md)
+- [XCL HANDOFF at the pin](https://github.com/ivall/xcl/blob/38b05b7b6954cfa5bd21cec72f68823603ca2227/HANDOFF.md)
 - [Public report #159](https://github.com/ivall/xcl/issues/159)
 - [Public report #173](https://github.com/ivall/xcl/issues/173)
 - [GPU results #42](https://github.com/ivall/xcl/issues/42)

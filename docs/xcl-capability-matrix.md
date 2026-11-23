@@ -36,8 +36,8 @@ Coverage boundaries:
 
 Public reports behind the XCL column:
 
-- [XCL README](https://github.com/ivall/xcl#readme)
-- [XCL HANDOFF](https://github.com/ivall/xcl/blob/main/HANDOFF.md)
+- [XCL README at the pin](https://github.com/ivall/xcl/blob/38b05b7b6954cfa5bd21cec72f68823603ca2227/README.md)
+- [XCL HANDOFF at the pin](https://github.com/ivall/xcl/blob/38b05b7b6954cfa5bd21cec72f68823603ca2227/HANDOFF.md)
 - [Public report #159](https://github.com/ivall/xcl/issues/159)
 - [Public report #173](https://github.com/ivall/xcl/issues/173)
 - [GPU results #42](https://github.com/ivall/xcl/issues/42)
