@@ -153,6 +153,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_cvt_pkrtz_f16_f32_e32\s+v\d+,\s+v\d+,\s+v\d+",
     r"v_cvt_u32_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",
     r"exp\s+mrt0,?\s+v\d+,\s+v\d+,\s+(?:v\d+|off),\s+(?:v\d+|off)\s+done\s+compr\s+vm",
+    r"exp\s+mrt0,?\s+(?:v\d+|off),\s+(?:v\d+|off),\s+(?:v\d+|off),\s+(?:v\d+|off)\s+done\s+vm",
     r"s_endpgm",
 ]
 

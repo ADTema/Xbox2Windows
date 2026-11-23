@@ -2193,6 +2193,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     requires every flat address to be global and excludes the scratch and LDS apertures.
     return_write_mask returns (source, RT0 mask). For partial compressed exports the caller
     must supply normalized whole-pair instructions and apply the returned mask in the PSO.
+    Uncompressed partial exports use the same opt-in for floating-point and integer targets.
     wave_size names the guest execution width (32 or 64). Low-only execution mask operations
     (s_mov_b32 save of exec_lo, s_wqm_b32, and s_and_b32/s_mov_b32 restore) require a validated
     guest wave32 profile (wave_size=32); native Scarlett/GFX10 wave64 operations remain independent
@@ -4293,12 +4294,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in values)):
                 raise ValueError("Unsupported export")
             channel_mask = sum(1 << index for index, reg in enumerate(channels) if reg != "off")
-            if channel_mask != 0xF and (integer_export or not return_write_mask):
-                raise ValueError("Partial uncompressed export requires an explicit floating-point RT0 write mask")
+            if channel_mask != 0xF and not return_write_mask:
+                raise ValueError("Partial uncompressed export requires an explicit RT0 write mask")
             args = [f"asuint({v})" for v in values] if integer_export else values
+            padding = "0u" if integer_export else "0.0f"
             for index, reg in enumerate(channels):
                 if reg == "off":
-                    args.insert(index, "0.0f")
+                    args.insert(index, padding)
             input_type = f"float{4 if attribute_input else texcoord_components}"
             lines[entry_line] = f"{result_type} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
             lines.append(f"    return {result_type}({', '.join(args)});")
@@ -4368,6 +4370,8 @@ def main():
     parser.add_argument("--half-denorm", choices=[HALF_DENORM_PRESERVE],
                         help="Declare the binary16 denormal state at shader entry; the plain binary16 VOP2 forms need it")
     parser.add_argument("--second-texture-offset", type=lambda s: int(s, 0), help="Byte offset of the t1 descriptor for a two-sample shader")
+    parser.add_argument("--rt0-write-mask", action="store_true",
+                        help="Emit the uncompressed RT0 mask for the caller to apply to the pipeline")
     args = parser.parse_args()
     dest = args.output.resolve()
     if dest.suffix.lower() != ".hlsl" or dest == args.archive.resolve():
@@ -4375,20 +4379,28 @@ def main():
     try:
         blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256, llvm=args.llvm)
         instructions = disassemble(code, args.llvm, offsets=True)
-        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor,
-                       texture_offset=args.texture_offset, second_texture_offset=args.second_texture_offset,
+        if args.rt0_write_mask and any(line.startswith("exp ") and "compr" in line.split()
+                                       for _, line in instructions):
+            raise ValueError("--rt0-write-mask only supports uncompressed exports")
+        result = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words,
+                       args.constant_descriptor, texture_offset=args.texture_offset,
+                       second_texture_offset=args.second_texture_offset,
                        extra_constants=[tuple(entry) for entry in args.extra_constant],
                        pointer_constants=[tuple(entry) for entry in args.pointer_constant],
-                       half_denorm=args.half_denorm)
+                       half_denorm=args.half_denorm, return_write_mask=args.rt0_write_mask)
+        source, write_mask = result if args.rt0_write_mask else (result, None)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False, mode="wb") as f:
         f.write(source.encode("utf-8"))
     Path(f.name).replace(dest)
-    print(json.dumps({"record":args.record, "container_sha256":hashlib.sha256(blob).hexdigest(),
-                      "native_sha256":hashlib.sha256(code).hexdigest(), "instructions":len(instructions),
-                      "hlsl_sha256":hashlib.sha256(dest.read_bytes()).hexdigest()}))
+    summary = {"record": args.record, "container_sha256": hashlib.sha256(blob).hexdigest(),
+               "native_sha256": hashlib.sha256(code).hexdigest(), "instructions": len(instructions),
+               "hlsl_sha256": hashlib.sha256(dest.read_bytes()).hexdigest()}
+    if write_mask is not None:
+        summary["rt0_write_mask"] = write_mask
+    print(json.dumps(summary))
 
 
 if __name__ == "__main__":
