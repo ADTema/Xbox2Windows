@@ -1487,6 +1487,48 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_xlatb COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xlatb.py"
         check "$<TARGET_FILE:cpu_xlatb>" "$<TARGET_FILE:cpu_xlatb_lifted>"
         "$<TARGET_FILE:cpu_xlatb_signed>" "$<TARGET_FILE:cpu_xlatb_noaddr32>" "$<TARGET_FILE:cpu_xlatb_clear>")
+    cpu_asm_fixture(cpu_rdtsc_harness rdtsc_harness)
+    # RDTSC runs on every host. RDTSCP has its own fixture and test, which exits 77 on a host without it. Each
+    # part has a lifted DLL, mutated controls that its check requires to break a property, and /O2 builds;
+    # plain removes volatile and is built only at /O2.
+    foreach(part IN ITEMS rdtsc rdtscp)
+        cpu_asm_fixture(cpu_${part} ${part})
+        if(part STREQUAL "rdtsc")
+            set(tsc_variants lifted constant swap noext stale flags plain)
+            set(tsc_o2_variants lifted plain)
+        else()
+            set(tsc_variants lifted swap noext noaux pflags)
+            set(tsc_o2_variants lifted)
+        endif()
+        set(tsc_controls)
+        foreach(variant IN LISTS tsc_variants)
+            set(tsc_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp")
+            add_custom_command(OUTPUT "${tsc_fixture}"
+                COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rdtsc.py"
+                    emit ${part} "$<TARGET_FILE:cpu_${part}>" "${tsc_fixture}" ${variant}
+                DEPENDS cpu_${part} tests/cpu/rdtsc.py tools/ffx_version_query.py tools/x87_lower.py
+                    tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+            if(NOT variant STREQUAL "plain")
+                add_library(cpu_${part}_${variant} SHARED "${tsc_fixture}")
+                if(NOT variant STREQUAL "lifted")
+                    list(APPEND tsc_controls "$<TARGET_FILE:cpu_${part}_${variant}>")
+                endif()
+            endif()
+        endforeach()
+        foreach(variant IN LISTS tsc_o2_variants)
+            set(tsc_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}_o2.dll")
+            add_custom_command(OUTPUT "${tsc_o2}"
+                COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp"
+                    "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}_o2.obj" "/Fe${tsc_o2}"
+                DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp" VERBATIM)
+            add_custom_target(cpu_${part}_${variant}_o2 ALL DEPENDS "${tsc_o2}")
+            list(APPEND tsc_controls "${tsc_o2}")
+        endforeach()
+        add_test(NAME cpu_aot_${part} COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rdtsc.py"
+            check ${part} "$<TARGET_FILE:cpu_rdtsc_harness>" "$<TARGET_FILE:cpu_${part}>"
+            "$<TARGET_FILE:cpu_${part}_lifted>" ${tsc_controls})
+    endforeach()
+    set_tests_properties(cpu_aot_rdtscp PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
