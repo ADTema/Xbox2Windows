@@ -4329,22 +4329,63 @@ blue mip 2 on that adapter. Linear mip filtering gave the expected blend
 (G=0.4375, B=0.5625). The translated `ps_6_0` sample and a direct HLSL clamp
 agreed. [Direct3D rules for per-sample clamping and mip selection](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm)
 
-The detailed fixture results below used Windows 10 build 19045, Agility SDK
-1.620.2, DXC 1.9.2609 and the debug layer.
+A `ps_6_0` probe of the point-filtered case (`MIN_MAG_MIP_POINT`, gate lowered
+locally, `929e659`) compared the translated `Sample` with `MinLod`, a direct
+HLSL clamp and a direct `SampleLevel` at the same value. Each cell is the mip
+that filled all 64 pixels; clamps 1, 1.25 and 1.4375 read mip 1 everywhere.
+Windows 10 build 19045, DXC 1.9.2609.
 
-| Clamp | Exact green, blue | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 |
-|---|---|---|---|
-| 1.25 | 0.75, 0.25 | exact | 0.7499962, 0.2500038 |
-| 1.3 | 0.7, 0.3 | 0.6992188, 0.3007813 | 0.7031205, 0.2968795 |
-| 1.001953125 | 0.9980469, 0.0019531 | 1, 0 | 1, 0 |
+| Clamp | `SampleLevel`, all | In-box WARP 10.0.19041.7811, `ps_6_0` | RTX 3080 Ti 32.0.16.1047, in-box runtime, `ps_6_0` | WARP 1.0.22 and RTX, Agility SDK 1.620.2, `ps_6_0` and `ps_6_6` |
+|---|---|---|---|---|
+| 0.5625 | 1 | 0 | 1 | 1 |
+| 1.5 | 2 | 1 | 2 | 2 |
+| 1.5625 | 2 | 1 | 2 | 2 |
+| 1.75 | 2 | 1 | 2 | 2 |
+| 2.5625 | 3 | 2 | 3 | 3 |
 
-Both adapters quantize the blend weight to 1/256. At 1.3, WARP rounds the
-weight to 77/256 and the RTX truncates it to 76/256. The RTX values also
-differ from those steps by up to 7.6e-6. In this fixture the translated and
-control results were identical on each adapter, so the measured differences
-come from the adapter's mip filtering. The 1/128 tolerance was chosen from these
-measurements, not from a specified precision. Whether this explains the
-archive differences is not established. [Issue](https://github.com/R0Y00/Xbox2Windows/issues/809)
+Only the Windows 10 in-box WARP reads the mip below a `MinLod` clamp, so the
+difference follows the WARP build, not the runtime or shader model. On Windows
+11 build 26200.9974, in-box WARP 10.0.26100.9818 and an RX 7900 XTX
+(32.0.32029.2010) read the nearest mip at 1.5 and 1.5625 (`ps_6_6`, no other
+clamps). Translated and direct HLSL agreed in every case.
+[Measurement](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7097414235),
+[Windows 11 report](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7095165499)
+
+Mip-linear results (`MIN_MAG_POINT_MIP_LINEAR`, `ps_6_6`, debug layer): WARP
+1.0.22 and the RTX on Windows 10 build 19045 with Agility SDK 1.620.2 and DXC
+1.9.2609; the Radeon and in-box WARP on Windows 11 build 26200.9974 with DXC
+1.8.2502.11.
+
+| Clamp | Exact green, blue | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 | RX 7900 XTX and in-box WARP 10.0.26100.9818 |
+|---|---|---|---|---|
+| 1.25 | 0.75, 0.25 | exact | 0.7499962, 0.2500038 | exact |
+| 1.3 | 0.7, 0.3 | 0.6992188, 0.3007813 | 0.7031205, 0.2968795 | 0.6992188, 0.3007813 |
+| 1.001953125 | 0.9980469, 0.0019531 | 1, 0 | 1, 0 | 1, 0 |
+
+All adapters quantize the blend weight to 1/256. At 1.3 the RTX truncates it
+to 76/256 and the others give 77/256. Translated and control results were
+bit-identical on each adapter, so the differences come from mip filtering. The
+1/128 tolerance was chosen from these measurements, not from a specified
+precision. Whether this explains the archive differences is not established.
+[Issue](https://github.com/R0Y00/Xbox2Windows/issues/809)
+
+A sweep of the blue weight from 76/256 to 77/256 in 1/4096 steps, plus the ties
+at 75.5, 76.5 and 77.5 (`6cd0f15`), separates rounding from truncation. Each
+cell is the observed weight × 256 and the blue word; all 64 pixels and both
+shaders matched at every point.
+
+| Requested weight × 256 | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 |
+|---|---|---|
+| 75.5 (tie) | 76 (`3e980000`) | 75 (`3e960096`) |
+| 76.0 to 76.49976 | 76 (`3e980000`) | 76 (`3e980098`) |
+| 76.5 (tie) | 76 (`3e980000`) | 76 (`3e980098`) |
+| 76.50024 to 76.99976 | 77 (`3e9a0000`) | 76 (`3e980098`) |
+| 77.0 | 77 (`3e9a0000`) | 77 (`3e9a009a`) |
+| 77.5 (tie) | 78 (`3e9c0000`) | 77 (`3e9a009a`) |
+
+WARP rounds to the nearest 1/256 with ties to even; the RTX truncates and
+stores step k as `k·256/65535`, which gives the offset of up to 7.6e-6.
+[Half-step sweep](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7095572305)
 
 ## Quad-local DS swizzle in pixel shaders
 
