@@ -739,9 +739,18 @@ READ_MAD24 = variant(
     ("v_and_b32_e32 v2, 0xffff, v1", "v_and_b32_e32 v2, 0x1ffffff, v1"),
     ("v_lshrrev_b32_e32 v1, 16, v1", "v_and_b32_e32 v1, 0x2ffffff, v1"),
 )
+# Keep the same guarded read and write. Use the entire source and constant words.
+READ_MUL_LO = variant(
+    READ_COMPUTE,
+    ("v_and_b32_e32 v2, 0xffff, v1", ""),
+    ("v_lshrrev_b32_e32 v1, 16, v1", ""),
+    ("v_mad_u32_u24 v1, v2, v1, v0", "v_mul_lo_u32 v1, s0, v1"),
+    ("v_min_u32_e32 v1, s0, v1", ""),
+)
 ALU_CASES = [
     ("read_compute", READ_COMPUTE, 32, READ_BINDING),
     ("read_mad24", READ_MAD24, 32, READ_BINDING),
+    ("read_mul_lo", READ_MUL_LO, 32, READ_BINDING),
 ]
 
 
@@ -957,6 +966,14 @@ def alu_controls():
     load = READ_LOADS["read_copy"]
     assert (f"min(params[0].y, (((0x0000012cu & 0xffffffu) * ((0xfffffff0u & {load}) & 0xffffffu)) + params[0].y)"
             in alu(("0xffff, v1", "-16, v1"), (mad, "v_mad_u32_u24 v1, 0x12c, v2, s0"))[-3])
+    mul = "v_mul_lo_u32 v1, s0, v1"
+    lines = aot.lower(READ_MUL_LO, 32, **READ_BINDING).splitlines()
+    assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, (params[0].y * {load}));",
+                         "    }", "}"], lines
+    rejects("Unverified ALU operand", aot.lower, variant(READ_MUL_LO, (mul, mul.replace("s0", "v255"))),
+            32, **READ_BINDING)
+    rejects("Unsupported compute instruction: v_mul_lo_u32", aot.lower, variant(READ_MUL_LO, (mul, mul + " clamp")),
+            32, **READ_BINDING)
     unsupported, operand = "Unsupported compute instruction: ", "Unverified ALU operand"
     compare = "Unverified lane guard compare"
     # The x8 descriptor load moved before the guard, so only the result is written under it.
@@ -1915,12 +1932,50 @@ def draw_mad24(directory, compiler, cmd, case):
     return 0
 
 
+def draw_mul_lo(cmd, case):
+    factor = 0x01000003
+    modulus = 1 << 32
+
+    def write(groups, bound, words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, factor, *([0] * 14)))
+
+    for groups, bound in READ_RUNS:
+        words = [SENTINEL] * 320
+        for gid in range(bound):
+            words[gid] = (source_word(gid) * factor) % modulus
+        write(groups, bound, words)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+
+    assert source_word(0) * factor >= modulus
+    controls = ((0, (source_word(0) * (factor & 0xffffff)) % modulus),
+                (0, ((source_word(0) & 0xffffff) * factor) % modulus),
+                (bound, (source_word(bound) * factor) % modulus))
+    for gid, wrong in controls:
+        assert wrong != words[gid]
+        stale = words.copy()
+        stale[gid] = wrong
+        write(groups, bound, stale)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        mismatch = f"word={gid} expected={wrong:08x} actual={words[gid]:08x}"
+        if bad.returncode != 1 or mismatch not in bad.stderr:
+            raise AssertionError(f"read_mul_lo: expected {mismatch}\n{bad.stderr}")
+        print(mismatch)
+    return 0
+
+
 def draw(directory, compiler, renderer, backend, cases=None):
     for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
+        if name == "read_mul_lo":
+            result = draw_mul_lo(cmd, case)
+            if result:
+                return result
+            continue
         if name == "read_mad24":
             result = draw_mad24(directory, compiler, cmd, case)
             if result:

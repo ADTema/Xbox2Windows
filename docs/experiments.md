@@ -2352,7 +2352,7 @@ python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-
 
 ### Integer ALU between a read and a store
 
-The store profile accepts four unsigned 32-bit vector operations on known words. Each one is what the LLVM 15 code generator emits for the read–compute–write fixture below:
+The store profile accepts these unsigned 32-bit vector operations on known words:
 
 | Instruction | Result |
 |---|---|
@@ -2360,10 +2360,11 @@ The store profile accepts four unsigned 32-bit vector operations on known words.
 | `v_lshrrev_b32_e32 vD, a, vB` | `b >> (a & 31)`, logical |
 | `v_mad_u32_u24 vD, a, b, c` | `(a & 0xffffff) * (b & 0xffffff) + c`, modulo 2^32 |
 | `v_min_u32_e32 vD, a, vB` | unsigned minimum |
+| `v_mul_lo_u32 vD, a, b` | low 32 bits of `a * b` |
 
 A source is a VGPR, an SGPR that holds a known word, an integer inline constant or a 32-bit literal. The VOP2 forms take a VGPR as the second source. A known word is a literal, a constant-buffer word, a dispatch index, a word read from t0, or an earlier result. The result becomes an inline HLSL expression of its sources. An expression longer than 1024 characters is rejected. `v_mad_u32_u24` with a byte offset as an operand is still the row pitch of a store address, as before.
 
-Results are data only. They can be stored or copied, but they cannot form a store or read address. A result or a word read from t0 is also rejected as a lane-guard compare operand. None of the four instructions writes `vcc`, so the guard compare stays valid. A result written under the guard is unknown after the restore, like any other register.
+Results are data only. They can be stored or copied, but they cannot form a store or read address. A result or a word read from t0 is also rejected as a lane-guard compare operand. These instructions leave `vcc` intact, so the guard compare stays valid. A result written under the guard is unknown after the restore, like any other register.
 
 Anything else stops the lowering at that instruction, with the instruction in the error. This includes signed and other operations (`v_min_i32`, `v_max_u32`, `v_ashrrev_i32`, `v_or_b32`, `v_mad_i32_i24`), carry forms that write `vcc` (`v_add_co_u32`), 16-bit, 64-bit and SDWA forms, register ranges, an SGPR as a VOP2 second source, and output modifiers such as `clamp`.
 
@@ -2389,6 +2390,17 @@ first multiplicand and bit 25 in the second. It enables lane zero only and
 sets the cap to UINT_MAX. The full 320-word readback requires word 0 to be
 `0x0df050e1` with all other words unchanged. Removing source truncation
 individually yields `0xfef050e1` and `0xeff050e1`; each must fail at word 0.
+
+#### Guarded full-width integer multiply
+
+The `v_mul_lo_u32` fixture reads each active lane's word from t0, multiplies it
+by the unsigned constant-buffer word `0x01000003`, and stores the low 32 bits
+to u0. The first lane's product wraps and both operands have nonzero bits
+above bit 23. The full 320-word readback covers zero active lanes, a split
+group, and five groups with 150 active lanes. Two stale references truncate
+one operand at a time, and a third changes the first inactive word. The test
+requires each control to fail at the expected word. Run
+`ctest --preset dev --no-tests=error -R '^compute_store_aot_guard_read_(warp|hardware)$' -V`.
 
 ### Two- and three-dimensional thread groups
 
