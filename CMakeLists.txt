@@ -3543,6 +3543,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_dstorage_caller>" "$<TARGET_FILE:cpu_dstorage_provider>"
         "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_dstorage PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_frame_events_provider SHARED tests/cpu/frame_events_provider.cpp tests/cpu/frame_events_provider.def)
+    add_library(cpu_frame_events_provider_clobber SHARED tests/cpu/frame_events_provider.cpp tests/cpu/frame_events_provider.def)
+    target_compile_definitions(cpu_frame_events_provider_clobber PRIVATE FAULT_CLOBBER)
+    add_library(cpu_frame_events_provider_early SHARED tests/cpu/frame_events_provider.cpp tests/cpu/frame_events_provider.def)
+    target_compile_definitions(cpu_frame_events_provider_early PRIVATE FAULT_EARLY_RELEASE)
+    add_executable(cpu_frame_events_caller tests/cpu/frame_events_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_frame_events_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_frame_events_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_frame_events_caller PRIVATE cpu_frame_events_provider cpu_exe_io)
+    add_test(NAME cpu_native_frame_events COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/frame_events_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_frame_events_caller>" "$<TARGET_FILE:cpu_frame_events_provider>"
+        "$<TARGET_FILE:cpu_frame_events_provider_clobber>"
+        "$<TARGET_FILE:cpu_frame_events_provider_early>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_frame_events PROPERTIES TIMEOUT 60)
     add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")
@@ -3849,6 +3865,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_shift64_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_shift64_${adapter}.txt")
+        add_test(NAME pixel_aot_pk_fmac_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-pk-fmac "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_pk_fmac_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_pk_fmac_${adapter}.txt")
         add_test(NAME pixel_aot_plain_bitscan_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-plain-bitscan "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
