@@ -3618,3 +3618,34 @@ ctest --preset dev --no-tests=error -R '^pixel_aot_align_(warp|hardware)$' -V
 Python-only controls check explicit reference words and translator acceptance.
 Those controls do not establish GPU execution; the command above must pass on
 the named backend before recording readback evidence.
+
+## Independent VOP3 ternary integer ALU readback
+
+The `pixel_aot_vop3_ternary_int_warp` and `pixel_aot_vop3_ternary_int_hardware` fixtures run
+dedicated 3-operand integer ALU programs covering 8 instructions:
+- `v_add3_u32`: `(src0 + src1 + src2)`
+- `v_or3_b32`: `(src0 | src1 | src2)`
+- `v_xor3_b32`: `(src0 ^ src1 ^ src2)`
+- `v_and_or_b32`: `((src0 & src1) | src2)`
+- `v_xad_u32`: `((src0 ^ src1) + src2)`
+- `v_lshl_or_b32`: `((src0 << (src1 & 31)) | src2)`
+- `v_lshl_add_u32`: `((src0 << (src1 & 31)) + src2)`
+- `v_add_lshl_u32`: `((src0 + src1) << (src2 & 31))`
+
+All 8 instructions are included in the source-built binary round trip. Each exports four
+observable UINT channels; the fourth instruction in each program aliases its second source
+and destination register.
+
+Each group has 30 input/reference cases from three asymmetric word pairs and ten shift/add
+counts (0, 1, 2, 3, 4, 8, 16, 24, 31, 32). References use 32-bit integer arithmetic.
+Input and output words avoid NaN and subnormal encodings so float register transport
+cannot obscure the instruction comparison. A wrong expected word is surrounded by correct
+cases; a separately compiled shader with mutated operations must fail every reference.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_vop3_ternary_int_(warp|hardware)$' -V
+```
+
+Python-only controls check explicit reference words and translator acceptance.
+Those controls do not establish GPU execution; the command above must pass on
+the named backend before recording readback evidence.
