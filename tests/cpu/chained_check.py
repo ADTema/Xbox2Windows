@@ -135,20 +135,21 @@ def check(native, compiled, harness, native_jne=None, compiled_jne=None,
         _, _, returns, stops = translate(path, "choose_value", callback_offset=8)
         assert len(returns) == 1 and not stops
 
-        for label, slot, save, result in (
-            ("wrong table slot", "10", "", ""),
-            ("volatile RDX after callback", "08", "", "48 89 d0"),
-            ("first shadow slot after callback", "08", "48 89 14 24", "48 8b 04 24"),
+        # Each control is refused at the instruction it changes: the call, the RDX read or the shadow-slot reload.
+        for label, slot, save, result, at in (
+            ("wrong table slot", "10", "", "", 4),
+            ("volatile RDX after callback", "08", "", "48 89 d0", 7),
+            ("first shadow slot after callback", "08", "48 89 14 24", "48 8b 04 24", 11),
         ):
             callback_image(slot, save, result)
             try:
                 translate(path, "choose_value", callback_offset=8)
             except ValueError as exc:
-                if "unsupported operation" not in str(exc):
+                if f"unsupported operation at {entry + at:#x}" not in str(exc):
                     raise
             else:
                 raise AssertionError(f"accepted callback control: {label}")
-    print("two null paths, three nonzero inputs (JE, JNE, XOR zeroing, 32-bit register writes and 32-bit stack frames), RBX/RSI, guarded writes, version-2 chained unwind and fourteen rejection controls passed")
+    print("two null paths, three nonzero inputs (JE, JNE, XOR zeroing, 32-bit register writes and 32-bit stack frames), RBX/RSI, guarded writes, version-2 chained unwind and fifteen rejection controls passed")
 
 
 if __name__ == "__main__":
