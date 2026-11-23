@@ -268,6 +268,10 @@ def check_shader_records():
         without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(trig)
     # Count the supported 64-bit SOP1/SOP2 and BFE forms in both gfx1013 and rdna2.
+    # The 64-bit VOP3 shifts (issue #928) count once each, in VOP3 only; LLVM prints them without a suffix.
+    shift64_forms = {("VOP3", "v_lshlrev_b64"), ("VOP3", "v_lshrrev_b64"), ("VOP3", "v_ashrrev_i64")}
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        assert shift64_forms <= fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name)), name
     masked_forms = {("SOP1", "s_and_saveexec_b64"), ("SOPP", "s_cbranch_execz")}
     assert masked_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
     scalar64_forms = {

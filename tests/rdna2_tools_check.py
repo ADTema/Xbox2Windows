@@ -3275,6 +3275,17 @@ class TestRdna2Scanner(unittest.TestCase):
         result = analyze_shader_instructions("sopk_wait_sgpr", ["s_waitcnt_vmcnt s5, 0x1", "s_endpgm"])
         self.assertEqual(result["unsupported_count"], 1)
 
+    def test_shift64_scanner_support(self):
+        """Issue #928: the 64-bit VOP3 shifts are supported with at most one SGPR or literal source."""
+        for line in ("v_lshlrev_b64 v[12:13], v20, v[18:19]", "v_lshrrev_b64 v[2:3], s46, v[4:5]",
+                     "v_ashrrev_i64 v[2:3], 0x41, v[4:5]", "v_lshlrev_b64 v[2:3], v1, s[4:5]",
+                     "v_ashrrev_i64 v[2:3], 3, -1", "v_lshlrev_b64_e64 v[2:3], v1, v[4:5]"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_lshlrev_b64 v[2:3], s4, s[4:5]", "v_lshlrev_b64 v[2:3], 0x41, s[4:5]",
+                     "v_lshlrev_b64 v[2:3], v1, 0x41", "v_lshlrev_b64 v[2:3], v1, v[4:5] clamp",
+                     "v_lshlrev_b64_e32 v[2:3], v1, v[4:5]", "v_lshlrev_b64 v[2:3], -v1, v[4:5]"):
+            self.assertFalse(is_instruction_supported(line), line)
+
     def test_sopk_s_version(self):
         """s_version with a 16-bit immediate is supported and known; larger, negative and register operands are not."""
         for operand in ("0x0", "0x1004", "0xffff", "0x00ff", "0", "1", "4100", "9999", "10000", "65535", "59999",

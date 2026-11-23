@@ -1356,6 +1356,46 @@ def cmp64_expected(kind, encoding, group, words):
     return tuple(channels)
 
 
+# 64-bit VOP3 shifts (issue #928). The constant words are s44 = value low, s45 = value high, s46 = amount;
+# cmp64_prefix copies them to v18..v20. The amounts cover 0, the word edges 31/32/33, 63, the six-bit wrap
+# 64/65 and amounts with bits above bit 5 set; the values include a negative high word for the sign fill.
+SHIFT64_OPS = ("lshlrev_b64", "lshrrev_b64", "ashrrev_i64")
+SHIFT64_AMOUNTS = (0, 1, 31, 32, 33, 63, 64, 65, 0xffffffc1, 0x80000020)
+SHIFT64_VALUES = ((0x89abcdef, 0x01234567), (0x76543210, 0xfedcba98), (0xffffffff, 0x80000000))
+
+
+def shift64_reference(op, lo, hi, amount):
+    """The (low, high) words of S1 shifted by S0[5:0] (AMD RDNA 2 ISA §12.12, opcodes 767-769)."""
+    value, count = hi << 32 | lo, amount & 63
+    if op == "lshlrev_b64":
+        result = value << count
+    elif op == "lshrrev_b64":
+        result = value >> count
+    else:
+        result = (value - (1 << 64) if value >> 63 else value) >> count
+    result &= (1 << 64) - 1
+    return result & 0xffffffff, result >> 32
+
+
+def shift64_programs(op):
+    """Two shifts per program, exported as four words: register sources; the in-place pair and a literal
+    amount (0x41 wraps to 1); and an SGPR-pair value next to the inline -1, sign-extended to 64 bits."""
+    return {
+        "registers": cmp64_program([f"v_{op} v[12:13], v20, v[18:19]", f"v_{op} v[14:15], s46, v[18:19]"]),
+        "in-place": cmp64_program(["v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v13, v19",
+                                   f"v_{op} v[12:13], v20, v[12:13]", f"v_{op} v[14:15], 0x41, v[18:19]"]),
+        "scalar-value": cmp64_program([f"v_{op} v[12:13], v20, s[44:45]", f"v_{op} v[14:15], v20, -1"]),
+    }
+
+
+def shift64_expected(op, program, words):
+    lo, hi, amount, _ = words
+    first = shift64_reference(op, lo, hi, amount)
+    second = {"registers": first, "in-place": shift64_reference(op, lo, hi, 0x41),
+              "scalar-value": shift64_reference(op, 0xffffffff, 0xffffffff, amount)}[program]
+    return tuple(as_float(word) for word in (*first, *second))
+
+
 # v_cmp_class_f32 is true when the class of S0 is in the mask S1 (LLVM SIInstrFlags::ClassFlags).
 # Each channel tests one property: +inf against its own bit, a quiet NaN against both NaN bits,
 # -0 against the +0 bit and a positive denormal against its bit, so neither the sign of zero
@@ -2330,6 +2370,122 @@ def check_cmp64_draw(directory, compiler, renderer, backend):
 
 # The SDWA comparisons with whole-dword selections repeat the 16-predicate draws, including NaN on either side.
 # For each group a reference that inverts the unordered (NaN) result must report a mismatch.
+def check_shift64_draw(directory, compiler, renderer, backend):
+    """64-bit VOP3 shifts (issue #928) against the Python reference, then HLSL mutations that must mismatch.
+
+    Words travel through the constant buffer and v_mov_b32 copies and are read back from the lossless
+    R32G32B32A32_UINT target. This pins the translator's two-word model on the desktop adapter; it is not
+    evidence for gfx1013.
+    """
+    source = directory / "shift64.hlsl"
+    shader = directory / "shift64.cso"
+
+    def build(text):
+        source.write_text(text, encoding="ascii")
+        compile_shader(compiler, source, shader)
+
+    def write_cases(op, program, tag):
+        paths = []
+        for value_index, (lo, hi) in enumerate(SHIFT64_VALUES):
+            for amount in SHIFT64_AMOUNTS:
+                words = (lo, hi, amount, 0)
+                constants = bytearray(256)
+                struct.pack_into("<4I", constants, 12, *words)
+                path = directory / f"shift64-{tag}-{value_index}-{amount:08x}.case"
+                write_case(path, bytes(constants), shift64_expected(op, program, words), integer_rt=True)
+                paths.append(path)
+        return paths
+
+    for op in SHIFT64_OPS:
+        for name, program in shift64_programs(op).items():
+            build(translate_int(program))
+            try:
+                run_pixel_batch(renderer, backend, shader,
+                                [(path, "pass") for path in write_cases(op, name, f"{op}-{name}")])
+            except AssertionError as error:
+                error.add_note(f"64-bit shift draw on {backend}, {op} {name}")
+                raise
+
+    # Mutations of the translated arithmetic shift (both shifts of the register program): each must mismatch.
+    program = shift64_programs("ashrrev_i64")["registers"]
+    lowered = translate_int(program)
+    number = program.index("v_ashrrev_i64 v[12:13], v20, v[18:19]")
+    cases = write_cases("ashrrev_i64", "registers", "mutant")
+
+    def mismatches(mutated, label):
+        assert mutated != lowered, label
+        build(mutated)
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, cases)
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+    mismatches(lowered.replace(" & 63u;", " & 31u;"), "the amount masked to five bits")
+    zero_fill = lowered.replace(f"asuint(asint(hi{number}) >> 31u)", "0u").replace(
+        f"asuint(asint(hi{number}) >> sb{number})", f"(hi{number} >> sb{number})")
+    mismatches(zero_fill, "the arithmetic shift filled with zeros")
+    swapped = lowered.replace(f"alu{number}_lo = ", "@@").replace(f"alu{number}_hi = ", f"alu{number}_lo = ").replace(
+        "@@", f"alu{number}_hi = ")
+    mismatches(swapped, "the result words swapped")
+    return 0
+
+
+def check_shift64_controls():
+    """64-bit VOP3 shifts (#928): lowering structure and refusals."""
+    prefix = cmp64_prefix()
+    for op in SHIFT64_OPS:
+        for name, program in shift64_programs(op).items():
+            source = translate_int(program)
+            main = source[source.index(" main("):]
+            # The amount keeps six bits, and every 32-bit HLSL shift count is below 32.
+            assert main.count(" & 63u;") == 2, (op, name)
+            counts = re.findall(r"(?:<<|>>) (\(32u - sb\d+\)|sb\d+|31u)\)", main)
+            assert len(counts) == len(re.findall(r"<<|>>", main)), (op, name, main)
+            assert ("asint(" in main) == (op == "ashrrev_i64"), (op, name)
+    # In place: both source words are read into temporaries before the destination pair is written.
+    program = shift64_programs("lshrrev_b64")["in-place"]
+    number = program.index("v_lshrrev_b64 v[12:13], v20, v[12:13]")
+    main = translate_int(program).splitlines()
+    order = [next(k for k, line in enumerate(main) if line.lstrip().startswith(prefix_))
+             for prefix_ in (f"uint lo{number} =", f"uint hi{number} =",
+                             f"precise float alu{number}_lo =", f"precise float alu{number}_hi =")]
+    assert order == sorted(order), order
+    assert f"uint lo{number} = asuint(alu{number - 2});" in "\n".join(main)
+    # The VOP3 spelling with an explicit _e64 suffix lowers identically.
+    plain = shift64_programs("lshlrev_b64")["registers"]
+    assert translate_int([line.replace("v_lshlrev_b64 ", "v_lshlrev_b64_e64 ") for line in plain]) == translate_int(plain)
+    # Refusals: encodings and modifiers, destinations, scalar sources, operand kinds and context.
+    for body in (
+            ["v_lshlrev_b64_e32 v[12:13], v20, v[18:19]"],
+            ["v_lshlrev_b64 v[12:13], v20, v[18:19] clamp"],
+            ["v_lshlrev_b64 v[12:13], v20, v[18:19] op_sel:[1,0]"],
+            ["v_lshlrev_b64 v[12:13], -v20, v[18:19]"],
+            ["v_lshlrev_b64 v[12:13], |v20|, v[18:19]"],
+            ["v_lshlrev_b64 v[12:13], v20, neg(v[18:19])"],
+            ["v_lshlrev_b64 v[12:14], v20, v[18:19]"],
+            ["v_lshlrev_b64 v[255:256], v20, v[18:19]"],
+            ["v_lshlrev_b64 v12, v20, v[18:19]"],
+            ["v_lshlrev_b64 v[12:13], s46, s[44:45]"],
+            ["v_lshlrev_b64 v[12:13], 0x41, s[44:45]"],
+            ["v_lshlrev_b64 v[12:13], v20, 0x41"],
+            ["v_lshlrev_b64 v[12:13], 65, v[18:19]"],
+            ["v_lshlrev_b64 v[12:13], 1.0, v[18:19]"],
+            ["v_lshlrev_b64 v[12:13], v20, v[40:41]"],
+            ["v_lshlrev_b64 v[12:13], v20, v[18:20]"],
+            ["v_lshlrev_b64 v[12:13], vcc_lo, v[18:19]"],
+    ):
+        must_reject(translate_int, uncompressed_export(prefix + body))
+    expect_value_error(translate_int, uncompressed_export(prefix + ["v_lshlrev_b64 v[12:13], s46, s[44:45]"]),
+                       "A 64-bit shift reads at most one scalar or literal source")
+    # A destination with an outstanding image sample is refused, before and up to the wait.
+    sampled = assembly(False)
+    sampled.insert(sampled.index("s_waitcnt vmcnt(0)"), "v_lshlrev_b64 v[12:13], 1, v[8:9]")
+    expect_value_error(translate, sampled, "Invalid 64-bit shift destination")
+    # Inside a masked region the shift is refused like any other non-region instruction.
+    must_reject(translate_int, uncompressed_export(prefix + [
+        "v_cmp_lt_u32_e64 vcc_lo, v18, v19", "s_and_saveexec_b64 s[60:61], vcc",
+        "v_lshlrev_b64 v[12:13], v20, v[18:19]", "s_or_b64 exec, exec, s[60:61]"]))
+
+
 def check_sdwa_predicate_draws(directory, compiler, renderer, backend):
     source = directory / "sdwa_predicates.hlsl"
     shader = directory / "sdwa_predicates.cso"
@@ -9650,6 +9806,7 @@ def check_f16_cvt_int_controls():
 def check_controls(directory):
     check_smem_pointer_controls()
     check_masked_controls()
+    check_shift64_controls()
     check_title_load_controls()
     check_ds_swizzle_controls()
     check_ds_nop_controls()
@@ -11489,6 +11646,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((masked_region(), translate))
     fixtures.append((masked_complementary(), translate))
     fixtures.append((masked_skip_asm(), translate, "gfx1013", "", masked_skip()))
+    fixtures.extend((program, translate_int) for op in SHIFT64_OPS for program in shift64_programs(op).values())
     fixtures.append((uncompressed_export(flat_scratch_ops_group1()), translate_int))
     fixtures.append((uncompressed_export(flat_scratch_ops_group2()), translate_int))
     for index, entry in enumerate(fixtures):
@@ -15619,7 +15777,7 @@ def main():
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64",
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
@@ -15651,6 +15809,7 @@ def main():
                         "draw-exec-regions": check_masked_draw,
                         "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw,
+                        "draw-shift64": check_shift64_draw,
                         "draw-flat-scratch": check_flat_scratch_draws,
                         "draw-smem-pointers": check_smem_pointer_draw}[mode]
                 return draw(directory, *args)
