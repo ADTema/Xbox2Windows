@@ -2569,6 +2569,64 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
             self.assertTrue(is_opcode_recognized(opcode), opcode)
         for line in (
+            "v_add_co_u32 v1, vcc_lo, s2, v3",
+            "v_sub_co_u32 v1, s[60:61], 64, v3",
+            "v_subrev_co_u32 v1, vcc, v2, 0x12345678",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_add_co_u32_e64 v1, vcc, v2, v3",
+            "v_sub_co_u32_e32 v1, vcc, v2, v3",
+            "v_subrev_co_u32 v1, exec, v2, v3",
+            "v_add_co_u32 v1, v4, v2, v3",
+            "v_add_co_u32 v1, vcc, v2, v3 clamp",
+            "v_sub_co_u32 v1, vcc, -v2, v3",
+            "v_add_co_u32 v1, vcc, v2",
+            "v_add_co_ci_u32_e64 v1, vcc, v2, v3, vcc",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_add_co_u32", "v_sub_co_u32", "v_subrev_co_u32"):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
+        for line in (
+            "v_cvt_pk_u16_u32 v1, v2, v3",
+            "v_cvt_pk_u16_u32 v1, 0x12345, v3",
+            "v_cvt_pk_i16_i32 v1, s2, v3",
+            "v_cvt_pk_i16_i32_e64 v1, -16, v3",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_cvt_pk_u16_u32_e32 v1, v2, v3",
+            "v_cvt_pk_i16_i32_e32 v1, v2, v3",
+            "v_cvt_pk_u16_u32 v1, v2",
+            "v_cvt_pk_i16_i32 v1, v2, v3, v4",
+            "v_cvt_pk_i16_i32 v1, v2, v3 clamp",
+            "v_cvt_pknorm_i16_f32 v1, v2, v3",
+            "v_cvt_pknorm_u16_f32 v1, v2, v3",
+            "v_cvt_pk_u8_f32 v1, v2, v3, v4",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32"):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
+        for line in (
+            "v_sad_hi_u8 v1, v2, v3, v4",
+            "v_sad_u32 v1, s2, v3, 64",
+            "v_sad_u32_e64 v1, v2, v3, v4",
+            "v_msad_u8 v1, v2, 0x7f00ff01, s4",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_sad_hi_u8_e32 v1, v2, v3, v4",
+            "v_sad_u32 v1, v2, v3",
+            "v_msad_u8 v1, v2, v3, v4, v5",
+            "v_msad_u8 v1, v2, v3, v4 clamp",
+            "v_sad_u8 v1, v2, v3, v4",
+            "v_sad_u16 v1, v2, v3, v4",
+            "v_mqsad_pk_u16_u8 v[1:2], v[3:4], v5, v[6:7]",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_sad_hi_u8", "v_sad_u32", "v_msad_u8"):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
+        for line in (
             "v_add3_u32 v1, v2, v3, v4",
             "v_add3_u32_e64 v1, s2, v3, 4",
             "v_or3_b32 v1, v2, v3, v4",

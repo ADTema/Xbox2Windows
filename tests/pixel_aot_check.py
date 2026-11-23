@@ -6064,6 +6064,216 @@ def sdwa_integer_cases(group):
     return cases
 
 
+# Saturating 16-bit packs (v_cvt_pk_u16_u32, v_cvt_pk_i16_i32). Bodies for uncompressed_export(): s44 = A and
+# s45 = B from the constants, v18 = B, v19 = B >> 16 (the high half, always inside both 16-bit ranges when
+# read as unsigned or sign-extended below), v20 = B >> 12 and v21 = B >> 16 arithmetic. A normal binary32
+# word is always outside both ranges, so the in-range operands are derived in the shader. A result whose
+# high half saturates is not a normal binary32 word, so those channels are exported through an xor with
+# PACK_FLIP, which moves the exponent field off all-ones and all-zeroes.
+PACK_FLIP = 0x40000000
+PACK_LITERAL = 0x12345
+PACK_PREFIX = ["v_mov_b32_e32 v18, s45", "v_lshrrev_b32_e32 v19, 16, v18", "v_lshrrev_b32_e32 v20, 12, v18",
+               "v_ashrrev_i32_e32 v21, 16, v18"]
+PACK_BODIES = {
+    "unsigned": [f"v_cvt_pk_u16_u32 v12, {PACK_LITERAL:#x}, v19", "v_cvt_pk_u16_u32 v13, v20, v19",
+                 "v_cvt_pk_u16_u32 v22, v19, s44", f"v_xor_b32_e32 v14, {PACK_FLIP:#x}, v22",
+                 "v_cvt_pk_u16_u32 v15, v21, v19"],
+    "signed": ["v_cvt_pk_i16_i32 v12, s44, v21", "v_cvt_pk_i16_i32 v22, v21, s44",
+               f"v_xor_b32_e32 v13, {PACK_FLIP:#x}, v22", "v_cvt_pk_i16_i32 v14, v19, v21",
+               "v_cvt_pk_i16_i32 v15, -16, v21"],
+}
+PACK_OPS = ("v_cvt_pk_i16_i32", "v_cvt_pk_u16_u32")
+
+
+def _sat_u16(word):
+    return min(word & 0xffffffff, 0xffff)
+
+
+def _sat_i16(word):
+    return max(-32768, min(_s32(word & 0xffffffff), 32767)) & 0xffff
+
+
+def _pk(lo, hi):
+    return (lo & 0xffff) | ((hi & 0xffff) << 16)
+
+
+# Reference words by group: src0 saturates into the low half and src1 into the high half.
+PACK_RESULTS = {
+    "unsigned": lambda a, b: (_pk(_sat_u16(PACK_LITERAL), _sat_u16(b >> 16)), _pk(_sat_u16(b >> 12), _sat_u16(b >> 16)),
+                              _pk(_sat_u16(b >> 16), _sat_u16(a)) ^ PACK_FLIP,
+                              _pk(_sat_u16(_sar32(b, 16)), _sat_u16(b >> 16))),
+    "signed": lambda a, b: (_pk(_sat_i16(a), _sat_i16(_sar32(b, 16))),
+                            _pk(_sat_i16(_sar32(b, 16)), _sat_i16(a)) ^ PACK_FLIP,
+                            _pk(_sat_i16(b >> 16), _sat_i16(_sar32(b, 16))),
+                            _pk(_sat_i16(-16), _sat_i16(_sar32(b, 16)))),
+}
+# Negative controls by group: (channel, word a wrong lowering would give, what went wrong). Each is drawn on
+# the first row of the group and must report a mismatch.
+PACK_WRONG = {
+    "unsigned": (
+        (0, lambda a, b: _pk(PACK_LITERAL, b >> 16), "literal truncated instead of saturated"),
+        (0, lambda a, b: _pk(b >> 16, _sat_u16(PACK_LITERAL)), "halves swapped"),
+        (1, lambda a, b: _pk(b >> 12, b >> 16), "register truncated instead of saturated"),
+        (2, lambda a, b: _pk(b >> 16, a) ^ PACK_FLIP, "high half truncated instead of saturated"),
+        (2, lambda a, b: _pk(_sat_u16(a), b >> 16) ^ PACK_FLIP, "halves swapped"),
+        (2, lambda a, b: _pk(b >> 16, _sat_i16(a)) ^ PACK_FLIP, "signed bound for the unsigned pack"),
+        (3, lambda a, b: _pk(0, b >> 16), "negative source clamped to zero"),
+        (3, lambda a, b: _pk(_sar32(b, 16), b >> 16), "source read as signed and kept"),
+    ),
+    "signed": (
+        (0, lambda a, b: _pk(a, _sar32(b, 16)), "truncated instead of saturated"),
+        (0, lambda a, b: _pk(_sat_u16(a), _sar32(b, 16)), "unsigned bound for the signed pack"),
+        (0, lambda a, b: _pk(_sar32(b, 16), _sat_i16(a)), "halves swapped"),
+        (1, lambda a, b: _pk(_sar32(b, 16), a) ^ PACK_FLIP, "high half truncated instead of saturated"),
+        (2, lambda a, b: _pk(b >> 16, _sar32(b, 16)), "value above 32767 kept"),
+        (3, lambda a, b: _pk(0x7fff, _sar32(b, 16)), "inline -16 read as unsigned"),
+        (3, lambda a, b: _pk(0, _sar32(b, 16)), "negative source clamped to zero"),
+    ),
+}
+# (A, B) as binary32 words; the inputs and every right result are normal numbers or zero (asserted at the
+# draw). First row: A is positive (it saturates to 0x7fff as signed) and B is negative, so B >> 16 is above
+# 32767, B >> 12 is above 65535 and the arithmetic shift is negative. Second row: A is negative (0x8000 as
+# signed) and B >> 12 is 0xfff, which both packs must keep.
+PACK_ROWS = ((0x40D12345, 0xC1257F90), (0xC0251234, 0x00FFF123))
+
+
+def pack_group(group):
+    return [*PACK_PREFIX, *PACK_BODIES[group]]
+
+
+# v_add_co_u32, v_sub_co_u32 and v_subrev_co_u32: a 32-bit add or subtract that also writes the unsigned carry
+# or borrow of each lane to a lane mask. Bodies for uncompressed_export(): A, B, C and D are the constants in
+# s44 to s47, v18 = B and v19 = D. v12 holds op(A, B) with its carry in vcc_lo and v14 holds op(B, A) with its
+# carry in an SGPR, in the Wave32 spelling LLVM 15 assembles for gfx1013. v13 and v15 select D where the carry
+# is set and C where it is clear; D is read from a VGPR because gfx10 allows two scalar operands at most.
+CARRY_OUT_OPS = ("v_add_co_u32", "v_sub_co_u32", "v_subrev_co_u32")
+
+
+def carry_out_group(op):
+    return ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v19, s47",
+            f"{op} v12, vcc_lo, s44, v18", "v_cndmask_b32_e64 v13, s46, v19, vcc_lo",
+            f"{op} v14, s60, v18, s44", "v_cndmask_b32_e64 v15, s46, v19, s60"]
+
+
+def _carry_out(op, src0, src1):
+    """The 32-bit result and the carry-out, from unbounded integers: bit 32 of the sum, or a negative difference."""
+    wide = {"v_add_co_u32": src0 + src1, "v_sub_co_u32": src0 - src1, "v_subrev_co_u32": src1 - src0}[op]
+    return wide & 0xffffffff, not 0 <= wide <= 0xffffffff
+
+
+def carry_out_words(op, a, b, c, d):
+    first, first_carry = _carry_out(op, a, b)
+    second, second_carry = _carry_out(op, b, a)
+    return first, d if first_carry else c, second, d if second_carry else c
+
+
+# (A, B) as binary32 words, drawn with C and D from _CARRY_SELECT; the inputs and every right result are normal
+# numbers or zero (asserted at the draw). Add: a carry, no carry, a zero addend (the sum equals src0 and must
+# not carry) and a sum that wraps to exactly zero (it must carry). Subtract: a borrow in one operand order and
+# none in the other, equal operands (no borrow in either order), and a row with the larger operand in A.
+_CARRY_SELECT = (0x3E270000, 0xBF620000)
+CARRY_OUT_ROWS = {
+    "v_add_co_u32": ((0xC1700000, 0x7F000000), (0x3F800024, 0x01000000), (0x40D10000, 0), (0xC0000000, 0x40000000)),
+    "v_sub_co_u32": ((0x3F800024, 0xC1700000), (0x40D10000, 0x40D10000), (0xC0250000, 0x3E270000)),
+    "v_subrev_co_u32": ((0x3F800024, 0xC1700000), (0x40D10000, 0x40D10000), (0xC0250000, 0x3E270000)),
+}
+# Negative controls by operation: (row, channel, word a wrong lowering would give, what went wrong). Each must
+# report a mismatch.
+CARRY_OUT_WRONG = {
+    "v_add_co_u32": (
+        (0, 0, lambda a, b, c, d: a - b, "subtract for add"),
+        (0, 1, lambda a, b, c, d: c, "carry dropped"),
+        (0, 3, lambda a, b, c, d: c, "carry dropped on the SGPR mask"),
+        (1, 1, lambda a, b, c, d: d, "carry without overflow"),
+        (2, 1, lambda a, b, c, d: d, "carry on a sum equal to src0"),
+        (3, 1, lambda a, b, c, d: c, "carry dropped when the sum wraps to zero"),
+    ),
+    "v_sub_co_u32": (
+        (0, 0, lambda a, b, c, d: b - a, "operands reversed"),
+        (0, 0, lambda a, b, c, d: a + b, "add for subtract"),
+        (0, 1, lambda a, b, c, d: c, "borrow dropped"),
+        (0, 3, lambda a, b, c, d: d, "borrow of the other operand order"),
+        (1, 1, lambda a, b, c, d: d, "borrow on equal operands"),
+        (2, 3, lambda a, b, c, d: c, "borrow dropped on the SGPR mask"),
+    ),
+    "v_subrev_co_u32": (
+        (0, 0, lambda a, b, c, d: a - b, "subtract for reverse subtract"),
+        (0, 1, lambda a, b, c, d: d, "borrow of the unreversed subtract"),
+        (0, 3, lambda a, b, c, d: c, "borrow dropped on the SGPR mask"),
+        (1, 1, lambda a, b, c, d: d, "borrow on equal operands"),
+        (2, 1, lambda a, b, c, d: c, "borrow dropped"),
+    ),
+}
+# Sums of absolute differences (v_sad_hi_u8, v_sad_u32, v_msad_u8). Bodies for uncompressed_export(): s44 = A,
+# s45 = B and s46 = C from the constants, v18 = B, and each channel v12..v15 holds its own result. The second
+# source is the reference of v_msad_u8, here once a register and once a literal whose byte 2 is zero. No
+# instruction uses more than two scalar registers and literals, the gfx10 constant bus limit LLVM 15 enforces.
+SAD_LITERAL = 0x7f00ff01
+SAD_BODIES = {
+    "bytes": ["v_sad_hi_u8 v12, s44, v18, s46", "v_sad_hi_u8 v13, v18, s44, 0",
+              "v_msad_u8 v14, s44, v18, s46", "v_msad_u8 v15, v18, s44, s46"],
+    "dword": ["v_sad_u32 v12, s44, v18, s46", "v_sad_u32 v13, v18, s44, 64",
+              f"v_msad_u8 v14, s44, {SAD_LITERAL:#x}, v18", "v_sad_hi_u8 v15, s45, s44, v18"],
+}
+SAD_OPS = tuple(sorted({line.split()[0] for body in SAD_BODIES.values() for line in body}))
+
+
+def _sad4(a, b, masked=False, lanes=4, signed=False):
+    """Sum of |a.byte[k] - b.byte[k]| over the low lanes; masked leaves out lanes whose b byte is zero."""
+    def lane(word, k):
+        value = _byte(word, k)
+        return value - 256 if signed and value >= 128 else value
+    return sum(abs(lane(a, k) - lane(b, k)) for k in range(lanes) if not masked or _byte(b, k))
+
+
+def _signed_absdiff32(a, b):
+    return abs((a - (1 << 32) if a & 0x80000000 else a) - (b - (1 << 32) if b & 0x80000000 else b))
+
+
+# Reference words by group, from the definitions in the AMD RDNA 2 ISA reference (see docs/experiments.md).
+SAD_RESULTS = {
+    "bytes": lambda a, b, c: ((_sad4(a, b) << 16) + c, _sad4(b, a) << 16, _sad4(a, b, True) + c, _sad4(b, a, True) + c),
+    "dword": lambda a, b, c: (abs(a - b) + c, abs(b - a) + 64, _sad4(a, SAD_LITERAL, True) + b, (_sad4(b, a) << 16) + b),
+}
+# Negative controls by group: (channel, word a wrong lowering would give, what went wrong). Each is drawn on
+# the first row of the group and must report a mismatch.
+SAD_WRONG = {
+    "bytes": (
+        (0, lambda a, b, c: _sad4(a, b) + c, "sum not moved to the high half"),
+        (0, lambda a, b, c: (_sad4(a, b, True) << 16) + c, "v_sad_hi_u8 masked like v_msad_u8"),
+        (0, lambda a, b, c: (_sad4(a, b, signed=True) << 16) + c, "signed byte lanes"),
+        (0, lambda a, b, c: (_sad4(a, b, lanes=3) << 16) + c, "top byte lane dropped"),
+        (0, lambda a, b, c: _sad4(a, b) << 16, "accumulator dropped"),
+        (1, lambda a, b, c: (_sad4(b, a) << 16) + c, "s46 read for the inline zero accumulator"),
+        (2, lambda a, b, c: _sad4(a, b) + c, "zero reference bytes not left out"),
+        (2, lambda a, b, c: _sad4(b, a, True) + c, "mask taken from src0"),
+        (2, lambda a, b, c: (_sad4(a, b, True) << 16) + c, "v_msad_u8 moved to the high half"),
+        (3, lambda a, b, c: _sad4(a, b, True) + c, "operands not swapped"),
+    ),
+    "dword": (
+        (0, lambda a, b, c: _signed_absdiff32(a, b) + c, "signed comparison"),
+        (0, lambda a, b, c: abs(a - b), "accumulator dropped"),
+        (0, lambda a, b, c: _sad4(a, b) + c, "byte lanes for the dword difference"),
+        (1, lambda a, b, c: abs(a - b) + c, "s46 read for the inline accumulator"),
+        (2, lambda a, b, c: _sad4(a, SAD_LITERAL) + b, "zero byte of the literal reference not left out"),
+        (2, lambda a, b, c: _sad4(SAD_LITERAL, a, True) + b, "mask taken from src0"),
+        (2, lambda a, b, c: _sad4(a, SAD_LITERAL, True) + c, "s46 read for the register accumulator"),
+        (3, lambda a, b, c: (_sad4(b, a) << 16) + c, "wrong accumulator register"),
+    ),
+}
+# (A, B, C) as binary32 words; the inputs and every right result are normal numbers or zero (asserted at the
+# draw). In the first bytes row A and B each have one zero byte in a different lane and lanes on both sides of
+# 0x80; in the first dword row A and B differ in the sign bit and the sum with C passes 2^32.
+SAD_ROWS = {
+    "bytes": ((0xC1007F90, 0x40C30011, 0x3F80FFFF), (0x3E0027FF, 0xBF62FF00, 0x40000000)),
+    "dword": ((0xC1700000, 0x3F800024, 0x7F000000), (0x40000023, 0x4C003A00, 0x3F800000)),
+}
+
+
+def sad_group(group):
+    return ["v_mov_b32_e32 v18, s45", *SAD_BODIES[group]]
+
+
 def sop2_lshl_add_group() -> list[str]:
     return with_constants([
         "s_lshl1_add_u32 s60, s44, s45",
@@ -6473,6 +6683,181 @@ def check_sdwa_integer_lowering():
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
 
 
+def check_pack_int16_lowering():
+    """Static checks for v_cvt_pk_u16_u32 and v_cvt_pk_i16_i32 in the programs of pack_group()."""
+    a = "asuint(params[0].w)"
+
+    def u16(x, y):
+        return f"asfloat(min({x}, 65535u) | (min({y}, 65535u) << 16u));"
+
+    def i16(x, y):
+        return (f"asfloat((asuint(clamp(asint({x}), -32768, 32767)) & 0xffffu) | "
+                f"(asuint(clamp(asint({y}), -32768, 32767)) << 16u));")
+
+    # The prefix writes alu20..alu23 (B, B >> 16, B >> 12, B >> 16 arithmetic); the body follows at 24.
+    hi, mid, sext = "asuint(alu21)", "asuint(alu22)", "asuint(alu23)"
+    expected = {
+        "unsigned": (u16(f"{PACK_LITERAL}u", hi), u16(mid, hi), u16(hi, a), u16(sext, hi)),
+        "signed": (i16(a, sext), i16(sext, a), i16(hi, sext), i16(f"{(-16) & 0xffffffff}u", sext)),
+    }
+    assert expected.keys() == PACK_BODIES.keys() == PACK_RESULTS.keys() == PACK_WRONG.keys()
+    for group, statements in expected.items():
+        program = uncompressed_export(pack_group(group))
+        assert program.index("v_mov_b32_e32 v18, s45") == 20, group
+        source = translate_int(program)
+        for statement in statements:
+            assert sum(line.endswith(" = " + statement) for line in source.splitlines()) == 1, (group, statement)
+        assert {line.split()[0] for line in PACK_BODIES[group]} & set(PACK_OPS), group
+    assert set(PACK_OPS) <= ACCEPTED, set(PACK_OPS) - ACCEPTED
+    # The Python references at the bounds and one step past them.
+    assert [_sat_u16(v) for v in (0, 0xffff, 0x10000, 0xffffffff)] == [0, 0xffff, 0xffff, 0xffff]
+    assert [_sat_i16(v) for v in (0x7fff, 0x8000, 0xffff8000, 0xffff7fff, 0xffffffff, 0x80000000)] == [
+        0x7fff, 0x7fff, 0x8000, 0x8000, 0xffff, 0x8000]
+    assert PACK_RESULTS["signed"](*PACK_ROWS[0]) == (0xC1257FFF, 0x3FFFC125, 0xC1257FFF, 0xC125FFF0)
+    assert PACK_RESULTS["unsigned"](*PACK_ROWS[1]) == (0x00FFFFFF, 0x00FF0FFF, 0xBFFF00FF, 0x00FF00FF)
+    # Two sources in the VOP3 encoding and nothing else: no e32 spelling (gfx10 has none), no clamp, no float
+    # modifier, an in-range destination, written registers and 32-bit literals only.
+    for op in PACK_OPS:
+        good = f"{op} v12, s44, v18"
+        translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
+        translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", f"{op}_e64 v12, s44, v18"]))
+        for bad in (
+            f"{op}_e32 v12, s44, v18",
+            f"{op} v12, s44, v18 clamp",
+            f"{op} v12, s44",
+            f"{op} v12, s44, v18, s46",
+            f"{op} v12, s44, -v18",
+            f"{op} v12, |v18|, s44",
+            f"{op} v256, s44, v18",
+            f"{op} v12, 0x100000000, v18",
+            f"{op} v12, s44, v106",
+            f"{op}_sdwa v12, v18, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+        ):
+            must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    for op in PACK_OPS:
+        expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", f"{op}_e32 v12, s44, v18"]),
+                           "does not support e32 encoding")
+    # The float packs stay unsupported: no public source found here states their rounding and bounds.
+    for neighbour in (
+        "v_cvt_pknorm_i16_f32 v12, s44, v18",
+        "v_cvt_pknorm_u16_f32 v12, s44, v18",
+        "v_cvt_pknorm_i16_f16 v12, s44, v18",
+        "v_cvt_pknorm_u16_f16 v12, s44, v18",
+        "v_cvt_pk_u8_f32 v12, s44, v18, v18",
+        "v_sat_pk_u8_i16_e32 v12, v18",
+        "v_sat_pk_u8_i16_e64 v12, v18",
+    ):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", neighbour]))
+
+
+def check_carry_out_lowering():
+    """Static checks for v_add_co_u32, v_sub_co_u32 and v_subrev_co_u32 as written by carry_out_group()."""
+    # v18 and v19 are written by the movs at 20 and 21; the first operation is 22, its select 23, the second
+    # 24, its select 25.
+    a, v, c, d = "asuint(params[0].w)", "asuint(alu20)", "params[1].y", "alu21"
+    expected = {
+        "v_add_co_u32": ((f"{a} + {v}", f"co22 < {a}"), (f"{v} + {a}", f"co24 < {v}")),
+        "v_sub_co_u32": ((f"{a} - {v}", f"{v} > {a}"), (f"{v} - {a}", f"{a} > {v}")),
+        "v_subrev_co_u32": ((f"{v} - {a}", f"{a} > {v}"), (f"{a} - {v}", f"{v} > {a}")),
+    }
+    assert set(expected) == set(CARRY_OUT_OPS) == set(CARRY_OUT_ROWS) == set(CARRY_OUT_WRONG)
+    for op, pairs in expected.items():
+        program = uncompressed_export(carry_out_group(op))
+        assert program.index("v_mov_b32_e32 v18, s45") == 20, op
+        source = translate_int(program).splitlines()
+        for index, (result, carry) in zip((22, 24), pairs):
+            for statement in (f"    uint co{index} = {result};", f"    bool cmp{index} = {carry};",
+                              f"    precise float alu{index} = asfloat(co{index});",
+                              f"    precise float alu{index + 1} = cmp{index} ? {d} : {c};"):
+                assert statement in source, (op, statement)
+    assert set(CARRY_OUT_OPS) <= ACCEPTED, set(CARRY_OUT_OPS) - ACCEPTED
+    # The carry goes to vcc, vcc_lo, one SGPR or an SGPR pair, and both sources take a register, an inline
+    # constant or a literal. Nothing else is accepted: no suffix, clamp, float modifier, exec or VGPR as the
+    # mask, missing or extra operand, unwritten register, DPP controls, or the carry-in forms.
+    for op in CARRY_OUT_OPS:
+        for good in (f"{op} v12, vcc, s44, v18", f"{op} v12, vcc_lo, v18, s44", f"{op} v12, s60, v18, v18",
+                     f"{op} v12, s[60:61], 64, v18", f"{op} v12, vcc, v18, 0x12345678", f"{op} v12, vcc, -16, s45"):
+            translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
+        for bad in (f"{op} v12, vcc, s44, v18 clamp", f"{op}_e64 v12, vcc, s44, v18", f"{op}_e32 v12, vcc, s44, v18",
+                    f"{op} v12, s44, v18", f"{op} v12, exec, s44, v18", f"{op} v12, v13, s44, v18",
+                    f"{op} v12, vcc, -s44, v18", f"{op} v12, vcc, s44, |v18|", f"{op} v12, vcc, s44, v106",
+                    f"{op} v12, vcc, s44", f"{op} v12, vcc, s44, v18, vcc", f"{op} vcc, s44, v18",
+                    f"{op} v12, vcc, s44, v18 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                    f"{op.replace('_co_', '_co_ci_')}_e64 v12, vcc, s44, v18, vcc"):
+            must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    # The mask the operation wrote is the one a select reads: a select on another register is refused, and a
+    # later comparison into the same register replaces the carry.
+    must_reject(translate_int, uncompressed_export(
+        ["v_mov_b32_e32 v18, s45", "v_add_co_u32 v12, s[60:61], s44, v18", "v_cndmask_b32_e64 v13, s46, s47, s[62:63]"]))
+    replaced = translate_int(uncompressed_export(
+        ["v_mov_b32_e32 v18, s45", "v_add_co_u32 v12, vcc, s44, v18", "v_cmp_lt_u32_e64 vcc, s44, v18",
+         "v_cndmask_b32_e64 v13, s46, s47, vcc"])).splitlines()
+    assert f"    precise float alu23 = cmp22 ? params[1].z : {c};" in replaced, replaced
+    sources = {op: translate_int(uncompressed_export(carry_out_group(op))) for op in CARRY_OUT_OPS}
+    assert len(set(sources.values())) == 3
+
+
+def check_sad_lowering():
+    """Static checks for v_sad_hi_u8, v_sad_u32 and v_msad_u8 in the programs of sad_group()."""
+    # v18 is written by the mov at index 20 and the four group instructions follow at 21..24.
+    a, b, c, v = "asuint(params[0].w)", "asuint(params[1].x)", "asuint(params[1].y)", "asuint(alu20)"
+    expected = {
+        "bytes": (f"(sad4_u8({a}, {v}, false) << 16u) + {c}", f"(sad4_u8({v}, {a}, false) << 16u) + 0u",
+                  f"sad4_u8({a}, {v}, true) + {c}", f"sad4_u8({v}, {a}, true) + {c}"),
+        "dword": (f"(max({a}, {v}) - min({a}, {v})) + {c}", f"(max({v}, {a}) - min({v}, {a})) + 64u",
+                  f"sad4_u8({a}, {SAD_LITERAL}u, true) + {v}", f"(sad4_u8({b}, {a}, false) << 16u) + {v}"),
+    }
+    assert expected.keys() == SAD_BODIES.keys() == SAD_RESULTS.keys() == SAD_WRONG.keys() == SAD_ROWS.keys()
+    for group, expressions in expected.items():
+        program = uncompressed_export(sad_group(group))
+        assert program.index("v_mov_b32_e32 v18, s45") == 20, group
+        source = translate_int(program)
+        for offset, expression in enumerate(expressions, start=21):
+            statement = f"    precise float alu{offset} = asfloat({expression});"
+            assert statement in source.splitlines(), (group, statement)
+        # The byte-lane helper is emitted once, and only for a program that uses it.
+        assert source.count("uint sad4_u8(uint a, uint b, bool masked)") == 1, group
+    only_dword = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_sad_u32 v12, s44, v18, s46"]))
+    assert "sad4_u8" not in only_dword
+    assert set(SAD_OPS) <= ACCEPTED, set(SAD_OPS) - ACCEPTED
+    assert SAD_OPS == ("v_msad_u8", "v_sad_hi_u8", "v_sad_u32")
+    # The Python references agree with the worked values of the first rows.
+    assert _sad4(0xC1007F90, 0x40C30011) == 0x242 and _sad4(0xC1007F90, 0x40C30011, True) == 0x1C3
+    assert _sad4(0x40C30011, 0xC1007F90, True) == 0x17F
+    assert SAD_RESULTS["dword"](*SAD_ROWS["dword"][0])[0] & 0xffffffff == 0x00EFFFDC
+    # Three sources in the VOP3 encoding and nothing else: no e32 spelling, no clamp (LLVM 15 assembles the
+    # bit, but the ISA text gives it no meaning for an integer result), no float modifier, an in-range
+    # destination, written registers and 32-bit literals only.
+    good = "v_sad_u32 v12, s44, v18, s46"
+    for bad in (
+        "v_sad_u32_e32 v12, s44, v18, s46",
+        "v_sad_u32 v12, s44, v18, s46 clamp",
+        "v_sad_u32 v12, s44, v18",
+        "v_sad_u32 v12, s44, v18, s46, s46",
+        "v_sad_u32 v12, s44, -v18, s46",
+        "v_sad_hi_u8 v12, |v18|, s44, s46",
+        "v_sad_hi_u8_e32 v12, s44, v18, s46",
+        "v_sad_hi_u8 v12, s44, v18, s46 clamp",
+        "v_msad_u8_e32 v12, s44, v18, s46",
+        "v_msad_u8 v12, s44, v18, s46 clamp",
+        "v_msad_u8 v12, s44, abs(v18), s46",
+        "v_msad_u8 v256, s44, v18, s46",
+        "v_msad_u8 v12, s44, 0x100000000, s46",
+        "v_msad_u8 v12, s44, v106, s46",
+    ):
+        translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    # The neighbours stay unsupported: the 8- and 16-bit lane sums without a shift, and the wide packed forms.
+    for neighbour in (
+        "v_sad_u8 v12, s44, v18, s46",
+        "v_sad_u16 v12, s44, v18, s46",
+        "v_qsad_pk_u16_u8 v[12:13], v[18:19], s44, v[20:21]",
+        "v_mqsad_pk_u16_u8 v[12:13], v[18:19], s44, v[20:21]",
+        "v_mqsad_u32_u8 v[12:15], v[18:19], s44, v[20:23]",
+    ):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", neighbour]))
+
+
 def check_nc_integer_lowering():
     """Static checks for the 32-bit no-carry add/sub forms of nc_integer_group(1..3)."""
     # v18 is written by the mov at index 20, and the four group instructions follow at 21..24. A and B are
@@ -6859,7 +7244,10 @@ def check_controls(directory):
             must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop3]))
     check_nc_integer_lowering()
     check_e64_integer_lowering()
+    check_carry_out_lowering()
     check_sdwa_integer_lowering()
+    check_pack_int16_lowering()
+    check_sad_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
     assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED
     for expected in (
@@ -7990,7 +8378,10 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY), translate_int))
     fixtures.append((uncompressed_export(f16_compares()), translate_int))
     fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
+    fixtures.extend((uncompressed_export(carry_out_group(op)), translate_int) for op in CARRY_OUT_OPS)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
+    fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
+    fixtures.extend((uncompressed_export(sad_group(group)), translate_int) for group in SAD_BODIES)
     fixtures.extend((compressed_export(mask), translate_masked) for mask in (0x3, 0xC, 0xF))
     fixtures.extend((uncompressed_export([], mask), translate_masked) for mask in (0x1, 0x8, 0x5, 0xA))
     for index, entry in enumerate(fixtures):
@@ -8534,6 +8925,144 @@ def check_sdwa_integer_draws(directory, compiler, renderer, backend):
             case = directory / f"sdwa_integer-{len(cases)}.case"
             case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
             cases.append((case, status))
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+def check_pack_int16_draws(directory, compiler, renderer, backend):
+    """Draw v_cvt_pk_u16_u32 and v_cvt_pk_i16_i32 through the integer readback target and compare the words.
+
+    Each group of PACK_BODIES is compiled once and drawn in one renderer batch: every row of PACK_ROWS with
+    the right words, and the first row once per PACK_WRONG entry with one channel replaced by the word a wrong
+    lowering would give, which must report a mismatch. On a desktop GPU the draws establish that the
+    translated shader computes the stated operation, not what the console does.
+    """
+    source = directory / "pack_int16.hlsl"
+    shader = directory / "pack_int16.cso"
+
+    def add_case(cases, row, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<2I", constants, 12, *row)
+        case = directory / f"pack_int16-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+
+    for group in PACK_BODIES:
+        source.write_text(translate_int(uncompressed_export(pack_group(group))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for index, row in enumerate(PACK_ROWS):
+            words = tuple(word & 0xffffffff for word in PACK_RESULTS[group](*row))
+            # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+            assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (group, [hex(w) for w in (*row, *words)])
+            add_case(cases, row, words, "pass")
+            if index:
+                continue
+            seen = set()
+            for channel, wrong, reason in PACK_WRONG[group]:
+                wrong_words = list(words)
+                wrong_words[channel] = wrong(*row) & 0xffffffff
+                assert wrong_words[channel] != words[channel], (group, reason)
+                assert (channel, wrong_words[channel]) not in seen, (group, reason)
+                seen.add((channel, wrong_words[channel]))
+                add_case(cases, row, wrong_words, "mismatch")
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+def check_carry_out_draws(directory, compiler, renderer, backend):
+    """Draw v_add_co_u32, v_sub_co_u32 and v_subrev_co_u32 through the integer readback target, bit for bit.
+
+    Each program of carry_out_group() is compiled once and drawn in one renderer batch: every row of
+    CARRY_OUT_ROWS with the right words, then one draw per CARRY_OUT_WRONG entry with one channel of its row
+    replaced by the word a wrong lowering would give, which must report a mismatch. The carry is observed
+    through v_cndmask_b32. On a desktop GPU the draws establish that the translated shader computes the stated
+    operation, not what the console does.
+    """
+    source = directory / "carry_out.hlsl"
+    shader = directory / "carry_out.cso"
+
+    def add_case(cases, row, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *row)
+        case = directory / f"carry_out-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+
+    for op in CARRY_OUT_OPS:
+        source.write_text(translate_int(uncompressed_export(carry_out_group(op))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        rows = [(a, b, *_CARRY_SELECT) for a, b in CARRY_OUT_ROWS[op]]
+        right = [carry_out_words(op, *row) for row in rows]
+        cases = []
+        for row, words in zip(rows, right):
+            # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+            assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (op, [hex(w) for w in (*row, *words)])
+            add_case(cases, row, words, "pass")
+        # Both carry states are drawn for each mask register, so a constant mask cannot pass.
+        for channel in (1, 3):
+            assert {words[channel] for words in right} == set(_CARRY_SELECT), (op, channel)
+        for index, channel, wrong, reason in CARRY_OUT_WRONG[op]:
+            wrong_words = list(right[index])
+            wrong_words[channel] = wrong(*rows[index]) & 0xffffffff
+            assert wrong_words[channel] != right[index][channel], (op, reason)
+            add_case(cases, rows[index], wrong_words, "mismatch")
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+def check_sad_draws(directory, compiler, renderer, backend):
+    """Draw v_sad_hi_u8, v_sad_u32 and v_msad_u8 through the integer readback target and compare the words.
+
+    Each group of SAD_BODIES is compiled once and drawn in one renderer batch: every row of SAD_ROWS with the
+    right words, and the first row once per SAD_WRONG entry with one channel replaced by the word a wrong
+    lowering would give, which must report a mismatch. On a desktop GPU the draws establish that the
+    translated shader computes the stated operation, not what the console does.
+    """
+    source = directory / "sad.hlsl"
+    shader = directory / "sad.cso"
+
+    def add_case(cases, row, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<3I", constants, 12, *row)
+        case = directory / f"sad-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+
+    for group, rows in SAD_ROWS.items():
+        source.write_text(translate_int(uncompressed_export(sad_group(group))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for index, row in enumerate(rows):
+            words = tuple(word & 0xffffffff for word in SAD_RESULTS[group](*row))
+            # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+            assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (group, [hex(w) for w in (*row, *words)])
+            add_case(cases, row, words, "pass")
+            if index:
+                continue
+            seen = set()
+            for channel, wrong, reason in SAD_WRONG[group]:
+                wrong_words = list(words)
+                wrong_words[channel] = wrong(*row) & 0xffffffff
+                assert wrong_words[channel] != words[channel], (group, reason)
+                assert (channel, wrong_words[channel]) not in seen, (group, reason)
+                seen.add((channel, wrong_words[channel]))
+                add_case(cases, row, wrong_words, "mismatch")
         try:
             run_pixel_batch(renderer, backend, shader, cases)
         except subprocess.CalledProcessError as error:
@@ -10886,13 +11415,15 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-int16-vop3", "draw-compressed-export",
-                    "draw-uncompressed-export", "draw-title-loads", "draw-cmp64"):
+                    "draw-mac-legacy", "draw-carry-out", "draw-pack-int16", "draw-sad",
+                    "draw-int16-vop3", "draw-compressed-export", "draw-uncompressed-export",
+                    "draw-title-loads", "draw-cmp64"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
                         "draw-e64-integer": check_e64_integer_draws,
+                        "draw-carry-out": check_carry_out_draws,
                         "draw-sdwa-integer": check_sdwa_integer_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-brev": check_brev_draw,
@@ -10901,6 +11432,8 @@ def main():
                         "draw-vop3-ternary-int": check_vop3_ternary_int_draws,
                         "draw-swap": check_swap_draw,
                         "draw-mac-legacy": check_mac_legacy_draws,
+                        "draw-pack-int16": check_pack_int16_draws,
+                        "draw-sad": check_sad_draws,
                         "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-compressed-export": check_compressed_export_draw,
                         "draw-uncompressed-export": check_uncompressed_export_draw,

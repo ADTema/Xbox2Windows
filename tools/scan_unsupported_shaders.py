@@ -134,6 +134,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_cvt_f32_(?:u32|i32)_e64\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+)(?:\s+clamp)?",
     r"v_ldexp_f32(?:_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+?(?:\s+clamp)?",
     rf"v_(?:(?:add|sub|subrev)_nc_u32(?:_e32|_e64)?|(?:add|sub)_nc_i32)\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
+    rf"v_(?:add|sub|subrev)_co_u32\s+v\d+,\s+{PIXEL_LANE_MASK},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:min|max)_(?:i32|u32)(?:_e32|_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:min3|max3|med3)_(?:i32|u32)(?:_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_cmp_class_f32{PIXEL_VOPC_DST},\s+[^,]+,\s+[^,]+",
@@ -202,7 +203,8 @@ if PIXEL_VOP3_INT16:
     )
 
 for name, (arity, _) in PIXEL_INTEGER.items():
-    encoding = r"(?:_e32|_e64)?" if arity <= 2 else r"(?:_e64)?"
+    vop3_only = arity > 2 or name in getattr(pixel_aot, "INTEGER_VOP3_ONLY", ())
+    encoding = r"(?:_e64)?" if vop3_only else r"(?:_e32|_e64)?"
     SUPPORTED_INSTRUCTIONS_REGEX.append(rf"v_{name}{encoding}\s+v\d+" + rf",\s*{INTEGER_SOURCE}" * arity)
 
 # SDWA forms of the 32-bit integer operations: register sources, optionally under sext(), every field printed,
@@ -304,6 +306,7 @@ KNOWN_RDNA2_BASE_OPCODES |= (
         "s_cmpk_eq_i32", "s_cmpk_lg_i32", "s_cmpk_gt_i32", "s_cmpk_ge_i32", "s_cmpk_lt_i32", "s_cmpk_le_i32",
         "s_cmpk_eq_u32", "s_cmpk_lg_u32", "s_cmpk_gt_u32", "s_cmpk_ge_u32", "s_cmpk_lt_u32", "s_cmpk_le_u32",
         "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_add_nc_i32", "v_sub_nc_i32",
+        "v_add_co_u32", "v_sub_co_u32", "v_subrev_co_u32",
         "v_min3_i32", "v_max3_i32", "v_med3_i32", "v_min3_u32", "v_max3_u32", "v_med3_u32",
         "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32",
         "v_cvt_f32_ubyte0", "v_cvt_f32_ubyte1", "v_cvt_f32_ubyte2", "v_cvt_f32_ubyte3",

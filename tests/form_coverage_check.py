@@ -304,12 +304,16 @@ def check_shader_records():
         "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32",
         "v_min_i32", "v_max_i32", "v_min_u32", "v_max_u32")}
     assert len(sdwa_integer_forms) == 15
+    # gfx10 encodes the carry-out add and subtracts as VOP3 only, under their plain names.
+    carry_out_forms = {("VOP3", "v_add_co_u32"), ("VOP3", "v_sub_co_u32"), ("VOP3", "v_subrev_co_u32")}
+    sad_forms = {("VOP3", "v_sad_hi_u8"), ("VOP3", "v_sad_u32"), ("VOP3", "v_msad_u8")}
     mul24_forms = {
         ("VOP2", "v_mul_i32_i24"), ("VOP3", "v_mul_i32_i24_e64"),
         ("VOP2", "v_mul_u32_u24"), ("VOP3", "v_mul_u32_u24_e64"),
         ("VOP2", "v_mul_hi_i32_i24"), ("VOP3", "v_mul_hi_i32_i24_e64"),
         ("VOP2", "v_mul_hi_u32_u24"), ("VOP3", "v_mul_hi_u32_u24_e64"),
     }
+    pack_int16_forms = {("VOP3", "v_cvt_pk_u16_u32"), ("VOP3", "v_cvt_pk_i16_i32")}
     sop2_lshl_add_forms = {
         ("SOP2", "s_lshl1_add_u32"), ("SOP2", "s_lshl2_add_u32"),
         ("SOP2", "s_lshl3_add_u32"), ("SOP2", "s_lshl4_add_u32"),
@@ -320,8 +324,11 @@ def check_shader_records():
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "v_mul_i32_i24_sdwa",
+        "v_cvt_pk_u8_f32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
+        "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
         "s_absdiff_i64", "s_absdiff_u32",
+        "v_sad_u8", "v_sad_u16", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_mqsad_u32_u8",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
     for name in ("gfx1013.tsv", "rdna2.tsv"):
@@ -334,9 +341,12 @@ def check_shader_records():
         # The VOP3 spellings of the interpolation pair and of v_nop.
         e64_spelling_forms = {("VOP3", "v_interp_p1_f32_e64"), ("VOP3", "v_interp_p2_f32_e64"), ("VOP3", "v_nop_e64")}
         assert e64_spelling_forms <= covered, (name, e64_spelling_forms - covered)
+        assert carry_out_forms <= covered, (name, carry_out_forms - covered)
+        assert sad_forms <= covered, (name, sad_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)
+        assert pack_int16_forms <= covered, (name, pack_int16_forms - covered)
         # v_mac_f32 is in the gfx1013 list only.
         approx_e64_forms = {("VOP3", "v_exp_f32_e64"), ("VOP3", "v_log_f32_e64")}
         approx_e64_forms |= {("VOP3", "v_mac_f32_e64")} if name == "gfx1013.tsv" else set()
