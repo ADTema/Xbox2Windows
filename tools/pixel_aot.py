@@ -648,6 +648,15 @@ CARRY_OUT = {
     "sub": ("{0} - {1}", "{1} > {0}"),
     "subrev": ("{1} - {0}", "{0} > {1}"),
 }
+# v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32 as (partial result {p} of the two sources, result {r}
+# after the carry-in {c}, carry-out). The add carries when either step wraps. The subtracts borrow when the
+# subtrahend is above the minuend or the borrow-in is above the partial difference, which together is when
+# subtrahend + borrow-in exceeds the minuend; subrev computes src1 - src0 - borrow-in.
+CARRY_IN = {
+    "add": ("{0} + {1}", "{p} + {c}", "{p} < {0} || {r} < {p}"),
+    "sub": ("{0} - {1}", "{p} - {c}", "{1} > {0} || {c} > {p}"),
+    "subrev": ("{1} - {0}", "{p} - {c}", "{0} > {1} || {c} > {p}"),
+}
 MUL24_HELPERS = {
     "mul_u32_u24": ("mul24_u32",),
     "mul_i32_i24": ("mul24_i32",),
@@ -3233,6 +3242,33 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             result, carry_out = CARRY_OUT[op]
             lines.append(f"    uint co{i} = {result.format(a, b)};")
             lines.append(f"    bool cmp{i} = {carry_out.format(a, b, r=f'co{i}')};")
+            lines.append(f"    precise float alu{i} = asfloat(co{i});")
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            vector[dst] = f"alu{i}"
+        elif m := match(rf"v_(add|sub|subrev)_co_ci_u32_(e32|e64) (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+), {LANE_MASK}"):
+            # The carry-out add and subtracts above with a carry or borrow of each lane read from a lane mask.
+            # LLVM 15 prints both encodings with their suffix. The VOP2 (e32) encoding reads and writes VCC and
+            # takes a VGPR as src1; the VOP3 (e64) encoding names both masks, which must have the same width.
+            # The carry-in must be a per-lane condition the translator tracks, as for v_cndmask_b32. A trailing
+            # clamp or an operand modifier is left to the fall-through.
+            op, encoding, dst, carry, src0, src1, carry_in = m.groups()
+            regs, in_regs = lane_mask(carry), lane_mask(carry_in)
+            condition = scalar.get(in_regs[0])
+            if (mask != "entry" or dst in sample_dest or int(dst[1:]) > 255 or len(regs) != len(in_regs)
+                    or pending.intersection(regs + in_regs)
+                    or (encoding == "e32" and not (regs == in_regs == ["vcc"] and re.fullmatch(r"v\d+", src1)))
+                    or not isinstance(condition, tuple) or condition[0] != "condition"
+                    or [scalar.get(r) for r in in_regs]
+                    != [(*condition[:2], j, len(in_regs)) for j in range(len(in_regs))]):
+                raise ValueError("Invalid carry-in operation")
+            a = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+            b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+            partial, result, carry_out = CARRY_IN[op]
+            lines.append(f"    uint ci{i} = {condition[1]} ? 1u : 0u;")
+            lines.append(f"    uint cp{i} = {partial.format(a, b)};")
+            lines.append(f"    uint co{i} = {result.format(p=f'cp{i}', c=f'ci{i}')};")
+            lines.append(f"    bool cmp{i} = {carry_out.format(a, b, p=f'cp{i}', c=f'ci{i}', r=f'co{i}')};")
             lines.append(f"    precise float alu{i} = asfloat(co{i});")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
