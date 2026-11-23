@@ -52,9 +52,11 @@ CONTROLS = {
     "nodaz": [("_mm_setcsr(want);", "_mm_setcsr(want & ~0x40u);")],
     # Simulated host without DAZ: only the probed capability changes; the variant must still keep every rule.
     "sim": [("if (!mxcsr_mask) mxcsr_mask = 0xFFBFu;", "mxcsr_mask = 0xFFBFu;")],
-    # The simulated host, with the capability check removed: DAZ would load on a host that lacks it.
+    # Ignore the simulated refusal but clear the bit at the actual load so the mutant is safe
+    # to run even on a physical host without DAZ. It must still be caught continuing guest work.
     "nomask": [("if (!mxcsr_mask) mxcsr_mask = 0xFFBFu;", "mxcsr_mask = 0xFFBFu;"),
-               ("if (want & ~mxcsr_mask)", "if (want & 0u)")],
+               ("if (want & ~mxcsr_mask)", "if (want & 0u)"),
+               ("_mm_setcsr(want);", "_mm_setcsr(want & ~0x40u);")],
 }
 SIMULATED = ("sim", "nomask")
 
@@ -133,10 +135,12 @@ def add_case(host, lib, word):
             struct.unpack_from("<I", state, 0x70)[0], after, state, before)
 
 
-def violation(host, native, lib, label, daz_ok):
-    """The first broken rule, or None. daz_ok: whether the entry should accept DAZ."""
+def violation(host, native, lib, label, daz_ok, probe_daz):
+    """Return the first mismatch for words with or without DAZ, according to probe_daz."""
     for rc in (0, 1):
         for combination, bits in COMBINATIONS.items():
+            if bool(bits & DAZ) != probe_daz:
+                continue
             word = DEFAULT | rc << 13 | bits
             result, ftz_sums, daz_lanes, readback, after, state, before = add_case(host, lib, word)
             if after != CALLER:
@@ -166,7 +170,7 @@ def violation(host, native, lib, label, daz_ok):
                     return (f"{label} rc {rc} {combination}: {ftz_sums}, {daz_lanes}, {readback:#x} != native "
                             f"{reference[1]}, {reference[2]}, {reference[3]:#x}")
     # Guest work after the load runs for an accepted word and not for a refused one.
-    for word in (DEFAULT | FTZ, DEFAULT | DAZ, DEFAULT | FTZ | DAZ):
+    for word in ((DEFAULT | DAZ, DEFAULT | FTZ | DAZ) if probe_daz else (DEFAULT | FTZ,)):
         state = fresh_state()
         host.set(CALLER)
         result = lib.den_after(0, word, 0, ctypes.addressof(state))
@@ -176,7 +180,8 @@ def violation(host, native, lib, label, daz_ok):
         if (result, status(lib, "den_after"), marker) != want or host.get() != CALLER:
             return (f"{label} den_after({word:#x}): (return, status, marker) {(result, status(lib, 'den_after'), marker)}, "
                     f"expected {want}, MXCSR {host.get():#x}")
-    # A guest fault after loading FTZ restores the caller's word.
+    # A guest fault after loading supported denormal mode bits restores the caller's word.
+    fault_word = DEFAULT | FTZ | (DAZ if probe_daz and daz_ok else 0)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.VirtualAlloc.restype = ctypes.c_void_p
     kernel32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
@@ -189,7 +194,7 @@ def violation(host, native, lib, label, daz_ok):
         state = fresh_state()
         host.set(CALLER)
         try:
-            lib.den_fault(page, DEFAULT | FTZ, 0, ctypes.addressof(state))
+            lib.den_fault(page, fault_word, 0, ctypes.addressof(state))
         except OSError:
             pass
         else:
@@ -201,7 +206,7 @@ def violation(host, native, lib, label, daz_ok):
     return None
 
 
-def check(harness_path, native_path, lifted_path, *extra_paths):
+def check(harness_path, native_path, lifted_path, *extra_paths, probe_daz):
     host = Host(harness_path)
     original = host.get()
     try:
@@ -209,26 +214,29 @@ def check(harness_path, native_path, lifted_path, *extra_paths):
         daz_host = bool(mask & DAZ)
         print(f"host MXCSR_MASK {mask:#x}: DAZ {'supported' if daz_host else 'not supported'}")
         native = load(native_path)
-        problem = violation(host, native, load(lifted_path), "lifted", daz_host)
+        problem = violation(host, native, load(lifted_path), "lifted", daz_host, probe_daz)
         if problem:
             raise AssertionError(problem)
-        scope = ("FTZ flushes the tiny signed sums and DAZ zeros the subnormal signed operands, in all four "
-                 "combinations under round to nearest and toward negative infinity, as natively and as the fixed raw "
-                 "words" if daz_host else
-                 "FTZ flushes the tiny signed sums under both rounding controls, as natively and as the fixed raw words, "
-                 "and every word with DAZ is refused before LDMXCSR")
+        if not probe_daz:
+            scope = "FTZ flushes the tiny signed sums under both rounding controls, as natively and as the fixed raw words"
+        elif daz_host:
+            scope = "DAZ zeros the signed subnormal operands with FTZ off and on, under both rounding controls"
+        else:
+            scope = "Every request with DAZ is refused before LDMXCSR"
         print(f"lifted: {scope}; read-back, adjacent bytes, the refusal marker and the caller's word after return "
               "and fault hold")
         for path in extra_paths:
             stem = Path(path).stem
             variant = "lifted_o2" if stem.endswith("_o2") else stem.rsplit("_", 1)[-1]
+            if variant not in (("nodaz", "sim", "nomask", "lifted_o2") if probe_daz else ("noftz", "lifted_o2")):
+                continue
             if variant == "nodaz" and not daz_host:
                 # The host refuses DAZ already, so a translation that clears it cannot differ.
                 print("control nodaz is not measurable: this host has no DAZ")
                 continue
             simulated = variant in SIMULATED
             problem = violation(host, None if simulated else native, load(path), variant,
-                                daz_host and not simulated)
+                                daz_host and not simulated, probe_daz)
             if variant in ("lifted_o2", "sim"):
                 if problem:
                     raise AssertionError(problem)
@@ -238,8 +246,8 @@ def check(harness_path, native_path, lifted_path, *extra_paths):
                 print(f"control {variant}: {problem}")
                 if problem is None:
                     raise AssertionError(f"control {variant} kept every rule")
-        if not daz_host:
-            print("skip: this host's MXCSR_MASK has no DAZ; the FTZ checks above passed")
+        if probe_daz and not daz_host:
+            print("skip: this host's MXCSR_MASK has no DAZ; the refusal controls above passed")
             raise SystemExit(77)
     finally:
         host.set(original)
@@ -250,7 +258,7 @@ if __name__ == "__main__":
     if mode == "emit":
         image, output, *variant = args
         emit(Path(image), Path(output), *variant)
-    elif mode == "check":
-        check(*args)
+    elif mode in ("check-ftz", "check-daz"):
+        check(*args, probe_daz=(mode == "check-daz"))
     else:
         raise ValueError(mode)

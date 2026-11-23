@@ -2372,9 +2372,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_lifted.cpp" VERBATIM)
     add_custom_target(cpu_mxcsr_denormals_lifted_o2 ALL DEPENDS "${den_o2}")
     add_test(NAME cpu_aot_mxcsr_denormals COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr_denormals.py"
-        check "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr_denormals>"
+        check-ftz "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr_denormals>"
         "$<TARGET_FILE:cpu_mxcsr_denormals_lifted>" ${mxcsr_denormals_extras} "${den_o2}")
-    set_tests_properties(cpu_aot_mxcsr_denormals PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME cpu_aot_mxcsr_denormals_daz COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr_denormals.py"
+        check-daz "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr_denormals>"
+        "$<TARGET_FILE:cpu_mxcsr_denormals_lifted>" ${mxcsr_denormals_extras} "${den_o2}")
+    set_tests_properties(cpu_aot_mxcsr_denormals_daz PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
