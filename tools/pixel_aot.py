@@ -987,6 +987,13 @@ VOP3_INT16 = {
     "mul_lo_u16": "mul_lo_u16",
     "lshlrev_b16": "lshlrev_b16", "lshrrev_b16": "lshrrev_b16", "ashrrev_i16": "ashrrev_i16",
 }
+# Three-operand forms of the same contract (LLVM 15 VOP3Instructions.td: V_MAD_{U,I}16 are Ternary_i16_Pats<mul, add>,
+# V_{MIN3,MAX3,MED3}_{I,U}16 are AMDGPU{s,u}{min3,max3,med3}). clamp and op_sel are not modelled and are refused.
+VOP3_INT16_TERNARY = {
+    "mad_u16": "mad_u16", "mad_i16": "mad_i16",
+    "min3_i16": "min3_i16", "min3_u16": "min3_u16", "max3_i16": "max3_i16", "max3_u16": "max3_u16",
+    "med3_i16": "med3_i16", "med3_u16": "med3_u16",
+}
 
 
 def sgpr_name(token):
@@ -1696,6 +1703,12 @@ def pk_int16_lane_expr(op, word_vars, sel, clamp):
     if op == "mad_u16":
         r = f"({u16(word_vars[0], sel[0])} * {u16(word_vars[1], sel[1])} + {u16(word_vars[2], sel[2])})"
         return f"min({r}, 65535u)" if clamp else f"({r} & 0xffffu)"
+    if op in ("min3_i16", "max3_i16", "med3_i16", "min3_u16", "max3_u16", "med3_u16"):
+        kind = op[-3:]
+        a, b, c = ((i16 if kind == "i16" else u16)(w, hi) for w, hi in zip(word_vars, sel))
+        r = {"min3": f"min(min({a}, {b}), {c})", "max3": f"max(max({a}, {b}), {c})",
+             "med3": f"max(min({a}, {b}), min(max({a}, {b}), {c}))"}[op[:4]]
+        return f"(asuint({r}) & 0xffffu)" if kind == "i16" else r
     if op == "lshlrev_b16":
         return f"(({u16(word_vars[1], sel[1])} << ({u16(word_vars[0], sel[0])} & 15u)) & 0xffffu)"
     if op == "lshrrev_b16":
@@ -1772,10 +1785,11 @@ class VectorRegisters(dict):
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
-          second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
+          texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
           title_ranges=None, flat_global_only=False, return_write_mask=False):
     """Track descriptor provenance, interpolation and packed or uncompressed exports.
 
+    texture_offset is the aligned byte offset of t0 in the texture descriptor table.
     constant_descriptor is the byte offset, on the texture table, of the descriptor mapped to b0.
     Each extra_constants entry is an (entry SGPR, byte offset) pair naming one further 16-byte
     descriptor; the entries map in order to b1 onward. The SGPR may be the texture table or another
@@ -1792,6 +1806,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Invalid scalar inputs")
     if sampler is not None and (len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
         raise ValueError("Invalid sampler descriptor words")
+    if texture_offset < 0 or texture_offset % 32:
+        raise ValueError("Texture descriptor offset must be non-negative and 32-byte aligned")
+    if sampler is None and texture_offset != 0:
+        raise ValueError("Texture offset requires a sampler")
     if texcoord_components not in (2, 4):
         raise ValueError("Expected two or four TEXCOORD components")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
@@ -1804,11 +1822,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if constant_descriptor < 0 or constant_descriptor % 4:
             raise ValueError("Invalid constant descriptor offset")
         lines.insert(0, "cbuffer Constants : register(b0) { float4 params[16]; };")
-    bindings = {} if sampler is None else {0: "tex"}
+    bindings = {} if sampler is None else {texture_offset: "tex"}
     if second_texture_offset is not None:
         if sampler is None:
             raise ValueError("Second texture requires a sampler")
-        if second_texture_offset < 32 or second_texture_offset % 32:
+        if (second_texture_offset < 0 or second_texture_offset % 32
+                or abs(second_texture_offset - texture_offset) < 32):
             raise ValueError("Second texture descriptor must have a distinct aligned offset")
         bindings[second_texture_offset] = "tex1"
         lines.insert(0, "Texture2D<float4> tex1 : register(t1);")
@@ -2361,14 +2380,27 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"(image_sample(?:_lz)?) v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:(0x[7f]) dim:SQ_RSRC_IMG_2D"):
-            op, *operands, dmask = m.groups()
-            lod_zero = op == "image_sample_lz"
-            if lod_zero and dmask != "0xf":
-                raise ValueError("LOD-zero sampling requires dmask:0xf")
-            channel_count = 3 if dmask == "0x7" else 4
-            dest, coords, image, state = [registers(*operands[k:k+2], width)
-                                          for k, width in zip((0,2,4,6), (channel_count,2,8,4))]
+        elif m := match(r"(image_sample(?:_lz|_l|_b)?) (?:v\[(\d+):(\d+)\]|v(\d+)), v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
+            op, dst_first, dst_last, dst_single, *rest, dmask_hex = m.groups()
+            dmask = int(dmask_hex, 16)
+            if op != "image_sample" and dmask != 0xf:
+                raise ValueError(f"{op} requires dmask:0xf")
+            coord_width = 3 if op in ("image_sample_l", "image_sample_b") else 2
+            channels = ["xyzw"[bit] for bit in range(4) if (dmask >> bit) & 1]
+            if len(channels) == 1:
+                if dst_single is None:
+                    raise ValueError("Single-channel image_sample requires a single VGPR destination")
+                dest = range(int(dst_single), int(dst_single) + 1)
+            else:
+                if dst_single is not None:
+                    raise ValueError("Multi-channel image_sample requires a VGPR range destination")
+                dest = registers(dst_first, dst_last, len(channels))
+            coords, image, state = [registers(*rest[k:k+2], width)
+                                    for k, width in zip((0, 2, 4), (coord_width, 8, 4))]
+            if dest.stop > 256:
+                raise ValueError("Texture sample destination VGPR out of range")
+            if coords.stop > 256:
+                raise ValueError("Texture sample coordinate VGPR out of range")
             if any(f"v{n}" in sample_dest for n in dest):
                 raise ValueError("Write overlaps an outstanding sample")
             descriptor = [scalar.get(f"s{n}") for n in image]
@@ -2380,20 +2412,40 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if sample_kind == "comparison":
                 raise ValueError("Comparison and ordinary sampling in one program")
             sample_kind = "plain"
-            uv = [vector[f"v{n}"] for n in coords]
-            if lod_zero:
-                if second_texture_offset is not None:
-                    raise ValueError("LOD-zero sampling requires a single texture sample")
-                uv = [f"uv.{v[1]}" if isinstance(v, tuple) and v[0] == "entry_uv" else v for v in uv]
-            if any(v not in quad_values for v in uv):
+            if op != "image_sample" and second_texture_offset is not None:
+                raise ValueError(f"{op} requires a single texture binding")
+            coord_regs = [f"v{n}" for n in coords]
+            if any(reg not in vector for reg in coord_regs):
                 raise ValueError("Unsupported texture coordinate")
-            coordinate = f"float2({', '.join(uv)})"
-            call = f"SampleLevel(samp, {coordinate}, 0.0f)" if lod_zero else f"Sample(samp, {coordinate})"
+
+            def sample_coord(reg):
+                value = vector[reg]
+                if isinstance(value, tuple) and value[0] == "entry_uv":
+                    return f"uv.{value[1]}"
+                if value in ("uv.x", "uv.y"):
+                    return value
+                return fp_operand(reg, scalar, vector, pending, sample_dest)
+
+            if op in ("image_sample_lz", "image_sample_l"):
+                u, v = [sample_coord(reg) for reg in coord_regs[:2]]
+                lod = sample_coord(coord_regs[2]) if op == "image_sample_l" else "0.0f"
+                call = f"SampleLevel(samp, float2({u}, {v}), {lod})"
+            else:
+                # RDNA2 places bias before the UV pair. Only UV contributes derivatives.
+                uv = [vector[reg] for reg in coord_regs[-2:]]
+                if any(value not in quad_values for value in uv):
+                    raise ValueError("Unsupported texture coordinate")
+                coordinate = f"float2({', '.join(uv)})"
+                if op == "image_sample_b":
+                    bias = sample_coord(coord_regs[0])
+                    call = f"SampleBias(samp, {coordinate}, {bias})"
+                else:
+                    call = f"Sample(samp, {coordinate})"
             lines.append(f"    float4 sample{i} = {texture}.{call};")
             samples += 1
             vector_loads += 1
-            for j, n in enumerate(dest):
-                vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
+            for ch, n in zip(channels, dest):
+                vector[f"v{n}"] = f"sample{i}.{ch}"
                 sample_dest[f"v{n}"] = vector_loads
         elif m := match(r"(flat|global)_load_dword (v\d+), v\[(\d+):(\d+)\](, off)?(?: offset:(-?\d+))?"):
             # One DWORD through a 64-bit title address. Cache-policy bits, the global saddr form and
@@ -3118,7 +3170,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint pki{i}_l1 = {hi_expr};")
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat(pki{i}_l0 | (pki{i}_l1 << 16));")
-        elif m := match(rf"v_({'|'.join(VOP3_INT16)})(?:_e64)? (v\d+), ([^,\s]+), ([^,\s]+)"):
+        elif m := match(rf"v_({'|'.join([*VOP3_INT16, *VOP3_INT16_TERNARY])})(?:_e64)? (v\d+), ([^,\s]+), ([^,\s]+)(?:, ([^,\s]+))?"):
             # Non-packed 16-bit integer VOP3 ops. The result is tracked as ("low16", alu): only bits 15:0
             # are defined. The HLSL variable holds the zero-extended result, but its upper half is an
             # implementation detail that no accepted reader observes (16-bit ops, 16-bit compares and
@@ -3126,8 +3178,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # high half is not measured here, so the destination may hold anything and nothing is merged.
             # Modifiers, op_sel, clamp, DPP and SDWA never match the anchored operands.
             name, dst, *sources = m.groups()
+            sources = [tok for tok in sources if tok is not None]
             if mask != "entry":
                 raise ValueError("Invalid 16-bit integer operation")
+            if len(sources) != (3 if name in VOP3_INT16_TERNARY else 2):
+                raise ValueError(f"Wrong 16-bit integer operand count for v_{name}")
             if not 0 <= int(dst[1:]) <= 255:
                 raise ValueError(f"Register out of range: {dst}")
             if dst in sample_dest:
@@ -3147,7 +3202,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     bits = int_operand(tok, scalar, vector, pending, sample_dest, signed=False)
                 lines.append(f"    uint i16s{i}_{k} = {bits};")
                 word_vars.append(f"i16s{i}_{k}")
-            expr = pk_int16_lane_expr(VOP3_INT16[name], word_vars, [0, 0], False)
+            expr = pk_int16_lane_expr({**VOP3_INT16, **VOP3_INT16_TERNARY}[name], word_vars, [0] * len(word_vars), False)
             vector[dst] = ("low16", f"alu{i}")
             lines.append(f"    precise float alu{i} = asfloat({expr});")
         elif m := match(r"v_cvt_off_f32_i4(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
@@ -3346,6 +3401,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="Destination .hlsl in a local output directory")
     parser.add_argument("--constant-descriptor", type=lambda s: int(s, 0),
                         help="Byte offset of a descriptor mapped to the 256-byte desktop buffer b0")
+    parser.add_argument("--texture-offset", type=lambda s: int(s, 0), default=0,
+                        help="Byte offset of the t0 descriptor in the texture descriptor table")
     parser.add_argument("--extra-constant", type=lambda s: int(s, 0), nargs=2, action="append", default=[],
                         metavar=("SGPR", "OFFSET"),
                         help="Entry register and byte offset of a further descriptor; repeat for b1, b2 and onward")
@@ -3357,7 +3414,8 @@ def main():
     try:
         blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256, llvm=args.llvm)
         instructions = disassemble(code, args.llvm)
-        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor, second_texture_offset=args.second_texture_offset,
+        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor,
+                       texture_offset=args.texture_offset, second_texture_offset=args.second_texture_offset,
                        extra_constants=[tuple(entry) for entry in args.extra_constant])
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")
