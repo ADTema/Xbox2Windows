@@ -3005,6 +3005,49 @@ def bfm_scalar_ops_reference(words):
     return (b32(s44, s45), b32(s46, s47), b64 & 0xffffffff, b64 >> 32)
 
 
+# s_brev_b32: s46 and s47 are reversed, s44 and s45 only set SCC. The words cover 0, all ones, the top bit, bit 0,
+# alternating bits and an asymmetric pattern, with SCC set for equal s44/s45 and clear otherwise.
+BREV_WORDS = (
+    (5, 5, 0x00000000, 0xffffffff),
+    (5, 6, 0xffffffff, 0x80000000),
+    (7, 7, 0x80000000, 0x00000001),
+    (1, 2, 0x00000001, 0xaaaaaaaa),
+    (9, 9, 0xaaaaaaaa, 0x12345678),
+    (3, 4, 0x12345678, 0x55555555),
+    (8, 8, 0xffffffff, 0x80000000),
+)
+BREV_LITERAL = 0x12345678
+
+
+def brev_scalar_ops() -> list[str]:
+    """s_brev_b32 between an SCC-setting compare and the select that reads it: the select proves SCC is preserved."""
+    return uncompressed_export([
+        "s_cmp_eq_u32 s44, s45",
+        "s_brev_b32 s50, s46",
+        f"s_brev_b32 s51, {BREV_LITERAL:#x}",
+        "s_cselect_b32 s52, s47, 0",
+        "s_brev_b32 s53, s47",
+        "v_mov_b32_e32 v12, s50",
+        "v_mov_b32_e32 v13, s51",
+        "v_mov_b32_e32 v14, s52",
+        "v_mov_b32_e32 v15, s53",
+    ])
+
+
+def brev_scalar_ops_reference(words):
+    """Independent bit loop; the select arm shows SCC from the compare (s44 == s45) survived both reversals."""
+    s44, s45, s46, s47 = words
+
+    def reverse(value):
+        result = 0
+        for bit in range(32):
+            if value >> bit & 1:
+                result |= 1 << (31 - bit)
+        return result
+
+    return (reverse(s46), reverse(BREV_LITERAL), s47 if s44 == s45 else 0, reverse(s47))
+
+
 def scalar():
     return with_constants(scalar_body())
 
@@ -3153,7 +3196,7 @@ def check_scalar_controls():
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
                 "s_bfe_u32 s62, v12, s45", "s_lshl5_add_u32 s62, s44, s45",
                 "s_bitreplicate_b64_b32 s[62:63], v12", "s_bitset0_b64 s[62:63], s44",
-                "s_brev_b32 s62, s44", "s_and_b64 s[62:63], s[44:46], s[46:47]",
+                "s_brev_b32 s62, v12", "s_and_b64 s[62:63], s[44:46], s[46:47]",
                 "s_add_u32 s62, s[44:45], s45", "s_add_u32 s62, s44", "s_add_u32 s62, s44, s45, s46",
                 "s_add_u32 s62, -s44, s45", "s_add_u32 s62, s28, s45", "s_add_u32 s62, s20, s45",
                 "s_add_u32 s62, s90, s45", "s_add_u32 s62, vcc_lo, s45", "s_add_u32 s62, exec_lo, s45",
@@ -3242,6 +3285,41 @@ def check_scalar_controls():
                      ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s90, s45")):
         changed = [line.replace(old, new) for line in bfm_program]
         assert changed != bfm_program, new
+        must_reject(translate_int, changed)
+
+    # s_brev_b32: reverses all 32 bits and leaves SCC untouched, so the select still reads the compare's SCC.
+    brev_program = brev_scalar_ops()
+    brev_source = translate_int(brev_program)
+    assert re.search(r"uint salu\d+ = reversebits\(asuint\(params\[1\]\.y\)\);", brev_source), brev_source
+    assert re.search(r"uint salu\d+ = reversebits\(asuint\(params\[1\]\.z\)\);", brev_source), brev_source
+    assert brev_source.count("reversebits(") == 3, brev_source
+    assert len(re.findall(r"\bscc\d+ =", brev_source)) == 1, brev_source  # only the compare writes SCC
+    assert re.search(r"= scc\d+ \? asuint\(params\[1\]\.z\) : 0u;", brev_source), brev_source
+    brev_refs = [brev_scalar_ops_reference(words) for words in BREV_WORDS]
+    assert brev_refs[0] == (0, 0x1e6a2c48, 0xffffffff, 0xffffffff), brev_refs[0]
+    assert brev_refs[1] == (0xffffffff, 0x1e6a2c48, 0, 1), brev_refs[1]
+    assert brev_refs[2] == (1, 0x1e6a2c48, 1, 0x80000000), brev_refs[2]
+    assert brev_refs[3][3] == 0x55555555 and brev_refs[4][0] == 0x55555555, brev_refs
+    assert brev_refs[4][3] == 0x1e6a2c48 and brev_refs[5][0] == 0x1e6a2c48, brev_refs
+    # Both SCC outcomes appear, so a brev that wrote SCC would change the select arm for some word set.
+    assert {words[0] == words[1] for words in BREV_WORDS} == {True, False}
+    # Without a tracked SCC the select is rejected even after s_brev_b32 (it does not create one).
+    brev_at = brev_program.index("s_cmp_eq_u32 s44, s45")
+    must_reject(translate_int, brev_program[:brev_at] + brev_program[brev_at + 1:])
+    brev_wait = brev_program.index("s_waitcnt lgkmcnt(0)", brev_program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    # Before the s_waitcnt, s44..s47 are still pending scalar loads: reading or overwriting them must be refused.
+    for bad in ("s_brev_b32 s50, s46", "s_brev_b32 s47, 1", "s_brev_b32 s50, s44"):
+        must_reject(translate_int, brev_program[:brev_wait] + [bad] + brev_program[brev_wait:])
+    for old, new in (("s_brev_b32 s50, s46", "s_brev_b32 v12, s46"),
+                     ("s_brev_b32 s50, s46", "s_brev_b32 s50, v12"),
+                     ("s_brev_b32 s50, s46", "s_brev_b32 s50"),
+                     ("s_brev_b32 s50, s46", "s_brev_b32 s50, s46, s47"),
+                     ("s_brev_b32 s50, s46", "s_brev_b32 s106, s46"),
+                     ("s_brev_b32 s50, s46", "s_brev_b32 s[50:51], s46"),
+                     ("s_brev_b32 s50, s46", "s_brev_b32 s50, s[46:47]"),
+                     ("s_brev_b32 s50, s46", "s_brev_b32 s50, s90")):
+        changed = [line.replace(old, new) for line in brev_program]
+        assert changed != brev_program, new
         must_reject(translate_int, changed)
 
     quadmask_source = translate_int(quadmask_bitreplicate_program("s_quadmask_b32"))
@@ -5948,6 +6026,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((sext_values(), translate))
     fixtures.append((sop1_scalar_ops(), translate_int))
     fixtures.append((bfm_scalar_ops(), translate_int))
+    fixtures.append((brev_scalar_ops(), translate_int))
     fixtures.extend((quadmask_bitreplicate_program(op), translate_int)
                     for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
     fixtures.append((scalar_select64(), translate_int))
@@ -8067,6 +8146,50 @@ def check_bfm_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutating {label} escaped detection")
 
 
+def check_brev_draw(directory, compiler, renderer, backend):
+    """s_brev_b32 against the Python reference, then controls that must mismatch."""
+    source = directory / "brev.hlsl"
+    shader = directory / "brev.cso"
+    program = brev_scalar_ops()
+    lowered = translate_int(program)
+
+    cases = []
+    for idx, words in enumerate(BREV_WORDS):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        expected = brev_scalar_ops_reference(words)
+        case = directory / f"brev-{idx}.case"
+        write_case(case, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+        cases.append(case)
+
+    source.write_text(lowered, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases])
+
+    def expect_mismatch(text, label):
+        source.write_text(text, encoding="ascii")
+        compile_shader(compiler, source, shader)
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, cases)
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+    # Control (a): a bitwise complement instead of the reversal.
+    mutated = lowered.replace("reversebits(", "~(")
+    assert mutated != lowered
+    expect_mismatch(mutated, "reversebits to complement")
+    # Control (b): the program writes SCC. s_not_b32 sets SCC to a nonzero result, so the select lane flips for the
+    # word sets whose compare disagrees (set 3 turns SCC on, set 6 turns it off); the destinations stay unchanged
+    # here, so only the select channel can reveal it.
+    extra = program[:]
+    at = extra.index("s_cselect_b32 s52, s47, 0")
+    extra.insert(at, "s_not_b32 s54, s46")
+    expect_mismatch(translate_int(extra), "SCC written after s_brev_b32")
+    # Control (b'): the instruction itself replaced by one that writes SCC.
+    swapped = [line.replace("s_brev_b32 s50, s46", "s_not_b32 s50, s46") for line in program]
+    assert swapped != program
+    expect_mismatch(translate_int(swapped), "s_brev_b32 replaced by s_not_b32")
+
+
 def check_e64_render(directory, compiler, renderer, backend):
     """The e64 draw cases on their own, so they run as a separate CTest entry per backend. A renderer that reports an
     unavailable adapter (exit 77) makes this a skip, as for the other pixel draws."""
@@ -8097,13 +8220,14 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
-                    "draw-e64-integer", "draw-bfm", "draw-align"):
+                    "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
                         "draw-e64-integer": check_e64_integer_draws,
                         "draw-bfm": check_bfm_draw,
+                        "draw-brev": check_brev_draw,
                         "draw-align": check_align_draws}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:

@@ -368,6 +368,23 @@ def check_shader_records():
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(rounding)
 
 
+def check_scalar_brev():
+    """s_brev_b32 counts as covered SOP1 in both references once the lowering accepts it."""
+    import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    pixel.translate_int(pixel.brev_scalar_ops())
+    assert "s_brev_b32" in pixel.ACCEPTED
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert ("SOP1", "s_brev_b32") in reference, name
+        assert ("SOP1", "s_brev_b32") in fc.gfx_forms(pixel.ACCEPTED, reference), name
+        # Negative control: without the accepted program the form is not covered.
+        assert ("SOP1", "s_brev_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"s_brev_b32"}, reference), name
+    pixel.ACCEPTED.clear()
+    pixel.ACCEPTED.update(saved)
+
+
 def check_parsing():
     with tempfile.TemporaryDirectory() as tmp:
         junit = Path(tmp) / "results.xml"
@@ -643,6 +660,7 @@ if __name__ == "__main__":
     check_local_cpu_registration()
     check_cpu_records()
     check_shader_records()
+    check_scalar_brev()
     check_parsing()
     check_gaps()
     check_dashboard()
