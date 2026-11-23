@@ -1,10 +1,20 @@
 # Xbox2Windows
 
-Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. The public tests build their own inputs and run without a game installation.
+**[Join the Xbox2Windows Dev Discord](https://discord.gg/DMcmNtpd6R)** · [Project status](#current-results-and-open-work) · [Get involved](#community-and-contributions) · [Build on Windows](#first-build) · [Run the GPU check](#run-the-gpu-check)
 
-**Startup status.** Source-built Windows programs run from entry to process exit. The main executable was absent from the inspected package. Execution of the title's CPU code, full-game startup and frame rate remain unverified.
+Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. You can run the public tests without a game installation.
 
-[Results](#current-results-and-open-work) · [Coverage chart](#instruction-coverage) · [Community and contributions](#community-and-contributions) · [Build on Windows](#first-build) · [Choose an experiment](#choose-an-experiment) · [Run the GPU check](#run-the-gpu-check)
+> **Current status.** Source-built programs run from PE entry to exit, and selected shader fixtures produce checked D3D12 output. Execution of the title's CPU code, full-game startup and frame rate remain unverified.
+
+## Community and contributions
+
+- **Follow the project or ask a question.** Start in `#start-here` on Discord. Read `#announcements` for verified progress or ask in `#general`. Everyone is welcome to follow along. For a build problem that others may hit, post the commit, command and error in [Development Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a).
+- **Test your GPU without building.** Run the [standalone Windows GPU check](#run-the-gpu-check) and post the generated report in [issue #1](https://github.com/R0Y00/Xbox2Windows/issues/1). Failures and capability skips are welcome.
+- **Contribute code or review a change.** Pick a [good first issue](https://github.com/R0Y00/Xbox2Windows/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) or a [task tagged help wanted](https://github.com/R0Y00/Xbox2Windows/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22). Check existing claims and [open PRs](https://github.com/R0Y00/Xbox2Windows/pulls), then say what you plan to test on the issue. The [contribution guide](CONTRIBUTING.md) covers patches, reproducible reports and reviews.
+
+Use `#dev-coordination` on Discord to find a reviewer and `#windows-testing` to arrange a test run. Record claims, test evidence, review conclusions and decisions on the corresponding GitHub issue or PR. Keep game files, dumps, distribution links and private logs local.
+
+[New contributor guide](https://github.com/R0Y00/Xbox2Windows/discussions/75) · [Report a bug or propose research](https://github.com/R0Y00/Xbox2Windows/issues/new/choose) · [Code of conduct](CODE_OF_CONDUCT.md) · [Private security reports](SECURITY.md)
 
 ## Current results and open work
 
@@ -30,22 +40,13 @@ Both Windows jobs on `main` must pass before CI publishes a new chart. The image
 
 [Chart source commit and CI run](https://github.com/R0Y00/Xbox2Windows/tree/coverage-dashboard#instruction-coverage) · [Find forms without a passing fixture](CONTRIBUTING.md#share-a-reproducible-finding)
 
-## Community and contributions
-
-Join [Xbox2Windows Dev on Discord](https://discord.gg/DMcmNtpd6R) for project questions, review coordination and independent test runs. Record task claims, reproduction evidence and decisions on the relevant GitHub issue or PR.
-
-- **Claim a task.** Search for the behavior or test name in [open issues](https://github.com/R0Y00/Xbox2Windows/issues) and [open PRs](https://github.com/R0Y00/Xbox2Windows/pulls). On the issue, say what you will test, on which platform, and which shared interface or other PR your work depends on. For a first patch, start with [good first issues](https://github.com/R0Y00/Xbox2Windows/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
-- **Submit a change.** Keep the PR focused on one behavior. Link the task it advances and any prerequisite PR. Include the exact command, expected and observed results, and a negative control for a new fixture. [Patch and evidence guide](CONTRIBUTING.md#submit-and-review-a-patch)
-- **Review a PR.** For CPU translation or PE loading, reproduce the comparison with the original fixture. For shaders or GPU compatibility, check the DXIL and relevant WARP or hardware results. Both reviewers cover shared CPU/GPU interfaces. Record your verdict and the commit you tested. The Maintainer merges after review threads are resolved and the required Windows check passes. [Review responsibilities](CONTRIBUTING.md#who-reviews-and-merges-a-pr)
-- **Contribute a hardware result.** Run the [standalone GPU check](#run-the-gpu-check) and post the report in [issue #1](https://github.com/R0Y00/Xbox2Windows/issues/1). You can also claim a batch there without owning a GPU. Verify the original logs, add new adapters as rows in the [hardware table](#hardware-coverage), and link driver retests in the existing row.
-
-[New contributor guide](https://github.com/R0Y00/Xbox2Windows/discussions/75) · [Build and debugging Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a) · [Report a bug or propose research](https://github.com/R0Y00/Xbox2Windows/issues/new/choose) · [Community conduct](CODE_OF_CONDUCT.md) · [Private security reports](SECURITY.md)
-
 ## First build
 
-On x64 Windows, install Python 3.11 or newer and Visual Studio's **Desktop development with C++** workload, including x64 MSVC, CMake, Ninja, and Windows SDK 10.0.26100 with DXC. Windows CI uses Python 3.12. Open PowerShell at the repository root and run the following commands.
+On x64 Windows, install Python 3.11 or newer and Visual Studio's **Desktop development with C++** workload, including x64 MSVC, CMake, Ninja, and Windows SDK 10.0.26100 with DXC. Windows CI uses Python 3.12. Open PowerShell and run the following commands. If you already have a clone, start at `.\tools\dev.ps1`.
 
 ```powershell
+git clone https://github.com/R0Y00/Xbox2Windows.git
+cd Xbox2Windows
 .\tools\dev.ps1
 python -m venv out/pe-env
 .\out\pe-env\Scripts\python.exe -m pip install -r requirements-dev.txt
