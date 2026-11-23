@@ -3,6 +3,8 @@
 Exercises contiguous mapping and scatter mapping contracts under controlled recording provider:
 - XMemMapPhysicalPages: 64 KiB alignment check, valid map, valid unmap (NULL page array), and unaligned/null refusals.
 - XMemMapPhysicalPagesScatter: valid scatter map, valid scatter unmap (NULL page array), and null array refusal.
+- Changed-argument controls: wrong page IDs and swapped scatter destinations are refused.
+- Trace verification: verifies expected count, page IDs, and ordered addresses in recorded trace.
 - Live-worker control: verifies clean finish_exe process exit under CPU_CRC_TEST_LIVE_WORKER.
 - Mapped return: verifies mapped return to host under pe_map.
 - Independent negative controls: pe_map stops before entry when each named export is withheld independently.
@@ -21,6 +23,14 @@ import pefile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mapped_exe_chain_check import run_mapped
 from native_map_check import Mapper, STATUS
+
+# Synthetic fixture inputs chosen for this fixture
+FIXTURE_ALIGNED_ADDR = 0x10000000
+FIXTURE_SCATTER_ADDR0 = 0x10000000
+FIXTURE_SCATTER_ADDR1 = 0x10010000
+FIXTURE_PAGE_0 = 1
+FIXTURE_PAGE_1 = 2
+FIXTURE_PAGE_COUNT = 2
 
 
 def imports_by_dll(image):
@@ -68,6 +78,7 @@ def compare(mapper_path, exe_path, provider_path, io_path):
         "get_map_pages_unmap_count",
         "get_scatter_map_call_count",
         "get_scatter_unmap_count",
+        "get_argument_mismatch_count",
     ])
     check("caller imports", imports, {
         io_name: ["finish_exe"],
@@ -86,6 +97,16 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     prov_lib.get_map_pages_unmap_count.restype = ctypes.c_uint32
     prov_lib.get_scatter_map_call_count.restype = ctypes.c_uint32
     prov_lib.get_scatter_unmap_count.restype = ctypes.c_uint32
+    prov_lib.get_argument_mismatch_count.restype = ctypes.c_uint32
+    prov_lib.get_recorded_map_address.restype = ctypes.c_uint64
+    prov_lib.get_recorded_map_count.restype = ctypes.c_uint64
+    prov_lib.get_recorded_map_page.restype = ctypes.c_uint64
+    prov_lib.get_recorded_map_page.argtypes = [ctypes.c_uint32]
+    prov_lib.get_recorded_scatter_address.restype = ctypes.c_uint64
+    prov_lib.get_recorded_scatter_address.argtypes = [ctypes.c_uint32]
+    prov_lib.get_recorded_scatter_count.restype = ctypes.c_uint64
+    prov_lib.get_recorded_scatter_page.restype = ctypes.c_uint64
+    prov_lib.get_recorded_scatter_page.argtypes = [ctypes.c_uint32]
     prov_lib.reset_map_pages_records.restype = None
 
     # Reset records before mapped run
@@ -105,7 +126,21 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     check("mapped contiguous unmap calls", prov_lib.get_map_pages_unmap_count(), 1)
     check("mapped scatter map calls", prov_lib.get_scatter_map_call_count(), 1)
     check("mapped scatter unmap calls", prov_lib.get_scatter_unmap_count(), 1)
-    print("contiguous and scatter mapping: native and mapped exit 0x870, calls recorded")
+    check("mapped argument mismatches", prov_lib.get_argument_mismatch_count(), 2)
+
+    # Verify recorded trace distinguishes expected count, page IDs, and ordered addresses
+    check("trace contiguous address", prov_lib.get_recorded_map_address(), FIXTURE_ALIGNED_ADDR)
+    check("trace contiguous page count", prov_lib.get_recorded_map_count(), FIXTURE_PAGE_COUNT)
+    check("trace contiguous page 0", prov_lib.get_recorded_map_page(0), FIXTURE_PAGE_0)
+    check("trace contiguous page 1", prov_lib.get_recorded_map_page(1), FIXTURE_PAGE_1)
+
+    check("trace scatter address 0", prov_lib.get_recorded_scatter_address(0), FIXTURE_SCATTER_ADDR0)
+    check("trace scatter address 1", prov_lib.get_recorded_scatter_address(1), FIXTURE_SCATTER_ADDR1)
+    check("trace scatter page count", prov_lib.get_recorded_scatter_count(), FIXTURE_PAGE_COUNT)
+    check("trace scatter page 0", prov_lib.get_recorded_scatter_page(0), FIXTURE_PAGE_0)
+    check("trace scatter page 1", prov_lib.get_recorded_scatter_page(1), FIXTURE_PAGE_1)
+
+    print("contiguous and scatter mapping: native and mapped exit 0x870, trace and ordered addresses verified")
 
     # 4. Independent negative controls: withhold each named mapping export independently
     mapper = Mapper(mapper_path)
@@ -118,6 +153,7 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     cnt2 = ctypes.cast(prov_lib.get_map_pages_unmap_count, ctypes.c_void_p).value
     cnt3 = ctypes.cast(prov_lib.get_scatter_map_call_count, ctypes.c_void_p).value
     cnt4 = ctypes.cast(prov_lib.get_scatter_unmap_count, ctypes.c_void_p).value
+    cnt5 = ctypes.cast(prov_lib.get_argument_mismatch_count, ctypes.c_void_p).value
 
     # Control A: Withhold XMemMapPhysicalPages (provide Scatter + query funcs)
     provider_without_map = {
@@ -126,6 +162,7 @@ def compare(mapper_path, exe_path, provider_path, io_path):
         b"get_map_pages_unmap_count": cnt2,
         b"get_scatter_map_call_count": cnt3,
         b"get_scatter_unmap_count": cnt4,
+        b"get_argument_mismatch_count": cnt5,
     }
     base, status, detail, _ = mapper(exe, {io_name: io_lib, "xmem.dll": provider_without_map})
     if base:
@@ -142,6 +179,7 @@ def compare(mapper_path, exe_path, provider_path, io_path):
         b"get_map_pages_unmap_count": cnt2,
         b"get_scatter_map_call_count": cnt3,
         b"get_scatter_unmap_count": cnt4,
+        b"get_argument_mismatch_count": cnt5,
     }
     base, status, detail, _ = mapper(exe, {io_name: io_lib, "xmem.dll": provider_without_scatter})
     if base:

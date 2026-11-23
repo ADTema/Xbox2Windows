@@ -4,13 +4,16 @@ EXTERN __imp_get_map_pages_call_count:QWORD
 EXTERN __imp_get_map_pages_unmap_count:QWORD
 EXTERN __imp_get_scatter_map_call_count:QWORD
 EXTERN __imp_get_scatter_unmap_count:QWORD
+EXTERN __imp_get_argument_mismatch_count:QWORD
 PUBLIC native_entry
 
 .data
-aligned_addr    dq 010000000h
-unaligned_addr  dq 010001234h
-pages           dq 1, 2
-addresses       dq 010000000h, 010010000h
+aligned_addr        dq 010000000h
+unaligned_addr      dq 010001234h
+pages               dq 1, 2
+wrong_pages         dq 999, 888
+addresses           dq 010000000h, 010010000h
+swapped_addresses   dq 010010000h, 010000000h
 
 .code
 native_entry PROC FRAME
@@ -74,7 +77,23 @@ native_entry PROC FRAME
     test eax, eax
     jnz fail_step_7
 
-    ; Step 8: Verify provider call counters directly in caller process
+    ; Step 8: Changed-argument control - wrong page IDs must be refused
+    mov rcx, qword ptr [aligned_addr]
+    mov rdx, 2
+    lea r8, wrong_pages
+    call qword ptr [__imp_XMemMapPhysicalPages]
+    test rax, rax
+    jnz fail_step_8
+
+    ; Step 9: Changed-argument control - swapped scatter destinations must be refused
+    lea rcx, swapped_addresses
+    mov edx, 2
+    lea r8, pages
+    call qword ptr [__imp_XMemMapPhysicalPagesScatter]
+    test eax, eax
+    jnz fail_step_9
+
+    ; Step 10: Verify provider call counters and mismatch counts directly in caller process
     call qword ptr [__imp_get_map_pages_call_count]
     cmp eax, 1
     jne fail_counters
@@ -89,6 +108,10 @@ native_entry PROC FRAME
 
     call qword ptr [__imp_get_scatter_unmap_count]
     cmp eax, 1
+    jne fail_counters
+
+    call qword ptr [__imp_get_argument_mismatch_count]
+    cmp eax, 2
     jne fail_counters
 
     ; All checks passed: return milestone status 0x870
@@ -116,8 +139,14 @@ fail_step_6:
 fail_step_7:
     mov eax, 0F07h
     jmp done
-fail_counters:
+fail_step_8:
     mov eax, 0F08h
+    jmp done
+fail_step_9:
+    mov eax, 0F09h
+    jmp done
+fail_counters:
+    mov eax, 0F0Ah
     jmp done
 
 done:
