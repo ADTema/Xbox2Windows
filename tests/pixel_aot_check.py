@@ -3052,6 +3052,72 @@ def plain_bitscan_reference(words):
             (plain_ffbl(s44), plain_ffbh_u(s45), xnor(s46, PLAIN_BITSCAN_LITERAL), plain_rev(s47)))
 
 
+
+# v_swap_b32: s44..s47 move to v18..v21 through float VGPRs, so every word is a normal binary32 pattern (no
+# subnormal, infinity or NaN) and the four words of a set are distinct.
+SWAP_WORDS = (
+    (0x3f800000, 0x40000000, 0x40400000, 0x40800000),
+    (0xc2f6e979, 0x41200000, 0x3dcccccd, 0x7f000000),
+    (0x00800000, 0x80800000, 0x3f000000, 0x12345678),
+    (0x9abcdef0, 0x7f7fffff, 0xff7fffff, 0x0dedbeef),
+)
+
+SWAP_BODY = [
+    "v_mov_b32_e32 v18, s44",
+    "v_mov_b32_e32 v19, s45",
+    "v_mov_b32_e32 v20, s46",
+    "v_mov_b32_e32 v21, s47",
+    "v_swap_b32 v18, v19",
+    "v_swap_b32 v20, v21",
+    "v_swap_b32 v18, v20",
+    "v_swap_b32 v21, v21",
+    "v_mov_b32_e32 v12, v18",
+    "v_mov_b32_e32 v13, v19",
+    "v_mov_b32_e32 v14, v20",
+    "v_mov_b32_e32 v15, v21",
+]
+
+
+def swap_ops(body=None) -> list[str]:
+    return uncompressed_export(list(SWAP_BODY if body is None else body))
+
+
+def swap_ops_reference(words):
+    """a b c d -> swap(1,2): b a c d -> swap(3,4): b a d c -> swap(1,3): d a b c -> self swap: d a b c."""
+    a, b, c, d = words
+    return (d, a, b, c)
+
+
+def swap_emulate(body, words):
+    """Independent model of the body's moves and swaps on Python integers; the other lines are not needed here."""
+    regs = dict(zip(("s44", "s45", "s46", "s47"), words))
+    for line in body:
+        op, _, operands = line.partition(" ")
+        args = operands.split(", ")
+        if op == "v_swap_b32":
+            regs[args[0]], regs[args[1]] = regs[args[1]], regs[args[0]]
+        elif op == "v_mov_b32_e32":
+            regs[args[0]] = regs[args[1]]
+        else:
+            raise AssertionError(line)
+    return tuple(regs[f"v{n}"] for n in range(12, 16))
+
+
+def swap_mutants():
+    """Wrong lowerings of the same body: (label, mutated body)."""
+    swaps = [i for i, line in enumerate(SWAP_BODY) if line.startswith("v_swap_b32")]
+    one_way = list(SWAP_BODY)
+    one_way[swaps[0]] = "v_mov_b32_e32 v18, v19"
+    no_snapshot = list(SWAP_BODY)
+    no_snapshot[swaps[0]:swaps[0] + 1] = ["v_mov_b32_e32 v18, v19", "v_mov_b32_e32 v19, v18"]
+    reordered = list(SWAP_BODY)
+    reordered[swaps[1]], reordered[swaps[2]] = reordered[swaps[2]], reordered[swaps[1]]
+    no_self = list(SWAP_BODY)
+    no_self[swaps[3]] = "v_mov_b32_e32 v21, v20"
+    return (("one-way copy", one_way), ("no snapshot", no_snapshot), ("reordered chain", reordered),
+            ("self swap as copy", no_self))
+
+
 def scalar():
     return with_constants(scalar_body())
 
@@ -3309,6 +3375,53 @@ def check_scalar_controls():
         changed = [line.replace(old, new) for line in bitscan_program]
         assert changed != bitscan_program, new
         expect_value_error(translate_int, changed, message)
+
+
+
+    # v_swap_b32: the independent model matches the reference, and every wrong lowering changes the result.
+    swap_program = swap_ops()
+    swap_source = translate_int(swap_program)
+    assert "v_swap_b32 v18, v19" in swap_program
+    for words in SWAP_WORDS:
+        assert len(set(words)) == 4 and all(0 < (w >> 23 & 0xff) < 0xff for w in words), words
+        assert swap_emulate(SWAP_BODY, words) == swap_ops_reference(words) != words
+    for label, body in swap_mutants():
+        assert body != SWAP_BODY, label
+        assert any(swap_emulate(body, words) != swap_ops_reference(words) for words in SWAP_WORDS), label
+        assert translate_int(swap_ops(body)) != swap_source, label
+    # A self swap is accepted and is a no-op: the program is the same as with an s_nop in its place.
+    nop_body = [("s_nop 0" if line == "v_swap_b32 v21, v21" else line) for line in SWAP_BODY]
+    assert nop_body != SWAP_BODY
+    assert translate_int(swap_ops(nop_body)) == swap_source
+    for old, new, message in (
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, s44", "Unsupported instruction"),  # SGPR source
+            ("v_swap_b32 v18, v19", "v_swap_b32 s44, v19", "Unsupported instruction"),  # SGPR destination
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, 1", "Unsupported instruction"),  # inline constant
+            ("v_swap_b32 v18, v19", "v_swap_b32_e64 v18, v19", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32_dpp v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+             "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32_sdwa v18, v19 dst_sel:DWORD dst_unused:UNUSED_PAD "
+             "src0_sel:DWORD src1_sel:DWORD", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, -v19", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, v19 clamp", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, v19, v20", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v256, v19", "Invalid register swap"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, v256", "Invalid register swap"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, v40", "Expected a numeric register"),  # never written
+            ("v_swap_b32 v18, v19", "v_swap_b32 v40, v19", "Expected a numeric register"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v0, v19", "Expected a numeric register"),  # barycentric, not numeric
+            ("v_swap_b32 v21, v21", "v_swap_b32 v40, v40", "Expected a numeric register")):
+        changed = [line.replace(old, new) for line in SWAP_BODY]
+        assert changed != SWAP_BODY, new
+        expect_value_error(translate_int, swap_ops(changed), message)
+    # The sample in v12..v15 is outstanding before its vmcnt wait: a swap touching it must be refused.
+    wait = swap_program.index("s_waitcnt vmcnt(0)")
+    for bad in ("v_swap_b32 v12, v13", "v_swap_b32 v13, v12"):
+        expect_value_error(translate_int, swap_program[:wait] + [bad] + swap_program[wait:],
+                           "Swap overlaps an outstanding sample")
+    # Once the wait has completed it, the same swap is accepted.
+    translate_int(swap_ops(["v_swap_b32 v12, v13"] + SWAP_BODY))
 
     quadmask_source = translate_int(quadmask_bitreplicate_program("s_quadmask_b32"))
     assert "s_quadmask_b32(" in quadmask_source, quadmask_source
@@ -6547,6 +6660,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((sop1_scalar_ops(), translate_int))
     fixtures.append((bfm_scalar_ops(), translate_int))
     fixtures.extend((plain_bitscan_ops(second), translate_int) for second in (False, True))
+    fixtures.append((swap_ops(), translate_int))
     fixtures.extend((quadmask_bitreplicate_program(op), translate_int)
                     for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
     fixtures.append((scalar_select64(), translate_int))
@@ -8741,6 +8855,34 @@ def check_plain_bitscan_draw(directory, compiler, renderer, backend):
         source.write_text(translate_int(mutated), encoding="ascii")
         compile_shader(compiler, source, shader)
         statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, cases[fixture])
+
+
+
+def check_swap_draw(directory, compiler, renderer, backend):
+    """v_swap_b32 chain against the Python reference, then wrong lowerings that must mismatch."""
+    source = directory / "swap.hlsl"
+    shader = directory / "swap.cso"
+
+    def write_cases(prefix):
+        cases = []
+        for idx, words in enumerate(SWAP_WORDS):
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *words)
+            case = directory / f"{prefix}-{idx}.case"
+            write_case(case, bytes(constants), tuple(as_float(word) for word in swap_ops_reference(words)),
+                       integer_rt=True)
+            cases.append(case)
+        return cases
+
+    cases = write_cases("swap")
+    source.write_text(translate_int(swap_ops()), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases])
+    for label, body in swap_mutants():
+        assert any(swap_emulate(body, words) != swap_ops_reference(words) for words in SWAP_WORDS), label
+        source.write_text(translate_int(swap_ops(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, cases)
         if "mismatch" not in statuses:
             raise AssertionError(f"Mutating {label} escaped detection")
 
@@ -8775,7 +8917,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
-                    "draw-e64-integer", "draw-bfm", "draw-align", "draw-sdwa-integer", "draw-plain-bitscan"):
+                    "draw-e64-integer", "draw-bfm", "draw-align", "draw-sdwa-integer", "draw-plain-bitscan", "draw-swap"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -8784,7 +8926,8 @@ def main():
                         "draw-sdwa-integer": check_sdwa_integer_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-align": check_align_draws,
-                        "draw-plain-bitscan": check_plain_bitscan_draw}[mode]
+                        "draw-plain-bitscan": check_plain_bitscan_draw,
+                        "draw-swap": check_swap_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):

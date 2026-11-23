@@ -2208,6 +2208,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_dest)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
+        elif m := match(r"v_swap_b32(?:_e32)? (v\d+), (v\d+)"):
+            # Both registers exchange their old values. Every vector entry names an immutable HLSL
+            # temporary, so exchanging the entries is the whole lowering and emits no code.
+            dst, src = m.groups()
+            if mask != "entry" or int(dst[1:]) > 255 or int(src[1:]) > 255:
+                raise ValueError("Invalid register swap")
+            for reg in (dst, src):
+                value = vector.get(reg)
+                if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
+                    raise ValueError("Expected a numeric register")
+                if reg in pending:
+                    raise ValueError("Constant read before load completion")
+                if reg in sample_dest:
+                    raise ValueError("Swap overlaps an outstanding sample")
+            vector[dst], vector[src] = vector[src], vector[dst]
         elif m := match(rf"v_({'|'.join(ALU)})_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
