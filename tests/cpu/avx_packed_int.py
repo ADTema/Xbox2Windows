@@ -22,13 +22,19 @@ EXPORTS = (
     "vpshufb_op", "vpalignr_op",
 )
 
+WIDE_EXPORT = "vpshufb256_mem"
+
 CPUID_HELPER = """#include <intrin.h>
 extern "C" __declspec(dllexport) uint32_t host_has_avx() {
     int info[4]{};
     __cpuid(info, 1);
     const int need = (1 << 27) | (1 << 28);
     if ((info[2] & need) != need) return 0u;
-    return (_xgetbv(0) & 6u) == 6u ? 1u : 0u;
+    if ((_xgetbv(0) & 6u) != 6u) return 0u;
+    __cpuid(info, 0);
+    if (info[0] < 7) return 1u;
+    __cpuidex(info, 7, 0);
+    return (info[1] & (1 << 5)) ? 2u : 1u;
 }
 """
 
@@ -36,7 +42,7 @@ extern "C" __declspec(dllexport) uint32_t host_has_avx() {
 def emit(native_dll: Path, output_cpp: Path) -> None:
     parts = [INTEGER_HEADER, CPUID_HELPER]
     with pefile.PE(str(native_dll), fast_load=True) as pe:
-        for name in EXPORTS:
+        for name in (*EXPORTS, WIDE_EXPORT):
             ranges = function_ranges(pe, export_rva(pe, name))
             body = [ins for lo, hi in ranges for ins in region(pe, lo, hi)]
             code = lower(body, ["rcx = a; rdx = b; r8 = dst;"], {}, {}, {})
@@ -49,19 +55,24 @@ def emit(native_dll: Path, output_cpp: Path) -> None:
 def check_controls() -> None:
     # EVEX vpaddb xmm0{k1}, xmm1, xmm2 (62 F1 75 09 FC C2) followed by ret must be rejected.
     evex = list(Decoder(64, b"\x62\xf1\x75\x09\xfc\xc2\xc3", ip=0x1000))
-    try:
-        lower(evex, [], {}, {}, {})
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected EVEX vpaddb to be rejected")
+    # VEX vpaddb xmm0, xmm1, xmm3 reaches the shared translator outside
+    # its declared vector register set and must be rejected deliberately.
+    untracked = list(Decoder(64, b"\xc5\xf1\xfc\xc3\xc3", ip=0x1000))
+    for code in (evex, untracked):
+        try:
+            lower(code, [], {}, {}, {})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected {code[0]} to be rejected")
 
 
 def check(native_dll: Path, lifted_dll: Path) -> None:
     check_controls()
     lifted = ctypes.CDLL(str(lifted_dll))
     lifted.host_has_avx.restype = ctypes.c_uint32
-    if not lifted.host_has_avx():
+    capability = lifted.host_has_avx()
+    if not capability:
         print("host lacks AVX; skipping native differential check")
         raise SystemExit(77)
     native = ctypes.CDLL(str(native_dll))
@@ -86,7 +97,26 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
         fn_l(ctypes.addressof(a_buf), ctypes.addressof(b_buf), ctypes.addressof(out_l))
         if bytes(out_n) != bytes(out_l):
             raise AssertionError(f"{name}: native={bytes(out_n).hex()} lifted={bytes(out_l).hex()}")
-    print(f"{len(EXPORTS)} VEX AVX packed integer ALU cases matched native and translated DLLs")
+    print(f"{len(EXPORTS)} VEX.128 cases matched native and translated DLLs")
+    if capability < 2:
+        print("host lacks AVX2; VEX.256 shuffle not exercised")
+        raise SystemExit(77)
+
+    # Use unequal halves and controls that independently select bytes and zeros.
+    a = (ctypes.c_ubyte * 32)(*range(32))
+    pattern = [0x0f, 0x80, 0x00, 0x0d] * 4 + [0x02, 0xff, 0x04, 0x00] * 4
+    control = (ctypes.c_ubyte * 32)(*pattern)
+    expected = bytes(0 if index & 0x80 else (lane & 16) + (index & 15)
+                     for lane, index in enumerate(pattern))
+    for library in (native, lifted):
+        shuffle = getattr(library, WIDE_EXPORT)
+        shuffle.argtypes = [ctypes.c_uint64] * 3
+        shuffle.restype = ctypes.c_uint64
+        for i in range(32):
+            out_n[i] = 0xff
+        shuffle(ctypes.addressof(a), ctypes.addressof(control), ctypes.addressof(out_n))
+        assert bytes(out_n) == expected, (bytes(out_n).hex(), expected.hex())
+    print("VEX.256 shuffle with a 32-byte source matched both independent lanes")
 
 
 if __name__ == "__main__":

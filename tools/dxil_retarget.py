@@ -611,15 +611,34 @@ def sign_container(probe: Path, blob: bytes) -> bytes:
     return signed
 
 
-def check_compute_pso(device_probe: Path, blob: bytes, *, warp_only: bool = False) -> dict:
-    """Test CreateRootSignature and CreateComputePipelineState via root_device_probe --compute-pso."""
+def check_compute_pso(device_probe: Path, blob: bytes, *, warp_only: bool = False,
+                      intrinsics: dict | None = None, status_of=None) -> dict:
+    """Test CreateRootSignature and CreateComputePipelineState via root_device_probe --compute-pso.
+
+    `intrinsics` carries the inventory of the module that would be submitted, and the gate is
+    mandatory: a module that still executes an xbox.* call, or one whose inventory is missing,
+    is decided without starting the probe process, so it produces no submission at all.
+    """
     if len(blob) < 32 or blob[:4] != b"DXBC":
         raise ValueError("Cannot create compute PSO from non-DXBC input")
+    from xbox_intrinsic_gate import ALLOW, decide, not_checked
+
+    if intrinsics is None:
+        gate = not_checked("module-not-disassembled")
+        gate["submitted"] = False
+        return {"gate": gate}
+    gate = decide(intrinsics, status_of)
+    if gate["verdict"] != ALLOW:
+        gate["submitted"] = False
+        return {"gate": gate}
     command = [str(device_probe), "--compute-pso"]
     if warp_only:
         command.append("--warp-only")
     run = subprocess.run(command, input=blob, capture_output=True, check=True, timeout=30)
-    return json.loads(run.stdout)
+    pso = json.loads(run.stdout)
+    gate["submitted"] = True
+    pso["gate"] = gate
+    return pso
 
 
 def validate_pe_containers(
@@ -640,13 +659,14 @@ def validate_pe_containers(
     import pefile
     from call_evidence import shader_containers
     from probe_roots import validate_shader
+    from xbox_intrinsic_gate import reaches_xbox
 
     raw = pe_path.read_bytes()
     with pefile.PE(data=raw, fast_load=True) as pe:
         containers = shader_containers(raw, pe, defaultdict(list))
         results = []
         skipped_non_dxil = 0
-        skipped_xbox_calls = 0
+        skipped_xbox_intrinsics = 0
 
         if output_dir is not None:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -661,8 +681,8 @@ def validate_pe_containers(
 
             before = validate_shader(probe, blob, secs[b"DXIL"], optional_modes=("module",))
             xbox_calls = before["ir"]["xbox_call_sites"]
-            if only_without_xbox_calls and xbox_calls:
-                skipped_xbox_calls += 1
+            if only_without_xbox_calls and reaches_xbox(before["ir"]["xbox_intrinsics"]):
+                skipped_xbox_intrinsics += 1
                 continue
 
             retargeted_blob, info = retarget_container(
@@ -674,6 +694,10 @@ def validate_pe_containers(
             )
             retargeted_secs = parts(retargeted_blob)
             after = validate_shader(probe, retargeted_blob, retargeted_secs[b"DXIL"], optional_modes=("module",))
+            # The gate reads the final module: calls removed or lowered by the adapter are gone here.
+            from xbox_intrinsic_gate import decide
+
+            gate_decision = decide(after["ir"]["xbox_intrinsics"])
 
             signed = False
             digest = None
@@ -683,7 +707,8 @@ def validate_pe_containers(
                 signed = True
                 digest = retargeted_blob[4:20].hex()
             if pso_probe is not None and after["container"].get("status") == "0x00000000":
-                pso_result = check_compute_pso(pso_probe, retargeted_blob, warp_only=warp_only)
+                pso_result = check_compute_pso(pso_probe, retargeted_blob, warp_only=warp_only,
+                                               intrinsics=after["ir"]["xbox_intrinsics"])
 
             saved_path = None
             if output_dir is not None:
@@ -697,6 +722,8 @@ def validate_pe_containers(
                 "retargeted_bytes": len(retargeted_blob),
                 "dx_op_count": len(before["ir"]["dx_op_call_sites"]),
                 "xbox_call_count": sum(xbox_calls.values()),
+                "xbox_intrinsics": before["ir"]["xbox_intrinsics"],
+                "gate": gate_decision,
                 "retarget": info,
                 "signed": signed,
                 "digest": digest,
@@ -725,14 +752,18 @@ def validate_pe_containers(
         "image_sha256": hashlib.sha256(raw).hexdigest(),
         "total_containers": len(containers),
         "skipped_non_dxil": skipped_non_dxil,
-        "skipped_xbox_calls": skipped_xbox_calls,
+        "skipped_xbox_intrinsics": skipped_xbox_intrinsics,
         "processed": len(results),
         "container_passed": sum(r["after"]["container_status"] == "0x00000000" for r in results),
         "module_passed": sum(r["after"]["module_status"] == "0x00000000" for r in results),
         "signed_count": sum(r["signed"] for r in results),
+        "gate_rejected": sum(r["gate"]["verdict"] == "REJECT" for r in results),
         "entries": results,
     }
     if pso_probe is not None:
+        report["pso_refused"] = sum(
+            r.get("pso", {}).get("gate", {}).get("verdict") == "REJECT" for r in results
+        )
         report["warp_pso_passed"] = sum(
             r.get("pso", {}).get("warp_pso") == "0x00000000" for r in results
         )
@@ -751,7 +782,8 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, help="Optional directory to write retargeted containers in --pe mode")
     parser.add_argument("--report", type=Path, help="Optional JSON report path in --pe mode")
     parser.add_argument("--only-without-xbox-calls", action="store_true",
-                        help="In --pe mode, process only DXIL modules with no direct xbox.* calls")
+                        help="In --pe mode, process only DXIL modules that neither call nor otherwise "
+                             "reach an xbox.* symbol")
     parser.add_argument("--source-triple", default=SOURCE_TRIPLE,
                         help=f"Source target triple to match (default: {SOURCE_TRIPLE}; '*' matches any)")
     parser.add_argument("--target-triple", default=DESKTOP_TRIPLE,
@@ -885,15 +917,32 @@ def main() -> int:
             info["validation"] = {"module": rec}
 
     if args.pso_probe:
+        from xbox_intrinsic_gate import NOT_CHECKED
+
+        # The gate needs the module's disassembly, which only --probe produces. The helper refuses
+        # to submit without it; say why instead of leaving a silent NOT_CHECKED in the report.
+        final_intrinsics = (info.get("validation") or {}).get("ir", {}).get("xbox_intrinsics")
+        # Resolve the probe only when it will actually be used: without an inventory nothing runs.
+        probe_path = args.pso_probe.resolve(strict=True) if final_intrinsics is not None else args.pso_probe
         info["pso"] = check_compute_pso(
-            args.pso_probe.resolve(strict=True),
+            probe_path,
             result_bytes,
             warp_only=args.warp_only,
+            intrinsics=final_intrinsics,
         )
+        if info["pso"]["gate"]["verdict"] == NOT_CHECKED:
+            print(
+                "warning: --pso-probe needs --probe to gate the final module; "
+                "the module was not disassembled, so nothing was submitted",
+                file=sys.stderr,
+            )
 
     print(json.dumps(info, indent=2))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError) as exc:
+        sys.exit(f"{Path(__file__).name}: {exc}")

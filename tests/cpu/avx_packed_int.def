@@ -25,3 +25,4 @@ EXPORTS
     vpsignd_op
     vpshufb_op
     vpalignr_op
+    vpshufb256_mem

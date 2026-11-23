@@ -259,4 +259,13 @@ vpalignr_op PROC FRAME
     ret
 vpalignr_op ENDP
 
+vpshufb256_mem PROC FRAME
+    .endprolog
+    vmovups ymm1, ymmword ptr [rcx]
+    vpshufb ymm0, ymm1, ymmword ptr [rdx]
+    vmovups ymmword ptr [r8], ymm0
+    vzeroupper
+    ret
+vpshufb256_mem ENDP
+
 END
