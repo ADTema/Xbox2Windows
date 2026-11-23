@@ -1570,14 +1570,14 @@ LDS_QWORD_COMPARISONS = {
     "ds_min_i64": min, "ds_max_i64": max, "ds_min_u64": min, "ds_max_u64": max,
     "ds_xor_b64": operator.xor,
 }
-LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in LDS_QWORD_UPDATES
+LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in (*LDS_QWORD_UPDATES, *LDS_QWORD_COMPARISONS)
                      for stem, width in [op.rsplit("_", 1)]}
 
 
 def lds_qword_program(op):
     returns = op in LDS_QWORD_RETURNS
     ret_operand = "v[18:19], " if returns else ""
-    if op in LDS_QWORD_COMPARISONS:
+    if LDS_QWORD_RETURNS.get(op, op) in LDS_QWORD_COMPARISONS:
         operands = ["v_mad_u32_u24 v16, 1, v8, 0xfffffff0", "v_mad_u32_u24 v17, 1, v8, 0x7ffffff0",
                     "v_mov_b32_e32 v18, 0x00000008", "v_mov_b32_e32 v19, 0x80000000"]
     else:
@@ -1593,19 +1593,19 @@ def lds_qword_program(op):
 
 
 def lds_qword_reference(op, groups):
+    base = LDS_QWORD_RETURNS.get(op, op)
     words = []
     for lane in range(groups * 32):
-        if op in LDS_QWORD_COMPARISONS:
+        if base in LDS_QWORD_COMPARISONS:
             previous = ((0x7ffffff0 + lane) << 32) | ((0xfffffff0 + lane) & 0xffffffff)
             data = 0x8000000000000008
-            if op.endswith("i64"):
-                signed = lambda value: int.from_bytes(value.to_bytes(8, "little"), "little", signed=True)
-                current = LDS_QWORD_COMPARISONS[op]((previous, data), key=signed)
+            if base.endswith("i64"):
+                current = LDS_QWORD_COMPARISONS[base]((previous, data), key=lambda value: value ^ (1 << 63))
             else:
-                current = LDS_QWORD_COMPARISONS[op](previous, data)
+                current = LDS_QWORD_COMPARISONS[base](previous, data)
         else:
             previous = (0xfffffff1 << 32) | ((0xfffffff0 + lane) & 0xffffffff)
-            current = LDS_QWORD_UPDATES[LDS_QWORD_RETURNS.get(op, op)](previous, 0x0000000e00000018)
+            current = LDS_QWORD_UPDATES[base](previous, 0x0000000e00000018)
         words.extend((current & 0xffffffff, (current >> 32) & 0xffffffff))
         if op in LDS_QWORD_RETURNS:
             words.extend((previous & 0xffffffff, previous >> 32))
