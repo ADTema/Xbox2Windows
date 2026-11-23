@@ -27,6 +27,8 @@
 
 extern "C" __declspec(dllimport) void* XMemAlloc(SIZE_T bytes, ULONGLONG attributes);
 extern "C" __declspec(dllimport) void XMemFree(void* allocation, ULONGLONG attributes);
+extern "C" __declspec(dllimport) void* XMemAllocDefault(SIZE_T bytes, ULONGLONG attributes);
+extern "C" __declspec(dllimport) void XMemFreeDefault(void* allocation, ULONGLONG attributes);
 extern "C" __declspec(dllimport) BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer);
 extern "C" __declspec(dllimport) BOOL XMemGetWorkingSetStatistics(UINT32 selector, void* statistics);
 
@@ -65,9 +67,15 @@ bool export_checks()
     HMODULE module = GetModuleHandleW(L"xmem.dll");
     if (!module) return false;
     unsigned found = 0;
-    for (const char* name : {"XMemAlloc", "XMemFree", "XMemVirtualQuery", "XMemGetWorkingSetStatistics"}) {
+    for (const char* name : {"XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
+                             "XMemVirtualQuery", "XMemGetWorkingSetStatistics"}) {
         if (!GetProcAddress(module, name)) return false;
         ++found;
+    }
+    const char* existing[] = {"XMemAlloc", "XMemFree", "XMemGetWorkingSetStatistics", "XMemVirtualQuery"};
+    for (WORD ordinal = 1; ordinal <= std::size(existing); ++ordinal) {
+        if (GetProcAddress(module, MAKEINTRESOURCEA(ordinal)) != GetProcAddress(module, existing[ordinal - 1]))
+            return false;
     }
     // The named imports in this executable resolve to the same module.
     HMODULE owner = nullptr;
@@ -82,30 +90,30 @@ bool export_checks()
     return true;
 }
 
-bool allocation_checks()
+bool allocation_checks(decltype(&XMemAlloc) allocate, decltype(&XMemFree) release)
 {
     // Bink: heap memory, 32-byte alignment, zero-filled.
-    auto* heap = static_cast<Byte*>(XMemAlloc(97, bink_word));
+    auto* heap = static_cast<Byte*>(allocate(97, bink_word));
     if (!heap || reinterpret_cast<std::uintptr_t>(heap) % 32 ||
         !std::all_of(heap, heap + 97, [](Byte b) { return b == 0; })) return false;
     std::fill_n(heap, 97, Byte{0x51});
-    XMemFree(heap, bink_word);
+    release(heap, bink_word);
 
     // AMD: graphics memory, committed read/write on the allocation granularity, freed by XMemFree.
-    auto* gpu = static_cast<Byte*>(XMemAlloc(512, amd_word));
+    auto* gpu = static_cast<Byte*>(allocate(512, amd_word));
     MEMORY_BASIC_INFORMATION info{};
     if (!gpu || VirtualQuery(gpu, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT ||
         info.Protect != PAGE_READWRITE || reinterpret_cast<std::uintptr_t>(gpu) % (std::size_t{64} << 10) ||
         !std::all_of(gpu, gpu + 512, [](Byte b) { return b == 0; })) return false;
     std::fill_n(gpu, 512, Byte{0x51});
-    XMemFree(gpu, amd_word);
+    release(gpu, amd_word);
     if (VirtualQuery(gpu, &info, sizeof(info)) != sizeof(info) || info.State != MEM_FREE) return false;
 
     // Rejections pass straight through, and freeing null is a no-op for both types.
-    XMemFree(nullptr, bink_word);
-    XMemFree(nullptr, amd_word);
-    return XMemAlloc(0, bink_word) == nullptr && XMemAlloc(64, bink_word | (ULONGLONG{1} << 40)) == nullptr &&
-           XMemAlloc(512, (amd_word & ~(ULONGLONG{15} << 29)) | (ULONGLONG{7} << 29)) == nullptr;
+    release(nullptr, bink_word);
+    release(nullptr, amd_word);
+    return allocate(0, bink_word) == nullptr && allocate(64, bink_word | (ULONGLONG{1} << 40)) == nullptr &&
+           allocate(512, (amd_word & ~(ULONGLONG{15} << 29)) | (ULONGLONG{7} << 29)) == nullptr;
 }
 
 bool query_checks()
@@ -466,7 +474,9 @@ int main(int argc, char** argv)
     if (scenario == "exports"sv) {
         passed = export_checks();
     } else if (scenario == "allocation"sv) {
-        passed = allocation_checks();
+        passed = allocation_checks(XMemAlloc, XMemFree);
+    } else if (scenario == "default_allocation"sv) {
+        passed = allocation_checks(XMemAllocDefault, XMemFreeDefault);
     } else if (scenario == "query"sv) {
         passed = query_checks();
     } else if (scenario == "working_set"sv) {
