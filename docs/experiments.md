@@ -1745,7 +1745,9 @@ paths use the same translated sample and CPU image reference.
 On Windows 10 build 19045.6456, the GTX 1060 6 GB (32.0.15.6094) and in-box
 WARP (10.0.19041.5794) matched all 128 export bytes and 1,024 RGBA pixels for
 each of the three inputs. The stale texture and stale UV references each
-produced 276 pixel mismatches and a matching export trace. The D3D12 debug
+produced 276 pixel mismatches and a matching export trace. The fallback pixel
+shader also reads markers at `b0` and `b1`. Changing either marker alone
+produced the same 276 pixel mismatches with matching exports. The D3D12 debug
 layer reported zero warnings and errors.
 
 ```powershell

@@ -18,6 +18,9 @@ PALETTE = ((255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255), (255, 255, 0, 2
 TEXTURE_INPUTS = ((PALETTE, False), (PALETTE[1:] + PALETTE[:1], False), (PALETTE, True))
 VERTEX_ORDER = (1, 2, 0)
 POSITIONS = [SMALL[i] for i in VERTEX_ORDER]
+# The export shader does not use the last register of either 512-byte CBV.
+PIXEL_CBV_OFFSETS = (31 * 16, 512 + 31 * 16)
+PIXEL_CBV_WORDS = (0x1234ABCD, 0x89ABCDEF)
 
 
 def vertex_attributes(flip):
@@ -59,6 +62,18 @@ def pixel_source():
     return lower_pixel(lod_zero_sample(), 20, 24, [1, 2, 3, 4], texcoord_components=4)
 
 
+def fallback_pixel_source():
+    source = pixel_source()
+    entry = "float4 main(float4 uv : TEXCOORD0) : SV_Target0 {\n"
+    assert source.count(entry) == 1, "Expected the translated texture shader entry point"
+    a, b = PIXEL_CBV_WORDS
+    guard = (f"    if (gate_a != 0x{a:08x}u || gate_b != 0x{b:08x}u)\n"
+             "        return float4(0, 0, 0, 1);\n")
+    return ("cbuffer GuardA : register(b0) { uint gate_a : packoffset(c31.x); };\n"
+            "cbuffer GuardB : register(b1) { uint gate_b : packoffset(c31.x); };\n"
+            + source.replace(entry, entry + guard, 1))
+
+
 def run(tmp, compiler, renderer, adapter):
     code = mesh_program()
     mesh_source, mesh = tmp / "mesh.hlsl", tmp / "mesh.dxil"
@@ -94,10 +109,12 @@ def run(tmp, compiler, renderer, adapter):
 
 
 def run_fallback(tmp, compiler, renderer, adapter):
-    shaders = compile_fallback(compiler, tmp, mesh_program(), pixel_source())
+    shaders = compile_fallback(compiler, tmp, mesh_program(), fallback_pixel_source())
     cases = texture_cases()
     labels = (("baseline", None), ("rotated-texture", "stale-texture"), ("flipped-uv", "stale-uv"))
-    for (label, stale), (_, flip), (data, pixels, texels) in zip(labels, TEXTURE_INPUTS, cases):
+    for (label, stale), (_, flip), (data, pixels, texels) in zip(labels, TEXTURE_INPUTS, cases, strict=True):
+        for offset, word in zip(PIXEL_CBV_OFFSETS, PIXEL_CBV_WORDS, strict=True):
+            struct.pack_into("<I", data, offset, word)
         attributes = vertex_attributes(flip)
         indexed_attributes = [attributes[i] for i in VERTEX_ORDER]
         draw_fallback(renderer, adapter, tmp, shaders, label,
@@ -106,6 +123,15 @@ def run_fallback(tmp, compiler, renderer, adapter):
             draw_fallback(renderer, adapter, tmp, shaders, stale,
                           fallback_fixture(data, POSITIONS, cases[0][1], indexed_attributes) + texels,
                           textured=True, bad_pixels=276)
+    data, pixels, texels = cases[0]
+    attributes = vertex_attributes(False)
+    indexed_attributes = [attributes[i] for i in VERTEX_ORDER]
+    for binding, offset in enumerate(PIXEL_CBV_OFFSETS):
+        stale_data = bytearray(data)
+        struct.pack_into("<I", stale_data, offset, 0)
+        draw_fallback(renderer, adapter, tmp, shaders, f"stale-pixel-b{binding}",
+                      fallback_fixture(stale_data, POSITIONS, pixels, indexed_attributes) + texels,
+                      textured=True, bad_pixels=276)
 
 
 if __name__ == "__main__":
