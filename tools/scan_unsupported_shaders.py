@@ -139,6 +139,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_ldexp_f32(?:_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+?(?:\s+clamp)?",
     rf"v_(?:(?:add|sub|subrev)_nc_u32(?:_e32|_e64)?|(?:add|sub)_nc_i32)\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:add|sub|subrev)_co_u32\s+v\d+,\s+{PIXEL_LANE_MASK},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
+    rf"v_(?:add|sub|subrev)_co_ci_u32_e32\s+v\d+,\s+{PIXEL_VCC},\s+{INTEGER_SOURCE},\s+v\d+,\s+{PIXEL_VCC}",
+    rf"v_(?:add|sub|subrev)_co_ci_u32_e64\s+v\d+,\s+{PIXEL_LANE_MASK},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE},\s+{PIXEL_LANE_MASK}",
     rf"v_(?:min|max)_(?:i32|u32)(?:_e32|_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:min3|max3|med3)_(?:i32|u32)(?:_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_cmp_class_f32{PIXEL_VOPC_DST},\s+[^,]+,\s+[^,]+",

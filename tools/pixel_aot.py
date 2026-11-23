@@ -499,6 +499,24 @@ def registers(first, last, count):
     return range(first, last+1)
 
 
+def vgpr_span(token, count):
+    if count == 1:
+        m = re.fullmatch(r"v(\d+)", token)
+        if not m:
+            raise ValueError(f"Expected single VGPR: {token}")
+        reg = int(m[1])
+        if reg > 255:
+            raise ValueError(f"VGPR index out of range: {token}")
+        return [f"v{reg}"]
+    m = re.fullmatch(r"v\[(\d+):(\d+)\]", token)
+    if not m:
+        raise ValueError(f"Expected VGPR span v[first:last]: {token}")
+    first, last = int(m[1]), int(m[2])
+    if first > 255 or last > 255 or last - first + 1 != count:
+        raise ValueError(f"Invalid VGPR span {token} for width {count}")
+    return [f"v{n}" for n in range(first, last + 1)]
+
+
 HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
 
 # s_setreg_imm32_b32 is accepted for two targets only.
@@ -647,6 +665,15 @@ CARRY_OUT = {
     "add": ("{0} + {1}", "{r} < {0}"),
     "sub": ("{0} - {1}", "{1} > {0}"),
     "subrev": ("{1} - {0}", "{0} > {1}"),
+}
+# v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32 as (partial result {p} of the two sources, result {r}
+# after the carry-in {c}, carry-out). The add carries when either step wraps. The subtracts borrow when the
+# subtrahend is above the minuend or the borrow-in is above the partial difference, which together is when
+# subtrahend + borrow-in exceeds the minuend; subrev computes src1 - src0 - borrow-in.
+CARRY_IN = {
+    "add": ("{0} + {1}", "{p} + {c}", "{p} < {0} || {r} < {p}"),
+    "sub": ("{0} - {1}", "{p} - {c}", "{1} > {0} || {c} > {p}"),
+    "subrev": ("{1} - {0}", "{p} - {c}", "{0} > {1} || {c} > {p}"),
 }
 MUL24_HELPERS = {
     "mul_u32_u24": ("mul24_u32",),
@@ -1400,6 +1427,19 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *,
     raise ValueError(f"Unsupported arithmetic operand {token}")
 
 
+
+def f32_comparison(op, tokens, scalar, vector, pending, sample_dest):
+    values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
+    predicate = COMPARE[op].format(*values)
+    if op not in ("lt", "eq", "le", "gt", "lg", "ge"):
+        return predicate
+    # Inspect the original bits. The sign modifiers preserve NaN classification,
+    # but a backend can fold relations such as -abs(x) <= 2.0 even when x is NaN.
+    bits = [fp_operand(t, scalar, vector, pending, sample_dest, ignore_sign=True) for t in tokens]
+    ordered = " && ".join(f"((asuint({f}) & 0x7fffffffu) <= 0x7f800000u)" for f in bits)
+    return f"({ordered} && ({predicate}))"
+
+
 def low16_name(token, vector):
     """Return the HLSL variable of a VGPR that holds only a defined low half, else None.
 
@@ -2148,6 +2188,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     interpolated = False
     region = None
     seen_skip = False
+    has_scratch = False
+    scratch_written = set()
     instructions = tuple(instructions)
     if any(isinstance(element, tuple) for element in instructions):
         offset_index = {}
@@ -2170,7 +2212,6 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     for i, (offset, line) in enumerate(positioned):
         vector.reads.clear()
         conditional = set(vector.conditional)
-
         def match(pattern):
             return re.fullmatch(pattern, line)
 
@@ -2276,7 +2317,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                             raise ValueError("VM wait count exceeds the gfx10 six-bit field")
                         if limit == 0:
                             sample_dest.clear()
-                        else:
+                        elif None not in sample_dest.values():
                             # Only the newest limit samples can remain outstanding. Filtering
                             # the current set also preserves guarantees made by earlier waits.
                             sample_dest = {reg: issue for reg, issue in sample_dest.items() if issue > vector_loads - limit}
@@ -2784,6 +2825,108 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     value = f"{params}[{word // 4}].{'xyzw'[word % 4]}"
                     scalar[f"s{n}"] = ("uint", value) if integer_export and params == "params" else value
                 pending.add(f"s{n}")
+        elif m := match(r"scratch_(load|store)_dword(x[234])?\s+(.*)"):
+            if title_ranges is not None:
+                raise ValueError(f"Unsupported instruction {i}: {line}")
+            kind, width_str, rest = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid scratch operation in non-entry mask")
+            count = int(width_str[1:]) if width_str else 1
+            parts = [p.strip() for p in rest.split(",")]
+            if len(parts) != 3:
+                raise ValueError("Scratch instruction requires exactly 3 operands")
+            last_words = parts[2].split()
+            if not last_words:
+                raise ValueError("Missing third operand")
+            op0, op1 = parts[0], parts[1]
+            op2 = last_words[0]
+            mods = last_words[1:]
+
+            offset = 0
+            seen_offset = False
+            seen_mods = set()
+            for mod in mods:
+                if mod.startswith("offset:"):
+                    if seen_offset:
+                        raise ValueError("Duplicate offset modifier")
+                    seen_offset = True
+                    off_val = int(mod.split(":", 1)[1])
+                    if not -2048 <= off_val <= 2047:
+                        raise ValueError(f"Scratch offset out of range (-2048..2047): {off_val}")
+                    offset = off_val
+                elif mod in ("glc", "slc", "dlc"):
+                    if mod in seen_mods:
+                        raise ValueError(f"Duplicate modifier {mod}")
+                    seen_mods.add(mod)
+                elif mod == "lds":
+                    raise ValueError("LDS modifier is not supported in pixel shaders")
+                else:
+                    raise ValueError(f"Unsupported scratch modifier: {mod}")
+
+            if offset % 4 != 0:
+                raise ValueError("Scratch dword offset must be 4-byte aligned")
+
+            if kind == "load":
+                vdst_str = op0
+                vaddr_str = op1
+                saddr_str = op2
+                regs = vgpr_span(vdst_str, count)
+                if any(reg in sample_dest for reg in regs):
+                    raise ValueError("Write overlaps an outstanding sample")
+            else:
+                vaddr_str = op0
+                vdata_str = op1
+                saddr_str = op2
+                regs = vgpr_span(vdata_str, count)
+                values = [int_operand(reg, scalar, vector, pending, sample_dest, signed=False) for reg in regs]
+
+            if vaddr_str != "off":
+                raise ValueError(f"Dynamic or unproven scratch address: vaddr must be off, got {vaddr_str}")
+            if saddr_str != "off":
+                m_s = re.fullmatch(r"s(\d+)", saddr_str)
+                if not m_s or not 0 <= int(m_s[1]) <= 105:
+                    raise ValueError(f"Invalid saddr register: {saddr_str}")
+                if saddr_str not in scalar:
+                    raise ValueError(f"Uninitialized or pending scalar register {saddr_str}")
+                base = scalar[saddr_str]
+                if not isinstance(base, int):
+                    raise ValueError(f"Dynamic or unproven scratch address: saddr {saddr_str} is not a proven integer constant")
+                addr_byte = base + offset
+            else:
+                addr_byte = offset
+
+            if addr_byte < 0:
+                raise ValueError("Negative scratch address")
+            if addr_byte % 4 != 0:
+                raise ValueError("Scratch dword offset must be 4-byte aligned")
+            if addr_byte + 4 * count > 1024:
+                raise ValueError(f"Scratch access exceeds frame: {addr_byte + 4 * count}")
+            addr_idx = addr_byte // 4
+
+            if not has_scratch:
+                lines.append("    uint scratch[256] = (uint[256])0;")
+                has_scratch = True
+
+            if kind == "load":
+                for comp, reg in enumerate(regs):
+                    dword_idx = addr_idx + comp
+                    if dword_idx not in scratch_written:
+                        raise ValueError(f"Scratch load from unwritten address: {addr_byte + 4 * comp}")
+                    if reg in sample_dest:
+                        raise ValueError("Write overlaps an outstanding sample")
+                    # A scratch result requires a full VM drain. Keep mixed loads
+                    # pending on partial waits because their relative order is unproven.
+                    sample_dest[reg] = None
+                    offset_term = f" + {comp}u" if comp else ""
+                    tag = f"alu{i}_{comp}" if count > 1 else f"alu{i}"
+                    vector[reg] = tag
+                    lines.append(f"    precise float {tag} = asfloat(scratch[{addr_idx}u{offset_term}]);")
+            else:
+                for comp, val in enumerate(values):
+                    dword_idx = addr_idx + comp
+                    scratch_written.add(dword_idx)
+                    offset_term = f" + {comp}u" if comp else ""
+                    lines.append(f"    scratch[{addr_idx}u{offset_term}] = {val};")
         elif m := match(r"v_cube(id|sc|tc|ma)_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+?)( clamp)?"):
             # LLVM ConstantFoldAMDGCNCubeIntrinsic: z, then y, then x is the major axis; a face is negative
             # only for a nonzero, non-NaN negative coordinate.
@@ -3224,6 +3367,33 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             vector[dst] = f"alu{i}"
+        elif m := match(rf"v_(add|sub|subrev)_co_ci_u32_(e32|e64) (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+), {LANE_MASK}"):
+            # The carry-out add and subtracts above with a carry or borrow of each lane read from a lane mask.
+            # LLVM 15 prints both encodings with their suffix. The VOP2 (e32) encoding reads and writes VCC and
+            # takes a VGPR as src1; the VOP3 (e64) encoding names both masks, which must have the same width.
+            # The carry-in must be a per-lane condition the translator tracks, as for v_cndmask_b32. A trailing
+            # clamp or an operand modifier is left to the fall-through.
+            op, encoding, dst, carry, src0, src1, carry_in = m.groups()
+            regs, in_regs = lane_mask(carry), lane_mask(carry_in)
+            condition = scalar.get(in_regs[0])
+            if (mask != "entry" or dst in sample_dest or int(dst[1:]) > 255 or len(regs) != len(in_regs)
+                    or pending.intersection(regs + in_regs)
+                    or (encoding == "e32" and not (regs == in_regs == ["vcc"] and re.fullmatch(r"v\d+", src1)))
+                    or not isinstance(condition, tuple) or condition[0] != "condition"
+                    or [scalar.get(r) for r in in_regs]
+                    != [(*condition[:2], j, len(in_regs)) for j in range(len(in_regs))]):
+                raise ValueError("Invalid carry-in operation")
+            a = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+            b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+            partial, result, carry_out = CARRY_IN[op]
+            lines.append(f"    uint ci{i} = {condition[1]} ? 1u : 0u;")
+            lines.append(f"    uint cp{i} = {partial.format(a, b)};")
+            lines.append(f"    uint co{i} = {result.format(p=f'cp{i}', c=f'ci{i}')};")
+            lines.append(f"    bool cmp{i} = {carry_out.format(a, b, p=f'cp{i}', c=f'ci{i}', r=f'co{i}')};")
+            lines.append(f"    precise float alu{i} = asfloat(co{i});")
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            vector[dst] = f"alu{i}"
         elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
             op, kind, dst, *tokens = m.groups()
             if mask != "entry":
@@ -3282,10 +3452,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
+            expr = f32_comparison(op, tokens, scalar, vector, pending, sample_dest)
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
-            lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+            lines.append(f"    bool cmp{i} = {expr};")
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f16(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, enc, dst, *tokens = m.groups()
             check_vopc_e32_dst(enc, dst)
@@ -3372,10 +3542,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
+            expr = f32_comparison(op, tokens, scalar, vector, pending, sample_dest)
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
-            lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+            lines.append(f"    bool cmp{i} = {expr};")
         elif m := match(rf"v_cndmask_b32(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+), {LANE_MASK}"):
             dst, unset, chosen, source = m.groups()
             regs = lane_mask(source)
