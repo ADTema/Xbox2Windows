@@ -934,9 +934,10 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(neg_one, "v_cmp_lt_f32_sdwa vcc_lo, neg(1), v18 src0_sel:DWORD src1_sel:DWORD")
         self.assertEqual(minus_one, "v_cmp_lt_f32_sdwa vcc_lo, -1, v18 src0_sel:DWORD src1_sel:DWORD")
 
-        # pixel_aot.lower accepts the inline constant -1 and refuses the neg(1) encoding, so the decoder text
-        # no longer lowers the sign-flipped 1 as the constant -1.
+        # Ordinary -1 remains valid. neg(1) must never lower as -1, and spelling a decimal
+        # modifier explicitly must not change its established binary32 comparison.
         from pixel_aot_check import with_constants
+        from scan_unsupported_shaders import is_instruction_supported
 
         def lowered(compare):
             program = with_constants(["v_sub_f32_e64 v18, s45, 0", "v_sub_f32_e64 v19, s47, 0", compare,
@@ -944,11 +945,15 @@ class TestRdna2Disasm(unittest.TestCase):
             return lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64)
 
         self.assertIn("asfloat(4294967295u) < alu20", lowered(minus_one))
-        for raw_hex in ("f924027c81009606", "f924027cf0009606"):  # neg(1) and neg(0.5) with src1 = v18
+        with self.assertRaisesRegex(ValueError, r"Unsupported arithmetic operand neg\("):
+            lowered(neg_one)
+        self.assertFalse(is_instruction_supported(neg_one))
+        for raw_hex, decimal in (("f924027cf0009606", "0.5"), ("f924027cf1009606", "-0.5")):
             compare = disasm_rdna2(bytes.fromhex(raw_hex))[0]["assembly"]
-            with self.subTest(lower_refused=compare):
-                with self.assertRaisesRegex(ValueError, r"Unsupported arithmetic operand neg\("):
-                    lowered(compare)
+            with self.subTest(decimal=decimal):
+                self.assertIn(f"neg({decimal})", compare)
+                self.assertEqual(lowered(compare), lowered(compare.replace(f"neg({decimal})", f"-{decimal}")))
+                self.assertTrue(is_instruction_supported(compare))
 
     def test_vopc_sdwa_neg_on_inline_constant_matches_llvm(self):
         """Issue #938: the neg(c) spellings and refusals equal LLVM 15's."""
