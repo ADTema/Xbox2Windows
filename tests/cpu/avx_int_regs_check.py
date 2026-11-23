@@ -64,7 +64,8 @@ EXPORTS = (
     "op_zeroupper_ymm1", "op_movdqu_load128",
 )
 
-ALL_EXPORTS = EXPORTS + ("op_zeroall",)
+NATIVE_ONLY_EXPORTS = ("op_palignr_255", "op_pmovsxbq_wide_src", "op_zeroupper_ymm2")
+ALL_EXPORTS = EXPORTS + NATIVE_ONLY_EXPORTS + ("op_zeroall",)
 
 
 # --- Independent Python ISA reference model ---
@@ -581,6 +582,9 @@ def inputs_for(name):
         return extend_pairs() + general_pairs()
     if name == "op_pmulhrsw":
         return mulhrsw_pairs() + general_pairs()
+    if name == "op_pmaddwd":
+        min_pair = pad32(struct.pack("<2h12x", -32768, -32768))
+        return general_pairs() + [(min_pair, min_pair)]
     return general_pairs()
 
 
@@ -630,6 +634,13 @@ def check_differential(native_path, lifted_path, altered_path):
             assert_equal_output("native", name, idx, got_native, want)
             assert_equal_output("lifted", name, idx, got_lifted, want)
             total += 1
+
+    a, b = general_pairs()[0]
+    for name in NATIVE_ONLY_EXPORTS:
+        got_native = invoke(native[name], a, b)
+        got_lifted = invoke(lifted[name], a, b)
+        assert_equal_output("lifted", name, 0, got_lifted, got_native)
+        total += 1
 
     # Dedicated 192-byte check for vzeroall across all six modeled YMM registers.
     want_zeroall = b"\x00" * 192
@@ -878,6 +889,9 @@ def check_rejections(original_path):
         ("segment_prefix_pinsr", (ld_xmm1, seg_pinsr, ret_ins), "unsupported instruction prefix"),
         ("missing_ret", (ld_xmm0,), "missing terminal ret"),
         ("after_ret", (ret_ins, ld_xmm0), "unreachable instruction after ret"),
+        ("undef_blend_mask", (ld_xmm1, ld_xmm2, Instruction.create_reg_reg_reg_reg(
+            Code.VEX_VPBLENDVB_XMM_XMM_XMMM128_XMM, R.XMM0, R.XMM1, R.XMM2, R.XMM3), ret_ins),
+         "undefined vector register ymm3"),
     ]
 
     all_unit = [
