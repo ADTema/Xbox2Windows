@@ -10,6 +10,7 @@ import heapq
 import json
 from pathlib import Path
 import sys
+import tempfile
 
 import pefile
 
@@ -33,7 +34,7 @@ def _relative(root, path):
 def _paths(root):
     result = {}
     total_bytes = 0
-    for path in sorted(root.rglob("*")):
+    for path in root.rglob("*"):
         if path.suffix.casefold() not in (".dll", ".exe"):
             continue
         if path.is_symlink():
@@ -105,17 +106,17 @@ def summarize(images, entry):
         reached[here] = dict(path=list(path), conditional=conditional, reasons=list(reasons))
         for row in per_image[here]:
             active_rows.append(row)
-            provider_paths = []
+            provider_path, edge_reasons = path, reasons
+            kind = row["kind"]
             for step in row["chain"]:
                 provider = step["provider"]
-                if step.get("package") and provider and provider not in provider_paths:
-                    provider_paths.append(provider)
-            for provider in provider_paths:
-                if provider not in path:
-                    kind = row["kind"]
-                    new_path = path + (provider,)
-                    heapq.heappush(queue, (conditional or kind == "delay", depth + 1,
-                                           new_path, reasons + (kind,)))
+                if step.get("package") and provider and provider not in provider_path:
+                    edge = kind if provider_path == path else "forwarder"
+                    provider_path += (provider,)
+                    edge_reasons += (edge,)
+                    distance = depth + len(provider_path) - len(path)
+                    heapq.heappush(queue, (conditional or kind == "delay", distance,
+                                           provider_path, edge_reasons))
 
     counts = Counter(row["status"] for row in active_rows)
     fatal = {"ambiguous_package_basename", "bundled_export_not_found", "bundled_forwarder_cycle",
@@ -166,7 +167,11 @@ def main(argv=None):
         output = json.dumps(report, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(output, encoding="utf-8")
+            # Replace the directory entry instead of writing through a possible hard link.
+            with tempfile.TemporaryDirectory(dir=args.output.parent) as directory:
+                report_path = Path(directory) / "report.json"
+                report_path.write_text(output, encoding="utf-8")
+                report_path.replace(args.output)
         else:
             print(output, end="")
     except (OSError, ValueError, KeyError, pefile.PEFormatError) as exc:

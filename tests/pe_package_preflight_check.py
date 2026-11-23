@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from pe_package_preflight import inspect, summarize  # noqa: E402
+from pe_package_preflight import inspect, main, summarize  # noqa: E402
 
 
 def info(name, entries=(), imports=()):
@@ -59,7 +59,11 @@ class OfflinePreflightChecks(unittest.TestCase):
         assert lookup["main.exe", "ExitProcess"]["status"] == "external_unverified"
         assert lookup["main.exe", "Twinned"]["status"] == "ambiguous_package_basename"
         assert lookup["main.exe", "Late"]["status"] == "bundled_export_present"
-        assert "bin/core.dll" in report["reachable"]
+        assert report["reachable"]["bin/core.dll"] == {
+            "path": ["main.exe", "bin/shim.dll", "bin/core.dll"],
+            "conditional": False,
+            "reasons": ["normal", "forwarder"],
+        }
         assert "bin/shim.dll" in report["reachable"]
         assert report["reachable"]["optional.dll"]["conditional"] is True
         assert "unused.dll" in report["ignored_images"]
@@ -87,6 +91,14 @@ class OfflinePreflightChecks(unittest.TestCase):
         two = summarize(dict(reversed(list(self.package.items()))), "main.exe")
         assert json.dumps(one, sort_keys=True) == json.dumps(two, sort_keys=True)
 
+    def test_normal_forwarder_precedes_a_direct_delay_import(self):
+        metadata, imports = self.package["main.exe"]
+        self.package["main.exe"] = (metadata, [*imports, ("delay", "core.dll", "Result")])
+        core = summarize(self.package, "main.exe")["reachable"]["bin/core.dll"]
+        self.assertEqual(core["path"], ["main.exe", "bin/shim.dll", "bin/core.dll"])
+        self.assertEqual(core["reasons"], ["normal", "forwarder"])
+        self.assertFalse(core["conditional"])
+
     def test_incorrect_entry_rejected(self):
         with self.assertRaisesRegex(ValueError, "Entry is not"):
             summarize(self.package, "missing.exe")
@@ -113,6 +125,20 @@ class OfflinePreflightChecks(unittest.TestCase):
             (root / "linked.dll").symlink_to(root / "shim.dll")
             with self.assertRaisesRegex(ValueError, "symlink"):
                 inspect(root, "main.exe")
+
+    def test_report_cannot_overwrite_input_through_hard_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            package = parent / "package"
+            package.mkdir()
+            image = package / "main.exe"
+            image.write_bytes(b"synthetic source image")
+            output = parent / "report.json"
+            output.hardlink_to(image)
+            with patch("pe_package_preflight.inspect", return_value={"entry": "main.exe"}):
+                self.assertEqual(main([str(package), "main.exe", "--output", str(output)]), 0)
+            self.assertEqual(image.read_bytes(), b"synthetic source image")
+            self.assertEqual(json.loads(output.read_text()), {"entry": "main.exe"})
 
     def test_cli_rejects_invalid_pe_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
