@@ -5953,6 +5953,28 @@ def check_ds_swizzle_controls():
     must_reject(translate_ds_swizzle, program[:i] + [restore] + program[i:-3] + program[-2:])
 
 
+def ds_nop_program():
+    program = ds_swizzle_program()
+    # Exercise entry EXEC and whole-quad EXEC, with each DS swizzle wait intact.
+    return ["ds_nop"] + program[:7] + ["ds_nop"] + program[7:]
+
+
+def check_ds_nop_controls():
+    base = ds_swizzle_program()
+    program = ds_nop_program()
+    # Keep the instruction indices used in generated HLSL temporary names.
+    control = ["s_nop 0" if line == "ds_nop" else line for line in program]
+    assert translate_ds_swizzle(program) == translate_ds_swizzle(control)
+    for invalid in ("ds_nop gds", "ds_nop offset:1", "ds_nop v0"):
+        must_reject(translate_ds_swizzle, [invalid] + base)
+    expect_value_error(translate_ds_swizzle, base[:-1] + ["ds_nop", base[-1]],
+                       "Unexpected instruction after color export")
+    expect_value_error(translate_ds_swizzle, base + ["ds_nop"], "Instruction follows program end")
+    wait = base.index("s_waitcnt lgkmcnt(0)")
+    expect_value_error(translate_ds_swizzle, base[:wait] + ["ds_nop"] + base[wait:],
+                       "ds_swizzle_b32 requires an immediate s_waitcnt lgkmcnt(0)")
+
+
 def check_ds_swizzle_draw(directory, compiler, renderer, backend):
     program = ds_swizzle_program()
     source, shader = directory / "ds_swizzle.hlsl", directory / "ds_swizzle.cso"
@@ -5972,10 +5994,11 @@ def check_ds_swizzle_draw(directory, compiler, renderer, backend):
     # Existing case trailer bits select UINT output and an explicit 8x8 viewport.
     case.write_bytes(bytes(256) + b"".join(struct.pack("<4f", *pixel) for pixel in pixels)
                      + struct.pack("<B4I", 3, 0, 0, 8, 8))
-    source.write_text(translate_ds_swizzle(program), encoding="ascii")
-    compile_shader(compiler, source, shader)
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    subprocess.run(draw, check=True)
+    for variant in (program, ds_nop_program()):
+        source.write_text(translate_ds_swizzle(variant), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        subprocess.run(draw, check=True)
 
     # Remove the horizontal swap from only the blue channel.
     wrong = [line.replace("QUAD_PERM,1,0,3,2", "QUAD_PERM,0,1,2,3") for line in program]
@@ -7590,6 +7613,7 @@ def check_vopc_e32_destination():
 def check_controls(directory):
     check_title_load_controls()
     check_ds_swizzle_controls()
+    check_ds_nop_controls()
     for mask in (0x3, 0xC, 0xF):
         program = compressed_export(mask)
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
@@ -9127,6 +9151,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((s_version_program(), translate_int))
     fixtures.append((with_constants(DOT_BODY), translate, "gfx1030"))
     fixtures.append((ds_swizzle_program(), translate_ds_swizzle, "gfx1030", "+wavefrontsize64,-wavefrontsize32"))
+    fixtures.append((ds_nop_program(), translate_ds_swizzle, "gfx1030", "+wavefrontsize64,-wavefrontsize32"))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000)), translate))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True)), translate))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True, clamp=True)), translate))
@@ -9165,6 +9190,9 @@ def check_binary(directory, assembler, objcopy, library):
         _, native = native_program(archive, "fixture")
         assert native == binary.read_bytes()
         decoded = disassemble(native, library, cpu=cpu.encode(), features=features.encode())
+        if "ds_nop" in instructions:
+            assert native.startswith(bytes.fromhex("000050d8 00000000"))
+            assert decoded.count("ds_nop") == instructions.count("ds_nop")
         assert lower_fixture(decoded) == lower_fixture(instructions)
         if index == 0:
             check_container_selector(directory, native, library)

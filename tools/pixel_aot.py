@@ -1947,6 +1947,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             continue
         if exported and line != "s_endpgm":
             raise ValueError("Unexpected instruction after color export")
+        # The operandless DS NOP leaves registers and memory untouched in either EXEC region.
+        if line == "ds_nop":
+            continue
         # v_nop_e64 is the VOP3 encoding of the same no-op; LLVM 15 prints both encodings as v_nop.
         if line in ("v_nop", "v_nop_e64"):
             if mask != "entry":
