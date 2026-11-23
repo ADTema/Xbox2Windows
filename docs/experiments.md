@@ -3077,6 +3077,23 @@ A separate memory-source fixture discards the compare result. Windows native and
 
 Not covered by this experiment: `VEX.W=1` 64-bit length forms (`vpcmpestri64`, `vpcmpestrm64`), control flow or calls mixed with AVX state, nonvolatile save/restore prologues, and title CPU code execution.
 
+## 64-bit explicit-length packed string compare leaf recompilation
+
+[The 64-bit packed string compare translator](../tools/cpu_pcmpstr64_aot.py) lifts bounded straight-line Windows x64 leaf functions exercising the four 64-bit explicit-length (`REX.W=1` / `VEX.W=1`) packed string compare forms in `docs/coverage/x64_zen2.tsv`: `pcmpestri64` and `pcmpestrm64` (`SSE3-4`) plus `vpcmpestri64` and `vpcmpestrm64` (`AVX`, both `xmm` and flat `m128` second operands).
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers and returns `std::uint64_t` in `rax` (packed `CF`/`ZF`/`SF`/`OF`/`PF` flags). `pcmpestri64` and `vpcmpestri64` read full signed 64-bit lengths from `RAX` and `RDX` and store the 64-bit index into `RCX`; `VEX.128` `vpcmpestrm64` zeroes `YMM0[255:128]` on its implicit `XMM0` mask write, whereas legacy `SSE4.2` `pcmpestrm64` preserves `YMM0[255:128]`. Transport and ABI glue covers `vmovdqu` (128/256-bit), `vzeroupper`, volatile GPR `mov`/`or`/`xor`/`shl`/`setb`/`sete`/`sets`/`seto`/`setp`/`movzx`, and terminal `ret`. The translator explicitly rejects 32-bit explicit-length forms (`pcmpestri`/`pcmpestrm`/`vpcmpestri`/`vpcmpestrm`), implicit-length forms (`pcmpistri`/`pcmpistrm`/`vpcmpistri`/`vpcmpistrm`), `VEX.256` (`L=1`), EVEX, uninitialized upper `YMM0[255:128]` reads after legacy `pcmpestrm64`, nonvolatile vector or GPR registers, writes to `r8`, reads through clobbered pointer registers, unsupported memory operands, prefixes, branches, undefined registers or flags, missing `ret`, and unreachable instructions after `ret`.
+
+```powershell
+cmake --build --preset dev --target cpu_pcmpstr64_original cpu_pcmpstr64_original_lifted cpu_pcmpstr64_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_pcmpstr64$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/pcmpstr64.asm) emits the exact `66 48/49 0F 3A 60/61` and `C4 E3/C3 F9 60/61` encodings across 17 exports covering `pcmpestri64`, `pcmpestrm64`, `vpcmpestri64`, and `vpcmpestrm64` (`xmm` and `m128` operands, all four element formats, all four aggregation modes, all four polarity modes, `imm8[7]` ignored, `xmm0` self-aliasing, `xmm1` preservation, `RCX` 64-bit index store, `YMM0[255:128]` zeroing on `vpcmpestrm64` vs preservation on `pcmpestrm64`, and `PF` clearing). [The differential check](../tests/cpu/pcmpstr64_check.py) skips with exit code 77 when CPUID/XCR0 lacks SSE4.2 or AVX and otherwise verifies 2,034 cases across 16 exports (including 64-bit explicit length clamping at `0x1_0000_0000`, `0x0000_0000_FFFF_FFFF`, `-4294967291`, `INT32_MIN`, and `INT64_MIN`) with 16-byte pre/post buffer guards across `dev` and `release` (`/O2`) builds against both the native MASM DLL and an independent Python reference model, alongside `vpcmpestrm64_discarded_read` dead-read fault ordering, 4 `ALTER_IMM` divergence controls (`pcmpestri64_ub_eqany_pos_lsb`: `105`, `pcmpestrm64_sb_ranges_neg_exp`: `133`, `vpcmpestri64_ub_eqany_pos_lsb`: `105`, `vpcmpestrm64_uw_eqeach_mpos_exp`: `60`), an output-mutation comparator control, 33 unit rejection controls, and 5 PE-patched DLL rejection controls.
+
+Not covered by this experiment: control flow or calls mixed with vector state, nonvolatile save/restore prologues, and title CPU code execution.
+
 ## Scalar SSE and SSE2 leaf functions
 
 Compilers keep `float` and `double` values in XMM registers and use the scalar SSE and SSE2 instructions for them. The [scalar float translator](../tools/cpu_sse_aot.py) adds these instructions to the control flow and integer instructions of the [jump-table translator](../tools/cpu_switch_aot.py), without its jump tables. It lifts `MOVSS` and `MOVSD` between registers and memory, register `MOVAPS`/`MOVUPS` copies, `ADD`/`SUB`/`MUL`/`DIV` in both precisions, `CVTSI2SS`/`CVTSI2SD` from 32- and 64-bit integers, the truncating `CVTTSS2SI`/`CVTTSD2SI`, `CVTSS2SD`/`CVTSD2SS`, the four `COMISS`-family compares, `MOVD`, `MOVQ` between XMM registers and memory, and `XORPS`/`XORPD`/`PXOR` of a register with itself.

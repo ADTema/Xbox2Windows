@@ -1113,6 +1113,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_pcmpstr_original_lifted>"
         "$<TARGET_FILE:cpu_avx_pcmpstr_altered_lifted>")
     set_tests_properties(cpu_aot_avx_pcmpstr PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_pcmpstr64_exports
+        "pcmpestri64_ub_eqany_pos_lsb,pcmpestri64_sw_ranges_neg_msb,"
+        "pcmpestri64_mem_sb_eqeach_mpos_msb,pcmpestri64_alias_xmm0,"
+        "pcmpestrm64_ub_eqany_pos_bit,pcmpestrm64_sb_ranges_neg_exp,"
+        "pcmpestrm64_mem_uw_eqord_mneg_exp,pcmpestrm64_xmm0_self,"
+        "vpcmpestri64_ub_eqany_pos_lsb,vpcmpestri64_uw_eqord_mneg_lsb,"
+        "vpcmpestri64_mem_sw_ranges_neg_msb,vpcmpestri64_alias_xmm0,"
+        "vpcmpestrm64_ub_eqany_pos_bit,vpcmpestrm64_uw_eqeach_mpos_exp,"
+        "vpcmpestrm64_mem_ub_eqany_exp,vpcmpestrm64_xmm0_self,"
+        "vpcmpestrm64_discarded_read")
+    string(CONCAT cpu_pcmpstr64_exports ${cpu_pcmpstr64_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_pcmpstr64_${variant} pcmpstr64)
+        cpu_translation(cpu_pcmpstr64_${variant} cpu_pcmpstr64_aot "${cpu_pcmpstr64_exports}")
+    endforeach()
+    target_compile_definitions(cpu_pcmpstr64_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_pcmpstr64 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/pcmpstr64_check.py"
+        "$<TARGET_FILE:cpu_pcmpstr64_original>"
+        "$<TARGET_FILE:cpu_pcmpstr64_original_lifted>"
+        "$<TARGET_FILE:cpu_pcmpstr64_altered_lifted>")
+    set_tests_properties(cpu_aot_pcmpstr64 PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_pcmpstr64.txt")
     set(cpu_sse2_exports
         "op_cmppd_0,op_cmppd_1,op_cmppd_2,op_cmppd_3,op_cmppd_4,op_cmppd_5,op_cmppd_6,op_cmppd_7,"
         "op_cmppd_mem,"
