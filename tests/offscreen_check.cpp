@@ -532,6 +532,12 @@ OperationResult run_spirv_compare_sampler(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_spirv_compaction(const OperationContext& ctx)
+{
+    check_spirv_compaction(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_ffx_device_init(const OperationContext& ctx)
 {
     check_ffx_device_init(ctx.device);
@@ -855,6 +861,10 @@ constexpr CapabilityGate kGateSm66Ballot{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: ballot fixture requires SM 6.6",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66Compaction{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "skip: subgroup compaction fixture requires SM 6.6",
+    CapsDiagnostic::none};
 
 // Static argument shapes and unconditional adapter prerequisites for every named operation.
 // Scenario-dependent capability checks (such as DXR tier, mesh tier, or existing-heap support)
@@ -871,6 +881,7 @@ const OperationSpec kOperations[] = {
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm66CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
+    {"--spirv-compaction", 4, 4, nullptr, kGateSm66Compaction, run_spirv_compaction},
     {"--ffx-device-init", 3, 3, nullptr, kNoGate, run_ffx_device_init},
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
