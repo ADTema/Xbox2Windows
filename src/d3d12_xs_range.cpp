@@ -18,6 +18,17 @@ HRESULT create_reserved(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, I
     return device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(window));
 }
 
+class SharedLock {
+public:
+    explicit SharedLock(SRWLOCK& lock) : lock_(lock) { AcquireSRWLockShared(&lock_); }
+    ~SharedLock() { ReleaseSRWLockShared(&lock_); }
+    SharedLock(const SharedLock&) = delete;
+    SharedLock& operator=(const SharedLock&) = delete;
+
+private:
+    SRWLOCK& lock_;
+};
+
 class GpuRange final : public IX2WGpuRange {
 public:
     HRESULT reserve(ID3D12Device* device, UINT64 size, d3d12_xs_range::CreateWindowFn create_window) noexcept
@@ -52,7 +63,6 @@ public:
             if (FAILED(hr)) return hr;
             windows_.push_back(std::move(created));  // capacity reserved above
         }
-        device_ = device;
         size_ = size;
         window_ = window;
         return S_OK;
@@ -75,13 +85,22 @@ public:
         return left;
     }
 
-    UINT64 STDMETHODCALLTYPE GetSize() override { return size_; }
-    UINT64 STDMETHODCALLTYPE GetWindowSize() override { return window_; }
-    UINT STDMETHODCALLTYPE GetWindowCount() override { return static_cast<UINT>(windows_.size()); }
+    UINT64 STDMETHODCALLTYPE GetSize() override
+    {
+        SharedLock shared(lock_);
+        return size_;
+    }
+    UINT64 STDMETHODCALLTYPE GetWindowSize() override { return window_; }  // fixed after create
+    UINT STDMETHODCALLTYPE GetWindowCount() override
+    {
+        SharedLock shared(lock_);
+        return static_cast<UINT>(windows_.size());
+    }
     HRESULT STDMETHODCALLTYPE GetWindow(UINT index, ID3D12Resource** window) override
     {
         if (!window) return E_INVALIDARG;
         *window = nullptr;
+        SharedLock shared(lock_);
         if (index >= windows_.size()) return E_INVALIDARG;
         *window = windows_[index].Get();
         (*window)->AddRef();
@@ -90,6 +109,7 @@ public:
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress(UINT64 offset, UINT64 bytes) override
     {
         if (!bytes) bytes = 1;
+        SharedLock shared(lock_);
         if (offset >= size_ || bytes > size_ - offset) return 0;
         const UINT64 index = offset / window_;
         const UINT64 inside = offset - index * window_;
@@ -98,22 +118,19 @@ public:
     }
     void STDMETHODCALLTYPE Close() override
     {
-        // The windows keep device_ alive until they are released below. The caller holds a reference
-        // to this range, so dropping the private data's reference does not destroy it here.
-        IX2WGpuRange* stored = nullptr;
-        UINT bytes = sizeof(stored);
-        if (device_ && SUCCEEDED(device_->GetPrivateData(__uuidof(IX2WGpuRange), &bytes, &stored)) && stored) {
-            if (stored == this) device_->SetPrivateData(__uuidof(IX2WGpuRange), 0, nullptr);  // deletes the entry
-            stored->Release();
-        }
-        device_ = nullptr;
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> released;
+        AcquireSRWLockExclusive(&lock_);
         size_ = 0;
-        windows_.clear();
+        released.swap(windows_);
+        ReleaseSRWLockExclusive(&lock_);
+        // The windows are released here, outside the lock; the last one may destroy the device.
     }
 
 private:
+    ~GpuRange() = default;
+
     std::atomic<ULONG> refs_{1};
-    ID3D12Device* device_ = nullptr;  // not owned; valid while windows_ is not empty
+    SRWLOCK lock_ = SRWLOCK_INIT;
     UINT64 size_ = 0;
     UINT64 window_ = 0;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> windows_;
@@ -135,25 +152,5 @@ HRESULT create(ID3D12Device* device, UINT64 size, IX2WGpuRange** range, CreateWi
     }
     *range = created;
     return S_OK;
-}
-
-HRESULT attach(ID3D12Device* device, UINT64 size, CreateWindowFn create_window) noexcept
-{
-    IX2WGpuRange* range = nullptr;
-    HRESULT hr = create(device, size, &range, create_window);
-    if (FAILED(hr)) return hr;
-    hr = device->SetPrivateDataInterface(__uuidof(IX2WGpuRange), range);
-    if (FAILED(hr)) range->Close();
-    range->Release();
-    return hr;
-}
-
-bool attached(ID3D12Device* device) noexcept
-{
-    IUnknown* range = nullptr;
-    UINT size = sizeof(range);
-    if (FAILED(device->GetPrivateData(__uuidof(IX2WGpuRange), &size, &range)) || !range) return false;
-    range->Release();
-    return true;
 }
 }

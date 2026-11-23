@@ -5,11 +5,8 @@
 //   D3D12CreateRootSignatureDeserializer: amd_fidelityfx_upscaler_xbox.dll (0x4f88) reads a
 //     serialized root signature from an embedded container and retrieves the descriptor interface.
 // The main executable also imports D3D12XboxCreateDevice and D3D12ConfigureVirtualMemoryX (#874).
-#include "d3d12_xs_range.h"
-
 #include <d3d12.h>
 #include <dxgi.h>
-#include <wrl/client.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -29,11 +26,9 @@ static_assert(offsetof(D3D12_VERSIONED_ROOT_SIGNATURE_DESC, Desc_1_1) +
 // configures once per process before it creates the device. The DWORD's meaning is open.
 constexpr std::size_t vm_config_bytes = 32;
 constexpr std::size_t vm_config_value = 4;
-// The caller computes the value as ceil(size / 16 GiB) + 2, so (value - 2) * 16 GiB covers its range
-// (16 GiB for 3, 24 GiB rounded up to 32 GiB for 4). Reserved address space has no backing.
-constexpr UINT64 vm_range_unit = UINT64{16} << 30;
-
-// Configuration and device creation are serialized. `value` is the accepted DWORD, 0 for none.
+// Configuration and device creation are serialized. `value` is the accepted DWORD, 0 for none. It is
+// recorded for the owner of the title's device, which will reserve the matching GPU range
+// (src/d3d12_xs_range.h); until that owner exists, device creation does not use it.
 struct VmState {
     SRWLOCK lock = SRWLOCK_INIT;
     std::uint32_t value = 0;
@@ -88,16 +83,8 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
     if (parameters) return E_INVALIDARG;
     if (iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
     AcquireSRWLockExclusive(&vm_state.lock);
-    Microsoft::WRL::ComPtr<ID3D12Device> created;
-    HRESULT hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&created));
-    // After a configuration, the device carries the reserved range (d3d12_xs_range.h). D3D12 returns
-    // the existing device for an adapter that already has one, so a range is attached only once.
-    if (SUCCEEDED(hr) && vm_state.value && !d3d12_xs_range::attached(created.Get()))
-        hr = d3d12_xs_range::attach(created.Get(), (vm_state.value - 2) * vm_range_unit);
-    if (SUCCEEDED(hr)) {
-        vm_state.device_created = true;
-        *device = created.Detach();
-    }
+    const HRESULT hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, iid, device);
+    if (SUCCEEDED(hr)) vm_state.device_created = true;
     ReleaseSRWLockExclusive(&vm_state.lock);
     return hr;
 }
