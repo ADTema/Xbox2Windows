@@ -2129,12 +2129,29 @@ or replaces the thread's word, `ds_read_b32` returns it in full, and
 `ds_read_u16` zero-extends the low or high half at offset 0 or 2. This
 footprint has no inter-thread aliasing, so the translator can retain the
 written value as a per-invocation expression. Reads require initialization.
+
+`ds_write_b8` and `ds_write_b16` replace the selected byte or halfword with
+low source bits while preserving the rest of the initialized word.
+`ds_read_u8` zero-extends a byte, and `ds_read_i8` and `ds_read_i16`
+sign-extend their results to 32 bits. Byte offsets are 0 through 3 and
+halfword offsets are 0 or 2. Subword accesses use the same address, LDS
+allocation, full EXEC and immediate wait checks as full-word accesses.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
 mismatch at word 2 (`0x000089ab` expected, `0x0000fff0` observed).
+
+Six subword variants cover all supported offsets. Each compares the updated
+word, the unsigned extraction and the signed extraction, with values on both
+sides of the sign boundary. Two successive partial writes check that the
+second preserves the earlier change. The fixture overwrites the source VGPR
+after the subword write and overwrites the LDS word again before export to
+check that earlier reads retain their values. Each dispatch checks the entire
+320-word UAV, including the untouched tail. Replacing the partial write with a full
+write must mismatch at word 0. Replacing sign extension with zero extension
+must mismatch at word 50, the signed result of lane 16.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check

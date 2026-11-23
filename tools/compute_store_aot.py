@@ -384,25 +384,43 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                                    f"    uint {result} = {slot}[(local.x + {bias}u) & 31u];"))
             vector[dst] = ("alu", result)
             ds_wait = True
-        elif m := re.fullmatch(r"ds_write_b32 v(\d+), v(\d+)", line):
-            addr, src = map(int, m.groups())
+        elif m := re.fullmatch(r"ds_write_b(8|16|32) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
+            width, addr, src = map(int, m.groups()[:3])
+            offset = int(m[4] or 0)
             value = vector.get(src)
             if (not lds_enabled or guard_span is not None or max(addr, src) > 255
-                    or vector.get(addr) != ("lds_address",) or not is_word(value)):
+                    or vector.get(addr) != ("lds_address",) or not is_word(value)
+                    or offset % (width // 8) or (width < 32 and lds_word is None)):
                 raise ValueError("Unverified private LDS write")
-            # Every lane owns one disjoint word. Capture the written value even if the source is overwritten.
-            lds_word = value
+            # Every lane owns one disjoint word. Capture values even if their VGPRs are overwritten.
+            if width == 32:
+                lds_word = value
+            else:
+                shift = offset * 8
+                mask = (1 << width) - 1
+                keep = 0xffffffff ^ (mask << shift)
+                expression = (f"(({hlsl_word(lds_word)} & 0x{keep:08x}u) | "
+                              f"(({hlsl_word(value)} & 0x{mask:x}u) << {shift}u))")
+                if len(expression) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("LDS expression exceeds the profile limit")
+                lds_word = ("alu", expression)
             ds_wait = True
-        elif m := re.fullmatch(r"ds_read_(b32|u16) v(\d+), v(\d+)(?: offset:(2))?", line):
-            op, dst, addr, offset = m[1], int(m[2]), int(m[3]), m[4]
+        elif m := re.fullmatch(r"ds_read_(b32|[ui](?:8|16)) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
+            op, dst, addr, offset = m[1], int(m[2]), int(m[3]), int(m[4] or 0)
+            width = int(op[1:])
             if (not lds_enabled or guard_span is not None or max(dst, addr) > 255
-                    or vector.get(addr) != ("lds_address",) or lds_word is None or (op == "b32" and offset)):
+                    or vector.get(addr) != ("lds_address",) or lds_word is None or offset % (width // 8)):
                 raise ValueError("Unverified private LDS read")
-            if op == "b32":
+            if width == 32:
                 vector[dst] = lds_word
             else:
-                shift = 16 if offset else 0
-                expression = f"(({hlsl_word(lds_word)} >> {shift}u) & 0xffffu)"
+                shifted = f"({hlsl_word(lds_word)} >> {offset * 8}u)"
+                if op.startswith("i"):
+                    # Shifting to the sign bit discards any higher neighbors before the arithmetic shift.
+                    extend = 32 - width
+                    expression = f"asuint(asint({shifted} << {extend}u) >> {extend}u)"
+                else:
+                    expression = f"({shifted} & 0x{(1 << width) - 1:x}u)"
                 if len(expression) > ALU_EXPRESSION_LIMIT:
                     raise ValueError("LDS expression exceeds the profile limit")
                 vector[dst] = ("alu", expression)
