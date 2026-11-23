@@ -2852,6 +2852,27 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_load_cookie COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/load_cookie_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_cookie_dll>" "$<TARGET_FILE:cpu_cookie_exe>" "$<TARGET_FILE:cpu_exe_io>")
+    foreach(variant IN ITEMS present absent alternate cfg)
+        add_executable(cpu_load_dispatch_${variant} tests/cpu/load_config_dispatch.asm tests/cpu/exe_startup.asm)
+        set_target_properties(cpu_load_dispatch_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_load_dispatch_${variant} PRIVATE
+            /ENTRY:native_startup /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_load_dispatch_${variant} PRIVATE cpu_exe_io)
+        if(variant STREQUAL absent)
+            target_compile_options(cpu_load_dispatch_${variant} PRIVATE /DDISPATCH_ABSENT)
+        elseif(variant STREQUAL alternate)
+            target_compile_options(cpu_load_dispatch_${variant} PRIVATE /DDISPATCH_ALTERNATE)
+        elseif(variant STREQUAL cfg)
+            target_compile_options(cpu_load_dispatch_${variant} PRIVATE /DDISPATCH_CFG)
+            target_link_options(cpu_load_dispatch_${variant} PRIVATE /GUARD:CF)
+        endif()
+    endforeach()
+    add_test(NAME cpu_native_load_dispatch COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/load_config_dispatch_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_load_dispatch_present>" "$<TARGET_FILE:cpu_load_dispatch_absent>"
+        "$<TARGET_FILE:cpu_load_dispatch_alternate>" "$<TARGET_FILE:cpu_load_dispatch_cfg>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_load_dispatch PROPERTIES TIMEOUT 60)
     foreach(variant IN ITEMS original no_tls)
         add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)

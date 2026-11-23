@@ -1415,6 +1415,14 @@ startup or use of this relocation by a particular title is established.
 
 `ctest --preset release --no-tests=error -R '^cpu_native_load_cookie$' -V`
 
+### Load-config dispatch slot
+
+`cpu_load_dispatch_present`, `_absent`, `_alternate` and `_cfg` share a hand-written 0x138-byte `_load_config_used`. The dispatch field at offset 0x78 (`GuardCFDispatchFunctionPointer`) is a typed callback pointer in read-only `.rdata`; the linker emits a DIR64 relocation at the field. `native_entry` loads the field, calls it with `ECX=0x1234` when non-null, and encodes the callback count, argument and return in its exit code through the existing `finish_exe` wrapper. The test inspects each image's own PE for the directory and structure sizes, the slot RVA and value, the read-only section and the DIR64 relocation, then runs the same image under Windows and `pe_map` with the same `cpu_exe_io.dll` provider.
+
+The absent build makes zero calls (exit `0xb211`). The present build calls the callback once with `0x1234` and return `0x5a` (`0xb111`); the alternate callback changes the return and exit (`0xb151`) so a wrong binding is visible. Native and mapped results match for all three. The CFG-linked build sets `GuardFlags=0x100` on the same hand-built structure; Windows refuses it before entry with `STATUS_DATA_ERROR` (`0xc000003e`), while `pe_map` ignores `GuardFlags` and returns `0xb111`. That is a reported CFG gap, not a pass; a linker-emitted valid CFG load config remains a follow-up. The fixture does not establish title behavior.
+
+`ctest --preset dev --no-tests=error -R '^cpu_native_load_dispatch$' -V`
+
 ### TLS callbacks and the entry point
 
 `tls_route` has an entry point and a TLS directory whose callback list holds one routine and whose data template is empty. Both routines report each call to `cpu_tls_sink.dll`, which outlives the image, so calls made during release stay visible. `cpu_native_tls` loads the image with `LoadLibraryW` and maps it with `pe_map`, each in its own child process, and compares the process notifications:
