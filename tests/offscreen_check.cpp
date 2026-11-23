@@ -850,6 +850,12 @@ OperationResult run_gpu_alias_lookup_writes(const OperationContext& ctx)
     return skip_if_false(check_gpu_alias_lookup_writes(ctx.device));
 }
 
+OperationResult run_gpu_alias_atomic_waterfall(const OperationContext& ctx)
+{
+    if (!check_gpu_alias_atomic_waterfall(ctx.device))
+        return {OutcomeKind::fail, "Waterfall atomic counts differ from the reference"};
+    return {OutcomeKind::pass, nullptr};
+}
 OperationResult run_gpu_alias_registry(const OperationContext& ctx)
 {
     return skip_if_false(check_gpu_alias_registry(ctx.device));
@@ -904,6 +910,10 @@ constexpr CapabilityGate kGateAddressWindow{
 constexpr CapabilityGate kGateSm66Ballot{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: ballot fixture requires SM 6.6",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60AtomicWaterfall{
+    D3D_SHADER_MODEL_6_0, false, true, 0,
+    "skip: atomic waterfall diagnostic requires SM 6.0 and WaveOps",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm60Compaction{
     D3D_SHADER_MODEL_6_0, false, true, 0,
@@ -992,6 +1002,7 @@ const OperationSpec kOperations[] = {
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
     {"--gpu-alias-lookup", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup},
     {"--gpu-alias-lookup-writes", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup_writes},
+    {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
     {"--gpu-alias-registry", 3, 3, nullptr, kNoGate, run_gpu_alias_registry},
     {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},

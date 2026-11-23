@@ -4250,7 +4250,7 @@ def check_int16_vop3_controls():
     for line in ("v_add_nc_u16 v24, v18, v19 op_sel:[0,0,1]", "v_add_nc_u16 v24, v18, v19 clamp",
                  "v_add_nc_u16_dpp v24, v18, v19 quad_perm:[0,1,2,3]",
                  "v_add_nc_u16_sdwa v24, v18, v19 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0",
-                 "v_add_f16_e64 v24, v18, v19"):
+                 "v_min_f16_e64 v24, v18, v19"):
         refuse(line, "Unsupported instruction")
     refuse("v_add_nc_u16 v24, v18, -v19", "Unsupported 16-bit integer operand")
     refuse("v_add_nc_u16 v24, v18, 1.0", "Unsupported 16-bit integer operand")
@@ -7938,6 +7938,538 @@ def check_vopc_e32_destination():
             translate(with_constants(["v_mov_b32_e32 v18, 64", f"{name}_e32 {dst}, s44, v18"]))
 
 
+# Plain non-fused binary16 VOP2 arithmetic (issue #839): v_add_f16, v_sub_f16, v_subrev_f16 and v_mul_f16, e32 and e64.
+# Both sources must be statically proven finite, so every operand is baked into the program as an inline constant, a
+# 16-bit literal, a tracked SGPR or a VGPR copied from a literal; a result that would overflow is refused. The lowering
+# is only valid with the entry denormal state declared (lower(half_denorm="preserve")).
+F16_ARITH_OPS = ("add", "sub", "subrev", "mul")
+# 40 pairs (a, b) of finite binary16 encodings. No lane of any of the four ops overflows (asserted below).
+F16_ARITH_PAIRS = (
+    (0x3c00, 0x1000), (0x6800, 0x3c00), (0xbc00, 0x9000),              # halfway, down to even
+    (0x3c01, 0x1000), (0x6801, 0x3c00), (0xbc01, 0x9000),              # halfway, up to even
+    (0x6800, 0x3c01), (0x6801, 0x3bff),                                # just above and below a tie
+    (0x7bff, 0x0001), (0xfbff, 0x8001),                                # sticky bit beyond binary32
+    (0x0001, 0x3800), (0x8001, 0x3800), (0x0003, 0x3800), (0x0005, 0x3800), (0x0006, 0x3400), (0x0001, 0x3400),
+    (0x0401, 0x0400), (0x8400, 0x0401), (0x0400, 0x3800),              # normal to subnormal
+    (0x03ff, 0x0001), (0x0001, 0x0001), (0x8001, 0x8001), (0x03ff, 0x03fe), (0x03ff, 0x4000),
+    (0x0001, 0x3c00), (0x0001, 0xbc00),                                # subnormal inputs and the carry into 0x0400
+    (0x0000, 0x0000), (0x8000, 0x8000), (0x0000, 0x8000), (0x8000, 0x0000),
+    (0x3c00, 0x3c00), (0xbc00, 0x3c00), (0x3c00, 0x8000), (0xbc00, 0x8000), (0x8001, 0x0001),   # signed zero
+    (0x3c01, 0x3c01), (0x3e00, 0x3e00), (0x7bff, 0x3800),             # plain
+    (0x8003, 0x0003), (0x3555, 0xb555),
+)
+# Junk for bits 31:16 of every source word, so that a source read from the high half changes lanes.
+F16_ARITH_JUNK = (0x3555, 0xd1a7, 0x4248, 0xa5c3)
+# Pairs read through the four accepted readers: v_cvt_f32_f16 e32 and e64, its SDWA WORD_0 form and v_mov_b32_sdwa
+# WORD_0. Reader r of program j reads the result of op (r + j) % 4.
+F16_ARITH_READER_PAIRS = ((0x0003, 0x3800), (0x8001, 0x8001), (0x8000, 0x8000), (0x6801, 0x3c00),
+                          (0x03ff, 0x0001), (0xbc00, 0x3c00))
+# Chains: v24 = add(a, b), v25 = mul(v24, c), v26 = sub(v25, v24), v27 = subrev(v24, v26), each a result of an
+# accepted op read as the source of the next one.
+F16_ARITH_CHAINS = ((0x3c01, 0x1000, 0x0401), (0x8001, 0x8001, 0x4000))
+F16_ARITH_MUTATIONS = ("truncate", "ties_away", "flush_out", "flush_in", "neg_subnormal_in", "zero_sign_out",
+                       "src_high", "subrev_as_sub", "sub_as_add", "mul_as_add", "zero_sum_sign")
+
+
+def f16_arith_reference(op, word_a, word_b, *, mutation=None, double=False):
+    """Binary16 result bits of one op on the low halves of two source words, from the semantics only.
+
+    Exact integer arithmetic (value = integer * 2^-24 per operand, a product in units of 2^-48) and one round to
+    nearest even on the binary16 grid, with the IEEE rule for the sign of an exact zero. No pixel_aot import and no
+    struct 'e'. Returns None for a NaN or infinity operand and for an overflow, which no fixture uses.
+    mutation models a deliberate deviation of the draw's mutated shaders; a mutation (or double=True) first rounds the
+    exact value to binary32 as the lowering does.
+    """
+    op = {"subrev_as_sub": {"subrev": "sub"}, "sub_as_add": {"sub": "add"},
+          "mul_as_add": {"mul": "add"}}.get(mutation, {}).get(op, op)
+
+    def operand(word, high):
+        half = (word >> 16 if high else word) & 0xffff
+        sign, exponent, mantissa = half >> 15, (half >> 10) & 31, half & 1023
+        if exponent == 31:
+            return None
+        if exponent == 0:
+            return (0 if mutation == "neg_subnormal_in" else sign), (0 if mutation == "flush_in" else mantissa)
+        return sign, (mantissa | 1024) << (exponent - 1)
+
+    first, second = operand(word_a, mutation == "src_high"), operand(word_b, False)
+    if first is None or second is None:
+        return None
+    (sign_a, mag_a), (sign_b, mag_b) = first, second
+    x, y = (-mag_a if sign_a else mag_a), (-mag_b if sign_b else mag_b)
+    if op == "mul":
+        exact, zero_negative = x * y, sign_a != sign_b
+    else:
+        exact, zero_negative = {"add": ((x + y) << 24, bool(sign_a and sign_b)),
+                                "sub": ((x - y) << 24, bool(sign_a and not sign_b)),
+                                "subrev": ((y - x) << 24, bool(sign_b and not sign_a))}[op]
+    magnitude = abs(exact)
+    if (double or mutation is not None) and magnitude.bit_length() > 24:
+        drop = magnitude.bit_length() - 24
+        kept, rest = divmod(magnitude, 1 << drop)
+        if rest > 1 << (drop - 1) or (rest == 1 << (drop - 1) and kept & 1):
+            kept += 1
+        magnitude = kept << drop
+    sign = 0x8000 if exact < 0 or (exact == 0 and zero_negative) else 0
+    if mutation == "zero_sign_out" and magnitude < 1 << 23:  # below 2^-25
+        return 0
+    if mutation == "flush_out" and magnitude < 1 << 34:  # below 2^-14
+        return sign
+    if magnitude == 0:
+        bits = 0
+    else:
+        exponent = magnitude.bit_length() - 1 - 48
+        quantum = max(exponent, -14) - 10
+        kept, rest = divmod(magnitude, 1 << (quantum + 48))
+        half = 1 << (quantum + 47)
+        if mutation == "ties_away":
+            kept += rest >= half
+        elif mutation != "truncate" and (rest > half or (rest == half and kept & 1)):
+            kept += 1
+        exponent = max(exponent, -14)
+        if kept >= 2048:
+            kept, exponent = kept >> 1, exponent + 1
+        if kept < 1024:
+            bits = kept
+        elif exponent + 15 >= 31:
+            return None
+        else:
+            bits = ((exponent + 15) << 10) | (kept - 1024)
+    result = sign | bits
+    if mutation == "zero_sum_sign" and op != "mul" and result == 0x8000:
+        return 0
+    return result
+
+
+def f16_widen_word(bits):
+    """The binary32 encoding of a finite binary16 encoding (v_cvt_f32_f16), exact."""
+    sign, exponent, mantissa = bits >> 15, (bits >> 10) & 31, bits & 1023
+    magnitude = (Fraction(mantissa, 1 << 24) if exponent == 0
+                 else Fraction(mantissa | 1024) * Fraction(2) ** (exponent - 25))
+    return struct.unpack("<I", struct.pack("<f", math.copysign(float(magnitude), -1.0 if sign else 1.0)))[0]
+
+
+def f16_arith_pair_words(pair):
+    """The 32-bit source words of F16_ARITH_PAIRS[pair]: the binary16 value in bits 15:0, junk in bits 31:16."""
+    half_a, half_b = F16_ARITH_PAIRS[pair]
+    return ((F16_ARITH_JUNK[pair % 4] << 16) | half_a, (F16_ARITH_JUNK[(pair + 1) % 4] << 16) | half_b)
+
+
+def f16_arith_token(half):
+    """The src0 token of an e32 literal form, spelled as LLVM 15 prints it, or None where LLVM folds it to an integer."""
+    inverse = {value: token for token, value in pixel_aot.INLINE_F16.items()}
+    if half in inverse:
+        return inverse[half]
+    if half == 0:
+        return "0"
+    return None if 1 <= half <= 0x40 else f"{half:#x}"
+
+
+def f16_arith_program(kind, index):
+    """One draw program. Kinds: main (two pairs, four ops each, packed two results per word), reader (one pair read
+    through the four readers) and chain (four chained results widened with v_cvt_f32_f16)."""
+    pack = "v_mov_b32_sdwa v{dst}, v{src} dst_sel:{sel} dst_unused:{unused} src0_sel:WORD_0"
+    body = []
+    if kind == "main":
+        for slot in (0, 1):
+            pair = 2 * index + slot
+            word_a, word_b = f16_arith_pair_words(pair)
+            reg_a, reg_b, sgpr = 18 + 2 * slot, 19 + 2 * slot, 60 + slot
+            body += [f"v_mov_b32_e32 v{reg_a}, {word_a:#x}", f"v_mov_b32_e32 v{reg_b}, {word_b:#x}",
+                     f"s_mov_b32 s{sgpr}, {word_a:#x}"]
+            literal = f16_arith_token(word_a & 0xffff)
+            for k, op in enumerate(F16_ARITH_OPS):
+                dst, form = 24 + 4 * slot + k, (pair + k) % 4
+                if form == 3 and literal is None:
+                    form = 0
+                body.append([f"v_{op}_f16_e32 v{dst}, v{reg_a}, v{reg_b}", f"v_{op}_f16_e64 v{dst}, v{reg_a}, v{reg_b}",
+                             f"v_{op}_f16_e64 v{dst}, s{sgpr}, v{reg_b}",
+                             f"v_{op}_f16_e32 v{dst}, {literal}, v{reg_b}"][form])
+        for word in range(4):
+            body.append(pack.format(dst=12 + word, src=24 + 2 * word, sel="WORD_0", unused="UNUSED_PAD"))
+            body.append(pack.format(dst=12 + word, src=25 + 2 * word, sel="WORD_1", unused="UNUSED_PRESERVE"))
+    elif kind == "reader":
+        word_a, word_b = f16_arith_pair_words(F16_ARITH_PAIRS.index(F16_ARITH_READER_PAIRS[index]))
+        body += [f"v_mov_b32_e32 v18, {word_a:#x}", f"v_mov_b32_e32 v19, {word_b:#x}",
+                 "v_add_f16_e32 v24, v18, v19", "v_sub_f16_e64 v25, v18, v19",
+                 "v_subrev_f16_e32 v26, v18, v19", "v_mul_f16_e64 v27, v18, v19"]
+        readers = ("v_cvt_f32_f16_e32 v12, v{}", "v_cvt_f32_f16_e64 v13, v{}",
+                   "v_cvt_f32_f16_sdwa v14, v{} dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                   "v_mov_b32_sdwa v15, v{} dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0")
+        body += [line.format(24 + (r + index) % 4) for r, line in enumerate(readers)]
+    else:
+        word_a, word_b, word_c = ((F16_ARITH_JUNK[k] << 16) | half for k, half in enumerate(F16_ARITH_CHAINS[index]))
+        body += [f"v_mov_b32_e32 v18, {word_a:#x}", f"v_mov_b32_e32 v19, {word_b:#x}", f"v_mov_b32_e32 v20, {word_c:#x}",
+                 "v_add_f16_e32 v24, v18, v19", "v_mul_f16_e32 v25, v24, v20",
+                 "v_sub_f16_e32 v26, v25, v24", "v_subrev_f16_e32 v27, v24, v26"]
+        body += [f"v_cvt_f32_f16_e32 v{12 + k}, v{24 + k}" for k in range(4)]
+    return uncompressed_export(body)
+
+
+def f16_arith_source_halves(kind, index):
+    """The binary16 source encodings of one draw program."""
+    if kind == "main":
+        return [half for pair in F16_ARITH_PAIRS[2 * index:2 * index + 2] for half in pair]
+    return list(F16_ARITH_READER_PAIRS[index] if kind == "reader" else F16_ARITH_CHAINS[index])
+
+
+def f16_arith_expected(kind, index, mutation=None):
+    """The four exported words of f16_arith_program(kind, index); an entry is None where the model gives NaN, infinity
+    or overflow (a mutated model only)."""
+    def result(op, word_a, word_b):
+        return f16_arith_reference(op, word_a, word_b, mutation=mutation)
+
+    def widened(bits):
+        return None if bits is None else f16_widen_word(bits)
+
+    if kind == "main":
+        results = []
+        for slot in (0, 1):
+            word_a, word_b = f16_arith_pair_words(2 * index + slot)
+            results += [result(op, word_a, word_b) for op in F16_ARITH_OPS]
+        return tuple(None if results[2 * w] is None or results[2 * w + 1] is None
+                     else results[2 * w] | results[2 * w + 1] << 16 for w in range(4))
+    if kind == "reader":
+        word_a, word_b = f16_arith_pair_words(F16_ARITH_PAIRS.index(F16_ARITH_READER_PAIRS[index]))
+        results = [result(op, word_a, word_b) for op in F16_ARITH_OPS]
+        chosen = [results[(r + index) % 4] for r in range(4)]
+        return (*(widened(bits) for bits in chosen[:3]), chosen[3])
+    word_a, word_b, word_c = ((F16_ARITH_JUNK[k] << 16) | half for k, half in enumerate(F16_ARITH_CHAINS[index]))
+    chain = [result("add", word_a, word_b)]
+    chain.append(None if chain[0] is None else result("mul", chain[0], word_c))
+    chain.append(None if chain[1] is None else result("sub", chain[1], chain[0]))
+    chain.append(None if chain[2] is None else result("subrev", chain[0], chain[2]))
+    return tuple(widened(bits) for bits in chain)
+
+
+F16_ARITH_PROGRAMS = (*(("main", i) for i in range(len(F16_ARITH_PAIRS) // 2)),
+                      *(("reader", i) for i in range(len(F16_ARITH_READER_PAIRS))),
+                      *(("chain", i) for i in range(len(F16_ARITH_CHAINS))))
+
+
+def translate_f16(instructions):
+    """translate_int() for a program that declares the binary16 denormal state at entry as preserved."""
+    return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                 half_denorm=pixel_aot.HALF_DENORM_PRESERVE)
+
+
+# The 11 deviations of the draw. Each text edit applies to the lowered source of every program and asserts that it
+# changed it; the three op-level ones rewrite the program instead.
+F16_ARITH_TEXT_EDITS = {
+    "truncate": (("return sign | ((full + (1u << (shift - 1u)) - 1u + ((full >> shift) & 1u)) >> shift);",
+                  "return sign | (full >> shift);"),
+                 ("uint rounded = (full + 0xfffu + ((full >> 13) & 1u)) >> 13;", "uint rounded = full >> 13;")),
+    "ties_away": (("(full + (1u << (shift - 1u)) - 1u + ((full >> shift) & 1u)) >> shift",
+                   "(full + (1u << (shift - 1u))) >> shift"),
+                  ("(full + 0xfffu + ((full >> 13) & 1u)) >> 13", "(full + 0x1000u) >> 13")),
+    "flush_out": (("return sign | ((full + (1u << (shift - 1u)) - 1u + ((full >> shift) & 1u)) >> shift);",
+                   "return sign;"),),
+    "flush_in": (("precise float magnitude = float(mantissa) * asfloat(0x33800000u);",
+                  "precise float magnitude = 0.0f;"),),
+    "neg_subnormal_in": (("return sign != 0u ? -magnitude : magnitude;", "return magnitude;"),),
+    "zero_sign_out": (("    if (exponent < 102u) {\n        return sign;\n", "    if (exponent < 102u) {\n        return 0u;\n"),),
+}
+F16_ARITH_OP_MUTATIONS = {"subrev_as_sub": ("v_subrev_f16", "v_sub_f16"), "sub_as_add": ("v_sub_f16", "v_add_f16"),
+                          "mul_as_add": ("v_mul_f16", "v_add_f16")}
+
+
+def f16_arith_mutated(mutation, program):
+    """The lowered source of program (instruction lines) with one deviation applied."""
+    if mutation in F16_ARITH_OP_MUTATIONS:
+        old, new = F16_ARITH_OP_MUTATIONS[mutation]
+        lines = [line.replace(old, new) for line in program]
+        assert lines != program, mutation
+        return translate_f16(lines)
+    text = translate_f16(program)
+    if mutation == "src_high":
+        mutated = re.sub(r"uint (hf\d+_0) = \((.+)\) & 0xffffu;", r"uint \1 = ((\2) >> 16u) & 0xffffu;", text)
+        assert mutated != text
+        return mutated
+    if mutation == "zero_sum_sign":
+        mutated = re.sub(r"(precise float hs\d+ = )(widen16\(hf\d+_\d\) [+-] widen16\(hf\d+_\d\));", r"\1(\2) + 0.0f;", text)
+        assert mutated != text
+        return mutated
+    for old, new in F16_ARITH_TEXT_EDITS[mutation]:
+        assert text.count(old) == 1, (mutation, old)
+        text = text.replace(old, new)
+    return text
+
+
+def f16_arith_detecting_program(mutation):
+    """The first program whose expected words the modelled mutation changes."""
+    for kind, index in F16_ARITH_PROGRAMS:
+        if f16_arith_expected(kind, index, mutation) != f16_arith_expected(kind, index):
+            return kind, index
+    raise AssertionError(f"No program separates {mutation}")
+
+
+def check_f16_arith_reference():
+    """The Python side of the draw: the reference against pinned rows, double rounding and the translator's own copy."""
+    assert F16_DENORM_MODE == pixel_aot.HALF_DENORM_PRESERVE
+    assert len(F16_ARITH_PAIRS) == 40 and len(set(F16_ARITH_PAIRS)) == 40
+    # Pinned rows, from the IEEE 754 round-to-nearest-even rules and worked by hand: (op, a, b, result).
+    for op, half_a, half_b, expected in (
+            ("add", 0x3c00, 0x1000, 0x3c00), ("add", 0x3c01, 0x1000, 0x3c02),                 # tie to even, down and up
+            ("add", 0x6800, 0x3c01, 0x6801), ("add", 0x7bff, 0x0001, 0x7bff),
+            ("add", 0x03ff, 0x0001, 0x0400), ("add", 0x8001, 0x8001, 0x8002),                 # carry into the normals
+            ("add", 0x8000, 0x8000, 0x8000), ("add", 0x0000, 0x8000, 0x0000), ("sub", 0x3c00, 0x3c00, 0x0000),
+            ("sub", 0x0401, 0x0400, 0x0001), ("subrev", 0x3c00, 0x4000, 0x3c00), ("subrev", 0x0001, 0x0003, 0x0002),
+            ("sub", 0x8000, 0x0000, 0x8000), ("subrev", 0x0000, 0x8000, 0x8000),
+            ("mul", 0x0001, 0x3800, 0x0000), ("mul", 0x8001, 0x3800, 0x8000), ("mul", 0x0003, 0x3800, 0x0002),
+            ("mul", 0x0005, 0x3800, 0x0002), ("mul", 0x0001, 0xbc00, 0x8001), ("mul", 0x3c01, 0x3c01, 0x3c02),
+            ("mul", 0x03ff, 0x4000, 0x07fe), ("mul", 0x8001, 0x0001, 0x8000), ("mul", 0xbc00, 0x8000, 0x0000)):
+        assert f16_arith_reference(op, half_a, half_b) == expected, (op, hex(half_a), hex(half_b))
+    # Overflow is refused, not computed: 65504 + 16 is the halfway case that rounds to infinity.
+    assert f16_arith_reference("add", 0x7bff, 0x4c00) is None and f16_arith_reference("add", 0x7bff, 0x4bff) == 0x7bff
+    assert f16_arith_reference("mul", 0x7bff, 0x4000) is None and f16_arith_reference("add", 0x7c00, 0x3c00) is None
+    for pair, (half_a, half_b) in enumerate(F16_ARITH_PAIRS):
+        words = f16_arith_pair_words(pair)
+        for op in F16_ARITH_OPS:
+            result = f16_arith_reference(op, *words)
+            assert result is not None and result & 0x7c00 != 0x7c00, (op, hex(half_a), hex(half_b))
+            assert result == pixel_aot.f16_vop2_result(op, half_a, half_b), (op, hex(half_a), hex(half_b))
+            assert result == f16_arith_reference(op, *words, double=True), (op, hex(half_a), hex(half_b))
+    # One binary32 operation followed by one binary16 rounding equals the single rounding: the claim of the lowering.
+    # Every 97th finite value (plus the edges of each binade) against 48 boundary values, all four ops.
+    finite = [h for h in range(0x10000) if (h >> 10) & 31 != 31]
+    edges = [e << 10 | m for e in range(31) for m in (0, 1, 0x3ff)]
+    boundary = sorted({h | s for h in (0x0000, 0x0001, 0x0002, 0x0003, 0x03ff, 0x0400, 0x0401, 0x0800, 0x1000, 0x3bff,
+                                       0x3c00, 0x3c01, 0x4000, 0x6800, 0x7bff, 0x77ff, 0x0200, 0x0100, 0x2400, 0x5800,
+                                       0x1400, 0x0555, 0x0001 << 3, 0x01ff) for s in (0, 0x8000)})
+    for half_a in sorted({*finite[::97], *edges, *(e | 0x8000 for e in edges)}):
+        if (half_a >> 10) & 31 == 31:
+            continue
+        for half_b in boundary:
+            for op in F16_ARITH_OPS:
+                single = f16_arith_reference(op, half_a, half_b)
+                assert single == f16_arith_reference(op, half_a, half_b, double=True), (op, hex(half_a), hex(half_b))
+                assert single == pixel_aot.f16_vop2_result(op, half_a, half_b), (op, hex(half_a), hex(half_b))
+    assert [f16_widen_word(h) for h in (0x3c00, 0x0001, 0x8000, 0xbc00, 0x7bff)] == [
+        0x3f800000, 0x33800000, 0x80000000, 0xbf800000, 0x477fe000]
+
+
+def check_f16_arith_mutation_coverage():
+    """Every deviation changes at least one expected word of some program, so the draw can detect it, and the
+    programs expect finite values only."""
+    for kind, index in F16_ARITH_PROGRAMS:
+        words = f16_arith_expected(kind, index)
+        assert len(words) == 4 and all(word is not None for word in words), (kind, index)
+    assert set(F16_ARITH_MUTATIONS) == {*F16_ARITH_TEXT_EDITS, *F16_ARITH_OP_MUTATIONS, "src_high", "zero_sum_sign"}
+    for mutation in F16_ARITH_MUTATIONS:
+        f16_arith_detecting_program(mutation)
+    # Each deviation moves a specific class of row: the rows named here are the ones the model must separate.
+    def differs(mutation, op, half_a, half_b):
+        words = (0xa5c30000 | half_a, 0x3555_0000 | half_b)
+        return f16_arith_reference(op, *words, mutation=mutation) != f16_arith_reference(op, *words)
+
+    assert differs("truncate", "add", 0x3c01, 0x1000) and differs("ties_away", "add", 0x3c00, 0x1000)
+    assert differs("flush_out", "sub", 0x0401, 0x0400) and differs("flush_in", "add", 0x0001, 0x0001)
+    assert differs("neg_subnormal_in", "add", 0x8001, 0x8001) and differs("zero_sign_out", "add", 0x8000, 0x8000)
+    assert differs("zero_sign_out", "mul", 0x8001, 0x0001) and differs("zero_sum_sign", "add", 0x8000, 0x8000)
+    assert differs("subrev_as_sub", "subrev", 0x3c00, 0x4000) and differs("sub_as_add", "sub", 0x3c00, 0x3c00)
+    assert differs("mul_as_add", "mul", 0x3c01, 0x3c01) and differs("src_high", "add", 0x3c00, 0x1000)
+    # A mutation must not move rows it should leave alone (a negative control for the model itself).
+    assert not differs("truncate", "add", 0x3c00, 0x3c00) and not differs("zero_sum_sign", "mul", 0x8000, 0x3c00)
+    assert not differs("flush_in", "add", 0x3c00, 0x3c00) and not differs("ties_away", "add", 0x3c00, 0x3c00)
+
+
+def check_f16_arith_controls():
+    """Lowering, spelling, input proof, overflow, mode and reader refusals of the plain binary16 VOP2 forms."""
+    check_f16_arith_reference()
+    check_f16_arith_mutation_coverage()
+    prefix = ["v_mov_b32_e32 v18, 0x35553c00", "v_mov_b32_e32 v19, 0xd1a74000", "s_mov_b32 s60, 0x3555c000"]
+
+    def program(*lines):
+        return uncompressed_export([*prefix, *lines])
+
+    def refuse(line, message, translator=translate_f16):
+        expect_value_error(translator, program(line), message)
+
+    # Lowering and spelling: the bare, _e32 and _e64 spellings are one lowering (names carry the instruction index).
+    for op in F16_ARITH_OPS:
+        spelled = [translate_f16(program(f"v_{op}_f16{suffix} v24, v18, v19")) for suffix in ("", "_e32", "_e64")]
+        assert spelled[0] == spelled[1] == spelled[2], op
+        body = spelled[0].split("uint4 main", 1)[1]
+        assert "widen16(" in body and "narrow16(" in body and "precise float hs" in body, op
+        for forbidden in ("f32tof16", "f16tof32", "float16_t", "half ", "0xffff0000u"):
+            assert forbidden not in body, (op, forbidden)
+    body = translate_f16(program("v_sub_f16 v24, v18, v19")).split("uint4 main", 1)[1]
+    assert re.search(r"hs\d+ = widen16\(hf\d+_0\) - widen16\(hf\d+_1\);", body), body
+    body = translate_f16(program("v_subrev_f16 v24, v18, v19")).split("uint4 main", 1)[1]
+    assert re.search(r"hs\d+ = widen16\(hf\d+_1\) - widen16\(hf\d+_0\);", body), body
+    assert re.search(r"hs\d+ = widen16\(hf\d+_0\) \* widen16\(hf\d+_1\);",
+                     translate_f16(program("v_mul_f16 v24, v18, v19"))), "mul"
+    assert re.search(r"hs\d+ = widen16\(hf\d+_0\) \+ widen16\(hf\d+_1\);",
+                     translate_f16(program("v_add_f16 v24, v18, v19"))), "add"
+    # Operand kinds: VGPR, SGPR, every inline constant (the emitted word is the table value), 0, 16-bit literals.
+    for token, bits in (*pixel_aot.INLINE_F16.items(), ("0", 0), ("0x3555", 0x3555), ("0x8000", 0x8000), ("0x7bff", 0x7bff)):
+        text = translate_f16(program(f"v_add_f16_e64 v24, {token}, v19"))
+        assert f"uint hf" in text and f"_0 = ({bits}u) & 0xffffu;" in text, token
+        assert f"_1 = (asuint(alu" in text.split("uint4 main", 1)[1]
+        assert f"_1 = ({bits}u) & 0xffffu;" in translate_f16(program(f"v_mul_f16_e64 v24, v18, {token}")), token
+    assert f"_0 = ({0x3555c000}u) & 0xffffu;" in translate_f16(program("v_add_f16_e64 v24, s60, s60")), "SGPR word"
+    translate_f16(program("v_add_f16_e64 v24, s60, v19"))
+    translate_f16(program("v_add_f16_e64 v24, 0x3555, 0x3555"))
+    # A VGPR copy of a proven constant keeps the proof; a result keeps it too and chains through the readers.
+    translate_f16(program("v_mov_b32_e32 v20, v18", "v_sub_f16 v24, v20, v19"))
+    translate_f16(program("s_mov_b32 s61, s60", "v_add_f16_e64 v24, s61, v19"))
+    chained = translate_f16(program("v_add_f16 v24, v18, v19", "v_mul_f16 v25, v24, v24", "v_cvt_f32_f16 v12, v25"))
+    assert "asuint(alu" in chained.split("uint4 main", 1)[1]
+    # Entry profile: unknown or an unsupported declaration refuses every spelling; the other forms are unaffected.
+    for op in F16_ARITH_OPS:
+        for suffix in ("", "_e32", "_e64"):
+            expect_value_error(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True),
+                               program(f"v_{op}_f16{suffix} v24, v18, v19"), "binary16 denormal mode unknown at entry")
+    for state in ("flush", "ftz", "", False):
+        expect_value_error(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                                           half_denorm=state), program("v_add_f16 v24, v18, v19"),
+                           "Invalid binary16 denormal entry state")
+    lower(program("v_add_nc_u16 v24, v18, v19"), 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True)
+    # No finite proof: a constant-buffer word, an uninitialized register, a sample, a copy without provenance.
+    for line, token in (("v_add_f16_e64 v24, s44, v19", "s44"), ("v_add_f16_e64 v24, v18, s45", "s45"),
+                        ("v_add_f16 v24, v30, v19", "v30"), ("v_add_f16 v24, v18, v30", "v30"),
+                        ("v_add_f16_e64 v24, s70, v19", "s70"), ("v_add_f16 v24, v12, v19", "v12")):
+        refuse(line, f"binary16 operand lacks a finite proof: {token}")
+    expect_value_error(translate_f16, program("v_mov_b32_e32 v20, s44", "v_add_f16 v24, v20, v19"),
+                       "binary16 operand lacks a finite proof: v20")
+    expect_value_error(translate_f16, program("v_add_nc_u16 v25, v18, v19", "v_add_f16 v24, v25, v19"),
+                       "binary16 operand lacks a finite proof: v25")
+    # NaN and infinity are refused wherever the proof finds them, in either source and through every provenance.
+    for token in ("0x7c00", "0xfc00", "0x7e00", "0x7c01", "0xffff"):
+        refuse(f"v_add_f16_e64 v24, {token}, v19", f"binary16 operand is not finite: {token}")
+        refuse(f"v_mul_f16_e64 v24, v18, {token}", f"binary16 operand is not finite: {token}")
+    expect_value_error(translate_f16, program("v_mov_b32_e32 v20, 0x7e00", "v_sub_f16 v24, v20, v19"),
+                       "binary16 operand is not finite: v20")
+    expect_value_error(translate_f16, program("s_mov_b32 s61, 0xdead7c00", "v_add_f16_e64 v24, s61, v19"),
+                       "binary16 operand is not finite: s61")
+    expect_value_error(translate_f16, program("v_mov_b32_e32 v20, 0x7e00", "v_mov_b32_e32 v21, v20", "v_sub_f16 v24, v21, v19"),
+                       "binary16 operand is not finite: v21")
+    # Negative controls for the finite proof: the largest finite values, a subnormal literal and a high half that is
+    # an infinity (only the low half is a source) are accepted.
+    for token in ("0x7bff", "0xfbff", "0x0001", "0x8001", "0x0400", "-2.0", "-0.5", "0"):
+        translate_f16(program(f"v_add_f16_e64 v24, {token}, v19"))
+    translate_f16(program("v_mov_b32_e32 v20, 0x7c003c00", "v_add_f16 v24, v20, v19"))
+    translate_f16(program("s_mov_b32 s61, 0x7e003c00", "v_add_f16_e64 v24, s61, v19"))
+    # Finite operands whose result overflows are refused, with both signs and at the rounding boundary.
+    for line, name in (("v_add_f16_e64 v24, 0x7bff, 0x4c00", "add"), ("v_add_f16_e64 v24, 0xfbff, 0xcc00", "add"),
+                       ("v_sub_f16_e64 v24, 0x7bff, 0xcc00", "sub"), ("v_sub_f16_e64 v24, 0xfbff, 0x4c00", "sub"),
+                       ("v_subrev_f16_e64 v24, 0xcc00, 0x7bff", "subrev"), ("v_subrev_f16_e64 v24, 0x4c00, 0xfbff", "subrev"),
+                       ("v_mul_f16_e64 v24, 0x7bff, 0x4000", "mul"), ("v_mul_f16_e64 v24, 0xfbff, 0x4000", "mul"),
+                       ("v_mul_f16_e64 v24, 0x7bff, 0xc000", "mul")):
+        refuse(line, f"binary16 result overflows: v_{name}_f16")
+    for line in ("v_add_f16_e64 v24, 0x7bff, 0x4bff", "v_add_f16_e64 v24, 0xfbff, 0xcbff", "v_sub_f16_e64 v24, 0x7bff, 0xcbff",
+                 "v_subrev_f16_e64 v24, 0xcbff, 0x7bff", "v_mul_f16_e64 v24, 0x7bff, 0x3c00", "v_mul_f16_e64 v24, 0xfbff, 0x3c00"):
+        translate_f16(program(line))
+    expect_value_error(translate_f16, program("v_mov_b32_e32 v20, 0x7bff", "v_mov_b32_e32 v21, 0x3c00",
+                                              "v_mul_f16 v25, v20, v21", "v_add_f16 v26, v25, v25"),
+                       "binary16 result overflows: v_add_f16")
+    # Operand grammar. A leading minus is a negative inline constant first and a refused modifier otherwise.
+    for token in ("-v18", "|v18|", "abs(v18)", "neg(v18)", "-|v18|", "-s60", "-3.0"):
+        refuse(f"v_add_f16_e64 v24, {token}, v19", f"Unsupported binary16 source modifier {token}")
+    for token in ("1", "64", "-1", "-16", "5", "-0"):
+        refuse(f"v_add_f16_e64 v24, {token}, v19", f"Unsupported binary16 integer inline constant {token}")
+    for token in ("3.0", "0.25", "vcc_lo", "m0", "exec_lo", "null", "v[18:19]"):
+        refuse(f"v_add_f16_e64 v24, {token}, v19", f"Unsupported binary16 operand {token}")
+    refuse("v_add_f16_e64 v24, 0x10000, v19", "16-bit literal out of range: 0x10000")
+    refuse("v_add_f16_e64 v256, 1.0, 1.0", "Register out of range: v256")
+    refuse("v_add_f16_e64 v24, v256, 1.0", "Register out of range: v256")
+    refuse("v_add_f16_e64 v24, s106, 1.0", "Register out of range: s106")
+    for line in ("v_add_f16_e32 v24, v18, s60", "v_add_f16 v24, v18, s60", "v_mul_f16 v24, v18, 1.0", "v_sub_f16_e32 v24, v18, 0x3555"):
+        refuse(line, "Binary16 e32 src1 must be a VGPR")
+    # Forms the lowering does not accept fall through to the generic refusal, and so do the neighbouring binary16 ops.
+    for line in ("v_add_f16_e64 v24, v18, v19 clamp", "v_mul_f16_e64 v24, v18, v19 mul:2", "v_mul_f16_e64 v24, v18, v19 div:2",
+                 "v_add_f16_e64 v24, v18, v19 op_sel:[0,1]", "v_add_f16_dpp v24, v18, v19 quad_perm:[0,1,2,3]",
+                 "v_add_f16_sdwa v24, v18, v19 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0",
+                 "v_add_f16 v24, v18, v19, v19", "v_add_f16 v24, v18", "v_min_f16_e64 v24, v18, v19",
+                 "v_max_f16_e32 v24, v18, v19", "v_fmac_f16_e32 v24, v18, v19", "v_ldexp_f16_e32 v24, v18, v19"):
+        refuse(line, "Unsupported instruction")
+
+    # Scheduling around the load and the samples: a pending SGPR, an outstanding sample, a non-entry mask.
+    def float_f16(instructions):
+        return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, half_denorm=pixel_aot.HALF_DENORM_PRESERVE)
+
+    base = with_constants([])
+    load = next(i for i, line in enumerate(base) if line.startswith("s_buffer_load_dwordx4"))
+    expect_value_error(float_f16, base[:load + 1] + ["v_add_f16_e64 v24, s44, 1.0"] + base[load + 1:],
+                       "Constant read before load completion")
+    sample = next(i for i, line in enumerate(base) if line.startswith("image_sample"))
+    expect_value_error(float_f16, base[:sample + 1] + ["v_add_f16_e64 v12, 1.0, 1.0"] + base[sample + 1:],
+                       "Write overlaps an outstanding sample")
+    expect_value_error(float_f16, base[:sample + 1] + ["v_add_f16_e64 v24, v12, 1.0"] + base[sample + 1:],
+                       "Sample used before vmcnt wait")
+    float_f16(base[:sample + 1] + ["v_add_f16_e64 v20, 1.0, 1.0"] + base[sample + 1:])
+    masked = base.index("s_wqm_b64 exec, exec") + 1
+    expect_value_error(float_f16, base[:masked] + ["v_add_f16_e64 v24, 1.0, 1.0"] + base[masked:],
+                       "Invalid binary16 arithmetic operation")
+    # Mode: every spelling is refused under round toward zero, a restored mode lowers like no write at all, and every
+    # instruction that could change the denormal state stays refused before and after the op.
+    for spelling in (f"v_{op}_f16{suffix}" for op in F16_ARITH_OPS for suffix in ("_e32", "_e64")):
+        line = f"{spelling} v24, v18, v19"
+        expect_value_error(translate_f16, uncompressed_export([HALF_RTZ, *prefix, line]),
+                           f"under round toward zero: {spelling}")
+        assert translate_f16(uncompressed_export([HALF_RTZ, HALF_RNE, *prefix, line])) == translate_f16(
+            uncompressed_export(["s_nop 0", "s_nop 0", *prefix, line]))
+    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
+                           ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write"),
+                           ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 4), 15", "Unsupported hardware register write"),
+                           ("s_setreg_b32 hwreg(HW_REG_MODE, 6, 2), s48", "Unsupported instruction")):
+        for lines in ([write, *prefix, "v_add_f16 v24, v18, v19"], [*prefix, "v_add_f16 v24, v18, v19", write]):
+            expect_value_error(translate_f16, uncompressed_export(lines), message)
+    # Readers. The audited ones read a binary16 result; every other reader of the tag refuses it.
+    produced = [*prefix, "v_add_f16_e32 v24, v18, v19", "v_add_nc_u16 v25, v18, v19"]
+
+    def reader(line):
+        return uncompressed_export([*produced, line])
+
+    for line in ("v_cvt_f32_f16_e32 v12, v24", "v_cvt_f32_f16_e64 v12, v24",
+                 "v_cvt_f32_f16_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_cvt_f32_f16_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+                 "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_mov_b32_sdwa v12, v24 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_add_f16_e32 v13, v24, v18"):
+        if line.startswith("v_add_f16"):
+            expect_value_error(translate_f16, reader(line), "Unsupported export")  # a chained op writes v13: not exportable
+        else:
+            translate_f16(reader(line))
+    numeric = "Expected a numeric register"
+    undefined = "Reads the undefined high half of a 16-bit result"
+    modifiers = "Modifiers on a binary16 arithmetic result are not lowered"
+    sdwa = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:"
+    for line, message in (
+            ("v_mov_b32_e32 v12, v24", numeric), ("v_add_f32_e32 v12, v24, v18", numeric),
+            ("v_swap_b32 v24, v18", numeric), ("v_add_nc_u32_e32 v12, v24, v18", numeric),
+            ("v_add_nc_u16 v12, v24, v18", numeric), ("v_cmp_lt_f16_e32 vcc_lo, v24, v18", numeric),
+            ("v_cmp_lt_f16_e64 s52, v24, v18", numeric), ("v_cmp_class_f16_e32 vcc_lo, v24, v18", numeric),
+            ("v_cmp_lt_u16_e32 vcc_lo, v24, v18", numeric), ("v_pk_add_f16 v12, v24, v18", numeric),
+            ("v_fma_mixlo_f16 v12, v24, v18, v18", numeric), ("v_dot2_f32_f16 v12, v24, v18, v18", numeric),
+            ("v_cvt_f16_f32_e32 v24, v18", "Unsupported conversion destination"),
+            ("v_cvt_pkrtz_f16_f32_e32 v12, v24, v18", "Unsupported pack operand"),
+            ("v_mov_b32_dpp v12, v24 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf", "Expected a numeric VGPR in DPP"),
+            ("v_cvt_f32_f16_dpp v12, v24 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf", "Expected a numeric VGPR in DPP"),
+            (f"v_cvt_f32_f16_sdwa v12, v24 {sdwa}WORD_1", undefined),
+            *((f"v_mov_b32_sdwa v12, v24 {sdwa}{select}", undefined)
+              for select in ("WORD_1", "BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "DWORD")),
+            (f"v_mov_b32_sdwa v12, sext(v24) {sdwa}WORD_0", undefined),
+            ("v_mov_b32_sdwa v24, v18 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0", undefined),
+            ("v_cvt_f32_f16_e32 v12, -v24", modifiers), ("v_cvt_f32_f16_e64 v12, |v24|", modifiers),
+            ("v_cvt_f32_f16_e64 v12, -|v24|", modifiers), ("v_cvt_f32_f16_e64 v12, v24 clamp", modifiers),
+            (f"v_cvt_f32_f16_sdwa v12, -v24 {sdwa}WORD_0", modifiers),
+            (f"v_cvt_f32_f16_sdwa v12, v24 clamp {sdwa}WORD_0", modifiers),
+            ("v_cvt_f32_f16_e32 v12, v25", numeric)):
+        expect_value_error(translate_f16, reader(line), message)
+    # Exports: an uncompressed export of a binary16 result, and the compressed form, whose string-pair check would
+    # accept a tag starting with "sample" or "alu".
+    for registers in ("v24, v13, v14, v15", "v12, v24, v14, v15", "v12, v13, v14, v24"):
+        export = uncompressed_export(produced)
+        export[next(i for i, line in enumerate(export) if line.startswith("exp ")):] = [
+            f"exp mrt0 {registers} done vm", "s_endpgm"]
+        expect_value_error(translate_f16, export, "Unsupported export")
+    export = uncompressed_export(produced)
+    export[next(i for i, line in enumerate(export) if line.startswith("exp ")):] = [
+        "exp mrt0 v24, v24, off, off done compr vm", "s_endpgm"]
+    expect_value_error(float_f16, export, "Unsupported export")
+
+
 def check_controls(directory):
     check_masked_controls()
     check_title_load_controls()
@@ -9460,6 +9992,7 @@ def check_controls(directory):
     must_reject(translate, base_m24[:wqm] + ["v_mul_hi_i32_i24_e64 v20, 1, 2"] + base_m24[wqm:])
     check_int16_vop3_controls()
     check_int16_ternary_controls()
+    check_f16_arith_controls()
 
 
 def check_program_extent(directory, library):
@@ -9496,8 +10029,22 @@ def check_program_extent(directory, library):
     must_reject(extract, branch + bytes.fromhex("ff0380be") + end + bytes.fromhex("000080bf") + end + padding)
 
 
+def check_f16_literal_fold(directory, assembler, objcopy, library):
+    """LLVM 15 prints a 16-bit literal that equals an integer inline constant as that integer, so 0xffff (a NaN) reads as
+    -1 and 0x0001 (a subnormal) as 1. The plain binary16 VOP2 lowering refuses every integer except 0 for this reason."""
+    source, obj, binary = directory / "fold.s", directory / "fold.o", directory / "fold.bin"
+    source.write_text(chr(10).join(("v_add_f16 v1, 0xffff, v3", "v_add_f16 v2, 0x0001, v3", "v_add_f16 v4, 0x0041, v3",
+                                 "v_add_f16 v5, 0x0000, v3", "v_add_f16 v6, 0x3c00, v3", "s_endpgm", "")), encoding="ascii")
+    subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", source, "-o", obj], check=True)
+    subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+    assert disassemble(binary.read_bytes(), library)[:5] == [
+        "v_add_f16_e32 v1, -1, v3", "v_add_f16_e32 v2, 1, v3", "v_add_f16_e32 v4, 0x41, v3",
+        "v_add_f16_e32 v5, 0, v3", "v_add_f16_e32 v6, 1.0, v3"]
+
+
 def check_binary(directory, assembler, objcopy, library):
     check_program_extent(directory, library)
+    check_f16_literal_fold(directory, assembler, objcopy, library)
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (with_three_constant_buffers(), translate_three_buffers),
@@ -9520,6 +10067,7 @@ def check_binary(directory, assembler, objcopy, library):
                     for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
     fixtures.extend((int16_vop3_ops(group), translate_int) for group in range(4))
     fixtures.extend((int16_ternary_ops(group), translate_int) for group in range(5))
+    fixtures.extend((f16_arith_program(*key), translate_f16) for key in F16_ARITH_PROGRAMS)
     fixtures.extend((scalar_bitset64(op, str(index)), translate_int)
                     for op in SCALAR_BITSET64_OPS for index in (0, 31, 32, 63, 64))
     fixtures.append((scalar_select64(), translate_int))
@@ -13087,6 +13635,53 @@ def check_int16_ternary_draw(directory, compiler, renderer, backend):
     expect_value_error(translate_int, refused, "Reads the undefined high half of a 16-bit result")
 
 
+def check_f16_arith_draw(directory, compiler, renderer, backend):
+    """The four plain binary16 VOP2 ops against the Python reference: 40 pairs of baked operands, every accepted
+    reader and two chains, all through the lossless R32G32B32A32_UINT readback. Then a binary32 -denorm ftz build of the
+    programs with subnormal operands or results, which must still pass, and 11 deviations of the lowering that must
+    each mismatch (one batch per mutation; the statuses are printed).
+
+    Only the zero-extended low half of each result is observed. Whether hardware keeps or zeroes the destination's
+    high half is not measured here; a source read from bits 31:16 is the high-half control.
+    """
+    check_f16_arith_mutation_coverage()
+    source = directory / "f16_arith.hlsl"
+    shader = directory / "f16_arith.cso"
+    constants = bytes(256)
+
+    def build(text, mode=F32_DENORM_MODE):
+        source.write_text(text, encoding="ascii")
+        compile_shader(compiler, source, shader, mode=mode)
+
+    def case(kind, index, tag):
+        path = directory / f"f16_arith-{tag}-{kind}-{index}.case"
+        write_case(path, constants, tuple(as_float(word) for word in f16_arith_expected(kind, index)), integer_rt=True)
+        return path
+
+    programs = {key: f16_arith_program(*key) for key in F16_ARITH_PROGRAMS}
+    for key in F16_ARITH_PROGRAMS:
+        build(translate_f16(programs[key]))
+        run_pixel_batch(renderer, backend, shader, [(case(*key, "ref"), "pass")])
+    # Binary32 flushing cannot reach binary16 values: every operand, product and sum is a binary32 normal.
+    subnormal = [key for key in F16_ARITH_PROGRAMS if any(
+        half & 0x7c00 == 0 and half & 0x3ff for half in f16_arith_source_halves(*key))]
+    assert subnormal and len(subnormal) < len(F16_ARITH_PROGRAMS), subnormal
+    for key in subnormal:
+        build(translate_f16(programs[key]), mode="ftz")
+        run_pixel_batch(renderer, backend, shader, [(case(*key, "ftz"), "pass")])
+    for mutation in F16_ARITH_MUTATIONS:
+        key = f16_arith_detecting_program(mutation)
+        build(f16_arith_mutated(mutation, programs[key]))
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, [case(*key, "mut")])
+        print(f"f16_arith mutation {mutation}: program {key} statuses {statuses}")
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {mutation} escaped detection")
+    # A widening that selects WORD_1 reads the undefined high half and must be refused at lowering.
+    refused = [line.replace("src0_sel:WORD_0", "src0_sel:WORD_1") for line in programs["reader", 0]]
+    assert refused != programs["reader", 0]
+    expect_value_error(translate_f16, refused, "Reads the undefined high half of a 16-bit result")
+
+
 def check_e64_render(directory, compiler, renderer, backend):
     """The e64 draw cases on their own, so they run as a separate CTest entry per backend. A renderer that reports an
     unavailable adapter (exit 77) makes this a skip, as for the other pixel draws."""
@@ -13124,7 +13719,7 @@ def main():
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
                     "draw-mac-legacy", "draw-carry-out", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64"):
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64", "draw-f16-arith"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -13143,6 +13738,7 @@ def main():
                         "draw-sad": check_sad_draws,
                         "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-int16-ternary": check_int16_ternary_draw,
+                        "draw-f16-arith": check_f16_arith_draw,
                         "draw-compressed-export": check_compressed_export_draw,
                         "draw-uncompressed-export": check_uncompressed_export_draw,
                         "draw-title-loads": check_title_load_draws,

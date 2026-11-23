@@ -209,6 +209,14 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.h" COMM
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_alias_writes.hlsl" DEPENDS tests/gpu_alias_writes.hlsl src/title_va_lookup.hlsli
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.cso" VERBATIM)
 target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.h")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
+    -E ProbeArrayAtomicsWaterfall -Vn ProbeArrayAtomicsWaterfall
+    -Fh "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.h"
+    -Fo "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.cso"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_alias_atomic_waterfall.hlsl"
+    DEPENDS tests/gpu_alias_atomic_waterfall.hlsl
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.cso" VERBATIM)
+target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.h")
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
     -E AliasTransform -Vn AliasTransform -Fh "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h"
@@ -1665,6 +1673,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_fma_packed>" "$<TARGET_FILE:cpu_fma_packed_lifted>")
     set_tests_properties(cpu_aot_fma_packed PROPERTIES SKIP_RETURN_CODE 77)
     add_dependencies(cpu_fma3_leaf_original cpu_fma_packed_lifted)
+
+    cpu_asm_fixture(cpu_sse34_fp sse34_fp)
+    set(sse34_fp_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse34_fp_lifted.cpp")
+    add_custom_command(OUTPUT "${sse34_fp_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse34_fp.py"
+            emit "$<TARGET_FILE:cpu_sse34_fp>" "${sse34_fp_fixture}"
+        DEPENDS cpu_sse34_fp tests/cpu/sse34_fp.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_sse34_fp_lifted SHARED "${sse34_fp_fixture}")
+    add_test(NAME cpu_aot_sse34_fp COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse34_fp.py"
+        check "$<TARGET_FILE:cpu_sse34_fp>" "$<TARGET_FILE:cpu_sse34_fp_lifted>")
+    set_tests_properties(cpu_aot_sse34_fp PROPERTIES SKIP_RETURN_CODE 77)
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
@@ -2842,6 +2862,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-guard-read "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_guard_read_${adapter} PROPERTIES TIMEOUT 45)
+        add_test(NAME compute_store_aot_ds_route_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-ds-route "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_ds_route_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_ds_route_${adapter}.txt")
         add_test(NAME compute_to_pixel_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_to_pixel_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2954,6 +2979,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-int16-ternary "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_int16_ternary_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME pixel_aot_f16_arith_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-arith "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_f16_arith_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_swap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-swap "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3103,6 +3132,8 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_int16_vop3_${adapter}.txt")
         set_tests_properties(pixel_aot_int16_ternary_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_int16_ternary_${adapter}.txt")
+        set_tests_properties(pixel_aot_f16_arith_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_arith_${adapter}.txt")
         set_tests_properties(pixel_aot_vop3_ternary_int_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_vop3_ternary_int_${adapter}.txt")
     endforeach()
