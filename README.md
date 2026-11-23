@@ -32,6 +32,8 @@ Both Windows jobs on `main` must pass before CI publishes a new chart. The image
 
 ## Community and contributions
 
+Join [Xbox2Windows Dev on Discord](https://discord.gg/DMcmNtpd6R) for project questions, review coordination and independent test runs. Record task claims, reproduction evidence and decisions on the relevant GitHub issue or PR.
+
 - **Claim a task.** Search for the behavior or test name in [open issues](https://github.com/R0Y00/Xbox2Windows/issues) and [open PRs](https://github.com/R0Y00/Xbox2Windows/pulls). On the issue, say what you will test, on which platform, and which shared interface or other PR your work depends on. For a first patch, start with [good first issues](https://github.com/R0Y00/Xbox2Windows/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
 - **Submit a change.** Keep the PR focused on one behavior. Link the task it advances and any prerequisite PR. Include the exact command, expected and observed results, and a negative control for a new fixture. [Patch and evidence guide](CONTRIBUTING.md#submit-and-review-a-patch)
 - **Review a PR.** For CPU translation or PE loading, reproduce the comparison with the original fixture. For shaders or GPU compatibility, check the DXIL and relevant WARP or hardware results. Both reviewers cover shared CPU/GPU interfaces. Record your verdict and the commit you tested. The Maintainer merges after review threads are resolved and the required Windows check passes. [Review responsibilities](CONTRIBUTING.md#who-reviews-and-merges-a-pr)
@@ -72,6 +74,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 |---|---|
 | Native, mapped and recompiled archive reader | `ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V` |
 | [Publish RGBA8 textures from completed archive records](docs/experiments.md#publishing-a-texture-from-each-complete-archive-record) | `ctest --preset release --no-tests=error -R '^cpu_archive_texture_publication$' -V` |
+| [Draw each archive record through D3D12](docs/experiments.md#drawing-each-archive-record-through-d3d12) | `ctest --preset dev --no-tests=error -R '^cpu_archive_texture_gpu_warp$' -V` |
 | Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
 | Textured mesh fallback at Shader Model 6.0 | `ctest --preset dev --no-tests=error -R '^mesh_textured_fallback_' -V` |
 | GPU-produced texture through the SM 6.0 mesh fallback | `ctest --preset dev --no-tests=error -R '^compute_mesh_texture_fallback_' -V` |

@@ -47,11 +47,35 @@ ctest --preset dev --no-tests=error -R '^cpu_native_archive_reader$' -V
 
 The [texture reader](../tests/cpu/archive/texture_reader.zig) selects a different publisher in the same Zig record loop. Each successful decode supplies one tightly packed 4×4 RGBA8 image to [consume_archive_texture](../tests/cpu/archive/texture.hpp). At pixel `(x, y)` the red channel cycles through the decoded bytes in row-major order, green is `85*x`, blue is `85*y`, and alpha is 255. Rows occupy 16 bytes. The consumer can use or copy the pixels during the call and returns zero on success. The fixture consumer writes those bytes to stdout.
 
-The [comparison](../tests/cpu/archive_texture_check.py) checks native Windows, the mapped reader and decoder, and the AOT reader and decoder against the known red samples and coordinate ramps. Two valid records produce 128 bytes. Reusing the first texture for the second would change nine red samples. With the second input truncated, blast emits one tentative byte internally. Only the first 64-byte texture reaches the consumer, both records are freed, and all three processes exit 2. GPU upload and frame readback are the next step in [#830](https://github.com/R0Y00/Xbox2Windows/issues/830).
+The [comparison](../tests/cpu/archive_texture_check.py) checks native Windows, the mapped reader and decoder, and the AOT reader and decoder against the known red samples and coordinate ramps. Two valid records produce 128 bytes. Reusing the first texture for the second would change nine red samples. With the second input truncated, blast emits one tentative byte internally. Only the first 64-byte texture reaches the consumer, both records are freed, and all three processes exit 2. [Drawing each record through D3D12](#drawing-each-archive-record-through-d3d12) adds GPU upload and frame readback.
 
 ```powershell
 cmake --build --preset release --target archive_texture_lifted pe_map
 ctest --preset release --no-tests=error -R '^cpu_archive_texture_publication$' -V
+```
+
+### Drawing each archive record through D3D12
+
+The same reader image also runs against a [GPU consumer](../tests/cpu/archive/texture_gpu.cpp) built as `archive_codec.dll` in `archive_gpu/`, next to copies of the reader and the blast DLL. The AOT reader links a GPU build of the codec with the translated decoder. On the first record the consumer creates one device, queue and pipeline. For each completed record it uploads the 4×4 texture, draws a full-target quad with a point-clamp sampler onto a 16×16 RGBA8 target, signals the next fence value, waits and writes the readback to stdout. After the last record, `completed()` calls `finish_archive_textures()`, which releases every object and reports the device's remaining references. The stdout consumer's version is empty, so the publication output above is unchanged. [`QuadFrames`](../tests/cpu/archive/quad_frames.hpp) holds the reusable device, pipeline and frame state. It accepts any copyable texture size and format and checks the source size against the copy footprint.
+
+The [comparison](../tests/cpu/archive_texture_gpu_check.py) runs native Windows, `pe_map` and AOT on WARP and on a physical adapter. Each pixel `(x, y)` must equal texel `(x/4, y/4)` of the independent texture reference. The stderr trace must contain the adapter and driver, which every run must report identically, the FNV-1a 64 hash of each staged texture, the completed fence values, the device references left after release, and the exit status. The three `X2W_ARCHIVE_TEXTURE_CASE` controls change only the second record.
+
+| Case | Frames | Trace and exit |
+|---|---|---|
+| Two valid records | Both match their references | Uploads of both textures, fences 1 and 2, `gpu release 0`, exit 0 |
+| Second record truncated | Only the first frame | One upload and fence 1. Both records are freed, the device is released once and the process exits 2 |
+| First record truncated | None | No device is created and nothing is released. The process exits 2 |
+| `stale`: the second upload is skipped | The second frame repeats the first and differs from its reference in 144 bytes (9 texels × 16 pixels) | `upload skipped`, fence 2, `gpu release 0`, exit 0 |
+| `fail`: the second texture is one byte short | Only the first frame | The copy-footprint check refuses the upload before any GPU work. The device is still released with no references left, and the consumer status reaches the exit as 4 |
+| `leak`: one more device object is never released | Both match their references | `gpu release 1`, which shows that the release count detects a leaked device object |
+
+The consumer and `QuadFrames` return errors instead of throwing C++ exceptions. In the mapped run, the codec DLL is mapped by `pe_map`. There, a C++ exception thrown and caught inside that DLL escaped the `catch` as `0xE06D7363`, while the same DLL loaded by Windows caught it. Structured exceptions are dispatched through the mapped image, as `cpu_native_seh` shows.
+
+On Windows 10 Pro 22H2 (build 19045) with MSVC 19.52, all 18 runs passed on the in-box WARP (driver 10.0.19041.7811) and on an NVIDIA GeForce RTX 3080 Ti (driver 32.0.16.1047), in the `dev` and `release` builds. The hardware test exits 77 without a physical D3D12 adapter.
+
+```powershell
+cmake --build --preset dev --target archive_texture_gpu_lifted archive_gpu_reader pe_map
+ctest --preset dev --no-tests=error -R '^cpu_archive_texture_gpu_(warp|hardware)$' -V
 ```
 
 ### Recompiling the blast decoder
@@ -2233,6 +2257,12 @@ if (params[0].x > tid.x) {
 
 The Windows fixture uses the read harness and its three dispatches, with `cap = 0x45000000`, which clamps about half of the lanes. The expected words come from a CPU model of the source. On five groups with `n = 150`, each of these must fail: a reference with one word off by one bit, with `max` instead of `min`, a shift of 15, a 24-bit instead of a 16-bit mask, or lane 150 also writing. So must recompiled HLSL with `max` for `min`, a shift of 15, a 24-bit mask, the `+ gid` dropped, or the cap read from `params[0].z`. The operands of `v_mad_u32_u24` stay below 2^16 in this fixture, so the 24-bit masks are checked by the exact output and not on the GPU.
 
+The same check includes a separate MAD24 fixture that holds bit 24 in the
+first multiplicand and bit 25 in the second. It enables lane zero only and
+sets the cap to UINT_MAX. The full 320-word readback requires word 0 to be
+`0x0df050e1` with all other words unchanged. Removing source truncation
+individually yields `0xfef050e1` and `0xeff050e1`; each must fail at word 0.
+
 ### Two- and three-dimensional thread groups
 
 The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits
@@ -3111,7 +3141,7 @@ Packed binary16 `VOP3P` arithmetic (`v_pk_add_f16`, `v_pk_mul_f16`, `v_pk_min_f1
 
 Mixed-precision `VOP3P` FMA (`v_fma_mix_f32`, `v_fma_mixlo_f16` and `v_fma_mixhi_f16`) interprets each source as binary32 (`op_sel == 0`) or binary16 (`op_sel == 1`, low or high half via `op_sel_hi`, widened through `widen16`), applies `abs` and `neg` after widening, evaluates the multiply-add with optional `[0, 1]` clamp, and for `v_fma_mixlo_f16`/`v_fma_mixhi_f16` packs the destination half with `pack16_rne` while preserving the untouched 16 bits of `vdst` (rejecting an uninitialized destination). The `fma_mix` fixture draws three constant sets covering mixed f16/f32 inputs, `|.|`/`-`, `op_sel_hi`, preserved high/low destination halves, `[0, 1]` clamp, and binary16 halfway RNE ties, with five mutations (`abs`, `neg`, `op_sel_hi`, `mixhi` preservation and `clamp`) that must each report a mismatch. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
-`VOP3P` dot products (`v_dot2_f32_f16`, `v_dot2_i32_i16`, `v_dot2_u32_u16`, `v_dot4_i32_i8`, `v_dot4_u32_u8`, `v_dot8_i32_i4` and `v_dot8_u32_u4`) compute the packed lane products plus the 32-bit accumulator. `v_dot2_f32_f16` widens its `f16` halves through `widen16` with `op_sel`, `op_sel_hi`, `neg_lo`, `neg_hi` and optional `[0, 1]` `clamp`, while the six integer forms accumulate in emulated 64-bit unsigned pairs (`uint2`) so wrapping and saturating `clamp` (`INT32_MIN`/`INT32_MAX`/`UINT32_MAX`) stay exact on SM 6.0 without requiring 64-bit integer shader support. The `dot` fixture assembles on `gfx1030` (since LLVM's `gfx1013` subtarget omits dot-product instructions) and draws four constant sets covering mixed signs, `INT32_MAX`/`INT32_MIN`/`UINT32_MAX` saturation and wrapping, with five mutations (`neg_lo`, signed vs unsigned `dot2`/`dot8`, and signed/unsigned `clamp`) that must each report a mismatch. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+`VOP3P` dot products (`v_dot2_f32_f16`, `v_dot2_i32_i16`, `v_dot2_u32_u16`, `v_dot4_i32_i8`, `v_dot4_u32_u8`, `v_dot8_i32_i4` and `v_dot8_u32_u4`) compute the packed lane products plus the 32-bit accumulator. `v_dot2_f32_f16` widens its `f16` halves through `widen16` with `op_sel`, `op_sel_hi`, `neg_lo`, `neg_hi` and optional `[0, 1]` `clamp`, while `v_dot2_i32_i16` and the three unsigned integer forms accumulate in emulated 64-bit unsigned pairs (`uint2`) so wrapping and saturating `clamp` (`INT32_MIN`/`INT32_MAX`/`UINT32_MAX`) stay exact on SM 6.0 without requiring 64-bit integer shader support. `v_dot4_i32_i8` and `v_dot8_i32_i4` add their product sums, which lie in `[-65024, 65536]` and `[-448, 512]`, to the accumulator in 32 bits. A signed overflow is then only possible for an accumulator of at least `2^30` or below `-2^30`, where it flips the sign of the wrapped result, so saturating `clamp` is decided from the accumulator and that result. On an Intel UHD Graphics (drivers 32.0.101.7026 and 32.0.101.7092) the 64-bit pair form gave wrong `v_dot4_i32_i8` results inside the full `dot` program while isolated probes were exact; with the 32-bit form `pixel_aot_hardware` passes there, as on an NVIDIA GeForce RTX 3050 Laptop GPU and on WARP ([#736](https://github.com/R0Y00/Xbox2Windows/issues/736)). The `dot` fixture assembles on `gfx1030` (since LLVM's `gfx1013` subtarget omits dot-product instructions) and draws six constant sets covering mixed signs, `INT32_MAX`/`INT32_MIN`/`UINT32_MAX` saturation and wrapping, and signed results one step inside `INT32_MAX` and `INT32_MIN` without saturation, with five mutations (`neg_lo`, signed vs unsigned `dot2`/`dot8`, and signed/unsigned `clamp`) that must each report a mismatch. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 Packed 16-bit integer `VOP3P` arithmetic and shifts (`v_pk_add_i16`, `v_pk_add_u16`, `v_pk_sub_i16`, `v_pk_sub_u16`, `v_pk_min_i16`, `v_pk_min_u16`, `v_pk_max_i16`, `v_pk_max_u16`, `v_pk_mul_lo_u16`, `v_pk_mad_i16`, `v_pk_mad_u16`, `v_pk_lshlrev_b16`, `v_pk_lshrrev_b16` and `v_pk_ashrrev_i16`) select each half-word lane through `op_sel` and `op_sel_hi`, mask shift counts to 4 bits (`& 15`), and saturate `clamp` on the six clamping add/sub/mad forms to `[-32768, 32767]` or `[0, 65535]` (rejecting `clamp` on min/max/mul/shift and rejecting `neg_lo`/`neg_hi` or float inline constants). The `pk_int16` fixture draws three constant sets covering all 14 forms, shift counts `>= 16`, inline `-1`, signed/unsigned clamping boundaries and cross-lane swaps, exporting all four bytes of the packed accumulator as exact `[0, 255]` integers with five mutations (`ashrrev` sign fill, signed vs unsigned min, `sub_u16` clamp, `op_sel` swap and `mad_i16` clamp) that must each report a mismatch. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 

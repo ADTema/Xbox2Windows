@@ -149,6 +149,7 @@ SOP1_OPS = {
     0x0a: ("s_wqm_b64", "Scalar whole-quad-mode 64-bit"),
     0x20: ("s_setpc_b64", "Set program counter 64-bit"),
     0x21: ("s_swappc_b64", "Swap program counter 64-bit"),
+    0x3c: ("s_and_saveexec_b32", "Save execution mask and bitwise AND with scalar source"),
 }
 
 SOP2_OPS = {
@@ -293,6 +294,10 @@ VOP1_OPS = {
     0x0d: ("v_cvt_flr_i32_f32_e32", "Convert float32 to int32 (floor)"),
     0x0f: ("v_cvt_f32_f64_e32", "Convert float64 to float32"),
     0x10: ("v_cvt_f64_f32_e32", "Convert float32 to float64"),
+    0x11: ("v_cvt_f32_ubyte0_e32", "Convert unsigned byte 0 to float32"),
+    0x12: ("v_cvt_f32_ubyte1_e32", "Convert unsigned byte 1 to float32"),
+    0x13: ("v_cvt_f32_ubyte2_e32", "Convert unsigned byte 2 to float32"),
+    0x14: ("v_cvt_f32_ubyte3_e32", "Convert unsigned byte 3 to float32"),
     0x15: ("v_cvt_u32_f64_e32", "Convert float64 to uint32"),
     0x16: ("v_cvt_f64_u32_e32", "Convert uint32 to float64"),
     0x20: ("v_fract_f32_e32", "Fractional part float32"),
@@ -531,6 +536,7 @@ VOP2_OPS = {
     0x1b: ("v_and_b32_e32", "Vector bitwise AND"),
     0x1c: ("v_or_b32_e32", "Vector bitwise OR"),
     0x1d: ("v_xor_b32_e32", "Vector bitwise XOR"),
+    0x1f: ("v_mac_f32_e32", "Vector multiply-accumulate float32"),
     0x20: ("v_madmk_f32", "Vector multiply-add (non-fused) with literal multiplier"),
     0x21: ("v_madak_f32", "Vector multiply-add (non-fused) with literal addend"),
     0x25: ("v_add_nc_u32_e32", "Vector add uint32 without carry"),
@@ -549,6 +555,7 @@ VOP3_NATIVE_OPS = {
     0x129: ("v_sub_co_ci_u32_e64", "V_SUB_CO_CI_U32 (VOP3B)", 3, True, 1, (1, 1, 1)),
     0x12a: ("v_subrev_co_ci_u32_e64", "V_SUBREV_CO_CI_U32 (VOP3B)", 3, True, 1, (1, 1, 1)),
     0x140: ("v_mad_legacy_f32", "V_MAD_LEGACY_F32 (VOP3A)", 3, False, 1, (1, 1, 1)),
+    0x141: ("v_mad_f32", "V_MAD_F32 (VOP3A)", 3, False, 1, (1, 1, 1)),
     0x142: ("v_mad_i32_i24", "V_MAD_I32_I24 (VOP3A)", 3, False, 1, (1, 1, 1)),
     0x143: ("v_mad_u32_u24", "V_MAD_U32_U24 (VOP3A)", 3, False, 1, (1, 1, 1)),
     0x144: ("v_cubeid_f32", "V_CUBEID_F32 (VOP3A)", 3, False, 1, (1, 1, 1)),

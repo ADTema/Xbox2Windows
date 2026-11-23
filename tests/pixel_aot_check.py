@@ -7167,6 +7167,10 @@ DOT_SETS = (
     (pack_f16_pair(-2.0, 2.0), 0x8000ffff, 0x7fff7fff, 0x80000010),
     # Set 4: v_dot8_u32_u4 unsigned saturation (UINT32_MAX) vs unwrapped v_dot4_u32_u8 wraparound.
     (pack_f16_pair(0.5, -1.0), 0xffffffff, 0xffffffff, 0xfffffe00),
+    # Set 5: signed dots one below INT32_MAX (0x7ffffffe), no saturation.
+    (pack_f16_pair(-0.5, 1.0), 0x00070007, 0x0003ffff, 0x7ffffff0),
+    # Set 6: signed dots one above INT32_MIN (0x80000001), no saturation.
+    (pack_f16_pair(-0.5, 1.0), 0x00050005, 0xfffeffff, 0x80000010),
 )
 
 
