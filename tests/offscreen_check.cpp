@@ -895,9 +895,9 @@ constexpr CapabilityGate kGateSm66Ballot{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: ballot fixture requires SM 6.6",
     CapsDiagnostic::none};
-constexpr CapabilityGate kGateSm66Compaction{
-    D3D_SHADER_MODEL_6_6, false, false, 0,
-    "skip: subgroup compaction fixture requires SM 6.6",
+constexpr CapabilityGate kGateSm60Compaction{
+    D3D_SHADER_MODEL_6_0, false, true, 0,
+    "skip: subgroup compaction fixture requires SM 6.0 and WaveOps",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66MinLod{
     D3D_SHADER_MODEL_6_6, false, false, 0,
@@ -919,7 +919,7 @@ const OperationSpec kOperations[] = {
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm66CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
-    {"--spirv-compaction", 4, 4, nullptr, kGateSm66Compaction, run_spirv_compaction},
+    {"--spirv-compaction", 4, 4, nullptr, kGateSm60Compaction, run_spirv_compaction},
     {"--ffx-device-init", 3, 3, nullptr, kNoGate, run_ffx_device_init},
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
@@ -1265,6 +1265,21 @@ int run_self_test()
             return 1;
         if (!require(out.find("skip: ballot fixture requires SM 6.6") != std::string::npos,
                      "--spirv-ballot must print its skip reason")) return 1;
+
+        const OperationSpec* compaction = find_operation("--spirv-compaction");
+        if (!require(compaction != nullptr, "--spirv-compaction operation")) return 1;
+        const AdapterCaps sm60_waves{D3D_SHADER_MODEL_6_0, false, true, 4, 4};
+        const AdapterCaps sm60_no_waves{D3D_SHADER_MODEL_6_0, false, false, 0, 0};
+        const AdapterCaps sm51_waves{D3D_SHADER_MODEL_5_1, false, true, 32, 32};
+        if (!require(evaluate_gate(compaction->gate, sm60_waves), "compaction accepts SM 6.0 with WaveOps"))
+            return 1;
+        for (const AdapterCaps& unmet : {sm60_no_waves, sm51_waves}) {
+            out.clear();
+            if (!require(!evaluate_gate(compaction->gate, unmet, {&out, &err}) &&
+                         out.find("skip: subgroup compaction fixture requires SM 6.0 and WaveOps") != std::string::npos,
+                         "compaction requires both SM 6.0 and WaveOps"))
+                return 1;
+        }
 
         // The MinLod draws skip the same way instead of failing at ps_6_6 pipeline creation.
         char quad_op[] = "--spirv-minlod-quad-lod";
