@@ -30,6 +30,8 @@ Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepend
 
 [`pe_run_package.py`](../tools/pe_run_package.py) starts a source-built x64 EXE with acyclic bundled DLL dependencies. Pass the path to `pe_map.dll`, a package directory and an EXE path relative to that directory. Use `--system kernel32.dll` or `--shim DLL PATH` for explicit external providers. `--preflight-only` resolves those external exports without mapping any guest image. In execution mode the runner attaches DLLs in dependency order, starts the EXE, and releases the images in reverse. A returning fixture must join any workers before it returns. The runner rejects cycles, self imports and bundled ordinal exports. `cpu_native_startup` checks the same two-DLL fixture under this runner and the Windows loader.
 
+External providers with process-lifetime workers can use `--pin-shim DLL` alongside `--shim DLL PATH`. This pins the provider immediately before the first guest image loads, and only in execution mode. Run packages in a child process when using pinned providers. The guest must still join its own workers and quiesce any host calls into guest code before returning. `cpu_package_shim_lifetime` verifies that the selected provider remains loaded after the entry returns and the ordinary provider unloads.
+
 ## Two-record archive reader from standard startup
 
 The [archive reader](../tests/cpu/archive/reader.zig) uses Zig 0.13.0's standard single-threaded Windows console startup. From the linked entry the translator follows the call into the record loop and the final call to RtlExitUserProcess. It recognizes six-byte linker jump thunks for explicitly bound IAT slots, models termination without fallthrough and propagates a narrow return value through a wider register copy. A control changes the startup to consume EAX instead of AL and must fail translation.
@@ -1102,6 +1104,8 @@ VEX 128-bit and 256-bit AVX packed shifts, saturating packs, unpacks, shuffles, 
 
 VEX 128-bit and 256-bit AVX broadcast, lane extract/insert, permute, shuffle, unpack, blend, dot-product, round, and `vzeroall` forms (`vbroadcastss`/`sd`/`f128`, `vextractf128`, `vinsertf128`, `vperm2f128`, `vpermilps`/`pd`, `vshufps`/`pd`, `vunpcklps`/`hps`/`lpd`/`hpd`, `vmovddup`/`sldup`/`shdup`, `vblendps`/`pd`/`vps`/`vpd`, `vdpps`/`pd`, `vroundps`/`pd`, `vzeroall`) are also lowered for `EncodingKind.VEX` while rejecting MXCSR rounding mode (`imm8 & 4 != 0`). `cpu_aot_avx_shuffle_blend` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it builds all 27 exports from MASM source (`tests/cpu/avx_shuffle_blend.asm`), translates them, compares exact 32-byte outputs against the native DLL, and checks that MXCSR-mode `vroundps` is rejected. The XMM memory form of `vmovddup` is also run with exactly eight readable bytes before a guard page. The `vdpps` cancellation case checks pairwise rounding. For multiple NaN inputs the selected lanes must be NaN, while the other lanes are compared bit for bit. Run `cmake --build --preset dev --target cpu_avx_shuffle_blend_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_shuffle_blend$' -V`.
 
+VEX AVX scalar floating-point, half-register move, `vinsertps`/`vextractps`, and `vcomiss`/`vucomiss`/`vcomisd`/`vucomisd` forms (`vaddss`/`sd`, `vsubss`/`sd`, `vmulss`/`sd`, `vdivss`/`sd`, `vsqrtss`/`sd`, `vminss`/`sd`, `vmaxss`/`sd`, `vroundss`/`sd`, `vmovss`, `vmovhlps`/`lhps`/`lps`/`hps`/`lpd`, `vinsertps`, `vextractps`, `vcomiss`/`sd`, `vucomiss`/`sd`) are also lowered for `EncodingKind.VEX` while zeroing upper YMM bytes and rejecting EVEX encodings and MXCSR rounding mode. `cpu_aot_avx_scalar_fp` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it builds all 27 exports from MASM source (`tests/cpu/avx_scalar_fp.asm`), translates them, compares exact 32-byte/scalar outputs and all four ordering outcomes (`<`, `==`, `>`, unordered) against the native DLL, and checks that EVEX `vaddss` is rejected. Separate raw-bit checks cover quieting signaling NaNs for scalar round and the effect of DAZ on scalar min/max and round-down. In masked mode the COMI and UCOMI checks compare the MXCSR invalid flag for signaling and quiet NaNs. Run `cmake --build --preset dev --target cpu_avx_scalar_fp_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_scalar_fp$' -V`.
+
 ## Recompiling a direct x64 call
 
 The [caller and callee](../tests/cpu/direct.asm) each accept two unsigned 64-bit integers and an output pointer. The [translator](../tools/cpu_call_aot.py) starts at the caller export, follows the signed displacement in its E8 call and reads the target's runtime-function interval. It generates two C++ functions from the linked machine code. MSVC emits a separate x64 DLL with a non-inlined call. The Windows test checks the relative call against the two export addresses in both the input and output DLLs.
@@ -1806,7 +1810,7 @@ The same translator follows direct calls and tail jumps to other functions of th
 
 On a Release (`/O2`) build of this change with MSVC 19.50, every `.pdata` entry of the 96 readable non-generated images was translated with four arguments, each unique function body once. Of 2,343 unique functions, 78 translated with the frame translator before this change and 97 after it, and none was lost. Of the 19 new ones, 8 are in `calls.asm`, 2 in `call_entries.asm`, 8 are callers in the other MASM call fixtures and 1 is MSVC output, a tail jump in `cpu_life_a.dll`, which is translated but not run. The most common first refusals are now a call target with no unwind entry or export (806 functions), mostly MSVC leaves without `.pdata` and import thunks, and a refused callee (299). Among refused callees, the innermost reason is an indirect transfer (`unsupported control flow`) in 186 and again a target with no unwind entry in 102. A frame address passed to a callee is the first refusal of 32.
 
-The fixed-frame proof also accepts `MOV RBP, RSP` and `LEA RBP, [RSP+disp]` as frame anchors. Both stack bases address the same checked frame array. Incoming paths must agree on the anchor at each join. An anchored RBP is usable only for a bounded stack access or register restoration. An ordinary import can receive a pointer into the frame under the explicit output contract below. The `anchored_frame` export in `cpu_aot_stack_frames` compares both paths of a shared slot written through RBP and updated through RSP. Its controls change the anchor on one path, turn a load into a frame-address LEA, and read an unwritten slot.
+The fixed-frame proof also accepts `MOV RBP, RSP` and `LEA RBP, [RSP+disp]` as frame anchors. Both stack bases address the same checked frame array. Incoming paths must agree on the anchor at each join. An anchored RBP is usable only for a bounded stack access or register restoration. An ordinary import can receive a pointer into the frame under the explicit output contract below. The `anchored_frame` export in `cpu_aot_stack_frames` compares both paths of a shared slot written through RBP and updated through RSP. Its controls change the anchor on one path, turn a load into a frame-address LEA, and read an unwritten slot. `LEAVE` with the 64-bit operand size is accepted as the epilogue of such a frame: only where the anchor is proven on every path, not below RSP, and low enough that RSP stays at or below entry RSP, it sets RSP to the anchor and pops RBP from it, and the frame proof releases every byte from the old RSP through anchor + 8, the pop slot included. It writes no flags. The pop reuses the saved-register proof, so RBP counts as restored only when the slot still holds the saved RBP. `ENTER` and a separate `MOV RSP, RBP` stay rejected as dynamic frames. `cpu_aot_leave` ([source](../tests/cpu/leave.asm)) compares three anchored frames with native execution: `MOV RBP, RSP` with flags that cross `LEAVE`, `LEA RBP, [RSP+20h]`, and a join where both paths keep the anchor. It also checks that the translation reloads RBP from the slot `PUSH RBP` wrote. The register probe samples RBX and RSI, so the RBP restore is shown by that proof rather than by execution. Its controls remove the anchor, let the anchors differ at a join, leave the anchor slot unwritten, overwrite the saved RBP with ordinary data, read a local that `LEAVE` released, put the anchor below RSP, put it where RSP would rise above entry RSP, and use `MOV RSP, RBP`, `ENTER`, and 16-bit `LEAVE`.
 
 An ordinary import binding can use `--stack-output ARG WIDTH` for one synchronous output argument. `ARG` is its 1-based position. The provider must write exactly `WIDTH` bytes before returning and must neither read their initial contents nor retain their address. The translator proves that a single `LEA` from RSP or an anchored RBP supplies the argument in the same basic block. The slot must be naturally aligned, inside the verified frame, and outside the callee's home space. The call initializes only the declared bytes. Tail calls and other uses of frame pointers remain outside the profile. Import bindings accept zero through four register arguments and can declare zero, one, two, four or eight defined return bytes.
 
@@ -3153,7 +3157,7 @@ For normalized compressed whole-pair exports, the Python API can return `(source
 
 The LLVM 15 binary fixture for #361 changes only the four EN bits of an assembled gfx1013 export and checks all 16 raw values. Reassembling the printed text keeps a packed pair when its first printed operand is enabled: raw 0x2 and 0xA reassemble as 0x0, and 0x5 reassembles as 0xF. Fully disabled source fields reassemble as zero. The normal lowering accepts 0x3, 0xC and 0xF through its explicit RT0-mask API. Other masks are rejected. These checks characterize the encoding and LLVM 15 behavior; they establish no gfx1013 channel-write semantics for non-pair masks.
 
-The explicit RT0-mask API also accepts uncompressed binary32 exports with any nonzero per-channel mask. The caller applies the result to the floating-point target. Disabled channels keep the clear value, and enabled channels preserve binary32 data. Partial uncompressed exports require the opt-in and are refused for integer targets. The source-built round trip and `pixel_aot_uncompressed_export_*` draws cover individual and disjoint channel masks, wrong PSO masks and wrong enabled-channel reference values.
+The explicit RT0-mask API also accepts uncompressed binary32 and integer exports with any nonzero per-channel mask. The caller applies the result to the target. Disabled channels keep the clear value, and enabled channels preserve their binary32 or raw integer data. Partial uncompressed exports require the opt-in; the `pixel_aot.py` CLI accepts `--rt0-write-mask` and returns `rt0_write_mask` in its JSON summary for the caller to apply to the PSO. Partial uncompressed exports are refused without that flag. The source-built round trip and `pixel_aot_uncompressed_export_*` plus `pixel_aot_uncompressed_integer_export_*` draws cover individual and disjoint channel masks, wrong PSO masks and wrong enabled-channel reference values.
 
 The caller identifies the entry registers for the texture address and interpolation base, and supplies the four sampler descriptor words to match. The generated pixel shader uses `TEXCOORD0`, texture `t0` and sampler `s0`. The test binds a point-clamp sampler, one mip and a full-screen triangle. These bindings are an explicit specialization. The test measures finite UNORM inputs under full pixel coverage. Execution with a title's original pipeline state, helper-lane behavior at triangle edges and other texture formats require separate validation.
 
@@ -3988,6 +3992,8 @@ The desktop XMem shim can map live 64 KiB physical grants into caller-owned, 64 
 
 `xmem_shim_mapped_pages` checks the shared values at two addresses, scatter order, readback after remapping, refusal of release while mapped, and rollback if a later destination has no placeholder.
 
+The reserve-only desktop cases from [#888](https://github.com/R0Y00/Xbox2Windows/pull/888) use 16 or 24 GiB Windows placeholder ranges. The page mapper splits out a 64 KiB destination on demand and coalesces the reservation after its last view is unmapped. The same test writes and reads one interior page after remapping, releases the entire reservation and reserves the same range again. Other allocation modes remain outside this profile.
+
 ### Tools-memory availability fixture
 
 The source-built caller ([`tools_mem_caller.asm`](../tests/cpu/tools_mem_caller.asm)) imports `XMemIsToolsMemAvailable` by name. It queries twice and checks the recorded count before choosing a path. The controlled recording provider ([`tools_mem_provider.cpp`](../tests/cpu/tools_mem_provider.cpp)) returns FALSE for the fallback path (exit 42) or TRUE for the tools-memory path (exit 84). The same EXE exits with a live test worker under the Windows loader and returns its result to the host under `pe_map`. Withholding the query export stops mapping at import resolution before entry, with the trace provider still available.
@@ -4050,7 +4056,7 @@ ctest --preset release --no-tests=error -R '^cpu_native_transfer_mem$' -V
 
 This fixture exercises the sequence where a caller checks tools-memory availability, queries working-set statistics, evaluates available memory budget, and transfers memory under partition 1. The source-built caller ([`transfer_chain_caller.asm`](../tests/cpu/transfer_chain_caller.asm)) imports `XMemIsToolsMemAvailable`, `XMemGetWorkingSetStatistics`, and `XMemTransferMemory` by name from `xmem.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled test provider ([`transfer_chain_provider.cpp`](../tests/cpu/transfer_chain_provider.cpp)), it verifies the prerequisite and failure isolation paths:
 
-- **Case 1 (Success reaches transfer)**: Tools-memory query returns `TRUE`, `XMemGetWorkingSetStatistics` with selector `0x2000000A` reports total and used budget (32 MiB total, 16 MiB used; difference 16 MiB), and transfer memory transfers 16 MiB under test-provider policy partition 1. Returns milestone exit code `0x870`.
+- **Case 1 (Success reaches transfer)**: Tools-memory query returns `TRUE`, `XMemGetWorkingSetStatistics` with selector `0x2000000A` reports total and used budget (32 MiB total, 16 MiB used; difference 16 MiB), and the recorder accepts a 16 MiB request under test-provider policy partition 1. Returns milestone exit code `0x870`.
 - **Case 2 (Tools-memory unavailable)**: When tools-memory query returns `FALSE` (the no-tools desktop policy established in #896), the sequence is blocked immediately. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x101`.
 - **Case 3 (Working-set statistics failure)**: When `XMemGetWorkingSetStatistics` returns `FALSE` or fails, the sequence is aborted immediately. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x102`.
 - **Case 4 (Zero available budget)**: When working-set statistics reports zero available budget (`total <= used`), transfer is skipped. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x103`.
@@ -4065,6 +4071,66 @@ On success, the caller exits with `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a 
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_transfer_chain$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_transfer_chain$' -V
+```
+
+### Audio-side import inventory
+
+Binding probes on #870 leave 19 audio-side imports unresolved: 5 from `chad.dll`, 5 from `xapu.dll` and 9 from `acphal.dll`. None of these modules exists in System32. This inventory records the public evidence for each name. Microsoft's reference pages for these APIs sit behind the NDA developer program, so they give no public signature. Microsoft's MIT-licensed [GDK Learn index at `f8c3438`](https://github.com/microsoft/XBOX-GDK-dotnet/blob/f8c3438aa366fbbb662d8a5e724021a9d0b65f5d/eng/gdk-learn-index.json) confirms that the `XDsp*` and `XApu*` functions are documented APIs and gives each one a page path. It lists AcpHal and the Audio Processing Unit only as member pages. Public MIT call sites in [DirectXTK12 at `f3555e3`](https://github.com/microsoft/DirectXTK12/tree/f3555e3014a53c81a6202b786dc4d6509b95a936) cover `ApuAlloc` and `ApuFree`. Several unaffiliated reimplementations also export these names. Their declarations do not trace to a public Microsoft source, so this inventory does not use them.
+
+| Module | Import | Public evidence | Desktop replacement candidate | Status |
+|---|---|---|---|---|
+| `chad.dll` | `XDspActivate` | Learn index entry only | None known. XAudio2 and WASAPI mix and play audio but do not provide this stream queue. | needs evidence |
+| `chad.dll` | `XDspConnectWithMaximumStreamLimit` | Learn index entry only | None known | needs evidence |
+| `chad.dll` | `XDspDeactivate` | Learn index entry only | None known | needs evidence |
+| `chad.dll` | `XDspDisconnect` | Learn index entry only | None known | needs evidence |
+| `chad.dll` | `XDspSubmitCommand` | Learn index entry only | None known | needs evidence |
+| `xapu.dll` | `XApuConnect` | Learn index entry only, plus input and output parameter struct names | None known | needs evidence |
+| `xapu.dll` | `XApuDequeueResult` | Learn index entry only | None known | needs evidence |
+| `xapu.dll` | `XApuDisconnect` | Learn index entry only | None known | needs evidence |
+| `xapu.dll` | `XApuEnqueueCommand` | Learn index entry only | None known. Desktop XAudio2 has no XMA decoder. | needs evidence |
+| `xapu.dll` | `XApuGetResultCount` | Learn index entry only | None known | needs evidence |
+| `acphal.dll` | `AcpHalCreate` | None (index lists only the AcpHal member page) | None known | needs evidence |
+| `acphal.dll` | `AcpHalAllocateShapeContexts` | None | None known | needs evidence |
+| `acphal.dll` | `AcpHalReleaseShapeContexts` | None | None known | needs evidence |
+| `acphal.dll` | `ApuCreateHeap` | Named in a DirectXTK12 diagnostic as the heap that `ApuAlloc` draws from. No call site and no signature. | Process memory (proposed, untested) | needs evidence |
+| `acphal.dll` | `ApuAlloc` | Call sites at [SoundEffect.cpp L246](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L246), [WaveBankReader.cpp L799](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/WaveBankReader.cpp#L799) and [SoundStreamInstance.cpp L470](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundStreamInstance.cpp#L470) | Aligned process memory (proposed, fixture only) | partial call shape |
+| `acphal.dll` | `ApuFree` | Call sites at [SoundEffect.cpp L95](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L95) and [SoundStreamInstance.cpp L60](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundStreamInstance.cpp#L60) | Release of the block above (proposed, fixture only) | partial call shape |
+| `acphal.dll` | `ApuIsVirtualAddressValid` | None | None known | needs evidence |
+| `acphal.dll` | `ApuMapApuAddress` | None | None known | needs evidence |
+| `acphal.dll` | `ApuMapVirtualAddress` | None | None known | needs evidence |
+
+No import has both a public signature and a usable desktop replacement. The 17 imports marked "needs evidence" stay unresolved, and this change adds no binding for any of them. Those calls cover the stream, command-queue and SHAPE context interfaces, which are console audio hardware with no desktop counterpart known. They need a public declaration or a source-built observation before any caller.
+
+The DirectXTK12 call sites establish the following:
+
+- `ApuAlloc` returns an `HRESULT` that callers test with `FAILED`.
+- The first argument is the address of a `void*` that receives the block.
+- The second argument is pointer-sized, and every call site passes `nullptr`. Its type is not public.
+- The third argument is a byte count cast to `UINT32`.
+- The fourth is the alignment constant `SHAPE_XMA_INPUT_BUFFER_ALIGNMENT`. Its value and width are not public.
+- `ApuFree` takes the returned `void*`. Every call site discards its result, so the return type is not public.
+- When `ApuAlloc` fails, DirectXTK12 asks whether the heap from `ApuCreateHeap` was large enough. Running out of heap is therefore one failure mode. The exact error code is not public.
+
+### APU allocation caller and recorder
+
+A source-built caller ([`apu_alloc_caller.asm`](../tests/cpu/apu_alloc_caller.asm)) imports `ApuAlloc` and `ApuFree` from `acphal.dll` by name with the call shape above, plus `finish_exe` from `cpu_exe_io.dll`, and starts through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). A test-only recording provider ([`apu_alloc_provider.cpp`](../tests/cpu/apu_alloc_provider.cpp)) serves both names from a 64 KiB arena. The arena stands in for the heap `ApuCreateHeap` would create. That function's signature is not public, so neither the caller nor the provider uses it. This is not a production `acphal.dll`. The arena size, the refusal code and the untouched output on failure are proposed desktop policy for the fixture, not console evidence.
+
+1. **Observable result:** a 4 KiB request at 2 KiB alignment returns `S_OK` and a 2 KiB-aligned block, and the caller writes and reads back the block's last word.
+2. **Refusal:** a 128 KiB request returns `E_OUTOFMEMORY` (`0x8007000E`) and leaves the caller's sentinel output unchanged.
+3. A 64 KiB request is refused the same way while the first block is live.
+4. After `ApuFree` releases the first block, the same 64 KiB request succeeds, and the caller writes and reads back its last word before releasing it.
+5. The caller checks its own provider's counts: 4 allocations, 2 releases, no live blocks and no rejected releases. It then exits with `0x8A0`.
+
+The check runs the EXE under the Windows loader, with and without a live worker at exit, and under `pe_map`. Both loaders exit with `0x8A0`, and the mapped run's recorded sizes, alignments and results match the expected sequence (`S_OK`, `E_OUTOFMEMORY`, `E_OUTOFMEMORY`, `S_OK`). It also runs these controls:
+
+- A lenient provider build (`APU_TEST_LENIENT`) accepts every size. Under both loaders the caller stops at the refusal step with `0xF02`.
+- Withholding `ApuAlloc` or `ApuFree` stops `pe_map` at import resolution before entry (`unresolved import acphal.dll!ApuAlloc` or `!ApuFree`). The provider records no calls.
+
+The fixture shows that the caller's success path, refusal path and release accounting are distinguishable and identical under both loaders. It does not establish the console's error codes, the second argument's meaning, the alignment width, the heap size, or whether the startup path calls `ApuAlloc` before `ApuCreateHeap`.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
 ```
 
 ### Grouped allocation descriptor builders

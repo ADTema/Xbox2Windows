@@ -11,3 +11,4 @@ EXPORTS
     XMemIsToolsMemAvailable @9
     XMemMapPhysicalPages @10
     XMemMapPhysicalPagesScatter @11
+    XMemVirtualAlloc @12

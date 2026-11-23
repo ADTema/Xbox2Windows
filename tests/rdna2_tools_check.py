@@ -578,6 +578,48 @@ class TestRdna2Disasm(unittest.TestCase):
             ],
         )
 
+    def test_hwreg_operands_use_llvm_spelling(self):
+        """Issue #938: hwreg operands and s_setreg_imm32_b32 literals print as LLVM 15 prints them for gfx1013.
+
+        Each expected string is LLVM 15.0.7's disassembly (pixel_aot.disassemble, gfx1013) of the same bytes.
+        """
+        endpgm = bytes.fromhex("000081bf")
+        cases = (
+            ("810880ba03000000", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3"),
+            ("810880ba00000000", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0"),
+            ("14f880ba00000000", "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0"),
+            ("15f880ba00040000", "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400"),
+            ("011980baffffffff", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 4), -1"),
+            ("04f880ba41000000", "s_setreg_imm32_b32 hwreg(4), 0x41"),
+            ("810880baf0ffffff", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), -16"),
+            ("810880baefffffff", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0xffffffef"),
+            ("810880ba40000000", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 64"),
+            ("810880ba00000080", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0x80000000"),
+            ("810880ba0000803f", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1.0"),
+            ("810880ba83f9223e", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0.15915494"),
+            ("810880ba000080c0", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), -4.0"),
+            ("01f804b9", "s_getreg_b32 s4, hwreg(HW_REG_MODE)"),
+            ("171a05b9", "s_getreg_b32 s5, hwreg(HW_REG_HW_ID1, 8, 4)"),
+            ("810884b9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s4"),
+            ("ff07fcb9", "s_setreg_b32 hwreg(63, 31, 1), m0"),
+        )
+        for raw, assembly in cases:
+            with self.subTest(raw=raw):
+                insns = disasm_rdna2(bytes.fromhex(raw) + endpgm)
+                self.assertEqual([i["assembly"] for i in insns], [assembly, "s_endpgm"])
+
+        # The shader scan recognizes the MODE rounding and FLAT_SCRATCH writes only in LLVM's spelling, so the
+        # decoded forms must reach is_instruction_supported in that spelling.
+        for raw in ("810880ba03000000", "810880ba00000000", "14f880ba00000000", "15f880ba00040000"):
+            with self.subTest(supported=raw):
+                line = disasm_rdna2(bytes.fromhex(raw))[0]["assembly"]
+                self.assertTrue(is_instruction_supported(line), line)
+        # Controls: the previous raw spelling, and a directed rounding mode the translator refuses.
+        self.assertFalse(is_instruction_supported("s_setreg_imm32_b32 0x881, 0x3"))
+        directed = disasm_rdna2(bytes.fromhex("810880ba01000000"))[0]["assembly"]
+        self.assertEqual(directed, "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1")
+        self.assertFalse(is_instruction_supported(directed), directed)
+
     def test_second_dword_forms_keep_the_stream_aligned(self):
         # Independent GFX10 encodings from LLVM MC 15.0.7 test/MC/AMDGPU (gfx10_asm_vop1.s,
         # gfx10_asm_vop2.s, gfx10_asm_dpp8.s, gfx10_asm_sop.s). Each is one 8-byte instruction.
@@ -592,7 +634,8 @@ class TestRdna2Disasm(unittest.TestCase):
             ("e9040a060188c6fa", "vop2_dpp8", "v_add_f32_dpp <unsupported DPP8>"),
             ("01070a6e21110000", "v_fmamk_f16", "v_fmamk_f16 v5, v1, 0x1121, v3"),
             ("01050a7021110000", "v_fmaak_f16", "v_fmaak_f16 v5, v1, v2, 0x1121"),
-            ("341280ba41312111", "s_setreg_imm32_b32", "s_setreg_imm32_b32 0x1234, 0x11213141"),
+            # Issue #938: LLVM 15 prints SIMM16 0x1234 as hwreg(52, 8, 3).
+            ("341280ba41312111", "s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(52, 8, 3), 0x11213141"),
         )
         for raw, opcode, assembly in cases:
             with self.subTest(raw=raw):
@@ -1710,6 +1753,48 @@ class TestRdna2Disasm(unittest.TestCase):
                     f"Instruction {i}: disasm_rdna2 '{rdna2_rec['assembly']}' does not match LLVM '{llvm_line}'"
                 )
 
+    def test_hwreg_llvm_round_trip(self):
+        """Issue #938: hwreg operands round-trip through LLVM 15 with register, offset and width intact.
+
+        Each line is assembled by llvm-mc, decoded by disasm_rdna2, compared with LLVM's text, and the decoded
+        text is assembled again and must give the same bytes. Neighbouring lines differ in one field only (the
+        register, the offset or the width), and the offsets and widths are unequal where it matters, so a decoder
+        that swaps or drops a field produces different bytes.
+        """
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"hwreg round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+
+        source = [
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3",
+            "s_setreg_imm32_b32 hwreg(HW_REG_STATUS, 2, 2), 3",   # register only
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 3, 2), 3",     # offset only
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 3), 3",     # width only
+            "s_setreg_imm32_b32 hwreg(HW_REG_TRAPSTS, 1, 5), 0x41",
+            "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0",
+            "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 4), -1",
+            "s_setreg_imm32_b32 hwreg(4), 0x41",                  # numeric fallback, whole register
+            "s_getreg_b32 s4, hwreg(HW_REG_MODE)",
+            "s_getreg_b32 s5, hwreg(HW_REG_HW_ID1, 8, 4)",
+            "s_getreg_b32 s7, hwreg(HW_REG_GPR_ALLOC, 6, 9)",
+            "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s4",
+            "s_setreg_b32 hwreg(63, 31, 1), m0",                  # numeric fallback, partial field
+            "s_endpgm",
+        ]
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        llvm_lines = llvm_disassemble(emitted, resolved_lib)
+        decoded = [rec["assembly"] for rec in disasm_rdna2(emitted)]
+        self.assertEqual(llvm_lines, source)
+        self.assertEqual(decoded, llvm_lines)
+        self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
+        # The first four lines are 8 bytes each; the three one-field variants must encode differently.
+        self.assertEqual(len({emitted[i:i + 8] for i in range(0, 32, 8)}), 4)
+
 
 class TestRdna2Extractor(unittest.TestCase):
     """Test shader extraction from RPF archives against known source-owned fixtures."""
@@ -2647,6 +2732,37 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(detect_shader_stage("cs_dispatch.bin"), "compute")
         self.assertEqual(detect_shader_stage("shaders/vertex/vs_main.s"), "vertex")
         self.assertEqual(detect_shader_stage("unknown_kernel.bin"), "other")
+
+    def test_binary_scan_reports_decoded_hwreg_writes_as_supported(self):
+        """Issue #938: a scanned binary's MODE rounding and FLAT_SCRATCH writes reach the scanner in LLVM's spelling.
+
+        The bytes are llvm-mc 15.0.7 (gfx1013) output for the commented source lines. With the raw spelling
+        (`s_setreg_imm32_b32 0x881, 0x3`) the first program reported four unsupported instructions.
+        """
+        accepted = bytes.fromhex(
+            "810880ba03000000"  # s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3
+            "14f880ba00000000"  # s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0
+            "15f880ba00040000"  # s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400
+            "810880ba00000000"  # s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0
+            "000081bf"          # s_endpgm
+        )
+        # Control: round toward +infinity (1) is a directed mode the translator refuses.
+        directed = bytes.fromhex(
+            "810880ba01000000"  # s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1
+            "000081bf"          # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "ps_hwreg.bin").write_bytes(accepted)
+            (tmp_path / "ps_hwreg_directed.bin").write_bytes(directed)
+            results = {r["shader_name"]: r for r in scan_directory_or_files([tmp_path])}
+        res = results["ps_hwreg.bin"]
+        self.assertEqual((res["total_instructions"], res["supported_instructions"], res["unsupported_count"]),
+                         (5, 5, 0), res.get("unsupported_details"))
+        control = results["ps_hwreg_directed.bin"]
+        self.assertEqual(control["unsupported_count"], 1)
+        self.assertEqual([d["raw"] for d in control["unsupported_details"]],
+                         ["s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1"])
 
     def test_binary_shader_scanning(self):
         """Verify scanning raw .bin files directly with disasm_rdna2 without LLVM."""

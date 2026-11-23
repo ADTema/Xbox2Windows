@@ -293,7 +293,7 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
     the flags byte and stores 512 bytes after it: the 256-byte buffers bound to b1 and b2. It may be
     combined with integer_rt.
     Bit 2 carries the title ranges and aliased buffers before any extra constants.
-    The high nibble can hold an explicit RT0 mask for a floating-point case.
+    The high nibble can hold an explicit RT0 mask for either a floating-point or an integer target.
     """
     rows = [pixels] * 64 if len(pixels) == 4 and not isinstance(pixels[0], (list, tuple)) else list(pixels)
     if len(rows) != 64 or any(len(row) != 4 for row in rows):
@@ -302,10 +302,10 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
     for row in rows:
         data += struct.pack("<4f", *row)
     if write_mask is not None:
-        if (not 0 < write_mask <= 0xF or integer_rt or
+        if (not 0 < write_mask <= 0xF or
                 any(item is not None for item in (nan_mask, extra_constants, title_memory))):
-            raise ValueError("An explicit write mask requires a nonzero nibble and a plain floating-point render target")
-        data.append(write_mask << 4)
+            raise ValueError("An explicit write mask requires a nonzero nibble and no other trailer fields")
+        data.append((write_mask << 4) | int(integer_rt))
     else:
         if extra_constants is not None and (nan_mask is not None or title_memory is not None):
             raise ValueError("Extra constant buffers combine only with the integer render target flag")
@@ -395,6 +395,7 @@ def check_container_selector(directory: Path, code: bytes, library: str | None =
         summary = json.loads(result.stdout)
         assert summary["container_sha256"] == digest
         assert summary["native_sha256"] == hashlib.sha256(code).hexdigest()
+        assert "rt0_write_mask" not in summary
         assert output.read_text(encoding="utf-8") == lower(assembly(False), 20, 24, [1, 2, 3, 4])
     wrong = subprocess.run([*command, "--container-sha256", "0" * 64], capture_output=True, text=True)
     assert wrong.returncode == 1 and "No record matches the name and container SHA-256" in wrong.stderr
@@ -411,6 +412,11 @@ def translate_masked(instructions):
 def translate_int(instructions):
     """translate() for a program that exports through the bit-exact R32G32B32A32_UINT target."""
     return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True)
+
+
+def translate_int_masked(instructions):
+    return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                 return_write_mask=True)
 
 
 def with_constants(body):
@@ -11276,6 +11282,43 @@ def check_f16_round_binary(directory, assembler, objcopy, library):
                        "Unsupported binary16 integer inline constant 1")
 
 
+def check_cli_partial_export(directory, assembler, objcopy, library):
+    """Issue #361: the command-line driver opts into partial EXP masks and reports the mask."""
+    def assembled(text):
+        source = directory / "partial.s"
+        obj = directory / "partial.o"
+        binary = directory / "partial.bin"
+        source.write_text(text, encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013",
+                        "-filetype=obj", source, "-o", obj], check=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+        return binary.read_bytes()
+
+    program = uncompressed_export([], 0x5)
+    archive = directory / "partial.rpf"
+    archive.write_bytes(envelope(assembled("\n".join(program) + "\n")))
+    output = directory / "partial.hlsl"
+    cmd = [sys.executable, "-B", str(Path(pixel_aot.__file__)), str(archive), "fixture",
+           "--llvm", library, "--texture-sgpr", "20", "--interp-sgpr", "24",
+           "--sampler-words", "1", "2", "3", "4", "--constant-descriptor", "64",
+           "--output", str(output)]
+    refused = subprocess.run(cmd, capture_output=True, text=True)
+    assert refused.returncode == 1 and "requires an explicit RT0 write mask" in refused.stderr, refused
+    assert not output.exists()
+    result = subprocess.run([*cmd, "--rt0-write-mask"], check=True, capture_output=True, text=True)
+    summary = json.loads(result.stdout)
+    expected, mask = translate_masked(program)
+    assert mask == 0x5
+    assert summary["rt0_write_mask"] == mask
+    assert output.read_text(encoding="utf-8") == expected
+
+    output.unlink()
+    archive.write_bytes(envelope(assembled("\n".join(assembly(False)) + "\n")))
+    compressed = subprocess.run([*cmd, "--rt0-write-mask"], capture_output=True, text=True)
+    assert compressed.returncode == 1 and "only supports uncompressed exports" in compressed.stderr, compressed
+    assert not output.exists()
+
+
 def check_f16_cvt_int16_binary(directory, assembler, objcopy, library):
     """LLVM 15 gfx1013 encodings of v_cvt_f16_i16 and v_cvt_f16_u16 (e32 and e64), the literal and inline-constant
     spellings of a 16-bit integer operand, and the clamp and omod spellings that assemble on e64 and that the lowering
@@ -11475,6 +11518,7 @@ def check_binary(directory, assembler, objcopy, library):
             check_container_selector(directory, native, library)
     check_wave32_mask_binary(directory, assembler, objcopy, library)
     check_exp_en_decoding(directory, assembler, objcopy, library)
+    check_cli_partial_export(directory, assembler, objcopy, library)
 
 
 def check_wave32_mask_binary(directory, assembler, objcopy, library):
@@ -11582,6 +11626,35 @@ def check_uncompressed_export_draw(directory, compiler, renderer, backend):
     values = tuple(value + 2**-20 for value in (0.5, 1.5, -2.5, 3.5))
     return check_float_export_masks(directory, compiler, renderer, backend, (0x1, 0x8, 0x5, 0xA, 0xF),
                                     lambda mask: uncompressed_export(body, mask), values, float)
+
+
+def check_uncompressed_integer_export_draw(directory, compiler, renderer, backend):
+    sentinel = tuple(as_float(word) for word in (1, 2, 3, 4))
+    words = (0x11111111, 0x22222222, 0x33333333, 0x44444444)
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *words)
+    body = [f"v_mov_b32 v{12 + i}, s{44 + i}" for i in range(4)]
+    source = directory / "masked-integer-export.hlsl"
+    shader = directory / "masked-integer-export.cso"
+    for requested in (0x1, 0x8, 0x5, 0xA, 0xF):
+        hlsl, mask = translate_int_masked(uncompressed_export(body, requested))
+        assert mask == requested
+        source.write_text(hlsl, encoding="ascii")
+        compile_shader(compiler, source, shader)
+        expected = tuple(as_float(word) if requested & (1 << ch) else sentinel[ch]
+                         for ch, word in enumerate(words))
+        good = write_case(directory / "masked-integer.case", constants, expected,
+                          integer_rt=True, write_mask=mask)
+        cases = [(good, "pass")]
+        if requested != 0xF:
+            wrong_mask = write_case(directory / "wrong-integer-mask.case", constants, expected,
+                                    integer_rt=True, write_mask=0xF)
+            wrong_values = tuple(as_float(word ^ 1) if mask & (1 << ch) else sentinel[ch]
+                                 for ch, word in enumerate(words))
+            wrong = write_case(directory / "wrong-integer-value.case", constants, wrong_values,
+                               integer_rt=True, write_mask=mask)
+            cases.extend([(wrong_mask, "mismatch"), (wrong, "mismatch"), (good, "pass")])
+        run_pixel_batch(renderer, backend, shader, cases)
 
 
 def check_float_export_masks(directory, compiler, renderer, backend, masks, program, values, channel_value):
@@ -15545,6 +15618,7 @@ def main():
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
+                    "draw-uncompressed-integer-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers"):
             try:
@@ -15571,6 +15645,7 @@ def main():
                         "draw-f16-cvt-int16": check_f16_cvt_int16_draw,
                         "draw-compressed-export": check_compressed_export_draw,
                         "draw-uncompressed-export": check_uncompressed_export_draw,
+                        "draw-uncompressed-integer-export": check_uncompressed_integer_export_draw,
                         "draw-title-loads": check_title_load_draws,
                         "draw-ds-swizzle": check_ds_swizzle_draw,
                         "draw-exec-regions": check_masked_draw,
