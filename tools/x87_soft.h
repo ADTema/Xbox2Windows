@@ -450,3 +450,52 @@ static inline X87Value x87_scale(X87Value a, X87Value b, uint16_t cw) {
     const X87Rounded r = x87_round(x.sign, x.e + n, x.sig, 0, x87_scale_format, x87_rounding(cw));  // scale round
     return {r.sig, static_cast<uint16_t>(s | r.biased)};
 }
+
+// FPREM and FPREM1: the partial remainder ST(0) - q * ST(1), where q is |ST(0) / ST(1)| truncated toward
+// zero (FPREM) or rounded to nearest-even (FPREM1); out receives it. When the normalized exponent of ST(0)
+// exceeds that of ST(1) by 64 or more, the instruction reduces ST(0) only partially, by an amount the SDM
+// leaves to the implementation, and the helper returns x87_prem_partial without computing a result. A NaN
+// or unsupported operand, an infinite ST(0) or a zero ST(1) gives a NaN as for the arithmetic instructions,
+// and the helper returns x87_prem_nan. Otherwise the remainder is exact and has the sign of ST(0) when it
+// is zero, and the helper returns the low three bits of q, which the instructions copy to C0 (bit 2), C3
+// (bit 1) and C1 (bit 0). A zero ST(0) is kept, and an infinite ST(1) gives ST(0) with q = 0. A
+// pseudo-denormal result is re-encoded at biased exponent 1. Neither precision nor rounding control
+// applies.
+static const int x87_prem_partial = -1;
+static const int x87_prem_nan = -2;
+static inline int x87_prem(X87Value a, X87Value b, bool nearest, X87Value& out) {
+    if (x87_special_operands(a, b, &out)) return x87_prem_nan;
+    if (x87_is_inf(a) || x87_is_zero(b)) { out = x87_indefinite; return x87_prem_nan; }
+    if (x87_is_zero(a)) { out = a; return 0; }
+    const X87Unpacked x = x87_unpack(a);
+    uint64_t r = x.sig, q = 0;
+    int e = x.e;  // the result is r * 2^(e - 63)
+    bool flip = false;
+    if (!x87_is_inf(b)) {
+        const X87Unpacked y = x87_unpack(b);
+        const int d = x.e - y.e;
+        if (d >= 64) { out = a; return x87_prem_partial; }  // prem partial
+        if (d >= 0) {  // long division of x.sig * 2^d by y.sig; r stays below y.sig
+            if (r >= y.sig) { r -= y.sig; q = 1; }
+            for (int k = 0; k < d; ++k) {
+                const bool high = (r >> 63) != 0;  // 2r reaches 2^64, so it is above y.sig
+                r <<= 1;
+                q <<= 1;
+                if (high || r >= y.sig) { r -= y.sig; q |= 1; }
+            }
+            e = y.e;
+            if (nearest && (r > y.sig - r || (r == y.sig - r && (q & 1)))) { r = y.sig - r; ++q; flip = true; }  // prem nearest
+        } else if (nearest && d == -1 && x.sig > y.sig) {  // |ST(0)| above half of |ST(1)|: q rounds to 1
+            r = y.sig - (x.sig - y.sig);  // |ST(1)| - |ST(0)| in units of ST(0)
+            q = 1;
+            flip = true;
+        }
+    }
+    if (r == 0) { out = {0, static_cast<uint16_t>(a.se & 0x8000)}; return static_cast<int>(q & 7); }
+    const int shift = x87_clz(r);
+    int biased = e - shift + 16383;
+    uint64_t sig = r << shift;
+    if (biased < 1) { sig >>= 1 - biased; biased = 0; }  // exact: the remainder is a multiple of the denormal step
+    out = {sig, static_cast<uint16_t>(((a.se & 0x8000) ^ (flip ? 0x8000 : 0)) | biased)};
+    return static_cast<int>(q & 7);
+}

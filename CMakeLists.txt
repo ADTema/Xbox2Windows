@@ -50,8 +50,21 @@ target_compile_features(era_title_gpu_alloc_check PRIVATE cxx_std_20)
 add_test(NAME era_title_gpu_alloc COMMAND era_title_gpu_alloc_check)
 set_tests_properties(era_title_gpu_alloc PROPERTIES TIMEOUT 30)
 
+# Physical-page bookkeeping behind XMemAllocatePhysicalPages/XMemFreePhysicalPages, linked next to a
+# lenient build of the same file (ERA_PHYSICAL_LENIENT_RELEASE) that the ownership controls must catch.
+add_library(era_physical_lenient OBJECT src/era_physical.cpp)
+target_include_directories(era_physical_lenient PRIVATE src)
+target_compile_features(era_physical_lenient PRIVATE cxx_std_17)
+target_compile_definitions(era_physical_lenient PRIVATE ERA_PHYSICAL_LENIENT_RELEASE era_physical=era_physical_lenient)
+add_executable(era_physical_check tests/era_physical_check.cpp src/era_physical.cpp $<TARGET_OBJECTS:era_physical_lenient>)
+target_include_directories(era_physical_check PRIVATE src)
+target_compile_features(era_physical_check PRIVATE cxx_std_17)
+foreach(scenario IN ITEMS controls lifetime)
+    add_test(NAME era_physical_${scenario} COMMAND era_physical_check ${scenario})
+endforeach()
+
 # Desktop xmem.dll for native and mapped callers.
-add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp
+add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
     src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 # LINK uses explicit export ordinals in the generated import library. Keep
@@ -78,7 +91,7 @@ target_link_options(xmem_shim_check PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi
 target_include_directories(xmem_shim_check PRIVATE src)
 target_compile_features(xmem_shim_check PRIVATE cxx_std_17)
 # working_set_aggregation feeds synthetic adapter readings to src/xmem_gpu_usage.h.
-foreach(scenario IN ITEMS exports allocation default_allocation query working_set working_set_aggregation)
+foreach(scenario IN ITEMS exports allocation default_allocation physical_pages query working_set working_set_aggregation)
     add_test(NAME xmem_shim_${scenario} COMMAND xmem_shim_check ${scenario})
 endforeach()
 # XMemGetWorkingSetStatistics differences around D3D12 heap and committed-resource lifetimes.
@@ -733,7 +746,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_frame frame)
     # frame_bound is translated and compiled but never called.
     cpu_translation(cpu_frame cpu_switch_aot
-        push_loop,spill_widths,home_save,home_args,two_paths,home_spill,loop_counter,realloc_slot,frame_bound)
+        push_loop,spill_widths,home_save,home_args,two_paths,home_spill,loop_counter,realloc_slot,anchored_frame,frame_bound)
     add_test(NAME cpu_aot_stack_frames COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/frame_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_frame>" "$<TARGET_FILE:cpu_frame_lifted>"
@@ -1734,6 +1747,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_avx_int_minmax_mul>" "$<TARGET_FILE:cpu_avx_int_minmax_mul_lifted>")
     set_tests_properties(cpu_aot_avx_int_minmax_mul PROPERTIES SKIP_RETURN_CODE 77)
 
+    cpu_asm_fixture(cpu_avx_int_extend_hadd avx_int_extend_hadd)
+    set(avx_int_extend_hadd_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_int_extend_hadd_lifted.cpp")
+    add_custom_command(OUTPUT "${avx_int_extend_hadd_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_extend_hadd.py"
+            emit "$<TARGET_FILE:cpu_avx_int_extend_hadd>" "${avx_int_extend_hadd_fixture}"
+        DEPENDS cpu_avx_int_extend_hadd tests/cpu/avx_int_extend_hadd.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_avx_int_extend_hadd_lifted SHARED "${avx_int_extend_hadd_fixture}")
+    add_test(NAME cpu_aot_avx_int_extend_hadd COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_extend_hadd.py"
+        check "$<TARGET_FILE:cpu_avx_int_extend_hadd>" "$<TARGET_FILE:cpu_avx_int_extend_hadd_lifted>")
+    set_tests_properties(cpu_aot_avx_int_extend_hadd PROPERTIES SKIP_RETURN_CODE 77)
+
+    cpu_asm_fixture(cpu_avx_int_shifts_pack avx_int_shifts_pack)
+    set(avx_int_shifts_pack_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_int_shifts_pack_lifted.cpp")
+    add_custom_command(OUTPUT "${avx_int_shifts_pack_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_shifts_pack.py"
+            emit "$<TARGET_FILE:cpu_avx_int_shifts_pack>" "${avx_int_shifts_pack_fixture}"
+        DEPENDS cpu_avx_int_shifts_pack tests/cpu/avx_int_shifts_pack.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_avx_int_shifts_pack_lifted SHARED "${avx_int_shifts_pack_fixture}")
+    add_test(NAME cpu_aot_avx_int_shifts_pack COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_shifts_pack.py"
+        check "$<TARGET_FILE:cpu_avx_int_shifts_pack>" "$<TARGET_FILE:cpu_avx_int_shifts_pack_lifted>")
+    set_tests_properties(cpu_aot_avx_int_shifts_pack PROPERTIES SKIP_RETURN_CODE 77)
+
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
@@ -2136,6 +2173,24 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_examine COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_examine.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_examine>"
         "$<TARGET_FILE:cpu_x87_examine_lifted>" ${x87_examine_control_files})
+    cpu_asm_fixture(cpu_x87_fprem x87_fprem)
+    # The lifted DLL and eight mutated controls that the check requires to mismatch.
+    set(x87_fprem_control_files "")
+    foreach(variant IN ITEMS lifted nopartial nonan d63 truncate1 tieup halfnear qswap zerosign)
+        set(x87_fprem_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_fprem_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_fprem_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fprem.py"
+                emit "$<TARGET_FILE:cpu_x87_fprem>" "${x87_fprem_fixture}" ${variant}
+            DEPENDS cpu_x87_fprem tests/cpu/x87_fprem.py tests/cpu/x87_add.py tools/ffx_version_query.py
+                tools/x87_lower.py tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_fprem_${variant} SHARED "${x87_fprem_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_fprem_control_files "$<TARGET_FILE:cpu_x87_fprem_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_fprem COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fprem.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_fprem>"
+        "$<TARGET_FILE:cpu_x87_fprem_lifted>" ${x87_fprem_control_files})
     cpu_asm_fixture(cpu_x87_fldcw x87_fldcw)
     # The checked translation and ten mutated controls that the check requires to mismatch.
     set(x87_fldcw_control_files "")
@@ -2580,6 +2635,35 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>")
     set_tests_properties(cpu_native_shim_startup PROPERTIES TIMEOUT 100
         ENVIRONMENT "X2W_SHIM_COMPUTE_CASE=;X2W_SHIM_DRAW_CASE=")
+    # Recording stand-ins for the main executable's D3D12ConfigureVirtualMemoryX call (#874).
+    # They keep the d3d12_xs.dll and xmem.dll names in their own directory, next to the fixture EXEs.
+    set(configure_vm_dir "${CMAKE_CURRENT_BINARY_DIR}/configure_vm")
+    foreach(provider IN ITEMS d3d12_xs xmem)
+        add_library(cpu_configure_vm_${provider} SHARED tests/cpu/configure_vm_recorder.cpp
+            tests/cpu/configure_vm_${provider}.def)
+        set_target_properties(cpu_configure_vm_${provider} PROPERTIES OUTPUT_NAME ${provider}
+            MSVC_RUNTIME_LIBRARY MultiThreaded
+            RUNTIME_OUTPUT_DIRECTORY "${configure_vm_dir}" ARCHIVE_OUTPUT_DIRECTORY "${configure_vm_dir}")
+    endforeach()
+    set(configure_vm_io "${configure_vm_dir}/cpu_exe_io.dll")
+    add_custom_command(OUTPUT "${configure_vm_io}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${configure_vm_dir}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:cpu_exe_io>" "${configure_vm_io}"
+        DEPENDS cpu_exe_io VERBATIM)
+    add_custom_target(cpu_configure_vm_io DEPENDS "${configure_vm_io}")
+    foreach(sample IN ITEMS 3 4)
+        add_executable(cpu_configure_vm_${sample} tests/cpu/configure_vm.asm tests/cpu/exe_startup.asm)
+        add_dependencies(cpu_configure_vm_${sample} cpu_configure_vm_io)
+        target_compile_definitions(cpu_configure_vm_${sample} PRIVATE SAMPLE=${sample})
+        set_target_properties(cpu_configure_vm_${sample} PROPERTIES LINKER_LANGUAGE CXX
+            RUNTIME_OUTPUT_DIRECTORY "${configure_vm_dir}")
+        target_link_options(cpu_configure_vm_${sample} PRIVATE
+            /ENTRY:native_startup /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(cpu_configure_vm_${sample} PRIVATE cpu_configure_vm_d3d12_xs cpu_configure_vm_xmem cpu_exe_io)
+    endforeach()
+    add_test(NAME cpu_native_configure_vm COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/configure_vm_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_configure_vm_3>" "$<TARGET_FILE:cpu_configure_vm_4>")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME cpu_shim_compute_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_compute_check.py"
@@ -2728,6 +2812,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Simulation control: finish_exe never terminates; the control installs it as cpu_exe_io.dll.
     add_library(cpu_exe_io_hang SHARED tests/cpu/exe_io.cpp)
     target_compile_definitions(cpu_exe_io_hang PRIVATE FINISH_HANG)
+    add_library(cpu_cookie_dll SHARED tests/cpu/load_cookie.asm)
+    add_executable(cpu_cookie_exe tests/cpu/load_cookie.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_cookie_dll cpu_cookie_exe PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_cookie_dll PRIVATE /ENTRY:fixture_entry /EXPORT:read_cookie
+        /NODEFAULTLIB /SUBSYSTEM:WINDOWS,6.00 /DYNAMICBASE /INCREMENTAL:NO)
+    target_link_options(cpu_cookie_exe PRIVATE /ENTRY:native_startup
+        /NODEFAULTLIB /SUBSYSTEM:CONSOLE,6.00 /DYNAMICBASE /INCREMENTAL:NO)
+    target_link_libraries(cpu_cookie_exe PRIVATE cpu_exe_io)
+    add_test(NAME cpu_native_load_cookie COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/load_cookie_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_cookie_dll>" "$<TARGET_FILE:cpu_cookie_exe>" "$<TARGET_FILE:cpu_exe_io>")
     foreach(variant IN ITEMS original no_tls)
         add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)
@@ -2741,6 +2836,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_exe_start_original>" "$<TARGET_FILE:cpu_exe_start_no_tls>"
         "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>"
         "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_live>" "$<TARGET_FILE:cpu_exe_io_hang>")
+    # An EXE that imports XMemAllocatePhysicalPages and XMemFreePhysicalPages by name (#880), started by
+    # Windows and by pe_map. FULL_COUNT and SKIP_RELEASE are negative controls.
+    foreach(variant IN ITEMS original full_count skip_release)
+        add_executable(cpu_xmem_physical_${variant} tests/cpu/xmem_physical_pair.asm tests/cpu/exe_startup.asm)
+        set_target_properties(cpu_xmem_physical_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_xmem_physical_${variant} PRIVATE /ENTRY:native_startup
+            /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_xmem_physical_${variant} PRIVATE xmem_shim cpu_exe_io)
+    endforeach()
+    target_compile_definitions(cpu_xmem_physical_full_count PRIVATE FULL_COUNT)
+    target_compile_definitions(cpu_xmem_physical_skip_release PRIVATE SKIP_RELEASE)
+    add_test(NAME cpu_native_xmem_physical_pair COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xmem_physical_pair_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_xmem_physical_original>" "$<TARGET_FILE:cpu_xmem_physical_full_count>"
+        "$<TARGET_FILE:cpu_xmem_physical_skip_release>" "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_xmem_physical_pair PROPERTIES TIMEOUT 120)
     foreach(variant IN ITEMS original returning no_worker)
         add_executable(cpu_exe_worker_alive_${variant} tests/cpu/worker_alive_entry.asm)
         set_target_properties(cpu_exe_worker_alive_${variant} PROPERTIES LINKER_LANGUAGE CXX)
@@ -3332,6 +3443,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/layout_chunks_check.py")
     add_test(NAME dependency_paths_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dependency_paths_check.py")
+    add_test(NAME pe_package_import_closure COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pe_package_preflight_check.py")
 else()
     message(WARNING
         "Python-driven tests, including the CPU fixtures, are disabled because "
