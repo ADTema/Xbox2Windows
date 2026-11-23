@@ -361,6 +361,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
     parity = x87_depth is not None and any(i.mnemonic in (M.JP, M.JNP, M.FCMOVU, M.FCMOVNU) for i in body)
     if parity:
         lines[2] = "bool zero=false, carry=false, overflow=false, sign=false, parity=false;"
+    # FNSTSW is the only reader of the x87 status word (x87_lower.statement).
+    status_word = x87_depth is not None and any(i.mnemonic == M.FNSTSW for i in body)
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
     sse2_int_ops = {
         M.PADDB, M.PADDW, M.PADDD, M.PADDQ, M.PSUBB, M.PSUBW, M.PSUBD, M.PSUBQ,
@@ -2361,7 +2363,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         elif x87_depth is not None and op in x87_lower.X87_OPS:
             stmt = x87_lower.statement(i, x87_depth[i.ip], address, checked, parity,
                                        "load" if i.op_count == 1 and i.op0_kind == K.MEMORY and in_frame()
-                                       else "load_always")
+                                       else "load_always", status_word)
         else:
             raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
         if captured:
