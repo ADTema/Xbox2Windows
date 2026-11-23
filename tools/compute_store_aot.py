@@ -33,13 +33,24 @@ def group_size(psv):
 
 
 def is_word(value):
-    return isinstance(value, int) or (isinstance(value, tuple) and value[0] in ("constant_word", "thread"))
+    return isinstance(value, int) or (isinstance(value, tuple) and value[0] in ("constant_word", "thread", "source"))
 
 
 def hlsl_word(value):
     if isinstance(value, int):
         return f"0x{value:08x}u"
+    if value[0] == "source":
+        # The source binding is read-only, so the read may sit where the word is used.
+        return f"inputData.Load({value[1]})"
     return f"tid.{AXES[value[1]]}" if value[0] == "thread" else f"params[{value[1] // 4}].{'xyzw'[value[1] % 4]}"
+
+
+def vector_operands(line):
+    """VGPR numbers named by an instruction, single or as a range."""
+    regs = set()
+    for single, first, last in re.findall(r"\bv(\d+)\b|\bv\[(\d+):(\d+)\]", line):
+        regs.update([int(single)] if single else range(int(first), int(last) + 1))
+    return regs
 
 
 def labelled(decoded):
@@ -63,11 +74,13 @@ def labelled(decoded):
 
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
-          constant_descriptor=None, group_reg_y=None, group_reg_z=None):
+          constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
+          source_stride=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
-    group dimension is larger than one. Descriptors name u0 and optionally b0.
+    group dimension is larger than one. Descriptors name u0 and optionally b0 and a read-only raw
+    source t0; source_stride is the t0 byte stride that indexed reads use.
     """
     dims = checked_group(group)
     if not 0 <= table_reg <= 105 or not 0 <= descriptor_offset < 1 << 20 or descriptor_offset % 4:
@@ -78,6 +91,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 or abs(constant_descriptor - descriptor_offset) < 16):
             raise ValueError("Invalid or overlapping constant descriptor binding")
         descriptor_bindings[constant_descriptor] = "cbv"
+    if source_descriptor is not None:
+        if (not 0 <= source_descriptor < 1 << 20 or source_descriptor % 4
+                or any(abs(source_descriptor - offset) < 16 for offset in descriptor_bindings)):
+            raise ValueError("Invalid or overlapping source descriptor binding")
+        descriptor_bindings[source_descriptor] = "srv"
+    if source_stride is not None and (source_descriptor is None or not 4 <= source_stride <= 0x3fff
+                                      or source_stride % 4):
+        raise ValueError("Indexed reads require a source binding and aligned stride")
     group_regs = {axis: reg for axis, reg in enumerate((group_reg, group_reg_y, group_reg_z)) if reg is not None}
     if (any(not 0 <= reg <= 105 or reg == table_reg for reg in group_regs.values())
             or len(set(group_regs.values())) != len(group_regs)):
@@ -89,6 +110,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         scalar[reg] = ("group", axis)
     vector = {axis: ("local", axis) for axis in range(3) if axis == 0 or dims[axis] > 1}
     pending = set()
+    # VGPRs a buffer_load_dword still writes, with the word they receive (None when unknown);
+    # they enter vector only at s_waitcnt vmcnt(0).
+    loading = {}
     stores = []
     written_spans = []
     layout = None
@@ -115,10 +139,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if int(m[1], 0) > 0x3f:
                 raise ValueError("Invalid s_clause operand")
             continue
-        if line in ("s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(0) vmcnt(0)", "s_waitcnt vmcnt(0) lgkmcnt(0)"):
-            pending.clear()
-        elif line == "s_waitcnt vmcnt(0)":
-            continue
+        if not line.startswith("s_waitcnt") and vector_operands(line) & loading.keys():
+            raise ValueError("Vector load result used or overwritten before s_waitcnt vmcnt(0)")
+        if line in ("s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(0) vmcnt(0)", "s_waitcnt vmcnt(0) lgkmcnt(0)",
+                    "s_waitcnt vmcnt(0)"):
+            if "lgkmcnt" in line:
+                pending.clear()
+            if "vmcnt" in line:
+                for reg, value in loading.items():
+                    if value is None:
+                        vector.pop(reg, None)
+                    else:
+                        vector[reg] = value
+                loading.clear()
         elif m := re.fullmatch(r"v_cmp_(gt|lt|ge|le)_u32_e32 vcc_lo, (s\d+|v\d+|-?\d+|0x[0-9a-f]+), v(\d+)", line):
             op, src, right = m[1], m[2], int(m[3])
             if src[0] in "sv":
@@ -136,7 +169,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if guard_span is not None or vcc is None or saved > 105 or saved in pending:
                 raise ValueError("Unverified or repeated lane guard")
             guard = dict(label=None, at_label=False, holders=None,
-                         scalar=dict(scalar), vector=dict(vector), pending=set(pending))
+                         scalar=dict(scalar), vector=dict(vector), pending=set(pending), loading=dict(loading))
             scalar[saved] = ("exec",)
             guard_span = [len(stores), None, vcc]
         elif m := re.fullmatch(r"s_cbranch_execz (\.L\w+)", line):
@@ -156,6 +189,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             # Registers written under the guard keep their old values in the lanes that did not
             # pass it, or in the whole wave when the branch skips the block: unknown after the
             # restore. A wait under the guard may have been skipped, so earlier loads stay pending.
+            # A load from before the guard keeps its word only if its register still holds that
+            # word on the guarded path, waited for or not. Any other loaded register, including a
+            # load issued under the guard (it writes only the lanes that passed), is unknown after
+            # its wait.
+            loading = {reg: guard["loading"].get(reg) if loading.get(reg, vector.get(reg)) == guard["loading"].get(reg)
+                       else None for reg in guard["loading"].keys() | loading.keys()}
             for state, before in ((scalar, guard["scalar"]), (vector, guard["vector"])):
                 for reg in [reg for reg, value in state.items() if reg not in before or before[reg] != value]:
                     del state[reg]
@@ -192,16 +231,20 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or shift != dims[axis].bit_length() - 1):
                 raise ValueError("Unverified group base")
             scalar[dst] = ("group_base", axis)
-        elif m := re.fullmatch(r"s_load_dwordx4 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)", line):
-            dest, last, base, high = map(int, m.groups()[:4])
-            offset = 0 if m[5] == "null" else int(m[5], 16)
+        elif m := re.fullmatch(r"s_load_dwordx([48]) s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)", line):
+            # x8 loads two descriptors bound at consecutive 16-byte slots of the table.
+            count = int(m[1])
+            dest, last, base, high = map(int, m.groups()[1:5])
+            offset = 0 if m[6] == "null" else int(m[6], 16)
             regs = range(dest, last + 1)
-            if (dest % 4 or last != dest + 3 or last > 105 or base % 2 or high != base + 1
+            slots = range(offset, offset + 4 * count, 16)
+            if (dest % 4 or last != dest + count - 1 or last > 105 or base % 2 or high != base + 1
                     or high > 105 or pending.intersection((*regs, base, high))
-                    or (scalar.get(base), scalar.get(high)) != ("table", 0) or offset not in descriptor_bindings):
+                    or (scalar.get(base), scalar.get(high)) != ("table", 0)
+                    or any(slot not in descriptor_bindings for slot in slots)):
                 raise ValueError("Unresolved compute descriptor load")
-            for component, reg in enumerate(regs):
-                scalar[reg] = (descriptor_bindings[offset], component)
+            for word, reg in enumerate(regs):
+                scalar[reg] = (descriptor_bindings[slots[word // 4]], word % 4)
             pending.update(regs)
         elif m := re.fullmatch(r"(?:s_buffer_load_dwordx([24]) s\[(\d+):(\d+)\]|s_buffer_load_dword s(\d+)), "
                                r"s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)", line):
@@ -289,6 +332,38 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
+        elif m := re.fullmatch(r"buffer_load_dword v(\d+), (off|v\d+), s\[(\d+):(\d+)\], 0( idxen)?( offen)?"
+                               r"(?: offset:(\d+))?", line):
+            dst, base, high = int(m[1]), int(m[3]), int(m[4])
+            offset = int(m[7] or 0)
+            if (dst > 255 or high != base + 3 or base % 4 or high > 105
+                    or pending.intersection(range(base, high + 1))):
+                raise ValueError("Unverified buffer read descriptor")
+            kinds = {scalar.get(base + i) for i in range(4)}
+            if kinds == {("uav", i) for i in range(4)}:
+                # The store target would need ordering against other invocations' stores.
+                raise ValueError("Reads from the stored UAV are not supported")
+            if kinds != {("srv", i) for i in range(4)}:
+                raise ValueError("Unverified buffer read descriptor")
+            if offset % 4 or offset > 4095:
+                raise ValueError("Unverified read offset")
+            tag = vector.get(int(m[2][1:])) if m[2] != "off" else None
+            if m[2] == "off" and not m[5] and not m[6]:
+                address = f"{offset}u"
+            elif (m[6] and not m[5] and isinstance(tag, tuple) and tag[0] == "thread_bytes"
+                  and 2 <= tag[2] < 32):
+                # A shift below 2 gives unaligned byte offsets, which ByteAddressBuffer.Load cannot express.
+                address = f"(tid.{AXES[tag[1]]} << {tag[2]}u) + {offset}u"
+            elif (m[5] and not m[6] and source_stride is not None and isinstance(tag, tuple)
+                  and tag[0] == "thread"):
+                # idxen: index * stride + instruction offset, inside one source element.
+                if offset + 4 > source_stride:
+                    raise ValueError("Read leaves its source element")
+                address = f"tid.{AXES[tag[1]]} * {source_stride}u + {offset}u"
+            else:
+                raise ValueError("Unsupported read address")
+            vector.pop(dst, None)
+            loading[dst] = ("source", address)
         elif m := re.fullmatch(r"buffer_store_dword(?:x([234]))? (v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), "
                                r"s\[(\d+):(\d+)\], 0( idxen)?( offen)?(?: offset:(\d+))?", line):
             count = int(m[1] or 1)
@@ -384,6 +459,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     body = "\n".join(stores)
     cbuffer = (f"cbuffer Constants : register(b0) {{ uint4 params[{CONSTANT_WORDS // 4}]; }};\n"
                if constant_descriptor is not None else "")
+    if source_descriptor is not None:
+        cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
     return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID) {{\n{body}\n}}\n")
 
@@ -400,6 +477,9 @@ def main():
     parser.add_argument("--group-reg-y", type=int, help="SGPR holding the group Y ID")
     parser.add_argument("--group-reg-z", type=int, help="SGPR holding the group Z ID")
     parser.add_argument("--stride", type=int, help="Indexed raw UAV byte stride")
+    parser.add_argument("--source-descriptor", type=lambda n: int(n, 0),
+                        help="Table byte offset bound to stable read-only t0, with no overlap with u0")
+    parser.add_argument("--source-stride", type=int, help="Indexed t0 byte stride")
     args = parser.parse_args()
     if args.output.suffix.lower() != ".hlsl" or args.output.resolve() == args.container.resolve():
         parser.error("Choose an HLSL destination distinct from the input")
@@ -410,7 +490,8 @@ def main():
     source = lower(labelled(disassemble(code, args.llvm, offsets=True)), group, table_reg=args.table_reg,
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
-                   group_reg_z=args.group_reg_z)
+                   group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
+                   source_stride=args.source_stride)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
