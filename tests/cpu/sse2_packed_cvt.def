@@ -21,3 +21,5 @@ EXPORTS
     sqrtsd_op
     minsd_op
     maxsd_op
+    read_mxcsr
+    write_mxcsr

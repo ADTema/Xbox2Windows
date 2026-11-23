@@ -54,6 +54,47 @@ def aligned_buf(data: bytes):
     return raw, ctypes.addressof(raw) + off, off
 
 
+def run_export(lib, name, a, b):
+    input_a, a_ptr, _ = aligned_buf(a)
+    input_b, b_ptr, _ = aligned_buf(b)
+    output, out_ptr, offset = aligned_buf(bytes(16))
+    function = getattr(lib, name)
+    function.argtypes = [ctypes.c_uint64] * 3
+    function.restype = ctypes.c_uint64
+    function(a_ptr, b_ptr, out_ptr)
+    return bytes(output[offset:offset + 16])
+
+
+def check_mxcsr_modes(native, lifted):
+    read_mxcsr, write_mxcsr = native.read_mxcsr, native.write_mxcsr
+    for function in (read_mxcsr, write_mxcsr):
+        function.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+        function.restype = None
+    saved = ctypes.c_uint32()
+    read_mxcsr(ctypes.byref(saved))
+    cases = (
+        (0x3f80, "cvtps2dq_op", struct.pack("<4f", 1.75, -1.75, 2.5, -2.5),
+         bytes(16), struct.pack("<4i", 1, -2, 2, -3)),
+        (0x7f80, "cvtpd2dq_op", struct.pack("<2d", 1.75, -1.75),
+         bytes(16), struct.pack("<4i", 1, -1, 0, 0)),
+        (0x1fc0, "minss_op", struct.pack("<4I", 1, 2, 3, 4),
+         struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), struct.pack("<4I", 0, 2, 3, 4)),
+        (0x1fc0, "minsd_op", struct.pack("<2Q", 1, 2),
+         struct.pack("<2d", 1.0, 0.0), struct.pack("<2Q", 0, 2)),
+    )
+    try:
+        for config, name, a, b, expected in cases:
+            for label, library in (("native", native), ("lifted", lifted)):
+                mode = ctypes.c_uint32(config)
+                write_mxcsr(ctypes.byref(mode))
+                actual = run_export(library, name, a, b)
+                if actual != expected:
+                    raise AssertionError(f"{name} {label} MXCSR={config:#x}: "
+                                         f"actual={actual.hex()} expected={expected.hex()}")
+    finally:
+        write_mxcsr(ctypes.byref(saved))
+
+
 def check(native_dll: Path, lifted_dll: Path) -> None:
     check_controls()
     native = ctypes.CDLL(str(native_dll))
@@ -79,20 +120,13 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
             a, b = pd_a, pd_b
         else:
             a, b = ps_a, ps_b
-        ra, pa, _ = aligned_buf(a)
-        rb, pb, _ = aligned_buf(b)
-        rn, pn, on = aligned_buf(b"\x00" * 16)
-        rl, pl, ol = aligned_buf(b"\x00" * 16)
-        fn_n, fn_l = getattr(native, name), getattr(lifted, name)
-        fn_n.argtypes = fn_l.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
-        fn_n.restype = fn_l.restype = ctypes.c_uint64
-        fn_n(pa, pb, pn)
-        fn_l(pa, pb, pl)
-        got_n = bytes(rn[on:on + 16])
-        got_l = bytes(rl[ol:ol + 16])
+        got_n = run_export(native, name, a, b)
+        got_l = run_export(lifted, name, a, b)
         if got_n != got_l:
             raise AssertionError(f"{name}: native={got_n.hex()} lifted={got_l.hex()}")
     print(f"{len(EXPORTS)} baseline 128-bit SSE/SSE2 conversion/compare/move/scalar cases matched native and translated DLLs")
+    check_mxcsr_modes(native, lifted)
+    print("MXCSR round-down, round-toward-zero, and DAZ controls passed")
 
 
 if __name__ == "__main__":
