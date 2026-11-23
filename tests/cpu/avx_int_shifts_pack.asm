@@ -238,8 +238,8 @@ vpblendvb_op PROC FRAME
     .endprolog
     vmovups ymm1, ymmword ptr [rcx]
     vmovups ymm2, ymmword ptr [rdx]
-    vmovups ymm3, ymmword ptr [r9]
-    vpblendvb xmm0, xmm1, xmm2, xmm3
+    vmovups ymm0, ymmword ptr [r9]
+    vpblendvb xmm0, xmm1, xmm2, xmm0
     vmovups ymmword ptr [r8], ymm0
     vzeroupper
     ret
@@ -324,5 +324,22 @@ vpextrq_op PROC FRAME
     vzeroupper
     ret
 vpextrq_op ENDP
+
+vpsrlw_mem_count_op PROC FRAME
+    .endprolog
+    vmovups ymm1, ymmword ptr [rcx]
+    vpsrlw xmm0, xmm1, xmmword ptr [rdx]
+    vmovups ymmword ptr [r8], ymm0
+    vzeroupper
+    ret
+vpsrlw_mem_count_op ENDP
+
+vpshufd_ymm_mem_op PROC FRAME
+    .endprolog
+    vpshufd ymm0, ymmword ptr [rcx], 0B1h
+    vmovups ymmword ptr [r8], ymm0
+    vzeroupper
+    ret
+vpshufd_ymm_mem_op ENDP
 
 END

@@ -33,3 +33,5 @@ EXPORTS
     vpextrw_op
     vpextrd_op
     vpextrq_op
+    vpsrlw_mem_count_op
+    vpshufd_ymm_mem_op

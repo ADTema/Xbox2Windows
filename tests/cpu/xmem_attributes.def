@@ -23,4 +23,6 @@ EXPORTS
     low_half
     partial_write
     exported_passthrough
+    caller_copy
+    caller_copy_low
     forward_alloc

@@ -1,5 +1,6 @@
 """Differential check for VEX AVX packed shifts, packs, unpacks, shuffles, blends, movemask, and insert/extract."""
 import ctypes
+import struct
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ VEC_EXPORTS = (
     "vpinsrb_op", "vpinsrw_op", "vpinsrd_op", "vpinsrq_op",
 )
 SCALAR_EXPORTS = ("vpmovmskb_op", "vpextrb_op", "vpextrw_op", "vpextrd_op", "vpextrq_op")
-ALL_EXPORTS = VEC_EXPORTS + SCALAR_EXPORTS
+ALL_EXPORTS = VEC_EXPORTS + SCALAR_EXPORTS + ("vpsrlw_mem_count_op", "vpshufd_ymm_mem_op")
 
 CPUID_HELPER = """#include <intrin.h>
 extern "C" __declspec(dllexport) uint32_t host_has_avx() {
@@ -31,6 +32,14 @@ extern "C" __declspec(dllexport) uint32_t host_has_avx() {
     const int need = (1 << 27) | (1 << 28);
     if ((info[2] & need) != need) return 0u;
     return (_xgetbv(0) & 6u) == 6u ? 1u : 0u;
+}
+extern "C" __declspec(dllexport) uint32_t host_has_avx2() {
+    if (!host_has_avx()) return 0u;
+    int info[4]{};
+    __cpuid(info, 0);
+    if (info[0] < 7) return 0u;
+    __cpuidex(info, 7, 0);
+    return (info[1] & (1 << 5)) != 0;
 }
 """
 
@@ -49,14 +58,63 @@ def emit(native_dll: Path, output_cpp: Path) -> None:
 
 
 def check_controls() -> None:
-    # EVEX vpshufd xmm0{k1}, xmm1, 0x1B (62 F1 7D 09 70 C1 1B) followed by ret must be rejected.
-    evex = list(Decoder(64, b"\x62\xf1\x7d\x09\x70\xc1\x1b\xc3", ip=0x1000))
+    for encoded in ("62f17d0970c11b", "c5f970c31b"):
+        body = list(Decoder(64, bytes.fromhex(encoded + "c3"), ip=0x1000))
+        try:
+            lower(body, [], {}, {}, {})
+        except ValueError as error:
+            if "unsupported packed shift, pack or lane operation" not in str(error):
+                raise
+        else:
+            raise AssertionError(f"expected {body[0]} to be rejected")
+
+
+def packed_function(library, name):
+    function = getattr(library, name)
+    function.argtypes = [ctypes.c_void_p] * 4
+    function.restype = ctypes.c_uint64
+    return function
+
+
+def check_memory_count(native, lifted, source, expected):
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.VirtualAlloc.restype = ctypes.c_void_p
+    kernel32.VirtualProtect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p]
+    kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+    page = 4096
+    base = kernel32.VirtualAlloc(None, 2 * page, 0x3000, 0x04)
+    if not base:
+        raise ctypes.WinError(ctypes.get_last_error())
     try:
-        lower(evex, [], {}, {}, {})
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected EVEX vpshufd to be rejected")
+        old = ctypes.c_uint32()
+        if not kernel32.VirtualProtect(base + page, page, 0x01, ctypes.byref(old)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        pointer = base + page - 16
+        ctypes.memmove(pointer, struct.pack("<QQ", 5, 0xffffffffffffffff), 16)
+        output = ctypes.create_string_buffer(32)
+        for library, label in ((native, "native"), (lifted, "lifted")):
+            run = packed_function(library, "vpsrlw_mem_count_op")
+            run(source, pointer, output, None)
+            if output.raw != expected:
+                raise AssertionError(f"{label}: count must use the low 64 bits")
+            # The low count still fits. The rest of the m128 operand is inaccessible.
+            ctypes.memmove(pointer + 8, struct.pack("<Q", 5), 8)
+            ctypes.memset(output, 0xa5, 32)
+            try:
+                run(source, pointer + 8, output, None)
+            except OSError as error:
+                if "access violation reading" not in str(error):
+                    raise
+            else:
+                raise AssertionError(f"{label}: incomplete m128 count did not fault")
+            if output.raw != b"\xa5" * 32:
+                raise AssertionError(f"{label}: result was stored before the fault")
+            ctypes.memmove(pointer + 8, struct.pack("<Q", 0xffffffffffffffff), 8)
+    finally:
+        if not kernel32.VirtualFree(base, 0, 0x8000):
+            raise ctypes.WinError(ctypes.get_last_error())
+    print("native and lifted shift read the full m128 count before storing")
 
 
 def check(native_dll: Path, lifted_dll: Path) -> None:
@@ -108,6 +166,20 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
         cases += 1
 
     print(f"{cases} VEX AVX shift/pack/unpack/shuffle/blend/movemask/insert/extract cases matched native and translated DLLs")
+    expected_count = struct.pack("<8H", *(word >> 5 for word in struct.unpack("<8H", a_bytes[:16]))) + bytes(16)
+    check_memory_count(native, lifted, a_buf, expected_count)
+    lifted.host_has_avx2.restype = ctypes.c_uint32
+    if not lifted.host_has_avx2():
+        print("host lacks AVX2; skipping the YMM memory shuffle")
+        return
+    source = ctypes.create_string_buffer(bytes(range(32)), 32)
+    words = struct.unpack("<8I", source.raw)
+    expected_y = struct.pack("<8I", *(words[lane + i] for lane in (0, 4) for i in (1, 0, 3, 2)))
+    for library, label in ((native, "native"), (lifted, "lifted")):
+        packed_function(library, "vpshufd_ymm_mem_op")(source, None, out_n, None)
+        if bytes(out_n) != expected_y:
+            raise AssertionError(f"{label}: YMM shuffle disagreed with the lane reference")
+    print("AVX2 YMM memory shuffle matched independent lane positions")
 
 
 if __name__ == "__main__":
