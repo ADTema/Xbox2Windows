@@ -101,6 +101,10 @@ def check_example():
     """branch.asm -> eight x64 forms, counted only while cpu_leaf_aot_branches passes."""
     branch = fc.masm_mnemonics(BRANCH)
     assert branch == {"mov", "cmp", "jb", "jae", "add", "jmp", "sub", "ret"}, branch  # jae: INVERT_BRANCH build
+    # ML64 encodes INT 3, 3h and 03h as CC, the reference's int3; another interrupt vector stays int.
+    for spelling in ("3", "3h", "03h"):
+        assert fc.masm_mnemonics(f"    int {spelling}\n    ud2\n") == {"int3", "ud2"}, spelling
+    assert fc.masm_mnemonics("    int 29h\n") == {"int"}
     reference = fc.load_reference("x64_zen2.tsv")
     assert fc.x64_forms(branch, reference) == {("Integer", m) for m in branch}
 
@@ -1138,6 +1142,25 @@ def check_swap_coverage():
         assert ("VOP1", "v_swap_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"v_swap_b32"}, reference), name
 
 
+def check_pk_fmac_coverage():
+    """v_pk_fmac_f16 is VOP2 in both references and counts as covered only through the accepted VOP2 spelling.
+    The _e64, DPP and SDWA spellings reach only rejections."""
+    import pixel_aot_check as pixel
+    pixel.ACCEPTED.clear()
+    with tempfile.TemporaryDirectory() as tmp:
+        pixel.check_controls(Path(tmp))
+    assert "v_pk_fmac_f16" in pixel.ACCEPTED
+    assert not {"v_pk_fmac_f16_e64", "v_pk_fmac_f16_dpp", "v_pk_fmac_f16_sdwa"} & pixel.ACCEPTED
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert ("VOP2", "v_pk_fmac_f16") in reference, name
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert ("VOP2", "v_pk_fmac_f16") in covered, name
+        # Control: without the accepted spellings the form is not covered.
+        stripped = pixel.ACCEPTED - {"v_pk_fmac_f16", "v_pk_fmac_f16_e32"}
+        assert ("VOP2", "v_pk_fmac_f16") not in fc.gfx_forms(stripped, reference), name
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -1157,6 +1180,7 @@ if __name__ == "__main__":
     check_f16_round_forms()
     check_f16_cvt_int16_forms()
     check_swap_coverage()
+    check_pk_fmac_coverage()
     check_sopk_wait_forms()
     check_s_version_form()
     check_parsing()

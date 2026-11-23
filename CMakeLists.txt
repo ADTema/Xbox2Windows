@@ -117,6 +117,27 @@ target_include_directories(xmem_commit_protection_check PRIVATE src)
 target_compile_features(xmem_commit_protection_check PRIVATE cxx_std_20)
 add_test(NAME xmem_commit_protection COMMAND xmem_commit_protection_check)
 set_tests_properties(xmem_commit_protection PROPERTIES TIMEOUT 30)
+# Mutation controls: each run flips one expected value and passes only when the
+# named check reports it. An unknown mutation name or an overall PASS fails.
+foreach(mutation_and_check
+        "xva_positive_refused|check_failed: xva_accepted_pair"
+        "xva_commit_accepted|check_failed: xva_commit_bit"
+        "xva_readonly_accepted|check_failed: xva_protection"
+        "xva_state_dependent|check_failed: xva_address_state_independent"
+        "private_second_va_aliases|check_failed: private_second_va_independent.*failing_fields=private_second_va\n"
+        "private_type_mapped|check_failed: private_type.*failing_fields=private_type\n"
+        "mapped_decommit_succeeds|check_failed: mapped_decommit.*failing_fields=mapped_decommit\n")
+  string(FIND "${mutation_and_check}" "|" split)
+  string(SUBSTRING "${mutation_and_check}" 0 ${split} mutation)
+  math(EXPR expected_start "${split} + 1")
+  string(SUBSTRING "${mutation_and_check}" ${expected_start} -1 expected_output)
+  add_test(NAME xmem_commit_protection_mutate_${mutation}
+           COMMAND xmem_commit_protection_check --mutate ${mutation})
+  set_tests_properties(xmem_commit_protection_mutate_${mutation} PROPERTIES
+    TIMEOUT 30
+    PASS_REGULAR_EXPRESSION "${expected_output}"
+    FAIL_REGULAR_EXPRESSION "unknown mutation|xmem_commit_protection: PASS")
+endforeach()
 
 add_executable(windows_placeholder_partition_check tests/windows_placeholder_partition_check.cpp)
 target_compile_features(windows_placeholder_partition_check PRIVATE cxx_std_17)
@@ -448,6 +469,9 @@ set_tests_properties(xg_swizzle_select PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
 # Mutation control: the same comparison must identify all nine mismatches.
 add_test(NAME xg_swizzle_select_mutation COMMAND xg_swizzle_select_check --mutate-linear-fallback)
 set_tests_properties(xg_swizzle_select_mutation PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+add_test(NAME xg_swizzle_factory COMMAND xg_swizzle_select_check --factory)
+add_test(NAME xg_swizzle_factory_no_write COMMAND xg_swizzle_select_check --mutate-factory-no-write)
+set_tests_properties(xg_swizzle_factory xg_swizzle_factory_no_write PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 foreach(adapter IN ITEMS hardware warp)
     add_test(NAME offscreen_${adapter} COMMAND offscreen_check ${adapter} triangle_${adapter}.bmp)
     add_test(NAME ffx_provider_loop_${adapter} COMMAND offscreen_check ${adapter} --ffx-provider-loop)
@@ -1110,6 +1134,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_pcmpstr_original_lifted>"
         "$<TARGET_FILE:cpu_avx_pcmpstr_altered_lifted>")
     set_tests_properties(cpu_aot_avx_pcmpstr PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_pcmpstr64_exports
+        "pcmpestri64_ub_eqany_pos_lsb,pcmpestri64_sw_ranges_neg_msb,"
+        "pcmpestri64_mem_sb_eqeach_mpos_msb,pcmpestri64_alias_xmm0,"
+        "pcmpestrm64_ub_eqany_pos_bit,pcmpestrm64_sb_ranges_neg_exp,"
+        "pcmpestrm64_mem_uw_eqord_mneg_exp,pcmpestrm64_xmm0_self,"
+        "vpcmpestri64_ub_eqany_pos_lsb,vpcmpestri64_uw_eqord_mneg_lsb,"
+        "vpcmpestri64_mem_sw_ranges_neg_msb,vpcmpestri64_alias_xmm0,"
+        "vpcmpestrm64_ub_eqany_pos_bit,vpcmpestrm64_uw_eqeach_mpos_exp,"
+        "vpcmpestrm64_mem_ub_eqany_exp,vpcmpestrm64_xmm0_self,"
+        "vpcmpestrm64_discarded_read")
+    string(CONCAT cpu_pcmpstr64_exports ${cpu_pcmpstr64_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_pcmpstr64_${variant} pcmpstr64)
+        cpu_translation(cpu_pcmpstr64_${variant} cpu_pcmpstr64_aot "${cpu_pcmpstr64_exports}")
+    endforeach()
+    target_compile_definitions(cpu_pcmpstr64_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_pcmpstr64 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/pcmpstr64_check.py"
+        "$<TARGET_FILE:cpu_pcmpstr64_original>"
+        "$<TARGET_FILE:cpu_pcmpstr64_original_lifted>"
+        "$<TARGET_FILE:cpu_pcmpstr64_altered_lifted>")
+    set_tests_properties(cpu_aot_pcmpstr64 PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_pcmpstr64.txt")
     set(cpu_sse2_exports
         "op_cmppd_0,op_cmppd_1,op_cmppd_2,op_cmppd_3,op_cmppd_4,op_cmppd_5,op_cmppd_6,op_cmppd_7,"
         "op_cmppd_mem,"
@@ -1171,6 +1219,21 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_fp_original>"
         "$<TARGET_FILE:cpu_sse_fp_original_lifted>"
         "$<TARGET_FILE:cpu_sse_fp_altered_lifted>")
+    set(cpu_avx_fp_move_exports
+        "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
+        "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64")
+    string(CONCAT cpu_avx_fp_move_exports ${cpu_avx_fp_move_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_fp_move_${variant} avx_fp_move)
+        cpu_translation(cpu_avx_fp_move_${variant} cpu_avx_fp_move_aot "${cpu_avx_fp_move_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_fp_move_altered PRIVATE ALTER_OP)
+    add_test(NAME cpu_aot_avx_fp_move COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_fp_move_check.py"
+        "$<TARGET_FILE:cpu_avx_fp_move_original>"
+        "$<TARGET_FILE:cpu_avx_fp_move_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_fp_move_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_fp_move PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_sse_mmx_exports
         "op_cvtpi2ps_reg,op_cvtpi2ps_mem,op_cvtpi2ps_mem_plus1,"
         "op_cvtps2pi_reg,op_cvtps2pi_mem,op_cvtps2pi_mem_plus1,"
@@ -2260,6 +2323,32 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_${part}_lifted>" ${host_cpu_extras})
         set_tests_properties(cpu_aot_${part} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
+    # INT3 and UD2: the lifted DLL, the drop, swap and nostore controls that must break a rule, an /O2 build,
+    # and the native SEH boundary that the check's child processes call through.
+    cpu_asm_fixture(cpu_trap trap)
+    add_library(cpu_trap_harness SHARED tests/cpu/trap_harness.cpp)
+    set(trap_controls)
+    foreach(variant IN ITEMS lifted drop swap nostore)
+        set(trap_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_${variant}.cpp")
+        add_custom_command(OUTPUT "${trap_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/trap.py"
+                emit "$<TARGET_FILE:cpu_trap>" "${trap_fixture}" ${variant}
+            DEPENDS cpu_trap tests/cpu/trap.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_trap_${variant} SHARED "${trap_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND trap_controls "$<TARGET_FILE:cpu_trap_${variant}>")
+        endif()
+    endforeach()
+    set(trap_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_lifted_o2.dll")
+    add_custom_command(OUTPUT "${trap_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /EHsc /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_lifted_o2.obj" "/Fe${trap_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_trap_lifted_o2 ALL DEPENDS "${trap_o2}")
+    add_test(NAME cpu_aot_trap COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/trap.py"
+        check "$<TARGET_FILE:cpu_trap_harness>" "$<TARGET_FILE:cpu_trap>" "$<TARGET_FILE:cpu_trap_lifted>"
+        ${trap_controls} "${trap_o2}")
     # The opt-in host-MXCSR profile: the lifted DLL, the noload and fixed controls that must break a rule, and
     # an /O2 build of the translation.
     cpu_asm_fixture(cpu_mxcsr_harness mxcsr_harness)
@@ -3585,6 +3674,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_frame_events_provider_clobber>"
         "$<TARGET_FILE:cpu_frame_events_provider_early>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_frame_events PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_xg_swizzle_provider SHARED tests/cpu/xg_swizzle_provider.cpp tests/cpu/xg_swizzle_provider.def)
+    add_library(cpu_xg_swizzle_provider_clobber SHARED tests/cpu/xg_swizzle_provider.cpp tests/cpu/xg_swizzle_provider.def)
+    target_compile_definitions(cpu_xg_swizzle_provider_clobber PRIVATE FAULT_CLOBBER)
+    add_library(cpu_xg_swizzle_provider_linear SHARED tests/cpu/xg_swizzle_provider.cpp tests/cpu/xg_swizzle_provider.def)
+    target_compile_definitions(cpu_xg_swizzle_provider_linear PRIVATE FAULT_LINEAR)
+    add_executable(cpu_xg_swizzle_caller tests/cpu/xg_swizzle_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_xg_swizzle_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_xg_swizzle_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_xg_swizzle_caller PRIVATE cpu_xg_swizzle_provider cpu_exe_io)
+    add_test(NAME cpu_native_xg_swizzle COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xg_swizzle_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_xg_swizzle_caller>" "$<TARGET_FILE:cpu_xg_swizzle_provider>"
+        "$<TARGET_FILE:cpu_xg_swizzle_provider_clobber>"
+        "$<TARGET_FILE:cpu_xg_swizzle_provider_linear>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_xg_swizzle PROPERTIES TIMEOUT 60)
     add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")
@@ -3769,6 +3874,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-core "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_dpp_f16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-dpp-f16 "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_dpp_f16_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_dpp_f16_${adapter}.txt")
         add_test(NAME pixel_aot_dpp_extra_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-dpp-extra "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3807,6 +3917,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_region_body_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_region_body_${adapter}.txt")
+        add_test(NAME pixel_aot_region_waits_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-region-waits "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_region_waits_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_region_waits_${adapter}.txt")
         add_test(NAME pixel_position_centers_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_position_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3886,6 +4001,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_shift64_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_shift64_${adapter}.txt")
+        add_test(NAME pixel_aot_pk_fmac_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-pk-fmac "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_pk_fmac_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_pk_fmac_${adapter}.txt")
         add_test(NAME pixel_aot_plain_bitscan_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-plain-bitscan "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

@@ -839,7 +839,7 @@ def check_region_body_controls():
     for body in ("v_rcp_f32_e64 v13, s46", "v_fmac_f32_e64 v13, s45, v20", "v_mac_f32_e64 v13, s45, v20",
                  "v_cvt_f32_ubyte0_e64 v13, s47", "v_exp_f32_e32 v13, s46", "v_log_f32_e32 v13, s46",
                  "v_cvt_f32_f16_e64 v13, v20", "v_fma_mix_f32 v13, s45, v20, 1.0", "v_max3_f32 v13, s45, v20, 1.0",
-                 "s_nop 0", "s_mov_b32 s62, 0", "v_cvt_pkrtz_f16_f32_e32 v13, v20, v20"):
+                 "s_mov_b32 s62, 0", "v_cvt_pkrtz_f16_f32_e32 v13, v20, v20"):
         for opener in ("cmpx", "saveexec"):
             expect_value_error(translate, region_body_program(body, False, opener),
                                "Instruction cannot run in a masked region")
@@ -853,6 +853,149 @@ def check_region_body_controls():
                                  "v_fmac_f32_e32 v13, v14, v20", "v_med3_f32 v14, v13, v20, 1.0", CMPX_MOV_RESTORE])
     main = translate(chain).split(" main(", 1)[1]
     assert sorted(re.findall(r"precise float alu\d+_(v1[34]) = \(cmp\d+ \? ", main)) == ["v13", "v14"], main
+
+
+# Stage 1 of issue #987: s_nop and the waits whose counters are already satisfied may sit inside a region. In
+# the prologue both counters are drained before the body, so every form below resolves nothing there.
+REGION_WAIT_FORMS = ("s_nop 0", "s_nop 0x7", "s_waitcnt vmcnt(0)", "s_waitcnt lgkmcnt(0)",
+                     "s_waitcnt vmcnt(0) lgkmcnt(0)", "s_waitcnt 0", "s_waitcnt expcnt(0)",
+                     "s_waitcnt_vmcnt null, 0x0", "s_waitcnt_lgkmcnt null, 0x0", "s_waitcnt_expcnt null, 0x0",
+                     "s_waitcnt_vscnt null, 0x0")
+REGION_WAIT_OPENERS = {
+    "cmpx": ([CMPX_SAVE, CMPX_COMPARE], CMPX_MOV_RESTORE),
+    "saveexec": (["v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc"], CMPX_OR_RESTORE),
+}
+
+
+def region_wait_program(forms, opener="cmpx", skip=False):
+    """The masked region (v13 = s45, v14 = s46 where sample.x < s44) with forms before, between and after the
+    two writes. With skip, an s_cbranch_execz after the opener targets the restore, as (offset, text) pairs."""
+    save, restore = REGION_WAIT_OPENERS[opener]
+    body = [*forms, "v_mov_b32_e32 v13, s45", *forms, "v_mov_b32_e32 v14, s46", *forms]
+    program = uncompressed_export([*save, *body, restore])
+    if not skip:
+        return program
+    branch = program.index(save[-1]) + 1
+    program.insert(branch, "s_cbranch_execz 0")
+    pairs = offset_pairs(program)
+    target = program.index(restore)
+    program[branch] = f"s_cbranch_execz {(pairs[target][0] - pairs[branch][0] - 4) // 4}"
+    return offset_pairs(program)
+
+
+def region_wait_skip_asm(forms, opener):
+    """region_wait_program with the skip as assembler text: the branch names its restore label instead."""
+    restore = REGION_WAIT_OPENERS[opener][1]
+    program = [line for _, line in region_wait_program(forms, opener, skip=True)]
+    branch = next(i for i, line in enumerate(program) if line.startswith("s_cbranch_execz"))
+    program[branch] = "s_cbranch_execz .Lwait_restore"
+    program.insert(program.index(restore), ".Lwait_restore:")
+    return program
+
+
+def region_wait_early(slot, body, opener):
+    """A region opened while a load is outstanding: right after the prologue's s_buffer_load_dwordx4 ("lgkm+vm":
+    the buffer load and the sample) or after its lgkmcnt(0) wait ("vm": the sample only). The region decides on
+    v21 = 1.0, so it reads no register an outstanding load writes."""
+    program = uncompressed_export([])
+    load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc")
+    if opener == "cmpx":
+        region = [CMPX_SAVE, "v_cmpx_gt_f32_e32 0.5, v21", body, "v_mov_b32_e32 v20, 1.0", CMPX_MOV_RESTORE]
+    else:
+        region = ["v_cmp_lt_f32_e64 vcc_lo, v21, 0.5", "s_and_saveexec_b64 s[60:61], vcc", body,
+                  "v_mov_b32_e32 v20, 1.0", CMPX_OR_RESTORE]
+    at = load + (1 if slot == "lgkm+vm" else 2)
+    program[at:at] = ["v_mov_b32_e32 v21, 1.0", *region]
+    return program
+
+
+def lowered_shape(source):
+    """Lowered HLSL with the instruction-numbered temporaries renamed in order of first use, so programs that
+    differ only by instructions that lower to nothing compare equal."""
+    names = {}
+    return re.sub(r"\b(alu|cmp)\d+", lambda m: names.setdefault(m[0], f"{m[1]}#{len(names)}"), source)
+
+
+def check_region_wait_controls():
+    """Stage 1 of #987: admitted no-ops lower to nothing under both openers, with and without the skip, and a
+    wait that would resolve outstanding work, or whose counter is not tracked, stays refused."""
+    for opener in REGION_WAIT_OPENERS:
+        for skip in (False, True):
+            reference = lowered_shape(translate(region_wait_program((), opener, skip)))
+            for forms in (*((form,) for form in REGION_WAIT_FORMS), REGION_WAIT_FORMS):
+                lowered = lowered_shape(translate(region_wait_program(forms, opener, skip)))
+                assert lowered == reference, (opener, skip, forms)
+    # Per counter: with the buffer load and the sample outstanding, and with the sample only.
+    refused = {
+        "lgkm+vm": {"s_waitcnt lgkmcnt(0)": "lgkm", "s_waitcnt lgkmcnt(1)": "lgkm", "s_waitcnt vmcnt(0)": "vm",
+                    "s_waitcnt vmcnt(3)": "vm", "s_waitcnt 0": "lgkm/vm", "s_waitcnt vmcnt(0) lgkmcnt(0)": "lgkm/vm",
+                    "s_waitcnt_lgkmcnt null, 0x0": "lgkm", "s_waitcnt_vmcnt null, 0x0": "vm"},
+        "vm": {"s_waitcnt vmcnt(0)": "vm", "s_waitcnt vmcnt(3)": "vm", "s_waitcnt 0": "vm",
+               "s_waitcnt vmcnt(0) lgkmcnt(0)": "vm", "s_waitcnt_vmcnt null, 0x0": "vm"},
+    }
+    admitted = {
+        "lgkm+vm": ("s_nop 0", "s_waitcnt expcnt(0)", "s_waitcnt_expcnt null, 0x0", "s_waitcnt_vscnt null, 0x0"),
+        "vm": ("s_nop 0", "s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(1)", "s_waitcnt_lgkmcnt null, 0x0",
+               "s_waitcnt expcnt(0)", "s_waitcnt_vscnt null, 0x0"),
+    }
+    for opener in REGION_WAIT_OPENERS:
+        for slot in refused:
+            for body, busy in refused[slot].items():
+                expect_value_error(translate, region_wait_early(slot, body, opener),
+                                   f"Wait would resolve outstanding {busy} work in a masked region: {body}")
+            for body in admitted[slot]:
+                translate(region_wait_early(slot, body, opener))
+    # The store counter is not tracked: after a scratch store, vscnt stays refused inside a region.
+    store = ["s_mov_b32 s48, 0", "v_mov_b32_e32 v10, s44", "scratch_store_dword off, v10, s48 offset:16"]
+    for opener, (save, restore) in REGION_WAIT_OPENERS.items():
+        translate(uncompressed_export([*store, *save, "v_mov_b32_e32 v13, s45", restore]))
+        expect_value_error(translate, uncompressed_export(
+            [*store, *save, "s_waitcnt_vscnt null, 0x0", "v_mov_b32_e32 v13, s45", restore]),
+            "Store counter state is unknown after a scratch store in a masked region")
+    # Unmodelled operands and other scalar forms stay refused, and the skip must still follow the opener directly.
+    for opener in REGION_WAIT_OPENERS:
+        for body, message in (("s_waitcnt_vmcnt s5, 0x0", "Unsupported s_waitcnt_vmcnt SGPR operand"),
+                              ("s_waitcnt_lgkmcnt s5, 0x0", "Unsupported s_waitcnt_lgkmcnt SGPR operand"),
+                              ("s_waitcnt_expcnt s5, 0x0", "Unsupported s_waitcnt_expcnt SGPR operand"),
+                              ("s_waitcnt vmcnt(64)", "VM wait count exceeds the gfx10 six-bit field"),
+                              ("s_waitcnt_depctr 0xfffe", "Instruction cannot run in a masked region"),
+                              ("s_inst_prefetch 0x3", "Instruction cannot run in a masked region"),
+                              ("s_clause 0x1", "Instruction cannot run in a masked region")):
+            expect_value_error(translate, region_wait_program((body,), opener), message)
+        skipped = [line for _, line in region_wait_program((), opener, skip=True)]
+        branch = next(i for i, line in enumerate(skipped) if line.startswith("s_cbranch_execz"))
+        skipped.insert(branch, "s_nop 0")
+        expect_value_error(translate, offset_pairs(skipped), "Instruction cannot run in a masked region: s_cbranch_execz")
+
+
+def check_region_wait_draw(directory, compiler, renderer, backend):
+    """Draw stage 1 of #987: every admitted no-op in both openers, with and without the skip (issue #987)."""
+    source = directory / "region-waits.hlsl"
+    shader = directory / "region-waits.cso"
+    constants = bytearray(256)
+    for opener in REGION_WAIT_OPENERS:
+        for skip in (False, True):
+            label = f"{opener}-{'skip' if skip else 'plain'}"
+            source.write_text(translate(region_wait_program(REGION_WAIT_FORMS, opener, skip)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            cases = []
+            # Mixed (0.5), full (10) and empty (-1) masks.
+            for threshold in (0.5, 10.0, -1.0):
+                struct.pack_into("<4f", constants, 12, threshold, 0.25, 0.75, 0.0)
+                case = directory / f"region-waits-{label}-{len(cases)}.case"
+                write_case(case, constants, masked_pixels(threshold, (0.25, 0.75), False))
+                cases.append((case, "pass"))
+            # Wrong reference: the writes applied to every lane, as if the region ignored the mask.
+            struct.pack_into("<4f", constants, 12, 0.5, 0.25, 0.75, 0.0)
+            case = directory / f"region-waits-{label}-unmasked.case"
+            write_case(case, constants, masked_pixels(10.0, (0.25, 0.75), False))
+            cases.append((case, "mismatch"))
+            try:
+                run_pixel_batch(renderer, backend, shader, cases)
+            except AssertionError as error:
+                error.add_note(f"Region wait draw on {backend}: {label}")
+                raise
+    return 0
 
 
 def with_scalar_constant_reads() -> list[str]:
@@ -2958,6 +3101,462 @@ def check_vop3p_draw(directory, compiler, renderer, backend):
                                capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
+
+
+# VOP2 packed binary16 fused multiply-accumulate (v_pk_fmac_f16 / v_pk_fmac_f16_e32):
+# finite preserve/RNE profile with statically proven finite operands and results.
+# Exercises the fused binary16 precision discriminator (0x3e00 * 0x3956 + 0x0001 -> 0x3c01 direct
+# vs 0x3c00 through intermediate binary32), an independent denormal-preserve lane (subnormal inputs
+# and subnormal outputs), exact binary16 halfway ties, VGPR/SGPR/32-bit literal/inline-f16 src0,
+# chained accumulation, and destination aliasing (dst == src1, dst == src0, dst == src0 == src1).
+PK_FMAC_DENORM_MODE = "preserve"
+PK_FMAC_PROGRAMS = ("precision", "alias_chain")
+PK_FMAC_BODIES = {
+    "precision": [
+        # channel 0: low half is the exact fused binary16 discriminator (0x3e00 * 0x3956 + 0x0001 = 16785409/16777216
+        # -> 0x3c01 single-rounded binary16 RNE, 0x3c00 through intermediate binary32); high half is exact (-1.0).
+        "v_mov_b32_e32 v16, 0x40003e00",
+        "v_mov_b32_e32 v17, 0xbc003956",
+        "v_mov_b32_e32 v12, 0x3c000001",
+        "v_pk_fmac_f16 v12, v16, v17",
+        # channel 1: dedicated denormal-preserve lane (SGPR src0, _e32 spelling):
+        # low half: 0x0001 * 0x3c00 + 0x0001 = 0x0002 (preserve) vs 0x0000 (flush-in or flush-out);
+        # high half: 0x0400 * 0x3800 + 0x0000 = 0x0200 (normal inputs -> subnormal output; preserve 0x0200 vs flush-out 0x0000).
+        "s_mov_b32 s60, 0x04000001",
+        "v_mov_b32_e32 v18, 0x38003c00",
+        "v_mov_b32_e32 v13, 1",
+        "v_pk_fmac_f16_e32 v13, s60, v18",
+        # channel 2: exact binary16 halfway ties (32-bit hex literal src0):
+        # low half: (1 + 2^-10) * 1 + 2^-11 -> 0x3c02 (tie up to even); high half: 1 * 1 + 2^-11 -> 0x3c00 (tie down to even).
+        "v_mov_b32_e32 v19, 0x3c003c01",
+        "v_mov_b32_e32 v14, 0x10001000",
+        "v_pk_fmac_f16 v14, 0x3c003c00, v19",
+        # channel 3: in-place aliasing (dst == src1) with inline f16 0.5 (zero-extended high half):
+        # low half: 0.5 * 1.0 + 1.0 = 1.5 (0x3e00); high half: 0.0 * (-2.0) + (-2.0) = -2.0 (0xc000).
+        "v_mov_b32_e32 v15, 0xc0003c00",
+        "v_pk_fmac_f16 v15, 0.5, v15",
+    ],
+    "alias_chain": [
+        # channel 0: chained accumulation across mixed signs and distinct halves (bare + _e32).
+        "v_mov_b32_e32 v16, 0x40003c00",
+        "v_mov_b32_e32 v17, 0xbc003800",
+        "v_mov_b32_e32 v18, 0x34004200",
+        "v_mov_b32_e32 v12, 0xc0003e00",
+        "v_pk_fmac_f16 v12, v16, v17",
+        "v_pk_fmac_f16_e32 v12, v18, v17",
+        # channel 1: src0 aliasing dst (dst == src0).
+        "v_mov_b32_e32 v21, 0xb8004000",
+        "v_mov_b32_e32 v13, 0x42003e00",
+        "v_pk_fmac_f16 v13, v13, v21",
+        # channel 2: triple aliasing (dst == src0 == src1).
+        "v_mov_b32_e32 v14, 0xc0003e00",
+        "v_pk_fmac_f16 v14, v14, v14",
+        # channel 3: low half subnormal-to-normal carry (0x0001 * 2.0 + 0x03ff = 0x0401; preserve 0x0401 vs flush-in 0x0000);
+        # high half is the fused binary16 discriminator (0x3e00 * 0x3956 + 0x0001 -> 0x3c01 direct vs 0x3c00 via f32).
+        "v_mov_b32_e32 v19, 0x3e000001",
+        "v_mov_b32_e32 v20, 0x39564000",
+        "v_mov_b32_e32 v15, 0x000103ff",
+        "v_pk_fmac_f16 v15, v19, v20",
+    ],
+}
+
+
+def pk_fmac_program(kind="precision"):
+    return uncompressed_export(PK_FMAC_BODIES[kind])
+
+
+def pk_fmac_lane_reference(a, b, c, *, denorm=PK_FMAC_DENORM_MODE):
+    """Exact binary16 fused multiply-accumulate (a * b + c) using fractions.Fraction, rounded once to binary16 RNE.
+
+    Independent of pixel_aot and Python struct float/half conversions. Returns None for non-finite inputs or overflow.
+    When denorm == "ftz", subnormal inputs and subnormal results are flushed to signed zero.
+    """
+    def decode(bits):
+        bits &= 0xffff
+        sign = -1 if bits & 0x8000 else 1
+        exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+        if exponent == 0x1f:
+            return None
+        if exponent == 0:
+            if denorm == "ftz":
+                return Fraction(0), bool(bits & 0x8000)
+            return sign * Fraction(mantissa, 1 << 24), bool(bits & 0x8000)
+        return sign * Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25), bool(bits & 0x8000)
+
+    da, db, dc = decode(a), decode(b), decode(c)
+    if da is None or db is None or dc is None:
+        return None
+    (va, sa), (vb, sb), (vc, sc) = da, db, dc
+    exact = va * vb + vc
+    if exact == 0:
+        if (va == 0 or vb == 0) and vc == 0:
+            return 0x8000 if ((sa ^ sb) and sc) else 0x0000
+        return 0x0000
+    sign = 0x8000 if exact < 0 else 0
+    magnitude = abs(exact)
+    if magnitude >= 65520:
+        return None
+    if denorm == "ftz" and magnitude < Fraction(1, 1 << 14):
+        return sign
+    exponent = max(magnitude.numerator.bit_length() - magnitude.denominator.bit_length(), -14)
+    while magnitude < Fraction(2) ** exponent and exponent > -14:
+        exponent -= 1
+    while magnitude >= Fraction(2) ** (exponent + 1):
+        exponent += 1
+    scaled = magnitude / Fraction(2) ** (exponent - 10)
+    count = scaled.numerator // scaled.denominator
+    remainder = scaled - count
+    if remainder > Fraction(1, 2) or (remainder == Fraction(1, 2) and (count & 1)):
+        count += 1
+    if count >= 0x800:
+        count, exponent = 0x400, exponent + 1
+    if count < 0x400:
+        return sign if denorm == "ftz" else (sign | count)
+    return sign | ((exponent + 15) << 10) | (count - 0x400)
+
+
+def pk_fmac_lane_f32_reference(a, b, c):
+    """Reference for the buggy double-rounded path: exact a * b + c rounded to binary32 RNE, then to binary16 RNE."""
+    def decode(bits):
+        bits &= 0xffff
+        sign = -1 if bits & 0x8000 else 1
+        exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+        if exponent == 0:
+            return sign * Fraction(mantissa, 1 << 24)
+        return sign * Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25)
+
+    exact = decode(a) * decode(b) + decode(c)
+    if exact == 0:
+        return pk_fmac_lane_reference(a, b, c)
+    sign = 0x8000 if exact < 0 else 0
+    magnitude = abs(exact)
+    # Round magnitude to binary32 RNE first (24-bit significand; every finite f16 product/sum is a binary32 normal).
+    exp32 = magnitude.numerator.bit_length() - magnitude.denominator.bit_length()
+    while magnitude < Fraction(2) ** exp32:
+        exp32 -= 1
+    while magnitude >= Fraction(2) ** (exp32 + 1):
+        exp32 += 1
+    scaled32 = magnitude / Fraction(2) ** (exp32 - 23)
+    count32 = scaled32.numerator // scaled32.denominator
+    rem32 = scaled32 - count32
+    if rem32 > Fraction(1, 2) or (rem32 == Fraction(1, 2) and (count32 & 1)):
+        count32 += 1
+    if count32 >= (1 << 24):
+        count32, exp32 = 1 << 23, exp32 + 1
+    mag_f32 = Fraction(count32) * Fraction(2) ** (exp32 - 23)
+    if mag_f32 >= 65520:
+        return None
+    exponent = max(exp32, -14)
+    scaled16 = mag_f32 / Fraction(2) ** (exponent - 10)
+    count16 = scaled16.numerator // scaled16.denominator
+    rem16 = scaled16 - count16
+    if rem16 > Fraction(1, 2) or (rem16 == Fraction(1, 2) and (count16 & 1)):
+        count16 += 1
+    if count16 >= 0x800:
+        count16, exponent = 0x400, exponent + 1
+    if count16 < 0x400:
+        return sign | count16
+    return sign | ((exponent + 15) << 10) | (count16 - 0x400)
+
+
+def pk_fmac_reference(kind="precision", *, denorm=PK_FMAC_DENORM_MODE):
+    def step(src0, src1, acc):
+        lo = pk_fmac_lane_reference(src0 & 0xffff, src1 & 0xffff, acc & 0xffff, denorm=denorm)
+        hi = pk_fmac_lane_reference((src0 >> 16) & 0xffff, (src1 >> 16) & 0xffff, (acc >> 16) & 0xffff, denorm=denorm)
+        assert lo is not None and hi is not None, (hex(src0), hex(src1), hex(acc))
+        return lo | (hi << 16)
+
+    if kind == "precision":
+        v12 = step(0x40003e00, 0xbc003956, 0x3c000001)
+        v13 = step(0x04000001, 0x38003c00, 0x00000001)
+        v14 = step(0x3c003c00, 0x3c003c01, 0x10001000)
+        v15 = step(0x00003800, 0xc0003c00, 0xc0003c00)
+        return (v12, v13, v14, v15)
+    if kind == "alias_chain":
+        v12 = step(0x40003c00, 0xbc003800, 0xc0003e00)
+        v12 = step(0x34004200, 0xbc003800, v12)
+        v13 = step(0x42003e00, 0xb8004000, 0x42003e00)
+        v14 = step(0xc0003e00, 0xc0003e00, 0xc0003e00)
+        v15 = step(0x3e000001, 0x39564000, 0x000103ff)
+        return (v12, v13, v14, v15)
+    raise ValueError(f"Unknown pk_fmac fixture kind: {kind}")
+
+
+def check_pk_fmac_controls():
+    """VOP2 v_pk_fmac_f16: exact fused reference, denormal profile, lowering structure, and static refusals."""
+    assert PK_FMAC_DENORM_MODE == pixel_aot.HALF_DENORM_PRESERVE
+    # Exact discriminator from #990/#1004: 0x3e00 * 0x3956 + 0x0001 = 16785409/16777216.
+    assert Fraction(3, 2) * Fraction(683, 1024) + Fraction(1, 1 << 24) == Fraction(16785409, 16777216)
+    assert pk_fmac_lane_reference(0x3e00, 0x3956, 0x0001) == 0x3c01
+    assert pixel_aot.f16_pk_fmac_lane_result(0x3e00, 0x3956, 0x0001) == 0x3c01
+    assert pk_fmac_lane_f32_reference(0x3e00, 0x3956, 0x0001) == 0x3c00
+    # Independent denormal-mode separation (preserve vs flush).
+    assert pk_fmac_lane_reference(0x0001, 0x3c00, 0x0001, denorm="preserve") == 0x0002
+    assert pk_fmac_lane_reference(0x0001, 0x3c00, 0x0001, denorm="ftz") == 0x0000
+    assert pk_fmac_lane_reference(0x0400, 0x3800, 0x0000, denorm="preserve") == 0x0200
+    assert pk_fmac_lane_reference(0x0400, 0x3800, 0x0000, denorm="ftz") == 0x0000
+    assert pk_fmac_lane_reference(0x0001, 0x4000, 0x03ff, denorm="preserve") == 0x0401
+    assert pk_fmac_lane_reference(0x0001, 0x4000, 0x03ff, denorm="ftz") == 0x0000
+    # Pinned expected words for both draw programs.
+    assert pk_fmac_reference("precision") == (0xbc003c01, 0x02000002, 0x3c003c02, 0xc0003e00)
+    assert pk_fmac_reference("alias_chain") == (0xc4404300, 0x3e004480, 0x40004380, 0x3c010401)
+    # Overflow boundary and fused intermediate-product cancellation.
+    assert pk_fmac_lane_reference(0x7bff, 0x3c00, 0x4bff) == 0x7bff
+    assert pk_fmac_lane_reference(0x7bff, 0x3c00, 0x4c00) is None
+    assert pk_fmac_lane_reference(0x7bff, 0x4000, 0xfbff) == 0x7bff
+    assert pixel_aot.f16_pk_fmac_lane_result(0x7bff, 0x4000, 0xfbff) == 0x7bff
+    # Signed-zero rules in the exact reference match translator reference.
+    for triple, expected in (
+        ((0x8000, 0x3c00, 0x8000), 0x8000),
+        ((0x0000, 0x3c00, 0x8000), 0x0000),
+        ((0x3c00, 0xbc00, 0x3c00), 0x0000),
+        ((0x8001, 0x3800, 0x0000), 0x8000),
+    ):
+        assert pk_fmac_lane_reference(*triple) == expected
+        assert pixel_aot.f16_pk_fmac_lane_result(*triple) == expected
+
+    for kind in PK_FMAC_PROGRAMS:
+        program = pk_fmac_program(kind)
+        lowered = translate_f16(program)
+        body = lowered.split("uint4 main", 1)[1]
+        assert "fma16_rne(" in lowered and "fma16_rne(" in body
+        for forbidden in ("pack16_rne(", "mad(", "f32tof16", "f16tof32"):
+            assert forbidden not in body, (kind, forbidden)
+        e32_only = [line.replace("v_pk_fmac_f16 ", "v_pk_fmac_f16_e32 ") for line in program]
+        assert translate_f16(e32_only) == lowered
+        # Unknown or invalid entry denormal state must refuse v_pk_fmac_f16.
+        expect_value_error(translate_int, program, "binary16 denormal mode unknown at entry")
+        # Round-toward-zero mode must refuse v_pk_fmac_f16.
+        expect_value_error(translate_f16, [HALF_RTZ] + program, "under round toward zero: v_pk_fmac_f16")
+    for state in ("flush", "ftz", "", False):
+        expect_value_error(
+            lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True, half_denorm=state),
+            pk_fmac_program("precision"),
+            "Invalid binary16 denormal entry state",
+        )
+
+    # Static refusals with proven finite prefix registers.
+    prefix = [
+        "s_mov_b32 s60, 0x3c003c00",
+        "v_mov_b32_e32 v12, 0x3c003c00",
+        "v_mov_b32_e32 v13, 0x38004000",
+        "v_mov_b32_e32 v14, 0x3e003400",
+        "v_mov_b32_e32 v15, 0xbc003c00",
+    ]
+    for bad, message in (
+        ("v_pk_fmac_f16 v20, v12, v13", "Uninitialized packed accumulator v20 at v_pk_fmac_f16"),
+        ("v_pk_fmac_f16 v12, v13, s60", "v_pk_fmac_f16 src1 must be a VGPR"),
+        ("v_pk_fmac_f16 v12, v13, 0x3c003c00", "v_pk_fmac_f16 src1 must be a VGPR"),
+        ("v_pk_fmac_f16 v12, v13, 1.0", "v_pk_fmac_f16 src1 must be a VGPR"),
+        ("v_pk_fmac_f16 v12, v13, v14 clamp", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v12, v13, v14 op_sel:[0,0]", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v12, v13, v14 op_sel_hi:[1,1]", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v12, v13, v14 neg_lo:[1,0]", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v12, v13, v14 neg_hi:[0,1]", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v12, -v13, v14", "Unsupported binary16 source modifier -v13"),
+        ("v_pk_fmac_f16 v12, |v13|, v14", "Unsupported binary16 source modifier |v13|"),
+        ("v_pk_fmac_f16 v12, v13, v14 mul:2", "Unsupported instruction"),
+        ("v_pk_fmac_f16_e64 v12, v13, v14", "Unsupported instruction"),
+        ("v_pk_fmac_f16_dpp v12, v13, v14 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "Unsupported instruction"),
+        ("v_pk_fmac_f16_sdwa v12, v13, v14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v256, v12, v13", "Register out of range: v256"),
+        ("v_pk_fmac_f16 v12, v256, v13", "Register out of range: v256"),
+        ("v_pk_fmac_f16 v12, s106, v13", "Register out of range: s106"),
+        ("v_pk_fmac_f16 v12, v13, v256", "Register out of range: v256"),
+        ("v_pk_fmac_f16 v12, v20, v13", "Unbound pixel input v20 at v_pk_fmac_f16"),
+        ("v_pk_fmac_f16 v12, s99, v13", "Unbound scalar input s99 at v_pk_fmac_f16"),
+        ("v_pk_fmac_f16 v12, v13, v20", "Unbound pixel input v20 at v_pk_fmac_f16"),
+        ("v_pk_fmac_f16 v12, 1, v13", "Unsupported binary16 integer inline constant 1"),
+        ("v_pk_fmac_f16 v12, -1, v13", "Unsupported binary16 integer inline constant -1"),
+        # Unproven runtime constant-buffer source.
+        ("v_pk_fmac_f16 v12, s44, v13", "binary16 operand lacks a finite proof: s44"),
+        # Non-finite literal in low or high half.
+        ("v_pk_fmac_f16 v12, 0x3c007c00, v13", "binary16 operand is not finite: 0x3c007c00"),
+        ("v_pk_fmac_f16 v12, 0x7c003c00, v13", "binary16 operand is not finite: 0x7c003c00"),
+        ("v_pk_fmac_f16 v12, 0x3c007e00, v13", "binary16 operand is not finite: 0x3c007e00"),
+        ("v_pk_fmac_f16 v12, 0xfc003c00, v13", "binary16 operand is not finite: 0xfc003c00"),
+    ):
+        expect_value_error(translate_f16, uncompressed_export(prefix + [bad]), message)
+
+    # Unproven runtime VGPR copy from constant buffer must be refused.
+    expect_value_error(
+        translate_f16,
+        uncompressed_export(prefix + ["v_mov_b32_e32 v16, s44", "v_pk_fmac_f16 v12, v16, v13"]),
+        "binary16 operand lacks a finite proof: v16",
+    )
+    expect_value_error(
+        translate_f16,
+        uncompressed_export(prefix + ["v_mov_b32_e32 v16, s44", "v_pk_fmac_f16 v16, v12, v13"]),
+        "binary16 operand lacks a finite proof: v16",
+    )
+    # Non-finite SGPR/VGPR operands (in either half) must be refused.
+    for non_finite in ("0x7e003c00", "0x3c007e00", "0x7c003c00", "0x3c00fc00"):
+        expect_value_error(
+            translate_f16,
+            uncompressed_export(prefix + [f"v_mov_b32_e32 v16, {non_finite}", "v_pk_fmac_f16 v12, v16, v13"]),
+            "binary16 operand is not finite: v16",
+        )
+        expect_value_error(
+            translate_f16,
+            uncompressed_export(prefix + [f"v_mov_b32_e32 v16, {non_finite}", "v_pk_fmac_f16 v16, v12, v13"]),
+            "binary16 operand is not finite: v16",
+        )
+    # Overflowing fused results in low or high half (both signs) must be refused; boundary finite and
+    # fused cancellation of an overflowing intermediate product must be accepted.
+    for acc, s0, s1 in (
+        ("0x3c004c00", "0x3c007bff", "0x3c003c00"),  # low half: 65504 + 16 = 65520 -> overflow
+        ("0x4c003c00", "0x7bff3c00", "0x3c003c00"),  # high half: 65504 + 16 = 65520 -> overflow
+        ("0x3c00cc00", "0x3c00fbff", "0x3c003c00"),  # low half: -65504 - 16 = -65520 -> overflow
+        ("0xcc003c00", "0xfbff3c00", "0x3c003c00"),  # high half: -65504 - 16 = -65520 -> overflow
+    ):
+        expect_value_error(
+            translate_f16,
+            uncompressed_export(prefix + [f"v_mov_b32_e32 v16, {acc}", f"v_mov_b32_e32 v17, {s1}",
+                                          f"v_pk_fmac_f16 v16, {s0}, v17"]),
+            "binary16 result overflows: v_pk_fmac_f16",
+        )
+    translate_f16(uncompressed_export(prefix + [
+        "v_mov_b32_e32 v16, 0x4bff4bff",
+        "v_mov_b32_e32 v17, 0x3c003c00",
+        "v_pk_fmac_f16 v16, 0x7bff7bff, v17",
+    ]))
+    translate_f16(uncompressed_export(prefix + [
+        "v_mov_b32_e32 v16, 0xfbfffbff",
+        "v_mov_b32_e32 v17, 0x40004000",
+        "v_pk_fmac_f16 v16, 0x7bff7bff, v17",
+    ]))
+    # A scalar half16 value only defines bits 15:0 and cannot act as a packed accumulator.
+    half16_acc = uncompressed_export([
+        "v_mov_b32_e32 v13, 0x3c003c00",
+        "v_mov_b32_e32 v14, 0x38003800",
+        "v_mov_b32_e32 v15, 0x40004000",
+        "v_add_f16_e32 v12, 1.0, v13",
+        "v_pk_fmac_f16 v12, v13, v14",
+    ])
+    expect_value_error(translate_f16, half16_acc, "binary16 operand lacks a finite proof: v12")
+
+
+def _parse_pixel_mismatch_channels(stderr):
+    """Parse offscreen_check pixel_mismatch channel diagnostics into {channel: (expected_bits, actual_bits)}."""
+    channels = {}
+    for line in stderr.splitlines():
+        if m := re.match(r"channel=(\d+) .*expected_bits=([0-9a-f]{8}) actual_bits=([0-9a-f]{8})", line):
+            channels[int(m.group(1))] = (int(m.group(2), 16), int(m.group(3), 16))
+    return channels
+
+
+def check_pk_fmac_draw(directory, compiler, renderer, backend):
+    """Draw v_pk_fmac_f16 through R32G32B32A32_UINT readback with exact rational reference and targeted mutants."""
+    source = directory / "pk_fmac.hlsl"
+    shader = directory / "pk_fmac.cso"
+    constants = bytes(256)
+
+    programs = {kind: pk_fmac_program(kind) for kind in PK_FMAC_PROGRAMS}
+    lowered = {kind: translate_f16(programs[kind]) for kind in PK_FMAC_PROGRAMS}
+    cases = {}
+    for kind in PK_FMAC_PROGRAMS:
+        expected = pk_fmac_reference(kind)
+        case = directory / f"pk_fmac-{kind}.case"
+        write_case(case, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+        cases[kind] = (case, expected)
+
+    # Exact readback under both binary32 -denorm preserve and -denorm ftz: binary16 subnormals stay preserved
+    # because fma16_rne runs purely in 32-bit integer arithmetic.
+    for kind in PK_FMAC_PROGRAMS:
+        source.write_text(lowered[kind], encoding="ascii")
+        for mode in ("preserve", "ftz"):
+            compile_shader(compiler, source, shader, mode=mode)
+            run_pixel_batch(renderer, backend, shader, [(cases[kind][0], "pass")])
+    print(f"pk_fmac exact readback ({PK_FMAC_DENORM_MODE}): "
+          + ", ".join(f"{kind}={tuple(f'{w:#010x}' for w in cases[kind][1])}" for kind in PK_FMAC_PROGRAMS))
+
+    def run_mutant(kind, mutated_hlsl, label):
+        assert mutated_hlsl != lowered[kind], label
+        source.write_text(mutated_hlsl, encoding="ascii")
+        compile_shader(compiler, source, shader, mode="preserve")
+        wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[kind][0]],
+                               capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection: rc={wrong.returncode}\n{wrong.stderr}")
+        channels = _parse_pixel_mismatch_channels(wrong.stderr)
+        assert len(channels) == 4, (label, wrong.stderr)
+        return channels
+
+    # Mutant 1: intermediate binary32 rounding (widen16 -> mad -> pack16_rne) instead of exact fused binary16 RNE.
+    # Must report pixel_mismatch ONLY at the discriminator lane (0x3c01 -> 0x3c00): channel 0 low half in "precision"
+    # and channel 3 high half in "alias_chain".
+    f32_helper = (
+        "float widen16(uint word);\n"
+        + pixel_aot.SALU_HELPERS["pack16_rne"] + "\n"
+        "uint fma16_rne(uint a_bits, uint b_bits, uint c_bits) {\n"
+        "    precise float s = mad(widen16(a_bits), widen16(b_bits), widen16(c_bits));\n"
+        "    return pack16_rne(s);\n"
+        "}"
+    )
+    for kind, disc_ch, exp_word, act_word in (
+        ("precision", 0, 0xbc003c01, 0xbc003c00),
+        ("alias_chain", 3, 0x3c010401, 0x3c000401),
+    ):
+        assert pixel_aot.SALU_HELPERS["fma16_rne"] in lowered[kind]
+        mutated_f32 = lowered[kind].replace(pixel_aot.SALU_HELPERS["fma16_rne"], f32_helper)
+        channels = run_mutant(kind, mutated_f32, f"intermediate_f32 ({kind})")
+        diff_channels = [ch for ch, (exp, act) in channels.items() if exp != act]
+        assert diff_channels == [disc_ch], (kind, channels)
+        assert channels[disc_ch] == (exp_word, act_word), (kind, channels[disc_ch])
+        print(f"pk_fmac mutant intermediate_f32 ({kind}): channel={disc_ch} "
+              f"expected={exp_word:#010x} actual={act_word:#010x}")
+
+    # Mutant 2: flush binary16 subnormal inputs (DAZ) — must mismatch on the dedicated denormal lane (channel 1 low half
+    # 0x0002 -> 0x0000 while normal-input high half 0x0200 stays intact; channel 3 low half 0x0401 -> 0x0000 in alias_chain).
+    flush_in_precision = lowered["precision"]
+    for v in ("a", "b", "c"):
+        old = f"uint m{v} = ({v} & 0x3ffu) | (e{v}_f != 0u ? 0x400u : 0u);"
+        new = f"uint m{v} = e{v}_f != 0u ? (({v} & 0x3ffu) | 0x400u) : 0u;"
+        assert flush_in_precision.count(old) == 1
+        flush_in_precision = flush_in_precision.replace(old, new)
+    channels = run_mutant("precision", flush_in_precision, "flush_denorm_in")
+    assert channels[1] == (0x02000002, 0x02000000), channels
+    print(f"pk_fmac mutant flush_denorm_in (precision): channel=1 "
+          f"expected={channels[1][0]:#010x} actual={channels[1][1]:#010x}")
+
+    # Mutant 3: flush binary16 subnormal outputs (FTZ) — must mismatch ONLY on channel 1 (0x02000002 -> 0x00000000),
+    # leaving normal-result channels 0, 2, 3 unchanged.
+    flush_out_old = "    if (res_exp == -25) return (res_sign << 15u) | (norm > 0x80000000u ? 1u : 0u);"
+    flush_out_new = "    return res_sign << 15u;"
+    assert lowered["precision"].count(flush_out_old) == 1
+    flush_out_precision = lowered["precision"].replace(flush_out_old, flush_out_new).replace(
+        "    if (mp == 0u) return c;",
+        "    if (mp == 0u) return ec_f == 0u ? (sc << 15u) : c;",
+    )
+    channels = run_mutant("precision", flush_out_precision, "flush_denorm_out")
+    assert [ch for ch, (exp, act) in channels.items() if exp != act] == [1], channels
+    assert channels[1] == (0x02000002, 0x00000000), channels
+    print(f"pk_fmac mutant flush_denorm_out (precision): channel=1 "
+          f"expected={channels[1][0]:#010x} actual={channels[1][1]:#010x}")
+
+    # Mutants 4-7: dropped accumulator, swapped halves, truncated rounding, and ties-away-from-zero.
+    idx_v12 = programs["precision"].index("v_pk_fmac_f16 v12, v16, v17")
+    idx_v13 = programs["precision"].index("v_pk_fmac_f16_e32 v13, s60, v18")
+    dropped_acc = lowered["precision"].replace(
+        f"fma16_rne(pk{idx_v13}_0, pk{idx_v13}_1, pk{idx_v13}_2)",
+        f"fma16_rne(pk{idx_v13}_0, pk{idx_v13}_1, 0u)",
+    )
+    swapped_halves = lowered["precision"].replace(
+        f"pk{idx_v12}_l0 | (pk{idx_v12}_l1 << 16)",
+        f"pk{idx_v12}_l1 | (pk{idx_v12}_l0 << 16)",
+    )
+    rne_line = "if (rem > 0x00100000u || (rem == 0x00100000u && (sig & 1u) != 0u)) sig += 1u;"
+    truncate = lowered["precision"].replace(rne_line, "if (false) sig += 1u;")
+    ties_away = lowered["precision"].replace(rne_line, "if (rem >= 0x00100000u) sig += 1u;")
+    for mutated, expected_ch, label in (
+        (dropped_acc, 1, "dropped accumulator"),
+        (swapped_halves, 0, "swapped halves"),
+        (truncate, 2, "truncated rounding"),
+        (ties_away, 2, "ties away from zero"),
+    ):
+        channels = run_mutant("precision", mutated, label)
+        assert channels[expected_ch][0] != channels[expected_ch][1], (label, channels)
+    return 0
 
 
 # v_cvt_f16_f32 rounds to nearest even and, on GFX10, writes only the low half of the destination. Channels 0
@@ -6534,6 +7133,246 @@ def check_three_way_templates():
                                    {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
                 assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
                                 "med3": sorted((a, b, c))[1]}, (a, b, c)
+
+
+# Quad-local DPP16 and DPP8 binary32-to-binary16 conversion (v_cvt_f16_f32_dpp) under the shared
+# low-16-only destination contract (#732/#881) and explicit half_denorm="preserve" / RNE mode.
+# DPP_F16_CVT_LANES derives per-quad lane IDs {0, 1, 2, 3} from uv.x/uv.y, routes {1, 2, 3, 4}
+# through DPP16 AcrossX negation and DPP8 cyclic rotation with preloaded high-half sentinels,
+# gathers all four lanes under injective base-4 weights (1, 4, 16, 64) via v_cvt_f32_f16_e32,
+# and extracts raw WORD_0 SDWA bit patterns.
+DPP_F16_CVT_LANES = [
+    "v_mov_b32_dpp v18, v8 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_dpp v19, v9 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_dpp v20, v8 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_dpp v21, v9 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_f32_e32 v18, v20, v18",
+    "v_sub_f32_e32 v19, v21, v19",
+    "v_mul_f32_e32 v18, 0x42800000, v18",
+    "v_fma_f32 v20, 0x43000000, v19, v18",
+    "v_add_f32_e32 v21, 1.0, v20",
+    "v_mov_b32_e32 v22, 0x3f400000",
+    "v_cvt_f16_f32_dpp v22, -v21 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v24, 0xdeadbeef",
+    "v_cvt_f16_f32_dpp v24, v21 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_cvt_f32_f16_e32 v23, v22",
+    "v_cvt_f32_f16_e32 v25, v24",
+    *[f"v_mov_b32_dpp v{26 + lane}, v23 quad_perm:[{lane},{lane},{lane},{lane}] row_mask:0xf bank_mask:0xf"
+      for lane in range(4)],
+    *[f"v_mov_b32_dpp v{30 + lane}, v25 quad_perm:[{lane},{lane},{lane},{lane}] row_mask:0xf bank_mask:0xf"
+      for lane in range(4)],
+    "v_fma_f32 v34, 4.0, v27, v26",
+    "v_fma_f32 v34, 0x41800000, v28, v34",
+    "v_fma_f32 v34, 0x42800000, v29, v34",
+    "v_cvt_i32_f32_e32 v12, v34",
+    "v_fma_f32 v35, 4.0, v31, v30",
+    "v_fma_f32 v35, 0x41800000, v32, v35",
+    "v_fma_f32 v35, 0x42800000, v33, v35",
+    "v_cvt_u32_f32_e32 v13, v35",
+    "v_mov_b32_sdwa v36, v22 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    "v_mov_b32_dpp v14, v36 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_sdwa v37, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    "v_mov_b32_dpp v15, v37 quad_perm:[3,3,3,3] row_mask:0xf bank_mask:0xf",
+]
+
+# Raw low-16 bit-exact word readback for v_cvt_f16_f32_dpp across DPP16 (identity, AcrossX + neg,
+# AcrossY + abs) and DPP8 cyclic rotation, with preloaded high-half sentinels in v24 and v25.
+DPP_F16_CVT_WORDS = [
+    "v_mov_b32_e32 v20, s44",
+    "v_mov_b32_e32 v21, s45",
+    "v_mov_b32_e32 v22, s46",
+    "v_mov_b32_e32 v23, s47",
+    "v_mov_b32_e32 v24, 0x3f400000",
+    "v_mov_b32_e32 v25, 0xdeadbeef",
+    "v_cvt_f16_f32_dpp v24, v20 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f16_f32_dpp v25, -v21 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f16_f32_dpp v26, |v22| quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f16_f32_dpp v27, v23 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    "v_mov_b32_sdwa v13, v25 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    "v_mov_b32_sdwa v14, v26 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    "v_mov_b32_sdwa v15, v27 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+]
+
+
+def dpp_f16_narrow16_ref(bits):
+    """Exact IEEE-754 binary32-to-binary16 RNE reference matching tools/pixel_aot.py narrow16()."""
+    sign = (bits >> 16) & 0x8000
+    exponent = (bits >> 23) & 0xff
+    mantissa = bits & 0x7fffff
+    if exponent == 0xff:
+        return sign | 0x7c00 | (0x200 | (mantissa >> 13) if mantissa else 0)
+    if exponent < 102:
+        return sign
+    full = mantissa | 0x800000
+    if exponent < 113:
+        shift = 126 - exponent
+        return sign | ((full + (1 << (shift - 1)) - 1 + ((full >> shift) & 1)) >> shift)
+    if exponent > 142:
+        return sign | 0x7c00
+    rounded = (full + 0xfff + ((full >> 13) & 1)) >> 13
+    return sign | min(((exponent - 113) << 10) + rounded, 0x7c00)
+
+
+def check_dpp_f16_contract_controls():
+    """Positive and negative controls for v_cvt_f16_f32_dpp (mode, low-16-only contract, DPP refusals)."""
+    identity = "quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf"
+    sdwa = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:"
+    # Preload a sentinel into v22 before writing v_cvt_f16_f32_dpp: low-half widening succeeds,
+    # while WORD_1 and whole-word reads/exports must still reject.
+    produced = [
+        "v_mov_b32_e32 v20, s44",
+        "v_mov_b32_e32 v22, 0x3f400000",
+        f"v_cvt_f16_f32_dpp v22, v20 {identity}",
+    ]
+    for good in (
+        "v_cvt_f32_f16_e32 v12, v22",
+        "v_cvt_f32_f16_e64 v12, v22",
+        f"v_cvt_f32_f16_sdwa v12, v22 {sdwa}WORD_0",
+        f"v_mov_b32_sdwa v12, v22 {sdwa}WORD_0",
+    ):
+        translate_f16(uncompressed_export([*produced, good]))
+    for bad, message in (
+        (f"v_mov_b32_sdwa v12, v22 {sdwa}WORD_1", "Reads the undefined high half of a 16-bit result"),
+        (f"v_cvt_f32_f16_sdwa v12, v22 {sdwa}WORD_1", "Reads the undefined high half of a 16-bit result"),
+        (f"v_mov_b32_sdwa v12, v22 {sdwa}BYTE_0", "Reads the undefined high half of a 16-bit result"),
+        ("v_mov_b32_e32 v12, v22", "Expected a numeric register"),
+        ("v_add_f32_e32 v12, v22, v20", "Expected a numeric register"),
+        (f"v_cvt_f16_f32_dpp v23, v22 {identity}", "Expected a numeric VGPR in DPP, got v22"),
+        ("v_add_f16_e32 v23, v22, v22", "binary16 operand lacks a finite proof: v22"),
+    ):
+        expect_value_error(translate_f16, uncompressed_export([*produced, bad]), message)
+    # Direct whole-word export of a v_cvt_f16_f32_dpp destination rejects even with the preloaded sentinel.
+    export = uncompressed_export(produced)
+    export[next(i for i, line in enumerate(export) if line.startswith("exp ")):] = [
+        "exp mrt0 v22, v13, v14, v15 done vm", "s_endpgm"]
+    expect_value_error(translate_f16, export, "Unsupported export")
+    # Explicit entry denormal mode and HW_REG_MODE binary16 rounding controls.
+    valid = uncompressed_export([*produced, f"v_mov_b32_sdwa v12, v22 {sdwa}WORD_0"])
+    expect_value_error(translate_int, valid, "binary16 denormal mode unknown at entry")
+    for state in ("flush", "ftz", "", False):
+        expect_value_error(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                                           half_denorm=state), valid, "Invalid binary16 denormal entry state")
+    expect_value_error(translate_f16, [HALF_RTZ, *valid], "under round toward zero: v_cvt_f16_f32_dpp")
+    assert translate_f16([HALF_RTZ, HALF_RNE, *valid]) == translate_f16(["s_nop 0", "s_nop 0", *valid])
+    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
+                           ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write")):
+        expect_value_error(translate_f16, [write, *valid], message)
+    # DPP encoding refusals and out-of-slice binary16 DPP opcodes (including FMAC and transcendentals).
+    for bad, message in (
+        ("v_cvt_f16_f32_dpp v23, v20 row_shl:1 row_mask:0xf bank_mask:0xf", "Unsupported DPP control row_shl:1"),
+        ("v_cvt_f16_f32_dpp v23, v20 quad_perm:[0,1,2,3] row_mask:0x7 bank_mask:0xf", "Unsupported DPP16 modifier row_mask:0x7"),
+        (f"v_cvt_f16_f32_dpp v23, v20 {identity} bound_ctrl:1", "Unsupported DPP16 modifier bound_ctrl:1"),
+        (f"v_cvt_f16_f32_dpp v23, v20 {identity} fi:1", "Unsupported DPP16 modifier fi:1"),
+        ("v_cvt_f16_f32_dpp v23, v20 dpp8:[4,5,6,7,0,1,2,3]", "Cross-quad DPP8 permutation is unsupported"),
+        ("v_cvt_f16_f32_dpp v23, v20 dpp8:[1,0,3,2,4,5,6,7]", "DPP8 permutation must repeat the same quad selection in both halves"),
+        ("v_cvt_f16_f32_dpp v23, -v20 dpp8:[1,2,3,0,5,6,7,4]", "Source modifiers are not allowed on -v20"),
+        (f"v_cvt_f16_f32_dpp v23, v70 {identity}", "DPP operand v70 is read before it is written"),
+        (f"v_cvt_f16_f32_dpp v256, v20 {identity}", "Invalid f16 DPP operation"),
+        (f"v_fmac_f16_dpp v20, v20, v20 {identity}", "Unsupported instruction"),
+        (f"v_add_f16_dpp v23, v20, v20 {identity}", "Unsupported instruction"),
+        (f"v_sin_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
+        (f"v_cos_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
+        (f"v_floor_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
+    ):
+        expect_value_error(translate_f16, uncompressed_export(["v_mov_b32_e32 v20, s44", bad]), message)
+    # Scheduling: outstanding sample and non-entry EXEC mask must refuse.
+    base = uncompressed_export([])
+    sample = next(i for i, line in enumerate(base) if line.startswith("image_sample"))
+    expect_value_error(translate_f16, base[:sample + 1] + [f"v_cvt_f16_f32_dpp v12, v8 {identity}"] + base[sample + 1:],
+                       "Write overlaps an outstanding sample")
+    expect_value_error(translate_f16, base[:sample + 1] + [f"v_cvt_f16_f32_dpp v24, v12 {identity}"] + base[sample + 1:],
+                       "Sample used before vmcnt wait")
+    masked = base.index("s_wqm_b64 exec, exec") + 1
+    expect_value_error(translate_f16, base[:masked] + [f"v_cvt_f16_f32_dpp v24, v8 {identity}"] + base[masked:],
+                       "Invalid f16 DPP operation")
+
+
+def check_dpp_f16_draw(directory, compiler, renderer, backend):
+    check_dpp_f16_contract_controls()
+    # 1. Lane-routing witness (DPP16 AcrossX + neg, DPP8 cyclic rotation, preloaded sentinels).
+    lanes_program = uncompressed_export(DPP_F16_CVT_LANES)
+    lanes_src = directory / "dpp_f16_lanes.hlsl"
+    lanes_shader = directory / "dpp_f16_lanes.cso"
+    lanes_case = directory / "dpp_f16_lanes.case"
+    lanes_src.write_text(translate_f16(lanes_program), encoding="ascii")
+    compile_shader(compiler, lanes_src, lanes_shader)
+    # ch0: (-2)*1 + (-1)*4 + (-4)*16 + (-3)*64 = -262 (0xfffffefa)
+    # ch1: 2*1 + 3*4 + 4*16 + 1*64 = 142 (0x8e)
+    # ch2: lane 0 of v22 = f16(-2.0) = 0xc000; ch3: lane 3 of v24 = f16(1.0) = 0x3c00
+    lanes_expected = (0xfffffefa, 142, 0xc000, 0x3c00)
+    lanes_case.write_bytes(bytes(256) + struct.pack("<4I", *lanes_expected) * 64 + b"\x01")
+    run_pixel_batch(renderer, backend, lanes_shader, [(lanes_case, "pass")])
+    for old, new in (
+        ("quad_perm:[1,0,3,2]", "quad_perm:[2,3,0,1]"),
+        ("dpp8:[1,2,3,0,5,6,7,4]", "dpp8:[3,0,1,2,7,4,5,6]"),
+        ("v_cvt_f16_f32_dpp v22, -v21", "v_cvt_f16_f32_dpp v22, v21"),
+    ):
+        mutated = [line.replace(old, new) for line in lanes_program]
+        assert mutated != lanes_program, old
+        lanes_src.write_text(translate_f16(mutated), encoding="ascii")
+        compile_shader(compiler, lanes_src, lanes_shader)
+        run_pixel_batch(renderer, backend, lanes_shader, [(lanes_case, "mismatch")])
+
+    # 2. Raw low-16 bit-exact word readback: in-range RNE vs RTZ & ties-to-even discriminators,
+    # binary16 subnormals and underflow ties, max finite / overflow, signed zeros, infinities, qNaN.
+    words_program = uncompressed_export(DPP_F16_CVT_WORDS)
+    words_src = directory / "dpp_f16_words.hlsl"
+    words_shader = directory / "dpp_f16_words.cso"
+    words_hlsl = translate_f16(words_program)
+    words_src.write_text(words_hlsl, encoding="ascii")
+    compile_shader(compiler, words_src, words_shader)
+    input_rows = (
+        # In-range ties: 1+2^-11 -> 0x3c00 (ties-to-even), -(1+3*2^-11) -> 0xbc02 (RNE vs RTZ),
+        # |-(1+2^-11+2^-23)| -> 0x3c01, 1+3*2^-11 (DPP8) -> 0x3c02.
+        (0x3f801000, 0x3f803000, 0xbf801001, 0x3f803000),
+        # Binary16 subnormals & underflow ties: 2^-25 -> 0x0000, -(2^-25+eps) -> 0x8001, |-2^-15| -> 0x0200, 2^-14 -> 0x0400.
+        (0x33000000, 0x33000001, 0xb8000000, 0x38800000),
+        # Max finite 65504 -> 0x7bff, -65520 -> -Inf (0xfc00), |-0.0| -> 0x0000, -0.0 -> 0x8000.
+        (0x477fe000, 0x477ff000, 0x80000000, 0x80000000),
+        # Infinities & quiet NaNs: +Inf -> 0x7c00, -(-Inf) -> 0x7c00, |-qNaN| -> 0x7e01, qNaN -> 0x7e01.
+        (0x7f800000, 0xff800000, 0xffc02000, 0x7fc02000),
+    )
+    cases = []
+    for index, (w0, w1, w2, w3) in enumerate(input_rows):
+        expected = (
+            dpp_f16_narrow16_ref(w0),
+            dpp_f16_narrow16_ref(w1 ^ 0x80000000),
+            dpp_f16_narrow16_ref(w2 & 0x7fffffff),
+            dpp_f16_narrow16_ref(w3),
+        )
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, w0, w1, w2, w3)
+        path = directory / f"dpp_f16_words_{index}.case"
+        path.write_bytes(bytes(constants) + struct.pack("<4I", *expected) * 64 + b"\x01")
+        cases.append((path, "pass"))
+    # Wrong-word control: RTZ output 0x3c01 instead of RNE 0x3c02 on 1 + 3*2^-11 must mismatch.
+    wrong_path = directory / "dpp_f16_words_rtz.case"
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *input_rows[0])
+    wrong_path.write_bytes(bytes(constants) + struct.pack("<4I", 0x3c00, 0xbc02, 0x3c01, 0x3c01) * 64 + b"\x01")
+    run_pixel_batch(renderer, backend, words_shader, [*cases, (wrong_path, "mismatch")])
+    # Program-level modifier mutations and narrow16 rounding mutations (truncate, ties-away) must mismatch.
+    for old, new in (
+        ("v_cvt_f16_f32_dpp v25, -v21", "v_cvt_f16_f32_dpp v25, v21"),
+        ("v_cvt_f16_f32_dpp v26, |v22|", "v_cvt_f16_f32_dpp v26, v22"),
+    ):
+        mutated = [line.replace(old, new) for line in words_program]
+        assert mutated != words_program, old
+        words_src.write_text(translate_f16(mutated), encoding="ascii")
+        compile_shader(compiler, words_src, words_shader)
+        run_pixel_batch(renderer, backend, words_shader, [(cases[0][0], "mismatch")])
+    for name in ("truncate", "ties_away"):
+        mutated_hlsl = words_hlsl
+        for old, new in F16_ARITH_TEXT_EDITS[name]:
+            assert old in mutated_hlsl, (name, old)
+            mutated_hlsl = mutated_hlsl.replace(old, new, 1)
+        words_src.write_text(mutated_hlsl, encoding="ascii")
+        compile_shader(compiler, words_src, words_shader)
+        run_pixel_batch(renderer, backend, words_shader, [(cases[0][0], "mismatch")])
+    return 0
+
+
 # Quad-local DPP16 and DPP8 integer/bitwise/shift/bit-scan fixture covering 23 VOP1/VOP2 DPP forms.
 # Derives integer quad lane ID {0, 1, 2, 3} from interpolated uv.x/uv.y (v8/v9), verifies quad
 # swizzles across lanes, folds all 23 ops into a 32-bit accumulator, and exports all 4 bytes as
@@ -8547,8 +9386,9 @@ def check_masked_controls():
     assert "_v13 = (cmp" in double and "sample16.y" in double.split("_v13")[1][:80]
     # A bare skip line carries no offset; only pair input can place it.
     must_reject(translate, [line for _, line in masked_skip()])
+    # Waits whose counters are drained are admitted since #987; check_region_wait_controls covers which stay refused.
     for extra in (
-            "s_mov_b32 s62, 1", "s_waitcnt lgkmcnt(0)", "s_and_saveexec_b64 s[58:59], vcc",
+            "s_mov_b32 s62, 1", "s_inst_prefetch 0x3", "s_and_saveexec_b64 s[58:59], vcc",
             "s_buffer_load_dword s70, s[44:47], 0x10", "exp mrt0 v12, v13, v14, v15 done vm",
             "image_sample v[16:19], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
             "v_cmp_eq_f32_e64 vcc_lo, v12, v13", "v_interp_p1_f32_e32 v17, v0, attr0.x",
@@ -8748,10 +9588,11 @@ def check_cmpx_controls():
     # A pending scalar load may not overlap the saved pair.
     must_reject(translate, uncompressed_export(["s_load_dwordx4 s[60:63], s[20:21], 0x40",
                                                 CMPX_SAVE, CMPX_COMPARE, CMPX_MOV_RESTORE]))
-    # Overwriting the saved pair, nesting, chaining and unsupported bodies are refused inside the region.
+    # Overwriting the saved pair, nesting, chaining and unsupported bodies are refused inside the region. Drained
+    # waits are admitted since #987; check_region_wait_controls covers the waits that stay refused.
     for extra in ("s_mov_b32 s60, 0", "s_mov_b64 s[60:61], exec", CMPX_SAVE.replace("60:61", "58:59"),
                   "v_cmpx_lt_f32_e32 s44, v13", "s_and_saveexec_b64 s[58:59], vcc",
-                  "s_waitcnt lgkmcnt(0)", "s_buffer_load_dword s70, s[44:47], 0x10",
+                  "s_inst_prefetch 0x3", "s_buffer_load_dword s70, s[44:47], 0x10",
                   "exp mrt0 v12, v13, v14, v15 done vm",
                   "image_sample v[16:19], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
                   "v_cmp_eq_f32_e64 vcc_lo, v12, v13", "v_readfirstlane_b32 s62, v12",
@@ -10278,11 +11119,14 @@ def check_f16_cvt_int_controls():
 
 
 def check_controls(directory):
+    check_dpp_f16_contract_controls()
     check_smem_pointer_controls()
     check_masked_controls()
     check_cmpx_controls()
     check_shift64_controls()
     check_region_body_controls()
+    check_region_wait_controls()
+    check_pk_fmac_controls()
     check_title_load_controls()
     check_ds_swizzle_controls()
     check_ds_nop_controls()
@@ -12148,6 +12992,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(MOVK_BODY), translate))
     fixtures.append((with_constants(HALF_BODY), translate))
     fixtures.append((with_constants(VOP3P_BODY), translate))
+    fixtures.extend((pk_fmac_program(kind), translate_f16) for kind in PK_FMAC_PROGRAMS)
     fixtures.append((with_constants(FMA_MIX_BODY), translate))
     fixtures.append((with_constants(NARROW_BODY), translate))
     fixtures.append((mode_program(), translate))
@@ -12168,6 +13013,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
+    fixtures.append((uncompressed_export(DPP_F16_CVT_LANES), translate_f16))
+    fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
     fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
     fixtures.append((with_constants(DPP_EXTRA_BODY), translate, "gfx1013"))
@@ -12222,6 +13069,10 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((program, translate_int) for op in SHIFT64_OPS for program in shift64_programs(op).values())
     fixtures.extend((region_body_program(body, approximate), translate)
                     for _, body, _, approximate in REGION_BODY_FORMS)
+    for opener in REGION_WAIT_OPENERS:
+        fixtures.append((region_wait_program(REGION_WAIT_FORMS, opener), translate))
+        fixtures.append((region_wait_skip_asm(REGION_WAIT_FORMS, opener), translate, "gfx1013", "",
+                         region_wait_program(REGION_WAIT_FORMS, opener, skip=True)))
     fixtures.append((uncompressed_export(flat_scratch_ops_group1()), translate_int))
     fixtures.append((uncompressed_export(flat_scratch_ops_group2()), translate_int))
     for index, entry in enumerate(fixtures):
@@ -16882,9 +17733,9 @@ def main():
                     "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-region-body", "draw-div-fmas", "draw-cmp64", "draw-shift64",
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-region-body", "draw-region-waits", "draw-div-fmas", "draw-cmp64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers",
-                    "draw-dpp-extra"):
+                    "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-extra": check_dpp_extra_draws,
@@ -16917,11 +17768,14 @@ def main():
                         "draw-exec-regions": check_masked_draw,
                         "draw-cmpx-regions": check_cmpx_draw,
                         "draw-region-body": check_region_body_draw,
+                        "draw-region-waits": check_region_wait_draw,
                         "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw,
                         "draw-shift64": check_shift64_draw,
+                        "draw-pk-fmac": check_pk_fmac_draw,
                         "draw-flat-scratch": check_flat_scratch_draws,
-                        "draw-smem-pointers": check_smem_pointer_draw}[mode]
+                        "draw-smem-pointers": check_smem_pointer_draw,
+                        "draw-dpp-f16": check_dpp_f16_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
