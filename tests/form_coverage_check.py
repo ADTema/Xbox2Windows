@@ -323,6 +323,8 @@ def check_shader_records():
         ("VOP2", "v_mul_hi_u32_u24"), ("VOP3", "v_mul_hi_u32_u24_e64"),
     }
     pack_int16_forms = {("VOP3", "v_cvt_pk_u16_u32"), ("VOP3", "v_cvt_pk_i16_i32")}
+    # gfx10 encodes the binary16 pack as VOP3 only, under its plain name.
+    pack_b32_forms = {("VOP3", "v_pack_b32_f16")}
     sop2_lshl_add_forms = {
         ("SOP2", "s_lshl1_add_u32"), ("SOP2", "s_lshl2_add_u32"),
         ("SOP2", "s_lshl3_add_u32"), ("SOP2", "s_lshl4_add_u32"),
@@ -359,6 +361,7 @@ def check_shader_records():
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)
         assert pack_int16_forms <= covered, (name, pack_int16_forms - covered)
+        assert pack_b32_forms <= covered, (name, pack_b32_forms - covered)
         # v_mac_f32 is in the gfx1013 list only.
         approx_e64_forms = {("VOP3", "v_exp_f32_e64"), ("VOP3", "v_log_f32_e64")}
         approx_e64_forms |= {("VOP3", "v_mac_f32_e64")} if name == "gfx1013.tsv" else set()
@@ -478,6 +481,30 @@ def check_plain_bitscan_forms():
         assert not untouched & covered, name
     pixel.ACCEPTED.clear()
 
+
+
+def check_pack_b32_forms():
+    """v_pack_b32_f16 counts as covered VOP3 in both references once the lowering accepts its fixture.
+    Without the accepted spelling the form is not covered; the _e32 spelling gfx10 lacks adds nothing."""
+    import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        assert "v_pack_b32_f16" not in pixel.ACCEPTED
+        pixel.translate_int(pixel.uncompressed_export(pixel.pack_b32_group()))
+        assert "v_pack_b32_f16" in pixel.ACCEPTED
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert ("VOP3", "v_pack_b32_f16") in reference, name
+            assert ("VOP3", "v_pack_b32_f16") in fc.gfx_forms(pixel.ACCEPTED, reference), name
+            # Negative control: without the accepted spelling the form is not covered.
+            assert ("VOP3", "v_pack_b32_f16") not in fc.gfx_forms(
+                pixel.ACCEPTED - {"v_pack_b32_f16"}, reference), name
+        # The suffixed control spelling is a different word, so it adds no reference form.
+        assert fc.gfx_forms({"v_pack_b32_f16_e64"}, fc.load_reference("gfx1013.tsv")) == set()
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
 
 
 def check_int16_vop3_forms():
@@ -1123,6 +1150,7 @@ if __name__ == "__main__":
     check_vector_bit_forms()
     check_scalar_brev()
     check_plain_bitscan_forms()
+    check_pack_b32_forms()
     check_int16_vop3_forms()
     check_int16_ternary_forms()
     check_f16_arith_forms()
