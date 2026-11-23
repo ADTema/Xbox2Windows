@@ -11080,7 +11080,6 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
         raise AssertionError("Changing the sopk multiply escaped detection")
 
     check_sopk_cmpk_cmovk_draw(directory, compiler, renderer, backend)
-    check_f16_compare_draws(directory, compiler, renderer, backend)
 
     source.write_text(translate(rounding()), encoding="ascii")
     compile_shader(compiler, source, shader)
@@ -11143,19 +11142,26 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     case = directory / "signed-export.case"
     write_case(case, constants, tuple(map(half_rtz, values)))
     subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
-    check_class_draw(directory, compiler, renderer, backend)
-    check_predicate_draws(directory, compiler, renderer, backend)
-    check_int_predicate_draws(directory, compiler, renderer, backend)
-    check_unsigned_less_than_draws(directory, compiler, renderer, backend)
     check_sext_draw(directory, compiler, renderer, backend)
     check_scalar_pack_draw(directory, compiler, renderer, backend)
     check_scalar_bit_count_draw(directory, compiler, renderer, backend)
     check_scalar_carry_chain_draw(directory, compiler, renderer, backend)
     check_scalar_leading_bit_draw(directory, compiler, renderer, backend)
     check_scalar_mul_hi_draw(directory, compiler, renderer, backend)
+    check_literal_fma_draw(directory, compiler, renderer, backend)
+    return 0
+
+
+def check_comparison_draws(directory, compiler, renderer, backend):
+    """The comparison and class draws, split from draw-predicate-rounding so each CTest entry stays under its
+    timeout on adapters where every renderer launch pays for device creation with the debug layer (issue #448)."""
+    check_f16_compare_draws(directory, compiler, renderer, backend)
+    check_class_draw(directory, compiler, renderer, backend)
+    check_predicate_draws(directory, compiler, renderer, backend)
+    check_int_predicate_draws(directory, compiler, renderer, backend)
+    check_unsigned_less_than_draws(directory, compiler, renderer, backend)
     check_int16_predicate_draws(directory, compiler, renderer, backend)
     check_sdwa_predicate_draws(directory, compiler, renderer, backend)
-    check_literal_fma_draw(directory, compiler, renderer, backend)
     return 0
 
 
@@ -11594,6 +11600,13 @@ def main():
         if mode == "draw-frexp-exp":
             try:
                 return check_frexp_exp_draws(directory, *args)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
+                    return 77
+                raise
+        if mode == "draw-comparisons":
+            try:
+                return check_comparison_draws(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
                     return 77
