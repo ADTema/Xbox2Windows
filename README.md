@@ -217,4 +217,4 @@ Windows Authenticode verification on the local copy reported `HashMismatch` for 
 
 ## License
 
-Original project code and documentation use the [MIT License](LICENSE). Third-party games, assets, SDKs and trademarks belong to their respective owners. Xbox2Windows is an independent community project, unaffiliated with Rockstar Games, Take-Two, Microsoft or AMD.
+Original project code and documentation use the [MIT License](LICENSE). Third-party games, assets, SDKs and trademarks belong to their respective owners. Xbox2Windows is an independent community project with no affiliation with the companies whose products it discusses.
