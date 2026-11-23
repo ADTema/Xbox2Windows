@@ -988,6 +988,8 @@ SCALAR = {
     "xnor_b32": (2, "~({0} ^ {1})", NONZERO),
     # SCC is not written. Both counts are masked to five bits, so every shift stays below 32.
     "bfm_b32": (2, "((1u << ({0} & 31u)) - 1u) << ({1} & 31u)", None),
+    # Like s_brev_b64, SCC is not written; reversebits reverses all 32 bits.
+    "brev_b32": (1, "reversebits({0})", None),
     "lshl_b32": (2, "{0} << ({1} & 31u)", NONZERO), "lshr_b32": (2, "{0} >> ({1} & 31u)", NONZERO),
     "ashr_i32": (2, "asuint(asint({0}) >> ({1} & 31u))", NONZERO),
     "lshl1_add_u32": (2, "({0} << 1u) + {1}", "({0} >> 31u != 0u) || ({r} < {1})"),
