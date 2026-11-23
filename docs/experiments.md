@@ -4017,9 +4017,13 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^spirv_minlod_' -V
 ```
 
-The source-built draw runs three samples against distinct red and green mips.
-Each sample must reach the green mip and match the 64-pixel reference.
-Removing the clamp selects the red mip and must fail at pixel (0, 0).
+The source-built `spirv_minlod_*` smoke draw compiles at `ps_6_0` and skips on
+adapters below Shader Model 6.0. It runs `Sample`, `SampleBias` with an offset,
+and `SampleGrad` against distinct red and green mips. Each sample must reach
+the green mip and match the 64-pixel reference. Removing the clamp selects
+the red mip and must fail at pixel (0, 0). The GTX 1060 (32.0.15.6094),
+Windows 10 in-box WARP (10.0.19041.5794), and app-local WARP 1.0.22 passed on
+Windows 10 build 19045.6456 with zero D3D12 debug errors and warnings.
 
 `spirv_minlod_levels_*` varies the clamp of a plain `Sample` over an 8x8
 texture with four solid-color mips. The coordinate is constant, so the LOD is
@@ -4034,10 +4038,16 @@ control on the same adapter.
 - Clamp 1 checked against mip 2, and clamp 1.25 checked against the 1.5 blend,
   must fail at pixel (0, 0).
 
-The `^spirv_minlod_` command above also runs these tests. All MinLod draws
-check for Shader Model 6.6 before creating the pipeline and skip (77) without
-it, as on the Windows 10 in-box runtime. Results on Windows 10
-build 19045 with the Agility SDK 1.620.2, DXC 1.9.2609 and the debug layer on:
+The detailed level and blend draws use `ps_6_6` and skip (77) on the Windows 10
+in-box runtime. In separate `ps_6_0` and `ps_6_2` probes, in-box WARP
+10.0.19041.5794 selected green mip 1 for a per-sample clamp of 1.5625 under
+point mip filtering. An explicit `SampleLevel` at the same LOD selected
+blue mip 2 on that adapter. Linear mip filtering gave the expected blend
+(G=0.4375, B=0.5625). The translated `ps_6_0` sample and a direct HLSL clamp
+agreed. [Direct3D rules for per-sample clamping and mip selection](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm)
+
+The detailed fixture results below used Windows 10 build 19045, Agility SDK
+1.620.2, DXC 1.9.2609 and the debug layer.
 
 | Clamp | Exact green, blue | WARP 1.0.22 | RTX 3080 Ti, driver 32.0.16.1047 |
 |---|---|---|---|

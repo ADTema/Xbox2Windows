@@ -899,6 +899,10 @@ constexpr CapabilityGate kGateSm66Compaction{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: subgroup compaction fixture requires SM 6.6",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60MinLodSmoke{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: MinLod smoke fixture requires SM 6.0",
+    CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66MinLod{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: MinLod fixture requires SM 6.6",
@@ -938,8 +942,8 @@ const OperationSpec kOperations[] = {
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
     {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
-    // The SPIR-V MinLod fixtures compile ps_6_6; these draws run behind an SM 6.6 gate.
-    {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm66MinLod, run_check_pixel_quad_lod},
+    {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm60MinLodSmoke, run_check_pixel_quad_lod},
+    // The detailed MinLod level and blend fixtures compile ps_6_6.
     {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},
     {"--check-pixel-mip-blend", 6, 6, nullptr, kGateSm66MinLod, run_check_pixel_mip_blend},
     {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
@@ -1267,15 +1271,13 @@ int run_self_test()
                      "--spirv-ballot must print its skip reason")) return 1;
 
         // The MinLod draws skip the same way instead of failing at ps_6_6 pipeline creation.
-        char quad_op[] = "--spirv-minlod-quad-lod";
         char clamp_op[] = "--check-pixel-mip-clamp";
         char blend_op[] = "--check-pixel-mip-blend";
         char level[] = "1";
         char tolerance[] = "0.0078125";
-        char* quad_argv[]{prog, mode, quad_op, dxil};
         char* clamp_argv[]{prog, mode, clamp_op, dxil, level};
         char* blend_argv[]{prog, mode, blend_op, dxil, level, tolerance};
-        const struct { char** argv; int argc; } minlod_cases[]{{quad_argv, 4}, {clamp_argv, 5}, {blend_argv, 6}};
+        const struct { char** argv; int argc; } minlod_cases[]{{clamp_argv, 5}, {blend_argv, 6}};
         for (const auto& c : minlod_cases) {
             const OperationSpec* spec = find_operation(c.argv[2]);
             if (!require(spec != nullptr, "MinLod operation")) return 1;
@@ -1287,6 +1289,21 @@ int run_self_test()
             if (!require(out.find("skip: MinLod fixture requires SM 6.6") != std::string::npos,
                          "MinLod draw must print its skip reason")) return 1;
         }
+
+        // The MinLod smoke draw accepts SM 6.0 without wave or int64 operations.
+        char quad_op[] = "--spirv-minlod-quad-lod";
+        char* quad_argv[]{prog, mode, quad_op, dxil};
+        const OperationSpec* quad = find_operation(quad_op);
+        if (!require(quad != nullptr, "MinLod smoke operation")) return 1;
+        const AdapterCaps sm60_caps{D3D_SHADER_MODEL_6_0};
+        if (!require(evaluate_gate(quad->gate, sm60_caps), "MinLod smoke draw must accept SM 6.0")) return 1;
+        OperationContext qctx{nullptr, nullptr, sm51_caps, "warp", 4, quad_argv, nullptr};
+        out.clear();
+        err.clear();
+        if (!require(run_operation_spec(*quad, qctx, {&out, &err}) == 77,
+                     "MinLod smoke draw below SM 6.0 must exit 77")) return 1;
+        if (!require(out.find("skip: MinLod smoke fixture requires SM 6.0") != std::string::npos,
+                     "MinLod smoke draw must print its skip reason")) return 1;
     }
 
     // (c) Handler OutcomeKind::fail and thrown exception exit 1 (never 77); OutcomeKind::skip exits 77; pass exits 0.
