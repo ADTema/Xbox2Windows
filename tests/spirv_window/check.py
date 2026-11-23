@@ -13,9 +13,10 @@ original = fixture.read_text(encoding="utf-8")
 adapted = window.lower(original)
 assert "OpMemoryModel Logical GLSL450" in adapted
 assert "OpConvertUToPtr" not in adapted and "OpUGreaterThanEqual" in adapted
-# The window ends at the last addressable DWORD, and a direct word cast is masked from its own address.
+# The range check applies to the indexed address, with a strict bound.
 assert "%x2w_address_p0_range = OpULessThan %bool %x2w_address_p0_address %x2w_end" in adapted.splitlines()
 
+# A direct word cast is checked from its own address.
 direct = original.replace(
     "%v1 = OpConvertUToPtr %_ptr_PSB_arr %a1\n"
     "%p1 = OpAccessChain %_ptr_PSB_uint %v1 %c0",
@@ -23,6 +24,7 @@ direct = original.replace(
 )
 assert direct != original
 assert "%x2w_address_p1_low = OpBitwiseAnd %ulong %a1 %x2w_mask" in window.lower(direct).splitlines()
+
 # Add a ballot read whose bit controls the value written through the physical address.
 combined = (original
     .replace("OpCapability Shader\n", "OpCapability Shader\nOpCapability GroupNonUniformBallot\n", 1)
@@ -79,7 +81,7 @@ with tempfile.TemporaryDirectory() as directory:
     # This input name previously overlapped the temporaries for %ballot_bit.
     renamed = combined.replace("%p2 ", "%ballot_ballot_bit ")
     assert renamed != combined
-    for label, source in (("combined", combined), ("renamed_pointer", renamed)):
+    for label, source in (("combined", combined), ("renamed_pointer", renamed), ("direct", direct)):
         mixed = Path(directory) / f"{label}.spvasm"
         mixed.write_text(source, encoding="utf-8")
         mixed_target = Path(directory) / f"{label}.spv"
