@@ -412,18 +412,23 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("LDS expression exceeds the profile limit")
                 lds_word = ("alu", expression)
             ds_wait = True
-        elif ((m := re.fullmatch(r"(ds_\w+) v(\d+), v(\d+)(?: offset:0)?", line))
-              and m[1] in LDS_RMW_OPERATORS):
-            addr, src = int(m[2]), int(m[3])
+        elif ((m := re.fullmatch(r"(ds_[a-z]+)(?P<ret>_rtn)?(_[ub]32) "
+                                 r"(?(ret)v(\d+), )v(\d+), v(\d+)(?: offset:0)?", line))
+              and (op := LDS_RMW_OPERATORS.get(m[1] + m[3])) is not None):
+            dst = int(m[4]) if m[4] is not None else None
+            addr, src = int(m[5]), int(m[6])
             value = vector.get(src)
             if (not lds_enabled or guard_span is not None or max(addr, src) > 255
-                    or vector.get(addr) != ("lds_address",) or lds_word is None or not is_word(value)):
+                    or (dst is not None and dst > 255) or vector.get(addr) != ("lds_address",)
+                    or lds_word is None or not is_word(value)):
                 raise ValueError("Unverified private LDS update")
             # Both operands are HLSL uints. Addition and subtraction wrap at 32 bits.
-            op = LDS_RMW_OPERATORS[m[1]]
             expression = f"({hlsl_word(lds_word)} {op} {hlsl_word(value)})"
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("LDS expression exceeds the profile limit")
+            # Capture the inputs before assigning the old word to a possibly overlapping VGPR.
+            if dst is not None:
+                vector[dst] = lds_word
             lds_word = ("alu", expression)
             ds_wait = True
         elif m := re.fullmatch(r"ds_read_(b32|[ui](?:8|16)) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
