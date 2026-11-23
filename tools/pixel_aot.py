@@ -1304,6 +1304,39 @@ def f16_vop2_result(name, a, b):
     return sign | ((exponent + 15) << 10) | (count - 0x400)
 
 
+# Plain binary16 VOP1 rounding (issue #839): llvm-mc mnemonic -> binary32 HLSL call. LLVM 15.0.7 VOP1Instructions.td
+# L449-452 selects ffloor, fceil, ftrunc and frint for them; frint is round to nearest even under the default
+# rounding mode, and HLSL round is round-half-to-even in DXIL (the binary32 rndne entry of ALU relies on it).
+VOP1_F16_ROUND = {"floor": "floor({0})", "ceil": "ceil({0})", "trunc": "trunc({0})", "rndne": "round({0})"}
+
+
+def f16_round_result(name, bits):
+    """Exact binary16 result bits of one VOP1_F16_ROUND op on a finite operand.
+
+    The rounded value of a finite binary16 is an integer of magnitude at most 65504, which is representable, so no
+    rounding happens on the way back. An exact zero result keeps the sign of the operand (floor(-0), ceil(-0.3),
+    trunc(-0.5) and rndne(-0.4) are -0; floor(0.3) is +0). Used at translation time so that a chained result stays a
+    proven value.
+    """
+    sign = bits & 0x8000
+    exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+    if exponent == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {bits:#06x}")
+    magnitude = Fraction(mantissa, 1 << 24) if exponent == 0 else Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25)
+    value = -magnitude if sign else magnitude
+    integer = {"floor": math.floor, "ceil": math.ceil, "trunc": math.trunc, "rndne": round}[name](value)
+    if integer == 0:
+        return sign
+    count = abs(integer)
+    top = count.bit_length() - 1
+    if top <= 10:
+        fraction = (count << (10 - top)) & 0x3ff
+    else:
+        assert count % (1 << (top - 10)) == 0, (name, bits)  # a binary16 value this large is already an integer
+        fraction = (count >> (top - 10)) & 0x3ff
+    return sign | ((top + 15) << 10) | fraction
+
+
 def half16_name(token, vector):
     """Return the HLSL variable of a VGPR that holds a binary16 arithmetic result, else None.
 
@@ -3924,6 +3957,27 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 lines.append(f"    uint hf{i}_{k} = ({word}) & 0xffffu;")
             expression = VOP2_F16[name].format(f"widen16(hf{i}_0)", f"widen16(hf{i}_1)")
             lines.append(f"    precise float hs{i} = {expression};")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
+        elif m := match(rf"v_({'|'.join(VOP1_F16_ROUND)})_f16(_e32|_e64)? (v\d+), ([^,\s]+)"):
+            # Plain binary16 VOP1 rounding under the rules of the VOP2 arithmetic above: a statically proven finite
+            # source, the declared entry profile, no modifier, clamp or omod (those fall through to the generic
+            # refusal). The half is widened exactly, rounded to an integer in binary32 and narrowed back, which is
+            # exact because the integer is representable in binary16. The result is ("half16", alu).
+            name, encoding, dst, token = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 rounding operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            word, proven = half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            result = f16_round_result(name, proven)
+            lines.append(f"    uint hf{i}_0 = ({word}) & 0xffffu;")
+            lines.append(f"    precise float hs{i} = {VOP1_F16_ROUND[name].format(f'widen16(hf{i}_0)')};")
             lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
             vector[dst] = ("half16", f"alu{i}")
             known_half[f"alu{i}"] = result
