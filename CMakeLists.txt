@@ -91,7 +91,7 @@ target_link_options(xmem_shim_check PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi
 target_include_directories(xmem_shim_check PRIVATE src)
 target_compile_features(xmem_shim_check PRIVATE cxx_std_17)
 # working_set_aggregation feeds synthetic adapter readings to src/xmem_gpu_usage.h.
-foreach(scenario IN ITEMS exports allocation default_allocation physical_pages query working_set working_set_aggregation)
+foreach(scenario IN ITEMS exports allocation default_allocation physical_pages tools_memory query working_set working_set_aggregation)
     add_test(NAME xmem_shim_${scenario} COMMAND xmem_shim_check ${scenario})
 endforeach()
 # XMemGetWorkingSetStatistics differences around D3D12 heap and committed-resource lifetimes.
@@ -519,6 +519,10 @@ endif()
 if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")
+    # Compile-only: outcome classification and GVN pass shares, no wall-time threshold (#775).
+    add_test(NAME dxc_compile_time_gvn COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/dxc_compile_time_check.py" "${DXC_EXECUTABLE}")
+    set_tests_properties(dxc_compile_time_gvn PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     # tools/setup-spirv-tools.ps1 builds the pinned tools into out/tools/spirv/bin.
     set(spirv_tool_hints "${CMAKE_SOURCE_DIR}/out/tools/spirv/bin" "$ENV{VULKAN_SDK}/Bin")
     find_program(SPIRV_WINDOW_AS spirv-as HINTS ${spirv_tool_hints})
@@ -692,6 +696,46 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_SEED}" "${CPU_FUZZ_FUNCTIONS}"
         "$<TARGET_FILE:cpu_fuzz>" "$<TARGET_FILE:cpu_fuzz_lifted>" "${cpu_fuzz_o2}")
     set_tests_properties(cpu_aot_fuzz_smoke PROPERTIES TIMEOUT 60)
+    # Fixed RSP frames: saved nonvolatile registers, partial spill overlaps and a planted reload fault.
+    set(CPU_FUZZ_FRAMES_SEED "0xF4A3" CACHE STRING "Seed for the CPU differential fuzz frame test")
+    set(CPU_FUZZ_FRAMES_FUNCTIONS "16" CACHE STRING "Number of generated functions in the CPU differential fuzz frame test")
+    set(cpu_fuzz_frames_asm "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_frames.asm")
+    set(cpu_fuzz_frames_def "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_frames.def")
+    add_custom_command(OUTPUT "${cpu_fuzz_frames_asm}" "${cpu_fuzz_frames_def}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" emit
+            "${CPU_FUZZ_FRAMES_SEED}" "${CPU_FUZZ_FRAMES_FUNCTIONS}" "${cpu_fuzz_frames_asm}"
+            "${cpu_fuzz_frames_def}" --area frames
+        DEPENDS tools/fuzz_cpu.py VERBATIM)
+    add_library(cpu_fuzz_frames SHARED "${cpu_fuzz_frames_asm}" "${cpu_fuzz_frames_def}")
+    set_target_properties(cpu_fuzz_frames PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_fuzz_frames PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO /OPT:NOICF)
+    set(cpu_fuzz_frames_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_frames_lifted.cpp")
+    set(cpu_fuzz_frames_mutant "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_frames_mutant.cpp")
+    foreach(variant lifted mutant)
+        set(mutant_flag "")
+        if(variant STREQUAL "mutant")
+            set(mutant_flag "--mutant")
+        endif()
+        add_custom_command(OUTPUT "${cpu_fuzz_frames_${variant}}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" translate
+                "${CPU_FUZZ_FRAMES_SEED}" "${CPU_FUZZ_FRAMES_FUNCTIONS}" "$<TARGET_FILE:cpu_fuzz_frames>"
+                "${cpu_fuzz_frames_${variant}}" --area frames ${mutant_flag}
+            DEPENDS cpu_fuzz_frames tools/fuzz_cpu.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py
+                tools/cpu_call_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_fuzz_frames_${variant} SHARED "${cpu_fuzz_frames_${variant}}")
+        target_compile_features(cpu_fuzz_frames_${variant} PRIVATE cxx_std_20)
+    endforeach()
+    set(cpu_fuzz_frames_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_frames_lifted_o2.dll")
+    add_custom_command(OUTPUT "${cpu_fuzz_frames_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${cpu_fuzz_frames_lifted}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_frames_lifted_o2.obj" "/Fe${cpu_fuzz_frames_o2}"
+        DEPENDS "${cpu_fuzz_frames_lifted}" VERBATIM)
+    add_custom_target(cpu_fuzz_frames_lifted_o2 ALL DEPENDS "${cpu_fuzz_frames_o2}")
+    add_test(NAME cpu_aot_fuzz_frames COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_FRAMES_SEED}" "${CPU_FUZZ_FRAMES_FUNCTIONS}"
+        "$<TARGET_FILE:cpu_fuzz_frames>" "$<TARGET_FILE:cpu_fuzz_frames_lifted>" "${cpu_fuzz_frames_o2}"
+        --area frames --mutant "$<TARGET_FILE:cpu_fuzz_frames_mutant>")
+    set_tests_properties(cpu_aot_fuzz_frames PROPERTIES TIMEOUT 60)
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_asm_fixture(cpu_switch_strings switch_strings)
     cpu_asm_fixture(cpu_string_probe string_probe)
@@ -1816,6 +1860,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_avx_int_extend_hadd COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_extend_hadd.py"
         check "$<TARGET_FILE:cpu_avx_int_extend_hadd>" "$<TARGET_FILE:cpu_avx_int_extend_hadd_lifted>")
     set_tests_properties(cpu_aot_avx_int_extend_hadd PROPERTIES SKIP_RETURN_CODE 77)
+
+    cpu_asm_fixture(cpu_avx_horiz_fp avx_horiz_fp)
+    set(avx_horiz_fp_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_horiz_fp_lifted.cpp")
+    add_custom_command(OUTPUT "${avx_horiz_fp_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_horiz_fp.py"
+            emit "$<TARGET_FILE:cpu_avx_horiz_fp>" "${avx_horiz_fp_fixture}"
+        DEPENDS cpu_avx_horiz_fp tests/cpu/avx_horiz_fp.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_avx_horiz_fp_lifted SHARED "${avx_horiz_fp_fixture}")
+    add_test(NAME cpu_aot_avx_horiz_fp COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_horiz_fp.py"
+        check "$<TARGET_FILE:cpu_avx_horiz_fp>" "$<TARGET_FILE:cpu_avx_horiz_fp_lifted>")
+    set_tests_properties(cpu_aot_avx_horiz_fp PROPERTIES SKIP_RETURN_CODE 77)
 
     cpu_asm_fixture(cpu_avx_int_shifts_pack avx_int_shifts_pack)
     set(avx_int_shifts_pack_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_int_shifts_pack_lifted.cpp")
@@ -3008,6 +3064,20 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_startup_exe>" "$<TARGET_FILE:cpu_startup_a>" "$<TARGET_FILE:cpu_startup_b>"
         "$<TARGET_FILE:cpu_startup_b_noinit>" "$<TARGET_FILE:cpu_startup_a_alt>"
         "$<TARGET_FILE:cpu_startup_exe_timeout>" "$<TARGET_FILE:cpu_startup_exe_create>")
+    # EXE-own TLS: a CRT-free EXE with a page-spanning initialized template and two TLS callbacks, launched
+    # by Windows and started with pe_map_run; the startup log and exit code must match (Refs #165, #870).
+    # The _early variant starts a thread inside its first process-attach callback (mapped only).
+    foreach(target IN ITEMS cpu_exe_tls cpu_exe_tls_early)
+        add_executable(${target} tests/cpu/exe_tls.cpp)
+        target_compile_options(${target} PRIVATE /GS- /Zl)
+        target_link_options(${target} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
+            /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE kernel32)
+    endforeach()
+    target_compile_definitions(cpu_exe_tls_early PRIVATE EARLY_THREAD)
+    add_test(NAME cpu_native_exe_tls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_tls_check.py" "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_exe_tls>"
+        "$<TARGET_FILE:cpu_exe_tls_early>")
     # Lifecycle fixtures: two DLLs with the static MSVC runtime (B imports A) and a CRT-free event sink.
     add_library(cpu_life_sink SHARED tests/cpu/life_sink.cpp)
     target_compile_options(cpu_life_sink PRIVATE /GS- /Zl)
@@ -3059,6 +3129,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_tools_mem_caller>" "$<TARGET_FILE:cpu_tools_mem_provider>"
         "$<TARGET_FILE:cpu_tools_mem_provider_devkit>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_tools_mem PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_map_pages_provider SHARED tests/cpu/map_pages_provider.cpp tests/cpu/map_pages_provider.def)
+    add_executable(cpu_map_pages_caller tests/cpu/map_pages_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_map_pages_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_map_pages_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_map_pages_caller PRIVATE cpu_map_pages_provider cpu_exe_io)
+    add_test(NAME cpu_native_map_pages COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/map_pages_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_map_pages_caller>" "$<TARGET_FILE:cpu_map_pages_provider>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_map_pages PROPERTIES TIMEOUT 60)
     add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")

@@ -115,3 +115,9 @@ extern "C" BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages)
 {
     return physical_result(era_physical::release(count, reinterpret_cast<const std::uint64_t*>(pages)));
 }
+
+extern "C" BOOL WINAPI XMemIsToolsMemAvailable()
+{
+    // The desktop runtime has no devkit tools-memory partition.
+    return FALSE;
+}

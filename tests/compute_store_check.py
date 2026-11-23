@@ -1438,6 +1438,53 @@ def lds_subword_reference(width, offset, groups):
     return expected
 
 
+LDS_REPLACEMENTS = ("ds_cmpst_b32", "ds_cmpst_rtn_b32", "ds_mskor_b32", "ds_mskor_rtn_b32", "ds_wrxchg_rtn_b32")
+
+
+def lds_replacement_instruction(op):
+    dst = "v10, " if "_rtn_" in op else ""
+    replacement = ", v7" if op != "ds_wrxchg_rtn_b32" else ""
+    return f"{op} {dst}v5, v6{replacement}"
+
+
+def lds_replacement_program(op):
+    lines = DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mad_u32_u24 v9, 1, v8, 0x81a23450",
+        "ds_write_b32 v5, v9",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 0x81a23450" if "cmpst" in op else "v_mov_b32_e32 v6, 0x00ff0ff0",
+        "v_mov_b32_e32 v7, 0x400580b1",
+    ]
+    if "_rtn_" not in op:
+        lines += ["ds_read_b32 v10, v5", "s_waitcnt lgkmcnt(0)"]
+    return lines + [
+        lds_replacement_instruction(op),
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v11, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+def lds_replacement_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = 0x81a23450 + lane
+        if "cmpst" in op:
+            updated = 0x400580b1 if lane == 0 else old
+        elif "mskor" in op:
+            updated = (old & 0xff00f00f) | 0x400580b1
+        else:
+            updated = 0x00ff0ff0
+        words.extend((old, updated, SENTINEL))
+    return words
+
+
+LDS_CASES += [(op, lds_replacement_program(op), LDS_BINDING) for op in LDS_REPLACEMENTS]
+
+
 def lds_overlap_reference(groups):
     words = []
     for lane in range(groups * 32):
@@ -1448,6 +1495,53 @@ def lds_overlap_reference(groups):
         data[1] = 0x5a
         words.extend((pre, middle, int.from_bytes(data, "little")))
     return words
+
+
+LDS_COUNTERS = {
+    "ds_inc_u32": lambda old: old + 1 if old < 7 else 0,
+    "ds_dec_u32": lambda old: old - 1 if 1 <= old <= 7 else 7,
+    "ds_inc_rtn_u32": lambda old: old + 1 if old < 7 else 0,
+    "ds_dec_rtn_u32": lambda old: old - 1 if 1 <= old <= 7 else 7,
+    "ds_wrap_rtn_b32": lambda old: old - 7 if old >= 7 else old + 3,
+}
+
+
+def lds_counter_instruction(op):
+    if op == "ds_wrap_rtn_b32":
+        return f"{op} v10, v5, v10, v7"
+    if "_rtn_" in op:
+        return f"{op} v10, v5, v10"
+    return f"{op} v5, v6"
+
+
+def lds_counter_program(op):
+    snapshot = ["v_mov_b32_e32 v10, 7"] if "_rtn_" in op else ["ds_read_b32 v10, v5", "s_waitcnt lgkmcnt(0)"]
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mad_u32_u24 v6, 1, v8, 0xfffffff0",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 7",
+        "v_mov_b32_e32 v7, 3",
+    ] + snapshot + [
+        lds_counter_instruction(op),
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v11, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+def lds_counter_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = (lane - 16) & 0xffffffff
+        words.extend((old, LDS_COUNTERS[op](old), SENTINEL))
+    return words
+
+
+LDS_CASES += [(op, lds_counter_program(op), LDS_BINDING) for op in LDS_COUNTERS]
 
 
 def lds_reference(groups):
@@ -1502,6 +1596,15 @@ LDS_CASES += [("lds_addtid", LDS_ADDTID_PROGRAM, LDS_BINDING | {"stride": 8})]
 
 
 def lds_controls():
+    cmpst = lds_replacement_instruction("ds_cmpst_rtn_b32")
+    lines = lds_replacement_program("ds_cmpst_rtn_b32")
+    for bad, message in (
+        (cmpst + " offset:4", "Unsupported compute instruction"),
+        (cmpst + " gds", "Unsupported compute instruction"),
+        (cmpst.replace(", v7", ""), "Unverified private LDS replacement operands"),
+        (cmpst.replace("v7", "v254"), "Unverified private LDS replacement"),
+    ):
+        rejects(message, aot.lower, variant(lines, (cmpst, bad)), 32, **LDS_BINDING)
     for old, new, message in (
         ("s_mov_b32 m0, 0", "s_nop 0", "Unverified private LDS thread-ID access"),
         ("s_mov_b32 m0, 0", "s_mov_b32 m0, 4", "Unsupported compute instruction"),
@@ -1570,7 +1673,7 @@ def lds_controls():
         ("ds_add_u32 v5, v254", "Unverified private LDS update"),
         ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
         ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
-        ("ds_inc_rtn_u32 v10, v5, v6", "Unsupported compute instruction"),
+        ("ds_inc_rtn_u64 v[10:11], v5, v[6:7]", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
     i = lines.index(update)
@@ -1581,6 +1684,21 @@ def lds_controls():
     pair = [update, "s_waitcnt lgkmcnt(0)"]
     rejects("LDS expression exceeds the profile limit", aot.lower,
             lines[:i] + pair * 32 + lines[i:], 32, **LDS_BINDING)
+
+
+    wrap = lds_counter_instruction("ds_wrap_rtn_b32")
+    lines = lds_counter_program("ds_wrap_rtn_b32")
+    for bad, message in (
+        (wrap + " offset:4", "Unsupported compute instruction"),
+        (wrap + " gds", "Unsupported compute instruction"),
+        (wrap.replace(", v7", ""), "Unverified LDS counter operands"),
+        (wrap.replace("v7", "v254"), "Unverified private LDS counter update"),
+        (wrap.replace("v5", "v8"), "Unverified private LDS counter update"),
+    ):
+        rejects(message, aot.lower, variant(lines, (wrap, bad)), 32, **LDS_BINDING)
+    i = lines.index(wrap)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
     update = "ds_add_rtn_u32 v10, v5, v10"
@@ -1680,6 +1798,19 @@ def ds_mutants(name, lines, binding, source):
             wrong_op = next(ret for ret, base in LDS_RETURN_UPDATES.items() if base == LDS_ORDER_MUTANTS[op])
             changed = variant(lines, (f"{name} v10, v5, v10", f"{wrong_op} v10, v5, v10"))
             yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_REPLACEMENTS:
+        instruction = lds_replacement_instruction(name)
+        if "cmpst" in name:
+            wrong = instruction.replace("v6, v7", "v7, v6")
+        elif "mskor" in name:
+            # Masking DATA1 would incorrectly discard bits outside the mask.
+            masked = 0x400580b1 & 0x00ff0ff0
+            changed = variant(lines, ("v_mov_b32_e32 v7, 0x400580b1", f"v_mov_b32_e32 v7, 0x{masked:08x}"))
+            yield aot.lower(changed, 32, **binding), 1
+            return
+        else:
+            wrong = "ds_read_b32 v10, v5"
+        yield aot.lower(variant(lines, (instruction, wrong)), 32, **binding), 1
     elif name in LDS_SUBWORDS:
         width, offset = LDS_SUBWORDS[name]
         suffix = f" offset:{offset}" if offset else ""
@@ -1704,6 +1835,10 @@ def ds_mutants(name, lines, binding, source):
         yield aot.lower(no_halfword, 32, **binding), 1
         no_byte = variant(lines, ("ds_write_b8 v5, v7 offset:1", "s_nop 0"))
         yield aot.lower(no_byte, 32, **binding), 2
+    elif name in LDS_COUNTERS:
+        no_update = "ds_read_b32 v10, v5" if "_rtn_" in name else "s_nop 0"
+        changed = variant(lines, (lds_counter_instruction(name), no_update))
+        yield aot.lower(changed, 32, **binding), 1
     elif name == "private":
         yield source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)"), 2
     else:
@@ -1731,12 +1866,16 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
                 words = lds_subword_reference(*LDS_SUBWORDS[name], groups)
             elif name in LDS_D16_READS:
                 words = lds_d16_reference(name, groups)
+            elif name in LDS_REPLACEMENTS:
+                words = lds_replacement_reference(name, groups)
             elif name in LDS_HIGH_WRITES:
                 words = lds_high_write_reference(name, groups)
             elif name == "lds_addtid":
                 words = [base + lane for lane in range(groups * 32) for base in (0x12345670, 0x89abcdef)]
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)
+            elif name in LDS_COUNTERS:
+                words = lds_counter_reference(name, groups)
             elif private:
                 words = lds_reference(groups)
             else:
