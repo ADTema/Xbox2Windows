@@ -19,6 +19,12 @@ Transport/ABI glue: movq (between mm, scratch r64 rax/r9/r10/r11, and flat
 [rcx|rdx|r8] memory), movaps/movdqa (16-byte aligned 128-bit load/store/reg copy),
 movdqu (unaligned 128-bit load/store/reg copy), emms, and terminal ret.
 
+Call with default MXCSR controls, an empty x87 stack with no pending unmasked
+exceptions, and no live MMX values. The caller owns the buffers and observes
+the output bytes after return. Floating-point status and physical x87 tag
+updates, and the non-temporal store's caching and inter-thread visibility,
+are outside this leaf profile.
+
 MMX state policy:
   - mmx_active starts false and becomes true whenever any MM0..MM7 register is
     touched; ret rejects while mmx_active is true.

@@ -5943,7 +5943,14 @@ group `SSE`:
 - Integer-to-float conversion: `cvtpi2ps` (`mm` and `m64` sources, preserving `xmm[127:64]`)
 - Float-to-integer conversions: `cvtps2pi` (round-to-nearest-even) and `cvttps2pi` (truncate toward zero) on `xmm` and `m64` sources, returning `0x80000000` on NaN, `+/-Inf`, or out-of-`int32_t` range after rounding
 - Word permutation: `pshufw` (`imm8` 16-bit word shuffle on `mm` and `m64` sources)
-- Non-temporal store: `movntq` (`m64` store to `[r8 + disp]`)
+- Non-temporal store: `movntq` (`m64` store to `[r8 + disp]`, tested at aligned and unaligned addresses)
+
+Call with round-to-nearest-even, masked MXCSR exceptions, DAZ and FTZ off, and
+an empty x87 stack with no pending unmasked exceptions or live MMX values.
+The caller owns the buffers and reads the output after return. The `movntq`
+lowering preserves the eight output bytes. Caching hints, inter-thread
+visibility, floating-point status flags and physical x87 tags are outside
+the observed contract.
 
 Each lifted export uses the leaf ABI `void fn(word rcx, word rdx, word r8)` (`rcx`/`rdx`
 inputs, `r8` output), modeling `xmm0`..`xmm5` (`Vec128`), `mm0`..`mm7` (`std::uint64_t mm[8]`),
