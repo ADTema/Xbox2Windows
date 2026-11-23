@@ -38,6 +38,7 @@ jobs:
           python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_descriptor_swap_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_lit_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/mesh_shadow_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/ffx_dispatch_aot_check.py llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 python3 -B tests/rdna2_tools_check.py
   python-linux:
@@ -63,6 +64,7 @@ jobs:
           python -B tests/bc7_tiles_check.py
           python -B tests/form_coverage_check.py
           python -B tests/resource_ranges_check.py
+          python -B tests/ttpf_batch_export_check.py
           python -B tests/awc_metadata_check.py
           python -B tests/sgd5_effects_check.py
           python -B tests/dxcontainer_part_offsets_check.py
@@ -106,7 +108,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: out/tools/spirv/bin
-          key: spirv-cli-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ hashFiles('tools/setup-spirv-tools.ps1') }}
+          key: spirv-cli-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ hashFiles('tools/setup-spirv-tools.ps1', 'tools/patches/spirv-cross-minlod.patch') }}
       - name: Build the pinned SPIR-V tools
         shell: pwsh
         run: .\tools\setup-spirv-tools.ps1
@@ -179,7 +181,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: out/tools/spirv/bin
-          key: spirv-cli-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ hashFiles('tools/setup-spirv-tools.ps1') }}
+          key: spirv-cli-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ hashFiles('tools/setup-spirv-tools.ps1', 'tools/patches/spirv-cross-minlod.patch') }}
       - name: Build the pinned SPIR-V tools
         shell: pwsh
         run: .\tools\setup-spirv-tools.ps1
