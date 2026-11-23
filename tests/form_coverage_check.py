@@ -1138,6 +1138,25 @@ def check_swap_coverage():
         assert ("VOP1", "v_swap_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"v_swap_b32"}, reference), name
 
 
+def check_pk_fmac_coverage():
+    """v_pk_fmac_f16 is VOP2 in both references and counts as covered only through the accepted VOP2 spelling.
+    The _e64, DPP and SDWA spellings reach only rejections."""
+    import pixel_aot_check as pixel
+    pixel.ACCEPTED.clear()
+    with tempfile.TemporaryDirectory() as tmp:
+        pixel.check_controls(Path(tmp))
+    assert "v_pk_fmac_f16" in pixel.ACCEPTED
+    assert not {"v_pk_fmac_f16_e64", "v_pk_fmac_f16_dpp", "v_pk_fmac_f16_sdwa"} & pixel.ACCEPTED
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert ("VOP2", "v_pk_fmac_f16") in reference, name
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert ("VOP2", "v_pk_fmac_f16") in covered, name
+        # Control: without the accepted spellings the form is not covered.
+        stripped = pixel.ACCEPTED - {"v_pk_fmac_f16", "v_pk_fmac_f16_e32"}
+        assert ("VOP2", "v_pk_fmac_f16") not in fc.gfx_forms(stripped, reference), name
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -1157,6 +1176,7 @@ if __name__ == "__main__":
     check_f16_round_forms()
     check_f16_cvt_int16_forms()
     check_swap_coverage()
+    check_pk_fmac_coverage()
     check_sopk_wait_forms()
     check_s_version_form()
     check_parsing()
