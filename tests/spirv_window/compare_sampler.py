@@ -77,6 +77,32 @@ def controls(directory):
                         "%copy = OpCopyObject %_ptr_UniformConstant_type_sampler %cmpSampler\n"
                         "%33 = OpLoad %type_sampler %cmpSampler"),
              ORDINARY_BINDING, "only direct loads are supported")
+    rejected(substitute(SHARED, "%33 = OpLoad %type_sampler %cmpSampler",
+                        "%33 = OpLoad %type_sampler %cmpSampler\n"
+                        "%loaded_copy = OpCopyObject %type_sampler %33"),
+             ORDINARY_BINDING, "loaded sampler feeds OpCopyObject")
+
+    # The remaining profile diagnostics.
+    rejected(SHARED, -1, "Ordinary sampler binding must be nonnegative")
+    rejected(substitute(SHARED, "OpEntryPoint GLCompute", "OpEntryPoint Fragment"),
+             ORDINARY_BINDING, "requires a single GLCompute entry point")
+    rejected(substitute(SHARED, "OpTypeImage %float 2D 2 0 0 1 Unknown",
+                        "OpTypeImage %float 2D 2 1 0 1 Unknown"),
+             ORDINARY_BINDING, "only non-array float32 Texture2D sampling is supported")
+    rejected(substitute(SHARED, " %cmpSampler %plainSampler %results", " %plainSampler %results"),
+             ORDINARY_BINDING, "sampler must be listed in the entry-point interface")
+    rejected(substitute(SHARED, "%float_0 = OpConstant %float 0",
+                        "%float_0 = OpConstant %float 0\n"
+                        "%x2w_plain_sampler_0 = OpConstant %float 0"),
+             ORDINARY_BINDING, "Reserved sampler split ID is already in use")
+
+    # Occupancy is per descriptor set: binding 3 is taken in set 0 and free in set 1.
+    other_set = substitute(SHARED, "OpDecorate %cmpSampler DescriptorSet 0",
+                           "OpDecorate %cmpSampler DescriptorSet 1")
+    other_lowered, other_mapping = split_comparison_sampler(other_set, 3)
+    assert other_mapping == {"descriptor_set": 1, "comparison_binding": 2, "ordinary_binding": 3}, other_mapping
+    assert "OpDecorate %x2w_plain_sampler DescriptorSet 1" in other_lowered.splitlines()
+    assert "OpDecorate %x2w_plain_sampler Binding 3" in other_lowered.splitlines()
 
     tool = [sys.executable, "-B", str(ROOT / "tools" / "spirv_sampler_split.py")]
     source = directory / "shared.spvasm"
