@@ -2314,6 +2314,37 @@ class TestRdna2Scanner(unittest.TestCase):
         for opcode in ("v_alignbit_b32", "v_alignbyte_b32"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
             self.assertTrue(is_opcode_recognized(opcode), opcode)
+        for line in (
+            "v_add3_u32 v1, v2, v3, v4",
+            "v_add3_u32_e64 v1, s2, v3, 4",
+            "v_or3_b32 v1, v2, v3, v4",
+            "v_xor3_b32 v1, v2, v3, v4",
+            "v_and_or_b32 v1, v2, v3, v4",
+            "v_xad_u32 v1, v2, v3, v4",
+            "v_lshl_or_b32 v1, v2, v3, v4",
+            "v_lshl_add_u32 v1, v2, v3, v4",
+            "v_add_lshl_u32 v1, v2, v3, v4",
+            "v_add_lshl_u32_e64 v1, s2, v3, 31",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_add3_u32_e32 v1, v2, v3, 4",
+            "v_or3_b32_e32 v1, v2, v3, 4",
+            "v_xor3_b32_e32 v1, v2, v3, 4",
+            "v_and_or_b32_e32 v1, v2, v3, 4",
+            "v_xad_u32_e32 v1, v2, v3, 4",
+            "v_lshl_or_b32_e32 v1, v2, v3, 4",
+            "v_lshl_add_u32_e32 v1, v2, v3, 4",
+            "v_add_lshl_u32_e32 v1, v2, v3, 4",
+            "v_add3_u32 v1, v2, v3",
+            "v_add3_u32 v1, v2, v3, 4, 5",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in (
+            "v_add3_u32", "v_or3_b32", "v_xor3_b32", "v_and_or_b32",
+            "v_xad_u32", "v_lshl_or_b32", "v_lshl_add_u32", "v_add_lshl_u32",
+        ):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
         for unsupported in ("v_cvt_f32_i32 v1, v2",
                             "v_cvt_f32_i32_e32 v1, v2 clamp",
                             "v_cvt_f32_u32_e64 v1, -v2",
