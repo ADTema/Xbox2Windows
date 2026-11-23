@@ -620,6 +620,13 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^pixel_aot_cmpx_regions_(warp|hardware)$' -V
 ```
 
+The region body also admits, under either opener, the per-lane binary32 forms the translator already lowers outside regions, in the encodings measured in real regions (stage 2 of issue #932): `v_fmac_f32_e32`, `v_mac_f32_e32`, `v_mul_legacy_f32_e32` and `_e64`, `v_cvt_f32_ubyte0` to `3` `_e32`, `v_rcp_f32_e32`, `v_rsq_f32_e32`, `v_sqrt_f32_e32`, `v_fma_f32`, `v_mad_f32` and `v_med3_f32`. Each lowers exactly as outside a region and still passes the per-instruction check that only VGPRs change; a false lane's speculated value, including an out-of-domain infinity or NaN, is discarded by the restore-time select. The accumulator forms read their destination, so a destination still conditional from an earlier region rejects. Other encodings of these operations (`_e64` of the VOP1/VOP2 forms), other operations and scalar instructions stay refused. Each form has its own draw (`pixel_aot_region_body_warp` and `_hardware`): it rewrites the green channel inside a `v_cmpx` region on mixed, full and empty masks, with inputs whose results are exact, and a reference that applies the body to every lane must mismatch. D3D allows `rcp`, `rsqrt` and `sqrt` an error, so their integer results (8, 4 and 4) and the outer value are rounded after the region with +0.5 and floor. The translation controls lower every form under both openers and check the refusals and the conditional accumulator read; the LLVM 15 round trip covers the fourteen programs.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_region_body_(warp|hardware)$' -V
+```
+
 ### SPIR-V physical addresses in a D3D12 buffer window
 
 An optional offline experiment accepts validated Vulkan 1.2 SPIR-V assembly with the named user-data and physical DWORD pointer types emitted by [Leonida at `f85582e`](https://github.com/ItsNotRexed/Leonida/blob/f85582e23d4ab9e19acbf694358f137d6b8531b1/tools/rdna2spirv.py). [SPIRV-Cross at `57e4efc`](https://github.com/KhronosGroup/SPIRV-Cross/tree/57e4efcc84112abcd426dc5ec248b5339bee04f2) rejects the physical addressing model on its HLSL path. The [window adapter](../tools/spirv_address_window.py) converts direct DWORD loads, stores and array element addresses to logical storage-buffer accesses. It validates the input and the result before publishing the output module.
@@ -2411,6 +2418,29 @@ the readback.
 ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_wide_replacement_(warp|hardware)$' -V
 ```
 
+Five private qword updates operate on an initialized pair of record slots
+at byte offset 0 or 8. `ds_add_u64`, `ds_sub_u64` and `ds_rsub_u64` update
+modulo 2^64 using a low-word carry or borrow. `ds_and_b64` and `ds_or_b64`
+update both words independently. Fixtures read back the pair at offset 8
+and cover both outcomes of the carry and borrow tests. Discarding carry or
+borrow, or interchanging the bitwise operations, must change the readback.
+Run these variants with `ctest --preset dev --no-tests=error -R
+'^compute_store_aot_lds_qword_(warp|hardware)$' -V`.
+
+
+The private LDS f32 profile requires `--lds-f32-mode normal-rne` as a
+caller guarantee that interpreted operands and results are normal binary32
+or positive zero and that the native arithmetic uses round-to-nearest-even.
+It lowers add, returning add, min, max and compare-and-store at byte offset
+zero. Each add emits a separate `precise float` operation. Min/max copy the
+selected word and compare-and-store copies the replacement on equality.
+The fixture uses exact results for normal inputs. NaNs, signed zero and
+subnormal arithmetic require a separate profile.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_f32_(warp|hardware)$' -V
+```
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
@@ -2960,9 +2990,9 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_avx_int_regs$' -V
 
 ### Measured results and open scope
 
-The [MASM fixture](../tests/cpu/avx_int_regs.asm) builds 119 exports covering all 90 surviving AVX packed-integer forms across their valid encodings: both `xmm`-count and `imm8` shifts (including in-range, overflow `>=` lane width, and upper-64-bit nonzero `xmm` counts), register and flat-memory forms of `vpextrb`/`w`/`d`/`q` and `vpinsrb`/`w`/`d`/`q`, `vpalignr` across offsets `0`/`5`/`16`/`23`/`32`, `vmpsadbw` ignored immediate bits, saturation edges, full `vpsign*` sign matrices, `vpmulhrsw` rounding boundaries, `vphminposuw` tie-breaking, `vpmovsx*`/`vpmovzx*` sign/zero-extension extremes, `vpblendvb` bit-7 mask checks, `vzeroupper`, a 192-byte `vzeroall` check across `ymm0`..`ymm5`, and a chained `op_pipeline` export. [The Windows test](../tests/cpu/avx_int_regs_check.py) checks 1,568 differential cases across all 119 exports with 16-byte pre/post guards against both the native MASM DLL and an independent Python reference model.
+The [MASM fixture](../tests/cpu/avx_int_regs.asm) builds 132 exports covering all 90 surviving AVX packed-integer forms across their valid encodings: both `xmm`-count and `imm8` shifts (including in-range, overflow `>=` lane width, and upper-64-bit nonzero `xmm` counts), register and flat-memory forms of `vpextrb`/`w`/`d`/`q` and `vpinsrb`/`w`/`d`/`q`, `vpalignr` across offsets `0`/`5`/`16`/`23`/`32`, `vmpsadbw` ignored immediate bits, saturation edges, full `vpsign*` sign matrices, `vpmulhrsw` rounding boundaries, `vphminposuw` tie-breaking, `vpmovsx*`/`vpmovzx*` sign/zero-extension extremes, `vpblendvb` bit-7 mask checks, `vzeroupper`, a 192-byte `vzeroall` check across `ymm0`..`ymm5`, and a chained `op_pipeline` export. [The Windows test](../tests/cpu/avx_int_regs_check.py) checks 1,728 differential cases across all 132 exports with 16-byte pre/post guards against both the native MASM DLL and an independent Python reference model.
 
-An `ALTER_IMM` variant changes the immediates of `op_palignr_5`, `op_pblendw`, `op_mpsadbw_0`, `op_pshufhw` and `op_pextrb_reg`, and must match the altered reference while diverging from the unmodified reference on 12, 11, 8, 10 and 10 cases respectively. An output-mutation negative control flips one bit of `op_pipeline` and confirms the comparator fails. Alternate-encoding lift checks cover 6 r64/W1 GPR bridge forms (`vpmovmskb`, `vpextrb`/`w` and `vpinsrb`/`w` `r64` variants that MASM does not emit by default). Rejection controls cover 110 unit cases (25 `VEX.L=1` packed-integer encodings, 25 register-domain memory operands, 32 carved-out encodings covering all 28 carved-out forms, 10 out-of-scope instructions and 18 EVEX/ABI/GPR/addressing/state violations) and 11 end-to-end PE-patched DLL cases. In `tools/form_coverage.py`, `avx_int_regs.asm` covers all 90 surviving AVX packed-integer forms (plus transport `vmovdqu`, 91 AVX forms total), advancing x64 Zen 2 `AVX` group coverage alone from 7/256 to 96/256 (+89 net new forms; total x64 Zen 2 from 55/948 to 144/948).
+An `ALTER_IMM` variant changes the immediates of `op_palignr_5`, `op_pblendw`, `op_mpsadbw_0`, `op_pshufhw` and `op_pextrb_reg`, and must match the altered reference while diverging from the unmodified reference on 12, 11, 8, 10 and 10 cases respectively. An output-mutation negative control flips one bit of `op_pipeline` and confirms the comparator fails. Alternate-encoding lift checks cover 6 r64/W1 GPR bridge forms (`vpmovmskb`, `vpextrb`/`w` and `vpinsrb`/`w` `r64` variants that MASM does not emit by default). Rejection controls cover 111 unit cases (25 `VEX.L=1` packed-integer encodings, 25 register-domain memory operands, 32 carved-out encodings covering all 28 carved-out forms, 10 out-of-scope instructions and 19 EVEX/ABI/GPR/addressing/state violations) and 11 end-to-end PE-patched DLL cases. In `tools/form_coverage.py`, `avx_int_regs.asm` covers all 90 surviving AVX packed-integer forms (plus transport `vmovdqu`, 91 AVX forms total), advancing x64 Zen 2 `AVX` group coverage alone from 7/256 to 96/256 (+89 net new forms; total x64 Zen 2 from 55/948 to 144/948).
 
 Not covered by this experiment: the 28 packed-integer forms carved out to `cpu_vex_aot.py (PR #325)`, memory operands on register-only AVX packed-integer forms, 256-bit AVX2 packed-integer forms (`VEX.L=1`), AVX floating-point/move/test/string-compare forms, control flow or calls mixed with AVX state, nonvolatile register save/restore prologues, and title CPU code execution.
 
@@ -3667,6 +3697,7 @@ With registration, the callers' predicates accept GPU-intended memory and reject
 | `XMemFree` | Allocation and the same attribute word. | Untracks graphics allocations, dropping any alias and the `era_query` registration, then `era_heap::release_with_attributes`. |
 | `XMemVirtualQuery` | The four BVH callers pass the process in `rcx`, the address in `rdx` and a 64-byte buffer in `r8`; `r9` is not set, so there is no length argument. They test the 32-bit result in `eax`. | `era_query::query` on the 64-byte buffer; returns `TRUE` when it succeeds. |
 | `XMemGetWorkingSetStatistics` | The seven AMD callers pass `0x20000001` in `ecx` and a 128-byte stack buffer in `rdx` and test the 32-bit result. On failure each uses zero instead of the 64-bit value at `+8`. They use only the difference of that value around GPU heap and committed-resource creation and release. | For `0x20000001`, writes the qword at `+8` with this process's GPU memory in bytes and returns `TRUE`; no other byte is written. The value is DXGI `QueryVideoMemoryInfo` `CurrentUsage`, local plus non-local on every node of an adapter LUID, combined by the aggregation rules below. A LUID's nodes are its linked physical adapters: DXGI enumerates a linked set as one adapter, and `QueryVideoMemoryInfo` takes the physical adapter index as its node. The shim reads their count with D3DKMT (`KMTQAITYPE_PHYSICALADAPTERCOUNT`). `dxgi.dll` and `gdi32.dll` (D3DKMT) are delay-loaded on the first call. When the rules give no total (including when the adapter list cannot be stored), or for other selectors, the call returns `FALSE` with `ERROR_NOT_SUPPORTED`; a null output returns `ERROR_INVALID_PARAMETER`. A failed call leaves the whole output untouched. |
+| `XMemTransferMemory` | Partition selector in `ecx` and byte count in `rdx`. | On a no-tools desktop runtime without devkit tools-memory backing (`XMemIsToolsMemAvailable() == FALSE` per #896), returns `FALSE` with `ERROR_NOT_SUPPORTED` without modifying memory or accounting state. Resolving this export allows PE import binding to succeed at load time, which is distinct from establishing that a caller's startup sequence can proceed past an unsupported transfer. |
 
 Windows can list one device under several LUIDs, and each view reports the same allocations. Without a GPU, Windows Server 2025 lists the Microsoft Basic Render Driver with flags 0 and as a software adapter. A hybrid laptop on Windows build 26200 (RTX 4060 Laptop, driver 32.0.16.1656) listed its NVIDIA GPU twice with flags 0. In that case both local counters moved from 7,294,976 to 74,403,840 bytes on one 64 MiB heap, so a plain sum reported 2x. Matching vendor and device IDs, or equal readings, do not show that two LUIDs are one device: separate adapters of the same model must each be counted. The shim therefore identifies each LUID by the PnP hardware registry keys of its physical adapters, which contain the device instance path, read with D3DKMT (`src/adapter_identity.cpp`), and `src/xmem_gpu_usage.h` publishes a total only when it is complete and non-duplicated:
 
@@ -3687,6 +3718,7 @@ A local scan of the inspected package's 16 DLLs together with this `xmem.dll` (`
 | `xmem_shim_allocation` | The Bink word returns 32-byte-aligned, zeroed heap memory. The AMD word returns committed read/write memory on a 64 KiB boundary that `XMemFree` releases (`MEM_FREE`). Zero size, a reserved bit and a physical memory type return null, and freeing null is a no-op for both memory types. |
 | `xmem_shim_query` | Graphics memory from `XMemAlloc` passes both BVH predicates and keeps the sentinel after `+0x30`, through the pseudo-handle and a real handle. After `XMemFree` the address reads as `MEM_FREE` with a clear tail. Heap memory fails the tail check, and an address outside user space returns `FALSE` without touching the buffer. |
 | `xmem_shim_working_set` | Selector `0x20000001` returns `TRUE` and writes only the qword at `+8` of a 128-byte buffer. Selector `0x20000002` returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the buffer untouched; a null output returns `ERROR_INVALID_PARAMETER`. |
+| `xmem_shim_transfer_memory` | Verifies that `XMemTransferMemory` returns `FALSE` with `ERROR_NOT_SUPPORTED` under caller sequences (including partition 1 and 2 MiB / 16 MiB counts), leaving existing heap/graphics allocations, physical page grants, query registration, tools memory status and working-set statistics untouched. |
 | `xmem_shim_working_set_aggregation` | Synthetic readings for the aggregation rules. Regression reference: the laptop readings above give no total when the two LUIDs have no identity, and a 64 MiB difference when both carry the same key. Also covered: Basic Render Driver aliases count once, distinct adapters of the same model with equal readings are summed, a genuine zero is published, and an all-failed, partly failed or incomplete enumeration, disagreeing aliases, an active adapter of unknown identity next to another active adapter, partly overlapping linked adapters and an overflowing sum give no total. Keys that differ only in case count once, must agree, and still give no total when they partly overlap. Malformed key query output (nothing written, an empty key, a length past the buffer, no terminator, an embedded terminator) gives no key. Per-node readings: usage only on node 1 of a linked pair is counted, and an unknown node count, a segment query that fails after a successful one (on the same node or a later node) and an overflow between segments or nodes give no total. |
 | `xmem_shim_working_set_warp`, `xmem_shim_working_set_hardware` | As the callers do, reads `+8` (zero on failure) before and after creating and releasing 64 MiB DEFAULT, UPLOAD and READBACK heaps and a 32 MiB committed buffer on a new device. Each creation must add at least the allocation size (`GetResourceAllocationInfo` for the buffer) and at most 4 MiB more, and each release must remove as much. Negative control: with the former `ERROR_NOT_SUPPORTED` stub every difference is 0 and both cases fail. Prints each DXGI adapter with its LUID, node count and PnP keys. The hardware case measures the first D3D12 adapter in high-performance order, or the first whose description contains `XBOX2WINDOWS_ADAPTER` (ignoring case; no match fails), and prints it. Skips (77) without the adapter or a D3D12 device. |
 
@@ -3782,6 +3814,14 @@ On Windows 10 19045 with D3D12 10.0.19041.7291, both device cases passed on in-b
 Because reserve-only ranges and addresses inside an allocation cannot be opened, this layout needs all of A committed and wrapped once. A 16 or 24 GiB range would be committed in full, and separately opened pieces would each get their own GPU base. The `D3D12ConfigureVirtualMemoryX` shim remains unimplemented.
 
 Run `ctest --preset dev --no-tests=error -R '^vm_translation_' -V`.
+
+#### Ordering a tile remap across D3D12 queues (#874)
+
+`tests/vm_copy_queue_check.cpp` maps two tiles in a reserved buffer and uploads a distinct 64 KiB pattern to each on a COPY queue. A DIRECT queue waits for the upload fence and reads the first pattern. The COPY queue waits for this read, remaps the first virtual tile to the second physical tile, and signals a new fence value. The DIRECT queue waits for that value and reads the second pattern from the same virtual address. The CPU waits only for the final readback.
+
+The test checks all 16,384 words in each read. The deliberately early read differs from all 16,384 words of the remapped pattern. Queue waits order both reads with respect to the remap, so the early result does not rely on a race. The fixture uses stock D3D12 queues, and skips (77) when the requested adapter or tiled-resource support is unavailable.
+
+Run `ctest --preset dev --no-tests=error -R '^vm_copy_queue_' -V`.
 
 ### Attribute words at xmem call sites
 
@@ -4331,6 +4371,35 @@ The fixture shows that the caller's success path, refusal path and release accou
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
+```
+
+### DirectStorage factory and queue adapter
+
+This fixture exercises the DirectStorage initialization sequence and submission controls. The source-built caller ([`dstorage_caller.asm`](../tests/cpu/dstorage_caller.asm)) imports `DStorageGetFactory` by name from `xcrdapi.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled adapter provider ([`dstorage_provider.cpp`](../tests/cpu/dstorage_provider.cpp)), it verifies factory acquisition, staging buffer configuration, queue creation, delayed submission, and exact readback:
+
+- **Public sources**:
+  - [Microsoft DirectStorage](https://github.com/microsoft/DirectStorage) (`include/dstorage.h`, MIT License) defines the public PC `IDStorageFactory` (`{6924ea0c-c3cd-4826-b10a-f64f4ed927c1}`), `IDStorageQueue` (`{cf90e079-90c1-4320-be50-b01ec69e0637}`), `DSTORAGE_QUEUE_DESC`, `DSTORAGE_REQUEST`, and public COM vtable slot orders.
+  - [Microsoft Learn GDK DirectStorage Overview](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/console/storage/directstorage/directstorage-overview) describes factory acquisition, staging buffer allocation, queue dispatch, delayed submit, and auto-submission thresholds.
+
+- **Convention vs Evidence**:
+  - **Public DirectStorage evidence**: the header identifies the PC `IDStorageFactory` interface. The GDK documentation describes explicit submission and the half-capacity auto-submission threshold. The recorder's PC IID refusal and unchanged output pointer are fixture behavior.
+  - **Recorder convention**: Fresh fixture-owned interface identifiers `IID_FixtureFactory` (`{ca891497-6f8f-4d03-b1a2-f239b4ce41af}`) and `IID_FixtureQueue` (`{82af1362-6445-4b96-9fbf-5d2d416b605e}`); mock provider structures; 32 MiB staging buffer configuration; and the adapter vtable layout (slot 3 `CreateQueue`, slot 8 `SetStagingBufferSize`, slot 3 `EnqueueRequest`, slot 6 `Submit` following the recorder convention). A public source would be needed before a fixture or production adapter presents other IDs or slots as a platform contract. Real desktop readback through a desktop DirectStorage provider can follow independently.
+  - **Windows runtime evidence**: Export binding of `xcrdapi.dll!DStorageGetFactory` and `cpu_exe_io.dll!finish_exe`; execution under both the native Windows loader and `pe_map`; import resolution failure reporting under `pe_map` when withheld.
+
+- **Verified cases**:
+  - **Case 1 (Success path reaches submit with exact readback)**: `DStorageGetFactory` queries `IID_FixtureFactory`, configures a 32 MiB staging buffer via `SetStagingBufferSize(0x2000000)` (vtable slot 8), creates a queue with descriptor `DSTORAGE_QUEUE_DESC` via `CreateQueue` (vtable slot 3) under `IID_FixtureQueue`, enqueues a memory request with destination buffer, verifies the delayed-submit negative control, explicitly submits via `Submit()` (vtable slot 6), verifies exact readback data transfer into destination buffer, releases objects, and exits with code `0x870`.
+  - **Case 2 (PC interface refusal)**: Requesting the public MIT DirectStorage PC `IDStorageFactory` interface (`{6924ea0c-c3cd-4826-b10a-f64f4ed927c1}`) returns `E_NOINTERFACE` and leaves the caller's output pointer untouched.
+  - **Case 3 (Factory failure refusal)**: When factory acquisition fails or is refused, the sequence aborts with exit code `0x301` leaving queues uncreated.
+  - **Case 4 (Queue failure refusal)**: When queue creation fails, the sequence aborts with exit code `0x303` with staging buffer configuration preserved.
+  - **Delayed-submit negative control**: Confirms that staged requests below the queue's half-capacity threshold remain pending and destination buffer bytes remain unmodified (`0xAA`) prior to explicit `Submit()`. Calling `Submit()` completes the staged request and sets completion.
+  - **Eager-provider negative control**: A faulty provider that completes prematurely on `EnqueueRequest` prior to `Submit()` is detected and rejected with exit code `0x304`.
+  - **Changed-IID patch control**: Patching the requested factory interface in the caller binary causes `DStorageGetFactory` to fail with `E_NOINTERFACE`, exiting with `0x301` under both loaders.
+
+On success, the caller exits with `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process cleanly with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return across all cases. An independent negative control confirms that withholding `DStorageGetFactory` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_dstorage$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_dstorage$' -V
 ```
 
 ### Grouped allocation descriptor builders
@@ -5739,6 +5808,14 @@ subnormals (`ftz`) report pixel mismatches under `--check-pixel-case`.
 resolver, but **does not query host Windows DLLs** or load/execute any image.
 The JSON output records direct versus delay imports, resolved package exports,
 forwarder chains, ambiguous package basenames, and unresolved local exports.
+An I386 importer cannot bind an AMD64 package DLL, or the reverse, even when its
+export name matches. Such an edge is `bundled_machine_mismatch`; its final chain
+step records the importer and provider machine tags, and traversal of that
+forwarder chain stops there. The check applies to direct and delayed imports and
+to intermediate forwarders. It does not reject an unrelated DLL that is not
+reachable. Other machine combinations, including ARM64EC/ARM64X hybrids, remain
+unverified rather than being classified by tag equality.
+This follows the [Windows in-process 32/64-bit DLL restriction](https://learn.microsoft.com/en-us/windows/win32/winprog64/process-interoperability).
 It follows static package providers reachable from the chosen EXE, preserving
 intermediate forwarders and preferring unconditional paths. Images not reached by that analysis are listed
 separately. External providers (including Windows system DLLs) are recorded as
@@ -5763,11 +5840,18 @@ under `out/` and must not contain private package data in a public PR.
 
 On a separate, source-built Win64 diagnostic executable, a Linux smoke test
 reported 46 static imports as external/unverified and zero bundled failures:
-no DLLs were included in that diagnostic directory. The self-contained eight-test
+no DLLs were included in that diagnostic directory. The self-contained eleven-test
 suite checks forwarded exports and ordinals, missing symbols, forwarder cycles,
 ambiguous local basenames, delay-import reachability, deterministic JSON output,
-path escapes, symlinks, hard-linked outputs and malformed PE CLI rejection. All tests use synthetic
+path escapes, symlinks, hard-linked outputs, I386/AMD64 import and forwarder mismatches,
+and malformed PE CLI rejection. All tests use synthetic
 metadata and fake local files; no title files or binary fixtures are checked in.
+
+An additional source-built smoke comparison used Clang/LLD 21.1.8 on Linux: an
+AMD64 EXE imports `Start` from `shim.dll`, built once as AMD64 and once as I386
+from the same C function. The matching pair reports one bundled export and zero
+failures; replacing only the DLL with the I386 build reports one machine mismatch.
+Before this check, both packages reported zero failures. Neither image was executed.
 
 
 ### Starting source-built packages with ordinal-only DLL exports
@@ -5802,3 +5886,65 @@ direct and forwarded ordinal routes and missing-symbol errors.
 This addresses **only static packaged ordinal binding**, not console ABI,
 DLL cycles, unknown runtime provider contracts, thread-local slot zero, or
 execution of any retail executable. The public tests contain no private binaries.
+
+
+## Legacy SSE FP compares and partial/non-temporal moves
+
+[The SSE FP leaf translator](../tools/cpu_sse_fp_aot.py) lifts bounded straight-line
+Windows x64 leaf functions covering five uncovered forms from `docs/coverage/x64_zen2.tsv`
+group `SSE`:
+
+- Packed float compare: `cmpps` (all eight `imm8` predicates `0..7`, `xmm` and 16-byte aligned `m128` sources)
+- Scalar float compare: `cmpss` (all eight `imm8` predicates `0..7`, `xmm` and unaligned `m32` sources, preserving bits `127:32` of the destination)
+- Half-qword float moves: `movlps` and `movhps` (`m64` load-merge preserving the other 64 bits, and `m64` store)
+- Non-temporal store: `movntps` (16-byte aligned `m128` store)
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned
+flat buffers (`rcx` and `rdx` inputs, `r8` output) with 16-byte-aligned bases and
+returns `void`. Register state covers `xmm0`..`xmm5` modeled as `Vec128` (`std::uint64_t q[2]`).
+For transport and ABI glue, the translator accepts `movaps`, `movdqa`, `movdqu` and
+terminal `ret`. Memory stores (`movlps`, `movhps`, `movntps`, `movaps`, `movdqa`, `movdqu`)
+must target an `r8`-rooted flat `[r8 + disp]` address; full 128-bit aligned operands
+(`cmpps` `m128`, `movntps`, `movaps` `m128`, `movdqa` `m128`) require displacements
+divisible by 16.
+
+The translator explicitly rejects VEX/EVEX encodings, `cmpps`/`cmpss` predicates
+`imm8 >= 8`, nonvolatile vector registers (`xmm6`..`xmm15`), nonvolatile or non-argument
+memory base registers, non-`r8` store destinations, unaligned 16-byte memory operands,
+undefined register reads/merges, `lock`/`rep`/segment prefixes, unsupported instructions,
+missing terminal `ret`, and instructions after `ret`.
+
+```powershell
+cmake --build --preset dev --target cpu_sse_fp_original cpu_sse_fp_original_lifted cpu_sse_fp_altered cpu_sse_fp_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fp$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/sse_fp.asm) exports 34 functions covering all five
+forms: all eight `cmpps` predicates plus aligned `m128`, displaced `m128` and self-compare
+cases; all eight `cmpss` predicates plus `m32`, unaligned `+1` `m32` and self-compare
+cases; `movlps`/`movhps` loads and stores including unaligned `+1` addresses; `movntps`
+aligned stores at `+0` and `+16`; and a chained `op_pipeline` export. [The differential check](../tests/cpu/sse_fp_check.py)
+verified 720 cases across the 34 exports bit-for-bit against both the native MASM DLL
+and an independent Python IEEE-754 single-precision reference model under default MXCSR
+controls (including signed zeros, infinities, quiet and signaling NaNs with distinct
+payloads, subnormals, and 32-byte pre/post buffer guards).
+
+A separate leaf stores one vector, executes a 16-byte load whose result is unused, and then stores
+another vector. Both native and translated code perform both stores when the source is readable.
+An inaccessible source must fault after the first store and leave the second vector unchanged,
+including in the Release preset.
+
+An `ALTER_IMM` variant flips predicates on `op_cmpps_1` (`1` to `5`), `op_cmpps_3`
+(`3` to `7`), `op_cmpps_6` (`6` to `2`), `op_cmpss_1` (`1` to `5`), `op_cmpss_3` (`3` to `7`),
+and `op_cmpss_6` (`6` to `2`); the altered lifted DLL matched the altered reference and
+diverged from the original on 27 cases per export. An output-mutation control confirmed
+the comparator detects single-bit output mismatches. Byte-decoded and synthetic `iced_x86`
+controls passed 7 alternate-encoding lift checks, 60 unit rejection controls (9 VEX/EVEX,
+4 `imm8 >= 8`, 15 unsupported instructions, 32 ABI/state/addressing/prefix/stream violations),
+and 10 end-to-end PE-patched DLL rejection controls.
+
+Not covered by this experiment: non-default MXCSR modes (FTZ/DAZ or unmasked exceptions),
+non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
+prologues, and title CPU code execution.
