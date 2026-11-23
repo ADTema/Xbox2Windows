@@ -371,7 +371,156 @@ def audit_candidates():
             assert profiles == ["store"] and expected in emitted[0].splitlines()
 
 
+# Two-exit compute programs (#721), reusing the pixel verifier from #477. Both kernels are the
+# llc-15 output (-mtriple=amdgcn--amdpal -mcpu=gfx1013 -O2) of an original source:
+#   if (gid >= n) return;   // wave-uniform, with branch weights that mark the return likely
+#   store gid at a byte offset;
+# The conditional branch jumps over the early s_endpgm to the store block.
+EXIT_KERNEL = [  # amdgpu_kernel: group X in s2, bound n and descriptor from the kernel arguments
+    "s_load_dword s3, s[0:1], 0x8",
+    "s_waitcnt lgkmcnt(0)",
+    "s_cmp_ge_u32 s2, s3",
+    "s_cbranch_scc0 .Lbody",
+    "s_endpgm",
+    ".Lbody:",
+    "s_load_dwordx2 s[0:1], s[0:1], null",
+    "v_lshlrev_b32_e32 v0, 2, v0",
+    "v_mov_b32_e32 v1, s2",
+    "s_waitcnt lgkmcnt(0)",
+    "s_load_dwordx4 s[4:7], s[0:1], null",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v1, v0, s[4:7], 0 offen",
+    "s_endpgm",
+]
+EXIT_CS = [  # amdgpu_cs: descriptor, n and the group ID as SGPR arguments
+    "s_cmp_ge_u32 s5, s4",
+    "s_cbranch_scc0 .Lbody",
+    "s_endpgm",
+    ".Lbody:",
+    "s_lshl_b32 s4, s5, 2",
+    "v_mov_b32_e32 v0, s5",
+    "v_mov_b32_e32 v1, s4",
+    "buffer_store_dword v0, v1, s[0:3], 0 offen",
+    "s_endpgm",
+]
+# The same source with a per-lane bound (local X >= n). LLVM 15 merges the per-lane return into
+# one exit: s_cbranch_execz skips the store and reaches the only s_endpgm.
+LANE_EXIT = [
+    "s_load_dword s3, s[0:1], 0x8",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s3, vcc_lo",
+    "s_cbranch_execz .Lend",
+    "s_load_dwordx2 s[0:1], s[0:1], null",
+    "v_lshlrev_b32_e32 v0, 2, v0",
+    "v_mov_b32_e32 v1, s2",
+    "s_waitcnt lgkmcnt(0)",
+    "s_load_dwordx4 s[4:7], s[0:1], null",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v1, v0, s[4:7], 0 offen",
+    ".Lend:",
+    "s_endpgm",
+]
+
+
+def assemble(directory, assembler, objcopy, lines):
+    src, obj, raw = [directory / x for x in ("exit.s", "exit.o", "exit.bin")]
+    src.write_text("\n".join(lines) + "\n", encoding="ascii")
+    subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
+    subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+    return raw.read_bytes()
+
+
+def bounded_container(code, *, mesh=False):
+    """A DXBC container whose FSSM v0x101 section ends in s_code_end padding."""
+    padded = code + bytes.fromhex("00009fbf") * (4 - (len(code) // 4 + 10) % 4)
+    payload = envelope(padded, directory_end=(40 + len(padded), 288 + len(padded)), compute_width=64,
+                       mesh_limits=(64, 32) if mesh else None)
+    return _read_named_container(payload, 1 + len(b"fixture") + 1)
+
+
+def rejects(message, function, *args, **kwargs):
+    """Require the named diagnostic, so a rejection cannot pass for an unrelated reason."""
+    try:
+        function(*args, **kwargs)
+    except ValueError as error:
+        assert message in str(error), error
+    else:
+        raise AssertionError(f"Expected rejection: {message}")
+
+
+def two_exits(directory, assembler, objcopy, library):
+    """Extraction only: the code span is verified, the compute lowering still stops at the branch."""
+    def extract(code, *, mesh=False, llvm=library):
+        return aot.container_code(parts(bounded_container(code, mesh=mesh))[b"DXIL"],
+                                  stage=13 if mesh else 5, llvm=llvm)
+
+    def retarget(code, target):
+        # Point the conditional branch at a byte offset that labels cannot express.
+        pc = next(pc for pc, line in disassemble(code, library, offsets=True) if line.startswith("s_cbranch"))
+        return code[:pc] + struct.pack("<h", (target - pc - 4) // 4) + code[pc + 2:]
+
+    accepted = []
+    for lines, first_stop in ((EXIT_KERNEL, "s_load_dword s3, s[0:1], 0x8"), (EXIT_CS, "s_cmp_ge_u32 s5, s4")):
+        code = assemble(directory, assembler, objcopy, lines)
+        decoded = disassemble(code, library)
+        assert decoded.count("s_endpgm") == 2 and "s_cbranch_scc0 1" in decoded, decoded
+        assert extract(code) == code
+        accepted.append(code)
+        # The stage and the exact count stay explicit: LLVM is required, mesh stays rejected.
+        rejects("Unverified multi-exit program", extract, code, llvm=None)
+        rejects("Unverified multi-exit program", extract, code, mesh=True)
+        # The CLI and the audit pass LLVM through, so the first stop moves to the lowering.
+        blob = bounded_container(code)
+        container, output = directory / "exit.dxbc", directory / "exit.hlsl"
+        container.write_bytes(blob)
+        cli = subprocess.run([sys.executable, "-B", str(Path(aot.__file__)), container, "--output", output,
+                              "--llvm", library, "--table-reg", "0", "--descriptor-offset", "0"],
+                             capture_output=True, text=True)
+        assert cli.returncode == 1 and f"Unsupported compute instruction: {first_stop}" in cli.stderr, cli.stderr
+        assert shader_profile_audit.classify(blob, parts(blob), 5, library, None) == ([], "store lowering")
+
+    kernel = accepted[0]
+    # A per-lane return is one exit and passes without the two-exit check.
+    lane = assemble(directory, assembler, objcopy, LANE_EXIT)
+    assert extract(lane, llvm=None) == lane
+    # A direct branch may skip alignment NOPs, which stay in the span; any other skipped word fails.
+    nop = assemble(directory, assembler, objcopy, ["s_branch .Lstart", "s_nop 0", ".Lstart:"] + EXIT_KERNEL)
+    assert extract(nop) == nop and nop.endswith(kernel)
+    exit_at = EXIT_KERNEL.index(".Lbody:")
+    skipped = EXIT_KERNEL[:exit_at] + ["s_mov_b32 s9, 0"] + EXIT_KERNEL[exit_at:]
+    skipped_start = ["s_branch .Lstart", "s_mov_b32 s9, 0", ".Lstart:"] + EXIT_KERNEL
+    # The target must directly follow the early exit, even with a NOP between them.
+    after_exit = EXIT_KERNEL[:exit_at] + ["s_nop 0"] + EXIT_KERNEL[exit_at:]
+    # Wrong targets: one instruction late, or the final exit with the store block unreachable.
+    late = EXIT_KERNEL[:exit_at] + EXIT_KERNEL[exit_at + 1:exit_at + 2] + [".Lbody:"] + EXIT_KERNEL[exit_at + 2:]
+    final = EXIT_KERNEL[:exit_at] + EXIT_KERNEL[exit_at + 1:-1] + [".Lbody:", "s_endpgm"]
+    # Disconnected exits: an unconditional branch strands the early exit; no branch strands the store.
+    jump = [line.replace("s_cbranch_scc0", "s_branch") for line in EXIT_KERNEL]
+    straight = [line.replace("s_cbranch_scc0 .Lbody", "s_nop 0") for line in EXIT_KERNEL]
+    for lines in (skipped, skipped_start, after_exit, late, final, jump, straight):
+        rejects("Unreachable code or unverified alternate exit",
+                extract, assemble(directory, assembler, objcopy, lines))
+    # A third exit, and a literal that spells s_endpgm, exceed the exact two-marker limit.
+    third = EXIT_KERNEL[:exit_at] + ["s_cmp_eq_u32 s3, 0", "s_cbranch_scc0 .Lmid", "s_endpgm", ".Lmid:"] + \
+        EXIT_KERNEL[exit_at:]
+    spelled = [line.replace("v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v1, 0xbf810000") for line in EXIT_KERNEL]
+    for lines in (third, spelled):
+        rejects("Unverified multi-exit program", extract, assemble(directory, assembler, objcopy, lines))
+    # In a one-exit program the same literal makes two raw markers but only one decoded exit.
+    rejects("Expected two decoded exits", extract, assemble(directory, assembler, objcopy, [
+        line.replace("v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v1, 0xbf810000") for line in LANE_EXIT]))
+    # Branches into a literal operand or into the trailing s_code_end padding.
+    literal = assemble(directory, assembler, objcopy,
+                       [line.replace("v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v1, 0x12345678") for line in EXIT_KERNEL])
+    assert extract(literal) == literal
+    operand = next(pc for pc, line in disassemble(literal, library, offsets=True) if "0x12345678" in line) + 4
+    for target in (operand, len(literal)):
+        rejects("Branch outside decoded instruction boundaries", extract, retarget(literal, target))
+
+
 def binary(directory, assembler, objcopy, library):
+    two_exits(directory, assembler, objcopy, library)
     for _, lines, width, binding in CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
         src.write_text("\n".join(lines) + "\n", encoding="ascii")

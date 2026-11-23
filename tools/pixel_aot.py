@@ -169,7 +169,9 @@ def container_code(program, *, stage, llvm=None):
         markers = sum(word == 0xbf810000 for word, in struct.iter_unpack("<I", code))
         if markers == 1:
             return code
-        if stage == 0 and markers == 2 and llvm is not None:
+        # Exactly two exits, verified for pixel (0) and compute (5) only. Mesh and other
+        # stages, and three or more markers, stay rejected.
+        if stage in (0, 5) and markers == 2 and llvm is not None:
             _check_two_exits(code, llvm)
             return code
         raise ValueError("Unverified multi-exit program")
