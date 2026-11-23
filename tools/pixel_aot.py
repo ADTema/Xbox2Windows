@@ -474,13 +474,16 @@ ALU = {
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     # Legacy multiply, then an unfused add: 0 * x is 0 even for an infinite or NaN x.
     "mad_legacy": (3, "((({0} == 0 || {1} == 0) ? 0.0f : {0} * {1}) + {2})"),
+    # The same, with the destination as the accumulator operand (LLVM 15 VOP2Instructions.td: VOP_MAC_LEGACY_F32).
+    "mac_legacy": (3, "((({0} == 0 || {1} == 0) ? 0.0f : {0} * {1}) + {2})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
     "mad": (3, "mad32({0}, {1}, {2})"), "mac": (3, "mad32({0}, {1}, {2})"),
     # Each result is one of the operands, so finite inputs need no rounding.
     "min3": (3, "min(min({0}, {1}), {2})"), "max3": (3, "max(max({0}, {1}), {2})"),
     "med3": (3, "max(min({0}, {1}), min(max({0}, {1}), {2}))"),
 }
-DPP_ALU = {k: v for k, v in ALU.items() if k != "fma"}
+# LLVM 15 sets HasExtDPP = 0 for v_mac_legacy_f32, so it has no DPP form.
+DPP_ALU = {k: v for k, v in ALU.items() if k not in ("fma", "mac_legacy")}
 # N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
     "f": "false", "tru": "true",
@@ -2282,7 +2285,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         elif m := match(rf"v_({'|'.join(ALU)})_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
-            if op in ("fmac", "mac"):
+            if op in ("fmac", "mac", "mac_legacy"):
                 tokens.append(dst)
             arity, template = ALU[op]
             quad = mask == "quad"

@@ -732,6 +732,41 @@ def legacy_multiply_add():
     ])
 
 
+# v_mac_legacy_f32 is D = legacy_mul(S0, S1) + D, the destination being the accumulator (LLVM 15 VOP2Instructions.td:
+# VOP_MAC_LEGACY_F32 under Constraints = "$vdst = $src2"). A, B, C and D are the constants in s44 to s47. Each channel
+# starts as a copy of its accumulator: C, C, A and D. Channel 0 is the e32 form; channels 1 to 3 are e64 with a
+# negated source, an absolute-value source and clamp.
+MAC_LEGACY_BODY = [
+    "v_mov_b32_e32 v18, s45",
+    "v_mov_b32_e32 v19, s47",
+    "v_mov_b32_e32 v12, s46",
+    "v_mov_b32_e32 v13, s46",
+    "v_mov_b32_e32 v14, s44",
+    "v_mov_b32_e32 v15, s47",
+    "v_mac_legacy_f32_e32 v12, s44, v18",
+    "v_mac_legacy_f32_e64 v13, -v18, s44",
+    "v_mac_legacy_f32_e64 v14, |s46|, v19",
+    "v_mac_legacy_f32_e64 v15, s44, v18 clamp",
+]
+# The last set is (1 + 2^-23) * (1 - 2^-23) + -1: unfused it is 0, fused it is -2^-46.
+MAC_LEGACY_SETS = ((0.0, math.inf, 1.5, -2.0), (2.0, 3.0, 0.5, 0.25), (0.0, math.nan, -0.75, 4.0),
+                   (-1.5, 0.0, 2.0, 0.5), (3.0, -2.0, 1.0, -1.0), (1 + 2.0**-23, 1 - 2.0**-23, -1.0, 0.0))
+
+
+def mac_legacy_reference(a, b, c, d, *, fused_first_channel=False, accumulate=lambda x, y, acc: acc):
+    """The four exported values, from an independent model: a zero factor gives zero, then a rounded unfused add.
+    accumulate chooses the added operand from (x, y, acc); the default is the destination, as the instruction has."""
+    def legacy(x, y, acc):
+        product = 0.0 if x == 0 or y == 0 else x * y
+        return single(single(product) + accumulate(x, y, acc))
+
+    values = [legacy(a, b, c), legacy(-b, a, c), legacy(abs(c), d, a), min(1.0, max(0.0, legacy(a, b, d)))]
+    if fused_first_channel:
+        values[0] = single(a * b + c)
+    assert not any(math.isnan(v) for v in values), values
+    return tuple(values)
+
+
 def ceiling():
     return with_constants([
         "v_ceil_f32_e32 v12, s44",
@@ -1102,6 +1137,46 @@ def check_e64_approx_lowering():
     # v_mac_f32 reads its destination, so an unwritten one is refused, as is a third source.
     must_reject(translate, with_constants(["v_mac_f32_e64 v20, -s44, |s45|"]))
     must_reject(translate, with_constants(["v_mov_b32_e32 v14, s46", "v_mac_f32_e64 v14, -s44, |s45|, v14"]))
+
+
+def check_mac_legacy_lowering():
+    """Static checks for MAC_LEGACY_BODY and the forms LLVM 15 does not have for v_mac_legacy_f32."""
+    program = uncompressed_export(MAC_LEGACY_BODY)
+    body = translate(program).split("float4 main", 1)[1]
+    assert {"v_mac_legacy_f32_e32", "v_mac_legacy_f32_e64"} <= ACCEPTED, ACCEPTED
+    assert body.count("? 0.0f :") == 4 and body.count("saturate(") == 1 and "mad32(" not in body and " mad(" not in body, body
+    # Each product is added to the value the destination held before the instruction: the copies of C, C, A and D.
+    for line in ("alu26 = (((params[0].w == 0 || alu20 == 0) ? 0.0f : params[0].w * alu20) + alu22);",
+                 "alu27 = ((((-alu20) == 0 || params[0].w == 0) ? 0.0f : (-alu20) * params[0].w) + alu23);",
+                 "alu28 = (((abs(params[1].y) == 0 || alu21 == 0) ? 0.0f : abs(params[1].y) * alu21) + alu24);",
+                 "alu29 = saturate((((params[0].w == 0 || alu20 == 0) ? 0.0f : params[0].w * alu20) + alu25));"):
+        assert line in body, line
+    # No DPP form exists in LLVM 15 (HasExtDPP = 0), and the SDWA table is an explicit list without it.
+    assert "mac_legacy" in ALU and "mac_legacy" not in pixel_aot.DPP_ALU and "mac_legacy" not in pixel_aot.SDWA_ALU
+
+    def swap(old, new):
+        return [line.replace(old, new) for line in program]
+
+    pos = program.index("v_mac_legacy_f32_e32 v12, s44, v18")
+    for line in ("v_mac_legacy_f32_dpp v12, v18, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                 "v_mac_legacy_f32_sdwa v12, v18, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+                 "v_fmac_legacy_f32 v12, s44, v18"):
+        expect_value_error(translate, program[:pos] + [line] + program[pos + 1:], f"Unsupported instruction {pos}: {line}")
+    # Operands: the accumulator is implicit, so a third source or a missing second one is refused.
+    for old, new in (("v_mac_legacy_f32_e32 v12, s44, v18", "v_mac_legacy_f32_e32 v12, s44, v18, v12"),
+                     ("v_mac_legacy_f32_e32 v12, s44, v18", "v_mac_legacy_f32_e32 v12, s44"),
+                     ("v_mac_legacy_f32_e64 v15, s44, v18 clamp", "v_mac_legacy_f32_e64 v15, s44, v18, v15 clamp")):
+        changed = swap(old, new)
+        assert changed != program
+        expect_value_error(translate, changed, "Invalid arithmetic operation")
+    # The accumulator must hold a tracked value, as for v_mac_f32: v20 was never written.
+    changed = swap("v_mac_legacy_f32_e32 v12, s44, v18", "v_mac_legacy_f32_e32 v20, s44, v18")
+    try:
+        translate(changed)
+    except KeyError as error:
+        assert error.args == ("v20",), error
+    else:
+        raise AssertionError("An untracked accumulator was accepted")
 
 
 def check_e64_approx_draws(directory, compiler, renderer, backend):
@@ -6527,6 +6602,7 @@ def check_controls(directory):
     must_reject(translate, with_constants(["v_mad_f32 v12, s44, s45"]))
     must_reject(translate, with_constants(["v_mac_f32_e32 v14, s44, v15, v14"]))
     check_e64_approx_lowering()
+    check_mac_legacy_lowering()
     # v_madak_f32 and v_madmk_f32 use the same helper. The literal is the last operand of madak and the
     # second of madmk; a register there, a missing operand, and the e64, DPP and SDWA spellings are refused.
     body = translate(with_constants(MAD_LITERAL_BODY)).split("float4 main", 1)[1]
@@ -7033,6 +7109,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((reciprocal_iflag(), translate))
     fixtures.append((offset_nibbles(), translate))
     fixtures.append((legacy_multiply_add(), translate))
+    fixtures.append((uncompressed_export(MAC_LEGACY_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
@@ -8522,6 +8599,60 @@ def check_legacy_multiply_add_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing the legacy multiply-add lost the zero rule without detection")
 
 
+def check_mac_legacy_draws(directory, compiler, renderer, backend):
+    """Draw MAC_LEGACY_BODY on every constant set, then draw wrong lowerings and wrong references.
+
+    The right shader must match mac_legacy_reference on all sets. Each wrong lowering must mismatch on at
+    least one set, and a fused reference must mismatch on the last. A renderer that reports an unavailable
+    adapter (exit 77) makes this a skip. On a desktop GPU the draws establish what the translated shader
+    computes, not what the console does.
+    """
+    source = directory / "mac_legacy.hlsl"
+    shader = directory / "mac_legacy.cso"
+    program = uncompressed_export(MAC_LEGACY_BODY)
+
+    def write(path, values, expected):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, *values)
+        write_case(path, constants, expected)
+
+    cases = []
+    for idx, values in enumerate(MAC_LEGACY_SETS):
+        path = directory / f"mac_legacy-{idx}.case"
+        write(path, values, mac_legacy_reference(*values))
+        cases.append(path)
+    fused = directory / "mac_legacy-fused.case"
+    write(fused, MAC_LEGACY_SETS[-1], mac_legacy_reference(*MAC_LEGACY_SETS[-1], fused_first_channel=True))
+    assert mac_legacy_reference(*MAC_LEGACY_SETS[-1])[0] == 0.0 != mac_legacy_reference(
+        *MAC_LEGACY_SETS[-1], fused_first_channel=True)[0]
+
+    def statuses(body_template=None):
+        with patch.dict(ALU, {} if body_template is None else {"mac_legacy": (3, body_template)}):
+            source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        return run_pixel_batch_statuses(renderer, backend, shader, [*cases, fused])[0]
+
+    right = statuses()
+    if right != ["pass"] * len(cases) + ["mismatch"]:
+        raise AssertionError(f"Unexpected statuses for the legacy multiply-accumulate: {right}")
+    legacy = "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"
+    # A plain product of 0 and infinity is NaN, so the first set separates the lowering without the zero rule.
+    assert math.isnan(MAC_LEGACY_SETS[0][0] * MAC_LEGACY_SETS[0][1])
+    mutants = (
+        ("legacy zero rule removed", "(({0} * {1}) + {2})", None),
+        ("accumulator ignored", f"({legacy} + 0)", lambda x, y, acc: 0.0),
+        ("source 1 as accumulator", f"({legacy} + {{1}})", lambda x, y, acc: y),
+        ("source 0 as accumulator", f"({legacy} + {{0}})", lambda x, y, acc: x),
+    )
+    for label, template, accumulate in mutants:
+        if accumulate is not None:
+            # The Python model of the wrong lowering must differ from the right one, so the fixture can see it.
+            assert any(mac_legacy_reference(*values, accumulate=accumulate) != mac_legacy_reference(*values)
+                       for values in MAC_LEGACY_SETS if not any(map(math.isnan, values))), label
+        if "mismatch" not in statuses(template)[:len(cases)]:
+            raise AssertionError(f"The wrong lowering escaped detection: {label}")
+
+
 def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend: str) -> None:
     hlsl = directory / "rgb-sample.hlsl"
     shader = directory / "rgb-sample.cso"
@@ -9383,7 +9514,8 @@ def main():
         directory = Path(tmp)
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
-                    "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap"):
+                    "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
+                    "draw-mac-legacy"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -9395,7 +9527,8 @@ def main():
                         "draw-align": check_align_draws,
                         "draw-plain-bitscan": check_plain_bitscan_draw,
                         "draw-vop3-ternary-int": check_vop3_ternary_int_draws,
-                        "draw-swap": check_swap_draw}[mode]
+                        "draw-swap": check_swap_draw,
+                        "draw-mac-legacy": check_mac_legacy_draws}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
