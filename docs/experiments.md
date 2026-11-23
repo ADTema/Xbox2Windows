@@ -4064,6 +4064,8 @@ Build the same `xg_swizzle_select_check` target and run both factory tests with 
 
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
 
+The GPU check report includes the adapter's shader-visible CBV/SRV/UAV descriptor heap limit from D3D12 OPTIONS19. Compare the `max_view_descriptor_heap_size` line in `ctest --preset dev --no-tests=error -R '^offscreen_(hardware|warp)$' -V`. The report says `not reported` when the runtime does not provide a limit.
+
 The original test machine had Windows Graphics Tools installed. A second build in `out/build/agility` used Microsoft Agility SDK 1.620.2. Set `-DOFFSCREEN_AGILITY_620_DIR=<directory containing the x64 SDK DLLs>` to reproduce it. This configuration verifies debug interface activation. [Agility SDK package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
 
 ### Desktop GPU addresses for xmem graphics allocations

@@ -1506,6 +1506,14 @@ int main(int argc, char** argv)
         } else {
             std::puts("driver=unavailable via DXGI");
         }
+#if defined(__ID3D12Device12_INTERFACE_DEFINED__)
+        D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19{};
+        if (SUCCEEDED(check_feature(device.Get(), D3D12_FEATURE_D3D12_OPTIONS19,
+                                    &options19, sizeof(options19))) &&
+            options19.MaxViewDescriptorHeapSize) {
+            std::printf("max_view_descriptor_heap_size=%u\n", options19.MaxViewDescriptorHeapSize);
+        }
+#endif
         if (debug) check(device.As(&messages), "Read debug queue");
         const AdapterCaps caps = query_adapter_caps(device.Get());
         if (cli.action == CliAction::draw) {
