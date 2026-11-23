@@ -32,3 +32,4 @@ EXPORTS
     vpmaddubsw_op
     vpsadbw_op
     vmpsadbw_op
+    vmpsadbw256_mem

@@ -332,4 +332,13 @@ vmpsadbw_op PROC FRAME
     ret
 vmpsadbw_op ENDP
 
+vmpsadbw256_mem PROC FRAME
+    .endprolog
+    vmovups ymm1, ymmword ptr [rcx]
+    vmpsadbw ymm0, ymm1, ymmword ptr [rdx], 15h
+    vmovups ymmword ptr [r8], ymm0
+    vzeroupper
+    ret
+vmpsadbw256_mem ENDP
+
 END
