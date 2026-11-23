@@ -108,8 +108,11 @@ a bound range only at its start; the callee is walked within that range alone,
 may not move RSP or call, and may not be an import thunk.
 
 A call or tail jump through the import address table is translated only through
-an explicit binding (--bind, --import-arguments, --return-bytes): one IAT slot
-for all functions of a run, which must hold the import that the binding names.
+an explicit binding (--bind, --import-arguments, --return-bytes). One binding
+covers one IAT slot for all functions of a run, which must hold the import that
+the binding names. With several --bind options, each names a distinct ordinary
+import of the image and binds the slot that holds it; a reached slot that no
+binding names is refused, as is a binding that no call or tail jump uses.
 It may be reached by call or jmp QWORD PTR [rip+slot], or by a direct CALL or
 JMP of an import thunk: the six bytes FF 25 disp32 at a target outside every
 unwind interval and bound range, read as a call or tail jump through their
@@ -172,6 +175,7 @@ STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL, 
 MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
+ROTATES = {M.ROL: "true", M.ROR: "false"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
@@ -181,10 +185,18 @@ SIGN_EXTENSIONS = {M.CBW: (R.AL, R.AX), M.CWDE: (R.AX, R.EAX), M.CDQE: (R.EAX, R
 # Implicit operands of one-operand MUL, IMUL, DIV and IDIV, by operand width.
 ACCUMULATOR = {1: R.AL, 2: R.AX, 4: R.EAX, 8: R.RAX}
 DATA = {2: R.DX, 4: R.EDX, 8: R.RDX}
+# Key by decoded Code, not Mnemonic: MOVSD also names an unrelated SSE instruction.
+STRING_TRANSFERS = {
+    Code.MOVSB_M8_M8: ("movs", 1), Code.MOVSW_M16_M16: ("movs", 2),
+    Code.MOVSD_M32_M32: ("movs", 4), Code.MOVSQ_M64_M64: ("movs", 8),
+    Code.STOSB_M8_AL: ("stos", 1), Code.STOSW_M16_AX: ("stos", 2),
+    Code.STOSD_M32_EAX: ("stos", 4), Code.STOSQ_M64_RAX: ("stos", 8),
+}
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC}
+FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
+                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -215,6 +227,9 @@ def full(register):
 def implicit_writes(ins):
     """Full registers that an instruction writes without naming them as operand 0. RDX counts for
     every one-operand multiply or divide, although an 8-bit multiply leaves it unchanged."""
+    if ins.code in STRING_TRANSFERS:
+        kind, _ = STRING_TRANSFERS[ins.code]
+        return {R.RDI} | ({R.RSI} if kind == "movs" else set()) | ({R.RCX} if ins.has_rep_prefix else set())
     if ins.mnemonic in SIGN_EXTENSIONS:
         return {full(SIGN_EXTENSIONS[ins.mnemonic][1])}
     if ins.mnemonic in (M.MUL, M.IMUL, M.DIV, M.IDIV) and ins.op_count == 1:
@@ -900,46 +915,51 @@ class Lifter:
         code = CONDITIONS.get(jcc.condition_code)
         width = self.width(producer)
         u, s = unsigned(width), signed(width)
+        a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
+        sign = f"{1 << (width * 8 - 1):#x}ull"
         if producer.mnemonic in (M.CMP, M.SUB):
-            a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
-            result = f"static_cast<{s}>(static_cast<{u}>({a} - {b}))"
+            flag_result = f"static_cast<{u}>({a} - {b})"
+            overflow = f"((({a} ^ {b}) & ({a} ^ {flag_result}) & {sign}) != 0)"
             table = {"e": f"{a} == {b}", "ne": f"{a} != {b}", "b": f"{a} < {b}", "ae": f"{a} >= {b}",
                      "be": f"{a} <= {b}", "a": f"{a} > {b}", "l": f"static_cast<{s}>({a}) < static_cast<{s}>({b})",
                      "ge": f"static_cast<{s}>({a}) >= static_cast<{s}>({b})",
                      "le": f"static_cast<{s}>({a}) <= static_cast<{s}>({b})",
                      "g": f"static_cast<{s}>({a}) > static_cast<{s}>({b})",
-                     "s": f"{result} < 0", "ns": f"{result} >= 0"}
+                     "s": f"static_cast<{s}>({flag_result}) < 0", "ns": f"static_cast<{s}>({flag_result}) >= 0"}
         else:
-            result = f"static_cast<{u}>(fa)"
-            table = {"e": f"{result} == 0", "ne": f"{result} != 0",
-                     "s": f"static_cast<{s}>({result}) < 0", "ns": f"static_cast<{s}>({result}) >= 0"}
+            if producer.mnemonic == M.ADD:
+                flag_result = f"static_cast<{u}>({a} + {b})"
+                overflow = f"((~({a} ^ {b}) & ({a} ^ {flag_result}) & {sign}) != 0)"
+            else:
+                flag_result = f"static_cast<{u}>(fa)"
+                if producer.mnemonic in (M.INC, M.NEG):
+                    overflow = f"{flag_result} == {sign}"
+                elif producer.mnemonic == M.DEC:
+                    overflow = f"{flag_result} == {((1 << (width * 8 - 1)) - 1):#x}ull"
+                else:
+                    overflow = "false"  # TEST, AND, OR and XOR clear OF.
+            s_cond = f"static_cast<{s}>({flag_result}) < 0"
+            ns_cond = f"static_cast<{s}>({flag_result}) >= 0"
+            table = {"e": f"{flag_result} == 0", "ne": f"{flag_result} != 0", "s": s_cond, "ns": ns_cond}
             if producer.mnemonic in (M.TEST, M.AND, M.OR, M.XOR):
                 # Logical operations clear CF and OF.
-                table.update({"b": "false", "ae": "true", "be": f"{result} == 0", "a": f"{result} != 0",
-                              "l": table["s"], "ge": table["ns"],
-                              "le": f"{result} == 0 || {table['s']}", "g": f"{result} != 0 && {table['ns']}"})
+                table.update({"b": "false", "ae": "true", "be": f"{flag_result} == 0", "a": f"{flag_result} != 0",
+                              "l": s_cond, "ge": ns_cond,
+                              "le": f"{flag_result} == 0 || {s_cond}", "g": f"{flag_result} != 0 && {ns_cond}"})
+            else:
+                # ADD, INC, DEC and NEG share SF != OF signed comparisons; only ADD and NEG define CF.
+                table.update({"l": f"({s_cond}) != ({overflow})", "ge": f"({s_cond}) == ({overflow})",
+                              "le": f"{flag_result} == 0 || ({s_cond}) != ({overflow})",
+                              "g": f"{flag_result} != 0 && ({s_cond}) == ({overflow})"})
+                if producer.mnemonic == M.ADD:
+                    table.update({"b": f"{flag_result} < {a}", "ae": f"{flag_result} >= {a}",
+                                  "be": f"{flag_result} < {a} || {flag_result} == 0",
+                                  "a": f"{flag_result} >= {a} && {flag_result} != 0"})
+                elif producer.mnemonic == M.NEG:
+                    table.update({"b": f"{flag_result} != 0", "ae": f"{flag_result} == 0",
+                                  "be": "true", "a": "false"})
         # PF is even parity of only the low result byte. OF is signed overflow,
         # independent of the host's signed arithmetic and its overflow rules.
-        a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
-        sign = f"{1 << (width * 8 - 1):#x}ull"
-        if producer.mnemonic in (M.CMP, M.SUB, M.ADD):
-            operator = "+" if producer.mnemonic == M.ADD else "-"
-            flag_result = f"static_cast<{u}>({a} {operator} {b})"
-            same_sign = f"~({a} ^ {b})" if producer.mnemonic == M.ADD else f"({a} ^ {b})"
-            overflow = f"(({same_sign} & ({a} ^ {flag_result}) & {sign}) != 0)"
-            if producer.mnemonic == M.ADD:
-                # ADD now snapshots its operands, rather than just its result.
-                table.update({"e": f"{flag_result} == 0", "ne": f"{flag_result} != 0",
-                              "s": f"static_cast<{s}>({flag_result}) < 0",
-                              "ns": f"static_cast<{s}>({flag_result}) >= 0"})
-        else:
-            flag_result = f"static_cast<{u}>(fa)"
-            if producer.mnemonic == M.INC:
-                overflow = f"{flag_result} == {sign}"
-            elif producer.mnemonic == M.DEC:
-                overflow = f"{flag_result} == {((1 << (width * 8 - 1)) - 1):#x}ull"
-            else:
-                overflow = "false"  # TEST, AND, OR and XOR clear OF.
         table.update({"o": overflow, "no": f"!({overflow})",
                       "p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
         if code not in table:
@@ -958,6 +978,34 @@ class Lifter:
         sets_flags records the flag inputs for a later consumer; producer is the
         instruction whose flags a SETcc or CMOVcc reads."""
         mnemonic = ins.mnemonic
+        if ins.code in STRING_TRANSFERS:
+            kind, width = STRING_TRANSFERS[ins.code]
+            if (ins.has_segment_prefix or ins.has_repne_prefix or ins.has_lock_prefix
+                    or any(ins.op_kind(n) not in (OpKind.REGISTER, OpKind.MEMORY_ESRDI, OpKind.MEMORY_SEG_RSI)
+                           for n in range(ins.op_count))):
+                raise ValueError(f"unsupported string addressing or prefix at RVA {ins.ip:#x}")
+            registers = {R.RDI} | ({R.RSI} if kind == "movs" else set())
+            self.used.update(registers)
+            reads = dict.fromkeys(registers, 8)
+            writes = dict.fromkeys(registers, 8)
+            if kind == "movs":
+                value = f"load_always<{unsigned(width)}>(rsi)"
+            else:
+                self.used.add(R.RAX)
+                reads[R.RAX] = width
+                value = f"static_cast<{unsigned(width)}>(rax)"
+            # One element at a time: neither memcpy nor memmove reproduces a forward
+            # overlapping MOVS that reads the bytes just written by earlier iterations.
+            alignment = " __unaligned" if width > 1 else ""
+            step = (f"*reinterpret_cast<volatile {unsigned(width)}{alignment}*>(rdi) = {value}; "
+                    + ("rsi += step; " if kind == "movs" else "") + "rdi += step;")
+            if ins.has_rep_prefix:
+                self.used.add(R.RCX)
+                reads[R.RCX] = writes[R.RCX] = 8
+                step = f"while (rcx != 0) {{ {step} --rcx; }}"
+            return f"{{ const word step = direction ? 0ull - {width}ull : {width}ull; {step} }}", reads, writes
+        if mnemonic in (M.CLD, M.STD):
+            return f"direction = {'true' if mnemonic == M.STD else 'false'};", {}, {}
         width = self.width(ins)
         reads, writes = {}, {}
 
@@ -1031,17 +1079,19 @@ class Lifter:
             value = {M.INC: f"{a} + 1u", M.DEC: f"{a} - 1u", M.NEG: f"0u - {a}", M.NOT: f"~{a}"}[mnemonic]
             line = self.write(ins, width, value)
             if sets_flags:
-                if mnemonic not in (M.INC, M.DEC):
+                if mnemonic not in (M.INC, M.DEC, M.NEG):
                     raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
                 self.flags = True
                 line = f"fa = static_cast<{unsigned(width)}>({value}); " + line
             return line, reads, writes
-        if mnemonic in SHIFTS:
+        if mnemonic in (*SHIFTS, *ROTATES):
+            if sets_flags:
+                raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
             note(0)
             a = self.operand(ins, 0, width)
-            # x86 masks the count to six bits for 64-bit operands and to five bits otherwise, so an
-            # 8- or 16-bit destination can be shifted by up to 31. The shift is done in 64 bits
-            # (count < 64, no host overflow) and the write truncates the result to the destination.
+            # x86 masks the count to six bits for 64-bit operands and to five bits otherwise.
+            # Shifts widen to 64 bits (count < 64, no host overflow) and truncate on write;
+            # rotates mask modulo the operand width inside rotate_bits.
             mask = 63 if width == 8 else 31
             if ins.op1_kind == OpKind.REGISTER:
                 if ins.op1_register != R.CL:
@@ -1050,11 +1100,15 @@ class Lifter:
                 count = f"({self.reg(R.RCX)} & {mask}u)"
             else:
                 count = f"{ins.immediate(1) & mask}u"
-            if mnemonic == M.SAR:
-                a = f"static_cast<std::int64_t>(static_cast<{signed(width)}>({a}))"
+            if mnemonic in ROTATES:
+                value = f"rotate_bits<{unsigned(width)}>({a}, {count}, {ROTATES[mnemonic]})"
             else:
-                a = f"static_cast<std::uint64_t>({a})"
-            return self.write(ins, width, f"{a} {SHIFTS[mnemonic]} {count}"), reads, writes
+                if mnemonic == M.SAR:
+                    a = f"static_cast<std::int64_t>(static_cast<{signed(width)}>({a}))"
+                else:
+                    a = f"static_cast<std::uint64_t>({a})"
+                value = f"{a} {SHIFTS[mnemonic]} {count}"
+            return self.write(ins, width, value), reads, writes
         if mnemonic == M.IMUL and ins.op_count in (2, 3):
             # The two-operand form reads its destination; the three-operand form only writes it.
             if ins.op_count == 2:
@@ -1362,6 +1416,28 @@ def check_call_sites(function, offsets):
             raise ValueError(f"call without an aligned home space at entry RSP{offsets[ip]:+#x} at RVA {ip:#x}")
 
 
+def prove_direction(function):
+    """The Windows ABI enters with DF clear and requires it clear at calls and returns.
+
+    Keep both possibilities at joins. The emitted local follows the actual path;
+    this proof prevents a backwards-copy region from leaking DF across an ABI edge.
+    """
+    states = {function.entry: frozenset({False})}
+    work = [function.entry]
+    while work:
+        ip = work.pop()
+        ins = function.instructions[ip]
+        incoming = states[ip]
+        if (ins.mnemonic == M.RET or ip in function.calls or ip in function.tails) and True in incoming:
+            raise ValueError(f"direction flag may be set at call or return RVA {ip:#x}")
+        outgoing = (frozenset({ins.mnemonic == M.STD}) if ins.mnemonic in (M.CLD, M.STD) else incoming)
+        for target in function.successors[ip]:
+            merged = states.get(target, frozenset()) | outgoing
+            if merged != states.get(target):
+                states[target] = merged
+                work.append(target)
+
+
 def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=False):
     """Translate one export that takes the given number of integer arguments, 3 or 4.
 
@@ -1493,6 +1569,7 @@ def lift_function(program, entry, symbol, arguments, internal):
             what = "call" if moved[0] in function.calls else "stack change"
             raise ValueError(f"{what} in a function without unwind data at RVA {moved[0]:#x}")
     check_call_sites(function, frame.offsets)
+    prove_direction(function)
     lifter.frame = {ip: access[0] - frame.start for ip, access in frame.accesses.items()}
     lifter.adjustments = frame.adjustments
     producers = {ip: flag_producer(function, edges, ins) for ip, ins in instructions.items()
@@ -1508,7 +1585,7 @@ def lift_function(program, entry, symbol, arguments, internal):
     effects = {}
     for ip in order:
         ins = instructions[ip]
-        if ins.has_lock_prefix or ins.has_rep_prefix or ins.has_repne_prefix:
+        if ins.has_lock_prefix or ins.has_repne_prefix or (ins.has_rep_prefix and ins.code not in STRING_TRANSFERS):
             raise ValueError(f"unsupported prefix at RVA {ip:#x}")
         body[ip] = ""
         if ip in callees:
@@ -1630,6 +1707,8 @@ def lift_function(program, entry, symbol, arguments, internal):
             labels.add(ins.next_ip)
     locals_ = sorted((lifter.used | {R.RAX}) - set(function.arguments), key=lambda r: NAMES[r])
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
+    if any(ins.code in STRING_TRANSFERS or ins.mnemonic in (M.CLD, M.STD) for ins in instructions.values()):
+        declarations.append("bool direction = false;  // Windows x64 ABI entry state")
     function.image_data = lifter.image_used
     if lifter.image_used:
         # Read once at entry: a call while nothing is bound fails here, before any access.
@@ -1676,6 +1755,14 @@ static inline bool even_parity(word value) {
     const auto folded = static_cast<unsigned>((value ^ (value >> 4)) & 15u);
     return ((0x6996u >> folded) & 1u) == 0;
 }
+template <class T> static inline T rotate_bits(T value, word count, bool left) {
+    const unsigned bits = static_cast<unsigned>(sizeof(T) * 8);
+    const unsigned shift = static_cast<unsigned>(count & (bits - 1));
+    if (!shift) return value;
+    const unsigned amount = left ? shift : bits - shift;
+    const word wide = value;
+    return static_cast<T>((wide << amount) | (wide >> (bits - amount)));
+}
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {
     T value;
@@ -1685,7 +1772,7 @@ template <class T> static T load(word address) {
 // Every guest read, once per instruction: the compiler must perform it even when its value is unused,
 // because the original faults on an inaccessible address either way.
 template <class T> static T load_always(word address) {
-    return *reinterpret_cast<const volatile T*>(address);
+    return *reinterpret_cast<const volatile T __unaligned*>(address);
 }
 template <class T> static void store(word address, T value) {
     std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
@@ -1816,40 +1903,118 @@ def load_bindings(source):
     return {"image_sha256": digest, "functions": functions}
 
 
+def import_identities(pe):
+    """(DLL, name or "#ordinal") of each ordinary import by its IAT slot RVA, named as resolve_import names it."""
+    pe.parse_data_directories(directories=[1])  # ordinary import directory
+    return {imp.address - pe.OPTIONAL_HEADER.ImageBase:
+            (desc.dll.decode("ascii"), f"#{imp.ordinal}" if imp.import_by_ordinal else imp.name.decode("ascii"))
+            for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) for imp in desc.imports}
+
+
 def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
+    """binding is one Binding or a sequence of them; with several, each binds the IAT slot of the import it names."""
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
     if image_data and {"bind_image", "unbind_image"} & {parse_entry(name)[0] for name in names}:
         raise ValueError("an export named bind_image or unbind_image collides with the image binding functions")
     program = Program(pe, None if bindings is None else load_bindings(bindings), image_data=image_data)
-    slots = {}
-    if binding is not None:
-        if binding.arguments not in ARGUMENT_COUNTS or binding.return_bytes not in (0, 1, 2, 8):
-            raise ValueError(f"unsupported binding of {binding.symbol}")
-
+    bound = () if binding is None else (binding,) if isinstance(binding, Binding) else tuple(binding)
+    for item in bound:
+        if item.arguments not in ARGUMENT_COUNTS or item.return_bytes not in (0, 1, 2, 8):
+            raise ValueError(f"unsupported binding of {item.symbol}")
+    # With several bindings, each names one ordinary import of the image and a slot takes the binding of its import.
+    imported = import_identities(pe) if len(bound) > 1 else {}
+    by_import = {}
+    for index, item in enumerate(bound if len(bound) > 1 else ()):
+        key = (Path(item.provider).name.casefold(), item.symbol)
+        if key in by_import:
+            raise ValueError(f"two bindings of {Path(item.provider).name}!{item.symbol}")
+        if key not in {(dll.casefold(), name) for dll, name in imported.values()}:
+            raise ValueError(f"binding {Path(item.provider).name}!{item.symbol} names no ordinary import of the image")
+        by_import[key] = index
+    slots, chosen = {}, {}  # slot -> HostImport, slot -> index of its binding
+    if bound:
         def resolve_slot(slot):
-            if slots and slot not in slots:
-                raise ValueError(f"call or tail jump through a second IAT slot RVA {slot:#x}")
-            symbol = resolve_import(pe, slot, Path(binding.provider), binding.symbol, binding.link_name)
+            if len(bound) == 1:
+                if slots and slot not in slots:
+                    raise ValueError(f"call or tail jump through a second IAT slot RVA {slot:#x}")
+                index = 0
+            else:
+                if slot not in imported:
+                    raise ValueError(f"RIP-relative target RVA {slot:#x} is not an ordinary IAT slot")
+                dll, name = imported[slot]
+                index = by_import.get((dll.casefold(), name))
+                if index is None:
+                    raise ValueError(f"call or tail jump through IAT slot RVA {slot:#x} ({dll}!{name}) matches "
+                                     "no binding")
+            item = bound[index]
+            symbol = resolve_import(pe, slot, Path(item.provider), item.symbol, item.link_name)
             # The translation calls the import instead of reading the slot; the original's read must not fault.
             if not any(s.VirtualAddress <= slot and slot + 8 <= s.VirtualAddress + extent(s)
                        and s.Characteristics & SCN_READ for s in pe.sections):
                 raise ValueError(f"IAT slot RVA {slot:#x} is not 8 bytes of one readable section")
-            slots[slot] = HostImport(symbol, (8,) * binding.arguments, binding.return_bytes)
+            slots[slot], chosen[slot] = HostImport(symbol, (8,) * item.arguments, item.return_bytes), index
             return slots[slot]
         program.import_resolver = resolve_slot
     functions = [lift(pe, *parse_entry(name), program=program) for name in names]
     # Callees precede every caller, so each internal function is defined before its first use.
     sources = program.sources + [source for source, _ in functions]
-    declarations = ""
-    if binding is not None:
-        if not slots:
-            raise ValueError(f"binding {Path(binding.provider).name}!{binding.symbol} supplied but no call or "
+    lines = []
+    for index, item in enumerate(bound):
+        used = [slot for slot, owner in chosen.items() if owner == index]
+        if not used:
+            raise ValueError(f"binding {Path(item.provider).name}!{item.symbol} supplied but no call or "
                              "tail jump uses it")
-        symbol = next(iter(slots.values())).symbol
-        params = ", ".join(["word"] * binding.arguments)
-        declarations = f'\nextern "C" __declspec(dllimport) word {symbol}({params});\n'
+        lines.append((min(used), slots[min(used)].symbol, item))
+    # Declared in IAT slot order, so the source does not depend on the order of the bindings.
+    lines = [(symbol, item) for _, symbol, item in sorted(lines, key=lambda line: line[0])]
+    for (symbol, item), (other, earlier) in ((a, b) for n, a in enumerate(lines) for b in lines[:n]):
+        if symbol == other:
+            raise ValueError(f"bindings {Path(earlier.provider).name}!{earlier.symbol} and "
+                             f"{Path(item.provider).name}!{item.symbol} both declare the C name {symbol}")
+    declarations = "".join(f'\nextern "C" __declspec(dllimport) word {symbol}({", ".join(["word"] * item.arguments)});'
+                           for symbol, item in lines) + "\n" if lines else ""
     return PRELUDE + declarations + (image_block(pe) if image_data else "") + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
+
+
+class BindingOption(argparse.Action):
+    """Records --bind, --link-name, --import-arguments and --return-bytes in command-line order."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        # The canonical spelling: argparse also accepts an abbreviation such as --return.
+        namespace.binding_options = [*namespace.binding_options, (self.option_strings[0], values)]
+
+
+def parse_binding_options(options):
+    """None, one Binding or a tuple of them from the recorded binding options. With one --bind the other options
+    may appear anywhere, the last of each counting, as before; with several, each belongs to the --bind before it."""
+    binds = sum(option == "--bind" for option, _ in options)
+    if binds < 2:
+        group = dict(options)  # the last value of each option counts
+        if not binds:
+            if group:
+                raise ValueError("--link-name, --import-arguments and --return-bytes require --bind")
+            return None
+        groups = [group]
+    else:
+        groups = []
+        for option, value in options:
+            if option == "--bind":
+                groups.append({option: value})
+            elif not groups:
+                raise ValueError(f"{option} comes before the first of several --bind options")
+            elif option in groups[-1]:
+                raise ValueError(f"{option} given twice for --bind {' '.join(groups[-1]['--bind'])}")
+            else:
+                groups[-1][option] = value
+    found = []
+    for group in groups:
+        if "--import-arguments" not in group or "--return-bytes" not in group:
+            raise ValueError("--bind requires --import-arguments and --return-bytes")
+        provider, symbol = group["--bind"]
+        found.append(Binding(Path(provider), symbol, group.get("--link-name"), group["--import-arguments"],
+                             group["--return-bytes"]))
+    return found[0] if len(found) == 1 else tuple(found)
 
 
 def translate(image, names, bindings=None, *, image_data=False, binding=None):
@@ -1868,25 +2033,25 @@ if __name__ == "__main__":
                              "binds at run time with lifted_bind_image; the generated source states the contract")
     parser.add_argument("--bind-ranges", type=Path, metavar="MANIFEST",
                         help="trusted [start, end) ranges of functions without unwind data, bound to this image's sha256")
-    parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"),
+    parser.set_defaults(binding_options=[])
+    parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"), action=BindingOption,
                         help="provider and export name or #ordinal of the import that calls and tail jumps "
                              "through the import address table reach. The image and target must stay valid and "
-                             "the original slot must stay readable and contain that target throughout execution")
-    parser.add_argument("--link-name", help="local import-library symbol for an ordinal binding")
-    parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS,
+                             "the original slot must stay readable and contain that target throughout execution. "
+                             "Repeat it to bind several imports, each followed by its own options below")
+    parser.add_argument("--link-name", action=BindingOption,
+                        help="local import-library symbol for an ordinal binding")
+    parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS, action=BindingOption,
                         help="integer arguments the bound import takes; stated by the binding, not derived from "
                              "the provider (required with --bind)")
-    parser.add_argument("--return-bytes", type=int, choices=(0, 1, 2, 8),
+    parser.add_argument("--return-bytes", type=int, choices=(0, 1, 2, 8), action=BindingOption,
                         help="guaranteed low RAX bytes of the bound import's return, 0 for none; stated by "
                              "the binding, not derived from the provider (required with --bind)")
     args = parser.parse_args()
-    binding = None
-    if args.bind:
-        if args.import_arguments is None or args.return_bytes is None:
-            parser.error("--bind requires --import-arguments and --return-bytes")
-        binding = Binding(Path(args.bind[0]), args.bind[1], args.link_name, args.import_arguments, args.return_bytes)
-    elif args.link_name is not None or args.import_arguments is not None or args.return_bytes is not None:
-        parser.error("--link-name, --import-arguments and --return-bytes require --bind")
+    try:
+        binding = parse_binding_options(args.binding_options)
+    except ValueError as error:
+        parser.error(str(error))
     try:
         source, functions = translate(args.image, args.exports.split(","), args.bind_ranges, image_data=args.image_data, binding=binding)
         args.output.write_text(source, encoding="utf-8")

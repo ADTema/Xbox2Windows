@@ -241,6 +241,13 @@ def check_rejections():
 
 
 def main():
+    capability_dll = ctypes.CDLL(sys.argv[4])
+    capability_dll.host_has_fma.argtypes = []
+    capability_dll.host_has_fma.restype = ctypes.c_int
+    if not capability_dll.host_has_fma():
+        print("FMA and OS-enabled XMM/YMM state are required for the native fixture")
+        return 77
+
     orig_dll = ctypes.CDLL(sys.argv[1])
     lifted_dll = ctypes.CDLL(sys.argv[2])
     altered_dll = ctypes.CDLL(sys.argv[3])
@@ -299,4 +306,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
