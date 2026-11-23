@@ -480,8 +480,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 vector[dst] = lds_word
             lds_word = ("alu", expression)
             ds_wait = True
-        elif m := re.fullmatch(r"ds_read_(b32|[ui](?:8|16)) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
-            op, dst, addr, offset = m[1], int(m[2]), int(m[3]), int(m[4] or 0)
+        elif m := re.fullmatch(r"ds_read_(b32|[ui](?:8|16))(?P<d16>_d16(?P<hi>_hi)?)? "
+                               r"v(?P<dst>\d+), v(?P<addr>\d+)(?: offset:(?P<offset>[0-3]))?", line):
+            op, dst, addr, offset = m[1], int(m["dst"]), int(m["addr"]), int(m["offset"] or 0)
+            d16, high = m["d16"], m["hi"]
+            if d16 and (op not in ("u8", "i8", "u16") or (op == "i8" and high)):
+                raise ValueError("Unsupported compute instruction: " + line)
             width = int(op[1:])
             if (not lds_enabled or guard_span is not None or max(dst, addr) > 255
                     or vector.get(addr) != ("lds_address",) or lds_word is None or offset % (width // 8)):
@@ -496,6 +500,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     expression = f"asuint(asint({shifted} << {extend}u) >> {extend}u)"
                 else:
                     expression = f"({shifted} & 0x{(1 << width) - 1:x}u)"
+                if d16:
+                    previous = vector.get(dst)
+                    if not is_word(previous):
+                        raise ValueError("Unverified D16 destination word")
+                    keep, shift = ("0x0000ffffu", 16) if high else ("0xffff0000u", 0)
+                    expression = f"(({hlsl_word(previous)} & {keep}) | (({expression} & 0xffffu) << {shift}u))"
                 if len(expression) > ALU_EXPRESSION_LIMIT:
                     raise ValueError("LDS expression exceeds the profile limit")
                 vector[dst] = ("alu", expression)
