@@ -4,6 +4,7 @@ import argparse
 import ctypes
 import json
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -186,9 +187,13 @@ def check_rejections(image, sink_path, mapper_path):
         flags = pe.FILE_HEADER.Characteristics
         entry = pe.OPTIONAL_HEADER.get_field_absolute_offset("AddressOfEntryPoint")
         data = next(s for s in pe.sections if s.Name.rstrip(b"\0") == b".data")
+        rdata = next(s for s in pe.sections if s.Name.rstrip(b"\0") == b".rdata")
         first_callback = pe.get_offset_from_rva(tls.AddressOfCallBacks - pe.OPTIONAL_HEADER.ImageBase)
         data_va = pe.OPTIONAL_HEADER.ImageBase + data.VirtualAddress
+        rdata_va = pe.OPTIONAL_HEADER.ImageBase + rdata.VirtualAddress
+        index = tls.get_field_absolute_offset("AddressOfIndex")
         image_base, callbacks_va = pe.OPTIONAL_HEADER.ImageBase, tls.AddressOfCallBacks
+        image_size = pe.OPTIONAL_HEADER.SizeOfImage
         callback_section = next(s for s in pe.sections if s.Name.rstrip(b"\0") == b".tlscb")
         data_flags = data.get_field_absolute_offset("Characteristics")
         callback_flags = callback_section.get_field_absolute_offset("Characteristics")
@@ -196,12 +201,15 @@ def check_rejections(image, sink_path, mapper_path):
         data_unreadable = data.Characteristics & no_access
         callbacks_unreadable = callback_section.Characteristics & no_access
     controls = (
-        ("<I", zero_fill, 16, "unsupported", "TLS data", False),
         ("<I", entry, data.VirtualAddress, "format", "entry point outside executable section", False),
         ("<Q", first_callback, data_va, "format", "TLS callback outside executable section", True),
         # Section protections are applied before the TLS directory and list are read.
         ("<I", data_flags, data_unreadable, "format", "TLS directory not readable", True),
         ("<I", callback_flags, callbacks_unreadable, "format", "TLS callback list not readable", True),
+        # The loader writes the TLS index, so the slot must be writable. Windows fails
+        # these copies with ERROR_NOACCESS; pe_map rejects them before any notification.
+        ("<Q", index, image_base + image_size + 0x1000, "format", "TLS index outside image", True),
+        ("<Q", index, rdata_va, "format", "TLS index outside writable section", True),
     )
     sink = load_sink(sink_path)
     mapper = Mapper(mapper_path)
@@ -217,8 +225,47 @@ def check_rejections(image, sink_path, mapper_path):
             raise AssertionError(f"{message} control: {base=} {status=} {detail=} {requests=}")
         if calls(sink):
             raise AssertionError(f"{message} control: notifications were sent: {calls(sink)}")
-    print("rejected without notifications: a TLS zero-fill size, an entry point in .data, a TLS callback "
-          "pointing into .data, an unreadable TLS directory and an unreadable callback list")
+    print("rejected without notifications: an entry point in .data, a TLS callback "
+          "pointing into .data, an unreadable TLS directory, an unreadable callback list, a TLS "
+          "index past the image and a TLS index in read-only .rdata")
+
+    # Copies both loaders accept, with the usual notifications.
+    # - A valid alternate writable slot (even unaligned): measured on Windows 11, .data+4 runs the
+    #   callback and the entry point. This guards the index check against false rejections.
+    # - A zero-fill size on the empty template: measured on Windows 10 build 19045, the copy loads.
+    #   pe_map hands the size to Windows in the TLS carrier (tools/pe_map.cpp).
+    loader = ctypes.WinDLL("kernel32", use_last_error=True)
+    loader.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
+    loader.LoadLibraryExW.restype = ctypes.c_void_p
+    loader.FreeLibrary.argtypes = [ctypes.c_void_p]
+    expected = [[TLS, ATTACH, "module", 0], [ENTRY, ATTACH, "module", 0]]
+    accepted = (
+        ("alternate writable TLS index (.data+4, unaligned)", "<Q", index, data_va + 4),
+        ("TLS zero-fill size 16 on an empty template", "<I", zero_fill, 16),
+    )
+    for label, layout, offset, value in accepted:
+        copy = bytearray(Path(image).read_bytes())
+        struct.pack_into(layout, copy, offset, value)
+        sink.sink_clear()
+        with TemporaryDirectory() as temp:
+            moved = Path(temp) / Path(image).name
+            moved.write_bytes(copy)
+            shutil.copy(sink_path, Path(temp) / Path(sink_path).name)
+            altered = loader.LoadLibraryExW(str(moved), None, 0x8)
+            native_attach = calls(sink)
+            if altered:
+                loader.FreeLibrary(altered)
+            # sink_read does not consume: clear the native attach/detach before mapping.
+            sink.sink_clear()
+            base, status, detail, _ = mapper(moved, {Path(sink_path).name.casefold(): sink})
+            mapped_attach = calls(sink, base) if base else None
+            if base:
+                mapper.release(base)
+        if not altered or native_attach != expected:
+            raise AssertionError(f"{label}: native={bool(altered)} {native_attach}")
+        if not base or status != STATUS["ok"] or mapped_attach != expected:
+            raise AssertionError(f"{label}: mapped={base} {status} {detail} {mapped_attach}")
+        print(f"{label}: Windows and pe_map run the TLS callback and the entry point")
 
     # LoadLibrary sends nothing to a non-DLL image (for an EXE the entry point is the program).
     # Clearing IMAGE_FILE_DLL must leave both the TLS callback and the entry point silent.

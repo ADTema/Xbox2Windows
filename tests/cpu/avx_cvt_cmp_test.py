@@ -17,7 +17,7 @@ VEC_EXPORTS = (
     "vcvtdq2ps_op", "vcvtdq2pd_op", "vcvtps2dq_op", "vcvtpd2dq_op",
     "vcvttps2dq_op", "vcvttpd2dq_op", "vcvtps2pd_op", "vcvtpd2ps_op",
     "vcvtsi2ss_op", "vcvtsi2sd_op", "vcvtss2sd_op", "vcvtsd2ss_op",
-    "vcmpps_op", "vcmppd_op", "vcmpss_op", "vcmpsd_op", "vlddqu_movntdqa_op",
+    "vcmpps_op", "vcmppd_op", "vcmpss_op", "vcmpsd_op", "vlddqu_op", "vcmpps_true_signaling",
 )
 SCALAR_EXPORTS = ("vcvtss2si_op", "vcvttss2si_op", "vcvtsd2si_op", "vcvttsd2si_op")
 FLAG_EXPORTS = ("vptest_op", "vtestps_op", "vtestpd_op")
@@ -30,6 +30,11 @@ extern "C" __declspec(dllexport) uint32_t host_has_avx() {
     const int need = (1 << 27) | (1 << 28);
     if ((info[2] & need) != need) return 0u;
     return (_xgetbv(0) & 6u) == 6u ? 1u : 0u;
+}
+extern "C" __declspec(dllexport) uint32_t host_exchange_mxcsr(uint32_t next) {
+    const uint32_t current = _mm_getcsr();
+    _mm_setcsr(next);
+    return current;
 }
 """
 
@@ -56,6 +61,13 @@ def check_controls() -> None:
         pass
     else:
         raise AssertionError("expected EVEX vcvtdq2ps to be rejected")
+    streaming = list(Decoder(64, bytes.fromhex("c4 e2 79 2a 09 c3"), ip=0x1000))
+    try:
+        lower(streaming, [], {}, {}, {})
+    except ValueError as error:
+        assert "unsupported VMOVNTDQA memory contract" in str(error), error
+    else:
+        raise AssertionError("accepted an unproven streaming load")
 
 
 def aligned32(data: bytes):
@@ -138,7 +150,48 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
                 raise AssertionError(f"{name}: native={got_n} lifted={got_l}")
             cases += 1
 
+    check_mxcsr(native, lifted)
     print(f"{cases} AVX conversion/compare/test/move cases matched native and translated DLLs")
+
+
+def check_mxcsr(native, lifted):
+    exchange = lifted.host_exchange_mxcsr
+    exchange.argtypes = [ctypes.c_uint32]
+    exchange.restype = ctypes.c_uint32
+
+    def run(dll, name, source, mode):
+        a, pa, _ = aligned32(source)
+        b, pb, _ = aligned32(bytes(32))
+        output, dst, offset = aligned32(bytes(32))
+        saved = exchange(mode)
+        try:
+            value = getattr(dll, name)(pa, pb, dst)
+        finally:
+            status = exchange(saved)
+        return value, bytes(output[offset:offset + 32]), status & 0x3f
+
+    inputs = (
+        ("vcvtps2dq_op", struct.pack("<8f", 1.75, -1.75, 0, 0, 0, 0, 0, 0)),
+        ("vcvtpd2dq_op", struct.pack("<4d", 1.75, -1.75, 0, 0)),
+        ("vcvtss2si_op", struct.pack("<8f", 1.75, 0, 0, 0, 0, 0, 0, 0)),
+        ("vcvtsd2si_op", struct.pack("<4d", 1.75, 0, 0, 0)),
+    )
+    for name, source in inputs:
+        for mode, expected in ((0x1f80, (2, -2)), (0x3f80, (1, -2)),
+                               (0x5f80, (2, -1)), (0x7f80, (1, -1))):
+            baseline = run(native, name, source, mode)
+            translated = run(lifted, name, source, mode)
+            assert baseline[1:] == translated[1:], (name, hex(mode), baseline, translated)
+            if "2dq" in name:
+                assert struct.unpack_from("<2i", baseline[1]) == expected, (name, hex(mode), baseline)
+            else:
+                assert baseline[0] == translated[0] == expected[0], (name, hex(mode), baseline, translated)
+
+    qnan = struct.pack("<8I", 0x7fc01234, 0, 0, 0, 0, 0, 0, 0)
+    for dll in (native, lifted):
+        _, output, status = run(dll, "vcmpps_true_signaling", qnan, 0x1f80)
+        assert output == bytes([255] * 32) and status & 1, (output.hex(), status)
+    print("MXCSR rounding modes and signaling predicate 31 matched")
 
 
 if __name__ == "__main__":

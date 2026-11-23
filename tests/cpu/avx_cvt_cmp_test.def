@@ -22,4 +22,5 @@ EXPORTS
     vptest_op
     vtestps_op
     vtestpd_op
-    vlddqu_movntdqa_op
+    vlddqu_op
+    vcmpps_true_signaling

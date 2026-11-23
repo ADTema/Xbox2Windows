@@ -234,14 +234,22 @@ vtestpd_cf:
     ret
 vtestpd_op ENDP
 
-vlddqu_movntdqa_op PROC FRAME
+vlddqu_op PROC FRAME
     .endprolog
     vlddqu ymm0, ymmword ptr [rcx]
-    vmovntdqa xmm1, xmmword ptr [rdx]
     vmovdqa ymmword ptr [r8], ymm0
-    vmovdqa xmmword ptr [r8], xmm1
     vzeroupper
     ret
-vlddqu_movntdqa_op ENDP
+vlddqu_op ENDP
+
+vcmpps_true_signaling PROC FRAME
+    .endprolog
+    vmovaps ymm1, ymmword ptr [rcx]
+    vmovaps ymm2, ymmword ptr [rdx]
+    vcmpps ymm0, ymm1, ymm2, 31
+    vmovaps ymmword ptr [r8], ymm0
+    vzeroupper
+    ret
+vcmpps_true_signaling ENDP
 
 END
