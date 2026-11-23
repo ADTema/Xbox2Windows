@@ -36,7 +36,13 @@ def main():
         git("remote", "add", "origin", URL, cwd=dest)
     git("sparse-checkout", "set", "--cone", SUBDIR, cwd=dest)
     git("fetch", "--depth", "1", "--filter=blob:none", "origin", COMMIT, cwd=dest)
-    git("checkout", "-q", "--detach", COMMIT, cwd=dest)
+    # Discard any local edit in the dependency checkout so the pinned tree is what gets built.
+    git("checkout", "-q", "--force", "--detach", COMMIT, cwd=dest)
+    git("clean", "-ffdxq", cwd=dest)
+    dirty = subprocess.run(["git", "status", "--porcelain", "--ignored"], cwd=dest, check=True,
+                           capture_output=True, text=True).stdout.strip()
+    if dirty:
+        sys.exit(f"{dest} still differs from {COMMIT}: {dirty}")
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=dest, check=True, capture_output=True, text=True).stdout.strip()
     if head != COMMIT:
         sys.exit(f"checked out {head}, expected {COMMIT}")

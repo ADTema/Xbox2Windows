@@ -3929,13 +3929,14 @@ Proposed desktop policy, in the test-only provider: every request sets `texture`
 Every call returned `ADDR_OK`. The test requires each row to match exactly. A first run with placeholder expectations failed every row, so the comparison is not vacuous.
 
 Controls:
-- **Linear fallback.** A provider that always answers `SW_LINEAR` disagrees on all 9 tiled rows.
+- **Linear fallback.** A second provider sends each request to addrlib with only the linear block allowed. It goes through the same table comparison as the provider under test, and the comparison rejects it on all 9 tiled rows. The 8 tiled colour rows get `SW_LINEAR`, the depth target is refused, and it agrees only on the 4096x1 `SW_LINEAR` row.
+- **Mutation.** `xg_swizzle_select_mutation` (`--mutate-linear-fallback`) substitutes that provider for the provider under test. CTest expects the run to fail (`WILL_FAIL`), and it does: 9 row checks fail. It also skips with 77 without addrlib.
 - **Forced linear.** With only the linear block allowed, the 9 colour requests select `SW_LINEAR`. The depth target, which has no linear mode, is refused with `ADDR_INVALIDPARAMS` rather than given a tiled mode.
 - **Tiled request.** With the linear block forbidden, no request selects `SW_LINEAR`, including the 4096x1 row.
 - **Explicit pitch.** A linear 100x64 `8_8_8_8` surface needs a pitch of 128 elements. An explicit pitch of 128 is accepted. A pitch of 129 (misaligned) and a pitch of 64 (tight) return `ADDR_INVALIDPARAMS`.
 - **Mismatched input.** The requests in the table do not all select the same mode.
 
-addrlib is an optional local dependency and is never vendored. `tools/fetch_addrlib.py` makes a shallow sparse fetch of `src/amd/addrlib` at the pinned commit into `out/deps/mesa`. CMake builds it as a static library with the source list and definitions from Mesa's `meson.build` (`ADDR_FASTCALL=`, `LITTLEENDIAN_CPU`, `DEBUG=0`). The first configure detects it under `out/deps/mesa`. For an existing build that was configured without AddrLib, pass `XBOX2WINDOWS_ADDRLIB_DIR` explicitly to replace the cached empty path. Without it, the rest of the build is unchanged and `xg_swizzle_select` returns 77, a capability skip. CI therefore skips this test unless addrlib is present.
+addrlib is an optional local dependency and is never vendored. `tools/fetch_addrlib.py` makes a shallow sparse fetch of `src/amd/addrlib` at the pinned commit into `out/deps/mesa`. It force-checks-out the commit and runs `git clean -ffdx` in that checkout only, so a re-run discards local edits. It then fails if `git status --porcelain --ignored` still reports anything. CMake builds it as a static library with the source list and definitions from Mesa's `meson.build` (`ADDR_FASTCALL=`, `LITTLEENDIAN_CPU`, `DEBUG=0`). The first configure detects it under `out/deps/mesa`. For an existing build that was configured without AddrLib, pass `XBOX2WINDOWS_ADDRLIB_DIR` explicitly to replace the cached empty path. Without it, the rest of the build is unchanged and `xg_swizzle_select` returns 77, a capability skip. CI therefore skips this test unless addrlib is present.
 
 Measured on Windows 10 Pro 10.0.19045.6466 with MSVC 19.44.35207.1 x64, `dev` and `release`. No GPU is involved.
 
@@ -3943,7 +3944,7 @@ Measured on Windows 10 Pro 10.0.19045.6466 with MSVC 19.44.35207.1 x64, `dev` an
 python tools/fetch_addrlib.py
 cmake --preset dev -DXBOX2WINDOWS_ADDRLIB_DIR=out/deps/mesa/src/amd/addrlib
 cmake --build --preset dev --target xg_swizzle_select_check
-ctest --preset dev --no-tests=error -R '^xg_swizzle_select$' -V
+ctest --preset dev --no-tests=error -R '^xg_swizzle_select' -V
 ```
 
 ## Offscreen rendering and readback
