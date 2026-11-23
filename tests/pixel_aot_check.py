@@ -7925,8 +7925,9 @@ def check_s_version():
 def check_vopc_e32_destination():
     """VOPC e32 writes VCC only: LLVM 15 rejects an SGPR destination on the explicit spelling."""
     message = "VOPC e32 destination must be vcc"
-    families = [f"v_cmp_{op}_{kind}" for kind in ("f32", "f16", "i32", "u32", "i16", "u16")
-                for op in ("lt", "eq")] + ["v_cmp_class_f32", "v_cmp_class_f16"]
+    f32_all = [f"v_cmp_{op}_f32" for op in PREDICATES]
+    families = [f"v_cmp_{op}_{kind}" for kind in ("f16", "i32", "u32", "i16", "u16")
+                for op in ("lt", "eq")] + ["v_cmp_class_f32", "v_cmp_class_f16"] + f32_all
     for name in families:
         for dst in ("s52", "s[52:53]"):
             expect_value_error(translate, with_constants(["v_mov_b32_e32 v18, 64", f"{name}_e32 {dst}, s44, v18"]), message)
@@ -9322,6 +9323,28 @@ def check_controls(directory):
     pos = f16_program.index("s_waitcnt lgkmcnt(0)", load)
     must_reject(translate_int, f16_program[:pos] + ["v_cmp_eq_f16_e32 vcc_lo, s44, v16"] + f16_program[pos:])
     must_reject(translate_int, f16_program[:pos] + ["v_cmp_class_f16_e32 vcc_lo, s44, v16"] + f16_program[pos:])
+
+    f32_hlsl = translate_int(uncompressed_export(f32_compares()))
+    assert "uint4 main(" in f32_hlsl
+    for words in F32_COMPARE_SETS:
+        expected_words = f32_compares_reference(words)
+        assert expected_words != f32_compares_reference((words[0], words[1] ^ 0x3f800000, words[2], words[3]))
+    f32_program = uncompressed_export(f32_compares())
+    for bad in (
+        "v_cmp_lt_f32_e64 s52, s44, v18 clamp",
+        "v_cmp_lt_f32_e64 s52, s44, v18 op_sel:[1,0,0]",
+        "v_cmpx_lt_f32_e32 s44, v18",
+        "v_cmpx_lt_f32_e64 s52, s44, v18",
+        "v_cmp_lt_f32_sdwa vcc_lo, s44, v18 src0_sel:WORD_0 src1_sel:DWORD",
+        "v_cmp_lt_f32_sdwa vcc_lo, s44, v18 src0_sel:DWORD src1_sel:BYTE_2",
+        "v_cmp_lt_f32_e32 vcc_lo, s44, v255",
+    ):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    pos = f32_program.index("s_waitcnt vmcnt(0)")
+    must_reject(translate_int, f32_program[:pos] + ["v_cmp_eq_f32_e32 vcc_lo, v12, v13"] + f32_program[pos:])
+    load = next(i for i, line in enumerate(f32_program) if line.startswith("s_buffer_load_dwordx4"))
+    pos = f32_program.index("s_waitcnt lgkmcnt(0)", load)
+    must_reject(translate_int, f32_program[:pos] + ["v_cmp_eq_f32_e32 vcc_lo, s44, v16"] + f32_program[pos:])
 
     # 32-bit integer min/max/min3/max3/med3 controls and rejections.
     pair_src = translate(int_minmax_pair("e32"))
@@ -12551,6 +12574,223 @@ def check_f16_compare_draws(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutating {label} escaped detection")
 
 
+F32_COMPARE_SETS = (
+    # (lhs, rhs, extra_a, extra_b)
+    # 0: standard ordered comparisons
+    (0x3f800000, 0x40000000, 0x3f000000, 0x3fc00000),  # 1.0, 2.0, 0.5, 1.5
+    # 1: equal values and signed zeros
+    (0x00000000, 0x80000000, 0xbf800000, 0x3f800000),  # +0.0, -0.0, -1.0, 1.0
+    # 2: reversed order
+    (0x40a00000, 0x3f800000, 0x41200000, 0x3f000000),  # 5.0, 1.0, 10.0, 0.5
+    # 3: equal positive finite
+    (0x40200000, 0x40200000, 0x40400000, 0x40000000),  # 2.5, 2.5, 3.0, 2.0
+    # 4: NaN operand
+    (0x7fc00000, 0x3f800000, 0x00000000, 0x00000000),  # NaN, 1.0, 0, 0
+    # 5: infinite and extreme finite
+    (0x7f800000, 0xff800000, 0x7f7fffff, 0xff7fffff),  # +inf, -inf, max_flt, min_flt
+)
+
+
+def f32_compares() -> list[str]:
+    """Build a shader testing all 16 binary32 predicates across e32, e64, and SDWA."""
+    body = [
+        "v_mov_b32_e32 v12, 0",
+        "v_mov_b32_e32 v13, 0",
+        "v_mov_b32_e32 v14, 0",
+        "v_mov_b32_e32 v15, 0",
+        "v_mov_b32_e32 v16, s45",
+        "v_mov_b32_e32 v18, s44",
+        "v_mov_b32_e32 v20, s46",
+        "v_mov_b32_e32 v21, s47",
+    ]
+
+    def emit_flag(acc: str, bit: int, cond: str, insn: str) -> None:
+        body.append(insn)
+        body.append(f"v_cndmask_b32_e64 v17, 0, 1, {cond}")
+        if bit:
+            body.append(f"v_lshlrev_b32_e32 v17, {bit}, v17")
+        body.append(f"v_or_b32_e32 {acc}, {acc}, v17")
+
+    # Channel 0: all 16 predicates in _e32 encoding (vcc_lo)
+    for bit, pred in enumerate(PREDICATES):
+        emit_flag("v12", bit, "vcc_lo", f"v_cmp_{pred}_f32_e32 vcc_lo, s44, v16")
+    for bit, insn in (
+        (16, "v_cmp_lt_f32_e32 vcc_lo, v18, v16"),
+        (17, "v_cmp_eq_f32_e32 vcc_lo, 1.0, v16"),
+        (18, "v_cmp_eq_f32_e32 vcc_lo, 1, v16"),
+        (19, "v_cmp_lt_f32_e32 vcc_lo, -0.5, v16"),
+        (20, "v_cmp_lt_f32_e32 vcc_lo, 0.15915494, v16"),
+        (21, "v_cmp_lt_f32_e32 vcc_lo, 0x3f800000, v16"),
+    ):
+        emit_flag("v12", bit, "vcc_lo", insn)
+
+    # Channel 1: all 16 predicates in _e64 encoding (SGPR destination s52) with input modifiers
+    for bit, pred in enumerate(PREDICATES):
+        emit_flag("v13", bit, "s52", f"v_cmp_{pred}_f32_e64 s52, -s44, |s45|")
+    for bit, cond, insn in (
+        (16, "s53", "v_cmp_lt_f32_e64 s53, v18, s45"),
+        (17, "vcc_lo", "v_cmp_le_f32_e64 vcc_lo, -|s44|, 2.0"),
+        (18, "s52", "v_cmp_gt_f32_e64 s52, s44, -1.0"),
+        (19, "s52", "v_cmp_eq_f32_e64 s52, -4.0, v16"),
+        (20, "s52", "v_cmp_lt_f32_e64 s52, |v18|, 0x3f000000"),
+    ):
+        emit_flag("v13", bit, cond, insn)
+
+    # Channel 2: all 16 predicates in whole-dword _sdwa encoding (vcc_lo)
+    for bit, pred in enumerate(PREDICATES):
+        emit_flag("v14", bit, "vcc_lo", f"v_cmp_{pred}_f32_sdwa vcc_lo, s44, v16 src0_sel:DWORD src1_sel:DWORD")
+
+    # Channel 3: heterogeneous combinations across e32 and e64
+    for bit, cond, insn in (
+        (0, "s52", "v_cmp_eq_f32_e64 s52, s44, v16"),
+        (1, "s52", "v_cmp_lt_f32_e64 s52, |v18|, |v16|"),
+        (2, "s52", "v_cmp_eq_f32_e64 s52, -v18, -s45"),
+        (3, "s52", "v_cmp_o_f32_e64 s52, s44, -|v16|"),
+        (4, "s52", "v_cmp_u_f32_e64 s52, s44, s45"),
+        (5, "vcc_lo", "v_cmp_neq_f32_e32 vcc_lo, 0.5, v16"),
+        (6, "vcc_lo", "v_cmp_ge_f32_e32 vcc_lo, -2.0, v16"),
+        (7, "vcc_lo", "v_cmp_gt_f32_e32 vcc_lo, 4.0, v16"),
+        (8, "vcc_lo", "v_cmp_le_f32_e32 vcc_lo, -4.0, v16"),
+        (9, "vcc_lo", "v_cmp_eq_f32_e32 vcc_lo, 2.0, v16"),
+        (10, "vcc_lo", "v_cmp_eq_f32_e32 vcc_lo, 0, v16"),
+        (11, "s52", "v_cmp_gt_f32_e64 s52, v20, 0.0"),
+        (12, "vcc_lo", "v_cmp_lt_f32_e32 vcc_lo, v20, v21"),
+        (13, "vcc_lo", "v_cmp_eq_f32_e32 vcc_lo, -1, v16"),
+    ):
+        emit_flag("v15", bit, cond, insn)
+
+    return body
+
+
+def f32_compares_reference(words: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Compute the exact 4 uint bitmasks expected from f32_compares()."""
+    def cmp_pred(pred: str, a: float, b: float) -> bool:
+        ordered = (not math.isnan(a)) and (not math.isnan(b))
+        table = {
+            "f": False,
+            "lt": ordered and a < b,
+            "eq": ordered and a == b,
+            "le": ordered and a <= b,
+            "gt": ordered and a > b,
+            "lg": ordered and a != b,
+            "ge": ordered and a >= b,
+            "o": ordered,
+            "u": not ordered,
+            "nge": not (ordered and a >= b),
+            "nlg": not (ordered and a != b),
+            "ngt": not (ordered and a > b),
+            "nle": not (ordered and a <= b),
+            "neq": not (ordered and a == b),
+            "nlt": not (ordered and a < b),
+            "tru": True,
+        }
+        return table[pred]
+
+    def word_to_float(w: int) -> float:
+        return struct.unpack("<f", struct.pack("<I", w & 0xffffffff))[0]
+
+    lhs = word_to_float(words[0])
+    rhs = word_to_float(words[1])
+    extra_a = word_to_float(words[2])
+    extra_b = word_to_float(words[3])
+
+    w0 = 0
+    for bit, pred in enumerate(PREDICATES):
+        if cmp_pred(pred, lhs, rhs):
+            w0 |= 1 << bit
+    for bit, cond in (
+        (16, cmp_pred("lt", lhs, rhs)),
+        (17, cmp_pred("eq", 1.0, rhs)),
+        (18, cmp_pred("eq", 1.0, rhs)),
+        (19, cmp_pred("lt", -0.5, rhs)),
+        (20, cmp_pred("lt", 0.15915494, rhs)),
+        (21, cmp_pred("lt", 1.0, rhs)),
+    ):
+        if cond:
+            w0 |= 1 << bit
+
+    w1 = 0
+    for bit, pred in enumerate(PREDICATES):
+        if cmp_pred(pred, -lhs, abs(rhs)):
+            w1 |= 1 << bit
+    for bit, cond in (
+        (16, cmp_pred("lt", lhs, rhs)),
+        (17, cmp_pred("le", -abs(lhs), 2.0)),
+        (18, cmp_pred("gt", lhs, -1.0)),
+        (19, cmp_pred("eq", -4.0, rhs)),
+        (20, cmp_pred("lt", abs(lhs), 0.5)),
+    ):
+        if cond:
+            w1 |= 1 << bit
+
+    w2 = 0
+    for bit, pred in enumerate(PREDICATES):
+        if cmp_pred(pred, lhs, rhs):
+            w2 |= 1 << bit
+
+    w3 = 0
+    for bit, cond in (
+        (0, cmp_pred("eq", lhs, rhs)),
+        (1, cmp_pred("lt", abs(lhs), abs(rhs))),
+        (2, cmp_pred("eq", -lhs, -rhs)),
+        (3, cmp_pred("o", lhs, -abs(rhs))),
+        (4, cmp_pred("u", lhs, rhs)),
+        (5, cmp_pred("neq", 0.5, rhs)),
+        (6, cmp_pred("ge", -2.0, rhs)),
+        (7, cmp_pred("gt", 4.0, rhs)),
+        (8, cmp_pred("le", -4.0, rhs)),
+        (9, cmp_pred("eq", 2.0, rhs)),
+        (10, cmp_pred("eq", 0.0, rhs)),
+        (11, cmp_pred("gt", extra_a, 0.0)),
+        (12, cmp_pred("lt", extra_a, extra_b)),
+        (13, cmp_pred("eq", -1.0, rhs)),
+    ):
+        if cond:
+            w3 |= 1 << bit
+
+    return (w0, w1, w2, w3)
+
+
+def check_f32_compare_draws(directory, compiler, renderer, backend):
+    source = directory / "f32-compare.hlsl"
+    shader = directory / "f32-compare.cso"
+    program = uncompressed_export(f32_compares())
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for index, words in enumerate(F32_COMPARE_SETS):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        expected = tuple(as_float(w) for w in f32_compares_reference(words))
+        path = write_case(directory / f"f32-cmp-{index}.case", constants, expected, integer_rt=True)
+        cases.append((path, "pass"))
+        if index < 4:
+            wrong_words = list(f32_compares_reference(words))
+            wrong_words[index] ^= 1 << index
+            wrong_path = write_case(
+                directory / f"f32-cmp-bad-{index}.case",
+                constants,
+                tuple(as_float(w) for w in wrong_words),
+                integer_rt=True,
+            )
+            cases.append((wrong_path, "mismatch"))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+    mutated_shader = directory / "f32-compare-mutated.cso"
+    for label, old, new, case_index in (
+        ("f32 e32 predicate", "v_cmp_lt_f32_e32 vcc_lo, s44, v16", "v_cmp_le_f32_e32 vcc_lo, s44, v16", 0),
+        ("f32 e64 neg", "v_cmp_lt_f32_e64 s52, -s44, |s45|", "v_cmp_lt_f32_e64 s52, s44, |s45|", 1),
+    ):
+        mutated = [new if line == old else line for line in program]
+        assert mutated != program
+        source.write_text(translate_int(mutated), encoding="ascii")
+        compile_shader(compiler, source, mutated_shader)
+        draw = [renderer, backend, "--check-pixel-case", mutated_shader, directory / f"f32-cmp-{case_index}.case"]
+        result = subprocess.run(draw, capture_output=True, text=True)
+        if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+
 def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     source = directory / "fixture.hlsl"
     shader = directory / "fixture.cso"
@@ -12663,6 +12903,7 @@ def check_comparison_draws(directory, compiler, renderer, backend):
     """The comparison and class draws, split from draw-predicate-rounding so each CTest entry stays under its
     timeout on adapters where every renderer launch pays for device creation with the debug layer (issue #448)."""
     check_f16_compare_draws(directory, compiler, renderer, backend)
+    check_f32_compare_draws(directory, compiler, renderer, backend)
     check_class_draw(directory, compiler, renderer, backend)
     check_predicate_draws(directory, compiler, renderer, backend)
     check_int_predicate_draws(directory, compiler, renderer, backend)
