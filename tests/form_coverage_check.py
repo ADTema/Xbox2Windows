@@ -371,6 +371,27 @@ def check_shader_records():
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(rounding)
 
 
+def check_plain_bitscan_forms():
+    """The two plain bitscan fixtures cover VOP1 v_bfrev_b32, v_ffbh_u32, v_ffbh_i32, v_ffbl_b32 and VOP2
+    v_xnor_b32 in both reference lists; a form neither fixture uses stays uncovered."""
+    import pixel_aot_check as pixel
+    wanted = {("VOP1", "v_bfrev_b32"), ("VOP1", "v_ffbh_u32"), ("VOP1", "v_ffbh_i32"), ("VOP1", "v_ffbl_b32"),
+              ("VOP2", "v_xnor_b32")}
+    e64 = {("VOP3", "v_bfrev_b32_e64"), ("VOP3", "v_ffbh_u32_e64"), ("VOP3", "v_xnor_b32_e64")}
+    untouched = {("VOP3", "v_ffbl_b32_e64"), ("VOP3", "v_ffbh_i32_e64")}
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert wanted | e64 | untouched <= reference, name
+        pixel.ACCEPTED.clear()
+        assert not wanted & fc.gfx_forms(pixel.ACCEPTED, reference)  # nothing lowered, nothing covered
+        for second in (False, True):
+            pixel.translate_int(pixel.plain_bitscan_ops(second))
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert wanted | e64 <= covered, (name, sorted((wanted | e64) - covered))
+        assert not untouched & covered, name
+    pixel.ACCEPTED.clear()
+
+
 def check_parsing():
     with tempfile.TemporaryDirectory() as tmp:
         junit = Path(tmp) / "results.xml"
@@ -646,6 +667,7 @@ if __name__ == "__main__":
     check_local_cpu_registration()
     check_cpu_records()
     check_shader_records()
+    check_plain_bitscan_forms()
     check_parsing()
     check_gaps()
     check_dashboard()

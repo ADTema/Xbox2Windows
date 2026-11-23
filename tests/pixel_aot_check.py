@@ -3005,6 +3005,53 @@ def bfm_scalar_ops_reference(words):
     return (b32(s44, s45), b32(s46, s47), b64 & 0xffffffff, b64 >> 32)
 
 
+# Plain VOP1/VOP2 (and e64) v_bfrev_b32, v_ffbh_u32, v_ffbh_i32, v_ffbl_b32 and v_xnor_b32. The sources are the
+# constant words in s44..s47, so no input passes through a float VGPR. Case k rotates the nine words over s44..s47.
+PLAIN_BITSCAN_W = (0, 0xffffffff, 0x80000000, 0x00000001, 0x7fffffff, 0x0000ffff, 0xaaaaaaaa, 0x12345678, 0xfffffffe)
+PLAIN_BITSCAN_WORDS = tuple(tuple(PLAIN_BITSCAN_W[(k + j) % 9] for j in range(4)) for k in range(9))
+PLAIN_BITSCAN_LITERAL = 0x0f0f0f0f
+
+
+def plain_bitscan_ops(second=False, vgpr_source=False) -> list[str]:
+    """Fixture 1 (second=False) uses the plain spellings; fixture 2 mixes explicit _e32 and _e64 and a literal."""
+    if second:
+        ops = ["v_ffbl_b32_e32 v24, s44", "v_ffbh_u32_e64 v25, s45",
+               "v_xnor_b32_e64 v26, s46, 0x0f0f0f0f", "v_bfrev_b32_e64 v27, s47"]
+    else:
+        ops = ["v_bfrev_b32 v24, s44", "v_ffbh_u32 v25, s45", "v_ffbh_i32 v26, s46", "v_xnor_b32 v27, s47, s44"]
+    if vgpr_source:  # a VGPR source produced by an earlier integer op
+        ops += ["v_xor_b32 v30, s44, s45", "v_bfrev_b32 v31, v30"]
+    return uncompressed_export(ops + [f"v_mov_b32_e32 v{12 + i}, v{24 + i}" for i in range(4)])
+
+
+def plain_rev(x):
+    return sum(((x >> i) & 1) << (31 - i) for i in range(32))
+
+
+def plain_ffbl(x):
+    """Index of the lowest set bit; all ones when no bit is set."""
+    return next((i for i in range(32) if (x >> i) & 1), 0xffffffff)
+
+
+def plain_ffbh_u(x):
+    """Zero-based position of the highest set bit counted from the MSB; all ones when no bit is set."""
+    return next((i for i in range(32) if (x >> (31 - i)) & 1), 0xffffffff)
+
+
+def plain_ffbh_i(x):
+    """Position, counted from the MSB, of the first bit below the sign bit that differs from it; all ones if none."""
+    sign = x >> 31
+    return next((i for i in range(1, 32) if ((x >> (31 - i)) & 1) != sign), 0xffffffff)
+
+
+def plain_bitscan_reference(words):
+    """Expected (fixture 1, fixture 2) channels, from bit loops written independently of the HLSL helpers."""
+    s44, s45, s46, s47 = words
+    xnor = lambda a, b: ~(a ^ b) & 0xffffffff
+    return ((plain_rev(s44), plain_ffbh_u(s45), plain_ffbh_i(s46), xnor(s47, s44)),
+            (plain_ffbl(s44), plain_ffbh_u(s45), xnor(s46, PLAIN_BITSCAN_LITERAL), plain_rev(s47)))
+
+
 def scalar():
     return with_constants(scalar_body())
 
@@ -3243,6 +3290,25 @@ def check_scalar_controls():
         changed = [line.replace(old, new) for line in bfm_program]
         assert changed != bfm_program, new
         must_reject(translate_int, changed)
+
+    # Plain bfrev/ffbh/ffbl/xnor: both fixtures lower; each ffbh helper is defined exactly once, and only when used.
+    bitscan_first = translate_int(plain_bitscan_ops())
+    bitscan_second = translate_int(plain_bitscan_ops(True))
+    assert "reversebits(" in bitscan_first and "firstbitlow(" in bitscan_second
+    assert "~(asuint(params[1].z) ^ asuint(params[0].w))" in bitscan_first, bitscan_first
+    assert bitscan_first.count("uint dpp_ffbh_u32(") == 1 and bitscan_first.count("uint dpp_ffbh_i32(") == 1
+    assert bitscan_second.count("uint dpp_ffbh_u32(") == 1 and "uint dpp_ffbh_i32(" not in bitscan_second
+    assert "uint dpp_ffbh_" not in translate_int(uncompressed_export(["v_bfrev_b32 v24, s44"]))
+    assert "reversebits(" in translate_int(plain_bitscan_ops(vgpr_source=True))  # a VGPR source lowers too
+    bitscan_program = plain_bitscan_ops()
+    for old, new, message in (("v_bfrev_b32 v24, s44", "v_bfrev_b32 v24, s44 clamp", "Unsupported 32-bit scalar operand"),
+                              ("v_xnor_b32 v27, s47, s44", "v_xnor_b32 v27, s47", "Invalid integer operation"),
+                              ("v_xnor_b32 v27, s47, s44", "v_xnor_b32 v27, s47, s44, s45", "Invalid integer operation"),
+                              ("v_bfrev_b32 v24, s44", "v_bfrev_b32 v24, s44, s45", "Invalid integer operation"),
+                              ("v_bfrev_b32 v24, s44", "v_bfrev_b32 v256, s44", "Invalid integer operation")):
+        changed = [line.replace(old, new) for line in bitscan_program]
+        assert changed != bitscan_program, new
+        expect_value_error(translate_int, changed, message)
 
     quadmask_source = translate_int(quadmask_bitreplicate_program("s_quadmask_b32"))
     assert "s_quadmask_b32(" in quadmask_source, quadmask_source
@@ -6077,6 +6143,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((sext_values(), translate))
     fixtures.append((sop1_scalar_ops(), translate_int))
     fixtures.append((bfm_scalar_ops(), translate_int))
+    fixtures.extend((plain_bitscan_ops(second), translate_int) for second in (False, True))
     fixtures.extend((quadmask_bitreplicate_program(op), translate_int)
                     for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
     fixtures.append((scalar_select64(), translate_int))
@@ -8197,6 +8264,52 @@ def check_bfm_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutating {label} escaped detection")
 
 
+def check_plain_bitscan_draw(directory, compiler, renderer, backend):
+    """Plain bfrev/ffbh/ffbl/xnor against the Python reference, then program-text mutations that must mismatch."""
+    source = directory / "plain_bitscan.hlsl"
+    shader = directory / "plain_bitscan.cso"
+    references = [plain_bitscan_reference(words) for words in PLAIN_BITSCAN_WORDS]
+    lanes = {  # per mutation: (fixture, lane, lane value the mutated program produces for the words)
+        "ffbh_i32 -> ffbh_u32": (0, 2, lambda w: plain_ffbh_u(w[2])),
+        "ffbl_b32 -> ffbh_u32": (1, 0, lambda w: plain_ffbh_u(w[0])),
+        "xnor_b32 -> xor_b32": (0, 3, lambda w: (w[3] ^ w[0]) & 0xffffffff),
+        "bfrev_b32 -> not_b32": (0, 0, lambda w: ~w[0] & 0xffffffff),
+    }
+    # Before any GPU run: every mutated lane differs from the reference in at least one case.
+    for label, (fixture, lane, value) in lanes.items():
+        assert any(value(words) != ref[fixture][lane] for words, ref in zip(PLAIN_BITSCAN_WORDS, references)), label
+
+    def make_cases(fixture):
+        cases = []
+        for idx, (words, ref) in enumerate(zip(PLAIN_BITSCAN_WORDS, references)):
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *words)
+            case = directory / f"plain_bitscan-{fixture}-{idx}.case"
+            write_case(case, bytes(constants), tuple(as_float(word) for word in ref[fixture]), integer_rt=True)
+            cases.append(case)
+        return cases
+
+    cases = [make_cases(0), make_cases(1)]
+    programs = [plain_bitscan_ops(), plain_bitscan_ops(True)]
+    for fixture, program in enumerate(programs):
+        source.write_text(translate_int(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases[fixture]])
+
+    for (old, new, label), fixture in ((("v_ffbh_i32 ", "v_ffbh_u32 ", "ffbh_i32 -> ffbh_u32"), 0),
+                                       (("v_ffbl_b32_e32", "v_ffbh_u32_e32", "ffbl_b32 -> ffbh_u32"), 1),
+                                       (("v_xnor_b32 ", "v_xor_b32 ", "xnor_b32 -> xor_b32"), 0),
+                                       (("v_bfrev_b32 ", "v_not_b32 ", "bfrev_b32 -> not_b32"), 0)):
+        assert lanes[label][0] == fixture, label
+        mutated = [line.replace(old, new) for line in programs[fixture]]
+        assert mutated != programs[fixture], label
+        source.write_text(translate_int(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, cases[fixture])
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+
 def check_e64_render(directory, compiler, renderer, backend):
     """The e64 draw cases on their own, so they run as a separate CTest entry per backend. A renderer that reports an
     unavailable adapter (exit 77) makes this a skip, as for the other pixel draws."""
@@ -8227,14 +8340,15 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
-                    "draw-e64-integer", "draw-bfm", "draw-align"):
+                    "draw-e64-integer", "draw-bfm", "draw-align", "draw-plain-bitscan"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
                         "draw-e64-integer": check_e64_integer_draws,
                         "draw-bfm": check_bfm_draw,
-                        "draw-align": check_align_draws}[mode]
+                        "draw-align": check_align_draws,
+                        "draw-plain-bitscan": check_plain_bitscan_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
