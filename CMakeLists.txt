@@ -50,8 +50,21 @@ target_compile_features(era_title_gpu_alloc_check PRIVATE cxx_std_20)
 add_test(NAME era_title_gpu_alloc COMMAND era_title_gpu_alloc_check)
 set_tests_properties(era_title_gpu_alloc PROPERTIES TIMEOUT 30)
 
+# Physical-page bookkeeping behind XMemAllocatePhysicalPages/XMemFreePhysicalPages, linked next to a
+# lenient build of the same file (ERA_PHYSICAL_LENIENT_RELEASE) that the ownership controls must catch.
+add_library(era_physical_lenient OBJECT src/era_physical.cpp)
+target_include_directories(era_physical_lenient PRIVATE src)
+target_compile_features(era_physical_lenient PRIVATE cxx_std_17)
+target_compile_definitions(era_physical_lenient PRIVATE ERA_PHYSICAL_LENIENT_RELEASE era_physical=era_physical_lenient)
+add_executable(era_physical_check tests/era_physical_check.cpp src/era_physical.cpp $<TARGET_OBJECTS:era_physical_lenient>)
+target_include_directories(era_physical_check PRIVATE src)
+target_compile_features(era_physical_check PRIVATE cxx_std_17)
+foreach(scenario IN ITEMS controls lifetime)
+    add_test(NAME era_physical_${scenario} COMMAND era_physical_check ${scenario})
+endforeach()
+
 # Desktop xmem.dll for native and mapped callers.
-add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp
+add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
     src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 # LINK uses explicit export ordinals in the generated import library. Keep
@@ -78,7 +91,7 @@ target_link_options(xmem_shim_check PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi
 target_include_directories(xmem_shim_check PRIVATE src)
 target_compile_features(xmem_shim_check PRIVATE cxx_std_17)
 # working_set_aggregation feeds synthetic adapter readings to src/xmem_gpu_usage.h.
-foreach(scenario IN ITEMS exports allocation default_allocation query working_set working_set_aggregation)
+foreach(scenario IN ITEMS exports allocation default_allocation physical_pages query working_set working_set_aggregation)
     add_test(NAME xmem_shim_${scenario} COMMAND xmem_shim_check ${scenario})
 endforeach()
 # XMemGetWorkingSetStatistics differences around D3D12 heap and committed-resource lifetimes.
@@ -2823,6 +2836,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_exe_start_original>" "$<TARGET_FILE:cpu_exe_start_no_tls>"
         "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>"
         "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_live>" "$<TARGET_FILE:cpu_exe_io_hang>")
+    # An EXE that imports XMemAllocatePhysicalPages and XMemFreePhysicalPages by name (#880), started by
+    # Windows and by pe_map. FULL_COUNT and SKIP_RELEASE are negative controls.
+    foreach(variant IN ITEMS original full_count skip_release)
+        add_executable(cpu_xmem_physical_${variant} tests/cpu/xmem_physical_pair.asm tests/cpu/exe_startup.asm)
+        set_target_properties(cpu_xmem_physical_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_xmem_physical_${variant} PRIVATE /ENTRY:native_startup
+            /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_xmem_physical_${variant} PRIVATE xmem_shim cpu_exe_io)
+    endforeach()
+    target_compile_definitions(cpu_xmem_physical_full_count PRIVATE FULL_COUNT)
+    target_compile_definitions(cpu_xmem_physical_skip_release PRIVATE SKIP_RELEASE)
+    add_test(NAME cpu_native_xmem_physical_pair COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xmem_physical_pair_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_xmem_physical_original>" "$<TARGET_FILE:cpu_xmem_physical_full_count>"
+        "$<TARGET_FILE:cpu_xmem_physical_skip_release>" "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_xmem_physical_pair PROPERTIES TIMEOUT 120)
     foreach(variant IN ITEMS original returning no_worker)
         add_executable(cpu_exe_worker_alive_${variant} tests/cpu/worker_alive_entry.asm)
         set_target_properties(cpu_exe_worker_alive_${variant} PROPERTIES LINKER_LANGUAGE CXX)

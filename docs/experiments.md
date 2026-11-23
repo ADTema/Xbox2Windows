@@ -3720,6 +3720,78 @@ Build the dev preset and run `ctest --preset dev --no-tests=error -R 'frame_to_h
 
 The desktop shim exports `XMemAllocDefault(size, attributes)` and `XMemFreeDefault(pointer, attributes)` through its existing unhooked allocator. The arguments use the same x64 widths as the normal allocation pair. The original four exports retain their ordinals. Both named allocation pairs run the same source-built checks for zero-filled heap and graphics memory, alignment, matching release, null release and rejected attribute words on Windows. Run `ctest --preset release --no-tests=error -R '^xmem_shim_(exports|allocation|default_allocation)$'`. [Public ABI reference](https://github.com/XWine1/SlimEra/blob/397807a9563f62b56cf7aaea9809b6fa635ba651/era.h)
 
+### Physical-page allocation imports
+
+Refs #880 and #870. With the default allocation pair bound, the startup mapping probe stopped at `XMemAllocatePhysicalPages`. The desktop `xmem.dll` now exports it with `XMemFreePhysicalPages`. Mapping (`XMemMapPhysicalPages`), scatter mapping and transfer are not modeled.
+
+**Source-built comparison.** `cpu_native_xmem_physical_pair` builds `tests/cpu/xmem_physical_pair.asm` into three x64 EXEs. Each imports the pair by name from `xmem.dll` and `finish_exe` from `cpu_exe_io.dll`, and starts through `exe_startup.asm`. The comparison follows triggered02's independent fixture posted on #880 (Windows loader vs `pe_map`, a canary-filled page array, a missing-provider control). It adds a nonzero success code and mutation variants. The body returns `0x880` when its 10 steps pass, or `0xF00` plus the first failing step:
+
+1. `XMemAllocatePhysicalPages(MEM_64K_PAGES, &count = 2, pages)` returns `TRUE`.
+2. The count is still 2.
+3. The two page numbers are nonzero and distinct, and the canary after them is untouched.
+4. Count 1 for the two-page grant is refused.
+5. The grant still releases with count 2.
+6. The same release again (double free) is refused.
+7. `MEM_LARGE_PAGES` alone is refused.
+8. That refusal sets the count to 0.
+9. That refusal leaves all three canaries untouched.
+10. `XMemFreePhysicalPages(1, NULL)` is refused.
+
+Steps 4 and 7–9 check proposed desktop policy (see the table below). The test stages each EXE with the two DLLs, launches it normally, then maps it in a child process and starts it with `pe_map_run`. Both exit codes must match the expected value, and the mapping must request exactly the three imports.
+
+| Variant | Windows launch | `pe_map` |
+|---|---|---|
+| `original` | `0x880` | `0x880` |
+| `full_count` (count 2 at step 4, so the grant is released there) | `0xf04` | `0xf04` |
+| `skip_release` (step 5 omitted, so step 6 releases the live grant) | `0xf06` | `0xf06` |
+
+A provider that binds only one of the pair stops the mapping before the entry point. The diagnostic is `unresolved import xmem.dll!XMemAllocatePhysicalPages` or `unresolved import xmem.dll!XMemFreePhysicalPages`.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `era_physical_controls` | Links `era_physical.cpp` twice, once as built into `xmem.dll` and once with the test-only `ERA_PHYSICAL_LENIENT_RELEASE`, whose release clears any listed page as SlimEra's `FreeTitlePhysicalPages` does. Seven ownership and page-count controls each run from a clean registry with live grants of 4, 3 and 1 pages: short count, long count, a single page of a grant, double free, never-issued page, forged mix and duplicate entry. The policy must refuse each one with the granted total unchanged, and the lenient build must accept each one. That shows every control detects the faulty handling. |
+| `xmem_shim_physical_pages` | Through the named imports: grants of 4, 3 and 1 pages keep their counts and return unique nonzero page numbers in range, with the slot after them untouched. 14 refused releases each return `ERROR_INVALID_PARAMETER` and leave the array unchanged: short, long and single-page counts, a never-issued number, 0, a number past the capacity, a forged mix, a duplicate, a zero count, a null array and an overflowing count, then three double frees. The grants still release afterwards, one reversed and two in one call. 10 refused allocations each leave a count of 0 and the array untouched: a null count, five bad flag words, a zero count, a null array, and counts of 2^18 + 1 and all-ones. Exhaustion with 2^18 - 1 pages granted refuses 2 pages, grants 1, then refuses 1. After cleanup the full 2^18 pages can be granted again. |
+| `era_physical_lifetime` | Exact granted totals (5, then 7, then 0 after one release of both grants in mixed order). Exhaustion leaves the count at 0, the array untouched and the total unchanged. Cleanup returns the total to 0. |
+| `xmem_shim_exports` | Also resolves the two new names. |
+
+**Public call evidence.** Microsoft's Xbox GDK samples (MIT, commit `b1e77b6`) establish the 64 KiB allocate/free pairing, the in/out count with a page array, and the Boolean success check:
+
+- [`AdvancedESRAM/PageAllocator.cpp`](https://github.com/microsoft/Xbox-GDK-Samples/blob/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/Graphics/AdvancedESRAM/PageAllocator.cpp#L193-L232) passes `MEM_64K_PAGES`, a `ULONG_PTR` count by address and a `PULONG_PTR` page array, and tests the `BOOL` result. It later releases the block with `XMemFreePhysicalPages(count, pages)` using the same count and array slice.
+- [`AMDFidelityFX_FSR3FrameInterpolation/FSR3FrameInterpolation.cpp`](https://github.com/microsoft/Xbox-GDK-Samples/blob/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/Graphics/AMDFidelityFX_FSR3FrameInterpolation/FSR3FrameInterpolation.cpp#L146-L167) casts the flag to `ULONG_PTR` (`XMEM_2MB_CLUSTERS` for 2 MiB pages, `MEM_64K_PAGES` for 64 KiB pages) and passes an in/out count. It asserts that the count comes back unchanged and that both calls return a nonzero `BOOL`.
+- The [GDK DirectStorage overview](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/console/storage/directstorage/directstorage-overview?view=gdk-2604) describes arrays of 64 KiB physical pages from this path as a request destination.
+
+The samples do not settle what happens to the count and array on failure, or whether a partial release is permitted. [SlimEra `kernelx.cpp`](https://github.com/XWine1/SlimEra/blob/397807a9563f62b56cf7aaea9809b6fa635ba651/kernelx.cpp) (MIT) implements the kernelx-level `AllocateTitlePhysicalPages`/`FreeTitlePhysicalPages`, which have the same count and array shape plus a process handle. It returns 64 KiB page indices and can return fewer pages than requested. It sets the count to 0 for bad flags, and its release clears whatever indices it is given. It is a reimplementation, not console evidence.
+
+**Desktop contract** (`src/era_physical.cpp`, exported from `src/xmem_shim.cpp`):
+
+| Item | Desktop behavior | Basis |
+|---|---|---|
+| `XMemAllocatePhysicalPages(ULONG_PTR flags, PULONG_PTR count, PULONG_PTR pages)` | `rcx`, `rdx` and `r8` as declared. Returns `BOOL`. | Samples. A full 64-bit flag argument is inferred from the `ULONG_PTR` cast. |
+| Page-count unit | 64 KiB pages for `MEM_64K_PAGES`. | Samples |
+| Flags | Only `MEM_64K_PAGES` (`0x20400000`). Any other bit, including the upper 32, is refused. `XMEM_2MB_CLUSTERS` is refused because its value and array layout are not public. | Proposed desktop policy |
+| Valid allocation | Returns `TRUE` and `ERROR_SUCCESS`. Writes `count` opaque, nonzero page numbers, unique among live pages, and leaves the count unchanged. All or nothing. Nothing is committed: the numbers are bookkeeping until mapping is modeled. | Count unchanged: samples. The rest is proposed desktop policy. |
+| Failure | Returns `FALSE` and sets `*count = 0`. The array is left untouched. A zero count, a null count or array, bad flags, or a count above the desktop capacity of 2^18 pages (16 GiB) gives `ERROR_INVALID_PARAMETER`. Too few free pages gives `ERROR_NOT_ENOUGH_MEMORY`. | Proposed desktop policy. The capacity matches SlimEra's 16 GiB. |
+| `XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages)` | Returns `BOOL`. Releasing the same count and array that were allocated succeeds. | Samples |
+| Release beyond that | Several whole grants may be released in one call, in any order. A zero count, duplicate entry, unallocated number or incomplete grant returns `FALSE` with `ERROR_INVALID_PARAMETER` and changes nothing. | Proposed desktop policy |
+
+The caller supplies a valid count and a separate array large enough for the
+request. Release reads a valid array that stays unchanged during the call. Page
+numbers refer to current grants and may be reused. A caller must discard its
+numbers after release. An immediate repeat while the numbers are free is refused.
+
+Open questions for #870:
+
+- **Flag width.** Is the flag argument `ULONG_PTR` or `DWORD` on the console? The desktop refuses upper bits, so a caller that leaves garbage in the upper half of `rcx` would be refused.
+- **2 MiB clusters.** What is the value of `XMEM_2MB_CLUSTERS`, and are the count and array then in 2 MiB or 64 KiB units?
+- **State on failure.** Does the console leave the count and array alone on failure? Can it grant fewer pages than requested?
+- **Release rules.** What do console page numbers encode? Does `XMemFreePhysicalPages` accept a subset of a grant?
+- **Limits and errors.** What error codes does the console return, and what is the title's physical-page budget?
+
+```powershell
+cmake --build --preset dev --target xmem_shim_check era_physical_check pe_map cpu_exe_io cpu_xmem_physical_original cpu_xmem_physical_full_count cpu_xmem_physical_skip_release
+ctest --preset dev --no-tests=error -R '^(xmem_shim_(exports|physical_pages)|era_physical_(controls|lifetime)|cpu_native_xmem_physical_pair)$' -V
+```
+
 ### Grouped allocation descriptor builders
 
 In the inspected Bink image, the function interval beginning at RVA `0x67c0` contains direct calls to the group initializer (`0x25b80`), append helper (`0x25b20`) and grouped allocator (`0x25a40`). The initializer places two adjacent arrays after a 64-byte header. Each successful append records a destination and a padded stride. With five available slots, requests of 0, 33, 1, 1025 and 32 bytes produced strides of 32, 64, 128, 1280 and 512 bytes in order. The stride in 32-byte units is congruent to the previous total in units plus one, modulo 32. All five stored strides were even. These helpers do not establish who produces odd tagged entries.
