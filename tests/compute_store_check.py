@@ -1624,6 +1624,17 @@ LDS_WIDE_SETUP = DS_PREFIX + [
     "v_mov_b32_e32 v7, 0x89abcdef",
     "v_mov_b32_e32 v9, 0x76543210",
 ]
+LDS_WIDE_QUAD_SETUP = [
+    "v_mov_b32_e32 v16, v6", "v_mov_b32_e32 v17, v7",
+    "v_mov_b32_e32 v18, v9", "v_mov_b32_e32 v19, 0xf0e1d2c3",
+]
+LDS_WIDE_QUADS = {
+    "lds_b128": ["ds_write_b128 v5, v[16:19]", "ds_read_b128 v[10:13], v5"],
+    "lds_write2_b32": ["ds_write_b128 v5, v[16:19]", "ds_write2_b32 v5, v6, v9 offset0:3 offset1:1",
+                       "ds_read_b128 v[10:13], v5"],
+    "lds_pair_b64": ["ds_write2_b64 v5, v[16:17], v[18:19] offset0:1",
+                     "ds_read2_b64 v[10:13], v5 offset1:1"],
+}
 LDS_WIDE_PROGRAMS = {
     "lds_b64": [
         "v_mov_b32_e32 v16, 5", "v_mov_b32_e32 v17, 9",
@@ -1647,6 +1658,11 @@ LDS_WIDE_PROGRAMS = {
 
 
 def lds_wide_program(name):
+    if name in LDS_WIDE_QUADS:
+        ds = [line for op in LDS_WIDE_QUADS[name] for line in (op, "s_waitcnt lgkmcnt(0)")]
+        return LDS_WIDE_SETUP + LDS_WIDE_QUAD_SETUP + ds + [
+            "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
+        ]
     return LDS_WIDE_SETUP + LDS_WIDE_PROGRAMS[name] + [
         "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen", "s_endpgm",
     ]
@@ -1656,12 +1672,20 @@ def lds_wide_reference(name, groups):
     words = []
     for lane in range(groups * 32):
         data = 0x12345670 + lane
+        if name in LDS_WIDE_QUADS:
+            words.extend({
+                "lds_b128": (data, 0x89abcdef, 0x76543210, 0xf0e1d2c3),
+                "lds_write2_b32": (data, 0x76543210, 0x76543210, data),
+                "lds_pair_b64": (0x76543210, 0xf0e1d2c3, data, 0x89abcdef),
+            }[name])
+            continue
         words.extend((0x76543210, 0x89abcdef, data) if name == "lds_read2_b32"
                      else (data, 0x89abcdef, 0x76543210))
     return words
 
 
 LDS_PACKED_CASES = [(name, lds_wide_program(name), LDS_WIDE_BINDING) for name in LDS_WIDE_PROGRAMS]
+LDS_PACKED_CASES += [(name, lds_wide_program(name), LDS_WIDE_BINDING | {"stride": 16}) for name in LDS_WIDE_QUADS]
 
 
 LDS_HIGH_WRITES = {"ds_write_b8_d16_hi": (1, 1), "ds_write_b16_d16_hi": (2, 2)}
@@ -1732,6 +1756,17 @@ def lds_controls():
             variant(high, ("offset:2", "offset:1")), 32, **LDS_BINDING)
     rejects("Unverified private LDS write", aot.lower,
             variant(high, ("ds_write_b32 v5, v6", "s_nop 0")), 32, **LDS_BINDING)
+
+    pair = lds_wide_program("lds_pair_b64")
+    for before, after, message in (
+        ("offset0:1", "offset0:0", "Unverified private paired LDS access"),
+        ("offset1:1", "offset1:2", "Unverified private paired LDS access"),
+        ("v[18:19] offset0:1", "v[18:20] offset0:1", "Unverified private paired LDS register range"),
+        ("ds_write2_b64 v5, v[16:17], v[18:19] offset0:1", "ds_write_b64 v5, v[16:17]",
+         "Uninitialized private wide LDS word"),
+        ("offset1:1", "offset1:1 gds", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(pair, (before, after)), 32, **(LDS_WIDE_BINDING | {"stride": 16}))
 
     name, lines, binding = LDS_STRIDED_CASES[1]
     assert name == "lds_st64_b64"
@@ -1974,6 +2009,17 @@ def ds_mutants(name, lines, binding, source):
         if name in ("ds_read_i8_d16", "ds_read_i8_d16_hi"):
             changed = variant(lines, (f"{name} v10, v5", f"{name.replace('i8', 'u8')} v10, v5"))
             yield aot.lower(changed, 32, **binding), 0
+    elif name in LDS_WIDE_QUADS:
+        if name == "lds_b128":
+            change = ("v_mov_b32_e32 v19, 0xf0e1d2c3", "v_mov_b32_e32 v19, 0")
+            word = 3
+        elif name == "lds_write2_b32":
+            change = ("offset0:3 offset1:1", "offset0:1 offset1:3")
+            word = 1
+        else:
+            change = ("ds_read2_b64 v[10:13], v5 offset1:1", "ds_read2_b64 v[10:13], v5 offset0:1")
+            word = 0
+        yield aot.lower(variant(lines, change), 32, **binding), word
     elif name in LDS_WIDE_PROGRAMS:
         if name == "lds_read2_b32":
             change = ("offset0:2 offset1:1", "offset0:1 offset1:2")
@@ -2025,7 +2071,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
         compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
-        for groups in (1, 2) if name in LDS_STRIDED_PROGRAMS else (1, 3):
+        # Four words per lane fill the fixed 320-word readback before three groups.
+        for groups in (1, 2) if name in LDS_WIDE_QUADS or name in LDS_STRIDED_PROGRAMS else (1, 3):
             if name in LDS_UPDATES or name in LDS_RETURN_UPDATES:
                 words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
             elif name in LDS_SUBWORDS:
@@ -2040,7 +2087,7 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = [base + lane for lane in range(groups * 32) for base in (0x12345670, 0x89abcdef)]
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)
-            elif name in LDS_WIDE_PROGRAMS:
+            elif name in LDS_WIDE_PROGRAMS or name in LDS_WIDE_QUADS:
                 words = lds_wide_reference(name, groups)
             elif name in LDS_COUNTERS:
                 words = lds_counter_reference(name, groups)

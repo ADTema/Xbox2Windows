@@ -2348,6 +2348,13 @@ the old word to the destination VGPR. The fixtures compare old and new words
 and exercise successful and unsuccessful comparisons. Reversing the comparison
 operands, masking the OR operand or omitting the exchange must mismatch at word 1.
 
+The same 16-byte record supports `ds_write_b128` and `ds_read_b128` at
+byte offset zero, `ds_write2_b32` at distinct dword offsets and
+`ds_write2_b64` and `ds_read2_b64` at qword offsets. Both elements must fit
+and a dual write must not overlap itself. The fixtures export four words
+per lane for one and two groups. Clearing the fourth source or swapping
+paired offsets must produce a readback mismatch.
+
 `ds_write_b8_d16_hi` selects source bits 23:16 and `ds_write_b16_d16_hi`
 selects bits 31:16, preserving bytes outside the addressed field.
 `ds_read_i8_d16_hi` sign-extends the selected byte into bits 31:16 and
