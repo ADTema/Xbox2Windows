@@ -790,7 +790,12 @@ OperationResult run_bvh_wave64(const OperationContext& ctx)
 
 OperationResult run_dxr_update(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_update(ctx.device));
+    return skip_if_false(check_dxr_update(ctx.device, false));
+}
+
+OperationResult run_dxr_update_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_update(ctx.device, true));
 }
 
 OperationResult run_dxr_facing(const OperationContext& ctx)
@@ -955,6 +960,7 @@ const OperationSpec kOperations[] = {
     {"--bvh-waves", 3, 3, nullptr, kGateSm65, run_bvh_waves},
     {"--bvh-wave64", 3, 3, nullptr, kGateWave64, run_bvh_wave64},
     {"--dxr-update", 3, 3, nullptr, kNoGate, run_dxr_update},
+    {"--dxr-update-pipeline", 3, 3, nullptr, kNoGate, run_dxr_update_pipeline},
     {"--dxr-facing", 3, 3, nullptr, kNoGate, run_dxr_facing},
     {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
