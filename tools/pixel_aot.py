@@ -1750,7 +1750,12 @@ def emit_quad_swizzle_u32(lines, idx, base_expr, perm):
         lines.append(f"    uint {lv} = QuadReadLaneAt(dpp{idx}_in, {lane});")
         lane_vars[lane] = lv
     l0, l1, l2, l3 = (lane_vars[p] for p in perm)
-    lines.append(f"    uint {svar} = (dpp{idx}_q == 0u ? {l0} : (dpp{idx}_q == 1u ? {l1} : (dpp{idx}_q == 2u ? {l2} : {l3})));")
+    # Select with bits so the quad reads stay outside divergent branch arms (#1024).
+    even, top = f"dpp{idx}_even", f"dpp{idx}_top"
+    lines.append(f"    uint {even} = (dpp{idx}_q & 1u) - 1u;")
+    lines.append(f"    uint {top} = (dpp{idx}_q >> 1u) - 1u;")
+    lines.append(f"    uint {svar} = ((({l0} & {even}) | ({l1} & ~{even})) & {top}) | "
+                 f"((({l2} & {even}) | ({l3} & ~{even})) & ~{top});")
     return svar
 
 
