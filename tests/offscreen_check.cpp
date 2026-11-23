@@ -697,6 +697,17 @@ OperationResult run_mesh_depth_pair(const OperationContext& ctx)
                                                true, MeshConstantBinding::root, MeshDrawMode::depth_pair));
 }
 
+OperationResult run_mesh_shadow(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_shadow_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6],
+                                                ctx.argc == 8));
+}
+
+bool validate_mesh_shadow_args(int argc, char** argv)
+{
+    return argc == 7 || std::string_view(argv[7]) == "stale";
+}
+
 OperationResult run_bvh_root_roundtrip(const OperationContext& ctx)
 {
     check_bvh_root_roundtrip(ctx.device);
@@ -887,6 +898,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-textured", 6, 6, nullptr, kNoGate, run_mesh_textured},
     {"--compute-mesh-texture", 7, 9, validate_compute_mesh_texture_args, kNoGate, run_compute_mesh_texture},
     {"--mesh-depth-pair", 6, 6, nullptr, kNoGate, run_mesh_depth_pair},
+    {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
     {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},
     {"--bvh-differential", 3, 3, nullptr, kNoGate, run_bvh_differential},
     {"--bvh-differential-pipeline", 3, 3, nullptr, kNoGate, run_bvh_differential_pipeline},
