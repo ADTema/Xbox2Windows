@@ -435,29 +435,26 @@ endif()
 if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")
-    find_program(SPIRV_WINDOW_AS spirv-as HINTS "$ENV{VULKAN_SDK}/Bin")
-    find_program(SPIRV_WINDOW_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin")
-    find_program(SPIRV_WINDOW_CROSS spirv-cross HINTS "$ENV{VULKAN_SDK}/Bin")
-    if(SPIRV_WINDOW_AS AND SPIRV_WINDOW_VAL AND SPIRV_WINDOW_CROSS)
-        foreach(adapter IN ITEMS hardware warp)
-            add_test(NAME spirv_address_window_${adapter} COMMAND "${INTAKE_PYTHON}" -B
-                "${CMAKE_SOURCE_DIR}/tests/spirv_window/draw.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
+    # tools/setup-spirv-tools.ps1 builds the pinned tools into out/tools/spirv/bin.
+    set(spirv_tool_hints "${CMAKE_SOURCE_DIR}/out/tools/spirv/bin" "$ENV{VULKAN_SDK}/Bin")
+    find_program(SPIRV_WINDOW_AS spirv-as HINTS ${spirv_tool_hints})
+    find_program(SPIRV_WINDOW_VAL spirv-val HINTS ${spirv_tool_hints})
+    find_program(SPIRV_WINDOW_CROSS spirv-cross HINTS ${spirv_tool_hints})
+    # Registered unconditionally: without the tools the wrapper reports a skip (77) rather than the
+    # tests silently disappearing. Hosted CI sets X2W_REQUIRE_SPIRV_TOOLS=1 to turn skips into failures.
+    foreach(adapter IN ITEMS hardware warp)
+        foreach(bridge IN ITEMS address_window:draw sampler_views:sampler ballot_extract:ballot
+                                compare_sampler:compare_sampler)
+            string(REPLACE ":" ";" bridge "${bridge}")
+            list(GET bridge 0 name)
+            list(GET bridge 1 driver)
+            add_test(NAME spirv_${name}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/spirv_window/run_bridge_test.py"
+                "${CMAKE_SOURCE_DIR}/tests/spirv_window/${driver}.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
                 "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
-            add_test(NAME spirv_sampler_views_${adapter} COMMAND "${INTAKE_PYTHON}" -B
-                "${CMAKE_SOURCE_DIR}/tests/spirv_window/sampler.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
-                "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
-            set_tests_properties(spirv_sampler_views_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
-            add_test(NAME spirv_ballot_extract_${adapter} COMMAND "${INTAKE_PYTHON}" -B
-                "${CMAKE_SOURCE_DIR}/tests/spirv_window/ballot.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
-                "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
-            add_test(NAME spirv_compare_sampler_${adapter} COMMAND "${INTAKE_PYTHON}" -B
-                "${CMAKE_SOURCE_DIR}/tests/spirv_window/compare_sampler.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
-                "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
-            set_tests_properties(spirv_compare_sampler_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
-            set_tests_properties(spirv_ballot_extract_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
-            set_tests_properties(spirv_address_window_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
+            set_tests_properties(spirv_${name}_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
-    endif()
+    endforeach()
     # Outside a Git checkout, such as a source archive, the tracked-path check cannot run.
     set_tests_properties(docs_links PROPERTIES SKIP_RETURN_CODE 77)
 
