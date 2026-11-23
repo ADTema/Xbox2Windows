@@ -268,6 +268,8 @@ def check_shader_records():
         without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(trig)
     # Count the supported 64-bit SOP1/SOP2 and BFE forms in both gfx1013 and rdna2.
+    masked_forms = {("SOP1", "s_and_saveexec_b64"), ("SOPP", "s_cbranch_execz")}
+    assert masked_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
     scalar64_forms = {
         ("SOP1", "s_cmov_b64"), ("SOP1", "s_not_b64"), ("SOP1", "s_brev_b64"),
         ("SOP2", "s_and_b64"), ("SOP2", "s_or_b64"), ("SOP2", "s_xor_b64"),
@@ -322,11 +324,13 @@ def check_shader_records():
         ("SOP2", "s_absdiff_i32"),
     }
     rejected_forms = {
-        "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
+        "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
         "v_mul_i32_i24_sdwa",
         "v_cvt_pk_u8_f32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
         "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
+        "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz",
+        "s_cbranch_scc0", "s_cbranch_scc1",
         "s_absdiff_i64", "s_absdiff_u32",
         "v_sad_u8", "v_sad_u16", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_mqsad_u32_u8",
     }
