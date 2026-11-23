@@ -346,8 +346,42 @@ def string_op(i):
     return f"{{ const word step = direction ? 0ull - {size}ull : {size}ull; {body} }}"
 
 
+# The host-MXCSR profile's refusal statuses: a requested word with a reserved bit (16-31), with one of the six
+# exception masks (bits 7-12) clear, or with FTZ (bit 15) or DAZ (bit 6), which the first profile leaves out.
+MXCSR_STATUS = {"reserved": 1, "unmasked": 2, "unsupported": 3}
+# A file that lowers with the host-MXCSR profile observes the floating-point environment.
+MXCSR_HEADER = "#pragma fenv_access(on)\n"
+
+
+class Mxcsr:
+    """The host-MXCSR profile's error channel. reject is a format string with a {status} field: C++ that leaves
+    the lowered function and hands the status to the caller, as for x87_lower.Checked."""
+
+    def __init__(self, reject):
+        self.reject = reject
+
+    def leave(self, name):
+        return self.reject.format(status=MXCSR_STATUS[name])
+
+
+def mxcsr_entry(name, inner):
+    """The exported boundary of a function lowered with the host-MXCSR profile. inner(a, b, c, state, &status) is
+    the lowered body. The boundary saves the caller's whole MXCSR and restores it on a normal return, after a
+    refusal and when a structured exception such as a guest memory fault leaves inner. <name>_status() returns the
+    refusal status of the calling thread's last call, 0 when none."""
+    return (f"static thread_local int {name}_last_status = 0;\n"
+            f'extern "C" __declspec(dllexport) int {name}_status() {{ return {name}_last_status; }}\n'
+            f'extern "C" __declspec(dllexport) word {name}(word a, word b, word c, word state) {{\n'
+            f"    const unsigned int caller_mxcsr = _mm_getcsr(); word result = 0; int status = 0;\n"
+            f"    __try {{ result = {inner}(a, b, c, state, &status); }} __finally {{\n"
+            f"        _mm_setcsr(caller_mxcsr);\n"
+            f"        {name}_last_status = status;\n"
+            f"    }}\n"
+            f"    return result;\n}}\n")
+
+
 def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, host_entropy=False,
-          host_cpu=False):
+          host_cpu=False, host_mxcsr=None):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = [f"word frame[{FRAME_WORDS}]{{}};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false, overflow=false, sign=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
@@ -835,6 +869,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             stmt = ("{ int cpu_regs[4]; __cpuidex(cpu_regs, static_cast<int>(rax), static_cast<int>(rcx)); "
                     "rax = static_cast<uint32_t>(cpu_regs[0]); rbx = static_cast<uint32_t>(cpu_regs[1]); "
                     "rcx = static_cast<uint32_t>(cpu_regs[2]); rdx = static_cast<uint32_t>(cpu_regs[3]); }")
+        elif op == M.LDMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+            # The opt-in host-MXCSR profile: the requested word is checked before it reaches the host register,
+            # so a refused word changes nothing and no later guest instruction runs.
+            stmt = (f"{{ const uint32_t want = {guest('uint32_t')}; "
+                    f"if (want & 0xffff0000u) {host_mxcsr.leave('reserved')} "
+                    f"if ((want & 0x1f80u) != 0x1f80u) {host_mxcsr.leave('unmasked')} "
+                    f"if (want & 0x8040u) {host_mxcsr.leave('unsupported')} "
+                    f"_mm_setcsr(want); }}")
+        elif op == M.STMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+            stmt = f"store<uint32_t>({address()}, _mm_getcsr());"
         elif op == M.XGETBV and host_cpu:
             # The host's extended control register ECX into EDX:EAX, flags kept. Any ECX is passed through, but
             # the supported contract is a caller that checked OSXSAVE and reads XCR0 (ECX = 0); an invalid index
