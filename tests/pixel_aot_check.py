@@ -1139,6 +1139,17 @@ def check_e64_approx_lowering():
     must_reject(translate, with_constants(["v_mov_b32_e32 v14, s46", "v_mac_f32_e64 v14, -s44, |s45|, v14"]))
 
 
+def check_dpp_vop3_only_refused():
+    """VOP3-only ALU ops have no DPP spelling; lowering one is a clean refusal, not a crash in the DPP path."""
+    body = list(DPP_BODY)
+    at = next(k for k, line in enumerate(body) if line.startswith("v_add_f32_dpp v23"))
+    for op in ("mad", "mad_legacy", "min3", "max3", "med3"):
+        assert op in ALU and op not in pixel_aot.DPP_ALU, op
+        line = f"v_{op}_f32_dpp v23, v20, v20, v20 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf"
+        program = with_constants(body[:at] + [line] + body[at + 1:])
+        expect_value_error(translate, program, f"Unsupported instruction {program.index(line)}: {line}")
+
+
 def check_mac_legacy_lowering():
     """Static checks for MAC_LEGACY_BODY and the forms LLVM 15 does not have for v_mac_legacy_f32."""
     program = uncompressed_export(MAC_LEGACY_BODY)
@@ -6711,6 +6722,7 @@ def check_controls(directory):
     must_reject(translate, with_constants(["v_mac_f32_e32 v14, s44, v15, v14"]))
     check_e64_approx_lowering()
     check_mac_legacy_lowering()
+    check_dpp_vop3_only_refused()
     # v_madak_f32 and v_madmk_f32 use the same helper. The literal is the last operand of madak and the
     # second of madmk; a register there, a missing operand, and the e64, DPP and SDWA spellings are refused.
     body = translate(with_constants(MAD_LITERAL_BODY)).split("float4 main", 1)[1]

@@ -482,8 +482,9 @@ ALU = {
     "min3": (3, "min(min({0}, {1}), {2})"), "max3": (3, "max(max({0}, {1}), {2})"),
     "med3": (3, "max(min({0}, {1}), min(max({0}, {1}), {2}))"),
 }
-# LLVM 15 sets HasExtDPP = 0 for v_mac_legacy_f32, so it has no DPP form.
-DPP_ALU = {k: v for k, v in ALU.items() if k not in ("fma", "mac_legacy")}
+# LLVM 15 sets HasExtDPP = 0 for v_mac_legacy_f32, and fma, mad, mad_legacy, min3, max3 and med3 are VOP3-only, so
+# none of them has a DPP form (llvm-mc for gfx1013: "dpp variant of this instruction is not supported").
+DPP_ALU = {k: v for k, v in ALU.items() if k not in ("fma", "mac_legacy", "mad", "mad_legacy", "min3", "max3", "med3")}
 # N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
     "f": "false", "tru": "true",
