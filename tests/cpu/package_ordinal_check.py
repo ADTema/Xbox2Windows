@@ -97,6 +97,7 @@ def check_mapper_ordinal(mapper, provider):
         fn = export(base, 77)
         assert fn, "NONAME ordinal @77 should be callable"
         assert all(not export(base, x) for x in (0, 1, 76, 78, 65535, 65536)), "invalid ordinals returned code"
+        assert not export(None, 77), "null mapping returned code"
         output = (ctypes.c_uint64 * 3)()
         result = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
                                  ctypes.POINTER(ctypes.c_uint64))(fn)(5, 3, output)

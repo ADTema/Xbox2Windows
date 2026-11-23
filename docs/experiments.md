@@ -32,6 +32,8 @@ Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepend
 including ordinal-only (`NONAME`) DLL exports and forwarder chains ending in an
 ordinal, using `pe_map_export_ordinal` on the mapped provider. `cpu_native_startup` checks the same two-DLL fixture under this runner and the Windows loader.
 
+External providers with process-lifetime workers can use `--pin-shim DLL` alongside `--shim DLL PATH`. This pins the provider immediately before the first guest image loads, and only in execution mode. Run packages in a child process when using pinned providers. The guest must still join its own workers and quiesce any host calls into guest code before returning. `cpu_package_shim_lifetime` verifies that the selected provider remains loaded after the entry returns and the ordinary provider unloads.
+
 ## Two-record archive reader from standard startup
 
 The [archive reader](../tests/cpu/archive/reader.zig) uses Zig 0.13.0's standard single-threaded Windows console startup. From the linked entry the translator follows the call into the record loop and the final call to RtlExitUserProcess. It recognizes six-byte linker jump thunks for explicitly bound IAT slots, models termination without fallthrough and propagates a narrow return value through a wider register copy. A control changes the startup to consume EAX instead of AL and must fail translation.
@@ -2335,6 +2337,18 @@ the old word to the destination VGPR. The fixtures compare old and new words
 and exercise successful and unsuccessful comparisons. Reversing the comparison
 operands, masking the OR operand or omitting the exchange must mismatch at word 1.
 
+`ds_write_b8_d16_hi` selects source bits 23:16 and `ds_write_b16_d16_hi`
+selects bits 31:16, preserving bytes outside the addressed field.
+`ds_read_i8_d16_hi` sign-extends the selected byte into bits 31:16 and
+preserves the destination's low half. The fixtures replace the high source
+or signed extraction with its low or unsigned counterpart and expect a mismatch.
+
+`ds_write_addtid_b32` and `ds_read_addtid_b32` use the same private word
+when M0 is explicitly zero, the instruction offset is zero and a single
+full wave32 makes TID equal to local X. The fixture writes through each
+addressing mode and reads through the other, then compares both words.
+Returning the first value for the second read must mismatch at word 1. The implicit address uses a four-byte stride. The lowerer rejects it if a 16-byte private LDS stride also appears in the program, regardless of which form comes first.
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
@@ -2373,7 +2387,7 @@ at the first lane affected by each mutation.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
-ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_private_(warp|hardware)$' -V
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_(private|packed|arithmetic|replacement)_(warp|hardware)$' -V
 ```
 
 ```sh
@@ -4052,6 +4066,66 @@ ctest --preset dev --no-tests=error -R '^cpu_native_transfer_mem$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_transfer_mem$' -V
 ```
 
+### Audio-side import inventory
+
+Binding probes on #870 leave 19 audio-side imports unresolved: 5 from `chad.dll`, 5 from `xapu.dll` and 9 from `acphal.dll`. None of these modules exists in System32. This inventory records the public evidence for each name. Microsoft's reference pages for these APIs sit behind the NDA developer program, so they give no public signature. Microsoft's MIT-licensed [GDK Learn index at `f8c3438`](https://github.com/microsoft/XBOX-GDK-dotnet/blob/f8c3438aa366fbbb662d8a5e724021a9d0b65f5d/eng/gdk-learn-index.json) confirms that the `XDsp*` and `XApu*` functions are documented APIs and gives each one a page path. It lists AcpHal and the Audio Processing Unit only as member pages. Public MIT call sites in [DirectXTK12 at `f3555e3`](https://github.com/microsoft/DirectXTK12/tree/f3555e3014a53c81a6202b786dc4d6509b95a936) cover `ApuAlloc` and `ApuFree`. Several unaffiliated reimplementations also export these names. Their declarations do not trace to a public Microsoft source, so this inventory does not use them.
+
+| Module | Import | Public evidence | Desktop replacement candidate | Status |
+|---|---|---|---|---|
+| `chad.dll` | `XDspActivate` | Learn index entry only | None known. XAudio2 and WASAPI mix and play audio but do not provide this stream queue. | needs evidence |
+| `chad.dll` | `XDspConnectWithMaximumStreamLimit` | Learn index entry only | None known | needs evidence |
+| `chad.dll` | `XDspDeactivate` | Learn index entry only | None known | needs evidence |
+| `chad.dll` | `XDspDisconnect` | Learn index entry only | None known | needs evidence |
+| `chad.dll` | `XDspSubmitCommand` | Learn index entry only | None known | needs evidence |
+| `xapu.dll` | `XApuConnect` | Learn index entry only, plus input and output parameter struct names | None known | needs evidence |
+| `xapu.dll` | `XApuDequeueResult` | Learn index entry only | None known | needs evidence |
+| `xapu.dll` | `XApuDisconnect` | Learn index entry only | None known | needs evidence |
+| `xapu.dll` | `XApuEnqueueCommand` | Learn index entry only | None known. Desktop XAudio2 has no XMA decoder. | needs evidence |
+| `xapu.dll` | `XApuGetResultCount` | Learn index entry only | None known | needs evidence |
+| `acphal.dll` | `AcpHalCreate` | None (index lists only the AcpHal member page) | None known | needs evidence |
+| `acphal.dll` | `AcpHalAllocateShapeContexts` | None | None known | needs evidence |
+| `acphal.dll` | `AcpHalReleaseShapeContexts` | None | None known | needs evidence |
+| `acphal.dll` | `ApuCreateHeap` | Named in a DirectXTK12 diagnostic as the heap that `ApuAlloc` draws from. No call site and no signature. | Process memory (proposed, untested) | needs evidence |
+| `acphal.dll` | `ApuAlloc` | Call sites at [SoundEffect.cpp L246](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L246), [WaveBankReader.cpp L799](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/WaveBankReader.cpp#L799) and [SoundStreamInstance.cpp L470](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundStreamInstance.cpp#L470) | Aligned process memory (proposed, fixture only) | partial call shape |
+| `acphal.dll` | `ApuFree` | Call sites at [SoundEffect.cpp L95](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L95) and [SoundStreamInstance.cpp L60](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundStreamInstance.cpp#L60) | Release of the block above (proposed, fixture only) | partial call shape |
+| `acphal.dll` | `ApuIsVirtualAddressValid` | None | None known | needs evidence |
+| `acphal.dll` | `ApuMapApuAddress` | None | None known | needs evidence |
+| `acphal.dll` | `ApuMapVirtualAddress` | None | None known | needs evidence |
+
+No import has both a public signature and a usable desktop replacement. The 17 imports marked "needs evidence" stay unresolved, and this change adds no binding for any of them. Those calls cover the stream, command-queue and SHAPE context interfaces, which are console audio hardware with no desktop counterpart known. They need a public declaration or a source-built observation before any caller.
+
+The DirectXTK12 call sites establish the following:
+
+- `ApuAlloc` returns an `HRESULT` that callers test with `FAILED`.
+- The first argument is the address of a `void*` that receives the block.
+- The second argument is pointer-sized, and every call site passes `nullptr`. Its type is not public.
+- The third argument is a byte count cast to `UINT32`.
+- The fourth is the alignment constant `SHAPE_XMA_INPUT_BUFFER_ALIGNMENT`. Its value and width are not public.
+- `ApuFree` takes the returned `void*`. Every call site discards its result, so the return type is not public.
+- When `ApuAlloc` fails, DirectXTK12 asks whether the heap from `ApuCreateHeap` was large enough. Running out of heap is therefore one failure mode. The exact error code is not public.
+
+### APU allocation caller and recorder
+
+A source-built caller ([`apu_alloc_caller.asm`](../tests/cpu/apu_alloc_caller.asm)) imports `ApuAlloc` and `ApuFree` from `acphal.dll` by name with the call shape above, plus `finish_exe` from `cpu_exe_io.dll`, and starts through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). A test-only recording provider ([`apu_alloc_provider.cpp`](../tests/cpu/apu_alloc_provider.cpp)) serves both names from a 64 KiB arena. The arena stands in for the heap `ApuCreateHeap` would create. That function's signature is not public, so neither the caller nor the provider uses it. This is not a production `acphal.dll`. The arena size, the refusal code and the untouched output on failure are proposed desktop policy for the fixture, not console evidence.
+
+1. **Observable result:** a 4 KiB request at 2 KiB alignment returns `S_OK` and a 2 KiB-aligned block, and the caller writes and reads back the block's last word.
+2. **Refusal:** a 128 KiB request returns `E_OUTOFMEMORY` (`0x8007000E`) and leaves the caller's sentinel output unchanged.
+3. A 64 KiB request is refused the same way while the first block is live.
+4. After `ApuFree` releases the first block, the same 64 KiB request succeeds, and the caller writes and reads back its last word before releasing it.
+5. The caller checks its own provider's counts: 4 allocations, 2 releases, no live blocks and no rejected releases. It then exits with `0x8A0`.
+
+The check runs the EXE under the Windows loader, with and without a live worker at exit, and under `pe_map`. Both loaders exit with `0x8A0`, and the mapped run's recorded sizes, alignments and results match the expected sequence (`S_OK`, `E_OUTOFMEMORY`, `E_OUTOFMEMORY`, `S_OK`). It also runs these controls:
+
+- A lenient provider build (`APU_TEST_LENIENT`) accepts every size. Under both loaders the caller stops at the refusal step with `0xF02`.
+- Withholding `ApuAlloc` or `ApuFree` stops `pe_map` at import resolution before entry (`unresolved import acphal.dll!ApuAlloc` or `!ApuFree`). The provider records no calls.
+
+The fixture shows that the caller's success path, refusal path and release accounting are distinguishable and identical under both loaders. It does not establish the console's error codes, the second argument's meaning, the alignment width, the heap size, or whether the startup path calls `ApuAlloc` before `ApuCreateHeap`.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
+```
+
 ### Grouped allocation descriptor builders
 
 In the inspected Bink image, the function interval beginning at RVA `0x67c0` contains direct calls to the group initializer (`0x25b80`), append helper (`0x25b20`) and grouped allocator (`0x25a40`). The initializer places two adjacent arrays after a 64-byte header. Each successful append records a destination and a padded stride. With five available slots, requests of 0, 33, 1, 1025 and 32 bytes produced strides of 32, 64, 128, 1280 and 512 bytes in order. The stride in 32-byte units is congruent to the previous total in units plus one, modulo 32. All five stored strides were even. These helpers do not establish who produces odd tagged entries.
@@ -5437,7 +5511,9 @@ metadata and fake local files; no title files or binary fixtures are checked in.
 DLL whose export address table contains only an unnamed ordinal. The offline
 preflight resolves the package dependency as before. The mapper now exposes
 `pe_map_export_ordinal(mapped, ordinal)`, accepting an ordinal in 1..65535
-only when the mapped DLL exports a non-forwarded address at that exact ordinal.
+for a live mapping returned by `pe_map_image` with a non-forwarded export at
+that exact ordinal. A null mapping returns null. The runner requires this
+export from its mapper DLL only when a package actually needs an ordinal.
 It refuses holes, absent ordinals, out-of-range inputs and forwarder RVAs, rather
 than mistaking an export name-table index for an address-table index. Packages
 with a forwarded ordinal target are resolved by the existing package graph

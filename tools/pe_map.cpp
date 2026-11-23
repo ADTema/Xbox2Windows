@@ -1166,11 +1166,13 @@ bool find_export(const Image& image, const IMAGE_NT_HEADERS64* nt, const char* n
 // NONAME entries. An ordinal is Base + address-table index, not a name index.
 // Like pe_map_export, this deliberately refuses forwarders and holes; the package
 // runner resolves forwarder chains before asking the mapper for their final target.
+// The caller keeps the mapping returned by pe_map_image live throughout lookup.
 extern "C" __declspec(dllexport) void* pe_map_export_ordinal(void* mapped, std::uint32_t ordinal) {
+    if (!mapped || !ordinal || ordinal > 65535) return nullptr;
     const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();
     const Image image{static_cast<std::uint8_t*>(mapped), nt->OptionalHeader.SizeOfImage};
     const auto& exports = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
-    if (!ordinal || ordinal > 65535 || exports.Size < sizeof(IMAGE_EXPORT_DIRECTORY)
+    if (exports.Size < sizeof(IMAGE_EXPORT_DIRECTORY)
         || !inside(exports.VirtualAddress, exports.Size, image.size)) return nullptr;
     const auto* dir = image.at<IMAGE_EXPORT_DIRECTORY>(exports.VirtualAddress);
     if (!dir || !readable(dir, sizeof(*dir)) || ordinal < dir->Base) return nullptr;
