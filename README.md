@@ -66,6 +66,8 @@ out/source-built-package app.exe --output out/pe-package-report.json` reports di
 imports, package export/forwarder closure and external providers that could not be
 verified on the host, without loading an EXE or DLL. [Scope and synthetic tests](docs/experiments.md#offline-package-pe-import-closure).
 
+**Inspect one AMD64 PE image's import routing offline:** `python -B tools/compat_report.py <image.exe> --json out/compat-report.json --markdown out/compat-report.md` labels each normal and delay import as a candidate HLE, Windows, stub or unsupported module route from an explicit policy; the labels do not resolve exports or prove a provider. It also reports TLS, SEH and load-config directory presence. It reads the image without loading or executing it. This is an offline routing report, not a runtime measurement.
+
 ### Windows build notes
 
 - **DXC validation.** `shader_metadata_probe` skips when the validator lacks module-only validation. DXC 1.8.2502 is the first verified release that passes. To use a separate DXC installation, configure with `cmake --preset dev -DDXC_EXECUTABLE=C:/path/to/dxc/bin/x64/dxc.exe`. [Results by release](docs/experiments.md#module-only-validation-by-dxc-release) · [Original report](https://github.com/R0Y00/Xbox2Windows/issues/98) · [DXC download](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2502)
@@ -228,6 +230,8 @@ Maintainers link independent results to the original report and record the adapt
 The installation metadata inspected for this case study lists a Scarlett executable. The main executable was absent from the inspected files. The public regression suite uses source-built fixtures and independently built shaders. [Intake methods and evidence](docs/experiments.md#static-executable-intake)
 
 Windows Authenticode verification on the local copy reported `HashMismatch` for 12 DLLs and `NotSigned` for four. Three independently compared whole-file SHA-256 values matched the community reports. The cause of the digest mismatch and the original signing path remain undetermined. [Methods and fingerprints](https://github.com/R0Y00/Xbox2Windows/issues/52)
+
+XCL is a public behavioural reference for what a retail title may ask of the platform. The [XCL reference](docs/xcl-reference.md) records the GPL-2.0-only boundary and the pinned revision; the [capability matrix](docs/xcl-capability-matrix.md) maps selected XCL behaviours to named checked-in tests. Neither document is an Xbox2Windows measurement or a roadmap.
 
 ## License
 
