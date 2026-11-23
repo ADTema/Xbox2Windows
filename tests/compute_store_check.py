@@ -2,6 +2,7 @@
 from pathlib import Path
 import operator
 import os
+import operator
 import struct
 import subprocess
 import sys
@@ -1624,6 +1625,33 @@ LDS_WIDE_SETUP = DS_PREFIX + [
     "v_mov_b32_e32 v7, 0x89abcdef",
     "v_mov_b32_e32 v9, 0x76543210",
 ]
+LDS_QWORD_UPDATES = {
+    "ds_add_u64": operator.add, "ds_sub_u64": operator.sub, "ds_rsub_u64": lambda a, b: b - a,
+    "ds_and_b64": operator.and_, "ds_or_b64": operator.or_,
+}
+
+
+def lds_qword_program(op):
+    return LDS_WIDE_SETUP + [
+        "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
+        "v_mov_b32_e32 v17, 0xfffffff1",
+        "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x0000000e",
+        "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+        f"{op} v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
+    ]
+
+
+def lds_qword_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        previous = (0xfffffff1 << 32) | ((0xfffffff0 + lane) & 0xffffffff)
+        current = LDS_QWORD_UPDATES[op](previous, 0x0000000e00000018)
+        words.extend((current & 0xffffffff, (current >> 32) & 0xffffffff))
+    return words
+
+
 LDS_WIDE_QUAD_SETUP = [
     "v_mov_b32_e32 v16, v6", "v_mov_b32_e32 v17, v7",
     "v_mov_b32_e32 v18, v9", "v_mov_b32_e32 v19, 0xf0e1d2c3",
@@ -1780,6 +1808,9 @@ LDS_WIDE_REPLACEMENT_CASES = [
     for op in LDS_WIDE_REPLACEMENTS
 ]
 
+LDS_QWORD_BINDING = LDS_WIDE_BINDING | {"stride": 8}
+LDS_QWORD_CASES = [(op, lds_qword_program(op), LDS_QWORD_BINDING) for op in LDS_QWORD_UPDATES]
+
 
 def lds_controls():
     op, lines, binding = LDS_WIDE_REPLACEMENT_CASES[1]
@@ -1816,6 +1847,16 @@ def lds_controls():
             variant(high, ("offset:2", "offset:1")), 32, **LDS_BINDING)
     rejects("Unverified private LDS write", aot.lower,
             variant(high, ("ds_write_b32 v5, v6", "s_nop 0")), 32, **LDS_BINDING)
+
+    quad = lds_qword_program("ds_add_u64")
+    op = "ds_add_u64 v5, v[18:19] offset:8"
+    for bad, message in (
+        ("ds_add_u64 v5, v[18:19]", "Unverified private wide LDS update"),
+        ("ds_add_u64 v5, v[18:20] offset:8", "Unverified private wide LDS update"),
+        ("ds_add_u64 v5, v[254:255] offset:8", "Unverified private wide LDS update"),
+        (op + " gds", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(quad, (op, bad)), 32, **LDS_QWORD_BINDING)
 
     pair = lds_wide_program("lds_pair_b64")
     for before, after, message in (
@@ -2000,6 +2041,7 @@ def lds_controls():
 def ds_binary(directory, assembler, objcopy, library):
     cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES + LDS_STRIDED_CASES
     cases += LDS_WIDE_REPLACEMENT_CASES
+    cases += LDS_QWORD_CASES
     for name, lines, binding in cases:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -2070,6 +2112,18 @@ def ds_mutants(name, lines, binding, source):
         if name in ("ds_read_i8_d16", "ds_read_i8_d16_hi"):
             changed = variant(lines, (f"{name} v10, v5", f"{name.replace('i8', 'u8')} v10, v5"))
             yield aot.lower(changed, 32, **binding), 0
+    elif name in LDS_QWORD_UPDATES:
+        if name == "ds_add_u64":
+            wrong = source.replace(" + uint(", " + 0u * uint(")
+            word = 1
+        elif name in ("ds_sub_u64", "ds_rsub_u64"):
+            wrong = source.replace(" - uint(", " - 0u * uint(")
+            word = 33 if name == "ds_sub_u64" else 1
+        else:
+            alternate = "ds_or_b64" if name == "ds_and_b64" else "ds_and_b64"
+            wrong = aot.lower(variant(lines, (name, alternate)), 32, **binding)
+            word = 0
+        yield wrong, word
     elif name in LDS_WIDE_QUADS:
         if name == "lds_b128":
             change = ("v_mov_b32_e32 v19, 0xf0e1d2c3", "v_mov_b32_e32 v19, 0")
@@ -2162,6 +2216,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = [base + lane for lane in range(groups * 32) for base in (0x12345670, 0x89abcdef)]
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)
+            elif name in LDS_QWORD_UPDATES:
+                words = lds_qword_reference(name, groups)
             elif name in LDS_WIDE_PROGRAMS or name in LDS_WIDE_QUADS:
                 words = lds_wide_reference(name, groups)
             elif name in LDS_COUNTERS:
@@ -2662,6 +2718,7 @@ if __name__ == "__main__":
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
                  "draw-ds-route": ds_draw,
+                 "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
                  "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),
                  "draw-lds-wide-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_WIDE_REPLACEMENT_CASES),
                  "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
