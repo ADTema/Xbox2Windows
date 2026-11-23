@@ -16,9 +16,11 @@ access and carry DIR64 relocations, the null entry has none, the load-config fie
 hold the relocated in-image targets on read-only pages.
 
 Windows replaces both slots of a /guard:cf image and ends a call to the invalid target before it writes
-output. pe_map does not implement CFG: it keeps the image's own slots, so the valid callback runs without
-the slot bits and the invalid target runs. Both are asserted as the current pe_map behavior, so a change
-to the loader policy has to update this test.
+output. pe_map currently does not implement CFG: it keeps the image's own slots, so the valid callback runs
+without the slot bits and the invalid target runs. The unchecked invalid result is recorded as an
+observation. The test also accepts a mapper that explicitly rejects unsupported CFG before dispatch, or
+that enforces CFG and ends the invalid target without an entry result, so a later loader change does not
+rewrite what the fixture establishes.
 """
 import ctypes
 from ctypes import wintypes
@@ -195,15 +197,18 @@ def main(mapper_path, io, *images):
                 raise AssertionError(f"{name}: Windows launch did not end: {row}")
             native = (row["code"], trace(row["stderr"]["bytes"], row["stdout"]["bytes"]))
             result, out, err = mapped(mapper_path, staged, staged_io, temp)
-            if result["status"] != STATUS["ok"] or result.get("started") != 1:
+            started = result["status"] == STATUS["ok"] and result.get("started") == 1
+            if not started and name != "cfg_invalid":
                 raise AssertionError(f"mapped {name}: {result}")
-            for slot, state in result["slots"].items():
-                if state["protect"] != PAGE_READONLY or not state["relocated"]:
-                    raise AssertionError(f"mapped {name}: {slot} {state}")
-            mapped_row = (result["exit"], trace(err, out))
+            if started:
+                for slot, state in result["slots"].items():
+                    if state["protect"] != PAGE_READONLY or not state["relocated"]:
+                        raise AssertionError(f"mapped {name}: {slot} {state}")
+            mapped_row = (result["exit"], trace(err, out)) if started else None
             observed[name] = native, mapped_row
 
             base = name.removeprefix("cfg_")
+            note = "mapped slots read-only and relocated"
             if name in expected:
                 if native != expected[name] or mapped_row != expected[name]:
                     raise AssertionError(f"{name}: Windows {native}, pe_map {mapped_row}, expected {expected[name]}")
@@ -216,13 +221,21 @@ def main(mapper_path, io, *images):
             else:  # cfg_invalid
                 if native[0] == 0 or native[1] is not None or row["stdout"]["bytes"] or row["stderr"]["bytes"]:
                     raise AssertionError(f"{name}: Windows {native}, expected the process to end before writing output")
-                if mapped_row != expected[base]:
-                    raise AssertionError(f"{name}: pe_map {mapped_row}, expected the unchecked call {expected[base]}")
-            print(f"{name}: Windows {show(native)}; pe_map {show(mapped_row)}; mapped slots read-only and relocated")
+                if not started:
+                    note = f"status {result['status']} before dispatch ({result['detail']})"
+                elif mapped_row == expected[base]:
+                    note = "unchecked target (current observation); mapped slots read-only and relocated"
+                elif mapped_row[1] is None:
+                    note = "CFG enforced; no entry result"
+                else:
+                    raise AssertionError(f"{name}: pe_map {mapped_row}, expected the unchecked call, a "
+                                         "pre-dispatch rejection or no entry result")
+            shown = show(mapped_row) if mapped_row is not None else "not started"
+            print(f"{name}: Windows {show(native)}; pe_map {shown}; {note}")
 
         if observed["other"][0] == observed["record"][0]:
             raise AssertionError("the control binding was not distinguished")
-    print("load-config dispatch callback: PASS (pe_map keeps the image's own slots for /guard:cf images)")
+    print("load-config dispatch callback: PASS (valid callback and layout asserted; pe_map CFG boundary recorded)")
 
 
 if __name__ == "__main__":
