@@ -14,8 +14,8 @@
 // - A request succeeds completely or not at all; a successful call leaves the count unchanged.
 // - On failure the count is set to 0 and the page array is left untouched.
 // - A release must name every page of one or more live grants, each exactly once, in any order.
-//   A short or long count, a page freed twice, a page number that was never issued, a duplicate
-//   entry or part of a grant (partial release) is refused, and a refused release changes nothing.
+//   Unallocated numbers, incomplete grants and duplicate entries are refused without changing state.
+// - Page numbers can be reused. After releasing a grant, callers must discard its page numbers.
 namespace era_physical {
 constexpr std::uint64_t mem_64k_pages = 0x20400000;  // MEM_LARGE_PAGES | MEM_PHYSICAL
 constexpr std::uint64_t page_bytes = std::uint64_t{64} << 10;
@@ -24,7 +24,7 @@ constexpr std::uint64_t capacity_pages = std::uint64_t{1} << 18;  // 16 GiB of 6
 enum class Status { ok, invalid, exhausted };
 
 // On success writes count page numbers to pages. On failure sets *count to 0 (when count is not
-// null) and leaves pages untouched (proposed desktop policy).
+// null) and leaves pages untouched. The count and array must be disjoint, valid caller buffers.
 Status allocate(std::uint64_t flags, std::uint64_t* count, std::uint64_t* pages) noexcept;
 Status release(std::uint64_t count, const std::uint64_t* pages) noexcept;
 // Pages currently granted, for tests.

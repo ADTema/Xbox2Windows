@@ -3700,7 +3700,12 @@ The samples do not settle what happens to the count and array on failure, or whe
 | Valid allocation | Returns `TRUE` and `ERROR_SUCCESS`. Writes `count` opaque, nonzero page numbers, unique among live pages, and leaves the count unchanged. All or nothing. Nothing is committed: the numbers are bookkeeping until mapping is modeled. | Count unchanged: samples. The rest is proposed desktop policy. |
 | Failure | Returns `FALSE` and sets `*count = 0`. The array is left untouched. A zero count, a null count or array, bad flags, or a count above the desktop capacity of 2^18 pages (16 GiB) gives `ERROR_INVALID_PARAMETER`. Too few free pages gives `ERROR_NOT_ENOUGH_MEMORY`. | Proposed desktop policy. The capacity matches SlimEra's 16 GiB. |
 | `XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages)` | Returns `BOOL`. Releasing the same count and array that were allocated succeeds. | Samples |
-| Release beyond that | Several whole grants may be released in one call, in any order. Anything else returns `FALSE` with `ERROR_INVALID_PARAMETER` and changes nothing: a zero count, a short or long count, part of a grant (partial release), a double free, a never-issued or forged page number, or a duplicate entry. | Proposed desktop policy |
+| Release beyond that | Several whole grants may be released in one call, in any order. A zero count, duplicate entry, unallocated number or incomplete grant returns `FALSE` with `ERROR_INVALID_PARAMETER` and changes nothing. | Proposed desktop policy |
+
+The caller supplies a valid count and a separate array large enough for the
+request. Release reads a valid array that stays unchanged during the call. Page
+numbers refer to current grants and may be reused. A caller must discard its
+numbers after release. An immediate repeat while the numbers are free is refused.
 
 Open questions for #870:
 
