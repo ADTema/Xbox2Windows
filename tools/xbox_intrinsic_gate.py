@@ -61,9 +61,10 @@ def decide(inventory, status_of=None):
     the verdict ignores it.
     """
     status_of = status_of or default_status_of
+    calls = inventory["calls"]
     references = inventory.get("references") or {}
-    blocking = []
-    for symbol in sorted(set(inventory["calls"]) | set(references)):
+    blocking_calls, blocking_references, debug_only = [], [], []
+    for symbol in sorted(set(calls) | set(references)):
         builtin = symbol[len(XBOX_PREFIX):] if symbol.startswith(XBOX_PREFIX) else symbol
         advisory, unblocks = status_of(builtin)
         entry = {
@@ -73,18 +74,30 @@ def decide(inventory, status_of=None):
             "unblocks": unblocks,
             "advisory": advisory,
         }
-        if symbol in inventory["calls"]:
+        if symbol in calls:
             entry["form"] = "call"
-            entry["sites"] = inventory["calls"][symbol]
-        else:
-            entry["form"] = ", ".join(references[symbol]["kinds"])
-            entry["sites"] = references[symbol]["sites"]
-        blocking.append(entry)
+            entry["sites"] = calls[symbol]
+            blocking_calls.append(entry)
+            continue
+        executable = [kind for kind in references[symbol]["kinds"] if kind != "debug-only"]
+        if not executable:
+            debug_only.append(symbol)
+            continue
+        entry["form"] = ", ".join(executable)
+        entry["sites"] = references[symbol]["sites"]
+        blocking_references.append(entry)
+    blocking = blocking_calls + blocking_references
     verdict = REJECT if blocking else ALLOW
     names = [entry["name"] for entry in blocking]
     if verdict == REJECT:
-        listed = ", ".join(f"{entry['name']} ({entry['form']})" for entry in blocking)
-        message = f"REJECT: {len(names)} executable xbox.* reference(s): {listed}"
+        parts = []
+        if blocking_calls:
+            listed = ", ".join(f"{entry['name']} ({entry['form']})" for entry in blocking_calls)
+            parts.append(f"{len(blocking_calls)} executable xbox.* call(s): {listed}")
+        if blocking_references:
+            listed = ", ".join(f"{entry['name']} ({entry['form']})" for entry in blocking_references)
+            parts.append(f"{len(blocking_references)} executable xbox.* reference(s): {listed}")
+        message = "REJECT: " + "; ".join(parts)
         claimed = [entry["builtin"] for entry in blocking if entry["advisory"] == LOWERED]
         if claimed:
             message += (f" (advisory reports LOWERED for {', '.join(claimed)};"
@@ -94,15 +107,20 @@ def decide(inventory, status_of=None):
             f"ALLOW: no executable xbox.* calls or references "
             f"(declarations={len(inventory['declarations'])}, metadata_only={len(inventory['metadata_only'])})"
         )
+        if debug_only:
+            message = message[:-1] + f"; debug-only use of {', '.join(debug_only)})"
     return {
         "verdict": verdict,
         "reason": "executable-xbox-references" if blocking else "no-executable-xbox-references",
         "message": message,
-        "calls": inventory["calls"],
+        "calls": calls,
         "declarations": inventory["declarations"],
         "metadata_only": inventory["metadata_only"],
         "references": references,
+        "debug_only": debug_only,
         "blocking": blocking,
+        "blocking_calls": blocking_calls,
+        "blocking_references": blocking_references,
         "reported_names": names,
         "checked": True,
     }

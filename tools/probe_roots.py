@@ -38,6 +38,9 @@ STORE_INSTRUCTION = re.compile(r'^(?:%[^\s=]+\s*=\s*)?store\b')
 BITCAST_USE = re.compile(r'\bbitcast\b')
 GLOBAL_INITIALIZER = re.compile(
     r'^@(?:"[^"]+"|[\w.$-]+)\s*=\s*(?:global|constant|externally_initialized)\b')
+# Debug intrinsics take metadata operands that the runtime never reads, so an xbox.* symbol that
+# only appears inside one of these calls is not an executable use.
+DEBUG_INTRINSIC = re.compile(r'@llvm\.dbg\.(?:value|declare|assign|label)\b')
 XBOX_SYMBOL = re.compile(r"xbox\.[\w.$-]+")
 METADATA_STRING = re.compile(r'!"([^"]*)"')
 
@@ -58,7 +61,11 @@ def strip_comment(line):
 
 
 def reference_kind(line):
-    """Name the executable form of a non-call xbox.* reference."""
+    """Name the executable form of a non-call xbox.* reference.
+
+    A call to a debug intrinsic is not executable use and is labelled `debug-only` by
+    `classify_line()` instead, so this helper never sees it.
+    """
     if ALIAS_DEFINITION.match(line):
         return "alias"
     if STORE_INSTRUCTION.match(line):
@@ -98,6 +105,7 @@ def classify_line(line, calls, declarations, references):
         return
     is_call = CALL_INSTRUCTION.match(line) is not None
     operands_at = call_operand_paren(line) if is_call else -1
+    debug_call = is_call and DEBUG_INTRINSIC.search(line) is not None
     callee_seen = False
     for match in CALLEE.finditer(line):
         symbol = match.group(1) or match.group(2)
@@ -107,7 +115,12 @@ def classify_line(line, calls, declarations, references):
             callee_seen = True
             calls[symbol] += 1
             continue
-        kind = "call-operand" if is_call else reference_kind(line)
+        if debug_call:
+            kind = "debug-only"
+        elif is_call:
+            kind = "call-operand"
+        else:
+            kind = reference_kind(line)
         entry = references.setdefault(symbol, {"sites": 0, "kinds": set()})
         entry["sites"] += 1
         entry["kinds"].add(kind)
