@@ -2371,7 +2371,9 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_float_to_word_conversions_e32_and_e64(self):
-        """v_cvt_u32_f32 and v_cvt_i32_f32 accept plain e32 and e64 with optional source abs/neg."""
+        """v_cvt_u32_f32 and v_cvt_i32_f32 accept plain e32 and e64 with optional source abs/neg;
+        v_cvt_flr_i32_f32 and v_cvt_rpi_i32_f32 stay out of generic scanner support until arbitrary runtime
+        exceptional inputs are backed by a native RDNA reference."""
         for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
                      "v_cvt_u32_f32_e32 v12, 0x40400000", "v_cvt_u32_f32_e64 v12, v13",
                      "v_cvt_i32_f32_e64 v12, s44", "v_cvt_u32_f32_e64 v12, |s44|",
@@ -2386,6 +2388,20 @@ class TestRdna2Scanner(unittest.TestCase):
                      "v_cvt_u32_f32_e32  v12, v13", "v_cvt_u32_f32_e64  v12, v13",
                      "v_cvt_flr_i32_f32_e32 v12, v13", "v_cvt_rpi_i32_f32_e64 v12, -v13"):
             self.assertFalse(is_instruction_supported(line), line)
+
+    def test_disasm_cvt_flr_and_rpi_e32_and_e64(self):
+        """tools/disasm_rdna2.py decodes v_cvt_rpi_i32_f32 and v_cvt_flr_i32_f32 in VOP1 and VOP3."""
+        cases = (
+            (bytes([0x00, 0x19, 0x02, 0x7e]), "v_cvt_rpi_i32_f32_e32", "v_cvt_rpi_i32_f32_e32 v1, v0"),
+            (bytes([0x00, 0x1b, 0x02, 0x7e]), "v_cvt_flr_i32_f32_e32", "v_cvt_flr_i32_f32_e32 v1, v0"),
+            (bytes([0x01, 0x00, 0x8d, 0xd5, 0x00, 0x01, 0x01, 0x02]), "v_cvt_flr_i32_f32_e64", "v_cvt_flr_i32_f32_e64 v1, v0"),
+            (bytes([0x01, 0x01, 0x8c, 0xd5, 0x00, 0x01, 0x01, 0x22]), "v_cvt_rpi_i32_f32_e64", "v_cvt_rpi_i32_f32_e64 v1, -|v0|"),
+        )
+        for raw, expected_op, expected_asm in cases:
+            length, op_name, asm, _ = decode_instruction(raw, 0)
+            self.assertEqual(length, len(raw))
+            self.assertEqual(op_name, expected_op)
+            self.assertEqual(asm, expected_asm)
 
     def test_inline_slash_comments_and_blank_lines(self):
         """Inline // comments must be stripped and blank/comment lines must not inflate counts."""

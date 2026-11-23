@@ -268,6 +268,8 @@ VOP1_OPS = {
     0x08: ("v_cvt_i32_f32_e32", "Convert float32 to int32"),
     0x0a: ("v_cvt_f16_f32_e32", "Convert float32 to float16"),
     0x0b: ("v_cvt_f32_f16_e32", "Convert float16 to float32"),
+    0x0c: ("v_cvt_rpi_i32_f32_e32", "Convert float32 to int32 (round to +inf)"),
+    0x0d: ("v_cvt_flr_i32_f32_e32", "Convert float32 to int32 (floor)"),
     0x0f: ("v_cvt_f32_f64_e32", "Convert float64 to float32"),
     0x10: ("v_cvt_f64_f32_e32", "Convert float32 to float64"),
     0x15: ("v_cvt_u32_f64_e32", "Convert float64 to uint32"),

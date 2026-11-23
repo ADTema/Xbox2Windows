@@ -400,13 +400,16 @@ def check_shader_records():
         covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": set(pixel.ACCEPTED)})
         without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(rounding)
-    # Truncating float-to-word conversions cover VOP1 e32 and VOP3 e64; FLR/RPI stay excluded.
+    # Float-to-word conversions (truncate, floor, round-to-+inf) cover VOP1 e32 and VOP3 e64;
+    # DPP/SDWA variants stay excluded.
     cvt_f32_int = {
         ("VOP1", "v_cvt_u32_f32"), ("VOP1", "v_cvt_i32_f32"),
+        ("VOP1", "v_cvt_flr_i32_f32"), ("VOP1", "v_cvt_rpi_i32_f32"),
         ("VOP3", "v_cvt_u32_f32_e64"), ("VOP3", "v_cvt_i32_f32_e64"),
+        ("VOP3", "v_cvt_flr_i32_f32_e64"), ("VOP3", "v_cvt_rpi_i32_f32_e64"),
     }
-    cvt_f32_excluded = {"v_cvt_flr_i32_f32", "v_cvt_flr_i32_f32_e64",
-                        "v_cvt_rpi_i32_f32", "v_cvt_rpi_i32_f32_e64"}
+    cvt_f32_excluded = {"v_cvt_flr_i32_f32_dpp", "v_cvt_flr_i32_f32_sdwa",
+                        "v_cvt_rpi_i32_f32_dpp", "v_cvt_rpi_i32_f32_sdwa"}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert cvt_f32_int <= reference, name

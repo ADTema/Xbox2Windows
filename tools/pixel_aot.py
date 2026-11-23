@@ -3,6 +3,7 @@ import argparse
 import ctypes as C
 import hashlib
 import json
+import math
 import mmap
 from pathlib import Path
 import re
@@ -929,6 +930,19 @@ uint mul_hi_i32(uint a, uint b) {
         "    return hi;\n"
         "}"
     ),
+    "cvt_flr_i32_f32": (
+        "uint cvt_flr_i32_f32(uint bits) {\n"
+        "    float x = asfloat(bits);\n"
+        "    return asuint(int(floor(x)));\n"
+        "}"
+    ),
+    "cvt_rpi_i32_f32": (
+        "uint cvt_rpi_i32_f32(uint bits) {\n"
+        "    float x = asfloat(bits);\n"
+        "    float f = floor(x);\n"
+        "    return asuint(int(f + ((x - f) >= 0.5f ? 1.0f : 0.0f)));\n"
+        "}"
+    ),
 }
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
@@ -1144,6 +1158,37 @@ def parse_cvt_f32_e64_source(token):
     if not re.fullmatch(r"[vs]\d+|0x[0-9a-f]{1,8}", token):
         return None
     return token, has_abs, neg
+
+
+def require_proven_i32_f32_range(base, has_abs, has_neg, scalar, vector, known_ssa_bits, kind):
+    """Require a statically known binary32 input that is finite and in [-2^31, 2^31) after modifiers.
+
+    AMD RDNA 2 VOP1 opcodes 12 and 13 (v_cvt_rpi_i32_f32 and v_cvt_flr_i32_f32) document the finite
+    rounding formulas without an exceptional-input rule for NaN, infinities, or i32 overflow. Reject
+    unproven runtime inputs and out-of-range or non-finite constants until a native RDNA reference
+    establishes exceptional behavior.
+    """
+    if base.startswith("0x"):
+        raw_bits = int(base, 16)
+    elif base.startswith("s"):
+        val = scalar.get(base)
+        if not isinstance(val, int):
+            raise ValueError(f"Unproven runtime input {base} at v_cvt_{kind}_f32")
+        raw_bits = val & 0xffffffff
+    else:
+        ssa = vector.get(base)
+        if not isinstance(ssa, str) or ssa not in known_ssa_bits:
+            raise ValueError(f"Unproven runtime input {base} at v_cvt_{kind}_f32")
+        raw_bits = known_ssa_bits[ssa]
+    eff_bits = raw_bits
+    if has_abs:
+        eff_bits &= 0x7fffffff
+    if has_neg:
+        eff_bits ^= 0x80000000
+    x, = struct.unpack("<f", struct.pack("<I", eff_bits))
+    if not math.isfinite(x) or not (-2147483648.0 <= x < 2147483648.0):
+        raise ValueError(f"Unproven exceptional or out-of-range input 0x{eff_bits:08x} at v_cvt_{kind}_f32")
+    return eff_bits
 
 
 def fp_operand(token, scalar, vector, pending, sample_dest, *,
@@ -1820,6 +1865,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     guest_wave32 = wave_size == 32
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
     vector = VectorRegisters({"v0": "bary_i", "v1": "bary_j"})
+    known_ssa_bits: dict[str, int] = {}
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
     # The boolean records whether the quad value depends on interpolated coordinates.
     quad_values = {"uv.x": True, "uv.y": True}
@@ -2654,8 +2700,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             value = fp_operand(src, scalar, vector, pending, sample_dest)
+            src_bits = None
+            if re.fullmatch(r"0x[0-9a-f]{1,8}", src):
+                src_bits = int(src, 16)
+            elif re.fullmatch(r"-?\d+", src):
+                src_bits = int(src) & 0xffffffff
+            elif re.fullmatch(r"-?\d+\.\d+", src):
+                src_bits, = struct.unpack("<I", struct.pack("<f", float(src)))
+            elif src.startswith("s") and isinstance(scalar.get(src), int):
+                src_bits = scalar[src] & 0xffffffff
+            elif src.startswith("v") and isinstance(vector.get(src), str) and vector[src] in known_ssa_bits:
+                src_bits = known_ssa_bits[vector[src]]
             is_uniform = src.startswith("s") or bool(re.fullmatch(r"-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}", src)) or vector.is_uniform(src)
             vector[dst] = f"alu{i}"
+            if src_bits is not None:
+                known_ssa_bits[f"alu{i}"] = src_bits
             if is_uniform:
                 vector.uniform.add(dst)
             lines.append(f"    precise float alu{i} = {value};")
@@ -3345,8 +3404,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(r"v_cvt_i32_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8})"):
-            dst, src = m.groups()
+        elif m := match(r"v_cvt_(i32|flr_i32|rpi_i32)_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8})"):
+            kind, dst, src = m.groups()
             if int(dst[1:]) > 255 or (src.startswith(("v", "s")) and
                     int(src[1:]) > (255 if src.startswith("v") else 105)):
                 raise ValueError("Invalid signed conversion register")
@@ -3355,17 +3414,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             if src.startswith("v") and src not in vector:
-                raise ValueError(f"Unbound pixel input {src} at v_cvt_i32_f32_e32")
+                raise ValueError(f"Unbound pixel input {src} at v_cvt_{kind}_f32_e32")
             operand = fp_operand(src, scalar, vector, pending, sample_dest)
-            helpers.add("cvt_i32_f32")
+            if kind in ("flr_i32", "rpi_i32"):
+                require_proven_i32_f32_range(src, False, False, scalar, vector, known_ssa_bits, kind)
+            helper = f"cvt_{kind}_f32"
+            helpers.add(helper)
             vector[dst] = f"alu{i}"
-            lines.append(f"    precise float alu{i} = asfloat(cvt_i32_f32(asuint({operand})));")
-        elif (m := match(r"v_cvt_(u32|i32)_f32_e64 (v\d+), ([^,\s]+)")) and (
+            lines.append(f"    precise float alu{i} = asfloat({helper}(asuint({operand})));")
+        elif (m := match(r"v_cvt_(u32|i32|flr_i32|rpi_i32)_f32_e64 (v\d+), ([^,\s]+)")) and (
                 parsed := parse_cvt_f32_e64_source(m.group(3))):
-            # VOP3 truncating float-to-int with optional bitwise source abs/neg modifiers.
-            # Apply abs then neg on the raw IEEE-754 word before passing it to the shared
-            # src/ffx_float_to_int.hlsli helper; clamp, omod, decimal/float literals and
-            # FLR/RPI variants remain rejected.
+            # VOP3 float-to-int (truncate, floor, round-to-+inf) with optional bitwise source
+            # abs/neg modifiers applied on the raw IEEE-754 word before conversion. Truncating u32/i32
+            # accepts arbitrary runtime inputs; flr/rpi requires a statically proven finite in-range
+            # binary32 value after modifiers until a native RDNA reference establishes exceptional
+            # NaN/infinity/overflow behavior. clamp, omod, decimal/float literals, DPP and SDWA remain rejected.
             kind, dst, _ = m.groups()
             base, has_abs, has_neg = parsed
             if int(dst[1:]) > 255 or (base.startswith(("v", "s")) and
@@ -3378,6 +3441,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if base.startswith("v") and base not in vector:
                 raise ValueError(f"Unbound pixel input {base} at v_cvt_{kind}_f32_e64")
             operand = fp_operand(base, scalar, vector, pending, sample_dest)
+            if kind in ("flr_i32", "rpi_i32"):
+                require_proven_i32_f32_range(base, has_abs, has_neg, scalar, vector, known_ssa_bits, kind)
             bits = f"asuint({operand})"
             if has_abs:
                 bits = f"({bits} & 0x7fffffffu)"
