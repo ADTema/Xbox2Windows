@@ -398,6 +398,41 @@ foreach(adapter IN ITEMS warp hardware)
     add_test(NAME vm_translation_device_${adapter} COMMAND vm_translation_check device_${adapter})
     set_tests_properties(vm_translation_device_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
 endforeach()
+# XG-style swizzle selection compared with AMD addrlib (#870). addrlib is an optional local dependency
+# fetched by tools/fetch_addrlib.py into out/deps/mesa (Mesa 25.1.0, src/amd/addrlib, MIT); without it the
+# test skips (77). The source list and definitions follow Mesa's src/amd/addrlib/meson.build.
+set(_addrlib_default "${CMAKE_CURRENT_SOURCE_DIR}/out/deps/mesa/src/amd/addrlib")
+if(NOT EXISTS "${_addrlib_default}/inc/addrinterface.h")
+    set(_addrlib_default "")
+endif()
+set(XBOX2WINDOWS_ADDRLIB_DIR "${_addrlib_default}" CACHE PATH
+    "AMD addrlib source (Mesa src/amd/addrlib, see tools/fetch_addrlib.py); empty skips xg_swizzle_select")
+add_executable(xg_swizzle_select_check tests/xg_swizzle_select_check.cpp)
+target_compile_features(xg_swizzle_select_check PRIVATE cxx_std_17)
+if(XBOX2WINDOWS_ADDRLIB_DIR)
+    if(NOT EXISTS "${XBOX2WINDOWS_ADDRLIB_DIR}/inc/addrinterface.h")
+        message(FATAL_ERROR "XBOX2WINDOWS_ADDRLIB_DIR=${XBOX2WINDOWS_ADDRLIB_DIR} has no inc/addrinterface.h")
+    endif()
+    set(_a "${XBOX2WINDOWS_ADDRLIB_DIR}")
+    add_library(xbw_addrlib STATIC EXCLUDE_FROM_ALL
+        "${_a}/src/addrinterface.cpp" "${_a}/src/core/addrelemlib.cpp" "${_a}/src/core/addrlib.cpp"
+        "${_a}/src/core/addrlib1.cpp" "${_a}/src/core/addrlib2.cpp" "${_a}/src/core/addrlib3.cpp"
+        "${_a}/src/core/addrobject.cpp" "${_a}/src/core/addrswizzler.cpp" "${_a}/src/core/coord.cpp"
+        "${_a}/src/gfx9/gfx9addrlib.cpp" "${_a}/src/gfx10/gfx10addrlib.cpp" "${_a}/src/gfx11/gfx11addrlib.cpp"
+        "${_a}/src/gfx12/gfx12addrlib.cpp" "${_a}/src/r800/ciaddrlib.cpp" "${_a}/src/r800/egbaddrlib.cpp"
+        "${_a}/src/r800/siaddrlib.cpp")
+    target_include_directories(xbw_addrlib PUBLIC "${_a}/inc" PRIVATE "${_a}/src" "${_a}/src/core"
+        "${_a}/src/chip/gfx9" "${_a}/src/chip/r800" "${_a}/src/chip/gfx10" "${_a}/src/chip/gfx11" "${_a}/src/chip/gfx12")
+    target_compile_definitions(xbw_addrlib PUBLIC ADDR_FASTCALL= PRIVATE LITTLEENDIAN_CPU DEBUG=0)
+    target_compile_options(xbw_addrlib PRIVATE /w)
+    target_link_libraries(xg_swizzle_select_check PRIVATE xbw_addrlib)
+    target_compile_definitions(xg_swizzle_select_check PRIVATE XBOX2WINDOWS_HAVE_ADDRLIB)
+    message(STATUS "xg_swizzle_select: addrlib from ${XBOX2WINDOWS_ADDRLIB_DIR}")
+else()
+    message(STATUS "xg_swizzle_select: addrlib not configured, the test will skip (77)")
+endif()
+add_test(NAME xg_swizzle_select COMMAND xg_swizzle_select_check)
+set_tests_properties(xg_swizzle_select PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 foreach(adapter IN ITEMS hardware warp)
     add_test(NAME offscreen_${adapter} COMMAND offscreen_check ${adapter} triangle_${adapter}.bmp)
     add_test(NAME ffx_provider_loop_${adapter} COMMAND offscreen_check ${adapter} --ffx-provider-loop)
