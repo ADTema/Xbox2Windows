@@ -2335,6 +2335,18 @@ the old word to the destination VGPR. The fixtures compare old and new words
 and exercise successful and unsuccessful comparisons. Reversing the comparison
 operands, masking the OR operand or omitting the exchange must mismatch at word 1.
 
+`ds_write_b8_d16_hi` selects source bits 23:16 and `ds_write_b16_d16_hi`
+selects bits 31:16, preserving bytes outside the addressed field.
+`ds_read_i8_d16_hi` sign-extends the selected byte into bits 31:16 and
+preserves the destination's low half. The fixtures replace the high source
+or signed extraction with its low or unsigned counterpart and expect a mismatch.
+
+`ds_write_addtid_b32` and `ds_read_addtid_b32` use the same private word
+when M0 is explicitly zero, the instruction offset is zero and a single
+full wave32 makes TID equal to local X. The fixture writes through each
+addressing mode and reads through the other, then compares both words.
+Returning the first value for the second read must mismatch at word 1. The implicit address uses a four-byte stride. The lowerer rejects it if a 16-byte private LDS stride also appears in the program, regardless of which form comes first.
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
@@ -2373,7 +2385,7 @@ at the first lane affected by each mutation.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
-ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_private_(warp|hardware)$' -V
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_(private|packed|arithmetic|replacement)_(warp|hardware)$' -V
 ```
 
 ```sh

@@ -164,6 +164,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     lds_word = None
     lds_wide_words = {}
     lds_address_shift = None
+    lds_addtid_base_zero = False
     ds_wait = False
     written_spans = []
     layout = None
@@ -258,6 +259,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             pending |= guard["pending"]
             guard = None
             guard_span[1] = len(stores)
+        elif line in ("s_mov_b32 m0, 0", "s_mov_b32 m0, 0x0"):
+            if not lds_enabled or guard_span is not None:
+                raise ValueError("Unverified private LDS thread-ID base")
+            lds_addtid_base_zero = True
         elif m := re.fullmatch(r"s_mov_b32 s(\d+), (s\d+|-?\d+|0x[0-9a-f]+)", line):
             dst, src = int(m[1]), m[2]
             if dst in pending or dst > 105:
@@ -471,9 +476,31 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Uninitialized private wide LDS word")
             vector.update(zip(range(first, last + 1), (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
-        elif m := re.fullmatch(r"ds_write_b(8|16|32) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
-            width, addr, src = map(int, m.groups()[:3])
-            offset = int(m[4] or 0)
+        elif m := re.fullmatch(r"ds_(write|read)_addtid_b32 v(\d+)(?: offset:0)?", line):
+            op, reg = m[1], int(m[2])
+            # A single full wave32 makes TID equal to local.x. Zero M0 and
+            # offset make this the same private word as an explicit byte address.
+            if not lds_addtid_base_zero or guard_span is not None or reg > 255:
+                raise ValueError("Unverified private LDS thread-ID access")
+            if lds_address_shift not in (None, 2):
+                raise ValueError("Mixed private LDS address strides")
+            lds_address_shift = 2
+            if op == "write":
+                value = vector.get(reg)
+                if not is_word(value):
+                    raise ValueError("Unverified private LDS thread-ID source")
+                lds_word = value
+            else:
+                if lds_word is None:
+                    raise ValueError("Uninitialized private LDS thread-ID word")
+                vector[reg] = lds_word
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_write_b(8|16|32)(?P<high>_d16_hi)? v(\d+), v(\d+)(?: offset:([0-3]))?", line):
+            width, addr, src = map(int, (m[1], m[3], m[4]))
+            offset = int(m[5] or 0)
+            high = m["high"]
+            if high and width == 32:
+                raise ValueError("Unsupported compute instruction: " + line)
             value = vector.get(src)
             if (not lds_enabled or guard_span is not None or max(addr, src) > 255
                     or vector.get(addr) != ("lds_address",) or not is_word(value)
@@ -486,8 +513,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 shift = offset * 8
                 mask = (1 << width) - 1
                 keep = 0xffffffff ^ (mask << shift)
+                data = hlsl_word(value)
+                if high:
+                    data = f"({data} >> 16u)"
                 expression = (f"(({hlsl_word(lds_word)} & 0x{keep:08x}u) | "
-                              f"(({hlsl_word(value)} & 0x{mask:x}u) << {shift}u))")
+                              f"(({data} & 0x{mask:x}u) << {shift}u))")
                 if len(expression) > ALU_EXPRESSION_LIMIT:
                     raise ValueError("LDS expression exceeds the profile limit")
                 lds_word = ("alu", expression)
@@ -514,7 +544,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                                r"v(?P<dst>\d+), v(?P<addr>\d+)(?: offset:(?P<offset>[0-3]))?", line):
             op, dst, addr, offset = m[1], int(m["dst"]), int(m["addr"]), int(m["offset"] or 0)
             d16, high = m["d16"], m["hi"]
-            if d16 and (op not in ("u8", "i8", "u16") or (op == "i8" and high)):
+            if d16 and op not in ("u8", "i8", "u16"):
                 raise ValueError("Unsupported compute instruction: " + line)
             width = int(op[1:])
             if (not lds_enabled or guard_span is not None or max(dst, addr) > 255
