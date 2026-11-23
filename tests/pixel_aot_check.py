@@ -2960,173 +2960,459 @@ def check_vop3p_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutation of {label} escaped detection")
 
 
-# VOP2 packed binary16 multiply-accumulate (v_pk_fmac_f16 / v_pk_fmac_f16_e32):
-# exercises VGPR/SGPR/32-bit literal/inline-f16 src0, chained accumulation into vdst,
-# in-place aliasing (dst == src1), exact binary16 RNE ties, subnormals, and infinity overflow.
-PK_FMAC_BODY = [
-    "v_mov_b32_e32 v16, s44",
-    "v_mov_b32_e32 v17, s45",
-    "v_mov_b32_e32 v18, s46",
-    "v_mov_b32_e32 v12, s47",
-    "v_pk_fmac_f16 v12, v16, v17",
-    "v_pk_fmac_f16_e32 v12, v18, v17",
-    "v_mov_b32_e32 v13, s46",
-    "v_pk_fmac_f16 v13, s44, v17",
-    "v_mov_b32_e32 v14, s47",
-    "v_pk_fmac_f16 v14, 0xbc003800, v16",
-    "v_mov_b32_e32 v15, s44",
-    "v_pk_fmac_f16 v15, 0.5, v15",
-]
-PK_FMAC_WORDS = (
-    # Mixed signs and asymmetric low/high halves across all four words.
-    (0x40003c00, 0xbc003800, 0x34004200, 0xc0003e00),
-    # Exact binary16 halfway ties: (1 + 2^-10) * 1 + 2^-11 -> 0x3c02 (even), 1 * 1 + 2^-11 -> 0x3c00 (even).
-    (0x3c003c01, 0x3c003c00, 0x10001000, 0x90001000),
-    # Binary16 subnormal inputs and results (0x0400 * 0.5 + 0x0001 = 0x0201; 0x0001 * 0.5 + 0x03ff = 0x0400).
-    (0x00010400, 0x38003800, 0x03ff0001, 0x80000001),
-    # Overflow to signed infinity and signed zero accumulation.
-    (0xfbff7bff, 0x3c003c00, 0xcc004c00, 0x00008000),
-)
+# VOP2 packed binary16 fused multiply-accumulate (v_pk_fmac_f16 / v_pk_fmac_f16_e32):
+# finite preserve/RNE profile with statically proven finite operands and results.
+# Exercises the fused binary16 precision discriminator (0x3e00 * 0x3956 + 0x0001 -> 0x3c01 direct
+# vs 0x3c00 through intermediate binary32), an independent denormal-preserve lane (subnormal inputs
+# and subnormal outputs), exact binary16 halfway ties, VGPR/SGPR/32-bit literal/inline-f16 src0,
+# chained accumulation, and destination aliasing (dst == src1, dst == src0, dst == src0 == src1).
+PK_FMAC_DENORM_MODE = "preserve"
+PK_FMAC_PROGRAMS = ("precision", "alias_chain")
+PK_FMAC_BODIES = {
+    "precision": [
+        # channel 0: low half is the exact fused binary16 discriminator (0x3e00 * 0x3956 + 0x0001 = 16785409/16777216
+        # -> 0x3c01 single-rounded binary16 RNE, 0x3c00 through intermediate binary32); high half is exact (-1.0).
+        "v_mov_b32_e32 v16, 0x40003e00",
+        "v_mov_b32_e32 v17, 0xbc003956",
+        "v_mov_b32_e32 v12, 0x3c000001",
+        "v_pk_fmac_f16 v12, v16, v17",
+        # channel 1: dedicated denormal-preserve lane (SGPR src0, _e32 spelling):
+        # low half: 0x0001 * 0x3c00 + 0x0001 = 0x0002 (preserve) vs 0x0000 (flush-in or flush-out);
+        # high half: 0x0400 * 0x3800 + 0x0000 = 0x0200 (normal inputs -> subnormal output; preserve 0x0200 vs flush-out 0x0000).
+        "s_mov_b32 s60, 0x04000001",
+        "v_mov_b32_e32 v18, 0x38003c00",
+        "v_mov_b32_e32 v13, 1",
+        "v_pk_fmac_f16_e32 v13, s60, v18",
+        # channel 2: exact binary16 halfway ties (32-bit hex literal src0):
+        # low half: (1 + 2^-10) * 1 + 2^-11 -> 0x3c02 (tie up to even); high half: 1 * 1 + 2^-11 -> 0x3c00 (tie down to even).
+        "v_mov_b32_e32 v19, 0x3c003c01",
+        "v_mov_b32_e32 v14, 0x10001000",
+        "v_pk_fmac_f16 v14, 0x3c003c00, v19",
+        # channel 3: in-place aliasing (dst == src1) with inline f16 0.5 (zero-extended high half):
+        # low half: 0.5 * 1.0 + 1.0 = 1.5 (0x3e00); high half: 0.0 * (-2.0) + (-2.0) = -2.0 (0xc000).
+        "v_mov_b32_e32 v15, 0xc0003c00",
+        "v_pk_fmac_f16 v15, 0.5, v15",
+    ],
+    "alias_chain": [
+        # channel 0: chained accumulation across mixed signs and distinct halves (bare + _e32).
+        "v_mov_b32_e32 v16, 0x40003c00",
+        "v_mov_b32_e32 v17, 0xbc003800",
+        "v_mov_b32_e32 v18, 0x34004200",
+        "v_mov_b32_e32 v12, 0xc0003e00",
+        "v_pk_fmac_f16 v12, v16, v17",
+        "v_pk_fmac_f16_e32 v12, v18, v17",
+        # channel 1: src0 aliasing dst (dst == src0).
+        "v_mov_b32_e32 v21, 0xb8004000",
+        "v_mov_b32_e32 v13, 0x42003e00",
+        "v_pk_fmac_f16 v13, v13, v21",
+        # channel 2: triple aliasing (dst == src0 == src1).
+        "v_mov_b32_e32 v14, 0xc0003e00",
+        "v_pk_fmac_f16 v14, v14, v14",
+        # channel 3: low half subnormal-to-normal carry (0x0001 * 2.0 + 0x03ff = 0x0401; preserve 0x0401 vs flush-in 0x0000);
+        # high half is the fused binary16 discriminator (0x3e00 * 0x3956 + 0x0001 -> 0x3c01 direct vs 0x3c00 via f32).
+        "v_mov_b32_e32 v19, 0x3e000001",
+        "v_mov_b32_e32 v20, 0x39564000",
+        "v_mov_b32_e32 v15, 0x000103ff",
+        "v_pk_fmac_f16 v15, v19, v20",
+    ],
+}
 
 
-def pk_fmac_program():
-    return uncompressed_export(PK_FMAC_BODY)
+def pk_fmac_program(kind="precision"):
+    return uncompressed_export(PK_FMAC_BODIES[kind])
 
 
-def pk_fmac_reference(words):
-    def pack16(value):
-        if math.isnan(value):
-            return 0x7e00
-        try:
-            return struct.unpack("<H", struct.pack("<e", value))[0]
-        except OverflowError:
-            return 0xfc00 if math.copysign(1.0, value) < 0.0 else 0x7c00
+def pk_fmac_lane_reference(a, b, c, *, denorm=PK_FMAC_DENORM_MODE):
+    """Exact binary16 fused multiply-accumulate (a * b + c) using fractions.Fraction, rounded once to binary16 RNE.
 
+    Independent of pixel_aot and Python struct float/half conversions. Returns None for non-finite inputs or overflow.
+    When denorm == "ftz", subnormal inputs and subnormal results are flushed to signed zero.
+    """
+    def decode(bits):
+        bits &= 0xffff
+        sign = -1 if bits & 0x8000 else 1
+        exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+        if exponent == 0x1f:
+            return None
+        if exponent == 0:
+            if denorm == "ftz":
+                return Fraction(0), bool(bits & 0x8000)
+            return sign * Fraction(mantissa, 1 << 24), bool(bits & 0x8000)
+        return sign * Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25), bool(bits & 0x8000)
+
+    da, db, dc = decode(a), decode(b), decode(c)
+    if da is None or db is None or dc is None:
+        return None
+    (va, sa), (vb, sb), (vc, sc) = da, db, dc
+    exact = va * vb + vc
+    if exact == 0:
+        if (va == 0 or vb == 0) and vc == 0:
+            return 0x8000 if ((sa ^ sb) and sc) else 0x0000
+        return 0x0000
+    sign = 0x8000 if exact < 0 else 0
+    magnitude = abs(exact)
+    if magnitude >= 65520:
+        return None
+    if denorm == "ftz" and magnitude < Fraction(1, 1 << 14):
+        return sign
+    exponent = max(magnitude.numerator.bit_length() - magnitude.denominator.bit_length(), -14)
+    while magnitude < Fraction(2) ** exponent and exponent > -14:
+        exponent -= 1
+    while magnitude >= Fraction(2) ** (exponent + 1):
+        exponent += 1
+    scaled = magnitude / Fraction(2) ** (exponent - 10)
+    count = scaled.numerator // scaled.denominator
+    remainder = scaled - count
+    if remainder > Fraction(1, 2) or (remainder == Fraction(1, 2) and (count & 1)):
+        count += 1
+    if count >= 0x800:
+        count, exponent = 0x400, exponent + 1
+    if count < 0x400:
+        return sign if denorm == "ftz" else (sign | count)
+    return sign | ((exponent + 15) << 10) | (count - 0x400)
+
+
+def pk_fmac_lane_f32_reference(a, b, c):
+    """Reference for the buggy double-rounded path: exact a * b + c rounded to binary32 RNE, then to binary16 RNE."""
+    def decode(bits):
+        bits &= 0xffff
+        sign = -1 if bits & 0x8000 else 1
+        exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+        if exponent == 0:
+            return sign * Fraction(mantissa, 1 << 24)
+        return sign * Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25)
+
+    exact = decode(a) * decode(b) + decode(c)
+    if exact == 0:
+        return pk_fmac_lane_reference(a, b, c)
+    sign = 0x8000 if exact < 0 else 0
+    magnitude = abs(exact)
+    # Round magnitude to binary32 RNE first (24-bit significand; every finite f16 product/sum is a binary32 normal).
+    exp32 = magnitude.numerator.bit_length() - magnitude.denominator.bit_length()
+    while magnitude < Fraction(2) ** exp32:
+        exp32 -= 1
+    while magnitude >= Fraction(2) ** (exp32 + 1):
+        exp32 += 1
+    scaled32 = magnitude / Fraction(2) ** (exp32 - 23)
+    count32 = scaled32.numerator // scaled32.denominator
+    rem32 = scaled32 - count32
+    if rem32 > Fraction(1, 2) or (rem32 == Fraction(1, 2) and (count32 & 1)):
+        count32 += 1
+    if count32 >= (1 << 24):
+        count32, exp32 = 1 << 23, exp32 + 1
+    mag_f32 = Fraction(count32) * Fraction(2) ** (exp32 - 23)
+    if mag_f32 >= 65520:
+        return None
+    exponent = max(exp32, -14)
+    scaled16 = mag_f32 / Fraction(2) ** (exponent - 10)
+    count16 = scaled16.numerator // scaled16.denominator
+    rem16 = scaled16 - count16
+    if rem16 > Fraction(1, 2) or (rem16 == Fraction(1, 2) and (count16 & 1)):
+        count16 += 1
+    if count16 >= 0x800:
+        count16, exponent = 0x400, exponent + 1
+    if count16 < 0x400:
+        return sign | count16
+    return sign | ((exponent + 15) << 10) | (count16 - 0x400)
+
+
+def pk_fmac_reference(kind="precision", *, denorm=PK_FMAC_DENORM_MODE):
     def step(src0, src1, acc):
-        lanes = []
-        for shift in (0, 16):
-            a = half_value(src0 >> shift)
-            b = half_value(src1 >> shift)
-            c = half_value(acc >> shift)
-            prod = struct.unpack("<f", struct.pack("<f", a * b))[0]
-            total = struct.unpack("<f", struct.pack("<f", prod + c))[0]
-            lanes.append(pack16(total))
-        return lanes[0] | (lanes[1] << 16)
+        lo = pk_fmac_lane_reference(src0 & 0xffff, src1 & 0xffff, acc & 0xffff, denorm=denorm)
+        hi = pk_fmac_lane_reference((src0 >> 16) & 0xffff, (src1 >> 16) & 0xffff, (acc >> 16) & 0xffff, denorm=denorm)
+        assert lo is not None and hi is not None, (hex(src0), hex(src1), hex(acc))
+        return lo | (hi << 16)
 
-    s44, s45, s46, s47 = words
-    v12 = step(s44, s45, s47)
-    v12 = step(s46, s45, v12)
-    v13 = step(s44, s45, s46)
-    v14 = step(0xbc003800, s44, s47)
-    v15 = step(0x00003800, s44, s44)
-    return (v12, v13, v14, v15)
+    if kind == "precision":
+        v12 = step(0x40003e00, 0xbc003956, 0x3c000001)
+        v13 = step(0x04000001, 0x38003c00, 0x00000001)
+        v14 = step(0x3c003c00, 0x3c003c01, 0x10001000)
+        v15 = step(0x00003800, 0xc0003c00, 0xc0003c00)
+        return (v12, v13, v14, v15)
+    if kind == "alias_chain":
+        v12 = step(0x40003c00, 0xbc003800, 0xc0003e00)
+        v12 = step(0x34004200, 0xbc003800, v12)
+        v13 = step(0x42003e00, 0xb8004000, 0x42003e00)
+        v14 = step(0xc0003e00, 0xc0003e00, 0xc0003e00)
+        v15 = step(0x3e000001, 0x39564000, 0x000103ff)
+        return (v12, v13, v14, v15)
+    raise ValueError(f"Unknown pk_fmac fixture kind: {kind}")
 
 
 def check_pk_fmac_controls():
-    """VOP2 v_pk_fmac_f16: lowering structure, spelling equivalence, and static refusals."""
-    program = pk_fmac_program()
-    lowered = translate_int(program)
-    assert "pack16_rne(" in lowered and "widen16(" in lowered and "mad(" in lowered
-    e32_only = [line.replace("v_pk_fmac_f16 ", "v_pk_fmac_f16_e32 ") for line in program]
-    assert translate_int(e32_only) == lowered
-    # Round-toward-zero mode must refuse v_pk_fmac_f16.
-    expect_value_error(translate_int, [HALF_RTZ] + program, "under round toward zero: v_pk_fmac_f16")
-    # Static refusals: uninitialized accumulator, non-VGPR src1, modifiers, unmodelled encodings,
-    # out-of-range registers, and uninitialized sources.
-    prefix = [
-        "v_mov_b32_e32 v12, s44",
-        "v_mov_b32_e32 v13, s45",
-        "v_mov_b32_e32 v14, s46",
-        "v_mov_b32_e32 v15, s47",
-    ]
-    for bad in (
-        "v_pk_fmac_f16 v20, v12, v13",
-        "v_pk_fmac_f16 v12, v13, s45",
-        "v_pk_fmac_f16 v12, v13, 0x3c003c00",
-        "v_pk_fmac_f16 v12, v13, 1.0",
-        "v_pk_fmac_f16 v12, v13, v14 clamp",
-        "v_pk_fmac_f16 v12, v13, v14 op_sel:[0,0]",
-        "v_pk_fmac_f16 v12, v13, v14 op_sel_hi:[1,1]",
-        "v_pk_fmac_f16 v12, v13, v14 neg_lo:[1,0]",
-        "v_pk_fmac_f16 v12, v13, v14 neg_hi:[0,1]",
-        "v_pk_fmac_f16 v12, -v13, v14",
-        "v_pk_fmac_f16 v12, |v13|, v14",
-        "v_pk_fmac_f16 v12, v13, v14 mul:2",
-        "v_pk_fmac_f16_e64 v12, v13, v14",
-        "v_pk_fmac_f16_dpp v12, v13, v14 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
-        "v_pk_fmac_f16_sdwa v12, v13, v14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
-        "v_pk_fmac_f16 v256, v12, v13",
-        "v_pk_fmac_f16 v12, v256, v13",
-        "v_pk_fmac_f16 v12, s106, v13",
-        "v_pk_fmac_f16 v12, v13, v256",
-        "v_pk_fmac_f16 v12, v20, v13",
-        "v_pk_fmac_f16 v12, s99, v13",
-        "v_pk_fmac_f16 v12, v13, v20",
+    """VOP2 v_pk_fmac_f16: exact fused reference, denormal profile, lowering structure, and static refusals."""
+    assert PK_FMAC_DENORM_MODE == pixel_aot.HALF_DENORM_PRESERVE
+    # Exact discriminator from #990/#1004: 0x3e00 * 0x3956 + 0x0001 = 16785409/16777216.
+    assert Fraction(3, 2) * Fraction(683, 1024) + Fraction(1, 1 << 24) == Fraction(16785409, 16777216)
+    assert pk_fmac_lane_reference(0x3e00, 0x3956, 0x0001) == 0x3c01
+    assert pixel_aot.f16_pk_fmac_lane_result(0x3e00, 0x3956, 0x0001) == 0x3c01
+    assert pk_fmac_lane_f32_reference(0x3e00, 0x3956, 0x0001) == 0x3c00
+    # Independent denormal-mode separation (preserve vs flush).
+    assert pk_fmac_lane_reference(0x0001, 0x3c00, 0x0001, denorm="preserve") == 0x0002
+    assert pk_fmac_lane_reference(0x0001, 0x3c00, 0x0001, denorm="ftz") == 0x0000
+    assert pk_fmac_lane_reference(0x0400, 0x3800, 0x0000, denorm="preserve") == 0x0200
+    assert pk_fmac_lane_reference(0x0400, 0x3800, 0x0000, denorm="ftz") == 0x0000
+    assert pk_fmac_lane_reference(0x0001, 0x4000, 0x03ff, denorm="preserve") == 0x0401
+    assert pk_fmac_lane_reference(0x0001, 0x4000, 0x03ff, denorm="ftz") == 0x0000
+    # Pinned expected words for both draw programs.
+    assert pk_fmac_reference("precision") == (0xbc003c01, 0x02000002, 0x3c003c02, 0xc0003e00)
+    assert pk_fmac_reference("alias_chain") == (0xc4404300, 0x3e004480, 0x40004380, 0x3c010401)
+    # Overflow boundary and fused intermediate-product cancellation.
+    assert pk_fmac_lane_reference(0x7bff, 0x3c00, 0x4bff) == 0x7bff
+    assert pk_fmac_lane_reference(0x7bff, 0x3c00, 0x4c00) is None
+    assert pk_fmac_lane_reference(0x7bff, 0x4000, 0xfbff) == 0x7bff
+    assert pixel_aot.f16_pk_fmac_lane_result(0x7bff, 0x4000, 0xfbff) == 0x7bff
+    # Signed-zero rules in the exact reference match translator reference.
+    for triple, expected in (
+        ((0x8000, 0x3c00, 0x8000), 0x8000),
+        ((0x0000, 0x3c00, 0x8000), 0x0000),
+        ((0x3c00, 0xbc00, 0x3c00), 0x0000),
+        ((0x8001, 0x3800, 0x0000), 0x8000),
     ):
-        must_reject(translate_int, uncompressed_export(prefix + [bad]))
+        assert pk_fmac_lane_reference(*triple) == expected
+        assert pixel_aot.f16_pk_fmac_lane_result(*triple) == expected
+
+    for kind in PK_FMAC_PROGRAMS:
+        program = pk_fmac_program(kind)
+        lowered = translate_f16(program)
+        body = lowered.split("uint4 main", 1)[1]
+        assert "fma16_rne(" in lowered and "fma16_rne(" in body
+        for forbidden in ("pack16_rne(", "mad(", "f32tof16", "f16tof32"):
+            assert forbidden not in body, (kind, forbidden)
+        e32_only = [line.replace("v_pk_fmac_f16 ", "v_pk_fmac_f16_e32 ") for line in program]
+        assert translate_f16(e32_only) == lowered
+        # Unknown or invalid entry denormal state must refuse v_pk_fmac_f16.
+        expect_value_error(translate_int, program, "binary16 denormal mode unknown at entry")
+        # Round-toward-zero mode must refuse v_pk_fmac_f16.
+        expect_value_error(translate_f16, [HALF_RTZ] + program, "under round toward zero: v_pk_fmac_f16")
+    for state in ("flush", "ftz", "", False):
+        expect_value_error(
+            lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True, half_denorm=state),
+            pk_fmac_program("precision"),
+            "Invalid binary16 denormal entry state",
+        )
+
+    # Static refusals with proven finite prefix registers.
+    prefix = [
+        "s_mov_b32 s60, 0x3c003c00",
+        "v_mov_b32_e32 v12, 0x3c003c00",
+        "v_mov_b32_e32 v13, 0x38004000",
+        "v_mov_b32_e32 v14, 0x3e003400",
+        "v_mov_b32_e32 v15, 0xbc003c00",
+    ]
+    for bad, message in (
+        ("v_pk_fmac_f16 v20, v12, v13", "Uninitialized packed accumulator v20 at v_pk_fmac_f16"),
+        ("v_pk_fmac_f16 v12, v13, s60", "v_pk_fmac_f16 src1 must be a VGPR"),
+        ("v_pk_fmac_f16 v12, v13, 0x3c003c00", "v_pk_fmac_f16 src1 must be a VGPR"),
+        ("v_pk_fmac_f16 v12, v13, 1.0", "v_pk_fmac_f16 src1 must be a VGPR"),
+        ("v_pk_fmac_f16 v12, v13, v14 clamp", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v12, v13, v14 op_sel:[0,0]", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v12, v13, v14 op_sel_hi:[1,1]", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v12, v13, v14 neg_lo:[1,0]", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v12, v13, v14 neg_hi:[0,1]", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v12, -v13, v14", "Unsupported binary16 source modifier -v13"),
+        ("v_pk_fmac_f16 v12, |v13|, v14", "Unsupported binary16 source modifier |v13|"),
+        ("v_pk_fmac_f16 v12, v13, v14 mul:2", "Unsupported instruction"),
+        ("v_pk_fmac_f16_e64 v12, v13, v14", "Unsupported instruction"),
+        ("v_pk_fmac_f16_dpp v12, v13, v14 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "Unsupported instruction"),
+        ("v_pk_fmac_f16_sdwa v12, v13, v14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD", "Unsupported instruction"),
+        ("v_pk_fmac_f16 v256, v12, v13", "Register out of range: v256"),
+        ("v_pk_fmac_f16 v12, v256, v13", "Register out of range: v256"),
+        ("v_pk_fmac_f16 v12, s106, v13", "Register out of range: s106"),
+        ("v_pk_fmac_f16 v12, v13, v256", "Register out of range: v256"),
+        ("v_pk_fmac_f16 v12, v20, v13", "Unbound pixel input v20 at v_pk_fmac_f16"),
+        ("v_pk_fmac_f16 v12, s99, v13", "Unbound scalar input s99 at v_pk_fmac_f16"),
+        ("v_pk_fmac_f16 v12, v13, v20", "Unbound pixel input v20 at v_pk_fmac_f16"),
+        ("v_pk_fmac_f16 v12, 1, v13", "Unsupported binary16 integer inline constant 1"),
+        ("v_pk_fmac_f16 v12, -1, v13", "Unsupported binary16 integer inline constant -1"),
+        # Unproven runtime constant-buffer source.
+        ("v_pk_fmac_f16 v12, s44, v13", "binary16 operand lacks a finite proof: s44"),
+        # Non-finite literal in low or high half.
+        ("v_pk_fmac_f16 v12, 0x3c007c00, v13", "binary16 operand is not finite: 0x3c007c00"),
+        ("v_pk_fmac_f16 v12, 0x7c003c00, v13", "binary16 operand is not finite: 0x7c003c00"),
+        ("v_pk_fmac_f16 v12, 0x3c007e00, v13", "binary16 operand is not finite: 0x3c007e00"),
+        ("v_pk_fmac_f16 v12, 0xfc003c00, v13", "binary16 operand is not finite: 0xfc003c00"),
+    ):
+        expect_value_error(translate_f16, uncompressed_export(prefix + [bad]), message)
+
+    # Unproven runtime VGPR copy from constant buffer must be refused.
+    expect_value_error(
+        translate_f16,
+        uncompressed_export(prefix + ["v_mov_b32_e32 v16, s44", "v_pk_fmac_f16 v12, v16, v13"]),
+        "binary16 operand lacks a finite proof: v16",
+    )
+    expect_value_error(
+        translate_f16,
+        uncompressed_export(prefix + ["v_mov_b32_e32 v16, s44", "v_pk_fmac_f16 v16, v12, v13"]),
+        "binary16 operand lacks a finite proof: v16",
+    )
+    # Non-finite SGPR/VGPR operands (in either half) must be refused.
+    for non_finite in ("0x7e003c00", "0x3c007e00", "0x7c003c00", "0x3c00fc00"):
+        expect_value_error(
+            translate_f16,
+            uncompressed_export(prefix + [f"v_mov_b32_e32 v16, {non_finite}", "v_pk_fmac_f16 v12, v16, v13"]),
+            "binary16 operand is not finite: v16",
+        )
+        expect_value_error(
+            translate_f16,
+            uncompressed_export(prefix + [f"v_mov_b32_e32 v16, {non_finite}", "v_pk_fmac_f16 v16, v12, v13"]),
+            "binary16 operand is not finite: v16",
+        )
+    # Overflowing fused results in low or high half (both signs) must be refused; boundary finite and
+    # fused cancellation of an overflowing intermediate product must be accepted.
+    for acc, s0, s1 in (
+        ("0x3c004c00", "0x3c007bff", "0x3c003c00"),  # low half: 65504 + 16 = 65520 -> overflow
+        ("0x4c003c00", "0x7bff3c00", "0x3c003c00"),  # high half: 65504 + 16 = 65520 -> overflow
+        ("0x3c00cc00", "0x3c00fbff", "0x3c003c00"),  # low half: -65504 - 16 = -65520 -> overflow
+        ("0xcc003c00", "0xfbff3c00", "0x3c003c00"),  # high half: -65504 - 16 = -65520 -> overflow
+    ):
+        expect_value_error(
+            translate_f16,
+            uncompressed_export(prefix + [f"v_mov_b32_e32 v16, {acc}", f"v_mov_b32_e32 v17, {s1}",
+                                          f"v_pk_fmac_f16 v16, {s0}, v17"]),
+            "binary16 result overflows: v_pk_fmac_f16",
+        )
+    translate_f16(uncompressed_export(prefix + [
+        "v_mov_b32_e32 v16, 0x4bff4bff",
+        "v_mov_b32_e32 v17, 0x3c003c00",
+        "v_pk_fmac_f16 v16, 0x7bff7bff, v17",
+    ]))
+    translate_f16(uncompressed_export(prefix + [
+        "v_mov_b32_e32 v16, 0xfbfffbff",
+        "v_mov_b32_e32 v17, 0x40004000",
+        "v_pk_fmac_f16 v16, 0x7bff7bff, v17",
+    ]))
     # A scalar half16 value only defines bits 15:0 and cannot act as a packed accumulator.
     half16_acc = uncompressed_export([
-        "v_mov_b32_e32 v13, s45",
-        "v_mov_b32_e32 v14, s46",
-        "v_mov_b32_e32 v15, s47",
+        "v_mov_b32_e32 v13, 0x3c003c00",
+        "v_mov_b32_e32 v14, 0x38003800",
+        "v_mov_b32_e32 v15, 0x40004000",
         "v_add_f16_e32 v12, 1.0, v13",
         "v_pk_fmac_f16 v12, v13, v14",
     ])
-    must_reject(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
-                                integer_export=True, half_denorm="preserve"), half16_acc)
+    expect_value_error(translate_f16, half16_acc, "binary16 operand lacks a finite proof: v12")
+
+
+def _parse_pixel_mismatch_channels(stderr):
+    """Parse offscreen_check pixel_mismatch channel diagnostics into {channel: (expected_bits, actual_bits)}."""
+    channels = {}
+    for line in stderr.splitlines():
+        if m := re.match(r"channel=(\d+) .*expected_bits=([0-9a-f]{8}) actual_bits=([0-9a-f]{8})", line):
+            channels[int(m.group(1))] = (int(m.group(2), 16), int(m.group(3), 16))
+    return channels
 
 
 def check_pk_fmac_draw(directory, compiler, renderer, backend):
-    """Draw v_pk_fmac_f16 through R32G32B32A32_UINT readback with exact reference and negative controls."""
+    """Draw v_pk_fmac_f16 through R32G32B32A32_UINT readback with exact rational reference and targeted mutants."""
     source = directory / "pk_fmac.hlsl"
     shader = directory / "pk_fmac.cso"
-    program = pk_fmac_program()
-    lowered = translate_int(program)
+    constants = bytes(256)
 
-    cases = []
-    for idx, words in enumerate(PK_FMAC_WORDS):
-        constants = bytearray(256)
-        struct.pack_into("<4I", constants, 12, *words)
-        expected = pk_fmac_reference(words)
-        for word in expected:
-            assert struct.unpack("<I", struct.pack("<f", as_float(word)))[0] == word, hex(word)
-        case = directory / f"pk_fmac-{idx}.case"
-        write_case(case, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
-        cases.append(case)
+    programs = {kind: pk_fmac_program(kind) for kind in PK_FMAC_PROGRAMS}
+    lowered = {kind: translate_f16(programs[kind]) for kind in PK_FMAC_PROGRAMS}
+    cases = {}
+    for kind in PK_FMAC_PROGRAMS:
+        expected = pk_fmac_reference(kind)
+        case = directory / f"pk_fmac-{kind}.case"
+        write_case(case, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+        cases[kind] = (case, expected)
 
-    source.write_text(lowered, encoding="ascii")
-    compile_shader(compiler, source, shader, mode="preserve")
-    run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases])
-    # Binary16 subnormals in pack16_rne/widen16 must stay unchanged under -denorm ftz too.
-    compile_shader(compiler, source, shader, mode="ftz")
-    subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[2]], check=True)
+    # Exact readback under both binary32 -denorm preserve and -denorm ftz: binary16 subnormals stay preserved
+    # because fma16_rne runs purely in 32-bit integer arithmetic.
+    for kind in PK_FMAC_PROGRAMS:
+        source.write_text(lowered[kind], encoding="ascii")
+        for mode in ("preserve", "ftz"):
+            compile_shader(compiler, source, shader, mode=mode)
+            run_pixel_batch(renderer, backend, shader, [(cases[kind][0], "pass")])
+    print(f"pk_fmac exact readback ({PK_FMAC_DENORM_MODE}): "
+          + ", ".join(f"{kind}={tuple(f'{w:#010x}' for w in cases[kind][1])}" for kind in PK_FMAC_PROGRAMS))
 
-    # Negative controls: dropped accumulator, swapped halves, and wrong rounding must each report pixel_mismatch.
-    idx_v13 = program.index("v_pk_fmac_f16 v13, s44, v17")
-    dropped_acc = lowered.replace(
-        f"mad(widen16(pk{idx_v13}_0), widen16(pk{idx_v13}_1), widen16(pk{idx_v13}_2))",
-        f"(widen16(pk{idx_v13}_0) * widen16(pk{idx_v13}_1))",
-    )
-    swapped_halves = lowered.replace(
-        f"pack16_rne(pk{idx_v13}_l0) | (pack16_rne(pk{idx_v13}_l1) << 16)",
-        f"pack16_rne(pk{idx_v13}_l1) | (pack16_rne(pk{idx_v13}_l0) << 16)",
-    )
-    wrong_rounding = lowered.replace(
-        "uint round_bit = 0x00000fffu + ((shifted >> 13) & 1u);",
-        "uint round_bit = 0u;",
-    )
-    for mutated, case_idx, label in (
-        (dropped_acc, 0, "dropped accumulator"),
-        (swapped_halves, 0, "swapped halves"),
-        (wrong_rounding, 1, "wrong rounding"),
-    ):
-        assert mutated != lowered, label
-        source.write_text(mutated, encoding="ascii")
+    def run_mutant(kind, mutated_hlsl, label):
+        assert mutated_hlsl != lowered[kind], label
+        source.write_text(mutated_hlsl, encoding="ascii")
         compile_shader(compiler, source, shader, mode="preserve")
-        wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[case_idx]],
+        wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[kind][0]],
                                capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
-            raise AssertionError(f"Mutation of {label} escaped detection")
+            raise AssertionError(f"Mutation of {label} escaped detection: rc={wrong.returncode}\n{wrong.stderr}")
+        channels = _parse_pixel_mismatch_channels(wrong.stderr)
+        assert len(channels) == 4, (label, wrong.stderr)
+        return channels
+
+    # Mutant 1: intermediate binary32 rounding (widen16 -> mad -> pack16_rne) instead of exact fused binary16 RNE.
+    # Must report pixel_mismatch ONLY at the discriminator lane (0x3c01 -> 0x3c00): channel 0 low half in "precision"
+    # and channel 3 high half in "alias_chain".
+    f32_helper = (
+        "float widen16(uint word);\n"
+        + pixel_aot.SALU_HELPERS["pack16_rne"] + "\n"
+        "uint fma16_rne(uint a_bits, uint b_bits, uint c_bits) {\n"
+        "    precise float s = mad(widen16(a_bits), widen16(b_bits), widen16(c_bits));\n"
+        "    return pack16_rne(s);\n"
+        "}"
+    )
+    for kind, disc_ch, exp_word, act_word in (
+        ("precision", 0, 0xbc003c01, 0xbc003c00),
+        ("alias_chain", 3, 0x3c010401, 0x3c000401),
+    ):
+        assert pixel_aot.SALU_HELPERS["fma16_rne"] in lowered[kind]
+        mutated_f32 = lowered[kind].replace(pixel_aot.SALU_HELPERS["fma16_rne"], f32_helper)
+        channels = run_mutant(kind, mutated_f32, f"intermediate_f32 ({kind})")
+        diff_channels = [ch for ch, (exp, act) in channels.items() if exp != act]
+        assert diff_channels == [disc_ch], (kind, channels)
+        assert channels[disc_ch] == (exp_word, act_word), (kind, channels[disc_ch])
+        print(f"pk_fmac mutant intermediate_f32 ({kind}): channel={disc_ch} "
+              f"expected={exp_word:#010x} actual={act_word:#010x}")
+
+    # Mutant 2: flush binary16 subnormal inputs (DAZ) — must mismatch on the dedicated denormal lane (channel 1 low half
+    # 0x0002 -> 0x0000 while normal-input high half 0x0200 stays intact; channel 3 low half 0x0401 -> 0x0000 in alias_chain).
+    flush_in_precision = lowered["precision"]
+    for v in ("a", "b", "c"):
+        old = f"uint m{v} = ({v} & 0x3ffu) | (e{v}_f != 0u ? 0x400u : 0u);"
+        new = f"uint m{v} = e{v}_f != 0u ? (({v} & 0x3ffu) | 0x400u) : 0u;"
+        assert flush_in_precision.count(old) == 1
+        flush_in_precision = flush_in_precision.replace(old, new)
+    channels = run_mutant("precision", flush_in_precision, "flush_denorm_in")
+    assert channels[1] == (0x02000002, 0x02000000), channels
+    print(f"pk_fmac mutant flush_denorm_in (precision): channel=1 "
+          f"expected={channels[1][0]:#010x} actual={channels[1][1]:#010x}")
+
+    # Mutant 3: flush binary16 subnormal outputs (FTZ) — must mismatch ONLY on channel 1 (0x02000002 -> 0x00000000),
+    # leaving normal-result channels 0, 2, 3 unchanged.
+    flush_out_old = "    if (res_exp == -25) return (res_sign << 15u) | (norm > 0x80000000u ? 1u : 0u);"
+    flush_out_new = "    return res_sign << 15u;"
+    assert lowered["precision"].count(flush_out_old) == 1
+    flush_out_precision = lowered["precision"].replace(flush_out_old, flush_out_new).replace(
+        "    if (mp == 0u) return c;",
+        "    if (mp == 0u) return ec_f == 0u ? (sc << 15u) : c;",
+    )
+    channels = run_mutant("precision", flush_out_precision, "flush_denorm_out")
+    assert [ch for ch, (exp, act) in channels.items() if exp != act] == [1], channels
+    assert channels[1] == (0x02000002, 0x00000000), channels
+    print(f"pk_fmac mutant flush_denorm_out (precision): channel=1 "
+          f"expected={channels[1][0]:#010x} actual={channels[1][1]:#010x}")
+
+    # Mutants 4-7: dropped accumulator, swapped halves, truncated rounding, and ties-away-from-zero.
+    idx_v12 = programs["precision"].index("v_pk_fmac_f16 v12, v16, v17")
+    idx_v13 = programs["precision"].index("v_pk_fmac_f16_e32 v13, s60, v18")
+    dropped_acc = lowered["precision"].replace(
+        f"fma16_rne(pk{idx_v13}_0, pk{idx_v13}_1, pk{idx_v13}_2)",
+        f"fma16_rne(pk{idx_v13}_0, pk{idx_v13}_1, 0u)",
+    )
+    swapped_halves = lowered["precision"].replace(
+        f"pk{idx_v12}_l0 | (pk{idx_v12}_l1 << 16)",
+        f"pk{idx_v12}_l1 | (pk{idx_v12}_l0 << 16)",
+    )
+    rne_line = "if (rem > 0x00100000u || (rem == 0x00100000u && (sig & 1u) != 0u)) sig += 1u;"
+    truncate = lowered["precision"].replace(rne_line, "if (false) sig += 1u;")
+    ties_away = lowered["precision"].replace(rne_line, "if (rem >= 0x00100000u) sig += 1u;")
+    for mutated, expected_ch, label in (
+        (dropped_acc, 1, "dropped accumulator"),
+        (swapped_halves, 0, "swapped halves"),
+        (truncate, 2, "truncated rounding"),
+        (ties_away, 2, "ties away from zero"),
+    ):
+        channels = run_mutant("precision", mutated, label)
+        assert channels[expected_ch][0] != channels[expected_ch][1], (label, channels)
     return 0
 
 
@@ -12112,7 +12398,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(MOVK_BODY), translate))
     fixtures.append((with_constants(HALF_BODY), translate))
     fixtures.append((with_constants(VOP3P_BODY), translate))
-    fixtures.append((pk_fmac_program(), translate_int))
+    fixtures.extend((pk_fmac_program(kind), translate_f16) for kind in PK_FMAC_PROGRAMS)
     fixtures.append((with_constants(FMA_MIX_BODY), translate))
     fixtures.append((with_constants(NARROW_BODY), translate))
     fixtures.append((mode_program(), translate))
