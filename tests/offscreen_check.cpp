@@ -893,8 +893,8 @@ constexpr CapabilityGate kGateSm66CompareSampler{
     "skip: comparison-sampler fixture requires SM 6.6",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
-    D3D_SHADER_MODEL_6_6, true, false, 0,
-    "skip: address window fixture requires SM 6.6 and 64-bit shader integer operations",
+    D3D_SHADER_MODEL_6_0, true, false, 0,
+    "skip: address window fixture requires SM 6.0 and 64-bit shader integer operations",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66Ballot{
     D3D_SHADER_MODEL_6_6, false, false, 0,
@@ -1288,6 +1288,21 @@ int run_self_test()
             if (!require(!evaluate_gate(compaction->gate, unmet, {&out, &err}) &&
                          out.find("skip: subgroup compaction fixture requires SM 6.0 and WaveOps") != std::string::npos,
                          "compaction requires both SM 6.0 and WaveOps"))
+                return 1;
+        }
+
+        const OperationSpec* address_window = find_operation("--spirv-address-window");
+        if (!require(address_window != nullptr, "--spirv-address-window operation")) return 1;
+        const AdapterCaps sm60_int64{D3D_SHADER_MODEL_6_0, true};
+        const AdapterCaps sm51_int64{D3D_SHADER_MODEL_5_1, true};
+        if (!require(evaluate_gate(address_window->gate, sm60_int64), "address window accepts SM 6.0 with Int64ShaderOps"))
+            return 1;
+        for (const AdapterCaps& unmet : {sm60_no_waves, sm51_int64}) {
+            out.clear();
+            if (!require(!evaluate_gate(address_window->gate, unmet, {&out, &err}) &&
+                         out.find("skip: address window fixture requires SM 6.0 and 64-bit shader integer operations") !=
+                             std::string::npos,
+                         "address window requires both SM 6.0 and Int64ShaderOps"))
                 return 1;
         }
 
