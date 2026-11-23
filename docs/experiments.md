@@ -3587,8 +3587,18 @@ An RTX 5080 (driver 32.0.16.1692, DXR tier 1.2) matched all 126 rays in both run
 
 On an AMD RDNA 4 GPU, a run reported by denn0x in the review of #216 failed `dxr_opacity_hardware`. Every mismatch was a shader-committed hit with the correct instance and geometry, but its `CommittedRayT()` equalled the true distance plus TMin. The specification makes a committed non-opaque triangle the closest hit at the candidate's distance, and `CandidateTriangleRayT` and `CommittedRayT` both measure the distance from the ray origin, not from TMin. [TraceRayInline control flow](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#tracerayinline-control-flow) · [CommittedRayT](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#rayquery-committedrayt) · [CandidateTriangleRayT](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#rayquery-candidatetrianglerayt) All 126 rays use TMin 0.25, so the offset is visible at every hit distance. On the RX 9070 XT with driver 32.0.32015.7029 the reporter observed 43 affected rays. Each such ray increments both `committed_t_plus_tmin` and the committed-hit mismatch count, and the device test fails. The diagnostic identifies shader-committed hits with the expected identity and candidate distance whose committed distance differs by TMin. The same tolerance applies on every adapter. A synthetic control adds 0.25 to a known hit distance and requires the committed-hit check to reject it.
 
+### Opacity in DispatchRays
+
+`dxr_opacity_pipeline` traces the same 126 rays with a `lib_6_3` ray generation, any-hit, closest-hit and miss library. Each geometry selects its own hit group record using a TraceRay geometry multiplier of 1. The record provides the geometry index as a local root constant, so the shaders can identify the four geometries on Tier 1.0. AnyHit records each presented geometry and calls `IgnoreHit` when the accept mask rejects it. [Hit group table indexing](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#hit-group-table-indexing) · [Any hit shaders](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#any-hit-shaders)
+
+The CPU checks require the closest committable hit or a legal first hit, verify instance, geometry, primitive and distance, and compare the required and allowed any-hit geometry masks. The pipeline check also rejects another invocation after a shader-accepted first hit. The diagnostic for candidates after an automatic opaque commit is specific to inline RayQuery.
+
+The pipeline matched 94 hits and 32 misses on the GTX 1060 (driver 32.0.15.6094, Windows 10 build 19045.6456) and app-local WARP 1.0.22 with Agility SDK 1.620.2. Both reported zero D3D12 debug warnings and errors. App-local WARP also passed inline RayQuery with three instances of its known first-hit continuation. The GTX 1060 skipped inline RayQuery at Tier 1.0, and Windows 10 in-box WARP skipped both opacity tests because it has no DXR.
+
+Two local shader mutations confirmed that the check detects each failure independently. Accepting every non-opaque candidate changed the first ray from geometry 1 at distance 2 to geometry 0 at distance 1. Flipping the low bit of the geometry index read from the hit record changed that ray's reported geometry from 1 to 0 at distance 2. Both mutations failed on the GTX 1060 and app-local WARP.
+
 ```powershell
-ctest --preset dev --no-tests=error -R '^dxr_opacity_' -V
+ctest --preset dev --no-tests=error -R '^dxr_opacity_(pipeline_)?(hardware|warp)$' -V
 ```
 
 ### Desktop checks for the query tail and root flags
