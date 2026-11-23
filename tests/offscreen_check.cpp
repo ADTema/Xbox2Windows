@@ -807,7 +807,12 @@ OperationResult run_dxr_update_pipeline(const OperationContext& ctx)
 
 OperationResult run_dxr_facing(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_facing(ctx.device));
+    return skip_if_false(check_dxr_facing(ctx.device, false));
+}
+
+OperationResult run_dxr_facing_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_facing(ctx.device, true));
 }
 
 OperationResult run_dxr_opacity(const OperationContext& ctx)
@@ -974,6 +979,7 @@ const OperationSpec kOperations[] = {
     {"--dxr-update", 3, 3, nullptr, kNoGate, run_dxr_update},
     {"--dxr-update-pipeline", 3, 3, nullptr, kNoGate, run_dxr_update_pipeline},
     {"--dxr-facing", 3, 3, nullptr, kNoGate, run_dxr_facing},
+    {"--dxr-facing-pipeline", 3, 3, nullptr, kNoGate, run_dxr_facing_pipeline},
     {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},

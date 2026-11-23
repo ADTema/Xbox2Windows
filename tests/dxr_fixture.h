@@ -24,7 +24,8 @@ struct Capabilities {
 Capabilities capabilities(ID3D12Device* device);
 bool supported(ID3D12Device* device, Backend backend = Backend::inline_query);
 D3D12_RAYTRACING_INSTANCE_DESC instance(UINT id, UINT mask, float translateX = 0);
-// The pipeline backend uses one opaque geometry, hit group 0 and unflagged rays.
+// The pipeline backend uses one opaque geometry, hit group 0 and rays with
+// optional facing readback and at most one face-cull flag.
 std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Vertex>& vertices,
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances, const std::vector<Ray>& rays,
     Backend backend = Backend::inline_query, const SceneUpdate* update = nullptr,
