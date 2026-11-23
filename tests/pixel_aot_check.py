@@ -2801,6 +2801,45 @@ def check_scalar_leading_bit_draw(directory, compiler, renderer, backend):
         raise AssertionError("Unsigned leading-bit scan matched the signed reference")
 
 
+def scalar_first_bit_values(width):
+    src = "s44" if width == 32 else "s[44:45]"
+    body = []
+    for bit in (0, 1):
+        body.extend([
+            "s_cmp_eq_u32 s44, s45",
+            f"s_ff{bit}_i32_b{width} s62, {src}",
+            "s_cselect_b32 s63, 0x3f800000, 0", f"v_mov_b32_e32 v{14 + bit}, s63",
+            f"s_cmp_eq_u32 s62, s{46 + bit}",
+            "s_cselect_b32 s63, 0x3f800000, 0", f"v_mov_b32_e32 v{12 + bit}, s63",
+        ])
+    return with_constants(body)
+
+
+def check_scalar_first_bit_draw(directory, compiler, renderer, backend):
+    source, shader, case = (directory / name for name in ("first-bit.hlsl", "first-bit.cso", "first-bit.case"))
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for width in (32, 64):
+        source.write_text(translate(scalar_first_bit_values(width)), encoding="ascii")
+        compile_shader(compiler, source, shader, ieee=False)
+        for lo, hi in ((0, 0), (0xffffffff, 0xffffffff), (0xffffffff, 0xfffffffe),
+                       (0x80000000, 1), (0, 1), (0, 0x80000000)):
+            word = lo if width == 32 else lo | (hi << 32)
+            expected = [next((i for i in range(width) if (word >> i) & 1 == bit), 0xffffffff)
+                        for bit in (0, 1)]
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, lo, hi, *expected)
+            case.write_bytes(constants + struct.pack("<4f", 1, 1, lo == hi, lo == hi) * 64)
+            subprocess.run(draw, check=True)
+    # For the final input, scanning only the low word misses the set bit at position 63.
+    program = [line.replace("s_ff1_i32_b64 s62, s[44:45]", "s_ff1_i32_b32 s62, s44")
+               for line in scalar_first_bit_values(64)]
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Ignoring the high word escaped detection")
+
+
 def scalar_bit_count_values(width):
     src = "s44" if width == 32 else "s[44:45]"
     body = []
@@ -6951,6 +6990,7 @@ def check_binary(directory, assembler, objcopy, library):
         ))
     fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
     fixtures.extend((scalar_bit_count_values(width), translate) for width in (32, 64))
+    fixtures.extend((scalar_first_bit_values(width), translate) for width in (32, 64))
     fixtures.extend((scalar_carry_chain(subtract), translate_int) for subtract in (False, True))
     fixtures.extend((scalar_leading_bit_values(width), translate) for width in (32, 64))
     fixtures.append((scalar_mul_hi_values(), translate))
@@ -9357,6 +9397,13 @@ def main():
                         "draw-vop3-ternary-int": check_vop3_ternary_int_draws,
                         "draw-swap": check_swap_draw}[mode]
                 return draw(directory, *args)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
+                    return 77
+                raise
+        if mode == "draw-first-bit":
+            try:
+                return check_scalar_first_bit_draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
                     return 77

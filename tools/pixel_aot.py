@@ -977,6 +977,8 @@ def lane_mask(token):
 # {r} names the result. Shift counts use their low five bits; signed overflow sets SCC for _i32 add/sub.
 NONZERO = "{r} != 0u"
 SCALAR = {
+    "ff0_i32_b32": (1, "firstbitlow(~{0})", None),
+    "ff1_i32_b32": (1, "firstbitlow({0})", None),
     "flbit_i32_b32": (1, "dpp_ffbh_u32({0})", None),
     "flbit_i32": (1, "dpp_ffbh_i32({0})", None),
     "bcnt0_i32_b32": (1, "32u - countbits({0})", NONZERO),
@@ -1894,6 +1896,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 lo, hi = f"({lo} ^ signmask{i})", f"({hi} ^ signmask{i})"
             lines.append(f"    uint salu{i} = {hi} != 0u ? 31u - firstbithigh({hi}) : "
                          f"({lo} != 0u ? 63u - firstbithigh({lo}) : 0xffffffffu);")
+            scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"s_ff([01])_i32_b64 (s\d+), ([^,]+)"):
+            bit, dst, src = m.groups()
+            sgpr_name(dst)
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            lo, hi = scalar_u64(src, scalar, pending)
+            if bit == "0":
+                lo, hi = f"(~{lo})", f"(~{hi})"
+            lines.append(f"    uint salu{i} = {lo} != 0u ? firstbitlow({lo}) : "
+                         f"({hi} != 0u ? 32u + firstbitlow({hi}) : 0xffffffffu);")
             scalar[dst] = ("uint", f"salu{i}")
         elif m := match(r"s_bcnt([01])_i32_b64 (s\d+), ([^,]+)"):
             bit, dst, src = m.groups()
