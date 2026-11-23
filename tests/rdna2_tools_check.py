@@ -875,6 +875,96 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(trunc[0]["opcode"], "vopc_truncated")
         self.assertEqual(trunc[0]["length"], 4)
 
+    # Issue #938: VOPC SDWA neg without abs on an inline constant, printed neg(c) as LLVM 15 does. The encodings
+    # are llvm-mc 15.0.7 output (gfx1013, wave32) for the same text; LLVM prints float constants in decimal.
+    SDWA_NEG_INLINE_DECODED = (
+        ("f904027c81009606", "v_cmp_lt_f32_sdwa vcc_lo, neg(1), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027c80009606", "v_cmp_lt_f32_sdwa vcc_lo, neg(0), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cc0009606", "v_cmp_lt_f32_sdwa vcc_lo, neg(64), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cc1009606", "v_cmp_lt_f32_sdwa vcc_lo, neg(-1), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cd0009606", "v_cmp_lt_f32_sdwa vcc_lo, neg(-16), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cf0009606", "v_cmp_lt_f32_sdwa vcc_lo, neg(0.5), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cf1009606", "v_cmp_lt_f32_sdwa vcc_lo, neg(-0.5), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cf2009606", "v_cmp_lt_f32_sdwa vcc_lo, neg(1.0), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cf8009606", "v_cmp_lt_f32_sdwa vcc_lo, neg(0.15915494), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f902037c01000696", "v_cmp_lt_f32_sdwa vcc_lo, v1, neg(1) src0_sel:DWORD src1_sel:DWORD"),
+        ("f9e2037c01000696", "v_cmp_lt_f32_sdwa vcc_lo, v1, neg(-0.5) src0_sel:DWORD src1_sel:DWORD"),
+        ("f904927df4869606", "v_cmp_lt_f16_sdwa s6, neg(2.0), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f9ee937d01000696", "v_cmp_lt_f16_sdwa vcc_lo, v1, neg(-4.0) src0_sel:DWORD src1_sel:DWORD"),
+        ("f904107dc1869606", "v_cmp_class_f32_sdwa s6, neg(-1), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904247cf0009606", "v_cmpx_eq_f32_sdwa neg(0.5), v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f90e257c01000696", "v_cmpx_eq_f32_sdwa v1, neg(7) src0_sel:DWORD src1_sel:DWORD"),
+        # Spellings that already matched LLVM 15 and stay unchanged: abs, abs+neg, the inline constants
+        # themselves, and neg on a register or a named special operand.
+        ("f904027c8100b606", "v_cmp_lt_f32_sdwa vcc_lo, -|1|, v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cc100a606", "v_cmp_lt_f32_sdwa vcc_lo, |-1|, v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cf000b606", "v_cmp_lt_f32_sdwa vcc_lo, -|0.5|, v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cc1008606", "v_cmp_lt_f32_sdwa vcc_lo, -1, v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027cf1008606", "v_cmp_lt_f32_sdwa vcc_lo, -0.5, v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027c01009606", "v_cmp_lt_f32_sdwa vcc_lo, -s1, v2 src0_sel:DWORD src1_sel:DWORD"),
+        ("f904027ceb009606", "v_cmp_lt_f32_sdwa vcc_lo, -src_shared_base, v2 src0_sel:DWORD src1_sel:DWORD"),
+    )
+    # neg on an integer operand stays refused: an integer compare's src0 and a class compare's src1, each with
+    # neg on the inline constant 1 (the accepted forms without neg are f904887d81868606 and f902117d01860686).
+    SDWA_NEG_INLINE_REFUSED = ("f904887d81869606", "f902117d01860696")
+
+    def test_vopc_sdwa_neg_on_inline_constant(self):
+        """Issue #938: neg without abs on an inline constant is neg(c), not -c, which names another constant."""
+        mov = bytes.fromhex("0403067e")  # v_mov_b32_e32 v3, v4
+        for raw_hex, expected in self.SDWA_NEG_INLINE_DECODED:
+            insns = disasm_rdna2(bytes.fromhex(raw_hex) + mov)
+            self.assertEqual(
+                [(i["offset"], i["length"], i["opcode"], i["assembly"]) for i in insns],
+                [(0, 8, expected.split()[0], expected), (8, 4, "v_mov_b32_e32", "v_mov_b32_e32 v3, v4")],
+                raw_hex,
+            )
+        for raw_hex in self.SDWA_NEG_INLINE_REFUSED:
+            insns = disasm_rdna2(bytes.fromhex(raw_hex) + mov)
+            self.assertEqual(
+                [(i["offset"], i["length"], i["opcode"]) for i in insns],
+                [(0, 8, "vopc_sdwa"), (8, 4, "v_mov_b32_e32")],
+                raw_hex,
+            )
+            self.assertIn("<unsupported SDWA>", insns[0]["assembly"], raw_hex)
+            self.assertEqual(insns[1]["assembly"], "v_mov_b32_e32 v3, v4", raw_hex)
+
+        # neg(1) (0x80000001) and the inline constant -1 (0xffffffff) are different operands with different text.
+        neg_one = disasm_rdna2(bytes.fromhex("f924027c81009606"))[0]["assembly"]
+        minus_one = disasm_rdna2(bytes.fromhex("f924027cc1008606"))[0]["assembly"]
+        self.assertEqual(neg_one, "v_cmp_lt_f32_sdwa vcc_lo, neg(1), v18 src0_sel:DWORD src1_sel:DWORD")
+        self.assertEqual(minus_one, "v_cmp_lt_f32_sdwa vcc_lo, -1, v18 src0_sel:DWORD src1_sel:DWORD")
+
+        # pixel_aot.lower accepts the inline constant -1 and refuses the neg(1) encoding, so the decoder text
+        # no longer lowers the sign-flipped 1 as the constant -1.
+        from pixel_aot_check import with_constants
+
+        def lowered(compare):
+            program = with_constants(["v_sub_f32_e64 v18, s45, 0", "v_sub_f32_e64 v19, s47, 0", compare,
+                                      "v_cndmask_b32_e32 v12, 0, v19, vcc_lo"])
+            return lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64)
+
+        self.assertIn("asfloat(4294967295u) < alu20", lowered(minus_one))
+        for raw_hex in ("f924027c81009606", "f924027cf0009606"):  # neg(1) and neg(0.5) with src1 = v18
+            compare = disasm_rdna2(bytes.fromhex(raw_hex))[0]["assembly"]
+            with self.subTest(lower_refused=compare):
+                with self.assertRaisesRegex(ValueError, r"Unsupported arithmetic operand neg\("):
+                    lowered(compare)
+
+    def test_vopc_sdwa_neg_on_inline_constant_matches_llvm(self):
+        """Issue #938: the neg(c) spellings and refusals equal LLVM 15's."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        mov = bytes.fromhex("0403067e")
+        for raw_hex, expected in self.SDWA_NEG_INLINE_DECODED:
+            with self.subTest(llvm_decoded=raw_hex):
+                self.assertEqual(llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib, offsets=True),
+                                 [(0, expected), (8, "v_mov_b32_e32 v3, v4")])
+        for raw_hex in self.SDWA_NEG_INLINE_REFUSED:
+            with self.subTest(llvm_refused=raw_hex):
+                with self.assertRaisesRegex(ValueError, "at byte 0$"):
+                    llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib)
+
     def test_vopc_sdwa_llvm_round_trip(self):
         """Issue #938: VOPC/VOPCX SDWA forms round-trip byte-for-byte through LLVM 15."""
         if not os.environ.get("LLVM_LIB"):
