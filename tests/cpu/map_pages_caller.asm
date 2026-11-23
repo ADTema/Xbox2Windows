@@ -1,0 +1,102 @@
+EXTERN __imp_XMemMapPhysicalPages:QWORD
+EXTERN __imp_XMemMapPhysicalPagesScatter:QWORD
+
+.data
+aligned_addr    dq 010000000h
+unaligned_addr  dq 010001234h
+pages           dq 1, 2
+addresses       dq 010000000h, 010010000h
+
+.code
+native_entry PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+
+    ; Step 1: Valid contiguous mapping
+    mov rcx, qword ptr [aligned_addr]
+    mov rdx, 2
+    lea r8, pages
+    call qword ptr [__imp_XMemMapPhysicalPages]
+    cmp rax, qword ptr [aligned_addr]
+    jne fail_step_1
+
+    ; Step 2: Valid contiguous unmapping (NULL page array)
+    mov rcx, qword ptr [aligned_addr]
+    mov rdx, 2
+    xor r8d, r8d
+    call qword ptr [__imp_XMemMapPhysicalPages]
+    cmp rax, qword ptr [aligned_addr]
+    jne fail_step_2
+
+    ; Step 3: Valid scatter mapping
+    lea rcx, addresses
+    mov edx, 2
+    lea r8, pages
+    call qword ptr [__imp_XMemMapPhysicalPagesScatter]
+    cmp eax, 1
+    jne fail_step_3
+
+    ; Step 4: Valid scatter unmapping (NULL page array)
+    lea rcx, addresses
+    mov edx, 2
+    xor r8d, r8d
+    call qword ptr [__imp_XMemMapPhysicalPagesScatter]
+    cmp eax, 1
+    jne fail_step_4
+
+    ; Step 5: Negative control - unaligned virtual address
+    mov rcx, qword ptr [unaligned_addr]
+    mov rdx, 2
+    lea r8, pages
+    call qword ptr [__imp_XMemMapPhysicalPages]
+    test rax, rax
+    jnz fail_step_5
+
+    ; Step 6: Negative control - null virtual address
+    xor ecx, ecx
+    mov rdx, 2
+    lea r8, pages
+    call qword ptr [__imp_XMemMapPhysicalPages]
+    test rax, rax
+    jnz fail_step_6
+
+    ; Step 7: Negative control - null scatter address array
+    xor ecx, ecx
+    mov edx, 2
+    lea r8, pages
+    call qword ptr [__imp_XMemMapPhysicalPagesScatter]
+    test eax, eax
+    jnz fail_step_7
+
+    ; All checks passed: return milestone status 0x870
+    mov eax, 0870h
+    jmp done
+
+fail_step_1:
+    mov eax, 0F01h
+    jmp done
+fail_step_2:
+    mov eax, 0F02h
+    jmp done
+fail_step_3:
+    mov eax, 0F03h
+    jmp done
+fail_step_4:
+    mov eax, 0F04h
+    jmp done
+fail_step_5:
+    mov eax, 0F05h
+    jmp done
+fail_step_6:
+    mov eax, 0F06h
+    jmp done
+fail_step_7:
+    mov eax, 0F07h
+    jmp done
+
+done:
+    add rsp, 28h
+    ret
+native_entry ENDP
+END

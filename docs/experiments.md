@@ -3646,6 +3646,24 @@ Build the dev preset and run `ctest --preset dev --no-tests=error -R 'frame_to_h
 
 The desktop shim exports `XMemAllocDefault(size, attributes)` and `XMemFreeDefault(pointer, attributes)` through its existing unhooked allocator. The arguments use the same x64 widths as the normal allocation pair. The original four exports retain their ordinals. Both named allocation pairs run the same source-built checks for zero-filled heap and graphics memory, alignment, matching release, null release and rejected attribute words on Windows. Run `ctest --preset release --no-tests=error -R '^xmem_shim_(exports|allocation|default_allocation)$'`. [Public ABI reference](https://github.com/XWine1/SlimEra/blob/397807a9563f62b56cf7aaea9809b6fa635ba651/era.h)
 
+### Physical-page mapping contracts (contiguous and scatter)
+
+Following physical-page allocation, titles map physical pages into a reserved virtual address space using `XMemMapPhysicalPages` (contiguous) and `XMemMapPhysicalPagesScatter` (scatter-gather). The calls require 64 KiB address alignment (`VirtualAddress % 65536 == 0`), a positive page count, and an array of physical page numbers; passing a null page array unbinds the physical pages while leaving the virtual address reservation intact.
+
+A source-built caller ([`map_pages_caller.asm`](../tests/cpu/map_pages_caller.asm)) imports both functions from `xmem.dll` by name and executes seven verification steps through a controlled recording provider ([`map_pages_provider.cpp`](../tests/cpu/map_pages_provider.cpp)):
+- **Step 1**: Contiguous mapping to a 64 KiB aligned virtual address, returning the base address.
+- **Step 2**: Contiguous unmapping (`NULL` page array), returning the base address.
+- **Step 3**: Scatter mapping across an array of 64 KiB aligned virtual addresses, returning `TRUE` (`1`).
+- **Step 4**: Scatter unmapping (`NULL` page array), returning `TRUE` (`1`).
+- **Step 5–7**: Negative controls for unaligned virtual address, null virtual address, and null scatter array, each returning `0`.
+
+On success, the caller exits with milestone status `0x870`. Both the native Windows loader and `pe_map` produce identical results. When `xmem.dll` is missing, `pe_map` stops at map time before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_map_pages$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_map_pages$' -V
+```
+
 ### Grouped allocation descriptor builders
 
 In the inspected Bink image, the function interval beginning at RVA `0x67c0` contains direct calls to the group initializer (`0x25b80`), append helper (`0x25b20`) and grouped allocator (`0x25a40`). The initializer places two adjacent arrays after a 64-byte header. Each successful append records a destination and a padded stride. With five available slots, requests of 0, 33, 1, 1025 and 32 bytes produced strides of 32, 64, 128, 1280 and 512 bytes in order. The stride in 32-byte units is congruent to the previous total in units plus one, modulo 32. All five stored strides were even. These helpers do not establish who produces odd tagged entries.

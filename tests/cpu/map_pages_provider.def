@@ -1,0 +1,9 @@
+LIBRARY xmem
+EXPORTS
+    XMemMapPhysicalPages
+    XMemMapPhysicalPagesScatter
+    get_map_pages_call_count
+    get_map_pages_unmap_count
+    get_scatter_map_call_count
+    get_scatter_unmap_count
+    reset_map_pages_records
