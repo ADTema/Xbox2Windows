@@ -50,6 +50,9 @@ QUERIES = [
     "get_xapu_refused_count",
 ]
 EXPECTED_IDS = [0x101, 0x102, 0x103]
+SENTINEL = 0xA9A9A9A9A9A9A9A9
+# Refusals with an output: empty dequeue, unknown-handle dequeue, zero-handle count.
+EXPECTED_REFUSED_OUTPUTS = [SENTINEL, SENTINEL, 0xA9A9A9A9]
 # Calls made by the caller: 1 connect, 3 enqueues, 1 count, 3 x (dequeue + count),
 # 1 empty dequeue, 4 handle-step calls, 3 disconnect-step calls.
 EXPECTED_CALLS = 1 + 3 + 1 + 6 + 1 + 4 + 3
@@ -90,7 +93,8 @@ def load_provider(path):
     lib = ctypes.WinDLL(str(path))
     for name in (*QUERIES, "get_xapu_call_count"):
         getattr(lib, name).restype = ctypes.c_uint32
-    for name in ("get_xapu_enqueued_id", "get_xapu_dequeued_id"):
+    lib.get_xapu_refused_output_count.restype = ctypes.c_uint32
+    for name in ("get_xapu_enqueued_id", "get_xapu_dequeued_id", "get_xapu_refused_output"):
         getattr(lib, name).restype = ctypes.c_uint64
         getattr(lib, name).argtypes = [ctypes.c_uint32]
     lib.reset_xapu_records.restype = None
@@ -135,7 +139,12 @@ def compare(mapper_path, exe_path, provider_path, lenient_path, lifo_path, io_pa
     check("mapped calls", prov.get_xapu_call_count(), EXPECTED_CALLS)
     check("enqueued IDs", [prov.get_xapu_enqueued_id(i) for i in range(4)], [*EXPECTED_IDS, 0])
     check("dequeued IDs", [prov.get_xapu_dequeued_id(i) for i in range(4)], [*EXPECTED_IDS, 0])
-    print(f"native and mapped exit {PASS:#x}; FIFO IDs {[hex(i) for i in EXPECTED_IDS]}; 6 refusals")
+    check("refused outputs", prov.get_xapu_refused_output_count(), len(EXPECTED_REFUSED_OUTPUTS))
+    check("sentinels seen at refusal",
+          [prov.get_xapu_refused_output(i) for i in range(len(EXPECTED_REFUSED_OUTPUTS))],
+          EXPECTED_REFUSED_OUTPUTS)
+    print(f"native and mapped exit {PASS:#x}; FIFO IDs {[hex(i) for i in EXPECTED_IDS]}; 6 refusals; "
+          f"sentinels seen at refusal {[hex(v) for v in EXPECTED_REFUSED_OUTPUTS]}")
 
     # Control: a provider that accepts unknown handles is caught at the handle step.
     check("native lenient exit", run_native(exe, lenient, io_dll), FAIL_HANDLE)

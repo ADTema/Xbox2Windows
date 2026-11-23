@@ -14,4 +14,6 @@ EXPORTS
     get_xapu_call_count
     get_xapu_enqueued_id
     get_xapu_dequeued_id
+    get_xapu_refused_output_count
+    get_xapu_refused_output
     reset_xapu_records

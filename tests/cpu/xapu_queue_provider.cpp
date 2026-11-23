@@ -22,7 +22,12 @@
 // are never reused. An unknown, zero or disconnected handle fails with E_HANDLE, a
 // dequeue from an empty queue fails with HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS), a full
 // queue (4 results) fails with HRESULT_FROM_WIN32(ERROR_BUSY), and a null output fails
-// with E_POINTER. A failed call leaves its output untouched. All codes are fixture policy.
+// with E_POINTER. A failed call leaves its output untouched. All codes are fixture policy
+// until there is an independent reference.
+//
+// When the provider refuses a call that has an output, it reads (never writes) the output
+// and records its first 8 bytes (4 for a count), so the check can confirm that the
+// caller's sentinel survived each refusal.
 //
 // XAPU_TEST_LENIENT builds a control provider that accepts unknown handles.
 // XAPU_TEST_LIFO builds a control provider that returns the newest result first.
@@ -69,6 +74,16 @@ std::uint32_t refused = 0;
 std::uint32_t calls = 0;
 std::uint64_t enqueued_ids[max_records];
 std::uint64_t dequeued_ids[max_records];
+std::uint32_t refused_outputs = 0;
+std::uint64_t refused_output_values[max_records];
+
+HRESULT refuse_with_output(HRESULT result, std::uint64_t observed)
+{
+    if (refused_outputs < max_records)
+        refused_output_values[refused_outputs] = observed;
+    ++refused_outputs;
+    return result;
+}
 
 Client* find(std::uint64_t handle)
 {
@@ -144,7 +159,7 @@ extern "C" HRESULT WINAPI XApuGetResultCount(UINT64 handle, UINT32* count)
         return finish(E_POINTER);
     Client* client = find(handle);
     if (!client)
-        return finish(E_HANDLE);
+        return finish(refuse_with_output(E_HANDLE, *count));
     *count = static_cast<UINT32>(client->count);
     return finish(S_OK);
 }
@@ -156,9 +171,9 @@ extern "C" HRESULT WINAPI XApuDequeueResult(UINT64 handle, FixtureResult* result
         return finish(E_POINTER);
     Client* client = find(handle);
     if (!client)
-        return finish(E_HANDLE);
+        return finish(refuse_with_output(E_HANDLE, result->command_id));
     if (client->count == 0)
-        return finish(no_more_items);
+        return finish(refuse_with_output(no_more_items, result->command_id));
 #ifdef XAPU_TEST_LIFO
     // Control: newest result first.
     const int slot = (client->head + client->count - 1) % queue_capacity;
@@ -235,13 +250,23 @@ extern "C" UINT64 WINAPI get_xapu_dequeued_id(UINT32 index)
     return index < max_records ? dequeued_ids[index] : 0;
 }
 
+extern "C" UINT32 WINAPI get_xapu_refused_output_count(void)
+{
+    return refused_outputs;
+}
+
+extern "C" UINT64 WINAPI get_xapu_refused_output(UINT32 index)
+{
+    return index < max_records ? refused_output_values[index] : 0;
+}
+
 extern "C" void WINAPI reset_xapu_records(void)
 {
     AcquireSRWLockExclusive(&lock);
     for (auto& client : clients)
         client = {};
-    connects = disconnects = enqueued = dequeued = refused = calls = 0;
+    connects = disconnects = enqueued = dequeued = refused = calls = refused_outputs = 0;
     for (int i = 0; i < max_records; ++i)
-        enqueued_ids[i] = dequeued_ids[i] = 0;
+        enqueued_ids[i] = dequeued_ids[i] = refused_output_values[i] = 0;
     ReleaseSRWLockExclusive(&lock);
 }
