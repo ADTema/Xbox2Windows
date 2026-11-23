@@ -439,6 +439,58 @@ uint narrow16(float value) {
 """
 
 
+DIV_FMAS_HELPERS = """// v_div_fmas_f32: fused multiply-add with conditional 2^32 scale when condition is true.
+// Double-precision 2Sum tracks which side of a binary32 midpoint the finite sum lies on.
+// Scaling is applied before conversion to binary32.
+float div_fmas32_core(float s0, float s1, float s2, bool cond, bool clamp_res) {
+    precise double p = (double)s0 * (double)s1;
+    precise double s = p + (double)s2;
+    precise double v = s - p;
+    precise double err = (p - (s - v)) + ((double)s2 - v);
+
+    double scale = cond ? 4294967296.0 : 1.0;
+    precise double s_sc = s * scale;
+    precise double err_sc = err * scale;
+
+    uint u0, u1;
+    asuint(s_sc, u0, u1);
+    uint exp = (u1 >> 20) & 0x7ffu;
+    // Binary32 subnormals retain a fixed 2^-149 spacing. The guard may
+    // move into the high word or become the implicit bit at 2^-150.
+    bool midpoint = false;
+    if (exp >= 873u && exp <= 1150u) {
+        uint discarded = exp < 897u ? 926u - exp : 29u;
+        if (discarded <= 32u) {
+            uint guard = 1u << (discarded - 1u);
+            midpoint = (u0 & (guard | (guard - 1u))) == guard;
+        } else {
+            uint guard = 1u << (discarded - 33u);
+            uint significand_hi = (u1 & 0x000fffffu) | 0x00100000u;
+            midpoint = u0 == 0u && (significand_hi & (guard | (guard - 1u))) == guard;
+        }
+    }
+    if (midpoint && err_sc != 0.0) {
+        if ((s_sc > 0.0 && err_sc > 0.0) || (s_sc < 0.0 && err_sc < 0.0)) {
+            if (++u0 == 0u) ++u1;
+        } else {
+            if (u0-- == 0u) --u1;
+        }
+        s_sc = asdouble(u0, u1);
+    }
+    if (clamp_res) {
+        s_sc = clamp(s_sc, 0.0, 1.0);
+    }
+    return (float)s_sc;
+}
+float div_fmas32(float s0, float s1, float s2, bool cond) {
+    return div_fmas32_core(s0, s1, s2, cond, false);
+}
+float div_fmas32_clamp(float s0, float s1, float s2, bool cond) {
+    return div_fmas32_core(s0, s1, s2, cond, true);
+}
+"""
+
+
 def registers(first, last, count):
     first, last = int(first), int(last)
     if last - first + 1 != count:
@@ -1594,6 +1646,23 @@ def parse_fma_mix(rest):
     if any(hi and not f16 for f16, hi in zip(op_sel, op_sel_hi)):
         raise ValueError("High-half selection requires an f16 operand")
     return operands, op_sel, op_sel_hi, clamp
+
+
+def parse_div_fmas(rest):
+    parts_ = rest.split(", ")
+    if len(parts_) != 3:
+        raise ValueError("Invalid div_fmas operand count")
+    last_op, _, mod_text = parts_[-1].partition(" ")
+    operands = [*parts_[:-1], last_op]
+    clamp = False
+    for mod in mod_text.split():
+        if mod == "clamp":
+            if clamp:
+                raise ValueError("Duplicate clamp modifier")
+            clamp = True
+        else:
+            raise ValueError(f"Unsupported div_fmas modifier {mod}")
+    return operands, clamp
 def dot_word(token, scalar, vector, pending, sample_dest, *, allow_f16=False):
     """Return a 32-bit uint HLSL expression for one VOP3P dot-product source operand."""
     if allow_f16 and token in INLINE_F16:
@@ -3381,6 +3450,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     packed = f"(mix{i}_p & 0x0000ffffu) | (pack16_rne(mix{i}) << 16)"
                 vector[dst] = f"alu{i}"
                 lines.append(f"    precise float alu{i} = asfloat({packed});")
+        elif re.fullmatch(r"v_fma_f16(?:_e64)? .+", line):
+            raise ValueError("Unverified v_fma_f16 binary16 FMA semantics")
+        elif re.fullmatch(r"v_div_scale_f32(?:_e64)? .+", line):
+            raise ValueError("Unverified v_div_scale_f32 prescaling and VCC semantics")
+        elif m := match(r"v_div_fmas_f32(?:_e64)? (v\d+), (.+)"):
+            dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid div_fmas operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, clamp = parse_div_fmas(rest)
+            condition = scalar.get("vcc")
+            if condition is None:
+                condition = scalar.get("vcc_lo")
+            if condition is None or not isinstance(condition, tuple) or condition[0] != "condition":
+                raise ValueError("Divide FMA requires a tracked VCC condition")
+            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
+            helpers.add("div_fmas32")
+            func = "div_fmas32_clamp" if clamp else "div_fmas32"
+            expr = f"{func}({values[0]}, {values[1]}, {values[2]}, {condition[1]})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expr};")
         elif m := match(r"(v_dot2_f32_f16|v_dot2_i32_i16|v_dot2_u32_u16|v_dot4_i32_i8|v_dot4_u32_u8|v_dot8_i32_i4|v_dot8_u32_u4) (v\d+), (.+)"):
             op, dst, rest = m.groups()
             if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
@@ -3681,6 +3772,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
+        if "div_fmas32" in helpers:
+            defs.append(DIV_FMAS_HELPERS)
         if helpers & {"cvt_u32_f32", "cvt_i32_f32"}:
             defs.append((Path(__file__).resolve().parents[1] / "src/ffx_float_to_int.hlsli").read_text())
         lines[:0] = defs

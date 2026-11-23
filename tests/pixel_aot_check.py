@@ -3016,6 +3016,20 @@ def check_scalar_select64_draw(directory, compiler, renderer, backend):
     run_pixel_batch(renderer, backend, shader, scc_cases)
 
 
+def valu_div_fmas_program():
+    return with_constants([
+        "v_mov_b32_e32 v19, 2.0",
+        "v_mov_b32_e32 v20, 4.0",
+        "v_mov_b32_e32 v21, v19",
+        "v_cmp_lt_f32 vcc_lo, 1.0, 0",
+        "v_div_fmas_f32 v12, v21, 0.5, 1.0",
+        "v_div_fmas_f32 v13, v21, 0.5, 1.0 clamp",
+        "v_cmp_lt_f32 vcc_lo, 0, 1.0",
+        "v_div_fmas_f32 v14, 1.0, 2.0, 3.0",
+        "v_div_fmas_f32 v15, 0x00800000, 0.5, 0",
+    ])
+
+
 SCALAR64_SETS = (
     # (a_lo, a_hi, b_lo, b_hi, sh_lo, sh_hi, bfm_w, bfm_off, bfe_src, bfe_ctrl_a, bfe_ctrl_b, alt)
     (0x89abcdef, 0x91234567, 0x55aa55aa, 0x7fffffff, 5, 37, 12, 28, 0x9a345f50, 0x00080004, 0x00100018, 0x55aa55aa),
@@ -8766,6 +8780,119 @@ def check_controls(directory):
     must_reject(translate, with_constants(["v_madak_f32_dpp v12, v13, v14, 0x3e800000 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf"]))
     must_reject(translate, with_constants(["v_madmk_f32_sdwa v12, v13, 0x3e800000, v14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"]))
 
+    # 3-operand vector float math: v_div_fmas_f32 and rejection of unverified v_fma_f16 / v_div_scale_f32
+    for opcode in ("v_fma_f16", "v_fma_f16_e64"):
+        for insn in (
+            f"{opcode} v22, v19, v20, v21",
+            f"{opcode} v22, v19, v20, v21 op_sel:[0,0,0]",
+            f"{opcode} v22, v19, v20, v21 clamp",
+        ):
+            try:
+                translate(with_constants([insn]))
+            except ValueError as error:
+                assert "Unverified v_fma_f16" in str(error), error
+            else:
+                raise AssertionError(f"Unverified {insn} was accepted")
+
+    # Rounding controls for binary16: independent case where RNE and RTZ differ.
+    val_diff = 1.0 + 2.0 ** -11 + 2.0 ** -12
+    rne_packed = struct.unpack("<H", struct.pack("<e", val_diff))[0]
+    rtz_packed = struct.unpack("<H", struct.pack("<e", half_rtz(val_diff)))[0]
+    assert rne_packed == 0x3c01 and rtz_packed == 0x3c00
+    assert rne_packed != rtz_packed
+
+    # Fused-half halfway case distinguishing single rounding to binary16 from rounding to float32 first:
+    # a = 0x3c69 (1.1025390625), b = 0x3faa (1.916015625), c = 0x89d1 (-0.00017750263214111328).
+    # Exact a * b + c = 2.11230456829071044921875.
+    # Midpoint between 0x4039 (2.111328125) and 0x403a (2.11328125) is exactly 2.1123046875.
+    # Single rounding to binary16 rounds down to 0x4039.
+    # Intermediate rounding to float32 produces 2.1123046875 (0x40073000), which lands exactly on
+    # the halfway tie and rounds up to even mantissa 0x403a.
+    a_f16 = half_value(0x3c69)
+    b_f16 = half_value(0x3faa)
+    c_f16 = half_value(0x89d1)
+    exact_fma = a_f16 * b_f16 + c_f16
+    single_rounded_f16 = struct.unpack("<H", struct.pack("<e", exact_fma))[0]
+    float32_intermediate = struct.unpack("<f", struct.pack("<f", exact_fma))[0]
+    double_rounded_f16 = struct.unpack("<H", struct.pack("<e", float32_intermediate))[0]
+    assert single_rounded_f16 == 0x4039
+    assert double_rounded_f16 == 0x403a
+    assert single_rounded_f16 != double_rounded_f16
+
+    div_source = translate(valu_div_fmas_program())
+    assert div_source.count("float div_fmas32(") == 1
+    assert "div_fmas32" not in translate(assembly(False))
+    assert "4294967296.0" in div_source
+    # v_div_fmas_f32 scaling boundary: intermediate subnormal value (2^-127) before multiplying by 2^32.
+    assert "asfloat(8388608u)" in div_source or "asfloat(0x00800000u)" in div_source
+    s0_bound = struct.unpack("<f", struct.pack("<I", 0x00800000))[0]
+    inter_fma = s0_bound * 0.5
+    assert 0 < inter_fma < 2.0 ** -126
+    scaled_fma = inter_fma * (2.0 ** 32)
+    assert scaled_fma == 2.0 ** -95
+
+    # Cancellation check: (1 + 2^-23) * (1 - 2^-23) - 1.0 = -2^-46
+    s0_cancel = struct.unpack("<f", struct.pack("<I", 0x3f800001))[0]
+    s1_cancel = struct.unpack("<f", struct.pack("<I", 0x3f7ffffe))[0]
+    s2_cancel = struct.unpack("<f", struct.pack("<I", 0xbf800000))[0]
+    f32_cancel = struct.unpack("<f", struct.pack("<f", s0_cancel * s1_cancel))[0]
+    assert f32_cancel == 1.0 and f32_cancel + s2_cancel == 0.0  # unfused float32 rounds to 1.0
+    cancel_exact = s0_cancel * s1_cancel + s2_cancel  # double maintains exact product + addend
+    assert cancel_exact == -(2.0 ** -46)
+    assert struct.unpack("<I", struct.pack("<f", cancel_exact))[0] == 0xa8800000
+    cancel_scaled = cancel_exact * (2.0 ** 32)
+    assert cancel_scaled == -(2.0 ** -14)
+    assert struct.unpack("<I", struct.pack("<f", cancel_scaled))[0] == 0xb8800000
+
+    # Pre-scale underflow check: 2^-126 * 2^-25 = 2^-151 (underflows float32 to 0.0 before scale)
+    s0_under = struct.unpack("<f", struct.pack("<I", 0x00800000))[0]
+    s1_under = struct.unpack("<f", struct.pack("<I", 0x33000000))[0]
+    f32_under = struct.unpack("<f", struct.pack("<f", s0_under * s1_under))[0]
+    assert f32_under == 0.0  # intermediate underflow in float32
+    under_scaled = (s0_under * s1_under) * (2.0 ** 32)  # double preserves 2^-151, scaling to 2^-119
+    assert under_scaled == 2.0 ** -119
+    assert struct.unpack("<I", struct.pack("<f", under_scaled))[0] == 0x04000000
+
+    # Midpoint double-rounding check: exact product 1.5 + 3*2^-24, addend -2^-100.
+    # The exact sum is strictly less than midpoint, rounding down to 0x3fc00001 (unscaled)
+    # and 0x4fc00001 (scaled by 2^32), whereas uncorrected double rounding yields 0x3fc00002 / 0x4fc00002.
+    s0_mid = struct.unpack("<f", struct.pack("<I", 0x3f800001))[0]
+    s1_mid = struct.unpack("<f", struct.pack("<I", 0x3fc00000))[0]
+    s2_mid = struct.unpack("<f", struct.pack("<I", 0x8d800000))[0]
+    p_mid = s0_mid * s1_mid
+    s_mid = p_mid + s2_mid
+    v_mid = s_mid - p_mid
+    err_mid = (p_mid - (s_mid - v_mid)) + (s2_mid - v_mid)
+    assert err_mid < 0.0
+    for opcode in ("v_div_scale_f32", "v_div_scale_f32_e64"):
+        for denominator, numerator in (("1.0", "0x71800000"), ("0", "1.0"),
+                                       ("0x00800000", "1.0"), ("1.0", "1.0")):
+            program = uncompressed_export([
+                f"v_mov_b32_e32 v19, {denominator}",
+                f"v_mov_b32_e32 v20, {numerator}",
+                f"{opcode} v12, vcc_lo, v19, v19, v20",
+                "v_cndmask_b32_e64 v13, 0, 1.0, vcc_lo",
+            ])
+            try:
+                translate(program)
+            except ValueError as error:
+                assert "Unverified v_div_scale_f32" in str(error), error
+            else:
+                raise AssertionError("Unverified division prescaling was accepted")
+
+    for bad in (
+        "v_div_scale_f32 v21, vcc_lo, v19, v20",
+        "v_div_scale_f32 s21, vcc_lo, v19, v20, v19",
+        "v_div_scale_f32 v21, v22, v19, v20, v19",
+        "v_div_fmas_f32 v12, v19, v20, v21",
+        "v_div_fmas_f32 v12, v19, v20, v21 clamp clamp",
+        "v_div_fmas_f32 v12, v19, v20, v21 op_sel:[1,0,0]",
+        "v_div_fmas_f32 v12, v19, v20",
+        "v_div_fmas_f32 s12, v19, v20, v21",
+        "v_div_fmas_f32 v256, v19, v20, v21",
+    ):
+        must_reject(translate, with_constants([bad]))
+
     # 64-bit scalar ALU and BFE controls.
     for op in SCALAR_BFE64_OPS:
         bfe = scalar_bfe64(op)
@@ -10601,6 +10728,109 @@ def check_valu_int32_draw(directory, compiler, renderer, backend):
         case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
         cases_c.append((case, status))
     run_pixel_batch(renderer, backend, cso_c, cases_c)
+
+
+def check_valu_div_fmas_draw(directory, compiler, renderer, backend):
+    """Draw v_div_fmas_f32 forms through integer readback target, testing VCC true/false,
+    runtime constant inputs, FMA cancellation, pre-scale underflow, and subnormal scale boundary."""
+    src = directory / "valu_div_fmas.hlsl"
+    cso = directory / "valu_div_fmas.cso"
+    prog = uncompressed_export([
+        "v_cmp_lt_f32 vcc_lo, 1.0, 0",              # VCC = false
+        "v_div_fmas_f32 v12, s44, s45, s46",        # VCC = false, unscaled
+        "v_div_fmas_f32 v13, s44, s45, s46 clamp",  # VCC = false, clamped
+        "v_cmp_lt_f32 vcc_lo, 0, 1.0",              # VCC = true
+        "v_div_fmas_f32 v14, s44, s45, s46",        # VCC = true, scaled
+        "v_div_fmas_f32 v15, s44, s45, s46 clamp",  # VCC = true, clamped
+    ])
+    src.write_text(lower(prog, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                         integer_export=True), encoding="ascii")
+    compile_shader(compiler, src, cso)
+
+    cases = []
+    # (name, (s44, s45, s46), (v12, v13, v14, v15), status)
+    for name, inputs, words, status in (
+        # Oracle mismatch controls:
+        ("oracle-mismatch-cancel", (0x3f800001, 0x3f7ffffe, 0xbf800000), (0, 0, 0, 0), "mismatch"),
+        ("oracle-mismatch-underflow", (0x00800000, 0x33000000, 0x00000000), (0, 0, 0, 0), "mismatch"),
+        ("oracle-mismatch-midpoint", (0x3f800001, 0x3fc00000, 0x8d800000), (0x3fc00002, 0x3f800000, 0x4fc00002, 0x3f800000), "mismatch"),
+        # Midpoint single-rounding: exact sum 1.5 + 3*2^-24 - 2^-100 rounds down to 0x3fc00001 / 0x4fc00001
+        ("midpoint", (0x3f800001, 0x3fc00000, 0x8d800000), (0x3fc00001, 0x3f800000, 0x4fc00001, 0x3f800000), "pass"),
+        # Cancellation: exact product plus addend is -2^-46
+        ("cancel", (0x3f800001, 0x3f7ffffe, 0xbf800000), (0xa8800000, 0x00000000, 0xb8800000, 0x00000000), "pass"),
+        # An exact product of 2^-150 minus 2^-196 falls short of increasing the odd subnormal.
+        ("subnormal-low-word", (0x1a000001, 0x19fffffe, 0x00400001),
+         (0x00400001, 0x00400001, 0x10000003, 0x10000003), "pass"),
+        ("subnormal-high-word", (0x1a000001, 0x19fffffe, 0x00040001),
+         (0x00040001, 0x00040001, 0x0e000030, 0x0e000030), "pass"),
+        # Pre-scale underflow: 2^-126 * 2^-25 = 2^-151 before scale, 2^-119 after scale
+        ("underflow", (0x00800000, 0x33000000, 0x00000000), (0x00000000, 0x00000000, 0x04000000, 0x04000000), "pass"),
+        # Scale boundary: 2^-126 * 0.5 = 2^-127 intermediate subnormal, 2^-95 after scale
+        ("boundary", (0x00800000, 0x3f000000, 0x00000000), (0x00400000, 0x00400000, 0x10000000, 0x10000000), "pass"),
+        # Normal arithmetic: 2.0 * 0.5 + 1.0 = 2.0
+        ("normal", (0x40000000, 0x3f000000, 0x3f800000), (0x40000000, 0x3f800000, 0x50000000, 0x3f800000), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<3I", constants, 12, *inputs)
+        case = directory / f"valu-div-fmas-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+    run_pixel_batch(renderer, backend, cso, cases)
+
+    # Negative control 1: omit the 2^32 scale on VCC=true.
+    mut_src1 = directory / "valu_div_fmas_mut_no_scale.hlsl"
+    mut_cso1 = directory / "valu_div_fmas_mut_no_scale.cso"
+    hlsl_text = src.read_text(encoding="ascii")
+    mut_hlsl1 = hlsl_text.replace("double scale = cond ? 4294967296.0 : 1.0;", "double scale = 1.0;")
+    assert mut_hlsl1 != hlsl_text
+    mut_src1.write_text(mut_hlsl1, encoding="ascii")
+    compile_shader(compiler, mut_src1, mut_cso1)
+    underflow_case = directory / "valu-div-fmas-underflow.case"
+    wrong1 = subprocess.run([renderer, backend, "--check-pixel-case", mut_cso1, underflow_case],
+                            capture_output=True, text=True)
+    if wrong1.returncode != 1 or "pixel_mismatch" not in wrong1.stderr:
+        raise AssertionError("Omitting 2^32 scale on VCC=true escaped detection")
+
+    # Negative control 2: early float32 rounding / unfused mad.
+    mut_src2 = directory / "valu_div_fmas_mut_unfused.hlsl"
+    mut_cso2 = directory / "valu_div_fmas_mut_unfused.cso"
+    mut_hlsl2 = hlsl_text.replace("return (float)s_sc;",
+                                  "return (float)(cond ? (asfloat(0x4f800000u) * mad(s0, s1, s2)) : mad(s0, s1, s2));")
+    assert mut_hlsl2 != hlsl_text
+    mut_src2.write_text(mut_hlsl2, encoding="ascii")
+    compile_shader(compiler, mut_src2, mut_cso2)
+    cancel_case = directory / "valu-div-fmas-cancel.case"
+    wrong2 = subprocess.run([renderer, backend, "--check-pixel-case", mut_cso2, cancel_case],
+                            capture_output=True, text=True)
+    if wrong2.returncode != 1 or "pixel_mismatch" not in wrong2.stderr:
+        raise AssertionError("Unfused mad / premature float32 rounding escaped detection")
+
+    # Negative control 3: double rounding without 2Sum midpoint correction.
+    mut_src3 = directory / "valu_div_fmas_mut_double_round.hlsl"
+    mut_cso3 = directory / "valu_div_fmas_mut_double_round.cso"
+    mut_hlsl3 = hlsl_text.replace("if (midpoint && err_sc != 0.0)", "if (false)")
+    assert mut_hlsl3 != hlsl_text
+    mut_src3.write_text(mut_hlsl3, encoding="ascii")
+    compile_shader(compiler, mut_src3, mut_cso3)
+    for label in ("midpoint", "subnormal-low-word", "subnormal-high-word"):
+        midpoint_case = directory / f"valu-div-fmas-{label}.case"
+        wrong3 = subprocess.run([renderer, backend, "--check-pixel-case", mut_cso3, midpoint_case],
+                                capture_output=True, text=True)
+        if wrong3.returncode != 1 or "pixel_mismatch" not in wrong3.stderr:
+            raise AssertionError(f"Double-rounding midpoint error escaped detection: {label}")
+
+    # Negative control 4: flush intermediate subnormal to zero before scaling (ftz).
+    mut_src4 = directory / "valu_div_fmas_mut_ftz.hlsl"
+    mut_cso4 = directory / "valu_div_fmas_mut_ftz.cso"
+    mut_hlsl4 = hlsl_text.replace("precise double s = p + (double)s2;",
+                                  "precise double s = (abs(p + (double)s2) < asfloat(0x00800000u)) ? 0.0 : (p + (double)s2);")
+    assert mut_hlsl4 != hlsl_text
+    mut_src4.write_text(mut_hlsl4, encoding="ascii")
+    compile_shader(compiler, mut_src4, mut_cso4)
+    wrong4 = subprocess.run([renderer, backend, "--check-pixel-case", mut_cso4, underflow_case],
+                            capture_output=True, text=True)
+    if wrong4.returncode != 1 or "pixel_mismatch" not in wrong4.stderr:
+        raise AssertionError("Flushing intermediate subnormal before scale escaped detection")
 
 
 # v_cvt_f32_u32_e32 and v_cvt_f32_i32_e32 convert one 32-bit word to binary32, reading it unsigned
@@ -12866,7 +13096,7 @@ def main():
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
                     "draw-mac-legacy", "draw-carry-out", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmp64"):
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-div-fmas", "draw-cmp64"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -12890,6 +13120,7 @@ def main():
                         "draw-title-loads": check_title_load_draws,
                         "draw-ds-swizzle": check_ds_swizzle_draw,
                         "draw-exec-regions": check_masked_draw,
+                        "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
