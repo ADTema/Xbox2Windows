@@ -4074,6 +4074,34 @@ Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer una
   `64,64,64,64` in four runs on the RX 6500 and passed on WARP
   10.0.26100.10068. These measurements leave the cause open.
 
+#### AMD and Intel divergent array-atomic measurements (#369)
+
+The direct probe and explicit waterfall are separate measurements; the direct probe remains strict and the ordinary title-address write path is unchanged. On an AMD Radeon RX 9070 XT (`1002:7550`), the direct probe returned `256,256,256,256` instead of `64,64,64,64` in six runs on two driver versions (2 on `32.0.31035.1003` and 4 on `32.0.31044.16`). Earlier reports on `32.0.32015.7029` and `32.0.32029.2010` recorded the same result. The title-address fixture still reported zero mismatches. The explicit waterfall returned `64,64,64,64` in 3/3 runs; WARP 10.0.26100.9818 returned `64,64,64,64` for both the direct probe and waterfall. The RX 9060 XT independently showed the same direct result and an exact waterfall. These AMD results are distinct from the Intel signature below. [RX 9070 XT driver runs](https://github.com/R0Y00/Xbox2Windows/issues/369#issuecomment-7113579438) · [RX 9070 XT waterfall and ISA](https://github.com/R0Y00/Xbox2Windows/issues/369#issuecomment-7114124208) · [RX 9060 XT waterfall](https://github.com/R0Y00/Xbox2Windows/issues/369#issuecomment-7072945852)
+
+For the RX 9070 XT ISA comparison, the inputs were the `dev` build's `ProbeArrayAtomics.cso` and `ProbeArrayAtomicsWaterfall.cso` (commit `1ccc326`, DXC 1.8.2502.11), analyzed with Radeon GPU Analyzer 2.15.0.30 in DX12 mode on `gfx1201`, using the installed RX 9070 XT driver 32.0.31044.16 on Windows 11 build 26300.9974:
+
+```powershell
+rga.exe -s dx12 -c gfx1201 --cs-blob out\build\dev\ProbeArrayAtomics.cso --isa ProbeArrayAtomics.isa
+rga.exe -s dx12 -c gfx1201 --cs-blob out\build\dev\ProbeArrayAtomicsWaterfall.cso --isa ProbeArrayAtomicsWaterfall.isa
+```
+
+In the direct-probe ISA, the wave active-lane count is taken before the non-uniform resource loop narrows `EXEC`; the resulting whole-wave count is the atomic operand at each loop iteration. In the waterfall ISA, the lane count is taken inside that loop, after narrowing. This matches the direct `256,256,256,256` and waterfall `64,64,64,64` runtime readbacks, but it is an ISA observation from RGA's compiler-blob pipeline, not a capture of the exact runtime pipeline. Matching the ISA to runtime behavior, and any explanation of the underlying cause, remain inference rather than a confirmed project root cause.
+
+Intel is a separate observation. On Intel UHD Graphics (`8086:468B`, driver 32.0.101.7092; Windows 11 build 26300.10075; MSVC 19.44.35230, Windows SDK 10.0.26100, DXC 1.9.2602.17; debug layer unavailable), the direct probe returned `256,192,128,64` in 3/3 runs, while the explicit waterfall returned `64,64,64,64` in 3/3 runs and the title-address fixture had zero mismatches. In separate local-only width instrumentation, the reported wave width was 16 in 15/15 runs: `id % rangeCount` retained the staircase, `(id / 16) % rangeCount` gave `64,64,64,64`, and `(id / 8) % rangeCount` gave `128,64,128,64`. This instrumentation was local to the Intel study. [Intel paired runs and wave-width instrumentation](https://github.com/R0Y00/Xbox2Windows/issues/369#issuecomment-7107139741)
+
+Runtime commands, run from the build directory (the direct hardware probe intentionally fails on the reported AMD and Intel signatures):
+
+```powershell
+$env:XBOX2WINDOWS_ADAPTER = 'RX 9070 XT' # or 'Intel' for the Intel adapter
+.\offscreen_check.exe hardware --gpu-alias-lookup-writes
+.\offscreen_check.exe hardware --gpu-alias-atomic-waterfall
+Remove-Item Env:XBOX2WINDOWS_ADAPTER
+.\offscreen_check.exe warp --gpu-alias-lookup-writes
+.\offscreen_check.exe warp --gpu-alias-atomic-waterfall
+```
+
+The RGA result covers one AMD device, driver and compiler-blob pipeline; it does not establish behavior for other driver versions, the Intel compiler, or Windows 10 WARP. No local width instrumentation or RGA ISA dump was added to the repository; this note records measurements only.
+
 The wave diagnostic is run explicitly, with the same dispatch sizes, resource
 setup and readback as the direct probe. Run both from the build directory:
 
