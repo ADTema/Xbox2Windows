@@ -16326,6 +16326,15 @@ def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend
         raise AssertionError("RGB sample with an overwritten alpha register escaped detection")
 
 
+def check_core_vector_draws(directory, compiler, renderer, backend):
+    check_dpp_int32_draw(directory, compiler, renderer, backend)
+    check_dpp_draw(directory, compiler, renderer, backend)
+    check_vop3p_draw(directory, compiler, renderer, backend)
+    check_bitwise_draw(directory, compiler, renderer, backend)
+    check_fma_mix_draw(directory, compiler, renderer, backend)
+    check_dot_draw(directory, compiler, renderer, backend)
+
+
 def check_render(directory, compiler, renderer, backend, *, core_only=False):
     for swap in (False, True):
         source = directory / "fixture.hlsl"
@@ -16340,12 +16349,8 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
             wrong = subprocess.run([*draw, "rgba"], capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("The renderer failed to detect the changed channel order")
-    check_dpp_int32_draw(directory, compiler, renderer, backend)
-    check_dpp_draw(directory, compiler, renderer, backend)
-    check_vop3p_draw(directory, compiler, renderer, backend)
-    check_bitwise_draw(directory, compiler, renderer, backend)
-    check_fma_mix_draw(directory, compiler, renderer, backend)
-    check_dot_draw(directory, compiler, renderer, backend)
+    if not core_only:
+        check_core_vector_draws(directory, compiler, renderer, backend)
     check_pk_int16_draw(directory, compiler, renderer, backend)
     check_narrow_draw(directory, compiler, renderer, backend)
     check_mode_register_draw(directory, compiler, renderer, backend)
@@ -17942,6 +17947,13 @@ def main():
         if mode == "draw-comparisons":
             try:
                 return check_comparison_draws(directory, *args)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
+                    return 77
+                raise
+        if mode == "draw-core-vector":
+            try:
+                return check_core_vector_draws(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
                     return 77

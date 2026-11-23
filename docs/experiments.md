@@ -3318,6 +3318,32 @@ comparison and class draws (`v_cmp_*` f16, i16, i32, u32 and SDWA groups and
 references and expected-mismatch controls are unchanged; only the CTest entry
 that runs them moved.
 
+The `draw-core` entry was also close to its 60 s limit on an RTX 3050 Laptop
+GPU (56–58.5 s in the runs reported on #448). Its DPP, VOP3P, bitwise, FMA-mix
+and dot-product draws now run as the separate `draw-core-vector` mode,
+registered as `pixel_aot_core_vector_{hardware,warp}`. The six existing draw
+helpers, their cases and expected-mismatch controls are unchanged; the original
+entry retains the other core draws. Both entries keep the 60 s timeout and
+write separate form-coverage records. To run both entries on each adapter:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_(hardware|warp|core_vector_(hardware|warp))$' -V
+```
+
+On Windows build 26300, the WARP adapter (driver 10.0.26100.10068, debug
+layer enabled) passed the two WARP entries in 32.93 and 9.95 seconds
+(42.94 seconds total):
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_(warp|core_vector_warp)$' -V
+```
+
+A trace of the pre-split `draw-core` run and the two post-split selections
+matched all 72 renderer calls and 70 DXC calls, including shader and case
+hashes and per-case outcomes. The union of the two new coverage records matched
+the original 710 forms. This establishes equivalent selected work on WARP, not
+physical-adapter timeout headroom.
+
 The first raw buffer_load_dword path remains a proposal while
 [issue #319](https://github.com/R0Y00/Xbox2Windows/issues/319) is open. The
 [binding contract](pixel_mubuf_contract.md) records the separate DW0/DW1
