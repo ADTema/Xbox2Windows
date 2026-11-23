@@ -2,6 +2,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <string_view>
@@ -182,12 +183,171 @@ int run(bool warp)
     return bad_before == 0 && bad_after == 0 && missed_new_before_remap == words &&
            check(device->GetDeviceRemovedReason(), "Device removal status") ? 0 : 1;
 }
+
+struct SectionPage {
+    HANDLE section = nullptr;
+    std::uint32_t* canonical = nullptr;
+    ComPtr<ID3D12Heap> heap;
+    ComPtr<ID3D12Resource> staging;
+
+    ~SectionPage()
+    {
+        staging.Reset();
+        heap.Reset();
+        if (canonical) UnmapViewOfFile(canonical);
+        if (section) CloseHandle(section);
+    }
+
+    HRESULT init(ID3D12Device3* device)
+    {
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                     static_cast<DWORD>(tile_bytes), nullptr);
+        if (!section) return HRESULT_FROM_WIN32(GetLastError());
+        canonical = static_cast<std::uint32_t*>(MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, tile_bytes));
+        if (!canonical) return HRESULT_FROM_WIN32(GetLastError());
+        const HRESULT result = device->OpenExistingHeapFromFileMapping(section, IID_PPV_ARGS(&heap));
+        if (FAILED(result)) return result;
+        auto desc = buffer_desc();
+        desc.Width = tile_bytes;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        return device->CreatePlacedResource(heap.Get(), 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                            IID_PPV_ARGS(&staging));
+    }
+};
+
+// Own the adjacent CPU views. Their addresses are in logical order while the
+// section handles used to create them are in the opposite order.
+struct SectionWindow {
+    HANDLE process = GetCurrentProcess();
+    std::uint8_t* base = nullptr;
+    bool split = false;
+    unsigned mapped = 0;
+
+    bool init(const std::array<SectionPage*, 2>& page_order)
+    {
+        base = static_cast<std::uint8_t*>(VirtualAlloc2(process, nullptr, 2 * tile_bytes,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+        if (!base) return false;
+        split = VirtualFree(base, tile_bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
+        if (!split) return false;
+        for (auto* page : page_order) {
+            auto* address = base + mapped * tile_bytes;
+            if (MapViewOfFile3(page->section, process, address, 0, tile_bytes, MEM_REPLACE_PLACEHOLDER,
+                               PAGE_READWRITE, nullptr, 0) != address) return false;
+            ++mapped;
+        }
+        return true;
+    }
+
+    ~SectionWindow()
+    {
+        for (unsigned i = 0; i < mapped; ++i) {
+            UnmapViewOfFile2(process, base + i * tile_bytes, MEM_PRESERVE_PLACEHOLDER);
+        }
+        if (base) VirtualFree(base, 0, MEM_RELEASE);
+        if (split) VirtualFree(base + tile_bytes, 0, MEM_RELEASE);
+    }
+};
+
+int provenance(bool warp)
+{
+    constexpr UINT span_words = 1024;
+    constexpr UINT half_words = span_words / 2;
+    constexpr UINT64 span_bytes = span_words * sizeof(std::uint32_t);
+    constexpr UINT64 half_bytes = span_bytes / 2;
+    constexpr UINT64 logical_offset = tile_bytes - half_bytes;
+    constexpr std::uint32_t changed = 0xa5a5a5a5u;
+    bool unmatched = false;
+    const auto base = create_device(warp, unmatched);
+    if (unmatched) return 1;
+    ComPtr<ID3D12Device3> device;
+    if (!base || FAILED(base.As(&device))) return 77;
+
+    std::array<SectionPage, 2> pages;
+    for (unsigned token = 0; token < pages.size(); ++token) {
+        const HRESULT result = pages[token].init(device.Get());
+        if (result == E_NOTIMPL || result == DXGI_ERROR_UNSUPPORTED) {
+            std::puts("Section-backed D3D12 buffers are unavailable");
+            return 77;
+        }
+        if (!check(result, "Create a D3D12 buffer over a CPU section")) return 1;
+        for (UINT word = 0; word < words; ++word) pages[token].canonical[word] = pattern(token, word);
+    }
+    const std::array<SectionPage*, 2> mapped_pages{&pages[1], &pages[0]};
+    SectionWindow window;
+    if (!window.init(mapped_pages)) {
+        std::fprintf(stderr, "Map permuted CPU pages failed: %lu\n", GetLastError());
+        return 1;
+    }
+    auto* source = reinterpret_cast<volatile std::uint32_t*>(window.base + logical_offset);
+    std::array<std::uint32_t, span_words> expected;
+    for (UINT i = 0; i < half_words; ++i) {
+        expected[i] = pattern(1, words - half_words + i);
+        expected[half_words + i] = pattern(0, i);
+    }
+    for (UINT i = 0; i < span_words; ++i) {
+        if (source[i] != expected[i]) {
+            std::fprintf(stderr, "CPU source provenance mismatch at word %u\n", i);
+            return 1;
+        }
+    }
+
+    Queue direct;
+    ComPtr<ID3D12Resource> destination, readback;
+    auto desc = buffer_desc();
+    desc.Width = span_bytes;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (!direct.init(device.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT) ||
+        !check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                               IID_PPV_ARGS(&destination)), "Create GPU destination")) return 1;
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    if (!check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&readback)), "Create GPU readback")) return 1;
+
+    UINT64 serial = 0;
+    const auto capture = [&](bool upload, std::uint32_t change_mask, const char* label) {
+        ComPtr<ID3D12GraphicsCommandList> transfer, read;
+        if (upload) {
+            if (!check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, direct.allocator.Get(),
+                                                  nullptr, IID_PPV_ARGS(&transfer)), "Create transfer list")) return false;
+            transfer->CopyBufferRegion(destination.Get(), 0, mapped_pages[0]->staging.Get(), logical_offset, half_bytes);
+            transfer->CopyBufferRegion(destination.Get(), half_bytes, mapped_pages[1]->staging.Get(), 0, half_bytes);
+            if (!check(transfer->Close(), "Close transfer list")) return false;
+            direct.execute(transfer.Get());
+        }
+        if (!record_copy(device.Get(), direct, readback.Get(), 0, destination.Get(), span_bytes, read)) return false;
+        direct.execute(read.Get());
+        if (!check(direct.commands->Signal(direct.fence.Get(), ++serial), "Signal page readback") ||
+            !wait_for_read(direct.fence.Get(), serial)) return false;
+        void* data = nullptr;
+        const D3D12_RANGE range{0, span_bytes}, no_write{};
+        if (!check(readback->Map(0, &range, &data), "Map page readback")) return false;
+        const auto* result = static_cast<const std::uint32_t*>(data);
+        UINT mismatches = 0;
+        for (UINT i = 0; i < span_words; ++i) mismatches += result[i] != (expected[i] ^ change_mask);
+        readback->Unmap(0, &no_write);
+        std::printf("%s: %u/%u mismatches\n", label, mismatches, span_words);
+        return mismatches == 0;
+    };
+
+    if (!capture(true, 0, "cross-page upload in mapped order")) return 1;
+    for (UINT i = 0; i < span_words; ++i) source[i] = expected[i] ^ changed;
+    if (pages[1].canonical[words - half_words] != (expected[0] ^ changed) ||
+        pages[0].canonical[0] != (expected[half_words] ^ changed)) return 1;
+    return capture(false, 0, "GPU keeps its prior snapshot after CPU writes") &&
+           capture(true, changed, "re-upload observes the updated CPU pages") ? 0 : 1;
+}
 } // namespace
 
 int main(int argc, char** argv)
 {
     if (argc != 2) return 1;
     const std::string_view mode(argv[1]);
+    if (mode == "provenance_warp"sv || mode == "provenance_hardware"sv) return provenance(mode == "provenance_warp"sv);
     if (mode != "warp"sv && mode != "hardware"sv) return 1;
     return run(mode == "warp"sv);
 }

@@ -62,6 +62,7 @@ EXPORTS = (
     "op_palignr_69", "op_mpsadbw_6", "op_pshuflw_1b", "op_psllq_imm_129",
     "op_pextrw_reg_2", "op_pextrd_reg_2", "op_pinsrb_reg_upper", "op_pinsrw_reg_3",
     "op_zeroupper_ymm1", "op_movdqu_load128",
+    "op_palignr_255", "op_pmovsxbq_wide_src", "op_zeroupper_ymm2",
 )
 
 ALL_EXPORTS = EXPORTS + ("op_zeroall",)
@@ -423,6 +424,10 @@ def reference(name, a, b, altered=False):
         return a[:16] + ZERO16
     if name == "op_movdqu_load128":
         return a[:16] + ZERO16
+    if name == "op_palignr_255": return ref_palignr(a, b, 255)
+    if name == "op_pmovsxbq_wide_src": return pack_s64(s8s(a)[:2])
+    if name == "op_zeroupper_ymm2":
+        return a[:16] + ZERO16
     raise ValueError(f"unknown export {name}")
 
 
@@ -581,6 +586,9 @@ def inputs_for(name):
         return extend_pairs() + general_pairs()
     if name == "op_pmulhrsw":
         return mulhrsw_pairs() + general_pairs()
+    if name == "op_pmaddwd":
+        min_pair = pad32(struct.pack("<2h12x", -32768, -32768))
+        return general_pairs() + [(min_pair, min_pair)]
     return general_pairs()
 
 
@@ -878,6 +886,9 @@ def check_rejections(original_path):
         ("segment_prefix_pinsr", (ld_xmm1, seg_pinsr, ret_ins), "unsupported instruction prefix"),
         ("missing_ret", (ld_xmm0,), "missing terminal ret"),
         ("after_ret", (ret_ins, ld_xmm0), "unreachable instruction after ret"),
+        ("undef_blend_mask", (ld_xmm1, ld_xmm2, Instruction.create_reg_reg_reg_reg(
+            Code.VEX_VPBLENDVB_XMM_XMM_XMMM128_XMM, R.XMM0, R.XMM1, R.XMM2, R.XMM3), ret_ins),
+         "undefined vector register ymm3"),
     ]
 
     all_unit = [
