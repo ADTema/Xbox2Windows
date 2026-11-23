@@ -2248,7 +2248,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps_flip.h")
     target_include_directories(cpu_shim_draw PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_features(cpu_shim_draw PRIVATE cxx_std_17)
-    target_link_libraries(cpu_shim_draw PRIVATE dxgi d3d12)
+    target_link_libraries(cpu_shim_draw PRIVATE dxgi d3d12 d3d12_xs_shim)
     add_executable(cpu_shim_startup tests/cpu/shim_startup.asm tests/cpu/exe_startup.asm)
     set_target_properties(cpu_shim_startup PROPERTIES LINKER_LANGUAGE CXX)
     target_link_options(cpu_shim_startup PRIVATE /ENTRY:native_startup /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
@@ -2681,6 +2681,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_swap_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_swap_${adapter}.txt")
+        add_test(NAME pixel_aot_cvt_float_int_e64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-cvt-float-int-e64 "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_cvt_float_int_e64_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_cvt_float_int_e64_${adapter}.txt")
         add_test(NAME pixel_aot_e64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-e64 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

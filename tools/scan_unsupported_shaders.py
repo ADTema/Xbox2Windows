@@ -29,8 +29,9 @@ except ImportError:
     parts = None
 
 try:
-    from disasm_rdna2 import FLAT_OPS, GLOBAL_OPS, MTBUF_OPS, MUBUF_OPS, SCRATCH_OPS, disasm_rdna2
+    from disasm_rdna2 import DS_OPS, FLAT_OPS, GLOBAL_OPS, MTBUF_OPS, MUBUF_OPS, SCRATCH_OPS, disasm_rdna2
 except ImportError:
+    DS_OPS = {}
     MTBUF_OPS = {}
     MUBUF_OPS = {}
     FLAT_OPS = {}
@@ -59,6 +60,9 @@ SCALAR64_SOURCE = r"(?:s\[\d+:\d+\]|0x[0-9a-f]{1,8}|-?\d+)"
 F16_PLAIN = r"(?:-?(?:\d+\.\d+|\d+)|0x[0-9a-f]{1,4}|[vs]\d+)"
 F16_MOD = rf"-?(?:\|{F16_PLAIN}\||abs\({F16_PLAIN}\)|{F16_PLAIN})"
 SDWA_SEL_PATTERN = r"(?:BYTE_[0-3]|WORD_[01]|DWORD)"
+CVT_F32_E64_BASE = r"(?:[vs]\d+|0x[0-9a-f]{1,8})"
+CVT_F32_E64_ABS = rf"(?:\|{CVT_F32_E64_BASE}\||abs\({CVT_F32_E64_BASE}\))"
+CVT_F32_E64_SOURCE = rf"(?:neg\((?:{CVT_F32_E64_ABS}|{CVT_F32_E64_BASE})\)|-(?:{CVT_F32_E64_ABS}|[vs]\d+)|{CVT_F32_E64_ABS}|{CVT_F32_E64_BASE})"
 
 WAIT_COUNTER = r"(?:vmcnt\((?:[0-9]|[1-5][0-9]|6[0-3])\)|lgkmcnt\((?:[0-9]|[1-5][0-9]|6[0-3])\)|expcnt\([0-7]\))"
 
@@ -111,6 +115,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_cvt_f32_f16_sdwa\s+v\d+,\s+-?(?:\|[vs]\d+\||[vs]\d+)(?:\s+clamp)?\s+dst_sel:DWORD\s+dst_unused:UNUSED_(?:PAD|PRESERVE)\s+src0_sel:WORD_[01]",
     r"v_cvt_f16_f32(?:_e32|_e64)?\s+v\d+,\s+[^,\s]+",
     r"v_cvt_i32_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",
+    rf"v_cvt_(?:i32|u32)_f32_e64 v\d+, {CVT_F32_E64_SOURCE}",
     r"v_cvt_f32_ubyte[0-3](?:_e32|_e64)?\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_off_f32_i4(?:_e32|_e64)?\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_f32_(?:u32|i32)_e32\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+)",
@@ -265,6 +270,7 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {entry[0] for entry in FLAT_OPS.values()}
     | {entry[0] for entry in GLOBAL_OPS.values()}
     | {entry[0] for entry in SCRATCH_OPS.values()}
+    | {entry[0] for entry in DS_OPS.values()}
     | (set(pixel_aot.HINT_LIMITS) if pixel_aot is not None else set())
     | {
         "s_brev_b64", "s_bfm_b64", "s_bfe_u32", "s_bfe_i32", "s_bfe_u64", "s_bfe_i64",

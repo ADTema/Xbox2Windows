@@ -1020,6 +1020,31 @@ SCALAR = {
 }
 
 
+def parse_cvt_f32_e64_source(token):
+    """Parse a register or hex literal with optional VOP3 neg and abs modifiers.
+
+    Rejects bare `-0x...` because llvm-mc folds integer two's-complement negation on hex
+    literals rather than setting the VOP3 sign-flip modifier (printed as `neg(0x...)`).
+    """
+    neg = False
+    if token.startswith("neg(") and token.endswith(")"):
+        neg = True
+        token = token[4:-1]
+    elif token.startswith("-"):
+        neg = True
+        token = token[1:]
+        if token.startswith("0x"):
+            return None
+    has_abs = False
+    if (token.startswith("|") and token.endswith("|")) or (
+            token.startswith("abs(") and token.endswith(")")):
+        has_abs = True
+        token = token[1:-1] if token.startswith("|") else token[4:-1]
+    if not re.fullmatch(r"[vs]\d+|0x[0-9a-f]{1,8}", token):
+        return None
+    return token, has_abs, neg
+
+
 def fp_operand(token, scalar, vector, pending, sample_dest, *,
                quad_values: dict[str, bool] | None = None, ignore_sign=False):
     if re.fullmatch(r"-\d+", token):
@@ -2887,6 +2912,33 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             helpers.add("cvt_i32_f32")
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat(cvt_i32_f32(asuint({operand})));")
+        elif (m := match(r"v_cvt_(u32|i32)_f32_e64 (v\d+), ([^,\s]+)")) and (
+                parsed := parse_cvt_f32_e64_source(m.group(3))):
+            # VOP3 truncating float-to-int with optional bitwise source abs/neg modifiers.
+            # Apply abs then neg on the raw IEEE-754 word before passing it to the shared
+            # src/ffx_float_to_int.hlsli helper; clamp, omod, decimal/float literals and
+            # FLR/RPI variants remain rejected.
+            kind, dst, _ = m.groups()
+            base, has_abs, has_neg = parsed
+            if int(dst[1:]) > 255 or (base.startswith(("v", "s")) and
+                    int(base[1:]) > (255 if base.startswith("v") else 105)):
+                raise ValueError(f"Invalid {'unsigned' if kind == 'u32' else 'signed'} conversion register")
+            if mask != "entry":
+                raise ValueError("Invalid conversion")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if base.startswith("v") and base not in vector:
+                raise ValueError(f"Unbound pixel input {base} at v_cvt_{kind}_f32_e64")
+            operand = fp_operand(base, scalar, vector, pending, sample_dest)
+            bits = f"asuint({operand})"
+            if has_abs:
+                bits = f"({bits} & 0x7fffffffu)"
+            if has_neg:
+                bits = f"({bits} ^ 0x80000000u)"
+            helper = f"cvt_{kind}_f32"
+            helpers.add(helper)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({helper}({bits}));")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             if dst in sample_dest:
