@@ -9,3 +9,7 @@ EXPORTS
     zero_xorps
     zero_pxor
     zero_xorpd
+    probe_ss
+    neg_jcc
+    setcc_mix
+    cmovcc_mix

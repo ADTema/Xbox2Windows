@@ -7,9 +7,9 @@ The profile accepts:
 - the constant loads FLD1, FLDZ, FLDPI, FLDL2T, FLDL2E, FLDLG2 and FLDLN2;
 - FILD, FISTP and FISTTP with an m16, m32 or m64 integer operand, and FIST with m16 or m32;
 - FCOMI, FCOMIP, FUCOMI and FUCOMIP ST(0), ST(i), which set ZF and CF and clear OF for the integer
-  lowering (PF is not modelled, so a JP or JNP after them is rejected, and so is every other reader of PF);
-- FCMOVB, FCMOVE, FCMOVBE, FCMOVNB, FCMOVNE and FCMOVNBE ST(0), ST(i), which read ZF and CF (FCMOVU
-  and FCMOVNU read PF and stay outside the profile);
+  lowering, and PF in a function with a JP, JNP, FCMOVU or FCMOVNU;
+- FCMOVB, FCMOVE, FCMOVBE, FCMOVNB, FCMOVNE, FCMOVNBE, FCMOVU and FCMOVNU ST(0), ST(i), which read ZF,
+  CF and PF;
 - FCOM and FCOMP with ST(i) or an m32 or m64 operand, FCOMPP, FUCOM and FUCOMP ST(i) and FUCOMPP, which
   set C0, C2 and C3 of the status word, and FNSTSW AX, which copies the status word to AX (see below);
 - FADD, FSUB, FSUBR, FMUL, FDIV and FDIVR with an m32 or m64 operand, with ST(0), ST(i) and with
@@ -18,7 +18,10 @@ The profile accepts:
 - FIADD, FISUB, FISUBR, FIMUL, FIDIV and FIDIVR with an m16 or m32 integer operand, which is converted
   exactly, as FILD converts it, before the arithmetic;
 - FNSTCW m16, which stores the profile's control word 0x027F, and WAIT, which does nothing because
-  every exception is masked, so none can be pending (FSTCW m16 decodes as WAIT and FNSTCW).
+  every exception is masked, so none can be pending (FSTCW m16 decodes as WAIT and FNSTCW);
+- FTST, and FICOM and FICOMP with an m16 or m32 integer, which set C0, C2 and C3 as FCOM does, and FXAM,
+  which sets them from the class of ST(0) (an empty ST(0) is known at translation time; C1 stays unknown);
+- FNOP and FNCLEX, which change nothing the profile models (FCLEX decodes as WAIT and FNCLEX).
 A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status word, and
 must return with the stack empty. The stack depth before every instruction is fixed at translation
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
@@ -32,8 +35,9 @@ source must include before the lowered functions (X87_HEADER).
 Flags and the status word. In a function with an FCMOV, FNSTSW, SAHF, JP or JNP, each status flag that
 any instruction reads must be defined on every path from the entry: the caller's flags are not an input
 of the lowered function, a call leaves them undefined, and ADC, SBB, RCL, RCR and CMC carry an undefined
-CF on into the flags and registers they write. The integer lowering models PF only after SAHF and an
-8-bit TEST or AND, so a reader of PF that another instruction may have written last is rejected. SAHF,
+CF on into the flags and registers they write. The integer lowering models PF only after SAHF, the FCOMI
+family and an 8-bit TEST or AND, so a reader of PF that another instruction may have written last is
+rejected. SAHF,
 JP and JNP are accepted only in such a function. C0, C2 and C3 are known after a comparison into the
 status word and unknown at the entry. FCOMI, FCOMIP, FUCOMI and FUCOMIP leave them as they were, and
 every other x87 instruction leaves them undefined, as the SDM states, including WAIT (so FSTSW AX, which
@@ -68,15 +72,22 @@ IARITHMETIC = {M.FIADD: "x87_add", M.FISUB: "x87_sub", M.FISUBR: "x87_subr", M.F
                M.FIDIV: "x87_div", M.FIDIVR: "x87_divr"}
 # Conditional register moves and the C++ condition each reads from the integer lowering's flags.
 FCMOV = {M.FCMOVB: "carry", M.FCMOVE: "zero", M.FCMOVBE: "carry || zero", M.FCMOVNB: "!carry",
-         M.FCMOVNE: "!zero", M.FCMOVNBE: "!carry && !zero"}
+         M.FCMOVNE: "!zero", M.FCMOVNBE: "!carry && !zero", M.FCMOVU: "parity", M.FCMOVNU: "!parity"}
 X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FLD1, M.FLDZ, M.FLDPI, M.FLDL2T, M.FLDL2E,
                      M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, *FCMOV, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT, M.FLDCW, M.FCOM,
-                     M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW})
+                     M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW, M.FTST, M.FICOM, M.FICOMP,
+                     M.FXAM, M.FNOP, M.FNCLEX})
 # Comparisons into C0, C2 and C3 of the status word; FCOMPP and FUCOMPP pop twice, the other P forms once.
 STATUS_COMPARES = frozenset({M.FCOM, M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP})
 STATUS_POPS = {M.FCOM: 0, M.FCOMP: 1, M.FCOMPP: 2, M.FUCOM: 0, M.FUCOMP: 1, M.FUCOMPP: 2}
+# FICOM and FICOMP compare ST(0) with an m16 or m32 integer, converted exactly as for FILD; FICOMP pops.
+ICOMPARES = {M.FICOM: 0, M.FICOMP: 1}
+# Every instruction that leaves C0, C2 and C3 known: the comparisons, FTST (ST(0) with +0.0) and FXAM.
+STATUS_WRITERS = STATUS_COMPARES | {M.FTST, M.FXAM, *ICOMPARES}
+# C3, C2 and C0 from x87_compare's result: 0 0 1 less, 1 0 0 equal, 0 0 0 greater, 1 1 1 unordered.
+COMPARE_SW = "x87_sw = static_cast<uint16_t>(r == 0 ? 0x0100 : r == 1 ? 0x4000 : r == 3 ? 0x4500 : 0);"
 # Status-word bits: C0, C2 and C3 (the comparison result), and TOP.
 C_BITS = 0x4500
 TOP_BITS = 0x3800
@@ -93,7 +104,7 @@ def declaration(body, checked=None):
     """The x87 locals of a lowered function: the slots, the control word and, in a function that compares
     into the status word or stores it, C0, C2 and C3 of the status word."""
     text = DECLARATION if checked is None else CHECKED_DECLARATION
-    if any(i.mnemonic in STATUS_COMPARES or i.mnemonic == M.FNSTSW for i in body):
+    if any(i.mnemonic in STATUS_WRITERS or i.mnemonic == M.FNSTSW for i in body):
         text += " uint16_t x87_sw = 0; (void)x87_sw;"
     return text
 
@@ -171,6 +182,18 @@ def _effect(i, depth, checked=None):
         raise ValueError(f"unsupported x87 encoding at {i.ip:#x}: {i}")
     if op in (M.FNSTCW, M.WAIT) or (op == M.FLDCW and checked is not None):  # no register stack access
         return depth
+    if op in (M.FNOP, M.FNCLEX, M.FXAM):  # no register stack change; FXAM also classifies an empty ST(0)
+        return depth
+    if op == M.FTST:
+        if depth == 0:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth
+    if op in ICOMPARES:
+        if i.op0_kind != K.MEMORY or i.memory_size not in (S.INT16, S.INT32):
+            raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
+        if depth == 0:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth - ICOMPARES[op]
     if op in (M.FLD, M.FST, M.FSTP) and i.op0_kind == K.REGISTER:  # ST(i) copies
         if depth <= i.op0_register - R.ST0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
@@ -376,8 +399,9 @@ _INFO = InstructionInfoFactory()
 
 
 def assigns_parity(i):
-    """Whether the integer lowering sets PF for i: SAHF, and TEST and AND with an 8-bit destination."""
-    if i.mnemonic == M.SAHF:
+    """Whether the integer lowering sets PF for i: SAHF, the FCOMI family, and TEST and AND with an 8-bit
+    destination."""
+    if i.mnemonic == M.SAHF or i.mnemonic in COMPARES:
         return True
     if i.mnemonic not in (M.TEST, M.AND):
         return False
@@ -451,7 +475,7 @@ def _after(i, s):
         ax = 0xFFFF  # the return value
     else:
         ax |= _ax_access(i)[1]
-    if op in STATUS_COMPARES:
+    if op in STATUS_WRITERS:
         c = C_BITS
     elif op in COMPARES or not (is_x87(i) or call):  # FCOMI and integer instructions leave C0, C2 and C3
         c = s.c
@@ -511,8 +535,8 @@ def check_flags(body, exits):
             raise ValueError(f"{i} at {i.ip:#x} reads {names}, which no instruction defines on every path from "
                              "the entry")
         if i.rflags_read & F.PF and not s.parity:
-            raise ValueError(f"{i} at {i.ip:#x} reads PF, which the integer lowering models only after SAHF "
-                             "and an 8-bit TEST or AND")
+            raise ValueError(f"{i} at {i.ip:#x} reads PF, which the integer lowering models only after SAHF, "
+                             "FCOMI, FCOMIP, FUCOMI, FUCOMIP and an 8-bit TEST or AND")
         unknown = 0xFFFF & ~s.ax
         if not unknown:
             continue
@@ -531,9 +555,10 @@ def check_flags(body, exits):
                                  f"{i.ip:#x} -> {target:#x}")
 
 
-def statement(i, depth, address, checked=None):
+def statement(i, depth, address, checked=None, parity=False):
     """C++ for one profile instruction at a known stack depth; address() gives the memory operand. checked
-    is the Checked entry's error channel, or None for the fixed control word."""
+    is the Checked entry's error channel, or None for the fixed control word. parity is whether the function
+    declares the integer lowering's PF, which the FCOMI family then sets."""
     op = i.mnemonic
     _effect(i, depth, checked)
     top = depth - 1  # ST(k) is x87_slot[top - k]
@@ -547,6 +572,19 @@ def statement(i, depth, address, checked=None):
                 "x87_cw = static_cast<uint16_t>((w & 0x1f3f) | 0x40); }  // fldcw")
     if op == M.WAIT:  # every exception is masked, so none is pending
         return ";  // wait"
+    if op in (M.FNOP, M.FNCLEX):  # the profile keeps no exception flag, so clearing them changes nothing
+        return f";  // {'fnop' if op == M.FNOP else 'fnclex'}"
+    if op == M.FTST:  # ST(0) compared with +0.0
+        return f"{{ const int r = x87_compare(x87_slot[{top}], X87Value{{0, 0}}); {COMPARE_SW} }}  // ftst"
+    if op in ICOMPARES:
+        signed, unsigned, bits = INTEGERS[i.memory_size]
+        name = "ficom" if op == M.FICOM else "ficomp"
+        return (f"{{ const word a = {address()}; const int r = x87_compare(x87_slot[{top}], "
+                f"x87_from_integer(static_cast<{signed}>(load<{unsigned}>(a)))); {COMPARE_SW} }}  // {name} m{bits}")
+    if op == M.FXAM:  # an empty ST(0) is C3 and C0
+        if depth == 0:
+            return "x87_sw = 0x4100;  // fxam, empty"
+        return f"x87_sw = x87_examine(x87_slot[{top}]);  // fxam"
     if op in (M.FLD, M.FST, M.FSTP) and i.op0_kind == K.REGISTER:
         k = i.op0_register - R.ST0
         if op == M.FLD:  # push a copy of ST(k): every encoding is copied as it is
@@ -574,9 +612,10 @@ def statement(i, depth, address, checked=None):
                 "x87_sw = static_cast<uint16_t>(r == 0 ? 0x0100 : r == 1 ? 0x4000 : r == 3 ? 0x4500 : 0); }  "
                 f"// {name}")
     if op in COMPARES:  # ZF and CF: 1 and 0 for equal, 0 and 1 for less, 0 and 0 for greater, 1 and 1 unordered
-        k = top - (i.op1_register - R.ST0)  # OF is always cleared
+        k = top - (i.op1_register - R.ST0)  # OF is always cleared, and PF is 1 only for unordered
         return (f"{{ const int r = x87_compare(x87_slot[{top}], x87_slot[{k}]); "
-                f"zero = r == 1 || r == 3; carry = r == 0 || r == 3; overflow = false; }}")
+                f"{'parity = r == 3; ' if parity else ''}zero = r == 1 || r == 3; carry = r == 0 || r == 3; "
+                "overflow = false; }")
     if op in (M.FILD, M.FIST, M.FISTP, M.FISTTP):
         signed, unsigned, bits = INTEGERS[i.memory_size]
         if op == M.FILD:

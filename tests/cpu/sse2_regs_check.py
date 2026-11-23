@@ -559,8 +559,8 @@ def check_alt_encodings_and_rejections(original_path):
         "cvtsd2si_r10d": "r10 = static_cast<word>(op_cvtsd2si32(xmm1.q[0]))",
         "movnti_r9d": "store32(r8, static_cast<std::uint32_t>(r9))",
         "movnti_r10": "store64(r8, r10)",
-        "lfence_standalone": "atomic_signal_fence",
-        "mfence_standalone": "atomic_signal_fence",
+        "lfence_standalone": "_mm_lfence();",
+        "mfence_standalone": "_mm_mfence();",
         "cmppd_mem_disp": "load128((rdx + 0x10ull))",
         "movhpd_load_disp": ".q[1] = load64((rdx + 0x18ull))",
         "movlpd_store_disp": "store64((r8 + 0x18ull), xmm0.q[0])",
@@ -650,6 +650,15 @@ def check_alt_encodings_and_rejections(original_path):
     seg_load = Instruction.create_reg_mem(Code.MOVDQA_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX))
     seg_load.segment_prefix = R.FS
     other_cases = [
+        ("unaligned_movdqa_source", (Instruction.create_reg_mem(
+            Code.MOVDQA_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX, displ=1)), ret_ins),
+         "unaligned 16-byte memory operand"),
+        ("unaligned_cmppd_source", (ld_xmm0, Instruction.create_reg_mem_i32(
+            Code.CMPPD_XMM_XMMM128_IMM8, R.XMM0, MemoryOperand(R.RDX, displ=8), 0), ret_ins),
+         "unaligned 16-byte memory operand"),
+        ("unaligned_movntdq_destination", (ld_xmm0, Instruction.create_mem_reg(
+            Code.MOVNTDQ_M128_XMM, MemoryOperand(R.R8, displ=8), R.XMM0), ret_ins),
+         "unaligned 16-byte memory operand"),
         ("nonvolatile_xmm6", (Instruction.create_reg_mem(
             Code.MOVDQA_XMM_XMMM128, R.XMM6, MemoryOperand(R.RCX)), ret_ins), "nonvolatile vector register"),
         ("nonvolatile_xmm15", (Instruction.create_reg_reg(
@@ -735,6 +744,7 @@ def check_alt_encodings_and_rejections(original_path):
         orig_end = struct.unpack_from("<I", records, rec_idx + 4)[0]
         max_len = orig_end - entry
 
+    other_sequences = {label: seq for label, seq, _ in other_cases}
     pe_patches = [
         ("pe_addpd", encode_seq(ld_xmm1, reserved_cases[0][1], ret_ins), "unsupported instruction"),
         ("pe_movdqu_load", encode_seq(Instruction.create_reg_mem(
@@ -744,9 +754,9 @@ def check_alt_encodings_and_rejections(original_path):
         ("pe_maskmovdqu", bytes.fromhex("660ff7c8") + encode_seq(ret_ins), "implicit RDI"),
         ("pe_vex_vaddpd", encode_seq(*nonlegacy_cases[0][1]), "non-legacy encoding"),
         ("pe_cmppd_imm8", encode_seq(*cmppd_imm_case[1]), "unsupported cmppd predicate"),
-        ("pe_nonvolatile_xmm6", encode_seq(*other_cases[0][1]), "nonvolatile vector register"),
-        ("pe_undef_xmm3", encode_seq(*other_cases[4][1]), "undefined vector register xmm3"),
-        ("pe_rsp_mem", encode_seq(*other_cases[9][1]), "unsupported memory operand"),
+        ("pe_nonvolatile_xmm6", encode_seq(*other_sequences["nonvolatile_xmm6"]), "nonvolatile vector register"),
+        ("pe_undef_xmm3", encode_seq(*other_sequences["undefined_xmm3"]), "undefined vector register xmm3"),
+        ("pe_rsp_mem", encode_seq(*other_sequences["rsp_mem"]), "unsupported memory operand"),
         ("pe_missing_ret", encode_seq(ld_xmm0), "missing terminal ret"),
         ("pe_after_ret", encode_seq(ret_ins, ld_xmm0), "unreachable instruction after ret"),
     ]

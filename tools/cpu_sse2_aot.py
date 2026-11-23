@@ -1,7 +1,7 @@
 """Lift bounded Windows x64 leaf functions with legacy SSE2 instructions to C++.
 
 Each export uses the leaf ABI void fn(word rcx, word rdx, word r8), where rcx,
-rdx and r8 carry flat host pointers to caller-owned buffers. XMM0..XMM5 are
+rdx and r8 carry 16-byte-aligned host pointers to caller-owned buffers. XMM0..XMM5 are
 modeled as portable 128-bit value structs (two 64-bit lanes). Volatile scratch
 GPRs (rax, r9, r10, r11) carry cvtsd2si results and movnti/mov transport
 values. Only legacy encodings are accepted; VEX, EVEX and other non-legacy forms reject.
@@ -14,7 +14,7 @@ group SSE2):
   - MMX-source convert: cvtpi2pd (m64 memory form only)
   - Scalar convert: cvtsd2si (r32/r64 destination, xmm or m64 source)
   - Scalar double ops: maxsd, minsd, sqrtsd (bits 127:64 of dest preserved)
-  - Fences: lfence, mfence (compiler barrier; no observable register state)
+  - Fences: lfence, mfence (host x64 SSE2 fences)
   - Aligned moves: movapd, movdqa (reg copy, aligned load, aligned store)
   - Half-qword moves: movhpd, movlpd (m64 load merge and m64 store)
   - Non-temporal stores: movntdq, movntpd, movnti (r32 and r64)
@@ -126,7 +126,7 @@ ALLOWED_CODES = {
     Code.MOVNTI_M64_R64,
 }
 
-PRELUDE = """#include <atomic>
+PRELUDE = """#include <emmintrin.h>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -362,7 +362,7 @@ def gpr_scratch(register, ins):
     raise ValueError(f"unsupported GPR {register} at RVA {ins.ip:#x}: {ins}")
 
 
-def flat_address(ins):
+def flat_address(ins, *, alignment=1):
     """Lower a flat [base + disp] pointer operand rooted in an argument GPR64."""
     base = ins.memory_base
     if (ins.is_ip_rel_memory_operand or base in (R.NONE, R.RIP, R.EIP, R.RSP, R.ESP)
@@ -370,6 +370,8 @@ def flat_address(ins):
             or base not in ARGUMENTS):
         raise ValueError(f"unsupported memory operand at RVA {ins.ip:#x}: {ins}")
     disp = ins.memory_displacement & ((1 << 64) - 1)
+    if disp % alignment:
+        raise ValueError(f"unaligned {alignment}-byte memory operand at RVA {ins.ip:#x}: {ins}")
     name = ARGUMENTS[base]
     return f"({name} + {disp:#x}ull)" if disp else name
 
@@ -431,7 +433,7 @@ def lift_code(name, start, raw):
     def vec_src128(op_index, ins):
         """Source of a full-width vector operand: xmm name or m128 load expression."""
         if ins.op_kind(op_index) == OpKind.MEMORY:
-            return f"load128({flat_address(ins)})"
+            return f"load128({flat_address(ins, alignment=16)})"
         return read_vec(op_index, ins)
 
     def vec_src64(op_index, ins):
@@ -457,10 +459,10 @@ def lift_code(name, start, raw):
         if ins.code == Code.RETNQ:
             statements.append("return;")
             returned = True
-        elif ins.code in (Code.LFENCE, Code.MFENCE):
-            # Serializing instruction with no observable register state; model it as a
-            # compiler barrier so the lifted code keeps the ordering contract.
-            statements.append("std::atomic_signal_fence(std::memory_order_seq_cst);")
+        elif ins.code == Code.LFENCE:
+            statements.append("_mm_lfence();")
+        elif ins.code == Code.MFENCE:
+            statements.append("_mm_mfence();")
         elif ins.code in (Code.MOV_R32_RM32, Code.MOV_R64_RM64):
             if ins.op0_kind != OpKind.REGISTER or ins.op1_kind != OpKind.MEMORY:
                 raise ValueError(f"unsupported mov instruction at RVA {ins.ip:#x}: {ins}")
@@ -541,7 +543,7 @@ def lift_code(name, start, raw):
         elif ins.code in (Code.MOVAPD_XMM_XMMM128, Code.MOVDQA_XMM_XMMM128):
             if ins.op1_kind == OpKind.MEMORY:
                 dst_idx, dst_name = write_vec(0, ins)
-                statements.append(f"{dst_name} = load128({flat_address(ins)});")
+                statements.append(f"{dst_name} = load128({flat_address(ins, alignment=16)});")
             else:
                 src = read_vec(1, ins)
                 dst_idx, dst_name = write_vec(0, ins)
@@ -549,7 +551,7 @@ def lift_code(name, start, raw):
             defined.add(dst_idx)
         elif ins.code in (Code.MOVAPD_XMMM128_XMM, Code.MOVDQA_XMMM128_XMM):
             src = read_vec(1, ins)
-            statements.append(f"store128({flat_address(ins)}, {src});")
+            statements.append(f"store128({flat_address(ins, alignment=16)}, {src});")
         elif ins.code in (Code.MOVHPD_XMM_M64, Code.MOVLPD_XMM_M64):
             dst = read_vec(0, ins)
             dst_idx, dst_name = write_vec(0, ins)
@@ -562,7 +564,7 @@ def lift_code(name, start, raw):
             statements.append(f"store64({flat_address(ins)}, {src}.q[{q_idx}]);")
         elif ins.code in (Code.MOVNTDQ_M128_XMM, Code.MOVNTPD_M128_XMM):
             src = read_vec(1, ins)
-            statements.append(f"store128({flat_address(ins)}, {src});")
+            statements.append(f"store128({flat_address(ins, alignment=16)}, {src});")
         else:
             raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
 

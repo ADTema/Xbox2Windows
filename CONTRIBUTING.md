@@ -4,6 +4,8 @@ You can contribute a hardware result, a source-built failing case, a documentati
 
 Visit [GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions) and follow the [pinned newcomer guide](https://github.com/R0Y00/Xbox2Windows/discussions/75) to get started. For build or debugging help, post the commit, command and observed result in [Development Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a).
 
+Keep public project wording title-neutral. Refer to the platform, component or fixture when describing a result.
+
 ## Find and claim a task
 
 1. Search the [issue tracker](https://github.com/R0Y00/Xbox2Windows/issues) for the test name or observed behavior. Issues labeled **good first issue** have a small first step. **help wanted** marks work that can proceed independently.
@@ -12,7 +14,7 @@ Visit [GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions) an
 
 ## Build and test
 
-Hardware reporters can use the [standalone package](tools/gpu-check/README.md). Paste the generated Markdown into the [ongoing hardware thread](https://github.com/R0Y00/Xbox2Windows/issues/1). Maintainers verify each incoming result, link the source report in the README coverage table, and record repeated runs on the same adapter as follow-ups.
+Hardware reporters can use the [standalone package](tools/gpu-check/README.md). Paste the generated Markdown into the [ongoing hardware thread](https://github.com/R0Y00/Xbox2Windows/issues/1). Maintainers verify each incoming result, link the source report in the README coverage table, and record repeated runs on the same adapter as follow-ups. To prepare a batch for the table, export the thread with `gh api --paginate repos/R0Y00/Xbox2Windows/issues/1/comments > out/issue-1-comments.json` and run `python -B tools/hardware_reports.py out/issue-1-comments.json`. It lists the reports that the README does not link yet with suggested cells, and notes where a result differs from the existing row.
 
 The [first independent clean build](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821) records the toolchain and three smoke-test outcomes. If a clean build fails on your machine, open a [build bug report](https://github.com/R0Y00/Xbox2Windows/issues/new?template=bug_report.yml) with the commit, toolchain, first failing command and diagnostic. Link a feedback-driven fix to its report and ask the reporter to verify the change.
 
@@ -39,7 +41,7 @@ To find instruction forms without a passing fixture in a measured run, use its
 CTest JUnit file and matching records directory:
 
 ```powershell
-python tools/form_coverage.py results.xml --records out/dev/form_coverage --gaps gfx1013
+python tools/form_coverage.py results.xml --records out/build/dev/form_coverage --gaps gfx1013
 ```
 
 The TSV lists one row per uncovered reference form, sorted by group and mnemonic.

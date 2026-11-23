@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_sse2_regs
 ; Source-built MASM fixture exercising 23 SSE2 forms from docs/coverage/x64_zen2.tsv
 ; group SSE2: cmppd, every packed/scalar convert expressible in the leaf ABI,
 ; maxsd/minsd/sqrtsd, lfence/mfence and the aligned, half-qword and

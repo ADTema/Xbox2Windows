@@ -17,7 +17,8 @@ from cpu_sse_aot import translate
 
 SIGNATURES = {"blend_ss": "f:ffqf", "blend_sd": "d:ddqd", "convert": "q:fdq", "from_int": "d:qq",
               "classify_ss": "q:ff", "classify_sd": "q:dq", "round_trip": "f:f",
-              "zero_xorps": "d:d", "zero_pxor": "d:d", "zero_xorpd": "d:d"}
+              "zero_xorps": "d:d", "zero_pxor": "d:d", "zero_xorpd": "d:d", "probe_ss": "q:qff",
+              "neg_jcc": "q:q", "setcc_mix": "q:qqq", "cmovcc_mix": "q:qqq"}
 GUARD = bytes.fromhex("5a5a1234a5a54321")
 FILL = 0xa5
 MASK32 = 0xffffffff
@@ -88,6 +89,14 @@ def cases():
         found.extend((name, (value,), b"") for value in DOUBLES)
     found += [("from_int", (n, None), bytes([FILL]) * 32) for n in INTEGERS]
     found += [("round_trip", (f,), b"") for f in SINGLES]
+    name, values, payload, _, _ = probe_answer(2.0, 1.0)
+    found.append((name, values, payload))
+    flag_values = [0, 1, 2, 0x7fffffff, 0x80000000, 0xffffffff, (1 << 63) - 1, 1 << 63, (1 << 64) - 1]
+    found += [("neg_jcc", (value,), b"") for value in flag_values]
+    for a in flag_values:
+        for b in flag_values:
+            found.append(("setcc_mix", (a, b, None), bytes([FILL]) * 4))
+            found.append(("cmovcc_mix", (a, b, None), struct.pack("<QQ", 0xdeadbeefcafebabe, 0xaaaa555511112222)))
     return found
 
 
@@ -128,6 +137,19 @@ def single(value):
 
 def double(value):
     return struct.unpack("<Q", struct.pack("<d", value))[0]
+
+
+def probe_answer(a, b):
+    seed = double(2.75)
+    integer = struct.pack("<i", -1) + bytes(4)
+    operand = 1.5
+    inputs = struct.pack("<Q8sf4x", seed, integer, operand)
+    low, high = struct.unpack("<fI", struct.pack("<Q", seed))
+    memory = inputs + struct.pack("<QfIfIfI", seed, low + operand, high,
+                                  float(struct.unpack_from("<i", integer)[0]), high,
+                                  operand, 0)
+    result = 2 * (a > b) + 3 * (a < b) + (a != a or b != b)
+    return "probe_ss", (None, single(a), single(b)), inputs + bytes([FILL]) * 32, result, memory
 
 
 def known_answers():
@@ -196,6 +218,23 @@ def known_answers():
         ("round_trip", (0xffa00000,), b"", 0xffe00000, b""),
         ("round_trip", (0x7fc12345,), b"", 0x7fc12345, b""),
         ("round_trip", (single(-2.75),), b"", single(-2.75), b""),
+        probe_answer(1.0, 1.0),
+        probe_answer(float("nan"), 1.0),
+        ("neg_jcc", (0,), b"", 0, b""),
+        ("neg_jcc", (1,), b"", 7, b""),
+        ("neg_jcc", (0xffffffff,), b"", 3, b""),
+        ("neg_jcc", (0x80000000,), b"", 0xf, b""),
+        ("setcc_mix", (0xffffffff, 1, None), bytes([FILL]) * 4, 0x123456789abcde01, b"\x00\x01\x00\x00"),
+        ("setcc_mix", (0x80000000, 0x80000000, None), bytes([FILL]) * 4, 0x123456789abcde00, b"\x01\x01\x01\x00"),
+        ("setcc_mix", (0, 1, None), bytes([FILL]) * 4, 0x123456789abcde01, b"\x00\x00\x00\x01"),
+        ("cmovcc_mix", (1, 2, None), struct.pack("<QQ", 0x12345678deadbeef, 0xaaaa555511112222),
+         0x76543210, struct.pack("<QQ", 0x12345678deadbeef, 0xaaaa555511112222)),
+        ("cmovcc_mix", (5, 2, None), struct.pack("<QQ", 0x12345678deadbeef, 0xaaaa555511112222),
+         0xdeadbeef, struct.pack("<QQ", 0x12345678deadbeef, 0xaaaa555511112222)),
+        ("cmovcc_mix", (0, 99, None), struct.pack("<QQ", 0xdeadbeef, 0xaaaa555511112222),
+         99, struct.pack("<QQ", 0xdeadbeef, 0xaaaa555511112222)),
+        ("cmovcc_mix", (1 << 63, 7, None), struct.pack("<QQ", 0xdeadbeef, 0xaaaa555511112222),
+         0xaaaa555511112222, struct.pack("<QQ", 0xdeadbeef, 0xaaaa555511112222)),
     ]
 
 
@@ -258,6 +297,15 @@ def check_rejections(original_path):
     load, subtract = first("blend_ss", M.MOVSS), first("blend_ss", M.SUBSS)
     truncate = next(i for i in code["convert"] if i.mnemonic == M.CVTTSS2SI and i.len == 5)
     compare, parity, below_equal = (first("classify_ss", m) for m in (M.UCOMISS, M.JP, M.JBE))
+    classify_jne = first("classify_ss", M.JNE)
+    neg_je = first("neg_jcc", M.JE)
+    neg_after_je = next(i for i in code["neg_jcc"] if i.ip == neg_je.next_ip)
+    neg_movs = [i for i in code["neg_jcc"] if i.mnemonic == M.MOV]
+    neg_join = neg_movs[2]
+    neg_join_next = next(i for i in code["neg_jcc"] if i.ip == neg_join.next_ip)
+    setcc_mov_r9 = next(i for i in code["setcc_mix"] if i.mnemonic == M.MOV and i.ip > first("setcc_mix", M.CMP).ip)
+    setcc_setl = first("setcc_mix", M.SETL)
+    cmov_32 = first("cmovcc_mix", M.CMOVG)
     assert load.next_ip == multiply.ip and compare.next_ip == parity.ip
     everything = [f"{name}={signature}" for name, signature in SIGNATURES.items()]
     controls = [
@@ -275,6 +323,13 @@ def check_rejections(original_path):
         (patch(below_equal, ""), "float compare without a conditional branch", "COMISS without a jump"),
         # CMP EAX, 1 and JB in place of UCOMISS and JP: the JNE that follows no longer has a producer.
         ((compare.ip, bytes.fromhex("83 f8 01 72")), "flags cross a branch", "second jump after CMP"),
+        (patch(parity, "0f 94 c0", classify_jne), "unsupported flag producer", "SETcc after UCOMISS"),
+        (patch(parity, "0f 44 c1", classify_jne), "unsupported flag producer", "CMOVcc after UCOMISS"),
+        (patch(neg_after_je, "0f 94 c0"), "flags cross a join", "SETcc across a branch after NEG"),
+        (patch(neg_join, "0f 44 c1", neg_join_next), "flags cross a join", "CMOVcc at a join target"),
+        (patch(neg_after_je, "72 00"), "flags cross a branch", "second jump after NEG"),
+        (patch(setcc_mov_r9, "41 0f 9c c1", setcc_setl), "undefined register r9", "SETcc partial write to undefined GPR"),
+        (patch(cmov_32, "66 0f 4f c1"), "unsupported partial register write", "16-bit CMOVcc"),
     ]
     with TemporaryDirectory() as folder:
         path = Path(folder) / "control.dll"

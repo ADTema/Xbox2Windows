@@ -491,7 +491,7 @@ def check_rejections():
 
     unknown = "which depends on a status-word bit that is not known on every path from the entry"
     ax = "which FNSTSW AX leaves unknown on some path from the entry"
-    parity = "reads PF, which the integer lowering models only after SAHF and an 8-bit TEST or AND"
+    parity = "reads PF, which the integer lowering models only after SAHF, FCOMI, FCOMIP, FUCOMI, FUCOMIP and an 8-bit TEST or AND"
     rejected = {
         # The C0, C2 and C3 bits that a consumer sees must come from a comparison on every path.
         "FNSTSW AX with no comparison, then SAHF and JB": (status("", sahf_jb, before=""), "reads CF, " + unknown),
@@ -519,7 +519,7 @@ def check_rejections():
             attempt(f"{fld} {fcom.replace('d1', 'd0')} {sw} dd d8 e9 00 01 00 00", exits={0x110d: "return rax;"}),
             "RAX holds unknown status-word bits 0x82ff at the external edge"),
         # PF of the integer lowering.
-        "FUCOMI, then JP": (attempt(f"{two} db e9 7a 00 {pop2} {clear}"), parity),
+        "FUCOMI and INC EAX, then JP": (attempt(f"{two} db e9 ff c0 7a 00 {pop2} {clear}"), parity),
         "CMP, then JP": (attempt(f"{two} 39 c0 7a 00 {pop2} {clear}"), parity),
         "TEST EAX, EAX, then JP": (attempt(f"{two} 85 c0 7a 00 {pop2} {clear}"), parity),
         "JP before any flag writer": (attempt(f"{two} 7a 00 {pop2} {clear}"), "reads PF, which no instruction defines"),
@@ -530,9 +530,9 @@ def check_rejections():
         "FCOM alias DC D1": (attempt(f"{two} dc d1 {pop2} {clear}"), "unsupported x87 encoding"),
         "FCOMP alias DC D9": (attempt(f"{two} dc d9 dd d8 {clear}"), "unsupported x87 encoding"),
         "FCOMP alias DE D1": (attempt(f"{two} de d1 dd d8 {clear}"), "unsupported x87 encoding"),
-        "FTST": (attempt(f"{fld} d9 e4 dd d8 {clear}"), "unsupported x87 operation"),
-        "FXAM": (attempt(f"{fld} d9 e5 dd d8 {clear}"), "unsupported x87 operation"),
-        "FICOM m16": (attempt(f"{fld} de 11 dd d8 {clear}"), "unsupported x87 operation"),
+        "FSINCOS": (attempt(f"{fld} d9 fb dd d8 {clear}"), "unsupported x87 operation"),
+        "FPATAN": (attempt(f"{fld} d9 f3 dd d8 {clear}"), "unsupported x87 operation"),
+        "FBSTP m80": (attempt(f"{fld} df 31 dd d8 {clear}"), "unsupported x87 operation"),
         "FCOMPP with one value": (attempt(f"{fld} de d9 {clear}"), "x87 stack underflow"),
         "FUCOM ST(2) with two values": (attempt(f"{two} dd e2 {pop2} {clear}"), "x87 stack underflow"),
         "FCOM m32 on an empty stack": (attempt(f"d8 11 {clear}"), "x87 stack underflow"),
