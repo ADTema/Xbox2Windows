@@ -3867,22 +3867,19 @@ variants and compares their four control words with the fixture:
 - a negative control with one UV constant changed failed on both adapters, and every
   emitted CSO was accepted by the DXC validator from the same package.
 
-`samplebranch_12288` was not dispatched at all: creating its pipeline on the RTX 4060
-did not return within about 9 minutes for its 2.77 MB DXIL. That is NVIDIA driver shader
-JIT during pipeline creation, outside DXC, and it is excluded from every DXC time above.
-Its DXIL validates with `dxv` and keeps the control stores that the smaller variants
-pass.
+`samplebranch_12288` reached pipeline creation on the RTX 4060. The call did not return
+within about 9 minutes for its 2.77 MB DXIL, so there was no dispatch. This separate
+pipeline measurement is outside the DXC time above. The DXIL validates with `dxv`
+and keeps the control stores checked by the smaller variants.
 
 The archive-replay attribution in
 [#775](https://github.com/R0Y00/Xbox2Windows/issues/775) remains open. This family
 reaches the policy timeout only at multi-MB HLSL; the fixture-scale sources compile in
-about 0.02 s and the worst measured case below 0.5 MB is 2.54 s. The replay profile is
-not public, so these aggregates cannot say which real records time out or how large
-their HLSL is. Closing the attribution needs a failing local record that supplies its
-input size and pass-time totals, for example a `-ftime-report` from the same command.
-The aggregate measurements above are enough for this reproduction record; they are not
-evidence about the corpus. No translator change is proposed, and the GPU was used only
-to check the compiled UAVs.
+about 0.02 s and the worst measured case below 0.5 MB is 2.54 s. On a separate
+17,188,611-byte archive-derived input, an instrumented default-optimization run last
+entered `loop-rotate`. That trace locates the observed stall under instrumentation.
+Uninstrumented pass-time totals and attribution across the replay cohort remain open.
+The GPU check above covers the public fixture's four control words. [Archive trace](https://github.com/R0Y00/Xbox2Windows/issues/775)
 
 ## Independent bit and byte alignment readback
 
