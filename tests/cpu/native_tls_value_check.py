@@ -87,7 +87,8 @@ def layout(image):
     if offset < 0:
         raise AssertionError(f"{Path(image).name}: the 8 KiB array is not in the TLS template")
     span_rva = rva + offset
-    boundary = (span_rva + PAGE - 1) & ~(PAGE - 1)
+    # Select the next boundary strictly inside the span, including an aligned start.
+    boundary = (span_rva // PAGE + 1) * PAGE
     if not span_rva < boundary < span_rva + len(pattern):
         raise AssertionError(f"{Path(image).name}: the array at {span_rva:#x} does not cross a page boundary")
     index = (boundary - span_rva) // 4
