@@ -101,6 +101,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/script_state_check.py
 ./out/pe-env/bin/python -B tests/resource_root_check.py
 ./out/pe-env/bin/python -B tests/bcpack_check.py
+./out/pe-env/bin/python -B tests/bcpack_symbols_check.py
 ./out/pe-env/bin/python -B tests/bc7_blocks_check.py
 ./out/pe-env/bin/python -B tests/bc7_tiles_check.py
 ./out/pe-env/bin/python -B tests/form_coverage_check.py
