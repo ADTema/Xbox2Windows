@@ -7481,7 +7481,9 @@ def check_controls(directory):
         must_reject(translate, with_constants([bad_absdiff]))
     rgb = rgb_sample()
     translate(rgb)
-    for old, new in (("v[12:14]", "v[12:15]"), ("dmask:0x7", "dmask:0xb")):
+    rga = translate([line.replace("dmask:0x7", "dmask:0xb") for line in rgb])
+    assert re.search(r"sample\d+\.w", rga), rga
+    for old, new in (("v[12:14]", "v[12:15]"), ("dmask:0x7", "dmask:0x3")):
         must_reject(translate, [line.replace(old, new) for line in rgb])
     wait = rgb.index("s_waitcnt vmcnt(0)")
     must_reject(translate, rgb[:wait] + rgb[wait+1:])
