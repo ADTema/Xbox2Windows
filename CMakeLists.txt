@@ -1322,6 +1322,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_mul_div COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mul_div.py"
         check "$<TARGET_FILE:cpu_mul_div>" "$<TARGET_FILE:cpu_mul_div_lifted>")
 
+    cpu_asm_fixture(cpu_cmpxchg_wide cmpxchg_wide)
+    set(cmpxchg_wide_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_cmpxchg_wide_lifted.cpp")
+    add_custom_command(OUTPUT "${cmpxchg_wide_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/cmpxchg_wide.py"
+            emit "$<TARGET_FILE:cpu_cmpxchg_wide>" "${cmpxchg_wide_fixture}"
+        DEPENDS cpu_cmpxchg_wide tests/cpu/cmpxchg_wide.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_cmpxchg_wide_lifted SHARED "${cmpxchg_wide_fixture}")
+    add_test(NAME cpu_aot_cmpxchg_wide COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/cmpxchg_wide.py"
+        check "$<TARGET_FILE:cpu_cmpxchg_wide>" "$<TARGET_FILE:cpu_cmpxchg_wide_lifted>")
+
     cpu_asm_fixture(cpu_cmov_setcc cmov_setcc)
     set(cmov_setcc_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_cmov_setcc_lifted.cpp")
     add_custom_command(OUTPUT "${cmov_setcc_fixture}"
@@ -2248,7 +2259,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps_flip.h")
     target_include_directories(cpu_shim_draw PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_features(cpu_shim_draw PRIVATE cxx_std_17)
-    target_link_libraries(cpu_shim_draw PRIVATE dxgi d3d12)
+    target_link_libraries(cpu_shim_draw PRIVATE dxgi d3d12 d3d12_xs_shim)
     add_executable(cpu_shim_startup tests/cpu/shim_startup.asm tests/cpu/exe_startup.asm)
     set_target_properties(cpu_shim_startup PROPERTIES LINKER_LANGUAGE CXX)
     target_link_options(cpu_shim_startup PRIVATE /ENTRY:native_startup /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
@@ -2618,6 +2629,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-core "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_compressed_export_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-compressed-export "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_compressed_export_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_position_centers_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_position_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2677,6 +2692,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_swap_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_swap_${adapter}.txt")
+        add_test(NAME pixel_aot_cvt_float_int_e64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-cvt-float-int-e64 "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_cvt_float_int_e64_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_cvt_float_int_e64_${adapter}.txt")
         add_test(NAME pixel_aot_e64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-e64 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

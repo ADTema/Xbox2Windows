@@ -1020,6 +1020,31 @@ SCALAR = {
 }
 
 
+def parse_cvt_f32_e64_source(token):
+    """Parse a register or hex literal with optional VOP3 neg and abs modifiers.
+
+    Rejects bare `-0x...` because llvm-mc folds integer two's-complement negation on hex
+    literals rather than setting the VOP3 sign-flip modifier (printed as `neg(0x...)`).
+    """
+    neg = False
+    if token.startswith("neg(") and token.endswith(")"):
+        neg = True
+        token = token[4:-1]
+    elif token.startswith("-"):
+        neg = True
+        token = token[1:]
+        if token.startswith("0x"):
+            return None
+    has_abs = False
+    if (token.startswith("|") and token.endswith("|")) or (
+            token.startswith("abs(") and token.endswith(")")):
+        has_abs = True
+        token = token[1:-1] if token.startswith("|") else token[4:-1]
+    if not re.fullmatch(r"[vs]\d+|0x[0-9a-f]{1,8}", token):
+        return None
+    return token, has_abs, neg
+
+
 def fp_operand(token, scalar, vector, pending, sample_dest, *,
                quad_values: dict[str, bool] | None = None, ignore_sign=False):
     if re.fullmatch(r"-\d+", token):
@@ -1581,13 +1606,16 @@ SDWA_INT_OPERANDS = re.compile(
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
-          second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=()):
+          second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
+          return_write_mask=False):
     """Track descriptor provenance, interpolation and packed or uncompressed exports.
 
     constant_descriptor is the byte offset, on the texture table, of the descriptor mapped to b0.
     Each extra_constants entry is an (entry SGPR, byte offset) pair naming one further 16-byte
     descriptor; the entries map in order to b1 onward. The SGPR may be the texture table or another
     entry register that holds the low word of a table address.
+    return_write_mask returns (source, RT0 mask). For partial compressed exports the caller
+    must supply normalized whole-pair instructions and apply the returned mask in the PSO.
     """
     if texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105:
         raise ValueError("Invalid scalar inputs")
@@ -1640,6 +1668,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     sample_kind = None  # "plain" or "comparison": both would need s0
     sample_dest = {}  # VGPR -> issue number of its outstanding image_sample
     exported = False
+    channel_mask = 0xF
     ended = False
     entry_line = len(lines)
     result_type = "uint4" if integer_export else "float4"
@@ -2883,6 +2912,33 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             helpers.add("cvt_i32_f32")
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat(cvt_i32_f32(asuint({operand})));")
+        elif (m := match(r"v_cvt_(u32|i32)_f32_e64 (v\d+), ([^,\s]+)")) and (
+                parsed := parse_cvt_f32_e64_source(m.group(3))):
+            # VOP3 truncating float-to-int with optional bitwise source abs/neg modifiers.
+            # Apply abs then neg on the raw IEEE-754 word before passing it to the shared
+            # src/ffx_float_to_int.hlsli helper; clamp, omod, decimal/float literals and
+            # FLR/RPI variants remain rejected.
+            kind, dst, _ = m.groups()
+            base, has_abs, has_neg = parsed
+            if int(dst[1:]) > 255 or (base.startswith(("v", "s")) and
+                    int(base[1:]) > (255 if base.startswith("v") else 105)):
+                raise ValueError(f"Invalid {'unsigned' if kind == 'u32' else 'signed'} conversion register")
+            if mask != "entry":
+                raise ValueError("Invalid conversion")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if base.startswith("v") and base not in vector:
+                raise ValueError(f"Unbound pixel input {base} at v_cvt_{kind}_f32_e64")
+            operand = fp_operand(base, scalar, vector, pending, sample_dest)
+            bits = f"asuint({operand})"
+            if has_abs:
+                bits = f"({bits} & 0x7fffffffu)"
+            if has_neg:
+                bits = f"({bits} ^ 0x80000000u)"
+            helper = f"cvt_{kind}_f32"
+            helpers.add(helper)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({helper}({bits}));")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             if dst in sample_dest:
@@ -2891,14 +2947,29 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or lo in sample_dest or hi in sample_dest or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
-        elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+|off), \2 done compr vm"):
+        elif m := match(r"exp mrt0,? (v\d+|off), \1, (v\d+|off), \2 done compr vm"):
             if integer_export:
                 raise ValueError("Integer export requires the uncompressed export form")
-            pairs = [vector[v] for v in m.groups() if v != "off"]
-            if mask != "entry" or exported or not all(isinstance(p, tuple) and len(p)==2 and
-                    all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
+            low, high = m.groups()
+            if low == "off" and high == "off":
                 raise ValueError("Unsupported export")
-            args = [f"export16({v})" for pair in pairs for v in pair]
+            if low == "off" and not return_write_mask:
+                raise ValueError("High-pair compressed export requires an explicit RT0 write mask")
+            regs = [reg for reg in (low, high) if reg != "off"]
+            pairs = [vector.get(reg) for reg in regs]
+            if (mask != "entry" or exported or any(reg in sample_dest for reg in regs)
+                    or not all(isinstance(pair, tuple) and len(pair) == 2
+                               and all(isinstance(value, str) and value.startswith(("sample", "alu"))
+                                       for value in pair) for pair in pairs)):
+                raise ValueError("Unsupported export")
+            args = [f"export16({value})" for pair in pairs for value in pair]
+            if low == "off":
+                channel_mask = 0xC
+                args[:0] = ["0.0f", "0.0f"]
+            elif high == "off":
+                channel_mask = 0x3
+                if return_write_mask:
+                    args.extend(["0.0f", "0.0f"])
             components = 4 if attribute_input else texcoord_components
             inputs = f"float{components} uv : TEXCOORD0"
             if not bindings and not interpolated:
@@ -2930,7 +3001,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if helpers & {"cvt_u32_f32", "cvt_i32_f32"}:
             defs.append((Path(__file__).resolve().parents[1] / "src/ffx_float_to_int.hlsli").read_text())
         lines[:0] = defs
-    return "\n".join([*lines, "}",""])
+    source = "\n".join([*lines, "}", ""])
+    return (source, channel_mask) if return_write_mask else source
 
 
 def main():
