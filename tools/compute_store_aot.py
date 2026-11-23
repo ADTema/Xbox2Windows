@@ -403,6 +403,36 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                                    f"    uint {result} = {slot}[(local.x + {bias}u) & 31u];"))
             vector[dst] = ("alu", result)
             ds_wait = True
+        elif m := re.fullmatch(r"ds_((?:cmpst|mskor)(?:_rtn)?|wrxchg_rtn)_b32 "
+                               r"(v\d+(?:, v\d+){1,3})(?: offset:0)?", line):
+            op = m[1]
+            returns = op.endswith("_rtn")
+            exchange = op == "wrxchg_rtn"
+            regs = [int(token[1:]) for token in m[2].split(", ")]
+            if len(regs) != (2 if exchange else 3) + returns:
+                raise ValueError("Unverified private LDS replacement operands")
+            addr, first, *second = regs[returns:]
+            data0 = vector.get(first)
+            data1 = vector.get(second[0]) if second else None
+            if (not lds_enabled or guard_span is not None or max(regs) > 255
+                    or vector.get(addr) != ("lds_address",) or lds_word is None or not is_word(data0)
+                    or (not exchange and not is_word(data1))):
+                raise ValueError("Unverified private LDS replacement")
+            if exchange:
+                new_word = data0
+            else:
+                old, a, b = hlsl_word(lds_word), hlsl_word(data0), hlsl_word(data1)
+                if op.startswith("cmpst"):
+                    expression = f"(({old} == {a}) ? {b} : {old})"
+                else:
+                    expression = f"(({old} & ~{a}) | {b})"
+                if len(expression) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("LDS expression exceeds the profile limit")
+                new_word = ("alu", expression)
+            if returns:
+                vector[regs[0]] = lds_word
+            lds_word = new_word
+            ds_wait = True
         elif m := re.fullmatch(
                 r"ds_(read2st64_b(?:32|64)|write2st64_b(?:32|64)|wrxchg2st64_rtn_b32) "
                 r"(v\[\d+:\d+\]|v\d+), (v\[\d+:\d+\]|v\d+)"
