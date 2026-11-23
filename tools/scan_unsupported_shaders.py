@@ -153,6 +153,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_cvt_pkrtz_f16_f32_e32\s+v\d+,\s+v\d+,\s+v\d+",
     r"v_cvt_u32_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",
     r"exp\s+mrt0,?\s+v\d+,\s+v\d+,\s+(?:v\d+|off),\s+(?:v\d+|off)\s+done\s+compr\s+vm",
+    r"exp\s+mrt0,?\s+(?:v\d+|off),\s+(?:v\d+|off),\s+(?:v\d+|off),\s+(?:v\d+|off)\s+done\s+vm",
     r"s_endpgm",
 ]
 
@@ -213,6 +214,16 @@ if PIXEL_VOP3_INT16_TERNARY:
         rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP3_INT16_TERNARY))})(?:_e64)?\s+{INT16_VGPR},"
         rf"\s+{INT16_SOURCE},\s+{INT16_SOURCE},\s+{INT16_SOURCE}"
     )
+# 64-bit VOP3 shifts (issue #928): a VGPR-pair destination, a 32-bit amount (VGPR, SGPR, inline integer or
+# literal) and a 64-bit value (VGPR pair, SGPR pair or inline integer), with at most one SGPR or literal source.
+# This matches syntax only; pixel_aot also checks the pair ranges and that the sources are tracked.
+SHIFT64_AMOUNT = r"(?:v\d+|-?\d+)"
+SHIFT64_VALUE = r"(?:v\[\d+:\d+\]|-?\d+)"
+SUPPORTED_INSTRUCTIONS_REGEX.append(
+    r"v_(?:lshlrev_b64|lshrrev_b64|ashrrev_i64)(?:_e64)?\s+v\[\d+:\d+\],\s+"
+    rf"(?:{SHIFT64_AMOUNT},\s+{SHIFT64_VALUE}|(?:s\d+|0x[0-9a-f]{{1,8}}),\s+{SHIFT64_VALUE}"
+    rf"|{SHIFT64_AMOUNT},\s+s\[\d+:\d+\])"
+)
 
 for name, (arity, _) in PIXEL_INTEGER.items():
     vop3_only = arity > 2 or name in getattr(pixel_aot, "INTEGER_VOP3_ONLY", ())
@@ -265,7 +276,8 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
     "s_mul_hi_u32", "s_mul_hi_i32",
     # SOPK
-    "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork", "s_version",
+    "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork",
+    "s_getreg_b32", "s_setreg_b32", "s_setreg_imm32_b32", "s_version",
     # VOP1
     "v_nop", "v_mov_b32", "v_swap_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",

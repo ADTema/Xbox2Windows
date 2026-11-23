@@ -2145,9 +2145,13 @@ class VectorRegisters(dict):
 
 MISSING = object()
 
-# Only operations with per-lane, safe speculative evaluation enter the region.
+# Only operations with per-lane, safe speculative evaluation enter the region. Stage 2 of issue #932 adds the
+# per-lane binary32 forms the translator already lowers outside regions, in the encodings measured in real
+# regions; each still passes the per-instruction check in lower() (only VGPRs may change).
 REGION_ALU = re.compile(
-    r"v_(?:mov_b32|(?:add|sub|subrev|mul|min|max)_f32)(?:_e32|_e64)? ")
+    r"v_(?:mov_b32|(?:add|sub|subrev|mul|min|max)_f32)(?:_e32|_e64)? "
+    r"|v_(?:fmac|mac|rcp|rsq|sqrt)_f32_e32 |v_cvt_f32_ubyte[0-3]_e32 |v_mul_legacy_f32_e(?:32|64) "
+    r"|v_(?:fma|mad|med3)_f32 ")
 
 
 class TrackedVector(VectorRegisters):
@@ -2193,6 +2197,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     requires every flat address to be global and excludes the scratch and LDS apertures.
     return_write_mask returns (source, RT0 mask). For partial compressed exports the caller
     must supply normalized whole-pair instructions and apply the returned mask in the PSO.
+    Uncompressed partial exports use the same opt-in for floating-point and integer targets.
     wave_size names the guest execution width (32 or 64). Low-only execution mask operations
     (s_mov_b32 save of exec_lo, s_wqm_b32, and s_and_b32/s_mov_b32 restore) require a validated
     guest wave32 profile (wave_size=32); native Scarlett/GFX10 wave64 operations remain independent
@@ -2334,6 +2339,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             raise ValueError("Invalid instruction element")
         offset_index = {}
         positioned = ((None, line) for line in instructions)
+
+    def close_region(i, pair):
+        """Merge every register the open region rewrote with a per-lane select on its condition."""
+        if (region is None or pair != region["save"]
+                or (region["skip"] is not None and region["skip"] != i)):
+            raise ValueError("Unexpected execution mask restore")
+        for dst, outer in region["written"].items():
+            if outer is MISSING or dst in vector.conditional:
+                vector.conditional.add(dst)
+                continue
+            if not isinstance(outer, str) or outer in ("bary_i", "bary_j"):
+                raise ValueError("Masked region rewrites a register without a numeric value")
+            inner = vector[dst]
+            lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
+            vector[dst] = f"alu{i}_{dst}"
+        vector.masked = False
+        vector.reads.clear()
+
     for i, (offset, line) in enumerate(positioned):
         vector.reads.clear()
         conditional = set(vector.conditional)
@@ -2349,6 +2372,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         rstate = None
         if region is not None:
             if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]", line):
+                pass
+            elif region["opener"] == "cmpx" and re.fullmatch(r"s_mov_b64 exec, s\[\d+:\d+\]", line):
                 pass
             elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
                     and i == region["start"] + 1 and region["skip"] is None):
@@ -2526,6 +2551,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             mask = "entry"
             wqm_width = None
             scc = None
+        elif region is not None and (m := match(r"s_mov_b64 exec, (s\[\d+:\d+\])")):
+            # The v_cmpx region closes with an exact copy of the saved mask. Unlike s_or_b64 it leaves SCC.
+            if region["opener"] != "cmpx":
+                raise ValueError("Unexpected execution mask restore")
+            close_region(i, sgpr_pair(m[1]))
+            region = None
         elif m := match(r"s_mov_b64 (?:exec|exec_lo), (s\[\d+:\d+\])"):
             lo, hi = sgpr_pair(m.group(1))
             if mask != "quad" or wqm_width != 64 or [scalar.get(lo), scalar.get(hi)] != [("entry", 0), ("entry", 1)]:
@@ -2564,9 +2595,38 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                         != [(*condition[:2], j, len(regs)) for j in range(len(regs))]):
                 raise ValueError("Unsupported execution mask save")
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
-            region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i}
+            region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i,
+                      "opener": "saveexec"}
             vector.masked = True
             scc = None
+        elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32))_e32 "
+                        r"([^,]+), ([^,]+)"):
+            # A masked-if opened by a VOPC e32 compare that writes EXEC (issue #932). It must directly
+            # follow `s_mov_b64 s[a:b], exec` of the known entry mask, so EXEC becomes the entry mask
+            # intersected with the comparison, as after s_and_saveexec_b64. v_cmpx writes neither VCC nor
+            # SCC, so both keep their tracked values; the region closes with s_mov_b64 or s_or_b64.
+            fop, iop, kind, src0, src1 = m.groups()
+            previous = instructions[i - 1] if i else ""
+            previous = previous[1] if isinstance(previous, tuple) else previous
+            saved = re.fullmatch(r"s_mov_b64 (s\[\d+:\d+\]), exec", previous)
+            pair = sgpr_pair(saved[1]) if saved else None
+            if (region is not None or mask != "entry" or pair is None
+                    or [scalar.get(r) for r in pair] != [("entry", 0), ("entry", 1)]):
+                raise ValueError("Unsupported v_cmpx execution mask save")
+            # VOPC e32 encodes VSRC1 as a VGPR and carries no source modifiers.
+            if not re.fullmatch(r"v\d+", src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0):
+                raise ValueError(f"Invalid VOPC e32 operands: {line}")
+            if fop is not None:
+                expr = f32_comparison(fop, [src0, src1], scalar, vector, pending, sample_dest)
+            else:
+                values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
+                          for t in (src0, src1)]
+                expr = INT_COMPARE[iop].format(*values)
+            lines.append(f"    bool cmp{i} = {expr};")
+            scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
+            region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i,
+                      "opener": "cmpx"}
+            vector.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
             # The whole-wave empty-mask skip may sit right after the save; its target must be
             # the matching restore exactly. Offsets count from the next instruction.
@@ -2580,28 +2640,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if restore is None or restore <= i:
                 raise ValueError("Execution skip targets no instruction boundary")
             target = instructions[restore][1] if isinstance(instructions[restore], tuple) else instructions[restore]
-            if not (rm := re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)) \
-                    or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
+            rm = re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)
+            if rm is None and region["opener"] == "cmpx":
+                rm = re.fullmatch(r"s_mov_b64 exec, s\[(\d+):(\d+)\]", target)
+            if rm is None or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
                 raise ValueError("Execution skip does not target the matching restore")
             region["skip"] = restore
             seen_skip = True
         elif m := match(r"s_or_b64 exec, exec, (s\[\d+:\d+\])"):
-            pair = sgpr_pair(m[1])
-            if (region is None or pair != region["save"]
-                    or (region["skip"] is not None and region["skip"] != i)):
-                raise ValueError("Unexpected execution mask restore")
-            for dst, outer in region["written"].items():
-                if outer is MISSING or dst in vector.conditional:
-                    vector.conditional.add(dst)
-                    continue
-                if not isinstance(outer, str) or outer in ("bary_i", "bary_j"):
-                    raise ValueError("Masked region rewrites a register without a numeric value")
-                inner = vector[dst]
-                lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
-                vector[dst] = f"alu{i}_{dst}"
+            close_region(i, sgpr_pair(m[1]))
             region = None
-            vector.masked = False
-            vector.reads.clear()
+            # s_or_b64 writes SCC from the restored mask, a wave property the per-lane model cannot compute.
             scc = None
         elif m := match(r"s_(cmov|not|brev)_b64 (s\[\d+:\d+\]), ([^,]+)"):
             op, dst, src = m.groups()
@@ -3438,6 +3487,49 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             result = sdwa_dest(f"({template.format(*args)})", dst_sel, unused, vector.get(dst))
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({result});")
+        elif m := match(r"v_(lshlrev_b64|lshrrev_b64|ashrrev_i64)(?:_e64)? (v\[\d+:\d+\]), ([^,\s]+), ([^,\s]+)"):
+            # VOP3 64-bit shifts (issue #928): D = S1 << S0[5:0], S1 >> S0[5:0], or signext(S1) >> S0[5:0]
+            # (AMD RDNA 2 ISA §12.12, opcodes 767-769). The 64-bit value is two 32-bit words. Both source words
+            # are read into temporaries before the destination pair is written, so the in-place form keeps the
+            # original value, and no 32-bit HLSL shift ever receives a count of 32 or more.
+            op, dst, amount, value = m.groups()
+            first, last = (int(n) for n in re.fullmatch(r"v\[(\d+):(\d+)\]", dst).groups())
+            names = (f"v{first}", f"v{last}")
+            if mask != "entry" or last != first + 1 or last > 255 or any(n in sample_dest for n in names):
+                raise ValueError(f"Invalid 64-bit shift destination: {line}")
+            if re.search(r"\||abs\(|neg\(|^-[vs]", amount) or re.search(r"\||abs\(|neg\(|^-[vs]", value):
+                raise ValueError(f"Source modifiers are not allowed on a 64-bit shift: {line}")
+            # The ISA allows one scalar broadcast constant: an SGPR, an SGPR pair or a literal.
+            scalar_like = [bool(re.fullmatch(r"s\d+|s\[\d+:\d+\]|0x[0-9a-f]+", t)) for t in (amount, value)]
+            if all(scalar_like):
+                raise ValueError(f"A 64-bit shift reads at most one scalar or literal source: {line}")
+            if not re.fullmatch(r"v\d+|s\d+|-?\d+|0x[0-9a-f]{1,8}", amount) or (
+                    re.fullmatch(r"-?\d+", amount) and not -16 <= int(amount) <= 64):
+                raise ValueError(f"Invalid 64-bit shift amount: {amount}")
+            count = int_operand(amount, scalar, vector, pending, sample_dest, signed=False)
+            low, high = int64_operand(value, scalar, vector, pending, sample_dest, signed=False,
+                                      encoding="e64", position=1)
+            lines.append(f"    uint sh{i} = {count} & 63u;")
+            lines.append(f"    uint sb{i} = sh{i} & 31u;")
+            lines.append(f"    uint sc{i} = (32u - sb{i}) & 31u;")
+            lines.append(f"    uint lo{i} = {low};")
+            lines.append(f"    uint hi{i} = {high};")
+            if op == "lshlrev_b64":
+                lines.append(f"    uint cy{i} = sb{i} == 0u ? 0u : (lo{i} >> sc{i});")
+                result_lo = f"(sh{i} < 32u ? (lo{i} << sb{i}) : 0u)"
+                result_hi = f"(sh{i} < 32u ? ((hi{i} << sb{i}) | cy{i}) : (lo{i} << sb{i}))"
+            else:
+                lines.append(f"    uint cy{i} = sb{i} == 0u ? 0u : (hi{i} << sc{i});")
+                if op == "lshrrev_b64":
+                    shifted_hi, fill = f"(hi{i} >> sb{i})", "0u"
+                else:
+                    shifted_hi, fill = f"asuint(asint(hi{i}) >> sb{i})", f"asuint(asint(hi{i}) >> 31u)"
+                result_lo = f"(sh{i} < 32u ? ((lo{i} >> sb{i}) | cy{i}) : {shifted_hi})"
+                result_hi = f"(sh{i} < 32u ? {shifted_hi} : {fill})"
+            lines.append(f"    precise float alu{i}_lo = asfloat({result_lo});")
+            lines.append(f"    precise float alu{i}_hi = asfloat({result_hi});")
+            vector[names[0]] = f"alu{i}_lo"
+            vector[names[1]] = f"alu{i}_hi"
         elif m := match(rf"v_({'|'.join(INTEGER)})(?:_(e32|e64))? (v\d+), (.+)"):
             op, encoding, dst, sources = m.groups()
             tokens = sources.split(", ")
@@ -4293,12 +4385,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in values)):
                 raise ValueError("Unsupported export")
             channel_mask = sum(1 << index for index, reg in enumerate(channels) if reg != "off")
-            if channel_mask != 0xF and (integer_export or not return_write_mask):
-                raise ValueError("Partial uncompressed export requires an explicit floating-point RT0 write mask")
+            if channel_mask != 0xF and not return_write_mask:
+                raise ValueError("Partial uncompressed export requires an explicit RT0 write mask")
             args = [f"asuint({v})" for v in values] if integer_export else values
+            padding = "0u" if integer_export else "0.0f"
             for index, reg in enumerate(channels):
                 if reg == "off":
-                    args.insert(index, "0.0f")
+                    args.insert(index, padding)
             input_type = f"float{4 if attribute_input else texcoord_components}"
             lines[entry_line] = f"{result_type} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
             lines.append(f"    return {result_type}({', '.join(args)});")
@@ -4368,6 +4461,8 @@ def main():
     parser.add_argument("--half-denorm", choices=[HALF_DENORM_PRESERVE],
                         help="Declare the binary16 denormal state at shader entry; the plain binary16 VOP2 forms need it")
     parser.add_argument("--second-texture-offset", type=lambda s: int(s, 0), help="Byte offset of the t1 descriptor for a two-sample shader")
+    parser.add_argument("--rt0-write-mask", action="store_true",
+                        help="Emit the uncompressed RT0 mask for the caller to apply to the pipeline")
     args = parser.parse_args()
     dest = args.output.resolve()
     if dest.suffix.lower() != ".hlsl" or dest == args.archive.resolve():
@@ -4375,20 +4470,28 @@ def main():
     try:
         blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256, llvm=args.llvm)
         instructions = disassemble(code, args.llvm, offsets=True)
-        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor,
-                       texture_offset=args.texture_offset, second_texture_offset=args.second_texture_offset,
+        if args.rt0_write_mask and any(line.startswith("exp ") and "compr" in line.split()
+                                       for _, line in instructions):
+            raise ValueError("--rt0-write-mask only supports uncompressed exports")
+        result = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words,
+                       args.constant_descriptor, texture_offset=args.texture_offset,
+                       second_texture_offset=args.second_texture_offset,
                        extra_constants=[tuple(entry) for entry in args.extra_constant],
                        pointer_constants=[tuple(entry) for entry in args.pointer_constant],
-                       half_denorm=args.half_denorm)
+                       half_denorm=args.half_denorm, return_write_mask=args.rt0_write_mask)
+        source, write_mask = result if args.rt0_write_mask else (result, None)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False, mode="wb") as f:
         f.write(source.encode("utf-8"))
     Path(f.name).replace(dest)
-    print(json.dumps({"record":args.record, "container_sha256":hashlib.sha256(blob).hexdigest(),
-                      "native_sha256":hashlib.sha256(code).hexdigest(), "instructions":len(instructions),
-                      "hlsl_sha256":hashlib.sha256(dest.read_bytes()).hexdigest()}))
+    summary = {"record": args.record, "container_sha256": hashlib.sha256(blob).hexdigest(),
+               "native_sha256": hashlib.sha256(code).hexdigest(), "instructions": len(instructions),
+               "hlsl_sha256": hashlib.sha256(dest.read_bytes()).hexdigest()}
+    if write_mask is not None:
+        summary["rt0_write_mask"] = write_mask
+    print(json.dumps(summary))
 
 
 if __name__ == "__main__":
