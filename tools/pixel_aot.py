@@ -499,6 +499,24 @@ def registers(first, last, count):
     return range(first, last+1)
 
 
+def vgpr_span(token, count):
+    if count == 1:
+        m = re.fullmatch(r"v(\d+)", token)
+        if not m:
+            raise ValueError(f"Expected single VGPR: {token}")
+        reg = int(m[1])
+        if reg > 255:
+            raise ValueError(f"VGPR index out of range: {token}")
+        return [f"v{reg}"]
+    m = re.fullmatch(r"v\[(\d+):(\d+)\]", token)
+    if not m:
+        raise ValueError(f"Expected VGPR span v[first:last]: {token}")
+    first, last = int(m[1]), int(m[2])
+    if first > 255 or last > 255 or last - first + 1 != count:
+        raise ValueError(f"Invalid VGPR span {token} for width {count}")
+    return [f"v{n}" for n in range(first, last + 1)]
+
+
 HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
 
 # s_setreg_imm32_b32 is accepted for two targets only.
@@ -2148,6 +2166,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     interpolated = False
     region = None
     seen_skip = False
+    has_scratch = False
+    scratch_written = set()
+    scratch_pending = set()
     instructions = tuple(instructions)
     if any(isinstance(element, tuple) for element in instructions):
         offset_index = {}
@@ -2170,7 +2191,6 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     for i, (offset, line) in enumerate(positioned):
         vector.reads.clear()
         conditional = set(vector.conditional)
-
         def match(pattern):
             return re.fullmatch(pattern, line)
 
@@ -2784,6 +2804,106 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     value = f"{params}[{word // 4}].{'xyzw'[word % 4]}"
                     scalar[f"s{n}"] = ("uint", value) if integer_export and params == "params" else value
                 pending.add(f"s{n}")
+        elif m := match(r"scratch_(load|store)_dword(x[234])?\s+(.*)"):
+            if title_ranges is not None:
+                raise ValueError(f"Unsupported instruction {i}: {line}")
+            kind, width_str, rest = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid scratch operation in non-entry mask")
+            count = int(width_str[1:]) if width_str else 1
+            parts = [p.strip() for p in rest.split(",")]
+            if len(parts) != 3:
+                raise ValueError("Scratch instruction requires exactly 3 operands")
+            last_words = parts[2].split()
+            if not last_words:
+                raise ValueError("Missing third operand")
+            op0, op1 = parts[0], parts[1]
+            op2 = last_words[0]
+            mods = last_words[1:]
+
+            offset = 0
+            seen_offset = False
+            seen_mods = set()
+            for mod in mods:
+                if mod.startswith("offset:"):
+                    if seen_offset:
+                        raise ValueError("Duplicate offset modifier")
+                    seen_offset = True
+                    off_val = int(mod.split(":", 1)[1])
+                    if not -2048 <= off_val <= 2047:
+                        raise ValueError(f"Scratch offset out of range (-2048..2047): {off_val}")
+                    offset = off_val
+                elif mod in ("glc", "slc", "dlc"):
+                    if mod in seen_mods:
+                        raise ValueError(f"Duplicate modifier {mod}")
+                    seen_mods.add(mod)
+                elif mod == "lds":
+                    raise ValueError("LDS modifier is not supported in pixel shaders")
+                else:
+                    raise ValueError(f"Unsupported scratch modifier: {mod}")
+
+            if offset % 4 != 0:
+                raise ValueError("Scratch dword offset must be 4-byte aligned")
+
+            if kind == "load":
+                vdst_str = op0
+                vaddr_str = op1
+                saddr_str = op2
+                regs = vgpr_span(vdst_str, count)
+                if any(reg in sample_dest for reg in regs):
+                    raise ValueError("Write overlaps an outstanding sample")
+            else:
+                vaddr_str = op0
+                vdata_str = op1
+                saddr_str = op2
+                regs = vgpr_span(vdata_str, count)
+                values = [int_operand(reg, scalar, vector, pending, sample_dest, signed=False) for reg in regs]
+
+            if vaddr_str != "off":
+                raise ValueError(f"Dynamic or unproven scratch address: vaddr must be off, got {vaddr_str}")
+            if saddr_str != "off":
+                m_s = re.fullmatch(r"s(\d+)", saddr_str)
+                if not m_s or not 0 <= int(m_s[1]) <= 105:
+                    raise ValueError(f"Invalid saddr register: {saddr_str}")
+                if saddr_str not in scalar:
+                    raise ValueError(f"Uninitialized or pending scalar register {saddr_str}")
+                base = scalar[saddr_str]
+                if not isinstance(base, int):
+                    raise ValueError(f"Dynamic or unproven scratch address: saddr {saddr_str} is not a proven integer constant")
+                addr_byte = base + offset
+            else:
+                addr_byte = offset
+
+            if addr_byte < 0:
+                raise ValueError("Negative scratch address")
+            if addr_byte % 4 != 0:
+                raise ValueError("Scratch dword offset must be 4-byte aligned")
+            if addr_byte + 4 * count > 1024:
+                raise ValueError(f"Scratch access exceeds frame: {addr_byte + 4 * count}")
+            addr_idx = addr_byte // 4
+
+            if not has_scratch:
+                lines.append("    uint scratch[256] = (uint[256])0;")
+                has_scratch = True
+
+            if kind == "load":
+                for comp, reg in enumerate(regs):
+                    dword_idx = addr_idx + comp
+                    if dword_idx not in scratch_written:
+                        raise ValueError(f"Scratch load from unwritten address: {addr_byte + 4 * comp}")
+                    if reg in sample_dest:
+                        raise ValueError("Write overlaps an outstanding sample")
+                    sample_dest[reg] = 0
+                    offset_term = f" + {comp}u" if comp else ""
+                    tag = f"alu{i}_{comp}" if count > 1 else f"alu{i}"
+                    vector[reg] = tag
+                    lines.append(f"    precise float {tag} = asfloat(scratch[{addr_idx}u{offset_term}]);")
+            else:
+                for comp, val in enumerate(values):
+                    dword_idx = addr_idx + comp
+                    scratch_written.add(dword_idx)
+                    offset_term = f" + {comp}u" if comp else ""
+                    lines.append(f"    scratch[{addr_idx}u{offset_term}] = {val};")
         elif m := match(r"v_cube(id|sc|tc|ma)_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+?)( clamp)?"):
             # LLVM ConstantFoldAMDGCNCubeIntrinsic: z, then y, then x is the major axis; a face is negative
             # only for a nonzero, non-NaN negative coordinate.
