@@ -4127,3 +4127,31 @@ level 12.0. The fixture uses a null parameter block and the desktop
 interface is rejected. The negative case supplies an unsupported IID after
 adapter selection. It checks the cleared device output, release of the adapter
 and factory references, zero frame bytes and exit code 20 on all three runners.
+
+## First-active-lane vector broadcast readback
+
+The `pixel_aot_warp` and `pixel_aot_hardware` fixtures include a dedicated
+`v_readfirstlane_b32` program, which is also included in the source-built
+binary round trip. `v_readfirstlane_b32` copies the value of a VGPR from the
+first active lane in the wavefront into an SGPR destination, lowered to HLSL SM 6.0
+`WaveReadLaneFirst()`. The destination scalar register is immediately tracked
+for downstream SALU arithmetic, VALU operands, and constant-buffer offset indexing.
+
+The lowerer enforces uniform-source extraction, where participating lanes
+hold the same value (as when broadcasting or scalarizing values copied from
+SGPRs, constant buffers, or immediate bit patterns). The draw fixture verifies
+broadcast scalar extraction across zero, normal, and high integer inputs against
+an exact bit pattern across 64 pixels, with a deliberate oracle mismatch case
+ensuring incorrect readbacks fail. Divergent per-lane source readback and
+non-zero first participating lane behavior remain unmeasured. Dedicated controls
+verify rejection of varying VGPR inputs (such as interpolated coordinates and
+barycentrics), non-entry execution masks (during whole-quad mode), VGPR destinations,
+out-of-range SGPR indices, unresolved scalar memory dependencies, and invalid modifiers,
+while uniform self-moves (`v_mov_b32_e32 v18, v18`) retain uniform provenance.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_(warp|hardware)$' -V
+```
+
+Python-only controls check HLSL wave-intrinsic translation, register tracking,
+and scanner recognition without requiring a GPU.

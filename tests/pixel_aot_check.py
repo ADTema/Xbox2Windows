@@ -4935,6 +4935,62 @@ def check_scalar_pair_reads() -> None:
     must_reject(translate, alias[:wait + 1] + [load] + alias[wait + 1:])
 
 
+def check_readfirstlane_controls() -> None:
+    program = readfirstlane_program()
+    source = translate_int(program)
+    assert "WaveReadLaneFirst(asuint(" in source
+    assert "salu" in source
+    assert "v_readfirstlane_b32" in ACCEPTED
+
+    # Positive control: self-move of a uniform register retains uniform provenance
+    self_move_prog = uncompressed_export([
+        "v_mov_b32_e32 v18, s44",
+        "v_mov_b32_e32 v18, v18",
+        "v_readfirstlane_b32 s48, v18",
+        "s_add_u32 s49, s48, 5",
+        "v_mov_b32_e32 v12, s48",
+        "v_mov_b32_e32 v13, s49",
+        "v_mov_b32_e32 v14, 0x12345678",
+        "v_mov_b32_e32 v15, 0",
+    ])
+    assert "WaveReadLaneFirst(asuint(" in translate_int(self_move_prog)
+
+    # Rejection controls with uniform source register
+    must_reject(translate, with_constants(["v_mov_b32_e32 v18, s44", "v_readfirstlane_b32 v12, v18"]))
+    must_reject(translate, with_constants(["v_mov_b32_e32 v18, s44", "v_readfirstlane_b32 s200, v18"]))
+    must_reject(translate, with_constants(["v_mov_b32_e32 v18, s44", "v_readfirstlane_b32 s48, v18 clamp"]))
+    must_reject(translate, with_constants(["v_mov_b32_e32 v18, s44", "v_readfirstlane_b32 s48, abs(v18)"]))
+    must_reject(translate, with_constants(["v_mov_b32_e32 v18, s44", "v_readfirstlane_b32 s48, -v18"]))
+    must_reject(translate, with_constants(["v_mov_b32_e32 v18, s44", "v_readfirstlane_b32 s48, v18, v13"]))
+
+    # Varying VGPR rejection: interpolated coordinates and barycentric inputs are not uniform
+    varying_prog = list(assembly(False))
+    pos = varying_prog.index("v_interp_p2_f32_e32 v8, v1, attr0.x")
+    varying_prog.insert(pos + 1, "v_readfirstlane_b32 s48, v8")
+    must_reject(translate, varying_prog)
+    must_reject(translate, with_constants(["v_readfirstlane_b32 s48, v0"]))
+    must_reject(translate, with_constants(["v_readfirstlane_b32 s48, v1"]))
+    varying_self_prog = list(assembly(False))
+    pos_self = varying_self_prog.index("v_interp_p2_f32_e32 v8, v1, attr0.x")
+    varying_self_prog.insert(pos_self + 1, "v_mov_b32_e32 v8, v8")
+    varying_self_prog.insert(pos_self + 2, "v_readfirstlane_b32 s48, v8")
+    must_reject(translate, varying_self_prog)
+
+    # Non-entry EXEC rejection (e.g. during WQM)
+    wqm_prog = list(assembly(False))
+    pos = wqm_prog.index("s_wqm_b64 exec, exec")
+    wqm_prog.insert(pos + 1, "v_mov_b32_e32 v18, s44")
+    wqm_prog.insert(pos + 2, "v_readfirstlane_b32 s48, v18")
+    must_reject(translate, wqm_prog)
+
+    # Unresolved scalar memory dependency
+    pending_prog = list(assembly(False))
+    pos = pending_prog.index("s_load_dwordx8 s[28:35], s[20:21], null")
+    pending_prog.insert(pos + 1, "v_mov_b32_e32 v18, s44")
+    pending_prog.insert(pos + 2, "v_readfirstlane_b32 s28, v18")
+    must_reject(translate, pending_prog)
+
+
 # s_setreg_imm32_b32 writes hardware state. The program opens with the scratch base writes, which no lowered
 # instruction reads. MODE[3:2] then selects round toward zero for an exact widening, restores round to nearest
 # even for two narrowings, and selects round toward zero again before a second exact widening and the
@@ -5764,6 +5820,18 @@ def align_integer_group(byte=False, swapped=False) -> list[str]:
         f"{op} v14, {left}, {right}, {last}",
         f"{op} v18, {left}, {right}, s46",
         "v_mov_b32_e32 v15, v18",
+    ])
+
+
+def readfirstlane_program() -> list[str]:
+    return uncompressed_export([
+        "v_mov_b32_e32 v18, s44",
+        "v_readfirstlane_b32 s48, v18",
+        "s_add_u32 s49, s48, 5",
+        "v_mov_b32_e32 v12, s48",
+        "v_mov_b32_e32 v13, s49",
+        "v_mov_b32_e32 v14, 0x12345678",
+        "v_mov_b32_e32 v15, 0",
     ])
 
 
@@ -7124,6 +7192,7 @@ def check_controls(directory):
     check_scalar_helpers_with_vector_arithmetic()
     check_adapter_skip(directory)
     check_scalar_pair_reads()
+    check_readfirstlane_controls()
     # Whole-dword SDWA comparisons lower exactly as the e32 forms; byte and word selections are refused.
     for first in range(0, 16, 4):
         assert translate(predicate_group(first, sdwa=True)) == translate(predicate_group(first)), first
@@ -8284,6 +8353,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (scalar64(), translate), (sopk_scalar(), translate), (sopk_cmpk_cmovk(), translate_int)]
     fixtures.extend((align_integer_group(byte), translate_int) for byte in (False, True))
     fixtures.extend((vop3_ternary_int_group(group), translate_int) for group in (1, 2))
+    fixtures.append((readfirstlane_program(), translate_int))
     fixtures.append((rgb_sample(), translate))
     fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
@@ -9368,6 +9438,27 @@ def check_absdiff_i32_draw(directory, compiler, renderer, backend):
         constants = bytearray(256)
         struct.pack_into("<2I", constants, 12, *inputs)
         case = directory / f"absdiff-i32-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+
+def check_readfirstlane_draw(directory, compiler, renderer, backend):
+    source = directory / "readfirstlane.hlsl"
+    shader = directory / "readfirstlane.cso"
+    program = readfirstlane_program()
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for name, input_val, words, status in (
+        ("oracle-mismatch", 42, (42, 47, 0x12345678, 999), "mismatch"),
+        ("normal", 42, (42, 47, 0x12345678, 0), "pass"),
+        ("zero", 0, (0, 5, 0x12345678, 0), "pass"),
+        ("large", 0x7ffffff0, (0x7ffffff0, 0x7ffffff5, 0x12345678, 0), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<I", constants, 12, input_val)
+        case = directory / f"readfirstlane-{name}.case"
         case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
         cases.append((case, status))
     run_pixel_batch(renderer, backend, shader, cases)
@@ -11398,6 +11489,7 @@ def check_e64_render(directory, compiler, renderer, backend):
     check_subrev_u32_draw(directory, compiler, renderer, backend)
     check_lshl_add_u32_draw(directory, compiler, renderer, backend)
     check_absdiff_i32_draw(directory, compiler, renderer, backend)
+    check_readfirstlane_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend)
     check_cvt_float_int_draw(directory, compiler, renderer, backend)

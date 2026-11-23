@@ -1751,6 +1751,21 @@ SDWA_INT_OPERANDS = re.compile(
     r"(?: src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD))?")
 
 
+class VectorRegisters(dict):
+    """Register tracker for vector registers with uniform provenance tracking."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.uniform = set()
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.uniform.discard(key)
+
+    def is_uniform(self, reg):
+        return reg in self.uniform
+
+
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
           title_ranges=None, flat_global_only=False, return_write_mask=False):
@@ -1775,7 +1790,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if texcoord_components not in (2, 4):
         raise ValueError("Expected two or four TEXCOORD components")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
-    vector = {"v0": "bary_i", "v1": "bary_j"}
+    vector = VectorRegisters({"v0": "bary_i", "v1": "bary_j"})
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
     # The boolean records whether the quad value depends on interpolated coordinates.
     quad_values = {"uv.x": True, "uv.y": True}
@@ -2504,7 +2519,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             value = fp_operand(src, scalar, vector, pending, sample_dest)
+            is_uniform = src.startswith("s") or bool(re.fullmatch(r"-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}", src)) or vector.is_uniform(src)
             vector[dst] = f"alu{i}"
+            if is_uniform:
+                vector.uniform.add(dst)
             lines.append(f"    precise float alu{i} = {value};")
         elif m := match(r"v_swap_b32(?:_e32)? (v\d+), (v\d+)"):
             # Both registers exchange their old values. Every vector entry names an immutable HLSL
@@ -2520,7 +2538,29 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError("Constant read before load completion")
                 if reg in sample_dest:
                     raise ValueError("Swap overlaps an outstanding sample")
+            u_dst = vector.is_uniform(dst)
+            u_src = vector.is_uniform(src)
             vector[dst], vector[src] = vector[src], vector[dst]
+            if u_dst:
+                vector.uniform.add(src)
+            else:
+                vector.uniform.discard(src)
+            if u_src:
+                vector.uniform.add(dst)
+            else:
+                vector.uniform.discard(dst)
+        elif m := match(r"v_readfirstlane_b32(?:_e32)? (s\d+), (.+)"):
+            dst, src = m.groups()
+            sgpr_name(dst)
+            if mask != "entry":
+                raise ValueError("Invalid lane read operation")
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            if src.startswith("v") and not vector.is_uniform(src):
+                raise ValueError(f"v_readfirstlane_b32 requires a uniform source register: {src}")
+            arg = int_operand(src, scalar, vector, pending, sample_dest, signed=False)
+            lines.append(f"    uint salu{i} = WaveReadLaneFirst({arg});")
+            scalar[dst] = ("uint", f"salu{i}")
         elif m := match(rf"v_({'|'.join(ALU)})_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
