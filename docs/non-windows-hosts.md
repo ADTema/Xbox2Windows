@@ -134,7 +134,7 @@ LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 \
   ./out/pe-env/bin/python -B tests/rdna2_tools_check.py
 ```
 
-On Fedora, the system `python3` creates the virtual environment without an extra package. Install the `llvm15` compatibility package. It does not add LLVM 15 to `PATH`, so pass the full paths under `/usr/lib64/llvm15`:
+On Fedora, the system `python3` creates the virtual environment without an extra package. Install the `llvm15` compatibility package. The package also installs versioned tool names such as `llvm-mc-15` and `llvm-objcopy-15`. The commands below use the package's full paths on x86-64 to select LLVM 15 explicitly:
 
 ```bash
 sudo dnf install -y llvm15
@@ -149,7 +149,7 @@ LLVM_LIB="$LLVM15/lib/libLLVM-15.so" \
   ./out/pe-env/bin/python -B tests/rdna2_tools_check.py
 ```
 
-These commands were checked on Fedora 45 with `llvm15` 15.0.7 and Python 3.15.2. Fedora's default `llvm` package is a newer major version (23 on Fedora 45), which the fixtures do not target.
+These commands were checked on Fedora 45 with `llvm15` 15.0.7 and Python 3.15.2. See the [Fedora 45 package file list](https://packages.fedoraproject.org/pkgs/llvm15/llvm15/fedora-45.html) for the versioned tools and their paths. Fedora's default `llvm` package is a newer major version (23 on Fedora 45), which the fixtures do not target.
 
 ## Optional Vulkan arithmetic check
 
