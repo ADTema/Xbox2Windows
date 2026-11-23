@@ -3122,6 +3122,24 @@ An `ALTER_IMM` variant changes the `cmppd` predicates of `op_cmppd_1` (1 to 5), 
 
 Not covered by this experiment: the 36 reserved SSE2 forms, MMX-domain operands and `maskmovdqu`, control flow or calls mixed with SSE2 state, nonvolatile `XMM6`..`XMM15` save/restore prologues, faults caused by violating the aligned-base or valid-buffer preconditions, and non-temporal caching effects, and title CPU code execution.
 
+## MMX/SSE2 conversion and bridge leaf recompilation
+
+[The MMX/SSE2 bridge translator](../tools/cpu_mmx_sse2_aot.py) lifts bounded straight-line Windows x64 leaf functions covering `cvtpd2pi`, `cvttpd2pi`, `movdq2q`, `movq2dq` (`SSE2`) and `emms` (`MMX`), alongside `movdqa`, `movdqu`, `movq` (between `mm`, volatile scratch `r64` `rax`/`r9`/`r10`/`r11`, and flat `[rcx|rdx|r8]` memory) and `ret`.
+
+Call with an empty x87 stack, no live MMX values, and default MXCSR controls (round-to-nearest-even, all exceptions masked, DAZ and FTZ off). The leaf ABI compares the output bytes. Floating-point status flags and physical x87 tag transitions are outside this profile. The caller provides valid buffers and a 16-byte-aligned base for each aligned memory operand.
+
+- `XMM0`..`XMM5` are modeled as `Vec128` (`std::uint64_t q[2]`) and `MM0`..`MM7` as `std::uint64_t mm[8]`.
+- `mmx_active` is tracked across the function; any `MM` register touch activates it, `emms` clears it (and invalidates prior `MM` definitions) unconditionally, and `ret` rejects if `mmx_active` remains true.
+- `cvtpd2pi` (round-to-nearest-even) and `cvttpd2pi` (truncate toward zero) lower to portable `<cmath>`/`<cstdint>`/`<cstring>` helpers returning `0x80000000` on NaN, `+/-Inf`, or out-of-`int32_t` range after rounding. `movq2dq` zeroes `xmm[127:64]`.
+- Memory operands must be flat `[base + disp]` rooted in `rcx`, `rdx` or `r8`, memory stores are restricted to `r8`, and `cvtpd2pi`/`cvttpd2pi` `m128` and `movdqa` require `disp % 16 == 0`. VEX/EVEX encodings, `xmm6`..`xmm15`, nonvolatile/argument GPRs, undefined registers, prefixes and unsupported instructions reject.
+
+```powershell
+cmake --build --preset dev --target cpu_mmx_sse2_original cpu_mmx_sse2_original_lifted cpu_mmx_sse2_altered cpu_mmx_sse2_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_mmx_sse2$' -V
+```
+
+[The MASM fixture](../tests/cpu/mmx_sse2.asm) builds 12 exports covering register and displaced-memory `cvtpd2pi`/`cvttpd2pi`, `movdq2q`, dirty-seeded `movq2dq`, standalone `emms`, `movq` (`mm`/`r64`/`[rcx|r8]`), aligned `movdqa`, unaligned `movdqu` and a chained bridge re-entering MMX after `emms`. [The check script](../tests/cpu/mmx_sse2_check.py) verified 210 native/lifted/reference differential cases (including `2147483647.5`, `2147483648.0`, `-2147483648.5`, `-2147483649.0`, `+/-0.0`, `+/-Inf` and NaNs), an `ALTER_IMM` variant swapping `cvtpd2pi`/`cvttpd2pi` (diverging on 4 cases each), an output-mutation negative control, 8 alternate-encoding lift checks, 46 unit rejections and 9 PE-patched DLL rejections. Not covered: remaining `MMX`/`SSE2` forms outside these 5 ops, control flow/calls, x87/MMX aliasing across calls, and title CPU code execution.
+
 ## D3D12 pixel-position inputs
 
 `pixel_position_centers` compiles a standalone Shader Model 6.0 pixel shader. Its inputs are `float4 TEXCOORD0` and `float4 SV_Position`, in the order emitted by the existing full-screen vertex shader. Red and green depend only on `SV_Position`. The test reads an 8×8 RGBA32F target with a 5×3 viewport at (2, 1). The CPU reference expects red and green to contain the absolute pixel center coordinates, with a half-pixel offset on each axis. The other 49 pixels retain the clear color. A second shader exchanges red and green and must first disagree at (2, 1), where the expected coordinates are (2.5, 1.5). [HLSL system-value semantics](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-semantics)
