@@ -329,7 +329,7 @@ def string_op(i):
     return f"{{ const word step = direction ? 0ull - {size}ull : {size}ull; {body} }}"
 
 
-def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
+def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, host_entropy=False):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false, overflow=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
@@ -635,6 +635,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         elif op == M.RDTSCP:
             stmt = ("{ unsigned int aux; const volatile uint64_t tsc = __rdtscp(&aux); "
                     "rax = static_cast<uint32_t>(tsc); rdx = tsc >> 32; rcx = aux; }")
+        elif op in (M.RDRAND, M.RDSEED) and host_entropy:
+            # The opt-in host-entropy profile: one host RDRAND or RDSEED per guest execution. CF is the
+            # intrinsic's result; on CF=0 the destination gets zero at its width, and the guest decides whether
+            # to retry. ZF and OF are cleared (PF where it is modelled; SF and AF are not). The volatile result
+            # keeps the read when the guest discards it; without it /O2 removes the read.
+            size = RegisterExt.size(i.op0_register)
+            step = f"_{'rdrand' if op == M.RDRAND else 'rdseed'}{8 * size}_step"
+            stmt = (f"{{ {UINT[size]} rnd = 0; const volatile int rnd_ok = {step}(&rnd); if (!rnd_ok) rnd = 0; "
+                    f"carry = rnd_ok != 0; zero = false; overflow = false; {'parity = false; ' if parity else ''}"
+                    f"{write_register(i.op0_register, 'rnd')} }}")
         elif op in (M.SHL, M.SHR, M.SAR) and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
             size = RegisterExt.size(i.op0_register)
             bits = 8 * size
