@@ -1873,18 +1873,30 @@ the descriptor-table load of the other fixtures. Its bindings are
 `--table-reg 0 --descriptor-offset 0 --group-reg 2 --group-reg-y 3
 --group-reg-z 4 --stride 136`.
 
+A store with `offen` and no `idxen` can also take a row pitch:
+`v_mad_u32_u24` of a row dispatch index, a literal pitch and the column's
+`v_lshlrev_b32` byte offset, with the pitch in either multiplicand. LLVM 15
+emits this form when the source masks the row index to 24 bits, and places the
+pitch in src0. The instruction multiplies only bits [23:0] of the row, so the
+HLSL masks the row with `0xffffff` before the multiply. The pitch must be a
+multiple of 4 from 4 to 2^24 - 4. The store must fit in one element and one
+group's columns in the pitch. Without `idxen` the descriptor stride is unused,
+so `--stride` does not change the output.
+
 All stores in a program use one layout, so no two invocations of a group write
 the same bytes. A dispatch-thread index can also be stored as data. The
 translator does not model out-of-range behavior for structured buffers: the
 caller's stride and dispatch must keep every row in range. Addresses that need
-other ALU forms, for example a `v_mad_u32_u24` row pitch, are still rejected.
+other ALU forms are still rejected: a `v_mul_lo_u32` row pitch on an unmasked
+index, a pitch read from a constant or a register, a `v_lshl_or_b32` dispatch
+index and a pitch offset combined with `idxen`.
 
 ```sh
 python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-reg 8 --descriptor-offset 0 --group-reg 10 --group-reg-y 11 --stride 72 --output out/tile.hlsl
 ```
 
 The Windows fixture covers five group shapes, one of them in two address
-forms, each with a full 320-word readback:
+forms, and a row-pitch kernel, each with a full 320-word readback:
 
 | Group | Dispatches |
 |---|---|
@@ -1894,11 +1906,18 @@ forms, each with a full 320-word readback:
 | 256×1×1 | 1×1×1 |
 | 4×4×4 | 1×1×1 and 1×2×2 |
 | 4×4×4, LLVM 15 form | 1×1×1, 1×1×2 and 1×2×2 |
+| 4×4×1, row pitch | 1×1×1 and 2×3×1 |
 
 The 4×4×4 kernel stores dispatch Z at `tid.z * 132 + (tid.y << 4) + (tid.x << 2)`.
 Its 132-byte stride covers both groups' rows in Y and leaves one guard word per
 plane. The LLVM 15 form stores dispatch Z at `tid.z * 136 + (tid.y << 4) +
 (tid.x << 2)`, with two guard words per plane.
+
+The row-pitch kernel stores `(tid.x, tid.y)` at
+`(tid.y & 0xffffff) * 72 + (tid.x << 3)`. Two groups of 8-byte columns in X
+leave two guard words per row. The fixture is hand-assembled in the operand
+order LLVM 15 emits. It does not cover row indexes of 2^24 or more, where the
+mask changes the address.
 
 The expected words come from an independent per-invocation model. For each
 shape, the following must fail on the adapter:
@@ -1908,7 +1927,8 @@ shape, the following must fail on the adapter:
 - recompiled HLSL with swapped axes;
 - recompiled HLSL that ignores Z (4×1×8 and 4×4×4);
 - recompiled HLSL with half the group X size;
-- for the LLVM 15 form, recompiled HLSL with X and Z or Y and Z swapped.
+- for the LLVM 15 form, recompiled HLSL with X and Z or Y and Z swapped;
+- recompiled HLSL with a 64-byte pitch (row pitch only).
 
 Each recompiled variant runs on the shape's largest dispatch, with one
 exception: Y and Z both span 8 in the 1×2×2 dispatch, so swapping them leaves
@@ -1935,12 +1955,23 @@ The CPU controls reject:
   a group Y size different from X, checks the shift and the power of two against
   Y;
 - `v_add_lshl_u32` of an unscaled group ID, of the local ID of another axis or
-  into a register past `v255`, and a group base stored as data.
+  into a register past `v255`, and a group base stored as data;
+- a pitch that is unaligned, zero, negative, wider than 24 bits, narrower than
+  one group's columns, or read from a register;
+- a pitch offset built from a raw local ID, from the column's axis or from an
+  index instead of a byte offset, or written with `clamp`;
+- a pitch offset combined with `idxen`, stored as data, or used next to a
+  store with another pitch.
+
+They also check that the pitch is accepted in either multiplicand, as a
+decimal inline constant, and with or without a stride binding.
 
 `tools/shader_profile_audit.py` passes the PSV0 size and tries the next one or
 two SGPRs after the group-X candidate for group Y and Z. A CPU control in
 `compute_store_check.py` checks that a 4×1×8 kernel reading group Z from the
-SGPR after group X is accepted, and one reading it two SGPRs later is not. Its
+SGPR after group X is accepted, and one reading it two SGPRs later is not.
+Another checks that the audit accepts the row-pitch kernel although it always
+offers a stride for groups larger than one thread. Its
 record counts have not been remeasured after this change.
 
 A local scan of 2,689 compute records accepted 12 records (10 distinct instruction streams). Ten use one-thread groups and fixed addresses. Two use 32- and 64-thread groups and indexed addresses. Tested table bindings used s4 or s5 with descriptor offsets of 0, 32 or 64. The indexed bindings used strides of 4, 8, 12 or 16 bytes, selecting the first compatible profile. On RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), each record compiled to desktop DXIL and dispatched. Each adapter completed 14 full-buffer comparisons with zero mismatches, including two different group counts for both indexed records.
