@@ -122,6 +122,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_madmk_f32\s+v\d+,\s+[^,]+,\s+0x[0-9a-f]{1,8},\s+[^,]+",
     r"v_mov_b32(?:_e32|_e64)?\s+v\d+,\s+(?:-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)",
     r"v_swap_b32(?:_e32)?\s+v\d+,\s+v\d+",
+    rf"v_readfirstlane_b32(?:_e32)?\s+s\d+,\s+{INTEGER_SOURCE}",
     rf"v_mov_b32_sdwa\s+v\d+,\s+(?:sext\((?:[vs]\d+|-?\d+(?:\.\d+)?)\)|[vs]\d+|-?\d+(?:\.\d+)?)\s+dst_sel:{SDWA_SEL_PATTERN}\s+dst_unused:(?:UNUSED_PAD|UNUSED_PRESERVE)\s+src0_sel:{SDWA_SEL_PATTERN}",
     r"v_cvt_f32_f16(?:_e32|_e64)?\s+v\d+,\s+-?(?:\|(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\((?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_f32_f16_sdwa\s+v\d+,\s+-?(?:\|[vs]\d+\||[vs]\d+)(?:\s+clamp)?\s+dst_sel:DWORD\s+dst_unused:UNUSED_(?:PAD|PRESERVE)\s+src0_sel:WORD_[01]",

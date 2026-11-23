@@ -174,6 +174,8 @@ class TestRdna2Disasm(unittest.TestCase):
             ("f202047e", "v_mov_b32_e32", "v_mov_b32_e32 v2, 1.0"),
             ("f002067e", "v_mov_b32_e32", "v_mov_b32_e32 v3, 0.5"),
             ("8002087e", "v_mov_b32_e32", "v_mov_b32_e32 v4, 0"),
+            ("0105007e", "v_readfirstlane_b32", "v_readfirstlane_b32 s0, v1"),
+            ("0c05587e", "v_readfirstlane_b32", "v_readfirstlane_b32 s44, v12"),
             # VOP2 9-bit SRC0 (VGPR vs SGPR vs inline constant) with GFX10/RDNA 2 opcodes
             ("01050602", "v_cndmask_b32_e32", "v_cndmask_b32_e32 v3, v1, v2, vcc_lo"),
             ("01050606", "v_add_f32_e32", "v_add_f32_e32 v3, v1, v2"),
@@ -2547,6 +2549,21 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_cmp_lt_u64_e64 s52, v[18:20], v[20:21]",
         ):
             self.assertFalse(is_instruction_supported(line), line)
+        for line in (
+            "v_readfirstlane_b32 s0, v1",
+            "v_readfirstlane_b32 s44, v12",
+            "v_readfirstlane_b32 s10, 0x1234",
+            "v_readfirstlane_b32 s10, 42",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_readfirstlane_b32 v0, v1",
+            "v_readfirstlane_b32 s0, v1, v2",
+            "v_readfirstlane_b32 s0",
+            "v_readfirstlane_b32",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        self.assertTrue(is_opcode_recognized("v_readfirstlane_b32"))
         for line in (
             "v_alignbit_b32 v1, v2, v3, v4",
             "v_alignbit_b32_e64 v1, v2, v3, 4",
