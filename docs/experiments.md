@@ -1180,6 +1180,23 @@ The model compares with the `Fraction` model of `cpu_aot_x87_compare` and copies
 
 `pfkeep` mismatches in `sahf_fucomi` only where the `sahf` before `fucomi` left a different PF. On the AMD Ryzen 7 7700 and the Intel Core Ultra 7 358H (Windows 11 build 26300) every case matched in the native and translated DLLs. Translation rejects 10 sequences: `fcmovu` before any flag writer, `fcmovnu` after `test eax, eax`, `fcmovu` after `fucomi` and `inc eax`, `jp` after `fucomi` and `add eax, 1`, `fcmovu` after a call, a join of a `fucomi` path and a `cmp` path, `sahf` on `fnstsw ax` without a comparison before `fcmovu`, `fcmovu st, st(2)` with two values, `fcmovnu st, st(1)` with one value, and `setp` after `fucomi`, which the integer lowering does not implement. It translates 5 twins: `fcmovu` after `fucomi`, `fcmovnu` after `fucomi` and a `mov`, `jp` after `fucomip` and `fstp st(0)`, a join of a `fucomi` path and a `sahf` path, and `fcmovu` after `fucomi` and `lea`. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_x87_parity$' -V`.
 
+### Ryzen 7 7800X3D measurements
+
+The four x87 fixtures reported in [#592](https://github.com/R0Y00/Xbox2Windows/pull/592) also passed on an AMD Ryzen 7 7800X3D with Windows 11 Pro x64 build `26200.9974` and MSVC `19.44.35228.0`. The `dev` build used commit `af942385c9561a9ee4d5d202d79bae9a084fb87f`.
+
+| CTest | Cases | Exports | Negative controls that detected a mismatch |
+|---|---:|---:|---:|
+| `cpu_aot_x87_compare` | 12,230 | 12 | 7 |
+| `cpu_aot_x87_fcmov` | 13,290 | 16 | 8 |
+| `cpu_aot_x87_iarith` | 28,512 | 15 | 6 |
+| `cpu_aot_x87_fnstcw` | 1,776 | 6 | 4 |
+
+The native and recompiled DLLs matched the reference for the output blocks and guards in all 55,808 cases. Every checked export returned with control word `0x027F` and an empty x87 stack. CTest reported four passes and no skips.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_aot_x87_(compare|fcmov|iarith|fnstcw)$' -V
+```
+
 ## Mapping an image without LoadLibrary
 
 `tools/pe_map.cpp` maps an x64 PE32+ image into memory it allocates itself, away from the preferred base, and applies its DIR64 and HIGHLOW base relocations. It binds ordinary and delay imports through a resolver supplied by the host, sets section protections, records the actual base in the mapped headers and registers `.pdata` with `RtlAddFunctionTable`. The original machine code runs unchanged. Header fields are checked against the file and image size before use. It then calls TLS callbacks and the entry point of a DLL; `pe_map_run` starts an EXE. An implicit TLS data template is served through a carrier DLL that Windows loads (see "Implicit TLS data" below). [Issue #46](https://github.com/R0Y00/Xbox2Windows/issues/46)
