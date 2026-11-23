@@ -833,8 +833,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                     "rax = static_cast<uint32_t>(cpu_regs[0]); rbx = static_cast<uint32_t>(cpu_regs[1]); "
                     "rcx = static_cast<uint32_t>(cpu_regs[2]); rdx = static_cast<uint32_t>(cpu_regs[3]); }")
         elif op == M.XGETBV and host_cpu:
-            # The host's extended control register ECX into EDX:EAX, flags kept; an invalid index faults on the
-            # host as it does natively. The volatile result keeps a discarded read; without it /O2 removes it.
+            # The host's extended control register ECX into EDX:EAX, flags kept. Any ECX is passed through, but
+            # the supported contract is a caller that checked OSXSAVE and reads XCR0 (ECX = 0); an invalid index
+            # faults on the host as it does natively. The volatile result keeps a discarded read; without it /O2
+            # removes it.
             stmt = ("{ const volatile uint64_t xcr = _xgetbv(static_cast<uint32_t>(rcx)); "
                     "rax = static_cast<uint32_t>(xcr); rdx = xcr >> 32; }")
         elif op in (M.RDRAND, M.RDSEED) and host_entropy:
