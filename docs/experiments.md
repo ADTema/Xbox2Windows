@@ -2238,6 +2238,12 @@ The corresponding `ds_add_rtn_u32`, `ds_sub_rtn_u32`, `ds_and_rtn_b32`,
 `ds_or_rtn_b32` and `ds_xor_rtn_b32` forms also copy the word's value before
 the update into the destination VGPR. They capture the inputs before writing
 that destination, which may overlap the address or data VGPR.
+
+At offset 0, `ds_rsub_u32` stores the source VGPR minus the old word modulo
+2^32. `ds_min_i32` and `ds_max_i32` compare the operands as signed 32-bit
+integers. `ds_min_u32` and `ds_max_u32` compare them as unsigned integers.
+Each comparison stores the selected operand's 32-bit pattern in the private
+LDS word. These five forms have no destination VGPR.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The source-built wave32 fixture reads the full word and both halves after
@@ -2266,6 +2272,12 @@ the second overlaps the address VGPR. Both returned values and the final LDS
 word are compared across the entire UAV for one and three groups. Returning
 the updated word from the first operation must mismatch at word 0. Omitting
 the second update while preserving its return value must mismatch at word 2.
+
+The reverse subtract and min/max fixtures read the initialized word and the
+results of two consecutive updates. Operands cross the sign bit and wrap to
+zero at different lanes. All 320 UAV words are compared for dispatches of one
+and three groups. Swapping the subtraction operands or changing a comparison's
+signedness must mismatch at word 1.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
