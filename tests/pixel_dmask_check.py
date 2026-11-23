@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 
-from pixel_aot_check import RAMP, half_rtz, lower, must_reject, single
+from pixel_aot_check import RAMP, dual_program, half_rtz, lower, must_reject, single
 
 SAMPLER = (0x92, 0xc00000, 0x14500000, 0)
 W_G = struct.unpack("<f", bytes.fromhex("7424373f"))[0]
@@ -83,6 +83,19 @@ def sparse_two_channel_program(dmask, tex_offset=0x0):
     ]
 
 
+def sparse_rga_program():
+    return [
+        *make_header(0),
+        "v_mov_b32_e32 v7, 0.25",
+        "image_sample v[4:6], v[2:3], s[4:11], s[0:3] dmask:0xb dim:SQ_RSRC_IMG_2D",
+        "s_waitcnt vmcnt(0)",
+        "v_cvt_pkrtz_f16_f32_e32 v0, v4, v5",
+        "v_cvt_pkrtz_f16_f32_e32 v1, v6, v7",
+        "exp mrt0 v0, v0, v1, v1 done compr vm",
+        "s_endpgm",
+    ]
+
+
 def build_case(eval_fn):
     data = bytearray(256)
     for y in RAMP:
@@ -103,8 +116,11 @@ def check_rejections():
     must_reject(lambda: lower(base, 8, 9, None, texture_offset=32))
     # Overlapping texture_offset and second_texture_offset
     must_reject(lambda: lower(base, 8, 9, SAMPLER, texture_offset=32, second_texture_offset=32))
+    for invalid in (-32, 16):
+        must_reject(lambda: lower(base, 8, 9, SAMPLER, texture_offset=32, second_texture_offset=invalid))
     # Overlapping texture_offset and constant_descriptor
     must_reject(lambda: lower(base, 8, 9, SAMPLER, constant_descriptor=0x24, texture_offset=0x20))
+    must_reject(lambda: lower(base, 8, 9, SAMPLER, texture_offset=0x20, extra_constants=[(8, 0x24)]))
     # dmask:0x0 rejected
     must_reject(lambda: lower([s.replace("dmask:0x7", "dmask:0x0") for s in base], 8, 9, SAMPLER, texture_offset=0x20))
     # VGPR width mismatch (dmask:0x7 needs 3 VGPRs, not 4 or 2)
@@ -112,12 +128,26 @@ def check_rejections():
     must_reject(lambda: lower([s.replace("v[0:2]", "v[0:1]") for s in base], 8, 9, SAMPLER, texture_offset=0x20))
     # Single-channel must use vN (not v[N:N]); multi-channel must use v[a:b] (not vN)
     one = single_channel_program(0x1, 0x40)
+    must_reject(lambda: lower([s.replace("image_sample v4,", "image_sample v256,") for s in one],
+                              8, 9, SAMPLER, texture_offset=0x40))
     must_reject(lambda: lower([s.replace("image_sample v4,", "image_sample v[4:4],") for s in one], 8, 9, SAMPLER, texture_offset=0x40))
     must_reject(lambda: lower([s.replace("dmask:0x1", "dmask:0x3") for s in one], 8, 9, SAMPLER, texture_offset=0x40))
 
 
+def check_adjacent_descriptors():
+    first = "s_load_dwordx8 s[28:35], s[20:21], null"
+    second = "s_load_dwordx8 s[56:63], s[20:21], 0x20"
+    program = dual_program()
+    program[program.index(first)] = first.replace("null", "0x20")
+    program[program.index(second)] = second.replace("0x20", "null")
+    source = lower(program, 20, 24, [1, 2, 3, 4], texture_offset=32, second_texture_offset=0)
+    assert source.index("= tex.Sample(") < source.index("= tex1.Sample(")
+    must_reject(lambda: lower(program, 20, 24, [1, 2, 3, 4], 0x10, texture_offset=32, second_texture_offset=0))
+
+
 def run(directory, compiler, renderer, backend):
     check_rejections()
+    check_adjacent_descriptors()
 
     def eval_luma(r, g, b, a):
         y1 = fma32(W_R, r, single(W_G * g))
@@ -134,6 +164,8 @@ def run(directory, compiler, renderer, backend):
          lambda r, g, b, a: (half_rtz(r), half_rtz(b), half_rtz(b), half_rtz(r))),
         ("sparse_ga_0x0", sparse_two_channel_program(0xa, 0x0), 0x0,
          lambda r, g, b, a: (half_rtz(g), half_rtz(a), half_rtz(a), half_rtz(g))),
+        ("sparse_rga_0x0", sparse_rga_program(), 0x0,
+         lambda r, g, b, a: (half_rtz(r), half_rtz(g), half_rtz(a), 0.25)),
     ]
 
     for tag, prog, tex_off, eval_fn in cases:
@@ -147,18 +179,20 @@ def run(directory, compiler, renderer, backend):
         if res.returncode != 0:
             return res.returncode
 
-    # Mutation negative control: changing dmask:0x5 (R,B) to dmask:0x6 (G,B) must fail pixel check
-    bad_prog = sparse_two_channel_program(0x6, 0x0)
+    # Change either the selected channel or the unsampled neighbor.
+    clobbered = sparse_rga_program()
+    clobbered.insert(clobbered.index("s_waitcnt vmcnt(0)") + 1, "v_mov_b32_e32 v7, v6")
     bad_hlsl = directory / "bad_dmask.hlsl"
     bad_cso = directory / "bad_dmask.cso"
-    bad_hlsl.write_text(lower(bad_prog, 8, 9, SAMPLER, texture_offset=0x0), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", bad_cso, bad_hlsl], check=True)
-    wrong = subprocess.run(
-        [renderer, backend, "--check-pixel-case", bad_cso, directory / "sparse_rb_0x0.case"],
-        capture_output=True, text=True,
-    )
-    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
-        raise AssertionError("Wrong dmask channel selection escaped detection")
+    for program, tag in ((sparse_two_channel_program(0x6), "sparse_rb_0x0"), (clobbered, "sparse_rga_0x0")):
+        bad_hlsl.write_text(lower(program, 8, 9, SAMPLER), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", bad_cso, bad_hlsl], check=True)
+        wrong = subprocess.run(
+            [renderer, backend, "--check-pixel-case", bad_cso, directory / f"{tag}.case"],
+            capture_output=True, text=True,
+        )
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"{tag}: changed output escaped detection")
 
     return 0
 

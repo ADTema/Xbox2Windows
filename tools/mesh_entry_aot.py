@@ -1,4 +1,4 @@
-"""Specialize a bounded, two-wave gfx1013 mesh entry to a single desktop mesh dispatch.
+"""Specialize a bounded, two-wave gfx1013 mesh entry for desktop D3D12.
 
 Geometry words and dispatch ABI are static inputs. Position and transform buffers
 remain GPU inputs. Only forward control flow decided by static values is accepted.
@@ -47,6 +47,7 @@ class Wave:
         self.barriers = []
         self.counts = []
         self.positions = {}
+        self.attributes = {}
         self.indices = {}
         self.m0 = None
 
@@ -408,9 +409,11 @@ class Wave:
                         self.v[lane][int(match[1][1:])] = self.geometry[addr // 4]
                         self.pending_v.add((lane, match[1]))
             elif op == "exp":
-                m = re.fullmatch(r"(prim|pos0),? (.+) done", tail)
+                m = re.fullmatch(r"(prim|pos0|param0),? (.+?)( done)?", tail)
                 if not m:
                     raise ValueError("Unsupported mesh export")
+                if not m[3] and m[1] != "param0":
+                    raise ValueError("Expected completed primitive or position export")
                 operands = m[2].split(", ")
                 for lane in range(64):
                     if not self.exec & (1 << lane):
@@ -427,6 +430,10 @@ class Wave:
                         if i in self.positions:
                             raise ValueError("Duplicate position")
                         self.positions[i] = [self.lane_value(t, lane) for t in operands]
+                    elif m[1] == "param0" and len(operands) == 4 and all(re.fullmatch(r"v\d+", t) for t in operands):
+                        if i in self.attributes:
+                            raise ValueError("Duplicate vertex attribute")
+                        self.attributes[i] = [self.lane_value(t, lane) for t in operands]
                     else:
                         raise ValueError("Unsupported live export")
             elif op.startswith("s_"):
@@ -438,7 +445,45 @@ class Wave:
         raise ValueError("No program exit")
 
 
-def lower(decoded, geometry, limits, vertex_header=None):
+def float4(values):
+    components = ", ".join(v if isinstance(v, str) else f"asfloat(0x{v:08x}u)" for v in values)
+    return f"float4({components})"
+
+
+def emit_compute_draw(bindings, expressions, positions, indices, attributes):
+    # Match the native trace layout, with optional PARAM0 data after its 80 bytes.
+    # The vertex shader follows the generated triangle indices using SV_VertexID.
+    lines = [
+        *bindings,
+        "RWByteAddressBuffer geometryOut : register(u0);",
+        "ByteAddressBuffer geometryIn : register(t1);",
+        "[numthreads(3,1,1)] void main(uint id:SV_GroupIndex) {",
+        *(f"  precise float {name} = {expr};" for expr, name in expressions.items()),
+    ]
+    for i, values in positions.items():
+        lines.append(f"  if (id == {i}) geometryOut.Store4({16 + i * 16}, asuint({float4(values)}));")
+    for i, values in attributes.items():
+        lines.append(f"  if (id == {i}) geometryOut.Store4({80 + i * 16}, asuint({float4(values)}));")
+    lines.extend([
+        "  if (!id) {",
+        "    geometryOut.Store2(0, uint2(3,1));",
+        f"    geometryOut.Store3(64, uint3({','.join(map(str, indices[0]))}));",
+        "  }",
+        "}",
+        # The translated pixel input expects TEXCOORD0 in register zero.
+        "struct Vertex {" + ("float4 attr:TEXCOORD0;" if attributes else "") + "float4 position:SV_Position;};",
+        "Vertex vertex_main(uint id:SV_VertexID) {",
+        "  uint index = geometryIn.Load(64 + id * 4);",
+        "  Vertex v;",
+        "  v.position = asfloat(geometryIn.Load4(16 + index * 16));",
+    ])
+    if attributes:
+        lines.append("  v.attr = asfloat(geometryIn.Load4(80 + index * 16));")
+    lines.extend(["  return v;", "}"])
+    return "\n".join(lines) + "\n"
+
+
+def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False):
     if vertex_header is not None and (
         type(vertex_header) != int or not 0 <= vertex_header <= U32
     ):
@@ -461,6 +506,9 @@ def lower(decoded, geometry, limits, vertex_header=None):
         raise ValueError("Inconsistent mesh synchronization or allocation")
     nv, np = waves[0].counts[0]
     pos = waves[0].positions | waves[1].positions
+    attributes = waves[0].attributes | waves[1].attributes
+    if attributes and attributes.keys() != pos.keys():
+        raise ValueError("Incomplete vertex attribute")
     idx = waves[0].indices | waves[1].indices
     if (nv, np) != (3, 1):
         raise ValueError("Expected a single three-vertex triangle")
@@ -472,34 +520,38 @@ def lower(decoded, geometry, limits, vertex_header=None):
         or any(max(tri) >= nv for tri in idx.values())
     ):
         raise ValueError("Conflicting mesh counts, vertices or primitive indices")
-    lines = [
+    bindings = [
         "cbuffer Points : register(b0) { float4 pointData[32]; };",
         "cbuffer Matrices : register(b1) { float4 matrixData[32]; };",
+    ]
+    if vertex_header is not None:
+        bindings.insert(0, "ByteAddressBuffer vertexData : register(t0);")
+    if compute_fallback:
+        return emit_compute_draw(bindings, expressions, pos, idx, attributes)
+    lines = [
+        *bindings,
         "#ifdef TRACE_EXPORTS",
         "RWByteAddressBuffer trace : register(u0);",
         "#endif",
-        "struct Vertex {float4 position:SV_Position;};",
+        "struct Vertex {float4 position:SV_Position;" + ("float4 attr:TEXCOORD0;" if attributes else "") + "};",
         '[outputtopology("triangle")]',
         f"[numthreads(128,1,1)] void main(uint id:SV_GroupIndex, out vertices Vertex v[{nv}], out indices uint3 p[{np}]) {{",
         f"  SetMeshOutputCounts({nv},{np});",
     ]
-    if vertex_header is not None:
-        lines.insert(0, "ByteAddressBuffer vertexData : register(t0);")
     for expr, name in expressions.items():
         lines.append(f"  precise float {name} = {expr};")
     for i, values in pos.items():
-        args = ", ".join(
-            v if isinstance(v, str) else f"asfloat(0x{v:08x}u)" for v in values
-        )
         lines.extend(
             [
-                f"  if(id=={i}) {{ float4 q=float4({args}); v[{i}].position=q;",
+                f"  if(id=={i}) {{ float4 q={float4(values)}; v[{i}].position=q;",
                 "#ifdef TRACE_EXPORTS",
                 f"    trace.Store4({16 + i * 16},asuint(q));",
                 "#endif",
                 "  }",
             ]
         )
+        if attributes:
+            lines.append(f"  if(id=={i}) v[{i}].attr={float4(attributes[i])};")
     for i, tri in idx.items():
         lines.extend(
             [
@@ -521,7 +573,7 @@ def lower(decoded, geometry, limits, vertex_header=None):
     return "\n".join(lines) + "\n"
 
 
-def translate(blob, geometry, library, vertex_header=None):
+def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
     chunks = parts(blob)
     p = chunks[b"PSV0"]
     if (
@@ -543,6 +595,7 @@ def translate(blob, geometry, library, vertex_header=None):
         geometry,
         limits,
         vertex_header,
+        compute_fallback=compute_fallback,
     )
 
 
@@ -556,6 +609,11 @@ if __name__ == "__main__":
     )
     p.add_argument("--geometry-words", required=True, type=Path)
     p.add_argument("--llvm", required=True)
+    p.add_argument(
+        "--compute-fallback",
+        action="store_true",
+        help="Emit SM 6.0 compute (main) and vertex (vertex_main) entry points",
+    )
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
     if a.output.suffix.lower() != ".hlsl" or a.output.resolve() in (
@@ -568,6 +626,7 @@ if __name__ == "__main__":
         json.loads(a.geometry_words.read_text()),
         a.llvm,
         a.vertex_header,
+        compute_fallback=a.compute_fallback,
     )
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_text(src, encoding="ascii")
