@@ -333,12 +333,14 @@ class BatchExportTests(unittest.TestCase):
             finally:
                 batch.load_tools = orig_load
 
-    @unittest.skipUnless(os.environ.get("BCPACK_REFERENCE_TOOLS") or os.environ.get("TTPF_TOOLS_DIR") or
-                         (ROOT / "out" / "Leonida" / "tools").is_dir(),
-                         "optional local ttpf tools directory")
     def test_real_exporter_dds_and_pixel_verification(self):
         """Verify real pinned exporter with generated synthetic TTPF input and independent pixel decoding."""
-        tools = batch.load_tools()
+        tools_path = None
+        if not (os.environ.get("TTPF_TOOLS_DIR") or os.environ.get("BCPACK_REFERENCE_TOOLS")):
+            tools_path = ROOT / "out" / "Leonida" / "tools"
+            if not (tools_path / "ttpf_mips.py").is_file():
+                self.skipTest("optional local ttpf tools directory")
+        tools = batch.load_tools(tools_path)
         self.assertIsNotNone(tools, "tools module could not be loaded")
 
         archive = make_synthetic_ttpf_archive()
@@ -353,6 +355,7 @@ class BatchExportTests(unittest.TestCase):
                 out_dir=out_dir,
                 indices=[0, 1],
                 allow_provisional=False,
+                tools_path=tools_path,
             )
             self.assertEqual(summary["total_textures"], 2)
             self.assertEqual(summary["processed"], 2)
