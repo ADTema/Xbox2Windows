@@ -3744,6 +3744,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_acphal_hal_provider_faulty>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_acphal_hal PROPERTIES TIMEOUT 60)
 
+    add_library(cpu_xapu_queue_provider SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
+    add_library(cpu_xapu_queue_provider_lenient SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
+    target_compile_definitions(cpu_xapu_queue_provider_lenient PRIVATE XAPU_TEST_LENIENT)
+    add_library(cpu_xapu_queue_provider_lifo SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
+    target_compile_definitions(cpu_xapu_queue_provider_lifo PRIVATE XAPU_TEST_LIFO)
+    add_executable(cpu_xapu_queue_caller tests/cpu/xapu_queue_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_xapu_queue_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_xapu_queue_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_xapu_queue_caller PRIVATE cpu_xapu_queue_provider cpu_exe_io)
+    add_test(NAME cpu_native_xapu_queue COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xapu_queue_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_xapu_queue_caller>" "$<TARGET_FILE:cpu_xapu_queue_provider>"
+        "$<TARGET_FILE:cpu_xapu_queue_provider_lenient>" "$<TARGET_FILE:cpu_xapu_queue_provider_lifo>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_xapu_queue PROPERTIES TIMEOUT 60)
+
     add_library(cpu_dstorage_provider SHARED tests/cpu/dstorage_provider.cpp tests/cpu/dstorage_provider.def)
     add_executable(cpu_dstorage_caller tests/cpu/dstorage_caller.asm tests/cpu/exe_startup.asm)
     set_target_properties(cpu_dstorage_caller PROPERTIES LINKER_LANGUAGE CXX)
