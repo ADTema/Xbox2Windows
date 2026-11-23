@@ -4458,7 +4458,8 @@ lane in the same quad. The profile requires a verified whole-quad execution
 region, a VGPR defined for the whole quad, and an immediate
 `s_waitcnt lgkmcnt(0)`. The generated HLSL reads the source as `uint` through
 quad intrinsics before restoring the bits to the VGPR value. GDS, bit-mask
-mode and other DS operations remain outside this profile.
+mode and DS operations other than the swizzle and no-op described here remain
+outside this profile.
 [AMD cross-lane instruction semantics](https://gpuopen.com/learn/amd-gcn-assembly-cross-lane-operations/)
 
 The source-built fixture assembles for `gfx1030` with wave64 in the LLVM 15
@@ -4479,6 +4480,19 @@ skipped. This measures the desktop translation against the reference.
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^pixel_aot_ds_swizzle_(warp|hardware)$' -V
+```
+
+The same fixture now also draws a variant with operandless `ds_nop` inserted
+in the entry and whole-quad execution regions. The two variants are checked
+against the same 256-word CPU oracle. Replacing those two instructions with
+`s_nop 0` in place produces identical HLSL. The profile rejects `ds_nop` with
+operands or modifiers, after the color export or program end, and between a
+DS swizzle and its required immediate wait. The LLVM 15 gfx1030 wave64
+round trip verifies the leading eight-byte encoding and both decoded no-ops.
+The coverage record for the passing draw includes `ds_nop`.
+
+```sh
+python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
 ## Independent bit and byte alignment readback
