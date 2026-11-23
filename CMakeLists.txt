@@ -2656,6 +2656,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_${adapter} PROPERTIES TIMEOUT 45)
+        add_test(NAME compute_store_aot_guard_read_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-guard-read "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_guard_read_${adapter} PROPERTIES TIMEOUT 45)
         add_test(NAME compute_to_pixel_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_to_pixel_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2821,7 +2825,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         pixel_aot_three_way_hardware pixel_aot_e64_hardware pixel_aot_blend_scalar_hardware pixel_aot_predicate_rounding_hardware bc7_draw_hardware
         pixel_aot_integer_nc_hardware pixel_aot_align_hardware pixel_aot_vop3_ternary_int_hardware
         PROPERTIES SKIP_RETURN_CODE 77)
-    set_tests_properties(compute_store_aot_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(compute_store_aot_hardware compute_store_aot_guard_read_hardware PROPERTIES SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS hardware warp)
         # The gfx programs this test translated, for tools/form_coverage.py.
         set_tests_properties(pixel_aot_${adapter} PROPERTIES
