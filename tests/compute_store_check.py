@@ -1617,6 +1617,45 @@ def lds_strided_reference(name, groups):
 
 
 
+LDS_F32_BINDING = LDS_BINDING | {"stride": 8, "lds_f32_mode": "normal-rne"}
+LDS_F32_OPS = {
+    "ds_add_f32": "v5, v7", "ds_add_rtn_f32": "v11, v5, v11",
+    "ds_min_f32": "v5, v7", "ds_max_f32": "v5, v7", "ds_cmpst_f32": "v5, v6, v7",
+}
+
+
+def lds_f32_program(op):
+    add = op.startswith("ds_add")
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0", "v_and_b32_e32 v6, 1, v8",
+        "v_mov_b32_e32 v7, 0x40200000", "v_mad_u32_u24 v6, 0x800000, v6, v7",
+        "ds_write_b32 v5, v6", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v11, v5", "s_waitcnt lgkmcnt(0)",
+        f"v_mov_b32_e32 v7, {'0xc0400000' if add else '0x40400000'}",
+    ] + (["v_mov_b32_e32 v11, v7"] if op == "ds_add_rtn_f32" else []) + (
+        ["v_mov_b32_e32 v6, 0x40200000"] if op == "ds_cmpst_f32" else []) + [
+        f"{op} {LDS_F32_OPS[op]}", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v10, v5", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
+    ]
+
+
+def lds_f32_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = 2.5 if lane % 2 == 0 else 5.0
+        if op.startswith("ds_add"):
+            new = old - 3.0
+        elif op == "ds_cmpst_f32":
+            new = 3.0 if old == 2.5 else old
+        else:
+            new = (min if op == "ds_min_f32" else max)(old, 3.0)
+        words.extend(struct.unpack("<II", struct.pack("<ff", new, old)))
+    return words
+
+
+LDS_F32_CASES = [(op, lds_f32_program(op), LDS_F32_BINDING) for op in LDS_F32_OPS]
+
 
 LDS_WIDE_BINDING = LDS_BINDING | {"lds_bytes": 512}
 LDS_WIDE_SETUP = DS_PREFIX + [
@@ -1822,6 +1861,15 @@ def lds_controls():
         (target + " gds", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(lines, (target, replacement)), 32, **binding)
+    lines = lds_f32_program("ds_add_f32")
+    rejects("Unverified private LDS floating-point mode", aot.lower, lines, 32, **LDS_BINDING)
+    for bad, message in (
+        ("ds_add_f32 v5, v7 gds", "Unsupported compute instruction"),
+        ("ds_add_f32 v5, v7 offset:4", "Unsupported compute instruction"),
+        ("ds_add_f32 v5, v255", "Unverified private LDS floating-point access"),
+        ("ds_add_f32 v5, v7, v8", "Unverified private LDS floating-point operands"),
+    ):
+        rejects(message, aot.lower, variant(lines, ("ds_add_f32 v5, v7", bad)), 32, **LDS_F32_BINDING)
 
     cmpst = lds_replacement_instruction("ds_cmpst_rtn_b32")
     lines = lds_replacement_program("ds_cmpst_rtn_b32")
@@ -2042,6 +2090,7 @@ def ds_binary(directory, assembler, objcopy, library):
     cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES + LDS_STRIDED_CASES
     cases += LDS_WIDE_REPLACEMENT_CASES
     cases += LDS_QWORD_CASES
+    cases += LDS_F32_CASES
     for name, lines, binding in cases:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -2176,6 +2225,15 @@ def ds_mutants(name, lines, binding, source):
             changed = variant(lines, (op, "ds_read_b64 v[20:21], v5 offset:8"))
             word = 4
         yield aot.lower(changed, 32, **binding), word
+    elif name in LDS_F32_OPS:
+        if name.startswith("ds_add"):
+            yield source.replace(" + asfloat(", " - asfloat("), 0
+        elif name == "ds_cmpst_f32":
+            yield aot.lower(variant(lines, ("ds_cmpst_f32 v5, v6, v7", "ds_cmpst_f32 v5, v7, v6")),
+                            32, **binding), 0
+        else:
+            other = "ds_max_f32" if name == "ds_min_f32" else "ds_min_f32"
+            yield aot.lower(variant(lines, (name, other)), 32, **binding), 0
     elif name == "private":
         yield source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)"), 2
     else:
@@ -2226,6 +2284,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = lds_strided_reference(name, groups)
             elif name in LDS_WIDE_REPLACEMENTS:
                 words = lds_wide_replacement_reference(name, groups)
+            elif name in LDS_F32_OPS:
+                words = lds_f32_reference(name, groups)
             elif private:
                 words = lds_reference(groups)
             else:
@@ -2721,6 +2781,7 @@ if __name__ == "__main__":
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
                  "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),
                  "draw-lds-wide-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_WIDE_REPLACEMENT_CASES),
+                 "draw-lds-f32": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_F32_CASES),
                  "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
                  "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
