@@ -2118,6 +2118,16 @@ class TestRdna2Scanner(unittest.TestCase):
                 self.assertFalse(is_instruction_supported(wrong), wrong)
         self.assertTrue(is_instruction_supported("v_subrev_f32_e32 v1, v2, v3"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e64 v1, v2, v3 clamp"))
+        # v_mac_legacy_f32 has an e32 and an e64 form (the latter with clamp) and no DPP form in LLVM 15. The
+        # accumulator is the destination, so only two sources are written. v_fmac_legacy_f32 does not exist on gfx1013.
+        for line in ("v_mac_legacy_f32_e32 v1, v2, v3", "v_mac_legacy_f32_e64 v1, v2, v3",
+                     "v_mac_legacy_f32_e64 v1, -s2, |v3| clamp"):
+            self.assertTrue(is_instruction_supported(line), line)
+        self.assertTrue(is_opcode_recognized("v_mac_legacy_f32_e64"))
+        for line in ("v_mac_legacy_f32_dpp v1, v2, v3 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                     "v_mac_legacy_f32_sdwa v1, v2, v3 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+                     "v_fmac_legacy_f32 v1, v2, v3", "v_fmac_legacy_f32_e32 v1, v2, v3"):
+            self.assertFalse(is_instruction_supported(line), line)
         # The 32-bit no-carry family. The INTEGER_SOURCE class is coarser than the translator, so this
         # pins the spellings and the refused modifiers, not the operand ranges.
         for line in (
