@@ -15,6 +15,8 @@ IMPORTS = {
     (STDIO, b"putchar"): HostImport("host_putchar", (4,), 4),
     (STDIO, b"fflush"): HostImport("host_fflush", (8,), 4),
 }
+# Called only by the shared native startup wrapper, which stays outside a lifted entry export.
+STARTUP_ONLY = ("cpu_exe_io.dll", b"finish_exe")
 HOST = """
 #include <cstdio>
 static word host_getchar() { return static_cast<unsigned>(std::getchar()); }
@@ -49,7 +51,7 @@ def translate(image, bindings=IMPORTS, host=HOST, *, allow_process_exit=False, e
                 binding = bindings.get(key)
                 # The native startup wrapper is outside the lifted body. A call
                 # from the body still fails when this slot has no binding.
-                if binding is None and entry_export is not None and key == ("cpu_exe_io.dll", b"finish_exe"):
+                if binding is None and entry_export is not None and key == STARTUP_ONLY:
                     continue
                 if binding is None:
                     symbol = imp.name.decode("ascii") if imp.name else f"#{imp.ordinal}"
