@@ -314,10 +314,14 @@ def check_shader_records():
         ("SOP2", "s_lshl1_add_u32"), ("SOP2", "s_lshl2_add_u32"),
         ("SOP2", "s_lshl3_add_u32"), ("SOP2", "s_lshl4_add_u32"),
     }
+    sop2_absdiff_forms = {
+        ("SOP2", "s_absdiff_i32"),
+    }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "v_mul_i32_i24_sdwa",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
+        "s_absdiff_i64", "s_absdiff_u32",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
     for name in ("gfx1013.tsv", "rdna2.tsv"):
@@ -332,6 +336,7 @@ def check_shader_records():
         assert e64_spelling_forms <= covered, (name, e64_spelling_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
+        assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)
         # v_mac_f32 is in the gfx1013 list only.
         approx_e64_forms = {("VOP3", "v_exp_f32_e64"), ("VOP3", "v_log_f32_e64")}
         approx_e64_forms |= {("VOP3", "v_mac_f32_e64")} if name == "gfx1013.tsv" else set()
@@ -380,6 +385,23 @@ def check_shader_records():
         covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": set(pixel.ACCEPTED)})
         without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(rounding)
+
+
+def check_scalar_brev():
+    """s_brev_b32 counts as covered SOP1 in both references once the lowering accepts it."""
+    import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    pixel.translate_int(pixel.brev_scalar_ops())
+    assert "s_brev_b32" in pixel.ACCEPTED
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert ("SOP1", "s_brev_b32") in reference, name
+        assert ("SOP1", "s_brev_b32") in fc.gfx_forms(pixel.ACCEPTED, reference), name
+        # Negative control: without the accepted program the form is not covered.
+        assert ("SOP1", "s_brev_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"s_brev_b32"}, reference), name
+    pixel.ACCEPTED.clear()
+    pixel.ACCEPTED.update(saved)
 
 
 def check_plain_bitscan_forms():
@@ -432,6 +454,37 @@ def check_int16_vop3_forms():
     finally:
         pixel.ACCEPTED.clear()
         pixel.ACCEPTED.update(saved)
+def check_sopk_wait_forms():
+    """The SOPK wait forms count once a program using them lowers; a refused SGPR operand records nothing."""
+    import pixel_aot_check as pixel
+    forms = {("SOPK", "s_waitcnt_vmcnt"), ("SOPK", "s_waitcnt_lgkmcnt"), ("SOPK", "s_waitcnt_vscnt")}
+    program = pixel.sopk_wait_program()
+    pixel.ACCEPTED.clear()
+    pixel.must_reject(pixel.translate, [line.replace("null", "s5") for line in program])
+    assert not pixel.ACCEPTED
+    pixel.translate(program)
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert forms <= reference and ("SOPP", "s_waitcnt_depctr") in reference, name
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert forms <= covered, (name, forms - covered)
+        assert ("SOPP", "s_waitcnt_depctr") not in covered and ("SOPK", "s_waitcnt_expcnt") not in covered, name
+
+
+def check_s_version_form():
+    """s_version counts once a program using it lowers; a refused operand records nothing."""
+    import pixel_aot_check as pixel
+    form = ("SOPK", "s_version")
+    program = pixel.s_version_program()
+    pixel.ACCEPTED.clear()
+    pixel.must_reject(pixel.translate_int, [line.replace("0x1004", "0x10000") for line in program])
+    assert "s_version" not in pixel.ACCEPTED
+    pixel.translate_int(program)
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert form in reference, name
+        assert form in fc.gfx_forms(pixel.ACCEPTED, reference), name
+    pixel.ACCEPTED.clear()
 
 
 def check_parsing():
@@ -700,6 +753,25 @@ def check_avx_move_regs():
         assert only_fail["blocked_by_skip"] == []
 
 
+def check_swap_coverage():
+    """v_swap_b32 is VOP1 in both references and counts as covered only through the accepted spelling.
+    The _e64, DPP and SDWA spellings reach only rejections, and the neighbouring v_swaprel_b32 stays uncovered."""
+    import pixel_aot_check as pixel
+    pixel.ACCEPTED.clear()
+    with tempfile.TemporaryDirectory() as tmp:
+        pixel.check_controls(Path(tmp))
+    assert "v_swap_b32" in pixel.ACCEPTED
+    assert not {"v_swap_b32_e64", "v_swap_b32_dpp", "v_swap_b32_sdwa", "v_swaprel_b32"} & pixel.ACCEPTED
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert ("VOP1", "v_swap_b32") in reference, name
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert ("VOP1", "v_swap_b32") in covered, name
+        assert ("VOP1", "v_swaprel_b32") not in covered, name
+        # Control: without the accepted word the form is not covered.
+        assert ("VOP1", "v_swap_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"v_swap_b32"}, reference), name
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -709,8 +781,12 @@ if __name__ == "__main__":
     check_local_cpu_registration()
     check_cpu_records()
     check_shader_records()
+    check_scalar_brev()
     check_plain_bitscan_forms()
     check_int16_vop3_forms()
+    check_swap_coverage()
+    check_sopk_wait_forms()
+    check_s_version_form()
     check_parsing()
     check_gaps()
     check_dashboard()

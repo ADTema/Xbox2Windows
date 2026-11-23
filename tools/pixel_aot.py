@@ -106,10 +106,10 @@ def _check_two_exits(code, llvm):
                                  "s_mov_", "s_and", "s_or_", "s_xor_", "s_not_", "s_lsh", "s_ash",
                                  "s_add", "s_sub", "s_mul", "s_min_", "s_max_", "s_cselect", "s_bfe",
                                  "s_bfm", "s_brev", "s_ff", "s_bcnt", "s_wqm", "s_quadmask"))
-                  or op in ("s_nop", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
+                  or op in ("s_nop", "s_version", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
                             "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
                             "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
-                            "s_bitreplicate_b64_b32",
+                            "s_bitreplicate_b64_b32", "s_bitset0_b64", "s_bitset1_b64",
                             "s_setreg_imm32_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
@@ -341,6 +341,14 @@ float frexp_mant32(float value) {
     }
     return asfloat(sign | 0x3f000000u | mant);
 }
+// v_frexp_exp_i32_f32 returns the signed exponent of the normalized significand.
+int frexp_exp32(float value) {
+    uint magnitude = asuint(value) & 0x7fffffffu;
+    uint exp = magnitude >> 23;
+    if (magnitude == 0u || exp == 0xffu) return 0;
+    if (exp == 0u) return (int)firstbithigh(magnitude) - 148;
+    return (int)exp - 126;
+}
 // v_ldexp_f32: exact binary32 scaling by 2^delta, preserving +/-0, +/-Inf and NaN.
 float ldexp32(float value, int delta) {
     uint bits = asuint(value);
@@ -466,13 +474,16 @@ ALU = {
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     # Legacy multiply, then an unfused add: 0 * x is 0 even for an infinite or NaN x.
     "mad_legacy": (3, "((({0} == 0 || {1} == 0) ? 0.0f : {0} * {1}) + {2})"),
+    # The same, with the destination as the accumulator operand (LLVM 15 VOP2Instructions.td: VOP_MAC_LEGACY_F32).
+    "mac_legacy": (3, "((({0} == 0 || {1} == 0) ? 0.0f : {0} * {1}) + {2})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
     "mad": (3, "mad32({0}, {1}, {2})"), "mac": (3, "mad32({0}, {1}, {2})"),
     # Each result is one of the operands, so finite inputs need no rounding.
     "min3": (3, "min(min({0}, {1}), {2})"), "max3": (3, "max(max({0}, {1}), {2})"),
     "med3": (3, "max(min({0}, {1}), min(max({0}, {1}), {2}))"),
 }
-DPP_ALU = {k: v for k, v in ALU.items() if k != "fma"}
+# LLVM 15 sets HasExtDPP = 0 for v_mac_legacy_f32, so it has no DPP form.
+DPP_ALU = {k: v for k, v in ALU.items() if k not in ("fma", "mac_legacy")}
 # N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
     "f": "false", "tru": "true",
@@ -494,6 +505,14 @@ INTEGER = {
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
     "alignbit_b32": (3, "(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))"),
     "alignbyte_b32": (3, "(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - (({2} & 3u) * 8u)))))"),
+    "add3_u32": (3, "({0} + {1} + {2})"),
+    "or3_b32": (3, "({0} | {1} | {2})"),
+    "xor3_b32": (3, "({0} ^ {1} ^ {2})"),
+    "and_or_b32": (3, "(({0} & {1}) | {2})"),
+    "xad_u32": (3, "(({0} ^ {1}) + {2})"),
+    "lshl_or_b32": (3, "(({0} << ({1} & 31u)) | {2})"),
+    "lshl_add_u32": (3, "(({0} << ({1} & 31u)) + {2})"),
+    "add_lshl_u32": (3, "(({0} + {1}) << ({2} & 31u))"),
     "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
     "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
     "mul_u32_u24": (2, "mul24_u32({0}, {1})"),
@@ -970,6 +989,8 @@ def lane_mask(token):
 # {r} names the result. Shift counts use their low five bits; signed overflow sets SCC for _i32 add/sub.
 NONZERO = "{r} != 0u"
 SCALAR = {
+    "ff0_i32_b32": (1, "firstbitlow(~{0})", None),
+    "ff1_i32_b32": (1, "firstbitlow({0})", None),
     "flbit_i32_b32": (1, "dpp_ffbh_u32({0})", None),
     "flbit_i32": (1, "dpp_ffbh_i32({0})", None),
     "bcnt0_i32_b32": (1, "32u - countbits({0})", NONZERO),
@@ -982,6 +1003,7 @@ SCALAR = {
     "sext_i32_i8": (1, "asuint(asint({0} << 24) >> 24)", None),
     "sext_i32_i16": (1, "asuint(asint({0} << 16) >> 16)", None),
     "abs_i32": (1, "(asint({0}) < 0 ? (0u - {0}) : {0})", NONZERO),
+    "absdiff_i32": (2, "asuint(abs(asint({0}) - asint({1})))", NONZERO),
     "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),
     "add_i32": (2, "{0} + {1}", "(~({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
     "sub_i32": (2, "{0} - {1}", "(({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
@@ -996,6 +1018,8 @@ SCALAR = {
     "xnor_b32": (2, "~({0} ^ {1})", NONZERO),
     # SCC is not written. Both counts are masked to five bits, so every shift stays below 32.
     "bfm_b32": (2, "((1u << ({0} & 31u)) - 1u) << ({1} & 31u)", None),
+    # Like s_brev_b64, SCC is not written; reversebits reverses all 32 bits.
+    "brev_b32": (1, "reversebits({0})", None),
     "lshl_b32": (2, "{0} << ({1} & 31u)", NONZERO), "lshr_b32": (2, "{0} >> ({1} & 31u)", NONZERO),
     "ashr_i32": (2, "asuint(asint({0}) >> ({1} & 31u))", NONZERO),
     "lshl1_add_u32": (2, "({0} << 1u) + {1}", "({0} >> 31u != 0u) || ({r} < {1})"),
@@ -1005,14 +1029,18 @@ SCALAR = {
 }
 
 
-def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict[str, bool] | None = None):
+def fp_operand(token, scalar, vector, pending, sample_dest, *,
+               quad_values: dict[str, bool] | None = None, ignore_sign=False):
     if re.fullmatch(r"-\d+", token):
         return f"asfloat({int(token) & 0xffffffff}u)"
     if token.startswith("-"):
-        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_dest, quad_values=quad_values) + ")"
+        inner = fp_operand(token[1:], scalar, vector, pending, sample_dest,
+                           quad_values=quad_values, ignore_sign=ignore_sign)
+        return inner if ignore_sign else f"(-{inner})"
     if absolute := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
-        inner = absolute.group(1) or absolute.group(2)
-        return f"abs({fp_operand(inner, scalar, vector, pending, sample_dest, quad_values=quad_values)})"
+        inner = fp_operand(absolute.group(1) or absolute.group(2), scalar, vector, pending, sample_dest,
+                           quad_values=quad_values, ignore_sign=ignore_sign)
+        return inner if ignore_sign else f"abs({inner})"
     if re.fullmatch(r"[vs]\d+", token):
         if token in pending:
             raise ValueError("Constant read before load completion")
@@ -1654,6 +1682,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             raise ValueError("Instruction follows program end")
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
             continue
+        # SOPK s_version K (gfx10+) has no destination and does not write SCC: a marker with no effect.
+        # Like s_nop it is also accepted after the color export. The operand is a 16-bit immediate.
+        if line == "s_version" or line.startswith("s_version "):
+            if not (m := match(r"s_version (0x[0-9a-f]+|0|[1-9]\d*)")) or int(m[1], 0) > 0xffff:
+                raise ValueError(f"Invalid s_version operand: {line}")
+            continue
         if match(r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])"):
             continue
         if match(r"s_waitcnt\s+expcnt\([0-7]\)"):
@@ -1689,8 +1723,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if (half_rounding != HALF_ROUNDING["0"] and re.match(r"v_\w*_f(?:16|64)", line)
                 and not line.startswith(HALF_ROUNDING_EXEMPT)):
             raise ValueError(f"Unsupported binary16 or binary64 operation under round {half_rounding}: {line.split()[0]}")
-        if m := match(r"s_waitcnt\s+(.*)"):
-            payload = m[1].strip()
+        # gfx10 SOPK wait forms: `s_waitcnt_<counter> <sgpr|null>, <simm16>`. Only null is modelled, since it
+        # reads as 0 and the count is then the immediate; an SGPR value would add to or replace it.
+        # vmcnt and lgkmcnt act exactly like the vmcnt(K) and lgkmcnt(K) tokens of s_waitcnt. vscnt is a no-op:
+        # this translator lowers no vector memory stores, so nothing is outstanding on the store counter.
+        sopk_wait = None
+        if m := match(r"s_waitcnt_(vmcnt|lgkmcnt|vscnt)(?:\s+(.*))?"):
+            counter = m[1]
+            label = {"vmcnt": "VM", "lgkmcnt": "LGKM", "vscnt": "VS"}[counter]
+            operands = [part.strip() for part in (m[2] or "").split(",")]
+            if len(operands) != 2 or not re.fullmatch(r"0x[0-9a-f]+|0|[1-9]\d*", operands[1]):
+                raise ValueError(f"Malformed s_waitcnt_{counter} operands: {line}")
+            if operands[0] != "null":
+                raise ValueError(f"Unsupported s_waitcnt_{counter} SGPR operand (only null is modelled): {line}")
+            count = int(operands[1], 0)
+            if count > 63:
+                raise ValueError(f"{label} wait count exceeds the gfx10 six-bit field")
+            if counter == "vscnt":
+                continue
+            sopk_wait = f"{counter}({count})"
+        wait_match = match(r"s_waitcnt\s+(.*)")
+        if sopk_wait is not None or wait_match:
+            payload = sopk_wait if sopk_wait is not None else wait_match[1].strip()
             if payload in ("0", "0x0"):
                 pending.clear()
                 sample_dest.clear()
@@ -1880,6 +1934,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint salu{i} = {hi} != 0u ? 31u - firstbithigh({hi}) : "
                          f"({lo} != 0u ? 63u - firstbithigh({lo}) : 0xffffffffu);")
             scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"s_ff([01])_i32_b64 (s\d+), ([^,]+)"):
+            bit, dst, src = m.groups()
+            sgpr_name(dst)
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            lo, hi = scalar_u64(src, scalar, pending)
+            if bit == "0":
+                lo, hi = f"(~{lo})", f"(~{hi})"
+            lines.append(f"    uint salu{i} = {lo} != 0u ? firstbitlow({lo}) : "
+                         f"({hi} != 0u ? 32u + firstbitlow({hi}) : 0xffffffffu);")
+            scalar[dst] = ("uint", f"salu{i}")
         elif m := match(r"s_bcnt([01])_i32_b64 (s\d+), ([^,]+)"):
             bit, dst, src = m.groups()
             sgpr_name(dst)
@@ -1985,6 +2050,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint salu{i} = {op}({value});")
             scalar[dst] = ("uint", f"salu{i}")
             scc = f"(salu{i} != 0u)"
+        elif m := match(r"(s_bitset[01]_b64) (s\[\d+:\d+\]), ([^,]+)"):
+            op, dst, src = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            initial_lo, initial_hi = scalar_u64(dst, scalar, pending)
+            bit = scalar_u32(src, scalar, pending)
+            make_mask = f"(1u << (salu{i}_bit & 31u))"
+            if op == "s_bitset0_b64":
+                clear = f"~{make_mask}"
+                low = f"({initial_lo} & ((salu{i}_bit & 32u) ? 0xffffffffu : {clear}))"
+                high = f"({initial_hi} & ((salu{i}_bit & 32u) ? {clear} : 0xffffffffu))"
+            else:
+                low = f"({initial_lo} | ((salu{i}_bit & 32u) ? 0u : {make_mask}))"
+                high = f"({initial_hi} | ((salu{i}_bit & 32u) ? {make_mask} : 0u))"
+            lines.append(f"    uint salu{i}_bit = {bit} & 63u;")
+            lines.append(f"    uint2 salu{i} = uint2({low}, {high});")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
         elif m := match(r"(s_quadmask_b64) (s\[\d+:\d+\]), ([^,]+)"):
             op, dst, src = m.groups()
             regs = sgpr_pair(dst)
@@ -2245,10 +2328,25 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_dest)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
+        elif m := match(r"v_swap_b32(?:_e32)? (v\d+), (v\d+)"):
+            # Both registers exchange their old values. Every vector entry names an immutable HLSL
+            # temporary, so exchanging the entries is the whole lowering and emits no code.
+            dst, src = m.groups()
+            if mask != "entry" or int(dst[1:]) > 255 or int(src[1:]) > 255:
+                raise ValueError("Invalid register swap")
+            for reg in (dst, src):
+                value = vector.get(reg)
+                if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
+                    raise ValueError("Expected a numeric register")
+                if reg in pending:
+                    raise ValueError("Constant read before load completion")
+                if reg in sample_dest:
+                    raise ValueError("Swap overlaps an outstanding sample")
+            vector[dst], vector[src] = vector[src], vector[dst]
         elif m := match(rf"v_({'|'.join(ALU)})_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
-            if op in ("fmac", "mac"):
+            if op in ("fmac", "mac", "mac_legacy"):
                 tokens.append(dst)
             arity, template = ALU[op]
             quad = mask == "quad"
@@ -2380,6 +2478,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"{fn}({fn}({values[0]}, {values[1]}), {values[2]})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({expression});")
+
+        elif m := match(r"v_frexp_exp_i32_f32(?:_e32|_e64)? (v\d+), ([^,]+)"):
+            dst, src = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            # Only the magnitude bits matter. Float sign operations can flush subnormal inputs.
+            value = fp_operand(src, scalar, vector, pending, sample_dest, ignore_sign=True)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat(frexp_exp32({value}));")
 
         elif m := match(r"v_ldexp_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+?)( clamp)?"):
             dst, src0, src1, clamp = m.groups()
