@@ -68,18 +68,15 @@ def upload(texture):
     return f"upload {value:016x}"
 
 
-def skip_without_adapter(child):
-    if child.returncode == 77:
-        print(child.stderr.decode(errors="replace").strip())
-        print("capability skip: no D3D12 physical adapter")
-        sys.exit(77)
-
-
 def device_line(native):
     """The adapter and driver the native run reports; every other run must match it."""
     child = subprocess.run([native], input=FIRST_RECORD, capture_output=True, timeout=60,
                            env={**os.environ, "X2W_ARCHIVE_TEXTURE_CASE": ""})
-    skip_without_adapter(child)
+    if child.returncode == 77 and os.environ.get("X2W_SHIM_DRAW_ADAPTER") == "hardware":
+        print(child.stderr.decode(errors="replace").strip())
+        print("capability skip: no D3D12 physical adapter")
+        sys.exit(77)
+    check("native device probe exit", child.returncode, 0)
     lines = [line for line in child.stderr.decode("utf-8").splitlines() if line.startswith("gpu device ")]
     check("native device lines", len(lines), 1)
     return lines[0]
@@ -116,7 +113,6 @@ def compare(mapper, native, lifted, codec, blast):
         for label, case, data, output, status, events in cases:
             env = {**os.environ, "X2W_ARCHIVE_TEXTURE_CASE": case}
             child = subprocess.run(command, input=data, capture_output=True, timeout=60, env=env)
-            skip_without_adapter(child)
             trace = ("\n".join(events) + "\n").encode("utf-8")
             check(f"{runner} {label} trace and status", (child.stderr, child.returncode), (trace, status))
             check(f"{runner} {label} first differing pixel", first_difference(child.stdout, output), None)
