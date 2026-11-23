@@ -14721,7 +14721,7 @@ def check_dpp_dotc_draw(directory, compiler, renderer, backend):
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
 # Dedicated semantic probe compiled under -denorm preserve:
-#   ch0 (v12): large-turns sin32/cos32 at 2^21 + 0.25 and 2^21 + 0.5 (4*1 + 2*(-1) = 2.0)
+#   ch0 (v12): large-turns sin32/cos32 at 123457.125 and 123457.375 (4*sin(pi/4) + 2*cos(3*pi/4))
 #   ch1 (v13): v_mac_f32_dpp unfused vs fused (4097*4097 - 16785408 = 0.0 unfused vs 1.0 fused)
 #   ch2 (v14): v_mac_f32_dpp denormal input flush (2^-127 * 2^126 + 0.5 = 0.5 flushed vs 1.0 un-flushed)
 #   ch3 (v15): all-4-lane observation of dpp8:[1,2,3,0,5,6,7,4] under injective base-4 weights (1,4,16,64 -> 57.0)
@@ -14802,14 +14802,15 @@ def check_dpp_extra_semantics_draw(directory, compiler, renderer, backend):
     source.write_text(hlsl, encoding="ascii")
     compile_shader(compiler, source, shader)
     constants = bytearray(256)
-    struct.pack_into("<4I", constants, 12, 0x4a000001, 0x00400000, 0x7e800000, 0x4a000002)
-    expected = (2.0, 0.0, 0.5, 57.0)
+    struct.pack_into("<4I", constants, 12, 0x47f12090, 0x00400000, 0x7e800000, 0x47f120b0)
+    # The compressed export truncates the mathematical reference to binary16.
+    expected = (half_rtz(math.sqrt(2.0)), 0.0, 0.5, 57.0)
     case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
     subprocess.run(draw, check=True)
     # Wrong-mode references: fused v_mac_f32_dpp exports 1.0 in ch1, denormal-preserving exports 1.0 in ch2.
     for wrong_vals, label in (
-        ((2.0, 1.0, 0.5, 57.0), "fused mac reference"),
-        ((2.0, 0.0, 1.0, 57.0), "denormal-preserving mac reference"),
+        ((expected[0], 1.0, 0.5, 57.0), "fused mac reference"),
+        ((expected[0], 0.0, 1.0, 57.0), "denormal-preserving mac reference"),
     ):
         case.write_bytes(constants + struct.pack("<4f", *wrong_vals) * 64)
         wrong = subprocess.run(draw, capture_output=True, text=True)
@@ -14829,7 +14830,7 @@ def check_dpp_extra_semantics_draw(directory, compiler, renderer, backend):
         compile_shader(compiler, source, shader)
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
-            raise AssertionError(f"Mutation of {label} escaped detection")
+            raise AssertionError(f"Mutation of {label}: exit={wrong.returncode}; {wrong.stderr}; {wrong.stdout}")
     # Assembly mutations changing only lane 3 or lane 1 of dpp8 (invisible to lane-0-only broadcast).
     for old, new, label in (
         ("dpp8:[1,2,3,0,5,6,7,4]", "dpp8:[1,2,3,1,5,6,7,5]", "dpp8 lane 3 observation"),
@@ -14841,7 +14842,7 @@ def check_dpp_extra_semantics_draw(directory, compiler, renderer, backend):
         compile_shader(compiler, source, shader)
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
-            raise AssertionError(f"Mutation of {label} escaped detection")
+            raise AssertionError(f"Mutation of {label}: exit={wrong.returncode}; {wrong.stderr}; {wrong.stdout}")
 
 
 def check_dpp_extra_subnormal_draw(directory, compiler, renderer, backend):
