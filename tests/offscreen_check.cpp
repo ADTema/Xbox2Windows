@@ -817,7 +817,12 @@ OperationResult run_dxr_facing_pipeline(const OperationContext& ctx)
 
 OperationResult run_dxr_opacity(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp"));
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", false));
+}
+
+OperationResult run_dxr_opacity_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", true));
 }
 
 OperationResult run_ray_query(const OperationContext& ctx)
@@ -981,6 +986,7 @@ const OperationSpec kOperations[] = {
     {"--dxr-facing", 3, 3, nullptr, kNoGate, run_dxr_facing},
     {"--dxr-facing-pipeline", 3, 3, nullptr, kNoGate, run_dxr_facing_pipeline},
     {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
+    {"--dxr-opacity-pipeline", 3, 3, nullptr, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
