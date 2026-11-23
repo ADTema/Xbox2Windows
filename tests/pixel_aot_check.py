@@ -7986,6 +7986,29 @@ def check_controls(directory):
     cbuf_composite_pending[cbuf_wait] = "s_waitcnt vmcnt(7) lgkmcnt(63)"
     must_reject(translate, cbuf_composite_pending)
 
+    # 32-bit vector integer ALU operations: lshl_add_u32, lshl_or_b32, and_or_b32, or3_b32, add3_u32, mul_lo_u32.
+    alu_prog = uncompressed_export([
+        "v_lshl_add_u32 v12, s44, 2, s45",
+        "v_lshl_or_b32 v13, s44, 4, s45",
+        "v_and_or_b32 v14, s44, s45, s46",
+        "v_or3_b32 v15, s44, s45, s46",
+        "v_mul_lo_u32 v12, v12, s47",
+        "v_add3_u32 v13, v13, v14, v15",
+    ])
+    alu_src = translate(alu_prog)
+    assert "((asuint(params[0].w) << (2u & 31u)) + asuint(params[1].x))" in alu_src
+    assert "((asuint(params[0].w) << (4u & 31u)) | asuint(params[1].x))" in alu_src
+    assert "((asuint(params[0].w) & asuint(params[1].x)) | asuint(params[1].y))" in alu_src
+    assert "(asuint(params[0].w) | asuint(params[1].x) | asuint(params[1].y))" in alu_src
+    assert "(asuint(alu20) * asuint(params[1].z))" in alu_src
+    assert "(asuint(alu21) + asuint(alu22) + asuint(alu23))" in alu_src
+    # Negative controls: arity mismatch and register out-of-range
+    must_reject(translate, uncompressed_export(["v_lshl_add_u32 v12, s44, 2"]))
+    must_reject(translate, uncompressed_export(["v_lshl_add_u32 v12, s44, 2, s45, s46"]))
+    must_reject(translate, uncompressed_export(["v_mul_lo_u32 v12, s44"]))
+    must_reject(translate, uncompressed_export(["v_mul_lo_u32 v12, s44, s45, s46"]))
+    must_reject(translate, uncompressed_export(["v_or3_b32 v256, s44, s45, s46"]))
+
     # LLVM 15 prints "exp mrt0 v16, ..."; newer LLVM prints "exp mrt0, v16, ...".
     for program in (assembly(False), assembly(True), curve(), shaping(), arithmetic(), three_way(), rounding()):
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
@@ -8884,6 +8907,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((align_integer_group(byte), translate_int) for byte in (False, True))
     fixtures.extend((vop3_ternary_int_group(group), translate_int) for group in (1, 2))
     fixtures.append((readfirstlane_program(), translate_int))
+    fixtures.append((uncompressed_export(["v_mul_lo_u32 v12, s44, s45"]), translate_int))
     fixtures.append((rgb_sample(), translate))
     fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
@@ -10022,6 +10046,104 @@ def check_readfirstlane_draw(directory, compiler, renderer, backend):
         case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
         cases.append((case, status))
     run_pixel_batch(renderer, backend, shader, cases)
+
+
+def check_valu_int32_draw(directory, compiler, renderer, backend):
+    """Draw 32-bit vector integer ALU forms through the integer readback target and compare the words."""
+    # Program A: mul_lo_u32, add3_u32, lshl_add_u32, lshl_or_b32
+    src_a = directory / "valu_int32_a.hlsl"
+    cso_a = directory / "valu_int32_a.cso"
+    prog_a = uncompressed_export([
+        "v_mul_lo_u32 v12, s44, s45",
+        "v_add3_u32 v13, s44, s45, s46",
+        "v_lshl_add_u32 v14, s44, 2, s45",
+        "v_lshl_or_b32 v15, s44, s45, s46",
+    ])
+    src_a.write_text(lower(prog_a, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                           integer_export=True), encoding="ascii")
+    compile_shader(compiler, src_a, cso_a)
+
+    cases_a = []
+    # (s44, s45, s46) -> (v12, v13, v14, v15)
+    for name, inputs, words, status in (
+        ("oracle-mismatch-mul", (0xffffffff, 0xffffffff, 0), (0x2, 0xfffffffe, 0xfffffffb, 0x80000000), "mismatch"),
+        ("oracle-mismatch-lane", (0xffffffff, 0xffffffff, 0), (0x1, 0xfffffffe, 0xfffffffb, 0x12345678), "mismatch"),
+        ("wrap-max", (0xffffffff, 0xffffffff, 0), (0x1, 0xfffffffe, 0xfffffffb, 0x80000000), "pass"),
+        ("wrap-large-nonzero-high", (0x12345678, 0x9abcdef0, 0), (0x242d2080, 0xacf13568, 0xe38e38d0, 0x56780000), "pass"),
+        ("overflow-add", (0x40000000, 0x80000000, 1), (0x0, 0xc0000001, 0x80000000, 0x40000001), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<3I", constants, 12, *inputs)
+        case = directory / f"valu-int32-a-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases_a.append((case, status))
+    run_pixel_batch(renderer, backend, cso_a, cases_a)
+
+    # Negative control: verify that substituting a wrong expression for v_mul_lo_u32 changes the result.
+    mut_src = directory / "valu_int32_a_mut.hlsl"
+    mut_cso = directory / "valu_int32_a_mut.cso"
+    mut_prog = [line.replace("v_mul_lo_u32 v12, s44, s45", "v_add3_u32 v12, s44, s45, 0") for line in prog_a]
+    assert mut_prog != prog_a
+    mut_src.write_text(lower(mut_prog, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                             integer_export=True), encoding="ascii")
+    compile_shader(compiler, mut_src, mut_cso)
+    wrap_max_case = directory / "valu-int32-a-wrap-max.case"
+    wrong = subprocess.run([renderer, backend, "--check-pixel-case", mut_cso, wrap_max_case],
+                           capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Replacing v_mul_lo_u32 with addition escaped detection")
+
+    # Program B: and_or_b32, or3_b32, mul_lo_u32, add3_u32
+    src_b = directory / "valu_int32_b.hlsl"
+    cso_b = directory / "valu_int32_b.cso"
+    prog_b = uncompressed_export([
+        "v_mul_lo_u32 v12, s44, s45",
+        "v_add3_u32 v13, s44, s45, s46",
+        "v_and_or_b32 v14, s44, s45, s46",
+        "v_or3_b32 v15, s44, s45, s46",
+    ])
+    src_b.write_text(lower(prog_b, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                           integer_export=True), encoding="ascii")
+    compile_shader(compiler, src_b, cso_b)
+
+    cases_b = []
+    for name, inputs, words, status in (
+        ("oracle-mismatch", (0x0f, 0xf0, 0xff), (0xe10, 0x1fe, 0xff, 0x0), "mismatch"),
+        ("precedence-and-or", (0x0f, 0xf0, 0xff), (0xe10, 0x1fe, 0xff, 0xff), "pass"),
+        ("identity-and-or", (0xffffffff, 0x1, 0), (0xffffffff, 0x0, 0x1, 0xffffffff), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<3I", constants, 12, *inputs)
+        case = directory / f"valu-int32-b-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases_b.append((case, status))
+    run_pixel_batch(renderer, backend, cso_b, cases_b)
+
+    # Program C: shift immediate > 31 on v_lshl_add_u32 (shift 33 yielding 2, verifying & 31u).
+    src_c = directory / "valu_int32_shift.hlsl"
+    cso_c = directory / "valu_int32_shift.cso"
+    prog_c = uncompressed_export([
+        "v_lshl_add_u32 v12, s44, 33, s45",
+        "v_mov_b32_e32 v13, 0",
+        "v_mov_b32_e32 v14, 0",
+        "v_mov_b32_e32 v15, 0",
+    ])
+    src_c.write_text(lower(prog_c, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                           integer_export=True), encoding="ascii")
+    compile_shader(compiler, src_c, cso_c)
+
+    cases_c = []
+    # (s44, s45) = (1, 0) -> (1 << (33 & 31)) + 0 = 1 << 1 = 2
+    for name, inputs, words, status in (
+        ("oracle-mismatch", (1, 0), (999, 0, 0, 0), "mismatch"),
+        ("shift-33", (1, 0), (2, 0, 0, 0), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<2I", constants, 12, *inputs)
+        case = directory / f"valu-int32-c-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases_c.append((case, status))
+    run_pixel_batch(renderer, backend, cso_c, cases_c)
 
 
 # v_cvt_f32_u32_e32 and v_cvt_f32_i32_e32 convert one 32-bit word to binary32, reading it unsigned
@@ -12265,6 +12387,7 @@ def check_e64_render(directory, compiler, renderer, backend):
     check_lshl_add_u32_draw(directory, compiler, renderer, backend)
     check_absdiff_i32_draw(directory, compiler, renderer, backend)
     check_readfirstlane_draw(directory, compiler, renderer, backend)
+    check_valu_int32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend)
     check_cvt_float_int_draw(directory, compiler, renderer, backend)
