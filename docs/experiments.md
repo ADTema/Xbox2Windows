@@ -2965,7 +2965,8 @@ were compiled with `dxc -T ps_6_0 -E main`. Each case ran
 `XBOX2WINDOWS_ADAPTER` set to `Intel` or `NVIDIA`, or
 `offscreen_check.exe warp --sampled-coverage <ps.dxil> <case.bin>`. Leave
 `X2W_COV_SWAP` and `X2W_COV_ADJACENT` unset for `base`; set the respective
-variable to `1` for the other variants.
+variable to `1` for the other variants. These switches come from the
+[instrumentation patch and run log](https://github.com/R0Y00/Xbox2Windows/issues/737#issuecomment-7107117114).
 
 **Environment.** Windows 11 build 26300.10075; MSVC 19.44.35230, Windows SDK
 10.0.26100 and DXC 1.9.2602.17. Intel UHD Graphics (`8086:468B`, driver
