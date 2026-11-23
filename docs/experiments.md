@@ -3648,13 +3648,9 @@ The desktop shim exports `XMemAllocDefault(size, attributes)` and `XMemFreeDefau
 
 ### Tools-memory availability fixture
 
-The startup preflight reaches `XMemIsToolsMemAvailable` following default and physical allocation binding. In console environments, tools memory is available only on development kits where an additional tools memory partition is configured; on retail consoles and standard desktop environments without such a partition, `XMemIsToolsMemAvailable` returns `FALSE` (`0`).
+The source-built caller ([`tools_mem_caller.asm`](../tests/cpu/tools_mem_caller.asm)) imports `XMemIsToolsMemAvailable` by name. It queries twice and checks the recorded count before choosing a path. The controlled recording provider ([`tools_mem_provider.cpp`](../tests/cpu/tools_mem_provider.cpp)) returns FALSE for the fallback path (exit 42) or TRUE for the tools-memory path (exit 84). The same EXE exits with a live test worker under the Windows loader and returns its result to the host under `pe_map`. Withholding the query export stops mapping at import resolution before entry, with the trace provider still available.
 
-A source-built caller ([`tools_mem_caller.asm`](../tests/cpu/tools_mem_caller.asm)) imports `XMemIsToolsMemAvailable` from `xmem.dll` by name and verifies consistency across repeated invocations. Under a controlled recording provider ([`tools_mem_provider.cpp`](../tests/cpu/tools_mem_provider.cpp)), two modes are exercised:
-- **Mode FALSE (desktop policy / retail without tools partition)**: `XMemIsToolsMemAvailable` returns `FALSE`, the caller takes the normal title fallback path, exits with code `42`, and the provider records exactly two calls.
-- **Mode TRUE (console devkit with tools partition)**: `XMemIsToolsMemAvailable` returns `TRUE`, the caller takes the tools memory path, exits with code `84`, and the devkit provider records exactly two calls.
-
-Both modes produce identical outcomes under the native Windows loader and `pe_map`. A negative control with missing providers confirms that `pe_map` stops at map time before entry with `STATUS["unresolved"]` (`unresolved import xmem.dll!XMemIsToolsMemAvailable`). Run:
+The paired outcomes describe the synthetic caller. Actual console ordering and the production desktop shim behavior remain open. [Independent recording fixture and results](https://github.com/R0Y00/Xbox2Windows/pull/900)
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_tools_mem$' -V

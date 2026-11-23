@@ -1,17 +1,18 @@
 """Compare the source-built XMemIsToolsMemAvailable caller under Windows and pe_map.
 
-Exercises both BOOL outcomes:
-- Mode FALSE: desktop policy without a tools partition (caller takes retail fallback, exit 42).
-- Mode TRUE: console devkit with a tools partition (caller takes tools path, exit 84).
-Also verifies that pe_map stops at map time with unresolved import diagnostic on missing provider.
+The recording providers return FALSE (fallback, exit 42) or TRUE (tools path, exit 84).
+The caller checks that both invocations match and the provider counted two calls.
+A missing provider must stop pe_map before entry.
 """
 
 import ctypes
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import pefile
 
@@ -23,7 +24,7 @@ from native_map_check import Mapper, STATUS
 def imports_by_dll(image):
     with pefile.PE(str(image), fast_load=True) as pe:
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
-        return {module.dll.decode().casefold(): sorted(imp.name.decode() for imp in module.imports if imp.name)
+        return {module.dll.decode().casefold(): sorted(imp.name.decode() if imp.name else f"#{imp.ordinal}" for imp in module.imports)
                 for module in pe.DIRECTORY_ENTRY_IMPORT}
 
 
@@ -32,7 +33,7 @@ def check(label, actual, expected):
         raise AssertionError(f"{label}: expected {expected!r}, got {actual!r}")
 
 
-def run_native(exe, provider_dll):
+def run_native(exe, provider_dll, io_path):
     """Run the native caller EXE in a temporary directory where provider_dll is served as xmem.dll."""
     with TemporaryDirectory() as temp:
         temp_dir = Path(temp)
@@ -40,60 +41,45 @@ def run_native(exe, provider_dll):
         temp_xmem = temp_dir / "xmem.dll"
         shutil.copyfile(exe, temp_exe)
         shutil.copyfile(provider_dll, temp_xmem)
-        proc = subprocess.run([str(temp_exe)], cwd=str(temp_dir), timeout=20)
+        shutil.copyfile(io_path, temp_dir / io_path.name)
+        env = dict(os.environ, CPU_CRC_TEST_LIVE_WORKER="1")
+        proc = subprocess.run([str(temp_exe)], cwd=str(temp_dir), env=env, timeout=20)
         return proc.returncode
 
 
-def compare(mapper_path, exe_path, provider_path, provider_devkit_path):
-    mapper_path = Path(mapper_path)
-    exe = Path(exe_path)
-    provider = Path(provider_path)
-    provider_devkit = Path(provider_devkit_path)
-
-    # 1. Verify import descriptor in caller PE image
+def compare(mapper_path, exe_path, provider_path, provider_devkit_path, io_path):
+    mapper_path, exe, io_path = map(Path, (mapper_path, exe_path, io_path))
+    io_name = io_path.name.casefold()
     imports = imports_by_dll(exe)
-    check("xmem.dll imports", imports.get("xmem.dll"), ["XMemIsToolsMemAvailable"])
-    print(f"caller imports: {imports}")
+    check("caller imports", imports, {io_name: ["finish_exe"],
+                                      "xmem.dll": ["XMemIsToolsMemAvailable", "get_tools_mem_call_count"]})
 
-    # 2. Mode FALSE: desktop without a tools partition
-    native_false = run_native(exe, provider)
-    check("native desktop fallback exit", native_false, 42)
-
-    prov_lib = ctypes.WinDLL(str(provider))
-    prov_lib.get_tools_mem_call_count.restype = ctypes.c_uint32
-    prov_lib.reset_tools_mem_call_count.restype = None
-    prov_lib.reset_tools_mem_call_count()
-
-    providers_false = {"xmem.dll": prov_lib}
-    mapped_false = run_mapped(mapper_path, exe, providers_false)
-    check("mapped desktop fallback exit", mapped_false, 42)
-    check("desktop call count", prov_lib.get_tools_mem_call_count(), 2)
-    print("mode FALSE (desktop without tools partition): native and mapped exit 42, 2 calls recorded")
-
-    # 3. Mode TRUE: console devkit with a tools partition
-    native_true = run_native(exe, provider_devkit)
-    check("native devkit exit", native_true, 84)
-
-    prov_devkit_lib = ctypes.WinDLL(str(provider_devkit))
-    prov_devkit_lib.get_tools_mem_call_count.restype = ctypes.c_uint32
-    prov_devkit_lib.reset_tools_mem_call_count.restype = None
-    prov_devkit_lib.reset_tools_mem_call_count()
-
-    providers_true = {"xmem.dll": prov_devkit_lib}
-    mapped_true = run_mapped(mapper_path, exe, providers_true)
-    check("mapped devkit exit", mapped_true, 84)
-    check("devkit call count", prov_devkit_lib.get_tools_mem_call_count(), 2)
-    print("mode TRUE (console devkit with tools partition): native and mapped exit 84, 2 calls recorded")
-
-    # 4. Negative control: missing xmem provider fails at map time before entry
+    io = ctypes.WinDLL(str(io_path))
     mapper = Mapper(mapper_path)
-    base, status, detail, requests = mapper(exe, {})
+    cases = (("FALSE", Path(provider_path), 42), ("TRUE", Path(provider_devkit_path), 84))
+    false_provider = ctypes.WinDLL(str(cases[0][1]))
+    count = ctypes.cast(false_provider.get_tools_mem_call_count, ctypes.c_void_p).value
+    base, status, detail, _ = mapper(exe, {io_name: io, "xmem.dll": {b"get_tools_mem_call_count": count}})
     if base:
         mapper.release(base)
-        raise AssertionError("caller mapped with empty providers")
-    check("missing provider status", status, STATUS["unresolved"])
-    check("missing provider diagnostic", detail, "unresolved import xmem.dll!XMemIsToolsMemAvailable")
-    print(f"negative control: map time refusal before entry: {detail}")
+        raise AssertionError("caller mapped without the tools-memory export")
+    check("missing export status", status, STATUS["unresolved"])
+    check("missing export diagnostic", detail, "unresolved import xmem.dll!XMemIsToolsMemAvailable")
+    print(f"negative control before entry: {detail}")
+
+    with patch.dict(os.environ, {"CPU_CRC_TEST_LIVE_WORKER": "0"}):
+        for label, provider, expected in cases:
+            native = run_native(exe, provider, io_path)
+            check(f"{label} native exit", native, expected)
+
+            module = ctypes.WinDLL(str(provider))
+            module.reset_tools_mem_call_count.restype = None
+            module.get_tools_mem_call_count.restype = ctypes.c_uint32
+            module.reset_tools_mem_call_count()
+            mapped = run_mapped(mapper_path, exe, {io_name: io, "xmem.dll": module})
+            check(f"{label} mapped exit", mapped, expected)
+            check(f"{label} mapped provider count", module.get_tools_mem_call_count(), 2)
+            print(f"controlled {label}: native and mapped exit {expected}, two matching queries each")
 
 
 if __name__ == "__main__":
