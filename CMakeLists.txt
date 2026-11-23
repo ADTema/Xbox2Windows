@@ -3142,6 +3142,19 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_map_pages_caller>" "$<TARGET_FILE:cpu_map_pages_provider>"
         "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_map_pages PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_apu_alloc_provider SHARED tests/cpu/apu_alloc_provider.cpp tests/cpu/apu_alloc_provider.def)
+    add_library(cpu_apu_alloc_provider_lenient SHARED tests/cpu/apu_alloc_provider.cpp tests/cpu/apu_alloc_provider.def)
+    target_compile_definitions(cpu_apu_alloc_provider_lenient PRIVATE APU_TEST_LENIENT)
+    add_executable(cpu_apu_alloc_caller tests/cpu/apu_alloc_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_apu_alloc_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_apu_alloc_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_apu_alloc_caller PRIVATE cpu_apu_alloc_provider cpu_exe_io)
+    add_test(NAME cpu_native_apu_alloc_caller COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/apu_alloc_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_apu_alloc_caller>" "$<TARGET_FILE:cpu_apu_alloc_provider>"
+        "$<TARGET_FILE:cpu_apu_alloc_provider_lenient>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_apu_alloc_caller PROPERTIES TIMEOUT 60)
     add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")

@@ -4002,6 +4002,66 @@ ctest --preset dev --no-tests=error -R '^cpu_native_map_pages$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_map_pages$' -V
 ```
 
+### Audio-side import inventory
+
+Binding probes on #870 leave 19 audio-side imports unresolved: 5 from `chad.dll`, 5 from `xapu.dll` and 9 from `acphal.dll`. None of these modules exists in System32. This inventory records the public evidence for each name. Microsoft's reference pages for these APIs sit behind the NDA developer program, so they give no public signature. Microsoft's MIT-licensed [GDK Learn index at `f8c3438`](https://github.com/microsoft/XBOX-GDK-dotnet/blob/f8c3438aa366fbbb662d8a5e724021a9d0b65f5d/eng/gdk-learn-index.json) confirms that the `XDsp*` and `XApu*` functions are documented APIs and gives each one a page path. It lists AcpHal and the Audio Processing Unit only as member pages. Public MIT call sites in [DirectXTK12 at `f3555e3`](https://github.com/microsoft/DirectXTK12/tree/f3555e3014a53c81a6202b786dc4d6509b95a936) cover `ApuAlloc` and `ApuFree`. Several unaffiliated reimplementations also export these names. Their declarations do not trace to a public Microsoft source, so this inventory does not use them.
+
+| Module | Import | Public evidence | Desktop replacement candidate | Status |
+|---|---|---|---|---|
+| `chad.dll` | `XDspActivate` | Learn index entry only | None known. XAudio2 and WASAPI mix and play audio but do not provide this stream queue. | needs evidence |
+| `chad.dll` | `XDspConnectWithMaximumStreamLimit` | Learn index entry only | None known | needs evidence |
+| `chad.dll` | `XDspDeactivate` | Learn index entry only | None known | needs evidence |
+| `chad.dll` | `XDspDisconnect` | Learn index entry only | None known | needs evidence |
+| `chad.dll` | `XDspSubmitCommand` | Learn index entry only | None known | needs evidence |
+| `xapu.dll` | `XApuConnect` | Learn index entry only, plus input and output parameter struct names | None known | needs evidence |
+| `xapu.dll` | `XApuDequeueResult` | Learn index entry only | None known | needs evidence |
+| `xapu.dll` | `XApuDisconnect` | Learn index entry only | None known | needs evidence |
+| `xapu.dll` | `XApuEnqueueCommand` | Learn index entry only | None known. Desktop XAudio2 has no XMA decoder. | needs evidence |
+| `xapu.dll` | `XApuGetResultCount` | Learn index entry only | None known | needs evidence |
+| `acphal.dll` | `AcpHalCreate` | None (index lists only the AcpHal member page) | None known | needs evidence |
+| `acphal.dll` | `AcpHalAllocateShapeContexts` | None | None known | needs evidence |
+| `acphal.dll` | `AcpHalReleaseShapeContexts` | None | None known | needs evidence |
+| `acphal.dll` | `ApuCreateHeap` | Named in a DirectXTK12 diagnostic as the heap that `ApuAlloc` draws from. No call site and no signature. | Process memory (proposed, untested) | needs evidence |
+| `acphal.dll` | `ApuAlloc` | Call sites at [SoundEffect.cpp L246](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L246), [WaveBankReader.cpp L799](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/WaveBankReader.cpp#L799) and [SoundStreamInstance.cpp L470](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundStreamInstance.cpp#L470) | Aligned process memory (proposed, fixture only) | partial call shape |
+| `acphal.dll` | `ApuFree` | Call sites at [SoundEffect.cpp L95](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L95) and [SoundStreamInstance.cpp L60](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundStreamInstance.cpp#L60) | Release of the block above (proposed, fixture only) | partial call shape |
+| `acphal.dll` | `ApuIsVirtualAddressValid` | None | None known | needs evidence |
+| `acphal.dll` | `ApuMapApuAddress` | None | None known | needs evidence |
+| `acphal.dll` | `ApuMapVirtualAddress` | None | None known | needs evidence |
+
+No import has both a public signature and a usable desktop replacement. The 17 imports marked "needs evidence" stay unresolved, and this change adds no binding for any of them. Those calls cover the stream, command-queue and SHAPE context interfaces, which are console audio hardware with no desktop counterpart known. They need a public declaration or a source-built observation before any caller.
+
+The DirectXTK12 call sites establish the following:
+
+- `ApuAlloc` returns an `HRESULT` that callers test with `FAILED`.
+- The first argument is the address of a `void*` that receives the block.
+- The second argument is pointer-sized, and every call site passes `nullptr`. Its type is not public.
+- The third argument is a byte count cast to `UINT32`.
+- The fourth is the alignment constant `SHAPE_XMA_INPUT_BUFFER_ALIGNMENT`. Its value and width are not public.
+- `ApuFree` takes the returned `void*`. Every call site discards its result, so the return type is not public.
+- When `ApuAlloc` fails, DirectXTK12 asks whether the heap from `ApuCreateHeap` was large enough. Running out of heap is therefore one failure mode. The exact error code is not public.
+
+### APU allocation caller and recorder
+
+A source-built caller ([`apu_alloc_caller.asm`](../tests/cpu/apu_alloc_caller.asm)) imports `ApuAlloc` and `ApuFree` from `acphal.dll` by name with the call shape above, plus `finish_exe` from `cpu_exe_io.dll`, and starts through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). A test-only recording provider ([`apu_alloc_provider.cpp`](../tests/cpu/apu_alloc_provider.cpp)) serves both names from a 64 KiB arena. The arena stands in for the heap `ApuCreateHeap` would create. That function's signature is not public, so neither the caller nor the provider uses it. This is not a production `acphal.dll`. The arena size, the refusal code and the untouched output on failure are proposed desktop policy for the fixture, not console evidence.
+
+1. **Observable result:** a 4 KiB request at 2 KiB alignment returns `S_OK` and a 2 KiB-aligned block, and the caller writes and reads back the block's last word.
+2. **Refusal:** a 128 KiB request returns `E_OUTOFMEMORY` (`0x8007000E`) and leaves the caller's sentinel output unchanged.
+3. A 64 KiB request is refused the same way while the first block is live.
+4. After `ApuFree` releases the first block, the same 64 KiB request succeeds, and the caller writes and reads back its last word before releasing it.
+5. The caller checks its own provider's counts: 4 allocations, 2 releases, no live blocks and no rejected releases. It then exits with `0x8A0`.
+
+The check runs the EXE under the Windows loader, with and without a live worker at exit, and under `pe_map`. Both loaders exit with `0x8A0`, and the mapped run's recorded sizes, alignments and results match the expected sequence (`S_OK`, `E_OUTOFMEMORY`, `E_OUTOFMEMORY`, `S_OK`). It also runs these controls:
+
+- A lenient provider build (`APU_TEST_LENIENT`) accepts every size. Under both loaders the caller stops at the refusal step with `0xF02`.
+- Withholding `ApuAlloc` or `ApuFree` stops `pe_map` at import resolution before entry (`unresolved import acphal.dll!ApuAlloc` or `!ApuFree`). The provider records no calls.
+
+The fixture shows that the caller's success path, refusal path and release accounting are distinguishable and identical under both loaders. It does not establish the console's error codes, the second argument's meaning, the alignment width, the heap size, or whether the startup path calls `ApuAlloc` before `ApuCreateHeap`.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_apu_alloc_caller$' -V
+```
+
 ### Grouped allocation descriptor builders
 
 In the inspected Bink image, the function interval beginning at RVA `0x67c0` contains direct calls to the group initializer (`0x25b80`), append helper (`0x25b20`) and grouped allocator (`0x25a40`). The initializer places two adjacent arrays after a 64-byte header. Each successful append records a destination and a padded stride. With five available slots, requests of 0, 33, 1, 1025 and 32 bytes produced strides of 32, 64, 128, 1280 and 512 bytes in order. The stride in 32-byte units is congruent to the previous total in units plus one, modulo 32. All five stored strides were even. These helpers do not establish who produces odd tagged entries.
