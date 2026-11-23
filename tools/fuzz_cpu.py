@@ -215,8 +215,14 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None):
         loaded.append((library, prefix))
 
     native_library, lifted_library, o2_library = (item[0] for item in loaded)
+    if count <= 0:
+        raise SystemExit("CPU_FUZZ_FUNCTIONS must be positive")
     selected = [function for function in functions if only is None or function.name == only]
     selected_inputs = [(index, value) for index, value in enumerate(inputs) if input_index is None or index == input_index]
+    if not selected:
+        raise SystemExit(f"no generated function matches --only {only!r}")
+    if not selected_inputs:
+        raise SystemExit(f"no input matches --input {input_index}")
     checks = 0
     for function in selected:
         native_symbol = getattr(native_library, function.name)
