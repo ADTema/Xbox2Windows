@@ -677,6 +677,24 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_dead_reads COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/dead_read_check.py" "$<TARGET_FILE:cpu_guarded_call>"
         "$<TARGET_FILE:cpu_dead_read>" "$<TARGET_FILE:cpu_dead_read_lifted>" "${dead_read_o2}")
+    # The same control for the shared integer lowering (ffx_version_query.lower, with its x87 profile).
+    cpu_asm_fixture(cpu_lower_dead_read lower_dead_read)
+    set(lower_dead_read_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_lower_dead_read_lifted.cpp")
+    add_custom_command(OUTPUT "${lower_dead_read_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/lower_dead_read.py"
+            emit "$<TARGET_FILE:cpu_lower_dead_read>" "${lower_dead_read_fixture}"
+        DEPENDS cpu_lower_dead_read tests/cpu/lower_dead_read.py tools/ffx_version_query.py tools/x87_lower.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_lower_dead_read_lifted SHARED "${lower_dead_read_fixture}")
+    set(lower_dead_read_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_lower_dead_read_lifted_o2.dll")
+    add_custom_command(OUTPUT "${lower_dead_read_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /EHsc /LD "${lower_dead_read_fixture}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_lower_dead_read_lifted_o2.obj" "/Fe${lower_dead_read_o2}"
+        DEPENDS "${lower_dead_read_fixture}" VERBATIM)
+    add_custom_target(cpu_lower_dead_read_lifted_o2 ALL DEPENDS "${lower_dead_read_o2}")
+    add_test(NAME cpu_aot_lower_dead_reads COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/lower_dead_read.py" check "$<TARGET_FILE:cpu_guarded_call>"
+        "$<TARGET_FILE:cpu_lower_dead_read>" "$<TARGET_FILE:cpu_lower_dead_read_lifted>" "${lower_dead_read_o2}")
     cpu_asm_fixture(cpu_narrow narrow)
     cpu_translation(cpu_narrow cpu_switch_aot
         byte_merge,word_ops,byte_shift,byte_unary,al_less,mixed_width,ax_copy,zx_byte,set_less,set_zx,store_only,store_ret0,self_loop,qword_ops,flag_results,imul3_fresh)
@@ -2277,6 +2295,41 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_texture_check.py" "$<TARGET_FILE:pe_map>"
         "${texture_exe}" "$<TARGET_FILE:archive_texture_lifted>" "$<TARGET_FILE:archive_codec>"
         "$<TARGET_FILE:blast_source>")
+
+    # The same reader image drawing each completed record through D3D12 (#830). The GPU codec keeps
+    # the name archive_codec.dll in its own directory, next to copies of the reader and blast.
+    set(archive_gpu_dir "${CMAKE_CURRENT_BINARY_DIR}/archive_gpu")
+    set(archive_gpu_sources "${archive_src}/codec.cpp" "${archive_src}/texture_gpu.cpp"
+        "${archive_src}/quad_frames.cpp" "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_vs.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_ps.h")
+    add_library(archive_codec_gpu SHARED ${archive_gpu_sources})
+    target_link_libraries(archive_codec_gpu PRIVATE blast_source dxgi d3d12)
+    set_target_properties(archive_codec_gpu PROPERTIES OUTPUT_NAME archive_codec
+        RUNTIME_OUTPUT_DIRECTORY "${archive_gpu_dir}" ARCHIVE_OUTPUT_DIRECTORY "${archive_gpu_dir}")
+    add_library(archive_codec_gpu_lifted SHARED ${archive_gpu_sources})
+    target_link_libraries(archive_codec_gpu_lifted PRIVATE blast_lifted dxgi d3d12)
+    foreach(codec IN ITEMS archive_codec_gpu archive_codec_gpu_lifted)
+        target_include_directories(${codec} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_features(${codec} PRIVATE cxx_std_17)
+        set_target_properties(${codec} PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+    endforeach()
+    set(archive_gpu_reader "${archive_gpu_dir}/archive_texture_reader.exe")
+    add_custom_command(OUTPUT "${archive_gpu_reader}" "${archive_gpu_dir}/blast_source.dll"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${texture_exe}" "$<TARGET_FILE:blast_source>"
+            "${archive_gpu_dir}"
+        DEPENDS "${texture_exe}" blast_source VERBATIM)
+    add_custom_target(archive_gpu_reader ALL DEPENDS "${archive_gpu_reader}")
+    add_executable(archive_texture_gpu_lifted "${texture_cpp}")
+    target_link_libraries(archive_texture_gpu_lifted PRIVATE archive_codec_gpu_lifted ntdll)
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME cpu_archive_texture_gpu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_texture_gpu_check.py" "$<TARGET_FILE:pe_map>"
+            "${archive_gpu_reader}" "$<TARGET_FILE:archive_texture_gpu_lifted>"
+            "$<TARGET_FILE:archive_codec_gpu>" "$<TARGET_FILE:blast_source>")
+        set_tests_properties(cpu_archive_texture_gpu_${adapter} PROPERTIES TIMEOUT 180
+            ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter}")
+    endforeach()
+    set_tests_properties(cpu_archive_texture_gpu_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
     function(crc_line_program target polynomial)
         # Use the same CRC object optimization flags in Debug and Release.
