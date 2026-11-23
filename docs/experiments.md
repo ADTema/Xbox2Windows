@@ -1827,6 +1827,12 @@ The report follows the effect's stored list order. Each entry gives its stored g
 
 Two independently located local effects yielded 5 and 81 candidates across all groups. Their pixel lists contained 2 and 41 candidates respectively, and every pixel-container digest matched an independent decode. Identifying which candidate a draw uses still requires evidence of pass selection.
 
+## Differential fuzz smoke test for the CPU translators
+
+[#446](https://github.com/R0Y00/Xbox2Windows/issues/446) asks for native and translated functions to run side by side on generated inputs. `tools/fuzz_cpu.py` generates deterministic leaf functions for the shared `cpu_switch_aot` lifter. The default smoke generates 20 functions from seed `0xA902`: 8-, 16-, 32- and 64-bit ALU chains, shifts and rotates, CMP and TEST producers feeding SETcc, CMOVcc and Jcc consumers, a forward branch diamond, and a Jcc to its own fallthrough. Each function starts from RCX and RDX and writes to the R8 output buffer. The build writes one MASM DLL, translates all 20 exports into one C++ source, and builds that source at the preset's optimization and again at `/O2`. The test calls the native, default-translated and `/O2`-translated exports with 313 deterministic input pairs per function and compares RAX plus a guarded 256-byte output buffer. It performs 12,520 comparisons in about 0.35 s on Windows 11 build 26200 with MSVC 19.52.
+
+Run `ctest --preset dev --no-tests=error -R '^cpu_aot_fuzz_smoke$' -V`. `CPU_FUZZ_FUNCTIONS` and `CPU_FUZZ_SEED` select a longer manual run; 96 functions at seed `0xCCD1` made 60,096 comparisons in about 1.1 s. A mismatch prints the seed, function, input and one-function MASM; `--only NAME --input INDEX` repeats that case. The current scope is leaf ALU, flags and branches; frames, calls, shared callees, tail jumps, dead reads and fault equivalence remain follow-ups. A case worth keeping can be reduced to a fixed fixture with the existing `cpu_asm_fixture` and `cpu_translation` helpers.
+
 ## Mesh draw fallback
 
 The bounded mesh translator can emit `cs_6_0` entry `main` and `vs_6_0` entry
