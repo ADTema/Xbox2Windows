@@ -841,6 +841,16 @@ int range_partial_checks(bool warp)
         }
         window_calls = 0;
         fail_window = fail_at;
+        if (fail_at == 1) {
+            for (const UINT64 invalid_size : {UINT64{0}, UINT64{65537}, ~UINT64{0} - 65535}) {
+                auto* invalid_range = reinterpret_cast<IX2WGpuRange*>(std::uintptr_t{1});
+                const HRESULT invalid = d3d12_xs_range::create(device.Get(), invalid_size, &invalid_range,
+                                                              failing_window);
+                expect(invalid == E_INVALIDARG && !invalid_range && window_calls == 0,
+                       "invalid range size is rejected before creating any window");
+                if (SUCCEEDED(invalid) && invalid_range) invalid_range->Release();
+            }
+        }
         IX2WGpuRange* range = reinterpret_cast<IX2WGpuRange*>(std::uintptr_t{1});
         const HRESULT hr = d3d12_xs_range::create(device.Get(), range_bytes, &range, failing_window);
         std::printf("window %u fails: hr=0x%08lx after %u calls\n", fail_at, static_cast<unsigned long>(hr),

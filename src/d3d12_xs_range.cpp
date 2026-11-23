@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <limits>
 #include <new>
 #include <vector>
 
@@ -36,13 +37,14 @@ public:
         D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va{};
         HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va, sizeof(va));
         if (FAILED(hr)) return hr;
-        if (va.MaxGPUVirtualAddressBitsPerResource < 17 || !size) return E_FAIL;
+        if (va.MaxGPUVirtualAddressBitsPerResource < 17) return E_FAIL;
         // Below 4 GiB, the largest whole number of tiles a resource of this adapter can span.
         const UINT64 per_resource = va.MaxGPUVirtualAddressBitsPerResource >= 64
                                         ? max_window_bytes
                                         : (UINT64{1} << va.MaxGPUVirtualAddressBitsPerResource) - tile_bytes;
         const UINT64 window = std::min(max_window_bytes, per_resource) & ~(tile_bytes - 1);
-        const UINT64 count = (size + window - 1) / window;
+        const UINT64 count = 1 + (size - 1) / window;
+        if (count > std::numeric_limits<UINT>::max() || count > windows_.max_size()) return E_INVALIDARG;
         try {
             windows_.reserve(static_cast<std::size_t>(count));
         } catch (const std::bad_alloc&) {
@@ -142,7 +144,7 @@ HRESULT create(ID3D12Device* device, UINT64 size, IX2WGpuRange** range, CreateWi
 {
     if (!range) return E_POINTER;
     *range = nullptr;
-    if (!device) return E_INVALIDARG;
+    if (!device || size == 0 || size % tile_bytes != 0) return E_INVALIDARG;
     auto* created = new (std::nothrow) GpuRange;
     if (!created) return E_OUTOFMEMORY;
     const HRESULT hr = created->reserve(device, size, create_window ? create_window : create_reserved);

@@ -43,8 +43,9 @@ namespace d3d12_xs_range {
 // Creates one window; the default calls ID3D12Device::CreateReservedResource.
 using CreateWindowFn = HRESULT (*)(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, ID3D12Resource** window);
 
-// Reserves `size` bytes in windows of at most 4 GiB, or less where the adapter's per-resource limit
-// is lower, and returns the owning reference in *range. On failure returns the HRESULT with *range
+// Reserves a positive multiple of 64 KiB in windows of at most 4 GiB, or less where the adapter's
+// per-resource limit is lower, and returns the owning reference in *range. The count must fit UINT.
+// On failure returns the HRESULT with *range
 // null, and every window created so far is released.
 HRESULT create(ID3D12Device* device, UINT64 size, IX2WGpuRange** range, CreateWindowFn create_window = nullptr) noexcept;
 }
