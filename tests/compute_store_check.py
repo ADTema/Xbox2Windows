@@ -288,22 +288,24 @@ def controls():
         [s.replace("s_movk_i32 s11, 0xfffc", "s_movk_i32 s11, 0x10000") for s in MULTI_FIXED],
         1, **FIXED_BINDING))
     must_reject(aot.group_size, bytes(52))
+    # Runtime info shorter than 48 bytes, or a non-compute stage, has no usable thread dimensions.
     for size, stage in ((47, 5), (48, 4)):
         psv = bytearray(52)
         struct.pack_into("<I", psv, 0, size)
         psv[28] = stage
         struct.pack_into("<3I", psv, 40, 1, 1, 1)
-        must_reject(aot.group_size, bytes(psv))
+        rejects("Expected compute PSV runtime info", aot.group_size, bytes(psv))
 
+    # The 6-bit s_clause field, 32-bit literals and the 12-bit MUBUF offset.
     max_clause = [s.replace("s_clause 0x1", "s_clause 0x3f") for s in MULTI_FIXED]
     assert aot.lower(max_clause, 1, **FIXED_BINDING) == aot.lower(MULTI_FIXED, 1, **FIXED_BINDING)
-    must_reject(lambda: aot.lower(
+    rejects("Invalid scalar immediate", lambda: aot.lower(
         [s.replace("s10, 0x12345678", "s10, -2147483649") for s in MULTI_FIXED],
         1, **FIXED_BINDING))
-    must_reject(lambda: aot.lower(
+    rejects("Invalid literal move", lambda: aot.lower(
         [s.replace("v20, 11", "v20, 0x100000000") for s in FIXED],
         1, **FIXED_BINDING))
-    must_reject(lambda: aot.lower(
+    rejects("Unverified raw UAV store", lambda: aot.lower(
         [s.replace("offset:20", "offset:4096") for s in FIXED],
         1, **FIXED_BINDING))
     for descriptor in (None, 8, 16, 33):
@@ -898,7 +900,6 @@ def read_controls():
     # A fixed read address.
     assert "        outputData.Store(tid.x * 4u + 0u, inputData.Load(8u));" in read(
         "read_copy", ("v1, v1, s[4:7], 0 offen", "v1, off, s[4:7], 0 offset:8"))
-    must_reject(lambda: read("read_copy", ("s_waitcnt vmcnt(0)", "s_waitcnt lgkmcnt(0) vmcnt(1)")))
     wait = "Vector load result used or overwritten before s_waitcnt vmcnt(0)"
     descriptor, address = "Unverified buffer read descriptor", "Unsupported read address"
     for name, message, changes, binding in (
@@ -911,6 +912,8 @@ def read_controls():
         # A partial count does not say which load completed.
         ("read_copy", "Unsupported compute instruction: s_waitcnt vmcnt(1)",
          (("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(1)"),), {}),
+        ("read_copy", "Unsupported compute instruction: s_waitcnt lgkmcnt(0) vmcnt(1)",
+         (("s_waitcnt vmcnt(0)", "s_waitcnt lgkmcnt(0) vmcnt(1)"),), {}),
         # The read uses the store target, the constant buffer, an unbound slot, or a pending descriptor.
         ("read_copy", "Reads from the stored UAV are not supported", (("v1, v1, s[4:7]", "v1, v1, s[0:3]"),), {}),
         ("read_copy", "Unresolved compute descriptor load", (), dict(source_descriptor=48)),
