@@ -17,14 +17,14 @@
 #include <wrl/client.h>
 
 #include <cstdio>
+#include <cstddef>
 #include <cstring>
 #include <cwchar>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <vector>
-
-extern "C" HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -36,6 +36,21 @@ constexpr UINT trace_bytes = 80;
 constexpr UINT image_bytes = side * side * 4;
 
 struct Failure {};
+
+struct ShadowDeviceArguments {
+    IUnknown* adapter = nullptr;
+    const IID* iid = nullptr;
+    void* device = nullptr;
+};
+static_assert(offsetof(ShadowDeviceArguments, adapter) == 0);
+static_assert(offsetof(ShadowDeviceArguments, iid) == 8);
+static_assert(offsetof(ShadowDeviceArguments, device) == 16);
+
+struct ShadowRequest : ShadowDeviceArguments {
+    ComPtr<IDXGIFactory6> factory;
+    ComPtr<IDXGIAdapter1> selected;
+    DWORD mode = 0;
+};
 
 void require(HRESULT hr, const char* operation)
 {
@@ -67,11 +82,9 @@ std::vector<char> read_input(const char* name)
 // WARP by default. "hardware" takes the first physical D3D12 adapter in high-performance
 // order or, with XBOX2WINDOWS_ADAPTER, the first whose description contains that value.
 // No physical adapter is a capability skip (77); a filter that matches none is an error.
-ComPtr<ID3D12Device> create_device(bool xbox_shim = false, bool reject = false)
+void select_adapter(ComPtr<IDXGIFactory6>& factory, ComPtr<IDXGIAdapter1>& adapter)
 {
-    ComPtr<IDXGIFactory6> factory;
     require(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
-    ComPtr<IDXGIAdapter1> adapter;
     char backend[16]{};
     const auto size = GetEnvironmentVariableA("X2W_SHIM_DRAW_ADAPTER", backend, sizeof(backend));
     if (!size || (size < sizeof(backend) && std::strcmp(backend, "warp") == 0)) {
@@ -107,22 +120,15 @@ ComPtr<ID3D12Device> create_device(bool xbox_shim = false, bool reject = false)
     } else {
         require(E_INVALIDARG, "Select draw adapter");
     }
+}
+
+ComPtr<ID3D12Device> create_device()
+{
+    ComPtr<IDXGIFactory6> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    select_adapter(factory, adapter);
     ComPtr<ID3D12Device> device;
-    if (!xbox_shim) {
-        require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
-        return device;
-    }
-    if (reject) {
-        void* rejected = adapter.Get();
-        const auto hr = D3D12XboxCreateDevice(adapter.Get(), nullptr, __uuidof(IDXGIFactory6), &rejected);
-        if (hr != E_NOINTERFACE || rejected || !adapter || !factory)
-            fail("Unexpected rejected shim device or missing adapter ownership");
-        adapter.Reset();
-        factory.Reset();
-        std::fputs("Xbox device rejected: no device, released adapter and factory\n", stderr);
-        throw Failure{};
-    }
-    require(D3D12XboxCreateDevice(adapter.Get(), nullptr, IID_PPV_ARGS(&device)), "D3D12XboxCreateDevice");
+    require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
     return device;
 }
 
@@ -396,17 +402,50 @@ bool shim_chain_gpu(unsigned mode, std::vector<unsigned char>& published, unsign
     }
 }
 
-bool shim_shadow_gpu(bool stale, bool reject, std::vector<unsigned char>& output)
+extern "C" __declspec(dllexport) void* shadow_device_request(DWORD mode)
 {
     try {
+        auto request = std::make_unique<ShadowRequest>();
+        select_adapter(request->factory, request->selected);
+        request->mode = mode;
+        request->adapter = request->selected.Get();
+        request->iid = mode == 16 ? &__uuidof(IDXGIFactory6) : &__uuidof(ID3D12Device);
+        if (mode == 16) request->device = request->adapter;
+        return static_cast<ShadowDeviceArguments*>(request.release());
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return nullptr;
+    } catch (const Failure&) {
+        return nullptr;
+    }
+}
+
+bool shim_shadow_gpu(void* args, HRESULT result, std::vector<unsigned char>& output)
+{
+    try {
+        std::unique_ptr<ShadowRequest> request(static_cast<ShadowRequest*>(static_cast<ShadowDeviceArguments*>(args)));
+        if (request->mode == 16) {
+            if (result != E_NOINTERFACE || request->device || !request->selected || !request->factory)
+                fail("Unexpected rejected shim device or missing adapter ownership");
+            request->selected.Reset();
+            request->factory.Reset();
+            std::fputs("Xbox device rejected: no device, released adapter and factory\n", stderr);
+            return false;
+        }
+        require(result, "D3D12XboxCreateDevice");
+        if (!request->device) fail("D3D12XboxCreateDevice returned no device");
+        ComPtr<ID3D12Device> device;
+        device.Attach(static_cast<ID3D12Device*>(request->device));
+        request->selected.Reset();
+        request->factory.Reset();
+        std::fputs("Xbox device created: EXE import returned a desktop device\n", stderr);
         const auto* path = std::getenv("X2W_SHIM_CHAIN_DIR");
         if (!path || !*path) return false;
         const auto directory = std::filesystem::path(path);
-        auto device = create_device(true, reject);
         if (!check_mesh_shadow_draw(device.Get(), (directory / "mesh.dxil").string().c_str(),
                                     (directory / "receiver.dxil").string().c_str(),
                                     (directory / "caster.dxil").string().c_str(),
-                                    (directory / "frames.case").string().c_str(), stale, &output))
+                                    (directory / "frames.case").string().c_str(), request->mode == 15, &output))
             ExitProcess(77);
         return true;
     } catch (const std::exception& error) {
