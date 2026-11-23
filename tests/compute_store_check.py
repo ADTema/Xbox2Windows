@@ -488,6 +488,10 @@ def pitch_controls():
         must_reject(lambda: aot.lower(PITCH, group, **PITCH_BINDING))
     for change in (dict(group_reg_y=None), dict(group_reg_y=12)):
         must_reject(lambda: aot.lower(PITCH, (4, 4, 1), **(PITCH_BINDING | change)))
+    # One group's rows may span the whole 32-bit address space but not wrap onto each other.
+    tall = [s.replace("s10, 2, v0", "s10, 0, v0").replace("s11, 2, v1", "s11, 10, v1") for s in PITCH]
+    aot.lower([s.replace("0x48", "0x400000") for s in tall], (1, 1024, 1), **PITCH_BINDING)
+    must_reject(lambda: aot.lower([s.replace("0x48", "0x400004") for s in tall], (1, 1024, 1), **PITCH_BINDING))
     # A second store with another pitch would use a different layout.
     second = ["v_mad_u32_u24 v7, 0x50, v4, v5", "buffer_store_dword v8, v7, s[12:15], 0 offen offset:4"]
     try:

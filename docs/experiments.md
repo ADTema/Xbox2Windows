@@ -1880,7 +1880,8 @@ emits this form when the source masks the row index to 24 bits, and places the
 pitch in src0. The instruction multiplies only bits [23:0] of the row, so the
 HLSL masks the row with `0xffffff` before the multiply. The pitch must be a
 multiple of 4 from 4 to 2^24 - 4. The store must fit in one element and one
-group's columns in the pitch. Without `idxen` the descriptor stride is unused,
+group's columns in the pitch, and one group's rows must not wrap the 32-bit
+address. Without `idxen` the descriptor stride is unused,
 so `--stride` does not change the output.
 
 All stores in a program use one layout, so no two invocations of a group write
@@ -1957,7 +1958,8 @@ The CPU controls reject:
 - `v_add_lshl_u32` of an unscaled group ID, of the local ID of another axis or
   into a register past `v255`, and a group base stored as data;
 - a pitch that is unaligned, zero, negative, wider than 24 bits, narrower than
-  one group's columns, or read from a register;
+  one group's columns, so wide that one group's rows wrap the address, or read
+  from a register;
 - a pitch offset built from a raw local ID, from the column's axis or from an
   index instead of a byte offset, or written with `clamp`;
 - a pitch offset combined with `idxen`, stored as data, or used next to a

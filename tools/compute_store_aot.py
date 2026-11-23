@@ -258,7 +258,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 # offen only: (row & 0xffffff) * pitch + (column << shift) + instruction offset.
                 # Without idxen the descriptor stride is not used, so the stride binding is ignored.
                 _, row, pitch, column, shift = tags[0]
-                if offset + 4 * count > 1 << shift or dims[column] << shift > pitch:
+                # A group's rows start on a 24-bit-aligned power-of-two boundary, so masking keeps them
+                # consecutive; their pitches must not wrap the 32-bit address onto each other.
+                if (offset + 4 * count > 1 << shift or dims[column] << shift > pitch
+                        or dims[row] * pitch > 1 << 32):
                     raise ValueError("Store leaves its element or row")
                 store_layout = ("pitch", row, pitch, column, shift)
                 covered = {row, column}
