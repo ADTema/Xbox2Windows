@@ -1374,6 +1374,12 @@ mutation and relocation-free tests also passed in both configurations.
 define the four-byte HIGHLOW operation. This adds a mapper capability; no title
 startup or use of this relocation by a particular title is established.
 
+### Security cookie before entry
+
+`cpu_native_load_cookie` uses a CRT-free DLL and EXE to observe the load-config cookie before either entry can initialize it. On Windows 11, the native loader replaces the default x64 cookie with a nonzero, non-default 48-bit value when the load-config sizes reach the 0x70-byte prefix. `pe_map` seeds the same case with the system random generator after relocation and before guest callbacks or entry. The fixture compares the behavior and value bounds across the two loaders. It checks the size boundary from both fields, the unused-cookie flag, and a preinitialized cookie. A read-only target must be rejected by the mapper before entry.
+
+`ctest --preset release --no-tests=error -R '^cpu_native_load_cookie$' -V`
+
 ### TLS callbacks and the entry point
 
 `tls_route` has an entry point and a TLS directory whose callback list holds one routine and whose data template is empty. Both routines report each call to `cpu_tls_sink.dll`, which outlives the image, so calls made during release stay visible. `cpu_native_tls` loads the image with `LoadLibraryW` and maps it with `pe_map`, each in its own child process, and compares the process notifications:

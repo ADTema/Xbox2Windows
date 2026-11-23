@@ -2740,6 +2740,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Simulation control: finish_exe never terminates; the control installs it as cpu_exe_io.dll.
     add_library(cpu_exe_io_hang SHARED tests/cpu/exe_io.cpp)
     target_compile_definitions(cpu_exe_io_hang PRIVATE FINISH_HANG)
+    add_library(cpu_cookie_dll SHARED tests/cpu/load_cookie.asm)
+    add_executable(cpu_cookie_exe tests/cpu/load_cookie.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_cookie_dll cpu_cookie_exe PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_cookie_dll PRIVATE /ENTRY:fixture_entry /EXPORT:read_cookie
+        /NODEFAULTLIB /SUBSYSTEM:WINDOWS,6.00 /DYNAMICBASE /INCREMENTAL:NO)
+    target_link_options(cpu_cookie_exe PRIVATE /ENTRY:native_startup
+        /NODEFAULTLIB /SUBSYSTEM:CONSOLE,6.00 /DYNAMICBASE /INCREMENTAL:NO)
+    target_link_libraries(cpu_cookie_exe PRIVATE cpu_exe_io)
+    add_test(NAME cpu_native_load_cookie COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/load_cookie_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_cookie_dll>" "$<TARGET_FILE:cpu_cookie_exe>" "$<TARGET_FILE:cpu_exe_io>")
     foreach(variant IN ITEMS original no_tls)
         add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)
