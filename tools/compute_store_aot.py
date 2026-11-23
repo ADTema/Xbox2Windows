@@ -27,12 +27,20 @@ ALU = {
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
-LDS_RMW_OPERATORS = {
-    "ds_add_u32": "+",
-    "ds_sub_u32": "-",
-    "ds_and_b32": "&",
-    "ds_or_b32": "|",
-    "ds_xor_b32": "^",
+# Template operands are the old LDS word and the source VGPR, both HLSL uints.
+LDS_RMW_RETURN = {
+    "ds_add_u32": "({0} + {1})",
+    "ds_sub_u32": "({0} - {1})",
+    "ds_and_b32": "({0} & {1})",
+    "ds_or_b32": "({0} | {1})",
+    "ds_xor_b32": "({0} ^ {1})",
+}
+LDS_RMW_NO_RETURN = LDS_RMW_RETURN | {
+    "ds_rsub_u32": "({1} - {0})",
+    "ds_min_i32": "asuint(min(asint({0}), asint({1})))",
+    "ds_max_i32": "asuint(max(asint({0}), asint({1})))",
+    "ds_min_u32": "min({0}, {1})",
+    "ds_max_u32": "max({0}, {1})",
 }
 
 
@@ -412,9 +420,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("LDS expression exceeds the profile limit")
                 lds_word = ("alu", expression)
             ds_wait = True
-        elif ((m := re.fullmatch(r"(ds_[a-z]+)(?P<ret>_rtn)?(_[ub]32) "
+        elif ((m := re.fullmatch(r"(ds_[a-z]+)(?P<ret>_rtn)?(_[iub]32) "
                                  r"(?(ret)v(\d+), )v(\d+), v(\d+)(?: offset:0)?", line))
-              and (op := LDS_RMW_OPERATORS.get(m[1] + m[3])) is not None):
+              and (template := (LDS_RMW_RETURN if m["ret"] else LDS_RMW_NO_RETURN).get(m[1] + m[3]))):
             dst = int(m[4]) if m[4] is not None else None
             addr, src = int(m[5]), int(m[6])
             value = vector.get(src)
@@ -422,8 +430,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or (dst is not None and dst > 255) or vector.get(addr) != ("lds_address",)
                     or lds_word is None or not is_word(value)):
                 raise ValueError("Unverified private LDS update")
-            # Both operands are HLSL uints. Addition and subtraction wrap at 32 bits.
-            expression = f"({hlsl_word(lds_word)} {op} {hlsl_word(value)})"
+            expression = template.format(hlsl_word(lds_word), hlsl_word(value))
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("LDS expression exceeds the profile limit")
             # Capture the inputs before assigning the old word to a possibly overlapping VGPR.

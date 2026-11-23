@@ -1170,30 +1170,57 @@ def ds_controls():
 
 
 LDS_BINDING = DS_BINDING | {"stride": 12, "lds_bytes": 128}
+
+
+def signed_order(word):
+    # Flipping the sign bit places negatives before nonnegatives in an unsigned comparison.
+    return word ^ 0x80000000
+
+
 LDS_UPDATES = {
     "ds_add_u32": operator.add,
     "ds_sub_u32": operator.sub,
     "ds_and_b32": operator.and_,
     "ds_or_b32": operator.or_,
     "ds_xor_b32": operator.xor,
+    "ds_rsub_u32": lambda old, value: value - old,
+    "ds_min_i32": lambda old, value: min(old, value, key=signed_order),
+    "ds_max_i32": lambda old, value: max(old, value, key=signed_order),
+    "ds_min_u32": min,
+    "ds_max_u32": max,
+}
+LDS_ORDER_MUTANTS = {
+    "ds_rsub_u32": "ds_sub_u32",
+    "ds_min_i32": "ds_min_u32",
+    "ds_max_i32": "ds_max_u32",
+    "ds_min_u32": "ds_min_i32",
+    "ds_max_u32": "ds_max_i32",
 }
 
 
+def lds_update_inputs(op):
+    # Each pair is (scale, base) for a lane-dependent 32-bit word.
+    if op in LDS_ORDER_MUTANTS:
+        return (1, 0x7ffffff0), (1, 0xfffffff8), (4, 0xfffffff0)
+    return (1, 0xfffffff0), (1, 0x40000021), (1, 0x80000003)
+
+
 def lds_update_program(op):
+    (init_scale, init_base), (first_scale, first_base), (second_scale, second_base) = lds_update_inputs(op)
     return DS_PREFIX + [
         "v_lshlrev_b32_e32 v5, 2, v0",
-        "v_mad_u32_u24 v6, 1, v8, 0xfffffff0",
+        f"v_mad_u32_u24 v6, {init_scale}, v8, 0x{init_base:08x}",
         "ds_write_b32 v5, v6",
         "s_waitcnt lgkmcnt(0)",
         "ds_read_b32 v10, v5",
         "s_waitcnt lgkmcnt(0)",
-        "v_mad_u32_u24 v6, 1, v8, 0x40000021",
+        f"v_mad_u32_u24 v6, {first_scale}, v8, 0x{first_base:08x}",
         f"{op} v5, v6",
         "s_waitcnt lgkmcnt(0)",
         "v_mov_b32_e32 v6, 0",
         "ds_read_b32 v11, v5",
         "s_waitcnt lgkmcnt(0)",
-        "v_mad_u32_u24 v9, 1, v8, 0x80000003",
+        f"v_mad_u32_u24 v9, {second_scale}, v8, 0x{second_base:08x}",
         f"{op} v5, v9",
         "s_waitcnt lgkmcnt(0)",
         "v_mov_b32_e32 v9, 0",
@@ -1206,11 +1233,12 @@ def lds_update_program(op):
 
 def lds_update_reference(op, groups):
     update = LDS_UPDATES[op]
+    inputs = lds_update_inputs(op)
     words = []
     for lane in range(groups * 32):
-        initial = (lane - 16) & 0xffffffff
-        first = update(initial, 0x40000021 + lane) & 0xffffffff
-        second = update(first, 0x80000003 + lane) & 0xffffffff
+        initial, src1, src2 = ((scale * lane + base) & 0xffffffff for scale, base in inputs)
+        first = update(initial, src1) & 0xffffffff
+        second = update(first, src2) & 0xffffffff
         words.extend((initial, first, second))
     return words
 
@@ -1453,6 +1481,14 @@ def lds_controls():
             lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
+    for op in LDS_ORDER_MUTANTS:
+        lines = lds_update_program(op)
+        update = f"{op} v5, v6"
+        prefix, suffix = op.rsplit("_", 1)
+        for bad in (update + " offset:4", update + " gds", f"{prefix}_rtn_{suffix} v11, v5, v6"):
+            rejects("Unsupported compute instruction", aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
+
+
 def ds_binary(directory, assembler, objcopy, library):
     for name, lines, binding in DS_CASES + LDS_CASES:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
@@ -1476,7 +1512,10 @@ def ds_binary(directory, assembler, objcopy, library):
 
 
 def ds_mutants(name, lines, binding, source):
-    if name in LDS_UPDATES:
+    if name in LDS_ORDER_MUTANTS:
+        changed = variant(lines, (f"{name} v5, v6", f"{LDS_ORDER_MUTANTS[name]} v5, v6"))
+        yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_UPDATES:
         changed = variant(lines, (f"{name} v5, v6", "ds_write_b32 v5, v6"))
         yield aot.lower(changed, 32, **binding), 1
     elif name in LDS_RETURN_UPDATES:
