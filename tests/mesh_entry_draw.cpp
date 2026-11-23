@@ -77,6 +77,15 @@ ComPtr<ID3D12PipelineState> fallback_draw_pipeline(ID3D12Device* device, ID3D12R
     return pipeline;
 }
 
+ComPtr<ID3D12RootSignature> create_draw_root(ID3D12Device* device, const D3D12_ROOT_SIGNATURE_DESC& layout)
+{
+    ComPtr<ID3DBlob> blob;
+    check(D3D12SerializeRootSignature(&layout, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr), "Serialize draw root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)), "Draw root");
+    return root;
+}
+
 bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second, const char* fixture,
                      bool vertices, MeshConstantBinding binding, const char* fallback_vertex, MeshDrawMode mode,
                      const MeshTextureProducers* producers)
@@ -125,23 +134,34 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     params[trace_slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     D3D12_ROOT_SIGNATURE_DESC layout{};
     params[vertex_slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    const UINT geometry_slot = vertex_slot + vertices;
-    if (fallback) {
-        params[geometry_slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        params[geometry_slot].Descriptor.ShaderRegister = 1;
-        params[geometry_slot].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    }
-    layout.NumParameters = geometry_slot + fallback;
+    const bool separate_roots = fallback && textured;
+    const UINT input_slots = vertex_slot + vertices;
+    const UINT geometry_slot = separate_roots ? trace_slot : input_slots;
+    const UINT texture_slot = separate_roots ? vertex_slot : vertex_slot + 1;
+    layout.NumParameters = input_slots + fallback;
     layout.pParameters = params;
-    const UINT texture_slot = vertex_slot + 1;
+    ComPtr<ID3D12RootSignature> export_root;
+    if (separate_roots) {
+        // Compute reads a buffer at t0. Graphics keeps the CBVs and uses t1 for
+        // the exported geometry and t0 for the sampled texture.
+        layout.NumParameters = input_slots;
+        export_root = create_draw_root(device, layout);
+    }
+    if (fallback) {
+        auto& geometry_param = params[geometry_slot];
+        geometry_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        geometry_param.Descriptor.ShaderRegister = 1;
+        geometry_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    }
     D3D12_DESCRIPTOR_RANGE texture_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
     D3D12_STATIC_SAMPLER_DESC sampler{};
     if (textured) {
-        // Both stages use t0. The mesh reads a root buffer SRV and the pixel stage reads a texture table.
-        params[vertex_slot].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
-        params[texture_slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[texture_slot].DescriptorTable = {1, &texture_range};
-        params[texture_slot].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        // On the native path, mesh and pixel each use t0 with stage-specific visibility.
+        if (!fallback) params[vertex_slot].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+        auto& texture_param = params[texture_slot];
+        texture_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        texture_param.DescriptorTable = {1, &texture_range};
+        texture_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
         sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         sampler.MaxAnisotropy = 1;
@@ -152,18 +172,16 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
         layout.NumStaticSamplers = 1;
         layout.pStaticSamplers = &sampler;
     }
-    ComPtr<ID3DBlob> blob;
-    check(D3D12SerializeRootSignature(&layout, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr), "Serialize draw root");
-    ComPtr<ID3D12RootSignature> root;
-    check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)), "Draw root");
+    auto root = create_draw_root(device, layout);
     ComPtr<ID3D12PipelineState> pipeline;
     ComPtr<ID3D12PipelineState> compute_pipeline;
     const D3D12_SHADER_BYTECODE ps{pixel.data(), pixel.size()};
     if (fallback) {
+        if (!export_root) export_root = root;
         const auto vertex = read_bytes(fallback_vertex);
         pipeline = fallback_draw_pipeline(device, root.Get(), {vertex.data(), vertex.size()}, ps);
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
-        desc.pRootSignature = root.Get();
+        desc.pRootSignature = export_root.Get();
         desc.CS = {shader.data(), shader.size()};
         check(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&compute_pipeline)), "Create mesh export compute pipeline");
     } else {
@@ -342,7 +360,7 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     auto trace_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     if (fallback) {
         list->SetPipelineState(compute_pipeline.Get());
-        list->SetComputeRootSignature(root.Get());
+        list->SetComputeRootSignature(export_root.Get());
         list->SetComputeRootConstantBufferView(0, base);
         list->SetComputeRootConstantBufferView(1, base + cb_bytes);
         if (vertices) list->SetComputeRootShaderResourceView(vertex_slot, base + 2 * cb_bytes);
@@ -458,7 +476,9 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* mesh, const char* p
 }
 
 void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const char* vertex,
-                              const char* pixel, const char* fixture)
+                              const char* pixel, const char* fixture, bool textured,
+                              const MeshTextureProducers* producers)
 {
-    check_mesh_draw(device, compute, pixel, fixture, true, MeshConstantBinding::root, vertex, MeshDrawMode::color, nullptr);
+    const auto mode = textured || producers ? MeshDrawMode::textured : MeshDrawMode::color;
+    check_mesh_draw(device, compute, pixel, fixture, true, MeshConstantBinding::root, vertex, mode, producers);
 }

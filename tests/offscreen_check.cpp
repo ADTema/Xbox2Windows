@@ -3,6 +3,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cwchar>
 #include <fstream>
@@ -427,6 +428,13 @@ bool validate_compute_mesh_texture_args(int argc, char** argv)
     return argc != 9 || std::string_view(argv[8]) == "--stale";
 }
 
+bool validate_compute_mesh_texture_fallback_args(int argc, char** argv)
+{
+    return std::string_view(argv[7]) != "--stale" &&
+           (argc < 9 || std::string_view(argv[8]) != "--stale") &&
+           (argc != 10 || std::string_view(argv[9]) == "--stale");
+}
+
 OperationResult run_check_pixel_batch(const OperationContext& ctx)
 {
     bool failed = false;
@@ -616,6 +624,28 @@ OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_check_pixel_mip_clamp(const OperationContext& ctx)
+{
+    const std::string_view level = ctx.argv[4];
+    if (level.size() != 1 || level[0] < '0' || level[0] > '3')
+        throw std::runtime_error("Expected a mip level from 0 to 3");
+    check_pixel_mip_clamp(ctx.device, ctx.argv[3], unsigned(level[0] - '0'));
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_mip_blend(const OperationContext& ctx)
+{
+    const auto number = [](std::string_view text) {
+        float value = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (error != std::errc{} || end != text.data() + text.size())
+            throw std::runtime_error("Expected a decimal clamp and tolerance");
+        return value;
+    };
+    check_pixel_mip_blend(ctx.device, ctx.argv[3], number(ctx.argv[4]), number(ctx.argv[5]));
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_check_pixel(const OperationContext& ctx)
 {
     check_translated_pixel(ctx.device, ctx.argv[3], std::string_view(ctx.argv[4]) == "bgra");
@@ -653,6 +683,12 @@ OperationResult run_mesh_indexed_fallback(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_mesh_textured_fallback(const OperationContext& ctx)
+{
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6], true);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_mesh_entry_table(const OperationContext& ctx)
 {
     const auto binding = ctx.argc == 7 ? MeshConstantBinding::swapped_table : MeshConstantBinding::table;
@@ -670,6 +706,13 @@ OperationResult run_compute_mesh_texture(const OperationContext& ctx)
     const MeshTextureProducers producers{ctx.argv[6], ctx.argc >= 8 ? ctx.argv[7] : nullptr, ctx.argc == 9};
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
                                                true, MeshConstantBinding::root, MeshDrawMode::textured, &producers));
+}
+
+OperationResult run_compute_mesh_texture_fallback(const OperationContext& ctx)
+{
+    const MeshTextureProducers producers{ctx.argv[7], ctx.argc >= 9 ? ctx.argv[8] : nullptr, ctx.argc == 10};
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6], true, &producers);
+    return {OutcomeKind::pass, nullptr};
 }
 
 OperationResult run_mesh_depth_pair(const OperationContext& ctx)
@@ -844,6 +887,10 @@ constexpr CapabilityGate kGateSm66Compaction{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: subgroup compaction fixture requires SM 6.6",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66MinLod{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "skip: MinLod fixture requires SM 6.6",
+    CapsDiagnostic::none};
 
 // Static argument shapes and unconditional adapter prerequisites for every named operation.
 // Scenario-dependent capability checks (such as DXR tier, mesh tier, or existing-heap support)
@@ -879,15 +926,22 @@ const OperationSpec kOperations[] = {
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
     {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
+    // The SPIR-V MinLod fixtures compile ps_6_6; these draws run behind an SM 6.6 gate.
+    {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm66MinLod, run_check_pixel_quad_lod},
+    {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},
+    {"--check-pixel-mip-blend", 6, 6, nullptr, kGateSm66MinLod, run_check_pixel_mip_blend},
     {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
     {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
+    {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
     {"--mesh-textured", 6, 6, nullptr, kNoGate, run_mesh_textured},
     {"--compute-mesh-texture", 7, 9, validate_compute_mesh_texture_args, kNoGate, run_compute_mesh_texture},
+    {"--compute-mesh-texture-fallback", 8, 10, validate_compute_mesh_texture_fallback_args,
+     kGateSm60MeshFallback, run_compute_mesh_texture_fallback},
     {"--mesh-depth-pair", 6, 6, nullptr, kNoGate, run_mesh_depth_pair},
     {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
     {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},
@@ -1178,6 +1232,28 @@ int run_self_test()
             return 1;
         if (!require(out.find("skip: ballot fixture requires SM 6.6") != std::string::npos,
                      "--spirv-ballot must print its skip reason")) return 1;
+
+        // The MinLod draws skip the same way instead of failing at ps_6_6 pipeline creation.
+        char quad_op[] = "--spirv-minlod-quad-lod";
+        char clamp_op[] = "--check-pixel-mip-clamp";
+        char blend_op[] = "--check-pixel-mip-blend";
+        char level[] = "1";
+        char tolerance[] = "0.0078125";
+        char* quad_argv[]{prog, mode, quad_op, dxil};
+        char* clamp_argv[]{prog, mode, clamp_op, dxil, level};
+        char* blend_argv[]{prog, mode, blend_op, dxil, level, tolerance};
+        const struct { char** argv; int argc; } minlod_cases[]{{quad_argv, 4}, {clamp_argv, 5}, {blend_argv, 6}};
+        for (const auto& c : minlod_cases) {
+            const OperationSpec* spec = find_operation(c.argv[2]);
+            if (!require(spec != nullptr, "MinLod operation")) return 1;
+            OperationContext mctx{nullptr, nullptr, low_caps, "warp", c.argc, c.argv, nullptr};
+            out.clear();
+            err.clear();
+            if (!require(run_operation_spec(*spec, mctx, {&out, &err}) == 77, "MinLod draw below SM 6.6 must exit 77"))
+                return 1;
+            if (!require(out.find("skip: MinLod fixture requires SM 6.6") != std::string::npos,
+                         "MinLod draw must print its skip reason")) return 1;
+        }
     }
 
     // (c) Handler OutcomeKind::fail and thrown exception exit 1 (never 77); OutcomeKind::skip exits 77; pass exits 0.

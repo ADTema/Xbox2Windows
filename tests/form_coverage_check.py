@@ -355,16 +355,21 @@ def check_shader_records():
         sdwa_unary_forms = {("SDWA", f"v_{op}_f32_sdwa") for op in (
             "exp", "log", "rcp", "rcp_iflag", "rsq", "sqrt", "sin", "cos", "rndne", "frexp_mant")}
         assert sdwa_unary_forms <= covered, (name, sdwa_unary_forms - covered)
-    # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit
-    # predicate the translator lowers; the rejected exec-writing and 64-bit neighbours stay out.
-    int_compares = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
-                    for kind in ("i16", "u16", "i32", "u32")}
-    int_compares |= {f"v_cmp_{op}_{kind}" for op in ("f", "t") for kind in ("i32", "u32")}
+    # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16-, 32- and 64-bit
+    # predicate the translator lowers; the rejected exec-writing neighbours stay out.
+    narrow_int = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
+                  for kind in ("i16", "u16", "i32", "u32")}
+    narrow_int |= {f"v_cmp_{op}_{kind}" for op in ("f", "t") for kind in ("i32", "u32")}
+    ops64 = ("f", "lt", "eq", "le", "gt", "ne", "ge", "t")
+    int64 = {f"v_cmp_{op}_{kind}" for op in ops64 for kind in ("i64", "u64")}
+    assert len(int64) == len(ops64) * 2, sorted(int64)
+    int_compares = narrow_int | int64
     f16_compares = {f"v_cmp_{op}_f16" for op in pixel.PREDICATES} | {"v_cmp_class_f16"}
     compare_forms = ({("VOPC", form) for form in int_compares | f16_compares}
                      | {("VOP3", f"{form}_e64") for form in int_compares | f16_compares})
-    assert len(compare_forms) == 90
-    compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_i32", "v_cmp_lt_i64", "v_cmp_lt_u64",
+    # Each name is counted once as VOPC and once as VOP3; the three sets must not share a name.
+    assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares)), len(compare_forms)
+    compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_i32", "v_cmpx_lt_i64", "v_cmpx_lt_u64",
                           "v_cmp_class_f64", "v_cmp_lt_f64"}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
@@ -395,6 +400,19 @@ def check_shader_records():
         covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": set(pixel.ACCEPTED)})
         without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(rounding)
+    # Truncating float-to-word conversions cover VOP1 e32 and VOP3 e64; FLR/RPI stay excluded.
+    cvt_f32_int = {
+        ("VOP1", "v_cvt_u32_f32"), ("VOP1", "v_cvt_i32_f32"),
+        ("VOP3", "v_cvt_u32_f32_e64"), ("VOP3", "v_cvt_i32_f32_e64"),
+    }
+    cvt_f32_excluded = {"v_cvt_flr_i32_f32", "v_cvt_flr_i32_f32_e64",
+                        "v_cvt_rpi_i32_f32", "v_cvt_rpi_i32_f32_e64"}
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert cvt_f32_int <= reference, name
+        forms = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert cvt_f32_int <= forms, (name, sorted(cvt_f32_int - forms))
+        assert not ({form for _, form in forms} & cvt_f32_excluded), name
 
 
 def check_scalar_brev():
@@ -435,6 +453,35 @@ def check_plain_bitscan_forms():
     pixel.ACCEPTED.clear()
 
 
+
+def check_int16_vop3_forms():
+    """The 12 non-packed 16-bit integer VOP3 forms count as covered once the translator accepts their fixtures.
+    The unsuffixed spellings match the reference; the _e64 control does not count (gfx_forms keeps _e64 names), and
+    the nearby VOP3 forms that stay rejected (v_mad_u16, v_mad_i16, f16 ops) stay uncovered."""
+    import pixel_aot
+    import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for group in range(3):
+            pixel.translate_int(pixel.int16_vop3_ops(group))
+        forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_INT16}
+        assert len(forms) == 12
+        neighbours = {("VOP3", "v_mad_u16"), ("VOP3", "v_mad_i16"), ("VOP3", "v_add_f16_e64"),
+                      ("VOP3", "v_cvt_f16_u16_e64")}
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not neighbours & covered, (name, neighbours & covered)
+        # The suffixed control spelling is a different word, so it adds no reference form.
+        reference = fc.load_reference("gfx1013.tsv")
+        assert fc.gfx_forms({"v_add_nc_u16_e64"}, reference) == set()
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
 def check_sopk_wait_forms():
     """The SOPK wait forms count once a program using them lowers; a refused SGPR operand records nothing."""
     import pixel_aot_check as pixel
@@ -764,6 +811,7 @@ if __name__ == "__main__":
     check_shader_records()
     check_scalar_brev()
     check_plain_bitscan_forms()
+    check_int16_vop3_forms()
     check_swap_coverage()
     check_sopk_wait_forms()
     check_s_version_form()

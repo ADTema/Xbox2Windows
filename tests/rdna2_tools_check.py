@@ -15,7 +15,7 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from disasm_rdna2 import disasm_rdna2, decode_instruction, disassemble_binary
 from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
-from pixel_aot import fma_mix_operand, lower, native_program, parse_fma_mix
+from pixel_aot import VOP3_INT16, fma_mix_operand, lower, native_program, parse_fma_mix
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
     is_instruction_supported,
@@ -2055,6 +2055,18 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertEqual(classify_isa_category(opcode), "VOPC (Vector Compare)", opcode)
         self.assertEqual(classify_isa_category("v_add_f32"), "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)")
 
+    def test_vopc_e32_destination_must_be_vcc(self):
+        """An explicit _e32 compare may only write vcc; suffix-less and _e64 may name an SGPR."""
+        families = [f"v_cmp_{op}_{kind}" for kind in ("f32", "f16", "i32", "u32", "i16", "u16")
+                    for op in ("lt", "eq")] + ["v_cmp_class_f32", "v_cmp_class_f16"]
+        for name in families:
+            for dst in ("s52", "s[52:53]"):
+                self.assertFalse(is_instruction_supported(f"{name}_e32 {dst}, s44, v18"), (name, dst))
+                self.assertTrue(is_instruction_supported(f"{name} {dst}, s44, v18"), (name, dst))
+                self.assertTrue(is_instruction_supported(f"{name}_e64 {dst}, s44, v18"), (name, dst))
+            for dst in ("vcc", "vcc_lo"):
+                self.assertTrue(is_instruction_supported(f"{name}_e32 {dst}, s44, v18"), (name, dst))
+
     def test_vop3p_classification(self):
         """Packed and mixed-precision opcodes must classify as VOP3P."""
         for opcode in (
@@ -2084,13 +2096,42 @@ class TestRdna2Scanner(unittest.TestCase):
                      "v_madak_f32 v5, v1, v2, v3", "v_madmk_f32 v5, v1, v2, v3"):
             self.assertFalse(is_instruction_supported(line), line)
 
-    def test_float_to_word_conversions_are_plain_e32_only(self):
-        """v_cvt_u32_f32 and v_cvt_i32_f32 are supported as e32 with a register or hex literal source."""
-        for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
-                     "v_cvt_u32_f32_e32 v12, 0x40400000"):
+    def test_non_packed_int16_vop3_forms(self):
+        """The 12 non-packed 16-bit integer VOP3 forms take two integer sources; modifiers and wide operands are not supported."""
+        names = ("add_nc_u16", "add_nc_i16", "sub_nc_u16", "sub_nc_i16", "min_u16", "max_u16", "min_i16",
+                 "max_i16", "mul_lo_u16", "lshlrev_b16", "lshrrev_b16", "ashrrev_i16")
+        self.assertEqual(set(names), set(VOP3_INT16))
+        for name in names:
+            line = f"v_{name} v5, v1, v2"
             self.assertTrue(is_instruction_supported(line), line)
-        for line in ("v_cvt_u32_f32_e64 v12, v13", "v_cvt_i32_f32_e32 v12, 1",
-                     "v_cvt_u32_f32_e32 v12, 0.5", "v_cvt_u32_f32_e32  v12, v13"):
+            self.assertTrue(is_opcode_recognized(f"v_{name}"), name)
+        for line in ("v_add_nc_u16_e64 v5, v1, v2", "v_sub_nc_i16 v5, v1, 0x1234",
+                     "v_add_nc_i16 v5, v1, 4", "v_add_nc_u16 v5, v1, -16", "v_add_nc_u16 v5, v1, 64",
+                     "v_add_nc_u16 v5, v1, 0x00001234", "v_add_nc_u16 v255, s105, v2"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_add_nc_u16 v5, v1, v2 op_sel:[0,0,1]", "v_add_nc_u16 v5, v1, v2 clamp",
+                     "v_add_nc_u16 v5, v1, 1.0", "v_add_nc_u16 v5, v1, 0x10000", "v_add_nc_u16 v5, v1, 65",
+                     "v_add_nc_u16 v5, v1, -17", "v_add_nc_u16_dpp v5, v1, v2 quad_perm:[0,1,2,3]",
+                     "v_add_nc_u16_sdwa v5, v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0",
+                     "v_add_nc_u16 v5, -v1, v2", "v_add_nc_u16 v256, v1, v2", "v_add_nc_u16 v5, v256, v2",
+                     "v_add_nc_u16 v5, s106, v2", "v_mad_u16 v5, v1, v2, v3"):
+            self.assertFalse(is_instruction_supported(line), line)
+
+    def test_float_to_word_conversions_e32_and_e64(self):
+        """v_cvt_u32_f32 and v_cvt_i32_f32 accept plain e32 and e64 with optional source abs/neg."""
+        for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
+                     "v_cvt_u32_f32_e32 v12, 0x40400000", "v_cvt_u32_f32_e64 v12, v13",
+                     "v_cvt_i32_f32_e64 v12, s44", "v_cvt_u32_f32_e64 v12, |s44|",
+                     "v_cvt_i32_f32_e64 v12, -s44", "v_cvt_i32_f32_e64 v12, -|v13|",
+                     "v_cvt_u32_f32_e64 v12, abs(v13)", "v_cvt_i32_f32_e64 v12, neg(0x40400000)",
+                     "v_cvt_u32_f32_e64 v12, |0xc0300000|"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_cvt_u32_f32_e64 v12, s44 clamp", "v_cvt_i32_f32_e64 v12, s44 omod:2",
+                     "v_cvt_i32_f32_e32 v12, 1", "v_cvt_u32_f32_e32 v12, 0.5",
+                     "v_cvt_u32_f32_e64 v12, 0.5", "v_cvt_i32_f32_e64 v12, -1",
+                     "v_cvt_i32_f32_e64 v12, -0x40400000", "v_cvt_u32_f32_e64 v12, |-s44|",
+                     "v_cvt_u32_f32_e32  v12, v13", "v_cvt_u32_f32_e64  v12, v13",
+                     "v_cvt_flr_i32_f32_e32 v12, v13", "v_cvt_rpi_i32_f32_e64 v12, -v13"):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_inline_slash_comments_and_blank_lines(self):
@@ -2470,6 +2511,42 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertFalse(is_instruction_supported(line), line)
         for opcode in ("s_bfe_u64", "s_bfe_i64", "s_bfm_b64"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
+        # 64-bit integer comparisons: register pairs or an inline integer; VOPC writes VCC and takes a VGPR pair
+        # as src1. Literals, floats, modifiers, SGPR src1 or an SGPR destination on e32, and exec writers are refused.
+        for op in ("f", "lt", "eq", "le", "gt", "ne", "ge", "t"):
+            for kind in ("i64", "u64"):
+                for line in (f"v_cmp_{op}_{kind}_e32 vcc_lo, v[18:19], v[20:21]",
+                             f"v_cmp_{op}_{kind} vcc_lo, s[44:45], v[20:21]",
+                             f"v_cmp_{op}_{kind}_e32 vcc_lo, -1, v[20:21]",
+                             f"v_cmp_{op}_{kind}_e64 s52, v[18:19], v[19:20]",
+                             f"v_cmp_{op}_{kind}_e64 vcc_lo, s[44:45], s[46:47]",
+                             f"v_cmp_{op}_{kind}_e64 s[52:53], 64, v[20:21]",
+                             # Without a suffix LLVM 15 picks e64 when the operands need it.
+                             f"v_cmp_{op}_{kind} s[52:53], v[18:19], v[20:21]",
+                             f"v_cmp_{op}_{kind} vcc_lo, v[18:19], s[44:45]"):
+                    self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_cmp_lt_i64_e32 vcc_lo, v[18:19], s[44:45]",
+            "v_cmp_lt_i64_e32 vcc_lo, v[18:19], 64",
+            "v_cmp_lt_i64_e32 s52, v[18:19], v[20:21]",
+            "v_cmp_lt_u64_e64 s52, 0x12345678, v[20:21]",
+            "v_cmp_lt_u64_e64 s52, 1.0, v[20:21]",
+            "v_cmp_lt_u64_e64 s52, v[18:19], v[20:21] clamp",
+            "v_cmp_lt_u64_e64 s52, -v[18:19], v[20:21]",
+            "v_cmp_lt_u64_e64 s52, v18, v[20:21]",
+            "v_cmp_lt_u64_e64 exec, v[18:19], v[20:21]",
+            "v_cmpx_lt_i64_e32 v[18:19], v[20:21]",
+            "v_cmpx_lt_u64_e64 v[18:19], v[20:21]",
+            "v_cmp_lt_f64_e64 s52, v[18:19], v[20:21]",
+            "v_cmp_ngt_u64_e64 s52, v[18:19], v[20:21]",
+            "v_cmp_lt_u64_e64 s52, 65, v[20:21]",
+            "v_cmp_lt_u64_e64 s52, v[18:19], -17",
+            "v_cmp_lt_u64_e64 s52, v[255:256], v[20:21]",
+            "v_cmp_lt_u64_e64 s52, s[45:46], v[20:21]",
+            "v_cmp_lt_i64_e32 vcc_lo, s[45:46], v[20:21]",
+            "v_cmp_lt_u64_e64 s52, v[18:20], v[20:21]",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
         for line in (
             "v_alignbit_b32 v1, v2, v3, v4",
             "v_alignbit_b32_e64 v1, v2, v3, 4",

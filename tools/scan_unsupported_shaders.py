@@ -53,13 +53,28 @@ PIXEL_COMPARE = tuple(pixel_aot.COMPARE) if pixel_aot is not None else ()
 PIXEL_INT_COMPARE = tuple(pixel_aot.INT_COMPARE) if pixel_aot is not None else ()
 PIXEL_VOP3P_F16 = pixel_aot.VOP3P_F16 if pixel_aot is not None else {}
 PIXEL_VOP3P_INT16 = pixel_aot.VOP3P_INT16 if pixel_aot is not None else {}
+PIXEL_VOP3_INT16 = pixel_aot.VOP3_INT16 if pixel_aot is not None else {}
+PIXEL_VCC = r"(?:vcc(?:_lo)?)"
 PIXEL_LANE_MASK = pixel_aot.LANE_MASK if pixel_aot is not None else r"(?:vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
+# Explicit _e32 VOPC writes VCC only; suffix-less and _e64 may name an SGPR destination.
+PIXEL_VOPC_DST = rf"(?:_e32\s+{PIXEL_VCC}|(?:_e64)?\s+{PIXEL_LANE_MASK})"
+PIXEL_VOPC_E32_DST = rf"(?:_e32\s+{PIXEL_VCC}|\s+{PIXEL_LANE_MASK})"
 INTEGER_SOURCE = r"(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
+# 16-bit integer operand as pixel_aot.int16_operand accepts it: VGPR 0-255, SGPR 0-105, inline -16..64 or a
+# hex literal up to 0xffff (leading zeros allowed, up to 8 digits).
+INT16_VGPR = r"v(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])"
+INT16_SOURCE = (
+    rf"(?:{INT16_VGPR}|s(?:[0-9]|[1-9][0-9]|10[0-5])|0x0{{0,4}}[0-9a-f]{{1,4}}"
+    r"|-?(?:[0-9]|1[0-6])|(?:1[7-9]|[2-5][0-9]|6[0-4]))"
+)
 SCALAR32_SOURCE = r"(?:s\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
 SCALAR64_SOURCE = r"(?:s\[\d+:\d+\]|0x[0-9a-f]{1,8}|-?\d+)"
 F16_PLAIN = r"(?:-?(?:\d+\.\d+|\d+)|0x[0-9a-f]{1,4}|[vs]\d+)"
 F16_MOD = rf"-?(?:\|{F16_PLAIN}\||abs\({F16_PLAIN}\)|{F16_PLAIN})"
 SDWA_SEL_PATTERN = r"(?:BYTE_[0-3]|WORD_[01]|DWORD)"
+CVT_F32_E64_BASE = r"(?:[vs]\d+|0x[0-9a-f]{1,8})"
+CVT_F32_E64_ABS = rf"(?:\|{CVT_F32_E64_BASE}\||abs\({CVT_F32_E64_BASE}\))"
+CVT_F32_E64_SOURCE = rf"(?:neg\((?:{CVT_F32_E64_ABS}|{CVT_F32_E64_BASE})\)|-(?:{CVT_F32_E64_ABS}|[vs]\d+)|{CVT_F32_E64_ABS}|{CVT_F32_E64_BASE})"
 
 WAIT_COUNTER = r"(?:vmcnt\((?:[0-9]|[1-5][0-9]|6[0-3])\)|lgkmcnt\((?:[0-9]|[1-5][0-9]|6[0-3])\)|expcnt\([0-7]\))"
 
@@ -112,6 +127,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_cvt_f32_f16_sdwa\s+v\d+,\s+-?(?:\|[vs]\d+\||[vs]\d+)(?:\s+clamp)?\s+dst_sel:DWORD\s+dst_unused:UNUSED_(?:PAD|PRESERVE)\s+src0_sel:WORD_[01]",
     r"v_cvt_f16_f32(?:_e32|_e64)?\s+v\d+,\s+[^,\s]+",
     r"v_cvt_i32_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",
+    rf"v_cvt_(?:i32|u32)_f32_e64 v\d+, {CVT_F32_E64_SOURCE}",
     r"v_cvt_f32_ubyte[0-3](?:_e32|_e64)?\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_off_f32_i4(?:_e32|_e64)?\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_f32_(?:u32|i32)_e32\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+)",
@@ -121,8 +137,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     rf"v_(?:add|sub|subrev)_co_u32\s+v\d+,\s+{PIXEL_LANE_MASK},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:min|max)_(?:i32|u32)(?:_e32|_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:min3|max3|med3)_(?:i32|u32)(?:_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
-    rf"v_cmp_class_f32(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+[^,]+,\s+[^,]+",
-    rf"v_cmp_class_f16(?:_e32)?\s+{PIXEL_LANE_MASK},\s+{F16_PLAIN},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
+    rf"v_cmp_class_f32{PIXEL_VOPC_DST},\s+[^,]+,\s+[^,]+",
+    rf"v_cmp_class_f16{PIXEL_VOPC_E32_DST},\s+{F16_PLAIN},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
     rf"v_cmp_class_f16_e64\s+{PIXEL_LANE_MASK},\s+{F16_MOD},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
     rf"v_cndmask_b32(?:_e32|_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+,\s+{PIXEL_LANE_MASK}",
     r"v_fma_mix(?:_f32|lo_f16|hi_f16)\s+v\d+,\s+.+",
@@ -151,13 +167,13 @@ if PIXEL_SALU_BIT64:
 if PIXEL_COMPARE:
     cmp_ops = "|".join(map(re.escape, PIXEL_COMPARE))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_cmp_(?:{cmp_ops})_f32(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+[^,]+,\s+[^,]+"
+        rf"v_cmp_(?:{cmp_ops})_f32{PIXEL_VOPC_DST},\s+[^,]+,\s+[^,]+"
     )
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{cmp_ops})_f32_sdwa\s+{PIXEL_LANE_MASK},\s+[^,]+,\s+[^,]+\s+src0_sel:DWORD\s+src1_sel:DWORD"
     )
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_cmp_(?:{cmp_ops})_f16(?:_e32)?\s+{PIXEL_LANE_MASK},\s+{F16_PLAIN},\s+{F16_PLAIN}"
+        rf"v_cmp_(?:{cmp_ops})_f16{PIXEL_VOPC_E32_DST},\s+{F16_PLAIN},\s+{F16_PLAIN}"
     )
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{cmp_ops})_f16_e64\s+{PIXEL_LANE_MASK},\s+{F16_MOD},\s+{F16_MOD}"
@@ -165,8 +181,14 @@ if PIXEL_COMPARE:
 if PIXEL_INT_COMPARE:
     icmp_ops = "|".join(map(re.escape, PIXEL_INT_COMPARE))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_cmp_(?:{icmp_ops})_(?:i32|u32|i16|u16)(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
+        rf"v_cmp_(?:{icmp_ops})_(?:i32|u32|i16|u16){PIXEL_VOPC_DST},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
     )
+    # 64-bit comparisons are checked by supports_int64_compare() below: the pair and inline ranges are numeric.
+    INT64_COMPARE_PATTERN = re.compile(
+        rf"v_cmp_(?:{icmp_ops})_(?:i64|u64)(_e32|_e64)?\s+(vcc(?:_lo)?|s\d+|s\[\d+:\d+\]),\s+(\S+),\s+(\S+)"
+    )
+else:
+    INT64_COMPARE_PATTERN = None
 if PIXEL_VOP3P_F16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_pk_(?:{'|'.join(map(re.escape, PIXEL_VOP3P_F16))})_f16\s+v\d+,\s+.+"
@@ -174,6 +196,10 @@ if PIXEL_VOP3P_F16:
 if PIXEL_VOP3P_INT16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_pk_(?:{'|'.join(map(re.escape, PIXEL_VOP3P_INT16))})\s+v\d+,\s+.+"
+    )
+if PIXEL_VOP3_INT16:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP3_INT16))})(?:_e64)?\s+{INT16_VGPR},\s+{INT16_SOURCE},\s+{INT16_SOURCE}"
     )
 
 for name, (arity, _) in PIXEL_INTEGER.items():
@@ -263,6 +289,7 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"s_{name}_b64" for name in PIXEL_SALU_BIT64}
     | {f"v_pk_{name}_f16" for name in PIXEL_VOP3P_F16}
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
+    | {f"v_{name}" for name in PIXEL_VOP3_INT16}
     | {name for name, _, _ in MUBUF_OPS.values()}
     | {name for name, _, _ in MTBUF_OPS.values()}
     | {entry[0] for entry in FLAT_OPS.values()}
@@ -407,12 +434,46 @@ def extract_opcode(instruction_line: str) -> str:
     return tokens[0] if tokens else ""
 
 
+def supports_int64_compare(clean: str) -> bool:
+    """Mirror pixel_aot.int64_operand and the 64-bit comparison destination rules."""
+    if INT64_COMPARE_PATTERN is None or not (m := INT64_COMPARE_PATTERN.fullmatch(clean)):
+        return False
+    enc, dst, *sources = m.groups()
+    if enc is None:  # LLVM 15 picks e32 only when the operands fit it
+        enc = "_e32" if dst in ("vcc", "vcc_lo") and re.fullmatch(r"v\[\d+:\d+\]", sources[1].strip()) else "_e64"
+    if enc == "_e32" and dst not in ("vcc", "vcc_lo"):
+        return False
+    if (p := re.fullmatch(r"s\[(\d+):(\d+)\]", dst)) and not _sgpr_pair_ok(p):
+        return False
+    if re.fullmatch(r"s\d+", dst) and int(dst[1:]) > 105:
+        return False
+    for position, token in enumerate(sources):
+        if (p := re.fullmatch(r"v\[(0|[1-9]\d*):(0|[1-9]\d*)\]", token)):
+            if int(p[2]) != int(p[1]) + 1 or int(p[1]) > 254:
+                return False
+        elif enc == "_e32" and position == 1:
+            return False
+        elif p := re.fullmatch(r"s\[(\d+):(\d+)\]", token):
+            if not _sgpr_pair_ok(p):
+                return False
+        elif not (re.fullmatch(r"0|-?[1-9]\d*", token) and -16 <= int(token) <= 64):
+            return False
+    return True
+
+
+def _sgpr_pair_ok(pair: "re.Match") -> bool:
+    first, last = int(pair[1]), int(pair[2])
+    return last == first + 1 and first % 2 == 0 and last <= 105
+
+
 def is_instruction_supported(instruction_line: str) -> bool:
     """Check if instruction is supported by pixel_aot regex patterns."""
     clean = instruction_line.strip()
     clean = re.split(r"//|[;#]", clean)[0].strip()
     if not clean:
         return True
+    if clean.startswith("v_cmp_") and re.search(r"_[iu]64(?:_e32|_e64)?\s", clean):
+        return supports_int64_compare(clean)
     if not any(pattern.match(clean) for pattern in COMPILED_SUPPORTED_PATTERNS):
         return False
     if wait := re.fullmatch(r"s_waitcnt\s+(.*)", clean):
