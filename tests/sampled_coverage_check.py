@@ -101,6 +101,42 @@ def controls():
     must_reject(lower, program, bindings(2))
     must_reject(lower, program, bindings(0) | {"selector_byte": 12})
 
+    source = "\n".join(PROGRAM)
+    selector_load = "s_buffer_load_dword s6, s[72:75], s7"
+    zero_offset = source.replace(selector_load, selector_load.replace(", s7", ", null"))
+    must_reject(lower, decoded(zero_offset.splitlines()), bindings(0) | {"selector_byte": False})
+
+    overlap = bindings(0)
+    overlap["descriptors"].append([20, 64, "cb", 0])
+    must_reject(lower, program, overlap)
+
+    wide_sampler = source.replace(
+        "s_load_dwordx4 s[60:63], s[30:31], 0x10",
+        "s_load_dwordx8 s[56:63], s[30:31], 0x10",
+    ).replace("s[60:63] dmask", "s[56:59] dmask")
+    must_reject(lower, decoded(wide_sampler.splitlines()), bindings(0))
+
+    scalar_wait = "s_waitcnt lgkmcnt(0)"
+    early_selector = source.replace(
+        f"{scalar_wait}\n{selector_load}", f"{selector_load}\n{scalar_wait}"
+    )
+    must_reject(lower, decoded(early_selector.splitlines()), bindings(0))
+
+    swapped_coords = source.replace("attr0.x", "attr0.y").replace(
+        "v9, v0, attr0.y", "v9, v0, attr0.x"
+    ).replace("v9, v1, attr0.y", "v9, v1, attr0.x")
+    must_reject(lower, decoded(swapped_coords.splitlines()), bindings(0))
+
+    sample_wait = "s_waitcnt vmcnt(0)"
+    product = "v_mul_legacy_f32_e32 v11, s3, v10"
+    early_product = source.replace(f"{sample_wait}\n{product}", f"{product}\n{sample_wait}")
+    must_reject(lower, decoded(early_product.splitlines()), bindings(0))
+
+    wrong_quad_source = source.replace(
+        "s_wqm_b64 s[54:55], s[48:49]", "s_wqm_b64 s[54:55], s[52:53]"
+    )
+    must_reject(lower, decoded(wrong_quad_source.splitlines()), bindings(0))
+
 
 def binary(tmp, assembler, objcopy, library):
     src, obj, raw = (tmp / n for n in ("synthetic.s", "synthetic.o", "synthetic.bin"))

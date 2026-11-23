@@ -364,9 +364,13 @@ def check_pure_python_controls() -> None:
         mock_run.return_value = subprocess.CompletedProcess(
             ["dev", "--compute-pso", "--warp-only"], 0, b'{"warp_pso":"0x00000000"}\n', b""
         )
-        assert rt.check_compute_pso(Path("dev"), signed_synth, warp_only=True) == {"warp_pso": "0x00000000"}
+        cleared_inventory = dict(calls={}, declarations=[], metadata_only=[])
+        warp_pso = rt.check_compute_pso(Path("dev"), signed_synth, warp_only=True,
+                                        intrinsics=cleared_inventory)
+        assert warp_pso["warp_pso"] == "0x00000000", warp_pso
+        assert warp_pso["gate"]["verdict"] == "ALLOW", warp_pso
         assert mock_run.call_args[0][0] == ["dev", "--compute-pso", "--warp-only"]
-        rt.check_compute_pso(Path("dev"), signed_synth, warp_only=False)
+        rt.check_compute_pso(Path("dev"), signed_synth, warp_only=False, intrinsics=cleared_inventory)
         assert mock_run.call_args[0][0] == ["dev", "--compute-pso"]
 
         # Hardware backend probe helper: exit 5 ("no hardware adapter") maps to None (skip 77),
@@ -374,20 +378,26 @@ def check_pure_python_controls() -> None:
         mock_run.return_value = subprocess.CompletedProcess(
             ["dev", "--compute-pso"], 0, b'{"hardware_pso":"0x00000000"}\n', b""
         )
-        assert _probe_compute_pso(Path("dev"), signed_synth, backend="hardware") == {"hardware_pso": "0x00000000"}
+        cleared = dict(calls={}, declarations=[], metadata_only=[])
+        hardware_result = _probe_compute_pso(Path("dev"), signed_synth, backend="hardware",
+                                             intrinsics=cleared)
+        assert hardware_result["hardware_pso"] == "0x00000000", hardware_result
+        assert hardware_result["gate"]["verdict"] == "ALLOW", hardware_result
+        assert hardware_result["gate"]["submitted"] is True, hardware_result
         assert mock_run.call_args[0][0] == ["dev", "--compute-pso"]
 
         mock_run.side_effect = subprocess.CalledProcessError(5, ["dev", "--compute-pso"])
-        assert _probe_compute_pso(Path("dev"), signed_synth, backend="hardware") is None
+        assert _probe_compute_pso(Path("dev"), signed_synth, backend="hardware",
+                                  intrinsics=cleared) is None
         try:
-            _probe_compute_pso(Path("dev"), signed_synth, backend="warp")
+            _probe_compute_pso(Path("dev"), signed_synth, backend="warp", intrinsics=cleared)
         except subprocess.CalledProcessError:
             pass
         else:
             raise AssertionError("_probe_compute_pso swallowed exit 5 on warp backend")
         mock_run.side_effect = subprocess.CalledProcessError(6, ["dev", "--compute-pso"])
         try:
-            _probe_compute_pso(Path("dev"), signed_synth, backend="hardware")
+            _probe_compute_pso(Path("dev"), signed_synth, backend="hardware", intrinsics=cleared)
         except subprocess.CalledProcessError:
             pass
         else:
@@ -444,7 +454,8 @@ define void @main() {
 
     # A metadata description that looks like a call still contains no instruction.
     inventory = xbox_intrinsic_inventory('!0 = !{!"call void @xbox.inventory_example("}')
-    assert inventory == dict(calls={}, declarations=[], metadata_only=["xbox.inventory_example"]), inventory
+    assert inventory == dict(calls={}, declarations=[], metadata_only=["xbox.inventory_example"],
+                            references={}), inventory
     inventory = xbox_intrinsic_inventory('  %"call result" = tail call i32 @"xbox.inventory_example"()')
     assert inventory["calls"] == {"xbox.inventory_example": 1}, inventory
 
@@ -458,7 +469,7 @@ define void @main() {
 !1 = !{!"__XBOX_ENABLE_WAVE32=1"}
 """
     inventory = xbox_intrinsic_inventory(named_metadata)
-    assert inventory == dict(calls={}, declarations=[], metadata_only=[]), inventory
+    assert inventory == dict(calls={}, declarations=[], metadata_only=[], references={}), inventory
 
     # (d) Ordinary module: dx.op calls and unrelated metadata report three empty groups.
     ordinary = """
@@ -474,15 +485,272 @@ define void @main() {
 !0 = !{i32 2, !"DXC version", !"1.8.2407"}
 """
     inventory = xbox_intrinsic_inventory(ordinary)
-    assert inventory == dict(calls={}, declarations=[], metadata_only=[]), inventory
+    assert inventory == dict(calls={}, declarations=[], metadata_only=[], references={}), inventory
 
+    # 7. Submission gate: the final module is checked and a refused module is never submitted.
+    import xbox_intrinsic_gate as gate
+
+    class RecordingSubmit:
+        """Submission stub: a refused module must reach it zero times."""
+
+        def __init__(self):
+            self.batches = []
+
+        def __call__(self, module_text):
+            self.batches.append(module_text)
+
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(called), called, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert decision["submitted"] is False, decision
+    assert stub.batches == [], "a refused module reached the submission callable"
+    assert decision["reported_names"] == ["xbox.V_ALIGNBYTE_B32"], decision
+
+    for label, module_text in (("declared only", declared), ("metadata only", metadata),
+                               ("ordinary module", ordinary)):
+        stub = RecordingSubmit()
+        decision = gate.gate_submission(gate.check_text(module_text), module_text, stub)
+        assert decision["verdict"] == gate.ALLOW, (label, decision)
+        assert len(stub.batches) == 1, (label, stub.batches)
+
+    # An adapter status is advisory: a call the module still executes blocks whatever it claims.
+    stub = RecordingSubmit()
+    claims_lowered = gate.status_table(["V_ALIGNBYTE_B32"])
+    decision = gate.gate_submission(gate.check_text(called, claims_lowered), called, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert decision["reported_names"] == ["xbox.V_ALIGNBYTE_B32"], decision
+    assert decision["blocking"][0]["advisory"] == gate.LOWERED, decision["blocking"][0]
+    assert "advisory reports LOWERED" in decision["message"], decision["message"]
+    assert stub.batches == [], "an advisory status cleared a call the module still executes"
+    # The same module clears once the call is gone from the instructions.
+    stub = RecordingSubmit()
+    removed = gate.gate_submission(gate.check_text(declared), declared, stub)
+    assert removed["verdict"] == gate.ALLOW and len(stub.batches) == 1, removed
+
+    # Every form that keeps an xbox.* symbol reachable blocks, and the refusal names the form.
+    alias_module = "@alias_bfi = alias i32 (i32), ptr @xbox.BFI\n"
+    store_module = ("define void @main() {\n"
+                    "  store ptr @xbox.global_store_dword_with_cache, ptr %slot\n"
+                    "  ret void\n}\n")
+    indirect_module = ("define void @main() {\n"
+                       "  %fp = bitcast ptr @xbox.foo to ptr\n"
+                       "  call void %fp(i32 1)\n"
+                       "  ret void\n}\n")
+    bitcast_call_module = ("define void @main() {\n"
+                           "  call void bitcast (void (i32)* @xbox.foo to void (i64)*)(i64 5)\n"
+                           "  ret void\n}\n")
+    global_initializer_module = "@table = global ptr @xbox.Med3_F32\n"
+    # A function pointer: the symbol goes into a global, the call goes through the loaded pointer.
+    function_pointer_module = ("@slot = global ptr null\n"
+                               "define void @main() {\n"
+                               "  store ptr @xbox.foo, ptr @slot\n"
+                               "  %fp = load ptr, ptr @slot\n"
+                               "  call void %fp(i32 1)\n"
+                               "  ret void\n}\n")
+    # An ordinary callee that receives the symbol as an argument — not a debug intrinsic.
+    call_operand_module = ("declare void @consume(ptr)\n"
+                           "define void @main() {\n"
+                           "  call void @consume(ptr @xbox.foo)\n"
+                           "  ret void\n}\n")
+    for label, module_text, form in (
+        ("alias", alias_module, "alias"),
+        ("store", store_module, "store"),
+        ("indirect call through a bitcast", indirect_module, "bitcast"),
+        ("function pointer in a global initializer", global_initializer_module, "global-initializer"),
+        ("function pointer in a slot", function_pointer_module, "store"),
+        ("call operand of an ordinary callee", call_operand_module, "call-operand"),
+        ("bitcast-spelled direct call", bitcast_call_module, "call"),
+    ):
+        stub = RecordingSubmit()
+        decision = gate.gate_submission(gate.check_text(module_text), module_text, stub)
+        assert decision["verdict"] == gate.REJECT, (label, decision)
+        assert stub.batches == [], (label, "a reachable symbol was submitted")
+        assert decision["blocking"][0]["form"] == form, (label, decision["blocking"])
+        assert form in decision["message"], (label, decision["message"])
+    # The bitcast-spelled call is a call site, not merely a reference.
+    assert gate.check_text(bitcast_call_module)["calls"] == {"xbox.foo": 1}, gate.check_text(bitcast_call_module)
+    # A referenced name is not metadata-only.
+    assert gate.check_text(alias_module)["metadata_only"] == [], gate.check_text(alias_module)
+
+    # A debug intrinsic carries the symbol only as metadata the runtime never reads: allowed.
+    debug_only_module = ("declare void @llvm.dbg.value(metadata, i64, metadata, metadata)\n"
+                         "define void @main() {\n"
+                         "  call void @llvm.dbg.value(metadata ptr @xbox.foo, i64 0,"
+                         " metadata !0, metadata !1)\n"
+                         "  ret void\n}\n"
+                         "!0 = !{}\n"
+                         "!1 = !{}\n")
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(debug_only_module), debug_only_module, stub)
+    assert decision["verdict"] == gate.ALLOW, decision
+    assert decision["calls"] == {} and decision["blocking"] == [], decision
+    assert decision["debug_only"] == ["xbox.foo"], decision
+    assert "debug-only" in decision["message"], decision["message"]
+    assert len(stub.batches) == 1, decision
+    # The same symbol stops being debug-only once an ordinary callee receives it.
+    assert gate.check_text(call_operand_module)["verdict"] == gate.REJECT
+
+    # Only the callee decides: an ordinary callee whose argument happens to mention a debug
+    # intrinsic is still an executable call, so the symbol must block.
+    trap_module = ("declare void @consume(ptr, ptr)\n"
+                   "define void @main() {\n"
+                   "  call void @consume(ptr @xbox.foo, ptr bitcast (void()* @llvm.dbg.value to i8*))\n"
+                   "  ret void\n}\n")
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(trap_module), trap_module, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert stub.batches == [], "a call mentioning a debug intrinsic was submitted"
+    assert decision["blocking_references"][0]["form"] == "call-operand", decision
+    assert decision["debug_only"] == [], decision
+
+    # The other debug intrinsics are debug-only uses as well.
+    for intrinsic, signature in (("llvm.dbg.declare", "metadata, metadata, metadata"),
+                                 ("llvm.dbg.assign", "metadata, metadata, metadata, metadata, metadata, metadata")):
+        module_text = (f"declare void @{intrinsic}({signature})\n"
+                       "define void @main() {\n"
+                       f"  call void @{intrinsic}(metadata ptr @xbox.foo, metadata !0, metadata !1"
+                       f"{', metadata !0, metadata !1, metadata !0' if 'assign' in intrinsic else ''})\n"
+                       "  ret void\n}\n"
+                       "!0 = !{}\n"
+                       "!1 = !{}\n")
+        stub = RecordingSubmit()
+        decision = gate.gate_submission(gate.check_text(module_text), module_text, stub)
+        assert decision["verdict"] == gate.ALLOW, (intrinsic, decision)
+        assert decision["debug_only"] == ["xbox.foo"], (intrinsic, decision)
+        assert len(stub.batches) == 1, (intrinsic, decision)
+
+    # sites counts executable uses only; a debug-only use is counted apart.
+    debug_inventory = xbox_intrinsic_inventory(debug_only_module)
+    assert debug_inventory["references"]["xbox.foo"]["sites"] == 0, debug_inventory
+    assert debug_inventory["references"]["xbox.foo"]["debug_sites"] == 1, debug_inventory
+    # The archive filter counts anything reachable, debug-only included: skipping is conservative.
+    assert gate.reaches_xbox(debug_inventory) is True, debug_inventory
+
+    # An advisory status cannot clear a reference the module still holds.
+    stub = RecordingSubmit()
+    claims = gate.status_table(["BFI"])
+    decision = gate.gate_submission(gate.check_text(alias_module, claims), alias_module, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert decision["blocking_references"][0]["advisory"] == gate.LOWERED, decision
+    assert stub.batches == [], "an advisory status cleared a reference"
+
+    # The same rule at the backend boundary: a reference-only inventory starts no probe process.
+    with patch.object(rt.subprocess, "run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["dev", "--compute-pso"], 0, b'{"warp_pso":"0x00000000"}\n', b"")
+        reference_only = rt.check_compute_pso(
+            Path("dev"), synth_dxbc,
+            intrinsics=dict(calls={}, declarations=[], metadata_only=[],
+                            references={"xbox.BFI": {"sites": 1, "kinds": ["alias"]}}))
+        assert mock_run.call_count == 0, "a reference-only module started a submission"
+        assert reference_only["gate"]["verdict"] == gate.REJECT, reference_only
+        assert reference_only["gate"]["blocking_references"][0]["form"] == "alias", reference_only
+
+    # --only-without-xbox-calls keeps one meaning: no form reaches an xbox.* symbol.
+    reached = xbox_intrinsic_inventory(alias_module)
+    assert gate.reaches_xbox(reached) is True, reached
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(called)) is True
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(declared)) is False
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(metadata)) is False
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(ordinary)) is False
+
+    # A metadata string that spells a call is not an instruction: it must not refuse the module.
+    spelled_call = '!0 = !{!"call void @xbox.text()"}'
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(spelled_call), spelled_call, stub)
+    assert decision["verdict"] == gate.ALLOW, decision
+    assert decision["metadata_only"] == ["xbox.text"], decision
+    assert len(stub.batches) == 1, decision
+
+    # A ';' inside a metadata string does not start a comment.
+    decision = gate.check_text('!0 = !{!"xbox.a;xbox.b"}')
+    assert decision["metadata_only"] == ["xbox.a", "xbox.b"], decision
+    assert decision["verdict"] == gate.ALLOW, decision
+
+    # The submission boundary: a refused module never starts the probe process.
+    with patch.object(rt.subprocess, "run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["dev", "--compute-pso", "--warp-only"], 0, b'{"warp_pso":"0x00000000"}\n', b"")
+        refused = rt.check_compute_pso(
+            Path("dev"), synth_dxbc, warp_only=True,
+            intrinsics=dict(calls={"xbox.BFI": 1}, declarations=[], metadata_only=[]))
+        assert mock_run.call_count == 0, "a refused module started a submission"
+        assert refused["gate"]["verdict"] == gate.REJECT, refused
+        assert refused["gate"]["submitted"] is False, refused
+        assert refused["gate"]["reported_names"] == ["xbox.BFI"], refused
+        allowed = rt.check_compute_pso(
+            Path("dev"), synth_dxbc, warp_only=True,
+            intrinsics=dict(calls={}, declarations=[], metadata_only=[]))
+        assert mock_run.call_count == 1, "an allowed module did not submit exactly once"
+        assert allowed["warp_pso"] == "0x00000000", allowed
+        assert allowed["gate"]["submitted"] is True, allowed
+
+    # The helper itself is fail closed: no inventory means no probe process at all.
+    with patch.object(rt.subprocess, "run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["dev", "--compute-pso"], 0, b'{"warp_pso":"0x00000000"}\n', b"")
+        no_inventory = rt.check_compute_pso(Path("dev"), synth_dxbc)
+        assert mock_run.call_count == 0, "a module with no inventory started a submission"
+        assert no_inventory["gate"]["verdict"] == gate.NOT_CHECKED, no_inventory
+        assert no_inventory["gate"]["reason"] == "module-not-disassembled", no_inventory
+        assert no_inventory["gate"]["submitted"] is False, no_inventory
+        advisory_only = rt.check_compute_pso(
+            Path("dev"), synth_dxbc,
+            intrinsics=dict(calls={"xbox.BFI": 1}, declarations=[], metadata_only=[]),
+            status_of=gate.status_table(["BFI"]))
+        assert mock_run.call_count == 0, "an advisory status started a submission"
+        assert advisory_only["gate"]["verdict"] == gate.REJECT, advisory_only
+        assert advisory_only["gate"]["blocking"][0]["advisory"] == gate.LOWERED, advisory_only
+
+    # A module nobody disassembled must not be submitted, and the decision has to stay visible.
+    unchecked = gate.not_checked("module-not-disassembled")
+    assert unchecked["verdict"] == gate.NOT_CHECKED, unchecked
+    assert unchecked["verdict"] != gate.ALLOW and unchecked["checked"] is False, unchecked
+    assert unchecked["reported_names"] == [] and unchecked["calls"] == {}, unchecked
+    stub = RecordingSubmit()
+    gate.gate_submission(unchecked, called, stub)
+    assert stub.batches == [], "an unexamined module reached the submission callable"
+
+    # --pso-probe without --probe: no disassembly, so the CLI records NOT_CHECKED and submits nothing.
+    tool = Path(__file__).resolve().parents[1] / "tools" / "dxil_retarget.py"
+    with TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        in_file = tmp_dir / "in.dxbc"
+        out_file = tmp_dir / "out.dxbc"
+        absent_probe = tmp_dir / "absent_probe.exe"
+        in_file.write_bytes(synth_dxbc)
+        ungated = subprocess.run(
+            [sys.executable, "-B", str(tool), str(in_file), str(out_file), "--pso-probe", str(absent_probe)],
+            capture_output=True, text=True)
+        assert ungated.returncode == 0, ungated.stderr
+        pso = json.loads(ungated.stdout)["pso"]
+        assert pso["gate"]["verdict"] == gate.NOT_CHECKED, pso
+        assert pso["gate"]["reason"] == "module-not-disassembled", pso
+        assert "warp_pso" not in pso and "hardware_pso" not in pso, pso
+        assert "--probe" in ungated.stderr, ungated.stderr
+
+    print("submission gate controls: executable call refused with 0 submissions; declared only, "
+          "metadata only and ordinary modules submit once; an advisory LOWERED status still refuses "
+          "while the call remains and clears once the call is gone; missing inventory starts 0 probe "
+          "processes; an alias, a store, an indirect call through a bitcast, a function pointer in a "
+          "global initializer, a function pointer in a slot, a call operand of an ordinary callee and a "
+          "bitcast-spelled direct call each refused with their form named in 0 submissions, with calls "
+          "and references listed apart; a debug intrinsic that only carries the symbol as metadata is "
+          "allowed and reported as debug-only, and so are llvm.dbg.declare and llvm.dbg.assign; an "
+          "ordinary call that merely mentions a debug intrinsic in an argument still blocks as "
+          "call-operand; an advisory LOWERED status clears neither a call nor a reference; sites counts "
+          "executable uses only while the archive filter treats every reachable form as reaching an "
+          "intrinsic; a metadata string that spells a call and a ';' inside a metadata string still "
+          "pass; without --probe the CLI records NOT_CHECKED and submits nothing")
     print("pure-python dxil_retarget controls: ok")
 
 
-def _probe_compute_pso(device_probe: Path, blob: bytes, *, backend: str) -> dict | None:
+def _probe_compute_pso(device_probe: Path, blob: bytes, *, backend: str,
+                       intrinsics: dict | None = None) -> dict | None:
     """Run root_device_probe --compute-pso; return None on hardware backend exit 5 (no GPU)."""
     try:
-        return rt.check_compute_pso(device_probe, blob, warp_only=(backend == "warp"))
+        return rt.check_compute_pso(device_probe, blob, warp_only=(backend == "warp"),
+                                    intrinsics=intrinsics)
     except subprocess.CalledProcessError as exc:
         if backend == "hardware" and exc.returncode == 5:
             return None
@@ -583,7 +851,8 @@ def check_validator_fixtures(
             unsigned_pso = None
             if device_probe is not None:
                 # Negative control 4: unsigned (zero-digest) retargeted DXBC must fail CreateComputePipelineState.
-                unsigned_pso = _probe_compute_pso(device_probe, retargeted_blob, backend=backend)
+                unsigned_pso = _probe_compute_pso(device_probe, retargeted_blob, backend=backend,
+                                                  intrinsics=after["ir"]["xbox_intrinsics"])
                 if unsigned_pso is None:
                     print("No compatible D3D12 hardware adapter visible; skipping hardware DXIL retarget check.")
                     return SKIP
@@ -611,7 +880,8 @@ def check_validator_fixtures(
 
                     # Negative control 5: flipping one bit in the digest must fail CreateComputePipelineState.
                     tampered_blob = signed_blob[:4] + bytes([signed_blob[4] ^ 1]) + signed_blob[5:]
-                    tampered_pso = _probe_compute_pso(device_probe, tampered_blob, backend=backend)
+                    tampered_pso = _probe_compute_pso(device_probe, tampered_blob, backend=backend,
+                                                      intrinsics=after["ir"]["xbox_intrinsics"])
                     assert tampered_pso is not None and tampered_pso[pso_key] != "0x00000000", tampered_pso
                     pso_summary = (
                         f"{backend}:unsigned={unsigned_pso[pso_key]} "

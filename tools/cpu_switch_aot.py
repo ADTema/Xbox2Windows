@@ -59,9 +59,10 @@ a guest address, which the switch replaces, and never needs the mapping. The
 generated source states the binding contract.
 A function may use its stack. A forward pass gives RSP at
 every instruction as entry RSP plus a constant that must agree at joins and be
-0 at every RET. PUSH and POP of a nonvolatile register and SUB or ADD RSP by a
-multiple of 8 are the only changes of RSP accepted; any other write of RSP is a
-dynamic frame, and any use of RSP as a value (MOV RAX, RSP or LEA RAX, [RSP+8])
+0 at every RET. PUSH and POP of a nonvolatile register, SUB or ADD RSP by a
+multiple of 8, and LEAVE where the RBP anchor is proven are the only changes of
+RSP accepted. LEAVE sets RSP to the anchor and pops RBP from it. ENTER, MOV RSP,
+RBP and any other write of RSP is a dynamic frame, and any use of RSP as a value (MOV RAX, RSP or LEA RAX, [RSP+8])
 would let the frame's address escape. Both are rejected. The frame becomes one
 byte array per call, from the lowest RSP up to the end of the caller's 32-byte
 home space at entry RSP + 40, at most MAX_FRAME bytes, and each RSP-based
@@ -92,8 +93,8 @@ other volatile registers, the flags and the callee's 32-byte home space at RSP
 are undefined, and the nonvolatile registers and the rest of the frame,
 including the caller's own home space above entry RSP, are kept. The return
 address and the callee's frame lie below RSP, where every byte is already
-undefined because the frame proof forgets the bytes that ADD RSP and POP leave
-below RSP. RSP must be 8
+undefined because the frame proof forgets the bytes that ADD RSP, POP and LEAVE
+leave below RSP. RSP must be 8
 mod 16 from entry at a call, with the callee's home space below the return
 address. A tail jump is checked as a RET and contributes the callee's return
 width. The callee's frame is its own array, so no frame address crosses a call,
@@ -108,8 +109,11 @@ a bound range only at its start; the callee is walked within that range alone,
 may not move RSP or call, and may not be an import thunk.
 
 A call or tail jump through the import address table is translated only through
-an explicit binding (--bind, --import-arguments, --return-bytes): one IAT slot
-for all functions of a run, which must hold the import that the binding names.
+an explicit binding (--bind, --import-arguments, --return-bytes). One binding
+covers one IAT slot for all functions of a run, which must hold the import that
+the binding names. With several --bind options, each names a distinct ordinary
+import of the image and binds the slot that holds it; a reached slot that no
+binding names is refused, as is a binding that no call or tail jump uses.
 It may be reached by call or jmp QWORD PTR [rip+slot], or by a direct CALL or
 JMP of an import thunk: the six bytes FF 25 disp32 at a target outside every
 unwind interval and bound range, read as a call or tail jump through their
@@ -156,6 +160,9 @@ NAMES = {R.RAX: "rax", R.RCX: "rcx", R.RDX: "rdx", R.RBX: "rbx", R.RSP: "rsp", R
 # Integer argument registers in order. An entry takes the first three unless it is listed as "name:4".
 ARGUMENT_REGISTERS = (R.RCX, R.RDX, R.R8, R.R9)
 ARGUMENT_COUNTS = (3, 4)
+IMPORT_ARGUMENT_COUNTS = range(len(ARGUMENT_REGISTERS) + 1)
+IMPORT_RETURN_WIDTHS = (0, 1, 2, 4, 8)
+STACK_OUTPUT_WIDTHS = (1, 2, 4, 8)
 DEFAULT_ARGUMENTS = 3
 VOLATILE = {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 NONVOLATILE = tuple(sorted(set(NAMES) - VOLATILE - {R.RSP}))  # RBX, RBP, RSI, RDI, R12-R15
@@ -172,6 +179,7 @@ STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL, 
 MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
+ROTATES = {M.ROL: "true", M.ROR: "false"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
@@ -191,8 +199,8 @@ STRING_TRANSFERS = {
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
 FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
-                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC}
+                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -833,8 +841,8 @@ class Lifter:
         if ins.memory_base == R.RIP and self.image is not None and not ins.has_segment_prefix:
             self.image_used = True
             return f"(image + {image_target(self.image, ins):#x}ull)"
-        if ins.memory_base == R.RSP and ins.ip in self.frame:
-            # A constant index into the frame array: RSP itself never becomes a C++ value.
+        if ins.ip in self.frame:
+            # A constant index into the frame array: stack bases never become C++ values.
             return self.slot(ins)
         if (ins.memory_base in (R.RIP, R.EIP, R.RSP, R.ESP) or ins.memory_index in (R.RSP, R.ESP)
                 or ins.has_segment_prefix or ins.memory_base == R.NONE):
@@ -866,7 +874,7 @@ class Lifter:
         if kind == OpKind.REGISTER:
             return self.reg(ins.op_register(number))
         if kind == OpKind.MEMORY:
-            if ins.memory_base == R.RSP and ins.ip in self.frame:
+            if ins.ip in self.frame:
                 # The function's own frame array: a read of it cannot fault.
                 return f"load<{unsigned(width)}>({self.address(ins)})"
             # The instruction's memory operand is read once, at its own width, into a local declared before
@@ -911,46 +919,51 @@ class Lifter:
         code = CONDITIONS.get(jcc.condition_code)
         width = self.width(producer)
         u, s = unsigned(width), signed(width)
+        a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
+        sign = f"{1 << (width * 8 - 1):#x}ull"
         if producer.mnemonic in (M.CMP, M.SUB):
-            a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
-            result = f"static_cast<{s}>(static_cast<{u}>({a} - {b}))"
+            flag_result = f"static_cast<{u}>({a} - {b})"
+            overflow = f"((({a} ^ {b}) & ({a} ^ {flag_result}) & {sign}) != 0)"
             table = {"e": f"{a} == {b}", "ne": f"{a} != {b}", "b": f"{a} < {b}", "ae": f"{a} >= {b}",
                      "be": f"{a} <= {b}", "a": f"{a} > {b}", "l": f"static_cast<{s}>({a}) < static_cast<{s}>({b})",
                      "ge": f"static_cast<{s}>({a}) >= static_cast<{s}>({b})",
                      "le": f"static_cast<{s}>({a}) <= static_cast<{s}>({b})",
                      "g": f"static_cast<{s}>({a}) > static_cast<{s}>({b})",
-                     "s": f"{result} < 0", "ns": f"{result} >= 0"}
+                     "s": f"static_cast<{s}>({flag_result}) < 0", "ns": f"static_cast<{s}>({flag_result}) >= 0"}
         else:
-            result = f"static_cast<{u}>(fa)"
-            table = {"e": f"{result} == 0", "ne": f"{result} != 0",
-                     "s": f"static_cast<{s}>({result}) < 0", "ns": f"static_cast<{s}>({result}) >= 0"}
+            if producer.mnemonic == M.ADD:
+                flag_result = f"static_cast<{u}>({a} + {b})"
+                overflow = f"((~({a} ^ {b}) & ({a} ^ {flag_result}) & {sign}) != 0)"
+            else:
+                flag_result = f"static_cast<{u}>(fa)"
+                if producer.mnemonic in (M.INC, M.NEG):
+                    overflow = f"{flag_result} == {sign}"
+                elif producer.mnemonic == M.DEC:
+                    overflow = f"{flag_result} == {((1 << (width * 8 - 1)) - 1):#x}ull"
+                else:
+                    overflow = "false"  # TEST, AND, OR and XOR clear OF.
+            s_cond = f"static_cast<{s}>({flag_result}) < 0"
+            ns_cond = f"static_cast<{s}>({flag_result}) >= 0"
+            table = {"e": f"{flag_result} == 0", "ne": f"{flag_result} != 0", "s": s_cond, "ns": ns_cond}
             if producer.mnemonic in (M.TEST, M.AND, M.OR, M.XOR):
                 # Logical operations clear CF and OF.
-                table.update({"b": "false", "ae": "true", "be": f"{result} == 0", "a": f"{result} != 0",
-                              "l": table["s"], "ge": table["ns"],
-                              "le": f"{result} == 0 || {table['s']}", "g": f"{result} != 0 && {table['ns']}"})
+                table.update({"b": "false", "ae": "true", "be": f"{flag_result} == 0", "a": f"{flag_result} != 0",
+                              "l": s_cond, "ge": ns_cond,
+                              "le": f"{flag_result} == 0 || {s_cond}", "g": f"{flag_result} != 0 && {ns_cond}"})
+            else:
+                # ADD, INC, DEC and NEG share SF != OF signed comparisons; only ADD and NEG define CF.
+                table.update({"l": f"({s_cond}) != ({overflow})", "ge": f"({s_cond}) == ({overflow})",
+                              "le": f"{flag_result} == 0 || ({s_cond}) != ({overflow})",
+                              "g": f"{flag_result} != 0 && ({s_cond}) == ({overflow})"})
+                if producer.mnemonic == M.ADD:
+                    table.update({"b": f"{flag_result} < {a}", "ae": f"{flag_result} >= {a}",
+                                  "be": f"{flag_result} < {a} || {flag_result} == 0",
+                                  "a": f"{flag_result} >= {a} && {flag_result} != 0"})
+                elif producer.mnemonic == M.NEG:
+                    table.update({"b": f"{flag_result} != 0", "ae": f"{flag_result} == 0",
+                                  "be": "true", "a": "false"})
         # PF is even parity of only the low result byte. OF is signed overflow,
         # independent of the host's signed arithmetic and its overflow rules.
-        a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
-        sign = f"{1 << (width * 8 - 1):#x}ull"
-        if producer.mnemonic in (M.CMP, M.SUB, M.ADD):
-            operator = "+" if producer.mnemonic == M.ADD else "-"
-            flag_result = f"static_cast<{u}>({a} {operator} {b})"
-            same_sign = f"~({a} ^ {b})" if producer.mnemonic == M.ADD else f"({a} ^ {b})"
-            overflow = f"(({same_sign} & ({a} ^ {flag_result}) & {sign}) != 0)"
-            if producer.mnemonic == M.ADD:
-                # ADD now snapshots its operands, rather than just its result.
-                table.update({"e": f"{flag_result} == 0", "ne": f"{flag_result} != 0",
-                              "s": f"static_cast<{s}>({flag_result}) < 0",
-                              "ns": f"static_cast<{s}>({flag_result}) >= 0"})
-        else:
-            flag_result = f"static_cast<{u}>(fa)"
-            if producer.mnemonic == M.INC:
-                overflow = f"{flag_result} == {sign}"
-            elif producer.mnemonic == M.DEC:
-                overflow = f"{flag_result} == {((1 << (width * 8 - 1)) - 1):#x}ull"
-            else:
-                overflow = "false"  # TEST, AND, OR and XOR clear OF.
         table.update({"o": overflow, "no": f"!({overflow})",
                       "p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
         if code not in table:
@@ -1008,7 +1021,7 @@ class Lifter:
                 kind = ins.op_kind(number)
                 if kind == OpKind.REGISTER:
                     read(ins.op_register(number))
-                elif kind == OpKind.MEMORY:
+                elif kind == OpKind.MEMORY and ins.ip not in self.frame:
                     for register in (ins.memory_base, ins.memory_index):
                         if register not in (R.NONE, R.RSP) and (register != R.RIP or self.image is None):
                             read(register)
@@ -1025,6 +1038,9 @@ class Lifter:
                 note(0)
                 return f"store<std::uint64_t>({self.slot(ins)}, {self.reg(ins.op0_register)});", reads, {}
             return self.write(ins, 8, f"load<std::uint64_t>({self.slot(ins)})"), {}, writes
+        if mnemonic == M.LEAVE:
+            # Frame proved the anchor: RSP stays a constant offset, and RBP is reloaded from the anchor slot.
+            return self.write(ins, 8, f"load<std::uint64_t>({self.slot(ins)})", R.RBP), {}, {R.RBP: 8}
         if ins.ip in self.adjustments:
             # SUB or ADD RSP, imm: Frame knows RSP as a constant offset, so nothing is computed.
             if sets_flags:
@@ -1070,17 +1086,19 @@ class Lifter:
             value = {M.INC: f"{a} + 1u", M.DEC: f"{a} - 1u", M.NEG: f"0u - {a}", M.NOT: f"~{a}"}[mnemonic]
             line = self.write(ins, width, value)
             if sets_flags:
-                if mnemonic not in (M.INC, M.DEC):
+                if mnemonic not in (M.INC, M.DEC, M.NEG):
                     raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
                 self.flags = True
                 line = f"fa = static_cast<{unsigned(width)}>({value}); " + line
             return line, reads, writes
-        if mnemonic in SHIFTS:
+        if mnemonic in (*SHIFTS, *ROTATES):
+            if sets_flags:
+                raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
             note(0)
             a = self.operand(ins, 0, width)
-            # x86 masks the count to six bits for 64-bit operands and to five bits otherwise, so an
-            # 8- or 16-bit destination can be shifted by up to 31. The shift is done in 64 bits
-            # (count < 64, no host overflow) and the write truncates the result to the destination.
+            # x86 masks the count to six bits for 64-bit operands and to five bits otherwise.
+            # Shifts widen to 64 bits (count < 64, no host overflow) and truncate on write;
+            # rotates mask modulo the operand width inside rotate_bits.
             mask = 63 if width == 8 else 31
             if ins.op1_kind == OpKind.REGISTER:
                 if ins.op1_register != R.CL:
@@ -1089,11 +1107,15 @@ class Lifter:
                 count = f"({self.reg(R.RCX)} & {mask}u)"
             else:
                 count = f"{ins.immediate(1) & mask}u"
-            if mnemonic == M.SAR:
-                a = f"static_cast<std::int64_t>(static_cast<{signed(width)}>({a}))"
+            if mnemonic in ROTATES:
+                value = f"rotate_bits<{unsigned(width)}>({a}, {count}, {ROTATES[mnemonic]})"
             else:
-                a = f"static_cast<std::uint64_t>({a})"
-            return self.write(ins, width, f"{a} {SHIFTS[mnemonic]} {count}"), reads, writes
+                if mnemonic == M.SAR:
+                    a = f"static_cast<std::int64_t>(static_cast<{signed(width)}>({a}))"
+                else:
+                    a = f"static_cast<std::uint64_t>({a})"
+                value = f"{a} {SHIFTS[mnemonic]} {count}"
+            return self.write(ins, width, value), reads, writes
         if mnemonic == M.IMUL and ins.op_count in (2, 3):
             # The two-operand form reads its destination; the three-operand form only writes it.
             if ins.op_count == 2:
@@ -1202,7 +1224,7 @@ class Frame:
     """RSP as entry RSP + a constant at each instruction, and the stack bytes each instruction accesses.
 
     offsets: RVA -> RSP - entry RSP before the instruction. accesses: RVA -> (offset of the first byte from entry
-    RSP, width, reads, writes). released: RVA -> (RSP before, RSP after) for an ADD RSP or POP, which leaves
+    RSP, width, reads, writes). released: RVA -> (RSP before, RSP after) for an ADD RSP, POP or LEAVE, which leaves
     those bytes below RSP, where their contents may change. The frame array starts at entry RSP + start, the lowest offset rounded down to
     8 mod 16: with RSP + 8 a multiple of 16 at entry, as the ABI requires, every array byte then has the address
     residue mod 16 of the stack byte it stands for. It ends with the home space at entry RSP + 40."""
@@ -1210,28 +1232,64 @@ class Frame:
     frame_limit = MAX_FRAME
     incoming_end = HOME_END
 
-    def __init__(self, function):
+    def __init__(self, function, edges):
         self.offsets, self.accesses, self.adjustments, self.released = {function.entry: 0}, {}, set(), {}
+        self.output_calls = {}
+        self.output_addresses = {}
+        self.outputs = {}
+        for ip, host in function.host_calls.items():
+            if host.output is None:
+                continue
+            register, width = host.output
+            if ip not in function.calls or host.noreturn or register not in host.demands or width not in STACK_OUTPUT_WIDTHS:
+                raise ValueError(f"unsupported stack output contract at RVA {ip:#x}")
+            before = ip
+            while before not in edges and before != function.entry:
+                ins = function.ending.get(before)
+                if ins is None or ins.flow_control != FlowControl.NEXT:
+                    break
+                if (ins.mnemonic == M.LEA and ins.op0_register == register and ins.memory_base in (R.RSP, R.RBP)
+                        and ins.memory_index == R.NONE and not ins.has_segment_prefix):
+                    self.output_calls[ip] = (ins, register, width)
+                    self.output_addresses[ins.ip] = width
+                    break
+                if any(RegisterExt.full_register(used.register) == register
+                       or RegisterExt.full_register(used.register) == R.RSP and used.access in WRITE_ACCESS
+                       for used in INFO.info(ins).used_registers()):
+                    break
+                before = ins.ip
+            if ip not in self.output_calls:
+                raise ValueError(f"stack output call at RVA {ip:#x} needs a proven frame address")
+        anchors, self.set_anchor = {function.entry: None}, set()
         work = [function.entry]
         while work:
             ip = work.pop()
+            anchor = anchors[ip]
             if ip in function.calls or ip in function.tails:
                 # The callee pops its return address; call sites are checked by check_call_sites.
                 after = self.offsets[ip]
             else:
-                after = self.step(function.instructions[ip], self.offsets[ip])
+                after, anchor = self.step(function.instructions[ip], self.offsets[ip], anchor)
                 if after > self.offsets[ip]:
                     self.released[ip] = (self.offsets[ip], after)
             for successor in function.successors[ip]:
                 if successor not in self.offsets:
                     self.offsets[successor] = after
+                    anchors[successor] = anchor
                     work.append(successor)
                 elif self.offsets[successor] != after:
                     raise ValueError(f"stack depth differs at join RVA {successor:#x}: entry RSP"
                                      f"{self.offsets[successor]:+#x} and entry RSP{after:+#x}")
+                elif anchors[successor] != anchor:
+                    raise ValueError(f"frame pointer differs at join RVA {successor:#x}")
         for ip in sorted(self.offsets):
             if function.instructions[ip].mnemonic == M.RET and self.offsets[ip]:
                 raise ValueError(f"stack not balanced at RET RVA {ip:#x}: RSP is entry RSP{self.offsets[ip]:+#x}")
+        for ip, (ins, _, width) in self.output_calls.items():
+            offset = self.accesses[ins.ip][0]
+            if offset < self.offsets[ip] + HOME_SIZE or offset % width:
+                raise ValueError(f"misaligned stack output or overlap with callee home space at RVA {ip:#x}")
+            self.outputs[ip] = (offset, width)
         low = min(self.offsets.values())
         self.start = low - (low + 8) % 16
         self.size = HOME_END - self.start
@@ -1247,17 +1305,45 @@ class Frame:
             raise ValueError(f"unsupported stack argument at RVA {ins.ip:#x}: entry RSP{offset:+#x}")
         self.accesses[ins.ip] = (offset, width, reads, writes)
 
-    def step(self, ins, rsp):
-        """RSP after ins; rejects every use of RSP other than a constant change or a frame access."""
+    def step(self, ins, rsp, anchor):
+        """RSP and the optional RBP anchor as offsets from entry RSP, after ins."""
         ip, mnemonic = ins.ip, ins.mnemonic
         if mnemonic == M.RET:
-            return rsp
+            return rsp, anchor
+        if mnemonic == M.LEAVE:
+            if ins.code != Code.LEAVEQ:
+                raise ValueError(f"unsupported LEAVE operand size at RVA {ip:#x}")
+            # RSP becomes the anchor and RBP is popped from it, so only a proven anchor gives the new RSP.
+            # __init__ then releases every byte from the old RSP through anchor + 8, the pop slot included.
+            if anchor is None:
+                raise ValueError(f"LEAVE without a proven frame anchor at RVA {ip:#x}")
+            if anchor < rsp:
+                raise ValueError(f"LEAVE with the frame anchor below RSP at RVA {ip:#x}: "
+                                 f"anchor entry RSP{anchor:+#x}, RSP entry RSP{rsp:+#x}")
+            if anchor + 8 > 0:
+                raise ValueError(f"LEAVE would raise RSP above entry RSP at RVA {ip:#x}: "
+                                 f"anchor entry RSP{anchor:+#x}")
+            self.access(ins, rsp, anchor, 8, True, False)
+            return anchor + 8, None
+        if ins.op0_kind == OpKind.REGISTER and ins.op0_register == R.RBP:
+            if mnemonic == M.MOV and ins.op1_kind == OpKind.REGISTER and ins.op1_register == R.RSP:
+                self.set_anchor.add(ip)
+                return rsp, rsp
+            if (mnemonic == M.LEA and ins.memory_base == R.RSP and ins.memory_index == R.NONE
+                    and not ins.has_segment_prefix):
+                self.set_anchor.add(ip)
+                displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
+                return rsp, rsp + displacement
         if mnemonic in (M.PUSH, M.POP):
             if ins.op0_kind != OpKind.REGISTER or ins.op0_register not in NONVOLATILE:
                 raise ValueError(f"unsupported push or pop at RVA {ip:#x}: {ins}")
+            if ins.op0_register == R.RBP and anchor is not None:
+                if mnemonic == M.PUSH:
+                    raise ValueError(f"frame pointer escapes at RVA {ip:#x}: {ins}")
+                anchor = None
             pushed = rsp - 8 if mnemonic == M.PUSH else rsp
             self.access(ins, pushed, pushed, 8, mnemonic == M.POP, mnemonic == M.PUSH)
-            return pushed if mnemonic == M.PUSH else rsp + 8
+            return (pushed if mnemonic == M.PUSH else rsp + 8), anchor
         if (mnemonic in (M.SUB, M.ADD) and ins.op0_kind == OpKind.REGISTER and ins.op0_register == R.RSP
                 and ins.op1_kind in (OpKind.IMMEDIATE8TO64, OpKind.IMMEDIATE32TO64)):
             change = ins.immediate(1) & ((1 << 64) - 1)
@@ -1266,8 +1352,15 @@ class Frame:
             if change % 8 or after > 0:
                 raise ValueError(f"unsupported stack adjustment at RVA {ip:#x}: {ins}")
             self.adjustments.add(ip)
-            return after
+            return after, anchor
         info = INFO.info(ins)
+        if ip in self.output_addresses:
+            base = rsp if ins.memory_base == R.RSP else anchor
+            if base is None:
+                raise ValueError(f"stack output uses an unproven frame anchor at RVA {ip:#x}")
+            displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
+            self.access(ins, rsp, base + displacement, self.output_addresses[ip], False, False)
+            return rsp, anchor
         if any(RegisterExt.full_register(used.register) == R.RSP and used.access in WRITE_ACCESS
                for used in info.used_registers()):
             raise ValueError(f"dynamic frame at RVA {ip:#x}: {ins}")
@@ -1275,22 +1368,37 @@ class Frame:
                 for n in range(ins.op_count))
                 or mnemonic == M.LEA and RegisterExt.full_register(ins.memory_base) == R.RSP):
             raise ValueError(f"frame address escapes at RVA {ip:#x}: {ins}")
-        if mnemonic != M.NOP and ins.memory_base == R.RSP and OpKind.MEMORY in map(ins.op_kind, range(ins.op_count)):
-            used = [memory for memory in info.used_memory() if memory.base == R.RSP]
+        has_memory = OpKind.MEMORY in map(ins.op_kind, range(ins.op_count))
+        anchored_memory = anchor is not None and ins.memory_base == R.RBP and has_memory
+        stack_base = anchor if anchored_memory else rsp
+        if mnemonic != M.NOP and has_memory and (ins.memory_base == R.RSP or anchored_memory):
+            used = [memory for memory in info.used_memory() if memory.base == ins.memory_base]
             if (ins.memory_index != R.NONE or ins.has_segment_prefix or len(used) != 1
                     or used[0].access not in (OpAccess.READ, OpAccess.WRITE, OpAccess.READ_WRITE)):
                 raise ValueError(f"unsupported stack operand at RVA {ip:#x}: {ins}")
             displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
-            self.access(ins, rsp, rsp + displacement, _memory_width(ins), used[0].access != OpAccess.WRITE,
+            self.access(ins, rsp, stack_base + displacement, _memory_width(ins), used[0].access != OpAccess.WRITE,
                         used[0].access != OpAccess.READ)
-        return rsp
+        if anchor is not None and mnemonic != M.NOP:
+            restores_rbp = (mnemonic == M.MOV and ins.op0_kind == OpKind.REGISTER
+                            and ins.op0_register == R.RBP and ip in self.accesses)
+            if (any(ins.op_kind(n) == OpKind.REGISTER and RegisterExt.full_register(ins.op_register(n)) == R.RBP
+                    and not (n == 0 and restores_rbp) for n in range(ins.op_count))
+                    or has_memory and RegisterExt.full_register(ins.memory_index) == R.RBP
+                    or has_memory and RegisterExt.full_register(ins.memory_base) == R.RBP and not anchored_memory):
+                raise ValueError(f"frame pointer escapes at RVA {ip:#x}: {ins}")
+            if restores_rbp:
+                anchor = None
+        return rsp, anchor
 
 
 def slot_register(ins):
     """The nonvolatile register that PUSH, POP or a 64-bit MOV copies whole to or from the frame, else None."""
     if ins.mnemonic in (M.PUSH, M.POP):
         return ins.op0_register
-    if ins.mnemonic == M.MOV and ins.memory_base == R.RSP:
+    if ins.mnemonic == M.LEAVE:
+        return R.RBP
+    if ins.mnemonic == M.MOV and ins.memory_base in (R.RSP, R.RBP):
         for number in (0, 1):
             if ins.op_kind(number) == OpKind.REGISTER and ins.op_register(number) in NONVOLATILE:
                 return ins.op_register(number)
@@ -1303,7 +1411,7 @@ def prove_frame(function, order, effects, frame):
 
     Per stack byte: 1 once a store writes it; 2 + 8 * i + k while it holds byte k of the entry value of
     NONVOLATILE[i], saved by PUSH or MOV [RSP+d] while that register holds its entry value; 0 when not
-    written on some path, or released since: when ADD RSP or POP raises RSP, the bytes it leaves below RSP
+    written on some path, or released since: when ADD RSP, POP or LEAVE raises RSP, the bytes it leaves below RSP
     become 0 after the POP has read its source, because their contents may change before a later allocation
     brings them back into the frame. Per nonvolatile register: "entry", "written" since entry or the last restore, or
     None when paths disagree. A join keeps what both sides agree on. A save is not a read of the entry value
@@ -1318,7 +1426,12 @@ def prove_frame(function, order, effects, frame):
             # bytes that ADD RSP and POP leave below RSP become 0. The rest of the frame, including this
             # function's own home space above entry RSP, is kept.
             index = frame.offsets[ip] - frame.start
-            return status, data[:index] + bytes(HOME_SIZE) + data[index + HOME_SIZE:]
+            data = data[:index] + bytes(HOME_SIZE) + data[index + HOME_SIZE:]
+            if ip in frame.outputs:
+                offset, width = frame.outputs[ip]
+                index = offset - frame.start
+                data = data[:index] + b"\1" * width + data[index + width:]
+            return status, data
         status, restored = dict(zip(NONVOLATILE, status)), None
         if ip in frame.accesses:
             offset, width, reads, writes = frame.accesses[ip]
@@ -1440,6 +1553,7 @@ class Binding(NamedTuple):
     link_name: str | None
     arguments: int
     return_bytes: int
+    output: tuple[int, int] | None = None
 
 
 class HostImport(NamedTuple):
@@ -1447,6 +1561,8 @@ class HostImport(NamedTuple):
     widths: tuple
     return_width: int
     noreturn: bool = False
+    # An explicitly bound synchronous import always initializes this output and does not retain its address.
+    output: tuple[int, int] | None = None
 
     @property
     def demands(self):
@@ -1546,7 +1662,7 @@ def lift_function(program, entry, symbol, arguments, internal):
     bases = {(base, anchor) for *_, (_, _, base, anchor) in function.dispatches.values()}
     order = sorted(function.instructions)
     instructions = function.instructions
-    frame = Frame(function)
+    frame = Frame(function, edges)
     if internal and not function.unwound:
         # Without unwind data a function may not move RSP, so it cannot push, allocate or call.
         moved = sorted(ip for ip, offset in frame.offsets.items() if offset or ip in function.calls)
@@ -1576,13 +1692,22 @@ def lift_function(program, entry, symbol, arguments, internal):
         if ip in callees:
             callee = callees[ip]
             if isinstance(callee, HostImport):
-                call = f"{callee.symbol}({', '.join(lifter.reg(r) for r in callee.demands)})"
+                output = frame.output_calls.get(ip)
+                call_args = [lifter.slot(output[0]) if output and r == output[1] else lifter.reg(r)
+                             for r in callee.demands]
+                call = f"{callee.symbol}({', '.join(call_args)})"
             else:
                 call = f"fn_{callee.entry:x}({', '.join(lifter.reg(r) for r in ARGUMENT_REGISTERS)})"
-            lifter.used.add(R.RAX)
             # A tail jump returns the callee's RAX; a call leaves it in RAX.
-            body[ip] = f"return {call};" if ip in function.tails else f"rax = {call};"
-            effects[ip] = (dict(callee.demands), {}, set())
+            if isinstance(callee, HostImport) and callee.return_width == 0:
+                body[ip] = f"{call}; return 0;" if ip in function.tails else f"{call};"
+            else:
+                lifter.used.add(R.RAX)
+                body[ip] = f"return {call};" if ip in function.tails else f"rax = {call};"
+            reads = dict(callee.demands)
+            if ip in frame.output_calls:
+                del reads[frame.output_calls[ip][1]]
+            effects[ip] = (reads, {}, set())
         elif ins.flow_control == FlowControl.CONDITIONAL_BRANCH:
             body[ip] = f"if ({lifter.condition(producers[ip], ins)}) goto loc_{ins.near_branch_target:x};"
             effects[ip] = ({}, {}, set())
@@ -1605,6 +1730,11 @@ def lift_function(program, entry, symbol, arguments, internal):
         elif ip in skipped:
             # The table load reads the 64-bit index; it and the add leave guest addresses behind.
             effects[ip] = ({loads[ip]: 8} if ip in loads else {}, {}, {full(ins.op0_register)})
+        elif ip in frame.set_anchor:
+            # Only the frame proof observes the anchor. No host pointer stands in for RBP.
+            effects[ip] = ({}, {R.RBP: 8}, set())
+        elif ip in frame.output_addresses:
+            effects[ip] = ({}, {}, {full(ins.op0_register)})
         elif (ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register)
               and (not image_data or (ins.op0_register, ins.ip_rel_memory_address) in bases)):
             # A guest address is only usable as a jump-table base, which the switch replaces.
@@ -1739,6 +1869,14 @@ static inline bool even_parity(word value) {
     // Fold the low byte into a nibble; bit n of 0x6996 is its odd parity.
     const auto folded = static_cast<unsigned>((value ^ (value >> 4)) & 15u);
     return ((0x6996u >> folded) & 1u) == 0;
+}
+template <class T> static inline T rotate_bits(T value, word count, bool left) {
+    const unsigned bits = static_cast<unsigned>(sizeof(T) * 8);
+    const unsigned shift = static_cast<unsigned>(count & (bits - 1));
+    if (!shift) return value;
+    const unsigned amount = left ? shift : bits - shift;
+    const word wide = value;
+    return static_cast<T>((wide << amount) | (wide >> (bits - amount)));
 }
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {
@@ -1880,40 +2018,129 @@ def load_bindings(source):
     return {"image_sha256": digest, "functions": functions}
 
 
+def import_identities(pe):
+    """(DLL, name or "#ordinal") of each ordinary import by its IAT slot RVA, named as resolve_import names it."""
+    pe.parse_data_directories(directories=[1])  # ordinary import directory
+    return {imp.address - pe.OPTIONAL_HEADER.ImageBase:
+            (desc.dll.decode("ascii"), f"#{imp.ordinal}" if imp.import_by_ordinal else imp.name.decode("ascii"))
+            for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) for imp in desc.imports}
+
+
 def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
+    """binding is one Binding or a sequence of them; with several, each binds the IAT slot of the import it names."""
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
     if image_data and {"bind_image", "unbind_image"} & {parse_entry(name)[0] for name in names}:
         raise ValueError("an export named bind_image or unbind_image collides with the image binding functions")
     program = Program(pe, None if bindings is None else load_bindings(bindings), image_data=image_data)
-    slots = {}
-    if binding is not None:
-        if binding.arguments not in ARGUMENT_COUNTS or binding.return_bytes not in (0, 1, 2, 8):
-            raise ValueError(f"unsupported binding of {binding.symbol}")
-
+    bound = () if binding is None else (binding,) if isinstance(binding, Binding) else tuple(binding)
+    for item in bound:
+        if item.arguments not in IMPORT_ARGUMENT_COUNTS or item.return_bytes not in IMPORT_RETURN_WIDTHS:
+            raise ValueError(f"unsupported binding of {item.symbol}")
+        if item.output is not None:
+            position, width = item.output
+            if not 1 <= position <= item.arguments or width not in STACK_OUTPUT_WIDTHS:
+                raise ValueError(f"invalid stack output argument or width for {item.symbol}")
+    # With several bindings, each names one ordinary import of the image and a slot takes the binding of its import.
+    imported = import_identities(pe) if len(bound) > 1 else {}
+    by_import = {}
+    for index, item in enumerate(bound if len(bound) > 1 else ()):
+        key = (Path(item.provider).name.casefold(), item.symbol)
+        if key in by_import:
+            raise ValueError(f"two bindings of {Path(item.provider).name}!{item.symbol}")
+        if key not in {(dll.casefold(), name) for dll, name in imported.values()}:
+            raise ValueError(f"binding {Path(item.provider).name}!{item.symbol} names no ordinary import of the image")
+        by_import[key] = index
+    slots, chosen = {}, {}  # slot -> HostImport, slot -> index of its binding
+    if bound:
         def resolve_slot(slot):
-            if slots and slot not in slots:
-                raise ValueError(f"call or tail jump through a second IAT slot RVA {slot:#x}")
-            symbol = resolve_import(pe, slot, Path(binding.provider), binding.symbol, binding.link_name)
+            if len(bound) == 1:
+                if slots and slot not in slots:
+                    raise ValueError(f"call or tail jump through a second IAT slot RVA {slot:#x}")
+                index = 0
+            else:
+                if slot not in imported:
+                    raise ValueError(f"RIP-relative target RVA {slot:#x} is not an ordinary IAT slot")
+                dll, name = imported[slot]
+                index = by_import.get((dll.casefold(), name))
+                if index is None:
+                    raise ValueError(f"call or tail jump through IAT slot RVA {slot:#x} ({dll}!{name}) matches "
+                                     "no binding")
+            item = bound[index]
+            symbol = resolve_import(pe, slot, Path(item.provider), item.symbol, item.link_name)
             # The translation calls the import instead of reading the slot; the original's read must not fault.
             if not any(s.VirtualAddress <= slot and slot + 8 <= s.VirtualAddress + extent(s)
                        and s.Characteristics & SCN_READ for s in pe.sections):
                 raise ValueError(f"IAT slot RVA {slot:#x} is not 8 bytes of one readable section")
-            slots[slot] = HostImport(symbol, (8,) * binding.arguments, binding.return_bytes)
+            output = None
+            if item.output is not None:
+                position, width = item.output
+                output = (ARGUMENT_REGISTERS[position - 1], width)
+            slots[slot] = HostImport(symbol, (8,) * item.arguments, item.return_bytes, output=output)
+            chosen[slot] = index
             return slots[slot]
         program.import_resolver = resolve_slot
     functions = [lift(pe, *parse_entry(name), program=program) for name in names]
     # Callees precede every caller, so each internal function is defined before its first use.
     sources = program.sources + [source for source, _ in functions]
-    declarations = ""
-    if binding is not None:
-        if not slots:
-            raise ValueError(f"binding {Path(binding.provider).name}!{binding.symbol} supplied but no call or "
+    lines = []
+    for index, item in enumerate(bound):
+        used = [slot for slot, owner in chosen.items() if owner == index]
+        if not used:
+            raise ValueError(f"binding {Path(item.provider).name}!{item.symbol} supplied but no call or "
                              "tail jump uses it")
-        symbol = next(iter(slots.values())).symbol
-        params = ", ".join(["word"] * binding.arguments)
-        declarations = f'\nextern "C" __declspec(dllimport) word {symbol}({params});\n'
+        lines.append((min(used), slots[min(used)].symbol, item))
+    # Declared in IAT slot order, so the source does not depend on the order of the bindings.
+    lines = [(symbol, item) for _, symbol, item in sorted(lines, key=lambda line: line[0])]
+    for (symbol, item), (other, earlier) in ((a, b) for n, a in enumerate(lines) for b in lines[:n]):
+        if symbol == other:
+            raise ValueError(f"bindings {Path(earlier.provider).name}!{earlier.symbol} and "
+                             f"{Path(item.provider).name}!{item.symbol} both declare the C name {symbol}")
+    declarations = "".join(f'\nextern "C" __declspec(dllimport) {"word" if item.return_bytes else "void"} '
+                           f'{symbol}({", ".join(["word"] * item.arguments)});'
+                           for symbol, item in lines) + "\n" if lines else ""
     return PRELUDE + declarations + (image_block(pe) if image_data else "") + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
+
+
+class BindingOption(argparse.Action):
+    """Records options for each import in command-line order."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        # The canonical spelling: argparse also accepts an abbreviation such as --return.
+        namespace.binding_options = [*namespace.binding_options, (self.option_strings[0], values)]
+
+
+def parse_binding_options(options):
+    """None, one Binding or a tuple of them from the recorded binding options. With one --bind the other options
+    may appear anywhere, the last of each counting, as before; with several, each belongs to the --bind before it."""
+    binds = sum(option == "--bind" for option, _ in options)
+    if binds < 2:
+        group = dict(options)  # the last value of each option counts
+        if not binds:
+            if group:
+                raise ValueError("--link-name, --import-arguments, --return-bytes and --stack-output require --bind")
+            return None
+        groups = [group]
+    else:
+        groups = []
+        for option, value in options:
+            if option == "--bind":
+                groups.append({option: value})
+            elif not groups:
+                raise ValueError(f"{option} comes before the first of several --bind options")
+            elif option in groups[-1]:
+                raise ValueError(f"{option} given twice for --bind {' '.join(groups[-1]['--bind'])}")
+            else:
+                groups[-1][option] = value
+    found = []
+    for group in groups:
+        if "--import-arguments" not in group or "--return-bytes" not in group:
+            raise ValueError("--bind requires --import-arguments and --return-bytes")
+        provider, symbol = group["--bind"]
+        output = group.get("--stack-output")
+        found.append(Binding(Path(provider), symbol, group.get("--link-name"), group["--import-arguments"],
+                             group["--return-bytes"], None if output is None else tuple(output)))
+    return found[0] if len(found) == 1 else tuple(found)
 
 
 def translate(image, names, bindings=None, *, image_data=False, binding=None):
@@ -1932,25 +2159,28 @@ if __name__ == "__main__":
                              "binds at run time with lifted_bind_image; the generated source states the contract")
     parser.add_argument("--bind-ranges", type=Path, metavar="MANIFEST",
                         help="trusted [start, end) ranges of functions without unwind data, bound to this image's sha256")
-    parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"),
+    parser.set_defaults(binding_options=[])
+    parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"), action=BindingOption,
                         help="provider and export name or #ordinal of the import that calls and tail jumps "
                              "through the import address table reach. The image and target must stay valid and "
-                             "the original slot must stay readable and contain that target throughout execution")
-    parser.add_argument("--link-name", help="local import-library symbol for an ordinal binding")
-    parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS,
+                             "the original slot must stay readable and contain that target throughout execution. "
+                             "Repeat it to bind several imports, each followed by its own options below")
+    parser.add_argument("--link-name", action=BindingOption,
+                        help="local import-library symbol for an ordinal binding")
+    parser.add_argument("--import-arguments", type=int, choices=IMPORT_ARGUMENT_COUNTS, action=BindingOption,
                         help="integer arguments the bound import takes; stated by the binding, not derived from "
                              "the provider (required with --bind)")
-    parser.add_argument("--return-bytes", type=int, choices=(0, 1, 2, 8),
+    parser.add_argument("--return-bytes", type=int, choices=IMPORT_RETURN_WIDTHS, action=BindingOption,
                         help="guaranteed low RAX bytes of the bound import's return, 0 for none; stated by "
                              "the binding, not derived from the provider (required with --bind)")
+    parser.add_argument("--stack-output", nargs=2, type=int, metavar=("ARG", "WIDTH"), action=BindingOption,
+                        help="1-based argument that the import fully writes before returning; WIDTH is 1, 2, "
+                             "4 or 8. It must not read the initial contents or retain the address")
     args = parser.parse_args()
-    binding = None
-    if args.bind:
-        if args.import_arguments is None or args.return_bytes is None:
-            parser.error("--bind requires --import-arguments and --return-bytes")
-        binding = Binding(Path(args.bind[0]), args.bind[1], args.link_name, args.import_arguments, args.return_bytes)
-    elif args.link_name is not None or args.import_arguments is not None or args.return_bytes is not None:
-        parser.error("--link-name, --import-arguments and --return-bytes require --bind")
+    try:
+        binding = parse_binding_options(args.binding_options)
+    except ValueError as error:
+        parser.error(str(error))
     try:
         source, functions = translate(args.image, args.exports.split(","), args.bind_ranges, image_data=args.image_data, binding=binding)
         args.output.write_text(source, encoding="utf-8")

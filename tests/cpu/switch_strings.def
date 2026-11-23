@@ -37,3 +37,8 @@ EXPORTS
     bad_df_call
     bad_df_tail
     bad_df_join
+    once_movsb_cleared
+    bad_df_mixed_call
+    bad_df_host_call
+    bad_df_back_edge
+    bad_once_stosb_rcx
