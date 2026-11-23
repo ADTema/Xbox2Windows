@@ -3784,6 +3784,57 @@ setup and readback as the direct probe. Run both from the build directory:
 An incorrect readback or setup failure fails the diagnostic. Exit 77 denotes
 an adapter without the required SM 6.0 or WaveOps capability.
 
+### XG swizzle selection against AddrLib
+
+`tests/xg_swizzle_select_check.cpp` (CTest `xg_swizzle_select`) compares XG-style swizzle selection with AMD addrlib, the supported swizzle selector for gfx10.3. It concerns the XG helper only and is separate from the graphics configuration work in #874. It does not change `xg_xs.dll` binding, and it does not repeat the layout and address checks reported on #870.
+
+The results are **AddrLib observations**. A match establishes the chosen PC reference behavior only. The Xbox-specific XG selection and its inputs still need separate evidence.
+
+Public inputs:
+
+- **XG caller sequence.** From [microsoft/DirectXTex `Auxiliary/DirectXTexXboxTile.cpp` at a8e5dbf](https://github.com/microsoft/DirectXTex/blob/a8e5dbf42909aeeb9fcf9c2ae399ae3c06737379/Auxiliary/DirectXTexXboxTile.cpp) (MIT). A caller with no specific mode asks XG with `XGComputeOptimalSwizzleMode(dimension, format, width, height, arraySize, sampleCount, bindFlags)` and stores the answer in `XG_TEXTURE2D_DESC::SwizzleMode`. DirectXTex does not select a mode itself.
+- **Reference implementation.** AMD addrlib from [Mesa `src/amd/addrlib` at tag mesa-25.1.0, commit 5c142e46f3f6e752ed745fd48912ebb8fad67145](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib), SPDX-License-Identifier MIT, copyright Advanced Micro Devices. The GPUOpen PAL copy was not used, because its `addrtypes.h` has no 64-bit integer types for MSVC.
+- **Create inputs.** These follow Mesa's `ac_addrlib_create`: `chipEngine` 0xD (`CIASICIDGFXENGINE_ARCTICISLAND`), `chipFamily` 0x8F (NV), `chipRevision` 0x28, `gbAddrConfig` 0x444, `createFlags` 0.
+- **GB_ADDR_CONFIG.** 0x444 is Mesa's "navi21" surface-test configuration (`src/amd/common/ac_fake_hw_db.h` at the same tag): base 0x40 with `NUM_PIPES` 4 and `NUM_PKRS` 4.
+- **Selection inputs.** These follow Mesa's `gfx9_get_preferred_swizzle_mode`: `ADDR_RSRC_TEX_2D`, `ADDR_RSRC_LOC_INVIS`, 256 B and variable blocks forbidden, one slice, one sample.
+
+Not public: the console's `GB_ADDR_CONFIG`, XG's own selection rules and enum values, and the signature of the imported `XGSuggestSwizzleMode`.
+
+Proposed desktop policy, in the test-only provider: every request sets `texture`. A render target adds `color`, a display target adds `color` and `display`, a depth target adds `depth`, and an unordered-access target adds `unordered`. A forced-linear request forbids every non-linear block.
+
+| Request (one slice, one sample) | addrlib flags | Selected mode | Base alignment |
+|---|---|---|---|
+| 128x128 `8_8_8_8`, 8 mips, shader resource | 0x200 | `SW_64KB_R_X` | 65,536 |
+| 1024x1024 `8_8_8_8`, 11 mips, shader resource | 0x200 | `SW_64KB_R_X` | 65,536 |
+| 64x64 `8`, 1 mip, shader resource | 0x200 | `SW_4KB_D_X` | 4,096 |
+| 16x16 `8_8_8_8`, 1 mip, shader resource | 0x200 | `SW_4KB_D_X` | 4,096 |
+| 4096x1 `32`, 1 mip, shader resource | 0x200 | `SW_LINEAR` | 256 |
+| 1920x1080 `8_8_8_8`, render target | 0x201 | `SW_64KB_R_X` | 65,536 |
+| 1920x1080 `8_8_8_8`, display render target | 0x221 | `SW_64KB_R_X` | 65,536 |
+| 1920x1080 `32`, depth target | 0x202 | `SW_64KB_Z_X` | 65,536 |
+| 512x512 `32_32_32_32`, 10 mips, unordered access | 0x600 | `SW_64KB_R_X` | 65,536 |
+| 2048x2048 `16`, 1 mip, unordered access | 0x600 | `SW_64KB_R_X` | 65,536 |
+
+Every call returned `ADDR_OK`. The test requires each row to match exactly. A first run with placeholder expectations failed every row, so the comparison is not vacuous.
+
+Controls:
+- **Linear fallback.** A provider that always answers `SW_LINEAR` disagrees on all 9 tiled rows.
+- **Forced linear.** With only the linear block allowed, the 9 colour requests select `SW_LINEAR`. The depth target, which has no linear mode, is refused with `ADDR_INVALIDPARAMS` rather than given a tiled mode.
+- **Tiled request.** With the linear block forbidden, no request selects `SW_LINEAR`, including the 4096x1 row.
+- **Explicit pitch.** A linear 100x64 `8_8_8_8` surface needs a pitch of 128 elements. An explicit pitch of 128 is accepted. A pitch of 129 (misaligned) and a pitch of 64 (tight) return `ADDR_INVALIDPARAMS`.
+- **Mismatched input.** The requests in the table do not all select the same mode.
+
+addrlib is an optional local dependency and is never vendored. `tools/fetch_addrlib.py` makes a shallow sparse fetch of `src/amd/addrlib` at the pinned commit into `out/deps/mesa`. CMake builds it as a static library with the source list and definitions from Mesa's `meson.build` (`ADDR_FASTCALL=`, `LITTLEENDIAN_CPU`, `DEBUG=0`). The configure step picks it up from `out/deps/mesa`, or from `XBOX2WINDOWS_ADDRLIB_DIR`. Without it, the rest of the build is unchanged and `xg_swizzle_select` returns 77, a capability skip. CI therefore skips this test unless addrlib is present.
+
+Measured on Windows 10 Pro 10.0.19045.6466 with MSVC 19.44.35207.1 x64, `dev` and `release`. No GPU is involved.
+
+```powershell
+python tools/fetch_addrlib.py
+cmake --preset dev
+cmake --build --preset dev --target xg_swizzle_select_check
+ctest --preset dev --no-tests=error -R '^xg_swizzle_select$' -V
+```
+
 ## Offscreen rendering and readback
 
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
