@@ -3373,6 +3373,242 @@ def plain_bitscan_reference(words):
 
 
 
+# Non-packed 16-bit integer VOP3 ops (Refs #669). v18..v21 hold the constant words 0..3 (s44..s47). The translator
+# tracks each result as ("low16", alu): only bits 15:0 are defined, and every reader that could observe the high
+# half is refused. Groups 0..2 run four ops into v24..v27 and widen each result with
+# v_mov_b32_sdwa ..., src0_sel:WORD_0 into v12..v15, so the export sees the zero-extended low half. The v24..v27
+# registers start as 0xa5c3xxxx sentinels; they would catch a sentinel merged into the low half only; they do not
+# detect a high-half leak (the widening never reads the high half). Group 3 runs a chain and 16-bit compares.
+# Operand mapping, one row per op (dst = src0, src1), a = low half of src0, b = low half of src1:
+#   group 0: v24 = add_nc_u16 v18, v19 (w0 + w1)       v25 = sub_nc_u16 s46, v18 (w2 - w0)
+#            v26 = add_nc_i16 v20, 5   (w2 + 5)        v27 = sub_nc_i16 0x1234, v21 (0x1234 - w3)
+#   group 1: v24 = min_u16 v18, v19 (w0, w1)           v25 = max_u16 s46, v21 (w2, w3)
+#            v26 = min_i16 v18, v19 (w0, w1)           v27 = max_i16 v20, -2 (w2, 0xfffe)
+#   group 2: v24 = mul_lo_u16 v18, v19 (w0 * w1)       v25 = lshlrev_b16 v20, v18 (w0 << (w2 & 15))
+#            v26 = lshrrev_b16 v19, v21 (w3 >> (w1 & 15))   v27 = ashrrev_i16 s47, v18 (sext(w0) >> (w3 & 15))
+#   group 3: v24 = add_nc_u16 v18, v19; v25 = mul_lo_u16 v24, v20 (a low16 result as a source);
+#            v26 = v_cmp_lt_u16 v24, v21 selecting v18 or v19 (whole words);
+#            v27 = v_cmp_lt_i16 v25, v24 selecting v20 or v21 (whole words)
+INT16_VOP3_GROUPS = (
+    (("add_nc_u16", "v18", "v19"), ("sub_nc_u16", "s46", "v18"),
+     ("add_nc_i16", "v20", "5"), ("sub_nc_i16", "0x1234", "v21")),
+    (("min_u16", "v18", "v19"), ("max_u16", "s46", "v21"),
+     ("min_i16", "v18", "v19"), ("max_i16", "v20", "-2")),
+    (("mul_lo_u16", "v18", "v19"), ("lshlrev_b16", "v20", "v18"),
+     ("lshrrev_b16", "v19", "v21"), ("ashrrev_i16", "s47", "v18")),
+)
+INT16_VOP3_CHAIN = ("v_add_nc_u16 v24, v18, v19", "v_mul_lo_u16 v25, v24, v20",
+                    "v_cmp_lt_u16 vcc_lo, v24, v21", "v_cndmask_b32 v26, v18, v19, vcc_lo",
+                    "v_cmp_lt_i16 vcc_lo, v25, v24", "v_cndmask_b32 v27, v20, v21, vcc_lo")
+INT16_VOP3_SENTINELS = (0xa5c31111, 0xa5c32222, 0xa5c33333, 0xa5c34444)
+INT16_VOP3_WIDEN = "v_mov_b32_sdwa v{dst}, v{src} dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0"
+# Four constant words per set. Cover 0x7fff/0x8000, 0xffff + 1, 0 - 1, shift counts 15/16/17/31, negative b under
+# ashrrev, signed/unsigned min/max disagreement, a mul_lo overflow (0x1234 * 0x0567) and high halves that differ from
+# the low halves. Set index 2 gives lshrrev/ashrrev count 16 with b != 0 and lshlrev count 17 with b = 1.
+INT16_VOP3_WORDS = (
+    (0xdead7fff, 0x12348000, 0xbeef0001, 0x5a5a0002),
+    (0x1111ffff, 0x22220001, 0x33330000, 0x4444ffff),
+    (0xabcd0001, 0x3c1d0010, 0x77770011, 0x13570010),
+    (0xf00f1234, 0x801f0567, 0x8000001f, 0x9999001f),
+    (0x00008000, 0xffff7fff, 0x0000000f, 0xc0de0000),
+    (0xfffe0000, 0x0001ffff, 0x80000010, 0x7ffe8001),
+)
+
+
+def int16_vop3_ops(group):
+    """The group's ops on the constant words, widened with SDWA WORD_0 into v12..v15 and exported."""
+    body = [f"v_mov_b32_e32 v{18 + k}, s{44 + k}" for k in range(4)]
+    body += [f"v_mov_b32_e32 v{24 + k}, {word:#x}" for k, word in enumerate(INT16_VOP3_SENTINELS)]
+    if group < 3:
+        body += [f"v_{op} v{24 + k}, {src0}, {src1}" for k, (op, src0, src1) in enumerate(INT16_VOP3_GROUPS[group])]
+        body += [INT16_VOP3_WIDEN.format(dst=12 + k, src=24 + k) for k in range(4)]
+    else:
+        body += INT16_VOP3_CHAIN
+        body += [INT16_VOP3_WIDEN.format(dst=12, src=24), INT16_VOP3_WIDEN.format(dst=13, src=25),
+                 "v_mov_b32_e32 v14, v26", "v_mov_b32_e32 v15, v27"]
+    return uncompressed_export(body)
+
+
+def int16_vop3_reference(group, words, *, mutation=None):
+    """Four exported words from the semantics table (a, b = low halves of src0 and src1), without pixel_aot.
+
+    Only the zero-extended low half of each 16-bit result is observed. mutation names a deliberate deviation that the
+    draw's mutated shaders model: shift31, min_unsigned, source_high (a source read from bits 31:16), low16_chain or
+    low16_compare (a low16 result read through >> 16u as a source of the chained op or of the first compare).
+    """
+    def signed(x):
+        return x - 0x10000 if x & 0x8000 else x
+
+    if group == 3:
+        w0, w1, w2, w3 = words
+        r24 = ((w0 & 0xffff) + (w1 & 0xffff)) & 0xffff
+        r25 = ((r24 >> 16 if mutation == "low16_chain" else r24) * (w2 & 0xffff)) & 0xffff
+        first = (0 if mutation == "low16_compare" else r24) < (w3 & 0xffff)
+        second = signed(r25) < signed(r24)
+        return (r24, r25, w1 if first else w0, w3 if second else w2)
+
+    def operand(token):
+        if token[0] == "v":
+            return words[int(token[1:]) - 18]
+        if token[0] == "s":
+            return words[int(token[1:]) - 44]
+        return int(token, 0) & 0xffffffff
+
+    out = []
+    for k, (op, src0, src1) in enumerate(INT16_VOP3_GROUPS[group]):
+        a = (operand(src0) >> 16 if mutation == "source_high" else operand(src0)) & 0xffff
+        b = operand(src1) & 0xffff
+        if mutation == "min_unsigned" and op == "min_i16":
+            op = "min_u16"
+        count = a & (31 if mutation == "shift31" else 15)
+        r = {
+            "add_nc_u16": lambda: a + b, "add_nc_i16": lambda: a + b,
+            "sub_nc_u16": lambda: a - b, "sub_nc_i16": lambda: a - b,
+            "min_u16": lambda: min(a, b), "max_u16": lambda: max(a, b),
+            "min_i16": lambda: min(signed(a), signed(b)), "max_i16": lambda: max(signed(a), signed(b)),
+            "mul_lo_u16": lambda: a * b,
+            "lshlrev_b16": lambda: b << count, "lshrrev_b16": lambda: b >> count,
+            "ashrrev_i16": lambda: signed(b) >> count,
+        }[op]() & 0xffff
+        out.append(r)
+    return tuple(out)
+
+
+# Each mutation of the draw: the groups it is applied to and the lanes whose expected value it must change.
+INT16_VOP3_MUTATIONS = {
+    "shift31": ((2,), (1, 2, 3)),
+    "min_unsigned": ((1,), (2,)),
+    "source_high": ((0,), (0, 1, 2, 3)),
+    "low16_chain": ((3,), (1, 3)),
+    "low16_compare": ((3,), (2,)),
+}
+
+
+def check_int16_vop3_mutation_coverage():
+    """Every mutation must change the affected lanes for some word set, so the draw can detect it."""
+    for mutation, (groups, lanes) in INT16_VOP3_MUTATIONS.items():
+        for group in groups:
+            for lane in lanes:
+                assert any(int16_vop3_reference(group, words, mutation=mutation)[lane]
+                           != int16_vop3_reference(group, words)[lane] for words in INT16_VOP3_WORDS), \
+                    (mutation, group, lane)
+    assert len(INT16_VOP3_WORDS) >= 5 and all(len(words) == 4 for words in INT16_VOP3_WORDS)
+
+
+def check_int16_vop3_controls():
+    """Lowering, spelling and refusals of the 12 non-packed 16-bit integer VOP3 ops and their low16 results."""
+    check_int16_vop3_mutation_coverage()
+    assert {op for group in INT16_VOP3_GROUPS for op, _, _ in group} == set(pixel_aot.VOP3_INT16)
+    for group in range(4):
+        lowered = translate_int(int16_vop3_ops(group))
+        body = lowered.split("uint4 main", 1)[1]
+        # No old-value merge: the destination's high half is neither kept nor zeroed explicitly.
+        assert "0xffff0000u" not in body and "asfloat(0u | " not in body, group
+        assert body.count("uint i16s") == (8 if group < 3 else 4), group
+    prefix = ["v_mov_b32_e32 v18, s44", "v_mov_b32_e32 v19, s45"]
+    # An untracked destination and a sentinel destination lower alike; the destination value is never read.
+    fresh = translate_int(uncompressed_export([*prefix, "v_add_nc_u16 v30, v18, v19"])).split("uint4 main", 1)[1]
+    assert "0xffff0000u" not in fresh and "precise float alu" in fresh, fresh
+    # The _e64 spelling lowers to the same shader as the unsuffixed one.
+    plain = translate_int(uncompressed_export([*prefix, "v_add_nc_u16 v24, v18, v19"]))
+    assert translate_int(uncompressed_export([*prefix, "v_add_nc_u16_e64 v24, v18, v19"])) == plain
+
+    def refuse(line, message):
+        expect_value_error(translate_int, uncompressed_export([*prefix, line]), message)
+
+    for line in ("v_add_nc_u16 v24, v18, v19 op_sel:[0,0,1]", "v_add_nc_u16 v24, v18, v19 clamp",
+                 "v_add_nc_u16_dpp v24, v18, v19 quad_perm:[0,1,2,3]",
+                 "v_add_nc_u16_sdwa v24, v18, v19 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0",
+                 "v_mad_u16 v24, v18, v19, v18", "v_mad_i16 v24, v18, v19, v18", "v_add_f16_e64 v24, v18, v19"):
+        refuse(line, "Unsupported instruction")
+    refuse("v_add_nc_u16 v24, v18, -v19", "Unsupported 16-bit integer operand")
+    refuse("v_add_nc_u16 v24, v18, 1.0", "Unsupported 16-bit integer operand")
+    refuse("v_add_nc_u16 v24, v18, 0x10000", "16-bit literal out of range")
+    refuse("v_add_nc_u16 v24, v18, 65", "Unsupported 16-bit integer inline constant")
+    refuse("v_add_nc_u16 v24, v18, -17", "Unsupported 16-bit integer inline constant")
+    refuse("v_add_nc_u16 v24, v18, v200", "Untracked 16-bit source")
+    refuse("v_add_nc_u16 v24, v200, v19", "Untracked 16-bit source")
+    refuse("v_add_nc_u16 v256, v18, v19", "Register out of range")
+    refuse("v_add_nc_u16 v24, v256, v19", "Register out of range")
+    refuse("v_add_nc_u16 v24, s106, v19", "Register out of range")
+    # A destination with an outstanding sample is refused; the same op on a free register is accepted.
+    sample = next(i for i, line in enumerate(with_constants([])) if line.startswith("image_sample"))
+    overlap = with_constants([])
+    overlap.insert(sample + 1, "v_add_nc_u16 v12, 1, 2")
+    expect_value_error(translate, overlap, "Write overlaps an outstanding sample")
+    ok = with_constants([])
+    ok.insert(sample + 1, "v_add_nc_u16 v20, 1, 2")
+    translate(ok)
+    # The helper rejects a key it does not know instead of falling back to ashrrev.
+    try:
+        pixel_aot.pk_int16_lane_expr("bogus", ["a", "b"], [0, 0], False)
+    except ValueError as error:
+        assert "Unknown 16-bit integer op" in str(error), error
+    else:
+        raise AssertionError("pk_int16_lane_expr accepted an unknown op")
+
+    # Low16 results. The readers that see only bits 15:0 accept them: a chain of two ops, a 16-bit compare and a
+    # v_mov_b32_sdwa that selects WORD_0, BYTE_0 or BYTE_1 (also sign-extending).
+    low = [*prefix, "v_mov_b32_e32 v20, s46", "v_mov_b32_e32 v21, s47", "v_add_nc_u16 v24, v18, v19"]
+    add_index = with_constants(low).index("v_add_nc_u16 v24, v18, v19")
+    chain = translate_int(uncompressed_export([*low, "v_mul_lo_u16 v25, v24, v20"]))
+    assert f"uint i16s{add_index + 1}_0 = asuint(alu{add_index});" in chain, chain
+    compare = translate_int(uncompressed_export([*low, "v_cmp_lt_u16 vcc_lo, v24, v21"]))
+    assert f"bool cmp{add_index + 1} = (asuint(alu{add_index}) & 0xffffu) <" in compare, compare
+    translate_int(uncompressed_export([*low, "v_cmp_lt_i16 vcc_lo, v24, v21"]))
+    for selection in ("WORD_0", "BYTE_0", "BYTE_1"):
+        for source in ("v24", "sext(v24)"):
+            translate_int(uncompressed_export([*low, f"v_mov_b32_sdwa v25, {source} dst_sel:DWORD "
+                                                f"dst_unused:UNUSED_PAD src0_sel:{selection}"]))
+    # A padded write into a low16 destination (any dst_sel) is a defined word and is accepted.
+    translate_int(uncompressed_export([*low, "v_mov_b32_sdwa v24, v18 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD"]))
+
+    def refuse_low(line, message, *, extra=(), function=translate_int):
+        expect_value_error(function, uncompressed_export([*low, *extra, line]), message)
+
+    numeric = "Expected a numeric register"
+    undefined = "Reads the undefined high half of a 16-bit result"
+    # Whole-word readers: integer (int_operand), float (fp_operand), move, compare data, packed and conversions.
+    for line in ("v_add_nc_u32 v25, v24, v18", "v_xor_b32 v25, v24, v18", "v_add_nc_u32 v25, v18, v24",
+                 "v_mul_f32 v25, v24, v18", "v_mov_b32_e32 v25, v24", "v_cvt_f32_u32_e32 v25, v24",
+                 "v_cvt_f32_f16_e32 v25, v24", "v_cvt_off_f32_i4 v25, v24", "v_cvt_f32_ubyte0 v25, v24",
+                 "v_cmp_lt_u32 vcc_lo, v24, v18", "v_cmp_lt_f32 vcc_lo, v24, v18",
+                 "v_pk_add_u16 v25, v24, v18", "v_pk_add_f16 v25, v24, v18",
+                 "v_cmp_class_f16 vcc_lo, v24, v18", "v_cmp_class_f16 vcc_lo, v18, v24",
+                 "v_dot2_f32_f16 v25, v18, v19, v24"):
+        refuse_low(line, numeric)
+    refuse_low("v_cndmask_b32 v25, v24, v18, vcc_lo", numeric, extra=["v_cmp_lt_u32 vcc_lo, v18, v19"])
+    refuse_low("v_cndmask_b32 v25, v18, v24, vcc_lo", numeric, extra=["v_cmp_lt_u32 vcc_lo, v18, v19"])
+    refuse_low("v_add_f32_dpp v25, v24, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+               "Expected a numeric VGPR in DPP")
+    refuse_low("v_cvt_pkrtz_f16_f32_e32 v25, v24, v18", "Unsupported pack operand")
+    refuse_low("v_cvt_f16_f32 v24, v18", "Unsupported conversion destination")
+    # Exports: the compressed form needs the float target, the uncompressed form works on either.
+    for tail, function in (("exp mrt0 v24, v25, v26, v27 done vm", translate_int),
+                           ("exp mrt0 v24, v24, off, off done compr vm", translate)):
+        program = with_constants([*low])
+        end = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
+        program[end:] = [tail, "s_endpgm"]
+        expect_value_error(function, program, "Unsupported export")
+    # An image sample coordinate: v8 holds a low16 result when the sample reads it.
+    coordinate = with_constants([])
+    coordinate.insert(next(i for i, line in enumerate(coordinate) if line.startswith("image_sample")),
+                      "v_add_nc_u16 v8, 1, 2")
+    expect_value_error(translate, coordinate, "Unsupported texture coordinate")
+    # v_mov_b32_sdwa: every selection that reaches the undefined bits 31:16 is refused, as is merging with a low16
+    # destination.
+    for selection in ("WORD_1", "BYTE_2", "BYTE_3", "DWORD"):
+        for source in ("v24", "sext(v24)"):
+            refuse_low(f"v_mov_b32_sdwa v25, {source} dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:{selection}",
+                       undefined)
+    refuse_low("v_mov_b32_sdwa v24, v18 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD", undefined)
+    refuse_low("v_mov_b32_sdwa v24, v18 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_0", undefined)
+    # The same selections on a whole-word source and a preserve on a tracked destination stay accepted.
+    translate_int(uncompressed_export([*low, "v_mov_b32_e32 v26, s44",
+                                  "v_mov_b32_sdwa v25, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1",
+                                  "v_mov_b32_sdwa v26, v18 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD"]))
+
+
 # v_swap_b32: s44..s47 move to v18..v21 through float VGPRs, so every word is a normal binary32 pattern (no
 # subnormal, infinity or NaN) and the four words of a set are distinct.
 SWAP_WORDS = (
@@ -7267,6 +7503,7 @@ def check_controls(directory):
     must_reject(translate, base_m24[:lgkm] + ["v_mul_u32_u24_e64 v20, s44, 2"] + base_m24[lgkm:])
     wqm = base_m24.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base_m24[:wqm] + ["v_mul_hi_i32_i24_e64 v20, 1, 2"] + base_m24[wqm:])
+    check_int16_vop3_controls()
 
 
 def check_program_extent(directory, library):
@@ -7323,6 +7560,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((swap_ops(), translate_int))
     fixtures.extend((quadmask_bitreplicate_program(op), translate_int)
                     for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
+    fixtures.extend((int16_vop3_ops(group), translate_int) for group in range(4))
     fixtures.extend((scalar_bitset64(op, str(index)), translate_int)
                     for op in SCALAR_BITSET64_OPS for index in (0, 31, 32, 63, 64))
     fixtures.append((scalar_select64(), translate_int))
@@ -10111,6 +10349,76 @@ def check_swap_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutating {label} escaped detection")
 
 
+
+
+def check_int16_vop3_draw(directory, compiler, renderer, backend):
+    """The 12 non-packed 16-bit integer VOP3 ops, a low16 chain and 16-bit compares against the Python reference,
+    then mutations that must mismatch (one batch per mutation; the statuses are printed) and one that must be refused.
+
+    Only the zero-extended low half of each result is observed. Whether hardware keeps or zeroes the destination's
+    high half is not measured here, and the sentinel preloads do not detect a high-half leak.
+    """
+    check_int16_vop3_mutation_coverage()
+    source = directory / "int16_vop3.hlsl"
+    shader = directory / "int16_vop3.cso"
+
+    def build(text):
+        source.write_text(text, encoding="ascii")
+        compile_shader(compiler, source, shader)
+
+    def cases(group, tag):
+        paths = []
+        for idx, words in enumerate(INT16_VOP3_WORDS):
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *words)
+            expected = int16_vop3_reference(group, words)
+            path = directory / f"int16_vop3-{tag}-{group}-{idx}.case"
+            write_case(path, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+            paths.append(path)
+        return paths
+
+    def detected(group, label, text):
+        """Build the mutated shader and require at least one mismatching word set; print the statuses."""
+        build(text)
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, cases(group, "mut"))
+        print(f"int16_vop3 mutation {label}: group {group} statuses {statuses}")
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+    programs = [int16_vop3_ops(group) for group in range(4)]
+    lowered = [translate_int(program) for program in programs]
+    for group in range(4):
+        build(lowered[group])
+        run_pixel_batch(renderer, backend, shader, [(path, "pass") for path in cases(group, "ref")])
+    # (a) a source read from bits 31:16, applied to the first source word of every op in group 0.
+    mutated = re.sub(r"(uint i16s\d+_0 = )(.+);", r"\1((\2) >> 16u);", lowered[0])
+    assert mutated != lowered[0] and mutated.count(">> 16u);") == 4, "source half"
+    detected(0, "the source high half", mutated)
+    # (b) the 16-bit shift count masked to five bits instead of four.
+    mutated = lowered[2].replace("& 15u)", "& 31u)")
+    assert mutated != lowered[2] and mutated.count("& 31u)") == 3, "shift mask"
+    detected(2, "the 16-bit shift count mask", mutated)
+    # (c) signed min as unsigned min.
+    mutated_program = [line.replace("v_min_i16", "v_min_u16") for line in programs[1]]
+    assert mutated_program != programs[1], "signed min"
+    detected(1, "signed min as unsigned min", translate_int(mutated_program))
+    # (d) widening the low half with WORD_1 reads the undefined high half and must be refused at lowering.
+    refused = [line.replace("src0_sel:WORD_0", "src0_sel:WORD_1") for line in programs[0]]
+    assert refused != programs[0]
+    expect_value_error(translate_int, refused, "Reads the undefined high half of a 16-bit result")
+    # (e) a low16 result read through >> 16u: as the source of the chained op, and as the source of the first compare.
+    add_index = programs[3].index("v_add_nc_u16 v24, v18, v19")
+    chain_read = f"uint i16s{add_index + 1}_0 = asuint(alu{add_index});"
+    assert lowered[3].count(chain_read) == 1, chain_read
+    detected(3, "the low16 chain source", lowered[3].replace(
+        chain_read, f"uint i16s{add_index + 1}_0 = (asuint(alu{add_index}) >> 16u);"))
+    compare_index = programs[3].index("v_cmp_lt_u16 vcc_lo, v24, v21")
+    compare_read = f"bool cmp{compare_index} = (asuint(alu{add_index}) & 0xffffu) <"
+    assert lowered[3].count(compare_read) == 1, compare_read
+    detected(3, "the low16 compare source", lowered[3].replace(
+        compare_read, f"bool cmp{compare_index} = ((asuint(alu{add_index}) >> 16u) & 0xffffu) <"))
+
+
 def check_e64_render(directory, compiler, renderer, backend):
     """The e64 draw cases on their own, so they run as a separate CTest entry per backend. A renderer that reports an
     unavailable adapter (exit 77) makes this a skip, as for the other pixel draws."""
@@ -10144,7 +10452,7 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-compressed-export", "draw-title-loads"):
+                    "draw-mac-legacy", "draw-int16-vop3", "draw-compressed-export", "draw-title-loads"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -10158,6 +10466,7 @@ def main():
                         "draw-vop3-ternary-int": check_vop3_ternary_int_draws,
                         "draw-swap": check_swap_draw,
                         "draw-mac-legacy": check_mac_legacy_draws,
+                        "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-compressed-export": check_compressed_export_draw,
                         "draw-title-loads": check_title_load_draws}[mode]
                 return draw(directory, *args)
