@@ -2294,6 +2294,15 @@ Each comparison stores the selected operand's 32-bit pattern in the private
 LDS word. Their returning forms `ds_rsub_rtn_u32`, `ds_min_rtn_i32`,
 `ds_max_rtn_i32`, `ds_min_rtn_u32` and `ds_max_rtn_u32` also write the
 pre-update word to the destination VGPR.
+
+`ds_inc_u32` and `ds_dec_u32` update the private word using an unsigned
+limit from a VGPR. Increment resets to zero at or above the limit.
+Decrement resets to the limit when the old value is zero or exceeds it.
+`ds_wrap_rtn_b32` subtracts the limit at or above it and adds a second
+VGPR otherwise. The three returning forms copy the old word into their
+destination. The fixtures compare old and new words around zero and the
+limit and with high-bit values. Replacing the update with a read or no-op
+must mismatch at word 1.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The source-built wave32 fixture reads the full word and both halves after
