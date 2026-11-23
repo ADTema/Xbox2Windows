@@ -1,6 +1,7 @@
-// Desktop xgameruntime.dll skeleton. This file does not claim ABI completeness:
-// every public thunk below records its component and function, then returns
-// E_NOTIMPL until a real implementation lands.
+// Fixture-only desktop xgameruntime.dll skeleton. It is built into the test
+// fixture directory, never beside the normal shims, and does not claim ABI
+// completeness: every public thunk below records its component and function,
+// then returns E_NOTIMPL until a real implementation lands.
 //
 // The public names and signatures are taken from the Microsoft GDK reference:
 //   XUserAddAsync                       https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xuser/functions/xuseraddasync?view=gdk-2604
