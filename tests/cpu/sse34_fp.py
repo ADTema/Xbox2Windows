@@ -713,9 +713,7 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
                 enabled = {words[k] for k in range(lanes) if arg3 & (1 << k)}
                 if any(words[k] != 0 for k in range(lanes) if not (arg3 & (1 << k))):
                     bad = "disabled lane is not +0.0"
-                elif len(enabled) > 1:
-                    bad = "enabled lanes differ"
-                elif enabled and enabled.pop() not in allowed:
+                elif not enabled <= allowed:
                     bad = f"result not in architecturally allowed set {sorted(allowed)}"
             if bad:
                 raise AssertionError(
@@ -731,6 +729,25 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
                 f"expected={want.hex()} native={got_n.hex()} lifted={got_l.hex()}"
             )
         cases += 1
+
+    # A +4 pointer is readable but violates these legacy m128 instructions' alignment.
+    # A failing load cannot publish output. The ordinary aligned cases below still run.
+    for name, memory_argument in (("addsubps_mem_op", 1), ("addsubpd_mem_op", 1),
+                                  ("movsldup_mem_op", 0), ("movshdup_mem_op", 0)):
+        buffers = [_guarded_buf(bytes(16), align_offset=4 if j == memory_argument else 0)
+                   for j in range(2)]
+        args = [buffer[1] for buffer in buffers]
+        for dll in (native, lifted):
+            ctypes.memset(out_n, 0xAA, 16)
+            try:
+                getattr(dll, name)(*args, ctypes.addressof(out_n), 0)
+            except OSError as exc:
+                if "access violation reading 0xFFFFFFFFFFFFFFFF" not in str(exc):
+                    raise
+            else:
+                raise AssertionError(f"{name}: unaligned m128 load did not fault")
+            if bytes(out_n) != bytes([0xAA]) * 16:
+                raise AssertionError(f"{name}: failed load changed output")
 
     # 1. Binary SSE3 arithmetic (reg and aligned memory)
     for name in ("addsubps_op", "addsubps_mem_op", "haddps_op", "hsubps_op"):
