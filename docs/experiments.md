@@ -3417,7 +3417,7 @@ The meaning of the DWORD, the purpose of the other 28 bytes and the effect the c
 
 | CTest case | Inputs and checks |
 |---|---|
-| `cpu_native_configure_vm` | Each EXE imports exactly `D3D12ConfigureVirtualMemoryX` and `XMemVirtualAlloc` by name. With either stand-in missing, `pe_map` stops at that import before the entry point. Under the Windows loader and `pe_map`, both EXEs log the same three calls in order: the 32-byte snapshot, then both reservations with their size, type and the two remaining argument words. A success returns 0. A stand-in failure (`0x8007000E`) reaches the exit code unchanged after both reservations. A stand-in write inside or after the block exits with 1 or 2. |
+| `cpu_native_configure_vm` | Each EXE imports `D3D12ConfigureVirtualMemoryX`, `XMemVirtualAlloc` and the shared `finish_exe` by name. The native run starts a worker before process termination, and the mapped entry returns to its host. With either recording stand-in missing, `pe_map` stops at that import before entry. Both loaders log the same 32-byte snapshot and both reservations in order. A success returns 0. A stand-in failure (`0x8007000E`) reaches the exit code unchanged after both reservations. A stand-in write inside or after the block exits with 1 or 2. |
 
 Run `ctest --preset dev --no-tests=error -R '^cpu_native_configure_vm$' -V`.
 

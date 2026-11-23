@@ -2590,14 +2590,21 @@ if(EXISTS "${INTAKE_PYTHON}")
             MSVC_RUNTIME_LIBRARY MultiThreaded
             RUNTIME_OUTPUT_DIRECTORY "${configure_vm_dir}" ARCHIVE_OUTPUT_DIRECTORY "${configure_vm_dir}")
     endforeach()
+    set(configure_vm_io "${configure_vm_dir}/cpu_exe_io.dll")
+    add_custom_command(OUTPUT "${configure_vm_io}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${configure_vm_dir}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:cpu_exe_io>" "${configure_vm_io}"
+        DEPENDS cpu_exe_io VERBATIM)
+    add_custom_target(cpu_configure_vm_io DEPENDS "${configure_vm_io}")
     foreach(sample IN ITEMS 3 4)
-        add_executable(cpu_configure_vm_${sample} tests/cpu/configure_vm.asm)
+        add_executable(cpu_configure_vm_${sample} tests/cpu/configure_vm.asm tests/cpu/exe_startup.asm)
+        add_dependencies(cpu_configure_vm_${sample} cpu_configure_vm_io)
         target_compile_definitions(cpu_configure_vm_${sample} PRIVATE SAMPLE=${sample})
         set_target_properties(cpu_configure_vm_${sample} PROPERTIES LINKER_LANGUAGE CXX
             RUNTIME_OUTPUT_DIRECTORY "${configure_vm_dir}")
         target_link_options(cpu_configure_vm_${sample} PRIVATE
-            /ENTRY:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
-        target_link_libraries(cpu_configure_vm_${sample} PRIVATE cpu_configure_vm_d3d12_xs cpu_configure_vm_xmem)
+            /ENTRY:native_startup /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(cpu_configure_vm_${sample} PRIVATE cpu_configure_vm_d3d12_xs cpu_configure_vm_xmem cpu_exe_io)
     endforeach()
     add_test(NAME cpu_native_configure_vm COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/configure_vm_check.py" "$<TARGET_FILE:pe_map>"

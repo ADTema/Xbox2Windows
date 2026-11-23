@@ -30,7 +30,8 @@ def check(label, actual, expected):
 def imports_by_dll(image):
     with pefile.PE(str(image), fast_load=True) as pe:
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
-        return {module.dll.decode().casefold(): sorted(imp.name.decode() for imp in module.imports if imp.name)
+        return {module.dll.decode().casefold(): sorted(imp.name.decode() if imp.name else f"#{imp.ordinal}"
+                                                       for imp in module.imports)
                 for module in pe.DIRECTORY_ENTRY_IMPORT}
 
 
@@ -43,14 +44,15 @@ def expected_log(sample):
 
 
 def providers(directory):
-    return {name: ctypes.WinDLL(str(directory / name)) for name in ("d3d12_xs.dll", "xmem.dll")}
+    return {name: ctypes.WinDLL(str(directory / name))
+            for name in ("d3d12_xs.dll", "xmem.dll", "cpu_exe_io.dll")}
 
 
 def run(mapper_path, exe, mapped, hresult=0, write=0):
     with tempfile.TemporaryDirectory() as scratch:
         log = Path(scratch) / "calls.txt"
         env = dict(os.environ, CONFIGURE_VM_LOG=str(log), CONFIGURE_VM_HRESULT=hex(hresult),
-                   CONFIGURE_VM_WRITE=str(write))
+                   CONFIGURE_VM_WRITE=str(write), CPU_CRC_TEST_LIVE_WORKER="0" if mapped else "1")
         if mapped:
             child = subprocess.run([sys.executable, "-B", __file__, "--child", str(mapper_path), str(exe)],
                                    env=env, capture_output=True, text=True, timeout=20)
@@ -67,7 +69,8 @@ def compare(mapper_path, *exes):
     mapper_path = Path(mapper_path)
     for exe, sample in zip(map(Path, exes), (3, 4)):
         check(f"{exe.name} imports", imports_by_dll(exe),
-              {"d3d12_xs.dll": ["D3D12ConfigureVirtualMemoryX"], "xmem.dll": ["XMemVirtualAlloc"]})
+              {"d3d12_xs.dll": ["D3D12ConfigureVirtualMemoryX"], "xmem.dll": ["XMemVirtualAlloc"],
+               "cpu_exe_io.dll": ["finish_exe"]})
 
         # Each missing provider stops mapping before the entry point.
         for missing in ("d3d12_xs.dll", "xmem.dll"):
