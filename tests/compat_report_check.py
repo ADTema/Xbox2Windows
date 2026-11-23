@@ -10,7 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools" / "compat_report.py"
 sys.path.insert(0, str(ROOT / "tools"))
-from compat_report import POLICY_VERSION, classify  # noqa: E402
+from import_routing import POLICY_VERSION, classify  # noqa: E402
 
 
 SECTION_RVA = 0x1000

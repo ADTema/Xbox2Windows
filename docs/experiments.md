@@ -4302,6 +4302,14 @@ By default, the intake tool locates the Scarlett entry in the sole build's `Micr
 
 Each run writes a new JSON report in `out/intake/`. Exit codes are 3 for a missing layout executable, 2 for an input or inspection failure and 0 for completed inspection. The report links the previous verification time, torrent SHA-256, install chunks and baseline summary. The inspected torrent omitted the EXE. The 13,345 matching pieces and 223,880,932,870 bytes verified in the historical report cover that original payload. A later EXE needs separate provenance. Intake rescans the package PEs and lists changed DLLs.
 
+Every inventory import row, each `unresolved_edges` entry and each
+`entry_import_gaps` row carries `route`, `reason`, `route_kind`, `resolution`,
+`provider`, `stub` and `candidate_provider` from the shared
+`tools/import_routing.py` policy. `--require-routing` returns 1 and prints
+`unsupported: <caller> -> <dll>!<symbol>` for each reported import whose module
+route is unsupported; the default run keeps returning 0. These are candidate
+module routes only: no export is resolved and no provider is proven.
+
 For each candidate the tool records SHA-256, architecture, entry RVA and section, TLS directory and callback order, then compares imports, modules and unresolved items with the baseline. Source-built PE fixtures and a miniature torrent cover named, ordinal and delayed imports, import names that pefile rejects, missing providers, TLS callbacks, invalid callback addresses, truncation, an absent entry and path conflicts. These checks establish static properties. Authenticity and startup remain unverified.
 
 `pe.startup.locations` lists TLS callbacks in table order followed by the executable entry. Each location includes its RVA, section and file offset. When the x64 exception directory supplies a covering function interval, the report includes its inclusive start, exclusive end and unwind data RVA. A location can legitimately lack a covering record. An absent or unusable table leaves the independently observed startup locations available. In the local debug fixture the table had 110 records, one covering its TLS callback. The entry had no covering record. CTest cross-checks against pefile and exercises both absent and incomplete directories. [Microsoft x64 unwind data](https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64)
