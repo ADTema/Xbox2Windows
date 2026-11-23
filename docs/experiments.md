@@ -1683,6 +1683,48 @@ RTX 4060 and WARP.
 ctest --preset dev --no-tests=error -R "^mesh_depth_pair_" -V
 ```
 
+The lit mesh fixture reuses the indexed PARAM0 mesh program. The three vertex
+attributes are now normals whose x and y equal the vertex NDC position and
+whose z is 1/4. The source-built pixel program interpolates attr0. It loads a
+light direction and an ambient term from b0 at byte 0x80 and computes N·L with
+`v_mul_f32` and two `v_fmac_f32`. It clamps the result with `v_max_f32`, adds
+the ambient term and exports gray RGB with the interpolated constant one as
+alpha. The b0 bytes it reads are unused by the mesh program. The normals are not
+normalized: the fixture checks the dot product, the clamp and the attribute
+path, not a lighting model.
+
+The CPU reference evaluates N·L exactly at each pixel center of the 276 covered
+pixels and applies the round-toward-zero binary16 export and the 8-bit target.
+At pixel centers N·L is a multiple of 1/128, so with an ambient term of exactly
+1/4 every result is itself a binary16 value. On the RTX 3070, 133 of the 276
+interpolated results of the base draw were one or two binary32 ulps (at most
+2^-23) below that value. Round toward zero then dropped a whole binary16 step,
+which changed the 8-bit byte at 17 pixels. WARP interpolated every pixel center
+exactly. The ambient term is therefore 1/4 + 2^-17: every positive result lies
+at least 2^-17 from both neighbouring binary16 values, 64 times the observed
+error, and still exports the same binary16 value. The reference asserts this
+for every pixel. On RTX 3070 and WARP, with the debug layer enabled,
+three lights match every RGBA byte: the base light, a second light and the
+inverted base light. Three negative controls
+compare against the base reference:
+
+- **Inverted light:** the same shaders and normals with the light negated in b0.
+  All 276 covered pixels differ; the 748 clear pixels match.
+- **Ignored normal:** a pixel program that lights a fixed +Z normal (the
+  attribute's constant fourth component) gives 276 mismatches. It matches its
+  own flat-shaded reference.
+- **Missing clamp:** without `v_max_f32`, only the 132 covered pixels that face
+  away from the light differ. It matches its own unclamped reference.
+
+Each draw also checks the mesh export trace.
+
+![Base light, second light and inverted light references](mesh-lit-reference.png)
+
+```sh
+python3 -B tests/mesh_lit_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_lit_draw_" -V
+```
+
 A separate draw binds two immutable constant buffers through a shader-visible
 D3D12 table. The translated mesh reads depth from b0 and a horizontal offset
 from b1. The translated pixel stage reads a packed color from b0. Both draws
