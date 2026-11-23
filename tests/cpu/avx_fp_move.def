@@ -1,18 +1,5 @@
 LIBRARY cpu_avx_fp_move
 EXPORTS
-    op_vaddsubps_xmm_reg
-    op_vaddsubps_xmm_mem
-    op_vaddsubps_xmm_mem_plus1
-    op_vaddsubps_ymm_reg
-    op_vaddsubps_ymm_mem
-    op_vaddsubps_ymm_mem_plus1
-    op_vaddsubps_self
-    op_vaddsubpd_xmm_reg
-    op_vaddsubpd_xmm_mem
-    op_vaddsubpd_xmm_mem_plus1
-    op_vaddsubpd_ymm_reg
-    op_vaddsubpd_ymm_mem
-    op_vaddsubpd_ymm_mem_plus1
     op_vmovq_xmm_xmm
     op_vmovq_xmm_m64
     op_vmovq_m64_xmm

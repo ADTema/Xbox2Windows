@@ -1,4 +1,4 @@
-"""Lift bounded Windows x64 leaf functions with AVX FP add/sub and move forms to C++.
+"""Lift bounded Windows x64 leaf functions with AVX quadword/GPR and masked-byte moves to C++.
 
 Each export uses the leaf ABI void fn(word rcx, word rdx, word r8), where rcx,
 rdx and r8 carry flat host pointers to caller-owned buffers (rcx and rdx are
@@ -9,10 +9,10 @@ structs (four 64-bit lanes); every VEX.128 write to XMM0..XMM5 zeroes
 vmaskmovdqu, and 64-bit flat load/store glue.
 
 Supported AVX instructions (docs/coverage/x64_zen2.tsv group AVX):
-  - Packed alternating subtract/add: vaddsubps (XMM & YMM, reg & m128/m256),
-    vaddsubpd (XMM & YMM, reg & m128/m256)
-  - Quadword / GPR move: vmovq (all 5 VEX.128 operand shapes: xmm<-xmm,
-    xmm<-m64, m64<-xmm, xmm<-r64, r64<-xmm)
+  - Quadword / GPR move: vmovq across all four VEX.128 Code encodings
+    (VEX_VMOVQ_XMM_XMMM64, VEX_VMOVQ_XMMM64_XMM, VEX_VMOVQ_XMM_RM64,
+    VEX_VMOVQ_RM64_XMM) covering all 5 operand shapes (xmm<-xmm, xmm<-m64,
+    m64<-xmm, xmm<-r64, r64<-xmm)
   - Conditional byte store: vmaskmovdqu (VEX.128 xmm1, xmm2 to implicit [rdi],
     requiring rdi save/restore via a volatile scratch GPR around mov rdi, r8)
 
@@ -20,11 +20,12 @@ Transport/ABI glue: vmovups, vmovaps, vmovdqu, vmovdqa (128/256-bit load, store
 and register copy), vzeroupper, 64-bit mov (volatile GPR <-> [base + disp],
 volatile GPR reg-reg, and rdi save/set-to-r8/restore), and terminal ret.
 
-Legacy SSE forms (addsubps, addsubpd, movq, maskmovdqu), EVEX encodings,
-nonvolatile registers (XMM6..15, YMM6..15, RBX/RBP/RSI/R12..R15/RSP and
-unrestored or non-r8 RDI), non-argument memory bases, stores outside r8,
-unaligned vmovaps/vmovdqa memory operands, prefixes, RIP-relative addressing,
-branches, and trailing bytes after ret are rejected.
+Legacy SSE forms (movq, maskmovdqu), EVEX encodings, FP arithmetic
+(vaddsubps/vaddsubpd), nonvolatile registers (XMM6..15, YMM6..15,
+RBX/RBP/RSI/R12..R15/RSP and unrestored, non-r8, or leaked RDI), non-argument
+memory bases, stores outside r8, unaligned vmovaps/vmovdqa memory operands,
+prefixes, RIP-relative addressing, branches, and trailing bytes after ret are
+rejected.
 """
 
 import argparse
@@ -36,7 +37,6 @@ from iced_x86 import (
     Decoder,
     EncodingKind,
     MemorySizeExt,
-    Mnemonic as M,
     OpKind,
     Register as R,
     RegisterExt,
@@ -66,13 +66,6 @@ NONVOLATILE_GPR = {
     R.R13, R.R13D, R.R13L,
     R.R14, R.R14D, R.R14L,
     R.R15, R.R15D, R.R15L,
-}
-
-ADDSUB_SPECS = {
-    Code.VEX_VADDSUBPS_XMM_XMM_XMMM128: ("op_vaddsubps", False),
-    Code.VEX_VADDSUBPS_YMM_YMM_YMMM256: ("op_vaddsubps", True),
-    Code.VEX_VADDSUBPD_XMM_XMM_XMMM128: ("op_vaddsubpd", False),
-    Code.VEX_VADDSUBPD_YMM_YMM_YMMM256: ("op_vaddsubpd", True),
 }
 
 VMOVQ_CODES = {
@@ -105,8 +98,6 @@ FULL_VEC_STORE_CODES = {
 }
 
 LEGACY_SSE_REJECT_CODES = {
-    Code.ADDSUBPS_XMM_XMMM128,
-    Code.ADDSUBPD_XMM_XMMM128,
     Code.MOVQ_XMM_XMMM64,
     Code.MOVQ_XMMM64_XMM,
     Code.MOVQ_XMM_RM64,
@@ -122,7 +113,6 @@ ALLOWED_CODES = {
     Code.MOV_R64_RM64,
     Code.MOV_RM64_R64,
     Code.VEX_VMASKMOVDQU_RDI_XMM_XMM,
-    *ADDSUB_SPECS,
     *VMOVQ_CODES,
     *FULL_VEC_LOAD_CODES,
     *FULL_VEC_STORE_CODES,
@@ -132,14 +122,7 @@ ALLOWED_CODES = {
 PRELUDE = """#include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 #include <intrin.h>
-
-#if defined(_MSC_VER) && !defined(__clang__)
-#pragma fp_contract(off)
-#else
-#pragma STDC FP_CONTRACT OFF
-#endif
 
 extern "C" __declspec(dllexport) std::uint32_t host_has_avx() {
     int info[4]{};
@@ -200,61 +183,27 @@ static inline Vec256 copy128(const Vec256& v) {
     return {{v.q[0], v.q[1], 0ull, 0ull}};
 }
 
-static inline std::uint32_t lane32(const Vec256& v, unsigned i) {
-    return static_cast<std::uint32_t>(v.q[i >> 1] >> ((i & 1u) * 32u));
-}
-
-static inline void set_lane32(Vec256& v, unsigned i, std::uint32_t val) {
-    const unsigned shift = (i & 1u) * 32u;
-    v.q[i >> 1] = (v.q[i >> 1] & ~(0xffffffffull << shift)) | (static_cast<std::uint64_t>(val) << shift);
-}
-
-// Preserve x86 src1-first NaN quieting/precedence and real-indefinite QNaN on invalid ops.
-template <class Float, class Bits>
-static inline Bits fp_arith(Bits a, Bits b, bool is_add) {
-    const Bits quiet = static_cast<Bits>(1) << (std::numeric_limits<Float>::digits - 2);
-    Float x, y;
-    std::memcpy(&x, &a, sizeof(x));
-    std::memcpy(&y, &b, sizeof(y));
-    if (x != x) return a | quiet;
-    if (y != y) return b | quiet;
-    const Float r = is_add ? (x + y) : (x - y);
-    if (r != r) return static_cast<Bits>(~(quiet - 1));
-    Bits out;
-    std::memcpy(&out, &r, sizeof(out));
-    return out;
-}
-
-static inline Vec256 op_vaddsubps(const Vec256& a, const Vec256& b, bool wide) {
-    Vec256 out{};
-    const unsigned lanes = wide ? 8u : 4u;
-    for (unsigned i = 0; i < lanes; ++i) {
-        set_lane32(out, i, fp_arith<float, std::uint32_t>(lane32(a, i), lane32(b, i), (i & 1u) != 0u));
-    }
-    return out;
-}
-
-static inline Vec256 op_vaddsubpd(const Vec256& a, const Vec256& b, bool wide) {
-    Vec256 out{};
-    const unsigned lanes = wide ? 4u : 2u;
-    for (unsigned i = 0; i < lanes; ++i) {
-        out.q[i] = fp_arith<double, std::uint64_t>(a.q[i], b.q[i], (i & 1u) != 0u);
-    }
-    return out;
-}
-
 static inline void op_vmaskmovdqu(word address, const Vec256& src, const Vec256& mask) {
     std::uint8_t src_bytes[16]{};
     std::uint8_t mask_bytes[16]{};
     std::memcpy(src_bytes, src.q, 16);
     std::memcpy(mask_bytes, mask.q, 16);
     auto* dst = reinterpret_cast<volatile std::uint8_t*>(address);
+    // Native vmaskmovdqu faults if any byte of the 16-byte destination is outside
+    // writable memory (even when all mask MSBs are clear), leaving writable prefix
+    // bytes unmodified. Probe both 16-byte endpoints before any masked byte write.
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const std::uint8_t first = dst[0];
+    const std::uint8_t last = dst[15];
+    dst[0] = first;
+    dst[15] = last;
     for (unsigned i = 0; i < 16u; ++i) {
         if ((mask_bytes[i] & 0x80u) != 0u) {
             std::atomic_signal_fence(std::memory_order_seq_cst);
             dst[i] = src_bytes[i];
         }
     }
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 """
 
@@ -307,7 +256,7 @@ def flat_address(ins, clobbered_ptrs, *, expected_bytes=None, alignment=1, write
 
 
 def lift_code(name, start, raw):
-    """Decode and lift one bounded straight-line AVX FP add/sub and move leaf function."""
+    """Decode and lift one bounded straight-line AVX quadword and byte-masked move leaf function."""
     instructions = list(Decoder(64, raw, ip=start))
     if not instructions or instructions[-1].next_ip != start + len(raw):
         raise ValueError(f"truncated instruction stream in {name} at RVA {start:#x}")
@@ -351,6 +300,8 @@ def lift_code(name, start, raw):
             raise ValueError(f"expected GPR operand {op_index} at RVA {ins.ip:#x}: {ins}")
         reg_name = gpr64_name(ins.op_register(op_index), ins)
         if reg_name not in defined_gpr:
+            if reg_name in caller_rdi_holders:
+                raise ValueError(f"GPR {reg_name} holds saved rdi at RVA {ins.ip:#x}: {ins}")
             raise ValueError(f"undefined GPR {reg_name} at RVA {ins.ip:#x}: {ins}")
         used_gpr.add(reg_name)
         return reg_name
@@ -400,19 +351,6 @@ def lift_code(name, start, raw):
         elif ins.code == Code.VEX_VZEROUPPER:
             for idx in sorted(defined_vec):
                 statements.append(f"ymm{idx}.q[2] = 0ull; ymm{idx}.q[3] = 0ull;")
-
-        elif ins.code in ADDSUB_SPECS:
-            helper, wide = ADDSUB_SPECS[ins.code]
-            src1, _ = read_vec(1, ins, require_xmm=not wide)
-            if ins.op2_kind == OpKind.MEMORY:
-                expected = 32 if wide else 16
-                addr = flat_address(ins, clobbered_ptrs, expected_bytes=expected)
-                src2 = f"{'load256' if wide else 'load128'}({addr})"
-            else:
-                src2, _ = read_vec(2, ins, require_xmm=not wide)
-            dst_idx, dst, _ = write_vec(0, ins, require_xmm=not wide)
-            statements.append(f"{dst} = {helper}({src1}, {src2}, {'true' if wide else 'false'});")
-            defined_vec.add(dst_idx)
 
         elif ins.code in VMOVQ_CODES:
             if ins.op0_kind == OpKind.MEMORY:
@@ -490,6 +428,8 @@ def lift_code(name, start, raw):
                     dst_gpr = write_gpr(0, ins, scratch_only=True)
                     if "rdi" not in caller_rdi_holders:
                         raise ValueError(f"cannot save clobbered rdi at RVA {ins.ip:#x}: {ins}")
+                    # Caller's RDI is outside this ABI: keep dst_gpr only for RDI restoration.
+                    defined_gpr.discard(dst_gpr)
                     caller_rdi_holders.add(dst_gpr)
                 elif op0_reg == R.RDI:
                     if op1_reg == R.R8:

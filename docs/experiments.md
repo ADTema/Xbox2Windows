@@ -705,7 +705,7 @@ cmake --build --preset dev --target cpu_chained_lifted cpu_chained_jne_lifted cp
 ctest --preset dev --no-tests=error -R '^cpu_aot_chained_ranges$' -V
 ```
 
-The source-owned fixture has a primary interval, two levels of chaining and a neighboring export, built in `JE`, `JNE`, self-`XOR` zeroing, general 32-bit immediate (`edx`/`r8d`), and 32-bit immediate stack-frame (`sub`/`add rsp, 136`) variants. Both null inputs return 7 (or 0 in the `XOR`-zeroing variant), and two non-null inputs return 21. A Windows probe compares native returns with the generated result, physical RBX/RSI, and guards. A patched copy verifies version-2 chained header resolution. Negative controls cover broken and cyclic parent links, unsupported chained header versions and combined flags, an unsupported conditional branch after `TEST`, a non-self `XOR`, clobbering an unsaved callee-saved register with a 32-bit immediate, a stack frame exceeding 4096 bytes, jumps into a neighbor or instruction interior, and an indirect call.
+The source-owned fixture has a primary interval, two levels of chaining and a neighboring export, built in `JE`, `JNE`, self-`XOR` zeroing, 32-bit register write (`r8d`/`edx` with 64-bit `lea` offsets, so a missing zero extension changes the result), and 32-bit immediate stack-frame (`sub`/`add rsp, 136`) variants. Both null inputs return 7 (or 0 in the `XOR`-zeroing variant), and three non-null inputs (1, 2^64-1 and 2^32) return 21. A Windows probe compares native returns with the generated result, physical RBX/RSI, and guards. A patched copy verifies version-2 chained header resolution. Negative controls cover broken and cyclic parent links, unsupported chained header versions and combined flags, an unsupported conditional branch after `TEST`, a non-self `XOR`, clobbering an unsaved callee-saved register with a 32-bit immediate, a stack frame exceeding 4096 bytes, jumps into a neighbor or instruction interior, an indirect call, and three bound-callback misuses (a call through another table slot, a read of volatile RDX after the callback, and a reload of the callee's home slot after the callback).
 
 The translator reads each `MOV` memory operand once, in guest order, into a local declared at that point, through a `volatile` load: the original faults on an inaccessible operand even when the value is overwritten before use, and with an ordinary load an optimized MSVC build drops such a read. A load whose value nothing uses is written as the declaration followed by `static_cast<void>(...)`. Reads of the modelled stack slots are not emitted, and the table and allocator words that a bound callback or destroy call compares keep their ordinary read, since the comparison uses the value.
 
@@ -1039,6 +1039,8 @@ RDRAND and RDSEED are lowered only in an opt-in host-entropy profile, `lower(...
 
 CPUID and XGETBV are lowered only in an opt-in host-CPU profile, `lower(..., host_cpu=True)`; the default profile still rejects both. They report the host processor, not a console CPU: no guest feature table is applied, so translated code sees the host's feature bits. CPUID passes the guest EAX leaf and ECX subleaf to `__cpuidex` and writes all four results zero-extended. XGETBV passes ECX to `_xgetbv` unchanged and writes EDX:EAX zero-extended. Both keep the flags. The lowering executes whatever index the guest supplies, but the supported contract is narrower: the caller has checked CPUID.01H:ECX bit 27 (OSXSAVE), which the lowering does not check, and reads XCR0 (ECX = 0). Other indices are passed through without a supported contract. An index the host rejects faults as it does natively. Where the host supports XINUSE (ECX = 1), that read reports the host's current extended-state use, which this profile does not verify. A discarded CPUID stays in MSVC `/O2` code. A discarded XGETBV is removed there unless its result is `volatile`, which the lowering uses. `cpu_aot_cpuid` ([source](../tests/cpu/cpuid.asm)) and `cpu_aot_xgetbv` ([source](../tests/cpu/xgetbv.asm)) pin the thread to the logical processor it runs on, in its processor group, run every native and translated read and the harness reads they are compared with there, and restore the previous affinity afterwards, because some leaves, such as the APIC ID in leaf 01H EBX, differ per logical processor. For CPUID, EAX and ECX start with their upper halves set and RBX and RDX with all ones; for XGETBV, RAX and RDX start with all ones. The CPUID check covers leaves 00H, 01H, 04H, 07H, 0BH and 0DH, subleaves 0 and 1 where the leaf takes one, and 80000000H and 80000001H, up to the host's maximum leaves. Every result must equal the host's, read by a [native harness](../tests/cpu/cpuid_harness.asm), with zero upper halves and ZF and CF kept from four presets. A read whose result is overwritten must return the overwritten value, and the `/O2` walk below must still find it. The XGETBV check exits 77 without OSXSAVE before any XGETBV runs. It compares XCR0 only, the supported contract. A reserved index runs in a child process, where native and translated code must report the same fault; this checks fault passthrough only, not XINUSE. Controls mutate the generated C++ and must break a property: `noext` keeps an upper half, `swap` exchanges EBX and EDX (CPUID) or the two halves (XGETBV), `nosubleaf` drops ECX, `constant` returns a fixed result, and `flags` flips ZF and CF. `nosubleaf` is measurable only when a covered leaf differs between subleaf 0 and 1; otherwise `cpu_aot_cpuid` exits 77 after its other checks. The translations are also built with `cl /O2`. A walk that follows every branch must find each CPUID or XGETBV, including the discarded one, and XGETBV's `plain` control, without `volatile`, must lose the discarded read there. On a hybrid processor the values hold for the one logical processor the test ran on. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_(cpuid|xgetbv)$' -V`.
 
+LDMXCSR and STMXCSR with a 32-bit memory operand are lowered only in an opt-in host-MXCSR profile, `lower(..., host_mxcsr=Mxcsr(reject))`; the default profile still rejects both, and the VEX forms stay rejected. LDMXCSR checks the requested word before it reaches the host register: a reserved bit (16 to 31), an unmasked exception (one of bits 7 to 12 clear), and FTZ (bit 15) or DAZ (bit 6) leave the lowered function through `reject` with the statuses 1, 2 and 3 of `MXCSR_STATUS`, and no later guest instruction runs. The word is read as a guest operand, so an inaccessible one faults before anything is loaded. A word that passes, with any rounding control and any sticky flags, is loaded with `_mm_setcsr`. STMXCSR stores `_mm_getcsr()`. The Windows x64 profile is opt-in for leaf fixtures. The caller supplies an initial MXCSR with all exceptions masked and DAZ and FTZ clear. Rounding control and sticky flags may vary. A lowered function with this profile runs inside `mxcsr_entry`, which saves the caller's whole MXCSR and restores it in a `__finally`: on a normal return, after a refusal, and when a structured exception such as a guest memory fault leaves the body. `<name>_status()` returns the refusal status of the calling thread's last call, or zero after normal return or a propagated memory fault. A file that uses the profile starts with `#pragma fenv_access(on)`, so the compiler keeps float operations after the `_mm_setcsr` that changes their rounding. `cpu_aot_mxcsr` ([source](../tests/cpu/mxcsr.asm)) loads every rounding control, with and without the six sticky flags. It sets a non-default caller word first: round toward zero with the precision flag set. For operands the test writes at run time, an ADDPS of 1 + 0.75 ulp and its negation, two halfway cases (1 + 0.5 ulp and (1 + 1 ulp) + 0.5 ulp, which to-nearest-even rounds in opposite directions) and a CVTSS2SI of 2.75 and -2.75 give a different result in each mode. The translation must match native execution and fixed expectations. STMXCSR must read back the loaded control bits and the requested sticky flags, the bytes next to every stored word must stay unchanged, and the caller's word must be back afterwards. The translated entry must also restore the caller's word when the guest returns without restoring it, after the four refused words, and when a guest load faults, both at the LDMXCSR operand and later. A refusal status stays with its thread while another thread calls the same entry successfully. The refused words must stop the guest before its next store. The native LDMXCSR of a reserved bit raises a #GP, which Windows reports as an access violation; it is a reference observation, not the promised status of the translated entry. Two controls must break a rule: `noload` checks the word but never loads it, and `fixed` stores 0x1F80 from STMXCSR. The default profile must refuse each LDMXCSR and STMXCSR of the fixture on its own. The translation is also built with `cl /O2`, must keep every rule there, and every export must still reach at least its source's LDMXCSR and STMXCSR. FTZ and DAZ, the VEX forms and unmasked exceptions are outside this profile. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_mxcsr$' -V`.
+
 The RCX-counted branches `loop`, `loope`, `loopne` and `jrcxz` lower to a decrement and a conditional `goto`, and so do their 67h forms, which count in ECX. The behaviour is as follows:
 - None of them changes a flag.
 - `loope` and `loopne` test ZF after the decrement.
@@ -1139,6 +1141,8 @@ VEX 128-bit and 256-bit AVX packed sign/zero-extend, horizontal integer add/sub,
 
 VEX 128-bit and 256-bit AVX horizontal floating-point add and subtract forms (`vhaddps`, `vhaddpd`, `vhsubps`, `vhsubpd`) are also lowered for `EncodingKind.VEX` using 128-bit SSE3 intrinsics per lane while zeroing upper YMM bytes for 128-bit destinations, supporting unaligned `m128`/`m256` memory sources, and rejecting EVEX, non-VEX, and untracked register encodings. `cpu_aot_avx_horiz_fp` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it builds all 22 exports from MASM source (`tests/cpu/avx_horiz_fp.asm`), translates them, compares exact 32-byte outputs (including upper-16-byte zeroing, unaligned memory sources, register aliasing, QNaN/SNaN payloads, signed zeros, infinities, subnormals, and 7 MXCSR rounding/DAZ/FTZ modes) against both the native DLL and an independent IEEE-754 Python reference, and verifies rejection and mutated controls. Run `cmake --build --preset dev --target cpu_avx_horiz_fp_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_horiz_fp$' -V`.
 
+VEX 128-bit and 256-bit AVX alternating floating-point add and subtract forms (`vaddsubps`, `vaddsubpd`) use the same per-lane lowering with `_mm_addsub_ps` and `_mm_addsub_pd`: even-indexed elements compute `a - b` and odd-indexed elements compute `a + b` in each 128-bit lane, 128-bit destinations zero upper YMM bytes, unaligned `m128`/`m256` memory sources are accepted, and untracked registers, segment prefixes and EIP-relative operands are rejected. `cpu_aot_avx_addsub_fp` builds 14 exports from MASM source (`tests/cpu/avx_addsub_fp.asm`), exits 77 on hosts without AVX, and compares exact 32-byte outputs (register and memory forms, register aliasing, QNaN/SNaN payloads in either operand, signed-zero cancellation in the add and subtract positions, infinities, overflow, subnormals and the same 7 MXCSR rounding/DAZ/FTZ modes) against both the native DLL and the IEEE-754 reference model shared with `cpu_aot_avx_horiz_fp`. Three mutated controls (all-add, all-subtract and a missing upper-byte clear) must mismatch. Run `cmake --build --preset dev --target cpu_avx_addsub_fp_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_addsub_fp$' -V`.
+
 VEX 128-bit and 256-bit AVX packed shifts, saturating packs, unpacks, shuffles, integer blends, `vpmovmskb`, and `vpextr*`/`vpinsr*` forms (`vpsllw`/`d`/`q`, `vpsrlw`/`q`, `vpsraw`/`d`, `vpslldq`, `vpacksswb`/`dw`, `vpackuswb`/`dw`, `vpunpckl*`/`h*`, `vpshufd`/`lw`/`hw`, `vpblendw`, `vpblendvb`, `vpmovmskb`, `vpextrb`/`w`/`d`/`q`, `vpinsrb`/`w`/`d`/`q`) are also lowered for `EncodingKind.VEX` while zeroing upper YMM bytes for 128-bit destinations and rejecting EVEX encodings. `cpu_aot_avx_int_shifts_pack` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it compares the 34 XMM cases in `tests/cpu/avx_int_shifts_pack.asm` against native 32-byte and scalar outputs and rejects EVEX and unmodeled registers. Its `vpsrlw` memory-count control uses the low 64 bits of a readable 128-bit operand and requires a fault before writing output when the higher eight bytes cross into an inaccessible page. On AVX2 hosts a YMM memory `vpshufd` checks the two 128-bit lanes against distinct expected bytes. Run `cmake --build --preset dev --target cpu_avx_int_shifts_pack_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_int_shifts_pack$' -V`.
 
 VEX 128-bit and 256-bit AVX broadcast, lane extract/insert, permute, shuffle, unpack, blend, dot-product, round, and `vzeroall` forms (`vbroadcastss`/`sd`/`f128`, `vextractf128`, `vinsertf128`, `vperm2f128`, `vpermilps`/`pd`, `vshufps`/`pd`, `vunpcklps`/`hps`/`lpd`/`hpd`, `vmovddup`/`sldup`/`shdup`, `vblendps`/`pd`/`vps`/`vpd`, `vdpps`/`pd`, `vroundps`/`pd`, `vzeroall`) are also lowered for `EncodingKind.VEX` while rejecting MXCSR rounding mode (`imm8 & 4 != 0`). `cpu_aot_avx_shuffle_blend` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it builds all 27 exports from MASM source (`tests/cpu/avx_shuffle_blend.asm`), translates them, compares exact 32-byte outputs against the native DLL, and checks that MXCSR-mode `vroundps` is rejected. The XMM memory form of `vmovddup` is also run with exactly eight readable bytes before a guard page. The `vdpps` cancellation case checks pairwise rounding. For multiple NaN inputs the selected lanes must be NaN, while the other lanes are compared bit for bit. Run `cmake --build --preset dev --target cpu_avx_shuffle_blend_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_shuffle_blend$' -V`.
@@ -1146,6 +1150,8 @@ VEX 128-bit and 256-bit AVX broadcast, lane extract/insert, permute, shuffle, un
 VEX 128-bit and 256-bit AVX conversion, compare, flag-test, and aligned or unaligned move forms (`vcvtdq2ps`/`pd`, `vcvtps2dq`/`pd2dq`, `vcvttps2dq`/`ttpd2dq`, `vcvtps2pd`/`pd2ps`, `vcvtsi2ss`/`sd`, `vcvtss2sd`/`sd2ss`, `vcvtss2si`/`sd2si`, `vcvttss2si`/`ttsd2si`, `vcmpps`/`pd`/`ss`/`sd`, `vptest`, `vtestps`/`pd`, `vmovaps`/`apd`/`dqa`, `vlddqu`) are also lowered for `EncodingKind.VEX` while rejecting EVEX encodings. `cpu_aot_avx_cvt_cmp_test` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it builds the exports from MASM source (`tests/cpu/avx_cvt_cmp_test.asm`), translates them, compares exact 32-byte/scalar outputs and all four `(ZF, CF)` outcomes of `vptest`/`vtestps`/`vtestpd` against the native DLL, and checks that EVEX `vcvtdq2ps` and streaming `vmovntdqa` are refused. Compare predicates use all five immediate bits. The fixture checks the four MXCSR rounding modes for float-to-integer conversions and distinguishes the signaling predicate using both the output bits and the invalid flag. Run `cmake --build --preset dev --target cpu_avx_cvt_cmp_test_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_cvt_cmp_test$' -V`.
 
 VEX AVX scalar floating-point, half-register move, `vinsertps`/`vextractps`, and `vcomiss`/`vucomiss`/`vcomisd`/`vucomisd` forms (`vaddss`/`sd`, `vsubss`/`sd`, `vmulss`/`sd`, `vdivss`/`sd`, `vsqrtss`/`sd`, `vminss`/`sd`, `vmaxss`/`sd`, `vroundss`/`sd`, `vmovss`, `vmovhlps`/`lhps`/`lps`/`hps`/`lpd`, `vinsertps`, `vextractps`, `vcomiss`/`sd`, `vucomiss`/`sd`) are also lowered for `EncodingKind.VEX` while zeroing upper YMM bytes and rejecting EVEX encodings and MXCSR rounding mode. `cpu_aot_avx_scalar_fp` probes CPUID leaf 1 ECX bits 27 (`OSXSAVE`) and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without AVX; on AVX-capable hosts it builds all 27 exports from MASM source (`tests/cpu/avx_scalar_fp.asm`), translates them, compares exact 32-byte/scalar outputs and all four ordering outcomes (`<`, `==`, `>`, unordered) against the native DLL, and checks that EVEX `vaddss` is rejected. Separate raw-bit checks cover quieting signaling NaNs for scalar round and the effect of DAZ on scalar min/max and round-down. In masked mode the COMI and UCOMI checks compare the MXCSR invalid flag for signaling and quiet NaNs. Run `cmake --build --preset dev --target cpu_avx_scalar_fp_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_scalar_fp$' -V`.
+
+The shared lowerer accepts legacy XMM packed compares (`cmpps` and `cmppd`), low and high 64-bit memory moves (`movlps`/`movhps` and `movlpd`/`movhpd`), and aligned XMM moves (`movaps`, `movapd` and `movdqa`). The compares use the low three immediate bits and the corresponding SSE intrinsic. Legacy memory compares and aligned moves enforce 16-byte alignment. Half moves access exactly eight bytes and preserve the other half of a destination register. `cpu_aot_sse2_packed_cvt` compares all 22 source-built exports with the native DLL. It includes register and memory packed-double comparisons and rejects a compare that writes nonvolatile XMM6. Separate controls verify packed conversions under round-down and round-toward-zero and scalar min with DAZ enabled. They restore the caller's MXCSR after the comparison. Run `cmake --build --preset dev --target cpu_sse2_packed_cvt_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_sse2_packed_cvt$' -V`.
 
 ## Recompiling a direct x64 call
 
@@ -1299,10 +1305,10 @@ The record then clears EAX. The model compares with the `Fraction` model of `cpu
 
 Two native-only exports read bits that the profile does not know. One stores the whole status word after `fcom`. Over 1759 runs its known bits matched the model, and the other bits took 0x0000, 0x0001 (IE) and 0x0002 (DE). The other is the branch export with `test al, 1` (IE) on the C3 successor, after `fucom`. An unordered `fucom` left IE clear for a quiet NaN and set for a signaling NaN, so the byte does not follow from C0, C2 and C3. Translation rejects both, at the store of AX and at `test al, 1`.
 
-Translation rejects 32 more sequences:
+Translation rejects 35 more sequences:
 - condition bits that are unknown at the reader: `fnstsw ax` without a comparison, or after `fadd`, `fld` and `fstp`, `fnstcw`, `wait` (`fstsw ax`), a second `fnstsw ax` or a call, and after a join where one path skips the comparison;
 - the review's control, a branch whose other successor tests C1;
-- direct reads of unknown bits: `test al, 1`, `test ax, 4500h`, `and ah, 47h` with a store of AH, a store of AX, a return (also in the checked entry after `fldcw`) and an external edge with the status word in AX;
+- direct reads of unknown bits: `test al, 1`, `test ax, 4500h`, `and ah, 47h` with a store of AH, a store of AX, a return (also in the checked entry after `fldcw`), an external edge or a direct call with the status word in AX, a store of AH after a join where one path skips `and ah, 45h`, and `test eax, eax` after `mov al, 0`;
 - PF: `jp` after `fucomi` and `inc eax`, after `cmp` or after `test eax, eax`, or before any flag writer, `sahf` in a function without x87 instructions, and `lahf`;
 - forms outside the profile: `fnstsw` with an m16 operand, the `fcom` and `fcomp` alias encodings DC D1, DC D9 and DE D1, `fsincos`, `fpatan` and `fldenv`, and comparisons without enough stack values.
 
@@ -2418,12 +2424,20 @@ the readback.
 ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_wide_replacement_(warp|hardware)$' -V
 ```
 
-Five private qword updates operate on an initialized pair of record slots
+Ten private qword updates operate on an initialized pair of record slots
 at byte offset 0 or 8. `ds_add_u64`, `ds_sub_u64` and `ds_rsub_u64` update
-modulo 2^64 using a low-word carry or borrow. `ds_and_b64` and `ds_or_b64`
-update both words independently. Fixtures read back the pair at offset 8
-and cover both outcomes of the carry and borrow tests. Discarding carry or
-borrow, or interchanging the bitwise operations, must change the readback.
+modulo 2^64 using a low-word carry or borrow. `ds_and_b64`, `ds_or_b64` and
+`ds_xor_b64` update both words independently. `ds_min_i64`, `ds_max_i64`,
+`ds_min_u64` and `ds_max_u64` compare the high words first, signed for the
+i64 forms and unsigned for the u64 forms, then compare the low words when
+the high words are equal. Fixtures read back the pair at offset 8 and cover
+both outcomes of the carry, borrow and comparison tests. The min/max fixtures
+alternate the prior high word between `0x7fffffff` and `0x80000000`: even lanes
+cross the signed boundary, while odd lanes repeat the high word so the
+low-word tie-break applies. Swapping signed and unsigned comparisons must
+mismatch word 0; dropping the low-word comparison must mismatch word 34 for
+min and word 2 for max. Discarding carry or borrow, interchanging the bitwise
+operations, or replacing min with max must also change the readback.
 Run these variants with `ctest --preset dev --no-tests=error -R
 '^compute_store_aot_lds_qword_(warp|hardware)$' -V`.
 
@@ -3122,6 +3136,24 @@ An `ALTER_IMM` variant changes the `cmppd` predicates of `op_cmppd_1` (1 to 5), 
 
 Not covered by this experiment: the 36 reserved SSE2 forms, MMX-domain operands and `maskmovdqu`, control flow or calls mixed with SSE2 state, nonvolatile `XMM6`..`XMM15` save/restore prologues, faults caused by violating the aligned-base or valid-buffer preconditions, and non-temporal caching effects, and title CPU code execution.
 
+## MMX/SSE2 conversion and bridge leaf recompilation
+
+[The MMX/SSE2 bridge translator](../tools/cpu_mmx_sse2_aot.py) lifts bounded straight-line Windows x64 leaf functions covering `cvtpd2pi`, `cvttpd2pi`, `movdq2q`, `movq2dq` (`SSE2`) and `emms` (`MMX`), alongside `movdqa`, `movdqu`, `movq` (between `mm`, volatile scratch `r64` `rax`/`r9`/`r10`/`r11`, and flat `[rcx|rdx|r8]` memory) and `ret`.
+
+Call with an empty x87 stack, no live MMX values, and default MXCSR controls (round-to-nearest-even, all exceptions masked, DAZ and FTZ off). The leaf ABI compares the output bytes. Floating-point status flags and physical x87 tag transitions are outside this profile. The caller provides valid buffers and a 16-byte-aligned base for each aligned memory operand.
+
+- `XMM0`..`XMM5` are modeled as `Vec128` (`std::uint64_t q[2]`) and `MM0`..`MM7` as `std::uint64_t mm[8]`.
+- `mmx_active` is tracked across the function; any `MM` register touch activates it, `emms` clears it (and invalidates prior `MM` definitions) unconditionally, and `ret` rejects if `mmx_active` remains true.
+- `cvtpd2pi` (round-to-nearest-even) and `cvttpd2pi` (truncate toward zero) lower to portable `<cmath>`/`<cstdint>`/`<cstring>` helpers returning `0x80000000` on NaN, `+/-Inf`, or out-of-`int32_t` range after rounding. `movq2dq` zeroes `xmm[127:64]`.
+- Memory operands must be flat `[base + disp]` rooted in `rcx`, `rdx` or `r8`, memory stores are restricted to `r8`, and `cvtpd2pi`/`cvttpd2pi` `m128` and `movdqa` require `disp % 16 == 0`. VEX/EVEX encodings, `xmm6`..`xmm15`, nonvolatile/argument GPRs, undefined registers, prefixes and unsupported instructions reject.
+
+```powershell
+cmake --build --preset dev --target cpu_mmx_sse2_original cpu_mmx_sse2_original_lifted cpu_mmx_sse2_altered cpu_mmx_sse2_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_mmx_sse2$' -V
+```
+
+[The MASM fixture](../tests/cpu/mmx_sse2.asm) builds 12 exports covering register and displaced-memory `cvtpd2pi`/`cvttpd2pi`, `movdq2q`, dirty-seeded `movq2dq`, standalone `emms`, `movq` (`mm`/`r64`/`[rcx|r8]`), aligned `movdqa`, unaligned `movdqu` and a chained bridge re-entering MMX after `emms`. [The check script](../tests/cpu/mmx_sse2_check.py) verified 210 native/lifted/reference differential cases (including `2147483647.5`, `2147483648.0`, `-2147483648.5`, `-2147483649.0`, `+/-0.0`, `+/-Inf` and NaNs), an `ALTER_IMM` variant swapping `cvtpd2pi`/`cvttpd2pi` (diverging on 4 cases each), an output-mutation negative control, 8 alternate-encoding lift checks, 46 unit rejections and 9 PE-patched DLL rejections. Not covered: remaining `MMX`/`SSE2` forms outside these 5 ops, control flow/calls, x87/MMX aliasing across calls, and title CPU code execution.
+
 ## D3D12 pixel-position inputs
 
 `pixel_position_centers` compiles a standalone Shader Model 6.0 pixel shader. Its inputs are `float4 TEXCOORD0` and `float4 SV_Position`, in the order emitted by the existing full-screen vertex shader. Red and green depend only on `SV_Position`. The test reads an 8×8 RGBA32F target with a 5×3 viewport at (2, 1). The CPU reference expects red and green to contain the absolute pixel center coordinates, with a half-pixel offset on each axis. The other 49 pixels retain the clear color. A second shader exchanges red and green and must first disagree at (2, 1), where the expected coordinates are (2.5, 1.5). [HLSL system-value semantics](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-semantics)
@@ -3371,6 +3403,8 @@ Scalar comparison lowering covers 18 RDNA2 SOPC instructions: 32-bit signed comp
 
 Scalar ALU instructions act on uniform 32-bit values: immediates, loaded constant words and earlier scalar results. Each result becomes an HLSL `uint` local, and a vector move or operand reads it through `asfloat`. Supported forms are `s_add_u32`, `s_sub_u32`, `s_add_i32`, `s_sub_i32`, `s_absdiff_i32`, `s_mul_i32`, `s_min_u32`, `s_max_u32`, `s_min_i32`, `s_max_i32`, `s_and_b32`, `s_or_b32`, `s_xor_b32`, `s_andn2_b32`, `s_orn2_b32`, `s_not_b32`, `s_nand_b32`, `s_nor_b32`, `s_xnor_b32`, `s_lshl_b32`, `s_lshr_b32`, `s_ashr_i32`, the scaled addition family (`s_lshl1_add_u32`, `s_lshl2_add_u32`, `s_lshl3_add_u32`, `s_lshl4_add_u32`), the six `s_cmp_*_i32` and six `s_cmp_*_u32` relations, and `s_cselect_b32`, besides the existing `s_mov_b32` and `s_movk_i32`. SCC follows the RDNA definitions: carry or borrow for the unsigned add, shifted additions and subtract, signed overflow for the signed ones, the comparison for min, max and `s_cmp_*`, and a nonzero result for the bitwise, shift, and absolute difference forms. For `s_lshl<K>_add_u32`, SCC records whether the 64-bit sum `(S0 << K) + S1` generated a carry out of bit 31, evaluated in 32-bit unsigned arithmetic as `(S0 >> (32 - K) != 0) || (dest < S1)`. `s_mul_i32` leaves it unchanged. A shift uses the low five bits of its count. `s_cselect_b32` is rejected unless the lowerer saw SCC written, and `s_wqm_b64` and the exec restore clear the tracked SCC. Scalar results are not folded to constants, so they cannot supply a texture address or sampler word. Carry-in, 64-bit, high-half multiply, bitfield, `s_cmpk_*`, `s_bitcmp*` and `s_cmov*` forms remain unsupported. The draw test packs 23 SCC outcomes and a 17-bit hash of the 32-bit results into four channels, ten bits each, exported as 1 + k/1024, which binary16 holds exactly. The program is drawn with two sets of constant words, including negative and sign-bit inputs, and every select takes a different arm between the sets. A CPU interpreter written from the instruction definitions supplies the expected color. Replacing `s_ashr_i32` with `s_lshr_b32`, `s_cmp_lt_i32` with `s_cmp_lt_u32`, `s_nand_b32` with `s_and_b32`, `s_nor_b32` with `s_or_b32`, `s_xnor_b32` with `s_xor_b32`, or swapping the subtraction's sources must produce a mismatch. In addition, `check_lshl_add_u32_draw` verifies `s_lshl[1-4]_add_u32` end-to-end via `R32G32B32A32_UINT` readback across small values, shift-wrap, and add-wrap arithmetic cases, alongside selective SCC carry-out cases through `s_cselect_b32`; corrupted expectation words and inverted carry flags report pixel mismatches. `check_absdiff_i32_draw` verifies `s_absdiff_i32` end-to-end via `R32G32B32A32_UINT` readback across positive, negative, zero (clearing SCC), double-negative, mixed-sign, INT_MIN edge, and (2^31, 2^32) overflow-wrap cases alongside SCC nonzero checks; corrupted expectation words report pixel mismatches.
 
+`s_add_i32` sets SCC on signed overflow, which the lowerer computes as `((a ^ r) & (b ^ r)) >> 31`: the result's sign differs from both operands. The earlier form `(~(a ^ b) & (a ^ r)) >> 31` is the same function, and DXC 1.7.2308 emits plain `add i32` (no `nsw`) for both, but an NVIDIA GeForce RTX 3090 (`10de:2204`, driver 32.0.16.1664, debug layer enabled, Windows 11 build 26300) returned SCC 0 for `0x7fffffff + 5` with it, so `pixel_aot_blend_scalar_hardware` reported `pixel_mismatch` on SCC flag bit 2 (channel 0 `3fa04000`, expected `3fa0c000`) while WARP passed. With the current form both pass. `s_sub_i32` keeps its form, which passed its overflowing case on the same adapter. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_blend_scalar_(hardware|warp)$' -V`.
+
 The `s_bcnt0_i32_b32` and `s_bcnt1_i32_b32` instructions count zero or one bits in a 32-bit scalar. Their `b64` forms count across an SGPR pair. All four set SCC when the count is nonzero. The predicate and rounding draw checks the count and SCC against a Python reference and rejects a 64-bit count that ignores the upper word.
 
 `s_bfe_u64` and `s_bfe_i64` extract a field from two scalar dwords. The control supplies the offset in bits 5:0 and the width in bits 22:16. An empty field returns zero. A field extending past bit 63 stops at bit 63, and the signed form extends the top bit of the resulting field. The lowerer reuses the two-dword shifts and sets SCC when either result word is nonzero. The source-built test uses raw UINT readback to check both words and SCC independently. Cases include an extraction across the dword boundary, a result with only its high word set, and offsets and widths at their limits. The signed and unsigned draws each require a mismatch against the other's cross-dword reference. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_blend_scalar_(warp|hardware)$' -V`. [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
@@ -3560,6 +3594,7 @@ ctest --preset dev --no-tests=error -R '^pixel_aot_smem_pointers_warp$' -V
 Before a single sample, whole-quad addition, FMA and legacy multiplication can compute affine coordinates from paired interpolation and ready uniform constants. Each coordinate used for implicit LOD must have a value defined on helper lanes. An entry-only write results in a value without that proof, and multiplication of two varying operands, absolute value and saturation fall outside the affine subset. The source-built draw checks a partial triangle on an 8×8 target with two solid-color mips. WARP and RTX 5080 select mip 1 at every covered pixel and preserve clear color outside the triangle. Replacing helper coordinates with the quad's top-left coordinates changes the first mismatched pixel at (6, 0) to mip 0 on both adapters.
 
 `v_cmp_class_f32` is true when the class of S0 is in the 10-bit mask S1, with the bits of LLVM's `SIInstrFlags::ClassFlags`: signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal and +inf. The lowering classifies the raw binary32 encoding, so desktop denormal handling does not change the class. The mask may be an inline constant, a literal or a register. The draw classifies +inf against the +inf bit, a quiet NaN against both NaN bits, -0 against the +0 bit and the smallest positive denormal against its bit, and selects 1.0 or 0 for each. A reference with any single result flipped must report a mismatch. Signaling NaN inputs are not drawn, and whether Scarlett classifies a denormal input without flushing it first is not measured.
+Quad-local `DPP16` (`quad_perm` with `row_mask:0xf` and `bank_mask:0xf`) and quad-local `DPP8` (`dpp8` repeating the same 2×2 quad permutation on lanes 0–3 and 4–7) forms for the remaining extra `f32` (`v_rndne_f32_dpp`, `v_sin_f32_dpp`, `v_cos_f32_dpp`, `v_rcp_iflag_f32_dpp`, `v_frexp_mant_f32_dpp`, `v_frexp_exp_i32_f32_dpp`, `v_mac_f32_dpp`), carry-in/carry-out (`v_add_co_ci_u32_dpp`, `v_sub_co_ci_u32_dpp`, `v_subrev_co_ci_u32_dpp`), and `gfx1030` integer dot-accumulate (`v_dot4c_i32_i8_dpp` and plain VOP2 e32 `v_dot4c_i32_i8_e32`) instructions lower via the shared SM 6.0 quad intrinsics (`QuadReadAcross*`, `QuadReadLaneAt`, `WaveGetLaneIndex() & 3u`) and helpers on raw 32-bit `uint` bits. `v_sin_f32_dpp` and `v_cos_f32_dpp` lower through `sin32`/`cos32` (with `turns()` range reduction matching plain `v_sin_f32`/`v_cos_f32`), and `v_mac_f32_dpp` lowers through `mad32` (unfused, denormal-flushing multiply-add matching plain `v_mac_f32`). Carry-in/carry-out forms read and update the tracked `vcc` per-lane condition; `DPP16` source modifiers (`-`/`|.|`) are allowed only on supported floating-point forms, the plain VOP2 e32 integer dot-accumulate form accepts VGPR/SGPR/literal/inline `src0` with VGPR `vsrc1` and reject source modifiers, `clamp`, and `_e64` spellings, and unproved `fi:`/`bound_ctrl:` modifiers, cross-quad or non-repeated `DPP8`, `row_*`/`wave_*`, partial masks, duplicate modifiers, non-VGPR DPP operands, uninitialized accumulators, WQM, and `vmcnt` hazards are refused with specific `ValueError` diagnostics. The `pixel_aot_dpp_extra_{hardware,warp}` test runs `DPP_EXTRA_BODY` (`gfx1013`, compiled with `mode="any"` + `flush_ftz` assertion matching `curve` and `dpp`), `DPP_DOTC_BODY` (`gfx1030`, covering the DPP and plain VOP2 e32 integer dot-accumulate forms), `DPP_EXTRA_SEMANTICS_BODY` (compiled under `mode="preserve"`, distinguishing large-turns `sin32`/`cos32` at `123457.125` and `123457.375`, unfused `mad32` at `4097 * 4097 - 16785408`, denormal-flushing `mad32` at `2^-127 * 2^126 + 0.5`, and all four lanes of `dpp8:[1,2,3,0,5,6,7,4]` under injective base-4 weights `(1, 4, 16, 64)`), `DPP_EXTRA_SUBNORMAL_BODY` (lossless integer readback of `v_frexp_mant_f32_dpp` and `v_frexp_exp_i32_f32_dpp` on binary32 subnormals `0x00000001`, `0x007fffff`, `0x80000001`), and `DPP_DOTC_WRAP_BODY` (lossless integer readback of 32-bit wrap-around on `v_dot4c_i32_i8_{dpp,e32}` at `0x7ffffff0 + 32 = 0x80000010` and `0x80000010 - 32 = 0x7ffffff0`), each with negative mutations that must report `pixel_mismatch`. The floating-point `v_dot2c_f32_f16` forms are refused pending independent evidence of their accumulation rounding. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_dpp_extra_" -V`, or `python -B tests/pixel_aot_check.py draw-dpp-extra <dxc> <offscreen_check> <hardware|warp>`.
 
 ```powershell
 ctest --preset dev -R '^pixel_aot_' -V
@@ -3955,13 +3990,14 @@ Proposed desktop policy, in the test-only provider: every request sets `texture`
 Every call returned `ADDR_OK`. The test requires each row to match exactly. A first run with placeholder expectations failed every row, so the comparison is not vacuous.
 
 Controls:
-- **Linear fallback.** A provider that always answers `SW_LINEAR` disagrees on all 9 tiled rows.
+- **Linear fallback.** A second provider sends each request to addrlib with only the linear block allowed. It goes through the same table comparison as the provider under test, and the comparison rejects it on all 9 tiled rows. The 8 tiled colour rows get `SW_LINEAR`, the depth target is refused, and it agrees only on the 4096x1 `SW_LINEAR` row.
+- **Mutation.** `xg_swizzle_select_mutation` (`--mutate-linear-fallback`) substitutes that provider for the provider under test. The same comparison must find exactly the nine expected mismatches and agree on the linear row. An unrelated error fails the test. It skips with 77 without addrlib.
 - **Forced linear.** With only the linear block allowed, the 9 colour requests select `SW_LINEAR`. The depth target, which has no linear mode, is refused with `ADDR_INVALIDPARAMS` rather than given a tiled mode.
 - **Tiled request.** With the linear block forbidden, no request selects `SW_LINEAR`, including the 4096x1 row.
 - **Explicit pitch.** A linear 100x64 `8_8_8_8` surface needs a pitch of 128 elements. An explicit pitch of 128 is accepted. A pitch of 129 (misaligned) and a pitch of 64 (tight) return `ADDR_INVALIDPARAMS`.
 - **Mismatched input.** The requests in the table do not all select the same mode.
 
-addrlib is an optional local dependency and is never vendored. `tools/fetch_addrlib.py` makes a shallow sparse fetch of `src/amd/addrlib` at the pinned commit into `out/deps/mesa`. CMake builds it as a static library with the source list and definitions from Mesa's `meson.build` (`ADDR_FASTCALL=`, `LITTLEENDIAN_CPU`, `DEBUG=0`). The first configure detects it under `out/deps/mesa`. For an existing build that was configured without AddrLib, pass `XBOX2WINDOWS_ADDRLIB_DIR` explicitly to replace the cached empty path. Without it, the rest of the build is unchanged and `xg_swizzle_select` returns 77, a capability skip. CI therefore skips this test unless addrlib is present.
+addrlib is an optional local dependency and is never vendored. `tools/fetch_addrlib.py` makes a shallow sparse fetch of `src/amd/addrlib` at the pinned commit into `out/deps/mesa`. A re-run checks the Mesa origin and refuses local changes before updating the checkout. Use an empty `--dest` to preserve existing work and prepare another pinned checkout. CMake builds it as a static library with the source list and definitions from Mesa's `meson.build` (`ADDR_FASTCALL=`, `LITTLEENDIAN_CPU`, `DEBUG=0`). The first configure detects it under `out/deps/mesa`. For an existing build that was configured without AddrLib, pass `XBOX2WINDOWS_ADDRLIB_DIR` explicitly to replace the cached empty path. Without it, the rest of the build is unchanged and `xg_swizzle_select` returns 77, a capability skip. CI therefore skips this test unless addrlib is present.
 
 Measured on Windows 10 Pro 10.0.19045.6466 with MSVC 19.44.35207.1 x64, `dev` and `release`. No GPU is involved.
 
@@ -3969,7 +4005,7 @@ Measured on Windows 10 Pro 10.0.19045.6466 with MSVC 19.44.35207.1 x64, `dev` an
 python tools/fetch_addrlib.py
 cmake --preset dev -DXBOX2WINDOWS_ADDRLIB_DIR=out/deps/mesa/src/amd/addrlib
 cmake --build --preset dev --target xg_swizzle_select_check
-ctest --preset dev --no-tests=error -R '^xg_swizzle_select$' -V
+ctest --preset dev --no-tests=error -R '^xg_swizzle_select' -V
 ```
 
 ## Offscreen rendering and readback
@@ -5588,6 +5624,15 @@ clamps). Translated and direct HLSL agreed in every case.
 [Measurement](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7097414235),
 [Windows 11 report](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7095165499)
 
+An RDNA 4 adapter repeated the five-clamp sweep at `ps_6_0` with both forms
+reported separately (`0f0c3eb`, Windows 11 build 26300.10075, DXC 1.9.2602.17,
+debug layer unavailable). An RX 9060 XT (32.0.32029.2010) and in-box WARP
+10.0.26100.10068 read mips 1, 2, 2, 2 and 3 at 0.5625, 1.5, 1.5625, 1.75 and
+2.5625, for `MinLod` and for explicit `SampleLevel`. Exactly one mip matched
+all 64 pixels at every clamp, and translated and direct HLSL agreed in every
+case. Neither adapter shows the Windows 10 in-box WARP behavior.
+[RX 9060 XT report](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7111499476)
+
 Mip-linear results (`MIN_MAG_POINT_MIP_LINEAR`, `ps_6_6`, debug layer): WARP
 1.0.22 and the RTX on Windows 10 build 19045 with Agility SDK 1.620.2 and DXC
 1.9.2609; the Radeon and in-box WARP on Windows 11 build 26200.9974 with DXC
@@ -5623,6 +5668,18 @@ shaders matched at every point.
 WARP rounds to the nearest 1/256 with ties to even; the RTX truncates and
 stores step k as `k·256/65535`, which gives the offset of up to 7.6e-6.
 [Half-step sweep](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7095572305)
+
+The RX 9060 XT (32.0.32029.2010) and in-box WARP 10.0.26100.10068 gave the
+WARP 1.0.22 column at `ps_6_0` (`0f0c3eb`, Windows 11 build 26300.10075, DXC
+1.9.2602.17, debug layer unavailable). That sweep had 22 points: 76/256 to
+77/256 in 1/16 steps, 76.5 ± 1/4096, 77 − 1/4096, and the ties at 75.5 and
+77.5. The ties read 76, 76 and 78 on both, 76.50024 already reads 77, and the
+blue words are exact `k/256` values with no RTX-style offset, so this Radeon
+rounds to the nearest 1/256 with ties to even. The raw words are from pixel
+(0, 0), where both shaders and both adapters matched at every point; the
+other 63 pixels are covered by the fixture's 1/128 comparison, not by a
+bit-for-bit one.
+[RX 9060 XT sweep](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7111499476)
 
 ## Quad-local DS swizzle in pixel shaders
 
@@ -5975,27 +6032,84 @@ Not covered by this experiment: non-default MXCSR modes (FTZ/DAZ or unmasked exc
 non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
 
-## AVX alternating FP add/sub and quadword/masked-byte moves
+## Legacy SSE/MMX conversion, shuffle, and non-temporal store
 
-[The AVX FP and move translator](../tools/cpu_avx_fp_move_aot.py) lifts bounded
-straight-line Windows x64 leaf functions covering four `VEX` forms from
+[The SSE/MMX leaf translator](../tools/cpu_sse_mmx_aot.py) lifts bounded straight-line
+Windows x64 leaf functions covering five uncovered forms from `docs/coverage/x64_zen2.tsv`
+group `SSE`:
+
+- Integer-to-float conversion: `cvtpi2ps` (`mm` and `m64` sources, preserving `xmm[127:64]`)
+- Float-to-integer conversions: `cvtps2pi` (round-to-nearest-even) and `cvttps2pi` (truncate toward zero) on `xmm` and `m64` sources, returning `0x80000000` on NaN, `+/-Inf`, or out-of-`int32_t` range after rounding
+- Word permutation: `pshufw` (`imm8` 16-bit word shuffle on `mm` and `m64` sources)
+- Non-temporal store: `movntq` (`m64` store to `[r8 + disp]`, tested at aligned and unaligned addresses)
+
+Call with round-to-nearest-even, masked MXCSR exceptions, DAZ and FTZ off, and
+an empty x87 stack with no pending unmasked exceptions or live MMX values.
+The caller owns the buffers and reads the output after return. The `movntq`
+lowering preserves the eight output bytes. Caching hints, inter-thread
+visibility, floating-point status flags and physical x87 tags are outside
+the observed contract.
+
+Each lifted export uses the leaf ABI `void fn(word rcx, word rdx, word r8)` (`rcx`/`rdx`
+inputs, `r8` output), modeling `xmm0`..`xmm5` (`Vec128`), `mm0`..`mm7` (`std::uint64_t mm[8]`),
+and volatile scratch GPRs `rax`/`r9`/`r10`/`r11` for `movq` bridges alongside `movaps`/`movdqa`
+(16-byte aligned), `movdqu`, `emms`, and terminal `ret`. Touching any `mm` register sets
+`mmx_active`; `emms` clears it and invalidates `mm` definitions unconditionally, and `ret`
+rejects while `mmx_active` is true. Dead-read fault ordering uses `std::atomic_signal_fence`
+with volatile loads. Memory stores are restricted to `r8`-rooted flat `[r8 + disp]` operands,
+and VEX/EVEX encodings, nonvolatile registers, undefined reads/merges, prefixes, and
+unsupported instructions reject.
+
+```powershell
+cmake --build --preset dev --target cpu_sse_mmx_original cpu_sse_mmx_original_lifted cpu_sse_mmx_altered cpu_sse_mmx_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_sse_mmx$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/sse_mmx.asm) exports 19 functions covering register and
+displaced/unaligned `m64` forms of all five instructions, `movq` GPR bridges, `emms`
+re-entry, a discarded `cvtps2pi` fault-ordering read, and a chained pipeline.
+[The differential check](../tests/cpu/sse_mmx_check.py) verified 237 cases across the 18
+differential exports bit-for-bit against both the native MASM DLL and an independent Python
+reference model (including `+/-0.0`, subnormals, ties-to-even, `2147483520.0`, `2147483648.0`,
+`-2147483648.0`, `-2147483904.0`, `+/-Inf`, qNaN/sNaN, `xmm[127:64]` preservation, and
+`pshufw` `imm8` edge patterns), plus the discarded-read fault-ordering test on both `dev`
+and `release` (`/O2`) presets. An `ALTER_IMM` variant swaps `cvtps2pi`/`cvttps2pi` and
+changes `pshufw` `imm8` on four exports (diverging on 3, 3, 7, and 7 cases); an
+output-mutation control confirmed single-bit mismatch detection; and rejection controls
+passed 7 alternate-encoding lift checks, 59 unit rejections (7 VEX/EVEX, 12 unsupported
+instructions, 40 ABI/state/addressing/prefix/stream), and 10 PE-patched DLL rejections.
+
+Not covered by this experiment: non-default MXCSR rounding modes, non-temporal cache-bypass
+hints on `movntq`, x87/MMX aliasing across calls, control flow, and title CPU code execution.
+
+## AVX quadword and masked-byte moves
+
+[The AVX quadword and masked-byte move translator](../tools/cpu_avx_fp_move_aot.py) lifts
+bounded straight-line Windows x64 leaf functions covering two `VEX` forms from
 `docs/coverage/x64_zen2.tsv` group `AVX`:
 
-- Packed alternating subtract/add: `vaddsubps` (`xmm` and `ymm`, register and flat `m128`/`m256`) and `vaddsubpd` (`xmm` and `ymm`, register and flat `m128`/`m256`), preserving x86 `src1`-first NaN quieting/precedence, real-indefinite QNaN on invalid operations, signed zeros, infinities and subnormals under default MXCSR.
-- Quadword / GPR moves: `vmovq` across all five `VEX.128` operand shapes (`xmm, xmm`; `xmm, m64`; `m64, xmm`; `xmm, r64`; `r64, xmm`), zeroing `YMM[255:64]` on `XMM` writes.
+- Quadword / GPR moves: `vmovq` across all four `VEX.128` `Code` encodings (`VEX_VMOVQ_XMM_XMMM64`, `VEX_VMOVQ_XMMM64_XMM`, `VEX_VMOVQ_XMM_RM64`, `VEX_VMOVQ_RM64_XMM`) and all five operand shapes (`xmm, xmm`; `xmm, m64`; `m64, xmm`; `xmm, r64`; `r64, xmm`), zeroing `YMM[255:64]` on `XMM` writes.
 - Conditional byte store: `vmaskmovdqu` (`VEX.128` `xmm1, xmm2` to implicit `[rdi]`), requiring nonvolatile `rdi` save/restore via a volatile scratch GPR around `mov rdi, r8`.
 
 Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned
 flat buffers and returns `void`. `YMM0`..`YMM5` use the portable `Vec256` model
-(`std::uint64_t q[4]`) without `/arch:AVX`; `VEX.128` writes zero `[255:128]`
-(`vaddsubps`/`vaddsubpd` XMM, `vmovups`/`vmovaps`/`vmovdqu`/`vmovdqa` XMM) or
-`[255:64]` (`vmovq` XMM). Transport and ABI glue covers `vmovups`, `vmovaps`,
+(`std::uint64_t q[4]`), `VEX.128` writes zero `[255:128]` (`vmovups`/`vmovaps`/
+`vmovdqu`/`vmovdqa` XMM) or `[255:64]` (`vmovq` XMM), and volatile scratch GPRs
+(`rax`, `r9`, `r10`, `r11`) become unavailable to ordinary consumers after saving `rdi`
+while remaining valid for `rdi` restoration. Native `VirtualAlloc` + `PAGE_NOACCESS` /
+`PAGE_READONLY` page-edge testing showed that `vmaskmovdqu` requires the entire 16-byte
+destination `[rdi..rdi+15]` to be writable (faulting even when all mask MSBs are clear; on
+unaligned page-crossing writes, native hardware may commit a writable 8-byte prefix before
+faulting on the guard page), so the lowered helper probes both 16-byte endpoints before
+writing masked bytes. Transport and ABI glue covers `vmovups`, `vmovaps`,
 `vmovdqu`, `vmovdqa`, `vzeroupper`, 64-bit `mov` and terminal `ret`. The translator
-rejects legacy SSE encodings (`addsubps`, `addsubpd`, `movq`, `maskmovdqu`), EVEX
-encodings, nonvolatile registers (`XMM6`..`15`, `YMM6`..`15`, `RBX`/`RBP`/`RSI`/
-`R12`..`R15`/`RSP`, and unrestored or non-`r8` `RDI`), non-argument memory bases,
-stores outside `r8`, unaligned `vmovaps`/`vmovdqa` operands, prefixes,
-RIP-relative addressing, undefined registers, missing `ret` and trailing bytes
+rejects legacy SSE encodings (`movq`, `maskmovdqu`), EVEX encodings, FP arithmetic
+(`vaddsubps`, `vaddsubpd`), nonvolatile registers (`XMM6`..`15`, `YMM6`..`15`,
+`RBX`/`RBP`/`RSI`/`R12`..`R15`/`RSP`, and unrestored, non-`r8`, or leaked `RDI`),
+non-argument memory bases, stores outside `r8`, unaligned `vmovaps`/`vmovdqa` operands,
+prefixes, RIP-relative addressing, undefined registers, missing `ret` and trailing bytes
 after `ret`.
 
 ```powershell
@@ -6005,19 +6119,19 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_avx_fp_move$' -V
 
 ### Measured results and open scope
 
-The [MASM fixture](../tests/cpu/avx_fp_move.asm) exports 22 functions covering
-`vaddsubps` and `vaddsubpd` (`xmm`/`ymm`, register, memory, `+1` unaligned and
-self-aliased), all five `vmovq` operand shapes (`+1`/`+9` unaligned),
-`vmaskmovdqu` with `rdi` save/restore, a chained `vzeroupper` pipeline, and two
-dead-read fault-ordering controls (`op_discarded_read` and `op_discarded_read64`).
+The [MASM fixture](../tests/cpu/avx_fp_move.asm) exports 9 functions covering all five
+`vmovq` operand shapes (`+1`/`+9` unaligned), `vmaskmovdqu` with `rdi` save/restore, a
+chained `vzeroupper` pipeline, and two dead-read fault-ordering controls
+(`op_discarded_read` and `op_discarded_read64`).
 [The differential check](../tests/cpu/avx_fp_move_check.py) skips with exit code 77
-when CPUID/XCR0 lacks AVX and otherwise verifies 257 cases across the 20
-functional exports bit-for-bit against both the native MASM DLL and an
-independent Python IEEE-754 reference model with 32-byte pre/post buffer guards,
-dead-read fault ordering across Debug and Release (`/O2`) builds, 5 `ALTER_OP`
-divergence controls, an output-mutation comparator control, 7 alternate-encoding
-lift checks, 37 unit rejection controls, and 8 end-to-end PE-patched DLL
-rejection controls.
+when CPUID/XCR0 lacks AVX and otherwise verifies 134 cases across the 7 differential
+exports bit-for-bit against both the native MASM DLL and an independent Python reference
+model with 32-byte pre/post buffer guards across `dev` and `release` (`/O2`) builds,
+plus 68 native/lifted `VirtualAlloc` + `PAGE_NOACCESS` / `PAGE_READONLY` page-edge checks,
+dead-read fault ordering (`op_discarded_read`, `op_discarded_read64`), 3 `ALTER_OP`
+divergence controls (`14`, `12`, `30`), an output-mutation comparator control, 8
+alternate-encoding lift checks, 38 unit rejection controls (including the `RDI`-save
+definedness leak control), and 9 end-to-end PE-patched DLL rejection controls.
 
-Not covered by this experiment: non-default MXCSR modes, control flow,
+Not covered by this experiment: non-temporal cache hints on `vmaskmovdqu`, control flow,
 nonvolatile `xmm6`..`xmm15` prologues, and title CPU code execution.

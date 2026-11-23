@@ -27,6 +27,7 @@
 // request forbids every non-linear block.
 //
 // Returns 0 on pass, 1 on failure, and 77 (skip) when built without addrlib (XBOX2WINDOWS_ADDRLIB_DIR unset).
+// With --mutate-linear-fallback the comparison must detect all nine mismatches.
 #include <cstdint>
 #include <cstdio>
 
@@ -199,6 +200,16 @@ void expect(bool ok, const char* what)
     failures += !ok;
 }
 
+using Provider = Selection (*)(ADDR_HANDLE, const XgRequest&);
+Selection reference_provider(ADDR_HANDLE lib, const XgRequest& r) { return suggest_swizzle_mode(lib, r); }
+// A provider that silently falls back to linear: it asks addrlib with every non-linear block forbidden.
+Selection linear_fallback_provider(ADDR_HANDLE lib, const XgRequest& r)
+{
+    XgRequest linear = r;
+    linear.force_linear = true;
+    return suggest_swizzle_mode(lib, linear);
+}
+
 // The reference table: addrlib's selection for each request on the Navi 21 configuration above, recorded
 // from this build (AddrLib observations, not console values).
 struct Row {
@@ -221,7 +232,20 @@ const Row rows[] = {
 };
 // clang-format on
 
-int run()
+bool matches(const Selection& s, const Row& row)
+{
+    return s.rc == ADDR_OK && s.mode == row.mode && s.base_align == row.base_align;
+}
+
+// The one comparison every provider goes through: the number of reference rows it does not reproduce.
+unsigned table_mismatches(ADDR_HANDLE lib, Provider provider)
+{
+    unsigned n = 0;
+    for (const Row& row : rows) n += !matches(provider(lib, row.request), row);
+    return n;
+}
+
+int run(bool mutate_linear_fallback)
 {
     std::printf("AddrLib observations from %s\n", addrlib_source);
     std::printf("  AddrCreate: chipEngine 0x%X chipFamily 0x%X chipRevision 0x%X gbAddrConfig 0x%X createFlags 0\n",
@@ -231,11 +255,13 @@ int run()
     expect(lib != nullptr, "AddrCreate for family NV rev 0x28, GB_ADDR_CONFIG 0x444 (Mesa navi21 test config)");
     if (!lib) return 1;
 
-    // 1. The test-only provider against the reference table.
+    // 1. The provider under test against the reference table, through the shared comparison.
+    const Provider under_test = mutate_linear_fallback ? linear_fallback_provider : reference_provider;
+    if (mutate_linear_fallback) std::puts("  mutation: the provider under test is the linear-fallback provider");
     unsigned tiled_rows = 0;
     std::vector<AddrSwizzleMode> chosen;
     for (const Row& row : rows) {
-        const Selection s = suggest_swizzle_mode(lib, row.request);
+        const Selection s = under_test(lib, row.request);
         chosen.push_back(s.mode);
         const FormatInfo fi = format_info(row.request.format);
         std::printf("  %-50s fmt 0x%X bpp %u flags 0x%X mips %u -> status %d %s (%u) baseAlign %u surfSize %llu\n",
@@ -244,19 +270,24 @@ int run()
         char line[200];
         std::snprintf(line, sizeof line, "%s selects %s with %u-byte base alignment", row.request.name,
                       mode_name(row.mode), row.base_align);
-        expect(s.rc == ADDR_OK && s.mode == row.mode && s.base_align == row.base_align, line);
+        const bool expected_match = !mutate_linear_fallback || row.mode == ADDR_SW_LINEAR;
+        if (mutate_linear_fallback && !expected_match) {
+            std::snprintf(line, sizeof line, "linear fallback mismatches %s", row.request.name);
+        }
+        expect(matches(s, row) == expected_match, line);
         tiled_rows += row.mode != ADDR_SW_LINEAR;
     }
+    const unsigned expected_mismatches = mutate_linear_fallback ? 9 : 0;
+    expect(table_mismatches(lib, under_test) == expected_mismatches, "the comparison finds the expected mismatch count");
 
-    // 2. Linear-fallback control: a provider that always answers LINEAR must disagree on every tiled row and
-    //    agree only on the reference's own LINEAR row.
-    auto always_linear = [](const XgRequest&) { return ADDR_SW_LINEAR; };
-    unsigned fallback_mismatches = 0;
-    for (const Row& row : rows) fallback_mismatches += always_linear(row.request) != row.mode;
-    std::printf("  tiled reference rows %u, linear-fallback disagreements %u of %zu\n", tiled_rows, fallback_mismatches,
-                sizeof rows / sizeof rows[0]);
+    // 2. Linear-fallback control: a provider that sends each request to addrlib with only the linear block allowed
+    //    goes through the same comparison and must be caught. It agrees only on the reference's own LINEAR row;
+    //    the 8 tiled colour rows get LINEAR and the depth target is refused.
+    const unsigned fallback_mismatches = table_mismatches(lib, linear_fallback_provider);
+    std::printf("  tiled reference rows %u, linear-fallback provider mismatches %u of %zu\n", tiled_rows,
+                fallback_mismatches, sizeof rows / sizeof rows[0]);
     expect(tiled_rows == 9 && fallback_mismatches == tiled_rows,
-           "linear-fallback control: an always-LINEAR provider disagrees on all 9 tiled rows");
+           "linear-fallback control: the comparison rejects the addrlib-backed linear-fallback provider on all 9 tiled rows");
 
     // 3. Forced-linear control: with only the linear block allowed, every colour request selects LINEAR and the
     //    depth target, which has no linear mode, is refused rather than given a tiled mode.
@@ -328,9 +359,15 @@ int run()
 }
 }  // namespace
 
-int main()
+// The mutation passes only if the comparison detects the expected fallback mismatches.
+int main(int argc, char** argv)
 {
-    const int result = run();
+    const bool mutate = argc == 2 && std::strcmp(argv[1], "--mutate-linear-fallback") == 0;
+    if (argc > 2 || (argc == 2 && !mutate)) {
+        std::puts("usage: xg_swizzle_select_check [--mutate-linear-fallback]");
+        return 2;
+    }
+    const int result = run(mutate);
     std::printf("xg_swizzle_select: %s\n", result == 0 ? "PASS" : "FAIL");
     return result;
 }

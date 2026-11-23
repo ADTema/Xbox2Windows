@@ -1,7 +1,7 @@
-"""Differential checks, fault-ordering controls, mutation controls and rejection controls for AVX FP add/sub and move AOT."""
+"""Differential checks, page-edge checks, fault-ordering controls, mutation controls and rejection controls for AVX quadword/masked-byte move AOT."""
 
 import ctypes
-from fractions import Fraction
+from ctypes import wintypes
 from pathlib import Path
 import random
 import struct
@@ -15,26 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_avx_fp_move_aot import lift_code, translate
 from cpu_leaf_aot import export_rva
 
-MASK32 = 0xFFFFFFFF
-MASK64 = 0xFFFFFFFFFFFFFFFF
 GUARD_PRE = bytes(0xA0 + (i % 16) for i in range(32))
 GUARD_POST = bytes(0xC0 + (i % 16) for i in range(32))
 FILL = b"\x5A" * 32
 
 EXPORTS = (
-    "op_vaddsubps_xmm_reg",
-    "op_vaddsubps_xmm_mem",
-    "op_vaddsubps_xmm_mem_plus1",
-    "op_vaddsubps_ymm_reg",
-    "op_vaddsubps_ymm_mem",
-    "op_vaddsubps_ymm_mem_plus1",
-    "op_vaddsubps_self",
-    "op_vaddsubpd_xmm_reg",
-    "op_vaddsubpd_xmm_mem",
-    "op_vaddsubpd_xmm_mem_plus1",
-    "op_vaddsubpd_ymm_reg",
-    "op_vaddsubpd_ymm_mem",
-    "op_vaddsubpd_ymm_mem_plus1",
     "op_vmovq_xmm_xmm",
     "op_vmovq_xmm_m64",
     "op_vmovq_m64_xmm",
@@ -45,142 +30,10 @@ EXPORTS = (
 )
 
 ALTERED_EXPORTS = (
-    "op_vaddsubps_xmm_reg",
-    "op_vaddsubps_ymm_reg",
-    "op_vaddsubpd_xmm_reg",
+    "op_vmovq_xmm_xmm",
     "op_vmovq_xmm_m64",
     "op_vmaskmovdqu",
 )
-
-
-# --- Independent Python IEEE-754 binary32 / binary64 reference model ---
-
-class _FPFormat:
-    def __init__(self, ebits: int, mbits: int):
-        self.ebits = ebits
-        self.mbits = mbits
-        self.bits = 1 + ebits + mbits
-        self.bias = (1 << (ebits - 1)) - 1
-        self.emax = (1 << ebits) - 1
-        self.sign_mask = 1 << (self.bits - 1)
-        self.exp_mask = self.emax << mbits
-        self.frac_mask = (1 << mbits) - 1
-        self.quiet_bit = 1 << (mbits - 1)
-        self.indef = self.sign_mask | self.exp_mask | self.quiet_bit
-        self.max_finite = ((self.emax - 1) << mbits) | self.frac_mask
-
-    def unpack(self, raw: int):
-        sign = (raw >> (self.bits - 1)) & 1
-        exp = (raw >> self.mbits) & self.emax
-        frac = raw & self.frac_mask
-        return sign, exp, frac
-
-    def is_nan(self, raw: int) -> bool:
-        _, exp, frac = self.unpack(raw)
-        return exp == self.emax and frac != 0
-
-    def is_inf(self, raw: int) -> bool:
-        _, exp, frac = self.unpack(raw)
-        return exp == self.emax and frac == 0
-
-    def is_zero(self, raw: int) -> bool:
-        _, exp, frac = self.unpack(raw)
-        return exp == 0 and frac == 0
-
-    def quiet(self, raw: int) -> int:
-        return raw | self.quiet_bit
-
-    def to_fraction(self, raw: int) -> Fraction:
-        sign, exp, frac = self.unpack(raw)
-        if exp == 0:
-            mag = Fraction(frac, 1) * (Fraction(1, 2) ** (self.bias - 1 + self.mbits))
-        else:
-            mag = Fraction((1 << self.mbits) | frac, 1) * (Fraction(2, 1) ** (exp - self.bias - self.mbits))
-        return -mag if sign else mag
-
-    @staticmethod
-    def _round_rne(mag: Fraction) -> int:
-        q, r = divmod(mag.numerator, mag.denominator)
-        twice_r = r * 2
-        if twice_r > mag.denominator or (twice_r == mag.denominator and (q & 1)):
-            q += 1
-        return q
-
-    def from_fraction(self, val: Fraction) -> int:
-        if val == 0:
-            return 0
-        sign = 1 if val < 0 else 0
-        mag = -val if sign else val
-        num, den = mag.numerator, mag.denominator
-        e = num.bit_length() - den.bit_length()
-        while (num << (-e) if e < 0 else num) < (den << e if e >= 0 else den):
-            e -= 1
-        while (num << (-(e + 1)) if e + 1 < 0 else num) >= (den << (e + 1) if e + 1 >= 0 else den):
-            e += 1
-        emin = 1 - self.bias
-        if e < emin:
-            scaled = mag * (Fraction(2, 1) ** (self.mbits - emin))
-            q = self._round_rne(scaled)
-            if q == (1 << self.mbits):
-                return (sign << (self.bits - 1)) | (1 << self.mbits)
-            if q == 0:
-                return sign << (self.bits - 1)
-            return (sign << (self.bits - 1)) | q
-        scaled = mag * (Fraction(2, 1) ** (self.mbits - e))
-        q = self._round_rne(scaled)
-        if q == (1 << (self.mbits + 1)):
-            q >>= 1
-            e += 1
-        bexp = e + self.bias
-        if bexp >= self.emax:
-            return (sign << (self.bits - 1)) | self.exp_mask
-        return (sign << (self.bits - 1)) | (bexp << self.mbits) | (q & self.frac_mask)
-
-    def add(self, a: int, b: int) -> int:
-        if self.is_nan(a):
-            return self.quiet(a)
-        if self.is_nan(b):
-            return self.quiet(b)
-        sa, _, _ = self.unpack(a)
-        sb, _, _ = self.unpack(b)
-        if self.is_inf(a) and self.is_inf(b):
-            return self.indef if sa != sb else a
-        if self.is_inf(a):
-            return a
-        if self.is_inf(b):
-            return b
-        if self.is_zero(a) and self.is_zero(b):
-            return (self.sign_mask if sa else 0) if sa == sb else 0
-        return self.from_fraction(self.to_fraction(a) + self.to_fraction(b))
-
-    def sub(self, a: int, b: int) -> int:
-        if self.is_nan(a):
-            return self.quiet(a)
-        if self.is_nan(b):
-            return self.quiet(b)
-        return self.add(a, b ^ self.sign_mask)
-
-
-F32 = _FPFormat(8, 23)
-F64 = _FPFormat(11, 52)
-
-
-def ref_vaddsubps(a: bytes, b: bytes, wide: bool) -> bytes:
-    n = 8 if wide else 4
-    xa = struct.unpack(f"<{n}I", a[: n * 4])
-    xb = struct.unpack(f"<{n}I", b[: n * 4])
-    out = [F32.add(xa[i], xb[i]) if (i & 1) else F32.sub(xa[i], xb[i]) for i in range(n)]
-    res = struct.pack(f"<{n}I", *out)
-    return res if wide else res + b"\x00" * 16
-
-
-def ref_vaddsubpd(a: bytes, b: bytes, wide: bool) -> bytes:
-    n = 4 if wide else 2
-    xa = struct.unpack(f"<{n}Q", a[: n * 8])
-    xb = struct.unpack(f"<{n}Q", b[: n * 8])
-    out = [F64.add(xa[i], xb[i]) if (i & 1) else F64.sub(xa[i], xb[i]) for i in range(n)]
-    res = struct.pack(f"<{n}Q", *out)
-    return res if wide else res + b"\x00" * 16
 
 
 def ref_vmaskmovdqu(src: bytes, mask: bytes, base: bytes) -> bytes:
@@ -194,38 +47,9 @@ def ref_vmaskmovdqu(src: bytes, mask: bytes, base: bytes) -> bytes:
 def reference(name: str, a: bytes, b: bytes, altered: bool = False) -> bytes:
     """Expected 32-byte output region; unwritten bytes keep the FILL pattern."""
     out = bytearray(FILL)
-    if name == "op_vaddsubps_xmm_reg":
-        src1, src2 = (b, a) if altered else (a, b)
-        out[:] = ref_vaddsubps(src1, src2, False)
-    elif name == "op_vaddsubps_xmm_mem":
-        out[:] = ref_vaddsubps(a, b, False)
-    elif name == "op_vaddsubps_xmm_mem_plus1":
-        out[:] = ref_vaddsubps(a, b[1:17], False)
-    elif name == "op_vaddsubps_ymm_reg":
-        src1, src2 = (b, a) if altered else (a, b)
-        out[:] = ref_vaddsubps(src1, src2, True)
-    elif name == "op_vaddsubps_ymm_mem":
-        out[:] = ref_vaddsubps(a, b, True)
-    elif name == "op_vaddsubps_ymm_mem_plus1":
-        # b is 32B payload; +1 reads b[1:32] + GUARD_POST[0:1]
-        out[:] = ref_vaddsubps(a, b[1:32] + GUARD_POST[:1], True)
-    elif name == "op_vaddsubps_self":
-        out[:] = ref_vaddsubps(a, a, True)
-    elif name == "op_vaddsubpd_xmm_reg":
-        src1, src2 = (b, a) if altered else (a, b)
-        out[:] = ref_vaddsubpd(src1, src2, False)
-    elif name == "op_vaddsubpd_xmm_mem":
-        out[:] = ref_vaddsubpd(a, b, False)
-    elif name == "op_vaddsubpd_xmm_mem_plus1":
-        out[:] = ref_vaddsubpd(a, b[1:17], False)
-    elif name == "op_vaddsubpd_ymm_reg":
-        out[:] = ref_vaddsubpd(a, b, True)
-    elif name == "op_vaddsubpd_ymm_mem":
-        out[:] = ref_vaddsubpd(a, b, True)
-    elif name == "op_vaddsubpd_ymm_mem_plus1":
-        out[:] = ref_vaddsubpd(a, b[1:32] + GUARD_POST[:1], True)
-    elif name == "op_vmovq_xmm_xmm":
-        out[0:8] = b[0:8]
+    if name == "op_vmovq_xmm_xmm":
+        src = a[0:8] if altered else b[0:8]
+        out[0:8] = src
         out[8:32] = b"\x00" * 24
     elif name == "op_vmovq_xmm_m64":
         off = 9 if altered else 1
@@ -242,12 +66,10 @@ def reference(name: str, a: bytes, b: bytes, altered: bool = False) -> bytes:
         src, mask = (b[:16], a[:16]) if altered else (a[:16], b[:16])
         out[:16] = ref_vmaskmovdqu(src, mask, FILL[:16])
     elif name == "op_pipeline":
-        ymm2 = ref_vaddsubps(a, b, True)
-        ymm2_z = ymm2[:16] + b"\x00" * 16
-        ymm0_z = a[:16] + b"\x00" * 16
-        ymm3 = ref_vaddsubpd(ymm2_z, ymm0_z, True)
-        xmm4 = b[16:24] + b"\x00" * 8
-        out[:] = ref_vmaskmovdqu(xmm4, b[:16], ymm3[:16]) + ymm3[16:32]
+        q_rdx16 = b[16:24]
+        out[0:16] = ref_vmaskmovdqu(a[0:16], b[0:16], a[0:16])
+        out[16:24] = q_rdx16
+        out[24:32] = q_rdx16
     else:
         raise ValueError(f"unknown export {name}")
     return bytes(out)
@@ -255,88 +77,16 @@ def reference(name: str, a: bytes, b: bytes, altered: bool = False) -> bytes:
 
 # --- Test vectors ---
 
-def _pk32(*vals):
-    return struct.pack(
-        f"<{len(vals)}I",
-        *(v if isinstance(v, int) else struct.unpack("<I", struct.pack("<f", v))[0] for v in vals),
-    )
-
-
-def _pk64(*vals):
-    return struct.pack(
-        f"<{len(vals)}Q",
-        *(v if isinstance(v, int) else struct.unpack("<Q", struct.pack("<d", v))[0] for v in vals),
-    )
-
-
-def f32_pairs():
-    qnan_p, qnan_n = 0x7FC01234, 0xFFC05678
-    snan_p, snan_n = 0x7F800042, 0xFFA00099
-    sub_p, sub_n = 0x00400001, 0x80400001
-    min_norm = 0x00800000
-    max_fin = 0x7F7FFFFF
-    pos_z, neg_z = 0x00000000, 0x80000000
-    pos_inf, neg_inf = 0x7F800000, 0xFF800000
-
-    pairs = [
-        # Finite values, rounding ties, normal->subnormal & subnormal->normal across all 8 lanes
-        (_pk32(1.5, -2.25, 1.0, 2.0**-24, 3.5, 0.125, -1.0, -(2.0**-24)),
-         _pk32(4.25, 0.75, min_norm, sub_n, -7.5, 2.5, sub_p, sub_p)),
-        # Signed zeros in all 4 combinations on even (sub) and odd (add) lanes
-        (_pk32(pos_z, pos_z, neg_z, neg_z, pos_z, neg_z, neg_z, pos_z),
-         _pk32(pos_z, neg_z, pos_z, neg_z, neg_z, pos_z, neg_z, pos_z)),
-        # Infinities, invalid ops (inf - inf, inf + (-inf)), and overflow
-        (_pk32(pos_inf, pos_inf, neg_inf, neg_inf, pos_inf, neg_inf, max_fin, max_fin),
-         _pk32(pos_inf, neg_inf, neg_inf, pos_inf, neg_inf, pos_inf, max_fin | 0x80000000, max_fin)),
-        # NaN precedence (src1 NaN wins over src2 NaN, sNaN gets quieted)
-        (_pk32(qnan_p, snan_p, 1.0, 2.0, qnan_n, snan_n, snan_p, 3.0),
-         _pk32(snan_n, qnan_n, qnan_p, snan_p, snan_p, qnan_p, 4.0, snan_n)),
-        # Unaligned +1 byte-shift checks with NaN/Inf/subnormal boundaries
-        (_pk32(snan_p, sub_p, pos_inf, neg_z, qnan_n, max_fin, 1.5, -1.5),
-         b"\xAA" + _pk32(qnan_n, sub_n, pos_inf, pos_z, snan_p, max_fin, 2.25)[:28] + b"\x55\x33\x11"),
-    ]
-    rng = random.Random(0xA7F901)
-    for _ in range(8):
-        pairs.append((rng.randbytes(32), rng.randbytes(32)))
-    return pairs
-
-
-def f64_pairs():
-    qnan_p, qnan_n = 0x7FF8000012345678, 0xFFF8000087654321
-    snan_p, snan_n = 0x7FF0000000000042, 0xFFF4000000000099
-    sub_p, sub_n = 0x0008000000000001, 0x8008000000000001
-    min_norm = 0x0010000000000000
-    max_fin = 0x7FEFFFFFFFFFFFFF
-    pos_z, neg_z = 0x0000000000000000, 0x8000000000000000
-    pos_inf, neg_inf = 0x7FF0000000000000, 0xFFF0000000000000
-
-    pairs = [
-        (_pk64(1.5, 2.0**-53, -3.5, -(2.0**-53)),
-         _pk64(min_norm, sub_n, sub_p, sub_p)),
-        (_pk64(pos_z, neg_z, neg_z, pos_z),
-         _pk64(neg_z, neg_z, pos_z, pos_z)),
-        (_pk64(pos_inf, pos_inf, neg_inf, max_fin),
-         _pk64(pos_inf, neg_inf, neg_inf, max_fin)),
-        (_pk64(qnan_p, snan_p, 1.0, 2.0),
-         _pk64(snan_n, qnan_n, qnan_p, snan_n)),
-        (_pk64(snan_p, sub_p, pos_inf, neg_z),
-         b"\xAA" + _pk64(qnan_n, sub_n, pos_inf)[:24] + b"\x55\x33\x11\x77\x99\xBB\xDD"),
-    ]
-    rng = random.Random(0xA7F902)
-    for _ in range(8):
-        pairs.append((rng.randbytes(32), rng.randbytes(32)))
-    return pairs
-
-
 def move_pairs():
     pairs = [
         (bytes(range(0x10, 0x30)), bytes(range(0x80, 0xA0))),
         (b"\xFF" * 32, b"\x00" * 32),
+        (b"\x00" * 32, b"\xFF" * 32),
         (bytes((0x17 * i + 3) & 0xFF for i in range(32)),
          bytes((0x2B * i + 7) & 0xFF for i in range(32))),
     ]
     rng = random.Random(0xA7F903)
-    for _ in range(6):
+    for _ in range(10):
         pairs.append((rng.randbytes(32), rng.randbytes(32)))
     return pairs
 
@@ -357,17 +107,13 @@ def maskmov_pairs():
         masks.append(bytes(m))
     rng = random.Random(0xA7F904)
     pairs = [(src, m) for m in masks]
-    for _ in range(8):
+    for _ in range(10):
         pairs.append((rng.randbytes(32), rng.randbytes(32)))
     return pairs
 
 
 def inputs_for(name: str):
-    if "vaddsubps" in name:
-        return f32_pairs()
-    if "vaddsubpd" in name or name == "op_pipeline":
-        return f64_pairs()
-    if name == "op_vmaskmovdqu":
+    if name in ("op_vmaskmovdqu", "op_pipeline"):
         return maskmov_pairs()
     return move_pairs()
 
@@ -445,6 +191,95 @@ def check_discarded_read(native_path: Path, lifted_path: Path) -> None:
                 )
 
 
+def check_vmaskmovdqu_page_edge(native_path: Path, lifted_path: Path) -> int:
+    """Verify native/lifted agreement when [r8..r8+15] abuts or crosses a PAGE_NOACCESS / PAGE_READONLY guard page."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.VirtualAlloc.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+    k32.VirtualAlloc.restype = ctypes.c_void_p
+    k32.VirtualProtect.argtypes = [
+        wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    ]
+    k32.VirtualProtect.restype = wintypes.BOOL
+    k32.VirtualFree.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD]
+    k32.VirtualFree.restype = wintypes.BOOL
+
+    MEM_COMMIT = 0x1000
+    MEM_RESERVE = 0x2000
+    MEM_RELEASE = 0x8000
+    PAGE_NOACCESS = 0x01
+    PAGE_READONLY = 0x02
+    PAGE_READWRITE = 0x04
+
+    _, native_fns = bind_exports(native_path, "", ("op_vmaskmovdqu",))
+    _, lifted_fns = bind_exports(lifted_path, "lifted_", ("op_vmaskmovdqu",))
+    src_bytes = bytes(range(0x10, 0x30))
+    buf_src, ptr_src, _, _, _ = alloc_aligned_buffer(src_bytes)
+
+    cases = 0
+    for guard_prot in (PAGE_NOACCESS, PAGE_READONLY):
+        base = k32.VirtualAlloc(None, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        if not base:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            old_prot = wintypes.DWORD()
+            if not k32.VirtualProtect(base + 4096, 4096, guard_prot, ctypes.byref(old_prot)):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+            for k in (16, 15, 8, 7, 1, 0):
+                ptr_dst = base + 4096 - k
+                masks = [
+                    ("only_writable_masked", bytes(0x80 if i < k else 0x7F for i in range(16)) + b"\x00" * 16),
+                    ("all_zero_mask", b"\x7F" * 16 + b"\x00" * 16),
+                ]
+                if k < 16:
+                    masks.append(
+                        ("edge_byte_masked", bytes(0x80 if i in (0, k) else 0x00 for i in range(16)) + b"\x00" * 16)
+                    )
+
+                for mask_name, mask_bytes in masks:
+                    buf_mask, ptr_mask, _, _, _ = alloc_aligned_buffer(mask_bytes)
+                    for label, fn in (("native", native_fns["op_vmaskmovdqu"]), ("lifted", lifted_fns["op_vmaskmovdqu"])):
+                        ctypes.memset(base + 4096 - 32, 0x5A, 32)
+                        try:
+                            fn(ptr_src, ptr_mask, ptr_dst)
+                        except OSError as error:
+                            assert k < 16 and "access violation" in str(error).lower(), (
+                                label, guard_prot, k, mask_name, error
+                            )
+                            if k > 0:
+                                after = bytes((ctypes.c_ubyte * k).from_address(ptr_dst))
+                                if label == "lifted":
+                                    assert after == b"\x5A" * k, (
+                                        f"{label} modified writable prefix bytes before page-edge fault "
+                                        f"(prot={guard_prot:#x}, k={k}, mask={mask_name}): {after.hex()}"
+                                    )
+                                else:
+                                    for i, byte_val in enumerate(after):
+                                        allowed = {0x5A}
+                                        if mask_bytes[i] & 0x80:
+                                            allowed.add(src_bytes[i])
+                                        assert byte_val in allowed, (
+                                            f"native wrote unexpected byte at offset {i} before page-edge fault "
+                                            f"(prot={guard_prot:#x}, k={k}, mask={mask_name}): {after.hex()}"
+                                        )
+                        else:
+                            assert k == 16, (
+                                f"{label} unexpectedly succeeded across non-writable page edge "
+                                f"(prot={guard_prot:#x}, k={k}, mask={mask_name})"
+                            )
+                            after = bytes((ctypes.c_ubyte * 16).from_address(ptr_dst))
+                            want = ref_vmaskmovdqu(src_bytes[:16], mask_bytes[:16], b"\x5A" * 16)
+                            assert after == want, (
+                                f"{label} k=16 page-abutting mismatch ({mask_name}): {after.hex()} != {want.hex()}"
+                            )
+                        cases += 1
+                    _ = buf_mask
+        finally:
+            k32.VirtualFree(base, 0, MEM_RELEASE)
+    _ = buf_src
+    return cases
+
+
 def check_differential(native_path: Path, lifted_path: Path, altered_path: Path) -> None:
     lifted_lib, lifted = bind_exports(lifted_path, "lifted_")
     lifted_lib.host_has_avx.restype = ctypes.c_uint32
@@ -453,6 +288,7 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
         raise SystemExit(77)
 
     check_discarded_read(native_path, lifted_path)
+    page_edge_cases = check_vmaskmovdqu_page_edge(native_path, lifted_path)
 
     _, native = bind_exports(native_path)
     _, altered = bind_exports(altered_path, "lifted_")
@@ -483,7 +319,7 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
         diverged[name] = diffs
 
     # Output mutation negative control.
-    sample_a, sample_b = f64_pairs()[0]
+    sample_a, sample_b = maskmov_pairs()[4]
     expected = reference("op_pipeline", sample_a, sample_b)
     mutated = bytearray(expected)
     mutated[5] ^= 0x01
@@ -495,8 +331,9 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
         raise AssertionError("mutated output was not caught by comparator")
 
     print(
-        f"{total} native/lifted/reference AVX FP/move cases across {len(EXPORTS)} exports matched "
-        f"bit-for-bit; ALTER_OP diverged on {diverged}; dead-read and output mutation controls passed"
+        f"{total} native/lifted/reference AVX move cases across {len(EXPORTS)} exports matched bit-for-bit; "
+        f"{page_edge_cases} native/lifted page-edge checks passed; "
+        f"ALTER_OP diverged on {diverged}; dead-read and output mutation controls passed"
     )
 
 
@@ -514,17 +351,18 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
     ld_xmm0 = Instruction.create_reg_mem(Code.VEX_VMOVUPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX))
     ld_xmm1 = Instruction.create_reg_mem(Code.VEX_VMOVUPS_XMM_XMMM128, R.XMM1, MemoryOperand(R.RDX))
     ld_ymm4 = Instruction.create_reg_mem(Code.VEX_VMOVUPS_YMM_YMMM256, R.YMM4, MemoryOperand(R.RCX))
-    ld_ymm5 = Instruction.create_reg_mem(Code.VEX_VMOVDQU_YMM_YMMM256, R.YMM5, MemoryOperand(R.RDX, displ=3, displ_size=1))
     st_xmm0 = Instruction.create_mem_reg(Code.VEX_VMOVUPS_XMMM128_XMM, MemoryOperand(R.R8), R.XMM0)
-    st_ymm4 = Instruction.create_mem_reg(Code.VEX_VMOVUPS_YMMM256_YMM, MemoryOperand(R.R8), R.YMM4)
     ret_ins = Instruction.create(Code.RETNQ)
 
     # Alternate encodings not emitted directly by MASM:
-    # F3 0F 7E vmovq xmm, m64; 66 0F D6 vmovq xmm, xmm and m64, xmm;
+    # F3 0F 7E vmovq xmm, m64; 66 0F 6E W1 vmovq xmm, m64; 66 0F D6 vmovq xmm, xmm and m64, xmm;
     # store-form reg-reg vmovups/vmovaps/vmovdqu/vmovdqa; r8 reads; neg disp; r9 rdi save.
     alt_accept = [
         ("vmovq_f3_m64", (
             Instruction.create_reg_mem(Code.VEX_VMOVQ_XMM_XMMM64, R.XMM0, MemoryOperand(R.RDX, displ=8, displ_size=1)),
+            st_xmm0, ret_ins)),
+        ("vmovq_6e_m64", (
+            Instruction.create_reg_mem(Code.VEX_VMOVQ_XMM_RM64, R.XMM0, MemoryOperand(R.RDX, displ=8, displ_size=1)),
             st_xmm0, ret_ins)),
         ("vmovq_d6_reg", (
             ld_xmm1, Instruction.create_reg_reg(Code.VEX_VMOVQ_XMMM64_XMM, R.XMM0, R.XMM1),
@@ -538,11 +376,9 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
             Instruction.create_reg_reg(Code.VEX_VMOVQ_XMM_RM64, R.XMM2, R.R10),
             Instruction.create_mem_reg(Code.VEX_VMOVQ_RM64_XMM, MemoryOperand(R.R8), R.XMM2),
             ret_ins)),
-        ("vaddsubps_ymm4_ymm5_neg_disp", (
-            ld_ymm4, ld_ymm5,
-            Instruction.create_reg_reg_mem(
-                Code.VEX_VADDSUBPS_YMM_YMM_YMMM256, R.YMM4, R.YMM5, MemoryOperand(R.R8, displ=-32, displ_size=1)),
-            st_ymm4, ret_ins)),
+        ("vmovq_r8_neg_disp", (
+            Instruction.create_reg_mem(Code.VEX_VMOVQ_XMM_XMMM64, R.XMM0, MemoryOperand(R.R8, displ=-16, displ_size=1)),
+            st_xmm0, ret_ins)),
         ("vmov_alt_reg_reg", (
             ld_ymm4,
             Instruction.create_reg_reg(Code.VEX_VMOVUPS_XMMM128_XMM, R.XMM0, R.XMM4),
@@ -561,10 +397,11 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
     ]
     alt_expected = {
         "vmovq_f3_m64": "ymm0 = {{load64((rdx + 0x8ull)), 0ull, 0ull, 0ull}};",
+        "vmovq_6e_m64": "ymm0 = {{load64((rdx + 0x8ull)), 0ull, 0ull, 0ull}};",
         "vmovq_d6_reg": "ymm0 = {{ymm1.q[0], 0ull, 0ull, 0ull}};",
         "vmovq_d6_m64": "store64((r8 + 0x10ull), ymm0.q[0]);",
         "vmovq_gpr_r10_r8": "r10 = ymm0.q[0];",
-        "vaddsubps_ymm4_ymm5_neg_disp": "op_vaddsubps(ymm5, load256((r8 + 0xffffffffffffffe0ull)), true);",
+        "vmovq_r8_neg_disp": "ymm0 = {{load64((r8 + 0xfffffffffffffff0ull)), 0ull, 0ull, 0ull}};",
         "vmov_alt_reg_reg": "ymm0 = copy128(ymm4);",
         "vmaskmovdqu_r9_save": "op_vmaskmovdqu(r8, ymm0, ymm1);",
     }
@@ -585,10 +422,6 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
 
     unit_cases = [
         # Legacy SSE rejections
-        ("legacy_addsubps", encode_seq(ld_xmm0, ld_xmm1, Instruction.create_reg_reg(
-            Code.ADDSUBPS_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins), "unsupported legacy SSE encoding"),
-        ("legacy_addsubpd", encode_seq(ld_xmm0, ld_xmm1, Instruction.create_reg_reg(
-            Code.ADDSUBPD_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins), "unsupported legacy SSE encoding"),
         ("legacy_movq_xmm", encode_seq(ld_xmm1, Instruction.create_reg_reg(
             Code.MOVQ_XMM_XMMM64, R.XMM0, R.XMM1), ret_ins), "unsupported legacy SSE encoding"),
         ("legacy_movq_r64", encode_seq(ld_xmm0, Instruction.create_reg_reg(
@@ -605,13 +438,24 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
         # Nonvolatile XMM6..15 / YMM6..15 and GPRs
         ("nonvolatile_xmm6", encode_seq(Instruction.create_reg_mem(
             Code.VEX_VMOVUPS_XMM_XMMM128, R.XMM6, MemoryOperand(R.RCX)), ret_ins), "nonvolatile vector register"),
-        ("nonvolatile_ymm15", encode_seq(ld_ymm4, Instruction.create_reg_reg_reg(
-            Code.VEX_VADDSUBPS_YMM_YMM_YMMM256, R.YMM15, R.YMM4, R.YMM4), ret_ins), "nonvolatile vector register"),
+        ("nonvolatile_ymm15", encode_seq(Instruction.create_reg_mem(
+            Code.VEX_VMOVUPS_YMM_YMMM256, R.YMM15, MemoryOperand(R.RCX)), ret_ins), "nonvolatile vector register"),
         ("nonvolatile_rbx_vmovq", encode_seq(ld_xmm0, Instruction.create_reg_reg(
             Code.VEX_VMOVQ_RM64_XMM, R.RBX, R.XMM0), ret_ins), "nonvolatile GPR"),
         ("nonvolatile_rdi_vmovq", encode_seq(ld_xmm0, Instruction.create_reg_reg(
             Code.VEX_VMOVQ_RM64_XMM, R.RDI, R.XMM0), ret_ins), "nonvolatile GPR"),
-        # RDI save/restore and vmaskmovdqu policy
+        # RDI save/restore, definedness leak, and vmaskmovdqu policy
+        ("rdi_save_clobbers_prior_def", encode_seq(
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RAX, R.RCX),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RAX, R.RDI),
+            Instruction.create_reg_reg(Code.VEX_VMOVQ_XMM_RM64, R.XMM0, R.RAX),
+            st_xmm0, ret_ins), "GPR rax holds saved rdi"),
+        ("rdi_save_post_restore_still_unavail", encode_seq(
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RAX, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.RAX),
+            Instruction.create_reg_reg(Code.VEX_VMOVQ_XMM_RM64, R.XMM0, R.RAX),
+            st_xmm0, ret_ins), "GPR rax holds saved rdi"),
         ("vmaskmovdqu_no_r8_rdi", encode_seq(ld_xmm0, ld_xmm1, Instruction.create_vmaskmovdqu(
             64, R.XMM0, R.XMM1), ret_ins), "vmaskmovdqu requires r8-rooted rdi"),
         ("vmaskmovdqu_unsaved_rdi", encode_seq(ld_xmm0, ld_xmm1, Instruction.create_reg_reg(
@@ -654,19 +498,21 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
         ("unaligned_vmovaps", encode_seq(Instruction.create_reg_mem(
             Code.VEX_VMOVAPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX, displ=1, displ_size=1)), ret_ins),
             "unaligned 16-byte memory operand"),
-        ("rip_rel_mem", encode_seq(ld_xmm0, Instruction.create_reg_reg_mem(
-            Code.VEX_VADDSUBPS_XMM_XMM_XMMM128, R.XMM0, R.XMM0, MemoryOperand(R.RIP, displ=0x1020, displ_size=1)),
+        ("rip_rel_mem", encode_seq(Instruction.create_reg_mem(
+            Code.VEX_VMOVQ_XMM_XMMM64, R.XMM0, MemoryOperand(R.RIP, displ=0x1020, displ_size=1)),
             ret_ins), "unsupported memory operand"),
         ("indexed_mem", encode_seq(Instruction.create_reg_mem(
             Code.VEX_VMOVUPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX, R.RDX, 4)), ret_ins), "unsupported memory operand"),
-        # Prefixes, out-of-scope, undefined, stream boundary
+        # Prefixes, out-of-scope (including vaddsubps/vaddsubpd), undefined, stream boundary
         ("segment_prefix", encode_seq(seg_load, ret_ins), "unsupported instruction prefix"),
         ("lock_prefix", bytes.fromhex("f00fb109") + encode_seq(ret_ins), "unsupported instruction prefix"),
         ("rep_prefix", bytes.fromhex("f3a4") + encode_seq(ret_ins), "unsupported instruction prefix"),
+        ("out_of_scope_vaddsubps", encode_seq(ld_xmm0, ld_xmm1, Instruction.create_reg_reg_reg(
+            Code.VEX_VADDSUBPS_XMM_XMM_XMMM128, R.XMM0, R.XMM0, R.XMM1), ret_ins), "unsupported instruction"),
         ("out_of_scope_vaddps", encode_seq(ld_xmm0, ld_xmm1, Instruction.create_reg_reg_reg(
             Code.VEX_VADDPS_XMM_XMM_XMMM128, R.XMM0, R.XMM0, R.XMM1), ret_ins), "unsupported instruction"),
-        ("undef_xmm2", encode_seq(ld_xmm0, Instruction.create_reg_reg_reg(
-            Code.VEX_VADDSUBPS_XMM_XMM_XMMM128, R.XMM0, R.XMM0, R.XMM2), ret_ins), "undefined vector register ymm2"),
+        ("undef_xmm2", encode_seq(Instruction.create_reg_reg(
+            Code.VEX_VMOVQ_XMM_XMMM64, R.XMM0, R.XMM2), ret_ins), "undefined vector register ymm2"),
         ("undef_rax", encode_seq(Instruction.create_reg_reg(
             Code.VEX_VMOVQ_XMM_RM64, R.XMM0, R.RAX), ret_ins), "undefined GPR rax"),
         ("missing_ret", encode_seq(ld_xmm0), "missing terminal ret"),
@@ -701,10 +547,11 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
 
     unit_map = {lbl: raw for lbl, raw, _ in unit_cases}
     pe_patches = [
-        ("pe_legacy_addsubps", unit_map["legacy_addsubps"], "unsupported legacy SSE encoding"),
+        ("pe_legacy_movq", unit_map["legacy_movq_xmm"], "unsupported legacy SSE encoding"),
         ("pe_legacy_maskmovdqu", unit_map["legacy_maskmovdqu"], "unsupported legacy SSE encoding"),
         ("pe_evex_vmovq", unit_map["evex_vmovq"], "unsupported EVEX instruction"),
         ("pe_nonvolatile_ymm15", unit_map["nonvolatile_ymm15"], "nonvolatile vector register"),
+        ("pe_rdi_save_leak", unit_map["rdi_save_clobbers_prior_def"], "GPR rax holds saved rdi"),
         ("pe_unrestored_rdi", unit_map["vmaskmovdqu_unrestored_rdi"], "unrestored nonvolatile GPR rdi"),
         ("pe_store_outside_r8", unit_map["store_outside_r8_vmovq"], "non-r8 store memory operand"),
         ("pe_rip_rel", unit_map["rip_rel_mem"], "unsupported memory operand"),

@@ -623,7 +623,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("Uninitialized private wide LDS word")
                 vector.update(zip(registers, (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
-        elif m := re.fullmatch(r"ds_(add_u64|sub_u64|rsub_u64|and_b64|or_b64) v(\d+), "
+        elif m := re.fullmatch(r"ds_(add_u64|sub_u64|rsub_u64|and_b64|or_b64|xor_b64|"
+                               r"min_i64|max_i64|min_u64|max_u64) v(\d+), "
                                r"v\[(\d+):(\d+)\](?: offset:(0|8))?", line):
             op = m[1]
             addr, first, last = map(int, m.groups()[1:4])
@@ -636,10 +637,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             left, right = (source, previous) if op == "rsub_u64" else (previous, source)
             lo, hi = map(hlsl_word, left)
             rhs_lo, rhs_hi = map(hlsl_word, right)
-            if op in ("and_b64", "or_b64"):
-                symbol = "&" if op == "and_b64" else "|"
+            if op in ("and_b64", "or_b64", "xor_b64"):
+                symbol = {"and_b64": "&", "or_b64": "|", "xor_b64": "^"}[op]
                 low = f"({lo} {symbol} {rhs_lo})"
                 high = f"({hi} {symbol} {rhs_hi})"
+            elif op in ("min_i64", "max_i64", "min_u64", "max_u64"):
+                relation = "<" if op.startswith("min") else ">"
+                if op.endswith("_i64"):
+                    first = f"asint({hi}) {relation} asint({rhs_hi})"
+                else:
+                    first = f"{hi} {relation} {rhs_hi}"
+                condition = f"(({first}) || (({hi} == {rhs_hi}) && ({lo} {relation} {rhs_lo})))"
+                low = f"({condition} ? {lo} : {rhs_lo})"
+                high = f"({condition} ? {hi} : {rhs_hi})"
             elif op == "add_u64":
                 low = f"({lo} + {rhs_lo})"
                 high = f"({hi} + {rhs_hi} + uint({low} < {lo}))"

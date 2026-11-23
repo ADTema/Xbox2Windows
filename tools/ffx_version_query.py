@@ -346,8 +346,42 @@ def string_op(i):
     return f"{{ const word step = direction ? 0ull - {size}ull : {size}ull; {body} }}"
 
 
+# The host-MXCSR profile's refusal statuses: a requested word with a reserved bit (16-31), with one of the six
+# exception masks (bits 7-12) clear, or with FTZ (bit 15) or DAZ (bit 6), which the first profile leaves out.
+MXCSR_STATUS = {"reserved": 1, "unmasked": 2, "unsupported": 3}
+# A file that lowers with the host-MXCSR profile observes the floating-point environment.
+MXCSR_HEADER = "#pragma fenv_access(on)\n"
+
+
+class Mxcsr:
+    """The host-MXCSR profile's error channel. reject is a format string with a {status} field: C++ that leaves
+    the lowered function and hands the status to the caller, as for x87_lower.Checked."""
+
+    def __init__(self, reject):
+        self.reject = reject
+
+    def leave(self, name):
+        return self.reject.format(status=MXCSR_STATUS[name])
+
+
+def mxcsr_entry(name, inner):
+    """The exported boundary of a function lowered with the host-MXCSR profile. inner(a, b, c, state, &status) is
+    the lowered body. The boundary saves the caller's whole MXCSR and restores it on a normal return, after a
+    refusal and when a structured exception such as a guest memory fault leaves inner. <name>_status() returns the
+    refusal status of the calling thread's last call, 0 when none."""
+    return (f"static thread_local int {name}_last_status = 0;\n"
+            f'extern "C" __declspec(dllexport) int {name}_status() {{ return {name}_last_status; }}\n'
+            f'extern "C" __declspec(dllexport) word {name}(word a, word b, word c, word state) {{\n'
+            f"    const unsigned int caller_mxcsr = _mm_getcsr(); word result = 0; int status = 0;\n"
+            f"    __try {{ result = {inner}(a, b, c, state, &status); }} __finally {{\n"
+            f"        _mm_setcsr(caller_mxcsr);\n"
+            f"        {name}_last_status = status;\n"
+            f"    }}\n"
+            f"    return result;\n}}\n")
+
+
 def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, host_entropy=False,
-          host_cpu=False):
+          host_cpu=False, host_mxcsr=None):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = [f"word frame[{FRAME_WORDS}]{{}};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false, overflow=false, sign=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
@@ -443,7 +477,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
     }
     has_wide |= any(i.mnemonic in sse34_fp_ops for i in body)
     shuffle_ops = {
-        M.SHUFPS, M.UNPCKHPS, M.UNPCKLPS, M.MOVHLPS, M.MOVLHPS, M.MOVMSKPS, M.MOVUPS,
+        M.SHUFPS, M.UNPCKHPS, M.UNPCKLPS, M.MOVHLPS, M.MOVLHPS, M.MOVMSKPS, M.MOVUPS, M.MOVAPS,
         M.RCPPS, M.RCPSS, M.RSQRTPS, M.RSQRTSS,
         M.SHUFPD, M.UNPCKHPD, M.UNPCKLPD, M.MOVMSKPD, M.MOVUPD, M.MOVAPD, M.MOVDQA,
         M.VSHUFPS, M.VUNPCKHPS, M.VUNPCKLPS, M.VSHUFPD, M.VUNPCKHPD, M.VUNPCKLPD,
@@ -537,11 +571,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         M.VHADDPD: ("__m128d", "_mm_hadd_pd"),
         M.VHSUBPS: ("__m128", "_mm_hsub_ps"),
         M.VHSUBPD: ("__m128d", "_mm_hsub_pd"),
+        M.VADDSUBPS: ("__m128", "_mm_addsub_ps"),
+        M.VADDSUBPD: ("__m128d", "_mm_addsub_pd"),
     }
     has_wide |= any(i.mnemonic in avx_horiz_fp_ops for i in body)
 
     def lower_avx_horiz_fp(insn, vec_reader):
-        """Lower VEX-encoded 128/256-bit horizontal FP add/sub using 128-bit SSE3 intrinsics per lane."""
+        """Lower VEX-encoded 128/256-bit SSE3 FP add/sub (horizontal and alternating) using 128-bit intrinsics per lane."""
         dest = insn.op0_register
         valid_regs = wide if dest in wide else wide_xmm
         nbytes = 32 if dest in wide else 16
@@ -551,7 +587,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                 or insn.op2_kind not in (K.REGISTER, K.MEMORY)
                 or (insn.op2_kind == K.REGISTER and insn.op2_register not in valid_regs)
                 or (insn.op2_kind == K.MEMORY and MemorySizeExt.size(insn.memory_size) != nbytes)):
-            raise ValueError(f"unsupported AVX horizontal FP operation at {insn.ip:#x}: {insn}")
+            raise ValueError(f"unsupported AVX SSE3 FP operation at {insn.ip:#x}: {insn}")
         vtype, fn = avx_horiz_fp_ops[insn.mnemonic]
         dst, src1 = wide_any[dest], wide_any[insn.op1_register]
         rhs = wide_any[insn.op2_register] if insn.op2_kind == K.REGISTER else vec_reader(nbytes)
@@ -577,6 +613,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
     }
     has_wide |= has_avx_shuffle
     avx_compare = {M.VCMPPS: "ps", M.VCMPPD: "pd", M.VCMPSS: "ss", M.VCMPSD: "sd"}
+    legacy_packed_compare = {M.CMPPS: ("ps", "__m128"), M.CMPPD: ("pd", "__m128d")}
+    legacy_half_move = {M.MOVLPS: 0, M.MOVLPD: 0, M.MOVHPS: 8, M.MOVHPD: 8}
+    has_wide |= any(i.mnemonic in legacy_packed_compare or i.mnemonic in legacy_half_move for i in body)
     avx_test = {M.VPTEST: 1, M.VTESTPS: 4, M.VTESTPD: 8}
     avx_wide_conversion = {
         M.VCVTDQ2PS: ("cvtepi32_ps", "__m256i", "__m256", 32, 32),
@@ -832,6 +871,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             stmt = ("{ int cpu_regs[4]; __cpuidex(cpu_regs, static_cast<int>(rax), static_cast<int>(rcx)); "
                     "rax = static_cast<uint32_t>(cpu_regs[0]); rbx = static_cast<uint32_t>(cpu_regs[1]); "
                     "rcx = static_cast<uint32_t>(cpu_regs[2]); rdx = static_cast<uint32_t>(cpu_regs[3]); }")
+        elif op == M.LDMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+            # The opt-in host-MXCSR profile: the requested word is checked before it reaches the host register,
+            # so a refused word changes nothing and no later guest instruction runs.
+            stmt = (f"{{ const uint32_t want = {guest('uint32_t')}; "
+                    f"if (want & 0xffff0000u) {host_mxcsr.leave('reserved')} "
+                    f"if ((want & 0x1f80u) != 0x1f80u) {host_mxcsr.leave('unmasked')} "
+                    f"if (want & 0x8040u) {host_mxcsr.leave('unsupported')} "
+                    f"_mm_setcsr(want); }}")
+        elif op == M.STMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+            stmt = f"store<uint32_t>({address()}, _mm_getcsr());"
         elif op == M.XGETBV and host_cpu:
             # The host's extended control register ECX into EDX:EAX, flags kept. Any ECX is passed through, but
             # the supported contract is a caller that checked OSXSAVE and reads XCR0 (ECX = 0); an invalid index
@@ -1230,6 +1279,22 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                     f"for (size_t n = {stride - 1}; n < {nbytes}; n += {stride}) {{ "
                     f"const unsigned a = {lhs}[n], b = rhs[n] & {mask}u; z |= a & b; c |= ~a & b; }} "
                     f"zero = z == 0; carry = c == 0; overflow = false; sign = false;{pf} }}")
+        elif op in legacy_packed_compare and i.encoding == EncodingKind.LEGACY:
+            suffix, fp_vector = legacy_packed_compare[op]
+            if i.op0_kind != K.REGISTER or i.op0_register not in wide_xmm:
+                raise ValueError(f"unsupported packed SSE compare destination at {i.ip:#x}: {i}")
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.MEMORY:
+                rhs = f"load_legacy_aligned_m128({address()})"
+            elif i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                rhs = wide_xmm[i.op1_register]
+            else:
+                raise ValueError(f"unsupported packed SSE compare source at {i.ip:#x}: {i}")
+            predicate = ("eq", "lt", "le", "unord", "neq", "nlt", "nle", "ord")[i.immediate(2) & 7]
+            stmt = (f"{{ {fp_vector} lhs, rhs; memcpy(&lhs, {dst}.data(), 16); "
+                    f"memcpy(&rhs, {rhs}.data(), 16); "
+                    f"const {fp_vector} result = _mm_cmp{predicate}_{suffix}(lhs, rhs); "
+                    f"memcpy({dst}.data(), &result, 16); }}")
         elif op in avx_compare:
             suffix = avx_compare[op]
             scalar = suffix in ("ss", "sd")
@@ -2330,6 +2395,25 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                 stmt = f"memset({dst}.data()+16, 0, 16);" if is_vex else ";"
             else:
                 stmt = f"{{ memcpy({dst}.data(), {src}.data(), 16); {' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}"
+        elif op in legacy_half_move and i.encoding == EncodingKind.LEGACY:
+            offset = legacy_half_move[op]
+            if i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and i.op1_kind == K.MEMORY:
+                stmt = (f"{{ const uint64_t value = {guest('uint64_t')}; "
+                        f"memcpy({wide_xmm[i.op0_register]}.data() + {offset}, &value, 8); }}")
+            elif i.op0_kind == K.MEMORY and i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                stmt = (f"{{ uint64_t value; memcpy(&value, {wide_xmm[i.op1_register]}.data() + {offset}, 8); "
+                        f"store<uint64_t>({address()}, value); }}")
+            else:
+                raise ValueError(f"unsupported SSE half move form at {i.ip:#x}: {i}")
+        elif op in (M.MOVAPS, M.MOVAPD, M.MOVDQA) and i.encoding == EncodingKind.LEGACY and has_wide:
+            if i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and i.op1_kind == K.MEMORY:
+                stmt = (f"{{ const auto bytes = load_legacy_aligned_m128({address()}); "
+                        f"memcpy({wide_xmm[i.op0_register]}.data(), bytes.data(), 16); }}")
+            elif i.op0_kind == K.MEMORY and i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                stmt = (f"{{ const word target = {address()}; if (target & 15u) raise_aligned_m128_fault(); "
+                        f"memcpy(reinterpret_cast<void*>(target), {wide_xmm[i.op1_register]}.data(), 16); }}")
+            else:
+                raise ValueError(f"unsupported aligned SSE move form at {i.ip:#x}: {i}")
         elif op in (M.MOVUPS, M.MOVUPD) and has_wide:
             is_vex = i.encoding == EncodingKind.VEX
             if i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and i.op1_kind == K.MEMORY:
