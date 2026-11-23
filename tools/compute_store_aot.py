@@ -12,6 +12,8 @@ from resource_inventory import parts
 
 CONSTANT_WORDS = 16
 AXES = "xyz"
+# Unsigned VOPC compares a lane guard may use: v_cmp_<op>_u32 a, b is (a <op> b) per lane.
+GUARD_COMPARES = {"gt": ">", "lt": "<", "ge": ">=", "le": "<="}
 
 
 def checked_group(group):
@@ -32,6 +34,32 @@ def group_size(psv):
 
 def is_word(value):
     return isinstance(value, int) or (isinstance(value, tuple) and value[0] in ("constant_word", "thread"))
+
+
+def hlsl_word(value):
+    if isinstance(value, int):
+        return f"0x{value:08x}u"
+    return f"tid.{AXES[value[1]]}" if value[0] == "thread" else f"params[{value[1] // 4}].{'xyzw'[value[1] % 4]}"
+
+
+def labelled(decoded):
+    """Name each s_cbranch_execz target as a label; decoded is [(byte offset, instruction)].
+
+    Only forward targets at a decoded instruction boundary are named. lower() then checks
+    where the label sits.
+    """
+    starts = {pc for pc, _ in decoded}
+    targets, lines = set(), []
+    for pc, line in decoded:
+        if m := re.fullmatch(r"s_cbranch_execz (-?\d+)", line):
+            # A backward target, printed signed or as its 16-bit pattern, is never accepted.
+            target = pc + 4 + 4 * int(m[1])
+            if target <= pc or target not in starts:
+                raise ValueError("Branch outside decoded instruction boundaries")
+            targets.add(target)
+            line = f"s_cbranch_execz .L{target}"
+        lines.append((pc, line))
+    return [item for pc, line in lines for item in ([f".L{pc}:"] if pc in targets else []) + [line]]
 
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
@@ -64,11 +92,24 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     stores = []
     written_spans = []
     layout = None
+    # One per-lane guard: v_cmp into vcc_lo, s_and_saveexec_b32, the stores under the mask, then
+    # s_or_b32 restoring exec or the final exit. An optional s_cbranch_execz must land exactly
+    # where the guarded stores end. The guarded stores become an HLSL if.
+    vcc = guard = None
+    guard_span = None
     if not instructions or instructions[-1] != "s_endpgm":
         raise ValueError("Missing final program exit")
 
     for line in instructions[:-1]:
-        if re.fullmatch(r"s_inst_prefetch (?:0x[0-9a-f]+|\d+)|s_nop \d+", line):
+        if m := re.fullmatch(r"(\.L\w+):", line):
+            if guard is None or guard["label"] != m[1] or guard["at_label"]:
+                raise ValueError("Unverified branch target")
+            guard["at_label"] = True
+            continue
+        if (guard is not None and guard["at_label"]
+                and not re.fullmatch(r"s_waitcnt_depctr 0x[0-9a-f]+|s_nop \d+|s_or_b32 .*", line)):
+            raise ValueError("Lane guard branch does not reach its restore")
+        if re.fullmatch(r"s_inst_prefetch (?:0x[0-9a-f]+|\d+)|s_nop \d+|s_waitcnt_depctr 0x[0-9a-f]+", line):
             continue
         if m := re.fullmatch(r"s_clause (0x[0-9a-f]+|\d+)", line):
             if int(m[1], 0) > 0x3f:
@@ -78,6 +119,49 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             pending.clear()
         elif line == "s_waitcnt vmcnt(0)":
             continue
+        elif m := re.fullmatch(r"v_cmp_(gt|lt|ge|le)_u32_e32 vcc_lo, (s\d+|v\d+|-?\d+|0x[0-9a-f]+), v(\d+)", line):
+            op, src, right = m[1], m[2], int(m[3])
+            if src[0] in "sv":
+                n = int(src[1:])
+                left = (None if src[0] == "s" and (n > 105 or n in pending) or src[0] == "v" and n > 255
+                        else (scalar if src[0] == "s" else vector).get(n))
+            else:
+                value = int(src, 0)
+                left = value & 0xffffffff if -(1 << 31) <= value <= 0xffffffff else None
+            if not is_word(left) or right > 255 or not is_word(vector.get(right)):
+                raise ValueError("Unverified lane guard compare")
+            vcc = (op, left, vector[right])
+        elif m := re.fullmatch(r"s_and_saveexec_b32 s(\d+), vcc_lo", line):
+            saved = int(m[1])
+            if guard_span is not None or vcc is None or saved > 105 or saved in pending:
+                raise ValueError("Unverified or repeated lane guard")
+            guard = dict(label=None, at_label=False, holders=None,
+                         scalar=dict(scalar), vector=dict(vector), pending=set(pending))
+            scalar[saved] = ("exec",)
+            guard_span = [len(stores), None, vcc]
+        elif m := re.fullmatch(r"s_cbranch_execz (\.L\w+)", line):
+            # Taken only when no lane passed the guard; it must skip exactly the guarded stores.
+            if guard is None:
+                raise ValueError("Unverified lane guard branch")
+            guard["label"] = m[1]
+            # A taken branch skips the block: only an SGPR that holds the mask here holds it on both paths.
+            holders = {reg for reg, value in scalar.items() if value == ("exec",)}
+            guard["holders"] = holders if guard["holders"] is None else guard["holders"] & holders
+        elif m := re.fullmatch(r"s_or_b32 exec_lo, (?:exec_lo, s(\d+)|s(\d+), exec_lo)", line):
+            # Any SGPR that still holds the saved mask restores it, on the skipped path too.
+            reg = int(m[1] or m[2])
+            if (guard is None or scalar.get(reg) != ("exec",)
+                    or guard["label"] is not None and (not guard["at_label"] or reg not in guard["holders"])):
+                raise ValueError("Unverified lane guard restore")
+            # Registers written under the guard keep their old values in the lanes that did not
+            # pass it, or in the whole wave when the branch skips the block: unknown after the
+            # restore. A wait under the guard may have been skipped, so earlier loads stay pending.
+            for state, before in ((scalar, guard["scalar"]), (vector, guard["vector"])):
+                for reg in [reg for reg, value in state.items() if reg not in before or before[reg] != value]:
+                    del state[reg]
+            pending |= guard["pending"]
+            guard = None
+            guard_span[1] = len(stores)
         elif m := re.fullmatch(r"s_mov_b32 s(\d+), (s\d+|-?\d+|0x[0-9a-f]+)", line):
             dst, src = int(m[1]), m[2]
             if dst in pending or dst > 105:
@@ -280,18 +364,23 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             values = [vector.get(reg) for reg in range(first, first + count)]
             if not all(is_word(value) for value in values):
                 raise ValueError("Store data is not a known word")
-            words = ", ".join(
-                f"0x{value:08x}u" if isinstance(value, int)
-                else f"tid.{AXES[value[1]]}" if value[0] == "thread"
-                else f"params[{value[1] // 4}].{'xyzw'[value[1] % 4]}"
-                for value in values
-            )
+            words = ", ".join(map(hlsl_word, values))
             arg = words if count == 1 else f"uint{count}({words})"
             stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
         else:
             raise ValueError(f"Unsupported compute instruction: {line}")
     if not stores:
         raise ValueError("Expected at least one observable store")
+    if guard is not None and guard["label"] is not None and not guard["at_label"]:
+        raise ValueError("Unverified branch target")
+    if guard_span is not None:
+        # Without a restore the mask holds until the exit.
+        start, end = guard_span[0], len(stores) if guard_span[1] is None else guard_span[1]
+        if start == end:
+            raise ValueError("Expected a store under the lane guard")
+        op, left, right = guard_span[2]
+        stores[start:end] = [f"    if ({hlsl_word(left)} {GUARD_COMPARES[op]} {hlsl_word(right)}) {{",
+                             *("    " + store for store in stores[start:end]), "    }"]
     body = "\n".join(stores)
     cbuffer = (f"cbuffer Constants : register(b0) {{ uint4 params[{CONSTANT_WORDS // 4}]; }};\n"
                if constant_descriptor is not None else "")
@@ -318,7 +407,7 @@ def main():
     chunks = parts(blob)
     group = group_size(chunks.get(b"PSV0", b""))
     code = container_code(chunks.get(b"DXIL", b""), stage=5, llvm=args.llvm)
-    source = lower(disassemble(code, args.llvm), group, table_reg=args.table_reg,
+    source = lower(labelled(disassemble(code, args.llvm, offsets=True)), group, table_reg=args.table_reg,
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z)

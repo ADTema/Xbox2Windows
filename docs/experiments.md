@@ -1828,6 +1828,27 @@ An `s_branch` that skips an alignment NOP at the start is still accepted, and th
 
 These are fixture results only. The 1,002 multi-exit CS records in the [fixed-profile rescan](#fixed-profile-archive-rescan) have not been split by marker count, so it is not known how many have exactly two exits or this layout. Their counts have not been remeasured after this change.
 
+### Per-lane guards around compute stores
+
+A per-lane bound such as `if (gid < n) store` compiles under LLVM 15 to one exit, with no early `s_endpgm`. A `v_cmp` sets `vcc_lo`, `s_and_saveexec_b32` saves `exec_lo` and masks it, and an optional `s_cbranch_execz` skips the masked block when no lane passes. `s_or_b32 exec_lo, exec_lo, sN` then restores the mask, or the program exits with the mask still applied. The store profile lowers this form as control flow: the stores issued under the mask go inside an HLSL `if`, and stores after the restore stay outside it.
+
+The accepted subset is small:
+
+- one guard per program, not nested;
+- `v_cmp_{gt,lt,ge,le}_u32_e32 vcc_lo, a, vN`, where both operands are known words (a dispatch index, a constant word or an immediate). The operator and operand order are kept;
+- `s_and_saveexec_b32` from `vcc_lo` only, and a restore from an SGPR that still holds the saved mask. With a branch, that SGPR must already hold it at the branch, so that it holds the mask when the block is skipped too;
+- `s_waitcnt_depctr` as a no-op.
+
+The CLI names each decoded `s_cbranch_execz` target as a label. The target must be forward, at a decoded instruction start, and exactly at the end of the masked block. Only `s_waitcnt_depctr` or `s_nop` may come between the target and the restore or the exit. A register written under the guard is unknown after the restore, since the lanes that did not pass, or a skipped block, keep the old value. A scalar load that was waited for only under the guard is pending again after the restore.
+
+The two fixtures are unchanged LLVM 15 code generator output for original `amdgpu_cs` sources with a group of 32. One keeps the guard to the exit and sinks the u0 descriptor load under it. The other restores the mask before a second, unguarded store. Their bindings are `--table-reg 0 --descriptor-offset 0 --constant-descriptor 32 --group-reg 1` with `--stride 4` or `--stride 8`, and the bound `n` is `params[0].x`.
+
+The Windows fixture reads back all 320 words with the untouched words at a sentinel value. It runs seven dispatches per program, from one group with `n` of 0, 17 and 32 to three groups with `n` of 1, 70, 96 and 200. The guarded words of lanes at or past the bound must stay untouched. On three groups with `n = 70`, a reference built for 69 or 71 must fail, and so must recompiled HLSL with the guard inverted, off by one or removed. For the second program, HLSL that keeps the second store under the guard must also fail.
+
+The CPU controls reject a missing or wrong restore, a saved mask overwritten under the guard, a restore from a copy made only inside the skipped block, a branch target before, inside or after the end of the masked block, a branch without a label, a label without a branch, a second branch to another label, `s_cbranch_execnz`, wave64 `s_and_saveexec_b64`, a mask from another source, a compare of an unknown, pending or non-word operand, a nested or second guard, a guard around no store, and registers written or waited for only under the guard and then used after the restore. Removing both the restore and the branch is accepted with both stores inside the `if`, because the mask then holds until the exit.
+
+`shader_profile_audit.py` is unchanged. It does not bind b0, so it does not try guards that read their bound from a constant, and it does not label branches.
+
 ### Two- and three-dimensional thread groups
 
 The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits
