@@ -1252,6 +1252,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_mmx_original>"
         "$<TARGET_FILE:cpu_sse_mmx_original_lifted>"
         "$<TARGET_FILE:cpu_sse_mmx_altered_lifted>")
+    set(cpu_sse_fxsave_exports
+        "op_fxsave_only,op_fxsave64_only,op_fxrstor_fxsave,op_fxrstor64_fxsave64,"
+        "op_fxrstor_fxsave64,op_fxrstor64_fxsave,op_fxrstor64_disp,op_pipeline,"
+        "op_discarded_read")
+    string(CONCAT cpu_sse_fxsave_exports ${cpu_sse_fxsave_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse_fxsave_${variant} sse_fxsave)
+        cpu_translation(cpu_sse_fxsave_${variant} cpu_sse_fxsave_aot "${cpu_sse_fxsave_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse_fxsave_altered PRIVATE ALTER_OP)
+    add_test(NAME cpu_aot_sse_fxsave COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fxsave_check.py"
+        "$<TARGET_FILE:cpu_sse_fxsave_original>"
+        "$<TARGET_FILE:cpu_sse_fxsave_original_lifted>"
+        "$<TARGET_FILE:cpu_sse_fxsave_altered_lifted>")
+    set_tests_properties(cpu_aot_sse_fxsave PROPERTIES SKIP_RETURN_CODE 77)
     # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
     # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
     set(tail_files)
