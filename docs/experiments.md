@@ -2341,7 +2341,7 @@ or signed extraction with its low or unsigned counterpart and expect a mismatch.
 when M0 is explicitly zero, the instruction offset is zero and a single
 full wave32 makes TID equal to local X. The fixture writes through each
 addressing mode and reads through the other, then compares both words.
-Returning the first value for the second read must mismatch at word 1.
+Returning the first value for the second read must mismatch at word 1. The implicit address uses a four-byte stride. The lowerer rejects it if a 16-byte private LDS stride also appears in the program, regardless of which form comes first.
 
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one

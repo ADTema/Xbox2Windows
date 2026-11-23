@@ -162,9 +162,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     ds_steps = []
     lds_enabled = ds_group and 128 <= lds_bytes <= 65536
     lds_word = None
-    lds_addtid_base_zero = False
     lds_wide_words = {}
     lds_address_shift = None
+    lds_addtid_base_zero = False
     ds_wait = False
     written_spans = []
     layout = None
@@ -483,7 +483,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if not lds_addtid_base_zero or guard_span is not None or reg > 255:
                 raise ValueError("Unverified private LDS thread-ID access")
             if lds_address_shift not in (None, 2):
-                raise ValueError("Mixed private LDS address layouts")
+                raise ValueError("Mixed private LDS address strides")
             lds_address_shift = 2
             if op == "write":
                 value = vector.get(reg)
