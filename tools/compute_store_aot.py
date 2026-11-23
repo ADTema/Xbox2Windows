@@ -445,6 +445,46 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             lds_word = new_word
             ds_wait = True
         elif m := re.fullmatch(
+                r"ds_((?:cmpst|mskor)(?:_rtn)?|wrxchg_rtn)_b64 "
+                r"(?:(v\[\d+:\d+\]), )?v(\d+), (v\[\d+:\d+\])(?:, (v\[\d+:\d+\]))?"
+                r"(?: offset:(0|8))?", line):
+            op, dst, addr, data, data2, offset = m.groups()
+            returns = op.endswith("_rtn")
+            exchange = op.startswith("wrxchg")
+            slot = int(offset or 0) // 4
+            old_words = (lds_wide_words.get(slot), lds_wide_words.get(slot + 1))
+            if (guard_span is not None or vector.get(int(addr)) != ("lds_wide_address",)
+                    or returns != (dst is not None) or exchange == (data2 is not None)
+                    or not all(map(is_word, old_words))):
+                raise ValueError("Unverified private wide LDS replacement")
+            ranges = []
+            for operand in (item for item in (data, data2, dst) if item is not None):
+                first, last = map(int, operand[2:-1].split(":"))
+                if last > 255 or last != first + 1:
+                    raise ValueError("Unverified private wide LDS replacement range")
+                ranges.append((first, last))
+            source = tuple(vector.get(reg) for reg in ranges[0])
+            other = tuple(vector.get(reg) for reg in ranges[1]) if not exchange else ()
+            if not all(map(is_word, source + other)):
+                raise ValueError("Unverified private wide LDS replacement source")
+            if not exchange:
+                old_low, old_high = map(hlsl_word, old_words)
+                data_low, data_high = map(hlsl_word, source)
+                new_low, new_high = map(hlsl_word, other)
+                if op.startswith("cmpst"):
+                    equal = f"({old_low} == {data_low} && {old_high} == {data_high})"
+                    low, high = f"({equal} ? {new_low} : {old_low})", f"({equal} ? {new_high} : {old_high})"
+                else:
+                    low = f"(({old_low} & ~{data_low}) | {new_low})"
+                    high = f"(({old_high} & ~{data_high}) | {new_high})"
+                if max(len(low), len(high)) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("LDS expression exceeds the profile limit")
+                source = (("alu", low), ("alu", high))
+            if returns:
+                vector.update(zip(ranges[-1], old_words))
+            lds_wide_words.update(zip(range(slot, slot + 2), source))
+            ds_wait = True
+        elif m := re.fullmatch(
                 r"ds_(read2st64_b(?:32|64)|write2st64_b(?:32|64)|wrxchg2st64_rtn_b32) "
                 r"(v\[\d+:\d+\]|v\d+), (v\[\d+:\d+\]|v\d+)"
                 r"(?:, (v\[\d+:\d+\]|v\d+))?(?:, (v\[\d+:\d+\]|v\d+))?"
