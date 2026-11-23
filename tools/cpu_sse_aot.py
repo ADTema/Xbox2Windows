@@ -19,7 +19,8 @@ import pefile
 from iced_x86 import ConditionCode as CC, FlowControl, MemorySizeExt, Mnemonic as M, OpKind, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
-from cpu_switch_aot import ALU, Function, Lifter, NAMES, PRELUDE, VOLATILE, full, signed, unsigned
+from cpu_switch_aot import (CMOVCC, FLAG_PRODUCERS, Function, Lifter, NAMES, PRELUDE, SETCC, VOLATILE,
+                            flag_producer, full, signed, unsigned)
 
 
 SLOTS = (R.RCX, R.RDX, R.R8, R.R9)
@@ -98,7 +99,7 @@ class ScalarLifter(Lifter):
         name = XMM[register]
         return f"{name} = {bits};" if width == 8 else f"{name} = low({name}, {bits});"
 
-    def statement(self, ins, next_ins):
+    def statement(self, ins, next_ins, sets_flags=False, producer=None):
         mnemonic = ins.mnemonic
         reads, writes = set(), set()
         self.merges = []
@@ -117,7 +118,8 @@ class ScalarLifter(Lifter):
             if vector:
                 raise unsupported
             text, gpr_reads, gpr_writes = super().statement(
-                ins, next_ins is not None and next_ins.flow_control == FlowControl.CONDITIONAL_BRANCH)
+                ins, sets_flags or (next_ins is not None and next_ins.flow_control == FlowControl.CONDITIONAL_BRANCH),
+                producer)
             # This leaf profile tracks whole GPRs. A byte or word write retains the previous high bits.
             partial = {register for register, width in gpr_writes.items() if width < 4}
             return text, set(gpr_reads) | partial, set(gpr_writes)
@@ -228,7 +230,7 @@ def condition(function, edges, lifter, jcc):
         return CONDITIONS[jcc.condition_code]
     if current is not jcc:
         raise ValueError(f"flags cross a branch before RVA {jcc.ip:#x}")
-    if producer.mnemonic not in (*ALU, M.CMP, M.TEST, M.INC, M.DEC):
+    if producer.mnemonic not in FLAG_PRODUCERS:
         raise ValueError(f"unsupported flag producer at RVA {producer.ip:#x}")
     return lifter.condition(producer, jcc)
 
@@ -240,6 +242,9 @@ def lift(pe, name, result, slots):
     lifter = ScalarLifter(result)
     order = sorted(function.instructions)
     instructions = function.instructions
+    producers = {ip: flag_producer(function, edges, ins) for ip, ins in instructions.items()
+                 if ins.mnemonic in SETCC | CMOVCC}
+    sets_flags = {producer.ip for producer in producers.values()}
     body = {}
     effects = {}
     for ip in order:
@@ -255,7 +260,7 @@ def lift(pe, name, result, slots):
         else:
             if ins.mnemonic != M.RET and ins.is_stack_instruction:
                 raise ValueError(f"stack operation in leaf profile at RVA {ip:#x}")
-            body[ip], reads, writes = lifter.statement(ins, following)
+            body[ip], reads, writes = lifter.statement(ins, following, ip in sets_flags, producers.get(ip))
             effects[ip] = (reads, writes, lifter.merges)
         reads, writes, merges = effects[ip]
         touched = reads | writes | {key for pair in merges for key in pair}
