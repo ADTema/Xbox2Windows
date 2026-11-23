@@ -5122,6 +5122,64 @@ optimization. It does not attribute the archive cohort. The archive trace's
 `loop-rotate` stall and Jump Threading profile are different passes, and the 695
 replay timeouts remain unattributed.
 
+#### Output parity of `-opt-disable gvn` on the minimized case
+
+`dxc_gvn_output_warp` and `dxc_gvn_output_hardware` (`tests/dxc_gvn_output_check.py`)
+compile `condstore_256` twice, once with default optimization and once with
+`-opt-disable gvn`. They dispatch both blobs with identical inputs and compare the
+complete raw UAV bit for bit, with each other and with an expected buffer that the
+script computes from the HLSL alone. The two containers are different programs. The
+default build folds the alternating branch conditions into phis, and the `-opt-disable
+gvn` build recomputes each condition. The script prints both SHA-256 values and fails
+if they are equal.
+
+- **Inputs:** the sampler fixture's bindings, with t0 a 2x1 R32_FLOAT texture
+  (0.25, 0.75), the wrap/clamp point samplers and the LESS_EQUAL comparison samplers.
+  u0 is a 70,656-byte raw buffer, pre-filled so that word i holds
+  `((i + 1) * 0x9E3779B1) | 1`. Words the shader does not write therefore keep a
+  distinct value.
+- **Dispatches:** one with 1 group and one with 2 groups. `offscreen_check <adapter>
+  --raw-uav-dump <cso> <groups> <bytes> <out.bin>` performs the dispatch and writes
+  the whole UAV.
+- **Expected buffer:** the control words 0-3 are the sampler fixture's values. For
+  group x, word 16384+k becomes `gl_WorkGroupID.y` (0) when `(x + k) & 1` is set.
+  Every other word keeps the fill, so 130 words change with 1 group and 260 with 2.
+- **Wrong-output controls:**
+  - A mutated source, with store k=101 redirected into the unused tail (word 16704)
+    and compiled with default optimization, must mismatch at exactly words 16485 and
+    16704 in both dispatches.
+  - Flipping one bit of expected word 16385 must give exactly that one mismatch.
+- **Target:** cs_6_0 without native 16-bit types. The compile-time measurements above
+  use cs_6_6, but the Windows 10 in-box D3D12 runtime exposes SM 6.6 neither on WARP
+  nor on the RTX 3060 (`offscreen_check` reports `skip: ... requires SM 6.6` on both).
+  At cs_6_0, GVN still takes 81.8 % of the pass time of `condstore_1024` (DXC
+  1.7.2308.16).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^dxc_gvn_output_(warp|hardware)$' -V
+# direct form, with the DXC under test
+out\pe-env\Scripts\python.exe -B tests\dxc_gvn_output_check.py <path-to-dxc.exe> out\build\dev\offscreen_check.exe warp
+```
+
+Measured on 2026-11-23 on Windows 10 Pro build 19045 (Ryzen 7 3700X). WARP was the
+in-box `d3d10warp.dll` 10.0.19041.5794 and the hardware adapter was an NVIDIA GeForce
+RTX 3060 (driver 32.0.15.9636). No Agility SDK and no debug layer were used. With DXC
+1.7.2308.16 (`52da17e29`, the configured CTest DXC) and with DXC 1.9.0.5512
+(`01b62ad47`, LunarG Vulkan SDK 1.4.363.0), both adapters gave the same result:
+
+- the default and `-opt-disable gvn` buffers matched each other and the expected
+  buffer in all 17,664 words, for both dispatches;
+- the mutated-store control mismatched at exactly [16485, 16704];
+- the corrupted-expected control mismatched at exactly [16385].
+
+There were no capability skips. The container hashes were `cc17e4dc...` (default) and
+`649f66ed...` (`-opt-disable gvn`) for 1.7.2308.16, and `ac0ff6cb...` and `11042b5a...`
+for 1.9.0.5512.
+
+This supports output equivalence of the GVN option on this one minimized shader, for
+these inputs, dispatch sizes and adapters. It says nothing about larger members of the
+family, other shaders, cs_6_6 DXIL, production flags or the archive cohort.
+
 ### Mesh shader -Od pipeline creation across adapters
 
 [#810](https://github.com/R0Y00/Xbox2Windows/issues/810) asks whether mesh shader DXIL
