@@ -78,21 +78,30 @@ def inspect_executable(path):
             if section.SizeOfRawData and section.PointerToRawData + section.SizeOfRawData > size:
                 raise ValueError("Section extends beyond end of file")
 
+        def section_span(section):
+            """Bytes the loader maps for a section: VirtualSize, else raw size, inside the image."""
+            span = section.Misc_VirtualSize or section.SizeOfRawData
+            return min(span, max(0, hdr.SizeOfImage - section.VirtualAddress))
+
         def section_for(rva, length, *, executable=False):
             for s in pe.sections:
                 offset = rva - s.VirtualAddress
-                if (0 <= offset and offset + length <= s.SizeOfRawData and
+                if (0 <= offset and offset + length <= section_span(s) and
                         rva + length <= hdr.SizeOfImage and
                         (not executable or s.Characteristics & 0x20000000)):
                     return s
             raise ValueError(f"Unmapped or unsuitable RVA {rva:#x}")
 
         def read_rva(rva, length):
-            section_for(rva, length)
-            data = pe.get_data(rva, length)
-            if len(data) != length:
+            section = section_for(rva, length)
+            offset = rva - section.VirtualAddress
+            # A zero raw pointer leaves the entire section zero-filled, as in pe_map.
+            raw_size = section.SizeOfRawData if section.PointerToRawData else 0
+            file_backed = min(length, max(0, raw_size - offset))
+            data = section.get_data(rva, file_backed) if file_backed else b""
+            if len(data) != file_backed:
                 raise ValueError(f"Truncated data at RVA {rva:#x}")
-            return data
+            return data + bytes(length - file_backed)
 
         entry = hdr.AddressOfEntryPoint
         entry_section = section_for(entry, 1, executable=True) if entry else None
@@ -106,7 +115,7 @@ def inspect_executable(path):
                 if callbacks:
                     table = callbacks - hdr.ImageBase
                     section = section_for(table, 8)
-                    slots = (section.VirtualAddress + section.SizeOfRawData - table) // 8
+                    slots = (section.VirtualAddress + section_span(section) - table) // 8
                     for i in range(min(slots, 65536)):
                         va, = struct.unpack("<Q", read_rva(table + i * 8, 8))
                         if not va:

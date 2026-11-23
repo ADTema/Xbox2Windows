@@ -10,7 +10,7 @@ from iced_x86 import Decoder, Formatter, FormatterSyntax, Mnemonic as M, Registe
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools'))
 from cpu_leaf_aot import bounded_code, export_rva
-from cpu_switch_aot import Lifter, PRELUDE, translate
+from cpu_switch_aot import HostImport, Lifter, PRELUDE, Program, lift, translate
 
 WORD = C.c_uint64
 MASK = (1 << 64) - 1
@@ -20,7 +20,12 @@ WIDTHS = dict(b=1, w=2, d=4, q=8)
 NAMES = ('rep_movsb_forward', 'rep_movsw_forward', 'rep_movsd_forward', 'rep_movsq_forward', 'rep_stosb_forward', 'rep_stosw_forward', 'rep_stosd_forward', 'rep_stosq_forward', 'rep_movsb_backward', 'rep_movsw_backward', 'rep_movsd_backward', 'rep_movsq_backward', 'rep_stosb_backward', 'rep_stosw_backward', 'rep_stosd_backward', 'rep_stosq_backward', 'once_movsb_forward', 'once_movsw_forward', 'once_movsd_forward', 'once_movsq_forward', 'once_stosb_forward', 'once_stosw_forward', 'once_stosd_forward', 'once_stosq_forward', 'once_movsb_backward', 'once_movsw_backward', 'once_movsd_backward', 'once_movsq_backward', 'once_stosb_backward', 'once_stosw_backward', 'once_stosd_backward', 'once_stosq_backward', 'branch_direction', 'loop_copy', 'call_copy')
 
 
+NAMES += ('once_movsb_cleared',)
+
+
 def spec(name, backwards):
+    if name == 'once_movsb_cleared':
+        return 'movs', 1, False, False, 1
     if name in ('branch_direction', 'loop_copy', 'call_copy'):
         return 'movs', 1, True, backwards if name == 'branch_direction' else False, 3 if name == 'loop_copy' else 1
     repeat, operation, direction = name.split('_')
@@ -45,7 +50,9 @@ def reference(initial, source, target, fill, count, name, backwards):
 
 def rejection_checks(image):
     data = Path(image).read_bytes()
-    cases = [(name, data, 'direction flag') for name in ('bad_df_call', 'bad_df_tail', 'bad_df_join')]
+    cases = [(name, data, 'direction flag') for name in
+             ('bad_df_call', 'bad_df_tail', 'bad_df_join', 'bad_df_mixed_call', 'bad_df_back_edge')]
+    cases.append(('bad_once_stosb_rcx', data, 'undefined register rcx'))
     with pefile.PE(str(image), fast_load=True) as pe:
         def instructions(name):
             start = export_rva(pe, name)
@@ -65,6 +72,15 @@ def rejection_checks(image):
         # Do not invent an RSI/RDI value if the only definition is removed.
         patch('rep_movsb_forward', lambda i: i.mnemonic == M.MOV and i.op0_register == R.RSI,
               b'\x90'*3, 'nonvolatile register')
+        name = 'bad_df_host_call'
+        call = next(i for i in instructions(name) if i.mnemonic == M.CALL)
+        program = Program(pe, imports={call.ip_rel_memory_address: HostImport('host_call', (), 8)})
+        try:
+            lift(pe, name, program=program)
+        except ValueError as exc:
+            assert str(exc) == f'direction flag may be set at call or return RVA {call.ip:#x}', str(exc)
+        else:
+            raise AssertionError(f'Accepted {name}: direction flag')
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / 'rejected.dll'
         for name, altered, expected in cases:
@@ -84,7 +100,14 @@ def rejection_checks(image):
             pass
         else:
             raise AssertionError(f'Accepted unsupported {instruction}')
-    print(f'{len(cases)} whole-PE rejection controls and 5 unsupported forms rejected')
+    instruction = next(iter(Decoder(64, bytes.fromhex('67a4'))))
+    try:
+        Lifter().statement(instruction)
+    except ValueError as exc:
+        assert str(exc) == 'unsupported string addressing or prefix at RVA 0x0', str(exc)
+    else:
+        raise AssertionError(f'Accepted unsupported {instruction}')
+    print(f'{len(cases) + 1} whole-PE rejection controls and 6 unsupported forms rejected')
 
 
 def emit_mutants(image, output):
@@ -130,15 +153,16 @@ def differential(probe_path, native_path, *lifted_paths):
     libraries = [C.CDLL(str(Path(path).resolve())) for path in (native_path, *lifted_paths)]
     storage = (C.c_ubyte * 1024)()
     base = C.addressof(storage)
+    assert base % 2 == 0, 'the odd-source case needs an even base'
     initial = bytes((i*73 + (i >> 3)*19 + 17) & 255 for i in range(len(storage)))
     cases = 0
     for name in NAMES:
         functions = [getattr(lib, ('' if n == 0 else 'lifted_') + name) for n, lib in enumerate(libraries)]
         for count in (0, 1, 2, 3, 7, 16, 31):
-            for delta in (None, -7, -1, 0, 1, 7):
-                for fill in (0, 0x80ff7f0100ff0180, MASK):
+            for delta in (None, 'odd', -7, -1, 0, 1, 7, 8):
+                for fill in (0, 0x80ff7f0100ff0180, MASK, 0x0100):
                     for backwards in ((False, True) if name == 'branch_direction' else (False,)):
-                        source, target = (256, 640) if delta is None else (512, 512+delta)
+                        source, target = (256, 640) if delta is None else (257, 640) if delta == 'odd' else (512, 512+delta)
                         expected, left, source_end, target_end, flag = reference(initial, source, target, fill, count, name, backwards)
                         context = (WORD * 4)(base+source, base+target, fill, int(backwards))
                         for function in functions:
@@ -175,6 +199,31 @@ def differential(probe_path, native_path, *lifted_paths):
                 cases += 1
     finally:
         if not kernel.VirtualFree(inaccessible, 0, 0x8000):
+            raise C.WinError(C.get_last_error())
+    # A non-null VirtualAlloc reservation starts on a 64 KiB boundary.
+    size = 0x10000
+    for high in range(1, 65):
+        boundary = high << 32
+        region = kernel.VirtualAlloc(boundary - size, size, 0x3000, 0x04)
+        if region:
+            break
+    else:
+        raise C.WinError(C.get_last_error())
+    try:
+        assert region == boundary - size, (region, boundary)
+        edge = C.c_ubyte.from_address(boundary - 1)
+        context = (WORD * 4)(0, boundary - 1, 0x6c, 0)
+        for n, lib in enumerate(libraries):
+            function = getattr(lib, ('' if n == 0 else 'lifted_') + 'rep_stosb_forward')
+            edge.value = 0xa5
+            trace, observed = (WORD * 4)(MASK, MASK, MASK, MASK), (WORD * 3)()
+            result = probe(function, C.addressof(context), 1, trace, observed)
+            assert (edge.value, result, tuple(trace), tuple(observed)) == (
+                0x6c, 0, (0, 0, boundary, 1), SENTINELS
+            ), (n, hex(boundary), edge.value, result, tuple(trace), tuple(observed))
+            cases += 1
+    finally:
+        if not kernel.VirtualFree(region, 0, 0x8000):
             raise C.WinError(C.get_last_error())
     print(f'{cases} native/AOT/reference cases passed: bytes, guards, remaining count, pointers, CF, RSI/RDI and DF')
 
@@ -214,6 +263,12 @@ def faults(guard_path, native_path, *lifted_paths):
                         code = guarded(function, C.addressof(context), 1, trace, C.byref(result))
                         assert code == 0xc0000005 and tuple(trace) == (MASK,)*4, (kind, suffix, hex(code), tuple(trace))
                         count += 1
+            function = getattr(lib, prefix+'once_movsb_forward')
+            context = (WORD * 4)(page+4096, page+4096, MASK, 0)
+            trace, result = (WORD * 4)(MASK, MASK, MASK, MASK), WORD()
+            code = guarded(function, C.addressof(context), 1, trace, C.byref(result))
+            assert code == 0xc0000005 and tuple(trace) == (MASK,)*4, (hex(code), tuple(trace))
+            count += 1
             # A word, dword or qword can straddle a page. Match native bytes even
             # when the faulting access is within one element, not between iterations.
             for suffix in ("w", "d", "q"):
@@ -231,16 +286,32 @@ def faults(guard_path, native_path, *lifted_paths):
                     key = (suffix, access)
                     assert written == split_element_results.setdefault(key, written), (key, written)
                     count += 1
+            edge = C.c_ubyte.from_address(page + 4095)
+            for suffix, destination, repetitions, expected_edge in (
+                ('b', page + 4096, 1 << 32, 0xa5),  # RCX is nonzero with ECX zero.
+                ('b', page + 4095, 2, 0x6c),       # The first byte completes before the fault.
+                ('w', page + 4095, 1, 0xa5),       # The fault is within the first word.
+            ):
+                edge.value = 0xa5
+                function = getattr(lib, prefix + 'rep_stos' + suffix + '_forward')
+                context = (WORD * 4)(0, destination, 0x126c, 0)
+                trace, result = (WORD * 4)(MASK, MASK, MASK, MASK), WORD()
+                code = guarded(function, C.addressof(context), repetitions, trace, C.byref(result))
+                assert (code, tuple(trace), edge.value) == (0xc0000005, (MASK,) * 4, expected_edge), (
+                    path, suffix, destination, repetitions, hex(code), tuple(trace), edge.value
+                )
+                count += 1
             # Three byte iterations complete before a source page fault. The trace
             # follows REP, so no trace store may move before the faulting instruction.
             C.memmove(page+4093, b'abc', 3)
-            target = (C.c_ubyte * 16)(*[0xa5]*16)
-            context = (WORD * 4)(page+4093, C.addressof(target)+4, 0, 0)
-            trace, result = (WORD * 4)(MASK, MASK, MASK, MASK), WORD()
-            code = guarded(getattr(lib, prefix+'rep_movsb_forward'), C.addressof(context), 8, trace, C.byref(result))
-            assert code == 0xc0000005 and bytes(target) == bytes([0xa5]*4)+b'abc'+bytes([0xa5]*9)
-            assert tuple(trace) == (MASK,)*4
-            count += 1
+            for name, repetitions in (('rep_movsb_forward', 8), ('rep_movsb_forward', (1 << 32) + 1)):
+                target = (C.c_ubyte * 16)(*[0xa5]*16)
+                context = (WORD * 4)(page+4093, C.addressof(target)+4, 0, 0)
+                trace, result = (WORD * 4)(MASK, MASK, MASK, MASK), WORD()
+                code = guarded(getattr(lib, prefix+name), C.addressof(context), repetitions, trace, C.byref(result))
+                assert code == 0xc0000005 and bytes(target) == bytes([0xa5]*4)+b'abc'+bytes([0xa5]*9), (name, hex(code), bytes(target))
+                assert tuple(trace) == (MASK,)*4
+                count += 1
     finally:
         if not kernel.VirtualFree(page, 0, 0x8000):
             raise C.WinError(C.get_last_error())

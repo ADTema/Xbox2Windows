@@ -1,6 +1,7 @@
 #pragma once
 #include <d3d12.h>
 #include <stdexcept>
+#include <vector>
 #include <wrl/client.h>
 
 void check(HRESULT hr, const char* stage);
@@ -12,6 +13,9 @@ Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D1
 void check_compute(ID3D12Device* device, bool tables);
 void check_sampler_views(ID3D12Device* device, const char* shader_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
+void check_spirv_compaction(ID3D12Device* device, const char* shader_path);
+void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, const char* ordinary_register,
+                                 const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr);
 void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);
@@ -27,6 +31,9 @@ bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*,
                            MeshConstantBinding = MeshConstantBinding::root,
                            MeshDrawMode = MeshDrawMode::color,
                            const MeshTextureProducers* = nullptr);
+void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const char* vertex,
+                              const char* pixel, const char* fixture, MeshDrawMode mode = MeshDrawMode::color,
+                              const MeshTextureProducers* = nullptr);
 void check_texture_mips(ID3D12Device* device);
 void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);
 void check_sampled_coverage(ID3D12Device*, const char*, const char*);
@@ -41,6 +48,11 @@ void check_attribute_pixel(ID3D12Device* device, const char* shader, const char*
 void check_compute_to_pixel(ID3D12Device* device, const char* compute, const char* pixel,
                             const char* reference, const char* previous);
 void check_pixel_quad_lod(ID3D12Device* device, const char* shader);
+void check_pixel_mip_clamp(ID3D12Device* device, const char* shader, unsigned expectedLevel);
+void check_pixel_mip_blend(ID3D12Device* device, const char* shader, float clamp, float tolerance);
+void check_pixel_compare(ID3D12Device* device, const char* shader, const char* reference);
+bool check_mesh_shadow_draw(ID3D12Device*, const char* mesh, const char* receiver, const char* caster,
+                            const char* fixture, bool stale, std::vector<unsigned char>* frames = nullptr);
 void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* input,
                      const char* capture, const char* mip1 = nullptr);
 void check_bc7_tail(ID3D12Device* device, const char* shader, const char* firstMip, int count, char** paths);
