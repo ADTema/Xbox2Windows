@@ -1299,10 +1299,10 @@ The record then clears EAX. The model compares with the `Fraction` model of `cpu
 
 Two native-only exports read bits that the profile does not know. One stores the whole status word after `fcom`. Over 1759 runs its known bits matched the model, and the other bits took 0x0000, 0x0001 (IE) and 0x0002 (DE). The other is the branch export with `test al, 1` (IE) on the C3 successor, after `fucom`. An unordered `fucom` left IE clear for a quiet NaN and set for a signaling NaN, so the byte does not follow from C0, C2 and C3. Translation rejects both, at the store of AX and at `test al, 1`.
 
-Translation rejects 32 more sequences:
+Translation rejects 35 more sequences:
 - condition bits that are unknown at the reader: `fnstsw ax` without a comparison, or after `fadd`, `fld` and `fstp`, `fnstcw`, `wait` (`fstsw ax`), a second `fnstsw ax` or a call, and after a join where one path skips the comparison;
 - the review's control, a branch whose other successor tests C1;
-- direct reads of unknown bits: `test al, 1`, `test ax, 4500h`, `and ah, 47h` with a store of AH, a store of AX, a return (also in the checked entry after `fldcw`) and an external edge with the status word in AX;
+- direct reads of unknown bits: `test al, 1`, `test ax, 4500h`, `and ah, 47h` with a store of AH, a store of AX, a return (also in the checked entry after `fldcw`), an external edge or a direct call with the status word in AX, a store of AH after a join where one path skips `and ah, 45h`, and `test eax, eax` after `mov al, 0`;
 - PF: `jp` after `fucomi` and `inc eax`, after `cmp` or after `test eax, eax`, or before any flag writer, `sahf` in a function without x87 instructions, and `lahf`;
 - forms outside the profile: `fnstsw` with an m16 operand, the `fcom` and `fcomp` alias encodings DC D1, DC D9 and DE D1, `fsincos`, `fpatan` and `fldenv`, and comparisons without enough stack values.
 
