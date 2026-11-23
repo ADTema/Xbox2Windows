@@ -1125,6 +1125,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse2_regs_original>"
         "$<TARGET_FILE:cpu_sse2_regs_original_lifted>"
         "$<TARGET_FILE:cpu_sse2_regs_altered_lifted>")
+    set(cpu_mmx_sse2_exports
+        "op_cvtpd2pi_reg,op_cvtpd2pi_mem,op_cvtpd2pi_mem_disp,"
+        "op_cvttpd2pi_reg,op_cvttpd2pi_mem,"
+        "op_movdq2q,op_movq2dq,op_emms_standalone,"
+        "op_movq_reg_mem,op_movdqa_reg_ls,op_movdqu_reg_ls,op_mmx_sse2_bridge")
+    string(CONCAT cpu_mmx_sse2_exports ${cpu_mmx_sse2_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_mmx_sse2_${variant} mmx_sse2)
+        cpu_translation(cpu_mmx_sse2_${variant} cpu_mmx_sse2_aot "${cpu_mmx_sse2_exports}")
+    endforeach()
+    target_compile_definitions(cpu_mmx_sse2_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_mmx_sse2 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/mmx_sse2_check.py"
+        "$<TARGET_FILE:cpu_mmx_sse2_original>"
+        "$<TARGET_FILE:cpu_mmx_sse2_original_lifted>"
+        "$<TARGET_FILE:cpu_mmx_sse2_altered_lifted>")
     # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
     # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
     set(tail_files)
