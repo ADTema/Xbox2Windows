@@ -685,7 +685,7 @@ OperationResult run_mesh_indexed_fallback(const OperationContext& ctx)
 
 OperationResult run_mesh_textured_fallback(const OperationContext& ctx)
 {
-    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6], true);
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6], MeshDrawMode::textured);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -711,7 +711,8 @@ OperationResult run_compute_mesh_texture(const OperationContext& ctx)
 OperationResult run_compute_mesh_texture_fallback(const OperationContext& ctx)
 {
     const MeshTextureProducers producers{ctx.argv[7], ctx.argc >= 9 ? ctx.argv[8] : nullptr, ctx.argc == 10};
-    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6], true, &producers);
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6],
+                             MeshDrawMode::textured, &producers);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -719,6 +720,12 @@ OperationResult run_mesh_depth_pair(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
                                                true, MeshConstantBinding::root, MeshDrawMode::depth_pair));
+}
+
+OperationResult run_mesh_depth_pair_fallback(const OperationContext& ctx)
+{
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6], MeshDrawMode::depth_pair);
+    return {OutcomeKind::pass, nullptr};
 }
 
 OperationResult run_mesh_shadow(const OperationContext& ctx)
@@ -865,7 +872,7 @@ constexpr CapabilityGate kGateWaveShuffle{
     CapsDiagnostic::wave_6_6};
 constexpr CapabilityGate kGateSm60MeshFallback{
     D3D_SHADER_MODEL_6_0, false, false, 0,
-    "skip: indexed mesh fallback requires SM 6.0",
+    "skip: mesh fallback requires SM 6.0",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm60SamplerViews{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -943,6 +950,7 @@ const OperationSpec kOperations[] = {
     {"--compute-mesh-texture-fallback", 8, 10, validate_compute_mesh_texture_fallback_args,
      kGateSm60MeshFallback, run_compute_mesh_texture_fallback},
     {"--mesh-depth-pair", 6, 6, nullptr, kNoGate, run_mesh_depth_pair},
+    {"--mesh-depth-pair-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_depth_pair_fallback},
     {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
     {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},
     {"--bvh-differential", 3, 3, nullptr, kNoGate, run_bvh_differential},
@@ -1154,6 +1162,8 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --mesh-entry")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-indexed-fallback")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-depth-pair-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-depth-pair-fallback")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry-table", "a", "b", "c", "--bad"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-entry-table")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--compute-mesh-texture", "a", "b", "c", "d", "e", "--bad"},
@@ -1217,6 +1227,23 @@ int run_self_test()
         if (!require(!called, "unmet wave64 gate must not invoke handler")) return 1;
         if (!require(out.find("native_lane_range=32..32 shader_model_capped_at_6_6=0x66") != std::string::npos,
                      "unmet wave64 gate must preserve native_lane_range diagnostic")) return 1;
+
+        const OperationSpec* depth_pair = find_operation("--mesh-depth-pair-fallback");
+        if (!require(depth_pair != nullptr, "--mesh-depth-pair-fallback operation")) return 1;
+        const AdapterCaps sm51_caps{D3D_SHADER_MODEL_5_1};
+        char depth_pair_op[] = "--mesh-depth-pair-fallback";
+        char cs[] = "cs.dxil";
+        char vs[] = "vs.dxil";
+        char ps[] = "ps.dxil";
+        char fixture[] = "depth.case";
+        char* depth_pair_argv[]{prog, mode, depth_pair_op, cs, vs, ps, fixture};
+        OperationContext dctx{nullptr, nullptr, sm51_caps, "warp", 7, depth_pair_argv, nullptr};
+        out.clear();
+        err.clear();
+        if (!require(run_operation_spec(*depth_pair, dctx, {&out, &err}) == 77,
+                     "--mesh-depth-pair-fallback below SM 6.0 must exit 77")) return 1;
+        if (!require(out.find("skip: mesh fallback requires SM 6.0") != std::string::npos,
+                     "--mesh-depth-pair-fallback must print its skip reason")) return 1;
 
         // The ballot fixture skips on a runtime capped at SM 6.5, as the Windows 10 in-box runtime is (#751).
         const OperationSpec* ballot = find_operation("--spirv-ballot");

@@ -53,7 +53,8 @@ struct MeshPipeline {
 };
 
 ComPtr<ID3D12PipelineState> fallback_draw_pipeline(ID3D12Device* device, ID3D12RootSignature* root,
-    D3D12_SHADER_BYTECODE vs, D3D12_SHADER_BYTECODE ps)
+    D3D12_SHADER_BYTECODE vs, D3D12_SHADER_BYTECODE ps, const D3D12_DEPTH_STENCIL_DESC& depth,
+    DXGI_FORMAT depth_format)
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root;
@@ -72,6 +73,8 @@ ComPtr<ID3D12PipelineState> fallback_draw_pipeline(ID3D12Device* device, ID3D12R
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = desc.SampleDesc.Count = 1;
     desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.DepthStencilState = depth;
+    desc.DSVFormat = depth_format;
     ComPtr<ID3D12PipelineState> pipeline;
     check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "Create fallback vertex pipeline");
     return pipeline;
@@ -103,12 +106,12 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     constexpr UINT cb_bytes = 512;
     const UINT trace_stride = fallback ? 128 : 80;
     constexpr UINT image_bytes = side * side * 4;
-    constexpr auto depth_format = DXGI_FORMAT_D32_FLOAT;
     constexpr UINT texel_bytes = 2 * 2 * 4;
     const auto input = read_bytes(fixture);
     const UINT draw_bytes = 2 * cb_bytes + (vertices ? 512 : 0);
     const bool textured = mode == MeshDrawMode::textured;
     const bool depth_pair = mode == MeshDrawMode::depth_pair;
+    const auto depth_format = depth_pair ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_UNKNOWN;
     const UINT draw_count = depth_pair ? 2 : 1;
     const UINT input_bytes = draw_count * draw_bytes;
     const UINT trace_bytes = draw_count * trace_stride;
@@ -176,10 +179,17 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     ComPtr<ID3D12PipelineState> pipeline;
     ComPtr<ID3D12PipelineState> compute_pipeline;
     const D3D12_SHADER_BYTECODE ps{pixel.data(), pixel.size()};
+    D3D12_DEPTH_STENCIL_DESC depth_state{};
+    if (depth_pair) {
+        depth_state.DepthEnable = TRUE;
+        depth_state.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        depth_state.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    }
     if (fallback) {
         if (!export_root) export_root = root;
         const auto vertex = read_bytes(fallback_vertex);
-        pipeline = fallback_draw_pipeline(device, root.Get(), {vertex.data(), vertex.size()}, ps);
+        pipeline = fallback_draw_pipeline(device, root.Get(), {vertex.data(), vertex.size()}, ps,
+                                          depth_state, depth_format);
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = export_root.Get();
         desc.CS = {shader.data(), shader.size()};
@@ -194,12 +204,8 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
         stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
         stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
         stream.raster.value.DepthClipEnable = TRUE;
-        if (depth_pair) {
-            stream.depth.value.DepthEnable = TRUE;
-            stream.depth.value.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-            stream.depth.value.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-            stream.depth_format.value = depth_format;
-        }
+        stream.depth.value = depth_state;
+        stream.depth_format.value = depth_format;
         stream.topology.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
         ComPtr<ID3D12Device2> device2;
@@ -361,15 +367,18 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     if (fallback) {
         list->SetPipelineState(compute_pipeline.Get());
         list->SetComputeRootSignature(export_root.Get());
-        list->SetComputeRootConstantBufferView(0, base);
-        list->SetComputeRootConstantBufferView(1, base + cb_bytes);
-        if (vertices) list->SetComputeRootShaderResourceView(vertex_slot, base + 2 * cb_bytes);
-        list->SetComputeRootUnorderedAccessView(trace_slot, trace->GetGPUVirtualAddress());
-        list->Dispatch(1, 1, 1);
+        // The dispatches write disjoint trace ranges. Transition once before either draw reads them.
+        for (UINT i = 0; i < draw_count; ++i) {
+            const auto draw_base = base + i * draw_bytes;
+            list->SetComputeRootConstantBufferView(0, draw_base);
+            list->SetComputeRootConstantBufferView(1, draw_base + cb_bytes);
+            if (vertices) list->SetComputeRootShaderResourceView(vertex_slot, draw_base + 2 * cb_bytes);
+            list->SetComputeRootUnorderedAccessView(trace_slot, trace->GetGPUVirtualAddress() + i * trace_stride);
+            list->Dispatch(1, 1, 1);
+        }
         trace_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         transition(list, trace.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, trace_state);
         list->SetPipelineState(pipeline.Get());
-        list->SetGraphicsRootShaderResourceView(geometry_slot, trace->GetGPUVirtualAddress());
     } else {
         list->SetGraphicsRootUnorderedAccessView(trace_slot, trace->GetGPUVirtualAddress());
     }
@@ -399,7 +408,10 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     list->ClearRenderTargetView(handle, clear, 0, nullptr);
     if (fallback) {
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        list->DrawInstanced(3, 1, 0, 0);
+        for (UINT i = 0; i < draw_count; ++i) {
+            list->SetGraphicsRootShaderResourceView(geometry_slot, trace->GetGPUVirtualAddress() + i * trace_stride);
+            list->DrawInstanced(3, 1, 0, 0);
+        }
     } else {
         ComPtr<ID3D12GraphicsCommandList6> mesh_list;
         check(commands.list.As(&mesh_list), "Query mesh dispatch list");
@@ -436,7 +448,7 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     const auto* trace_end = reference + trace_bytes;
     const auto* first_bad = std::mismatch(reference, trace_end, rows + size).first;
     const bool trace_ok = first_bad == trace_end;
-    if (fallback) {
+    if (fallback || depth_pair) {
         std::printf("mesh_exports bytes=%u matched=%d\n", trace_bytes, trace_ok ? 1 : 0);
         if (!trace_ok) std::printf("first_mesh_export_mismatch_byte=%td\n", first_bad - reference);
     }
@@ -476,9 +488,8 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* mesh, const char* p
 }
 
 void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const char* vertex,
-                              const char* pixel, const char* fixture, bool textured,
+                              const char* pixel, const char* fixture, MeshDrawMode mode,
                               const MeshTextureProducers* producers)
 {
-    const auto mode = textured || producers ? MeshDrawMode::textured : MeshDrawMode::color;
     check_mesh_draw(device, compute, pixel, fixture, true, MeshConstantBinding::root, vertex, mode, producers);
 }

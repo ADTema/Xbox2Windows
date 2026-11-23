@@ -32,7 +32,7 @@ bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*,
                            MeshDrawMode = MeshDrawMode::color,
                            const MeshTextureProducers* = nullptr);
 void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const char* vertex,
-                              const char* pixel, const char* fixture, bool textured = false,
+                              const char* pixel, const char* fixture, MeshDrawMode mode = MeshDrawMode::color,
                               const MeshTextureProducers* = nullptr);
 void check_texture_mips(ID3D12Device* device);
 void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);

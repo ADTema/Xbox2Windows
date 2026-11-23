@@ -1846,7 +1846,21 @@ RTX 4060 and WARP.
 ![Mesh depth-pair color references before and after the depth exchange](mesh-depth-pair-reference.png)
 
 ```powershell
-ctest --preset dev --no-tests=error -R "^mesh_depth_pair_" -V
+ctest --preset dev --no-tests=error -R '^mesh_depth_pair_(hardware|warp)$' -V
+```
+
+The SM 6.0 depth-pair fallback uses two compute dispatches to export both
+triangles into separate ranges of one buffer. After a single UAV-to-SRV
+transition, two vertex draws read those ranges in order and share the same
+color and depth targets, cleared once. The fixture uses the native color and
+depth references and checks 256 bytes of exports, including both sets of
+PARAM0 values. The GTX 1060 and Windows 10 in-box WARP matched all 1,024
+color and 1,024 depth pixels for baseline, reversed order and swapped depths.
+The stale-color and stale-depth controls reproduced 190 and 172 mismatches,
+respectively, with matching exports and zero D3D12 debug warnings or errors.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^mesh_depth_pair_fallback_(hardware|warp)$' -V
 ```
 
 The lit mesh fixture reuses the indexed PARAM0 mesh program. The three vertex
