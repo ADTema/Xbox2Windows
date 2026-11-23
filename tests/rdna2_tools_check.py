@@ -15,7 +15,7 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from disasm_rdna2 import disasm_rdna2, decode_instruction, disassemble_binary
 from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
-from pixel_aot import native_program
+from pixel_aot import fma_mix_operand, native_program, parse_fma_mix
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
     is_instruction_supported,
@@ -772,6 +772,117 @@ class TestRdna2Disasm(unittest.TestCase):
             res_rec = disasm_rdna2(reserved_raw)[0]
             self.assertEqual(res_rec["opcode"], "v_pk_add_u16_unsupported")
             self.assertIn("<unsupported_reserved_bits>", res_rec["assembly"])
+
+    def test_vop3p_fma_mix_inline_abs_neg_modifiers(self):
+        """v_fma_mix* must decode w0[10:8] as abs and w1[31:29] as neg inline, not neg_lo/neg_hi."""
+        # Issue reproduction encoding: v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]
+        repro = disasm_rdna2(bytes.fromhex("0c1920cc2c26524c"))
+        self.assertEqual(len(repro), 1)
+        self.assertEqual(
+            repro[0]["assembly"],
+            "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]",
+        )
+        operands, op_sel, op_sel_hi, clamp = parse_fma_mix(repro[0]["assembly"].split(" ", 2)[2])
+        self.assertEqual((operands, op_sel, op_sel_hi, clamp), (["|s44|", "-v19", "v20"], [1, 1, 0], [1, 0, 0], False))
+        scalar = {"s44": "params[0].x"}
+        vector = {"v19": "alu_19", "v20": "alu_20"}
+        lowered = [
+            fma_mix_operand(tok, bool(f16), bool(hi), scalar, vector, set(), set())
+            for tok, f16, hi in zip(operands, op_sel, op_sel_hi)
+        ]
+        self.assertEqual(lowered, ["abs(widen16(asuint(params[0].x) >> 16))", "(-widen16(asuint(alu_19)))", "alu_20"])
+
+        def encode_fma_mix(op, vdst, src0, src1, src2, abs_bits=(0, 0, 0), neg_bits=(0, 0, 0),
+                           sel=(0, 0, 0), sel_hi=(0, 0, 0), use_clamp=False, literal=None):
+            w0 = (
+                0xcc000000
+                | (op << 16)
+                | (int(use_clamp) << 15)
+                | (sel_hi[2] << 14)
+                | (sel[2] << 13)
+                | (sel[1] << 12)
+                | (sel[0] << 11)
+                | (abs_bits[2] << 10)
+                | (abs_bits[1] << 9)
+                | (abs_bits[0] << 8)
+                | vdst
+            )
+            w1 = (
+                (neg_bits[2] << 31)
+                | (neg_bits[1] << 30)
+                | (neg_bits[0] << 29)
+                | (sel_hi[1] << 28)
+                | (sel_hi[0] << 27)
+                | (src2 << 18)
+                | (src1 << 9)
+                | src0
+            )
+            return struct.pack("<3I", w0, w1, literal) if literal is not None else struct.pack("<2I", w0, w1)
+
+        opcodes = (
+            (0x20, "v_fma_mix_f32"),
+            (0x21, "v_fma_mixlo_f16"),
+            (0x22, "v_fma_mixhi_f16"),
+        )
+        cases = (
+            # (abs_bits, neg_bits, sel, sel_hi, use_clamp, expected_ops, expected_suffix)
+            ((1, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0), False, "|v2|, v3, v4", ""),
+            ((0, 1, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0), False, "v2, |v3|, v4", ""),
+            ((0, 0, 1), (0, 0, 0), (0, 0, 0), (0, 0, 0), False, "v2, v3, |v4|", ""),
+            ((0, 0, 0), (1, 0, 0), (0, 0, 0), (0, 0, 0), False, "-v2, v3, v4", ""),
+            ((0, 0, 0), (0, 1, 0), (0, 0, 0), (0, 0, 0), False, "v2, -v3, v4", ""),
+            ((0, 0, 0), (0, 0, 1), (0, 0, 0), (0, 0, 0), False, "v2, v3, -v4", ""),
+            ((1, 1, 1), (1, 0, 1), (1, 1, 1), (1, 0, 1), True,
+             "-|v2|, |v3|, -|v4|", " op_sel:[1,1,1] op_sel_hi:[1,0,1] clamp"),
+        )
+        vec = {"v2": "alu_2", "v3": "alu_3", "v4": "alu_4"}
+        for op, name in opcodes:
+            for abs_b, neg_b, sel, sel_hi, use_clamp, expected_ops, suffix in cases:
+                with self.subTest(op=name, abs_b=abs_b, neg_b=neg_b, clamp=use_clamp):
+                    raw = encode_fma_mix(op, 1, 258, 259, 260, abs_b, neg_b, sel, sel_hi, use_clamp)
+                    insns = disasm_rdna2(raw)
+                    self.assertEqual(len(insns), 1)
+                    asm = insns[0]["assembly"]
+                    self.assertEqual(asm, f"{name} v1, {expected_ops}{suffix}")
+                    self.assertNotIn("neg_lo", asm)
+                    self.assertNotIn("neg_hi", asm)
+                    self.assertTrue(is_instruction_supported(asm))
+                    parsed_ops, parsed_sel, parsed_hi, parsed_clamp = parse_fma_mix(asm.split(" ", 2)[2])
+                    self.assertEqual((parsed_sel, parsed_hi, parsed_clamp), (list(sel), list(sel_hi), use_clamp))
+                    for tok, f16, hi in zip(parsed_ops, parsed_sel, parsed_hi):
+                        fma_mix_operand(tok, bool(f16), bool(hi), {}, vec, set(), set())
+
+        # Literal operand with combined -|literal| modifiers must consume trailing DWORD and round-trip.
+        lit_raw = encode_fma_mix(0x20, 1, 255, 259, 260, abs_bits=(1, 0, 0), neg_bits=(1, 0, 0), literal=0x3f800000)
+        lit_insns = disasm_rdna2(lit_raw)
+        self.assertEqual(len(lit_insns), 1)
+        self.assertEqual(lit_insns[0]["length"], 12)
+        self.assertEqual(lit_insns[0]["assembly"], "v_fma_mix_f32 v1, -|0x3f800000|, v3, v4")
+        lit_ops, lit_sel, lit_hi, lit_clamp = parse_fma_mix(lit_insns[0]["assembly"].split(" ", 2)[2])
+        self.assertEqual((lit_ops, lit_sel, lit_hi, lit_clamp), (["-|0x3f800000|", "v3", "v4"], [0, 0, 0], [0, 0, 0], False))
+
+        # Standard VOP3P (e.g. v_dot2_f32_f16) retains neg_lo/neg_hi suffix modifiers.
+        dot_raw = encode_fma_mix(0x13, 12, 274, 275, 278, abs_bits=(1, 0, 0), neg_bits=(1, 0, 0), sel_hi=(1, 1, 1))
+        self.assertEqual(
+            disasm_rdna2(dot_raw)[0]["assembly"],
+            "v_dot2_f32_f16 v12, v18, v19, v22 neg_lo:[1,0,0] neg_hi:[1,0,0]",
+        )
+
+        # Negative controls: parse_fma_mix rejects neg_lo/neg_hi and f32 high-half selection; truncated literal fails safely.
+        for bad_tail in (
+            "s44, v19, v20 neg_lo:[0,1,0]",
+            "s44, v19, v20 neg_hi:[1,0,0]",
+            "v2, v3, v4 op_sel:[0,0,0] op_sel_hi:[1,0,0]",
+        ):
+            with self.assertRaises(ValueError):
+                parse_fma_mix(bad_tail)
+
+        trunc_raw = encode_fma_mix(0x20, 1, 255, 259, 260, abs_bits=(1, 0, 0), neg_bits=(1, 0, 0))
+        trunc_insns = disasm_rdna2(trunc_raw)
+        self.assertEqual(len(trunc_insns), 1)
+        self.assertEqual(trunc_insns[0]["opcode"], "vop3p_truncated")
+        self.assertEqual(trunc_insns[0]["length"], 8)
+        self.assertIn("<truncated>", trunc_insns[0]["assembly"])
 
     def test_mubuf_opcode_table_synthetic_forms(self):
         """Every GFX1013 MUBUF opcode must decode with exact width, scanner recognition, and 8-byte alignment."""
