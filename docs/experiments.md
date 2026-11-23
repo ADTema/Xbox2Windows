@@ -4057,6 +4057,25 @@ The desktop XMem shim can map live 64 KiB physical grants into caller-owned, 64 
 
 The reserve-only desktop cases from [#888](https://github.com/R0Y00/Xbox2Windows/pull/888) use 16 or 24 GiB Windows placeholder ranges. The page mapper splits out a 64 KiB destination on demand and coalesces the reservation after its last view is unmapped. The same test writes and reads one interior page after remapping, releases the entire reservation and reserves the same range again. Other allocation modes remain outside this profile.
 
+### Aligned committed CPU memory
+
+`xmem_committed_memory` reserves three ordinary host pages at each guest base alignment (64 KiB and
+2 MiB). A request for one host page plus five bytes commits exactly two host pages and leaves the
+third reserved. The test checks every committed byte for zero-fill, writes a pattern across the
+page boundary and at the last rounded byte, and verifies the readback and release with
+`VirtualQuery` and CPU reads.
+
+The test-only profile accepts `PAGE_READWRITE`. A rounding overflow, a `PAGE_READONLY` request, and a
+commit one page beyond the reservation leave the original data and reserved tail intact. The last
+case preserves the Win32 allocator's `ERROR_INVALID_ADDRESS`. This is a CPU backing fixture for
+[#870](https://github.com/R0Y00/Xbox2Windows/issues/870). The desktop XMem shim and GPU address
+registration are outside its scope. [Windows address requirements](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-mem_address_requirements) · [Win32 commit behavior](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc)
+
+```powershell
+cmake --build --preset dev --target xmem_committed_memory_check
+ctest --preset dev --no-tests=error -R '^xmem_committed_memory$' -V
+```
+
 ### Tools-memory availability fixture
 
 The source-built caller ([`tools_mem_caller.asm`](../tests/cpu/tools_mem_caller.asm)) imports `XMemIsToolsMemAvailable` by name. It queries twice and checks the recorded count before choosing a path. The controlled recording provider ([`tools_mem_provider.cpp`](../tests/cpu/tools_mem_provider.cpp)) returns FALSE for the fallback path (exit 42) or TRUE for the tools-memory path (exit 84). The same EXE exits with a live test worker under the Windows loader and returns its result to the host under `pe_map`. Withholding the query export stops mapping at import resolution before entry, with the trace provider still available.
