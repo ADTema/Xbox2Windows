@@ -3774,6 +3774,14 @@ Because reserve-only ranges and addresses inside an allocation cannot be opened,
 
 Run `ctest --preset dev --no-tests=error -R '^vm_translation_' -V`.
 
+#### Ordering a tile remap across D3D12 queues (#874)
+
+`tests/vm_copy_queue_check.cpp` maps two tiles in a reserved buffer and uploads a distinct 64 KiB pattern to each on a COPY queue. A DIRECT queue waits for the upload fence and reads the first pattern. The COPY queue waits for this read, remaps the first virtual tile to the second physical tile, and signals a new fence value. The DIRECT queue waits for that value and reads the second pattern from the same virtual address. The CPU waits only for the final readback.
+
+The test checks all 16,384 words in each read. The deliberately early read differs from all 16,384 words of the remapped pattern. Queue waits order both reads with respect to the remap, so the early result does not rely on a race. The fixture uses stock D3D12 queues, and skips (77) when the requested adapter or tiled-resource support is unavailable.
+
+Run `ctest --preset dev --no-tests=error -R '^vm_copy_queue_' -V`.
+
 ### Attribute words at xmem call sites
 
 `tools/xmem_attribute_scan.py` reads a PE image without loading or running it. It reports the attribute word at each call or tail jump into `xmem.dll`'s `XMemAlloc` or `XMemFree`, from a normal or delay-load import. It finds sites reached through the IAT slot, through an import thunk, or through a register loaded from the slot.
