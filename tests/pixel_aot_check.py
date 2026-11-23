@@ -3434,6 +3434,172 @@ def check_sdwa_arith_draws(directory, compiler, renderer, backend):
         run_pixel_batch(renderer, backend, shader, cases)
 
 
+# SDWA forms of the remaining unary binary32 operations, with whole-dword sources. D3D allows exp2, log2, a
+# reciprocal, rsqrt, sqrt, sin and cos an error, so a raw result has no single binary32 reference: in the first
+# two programs each input makes the true result an integer, and adding 0.5 then taking the floor returns that
+# integer for any result within 0.5 of it. That checks which operation ran and its source modifiers, not
+# last-place accuracy. v_rndne_f32 and v_frexp_mant_f32 are exact and are compared directly, with clamp, a byte
+# kept in 1.0 under UNUSED_PRESERVE and a byte padded into BYTE_3. A, B, C and D are the constants in s44 to s47.
+SDWA_UNARY_OPS = tuple(f"v_{op}_f32_sdwa" for op in (
+    "exp", "log", "rcp", "rcp_iflag", "rsq", "sqrt", "sin", "cos", "rndne", "frexp_mant"))
+SDWA_UNARY_ROUND = [line for channel in (12, 13, 14, 15)
+                    for line in (f"v_add_f32_e32 v{channel}, 0.5, v{channel}", f"v_floor_f32_e32 v{channel}, v{channel}")]
+
+
+def sdwa_unary_place(result, old, offset, width):
+    """Bits of result's low field written at offset into old (0 for UNUSED_PAD), as a float."""
+    bits, = struct.unpack("<I", struct.pack("<f", result))
+    mask = (1 << width) - 1
+    word = (old & ~(mask << offset) & 0xffffffff) | ((bits & mask) << offset)
+    return struct.unpack("<f", struct.pack("<I", word))[0]
+
+
+def sdwa_unary_rounded(*values):
+    return tuple(float(math.floor(value + 0.5)) for value in values)
+
+
+# (name, body, rows of constants, reference(a, b, c, d), wrong references). A wrong reference is
+# (row, channel, value(a, b, c, d), what a lowering exporting it got wrong) and must report a mismatch.
+SDWA_UNARY = (
+    ("sdwa_unary_exp", [
+        sdwa_arith("exp", "v12", ["-s44"]),
+        sdwa_arith("log", "v13", ["|s45|"]),
+        sdwa_arith("rcp", "v14", ["s46"]),
+        sdwa_arith("rcp_iflag", "v15", ["-|s47|"]),
+        *SDWA_UNARY_ROUND,
+    ], ((-3.0, -32.0, 0.125, 0.25), (-4.0, -8.0, -0.5, -0.0625)),
+     lambda a, b, c, d: sdwa_unary_rounded(2.0 ** -a, math.log2(abs(b)), 1.0 / c, 1.0 / -abs(d)),
+     ((0, 0, lambda a, b, c, d: math.floor(2.0 ** a + 0.5), "negation dropped on exp"),
+      (0, 0, lambda a, b, c, d: math.floor(math.exp(-a) + 0.5), "natural exponential for exp2"),
+      (0, 1, lambda a, b, c, d: math.floor(math.log(abs(b)) + 0.5), "natural logarithm for log2"),
+      (0, 1, lambda a, b, c, d: math.floor(abs(b) + 0.5), "source copied for log"),
+      (0, 2, lambda a, b, c, d: math.floor(c ** -0.5 + 0.5), "rsq for rcp"),
+      (0, 2, lambda a, b, c, d: math.floor(c + 0.5), "source copied for rcp"),
+      (0, 3, lambda a, b, c, d: math.floor(1.0 / abs(d) + 0.5), "negation dropped on rcp_iflag"),
+      (0, 3, lambda a, b, c, d: math.floor(-abs(d) + 0.5), "source copied for rcp_iflag"))),
+    ("sdwa_unary_root", [
+        sdwa_arith("rsq", "v12", ["|s44|"]),
+        sdwa_arith("sqrt", "v13", ["s45"]),
+        sdwa_arith("sin", "v14", ["s46"]),
+        sdwa_arith("cos", "v15", ["-s47"]),
+        *SDWA_UNARY_ROUND,
+    ], ((-0.0625, 49.0, 0.25, -0.5), (-0.25, 9.0, -0.25, 1.0)),
+     lambda a, b, c, d: sdwa_unary_rounded(abs(a) ** -0.5, math.sqrt(b), math.sin(2 * math.pi * c),
+                                           math.cos(2 * math.pi * -d)),
+     ((0, 0, lambda a, b, c, d: math.floor(math.sqrt(abs(a)) + 0.5), "sqrt for rsq"),
+      (0, 0, lambda a, b, c, d: math.floor(1.0 / abs(a) + 0.5), "rcp for rsq"),
+      (0, 1, lambda a, b, c, d: math.floor(b ** -0.5 + 0.5), "rsq for sqrt"),
+      (0, 1, lambda a, b, c, d: b, "source copied for sqrt"),
+      (0, 2, lambda a, b, c, d: math.floor(math.cos(2 * math.pi * c) + 0.5), "cos for sin"),
+      (0, 2, lambda a, b, c, d: math.floor(math.sin(c) + 0.5), "radians for revolutions in sin"),
+      (0, 3, lambda a, b, c, d: math.floor(math.sin(2 * math.pi * -d) + 0.5), "sin for cos"),
+      (0, 3, lambda a, b, c, d: math.floor(math.cos(-d) + 0.5), "radians for revolutions in cos"))),
+    ("sdwa_unary_exact", [
+        sdwa_arith("rndne", "v12", ["s44"]),
+        sdwa_arith("frexp_mant", "v13", ["-s45"], clamp=True),
+        "v_mov_b32_e32 v14, 1.0",
+        sdwa_arith("rndne", "v14", ["s46"], "BYTE_2", "UNUSED_PRESERVE"),
+        sdwa_arith("frexp_mant", "v15", ["s47"], dst_sel="BYTE_3"),
+    ], ((2.5, -12.0, 8388613.0, 0x41400040), (-3.5, 12.0, 4194306.5, 0x414000c0)),
+     lambda a, b, c, d: (float(round(a)), min(max(math.frexp(-b)[0], 0.0), 1.0),
+                         sdwa_unary_place(float(round(c)), 0x3f800000, 16, 8),
+                         sdwa_unary_place(math.frexp(d)[0], 0, 24, 8)),
+     ((0, 0, lambda a, b, c, d: math.floor(a + 0.5), "ties rounded up"),
+      (1, 0, lambda a, b, c, d: math.trunc(a), "ties rounded toward zero"),
+      (0, 1, lambda a, b, c, d: min(max(math.frexp(b)[0], 0.0), 1.0), "negation dropped on frexp_mant"),
+      (0, 1, lambda a, b, c, d: 1.0, "source copied for frexp_mant, then clamped"),
+      (1, 1, lambda a, b, c, d: math.frexp(-b)[0], "clamp dropped"),
+      (0, 2, lambda a, b, c, d: half_rtz(sdwa_unary_place(float(round(c)), 0, 16, 8)), "padded instead of preserved"),
+      (0, 2, lambda a, b, c, d: half_rtz(sdwa_unary_place(float(round(c)), 0x3f800000, 8, 8)),
+       "placed in the neighbouring byte"),
+      (1, 2, lambda a, b, c, d: sdwa_unary_place(float(math.floor(c + 0.5)), 0x3f800000, 16, 8),
+       "ties rounded up, placed"),
+      (0, 3, lambda a, b, c, d: half_rtz(math.frexp(d)[0]), "result not placed"),
+      (0, 3, lambda a, b, c, d: sdwa_unary_place(d, 0, 24, 8) * 2.0, "wrong byte value placed"))),
+)
+
+
+def sdwa_unary_inputs(row):
+    """Constants of a row as floats; an int is a binary32 bit pattern."""
+    return tuple(struct.unpack("<f", struct.pack("<I", v))[0] if isinstance(v, int) else v for v in row)
+
+
+def check_sdwa_unary_lowering():
+    """Static checks for SDWA_UNARY: each form reuses its e32/e64 lowering, and the refusals stay."""
+    bodies = [translate(with_constants(body)).split("float4 main", 1)[1] for _, body, *_ in SDWA_UNARY]
+    assert set(SDWA_UNARY_OPS) <= ACCEPTED, set(SDWA_UNARY_OPS) - ACCEPTED
+    for text in ("exp2((-params[0].w))", "log2(abs(params[1].x))", "(1.0f / params[1].y)",
+                 "(1.0f / (-abs(params[1].z)))"):
+        assert text in bodies[0], (text, bodies[0])
+    for text in ("rsqrt(abs(params[0].w))", "sqrt(params[1].x)", "sin32(params[1].y)", "cos32((-params[1].z))"):
+        assert text in bodies[1], (text, bodies[1])
+    for text in ("round(params[0].w)", "saturate(frexp_mant32((-params[1].x)))",
+                 "& 0xff00ffffu) | ((asuint(round(params[1].y)) & 0xffu) << 16u)",
+                 "((asuint(frexp_mant32(params[1].z)) & 0xffu) << 24u)"):
+        assert text in bodies[2], (text, bodies[2])
+    for op in SDWA_UNARY_OPS:
+        # The SDWA and e32 spellings of each operation produce the same shader.
+        sdwa = translate(with_constants([f"{op} v12, s44 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"]))
+        assert sdwa == translate(with_constants([f"{op.replace('_sdwa', '_e32')} v12, s44"])), op
+        # Byte and word sources stay refused, as do a second source selection, a second operand, an output
+        # modifier, UNUSED_SEXT on a partial destination and UNUSED_PRESERVE over an untracked destination.
+        name = op[2:-len("_f32_sdwa")]
+        for field in ("BYTE_0", "BYTE_3", "WORD_0", "WORD_1"):
+            must_reject(translate, with_constants(
+                [sdwa_arith(name, "v12", ["s44"]).replace("src0_sel:DWORD", f"src0_sel:{field}")]))
+        must_reject(translate, with_constants([sdwa_arith(name, "v12", ["s44"]) + " src1_sel:DWORD"]))
+        must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", sdwa_arith(name, "v12", ["s44", "v18"])]))
+        must_reject(translate, with_constants([sdwa_arith(name, "v12", ["s44 mul:2"])]))
+        must_reject(translate, with_constants(
+            ["v_mov_b32_e32 v12, 1.0", sdwa_arith(name, "v12", ["s44"], "WORD_0", "UNUSED_SEXT")]))
+        must_reject(translate, with_constants([sdwa_arith(name, "v20", ["s44"], "BYTE_2", "UNUSED_PRESERVE")]))
+
+
+def check_sdwa_unary_draws(directory, compiler, renderer, backend):
+    """Draw each program of SDWA_UNARY once per row and once per wrong reference.
+
+    One compile and one renderer batch per program. A renderer that reports an unavailable adapter (exit 77)
+    makes this a skip. On a desktop GPU the draws establish what the translated shader computes, not what the
+    console does.
+    """
+    for name, body, rows, reference, wrongs in SDWA_UNARY:
+        source = directory / f"{name}.hlsl"
+        shader = directory / f"{name}.cso"
+        source.write_text(translate(with_constants(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+
+        def add_case(row, values, status):
+            words = [v if isinstance(v, int) else struct.unpack("<I", struct.pack("<f", v))[0] for v in row]
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *words)
+            path = directory / f"{name}-{len(cases)}.case"
+            path.write_bytes(bytes(constants) + struct.pack("<4f", *values) * 64)
+            cases.append((path, status))
+
+        for index, row in enumerate(rows):
+            right = tuple(reference(*sdwa_unary_inputs(row)))
+            # Every right value survives the binary16 export unchanged.
+            assert tuple(map(half_rtz, right)) == right, (name, right)
+            for wrong_row, channel, wrong, reason in wrongs:
+                if wrong_row != index:
+                    continue
+                values = list(right)
+                values[channel] = float(wrong(*sdwa_unary_inputs(row)))
+                assert half_rtz(values[channel]) == values[channel], (name, reason, values[channel])
+                assert struct.pack("<f", values[channel]) != struct.pack("<f", right[channel]), (name, reason)
+                add_case(row, values, "mismatch")
+            add_case(row, right, "pass")
+        assert cases[-1][1] == "pass" and len(cases) == len(rows) + len(wrongs), name
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
 def check_constant_descriptor_bounds() -> None:
     for offset in (0, 28, 32):
         program = [line.replace("s[20:21], 0x40", f"s[20:21], {offset:#x}")
@@ -5373,6 +5539,7 @@ def check_controls(directory):
     # A partial UNUSED_PRESERVE result needs a tracked numeric destination, as for SDWA moves.
     for register in ("v0", "v8", "v20"):
         must_reject(translate, with_constants([sdwa_arith("floor", register, ["s44"], "BYTE_2", "UNUSED_PRESERVE")]))
+    check_sdwa_unary_lowering()
 
     program = assembly(False)
     for old, new in (("s_mov_b32 s21, 0", "s_mov_b32 s21, 1"),
@@ -5990,6 +6157,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(DPP_INT32_BODY), translate))
     fixtures.append((with_constants(DPP_BODY), translate))
     fixtures.extend((with_constants(body), translate) for body, *_ in SDWA_ARITH)
+    fixtures.extend((with_constants(body), translate) for _, body, *_ in SDWA_UNARY)
     fixtures.append((with_constants(PK_INT16_BODY), translate))
     fixtures.extend((with_constants(body), translate) for body in (SDWA_PRESERVE_BODY, SDWA_PAD_BODY))
     exp_sync_program = ["s_waitcnt_expcnt null, 0"] + assembly(False)[:-1] + ["s_waitcnt_expcnt null, 0", "s_endpgm"]
@@ -8099,6 +8267,8 @@ def main():
             return check_e64_render(directory, *args)
         if mode == "draw-e64-approx":
             return check_e64_approx_draws(directory, *args)
+        if mode == "draw-sdwa-unary":
+            return check_sdwa_unary_draws(directory, *args)
         check_controls(directory)
         try:
             if mode == "binary":

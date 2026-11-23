@@ -1925,6 +1925,21 @@ class TestRdna2Scanner(unittest.TestCase):
         for opcode in ("v_add_nc_i32", "v_sub_nc_i32", "v_subrev_nc_u32_e64"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
         self.assertFalse(is_opcode_recognized("v_subrev_nc_i32"))
+        # SDWA binary32 arithmetic: whole-dword sources only; a byte or word source, UNUSED_SEXT and
+        # operations outside pixel_aot.SDWA_ALU stay unsupported.
+        for op in ("exp", "log", "rcp", "rcp_iflag", "rsq", "sqrt", "sin", "cos", "rndne", "frexp_mant", "floor"):
+            line = f"v_{op}_f32_sdwa v1, -|s2| dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"
+            self.assertTrue(is_instruction_supported(line), line)
+            self.assertTrue(is_instruction_supported(line.replace("dst_sel:DWORD", "clamp dst_sel:BYTE_2")), line)
+            self.assertFalse(is_instruction_supported(line.replace("src0_sel:DWORD", "src0_sel:WORD_1")), line)
+            self.assertFalse(is_instruction_supported(line.replace("src0_sel:DWORD", "src0_sel:BYTE_0")), line)
+            self.assertFalse(is_instruction_supported(line.replace("UNUSED_PAD", "UNUSED_SEXT")), line)
+        self.assertTrue(is_instruction_supported(
+            "v_add_f32_sdwa v1, s2, v3 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"))
+        self.assertFalse(is_instruction_supported(
+            "v_add_f32_sdwa v1, s2, v3 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_0"))
+        self.assertFalse(is_instruction_supported(
+            "v_mad_f32_sdwa v1, s2, v3, v4 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"))
         self.assertTrue(is_opcode_recognized("v_mov_b32_sdwa"))
         self.assertTrue(is_opcode_recognized("v_cvt_f32_f16_sdwa"))
         self.assertTrue(is_opcode_recognized("v_pk_add_f16"))

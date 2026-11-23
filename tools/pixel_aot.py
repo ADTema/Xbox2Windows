@@ -1525,8 +1525,10 @@ def sdwa_dest(result, sel, unused, old):
         raise ValueError("UNUSED_PRESERVE needs a tracked numeric destination")
     keep = ~(((1 << width) - 1) << offset) & 0xffffffff
     return f"((asuint({old}) & {keep:#x}u) | {field})"
-# Exact arithmetic with SDWA forms on gfx1013 (docs/coverage/gfx1013.tsv).
-SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", "ceil", "fract", "trunc")
+# Binary32 arithmetic with SDWA forms on gfx1013 (docs/coverage/gfx1013.tsv): the exact operations, then the
+# remaining unary ones. Each reuses its e32/e64 entry in ALU unchanged.
+SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", "ceil", "fract", "trunc",
+            "exp", "log", "rcp_iflag", "rcp", "rsq", "sqrt", "sin", "cos", "rndne", "frexp_mant")
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
@@ -2156,8 +2158,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(rf"v_({'|'.join(SDWA_ALU)})_f32_sdwa (v\d+), (.+?)( clamp)? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:DWORD( src1_sel:DWORD)?"):
-            # SDWA forms of exact arithmetic take whole-dword sources, so the binary32 denormal mode never applies
-            # to a zero-extended field; the result is placed like an SDWA move.
+            # SDWA forms of binary32 arithmetic take whole-dword sources, so the binary32 denormal mode never
+            # applies to a zero-extended field; the result is placed like an SDWA move.
             op, dst, operands, clamp, dst_sel, unused, src1_sel = m.groups()
             tokens = operands.split(", ")
             arity, template = ALU[op]
