@@ -164,6 +164,7 @@ SOP2_OPS = {
 
 SOPK_OPS = {
     0x00: ("s_movk_i32", "Scalar move 16-bit sign-extended immediate"),
+    0x01: ("s_version", "Version marker with a 16-bit immediate, no destination"),
     0x02: ("s_cmovk_i32", "Scalar conditional move immediate"),
     0x03: ("s_cmpk_eq_i32", "Scalar compare equal immediate"),
     0x04: ("s_cmpk_lg_i32", "Scalar compare not-equal immediate"),
@@ -1197,6 +1198,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 return (4, "sopk_truncated", f"{op_name} <truncated>", "Incomplete SOPK literal")
             literal, = struct.unpack_from("<I", data, offset + 4)
             return (8, op_name, f"{op_name} 0x{simm:x}, 0x{literal:x}", comment)
+        if op_name == "s_version":
+            # No destination operand; the SDST field is not printed.
+            return (4, op_name, f"{op_name} 0x{simm:x}", comment)
         asm = f"{op_name} {decode_s_reg(sdst)}, 0x{simm:x}"
         return (4, op_name, asm, comment)
 

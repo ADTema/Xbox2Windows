@@ -106,7 +106,7 @@ def _check_two_exits(code, llvm):
                                  "s_mov_", "s_and", "s_or_", "s_xor_", "s_not_", "s_lsh", "s_ash",
                                  "s_add", "s_sub", "s_mul", "s_min_", "s_max_", "s_cselect", "s_bfe",
                                  "s_bfm", "s_brev", "s_ff", "s_bcnt", "s_wqm", "s_quadmask"))
-                  or op in ("s_nop", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
+                  or op in ("s_nop", "s_version", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
                             "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
                             "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
                             "s_bitreplicate_b64_b32",
@@ -1650,6 +1650,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if ended:
             raise ValueError("Instruction follows program end")
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
+            continue
+        # SOPK s_version K (gfx10+) has no destination and does not write SCC: a marker with no effect.
+        # Like s_nop it is also accepted after the color export. The operand is a 16-bit immediate.
+        if line == "s_version" or line.startswith("s_version "):
+            if not (m := match(r"s_version (0x[0-9a-f]+|0|[1-9]\d*)")) or int(m[1], 0) > 0xffff:
+                raise ValueError(f"Invalid s_version operand: {line}")
             continue
         if match(r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])"):
             continue

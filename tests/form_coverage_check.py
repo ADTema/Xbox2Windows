@@ -442,6 +442,22 @@ def check_sopk_wait_forms():
         assert ("SOPP", "s_waitcnt_depctr") not in covered and ("SOPK", "s_waitcnt_expcnt") not in covered, name
 
 
+def check_s_version_form():
+    """s_version counts once a program using it lowers; a refused operand records nothing."""
+    import pixel_aot_check as pixel
+    form = ("SOPK", "s_version")
+    program = pixel.s_version_program()
+    pixel.ACCEPTED.clear()
+    pixel.must_reject(pixel.translate_int, [line.replace("0x1004", "0x10000") for line in program])
+    assert "s_version" not in pixel.ACCEPTED
+    pixel.translate_int(program)
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert form in reference, name
+        assert form in fc.gfx_forms(pixel.ACCEPTED, reference), name
+    pixel.ACCEPTED.clear()
+
+
 def check_parsing():
     with tempfile.TemporaryDirectory() as tmp:
         junit = Path(tmp) / "results.xml"
@@ -740,6 +756,7 @@ if __name__ == "__main__":
     check_plain_bitscan_forms()
     check_swap_coverage()
     check_sopk_wait_forms()
+    check_s_version_form()
     check_parsing()
     check_gaps()
     check_dashboard()
