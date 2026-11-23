@@ -1906,6 +1906,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_avx_shuffle_blend>" "$<TARGET_FILE:cpu_avx_shuffle_blend_lifted>")
     set_tests_properties(cpu_aot_avx_shuffle_blend PROPERTIES SKIP_RETURN_CODE 77)
 
+    cpu_asm_fixture(cpu_avx_cvt_cmp_test avx_cvt_cmp_test)
+    set(avx_cvt_cmp_test_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_cvt_cmp_test_lifted.cpp")
+    add_custom_command(OUTPUT "${avx_cvt_cmp_test_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_cvt_cmp_test.py"
+            emit "$<TARGET_FILE:cpu_avx_cvt_cmp_test>" "${avx_cvt_cmp_test_fixture}"
+        DEPENDS cpu_avx_cvt_cmp_test tests/cpu/avx_cvt_cmp_test.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_avx_cvt_cmp_test_lifted SHARED "${avx_cvt_cmp_test_fixture}")
+    add_test(NAME cpu_aot_avx_cvt_cmp_test COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_cvt_cmp_test.py"
+        check "$<TARGET_FILE:cpu_avx_cvt_cmp_test>" "$<TARGET_FILE:cpu_avx_cvt_cmp_test_lifted>")
+    set_tests_properties(cpu_aot_avx_cvt_cmp_test PROPERTIES SKIP_RETURN_CODE 77)
+
     cpu_asm_fixture(cpu_avx_scalar_fp avx_scalar_fp)
     set(avx_scalar_fp_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_scalar_fp_lifted.cpp")
     add_custom_command(OUTPUT "${avx_scalar_fp_fixture}"
