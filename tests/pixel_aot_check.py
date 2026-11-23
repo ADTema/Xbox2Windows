@@ -755,6 +755,106 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
     return 0
 
 
+# Stage 2 of issue #932: each admitted body form rewrites v13 inside a v_cmpx region whose outer value is the
+# green sample. Constants: s44 threshold, s45 = 0.25, s46 = 0.125, s47 = 0x04030201 (bytes 1, 2, 3, 4); before
+# the region v20 = 4.0, v21 = 0.0625 and v22 = 16.0. Every inner value is exact. D3D allows rcp, rsqrt and sqrt
+# an error, so those results (8.0, 4.0, 4.0) are rounded after the region with +0.5 and floor, which returns
+# the integer for any result within 0.5 of it; the outer value goes through the same rounding.
+REGION_BODY_FORMS = (
+    ("fmac", "v_fmac_f32_e32 v13, s45, v20", lambda gy: single(gy + 1.0), False),
+    ("mac", "v_mac_f32_e32 v13, s45, v20", lambda gy: single(gy + 1.0), False),
+    ("mul-legacy-e32", "v_mul_legacy_f32_e32 v13, s45, v20", lambda gy: 1.0, False),
+    ("mul-legacy-e64", "v_mul_legacy_f32_e64 v13, -s45, v20", lambda gy: -1.0, False),
+    *((f"cvt-ubyte{n}", f"v_cvt_f32_ubyte{n}_e32 v13, s47", lambda gy, n=n: float(n + 1), False) for n in range(4)),
+    ("rcp", "v_rcp_f32_e32 v13, s46", lambda gy: 8.0, True),
+    ("rsq", "v_rsq_f32_e32 v13, v21", lambda gy: 4.0, True),
+    ("sqrt", "v_sqrt_f32_e32 v13, v22", lambda gy: 4.0, True),
+    ("fma", "v_fma_f32 v13, s45, v20, 1.0", lambda gy: 2.0, False),
+    ("mad", "v_mad_f32 v13, s45, v20, 1.0", lambda gy: 2.0, False),
+    ("med3", "v_med3_f32 v13, s45, v20, 1.0", lambda gy: 1.0, False),
+)
+REGION_BODY_PREFIX = ("v_mov_b32_e32 v20, 4.0", "v_mov_b32_e32 v21, 0x3d800000", "v_mov_b32_e32 v22, 0x41800000")
+REGION_BODY_ROUND = ("v_add_f32_e32 v13, 0.5, v13", "v_floor_f32_e32 v13, v13")
+
+
+def region_body_program(body, approximate, opener="cmpx"):
+    """REGION_BODY_PREFIX, then body in a v_cmpx region (or an s_and_saveexec_b64 one), optionally rounded."""
+    if opener == "cmpx":
+        region = [CMPX_SAVE, CMPX_COMPARE, body, CMPX_MOV_RESTORE]
+    else:
+        region = ["v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc", body, CMPX_OR_RESTORE]
+    return uncompressed_export([*REGION_BODY_PREFIX, *region, *(REGION_BODY_ROUND if approximate else ())])
+
+
+def region_body_constants(threshold):
+    constants = bytearray(256)
+    struct.pack_into("<3fI", constants, 12, threshold, 0.25, 0.125, 0x04030201)
+    return constants
+
+
+def region_body_pixels(threshold, inner, approximate, *, ignore_mask=False):
+    pixels = []
+    for g in MASKED_RAMP:
+        for r in MASKED_RAMP:
+            x, gy = single(r / 255), single(g / 255)
+            value = inner(gy) if (ignore_mask or x < threshold) else gy
+            if approximate:
+                value = float(math.floor(single(value + 0.5)))
+            pixels.append((x, value, single(128 / 255), 1))
+    return pixels
+
+
+def check_region_body_draw(directory, compiler, renderer, backend):
+    """Draw every stage-2 region body form on WARP or hardware (issue #932)."""
+    source = directory / "region-body.hlsl"
+    shader = directory / "region-body.cso"
+    for label, body, inner, approximate in REGION_BODY_FORMS:
+        source.write_text(translate(region_body_program(body, approximate)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for threshold in (0.5, 10.0, -1.0):
+            case = directory / f"region-body-{label}-{len(cases)}.case"
+            write_case(case, region_body_constants(threshold), region_body_pixels(threshold, inner, approximate))
+            cases.append((case, "pass"))
+        # Wrong reference: the body applied to every lane, as if the region ignored the mask.
+        case = directory / f"region-body-{label}-unmasked.case"
+        write_case(case, region_body_constants(0.5), region_body_pixels(0.5, inner, approximate, ignore_mask=True))
+        cases.append((case, "mismatch"))
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except AssertionError as error:
+            error.add_note(f"Region body draw on {backend}: {body}")
+            raise
+    return 0
+
+
+def check_region_body_controls():
+    """Stage 2 of #932: the admitted body forms in both region openers, and what stays refused."""
+    for label, body, _, approximate in REGION_BODY_FORMS:
+        for opener in ("cmpx", "saveexec"):
+            main = translate(region_body_program(body, approximate, opener)).split(" main(", 1)[1]
+            merges = re.findall(r"precise float alu\d+_v13 = \((cmp\d+) \? ", main)
+            assert len(merges) == 1, (label, opener, main)
+    # Other forms and encodings stay refused inside a region, under either opener.
+    for body in ("v_rcp_f32_e64 v13, s46", "v_fmac_f32_e64 v13, s45, v20", "v_mac_f32_e64 v13, s45, v20",
+                 "v_cvt_f32_ubyte0_e64 v13, s47", "v_exp_f32_e32 v13, s46", "v_log_f32_e32 v13, s46",
+                 "v_cvt_f32_f16_e64 v13, v20", "v_fma_mix_f32 v13, s45, v20, 1.0", "v_max3_f32 v13, s45, v20, 1.0",
+                 "s_nop 0", "s_mov_b32 s62, 0", "v_cvt_pkrtz_f16_f32_e32 v13, v20, v20"):
+        for opener in ("cmpx", "saveexec"):
+            expect_value_error(translate, region_body_program(body, False, opener),
+                               "Instruction cannot run in a masked region")
+    # An accumulator form reads its destination: a register still conditional from an earlier region rejects.
+    expect_value_error(translate, uncompressed_export([
+        *REGION_BODY_PREFIX, CMPX_SAVE, CMPX_COMPARE, "v_mov_b32_e32 v30, s45", CMPX_MOV_RESTORE,
+        CMPX_SAVE, CMPX_COMPARE, "v_fmac_f32_e32 v30, s45, v20", CMPX_MOV_RESTORE]),
+        "Read of a register defined only on the masked path")
+    # Several admitted forms in one region merge each rewritten register once.
+    chain = uncompressed_export([*REGION_BODY_PREFIX, CMPX_SAVE, CMPX_COMPARE, "v_rcp_f32_e32 v14, s46",
+                                 "v_fmac_f32_e32 v13, v14, v20", "v_med3_f32 v14, v13, v20, 1.0", CMPX_MOV_RESTORE])
+    main = translate(chain).split(" main(", 1)[1]
+    assert sorted(re.findall(r"precise float alu\d+_(v1[34]) = \(cmp\d+ \? ", main)) == ["v13", "v14"], main
+
+
 def with_scalar_constant_reads() -> list[str]:
     program = with_constants(["v_mov_b32_e32 v12, s61", "v_mov_b32_e32 v13, s62", "v_mov_b32_e32 v14, s63"])
     load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc")
@@ -10061,6 +10161,7 @@ def check_controls(directory):
     check_masked_controls()
     check_cmpx_controls()
     check_shift64_controls()
+    check_region_body_controls()
     check_title_load_controls()
     check_ds_swizzle_controls()
     check_ds_nop_controls()
@@ -11905,6 +12006,8 @@ def check_binary(directory, assembler, objcopy, library):
         *(cmpx_predicate_group(kind, first) for kind, first in CMPX_PREDICATE_GROUPS)))
     fixtures.append((cmpx_skip_asm(), translate, "gfx1013", "", cmpx_skip()))
     fixtures.extend((program, translate_int) for op in SHIFT64_OPS for program in shift64_programs(op).values())
+    fixtures.extend((region_body_program(body, approximate), translate)
+                    for _, body, _, approximate in REGION_BODY_FORMS)
     fixtures.append((uncompressed_export(flat_scratch_ops_group1()), translate_int))
     fixtures.append((uncompressed_export(flat_scratch_ops_group2()), translate_int))
     for index, entry in enumerate(fixtures):
@@ -16035,7 +16138,7 @@ def main():
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-div-fmas", "draw-cmp64", "draw-shift64",
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-region-body", "draw-div-fmas", "draw-cmp64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
@@ -16066,6 +16169,7 @@ def main():
                         "draw-ds-swizzle": check_ds_swizzle_draw,
                         "draw-exec-regions": check_masked_draw,
                         "draw-cmpx-regions": check_cmpx_draw,
+                        "draw-region-body": check_region_body_draw,
                         "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw,
                         "draw-shift64": check_shift64_draw,
