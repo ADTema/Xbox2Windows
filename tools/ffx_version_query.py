@@ -531,6 +531,35 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         M.VPHADDW, M.VPHADDD, M.VPHADDSW, M.VPHSUBW, M.VPHSUBD, M.VPHSUBSW, M.VPHMINPOSUW,
     }
     has_wide |= any(i.mnemonic in avx_ext_hadd_ops for i in body)
+    avx_horiz_fp_ops = {
+        M.VHADDPS: ("__m128", "_mm_hadd_ps"),
+        M.VHADDPD: ("__m128d", "_mm_hadd_pd"),
+        M.VHSUBPS: ("__m128", "_mm_hsub_ps"),
+        M.VHSUBPD: ("__m128d", "_mm_hsub_pd"),
+    }
+    has_wide |= any(i.mnemonic in avx_horiz_fp_ops for i in body)
+
+    def lower_avx_horiz_fp(insn, vec_reader):
+        """Lower VEX-encoded 128/256-bit horizontal FP add/sub using 128-bit SSE3 intrinsics per lane."""
+        dest = insn.op0_register
+        valid_regs = wide if dest in wide else wide_xmm
+        nbytes = 32 if dest in wide else 16
+        if (insn.encoding != EncodingKind.VEX or insn.op_count != 3
+                or insn.op0_kind != K.REGISTER or dest not in valid_regs
+                or insn.op1_kind != K.REGISTER or insn.op1_register not in valid_regs
+                or insn.op2_kind not in (K.REGISTER, K.MEMORY)
+                or (insn.op2_kind == K.REGISTER and insn.op2_register not in valid_regs)
+                or (insn.op2_kind == K.MEMORY and MemorySizeExt.size(insn.memory_size) != nbytes)):
+            raise ValueError(f"unsupported AVX horizontal FP operation at {insn.ip:#x}: {insn}")
+        vtype, fn = avx_horiz_fp_ops[insn.mnemonic]
+        dst, src1 = wide_any[dest], wide_any[insn.op1_register]
+        rhs = wide_any[insn.op2_register] if insn.op2_kind == K.REGISTER else vec_reader(nbytes)
+        zero_hi = f" memset({dst}.data() + 16, 0, 16);" if nbytes == 16 else ""
+        return (f"{{ const auto lhs = {src1}; const auto rhs = {rhs}; "
+                f"for (size_t l = 0; l < {nbytes}; l += 16) {{ "
+                f"{vtype} a, b; memcpy(&a, lhs.data() + l, 16); memcpy(&b, rhs.data() + l, 16); "
+                f"const {vtype} r = {fn}(a, b); memcpy({dst}.data() + l, &r, 16); }}{zero_hi} }}")
+
     avx_shift_pack_ops = {
         M.VPSLLW, M.VPSLLD, M.VPSLLQ, M.VPSRLW, M.VPSRLQ, M.VPSRAW, M.VPSRAD, M.VPSLLDQ,
         M.VPACKSSWB, M.VPACKSSDW, M.VPACKUSWB, M.VPACKUSDW,
@@ -2592,6 +2621,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                             f"memcpy(&b0, rhs.data()+l+2*k*{ls}, {ls}); memcpy(&b1, rhs.data()+l+(2*k+1)*{ls}, {ls}); "
                             f"const {ut} va = static_cast<{ut}>(a0 {sign} a1), vb = static_cast<{ut}>(b0 {sign} b1); "
                             f"memcpy({dst}.data()+l+k*{ls}, &va, {ls}); memcpy({dst}.data()+l+8+k*{ls}, &vb, {ls}); }} }}{zero_hi} }}")
+        elif op in avx_horiz_fp_ops:
+            stmt = lower_avx_horiz_fp(i, vector)
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = {vector(32)};"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
