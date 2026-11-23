@@ -4034,6 +4034,14 @@ cmake --build --preset dev --target xg_swizzle_select_check
 ctest --preset dev --no-tests=error -R '^xg_swizzle_select' -V
 ```
 
+### Swizzle selection and texture-computer handoff
+
+`xg_swizzle_factory` extends the same optional Navi 21 AddrLib comparison using the three-argument call shape in [DirectXTex issue #498](https://github.com/microsoft/DirectXTex/issues/498). It passes selector zero and an unknown layout in a test descriptor for the existing 128 by 128 RGBA8 reference with eight mips. Separate output leaves every descriptor byte intact. In-place output changes only the layout word. Both routes feed the selected layout to the test texture computer.
+
+On Windows 10 22H2 build 19045.6456 with MSVC 19.44 x64, both Debug and Release selected `64KB_R_X` and matched the mip pitches, heights, offsets and all 21,845 texel addresses across the two routes. The tiled and linear layouts each copied every texel exactly. Using the linear address map on the tiled data disagreed on all 21,845 texels. A zero width returned `E_INVALIDARG` and preserved the descriptor and output. `xg_swizzle_factory_no_write` verifies that the same check detects `S_OK` with an unwritten layout output. This is a CPU test of the fixture's PC layout policy. The Xbox flag-zero result and layout encoding still require a reference for the exact export.
+
+Build the same `xg_swizzle_select_check` target and run both factory tests with `ctest --preset dev --no-tests=error -R '^xg_swizzle_factory' -V`. Repeat with the `release` preset. Both tests return 77 when the optional AddrLib dependency is absent.
+
 ## Offscreen rendering and readback
 
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
