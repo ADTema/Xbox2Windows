@@ -1855,6 +1855,24 @@ takes one of three forms:
   The store must fit in one element, one group's columns in one row
   (`1 << shift`), and one group's rows in the stride.
 
+A byte offset can also come in the form LLVM 15 emits for gfx1013:
+`s_lshl_b32` of a group ID by log2 of its power-of-two group dimension gives
+the group's first dispatch index, and `v_add_lshl_u32` of that SGPR and the
+local ID of the same axis, with a shift, gives the same byte offset as
+`v_lshlrev_b32` of the dispatch index. The group-base SGPR is not a storable
+word. The `llvm_cube` fixture keeps the address instructions that `llc-15`
+produced for the 4×4×4 store below, with their registers:
+
+```sh
+llc-15 -mtriple=amdgcn--amdpal -mcpu=gfx1013 -O2 -filetype=obj cube.ll -o cube.o
+llvm-objdump-15 -d --mcpu=gfx1013 cube.o
+```
+
+The source is an `amdgpu_kernel`; only its kernel-argument load is replaced by
+the descriptor-table load of the other fixtures. Its bindings are
+`--table-reg 0 --descriptor-offset 0 --group-reg 2 --group-reg-y 3
+--group-reg-z 4 --stride 136`.
+
 All stores in a program use one layout, so no two invocations of a group write
 the same bytes. A dispatch-thread index can also be stored as data. The
 translator does not model out-of-range behavior for structured buffers: the
@@ -1865,8 +1883,8 @@ other ALU forms, for example a `v_mad_u32_u24` row pitch, are still rejected.
 python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-reg 8 --descriptor-offset 0 --group-reg 10 --group-reg-y 11 --stride 72 --output out/tile.hlsl
 ```
 
-The Windows fixture covers five group shapes, each with a full 320-word
-readback:
+The Windows fixture covers five group shapes, one of them in two address
+forms, each with a full 320-word readback:
 
 | Group | Dispatches |
 |---|---|
@@ -1875,10 +1893,12 @@ readback:
 | 4×4×1 | 1×1×1 and 3×2×1 |
 | 256×1×1 | 1×1×1 |
 | 4×4×4 | 1×1×1 and 1×2×2 |
+| 4×4×4, LLVM 15 form | 1×1×1, 1×1×2 and 1×2×2 |
 
 The 4×4×4 kernel stores dispatch Z at `tid.z * 132 + (tid.y << 4) + (tid.x << 2)`.
 Its 132-byte stride covers both groups' rows in Y and leaves one guard word per
-plane.
+plane. The LLVM 15 form stores dispatch Z at `tid.z * 136 + (tid.y << 4) +
+(tid.x << 2)`, with two guard words per plane.
 
 The expected words come from an independent per-invocation model. For each
 shape, the following must fail on the adapter:
@@ -1887,7 +1907,13 @@ shape, the following must fail on the adapter:
 - the first group count against the larger reference;
 - recompiled HLSL with swapped axes;
 - recompiled HLSL that ignores Z (4×1×8 and 4×4×4);
-- recompiled HLSL with half the group X size.
+- recompiled HLSL with half the group X size;
+- for the LLVM 15 form, recompiled HLSL with X and Z or Y and Z swapped.
+
+Each recompiled variant runs on the shape's largest dispatch, with one
+exception: Y and Z both span 8 in the 1×2×2 dispatch, so swapping them leaves
+the buffer unchanged. That swap runs on 1×1×2, where Y spans 4 and Z spans 8
+(`MUTATION_DISPATCH` in the test).
 
 The CPU controls reject:
 
@@ -1902,7 +1928,14 @@ The CPU controls reject:
 - a plane offset built from a raw local ID or from an index instead of a byte
   offset;
 - a group's columns overflowing a row, or its rows overflowing the stride;
-- a plane offset stored without its `idxen` index, or stored as data.
+- a plane offset stored without its `idxen` index, or stored as data;
+- a group base with the wrong shift, a non-power-of-two size whose shift still
+  matches, a source that is not a group ID, a destination past `s105` or still
+  pending from a descriptor load, or a group base scaled again; the Y form, with
+  a group Y size different from X, checks the shift and the power of two against
+  Y;
+- `v_add_lshl_u32` of an unscaled group ID, of the local ID of another axis or
+  into a register past `v255`, and a group base stored as data.
 
 `tools/shader_profile_audit.py` passes the PSV0 size and tries the next one or
 two SGPRs after the group-X candidate for group Y and Z. A CPU control in
