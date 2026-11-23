@@ -11,7 +11,6 @@
 // D3D12 device is attached to the registry, gives them desktop GPU addresses. The exports are
 // unchanged; nothing here loads D3D12. DXGI and gdi32 are delay-loaded.
 #include "era_heap.h"
-#include "era_physical.h"
 #include "era_query.h"
 #include "era_title_gpu.h"
 #include "xmem_gpu_usage.h"
@@ -83,41 +82,21 @@ extern "C" BOOL XMemGetWorkingSetStatistics(UINT32 selector, void* statistics)
     return TRUE;
 }
 
-namespace {
-BOOL physical_result(era_physical::Status status) noexcept
-{
-    switch (status) {
-    case era_physical::Status::ok:
-        SetLastError(ERROR_SUCCESS);
-        return TRUE;
-    case era_physical::Status::exhausted:
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return FALSE;
-    default:
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-}
-}
-
-// Proposed desktop policy (docs/experiments.md, #880): 64 KiB pages only, all or nothing. On failure
-// *count is 0 and the page array is untouched; console behavior on failure is not established.
-extern "C" BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR flags, PULONG_PTR count, PULONG_PTR pages)
-{
-    static_assert(sizeof(ULONG_PTR) == sizeof(std::uint64_t));
-    return physical_result(era_physical::allocate(flags, reinterpret_cast<std::uint64_t*>(count),
-                                                  reinterpret_cast<std::uint64_t*>(pages)));
-}
-
-// Proposed desktop policy: releases whole grants only (no partial release); any other array is
-// refused without changing state. Whether the console permits partial release is not established.
-extern "C" BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages)
-{
-    return physical_result(era_physical::release(count, reinterpret_cast<const std::uint64_t*>(pages)));
-}
-
 extern "C" BOOL WINAPI XMemIsToolsMemAvailable()
 {
     // The desktop runtime has no devkit tools-memory partition.
+    return FALSE;
+}
+
+// Desktop policy (docs/experiments.md): on a no-tools desktop runtime without devkit
+// tools-memory backing (XMemIsToolsMemAvailable() == FALSE per #896), transfer memory
+// returns FALSE with ERROR_NOT_SUPPORTED and leaves memory and accounting state unchanged.
+// Without independent evidence of runtime parameter validation returning 87
+// (ERROR_INVALID_PARAMETER), all calls take this narrow refusal.
+extern "C" BOOL WINAPI XMemTransferMemory(UINT32 partition, UINT64 byte_count)
+{
+    (void)partition;
+    (void)byte_count;
+    SetLastError(ERROR_NOT_SUPPORTED);
     return FALSE;
 }
