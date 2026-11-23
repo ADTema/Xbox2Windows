@@ -2332,6 +2332,13 @@ subnormal arithmetic require a separate profile.
 ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_f32_(warp|hardware)$' -V
 ```
 
+Returning binary32 min, max and compare-and-store preserve the old word
+when the destination overlaps an input. The binary64 compare-and-store forms
+require `--lds-f64-mode normal`, which guarantees normal values or positive
+zero when comparing. Under this contract bitwise equality of the two dwords
+implements numeric equality. Fixtures cover each binary64 dword matching
+independently and export the original pair in the returning form.
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
