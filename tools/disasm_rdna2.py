@@ -371,6 +371,22 @@ MIMG_OPS = {
     0x08: ("image_store", False, 0),
     0x09: ("image_store_mip", False, 1),
     0x0e: ("image_get_resinfo", False, 0),
+    0x0f: ("image_atomic_swap", False, 0),
+    0x10: ("image_atomic_cmpswap", False, 0),
+    0x11: ("image_atomic_add", False, 0),
+    0x12: ("image_atomic_sub", False, 0),
+    0x14: ("image_atomic_smin", False, 0),
+    0x15: ("image_atomic_umin", False, 0),
+    0x16: ("image_atomic_smax", False, 0),
+    0x17: ("image_atomic_umax", False, 0),
+    0x18: ("image_atomic_and", False, 0),
+    0x19: ("image_atomic_or", False, 0),
+    0x1a: ("image_atomic_xor", False, 0),
+    0x1b: ("image_atomic_inc", False, 0),
+    0x1c: ("image_atomic_dec", False, 0),
+    0x1d: ("image_atomic_fcmpswap", False, 0),
+    0x1e: ("image_atomic_fmin", False, 0),
+    0x1f: ("image_atomic_fmax", False, 0),
     0x20: ("image_sample", True, 0),
     0x21: ("image_sample_cl", True, 1),
     0x22: ("image_sample_d", True, 0),
@@ -673,6 +689,9 @@ VOP2_OPS = {
     0x25: ("v_add_nc_u32_e32", "Vector add uint32 without carry"),
     0x26: ("v_sub_nc_u32_e32", "Vector sub uint32 without carry"),
     0x27: ("v_subrev_nc_u32_e32", "Vector reverse sub uint32 without carry"),
+    0x28: ("v_add_co_ci_u32_e32", "Vector add with carry-in and carry-out uint32"),
+    0x29: ("v_sub_co_ci_u32_e32", "Vector sub with carry-in and carry-out uint32"),
+    0x2a: ("v_subrev_co_ci_u32_e32", "Vector reverse sub with carry-in and carry-out uint32"),
     0x2b: ("v_fmac_f32_e32", "Vector fused multiply-accumulate float32"),
     0x2c: ("v_fmamk_f32", "Vector fused multiply-add with literal multiplier"),
     0x2d: ("v_fmaak_f32", "Vector fused multiply-add with literal addend"),
@@ -1021,6 +1040,65 @@ MTBUF_FORMATS = {
 # DPP8 (233, or 234 with FI set), SDWA (249) and DPP16 (250). The dword holds the real SRC0 and
 # the lane or sub-dword controls.
 VOP_EXTENSION_FORMS = {233: "DPP8", 234: "DPP8", 249: "SDWA", 250: "DPP16"}
+SDWA_SEL_NAMES = ("BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD")
+
+
+def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
+    """Decode a GFX10 VOP_SDWA9Be (VOPC SDWA) 8-byte instruction."""
+    if op_name.startswith("v_vopc_") or op_name.endswith(("_f64_e32", "_i64_e32", "_u64_e32")):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "VOPC SDWA is not supported for this opcode")
+    src0_sel = (w1 >> 16) & 0x7
+    src1_sel = (w1 >> 24) & 0x7
+    if src0_sel >= len(SDWA_SEL_NAMES) or src1_sel >= len(SDWA_SEL_NAMES):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA selector")
+    sdwa_name = f"{op_name[:-4]}_sdwa" if op_name.endswith("_e32") else f"{op_name}_sdwa"
+    src0_raw = w1 & 0xff
+    sdst = (w1 >> 8) & 0x7f
+    sdst_en = (w1 >> 15) & 1
+    src0_sext = (w1 >> 19) & 1
+    src0_neg = (w1 >> 20) & 1
+    src0_abs = (w1 >> 21) & 1
+    src0_sgpr = (w1 >> 23) & 1
+    src1_sext = (w1 >> 27) & 1
+    src1_neg = (w1 >> 28) & 1
+    src1_abs = (w1 >> 29) & 1
+    src1_sgpr = (w1 >> 31) & 1
+
+    is_cmpx = op_name.startswith("v_cmpx_")
+    if is_cmpx and sdst_en:
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "VOPCX SDWA forbids sdst_en")
+    if (src0_sgpr and src0_raw in (249, 250, 255)) or (src1_sgpr and vsrc1 in (249, 250, 255)):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA scalar operand")
+
+    is_float = op_name.endswith(("_f32_e32", "_f16_e32"))
+    is_class = "_class_" in op_name
+    src0_is_float = is_float
+    src1_is_float = is_float and not is_class
+    # Reject modifier bits disallowed by VOP_SDWA9e for the operand type (LLVM 15 refuses these).
+    if (src0_is_float and src0_sext) or (not src0_is_float and (src0_neg or src0_abs)):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA src0 modifier")
+    if (src1_is_float and src1_sext) or (not src1_is_float and (src1_neg or src1_abs)):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA src1 modifier")
+
+    src0_str = decode_s_reg(src0_raw) if src0_sgpr else f"v{src0_raw}"
+    src1_str = decode_s_reg(vsrc1) if src1_sgpr else f"v{vsrc1}"
+
+    if src0_is_float:
+        src0_str = _format_operand_modifiers(src0_str, src0_abs, src0_neg)
+    elif src0_sext:
+        src0_str = f"sext({src0_str})"
+    if src1_is_float:
+        src1_str = _format_operand_modifiers(src1_str, src1_abs, src1_neg)
+    elif src1_sext:
+        src1_str = f"sext({src1_str})"
+
+    sels = f"src0_sel:{SDWA_SEL_NAMES[src0_sel]} src1_sel:{SDWA_SEL_NAMES[src1_sel]}"
+    if is_cmpx:
+        asm = f"{sdwa_name} {src0_str}, {src1_str} {sels}"
+    else:
+        dst_str = decode_s_reg(sdst) if sdst_en else "vcc_lo"
+        asm = f"{sdwa_name} {dst_str}, {src0_str}, {src1_str} {sels}"
+    return (8, sdwa_name, asm, comment)
 
 
 def _vop_extension(data: bytes, offset: int, encoding: str, op_name: str, src0: int) -> tuple[int, str, str, str]:
@@ -1755,7 +1833,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             if offset + 8 > len(data):
                 return (4, "vopc_truncated", f"{op_name} <truncated>", f"Incomplete VOPC {extension}")
             if src0 == 249:
-                return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "VOPC SDWA is not decoded")
+                w1, = struct.unpack_from("<I", data, offset + 4)
+                return _decode_vopc_sdwa(w1, vsrc1, op_name, comment)
             literal, = struct.unpack_from("<I", data, offset + 4)
             length = 8
         wide0 = op_name.endswith(("_f64_e32", "_i64_e32", "_u64_e32"))
@@ -1797,6 +1876,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0_str = f"0x{literal:x}" if src0 == 255 and literal is not None else decode_v_reg(src0)
         if op_name == "v_cndmask_b32_e32":
             asm = f"{op_name} v{vdst}, {src0_str}, v{vsrc1}, vcc_lo"
+        elif op in (0x28, 0x29, 0x2a):
+            asm = f"{op_name} v{vdst}, vcc_lo, {src0_str}, v{vsrc1}, vcc_lo"
         elif op in (0x20, 0x2c, 0x37):
             asm = f"{op_name} v{vdst}, {src0_str}, 0x{literal:x}, v{vsrc1}"
         elif op in (0x21, 0x2d, 0x38):

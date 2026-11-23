@@ -55,6 +55,7 @@ BYTE_PAIRS = (
     (b"za" + b"\x80\x7f" + b"\x00" * 12, b"\x80\xff\x00\x01\x7f\x81azbcdefghi"),
     (b"0123456789abcdef", b"0123456789abcdef"),
     (b"0123456789abcdef", b"012345X789abcdef"),
+    (b"A" * 15 + b"\x00", b"A" * 15 + b"\x00"),
 )
 
 WORD_PAIRS = (
@@ -74,12 +75,17 @@ WORD_PAIRS = (
         struct.pack("<8H", 0, 0, 0, 0, 0, 0, 0, 0),
         struct.pack("<8H", 1, 2, 3, 4, 5, 6, 7, 8),
     ),
+    (
+        struct.pack("<8H", 10, 10, 0, 0, 0, 0, 0, 0),
+        struct.pack("<8H", 10, 0, 0, 0, 0, 0, 0, 0),
+    ),
 )
 
 EXPLICIT_LEN_PAIRS = (
     (0, 0),
     (0, 5),
     (1, 5),
+    (1, 15),
     (3, 16),
     (4, 8),
     (8, 8),
@@ -387,6 +393,9 @@ def check_rejections(original_path: Path) -> None:
          "unsupported memory operand"),
         ("indexed_mem", encode_seq(ld_xmm1, Instruction.create_reg_mem_u32(
             Code.VEX_VPCMPISTRI_XMM_XMMM128_IMM8, R.XMM1, MemoryOperand(R.RDX, R.RCX, 4), 0), ret_ins),
+         "unsupported memory operand"),
+        ("unscaled_indexed_mem", encode_seq(ld_xmm1, ld_eax, Instruction.create_reg_mem_u32(
+            Code.VEX_VPCMPISTRI_XMM_XMMM128_IMM8, R.XMM1, MemoryOperand(R.RDX, R.RCX, 1), 0), ret_ins),
          "unsupported memory operand"),
         ("non_arg_base", encode_seq(ld_xmm1, Instruction.create_reg_mem_u32(
             Code.VEX_VPCMPISTRI_XMM_XMMM128_IMM8, R.XMM1, MemoryOperand(R.RAX), 0), ret_ins),

@@ -755,6 +755,106 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
     return 0
 
 
+# Stage 2 of issue #932: each admitted body form rewrites v13 inside a v_cmpx region whose outer value is the
+# green sample. Constants: s44 threshold, s45 = 0.25, s46 = 0.125, s47 = 0x04030201 (bytes 1, 2, 3, 4); before
+# the region v20 = 4.0, v21 = 0.0625 and v22 = 16.0. Every inner value is exact. D3D allows rcp, rsqrt and sqrt
+# an error, so those results (8.0, 4.0, 4.0) are rounded after the region with +0.5 and floor, which returns
+# the integer for any result within 0.5 of it; the outer value goes through the same rounding.
+REGION_BODY_FORMS = (
+    ("fmac", "v_fmac_f32_e32 v13, s45, v20", lambda gy: single(gy + 1.0), False),
+    ("mac", "v_mac_f32_e32 v13, s45, v20", lambda gy: single(gy + 1.0), False),
+    ("mul-legacy-e32", "v_mul_legacy_f32_e32 v13, s45, v20", lambda gy: 1.0, False),
+    ("mul-legacy-e64", "v_mul_legacy_f32_e64 v13, -s45, v20", lambda gy: -1.0, False),
+    *((f"cvt-ubyte{n}", f"v_cvt_f32_ubyte{n}_e32 v13, s47", lambda gy, n=n: float(n + 1), False) for n in range(4)),
+    ("rcp", "v_rcp_f32_e32 v13, s46", lambda gy: 8.0, True),
+    ("rsq", "v_rsq_f32_e32 v13, v21", lambda gy: 4.0, True),
+    ("sqrt", "v_sqrt_f32_e32 v13, v22", lambda gy: 4.0, True),
+    ("fma", "v_fma_f32 v13, s45, v20, 1.0", lambda gy: 2.0, False),
+    ("mad", "v_mad_f32 v13, s45, v20, 1.0", lambda gy: 2.0, False),
+    ("med3", "v_med3_f32 v13, s45, v20, 1.0", lambda gy: 1.0, False),
+)
+REGION_BODY_PREFIX = ("v_mov_b32_e32 v20, 4.0", "v_mov_b32_e32 v21, 0x3d800000", "v_mov_b32_e32 v22, 0x41800000")
+REGION_BODY_ROUND = ("v_add_f32_e32 v13, 0.5, v13", "v_floor_f32_e32 v13, v13")
+
+
+def region_body_program(body, approximate, opener="cmpx"):
+    """REGION_BODY_PREFIX, then body in a v_cmpx region (or an s_and_saveexec_b64 one), optionally rounded."""
+    if opener == "cmpx":
+        region = [CMPX_SAVE, CMPX_COMPARE, body, CMPX_MOV_RESTORE]
+    else:
+        region = ["v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc", body, CMPX_OR_RESTORE]
+    return uncompressed_export([*REGION_BODY_PREFIX, *region, *(REGION_BODY_ROUND if approximate else ())])
+
+
+def region_body_constants(threshold):
+    constants = bytearray(256)
+    struct.pack_into("<3fI", constants, 12, threshold, 0.25, 0.125, 0x04030201)
+    return constants
+
+
+def region_body_pixels(threshold, inner, approximate, *, ignore_mask=False):
+    pixels = []
+    for g in MASKED_RAMP:
+        for r in MASKED_RAMP:
+            x, gy = single(r / 255), single(g / 255)
+            value = inner(gy) if (ignore_mask or x < threshold) else gy
+            if approximate:
+                value = float(math.floor(single(value + 0.5)))
+            pixels.append((x, value, single(128 / 255), 1))
+    return pixels
+
+
+def check_region_body_draw(directory, compiler, renderer, backend):
+    """Draw every stage-2 region body form on WARP or hardware (issue #932)."""
+    source = directory / "region-body.hlsl"
+    shader = directory / "region-body.cso"
+    for label, body, inner, approximate in REGION_BODY_FORMS:
+        source.write_text(translate(region_body_program(body, approximate)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for threshold in (0.5, 10.0, -1.0):
+            case = directory / f"region-body-{label}-{len(cases)}.case"
+            write_case(case, region_body_constants(threshold), region_body_pixels(threshold, inner, approximate))
+            cases.append((case, "pass"))
+        # Wrong reference: the body applied to every lane, as if the region ignored the mask.
+        case = directory / f"region-body-{label}-unmasked.case"
+        write_case(case, region_body_constants(0.5), region_body_pixels(0.5, inner, approximate, ignore_mask=True))
+        cases.append((case, "mismatch"))
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except AssertionError as error:
+            error.add_note(f"Region body draw on {backend}: {body}")
+            raise
+    return 0
+
+
+def check_region_body_controls():
+    """Stage 2 of #932: the admitted body forms in both region openers, and what stays refused."""
+    for label, body, _, approximate in REGION_BODY_FORMS:
+        for opener in ("cmpx", "saveexec"):
+            main = translate(region_body_program(body, approximate, opener)).split(" main(", 1)[1]
+            merges = re.findall(r"precise float alu\d+_v13 = \((cmp\d+) \? ", main)
+            assert len(merges) == 1, (label, opener, main)
+    # Other forms and encodings stay refused inside a region, under either opener.
+    for body in ("v_rcp_f32_e64 v13, s46", "v_fmac_f32_e64 v13, s45, v20", "v_mac_f32_e64 v13, s45, v20",
+                 "v_cvt_f32_ubyte0_e64 v13, s47", "v_exp_f32_e32 v13, s46", "v_log_f32_e32 v13, s46",
+                 "v_cvt_f32_f16_e64 v13, v20", "v_fma_mix_f32 v13, s45, v20, 1.0", "v_max3_f32 v13, s45, v20, 1.0",
+                 "s_nop 0", "s_mov_b32 s62, 0", "v_cvt_pkrtz_f16_f32_e32 v13, v20, v20"):
+        for opener in ("cmpx", "saveexec"):
+            expect_value_error(translate, region_body_program(body, False, opener),
+                               "Instruction cannot run in a masked region")
+    # An accumulator form reads its destination: a register still conditional from an earlier region rejects.
+    expect_value_error(translate, uncompressed_export([
+        *REGION_BODY_PREFIX, CMPX_SAVE, CMPX_COMPARE, "v_mov_b32_e32 v30, s45", CMPX_MOV_RESTORE,
+        CMPX_SAVE, CMPX_COMPARE, "v_fmac_f32_e32 v30, s45, v20", CMPX_MOV_RESTORE]),
+        "Read of a register defined only on the masked path")
+    # Several admitted forms in one region merge each rewritten register once.
+    chain = uncompressed_export([*REGION_BODY_PREFIX, CMPX_SAVE, CMPX_COMPARE, "v_rcp_f32_e32 v14, s46",
+                                 "v_fmac_f32_e32 v13, v14, v20", "v_med3_f32 v14, v13, v20, 1.0", CMPX_MOV_RESTORE])
+    main = translate(chain).split(" main(", 1)[1]
+    assert sorted(re.findall(r"precise float alu\d+_(v1[34]) = \(cmp\d+ \? ", main)) == ["v13", "v14"], main
+
+
 def with_scalar_constant_reads() -> list[str]:
     program = with_constants(["v_mov_b32_e32 v12, s61", "v_mov_b32_e32 v13, s62", "v_mov_b32_e32 v14, s63"])
     load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc")
@@ -5023,7 +5123,7 @@ def check_scalar_controls():
     source = translate(program)
     for expected in ("= asuint(params[0].w) + asuint(params[1].x);", " < asuint(params[0].w)) ? 1u : 0u;",
                      "= (asuint(params[1].y) < asuint(params[1].z)) ? 2u : 0u;",
-                     "= ((~(asuint(params[1].y) ^ asuint(params[1].x)) & (asuint(params[1].y) ^ salu",
+                     "= (((asuint(params[1].y) ^ salu32) & (asuint(params[1].x) ^ salu32)) >> 31 != 0u)",
                      "= asuint(min(asint(asuint(params[0].w)), asint(asuint(params[1].x))));",
                      "= (asint(asuint(params[1].x)) > asint(asuint(params[0].w)));", "? 8192u : 0u;",
                      "= (asint(asuint(params[1].z)) == asint(4294967295u));", "? 2097152u : 0u;",
@@ -7364,6 +7464,52 @@ def pack_group(group):
     return [*PACK_PREFIX, *PACK_BODIES[group]]
 
 
+# v_pack_b32_f16 copies the low binary16 encoding of each source into one half of the destination: src0 gives
+# D[15:0] and src1 D[31:16], with no conversion, rounding or NaN handling (AMD RDNA ISA reference, VOP3OpSel:
+# D[15:0].f16 = S0.f16, D[31:16].f16 = S1.f16). Bodies for uncompressed_export(): A = s44 and B = s45 are the
+# constants, copied to v18 and v19, with noisy upper halves so an unmasked or high-half source read differs.
+# Three packs read A and B as register/register, SGPR/register and register/SGPR; the fourth writes back to v18,
+# its own src0, so a lowering that writes the destination before reading src0 differs. Every input and every
+# right result is a normal binary32 word or zero (asserted at the draw), so the NaN and signed-zero half
+# patterns of the low halves stay in the low halves of the packed words.
+PACK_B32_PREFIX = ["v_mov_b32_e32 v18, s44", "v_mov_b32_e32 v19, s45"]
+PACK_B32_BODY = ["v_pack_b32_f16 v12, v18, v19", "v_pack_b32_f16 v13, s44, v19",
+                 "v_pack_b32_f16 v14, v18, s45", "v_pack_b32_f16 v18, v18, v19",
+                 "v_mov_b32_e32 v15, v18"]
+PACK_B32_OPS = ("v_pack_b32_f16",)
+
+
+def pack_b32_group():
+    return [*PACK_B32_PREFIX, *PACK_B32_BODY]
+
+
+def pack_b32(lo, hi):
+    return (lo & 0xffff) | ((hi & 0xffff) << 16)
+
+
+def pack_b32_results(a, b):
+    """Reference words: src0's low half under src1's, including the in-place pack that writes back to v18."""
+    word = pack_b32(a, b)
+    return word, word, word, word
+
+
+# Negative controls: (channel, word a wrong lowering would give, what went wrong). Each is drawn on the first
+# row and must report a mismatch.
+PACK_B32_WRONG = (
+    (0, lambda a, b: pack_b32(b, a), "halves swapped"),
+    (1, lambda a, b: a | ((b & 0xffff) << 16), "src0 high half leaked into the low half"),
+    (2, lambda a, b: (a >> 16) | ((b & 0xffff) << 16), "src0 taken from bits 31:16"),
+    (3, lambda a, b: (b & 0xffff) | ((a & 0xffff) << 16), "src1 placed in the low half"),
+    (3, lambda a, b: (b & 0xffff) | ((b & 0xffff) << 16), "src0 read after the in-place destination write"),
+)
+# (A, B) as binary32 words with noisy upper halves 0xa5a5 and 0x5a5a. First row: the low halves are asymmetric
+# and each control gives a different word. The next rows put a quiet NaN half, a signed-zero half, a NaN half
+# in src1 (which lands in bits 31:16 but still gives a normal binary32 word) and two zero halves, which must
+# give zero. All the low-half patterns are copied as bits, with no quieting or conversion.
+PACK_B32_ROWS = ((0xA5A54200, 0x5A5AC000), (0xA5A57E00, 0x5A5A3C00), (0xA5A58000, 0x5A5A4200),
+                 (0xA5A54200, 0x5A5A7E00), (0xA5A50000, 0x5A5A0000))
+
+
 # v_add_co_u32, v_sub_co_u32 and v_subrev_co_u32: a 32-bit add or subtract that also writes the unsigned carry
 # or borrow of each lane to a lane mask. Bodies for uncompressed_export(): A, B, C and D are the constants in
 # s44 to s47, v18 = B and v19 = D. v12 holds op(A, B) with its carry in vcc_lo and v14 holds op(B, A) with its
@@ -8082,6 +8228,64 @@ def check_pack_int16_lowering():
         "v_sat_pk_u8_i16_e64 v12, v18",
     ):
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", neighbour]))
+
+
+def check_pack_b32_lowering():
+    """Static checks for v_pack_b32_f16 in the program of pack_b32_group()."""
+    a = "params[0].w"
+    # The prefix writes alu20 (A) and alu21 (B); the four packs follow at 22 to 25, then the move at 26.
+    source = translate_int(uncompressed_export(pack_b32_group())).splitlines()
+    for statement in (
+        f"    precise float alu22 = asfloat((asuint(alu20) & 0xffffu) | ((asuint(alu21) & 0xffffu) << 16));",
+        f"    precise float alu23 = asfloat(({a} & 0xffffu) | ((asuint(alu21) & 0xffffu) << 16));",
+        "    precise float alu24 = asfloat((asuint(alu20) & 0xffffu) | ((params[1].x & 0xffffu) << 16));",
+        "    precise float alu25 = asfloat((asuint(alu20) & 0xffffu) | ((asuint(alu21) & 0xffffu) << 16));",
+        "    precise float alu26 = alu25;",
+    ):
+        assert statement in source, statement
+    assert set(PACK_B32_OPS) <= ACCEPTED, set(PACK_B32_OPS) - ACCEPTED
+    # The Python reference at the word bounds and at the patterns used by the draws.
+    assert pack_b32(0xffffffff, 0) == 0xffff
+    assert pack_b32(0, 0xffffffff) == 0xffff0000
+    assert pack_b32(0xffff0000, 0x0000ffff) == 0xffff0000
+    assert pack_b32_results(*PACK_B32_ROWS[0]) == (0xC0004200,) * 4
+    # Raw half patterns are copied as bits: a quiet NaN half, a signed-zero half and a NaN half in src1.
+    assert pack_b32_results(*PACK_B32_ROWS[1]) == (0x3C007E00,) * 4
+    assert pack_b32_results(*PACK_B32_ROWS[2]) == (0x42008000,) * 4
+    assert pack_b32_results(*PACK_B32_ROWS[3]) == (0x7E004200,) * 4
+    assert pack_b32_results(*PACK_B32_ROWS[-1]) == (0,) * 4
+    # Each negative control changes its channel on the row it is drawn with.
+    for channel, wrong, reason in PACK_B32_WRONG:
+        assert wrong(*PACK_B32_ROWS[0]) & 0xffffffff != pack_b32_results(*PACK_B32_ROWS[0])[channel], reason
+    # Two sources in the VOP3 encoding only: no e32 spelling, no clamp, no op_sel, no float modifier, an
+    # in-range destination, written and in-range registers, 32-bit literals and no SDWA spelling.
+    good = "v_pack_b32_f16 v12, s44, v18"
+    translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
+    translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_pack_b32_f16_e64 v12, s44, v18"]))
+    for bad in (
+        "v_pack_b32_f16_e32 v12, s44, v18",
+        f"{good} clamp",
+        "v_pack_b32_f16 v12, s44, v18 op_sel:[1,0]",
+        "v_pack_b32_f16 v12, s44, v18 op_sel:[0,1] op_sel_hi:[0,0]",
+        "v_pack_b32_f16 v12, s44",
+        "v_pack_b32_f16 v12, s44, v18, s46",
+        "v_pack_b32_f16 v12, s44, -v18",
+        "v_pack_b32_f16 v12, |s44|, v18",
+        "v_pack_b32_f16 v12, -s44, v18",
+        "v_pack_b32_f16 v256, s44, v18",
+        "v_pack_b32_f16 v12, 0x100000000, v18",
+        "v_pack_b32_f16 v12, s44, s106",
+        "v_pack_b32_f16 v12, s44, v106",
+        "v_pack_b32_f16 v12, s44, v0",
+        "v_pack_b32_f16_sdwa v12, v18, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+    ):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", "v_pack_b32_f16_e32 v12, s44, v18"]),
+                       "does not support e32 encoding")
+    # A sample destination that has not been waited on is not readable.
+    rgb = rgb_sample()
+    wait = rgb.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, rgb[:wait] + ["v_pack_b32_f16 v16, v12, v13"] + rgb[wait:])
 
 
 def check_carry_out_lowering():
@@ -10061,6 +10265,7 @@ def check_controls(directory):
     check_masked_controls()
     check_cmpx_controls()
     check_shift64_controls()
+    check_region_body_controls()
     check_title_load_controls()
     check_ds_swizzle_controls()
     check_ds_nop_controls()
@@ -10258,6 +10463,7 @@ def check_controls(directory):
     check_carry_in_lowering()
     check_sdwa_integer_lowering()
     check_pack_int16_lowering()
+    check_pack_b32_lowering()
     check_sad_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
     assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED
@@ -11894,6 +12100,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(carry_in_group(op)), translate_int) for op in CARRY_IN_OPS)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
+    fixtures.append((uncompressed_export(pack_b32_group()), translate_int))
     fixtures.extend((uncompressed_export(sad_group(group)), translate_int) for group in SAD_BODIES)
     fixtures.extend((compressed_export(mask), translate_masked) for mask in (0x3, 0xC, 0xF))
     fixtures.extend((uncompressed_export([], mask), translate_masked) for mask in (0x1, 0x8, 0x5, 0xA))
@@ -11905,6 +12112,8 @@ def check_binary(directory, assembler, objcopy, library):
         *(cmpx_predicate_group(kind, first) for kind, first in CMPX_PREDICATE_GROUPS)))
     fixtures.append((cmpx_skip_asm(), translate, "gfx1013", "", cmpx_skip()))
     fixtures.extend((program, translate_int) for op in SHIFT64_OPS for program in shift64_programs(op).values())
+    fixtures.extend((region_body_program(body, approximate), translate)
+                    for _, body, _, approximate in REGION_BODY_FORMS)
     fixtures.append((uncompressed_export(flat_scratch_ops_group1()), translate_int))
     fixtures.append((uncompressed_export(flat_scratch_ops_group2()), translate_int))
     for index, entry in enumerate(fixtures):
@@ -12562,6 +12771,49 @@ def check_pack_int16_draws(directory, compiler, renderer, backend):
             if error.returncode == 77:
                 return 77
             raise
+    return 0
+
+
+def check_pack_b32_draw(directory, compiler, renderer, backend):
+    """Draw v_pack_b32_f16 through the integer readback target and compare the words.
+
+    The one program of pack_b32_group() is compiled once and drawn in one renderer batch: every row of
+    PACK_B32_ROWS with the right words, and the first row once per PACK_B32_WRONG entry with one channel replaced
+    by the word a wrong lowering would give, which must report a mismatch. On a desktop GPU the draw establishes
+    that the translated shader copies the stated halves, not what the console does.
+    """
+    source = directory / "pack_b32.hlsl"
+    shader = directory / "pack_b32.cso"
+    source.write_text(translate_int(uncompressed_export(pack_b32_group())), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for index, row in enumerate(PACK_B32_ROWS):
+        words = pack_b32_results(*row)
+        # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+        assert all(binary32_normal_or_zero(word) for word in (*row, *words)), [hex(w) for w in (*row, *words)]
+        constants = bytearray(256)
+        struct.pack_into("<2I", constants, 12, *row)
+        case = directory / f"pack_b32-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, "pass"))
+        if index:
+            continue
+        seen = set()
+        for channel, wrong, reason in PACK_B32_WRONG:
+            wrong_words = list(words)
+            wrong_words[channel] = wrong(*row) & 0xffffffff
+            assert wrong_words[channel] != words[channel], reason
+            assert (channel, wrong_words[channel]) not in seen, reason
+            seen.add((channel, wrong_words[channel]))
+            wrong_case = directory / f"pack_b32-{len(cases)}.case"
+            wrong_case.write_bytes(bytes(constants) + struct.pack("<4I", *wrong_words) * 64 + b"\x01")
+            cases.append((wrong_case, "mismatch"))
+    try:
+        run_pixel_batch(renderer, backend, shader, cases)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 77:
+            return 77
+        raise
     return 0
 
 
@@ -16032,10 +16284,11 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-sad",
+                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-pack-b32",
+                    "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-div-fmas", "draw-cmp64", "draw-shift64",
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-region-body", "draw-div-fmas", "draw-cmp64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
@@ -16053,6 +16306,7 @@ def main():
                         "draw-swap": check_swap_draw,
                         "draw-mac-legacy": check_mac_legacy_draws,
                         "draw-pack-int16": check_pack_int16_draws,
+                        "draw-pack-b32": check_pack_b32_draw,
                         "draw-sad": check_sad_draws,
                         "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-int16-ternary": check_int16_ternary_draw,
@@ -16066,6 +16320,7 @@ def main():
                         "draw-ds-swizzle": check_ds_swizzle_draw,
                         "draw-exec-regions": check_masked_draw,
                         "draw-cmpx-regions": check_cmpx_draw,
+                        "draw-region-body": check_region_body_draw,
                         "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw,
                         "draw-shift64": check_shift64_draw,

@@ -623,6 +623,9 @@ INTEGER = {
     "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
     "xnor_b32": (2, "~({0} ^ {1})"),
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
+    # Copies the low binary16 encoding of each source into one half of the destination, with no conversion,
+    # rounding or NaN handling (AMD RDNA ISA reference, VOP3OpSel: D[15:0].f16 = S0.f16, D[31:16].f16 = S1.f16).
+    "pack_b32_f16": (2, "({0} & 0xffffu) | (({1} & 0xffffu) << 16)"),
     # Saturating packs: src0 gives the low and src1 the high 16 bits (AMD RDNA 2 ISA reference, VOP3 opcodes
     # 874 and 875). The ISA text does not define its conversion functions; the bounds are the clamp Mesa
     # documents for the NIR operations its ACO backend selects these instructions for.
@@ -684,7 +687,7 @@ MUL24_HELPERS = {
     "mul_hi_i32_i24": ("mul24_hi_u32", "mul24_hi_i32"),
 }
 # Two-source integer operations that exist in the VOP3 encoding only on gfx10.
-INTEGER_VOP3_ONLY = ("cvt_pk_u16_u32", "cvt_pk_i16_i32", "bfm_b32", "bcnt_u32_b32")
+INTEGER_VOP3_ONLY = ("cvt_pk_u16_u32", "cvt_pk_i16_i32", "bfm_b32", "bcnt_u32_b32", "pack_b32_f16")
 SAD_HELPERS = {"sad_hi_u8": ("sad4_u8",), "msad_u8": ("sad4_u8",)}
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 
@@ -1204,7 +1207,7 @@ SCALAR = {
     "abs_i32": (1, "(asint({0}) < 0 ? (0u - {0}) : {0})", NONZERO),
     "absdiff_i32": (2, "asuint(abs(asint({0}) - asint({1})))", NONZERO),
     "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),
-    "add_i32": (2, "{0} + {1}", "(~({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
+    "add_i32": (2, "{0} + {1}", "(({0} ^ {r}) & ({1} ^ {r})) >> 31 != 0u"),
     "sub_i32": (2, "{0} - {1}", "(({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
     "mul_i32": (2, "{0} * {1}", None),
     "min_u32": (2, "min({0}, {1})", "{0} < {1}"), "max_u32": (2, "max({0}, {1})", "{0} > {1}"),
@@ -2145,9 +2148,13 @@ class VectorRegisters(dict):
 
 MISSING = object()
 
-# Only operations with per-lane, safe speculative evaluation enter the region.
+# Only operations with per-lane, safe speculative evaluation enter the region. Stage 2 of issue #932 adds the
+# per-lane binary32 forms the translator already lowers outside regions, in the encodings measured in real
+# regions; each still passes the per-instruction check in lower() (only VGPRs may change).
 REGION_ALU = re.compile(
-    r"v_(?:mov_b32|(?:add|sub|subrev|mul|min|max)_f32)(?:_e32|_e64)? ")
+    r"v_(?:mov_b32|(?:add|sub|subrev|mul|min|max)_f32)(?:_e32|_e64)? "
+    r"|v_(?:fmac|mac|rcp|rsq|sqrt)_f32_e32 |v_cvt_f32_ubyte[0-3]_e32 |v_mul_legacy_f32_e(?:32|64) "
+    r"|v_(?:fma|mad|med3)_f32 ")
 
 
 class TrackedVector(VectorRegisters):
