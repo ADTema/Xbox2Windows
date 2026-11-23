@@ -6320,6 +6320,17 @@ separately. External providers (including Windows system DLLs) are recorded as
 mapping were consulted. Forwarders to external providers are likewise marked
 unverified. This is not a prediction that the image will start or run correctly.
 
+`pe_run_package.plan(report, allow_external=False)` adds a strict closed-package
+check. Every reachable import must terminate in a bundled export; an
+`external_unverified` import, including the fixture-only XGameRuntime stub, is
+refused before any image is loaded or mapped. The default `plan(report)` keeps
+the earlier permissive behavior because the offline preflight does not inspect
+host providers. The XGameRuntime skeleton is built under
+`out/build/dev/fixture-shims/`, never beside `xmem.dll` or `d3d12_xs.dll`. A
+source-built EXE importing `xgameruntime.dll!XUserAddAsync` is packaged with the
+normal shims but without that fixture DLL; `xgameruntime_preflight_stub_refused`
+checks its `external_unverified` status and the strict plan's refusal.
+
 ```sh
 python -B tools/pe_package_preflight.py out/source-built-package app.exe \
     --output out/pe-package-report.json

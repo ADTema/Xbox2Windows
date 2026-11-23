@@ -150,6 +150,43 @@ set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
 
+# Fixture-only desktop xgameruntime.dll skeleton. Every exported thunk is
+# generated from the single X-macro table in xgameruntime_shim.cpp and returns
+# E_NOTIMPL. Keep it out of the normal shim directory so a package cannot treat
+# the production-named DLL as a provider.
+add_library(xgameruntime_shim SHARED src/xgameruntime_shim.cpp src/xgameruntime_shim.def)
+set(xgameruntime_fixture_dir "${CMAKE_BINARY_DIR}/fixture-shims")
+set_target_properties(xgameruntime_shim PROPERTIES
+    OUTPUT_NAME xgameruntime
+    RUNTIME_OUTPUT_DIRECTORY "${xgameruntime_fixture_dir}"
+    LIBRARY_OUTPUT_DIRECTORY "${xgameruntime_fixture_dir}"
+    ARCHIVE_OUTPUT_DIRECTORY "${xgameruntime_fixture_dir}")
+target_compile_features(xgameruntime_shim PRIVATE cxx_std_17)
+
+add_executable(xgameruntime_shim_check tests/xgameruntime_thunks_check.cpp)
+add_dependencies(xgameruntime_shim_check xgameruntime_shim)
+target_compile_features(xgameruntime_shim_check PRIVATE cxx_std_17)
+add_test(NAME xgameruntime_thunks COMMAND xgameruntime_shim_check
+    "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
+    "$<TARGET_FILE_DIR:xmem_shim>")
+set_tests_properties(xgameruntime_thunks PROPERTIES TIMEOUT 30)
+
+# A real source-built EXE import fixture. The import library below only names
+# xgameruntime.dll; no build product or test package copies the fixture DLL.
+set(xgameruntime_import_def "${CMAKE_CURRENT_SOURCE_DIR}/tests/xgameruntime_import.def")
+set(xgameruntime_import_lib "${CMAKE_CURRENT_BINARY_DIR}/xgameruntime_fixture_import.lib")
+add_custom_command(OUTPUT "${xgameruntime_import_lib}"
+    COMMAND "${CMAKE_AR}" /nologo /machine:x64 "/def:${xgameruntime_import_def}"
+            "/out:${xgameruntime_import_lib}"
+    DEPENDS tests/xgameruntime_import.def VERBATIM)
+add_executable(xgameruntime_preflight_exe tests/xgameruntime_preflight_exe.cpp)
+target_sources(xgameruntime_preflight_exe PRIVATE "${xgameruntime_import_lib}")
+target_link_libraries(xgameruntime_preflight_exe PRIVATE "${xgameruntime_import_lib}")
+target_compile_features(xgameruntime_preflight_exe PRIVATE cxx_std_17)
+target_compile_options(xgameruntime_preflight_exe PRIVATE /GS-)
+target_link_options(xgameruntime_preflight_exe PRIVATE /ENTRY:fixture_entry /NODEFAULTLIB
+    /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
@@ -4317,6 +4354,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/dependency_paths_check.py")
     add_test(NAME pe_package_import_closure COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pe_package_preflight_check.py")
+    add_test(NAME xgameruntime_preflight_stub_refused COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xgameruntime_preflight_check.py"
+        "$<TARGET_FILE:xgameruntime_preflight_exe>" "$<TARGET_FILE:xmem_shim>"
+        "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
+        "$<TARGET_FILE_DIR:xmem_shim>")
+    set_tests_properties(xgameruntime_preflight_stub_refused PROPERTIES TIMEOUT 30)
 else()
     message(WARNING
         "Python-driven tests, including the CPU fixtures, are disabled because "
