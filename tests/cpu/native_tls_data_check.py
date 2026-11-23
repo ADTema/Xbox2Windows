@@ -6,9 +6,17 @@ C++ thread_local with a dynamic initializer. Each case runs in a fresh child pro
 the image with LoadLibraryW or maps it with pe_map and records what three threads observe: the
 loading thread, a thread that existed before the load and a thread created after it.
 
-pe_map serves the template through a carrier DLL that Windows loads from the temporary directory.
-The test also checks that the carrier file is gone after release, and that the file a process
-leaves when it ends without releasing is removed by the next process that maps a TLS image.
+pe_map serves the template through a carrier DLL that Windows loads from a private directory
+under the temporary directory. Every child gets a temporary directory of its own (TMP and TEMP), so
+the test sees each process's carriers. It checks that while an image is mapped its carrier can be
+neither renamed nor opened for writing and its directory cannot be renamed, that the carrier is gone
+after release, and that the carrier a process leaves when it ends without releasing is not touched
+by the next process that maps a TLS image there.
+
+Two failure controls run beside carrier-like files of another process: one where Windows refuses
+to load the carrier after it was written (the child accepts only Microsoft-signed images), and one
+where the carrier was loaded and the guest's entry point refuses the process attach. Each failed map
+must remove its own carrier and leave the other files as they were.
 """
 
 import argparse
@@ -18,6 +26,7 @@ import os
 from pathlib import Path
 import shutil
 import struct
+import secrets
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -29,7 +38,9 @@ from native_map_check import Mapper, Resolver, STATUS
 
 TIMEOUT = 60
 WAIT_MS = 10000
-ERROR_BAD_EXE_FORMAT, ERROR_NOACCESS = 193, 998
+ERROR_BAD_EXE_FORMAT, ERROR_NOACCESS, ERROR_INVALID_IMAGE_HASH, ERROR_DLL_INIT_FAILED = 193, 998, 577, 1114
+MAP_MEMORY = 3  # MapStatus in tools/pe_map.cpp; the carrier's failures are reported with it
+CARRIER = "pe_map_tls_"
 ALIGN_MASK, ALIGN_4096 = 0x00F00000, 0x00D00000
 MAX_TEMPLATE = 16 << 20  # MAX_TLS_TEMPLATE in tools/pe_map.cpp
 
@@ -46,6 +57,13 @@ kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
 kernel.WaitForSingleObject.restype = ctypes.c_uint32
 kernel.CloseHandle.argtypes = [ctypes.c_void_p]
 kernel.GetTempPathW.argtypes = [ctypes.c_uint32, ctypes.c_wchar_p]
+kernel.GetEnvironmentVariableW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+kernel.SetProcessMitigationPolicy.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+PROCESS_SIGNATURE_POLICY, MICROSOFT_SIGNED_ONLY = 8, 1  # PROCESS_MITIGATION_POLICY, its first flag
+kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
+                               ctypes.c_uint32, ctypes.c_void_p]
+kernel.CreateFileW.restype = ctypes.c_void_p
+GENERIC_WRITE, SHARE_ALL, OPEN_EXISTING, INVALID_HANDLE = 0x40000000, 7, 3, 2 ** 64 - 1
 
 
 class Snapshot(ctypes.Structure):
@@ -69,11 +87,45 @@ def written(value):
             "big_sum": value + 4}
 
 
-def carrier_files(pid):
-    """Carrier files pe_map wrote for one process and has not removed yet."""
+def temporary_directory():
     buffer = ctypes.create_unicode_buffer(262)
     kernel.GetTempPathW(len(buffer), buffer)
-    return sorted(path.name for path in Path(buffer.value).glob(f"pe_map_tls_{pid:08x}_*.dll"))
+    return Path(buffer.value)
+
+
+def listing(folder):
+    """Every file and directory under folder, relative to it."""
+    return sorted(path.relative_to(folder).as_posix() for path in Path(folder).rglob("*"))
+
+
+def carrier_files(folder=None):
+    """Carrier files under a temporary directory, by default this process's."""
+    folder = Path(folder) if folder else temporary_directory()
+    return sorted(path.relative_to(folder).as_posix() for path in folder.glob(f"{CARRIER}*/{CARRIER}*.dll"))
+
+
+def open_for_writing(path):
+    """CreateFileW with GENERIC_WRITE, sharing everything; raises PermissionError with the Windows error."""
+    handle = kernel.CreateFileW(str(path), GENERIC_WRITE, SHARE_ALL, None, OPEN_EXISTING, 0, None)
+    if handle in (None, INVALID_HANDLE):
+        error = ctypes.get_last_error()
+        raise PermissionError(None, "cannot open for writing", str(path), error)
+    kernel.CloseHandle(handle)
+
+
+def held(path):
+    """Whether the carrier file and its directory resist a rename and the file resists a writer."""
+    path = Path(path)
+    results = {}
+    for label, attempt in (("rename", lambda: path.rename(path.with_name("renamed.dll"))),
+                           ("write", lambda: open_for_writing(path)),
+                           ("rename directory", lambda: path.parent.rename(path.parent.with_name("renamed")))):
+        try:
+            attempt()
+            results[label] = "succeeded"
+        except PermissionError as error:
+            results[label] = error.winerror
+    return results
 
 
 class Loader:
@@ -150,12 +202,15 @@ def run(target, mapper_path, image, second, leave="release"):
     thread = threading.Thread(target=before_load, daemon=True)
     thread.start()  # exists before the image is loaded
 
+    others = carrier_files()  # left by an earlier process; never touched here
     module, failure = loader.load(image)
     if not module:
-        emit({"failure": failure, "carriers": carrier_files(os.getpid())})
+        emit({"failure": failure, "carriers": carrier_files()})
     first = Image(loader, module)
     holder.append(first)
-    report = {"failure": None, "carriers_loaded": len(carrier_files(os.getpid()))}
+    own = [name for name in carrier_files() if name not in others]
+    report = {"failure": None, "carriers_loaded": len(own)}
+    report["held"] = [held(temporary_directory() / name) for name in own]
     report["main"] = first.snapshot()
     first.write(20)
     report["main_written"] = first.snapshot()
@@ -175,27 +230,83 @@ def run(target, mapper_path, image, second, leave="release"):
     other.write(30)
     report["second_written"] = other.snapshot()
     report["first_after_second"] = first.snapshot()
-    report["carriers_two"] = len(carrier_files(os.getpid()))
+    report["carriers_two"] = len(set(carrier_files()) - set(others))
     report["released"] = [loader.release(other_module), loader.release(module)]
-    report["carriers_released"] = len(carrier_files(os.getpid()))
+    report["carriers_released"] = len(set(carrier_files()) - set(others))
 
     # Loaded again, the loading thread starts from the template, not from the earlier writes.
     module, failure = loader.load(image)
     if not module:
         emit({"failure": ["reload", failure]})
     report["reload"] = Image(loader, module).snapshot()
-    report["pid"] = os.getpid()
+    report["carriers"] = [name for name in carrier_files() if name not in others]
     if leave != "leave":  # "leave" ends the process with the image still loaded
         report["released"].append(loader.release(module))
     emit(report)
 
 
-def child(target, mapper, image, second, leave=False):
-    result = subprocess.run([sys.executable, "-B", __file__, "--run", target, str(mapper), str(image), str(second),
-                             "leave" if leave else "release"], capture_output=True, text=True, timeout=TIMEOUT)
+def fail_run(target, mapper_path, image, kind):
+    """Child: a map or load that fails after the carrier was written or after it was loaded.
+
+    signed-only: the process accepts only Microsoft-signed images from here on, so Windows refuses
+    the carrier that pe_map wrote. refuse: image is the refusing fixture, whose entry point records
+    what its thread-locals hold and fails the process attach.
+    """
+    loader = Loader(target, mapper_path)
+    if kind == "signed-only":
+        flags = ctypes.c_uint32(MICROSOFT_SIGNED_ONLY)
+        if not kernel.SetProcessMitigationPolicy(PROCESS_SIGNATURE_POLICY, ctypes.byref(flags), 4):
+            emit({"failure": ["policy", ctypes.get_last_error()]})
+    module, failure = loader.load(image)
+    seen = ctypes.create_unicode_buffer(64)
+    kernel.GetEnvironmentVariableW("TLS_DATA_ATTACH", seen, len(seen))
+    emit({"failure": failure, "loaded": bool(module), "attach": seen.value, "listing": listing(temporary_directory())})
+
+
+def child(target, mapper, image, second, leave=False, temp=None, fail=None):
+    """Runs a child with temp as its temporary directory; fail selects a failure control instead."""
+    environment = dict(os.environ)
+    if temp:
+        Path(temp).mkdir(parents=True, exist_ok=True)
+        environment["TMP"] = environment["TEMP"] = str(temp)
+    mode = ["--fail", target, str(mapper), str(image), fail] if fail else \
+        ["--run", target, str(mapper), str(image), str(second), "leave" if leave else "release"]
+    result = subprocess.run([sys.executable, "-B", __file__, *mode], capture_output=True, text=True, timeout=TIMEOUT,
+                            env=environment)
     if result.returncode:
         raise AssertionError(f"{target} {Path(image).name}: child exited {result.returncode:#x}: {result.stderr}")
     return json.loads(result.stdout)
+
+
+def ended_pid():
+    """The ID of a process that has ended."""
+    process = subprocess.Popen([sys.executable, "-c", "pass"])
+    process.wait(TIMEOUT)
+    return process.pid
+
+
+def decoys(folder):
+    """Carrier-like files of another process: one in the layout of an earlier pe_map, named after a
+    process that has ended, and one directory in the current layout. Returns their contents."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    name = secrets.token_hex(16)
+    files = {f"{CARRIER}{ended_pid():08x}_00000001_0000000000000000.dll": b"another process's carrier, old layout",
+             f"{CARRIER}{name}/{CARRIER}{name}.dll": b"another process's carrier"}
+    for relative, data in files.items():
+        (folder / relative).parent.mkdir(exist_ok=True)
+        (folder / relative).write_bytes(data)
+    return files
+
+
+def check_decoys(label, folder, files, report):
+    """Only the decoys are left, unchanged."""
+    expected = sorted({*files, *(Path(relative).parent.as_posix() for relative in files)} - {"."})
+    if report["listing"] != expected:
+        raise AssertionError(f"{label}: expected only the other process's files {expected}, found {report['listing']}")
+    for relative, data in files.items():
+        if (Path(folder) / relative).read_bytes() != data:
+            raise AssertionError(f"{label}: {relative} was changed")
 
 
 SEMANTIC = ("main", "main_written", "worker", "worker_written", "existing", "main_end", "second",
@@ -270,14 +381,14 @@ REJECTED = {
 }
 
 
-def check(mapper, fixture):
+def check(mapper, fixture, refuse):
     with TemporaryDirectory() as temporary:
         folder = Path(temporary)
         second = folder / "tls_data_second.dll"
         shutil.copy2(fixture, second)
 
-        native = child("native", mapper, fixture, second)
-        mapped = child("mapped", mapper, fixture, second)
+        native = child("native", mapper, fixture, second, temp=folder / "temp_native")
+        mapped = child("mapped", mapper, fixture, second, temp=folder / "temp_mapped")
         check_structure("native", native)
         check_structure("mapped", mapped)
         expected = {"main": FRESH, "main_written": written(20), "worker": FRESH, "worker_written": written(50),
@@ -290,26 +401,62 @@ def check(mapper, fixture):
         counts = [(r["carriers_loaded"], r["carriers_two"], r["carriers_released"]) for r in (native, mapped)]
         if counts != [(0, 0, 0), (1, 2, 0)]:
             raise AssertionError(f"carrier files while loaded, with two images, after release: {counts}")
-        if carrier_files(mapped["pid"]):
-            raise AssertionError(f"carrier file left after release: {carrier_files(mapped['pid'])}")
-        # A process that ends with an image still mapped leaves its carrier file (Windows cannot delete
-        # a mapped image); the next process that maps a TLS image removes it.
-        left = child("mapped", mapper, fixture, second, leave=True)
-        if len(carrier_files(left["pid"])) != 1:
-            raise AssertionError(f"expected one carrier file from the ended process: {carrier_files(left['pid'])}")
-        child("mapped", mapper, fixture, second)
-        if carrier_files(left["pid"]):
-            raise AssertionError(f"carrier file of an ended process not removed: {carrier_files(left['pid'])}")
+        if listing(folder / "temp_mapped"):
+            raise AssertionError(f"left after release: {listing(folder / 'temp_mapped')}")
         print(f"native and mapped agree on {len(SEMANTIC)} observations: the loading thread, a thread that existed "
               f"before the load and a new thread each start from the template in a block of their own, aligned to "
               f"64 bytes; indexes native {native['main']['index']}/{native['second']['index']}, "
               f"mapped {mapped['main']['index']}/{mapped['second']['index']}")
+        # While mapped, the carrier's path keeps naming the file pe_map wrote: the file and its
+        # directory cannot be renamed and the file cannot be opened for writing (error 32).
+        if mapped["held"] != [{"rename": 32, "write": 32, "rename directory": 32}]:
+            raise AssertionError(f"the carrier's path did not hold while mapped: {mapped['held']}")
+        # A process that ends with an image still mapped leaves its carrier (Windows cannot delete a
+        # mapped image). The next process that maps a TLS image in the same temporary directory
+        # removes its own carrier and leaves that one alone.
+        shared = folder / "temp_shared"
+        left = child("mapped", mapper, fixture, second, leave=True, temp=shared)
+        leftover = carrier_files(shared)
+        if leftover != left["carriers"] or len(leftover) != 1:
+            raise AssertionError(f"expected the ended process's one carrier, found {leftover}, reported {left['carriers']}")
+        contents = (shared / leftover[0]).read_bytes()
+        later = child("mapped", mapper, fixture, second, temp=shared)
+        if later["failure"] is not None or carrier_files(shared) != leftover \
+                or (shared / leftover[0]).read_bytes() != contents:
+            raise AssertionError(f"another process's carrier was touched: {carrier_files(shared)}, {later['failure']}")
+        print("while mapped, renaming the carrier or its directory and opening it for writing fail with error 32; "
+              "nothing is left after release; a carrier left by an ended process is not touched by a later map")
+
+        # Failure controls: each failed map removes its own carrier and nothing else.
+        controls = {}
+        temp = folder / "temp_signed_only"
+        files = decoys(temp)
+        report = child("mapped", mapper, fixture, None, temp=temp, fail="signed-only")
+        expected_failure = [MAP_MEMORY, f"Windows cannot load the TLS carrier (error {ERROR_INVALID_IMAGE_HASH})"]
+        if report["failure"] != expected_failure:
+            raise AssertionError(f"signed-only: expected {expected_failure}, got {report}")
+        check_decoys("signed-only", temp, files, report)
+        controls["the carrier was written and Windows refused it"] = report["failure"][1]
+        native = child("native", mapper, refuse, None, temp=folder / "temp_refuse_native", fail="refuse")
+        if native["failure"] != ERROR_DLL_INIT_FAILED or native["attach"] != "7 1":
+            raise AssertionError(f"refuse: Windows gave {native}, expected error {ERROR_DLL_INIT_FAILED} after '7 1'")
+        temp = folder / "temp_refuse"
+        files = decoys(temp)
+        report = child("mapped", mapper, refuse, None, temp=temp, fail="refuse")
+        # "7 1": during the attach, t_init and t_wide held their template values in the carrier's block.
+        if report["failure"] != [STATUS["init_failed"], "entry point returned FALSE"] or report["attach"] != "7 1":
+            raise AssertionError(f"refuse: expected init_failed after the attach saw '7 1', got {report}")
+        check_decoys("refuse", temp, files, report)
+        controls["the carrier was loaded and the entry point refused"] = report["failure"][1]
+        print("failed maps remove only their own carrier, beside an ended process's old-layout file and another "
+              f"carrier directory: {'; '.join(f'{k}: {v}' for k, v in controls.items())}; Windows fails the refusing "
+              f"fixture with error {ERROR_DLL_INIT_FAILED} after the same attach")
 
         for label, (edit, ignore) in ACCEPTED.items():
             copy = folder / "accepted.dll"
             patch(fixture, copy, edit)
-            native = child("native", mapper, copy, second)
-            mapped = child("mapped", mapper, copy, second)
+            native = child("native", mapper, copy, second, temp=folder / "temp_accepted_native")
+            mapped = child("mapped", mapper, copy, second, temp=folder / "temp_accepted_mapped")
             check_structure(f"native {label}", native)
             check_structure(f"mapped {label}", mapped)
             if semantic(native, ignore) != semantic(mapped, ignore):
@@ -326,11 +473,11 @@ def check(mapper, fixture):
             copy = folder / "rejected.dll"
             patch(fixture, copy, edit)
             if windows_error is not None:
-                native = child("native", mapper, copy, second)
+                native = child("native", mapper, copy, second, temp=folder / "temp_rejected_native")
                 if native["failure"] != windows_error:
                     raise AssertionError(f"{label}: Windows gave {native['failure']}, expected {windows_error}")
-            mapped = child("mapped", mapper, copy, second)
-            if mapped["failure"] != rejection or mapped["carriers"]:
+            mapped = child("mapped", mapper, copy, second, temp=folder / "temp_rejected_mapped")
+            if mapped["failure"] != rejection or mapped["carriers"] or listing(folder / "temp_rejected_mapped"):
                 raise AssertionError(f"{label}: expected {rejection} and no carrier file, got {mapped}")
         print(f"pe_map rejects a {', a '.join(REJECTED)}; Windows fails the first two with errors "
               f"{ERROR_NOACCESS} and {ERROR_BAD_EXE_FORMAT}")
@@ -339,9 +486,12 @@ def check(mapper, fixture):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--run":
         run(*sys.argv[2:7])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--fail":
+        fail_run(*sys.argv[2:6])
     else:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("mapper", type=Path)
         parser.add_argument("fixture", type=Path)
+        parser.add_argument("refuse", type=Path, help="the fixture built with ENTRY_FAILS")
         arguments = parser.parse_args()
-        check(arguments.mapper, arguments.fixture)
+        check(arguments.mapper, arguments.fixture, arguments.refuse)

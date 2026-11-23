@@ -6,6 +6,10 @@
 // Header fields are checked against the file or SizeOfImage before use.
 #include <windows.h>
 
+#include <bcrypt.h>
+#include <psapi.h>
+#include <sddl.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -222,28 +226,75 @@ BOOL notify(const Image& image, const IMAGE_NT_HEADERS64* nt, const std::vector<
 // ThreadLocalStoragePointer array (gs:[0x58]), indexed by the DWORD at AddressOfIndex. ntdll owns
 // that array: it sizes it, assigns the indexes, gives every thread a block per index and frees the
 // blocks. pe_map does not touch it. For an image with a non-empty template it writes a small
-// carrier DLL to the temporary directory and loads it with LoadLibraryExW. The carrier has no code
+// carrier DLL to a private directory under the temporary directory (see load_carrier) and loads
+// it with LoadLibraryExW. The carrier has no code
 // and imports nothing; it holds a TLS directory whose template is a copy of the guest's relocated template
 // and whose SizeOfZeroFill and Characteristics (alignment) are the guest's. Windows then assigns
 // the carrier a real index and allocates, aligns, initializes and frees one block per thread,
 // for threads that already exist and for threads created later, as it would for the guest.
 // pe_map stores the carrier's index at the guest's AddressOfIndex, so the guest's accesses land
-// in the carrier's blocks. FreeLibrary on the carrier returns the index and the blocks.
+// in the carrier's blocks. FreeLibrary on the carrier returns the index and the blocks; the
+// carrier's file and directory are then deleted through the handles the map call holds.
+//
+// A process that ends with an image still mapped leaves its carrier directory behind, since
+// deletion is only requested on release. pe_map does not remove such directories: nothing but a
+// handle establishes that a carrier belongs to the caller.
 //
 // Differences from a Windows load of the guest: the template is copied once, when the image is
 // mapped, so a later write to the template in the image does not reach threads created afterwards;
 // and code that assumes index 0 without reading AddressOfIndex cannot be served.
 constexpr std::uint64_t MAX_TLS_TEMPLATE = 16ull << 20;
 
+// One map call's carrier and everything it owns. Nothing else is ever deleted: cleanup goes through
+// these handles, never through a name or a pattern.
 struct TlsCarrier {
     HMODULE module = nullptr;
-    HANDLE file = INVALID_HANDLE_VALUE;  // opened delete-on-close, so the file goes with the handle
+    HANDLE file = INVALID_HANDLE_VALUE;       // read and delete access, shared for reading only
+    HANDLE directory = INVALID_HANDLE_VALUE;  // the private directory that holds the file
 };
 
-void unload(TlsCarrier& carrier) {
-    if (carrier.module) FreeLibrary(carrier.module);
-    if (carrier.file != INVALID_HANDLE_VALUE) CloseHandle(carrier.file);
+// Deletes the object behind handle. POSIX semantics remove the name when the handle closes, which
+// the directory needs: measured on Windows 10 build 19045, a carrier deleted with the classic
+// disposition after FreeLibrary sometimes stays listed after its last handle closes (1 of 10 runs),
+// and its directory then cannot be removed (ERROR_DIR_NOT_EMPTY). With POSIX semantics the name was
+// gone and the directory removed in 10 of 10 runs. File systems without them get the classic one.
+bool dispose(HANDLE handle) {
+    FILE_DISPOSITION_INFO_EX posix{FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS};
+    if (SetFileInformationByHandle(handle, FileDispositionInfoEx, &posix, sizeof(posix))) return true;
+    const DWORD error = GetLastError();
+    if (error != ERROR_INVALID_PARAMETER && error != ERROR_NOT_SUPPORTED && error != ERROR_INVALID_FUNCTION)
+        return false;
+    FILE_DISPOSITION_INFO classic{TRUE};
+    return SetFileInformationByHandle(handle, FileDispositionInfo, &classic, sizeof(classic)) != FALSE;
+}
+
+// Unloads the carrier, then deletes its file and its directory through the handles it holds.
+// Returns null, or the first cleanup step that failed with error holding GetLastError; whatever
+// could not be deleted stays where it is.
+const char* unload(TlsCarrier& carrier, DWORD& error) {
+    const char* failed = nullptr;
+    auto note = [&](const char* step) {
+        if (!failed) {
+            failed = step;
+            error = GetLastError();
+        }
+    };
+    if (carrier.module && !FreeLibrary(carrier.module)) note("cannot unload the TLS carrier");
+    if (carrier.file != INVALID_HANDLE_VALUE) {
+        if (!dispose(carrier.file)) note("cannot delete the TLS carrier file");
+        CloseHandle(carrier.file);
+    }
+    if (carrier.directory != INVALID_HANDLE_VALUE) {
+        if (!dispose(carrier.directory)) note("cannot remove the TLS carrier directory");
+        CloseHandle(carrier.directory);
+    }
     carrier = TlsCarrier{};
+    return failed;
+}
+
+void unload(TlsCarrier& carrier) {
+    DWORD ignored = 0;
+    unload(carrier, ignored);
 }
 
 constexpr DWORD CARRIER_DATA_RVA = 0x1000, CARRIER_FILE_ALIGN = 0x200, CARRIER_PAGE = 0x1000;
@@ -345,87 +396,152 @@ std::vector<std::uint8_t> carrier_image(const std::uint8_t* tls_template, std::s
 
 constexpr wchar_t CARRIER_PREFIX[] = L"pe_map_tls_";
 
-// Removes carrier files whose process has ended. Measured on Windows 10 build 19045: a process
-// that ends with an image still mapped leaves its carrier file behind, because the handles are
-// closed while the carrier is still mapped and a mapped image cannot be deleted. The process ID
-// is in the file name; a file whose process is alive, or cannot be queried, is left alone.
-void sweep_carriers(const wchar_t* directory) {
-    wchar_t pattern[MAX_PATH + 64], path[MAX_PATH + 64 + MAX_PATH];
-    std::swprintf(pattern, sizeof(pattern) / sizeof(pattern[0]), L"%ls%ls*.dll", directory, CARRIER_PREFIX);
-    WIN32_FIND_DATAW found{};
-    HANDLE search = FindFirstFileW(pattern, &found);
-    if (search == INVALID_HANDLE_VALUE) return;
-    do {
-        wchar_t* end = nullptr;
-        const wchar_t* digits = found.cFileName + sizeof(CARRIER_PREFIX) / sizeof(CARRIER_PREFIX[0]) - 1;
-        const unsigned long owner = std::wcstoul(digits, &end, 16);
-        if (end != digits + 8 || *end != L'_' || owner == GetCurrentProcessId()) continue;
-        HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, owner);
-        const bool ended = process ? WaitForSingleObject(process, 0) == WAIT_OBJECT_0
-                                   : GetLastError() == ERROR_INVALID_PARAMETER;  // no such process
-        if (process) CloseHandle(process);
-        if (!ended) continue;
-        std::swprintf(path, sizeof(path) / sizeof(path[0]), L"%ls%ls", directory, found.cFileName);
-        DeleteFileW(path);
-    } while (FindNextFileW(search, &found));
-    FindClose(search);
+// The identity of the file behind handle: volume serial number and 128-bit file ID.
+bool file_identity(HANDLE handle, FILE_ID_INFO& out) {
+    return GetFileInformationByHandleEx(handle, FileIdInfo, &out, sizeof(out)) != FALSE;
 }
 
-// Writes the carrier to the temporary directory and loads it. The file is held by a
-// delete-on-close handle, so it is removed when the carrier is unloaded. A file left by a process
-// that ended without releasing its images is removed by the next process that loads a carrier.
-// index receives the TLS index Windows assigned to it. Returns null on success or the step that
-// failed; error then holds GetLastError.
+bool same_file(const FILE_ID_INFO& a, const FILE_ID_INFO& b) {
+    return a.VolumeSerialNumber == b.VolumeSerialNumber && std::memcmp(&a.FileId, &b.FileId, sizeof(a.FileId)) == 0;
+}
+
+// A protected DACL that grants full access to the process's user only, inherited by the carrier.
+bool private_descriptor(PSECURITY_DESCRIPTOR& descriptor) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    union {
+        TOKEN_USER user;
+        std::uint8_t bytes[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+    } info;
+    DWORD size = 0;
+    const bool queried = GetTokenInformation(token, TokenUser, &info, sizeof(info), &size) != FALSE;
+    CloseHandle(token);
+    wchar_t* sid = nullptr;
+    if (!queried || !ConvertSidToStringSidW(info.user.User.Sid, &sid)) return false;
+    wchar_t sddl[32 + SECURITY_MAX_SID_SIZE * 4];
+    std::swprintf(sddl, sizeof(sddl) / sizeof(sddl[0]), L"D:P(A;OICI;FA;;;%ls)", sid);
+    LocalFree(sid);
+    return ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor, nullptr)
+        != FALSE;
+}
+
+// Writes the carrier into a directory of its own and loads it. The path must keep naming the file
+// this call wrote until the loader has opened it:
+// - The directory is new, under the temporary directory, with a 128-bit random name and a protected
+//   DACL for the process's user only. It is held open without delete sharing, so it cannot be
+//   renamed or removed. A reparse point in its place fails the map.
+// - The file is created there with CREATE_NEW, written, and identified by its file ID. The write
+//   handle has to be closed before the load, because the loader's open does not share writing.
+// - It is reopened for reading and deletion, shared for reading only, so from then on no one can
+//   write, rename or delete it. The reopened file must have the same ID, and its contents, read
+//   back through this handle, must be the bytes written.
+// - After the load, the file mapped as the carrier must be the file behind this handle.
+// Measured on Windows 10 build 19045: while those two handles are held, opening the file for
+// writing, renaming it, deleting it and renaming its directory fail with ERROR_SHARING_VIOLATION,
+// renaming the directory above fails with ERROR_ACCESS_DENIED, and LoadLibraryExW still loads it.
+// index receives the TLS index Windows assigned to the carrier. Returns null on success or the step
+// that failed; error then holds GetLastError. On failure this call deletes what it created and
+// still holds a handle to; nothing else is touched. If the carrier cannot be reopened, or the
+// directory cannot be queried, the file or directory is left where it is, since without a
+// verified handle this call cannot tell it is still its own.
 const char* load_carrier(const std::vector<std::uint8_t>& file, DWORD index_rva, TlsCarrier& carrier, DWORD& index,
                          DWORD& error) {
-    static volatile LONG serial;
-    wchar_t directory[MAX_PATH + 1], path[MAX_PATH + 64];
-    const DWORD length = GetTempPathW(MAX_PATH + 1, directory);
-    if (!length || length > MAX_PATH) {
-        error = GetLastError();
-        return "cannot find the temporary directory for the TLS carrier";
+    auto failure = [&](const char* step, DWORD code) {
+        unload(carrier);
+        error = code;
+        return step;
+    };
+    wchar_t temporary[MAX_PATH + 1], directory[MAX_PATH + 1], path[MAX_PATH + 1];
+    DWORD length = GetTempPathW(MAX_PATH + 1, temporary);
+    if (length && length <= MAX_PATH) length = GetLongPathNameW(temporary, directory, MAX_PATH + 1);
+    if (!length || length > MAX_PATH)
+        return failure("cannot find the temporary directory for the TLS carrier", GetLastError());
+    std::uint8_t random[16];
+    const NTSTATUS generated = BCryptGenRandom(nullptr, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (generated != 0)  // error holds the NTSTATUS here
+        return failure("cannot generate a name for the TLS carrier", static_cast<DWORD>(generated));
+    wchar_t name[sizeof(random) * 2 + 1];
+    for (std::size_t i = 0; i < sizeof(random); ++i) std::swprintf(name + 2 * i, 3, L"%02x", random[i]);
+    // The directory name, a separator, the file name and ".dll" must fit.
+    constexpr std::size_t prefix = sizeof(CARRIER_PREFIX) / sizeof(CARRIER_PREFIX[0]) - 1;
+    if (length + 2 * (prefix + sizeof(random) * 2) + 5 > MAX_PATH)
+        return failure("the temporary directory path is too long for the TLS carrier", ERROR_FILENAME_EXCED_RANGE);
+    std::swprintf(path, MAX_PATH + 1, L"%ls%ls%ls", directory, CARRIER_PREFIX, name);
+    std::wcscpy(directory, path);
+
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!private_descriptor(descriptor))
+        return failure("cannot build the access list of the TLS carrier directory", GetLastError());
+    SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor, FALSE};
+    const BOOL created = CreateDirectoryW(directory, &attributes);
+    const DWORD create_error = GetLastError();
+    LocalFree(descriptor);
+    if (!created) return failure("cannot create the TLS carrier directory", create_error);
+    carrier.directory = CreateFileW(directory, DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                    nullptr);
+    if (carrier.directory == INVALID_HANDLE_VALUE)
+        return failure("cannot open the TLS carrier directory", GetLastError());
+    FILE_BASIC_INFO basic{};
+    if (!GetFileInformationByHandleEx(carrier.directory, FileBasicInfo, &basic, sizeof(basic))) {
+        const DWORD code = GetLastError();
+        CloseHandle(carrier.directory);  // unverified, so not removed
+        carrier.directory = INVALID_HANDLE_VALUE;
+        return failure("cannot query the TLS carrier directory", code);
     }
-    sweep_carriers(directory);
-    LARGE_INTEGER tick{};
-    QueryPerformanceCounter(&tick);
-    std::swprintf(path, sizeof(path) / sizeof(path[0]), L"%ls%ls%08lx_%08lx_%016llx.dll", directory, CARRIER_PREFIX,
-                  GetCurrentProcessId(), static_cast<unsigned long>(InterlockedIncrement(&serial)),
-                  static_cast<unsigned long long>(tick.QuadPart));
-    HANDLE out = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
-    if (out == INVALID_HANDLE_VALUE) {
-        error = GetLastError();
-        return "cannot create the TLS carrier file";
+    if (!(basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        CloseHandle(carrier.directory);  // not the directory this call created, so not removed
+        carrier.directory = INVALID_HANDLE_VALUE;
+        return failure("the TLS carrier directory was replaced", ERROR_SUCCESS);
     }
+
+    std::swprintf(path, MAX_PATH + 1, L"%ls\\%ls%ls.dll", directory, CARRIER_PREFIX, name);
+    HANDLE out = CreateFileW(path, GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
+                             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (out == INVALID_HANDLE_VALUE) return failure("cannot create the TLS carrier file", GetLastError());
     DWORD written = 0;
+    FILE_ID_INFO wrote{};
     const bool ok = WriteFile(out, file.data(), static_cast<DWORD>(file.size()), &written, nullptr)
-        && written == file.size();
-    error = GetLastError();
-    CloseHandle(out);
+        && written == file.size() && file_identity(out, wrote);
+    const DWORD write_error = GetLastError();
     if (!ok) {
-        DeleteFileW(path);
-        return "cannot write the TLS carrier file";
+        dispose(out);
+        CloseHandle(out);
+        return failure("cannot write the TLS carrier file", write_error);
     }
-    // Opened before the load: a delete-on-close open is refused once the file is mapped as an image.
-    // Not shared for deletion, so nothing else can remove the file while this handle is open.
-    carrier.file = CreateFileW(path, DELETE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE,
-                               nullptr);
-    if (carrier.file == INVALID_HANDLE_VALUE) {
-        error = GetLastError();
-        DeleteFileW(path);
-        return "cannot reopen the TLS carrier file";
+    CloseHandle(out);
+
+    // Opened before the load: the loader's own open shares reading and deletion, so this handle can
+    // be opened beside it, and it keeps any writer, rename or delete out until the carrier is unloaded.
+    HANDLE held = CreateFileW(path, GENERIC_READ | DELETE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (held == INVALID_HANDLE_VALUE) return failure("cannot reopen the TLS carrier file", GetLastError());
+    FILE_ID_INFO reopened{};
+    if (!file_identity(held, reopened) || !same_file(wrote, reopened)) {
+        const DWORD code = GetLastError();
+        CloseHandle(held);  // not the file this call wrote, so not deleted
+        return failure("the TLS carrier file was replaced before it was loaded", code);
     }
+    carrier.file = held;
+    std::vector<std::uint8_t> check(file.size() + 1);
+    DWORD read = 0;
+    if (!ReadFile(carrier.file, check.data(), static_cast<DWORD>(check.size()), &read, nullptr))
+        return failure("cannot read back the TLS carrier file", GetLastError());
+    if (read != file.size() || std::memcmp(check.data(), file.data(), file.size()) != 0)
+        return failure("the TLS carrier file changed before it was loaded", ERROR_SUCCESS);
+
     carrier.module = LoadLibraryExW(path, nullptr, 0);
-    if (!carrier.module) {
-        error = GetLastError();
-        unload(carrier);
-        return "Windows cannot load the TLS carrier";
-    }
+    if (!carrier.module) return failure("Windows cannot load the TLS carrier", GetLastError());
+    constexpr DWORD NAME = MAX_PATH + 64;
+    wchar_t mapped[NAME], held_name[NAME];
+    const DWORD mapped_length = GetMappedFileNameW(GetCurrentProcess(), carrier.module, mapped, NAME);
+    const DWORD held_length = GetFinalPathNameByHandleW(carrier.file, held_name, NAME, FILE_NAME_OPENED | VOLUME_NAME_NT);
+    if (!mapped_length || mapped_length >= NAME || !held_length || held_length >= NAME)
+        return failure("cannot name the file mapped as the TLS carrier", GetLastError());
+    if (CompareStringOrdinal(mapped, -1, held_name, -1, TRUE) != CSTR_EQUAL)
+        return failure("Windows mapped a different file as the TLS carrier", ERROR_SUCCESS);
     std::memcpy(&index, reinterpret_cast<const std::uint8_t*>(carrier.module) + index_rva, sizeof(index));
-    if (index == CARRIER_NO_INDEX) {
-        error = ERROR_SUCCESS;
-        unload(carrier);
-        return "Windows assigned no TLS index to the carrier";
-    }
+    if (index == CARRIER_NO_INDEX) return failure("Windows assigned no TLS index to the carrier", ERROR_SUCCESS);
     return nullptr;
 }
 
@@ -616,8 +732,12 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     if (!base) return fail(MAP_MEMORY, "cannot reserve image");
     const Image image{base, opt.SizeOfImage};
     TlsCarrier carrier;
+    // A carrier that cannot be fully cleaned up is reported after the failure that caused the release.
     auto release = [&](void* result) {
-        unload(carrier);
+        DWORD error = 0;
+        const char* cleanup = unload(carrier, error);
+        const std::size_t used = cleanup && detail && capacity ? std::strlen(detail) : capacity;
+        if (used + 1 < capacity) std::snprintf(detail + used, capacity - used, "; %s (error %lu)", cleanup, error);
         VirtualFree(base, 0, MEM_RELEASE);
         return result;
     };

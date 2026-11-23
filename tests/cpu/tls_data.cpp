@@ -5,6 +5,7 @@
 // directory, _tls_index and the dynamic-initializer callback are the linker's and the CRT's own.
 //
 // The harness loads it with LoadLibraryW and with pe_map and compares what each thread observes.
+// Built with ENTRY_FAILS, the entry point refuses the process attach (see DllMain).
 #include <windows.h>
 
 #include <cstdint>
@@ -70,4 +71,18 @@ extern "C" __declspec(dllexport) DWORD WINAPI tls_data_worker(LPVOID parameter) 
     return 0;
 }
 
+#ifdef ENTRY_FAILS
+// The refusing variant fails its process attach after recording, in the process environment, what
+// its loading thread sees in t_init and t_wide: the template values show that the TLS block was in
+// place before the entry point ran.
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+    if (reason != DLL_PROCESS_ATTACH) return TRUE;
+    // "<t_init> <1 if t_wide holds its template value>", for a t_init from 0 to 9.
+    const wchar_t seen[] = {static_cast<wchar_t>(t_init >= 0 && t_init <= 9 ? L'0' + t_init : L'?'), L' ',
+                            t_wide == 0x1122334455667788ull ? L'1' : L'0', 0};
+    SetEnvironmentVariableW(L"TLS_DATA_ATTACH", seen);
+    return FALSE;
+}
+#else
 BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }
+#endif
