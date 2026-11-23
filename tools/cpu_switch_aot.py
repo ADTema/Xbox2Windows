@@ -837,8 +837,8 @@ class Lifter:
         if ins.memory_base == R.RIP and self.image is not None and not ins.has_segment_prefix:
             self.image_used = True
             return f"(image + {image_target(self.image, ins):#x}ull)"
-        if ins.memory_base == R.RSP and ins.ip in self.frame:
-            # A constant index into the frame array: RSP itself never becomes a C++ value.
+        if ins.ip in self.frame:
+            # A constant index into the frame array: stack bases never become C++ values.
             return self.slot(ins)
         if (ins.memory_base in (R.RIP, R.EIP, R.RSP, R.ESP) or ins.memory_index in (R.RSP, R.ESP)
                 or ins.has_segment_prefix or ins.memory_base == R.NONE):
@@ -870,7 +870,7 @@ class Lifter:
         if kind == OpKind.REGISTER:
             return self.reg(ins.op_register(number))
         if kind == OpKind.MEMORY:
-            if ins.memory_base == R.RSP and ins.ip in self.frame:
+            if ins.ip in self.frame:
                 # The function's own frame array: a read of it cannot fault.
                 return f"load<{unsigned(width)}>({self.address(ins)})"
             # The instruction's memory operand is read once, at its own width, into a local declared before
@@ -1017,7 +1017,7 @@ class Lifter:
                 kind = ins.op_kind(number)
                 if kind == OpKind.REGISTER:
                     read(ins.op_register(number))
-                elif kind == OpKind.MEMORY:
+                elif kind == OpKind.MEMORY and ins.ip not in self.frame:
                     for register in (ins.memory_base, ins.memory_index):
                         if register not in (R.NONE, R.RSP) and (register != R.RIP or self.image is None):
                             read(register)
@@ -1227,23 +1227,28 @@ class Frame:
 
     def __init__(self, function):
         self.offsets, self.accesses, self.adjustments, self.released = {function.entry: 0}, {}, set(), {}
+        anchors, self.set_anchor = {function.entry: None}, set()
         work = [function.entry]
         while work:
             ip = work.pop()
+            anchor = anchors[ip]
             if ip in function.calls or ip in function.tails:
                 # The callee pops its return address; call sites are checked by check_call_sites.
                 after = self.offsets[ip]
             else:
-                after = self.step(function.instructions[ip], self.offsets[ip])
+                after, anchor = self.step(function.instructions[ip], self.offsets[ip], anchor)
                 if after > self.offsets[ip]:
                     self.released[ip] = (self.offsets[ip], after)
             for successor in function.successors[ip]:
                 if successor not in self.offsets:
                     self.offsets[successor] = after
+                    anchors[successor] = anchor
                     work.append(successor)
                 elif self.offsets[successor] != after:
                     raise ValueError(f"stack depth differs at join RVA {successor:#x}: entry RSP"
                                      f"{self.offsets[successor]:+#x} and entry RSP{after:+#x}")
+                elif anchors[successor] != anchor:
+                    raise ValueError(f"frame pointer differs at join RVA {successor:#x}")
         for ip in sorted(self.offsets):
             if function.instructions[ip].mnemonic == M.RET and self.offsets[ip]:
                 raise ValueError(f"stack not balanced at RET RVA {ip:#x}: RSP is entry RSP{self.offsets[ip]:+#x}")
@@ -1262,17 +1267,30 @@ class Frame:
             raise ValueError(f"unsupported stack argument at RVA {ins.ip:#x}: entry RSP{offset:+#x}")
         self.accesses[ins.ip] = (offset, width, reads, writes)
 
-    def step(self, ins, rsp):
-        """RSP after ins; rejects every use of RSP other than a constant change or a frame access."""
+    def step(self, ins, rsp, anchor):
+        """RSP and the optional RBP anchor as offsets from entry RSP, after ins."""
         ip, mnemonic = ins.ip, ins.mnemonic
         if mnemonic == M.RET:
-            return rsp
+            return rsp, anchor
+        if ins.op0_kind == OpKind.REGISTER and ins.op0_register == R.RBP:
+            if mnemonic == M.MOV and ins.op1_kind == OpKind.REGISTER and ins.op1_register == R.RSP:
+                self.set_anchor.add(ip)
+                return rsp, rsp
+            if (mnemonic == M.LEA and ins.memory_base == R.RSP and ins.memory_index == R.NONE
+                    and not ins.has_segment_prefix):
+                self.set_anchor.add(ip)
+                displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
+                return rsp, rsp + displacement
         if mnemonic in (M.PUSH, M.POP):
             if ins.op0_kind != OpKind.REGISTER or ins.op0_register not in NONVOLATILE:
                 raise ValueError(f"unsupported push or pop at RVA {ip:#x}: {ins}")
+            if ins.op0_register == R.RBP and anchor is not None:
+                if mnemonic == M.PUSH:
+                    raise ValueError(f"frame pointer escapes at RVA {ip:#x}: {ins}")
+                anchor = None
             pushed = rsp - 8 if mnemonic == M.PUSH else rsp
             self.access(ins, pushed, pushed, 8, mnemonic == M.POP, mnemonic == M.PUSH)
-            return pushed if mnemonic == M.PUSH else rsp + 8
+            return (pushed if mnemonic == M.PUSH else rsp + 8), anchor
         if (mnemonic in (M.SUB, M.ADD) and ins.op0_kind == OpKind.REGISTER and ins.op0_register == R.RSP
                 and ins.op1_kind in (OpKind.IMMEDIATE8TO64, OpKind.IMMEDIATE32TO64)):
             change = ins.immediate(1) & ((1 << 64) - 1)
@@ -1281,7 +1299,7 @@ class Frame:
             if change % 8 or after > 0:
                 raise ValueError(f"unsupported stack adjustment at RVA {ip:#x}: {ins}")
             self.adjustments.add(ip)
-            return after
+            return after, anchor
         info = INFO.info(ins)
         if any(RegisterExt.full_register(used.register) == R.RSP and used.access in WRITE_ACCESS
                for used in info.used_registers()):
@@ -1290,22 +1308,35 @@ class Frame:
                 for n in range(ins.op_count))
                 or mnemonic == M.LEA and RegisterExt.full_register(ins.memory_base) == R.RSP):
             raise ValueError(f"frame address escapes at RVA {ip:#x}: {ins}")
-        if mnemonic != M.NOP and ins.memory_base == R.RSP and OpKind.MEMORY in map(ins.op_kind, range(ins.op_count)):
-            used = [memory for memory in info.used_memory() if memory.base == R.RSP]
+        has_memory = OpKind.MEMORY in map(ins.op_kind, range(ins.op_count))
+        anchored_memory = anchor is not None and ins.memory_base == R.RBP and has_memory
+        stack_base = anchor if anchored_memory else rsp
+        if mnemonic != M.NOP and has_memory and (ins.memory_base == R.RSP or anchored_memory):
+            used = [memory for memory in info.used_memory() if memory.base == ins.memory_base]
             if (ins.memory_index != R.NONE or ins.has_segment_prefix or len(used) != 1
                     or used[0].access not in (OpAccess.READ, OpAccess.WRITE, OpAccess.READ_WRITE)):
                 raise ValueError(f"unsupported stack operand at RVA {ip:#x}: {ins}")
             displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
-            self.access(ins, rsp, rsp + displacement, _memory_width(ins), used[0].access != OpAccess.WRITE,
+            self.access(ins, rsp, stack_base + displacement, _memory_width(ins), used[0].access != OpAccess.WRITE,
                         used[0].access != OpAccess.READ)
-        return rsp
+        if anchor is not None and mnemonic != M.NOP:
+            restores_rbp = (mnemonic == M.MOV and ins.op0_kind == OpKind.REGISTER
+                            and ins.op0_register == R.RBP and ip in self.accesses)
+            if (any(ins.op_kind(n) == OpKind.REGISTER and RegisterExt.full_register(ins.op_register(n)) == R.RBP
+                    and not (n == 0 and restores_rbp) for n in range(ins.op_count))
+                    or has_memory and RegisterExt.full_register(ins.memory_index) == R.RBP
+                    or has_memory and RegisterExt.full_register(ins.memory_base) == R.RBP and not anchored_memory):
+                raise ValueError(f"frame pointer escapes at RVA {ip:#x}: {ins}")
+            if restores_rbp:
+                anchor = None
+        return rsp, anchor
 
 
 def slot_register(ins):
     """The nonvolatile register that PUSH, POP or a 64-bit MOV copies whole to or from the frame, else None."""
     if ins.mnemonic in (M.PUSH, M.POP):
         return ins.op0_register
-    if ins.mnemonic == M.MOV and ins.memory_base == R.RSP:
+    if ins.mnemonic == M.MOV and ins.memory_base in (R.RSP, R.RBP):
         for number in (0, 1):
             if ins.op_kind(number) == OpKind.REGISTER and ins.op_register(number) in NONVOLATILE:
                 return ins.op_register(number)
@@ -1620,6 +1651,9 @@ def lift_function(program, entry, symbol, arguments, internal):
         elif ip in skipped:
             # The table load reads the 64-bit index; it and the add leave guest addresses behind.
             effects[ip] = ({loads[ip]: 8} if ip in loads else {}, {}, {full(ins.op0_register)})
+        elif ip in frame.set_anchor:
+            # Only the frame proof observes the anchor. No host pointer stands in for RBP.
+            effects[ip] = ({}, {R.RBP: 8}, set())
         elif (ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register)
               and (not image_data or (ins.op0_register, ins.ip_rel_memory_address) in bases)):
             # A guest address is only usable as a jump-table base, which the switch replaces.
