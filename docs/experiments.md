@@ -2307,6 +2307,18 @@ limit and with high-bit values. Replacing the update with a read or no-op
 must mismatch at word 1.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
+Paired strided LDS accesses use `local_x * width + offset * 64 * width`,
+where width is four or eight bytes. The profile accepts initialized read
+planes starting at byte 512 or higher and entirely within the LDS binding.
+Each kernel uses one strided element width. The dword exchange captures
+both old values and both inputs before replacing the destination VGPRs.
+The fixtures compare two or four words per lane for one and two groups.
+Swapping the paired offsets must mismatch at word 0.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_strided_(warp|hardware)$' -V
+```
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must

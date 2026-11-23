@@ -162,6 +162,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     ds_steps = []
     lds_enabled = ds_group and 128 <= lds_bytes <= 65536
     lds_word = None
+    lds_strided_words = {}
+    lds_strided_width = None
     ds_wait = False
     written_spans = []
     layout = None
@@ -377,6 +379,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if lds_enabled and dst <= 255 and shift == 2 and tag == ("local", 0):
                 vector[dst] = ("lds_address",)
                 continue
+            if lds_enabled and dst <= 255 and shift == 3 and tag == ("local", 0):
+                vector[dst] = ("lds_strided_qword_address",)
+                continue
             # The element and row checks at the store bound the shift.
             if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
                 raise ValueError("Unverified dispatch byte offset")
@@ -397,6 +402,55 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                                    f"    GroupMemoryBarrierWithGroupSync();\n"
                                    f"    uint {result} = {slot}[(local.x + {bias}u) & 31u];"))
             vector[dst] = ("alu", result)
+            ds_wait = True
+        elif m := re.fullmatch(
+                r"ds_(read2st64_b(?:32|64)|write2st64_b(?:32|64)|wrxchg2st64_rtn_b32) "
+                r"(v\[\d+:\d+\]|v\d+), (v\[\d+:\d+\]|v\d+)"
+                r"(?:, (v\[\d+:\d+\]|v\d+))?(?:, (v\[\d+:\d+\]|v\d+))?"
+                r" offset0:(\d+) offset1:(\d+)", line):
+            op = m[1]
+            width = int(op[-2:]) // 8
+            reads = not op.startswith("write")
+            writes = not op.startswith("read")
+            exchange = reads and writes
+            addr_text = m[3] if reads else m[2]
+            addr = re.fullmatch(r"v(\d+)", addr_text)
+            address_tag = ("lds_address",) if width == 4 else ("lds_strided_qword_address",)
+            offsets = tuple(map(int, m.groups()[-2:]))
+            # Keep strided planes above the contiguous private records, and
+            # use a single element width so no two lane-owned planes alias.
+            if (guard_span is not None or not addr or vector.get(int(addr[1])) != address_tag
+                    or lds_strided_width not in (None, width) or max(offsets) > 255
+                    or min(offsets) * 64 * width < 512 or (max(offsets) * 64 + 32) * width > lds_bytes
+                    or writes != (m[4] is not None) or writes and offsets[0] == offsets[1]):
+                raise ValueError("Unverified private strided LDS access")
+            lds_strided_width = width
+            count = width // 4
+            if writes:
+                sources = (m[4], m[5]) if exchange else (m[3], m[4])
+                if not all(sources) or not exchange and m[5] is not None:
+                    raise ValueError("Unverified private strided LDS operands")
+                pairs = []
+                for source in sources:
+                    regs = re.fullmatch(r"v(\d+)" if count == 1 else r"v\[(\d+):(\d+)\]", source)
+                    if not regs or count == 2 and int(regs[2]) != int(regs[1]) + 1:
+                        raise ValueError("Unverified private strided LDS source range")
+                    first = int(regs[1])
+                    words = tuple(vector.get(reg) for reg in range(first, first + count))
+                    if first + count > 256 or not all(map(is_word, words)):
+                        raise ValueError("Unverified private strided LDS source")
+                    pairs.append(words)
+            if reads:
+                regs = re.fullmatch(r"v\[(\d+):(\d+)\]", m[2])
+                if not regs or int(regs[2]) > 255 or int(regs[2]) - int(regs[1]) + 1 != 2 * count:
+                    raise ValueError("Unverified private strided LDS destination range")
+                if not all(offset in lds_strided_words for offset in offsets):
+                    raise ValueError("Uninitialized private strided LDS plane")
+                first = int(regs[1])
+                words = lds_strided_words[offsets[0]] + lds_strided_words[offsets[1]]
+                vector.update(zip(range(first, first + 2 * count), words))
+            if writes:
+                lds_strided_words.update(zip(offsets, pairs))
             ds_wait = True
         elif m := re.fullmatch(r"ds_write_b(8|16|32) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
             width, addr, src = map(int, m.groups()[:3])
