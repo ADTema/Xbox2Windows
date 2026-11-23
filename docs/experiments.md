@@ -1973,6 +1973,22 @@ python3 -B tests/mesh_lit_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.
 ctest --preset dev --no-tests=error -R "^mesh_lit_draw_" -V
 ```
 
+The SM 6.0 lit mesh fallback uses the same mesh and pixel programs and CPU
+image reference. The compute shader writes the indexed positions and PARAM0
+normals to the export buffer. The vertex shader reads the exports and passes
+the normals to the rasterizer for interpolation. The pixel shader reads the
+light from b0 and computes the same clamped lighting.
+
+On the GTX 1060, Windows 10 in-box WARP and app-local WARP, all five positive
+cases matched 128 export bytes and 1,024 RGBA pixels. The stale light, normal
+and clamp controls gave 276, 276 and 132 pixel mismatches, respectively, with
+matching exports. The D3D12 debug layer reported zero warnings and errors.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^mesh_lit_fallback_(hardware|warp)$' -V
+```
+
 The shadow fixture (`tests/mesh_shadow_check.py`, `offscreen_check
 --mesh-shadow`) adds a depth pass and a comparison sample to the lit fixture.
 All draws use the PARAM0 mesh program of the textured fixture on a 64×64 target.
