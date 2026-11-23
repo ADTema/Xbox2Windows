@@ -1664,17 +1664,45 @@ LDS_WIDE_SETUP = DS_PREFIX + [
     "v_mov_b32_e32 v7, 0x89abcdef",
     "v_mov_b32_e32 v9, 0x76543210",
 ]
+
+
+def _signed64(value):
+    return value - (1 << 64) if value >> 63 else value
+
+
+def _min_i64(a, b):
+    return a if _signed64(a) < _signed64(b) else b
+
+
+def _max_i64(a, b):
+    return a if _signed64(a) > _signed64(b) else b
+
+
 LDS_QWORD_UPDATES = {
     "ds_add_u64": operator.add, "ds_sub_u64": operator.sub, "ds_rsub_u64": lambda a, b: b - a,
-    "ds_and_b64": operator.and_, "ds_or_b64": operator.or_,
+    "ds_and_b64": operator.and_, "ds_or_b64": operator.or_, "ds_xor_b64": operator.xor,
+    "ds_min_u64": min, "ds_max_u64": max, "ds_min_i64": _min_i64, "ds_max_i64": _max_i64,
 }
 
 
 def lds_qword_program(op):
+    if op in ("ds_min_i64", "ds_max_i64", "ds_min_u64", "ds_max_u64"):
+        # Even lanes cross the signed high-word boundary; odd lanes repeat the
+        # high word and exercise the unsigned low-word tie-break.
+        prior = [
+            "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
+            "v_and_b32_e32 v17, 1, v8",
+            "v_mad_u32_u24 v17, 1, v17, 0x7fffffff",
+            "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x80000000",
+        ]
+    else:
+        prior = [
+            "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
+            "v_mov_b32_e32 v17, 0xfffffff1",
+            "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x0000000e",
+        ]
     return LDS_WIDE_SETUP + [
-        "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
-        "v_mov_b32_e32 v17, 0xfffffff1",
-        "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x0000000e",
+        *prior,
         "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
         f"{op} v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
         "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
@@ -1685,10 +1713,26 @@ def lds_qword_program(op):
 def lds_qword_reference(op, groups):
     words = []
     for lane in range(groups * 32):
-        previous = (0xfffffff1 << 32) | ((0xfffffff0 + lane) & 0xffffffff)
-        current = LDS_QWORD_UPDATES[op](previous, 0x0000000e00000018)
+        if op in ("ds_min_i64", "ds_max_i64", "ds_min_u64", "ds_max_u64"):
+            previous = ((0x7fffffff + (lane & 1)) << 32) | ((0xfffffff0 + lane) & 0xffffffff)
+            source = 0x8000000000000018
+        else:
+            previous = (0xfffffff1 << 32) | ((0xfffffff0 + lane) & 0xffffffff)
+            source = 0x0000000e00000018
+        current = LDS_QWORD_UPDATES[op](previous, source)
         words.extend((current & 0xffffffff, (current >> 32) & 0xffffffff))
     return words
+
+
+def without_low_tiebreak(source):
+    """Remove the low-word clause from a qword min/max condition."""
+    start = source.index(" || ((")
+    depth = 0
+    for end in range(start + len(" || "), len(source)):
+        depth += {"(": 1, ")": -1}.get(source[end], 0)
+        if depth == 0:
+            return source[:start] + source[end + 1:]
+    raise AssertionError("Missing qword comparison tie-break")
 
 
 LDS_WIDE_QUAD_SETUP = [
@@ -1905,6 +1949,15 @@ def lds_controls():
         (op + " gds", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(quad, (op, bad)), 32, **LDS_QWORD_BINDING)
+
+    for name in ("ds_xor_b64", "ds_min_u64", "ds_max_u64", "ds_min_i64", "ds_max_i64"):
+        lines = lds_qword_program(name)
+        update = f"{name} v5, v[18:19] offset:8"
+        for bad, message in (
+            (f"{name} v5, v[18:19]", "Unverified private wide LDS update"),
+            (update + " gds", "Unsupported compute instruction"),
+        ):
+            rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_QWORD_BINDING)
 
     pair = lds_wide_program("lds_pair_b64")
     for before, after, message in (
@@ -2165,14 +2218,29 @@ def ds_mutants(name, lines, binding, source):
         if name == "ds_add_u64":
             wrong = source.replace(" + uint(", " + 0u * uint(")
             word = 1
+            yield wrong, word
         elif name in ("ds_sub_u64", "ds_rsub_u64"):
             wrong = source.replace(" - uint(", " - 0u * uint(")
             word = 33 if name == "ds_sub_u64" else 1
+            yield wrong, word
+        elif name == "ds_xor_b64":
+            wrong = aot.lower(variant(lines, (name, "ds_and_b64")), 32, **binding)
+            yield wrong, 0
+        elif name in ("ds_min_u64", "ds_max_u64", "ds_min_i64", "ds_max_i64"):
+            alternate = {"ds_min_u64": "ds_max_u64", "ds_max_u64": "ds_min_u64",
+                         "ds_min_i64": "ds_max_i64", "ds_max_i64": "ds_min_i64"}[name]
+            wrong = aot.lower(variant(lines, (name, alternate)), 32, **binding)
+            yield wrong, 0
+            # With only the high-word test left, min keeps the source on a tie
+            # and first differs at lane 17. Max instead keeps the source at
+            # lane 1, whose low word should have won.
+            wrong = without_low_tiebreak(source)
+            assert wrong != source
+            yield wrong, 34 if name.startswith("ds_min") else 2
         else:
             alternate = "ds_or_b64" if name == "ds_and_b64" else "ds_and_b64"
             wrong = aot.lower(variant(lines, (name, alternate)), 32, **binding)
-            word = 0
-        yield wrong, word
+            yield wrong, 0
     elif name in LDS_WIDE_QUADS:
         if name == "lds_b128":
             change = ("v_mov_b32_e32 v19, 0xf0e1d2c3", "v_mov_b32_e32 v19, 0")

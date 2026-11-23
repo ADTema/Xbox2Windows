@@ -2418,12 +2418,20 @@ the readback.
 ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_wide_replacement_(warp|hardware)$' -V
 ```
 
-Five private qword updates operate on an initialized pair of record slots
+Ten private qword updates operate on an initialized pair of record slots
 at byte offset 0 or 8. `ds_add_u64`, `ds_sub_u64` and `ds_rsub_u64` update
-modulo 2^64 using a low-word carry or borrow. `ds_and_b64` and `ds_or_b64`
-update both words independently. Fixtures read back the pair at offset 8
-and cover both outcomes of the carry and borrow tests. Discarding carry or
-borrow, or interchanging the bitwise operations, must change the readback.
+modulo 2^64 using a low-word carry or borrow. `ds_and_b64`, `ds_or_b64` and
+`ds_xor_b64` update both words independently. `ds_min_i64`, `ds_max_i64`,
+`ds_min_u64` and `ds_max_u64` compare the high words first, signed for the
+i64 forms and unsigned for the u64 forms, then compare the low words when
+the high words are equal. Fixtures read back the pair at offset 8 and cover
+both outcomes of the carry, borrow and comparison tests. The min/max fixtures
+alternate the prior high word between `0x7fffffff` and `0x80000000`: even lanes
+cross the signed boundary, while odd lanes repeat the high word so the
+low-word tie-break applies. Swapping signed and unsigned comparisons must
+mismatch word 0; dropping the low-word comparison must mismatch word 34 for
+min and word 2 for max. Discarding carry or borrow, interchanging the bitwise
+operations, or replacing min with max must also change the readback.
 Run these variants with `ctest --preset dev --no-tests=error -R
 '^compute_store_aot_lds_qword_(warp|hardware)$' -V`.
 
