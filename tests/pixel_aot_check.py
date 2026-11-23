@@ -2244,6 +2244,21 @@ def quadmask_bitreplicate_program(op):
     ])
 
 
+SCALAR_BITSET64_OPS = ("s_bitset0_b64", "s_bitset1_b64")
+
+
+def scalar_bitset64(op, index="s46"):
+    return uncompressed_export([
+        "s_cmp_lg_u32 s47, 0",
+        f"{op} s[44:45], {index}",
+        "s_cselect_b32 s48, 1, 0",
+        "v_mov_b32_e32 v12, s44",
+        "v_mov_b32_e32 v13, s45",
+        "v_mov_b32_e32 v14, s48",
+        "v_mov_b32_e32 v15, 0",
+    ])
+
+
 def quadmask32(word):
     return sum((((word >> (4 * group)) & 0xf) != 0) << group for group in range(8))
 
@@ -2349,6 +2364,98 @@ def run_quadmask_bitreplicate(directory, compiler, renderer, backend):
             print(f"quadmask-bitreplicate {op}: {path.stem} expected={status}", flush=True)
         run_pixel_batch(renderer, backend, shader, cases)
 
+def bitset64_reference(lo, hi, index, set_bit):
+    """Set or clear one bit in a 64-bit pair without changing the other word."""
+    bit = index & 63
+    mask = 1 << bit
+    value = (hi << 32) | lo
+    value = value | mask if set_bit else value & ~mask
+    return value & 0xffffffff, (value >> 32) & 0xffffffff
+
+
+def check_scalar_bitset64_draw(directory, compiler, renderer, backend):
+    source = directory / "scalar-bitset64.hlsl"
+    shader = directory / "scalar-bitset64.cso"
+    initial_lo, initial_hi = 0x81020408, 0x00010001
+
+    for op in SCALAR_BITSET64_OPS:
+        source.write_text(translate_int(scalar_bitset64(op)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for index in (0, 31, 32, 63, 64):
+            for initial_scc in (0, 1):
+                constants = bytearray(256)
+                struct.pack_into("<4I", constants, 12, initial_lo, initial_hi, index, initial_scc)
+                result_lo, result_hi = bitset64_reference(
+                    initial_lo, initial_hi, index, op == "s_bitset1_b64")
+                expected = (result_lo, result_hi, initial_scc, 0)
+                path = directory / f"{op}-{index}-scc{initial_scc}.case"
+                write_case(path, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+                cases.append((path, "pass"))
+        if op == "s_bitset1_b64":
+            # Exact all-ones NaN-shaped input from PR #680. Setting bit 31 must
+            # keep the full-width integer 0xffffffff instead of canonicalising it.
+            for initial_scc in (0, 1):
+                constants = bytearray(256)
+                struct.pack_into("<4I", constants, 12, 0xFFFFFFFF, 0xFFFFFFFF, 31, initial_scc)
+                expected = (0xFFFFFFFF, 0xFFFFFFFF, initial_scc, 0)
+                path = directory / f"{op}-nan-bit31-scc{initial_scc}.case"
+                write_case(path, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+                cases.append((path, "pass"))
+        run_pixel_batch(renderer, backend, shader, cases)
+
+        # At index 31, selecting the high destination word changes bit 63 instead of bit 31.
+        boundary = directory / f"{op}-boundary-word.case"
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, initial_lo, initial_hi, 31, 0)
+        wrong_value = (initial_hi << 32) | initial_lo
+        wrong_mask = 1 << 63
+        wrong_value = wrong_value | wrong_mask if op == "s_bitset1_b64" else wrong_value & ~wrong_mask
+        wrong_expected = (wrong_value & 0xffffffff, wrong_value >> 32, 0, 0)
+        write_case(boundary, constants, tuple(as_float(word) for word in wrong_expected),
+                   integer_rt=True)
+        run_pixel_batch(renderer, backend, shader, [(boundary, "mismatch")])
+
+        # The index may alias either destination word. The lowering must read
+        # the old pair before replacing it.
+        alias_inputs = {
+            "s_bitset1_b64": (("s44", 0x0000001F, 0xA5A5A5A5),
+                              ("s45", 0x12345678, 0x00000021)),
+            "s_bitset0_b64": (("s44", 0x8000001F, 0xA5A5A5A5),
+                              ("s45", 0x12345678, 0x0000082B)),
+        }
+        for alias_index, alias_lo, alias_hi in alias_inputs[op]:
+            alias_source = directory / f"{op}-{alias_index}.hlsl"
+            alias_shader = directory / f"{op}-{alias_index}.cso"
+            alias_source.write_text(translate_int(scalar_bitset64(op, alias_index)), encoding="ascii")
+            compile_shader(compiler, alias_source, alias_shader)
+            alias_cases = []
+            for initial_scc in (0, 1):
+                index = alias_lo if alias_index == "s44" else alias_hi
+                result_lo, result_hi = bitset64_reference(
+                    alias_lo, alias_hi, index, op == "s_bitset1_b64")
+                constants = bytearray(256)
+                struct.pack_into("<4I", constants, 12, alias_lo, alias_hi, 0, initial_scc)
+                expected = (result_lo, result_hi, initial_scc, 0)
+                path = directory / f"{op}-{alias_index}-scc{initial_scc}.case"
+                write_case(path, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+                alias_cases.append((path, "pass"))
+            run_pixel_batch(renderer, backend, alias_shader, alias_cases)
+
+        if op == "s_bitset1_b64":
+            # A read-after-write alias would take the index from 0x25 and set
+            # bit 37 instead of bit 5. The reference encodes that wrong result.
+            read_after_write = directory / "s_bitset1_b64-read-after-write.case"
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, 5, 0x11111111, 0, 0)
+            wrong_expected = (5, 0x11111131, 0, 0)
+            write_case(read_after_write, constants,
+                       tuple(as_float(word) for word in wrong_expected), integer_rt=True)
+            alias_source = directory / "s_bitset1_b64-s44.hlsl"
+            alias_shader = directory / "s_bitset1_b64-s44.cso"
+            alias_source.write_text(translate_int(scalar_bitset64(op, "s44")), encoding="ascii")
+            compile_shader(compiler, alias_source, alias_shader)
+            run_pixel_batch(renderer, backend, alias_shader, [(read_after_write, "mismatch")])
 
 S_CSELECT_B64 = "s_cselect_b64 s[44:45], s[44:45], s[46:47]"
 
@@ -3444,6 +3551,7 @@ def check_scalar_controls():
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
                 "s_bfe_u32 s62, v12, s45", "s_lshl5_add_u32 s62, s44, s45",
                 "s_bitreplicate_b64_b32 s[62:63], v12", "s_bitset0_b64 s[62:63], s44",
+                "s_quadmask_b32 s62, v12", "s_bitset0_b64 s[62:63], v12",
                 "s_brev_b32 s62, v12", "s_and_b64 s[62:63], s[44:46], s[46:47]",
                 "s_add_u32 s62, s[44:45], s45", "s_add_u32 s62, s44", "s_add_u32 s62, s44, s45, s46",
                 "s_add_u32 s62, -s44, s45", "s_add_u32 s62, s28, s45", "s_add_u32 s62, s20, s45",
@@ -6635,6 +6743,16 @@ def check_controls(directory):
         for operands in ("s[44:45], 0, 0", "s[50:51], s[44:45], 0", "s[50:51], 0, s46"):
             must_reject(translate_int, bfe[:wait] + [f"{op} {operands}"] + bfe[wait:])
     assert set(SCALAR_BFE64_OPS) <= ACCEPTED
+    for op in SCALAR_BITSET64_OPS:
+        lowered = translate_int(scalar_bitset64(op))
+        assert "_bit = asuint(params[1].y) & 63u;" in lowered, lowered
+        for index in (0, 31, 32, 63, 64):
+            assert "salu" in translate_int(scalar_bitset64(op, str(index)))
+        for bad in ("v12", "s[46:47]"):
+            must_reject(translate_int, scalar_bitset64(op, bad))
+        untracked = [line.replace("s[44:45]", "s[60:61]")
+                     for line in scalar_bitset64(op)]
+        must_reject(translate_int, untracked)
     select64 = scalar_select64()
     translate_int(select64)
     selected = select64.index(S_CSELECT_B64)
@@ -7059,6 +7177,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((swap_ops(), translate_int))
     fixtures.extend((quadmask_bitreplicate_program(op), translate_int)
                     for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
+    fixtures.extend((scalar_bitset64(op, str(index)), translate_int)
+                    for op in SCALAR_BITSET64_OPS for index in (0, 31, 32, 63, 64))
     fixtures.append((scalar_select64(), translate_int))
     for op in SCALAR_BFE64_OPS:
         fixtures.extend((program, translate_int) for program in (
@@ -9537,6 +9657,13 @@ def main():
         if mode == "draw-first-bit":
             try:
                 return check_scalar_first_bit_draw(directory, *args)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
+                    return 77
+                raise
+        if mode == "draw-bitset64":
+            try:
+                return check_scalar_bitset64_draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
                     return 77
