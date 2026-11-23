@@ -1,4 +1,5 @@
 #include "../desktop_gpu.h"
+#include "../mesh_shadow_draw.h"
 #include <cstdlib>
 #include <filesystem>
 // Run the translated compute -> mesh -> pixel chain for one EXE-requested frame.
@@ -49,8 +50,15 @@ static_assert(offsetof(ShadowDeviceArguments, device) == 16);
 struct ShadowRequest : ShadowDeviceArguments {
     ComPtr<IDXGIFactory6> factory;
     ComPtr<IDXGIAdapter1> selected;
+    ComPtr<ID3D12Device> created_device;
+    std::unique_ptr<MeshShadowDraw> scene;
     DWORD mode = 0;
 };
+
+ShadowRequest* shadow_request(void* args)
+{
+    return static_cast<ShadowRequest*>(static_cast<ShadowDeviceArguments*>(args));
+}
 
 void require(HRESULT hr, const char* operation)
 {
@@ -420,38 +428,95 @@ extern "C" __declspec(dllexport) void* shadow_device_request(DWORD mode)
     }
 }
 
-bool shim_shadow_gpu(void* args, HRESULT result, std::vector<unsigned char>& output)
+extern "C" __declspec(dllexport) HRESULT shadow_open(void* args, HRESULT result)
 {
     try {
-        std::unique_ptr<ShadowRequest> request(static_cast<ShadowRequest*>(static_cast<ShadowDeviceArguments*>(args)));
+        auto* request = shadow_request(args);
         if (request->mode == 16) {
             if (result != E_NOINTERFACE || request->device || !request->selected || !request->factory)
                 fail("Unexpected rejected shim device or missing adapter ownership");
             request->selected.Reset();
             request->factory.Reset();
             std::fputs("Xbox device rejected: no device, released adapter and factory\n", stderr);
-            return false;
+            return E_NOINTERFACE;
         }
         require(result, "D3D12XboxCreateDevice");
         if (!request->device) fail("D3D12XboxCreateDevice returned no device");
-        ComPtr<ID3D12Device> device;
-        device.Attach(static_cast<ID3D12Device*>(request->device));
+        request->created_device.Attach(static_cast<ID3D12Device*>(request->device));
         request->selected.Reset();
         request->factory.Reset();
         std::fputs("Xbox device created: EXE import returned a desktop device\n", stderr);
         const auto* path = std::getenv("X2W_SHIM_CHAIN_DIR");
-        if (!path || !*path) return false;
+        if (!path || !*path) fail("X2W_SHIM_CHAIN_DIR is not set");
         const auto directory = std::filesystem::path(path);
-        if (!check_mesh_shadow_draw(device.Get(), (directory / "mesh.dxil").string().c_str(),
-                                    (directory / "receiver.dxil").string().c_str(),
-                                    (directory / "caster.dxil").string().c_str(),
-                                    (directory / "frames.case").string().c_str(), request->mode == 15, &output))
-            ExitProcess(77);
+        request->scene = std::make_unique<MeshShadowDraw>(
+            request->created_device.Get(), (directory / "mesh.dxil").string().c_str(),
+            (directory / "receiver.dxil").string().c_str(), (directory / "caster.dxil").string().c_str(),
+            (directory / "frames.case").string().c_str(), true);
+        if (!request->scene->supported()) return DXGI_ERROR_UNSUPPORTED;
+        return S_OK;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return E_FAIL;
+    } catch (const Failure&) {
+        return E_FAIL;
+    }
+}
+
+extern "C" __declspec(dllexport) HRESULT shadow_record(void* args, UINT frame, UINT map)
+{
+    try {
+        shadow_request(args)->scene->record(frame, map);
+        std::fprintf(stderr, "shadow record frame=%u map=%u\n", frame, map);
+        return S_OK;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return E_FAIL;
+    }
+}
+
+extern "C" __declspec(dllexport) HRESULT shadow_submit(void* args, UINT frame)
+{
+    try {
+        const auto fence = shadow_request(args)->scene->submit(frame);
+        if (!fence) {
+            std::fprintf(stderr, "shadow submit frame=%u rejected\n", frame);
+            return E_INVALIDARG;
+        }
+        std::fprintf(stderr, "shadow submit frame=%u fence=%llu\n", frame, static_cast<unsigned long long>(fence));
+        return S_OK;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return E_FAIL;
+    }
+}
+
+bool shim_shadow_wait(void* args, std::vector<unsigned char>& output)
+{
+    try {
+        const auto fence = shadow_request(args)->scene->wait(output);
+        std::fprintf(stderr, "shadow wait fence=%llu\n", static_cast<unsigned long long>(fence));
         return true;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return false;
-    } catch (const Failure&) {
-        return false;
+    }
+}
+
+extern "C" __declspec(dllexport) HRESULT shadow_close(void* args)
+{
+    try {
+        std::unique_ptr<ShadowRequest> request(shadow_request(args));
+        // An unsupported mesh tier leaves an empty scene with a live device.
+        const UINT surfaces = request->scene && request->scene->supported()
+            ? request->scene->release_surfaces() : 0;
+        request->scene.reset();
+        const bool device = static_cast<bool>(request->created_device);
+        request->created_device.Reset();
+        std::fprintf(stderr, "shadow close surfaces=%u device=%u\n", surfaces, unsigned(device));
+        return S_OK;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return E_FAIL;
     }
 }

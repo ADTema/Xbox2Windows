@@ -4113,10 +4113,20 @@ The native, mapped and AOT runners use the existing translated shadow scene. The
 second frame shifts the caster four pixels while retaining the device, pipeline
 states, descriptor heap, camera depth and color target. Two light depth maps
 remain live so the second camera pass can deliberately select the first one.
-The fixture compares all 4,096 color pixels and 4,096 light-depth texels of each
-frame against the CPU reference, checks four owned surface releases after the
-GPU fence, and verifies exit code 42. The stale binding changes only the
-second color frame and is checked against its own reference.
+The EXE selects each frame and map slot and calls the test provider to record,
+submit and wait for each frame. One queue signals fence values 1 and 2. Frame
+data is published after its wait and contains 4,096 color pixels followed by
+4,096 light-depth texels. The check compares every byte to the CPU reference,
+checks the mesh export traces, verifies the ordered calls and four owned surface
+releases, and expects exit code 42. The stale binding changes only the second
+color frame, by 170 pixels, and is checked against its own reference.
+
+For the submission control the EXE records the second frame, then supplies an
+invalid frame index to submit. The fixture rejects that request with
+`E_INVALIDARG` before the queue is called. Only fence 1 and the first frame are
+published. The EXE takes its submit-error exit 24 after the unsubmitted list,
+four surfaces and device are released. The fixture provider implements the
+record, submit, wait and close imports for this source-built scene.
 
 Run `ctest --preset release --no-tests=error -R '^cpu_shim_shadow_(warp|hardware)$' -V`.
 

@@ -23,7 +23,11 @@ IMPORTS = {
     (DRAW, b"draw_frame"): HostImport("host_draw_frame", (4,), 4),
     (DRAW, b"shadow_device_request"): HostImport("host_shadow_device_request", (4,), 8),
     ("d3d12_xs.dll", b"D3D12XboxCreateDevice"): HostImport("host_xbox_create_device", (8, 8, 8, 8), 4),
-    (DRAW, b"shadow_draw_result"): HostImport("host_shadow_draw_result", (8, 4), 4),
+    (DRAW, b"shadow_open"): HostImport("host_shadow_open", (8, 4), 4),
+    (DRAW, b"shadow_record"): HostImport("host_shadow_record", (8, 4, 4), 4),
+    (DRAW, b"shadow_submit"): HostImport("host_shadow_submit", (8, 4), 4),
+    (DRAW, b"shadow_wait"): HostImport("host_shadow_wait", (8,), 4),
+    (DRAW, b"shadow_close"): HostImport("host_shadow_close", (8,), 4),
 }
 
 HOST = r"""
@@ -39,7 +43,11 @@ extern "C" __declspec(dllimport) DWORD draw_request();
 extern "C" __declspec(dllimport) DWORD draw_frame(DWORD);
 extern "C" __declspec(dllimport) void* shadow_device_request(DWORD);
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
-extern "C" __declspec(dllimport) DWORD shadow_draw_result(void*, HRESULT);
+extern "C" __declspec(dllimport) HRESULT shadow_open(void*, HRESULT);
+extern "C" __declspec(dllimport) HRESULT shadow_record(void*, UINT, UINT);
+extern "C" __declspec(dllimport) HRESULT shadow_submit(void*, UINT);
+extern "C" __declspec(dllimport) HRESULT shadow_wait(void*);
+extern "C" __declspec(dllimport) HRESULT shadow_close(void*);
 
 static word bound_image() { return reinterpret_cast<word>(GetModuleHandleW(nullptr)); }
 static word host_alloc(word size, word attr) { return reinterpret_cast<word>(compute_alloc(size, attr)); }
@@ -55,8 +63,21 @@ static word host_xbox_create_device(word adapter, word parameters, word iid, wor
     return static_cast<DWORD>(D3D12XboxCreateDevice(reinterpret_cast<IUnknown*>(adapter),
         reinterpret_cast<const void*>(parameters), *reinterpret_cast<const IID*>(iid), reinterpret_cast<void**>(output)));
 }
-static word host_shadow_draw_result(word request, word result) {
-    return shadow_draw_result(reinterpret_cast<void*>(request), static_cast<HRESULT>(result));
+static word host_shadow_open(word request, word result) {
+    return static_cast<DWORD>(shadow_open(reinterpret_cast<void*>(request), static_cast<HRESULT>(result)));
+}
+static word host_shadow_record(word request, word frame, word map) {
+    return static_cast<DWORD>(shadow_record(reinterpret_cast<void*>(request), static_cast<UINT>(frame),
+                                          static_cast<UINT>(map)));
+}
+static word host_shadow_submit(word request, word frame) {
+    return static_cast<DWORD>(shadow_submit(reinterpret_cast<void*>(request), static_cast<UINT>(frame)));
+}
+static word host_shadow_wait(word request) {
+    return static_cast<DWORD>(shadow_wait(reinterpret_cast<void*>(request)));
+}
+static word host_shadow_close(word request) {
+    return static_cast<DWORD>(shadow_close(reinterpret_cast<void*>(request)));
 }
 static word host_finish(word base, word code) { return finish_exe(reinterpret_cast<void*>(base), static_cast<DWORD>(code)); }
 """
