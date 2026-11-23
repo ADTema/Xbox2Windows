@@ -4170,6 +4170,99 @@ entered `loop-rotate`. That trace locates the observed stall under instrumentati
 Uninstrumented pass-time totals and attribution across the replay cohort remain open.
 The GPU check above covers the public fixture's four control words. [Archive trace](https://github.com/R0Y00/Xbox2Windows/issues/775)
 
+### Mesh shader -Od pipeline creation across adapters
+
+[#810](https://github.com/R0Y00/Xbox2Windows/issues/810) asks whether mesh shader DXIL
+compiled with `-Od` reaches pipeline creation and the expected draw on more than one
+adapter. The [mesh -Od tool](../tools/mesh_od_pipeline.py) generates a source-built mesh
+shader with a known draw: threads 0-2 emit one triangle that covers the 32x32 target.
+Every thread first runs a generated integer computation on a constant-buffer seed, and
+the vertex depth stays inside the clip volume only when the result equals the value the
+tool computes in Python. The draw therefore matches the green reference only if the
+compiled computation is correct. The families grow that computation and keep the
+expected image:
+
+- `control`: no extra computation.
+- `chain_N`: N dependent multiply/xor/add steps.
+- `branches_N`: N divergent if/else regions that depend on the group thread.
+- `loops_N`: N loops whose trip count is a constant-buffer word plus `(thread + k) & 3`.
+
+The tool compiles each variant twice with the same DXC and target (`ms_6_5`, default
+optimization and `-Od`) and records compile time, peak working set and outcome. Each
+DXIL blob that compiles goes unchanged to `offscreen_check <adapter> --mesh-entry`, so
+both blobs use the same root signature, pixel shader, pipeline stream and draw. The
+renderer prints the duration of the mesh `CreatePipelineState` call as
+`mesh_pipeline_ms` and flushes it, so the tool records pipeline time separately from
+the process wall time and peak working set, and places a crash or timeout before or
+after pipeline creation. Two negative controls run on every blob that draws the
+reference: the seed with one bit flipped, and a reference image with the triangle
+missing. Both must report a draw mismatch. Use a fresh `--seed` to vary the expected
+constants and the DXIL between runs. Repeated draws use the same blob. The harness
+records first and repeated pipeline times without inspecting driver cache state.
+
+`ctest` runs the small variants (`control`, `chain_64`, `branches_64`, `loops_16`) with
+`--check` on the default hardware adapter and on WARP. It fails if a blob does not
+compile, does not draw the reference, misses either control, or the renderer prints no
+pipeline time, and it exits 77 when the adapter has no mesh shader tier.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^mesh_od_pipeline_' -V
+# measurement run; timeouts are local policy values, not defaults
+$env:XBOX2WINDOWS_ADAPTER = 'RTX 5080'
+out\pe-env\Scripts\python.exe -B tools\mesh_od_pipeline.py --dxc <path-to-dxc.exe> --renderer out\build\dev\offscreen_check.exe --adapter hardware --variants control,chain_4096,branches_4096,loops_1024,loops_4096,loops_8192 --repeat 3 --seed 0x5eed0201 --compile-timeout 300 --pipeline-timeout 300 --out out\mesh-od\nvidia.json
+```
+
+Measured on 2026-11-23 at `523d9ac` plus this change, Windows 11 build 26300.9974,
+Ryzen 7 9800X3D, 31.1 GiB, DXC 1.9.2602.17 from Windows SDK 10.0.26100, debug layer
+unavailable, one process at a time. Seeds were `0x5eed0201` (RTX 5080), `0x5eed0202`
+(Radeon) and `0x5eed0303` (WARP, run after the flush was added). Adapters: NVIDIA
+GeForce RTX 5080 (`10de:2c02`, 32.0.16.2124), the AMD Radeon integrated GPU of the same
+CPU (`1002:13c0`, 32.0.11034.2) and WARP (`1414:008c`, 10.0.26100.9818). DXC times are
+from the RTX 5080 run. In the other runs, times below 2 s differ by at most 0.25 s and
+larger times by up to 18 %. Pipeline times are the first creation with a fresh seed; peak is the
+largest renderer working set.
+
+| variant | DXC default / -Od s | DXIL default / -Od B | RTX 5080 default / -Od | Radeon default / -Od | WARP default / -Od |
+|---|---:|---:|---|---|---|
+| control | 0.02 / 0.02 | 4,160 / 4,224 | 0.03 / 0.02 s | 0.05 / 0.01 s | 0.0005 / 0.0005 s |
+| chain_4096 | 0.32 / 0.15 | 73,796 / 90,616 | 0.90 / 1.03 s | 0.30 / 0.32 s | 0.005 / 0.007 s |
+| branches_4096 | 0.42 / 1.46 | 105,288 / 351,588 | 2.04 / 3.93 s | 0.36 / 3.25 s | 0.005 s / 3.63 s, crash |
+| loops_1024 | 1.35 / 0.60 | 127,332 / 179,488 | 5.35 / 5.16 s | 8.67 / 1.28 s | 0.36 s, crash / 0.37 s, mismatch |
+| loops_4096 | 19.79 / 8.07 | 525,848 / 762,564 | 83.9 / 79.0 s, 3.1 / 3.2 GiB | timeout, 3.1 GiB / 17.6 s, 4.7 GiB | 6.3 / 6.4 s, crash |
+| loops_8192 | 79.53 / 34.32 | 1,073,872 / 1,563,332 | timeout, 11.6 / 11.6 GiB | timeout, 10.6 GiB / 75.2 s, 15.4 GiB | 28.5 / 28.4 s, crash, 6.6 GiB |
+
+Every blob that drew the reference on an adapter also failed both controls there.
+`timeout` is the 300 s policy expiring inside pipeline creation; the process was
+killed. On WARP, `crash` is the renderer exiting with NTSTATUS `0xc0000005`
+(`branches_4096 -Od` gave `0xc0000374` in two of three runs), after `CreatePipelineState` returned and before
+the readback; `mismatch` means the draw completed with all 1024 pixels wrong. No
+HRESULT failure, compiler diagnostic or unsupported mesh tier occurred.
+
+What the measurements show:
+
+- On the RTX 5080, `-Od` changed pipeline time by less than 15 % on the loop variants
+  and doubled it for `branches_4096`. Both blobs of `loops_8192` exceeded 300 s with
+  about 11.6 GiB of working set. Repeated creations of the same blob took 1-32 ms.
+- On the Radeon, `-Od` turned the default timeouts of `loops_4096` and `loops_8192`
+  into completed pipelines that drew the reference. It cost more for `branches_4096`
+  (0.36 to 3.25 s).
+- On WARP, pipeline creation returned for every blob (at most 28.5 s), and no blob
+  from `branches_4096 -Od`, `loops_768` or larger drew the reference. `loops_768` gave a
+  mismatch at both optimization levels in two runs, while `loops_512` and `loops_640`
+  matched. `loops_1024` gave a mismatch in some runs and an access violation in
+  others, so the outcome there is not deterministic.
+  In an ad hoc run outside the tool, `loops_768` with trip-count base 0, 5 or 20 still
+  mismatched and a single loop of 1,000,000 iterations matched, so the observed boundary
+  follows the number of loops in the shader rather than the iteration count. The RTX
+  5080 and the Radeon drew the reference with the same `loops_1024` blobs. The cause on
+  WARP is not established here.
+
+This covers source-built mesh shaders, one seed per run and the listed adapters. It
+does not replay archive records, does not change any watchdog, memory or host stack
+setting, and does not establish that a default and an `-Od` blob are equivalent for
+other inputs. The archive-wide follow-up remains with the aggregate acceptance run.
+
 ### Minimum LOD in the SPIR-V bridge
 
 The pinned Windows SPIRV-Cross build maps the SPIR-V `MinLod` operand to the
