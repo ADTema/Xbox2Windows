@@ -9,3 +9,5 @@ EXPORTS
     XMemAllocatePhysicalPages @7
     XMemFreePhysicalPages @8
     XMemIsToolsMemAvailable @9
+    XMemMapPhysicalPages @10
+    XMemMapPhysicalPagesScatter @11

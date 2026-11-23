@@ -65,7 +65,7 @@ endforeach()
 
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
-    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp)
+    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 # LINK uses explicit export ordinals in the generated import library. Keep
 # those ordinals in the DLL and build the consumer library with names.
@@ -82,7 +82,7 @@ add_custom_command(TARGET xmem_shim POST_BUILD
 target_include_directories(xmem_shim PRIVATE src)
 target_compile_features(xmem_shim PRIVATE cxx_std_20)
 # Delay-loaded: only XMemGetWorkingSetStatistics uses DXGI and D3DKMT (gdi32).
-target_link_libraries(xmem_shim PRIVATE dxgi gdi32 delayimp)
+target_link_libraries(xmem_shim PRIVATE dxgi gdi32 delayimp OneCore)
 target_link_options(xmem_shim PRIVATE /DELAYLOAD:dxgi.dll /DELAYLOAD:gdi32.dll)
 add_executable(xmem_shim_check tests/xmem_shim_check.cpp src/adapter_identity.cpp)
 # D3D12 and DXGI are delay-loaded so the exports scenario can check that xmem.dll loads neither.
@@ -517,6 +517,8 @@ if(FFX_UPSCALER_IMAGE)
     endif()
 endif()
 if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME xmem_shim_mapped_pages COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_check.py" "$<TARGET_FILE:xmem_shim>")
     add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")
     # Compile-only: outcome classification and GVN pass shares, no wall-time threshold (#775).
@@ -3140,6 +3142,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_map_pages_caller>" "$<TARGET_FILE:cpu_map_pages_provider>"
         "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_map_pages PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_transfer_mem_provider SHARED tests/cpu/transfer_mem_provider.cpp tests/cpu/transfer_mem_provider.def)
+    add_executable(cpu_transfer_mem_caller tests/cpu/transfer_mem_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_transfer_mem_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_transfer_mem_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_transfer_mem_caller PRIVATE cpu_transfer_mem_provider cpu_exe_io)
+    add_test(NAME cpu_native_transfer_mem COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/transfer_mem_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_transfer_mem_caller>" "$<TARGET_FILE:cpu_transfer_mem_provider>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_transfer_mem PROPERTIES TIMEOUT 60)
     add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")
@@ -3409,6 +3422,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-round "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_f16_round_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME pixel_aot_f16_cvt_int16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-cvt-int16 "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_f16_cvt_int16_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_swap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-swap "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3576,6 +3593,8 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_arith_${adapter}.txt")
         set_tests_properties(pixel_aot_f16_round_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_round_${adapter}.txt")
+        set_tests_properties(pixel_aot_f16_cvt_int16_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_cvt_int16_${adapter}.txt")
         set_tests_properties(pixel_aot_vop3_ternary_int_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_vop3_ternary_int_${adapter}.txt")
     endforeach()
