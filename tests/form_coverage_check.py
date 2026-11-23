@@ -563,6 +563,10 @@ def check_junit_errors():
         "bad_time.xml": ('<testsuite time="soon" timestamp="2026-11-21T21:05:21"/>', "time"),
         "valid.xml": (valid, None),
     }
+    cases.update({
+        f"time_{value}.xml": (valid.replace('time="1"', f'time="{value}"'), "finite and nonnegative")
+        for value in ("nan", "inf", "-1")
+    })
     with tempfile.TemporaryDirectory() as tmp:
         for name, (text, expected) in cases.items():
             junit = Path(tmp) / name

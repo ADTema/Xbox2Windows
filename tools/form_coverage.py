@@ -26,6 +26,7 @@ Python standard library only.
 import argparse
 from datetime import datetime
 import json
+import math
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -168,6 +169,8 @@ def read_results(junit):
         duration = float(suite.get("time"))
     except (TypeError, ValueError):
         raise ValueError(f"<testsuite> time {suite.get('time')!r} is not a number of seconds") from None
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError(f"<testsuite> time {suite.get('time')!r} must be finite and nonnegative")
     status = {"run": "pass", "fail": "fail", "notrun": "skip"}
     results = {}
     for case in suite.iter("testcase"):
