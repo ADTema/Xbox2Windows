@@ -1,7 +1,7 @@
 ; coverage: record cpu_aot_switch_strings
 ; Original Windows x64 fixtures: ctx = {source, destination, fill, backwards}.
 ; Each operation reports remaining count, final pointers and an arithmetic flag.
-STRING_CASE MACRO symbol, operation, backwards, repeated
+STRING_CASE MACRO symbol, operation, backwards, repeated, clear_first:=<0>
 symbol PROC FRAME
     push rsi
     .pushreg rsi
@@ -16,6 +16,9 @@ symbol PROC FRAME
     cmp rcx, 3
 IF backwards
     std
+ENDIF
+IF clear_first
+    cld
 ENDIF
 IF repeated
     rep operation
@@ -53,6 +56,23 @@ STRING_CASE rep_stosb_backward, stosb, 1, 1
 STRING_CASE rep_stosw_backward, stosw, 1, 1
 STRING_CASE rep_stosd_backward, stosd, 1, 1
 STRING_CASE rep_stosq_backward, stosq, 1, 1
+STRING_CASE once_movsb_forward, movsb, 0, 0
+STRING_CASE once_movsw_forward, movsw, 0, 0
+STRING_CASE once_movsd_forward, movsd, 0, 0
+STRING_CASE once_movsq_forward, movsq, 0, 0
+STRING_CASE once_stosb_forward, stosb, 0, 0
+STRING_CASE once_stosw_forward, stosw, 0, 0
+STRING_CASE once_stosd_forward, stosd, 0, 0
+STRING_CASE once_stosq_forward, stosq, 0, 0
+STRING_CASE once_movsb_backward, movsb, 1, 0
+STRING_CASE once_movsb_cleared, movsb, 1, 0, 1
+STRING_CASE once_movsw_backward, movsw, 1, 0
+STRING_CASE once_movsd_backward, movsd, 1, 0
+STRING_CASE once_movsq_backward, movsq, 1, 0
+STRING_CASE once_stosb_backward, stosb, 1, 0
+STRING_CASE once_stosw_backward, stosw, 1, 0
+STRING_CASE once_stosd_backward, stosd, 1, 0
+STRING_CASE once_stosq_backward, stosq, 1, 0
 
 ; Two paths join with different DF values. The selected direction is live at REP.
 branch_direction PROC FRAME
@@ -146,4 +166,63 @@ bad_join:
     xor eax, eax
     ret
 bad_df_join ENDP
+
+bad_df_mixed_call PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    test rdx, rdx
+    jne mixed_call_dirty
+    jmp mixed_call_invoke
+mixed_call_dirty:
+    std
+mixed_call_invoke:
+    call rep_movsb_forward
+    cld
+    add rsp, 28h
+    ret
+bad_df_mixed_call ENDP
+
+bad_df_host_call PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    std
+    ; CALL [RIP+0]. The rejection check supplies a synthetic host binding at
+    ; the slot RVA. This translation-only fixture is never executed.
+    db 0ffh, 15h
+    dd 0
+    cld
+    add rsp, 28h
+    ret
+bad_df_host_call ENDP
+
+bad_df_back_edge PROC FRAME
+    .endprolog
+df_loop_header:
+    test rdx, rdx
+    je df_loop_done
+    std
+    dec rdx
+    jmp df_loop_header
+df_loop_done:
+    xor eax, eax
+    ret
+bad_df_back_edge ENDP
+
+bad_once_stosb_rcx PROC FRAME
+    push rdi
+    .pushreg rdi
+    sub rsp, 20h
+    .allocstack 20h
+    .endprolog
+    mov rdi, [rcx+8]
+    call rep_movsb_forward
+    xor eax, eax
+    stosb
+    test rcx, rcx
+    add rsp, 20h
+    pop rdi
+    ret
+bad_once_stosb_rcx ENDP
 END

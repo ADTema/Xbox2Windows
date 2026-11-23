@@ -293,7 +293,11 @@ def check_shader_records():
         ("VOP2", "v_lshrrev_b32"), ("VOP2", "v_ashrrev_i32"), ("VOP2", "v_lshlrev_b32"),
         ("VOP2", "v_and_b32"), ("VOP2", "v_or_b32"), ("VOP2", "v_xor_b32"),
         ("VOP2", "v_add_nc_u32"), ("VOP2", "v_sub_nc_u32"), ("VOP2", "v_subrev_nc_u32"),
+        ("VOP2", "v_xnor_b32"),
     }
+    e64_integer_forms = {("VOP3", f"{form}_e64") for form in (
+        "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_not_b32",
+        "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_cvt_f32_ubyte2")}
     mul24_forms = {
         ("VOP2", "v_mul_i32_i24"), ("VOP3", "v_mul_i32_i24_e64"),
         ("VOP2", "v_mul_u32_u24"), ("VOP3", "v_mul_u32_u24_e64"),
@@ -315,17 +319,24 @@ def check_shader_records():
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
         assert sopc_forms <= covered, (name, sopc_forms - covered)
         assert vop2_forms <= covered, (name, vop2_forms - covered)
+        assert e64_integer_forms <= covered, (name, e64_integer_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
-    # Integer comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit predicate the
-    # translator lowers; the rejected exec-writing, 64-bit and f16 class neighbours stay out.
+        # v_mac_f32 is in the gfx1013 list only.
+        approx_e64_forms = {("VOP3", "v_exp_f32_e64"), ("VOP3", "v_log_f32_e64")}
+        approx_e64_forms |= {("VOP3", "v_mac_f32_e64")} if name == "gfx1013.tsv" else set()
+        assert approx_e64_forms <= covered, (name, approx_e64_forms - covered)
+    # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit
+    # predicate the translator lowers; the rejected exec-writing and 64-bit neighbours stay out.
     int_compares = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
                     for kind in ("i16", "u16", "i32", "u32")}
     int_compares |= {f"v_cmp_{op}_{kind}" for op in ("f", "t") for kind in ("i32", "u32")}
-    compare_forms = {("VOPC", form) for form in int_compares} | {("VOP3", f"{form}_e64") for form in int_compares}
-    assert len(compare_forms) == 56
+    f16_compares = {f"v_cmp_{op}_f16" for op in pixel.PREDICATES} | {"v_cmp_class_f16"}
+    compare_forms = ({("VOPC", form) for form in int_compares | f16_compares}
+                     | {("VOP3", f"{form}_e64") for form in int_compares | f16_compares})
+    assert len(compare_forms) == 90
     compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_i32", "v_cmp_lt_i64", "v_cmp_lt_u64",
-                          "v_cmp_class_f16", "v_cmp_lt_f16"}
+                          "v_cmp_class_f64", "v_cmp_lt_f64"}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert compare_forms | {("VOPC", n) for n in compare_neighbours} <= reference, name

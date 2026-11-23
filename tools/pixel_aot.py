@@ -109,6 +109,7 @@ def _check_two_exits(code, llvm):
                   or op in ("s_nop", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
                             "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
                             "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
+                            "s_bitreplicate_b64_b32",
                             "s_setreg_imm32_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
@@ -168,7 +169,9 @@ def container_code(program, *, stage, llvm=None):
         markers = sum(word == 0xbf810000 for word, in struct.iter_unpack("<I", code))
         if markers == 1:
             return code
-        if stage == 0 and markers == 2 and llvm is not None:
+        # Exactly two exits, verified for pixel (0) and compute (5) only. Mesh and other
+        # stages, and three or more markers, stay rejected.
+        if stage in (0, 5) and markers == 2 and llvm is not None:
             _check_two_exits(code, llvm)
             return code
         raise ValueError("Unverified multi-exit program")
@@ -214,6 +217,73 @@ def disassemble(code, library, *, cpu=b"gfx1013", offsets=False, features=b""):
 
 SAMPLED_RESOURCES = """Texture2D<float4> tex : register(t0);
 SamplerState samp : register(s0);"""
+
+# SQ_TEX_DEPTH_COMPARE values (sampler word 0, bits 14:12). D3D12_COMPARISON_FUNC is the same order plus one.
+# The hardware compares the reference against the texel: the result is (reference OP texel).
+DEPTH_COMPARE = ("NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_EQUAL", "ALWAYS")
+# D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT and D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT.
+COMPARISON_FILTERS = {0: ("point", 0x80), 1: ("bilinear", 0x94)}
+
+
+def comparison_sampler_state(words):
+    """Decode the sampler descriptor fields that change an image_sample_c_lz result on a 2D texture.
+
+    Field positions are those of SQ_IMG_SAMP_WORD0..3 (registers 0x8F30..0x8F3C in Mesa
+    src/amd/registers/gfx10-rsrc.json; enum values in the Linux navi10_enum.h). Not read, because the accepted profile makes them irrelevant: CLAMP_Z,
+    DISABLE_CUBE_WRAP and Z_FILTER (2D only), ANISO_THRESHOLD and ANISO_BIAS (ratio 1), word 0 bit 31
+    (degamma control; no effect on a float depth texel), MAX_LOD, PERF_MIP and PERF_Z (LOD 0 only), and
+    BORDER_COLOR_PTR and BORDER_COLOR_TYPE (no border addressing). Any other non-zero field is refused,
+    including word 2 bits 28-31 (MIP_POINT_PRECLAMP, ANISO_OVERRIDE, BLEND_ZERO_PRT) and word 3 bits 12-29,
+    which gfx10 leaves unnamed (bit 29 is UPGRADED_DEPTH on GFX8).
+
+    TRUNC_COORD (word 0 bit 27) applies to X and Y for every filter on gfx10 (Mesa ac_gpu_info.h). With 1 the
+    texel-space coordinate is truncated; with 0 it is rounded to nearest even at six fraction bits, and point
+    sampling then drops the fraction (Mesa commit d573d1d8), so it can select the next texel up to 1/128 texel
+    below an edge. D3D point sampling takes the floor (D3D11.3 7.18.7). The accepted pairs are the ones RADV
+    programs on gfx10 by default (radv_sampler.c), point with 1 and bilinear with 0; the other two are refused,
+    including point with 0, which RADV programs for DXVK and vkd3d-proton. Bilinear results are in the
+    contract where the texel-space position is a multiple of 1/64, so the rounding is exact on both sides.
+    """
+    w0, w1, w2, w3 = words
+    if (w0 & 7, (w0 >> 3) & 7) != (2, 2):
+        raise ValueError("Comparison sampling requires CLAMP_LAST_TEXEL in X and Y")
+    if (w0 >> 9) & 7:
+        raise ValueError("Comparison sampling with anisotropy is not supported")
+    if (w0 >> 15) & 1:
+        raise ValueError("Comparison sampling with unnormalized coordinates is not supported")
+    if (w0 >> 19) & 3:
+        raise ValueError("Comparison sampling with MC_COORD_TRUNC or FORCE_DEGAMMA is not supported")
+    if (w0 >> 29) & 3:
+        raise ValueError("Comparison sampling requires the blend filter mode")
+    if w1 & 0xfff:
+        raise ValueError("Comparison sampling at LOD zero requires MIN_LOD 0")
+    if w2 & 0xfffff:
+        raise ValueError("Comparison sampling with an LOD bias is not supported")
+    mag, minify, mip = (w2 >> 20) & 3, (w2 >> 22) & 3, (w2 >> 26) & 3
+    if mag != minify or mag not in COMPARISON_FILTERS:
+        raise ValueError("Comparison sampling requires one point or bilinear XY filter")
+    if mip == 3 or w2 >> 28:
+        raise ValueError("Unsupported mip filter or word 2 bits 28-31")
+    if (w3 >> 12) & 0x3ffff:
+        raise ValueError("Comparison sampling with word 3 bits 12-29 (UPGRADED_DEPTH on GFX8) is not supported")
+    func = (w0 >> 12) & 7
+    filter_name, d3d_filter = COMPARISON_FILTERS[mag]
+    trunc_coord = (w0 >> 27) & 1
+    if trunc_coord != (filter_name == "point"):
+        raise ValueError(f"Comparison sampling with {filter_name} filtering requires TRUNC_COORD "
+                         f"{int(filter_name == 'point')}")
+    return {"compare": DEPTH_COMPARE[func], "d3d12_comparison_func": func + 1,
+            "filter": filter_name, "d3d12_filter": d3d_filter, "address": "clamp",
+            "trunc_coord": trunc_coord}
+
+
+def comparison_resources(state):
+    return (f"// s0 comparison sampler: D3D12_FILTER 0x{state['d3d12_filter']:x}, "
+            f"D3D12_COMPARISON_FUNC {state['d3d12_comparison_func']} ({state['compare']}), address CLAMP\n"
+            f"// Console TRUNC_COORD {state['trunc_coord']}. Contract: reference and texels in [0, 1] on an R32_FLOAT "
+            "view; outside it the result depends on the image format, which is not decoded.\n"
+            "Texture2D<float> tex : register(t0);\n"
+            "SamplerComparisonState samp : register(s0);")
 PREAMBLE = """// v_cmp_class_f32: the ten binary32 classes of LLVM SIInstrFlags::ClassFlags, from the raw encoding:
 // signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
 uint class32(float value) {
@@ -225,6 +295,22 @@ uint class32(float value) {
     if (magnitude >= 0x00800000u) return negative ? 0x8u : 0x100u;
     if (magnitude != 0u) return negative ? 0x10u : 0x80u;
     return negative ? 0x20u : 0x40u;
+}
+// v_cmp_class_f16: the ten binary16 classes of LLVM SIInstrFlags::ClassFlags, from bits [15:0]:
+// signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
+uint class16(uint bits) {
+    uint h = bits & 0xffffu;
+    uint magnitude = h & 0x7fffu;
+    bool negative = h >= 0x8000u;
+    if (magnitude > 0x7c00u) return (h & 0x0200u) != 0u ? 0x2u : 0x1u;
+    if (magnitude == 0x7c00u) return negative ? 0x4u : 0x200u;
+    if (magnitude >= 0x0400u) return negative ? 0x8u : 0x100u;
+    if (magnitude != 0u) return negative ? 0x10u : 0x80u;
+    return negative ? 0x20u : 0x40u;
+}
+// binary16 operand is not a NaN: decided on the encoding, because some desktop compilers fold float NaN tests.
+bool num16(uint bits) {
+    return (bits & 0x7fffu) <= 0x7c00u;
 }
 // v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
 // D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
@@ -404,7 +490,10 @@ INT_COMPARE = {
 # 32-bit integer operations on register bits. Shift counts use their low five bits, as on the target.
 INTEGER = {
     "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
+    "xnor_b32": (2, "~({0} ^ {1})"),
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
+    "alignbit_b32": (3, "(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))"),
+    "alignbyte_b32": (3, "(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - (({2} & 3u) * 8u)))))"),
     "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
     "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
     "mul_u32_u24": (2, "mul24_u32({0}, {1})"),
@@ -467,6 +556,34 @@ uint mul_hi_i32(uint a, uint b) {
         "    return uint2(asuint(asint(v.y) >> (s - 32u)), asuint(asint(v.y) >> 31));\n"
         "}"
     ),
+    "s_quadmask_b32": """uint s_quadmask_b32(uint value) {
+    uint result = 0u;
+    [unroll]
+    for (uint group = 0u; group < 8u; ++group) {
+        if ((value & (0xfu << (group * 4u))) != 0u) result |= 1u << group;
+    }
+    return result;
+}
+""",
+    "s_quadmask_b64": """uint2 s_quadmask_b64(uint2 value) {
+    uint result = s_quadmask_b32(value.x) | (s_quadmask_b32(value.y) << 8u);
+    return uint2(result, 0u);
+}
+""",
+    "s_bitreplicate_b64_b32": """uint2 s_bitreplicate_b64_b32(uint value) {
+    uint low = value & 0xffffu;
+    uint high = value >> 16u;
+    low = (low | (low << 8u)) & 0x00ff00ffu;
+    high = (high | (high << 8u)) & 0x00ff00ffu;
+    low = (low | (low << 4u)) & 0x0f0f0f0fu;
+    high = (high | (high << 4u)) & 0x0f0f0f0fu;
+    low = (low | (low << 2u)) & 0x33333333u;
+    high = (high | (high << 2u)) & 0x33333333u;
+    low = (low | (low << 1u)) & 0x55555555u;
+    high = (high | (high << 1u)) & 0x55555555u;
+    return uint2(low | (low << 1u), high | (high << 1u));
+}
+""",
     "s_bfm_b64": (
         "uint2 s_bfm_b64(uint width, uint offset) {\n"
         "    uint w = width & 63u;\n"
@@ -781,7 +898,7 @@ def scalar_u32(token, scalar, pending):
             return f"{value}u"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return value[1]
-        if isinstance(value, str) and value.startswith("params["):
+        if isinstance(value, str) and value.startswith("params"):
             return f"asuint({value})"
         raise ValueError(f"Expected a numeric scalar register: {token}")
     if re.fullmatch(r"-?\d+", token):
@@ -895,7 +1012,7 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict
             return f"asfloat({value}u)"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return f"asfloat({value[1]})"
-        if not isinstance(value, str) or not (value.startswith(("sample", "alu", "params["))
+        if not isinstance(value, str) or not (value.startswith(("sample", "alu", "params"))
                 or (quad_values is not None and value in quad_values)):
             raise ValueError("Expected a numeric register")
         if token in sample_dest:
@@ -911,7 +1028,7 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict
 def int_operand(token, scalar, vector, pending, sample_dest, *, signed):
     if re.fullmatch(r"v\d+", token):
         value = vector[token]
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
             raise ValueError("Expected a numeric register")
         if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
@@ -1054,7 +1171,7 @@ def vop3p_f16_word(token, scalar, vector, pending, sample_dest):
             return f"{value}u"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return value[1]
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
             raise ValueError("Expected a numeric register")
         if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
@@ -1067,6 +1184,37 @@ def vop3p_f16_word(token, scalar, vector, pending, sample_dest):
             raise ValueError(f"Unsupported packed integer inline constant {token}")
         return f"{value & 0xffffffff}u"
     raise ValueError(f"Unsupported packed operand {token}")
+
+
+def f16_cmp_operand(token, scalar, vector, pending, sample_dest, *, allow_mods, as_bits):
+    """Return one binary16 comparison source as low-16-bit uint bits or a widened float."""
+    neg = False
+    use_abs = False
+    if token not in INLINE_F16 and not re.fullmatch(r"-\d+", token):
+        if token.startswith("-"):
+            neg = True
+            token = token[1:]
+        if m := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
+            use_abs = True
+            token = m.group(1) or m.group(2)
+        if (neg or use_abs) and not allow_mods:
+            raise ValueError("Input modifiers require VOP3 encoding")
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", token) and int(token, 16) > 0xffff:
+        raise ValueError(f"16-bit literal out of range: {token}")
+    word = vop3p_f16_word(token, scalar, vector, pending, sample_dest)
+    if as_bits:
+        expr = f"({word} & 0xffffu)"
+        if use_abs:
+            expr = f"({expr} & 0x7fffu)"
+        if neg:
+            expr = f"({expr} ^ 0x8000u)"
+        return expr
+    expr = f"widen16({word})"
+    if use_abs:
+        expr = f"abs({expr})"
+    if neg:
+        expr = f"(-{expr})"
+    return expr
 
 
 def parse_vop3p_f16(rest, arity):
@@ -1105,7 +1253,7 @@ def fma_mix_reg(token, scalar, vector, pending, sample_dest):
         return f"asfloat({value}u)", f"{value}u"
     if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
         return f"asfloat({value[1]})", value[1]
-    if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+    if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
         raise ValueError("Expected a numeric register")
     if token in sample_dest:
         raise ValueError("Sample used before vmcnt wait")
@@ -1203,7 +1351,7 @@ def dot_word(token, scalar, vector, pending, sample_dest, *, allow_f16=False):
             return f"{value}u"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return value[1]
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
             raise ValueError("Expected a numeric register")
         if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
@@ -1268,7 +1416,7 @@ def vop3p_int_word(token, scalar, vector, pending, sample_dest):
             return f"{value}u"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return value[1]
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params")):
             raise ValueError("Expected a numeric register")
         if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
@@ -1373,7 +1521,7 @@ def sdwa_dest(result, sel, unused, old):
     if unused == "UNUSED_PAD":
         return field
     # The kept bits must come from a tracked numeric value; hardware would keep whatever an untracked register holds.
-    if not (isinstance(old, str) and old.startswith(("sample", "alu", "params["))):
+    if not (isinstance(old, str) and old.startswith(("sample", "alu", "params"))):
         raise ValueError("UNUSED_PRESERVE needs a tracked numeric destination")
     keep = ~(((1 << width) - 1) << offset) & 0xffffffff
     return f"((asuint({old}) & {keep:#x}u) | {field})"
@@ -1382,8 +1530,14 @@ SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", 
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
-          second_texture_offset=None, integer_export=False, texcoord_components=2):
-    """Track descriptor provenance, interpolation and packed or uncompressed exports."""
+          second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=()):
+    """Track descriptor provenance, interpolation and packed or uncompressed exports.
+
+    constant_descriptor is the byte offset, on the texture table, of the descriptor mapped to b0.
+    Each extra_constants entry is an (entry SGPR, byte offset) pair naming one further 16-byte
+    descriptor; the entries map in order to b1 onward. The SGPR may be the texture table or another
+    entry register that holds the low word of a table address.
+    """
     if texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105:
         raise ValueError("Invalid scalar inputs")
     if sampler is not None and (len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
@@ -1411,12 +1565,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if constant_descriptor is not None and any(
             start < constant_descriptor + 16 and constant_descriptor < start + 32 for start in bindings):
         raise ValueError("Texture and constant descriptors overlap")
+    # (table marker, descriptor byte offset) -> HLSL array. A table other than the texture table
+    # is an entry SGPR whose only accepted use is the low address word of a descriptor load.
+    constants = {} if constant_descriptor is None else {("texture_ptr", constant_descriptor): "params"}
+    for slot, entry in enumerate(extra_constants, 1):
+        if (len(entry) != 2 or any(type(word) is not int for word in entry) or not 0 <= entry[0] <= 105
+                or entry[0] == interp_sgpr or entry[1] < 0 or entry[1] % 4):
+            raise ValueError("Invalid constant descriptor binding")
+        table = "texture_ptr" if entry[0] == texture_sgpr else ("constant_table", entry[0])
+        if any(other == table and abs(start - entry[1]) < 16 for other, start in constants):
+            raise ValueError("Constant descriptors overlap")
+        if table == "texture_ptr" and any(start < entry[1] + 16 and entry[1] < start + 32 for start in bindings):
+            raise ValueError("Texture and constant descriptors overlap")
+        constants[table, entry[1]] = f"params{slot}"
+        scalar[f"s{entry[0]}"] = table
+        lines.insert(0, f"cbuffer Constants{slot} : register(b{slot}) {{ float4 params{slot}[16]; }};")
     pending = set()
     scc = None
     helpers = set()
     half_rounding = HALF_ROUNDING["0"]
     mask = "entry"
     samples = 0
+    sample_kind = None  # "plain" or "comparison": both would need s0
     sample_dest = {}  # VGPR -> issue number of its outstanding image_sample
     exported = False
     ended = False
@@ -1753,6 +1923,35 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             expr = f"({prev} & ~(1u << ({bit} & 31u)))" if op == "s_bitset0_b32" else f"({prev} | (1u << ({bit} & 31u)))"
             lines.append(f"    uint salu{i} = {expr};")
             scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"(s_quadmask_b32) (s\d+), ([^,]+)"):
+            op, dst, src = m.groups()
+            sgpr_name(dst)
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            value = scalar_u32(src, scalar, pending)
+            helpers.add(op)
+            lines.append(f"    uint salu{i} = {op}({value});")
+            scalar[dst] = ("uint", f"salu{i}")
+            scc = f"(salu{i} != 0u)"
+        elif m := match(r"(s_quadmask_b64) (s\[\d+:\d+\]), ([^,]+)"):
+            op, dst, src = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            low, high = scalar_u64(src, scalar, pending)
+            helpers.update(("s_quadmask_b32", op))
+            lines.append(f"    uint2 salu{i} = {op}(uint2({low}, {high}));")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
+            scc = f"((salu{i}.x | salu{i}.y) != 0u)"
+        elif m := match(r"(s_bitreplicate_b64_b32) (s\[\d+:\d+\]), ([^,]+)"):
+            op, dst, src = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            value = scalar_u32(src, scalar, pending)
+            helpers.add(op)
+            lines.append(f"    uint2 salu{i} = {op}({value});")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
         elif m := match(r"(s_addk_i32|s_mulk_i32) (s\d+), (-?\d+|0x[0-9a-f]+)"):
             op, dst, imm = m.groups()
             operand = scalar_u32(dst, scalar, pending)
@@ -1787,18 +1986,26 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid scalar buffer registers")
             dst = registers(first, last, width)
             base = [f"s{n}" for n in registers(low, high, 2 if descriptor else 4)]
-            expected = ["texture_ptr", 0] if descriptor else [("cbv", n) for n in range(4)]
-            if constant_descriptor is None or pending.intersection(base) or [scalar.get(r) for r in base] != expected:
+            source = [scalar.get(r) for r in base]
+            table = source[0]
+            if descriptor:
+                resolved = (source[1] == 0
+                            and (table == "texture_ptr" or isinstance(table, tuple) and table[0] == "constant_table"))
+            else:
+                resolved = (isinstance(table, tuple) and table[0] == "cbv"
+                            and source == [("cbv", table[1], n) for n in range(4)])
+            if not constants or pending.intersection(base) or not resolved:
                 raise ValueError("Unresolved constant buffer binding")
-            if descriptor and offset != constant_descriptor:
+            if descriptor and (table, offset) not in constants:
                 raise ValueError("Constant descriptor differs from binding contract")
+            params = constants[table, offset] if descriptor else table[1]
             if not descriptor and (offset % 4 or offset + 4 * len(dst) > 256):
                 raise ValueError("Constant read exceeds binding or is unaligned")
             for j, n in enumerate(dst):
                 if f"s{n}" in pending:
                     raise ValueError("Write overlaps an outstanding scalar load")
                 word = offset // 4 + j
-                scalar[f"s{n}"] = ("cbv", j) if descriptor else f"params[{word // 4}].{'xyzw'[word % 4]}"
+                scalar[f"s{n}"] = ("cbv", params, j) if descriptor else f"{params}[{word // 4}].{'xyzw'[word % 4]}"
                 pending.add(f"s{n}")
         elif m := match(r"v_cube(id|sc|tc|ma)_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+?)( clamp)?"):
             # LLVM ConstantFoldAMDGCNCubeIntrinsic: z, then y, then x is the major axis; a face is negative
@@ -1859,6 +2066,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or texture is None
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
+            if sample_kind == "comparison":
+                raise ValueError("Comparison and ordinary sampling in one program")
+            sample_kind = "plain"
             uv = [vector[f"v{n}"] for n in coords]
             if lod_zero:
                 if second_texture_offset is not None:
@@ -1873,6 +2083,40 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
                 sample_dest[f"v{n}"] = samples
+        elif m := match(r"image_sample_c_lz (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
+                        r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
+            # Depth comparison at LOD zero. The RDNA2 address order puts the reference before the
+            # coordinates, so the operands are (reference, u, v), in one VGPR range or the NSA form.
+            dst, first, last, *nsa = m.groups()[:6]
+            image = registers(*m.groups()[6:8], 8)
+            state = registers(*m.groups()[8:10], 4)
+            address = ([f"v{n}" for n in registers(first, last, 3)] if first is not None else nsa)
+            if any(int(reg[1:]) > 255 for reg in (dst, *address)):
+                raise ValueError("Comparison sample VGPR out of range")
+            if sampler is None or second_texture_offset is not None or sample_kind == "plain":
+                raise ValueError("Comparison sampling requires one texture and no ordinary sampling")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            descriptor = [scalar.get(f"s{n}") for n in image]
+            if (mask != "entry" or any(f"s{n}" in pending for n in (*image, *state))
+                    or descriptor != [("tex", j) for j in range(8)]
+                    or [scalar.get(f"s{n}") for n in state] != list(sampler)):
+                raise ValueError("Unsupported image or sampler binding")
+            if sample_kind is None:
+                lines[lines.index(SAMPLED_RESOURCES)] = comparison_resources(comparison_sampler_state(sampler))
+            sample_kind = "comparison"
+            values = [vector.get(reg) for reg in address]
+            values = [f"uv.{v[1]}" if isinstance(v, tuple) and v[0] == "entry_uv" else v for v in values]
+            for reg, value in zip(address, values):
+                if reg in sample_dest:
+                    raise ValueError("Sample used before vmcnt wait")
+                if not isinstance(value, str) or not (value in quad_values or value.startswith(("sample", "alu", "params"))):
+                    raise ValueError("Unsupported comparison sample operand")
+            reference, u, v = values
+            lines.append(f"    float sample{i} = tex.SampleCmpLevelZero(samp, float2({u}, {v}), {reference});")
+            samples += 1
+            vector[dst] = f"sample{i}"
+            sample_dest[dst] = samples
         elif m := match(r"v_(fmaak|fmamk|madak|madmk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
             # The mad forms use the unfused, denormal-flushing helper; the fma forms are fused.
             op, dst, *tokens = m.groups()
@@ -1965,12 +2209,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(rf"v_({'|'.join(INTEGER)})(?:_e32|_e64)? (v\d+), (.+)"):
-            op, dst, sources = m.groups()
+        elif m := match(rf"v_({'|'.join(INTEGER)})(?:_(e32|e64))? (v\d+), (.+)"):
+            op, encoding, dst, sources = m.groups()
             tokens = sources.split(", ")
             arity, template = INTEGER[op]
             if mask != "entry" or int(dst[1:]) > 255 or dst in sample_dest or len(tokens) != arity:
                 raise ValueError("Invalid integer operation")
+            if arity > 2 and encoding == "e32":
+                raise ValueError(f"Three-operand operation does not support e32 encoding: v_{op}")
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
             if op in MUL24_HELPERS:
                 helpers.update(MUL24_HELPERS[op])
@@ -1991,6 +2237,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
+        elif m := match(rf"v_cmp_class_f16(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            enc, dst, value, classes = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+                bits = f"{int(classes, 0) & 0xffffffff}u"
+            elif re.fullmatch(r"[vs]\d+", classes):
+                bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
+            else:
+                raise ValueError("Unsupported class mask")
+            operand = f16_cmp_operand(
+                value, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=True
+            )
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = (class16({operand}) & {bits}) != 0u;")
 
         elif m := (match(r"v_(add|sub|subrev)_nc_u32(?:_e32|_e64)? (v\d+), ([^,\s]+), ([^,\s]+)")
                    or match(r"v_(add|sub)_nc_i32 (v\d+), ([^,\s]+), ([^,\s]+)")):
@@ -2054,6 +2317,35 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+        elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f16(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            op, enc, dst, *tokens = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            values = [
+                f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=False)
+                for t in tokens
+            ]
+            raw = [
+                f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=True)
+                for t in tokens
+            ]
+            ordered = f"(num16({raw[0]}) && num16({raw[1]}))"
+            direct = {"lt": "lt", "eq": "eq", "le": "le", "gt": "gt", "lg": "lg", "ge": "ge"}
+            negated = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
+            if op in direct:
+                expr = f"({ordered} && ({COMPARE[op].format(*values)}))"
+            elif op in negated:
+                expr = f"!({ordered} && ({COMPARE[negated[op]].format(*values)}))"
+            elif op == "o":
+                expr = ordered
+            elif op == "u":
+                expr = f"!{ordered}"
+            else:
+                expr = COMPARE[op]
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {expr};")
         elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32)(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, kind, dst, *tokens = m.groups()
             regs = lane_mask(dst)
@@ -2382,7 +2674,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             old = vector.get(dst)
-            if old is not None and not (isinstance(old, str) and old.startswith(("sample", "alu", "params["))):
+            if old is not None and not (isinstance(old, str) and old.startswith(("sample", "alu", "params"))):
                 raise ValueError("Unsupported conversion destination")
             # fp_operand reads modifiers and inline constants, so -1 stays the bit pattern 0xffffffff.
             value = fp_operand(src, scalar, vector, pending, sample_dest)
@@ -2498,6 +2790,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="Destination .hlsl in a local output directory")
     parser.add_argument("--constant-descriptor", type=lambda s: int(s, 0),
                         help="Byte offset of a descriptor mapped to the 256-byte desktop buffer b0")
+    parser.add_argument("--extra-constant", type=lambda s: int(s, 0), nargs=2, action="append", default=[],
+                        metavar=("SGPR", "OFFSET"),
+                        help="Entry register and byte offset of a further descriptor; repeat for b1, b2 and onward")
     parser.add_argument("--second-texture-offset", type=lambda s: int(s, 0), help="Byte offset of the t1 descriptor for a two-sample shader")
     args = parser.parse_args()
     dest = args.output.resolve()
@@ -2506,7 +2801,8 @@ def main():
     try:
         blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256, llvm=args.llvm)
         instructions = disassemble(code, args.llvm)
-        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor, second_texture_offset=args.second_texture_offset)
+        source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor, second_texture_offset=args.second_texture_offset,
+                       extra_constants=[tuple(entry) for entry in args.extra_constant])
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")
     dest.parent.mkdir(parents=True, exist_ok=True)
