@@ -1,6 +1,10 @@
 // Source-built CRT-free EXE importing the provider only by ordinal 77.
 #include <cstdint>
 
+// Debug /RTC inserts CRT initialization calls that a /NODEFAULTLIB fixture
+// cannot serve. Keep this synthetic fixture CRT-free in Debug and Release.
+#pragma runtime_checks("", off)
+
 extern "C" __declspec(dllimport) std::uint64_t mix_args(
     std::uint64_t a, std::uint64_t b, std::uint64_t* output);
 

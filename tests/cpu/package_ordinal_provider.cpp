@@ -2,6 +2,10 @@
 #include <windows.h>
 #include <cstdint>
 
+// Debug /RTC inserts CRT initialization calls that a /NODEFAULTLIB fixture
+// cannot serve. Keep this synthetic fixture CRT-free in Debug and Release.
+#pragma runtime_checks("", off)
+
 extern "C" BOOL WINAPI ordinal_provider_entry(HINSTANCE, DWORD, void*) { return TRUE; }
 
 extern "C" std::uint64_t mix_args(std::uint64_t a, std::uint64_t b, std::uint64_t* words) {
