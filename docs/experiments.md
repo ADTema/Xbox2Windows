@@ -2270,6 +2270,18 @@ LDS word. Their returning forms `ds_rsub_rtn_u32`, `ds_min_rtn_i32`,
 pre-update word to the destination VGPR.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
+`ds_write_b8_d16_hi` selects source bits 23:16 and `ds_write_b16_d16_hi`
+selects bits 31:16, preserving bytes outside the addressed field.
+`ds_read_i8_d16_hi` sign-extends the selected byte into bits 31:16 and
+preserves the destination's low half. The fixtures replace the high source
+or signed extraction with its low or unsigned counterpart and expect a mismatch.
+
+`ds_write_addtid_b32` and `ds_read_addtid_b32` use the same private word
+when M0 is explicitly zero, the instruction offset is zero and a single
+full wave32 makes TID equal to local X. The fixture writes through each
+addressing mode and reads through the other, then compares both words.
+Returning the first value for the second read must mismatch at word 1.
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
