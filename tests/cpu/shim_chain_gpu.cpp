@@ -1,3 +1,6 @@
+#include "../desktop_gpu.h"
+#include <cstdlib>
+#include <filesystem>
 // Run the translated compute -> mesh -> pixel chain for one EXE-requested frame.
 //
 // This repeats the sequence of `offscreen_check --compute-mesh-texture`
@@ -20,6 +23,8 @@
 #include <iterator>
 #include <string>
 #include <vector>
+
+extern "C" HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -62,7 +67,7 @@ std::vector<char> read_input(const char* name)
 // WARP by default. "hardware" takes the first physical D3D12 adapter in high-performance
 // order or, with XBOX2WINDOWS_ADAPTER, the first whose description contains that value.
 // No physical adapter is a capability skip (77); a filter that matches none is an error.
-ComPtr<ID3D12Device> create_device()
+ComPtr<ID3D12Device> create_device(bool xbox_shim = false, bool reject = false)
 {
     ComPtr<IDXGIFactory6> factory;
     require(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
@@ -103,7 +108,21 @@ ComPtr<ID3D12Device> create_device()
         require(E_INVALIDARG, "Select draw adapter");
     }
     ComPtr<ID3D12Device> device;
-    require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
+    if (!xbox_shim) {
+        require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
+        return device;
+    }
+    if (reject) {
+        void* rejected = adapter.Get();
+        const auto hr = D3D12XboxCreateDevice(adapter.Get(), nullptr, __uuidof(IDXGIFactory6), &rejected);
+        if (hr != E_NOINTERFACE || rejected || !adapter || !factory)
+            fail("Unexpected rejected shim device or missing adapter ownership");
+        adapter.Reset();
+        factory.Reset();
+        std::fputs("Xbox device rejected: no device, released adapter and factory\n", stderr);
+        throw Failure{};
+    }
+    require(D3D12XboxCreateDevice(adapter.Get(), nullptr, IID_PPV_ARGS(&device)), "D3D12XboxCreateDevice");
     return device;
 }
 
@@ -129,15 +148,6 @@ ComPtr<ID3D12Resource> buffer(ID3D12Device* device, UINT64 bytes, D3D12_HEAP_TYP
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     desc.Flags = flags;
     return committed(device, desc, heap, state);
-}
-
-void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
-                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
-{
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
-    list->ResourceBarrier(1, &barrier);
 }
 
 template<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Kind, typename T>
@@ -382,6 +392,27 @@ bool shim_chain_gpu(unsigned mode, std::vector<unsigned char>& published, unsign
             mismatches += std::memcmp(published.data() + 4 * i, expected_frame + 4 * i, 4) != 0;
         return true;
     } catch (Failure) {
+        return false;
+    }
+}
+
+bool shim_shadow_gpu(bool stale, bool reject, std::vector<unsigned char>& output)
+{
+    try {
+        const auto* path = std::getenv("X2W_SHIM_CHAIN_DIR");
+        if (!path || !*path) return false;
+        const auto directory = std::filesystem::path(path);
+        auto device = create_device(true, reject);
+        if (!check_mesh_shadow_draw(device.Get(), (directory / "mesh.dxil").string().c_str(),
+                                    (directory / "receiver.dxil").string().c_str(),
+                                    (directory / "caster.dxil").string().c_str(),
+                                    (directory / "frames.case").string().c_str(), stale, &output))
+            ExitProcess(77);
+        return true;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return false;
+    } catch (const Failure&) {
         return false;
     }
 }
