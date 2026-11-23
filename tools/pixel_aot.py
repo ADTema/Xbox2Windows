@@ -3915,6 +3915,44 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expr = DPP_ALU[base_op][1].format(*args)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expr};")
+        elif m := match(r"v_pk_fmac_f16(?:_e32)? (v\d+), ([^,\s]+), ([^,\s]+)"):
+            # VOP2 packed binary16 multiply-accumulate (AMD RDNA 2 ISA §12.11, opcode 60 / 0x3c;
+            # LLVM 15 VOP2Instructions.td: V_PK_FMAC_F16):
+            # D.f16[0] = S0.f16[0] * S1.f16[0] + D.f16[0],
+            # D.f16[1] = S0.f16[1] * S1.f16[1] + D.f16[1].
+            # Plain 32-bit VOP2 encoding only: src1 must be a VGPR, vdst is the implicit packed
+            # accumulator and must already be initialized, and no modifiers (clamp, op_sel, neg,
+            # abs, omod) or _e64/DPP/SDWA spellings are accepted.
+            dst, src0, src1 = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid packed operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if not re.fullmatch(r"v\d+", src1):
+                raise ValueError("v_pk_fmac_f16 src1 must be a VGPR")
+            if dst not in vector:
+                raise ValueError(f"Uninitialized packed accumulator {dst} at v_pk_fmac_f16")
+            if src0.startswith("v") and src0 not in vector:
+                raise ValueError(f"Unbound pixel input {src0} at v_pk_fmac_f16")
+            if src0.startswith("s") and src0 not in scalar:
+                raise ValueError(f"Unbound scalar input {src0} at v_pk_fmac_f16")
+            if src1 not in vector:
+                raise ValueError(f"Unbound pixel input {src1} at v_pk_fmac_f16")
+            words = [vop3p_f16_word(t, scalar, vector, pending, sample_dest) for t in (src0, src1, dst)]
+            word_vars = []
+            for k, expr in enumerate(words):
+                wvar = f"pk{i}_{k}"
+                lines.append(f"    uint {wvar} = {expr};")
+                word_vars.append(wvar)
+            packed_lanes = []
+            for lane in (0, 1):
+                lane_args = [f"widen16({wvar} >> 16)" if lane else f"widen16({wvar})" for wvar in word_vars]
+                lvar = f"pk{i}_l{lane}"
+                lines.append(f"    precise float {lvar} = mad({lane_args[0]}, {lane_args[1]}, {lane_args[2]});")
+                packed_lanes.append(f"pack16_rne({lvar})")
+            helpers.add("pack16_rne")
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({packed_lanes[0]} | ({packed_lanes[1]} << 16));")
         elif m := match(r"v_pk_(add|mul|min|max|fma)_f16 (v\d+), (.+)"):
             op, dst, rest = m.groups()
             arity, template = VOP3P_F16[op]

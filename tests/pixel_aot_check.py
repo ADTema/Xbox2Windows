@@ -2960,6 +2960,176 @@ def check_vop3p_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutation of {label} escaped detection")
 
 
+# VOP2 packed binary16 multiply-accumulate (v_pk_fmac_f16 / v_pk_fmac_f16_e32):
+# exercises VGPR/SGPR/32-bit literal/inline-f16 src0, chained accumulation into vdst,
+# in-place aliasing (dst == src1), exact binary16 RNE ties, subnormals, and infinity overflow.
+PK_FMAC_BODY = [
+    "v_mov_b32_e32 v16, s44",
+    "v_mov_b32_e32 v17, s45",
+    "v_mov_b32_e32 v18, s46",
+    "v_mov_b32_e32 v12, s47",
+    "v_pk_fmac_f16 v12, v16, v17",
+    "v_pk_fmac_f16_e32 v12, v18, v17",
+    "v_mov_b32_e32 v13, s46",
+    "v_pk_fmac_f16 v13, s44, v17",
+    "v_mov_b32_e32 v14, s47",
+    "v_pk_fmac_f16 v14, 0xbc003800, v16",
+    "v_mov_b32_e32 v15, s44",
+    "v_pk_fmac_f16 v15, 0.5, v15",
+]
+PK_FMAC_WORDS = (
+    # Mixed signs and asymmetric low/high halves across all four words.
+    (0x40003c00, 0xbc003800, 0x34004200, 0xc0003e00),
+    # Exact binary16 halfway ties: (1 + 2^-10) * 1 + 2^-11 -> 0x3c02 (even), 1 * 1 + 2^-11 -> 0x3c00 (even).
+    (0x3c003c01, 0x3c003c00, 0x10001000, 0x90001000),
+    # Binary16 subnormal inputs and results (0x0400 * 0.5 + 0x0001 = 0x0201; 0x0001 * 0.5 + 0x03ff = 0x0400).
+    (0x00010400, 0x38003800, 0x03ff0001, 0x80000001),
+    # Overflow to signed infinity and signed zero accumulation.
+    (0xfbff7bff, 0x3c003c00, 0xcc004c00, 0x00008000),
+)
+
+
+def pk_fmac_program():
+    return uncompressed_export(PK_FMAC_BODY)
+
+
+def pk_fmac_reference(words):
+    def pack16(value):
+        if math.isnan(value):
+            return 0x7e00
+        try:
+            return struct.unpack("<H", struct.pack("<e", value))[0]
+        except OverflowError:
+            return 0xfc00 if math.copysign(1.0, value) < 0.0 else 0x7c00
+
+    def step(src0, src1, acc):
+        lanes = []
+        for shift in (0, 16):
+            a = half_value(src0 >> shift)
+            b = half_value(src1 >> shift)
+            c = half_value(acc >> shift)
+            prod = struct.unpack("<f", struct.pack("<f", a * b))[0]
+            total = struct.unpack("<f", struct.pack("<f", prod + c))[0]
+            lanes.append(pack16(total))
+        return lanes[0] | (lanes[1] << 16)
+
+    s44, s45, s46, s47 = words
+    v12 = step(s44, s45, s47)
+    v12 = step(s46, s45, v12)
+    v13 = step(s44, s45, s46)
+    v14 = step(0xbc003800, s44, s47)
+    v15 = step(0x00003800, s44, s44)
+    return (v12, v13, v14, v15)
+
+
+def check_pk_fmac_controls():
+    """VOP2 v_pk_fmac_f16: lowering structure, spelling equivalence, and static refusals."""
+    program = pk_fmac_program()
+    lowered = translate_int(program)
+    assert "pack16_rne(" in lowered and "widen16(" in lowered and "mad(" in lowered
+    e32_only = [line.replace("v_pk_fmac_f16 ", "v_pk_fmac_f16_e32 ") for line in program]
+    assert translate_int(e32_only) == lowered
+    # Round-toward-zero mode must refuse v_pk_fmac_f16.
+    expect_value_error(translate_int, [HALF_RTZ] + program, "under round toward zero: v_pk_fmac_f16")
+    # Static refusals: uninitialized accumulator, non-VGPR src1, modifiers, unmodelled encodings,
+    # out-of-range registers, and uninitialized sources.
+    prefix = [
+        "v_mov_b32_e32 v12, s44",
+        "v_mov_b32_e32 v13, s45",
+        "v_mov_b32_e32 v14, s46",
+        "v_mov_b32_e32 v15, s47",
+    ]
+    for bad in (
+        "v_pk_fmac_f16 v20, v12, v13",
+        "v_pk_fmac_f16 v12, v13, s45",
+        "v_pk_fmac_f16 v12, v13, 0x3c003c00",
+        "v_pk_fmac_f16 v12, v13, 1.0",
+        "v_pk_fmac_f16 v12, v13, v14 clamp",
+        "v_pk_fmac_f16 v12, v13, v14 op_sel:[0,0]",
+        "v_pk_fmac_f16 v12, v13, v14 op_sel_hi:[1,1]",
+        "v_pk_fmac_f16 v12, v13, v14 neg_lo:[1,0]",
+        "v_pk_fmac_f16 v12, v13, v14 neg_hi:[0,1]",
+        "v_pk_fmac_f16 v12, -v13, v14",
+        "v_pk_fmac_f16 v12, |v13|, v14",
+        "v_pk_fmac_f16 v12, v13, v14 mul:2",
+        "v_pk_fmac_f16_e64 v12, v13, v14",
+        "v_pk_fmac_f16_dpp v12, v13, v14 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_pk_fmac_f16_sdwa v12, v13, v14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+        "v_pk_fmac_f16 v256, v12, v13",
+        "v_pk_fmac_f16 v12, v256, v13",
+        "v_pk_fmac_f16 v12, s106, v13",
+        "v_pk_fmac_f16 v12, v13, v256",
+        "v_pk_fmac_f16 v12, v20, v13",
+        "v_pk_fmac_f16 v12, s99, v13",
+        "v_pk_fmac_f16 v12, v13, v20",
+    ):
+        must_reject(translate_int, uncompressed_export(prefix + [bad]))
+    # A scalar half16 value only defines bits 15:0 and cannot act as a packed accumulator.
+    half16_acc = uncompressed_export([
+        "v_mov_b32_e32 v13, s45",
+        "v_mov_b32_e32 v14, s46",
+        "v_mov_b32_e32 v15, s47",
+        "v_add_f16_e32 v12, 1.0, v13",
+        "v_pk_fmac_f16 v12, v13, v14",
+    ])
+    must_reject(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                                integer_export=True, half_denorm="preserve"), half16_acc)
+
+
+def check_pk_fmac_draw(directory, compiler, renderer, backend):
+    """Draw v_pk_fmac_f16 through R32G32B32A32_UINT readback with exact reference and negative controls."""
+    source = directory / "pk_fmac.hlsl"
+    shader = directory / "pk_fmac.cso"
+    program = pk_fmac_program()
+    lowered = translate_int(program)
+
+    cases = []
+    for idx, words in enumerate(PK_FMAC_WORDS):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        expected = pk_fmac_reference(words)
+        for word in expected:
+            assert struct.unpack("<I", struct.pack("<f", as_float(word)))[0] == word, hex(word)
+        case = directory / f"pk_fmac-{idx}.case"
+        write_case(case, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+        cases.append(case)
+
+    source.write_text(lowered, encoding="ascii")
+    compile_shader(compiler, source, shader, mode="preserve")
+    run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases])
+    # Binary16 subnormals in pack16_rne/widen16 must stay unchanged under -denorm ftz too.
+    compile_shader(compiler, source, shader, mode="ftz")
+    subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[2]], check=True)
+
+    # Negative controls: dropped accumulator, swapped halves, and wrong rounding must each report pixel_mismatch.
+    idx_v13 = program.index("v_pk_fmac_f16 v13, s44, v17")
+    dropped_acc = lowered.replace(
+        f"mad(widen16(pk{idx_v13}_0), widen16(pk{idx_v13}_1), widen16(pk{idx_v13}_2))",
+        f"(widen16(pk{idx_v13}_0) * widen16(pk{idx_v13}_1))",
+    )
+    swapped_halves = lowered.replace(
+        f"pack16_rne(pk{idx_v13}_l0) | (pack16_rne(pk{idx_v13}_l1) << 16)",
+        f"pack16_rne(pk{idx_v13}_l1) | (pack16_rne(pk{idx_v13}_l0) << 16)",
+    )
+    wrong_rounding = lowered.replace(
+        "uint round_bit = 0x00000fffu + ((shifted >> 13) & 1u);",
+        "uint round_bit = 0u;",
+    )
+    for mutated, case_idx, label in (
+        (dropped_acc, 0, "dropped accumulator"),
+        (swapped_halves, 0, "swapped halves"),
+        (wrong_rounding, 1, "wrong rounding"),
+    ):
+        assert mutated != lowered, label
+        source.write_text(mutated, encoding="ascii")
+        compile_shader(compiler, source, shader, mode="preserve")
+        wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[case_idx]],
+                               capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+    return 0
+
+
 # v_cvt_f16_f32 rounds to nearest even and, on GFX10, writes only the low half of the destination. Channels 0
 # and 1 read the whole word: v12 starts as 1.0, so after the conversion it is 1 + h * 2^-23 when the high half
 # is kept, and (v12 - 1) * 2^23 splits into the low and high bytes of the binary16 encoding h. Channel 2
@@ -10162,6 +10332,7 @@ def check_controls(directory):
     check_cmpx_controls()
     check_shift64_controls()
     check_region_body_controls()
+    check_pk_fmac_controls()
     check_title_load_controls()
     check_ds_swizzle_controls()
     check_ds_nop_controls()
@@ -11941,6 +12112,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(MOVK_BODY), translate))
     fixtures.append((with_constants(HALF_BODY), translate))
     fixtures.append((with_constants(VOP3P_BODY), translate))
+    fixtures.append((pk_fmac_program(), translate_int))
     fixtures.append((with_constants(FMA_MIX_BODY), translate))
     fixtures.append((with_constants(NARROW_BODY), translate))
     fixtures.append((mode_program(), translate))
@@ -16138,7 +16310,7 @@ def main():
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-region-body", "draw-div-fmas", "draw-cmp64", "draw-shift64",
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-region-body", "draw-div-fmas", "draw-cmp64", "draw-shift64", "draw-pk-fmac",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
@@ -16173,6 +16345,7 @@ def main():
                         "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw,
                         "draw-shift64": check_shift64_draw,
+                        "draw-pk-fmac": check_pk_fmac_draw,
                         "draw-flat-scratch": check_flat_scratch_draws,
                         "draw-smem-pointers": check_smem_pointer_draw}[mode]
                 return draw(directory, *args)
