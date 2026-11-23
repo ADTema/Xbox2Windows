@@ -2379,6 +2379,27 @@ REGION_ALU = re.compile(
     r"v_(?:mov_b32|(?:add|sub|subrev|mul|min|max)_f32)(?:_e32|_e64)? "
     r"|v_(?:fmac|mac|rcp|rsq|sqrt)_f32_e32 |v_cvt_f32_ubyte[0-3]_e32 |v_mul_legacy_f32_e(?:32|64) "
     r"|v_(?:fma|mad|med3)_f32 ")
+# Stage 1 of issue #987: scalar instructions that leave every tracked register and counter unchanged may also sit
+# in a region, because skipping them with the whole wave (s_cbranch_execz) or running them changes nothing.
+REGION_NOP = re.compile(r"s_nop (?:0x[0-9a-f]+|\d+)")
+WAIT_COUNTERS = {"vmcnt": "vm", "lgkmcnt": "lgkm", "expcnt": "exp", "vscnt": "vs"}
+
+
+def wait_counters(line):
+    """The counters a wait instruction names, or None when line is not a wait.
+
+    Only the names are read here. The main wait handler still validates operands and field widths and refuses
+    every form it does not model, so a malformed wait is rejected there.
+    """
+    if m := re.fullmatch(r"s_waitcnt_(vmcnt|lgkmcnt|expcnt|vscnt)(?:\s.*)?", line):
+        return {WAIT_COUNTERS[m[1]]}
+    if m := re.fullmatch(r"s_waitcnt\s+(.*)", line):
+        payload = m[1].strip()
+        if payload in ("0", "0x0"):
+            return {"vm", "lgkm", "exp"}
+        return {WAIT_COUNTERS[token.split("(", 1)[0]] for token in payload.split()
+                if token.split("(", 1)[0] in WAIT_COUNTERS}
+    return None
 
 
 class TrackedVector(VectorRegisters):
@@ -2605,6 +2626,22 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
                     and i == region["start"] + 1 and region["skip"] is None):
                 pass
+            elif REGION_NOP.fullmatch(line):
+                pass
+            elif (counters := wait_counters(line)) is not None:
+                if re.match(r"s_waitcnt_expcnt\s+s\d+,", line):
+                    raise ValueError(f"Unsupported s_waitcnt_expcnt SGPR operand in a masked region: {line}")
+                # A wait is admitted only if every counter it names is already satisfied in the tracked state, so
+                # it resolves nothing whether the wave runs or skips it. Loads leave sample_dest and pending only
+                # through a wait, and overwriting an outstanding destination is refused, so empty means nothing is
+                # outstanding. No export can be outstanding (only s_endpgm may follow one). Scratch stores are
+                # not tracked on the store counter, so vscnt is unknown once any store has been lowered.
+                busy = sorted(name for name, outstanding in (("vm", sample_dest), ("lgkm", pending))
+                              if name in counters and outstanding)
+                if busy:
+                    raise ValueError(f"Wait would resolve outstanding {'/'.join(busy)} work in a masked region: {line}")
+                if "vs" in counters and scratch_written:
+                    raise ValueError(f"Store counter state is unknown after a scratch store in a masked region: {line}")
             elif not REGION_ALU.match(line):
                 raise ValueError(f"Instruction cannot run in a masked region: {line}")
             else:
