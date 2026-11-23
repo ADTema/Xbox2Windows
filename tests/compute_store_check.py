@@ -1219,7 +1219,32 @@ def lds_subword_program(width, offset):
     ]
 
 
-LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING)] + [
+# Capture the same byte before and after a halfword write, then overwrite
+# that byte alone and read the complete word.
+LDS_OVERLAP_PROGRAM = DS_PREFIX + [
+    "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
+    "ds_write_b32 v5, v6",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u8 v10, v5 offset:1",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v7, 0x1234",
+    "ds_write_b16 v5, v7",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u8 v11, v5 offset:1",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v7, 0x5a",
+    "ds_write_b8 v5, v7 offset:1",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v12, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+    "s_endpgm",
+]
+
+
+LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING),
+             ("lds_overlap", LDS_OVERLAP_PROGRAM, LDS_BINDING)] + [
     (name, lds_subword_program(*layout), LDS_BINDING) for name, layout in LDS_SUBWORDS.items()
 ]
 
@@ -1236,6 +1261,18 @@ def lds_subword_reference(width, offset, groups):
         expected.extend((int.from_bytes(word, "little"), value,
                          int.from_bytes(data, "little", signed=True) & 0xffffffff))
     return expected
+
+
+def lds_overlap_reference(groups):
+    words = []
+    for lane in range(groups * 32):
+        data = bytearray((0x89abfff0 + lane).to_bytes(4, "little"))
+        pre = data[1]
+        data[0:2] = b"\x34\x12"
+        middle = data[1]
+        data[1] = 0x5a
+        words.extend((pre, middle, int.from_bytes(data, "little")))
+    return words
 
 
 def lds_reference(groups):
@@ -1321,6 +1358,11 @@ def ds_mutants(name, lines, binding, source):
         changed = variant(lines, (f"ds_read_i{width} v12, v5{suffix}", f"ds_read_u{width} v12, v5{suffix}"))
         # Lane 16 is the first to set the sign bit. The signed read is its third word.
         yield aot.lower(changed, 32, **binding), 16 * 3 + 2
+    elif name == "lds_overlap":
+        no_halfword = variant(lines, ("ds_write_b16 v5, v7", "s_nop 0"))
+        yield aot.lower(no_halfword, 32, **binding), 1
+        no_byte = variant(lines, ("ds_write_b8 v5, v7 offset:1", "s_nop 0"))
+        yield aot.lower(no_byte, 32, **binding), 2
     elif name == "private":
         yield source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)"), 2
     else:
@@ -1344,6 +1386,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
         for groups in (1, 3):
             if name in LDS_SUBWORDS:
                 words = lds_subword_reference(*LDS_SUBWORDS[name], groups)
+            elif name == "lds_overlap":
+                words = lds_overlap_reference(groups)
             elif private:
                 words = lds_reference(groups)
             else:
