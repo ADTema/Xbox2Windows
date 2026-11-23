@@ -2399,7 +2399,7 @@ was incorporated into this translator.
 - Indexed gathers (VSIB): `vgatherdps`, `vgatherdpd`, `vgatherqps`, `vgatherqpd`, `vpgatherdd`, `vpgatherdq`, `vpgatherqd`, `vpgatherqq` (all 16 VEX encodings across `vm32x`, `vm32y`, `vm64x`, `vm64y` and XMM/YMM widths)
 - Masked loads and stores: `vpmaskmovd`, `vpmaskmovq` (all 8 VEX encodings across XMM/YMM load and store forms)
 
-Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers and returns `void`. For transport and ABI glue the translator accepts `vmovdqu` (128- and 256-bit flat loads, stores and register copies), `vzeroupper` and terminal `ret`.
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers with 16-byte-aligned bases and returns `void`. The caller supplies live buffers for the whole invocation and keeps them private to the executing thread. This fixture uses the default MXCSR controls (masked exceptions, round-to-nearest-even, DAZ and FTZ disabled) and compares result bytes. Memory forms using a full 128-bit operand require a displacement divisible by 16. For transport and ABI glue the translator accepts `vmovdqu` (128- and 256-bit flat loads, stores and register copies), `vzeroupper` and terminal `ret`.
 
 ### State model, memory semantics and explicit rejections
 
@@ -2556,7 +2556,7 @@ Not covered by this experiment: the 28 packed-integer forms carved out to `cpu_v
 - Vector and scalar moves: `vmovapd`, `vmovupd` (128/256-bit load, store and register copy), `vlddqu`, `vmovntdq`, `vmovntdqa`, `vmovntpd`, `vmovntps`, `vmovddup`, `vmovshdup`, `vmovsldup`, `vmovhlps`, `vmovlhps`, `vmovhpd`, `vmovhps`, `vmovlpd`, `vmovlps`, `vmovsd`, `vmovss`, `vmovmskpd`, `vmovmskps`
 - Masked loads and stores: `vmaskmovpd`, `vmaskmovps` (all 8 VEX encodings across XMM/YMM load and store forms)
 
-Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers and returns `void`. For transport and ABI glue the translator accepts `vmovdqu` (128/256-bit flat load, store and register copy), flat argument-rooted 32/64-bit `mov` between volatile scratch GPRs (`rax`/`eax`, `r9`/`r9d`, `r10`/`r10d`, `r11`/`r11d`) and `[base + disp]`, `vzeroupper`, and terminal `ret`.
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers with 16-byte-aligned bases and returns `void`. The caller supplies live buffers for the whole invocation and keeps them private to the executing thread. This fixture uses the default MXCSR controls (masked exceptions, round-to-nearest-even, DAZ and FTZ disabled) and compares result bytes. Memory forms using a full 128-bit operand require a displacement divisible by 16. For transport and ABI glue the translator accepts `vmovdqu` (128/256-bit flat load, store and register copy), flat argument-rooted 32/64-bit `mov` between volatile scratch GPRs (`rax`/`eax`, `r9`/`r9d`, `r10`/`r10d`, `r11`/`r11d`) and `[base + disp]`, `vzeroupper`, and terminal `ret`.
 
 ### State model, bit-transparent semantics and explicit rejections
 
@@ -2610,6 +2610,45 @@ On a copy of the linked DLL, the test patches one instruction at a time and expe
 Not covered: RIP-relative constants, packed operations, `SQRT`, `MIN` and `MAX`, the rounding conversions, stack frames and calls.
 
 On Linux, `llvm-ml` assembled the fixture and `lld-link` linked it. The original machine code ran in-process through a Windows-ABI trampoline that loads each slot into both its integer and its XMM register. It matched the lifted C++ built with clang at `-O0`, `-O2` and `-O3` on every call, for both builds, and all rejection controls passed. The generated sources compile without warnings under clang-cl `/W4 /WX`. A Windows run of `cpu_aot_scalar_float` with ML64 and MSVC has not been recorded yet.
+
+## Legacy SSE2 leaf recompilation
+
+[The SSE2 leaf translator](../tools/cpu_sse2_aot.py) lifts bounded straight-line Windows x64 leaf functions covering 23 of the 64 forms in `docs/coverage/x64_zen2.tsv` group `SSE2`:
+
+- Packed compare: `cmppd` (all eight `imm8` predicates, `xmm` and `m128` sources)
+- Packed converts: `cvtdq2pd`, `cvtdq2ps`, `cvtpd2dq`, `cvtpd2ps`, `cvtps2dq`, `cvtps2pd`, `cvttpd2dq`, `cvttps2dq`
+- MMX-domain source convert: `cvtpi2pd` (flat `m64` memory source only)
+- Scalar convert: `cvtsd2si` (`r32`/`r64` destinations, `xmm` or `m64` source)
+- Scalar double ops: `maxsd`, `minsd`, `sqrtsd` (merge into the destination's low qword)
+- Fences: `lfence`, `mfence`
+- Aligned moves: `movapd`, `movdqa` (register copies, loads, stores)
+- Half-qword moves: `movhpd`, `movlpd` (`m64` load merge and `m64` store)
+- Non-temporal stores: `movntdq`, `movntpd`, `movnti` (`r32` and `r64`)
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers with 16-byte-aligned bases and returns `void`. The caller supplies live buffers for the whole invocation and keeps them private to the executing thread. This fixture uses the default MXCSR controls (masked exceptions, round-to-nearest-even, DAZ and FTZ disabled) and compares result bytes. Memory forms using a full 128-bit operand require a displacement divisible by 16. For transport and ABI glue the translator accepts 32/64-bit `mov` between the volatile scratch GPRs (`rax`, `r9`, `r10`, `r11`) and flat `[base + disp]` memory rooted in an argument, plus terminal `ret`.
+
+### State model and explicit rejections
+
+XMM registers `xmm0`..`xmm5` are represented as a portable C++ value struct (`struct Vec128 { std::uint64_t q[2]; }`) rather than MSVC intrinsics, so the generated C++ compiles under default x64 flags. Moves and compares transfer raw bits. The packed-conversion helpers use host floating-point operations and reproduce the SSE2 rounding and truncation rules written out in the code: `cvtpd2dq`/`cvtps2dq`/`cvtsd2si` round to nearest even, `cvttpd2dq`/`cvttps2dq` truncate, NaN or out-of-range results return the integer indefinite value (`0x80000000` or `0x8000000000000000`), `maxsd`/`minsd` return the second source on ties and unordered inputs, and `sqrtsd` returns the quieted source NaN or the real indefinite for negative inputs. `lfence` and `mfence` emit the corresponding host x64 SSE2 fence. All memory operands must be flat `[base + disp]` rooted in `rcx`, `rdx` or `r8`.
+
+The translator explicitly rejects:
+
+- the 36 SSE2-group forms reserved for sibling translators (`addpd`, `movdqu`, `pshufd`, `ucomisd` and the others in the fixture check), so each SSE2 form has a single owner;
+- the five task forms that cannot be expressed through the leaf ABI: `cvtpd2pi`, `cvttpd2pi`, `movdq2q` and `movq2dq` use MMX register operands, and `maskmovdqu` stores through implicit `DS:rdi`;
+- the `mm`-register source of `cvtpi2pd`, `cmppd` immediates above 7, non-legacy (VEX/EVEX) encodings, `lock`/`rep`/segment prefixes, nonvolatile vector registers (`xmm6`..`xmm15`), nonvolatile or argument GPR destinations, undefined registers, non-flat memory operands, missing terminal `ret` and instructions after `ret`.
+
+```powershell
+cmake --build --preset dev --target cpu_sse2_regs_original cpu_sse2_regs_original_lifted cpu_sse2_regs_altered cpu_sse2_regs_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_sse2_regs$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/sse2_regs.asm) builds 57 exports covering all 23 forms: eight `cmppd` predicate exports plus an `m128`-source case, register and memory forms of every scalar op and convert, with the six upper-zeroing converts run on dirty-seeded destinations so zeroing versus merging is observable, `cvtpi2pd` from memory, aligned load/store and register copies, `movhpd`/`movlpd` merges including unaligned `+1` memory loads and `+1` stores, unaligned `+1` `m64` sources for `maxsd` and `cvtsd2si`, non-temporal stores and a chained `op_pipeline` export. [The Windows test](../tests/cpu/sse2_regs_check.py) ran 1,168 differential cases across the 57 exports against both the native MASM DLL and an independent Python reference model, covering IEEE-754 specials (signed zero, subnormals, infinities, sNaN and qNaN with distinct payloads), integer-indefinite boundaries at 2^31 and 2^63, boundary conversion values and random patterns, with 32-byte pre/post guards on every buffer.
+
+An `ALTER_IMM` variant changes the `cmppd` predicates of `op_cmppd_1` (1 to 5), `op_cmppd_3` (3 to 7) and `op_cmppd_6` (6 to 2); the altered translation must match the altered reference while diverging from the unmodified reference, which it did on 28 cases each. An output-mutation negative control flips one bit of `op_pipeline` and confirms the comparator fails. Rejection controls cover 10 alternate-encoding lift checks (non-`rax` `cvtsd2si`/`movnti` operands, displaced memory forms, standalone fences), 69 unit cases (36 reserved SSE2 forms, 7 MMX/implicit-address encodings, 1 `cmppd` immediate, 4 VEX/EVEX encodings, 21 ABI/state/addressing/prefix violations) and 12 end-to-end PE-patched DLL cases. In `tools/form_coverage.py`, `sse2_regs.asm` accounts for exactly its 23 SSE2 forms, advancing x64 Zen 2 `SSE2` group coverage from 14/64 to 37/64 and total x64 Zen 2 coverage from 549/948 to 572/948 (+23).
+
+Not covered by this experiment: the 36 reserved SSE2 forms, MMX-domain operands and `maskmovdqu`, control flow or calls mixed with SSE2 state, nonvolatile `XMM6`..`XMM15` save/restore prologues, faults caused by violating the aligned-base or valid-buffer preconditions, and non-temporal caching effects, and title CPU code execution.
 
 ## D3D12 pixel-position inputs
 
