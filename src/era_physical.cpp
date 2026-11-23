@@ -120,6 +120,13 @@ Status release(std::uint64_t count, const std::uint64_t* pages) noexcept
 #endif
 }
 
+bool owns(std::uint64_t page) noexcept
+{
+    auto& r = registry();
+    std::lock_guard guard(r.lock);
+    return page && page <= capacity_pages && !r.grant.empty() && r.grant[page] != 0;
+}
+
 std::uint64_t granted_pages() noexcept
 {
     auto& r = registry();

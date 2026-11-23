@@ -72,6 +72,10 @@ CPU_FIXTURES = {
     "rdrand": "cpu_aot_rdrand",
     "rdseed": "cpu_aot_rdseed",
     "rdrand_harness": None,  # native CPUID and RFLAGS reads
+    "cpuid": "cpu_aot_cpuid",
+    "xgetbv": "cpu_aot_xgetbv",
+    "cpuid_harness": None,  # native CPUID, OSXSAVE and XGETBV reads
+    "mxcsr_harness": None,  # native MXCSR reads and writes
     "exe_entry": "cpu_aot_exe_entry",
     "xchg": "cpu_aot_xchg",
     "address_size": "cpu_aot_address_size",
@@ -128,8 +132,21 @@ def masm_mnemonics(text):
             words = words[1:]
         if not words:
             continue
+        if words[0] == "int" and len(words) > 1 and masm_integer(words[1]) == 3:
+            # ML64 has no INT3 mnemonic and encodes INT 3 (also written 3h or 03h) as the one-byte CC form,
+            # the reference's int3.
+            found.add("int3")
+            continue
         found.add(x64_canonical(words[0]))
     return found
+
+
+def masm_integer(token):
+    """A MASM integer literal (decimal, or hexadecimal with an h suffix), or None."""
+    try:
+        return int(token[:-1], 16) if token.endswith("h") else int(token, 10)
+    except ValueError:
+        return None
 
 
 def x64_canonical(mnemonic):
