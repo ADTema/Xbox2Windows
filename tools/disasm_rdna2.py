@@ -1041,6 +1041,10 @@ MTBUF_FORMATS = {
 # the lane or sub-dword controls.
 VOP_EXTENSION_FORMS = {233: "DPP8", 234: "DPP8", 249: "SDWA", 250: "DPP16"}
 SDWA_SEL_NAMES = ("BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD")
+# Scalar source codes 209-234 are outside the supported LLVM 15 decoder subset for GFX10 SDWA: LLVM 15
+# refuses every VOPC SDWA record that names one as src0 or src1. This records LLVM 15's behaviour; it is
+# not a claim about the ISA.
+SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES = range(209, 235)
 
 
 def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
@@ -1069,6 +1073,10 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
         return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "VOPCX SDWA forbids sdst_en")
     if (src0_sgpr and src0_raw in (249, 250, 255)) or (src1_sgpr and vsrc1 in (249, 250, 255)):
         return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA scalar operand")
+    if ((src0_sgpr and src0_raw in SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES)
+            or (src1_sgpr and vsrc1 in SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES)):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>",
+                "VOPC SDWA scalar operand outside the supported LLVM 15 decoder subset")
 
     is_float = op_name.endswith(("_f32_e32", "_f16_e32"))
     is_class = "_class_" in op_name
