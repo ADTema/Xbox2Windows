@@ -173,6 +173,31 @@ def check_failure_control(mapper, exe_control, a, b, expected, what):
     print(f"control, {what}: both processes end with {expected:#x} before consuming a result or printing the log")
 
 
+def check_package_runner(mapper, exe, a, b, native_result):
+    tool = Path(__file__).resolve().parents[2] / "tools" / "pe_run_package.py"
+    with TemporaryDirectory() as temp:
+        package = Path(temp)
+        for name, path in ((A, a), (B, b), (EXE, exe)):
+            shutil.copy(path, package / name)
+        command = [sys.executable, "-B", str(tool), str(mapper), str(package), EXE]
+        failed = subprocess.run(command, capture_output=True, timeout=TIMEOUT)
+        if failed.returncode != 1 or failed.stdout or b"unresolved external symbol" not in failed.stderr:
+            raise AssertionError(f"package runner accepted missing host provider: {failed}")
+        command += ["--system", "kernel32.dll"]
+        done = subprocess.run(command, capture_output=True, timeout=TIMEOUT)
+        if done.returncode or done.stderr:
+            raise AssertionError(f"package runner failed: {done}")
+        lines = done.stdout.decode().splitlines()
+        log = next(line[4:] for line in lines if line.startswith("LOG:"))
+        start_of_json = lines.index("{")
+        result = json.loads("\n".join(lines[start_of_json:]))
+        if (log, result) != (native_result["log"], {
+            "image_order": [A, B, EXE], "entry_executed": True, "exit_code": native_result["exit"],
+        }):
+            raise AssertionError(f"package runner differs from Windows: {log!r} {result!r}")
+        print("package runner found both dependencies, matched the native entry trace, and refused a missing provider")
+
+
 def check(mapper, exe, a, b, b_noinit, a_alt, exe_timeout, exe_create):
     check_pe_dependencies(exe, a, b)
     check_failure_control(mapper, exe_timeout, a, b, WAIT_TIMED_OUT, "a worker that outlives the wait")
@@ -190,6 +215,7 @@ def check(mapper, exe, a, b, b_noinit, a_alt, exe_timeout, exe_create):
     check_tls("mapped", map_)
     if map_["order"] != [A, B, EXE]:
         raise AssertionError(f"dependency order {map_['order']}")
+    check_package_runner(mapper, exe, a, b, nat)
     for event in "abte":  # initializers, TLS callback and entry point ran exactly once
         if map_["log"].count(event) != 1:
             raise AssertionError(f"event {event!r} not logged exactly once in {map_['log']}")
