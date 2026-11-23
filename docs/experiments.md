@@ -2257,6 +2257,14 @@ Each comparison stores the selected operand's 32-bit pattern in the private
 LDS word. These five forms have no destination VGPR.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
+`ds_cmpst_b32` and `ds_cmpst_rtn_b32` replace the private word when
+it equals the first data operand. `ds_mskor_b32` and `ds_mskor_rtn_b32`
+clear the bits selected by the first operand and OR in the second operand.
+`ds_wrxchg_rtn_b32` replaces the word directly. The returning forms write
+the old word to the destination VGPR. The fixtures compare old and new words
+and exercise successful and unsuccessful comparisons. Reversing the comparison
+operands, masking the OR operand or omitting the exchange must mismatch at word 1.
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
