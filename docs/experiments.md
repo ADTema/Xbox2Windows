@@ -2935,6 +2935,44 @@ target must retain its clear value. It exercises both bound textures, mixed
 coverage, full survival and full rejection. A reference computed for the
 opposite texture must fail at the sample comparison.
 
+#### Intel first-full-query diagnostic
+
+On source `c639a01`, a local instrumented `offscreen_check` build ran the fixture's
+no-color-output pixel shader in three query-order variants. Each variant ran 13
+draws (twice on Intel, once on NVIDIA and WARP). In `base`, the full draw used
+query index 0, followed by 64 one-pixel draws and an empty query at index 65.
+`swap` assigned index 65 to the first full draw and index 0 to a second full
+draw after the one-pixel draws. `adjacent` recorded two full draws at indices 0
+and 65 before the one-pixel draws.
+
+| Variant | Intel first full query | Intel second full query | Intel one-pixel sum | NVIDIA / WARP |
+|---|---|---|---|---|
+| `base` | 64 in 26/26 (8/26 match reference) | Empty query: 0 | 26/26 | 13/13 each |
+| `swap` | 64 in 26/26 at index 65 (8/26 match reference) | 26/26 at index 0 | 26/26 | 13/13 each |
+| `adjacent` | 64 in 26/26 at index 0 (8/26 match reference) | 26/26 at index 65 | 26/26 | 13/13 each |
+
+**Predictions and observations.** If index 0 caused the mismatch, `swap` would
+leave 64 at index 0; instead it moved with the first full query to index 65. If
+one-pixel draws were required before a matching full query, the second query in
+`adjacent` would still mismatch; instead it matched 26/26. These variants reject
+both hypotheses and are consistent with the first-full-query hypothesis, but do
+not confirm a cause. The original first-query mismatch remains a failure; the
+later query is diagnostic evidence, not a replacement result.
+
+**Commands.** The fixture shader sources in `tests/sampled_coverage_check.py`
+were compiled with `dxc -T ps_6_0 -E main`. Each case ran
+`offscreen_check.exe hardware --sampled-coverage <ps.dxil> <case.bin>` with
+`XBOX2WINDOWS_ADAPTER` set to `Intel` or `NVIDIA`, or
+`offscreen_check.exe warp --sampled-coverage <ps.dxil> <case.bin>`. Leave
+`X2W_COV_SWAP` and `X2W_COV_ADJACENT` unset for `base`; set the respective
+variable to `1` for the other variants.
+
+**Environment.** Windows 11 build 26300.10075; MSVC 19.44.35230, Windows SDK
+10.0.26100 and DXC 1.9.2602.17. Intel UHD Graphics (`8086:468B`, driver
+32.0.101.7092); NVIDIA GeForce RTX 3050 6GB Laptop GPU (`10DE:25EC`, driver
+32.0.16.2114); WARP 10.0.26100.10068. The D3D12 debug layer was unavailable
+for all three backends.
+
 ### Buffered depth export
 
 `tools/depth_mask_aot.py` follows the two entry table pointers through scalar
