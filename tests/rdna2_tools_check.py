@@ -174,6 +174,23 @@ class TestRdna2Disasm(unittest.TestCase):
             ("f202047e", "v_mov_b32_e32", "v_mov_b32_e32 v2, 1.0"),
             ("f002067e", "v_mov_b32_e32", "v_mov_b32_e32 v3, 0.5"),
             ("8002087e", "v_mov_b32_e32", "v_mov_b32_e32 v4, 0"),
+            # Special source operands 235-239 and 251-254, and the 1/(2*pi) inline
+            # constant 248. Encodings and spellings from llvm-mc -mcpu=gfx1013.
+            ("eb02007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, src_shared_base"),
+            ("ec02007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, src_shared_limit"),
+            ("ed02007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, src_private_base"),
+            ("ee02007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, src_private_limit"),
+            ("ef02007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, src_pops_exiting_wave_id"),
+            ("fb02007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, src_vccz"),
+            ("fc02007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, src_execz"),
+            ("fd02007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, src_scc"),
+            ("fe02007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, src_lds_direct"),
+            ("f8040606", "v_add_f32_e32", "v_add_f32_e32 v3, 0.15915494, v2"),
+            ("fd0382be", "s_mov_b32", "s_mov_b32 s2, src_scc"),
+            ("eb0482be", "s_mov_b64", "s_mov_b64 s[2:3], src_shared_base"),
+            ("f80482be", "s_mov_b64", "s_mov_b64 s[2:3], 0.15915494309189532"),
+            ("000064d5f8040200", "v_add_f64", "v_add_f64 v[0:1], 0.15915494309189532, v[2:3]"),
+            ("000064d5ed040200", "v_add_f64", "v_add_f64 v[0:1], src_private_base, v[2:3]"),
             ("0105007e", "v_readfirstlane_b32", "v_readfirstlane_b32 s0, v1"),
             ("0c05587e", "v_readfirstlane_b32", "v_readfirstlane_b32 s44, v12"),
             # VOP2 9-bit SRC0 (VGPR vs SGPR vs inline constant) with GFX10/RDNA 2 opcodes
@@ -1419,6 +1436,12 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_mov_b32_e32 v2, 1.0",
             "v_mov_b32_e32 v3, 0.5",
             "v_mov_b32_e32 v4, 0",
+            "v_mov_b32_e32 v4, src_shared_base",
+            "v_mov_b32_e32 v4, src_pops_exiting_wave_id",
+            "v_mov_b32_e32 v4, src_scc",
+            "v_mov_b32_e32 v4, src_lds_direct",
+            "v_add_f32_e32 v3, 0.15915494, v2",
+            "v_add_f64 v[0:1], 0.15915494309189532, v[2:3]",
             # Issue #746: VOP1 destination is an SGPR; the LLVM 15 gfx1013 CI job
             # assembles and disassembles this line in test_llvm_comparison.
             "v_readfirstlane_b32 s2, v0",
