@@ -3392,6 +3392,14 @@ python -I $exporter export $pool 8253 "$out/fitted-8253.dds" --allow-provisional
 Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
 ```
 
+### Batch export TTPF textures to DDS
+
+`tools/ttpf_batch_export.py` runs batch export over a range of texture indices in a TTPF (RDS5) pool. It attempts strict export first, optionally falls back to provisional calibration history for entries that fail strict verification, and records entry status, dimensions, DXGI codec, output DDS file size and SHA-256 in `manifest.json`.
+
+```powershell
+python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --indices 0,8253 --history "$out/history.json" --tools-path "$out/Leonida/tools"
+```
+
 ### Drawing BC7 textures with a recompiled pixel shader
 
 `linearize_4k_s_tail(tile, width, height, tail_level)` reads a single BC7 level from a shared GFX10 4 KiB mip-tail tile. Supply the decoded tile, the requested pixel dimensions and its zero-based position within the tail. Whole-tile storage and per-slot bounds are checked before reading. [AMD mip-tail address calculation](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10addrlib.cpp)
