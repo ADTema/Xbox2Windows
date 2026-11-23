@@ -623,6 +623,9 @@ INTEGER = {
     "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
     "xnor_b32": (2, "~({0} ^ {1})"),
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
+    # Copies the low binary16 encoding of each source into one half of the destination, with no conversion,
+    # rounding or NaN handling (AMD RDNA ISA reference, VOP3OpSel: D[15:0].f16 = S0.f16, D[31:16].f16 = S1.f16).
+    "pack_b32_f16": (2, "({0} & 0xffffu) | (({1} & 0xffffu) << 16)"),
     # Saturating packs: src0 gives the low and src1 the high 16 bits (AMD RDNA 2 ISA reference, VOP3 opcodes
     # 874 and 875). The ISA text does not define its conversion functions; the bounds are the clamp Mesa
     # documents for the NIR operations its ACO backend selects these instructions for.
@@ -684,7 +687,7 @@ MUL24_HELPERS = {
     "mul_hi_i32_i24": ("mul24_hi_u32", "mul24_hi_i32"),
 }
 # Two-source integer operations that exist in the VOP3 encoding only on gfx10.
-INTEGER_VOP3_ONLY = ("cvt_pk_u16_u32", "cvt_pk_i16_i32", "bfm_b32", "bcnt_u32_b32")
+INTEGER_VOP3_ONLY = ("cvt_pk_u16_u32", "cvt_pk_i16_i32", "bfm_b32", "bcnt_u32_b32", "pack_b32_f16")
 SAD_HELPERS = {"sad_hi_u8": ("sad4_u8",), "msad_u8": ("sad4_u8",)}
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 
