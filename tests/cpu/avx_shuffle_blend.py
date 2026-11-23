@@ -38,7 +38,8 @@ def emit(native_dll: Path, output_cpp: Path) -> None:
     parts = [INTEGER_HEADER, CPUID_HELPER]
     with pefile.PE(str(native_dll), fast_load=True) as pe:
         for name in EXPORTS:
-            ranges = function_ranges(pe, export_rva(pe, name))
+            entry = "vzeroall_lift_entry" if name == "vzeroall_op" else name
+            ranges = function_ranges(pe, export_rva(pe, entry))
             body = [ins for lo, hi in ranges for ins in region(pe, lo, hi)]
             code = lower(body, ["rcx = a; rdx = b; r8 = dst; r9 = mask;"], {}, {}, {})
             parts.append(
@@ -151,6 +152,17 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
         fn_l(ctypes.addressof(a_buf), ctypes.addressof(b_buf), ctypes.addressof(out_l), ctypes.addressof(m_buf))
         if bytes(out_n) != bytes(out_l):
             raise AssertionError(f"{name}: native={bytes(out_n).hex()} lifted={bytes(out_l).hex()}")
+    probe = native.vzeroall_abi
+    probe.argtypes = [ctypes.c_uint64] * 4
+    probe.restype = ctypes.c_uint32
+    assert probe(ctypes.addressof(a_buf), 0, ctypes.addressof(out_n), 0) == 1
+    print("VZEROALL native wrapper preserves a caller XMM6 sentinel")
+    for library in (native, lifted):
+        f32 = ctypes.create_string_buffer(struct.pack("<8I", 0x7f800001, *([0] * 7)))
+        f64 = ctypes.create_string_buffer(struct.pack("<4Q", 0xfff0000000000001, *([0] * 3)))
+        assert invoke(library, "vroundps_op", ctypes.addressof(f32)) == struct.pack("<8I", 0x7fc00001, *([0] * 7))
+        assert invoke(library, "vroundpd_op", ctypes.addressof(f64)) == struct.pack("<4Q", 0xfff8000000000001, *([0] * 3))
+    print("VROUNDPS and VROUNDPD quiet signaling NaNs with the same payload")
     check_m64(native, lifted)
     check_cancellation(native, lifted)
     print(f"{len(EXPORTS)} AVX broadcast/permute/shuffle/blend/dot/round/zeroall cases matched native and translated DLLs")

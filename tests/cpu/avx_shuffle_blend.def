@@ -26,3 +26,5 @@ EXPORTS
     vroundps_op
     vroundpd_op
     vzeroall_op
+    vzeroall_abi
+    vzeroall_lift_entry

@@ -248,12 +248,70 @@ vroundpd_op PROC FRAME
     ret
 vroundpd_op ENDP
 
-vzeroall_op PROC FRAME
+vzeroall_lift_entry PROC FRAME
     .endprolog
     vmovups ymm0, ymmword ptr [rcx]
     vzeroall
     vmovups ymmword ptr [r8], ymm0
     ret
+vzeroall_lift_entry ENDP
+
+; Native ABI wrapper. The raw lift entry clobbers the nonvolatile XMM halves.
+vzeroall_op PROC FRAME
+    sub rsp, 0C8h
+    .allocstack 0C8h
+    movdqa xmmword ptr [rsp+020h], xmm6
+    .savexmm128 xmm6, 020h
+    movdqa xmmword ptr [rsp+030h], xmm7
+    .savexmm128 xmm7, 030h
+    movdqa xmmword ptr [rsp+040h], xmm8
+    .savexmm128 xmm8, 040h
+    movdqa xmmword ptr [rsp+050h], xmm9
+    .savexmm128 xmm9, 050h
+    movdqa xmmword ptr [rsp+060h], xmm10
+    .savexmm128 xmm10, 060h
+    movdqa xmmword ptr [rsp+070h], xmm11
+    .savexmm128 xmm11, 070h
+    movdqa xmmword ptr [rsp+080h], xmm12
+    .savexmm128 xmm12, 080h
+    movdqa xmmword ptr [rsp+090h], xmm13
+    .savexmm128 xmm13, 090h
+    movdqa xmmword ptr [rsp+0A0h], xmm14
+    .savexmm128 xmm14, 0A0h
+    movdqa xmmword ptr [rsp+0B0h], xmm15
+    .savexmm128 xmm15, 0B0h
+    .endprolog
+    call vzeroall_lift_entry
+    movdqa xmm6, xmmword ptr [rsp+020h]
+    movdqa xmm7, xmmword ptr [rsp+030h]
+    movdqa xmm8, xmmword ptr [rsp+040h]
+    movdqa xmm9, xmmword ptr [rsp+050h]
+    movdqa xmm10, xmmword ptr [rsp+060h]
+    movdqa xmm11, xmmword ptr [rsp+070h]
+    movdqa xmm12, xmmword ptr [rsp+080h]
+    movdqa xmm13, xmmword ptr [rsp+090h]
+    movdqa xmm14, xmmword ptr [rsp+0A0h]
+    movdqa xmm15, xmmword ptr [rsp+0B0h]
+    add rsp, 0C8h
+    ret
 vzeroall_op ENDP
+
+; Check the wrapper against a live caller sentinel and restore the caller's value.
+vzeroall_abi PROC FRAME
+    sub rsp, 38h
+    .allocstack 38h
+    movdqa xmmword ptr [rsp+20h], xmm6
+    .savexmm128 xmm6, 20h
+    .endprolog
+    pcmpeqd xmm6, xmm6
+    call vzeroall_op
+    pmovmskb eax, xmm6
+    cmp eax, 0FFFFh
+    sete al
+    movzx eax, al
+    movdqa xmm6, xmmword ptr [rsp+20h]
+    add rsp, 38h
+    ret
+vzeroall_abi ENDP
 
 END
