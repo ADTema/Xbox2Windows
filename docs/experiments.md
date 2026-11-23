@@ -2091,16 +2091,17 @@ wave32 with a 32×1×1 group. The caller supplies `--lds-bytes` for the native
 allocation. The profile requires at least 128 bytes, a verified
 `local_x << 2` address and an immediate
 `s_waitcnt lgkmcnt(0)` after every DS operation. `ds_write_b32` initializes
-or replaces the thread's word, `ds_read_b32` returns it in full, and
-`ds_read_u16` zero-extends the low or high half at offset 0 or 2. This
+or replaces the thread's word, `ds_write_b16` updates a 16-bit half (offset 0 or 2),
+and `ds_write_b8` updates an 8-bit byte (offsets 0..3). `ds_read_b32` returns it in full,
+`ds_read_u16` and `ds_read_i16` zero- or sign-extend the halfword at offset 0 or 2, and
+`ds_read_u8` and `ds_read_i8` zero- or sign-extend individual bytes at offsets 0..3. This
 footprint has no inter-thread aliasing, so the translator can retain the
 written value as a per-invocation expression. Reads require initialization.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
-The source-built wave32 fixture reads the full word and both halves after
-reassigning the source VGPR. It compares 320 UAV words for dispatches of one
-and three groups. Selecting the low half for the high-half read must
-mismatch at word 2 (`0x000089ab` expected, `0x0000fff0` observed).
+The source-built wave32 fixtures exercise full-word, signed half/byte reads and sub-dword
+partial writes across three test programs. They compare 320 UAV words for dispatches of one
+and three groups, verifying negative detection via word, sign, and write mutations.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check

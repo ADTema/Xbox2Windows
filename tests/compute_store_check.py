@@ -1172,27 +1172,92 @@ LDS_PROGRAM = DS_PREFIX + [
     "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
     "s_endpgm",
 ]
-LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING)]
+
+LDS_SIGNED_PROGRAM = DS_PREFIX + [
+    "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
+    "ds_write_b32 v5, v6",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v6, 0",
+    "ds_read_i16 v10, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_i16 v11, v5 offset:2",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_i8 v12, v5 offset:3",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+    "s_endpgm",
+]
+
+LDS_SUBWRITE_PROGRAM = DS_PREFIX + [
+    "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
+    "ds_write_b32 v5, v6",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u8 v10, v5 offset:1",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v7, 0x1234",
+    "ds_write_b16 v5, v7",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v7, 0x5a",
+    "ds_write_b8 v5, v7 offset:3",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v11, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u8 v12, v5 offset:3",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+    "s_endpgm",
+]
+
+LDS_CASES = [
+    ("private", LDS_PROGRAM, LDS_BINDING),
+    ("lds_signed", LDS_SIGNED_PROGRAM, LDS_BINDING),
+    ("lds_subwrite", LDS_SUBWRITE_PROGRAM, LDS_BINDING),
+]
 
 
-def lds_reference(groups):
+def lds_reference(groups, name="private"):
     words = []
     for lane in range(groups * 32):
         word = 0x89abfff0 + lane
-        words.extend((word, word & 0xffff, word >> 16))
+        if name == "private":
+            words.extend((word, word & 0xffff, word >> 16))
+        elif name == "lds_signed":
+            i16_lo = (word & 0xffff) if (word & 0x8000) == 0 else (word & 0xffff) | 0xffff0000
+            i16_hi = (word >> 16) if (word & 0x80000000) == 0 else (word >> 16) | 0xffff0000
+            i8_hi = (word >> 24) if (word & 0x80000000) == 0 else (word >> 24) | 0xffffff00
+            words.extend((i16_lo, i16_hi, i8_hi))
+        elif name == "lds_subwrite":
+            u8_b1 = (word >> 8) & 0xff
+            updated = (word & 0xffff0000) | 0x1234
+            updated = (updated & 0x00ffffff) | (0x5a << 24)
+            u8_b3 = 0x5a
+            words.extend((u8_b1, updated, u8_b3))
     return words
 
 
 def lds_controls():
     lines = LDS_PROGRAM
     assert " >> 16u) & 0xffffu)" in aot.lower(lines, 32, **LDS_BINDING)
+    assert "asuint(asint(" in aot.lower(LDS_SIGNED_PROGRAM, 32, **LDS_BINDING)
+    assert " & ~0xffffu)" in aot.lower(LDS_SUBWRITE_PROGRAM, 32, **LDS_BINDING)
     for old, new, message in (
         ("ds_write_b32 v5, v6", "s_nop 0", "Unverified private LDS read"),
         ("ds_write_b32 v5, v6", "ds_write_b32 v8, v6", "Unverified private LDS write"),
-        ("ds_read_b32 v10, v5", "ds_read_b32 v10, v5 offset:2", "Unverified private LDS read"),
-        ("ds_read_u16 v12, v5 offset:2", "ds_read_u16 v12, v5 offset:1", "Unsupported compute instruction"),
+        ("ds_read_b32 v10, v5", "ds_read_b32 v10, v5 offset:2", "Unverified private LDS read offset"),
+        ("ds_read_u16 v12, v5 offset:2", "ds_read_u16 v12, v5 offset:1", "Unverified private LDS read offset"),
+        ("ds_read_u16 v12, v5 offset:2", "ds_read_i16 v12, v5 offset:1", "Unverified private LDS read offset"),
+        ("ds_read_u16 v12, v5 offset:2", "ds_read_u8 v12, v5 offset:4", "Unverified private LDS read offset"),
+        ("ds_read_u16 v12, v5 offset:2", "ds_read_i8 v12, v5 offset:4", "Unverified private LDS read offset"),
+        ("ds_write_b32 v5, v6", "ds_write_b16 v5, v6 offset:1", "Unverified private LDS write"),
+        ("ds_write_b32 v5, v6", "ds_write_b8 v5, v6 offset:4", "Unverified private LDS write"),
     ):
         rejects(message, aot.lower, variant(lines, (old, new)), 32, **LDS_BINDING)
+    rejects("Unverified private LDS write", aot.lower,
+            ["v_lshlrev_b32_e32 v5, 2, v0", "ds_write_b16 v5, v6", "s_waitcnt lgkmcnt(0)", "s_endpgm"], 32, **LDS_BINDING)
+    rejects("Unverified private LDS write", aot.lower,
+            ["v_lshlrev_b32_e32 v5, 2, v0", "ds_write_b8 v5, v6", "s_waitcnt lgkmcnt(0)", "s_endpgm"], 32, **LDS_BINDING)
     i = lines.index("ds_write_b32 v5, v6")
     masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
     rejects("Unverified private LDS write", aot.lower, masked, 32, **LDS_BINDING)
@@ -1237,7 +1302,7 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
         for groups in (1, 3):
-            words = lds_reference(groups) if private else ds_reference(name, groups)
+            words = lds_reference(groups, name=name) if private else ds_reference(name, groups)
             words += [SENTINEL] * (320 - len(words))
             case.write_bytes(struct.pack("<321I", groups, *words))
             execution = subprocess.run(run)
@@ -1245,14 +1310,21 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
                 return execution.returncode
         if name == "private":
             mutated = source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)")
+            mismatched_word = 2
+        elif name == "lds_signed":
+            mutated = source.replace(">> 16)", ">> 0)")
+            mismatched_word = 0
+        elif name == "lds_subwrite":
+            mutated = source.replace("0x00001234u", "0x00004321u")
+            mismatched_word = 1
         else:
             bias = 5 if name == "ds_bpermute_b32" else 27
             mutated = source.replace(f"local.x + {bias}u", f"local.x + {32 - bias}u")
+            mismatched_word = 0
         assert mutated != source
         src.write_text(mutated, encoding="ascii")
         subprocess.run(compile, check=True)
         bad = subprocess.run(run, capture_output=True, text=True)
-        mismatched_word = 2 if name == "private" else 0
         if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
             raise AssertionError(f"{name}: DS mutation escaped detection\n{bad.stderr}")
         print(bad.stderr, end="")
