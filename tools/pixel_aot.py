@@ -873,6 +873,15 @@ VOP3P_INT16 = {
     "mad_i16": (3, True), "mad_u16": (3, True),
     "lshlrev_b16": (2, False), "lshrrev_b16": (2, False), "ashrrev_i16": (2, False),
 }
+# Non-packed VOP3 16-bit integer forms (llvm-mc spelling -> pk_int16_lane_expr key). Each defines only the
+# low half of the destination.
+VOP3_INT16 = {
+    "add_nc_u16": "add_u16", "add_nc_i16": "add_i16",
+    "sub_nc_u16": "sub_u16", "sub_nc_i16": "sub_i16",
+    "min_u16": "min_u16", "max_u16": "max_u16", "min_i16": "min_i16", "max_i16": "max_i16",
+    "mul_lo_u16": "mul_lo_u16",
+    "lshlrev_b16": "lshlrev_b16", "lshrrev_b16": "lshrrev_b16", "ashrrev_i16": "ashrrev_i16",
+}
 
 
 def sgpr_name(token):
@@ -1029,6 +1038,20 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict
     raise ValueError(f"Unsupported arithmetic operand {token}")
 
 
+def low16_name(token, vector):
+    """Return the HLSL variable of a VGPR that holds only a defined low half, else None.
+
+    The non-packed 16-bit integer VOP3 ops store ("low16", name). The variable holds a 32-bit word whose
+    bits 15:0 are the result; bits 31:16 are unspecified and no accepted reader may observe them. Only the
+    16-bit integer ops, the 16-bit integer compares and v_mov_b32_sdwa with a low-half selection read it.
+    Every other reader sees a tuple and refuses it.
+    """
+    value = vector.get(token) if re.fullmatch(r"v\d+", token) else None
+    if isinstance(value, tuple) and len(value) == 2 and value[0] == "low16":
+        return value[1]
+    return None
+
+
 def int_operand(token, scalar, vector, pending, sample_dest, *, signed):
     if re.fullmatch(r"v\d+", token):
         value = vector[token]
@@ -1056,7 +1079,10 @@ def int16_operand(token, scalar, vector, pending, sample_dest, *, signed):
             raise ValueError(f"16-bit literal out of range: {token}")
     elif not re.fullmatch(r"[vs]\d+", token):
         raise ValueError(f"Unsupported 16-bit integer operand {token}")
-    bits = int_operand(token, scalar, vector, pending, sample_dest, signed=False)
+    if (name := low16_name(token, vector)) is not None:
+        bits = f"asuint({name})"
+    else:
+        bits = int_operand(token, scalar, vector, pending, sample_dest, signed=False)
     return f"(asint({bits} << 16) >> 16)" if signed else f"({bits} & 0xffffu)"
 
 
@@ -1498,7 +1524,9 @@ def pk_int16_lane_expr(op, word_vars, sel, clamp):
         return f"(({u16(word_vars[1], sel[1])} << ({u16(word_vars[0], sel[0])} & 15u)) & 0xffffu)"
     if op == "lshrrev_b16":
         return f"({u16(word_vars[1], sel[1])} >> ({u16(word_vars[0], sel[0])} & 15u))"
-    return f"(asuint({i16(word_vars[1], sel[1])} >> ({u16(word_vars[0], sel[0])} & 15u)) & 0xffffu)"
+    if op == "ashrrev_i16":
+        return f"(asuint({i16(word_vars[1], sel[1])} >> ({u16(word_vars[0], sel[0])} & 15u)) & 0xffffu)"
+    raise ValueError(f"Unknown 16-bit integer op {op}")
 # SDWA selections: (bit offset, width). A source selection is zero-extended, or sign-extended with sext();
 # a destination selection writes the low bits of the result into that field. Following the equivalences in
 # LLVM's SIPeepholeSDWA, UNUSED_PAD zeroes the other bits and UNUSED_PRESERVE keeps them from the destination.
@@ -2160,7 +2188,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid register move")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            word = f"asuint({fp_operand(src, scalar, vector, pending, sample_dest)})"
+            if (src_name := low16_name(src, vector)) is not None:
+                # A 16-bit integer result defines only bits 15:0. A selection inside that half widens it
+                # into a fully defined word; any other selection would read the undefined high half.
+                if src_sel not in ("WORD_0", "BYTE_0", "BYTE_1"):
+                    raise ValueError("Reads the undefined high half of a 16-bit result")
+                word = f"asuint({src_name})"
+            else:
+                word = f"asuint({fp_operand(src, scalar, vector, pending, sample_dest)})"
+            if unused == "UNUSED_PRESERVE" and isinstance(vector.get(dst), tuple) and vector[dst][0] == "low16":
+                raise ValueError("Reads the undefined high half of a 16-bit result")
             result = sdwa_dest(sdwa_source(word, src_sel, bool(sext)), dst_sel, unused, vector.get(dst))
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({result});")
@@ -2697,6 +2734,38 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint pki{i}_l1 = {hi_expr};")
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat(pki{i}_l0 | (pki{i}_l1 << 16));")
+        elif m := match(rf"v_({'|'.join(VOP3_INT16)})(?:_e64)? (v\d+), ([^,\s]+), ([^,\s]+)"):
+            # Non-packed 16-bit integer VOP3 ops. The result is tracked as ("low16", alu): only bits 15:0
+            # are defined. The HLSL variable holds the zero-extended result, but its upper half is an
+            # implementation detail that no accepted reader observes (16-bit ops, 16-bit compares and
+            # v_mov_b32_sdwa with WORD_0/BYTE_0/BYTE_1). Whether hardware keeps or zeroes the destination's
+            # high half is not measured here, so the destination may hold anything and nothing is merged.
+            # Modifiers, op_sel, clamp, DPP and SDWA never match the anchored operands.
+            name, dst, *sources = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid 16-bit integer operation")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            word_vars = []
+            for k, tok in enumerate(sources):
+                if rm := re.fullmatch(r"([vs])(\d+)", tok):
+                    limit = 255 if rm.group(1) == "v" else 105
+                    if not 0 <= int(rm.group(2)) <= limit:
+                        raise ValueError(f"Register out of range: {tok}")
+                    if tok not in (vector if rm.group(1) == "v" else scalar):
+                        raise ValueError(f"Untracked 16-bit source: {tok}")
+                int16_operand(tok, scalar, vector, pending, sample_dest, signed=False)
+                if (src_name := low16_name(tok, vector)) is not None:
+                    bits = f"asuint({src_name})"
+                else:
+                    bits = int_operand(tok, scalar, vector, pending, sample_dest, signed=False)
+                lines.append(f"    uint i16s{i}_{k} = {bits};")
+                word_vars.append(f"i16s{i}_{k}")
+            expr = pk_int16_lane_expr(VOP3_INT16[name], word_vars, [0, 0], False)
+            vector[dst] = ("low16", f"alu{i}")
+            lines.append(f"    precise float alu{i} = asfloat({expr});")
         elif m := match(r"v_cvt_off_f32_i4(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
             # Bits 3:0 of the source as a signed nibble in units of 1/16, so 0x7 gives 0.4375
             # and 0x8 gives -0.5. The source is read as bits, so float modifiers do not apply.
