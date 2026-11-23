@@ -3857,8 +3857,7 @@ Contract boundaries and fixture choices:
   - Exposing these methods as PE imports from `d3d12_xs.dll` is a fixture choice (the GDK sample invokes device methods).
   - Passing a null output to `SetFrameIntervalX` is a fixture choice (the sample passes an actual `IDXGIOutput*`).
   - Numeric constants (e.g. 60) and seeded token representation (monotonically advancing 64-bit integer 1, 2, ...).
-  - Unused `HANDLE` signaling was dropped per review feedback.
-  - Controlled tick driver: registration injects two scheduled ticks from an internal thread, exercising real blocked waiters with an explicit witness (`get_frame_events_blocked_waits() == 2`) without wall-clock drift.
+  - After one registration, an internal worker delivers each of two ticks only when the caller enters a condition-variable wait and releases the shared lock. No delay drives delivery. The mapped recorder checks one registration, two delivered waits, one timeout and two refusals.
   - Bounded timeout before tick leaves the output sentinel unchanged and returns `WAIT_TIMEOUT` (`0x00000102`).
   - Unrepresented event refusal: event types other than `D3D12XBOX_FRAME_EVENT_ORIGIN` (value 0) return `E_INVALIDARG` (`0x80070057`) leaving the output sentinel intact.
   - Separate fault controls: `cpu_frame_events_provider_clobber` tests refusal sentinel overwrite (specific exit `0xE03`), and `cpu_frame_events_provider_early` tests premature release before tick (specific exit `0xE04`).

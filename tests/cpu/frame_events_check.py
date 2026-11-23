@@ -112,15 +112,21 @@ def compare(mapper_path, exe_path, provider_path, clobber_provider_path, early_p
     print(f"mutation 2 (early release): caught at step 3 with exit {code_early:#x} PASS")
 
     # Case 4: Mapped execution under pe_map
-    prov_loaded = ctypes.WinDLL(str(provider))
     io_loaded = ctypes.WinDLL(str(io_dll))
     providers_dict = {
-        "d3d12_xs.dll": prov_loaded,
+        "d3d12_xs.dll": prov_lib,
         io_name: io_loaded,
     }
     mapped_code = run_mapped(mapper_path, exe, providers_dict)
     check("mapped execution exit", mapped_code, 0x874)
     print("mapped execution under pe_map: exit 0x874 PASS")
+    observed = (prov_lib.get_frame_events_schedule_calls(), prov_lib.get_frame_events_blocked_waits(),
+                prov_lib.get_frame_events_origin_waits(), prov_lib.get_frame_events_last_token(),
+                prov_lib.get_frame_events_timeouts(), prov_lib.get_frame_events_rejections(),
+                prov_lib.get_frame_events_mode())
+    check("mapped recorder (registrations, waits signaled, waits completed, token, timeouts, refusals, mode)",
+          observed, (1, 2, 2, 2, 1, 2, 0))
+    print("mapped recorder: one registration, two pending waits delivered, one timeout, two refusals PASS")
 
     # Case 5: Withholding d3d12_xs.dll stops pe_map at import resolution
     withheld_providers = {io_name: io_loaded}
