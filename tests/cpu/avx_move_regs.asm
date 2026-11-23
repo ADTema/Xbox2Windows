@@ -631,6 +631,7 @@ op_perm2f128_zero_both PROC FRAME
     vmovdqu ymm1, YMMWORD PTR [rcx]
     vmovdqu ymm2, YMMWORD PTR [rdx]
     vperm2f128 ymm0, ymm1, ymm2, 88h
+    ; 0CBh also zeroes both lanes, so the OR stays zero only if zeroing wins over lane selection.
     vperm2f128 ymm3, ymm1, ymm2, 0CBh
     vorps ymm0, ymm0, ymm3
     vmovdqu YMMWORD PTR [r8], ymm0
