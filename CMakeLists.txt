@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.21)
 project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
+add_executable(guest_content_root_check tests/guest_content_root_check.cpp)
+target_compile_features(guest_content_root_check PRIVATE cxx_std_17)
+add_test(NAME startup_content_root COMMAND guest_content_root_check "${CMAKE_CURRENT_BINARY_DIR}")
+set_tests_properties(startup_content_root PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(root_probe tools/root_probe.cpp)
 target_compile_features(root_probe PRIVATE cxx_std_17)
 target_link_libraries(root_probe PRIVATE d3d12)
@@ -96,7 +101,7 @@ target_link_options(xmem_shim_check PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi
 target_include_directories(xmem_shim_check PRIVATE src)
 target_compile_features(xmem_shim_check PRIVATE cxx_std_17)
 # working_set_aggregation feeds synthetic adapter readings to src/xmem_gpu_usage.h.
-foreach(scenario IN ITEMS exports allocation default_allocation physical_pages tools_memory query working_set working_set_aggregation)
+foreach(scenario IN ITEMS exports allocation default_allocation physical_pages tools_memory transfer_memory query working_set working_set_aggregation)
     add_test(NAME xmem_shim_${scenario} COMMAND xmem_shim_check ${scenario})
 endforeach()
 # XMemGetWorkingSetStatistics differences around D3D12 heap and committed-resource lifetimes.
@@ -104,6 +109,14 @@ foreach(adapter IN ITEMS warp hardware)
     add_test(NAME xmem_shim_working_set_${adapter} COMMAND xmem_shim_check working_set_${adapter})
     set_tests_properties(xmem_shim_working_set_${adapter} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
+
+# Second commit/protection check (#870): ordinary committed pages vs live shared-page views.
+add_executable(xmem_commit_protection_check tests/xmem_commit_protection_check.cpp)
+target_link_libraries(xmem_commit_protection_check PRIVATE xmem_shim OneCore)
+target_include_directories(xmem_commit_protection_check PRIVATE src)
+target_compile_features(xmem_commit_protection_check PRIVATE cxx_std_20)
+add_test(NAME xmem_commit_protection COMMAND xmem_commit_protection_check)
+set_tests_properties(xmem_commit_protection PROPERTIES TIMEOUT 30)
 
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
 add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12_xs_shim.def)
@@ -390,6 +403,41 @@ foreach(adapter IN ITEMS warp hardware)
     add_test(NAME vm_translation_device_${adapter} COMMAND vm_translation_check device_${adapter})
     set_tests_properties(vm_translation_device_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
 endforeach()
+# XG-style swizzle selection compared with AMD addrlib (#870). addrlib is an optional local dependency
+# fetched by tools/fetch_addrlib.py into out/deps/mesa (Mesa 25.1.0, src/amd/addrlib, MIT); without it the
+# test skips (77). The source list and definitions follow Mesa's src/amd/addrlib/meson.build.
+set(_addrlib_default "${CMAKE_CURRENT_SOURCE_DIR}/out/deps/mesa/src/amd/addrlib")
+if(NOT EXISTS "${_addrlib_default}/inc/addrinterface.h")
+    set(_addrlib_default "")
+endif()
+set(XBOX2WINDOWS_ADDRLIB_DIR "${_addrlib_default}" CACHE PATH
+    "AMD addrlib source (Mesa src/amd/addrlib, see tools/fetch_addrlib.py); empty skips xg_swizzle_select")
+add_executable(xg_swizzle_select_check tests/xg_swizzle_select_check.cpp)
+target_compile_features(xg_swizzle_select_check PRIVATE cxx_std_17)
+if(XBOX2WINDOWS_ADDRLIB_DIR)
+    if(NOT EXISTS "${XBOX2WINDOWS_ADDRLIB_DIR}/inc/addrinterface.h")
+        message(FATAL_ERROR "XBOX2WINDOWS_ADDRLIB_DIR=${XBOX2WINDOWS_ADDRLIB_DIR} has no inc/addrinterface.h")
+    endif()
+    set(_a "${XBOX2WINDOWS_ADDRLIB_DIR}")
+    add_library(xbw_addrlib STATIC EXCLUDE_FROM_ALL
+        "${_a}/src/addrinterface.cpp" "${_a}/src/core/addrelemlib.cpp" "${_a}/src/core/addrlib.cpp"
+        "${_a}/src/core/addrlib1.cpp" "${_a}/src/core/addrlib2.cpp" "${_a}/src/core/addrlib3.cpp"
+        "${_a}/src/core/addrobject.cpp" "${_a}/src/core/addrswizzler.cpp" "${_a}/src/core/coord.cpp"
+        "${_a}/src/gfx9/gfx9addrlib.cpp" "${_a}/src/gfx10/gfx10addrlib.cpp" "${_a}/src/gfx11/gfx11addrlib.cpp"
+        "${_a}/src/gfx12/gfx12addrlib.cpp" "${_a}/src/r800/ciaddrlib.cpp" "${_a}/src/r800/egbaddrlib.cpp"
+        "${_a}/src/r800/siaddrlib.cpp")
+    target_include_directories(xbw_addrlib PUBLIC "${_a}/inc" PRIVATE "${_a}/src" "${_a}/src/core"
+        "${_a}/src/chip/gfx9" "${_a}/src/chip/r800" "${_a}/src/chip/gfx10" "${_a}/src/chip/gfx11" "${_a}/src/chip/gfx12")
+    target_compile_definitions(xbw_addrlib PUBLIC ADDR_FASTCALL= PRIVATE LITTLEENDIAN_CPU DEBUG=0)
+    target_compile_options(xbw_addrlib PRIVATE /w)
+    target_link_libraries(xg_swizzle_select_check PRIVATE xbw_addrlib)
+    target_compile_definitions(xg_swizzle_select_check PRIVATE XBOX2WINDOWS_HAVE_ADDRLIB)
+    message(STATUS "xg_swizzle_select: addrlib from ${XBOX2WINDOWS_ADDRLIB_DIR}")
+else()
+    message(STATUS "xg_swizzle_select: addrlib not configured, the test will skip (77)")
+endif()
+add_test(NAME xg_swizzle_select COMMAND xg_swizzle_select_check)
+set_tests_properties(xg_swizzle_select PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 foreach(adapter IN ITEMS hardware warp)
     add_test(NAME offscreen_${adapter} COMMAND offscreen_check ${adapter} triangle_${adapter}.bmp)
     add_test(NAME ffx_provider_loop_${adapter} COMMAND offscreen_check ${adapter} --ffx-provider-loop)
@@ -2056,6 +2104,49 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_${part}_lifted>" ${entropy_extras})
         set_tests_properties(cpu_aot_${part} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
+    cpu_asm_fixture(cpu_cpuid_harness cpuid_harness)
+    # The opt-in host-CPU profile. CPUID and XGETBV have their own fixtures and tests; cpu_aot_xgetbv exits 77
+    # without OSXSAVE, and cpu_aot_cpuid when no covered leaf depends on the subleaf. Each part has the lifted
+    # DLL, mutated controls that must break a property, and /O2 builds; XGETBV's plain removes volatile and is
+    # built only at /O2.
+    foreach(part IN ITEMS cpuid xgetbv)
+        cpu_asm_fixture(cpu_${part} ${part})
+        if(part STREQUAL "cpuid")
+            set(host_cpu_variants lifted noext swap nosubleaf constant flags)
+            set(host_cpu_o2_variants lifted)
+        else()
+            set(host_cpu_variants lifted noext swap constant flags plain)
+            set(host_cpu_o2_variants lifted plain)
+        endif()
+        set(host_cpu_extras)
+        foreach(variant IN LISTS host_cpu_variants)
+            set(host_cpu_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp")
+            add_custom_command(OUTPUT "${host_cpu_fixture}"
+                COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/cpuid.py"
+                    emit ${part} "$<TARGET_FILE:cpu_${part}>" "${host_cpu_fixture}" ${variant}
+                DEPENDS cpu_${part} tests/cpu/cpuid.py tools/ffx_version_query.py tools/x87_lower.py
+                    tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+            if(NOT variant STREQUAL "plain")
+                add_library(cpu_${part}_${variant} SHARED "${host_cpu_fixture}")
+                if(NOT variant STREQUAL "lifted")
+                    list(APPEND host_cpu_extras "$<TARGET_FILE:cpu_${part}_${variant}>")
+                endif()
+            endif()
+        endforeach()
+        foreach(variant IN LISTS host_cpu_o2_variants)
+            set(host_cpu_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}_o2.dll")
+            add_custom_command(OUTPUT "${host_cpu_o2}"
+                COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp"
+                    "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}_o2.obj" "/Fe${host_cpu_o2}"
+                DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_${part}_${variant}.cpp" VERBATIM)
+            add_custom_target(cpu_${part}_${variant}_o2 ALL DEPENDS "${host_cpu_o2}")
+            list(APPEND host_cpu_extras "${host_cpu_o2}")
+        endforeach()
+        add_test(NAME cpu_aot_${part} COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/cpuid.py"
+            check ${part} "$<TARGET_FILE:cpu_cpuid_harness>" "$<TARGET_FILE:cpu_${part}>"
+            "$<TARGET_FILE:cpu_${part}_lifted>" ${host_cpu_extras})
+        set_tests_properties(cpu_aot_${part} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
@@ -3315,6 +3406,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_apu_alloc_caller>" "$<TARGET_FILE:cpu_apu_alloc_provider>"
         "$<TARGET_FILE:cpu_apu_alloc_provider_lenient>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_apu_alloc_caller PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_dstorage_provider SHARED tests/cpu/dstorage_provider.cpp tests/cpu/dstorage_provider.def)
+    add_executable(cpu_dstorage_caller tests/cpu/dstorage_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_dstorage_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_dstorage_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_dstorage_caller PRIVATE cpu_dstorage_provider cpu_exe_io)
+    add_test(NAME cpu_native_dstorage COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/dstorage_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_dstorage_caller>" "$<TARGET_FILE:cpu_dstorage_provider>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_dstorage PROPERTIES TIMEOUT 60)
     add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")
@@ -3471,6 +3573,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_lds_strided_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_lds_strided_${adapter}.txt")
+        add_test(NAME compute_store_aot_lds_wide_replacement_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-lds-wide-replacement "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_lds_wide_replacement_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_lds_wide_replacement_${adapter}.txt")
+        add_test(NAME compute_store_aot_lds_qword_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-lds-qword "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_lds_qword_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_lds_qword_${adapter}.txt")
         add_test(NAME compute_to_pixel_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_to_pixel_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3517,6 +3629,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_cmpx_regions_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_cmpx_regions_${adapter}.txt")
+        add_test(NAME pixel_aot_region_body_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-region-body "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_region_body_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_region_body_${adapter}.txt")
         add_test(NAME pixel_position_centers_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_position_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3591,6 +3708,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_cmp64_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_cmp64_${adapter}.txt")
+        add_test(NAME pixel_aot_shift64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-shift64 "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_shift64_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_shift64_${adapter}.txt")
         add_test(NAME pixel_aot_plain_bitscan_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-plain-bitscan "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3859,6 +3981,14 @@ else()
         "Follow the Python setup under First build in README.md, or set INTAKE_PYTHON "
         "to an interpreter with requirements-dev.txt installed. Then rerun CMake.")
 endif()
+
+add_executable(vm_copy_queue_check tests/vm_copy_queue_check.cpp)
+target_compile_features(vm_copy_queue_check PRIVATE cxx_std_17)
+target_link_libraries(vm_copy_queue_check PRIVATE d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME vm_copy_queue_${adapter} COMMAND vm_copy_queue_check ${adapter})
+    set_tests_properties(vm_copy_queue_${adapter} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+endforeach()
 
 if(EXISTS "${INTAKE_PYTHON}")
     add_executable(rcas_coordinate_readback tests/rcas_coordinate_readback/readback.cpp)
