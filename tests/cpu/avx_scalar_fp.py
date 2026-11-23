@@ -29,6 +29,11 @@ extern "C" __declspec(dllexport) uint32_t host_has_avx() {
     if ((info[2] & need) != need) return 0u;
     return (_xgetbv(0) & 6u) == 6u ? 1u : 0u;
 }
+extern "C" __declspec(dllexport) uint32_t host_exchange_mxcsr(uint32_t next) {
+    const uint32_t current = _mm_getcsr();
+    _mm_setcsr(next);
+    return current;
+}
 """
 
 
@@ -112,7 +117,57 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
                 raise AssertionError(f"{name}({x}, {y}): native={got_n} lifted={got_l}")
             cases += 1
 
+    check_mxcsr(native, lifted)
     print(f"{cases} VEX AVX scalar FP/move/extract/insert/compare cases matched native and translated DLLs")
+
+
+def check_mxcsr(native, lifted):
+    exchange = lifted.host_exchange_mxcsr
+    exchange.argtypes = [ctypes.c_uint32]
+    exchange.restype = ctypes.c_uint32
+
+    def invoke(dll, name, fmt, x, y, mode):
+        a = ctypes.create_string_buffer(struct.pack(fmt, x), 32)
+        b = ctypes.create_string_buffer(struct.pack(fmt, y), 32)
+        dst = ctypes.create_string_buffer(32)
+        saved = exchange(mode)
+        try:
+            result = getattr(dll, name)(ctypes.addressof(a), ctypes.addressof(b), ctypes.addressof(dst))
+        finally:
+            status = exchange(saved) & 0x3f
+        return result, dst.raw, status
+
+    for suffix, fmt, signaling_nan, sign, quiet in (
+        ("ss", "<I", 0x7f801234, 0x80000000, 0x00400000),
+        ("sd", "<Q", 0x7ff0000000001234, 0x8000000000000000, 0x0008000000000000),
+    ):
+        round_name = f"vround{suffix}_op"
+        for name, x, y, mode, expected in (
+            (round_name, 0, signaling_nan, 0x1f80, signaling_nan | quiet),
+            (f"vmin{suffix}_op", 0, sign | 1, 0x1f80, sign | 1),
+            (f"vmin{suffix}_op", 0, sign | 1, 0x1fc0, sign),
+            (f"vmax{suffix}_op", 0, 1, 0x1f80, 1),
+            (f"vmax{suffix}_op", 0, 1, 0x1fc0, 0),
+        ):
+            actual = [invoke(dll, name, fmt, x, y, mode) for dll in (native, lifted)]
+            assert actual[0][1] == actual[1][1], (name, hex(mode), actual)
+            for _, output, _ in actual:
+                assert struct.unpack_from(fmt, output)[0] == expected, (name, hex(mode), output.hex())
+            if name == round_name:
+                assert all(status & 1 for _, _, status in actual), (name, actual)
+
+        for stem in ("vcomi", "vucomi"):
+            name = f"{stem}{suffix}_op"
+            for nan, invalid in ((signaling_nan, True), (signaling_nan | quiet, stem == "vcomi")):
+                actual = [invoke(dll, name, fmt, nan, 0, 0x1f80) for dll in (native, lifted)]
+                assert [(value, bool(status & 1)) for value, _, status in actual] == [(3, invalid)] * 2, (name, actual)
+
+    for mode, expected in ((0x1f80, 0xbff0000000000000), (0x1fc0, 0x8000000000000000)):
+        for dll in (native, lifted):
+            _, output, _ = invoke(dll, "vroundsd_op", "<Q", 0, 0x8000000000000001, mode)
+            assert struct.unpack_from("<Q", output)[0] == expected, (hex(mode), output.hex())
+    print("scalar rounding quiets signaling NaNs, DAZ affects MIN/MAX and round-down, and COMI/UCOMI invalid flags match")
+
 
 
 if __name__ == "__main__":
