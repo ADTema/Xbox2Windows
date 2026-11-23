@@ -498,13 +498,13 @@ The host contract supplies a read-only raw SRV at `t0, space1` containing the or
 
 The [source-built compute shader](../tests/spirv_window/subtract.spvasm) reads two distinct addresses, subtracts their words and writes to a third. Windows checks all 16 words of the arena, including guards, for eight cases. Swapping the two reads reverses the result; moving the store changes which guard is replaced. High addresses, misalignment, 64-bit index overflow and a write past the actual descriptor exercise the window bounds.
 
-The SPIR-V bridge GPU tests (`spirv_{address_window,sampler_views,ballot_extract,compare_sampler}_{hardware,warp}`)
+The SPIR-V bridge GPU tests (`spirv_{address_window,sampler_views,ballot_extract,compaction,compare_sampler}_{hardware,warp}`)
 need `spirv-as`, `spirv-val` and `spirv-cross`. `tools/setup-spirv-tools.ps1` builds them from pinned
 SPIRV-Tools, SPIRV-Headers and SPIRV-Cross revisions into `out/tools/spirv/bin`, where CMake looks
 first. It also searches `PATH` and `$env:VULKAN_SDK\Bin`. Without the tools, the tests are still
 registered and report a skip. Both Windows CI jobs build the pinned tools, cached by revision and MSVC
 toolset, and set `X2W_REQUIRE_SPIRV_TOOLS=1`, which turns a missing tool or a skip into a failure.
-A separate step then requires all four `_warp` tests to have passed. Physical-GPU runs stay manual.
+A separate step then requires all five `_warp` tests to have passed. Physical-GPU runs stay manual.
 
 ```powershell
 .\tools\setup-spirv-tools.ps1
@@ -514,6 +514,24 @@ ctest --preset dev --no-tests=error -R '^spirv_address_window_' -V
 ```
 
 With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. This also validates a combined fixture where a lowered ballot bit controls the value stored through the address window. The adapter reserves `%x2w_` identifiers in the input and gives address and ballot temporaries separate prefixes. The GPU check can also use WSL tools: generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 66 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_6 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
+
+### SPIR-V subgroup compaction across lane widths
+
+An optional experiment starts from the optional bridge fixture and compares a source-built subgroup compaction dispatch on a physical adapter and on WARP. The [SPIR-V module](../tests/spirv_window/compaction.spvasm) is one 64-thread group. It computes a sparse predicate from a 64-bit mask, ballots it with `OpGroupNonUniformBallot`, derives the first and last active lane and each lane's compaction rank, and writes the lane index, the observed lane width, the four ballot words, the active count, the selected lane's rank and the compacted payloads into separate output words. Compacted writes go to per-wave disjoint ranges keyed by rank, so the readback does not depend on workgroup or wave scheduling order; a repeated dispatch must be word-identical. The [direct desktop-HLSL control](../tests/spirv_window/compaction.hlsl) implements the same contract independently, so the bridge path and the direct path can be compared word for word. The CPU reference in `compaction.py` is recomputed with the lane width the shader observed, from an independent Python model of the ballot, first/last lanes, ranks and compaction.
+
+Two deterministic masks are injected into the fixture constants. Every 4-bit nibble of both masks has one bit set, so every wave of every supported width (4, 8, 16, 32 and 64) has an active lane. The negative controls flip the predicate bit selection and shift the compaction write index by one; the first divergent word must be the wave-0 ballot word (65) and the first compacted payload (257) respectively, otherwise the test fails.
+
+Measured with SPIRV-Tools 2025.5 (`262bdab`), SPIRV-Cross `57e4efc`, DXC 1.9.2609.5 and MSVC 19.50 on Windows 11 build 26300, debug layer unavailable: the RTX 4060 (driver 32.0.16.2124) reports a 32-lane wave and WARP 10.0.26100.10068 reports a 4-lane wave (`D3D12_OPTIONS1.WaveLaneCountMin/Max` are 4/4). Each adapter matched its own width-aware CPU reference in all 328 words for both masks, on both the bridge and the direct-HLSL path, and both negative controls were caught at the predicted first word. The first difference between the adapters is output word 4 (the lane index each group thread observed): the RTX 4060 wrote 4 where WARP wrote 0, and 259 words differ in total. A CPU reference computed at width 32 reports the same word 4 as the first mismatch against the WARP readback, so the difference is the subgroup width the shader runs at, not WARP ballot or compaction arithmetic. Neither adapter exposes a 64-lane wave here, so an intra-wave 31/32 ballot-word boundary is a capability skip; the 31/32 mask-bit boundary is still exercised across the two 32-lane waves.
+
+```powershell
+.\tools\setup-spirv-tools.ps1
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^spirv_compaction_' -V
+python -B tests/spirv_window/compaction.py out/tools/spirv/bin/spirv-as.exe out/tools/spirv/bin/spirv-val.exe out/tools/spirv/bin/spirv-cross.exe <dxc> out/build/dev/offscreen_check.exe hardware
+```
+
+`offscreen_check.exe <adapter> --spirv-compaction <dxil>` prints every one of the 328 observed words, so a mismatch can be placed before or after ballot, rank and address calculation.
 
 ## Offline CPU leaf recompilation
 
