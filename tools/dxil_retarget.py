@@ -659,13 +659,14 @@ def validate_pe_containers(
     import pefile
     from call_evidence import shader_containers
     from probe_roots import validate_shader
+    from xbox_intrinsic_gate import reaches_xbox
 
     raw = pe_path.read_bytes()
     with pefile.PE(data=raw, fast_load=True) as pe:
         containers = shader_containers(raw, pe, defaultdict(list))
         results = []
         skipped_non_dxil = 0
-        skipped_xbox_calls = 0
+        skipped_xbox_intrinsics = 0
 
         if output_dir is not None:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -680,8 +681,8 @@ def validate_pe_containers(
 
             before = validate_shader(probe, blob, secs[b"DXIL"], optional_modes=("module",))
             xbox_calls = before["ir"]["xbox_call_sites"]
-            if only_without_xbox_calls and xbox_calls:
-                skipped_xbox_calls += 1
+            if only_without_xbox_calls and reaches_xbox(before["ir"]["xbox_intrinsics"]):
+                skipped_xbox_intrinsics += 1
                 continue
 
             retargeted_blob, info = retarget_container(
@@ -751,7 +752,7 @@ def validate_pe_containers(
         "image_sha256": hashlib.sha256(raw).hexdigest(),
         "total_containers": len(containers),
         "skipped_non_dxil": skipped_non_dxil,
-        "skipped_xbox_calls": skipped_xbox_calls,
+        "skipped_xbox_intrinsics": skipped_xbox_intrinsics,
         "processed": len(results),
         "container_passed": sum(r["after"]["container_status"] == "0x00000000" for r in results),
         "module_passed": sum(r["after"]["module_status"] == "0x00000000" for r in results),
@@ -781,7 +782,8 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, help="Optional directory to write retargeted containers in --pe mode")
     parser.add_argument("--report", type=Path, help="Optional JSON report path in --pe mode")
     parser.add_argument("--only-without-xbox-calls", action="store_true",
-                        help="In --pe mode, process only DXIL modules with no direct xbox.* calls")
+                        help="In --pe mode, process only DXIL modules that neither call nor otherwise "
+                             "reach an xbox.* symbol")
     parser.add_argument("--source-triple", default=SOURCE_TRIPLE,
                         help=f"Source target triple to match (default: {SOURCE_TRIPLE}; '*' matches any)")
     parser.add_argument("--target-triple", default=DESKTOP_TRIPLE,

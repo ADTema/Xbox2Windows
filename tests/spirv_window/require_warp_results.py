@@ -8,7 +8,8 @@ missing from the report, skipped or failed fails this check.
 import sys
 import xml.etree.ElementTree as ET
 
-REQUIRED = [f"spirv_{name}_warp" for name in ("address_window", "sampler_views", "ballot_extract", "compare_sampler")]
+REQUIRED = [f"spirv_{name}_warp" for name in ("address_window", "sampler_views", "ballot_extract",
+                                               "compaction", "compare_sampler")]
 
 
 def statuses(junit):

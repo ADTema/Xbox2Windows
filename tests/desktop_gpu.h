@@ -12,6 +12,7 @@ Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D1
 void check_compute(ID3D12Device* device, bool tables);
 void check_sampler_views(ID3D12Device* device, const char* shader_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
+void check_spirv_compaction(ID3D12Device* device, const char* shader_path);
 void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, const char* ordinary_register,
                                  const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr);
@@ -29,6 +30,8 @@ bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*,
                            MeshConstantBinding = MeshConstantBinding::root,
                            MeshDrawMode = MeshDrawMode::color,
                            const MeshTextureProducers* = nullptr);
+void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const char* vertex,
+                              const char* pixel, const char* fixture);
 void check_texture_mips(ID3D12Device* device);
 void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);
 void check_sampled_coverage(ID3D12Device*, const char*, const char*);

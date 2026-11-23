@@ -398,6 +398,81 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(insns[0]["opcode"], expected_op)
             self.assertIn("<truncated>", insns[0]["assembly"])
 
+    def test_vop1_readfirstlane_b32_destination_is_an_sgpr(self):
+        # Issue #746: in VOP1 the vdst field of v_readfirstlane_b32 names an SGPR
+        # even though the mnemonic starts with "v_". LLVM for gfx1013 (triple
+        # amdgcn--amdpal) assembles `v_readfirstlane_b32 s2, v0` to this encoding
+        # and disassembles those bytes back to `v_readfirstlane_b32 s2, v0`.
+        record = disasm_rdna2(bytes.fromhex("0005047e"))[0]
+        self.assertEqual(record["opcode"], "v_readfirstlane_b32")
+        self.assertEqual(record["length"], 4)
+        self.assertEqual(record["assembly"], "v_readfirstlane_b32 s2, v0")
+
+        # The plain register form is the only shape the target assembles:
+        # `v_readfirstlane_b32 v2, v0` and `v_readfirstlane_b32 s2, s0` are both
+        # rejected with "invalid operand for instruction", so the source stays a
+        # VGPR and only the destination class is corrected.
+
+        # Keep a following s_endpgm in both controls.  The VOP1 control checks
+        # that the 32-bit instruction still ends at +4.
+        control = bytes.fromhex(
+            "0005047e"  # v_readfirstlane_b32 s2, v0
+            "000081bf"  # s_endpgm
+        )
+        self.assertEqual(
+            [(i["offset"], i["length"], i["opcode"], i["assembly"]) for i in disasm_rdna2(control)],
+            [
+                (0, 4, "v_readfirstlane_b32", "v_readfirstlane_b32 s2, v0"),
+                (4, 4, "s_endpgm", "s_endpgm"),
+            ],
+        )
+
+        # An intervening 32-bit instruction is an alignment control as well.
+        stream = bytes.fromhex(
+            "0005047e"  # v_readfirstlane_b32 s2, v0
+            "0103007e"  # v_mov_b32_e32 v0, v1
+            "000081bf"  # s_endpgm
+        )
+        self.assertEqual(
+            [(i["offset"], i["length"], i["opcode"], i["assembly"]) for i in disasm_rdna2(stream)],
+            [
+                (0, 4, "v_readfirstlane_b32", "v_readfirstlane_b32 s2, v0"),
+                (4, 4, "v_mov_b32_e32", "v_mov_b32_e32 v0, v1"),
+                (8, 4, "s_endpgm", "s_endpgm"),
+            ],
+        )
+
+        # Negative control: vdst == 2 in an ordinary VOP1 is still a VGPR.
+        self.assertEqual(
+            disasm_rdna2(bytes.fromhex("0103047e"))[0]["assembly"],
+            "v_mov_b32_e32 v2, v1",
+        )
+
+        # VOP3A control: gfx1013 does not assemble a VOP3A shape of this
+        # operation (`v_readfirstlane_b32_e64 s2, v0` fails with "e64 variant of
+        # this instruction is not supported") and llvm-mc reports the issue's
+        # bytes 020082d500010000 as an invalid instruction encoding.  The record
+        # keeps a distinct unsupported-encoding diagnostic, consumes exactly
+        # eight bytes, is neither recognized nor supported by the scanner (so a
+        # lowerer does not receive an instruction), and the following s_endpgm
+        # still decodes at +8.
+        vop3a = disasm_rdna2(bytes.fromhex(
+            "020082d500010000"  # proposed VOP3A word from issue #746 (invalid on gfx1013)
+            "000081bf"          # s_endpgm
+        ))
+        self.assertEqual(len(vop3a), 2)
+        self.assertEqual((vop3a[0]["offset"], vop3a[0]["length"]), (0, 8))
+        self.assertEqual(vop3a[0]["opcode"], "v_readfirstlane_b32_unsupported")
+        self.assertEqual(vop3a[0]["assembly"],
+                         "v_readfirstlane_b32 <unsupported VOP3A encoding>")
+        self.assertNotEqual(vop3a[0]["opcode"], "v_readfirstlane_b32")
+        self.assertFalse(is_opcode_recognized(vop3a[0]["opcode"]))
+        self.assertFalse(is_instruction_supported(vop3a[0]["assembly"]))
+        self.assertEqual(
+            (vop3a[1]["offset"], vop3a[1]["length"], vop3a[1]["opcode"]),
+            (8, 4, "s_endpgm"),
+        )
+
     def test_sopc_literal_keeps_the_following_instruction_aligned(self):
         # src1 == literal (255) makes the SOPC encoding 8 bytes. Without
         # consuming the literal dword, the following s_endpgm would be misread.
@@ -1204,6 +1279,9 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_mov_b32_e32 v2, 1.0",
             "v_mov_b32_e32 v3, 0.5",
             "v_mov_b32_e32 v4, 0",
+            # Issue #746: VOP1 destination is an SGPR; the LLVM 15 gfx1013 CI job
+            # assembles and disassembles this line in test_llvm_comparison.
+            "v_readfirstlane_b32 s2, v0",
             "v_cndmask_b32_e32 v3, v1, v2, vcc_lo",
             "v_add_f32_e32 v3, v1, v2",
             "v_sub_f32_e32 v3, v1, v2",
@@ -2246,6 +2324,37 @@ class TestRdna2Scanner(unittest.TestCase):
         for opcode in ("v_alignbit_b32", "v_alignbyte_b32"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
             self.assertTrue(is_opcode_recognized(opcode), opcode)
+        for line in (
+            "v_add3_u32 v1, v2, v3, v4",
+            "v_add3_u32_e64 v1, s2, v3, 4",
+            "v_or3_b32 v1, v2, v3, v4",
+            "v_xor3_b32 v1, v2, v3, v4",
+            "v_and_or_b32 v1, v2, v3, v4",
+            "v_xad_u32 v1, v2, v3, v4",
+            "v_lshl_or_b32 v1, v2, v3, v4",
+            "v_lshl_add_u32 v1, v2, v3, v4",
+            "v_add_lshl_u32 v1, v2, v3, v4",
+            "v_add_lshl_u32_e64 v1, s2, v3, 31",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_add3_u32_e32 v1, v2, v3, 4",
+            "v_or3_b32_e32 v1, v2, v3, 4",
+            "v_xor3_b32_e32 v1, v2, v3, 4",
+            "v_and_or_b32_e32 v1, v2, v3, 4",
+            "v_xad_u32_e32 v1, v2, v3, 4",
+            "v_lshl_or_b32_e32 v1, v2, v3, 4",
+            "v_lshl_add_u32_e32 v1, v2, v3, 4",
+            "v_add_lshl_u32_e32 v1, v2, v3, 4",
+            "v_add3_u32 v1, v2, v3",
+            "v_add3_u32 v1, v2, v3, 4, 5",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in (
+            "v_add3_u32", "v_or3_b32", "v_xor3_b32", "v_and_or_b32",
+            "v_xad_u32", "v_lshl_or_b32", "v_lshl_add_u32", "v_add_lshl_u32",
+        ):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
         for unsupported in ("v_cvt_f32_i32 v1, v2",
                             "v_cvt_f32_i32_e32 v1, v2 clamp",
                             "v_cvt_f32_u32_e64 v1, -v2",
@@ -2260,6 +2369,20 @@ class TestRdna2Scanner(unittest.TestCase):
                             "s_bfm_b32 s1, v2, s3",
                             "s_bfm_b32 s[2:3], s2, s3"):
             self.assertFalse(is_instruction_supported(unsupported), unsupported)
+
+        for line in ("v_swap_b32 v1, v2", "v_swap_b32_e32 v1, v2", "v_swap_b32 v1, v1", "v_swap_b32 v255, v254"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_swap_b32 v1, s2",
+                     "v_swap_b32 s1, v2",
+                     "v_swap_b32_e64 v1, v2",
+                     "v_swap_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                     "v_swap_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+                     "v_swap_b32 v1, v2 clamp",
+                     "v_swap_b32 v1, -v2",
+                     "v_swap_b32 v1",
+                     "v_swaprel_b32 v1, v2"):
+            self.assertFalse(is_instruction_supported(line), line)
+        self.assertTrue(is_opcode_recognized("v_swap_b32"))
 
         # Verify unsupported operands or spellings are rejected by scanner
         self.assertFalse(is_opcode_recognized("v_imaginary_opcode_sdwa"))
@@ -2281,6 +2404,23 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(0) lgkmcnt(0) vmcnt(1)"))
         self.assertFalse(is_instruction_supported("s_waitcnt lgkmcnt(0)lgkmcnt(1)"))
         self.assertFalse(is_instruction_supported("s_waitcnt expcnt(0) expcnt(1)"))
+
+    def test_sopk_waitcnt_forms(self):
+        """null with a count of 0..63 is supported for the three SOPK wait forms; an SGPR or larger count is not."""
+        for op in ("s_waitcnt_vmcnt", "s_waitcnt_lgkmcnt", "s_waitcnt_vscnt"):
+            for count in ("0x0", "0x3", "0x3f", "0", "1", "9", "10", "63"):
+                self.assertTrue(is_instruction_supported(f"{op} null, {count}"), (op, count))
+            for unsupported in ("s5, 0x1", "s0, 0x0", "vcc_lo, 0x0", "0x1", "null", "null, 0x40", "null, 64",
+                                "null, 0xffff", "null, 0x400", "null, -1", "null, invalid", "null,"):
+                self.assertFalse(is_instruction_supported(f"{op} {unsupported}"), (op, unsupported))
+        self.assertFalse(is_instruction_supported("s_waitcnt_depctr null, 0x0"))
+        decoded = disassemble_binary_shader(bytes.fromhex("00007dbc" "00007dbd" "0000fdbb" "000081bf"))
+        self.assertEqual(decoded, ["s_waitcnt_vmcnt null, 0x0", "s_waitcnt_lgkmcnt null, 0x0",
+                                   "s_waitcnt_vscnt null, 0x0", "s_endpgm"])
+        result = analyze_shader_instructions("sopk_wait", decoded)
+        self.assertEqual((result["supported_instructions"], result["unsupported_count"]), (4, 0))
+        result = analyze_shader_instructions("sopk_wait_sgpr", ["s_waitcnt_vmcnt s5, 0x1", "s_endpgm"])
+        self.assertEqual(result["unsupported_count"], 1)
 
     def test_gfx1013_waitcnt_expcnt_decode_and_lower(self):
         """Assemble/decode GFX1013 s_waitcnt_expcnt binary bytes and lower with pixel_aot."""

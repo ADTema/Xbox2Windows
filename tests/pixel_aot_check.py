@@ -41,6 +41,10 @@ VOP2_INT_OPS = (
 VOP3_ALIGN_OPS = (
     "v_alignbit_b32", "v_alignbyte_b32",
 )
+VOP3_TERNARY_INT_OPS = (
+    "v_add3_u32", "v_or3_b32", "v_xor3_b32", "v_and_or_b32",
+    "v_xad_u32", "v_lshl_or_b32", "v_lshl_add_u32", "v_add_lshl_u32",
+)
 # The 32-bit no-carry forms of nc_integer_group(1..3), as ACCEPTED records them (first word of the line).
 NC_INT_OPS = (
     "v_add_nc_u32_e32", "v_sub_nc_u32_e32", "v_subrev_nc_u32_e32",
@@ -826,6 +830,20 @@ def frexp_mant_values():
         "v_frexp_mant_f32_e64 v13, -|s45|",
         "v_frexp_mant_f32_e64 v14, |s46|",
         "v_frexp_mant_f32_e64 v15, s47 clamp",
+    ])
+
+
+def frexp_exp_values():
+    # Compare the integer exponent before the binary16 pixel export.
+    return with_constants([
+        "v_frexp_exp_i32_f32_e32 v18, s44",
+        "v_frexp_exp_i32_f32_e64 v19, -|s46|",
+        "v_mov_b32_e32 v15, 1.0",
+        "v_cmp_eq_i32_e32 vcc_lo, s45, v18",
+        "v_cndmask_b32_e32 v12, 0, v15, vcc_lo",
+        "v_cmp_eq_i32_e32 vcc_lo, s47, v19",
+        "v_cndmask_b32_e32 v13, 0, v15, vcc_lo",
+        "v_mov_b32_e32 v14, 0",
     ])
 
 
@@ -2858,6 +2876,45 @@ def check_scalar_leading_bit_draw(directory, compiler, renderer, backend):
         raise AssertionError("Unsigned leading-bit scan matched the signed reference")
 
 
+def scalar_first_bit_values(width):
+    src = "s44" if width == 32 else "s[44:45]"
+    body = []
+    for bit in (0, 1):
+        body.extend([
+            "s_cmp_eq_u32 s44, s45",
+            f"s_ff{bit}_i32_b{width} s62, {src}",
+            "s_cselect_b32 s63, 0x3f800000, 0", f"v_mov_b32_e32 v{14 + bit}, s63",
+            f"s_cmp_eq_u32 s62, s{46 + bit}",
+            "s_cselect_b32 s63, 0x3f800000, 0", f"v_mov_b32_e32 v{12 + bit}, s63",
+        ])
+    return with_constants(body)
+
+
+def check_scalar_first_bit_draw(directory, compiler, renderer, backend):
+    source, shader, case = (directory / name for name in ("first-bit.hlsl", "first-bit.cso", "first-bit.case"))
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for width in (32, 64):
+        source.write_text(translate(scalar_first_bit_values(width)), encoding="ascii")
+        compile_shader(compiler, source, shader, ieee=False)
+        for lo, hi in ((0, 0), (0xffffffff, 0xffffffff), (0xffffffff, 0xfffffffe),
+                       (0x80000000, 1), (0, 1), (0, 0x80000000)):
+            word = lo if width == 32 else lo | (hi << 32)
+            expected = [next((i for i in range(width) if (word >> i) & 1 == bit), 0xffffffff)
+                        for bit in (0, 1)]
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, lo, hi, *expected)
+            case.write_bytes(constants + struct.pack("<4f", 1, 1, lo == hi, lo == hi) * 64)
+            subprocess.run(draw, check=True)
+    # For the final input, scanning only the low word misses the set bit at position 63.
+    program = [line.replace("s_ff1_i32_b64 s62, s[44:45]", "s_ff1_i32_b32 s62, s44")
+               for line in scalar_first_bit_values(64)]
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Ignoring the high word escaped detection")
+
+
 def scalar_bit_count_values(width):
     src = "s44" if width == 32 else "s[44:45]"
     body = []
@@ -3173,6 +3230,72 @@ def plain_bitscan_reference(words):
             (plain_ffbl(s44), plain_ffbh_u(s45), xnor(s46, PLAIN_BITSCAN_LITERAL), plain_rev(s47)))
 
 
+
+# v_swap_b32: s44..s47 move to v18..v21 through float VGPRs, so every word is a normal binary32 pattern (no
+# subnormal, infinity or NaN) and the four words of a set are distinct.
+SWAP_WORDS = (
+    (0x3f800000, 0x40000000, 0x40400000, 0x40800000),
+    (0xc2f6e979, 0x41200000, 0x3dcccccd, 0x7f000000),
+    (0x00800000, 0x80800000, 0x3f000000, 0x12345678),
+    (0x9abcdef0, 0x7f7fffff, 0xff7fffff, 0x0dedbeef),
+)
+
+SWAP_BODY = [
+    "v_mov_b32_e32 v18, s44",
+    "v_mov_b32_e32 v19, s45",
+    "v_mov_b32_e32 v20, s46",
+    "v_mov_b32_e32 v21, s47",
+    "v_swap_b32 v18, v19",
+    "v_swap_b32 v20, v21",
+    "v_swap_b32 v18, v20",
+    "v_swap_b32 v21, v21",
+    "v_mov_b32_e32 v12, v18",
+    "v_mov_b32_e32 v13, v19",
+    "v_mov_b32_e32 v14, v20",
+    "v_mov_b32_e32 v15, v21",
+]
+
+
+def swap_ops(body=None) -> list[str]:
+    return uncompressed_export(list(SWAP_BODY if body is None else body))
+
+
+def swap_ops_reference(words):
+    """a b c d -> swap(1,2): b a c d -> swap(3,4): b a d c -> swap(1,3): d a b c -> self swap: d a b c."""
+    a, b, c, d = words
+    return (d, a, b, c)
+
+
+def swap_emulate(body, words):
+    """Independent model of the body's moves and swaps on Python integers; the other lines are not needed here."""
+    regs = dict(zip(("s44", "s45", "s46", "s47"), words))
+    for line in body:
+        op, _, operands = line.partition(" ")
+        args = operands.split(", ")
+        if op == "v_swap_b32":
+            regs[args[0]], regs[args[1]] = regs[args[1]], regs[args[0]]
+        elif op == "v_mov_b32_e32":
+            regs[args[0]] = regs[args[1]]
+        else:
+            raise AssertionError(line)
+    return tuple(regs[f"v{n}"] for n in range(12, 16))
+
+
+def swap_mutants():
+    """Wrong lowerings of the same body: (label, mutated body)."""
+    swaps = [i for i, line in enumerate(SWAP_BODY) if line.startswith("v_swap_b32")]
+    one_way = list(SWAP_BODY)
+    one_way[swaps[0]] = "v_mov_b32_e32 v18, v19"
+    no_snapshot = list(SWAP_BODY)
+    no_snapshot[swaps[0]:swaps[0] + 1] = ["v_mov_b32_e32 v18, v19", "v_mov_b32_e32 v19, v18"]
+    reordered = list(SWAP_BODY)
+    reordered[swaps[1]], reordered[swaps[2]] = reordered[swaps[2]], reordered[swaps[1]]
+    no_self = list(SWAP_BODY)
+    no_self[swaps[3]] = "v_mov_b32_e32 v21, v20"
+    return (("one-way copy", one_way), ("no snapshot", no_snapshot), ("reordered chain", reordered),
+            ("self swap as copy", no_self))
+
+
 def scalar():
     return with_constants(scalar_body())
 
@@ -3465,6 +3588,53 @@ def check_scalar_controls():
         changed = [line.replace(old, new) for line in bitscan_program]
         assert changed != bitscan_program, new
         expect_value_error(translate_int, changed, message)
+
+
+
+    # v_swap_b32: the independent model matches the reference, and every wrong lowering changes the result.
+    swap_program = swap_ops()
+    swap_source = translate_int(swap_program)
+    assert "v_swap_b32 v18, v19" in swap_program
+    for words in SWAP_WORDS:
+        assert len(set(words)) == 4 and all(0 < (w >> 23 & 0xff) < 0xff for w in words), words
+        assert swap_emulate(SWAP_BODY, words) == swap_ops_reference(words) != words
+    for label, body in swap_mutants():
+        assert body != SWAP_BODY, label
+        assert any(swap_emulate(body, words) != swap_ops_reference(words) for words in SWAP_WORDS), label
+        assert translate_int(swap_ops(body)) != swap_source, label
+    # A self swap is accepted and is a no-op: the program is the same as with an s_nop in its place.
+    nop_body = [("s_nop 0" if line == "v_swap_b32 v21, v21" else line) for line in SWAP_BODY]
+    assert nop_body != SWAP_BODY
+    assert translate_int(swap_ops(nop_body)) == swap_source
+    for old, new, message in (
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, s44", "Unsupported instruction"),  # SGPR source
+            ("v_swap_b32 v18, v19", "v_swap_b32 s44, v19", "Unsupported instruction"),  # SGPR destination
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, 1", "Unsupported instruction"),  # inline constant
+            ("v_swap_b32 v18, v19", "v_swap_b32_e64 v18, v19", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32_dpp v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+             "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32_sdwa v18, v19 dst_sel:DWORD dst_unused:UNUSED_PAD "
+             "src0_sel:DWORD src1_sel:DWORD", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, -v19", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, v19 clamp", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, v19, v20", "Unsupported instruction"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v256, v19", "Invalid register swap"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, v256", "Invalid register swap"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v18, v40", "Expected a numeric register"),  # never written
+            ("v_swap_b32 v18, v19", "v_swap_b32 v40, v19", "Expected a numeric register"),
+            ("v_swap_b32 v18, v19", "v_swap_b32 v0, v19", "Expected a numeric register"),  # barycentric, not numeric
+            ("v_swap_b32 v21, v21", "v_swap_b32 v40, v40", "Expected a numeric register")):
+        changed = [line.replace(old, new) for line in SWAP_BODY]
+        assert changed != SWAP_BODY, new
+        expect_value_error(translate_int, swap_ops(changed), message)
+    # The sample in v12..v15 is outstanding before its vmcnt wait: a swap touching it must be refused.
+    wait = swap_program.index("s_waitcnt vmcnt(0)")
+    for bad in ("v_swap_b32 v12, v13", "v_swap_b32 v13, v12"):
+        expect_value_error(translate_int, swap_program[:wait] + [bad] + swap_program[wait:],
+                           "Swap overlaps an outstanding sample")
+    # Once the wait has completed it, the same swap is accepted.
+    translate_int(swap_ops(["v_swap_b32 v12, v13"] + SWAP_BODY))
 
     quadmask_source = translate_int(quadmask_bitreplicate_program("s_quadmask_b32"))
     assert "s_quadmask_b32(" in quadmask_source, quadmask_source
@@ -4901,6 +5071,45 @@ def align_reference(a, b, count, byte=False):
     return tuple((joined >> (shift * (8 if byte else 1))) & 0xffffffff for shift in shifts)
 
 
+def vop3_ternary_int_group(group=1, mutated=False) -> list[str]:
+    if group == 1:
+        ops = (
+            ("v_xor3_b32", "v_and_or_b32", "v_add3_u32", "v_or3_b32")
+            if mutated
+            else ("v_add3_u32", "v_or3_b32", "v_xor3_b32", "v_and_or_b32")
+        )
+    else:
+        ops = (
+            ("v_lshl_add_u32", "v_add_lshl_u32", "v_xad_u32", "v_lshl_or_b32")
+            if mutated
+            else ("v_xad_u32", "v_lshl_or_b32", "v_lshl_add_u32", "v_add_lshl_u32")
+        )
+    return uncompressed_export([
+        "v_mov_b32_e32 v18, s45",
+        f"{ops[0]} v12, s44, v18, s46",
+        f"{ops[1]} v13, s44, v18, s46",
+        f"{ops[2]} v14, s44, v18, s46",
+        f"{ops[3]} v18, s44, v18, s46",
+        "v_mov_b32_e32 v15, v18",
+    ])
+
+
+def vop3_ternary_int_reference(group, a, b, c):
+    if group == 1:
+        return (
+            (a + b + c) & 0xffffffff,
+            (a | b | c) & 0xffffffff,
+            (a ^ b ^ c) & 0xffffffff,
+            ((a & b) | c) & 0xffffffff,
+        )
+    return (
+        ((a ^ b) + c) & 0xffffffff,
+        ((a << (b & 31)) | c) & 0xffffffff,
+        ((a << (b & 31)) + c) & 0xffffffff,
+        (((a + b) & 0xffffffff) << (c & 31)) & 0xffffffff,
+    )
+
+
 # Bodies for uncompressed_export(): s44 = A and s45 = B from the constants, v18 = B, and each channel v12..v15
 # holds its own result. Group 3 uses inline constants and register-first operands.
 NC_INT_BODIES = {
@@ -5607,6 +5816,90 @@ def check_nc_integer_lowering():
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
 
 
+def sopk_wait_program():
+    """The sampled program with every wait spelled as a gfx10 SOPK wait, plus a store-counter wait."""
+    spelled = {"s_waitcnt lgkmcnt(0)": "s_waitcnt_lgkmcnt null, 0x0", "s_waitcnt vmcnt(0)": "s_waitcnt_vmcnt null, 0x0"}
+    program = [spelled.get(line, line) for line in assembly(False)]
+    program.insert(program.index("s_waitcnt_vmcnt null, 0x0") + 1, "s_waitcnt_vscnt null, 0x0")
+    return program
+
+
+def check_sopk_waitcnt(program):
+    """The gfx10 SOPK wait forms with null act like the s_waitcnt tokens; vscnt is a no-op."""
+    def same(function, old, token_line, new, source):
+        """The new spelling must give the same HLSL as the token form, or be rejected as it is."""
+        token = [token_line if line == old else line for line in source]
+        sopk = [new if line == old else line for line in source]
+        try:
+            expected = function(token)
+        except ValueError:
+            must_reject(function, sopk)
+            return None
+        assert function(sopk) == expected
+        return expected
+
+    for count in ("0", "1", "2", "63"):
+        for spelling in (f"s_waitcnt_vmcnt null, 0x{int(count):x}", f"s_waitcnt_vmcnt null, {count}"):
+            same(translate, "s_waitcnt vmcnt(0)", f"s_waitcnt vmcnt({count})", spelling, program)
+        for spelling in (f"s_waitcnt_lgkmcnt null, 0x{int(count):x}", f"s_waitcnt_lgkmcnt null, {count}"):
+            same(translate, "s_waitcnt lgkmcnt(0)", f"s_waitcnt lgkmcnt({count})", spelling, program)
+    # Full drain gives the baseline output; a partial count leaves the sample or the descriptor load
+    # outstanding, so the single-sample program refuses it (the dependent use is not covered).
+    base = translate(program)
+    assert same(translate, "s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(0)", "s_waitcnt_vmcnt null, 0x0", program) == base
+    assert same(translate, "s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(0)", "s_waitcnt_lgkmcnt null, 0x0", program) == base
+    must_reject(translate, [("s_waitcnt_vmcnt null, 0x1" if line == "s_waitcnt vmcnt(0)" else line) for line in program])
+    must_reject(translate, [("s_waitcnt_lgkmcnt null, 0x1" if line == "s_waitcnt lgkmcnt(0)" else line) for line in program])
+    # Partial counts with two outstanding samples behave like vmcnt(1).
+    partial = dual_program("partial")
+    wait = partial.index("s_waitcnt vmcnt(1)")
+    legal = same(translate_dual, "s_waitcnt vmcnt(1)", "s_waitcnt vmcnt(1)", "s_waitcnt_vmcnt null, 0x1", partial)
+    assert legal is not None and legal == translate_dual(partial)
+    for early_use in ("v_mov_b32_e32 v24, v20", "v_mov_b32_e32 v20, v12", "v_mov_b32_e32 v20, 0"):
+        changed = partial.copy()
+        changed[wait] = "s_waitcnt_vmcnt null, 0x1"
+        changed.insert(wait + 1, early_use)
+        must_reject(translate_dual, changed)
+    for count in ("0x2", "0x3f"):
+        changed = partial.copy()
+        changed[wait] = f"s_waitcnt_vmcnt null, {count}"
+        must_reject(translate_dual, changed)
+    # A later, larger wait after draining does not invalidate completed samples.
+    end_wait = partial.index("s_waitcnt vmcnt(0)")
+    translate_dual(partial[:end_wait + 1] + ["s_waitcnt_vmcnt null, 0x3f"] + partial[end_wait + 1:])
+    # vscnt: nothing is outstanding on the store counter, so it is accepted anywhere before the export
+    # and changes nothing.
+    export = next(i for i, line in enumerate(program) if line.startswith("exp "))
+    # HLSL temporaries are named after the index of the instruction defining them, so an insertion
+    # shifts later names; renumber by first appearance before comparing. After the last definition
+    # the output must be byte-identical.
+    def renumbered(source):
+        names = {}
+        return re.sub(r"\b(sample|alu)\d+\b", lambda m: names.setdefault(m[0], f"{m[1]}#{len(names)}"), source)
+
+    for form in ("s_waitcnt_vscnt null, 0x0", "s_waitcnt_vscnt null, 0", "s_waitcnt_vscnt null, 0x3f"):
+        for at in range(export + 1):
+            assert renumbered(translate(program[:at] + [form] + program[at:])) == renumbered(base), (form, at)
+        assert translate(program[:export] + [form] + program[export:]) == base, form
+    must_reject(translate, program + ["s_waitcnt_vscnt null, 0x0"])
+    assert translate(sopk_wait_program()) == base
+    # Refusals, with exact messages.
+    for counter, label in (("vmcnt", "VM"), ("lgkmcnt", "LGKM"), ("vscnt", "VS")):
+        for operand in ("s5", "s0", "vcc_lo", "m0", "0"):
+            expect_value_error(translate, [f"s_waitcnt_{counter} {operand}, 0x1"] + program,
+                               f"Unsupported s_waitcnt_{counter} SGPR operand (only null is modelled): "
+                               f"s_waitcnt_{counter} {operand}, 0x1")
+        for count in ("0x40", "64", "0xffff"):
+            expect_value_error(translate, [f"s_waitcnt_{counter} null, {count}"] + program,
+                               f"{label} wait count exceeds the gfx10 six-bit field")
+        for bad in (f"s_waitcnt_{counter}", f"s_waitcnt_{counter} null", f"s_waitcnt_{counter} null,",
+                    f"s_waitcnt_{counter} 0x1", f"s_waitcnt_{counter} null, null", f"s_waitcnt_{counter} null, -1",
+                    f"s_waitcnt_{counter} null, 05", f"s_waitcnt_{counter} null, 0x1, 0x2"):
+            expect_value_error(translate, [bad] + program, f"Malformed s_waitcnt_{counter} operands: {bad}")
+    # The neighbouring SOPK wait spelling stays unsupported.
+    must_reject(translate, ["s_waitcnt_depctr 0x0"] + program)
+
+
 def check_controls(directory):
     # A syntactically valid DPP VGPR must already have a tracked numeric value.
     must_reject(translate, with_constants([
@@ -5740,6 +6033,30 @@ def check_controls(directory):
         "v_alignbyte_b32 v12, s44, v18, 1 clamp",
     ):
         must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_align]))
+    vop3_source = "\n".join(translate_int(vop3_ternary_int_group(group)) for group in (1, 2))
+    assert set(VOP3_TERNARY_INT_OPS) <= ACCEPTED
+    for expected in (
+        "(asuint(params[0].w) + asuint(alu20) + asuint(params[1].y))",
+        "(asuint(params[0].w) | asuint(alu20) | asuint(params[1].y))",
+        "(asuint(params[0].w) ^ asuint(alu20) ^ asuint(params[1].y))",
+        "((asuint(params[0].w) & asuint(alu20)) | asuint(params[1].y))",
+        "((asuint(params[0].w) ^ asuint(alu20)) + asuint(params[1].y))",
+        "((asuint(params[0].w) << (asuint(alu20) & 31u)) | asuint(params[1].y))",
+        "((asuint(params[0].w) << (asuint(alu20) & 31u)) + asuint(params[1].y))",
+        "((asuint(params[0].w) + asuint(alu20)) << (asuint(params[1].y) & 31u))",
+    ):
+        assert expected in vop3_source, expected
+    for op in VOP3_TERNARY_INT_OPS:
+        for bad_vop3 in (
+            f"{op}_e32 v12, s44, v18, s46",
+            f"{op} v12, s44, v18",
+            f"{op} v12, s44, v18, s46, 5",
+            f"{op} v256, s44, v18, s46",
+            f"{op} v12, abs(s44), v18, s46",
+            f"{op} v12, s44, -v18, s46",
+            f"{op} v12, s44, v18, s46 clamp",
+        ):
+            must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop3]))
     check_nc_integer_lowering()
     check_e64_integer_lowering()
     check_sdwa_integer_lowering()
@@ -6190,6 +6507,7 @@ def check_controls(directory):
     must_reject(translate, ["s_waitcnt_expcnt invalid"] + program)
     must_reject(translate, ["s_waitcnt_expcnt null, invalid"] + program)
     must_reject(translate, ["s_waitcnt expcnt(8)"] + program)
+    check_sopk_waitcnt(program)
 
     wait = program.index("s_waitcnt vmcnt(0)")
     overwrite = "v_floor_f32_e32 v13, 1.0"
@@ -6593,6 +6911,13 @@ def check_controls(directory):
     assert "frexp_mant32(params[0].w)" in frexp_body, frexp_body
     assert "frexp_mant32((-abs(params[1].x)))" in frexp_body, frexp_body
     assert "saturate(frexp_mant32(params[1].z))" in frexp_body, frexp_body
+    frexp_exp_body = translate(frexp_exp_values()).split("float4 main", 1)[1]
+    assert "asfloat(frexp_exp32(params[0].w))" in frexp_exp_body, frexp_exp_body
+    assert "asfloat(frexp_exp32(params[1].y))" in frexp_exp_body, frexp_exp_body
+    must_reject(translate, [
+        line + " clamp" if line.startswith("v_frexp_exp_i32_f32_e64 ") else line
+        for line in frexp_exp_values()
+    ])
     ldexp_body = translate(ldexp_values()).split("float4 main", 1)[1]
     assert "ldexp32(alu20, asint(params[1].x))" in ldexp_body, ldexp_body
     assert "ldexp32((-abs(params[0].w)), asint(2u))" in ldexp_body, ldexp_body
@@ -6722,6 +7047,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate), (sopk_scalar(), translate), (sopk_cmpk_cmovk(), translate_int)]
     fixtures.extend((align_integer_group(byte), translate_int) for byte in (False, True))
+    fixtures.extend((vop3_ternary_int_group(group), translate_int) for group in (1, 2))
     fixtures.append((rgb_sample(), translate))
     fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
@@ -6730,6 +7056,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((bfm_scalar_ops(), translate_int))
     fixtures.append((brev_scalar_ops(), translate_int))
     fixtures.extend((plain_bitscan_ops(second), translate_int) for second in (False, True))
+    fixtures.append((swap_ops(), translate_int))
     fixtures.extend((quadmask_bitreplicate_program(op), translate_int)
                     for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
     fixtures.append((scalar_select64(), translate_int))
@@ -6739,13 +7066,14 @@ def check_binary(directory, assembler, objcopy, library):
         ))
     fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
     fixtures.extend((scalar_bit_count_values(width), translate) for width in (32, 64))
+    fixtures.extend((scalar_first_bit_values(width), translate) for width in (32, 64))
     fixtures.extend((scalar_carry_chain(subtract), translate_int) for subtract in (False, True))
     fixtures.extend((scalar_leading_bit_values(width), translate) for width in (32, 64))
     fixtures.append((scalar_mul_hi_values(), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
     fixtures.append((fract_values(), translate))
-    fixtures.extend([(frexp_mant_values(), translate), (ldexp_values(), translate)])
+    fixtures.extend((program(), translate) for program in (frexp_mant_values, frexp_exp_values, ldexp_values))
     fixtures.append((mul24_values(), translate))
     fixtures.append((three_way(), translate))
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
@@ -6795,6 +7123,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((with_constants(body), translate) for body in (SDWA_PRESERVE_BODY, SDWA_PAD_BODY))
     exp_sync_program = ["s_waitcnt_expcnt null, 0"] + assembly(False)[:-1] + ["s_waitcnt_expcnt null, 0", "s_endpgm"]
     fixtures.append((exp_sync_program, translate))
+    fixtures.append((sopk_wait_program(), translate))
     fixtures.append((with_constants(DOT_BODY), translate, "gfx1030"))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000)), translate))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True)), translate))
@@ -7092,6 +7421,34 @@ def check_align_draws(directory, compiler, renderer, backend):
             compile_shader(compiler, source, shader)
             batch = [(path, "mismatch" if swapped else status) for path, status in cases]
             if not swapped:
+                batch.insert(1, (wrong, "mismatch"))
+            run_pixel_batch(renderer, backend, shader, batch)
+
+
+def check_vop3_ternary_int_draws(directory, compiler, renderer, backend):
+    source, shader = directory / "vop3_int.hlsl", directory / "vop3_int.cso"
+    pairs = ((0x12345678, 0x23456789), (0x456789ab, 0x11223344), (0x89abcdef, 0x91234567))
+    counts = (0, 1, 2, 3, 4, 8, 16, 24, 31, 32)
+    for group in (1, 2):
+        cases = []
+        for a, b in pairs:
+            for c in counts:
+                constants = bytearray(256)
+                struct.pack_into("<3I", constants, 12, a, b, c)
+                words = vop3_ternary_int_reference(group, a, b, c)
+                assert all(binary32_normal_or_zero(w) for w in (a, b, *words))
+                path = directory / f"vop3_int-{group}-{len(cases)}.case"
+                path.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+                cases.append((path, "pass"))
+        wrong = directory / f"vop3_int-wrong-{group}.case"
+        data = bytearray(cases[0][0].read_bytes())
+        data[256] ^= 1
+        wrong.write_bytes(data)
+        for mutated in (False, True):
+            source.write_text(translate_int(vop3_ternary_int_group(group, mutated)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            batch = [(path, "mismatch" if mutated else status) for path, status in cases]
+            if not mutated:
                 batch.insert(1, (wrong, "mismatch"))
             run_pixel_batch(renderer, backend, shader, batch)
 
@@ -8004,6 +8361,40 @@ def check_buffer_color_draw(directory, compiler, renderer, backend):
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError("Wrong buffer color escaped detection")
+# Powers of two, subnormal endpoints, the largest finite value, and special inputs.
+FREXP_EXP_CASES = (
+    (0x3F800000, 1, 0xBE800000, -1),
+    (0x00000001, -148, 0x007FFFFF, -126),
+    (0x00800000, -125, 0x7F7FFFFF, 128),
+    (0x00000000, 0, 0x80000000, 0),
+    (0x7F800000, 0, 0xFF800000, 0),
+    (0x7FC12345, 0, 0xFFC12345, 0),
+)
+
+
+def check_frexp_exp_draws(directory, compiler, renderer, backend):
+    source = directory / "frexp_exp.hlsl"
+    shader = directory / "frexp_exp.cso"
+    case = directory / "frexp_exp.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(frexp_exp_values()), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+
+    def set_case(a, exponent_a, b, exponent_b):
+        constants = bytearray(256)
+        struct.pack_into("<IiIi", constants, 12, a, exponent_a, b, exponent_b)
+        case.write_bytes(constants + struct.pack("<4f", 1.0, 1.0, 0.0, 1.0) * 64)
+
+    for values in FREXP_EXP_CASES:
+        set_case(*values)
+        subprocess.run(draw, check=True)
+    a, exponent_a, b, exponent_b = FREXP_EXP_CASES[1]
+    set_case(a, exponent_a + 1, b, exponent_b)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("The draw accepted an incorrect subnormal exponent")
+
+
 def check_unpack_byte_draws(directory, compiler, renderer, backend):
     instructions = unpack_bytes()
     source = directory / "ubyte.hlsl"
@@ -9059,6 +9450,34 @@ def check_plain_bitscan_draw(directory, compiler, renderer, backend):
         source.write_text(translate_int(mutated), encoding="ascii")
         compile_shader(compiler, source, shader)
         statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, cases[fixture])
+
+
+
+def check_swap_draw(directory, compiler, renderer, backend):
+    """v_swap_b32 chain against the Python reference, then wrong lowerings that must mismatch."""
+    source = directory / "swap.hlsl"
+    shader = directory / "swap.cso"
+
+    def write_cases(prefix):
+        cases = []
+        for idx, words in enumerate(SWAP_WORDS):
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *words)
+            case = directory / f"{prefix}-{idx}.case"
+            write_case(case, bytes(constants), tuple(as_float(word) for word in swap_ops_reference(words)),
+                       integer_rt=True)
+            cases.append(case)
+        return cases
+
+    cases = write_cases("swap")
+    source.write_text(translate_int(swap_ops()), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases])
+    for label, body in swap_mutants():
+        assert any(swap_emulate(body, words) != swap_ops_reference(words) for words in SWAP_WORDS), label
+        source.write_text(translate_int(swap_ops(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, cases)
         if "mismatch" not in statuses:
             raise AssertionError(f"Mutating {label} escaped detection")
 
@@ -9094,7 +9513,9 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
-                    "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align", "draw-sdwa-integer", "draw-plain-bitscan", "draw-mac-legacy"):
+                    "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
+                    "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
+                    "draw-mac-legacy"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -9105,8 +9526,24 @@ def main():
                         "draw-brev": check_brev_draw,
                         "draw-align": check_align_draws,
                         "draw-plain-bitscan": check_plain_bitscan_draw,
+                        "draw-vop3-ternary-int": check_vop3_ternary_int_draws,
+                        "draw-swap": check_swap_draw,
                         "draw-mac-legacy": check_mac_legacy_draws}[mode]
                 return draw(directory, *args)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
+                    return 77
+                raise
+        if mode == "draw-first-bit":
+            try:
+                return check_scalar_first_bit_draw(directory, *args)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
+                    return 77
+                raise
+        if mode == "draw-frexp-exp":
+            try:
+                return check_frexp_exp_draws(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
                     return 77
