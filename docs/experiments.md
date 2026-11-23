@@ -2317,6 +2317,15 @@ the old word to the destination VGPR. The fixtures compare old and new words
 and exercise successful and unsuccessful comparisons. Reversing the comparison
 operands, masking the OR operand or omitting the exchange must mismatch at word 1.
 
+Five private qword updates operate on an initialized pair of record slots
+at byte offset 0 or 8. `ds_add_u64`, `ds_sub_u64` and `ds_rsub_u64` update
+modulo 2^64 using a low-word carry or borrow. `ds_and_b64` and `ds_or_b64`
+update both words independently. Fixtures read back the pair at offset 8
+and cover both outcomes of the carry and borrow tests. Discarding carry or
+borrow, or interchanging the bitwise operations, must change the readback.
+Run these variants with `ctest --preset dev --no-tests=error -R
+'^compute_store_aot_lds_qword_(warp|hardware)$' -V`.
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must

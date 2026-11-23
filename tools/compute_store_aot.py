@@ -471,6 +471,34 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Uninitialized private wide LDS word")
             vector.update(zip(range(first, last + 1), (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
+        elif m := re.fullmatch(r"ds_(add_u64|sub_u64|rsub_u64|and_b64|or_b64) v(\d+), "
+                               r"v\[(\d+):(\d+)\](?: offset:(0|8))?", line):
+            op = m[1]
+            addr, first, last = map(int, m.groups()[1:4])
+            slot = int(m[5] or 0) // 4
+            source = (vector.get(first), vector.get(last))
+            previous = (lds_wide_words.get(slot), lds_wide_words.get(slot + 1))
+            if (guard_span is not None or vector.get(addr) != ("lds_wide_address",)
+                    or last > 255 or last != first + 1 or not all(map(is_word, previous + source))):
+                raise ValueError("Unverified private wide LDS update")
+            left, right = (source, previous) if op == "rsub_u64" else (previous, source)
+            lo, hi = map(hlsl_word, left)
+            rhs_lo, rhs_hi = map(hlsl_word, right)
+            if op in ("and_b64", "or_b64"):
+                symbol = "&" if op == "and_b64" else "|"
+                low = f"({lo} {symbol} {rhs_lo})"
+                high = f"({hi} {symbol} {rhs_hi})"
+            elif op == "add_u64":
+                low = f"({lo} + {rhs_lo})"
+                high = f"({hi} + {rhs_hi} + uint({low} < {lo}))"
+            else:
+                low = f"({lo} - {rhs_lo})"
+                high = f"({hi} - {rhs_hi} - uint({lo} < {rhs_lo}))"
+            if max(len(low), len(high)) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("LDS expression exceeds the profile limit")
+            lds_wide_words[slot] = ("alu", low)
+            lds_wide_words[slot + 1] = ("alu", high)
+            ds_wait = True
         elif m := re.fullmatch(r"ds_write_b(8|16|32) v(\d+), v(\d+)(?: offset:([0-3]))?", line):
             width, addr, src = map(int, m.groups()[:3])
             offset = int(m[4] or 0)
