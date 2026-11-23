@@ -1392,9 +1392,11 @@ ctest --preset dev --no-tests=error -R '^cpu_native_tls$' -V
 
 ### Implicit TLS values on the main and worker threads
 
-`cpu_tls_value` is a source-built DLL with one `__declspec(thread)` value (`7`). Its TLS callback (caller 1) and entry point (caller 2) each report the observed value in the sink's reserved slot. `cpu_native_tls_value` loads the image with `LoadLibraryW` and maps it with `pe_map`, each in a fresh child process, reads the value on the main thread, runs one worker thread whose start routine returns its own TLS value, joins it with a 10 s limit, and compares the sink events with raw thread IDs translated to semantic identities (`main`/`worker`) so two processes can be compared without comparing raw OS thread IDs. A worker timeout, a missing callback, or an unexpected value fails the test. The empty-template `cpu_tls_original` fixture is the control: it must load under both loaders.
+`cpu_tls_value` is a source-built DLL with one `__declspec(thread)` value (`7`) and an 8 KiB `__declspec(thread)` array of distinct words in the same initialized template, so the template spans at least one 4 KiB page boundary. Two TLS callbacks, in `.CRT$XLB` (caller 1) and `.CRT$XLM` (caller 3), and the entry point (caller 2) each report the observed state in the sink's reserved slot: the value in the low 16 bits and the number of array words that differ from the template above them, so a block copied from the template reports 7. `cpu_native_tls_value` first checks with `pefile` that the array crosses a page boundary inside the template and that both callbacks appear in the callback table in that order. It then loads the image with `LoadLibraryW` and maps it with `pe_map`, each in a fresh child process. The child checks that the template in the loaded image matches the file, observes the main thread's copy and writes 20 to it, then runs two workers that are alive at the same time: worker A observes, writes 50 and waits, worker B starts after A's write, observes, writes 60 and waits, and then both observe again. Workers are joined with a 10 s limit. Sink events are kept in call order with raw thread IDs translated to `main`, `a` and `b`. A worker timeout, a missing callback, an unexpected value or a changed template fails the test. The empty-template `cpu_tls_original` fixture is the control: it must load under both loaders.
 
-Under both loaders the TLS callback and the entry point read 7 on process attach (main thread), on thread attach and thread detach (worker) and on process detach, and both threads' own reads return 7. Until `pe_map` gained the TLS carrier described in the next section, this test pinned the opposite result: `pe_map_image` rejected the image with `MAP_UNSUPPORTED` ("TLS data"). `pe_map_run` still sends no thread notifications to an EXE (`notify` returns early for non-DLL images, so only `DLL_PROCESS_ATTACH` runs on the calling thread). This DLL test addresses the thread-local-value part of #165; it does not cover EXE startup: an EXE's TLS callbacks on a second worker thread under `pe_map_run`, C-runtime startup in a mapped EXE, `GetModuleHandle(NULL)`, and the PEB remain untested and unsupported. [Issue #165](https://github.com/R0Y00/Xbox2Windows/issues/165)
+Measured on Windows 10 build 19045, MSVC 19.44, `dev` and `release` presets: on every notification (process attach and detach on the main thread, thread attach and detach on both workers) both loaders call caller 1, then caller 3, then the entry point. Every thread starts from the template, each thread's writes stay in its own copy, and the template in the loaded image is unchanged at the end. The two workers exit in either order, so only the per-thread sequences are compared between loaders. Two negative controls patch copies of the built DLL and must be rejected under both loaders: swapping the two callback table entries is reported as a callback order failure (`[3, 1, 2]` on process attach), and zeroing the template from its first page boundary on is reported as a template failure (array words differ on the main thread). See [issue #870](https://github.com/R0Y00/Xbox2Windows/issues/870).
+
+Until `pe_map` gained the TLS carrier described in the next section, this test pinned the opposite result: `pe_map_image` rejected the image with `MAP_UNSUPPORTED` ("TLS data"). `pe_map_run` still sends no thread notifications to an EXE (`notify` returns early for non-DLL images, so only `DLL_PROCESS_ATTACH` runs on the calling thread). This DLL test addresses the thread-local-value part of #165; it does not cover EXE startup: an EXE's TLS callbacks on a second worker thread under `pe_map_run`, C-runtime startup in a mapped EXE, `GetModuleHandle(NULL)`, and the PEB remain untested and unsupported. [Issue #165](https://github.com/R0Y00/Xbox2Windows/issues/165)
 
 ```powershell
 cmake --build --preset dev --target pe_map cpu_tls_value cpu_tls_original cpu_tls_sink
@@ -2191,6 +2193,10 @@ and `ds_xor_b32` update the same initialized word in place at offset 0.
 Addition and subtraction wrap modulo 2^32, with subtraction taking the
 old word minus the VGPR value. Each lane has exclusive use of its own word,
 so the updates can use per-invocation arithmetic in HLSL.
+The corresponding `ds_add_rtn_u32`, `ds_sub_rtn_u32`, `ds_and_rtn_b32`,
+`ds_or_rtn_b32` and `ds_xor_rtn_b32` forms also copy the word's value before
+the update into the destination VGPR. They capture the inputs before writing
+that destination, which may overlap the address or data VGPR.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The source-built wave32 fixture reads the full word and both halves after
@@ -2213,6 +2219,12 @@ updates with different operands. The inputs cover wraparound, underflow and
 high-bit operands. Each variant compares all 320 UAV words after one-group
 and three-group dispatches. Replacing the first update with a full-word
 write must mismatch at word 1.
+
+For each returning update, the first destination overlaps the data VGPR and
+the second overlaps the address VGPR. Both returned values and the final LDS
+word are compared across the entire UAV for one and three groups. Returning
+the updated word from the first operation must mismatch at word 0. Omitting
+the second update while preserving its return value must mismatch at word 2.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
@@ -4025,6 +4037,27 @@ Bare paths begin at the record's `states` container. A leading `./` starts at th
 The [fixture supplied in #442](https://github.com/R0Y00/Xbox2Windows/issues/442) pins 104 packed bytes and the expected 16-byte BC7 block in `tests/bcpack_mode6_vector.py`. The optional [Leonida reference decoder](https://github.com/timelery/Leonida/tree/03d1e118a676d73aba66b1793cf033f6ad23b2b2/tools) reproduces all 16 bytes in strict mode with an empty provisional set. To repeat the packed-byte comparison, point `BCPACK_REFERENCE_TOOLS` at that revision's local tools directory and run `python -B tests/bc7_blocks_check.py -v`. The normal suite requires no external decoder.
 
 The CPU block test and the D3D12 BC7 draw tests check all 16 RGBA texels against fixed expected bytes. Changing the last selector from 15 to 0 selects the opposite endpoint only for the final texel. This covers a single zero-history synthetic vector. The local BCPack probe does not decode arbitrary BC7 streams.
+
+### Two synthetic BCPack mode-6 blocks
+
+`tests/bc7_mode6_multiblock_check.py` uses the [132-byte synthetic stream supplied by stan495 for #769](https://github.com/stan495/Xbox2Windows/blob/5e1af1695674866a784a80720426a0a5384263b1/tests/bcpack_mode6_multiblock_vector.py). The test builds the expected blocks from two sets of mode-6 endpoints and selectors. It strictly decodes the stream without external history, requires the exact 32 BC7 bytes in left-to-right order and uploads those decoded bytes. The translated copy shader samples the resulting 8×4 texture. The test compares the entire RGBA8 capture with the independent CPU reference derived from the expected blocks.
+
+Use the same pinned Leonida tools as for the single-block check. From the repository root with the Python environment set up:
+
+```powershell
+. .\tools\dev.ps1
+git init out/Leonida
+git -C out/Leonida fetch --depth=1 https://github.com/timelery/Leonida.git 03d1e118a676d73aba66b1793cf033f6ad23b2b2
+git -C out/Leonida checkout --detach FETCH_HEAD
+$env:BCPACK_REFERENCE_TOOLS = (Resolve-Path 'out/Leonida/tools').Path
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^(bc7_mode6_multiblock_(warp|hardware)|bc7_draw_(warp|hardware)|bc7_block_reference|bcpack_rans_symbols)$' -V
+```
+
+The two `bc7_mode6_multiblock_*` tests report a skip when `BCPACK_REFERENCE_TOOLS` is unset. To select a physical adapter by name, set `XBOX2WINDOWS_ADAPTER` before running CTest.
+
+On Windows 11 build 26200.9974 with the debug layer enabled, WARP (Microsoft Basic Render Driver 10.0.26100.9818) and Radeon RX 7900 XTX (32.0.32029.2010) matched all 32 texels with zero channel error, debug errors or debug warnings. The first mismatches were `(0, 0)` after swapping the two blocks and `(7, 3)` after changing the right block's last selector from 15 to 0. Truncation to 131, 66 or 32 bytes failed before upload. The 131-byte case first reported that lane 10 ran out of input at byte 131. The GPU runs used the test change on base `1e8c6a6`.
 
 ### Exporting two TTPF entries to DDS
 

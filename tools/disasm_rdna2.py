@@ -147,9 +147,58 @@ SOP1_OPS = {
     0x08: ("s_not_b64", "Scalar bitwise NOT 64-bit"),
     0x09: ("s_wqm_b32", "Scalar whole-quad-mode 32-bit"),
     0x0a: ("s_wqm_b64", "Scalar whole-quad-mode 64-bit"),
+    0x0b: ("s_brev_b32", "Scalar bit reverse 32-bit"),
+    0x0c: ("s_brev_b64", "Scalar bit reverse 64-bit"),
+    0x0d: ("s_bcnt0_i32_b32", "Count zero bits in scalar 32-bit"),
+    0x0e: ("s_bcnt0_i32_b64", "Count zero bits in scalar 64-bit"),
+    0x0f: ("s_bcnt1_i32_b32", "Count one bits in scalar 32-bit"),
+    0x10: ("s_bcnt1_i32_b64", "Count one bits in scalar 64-bit"),
+    0x11: ("s_ff0_i32_b32", "Find first zero bit in scalar 32-bit"),
+    0x12: ("s_ff0_i32_b64", "Find first zero bit in scalar 64-bit"),
+    0x13: ("s_ff1_i32_b32", "Find first one bit in scalar 32-bit"),
+    0x14: ("s_ff1_i32_b64", "Find first one bit in scalar 64-bit"),
+    0x15: ("s_flbit_i32_b32", "Find first bit high in scalar 32-bit unsigned"),
+    0x16: ("s_flbit_i32_b64", "Find first bit high in scalar 64-bit unsigned"),
+    0x17: ("s_flbit_i32", "Find first bit high in scalar 32-bit signed"),
+    0x18: ("s_flbit_i32_i64", "Find first bit high in scalar 64-bit signed"),
+    0x19: ("s_sext_i32_i8", "Sign-extend 8-bit to 32-bit"),
+    0x1a: ("s_sext_i32_i16", "Sign-extend 16-bit to 32-bit"),
+    0x1b: ("s_bitset0_b32", "Clear bit in scalar 32-bit"),
+    0x1c: ("s_bitset0_b64", "Clear bit in scalar 64-bit"),
+    0x1d: ("s_bitset1_b32", "Set bit in scalar 32-bit"),
+    0x1e: ("s_bitset1_b64", "Set bit in scalar 64-bit"),
+    0x1f: ("s_getpc_b64", "Get program counter 64-bit"),
     0x20: ("s_setpc_b64", "Set program counter 64-bit"),
     0x21: ("s_swappc_b64", "Swap program counter 64-bit"),
+    0x22: ("s_rfe_b64", "Return from exception 64-bit"),
+    0x24: ("s_and_saveexec_b64", "Save execution mask and bitwise AND with scalar source 64-bit"),
+    0x25: ("s_or_saveexec_b64", "Save execution mask and bitwise OR with scalar source 64-bit"),
+    0x26: ("s_xor_saveexec_b64", "Save execution mask and bitwise XOR with scalar source 64-bit"),
+    0x27: ("s_andn2_saveexec_b64", "Save execution mask and bitwise AND NOT2 with scalar source 64-bit"),
+    0x28: ("s_orn2_saveexec_b64", "Save execution mask and bitwise OR NOT2 with scalar source 64-bit"),
+    0x29: ("s_nand_saveexec_b64", "Save execution mask and bitwise NAND with scalar source 64-bit"),
+    0x2a: ("s_nor_saveexec_b64", "Save execution mask and bitwise NOR with scalar source 64-bit"),
+    0x2b: ("s_xnor_saveexec_b64", "Save execution mask and bitwise XNOR with scalar source 64-bit"),
+    0x2c: ("s_quadmask_b32", "Compute quad mask scalar 32-bit"),
+    0x2d: ("s_quadmask_b64", "Compute quad mask scalar 64-bit"),
+    0x34: ("s_abs_i32", "Scalar absolute value signed 32-bit"),
+    0x37: ("s_andn1_saveexec_b64", "Save execution mask and bitwise AND NOT1 with scalar source 64-bit"),
+    0x38: ("s_orn1_saveexec_b64", "Save execution mask and bitwise OR NOT1 with scalar source 64-bit"),
+    0x39: ("s_andn1_wrexec_b64", "Save execution mask and write bitwise AND NOT1 scalar source 64-bit"),
+    0x3a: ("s_andn2_wrexec_b64", "Save execution mask and write bitwise AND NOT2 scalar source 64-bit"),
+    0x3b: ("s_bitreplicate_b64_b32", "Replicate each bit of 32-bit source into 64-bit pair"),
     0x3c: ("s_and_saveexec_b32", "Save execution mask and bitwise AND with scalar source"),
+    0x3d: ("s_or_saveexec_b32", "Save execution mask and bitwise OR with scalar source 32-bit"),
+    0x3e: ("s_xor_saveexec_b32", "Save execution mask and bitwise XOR with scalar source 32-bit"),
+    0x3f: ("s_andn2_saveexec_b32", "Save execution mask and bitwise AND NOT2 with scalar source 32-bit"),
+    0x40: ("s_orn2_saveexec_b32", "Save execution mask and bitwise OR NOT2 with scalar source 32-bit"),
+    0x41: ("s_nand_saveexec_b32", "Save execution mask and bitwise NAND with scalar source 32-bit"),
+    0x42: ("s_nor_saveexec_b32", "Save execution mask and bitwise NOR with scalar source 32-bit"),
+    0x43: ("s_xnor_saveexec_b32", "Save execution mask and bitwise XNOR with scalar source 32-bit"),
+    0x44: ("s_andn1_saveexec_b32", "Save execution mask and bitwise AND NOT1 with scalar source 32-bit"),
+    0x45: ("s_orn1_saveexec_b32", "Save execution mask and bitwise OR NOT1 with scalar source 32-bit"),
+    0x46: ("s_andn1_wrexec_b32", "Save execution mask and write bitwise AND NOT1 scalar source 32-bit"),
+    0x47: ("s_andn2_wrexec_b32", "Save execution mask and write bitwise AND NOT2 scalar source 32-bit"),
 }
 
 SOP2_OPS = {
@@ -176,12 +225,21 @@ SOP2_OPS = {
     0x20: ("s_lshr_b32", "Scalar logical shift right 32-bit"),
     0x21: ("s_lshr_b64", "Scalar logical shift right 64-bit"),
     0x22: ("s_ashr_i32", "Scalar arithmetic shift right 32-bit"),
+    0x23: ("s_ashr_i64", "Scalar arithmetic shift right 64-bit"),
+    0x24: ("s_bfm_b32", "Scalar bitfield mask 32-bit"),
+    0x25: ("s_bfm_b64", "Scalar bitfield mask 64-bit"),
     0x26: ("s_mul_i32", "Scalar multiply signed 32-bit"),
+    0x27: ("s_bfe_u32", "Scalar bitfield extract unsigned 32-bit"),
+    0x28: ("s_bfe_i32", "Scalar bitfield extract signed 32-bit"),
+    0x29: ("s_bfe_u64", "Scalar bitfield extract unsigned 64-bit"),
+    0x2a: ("s_bfe_i64", "Scalar bitfield extract signed 64-bit"),
     0x2c: ("s_absdiff_i32", "Scalar absolute difference signed 32-bit"),
     0x2e: ("s_lshl1_add_u32", "Scalar shift left 1 and add 32-bit"),
     0x2f: ("s_lshl2_add_u32", "Scalar shift left 2 and add 32-bit"),
     0x30: ("s_lshl3_add_u32", "Scalar shift left 3 and add 32-bit"),
     0x31: ("s_lshl4_add_u32", "Scalar shift left 4 and add 32-bit"),
+    0x35: ("s_mul_hi_u32", "Scalar multiply high unsigned 32-bit"),
+    0x36: ("s_mul_hi_i32", "Scalar multiply high signed 32-bit"),
 }
 
 SOPK_OPS = {
@@ -522,8 +580,13 @@ VOP2_OPS = {
     0x03: ("v_add_f32_e32", "Vector add float32"),
     0x04: ("v_sub_f32_e32", "Vector subtract float32"),
     0x05: ("v_subrev_f32_e32", "Vector reverse subtract float32"),
+    0x06: ("v_mac_legacy_f32_e32", "Vector multiply-accumulate zero-preserving float32"),
     0x07: ("v_mul_legacy_f32_e32", "Vector multiply zero-preserving float32"),
     0x08: ("v_mul_f32_e32", "Vector multiply float32"),
+    0x09: ("v_mul_i32_i24_e32", "Vector multiply 24-bit signed integer"),
+    0x0a: ("v_mul_hi_i32_i24_e32", "Vector multiply high 24-bit signed integer"),
+    0x0b: ("v_mul_u32_u24_e32", "Vector multiply 24-bit unsigned integer"),
+    0x0c: ("v_mul_hi_u32_u24_e32", "Vector multiply high 24-bit unsigned integer"),
     0x0f: ("v_min_f32_e32", "Vector minimum float32"),
     0x10: ("v_max_f32_e32", "Vector maximum float32"),
     0x11: ("v_min_i32_e32", "Vector minimum int32"),
@@ -536,6 +599,7 @@ VOP2_OPS = {
     0x1b: ("v_and_b32_e32", "Vector bitwise AND"),
     0x1c: ("v_or_b32_e32", "Vector bitwise OR"),
     0x1d: ("v_xor_b32_e32", "Vector bitwise XOR"),
+    0x1e: ("v_xnor_b32_e32", "Vector bitwise XNOR"),
     0x1f: ("v_mac_f32_e32", "Vector multiply-accumulate float32"),
     0x20: ("v_madmk_f32", "Vector multiply-add (non-fused) with literal multiplier"),
     0x21: ("v_madak_f32", "Vector multiply-add (non-fused) with literal addend"),
@@ -642,6 +706,8 @@ VOP3_NATIVE_OPS = {
     0x359: ("v_med3_u16", "V_MED3_U16 (VOP3A)", 3, False, 1, (1, 1, 1)),
     0x35e: ("v_mad_i16", "V_MAD_I16 (VOP3A)", 3, False, 1, (1, 1, 1)),
     0x35f: ("v_div_fixup_f16", "V_DIV_FIXUP_F16 (VOP3A)", 3, False, 1, (1, 1, 1)),
+    0x360: ("v_readlane_b32", "Read lane from vector register into SGPR (VOP3A)", 2, False, 1, (1, 1)),
+    0x361: ("v_writelane_b32", "Write lane into vector register from scalar (VOP3A)", 2, False, 1, (1, 1)),
     0x362: ("v_ldexp_f32", "V_LDEXP_F32 (VOP3A)", 2, False, 1, (1, 1)),
     0x363: ("v_bfm_b32", "V_BFM_B32 (VOP3A)", 2, False, 1, (1, 1)),
     0x364: ("v_bcnt_u32_b32", "V_BCNT_U32_B32 (VOP3A)", 2, False, 1, (1, 1)),
@@ -1426,6 +1492,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_name, comment = op_info
         length = 4
         is_64 = op_name.endswith(("_b64", "_u64", "_i64"))
+        dst_64 = (is_64 and not op_name.startswith(("s_bcnt0_i32_", "s_bcnt1_i32_", "s_ff0_i32_", "s_ff1_i32_", "s_flbit_i32_"))) or op_name == "s_bitreplicate_b64_b32"
+        src0_64 = is_64 and op_name != "s_bitreplicate_b64_b32"
         if ssrc0 == 255:
             if offset + 8 > len(data):
                 return (4, "sop1_truncated", f"{op_name} <truncated>", "Incomplete SOP1 literal")
@@ -1433,9 +1501,14 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             src0_str = f"0x{literal:x}"
             length = 8
         else:
-            src0_str = decode_s_reg64(ssrc0) if is_64 else decode_s_reg(ssrc0)
-        sdst_str = decode_s_reg64(sdst) if is_64 else decode_s_reg(sdst)
-        asm = f"{op_name} {sdst_str}, {src0_str}"
+            src0_str = decode_s_reg64(ssrc0) if src0_64 else decode_s_reg(ssrc0)
+        sdst_str = decode_s_reg64(sdst) if dst_64 else decode_s_reg(sdst)
+        if op_name == "s_getpc_b64":
+            asm = f"{op_name} {sdst_str}"
+        elif op_name in ("s_setpc_b64", "s_rfe_b64"):
+            asm = f"{op_name} {src0_str}"
+        else:
+            asm = f"{op_name} {sdst_str}, {src0_str}"
         return (length, op_name, asm, comment)
 
     # SOPC: [31:23] == 0b101111110 (0xbf000000)
@@ -2015,7 +2088,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         raw_srcs = [src0, src1, src2][:arity]
         src_strs = [vop3_operand(raw_srcs[i], abs_bits[i], neg[i], src_widths[i]) for i in range(arity)]
 
-        if is_vopc:
+        if op_name == "v_readlane_b32" or is_vopc:
             dst_str = decode_s_reg(vdst)
             asm = f"{op_name} {dst_str}, {', '.join(src_strs)}"
         elif is_vop3b:
