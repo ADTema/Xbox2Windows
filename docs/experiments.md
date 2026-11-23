@@ -4097,6 +4097,27 @@ ctest --preset dev --no-tests=error -R '^cpu_native_transfer_mem$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_transfer_mem$' -V
 ```
 
+### Memory transfer prerequisite and failure chain
+
+This fixture exercises the sequence where a caller checks tools-memory availability, queries working-set statistics, evaluates available memory budget, and transfers memory under partition 1. The source-built caller ([`transfer_chain_caller.asm`](../tests/cpu/transfer_chain_caller.asm)) imports `XMemIsToolsMemAvailable`, `XMemGetWorkingSetStatistics`, and `XMemTransferMemory` by name from `xmem.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled test provider ([`transfer_chain_provider.cpp`](../tests/cpu/transfer_chain_provider.cpp)), it verifies the prerequisite and failure isolation paths:
+
+- **Case 1 (Success reaches transfer)**: Tools-memory query returns `TRUE`, `XMemGetWorkingSetStatistics` with selector `0x2000000A` reports total and used budget (32 MiB total, 16 MiB used; difference 16 MiB), and the recorder accepts a 16 MiB request under test-provider policy partition 1. Returns milestone exit code `0x870`.
+- **Case 2 (Tools-memory unavailable)**: When tools-memory query returns `FALSE` (the no-tools desktop policy established in #896), the sequence is blocked immediately. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x101`.
+- **Case 3 (Working-set statistics failure)**: When `XMemGetWorkingSetStatistics` returns `FALSE` or fails, the sequence is aborted immediately. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x102`.
+- **Case 4 (Zero available budget)**: When working-set statistics reports zero available budget (`total <= used`), transfer is skipped. `XMemTransferMemory` is never called (`transfer_calls == 0`), returning exit code `0x103`.
+- **Case 5 (Transfer failure isolation)**: The provider records one rejected 16 MiB request and the caller returns exit code `0x104`. The recording provider has no backing-page or ownership state.
+
+The specific fixture inputs tested (`selector = 0x2000000A`, `partition = 1`, 2 MiB alignment rounding, 16 MiB clamp) are synthetic fixture inputs chosen for this test. Partition selector 1, alignment, and maximum bounds are test-provider policy behaviors; native console transfer semantics remain open.
+
+A changed-selector patch control alters `0x2000000A` to `0x2000000B` in the caller binary: under both the Windows native loader and `pe_map`, the provider rejects the unrecognized selector, the query fails, and the caller exits with `0x102` with transfer uncalled.
+
+On success, the caller exits with `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process cleanly with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return across all cases. Independent negative controls confirm that withholding any of `XMemIsToolsMemAvailable`, `XMemGetWorkingSetStatistics`, or `XMemTransferMemory` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_transfer_chain$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_transfer_chain$' -V
+```
+
 ### Audio-side import inventory
 
 Binding probes on #870 leave 19 audio-side imports unresolved: 5 from `chad.dll`, 5 from `xapu.dll` and 9 from `acphal.dll`. None of these modules exists in System32. This inventory records the public evidence for each name. Microsoft's reference pages for these APIs sit behind the NDA developer program, so they give no public signature. Microsoft's MIT-licensed [GDK Learn index at `f8c3438`](https://github.com/microsoft/XBOX-GDK-dotnet/blob/f8c3438aa366fbbb662d8a5e724021a9d0b65f5d/eng/gdk-learn-index.json) confirms that the `XDsp*` and `XApu*` functions are documented APIs and gives each one a page path. It lists AcpHal and the Audio Processing Unit only as member pages. Public MIT call sites in [DirectXTK12 at `f3555e3`](https://github.com/microsoft/DirectXTK12/tree/f3555e3014a53c81a6202b786dc4d6509b95a936) cover `ApuAlloc` and `ApuFree`. Several unaffiliated reimplementations also export these names. Their declarations do not trace to a public Microsoft source, so this inventory does not use them.
