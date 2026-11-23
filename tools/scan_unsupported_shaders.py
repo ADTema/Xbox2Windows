@@ -42,8 +42,10 @@ except ImportError:
 # Known supported instructions and patterns in pixel_aot.py
 # Tables are imported from pixel_aot so the scanner stays aligned with the translator.
 PIXEL_ALU_NAMES = tuple(pixel_aot.ALU) if pixel_aot is not None else ()
+PIXEL_SDWA_ALU = tuple(pixel_aot.SDWA_ALU) if pixel_aot is not None else ()
 SUPPORTED_ALU = {f"v_{name}_f32" for name in PIXEL_ALU_NAMES}
 PIXEL_INTEGER = pixel_aot.INTEGER if pixel_aot is not None else {}
+PIXEL_SDWA_INT = pixel_aot.SDWA_INT if pixel_aot is not None else {}
 PIXEL_SCALAR = pixel_aot.SCALAR if pixel_aot is not None else {}
 PIXEL_SALU_BIT64 = tuple(pixel_aot.SALU_BIT64) if pixel_aot is not None else ()
 PIXEL_COMPARE = tuple(pixel_aot.COMPARE) if pixel_aot is not None else ()
@@ -54,17 +56,26 @@ PIXEL_LANE_MASK = pixel_aot.LANE_MASK if pixel_aot is not None else r"(?:vcc(?:_
 INTEGER_SOURCE = r"(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
 SCALAR32_SOURCE = r"(?:s\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
 SCALAR64_SOURCE = r"(?:s\[\d+:\d+\]|0x[0-9a-f]{1,8}|-?\d+)"
+F16_PLAIN = r"(?:-?(?:\d+\.\d+|\d+)|0x[0-9a-f]{1,4}|[vs]\d+)"
+F16_MOD = rf"-?(?:\|{F16_PLAIN}\||abs\({F16_PLAIN}\)|{F16_PLAIN})"
 SDWA_SEL_PATTERN = r"(?:BYTE_[0-3]|WORD_[01]|DWORD)"
+
+WAIT_COUNTER = r"(?:vmcnt\((?:[0-9]|[1-5][0-9]|6[0-3])\)|lgkmcnt\((?:[0-9]|[1-5][0-9]|6[0-3])\)|expcnt\([0-7]\))"
 
 SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_inst_prefetch\s+.*",
     r"s_nop\s+.*",
-    r"v_nop",
+    r"s_version\s+(?:0x0*[0-9a-f]{1,4}|0|[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d\d|655[0-2]\d|6553[0-5])",
+    r"v_nop(?:_e64)?",
     r"s_clause\s+(?:0x[0-3]?[0-9a-f]|[0-5]?[0-9]|6[0-3])",
     r"s_setprio\s+(?:0x[0-3]|[0-3])",
     r"s_sleep\s+(?:0x[0-7]?[0-9a-f]|[0-9]|[1-9][0-9]|1[01][0-9]|12[0-7])",
+    r"s_setreg_imm32_b32\s+hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\),\s+(?:-?\d+|0x[0-9a-f]{1,8})",
+    r"s_setreg_imm32_b32\s+hwreg\(HW_REG_MODE, 2, 2\),\s+[03]",
     r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])",
-    r"s_waitcnt\s+(?:lgkmcnt\(0\)|vmcnt\((?:[0-9]|[1-5][0-9]|6[0-3])\)|expcnt\([0-7]\)|vmcnt\(0\)\s+lgkmcnt\(0\)|lgkmcnt\(0\)\s+vmcnt\(0\))",
+    # SOPK wait forms: only null as the SGPR (reads as 0) and a count of 0..63, as in pixel_aot.
+    r"s_waitcnt_(?:vmcnt|lgkmcnt|vscnt)\s+null,\s*(?:0x(?:0?[0-9a-f]|[1-3][0-9a-f])|[0-9]|[1-5][0-9]|6[0-3])",
+    rf"s_waitcnt\s+(?:{WAIT_COUNTER}(?:\s+{WAIT_COUNTER}){{0,2}}|0(?:x0)?)",
     r"s_mov_b64\s+s\[\d+:\d+\],\s+exec",
     r"s_wqm_b64\s+exec,\s+exec",
     r"s_and_b64\s+exec,\s+exec,\s+s\[\d+:\d+\]",
@@ -72,6 +83,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     rf"s_(?:lshl_b64|lshr_b64|ashr_i64)\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"s_bfm_b64\s+s\[\d+:\d+\],\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"(?:s_bfe_u32|s_bfe_i32)\s+s\d+,\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
+    rf"(?:s_bfe_u64|s_bfe_i64)\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"(?:s_cmp_eq_u64|s_cmp_lg_u64)\s+{SCALAR64_SOURCE},\s+{SCALAR64_SOURCE}",
     rf"(?:s_bitcmp0_b64|s_bitcmp1_b64)\s+{SCALAR64_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"(?:s_bitcmp0_b32|s_bitcmp1_b32)\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
@@ -85,7 +97,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_load_dwordx8\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
     r"(?:s_load_dwordx4|s_buffer_load_dwordx[24])\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
     r"s_buffer_load_dword\s+s\d+,\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
-    r"v_interp_p[12]_f32_e32\s+v\d+,\s+v\d+,\s+attr0\.[xyzw]",
+    r"v_interp_p[12]_f32_e(?:32|64)\s+v\d+,\s+v\d+,\s+attr0\.[xyzw]",
     r"image_sample\s+v\[\d+:\d+\],\s+v\[\d+:\d+\],\s+s\[\d+:\d+\],\s+s\[\d+:\d+\]\s+dmask:0x[7f]\s+dim:SQ_RSRC_IMG_2D",
     r"v_cube(?:id|sc|tc|ma)_f32(?:_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+,\s+[^,]+?(?:\s+clamp)?",
     r"v_(?:fmaak|fmamk)_f32\s+v\d+,\s+[^,]+,\s+[^,]+,\s+[^,]+",
@@ -93,6 +105,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_madak_f32\s+v\d+,\s+[^,]+,\s+[^,]+,\s+0x[0-9a-f]{1,8}",
     r"v_madmk_f32\s+v\d+,\s+[^,]+,\s+0x[0-9a-f]{1,8},\s+[^,]+",
     r"v_mov_b32(?:_e32|_e64)?\s+v\d+,\s+(?:-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)",
+    r"v_swap_b32(?:_e32)?\s+v\d+,\s+v\d+",
     rf"v_mov_b32_sdwa\s+v\d+,\s+(?:sext\((?:[vs]\d+|-?\d+(?:\.\d+)?)\)|[vs]\d+|-?\d+(?:\.\d+)?)\s+dst_sel:{SDWA_SEL_PATTERN}\s+dst_unused:(?:UNUSED_PAD|UNUSED_PRESERVE)\s+src0_sel:{SDWA_SEL_PATTERN}",
     r"v_cvt_f32_f16(?:_e32|_e64)?\s+v\d+,\s+-?(?:\|(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\((?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_f32_f16_sdwa\s+v\d+,\s+-?(?:\|[vs]\d+\||[vs]\d+)(?:\s+clamp)?\s+dst_sel:DWORD\s+dst_unused:UNUSED_(?:PAD|PRESERVE)\s+src0_sel:WORD_[01]",
@@ -107,6 +120,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     rf"v_(?:min|max)_(?:i32|u32)(?:_e32|_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:min3|max3|med3)_(?:i32|u32)(?:_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_cmp_class_f32(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+[^,]+,\s+[^,]+",
+    rf"v_cmp_class_f16(?:_e32)?\s+{PIXEL_LANE_MASK},\s+{F16_PLAIN},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
+    rf"v_cmp_class_f16_e64\s+{PIXEL_LANE_MASK},\s+{F16_MOD},\s+(?:-?\d+|0x[0-9a-f]{{1,8}}|[vs]\d+)",
     rf"v_cndmask_b32(?:_e32|_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+,\s+{PIXEL_LANE_MASK}",
     r"v_fma_mix(?:_f32|lo_f16|hi_f16)\s+v\d+,\s+.+",
     r"(?:v_dot2_f32_f16|v_dot2_i32_i16|v_dot2_u32_u16|v_dot4_i32_i8|v_dot4_u32_u8|v_dot8_i32_i4|v_dot8_u32_u4)\s+v\d+,\s+.+",
@@ -120,6 +135,13 @@ if PIXEL_ALU_NAMES:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         r"v_(?:" + "|".join(map(re.escape, PIXEL_ALU_NAMES)) + r")_f32(?:_e32|_e64)?\s+v\d+,\s+.*"
     )
+if PIXEL_SDWA_ALU:
+    # Whole-dword sources only, as pixel_aot requires. This pins the spelling, not the operand count.
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        r"v_(?:" + "|".join(map(re.escape, PIXEL_SDWA_ALU)) + r")_f32_sdwa\s+v\d+,\s+.+?(?:\s+clamp)?"
+        rf"\s+dst_sel:{SDWA_SEL_PATTERN}\s+dst_unused:(?:UNUSED_PAD|UNUSED_PRESERVE)"
+        r"\s+src0_sel:DWORD(?:\s+src1_sel:DWORD)?"
+    )
 if PIXEL_SALU_BIT64:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"s_(?:{'|'.join(map(re.escape, PIXEL_SALU_BIT64))})_b64\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE},\s+{SCALAR64_SOURCE}"
@@ -131,6 +153,12 @@ if PIXEL_COMPARE:
     )
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{cmp_ops})_f32_sdwa\s+{PIXEL_LANE_MASK},\s+[^,]+,\s+[^,]+\s+src0_sel:DWORD\s+src1_sel:DWORD"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_(?:{cmp_ops})_f16(?:_e32)?\s+{PIXEL_LANE_MASK},\s+{F16_PLAIN},\s+{F16_PLAIN}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_(?:{cmp_ops})_f16_e64\s+{PIXEL_LANE_MASK},\s+{F16_MOD},\s+{F16_MOD}"
     )
 if PIXEL_INT_COMPARE:
     icmp_ops = "|".join(map(re.escape, PIXEL_INT_COMPARE))
@@ -150,6 +178,15 @@ for name, (arity, _) in PIXEL_INTEGER.items():
     encoding = r"(?:_e32|_e64)?" if arity <= 2 else r"(?:_e64)?"
     SUPPORTED_INSTRUCTIONS_REGEX.append(rf"v_{name}{encoding}\s+v\d+" + rf",\s*{INTEGER_SOURCE}" * arity)
 
+# SDWA forms of the 32-bit integer operations: register sources, optionally under sext(), every field printed,
+# and no UNUSED_SEXT. As for the moves, UNUSED_PRESERVE onto an untracked destination is refused by the translator only.
+SDWA_INT_SOURCE = r"(?:sext\([vs]\d+\)|[vs]\d+)"
+for name, (arity, _) in PIXEL_SDWA_INT.items():
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_{name}_sdwa\s+v\d+" + rf",\s+{SDWA_INT_SOURCE}" * arity
+        + rf"\s+dst_sel:{SDWA_SEL_PATTERN}\s+dst_unused:(?:UNUSED_PAD|UNUSED_PRESERVE)"
+        + "".join(rf"\s+src{index}_sel:{SDWA_SEL_PATTERN}" for index in range(arity)))
+
 for name, (arity, _, _) in PIXEL_SCALAR.items():
     SUPPORTED_INSTRUCTIONS_REGEX.append(rf"s_{name}\s+s\d+" + rf",\s*{SCALAR32_SOURCE}" * arity)
 
@@ -167,7 +204,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_wqm_b32", "s_wqm_b64", "s_swappc_b64", "s_setpc_b64", "s_rfe_b64",
     "s_and_saveexec_b64", "s_or_saveexec_b64", "s_xor_saveexec_b64",
     # SOP2
-    "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_addc_u32", "s_subb_u32",
+    "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_absdiff_i32", "s_addc_u32", "s_subb_u32",
     "s_min_i32", "s_min_u32", "s_max_i32", "s_max_u32", "s_cselect_b32", "s_cselect_b64",
     "s_and_b32", "s_and_b64", "s_or_b32", "s_or_b64", "s_xor_b32", "s_xor_b64",
     "s_andn2_b32", "s_andn2_b64", "s_orn2_b32", "s_orn2_b64", "s_nand_b32", "s_nand_b64",
@@ -175,11 +212,11 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_ashr_i32", "s_ashr_i64", "s_mul_i32",
     "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
     # SOPK
-    "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork",
+    "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork", "s_version",
     # VOP1
-    "v_nop", "v_mov_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
+    "v_nop", "v_mov_b32", "v_swap_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",
-    "v_sin_f32", "v_cos_f32", "v_bfrev_b32", "v_ffbh_u32", "v_ffbl_b32",
+    "v_sin_f32", "v_cos_f32", "v_bfrev_b32", "v_ffbh_u32", "v_ffbl_b32", "v_ffbh_i32", "v_rcp_iflag_f32",
     "v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_i32_f32", "v_cvt_u32_f32",
     "v_cvt_f16_f32", "v_cvt_f32_f16", "v_cvt_rpi_i32_f32", "v_cvt_flr_i32_f32",
     "v_cvt_pkrtz_f16_f32", "v_ceil_f32", "v_floor_f32", "v_rndne_f32",
@@ -193,6 +230,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "v_fmac_f32", "v_fmamk_f32", "v_fmaak_f32", "v_madmk_f32", "v_madak_f32",
     # VOP3
     "v_fma_f32", "v_fma_f16", "v_mad_f32", "v_div_scale_f32", "v_div_fmas_f32", "v_bfi_b32",
+    "v_alignbit_b32", "v_alignbyte_b32",
     # VOP3P
     "v_pk_mad_i16", "v_pk_mul_lo_u16", "v_pk_add_i16", "v_pk_sub_i16",
     "v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16",
@@ -201,6 +239,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "v_pk_add_f16", "v_pk_mul_f16", "v_pk_min_f16", "v_pk_max_f16",
     "v_dot2_f32_f16", "v_dot2_i32_i16", "v_dot2_u32_u16",
     "v_dot4_i32_i8", "v_dot4_u32_u8", "v_dot8_i32_i4", "v_dot8_u32_u4",
+        "v_mad_legacy_f32", "v_mad_i32_i24", "v_mad_u32_u24", "v_fma_f64", "v_lerp_u8", "v_alignbit_b32", "v_alignbyte_b32", "v_mullit_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32", "v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_cvt_pk_u8_f32", "v_div_fixup_f32", "v_div_fixup_f64", "v_add_f64", "v_mul_f64", "v_min_f64", "v_max_f64", "v_ldexp_f64", "v_mul_lo_u32", "v_mul_hi_u32", "v_mul_hi_i32", "v_div_scale_f32", "v_div_scale_f64", "v_div_fmas_f32", "v_div_fmas_f64", "v_msad_u8", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_trig_preop_f64", "v_mqsad_u32_u8", "v_mad_u64_u32", "v_mad_i64_i32", "v_xor3_b32", "v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64", "v_add_nc_u16", "v_sub_nc_u16", "v_mul_lo_u16", "v_lshrrev_b16", "v_ashrrev_i16", "v_max_u16", "v_max_i16", "v_min_u16", "v_min_i16", "v_add_nc_i16", "v_sub_nc_i16", "v_add_co_u32", "v_sub_co_u32", "v_pack_b32_f16", "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16", "v_lshlrev_b16", "v_subrev_co_u32", "v_mad_u16", "v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_perm_b32", "v_xad_u32", "v_lshl_add_u32", "v_add_lshl_u32", "v_fma_f16", "v_min3_f16", "v_min3_i16", "v_min3_u16", "v_max3_f16", "v_max3_i16", "v_max3_u16", "v_med3_f16", "v_med3_i16", "v_med3_u16", "v_interp_p2_f16", "v_mad_i16", "v_div_fixup_f16", "v_readlane_b32", "v_writelane_b32", "v_bfm_b32", "v_bcnt_u32_b32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32", "v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32", "v_add3_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32", "v_mad_u32_u16", "v_mad_i32_i16", "v_sub_nc_i32", "v_permlane16_b32", "v_permlanex16_b32", "v_add_nc_i32", "v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32",
     "v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16",
     # VINTRP
     "v_interp_p1_f32", "v_interp_p2_f32", "v_interp_mov_f32",
@@ -228,7 +267,7 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {entry[0] for entry in SCRATCH_OPS.values()}
     | (set(pixel_aot.HINT_LIMITS) if pixel_aot is not None else set())
     | {
-        "s_brev_b64", "s_bfm_b64", "s_bfe_u32", "s_bfe_i32",
+        "s_brev_b64", "s_bfm_b64", "s_bfe_u32", "s_bfe_i32", "s_bfe_u64", "s_bfe_i64",
         "s_cmp_eq_u64", "s_cmp_lg_u64",
         "s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64",
         "s_cmp_eq_i32", "s_cmp_lg_i32", "s_cmp_gt_i32", "s_cmp_ge_i32", "s_cmp_lt_i32", "s_cmp_le_i32",
@@ -240,6 +279,11 @@ KNOWN_RDNA2_BASE_OPCODES |= (
         "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32",
         "v_cvt_f32_ubyte0", "v_cvt_f32_ubyte1", "v_cvt_f32_ubyte2", "v_cvt_f32_ubyte3",
         "v_cvt_off_f32_i4", "v_ldexp_f32",
+        "v_cvt_f64_i32", "v_cvt_f64_u32", "v_cvt_f64_f32",
+        "v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64",
+        "v_fract_f64", "v_trunc_f64", "v_ceil_f64", "v_rndne_f64", "v_floor_f64",
+        "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
+        "v_frexp_exp_i32_f64", "v_frexp_mant_f64",
         "v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16",
         "v_dot2_f32_f16", "v_dot2_i32_i16", "v_dot2_u32_u16",
         "v_dot4_i32_i8", "v_dot4_u32_u8", "v_dot8_i32_i4", "v_dot8_u32_u4",
@@ -364,7 +408,12 @@ def is_instruction_supported(instruction_line: str) -> bool:
     clean = re.split(r"//|[;#]", clean)[0].strip()
     if not clean:
         return True
-    return any(pattern.match(clean) for pattern in COMPILED_SUPPORTED_PATTERNS)
+    if not any(pattern.match(clean) for pattern in COMPILED_SUPPORTED_PATTERNS):
+        return False
+    if wait := re.fullmatch(r"s_waitcnt\s+(.*)", clean):
+        counters = [token.partition("(")[0] for token in wait[1].split()]
+        return len(counters) == len(set(counters))
+    return True
 
 
 def analyze_shader_instructions(shader_name: str, instructions: list[str]) -> dict:
