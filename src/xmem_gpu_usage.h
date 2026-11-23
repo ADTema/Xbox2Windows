@@ -13,12 +13,20 @@ namespace xmem_gpu_usage {
 
 // One DXGI adapter (one LUID).
 struct Domain {
-    bool queried = false;              // local and non-local CurrentUsage both read
-    std::uint64_t bytes = 0;           // their sum
-    std::vector<std::wstring> devices; // adapter_identity::physical_devices; empty if unknown
+    bool queried = false;              // domain_bytes() gave a value
+    std::uint64_t bytes = 0;           // that value
+    std::vector<std::wstring> devices; // adapter_identity::Identity::devices; empty if unknown
 };
 
 namespace detail {
+// Adds `bytes` to `sum`; false, leaving `sum` unchanged, when the result would not fit.
+inline bool add(std::uint64_t& sum, std::uint64_t bytes) noexcept
+{
+    if (bytes > UINT64_MAX - sum) return false;
+    sum += bytes;
+    return true;
+}
+
 inline bool overlap(const Domain& a, const Domain& b) noexcept
 {
     return std::any_of(a.devices.begin(), a.devices.end(), [&](const std::wstring& device) {
@@ -42,6 +50,23 @@ inline std::optional<bool> first_view(const Domain* begin, const Domain& domain)
 }
 }
 
+// One LUID's usage: local plus non-local on every node in [0, nodes), or nothing when the node
+// count is unknown (0), a read fails or the sum overflows. read(node, group, bytes) returns whether
+// QueryVideoMemoryInfo succeeded; group is a DXGI_MEMORY_SEGMENT_GROUP value.
+template <class Read>
+std::optional<std::uint64_t> domain_bytes(std::uint32_t nodes, const Read& read) noexcept
+{
+    if (nodes == 0) return std::nullopt;
+    std::uint64_t sum = 0;
+    for (std::uint32_t node = 0; node < nodes; ++node) {
+        for (const int group : {0, 1}) {
+            std::uint64_t bytes = 0;
+            if (!read(node, group, bytes) || !detail::add(sum, bytes)) return std::nullopt;
+        }
+    }
+    return sum;
+}
+
 // Reads every DXGI adapter (xmem_gpu_usage.cpp) and returns total() of the readings.
 std::optional<std::uint64_t> process_bytes() noexcept;
 
@@ -61,8 +86,7 @@ inline std::optional<std::uint64_t> total(const std::vector<Domain>& domains, bo
         const auto first = detail::first_view(domains.data(), domain);
         if (!first) return std::nullopt;
         if (!*first || domain.bytes == 0) continue;
-        if (domain.bytes > UINT64_MAX - sum) return std::nullopt;
-        sum += domain.bytes;
+        if (!detail::add(sum, domain.bytes)) return std::nullopt;
         ++active;
         unknown_active |= domain.devices.empty();
     }

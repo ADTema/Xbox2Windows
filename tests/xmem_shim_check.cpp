@@ -23,6 +23,7 @@
 
 #include "adapter_identity.h"
 #include "xmem_gpu_usage.h"
+#include "xmem_test_device.h"
 
 extern "C" __declspec(dllimport) void* XMemAlloc(SIZE_T bytes, ULONGLONG attributes);
 extern "C" __declspec(dllimport) void XMemFree(void* allocation, ULONGLONG attributes);
@@ -191,6 +192,56 @@ bool working_set_checks()
            null_error == ERROR_INVALID_PARAMETER;
 }
 
+// Synthetic QueryVideoMemoryInfo results for xmem_gpu_usage::domain_bytes, one LUID's share of the
+// value at +8, passed on to total() as the shim does.
+bool node_checks()
+{
+    using Reading = std::optional<std::uint64_t>; // nothing: the query fails
+    using Nodes = std::vector<std::array<Reading, 2>>; // per node: local, non-local
+    constexpr std::uint64_t mib = 1ull << 20;
+    const std::wstring gpu_a = LR"(PCI\VEN_10DE&DEV_28E0\4&1&0&0008)";
+    const std::wstring gpu_b = LR"(PCI\VEN_10DE&DEV_28E0\4&2&0&0010)";
+    const std::wstring igpu = LR"(PCI\VEN_8086&DEV_A7A0\3&1&0&0010)";
+    struct Case {
+        const char* name;
+        std::uint32_t nodes; // as adapter_identity reports; 0 when unknown
+        Nodes readings;
+        std::vector<std::wstring> devices;
+        std::optional<std::uint64_t> expected;
+    };
+    const Case cases[] = {
+        {"single_node_segments", 1, {{64 * mib, 2 * mib}}, {gpu_a}, 66 * mib},
+        // A linked pair: nothing on node 0, so reading node 0 alone would report 0.
+        {"node1_only", 2, {{0, 0}, {64 * mib, 0}}, {gpu_a, gpu_b}, 64 * mib},
+        {"node_count_unknown", 0, {{0, 0}}, {}, std::nullopt},
+        {"segment_failed_after_read", 1, {{64 * mib, std::nullopt}}, {gpu_a}, std::nullopt},
+        {"node1_failed_after_node0", 2, {{64 * mib, 0}, {std::nullopt, 0}}, {gpu_a, gpu_b}, std::nullopt},
+        {"segment_overflow", 1, {{UINT64_MAX, 1}}, {gpu_a}, std::nullopt},
+        {"node_overflow", 2, {{UINT64_MAX, 0}, {1, 0}}, {gpu_a, gpu_b}, std::nullopt},
+    };
+    bool passed = true;
+    for (const auto& c : cases) {
+        const auto read = [&](std::uint32_t node, int group, std::uint64_t& bytes) noexcept {
+            if (node >= c.readings.size() || !c.readings[node][group]) return false;
+            bytes = *c.readings[node][group];
+            return true;
+        };
+        const auto bytes = xmem_gpu_usage::domain_bytes(c.nodes, read);
+        // The domain next to an idle integrated GPU, so total() must decline whenever domain_bytes() does.
+        const std::vector<xmem_gpu_usage::Domain> domains{{bytes.has_value(), bytes.value_or(0), c.devices},
+                                                          {true, 0, {igpu}}};
+        const auto result = xmem_gpu_usage::total(domains, true);
+        const bool ok = bytes == c.expected && result == c.expected;
+        passed &= ok;
+        if (result) {
+            std::printf("%s total=%llu %s\n", c.name, static_cast<unsigned long long>(*result), ok ? "ok" : "MISMATCH");
+        } else {
+            std::printf("%s declined %s\n", c.name, ok ? "ok" : "MISMATCH");
+        }
+    }
+    return passed;
+}
+
 // Synthetic per-adapter readings for xmem_gpu_usage::total, the aggregation behind the value at +8.
 bool aggregation_checks()
 {
@@ -260,7 +311,7 @@ bool aggregation_checks()
             std::printf("%s declined %s\n", c.name, ok ? "ok" : "MISMATCH");
         }
     }
-    return passed;
+    return node_checks() && passed;
 }
 
 // Lists the DXGI adapters with the identity the shim aggregates by, for GPU reports.
@@ -272,59 +323,15 @@ void describe_adapters()
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
         DXGI_ADAPTER_DESC1 desc{};
         if (FAILED(adapter->GetDesc1(&desc))) continue;
+        const auto identity = adapter_identity::query(desc.AdapterLuid);
         std::wstring devices;
-        for (const auto& device : adapter_identity::physical_devices(desc.AdapterLuid)) {
+        for (const auto& device : identity.devices) {
             devices += (devices.empty() ? L"" : L";") + device;
         }
-        std::printf("adapter %u %04x:%04x flags=%u luid=%08lx:%08lx device=%ls\n", i, desc.VendorId, desc.DeviceId,
-                    desc.Flags, desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart,
+        std::printf("adapter %u %04x:%04x flags=%u luid=%08lx:%08lx nodes=%u device=%ls\n", i, desc.VendorId,
+                    desc.DeviceId, desc.Flags, desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart, identity.nodes,
                     devices.empty() ? L"(unknown)" : devices.c_str());
     }
-}
-
-// As in offscreen_check: the first D3D12 hardware adapter in high-performance order, so a hybrid
-// laptop measures its discrete GPU. With XBOX2WINDOWS_ADAPTER, the first whose description
-// contains the value, ignoring case; a value that matches no adapter sets `unmatched`.
-Microsoft::WRL::ComPtr<ID3D12Device> create_device(bool warp, bool& unmatched)
-{
-    unmatched = false;
-    Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return nullptr;
-    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-    Microsoft::WRL::ComPtr<ID3D12Device> device;
-    if (warp) {
-        if (SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)))) {
-            D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
-        }
-        return device;
-    }
-    wchar_t wanted[128]{};
-    const DWORD filter = GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", wanted, 128);
-    if (filter >= 128) {
-        std::puts("XBOX2WINDOWS_ADAPTER is longer than 127 characters");
-        unmatched = true;
-        return nullptr;
-    }
-    for (UINT i = 0; factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                                                          IID_PPV_ARGS(&adapter)) != DXGI_ERROR_NOT_FOUND; ++i) {
-        DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
-        if (filter) {
-            bool match = false;
-            for (const wchar_t* text = desc.Description; *text && !match; ++text)
-                match = _wcsnicmp(text, wanted, filter) == 0;
-            if (!match) continue;
-        }
-        if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
-            std::printf("device adapter %04x:%04x %ls\n", desc.VendorId, desc.DeviceId, desc.Description);
-            return device;
-        }
-    }
-    if (filter) {
-        std::printf("No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=%ls\n", wanted);
-        unmatched = true;
-    }
-    return nullptr;
 }
 
 // Measures as the AMD callers do: reads the value before creating an object, after creating it

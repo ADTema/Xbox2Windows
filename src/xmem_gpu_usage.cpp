@@ -3,6 +3,7 @@
 #include "adapter_identity.h"
 
 #include <new>
+#include <utility>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -38,13 +39,18 @@ std::optional<std::uint64_t> process_bytes() noexcept
         DXGI_ADAPTER_DESC1 desc{};
         Microsoft::WRL::ComPtr<IDXGIAdapter3> memory;
         if (FAILED(adapter->GetDesc1(&desc)) || FAILED(adapter.As(&memory))) continue;
-        domain.queried = true;
-        for (const auto group : {DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL}) {
+        auto identity = adapter_identity::query(desc.AdapterLuid);
+        const auto bytes = domain_bytes(identity.nodes, [&](std::uint32_t node, int group, std::uint64_t& usage) {
             DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-            domain.queried &= SUCCEEDED(memory->QueryVideoMemoryInfo(0, group, &info));
-            domain.bytes += info.CurrentUsage;
-        }
-        domain.devices = adapter_identity::physical_devices(desc.AdapterLuid);
+            if (FAILED(memory->QueryVideoMemoryInfo(node, static_cast<DXGI_MEMORY_SEGMENT_GROUP>(group), &info))) {
+                return false;
+            }
+            usage = info.CurrentUsage;
+            return true;
+        });
+        domain.queried = bytes.has_value();
+        domain.bytes = bytes.value_or(0);
+        domain.devices = std::move(identity.devices);
     }
     return total(domains, complete);
 }

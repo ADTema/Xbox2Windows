@@ -10,13 +10,14 @@
 #endif
 #include <windows.h>
 #include <d3d12.h>
-#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <string_view>
+
+#include "../xmem_test_device.h"
 
 using word = std::uint64_t;
 extern "C" __declspec(dllimport) BOOL XMemGetWorkingSetStatistics(UINT32 selector, void* statistics);
@@ -54,25 +55,6 @@ Input bracket(const Sample& before, const Sample& after, std::uint32_t aliasable
 {
     return {before.status ? before.value : 0, after.value, static_cast<std::uint32_t>(after.status), aliasable};
 }
-
-Microsoft::WRL::ComPtr<ID3D12Device> create_device(bool warp)
-{
-    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return nullptr;
-    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-    if (warp) {
-        factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
-    } else {
-        Microsoft::WRL::ComPtr<IDXGIAdapter1> candidate;
-        for (UINT i = 0; !adapter && factory->EnumAdapters1(i, &candidate) != DXGI_ERROR_NOT_FOUND; ++i) {
-            DXGI_ADAPTER_DESC1 desc{};
-            if (SUCCEEDED(candidate->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) adapter = candidate;
-        }
-    }
-    Microsoft::WRL::ComPtr<ID3D12Device> device;
-    if (adapter) D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
-    return device;
-}
 }
 
 int main(int argc, char** argv)
@@ -80,7 +62,9 @@ int main(int argc, char** argv)
     using namespace std::literals;
     if (argc != 2 || (argv[1] != "warp"sv && argv[1] != "hardware"sv)) return 2;
     const bool warp = argv[1] == "warp"sv;
-    const auto device = create_device(warp);
+    bool unmatched = false;
+    const auto device = create_device(warp, unmatched);
+    if (unmatched) return 1;
     if (!device) {
         std::puts(warp ? "No D3D12 device on WARP" : "No D3D12-capable hardware adapter visible");
         return 77;

@@ -15,7 +15,7 @@
 #include <d3dkmthk.h>
 
 namespace adapter_identity {
-std::vector<std::wstring> physical_devices(const LUID& luid) noexcept
+Identity query(const LUID& luid) noexcept
 {
     D3DKMT_OPENADAPTERFROMLUID open{};
     open.AdapterLuid = luid;
@@ -28,10 +28,12 @@ std::vector<std::wstring> physical_devices(const LUID& luid) noexcept
             D3DKMTCloseAdapter(&close);
         }
     } close{open.hAdapter};
-    std::vector<std::wstring> devices;
     UINT count = 0;
     D3DKMT_QUERYADAPTERINFO query{open.hAdapter, KMTQAITYPE_PHYSICALADAPTERCOUNT, &count, sizeof(count)};
-    bool complete = D3DKMTQueryAdapterInfo(&query) == 0 && count > 0;
+    if (D3DKMTQueryAdapterInfo(&query) != 0) return {};
+    Identity identity{count, {}};
+    auto& devices = identity.devices;
+    bool complete = count > 0;
     for (UINT i = 0; complete && i < count; ++i) {
         WCHAR key[1024];
         UINT length = static_cast<UINT>(std::size(key));
@@ -41,11 +43,15 @@ std::vector<std::wstring> physical_devices(const LUID& luid) noexcept
         try {
             if (complete) devices.emplace_back(key, wcsnlen(key, std::size(key)));
         } catch (const std::bad_alloc&) {
-            return {};
+            devices.clear();
+            return identity;
         }
     }
-    if (!complete) return {};
-    std::sort(devices.begin(), devices.end());
-    return devices;
+    if (!complete) {
+        devices.clear();
+    } else {
+        std::sort(devices.begin(), devices.end());
+    }
+    return identity;
 }
 }
