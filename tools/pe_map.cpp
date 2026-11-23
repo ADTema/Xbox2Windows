@@ -1758,7 +1758,8 @@ extern "C" __declspec(dllexport) HANDLE WINAPI pe_map_main_create_thread(LPSECUR
         ++main.enroll_refused;
     }
     TerminateThread(thread, ENROLL_FAILED_EXIT);
-    WaitForSingleObject(watch, 10000);
+    // The enrollment reaper can close watch as soon as the worker is signaled.
+    WaitForSingleObject(thread, 10000);
     CloseHandle(thread);
     {
         const SlotLock hold;
