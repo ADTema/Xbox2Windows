@@ -399,14 +399,16 @@ add_custom_command(OUTPUT "${vm_translation_header}"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main -Vn vm_translation_cs -Fh "${vm_translation_header}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/vm_translation.hlsl"
     DEPENDS tests/vm_translation.hlsl VERBATIM)
-add_executable(vm_translation_check tests/vm_translation_check.cpp "${vm_translation_header}")
-target_include_directories(vm_translation_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" tests)
+add_executable(vm_translation_check tests/vm_translation_check.cpp src/d3d12_xs_range.cpp "${vm_translation_header}")
+target_include_directories(vm_translation_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" tests src)
 target_compile_features(vm_translation_check PRIVATE cxx_std_17)
-target_link_libraries(vm_translation_check PRIVATE d3d12 dxgi)
+target_link_libraries(vm_translation_check PRIVATE d3d12_xs_shim d3d12 dxgi)
 add_test(NAME vm_translation_shared_range COMMAND vm_translation_check shared_range)
 foreach(adapter IN ITEMS warp hardware)
-    add_test(NAME vm_translation_device_${adapter} COMMAND vm_translation_check device_${adapter})
-    set_tests_properties(vm_translation_device_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    foreach(scenario IN ITEMS device sequence range range_lifetime range_partial)
+        add_test(NAME vm_translation_${scenario}_${adapter} COMMAND vm_translation_check ${scenario}_${adapter})
+        set_tests_properties(vm_translation_${scenario}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
 endforeach()
 # XG-style swizzle selection compared with AMD addrlib (#870). addrlib is an optional local dependency
 # fetched by tools/fetch_addrlib.py into out/deps/mesa (Mesa 25.1.0, src/amd/addrlib, MIT); without it the
