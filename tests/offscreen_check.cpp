@@ -2,10 +2,13 @@
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <cstdio>
 #include <cwchar>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 #include <iterator>
@@ -24,24 +27,6 @@ __declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
 
 using Microsoft::WRL::ComPtr;
 constexpr UINT side = 64;
-
-void check(HRESULT hr, const char* stage)
-{
-    if (FAILED(hr)) {
-        std::fprintf(stderr, "%s failed (HRESULT 0x%08lx)\n", stage, static_cast<unsigned long>(hr));
-        throw std::runtime_error(stage);
-    }
-}
-
-HRESULT check_feature(ID3D12Device* device, D3D12_FEATURE feature, void* data, UINT size)
-{
-#if defined(OFFSCREEN_AGILITY_620) && defined(__ID3D12Device16_INTERFACE_DEFINED__)
-    ComPtr<ID3D12Device16> versioned;
-    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&versioned))))
-        return versioned->CheckFeatureSupport1(feature, data, size, D3D12SDKVersion);
-#endif
-    return device->CheckFeatureSupport(feature, data, size);
-}
 
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
@@ -102,19 +87,6 @@ ComPtr<IDXGIAdapter1> select_adapter(IDXGIFactory6* factory, bool warp, ComPtr<I
             std::fprintf(stderr, "XBOX2WINDOWS_ADAPTER: skipping %ls\n", desc.Description);
         }
     }
-}
-
-ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc,
-                               D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
-                               const D3D12_CLEAR_VALUE* clear)
-{
-    D3D12_HEAP_PROPERTIES props{};
-    props.Type = heap;
-    props.CreationNodeMask = props.VisibleNodeMask = 1;
-    ComPtr<ID3D12Resource> result;
-    check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, clear,
-                                          IID_PPV_ARGS(&result)), "Create resource");
-    return result;
 }
 
 void save_bitmap(const char* path, const std::vector<BYTE>& bgra)
@@ -339,56 +311,944 @@ bool report_debug_errors(ID3D12InfoQueue* messages)
     return errors != 0;
 }
 
-// These operations create pipelines from cs_6_5 fixtures. An adapter below SM 6.5, such as the
-// Windows 10 in-box WARP (SM 6.2), rejects them at pipeline creation with E_INVALIDARG.
-bool needs_cs_6_5(std::string_view operation)
+struct AdapterCaps {
+    D3D_SHADER_MODEL highest_shader_model{};
+    bool int64_shader_ops = false;
+    bool wave_ops = false;
+    UINT wave_lane_count_min = 0;
+    UINT wave_lane_count_max = 0;
+};
+
+AdapterCaps query_adapter_caps(ID3D12Device* device)
 {
-    return operation == "--bvh-reads" || operation == "--bvh-waves" ||
-           operation == "--bvh-hits" || operation == "--bvh-packed" || operation == "--bvh-numeric" ||
-           operation == "--bvh-atomics";
+    AdapterCaps caps{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1{};
+    check(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1)),
+          "Query adapter D3D12 options1");
+    caps.int64_shader_ops = options1.Int64ShaderOps != FALSE;
+    caps.wave_ops = options1.WaveOps != FALSE;
+    caps.wave_lane_count_min = options1.WaveLaneCountMin;
+    caps.wave_lane_count_max = options1.WaveLaneCountMax;
+
+    // Older runtimes reject shader-model enums above what they recognize with E_INVALIDARG.
+    for (D3D_SHADER_MODEL requested : {
+             D3D_SHADER_MODEL_6_6,
+             D3D_SHADER_MODEL_6_5,
+             D3D_SHADER_MODEL_6_4,
+             D3D_SHADER_MODEL_6_3,
+             D3D_SHADER_MODEL_6_2,
+             D3D_SHADER_MODEL_6_1,
+             D3D_SHADER_MODEL_6_0,
+             D3D_SHADER_MODEL_5_1,
+         }) {
+        D3D12_FEATURE_DATA_SHADER_MODEL model{requested};
+        const HRESULT hr = check_feature(device, D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+        if (hr == E_INVALIDARG) continue;
+        check(hr, "Query adapter shader model");
+        caps.highest_shader_model = model.HighestShaderModel;
+        break;
+    }
+    return caps;
 }
 
-bool supports_cs_6_5(ID3D12Device* device)
+enum class OutcomeKind { pass, skip, fail };
+
+struct OperationResult {
+    OutcomeKind kind = OutcomeKind::pass;
+    const char* detail = nullptr;
+};
+
+enum class CapsDiagnostic {
+    none,
+    shader_model_6_0,
+    shader_model_6_5,
+    wave_6_6,
+};
+
+struct CapabilityGate {
+    D3D_SHADER_MODEL min_shader_model{};
+    bool require_int64_ops = false;
+    bool require_wave_ops = false;
+    UINT required_wave_lane_count = 0;
+    const char* skip_reason = nullptr;
+    CapsDiagnostic diagnostic = CapsDiagnostic::none;
+};
+
+struct OperationContext {
+    ID3D12Device* device = nullptr;
+    ID3D12InfoQueue* messages = nullptr;
+    const AdapterCaps& caps;
+    std::string_view mode;
+    int argc = 0;
+    char** argv = nullptr;
+    void* user_data = nullptr;
+};
+
+using ValidateArgsFn = bool (*)(int argc, char** argv);
+using RunOperationFn = OperationResult (*)(const OperationContext& ctx);
+
+struct OperationSpec {
+    std::string_view name;
+    int min_argc;
+    int max_argc;
+    ValidateArgsFn validate_args;
+    CapabilityGate gate;
+    RunOperationFn run;
+};
+
+constexpr int kUnboundedArgc = (std::numeric_limits<int>::max)();
+
+OperationResult skip_if_false(bool ok, const char* skip_detail = nullptr)
 {
-    D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_5};
-    check(check_feature(device, D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query fixture shader model");
-    std::printf("shader_model_capped_at_6_5=0x%x\n", model.HighestShaderModel);
-    return model.HighestShaderModel >= D3D_SHADER_MODEL_6_5;
+    return ok ? OperationResult{OutcomeKind::pass, nullptr}
+              : OperationResult{OutcomeKind::skip, skip_detail};
+}
+
+bool validate_check_pixel_args(int, char** argv)
+{
+    const std::string_view format = argv[4];
+    return format == "rgba" || format == "bgra";
+}
+
+bool validate_mesh_entry_args(int argc, char** argv)
+{
+    if (argc == 6) return true;
+    const std::string_view order = argv[6];
+    return order == "ab" || order == "ba";
+}
+
+bool validate_mesh_entry_table_args(int argc, char** argv)
+{
+    return argc == 6 || std::string_view(argv[6]) == "--swap";
+}
+
+bool validate_compute_mesh_texture_args(int argc, char** argv)
+{
+    return argc != 9 || std::string_view(argv[8]) == "--stale";
+}
+
+OperationResult run_check_pixel_batch(const OperationContext& ctx)
+{
+    bool failed = false;
+    for (int i = 4; i < ctx.argc; ++i) {
+        const char* status = "pass";
+        std::fprintf(stderr, "case=%d path=%s\n", i - 4, ctx.argv[i]);
+        try {
+            check(ctx.device->GetDeviceRemovedReason(), "Pixel batch device");
+            check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[i]);
+        } catch (const PixelMismatch& e) {
+            std::fprintf(stderr, "%s\n", e.what());
+            status = "mismatch";
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "%s\n", e.what());
+            status = "error";
+        }
+        if (report_debug_errors(ctx.messages) || FAILED(ctx.device->GetDeviceRemovedReason()))
+            status = "error";
+        if (ctx.messages) ctx.messages->ClearStoredMessages();
+        std::printf("case=%d status=%s\n", i - 4, status);
+        failed |= std::string_view(status) != "pass";
+    }
+    return failed ? OperationResult{OutcomeKind::fail, nullptr} : OperationResult{OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_compute_root(const OperationContext& ctx)
+{
+    check_compute(ctx.device, false);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_compute_tables(const OperationContext& ctx)
+{
+    check_compute(ctx.device, true);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_compute_root_file(const OperationContext& ctx)
+{
+    check_compute_file(ctx.device, ctx.argv[3], false);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_ffx_immediate_conversion(const OperationContext& ctx)
+{
+    check_compute_file(ctx.device, ctx.argv[3], true);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_compute_store_case(const OperationContext& ctx)
+{
+    check_compute_file(ctx.device, ctx.argv[3], false, ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_sampler_views(const OperationContext& ctx)
+{
+    check_sampler_views(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window(const OperationContext& ctx)
+{
+    check_spirv_window(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_compare_sampler(const OperationContext& ctx)
+{
+    check_spirv_compare_sampler(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                ctx.argc == 7 ? ctx.argv[6] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_compaction(const OperationContext& ctx)
+{
+    check_spirv_compaction(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_ffx_device_init(const OperationContext& ctx)
+{
+    check_ffx_device_init(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_ffx_provider_loop(const OperationContext& ctx)
+{
+    check_ffx_provider_loop(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_ffx_recurrent(const OperationContext& ctx)
+{
+    check_ffx_recurrent(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_dual_uav(const OperationContext& ctx)
+{
+    check_dual_uav(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_texture_mips(const OperationContext& ctx)
+{
+    check_texture_mips(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_bc7_tail(const OperationContext& ctx)
+{
+    check_bc7_tail(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argc - 5, ctx.argv + 5);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_bc7_mip1(const OperationContext& ctx)
+{
+    check_bc7_pixel(ctx.device, ctx.argv[3], ctx.argv[4], nullptr, ctx.argv[5]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_bc7(const OperationContext& ctx)
+{
+    check_bc7_pixel(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argc == 6 ? ctx.argv[5] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_dual_pixel(const OperationContext& ctx)
+{
+    check_dual_pixel(ctx.device, ctx.argv[3], ctx.argv[4], false);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_dual_pixel_swapped(const OperationContext& ctx)
+{
+    check_dual_pixel(ctx.device, ctx.argv[3], ctx.argv[4], true);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_sampled_coverage(const OperationContext& ctx)
+{
+    check_sampled_coverage(ctx.device, ctx.argv[3], ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_compare(const OperationContext& ctx)
+{
+    check_pixel_compare(ctx.device, ctx.argv[3], ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_case(const OperationContext& ctx)
+{
+    check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_case_rg(const OperationContext& ctx)
+{
+    check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4],
+                           D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_compute_to_pixel(const OperationContext& ctx)
+{
+    check_compute_to_pixel(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argc == 7 ? ctx.argv[6] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_attribute(const OperationContext& ctx)
+{
+    check_attribute_pixel(ctx.device, ctx.argv[3], ctx.argv[4], false);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_attribute_rg(const OperationContext& ctx)
+{
+    check_attribute_pixel(ctx.device, ctx.argv[3], ctx.argv[4], true);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
+{
+    check_pixel_quad_lod(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel(const OperationContext& ctx)
+{
+    check_translated_pixel(ctx.device, ctx.argv[3], std::string_view(ctx.argv[4]) == "bgra");
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_depth_mask(const OperationContext& ctx)
+{
+    check_depth_mask_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_depth_mask_swapped(const OperationContext& ctx)
+{
+    check_depth_mask_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_mesh_entry(const OperationContext& ctx)
+{
+    auto binding = MeshConstantBinding::root;
+    if (ctx.argc == 7)
+        binding = ctx.argv[6][0] == 'b' ? MeshConstantBinding::swapped_root_pair : MeshConstantBinding::root_pair;
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false, binding));
+}
+
+OperationResult run_mesh_indexed(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true));
+}
+
+OperationResult run_mesh_indexed_fallback(const OperationContext& ctx)
+{
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_mesh_entry_table(const OperationContext& ctx)
+{
+    const auto binding = ctx.argc == 7 ? MeshConstantBinding::swapped_table : MeshConstantBinding::table;
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false, binding));
+}
+
+OperationResult run_mesh_textured(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                               true, MeshConstantBinding::root, MeshDrawMode::textured));
+}
+
+OperationResult run_compute_mesh_texture(const OperationContext& ctx)
+{
+    const MeshTextureProducers producers{ctx.argv[6], ctx.argc >= 8 ? ctx.argv[7] : nullptr, ctx.argc == 9};
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                               true, MeshConstantBinding::root, MeshDrawMode::textured, &producers));
+}
+
+OperationResult run_mesh_depth_pair(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                               true, MeshConstantBinding::root, MeshDrawMode::depth_pair));
+}
+
+OperationResult run_mesh_shadow(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_shadow_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6],
+                                                ctx.argc == 8));
+}
+
+bool validate_mesh_shadow_args(int argc, char** argv)
+{
+    return argc == 7 || std::string_view(argv[7]) == "stale";
+}
+
+OperationResult run_bvh_root_roundtrip(const OperationContext& ctx)
+{
+    check_bvh_root_roundtrip(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_bvh_differential(const OperationContext& ctx)
+{
+    return skip_if_false(check_bvh_differential(ctx.device, false));
+}
+
+OperationResult run_bvh_differential_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_bvh_differential(ctx.device, true));
+}
+
+OperationResult run_bvh_hits(const OperationContext& ctx)
+{
+    check_bvh_hits(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_bvh_packed(const OperationContext& ctx)
+{
+    check_bvh_packed(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_bvh_numeric(const OperationContext& ctx)
+{
+    check_bvh_numeric(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_bvh_atomics(const OperationContext& ctx)
+{
+    check_bvh_atomics(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_bvh_reads(const OperationContext& ctx)
+{
+    check_bvh_reads(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_bvh_waves(const OperationContext& ctx)
+{
+    return skip_if_false(check_bvh_waves(ctx.device, false));
+}
+
+OperationResult run_bvh_wave64(const OperationContext& ctx)
+{
+    return skip_if_false(check_bvh_waves(ctx.device, true));
+}
+
+OperationResult run_dxr_update(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_update(ctx.device));
+}
+
+OperationResult run_dxr_facing(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_facing(ctx.device));
+}
+
+OperationResult run_dxr_opacity(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp"));
+}
+
+OperationResult run_ray_query(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_rays(ctx.device, false));
+}
+
+OperationResult run_dxr_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_rays(ctx.device, true));
+}
+
+OperationResult run_gpu_alias(const OperationContext& ctx)
+{
+    return skip_if_false(check_gpu_alias(ctx.device));
+}
+
+OperationResult run_gpu_alias_lookup(const OperationContext& ctx)
+{
+    return skip_if_false(check_gpu_alias_lookup(ctx.device));
+}
+
+OperationResult run_gpu_alias_lookup_writes(const OperationContext& ctx)
+{
+    return skip_if_false(check_gpu_alias_lookup_writes(ctx.device));
+}
+
+OperationResult run_gpu_alias_registry(const OperationContext& ctx)
+{
+    return skip_if_false(check_gpu_alias_registry(ctx.device));
+}
+
+OperationResult run_buffer_ops(const OperationContext& ctx)
+{
+    check_buffer_ops(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_wave_shuffle(const OperationContext& ctx)
+{
+    return skip_if_false(
+        check_wave_shuffle(ctx.device),
+        "skip: wave shuffle fixture requires SM 6.6 and a supported forced wave width");
+}
+
+constexpr CapabilityGate kNoGate{};
+constexpr CapabilityGate kGateSm60BufferOps{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "Buffer operations require Shader Model 6.0",
+    CapsDiagnostic::shader_model_6_0};
+constexpr CapabilityGate kGateSm65{
+    D3D_SHADER_MODEL_6_5, false, false, 0,
+    "skip: fixture requires Shader Model 6.5",
+    CapsDiagnostic::shader_model_6_5};
+constexpr CapabilityGate kGateWave64{
+    D3D_SHADER_MODEL_6_6, false, true, 64,
+    "skip: 64-lane wave fixture requires SM 6.6, WaveOps, and 64-lane waves",
+    CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateWaveShuffle{
+    D3D_SHADER_MODEL_6_5, false, true, 0,
+    "skip: wave shuffle fixture requires SM 6.5 and WaveOps",
+    CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateSm60MeshFallback{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: indexed mesh fallback requires SM 6.0",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60SamplerViews{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: sampler fixture requires SM 6.0",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66CompareSampler{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "skip: comparison-sampler fixture requires SM 6.6",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateAddressWindow{
+    D3D_SHADER_MODEL_6_6, true, false, 0,
+    "skip: address window fixture requires SM 6.6 and 64-bit shader integer operations",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66Ballot{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "skip: ballot fixture requires SM 6.6",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66Compaction{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "skip: subgroup compaction fixture requires SM 6.6",
+    CapsDiagnostic::none};
+
+// Static argument shapes and unconditional adapter prerequisites for every named operation.
+// Scenario-dependent capability checks (such as DXR tier, mesh tier, or existing-heap support)
+// remain inside the handlers and report OutcomeKind::skip.
+const OperationSpec kOperations[] = {
+    {"--check-pixel-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_pixel_batch},
+    {"--compute-root", 3, 3, nullptr, kNoGate, run_compute_root},
+    {"--compute-tables", 3, 3, nullptr, kNoGate, run_compute_tables},
+    {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
+    {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
+    {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
+    {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
+    {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm66CompareSampler, run_spirv_compare_sampler},
+    // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
+    {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
+    {"--spirv-compaction", 4, 4, nullptr, kGateSm66Compaction, run_spirv_compaction},
+    {"--ffx-device-init", 3, 3, nullptr, kNoGate, run_ffx_device_init},
+    {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
+    {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
+    {"--dual-uav", 3, 3, nullptr, kNoGate, run_dual_uav},
+    {"--texture-mips", 3, 3, nullptr, kNoGate, run_texture_mips},
+    {"--check-bc7-tail", 6, kUnboundedArgc, nullptr, kNoGate, run_check_bc7_tail},
+    {"--check-bc7-mip1", 6, 6, nullptr, kNoGate, run_check_bc7_mip1},
+    {"--check-bc7", 5, 6, nullptr, kNoGate, run_check_bc7},
+    {"--dual-pixel", 5, 5, nullptr, kNoGate, run_dual_pixel},
+    {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
+    {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
+    {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
+    {"--check-pixel-case", 5, 5, nullptr, kNoGate, run_check_pixel_case},
+    {"--check-pixel-case-rg", 5, 5, nullptr, kNoGate, run_check_pixel_case_rg},
+    {"--compute-to-pixel", 6, 7, nullptr, kNoGate, run_compute_to_pixel},
+    {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
+    {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
+    {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
+    {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
+    {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
+    {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
+    {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
+    {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
+    {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
+    {"--mesh-textured", 6, 6, nullptr, kNoGate, run_mesh_textured},
+    {"--compute-mesh-texture", 7, 9, validate_compute_mesh_texture_args, kNoGate, run_compute_mesh_texture},
+    {"--mesh-depth-pair", 6, 6, nullptr, kNoGate, run_mesh_depth_pair},
+    {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
+    {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},
+    {"--bvh-differential", 3, 3, nullptr, kNoGate, run_bvh_differential},
+    {"--bvh-differential-pipeline", 3, 3, nullptr, kNoGate, run_bvh_differential_pipeline},
+    {"--bvh-hits", 3, 3, nullptr, kGateSm65, run_bvh_hits},
+    {"--bvh-packed", 3, 3, nullptr, kGateSm65, run_bvh_packed},
+    {"--bvh-numeric", 3, 3, nullptr, kGateSm65, run_bvh_numeric},
+    {"--bvh-atomics", 3, 3, nullptr, kGateSm65, run_bvh_atomics},
+    {"--bvh-reads", 3, 3, nullptr, kGateSm65, run_bvh_reads},
+    {"--bvh-waves", 3, 3, nullptr, kGateSm65, run_bvh_waves},
+    {"--bvh-wave64", 3, 3, nullptr, kGateWave64, run_bvh_wave64},
+    {"--dxr-update", 3, 3, nullptr, kNoGate, run_dxr_update},
+    {"--dxr-facing", 3, 3, nullptr, kNoGate, run_dxr_facing},
+    {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
+    {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
+    {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
+    {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
+    {"--gpu-alias-lookup", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup},
+    {"--gpu-alias-lookup-writes", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup_writes},
+    {"--gpu-alias-registry", 3, 3, nullptr, kNoGate, run_gpu_alias_registry},
+    {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
+    {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
+};
+
+struct DiagnosticTarget {
+    std::string* capture_stdout = nullptr;
+    std::string* capture_stderr = nullptr;
+};
+
+void emit_line(std::string* capture, FILE* stream, const char* text)
+{
+    if (!text || !text[0]) return;
+    if (capture) {
+        capture->append(text);
+        capture->push_back('\n');
+        return;
+    }
+    std::fprintf(stream, "%s\n", text);
+}
+
+template <typename... Args>
+void emit_format(std::string* capture, FILE* stream, const char* fmt, Args... args)
+{
+    char buffer[256];
+    const int n = std::snprintf(buffer, sizeof(buffer), fmt, args...);
+    if (n <= 0) return;
+    if (capture) {
+        capture->append(buffer);
+        return;
+    }
+    std::fputs(buffer, stream);
+}
+
+enum class CliAction {
+    usage_error,
+    self_test,
+    draw,
+    operation,
+};
+
+struct CliResolution {
+    CliAction action = CliAction::usage_error;
+    std::string_view mode;
+    const OperationSpec* spec = nullptr;
+};
+
+const OperationSpec* find_operation(std::string_view name)
+{
+    for (const auto& spec : kOperations) {
+        if (spec.name == name) return &spec;
+    }
+    return nullptr;
+}
+
+CliResolution resolve_cli(int argc, char** argv, DiagnosticTarget diag = {})
+{
+    if (argc == 2 && std::string_view(argv[1]) == "--self-test")
+        return {CliAction::self_test, {}, nullptr};
+    if (argc < 3) return {CliAction::usage_error, {}, nullptr};
+    const std::string_view mode = argv[1];
+    if (mode != "warp" && mode != "hardware") return {CliAction::usage_error, {}, nullptr};
+
+    const std::string_view operation = argv[2];
+    if (operation.size() >= 2 && operation.substr(0, 2) == "--") {
+        const OperationSpec* spec = find_operation(operation);
+        if (!spec || argc < spec->min_argc || argc > spec->max_argc ||
+            (spec->validate_args && !spec->validate_args(argc, argv))) {
+            emit_format(diag.capture_stderr, stderr, "Unknown GPU operation or invalid arguments: %s\n", argv[2]);
+            return {CliAction::usage_error, {}, nullptr};
+        }
+        return {CliAction::operation, mode, spec};
+    }
+
+    if (argc != 3 && argc != 5) return {CliAction::usage_error, {}, nullptr};
+    return {CliAction::draw, mode, nullptr};
+}
+
+bool evaluate_gate(const CapabilityGate& gate, const AdapterCaps& caps, DiagnosticTarget diag = {})
+{
+    if (gate.diagnostic == CapsDiagnostic::shader_model_6_5) {
+        emit_format(diag.capture_stdout, stdout, "shader_model_capped_at_6_5=0x%x\n",
+                    static_cast<unsigned>((std::min)(caps.highest_shader_model, D3D_SHADER_MODEL_6_5)));
+    }
+    const bool ok =
+        caps.highest_shader_model >= gate.min_shader_model &&
+        (!gate.require_int64_ops || caps.int64_shader_ops) &&
+        (!gate.require_wave_ops || caps.wave_ops) &&
+        (gate.required_wave_lane_count == 0 ||
+         (caps.wave_lane_count_min <= gate.required_wave_lane_count &&
+          caps.wave_lane_count_max >= gate.required_wave_lane_count));
+    if (!ok) {
+        if (gate.diagnostic == CapsDiagnostic::wave_6_6) {
+            emit_format(diag.capture_stdout, stdout,
+                        "native_lane_range=%u..%u shader_model_capped_at_6_6=0x%x\n",
+                        caps.wave_lane_count_min, caps.wave_lane_count_max,
+                        static_cast<unsigned>((std::min)(caps.highest_shader_model, D3D_SHADER_MODEL_6_6)));
+        }
+        emit_line(diag.capture_stdout, stdout, gate.skip_reason);
+        return false;
+    }
+    if (gate.diagnostic == CapsDiagnostic::shader_model_6_0) {
+        emit_format(diag.capture_stdout, stdout, "shader_model_capped_at_6_0=0x%x\n",
+                    static_cast<unsigned>((std::min)(caps.highest_shader_model, D3D_SHADER_MODEL_6_0)));
+    }
+    return true;
+}
+
+int run_operation_spec(const OperationSpec& spec, const OperationContext& ctx, DiagnosticTarget diag = {})
+{
+    if (!evaluate_gate(spec.gate, ctx.caps, diag)) return 77;
+    try {
+        const OperationResult result = spec.run(ctx);
+        switch (result.kind) {
+        case OutcomeKind::pass:
+            return report_debug_errors(ctx.messages) ? 1 : 0;
+        case OutcomeKind::skip:
+            emit_line(diag.capture_stdout, stdout, result.detail);
+            return 77;
+        case OutcomeKind::fail:
+            emit_line(diag.capture_stderr, stderr, result.detail);
+            report_debug_errors(ctx.messages);
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        emit_line(diag.capture_stderr, stderr, e.what());
+        report_debug_errors(ctx.messages);
+        return 1;
+    }
+    return 1;
+}
+
+int run_self_test()
+{
+    auto require = [](bool condition, const char* what) {
+        if (!condition) {
+            std::fprintf(stderr, "offscreen_check self-test failed: %s\n", what);
+            return false;
+        }
+        return true;
+    };
+
+    // Table sanity: unique --* names, valid arity bounds, non-null runners.
+    for (std::size_t i = 0; i < std::size(kOperations); ++i) {
+        const auto& op = kOperations[i];
+        if (!require(op.name.size() > 2 && op.name.substr(0, 2) == "--", "operation name prefix")) return 1;
+        if (!require(op.min_argc >= 3 && op.max_argc >= op.min_argc, "operation arity bounds")) return 1;
+        if (!require(op.run != nullptr, "operation runner")) return 1;
+        for (std::size_t j = i + 1; j < std::size(kOperations); ++j) {
+            if (!require(op.name != kOperations[j].name, "duplicate operation name")) return 1;
+        }
+    }
+
+    // (a) CLI validation rejects unknown --*, bad argc, bad flags, and bad positional draw argc with usage_error (exit 2).
+    auto check_cli = [&](std::vector<const char*> args, CliAction expected_action,
+                         std::string_view expected_err_substr = {}) {
+        std::vector<char*> mut_argv;
+        std::vector<std::string> storage;
+        storage.reserve(args.size());
+        for (const char* s : args) storage.emplace_back(s);
+        for (auto& s : storage) mut_argv.push_back(&s[0]);
+        std::string out, err;
+        const CliResolution res = resolve_cli(static_cast<int>(mut_argv.size()), mut_argv.data(), {&out, &err});
+        if (!require(res.action == expected_action, args.size() > 2 ? args[2] : "cli_action")) return false;
+        if (!expected_err_substr.empty() &&
+            !require(err.find(expected_err_substr) != std::string::npos, "expected stderr substring")) {
+            return false;
+        }
+        return true;
+    };
+
+    if (!check_cli({"offscreen_check", "warp", "--bvh-wave"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --bvh-wave")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--dual-uav", "extra"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --dual-uav")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--compute-root-file"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --compute-root-file")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-sampler-views"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --spirv-sampler-views")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --spirv-compare-sampler")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin", "baseline", "extra"},
+                   CliAction::usage_error, "Unknown GPU operation or invalid arguments: --spirv-compare-sampler"))
+        return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-ballot", "a.dxil"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --spirv-ballot")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "invalid"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-entry")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-indexed-fallback")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-entry-table", "a", "b", "c", "--bad"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-entry-table")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--compute-mesh-texture", "a", "b", "c", "d", "e", "--bad"},
+                   CliAction::usage_error, "Unknown GPU operation or invalid arguments: --compute-mesh-texture"))
+        return 1;
+    if (!check_cli({"offscreen_check", "warp", "out.bmp", "vs.cso"}, CliAction::usage_error)) return 1;
+    if (!check_cli({"offscreen_check", "invalid_backend", "--dual-uav"}, CliAction::usage_error)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "out.bmp"}, CliAction::draw)) return 1;
+    if (!check_cli({"offscreen_check", "hardware", "out.bmp", "vs.cso", "ps.cso"}, CliAction::draw)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "bgra"}, CliAction::operation)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps", "fixture"},
+                   CliAction::operation)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin"},
+                   CliAction::operation)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-ballot", "a.dxil", "case.bin"}, CliAction::operation)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin", "baseline"},
+                   CliAction::operation)) return 1;
+
+    // (b) Unmet CapabilityGate exits 77 with named skip reason without invoking the handler.
+    {
+        bool called = false;
+        const OperationSpec gated{
+            "--self-test-gated",
+            3,
+            3,
+            nullptr,
+            {D3D_SHADER_MODEL_6_6, true, false, 0, "skip: self-test requires SM 6.6 and Int64ShaderOps",
+             CapsDiagnostic::none},
+            [](const OperationContext& ctx) -> OperationResult {
+                *static_cast<bool*>(ctx.user_data) = true;
+                return {OutcomeKind::fail, "handler must not execute when gate fails"};
+            },
+        };
+        const AdapterCaps low_caps{D3D_SHADER_MODEL_6_5, false, true, 32, 32};
+        char prog[] = "offscreen_check";
+        char mode[] = "warp";
+        char op[] = "--self-test-gated";
+        char* argv[]{prog, mode, op};
+        OperationContext ctx{nullptr, nullptr, low_caps, "warp", 3, argv, &called};
+        std::string out, err;
+        const int code = run_operation_spec(gated, ctx, {&out, &err});
+        if (!require(code == 77, "unmet gate must exit 77")) return 1;
+        if (!require(!called, "unmet gate must not invoke handler")) return 1;
+        if (!require(out.find("skip: self-test requires SM 6.6 and Int64ShaderOps") != std::string::npos,
+                     "unmet gate must print named skip reason")) return 1;
+
+        // Also verify wave-64 gate prints native_lane_range before skipping.
+        const AdapterCaps wave32_caps{D3D_SHADER_MODEL_6_6, true, true, 32, 32};
+        const OperationSpec wave64_gated{
+            "--self-test-wave64", 3, 3, nullptr, kGateWave64,
+            [](const OperationContext& c) -> OperationResult {
+                *static_cast<bool*>(c.user_data) = true;
+                return {OutcomeKind::pass, nullptr};
+            },
+        };
+        OperationContext wctx{nullptr, nullptr, wave32_caps, "warp", 3, argv, &called};
+        out.clear();
+        err.clear();
+        const int wcode = run_operation_spec(wave64_gated, wctx, {&out, &err});
+        if (!require(wcode == 77, "unmet wave64 gate must exit 77")) return 1;
+        if (!require(!called, "unmet wave64 gate must not invoke handler")) return 1;
+        if (!require(out.find("native_lane_range=32..32 shader_model_capped_at_6_6=0x66") != std::string::npos,
+                     "unmet wave64 gate must preserve native_lane_range diagnostic")) return 1;
+
+        // The ballot fixture skips on a runtime capped at SM 6.5, as the Windows 10 in-box runtime is (#751).
+        const OperationSpec* ballot = find_operation("--spirv-ballot");
+        if (!require(ballot != nullptr, "--spirv-ballot operation")) return 1;
+        char ballot_op[] = "--spirv-ballot";
+        char dxil[] = "a.dxil";
+        char case_file[] = "case.bin";
+        char* ballot_argv[]{prog, mode, ballot_op, dxil, case_file};
+        OperationContext bctx{nullptr, nullptr, low_caps, "warp", 5, ballot_argv, nullptr};
+        out.clear();
+        err.clear();
+        if (!require(run_operation_spec(*ballot, bctx, {&out, &err}) == 77, "--spirv-ballot below SM 6.6 must exit 77"))
+            return 1;
+        if (!require(out.find("skip: ballot fixture requires SM 6.6") != std::string::npos,
+                     "--spirv-ballot must print its skip reason")) return 1;
+    }
+
+    // (c) Handler OutcomeKind::fail and thrown exception exit 1 (never 77); OutcomeKind::skip exits 77; pass exits 0.
+    {
+        const AdapterCaps caps{D3D_SHADER_MODEL_6_6, true, true, 32, 64};
+        char prog[] = "offscreen_check";
+        char mode[] = "warp";
+        char op[] = "--self-test-outcome";
+        char* argv[]{prog, mode, op};
+        OperationContext ctx{nullptr, nullptr, caps, "warp", 3, argv, nullptr};
+
+        const OperationSpec fail_spec{
+            "--self-test-fail", 3, 3, nullptr, kNoGate,
+            [](const OperationContext&) -> OperationResult {
+                return {OutcomeKind::fail, "explicit failure control"};
+            },
+        };
+        std::string out, err;
+        if (!require(run_operation_spec(fail_spec, ctx, {&out, &err}) == 1, "OutcomeKind::fail must exit 1"))
+            return 1;
+        if (!require(err.find("explicit failure control") != std::string::npos, "OutcomeKind::fail detail"))
+            return 1;
+
+        const OperationSpec throw_spec{
+            "--self-test-throw", 3, 3, nullptr, kNoGate,
+            [](const OperationContext&) -> OperationResult {
+                throw std::runtime_error("thrown exception control");
+            },
+        };
+        out.clear();
+        err.clear();
+        if (!require(run_operation_spec(throw_spec, ctx, {&out, &err}) == 1, "thrown exception must exit 1"))
+            return 1;
+        if (!require(err.find("thrown exception control") != std::string::npos, "thrown exception detail"))
+            return 1;
+
+        const OperationSpec skip_spec{
+            "--self-test-skip", 3, 3, nullptr, kNoGate,
+            [](const OperationContext&) -> OperationResult {
+                return {OutcomeKind::skip, "scenario skip control"};
+            },
+        };
+        out.clear();
+        err.clear();
+        if (!require(run_operation_spec(skip_spec, ctx, {&out, &err}) == 77, "OutcomeKind::skip must exit 77"))
+            return 1;
+        if (!require(out.find("scenario skip control") != std::string::npos, "OutcomeKind::skip detail"))
+            return 1;
+
+        const OperationSpec pass_spec{
+            "--self-test-pass", 3, 3, nullptr, kNoGate,
+            [](const OperationContext&) -> OperationResult {
+                return {OutcomeKind::pass, nullptr};
+            },
+        };
+        out.clear();
+        err.clear();
+        if (!require(run_operation_spec(pass_spec, ctx, {&out, &err}) == 0, "OutcomeKind::pass must exit 0"))
+            return 1;
+    }
+
+    std::puts("offscreen_self_test: cli_validation=ok gate_skip=ok outcome_fail=ok outcome_throw=ok outcome_skip=ok outcome_pass=ok");
+    return 0;
 }
 
 int main(int argc, char** argv)
 {
-    if (argc < 3) return 2;
-    const std::string_view operation = argv[2];
-    if (operation == "--check-pixel-batch") {
-        if (argc < 5) return 2;
-    } else if (operation == "--compute-to-pixel") {
-        if (argc != 6 && argc != 7) return 2;
-    } else if (operation == "--compute-mesh-texture") {
-        if (argc != 7 && argc != 8 && (argc != 9 || std::string_view(argv[8]) != "--stale")) return 2;
-    } else if (operation == "--check-pixel-quad-lod") {
-        if (argc != 4) return 2;
-    } else if (operation == "--mesh-entry" || operation == "--mesh-indexed" || operation == "--mesh-textured") {
-        if (argc != 6 && !(operation == "--mesh-entry" && argc == 7 &&
-            (std::string_view(argv[6]) == "ab" || std::string_view(argv[6]) == "ba"))) return 2;
-    } else if (operation == "--mesh-entry-table") {
-        if (argc != 6 && (argc != 7 || std::string_view(argv[6]) != "--swap")) return 2;
-    } else if (operation == "--mesh-depth-pair") {
-        if (argc != 6) return 2;
-    } else if (operation == "--check-bc7-tail") {
-        if (argc < 6) return 2;
-    } else if ((operation == "--depth-mask" || operation == "--depth-mask-swapped")) {
-        if (argc != 6) return 2;
-    } else if (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion" ||
-               operation == "--spirv-address-window" || operation == "--spirv-sampler-views") {
-        if (argc != 4) return 2;
-    } else {
-        if (argc != 3 && argc != 5 && argc != 6) return 2;
-        if (argc == 6 && operation != "--check-bc7" && operation != "--check-bc7-mip1") return 2;
-    }
-    if ((operation == "--check-bc7" && argc < 5) || (operation == "--check-bc7-mip1" && argc != 6)) return 2;
-    const std::string_view mode = argv[1];
-    if (mode != "warp" && mode != "hardware") return 2;
+    const CliResolution cli = resolve_cli(argc, argv);
+    if (cli.action == CliAction::usage_error) return 2;
+    if (cli.action == CliAction::self_test) return run_self_test();
+
     ComPtr<ID3D12InfoQueue> messages;
     try {
         ComPtr<ID3D12Debug> debug;
@@ -409,9 +1269,9 @@ int main(int argc, char** argv)
         check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "Create DXGI factory");
         ComPtr<ID3D12Device> device;
 #ifdef OFFSCREEN_AGILITY_620
-        auto adapter = select_adapter(factory.Get(), mode == "warp", device, device_factory.Get());
+        auto adapter = select_adapter(factory.Get(), cli.mode == "warp", device, device_factory.Get());
 #else
-        auto adapter = select_adapter(factory.Get(), mode == "warp", device);
+        auto adapter = select_adapter(factory.Get(), cli.mode == "warp", device);
 #endif
         if (!adapter) {
             std::puts("No D3D12-capable hardware adapter visible");
@@ -428,164 +1288,13 @@ int main(int argc, char** argv)
             std::puts("driver=unavailable via DXGI");
         }
         if (debug) check(device.As(&messages), "Read debug queue");
-        if (operation == "--check-pixel-batch") {
-            bool failed = false;
-            for (int i = 4; i < argc; ++i) {
-                const char* status = "pass";
-                std::fprintf(stderr, "case=%d path=%s\n", i - 4, argv[i]);
-                try {
-                    check(device->GetDeviceRemovedReason(), "Pixel batch device");
-                    check_translated_pixel(device.Get(), argv[3], false, argv[i]);
-                } catch (const PixelMismatch& e) {
-                    std::fprintf(stderr, "%s\n", e.what());
-                    status = "mismatch";
-                } catch (const std::exception& e) {
-                    std::fprintf(stderr, "%s\n", e.what());
-                    status = "error";
-                }
-                if (report_debug_errors(messages.Get()) || FAILED(device->GetDeviceRemovedReason()))
-                    status = "error";
-                if (messages) messages->ClearStoredMessages();
-                std::printf("case=%d status=%s\n", i - 4, status);
-                failed |= std::string_view(status) != "pass";
-            }
-            return failed ? 1 : 0;
-        }
-        if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
-        if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
-            check_compute(device.Get(), operation == "--compute-tables");
-        } else if (operation == "--spirv-sampler-views") {
-            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
-            auto hr = check_feature(device.Get(), D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
-            if (hr != E_INVALIDARG) check(hr, "Query sampler fixture shader model");
-            if (hr == E_INVALIDARG || model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
-                std::puts("skip: sampler fixture requires SM 6.6");
-                return 77;
-            }
-            check_sampler_views(device.Get(), argv[3]);
-        } else if (operation == "--spirv-address-window") {
-            D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
-            check(check_feature(device.Get(), D3D12_FEATURE_D3D12_OPTIONS1, &options, sizeof(options)),
-                  "Query 64-bit shader integer support");
-            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
-            auto model_hr = check_feature(device.Get(), D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
-            if (model_hr != E_INVALIDARG) check(model_hr, "Query address-window shader model");
-            if (!options.Int64ShaderOps || model_hr == E_INVALIDARG || model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
-                std::puts("skip: address window fixture requires SM 6.6 and 64-bit shader integer operations");
-                return 77;
-            }
-            check_spirv_window(device.Get(), argv[3]);
-        } else if (argc == 4 && (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
-            check_compute_file(device.Get(), argv[3], operation == "--ffx-immediate-conversion");
-        } else if (argc == 5 && operation == "--compute-store-case") {
-            check_compute_file(device.Get(), argv[3], false, argv[4]);
-        } else if (argc == 3 && operation == "--ffx-device-init") {
-            check_ffx_device_init(device.Get());
-        } else if (argc == 3 && operation == "--ffx-provider-loop") {
-            check_ffx_provider_loop(device.Get());
-        } else if (argc == 3 && operation == "--ffx-recurrent") {
-            check_ffx_recurrent(device.Get());
-        } else if (operation == "--check-bc7-tail") {
-            check_bc7_tail(device.Get(), argv[3], argv[4], argc - 5, argv + 5);
-        } else if (argc == 6 && operation == "--check-bc7-mip1") {
-            check_bc7_pixel(device.Get(), argv[3], argv[4], nullptr, argv[5]);
-        } else if ((argc == 5 || argc == 6) && operation == "--check-bc7") {
-            check_bc7_pixel(device.Get(), argv[3], argv[4], argc == 6 ? argv[5] : nullptr);
-        } else if (argc == 5 && (operation == "--dual-pixel" || operation == "--dual-pixel-swapped")) {
-            check_dual_pixel(device.Get(), argv[3], argv[4], operation == "--dual-pixel-swapped");
-        } else if (argc == 5 && operation == "--sampled-coverage") {
-            check_sampled_coverage(device.Get(), argv[3], argv[4]);
-        } else if (argc == 5 && operation == "--check-pixel-case") {
-            check_translated_pixel(device.Get(), argv[3], false, argv[4]);
-        } else if (operation == "--compute-to-pixel") {
-            check_compute_to_pixel(device.Get(), argv[3], argv[4], argv[5], argc == 7 ? argv[6] : nullptr);
-        } else if (argc == 5 && (operation == "--check-pixel-attribute" || operation == "--check-pixel-attribute-rg")) {
-            check_attribute_pixel(device.Get(), argv[3], argv[4], operation == "--check-pixel-attribute-rg");
-        } else if (argc == 5 && operation == "--check-pixel-case-rg") {
-            check_translated_pixel(device.Get(), argv[3], false, argv[4],
-                                   D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN);
-        } else if (operation == "--check-pixel-quad-lod") {
-            check_pixel_quad_lod(device.Get(), argv[3]);
-        } else if (operation == "--check-pixel") {
-            if (argc != 5 || (std::string_view(argv[4]) != "rgba" && std::string_view(argv[4]) != "bgra"))
-                throw std::runtime_error("Expected --check-pixel <pixel.cso> rgba|bgra");
-            check_translated_pixel(device.Get(), argv[3], std::string_view(argv[4]) == "bgra");
-        } else if ((operation == "--depth-mask" || operation == "--depth-mask-swapped")) {
-            check_depth_mask_draw(device.Get(), argv[3], argv[4], argv[5], operation == "--depth-mask-swapped");
-        } else if (argc == 3 && operation == "--dual-uav") {
-            check_dual_uav(device.Get());
-        } else if (argc == 3 && operation == "--texture-mips") {
-            check_texture_mips(device.Get());
-        } else if (argc == 3 && operation == "--bvh-root-roundtrip") {
-            check_bvh_root_roundtrip(device.Get());
-        } else if (argc == 3 && (operation == "--bvh-differential" || operation == "--bvh-differential-pipeline")) {
-            if (!check_bvh_differential(device.Get(), operation == "--bvh-differential-pipeline")) return 77;
-        } else if (argc == 3 && operation == "--bvh-hits") {
-            check_bvh_hits(device.Get());
-        } else if (argc == 3 && operation == "--dxr-update") {
-            if (!check_dxr_update(device.Get())) return 77;
-        } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
-            auto binding = MeshConstantBinding::root;
-            if (argc == 7)
-                binding = argv[6][0] == 'b' ? MeshConstantBinding::swapped_root_pair : MeshConstantBinding::root_pair;
-            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
-                                       operation == "--mesh-indexed", binding)) return 77;
-        } else if (operation == "--mesh-entry-table") {
-            const auto binding = argc == 7 ? MeshConstantBinding::swapped_table : MeshConstantBinding::table;
-            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5], false, binding)) return 77;
-        } else if (operation == "--mesh-textured") {
-            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
-                                       true, MeshConstantBinding::root, MeshDrawMode::textured)) return 77;
-        } else if (operation == "--compute-mesh-texture") {
-            const MeshTextureProducers producers{argv[6], argc >= 8 ? argv[7] : nullptr, argc == 9};
-            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
-                                       true, MeshConstantBinding::root, MeshDrawMode::textured, &producers)) return 77;
-        } else if (operation == "--mesh-depth-pair") {
-            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
-                                       true, MeshConstantBinding::root, MeshDrawMode::depth_pair)) return 77;
-        } else if (argc == 3 && operation == "--dxr-facing") {
-            if (!check_dxr_facing(device.Get())) return 77;
-        } else if (argc == 3 && operation == "--dxr-opacity") {
-            if (!check_dxr_opacity(device.Get(), mode == "warp")) return 77;
-        } else if (argc == 3 && operation == "--bvh-packed") {
-            check_bvh_packed(device.Get());
-        } else if (argc == 3 && operation == "--bvh-numeric") {
-            check_bvh_numeric(device.Get());
-        } else if (argc == 3 && operation == "--bvh-atomics") {
-            check_bvh_atomics(device.Get());
-        } else if (argc == 3 && operation == "--bvh-reads") {
-            check_bvh_reads(device.Get());
-        } else if (argc == 3 && (operation == "--bvh-waves" || operation == "--bvh-wave64")) {
-            if (!check_bvh_waves(device.Get(), operation == "--bvh-wave64")) return 77;
-        } else if (argc == 3 && operation == "--gpu-alias") {
-            if (!check_gpu_alias(device.Get())) return 77;
-        } else if (argc == 3 && operation == "--gpu-alias-lookup") {
-            if (!check_gpu_alias_lookup(device.Get())) return 77;
-        } else if (argc == 3 && operation == "--gpu-alias-lookup-writes") {
-            if (!check_gpu_alias_lookup_writes(device.Get())) return 77;
-        } else if (argc == 3 && operation == "--gpu-alias-registry") {
-            if (!check_gpu_alias_registry(device.Get())) return 77;
-        } else if (argc == 3 && operation == "--buffer-ops") {
-            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_0};
-            const HRESULT hr = check_feature(device.Get(), D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
-            if (hr != E_INVALIDARG) check(hr, "Query buffer operation shader model");
-            if (hr == E_INVALIDARG || model.HighestShaderModel < D3D_SHADER_MODEL_6_0) {
-                std::puts("Buffer operations require Shader Model 6.0");
-                return 77;
-            }
-            std::printf("shader_model_capped_at_6_0=0x%x\n", model.HighestShaderModel);
-            check_buffer_ops(device.Get());
-        } else if (argc == 3 && (operation == "--ray-query" || operation == "--dxr-pipeline")) {
-            if (!check_dxr_rays(device.Get(), operation == "--dxr-pipeline")) return 77;
-        } else if (argc == 3 && operation == "--wave-shuffle") {
-            if (!check_wave_shuffle(device.Get())) return 77;
-        } else if (operation.substr(0, 2) == "--") {
-            std::fprintf(stderr, "Unknown GPU operation or invalid arguments: %s\n", argv[2]);
-            return 2;
-        } else {
+        const AdapterCaps caps = query_adapter_caps(device.Get());
+        if (cli.action == CliAction::draw) {
             draw(device.Get(), argv[2], argc == 5 ? argv + 3 : nullptr);
+            return report_debug_errors(messages.Get()) ? 1 : 0;
         }
-        return report_debug_errors(messages.Get()) ? 1 : 0;
+        const OperationContext ctx{device.Get(), messages.Get(), caps, cli.mode, argc, argv, nullptr};
+        return run_operation_spec(*cli.spec, ctx);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());
         report_debug_errors(messages.Get());

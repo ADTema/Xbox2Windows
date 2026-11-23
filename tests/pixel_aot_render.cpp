@@ -52,6 +52,7 @@ struct PixelInput {
     std::vector<Color> expected;
     std::vector<BYTE> secondRows;
     std::vector<Word> constants = std::vector<Word>(64);
+    std::vector<Word> extraConstants;   // 128 words for b1 then b2, empty unless trailer flag bit 3 is set
     UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     std::vector<BYTE> coverage;
     bool integerRT = false;      // bit 0 of the optional case-trailer flags byte
@@ -97,19 +98,21 @@ ComPtr<ID3D12RootSignature> title_root_signature(ID3D12Device* device)
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1 + titleAliasSlots, 0, 1, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
     };
-    D3D12_ROOT_PARAMETER parameters[3]{};
+    D3D12_ROOT_PARAMETER parameters[5]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[0].DescriptorTable.NumDescriptorRanges = 1;
     parameters[0].DescriptorTable.pDescriptorRanges = &ranges[0];
     parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    parameters[1].Descriptor.ShaderRegister = 0;
-    parameters[1].Descriptor.RegisterSpace = 0;
-    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[2].DescriptorTable.NumDescriptorRanges = 1;
-    parameters[2].DescriptorTable.pDescriptorRanges = &ranges[1];
-    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    for (UINT cbv = 0; cbv < 3; ++cbv) {
+        auto& param = parameters[1 + cbv];
+        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        param.Descriptor.ShaderRegister = cbv;
+        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[4].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[4].DescriptorTable.pDescriptorRanges = &ranges[1];
+    parameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     // The static sampler of tests/pixel_aot_vs.hlsl, with the HLSL defaults for the fields it leaves out.
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -120,7 +123,7 @@ ComPtr<ID3D12RootSignature> title_root_signature(ID3D12Device* device)
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC signature{};
-    signature.NumParameters = 3;
+    signature.NumParameters = 5;
     signature.pParameters = parameters;
     signature.NumStaticSamplers = 1;
     signature.pStaticSamplers = &sampler;
@@ -157,6 +160,14 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     if (!gpuConstants) {
         uploadedConstants = upload(device, input.constants);
         gpuConstants = uploadedConstants.Get();
+    }
+    // b1 and b2 are bound only for a case that supplies them. No other fixture shader declares them.
+    std::array<ComPtr<ID3D12Resource>, 2> extraConstants;
+    if (!input.extraConstants.empty()) {
+        if (input.extraConstants.size() != 128) throw std::runtime_error("Expected two 256-byte extra constant buffers");
+        for (size_t i = 0; i < extraConstants.size(); ++i)
+            extraConstants[i] = upload(device, std::vector<Word>(input.extraConstants.begin() + 64 * i,
+                                                                 input.extraConstants.begin() + 64 * (i + 1)));
     }
     std::ifstream file(path, std::ios::binary);
     std::vector<char> ps{std::istreambuf_iterator<char>(file), {}};
@@ -311,10 +322,13 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->SetGraphicsRootSignature(root.Get());
         list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
         list->SetGraphicsRootConstantBufferView(1, gpuConstants->GetGPUVirtualAddress());
+        for (UINT i = 0; i < extraConstants.size(); ++i)
+            if (extraConstants[i])
+                list->SetGraphicsRootConstantBufferView(2 + i, extraConstants[i]->GetGPUVirtualAddress());
         if (titleMemory) {
             auto titleTable = srvs->GetGPUDescriptorHandleForHeapStart();
             titleTable.ptr += 2 * UINT64(srvIncrement);
-            list->SetGraphicsRootDescriptorTable(2, titleTable);
+            list->SetGraphicsRootDescriptorTable(4, titleTable);
         }
         // WARP and hardware can use either the rounded SRV extent or the
         // unrounded base extent for implicit LOD. Their geometric mean is
@@ -545,7 +559,7 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
         if (file.peek() != std::char_traits<char>::eof()) {
             BYTE flags = 0;
             file.read(reinterpret_cast<char*>(&flags), 1);
-            if (flags & 0xf8u)
+            if (flags & 0xf0u)
                 throw std::runtime_error("Unknown case trailer flag bits");
             input.integerRT = (flags & 1u) != 0;
             if (flags & 2u) {
@@ -560,6 +574,13 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
                 input.viewport = D3D12_VIEWPORT{float(left), float(top), float(width), float(height), 0, 1};
             }
             if (flags & 4u) read_title_memory(file, input);
+            if (flags & 8u) {
+                input.extraConstants.resize(128);
+                file.read(reinterpret_cast<char*>(input.extraConstants.data()),
+                          static_cast<std::streamsize>(input.extraConstants.size() * sizeof(Word)));
+                if (!file)
+                    throw std::runtime_error("Expected two 256-byte constant buffers for b1 and b2");
+            }
             if (file.peek() != std::char_traits<char>::eof()) {
                 if (input.integerRT)
                     throw std::runtime_error("NaN-class masks require a floating-point render target");
