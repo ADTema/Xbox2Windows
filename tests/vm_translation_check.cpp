@@ -7,7 +7,12 @@
 //   device_<adapter>    A is one committed allocation wrapped as a D3D12 heap with one buffer over it
 //   sequence_<adapter>  the title's order through d3d12_xs.dll: configure, create the device, create
 //                       the first DIRECT queue, then the device_<adapter> checks on that queue
-// Returns 0 on pass, 1 on failure, 77 (skip) without the adapter or ID3D12Device3.
+//   range_<valid|missing|rejected>_<adapter>
+//                       the same adapter, device requests and tile inputs after an accepted, absent or
+//                       refused configuration; only the accepted one gives the device a range whose
+//                       mapped tiles a dispatch reads (d3d12_xs_range.h)
+// Returns 0 on pass, 1 on failure, 77 (skip) without the adapter or ID3D12Device3, or when a dispatch
+// cannot read a reserved buffer's copied tile.
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -17,8 +22,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <string_view>
+#include <utility>
 
+#include "d3d12_xs_range.h"
 #include "vm_translation_cs.h"
 #include "xmem_test_device.h"
 
@@ -139,22 +147,52 @@ struct Gpu {
         if (event) CloseHandle(event);
     }
 
-    // One dispatch with both root UAVs given as raw GPU addresses.
-    bool dispatch(ID3D12Resource* resource, std::uint64_t src, std::uint64_t dst)
+    // Moves each non-null resource between COMMON and `state`.
+    void transition(ID3D12Resource* const* resources, UINT count, D3D12_RESOURCE_STATES state, bool back)
     {
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Transition.pResource = resource;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        list->ResourceBarrier(1, &barrier);
+        D3D12_RESOURCE_BARRIER barriers[2]{};
+        UINT used = 0;
+        for (UINT i = 0; i < count; ++i) {
+            if (!resources[i]) continue;
+            auto& barrier = barriers[used++];
+            barrier.Transition.pResource = resources[i];
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore = back ? state : D3D12_RESOURCE_STATE_COMMON;
+            barrier.Transition.StateAfter = back ? D3D12_RESOURCE_STATE_COMMON : state;
+        }
+        if (used) list->ResourceBarrier(used, barriers);
+    }
+
+    // One dispatch with both root UAVs given as raw GPU addresses. `resource` (and `second`) are the
+    // buffers those addresses fall in.
+    bool dispatch(ID3D12Resource* resource, std::uint64_t src, std::uint64_t dst, ID3D12Resource* second = nullptr)
+    {
+        ID3D12Resource* const used[] = {resource, second};
+        transition(used, 2, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, false);
         list->SetComputeRootSignature(root.Get());
         list->SetPipelineState(pipeline.Get());
         list->SetComputeRootUnorderedAccessView(0, src);
         list->SetComputeRootUnorderedAccessView(1, dst);
         list->Dispatch(words / 64, 1, 1);
-        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-        list->ResourceBarrier(1, &barrier);
+        transition(used, 2, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+        return submit();
+    }
+
+    // Copies `bytes` from src to dst at the given offsets.
+    bool copy(ID3D12Resource* dst, std::uint64_t dst_offset, ID3D12Resource* src, std::uint64_t src_offset,
+              std::uint64_t bytes)
+    {
+        transition(&dst, 1, D3D12_RESOURCE_STATE_COPY_DEST, false);
+        transition(&src, 1, D3D12_RESOURCE_STATE_COPY_SOURCE, false);
+        list->CopyBufferRegion(dst, dst_offset, src, src_offset, bytes);
+        transition(&dst, 1, D3D12_RESOURCE_STATE_COPY_DEST, true);
+        transition(&src, 1, D3D12_RESOURCE_STATE_COPY_SOURCE, true);
+        return submit();
+    }
+
+    // Closes, executes and waits for the recorded list, then reopens it.
+    bool submit()
+    {
         if (FAILED(list->Close())) return false;
         ID3D12CommandList* lists[] = {list.Get()};
         queue->ExecuteCommandLists(1, lists);
@@ -460,6 +498,264 @@ int sequence_checks(bool warp)
     }
     return translation_checks(gpu);
 }
+
+// ---- The configured range (d3d12_xs_range.h) ----
+
+constexpr std::uint64_t tile = 64 * 1024;
+
+// A 64 KiB pagefile section with a CPU view and a buffer placed over it, as one #934 physical page.
+struct SectionBuffer {
+    HANDLE section = nullptr;
+    std::uint32_t* view = nullptr;
+    ComPtr<ID3D12Heap> heap;
+    ComPtr<ID3D12Resource> buffer;
+    bool open(ID3D12Device3* device)
+    {
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(tile),
+                                     nullptr);
+        if (section) view = static_cast<std::uint32_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, tile));
+        if (!view || FAILED(device->OpenExistingHeapFromFileMapping(section, IID_PPV_ARGS(&heap)))) return false;
+        const auto desc = buffer_desc(tile, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        return SUCCEEDED(device->CreatePlacedResource(heap.Get(), 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                      IID_PPV_ARGS(&buffer)));
+    }
+    SectionBuffer() = default;
+    SectionBuffer(const SectionBuffer&) = delete;
+    SectionBuffer& operator=(const SectionBuffer&) = delete;
+    ~SectionBuffer()
+    {
+        buffer.Reset();
+        heap.Reset();
+        if (view) UnmapViewOfFile(view);
+        if (section) CloseHandle(section);
+    }
+};
+
+enum class Configuration { valid, missing, rejected };
+
+// Device requests refused before the successful one, on the adapter that one uses.
+unsigned refused_device_rounds = 0;
+bool device_refusals_ok = true;
+
+HRESULT create_after_refusals(IUnknown* adapter, REFIID iid, void** device)
+{
+    const std::uint32_t parameters[16]{};
+    void* refused = reinterpret_cast<void*>(std::uintptr_t{1});
+    HRESULT hr = D3D12XboxCreateDevice(adapter, parameters, iid, &refused);
+    device_refusals_ok &= hr == E_INVALIDARG && !refused;
+    refused = reinterpret_cast<void*>(std::uintptr_t{1});
+    hr = D3D12XboxCreateDevice(adapter, nullptr, __uuidof(ID3D12Device3), &refused);
+    device_refusals_ok &= hr == E_NOINTERFACE && !refused;
+    ++refused_device_rounds;
+    return D3D12XboxCreateDevice(adapter, nullptr, iid, device);
+}
+
+ComPtr<IX2WGpuRange> device_range(ID3D12Device* device, HRESULT& hr)
+{
+    IX2WGpuRange* range = nullptr;
+    UINT size = sizeof(range);
+    hr = device->GetPrivateData(__uuidof(IX2WGpuRange), &size, &range);
+    ComPtr<IX2WGpuRange> owned;
+    owned.Attach(SUCCEEDED(hr) ? range : nullptr);
+    return owned;
+}
+
+// Maps the tile at range offset `offset` to pool tile `pool_tile` on the queue.
+bool map_tile(Gpu& gpu, IX2WGpuRange* range, std::uint64_t offset, ID3D12Heap* pool, UINT pool_tile)
+{
+    const UINT index = static_cast<UINT>(offset / range->GetWindowSize());
+    ComPtr<ID3D12Resource> window;
+    if (FAILED(range->GetWindow(index, &window))) return false;
+    D3D12_TILED_RESOURCE_COORDINATE coordinate{};
+    coordinate.X = static_cast<UINT>((offset - index * range->GetWindowSize()) / tile);
+    D3D12_TILE_REGION_SIZE region{};
+    region.NumTiles = 1;
+    const D3D12_TILE_RANGE_FLAGS flags = D3D12_TILE_RANGE_FLAG_NONE;
+    const UINT count = 1;
+    gpu.queue->UpdateTileMappings(window.Get(), 1, &coordinate, &region, pool, 1, &flags, &pool_tile, &count,
+                                  D3D12_TILE_MAPPING_FLAG_NONE);
+    return true;
+}
+
+// Reads the first `words` of the range at `offset` with one dispatch into `out` (dst = src ^ key).
+bool read_range(Gpu& gpu, IX2WGpuRange* range, std::uint64_t offset, SectionBuffer& out)
+{
+    const D3D12_GPU_VIRTUAL_ADDRESS va = range->GetGPUVirtualAddress(offset, words * 4);
+    ComPtr<ID3D12Resource> window;
+    if (!va || FAILED(range->GetWindow(static_cast<UINT>(offset / range->GetWindowSize()), &window))) return false;
+    std::memset(out.view, 0xcd, words * 4);
+    return gpu.dispatch(window.Get(), va, out.buffer->GetGPUVirtualAddress(), out.buffer.Get());
+}
+
+unsigned zero_reads(const std::uint32_t* dst)
+{
+    unsigned zero = 0;
+    for (UINT i = 0; i < words; ++i) zero += dst[i] == key;
+    return zero;
+}
+
+// The same adapter, device requests, queue and tile inputs for each configuration. Only a valid
+// configuration gives the device a range; a missing or refused one leaves it without.
+int range_checks(bool warp, Configuration configuration)
+{
+    ConfigBlock config;
+    if (configuration == Configuration::valid) {
+        config.reset(4);
+        expect_configure(config, S_OK, "the observed block (4 at +4) is accepted");
+    } else if (configuration == Configuration::rejected) {
+        config.reset(5);
+        expect_configure(config, E_INVALIDARG, "a value of 5 is refused");
+        config.reset(4);
+        config.block()[8] = 1;
+        expect_configure(config, E_INVALIDARG, "a non-zero byte at +8 is refused");
+    }
+
+    bool unmatched = false;
+    const auto base = create_device(warp, unmatched, create_after_refusals);
+    if (unmatched) return 1;
+    Gpu gpu;
+    if (!base || FAILED(base.As(&gpu.device))) {
+        std::puts(warp ? "No ID3D12Device3 on WARP" : "No hardware adapter with ID3D12Device3");
+        return 77;
+    }
+    expect(refused_device_rounds > 0 && device_refusals_ok,
+           "device requests with a parameter block or another interface are refused first");
+    D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va{};
+    if (SUCCEEDED(gpu.device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va, sizeof(va)))) {
+        std::printf("adapter VA bits: per resource %u, per process %u\n", va.MaxGPUVirtualAddressBitsPerResource,
+                    va.MaxGPUVirtualAddressBitsPerProcess);
+    }
+    if (!gpu.init()) {
+        std::puts("compute setup failed");
+        return 1;
+    }
+
+    // The device operation that tells the configurations apart.
+    HRESULT hr = S_OK;
+    const auto range = device_range(gpu.device.Get(), hr);
+    std::printf("range on device hr=0x%08lx\n", static_cast<unsigned long>(hr));
+    if (configuration != Configuration::valid) {
+        expect(hr == DXGI_ERROR_NOT_FOUND && !range, "without an accepted configuration the device has no range");
+        std::printf("range failures=%u\n", failures);
+        return failures ? 1 : 0;
+    }
+    expect(SUCCEEDED(hr) && range, "after the accepted configuration the device carries a range");
+    if (!range) return 1;
+    const std::uint64_t size = range->GetSize(), window_size = range->GetWindowSize();
+    const UINT count = range->GetWindowCount();
+    std::printf("range %llu GiB in %u windows of %llu MiB\n", static_cast<unsigned long long>(size >> 30), count,
+                static_cast<unsigned long long>(window_size >> 20));
+    expect(size == (32ull << 30) && window_size <= (4ull << 30) && window_size % tile == 0 &&
+               count == (size + window_size - 1) / window_size,
+           "the 4 sample reserves 32 GiB in windows of at most 4 GiB");
+    expect(range->GetGPUVirtualAddress(window_size - 4, 8) == 0 && range->GetGPUVirtualAddress(size, 1) == 0 &&
+               range->GetGPUVirtualAddress(size - 4, 4) != 0,
+           "spans across a window edge or past the range have no GPU address");
+
+    D3D12_HEAP_DESC pool_desc{};
+    pool_desc.SizeInBytes = 3 * tile;
+    pool_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    pool_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    ComPtr<ID3D12Heap> pool;
+    SectionBuffer staging, out;
+    if (FAILED(gpu.device->CreateHeap(&pool_desc, IID_PPV_ARGS(&pool))) || !staging.open(gpu.device.Get()) ||
+        !out.open(gpu.device.Get())) {
+        std::puts("setup error: tile pool or staging sections");
+        return 1;
+    }
+    struct Idle {
+        Gpu& gpu;
+        ~Idle() { gpu.wait_idle(); }
+    } idle{gpu};
+
+    // Adapter capability, independent of the range: a test-owned reserved buffer with its fourth tile
+    // mapped to pool tile 3, filled by copy and read by dispatch.
+    {
+        D3D12_HEAP_DESC probe_desc = pool_desc;
+        probe_desc.SizeInBytes = tile;
+        ComPtr<ID3D12Heap> probe_pool;
+        ComPtr<ID3D12Resource> probe;
+        const auto desc = buffer_desc(16 * tile, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        if (FAILED(gpu.device->CreateHeap(&probe_desc, IID_PPV_ARGS(&probe_pool))) ||
+            FAILED(gpu.device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                      IID_PPV_ARGS(&probe)))) {
+            std::puts("setup error: capability probe resources");
+            return 1;
+        }
+        D3D12_TILED_RESOURCE_COORDINATE coordinate{};
+        coordinate.X = 3;
+        D3D12_TILE_REGION_SIZE region{};
+        region.NumTiles = 1;
+        const D3D12_TILE_RANGE_FLAGS flags = D3D12_TILE_RANGE_FLAG_NONE;
+        const UINT start = 0, count = 1;
+        gpu.queue->UpdateTileMappings(probe.Get(), 1, &coordinate, &region, probe_pool.Get(), 1, &flags, &start, &count,
+                                      D3D12_TILE_MAPPING_FLAG_NONE);
+        fill(staging.view, 0x0f000000u);
+        std::uint32_t expected_words[words];
+        std::memcpy(expected_words, staging.view, sizeof(expected_words));
+        std::memset(out.view, 0xcd, words * 4);
+        const bool read = gpu.copy(probe.Get(), 3 * tile, staging.buffer.Get(), 0, tile) &&
+                          gpu.dispatch(probe.Get(), probe->GetGPUVirtualAddress() + 3 * tile,
+                                       out.buffer->GetGPUVirtualAddress(), out.buffer.Get()) &&
+                          mismatches(expected_words, out.view) == 0;
+        if (!read || FAILED(gpu.device->GetDeviceRemovedReason())) {
+            std::puts("capability: a dispatch does not read a copied tile of a test-owned reserved buffer on this "
+                      "adapter");
+            return 77;
+        }
+    }
+
+    // Range start, first tile of the second window, last tile of the range.
+    const std::uint64_t offsets[] = {0, window_size, size - tile};
+    expect(read_range(gpu, range.Get(), offsets[0], out) && zero_reads(out.view) == words,
+           "an unmapped tile reads zero through the range");
+    std::uint32_t staged[3][words];
+    for (UINT i = 0; i < 3; ++i) {
+        fill(staging.view, 0x10000000u * (i + 1));
+        std::memcpy(staged[i], staging.view, sizeof(staged[i]));
+        const UINT index = static_cast<UINT>(offsets[i] / window_size);
+        ComPtr<ID3D12Resource> window;
+        const bool mapped = SUCCEEDED(range->GetWindow(index, &window)) &&
+                            map_tile(gpu, range.Get(), offsets[i], pool.Get(), i) &&
+                            gpu.copy(window.Get(), offsets[i] - index * window_size, staging.buffer.Get(), 0, tile);
+        const bool read = mapped && read_range(gpu, range.Get(), offsets[i], out);
+        const unsigned bad = read ? mismatches(staged[i], out.view) : words;
+        std::printf("tile at range offset 0x%llx (window %u): %u/%u words wrong\n",
+                    static_cast<unsigned long long>(offsets[i]), index, bad, words);
+        expect(bad == 0, "a mapped and copied tile is read back through the range's GPU address");
+    }
+    expect(read_range(gpu, range.Get(), offsets[0] + tile, out) && zero_reads(out.view) == words,
+           "the range address shifted by one 64 KiB tile reads the unmapped neighbour");
+    fill(staging.view, 0x70000000u);
+    expect(read_range(gpu, range.Get(), offsets[0], out) && mismatches(staged[0], out.view) == 0,
+           "CPU writes to the staging page after the copy are not seen through the range");
+
+    // Refused requests after the range exists leave it and its tiles in place.
+    config.reset(4);
+    expect_configure(config, DXGI_ERROR_INVALID_CALL, "configuration after device creation is refused");
+    {
+        ComPtr<IDXGIFactory4> factory;
+        ComPtr<IDXGIAdapter1> adapter;
+        void* refused = reinterpret_cast<void*>(std::uintptr_t{1});
+        const std::uint32_t parameters[16]{};
+        hr = SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
+                     SUCCEEDED(factory->EnumAdapterByLuid(gpu.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter)))
+                 ? D3D12XboxCreateDevice(adapter.Get(), parameters, __uuidof(ID3D12Device), &refused)
+                 : E_FAIL;
+        std::printf("device hr=0x%08lx: ", static_cast<unsigned long>(hr));
+        expect(hr == E_INVALIDARG && !refused, "a later device request with a parameter block is refused");
+    }
+    const auto again = device_range(gpu.device.Get(), hr);
+    expect(again.Get() == range.Get() && range->GetGPUVirtualAddress(0, 4) == again->GetGPUVirtualAddress(0, 4),
+           "the device keeps the same range and GPU addresses");
+    bool intact = true;
+    for (UINT i = 0; i < 3; ++i) intact &= read_range(gpu, range.Get(), offsets[i], out) && mismatches(staged[i], out.view) == 0;
+    expect(intact, "the three mapped tiles still read back their words");
+
+    std::printf("range failures=%u\n", failures);
+    return failures ? 1 : 0;
+}
 }
 
 int main(int argc, char** argv)
@@ -477,6 +773,16 @@ int main(int argc, char** argv)
         result = sequence_checks(true);
     } else if (scenario == "sequence_hardware"sv) {
         result = sequence_checks(false);
+    } else {
+        for (const bool warp : {true, false}) {
+            for (const auto& [name, configuration] :
+                 {std::pair{"valid"sv, Configuration::valid}, std::pair{"missing"sv, Configuration::missing},
+                  std::pair{"rejected"sv, Configuration::rejected}}) {
+                std::string expected = "range_";
+                expected.append(name).append(warp ? "_warp" : "_hardware");
+                if (scenario == expected) result = range_checks(warp, configuration);
+            }
+        }
     }
     std::printf("vm_translation %s: %s\n", argv[1], result == 0 ? "PASS" : result == 77 ? "SKIP" : "FAIL");
     return result;
