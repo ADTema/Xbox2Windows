@@ -2451,6 +2451,11 @@ Run these variants with `ctest --preset dev --no-tests=error -R
 '^compute_store_aot_lds_qword_(warp|hardware)$' -V`.
 
 
+The five returning qword operations use the same updates and copy the
+old pair into the destination. The fixture aliases the destination with
+the data pair and exports all four dwords for one and two groups. Replacing
+the returned pair with the post-update pair must fail the CPU comparison.
+
 The private LDS f32 profile requires `--lds-f32-mode normal-rne` as a
 caller guarantee that interpreted operands and results are normal binary32
 or positive zero and that the native arithmetic uses round-to-nearest-even.
