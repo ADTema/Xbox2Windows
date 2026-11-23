@@ -2425,9 +2425,13 @@ modulo 2^64 using a low-word carry or borrow. `ds_and_b64`, `ds_or_b64` and
 `ds_min_u64` and `ds_max_u64` compare the high words first, signed for the
 i64 forms and unsigned for the u64 forms, then compare the low words when
 the high words are equal. Fixtures read back the pair at offset 8 and cover
-both outcomes of the carry, borrow and comparison tests. Discarding carry
-or borrow, interchanging the bitwise operations, or replacing min with max
-must change the readback.
+both outcomes of the carry, borrow and comparison tests. The min/max fixtures
+alternate the prior high word between `0x7fffffff` and `0x80000000`: even lanes
+cross the signed boundary, while odd lanes repeat the high word so the
+low-word tie-break applies. Swapping signed and unsigned comparisons must
+mismatch word 0; dropping the low-word comparison must mismatch word 34 for
+min and word 2 for max. Discarding carry or borrow, interchanging the bitwise
+operations, or replacing min with max must also change the readback.
 Run these variants with `ctest --preset dev --no-tests=error -R
 '^compute_store_aot_lds_qword_(warp|hardware)$' -V`.
 
