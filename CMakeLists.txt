@@ -118,6 +118,11 @@ target_compile_features(xmem_commit_protection_check PRIVATE cxx_std_20)
 add_test(NAME xmem_commit_protection COMMAND xmem_commit_protection_check)
 set_tests_properties(xmem_commit_protection PROPERTIES TIMEOUT 30)
 
+add_executable(windows_placeholder_partition_check tests/windows_placeholder_partition_check.cpp)
+target_compile_features(windows_placeholder_partition_check PRIVATE cxx_std_17)
+target_link_libraries(windows_placeholder_partition_check PRIVATE OneCore)
+add_test(NAME windows_placeholder_partition COMMAND windows_placeholder_partition_check)
+
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
 add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12_xs_shim.def)
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
