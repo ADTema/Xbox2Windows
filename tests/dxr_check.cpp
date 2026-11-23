@@ -112,11 +112,14 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
     Backend backend, const SceneUpdate* update, const std::vector<D3D12_RAYTRACING_GEOMETRY_FLAGS>* triangleGeometries) {
     const bool usePipeline = backend == Backend::pipeline;
     if (usePipeline) {
-        if (update || triangleGeometries)
-            throw std::runtime_error("The DXR pipeline fixture requires a static, opaque scene");
-        if (std::any_of(instances.begin(), instances.end(), [](const auto& desc) {
+        if (triangleGeometries)
+            throw std::runtime_error("The DXR pipeline fixture requires one opaque geometry");
+        const auto usesAnotherHitGroup = [](const auto& descriptors) {
+            return std::any_of(descriptors.begin(), descriptors.end(), [](const auto& desc) {
                 return desc.InstanceContributionToHitGroupIndex != 0;
-            }))
+            });
+        };
+        if (usesAnotherHitGroup(instances) || (update && usesAnotherHitGroup(update->instances)))
             throw std::runtime_error("The DXR pipeline fixture has only hit group 0");
         if (std::any_of(rays.begin(), rays.end(), [](const Ray& ray) { return ray.flags != 0; }))
             throw std::runtime_error("The DXR pipeline fixture requires unflagged rays");
@@ -218,7 +221,9 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
         updatedInstances = bvh_fixture::upload(device, descriptors);
         geometries[0].Triangles.VertexBuffer.StartAddress = updatedVertices->GetGPUVirtualAddress();
         top.Inputs.InstanceDescs = updatedInstances->GetGPUVirtualAddress();
-        bottom.Inputs.Flags = top.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        // Keep ALLOW_UPDATE on the refit. Dropping it caused device removal on the GTX 1060.
+        bottom.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        top.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
         bottom.SourceAccelerationStructureData = bottom.DestAccelerationStructureData;
         top.SourceAccelerationStructureData = top.DestAccelerationStructureData;
         list->ResourceBarrier(1, &order);
@@ -272,9 +277,10 @@ bool check_dxr_rays(ID3D12Device* device, bool usePipeline) {
     return true;
 }
 
-bool check_dxr_update(ID3D12Device* device) {
+bool check_dxr_update(ID3D12Device* device, bool usePipeline) {
     using namespace dxr_fixture;
-    if (!supported(device)) return false;
+    const auto backend = usePipeline ? Backend::pipeline : Backend::inline_query;
+    if (!supported(device, backend)) return false;
     const std::vector<Vertex> initial{{-1,-1,1}, {1,-1,1}, {0,1,1}};
     const std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances{instance(7,1), instance(11,2,4)};
     const SceneUpdate update{{{-1,-1,3}, {1,-1,3}, {0,1,3}}, {instance(7,1,2), instance(11,4,-3)}};
@@ -284,10 +290,16 @@ bool check_dxr_update(ID3D12Device* device) {
     for (const auto& probe : probes)
         rays.push_back({probe.x,0,0,0.01f,0,0,1,8,probe.mask});
     rays.push_back({2,0,0,0.01f,0,0,1,2,1});
-    const auto before = trace(device, initial, instances, rays);
-    const auto after = trace(device, initial, instances, rays, Backend::inline_query, &update);
-    if (after != trace(device, update.vertices, update.instances, rays))
+    const auto before = trace(device, initial, instances, rays, backend);
+    const auto after = trace(device, initial, instances, rays, backend, &update);
+    const auto rebuilt = trace(device, update.vertices, update.instances, rays, backend);
+    const auto mismatch = std::mismatch(after.begin(), after.end(), rebuilt.begin());
+    if (mismatch.first != after.end()) {
+        const auto word = static_cast<UINT>(mismatch.first - after.begin());
+        std::fprintf(stderr, "ray=%u field=%u rebuilt=%08x updated=%08x\n",
+                     word / 4, word % 4, *mismatch.second, *mismatch.first);
         throw std::runtime_error("In-place update differs from a fresh DXR build");
+    }
     const UINT idsBefore[]{7,11,0,0,0,0,0}, idsAfter[]{0,0,7,11,0,0,0};
     for (UINT i = 0; i < rays.size(); ++i) {
         for (bool updated : {false, true}) {
@@ -307,6 +319,24 @@ bool check_dxr_update(ID3D12Device* device) {
             }
         }
     }
+    const auto checkStale = [&](const char* name, const std::vector<bvh_fixture::Word>& stale, UINT expectedMask) {
+        UINT mismatchMask = 0;
+        for (UINT i = 0; i < rays.size(); ++i) {
+            const auto row = stale.begin() + 4 * i;
+            if (!std::equal(row, row + 4, after.begin() + 4 * i))
+                mismatchMask |= 1u << i;
+        }
+        std::printf("dxr_update control=%s mismatch_ray_mask=0x%02x expected=0x%02x\n",
+                    name, mismatchMask, expectedMask);
+        if (mismatchMask != expectedMask)
+            throw std::runtime_error("DXR update stale-result control differs from expected rays");
+    };
+    // Build valid controls with old inputs. Tracing an old TLAS after changing its BLAS is invalid.
+    checkStale("stale_scene", before, 0x0f); // Rays 0-3 change hit status.
+    checkStale("stale_vertices", trace(device, initial, update.instances, rays, backend),
+               0x4c); // Rays 2 and 3 change distance, and ray 6 hits before clipping.
+    checkStale("stale_instances", trace(device, update.vertices, instances, rays, backend),
+               0x0f); // Rays 0-3 change hit status.
     std::puts("dxr_update rays=7 changed_hits=4 in_place_matches_rebuild=1");
     return true;
 }
