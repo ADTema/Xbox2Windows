@@ -500,7 +500,11 @@ INTEGER = {
     "mul_i32_i24": (2, "mul24_i32({0}, {1})"),
     "mul_hi_u32_u24": (2, "mul24_hi_u32({0}, {1})"),
     "mul_hi_i32_i24": (2, "mul24_hi_i32({0}, {1})"),
+    "bfrev_b32": (1, "reversebits({0})"), "ffbl_b32": (1, "firstbitlow({0})"),
+    "ffbh_u32": (1, "dpp_ffbh_u32({0})"), "ffbh_i32": (1, "dpp_ffbh_i32({0})"),
 }
+# The ffbh helpers are the ones the DPP spellings use (DPP_INT32); the definitions live in SALU_HELPERS.
+INTEGER_HELPERS = {"ffbh_u32": ("dpp_ffbh_u32",), "ffbh_i32": ("dpp_ffbh_i32",)}
 MUL24_HELPERS = {
     "mul_u32_u24": ("mul24_u32",),
     "mul_i32_i24": ("mul24_i32",),
@@ -969,6 +973,7 @@ SCALAR = {
     "sext_i32_i8": (1, "asuint(asint({0} << 24) >> 24)", None),
     "sext_i32_i16": (1, "asuint(asint({0} << 16) >> 16)", None),
     "abs_i32": (1, "(asint({0}) < 0 ? (0u - {0}) : {0})", NONZERO),
+    "absdiff_i32": (2, "asuint(abs(asint({0}) - asint({1})))", NONZERO),
     "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),
     "add_i32": (2, "{0} + {1}", "(~({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
     "sub_i32": (2, "{0} - {1}", "(({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
@@ -1527,8 +1532,27 @@ def sdwa_dest(result, sel, unused, old):
         raise ValueError("UNUSED_PRESERVE needs a tracked numeric destination")
     keep = ~(((1 << width) - 1) << offset) & 0xffffffff
     return f"((asuint({old}) & {keep:#x}u) | {field})"
-# Exact arithmetic with SDWA forms on gfx1013 (docs/coverage/gfx1013.tsv).
-SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", "ceil", "fract", "trunc")
+# Binary32 arithmetic with SDWA forms on gfx1013 (docs/coverage/gfx1013.tsv): the exact operations, then the
+# remaining unary ones. Each reuses its e32/e64 entry in ALU unchanged.
+SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", "ceil", "fract", "trunc",
+            "exp", "log", "rcp_iflag", "rcp", "rsq", "sqrt", "sin", "cos", "rndne", "frexp_mant")
+
+# 32-bit integer operations with SDWA forms: (source count, expression on the selected unsigned words). The
+# selections never change the operation: LLVM's SIPeepholeSDWA folds a byte or word extract (zero-extended, or
+# sign-extended under sext()) into a source of whichever instruction consumes it, and a left shift by 16 or 24
+# of the result into its dst_sel, so each form is its e32 operation on the extracted words, placed like a move.
+SDWA_INT = {
+    **{op: INTEGER[op] for op in ("and_b32", "or_b32", "xor_b32", "xnor_b32", "not_b32",
+                                  "lshlrev_b32", "lshrrev_b32", "ashrrev_i32")},
+    "add_nc_u32": (2, "{0} + {1}"), "sub_nc_u32": (2, "{0} - {1}"), "subrev_nc_u32": (2, "{1} - {0}"),
+    "min_u32": (2, "min({0}, {1})"), "max_u32": (2, "max({0}, {1})"),
+    "min_i32": (2, "asuint(min(asint({0}), asint({1})))"), "max_i32": (2, "asuint(max(asint({0}), asint({1})))"),
+}
+SDWA_INT_SOURCE = r"(sext\()?([vs]\d+)(\))?"
+SDWA_INT_OPERANDS = re.compile(
+    rf"(v\d+), {SDWA_INT_SOURCE}(?:, {SDWA_INT_SOURCE})? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
+    r" dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
+    r"(?: src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD))?")
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
@@ -1611,7 +1635,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             continue
         if exported and line != "s_endpgm":
             raise ValueError("Unexpected instruction after color export")
-        if line == "v_nop":
+        # v_nop_e64 is the VOP3 encoding of the same no-op; LLVM 15 prints both encodings as v_nop.
+        if line in ("v_nop", "v_nop_e64"):
             if mask != "entry":
                 raise ValueError("Unexpected v_nop with non-entry mask")
             continue
@@ -2032,7 +2057,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(r"v_interp_p([12])_f32_e32 (v\d+), (v\d+), attr0\.([xyzw])"):
+        # The VOP3 (e64) spelling is accepted only in the operand shape of the e32 form. Its source modifiers,
+        # clamp and output modifiers do not match here and stay unrecognised.
+        elif m := match(r"v_interp_p([12])_f32_e(?:32|64) (v\d+), (v\d+), attr0\.([xyzw])"):
             phase, dst, src, component = m.groups()
             entry_interp = mask == "entry" and sampler is None
             if ((not entry_interp and (mask not in ("entry", "quad") or component not in "xy"))
@@ -2158,8 +2185,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(rf"v_({'|'.join(SDWA_ALU)})_f32_sdwa (v\d+), (.+?)( clamp)? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:DWORD( src1_sel:DWORD)?"):
-            # SDWA forms of exact arithmetic take whole-dword sources, so the binary32 denormal mode never applies
-            # to a zero-extended field; the result is placed like an SDWA move.
+            # SDWA forms of binary32 arithmetic take whole-dword sources, so the binary32 denormal mode never
+            # applies to a zero-extended field; the result is placed like an SDWA move.
             op, dst, operands, clamp, dst_sel, unused, src1_sel = m.groups()
             tokens = operands.split(", ")
             arity, template = ALU[op]
@@ -2211,6 +2238,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_({'|'.join(SDWA_INT)})_sdwa (.+)"):
+            # The e32 operation on the selected source words, placed with the SDWA move rules. Sources are
+            # registers; an inline constant, clamp, a float modifier or a missing field is refused.
+            op, rest = m.groups()
+            arity, template = SDWA_INT[op]
+            parsed = SDWA_INT_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported SDWA integer operands: v_{op}_sdwa {rest}")
+            dst, sext0, src0, close0, sext1, src1, close1, dst_sel, unused, sel0, sel1 = parsed.groups()
+            if bool(src1) != (arity == 2) or bool(sel1) != (arity == 2):
+                raise ValueError(f"v_{op}_sdwa takes {arity} source(s), each with its own selection")
+            if bool(sext0) != bool(close0) or bool(sext1) != bool(close1):
+                raise ValueError("Unbalanced sext() on an SDWA source")
+            if mask != "entry" or int(dst[1:]) > 255:
+                raise ValueError("Invalid integer operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            args = [sdwa_source(int_operand(token, scalar, vector, pending, sample_dest, signed=False), sel, bool(sext))
+                    for token, sel, sext in ((src0, sel0, sext0), (src1, sel1, sext1))[:arity]]
+            result = sdwa_dest(f"({template.format(*args)})", dst_sel, unused, vector.get(dst))
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({result});")
         elif m := match(rf"v_({'|'.join(INTEGER)})(?:_(e32|e64))? (v\d+), (.+)"):
             op, encoding, dst, sources = m.groups()
             tokens = sources.split(", ")
@@ -2222,6 +2271,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
             if op in MUL24_HELPERS:
                 helpers.update(MUL24_HELPERS[op])
+            helpers.update(INTEGER_HELPERS.get(op, ()))
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):

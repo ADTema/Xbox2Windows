@@ -32,7 +32,7 @@ def draw(directory, dxil, renderer, adapter):
             assert expected != bits
         case = directory / "ballot.case"
         case.write_bytes(struct.pack("<321I", 4, *expected, *([0xc5c5c5c5] * 192)))
-        run = subprocess.run([renderer, adapter, "--compute-store-case", dxil, case],
+        run = subprocess.run([renderer, adapter, "--spirv-ballot", dxil, case],
                              capture_output=True, text=True)
         print(run.stdout, run.stderr, flush=True)
         if run.returncode == 77 and not wrong:

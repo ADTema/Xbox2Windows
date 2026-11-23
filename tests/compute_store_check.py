@@ -152,6 +152,21 @@ LLVM_CUBE = [
     "buffer_store_dword v0, v[0:1], s[8:11], 0 idxen offen",
     "s_endpgm",
 ]
+# 4x4 tile with a 72-byte row pitch folded by v_mad_u32_u24 (pitch in src0, as LLVM 15 emits
+# it) and a pure offen store; each invocation stores (tid.x, tid.y) in an 8-byte column.
+PITCH = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v3, s10, 2, v0",
+    "v_lshl_add_u32 v4, s11, 2, v1",
+    "v_lshlrev_b32_e32 v5, 3, v3",
+    "v_mad_u32_u24 v6, 0x48, v4, v5",
+    "v_mov_b32_e32 v8, v3",
+    "v_mov_b32_e32 v9, v4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx2 v[8:9], v6, s[12:15], 0 offen",
+    "s_endpgm",
+]
 INDEX_BINDING = dict(table_reg=7, group_reg=11, descriptor_offset=48, stride=12)
 FIXED_BINDING = dict(table_reg=8, descriptor_offset=0)
 RUNTIME_BINDING = dict(FIXED_BINDING, constant_descriptor=32)
@@ -161,6 +176,7 @@ QUAD_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, stride=52)
 WIDE_BINDING = dict(FIXED_BINDING, group_reg=10, stride=4)
 CUBE_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, group_reg_z=16, stride=132)
 LLVM_CUBE_BINDING = dict(table_reg=0, descriptor_offset=0, group_reg=2, group_reg_y=3, group_reg_z=4, stride=136)
+PITCH_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11)
 CASES = [
     ("indexed", INDEXED, 32, INDEX_BINDING),
     ("fixed", FIXED, 1, FIXED_BINDING),
@@ -173,6 +189,7 @@ CASES = [
     ("wide", WIDE, (256, 1, 1), WIDE_BINDING),
     ("cube", CUBE, (4, 4, 4), CUBE_BINDING),
     ("llvm_cube", LLVM_CUBE, (4, 4, 4), LLVM_CUBE_BINDING),
+    ("pitch", PITCH, (4, 4, 1), PITCH_BINDING),
 ]
 
 
@@ -193,8 +210,12 @@ def grid_words(name, groups):
                     words[(132 * z + 16 * y + 4 * x) // 4] = z
                 elif name == "llvm_cube":
                     words[(136 * z + 16 * y + 4 * x) // 4] = z
-                else:
+                elif name == "pitch":
+                    words[(72 * y + 8 * x) // 4:(72 * y + 8 * x) // 4 + 2] = [x, y]
+                elif name == "wide":
                     words[x] = x
+                else:
+                    raise ValueError(f"No expected layout for {name}")
     return words
 
 
@@ -205,6 +226,7 @@ GRID_DISPATCHES = {
     "wide": ((1, 1, 1),),
     "cube": ((1, 1, 1), (1, 2, 2)),
     "llvm_cube": ((1, 1, 1), (1, 1, 2), (1, 2, 2)),
+    "pitch": ((1, 1, 1), (2, 3, 1)),
 }
 # Recompiled mutations run on the largest dispatch. Swapping two axes that span the same range
 # leaves the buffer unchanged: Y and Z both span 8 in the 1x2x2 cube, so that swap runs on 1x1x2,
@@ -343,6 +365,7 @@ def grid_controls():
                                   (8, 8, 1), **TILE_BINDING))
     cube_controls()
     llvm_cube_controls()
+    pitch_controls()
     audit_candidates()
 
 
@@ -431,16 +454,74 @@ def llvm_cube_controls():
                              ("buffer_store_dword v0,", "buffer_store_dword v5,")))
 
 
+def pitch_controls():
+    """Row-pitch stores: exact output, then one rejection per broken assumption."""
+    expected = "    outputData.Store2((tid.y & 0xffffffu) * 72u + (tid.x << 3u) + 0u, uint2(tid.x, tid.y));"
+    pitch = aot.lower(PITCH, (4, 4, 1), **PITCH_BINDING)
+    assert "[numthreads(4,4,1)]" in pitch.splitlines() and expected in pitch.splitlines()
+    # Either multiplicand may carry the pitch; without idxen the stride binding does not change the output.
+    assert aot.lower([s.replace("0x48, v4,", "v4, 0x48,") for s in PITCH], (4, 4, 1), **PITCH_BINDING) == pitch
+    assert aot.lower(PITCH, (4, 4, 1), **(PITCH_BINDING | dict(stride=16))) == pitch
+    # The column byte offset may also come in the LLVM 15 group-base form.
+    group_base = [part for line in PITCH for part in line.replace(
+        "v_lshlrev_b32_e32 v5, 3, v3", "s_lshl_b32 s20, s10, 2\nv_add_lshl_u32 v5, s20, v0, 3").split("\n")]
+    assert len(group_base) == len(PITCH) + 1 and aot.lower(group_base, (4, 4, 1), **PITCH_BINDING) == pitch
+    # An inline-constant pitch is printed in decimal.
+    assert expected.replace("72u", "64u") in aot.lower(
+        [s.replace("0x48", "64") for s in PITCH], (4, 4, 1), **PITCH_BINDING).splitlines()
+    for old, new in (
+        # Pitch unaligned, zero, negative, narrower than one group's columns, or wider than 24 bits.
+        ("0x48, v4", "0x46, v4"), ("0x48, v4", "0, v4"), ("0x48, v4", "-4, v4"),
+        ("0x48, v4", "0x1c, v4"), ("0x48, v4", "0x1000000, v4"),
+        # Pitch from a register, or no literal at all.
+        ("0x48, v4", "s10, v4"), ("0x48, v4", "v3, v4"),
+        # Row is a raw local ID, shares the column's axis, or the addend is an index, not bytes.
+        ("0x48, v4, v5", "0x48, v1, v5"), ("0x48, v4, v5", "0x48, v3, v5"), ("0x48, v4, v5", "0x48, v4, v3"),
+        # Output modifier.
+        ("0x48, v4, v5", "0x48, v4, v5 clamp"),
+        # The element overflows its column.
+        ("v_lshlrev_b32_e32 v5, 3, v3", "v_lshlrev_b32_e32 v5, 2, v3"), ("0 offen", "0 offen offset:4"),
+        # idxen on a pitch offset, or no offen.
+        ("0 offen", "0 idxen offen"), ("v6, s[12:15], 0 offen", "v6, s[12:15], 0 idxen"),
+        # The pitch offset is not a storable word.
+        ("buffer_store_dwordx2 v[8:9]", "buffer_store_dwordx2 v[6:7]"),
+    ):
+        must_reject(lambda: aot.lower([s.replace(old, new) for s in PITCH], (4, 4, 1), **PITCH_BINDING))
+    # A wrong group size breaks a shift or leaves an axis unseparated; a group register is missing.
+    for group in ((8, 4, 1), (4, 8, 1), (4, 4, 2), (4, 1, 1)):
+        must_reject(lambda: aot.lower(PITCH, group, **PITCH_BINDING))
+    for change in (dict(group_reg_y=None), dict(group_reg_y=12)):
+        must_reject(lambda: aot.lower(PITCH, (4, 4, 1), **(PITCH_BINDING | change)))
+    # One group's rows may span the whole 32-bit address space but not wrap onto each other.
+    tall = [s.replace("s10, 2, v0", "s10, 0, v0").replace("s11, 2, v1", "s11, 10, v1") for s in PITCH]
+    aot.lower([s.replace("0x48", "0x400000") for s in tall], (1, 1024, 1), **PITCH_BINDING)
+    must_reject(lambda: aot.lower([s.replace("0x48", "0x400004") for s in tall], (1, 1024, 1), **PITCH_BINDING))
+    # A second store with another pitch would use a different layout.
+    second = ["v_mad_u32_u24 v7, 0x50, v4, v5", "buffer_store_dword v8, v7, s[12:15], 0 offen offset:4"]
+    try:
+        aot.lower(PITCH[:6] + second[:1] + PITCH[6:-1] + second[1:] + ["s_endpgm"], (4, 4, 1), **PITCH_BINDING)
+    except ValueError as error:
+        assert str(error) == "Stores use different address layouts", error
+    else:
+        raise AssertionError("Two row pitches were accepted")
+
+
 def audit_candidates():
     """The audit tries group Z in the SGPR after group X when the group's Y is one."""
     slab = ["s_mov_b32 s4, s5", "s_mov_b32 s5, 0", "s_load_dwordx4 s[12:15], s[4:5], null",
             "v_lshl_add_u32 v3, s6, 2, v0", "v_lshl_add_u32 v4, s7, 3, v2", "v_lshlrev_b32_e32 v5, 2, v3",
             "s_waitcnt lgkmcnt(0)", "buffer_store_dword v4, v[4:5], s[12:15], 0 idxen offen", "s_endpgm"]
-    for lines, expected in ((slab, "    outputData.Store(tid.z * 16u + (tid.x << 2u) + 0u, tid.z);"),
-                            ([s.replace("s7, 3", "s8, 3") for s in slab], None)):
+    # The audit always offers a stride for multi-group shaders; a pure offen pitch store ignores it.
+    pitch = [s.replace("s[8:9]", "s[4:5]").replace("s9, 0", "s5, 0").replace("s10, 2", "s6, 2")
+             .replace("s11, 2", "s7, 2") for s in PITCH]
+    pitch.insert(0, "s_mov_b32 s4, s5")
+    pitch_line = "    outputData.Store2((tid.y & 0xffffffu) * 72u + (tid.x << 3u) + 0u, uint2(tid.x, tid.y));"
+    for lines, group, expected in ((slab, (4, 1, 8), "    outputData.Store(tid.z * 16u + (tid.x << 2u) + 0u, tid.z);"),
+                                   ([s.replace("s7, 3", "s8, 3") for s in slab], (4, 1, 8), None),
+                                   (pitch, (4, 4, 1), pitch_line)):
         emitted = []
         with patch.object(shader_profile_audit.pixel_aot, "disassemble", return_value=lines):
-            profiles = shader_profile_audit.compute_profiles(b"", (4, 1, 8), None,
+            profiles = shader_profile_audit.compute_profiles(b"", group, None,
                                                              lambda kind, source: emitted.append(source))
         if expected is None:
             assert profiles == [] and not emitted
@@ -661,6 +742,8 @@ def grid_mutations(source, name):
         for a, b in (("tid.x", "tid.z"), ("tid.y", "tid.z")):
             yield f"swapped {a[-1].upper()}/{b[-1].upper()}", (
                 source.replace(a, "tid.T").replace(b, a).replace("tid.T", b))
+    if name == "pitch":
+        yield "power-of-two pitch", source.replace(" * 72u", " * 64u")
     dims = dict((case[0], case[2]) for case in CASES)[name]
     shrunk = (dims[0] // 2, *dims[1:])
     yield "halved group X", source.replace("[numthreads({},{},{})]".format(*dims),

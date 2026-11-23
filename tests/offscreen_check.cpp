@@ -840,6 +840,10 @@ constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_6, true, false, 0,
     "skip: address window fixture requires SM 6.6 and 64-bit shader integer operations",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66Ballot{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "skip: ballot fixture requires SM 6.6",
+    CapsDiagnostic::none};
 
 // Static argument shapes and unconditional adapter prerequisites for every named operation.
 // Scenario-dependent capability checks (such as DXR tier, mesh tier, or existing-heap support)
@@ -854,6 +858,8 @@ const OperationSpec kOperations[] = {
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm66CompareSampler, run_spirv_compare_sampler},
+    // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
+    {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
     {"--ffx-device-init", 3, 3, nullptr, kNoGate, run_ffx_device_init},
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
@@ -1083,6 +1089,8 @@ int run_self_test()
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin", "baseline", "extra"},
                    CliAction::usage_error, "Unknown GPU operation or invalid arguments: --spirv-compare-sampler"))
         return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-ballot", "a.dxil"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --spirv-ballot")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "invalid"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,
@@ -1099,6 +1107,7 @@ int run_self_test()
     if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "bgra"}, CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin"},
                    CliAction::operation)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--spirv-ballot", "a.dxil", "case.bin"}, CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin", "baseline"},
                    CliAction::operation)) return 1;
 
@@ -1147,6 +1156,21 @@ int run_self_test()
         if (!require(!called, "unmet wave64 gate must not invoke handler")) return 1;
         if (!require(out.find("native_lane_range=32..32 shader_model_capped_at_6_6=0x66") != std::string::npos,
                      "unmet wave64 gate must preserve native_lane_range diagnostic")) return 1;
+
+        // The ballot fixture skips on a runtime capped at SM 6.5, as the Windows 10 in-box runtime is (#751).
+        const OperationSpec* ballot = find_operation("--spirv-ballot");
+        if (!require(ballot != nullptr, "--spirv-ballot operation")) return 1;
+        char ballot_op[] = "--spirv-ballot";
+        char dxil[] = "a.dxil";
+        char case_file[] = "case.bin";
+        char* ballot_argv[]{prog, mode, ballot_op, dxil, case_file};
+        OperationContext bctx{nullptr, nullptr, low_caps, "warp", 5, ballot_argv, nullptr};
+        out.clear();
+        err.clear();
+        if (!require(run_operation_spec(*ballot, bctx, {&out, &err}) == 77, "--spirv-ballot below SM 6.6 must exit 77"))
+            return 1;
+        if (!require(out.find("skip: ballot fixture requires SM 6.6") != std::string::npos,
+                     "--spirv-ballot must print its skip reason")) return 1;
     }
 
     // (c) Handler OutcomeKind::fail and thrown exception exit 1 (never 77); OutcomeKind::skip exits 77; pass exits 0.
