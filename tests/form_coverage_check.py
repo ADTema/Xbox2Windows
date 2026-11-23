@@ -438,6 +438,35 @@ def check_plain_bitscan_forms():
     pixel.ACCEPTED.clear()
 
 
+
+def check_int16_vop3_forms():
+    """The 12 non-packed 16-bit integer VOP3 forms count as covered once the translator accepts their fixtures.
+    The unsuffixed spellings match the reference; the _e64 control does not count (gfx_forms keeps _e64 names), and
+    the nearby VOP3 forms that stay rejected (v_mad_u16, v_mad_i16, f16 ops) stay uncovered."""
+    import pixel_aot
+    import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for group in range(3):
+            pixel.translate_int(pixel.int16_vop3_ops(group))
+        forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_INT16}
+        assert len(forms) == 12
+        neighbours = {("VOP3", "v_mad_u16"), ("VOP3", "v_mad_i16"), ("VOP3", "v_add_f16_e64"),
+                      ("VOP3", "v_cvt_f16_u16_e64")}
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not neighbours & covered, (name, neighbours & covered)
+        # The suffixed control spelling is a different word, so it adds no reference form.
+        reference = fc.load_reference("gfx1013.tsv")
+        assert fc.gfx_forms({"v_add_nc_u16_e64"}, reference) == set()
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
 def check_sopk_wait_forms():
     """The SOPK wait forms count once a program using them lowers; a refused SGPR operand records nothing."""
     import pixel_aot_check as pixel
@@ -767,6 +796,7 @@ if __name__ == "__main__":
     check_shader_records()
     check_scalar_brev()
     check_plain_bitscan_forms()
+    check_int16_vop3_forms()
     check_swap_coverage()
     check_sopk_wait_forms()
     check_s_version_form()
