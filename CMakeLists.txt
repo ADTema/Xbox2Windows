@@ -1449,6 +1449,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_float_packed>" "$<TARGET_FILE:cpu_float_packed_lifted>")
     set_tests_properties(cpu_aot_float_packed PROPERTIES SKIP_RETURN_CODE 77)
 
+    cpu_asm_fixture(cpu_float_conversions float_conversions)
+    set(float_conversions_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_float_conversions_lifted.cpp")
+    add_custom_command(OUTPUT "${float_conversions_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/float_conversions.py"
+            emit "$<TARGET_FILE:cpu_float_conversions>" "${float_conversions_fixture}"
+        DEPENDS cpu_float_conversions tests/cpu/float_conversions.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_float_conversions_lifted SHARED "${float_conversions_fixture}")
+    add_test(NAME cpu_aot_float_conversions COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/float_conversions.py"
+        check "$<TARGET_FILE:cpu_float_conversions>" "$<TARGET_FILE:cpu_float_conversions_lifted>")
+    set_tests_properties(cpu_aot_float_conversions PROPERTIES SKIP_RETURN_CODE 77)
+
     cpu_asm_fixture(cpu_fma_packed fma_packed)
     set(fma_packed_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_fma_packed_lifted.cpp")
     add_custom_command(OUTPUT "${fma_packed_fixture}"
