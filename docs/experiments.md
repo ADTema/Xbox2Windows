@@ -4512,29 +4512,37 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^spirv_minlod_' -V
 ```
 
-The source-built `spirv_minlod_*` smoke draw compiles at `ps_6_0` and skips on
-adapters below Shader Model 6.0. It runs `Sample`, `SampleBias` with an offset,
+The source-built `spirv_minlod_hardware` and `spirv_minlod_warp` smoke draws
+compile at `ps_6_0` and skip on adapters below Shader Model 6.0. They run
+`Sample`, `SampleBias` with an offset,
 and `SampleGrad` against distinct red and green mips. Each sample must reach
 the green mip and match the 64-pixel reference. Removing the clamp selects
 the red mip and must fail at pixel (0, 0). The GTX 1060 (32.0.15.6094),
 Windows 10 in-box WARP (10.0.19041.5794), and app-local WARP 1.0.22 passed on
 Windows 10 build 19045.6456 with zero D3D12 debug errors and warnings.
 
-`spirv_minlod_levels_*` varies the clamp of a plain `Sample` over an 8x8
-texture with four solid-color mips. The coordinate is constant, so the LOD is
-the clamp. Each clamp runs as the translated shader and as a direct HLSL
-control on the same adapter.
+The level and fractional fixtures use a plain `Sample` over an 8x8 texture
+with four solid-color mips. The coordinate is constant, so the LOD is the
+clamp. Each clamp runs as translated SPIR-V and direct HLSL on the same adapter.
 
-- With point mip filtering, clamps 0 to 3, 1.4375, 1.5625 and 3.75 read the
-  nearest mip exactly. The 1.5 tie read mip 2 on both adapters below.
+`spirv_minlod_levels_*` compiles at `ps_6_0`:
+
+- With point mip filtering, each integer clamp from 0 through 3 selects its
+  corresponding mip exactly across all 64 pixels.
 - With `MIN_MAG_POINT_MIP_LINEAR`, nine clamps from 1 to 3.75 match the exact
   mip blend within 1/128. The translated and control bits must be identical
   on each adapter.
 - Clamp 1 checked against mip 2, and clamp 1.25 checked against the 1.5 blend,
   must fail at pixel (0, 0).
 
-The detailed level and blend draws use `ps_6_6` and skip (77) on the Windows 10
-in-box runtime. In separate `ps_6_0` and `ps_6_2` probes, in-box WARP
+`spirv_minlod_fractional_*` retains the `ps_6_6` capability gate. It checks
+nearest-mip selection at 1.4375, 1.5625 and 3.75. At the 1.5 tie, either
+neighbor is accepted when both shader sources select the same mip. The
+stale-reference check at 1.5625 must reject mip 1 at pixel (0, 0).
+[Issue #809](https://github.com/R0Y00/Xbox2Windows/issues/809) records why the
+fractional point cases run separately.
+
+In separate `ps_6_0` and `ps_6_2` probes, in-box WARP
 10.0.19041.5794 selected green mip 1 for a per-sample clamp of 1.5625 under
 point mip filtering. An explicit `SampleLevel` at the same LOD selected
 blue mip 2 on that adapter. Linear mip filtering gave the expected blend
