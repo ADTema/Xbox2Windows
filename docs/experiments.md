@@ -1736,6 +1736,25 @@ python3 -B tests/mesh_textured_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 ctest --preset dev --no-tests=error -R "^mesh_textured_draw_" -V
 ```
 
+The same indexed textured scene can run through the Shader Model 6.0 compute
+and vertex fallback. Compute reads the vertex buffer at `t0` and writes the
+export buffer at `u0`. The graphics root binds the exported geometry to the
+vertex shader at `t1` and the 2×2 texture to the pixel shader at `t0`. Both
+paths use the same translated sample and CPU image reference.
+
+On Windows 10 build 19045.6456, the GTX 1060 6 GB (32.0.15.6094) and in-box
+WARP (10.0.19041.5794) matched all 128 export bytes and 1,024 RGBA pixels for
+each of the three inputs. The stale texture and stale UV references each
+produced 276 pixel mismatches and a matching export trace. The fallback pixel
+shader also reads markers at `b0` and `b1`. Changing either marker alone
+produced the same 276 pixel mismatches with matching exports. The D3D12 debug
+layer reported zero warnings and errors.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^mesh_textured_fallback_' -V
+```
+
 The compute-to-mesh texture fixture reuses that translated mesh and pixel
 shader. A translated compute program writes four packed RGBA8 texels to a raw
 default-heap UAV, with rows at byte offsets 0 and 256. After a UAV-to-copy-source
@@ -3772,6 +3791,25 @@ nonzero-LOD, already-separated and passthrough controls run without a GPU.
 ```powershell
 ctest --preset dev --no-tests=error -R '^spirv_compare_sampler_' -V
 ```
+
+### Minimum LOD in the SPIR-V bridge
+
+The pinned Windows SPIRV-Cross build maps the SPIR-V `MinLod` operand to the
+HLSL sampling clamp. The bridge supports non-projected `Sample`, `SampleBias`,
+`SampleGrad` and implicit-LOD `SampleCmp` forms at Shader Model 5 and above.
+It preserves a supplied texel offset and inserts zero when the HLSL overload
+requires one. Cube samplers take the clamp without an offset.
+
+```powershell
+.\tools\setup-spirv-tools.ps1
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^spirv_minlod_' -V
+```
+
+The source-built draw runs three samples against distinct red and green mips.
+Each sample must reach the green mip and match the 64-pixel reference.
+Removing the clamp selects the red mip and must fail at pixel (0, 0).
 
 ## Independent bit and byte alignment readback
 
