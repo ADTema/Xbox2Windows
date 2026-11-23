@@ -169,7 +169,9 @@ def container_code(program, *, stage, llvm=None):
         markers = sum(word == 0xbf810000 for word, in struct.iter_unpack("<I", code))
         if markers == 1:
             return code
-        if stage == 0 and markers == 2 and llvm is not None:
+        # Exactly two exits, verified for pixel (0) and compute (5) only. Mesh and other
+        # stages, and three or more markers, stay rejected.
+        if stage in (0, 5) and markers == 2 and llvm is not None:
             _check_two_exits(code, llvm)
             return code
         raise ValueError("Unverified multi-exit program")
@@ -215,6 +217,73 @@ def disassemble(code, library, *, cpu=b"gfx1013", offsets=False, features=b""):
 
 SAMPLED_RESOURCES = """Texture2D<float4> tex : register(t0);
 SamplerState samp : register(s0);"""
+
+# SQ_TEX_DEPTH_COMPARE values (sampler word 0, bits 14:12). D3D12_COMPARISON_FUNC is the same order plus one.
+# The hardware compares the reference against the texel: the result is (reference OP texel).
+DEPTH_COMPARE = ("NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_EQUAL", "ALWAYS")
+# D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT and D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT.
+COMPARISON_FILTERS = {0: ("point", 0x80), 1: ("bilinear", 0x94)}
+
+
+def comparison_sampler_state(words):
+    """Decode the sampler descriptor fields that change an image_sample_c_lz result on a 2D texture.
+
+    Field positions are those of SQ_IMG_SAMP_WORD0..3 (registers 0x8F30..0x8F3C in Mesa
+    src/amd/registers/gfx10-rsrc.json; enum values in the Linux navi10_enum.h). Not read, because the accepted profile makes them irrelevant: CLAMP_Z,
+    DISABLE_CUBE_WRAP and Z_FILTER (2D only), ANISO_THRESHOLD and ANISO_BIAS (ratio 1), word 0 bit 31
+    (degamma control; no effect on a float depth texel), MAX_LOD, PERF_MIP and PERF_Z (LOD 0 only), and
+    BORDER_COLOR_PTR and BORDER_COLOR_TYPE (no border addressing). Any other non-zero field is refused,
+    including word 2 bits 28-31 (MIP_POINT_PRECLAMP, ANISO_OVERRIDE, BLEND_ZERO_PRT) and word 3 bits 12-29,
+    which gfx10 leaves unnamed (bit 29 is UPGRADED_DEPTH on GFX8).
+
+    TRUNC_COORD (word 0 bit 27) applies to X and Y for every filter on gfx10 (Mesa ac_gpu_info.h). With 1 the
+    texel-space coordinate is truncated; with 0 it is rounded to nearest even at six fraction bits, and point
+    sampling then drops the fraction (Mesa commit d573d1d8), so it can select the next texel up to 1/128 texel
+    below an edge. D3D point sampling takes the floor (D3D11.3 7.18.7). The accepted pairs are the ones RADV
+    programs on gfx10 by default (radv_sampler.c), point with 1 and bilinear with 0; the other two are refused,
+    including point with 0, which RADV programs for DXVK and vkd3d-proton. Bilinear results are in the
+    contract where the texel-space position is a multiple of 1/64, so the rounding is exact on both sides.
+    """
+    w0, w1, w2, w3 = words
+    if (w0 & 7, (w0 >> 3) & 7) != (2, 2):
+        raise ValueError("Comparison sampling requires CLAMP_LAST_TEXEL in X and Y")
+    if (w0 >> 9) & 7:
+        raise ValueError("Comparison sampling with anisotropy is not supported")
+    if (w0 >> 15) & 1:
+        raise ValueError("Comparison sampling with unnormalized coordinates is not supported")
+    if (w0 >> 19) & 3:
+        raise ValueError("Comparison sampling with MC_COORD_TRUNC or FORCE_DEGAMMA is not supported")
+    if (w0 >> 29) & 3:
+        raise ValueError("Comparison sampling requires the blend filter mode")
+    if w1 & 0xfff:
+        raise ValueError("Comparison sampling at LOD zero requires MIN_LOD 0")
+    if w2 & 0xfffff:
+        raise ValueError("Comparison sampling with an LOD bias is not supported")
+    mag, minify, mip = (w2 >> 20) & 3, (w2 >> 22) & 3, (w2 >> 26) & 3
+    if mag != minify or mag not in COMPARISON_FILTERS:
+        raise ValueError("Comparison sampling requires one point or bilinear XY filter")
+    if mip == 3 or w2 >> 28:
+        raise ValueError("Unsupported mip filter or word 2 bits 28-31")
+    if (w3 >> 12) & 0x3ffff:
+        raise ValueError("Comparison sampling with word 3 bits 12-29 (UPGRADED_DEPTH on GFX8) is not supported")
+    func = (w0 >> 12) & 7
+    filter_name, d3d_filter = COMPARISON_FILTERS[mag]
+    trunc_coord = (w0 >> 27) & 1
+    if trunc_coord != (filter_name == "point"):
+        raise ValueError(f"Comparison sampling with {filter_name} filtering requires TRUNC_COORD "
+                         f"{int(filter_name == 'point')}")
+    return {"compare": DEPTH_COMPARE[func], "d3d12_comparison_func": func + 1,
+            "filter": filter_name, "d3d12_filter": d3d_filter, "address": "clamp",
+            "trunc_coord": trunc_coord}
+
+
+def comparison_resources(state):
+    return (f"// s0 comparison sampler: D3D12_FILTER 0x{state['d3d12_filter']:x}, "
+            f"D3D12_COMPARISON_FUNC {state['d3d12_comparison_func']} ({state['compare']}), address CLAMP\n"
+            f"// Console TRUNC_COORD {state['trunc_coord']}. Contract: reference and texels in [0, 1] on an R32_FLOAT "
+            "view; outside it the result depends on the image format, which is not decoded.\n"
+            "Texture2D<float> tex : register(t0);\n"
+            "SamplerComparisonState samp : register(s0);")
 PREAMBLE = """// v_cmp_class_f32: the ten binary32 classes of LLVM SIInstrFlags::ClassFlags, from the raw encoding:
 // signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
 uint class32(float value) {
@@ -423,6 +492,8 @@ INTEGER = {
     "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
     "xnor_b32": (2, "~({0} ^ {1})"),
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
+    "alignbit_b32": (3, "(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))"),
+    "alignbyte_b32": (3, "(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - (({2} & 3u) * 8u)))))"),
     "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
     "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
     "mul_u32_u24": (2, "mul24_u32({0}, {1})"),
@@ -1515,6 +1586,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     half_rounding = HALF_ROUNDING["0"]
     mask = "entry"
     samples = 0
+    sample_kind = None  # "plain" or "comparison": both would need s0
     sample_dest = {}  # VGPR -> issue number of its outstanding image_sample
     exported = False
     ended = False
@@ -1994,6 +2066,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or texture is None
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
+            if sample_kind == "comparison":
+                raise ValueError("Comparison and ordinary sampling in one program")
+            sample_kind = "plain"
             uv = [vector[f"v{n}"] for n in coords]
             if lod_zero:
                 if second_texture_offset is not None:
@@ -2008,6 +2083,40 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
                 sample_dest[f"v{n}"] = samples
+        elif m := match(r"image_sample_c_lz (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
+                        r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
+            # Depth comparison at LOD zero. The RDNA2 address order puts the reference before the
+            # coordinates, so the operands are (reference, u, v), in one VGPR range or the NSA form.
+            dst, first, last, *nsa = m.groups()[:6]
+            image = registers(*m.groups()[6:8], 8)
+            state = registers(*m.groups()[8:10], 4)
+            address = ([f"v{n}" for n in registers(first, last, 3)] if first is not None else nsa)
+            if any(int(reg[1:]) > 255 for reg in (dst, *address)):
+                raise ValueError("Comparison sample VGPR out of range")
+            if sampler is None or second_texture_offset is not None or sample_kind == "plain":
+                raise ValueError("Comparison sampling requires one texture and no ordinary sampling")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            descriptor = [scalar.get(f"s{n}") for n in image]
+            if (mask != "entry" or any(f"s{n}" in pending for n in (*image, *state))
+                    or descriptor != [("tex", j) for j in range(8)]
+                    or [scalar.get(f"s{n}") for n in state] != list(sampler)):
+                raise ValueError("Unsupported image or sampler binding")
+            if sample_kind is None:
+                lines[lines.index(SAMPLED_RESOURCES)] = comparison_resources(comparison_sampler_state(sampler))
+            sample_kind = "comparison"
+            values = [vector.get(reg) for reg in address]
+            values = [f"uv.{v[1]}" if isinstance(v, tuple) and v[0] == "entry_uv" else v for v in values]
+            for reg, value in zip(address, values):
+                if reg in sample_dest:
+                    raise ValueError("Sample used before vmcnt wait")
+                if not isinstance(value, str) or not (value in quad_values or value.startswith(("sample", "alu", "params"))):
+                    raise ValueError("Unsupported comparison sample operand")
+            reference, u, v = values
+            lines.append(f"    float sample{i} = tex.SampleCmpLevelZero(samp, float2({u}, {v}), {reference});")
+            samples += 1
+            vector[dst] = f"sample{i}"
+            sample_dest[dst] = samples
         elif m := match(r"v_(fmaak|fmamk|madak|madmk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
             # The mad forms use the unfused, denormal-flushing helper; the fma forms are fused.
             op, dst, *tokens = m.groups()
@@ -2100,12 +2209,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(rf"v_({'|'.join(INTEGER)})(?:_e32|_e64)? (v\d+), (.+)"):
-            op, dst, sources = m.groups()
+        elif m := match(rf"v_({'|'.join(INTEGER)})(?:_(e32|e64))? (v\d+), (.+)"):
+            op, encoding, dst, sources = m.groups()
             tokens = sources.split(", ")
             arity, template = INTEGER[op]
             if mask != "entry" or int(dst[1:]) > 255 or dst in sample_dest or len(tokens) != arity:
                 raise ValueError("Invalid integer operation")
+            if arity > 2 and encoding == "e32":
+                raise ValueError(f"Three-operand operation does not support e32 encoding: v_{op}")
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
             if op in MUL24_HELPERS:
                 helpers.update(MUL24_HELPERS[op])

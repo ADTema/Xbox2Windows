@@ -133,7 +133,7 @@ set(pixel_vs "${CMAKE_CURRENT_BINARY_DIR}/pixel_aot_vs.h")
 add_custom_command(OUTPUT "${pixel_vs}" COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E main
     -Fh "${pixel_vs}" -Vn pixel_aot_vs "${CMAKE_CURRENT_SOURCE_DIR}/tests/pixel_aot_vs.hlsl"
     DEPENDS tests/pixel_aot_vs.hlsl VERBATIM)
-target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp "${pixel_vs}")
+target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp tests/pixel_compare_render.cpp "${pixel_vs}")
 target_sources(offscreen_check PRIVATE tests/mesh_entry_draw.cpp)
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp tests/ffx_recurrent_views.cpp)
 target_sources(offscreen_check PRIVATE tests/ffx_rcas_views.cpp)
@@ -1449,6 +1449,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_float_packed>" "$<TARGET_FILE:cpu_float_packed_lifted>")
     set_tests_properties(cpu_aot_float_packed PROPERTIES SKIP_RETURN_CODE 77)
 
+    cpu_asm_fixture(cpu_float_conversions float_conversions)
+    set(float_conversions_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_float_conversions_lifted.cpp")
+    add_custom_command(OUTPUT "${float_conversions_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/float_conversions.py"
+            emit "$<TARGET_FILE:cpu_float_conversions>" "${float_conversions_fixture}"
+        DEPENDS cpu_float_conversions tests/cpu/float_conversions.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_float_conversions_lifted SHARED "${float_conversions_fixture}")
+    add_test(NAME cpu_aot_float_conversions COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/float_conversions.py"
+        check "$<TARGET_FILE:cpu_float_conversions>" "$<TARGET_FILE:cpu_float_conversions_lifted>")
+    set_tests_properties(cpu_aot_float_conversions PROPERTIES SKIP_RETURN_CODE 77)
+
     cpu_asm_fixture(cpu_fma_packed fma_packed)
     set(fma_packed_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_fma_packed_lifted.cpp")
     add_custom_command(OUTPUT "${fma_packed_fixture}"
@@ -2540,6 +2552,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-integer-nc "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_integer_nc_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_align_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-align "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_align_${adapter} PROPERTIES TIMEOUT 60)
         add_test(NAME pixel_aot_e64_integer_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-e64-integer "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2550,6 +2566,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_rndne_${adapter} PROPERTIES TIMEOUT 60
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_rndne_${adapter}.txt")
+        add_test(NAME pixel_aot_compare_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_compare_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_compare_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_compare_${adapter}.txt")
         add_test(NAME bc7_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/bc7_draw_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2557,7 +2578,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     set_tests_properties(cpu_native_frame_hardware pixel_aot_hardware pixel_aot_buffer_color_hardware
         pixel_aot_three_way_hardware pixel_aot_e64_hardware pixel_aot_blend_scalar_hardware pixel_aot_predicate_rounding_hardware bc7_draw_hardware
-        pixel_aot_integer_nc_hardware
+        pixel_aot_integer_nc_hardware pixel_aot_align_hardware
         PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(compute_store_aot_hardware PROPERTIES SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS hardware warp)
@@ -2572,6 +2593,8 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_e64_${adapter}.txt")
         set_tests_properties(pixel_aot_integer_nc_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_integer_nc_${adapter}.txt")
+        set_tests_properties(pixel_aot_align_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_align_${adapter}.txt")
     endforeach()
     set_tests_properties(pixel_aot_attribute_hardware pixel_aot_rndne_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compressed_scene_metadata COMMAND "${INTAKE_PYTHON}" -B

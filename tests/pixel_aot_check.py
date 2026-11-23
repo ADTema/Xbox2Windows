@@ -35,6 +35,9 @@ VOP2_INT_OPS = (
     "v_and_b32_e32", "v_or_b32_e32", "v_xor_b32_e32",
     "v_add_nc_u32_e32", "v_sub_nc_u32_e32", "v_subrev_nc_u32_e32",
 )
+VOP3_ALIGN_OPS = (
+    "v_alignbit_b32", "v_alignbyte_b32",
+)
 # The 32-bit no-carry forms of nc_integer_group(1..3), as ACCEPTED records them (first word of the line).
 NC_INT_OPS = (
     "v_add_nc_u32_e32", "v_sub_nc_u32_e32", "v_subrev_nc_u32_e32",
@@ -2291,6 +2294,23 @@ def check_scalar_select64_draw(directory, compiler, renderer, backend):
     compile_shader(compiler, source, shader)
     run_pixel_batch(renderer, backend, shader, [(case, "mismatch") for case in cases])
 
+    # s_cselect_b64 does not write SCC: capture SCC after a select that picks a zero pair.
+    program = scalar_select64()
+    pos = program.index("s_cselect_b64 s[48:49], 0, -1")
+    program[pos + 1:pos + 1] = ["s_cselect_b32 s50, 1, 0"]
+    program[program.index("v_mov_b32_e32 v14, s48")] = "v_mov_b32_e32 v14, s50"
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    scc_cases = []
+    for i, (lo, hi) in enumerate(((0, 0), (0x89abcdef, 0x12345678))):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, lo, hi, *other)
+        expected = (*other, 0, 0xffffffff) if lo else (lo, hi, 1, 0)
+        case = directory / f"scalar-select64-scc-{i}.case"
+        write_case(case, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+        scc_cases.append((case, "pass"))
+    run_pixel_batch(renderer, backend, shader, scc_cases)
+
 
 SCALAR64_SETS = (
     # (a_lo, a_hi, b_lo, b_hi, sh_lo, sh_hi, bfm_w, bfm_off, bfe_src, bfe_ctrl_a, bfe_ctrl_b, alt)
@@ -2675,7 +2695,8 @@ def check_scalar_carry_chain_draw(directory, compiler, renderer, backend):
         source.write_text(translate_int(program), encoding="ascii")
         compile_shader(compiler, source, shader)
         pairs = ((0, 0), (0x100000000, 1), (0, 0x100000000), (0, 1),
-                 (0, 0xffffffff00000001), (0xffffffff00000000, 0xffffffff00000001)) if subtract else (
+                 (0, 0xffffffff00000001), (0x0002000000000000, 0x0001000000000001),
+                 (0xffffffff00000000, 0xffffffff00000001)) if subtract else (
                      (0, 0), (0xffffffff, 1), (0xffffffff00000000, 0x100000000),
                      (0xffffffffffffffff, 1))
         cases = []
@@ -2699,6 +2720,19 @@ def check_scalar_carry_chain_draw(directory, compiler, renderer, backend):
                                capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Dropping SCC from {old} escaped detection")
+
+    program = scalar_carry_chain(False)
+    program[program.index("s_addc_u32 s45, s45, s47")] = "s_addc_u32 s45, s45, 0xffffffff"
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    # Carry in is set in both rows. With high A = 1 the first addition wraps.
+    # With high A = 0 only the addition of carry in wraps.
+    for high_a in (1, 0):
+        constants = bytearray(256)
+        struct.pack_into("<QQ", constants, 12, (high_a << 32) | 0xffffffff, 1)
+        words = (0, high_a, 1, 1)
+        write_case(case, constants, tuple(as_float(w) for w in words), integer_rt=True)
+        subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
 
 
 def scalar_leading_bit_values(width):
@@ -4314,6 +4348,26 @@ def vop2_integer_group() -> list[str]:
     ])
 
 
+def align_integer_group(byte=False, swapped=False) -> list[str]:
+    op = "v_alignbyte_b32" if byte else "v_alignbit_b32"
+    first, last = (1, 3) if byte else (4, 31)
+    left, right = ("v18", "s44") if swapped else ("s44", "v18")
+    return uncompressed_export([
+        "v_mov_b32_e32 v18, s45",
+        f"{op} v12, {left}, {right}, {first}",
+        f"{op} v13, {left}, {right}, 0",
+        f"{op} v14, {left}, {right}, {last}",
+        f"{op} v18, {left}, {right}, s46",
+        "v_mov_b32_e32 v15, v18",
+    ])
+
+
+def align_reference(a, b, count, byte=False):
+    shifts = (1, 0, 3, count & 3) if byte else (4, 0, 31, count & 31)
+    joined = (a << 32) | b
+    return tuple((joined >> (shift * (8 if byte else 1))) & 0xffffffff for shift in shifts)
+
+
 # Bodies for uncompressed_export(): s44 = A and s45 = B from the constants, v18 = B, and each channel v12..v15
 # holds its own result. Group 3 uses inline constants and register-first operands.
 NC_INT_BODIES = {
@@ -4864,6 +4918,49 @@ def check_controls(directory):
         "v_and_b32_e32 v12, s44, v106",
     ):
         must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop2]))
+    A, B = 0x12345678, 0x9abcdef0
+    assert align_reference(A, B, 0)[3] == B
+    assert align_reference(A, B, 0, True)[3] == B
+    assert align_reference(A, B, 31)[3] == 0x2468acf1
+    assert align_reference(A, B, 32)[3] == B
+    assert align_reference(A, B, 32)[3] != A
+    assert align_reference(A, B, 3, True)[3] == 0x3456789a
+    assert align_reference(A, B, 4, True)[3] == B
+    assert align_reference(A, B, 4, True)[3] != A
+    assert align_reference(A, B, 4) != align_reference(B, A, 4)
+    assert align_reference(A, B, 1, True) != align_reference(B, A, 1, True)
+    assert align_reference(0x12345678, 0x9abcdef0, 32) == (
+        0x89abcdef, 0x9abcdef0, 0x2468acf1, 0x9abcdef0)
+    assert align_reference(0x12345678, 0x9abcdef0, 4, True) == (
+        0x789abcde, 0x9abcdef0, 0x3456789a, 0x9abcdef0)
+    align_source = "\n".join(translate_int(align_integer_group(byte)) for byte in (False, True))
+    assert set(VOP3_ALIGN_OPS) <= ACCEPTED
+    for expected in (
+        "((4u & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (4u & 31u)) | (asuint(params[0].w) << (32u - (4u & 31u)))))",
+        "((0u & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (0u & 31u)) | (asuint(params[0].w) << (32u - (0u & 31u)))))",
+        "((31u & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (31u & 31u)) | (asuint(params[0].w) << (32u - (31u & 31u)))))",
+        "((asuint(params[1].y) & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (asuint(params[1].y) & 31u)) | (asuint(params[0].w) << (32u - (asuint(params[1].y) & 31u)))))",
+        "((1u & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((1u & 3u) * 8u)) | (asuint(params[0].w) << (32u - ((1u & 3u) * 8u)))))",
+        "((0u & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((0u & 3u) * 8u)) | (asuint(params[0].w) << (32u - ((0u & 3u) * 8u)))))",
+        "((3u & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((3u & 3u) * 8u)) | (asuint(params[0].w) << (32u - ((3u & 3u) * 8u)))))",
+        "((asuint(params[1].y) & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((asuint(params[1].y) & 3u) * 8u)) | (asuint(params[0].w) << (32u - ((asuint(params[1].y) & 3u) * 8u)))))",
+    ):
+        assert expected in align_source, expected
+    for bad_align in (
+        "v_alignbit_b32 v12, s44, v18",
+        "v_alignbit_b32 v12, s44, v18, 4, 5",
+        "v_alignbyte_b32 v12, s44, v18",
+        "v_alignbyte_b32 v12, s44, v18, 1, 2",
+        "v_alignbit_b32_e32 v12, s44, v18, 4",
+        "v_alignbyte_b32_e32 v12, s44, v18, 1",
+        "v_alignbit_b32 v256, s44, v18, 4",
+        "v_alignbyte_b32 v256, s44, v18, 1",
+        "v_alignbit_b32 v12, abs(s44), v18, 4",
+        "v_alignbyte_b32 v12, s44, -v18, 1",
+        "v_alignbit_b32 v12, s44, v18, 4 clamp",
+        "v_alignbyte_b32 v12, s44, v18, 1 clamp",
+    ):
+        must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_align]))
     check_nc_integer_lowering()
     check_e64_integer_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
@@ -5828,6 +5925,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (with_three_constant_buffers(), translate_three_buffers),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate), (sopk_scalar(), translate), (sopk_cmpk_cmovk(), translate_int)]
+    fixtures.extend((align_integer_group(byte), translate_int) for byte in (False, True))
     fixtures.append((rgb_sample(), translate))
     fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
@@ -6167,6 +6265,33 @@ def binary32_normal_or_zero(word):
     """True for a normal binary32 or a signed zero: no NaN, infinity or subnormal pattern."""
     exponent = (word >> 23) & 0xff
     return 0 < exponent < 0xff or word & 0x7fffffff == 0
+
+
+def check_align_draws(directory, compiler, renderer, backend):
+    source, shader = directory / "align.hlsl", directory / "align.cso"
+    pairs = ((0x12345678, 0x23456789), (0x3f123456, 0x40123456), (0x89abcdef, 0x91234567))
+    for byte in (False, True):
+        cases = []
+        for a, b in pairs:
+            for count in (0, 1, 3, 4, 31, 32, 63, 0xffffffff):
+                constants = bytearray(256)
+                struct.pack_into("<3I", constants, 12, a, b, count)
+                words = align_reference(a, b, count, byte)
+                assert all(binary32_normal_or_zero(w) for w in (a, b, *words))
+                path = directory / f"align-{byte}-{len(cases)}.case"
+                path.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+                cases.append((path, "pass"))
+        wrong = directory / f"align-wrong-{byte}.case"
+        data = bytearray(cases[0][0].read_bytes())
+        data[256] ^= 1
+        wrong.write_bytes(data)
+        for swapped in (False, True):
+            source.write_text(translate_int(align_integer_group(byte, swapped)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            batch = [(path, "mismatch" if swapped else status) for path, status in cases]
+            if not swapped:
+                batch.insert(1, (wrong, "mismatch"))
+            run_pixel_batch(renderer, backend, shader, batch)
 
 
 def check_integer_nc_draws(directory, compiler, renderer, backend):
@@ -7955,13 +8080,15 @@ def main():
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc", "draw-bfm", "draw-e64-integer"):
+        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
+                    "draw-e64-integer", "draw-bfm", "draw-align"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
                         "draw-e64-integer": check_e64_integer_draws,
-                        "draw-bfm": check_bfm_draw}[mode]
+                        "draw-bfm": check_bfm_draw,
+                        "draw-align": check_align_draws}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
