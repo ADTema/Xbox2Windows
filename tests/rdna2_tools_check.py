@@ -2055,6 +2055,18 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertEqual(classify_isa_category(opcode), "VOPC (Vector Compare)", opcode)
         self.assertEqual(classify_isa_category("v_add_f32"), "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)")
 
+    def test_vopc_e32_destination_must_be_vcc(self):
+        """An explicit _e32 compare may only write vcc; suffix-less and _e64 may name an SGPR."""
+        families = [f"v_cmp_{op}_{kind}" for kind in ("f32", "f16", "i32", "u32", "i16", "u16")
+                    for op in ("lt", "eq")] + ["v_cmp_class_f32", "v_cmp_class_f16"]
+        for name in families:
+            for dst in ("s52", "s[52:53]"):
+                self.assertFalse(is_instruction_supported(f"{name}_e32 {dst}, s44, v18"), (name, dst))
+                self.assertTrue(is_instruction_supported(f"{name} {dst}, s44, v18"), (name, dst))
+                self.assertTrue(is_instruction_supported(f"{name}_e64 {dst}, s44, v18"), (name, dst))
+            for dst in ("vcc", "vcc_lo"):
+                self.assertTrue(is_instruction_supported(f"{name}_e32 {dst}, s44, v18"), (name, dst))
+
     def test_vop3p_classification(self):
         """Packed and mixed-precision opcodes must classify as VOP3P."""
         for opcode in (

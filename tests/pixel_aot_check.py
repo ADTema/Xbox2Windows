@@ -6336,6 +6336,22 @@ def check_s_version():
     assert renumbered(translate_int(s_version_program())) == renumbered(base)
 
 
+def check_vopc_e32_destination():
+    """VOPC e32 writes VCC only: LLVM 15 rejects an SGPR destination on the explicit spelling."""
+    message = "VOPC e32 destination must be vcc"
+    families = [f"v_cmp_{op}_{kind}" for kind in ("f32", "f16", "i32", "u32", "i16", "u16")
+                for op in ("lt", "eq")] + ["v_cmp_class_f32", "v_cmp_class_f16"]
+    for name in families:
+        for dst in ("s52", "s[52:53]"):
+            expect_value_error(translate, with_constants(["v_mov_b32_e32 v18, 64", f"{name}_e32 {dst}, s44, v18"]), message)
+            # The suffix-less spelling is what LLVM turns into e64; both lower identically.
+            plain = translate(with_constants(["v_mov_b32_e32 v18, 64", f"{name} {dst}, s44, v18"]))
+            assert plain == translate(with_constants(["v_mov_b32_e32 v18, 64", f"{name}_e64 {dst}, s44, v18"])), (name, dst)
+        # vcc and vcc_lo stay valid on e32 (wave32 and wave64 spellings).
+        for dst in ("vcc_lo", "vcc"):
+            translate(with_constants(["v_mov_b32_e32 v18, 64", f"{name}_e32 {dst}, s44, v18"]))
+
+
 def check_controls(directory):
     check_title_load_controls()
     for mask in (0x3, 0xC, 0xF):
@@ -6369,6 +6385,7 @@ def check_controls(directory):
     assert dpp_ternary.count("QuadReadAcrossX(") == 1 and dpp_ternary.count("QuadReadLaneAt(") == 1
     assert not any("?" in line and "QuadRead" in line for line in dpp_ternary.splitlines())
     check_f16_denorm_controls()
+    check_vopc_e32_destination()
     program = bitwise_program()
     for before, after in (("s44, v18", "s44, |v18|"), ("20, v19", "20, v19 clamp"),
                           ("0x00700000, v18, v19", "0x00700000, v18")):
