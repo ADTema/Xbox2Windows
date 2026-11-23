@@ -227,4 +227,35 @@ exported_passthrough PROC
     mov ecx, 20h
     jmp QWORD PTR __imp_XMemAlloc
 exported_passthrough ENDP
+
+; The callee copies its entry register R8 into RDX. The caller also sets RDX to a different
+; word, so the site resolves from the caller's R8 only.
+caller_copy PROC
+    mov edx, 05E50000h
+    mov r8d, 0A8004000h
+    call entry_copy
+    ret
+caller_copy ENDP
+
+entry_copy PROC
+    mov rdx, r8
+    call QWORD PTR __imp_XMemAlloc
+    ret
+entry_copy ENDP
+
+; The same through a 32-bit copy: the caller's R8 is 1A8004000h, so the resolved word is the low
+; 32 bits. Without the truncation, bit 32 would set memory type 13 (undefined) and era_heap would
+; return null.
+caller_copy_low PROC
+    mov edx, 05E50000h
+    mov r8, 1A8004000h
+    call entry_copy_low
+    ret
+caller_copy_low ENDP
+
+entry_copy_low PROC
+    mov edx, r8d
+    call QWORD PTR __imp_XMemAlloc
+    ret
+entry_copy_low ENDP
 END
