@@ -389,8 +389,10 @@ int raw_uav(bool warp)
         UINT bytes;
         std::array<UINT32, 4> value;
     };
-    const Request scalar{windows[0].logical_base + window_bytes - 4, 4, {0xc0ffee01u, 0, 0, 0}};
-    const Request vector{windows[1].logical_base + window_bytes - 24, 16,
+    constexpr UINT scalar_offset = window_bytes - 4;
+    constexpr UINT vector_offset = window_bytes - 24;
+    const Request scalar{windows[0].logical_base + scalar_offset, 4, {0xc0ffee01u, 0, 0, 0}};
+    const Request vector{windows[1].logical_base + vector_offset, 16,
                          {0x0badf00du, 0x13579bdfu, 0x2468ace0u, 0xfeedc0deu}};
     const Request refused[]{
         {windows[1].logical_base + window_bytes - 8, 16, {}},  // aligned, but 8 bytes past the window
@@ -406,6 +408,31 @@ int raw_uav(bool warp)
         if (resolve_raw_uav_store(windows, 2, request.address, request.bytes, unused) != E_INVALIDARG) {
             std::fprintf(stderr, "accepted a %u-byte store at 0x%llx\n", request.bytes,
                          static_cast<unsigned long long>(request.address));
+            return 1;
+        }
+    }
+    constexpr UINT64 four_gib = 1ull << 32;
+    const RawUavWindow wide{0, four_gib + 16, 0, four_gib + 16};
+    const RawUavWindow unaligned{2, 16, 0, 16};
+    const RawUavWindow wrapping{UINT64_MAX - 15, 32, 0, 32};
+    const RawUavWindow overlapping[]{windows[0], {windows[0].logical_base + 16, 32, 0, 32}};
+    struct WindowControl {
+        const RawUavWindow* set;
+        std::size_t count;
+        UINT64 address;
+    };
+    const WindowControl window_refusals[]{
+        {&wide, 1, four_gib},
+        {&unaligned, 1, 4},
+        {&wrapping, 1, wrapping.logical_base},
+        {overlapping, std::size(overlapping), overlapping[1].logical_base},
+    };
+    for (const auto& control : window_refusals) {
+        RawUavStore unused{17, 0xcafe, {}};
+        if (resolve_raw_uav_store(control.set, control.count, control.address, 4, unused) != E_INVALIDARG ||
+            unused.window != 17 || unused.offset != 0xcafe) {
+            std::fprintf(stderr, "invalid raw UAV window changed the result at 0x%llx\n",
+                         static_cast<unsigned long long>(control.address));
             return 1;
         }
     }
@@ -534,8 +561,8 @@ int raw_uav(bool warp)
         }
         return ranges;
     };
-    const auto place = [&](Ranges& ranges, const Request& request, const RawUavStore& store, UINT binding) {
-        const UINT first = static_cast<UINT>(windows[binding].resource_offset / sizeof(UINT32)) + store.offset / 4u;
+    const auto place = [&](Ranges& ranges, const Request& request, UINT expected_offset, UINT binding) {
+        const UINT first = static_cast<UINT>(windows[binding].resource_offset / sizeof(UINT32)) + expected_offset / 4u;
         for (UINT lane = 0; lane < request.bytes / 4u; ++lane) ranges[binding][first + lane] = request.value[lane];
     };
     const D3D12_RANGE read_range{0, 4 * range_bytes};
@@ -544,8 +571,8 @@ int raw_uav(bool warp)
     UINT mismatches[2]{}, changed[2]{};
     for (UINT phase = 0; phase < 2; ++phase) {
         Ranges expected = fresh();
-        place(expected, scalar, scalar_store, static_cast<UINT>(scalar_store.window) ^ phase);
-        place(expected, vector, vector_store, static_cast<UINT>(vector_store.window) ^ phase);
+        place(expected, scalar, scalar_offset, phase);
+        place(expected, vector, vector_offset, 1u ^ phase);
         for (UINT r = 0; r < 2; ++r) {
             for (UINT word = 0; word < range_words; ++word) {
                 const UINT32 value = actual[(2 * phase + r) * range_words + word];
@@ -556,8 +583,8 @@ int raw_uav(bool warp)
     }
     // With swapped bindings, the words each store was meant for keep their sentinels.
     Ranges intended = fresh();
-    place(intended, scalar, scalar_store, static_cast<UINT>(scalar_store.window));
-    place(intended, vector, vector_store, static_cast<UINT>(vector_store.window));
+    place(intended, scalar, scalar_offset, 0);
+    place(intended, vector, vector_offset, 1);
     UINT intended_words = 0, intended_kept = 0;
     for (UINT r = 0; r < 2; ++r) {
         for (UINT word = 0; word < range_words; ++word) {
@@ -570,7 +597,7 @@ int raw_uav(bool warp)
     std::printf("UAV windows: bound mismatches=%u changed=%u/%u; swapped mismatches=%u changed=%u, "
                 "intended words kept=%u/%u; refused=%zu\n",
         mismatches[0], changed[0], 2 * range_words, mismatches[1], changed[1], intended_kept, intended_words,
-        std::size(refused));
+        std::size(refused) + std::size(window_refusals));
     return mismatches[0] == 0 && changed[0] == 5 && mismatches[1] == 0 && changed[1] == 5 &&
         intended_words == 5 && intended_kept == intended_words &&
         check(device->GetDeviceRemovedReason(), "Device removal status") ? 0 : 1;
