@@ -3543,7 +3543,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError(f"Three-operand operation does not support e32 encoding: v_{op}")
             if op in INTEGER_VOP3_ONLY and encoding == "e32":
                 raise ValueError(f"VOP3-only operation does not support e32 encoding: v_{op}")
-            args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
+            if op == "pack_b32_f16":
+                # The sources are binary16: llvm-mc prints an inline float constant as a decimal float, and
+                # the hardware supplies its binary16 encoding (1.0 is 0x3c00), not the binary32 one.
+                args = [f"{INLINE_F16[t]}u" if t in INLINE_F16
+                        else int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
+            else:
+                args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
             if op in MUL24_HELPERS:
                 helpers.update(MUL24_HELPERS[op])
             helpers.update(INTEGER_HELPERS.get(op, ()))

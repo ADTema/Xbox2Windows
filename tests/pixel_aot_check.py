@@ -8259,6 +8259,17 @@ def check_pack_b32_lowering():
         assert wrong(*PACK_B32_ROWS[0]) & 0xffffffff != pack_b32_results(*PACK_B32_ROWS[0])[channel], reason
     # Two sources in the VOP3 encoding only: no e32 spelling, no clamp, no op_sel, no float modifier, an
     # in-range destination, written and in-range registers, 32-bit literals and no SDWA spelling.
+    # Inline float constants are binary16 operands here: 1.0 supplies 0x3c00 (15360), -0.5 0xb800 (47104) and
+    # 1/(2*pi) 0x3118 (12568), never the low half of their binary32 encodings (0x3f800000 would give 0).
+    inline = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_pack_b32_f16 v12, 1.0, v18",
+                                                "v_pack_b32_f16 v13, v18, -0.5",
+                                                "v_pack_b32_f16 v14, 0.15915494, v18"])).splitlines()
+    for statement in (
+        "    precise float alu21 = asfloat((15360u & 0xffffu) | ((asuint(alu20) & 0xffffu) << 16));",
+        "    precise float alu22 = asfloat((asuint(alu20) & 0xffffu) | ((47104u & 0xffffu) << 16));",
+        "    precise float alu23 = asfloat((12568u & 0xffffu) | ((asuint(alu20) & 0xffffu) << 16));",
+    ):
+        assert statement in inline, statement
     good = "v_pack_b32_f16 v12, s44, v18"
     translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
     translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_pack_b32_f16_e64 v12, s44, v18"]))
