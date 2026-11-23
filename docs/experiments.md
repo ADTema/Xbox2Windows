@@ -2451,6 +2451,11 @@ Run these variants with `ctest --preset dev --no-tests=error -R
 '^compute_store_aot_lds_qword_(warp|hardware)$' -V`.
 
 
+The five returning qword operations use the same updates and copy the
+old pair into the destination. The fixture aliases the destination with
+the data pair and exports all four dwords for one and two groups. Replacing
+the returned pair with the post-update pair must fail the CPU comparison.
+
 The private LDS f32 profile requires `--lds-f32-mode normal-rne` as a
 caller guarantee that interpreted operands and results are normal binary32
 or positive zero and that the native arithmetic uses round-to-nearest-even.
@@ -3621,6 +3626,10 @@ The e64 draws use `offscreen_check <backend> --check-pixel-batch <shader.cso> <c
 
 `v_frexp_mant_f32` (in e32 and e64 encodings) and `v_ldexp_f32` lower through explicit IEEE-754 binary32 bit helpers (`frexp_mant32` and `ldexp32`) so subnormals, signed zero, infinity, NaN, and large exponent shifts stay independent of desktop driver flush-to-zero modes. `v_ldexp_f32` accepts float source modifiers on `src0` and `clamp`, while decoding `src1` as a signed 32-bit integer and rejecting float modifiers on the exponent. Binary and draw fixtures check normal values, signed zero, source negation and absolute value, runtime scalar exponents, negative exponents, and output clamping; replacing `v_frexp_mant_f32` with `v_mov_b32` or inverting a `v_ldexp_f32` exponent sign must report a pixel mismatch.
 
+Quad-local conversion DPP16 and DPP8 reuse the same routing helpers as the other pixel operations. This slice handles signed and unsigned float32-to-integer and integer-to-float32 conversion, extraction of four unsigned byte positions, and the signed four-bit offset scaled by 1/16. Float32-to-integer conversion uses the shared helpers for truncation, NaN to zero, and saturation. DPP16 permits abs and neg on floating sources. DPP8 repeats the same quad permutation in both halves. Partial masks, cross-quad routing, additional modifiers and uninitialized operands are refused. Binary16 destination, packed, FLR and RPI forms remain outside this slice.
+
+The source-built draw compares all four channels as raw words. It covers signed and unsigned endpoints, infinities and NaN, the rounding point 2^24+1, each byte position and both signs of the four-bit offset. All four routed lanes contribute distinct base-4 weights. Changing the DPP8 rotation, swapping the DPP16 axes, discarding the source negation, or reading the wrong byte must mismatch. The LLVM 15 binary round trip covers both programs. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_dpp_cvt_' -V`.
+
 `v_frexp_exp_i32_f32` in e32 and e64 encodings returns a signed 32-bit exponent. The binary32 bit helper handles normal and subnormal inputs and returns zero for signed zeros, infinities and NaNs. Source negation and absolute value leave the magnitude unchanged, so the lowerer can omit float sign operations that could flush subnormals. The lowerer keeps the result as integer bits in the destination register. The synthetic draw compares those bits before pixel export for 12 input words, including the smallest and largest subnormals. A reference with an exponent one too large for the smallest subnormal must report a pixel mismatch. Run the dedicated cases with `ctest --preset dev --no-tests=error -R '^pixel_aot_frexp_exp_'`.
 
 Plain `v_mul_lo_u32` multiplies two full 32-bit operands and keeps the low 32 bits. The `pixel_aot_e64_{warp,hardware}` draw reads back the integer word for `0xffffffff * 0xffffffff` and `0x12345678 * 0x9abcdef0`, whose low words are `0x00000001` and `0x242d2080`. Replacing multiply with addition must fail the same readback. The LLVM 15 binary fixture verifies the opcode through the normal decoding path.
@@ -4081,6 +4090,34 @@ Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer una
   `64,64,64,64` in four runs on the RX 6500 and passed on WARP
   10.0.26100.10068. These measurements leave the cause open.
 
+#### AMD and Intel divergent array-atomic measurements (#369)
+
+The direct probe and explicit waterfall are separate measurements; the direct probe remains strict and the ordinary title-address write path is unchanged. On an AMD Radeon RX 9070 XT (`1002:7550`), the direct probe returned `256,256,256,256` instead of `64,64,64,64` in six runs on two driver versions (2 on `32.0.31035.1003` and 4 on `32.0.31044.16`). Earlier reports on `32.0.32015.7029` and `32.0.32029.2010` recorded the same result. The title-address fixture still reported zero mismatches. The explicit waterfall returned `64,64,64,64` in 3/3 runs; WARP 10.0.26100.9818 returned `64,64,64,64` for both the direct probe and waterfall. The RX 9060 XT independently showed the same direct result and an exact waterfall. These AMD results are distinct from the Intel signature below. [RX 9070 XT driver runs](https://github.com/R0Y00/Xbox2Windows/issues/369#issuecomment-7113579438) · [RX 9070 XT waterfall and ISA](https://github.com/R0Y00/Xbox2Windows/issues/369#issuecomment-7114124208) · [RX 9060 XT waterfall](https://github.com/R0Y00/Xbox2Windows/issues/369#issuecomment-7072945852)
+
+For the RX 9070 XT ISA comparison, the inputs were the `dev` build's `ProbeArrayAtomics.cso` and `ProbeArrayAtomicsWaterfall.cso` (commit `1ccc326`, DXC 1.8.2502.11), analyzed with Radeon GPU Analyzer 2.15.0.30 in DX12 mode on `gfx1201`, using the installed RX 9070 XT driver 32.0.31044.16 on Windows 11 build 26300.9974:
+
+```powershell
+rga.exe -s dx12 -c gfx1201 --cs-blob out\build\dev\ProbeArrayAtomics.cso --isa ProbeArrayAtomics.isa
+rga.exe -s dx12 -c gfx1201 --cs-blob out\build\dev\ProbeArrayAtomicsWaterfall.cso --isa ProbeArrayAtomicsWaterfall.isa
+```
+
+In the direct-probe ISA, the wave active-lane count is taken before the non-uniform resource loop narrows `EXEC`; the resulting whole-wave count is the atomic operand at each loop iteration. In the waterfall ISA, the lane count is taken inside that loop, after narrowing. This matches the direct `256,256,256,256` and waterfall `64,64,64,64` runtime readbacks, but it is an ISA observation from RGA's compiler-blob pipeline, not a capture of the exact runtime pipeline. Matching the ISA to runtime behavior, and any explanation of the underlying cause, remain inference rather than a confirmed project root cause.
+
+Intel is a separate observation. On Intel UHD Graphics (`8086:468B`, driver 32.0.101.7092; Windows 11 build 26300.10075; MSVC 19.44.35230, Windows SDK 10.0.26100, DXC 1.9.2602.17; debug layer unavailable), the direct probe returned `256,192,128,64` in 3/3 runs, while the explicit waterfall returned `64,64,64,64` in 3/3 runs and the title-address fixture had zero mismatches. In separate local-only width instrumentation, the reported wave width was 16 in 15/15 runs: `id % rangeCount` retained the staircase, `(id / 16) % rangeCount` gave `64,64,64,64`, and `(id / 8) % rangeCount` gave `128,64,128,64`. This instrumentation was local to the Intel study. [Intel paired runs and wave-width instrumentation](https://github.com/R0Y00/Xbox2Windows/issues/369#issuecomment-7107139741)
+
+Runtime commands, run from the build directory (the direct hardware probe intentionally fails on the reported AMD and Intel signatures):
+
+```powershell
+$env:XBOX2WINDOWS_ADAPTER = 'RX 9070 XT' # or 'Intel' for the Intel adapter
+.\offscreen_check.exe hardware --gpu-alias-lookup-writes
+.\offscreen_check.exe hardware --gpu-alias-atomic-waterfall
+Remove-Item Env:XBOX2WINDOWS_ADAPTER
+.\offscreen_check.exe warp --gpu-alias-lookup-writes
+.\offscreen_check.exe warp --gpu-alias-atomic-waterfall
+```
+
+The RGA result covers one AMD device, driver and compiler-blob pipeline; it does not establish behavior for other driver versions, the Intel compiler, or Windows 10 WARP. No local width instrumentation or RGA ISA dump was added to the repository; this note records measurements only.
+
 The wave diagnostic is run explicitly, with the same dispatch sizes, resource
 setup and readback as the direct probe. Run both from the build directory:
 
@@ -4516,10 +4553,10 @@ Binding probes on #870 leave 19 audio-side imports unresolved: 5 from `chad.dll`
 | `xapu.dll` | `XApuDisconnect` | Learn index entry only | None known | needs evidence |
 | `xapu.dll` | `XApuEnqueueCommand` | Learn index entry only | None known. Desktop XAudio2 has no XMA decoder. | needs evidence |
 | `xapu.dll` | `XApuGetResultCount` | Learn index entry only | None known | needs evidence |
-| `acphal.dll` | `AcpHalCreate` | None (index lists only the AcpHal member page) | None known | needs evidence |
-| `acphal.dll` | `AcpHalAllocateShapeContexts` | None | None known | needs evidence |
-| `acphal.dll` | `AcpHalReleaseShapeContexts` | None | None known | needs evidence |
-| `acphal.dll` | `ApuCreateHeap` | Named in a DirectXTK12 diagnostic as the heap that `ApuAlloc` draws from. No call site and no signature. | Process memory (proposed, untested) | needs evidence |
+| `acphal.dll` | `AcpHalCreate` | None (index lists only the AcpHal member page) | Single HAL handle (fixture contract only, see below) | needs evidence |
+| `acphal.dll` | `AcpHalAllocateShapeContexts` | None (index lists only the ShapeContexts member pages) | Cleared context slots (fixture contract only, see below) | needs evidence |
+| `acphal.dll` | `AcpHalReleaseShapeContexts` | None | Release of the slots above (fixture contract only, see below) | needs evidence |
+| `acphal.dll` | `ApuCreateHeap` | Named in a DirectXTK12 diagnostic as the heap that `ApuAlloc` draws from. No call site and no signature. | Bounded arena for `ApuAlloc` (fixture contract only, see below) | needs evidence |
 | `acphal.dll` | `ApuAlloc` | Call sites at [SoundEffect.cpp L246](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L246), [WaveBankReader.cpp L799](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/WaveBankReader.cpp#L799) and [SoundStreamInstance.cpp L470](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundStreamInstance.cpp#L470) | Aligned process memory (proposed, fixture only) | partial call shape |
 | `acphal.dll` | `ApuFree` | Call sites at [SoundEffect.cpp L95](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L95) and [SoundStreamInstance.cpp L60](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundStreamInstance.cpp#L60) | Release of the block above (proposed, fixture only) | partial call shape |
 | `acphal.dll` | `ApuIsVirtualAddressValid` | Address validation per GDK index member page | Buffer validity query (proposed, fixture only) | partial call shape |
@@ -4584,6 +4621,38 @@ On success, the caller exits with `0x8A1`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a 
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_apu_address$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_apu_address$' -V
+```
+
+### ACP HAL, shape-context and heap caller and recorder
+
+A source-built caller ([`acphal_hal_caller.asm`](../tests/cpu/acphal_hal_caller.asm)) imports `ApuCreateHeap`, `AcpHalCreate`, `AcpHalAllocateShapeContexts` and `AcpHalReleaseShapeContexts` from `acphal.dll` by name. It also imports `ApuAlloc` and `ApuFree`, so that heap creation has an observable effect, plus `finish_exe` from `cpu_exe_io.dll`. It starts through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). A test-only recording provider ([`acphal_hal_provider.cpp`](../tests/cpu/acphal_hal_provider.cpp)) serves the six exports. This is not a production `acphal.dll`.
+
+- **Public evidence:**
+  - `ApuAlloc` and `ApuFree` use the DirectXTK12 call shape from the inventory above.
+  - DirectXTK12 names `ApuCreateHeap` only in the `ApuAlloc` failure diagnostic ([SoundEffect.cpp L249](https://github.com/microsoft/DirectXTK12/blob/f3555e3014a53c81a6202b786dc4d6509b95a936/Audio/SoundEffect.cpp#L249)), as the heap `ApuAlloc` draws from.
+  - The GDK Learn index lists `AcpHal` and `ShapeContexts` member pages, plus per-type pages (`ShapeDmaContext`, `ShapeEqCompContext`, `ShapeFiltVolContext`, `ShapePcmContext`, `ShapeSrcContext`, `ShapeXmaContext`, `ShapeFlowGraph`). These are names only.
+- **Fixture contract (not public):** none of the four has a public signature. The fixture uses `HRESULT ApuCreateHeap(UINT32 size)`, `HRESULT AcpHalCreate(void** hal)`, `HRESULT AcpHalAllocateShapeContexts(void* hal, UINT32 count, void** contexts)` and `HRESULT AcpHalReleaseShapeContexts(void* hal, void* contexts)`. The 64 KiB heap bound with 4 KiB granularity, the single HAL instance, the 16-slot pool of 64-byte contexts, first-fit reuse and every refusal code are proposed desktop policy. The console argument lists, context layout and error codes stay open.
+- **Verified cases** (identical under the Windows loader and `pe_map`):
+  1. `ApuAlloc` before any heap returns `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)` and leaves the output.
+  2. `ApuCreateHeap(0)` returns `E_INVALIDARG`, `ApuCreateHeap(0x2000)` succeeds, and a second heap returns `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`.
+  3. The heap bounds `ApuAlloc`: 4 KiB at 2 KiB alignment succeeds and a further 8 KiB returns `E_OUTOFMEMORY` with the output and the first block's data intact.
+  4. Shape-context allocation with a null handle before `AcpHalCreate` returns `E_HANDLE` with the output untouched. The checker also replays the provider's real handle address before create, which only the created-state check can refuse (`E_HANDLE`). The same call succeeds after create.
+  5. `AcpHalCreate(nullptr)` returns `E_POINTER`. One HAL is created. A second create returns `ERROR_ALREADY_EXISTS` with its output untouched.
+  6. Count 0, count 17 and a null output are refused (`E_INVALIDARG`, `E_INVALIDARG`, `E_POINTER`) with the output untouched.
+  7. Two allocations of 4 contexts come back cleared, 64-byte aligned and disjoint. The first keeps the caller's writes after the second.
+  8. A release succeeds. A double release returns `E_INVALIDARG` and is counted. A release with a handle that is not the HAL returns `E_HANDLE`.
+  9. After both releases, 8 contexts are allocated from the reused slots and come back cleared.
+  10. The checker reads back the provider records after the `pe_map` run: 3 heap calls with an 8 KiB limit, 3 `ApuAlloc` calls, 3 creates, 7 shape-context allocations (3 successful), 5 releases, 1 double-release refusal, 2 handle refusals and no live allocations.
+- **Controls:**
+  - A provider that reports success without clearing the contexts (`ACPHAL_TEST_FAULTY`) stops the caller at Step 7 (`0xF07`) under both loaders.
+  - Withholding any of the four exports stops `pe_map` before entry with `unresolved import acphal.dll!<name>` and no provider calls.
+  - With no `acphal.dll` binding, `pe_map` stops before entry. The Windows loader refuses the process with `0xC0000135` (`STATUS_DLL_NOT_FOUND`).
+
+On success the caller exits with `0x8AC`, also with `CPU_CRC_TEST_LIVE_WORKER=1` under the Windows loader. The fixture shows that the caller's create, allocate, release and heap paths and their refusals are distinguishable and identical under both loaders. It does not establish the console signatures, the shape-context layout, the call order on the startup path, or whether the startup path calls `ApuCreateHeap` before `ApuAlloc`. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_acphal_hal$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_acphal_hal$' -V
 ```
 
 ### DirectStorage factory and queue adapter

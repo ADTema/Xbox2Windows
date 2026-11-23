@@ -231,6 +231,8 @@ The installation metadata inspected for this case study lists a Scarlett executa
 
 Windows Authenticode verification on the local copy reported `HashMismatch` for 12 DLLs and `NotSigned` for four. Three independently compared whole-file SHA-256 values matched the community reports. The cause of the digest mismatch and the original signing path remain undetermined. [Methods and fingerprints](https://github.com/R0Y00/Xbox2Windows/issues/52)
 
+XCL is a public behavioural reference for what a retail title may ask of the platform. The [XCL reference](docs/xcl-reference.md) records the GPL-2.0-only boundary and the pinned revision; the [capability matrix](docs/xcl-capability-matrix.md) maps selected XCL behaviours to named checked-in tests. Neither document is an Xbox2Windows measurement or a roadmap.
+
 ## License
 
 Original project code and documentation use the [MIT License](LICENSE). Third-party games, assets, SDKs and trademarks belong to their respective owners. Xbox2Windows is an independent community project with no affiliation with the companies whose products it discusses.
