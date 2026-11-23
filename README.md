@@ -32,6 +32,8 @@ Both Windows jobs on `main` must pass before CI publishes a new chart. The image
 
 ## Community and contributions
 
+Join [Xbox2Windows Dev on Discord](https://discord.gg/DMcmNtpd6R) for project questions, review coordination and independent test runs. Record task claims, reproduction evidence and decisions on the relevant GitHub issue or PR.
+
 - **Claim a task.** Search for the behavior or test name in [open issues](https://github.com/R0Y00/Xbox2Windows/issues) and [open PRs](https://github.com/R0Y00/Xbox2Windows/pulls). On the issue, say what you will test, on which platform, and which shared interface or other PR your work depends on. For a first patch, start with [good first issues](https://github.com/R0Y00/Xbox2Windows/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
 - **Submit a change.** Keep the PR focused on one behavior. Link the task it advances and any prerequisite PR. Include the exact command, expected and observed results, and a negative control for a new fixture. [Patch and evidence guide](CONTRIBUTING.md#submit-and-review-a-patch)
 - **Review a PR.** For CPU translation or PE loading, reproduce the comparison with the original fixture. For shaders or GPU compatibility, check the DXIL and relevant WARP or hardware results. Both reviewers cover shared CPU/GPU interfaces. Record your verdict and the commit you tested. The Maintainer merges after review threads are resolved and the required Windows check passes. [Review responsibilities](CONTRIBUTING.md#who-reviews-and-merges-a-pr)
