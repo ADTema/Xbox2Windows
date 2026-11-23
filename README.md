@@ -71,6 +71,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | Experiment | Focused test |
 |---|---|
 | Native, mapped and recompiled archive reader | `ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V` |
+| [Publish RGBA8 textures from completed archive records](docs/experiments.md#publishing-a-texture-from-each-complete-archive-record) | `ctest --preset release --no-tests=error -R '^cpu_archive_texture_publication$' -V` |
 | Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
 | Textured mesh fallback at Shader Model 6.0 | `ctest --preset dev --no-tests=error -R '^mesh_textured_fallback_' -V` |
 | GPU-produced texture through the SM 6.0 mesh fallback | `ctest --preset dev --no-tests=error -R '^compute_mesh_texture_fallback_' -V` |

@@ -43,6 +43,17 @@ cmake --build --preset dev --target archive_reader_lifted pe_map
 ctest --preset dev --no-tests=error -R '^cpu_native_archive_reader$' -V
 ```
 
+### Publishing a texture from each complete archive record
+
+The [texture reader](../tests/cpu/archive/texture_reader.zig) selects a different publisher in the same Zig record loop. Each successful decode supplies one tightly packed 4×4 RGBA8 image to [consume_archive_texture](../tests/cpu/archive/texture.hpp). At pixel `(x, y)` the red channel cycles through the decoded bytes in row-major order, green is `85*x`, blue is `85*y`, and alpha is 255. Rows occupy 16 bytes. The consumer can use or copy the pixels during the call and returns zero on success. The fixture consumer writes those bytes to stdout.
+
+The [comparison](../tests/cpu/archive_texture_check.py) checks native Windows, the mapped reader and decoder, and the AOT reader and decoder against the known red samples and coordinate ramps. Two valid records produce 128 bytes. Reusing the first texture for the second would change nine red samples. With the second input truncated, blast emits one tentative byte internally. Only the first 64-byte texture reaches the consumer, both records are freed, and all three processes exit 2. GPU upload and frame readback are the next step in [#830](https://github.com/R0Y00/Xbox2Windows/issues/830).
+
+```powershell
+cmake --build --preset release --target archive_texture_lifted pe_map
+ctest --preset release --no-tests=error -R '^cpu_archive_texture_publication$' -V
+```
+
 ### Recompiling the blast decoder
 
 The `cpu_native_archive_blast` test starts from the same archive reader and builds the unmodified blast 1.3 C file into a separate scalar x64 DLL with MSVC /Od. The [fixture translator](../tests/cpu/archive/translate_blast.py) follows direct calls from its PE export through the bit reader, Huffman table construction, symbol decoder and decompression loop. It reuses the x64 instruction lifter and frame analysis. Only generated C++ is compiled into the translated decoder. Its initialized data, including relocated table pointers, is separate from the native module. This profile uses per-thread tables, a bounded invocation stack, the six-argument blast ABI and two typed callback targets. The host supplies setjmp/longjmp semantics for a single active recovery point. The file I/O and allocation callbacks remain native.
