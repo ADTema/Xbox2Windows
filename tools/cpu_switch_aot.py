@@ -172,6 +172,7 @@ STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL, 
 MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
+ROTATES = {M.ROL: "true", M.ROR: "false"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
@@ -185,12 +186,14 @@ DATA = {2: R.DX, 4: R.EDX, 8: R.RDX}
 STRING_TRANSFERS = {
     Code.MOVSB_M8_M8: ("movs", 1), Code.MOVSW_M16_M16: ("movs", 2),
     Code.MOVSD_M32_M32: ("movs", 4), Code.MOVSQ_M64_M64: ("movs", 8),
+    Code.STOSB_M8_AL: ("stos", 1), Code.STOSW_M16_AX: ("stos", 2),
+    Code.STOSD_M32_EAX: ("stos", 4), Code.STOSQ_M64_RAX: ("stos", 8),
 }
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
 FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
-                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.CLD}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC}
+                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -909,46 +912,51 @@ class Lifter:
         code = CONDITIONS.get(jcc.condition_code)
         width = self.width(producer)
         u, s = unsigned(width), signed(width)
+        a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
+        sign = f"{1 << (width * 8 - 1):#x}ull"
         if producer.mnemonic in (M.CMP, M.SUB):
-            a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
-            result = f"static_cast<{s}>(static_cast<{u}>({a} - {b}))"
+            flag_result = f"static_cast<{u}>({a} - {b})"
+            overflow = f"((({a} ^ {b}) & ({a} ^ {flag_result}) & {sign}) != 0)"
             table = {"e": f"{a} == {b}", "ne": f"{a} != {b}", "b": f"{a} < {b}", "ae": f"{a} >= {b}",
                      "be": f"{a} <= {b}", "a": f"{a} > {b}", "l": f"static_cast<{s}>({a}) < static_cast<{s}>({b})",
                      "ge": f"static_cast<{s}>({a}) >= static_cast<{s}>({b})",
                      "le": f"static_cast<{s}>({a}) <= static_cast<{s}>({b})",
                      "g": f"static_cast<{s}>({a}) > static_cast<{s}>({b})",
-                     "s": f"{result} < 0", "ns": f"{result} >= 0"}
+                     "s": f"static_cast<{s}>({flag_result}) < 0", "ns": f"static_cast<{s}>({flag_result}) >= 0"}
         else:
-            result = f"static_cast<{u}>(fa)"
-            table = {"e": f"{result} == 0", "ne": f"{result} != 0",
-                     "s": f"static_cast<{s}>({result}) < 0", "ns": f"static_cast<{s}>({result}) >= 0"}
+            if producer.mnemonic == M.ADD:
+                flag_result = f"static_cast<{u}>({a} + {b})"
+                overflow = f"((~({a} ^ {b}) & ({a} ^ {flag_result}) & {sign}) != 0)"
+            else:
+                flag_result = f"static_cast<{u}>(fa)"
+                if producer.mnemonic in (M.INC, M.NEG):
+                    overflow = f"{flag_result} == {sign}"
+                elif producer.mnemonic == M.DEC:
+                    overflow = f"{flag_result} == {((1 << (width * 8 - 1)) - 1):#x}ull"
+                else:
+                    overflow = "false"  # TEST, AND, OR and XOR clear OF.
+            s_cond = f"static_cast<{s}>({flag_result}) < 0"
+            ns_cond = f"static_cast<{s}>({flag_result}) >= 0"
+            table = {"e": f"{flag_result} == 0", "ne": f"{flag_result} != 0", "s": s_cond, "ns": ns_cond}
             if producer.mnemonic in (M.TEST, M.AND, M.OR, M.XOR):
                 # Logical operations clear CF and OF.
-                table.update({"b": "false", "ae": "true", "be": f"{result} == 0", "a": f"{result} != 0",
-                              "l": table["s"], "ge": table["ns"],
-                              "le": f"{result} == 0 || {table['s']}", "g": f"{result} != 0 && {table['ns']}"})
+                table.update({"b": "false", "ae": "true", "be": f"{flag_result} == 0", "a": f"{flag_result} != 0",
+                              "l": s_cond, "ge": ns_cond,
+                              "le": f"{flag_result} == 0 || {s_cond}", "g": f"{flag_result} != 0 && {ns_cond}"})
+            else:
+                # ADD, INC, DEC and NEG share SF != OF signed comparisons; only ADD and NEG define CF.
+                table.update({"l": f"({s_cond}) != ({overflow})", "ge": f"({s_cond}) == ({overflow})",
+                              "le": f"{flag_result} == 0 || ({s_cond}) != ({overflow})",
+                              "g": f"{flag_result} != 0 && ({s_cond}) == ({overflow})"})
+                if producer.mnemonic == M.ADD:
+                    table.update({"b": f"{flag_result} < {a}", "ae": f"{flag_result} >= {a}",
+                                  "be": f"{flag_result} < {a} || {flag_result} == 0",
+                                  "a": f"{flag_result} >= {a} && {flag_result} != 0"})
+                elif producer.mnemonic == M.NEG:
+                    table.update({"b": f"{flag_result} != 0", "ae": f"{flag_result} == 0",
+                                  "be": "true", "a": "false"})
         # PF is even parity of only the low result byte. OF is signed overflow,
         # independent of the host's signed arithmetic and its overflow rules.
-        a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
-        sign = f"{1 << (width * 8 - 1):#x}ull"
-        if producer.mnemonic in (M.CMP, M.SUB, M.ADD):
-            operator = "+" if producer.mnemonic == M.ADD else "-"
-            flag_result = f"static_cast<{u}>({a} {operator} {b})"
-            same_sign = f"~({a} ^ {b})" if producer.mnemonic == M.ADD else f"({a} ^ {b})"
-            overflow = f"(({same_sign} & ({a} ^ {flag_result}) & {sign}) != 0)"
-            if producer.mnemonic == M.ADD:
-                # ADD now snapshots its operands, rather than just its result.
-                table.update({"e": f"{flag_result} == 0", "ne": f"{flag_result} != 0",
-                              "s": f"static_cast<{s}>({flag_result}) < 0",
-                              "ns": f"static_cast<{s}>({flag_result}) >= 0"})
-        else:
-            flag_result = f"static_cast<{u}>(fa)"
-            if producer.mnemonic == M.INC:
-                overflow = f"{flag_result} == {sign}"
-            elif producer.mnemonic == M.DEC:
-                overflow = f"{flag_result} == {((1 << (width * 8 - 1)) - 1):#x}ull"
-            else:
-                overflow = "false"  # TEST, AND, OR and XOR clear OF.
         table.update({"o": overflow, "no": f"!({overflow})",
                       "p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
         if code not in table:
@@ -969,7 +977,7 @@ class Lifter:
         mnemonic = ins.mnemonic
         if ins.code in STRING_TRANSFERS:
             kind, width = STRING_TRANSFERS[ins.code]
-            if (not ins.has_rep_prefix or ins.has_segment_prefix or ins.has_repne_prefix or ins.has_lock_prefix
+            if (ins.has_segment_prefix or ins.has_repne_prefix or ins.has_lock_prefix
                     or any(ins.op_kind(n) not in (OpKind.REGISTER, OpKind.MEMORY_ESRDI, OpKind.MEMORY_SEG_RSI)
                            for n in range(ins.op_count))):
                 raise ValueError(f"unsupported string addressing or prefix at RVA {ins.ip:#x}")
@@ -977,7 +985,12 @@ class Lifter:
             self.used.update(registers)
             reads = dict.fromkeys(registers, 8)
             writes = dict.fromkeys(registers, 8)
-            value = f"load_always<{unsigned(width)}>(rsi)"
+            if kind == "movs":
+                value = f"load_always<{unsigned(width)}>(rsi)"
+            else:
+                self.used.add(R.RAX)
+                reads[R.RAX] = width
+                value = f"static_cast<{unsigned(width)}>(rax)"
             # One element at a time: neither memcpy nor memmove reproduces a forward
             # overlapping MOVS that reads the bytes just written by earlier iterations.
             alignment = " __unaligned" if width > 1 else ""
@@ -987,9 +1000,9 @@ class Lifter:
                 self.used.add(R.RCX)
                 reads[R.RCX] = writes[R.RCX] = 8
                 step = f"while (rcx != 0) {{ {step} --rcx; }}"
-            return f"{{ const word step = {width}ull; {step} }}", reads, writes
-        if mnemonic == M.CLD:
-            return "", {}, {}  # DF stays clear throughout this profile.
+            return f"{{ const word step = direction ? 0ull - {width}ull : {width}ull; {step} }}", reads, writes
+        if mnemonic in (M.CLD, M.STD):
+            return f"direction = {'true' if mnemonic == M.STD else 'false'};", {}, {}
         width = self.width(ins)
         reads, writes = {}, {}
 
@@ -1063,17 +1076,19 @@ class Lifter:
             value = {M.INC: f"{a} + 1u", M.DEC: f"{a} - 1u", M.NEG: f"0u - {a}", M.NOT: f"~{a}"}[mnemonic]
             line = self.write(ins, width, value)
             if sets_flags:
-                if mnemonic not in (M.INC, M.DEC):
+                if mnemonic not in (M.INC, M.DEC, M.NEG):
                     raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
                 self.flags = True
                 line = f"fa = static_cast<{unsigned(width)}>({value}); " + line
             return line, reads, writes
-        if mnemonic in SHIFTS:
+        if mnemonic in (*SHIFTS, *ROTATES):
+            if sets_flags:
+                raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
             note(0)
             a = self.operand(ins, 0, width)
-            # x86 masks the count to six bits for 64-bit operands and to five bits otherwise, so an
-            # 8- or 16-bit destination can be shifted by up to 31. The shift is done in 64 bits
-            # (count < 64, no host overflow) and the write truncates the result to the destination.
+            # x86 masks the count to six bits for 64-bit operands and to five bits otherwise.
+            # Shifts widen to 64 bits (count < 64, no host overflow) and truncate on write;
+            # rotates mask modulo the operand width inside rotate_bits.
             mask = 63 if width == 8 else 31
             if ins.op1_kind == OpKind.REGISTER:
                 if ins.op1_register != R.CL:
@@ -1082,11 +1097,15 @@ class Lifter:
                 count = f"({self.reg(R.RCX)} & {mask}u)"
             else:
                 count = f"{ins.immediate(1) & mask}u"
-            if mnemonic == M.SAR:
-                a = f"static_cast<std::int64_t>(static_cast<{signed(width)}>({a}))"
+            if mnemonic in ROTATES:
+                value = f"rotate_bits<{unsigned(width)}>({a}, {count}, {ROTATES[mnemonic]})"
             else:
-                a = f"static_cast<std::uint64_t>({a})"
-            return self.write(ins, width, f"{a} {SHIFTS[mnemonic]} {count}"), reads, writes
+                if mnemonic == M.SAR:
+                    a = f"static_cast<std::int64_t>(static_cast<{signed(width)}>({a}))"
+                else:
+                    a = f"static_cast<std::uint64_t>({a})"
+                value = f"{a} {SHIFTS[mnemonic]} {count}"
+            return self.write(ins, width, value), reads, writes
         if mnemonic == M.IMUL and ins.op_count in (2, 3):
             # The two-operand form reads its destination; the three-operand form only writes it.
             if ins.op_count == 2:
@@ -1394,6 +1413,28 @@ def check_call_sites(function, offsets):
             raise ValueError(f"call without an aligned home space at entry RSP{offsets[ip]:+#x} at RVA {ip:#x}")
 
 
+def prove_direction(function):
+    """The Windows ABI enters with DF clear and requires it clear at calls and returns.
+
+    Keep both possibilities at joins. The emitted local follows the actual path;
+    this proof prevents a backwards-copy region from leaking DF across an ABI edge.
+    """
+    states = {function.entry: frozenset({False})}
+    work = [function.entry]
+    while work:
+        ip = work.pop()
+        ins = function.instructions[ip]
+        incoming = states[ip]
+        if (ins.mnemonic == M.RET or ip in function.calls or ip in function.tails) and True in incoming:
+            raise ValueError(f"direction flag may be set at call or return RVA {ip:#x}")
+        outgoing = (frozenset({ins.mnemonic == M.STD}) if ins.mnemonic in (M.CLD, M.STD) else incoming)
+        for target in function.successors[ip]:
+            merged = states.get(target, frozenset()) | outgoing
+            if merged != states.get(target):
+                states[target] = merged
+                work.append(target)
+
+
 def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=False):
     """Translate one export that takes the given number of integer arguments, 3 or 4.
 
@@ -1525,6 +1566,7 @@ def lift_function(program, entry, symbol, arguments, internal):
             what = "call" if moved[0] in function.calls else "stack change"
             raise ValueError(f"{what} in a function without unwind data at RVA {moved[0]:#x}")
     check_call_sites(function, frame.offsets)
+    prove_direction(function)
     lifter.frame = {ip: access[0] - frame.start for ip, access in frame.accesses.items()}
     lifter.adjustments = frame.adjustments
     producers = {ip: flag_producer(function, edges, ins) for ip, ins in instructions.items()
@@ -1662,6 +1704,8 @@ def lift_function(program, entry, symbol, arguments, internal):
             labels.add(ins.next_ip)
     locals_ = sorted((lifter.used | {R.RAX}) - set(function.arguments), key=lambda r: NAMES[r])
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
+    if any(ins.code in STRING_TRANSFERS or ins.mnemonic in (M.CLD, M.STD) for ins in instructions.values()):
+        declarations.append("bool direction = false;  // Windows x64 ABI entry state")
     function.image_data = lifter.image_used
     if lifter.image_used:
         # Read once at entry: a call while nothing is bound fails here, before any access.
@@ -1707,6 +1751,14 @@ static inline bool even_parity(word value) {
     // Fold the low byte into a nibble; bit n of 0x6996 is its odd parity.
     const auto folded = static_cast<unsigned>((value ^ (value >> 4)) & 15u);
     return ((0x6996u >> folded) & 1u) == 0;
+}
+template <class T> static inline T rotate_bits(T value, word count, bool left) {
+    const unsigned bits = static_cast<unsigned>(sizeof(T) * 8);
+    const unsigned shift = static_cast<unsigned>(count & (bits - 1));
+    if (!shift) return value;
+    const unsigned amount = left ? shift : bits - shift;
+    const word wide = value;
+    return static_cast<T>((wide << amount) | (wide >> (bits - amount)));
 }
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {

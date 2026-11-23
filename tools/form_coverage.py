@@ -65,6 +65,9 @@ CPU_FIXTURES = {
     "repeat_call": "cpu_aot_repeated_call",
     "working_set_delta": "cpu_working_set_delta",
     "xlatb": "cpu_aot_xlatb",
+    "rdtsc": "cpu_aot_rdtsc",
+    "rdtscp": "cpu_aot_rdtscp",
+    "rdtsc_harness": None,  # native CPUID and serialized reads
     "exe_entry": "cpu_aot_exe_entry",
     "xchg": "cpu_aot_xchg",
     "address_size": "cpu_aot_address_size",
