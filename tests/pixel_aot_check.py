@@ -265,7 +265,7 @@ def flush_ftz(value):
 
 
 def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extra_constants=None,
-               write_mask=None):
+               title_memory=None, write_mask=None):
     """Write a renderer case: 256 constant bytes, then 64 expected float4 rows in row-major order.
 
     A single float4 broadcasts to every texel. The optional trailer appends one flags byte, whose
@@ -273,6 +273,7 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
     append a zero flags byte and 64 mask bytes for per-channel NaN-class checks. Cases written without
     integer_rt or nan_mask keep the original 1280-byte format exactly. extra_constants sets bit 3 of
     the flags byte and stores 512 bytes after it: the 256-byte buffers bound to b1 and b2.
+    Bit 2 carries the title ranges and aliased buffers before any extra constants.
     The high nibble can hold an explicit RT0 mask for a floating-point case.
     """
     rows = [pixels] * 64 if len(pixels) == 4 and not isinstance(pixels[0], (list, tuple)) else list(pixels)
@@ -282,27 +283,30 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
     for row in rows:
         data += struct.pack("<4f", *row)
     if write_mask is not None:
-        if not 0 < write_mask <= 0xF or integer_rt or nan_mask is not None or extra_constants is not None:
+        if (not 0 < write_mask <= 0xF or integer_rt or
+                any(item is not None for item in (nan_mask, extra_constants, title_memory))):
             raise ValueError("An explicit write mask requires a nonzero nibble and a plain floating-point render target")
         data.append(write_mask << 4)
-    elif extra_constants is not None:
-        if integer_rt or nan_mask is not None:
+    else:
+        if extra_constants is not None and (integer_rt or nan_mask is not None or title_memory is not None):
             raise ValueError("Extra constant buffers are not combined with other trailer fields")
-        if len(extra_constants) != 512:
+        if extra_constants is not None and len(extra_constants) != 512:
             raise ValueError("The b1 and b2 buffers need exactly 512 bytes")
-        data.append(8)
-        data += extra_constants
-    elif integer_rt:
-        if nan_mask is not None:
+        if integer_rt and nan_mask is not None:
             raise ValueError("NaN-class masks require a floating-point render target")
-        data.append(1)
-    elif nan_mask is not None:
-        if isinstance(nan_mask, int):
-            nan_mask = bytes([nan_mask]) * 64
-        elif len(nan_mask) != 64:
-            raise ValueError("The NaN-class mask needs exactly 64 texel bytes")
-        data.append(0)
-        data += nan_mask
+        flags = int(integer_rt) | (4 if title_memory is not None else 0) | (8 if extra_constants is not None else 0)
+        if flags or nan_mask is not None:
+            data.append(flags)
+            if title_memory is not None:
+                data += title_memory
+            if extra_constants is not None:
+                data += extra_constants
+            if nan_mask is not None:
+                if isinstance(nan_mask, int):
+                    nan_mask = bytes([nan_mask]) * 64
+                elif len(nan_mask) != 64:
+                    raise ValueError("The NaN-class mask needs exactly 64 texel bytes")
+                data += nan_mask
     Path(path).write_bytes(data)
     return Path(path)
 
@@ -4701,10 +4705,15 @@ def check_mode_register_controls():
                   "hwreg(HW_REG_STATUS), 0", "hwreg(HW_REG_TRAPSTS, 2, 2), 3", "hwreg(HW_REG_LDS_ALLOC), 0",
                   "hwreg(HW_REG_SHADER_CYCLES), 0", "hwreg(HW_REG_GPR_ALLOC), 0", "hwreg(HW_REG_IB_STS), 0"):
         expect_value_error(translate, [f"s_setreg_imm32_b32 {write}"] + plain, "Unsupported hardware register write")
-    # The scratch base stays unobservable: its readers are not lowered.
+    # The scratch base stays unobservable: scratch_* and s_getreg_b32 are not lowered, and flat_load_dword reads
+    # only through the title ranges, so the writes translate like s_nop 0 before it.
     for reader in ("scratch_load_dword v12, off, s48", "scratch_store_dword off, v12, s48 offset:16",
-                   "flat_load_dword v12, v[12:13]", "s_getreg_b32 s48, hwreg(HW_REG_FLAT_SCR_LO)"):
+                   "s_getreg_b32 s48, hwreg(HW_REG_FLAT_SCR_LO)"):
         expect_value_error(translate, with_constants([*FLAT_SCRATCH_WRITES, reader]), "Unsupported instruction")
+    expect_value_error(translate, with_constants([*FLAT_SCRATCH_WRITES, "flat_load_dword v12, v[12:13]"]),
+                       "Title memory is not bound")
+    assert (translate_title(FLAT_SCRATCH_WRITES + title_program())
+            == translate_title(["s_nop 0", "s_nop 0"] + title_program()))
     # Nearest even is the entry state, so writing it first is no change. The directed modes are refused.
     assert translate([HALF_RNE] + plain) == nop
     assert translate([HALF_RTZ, HALF_RNE] + plain) == translate(["s_nop 0", "s_nop 0"] + plain)
@@ -6330,6 +6339,7 @@ def check_s_version():
 
 
 def check_controls(directory):
+    check_title_load_controls()
     for mask in (0x3, 0xC, 0xF):
         program = compressed_export(mask)
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
@@ -7637,6 +7647,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True, clamp=True)), translate))
     fixtures.append((uncompressed_export(cvt_float_body(0x3fc00000, 0xc0300000)), translate_int))
     fixtures.extend((uncompressed_export(nc_integer_group(group)), translate_int) for group in (1, 2, 3))
+    fixtures.append((title_program(), translate_title))
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_PLAIN_BODY), translate_int))
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_U32_MOD_BODY), translate_int))
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY), translate_int))
@@ -8192,6 +8203,202 @@ def check_sdwa_integer_draws(directory, compiler, renderer, backend):
             if error.returncode == 77:
                 return 77
             raise
+    return 0
+
+
+# flat_load_dword and global_load_dword through TitleLookup (issue #319). Four sorted title ranges alias four
+# buffers. Each range's buffer holds at least as many words as the range, and slot 1 holds more, so a load that
+# ignored the end of its range would read a real word instead of TITLE_MISS.
+TITLE_RANGES = (  # (begin, end, slot)
+    (0x0_0010_0000, 0x0_0010_0102, 1),  # its last DWORD would end two bytes past the range
+    (0x0_ffff_f800, 0x1_0000_0800, 2),  # crosses the 32-bit boundary
+    (0x2_0000_0000, 0x2_0000_1000, 0),
+    (0x2_0000_1000, 0x2_0000_2000, 3),  # adjacent to the previous range, in another slot
+)
+TITLE_ALIAS_WORDS = (0x480, 0x80, 0x480, 0x480)
+# Address A is constant words 3 and 4 (s44, s45), address B words 5 and 6 (s46, s47). The four channels load A,
+# A + 2044, B - 2048 and B. Flat offsets are 11-bit unsigned on gfx1013, so the negative offset is a global load.
+TITLE_BODY = [
+    "v_mov_b32_e32 v20, s44",
+    "v_mov_b32_e32 v21, s45",
+    "v_mov_b32_e32 v22, s46",
+    "v_mov_b32_e32 v23, s47",
+    "flat_load_dword v12, v[20:21]",
+    "flat_load_dword v13, v[20:21] offset:2044",
+    "global_load_dword v14, v[22:23], off offset:-2048",
+    "global_load_dword v15, v[22:23], off",
+    "s_waitcnt vmcnt(0) lgkmcnt(0)",
+]
+TITLE_CHANNELS = ((0, 0), (0, 2044), (1, -2048), (1, 0))  # (address A or B, offset)
+TITLE_CASES = (  # (A, B)
+    (0x2_0000_0000, 0x2_0000_1800),  # first words: an offset inside a range, the first word of the next slot
+    (0x0_0010_00fc, 0x2_0000_17fc),  # last whole DWORD of two ranges; A + 2044 is past the first range
+    (0x0_ffff_fc00, 0x1_0000_0400),  # A + 2044 carries into the high word, B - 2048 borrows from it
+    (0x1_8000_0000, 0x0_0000_0800),  # misses: a hole between ranges, and below the first range
+    (0x0_0010_0100, 0x0_0010_0900),  # the DWORD straddling the first range's end, from both addresses
+    (0x2_0000_0ffc, 0x0_0010_0800),  # three slots in one draw
+)
+# Wrong references that the draw must refuse, each with the (case, channel) it changes: the high address word
+# dropped, the immediate ignored, the immediate masked to 12 bits instead of sign-extended (no borrow), the carry
+# dropped, zero instead of the sentinel, a DWORD accepted when only its first byte is inside the range, the slot
+# masked to one bit, and the range count frozen one short.
+TITLE_MUTATIONS = {"high": (0, 0), "immediate": (0, 1), "mask": (2, 2), "carry": (2, 1), "sentinel": (3, 0),
+                   "straddle": (4, 0), "slot": (0, 2), "count": (0, 2)}
+
+
+def title_word(slot, index):
+    """The word at DWORD index of slot's aliased buffer: distinct per slot and index, and a normal binary32."""
+    return 0xa0000000 | slot << 20 | index
+
+
+def title_memory_bytes():
+    """The case trailer after flag bit 2: counts, the ranges as TitleRange records, then each slot's words."""
+    slots = pixel_aot.TITLE_ALIAS_SLOTS
+    data = bytearray(struct.pack("<2I", len(TITLE_RANGES), slots))
+    for begin, end, slot in TITLE_RANGES:
+        data += struct.pack("<6I", begin & 0xffffffff, begin >> 32, end & 0xffffffff, end >> 32, slot, 0)
+    for slot in range(slots):
+        words = [title_word(slot, j) for j in range(TITLE_ALIAS_WORDS[slot])] if slot < len(TITLE_ALIAS_WORDS) else [0]
+        data += struct.pack(f"<{1 + len(words)}I", len(words), *words)
+    return bytes(data)
+
+
+def title_reference(base, offset, mutation=None):
+    """The DWORD a load at base + offset returns, or TITLE_MISS; mutation names one wrong reference."""
+    mask = 0xffffffff
+    if mutation == "high":
+        base &= mask
+    if mutation == "immediate":
+        offset = 0
+    extended = (offset & 0xfff) if mutation == "mask" else offset & 0xffffffffffffffff
+    low = (base & mask) + (extended & mask)
+    carry = 0 if mutation == "carry" else low >> 32
+    address = (((base >> 32) + (extended >> 32) + carry) & mask) << 32 | (low & mask)
+    ranges = TITLE_RANGES[:-1] if mutation == "count" else TITLE_RANGES
+    for begin, end, slot in ranges:
+        if address % 4 == 0 and begin <= address and address + (1 if mutation == "straddle" else 4) <= end:
+            return title_word(slot & 1 if mutation == "slot" else slot, (address - begin) // 4)
+    return 0 if mutation == "sentinel" else pixel_aot.TITLE_MISS
+
+
+def title_words(a, b, mutation=None):
+    return tuple(title_reference((a, b)[which], offset, mutation) for which, offset in TITLE_CHANNELS)
+
+
+def title_program():
+    return uncompressed_export(TITLE_BODY)
+
+
+def translate_title(instructions):
+    """translate_int() with the TITLE_RANGES table bound for flat and global loads."""
+    return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                 title_ranges=len(TITLE_RANGES), flat_global_only=True)
+
+
+def title_controls():
+    """Check that each wrong reference changes its own case and channel, so its draw control can fail."""
+    assert all(a % 4 == 0 and b % 4 == 0 for a, b in TITLE_CASES)
+    assert list(TITLE_RANGES) == sorted(TITLE_RANGES) and len({slot for *_, slot in TITLE_RANGES}) == 4
+    expected = [title_words(a, b) for a, b in TITLE_CASES]
+    hits = [word for words in expected for word in words if word != pixel_aot.TITLE_MISS]
+    assert len(hits) == 14 and len({word >> 20 & 0xf for word in hits}) == 4
+    assert expected[2] == (title_word(2, 0x100), title_word(2, 0x2ff), title_word(2, 0x100), title_word(2, 0x300))
+    assert expected[4] == (pixel_aot.TITLE_MISS,) * 4
+    for mutation, (index, channel) in TITLE_MUTATIONS.items():
+        assert title_words(*TITLE_CASES[index], mutation)[channel] != expected[index][channel], mutation
+    # Without the carry A + 2044 lands in the low 4 GiB, and without the borrow B - 2048 stays above 4 GiB.
+    assert title_words(*TITLE_CASES[2], "carry")[1] == title_words(*TITLE_CASES[2], "mask")[2] == pixel_aot.TITLE_MISS
+
+
+def check_title_load_controls():
+    title_controls()
+    program = title_program()
+    source = translate_title(program)
+    assert source.count("bool TitleLookup(") == 1 and source.count("uint title_load_dword(") == 1
+    assert "static const uint TITLE_RANGE_COUNT = 4u;" in source
+    assert "ByteAddressBuffer TitleAliases[8] : register(t1, space1);" in source
+    assert "StructuredBuffer<TitleRange> TitleRanges : register(t0, space1);" in source
+    assert "uint2(0x7fcu, 0x0u)" in source and "uint2(0xfffff800u, 0xffffffffu)" in source
+    assert source.count("title_load_dword(uint2(") == 4
+    assert "TitleLookup" not in translate_int(uncompressed_export(TITLE_BODY[:4]))
+    for count in (0, -1, True, 2.0, 1 << 32):
+        expect_value_error(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                                           title_ranges=count), program, "Invalid title range count")
+    expect_value_error(translate_int, program, "Title memory is not bound")
+    def without_flat_binding(instructions):
+        return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                     integer_export=True, title_ranges=len(TITLE_RANGES))
+
+    expect_value_error(without_flat_binding, program, "Flat loads require the global-only address profile")
+    global_program = [line.replace("flat_load_dword", "global_load_dword")
+                      .replace(":21]", ":21], off")
+                      if line.startswith("flat_load_dword") else line for line in program]
+    assert without_flat_binding(global_program).count("title_load_dword(uint2(") == 4
+    flat = "flat_load_dword v12, v[20:21]"
+
+    def replaced(line):
+        return [line if entry == flat else entry for entry in program]
+
+    # Neighbours that stay unsupported: other widths, sub-DWORD and D16 loads, stores, atomics, scratch, the
+    # global saddr and LDS forms, cache-policy bits, and offsets outside each segment's assembler range.
+    for neighbour in ("flat_load_dwordx2 v[12:13], v[20:21]", "flat_load_dwordx3 v[12:14], v[20:21]",
+                      "flat_load_dwordx4 v[12:15], v[20:21]", "flat_load_ubyte v12, v[20:21]",
+                      "flat_load_sbyte v12, v[20:21]", "flat_load_ushort v12, v[20:21]",
+                      "flat_load_sshort v12, v[20:21]", "flat_load_short_d16 v12, v[20:21]",
+                      "flat_load_short_d16_hi v12, v[20:21]", "flat_store_dword v[20:21], v12",
+                      "flat_atomic_add v12, v[20:21], v13 glc", "global_load_dwordx2 v[12:13], v[20:21], off",
+                      "global_load_ubyte v12, v[20:21], off", "global_store_dword v[20:21], v12, off",
+                      "global_load_dword v12, v20, s[44:45]", "global_load_dword v12, v20, s[44:45] offset:-8",
+                      "global_load_dword v[20:21], off lds", "scratch_load_dword v12, v20, off",
+                      "scratch_load_dword v12, off, s48", "scratch_store_dword off, v12, s48 offset:16",
+                      "flat_load_dword v12, v[20:21] glc", "flat_load_dword v12, v[20:21] offset:4 glc slc dlc",
+                      "global_load_dword v12, v[20:21], off slc"):
+        expect_value_error(translate_title, replaced(neighbour), "Unsupported instruction")
+    for form in ("flat_load_dword v12, v[20:21] offset:2048", "flat_load_dword v12, v[20:21] offset:4088",
+                 "flat_load_dword v12, v[20:21] offset:-8", "flat_load_dword v12, v[20:21], off",
+                 "global_load_dword v12, v[20:21]", "global_load_dword v12, v[20:21], off offset:2048",
+                 "global_load_dword v12, v[20:21], off offset:-2049"):
+        expect_value_error(translate_title, replaced(form), "load form")
+    must_reject(translate_title, replaced("flat_load_dword v12, v[20:22]"))
+    must_reject(translate_title, replaced("flat_load_dword v12, v[24:25]"))  # address never written
+    expect_value_error(translate_title, replaced("flat_load_dword v256, v[20:21]"), "Invalid title memory load")
+    wqm = program.index("s_wqm_b64 exec, exec") + 1
+    expect_value_error(translate_title, program[:wqm] + [flat] + program[wqm:], "Invalid title memory load")
+    # A loaded word is ready only after vmcnt covers its load: no wait, an lgkmcnt-only wait, or vmcnt(1) with
+    # the newest load still outstanding are refused; a reused destination before the wait is refused too.
+    wait = program.index("s_waitcnt vmcnt(0) lgkmcnt(0)")
+    for replacement in ([], ["s_waitcnt lgkmcnt(0)"], ["s_waitcnt vmcnt(1)"]):
+        must_reject(translate_title, program[:wait] + replacement + program[wait + 1:])
+    assert translate_title(program[:wait] + ["s_waitcnt vmcnt(0)"] + program[wait + 1:]) == source
+    expect_value_error(translate_title, program[:wait] + ["v_add_f32_e32 v16, v12, v12"] + program[wait:],
+                       "Sample used before vmcnt wait")
+    expect_value_error(translate_title, program[:wait] + ["flat_load_dword v12, v[22:23]"] + program[wait:],
+                       "Invalid title memory load")
+    loaded = program[:wait + 1] + ["flat_load_dword v15, v[12:13]", "s_waitcnt vmcnt(0)"] + program[wait + 1:]
+    assert translate_title(loaded).count("title_load_dword(uint2(") == 5
+
+
+def check_title_load_draws(directory, compiler, renderer, backend):
+    """Draw TITLE_CASES and one wrong reference per mutation through the integer readback: 22 draws, one batch."""
+    source = directory / "title_loads.hlsl"
+    shader = directory / "title_loads.cso"
+    source.write_text(translate_title(title_program()), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    memory = title_memory_bytes()
+
+    def case(name, a, b, words):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, a & 0xffffffff, a >> 32, b & 0xffffffff, b >> 32)
+        floats = tuple(struct.unpack("<f", struct.pack("<I", word))[0] for word in words)
+        return write_case(directory / f"title_{name}.case", constants, floats, integer_rt=True, title_memory=memory)
+
+    cases = [(case(n, a, b, title_words(a, b)), "pass") for n, (a, b) in enumerate(TITLE_CASES)]
+    title_controls()
+    # Each expected mismatch is followed by the passing draw of the same addresses.
+    for mutation, (index, _) in TITLE_MUTATIONS.items():
+        a, b = TITLE_CASES[index]
+        cases += [(case(mutation, a, b, title_words(a, b, mutation)), "mismatch"), cases[index]]
+    run_pixel_batch(renderer, backend, shader, cases)
     return 0
 
 
@@ -10342,7 +10549,8 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-int16-vop3", "draw-compressed-export", "draw-uncompressed-export"):
+                    "draw-mac-legacy", "draw-int16-vop3", "draw-compressed-export", "draw-title-loads",
+                    "draw-uncompressed-export"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
@@ -10358,6 +10566,7 @@ def main():
                         "draw-mac-legacy": check_mac_legacy_draws,
                         "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-compressed-export": check_compressed_export_draw,
+                        "draw-title-loads": check_title_load_draws,
                         "draw-uncompressed-export": check_uncompressed_export_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
