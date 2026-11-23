@@ -95,6 +95,22 @@ def check_mxcsr_modes(native, lifted):
         write_mxcsr(ctypes.byref(saved))
 
 
+def check_unaligned_legacy_load(native, lifted):
+    input_a, a_ptr, _ = aligned_buf(bytes(16))
+    input_b, b_ptr, _ = aligned_buf(bytes(16))
+    output, out_ptr, _ = aligned_buf(bytes(16))
+    for label, library in (("native", native), ("lifted", lifted)):
+        with_fault = library.cmppd_le_op
+        for left, right in ((a_ptr + 1, b_ptr), (a_ptr, b_ptr + 1)):
+            try:
+                with_fault(left, right, out_ptr)
+            except OSError as exc:
+                if "access violation" not in str(exc):
+                    raise
+            else:
+                raise AssertionError(f"{label}: misaligned MOVAPD or CMPPD memory read did not fault")
+
+
 def check(native_dll: Path, lifted_dll: Path) -> None:
     check_controls()
     native = ctypes.CDLL(str(native_dll))
@@ -126,6 +142,7 @@ def check(native_dll: Path, lifted_dll: Path) -> None:
             raise AssertionError(f"{name}: native={got_n.hex()} lifted={got_l.hex()}")
     print(f"{len(EXPORTS)} baseline 128-bit SSE/SSE2 conversion/compare/move/scalar cases matched native and translated DLLs")
     check_mxcsr_modes(native, lifted)
+    check_unaligned_legacy_load(native, lifted)
     print("MXCSR round-down, round-toward-zero, and DAZ controls passed")
 
 
