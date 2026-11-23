@@ -1,0 +1,8 @@
+LIBRARY xmem
+EXPORTS
+    XMemTransferMemory
+    get_transfer_call_count
+    get_argument_rejection_count
+    get_recorded_partition
+    get_recorded_bytes
+    reset_transfer_mem_records
