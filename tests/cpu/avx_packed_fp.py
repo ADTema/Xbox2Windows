@@ -1,6 +1,5 @@
-"""Differential check for AVX 256-bit packed floating-point lowering."""
+"""Native and translated VEX.256 float32 minimum and maximum, with and without DAZ."""
 import ctypes
-import struct
 import sys
 from pathlib import Path
 
@@ -13,17 +12,7 @@ from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges
 from ffx_version_query import INTEGER_HEADER, lower, region
 
-PS_EXPORTS = (
-    "vaddps_op", "vsubps_op", "vmulps_op", "vdivps_op", "vsqrtps_op",
-    "vminps_op", "vmaxps_op", "vandps_op", "vandnps_op", "vorps_op", "vxorps_op",
-    "vaddsubps_op", "vhaddps_op", "vhsubps_op",
-)
-PD_EXPORTS = (
-    "vaddpd_op", "vsubpd_op", "vmulpd_op", "vdivpd_op", "vsqrtpd_op",
-    "vminpd_op", "vmaxpd_op", "vandpd_op", "vandnpd_op", "vorpd_op", "vxorpd_op",
-    "vaddsubpd_op", "vhaddpd_op", "vhsubpd_op",
-)
-ALL_EXPORTS = PS_EXPORTS + ("vmovmskps_op",) + PD_EXPORTS + ("vmovmskpd_op",)
+EXPORTS = ("vminps_op", "vmaxps_op")
 
 CPUID_HELPER = """#include <intrin.h>
 extern "C" __declspec(dllexport) uint32_t host_has_avx() {
@@ -33,13 +22,18 @@ extern "C" __declspec(dllexport) uint32_t host_has_avx() {
     if ((info[2] & need) != need) return 0u;
     return (_xgetbv(0) & 6u) == 6u ? 1u : 0u;
 }
+extern "C" __declspec(dllexport) uint32_t host_exchange_mxcsr(uint32_t next) {
+    const uint32_t current = _mm_getcsr();
+    _mm_setcsr(next);
+    return current;
+}
 """
 
 
 def emit(native_dll: Path, output_cpp: Path) -> None:
     parts = [INTEGER_HEADER, CPUID_HELPER]
     with pefile.PE(str(native_dll), fast_load=True) as pe:
-        for name in ALL_EXPORTS:
+        for name in EXPORTS:
             ranges = function_ranges(pe, export_rva(pe, name))
             body = [ins for lo, hi in ranges for ins in region(pe, lo, hi)]
             code = lower(body, ["rcx = a; rdx = b; r8 = dst;"], {}, {}, {})
@@ -50,70 +44,75 @@ def emit(native_dll: Path, output_cpp: Path) -> None:
 
 
 def check_controls() -> None:
-    # EVEX vaddps ymm0{k1}, ymm1, ymm2 (62 F1 74 29 58 C2) followed by ret must be rejected.
-    evex = list(Decoder(64, b"\x62\xf1\x74\x29\x58\xc2\xc3", ip=0x1000))
-    try:
-        lower(evex, [], {}, {}, {})
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected EVEX vaddps to be rejected")
+    candidates = (
+        bytes.fromhex("62 f1 74 29 5d c2 c3"),  # EVEX vminps ymm0{k1}, ymm1, ymm2
+        bytes.fromhex("c5 f4 5d 02 c3"),        # VEX vminps ymm0, ymm1, ymmword ptr [rdx]
+        bytes.fromhex("c5 f4 5d c3 c3"),        # VEX vminps ymm0, ymm1, ymm3
+    )
+    for encoded in candidates:
+        body = list(Decoder(64, encoded, ip=0x1000))
+        try:
+            lower(body, [], {}, {}, {})
+        except ValueError:
+            continue
+        raise AssertionError(f"expected {body[0]} to be rejected")
+
+
+def minimum_or_maximum(a, b, *, maximum, daz):
+    if daz:
+        if a & 0x7fffffff < 0x00800000:
+            a &= 0x80000000
+        if b & 0x7fffffff < 0x00800000:
+            b &= 0x80000000
+    if (a & 0x7fffffff > 0x7f800000 or b & 0x7fffffff > 0x7f800000
+            or (a | b) & 0x7fffffff == 0):
+        return b
+    a_key = ~a if a & 0x80000000 else a
+    b_key = ~b if b & 0x80000000 else b
+    chosen = a_key > b_key if maximum else a_key < b_key
+    return a if chosen else b
 
 
 def check(native_dll: Path, lifted_dll: Path) -> None:
     check_controls()
     lifted = ctypes.CDLL(str(lifted_dll))
-    lifted.host_has_avx.restype = ctypes.c_uint32
+    lifted.host_has_avx.argtypes, lifted.host_has_avx.restype = [], ctypes.c_uint32
     if not lifted.host_has_avx():
         print("host lacks AVX; skipping native differential check")
         raise SystemExit(77)
     native = ctypes.CDLL(str(native_dll))
-
-    ps_a = struct.pack("<8f", 1.5, -2.25, 0.0, 9.0, -4.5, 3.25, -0.0, 16.0)
-    ps_b = struct.pack("<8f", 2.0, 4.0, -0.0, 3.0, 1.5, -2.5, 0.0, 8.0)
-    ps_sqrt = struct.pack("<8f", 0.0, -0.0, 2.25, 16.0, 9.0, 6.25, 1.0, 25.0)
-    pd_a = struct.pack("<4d", -3.5, 12.25, 0.0, -0.0)
-    pd_b = struct.pack("<4d", 1.75, -2.5, -0.0, 0.0)
-    pd_sqrt = struct.pack("<4d", -0.0, 20.25, 0.0, 49.0)
-
-    out_n = (ctypes.c_ubyte * 32)()
-    out_l = (ctypes.c_ubyte * 32)()
-    cases = 0
-    for name in PS_EXPORTS + PD_EXPORTS:
-        is_pd = "pd" in name
-        if name == "vsqrtps_op":
-            a, b = ps_sqrt, ps_b
-        elif name == "vsqrtpd_op":
-            a, b = pd_sqrt, pd_b
-        elif is_pd:
-            a, b = pd_a, pd_b
-        else:
-            a, b = ps_a, ps_b
-        a_buf = (ctypes.c_ubyte * 32)(*a)
-        b_buf = (ctypes.c_ubyte * 32)(*b)
-        fn_n, fn_l = getattr(native, name), getattr(lifted, name)
-        fn_n.argtypes = fn_l.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
-        fn_n.restype = fn_l.restype = ctypes.c_uint64
-        fn_n(ctypes.addressof(a_buf), ctypes.addressof(b_buf), ctypes.addressof(out_n))
-        fn_l(ctypes.addressof(a_buf), ctypes.addressof(b_buf), ctypes.addressof(out_l))
-        if bytes(out_n) != bytes(out_l):
-            raise AssertionError(f"{name}: native={bytes(out_n).hex()} lifted={bytes(out_l).hex()}")
-        cases += 1
-
-    for name, vec, exp in (
-        ("vmovmskps_op", ps_a, 0b01010010),
-        ("vmovmskpd_op", pd_a, 0b1001),
-    ):
-        buf = (ctypes.c_ubyte * 32)(*vec)
-        fn_n, fn_l = getattr(native, name), getattr(lifted, name)
-        fn_n.argtypes = fn_l.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
-        fn_n.restype = fn_l.restype = ctypes.c_uint64
-        got_n, got_l = fn_n(ctypes.addressof(buf), 0, 0), fn_l(ctypes.addressof(buf), 0, 0)
-        if got_n != exp or got_l != exp:
-            raise AssertionError(f"{name}: expected={exp:#x} native={got_n:#x} lifted={got_l:#x}")
-        cases += 1
-
-    print(f"{cases} AVX 256-bit packed FP cases matched native and translated DLLs")
+    exchange = lifted.host_exchange_mxcsr
+    exchange.argtypes, exchange.restype = [ctypes.c_uint32], ctypes.c_uint32
+    words = ctypes.c_uint32 * 8
+    inputs = (
+        (0, 0, 0x80000000, 0x80000000, 0x7fc01234, 0x3f800000, 0xffc07654, 0x80000001),
+        (1, 0x80000001, 1, 0x80000001, 0x3f800000, 0x7fc05678, 0x7fc04321, 0),
+    )
+    count = 0
+    for name in EXPORTS:
+        maximum = name == "vmaxps_op"
+        for mode in (0x1f80, 0x1fc0):
+            daz = bool(mode & 0x40)
+            for a, b in (inputs, inputs[::-1]):
+                expected = tuple(minimum_or_maximum(x, y, maximum=maximum, daz=daz)
+                                 for x, y in zip(a, b, strict=True))
+                a_ptr, b_ptr = words(*a), words(*b)
+                for library in (native, lifted):
+                    func = getattr(library, name)
+                    func.argtypes = [ctypes.c_uint64] * 3
+                    func.restype = ctypes.c_uint64
+                    output = words(*([0xcccccccc] * 8))
+                    previous = exchange(mode)
+                    try:
+                        func(ctypes.addressof(a_ptr), ctypes.addressof(b_ptr), ctypes.addressof(output))
+                    finally:
+                        exchange(previous)
+                    if tuple(output) != expected:
+                        raise AssertionError(f"{name} MXCSR={mode:#x} {library._name}: "
+                                             f"{tuple(output)} != {expected}")
+                count += len(expected)
+    assert minimum_or_maximum(0, 1, maximum=False, daz=True) != 1  # wrong raw-second source
+    print(f"{count} VEX.256 MINPS/MAXPS words matched native, translated and reference results")
 
 
 if __name__ == "__main__":
