@@ -1,5 +1,6 @@
 """Check the single-store compute profile with original synthetic kernels."""
 from pathlib import Path
+import operator
 import os
 import struct
 import subprocess
@@ -1169,6 +1170,51 @@ def ds_controls():
 
 
 LDS_BINDING = DS_BINDING | {"stride": 12, "lds_bytes": 128}
+LDS_UPDATES = {
+    "ds_add_u32": operator.add,
+    "ds_sub_u32": operator.sub,
+    "ds_and_b32": operator.and_,
+    "ds_or_b32": operator.or_,
+    "ds_xor_b32": operator.xor,
+}
+
+
+def lds_update_program(op):
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mad_u32_u24 v6, 1, v8, 0xfffffff0",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v10, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mad_u32_u24 v6, 1, v8, 0x40000021",
+        f"{op} v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 0",
+        "ds_read_b32 v11, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mad_u32_u24 v9, 1, v8, 0x80000003",
+        f"{op} v5, v9",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v9, 0",
+        "ds_read_b32 v12, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+def lds_update_reference(op, groups):
+    update = LDS_UPDATES[op]
+    words = []
+    for lane in range(groups * 32):
+        initial = (lane - 16) & 0xffffffff
+        first = update(initial, 0x40000021 + lane) & 0xffffffff
+        second = update(first, 0x80000003 + lane) & 0xffffffff
+        words.extend((initial, first, second))
+    return words
+
+
 LDS_PROGRAM = DS_PREFIX + [
     "v_lshlrev_b32_e32 v5, 2, v0",
     "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
@@ -1246,7 +1292,7 @@ LDS_OVERLAP_PROGRAM = DS_PREFIX + [
 LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING),
              ("lds_overlap", LDS_OVERLAP_PROGRAM, LDS_BINDING)] + [
     (name, lds_subword_program(*layout), LDS_BINDING) for name, layout in LDS_SUBWORDS.items()
-]
+] + [(op, lds_update_program(op), LDS_BINDING) for op in LDS_UPDATES]
 
 
 def lds_subword_reference(width, offset, groups):
@@ -1327,6 +1373,28 @@ def lds_controls():
             lines[:i] + pair * 32 + lines[i:], 32, **LDS_BINDING)
 
 
+    update = "ds_add_u32 v5, v6"
+    lines = lds_update_program("ds_add_u32")
+    no_init = variant(lines, ("ds_write_b32 v5, v6", "s_nop 0"), ("ds_read_b32 v10, v5", "s_nop 0"))
+    rejects("Unverified private LDS update", aot.lower, no_init, 32, **LDS_BINDING)
+    for bad, message in (
+        ("ds_add_u32 v8, v6", "Unverified private LDS update"),
+        ("ds_add_u32 v5, v254", "Unverified private LDS update"),
+        ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
+        ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
+        ("ds_add_rtn_u32 v10, v5, v6", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
+    i = lines.index(update)
+    masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+    rejects("Unverified private LDS update", aot.lower, masked, 32, **LDS_BINDING)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+    pair = [update, "s_waitcnt lgkmcnt(0)"]
+    rejects("LDS expression exceeds the profile limit", aot.lower,
+            lines[:i] + pair * 32 + lines[i:], 32, **LDS_BINDING)
+
+
 def ds_binary(directory, assembler, objcopy, library):
     for name, lines, binding in DS_CASES + LDS_CASES:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
@@ -1350,7 +1418,10 @@ def ds_binary(directory, assembler, objcopy, library):
 
 
 def ds_mutants(name, lines, binding, source):
-    if name in LDS_SUBWORDS:
+    if name in LDS_UPDATES:
+        changed = variant(lines, (f"{name} v5, v6", "ds_write_b32 v5, v6"))
+        yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_SUBWORDS:
         width, offset = LDS_SUBWORDS[name]
         suffix = f" offset:{offset}" if offset else ""
         changed = variant(lines, (f"ds_write_b{width} v5, v6{suffix}", "ds_write_b32 v5, v6"))
@@ -1384,7 +1455,9 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
         for groups in (1, 3):
-            if name in LDS_SUBWORDS:
+            if name in LDS_UPDATES:
+                words = lds_update_reference(name, groups)
+            elif name in LDS_SUBWORDS:
                 words = lds_subword_reference(*LDS_SUBWORDS[name], groups)
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)

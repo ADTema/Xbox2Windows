@@ -923,6 +923,10 @@ constexpr CapabilityGate kGateSm60MinLodSmoke{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: MinLod smoke fixture requires SM 6.0",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60MinLodLevels{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: MinLod exact mip and blend fixture requires SM 6.0",
+    CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66MinLod{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: MinLod fixture requires SM 6.6",
@@ -963,9 +967,10 @@ const OperationSpec kOperations[] = {
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
     {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
     {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm60MinLodSmoke, run_check_pixel_quad_lod},
-    // The detailed MinLod level and blend fixtures compile ps_6_6.
+    // Keep the fractional point-filter fixture on its existing gate (#809).
     {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},
-    {"--check-pixel-mip-blend", 6, 6, nullptr, kGateSm66MinLod, run_check_pixel_mip_blend},
+    {"--check-pixel-mip-exact", 5, 5, nullptr, kGateSm60MinLodLevels, run_check_pixel_mip_clamp},
+    {"--check-pixel-mip-blend", 6, 6, nullptr, kGateSm60MinLodLevels, run_check_pixel_mip_blend},
     {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
@@ -1333,24 +1338,38 @@ int run_self_test()
                 return 1;
         }
 
-        // The MinLod draws skip the same way instead of failing at ps_6_6 pipeline creation.
+        // The fractional point draw keeps its SM 6.6 gate. Exact mips and blends only need SM 6.0.
+        const AdapterCaps sm66_caps{D3D_SHADER_MODEL_6_6};
         char clamp_op[] = "--check-pixel-mip-clamp";
+        char exact_op[] = "--check-pixel-mip-exact";
         char blend_op[] = "--check-pixel-mip-blend";
         char level[] = "1";
         char tolerance[] = "0.0078125";
         char* clamp_argv[]{prog, mode, clamp_op, dxil, level};
+        char* exact_argv[]{prog, mode, exact_op, dxil, level};
         char* blend_argv[]{prog, mode, blend_op, dxil, level, tolerance};
-        const struct { char** argv; int argc; } minlod_cases[]{{clamp_argv, 5}, {blend_argv, 6}};
+        const struct {
+            char** argv;
+            int argc;
+            AdapterCaps supported;
+            AdapterCaps unsupported;
+            const char* skip_reason;
+        } minlod_cases[]{
+            {clamp_argv, 5, sm66_caps, low_caps, "skip: MinLod fixture requires SM 6.6"},
+            {exact_argv, 5, sm60_caps, sm51_caps, "skip: MinLod exact mip and blend fixture requires SM 6.0"},
+            {blend_argv, 6, sm60_caps, sm51_caps, "skip: MinLod exact mip and blend fixture requires SM 6.0"},
+        };
         for (const auto& c : minlod_cases) {
             const OperationSpec* spec = find_operation(c.argv[2]);
             if (!require(spec != nullptr, "MinLod operation")) return 1;
-            OperationContext mctx{nullptr, nullptr, low_caps, "warp", c.argc, c.argv, nullptr};
+            if (!require(evaluate_gate(spec->gate, c.supported), "MinLod draw accepts its minimum shader model"))
+                return 1;
+            OperationContext mctx{nullptr, nullptr, c.unsupported, "warp", c.argc, c.argv, nullptr};
             out.clear();
             err.clear();
-            if (!require(run_operation_spec(*spec, mctx, {&out, &err}) == 77, "MinLod draw below SM 6.6 must exit 77"))
+            if (!require(run_operation_spec(*spec, mctx, {&out, &err}) == 77, "MinLod draw below its minimum must exit 77"))
                 return 1;
-            if (!require(out.find("skip: MinLod fixture requires SM 6.6") != std::string::npos,
-                         "MinLod draw must print its skip reason")) return 1;
+            if (!require(out.find(c.skip_reason) != std::string::npos, "MinLod draw must print its skip reason")) return 1;
         }
 
         // The MinLod smoke draw accepts SM 6.0 without wave or int64 operations.

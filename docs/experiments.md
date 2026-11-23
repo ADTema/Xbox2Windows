@@ -1977,6 +1977,22 @@ python3 -B tests/mesh_lit_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.
 ctest --preset dev --no-tests=error -R "^mesh_lit_draw_" -V
 ```
 
+The SM 6.0 lit mesh fallback uses the same mesh and pixel programs and CPU
+image reference. The compute shader writes the indexed positions and PARAM0
+normals to the export buffer. The vertex shader reads the exports and passes
+the normals to the rasterizer for interpolation. The pixel shader reads the
+light from b0 and computes the same clamped lighting.
+
+On the GTX 1060, Windows 10 in-box WARP and app-local WARP, all five positive
+cases matched 128 export bytes and 1,024 RGBA pixels. The stale light, normal
+and clamp controls gave 276, 276 and 132 pixel mismatches, respectively, with
+matching exports. The D3D12 debug layer reported zero warnings and errors.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^mesh_lit_fallback_(hardware|warp)$' -V
+```
+
 The shadow fixture (`tests/mesh_shadow_check.py`, `offscreen_check
 --mesh-shadow`) adds a depth pass and a comparison sample to the lit fixture.
 All draws use the PARAM0 mesh program of the textured fixture on a 64×64 target.
@@ -2138,6 +2154,12 @@ low source bits while preserving the rest of the initialized word.
 sign-extend their results to 32 bits. Byte offsets are 0 through 3 and
 halfword offsets are 0 or 2. Subword accesses use the same address, LDS
 allocation, full EXEC and immediate wait checks as full-word accesses.
+
+The no-return forms `ds_add_u32`, `ds_sub_u32`, `ds_and_b32`, `ds_or_b32`
+and `ds_xor_b32` update the same initialized word in place at offset 0.
+Addition and subtraction wrap modulo 2^32, with subtraction taking the
+old word minus the VGPR value. Each lane has exclusive use of its own word,
+so the updates can use per-invocation arithmetic in HLSL.
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The source-built wave32 fixture reads the full word and both halves after
@@ -2154,6 +2176,12 @@ check that earlier reads retain their values. Each dispatch checks the entire
 320-word UAV, including the untouched tail. Replacing the partial write with a full
 write must mismatch at word 0. Replacing sign extension with zero extension
 must mismatch at word 50, the signed result of lane 16.
+
+Five update variants read the initial word and the results of two consecutive
+updates with different operands. The inputs cover wraparound, underflow and
+high-bit operands. Each variant compares all 320 UAV words after one-group
+and three-group dispatches. Replacing the first update with a full-word
+write must mismatch at word 1.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
@@ -4500,29 +4528,37 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^spirv_minlod_' -V
 ```
 
-The source-built `spirv_minlod_*` smoke draw compiles at `ps_6_0` and skips on
-adapters below Shader Model 6.0. It runs `Sample`, `SampleBias` with an offset,
+The source-built `spirv_minlod_hardware` and `spirv_minlod_warp` smoke draws
+compile at `ps_6_0` and skip on adapters below Shader Model 6.0. They run
+`Sample`, `SampleBias` with an offset,
 and `SampleGrad` against distinct red and green mips. Each sample must reach
 the green mip and match the 64-pixel reference. Removing the clamp selects
 the red mip and must fail at pixel (0, 0). The GTX 1060 (32.0.15.6094),
 Windows 10 in-box WARP (10.0.19041.5794), and app-local WARP 1.0.22 passed on
 Windows 10 build 19045.6456 with zero D3D12 debug errors and warnings.
 
-`spirv_minlod_levels_*` varies the clamp of a plain `Sample` over an 8x8
-texture with four solid-color mips. The coordinate is constant, so the LOD is
-the clamp. Each clamp runs as the translated shader and as a direct HLSL
-control on the same adapter.
+The level and fractional fixtures use a plain `Sample` over an 8x8 texture
+with four solid-color mips. The coordinate is constant, so the LOD is the
+clamp. Each clamp runs as translated SPIR-V and direct HLSL on the same adapter.
 
-- With point mip filtering, clamps 0 to 3, 1.4375, 1.5625 and 3.75 read the
-  nearest mip exactly. The 1.5 tie read mip 2 on both adapters below.
+`spirv_minlod_levels_*` compiles at `ps_6_0`:
+
+- With point mip filtering, each integer clamp from 0 through 3 selects its
+  corresponding mip exactly across all 64 pixels.
 - With `MIN_MAG_POINT_MIP_LINEAR`, nine clamps from 1 to 3.75 match the exact
   mip blend within 1/128. The translated and control bits must be identical
   on each adapter.
 - Clamp 1 checked against mip 2, and clamp 1.25 checked against the 1.5 blend,
   must fail at pixel (0, 0).
 
-The detailed level and blend draws use `ps_6_6` and skip (77) on the Windows 10
-in-box runtime. In separate `ps_6_0` and `ps_6_2` probes, in-box WARP
+`spirv_minlod_fractional_*` retains the `ps_6_6` capability gate. It checks
+nearest-mip selection at 1.4375, 1.5625 and 3.75. At the 1.5 tie, either
+neighbor is accepted when both shader sources select the same mip. The
+stale-reference check at 1.5625 must reject mip 1 at pixel (0, 0).
+[Issue #809](https://github.com/R0Y00/Xbox2Windows/issues/809) records why the
+fractional point cases run separately.
+
+In separate `ps_6_0` and `ps_6_2` probes, in-box WARP
 10.0.19041.5794 selected green mip 1 for a per-sample clamp of 1.5625 under
 point mip filtering. An explicit `SampleLevel` at the same LOD selected
 blue mip 2 on that adapter. Linear mip filtering gave the expected blend
@@ -4763,7 +4799,9 @@ native RDNA readback.
 `v_div_fmas_f32` evaluates `div_fmas32(src0, src1, src2, vcc)` using double precision
 with Knuth 2Sum remainder tracking for finite inputs. Scaling by 2^32 when VCC is true
 happens before conversion to binary32. The helper is emitted only for shaders using this
-operation and requires double-precision shader arithmetic. The integer-readback fixture
+operation and requires double-precision shader arithmetic. Its double comparisons use
+only `<`, `>=`, `==` and `!=`: the Windows 10 in-box WARP (10.0.19041) faults at the
+first dispatch of a double `>` or `<=` (DXIL `fcmp ogt`/`ole`) ([#876](https://github.com/R0Y00/Xbox2Windows/issues/876)). The integer-readback fixture
 (`pixel_aot_div_fmas_warp` and `pixel_aot_div_fmas_hardware`) checks both VCC conditions
 and clamping with runtime inputs under the preserve denormal mode:
 - Midpoint single-rounding: `(0x3f800001, 0x3fc00000, 0x8d800000)` produces exact sum
