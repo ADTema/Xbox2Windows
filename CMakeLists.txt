@@ -3059,6 +3059,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_tools_mem_caller>" "$<TARGET_FILE:cpu_tools_mem_provider>"
         "$<TARGET_FILE:cpu_tools_mem_provider_devkit>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_tools_mem PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_map_pages_provider SHARED tests/cpu/map_pages_provider.cpp tests/cpu/map_pages_provider.def)
+    add_executable(cpu_map_pages_caller tests/cpu/map_pages_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_map_pages_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_map_pages_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_map_pages_caller PRIVATE cpu_map_pages_provider cpu_exe_io)
+    add_test(NAME cpu_native_map_pages COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/map_pages_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_map_pages_caller>" "$<TARGET_FILE:cpu_map_pages_provider>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_map_pages PROPERTIES TIMEOUT 60)
     add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")

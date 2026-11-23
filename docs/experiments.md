@@ -3920,6 +3920,31 @@ ctest --preset dev --no-tests=error -R '^cpu_native_tools_mem$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_tools_mem$' -V
 ```
 
+### Physical-page mapping caller and recorder
+
+This fixture exercises proposed contiguous and scatter call shapes. The names and signatures in public reimplementations are independent reference material. [SlimEra declaration](https://github.com/XWine1/SlimEra/blob/397807a9563f62b56cf7aaea9809b6fa635ba651/era.h)
+
+A source-built caller ([`map_pages_caller.asm`](../tests/cpu/map_pages_caller.asm)) imports both functions from `xmem.dll` by name and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled recording provider ([`map_pages_provider.cpp`](../tests/cpu/map_pages_provider.cpp)), it exercises ten checks:
+- **Step 1**: Contiguous mapping to a 64 KiB aligned virtual address, returning the base address.
+- **Step 2**: Contiguous unmapping (`NULL` page array), returning the base address.
+- **Step 3**: Scatter mapping across an array of 64 KiB aligned virtual addresses, returning `TRUE` (`1`).
+- **Step 4**: Scatter unmapping (`NULL` page array), returning `TRUE` (`1`).
+- **Step 5–7**: Negative controls for unaligned virtual address, null virtual address, and null scatter array, each returning `0`.
+- **Step 8**: Changed-argument control with wrong page IDs (`[999, 888]`), returning `NULL`.
+- **Step 9**: Changed-argument control with swapped scatter destinations (`[0x10010000, 0x10000000]`), returning `0`.
+- **Step 10**: Internal verification of provider call counters and mismatch counts directly within the caller process.
+
+The specific fixture inputs tested (`VirtualAddress = 0x10000000`, `cPages = 2`, `rgPages = [1, 2]`, and scatter destinations `[0x10000000, 0x10010000]`) are synthetic fixture inputs chosen for this test. The provider's recorded trace validates the expected count, page IDs and ordered scatter destinations.
+
+On success, the caller exits with the success sentinel `0x870`. With `CPU_CRC_TEST_LIVE_WORKER=1`, a live worker thread outlives the body under the Windows loader, and `finish_exe` terminates the process with code `0x870`. Under `pe_map`, `finish_exe` preserves the host return. The two loaders consuming the controlled provider verify caller contracts and error propagation; they do not establish console return types, that `NULL` unmaps, that 64 KiB alignment is required, or that virtual address reservations survive unmapping. These remain proposed desktop policies and hypotheses under investigation. Production XMem behavior and physical page registry tracking remain separate (#892).
+
+Two independent negative controls confirm that withholding either `XMemMapPhysicalPages` or `XMemMapPhysicalPagesScatter` stops `pe_map` at import resolution before entry with `STATUS["unresolved"]` naming the missing export. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_map_pages$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_map_pages$' -V
+```
+
 ### Grouped allocation descriptor builders
 
 In the inspected Bink image, the function interval beginning at RVA `0x67c0` contains direct calls to the group initializer (`0x25b80`), append helper (`0x25b20`) and grouped allocator (`0x25a40`). The initializer places two adjacent arrays after a 64-byte header. Each successful append records a destination and a padded stride. With five available slots, requests of 0, 33, 1, 1025 and 32 bytes produced strides of 32, 64, 128, 1280 and 512 bytes in order. The stride in 32-byte units is congruent to the previous total in units plus one, modulo 32. All five stored strides were even. These helpers do not establish who produces odd tagged entries.
