@@ -68,9 +68,9 @@ def fixture(constants, positions, visible, traced):
     return constants + trace + pixels
 
 
-def draw(dxc, renderer, adapter, tmp, source, cases, *, indexed=False):
+def draw(dxc, renderer, adapter, tmp, source, cases, *, indexed=False, pixel_source=PIXEL):
     pixel = tmp / "pixel.hlsl"
-    pixel.write_text(PIXEL)
+    pixel.write_text(pixel_source)
     ps = tmp / "pixel.dxil"
     subprocess.run([dxc, "-T", "ps_6_0", "-E", "main", "-Fo", ps, pixel], check=True)
     shader = tmp / "mesh.hlsl"
@@ -140,6 +140,8 @@ def source():
         {
             "s_buffer_load_dword s15, s[24:27], null": "s_buffer_load_dword s15, s[24:27], 0x4"
         },
+        {"v_mov_b32_e32 v9, 0x200400": "v_mov_b32_e32 v9, 0x200600"},
+        {"exp pos0, v1, v2, v3, v4 done": "exp pos0, v1, v2, v3, v4"},
     ):
         try:
             lower([(pc, change.get(op, op)) for pc, op in decoded], [0x1003], (3, 1))
@@ -219,16 +221,58 @@ def binary(tmp, assembler, objcopy, library, *, program=None, words=None, header
     assert translated.read_text() == expected
 
 
+def offset_draw():
+    program = PROGRAM.copy()
+    program[program.index("s_buffer_load_dword s30, s[16:19], 0x4")] = (
+        "s_buffer_load_dword s30, s[16:19], 0x104"
+    )
+    program[-2:-2] = [
+        "s_buffer_load_dword s9, s[24:27], 0x404",
+        "v_mov_b32_e32 v10, 0x408",
+        "buffer_load_dword v10, v10, s[24:27], 0 offen",
+        "s_waitcnt vmcnt(0) lgkmcnt(0)",
+        "s_cmp_lt_u32 3, 3",
+        "s_cselect_b32 s14, 0x3fa00000, 0",
+        "v_add_f32_e32 v3, s9, v3",
+        "v_add_f32_e32 v3, v10, v3",
+        "v_add_f32_e32 v3, s14, v3",
+    ]
+
+    point, matrix, scalar, vector = 0.125, 0.375, 0.0625, 0.125
+    inputs = triangle_inputs()
+    struct.pack_into("<f", inputs, 4, 0.625)
+    struct.pack_into("<f", inputs, 260, point)
+    # Geometry words 1 and 2 are distinct decoys for high words 257 and 258.
+    words = [4099, *struct.unpack("<2I", struct.pack("<2f", 0.875, 1.125))]
+    words += [0] * 254
+    words.extend(struct.unpack("<2I", struct.pack("<2f", scalar, vector)))
+    # The equal operands contribute zero to the reference depth.
+    depth = point + matrix + scalar + vector
+    positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
+    return lower(enumerate_pcs(program), words, (3, 1)), [(inputs, positions, True)]
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as directory:
         if sys.argv[1] == "binary":
             binary(Path(directory), *sys.argv[2:])
             sys.exit(0)
+        clipped = triangle_inputs()
+        struct.pack_into("<f", clipped, 4, -0.625)  # Plus 0.375 gives Z = -0.25.
+        clipped_positions = [(x, y, -0.25, w) for x, y, _, w in TRIANGLE]
+        # The triangle runs right then up in render-target coordinates, so it
+        # is back-facing with the harness's clockwise front-face convention.
+        winding_pixel = (
+            "float4 main(bool front : SV_IsFrontFace) : SV_Target "
+            "{ return float4(0, front ? 0 : 1, 0, 1); }"
+        )
         sys.exit(
             draw(
                 *sys.argv[1:],
                 Path(directory),
                 source(),
-                [(triangle_inputs(), TRIANGLE, True)],
+                [(triangle_inputs(), TRIANGLE, True), (clipped, clipped_positions, False)],
+                pixel_source=winding_pixel,
             )
+            or draw(*sys.argv[1:], Path(directory), *offset_draw())
         )

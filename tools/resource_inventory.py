@@ -136,7 +136,7 @@ def probe_archive(path):
             "sample_streams": streams}
 
 
-def scene_records(data, validator=None):
+def scene_records(data, validator=None, *, observe=None):
     """Summarize candidate named raw-DEFLATE shader records without exporting their contents."""
     names = re.compile(rb"[!-~]{3,}")
     stages = Counter()
@@ -182,6 +182,8 @@ def scene_records(data, validator=None):
         stage = {0:"pixel", 1:"vertex", 2:"geometry", 3:"hull", 4:"domain", 5:"compute",
                  6:"library", 13:"mesh", 14:"amplification"}.get(kind, f"kind_{kind}")
         stages[stage] += 1
+        if observe is not None:
+            observe(kind, blob, sections)
         sections_seen.update(tag.decode("ascii", "replace") for tag in sections)
         tails[len(stream.unused_data)] += 1
         framed += dxil_program(blob, 0)
@@ -204,7 +206,10 @@ def main():
     parser.add_argument("--scene-validator", type=Path, help="Use the built root_probe.exe on one container per stage")
     args = parser.parse_args()
     root = args.directory.resolve(strict=True)
-    layout, = root.glob("layout*.xml")
+    layouts = [path for path in root.glob("layout*.xml") if path.is_file()]
+    if len(layouts) != 1:
+        parser.error(f"expected exactly one layout*.xml file in {root}, found {len(layouts)}")
+    layout, = layouts
     markers, targets = read_layout(layout)
     rows = []
     for path in sorted(root.rglob("*")):

@@ -11,12 +11,12 @@ from depth_mask_aot import lower
 
 VS = """
 float4 main(uint id : SV_VertexID) : SV_Position {
-    return float4(float2((id << 1) & 2, id & 2) * float2(2,-2) + float2(-1,1), 0.375, 1);
+    return float4(float2((id << 1) & 2, id & 2) * float2(2,-2) + float2(-1,1), 0.75, 1);
 }
 """
 
 
-def program():
+def program(extended=False):
     # Original fixture. The offsets here are instruction addresses in a decoded stream.
     prefix = [
         "s_mov_b32 s7, 0",
@@ -26,12 +26,18 @@ def program():
         "s_load_dwordx4 s[12:15], s[6:7], 0x20",
         "s_load_dwordx4 s[16:19], s[10:11], 0x10",
         "s_waitcnt lgkmcnt(0)",
-        "s_buffer_load_dword s30, s[12:15], 0x4",
+        f"s_buffer_load_dword s30, s[12:15], {0x18 if extended else 0x4:#x}",
         "s_buffer_load_dword s31, s[16:19], null",
         "s_waitcnt lgkmcnt(0)",
+    ]
+    if extended:
+        prefix += ["s_add_i32 s30, s30, 12", "s_and_b32 s30, s30, 31"]
+    # The extended fixture samples Y in a 32-pixel period.
+    position, scale = ("v3", "0x3d000000") if extended else ("v2", "0x3e000000")
+    prefix += [
         "v_cvt_f32_ubyte0_e32 v5, s30",
-        "v_mul_legacy_f32_e32 v7, 0x3e000000, v2",
-        "v_fmac_f32_e32 v7, 0x3e000000, v5",
+        f"v_mul_legacy_f32_e32 v7, {scale}, {position}",
+        f"v_fmac_f32_e32 v7, {scale}, v5",
         "v_fract_f32_e32 v7, v7",
     ]
     exits = [
@@ -48,8 +54,8 @@ def program():
     return prefix + exits
 
 
-def source():
-    lines = program()
+def source(extended=False):
+    lines = program(extended)
     sizes = [
         8 if line.startswith(("s_load_", "s_buffer_load_", "exp ")) else 4
         for line in lines
@@ -75,10 +81,49 @@ def source():
         except ValueError:
             continue
         raise AssertionError("Unverified mask or pending load accepted")
+    # These edits keep the decoded instruction addresses and widths intact.
+    for case, edits in (
+        ("partial wait", (("s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(1)"),)),
+        (
+            "restore mask operand",
+            (("s_and_b64 exec, s[24:25], s[22:23]", "s_and_b64 exec, s[24:25], s[24:25]"),),
+        ),
+        (
+            "restore mask alias",
+            (("s_and_b64 exec, s[24:25], s[22:23]", "s_and_b64 exec, s[22:23], s[22:23]"),),
+        ),
+        (
+            "constant buffer end",
+            ((
+                f"s_buffer_load_dword s30, s[12:15], {0x18 if extended else 0x4:#x}",
+                "s_buffer_load_dword s30, s[12:15], 0x800",
+            ),),
+        ),
+        (
+            "descriptor register alignment",
+            (
+                ("s_load_dwordx4 s[16:19], s[10:11], 0x10", "s_load_dwordx4 s[18:21], s[10:11], 0x10"),
+                ("s_buffer_load_dword s31, s[16:19], null", "s_buffer_load_dword s31, s[18:21], null"),
+            ),
+        ),
+        (
+            "null export valid mask",
+            (("exp null, off, off, off, off done vm", "exp null, off, off, off, off done"),),
+        ),
+    ):
+        changed = decoded.copy()
+        for original, replacement in edits:
+            index = lines.index(original)
+            changed[index] = (offsets[index], replacement)
+        try:
+            lower(changed, tables)
+        except ValueError:
+            continue
+        raise AssertionError(f"Invalid depth program accepted: {case}")
     return lower(decoded, tables)
 
 
-def draw(dxc, renderer, adapter, tmp, shader, word_offset, noise):
+def draw(dxc, renderer, adapter, tmp, shader, word_offset, noise, *, thresholds=()):
     vs, ps = tmp / "vertex.dxil", tmp / "pixel.dxil"
     for name, profile, text, binary in [("v", "vs", VS, vs), ("p", "ps", shader, ps)]:
         path = tmp / (name + ".hlsl")
@@ -94,7 +139,7 @@ def draw(dxc, renderer, adapter, tmp, shader, word_offset, noise):
     def picture(seed, threshold):
         return b"".join(
             struct.pack(
-                "<f", 0.375 if noise(x + 0.5, y + 0.5, seed) <= threshold else 0.9375
+                "<f", 0.75 if noise(x + 0.5, y + 0.5, seed) <= threshold else 0.9375
             )
             for y in range(32)
             for x in range(32)
@@ -113,6 +158,7 @@ def draw(dxc, renderer, adapter, tmp, shader, word_offset, noise):
         (False, 7, 0.25, picture(7, 0.25), False),
         (True, 7, 0.625, expected, True),
         (True, 7, 0.625, exchanged, False),
+        *((False, 7, threshold, picture(7, threshold), False) for threshold in thresholds),
     ):
         struct.pack_into("<I", a, word_offset, seed)
         struct.pack_into("<f", b, 0, threshold)
@@ -201,12 +247,16 @@ if __name__ == "__main__":
         if sys.argv[1] == "binary":
             binary(Path(directory), *sys.argv[2:])
             sys.exit(0)
+        draw_args = (*sys.argv[1:], Path(directory))
+        result = draw(*draw_args, source(), 4, lambda x, y, seed: ((x + seed) / 8) % 1)
+        if result:
+            sys.exit(result)
         sys.exit(
             draw(
-                *sys.argv[1:],
-                Path(directory),
-                source(),
-                4,
-                lambda x, y, seed: ((x + seed) / 8) % 1,
+                *draw_args,
+                source(extended=True),
+                0x18,
+                lambda x, y, seed: ((y + seed + 12) % 32) / 32,
+                thresholds=(62 / 64, 63 / 64, 0.0),
             )
         )
