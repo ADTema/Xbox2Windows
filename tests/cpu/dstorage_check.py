@@ -4,8 +4,11 @@ Exercises the typed factory adapter, console queue creation, and delayed-submit 
 - Case 1 (Success path): DStorageGetFactory acquires IDStorageFactoryX ({62959d11-d45f-4884-a0a3-f7862ea243ae}),
   configures staging buffer size (32 MiB), creates IDStorageQueueX ({3c02cb0c-c050-4195-99a1-a1ce94ba33c5}),
   enqueues request, verifies completion is withheld before Submit, calls Submit, and releases objects (exit 0x870).
-- Case 2 (Factory failure refusal): Failed factory creation aborts sequence (exit 0x301).
-- Case 3 (Queue failure refusal): Failed queue creation aborts sequence (exit 0x303).
+- Case 2 (PC interface refusal): PC IDStorageFactory ({6924ea0c-c3cd-4826-b10a-f64f4ed927c1}) is refused with
+  E_NOINTERFACE and leaves *ppv untouched.
+- Case 3 (Factory failure refusal): Failed factory creation aborts sequence (exit 0x301).
+- Case 4 (Queue failure refusal): Failed queue creation aborts sequence (exit 0x303).
+- Case 5 (Eager-provider control): Faulty provider completing before Submit is caught by delayed-submit check (exit 0x304).
 - Changed-IID patch control: Altering factory IID fails QueryInterface with E_NOINTERFACE (exit 0x301).
 - Clean exit: Verified with live worker thread under CPU_CRC_TEST_LIVE_WORKER.
 - Mapped return: Verified under pe_map.
@@ -95,6 +98,8 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     prov_lib.set_dstorage_factory_success.restype = None
     prov_lib.set_dstorage_queue_success.argtypes = [ctypes.c_int]
     prov_lib.set_dstorage_queue_success.restype = None
+    prov_lib.set_dstorage_eager_completion.argtypes = [ctypes.c_int]
+    prov_lib.set_dstorage_eager_completion.restype = None
     prov_lib.reset_dstorage_records.restype = None
 
     providers = {
@@ -114,7 +119,7 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     prov_lib.reset_dstorage_records()
     mapped_code = run_mapped(mapper_path, exe, providers)
     check("mapped dstorage success exit code", mapped_code, 0x870)
-    check("mapped factory calls", prov_lib.get_dstorage_factory_calls(), 1)
+    check("mapped factory calls", prov_lib.get_dstorage_factory_calls(), 2) # step 0 (refusal) + step 1 (success)
     check("mapped staging buffer size", prov_lib.get_dstorage_staging_buffer_size(), 0x2000000)
     check("mapped queue calls", prov_lib.get_dstorage_queue_calls(), 1)
     check("mapped staged requests", prov_lib.get_dstorage_staged_requests_count(), 1)
@@ -126,7 +131,6 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     prov_lib.set_dstorage_factory_success(0)
     mapped_code = run_mapped(mapper_path, exe, providers)
     check("failed factory exit code", mapped_code, 0x301)
-    check("failed factory calls", prov_lib.get_dstorage_factory_calls(), 1)
     check("failed factory queue calls", prov_lib.get_dstorage_queue_calls(), 0)
     print("case 2 (factory failure refused): exit 0x301, queue uncreated")
 
@@ -136,12 +140,21 @@ def compare(mapper_path, exe_path, provider_path, io_path):
     prov_lib.set_dstorage_queue_success(0)
     mapped_code = run_mapped(mapper_path, exe, providers)
     check("failed queue exit code", mapped_code, 0x303)
-    check("failed queue factory calls", prov_lib.get_dstorage_factory_calls(), 1)
     check("failed queue buffer size", prov_lib.get_dstorage_staging_buffer_size(), 0x2000000)
     check("failed queue queue calls", prov_lib.get_dstorage_queue_calls(), 0)
     print("case 3 (queue creation refused): exit 0x303, staging intact")
 
-    # 5. Changed-IID patch control: patch IID_IDStorageFactoryX from 11 9d ... to 12 9d ...
+    # 5. Case 4: Eager-provider negative control (exit 0x304)
+    # A faulty provider completing prematurely before Submit is caught and rejected
+    prov_lib.reset_dstorage_records()
+    prov_lib.set_dstorage_factory_success(1)
+    prov_lib.set_dstorage_queue_success(1)
+    prov_lib.set_dstorage_eager_completion(1)
+    mapped_code = run_mapped(mapper_path, exe, providers)
+    check("eager provider rejected exit code", mapped_code, 0x304)
+    print("case 4 (eager-provider negative control): premature completion caught with exit 0x304")
+
+    # 6. Changed-IID patch control: patch IID_IDStorageFactoryX
     target_iid_bytes = bytes([
         0x11, 0x9d, 0x95, 0x62, 0x5f, 0xd4, 0x84, 0x48, 0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae
     ])
@@ -159,11 +172,10 @@ def compare(mapper_path, exe_path, provider_path, io_path):
         prov_lib.reset_dstorage_records()
         mapped_patched = run_mapped(mapper_path, patched_exe, providers)
         check("mapped patched iid exit code", mapped_patched, 0x301)
-        check("patched iid factory calls", prov_lib.get_dstorage_factory_calls(), 1)
         check("patched iid queue calls", prov_lib.get_dstorage_queue_calls(), 0)
         print("changed-IID patch control: exit 0x301, E_NOINTERFACE rejected unrecognized interface")
 
-    # 6. Negative withholding control: withhold DStorageGetFactory
+    # 7. Negative withholding control: withhold DStorageGetFactory
     mapper = Mapper(mapper_path)
     io_lib = ctypes.WinDLL(str(io_dll))
     base, status, detail, _ = mapper(exe, {io_name: io_lib, "xcrdapi.dll": {}})

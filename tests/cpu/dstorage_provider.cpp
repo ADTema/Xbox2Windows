@@ -1,9 +1,11 @@
 // Controlled DirectStorage factory and queue adapter provider for startup and staging tests.
 // Implements XCRDAPI!DStorageGetFactory, IDStorageFactoryX, and IDStorageQueueX:
-// - Verifies factory creation under console factory interface {62959d11-d45f-4884-a0a3-f7862ea243ae}.
+// - Verifies factory creation under test-provider policy console factory interface {62959d11-d45f-4884-a0a3-f7862ea243ae}.
+// - Refuses PC desktop IDStorageFactory interface {6924ea0c-c3cd-4826-b10a-f64f4ed927c1} with E_NOINTERFACE without clobbering *ppv.
 // - Verifies SetStagingBufferSize (vtable slot 8) configuration (e.g. 32 MiB).
 // - Verifies console queue creation (vtable slot 10) under queue interface {3c02cb0c-c050-4195-99a1-a1ce94ba33c5}.
 // - Verifies delayed-submit negative control: staged requests remain pending until explicit Submit().
+// - Verifies eager-provider negative control: premature completion prior to Submit is caught and rejected.
 // - Verifies queue capacity threshold auto-submission behavior.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -18,7 +20,7 @@
 #include <cstring>
 
 namespace {
-// DirectStorage Xbox console interfaces
+// Test-provider policy console interface identifiers exercising the Xbox DirectStorage factory pattern
 // IDStorageFactoryX: {62959d11-d45f-4884-a0a3-f7862ea243ae}
 const GUID IID_IDStorageFactoryX = {
     0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae}
@@ -34,9 +36,15 @@ const GUID IID_IDStorageQueueX_Legacy = {
     0xcd66d752, 0x2786, 0x44f7, {0x90, 0x70, 0xe2, 0xa6, 0xfd, 0xad, 0x3f, 0x1b}
 };
 
+// Public MIT DirectStorage PC IDStorageFactory: {6924ea0c-c3cd-4826-b10a-f64f4ed927c1}
+const GUID IID_IDStorageFactory_PC = {
+    0x6924ea0c, 0xc3cd, 0x4826, {0xb1, 0x0a, 0xf6, 0x4f, 0x4e, 0xd9, 0x27, 0xc1}
+};
+
 // Test provider counters and records
 volatile LONG cfg_factory_success = 1;
 volatile LONG cfg_queue_success = 1;
+volatile LONG cfg_eager_completion = 0;
 
 volatile LONG factory_calls = 0;
 volatile LONG queue_calls = 0;
@@ -105,6 +113,13 @@ struct MockQueue {
         (void)request;
         InterlockedIncrement(&staged_requests);
         self->pending_requests++;
+
+        // If eager-provider control is active, simulate a faulty provider completing before Submit:
+        if (cfg_eager_completion) {
+            Submit(self);
+            return;
+        }
+
         // DirectStorage auto-submission triggers when reaching half capacity
         if (self->capacity > 0 && self->pending_requests >= (self->capacity / 2)) {
             Submit(self);
@@ -260,9 +275,15 @@ extern "C" __declspec(dllexport) HRESULT WINAPI DStorageGetFactory(const GUID& r
     InterlockedIncrement(&factory_calls);
     if (!ppv) return E_POINTER;
 
-    if (!cfg_factory_success || !IsEqualGUID(riid, IID_IDStorageFactoryX)) {
+    if (!IsEqualGUID(riid, IID_IDStorageFactoryX)) {
+        // DirectStorage contract: on refusal (such as PC IID or unknown interface),
+        // *ppv MUST be left untouched and not clobbered.
+        return E_NOINTERFACE;
+    }
+
+    if (!cfg_factory_success) {
         *ppv = nullptr;
-        return (!cfg_factory_success) ? E_FAIL : E_NOINTERFACE;
+        return E_FAIL;
     }
 
     *ppv = new MockFactory();
@@ -305,6 +326,11 @@ extern "C" __declspec(dllexport) void WINAPI set_dstorage_queue_success(BOOL val
     InterlockedExchange(&cfg_queue_success, val ? 1 : 0);
 }
 
+extern "C" __declspec(dllexport) void WINAPI set_dstorage_eager_completion(BOOL val)
+{
+    InterlockedExchange(&cfg_eager_completion, val ? 1 : 0);
+}
+
 extern "C" __declspec(dllexport) void WINAPI reset_dstorage_records(void)
 {
     InterlockedExchange(&factory_calls, 0);
@@ -315,4 +341,5 @@ extern "C" __declspec(dllexport) void WINAPI reset_dstorage_records(void)
     current_staging_buffer_size = 0;
     cfg_factory_success = 1;
     cfg_queue_success = 1;
+    cfg_eager_completion = 0;
 }

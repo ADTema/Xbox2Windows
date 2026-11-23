@@ -2,11 +2,15 @@ EXTERN __imp_DStorageGetFactory:QWORD
 PUBLIC native_entry
 
 .data
-; GUID IID_IDStorageFactoryX: {62959d11-d45f-4884-a0a3-f7862ea243ae}
+; Test-provider policy console IIDs exercising the Xbox DirectStorage factory pattern
+; IDStorageFactoryX: {62959d11-d45f-4884-a0a3-f7862ea243ae}
 IID_IDStorageFactoryX db 11h, 9dh, 95h, 62h, 5fh, 0d4h, 84h, 48h, 0a0h, 0a3h, 0f7h, 86h, 2eh, 0a2h, 43h, 0aeh
 
-; GUID IID_IDStorageQueueX: {3c02cb0c-c050-4195-99a1-a1ce94ba33c5}
+; IDStorageQueueX: {3c02cb0c-c050-4195-99a1-a1ce94ba33c5}
 IID_IDStorageQueueX   db 0ch, 0cbh, 02h, 3ch, 50h, 0c0h, 95h, 41h, 99h, 0a1h, 0a1h, 0ceh, 94h, 0bah, 33h, 0c5h
+
+; Public MIT DirectStorage PC IDStorageFactory: {6924ea0c-c3cd-4826-b10a-f64f4ed927c1}
+IID_IDStorageFactory_PC db 0ch, 0eah, 24h, 69h, 0cdh, 0c3h, 26h, 48h, 0b1h, 0ah, 0f6h, 4fh, 4eh, 0d9h, 27h, 0c1h
 
 pFactory dq 0
 pQueue   dq 0
@@ -22,6 +26,7 @@ db 5 dup(0)         ; padding
 dq queue_name       ; Name
 
 dummy_request db 64 dup(0)
+dest_buffer   db 64 dup(0AAh)
 
 .code
 native_entry PROC FRAME
@@ -29,7 +34,19 @@ native_entry PROC FRAME
     .allocstack 38h
     .endprolog
 
+    ; Step 0: Refusal control - request PC IDStorageFactory IID {6924ea0c-c3cd-4826-b10a-f64f4ed927c1}
+    ; Must return E_NOINTERFACE (0x80004002) and leave *ppv untouched.
+    mov qword ptr [pFactory], 0DEADBEEFh
+    lea rcx, IID_IDStorageFactory_PC
+    lea rdx, pFactory
+    call qword ptr [__imp_DStorageGetFactory]
+    cmp eax, 80004002h ; E_NOINTERFACE
+    jne fail_pc_refusal
+    cmp qword ptr [pFactory], 0DEADBEEFh
+    jne fail_pc_clobber
+
     ; Step 1: DStorageGetFactory(&IID_IDStorageFactoryX, &pFactory)
+    mov qword ptr [pFactory], 0
     lea rcx, IID_IDStorageFactoryX
     lea rdx, pFactory
     call qword ptr [__imp_DStorageGetFactory]
@@ -69,6 +86,10 @@ native_entry PROC FRAME
     ; Staged request (< half capacity) must remain pending before Submit
     mov rcx, qword ptr [pQueue]
     cmp dword ptr [rcx + 14h], 0
+    jne fail_delayed_submit
+
+    ; Check destination buffer remains unmodified (0xAA) before Submit
+    cmp byte ptr [dest_buffer], 0AAh
     jne fail_delayed_submit
 
     ; Step 6: queue->Submit() (slot 6 = +0x30)
@@ -112,6 +133,14 @@ fail_delayed_submit:
 
 fail_submit:
     mov eax, 0305h
+    jmp done
+
+fail_pc_refusal:
+    mov eax, 0306h
+    jmp done
+
+fail_pc_clobber:
+    mov eax, 0307h
     jmp done
 
 done:

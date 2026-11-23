@@ -8,4 +8,5 @@ EXPORTS
     get_dstorage_submitted_count
     set_dstorage_factory_success
     set_dstorage_queue_success
+    set_dstorage_eager_completion
     reset_dstorage_records
