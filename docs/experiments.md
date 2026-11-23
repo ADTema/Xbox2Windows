@@ -2307,6 +2307,12 @@ same matrix within that budget. The existing `pixel_aot_warp` also passed;
 the legacy `pixel_aot_hardware` reached its separate 60-second timeout and is
 not counted as a pass. No full-suite success is claimed.
 
+The batched fixture passed all 192 inputs and 12 wrong-reference controls per
+adapter on Windows 11 build 26200.9974 with Windows SDK 10.0.26100 DXC. WARP
+10.0.26100.9818 took 5.7 seconds and the RTX 4060 Laptop (32.0.16.1656) took
+19.3 seconds, with the debug layer enabled on both. These timings cover the
+dedicated test command, including compilation.
+
 The native AMDGPU binary round trip is also part of `pixel_aot_check.py binary`;
 LLVM 18 assembled and disassembled all twelve forms for gfx1013 and the generated
 HLSL matched source lowering. The tests and implementation are original MIT code.

@@ -5234,7 +5234,7 @@ def check_bit_draws(directory, compiler, renderer, backend):
             raise AssertionError(f"{op}: wrong reference did not report the first changed pixel")
         if op == BIT_OPERATIONS[0]:
             for line in batch.stdout.splitlines():
-                if line.startswith(("backend=", "adapter=", "driver=", "debug_errors=")):
+                if line.startswith(("backend=", "adapter=", "driver=")):
                     print(line)
         print(f"vector_bits={op} cases={len(BIT_CASES)} matched", flush=True)
     return 0
