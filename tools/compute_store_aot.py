@@ -290,7 +290,7 @@ def main():
     blob = args.container.read_bytes()
     chunks = parts(blob)
     group = group_size(chunks.get(b"PSV0", b""))
-    code = container_code(chunks.get(b"DXIL", b""), stage=5)
+    code = container_code(chunks.get(b"DXIL", b""), stage=5, llvm=args.llvm)
     source = lower(disassemble(code, args.llvm), group, table_reg=args.table_reg,
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
