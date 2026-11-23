@@ -1598,7 +1598,67 @@ def lds_wide_reference(name, groups):
 LDS_CASES += [(name, lds_wide_program(name), LDS_WIDE_BINDING) for name in LDS_WIDE_PROGRAMS]
 
 
+LDS_WIDE_REPLACEMENTS = ("ds_cmpst_b64", "ds_cmpst_rtn_b64", "ds_mskor_b64", "ds_mskor_rtn_b64", "ds_wrxchg_rtn_b64")
+
+
+def lds_wide_replacement_instruction(op):
+    returns = "_rtn" in op
+    dest = "v[20:21], " if returns else ""
+    data2 = "" if "wrxchg" in op else ", v[20:21]"
+    return f"{op} {dest}v5, v[18:19]{data2} offset:8"
+
+
+def lds_wide_replacement_program(op):
+    returns = "_rtn" in op
+    return LDS_WIDE_SETUP + [
+        "v_and_b32_e32 v16, 1, v8", "v_lshrrev_b32_e32 v17, 1, v8", "v_and_b32_e32 v17, 1, v17",
+        "v_mad_u32_u24 v16, 1, v16, 0x12345670",
+        "v_mad_u32_u24 v17, 1, v17, 0x9abcdef0",
+        "v_mov_b32_e32 v18, 0x12345670", "v_mov_b32_e32 v19, 0x9abcdef0",
+        "v_mov_b32_e32 v20, 0xf0e1d2c3", "v_mov_b32_e32 v21, 0x87654321",
+        "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+        lds_wide_replacement_instruction(op), "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + (["v_mov_b32_e32 v12, v20", "v_mov_b32_e32 v13, v21",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
+
+
+def lds_wide_replacement_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = (0x9abcdef0 + (lane >> 1 & 1)) << 32 | (0x12345670 + (lane & 1))
+        data = 0x9abcdef012345670
+        other = 0x87654321f0e1d2c3
+        if "cmpst" in op:
+            new = other if old == data else old
+        elif "mskor" in op:
+            new = (old & ~data) | other
+        else:
+            new = data
+        words.extend((new & 0xffffffff, new >> 32))
+        if "_rtn" in op:
+            words.extend((old & 0xffffffff, old >> 32))
+    return words
+
+
+LDS_WIDE_REPLACEMENT_CASES = [
+    (op, lds_wide_replacement_program(op), LDS_WIDE_BINDING | {"stride": 16 if "_rtn" in op else 8})
+    for op in LDS_WIDE_REPLACEMENTS
+]
+
+
 def lds_controls():
+    op, lines, binding = LDS_WIDE_REPLACEMENT_CASES[1]
+    target = lds_wide_replacement_instruction(op)
+    for replacement, message in (
+        (target.replace("offset:8", "offset:0"), "Unverified private wide LDS replacement"),
+        (target.replace("v[18:19]", "v[18:20]"), "Unverified private wide LDS replacement range"),
+        (target.replace("v[18:19]", "v[254:255]"), "Unverified private wide LDS replacement source"),
+        (target + " gds", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (target, replacement)), 32, **binding)
+
     cmpst = lds_replacement_instruction("ds_cmpst_rtn_b32")
     lines = lds_replacement_program("ds_cmpst_rtn_b32")
     for bad, message in (
@@ -1758,7 +1818,7 @@ def lds_controls():
 
 
 def ds_binary(directory, assembler, objcopy, library):
-    for name, lines, binding in DS_CASES + LDS_CASES:
+    for name, lines, binding in DS_CASES + LDS_CASES + LDS_WIDE_REPLACEMENT_CASES:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
         subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1030", f"-mattr={DS_FEATURES}",
@@ -1845,6 +1905,18 @@ def ds_mutants(name, lines, binding, source):
         no_update = "ds_read_b32 v10, v5" if "_rtn_" in name else "s_nop 0"
         changed = variant(lines, (lds_counter_instruction(name), no_update))
         yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_WIDE_REPLACEMENTS:
+        op = lds_wide_replacement_instruction(name)
+        if "cmpst" in name:
+            changed = variant(lines, ("v[18:19], v[20:21] offset:8", "v[20:21], v[18:19] offset:8"))
+            word = 0
+        elif "mskor" in name:
+            changed = variant(lines, ("v_mov_b32_e32 v20, 0xf0e1d2c3", "v_mov_b32_e32 v20, 0x10205240"))
+            word = 0
+        else:
+            changed = variant(lines, (op, "ds_read_b64 v[20:21], v5 offset:8"))
+            word = 4
+        yield aot.lower(changed, 32, **binding), word
     elif name == "private":
         yield source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)"), 2
     else:
@@ -1852,20 +1924,23 @@ def ds_mutants(name, lines, binding, source):
         yield source.replace(f"local.x + {bias}u", f"local.x + {32 - bias}u"), 0
 
 
-def ds_draw(directory, compiler, renderer, backend, *, private=False):
+def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None):
     if private:
         lds_controls()
     else:
         ds_controls()
     accepted = set()
-    for name, lines, binding in (LDS_CASES if private else DS_CASES):
+    if cases is None:
+        cases = LDS_CASES if private else DS_CASES
+    for name, lines, binding in cases:
         source = aot.lower(lines, 32, **binding)
         src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
         src.write_text(source, encoding="ascii")
         compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
-        for groups in (1, 3):
+        four_words = name in LDS_WIDE_REPLACEMENTS and "_rtn" in name
+        for groups in (1, 2) if four_words else (1, 3):
             if name in LDS_UPDATES or name in LDS_RETURN_UPDATES:
                 words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
             elif name in LDS_SUBWORDS:
@@ -1880,6 +1955,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
                 words = lds_wide_reference(name, groups)
             elif name in LDS_COUNTERS:
                 words = lds_counter_reference(name, groups)
+            elif name in LDS_WIDE_REPLACEMENTS:
+                words = lds_wide_replacement_reference(name, groups)
             elif private:
                 words = lds_reference(groups)
             else:
@@ -2372,6 +2449,7 @@ if __name__ == "__main__":
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
                  "draw-ds-route": ds_draw,
+                 "draw-lds-wide-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_WIDE_REPLACEMENT_CASES),
                  "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))

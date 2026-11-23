@@ -2317,6 +2317,17 @@ the old word to the destination VGPR. The fixtures compare old and new words
 and exercise successful and unsuccessful comparisons. Reversing the comparison
 operands, masking the OR operand or omitting the exchange must mismatch at word 1.
 
+The private qword replacement fixtures cover compare-and-store, masked OR
+and write-exchange at byte offset 8. The compare checks both dwords. Masked
+OR clears the selected bits before OR-ing the full replacement pair. Returning
+forms preserve the old pair even when the output overlaps a source. Swapping
+the compare operands, masking the OR data, or omitting exchange each changes
+the readback.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_wide_replacement_(warp|hardware)$' -V
+```
+
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
 and three groups. Selecting the low half for the high-half read must
