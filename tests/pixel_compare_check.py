@@ -354,6 +354,20 @@ def controls():
     changed[sample] = changed[sample].replace("image_sample_c_lz v12,", "image_sample_c_lz v255,")
     changed[changed.index("exp mrt0 v12, v13, v14, v15 done vm")] = "exp mrt0 v255, v13, v14, v15 done vm"
     assert "SampleCmpLevelZero" in translate(changed, words)
+    # A reference read from a further constant buffer (b1, the descriptor at 0x60 of the texture table).
+    from_b1 = prefix() + sampler_moves(words) + [
+        "s_load_dwordx4 s[48:51], s[20:21], 0x60",
+        "s_waitcnt lgkmcnt(0)",
+        "s_buffer_load_dword s64, s[48:51], 0x4",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v7, s64",
+        "image_sample_c_lz v12, v[7:9], s[28:35], s[40:43] dmask:0x1 dim:SQ_RSRC_IMG_2D",
+    ] + tail(reference="v7")
+    source = recorded_lower(from_b1, 20, 24, words, 64, extra_constants=[(20, 0x60)])
+    assert "cbuffer Constants1 : register(b1) { float4 params1[16]; };" in source, source
+    reference = next(line.split()[2] for line in source.splitlines() if line.endswith(" = params1[0].y;"))
+    assert f"tex.SampleCmpLevelZero(samp, float2(uv.x, uv.y), {reference});" in source, source
+    must_reject(translate, from_b1, words)
     # The sampler words must still match the caller binding.
     must_reject(translate, program, sampler_words("GREATER", "point"))
     # Reading the result before the wait, or a reference that is an outstanding sample result.

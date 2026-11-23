@@ -2106,7 +2106,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for reg, value in zip(address, values):
                 if reg in sample_dest:
                     raise ValueError("Sample used before vmcnt wait")
-                if not isinstance(value, str) or not (value in quad_values or value.startswith(("sample", "alu", "params["))):
+                if not isinstance(value, str) or not (value in quad_values or value.startswith(("sample", "alu", "params"))):
                     raise ValueError("Unsupported comparison sample operand")
             reference, u, v = values
             lines.append(f"    float sample{i} = tex.SampleCmpLevelZero(samp, float2({u}, {v}), {reference});")
