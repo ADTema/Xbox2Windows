@@ -1874,7 +1874,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if constant_descriptor is not None:
         if constant_descriptor < 0 or constant_descriptor % 4:
             raise ValueError("Invalid constant descriptor offset")
-        lines.insert(0, "cbuffer Constants : register(b0) { float4 params[16]; };")
+        constant_vector = "uint4" if integer_export else "float4"
+        lines.insert(0, f"cbuffer Constants : register(b0) {{ {constant_vector} params[16]; }};")
     bindings = {} if sampler is None else {texture_offset: "tex"}
     if second_texture_offset is not None:
         if sampler is None:
@@ -2463,7 +2464,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 if f"s{n}" in pending:
                     raise ValueError("Write overlaps an outstanding scalar load")
                 word = offset // 4 + j
-                scalar[f"s{n}"] = ("cbv", params, j) if descriptor else f"{params}[{word // 4}].{'xyzw'[word % 4]}"
+                if descriptor:
+                    scalar[f"s{n}"] = ("cbv", params, j)
+                else:
+                    value = f"{params}[{word // 4}].{'xyzw'[word % 4]}"
+                    scalar[f"s{n}"] = ("uint", value) if integer_export and params == "params" else value
                 pending.add(f"s{n}")
         elif m := match(r"v_cube(id|sc|tc|ma)_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+?)( clamp)?"):
             # LLVM ConstantFoldAMDGCNCubeIntrinsic: z, then y, then x is the major axis; a face is negative

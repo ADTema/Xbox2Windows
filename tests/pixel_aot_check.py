@@ -2810,6 +2810,26 @@ def check_scalar_bitset64_draw(directory, compiler, renderer, backend):
             compile_shader(compiler, alias_source, alias_shader)
             run_pixel_batch(renderer, backend, alias_shader, [(read_after_write, "mismatch")])
 
+    # PR #680 reproduced an NVIDIA sign-bit loss with an immediate index of 31.
+    # Keep the original float-overwrite control so a raw bit copy can never reuse stale bits.
+    program = scalar_bitset64("s_bitset1_b64", "31")
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, 0xffffffff, 0xffffffff, 0, 0)
+    for overwrite in (False, True):
+        copies = ["v_mov_b32_e32 v20, v12", "v_mov_b32_e32 v12, 1.0"]
+        copies.append("v_add_f32_e32 v12, 1.0, v12" if overwrite else "v_mov_b32_e32 v12, v20")
+        source.write_text(translate_int(program[:-2] + copies + program[-2:]), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        correct = 0x40000000 if overwrite else 0xffffffff
+        wrong = 0xffffffff if overwrite else 0x7fffffff
+        cases = []
+        for low, status in ((correct, "pass"), (wrong, "mismatch")):
+            path = directory / f"bitset31-transport-{overwrite}-{status}.case"
+            path.write_bytes(constants + struct.pack("<4I", low, 0xffffffff, 0, 0) * 64 + b"\x01")
+            cases.append((path, status))
+        run_pixel_batch(renderer, backend, shader, cases)
+
+
 S_CSELECT_B64 = "s_cselect_b64 s[44:45], s[44:45], s[46:47]"
 
 
@@ -4417,7 +4437,7 @@ def check_scalar_controls():
 
     sop1_program = sop1_scalar_ops()
     sop1_source = translate_int(sop1_program)
-    for expected in ("(asint(asuint(params[0].w)) < 0 ? (0u - asuint(params[0].w)) : asuint(params[0].w))",
+    for expected in ("(asint(params[0].w) < 0 ? (0u - params[0].w) : params[0].w)",
                      "& ~(1u << (", "| (1u << (31u & 31u))", "? 305419896u :"):
         assert expected in sop1_source, expected
     sop1_refs = [sop1_scalar_ops_reference(words) for words in SOP1_WORDS]
@@ -4449,7 +4469,7 @@ def check_scalar_controls():
     # s_bfm_b32: the lowering masks both counts to five bits and leaves SCC untouched.
     bfm_program = bfm_scalar_ops()
     bfm_source = translate_int(bfm_program)
-    assert ("= ((1u << (asuint(params[0].w) & 31u)) - 1u) << (asuint(params[1].x) & 31u);" in bfm_source), bfm_source
+    assert ("= ((1u << (params[0].w & 31u)) - 1u) << (params[1].x & 31u);" in bfm_source), bfm_source
     assert "s_bfm_b64(" in bfm_source
     refs = [bfm_scalar_ops_reference(words) for words in BFM_WORDS]
     # Counts 0, 1, 31, 32 and 33 for b32 and 63 and 64 for b64 are all covered with distinct results.
@@ -4462,7 +4482,7 @@ def check_scalar_controls():
     at = scc_program.index("v_mov_b32_e32 v12, s50")
     scc_program[at:at] = with_scc + ["s_bfm_b32 s54, 4, 8", "s_cselect_b32 s55, s44, s45"]
     scc_source = translate_int(scc_program)
-    assert re.search(r"= scc\d+ \? asuint\(params\[0\]\.w\) : asuint\(params\[1\]\.x\);", scc_source), scc_source
+    assert re.search(r"= scc\d+ \? params\[0\]\.w : params\[1\]\.x;", scc_source), scc_source
     # Without a tracked SCC the select is rejected even after s_bfm_b32 (it does not create one).
     at = bfm_program.index("v_mov_b32_e32 v12, s50")
     must_reject(translate_int, bfm_program[:at] + ["s_bfm_b32 s54, 4, 8", "s_cselect_b32 s55, s44, s45"] + bfm_program[at:])
@@ -4486,11 +4506,11 @@ def check_scalar_controls():
     # s_brev_b32: reverses all 32 bits and leaves SCC untouched, so the select still reads the compare's SCC.
     brev_program = brev_scalar_ops()
     brev_source = translate_int(brev_program)
-    assert re.search(r"uint salu\d+ = reversebits\(asuint\(params\[1\]\.y\)\);", brev_source), brev_source
-    assert re.search(r"uint salu\d+ = reversebits\(asuint\(params\[1\]\.z\)\);", brev_source), brev_source
+    assert re.search(r"uint salu\d+ = reversebits\(params\[1\]\.y\);", brev_source), brev_source
+    assert re.search(r"uint salu\d+ = reversebits\(params\[1\]\.z\);", brev_source), brev_source
     assert brev_source.count("reversebits(") == 3, brev_source
     assert len(re.findall(r"\bscc\d+ =", brev_source)) == 1, brev_source  # only the compare writes SCC
-    assert re.search(r"= scc\d+ \? asuint\(params\[1\]\.z\) : 0u;", brev_source), brev_source
+    assert re.search(r"= scc\d+ \? params\[1\]\.z : 0u;", brev_source), brev_source
     brev_refs = [brev_scalar_ops_reference(words) for words in BREV_WORDS]
     assert brev_refs[0] == (0, 0x1e6a2c48, 0xffffffff, 0xffffffff), brev_refs[0]
     assert brev_refs[1] == (0xffffffff, 0x1e6a2c48, 0, 1), brev_refs[1]
@@ -4522,7 +4542,7 @@ def check_scalar_controls():
     bitscan_first = translate_int(plain_bitscan_ops())
     bitscan_second = translate_int(plain_bitscan_ops(True))
     assert "reversebits(" in bitscan_first and "firstbitlow(" in bitscan_second
-    assert "~(asuint(params[1].z) ^ asuint(params[0].w))" in bitscan_first, bitscan_first
+    assert "~(params[1].z ^ params[0].w)" in bitscan_first, bitscan_first
     assert bitscan_first.count("uint dpp_ffbh_u32(") == 1 and bitscan_first.count("uint dpp_ffbh_i32(") == 1
     assert bitscan_second.count("uint dpp_ffbh_u32(") == 1 and "uint dpp_ffbh_i32(" not in bitscan_second
     assert "uint dpp_ffbh_" not in translate_int(uncompressed_export(["v_bfrev_b32 v24, s44"]))
@@ -7069,7 +7089,7 @@ def check_f16_denorm_controls():
 def check_e64_integer_lowering():
     """Static checks for the integer e64 forms of e64_integer_group() and for v_xnor_b32 in both encodings."""
     # v18 is written by the mov at index 20 and the four group instructions follow at 21..24.
-    a, b, c, v = "asuint(params[0].w)", "asuint(params[1].x)", "asuint(params[1].y)", "asuint(alu20)"
+    a, b, c, v = "params[0].w", "params[1].x", "asuint(asfloat(params[1].y))", "asuint(alu20)"
     expected = {
         "shift": (f"asfloat({b} << ({a} & 31u))", f"asfloat({b} >> ({a} & 31u))",
                   f"asfloat(asuint(asint({b}) >> ({a} & 31u)))", f"asfloat(~{b})"),
@@ -7126,7 +7146,7 @@ def check_sdwa_integer_lowering():
         assert len(lines) == 1, (body, lines)
         return lines[0].replace(f"alu{index} ", "r ", 1)
 
-    a, b, v = "asuint(params[0].w)", "asuint(params[1].x)", "asuint(alu20)"
+    a, b, v = "params[0].w", "params[1].x", "asuint(alu20)"
     sdwa = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"
     # With whole-dword selections every form is its e32 statement, up to the parentheses of the placement.
     for op, (arity, _) in pixel_aot.SDWA_INT.items():
@@ -7152,7 +7172,7 @@ def check_sdwa_integer_lowering():
                                             f"(({b} >> 16u) & 0xffu)) & 0xffu) << 24u));")
     assert statement("v_mov_b32_e32 v15, s47", "v_not_b32_sdwa v15, s46 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE "
                      "src0_sel:BYTE_2") == ("    precise float r = asfloat(((asuint(alu21) & 0xffff0000u) | "
-                                            "(((~((asuint(params[1].y) >> 16u) & 0xffu)) & 0xffffu) << 0u)));")
+                                            "(((~((params[1].y >> 16u) & 0xffu)) & 0xffffu) << 0u)));")
     good = f"v_and_b32_sdwa v12, s44, v18 {sdwa}"
     translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
     for bad, message in (
@@ -7197,7 +7217,7 @@ def check_sdwa_integer_lowering():
 
 def check_pack_int16_lowering():
     """Static checks for v_cvt_pk_u16_u32 and v_cvt_pk_i16_i32 in the programs of pack_group()."""
-    a = "asuint(params[0].w)"
+    a = "params[0].w"
 
     def u16(x, y):
         return f"asfloat(min({x}, 65535u) | (min({y}, 65535u) << 16u));"
@@ -7266,7 +7286,7 @@ def check_carry_out_lowering():
     """Static checks for v_add_co_u32, v_sub_co_u32 and v_subrev_co_u32 as written by carry_out_group()."""
     # v18 and v19 are written by the movs at 20 and 21; the first operation is 22, its select 23, the second
     # 24, its select 25.
-    a, v, c, d = "asuint(params[0].w)", "asuint(alu20)", "params[1].y", "alu21"
+    a, v, c, d = "params[0].w", "asuint(alu20)", "asfloat(params[1].y)", "alu21"
     expected = {
         "v_add_co_u32": ((f"{a} + {v}", f"co22 < {a}"), (f"{v} + {a}", f"co24 < {v}")),
         "v_sub_co_u32": ((f"{a} - {v}", f"{v} > {a}"), (f"{v} - {a}", f"{a} > {v}")),
@@ -7304,7 +7324,7 @@ def check_carry_out_lowering():
     replaced = translate_int(uncompressed_export(
         ["v_mov_b32_e32 v18, s45", "v_add_co_u32 v12, vcc, s44, v18", "v_cmp_lt_u32_e64 vcc, s44, v18",
          "v_cndmask_b32_e64 v13, s46, s47, vcc"])).splitlines()
-    assert f"    precise float alu23 = cmp22 ? params[1].z : {c};" in replaced, replaced
+    assert f"    precise float alu23 = cmp22 ? asfloat(params[1].z) : {c};" in replaced, replaced
     sources = {op: translate_int(uncompressed_export(carry_out_group(op))) for op in CARRY_OUT_OPS}
     assert len(set(sources.values())) == 3
 
@@ -7312,7 +7332,7 @@ def check_carry_out_lowering():
 def check_sad_lowering():
     """Static checks for v_sad_hi_u8, v_sad_u32 and v_msad_u8 in the programs of sad_group()."""
     # v18 is written by the mov at index 20 and the four group instructions follow at 21..24.
-    a, b, c, v = "asuint(params[0].w)", "asuint(params[1].x)", "asuint(params[1].y)", "asuint(alu20)"
+    a, b, c, v = "params[0].w", "params[1].x", "params[1].y", "asuint(alu20)"
     expected = {
         "bytes": (f"(sad4_u8({a}, {v}, false) << 16u) + {c}", f"(sad4_u8({v}, {a}, false) << 16u) + 0u",
                   f"sad4_u8({a}, {v}, true) + {c}", f"sad4_u8({v}, {a}, true) + {c}"),
@@ -7374,7 +7394,7 @@ def check_nc_integer_lowering():
     """Static checks for the 32-bit no-carry add/sub forms of nc_integer_group(1..3)."""
     # v18 is written by the mov at index 20, and the four group instructions follow at 21..24. A and B are
     # s44 (params[0].w) and s45. sub is src0 - src1; subrev swaps the operands and is src1 - src0.
-    a, b = "asuint(params[0].w)", "asuint(alu20)"
+    a, b = "params[0].w", "asuint(alu20)"
     expected = {
         1: (f"{a} + {b}", f"{a} - {b}", f"{b} - {a}", f"{b} - {a}"),
         2: (f"{a} + {b}", f"{a} - {b}", f"{a} + {b}", f"{a} - {b}"),
@@ -7708,14 +7728,14 @@ def check_controls(directory):
     align_source = "\n".join(translate_int(align_integer_group(byte)) for byte in (False, True))
     assert set(VOP3_ALIGN_OPS) <= ACCEPTED
     for expected in (
-        "((4u & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (4u & 31u)) | (asuint(params[0].w) << (32u - (4u & 31u)))))",
-        "((0u & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (0u & 31u)) | (asuint(params[0].w) << (32u - (0u & 31u)))))",
-        "((31u & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (31u & 31u)) | (asuint(params[0].w) << (32u - (31u & 31u)))))",
-        "((asuint(params[1].y) & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (asuint(params[1].y) & 31u)) | (asuint(params[0].w) << (32u - (asuint(params[1].y) & 31u)))))",
-        "((1u & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((1u & 3u) * 8u)) | (asuint(params[0].w) << (32u - ((1u & 3u) * 8u)))))",
-        "((0u & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((0u & 3u) * 8u)) | (asuint(params[0].w) << (32u - ((0u & 3u) * 8u)))))",
-        "((3u & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((3u & 3u) * 8u)) | (asuint(params[0].w) << (32u - ((3u & 3u) * 8u)))))",
-        "((asuint(params[1].y) & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((asuint(params[1].y) & 3u) * 8u)) | (asuint(params[0].w) << (32u - ((asuint(params[1].y) & 3u) * 8u)))))",
+        "((4u & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (4u & 31u)) | (params[0].w << (32u - (4u & 31u)))))",
+        "((0u & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (0u & 31u)) | (params[0].w << (32u - (0u & 31u)))))",
+        "((31u & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (31u & 31u)) | (params[0].w << (32u - (31u & 31u)))))",
+        "((params[1].y & 31u) == 0u ? asuint(alu20) : ((asuint(alu20) >> (params[1].y & 31u)) | (params[0].w << (32u - (params[1].y & 31u)))))",
+        "((1u & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((1u & 3u) * 8u)) | (params[0].w << (32u - ((1u & 3u) * 8u)))))",
+        "((0u & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((0u & 3u) * 8u)) | (params[0].w << (32u - ((0u & 3u) * 8u)))))",
+        "((3u & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((3u & 3u) * 8u)) | (params[0].w << (32u - ((3u & 3u) * 8u)))))",
+        "((params[1].y & 3u) == 0u ? asuint(alu20) : ((asuint(alu20) >> ((params[1].y & 3u) * 8u)) | (params[0].w << (32u - ((params[1].y & 3u) * 8u)))))",
     ):
         assert expected in align_source, expected
     for bad_align in (
@@ -7736,14 +7756,14 @@ def check_controls(directory):
     vop3_source = "\n".join(translate_int(vop3_ternary_int_group(group)) for group in (1, 2))
     assert set(VOP3_TERNARY_INT_OPS) <= ACCEPTED
     for expected in (
-        "(asuint(params[0].w) + asuint(alu20) + asuint(params[1].y))",
-        "(asuint(params[0].w) | asuint(alu20) | asuint(params[1].y))",
-        "(asuint(params[0].w) ^ asuint(alu20) ^ asuint(params[1].y))",
-        "((asuint(params[0].w) & asuint(alu20)) | asuint(params[1].y))",
-        "((asuint(params[0].w) ^ asuint(alu20)) + asuint(params[1].y))",
-        "((asuint(params[0].w) << (asuint(alu20) & 31u)) | asuint(params[1].y))",
-        "((asuint(params[0].w) << (asuint(alu20) & 31u)) + asuint(params[1].y))",
-        "((asuint(params[0].w) + asuint(alu20)) << (asuint(params[1].y) & 31u))",
+        "(params[0].w + asuint(alu20) + params[1].y)",
+        "(params[0].w | asuint(alu20) | params[1].y)",
+        "(params[0].w ^ asuint(alu20) ^ params[1].y)",
+        "((params[0].w & asuint(alu20)) | params[1].y)",
+        "((params[0].w ^ asuint(alu20)) + params[1].y)",
+        "((params[0].w << (asuint(alu20) & 31u)) | params[1].y)",
+        "((params[0].w << (asuint(alu20) & 31u)) + params[1].y)",
+        "((params[0].w + asuint(alu20)) << (params[1].y & 31u))",
     ):
         assert expected in vop3_source, expected
     for op in VOP3_TERNARY_INT_OPS:
@@ -7949,9 +7969,9 @@ def check_controls(directory):
     # e64 source modifiers apply bitwise sign-bit ops before the shared helper, never FP abs/neg.
     e64_mod_hlsl = translate_int(uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY))
     assert e64_mod_hlsl.count("uint cvt_i32_f32(uint bits)") == 1
-    assert "(asuint(params[0].w) & 0x7fffffffu)" in e64_mod_hlsl, e64_mod_hlsl
-    assert "(asuint(params[1].x) ^ 0x80000000u)" in e64_mod_hlsl, e64_mod_hlsl
-    assert "((asuint(params[1].y) & 0x7fffffffu) ^ 0x80000000u)" in e64_mod_hlsl, e64_mod_hlsl
+    assert "(asuint(asfloat(params[0].w)) & 0x7fffffffu)" in e64_mod_hlsl, e64_mod_hlsl
+    assert "(asuint(asfloat(params[1].x)) ^ 0x80000000u)" in e64_mod_hlsl, e64_mod_hlsl
+    assert "((asuint(asfloat(params[1].y)) & 0x7fffffffu) ^ 0x80000000u)" in e64_mod_hlsl, e64_mod_hlsl
     assert "abs(" not in e64_mod_hlsl.split("uint4 main", 1)[1], e64_mod_hlsl
     assert translate(with_constants(["v_cvt_u32_f32_e64 v12, abs(s44)"])) == translate(with_constants(["v_cvt_u32_f32_e64 v12, |s44|"]))
     assert translate(with_constants(["v_cvt_i32_f32_e64 v12, neg(s44)"])) == translate(with_constants(["v_cvt_i32_f32_e64 v12, -s44"]))
@@ -8217,8 +8237,8 @@ def check_controls(directory):
 
     cmpk_program = sopk_cmpk_cmovk()
     cmpk_source = translate_int(cmpk_program)
-    for expected in ("(asint(asuint(params[0].w)) < asint(4294934528u))",
-                     "(asuint(params[1].x) < 32768u)",
+    for expected in ("(asint(params[0].w) < asint(4294934528u))",
+                     "(params[1].x < 32768u)",
                      "? 4294967294u : ",
                      "? 32767u : "):
         assert expected in cmpk_source, expected
@@ -8453,7 +8473,7 @@ def check_controls(directory):
     assert set(SCALAR_BFE64_OPS) <= ACCEPTED
     for op in SCALAR_BITSET64_OPS:
         lowered = translate_int(scalar_bitset64(op))
-        assert "_bit = asuint(params[1].y) & 63u;" in lowered, lowered
+        assert "_bit = params[1].y & 63u;" in lowered, lowered
         for index in (0, 31, 32, 63, 64):
             assert "salu" in translate_int(scalar_bitset64(op, str(index)))
         for bad in ("v12", "s[46:47]"):
@@ -12223,9 +12243,9 @@ def check_bfm_draw(directory, compiler, renderer, backend):
     compile_shader(compiler, source, shader)
     run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases])
     # Controls on the generated HLSL: a narrower count mask and swapped count/offset. Words 1 and 4 distinguish both.
-    for old, new, label in (("(1u << (asuint(params[0].w) & 31u))", "(1u << (asuint(params[0].w) & 15u))", "b32 count mask"),
-                            ("((1u << (asuint(params[0].w) & 31u)) - 1u) << (asuint(params[1].x) & 31u)",
-                             "((1u << (asuint(params[1].x) & 31u)) - 1u) << (asuint(params[0].w) & 31u)", "b32 operand order")):
+    for old, new, label in (("(1u << (params[0].w & 31u))", "(1u << (params[0].w & 15u))", "b32 count mask"),
+                            ("((1u << (params[0].w & 31u)) - 1u) << (params[1].x & 31u)",
+                             "((1u << (params[1].x & 31u)) - 1u) << (params[0].w & 31u)", "b32 operand order")):
         mutated = lowered.replace(old, new)
         assert mutated != lowered, label
         source.write_text(mutated, encoding="ascii")
