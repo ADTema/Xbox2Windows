@@ -18,9 +18,8 @@ hold the relocated in-image targets on read-only pages.
 Windows replaces both slots of a /guard:cf image and ends a call to the invalid target before it writes
 output. pe_map currently does not implement CFG: it keeps the image's own slots, so the valid callback runs
 without the slot bits and the invalid target runs. The unchecked invalid result is recorded as an
-observation. The test also accepts a mapper that explicitly rejects unsupported CFG before dispatch, or
-that enforces CFG and ends the invalid target without an entry result, so a later loader change does not
-rewrite what the fixture establishes.
+observation. The test also accepts an explicit unsupported-CFG diagnostic before dispatch. An unrelated
+load failure or a missing output record does not establish CFG behavior.
 """
 import ctypes
 from ctypes import wintypes
@@ -221,15 +220,14 @@ def main(mapper_path, io, *images):
             else:  # cfg_invalid
                 if native[0] == 0 or native[1] is not None or row["stdout"]["bytes"] or row["stderr"]["bytes"]:
                     raise AssertionError(f"{name}: Windows {native}, expected the process to end before writing output")
-                if not started:
-                    note = f"status {result['status']} before dispatch ({result['detail']})"
+                if (not started and result["status"] == STATUS["unsupported"]
+                        and "cfg" in result["detail"].casefold() and not out and not err):
+                    note = f"unsupported before dispatch ({result['detail']})"
                 elif mapped_row == expected[base]:
                     note = "unchecked target (current observation); mapped slots read-only and relocated"
-                elif mapped_row[1] is None:
-                    note = "CFG enforced; no entry result"
                 else:
-                    raise AssertionError(f"{name}: pe_map {mapped_row}, expected the unchecked call, a "
-                                         "pre-dispatch rejection or no entry result")
+                    raise AssertionError(f"{name}: pe_map {mapped_row}, status {result['status']}, "
+                                         f"expected the current observation or an explicit CFG refusal: {result}")
             shown = show(mapped_row) if mapped_row is not None else "not started"
             print(f"{name}: Windows {show(native)}; pe_map {shown}; {note}")
 
