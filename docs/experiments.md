@@ -3394,10 +3394,10 @@ Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
 
 ### Batch export TTPF textures to DDS
 
-`tools/ttpf_batch_export.py` runs batch export over a range of texture indices in a TTPF (RDS5) pool. It attempts strict export first, optionally falls back to provisional calibration history for entries that fail strict verification, and records entry status, dimensions, DXGI codec, output DDS file size and SHA-256 in `manifest.json`.
+`tools/ttpf_batch_export.py` runs batch export over a range of texture indices in a TTPF (RDS5) pool. It enforces strict export by default, optionally retrying with fitted provisional calibration history when `--allow-provisional` is specified. Exports are written to temporary paths and published atomically on completion. Entry status, dimensions, DXGI codec, output DDS file size and SHA-256 are recorded in `manifest.json`.
 
 ```powershell
-python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --indices 0,8253 --history "$out/history.json" --tools-path "$out/Leonida/tools"
+python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --indices 0,8253 --allow-provisional --history "$out/history.json" --tools-path "$out/Leonida/tools"
 ```
 
 ### Drawing BC7 textures with a recompiled pixel shader

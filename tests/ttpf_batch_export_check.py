@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-from unittest.mock import MagicMock
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -109,34 +108,50 @@ class BatchExportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             batch.parse_indices("10-2")
 
-    def test_export_texture_entry_strict(self):
+    def test_export_texture_entry_strict_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp)
             pool = MockPool("mock.ttpf")
-            res = batch.export_texture_entry(pool, 0, out_dir, allow_provisional=False,
-                                             ttpf_module=MockTtpfModule)
+            # Strict mode by default
+            res = batch.export_texture_entry(pool, 0, out_dir, ttpf_module=MockTtpfModule)
             self.assertEqual(res["status"], "success")
             self.assertEqual(res["mode"], "strict")
             self.assertEqual(res["format_name"], "BC1")
             self.assertEqual(res["sha256"], hashlib.sha256(b"DDS_STRICT_BC1_DATA").hexdigest())
-            self.assertTrue((out_dir / "tex_00000.dds").exists())
+            final_file = out_dir / "tex_00000.dds"
+            self.assertTrue(final_file.exists())
+            # Ensure no leftover temporary files
+            tmp_files = list(out_dir.glob(".tmp_*"))
+            self.assertEqual(len(tmp_files), 0)
 
-    def test_export_texture_entry_provisional_retry(self):
+    def test_export_texture_entry_provisional_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp)
             pool = MockPool("mock.ttpf")
-            # Strict only -> fails
-            res_strict = batch.export_texture_entry(pool, 1, out_dir, allow_provisional=False,
-                                                    ttpf_module=MockTtpfModule)
+            # Default allow_provisional=False -> fails
+            res_strict = batch.export_texture_entry(pool, 1, out_dir, ttpf_module=MockTtpfModule)
             self.assertEqual(res_strict["status"], "failed")
+            self.assertFalse((out_dir / "tex_00001.dds").exists())
 
-            # With allow_provisional -> retries and succeeds
+            # Explicit opt-in allow_provisional=True -> succeeds
             res_prov = batch.export_texture_entry(pool, 1, out_dir, allow_provisional=True,
                                                   ttpf_module=MockTtpfModule)
             self.assertEqual(res_prov["status"], "success")
             self.assertEqual(res_prov["mode"], "provisional")
             self.assertEqual(res_prov["format_name"], "BC7")
             self.assertEqual(res_prov["sha256"], hashlib.sha256(b"DDS_PROVISIONAL_BC7_DATA").hexdigest())
+            self.assertTrue((out_dir / "tex_00001.dds").exists())
+
+    def test_export_texture_entry_atomic_publish_and_failure_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            pool = MockPool("mock.ttpf")
+            # Failed export (index 5)
+            res = batch.export_texture_entry(pool, 5, out_dir, ttpf_module=MockTtpfModule)
+            self.assertEqual(res["status"], "failed")
+            self.assertFalse((out_dir / "tex_00005.dds").exists())
+            # No temporary file leaked
+            self.assertEqual(len(list(out_dir.glob(".tmp_*"))), 0)
 
     def test_export_texture_entry_uncompressed_and_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -151,17 +166,6 @@ class BatchExportTests(unittest.TestCase):
             res_layout = batch.export_texture_entry(pool, 4, out_dir, ttpf_module=MockTtpfModule)
             self.assertEqual(res_layout["status"], "no_layout")
 
-    def test_cached_entry(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out_dir = Path(tmp)
-            pool = MockPool("mock.ttpf")
-            dds_file = out_dir / "tex_00000.dds"
-            dds_file.write_bytes(b"EXISTING_DATA")
-            res = batch.export_texture_entry(pool, 0, out_dir, skip_existing=True,
-                                             ttpf_module=MockTtpfModule)
-            self.assertEqual(res["status"], "cached")
-            self.assertEqual(res["sha256"], hashlib.sha256(b"EXISTING_DATA").hexdigest())
-
     def test_manifest_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "dds_out"
@@ -169,7 +173,6 @@ class BatchExportTests(unittest.TestCase):
             dummy_pool = Path(tmp) / "test.ttpf"
             dummy_pool.write_bytes(b"DUMMY_POOL")
 
-            # Patch load_tools to return MockTtpfModule
             orig_load = batch.load_tools
             try:
                 batch.load_tools = lambda *args, **kwargs: MockTtpfModule
@@ -178,7 +181,6 @@ class BatchExportTests(unittest.TestCase):
                     out_dir=out_dir,
                     indices=[0, 1, 2, 4],
                     allow_provisional=True,
-                    skip_existing=True,
                     manifest_path=manifest_file,
                 )
                 self.assertEqual(summary["total_textures"], 6)

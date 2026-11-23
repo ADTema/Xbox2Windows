@@ -1,9 +1,11 @@
 """Batch exporter for TTPF (RDS5) texture pools to DDS with manifest generation.
 
 Accepts an RDS5/ETPF texture pool archive and a range of texture indices. Tries
-strict export first and optionally retries with provisional history calibration.
-Records index, dimensions, codec, strict/provisional status, failure reason, and
-output DDS SHA-256 in a structured JSON manifest.
+strict export by default and optionally retries with provisional history
+calibration when --allow-provisional is specified. Writes each new export to a
+temporary path and publishes it only on successful completion. Records index,
+dimensions, codec, strict/provisional status, failure reason, and output DDS
+SHA-256 in a structured JSON manifest.
 """
 
 import argparse
@@ -90,21 +92,14 @@ def load_tools(tools_path: Path | None = None):
 def export_texture_entry(pool, index: int, out_dir: Path,
                          allow_provisional: bool = False,
                          history: dict | None = None,
-                         skip_existing: bool = True,
                          ttpf_module=None) -> dict:
-    """Export one texture entry from the pool to a DDS file and return its manifest entry."""
+    """Export one texture entry from the pool to a DDS file and return its manifest entry.
+
+    Writes to a temporary file first and publishes to dds_path only upon success.
+    """
     dds_name = f"tex_{index:05d}.dds"
     dds_path = out_dir / dds_name
-
-    if skip_existing and dds_path.exists():
-        data = dds_path.read_bytes()
-        return {
-            "index": index,
-            "status": "cached",
-            "file": dds_name,
-            "dds_size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-        }
+    temp_path = out_dir / f".tmp_{index}_{os.getpid()}_{time.time_ns()}.dds"
 
     if ttpf_module is None:
         ttpf_module = load_tools()
@@ -150,49 +145,57 @@ def export_texture_entry(pool, index: int, out_dir: Path,
             "height": h,
         }
 
-    # 1. Try strict export first
-    mode_used = "strict"
-    ret = export_fn(pool, index, str(dds_path), allow_provisional=False)
+    try:
+        # 1. Try strict export first (default)
+        mode_used = "strict"
+        ret = export_fn(pool, index, str(temp_path), allow_provisional=False)
 
-    # 2. Retry with provisional calibration if strict rejected
-    if ret != 0 and allow_provisional:
-        mode_used = "provisional"
-        ret = export_fn(pool, index, str(dds_path), allow_provisional=True, history=history)
+        # 2. Retry with provisional history only when explicitly opted in
+        if ret != 0 and allow_provisional:
+            mode_used = "provisional"
+            ret = export_fn(pool, index, str(temp_path), allow_provisional=True, history=history)
 
-    if ret != 0 or not dds_path.exists():
+        if ret != 0 or not temp_path.exists():
+            return {
+                "index": index,
+                "status": "failed",
+                "format": fmt,
+                "format_name": FORMAT_NAMES.get(fmt, str(fmt)),
+                "width": w,
+                "height": h,
+                "reason": f"export returned exit code {ret}",
+            }
+
+        # Atomic publish: move temporary file to final published path
+        os.replace(temp_path, dds_path)
+        data = dds_path.read_bytes()
         return {
             "index": index,
-            "status": "failed",
+            "status": "success",
+            "mode": mode_used,
             "format": fmt,
-            "format_name": FORMAT_NAMES.get(fmt, str(fmt)),
+            "format_name": FORMAT_NAMES.get(fmt, f"Format {fmt}"),
             "width": w,
             "height": h,
-            "reason": f"export returned exit code {ret}",
+            "mips": mips,
+            "dds_size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "file": dds_name,
         }
-
-    data = dds_path.read_bytes()
-    return {
-        "index": index,
-        "status": "success",
-        "mode": mode_used,
-        "format": fmt,
-        "format_name": FORMAT_NAMES.get(fmt, f"Format {fmt}"),
-        "width": w,
-        "height": h,
-        "mips": mips,
-        "dds_size": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "file": dds_name,
-    }
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def batch_export(pool_path: Path, out_dir: Path,
                  indices: list[int] | None = None,
                  start: int = 0, count: int | None = None,
-                 allow_provisional: bool = True,
+                 allow_provisional: bool = False,
                  history_path: Path | None = None,
                  threads: int = 4,
-                 skip_existing: bool = True,
                  manifest_path: Path | None = None,
                  tools_path: Path | None = None) -> dict:
     """Run batch export over a range of texture pool indices and write manifest.json."""
@@ -223,7 +226,7 @@ def batch_export(pool_path: Path, out_dir: Path,
 
     start_time = time.time()
     manifest_entries: list[dict] = []
-    stats = {"strict": 0, "provisional": 0, "cached": 0, "failed": 0, "skipped": 0}
+    stats = {"strict": 0, "provisional": 0, "failed": 0, "skipped": 0}
 
     def _worker(idx: int) -> dict:
         local_pool = ttpf.Pool(str(pool_path))
@@ -231,7 +234,6 @@ def batch_export(pool_path: Path, out_dir: Path,
             return export_texture_entry(local_pool, idx, out_dir,
                                         allow_provisional=allow_provisional,
                                         history=history_dict,
-                                        skip_existing=skip_existing,
                                         ttpf_module=ttpf)
         finally:
             local_pool.close()
@@ -249,25 +251,12 @@ def batch_export(pool_path: Path, out_dir: Path,
                     stats["strict"] += 1
                 elif mode == "provisional":
                     stats["provisional"] += 1
-            elif st == "cached":
-                stats["cached"] += 1
             elif st in ("no_layout", "uncompressed", "unsupported_codec"):
                 stats["skipped"] += 1
             else:
                 stats["failed"] += 1
 
     pool.close()
-
-    # Merge with existing manifest if updating
-    if manifest_path.exists() and skip_existing:
-        try:
-            old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            merged = {entry["index"]: entry for entry in old_manifest if "index" in entry}
-            for entry in manifest_entries:
-                merged[entry["index"]] = entry
-            manifest_entries = list(merged.values())
-        except Exception:
-            pass
 
     manifest_entries.sort(key=lambda x: x.get("index", 0))
     manifest_path.write_text(json.dumps(manifest_entries, indent=2), encoding="utf-8")
@@ -293,16 +282,12 @@ def main():
                         help="Comma-separated indices or ranges, e.g. '0,8253' or '0-10'")
     parser.add_argument("--start", type=int, default=0, help="Starting index (default: 0)")
     parser.add_argument("--count", type=int, default=None, help="Number of textures to export")
-    parser.add_argument("--allow-provisional", action="store_true", default=True,
-                        help="Allow fitted provisional history if strict export is rejected")
-    parser.add_argument("--strict-only", dest="allow_provisional", action="store_false",
-                        help="Enforce strict mode only; do not retry with provisional history")
+    parser.add_argument("--allow-provisional", action="store_true", default=False,
+                        help="Opt in to fitted provisional history if strict export is rejected")
     parser.add_argument("--history", type=Path, default=None,
                         help="Path to history.json calibration file")
     parser.add_argument("--threads", type=int, default=min(16, os.cpu_count() or 4),
                         help="Number of worker threads")
-    parser.add_argument("--no-skip", dest="skip_existing", action="store_false", default=True,
-                        help="Overwrite existing DDS files instead of skipping")
     parser.add_argument("--manifest", type=Path, default=None,
                         help="Output path for JSON manifest (default: <out>/manifest.json)")
     parser.add_argument("--tools-path", type=Path, default=None,
@@ -323,7 +308,6 @@ def main():
         allow_provisional=args.allow_provisional,
         history_path=args.history,
         threads=args.threads,
-        skip_existing=args.skip_existing,
         manifest_path=args.manifest,
         tools_path=args.tools_path,
     )
