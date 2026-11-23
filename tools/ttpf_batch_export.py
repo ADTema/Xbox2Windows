@@ -110,7 +110,15 @@ def export_texture_entry(pool, index: int, out_dir: Path,
     export_fn = getattr(ttpf_module, "export")
     bc_formats = getattr(ttpf_module, "BC_FORMATS", set(FORMAT_NAMES.keys()))
 
-    a = analyze_fn(pool, index)
+    try:
+        a = analyze_fn(pool, index)
+    except Exception as exc:
+        return {
+            "index": index,
+            "status": "failed",
+            "reason": str(exc),
+        }
+
     if "layout" not in a or "available" not in a:
         return {
             "index": index,
