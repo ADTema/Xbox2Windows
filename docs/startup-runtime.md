@@ -503,7 +503,9 @@ and `XApuDisconnect`, refuses null outputs (`E_POINTER`) and unknown or disconne
 handles (`E_HANDLE`), and queues one completion entry per `XApuEnqueueCommand` call so
 `XApuGetResultCount` and `XApuDequeueResult` retire commands cleanly (zeroing the
 `0x58`-byte result buffer without fabricating unmeasured fields, and returning `E_FAIL`
-when the queue is empty). Default non-permissive mode still traps on every export
+when the queue is empty). The all-zero result is a placeholder: its type field (`+0`) is not a measured
+completion value, and no caller has been observed consuming it. Entries are counters only, so memory does
+not grow per command. Handles are never reused. Default non-permissive mode still traps on every export
 (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
