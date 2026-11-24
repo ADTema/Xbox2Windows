@@ -162,6 +162,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_smem_address_check.py
 ./out/pe-env/bin/python -B tests/startup_stream_fetch_check.py
 ./out/pe-env/bin/python -B tests/compute_entry_layout_check.py
+./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support
