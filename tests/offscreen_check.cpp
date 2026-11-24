@@ -1081,17 +1081,19 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // --startup-image-3d <vs.cso> <ps.cso> <z> <expected rgba bits> [sampler manifest line]
 // The expected value is four comma-separated hex words. Omit the sampler line for point wrap.
 // --startup-image-2d-array takes the same arguments: the texels are two slices of a 2D array and the
-// third coordinate is the slice.
+// third coordinate is the slice. --startup-image-2d-array-mips uses a 4x4 array of two slices with three
+// mip levels whose cells all differ (tests/startup_image_3d.cpp).
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
-    const bool array = std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
+    const bool mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
+    const bool array = mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
     const float z = std::stof(ctx.argv[5]);
     std::uint32_t expected[4]{};
     if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array);
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1221,6 +1223,7 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},

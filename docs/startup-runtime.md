@@ -328,11 +328,16 @@ These are measured on one executable; treat them as hypotheses for others.
   a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
   (`ctest --preset release --no-tests=error -R "^startup_image_3d_"`).
-- **Explicit mip loads.** For 2D and 3D textures, `image_load_mip` passes the final address
-  register to `Texture.Load` as the mip level. Ordinary `image_load` still reads mip zero.
+- **Explicit mip loads.** For 2D textures, 2D arrays and 3D textures, `image_load_mip` passes the final
+  address register to `Texture.Load` as the mip level (`int4(x, y, slice, mip)` for an array, whose four
+  registers are x, y, slice and mip). Ordinary `image_load` still reads mip zero.
   The source-built 2D draw reads distinct colors from mips zero and two, and a wrong-mip
   reference must fail at pixel (0, 0). The 3D case checks nonconsecutive address registers
   during translation. Run `ctest --preset release --no-tests=error -R '^startup_image_load_mip_' -V`.
+  The array case is checked by `startup_image_2d_array_`: translation controls (also run on Linux) and a
+  draw of a 4x4 texture of two slices with three mips whose cells all differ, with mutants that exchange
+  slice and mip, ignore the mip, or shift it by one. The draw was written without a Windows run. Cube maps
+  are still refused for `image_load_mip`.
 - **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
   `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
   the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`
@@ -340,8 +345,8 @@ These are measured on one executable; treat them as hypotheses for others.
   Two source-built pixel stages draw one texel of a 2x2 texture with two slices on WARP and
   hardware with DXC and FXC; a slice fixed to 0 and exchanged coordinates fail it
   (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Cube, multisampled
-  and 1D images are still refused. Not covered: an array with mip levels in `image_load`
-  (`image_load_mip`), and binding a single-slice 2D view to an array declaration in the draw path.
+  and 1D images are still refused. Not covered: binding a single-slice 2D view to an array declaration
+  in the draw path.
 - **Flat parameters.** `v_interp_mov_f32` reads a `nointerpolation uint4` copy written from the
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost

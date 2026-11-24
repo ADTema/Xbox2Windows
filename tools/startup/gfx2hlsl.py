@@ -707,10 +707,10 @@ class Stage:
             if len(cs) != (4 if three else 3):
                 raise Unsupported('image_sample_l with %d address registers' % len(cs))
             lod, cs = cs[-1], cs[:-1]
-        if how == 'load_mip' and dim == 'SQ_RSRC_IMG_2D_ARRAY':
-            raise Unsupported('image_load_mip on a 2D array')
         tex = self.pipe.resource(self.descriptor(ops[2]), kinds[dim])
         if how in ('load', 'load_mip'):
+            # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
+            # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
             axes = 3 if three else 2
             mip = '0'
             if how == 'load_mip':
