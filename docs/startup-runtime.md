@@ -78,6 +78,19 @@ socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do no
 `tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
 
+## Launcher check
+
+`tests/startup_launch_check.py` (ctest `startup_launch`) drives `tools/startup/launch.py` on the
+source-built `tests/startup_launch_probe.cpp`. A finished run reports the child's exit code and saves
+its stdout, stderr and trap log; a child that outlives `--timeout` is terminated; `--memory-gib` and
+`--max-processes` stop an over-limit allocation and a helper process, and the same requests succeed
+under larger limits; a missing executable is reported instead of looking like a finished run. No GPU
+and no game files are needed, and the `pr` preset builds the probe and runs the test:
+
+```powershell
+ctest --preset release --no-tests=error -R '^startup_launch$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
