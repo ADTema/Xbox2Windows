@@ -24,6 +24,21 @@ bool tiled_bc_srv(const D3D12_RESOURCE_DESC& r)
 
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
+    if (x2w_startup::bc64::supports(r)) {
+        if (v.Format != r.Format || v.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)
+            return false;
+        if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+            const auto& a = v.Texture2DArray;
+            return r.DepthOrArraySize == 2 && a.FirstArraySlice < r.DepthOrArraySize && a.ArraySize > 0 &&
+                   a.ArraySize <= r.DepthOrArraySize - a.FirstArraySlice && a.MostDetailedMip < r.MipLevels &&
+                   a.MipLevels > 0 && a.MipLevels <= r.MipLevels - a.MostDetailedMip &&
+                   a.PlaneSlice == 0 && a.ResourceMinLODClamp == 0;
+        }
+        return r.DepthOrArraySize == 1 && v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+               v.Texture2D.MostDetailedMip < r.MipLevels && v.Texture2D.MipLevels > 0 &&
+               v.Texture2D.MipLevels <= r.MipLevels - v.Texture2D.MostDetailedMip &&
+               !v.Texture2D.PlaneSlice && v.Texture2D.ResourceMinLODClamp == 0;
+    }
     return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Width && r.Height &&
            r.DepthOrArraySize == 1 && r.MipLevels == 1 && r.SampleDesc.Count == 1 && r.SampleDesc.Quality == 0 &&
            (r.Format == DXGI_FORMAT_R8_UNORM || tiled_bc_srv(r)) && v.Format == r.Format && !(r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
@@ -83,7 +98,7 @@ std::unordered_multimap<u64, Wrapper*> tiled_srv_addresses;
 
 Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
-    const auto bytes = x2w_startup::Bc16Surface(desc).size();
+    const auto bytes = x2w_startup::bc64::supports(desc) ? x2w_startup::bc64::Chain(desc).bytes() : x2w_startup::Bc16Surface(desc).size();
     // The transient upload ring accepts individual copies up to 64 MiB.
     if (bytes > (64ull << 20) || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
@@ -122,6 +137,7 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
             if (first_calls(failures, 8)) log("x2w-d3d12 failed to materialize tiled memory SRV: 0x%08lx", hr);
             return nullptr;
         }
+        x2w_startup::mark_packed_stand_in(sampled.desktop.Get(), desktop_format(sampled.desc.Format));
     }
     return sampled.desktop.Get();
 }
@@ -136,7 +152,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         if (first_calls(refused, 8)) log("x2w-d3d12 Device::slot70 unsupported memory SRV arguments");
         return;
     }
-    Wrapper* texture = tiled_bc_srv(*resource) ? publish_tiled_texture(self, input->address, *resource)
+    Wrapper* texture = (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
                                               : existing_memory_texture(input->address, *resource);
     if (!texture) {
         if (first_calls(refused, 8)) log("x2w-d3d12 Device::slot70 unavailable texture at the supplied base and layout");

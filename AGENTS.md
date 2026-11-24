@@ -102,6 +102,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/resource_root_check.py
 ./out/pe-env/bin/python -B tests/bcpack_check.py
 ./out/pe-env/bin/python -B tests/bcpack_symbols_check.py
+./out/pe-env/bin/python -B tests/bcpack_tables_check.py
 ./out/pe-env/bin/python -B tests/bc7_blocks_check.py
 ./out/pe-env/bin/python -B tests/bc7_tiles_check.py
 ./out/pe-env/bin/python -B tests/gfx10_texture_roundtrip_check.py
@@ -135,7 +136,10 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/rectlist_topology_check.py
 ./out/pe-env/bin/python -B tests/startup_sampler_heap_check.py
 ./out/pe-env/bin/python -B tests/startup_image_3d_check.py
+./out/pe-env/bin/python -B tests/startup_host_cpu_check.py
 ./out/pe-env/bin/python -B tests/startup_translator_check.py
+./out/pe-env/bin/python -B tests/startup_flat_param_check.py
+./out/pe-env/bin/python -B tests/startup_inline_sampler_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support

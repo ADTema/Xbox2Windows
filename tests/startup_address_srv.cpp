@@ -115,3 +115,115 @@ int draw_bc_address_srvs(void* guest, void* list)
     }
     return 0;
 }
+
+// The backing is produced by XG CopyIntoSubresource from a source-built block texture.
+int draw_bc_chain(void* guest, void* list)
+{
+    wchar_t path[MAX_PATH]{};
+    const DWORD size = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", path, MAX_PATH);
+    if (!size || size >= MAX_PATH) return 43;
+    const bool array = GetEnvironmentVariableW(L"X2W_TEST_BC_ARRAY", nullptr, 0) != 0;
+    const bool rectangular = GetEnvironmentVariableW(L"X2W_TEST_BC_RECT", nullptr, 0) != 0;
+    const UINT height = rectangular ? 512 : 1024;
+    const UINT16 slices = array ? 2 : 1;
+    const UINT16 mips = array ? 9 : 6;
+    const UINT bytes = slices * (rectangular ? 0xc0000 : 0x160000);
+    static std::array<char, 2 * 0x160000 + 0xffff> storage{};
+    char* backing = reinterpret_cast<char*>((ptr(storage.data()) + 0xffff) & ~Word{0xffff});
+    std::ifstream input(path, std::ios::binary);
+    if (!input.read(backing, bytes) || input.peek() != std::char_traits<char>::eof()) return 43;
+    const bool bc5 = GetEnvironmentVariableW(L"X2W_TEST_BC5", nullptr, 0) != 0;
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1024, height, slices, mips,
+        bc5 ? DXGI_FORMAT_BC5_UNORM : DXGI_FORMAT_BC7_UNORM, {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(0x109),
+        D3D12_RESOURCE_FLAG_NONE};
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    ViewAt v{};
+    v.address = ptr(backing);
+    v.view.Format = desc.Format;
+    v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (array) {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        v.view.Texture2DArray.ArraySize = slices;
+        v.view.Texture2DArray.MipLevels = mips;
+    } else {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.view.Texture2D.MipLevels = mips;
+    }
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    invoke(list, 12, 3, 1);
+    return 0;
+}
+
+namespace {
+struct PlacedPair {
+    std::array<DWORD*, 2> memory{};
+    std::array<void*, 2> resource{};
+    bool rebind{};
+} placed_pair;
+}
+
+int draw_placed_vertices(ID3D12Device* desktop, void* guest, void* list)
+{
+    auto& p = placed_pair;
+    D3D12_FEATURE_DATA_EXISTING_HEAPS heaps{};
+    if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &heaps, sizeof(heaps))) || !heaps.Supported)
+        return 77;
+    if (!p.memory[0]) {
+        constexpr auto flags = MEM_RESERVE | MEM_COMMIT;
+        for (Word base = 0x1600000000ull; base < 0x1700000000ull; base += 16ull << 20) {
+            auto* low = static_cast<DWORD*>(VirtualAlloc(reinterpret_cast<void*>(base), 65536, flags, PAGE_READWRITE));
+            if (!low) continue;
+            auto* high = static_cast<DWORD*>(VirtualAlloc(reinterpret_cast<void*>(base + (1ull << 40)), 65536, flags, PAGE_READWRITE));
+            if (high) { p.memory = {low, high}; break; }
+            VirtualFree(low, 0, MEM_RELEASE);
+        }
+        if (!p.memory[0]) return 45;
+    }
+    for (UINT i = 0; i < 2; ++i) {
+        if (p.resource[i]) continue;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = p.rebind && i ? 516 : 260;
+        desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const auto hr = static_cast<HRESULT>(invoke(guest, 133, ptr(p.memory[i]), ptr(&desc),
+            D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&p.resource[i])));
+        if (FAILED(hr) || !p.resource[i] || invoke(p.resource[i], 11) != ptr(p.memory[i])) return 46;
+    }
+    const UINT hi = p.rebind ? 128 : 64;
+    p.memory[0][64] = 10; p.memory[1][hi] = 20;
+    auto draw = [&](LONG column, DWORD* word, UINT bytes) {
+        const D3D12_VERTEX_BUFFER_VIEW view{ptr(word), bytes, 4};
+        invoke(list, 48, 0, 1, ptr(&view));
+        const D3D12_RECT rect{column, 0, column + 1, 4};
+        invoke(list, 22, 1, ptr(&rect));
+        invoke(list, 12, 3, 1);
+    };
+    for (LONG col = 0; col < 8; ++col) {
+        switch (col % 4) {
+        case 0: draw(col, p.memory[0] + 64, 4); break;
+        case 1: draw(col, p.memory[1] + hi, 4); break;
+        case 2: draw(col, p.memory[1] + hi, 8); break; // Reject before requesting data; shader only loads byte 0.
+        case 3: draw(col, p.rebind ? p.memory[1] + 64 : p.memory[0] + 64, 4); break;
+        }
+    }
+    // Legitimate writes to the last DWORD of each buffer, before queue submission.
+    // A snapshot made when recording the list would publish the previous values.
+    p.memory[0][64] = p.rebind ? 49 : 41;
+    p.memory[1][hi] = p.rebind ? 153 : 135;
+    if (p.rebind) p.memory[1][64] = 179; // Reused address overlaps the retired smaller registration.
+    return 0;
+}
+
+void release_placed_vertices(bool done)
+{
+    auto& p = placed_pair;
+    invoke(p.resource[1], 2);
+    p.resource[1] = nullptr;
+    p.rebind = true;
+    if (done) {
+        invoke(p.resource[0], 2);
+        p.resource[0] = nullptr;
+    }
+}
