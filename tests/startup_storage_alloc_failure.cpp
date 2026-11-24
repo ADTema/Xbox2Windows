@@ -22,6 +22,9 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <cwchar>
+#include <string>
 #include <vector>
 
 namespace {
@@ -31,6 +34,10 @@ constexpr int skipped = 77;
 constexpr SIZE_T commit_headroom = SIZE_T{256} << 20;     // job limit above the current commit
 constexpr unsigned oversized_inflated = 1536u << 20;       // declared inflated size, above the limit
 constexpr DWORD completion_timeout_ms = 15000;
+// The submit threads start before commit runs out; a stack committed at creation is all they will have.
+constexpr SIZE_T submit_thread_stack = SIZE_T{256} << 10;
+
+void guard_this_thread();
 
 struct Object { void** vtable; };
 using GetFactoryFn = long(__stdcall*)(const void*, void**);
@@ -73,6 +80,7 @@ struct QueueCall {
     static DWORD WINAPI run(void* parameter)
     {
         auto* self = static_cast<QueueCall*>(parameter);
+        guard_this_thread();
         WaitForSingleObject(self->go, completion_timeout_ms);
         if (self->enqueue_status_index >= 0) {
             reinterpret_cast<EnqueueStatusFn>(self->queue->vtable[4])(
@@ -149,14 +157,432 @@ bool cap_commit()
            AssignProcessToJobObject(job, GetCurrentProcess());
 }
 
+
+// ---------------------------------------------------------------------------------------------------
+// Diagnostics for crashes in this process. A failure in the low-commit path has been seen as an access
+// violation or a stack overflow whose exception code and place were not recorded, so the fixture
+// records both. Nothing here allocates and the buffers are static: when the process is out of commit a
+// handler that allocates, or needs more stack than is already committed, would hide the original fault.
+// SetThreadStackGuarantee reserves room on each thread for the filter to run after a stack overflow.
+// The filter prints the code, the faulting address, and the unwound frames (module + offset) to stderr
+// and ends the process with crash_exit_code. The checks below pass or fail without it.
+constexpr DWORD crash_exit_code = 0xE1410;
+constexpr ULONG filter_stack_guarantee = 64 * 1024;
+
+char crash_line[256];
+char crash_module[MAX_PATH];
+CONTEXT crash_context;
+
+std::size_t put_text(std::size_t at, const char* text)
+{
+    while (*text && at + 1 < sizeof crash_line) crash_line[at++] = *text++;
+    return at;
+}
+
+std::size_t put_hex(std::size_t at, unsigned long long value)
+{
+    char digits[16];
+    int count = 0;
+    do {
+        digits[count++] = "0123456789abcdef"[value & 0xF];
+        value >>= 4;
+    } while (value && count < 16);
+    at = put_text(at, "0x");
+    while (count && at + 1 < sizeof crash_line) crash_line[at++] = digits[--count];
+    return at;
+}
+
+void write_crash_line(std::size_t length)
+{
+    DWORD written = 0;
+    crash_line[length < sizeof crash_line ? length : sizeof crash_line - 1] = '\n';
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), crash_line, static_cast<DWORD>(length + 1), &written, nullptr);
+}
+
+std::size_t put_place(std::size_t at, unsigned long long pc)
+{
+    HMODULE module = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(static_cast<std::uintptr_t>(pc)), &module) &&
+        GetModuleFileNameA(module, crash_module, MAX_PATH)) {
+        const char* name = crash_module;
+        for (const char* p = crash_module; *p; ++p)
+            if (*p == '\\' || *p == '/') name = p + 1;
+        at = put_text(at, name);
+        return put_hex(put_text(at, "+"), pc - reinterpret_cast<std::uintptr_t>(module));
+    }
+    return put_text(at, "(no module)");
+}
+
+LONG WINAPI report_crash(EXCEPTION_POINTERS* info)
+{
+    const EXCEPTION_RECORD* record = info->ExceptionRecord;
+    std::size_t at = put_text(0, "x2w-test crash: code=");
+    at = put_hex(at, record->ExceptionCode);
+    at = put_hex(put_text(at, " address="), reinterpret_cast<std::uintptr_t>(record->ExceptionAddress));
+    if (record->NumberParameters >= 2 && record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        at = put_text(at, record->ExceptionInformation[0] == 1 ? " write-to=" : " read-from=");
+        at = put_hex(at, record->ExceptionInformation[1]);
+    }
+    write_crash_line(at);
+#if defined(_M_X64) || defined(__x86_64__)
+    crash_context = *info->ContextRecord;
+    for (int frame = 0; frame < 8; ++frame) {
+        const unsigned long long pc = crash_context.Rip;
+        at = put_hex(put_text(put_hex(put_text(0, "  frame "), static_cast<unsigned>(frame)), " rip="), pc);
+        at = put_place(put_text(at, " "), pc);
+        write_crash_line(at);
+        DWORD64 image_base = 0;
+        RUNTIME_FUNCTION* function = RtlLookupFunctionEntry(pc, &image_base, nullptr);
+        if (!function) break;  // a leaf without unwind data: stop rather than read the stack blindly
+        void* handler_data = nullptr;
+        DWORD64 frame_pointer = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, pc, function, &crash_context, &handler_data, &frame_pointer,
+                         nullptr);
+        if (!crash_context.Rip) break;
+    }
+#endif
+    TerminateProcess(GetCurrentProcess(), crash_exit_code);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void guard_this_thread()
+{
+    ULONG guarantee = filter_stack_guarantee;
+    SetThreadStackGuarantee(&guarantee);
+}
+
+void install_crash_report()
+{
+    SetUnhandledExceptionFilter(report_crash);
+    guard_this_thread();
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Deterministic worker-creation failure. The stand-in starts its queue worker with CreateThread (first
+// with a committed stack, then once more with the default one). The fixture replaces that import in the
+// loaded stand-in so that exactly the chosen calls fail with ERROR_COMMITMENT_LIMIT (1455), the code a
+// system under commit pressure returns. No memory pressure is needed, so the same sequence runs on every
+// machine and every build type.
+constexpr DWORD commitment_limit_error = 1455;  // ERROR_COMMITMENT_LIMIT
+constexpr long out_of_memory_hr = static_cast<long>(0x8007000E);
+constexpr long pending_hr = static_cast<long>(0x8000000A);
+
+using CreateThreadFn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+CreateThreadFn real_create_thread = nullptr;
+volatile LONG fail_next_calls = 0;  // the next CreateThread calls that fail with 1455
+volatile LONG create_thread_calls = 0;
+volatile LONG create_thread_failures = 0;
+
+HANDLE WINAPI faulting_create_thread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack, LPTHREAD_START_ROUTINE start,
+                                     LPVOID parameter, DWORD flags, LPDWORD id)
+{
+    InterlockedIncrement(&create_thread_calls);
+    for (LONG left = fail_next_calls; left > 0; left = fail_next_calls) {
+        if (InterlockedCompareExchange(&fail_next_calls, left - 1, left) != left) continue;
+        InterlockedIncrement(&create_thread_failures);
+        SetLastError(commitment_limit_error);
+        return nullptr;
+    }
+    return real_create_thread(attributes, stack, start, parameter, flags, id);
+}
+
+// Points the import slots of CreateThread in "module" at the replacement. Returns how many were changed.
+int replace_import(HMODULE module, const char* function, void* replacement, void** original)
+{
+    auto* base = reinterpret_cast<unsigned char*>(module);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    int changed = 0;
+    if (!directory.VirtualAddress) return 0;
+    for (auto* entry = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + directory.VirtualAddress); entry->Name; ++entry) {
+        auto* names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + (entry->OriginalFirstThunk ? entry->OriginalFirstThunk : entry->FirstThunk));
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA*>(base + entry->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            auto* name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(name->Name), function) != 0) continue;
+            DWORD old = 0;
+            if (!VirtualProtect(&slots->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) return changed;
+            if (!*original) *original = reinterpret_cast<void*>(slots->u1.Function);
+            slots->u1.Function = reinterpret_cast<ULONG_PTR>(replacement);
+            VirtualProtect(&slots->u1.Function, sizeof(void*), old, &old);
+            ++changed;
+        }
+    }
+    return changed;
+}
+
+// A fence that notes, when it is signaled, which of the first status slots were already complete. A
+// status entry enqueued before a signal must be complete when the signal runs.
+struct OrderedFence {
+    void** vtable;
+    Object* status;
+    volatile LONG signaled;
+    u64 value;
+    bool complete_at_signal[4];
+    long hr_at_signal[4];
+    static volatile LONG order;
+    LONG position;
+    static long __stdcall signal(void* self, u64 value)
+    {
+        auto* fence = static_cast<OrderedFence*>(self);
+        for (unsigned i = 0; i < 4; ++i) {
+            fence->complete_at_signal[i] =
+                reinterpret_cast<IsCompleteFn>(fence->status->vtable[3])(fence->status, i);
+            fence->hr_at_signal[i] = reinterpret_cast<GetHResultFn>(fence->status->vtable[4])(fence->status, i);
+        }
+        fence->value = value;
+        fence->position = InterlockedIncrement(&order);
+        InterlockedExchange(&fence->signaled, 1);
+        return 0;
+    }
+};
+volatile LONG OrderedFence::order = 0;
+
+void* ordered_fence_vtable[11] = {};
+
+struct WorkerQueue {
+    Object* queue = nullptr;
+    Object* status = nullptr;
+
+    bool create(Object* factory, const void* description, const char* name)
+    {
+        void* status_ptr = nullptr;
+        void* queue_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 4, name, nullptr, &status_ptr) != 0 ||
+            reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue_ptr) != 0)
+            return false;
+        status = static_cast<Object*>(status_ptr);
+        queue = static_cast<Object*>(queue_ptr);
+        return true;
+    }
+    void enqueue_request(std::vector<unsigned char>& destination, const std::vector<unsigned char>& stream,
+                         unsigned inflated)
+    {
+        unsigned char bytes[0x48] = {};
+        *reinterpret_cast<u64*>(bytes + 0x00) = 1 | 0x400000;
+        *reinterpret_cast<unsigned char**>(bytes + 0x08) = destination.data();
+        *reinterpret_cast<unsigned*>(bytes + 0x18) = static_cast<unsigned>(destination.size());
+        *reinterpret_cast<const unsigned char**>(bytes + 0x20) = stream.data();
+        *reinterpret_cast<unsigned*>(bytes + 0x30) = static_cast<unsigned>(stream.size());
+        *reinterpret_cast<unsigned*>(bytes + 0x38) = inflated;
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, bytes);
+    }
+    void enqueue_status(unsigned index) { reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, index); }
+    void enqueue_signal(OrderedFence& fence, u64 value)
+    {
+        fence.vtable = ordered_fence_vtable;
+        fence.status = status;
+        reinterpret_cast<EnqueueSignalFn>(queue->vtable[5])(queue, &fence, value);
+    }
+    void submit() { reinterpret_cast<SubmitFn>(queue->vtable[6])(queue); }
+    bool complete(unsigned index) const { return reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, index); }
+    long hresult(unsigned index) const { return reinterpret_cast<GetHResultFn>(status->vtable[4])(status, index); }
+    bool wait_complete(unsigned index) const
+    {
+        const DWORD start = GetTickCount();
+        while (!complete(index)) {
+            if (GetTickCount() - start > completion_timeout_ms) return false;
+            Sleep(2);
+        }
+        return true;
+    }
+};
+
+bool wait_signaled(const OrderedFence& fence)
+{
+    const DWORD start = GetTickCount();
+    while (!fence.signaled) {
+        if (GetTickCount() - start > completion_timeout_ms) return false;
+        Sleep(2);
+    }
+    return true;
+}
+
+bool injected_check(bool ok, const char* scenario, const char* what)
+{
+    if (!ok) std::fprintf(stderr, "worker creation failure [%s]: %s\n", scenario, what);
+    return ok;
+}
+
+struct InjectedInputs {
+    Object* factory;
+    const void* description;
+    const std::vector<unsigned char>* stream;
+    const std::vector<unsigned char>* plain;
+};
+
+void arm_failures(long count)
+{
+    InterlockedExchange(&create_thread_calls, 0);
+    InterlockedExchange(&create_thread_failures, 0);
+    InterlockedExchange(&fail_next_calls, count);
+}
+
+// Exactly three Enqueue calls each find the worker missing (each tries both CreateThread variants, so six
+// calls fail with 1455); the fourth attempt, at Submit, succeeds. Everything enqueued before runs in order.
+bool scenario_three_failures_then_start(const InjectedInputs& in)
+{
+    const char* const name = "three failures then start";
+    WorkerQueue q;
+    if (!injected_check(q.create(in.factory, in.description, "Injected1"), name, "cannot create the queue")) return false;
+    const auto& plain = *in.plain;
+    std::vector<unsigned char> destination(plain.size(), 0xAA);
+    OrderedFence fence{};
+    arm_failures(6);
+    q.enqueue_request(destination, *in.stream, static_cast<unsigned>(plain.size()));
+    q.enqueue_status(0);
+    q.enqueue_signal(fence, 0xA1);
+    bool ok = injected_check(create_thread_calls == 6 && create_thread_failures == 6, name,
+                             "Enqueue did not try (and fail) exactly three times with two CreateThread calls each");
+    ok = injected_check(!q.complete(0) && !fence.signaled, name, "an entry completed before Submit") && ok;
+    q.submit();
+    ok = injected_check(q.wait_complete(0) && wait_signaled(fence), name, "status or fence never completed") && ok;
+    ok = injected_check(create_thread_calls == 7 && create_thread_failures == 6, name,
+                        "the worker was not started by the first CreateThread call that was allowed to succeed") && ok;
+    ok = injected_check(q.hresult(0) == 0 && destination == plain, name, "the request did not run after the worker started") && ok;
+    ok = injected_check(fence.value == 0xA1 && fence.complete_at_signal[0], name, "the fence ran before its status entry") && ok;
+    arm_failures(0);
+    return ok;
+}
+
+// The committed-stack CreateThread fails with 1455 and the default-stack one succeeds: the queue runs.
+bool scenario_default_stack_fallback(const InjectedInputs& in)
+{
+    const char* const name = "default stack fallback";
+    WorkerQueue q;
+    if (!injected_check(q.create(in.factory, in.description, "Injected2"), name, "cannot create the queue")) return false;
+    const auto& plain = *in.plain;
+    std::vector<unsigned char> destination(plain.size(), 0xAA);
+    OrderedFence fence{};
+    arm_failures(1);
+    q.enqueue_request(destination, *in.stream, static_cast<unsigned>(plain.size()));
+    q.enqueue_status(0);
+    q.enqueue_signal(fence, 0xB2);
+    q.submit();
+    bool ok = injected_check(q.wait_complete(0) && wait_signaled(fence), name, "status or fence never completed");
+    ok = injected_check(create_thread_calls == 2 && create_thread_failures == 1, name, "unexpected CreateThread sequence") && ok;
+    ok = injected_check(q.hresult(0) == 0 && destination == plain && fence.value == 0xB2, name, "the request did not run") && ok;
+    arm_failures(0);
+    return ok;
+}
+
+std::string read_text_file(const wchar_t* path)
+{
+    std::string text;
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return text;
+    char chunk[512];
+    DWORD got = 0;
+    while (ReadFile(file, chunk, sizeof chunk, &got, nullptr) && got) text.append(chunk, got);
+    CloseHandle(file);
+    return text;
+}
+
+bool scenario_worker_never_starts(const InjectedInputs& in)
+{
+    const char* const name = "worker never starts";
+    WorkerQueue q;
+    if (!injected_check(q.create(in.factory, in.description, "Injected3"), name, "cannot create the queue")) return false;
+    const auto& plain = *in.plain;
+    const unsigned inflated = static_cast<unsigned>(plain.size());
+    std::vector<unsigned char> first(plain.size(), 0xAA), second(plain.size(), 0xAA), third(plain.size(), 0xAA);
+    OrderedFence fence_a{}, fence_b{}, fence_c{};
+    arm_failures(100000);
+
+    // Batch one: request, status, signal, request, status, signal.
+    q.enqueue_request(first, *in.stream, inflated);
+    q.enqueue_status(0);
+    q.enqueue_signal(fence_a, 1);
+    q.enqueue_request(second, *in.stream, inflated);
+    q.enqueue_status(1);
+    q.enqueue_signal(fence_b, 2);
+    bool ok = injected_check(!q.complete(0) && !q.complete(1) && !fence_a.signaled && !fence_b.signaled, name,
+                             "an entry completed before Submit");
+    q.submit();
+    ok = injected_check(q.complete(0) && q.complete(1) && fence_a.signaled && fence_b.signaled, name,
+                        "Submit returned with a status entry or a fence left pending") && ok;
+    ok = injected_check(q.hresult(0) == out_of_memory_hr && q.hresult(1) == out_of_memory_hr, name,
+                        "a status entry did not report E_OUTOFMEMORY") && ok;
+    ok = injected_check(fence_a.value == 1 && fence_b.value == 2 && fence_a.position < fence_b.position, name,
+                        "the fences were not signaled in queue order") && ok;
+    ok = injected_check(fence_a.complete_at_signal[0] && !fence_a.complete_at_signal[1] &&
+                            fence_a.hr_at_signal[1] == pending_hr && fence_b.complete_at_signal[1],
+                        name, "a fence ran before its status entry, or after the next one") && ok;
+    ok = injected_check(first == std::vector<unsigned char>(plain.size(), 0xAA) &&
+                            second == std::vector<unsigned char>(plain.size(), 0xAA),
+                        name, "a failed request changed its destination") && ok;
+    ok = injected_check(create_thread_calls > 0 && create_thread_calls == create_thread_failures, name,
+                        "a thread was created while every CreateThread call was set to fail") && ok;
+
+    // Batch two on the same queue, which still has no worker; then an empty Submit.
+    q.enqueue_request(third, *in.stream, inflated);
+    q.enqueue_status(2);
+    q.enqueue_signal(fence_c, 3);
+    q.submit();
+    q.submit();
+    ok = injected_check(q.complete(2) && q.hresult(2) == out_of_memory_hr && fence_c.signaled && fence_c.value == 3 &&
+                            fence_c.complete_at_signal[2] && fence_c.position > fence_b.position,
+                        name, "a later batch did not fail in order on the same queue") && ok;
+
+    // Threads can be created again: the same queue starts its worker and serves a request.
+    arm_failures(0);
+    std::vector<unsigned char> recovered(plain.size(), 0xAA);
+    q.enqueue_request(recovered, *in.stream, inflated);
+    q.enqueue_status(3);
+    q.submit();
+    ok = injected_check(q.wait_complete(3) && q.hresult(3) == 0 && recovered == plain, name,
+                        "the queue did not recover once CreateThread worked again") && ok;
+    return ok;
+}
+
+// Runs every injected scenario on the loaded stand-in.
+bool run_injected_scenarios(const InjectedInputs& in, HMODULE library)
+{
+    ordered_fence_vtable[10] = reinterpret_cast<void*>(&OrderedFence::signal);
+    void* original = nullptr;
+    if (replace_import(library, "CreateThread", reinterpret_cast<void*>(&faulting_create_thread), &original) == 0 ||
+        !original) {
+        std::fprintf(stderr, "cannot intercept CreateThread in the stand-in\n");
+        return false;
+    }
+    real_create_thread = reinterpret_cast<CreateThreadFn>(original);
+
+    // The first scenario also reads the stand-in's own log: each failed Enqueue notes the code it was given.
+    wchar_t log_path[MAX_PATH] = {};
+    wchar_t temp_dir[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, temp_dir);
+    std::swprintf(log_path, MAX_PATH, L"%lsx2w_worker_failure_%lu.log", temp_dir, GetCurrentProcessId());
+    DeleteFileW(log_path);
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path);
+    bool ok = scenario_three_failures_then_start(in);
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", nullptr);
+    const std::string log_text = read_text_file(log_path);
+    DeleteFileW(log_path);
+    std::size_t noted = 0;
+    for (std::size_t at = 0; (at = log_text.find("queue worker not started: error 1455", at)) != std::string::npos; ++at) ++noted;
+    ok = injected_check(noted == 3, "three failures then start", "the three failures were not logged with error 1455") && ok;
+
+    return ok && scenario_default_stack_fallback(in) && scenario_worker_never_starts(in);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: startup_storage_alloc_failure XCRDAPI.dll\n");
+    install_crash_report();
+    if (argc < 2 || argc > 3 || (argc == 3 && std::strcmp(argv[2], "--injected-only") != 0 &&
+                                 std::strcmp(argv[2], "--crash-report-demo") != 0)) {
+        std::fprintf(stderr, "usage: startup_storage_alloc_failure XCRDAPI.dll [--injected-only]\n");
         return 2;
     }
+    if (argc == 3 && std::strcmp(argv[2], "--crash-report-demo") == 0) {
+        *static_cast<volatile int*>(nullptr) = 1;  // shows what the crash report prints (exit code 0xE1410)
+    }
+    const bool injected_only = argc == 3 && std::strcmp(argv[2], "--injected-only") == 0;
     HMODULE library = LoadLibraryA(argv[1]);
     auto* get_factory = library ? reinterpret_cast<GetFactoryFn>(GetProcAddress(library, "DStorageGetFactory")) : nullptr;
     void* factory_ptr = nullptr;
@@ -188,6 +614,14 @@ int main(int argc, char** argv)
     if (!queue.run(first, stream, plain_size, 0, hr) || hr != 0 || first != plain) {
         std::fprintf(stderr, "the baseline request did not succeed (hr 0x%08lx)\n", static_cast<unsigned long>(hr));
         return 1;
+    }
+
+    // Worker creation fails with ERROR_COMMITMENT_LIMIT without any real memory pressure.
+    const InjectedInputs injected{factory, description, &stream, &plain};
+    if (!run_injected_scenarios(injected, library)) return 1;
+    if (injected_only) {
+        std::puts("worker creation failures completed every status and fence in order");
+        return 0;
     }
 
     if (!cap_commit()) {
@@ -243,8 +677,8 @@ int main(int argc, char** argv)
     first_submit.queue = second_submit.queue = recovery_queue.queue;
     second_submit.status = recovery_queue.status;
     second_submit.enqueue_status_index = 2;
-    HANDLE first_thread = CreateThread(nullptr, 0, QueueCall::run, &first_submit, 0, nullptr);
-    HANDLE second_thread = CreateThread(nullptr, 0, QueueCall::run, &second_submit, 0, nullptr);
+    HANDLE first_thread = CreateThread(nullptr, submit_thread_stack, QueueCall::run, &first_submit, 0, nullptr);
+    HANDLE second_thread = CreateThread(nullptr, submit_thread_stack, QueueCall::run, &second_submit, 0, nullptr);
     if (!first_thread || !second_thread || !first_submit.go || !second_submit.go) {
         std::fprintf(stderr, "cannot start the submit threads\n");
         return 1;
