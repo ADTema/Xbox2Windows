@@ -3166,6 +3166,19 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 
 Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`. On Windows 11 build 26300.9974, the Intel Arc 140T (32.0.101.8132) matched all 320 words after one and after three indexed groups, with zero D3D12 debug errors and warnings.
 
+### Entry registers from COMPUTE_PGM_RSRC2
+
+With `--rsrc2 <COMPUTE_PGM_RSRC2>` (`rsrc2=` in `lower`), the translation places the entry registers itself instead of taking `--group-reg*`. On gfx10 a compute wave receives:
+
+- **User SGPRs:** `USER_SGPR`, bits 5:1. The table pointer must lie within them.
+- **Group IDs:** one SGPR for each group ID enabled by `TGID_X/Y/Z_EN` (bits 7–9), in X, Y, Z order.
+- **TG_SIZE:** one SGPR when `TG_SIZE_EN` (bit 10) is set.
+- **Local IDs:** `TIDIG_COMP_CNT + 1` VGPRs from v0 (bits 12:11), one local ID per VGPR. A local Y or Z that `TIDIG_COMP_CNT` does not enable is not bound.
+
+The TG_SIZE word is the group's wave count in bits 5:0 and the wave's index within the group in bits 11:6. This is the layout Mesa's AMD compiler reads on GFX6–10 (`load_num_subgroups`, `load_subgroup_id`). The translation computes it from `SV_GroupIndex` and the wave size given with `--wave-size 32|64`. Mesa reads the wave index from bits 24:20 on GFX10.3 and later; the translation does not write that field, and no console readback has settled which field titles read.
+
+`tests/compute_entry_layout_check.py` uses source-built gfx1013 programs that store each thread's dispatch index and its TG_SIZE register. The cases cover one wave, two and four waves at wave32, and a partial last wave at wave32 and at wave64. The expected words come from the definition above. The same programs with the wave index at bit 20 must mismatch. Without `rsrc2`, a TIDIG count below Y, a table outside the user SGPRs, or `rsrc2` combined with group registers, the translation refuses the program. Run `ctest --preset dev --no-tests=error -R '^compute_entry_layout_'`.
+
 ### gfx1030 MUBUF cache-invalidation rejection
 
 The compute store profile rejects `buffer_gl0_inv` and `buffer_gl1_inv`
