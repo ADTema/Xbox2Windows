@@ -4800,22 +4800,28 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_float_to_word_conversions_e32_and_e64(self):
-        """v_cvt_u32_f32 and v_cvt_i32_f32 accept plain e32 and e64 with optional source abs/neg;
-        v_cvt_flr_i32_f32 and v_cvt_rpi_i32_f32 stay out of generic scanner support until arbitrary runtime
-        exceptional inputs are backed by a native RDNA reference."""
+        """v_cvt_u32_f32, v_cvt_i32_f32, v_cvt_flr_i32_f32 and v_cvt_rpi_i32_f32 accept plain e32 and e64 with
+        optional source abs/neg, on runtime registers too: pixel_aot defines NaN, infinities and overflow for
+        flr and rpi (issue #1772)."""
         for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
                      "v_cvt_u32_f32_e32 v12, 0x40400000", "v_cvt_u32_f32_e64 v12, v13",
                      "v_cvt_i32_f32_e64 v12, s44", "v_cvt_u32_f32_e64 v12, |s44|",
                      "v_cvt_i32_f32_e64 v12, -s44", "v_cvt_i32_f32_e64 v12, -|v13|",
                      "v_cvt_u32_f32_e64 v12, abs(v13)", "v_cvt_i32_f32_e64 v12, neg(0x40400000)",
-                     "v_cvt_u32_f32_e64 v12, |0xc0300000|"):
+                     "v_cvt_u32_f32_e64 v12, |0xc0300000|",
+                     "v_cvt_flr_i32_f32_e32 v12, v13", "v_cvt_rpi_i32_f32_e32 v12, s44",
+                     "v_cvt_flr_i32_f32_e32 v12, 0x7fc00000", "v_cvt_rpi_i32_f32_e64 v12, -v13",
+                     "v_cvt_flr_i32_f32_e64 v12, -|s44|", "v_cvt_rpi_i32_f32_e64 v12, neg(0x4f000000)"):
             self.assertTrue(is_instruction_supported(line), line)
         for line in ("v_cvt_u32_f32_e64 v12, s44 clamp", "v_cvt_i32_f32_e64 v12, s44 omod:2",
                      "v_cvt_i32_f32_e32 v12, 1", "v_cvt_u32_f32_e32 v12, 0.5",
                      "v_cvt_u32_f32_e64 v12, 0.5", "v_cvt_i32_f32_e64 v12, -1",
                      "v_cvt_i32_f32_e64 v12, -0x40400000", "v_cvt_u32_f32_e64 v12, |-s44|",
                      "v_cvt_u32_f32_e32  v12, v13", "v_cvt_u32_f32_e64  v12, v13",
-                     "v_cvt_flr_i32_f32_e32 v12, v13", "v_cvt_rpi_i32_f32_e64 v12, -v13"):
+                     "v_cvt_flr_i32_f32_e64 v12, s44 clamp", "v_cvt_rpi_i32_f32_e64 v12, s44 omod:2",
+                     "v_cvt_flr_i32_f32_e32 v12, 0.5", "v_cvt_rpi_i32_f32_e64 v12, |-s44|",
+                     "v_cvt_flr_i32_f32_dpp v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                     "v_cvt_rpi_i32_f32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD"):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_disasm_cvt_flr_and_rpi_e32_and_e64(self):
@@ -4962,7 +4968,7 @@ class TestRdna2Scanner(unittest.TestCase):
             result = {r["shader_name"]: r for r in scan_directory_or_files([tmp_path])}["ps_vop1_swap.bin"]
         self.assertTrue(result["opcodes_recognized"])
         self.assertEqual(result["unsupported_opcodes"], {})
-        # pixel_aot lowers the first three, so only v_swaprel_b32 is listed as untranslated.
+        # The scanner's static tables still list v_swaprel_b32 as untranslated; pixel_aot lowers it since #1795.
         self.assertEqual([d["raw"].split()[0] for d in result["unsupported_details"]], ["v_swaprel_b32"])
 
     def test_binary_scan_recognizes_vop2_carry_and_image_atomics(self):
