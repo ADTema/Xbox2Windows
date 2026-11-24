@@ -4738,9 +4738,19 @@ if(EXISTS "${INTAKE_PYTHON}")
             /DYNAMICBASE /INCREMENTAL:NO)
         target_link_libraries(cpu_startup_exe_${control} PRIVATE kernel32 cpu_startup_a cpu_startup_b)
     endforeach()
+    # Lingering-thread controls (#1375): a thread outlives the entry point; _linger_return ends as before.
+    foreach(control IN ITEMS linger linger_return)
+        add_executable(cpu_startup_exe_${control} tests/cpu/startup_exe.cpp)
+        target_compile_definitions(cpu_startup_exe_${control} PRIVATE LINGER_CONTROL)
+        target_compile_options(cpu_startup_exe_${control} PRIVATE /GS- /Zl)
+        target_link_options(cpu_startup_exe_${control} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
+            /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_startup_exe_${control} PRIVATE kernel32 cpu_startup_a cpu_startup_b)
+    endforeach()
+    target_compile_definitions(cpu_startup_exe_linger_return PRIVATE RETURN_FROM_ENTRY)
     # Source-built CRT-free package: import the mapped DLL only by ordinal @77,
     # compare its native entry with pe_run_package, and reject a DLL exporting @78.
-    foreach(variant IN ITEMS provider altered wrong)
+    foreach(variant IN ITEMS provider altered wrong live)
         if(variant STREQUAL "wrong")
             set(ord_def tests/cpu/package_ordinal_provider_wrong.def)
         else()
@@ -4752,15 +4762,23 @@ if(EXISTS "${INTAKE_PYTHON}")
             /NODEFAULTLIB /INCREMENTAL:NO)
     endforeach()
     target_compile_definitions(cpu_package_ordinal_altered PRIVATE ALTER_RETURN)
-    add_executable(cpu_package_ordinal_exe tests/cpu/package_ordinal_exe.cpp)
-    target_compile_options(cpu_package_ordinal_exe PRIVATE /GS- /Zl)
-    target_link_options(cpu_package_ordinal_exe PRIVATE /ENTRY:ordinal_exe_entry
-        /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
-    target_link_libraries(cpu_package_ordinal_exe PRIVATE cpu_package_ordinal_provider)
+    # Control provider (#1375): mix_args leaves a thread running past the caller's entry point.
+    target_compile_definitions(cpu_package_ordinal_live PRIVATE LIVE_WORKER)
+    target_link_libraries(cpu_package_ordinal_live PRIVATE kernel32)
+    # The _return control ends as before #1375: its entry point returns instead of ending the process.
+    foreach(target IN ITEMS cpu_package_ordinal_exe cpu_package_ordinal_exe_return)
+        add_executable(${target} tests/cpu/package_ordinal_exe.cpp)
+        target_compile_options(${target} PRIVATE /GS- /Zl)
+        target_link_options(${target} PRIVATE /ENTRY:ordinal_exe_entry
+            /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE cpu_package_ordinal_provider)
+    endforeach()
+    target_compile_definitions(cpu_package_ordinal_exe_return PRIVATE RETURN_FROM_ENTRY)
     add_test(NAME cpu_native_package_ordinal_startup COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/package_ordinal_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_package_ordinal_exe>" "$<TARGET_FILE:cpu_package_ordinal_provider>"
-        "$<TARGET_FILE:cpu_package_ordinal_altered>" "$<TARGET_FILE:cpu_package_ordinal_wrong>")
+        "$<TARGET_FILE:cpu_package_ordinal_altered>" "$<TARGET_FILE:cpu_package_ordinal_wrong>"
+        "$<TARGET_FILE:cpu_package_ordinal_live>" "$<TARGET_FILE:cpu_package_ordinal_exe_return>")
     set_tests_properties(cpu_native_package_ordinal_startup PROPERTIES TIMEOUT 90)
     add_test(NAME pe_package_ordinal_plan COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pe_package_ordinal_plan_check.py")
@@ -4768,7 +4786,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_startup_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_startup_exe>" "$<TARGET_FILE:cpu_startup_a>" "$<TARGET_FILE:cpu_startup_b>"
         "$<TARGET_FILE:cpu_startup_b_noinit>" "$<TARGET_FILE:cpu_startup_a_alt>"
-        "$<TARGET_FILE:cpu_startup_exe_timeout>" "$<TARGET_FILE:cpu_startup_exe_create>")
+        "$<TARGET_FILE:cpu_startup_exe_timeout>" "$<TARGET_FILE:cpu_startup_exe_create>"
+        "$<TARGET_FILE:cpu_startup_exe_linger>" "$<TARGET_FILE:cpu_startup_exe_linger_return>")
     # EXE-own TLS: a CRT-free EXE with a page-spanning initialized template and two TLS callbacks, launched
     # by Windows and started with pe_map_run; the startup log and exit code must match (Refs #165, #870).
     # The _early variant starts a thread inside its first process-attach callback (mapped only).
