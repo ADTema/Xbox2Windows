@@ -8651,6 +8651,7 @@ def e64_spelling_programs():
 
 def check_e64_spelling_lowering():
     """Static checks: each e64 spelling lowers exactly like the e32 form, and nothing wider is accepted."""
+    check_vop1_nop_lowering()
     for name, program, function, plain in e64_spelling_programs():
         assert sum(line.startswith("v_interp_") and "_e64 " in line for line in program) in (2, 4, 8), name
         assert program.count("v_nop_e64") == 1, name
@@ -8692,6 +8693,62 @@ def check_e64_spelling_lowering():
     must_reject(translate, plain[:-1] + ["v_nop_e64", plain[-1]])
     must_reject(translate, plain[:3] + ["v_nop_e64"] + plain[3:])
     must_reject(translate, plain[:3] + ["v_nop"] + plain[3:])
+
+
+# v_clrexcp and v_pipeflush, in both encodings, as no-ops in the entry mask (#1791).
+VOP1_NOPS = ("v_clrexcp", "v_clrexcp_e64", "v_pipeflush", "v_pipeflush_e64")
+
+
+def vop1_nop_program(*, clobber=False, plain=False):
+    """The standard sampled program with the four no-op spellings after the sample wait, where v12 to v15 are
+    live. clobber replaces v_pipeflush with a write to v13, the control that a lowered register write is visible;
+    plain puts v_nop in each place, so the temporaries, which are numbered by line, line up."""
+    program = assembly(False)
+    at = program.index("s_waitcnt vmcnt(0)") + 1
+    nops = ["v_mov_b32_e32 v13, 0" if clobber and op == "v_pipeflush" else "v_nop" if plain else op
+            for op in VOP1_NOPS]
+    return program[:at] + nops + program[at:]
+
+
+def check_vop1_nop_lowering():
+    """Static checks: the no-ops lower to nothing, and nothing wider is accepted."""
+    assert translate(vop1_nop_program()) == translate(vop1_nop_program(plain=True))
+    for op in VOP1_NOPS:
+        program = assembly(False)
+        at = program.index("s_wqm_b64 exec, exec") + 1
+        try:
+            translate(program[:at] + [op] + program[at:])
+        except ValueError as error:
+            assert "non-entry mask" in str(error), (op, error)
+        else:
+            raise AssertionError(f"{op} accepted in the whole-quad mask")
+        for wider in (f"{op} v0", f"{op} v0, v1"):
+            try:
+                translate(assembly(False)[:10] + [wider] + assembly(False)[10:])
+            except ValueError as error:
+                assert str(error).startswith("Unsupported instruction"), (wider, error)
+            else:
+                raise AssertionError(f"{wider} accepted")
+
+
+def check_vop1_nop_draws(directory, compiler, renderer, backend):
+    """Draw the no-op program against the sampled texture reference; the clobber control must mismatch."""
+    source = directory / "vop1_nops.hlsl"
+    shader = directory / "vop1_nops.cso"
+    draw = [renderer, backend, "--check-pixel", shader, "rgba"]
+    source.write_text(translate(vop1_nop_program()), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    result = subprocess.run(draw)
+    if result.returncode:
+        return result.returncode
+    print(f"vop1 no-ops: {', '.join(VOP1_NOPS)} matched the sampled reference")
+    source.write_text(translate(vop1_nop_program(clobber=True)), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A no-op lowered as a register write escaped detection")
+    print("control v_pipeflush as a write to v13: pixel mismatch, as required")
+    return 0
 
 
 def check_e64_spelling_draws(directory, compiler, renderer, backend):
@@ -8773,6 +8830,24 @@ def translate_buffer_color(instructions):
     return lower(instructions, 9, 24, None, 0)
 
 
+def min_num(*values):
+    """HLSL min, and V_MIN_F32 with IEEE mode off: a NaN operand gives the other operand."""
+    numbers = [v for v in values if v == v]
+    return min(numbers) if numbers else math.nan
+
+
+def max_num(*values):
+    numbers = [v for v in values if v == v]
+    return max(numbers) if numbers else math.nan
+
+
+def med3_f32(a, b, c):
+    """V_MED3_F32 (RDNA 2 ISA): the median, or V_MIN3_F32 of the three operands when any of them is NaN."""
+    if any(v != v for v in (a, b, c)):
+        return min_num(a, b, c)
+    return sorted((a, b, c))[1]
+
+
 def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
     """Expected colors for three_way(); no rounding occurs before the half export."""
     case = bytearray(256)
@@ -8780,8 +8855,8 @@ def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
     for y in RAMP:
         for x in RAMP:
             r, g, b = single(x / 255), single(y / 255), single(128 / 255)
-            clamped = sorted((r, low, high))[1]
-            color = (clamped, min(abs(cap), g, clamped), max(r, b, g), sorted((middle, g, r))[1])
+            clamped = med3_f32(r, low, high)
+            color = (clamped, min(abs(cap), g, clamped), max(r, b, g), med3_f32(middle, g, r))
             case.extend(struct.pack("<4f", *map(half_rtz, color)))
     path = directory / name
     path.write_bytes(case)
@@ -8789,15 +8864,24 @@ def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
 
 
 def check_three_way_templates():
-    """The HLSL forms must pick the expected operand for every operand order."""
-    values = (-1.5, 0.0, 0.25, 0.25, 3.0)
+    """The HLSL forms must pick the expected operand for every operand order, NaN operands included."""
+    names = {"min": min_num, "max": max_num, "asuint": lambda x: struct.unpack("<I", struct.pack("<f", x))[0]}
+    # Evaluate the med3_32 helper of the preamble: its NaN test on the encoding, then the selected form.
+    helper = (r"^float med3_32\(float a, float b, float c\) \{\n    uint top = (.+);\n"
+              r"    return top > (0x[0-9a-f]+)u \? (.+) : (.+);\n\}")
+    for top, limit, nan_form, finite_form in re.findall(helper, pixel_aot.PREAMBLE, re.M):
+        top = re.sub(r"(0x[0-9a-f]+)u\b", r"\1", top)
+        names["med3_32"] = lambda a, b, c: eval(
+            nan_form if eval(top, names, {"a": a, "b": b, "c": c}) > int(limit, 16) else finite_form,
+            names, {"a": a, "b": b, "c": c})
+    values = (-1.5, 0.0, 0.25, 0.25, 3.0, math.nan)
     for a in values:
         for b in values:
             for c in values:
-                pick = {name: eval(ALU[name][1].format("a", "b", "c"), {"min": min, "max": max},
-                                   {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
-                assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
-                                "med3": sorted((a, b, c))[1]}, (a, b, c)
+                for name, expected in (("min3", min_num(a, b, c)), ("max3", max_num(a, b, c)),
+                                       ("med3", med3_f32(a, b, c))):
+                    pick = eval(ALU[name][1].format("a", "b", "c"), names, {"a": a, "b": b, "c": c})
+                    assert pick == expected or pick != pick and expected != expected, (name, a, b, c, pick)
 # Give the four invocations lane IDs 0, 1, 2, 3, then gather the converted values
 # using the author's injective base-4 weights. This witnesses every routed lane.
 DPP_CVT_LANES = [
@@ -15854,9 +15938,9 @@ def _check_controls_inline(directory):
                      ("v_add_f32_e32 v19, s44, v13", "v_add_f32_e32 v19, v13")):
         must_reject(translate, [line.replace(old, new) for line in shaping()])
     source = translate(three_way())
-    for expected in ("max(min(params[1].z, sample16.y), min(max(params[1].z, sample16.y), sample16.x))",
+    for expected in ("med3_32(params[1].z, sample16.y, sample16.x)",
                      "max(max(sample16.x, sample16.z), sample16.y)",
-                     "max(min(sample16.x, params[0].w), min(max(sample16.x, params[0].w), params[1].x))",
+                     "med3_32(sample16.x, params[0].w, params[1].x)",
                      "min(min(abs(params[1].y), sample16.y), alu"):
         assert expected in source, expected
     for old, new in (("v_med3_f32 v12, v12, s44, s45", "v_med3_f32 v12, v12, s44"),
@@ -17589,6 +17673,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
     fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
+    fixtures.append((vop1_nop_program(), translate))
     fixtures.extend((uncompressed_export(body), translate_int, "gfx1013")
                     for body in (DPP_CVT_FROM_FLOAT, DPP_CVT_TO_FLOAT))
     fixtures.append((with_constants(DPP_EXTRA_BODY), translate, "gfx1013"))
@@ -20273,10 +20358,20 @@ def check_three_way_draw(directory, compiler, renderer, backend):
     source.write_text(translate(three_way()), encoding="ascii")
     compile_shader(compiler, source, shader)
     cases = []
-    for idx, constants in enumerate(((.25, .75, .375, .5), (.625, .125, -.3125, .5))):
+    # The second case makes the bounds of the first med3 and the first operand of the second NaN.
+    for idx, constants in enumerate(((.25, .75, .375, .5), (math.nan, .75, .375, math.nan), (.625, .125, -.3125, .5))):
         case = three_way_case(directory, *constants, name=f"three_way-{idx}.case")
         cases.append((case, "pass"))
     run_pixel_batch(renderer, backend, shader, cases)
+    # Desktop min and max alone skip a NaN operand instead of taking V_MIN3_F32 of the rest.
+    text = source.read_text(encoding="ascii")
+    nan_ignored = text.replace("? min(min(a, b), c) :", "? max(min(a, b), min(max(a, b), c)) :")
+    assert nan_ignored != text
+    source.write_text(nan_ignored, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[1][0]], capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A median that ignores a NaN operand escaped detection")
     draw = [renderer, backend, "--check-pixel-case", shader, cases[-1][0]]
     without_abs = [line.replace("|s46|", "s46") for line in three_way()]
     source.write_text(translate(without_abs), encoding="ascii")
@@ -22981,6 +23076,21 @@ def check_sampler_descriptor_refusals():
         else:
             raise AssertionError("comparison sampler %s was accepted" % (words,))
 
+    # A gather offset must be a static 6-bit X/Y pair: an absent operand and any bit outside
+    # 0x3f3f are refused, and a legal pair decodes with the sign centred on 32.
+    for bad in (None, 0x40, 0x4040):
+        try:
+            pixel_aot.gather_offset(bad)
+        except ValueError as error:
+            assert "static packed XY offset" in str(error), (bad, error)
+        else:
+            raise AssertionError("gather offset %r was accepted" % (bad,))
+    assert pixel_aot.gather_offset(0x0101) == (1, 1), pixel_aot.gather_offset(0x0101)
+    # 0x3f in X decodes to -1 and 0x1f in Y to +31: the pair is centred on 32, not truncated.
+    assert pixel_aot.gather_offset(0x1f3f) == (-1, 31), pixel_aot.gather_offset(0x1f3f)
+    # 0x20 in Y decodes to -32, the other end of the signed range.
+    assert pixel_aot.gather_offset(0x203f) == (-1, -32), pixel_aot.gather_offset(0x203f)
+
 
 def main():
     if len(sys.argv) == 1:
@@ -23113,6 +23223,8 @@ def main():
                 raise
         if mode == "draw-e64-spellings":
             return check_e64_spelling_draws(directory, *args)
+        if mode == "draw-vop1-nops":
+            return check_vop1_nop_draws(directory, *args)
         if mode == "draw-e64":
             # The controls already run in the binary and draw modes; this mode only draws.
             return check_e64_render(directory, *args)

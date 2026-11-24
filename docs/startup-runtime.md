@@ -27,6 +27,10 @@ It covers what the draw cannot observe: the logged descriptor offset (4 bytes in
 a byte-for-byte copy of the descriptor, and refusal of a null list or one that is not whole
 records. The control expects the first blend patch to win and must fail.
 
+## Stencil reference
+
+Command-list slot 24 (`OMSetStencilRef`, the desktop slot) passes its reference to the desktop list, as slots 21 to 23 do for viewports, scissors and the blend factor, so a translated draw whose pipeline enables the stencil test compares against it. A closed list ignores the call. The slot number is the desktop one and has not been seen in a title log; `startup_stream_depth_{warp,hardware}` checks the references 0x5A, 0x5B, 0 and 0xFF against a stencil cleared to the matching value.
+
 ## Default viewport and scissor
 
 A desktop command list that never sets a viewport or scissor rectangle draws no pixel. A translated
@@ -159,13 +163,15 @@ data. The comparison uses the kept bytes because the ring is write-combined memo
 
 ## Root signature changes and dropped root constants
 
-Command-list slot 34 (`SetGraphicsRootSignature`) leaves no descriptor table bound when the signature differs from the
-current one, as it already clears the root addresses; setting the same signature again keeps the tables. Slot 40
+Command-list slot 34 (`SetGraphicsRootSignature`) clears the translated draw's cached descriptor tables, root
+addresses and root constants when the signature changes. Setting the same signature again preserves these arguments.
+An unset constant reads as zero in the translated draw. Slot 40
 (`SetGraphicsRoot32BitConstants`) keeps 16 parameters of 8 words. A call with a parameter of 16 or more or an offset of
 8 or more is dropped, and one whose count passes the eighth word is truncated; each logs one line
 (`root constants dropped` or `root constants truncated`, with the parameter, offset and count) for the first four such
-calls in the process. `startup_root_reset_{warp,hardware}` draws a 1D texture through a bound table with no change, the same
-signature, a switched signature and six out-of-range calls.
+calls in the process. `startup_root_reset_{warp,hardware}` draws a 1D texture through a bound table and writes a
+root constant into the blue channel. It checks the original bindings, the same signature, a switched signature and
+six out-of-range calls. The switched case clears both inputs to the shader.
 
 ## Null bindings in translated draws
 
@@ -594,6 +600,13 @@ These are measured on one executable; treat them as hypotheses for others.
   resubmission fixture issues an invalid viewport command on a compute list while an older
   valid submit is waiting on a fence. It verifies the failed Close and wrong-type Reset, then
   closes and submits a recovered recording and lets the queue finish both valid submissions.
+- **Upload arena fixture.** The standalone arena allocates 640 writable bytes with 16-byte CPU
+  and GPU alignment, preserves them when a later allocation needs a new page, and translates
+  only byte ranges inside one live allocation. The idle reset retires those ranges. An eventual
+  command-list caller must wait for its recordings and GPU submissions to retire before reset.
+  The fixture exercises allocation and retirement without queue submission or guest slot binding.
+  Run `cmake --build --preset release --target startup_upload_arena` and
+  `ctest --preset release --no-tests=error -R '^startup_upload_arena_' -V`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and
@@ -623,6 +636,16 @@ These are measured on one executable; treat them as hypotheses for others.
   (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Cube, multisampled
   and 1D images are still refused. Not covered: binding a single-slice 2D view to an array declaration
   in the draw path.
+- **2D array depth comparison.** `image_sample_c_lz` and `image_sample_c` (sampler MAX_LOD 0) with
+  `dim:SQ_RSRC_IMG_2D_ARRAY` take the reference, u, v and the slice as four address registers and lower to
+  `Texture2DArray.SampleCmpLevelZero(smp, float3(u, v, slice), reference)` on the same constant comparison
+  sampler as the 2D form. Before, they were refused with `image_sample_c[_lz] on SQ_RSRC_IMG_2D_ARRAY`.
+  `python -B tests/startup_image_sample_c_check.py` translates the fixtures (words checked against `llvm-mc`) and
+  fails seven edited array lowerings. `tests/startup_image_2d_array_check.py` also compiles and draws both
+  comparison forms through `offscreen_check --startup-image-2d-array` against a two-slice `R32_FLOAT` 2D array
+  (depths `0.25` and `0.75` at texel `(1, 0)`, reference `0.5`, `LESS` via the manifest `smpc` line) and requires
+  always-slice-zero and swapped-slice controls to differ (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`).
+  `image_sample_c_l` stays refused (shader model 6.7).
 - **Flat parameters.** `v_interp_mov_f32` reads a `nointerpolation uint4` copy written from the
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost

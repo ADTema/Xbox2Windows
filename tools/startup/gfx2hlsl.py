@@ -666,21 +666,58 @@ class Stage:
         self.op_s_buffer_load_dword(ops, mods, 16)
 
     def buffer_address(self, ops, mods):
+        # MUBUF and MTBUF share the same address calculation: optional index * stride (idxen),
+        # optional byte VGPR offset (offen), scalar byte offset (soffset) and 12-bit immediate
+        # offset. Cache-policy flags (glc, slc, dlc) do not change the loaded bytes; lds, tfe
+        # and any other modifier change the destination or operand layout and are refused first.
+        offset = 0
+        for m in mods:
+            if m.startswith('offset:') and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
+                offset += int(m[7:], 0)
+            elif m not in ('idxen', 'offen', 'glc', 'slc', 'dlc'):
+                raise Unsupported('buffer modifier %s' % m)
+        if len(ops) != 4:
+            raise Unsupported('buffer load with %d operands' % len(ops))
         key = self.descriptor(ops[2])
         buf = self.pipe.resource(key, 'buf')
-        offset = int(ops[3], 0)
-        for m in mods:
-            if m.startswith('offset:'):
-                offset += int(m[7:], 0)
-        if 'idxen' in mods:
+        soffset = None
+        if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
+            offset += int(ops[3], 0)
+        else:
+            sreg = reg_range(ops[3])
+            if not sreg or sreg[0] != 's' or sreg[1] != sreg[2] or sreg[1] > 105:
+                raise Unsupported('buffer soffset %s' % ops[3])
+            soffset = self.S(sreg[1])
+        idxen, offen = 'idxen' in mods, 'offen' in mods
+        terms = []
+        if idxen and offen:
             if key in self.pipe.modified:
                 raise Unsupported('indexed load through a modified descriptor')
-            address = '%s * ud%d + %d' % (self.u(ops[1]), self.pipe.ud(('stride',) + (self.pipe.resources[key]['index'],)), offset)
-        elif 'offen' in mods:
-            address = '%s + %d' % (self.u(ops[1]), offset)
-        else:
-            address = '%d' % offset
-        return buf, address
+            r = reg_range(ops[1])
+            if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
+                raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
+            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            terms.append('%s * ud%d' % (self.u('v%d' % r[1]), stride))
+            terms.append(self.u('v%d' % r[2]))
+        elif idxen:
+            if key in self.pipe.modified:
+                raise Unsupported('indexed load through a modified descriptor')
+            r = reg_range(ops[1])
+            if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
+                raise Unsupported('buffer vaddr %s for idxen' % ops[1])
+            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            terms.append('%s * ud%d' % (self.u(ops[1]), stride))
+        elif offen:
+            r = reg_range(ops[1])
+            if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
+                raise Unsupported('buffer vaddr %s for offen' % ops[1])
+            terms.append(self.u(ops[1]))
+        elif ops[1] != 'off':
+            raise Unsupported('buffer vaddr %s without idxen or offen' % ops[1])
+        if soffset is not None:
+            terms.append(soffset)
+        terms.append('%d' % offset)
+        return buf, ' + '.join(terms)
 
     def op_buffer_load_dword(self, ops, mods, count=1):
         dst = reg_range(ops[0])
@@ -710,6 +747,10 @@ class Stage:
                  'BUF_FMT_8_UINT': ('{0}.Load(a & ~3u) >> ((a & 3u) * 8u)', ['w & 255u', '0u', '0u', '1u']),
                  'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
+                 # Four half channels in one 8-byte element: x/y in the first dword, z/w in the second.
+                 'BUF_FMT_16_16_16_16_FLOAT': (None, ['U(f16tof32(ldu({0}, a)))', 'U(f16tof32(ldu({0}, a) >> 16))',
+                                                      'U(f16tof32(ldu({0}, a + 4)))',
+                                                      'U(f16tof32(ldu({0}, a + 4) >> 16))']),
                  'BUF_FMT_32_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', '{0}.Load(a + 12)']),
                  'BUF_FMT_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', 'U(1.0)']),
                  'BUF_FMT_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '0u', 'U(1.0)']),
@@ -802,10 +843,10 @@ class Stage:
                 n += 1
 
     def image_compare(self, ops, mods, how):
-        """image_sample_c and image_sample_c_lz: a 2D depth comparison returning one float.
+        """image_sample_c and image_sample_c_lz: a 2D or 2D-array depth comparison returning one float.
 
-        The address dwords are the reference, then u and v, which is what SampleCmp* takes as its third
-        argument and its location. The comparison function and the filter live in the sampler descriptor,
+        The address dwords are the reference, then u and v (and the slice of a 2D array), which is what
+        SampleCmp* takes as its third argument and its location. The comparison function and the filter live in the sampler descriptor,
         so they are read from its constant words by the decoder the pixel AOT path already checks against
         D3D12 (pixel_aot.comparison_sampler_state) and bound as a SamplerComparisonState. HLSL has no
         SampleCmpLevel before shader model 6.7 (the stages here compile as 5.1 and 6.0), so
@@ -822,8 +863,9 @@ class Stage:
         if len(dims) != 1 or len(masks) != 1:
             raise Unsupported('%s without exactly one dim and dmask' % base)
         dim, dmask = dims[0], int(masks[0], 0)
-        if dim != 'SQ_RSRC_IMG_2D':
+        if dim not in ('SQ_RSRC_IMG_2D', 'SQ_RSRC_IMG_2D_ARRAY'):
             raise Unsupported('%s on %s' % (base, dim))
+        array = dim == 'SQ_RSRC_IMG_2D_ARRAY'
         if dmask != 1:
             raise Unsupported('%s with dmask %#x: a comparison returns one channel' % (base, dmask))
         if len(ops) != 4:
@@ -834,7 +876,8 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        if len(cs) != 3:
+        # The reference, u and v; a 2D array adds the slice as the last address register.
+        if len(cs) != (4 if array else 3):
             raise Unsupported('%s with %d address registers' % (base, len(cs)))
         if self.heap_sampler(ops[3]):
             raise Unsupported('%s through a sampler heap' % base)
@@ -846,9 +889,12 @@ class Stage:
             pixel_aot.comparison_sampler_state(tuple(words))
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (base, error))
-        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
+        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2da' if array else 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
-        args = '%s, float2(%s, %s), %s' % (smp, self.f(cs[1]), self.f(cs[2]), self.f(cs[0]))
+        # Texture2DArray takes the slice as the third location component, like Sample and Load on the same type.
+        location = ('float3(%s, %s, %s)' % (self.f(cs[1]), self.f(cs[2]), self.f(cs[3])) if array
+                    else 'float2(%s, %s)' % (self.f(cs[1]), self.f(cs[2])))
+        args = '%s, %s, %s' % (smp, location, self.f(cs[0]))
         # MAX_LOD (word 1 bits 23:12) is not carried into the static sampler, and the comparison-state mapping ignores
         # the mip filter and uses level zero. Only a source limited to level zero is therefore exact for the implicit
         # form; any other limit would need mip selection and blending that is not lowered in this slice, so it is refused.

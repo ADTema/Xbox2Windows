@@ -466,10 +466,21 @@ foreach(mutation IN ITEMS tight wrap size-image)
     add_test(NAME startup_draw_bmp_${mutation}_control COMMAND startup_draw_bmp_check --mutate ${mutation})
     set_tests_properties(startup_draw_bmp_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Names the x2w-noop log gives to command list slots (src/startup_stubs/command_list_slot_names.h, #870).
+add_executable(startup_command_list_slot_names tests/startup_command_list_slot_names.cpp)
+target_compile_features(startup_command_list_slot_names PRIVATE cxx_std_17)
+add_test(NAME startup_command_list_slot_names COMMAND startup_command_list_slot_names)
 # Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.
 add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
 target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
 add_test(NAME startup_gamesave_persist COMMAND startup_gamesave_persist)
+# Enumeration of the same store (Store::list_containers, Store::list_blobs): exact names, sizes and
+# order, what is not listed, the busy and untouched-output rules, and a second process that
+# publishes two-blob updates while this one lists.
+add_executable(startup_gamesave_enumerate tests/startup_gamesave_enumerate.cpp)
+target_compile_features(startup_gamesave_enumerate PRIVATE cxx_std_17)
+add_test(NAME startup_gamesave_enumerate COMMAND startup_gamesave_enumerate)
+set_tests_properties(startup_gamesave_enumerate PROPERTIES TIMEOUT 120)
 # Publication of a multi-blob update: a second process sees the whole old generation or the whole
 # new one. The test is built from two generated copies of the store headers, each with a pause
 # point at every step of the publication (the `x2w-seam` comments). In the second copy the file lock
@@ -630,6 +641,25 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_list_resubmit_untracked_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
 endforeach()
+
+add_executable(startup_upload_arena tests/startup_upload_arena.cpp)
+target_compile_features(startup_upload_arena PRIVATE cxx_std_17)
+target_include_directories(startup_upload_arena PRIVATE src)
+target_link_libraries(startup_upload_arena PRIVATE d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_upload_arena_${backend} COMMAND startup_upload_arena ${backend})
+    set_tests_properties(startup_upload_arena_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+endforeach()
+
+# GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
+add_executable(startup_indirect_dispatch tests/startup_indirect_dispatch.cpp tests/desktop_gpu.cpp)
+target_compile_features(startup_indirect_dispatch PRIVATE cxx_std_17)
+target_link_libraries(startup_indirect_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_indirect_dispatch_${backend} COMMAND startup_indirect_dispatch ${backend})
+    set_tests_properties(startup_indirect_dispatch_${backend} PROPERTIES TIMEOUT 30)
+endforeach()
+set_tests_properties(startup_indirect_dispatch_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
 # OMSetRenderTargets with a single descriptor range, handles that hold no view, and a cleared copied descriptor.
 add_executable(startup_rtv_bind tests/startup_rtv_bind.cpp)
@@ -1745,6 +1775,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Output modifiers on float-result conversions (#1705).
     add_test(NAME startup_gfx2hlsl_vcvt_omod COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_vcvt_omod_check.py")
+    # A typed buffer load of BUF_FMT_16_16_16_16_FLOAT reads four halves from one 8-byte element (#1695).
+    add_test(NAME startup_gfx2hlsl_tbuffer_16f COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_tbuffer_16f_check.py")
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
     # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
     find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")
@@ -1762,6 +1795,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py")
     add_test(NAME startup_vertex_fetch_formats_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_vertex_fetch_formats_check.py" controls)
+    add_test(NAME startup_buffer_address_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_buffer_address_check.py" controls)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_r8_uint_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_r8_uint_check.py" "${DXC_EXECUTABLE}"
@@ -1772,6 +1807,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_vertex_fetch_formats_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_vertex_fetch_formats_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_buffer_address_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_buffer_address_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_buffer_address_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_sampler_heap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
@@ -6656,6 +6695,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_e64_spellings_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_e64_spellings_${adapter}.txt")
+        add_test(NAME pixel_aot_vop1_nops_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-vop1-nops "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_vop1_nops_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_vop1_nops_${adapter}.txt")
         add_test(NAME pixel_aot_frexp_exp_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-frexp-exp "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

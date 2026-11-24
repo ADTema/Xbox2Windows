@@ -31,6 +31,7 @@
 #include "startup_stubs/slice_footprints.h"
 
 #include <d3d12.h>
+#include "command_list_slot_names.h"
 #include "console_plane_size.h"
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
@@ -522,7 +523,9 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
     static LONG calls;
     if (first_calls(calls, 1)) {
         char name[64];
-        std::snprintf(name, sizeof(name), "%s::slot%d", kind_names[K], N);
+        const char* known = K == list_kind ? x2w_list_slots::name(N) : nullptr;
+        if (known) std::snprintf(name, sizeof(name), "%s::slot%d(%s)", kind_names[K], N, known);
+        else std::snprintf(name, sizeof(name), "%s::slot%d", kind_names[K], N);
         x2w_trap::record("x2w-noop", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, rcx, rdx, r8, r9,
                          _ReturnAddress());
     }
@@ -1778,12 +1781,13 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
 {
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
-    // A different root signature leaves no descriptor table bound; the same one keeps them.
-    if (pass.root != (w ? root_info(w) : nullptr))
-        for (auto& table : pass.view_tables) table = {};
     const auto* params = w ? root_info(w) : nullptr;
-    if (pass.root != params)
+    // A different root signature invalidates the title's cached root arguments.
+    if (pass.root != params) {
+        for (auto& table : pass.view_tables) table = {};
         std::fill_n(pass.root_address, 16, 0);
+        std::memset(pass.constants, 0, sizeof(pass.constants));
+    }
     pass.root = params;
     pass.srv_bound = 0;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real;
@@ -2012,6 +2016,11 @@ void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
 void __stdcall list_blend_factor(Wrapper* self, const float* factor)
 {
     if (auto* list = recording(self); list && x2w_local::readable(factor, 16)) list->OMSetBlendFactor(factor);
+}
+// List slot 24, OMSetStencilRef(reference): list state that the stencil test of the next draws compares against.
+void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
+{
+    if (auto* list = recording(self)) list->OMSetStencilRef(reference);
 }
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
@@ -3425,6 +3434,7 @@ void build_tables()
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
         list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);
         list_typed[23] = reinterpret_cast<ListTyped>(&list_blend_factor);
+        list_typed[24] = reinterpret_cast<ListTyped>(&list_stencil_ref);
         list_typed[25] = reinterpret_cast<ListTyped>(&list_pipeline);
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);

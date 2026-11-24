@@ -381,6 +381,13 @@ uint class16(uint bits) {
 bool num16(uint bits) {
     return (bits & 0x7fffu) <= 0x7c00u;
 }
+// v_med3_f32: the median of three. If any operand is NaN, the RDNA 2 ISA returns V_MIN3_F32 of the three, which with
+// IEEE mode off is the smallest operand that is not NaN; desktop min and max alone would skip only the NaN operand.
+// The NaN test is on the encoding, because some desktop compilers fold float NaN tests.
+float med3_32(float a, float b, float c) {
+    uint top = max(max(asuint(a) & 0x7fffffffu, asuint(b) & 0x7fffffffu), asuint(c) & 0x7fffffffu);
+    return top > 0x7f800000u ? min(min(a, b), c) : max(min(a, b), min(max(a, b), c));
+}
 // v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
 // D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
 float fract32(float value) {
@@ -666,7 +673,7 @@ ALU = {
     "mad": (3, "mad32({0}, {1}, {2})"), "mac": (3, "mad32({0}, {1}, {2})"),
     # Each result is one of the operands, so finite inputs need no rounding.
     "min3": (3, "min(min({0}, {1}), {2})"), "max3": (3, "max(max({0}, {1}), {2})"),
-    "med3": (3, "max(min({0}, {1}), min(max({0}, {1}), {2}))"),
+    "med3": (3, "med3_32({0}, {1}, {2})"),
 }
 # LLVM 15 sets HasExtDPP = 0 for v_mac_legacy_f32, and fma, mad, mad_legacy, min3, max3 and med3 are VOP3-only, so
 # none of them has a DPP form (llvm-mc for gfx1013: "dpp variant of this instruction is not supported").
@@ -3293,6 +3300,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if line in ("v_nop", "v_nop_e64"):
             if mask != "entry":
                 raise ValueError("Unexpected v_nop with non-entry mask")
+            continue
+        # v_pipeflush flushes a VALU destination cache and v_clrexcp clears the wave's exception state, which only
+        # s_getreg_b32 of the trap status could observe and which is not lowered; LLVM 15 prints both encodings of
+        # each without a suffix (#1791).
+        if line in ("v_clrexcp", "v_clrexcp_e64", "v_pipeflush", "v_pipeflush_e64"):
+            if mask != "entry":
+                raise ValueError(f"Unexpected {line} with non-entry mask")
             continue
         # Scheduling, performance and trace hints with no effect on results. Each operand is limited to the width of
         # its RDNA 2 field: clause length minus one, wave priority, sleep duration, the performance counter in
