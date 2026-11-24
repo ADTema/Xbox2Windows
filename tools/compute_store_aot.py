@@ -1050,7 +1050,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"(?:buffer_load_(?:dword|(?P<subword>[us](?:byte|short)))"
+        elif m := re.fullmatch(r"(?:buffer_load_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>[us](?:byte|short))"
+                               r"|(?P<d16_kind>[us]byte|short)_d16(?P<hi>_hi)?)"
                                r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
@@ -1058,16 +1059,20 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                                r"(?: offset:(?P<offset>\d+))?", line):
             channels = m["channels"]
             packed = channels is not None and channels.startswith("d16_")
-            components = len(channels.removeprefix("d16_")) if channels else 1
+            raw_count = m["raw_count"]
+            components = len(channels.removeprefix("d16_")) if channels else int(raw_count or 1)
             count = (components + 1) // 2 if packed else components
             dst, *last = map(int, re.findall(r"\d+", m["dst"]))
             base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
-            subword = m["subword"]
+            d16_kind = m["d16_kind"]
+            subword = m["subword"] or d16_kind
             width = 4 if subword is None else 1 if subword.endswith("byte") else 2
             if subword and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported subword buffer read target or address mode")
+            if raw_count and (cpu != "gfx1030" or not idxen or offen):
+                raise ValueError("Unsupported vector buffer read target or address mode")
             if channels and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported typed buffer read target or address mode")
             # The three-component D16 form uses the four-component 16-bit format.
@@ -1076,6 +1081,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported typed buffer read format")
             if last != ([] if count == 1 else [dst + count - 1]) or dst + count > 256:
                 raise ValueError("Unverified buffer read destination")
+            old = vector.get(dst) if d16_kind else None
+            if d16_kind and not is_word(old):
+                raise ValueError("Unverified D16 buffer read destination input")
             if (high != base + 3 or base % 4 or high > 105
                     or pending.intersection(range(base, high + 1))):
                 raise ValueError("Unverified buffer read descriptor")
@@ -1103,6 +1111,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {aligned + 4*i}u" for i in range(count)]
             else:
                 raise ValueError("Unsupported read address")
+            # The address has been captured, so the index can alias a destination.
             for reg, address in enumerate(addresses, dst):
                 vector.pop(reg, None)
                 # Whole-word consumers cannot read the undefined upper half of an odd D16 result.
@@ -1112,9 +1121,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     # The stride and SRV base are DWORD-aligned, so the enclosing word stays in the record.
                     bits, shift = width * 8, (offset % 4) * 8
                     field = f"(({hlsl_word(word)} >> {shift}u) & {((1 << bits) - 1):#x}u)"
-                    if subword.startswith("s"):
+                    if subword in ("sbyte", "sshort"):
                         sign = f"{1 << (bits - 1):#x}u"
                         field = f"(({field} ^ {sign}) - {sign})"
+                    if d16_kind:
+                        hi = bool(m["hi"])
+                        keep = "0xffffu" if hi else "0xffff0000u"
+                        field = f"(({hlsl_word(old)} & {keep}) | (({field} & 0xffffu) << {16 if hi else 0}u))"
+                        if len(field) > ALU_EXPRESSION_LIMIT:
+                            raise ValueError("D16 buffer read expression is too large")
                     word = ("alu", field)
                 loading[reg] = word
         elif m := re.fullmatch(r"image_load (v\d+|v\[\d+:\d+\]), (?:v\[(\d+):(\d+)\]|v(\d+)), "
@@ -1161,31 +1176,39 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 reg = first + index
                 vector.pop(reg, None)
                 loading[reg] = ("alu", f"{name}.{'xyzw'[index]}")
-        elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|"
+        elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
                                r"tbuffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
-                               r"(v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), s\[(\d+):(\d+)\], 0"
+                               r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "
+                               r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
             channels = m["channels"]
             packed = channels is not None and channels.startswith("d16_")
-            components = len(channels.removeprefix("d16_")) if channels else int(m[1] or 1)
+            components = len(channels.removeprefix("d16_")) if channels else int(m["raw_count"] or 1)
             partial = packed and components % 2 != 0
             count = (components + 1) // 2 if packed else components
             idxen, offen = m["idxen"], m["offen"]
+            subword = m["subword"]
+            if subword and (cpu != "gfx1030" or not idxen or offen or stride is None):
+                raise ValueError("Unsupported subword buffer store target or address mode")
+            width = {"byte": 1, "short": 2}.get(subword, 4)
             format_components = 4 if packed and components == 3 else components
             fmt = f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT"
             if channels and (cpu != "gfx1030" or not idxen or offen or m["format"] != fmt):
                 raise ValueError("Unsupported typed buffer store format, target or address mode")
-            first, *last = map(int, re.findall(r"\d+", m[3]))
-            base, high = int(m[5]), int(m[6])
+            first, *last = map(int, re.findall(r"\d+", m["data"]))
+            base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             if (last != ([] if count == 1 else [first + count - 1])
-                    or high != base + 3 or base % 4 or offset % 4 or offset > 4095
+                    or high != base + 3 or base % 4 or offset % width or offset > 4095
                     or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
                 raise ValueError("Unverified raw UAV store")
+            byte_shift = (offset % 4) * 8
+            # Reserve and address the containing DWORD for a subword store.
+            offset &= ~3
             address = f"{offset}u"
-            addr = m[4]
+            addr = m["addr"]
             addr_regs = list(map(int, re.findall(r"\d+", addr)))
             tags = [vector.get(reg) for reg in addr_regs]
             if addr == "off" and not idxen and not offen and dims == (1, 1, 1) and stride is None:
@@ -1250,7 +1273,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if not all(is_word(value) for value in values):
                 raise ValueError("Store data is not a known word")
             words = list(map(hlsl_word, values))
-            if partial:
+            if subword:
+                # The indexed layout and whole-DWORD reservation make the read/modify/write single-writer.
+                mask = (1 << (width * 8)) - 1
+                keep = 0xffffffff ^ (mask << byte_shift)
+                source_shift = 16 if m["store_hi"] else 0
+                words[0] = (f"((outputData.Load({address}) & {keep:#x}u) | "
+                            f"((({words[0]} >> {source_shift}u) & {mask:#x}u) << {byte_shift}u))")
+            elif partial:
                 # Reserve the entire final DWORD, including the untouched high half. The indexed
                 # layout, aligned stride and overlap checks give that word a single writer.
                 final_address = address if count == 1 else f"{address} + 4u"
