@@ -202,6 +202,13 @@ target_include_directories(xmem_commit_protection_check PRIVATE src)
 target_compile_features(xmem_commit_protection_check PRIVATE cxx_std_20)
 add_test(NAME xmem_commit_protection COMMAND xmem_commit_protection_check)
 set_tests_properties(xmem_commit_protection PROPERTIES TIMEOUT 30)
+
+# Slab slot bookkeeping of the physical pages (#1199): standard C++17 only, no Windows calls.
+add_executable(xmem_slab_slots_check tests/xmem_slab_slots_check.cpp)
+target_include_directories(xmem_slab_slots_check PRIVATE src)
+target_compile_features(xmem_slab_slots_check PRIVATE cxx_std_17)
+add_test(NAME xmem_slab_slots COMMAND xmem_slab_slots_check)
+set_tests_properties(xmem_slab_slots PROPERTIES TIMEOUT 30)
 if(EXISTS "${INTAKE_PYTHON}")
     # Startup memory accounting (#1199): the live physical-page section snapshot, and the peak commit
     # and section count the DirectStorage heartbeat reports from it.
