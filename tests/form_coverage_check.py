@@ -861,9 +861,9 @@ def check_parsing():
            "l:  mov DWORD PTR [rdx], eax ; c\ng:: ud2\n    emit rax\nvalue DQ 0\n    dd 1\n    ret\nx ENDP\nEND\n")
     assert fc.masm_mnemonics(asm) == {"cmpxchg", "movsb", "jae", "jne", "mov", "ud2", "ret"}, fc.masm_mnemonics(asm)
     # Anonymous labels, conditional-assembly directives and assembly-time assignments are not instructions.
-    asm = ("@@:\n    mov eax, ecx\n    jmp @b\nword_index = 0\n"
-           "REPT 2\n    nop\nENDM\nIFIDNI <a>, <b>\n    ret\nENDIF\n")
-    assert fc.masm_mnemonics(asm) == {"mov", "jmp", "nop", "ret"}, fc.masm_mnemonics(asm)
+    pseudo_ops_asm = ("@@:\n    mov eax, ecx\n    jmp @b\nword_index = 0\n"
+                      "REPT 2\n    nop\nENDM\nIFIDNI <a>, <b>\n    ret\nENDIF\n")
+    assert fc.masm_mnemonics(pseudo_ops_asm) == {"mov", "jmp", "nop", "ret"}, fc.masm_mnemonics(pseudo_ops_asm)
     with tempfile.TemporaryDirectory() as tmp:
         isolated = fc.measure({}, sample_repo(tmp, {"branch": asm}))["x64_zen2"]
         assert isolated["fixture_forms_not_in_reference"] == [], isolated["fixture_forms_not_in_reference"]
