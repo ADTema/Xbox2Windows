@@ -6018,6 +6018,18 @@ the handler writes back in one statement. VGPR pairs, SGPR pairs and the integer
 sources; the low word is always shifted unsigned and only the arithmetic form signs the high word.
 Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_b64_shift$' -V`.
 
+**The 32-bit scalar complement logic operations.** The scalar table had `s_nand_b64`, `s_nor_b64` and
+`s_xnor_b64` and the 32-bit `s_andn2_b32` and `s_orn2_b32`, but not `s_nand_b32`, `s_nor_b32` or `s_xnor_b32`
+(#870, issue #1919). They now lower as `~(S0 & S1)`, `~(S0 | S1)` and `~(S0 ^ S1)` on 32 bits, the text
+`pixel_aot` uses, and set SCC when the result is nonzero like the other logic operations. The check decodes
+SGPR, in-place, inline-constant, literal and m0-destination forms and evaluates the emitted lines against an
+integer reference over 0, all ones, alternating bits, every single bit and mixed words. Lane-mask and
+vcc_lo/exec_lo forms must emit the non-complement sibling's lines with the operation complemented. A table
+entry without the complement or without the SCC write must fail, and SOP2 operations with no lowering stay
+refused by name. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sop2_complement$' -V`; with
+LLVM 15, `tests/startup_gfx2hlsl_sop2_complement_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip
+the same words.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
