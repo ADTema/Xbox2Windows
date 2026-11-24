@@ -313,6 +313,12 @@ void first_creation(CreateFn create)
 void shape_contexts()
 {
     check(shape_alloc_fn(nullptr) == no_pointer, "AcpHalAllocateShapeContexts(null) returns E_POINTER");
+    if (void* ro = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY)) {
+        check(shape_alloc_fn(ro) == no_pointer, "AcpHalAllocateShapeContexts(read-only) returns E_POINTER");
+        VirtualFree(ro, 0, MEM_RELEASE);
+    } else {
+        check(false, "VirtualAlloc PAGE_READONLY for shape_contexts negative control");
+    }
 
     ShapeContexts zero_ctx{};
     check(shape_alloc_fn(&zero_ctx) == ok, "AcpHalAllocateShapeContexts with all-zero counts succeeds");
@@ -362,6 +368,12 @@ void shape_contexts()
 void hal_and_address_mapping()
 {
     check(hal_create_fn(nullptr) == no_pointer, "AcpHalCreate(null) returns E_POINTER");
+    if (void* ro = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY)) {
+        check(hal_create_fn(ro) == no_pointer, "AcpHalCreate(read-only) returns E_POINTER");
+        VirtualFree(ro, 0, MEM_RELEASE);
+    } else {
+        check(false, "VirtualAlloc PAGE_READONLY for AcpHalCreate negative control");
+    }
     void* hal = nullptr;
     check(hal_create_fn(&hal) == ok && hal != nullptr, "AcpHalCreate returns stand-in object");
     if (hal) {
@@ -385,10 +397,15 @@ void hal_and_address_mapping()
     check(map_apu_fn(apu + 0x80) == inner, "ApuMapApuAddress maps interior APU address");
 
     // Negative controls for address validity and mapping.
+    auto* heap_base = static_cast<unsigned char*>(block) - apu;
     check(valid_fn(nullptr) == 0, "ApuIsVirtualAddressValid(null) is 0");
     check(valid_fn(&failures) == 0, "ApuIsVirtualAddressValid(foreign) is 0");
+    check(valid_fn(heap_base - 1) == 0, "ApuIsVirtualAddressValid(before heap) is 0");
+    check(valid_fn(heap_base + heap_size) == 0, "ApuIsVirtualAddressValid(at heap end) is 0");
     check(map_fn(nullptr) == 0, "ApuMapVirtualAddress(null) is 0");
     check(map_fn(&failures) == 0, "ApuMapVirtualAddress(foreign) is 0");
+    check(map_fn(heap_base - 1) == 0, "ApuMapVirtualAddress(before heap) is 0");
+    check(map_fn(heap_base + heap_size) == 0, "ApuMapVirtualAddress(at heap end) is 0");
     check(map_apu_fn(0) == nullptr, "ApuMapApuAddress(0) is null");
     check(map_apu_fn(heap_size) == nullptr, "ApuMapApuAddress(heap_size) is null");
     check(map_apu_fn(heap_size + 0x1000) == nullptr, "ApuMapApuAddress(past end) is null");
@@ -400,6 +417,8 @@ void hal_and_address_mapping()
 int run_trap_control(const char* dll_path, const char* export_name)
 {
     SetEnvironmentVariableA("X2W_AUDIO_PERMISSIVE", nullptr);
+    SetEnvironmentVariableA("X2W_TRAP_CONTINUE", nullptr);
+    SetEnvironmentVariableA("X2W_TRAP_FAIL", nullptr);
     HMODULE module = LoadLibraryA(dll_path);
     if (!module) return 2;
     FARPROC proc = GetProcAddress(module, export_name);
@@ -454,7 +473,7 @@ void check_non_permissive_traps(const char* self_exe, const char* dll_path)
     check_trap_case(self_exe, dll_path, "ApuIsVirtualAddressValid", 0xE2570106u);
     check_trap_case(self_exe, dll_path, "ApuMapApuAddress", 0xE2570107u);
     check_trap_case(self_exe, dll_path, "ApuMapVirtualAddress", 0xE2570108u);
-    if (shape_release_fn) check_trap_case(self_exe, dll_path, "AcpHalReleaseShapeContexts", 0xE2570102u);
+    check_trap_case(self_exe, dll_path, "AcpHalReleaseShapeContexts", 0xE2570102u);
 }
 }  // namespace
 
@@ -474,7 +493,8 @@ int main(int argc, char** argv)
     shape_alloc_fn = reinterpret_cast<ShapeAllocFn>(GetProcAddress(module, "AcpHalAllocateShapeContexts"));
     shape_release_fn = reinterpret_cast<ShapeReleaseFn>(GetProcAddress(module, "AcpHalReleaseShapeContexts"));
     auto create = reinterpret_cast<CreateFn>(GetProcAddress(module, "ApuCreateHeap"));
-    if (!alloc_fn || !free_fn || !map_fn || !map_apu_fn || !valid_fn || !hal_create_fn || !shape_alloc_fn || !create)
+    if (!alloc_fn || !free_fn || !map_fn || !map_apu_fn || !valid_fn || !hal_create_fn || !shape_alloc_fn ||
+        !shape_release_fn || !create)
         return std::printf("FAIL: missing export\n"), 2;
     void* none = nullptr;
     check(take(&none, 64) == no_memory && !none, "no heap yet");
