@@ -124,7 +124,7 @@ def entry_registers(rsrc2):
     TG_SIZE_EN (bit 10) is refused: the gfx1013 TG_SIZE word layout and the guest wave width
     are not established, so its register cannot be given a value.
     """
-    if not 0 <= rsrc2 < 1 << 32:
+    if not isinstance(rsrc2, int) or isinstance(rsrc2, bool) or not 0 <= rsrc2 < 1 << 32:
         raise ValueError("Invalid COMPUTE_PGM_RSRC2")
     if rsrc2 >> 10 & 1:
         raise ValueError("COMPUTE_PGM_RSRC2 TG_SIZE_EN is not supported")

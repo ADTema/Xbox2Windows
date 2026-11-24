@@ -144,9 +144,19 @@ def controls():
             (user(2) | TGID_X | TGID_Z | tidig(2), (2, {0: 2, 2: 3}, 3)),
             (user(3) | TGID_Y | TGID_Z | tidig(1), (3, {1: 3, 2: 4}, 2)),
             (user(5) | TGID_X | TGID_Y | TGID_Z | tidig(2), (5, {0: 5, 1: 6, 2: 7}, 3)),
-            (user(2), (2, {}, 1))):
+            (user(2), (2, {}, 1)),
+            # USER_SGPR is five bits wide: 16 and 31 user SGPRs put group X in s16 and s31.
+            (user(16) | TGID_X, (16, {0: 16}, 1)),
+            (user(31) | TGID_X | TGID_Z, (31, {0: 31, 2: 32}, 1))):
         assert aot.entry_registers(rsrc2) == placed, (hex(rsrc2), aot.entry_registers(rsrc2))
     rejects("thread-ID component count", aot.entry_registers, user(2) | TGID_X | tidig(3))
+    # Fields outside USER_SGPR, TGID_X/Y/Z_EN, TG_SIZE_EN and TIDIG_COMP_CNT do not change the placement:
+    # bit 0, TRAP_PRESENT (bit 6), bits 13-14, an LDS size in bits 15-23 and bit 31.
+    plain = user(3) | TGID_Y | TGID_Z | tidig(1)
+    for other in (1, 1 << 6, 3 << 13, 0x1ff << 15, 1 << 24, 1 << 31):
+        assert aot.entry_registers(plain | other) == aot.entry_registers(plain), hex(other)
+    for value in (-1, 1 << 32, 1.0, "0x484", True):
+        rejects("Invalid COMPUTE_PGM_RSRC2", aot.entry_registers, value)
     print("entry_registers: user SGPRs, then the enabled group IDs in X, Y, Z order; TIDIG_COMP_CNT 0-2")
 
     # TG_SIZE_EN is refused, alone, with group IDs and in a translation.
