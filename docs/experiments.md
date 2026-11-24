@@ -3644,7 +3644,7 @@ group has its own record and that the complete write fits the declared
 stride without overlapping another store. The caller supplies a DWORD-aligned
 view base and fully in-range, unswizzled records with thread-ID addition
 disabled in the descriptor and no address wrap or external writers. Partial
-texel writes, packed D16 data, other formats and cache modifiers are refused.
+texel writes, other format combinations and cache modifiers are refused.
 
 The wave32 fixtures dispatch one and two groups of 16 threads. Each thread
 writes distinct channel words after one padding DWORD. A CPU reference
@@ -3655,6 +3655,41 @@ check descriptor and VGPR waits, mismatched formats, bad register ranges,
 misalignment, record overruns and store overlap. The LLVM 15 test assembles
 and disassembles every form and compares the compute-container CLI output
 with direct lowering. The GPU fixtures execute the translated desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_store_format_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+### Indexed gfx1030 formatted D16 UINT buffer writes
+
+The compute store profile accepts `buffer_store_format_d16_x`, `_xy` and
+`_xyzw` with `--output-format BUF_FMT_16_UINT`, `BUF_FMT_16_16_UINT` or
+`BUF_FMT_16_16_16_16_UINT`, respectively. The caller declares the format and
+identity destination selectors. The [AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+(§8.1.4 and MUBUF opcodes 132–135) sends packed 16-bit channels to the
+texture unit, low half first. The profile requires a whole texel. The ISA
+format table has no three-channel 16-bit UINT format, and the `xyz` form
+with a four-channel descriptor still needs a native fourth-channel check.
+
+The D16 forms use the same verified `idxen`, zero scalar offset,
+DWORD alignment and record bounds as the ordinary UINT forms. For `x`,
+the raw UAV lowering reserves the containing DWORD and preserves its high
+half with a read/modify/write. The caller supplies an in-range, exclusively
+owned DWORD even though the original instruction writes two bytes. The
+translator refuses any store that overlaps that DWORD, including an
+otherwise disjoint halfword write.
+
+The shared formatted store fixture compares all 320 output words on
+WARP and a physical adapter at one and two groups. The CPU reference copies
+selected bytes into the initial output. Clearing the preserved half for
+`x` or swapping the first two channels for `xy` and `xyzw` must produce a
+difference at word 1. LLVM 15 also exercises each encoding through the
+compute-container CLI.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check

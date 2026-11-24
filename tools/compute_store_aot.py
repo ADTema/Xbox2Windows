@@ -180,6 +180,8 @@ def labelled(decoded):
 
 MUBUF_UINT_FORMATS = tuple(f"BUF_FMT_{'32_' * count}UINT" for count in range(1, 5))
 MUBUF_SOURCE_FORMAT = MUBUF_UINT_FORMATS[-1]
+MUBUF_D16_OUTPUT_FORMATS = {1: "BUF_FMT_16_UINT", 2: "BUF_FMT_16_16_UINT", 4: "BUF_FMT_16_16_16_16_UINT"}
+MUBUF_OUTPUT_FORMATS = (*MUBUF_UINT_FORMATS, *MUBUF_D16_OUTPUT_FORMATS.values())
 MUBUF_TEXEL_BYTES = 16
 MUBUF_D16_SOURCE_FORMAT = "BUF_FMT_16_16_16_16_UINT"
 MUBUF_D16_TEXEL_BYTES = 8
@@ -240,7 +242,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         raise ValueError("Invalid group register")
     if stride is not None and (not group_regs or not 4 <= stride <= 0x3fff or stride % 4):
         raise ValueError("Indexed stores require a group register and aligned stride")
-    if output_format is not None and (output_format not in MUBUF_UINT_FORMATS or cpu != "gfx1030"
+    if output_format is not None and (output_format not in MUBUF_OUTPUT_FORMATS or cpu != "gfx1030"
                                       or stride is None):
         raise ValueError("Unsupported formatted output binding")
     scalar = {table_reg: "table"}
@@ -1235,12 +1237,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported typed buffer store format, target or address mode")
             formatted = channels is not None and not m["typed"]
             if formatted:
-                if cpu != "gfx1030" or packed or not idxen or offen:
+                if cpu != "gfx1030" or not idxen or offen:
                     raise ValueError("Unsupported formatted buffer store target or address mode")
                 if output_format is None:
                     raise ValueError("Formatted buffer stores require an output format")
                 # Only whole texels with identity selectors are proven here.
-                if output_format != MUBUF_UINT_FORMATS[components - 1]:
+                if packed and components not in MUBUF_D16_OUTPUT_FORMATS:
+                    raise ValueError("Formatted D16 buffer store requires a matching whole-texel format")
+                expected = MUBUF_D16_OUTPUT_FORMATS[components] if packed else MUBUF_UINT_FORMATS[components - 1]
+                if output_format != expected:
                     raise ValueError("Formatted buffer store width does not match output format")
             first, *last = map(int, re.findall(r"\d+", m["data"]))
             base, high = int(m["base"]), int(m["high"])
@@ -1394,7 +1399,7 @@ def main():
     parser.add_argument("--source-stride", type=int, help="Indexed t0 byte stride")
     parser.add_argument("--source-format", choices=MUBUF_SOURCE_TEXELS,
                         help="Caller-declared MUBUF t0 descriptor format with identity channel selectors")
-    parser.add_argument("--output-format", choices=MUBUF_UINT_FORMATS,
+    parser.add_argument("--output-format", choices=MUBUF_OUTPUT_FORMATS,
                         help="Caller-declared MUBUF u0 descriptor format with identity channel selectors")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset of the 8-dword image descriptor bound to t0")
