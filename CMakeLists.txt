@@ -7343,6 +7343,22 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(pe_run_package_trap_missing PROPERTIES TIMEOUT 60)
     add_test(NAME bink_heap_aot_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bink_heap_aot_check.py")
+    # Documented in the AGENTS platform-independent list but never registered here, so ctest did
+    # not run them locally while the CI Python job did.
+    add_test(NAME bidi_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/bidi_controls_check.py")
+    add_test(NAME compat_report COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/compat_report_check.py")
+    add_test(NAME form_coverage COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/form_coverage_check.py")
+    add_test(NAME gpu_report_format COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/gpu_report_format_check.py")
+    add_test(NAME hardware_reports COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/hardware_reports_check.py")
+    add_test(NAME shader_corpus_report COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/shader_corpus_report_check.py")
+    add_test(NAME xgameruntime_table COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xgameruntime_table_check.py")
     add_test(NAME ffx_create_context_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/ffx_create_context_check.py")
 else()
