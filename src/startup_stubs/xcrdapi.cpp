@@ -398,7 +398,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     bool cached_chunked = false;
                     // If the stream expanded beyond this request's destination and continuation chunks are queued
                     // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1214).
-                    if (!memory_source && produced > destination_size && self && self->work) {
+                    // BCPack streams are atomic multi-lane rANS payloads; they are not chunk-split continuation streams (Refs #1139).
+                    if (!memory_source && !bcpack && produced > destination_size && self && self->work) {
                         auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size, destination_size, produced);
                         if (!continuation_ids.empty()) {
                             QueueWork& work = *self->work;
@@ -850,6 +851,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                                   static_cast<unsigned long long>(sample.sections));
                 else
                     std::snprintf(section_text, sizeof(section_text), "unknown");
+                // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
+                // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
                     "still 0 at run=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
                     requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, memory,

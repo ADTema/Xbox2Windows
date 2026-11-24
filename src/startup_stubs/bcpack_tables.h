@@ -1,8 +1,13 @@
 // Generated BCPack model and codebook tables.
-// Adapted from bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com).
+// Codebook tables (BC7_CONTROL_TABLE, BC7_DICTIONARY, BC1_WINDOW, BC1_QUAD_MASKS) adapted
+// from bcpack-rs (pinned revision c55c5fad539644b8cf5a705051df214291763fc0)
+// by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com).
 // Source: https://github.com/Ahmet-Dedeler/bcpack-rs
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Also incorporates rANS interval constants derived from Microsoft silicon-rans (MIT License).
+//
+// rANS interval and probability tables (BASE_TABLE, FREQ_TABLE, RF_TABLE, RN_TABLE, RS_TABLE)
+// derived from Microsoft silicon-rans (commit 2f6827d / vendor rev 5bf5cc56 + Xbox2Windows multi-lane extensions).
+// SPDX-License-Identifier: MIT
 #pragma once
 #include <cstdint>
 

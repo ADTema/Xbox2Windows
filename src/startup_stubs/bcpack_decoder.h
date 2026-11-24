@@ -66,7 +66,7 @@ inline int32_t unzigzag(uint16_t v) {
 
 inline uint8_t residual(uint16_t sym, uint32_t prec) {
     int32_t unz = unzigzag(sym);
-    return static_cast<uint8_t>(unz & ((1i32 << prec) - 1));
+    return static_cast<uint8_t>(unz & ((int32_t{1} << prec) - 1));
 }
 
 inline uint8_t interleave(uint16_t even, uint16_t odd) {
@@ -134,7 +134,7 @@ struct Lane {
     uint32_t final_state = 0;
 };
 
-inline bool phase1(size_t /*i*/, Lane& ln) {
+inline bool phase1(Lane& ln) {
     switch (ln.state) {
     case LANE_IDLE:
         if (ln.go) {
@@ -221,6 +221,9 @@ inline bool phase1(size_t /*i*/, Lane& ln) {
             }
         } else if (x <= 0x1000000) {
             if (new_out > 0) {
+                // A flushed fragment must return to the rANS home state (0x1000000).
+                // Merely being <= L could silently accept a damaged fragment.
+                if (ln.flush && x != 0x1000000) return false;
                 ln.state = LANE_HDR0;
                 ln.virtual_zeros = 0;
                 if (ln.flush) {
@@ -311,7 +314,7 @@ inline bool decode_lanes(const uint8_t* input, size_t input_size,
         for (size_t i = 0; i < num_lanes; ++i) {
             Lane& ln = lanes[i];
             if (!ln.stall) {
-                if (!phase1(i, ln)) return false;
+                if (!phase1(ln)) return false;
             }
             uint32_t bit = 1u << i;
             if (!(ln.done && !ln.sym_full && (slots & bit) == 0)) {
@@ -529,6 +532,9 @@ inline bool decode_bc7_blocks(const std::vector<uint16_t>& symbols, size_t num_b
         uint16_t o15 = symbols[15 * target + 2 * i + 1];
         size_t code = ((o15 & 15) << 5) | (e15 & 31);
         if (code >= 512 || !BC7_CONTROL_TABLE[code].valid) {
+            // The reference decoder emits a zero block for unmapped codes; for valid BC7 streams
+            // all 285 mapped codes are legal. An unmapped code indicates stream corruption,
+            // so fail fast per repository fail-fast policy (Refs #1139).
             return false;
         }
         const Bc7Control& c = BC7_CONTROL_TABLE[code];
