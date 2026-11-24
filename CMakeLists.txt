@@ -1182,6 +1182,27 @@ set_tests_properties(d3d12x_device_create_hardware d3d12x_device_negative_hardwa
     SKIP_RETURN_CODE 77)
 set_tests_properties(d3d12x_device_negative_warp d3d12x_device_negative_hardware PROPERTIES
     PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice: unsupported IID \\{7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01\\}")
+# Negative control for the struct-return rejection cases: a build-tree copy of the adapter that
+# writes through the second candidate when neither candidate is the device.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/d3d12x_struct_return.cpp)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12x_struct_return.cpp" d3d12x_struct_return_text)
+string(REGEX REPLACE "} else {(\r?\n +)return nullptr;" "} else {\\1output = second;"
+    d3d12x_struct_return_control_text "${d3d12x_struct_return_text}")
+if(d3d12x_struct_return_control_text STREQUAL d3d12x_struct_return_text)
+    message(FATAL_ERROR "d3d12x_struct_return.cpp lost the anchor used by d3d12x_device_struct_return_neither_control")
+endif()
+set(d3d12x_struct_return_control "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_struct_return_control/d3d12x_struct_return.cpp")
+file(WRITE "${d3d12x_struct_return_control}" "${d3d12x_struct_return_control_text}")
+add_executable(d3d12x_device_struct_return_control tests/d3d12x_device_check.cpp
+    "${d3d12x_struct_return_control}" "${d3d12x_pso_header}")
+add_dependencies(d3d12x_device_struct_return_control d3d12_xs_shim)
+target_include_directories(d3d12x_device_struct_return_control PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" src)
+target_compile_features(d3d12x_device_struct_return_control PRIVATE cxx_std_17)
+target_link_libraries(d3d12x_device_struct_return_control PRIVATE d3d12 dxgi)
+add_test(NAME d3d12x_device_struct_return_neither_control_warp COMMAND d3d12x_device_struct_return_control
+    "$<TARGET_FILE:d3d12_xs_shim>" struct-return warp)
+set_tests_properties(d3d12x_device_struct_return_neither_control_warp PROPERTIES
+    PASS_REGULAR_EXPRESSION "FAIL: struct_return reject neither_is_device: returned ")
 # Static-sampler root signature and compute PSO through D3D12XboxCreateDevice (#XCL-19).
 foreach(adapter IN ITEMS warp hardware)
     add_test(NAME d3d12x_pso_static_sampler_${adapter} COMMAND d3d12x_device_check
