@@ -3473,6 +3473,44 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_subword_' -V
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### gfx1030 fixed-address MUBUF atomic reductions
+
+The compute store profile lowers one non-returning 32-bit MUBUF atomic
+reduction targeting the raw `u0` view. The supported operations are
+`buffer_atomic_add`, `_sub`, `_and`, `_or`, `_xor`, `_smin`, `_umin`,
+`_smax` and `_umax`. The [AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+(§8.1.8 and MUBUF opcodes 50–59) defines the integer operations and uses
+`glc` to request the previous value. With `glc` clear, the translator
+uses the corresponding HLSL `Interlocked` method. Subtraction uses
+addition of the two's-complement operand, and min/max select the signed
+or unsigned overload. The final reduction value is independent of lane
+execution order.
+
+The atomic uses `off`, zero scalar offset and a DWORD-aligned immediate
+in a caller-supplied, in-range, DWORD-aligned view. The caller uses a
+valid linear descriptor without thread-ID addition. The output descriptor
+must be ready at `lgkmcnt(0)`, and the data VGPR must hold a known word.
+The atomic is the program's sole UAV access and can run under a supported
+lane guard. Indexed addressing, extra cache or return flags, and other
+atomic opcodes are rejected.
+
+One and two groups of 32 lanes contend on the same DWORD, with a guard
+leaving 63 participants in the second dispatch. Both sizes compare all
+320 output words with the CPU reference. Operands span all four high-bit
+patterns to distinguish signed and unsigned reductions. The wrong-operation
+and wrong-signedness mutants must differ first at word 1. LLVM 15 checks
+the encoding and the compute-container CLI, and the execution tests run
+the translated desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_reduction_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### Indexed gfx1030 raw vector reads
 
 The compute store profile also lowers `buffer_load_dwordx2`,
