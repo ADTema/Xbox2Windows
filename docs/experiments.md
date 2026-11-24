@@ -4870,6 +4870,14 @@ The LLVM 15 round trip assembles and disassembles the fixture as for the other f
 
 Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_bcnt_exec_(warp|hardware)$' -V`.
 
+#### Writing one lane of a vector register
+
+`v_writelane_b32 vD, sS, lane` writes the uniform scalar `sS` to lane `lane & 31` of `vD` and leaves the other lanes unchanged, ignoring `exec`. gfx10 numbers lanes by `SV_GroupIndex` modulo the wave size, so per thread it lowers to `((gindex & 31u) == (lane & 31u)) ? sS : old_vD` under `wave_size=32`, where the lane is masked to 5 bits. A group of at most 32 threads is accepted without `wave_size=32` only when the lane is a known constant below 32 (since wave64 selects `lane[5:0]`, not `lane[4:0]`); larger groups require `wave_size=32`. Refused, each with its own control: an unknown or pending scalar source, an unknown or pending lane (or a lane not known to be `< 32` without `wave_size=32`), an unknown old `vD`, a use inside a guarded region, a group larger than 32 without `wave_size=32`, and `vD` above `v255`.
+
+The fixture runs one group of 64 threads with `wave_size=32`. Each thread starts with `v4 = tid.x + 1`, then `v_writelane_b32` writes `0x11223344` to lane 3 (via SGPR `s4` and inline constant `3`) and `0x55667788` to lane 31 (via literal `0x55667788` and SGPR `s5`). Both wave32 waves receive the writes, and all 320 words are compared against a Python reference. Reference controls must fail for: `gindex` without `& 31` (word 35), lane off by one (word 3), the scalar not written (word 3), and a changed sentinel past the group (word 64). Recompiled HLSL must also fail on the device with `gindex` without `& 31u`, `!=` for `==`, and `0` in place of the old `vD`.
+
+Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_writelane_(warp|hardware)$' -V`.
+
 ### Scalar ALU on known words
 
 The store profile also accepts these scalar 32-bit operations. Both sources are known words: an SGPR that holds one, an integer inline constant or a 32-bit literal.
