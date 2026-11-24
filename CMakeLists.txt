@@ -6763,6 +6763,14 @@ foreach(adapter IN ITEMS warp hardware)
         vm_raw_uav_${adapter}
         PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
+# Bounds, alignment, 64-bit offsets and view fields of make_raw_buffer_srv (src/raw_buffer_srv.h),
+# without a device. The mutated run is the negative control.
+add_executable(raw_buffer_srv_check tests/raw_buffer_srv_check.cpp)
+target_include_directories(raw_buffer_srv_check PRIVATE src)
+target_compile_features(raw_buffer_srv_check PRIVATE cxx_std_17)
+add_test(NAME raw_buffer_srv COMMAND raw_buffer_srv_check)
+add_test(NAME raw_buffer_srv_first_32_control COMMAND raw_buffer_srv_check --mutate first-32)
+set_tests_properties(raw_buffer_srv_first_32_control PROPERTIES WILL_FAIL TRUE)
 # Window validation and touching-window boundaries of resolve_raw_uav_store (src/raw_buffer_uav.h),
 # without a device. The mutated run is the negative control.
 add_executable(raw_buffer_uav_check tests/raw_buffer_uav_check.cpp)
