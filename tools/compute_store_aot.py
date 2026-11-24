@@ -530,6 +530,24 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Invalid scalar destination or movk immediate")
             signed = value - 0x10000 if value >= 0x8000 else value
             scalar[dst] = signed & 0xffffffff
+        elif m := re.fullmatch(r"s_bcnt1_i32_b32 s(\d+), (\S+)", line):
+            # Active lane count of a full wave: sD = popcount(exec_lo), SCC = sD != 0 (SCC is unread in this
+            # subset). Outside a guarded region exec covers the whole wave: at most 32 threads is one wave of
+            # either size, larger groups need wave_size=32 and a multiple of 32 threads.
+            dst, src = int(m[1]), m[2]
+            if src != "exec_lo":
+                raise ValueError("Unsupported active lane count source: " + src)
+            if dst in pending or dst > 105:
+                raise ValueError("Invalid scalar destination or pending load")
+            if guard is not None:
+                raise ValueError("Active lane count inside guarded region")
+            threads = dims[0] * dims[1] * dims[2]
+            if threads <= 32:
+                scalar[dst] = threads
+            elif wave_size == 32 and threads % 32 == 0:
+                scalar[dst] = 32
+            else:
+                raise ValueError("Unverified active lane count wave size or group size")
         elif m := re.fullmatch(r"s_bitreplicate_b64_b32 s\[(\d+):(\d+)\], (\S+)", line):
             # Each source bit fills two adjacent bits of the pair: D[2i] = D[2i + 1] = S0[i]. With an immediate
             # source both halves are known words; the low one replicates bits 0-15 and the high one bits 16-31.

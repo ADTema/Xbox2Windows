@@ -364,6 +364,7 @@ def controls():
     f32_controls()
     scalar_alu_controls()
     mbcnt_controls()
+    bcnt_exec_controls()
 
 
 def grid_controls():
@@ -1398,6 +1399,111 @@ def mbcnt_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"mbcnt: mutation '{label}' escaped detection")
+    return 0
+
+
+BCNT_EXEC = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_bcnt1_i32_b32 s4, exec_lo",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_mad_u32_u24 v1, v3, 64, s4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v1, v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+BCNT_EXEC_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=4, wave_size=32)
+
+
+def bcnt_exec_words(*, count=32):
+    """Independent reference for one BCNT_EXEC group: per thread, flat * 64 + count."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        words[flat] = flat * 64 + count
+    return words
+
+
+def bcnt_exec_controls():
+    """Active lane count of a full wave: exact output and one rejection per assumption."""
+    expected_line = "    outputData.Store(tid.x * 4u + 0u, (((tid.x & 0xffffffu) * (0x00000040u & 0xffffffu)) + 0x00000020u));"
+    lines = aot.lower(BCNT_EXEC, 64, **BCNT_EXEC_BINDING).splitlines()
+    assert lines[3] == expected_line, lines
+    unstated = dict(BCNT_EXEC_BINDING)
+    del unstated["wave_size"]
+    single = variant(BCNT_EXEC, ("s10, 6, v0", "s10, 5, v0"))
+    single_lines = aot.lower(single, 32, **unstated).splitlines()
+    assert single_lines[3] == expected_line, single_lines
+    # A group smaller than a wave counts its own threads, not 32.
+    partial = variant(BCNT_EXEC, ("s10, 6, v0", "s10, 4, v0"))
+    partial_lines = aot.lower(partial, 16, **unstated).splitlines()
+    assert partial_lines[3] == expected_line.replace("0x00000020u", "0x00000010u"), partial_lines
+    # Rejection tests:
+    rejects("Unverified active lane count wave size or group size", aot.lower, BCNT_EXEC, 64, **unstated)
+    rejects("Unverified active lane count wave size or group size", aot.lower, BCNT_EXEC, 48, **BCNT_EXEC_BINDING)
+    guarded = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx4 s[12:15], s[8:9], null",
+        "v_lshl_add_u32 v3, s10, 5, v0",
+        "v_cmp_lt_u32_e32 vcc_lo, 4, v3",
+        "s_and_saveexec_b32 s2, vcc_lo",
+        "s_bcnt1_i32_b32 s4, exec_lo",
+        "s_or_b32 exec_lo, exec_lo, s2",
+        "v_mad_u32_u24 v1, v3, 64, s4",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dword v1, v3, s[12:15], 0 idxen",
+        "s_endpgm",
+    ]
+    rejects("Active lane count inside guarded region", aot.lower, guarded, 32, **unstated)
+    for bad_src in ("exec_hi", "exec", "vcc_lo"):
+        rejects("Unsupported active lane count source: " + bad_src, aot.lower,
+                variant(BCNT_EXEC, ("s4, exec_lo", f"s4, {bad_src}")), 64, **BCNT_EXEC_BINDING)
+    rejects("Invalid scalar destination or pending load", aot.lower,
+            variant(BCNT_EXEC, ("s4, exec_lo", "s106, exec_lo")), 64, **BCNT_EXEC_BINDING)
+    rejects("Unsupported compute instruction", aot.lower,
+            [*BCNT_EXEC[:-1], "s_cbranch_scc0 0", "s_endpgm"],
+            64, **BCNT_EXEC_BINDING)
+
+
+def bcnt_exec_binary(directory, assembler, objcopy, library):
+    """The assembled BCNT_EXEC program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, BCNT_EXEC), library, offsets=True))
+    assert [line for line in decoded if line.startswith("s_bcnt1_i32_b32")] == [
+        line for line in BCNT_EXEC if line.startswith("s_bcnt1_i32_b32")], decoded
+    assert aot.lower(decoded, 64, **BCNT_EXEC_BINDING) == aot.lower(BCNT_EXEC, 64, **BCNT_EXEC_BINDING)
+
+
+def bcnt_exec_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("bcnt_exec.hlsl", "bcnt_exec.cso", "bcnt_exec.case")]
+    source = aot.lower(BCNT_EXEC, 64, **BCNT_EXEC_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = bcnt_exec_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[64] ^= 1
+    for label, reference, word in (("count off by one", bcnt_exec_words(count=33), 0),
+                                   ("group size instead of 32", bcnt_exec_words(count=64), 0),
+                                   ("untouched word", off, 64)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"bcnt_exec: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (("count off by one", source.replace("0x00000020u", "0x00000021u")),
+                           ("group size instead of 32", source.replace("0x00000020u", "0x00000040u"))):
+        if mutated == source:
+            raise AssertionError(f"bcnt_exec: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"bcnt_exec: mutation '{label}' escaped detection")
     return 0
 
 
@@ -3629,6 +3735,7 @@ def binary(directory, assembler, objcopy, library):
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
+    bcnt_exec_binary(directory, assembler, objcopy, library)
     mubuf_subword_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_store_cases(), "buffer_store_")
     ds_controls()
@@ -6380,6 +6487,7 @@ if __name__ == "__main__":
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
                  "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
                  "draw-mbcnt": mbcnt_draw,
+                 "draw-bcnt-exec": bcnt_exec_draw,
                  "draw-mtbuf-store": mtbuf_store_draw,
                  "draw-mubuf-subword-store": mubuf_subword_store_draw,
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES),
