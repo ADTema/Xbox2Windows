@@ -985,7 +985,7 @@ when either memory value changed, so the cost of a stalled load is visible. Each
 by a line of failed requests by cause (see DirectStorage failure causes under Findings).
 
 ```powershell
-cmake --build --preset release --target xmem_shim startup_stub_xcrdapi
+cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check
 ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|startup_heartbeat_commit)$' -V
 ```
 

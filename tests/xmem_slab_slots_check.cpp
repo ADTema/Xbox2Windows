@@ -147,7 +147,11 @@ void unwinding_a_fresh_slot_gives_it_back()
 {
     Slots slots(slot_bytes);
     Factory factory;
-    fresh(slots, factory);
+    const auto zero = fresh(slots, factory);
+    slots.unwind_fresh(zero);
+    counters(slots, 1, 0, per_slab);
+    CHECK(!slots.release(0, 0));  // unwound slot is not handed out
+    CHECK(fresh(slots, factory).offset == 0 && factory.made == 1);
     const auto lost = fresh(slots, factory);
     counters(slots, 1, 2, per_slab - 2);
     slots.unwind_fresh(lost);
