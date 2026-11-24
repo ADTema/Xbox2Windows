@@ -649,6 +649,16 @@ thread_local bool on_queue_worker = false;  // Submit from a worker must not wai
 
 void complete_deferred(Object* self, QueueWork* work);
 
+// True while snapshot entries of an earlier Submit are ready or being completed by some thread. The
+// worker starts no newer entry then, so a deferred completion and a normal one keep the same order.
+// The caller holds work.mutex.
+bool deferred_pending(const QueueWork& work)
+{
+    if (work.completing) return true;
+    if (!work.failing.empty() && work.failing.front().after <= work.finished_total) return true;
+    return work.deferred_head && work.deferred_head->after <= work.finished_total;
+}
+
 DWORD WINAPI queue_worker(void* parameter)
 {
     on_queue_worker = true;
@@ -658,7 +668,7 @@ DWORD WINAPI queue_worker(void* parameter)
         Entry entry;
         {
             std::unique_lock lock(work.mutex);
-            work.wake.wait(lock, [&] { return !work.submitted.empty(); });
+            work.wake.wait(lock, [&] { return !work.submitted.empty() && !deferred_pending(work); });
             entry = std::move(work.submitted.front());
             work.submitted.pop_front();
         }
@@ -955,6 +965,7 @@ void complete_deferred(Object* self, QueueWork* work)
                 if (!work->deferred_head) work->deferred_tail = nullptr;
             } else {
                 work->completing = false;
+                work->wake.notify_all();  // the worker may be waiting for the owner to finish
                 return;
             }
         }

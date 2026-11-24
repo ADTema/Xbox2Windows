@@ -565,11 +565,12 @@ std::atomic<int> completion_counter{0};
 HANDLE hold_entered = nullptr;
 HANDLE hold_release = nullptr;
 bool hold_prefix = false;
+void* hold_target = nullptr;  // a fence whose signal is held, wherever it runs
 
 long __stdcall held_signal(void* self, std::uint64_t)
 {
     auto* fence = static_cast<HoldFence*>(self);
-    if (hold_prefix) {
+    if (hold_prefix || self == hold_target) {
         SetEvent(hold_entered);
         WaitForSingleObject(hold_release, completion_timeout_ms);
     }
@@ -589,7 +590,9 @@ struct SubmitThread {
     }
 };
 
-bool suffix_waits_for_prefix(Fixture& f)
+// hold_deferred: the control holds the deferred (suffix) fence itself instead of the prefix. Whichever
+// thread owns that completion, a normal fence of a later Submit must not signal until it is released.
+bool suffix_waits_for_prefix(Fixture& f, bool hold_deferred)
 {
     void* hold_vtable[11] = {};
     hold_vtable[10] = reinterpret_cast<void*>(&held_signal);
@@ -608,6 +611,7 @@ bool suffix_waits_for_prefix(Fixture& f)
         ResetEvent(hold_entered);
         ResetEvent(hold_release);
         hold_prefix = false;
+        hold_target = nullptr;
         try {
             arm(fail_nth);
             reinterpret_cast<EnqueueSignalFn>(q.queue->vtable[5])(q.queue, &prefix_fence, 1);
@@ -630,13 +634,15 @@ bool suffix_waits_for_prefix(Fixture& f)
         }
         ++suffix_cases;
         completion_counter = 0;
-        hold_prefix = true;
+        hold_prefix = !hold_deferred;
+        hold_target = hold_deferred ? &suffix_fence : nullptr;
         SubmitThread submitter{&f, &q};
         HANDLE thread = CreateThread(nullptr, 0, SubmitThread::run, &submitter, 0, nullptr);
         if (!thread) return fail("cannot start the Submit thread");
         const bool held = WaitForSingleObject(hold_entered, completion_timeout_ms) == WAIT_OBJECT_0;
         // Submit snapshots the batch and returns without waiting for the held prefix.
-        const bool submit_returned = held && WaitForSingleObject(thread, completion_timeout_ms) == WAIT_OBJECT_0;
+        const bool submit_returned =
+            held && (hold_deferred || WaitForSingleObject(thread, completion_timeout_ms) == WAIT_OBJECT_0);
         // A second batch enqueued and submitted while the first prefix is held: its status and fence must
         // stay pending, and the first Submit must not have completed them.
         HoldFence second_fence;
@@ -653,6 +659,7 @@ bool suffix_waits_for_prefix(Fixture& f)
         WaitForSingleObject(thread, completion_timeout_ms);
         CloseHandle(thread);
         hold_prefix = false;
+        hold_target = nullptr;
         if (held && !submit_returned) return fail("Submit waited for the held prefix on the calling thread");
         if (!held) return fail("the worker never reached the held prefix fence");
         if (early) return fail("a status entry or fence of the failed suffix completed before the held prefix");
@@ -671,6 +678,9 @@ bool suffix_waits_for_prefix(Fixture& f)
     std::printf("suffix completes behind the prefix: %d cases\n", suffix_cases);
     return true;
 }
+
+bool suffix_waits_for_prefix_fence(Fixture& f) { return suffix_waits_for_prefix(f, false); }
+bool suffix_waits_for_deferred_fence(Fixture& f) { return suffix_waits_for_prefix(f, true); }
 
 // A crash is never silent: whatever ends the process names the stage it was in.
 const char* volatile current_stage = "start";
@@ -792,7 +802,8 @@ int main()
     if (!stage("every_allocation_on_every_thread_can_fail", every_allocation_on_every_thread_can_fail, f)) return 1;
     if (!stage("page_tokens_allocation_fails", page_tokens_allocation_fails, f)) return 1;
     if (!stage("entries_keep_their_order", entries_keep_their_order, f)) return 1;
-    if (!stage("suffix_waits_for_prefix", suffix_waits_for_prefix, f)) return 1;
+    if (!stage("suffix_waits_for_prefix", suffix_waits_for_prefix_fence, f)) return 1;
+    if (!stage("suffix_waits_for_deferred_fence", suffix_waits_for_deferred_fence, f)) return 1;
     std::puts("a queue that cannot start its worker or allocate completes status and fences at Submit, and recovers");
     return 0;
 }
