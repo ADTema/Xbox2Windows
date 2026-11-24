@@ -168,9 +168,9 @@ struct StoreCase {
 static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE shader,
                         D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false,
                         const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr,
-                        DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN)
+                        DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN, ID3D12Resource* rendered_texture = nullptr)
 {
-    if (texels && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
+    if ((texels || rendered_texture) && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
     ComPtr<ID3D12RootSignature> signature;
     check(device->CreateRootSignature(0, rootBytes.pShaderBytecode, rootBytes.BytecodeLength, IID_PPV_ARGS(&signature)),
           "Create compute root signature");
@@ -197,8 +197,8 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
     if (tables) {
         // An image-load case binds its output at u0 and the source texture at t0; the table
         // signature's UAV range starts at u0, while the root-descriptor path keeps u12.
-        heap = bind_tables(device, list.Get(), input.Get(), output.Get(), texture.Get(),
-                           texels ? 0 : uavs - 1);
+        auto* image = rendered_texture ? rendered_texture : texture.Get();
+        heap = bind_tables(device, list.Get(), input.Get(), output.Get(), image, image ? 0 : uavs - 1);
     } else {
         list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
@@ -315,6 +315,93 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
         throw std::runtime_error("Invalid compute image load reference");
     const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT : DXGI_FORMAT_R32G32B32A32_UINT;
     run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, &texels, format);
+}
+
+static ComPtr<ID3D12Resource> render_msaa_texture(ID3D12Device* device, D3D12_SHADER_BYTECODE vs,
+                                               D3D12_SHADER_BYTECODE ps)
+{
+    constexpr UINT side = 8;
+    constexpr DXGI_SAMPLE_DESC samples{4, 0};
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT format{DXGI_FORMAT_R32_UINT};
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{format.Format, samples.Count};
+    constexpr UINT required = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
+        D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD;
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format, sizeof(format))) ||
+        (format.Support1 & required) != required ||
+        FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality, sizeof(quality))) ||
+        !quality.NumQualityLevels)
+        return {};
+
+    D3D12_RESOURCE_DESC image{};
+    image.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    image.Width = image.Height = side;
+    image.DepthOrArraySize = image.MipLevels = 1;
+    image.Format = format.Format;
+    image.SampleDesc = samples;
+    image.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    auto texture = resource(device, image, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap_desc.NumDescriptors = 1;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "Create MSAA RTV heap");
+    const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+    device->CreateRenderTargetView(texture.Get(), nullptr, rtv);
+
+    D3D12_ROOT_SIGNATURE_DESC layout{};
+    ComPtr<ID3DBlob> blob;
+    check(D3D12SerializeRootSignature(&layout, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr), "Serialize MSAA draw root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
+          "Create MSAA draw root");
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = root.Get();
+    desc.VS = vs;
+    desc.PS = ps;
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.RasterizerState.MultisampleEnable = TRUE;
+    desc.SampleMask = UINT_MAX;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = format.Format;
+    desc.SampleDesc = samples;
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "Create MSAA input draw pipeline");
+    ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+    auto& list = commands.list;
+    list->SetGraphicsRootSignature(root.Get());
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT viewport{0, 0, side, side, 0, 1};
+    const D3D12_RECT scissor{0, 0, side, side};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->DrawInstanced(3, 1, 0, 0);
+    transition(list.Get(), texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    commands.submit_and_wait(device);
+    return texture;
+}
+
+bool check_compute_texture_msaa_file(ID3D12Device* device, const char* path, const char* reference,
+                                     const char* vs_path, const char* ps_path)
+{
+    StoreCase store{};
+    std::ifstream source(reference, std::ios::binary);
+    source.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
+    source.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
+    if (!source || source.peek() != std::char_traits<char>::eof() || store.groups != 1)
+        throw std::runtime_error("Invalid compute MSAA load reference");
+    const auto code = read_texture_shader(path);
+    const auto vs = read_texture_shader(vs_path), ps = read_texture_shader(ps_path);
+    auto texture = render_msaa_texture(device, {vs.data(), vs.size()}, {ps.data(), ps.size()});
+    if (!texture) return false;
+    run_compute(device, true, {code.data(), code.size()}, {compute_tables, sizeof(compute_tables)},
+                false, &store, nullptr, DXGI_FORMAT_UNKNOWN, texture.Get());
+    return true;
 }
 
 bool check_compute_texture_store_file(ID3D12Device* device, const char* path, const char* reference)

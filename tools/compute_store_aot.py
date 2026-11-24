@@ -78,7 +78,7 @@ ALU_EXPRESSION_LIMIT = 1024
 # loaded from, not the 9-bit GFX10 format, type, swizzle, level or size fields inside them; the two
 # 16-byte descriptor slots are bound to t0 for reads or u0 for writes.
 # Value: (HLSL texel type, channel count).
-IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4), "R8G8B8A8_UINT": ("uint4", 4)}
+IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4), "R8G8B8A8_UINT": ("uint4", 4), "R32_UINT": ("uint", 1)}
 # Template operands are the old LDS word and the source VGPR, both HLSL uints.
 LDS_RMW = {
     "ds_add_u32": "({0} + {1})",
@@ -209,6 +209,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
     the caller's statement of the image format inside it. The image binds to t0 for loads or u0
     for stores, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
+    R32_UINT declares the 4-sample Texture2DMS profile for image_msaa_load.
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
@@ -217,6 +218,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if not 0 <= table_reg <= 105:
         raise ValueError("Invalid table or thread group binding")
     image_output = image_uav_mip is not None
+    image_msaa = image_format == "R32_UINT"
+    if image_msaa and cpu != "gfx1030":
+        raise ValueError("The R32_UINT MSAA image binding requires gfx1030")
     if image_output:
         if (cpu != "gfx1030" or descriptor_offset is not None or stride is not None
                 or image_descriptor is None or image_format not in ("R32G32B32A32_UINT", "R8G8B8A8_UINT")
@@ -1189,6 +1193,32 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                             raise ValueError("D16 buffer read expression is too large")
                     word = ("alu", field)
                 loading[reg] = word
+        elif m := re.fullmatch(r"image_msaa_load v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], "
+                               r"s\[(\d+):(\d+)\] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm", line):
+            first, last, addr, addr_last, base, high = map(int, m.groups())
+            if not image_msaa or guard_span is not None:
+                raise ValueError("image_msaa_load requires an unguarded R32_UINT MSAA binding")
+            if last != first + 3 or addr_last != addr + 2 or max(last, addr_last) > 255:
+                raise ValueError("Invalid image_msaa_load VGPR tuple")
+            if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
+                raise ValueError("Unresolved image descriptor")
+            if tuple(scalar.get(base + index) for index in range(8)) != tuple(
+                    (("image", index // 4), index % 4) for index in range(8)):
+                raise ValueError("Unverified image descriptor")
+            x, y, fragment = (vector.get(reg) for reg in range(addr, addr_last + 1))
+            if not is_word(x) or not is_word(y):
+                raise ValueError("Unverified image_msaa_load coordinates")
+            if fragment != 0:
+                raise ValueError("image_msaa_load requires a known zero fragment ID")
+            # Snapshot both coordinates before publishing any result, including aliased VADDR/VDATA.
+            address = f"int2(asint({hlsl_word(x)}), asint({hlsl_word(y)}))"
+            for sample in range(4):
+                name = f"image_msaa_{image_step_count}_{sample}"
+                staged_steps.append((None, f"    uint {name} = imageData.Load({address}, {sample});"))
+                reg = first + sample
+                vector.pop(reg, None)
+                loading[reg] = ("alu", name)
+            image_step_count += 1
         elif m := re.fullmatch(r"image_(?P<kind>load|store|get_resinfo)(?P<mip>_mip)?(?P<packed>_pck(?:_sgn)?)? "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\] dmask:0x(?P<mask>[0-9a-f]+) "
@@ -1206,7 +1236,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             count = len(channels)
             data = [int(n) for n in re.findall(r"\d+", m["data"])]
             first, last = data[0], data[-1]
-            if (cpu != "gfx1030" or image_format is None or guard_span is not None or write != image_output
+            if (cpu != "gfx1030" or image_format is None or image_msaa or guard_span is not None or write != image_output
                     or len(vaddr) != min(address_words, 2) or vaddr[-1] != vaddr[0] + address_words - 1
                     or vaddr[-1] > 255 or last != first + count - 1
                     or not 0 < dmask < (1 << IMAGE_FORMATS[image_format][1])
@@ -1462,7 +1492,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if source_descriptor is not None:
         cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
     if image_descriptor is not None and not image_output:
-        cbuffer += f"Texture2D<{IMAGE_FORMATS[image_format][0]}> imageData : register(t0);\n"
+        texture_type = "Texture2DMS<uint, 4>" if image_msaa else f"Texture2D<{IMAGE_FORMATS[image_format][0]}>"
+        cbuffer += f"{texture_type} imageData : register(t0);\n"
     local = ""
     if staged_steps:
         body = "\n".join([*(step for _, step in staged_steps), body])
@@ -1507,7 +1538,7 @@ def main():
     parser.add_argument("--image-uav-mip", type=int,
                         help="Bind the image to u0 at this mip instead of binding a raw output descriptor")
     parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS),
-                        help="Caller statement of the format inside the image descriptor")
+                        help="Caller-declared image format (R32_UINT selects the 4-sample image_msaa_load profile)")
     args = parser.parse_args()
     if (args.descriptor_offset is None) == (args.image_uav_mip is None):
         parser.error("Choose either --descriptor-offset or --image-uav-mip")

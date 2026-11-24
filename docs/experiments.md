@@ -3135,6 +3135,47 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_resinfo_(warp|hardware)$' -V
 ```
 
+### gfx1030 4-sample image load
+
+`image_msaa_load` with `dim:SQ_RSRC_IMG_2D_MSAA`, `dmask:0xf` and `unorm`
+reads four samples of a single channel. The three contiguous 32-bit address
+VGPRs hold x, y and a fragment ID that must be statically zero. The four
+consecutive destination VGPRs receive samples 0 through 3. The lowering
+uses four `Texture2DMS<uint, 4>.Load(int2(x, y), sample)` calls at `t0` and
+allows the source and destination registers to alias. The descriptor load
+must complete with `lgkmcnt(0)` and the image result requires `vmcnt(0)`
+before use. See the MIMG section of the
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+
+Use `--image-descriptor` and `--image-format R32_UINT` with the raw UAV
+binding. This declares a matching GFX10 `32_UINT` (20) 2D MSAA descriptor
+with identity R selection, base level 0, and last level 2 (four samples).
+The translator checks descriptor provenance. The caller supplies matching
+resource fields, in-range coordinates and a one-to-one fragment-to-sample
+mapping. Other masks, array dimensions, packed addresses or data, NSA,
+nonzero or variable fragment IDs, and cache and status flags are outside
+this profile.
+
+The source-built fixture renders an 8×8 `DXGI_FORMAT_R32_UINT` target at 4×
+MSAA. The pixel shader encodes x, y, and `SV_SampleIndex` in each sample.
+The translated compute shader writes 256 words, and the CPU reference
+compares all 320 UAV words including the 64 untouched words. The first
+mismatches for repeating sample zero, reversing the sample order, swapping
+x/y and changing a sentinel are words 1, 0, 4 and 300 respectively. The
+adapter skips with code 77 if it lacks the required render target and
+multisample-load support. The GPU check executes translated desktop DXIL.
+LLVM 15 assembles the source fixture and the synthetic-container CLI
+reproduces the text path's HLSL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_msaa_(warp|hardware)$' -V
+```
+
+```sh
+python3 -B tests/compute_mimg_msaa_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### gfx1030 2D image stores
 
 `image_store`, `image_store_mip`, `image_store_pck` and `image_store_mip_pck`

@@ -513,6 +513,12 @@ OperationResult run_compute_texture_case(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_compute_texture_msaa_case(const OperationContext& ctx)
+{
+    return skip_if_false(check_compute_texture_msaa_file(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]),
+                         "R32_UINT 4x MSAA render target and load support unavailable");
+}
+
 OperationResult run_compute_texture_store_case(const OperationContext& ctx)
 {
     return skip_if_false(check_compute_texture_store_file(ctx.device, ctx.argv[3], ctx.argv[4]),
@@ -1214,6 +1220,7 @@ const OperationSpec kOperations[] = {
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
     {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},
+    {"--compute-texture-msaa-case", 7, 7, nullptr, kNoGate, run_compute_texture_msaa_case},
     {"--compute-texture-store-case", 5, 5, nullptr, kNoGate, run_compute_texture_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
     {"--dynamic-sampler-index", 3, 3, nullptr, kGateSm60SamplerViews, run_dynamic_sampler_index},
