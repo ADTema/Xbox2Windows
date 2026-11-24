@@ -231,6 +231,18 @@ def controls():
                 accepted.append(('%s s3, s1(mask), s2' % name, [str(error)]))
         check('%s: %d lane-mask forms refused' % (name, len(MASK_FORMS) + 1), not accepted, str(accepted[:2]))
 
+    # Symbolic descriptor sources cannot silently leave the previous SCC in place.
+    for name in OPS:
+        stage = Probe()
+        stage.sym[1] = ('ptr', 0, 0)
+        try:
+            stage.one(name, '%s s3, s1, s2' % name)
+        except G.Unsupported as error:
+            check('%s refuses a descriptor before writing SCC' % name,
+                  str(error) == 'scc from descriptor data' and not stage.lines, str(error))
+        else:
+            check('%s refuses a descriptor before writing SCC' % name, False, str(stage.lines))
+
     # 6. Mutated table entries, built from the sibling's, must read a wrong word or SCC.
     saved = dict(G.SCA)
     try:
