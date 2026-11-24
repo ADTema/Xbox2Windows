@@ -132,6 +132,19 @@ auto owned_reservation(ULONG_PTR address)
     return address - it->first < it->second ? it : memory.reservations.end();
 }
 
+// MEM_REPLACE_PLACEHOLDER needs a placeholder of exactly the view's size. When the range sits inside a
+// larger placeholder (ours or the caller's), split it off first and map again. If the split is refused
+// the range is not a placeholder, so the error of the first map is the one to report.
+template <class Map>
+bool map_split(void* target, SIZE_T bytes, Map map)
+{
+    if (map()) return true;
+    const DWORD error = GetLastError();
+    if (VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) && map()) return true;
+    SetLastError(error);
+    return false;
+}
+
 bool map_view(ULONG_PTR address, const Backing& backing)
 {
     const HANDLE section = backing.section;
@@ -141,9 +154,7 @@ bool map_view(ULONG_PTR address, const Backing& backing)
         return MapViewOfFile3(section, GetCurrentProcess(), target, section_offset,
                               page_bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
     };
-    if (map()) return true;
-    if (owned_reservation(address) == memory.reservations.end()) return false;
-    return VirtualFree(target, page_bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) && map();
+    return map_split(target, page_bytes, map);
 }
 
 // Maps bytes of one section at address as a single view; falls back to one view per page when the
@@ -155,8 +166,7 @@ bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes, std::vecto
         return MapViewOfFile3(backing.section, GetCurrentProcess(), target, backing.offset, bytes,
                               MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
     };
-    if (map() || (owned_reservation(address) != memory.reservations.end() &&
-                  VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) && map())) {
+    if (map_split(target, bytes, map)) {
         memory.runs[address] = bytes;
         made.emplace_back(address, bytes);
         return true;
