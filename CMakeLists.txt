@@ -1574,6 +1574,46 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fuzz_chains>" "$<TARGET_FILE:cpu_fuzz_chains_lifted>" "${cpu_fuzz_chains_o2}"
         --area chains --mutant "$<TARGET_FILE:cpu_fuzz_chains_mutant>")
     set_tests_properties(cpu_aot_fuzz_chains PROPERTIES TIMEOUT 60)
+
+    set(CPU_FUZZ_SWITCHES_SEED "0x5717" CACHE STRING "Seed for the CPU differential fuzz switch test")
+    set(CPU_FUZZ_SWITCHES_FUNCTIONS "48" CACHE STRING "Number of exported switches in the CPU differential fuzz switch test")
+    set(cpu_fuzz_switches_asm "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_switches.asm")
+    set(cpu_fuzz_switches_def "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_switches.def")
+    add_custom_command(OUTPUT "${cpu_fuzz_switches_asm}" "${cpu_fuzz_switches_def}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" emit
+            "${CPU_FUZZ_SWITCHES_SEED}" "${CPU_FUZZ_SWITCHES_FUNCTIONS}" "${cpu_fuzz_switches_asm}"
+            "${cpu_fuzz_switches_def}" --area switches
+        DEPENDS tools/fuzz_cpu.py VERBATIM)
+    add_library(cpu_fuzz_switches SHARED "${cpu_fuzz_switches_asm}" "${cpu_fuzz_switches_def}")
+    set_target_properties(cpu_fuzz_switches PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_fuzz_switches PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO /OPT:NOICF)
+    set(cpu_fuzz_switches_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_switches_lifted.cpp")
+    set(cpu_fuzz_switches_mutant "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_switches_mutant.cpp")
+    foreach(variant lifted mutant)
+        set(mutant_flag "")
+        if(variant STREQUAL "mutant")
+            set(mutant_flag "--mutant")
+        endif()
+        add_custom_command(OUTPUT "${cpu_fuzz_switches_${variant}}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" translate
+                "${CPU_FUZZ_SWITCHES_SEED}" "${CPU_FUZZ_SWITCHES_FUNCTIONS}" "$<TARGET_FILE:cpu_fuzz_switches>"
+                "${cpu_fuzz_switches_${variant}}" --area switches ${mutant_flag}
+            DEPENDS cpu_fuzz_switches tools/fuzz_cpu.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py
+                tools/cpu_call_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_fuzz_switches_${variant} SHARED "${cpu_fuzz_switches_${variant}}")
+        target_compile_features(cpu_fuzz_switches_${variant} PRIVATE cxx_std_20)
+    endforeach()
+    set(cpu_fuzz_switches_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_switches_lifted_o2.dll")
+    add_custom_command(OUTPUT "${cpu_fuzz_switches_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${cpu_fuzz_switches_lifted}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_switches_lifted_o2.obj" "/Fe${cpu_fuzz_switches_o2}"
+        DEPENDS "${cpu_fuzz_switches_lifted}" VERBATIM)
+    add_custom_target(cpu_fuzz_switches_lifted_o2 ALL DEPENDS "${cpu_fuzz_switches_o2}")
+    add_test(NAME cpu_aot_fuzz_switches COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_SWITCHES_SEED}" "${CPU_FUZZ_SWITCHES_FUNCTIONS}"
+        "$<TARGET_FILE:cpu_fuzz_switches>" "$<TARGET_FILE:cpu_fuzz_switches_lifted>" "${cpu_fuzz_switches_o2}"
+        --area switches --mutant "$<TARGET_FILE:cpu_fuzz_switches_mutant>")
+    set_tests_properties(cpu_aot_fuzz_switches PROPERTIES TIMEOUT 60)
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_asm_fixture(cpu_switch_strings switch_strings)
     cpu_asm_fixture(cpu_string_probe string_probe)
