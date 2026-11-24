@@ -615,6 +615,14 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
+        if base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32'):
+            # A lane mask here is the whole wave's mask, and SCC is set when any bit of the
+            # complemented 32-bit result is; the per-lane projection below cannot show that.
+            def lane_mask(t):
+                r = reg_range(t)
+                return t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or bool(r and r[0] == 's' and r[1] in self.masks)
+            if lane_mask(dname) or any(lane_mask(t) for t in srcs):
+                raise Unsupported('%s on a lane mask' % base)
         if pair and ('m0' in srcs or dname == 'm0'):
             raise Unsupported('64-bit scalar operand m0')
         def src_sym(t):

@@ -13,10 +13,11 @@ bit and its complement, and mixed words. The reference is written here with plai
 meaning: D = ~(S0 op S1) on 32 bits and SCC = (D != 0). SCC starts at a value neither 0 nor 1, so a form that does not
 write it fails. The value set gives SCC = 0 and SCC = 1 for every operation.
 
-The lowering text and SCC rule equal pixel_aot's SCALAR entries for the same operations (#561). Every form, including
-a lane-mask source and a vcc_lo, exec_lo or m0 destination, emits the lines of its non-complement sibling (s_and_b32,
-s_or_b32, s_xor_b32) with the operation wrapped in ~( ), and keeps the sibling's mask and EXEC bookkeeping. The
-lane-mask forms are checked only against the sibling: the translator models a mask as the current lane's bit.
+The lowering text and SCC rule equal pixel_aot's SCALAR entries for the same operations (#561). Every numeric form
+(SGPR, inline, literal or m0 operands) emits the lines of its non-complement sibling (s_and_b32, s_or_b32, s_xor_b32)
+with the operation wrapped in ~( ). Lane-mask forms are refused: a vcc_lo or exec_lo operand or destination, or an
+SGPR holding a compare mask, is the whole wave's mask, and SCC is set when any bit of the complemented 32-bit result
+is; the translator's per-lane projection cannot show that, so no mask lowering is claimed.
 
 Mutations: the table entry with the complement dropped, and the entry with the SCC write dropped, must each read a
 wrong result or SCC. Refused: every SOP2 operation the decoder names that still has no lowering.
@@ -197,10 +198,10 @@ def controls():
         check('%s: %d forms x %d pairs equal the reference (result and SCC)' % (name, len(VALUE_FORMS), len(PAIRS)),
               found is None, str(found))
 
-    # 5. Every form, the mask forms included, emits the sibling's lines with the operation complemented.
+    # 5. Every numeric form emits the sibling's lines with the operation complemented.
     for name, (sibling, _) in OPS.items():
         wrong = []
-        for form in VALUE_FORMS + MASK_FORMS:
+        for form in VALUE_FORMS:
             asm, stage = attempt(code(name, form))
             plain_asm, plain = translate(code(sibling, form))
             operands = plain_asm.split(' ', 1)[1].split(', ')
@@ -210,14 +211,25 @@ def controls():
             if (asm != plain_asm.replace(sibling, name, 1) or stage.lines != expected or expected == plain.lines
                     or stage.masks != plain.masks or stage.exec_known != plain.exec_known):
                 wrong.append((asm, stage.lines, plain.lines, stage.masks, plain.masks))
-        check('%s: %d forms emit the %s lines complemented, same mask and EXEC bookkeeping'
-              % (name, len(VALUE_FORMS + MASK_FORMS), sibling), not wrong, str(wrong[:2]))
-    asm, stage = attempt(code('s_nor_b32', (3, VCC_LO, 2, None)))
-    check('mask source: %s -> %s' % (asm, stage.lines),
-          stage.lines == ['s3 = (~(vcc | s2)) & 1;', 'scc = s3 != 0;'] and stage.masks == {3})
-    asm, stage = attempt(code('s_xnor_b32', (EXEC_LO, 1, 2, None)))
-    check('EXEC destination: %s -> %s' % (asm, stage.lines),
-          stage.lines == ['exec = (~(s1 ^ s2)) & 1;', 'scc = exec != 0;'] and not stage.exec_known)
+        check('%s: %d numeric forms emit the %s lines complemented, same mask and EXEC bookkeeping'
+              % (name, len(VALUE_FORMS), sibling), not wrong, str(wrong[:2]))
+
+    # 5b. Lane-mask forms are refused: vcc_lo/exec_lo operands and destinations, and an SGPR holding a compare mask.
+    for name in OPS:
+        accepted = []
+        for form in MASK_FORMS:
+            asm, stage = attempt(code(name, form))
+            if stage.lines != ['refused: %s on a lane mask' % name]:
+                accepted.append((asm, stage.lines))
+        stage = Probe()
+        stage.masks.add(1)  # s1 holds a compare result
+        try:
+            stage.one(name, '%s s3, s1, s2' % name)
+            accepted.append(('%s s3, s1(mask), s2' % name, stage.lines))
+        except G.Unsupported as error:
+            if str(error) != '%s on a lane mask' % name:
+                accepted.append(('%s s3, s1(mask), s2' % name, [str(error)]))
+        check('%s: %d lane-mask forms refused' % (name, len(MASK_FORMS) + 1), not accepted, str(accepted[:2]))
 
     # 6. Mutated table entries, built from the sibling's, must read a wrong word or SCC.
     saved = dict(G.SCA)

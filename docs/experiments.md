@@ -6023,8 +6023,9 @@ Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_b64_shift$' -V`.
 (#870, issue #1919). They now lower as `~(S0 & S1)`, `~(S0 | S1)` and `~(S0 ^ S1)` on 32 bits, the text
 `pixel_aot` uses, and set SCC when the result is nonzero like the other logic operations. The check decodes
 SGPR, in-place, inline-constant, literal and m0-destination forms and evaluates the emitted lines against an
-integer reference over 0, all ones, alternating bits, every single bit and mixed words. Lane-mask and
-vcc_lo/exec_lo forms must emit the non-complement sibling's lines with the operation complemented. A table
+integer reference over 0, all ones, alternating bits, every single bit and mixed words. Lane-mask forms (a
+vcc_lo/exec_lo operand or destination, or an SGPR holding a compare mask) are refused: guest SCC reads the whole
+32-bit mask, which the per-lane projection cannot show. A table
 entry without the complement or without the SCC write must fail, and SOP2 operations with no lowering stay
 refused by name. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sop2_complement$' -V`; with
 LLVM 15, `tests/startup_gfx2hlsl_sop2_complement_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip
