@@ -28,7 +28,8 @@ group XSAVE):
                        (old & ~rfbm) | (xinuse & rfbm).
   - xsavec / xsavec64: same alignment and mask contract as xsave; write the
                        compacted format: only components with XINUSE & RFBM set
-                       are stored (x87/SSE in the legacy region, AVX at the
+                       are stored (SSE is in use when any XMM register is live
+                       or MXCSR differs from 0x1F80; x87/SSE in the legacy region, AVX at the
                        first extended offset 576, which is also its compacted
                        offset because x87/SSE own no extended slot), header
                        XSTATE_BV = XINUSE & RFBM, XCOMP_BV = bit 63 | RFBM, and
@@ -602,7 +603,9 @@ static inline void op_xsavec(const XState& state, word address, word rax_val, wo
     if ((address & 63ull) != 0ull) raise_gp();
     if (static_cast<std::uint32_t>(rdx_val) != 0u || (static_cast<std::uint32_t>(rax_val) & ~7u) != 0u) raise_gp();
     const std::uint64_t rfbm = static_cast<std::uint64_t>(rax_val) & 7ull;
-    const std::uint64_t used = rfbm & state.xinuse;
+    // SDM vol.1 13.6: SSE is also in use when MXCSR differs from its reset value, even if no XMM register is live.
+    const std::uint64_t sse_live = state.mxcsr != 0x1F80u ? 2ull : 0ull;
+    const std::uint64_t used = rfbm & (state.xinuse | sse_live);
     op_xsave(state, address, used, 0ull, is64);
     std::atomic_signal_fence(std::memory_order_seq_cst);
     auto* dst = reinterpret_cast<volatile std::uint64_t*>(address);

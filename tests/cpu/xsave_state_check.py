@@ -18,6 +18,7 @@ from cpu_xsave_aot import lift_code, translate
 GUARD_PRE = bytes(0xA0 + (i % 16) for i in range(64))
 GUARD_POST = bytes(0xC0 + (i % 16) for i in range(64))
 BUF_LEN = 960
+DEFAULT_MXCSR = 0x1F80
 FILL = b"\x5A" * BUF_LEN
 
 CANONICAL_EXPORTS = (
@@ -399,10 +400,15 @@ class XStateModel:
             for i in range(16):
                 dst[offset + 576 + i * 16 : offset + 576 + i * 16 + 16] = self.ymm_hi[i]
 
-    def xsavec(self, dst: bytearray, offset: int, rfbm: int, is64: bool) -> None:
-        """SDM vol.1 13.4.3 compacted format: only XINUSE & RFBM components are stored."""
+    def xsavec(self, dst: bytearray, offset: int, rfbm: int, is64: bool, track_mxcsr: bool = True) -> None:
+        """SDM vol.1 13.4.3 compacted format: only XINUSE & RFBM components are stored.
+
+        SDM vol.1 13.6: XINUSE[1] is also set while MXCSR differs from 0x1F80; track_mxcsr=False is the mutation
+        control that forgets this rule.
+        """
         rfbm &= 7
-        used = rfbm & self.xinuse
+        sse_live = 2 if track_mxcsr and self.mxcsr != DEFAULT_MXCSR else 0
+        used = rfbm & (self.xinuse | sse_live)
         self.xsave(dst, offset, used, is64)
         struct.pack_into("<QQ", dst, offset + 512, used, (1 << 63) | rfbm)
 
@@ -550,6 +556,10 @@ def xsave_pairs(mxcsr_mask: int):
         (4, 0x037F, 0x0000, 0x00, 0x0000, 0x0000000000000000, 0, 0x0000000000000000, 0, 0x1F80, 14),
         (6, 0x037F, 0x0000, 0x00, 0x0000, 0x0000000000000000, 0, 0x0000000000000000, 0, 0x9FC0, 15),
         (7, 0xFFFF, 0x7F7F, 0x55, 0x1234, 0xFFFF800011223344, 0, 0x00007FFF55667788, 0, 0x5F80, 16),
+        # XSTATE_BV[1] clear with a non-default MXCSR: SSE is still in use (SDM vol.1 13.6), so xsavec must save it.
+        (0, 0x037F, 0x0000, 0x00, 0x0000, 0x0000000000000000, 0, 0x0000000000000000, 0, 0x3F80, 17),
+        (4, 0x037F, 0x0000, 0x00, 0x0000, 0x0000000000000000, 0, 0x0000000000000000, 0, 0x3F80, 18),
+        (1, 0x027F, 0x0000, 0xAA, 0x0357, 0x00007FFF12345678, 0, 0x00007FFF87654321, 0, 0x7FC0, 19),
     ]
     pairs = []
     for xbv, fcw, fsw, ftw, fop, fip, fcs, fdp, fds, mxcsr, seed in specs:
@@ -666,7 +676,15 @@ def assert_equal_output(label: str, name: str, idx, got: bytes, want: bytes) -> 
         if not want_bv & 2:
             loose[24:32] = got[24:32]
         loose[512:520] = got[512:520]
-        if want_bv & ~got_bv == 0 and got_bv & ~want_bv & ~3 == 0 and got == bytes(loose):
+        # A host-reported SSE component the reference leaves out must sit at its reset value: a non-default MXCSR
+        # means the reference lost live state (SDM vol.1 13.6), so it is never tolerated.
+        sse_extra_is_reset = not (got_bv & 2 and not want_bv & 2) or struct.unpack_from("<I", got, 24)[0] == DEFAULT_MXCSR
+        if (
+            sse_extra_is_reset
+            and want_bv & ~got_bv == 0
+            and got_bv & ~want_bv & ~3 == 0
+            and got == bytes(loose)
+        ):
             return
     elif label == "native":
         flex_spec = _xsave_header_flex(name)
@@ -1014,6 +1032,61 @@ def check_entry_state_contracts(
     _ = part_buf
 
 
+def sdm_xsavec_header(image: bytes, rfbm: int, mxcsr_mask: int) -> tuple[int, bytes]:
+    """XSTATE_BV and the MXCSR words xsavec must write after xrstor of image, straight from SDM vol.1 13.6.
+
+    Written without XStateModel so it is an independent oracle: x87 and AVX are in use when their restore bit is
+    set, and SSE is in use when its restore bit is set or MXCSR is not the reset value 0x1F80.
+    """
+    restore_bv = struct.unpack_from("<Q", image, 512)[0]
+    mxcsr = struct.unpack_from("<I", image, 24)[0]
+    in_use = restore_bv & 5
+    if restore_bv & 2 or mxcsr != DEFAULT_MXCSR:
+        in_use |= 2
+    used = in_use & rfbm
+    words = struct.pack("<II", mxcsr, mxcsr_mask) if used & 2 else FILL[24:32]
+    return used, words
+
+
+def check_xsavec_mxcsr_liveness(harness, native: dict, lifted: dict, mxcsr_mask: int, deprecates_cs_ds: bool) -> int:
+    """Non-default MXCSR keeps SSE in use for xsavec even when the restore image has XSTATE_BV[1] clear."""
+    checks = 0
+    for name, rfbm in (("op_xrstor64_xsavec64", 7), ("op_xrstor64_xsavec64_sse", 2)):
+        for idx, (a, b) in enumerate(xsave_pairs(mxcsr_mask)):
+            used, words = sdm_xsavec_header(a, rfbm, mxcsr_mask)
+            got = invoke_lifted(lifted[name], a, b)
+            assert struct.unpack_from("<Q", got, 512)[0] == used, f"lifted {name} case {idx}: XSTATE_BV word"
+            assert got[24:32] == words, f"lifted {name} case {idx}: MXCSR word"
+            if name in native:
+                got_n = invoke_native(harness, native[name], a, b)
+                got_bv = struct.unpack_from("<Q", got_n, 512)[0]
+                assert got_bv & used == used, f"native {name} case {idx}: XSTATE_BV {got_bv:#x} lacks {used:#x}"
+                if used & 2:
+                    assert got_n[24:32] == words, f"native {name} case {idx}: MXCSR word"
+            checks += 1
+
+    # Mutation control: a reference that ignores MXCSR must fail at the MXCSR word (byte 24, the first lost state)
+    # and also differ in the XSTATE_BV word (byte 512), for lifted and native.
+    a, b = xsave_pairs(mxcsr_mask)[7]
+    name = "op_xrstor64_xsavec64"
+    assert sdm_xsavec_header(a, 7, mxcsr_mask)[0] == 2, "control needs XSTATE_BV[1] clear in the image and MXCSR non-default"
+    right = reference(name, a, b, mxcsr_mask, deprecates_cs_ds)
+    model = XStateModel(mxcsr_mask, deprecates_cs_ds)
+    model.xrstor(a, rfbm=7, is64=True)
+    blind = bytearray(FILL)
+    model.xsavec(blind, 0, rfbm=7, is64=True, track_mxcsr=False)
+    assert right[512:520] != bytes(blind)[512:520], "MXCSR-blind reference must also lose XSTATE_BV[1]"
+    for label in ("lifted", "native"):
+        try:
+            assert_equal_output(label, name, 7, right, bytes(blind))
+        except AssertionError as err:
+            if "first mismatch at byte 24:" not in str(err):
+                raise AssertionError(f"MXCSR-blind reference failed at the wrong word: {err}") from err
+        else:
+            raise AssertionError(f"{label} comparison accepted a reference that ignores non-default MXCSR")
+    return checks + 2
+
+
 def check_differential(
     native_path: Path,
     lifted_path: Path,
@@ -1144,6 +1217,8 @@ def check_differential(
             else:
                 raise AssertionError(f"mutated xsavec byte {pos} was not caught by comparator")
 
+        liveness_checks = check_xsavec_mxcsr_liveness(harness, native, lifted, mxcsr_mask, deprecates_cs_ds)
+
         # Native comparison keeps active x87/SSE payloads: a flipped FCW, ST0 or XMM0 byte must fail, while an
         # initialized component carrying extra host bytes must still pass.
         want_bv = struct.unpack_from("<Q", xc_want, 512)[0]
@@ -1180,7 +1255,8 @@ def check_differential(
             f"fp_cpuid={fp_cpuid:#x}, fp_es0={es0_64}, fp_es1={es1_64}); "
             f"ALTER_OP diverged on {diverged}; {misalign_checks} misalignment #GP checks, "
             f"{hdr_mxcsr_checks} header/MXCSR #GP checks, {mask_checks} unsupported-mask #GP checks, entry-state contract, non-default entry controls, "
-            f"dead-read, host-state, and output mutation controls passed"
+            f"dead-read, host-state, and output mutation controls passed; "
+            f"{liveness_checks} xsavec MXCSR-liveness checks passed"
         )
     finally:
         harness.close()

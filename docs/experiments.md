@@ -1637,7 +1637,8 @@ lifted DLL exports `host_has_xsave()` (`CPUID.1:ECX[26..28]` and `XGETBV(0) & 7 
 returning exit code 77 when absent), `host_has_xsavec()` (`CPUID.(0DH,1):EAX[1]`; without it the
 native `xsavec` fixtures are skipped and only the lifted path is checked), `host_deprecates_fpu_cs_ds()`,
 `host_fp_err_cpuid_info()`, and `host_mxcsr_mask()`. `xsavec`/`xsavec64` store the compacted
-format: a component is written only when `XINUSE & RFBM` selects it, `XSTATE_BV = XINUSE & RFBM`,
+format: a component is written only when `XINUSE & RFBM` selects it (SSE is in use when an XMM register is
+live or `MXCSR` differs from `0x1F80`, so a restored non-default `MXCSR` with `XSTATE_BV[1]=0` is still saved), `XSTATE_BV = XINUSE & RFBM`,
 `XCOMP_BV = bit 63 | RFBM`, the reserved header bytes and legacy bytes `[416..511]` are left
 untouched, and `MXCSR` is stored with the SSE component. With only `x87|SSE|AVX` the compacted
 offsets equal the standard ones (AVX at 576), so the offset rule is not separately observable.
@@ -1681,8 +1682,9 @@ controls.
 The `xsavec` exports (`op_xrstor64_xsavec`, `op_xrstor64_xsavec64`, `_sse`, `_x87_avx`,
 and the lifted-only `op_xsavec64_dynmask`) are compared with the native instruction on
 the XSTATE_BV subsets above. The native comparison accepts extra initialized legacy
-components and an unwritten or written `MXCSR` when SSE is not in use, because those are
-implementation choices; `ALTER_OP` (standard `xsave64` instead of `xsavec64`, request mask
+components and an unwritten or written `MXCSR` when SSE is not in use and `MXCSR` is the
+default, because those are implementation choices; a non-default `MXCSR` is checked against the
+SDM rule with an independent oracle; `ALTER_OP` (standard `xsave64` instead of `xsavec64`, request mask
 ignored) and header/word mutations must fail. The harness has not run on Windows yet: run
 `ctest --preset dev -R '^cpu_aot_xsave_state$'` (Debug and `/O2`), which is outside `--preset pr`.
 
