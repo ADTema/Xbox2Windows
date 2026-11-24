@@ -649,15 +649,7 @@ thread_local bool on_queue_worker = false;  // Submit from a worker must not wai
 
 void complete_deferred(Object* self, QueueWork* work);
 
-// True while snapshot entries of an earlier Submit are ready or being completed by some thread. The
-// worker starts no newer entry then, so a deferred completion and a normal one keep the same order.
-// The caller holds work.mutex.
-bool deferred_pending(const QueueWork& work)
-{
-    if (work.completing) return true;
-    if (!work.failing.empty() && work.failing.front().after <= work.finished_total) return true;
-    return work.deferred_head && work.deferred_head->after <= work.finished_total;
-}
+bool deferred_pending(const QueueWork& work);
 
 DWORD WINAPI queue_worker(void* parameter)
 {
@@ -763,6 +755,16 @@ struct Unrecorded {
     void* fence;
     u64 value;
 };
+
+// True while snapshot entries of an earlier Submit are ready or being completed by some thread. The
+// worker starts no newer entry then, so a deferred completion and a normal one keep the same order.
+// The caller holds work.mutex.
+bool deferred_pending(const QueueWork& work)
+{
+    if (work.completing) return true;
+    if (!work.failing.empty() && work.failing.front().after <= work.finished_total) return true;
+    return work.deferred_head && work.deferred_head->after <= work.finished_total;
+}
 
 // Fails an entry that will not run: a request counts as failed, a status entry completes with the
 // pending failure (E_OUTOFMEMORY when nothing worse is pending), a fence is signaled.
