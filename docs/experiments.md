@@ -5857,14 +5857,19 @@ the host.
 The pass first looks for a directly loaded standalone sampler that feeds both kinds of
 sampling. Modules without one are returned byte-for-byte unchanged. That includes the
 indexed table above and unrelated samples on other samplers. For the sampler it splits,
-the profile covers direct float32 `Texture2D` and `Texture2DArray` sampling in one compute entry
-point at a constant LOD of zero. Other uses of that sampler, an occupied binding, a
+the profile covers direct float32 `Texture1D`, `Texture2D` and `TextureCube` sampling,
+including their array forms, in one compute entry point at a constant LOD of zero.
+Other uses of that sampler, an occupied binding, a
 nonzero LOD and more than one mixed sampler are rejected with a specific diagnostic.
 
 A [synthetic arrayed variant](../tests/spirv_window/shared_sampler_array.spvasm) of the fixture below
 uses `Texture2DArray` images with a float3 coordinate at layer 0. The test splits it to the same
 bindings, validates both modules for Vulkan 1.2 and checks that SPIRV-Cross emits two
 `SampleCmpLevelZero` calls on the comparison sampler and one `SampleLevel` on the ordinary one.
+The Linux check `python3 -B tests/spirv_window/check.py` generates four more
+variants, `Texture1D`, `Texture1DArray`, `TextureCube` and `TextureCubeArray`.
+It validates each before and after the split for Vulkan 1.2 and checks that only
+the ordinary sample moves from binding 2 to binding 5.
 The GPU readback below runs only the `Texture2D` module.
 
 The [source-built fixture](../tests/spirv_window/shared_sampler.spvasm) compares
