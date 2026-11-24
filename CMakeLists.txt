@@ -278,6 +278,12 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME startup_null_views_${adapter} COMMAND startup_null_views_check ${adapter})
 endforeach()
 set_tests_properties(startup_null_views_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# The opt-in API trace reads only declared outputs; this checks the decision about what it observed
+# (argument index 0, two outputs, exact and short buffers, same value, partial comparison).
+add_executable(api_trace_check tests/api_trace_check.cpp)
+target_compile_features(api_trace_check PRIVATE cxx_std_17)
+target_include_directories(api_trace_check PRIVATE src)
+add_test(NAME api_trace COMMAND api_trace_check)
 # A view heap larger than the adapter accepts: the stand-in creates the desktop heap at the measured
 # limit and keeps the title's full-size memory. Skips where the adapter accepts the full request.
 add_executable(startup_view_heap_check tests/startup_view_heap_check.cpp)

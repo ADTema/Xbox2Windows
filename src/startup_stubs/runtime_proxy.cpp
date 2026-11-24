@@ -7,6 +7,7 @@
 // methods log their first calls ("x2w-runtime") and forward to the real object.
 //
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below).
+#include "startup_stubs/api_trace.h"
 #include "startup_stubs/local_log.h"
 
 #include <cstdio>
@@ -77,48 +78,14 @@ bool trace_api() noexcept
     return on;
 }
 
-// Declared output arguments, as 0-based argument indices, with the width each one actually has. These
-// follow the answers in user_call, the gamertag branch below and area_call; anything not listed has no
-// known contract here and is not read back. A width of 0 means the caller supplies the capacity in
-// `size_argument` (a string buffer), and the snapshot is bounded by it.
-struct DeclaredOut {
-    unsigned long provider;
-    int slot;
-    unsigned char first;          // argument index of the first output
-    unsigned char first_bytes;    // its width, or 0 when the caller supplies the capacity
-    unsigned char size_argument;  // argument index holding that capacity, or no_argument
-    unsigned char second;         // second output, or no_argument
-    unsigned char second_bytes;   // its width
-};
+// The contract table and the decision about what was observed live in api_trace.h so the decision can
+// be checked by a source-built control without a running title.
+using x2w_api_trace::declared;
+using x2w_api_trace::DeclaredOut;
+using x2w_api_trace::max_outputs;
+using x2w_api_trace::max_snapshot;
+using x2w_api_trace::no_argument;
 
-constexpr unsigned char no_argument = 0xff;
-constexpr DeclaredOut declared_outs[] = {
-    {0x01acd177, 3, 1, 8, no_argument, no_argument, 0},    // duplicate handle
-    {0x01acd177, 8, 1, 8, no_argument, no_argument, 0},    // user add result: &handle
-    {0x01acd177, 9, 1, 8, no_argument, no_argument, 0},    // local id
-    {0x01acd177, 10, 1, 8, no_argument, no_argument, 0},   // find by local id
-    {0x01acd177, 11, 1, 8, no_argument, no_argument, 0},   // XUserGetId: &id
-    {0x01acd177, 12, 1, 8, no_argument, no_argument, 0},   // XUserFindUserById
-    {0x01acd177, 13, 1, 1, no_argument, no_argument, 0},   // is guest: one byte
-    {0x01acd177, 14, 1, 4, no_argument, no_argument, 0},   // state: DWORD
-    {0x01acd177, 15, 3, 0, 2, 4, 8},                       // gamertag buffer (capacity in arg 2), &used
-    {0x01acd177, 19, 1, 4, no_argument, no_argument, 0},   // age group: DWORD
-    {0x01acd177, 20, 3, 1, no_argument, 4, 4},             // privilege: &has, &deny reason
-    {0x01acd177, 40, 1, 8, no_argument, no_argument, 0},   // find for device
-    {0xcef4fac0, 3, 3, 0, 2, 4, 8},                        // gamertag interface: buffer, &used
-    {0x37e56907, 15, 0, 16, no_argument, no_argument, 0}, // connectivity hint: four words
-};
-
-const DeclaredOut* declared_out(unsigned long provider, int slot)
-{
-    for (const DeclaredOut& entry : declared_outs)
-        if (entry.provider == provider && entry.slot == slot) return &entry;
-    return nullptr;
-}
-
-// The widest output a declaration can describe; the gamertag buffer is bounded by the caller's
-// capacity but only its first bytes are compared.
-constexpr std::size_t max_snapshot = 64;
 
 template <int N>
 __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5, u64 s6, u64 s7)
@@ -127,33 +94,32 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
     u64 args[11] = {a, b, c, s0, s1, s2, s3, s4, s5, s6, s7};
     // Declared outputs are snapshotted so the write is seen rather than assumed; nothing else is read. The
     // snapshot is bounded by the declared width, so a one-byte flag, a DWORD and a caller-sized buffer
-    // are each read within their own extent rather than as eight bytes.
-    struct Output {
-        int index;
-        std::size_t bytes;
-        bool readable;
-        unsigned char data[max_snapshot];
-    };
-    Output before[2] = {};
-    const DeclaredOut* declared = trace_api() ? declared_out(provider_ids[self->provider].Data1, N) : nullptr;
-    if (declared) {
-        const auto take = [&args](Output& slot, unsigned char index, unsigned char fixed_bytes, unsigned char size_index) {
-            slot.index = index;
+    // Declared outputs are snapshotted so a write can be observed rather than assumed; nothing else is
+    // read. Each snapshot is bounded by the declared width, so a one-byte flag, a DWORD and a
+    // caller-sized buffer are each compared within their own extent.
+    bool compared[2] = {};
+    std::size_t compared_bytes[2] = {};
+    int compared_index[2] = {no_argument, no_argument};
+    unsigned char before[2][max_snapshot] = {};
+    const DeclaredOut* contract = trace_api() ? declared(provider_ids[self->provider].Data1, N) : nullptr;
+    if (contract) {
+        const auto take = [&](int slot, unsigned char index, unsigned char fixed_bytes, unsigned char size_index) {
+            compared_index[slot] = index;
             if (index == no_argument || !args[index]) return;
             std::size_t bytes = fixed_bytes;
             if (!bytes) {
                 if (size_index == no_argument) return;
                 const u64 capacity = args[size_index];
-                bytes = capacity < sizeof(slot.data) ? static_cast<std::size_t>(capacity) : sizeof(slot.data);
+                bytes = capacity < max_snapshot ? static_cast<std::size_t>(capacity) : max_snapshot;
             }
-            if (!bytes || bytes > sizeof(slot.data)) return;
+            if (!bytes || bytes > max_snapshot) return;
             if (!x2w_local::readable(reinterpret_cast<const void*>(args[index]), bytes)) return;
-            std::memcpy(slot.data, reinterpret_cast<const void*>(args[index]), bytes);
-            slot.bytes = bytes;
-            slot.readable = true;
+            std::memcpy(before[slot], reinterpret_cast<const void*>(args[index]), bytes);
+            compared_bytes[slot] = bytes;
+            compared[slot] = true;
         };
-        take(before[0], declared->first, declared->first_bytes, declared->size_argument);
-        take(before[1], declared->second, declared->second_bytes, no_argument);
+        take(0, contract->first, contract->first_bytes, contract->size_argument);
+        take(1, contract->second, contract->second_bytes, no_argument);
     }
     u64 result = 0;
     bool handled = self->provider == user_provider && fake_user() && user_call(N, args, &result);
@@ -191,25 +157,20 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
     const u64 raw_result = result;
     if (about_tracked && !handled && fake_user() && (result & 0xffffffffu) == borrowed_failure) result = 0;
     if (trace_api()) {
-        char out[24] = "?";
-        if (declared) {
-            // A separate flag: argument index 0 is a real output (the connectivity hint), so zero
-            // cannot double as "nothing changed".
-            int written = -1;
-            for (int i = 0; i < 2 && written < 0; ++i) {
-                const Output& snapshot = before[i];
-                if (snapshot.index == no_argument || !snapshot.readable) continue;
-                if (!x2w_local::readable(reinterpret_cast<const void*>(args[snapshot.index]), snapshot.bytes)) continue;
-                if (std::memcmp(reinterpret_cast<const void*>(args[snapshot.index]), snapshot.data, snapshot.bytes) != 0)
-                    written = snapshot.index;
-            }
-            if (written >= 0) {
-                std::snprintf(out, sizeof(out), "arg%d", written);
-            } else {
-                const bool any = before[0].readable || before[1].readable;
-                std::snprintf(out, sizeof(out), "%s", any ? "unchanged" : "unreadable");
-            }
+        unsigned char after[2][max_snapshot] = {};
+        bool current[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            if (!compared[i] || !compared_bytes[i]) continue;
+            if (!x2w_local::readable(reinterpret_cast<const void*>(args[compared_index[i]]), compared_bytes[i])) continue;
+            std::memcpy(after[i], reinterpret_cast<const void*>(args[compared_index[i]]), compared_bytes[i]);
+            current[i] = true;
         }
+        const x2w_api_trace::Report report = x2w_api_trace::decide(contract, current,
+                                                                  const_cast<const unsigned char (*)[max_snapshot]>(before),
+                                                                  const_cast<const unsigned char (*)[max_snapshot]>(after),
+                                                                  compared_bytes);
+        char out[48] = "?";
+        x2w_api_trace::format(report, contract, out, sizeof(out));
         x2w_local::logf("x2w-api %08lx::slot%d -> 0x%08x %s out=%s", provider_ids[self->provider].Data1, N,
                         static_cast<unsigned>(result & 0xffffffffu), handled ? "local" : "real", out);
     }
