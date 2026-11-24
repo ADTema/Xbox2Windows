@@ -620,6 +620,16 @@ add_custom_command(OUTPUT "${pixel_vs_linear}" COMMAND "${DXC_EXECUTABLE}" -T vs
 target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp tests/pixel_compare_render.cpp "${pixel_vs}"
     "${pixel_vs_linear}")
 target_sources(offscreen_check PRIVATE tests/desktop_gpu.cpp tests/mesh_entry_draw.cpp tests/mesh_shadow_draw.cpp)
+target_sources(offscreen_check PRIVATE tests/stream_root_srv.cpp)
+foreach(stage IN ITEMS vs ps)
+    string(TOUPPER "${stage}" entry)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/stream_root_srv_${stage}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${stage}_6_0 -E ${entry}Main -Vn stream_root_srv_${stage}
+                -Fh "${header}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/stream_root_srv.hlsl"
+        DEPENDS tests/stream_root_srv.hlsl VERBATIM)
+    target_sources(offscreen_check PRIVATE "${header}")
+endforeach()
 set(descriptor_window_cs "${CMAKE_CURRENT_BINARY_DIR}/descriptor_window_submissions_cs.h")
 add_custom_command(OUTPUT "${descriptor_window_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main
     -Vn descriptor_window_submissions_cs -Fh "${descriptor_window_cs}"
@@ -1136,6 +1146,8 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME ffx_device_init_${adapter} COMMAND offscreen_check ${adapter} --ffx-device-init)
     add_test(NAME ffx_recurrent_${adapter} COMMAND offscreen_check ${adapter} --ffx-recurrent)
     add_test(NAME dual_uav_${adapter} COMMAND offscreen_check ${adapter} --dual-uav)
+    add_test(NAME stream_root_srv_${adapter} COMMAND offscreen_check ${adapter} --stream-root-srv)
+    set_tests_properties(stream_root_srv_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME descriptor_window_submissions_${adapter} COMMAND offscreen_check ${adapter} --descriptor-window-submissions)
     add_test(NAME descriptor_window_stale_${adapter} COMMAND offscreen_check ${adapter} --descriptor-window-stale)
     set_tests_properties(descriptor_window_submissions_${adapter} descriptor_window_stale_${adapter}

@@ -641,6 +641,12 @@ OperationResult run_dual_uav(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_stream_root_srv(const OperationContext& ctx)
+{
+    check_stream_root_srv(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_descriptor_window_submissions(const OperationContext& ctx)
 {
     check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::direct);
@@ -1256,6 +1262,7 @@ const OperationSpec kOperations[] = {
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
     {"--dual-uav", 3, 3, nullptr, kNoGate, run_dual_uav},
+    {"--stream-root-srv", 3, 3, nullptr, kGateSm60BufferOps, run_stream_root_srv},
     {"--descriptor-window-submissions", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_submissions},
     {"--descriptor-window-stale", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_stale},
     {"--descriptor-record-copy", 4, 4, validate_descriptor_record_args, kGateSm60BufferOps, run_descriptor_record_copy},
