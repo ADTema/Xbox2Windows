@@ -1862,6 +1862,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_leaf_aot_branches COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/branches.py" "$<TARGET_FILE:cpu_leaf_original>"
         "$<TARGET_FILE:cpu_leaf_original_lifted>" "$<TARGET_FILE:cpu_leaf_inverted_lifted>")
+    add_test(NAME cpu_aot_malformed_pe COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/malformed_pe_check.py")
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_call_${variant} direct)
         cpu_translation(cpu_call_${variant} cpu_call_aot call_mix)
