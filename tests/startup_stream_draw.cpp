@@ -182,7 +182,7 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
 }
 }  // namespace
 
-int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7)
+int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7, DXGI_FORMAT format)
 {
     const bool bc = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
     const UINT width = bc7 ? bc7->width : bc ? 4 * 128 : 8;
@@ -193,8 +193,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
-        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
-    const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 1, 1}};
+        format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    const bool rgba = format == DXGI_FORMAT_R8G8B8A8_UNORM;
+    const D3D12_CLEAR_VALUE clear{format, {0, 0, 1, rgba ? 1.0f : 0.0f}};
     ComPtr<ID3D12Resource> target;
     if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &target_desc,
                                                 D3D12_RESOURCE_STATE_COMMON, &clear, IID_PPV_ARGS(&target)))) return 21;
@@ -280,7 +281,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     if (FAILED(readback->Map(0, nullptr, &memory))) return 32;
     std::ofstream out(pixels, std::ios::binary);
     for (UINT y = 0; y < height; ++y)
-        out.write(static_cast<const char*>(memory) + y * footprint.Footprint.RowPitch, width * 4);
+        out.write(static_cast<const char*>(memory) + y * footprint.Footprint.RowPitch, width * (rgba ? 4 : 1));
     readback->Unmap(0, nullptr);
     return out ? 0 : 33;
 }

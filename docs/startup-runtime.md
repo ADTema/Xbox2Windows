@@ -8,6 +8,19 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Derived pipeline blend state
+
+Device slot 55 accepts up to 64 fixed-size derived pipeline patches. The translated graphics
+path reads the blend descriptor from part 2 of a 332-byte patch. Within one derivation the last
+blend patch wins. A further derivation inherits that state until it supplies another blend patch.
+Other patch parts are outside this blend implementation. The record layout can also be compared
+with [XCL's implementation at 64b3f35](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/d3d12x/device_x.rs#L501-L515).
+
+Run `ctest --preset dev --no-tests=error -R "^startup_stream_draw_(hardware|warp)$" -V` after
+building `startup_stream_consumer`. The source-built shader writes to half of an 8×4 target.
+On A8 the parent preserves the zero clear and the child writes alpha 255. R8 records red 0 or
+255 according to the input shader. The untouched half stays zero in all four cases.
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.

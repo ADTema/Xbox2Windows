@@ -221,17 +221,22 @@ BoundPipeline* translation_for(Wrapper* pipeline)
     Translation*& result = bound->translation;
     const PipelineInfo* info = pipeline_info(pipeline);
     const PipelineInfo* own = info;
-    for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth) info = pipeline_info(info->base);
     {
         // The pipeline's own description first (a derived pipeline overrides state), then its base's state block.
         std::size_t where = 0;
         const char* from = "none";
-        if (own && own != info && find_blend(own->desc, &bound->blend, &where)) from = "derived description";
-        else if (info && info->has_stream_blend) {
+        for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth) {
+            if (!bound->has_blend && x2w_derived_blend::last_blend(info->desc.data(), info->desc.size(), bound->blend, where)) {
+                from = "derived blend patch";
+                bound->has_blend = true;
+            }
+            info = pipeline_info(info->base);
+        }
+        if (!bound->has_blend && info && info->has_stream_blend) {
             from = "stream blend subobject";
             bound->blend = info->stream_blend;
-        } else if (info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
-        else if (info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
+        } else if (!bound->has_blend && info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
+        else if (!bound->has_blend && info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
         bound->has_blend = from[0] != 'n';
         static LONG logged;
         if (first_calls(logged, 24)) {
