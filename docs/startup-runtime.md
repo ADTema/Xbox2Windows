@@ -152,6 +152,9 @@ These are measured on one executable; treat them as hypotheses for others.
   id, the source, the compressed size and the destination chunk size. A later independent
   request at a matching offset still decodes its own bytes or fails without touching its
   destination.
+- **DirectStorage file ranges.** A nonempty file request checks its byte offset and length against
+  the current file size before allocating the staging buffer. A range ending at EOF is valid.
+  An overrun or short read fails the queue request and preserves the destination.
 
 ## Shortcuts that are known to be wrong
 
