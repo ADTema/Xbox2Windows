@@ -1299,6 +1299,14 @@ when either memory value changed, so the cost of a stalled load is visible. Each
 by a line of failed requests by cause and a line of page-destination requests by end (see
 DirectStorage failure causes and DirectStorage page-request ends under Findings).
 
+The live log window also shows DirectStorage heartbeat lines and `x2w-render totals` as they
+arrive. It reports frame counts and FPS from the graphics heartbeat without inferring whether
+draws were executed. Network refusals are shown when observed; the window does not establish
+that all network activity is blocked. To check this presentation with generated logs, run
+`python -B tests/startup_live_telemetry_check.py`. See [#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)
+for memory accounting and [#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281) for
+the launcher's concurrent-hook limitation.
+
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check
 ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|startup_heartbeat_commit)$' -V
