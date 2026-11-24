@@ -38,6 +38,23 @@ requested view. This applies only to Texture2D views with no resource or counter
 `ctest --test-dir out/bin --no-tests=error -R "^startup_null_views_" -V` against your build
 directory to exercise both slots on hardware and WARP.
 
+## Null bindings in translated draws
+
+The `x2w-render totals` line reports `null bindings N`, then the same count split by cause as
+`(entry, buffer, token, wrapper, dimension)`. Each null binding falls in exactly one cause, so
+the five parts add up to N:
+
+- entry: the descriptor table entry is null, empty or unreadable.
+- buffer: the buffer address or size is missing or unreadable, or the frame copy failed.
+- token: the descriptor memory names a view id the wrapper never issued.
+- wrapper: the texture's resource is missing or is not a resource wrapper.
+- dimension: the view dimension does not match the shader, so a null texture is bound.
+
+The classification lives in `src/startup_stubs/null_binding_cause.h`. The source-built
+`startup_null_views_check` fixture checks every cause, that the parts sum to the total, and that
+valid bindings add nothing. It does not draw, so the counters in the totals line itself are checked
+by reading a render log.
+
 ## What is measured
 
 With the switches below, an x64 console executable on an AMD RDNA4 GPU (Windows 11, release
