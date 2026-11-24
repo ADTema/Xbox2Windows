@@ -18,14 +18,14 @@ Word invoke(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Wo
     return reinterpret_cast<Slot>((*static_cast<void***>(object))[index])(object, a, b, c, d, e, f, g, h);
 }
 
-int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels)
+int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, DXGI_FORMAT format)
 {
     constexpr UINT width = 8, height = 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
-        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+        format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
     ComPtr<ID3D12Resource> target;
     if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &target_desc,
                                                 D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target)))) return 21;
@@ -46,7 +46,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         FAILED(static_cast<HRESULT>(invoke(guest, 73, arg(list_desc), arg(allocator), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list)))) ||
         FAILED(static_cast<HRESULT>(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&fence))))) return 23;
 
-    const float clear[] = {0, 0, 1, 1};
+    const bool rgba = format == DXGI_FORMAT_R8G8B8A8_UNORM;
+    const float clear[] = {0, 0, 1, rgba ? 1.0f : 0.0f};
     const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
     const D3D12_RECT left{0, 0, width / 2, height};
     invoke(list, 139, arg(allocator));
@@ -100,7 +101,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     if (FAILED(readback->Map(0, nullptr, &memory))) return 32;
     std::ofstream out(pixels, std::ios::binary);
     for (UINT y = 0; y < height; ++y)
-        out.write(static_cast<const char*>(memory) + y * footprint.Footprint.RowPitch, width * 4);
+        out.write(static_cast<const char*>(memory) + y * footprint.Footprint.RowPitch, width * (rgba ? 4 : 1));
     readback->Unmap(0, nullptr);
     return out ? 0 : 33;
 }

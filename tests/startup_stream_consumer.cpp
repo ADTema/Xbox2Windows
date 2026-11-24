@@ -7,12 +7,45 @@
 #include <array>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
-int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels);
+int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, DXGI_FORMAT format);
+
+// A slot-55 patch is a tagged union with room for the full eight-target blend state.
+struct Patch { UINT tag; D3D12_BLEND_DESC blend; };
+static_assert(sizeof(Patch) == 0x14c);
+
+static bool derive(void* device, void*& pipeline, bool child)
+{
+    using Create = HRESULT (WINAPI*)(void*, void*, UINT, const Patch*, REFIID, void**);
+    auto create = reinterpret_cast<Create>((*static_cast<void***>(device))[55]);
+    Patch preserve{2}, write{2}, sample_mask{3};
+    const UINT all_samples = ~0u;
+    std::memcpy(&sample_mask.blend, &all_samples, sizeof(all_samples));
+    auto& t = preserve.blend.RenderTarget[0];
+    t = {TRUE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ZERO,
+         D3D12_BLEND_ONE, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+    write.blend = preserve.blend;
+    write.blend.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    write.blend.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+    void* next = nullptr;
+    if (create(device, pipeline, 1, nullptr, __uuidof(ID3D12PipelineState), &next) != E_INVALIDARG || next) return false;
+    if (FAILED(create(device, pipeline, 1, &preserve, __uuidof(ID3D12PipelineState), &next)) || !next) return false;
+    pipeline = next;
+    if (child) {
+        Patch patches[] = {preserve, write, sample_mask};
+        if (FAILED(create(device, pipeline, 3, patches, __uuidof(ID3D12PipelineState), &next)) || !next) return false;
+        pipeline = next;
+    }
+    // A grandchild with only a non-blend patch keeps its nearest ancestor's state.
+    if (FAILED(create(device, pipeline, 1, &sample_mask, __uuidof(ID3D12PipelineState), &next)) || !next) return false;
+    pipeline = next;
+    return true;
+}
 
 struct alignas(8) Stage {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
@@ -30,7 +63,7 @@ struct Stream {
 
 int main(int argc, char** argv)
 {
-    if (argc != 4 && argc != 6) return 2;
+    if (argc != 4 && argc != 6 && argc != 7) return 2;
     std::ifstream vs_file(argv[1], std::ios::binary), ps_file(argv[2], std::ios::binary);
     std::vector<char> vs{std::istreambuf_iterator<char>(vs_file), {}};
     std::vector<char> ps{std::istreambuf_iterator<char>(ps_file), {}};
@@ -39,7 +72,7 @@ int main(int argc, char** argv)
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGIAdapter> adapter;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
-    if (argc == 6 && std::strcmp(argv[4], "hardware") == 0) {
+    if (argc >= 6 && std::strcmp(argv[4], "hardware") == 0) {
         ComPtr<IDXGIFactory6> factory6;
         if (FAILED(factory.As(&factory6))) return 77;
         for (UINT n = 0;; ++n) {
@@ -90,5 +123,13 @@ int main(int argc, char** argv)
     if (!submit(sizeof(stream) - 8)) return 8;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
     if (!submit(sizeof(stream))) return 9;
-    return argc == 6 ? check_stream_draw(adapter.Get(), device, pso, argv[5]) : 0;
+    if (argc == 4) return 0;
+    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (argc == 7) {
+        const std::string mode(argv[6]);
+        if (mode != "parent-a8" && mode != "child-a8" && mode != "child-r8") return 2;
+        if (!derive(device, pso, mode != "parent-a8")) return 10;
+        format = mode == "child-r8" ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_A8_UNORM;
+    }
+    return check_stream_draw(adapter.Get(), device, pso, argv[5], format);
 }

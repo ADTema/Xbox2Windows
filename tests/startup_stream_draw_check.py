@@ -62,6 +62,18 @@ def check(directory, consumer, backend):
     wrong = sum(observations[0][i:i+4] != observations[1][i:i+4] for i in range(0, 8 * 4 * 4, 4))
     assert wrong == 16, f"swapping the pixel shader produced {wrong} changed pixels"
     print(f"{backend}: red/green draws exact, 32 RGBA pixels each; swapped shader differs at {wrong} of 32")
+    # Green has red=0 and alpha=1. Red makes the R8 target nonzero as a separate control.
+    # A cut-down record, wrong ancestor or red/alpha swap changes at least one observation.
+    for mode, green, value in (("parent-a8", True, 0), ("child-a8", True, 255),
+                               ("child-r8", True, 0), ("child-r8", False, 255)):
+        ps.write_bytes(pixel(green))
+        result = subprocess.run(args + [backend, output, mode], env=env, capture_output=True, text=True)
+        if result.returncode or "-> drawn;" not in result.stderr:
+            raise RuntimeError(f"{mode} failed on {backend}: {result.returncode}\n{result.stderr}")
+        expected = (bytes([value]) * 4 + bytes(4)) * 4
+        if output.read_bytes() != expected:
+            raise AssertionError(f"{mode}: got {output.read_bytes().hex()} expected {expected.hex()}")
+        print(f"{backend} {mode} green={green}: 32 pixels exact, drawn byte {value}")
     return 0
 
 
