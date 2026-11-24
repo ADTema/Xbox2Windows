@@ -253,7 +253,7 @@ ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?
 
 ## Trap-by-default header check
 
-`tests/startup_trap_header_check.cpp` (device-free ctest `startup_trap_header`, 40 cases, with
+`tests/startup_trap_header_check.cpp` (device-free ctest `startup_trap_header`, 41 cases, with
 `WILL_FAIL` negative controls `startup_trap_header_prefix_control` and
 `startup_trap_header_precedence_control`, Refs #1149) verifies `src/startup_stubs/trap.h`:
 `exit_code` 8-bit module/index bit-masking (`0xE2570000 | ...`), `listed` comma-separated,

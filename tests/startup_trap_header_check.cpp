@@ -62,6 +62,7 @@ void test_exit_code()
     check(x2w_trap::exit_code(0x12u, 0x34u) == 0xE2571234u, "exit_code encodes module and index");
     check(x2w_trap::exit_code(0xFFu, 0xFFu) == 0xE257FFFFu, "exit_code max 8-bit fields");
     check(x2w_trap::exit_code(0x100u, 0u) == 0xE2570000u, "exit_code masks module overflow bits");
+    check(x2w_trap::exit_code(0x800u, 0u) == 0xE2570000u, "exit_code masks module overflow bit 19");
     check(x2w_trap::exit_code(0u, 0x100u) == 0xE2570000u, "exit_code masks index overflow bits");
     check(x2w_trap::exit_code(0x1ABu, 0x2CDu) == 0xE257ABCDu, "exit_code masks module and index to 8 bits");
 }
