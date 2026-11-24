@@ -193,8 +193,8 @@ def eval_generated(shader, init):
         mul_high=lambda a, b: ((a & 0xffffffff) * (b & 0xffffffff)) >> 32,
         cvt_i32_f32=lambda bits: truncate_word(bits, -(1 << 31), (1 << 31) - 1),
         cvt_u32_f32=lambda bits: truncate_word(bits, 0, (1 << 32) - 1),
-        **init,
     )
+    env.update(init)
     for raw in shader.splitlines():
         if not raw.startswith("    "):
             continue
@@ -638,6 +638,10 @@ def _bits_to_float(word):
     return struct.unpack("<f", struct.pack("<I", word & 0xffffffff))[0]
 
 
+def _to_f32(value):
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
 FLOAT_MODEL = dict(
     asfloat=_bits_to_float,
     asuint=lambda x: struct.unpack("<I", struct.pack("<f", x))[0],
@@ -645,8 +649,12 @@ FLOAT_MODEL = dict(
     rsqrt=lambda x: math.inf if x == 0 else 1.0 / math.sqrt(x),
     floor=lambda x: float(math.floor(x)),
     trunc=lambda x: float(math.trunc(x)),
-    frac=lambda x: x - math.floor(x),
+    frac=lambda x: _to_f32(x - math.floor(x)) if math.isfinite(x) else math.nan,
     saturate=lambda x: min(max(x, 0.0), 1.0),
+    # D3D min returns its other operand when one is a NaN (Python's min keeps the first).
+    min=lambda a, b: b if math.isnan(a) else a if math.isnan(b) else min(a, b),
+    # The emitted cap, as a comparison: a NaN fails it and passes through.
+    fract_cap=lambda f: _bits_to_float(0x3f7fffff) if f >= 1.0 else f,
 )
 
 
@@ -677,8 +685,22 @@ def lower_only(text):
     return re.sub(r"asuint\(saturate\((.*)\)\);", r"asuint(max(\1,0.0));", text)
 
 
+# The emitted cap on a fraction: group 1 is the frac call. The checks rename it to fract_cap(<frac call>) so that the
+# mutations below can replace the call or the cap and the evaluator needs no ternary.
+FRACT_CAP = r"\((frac\(([^;]*?)\)) >= 1\.0f \? asfloat\(0x3f7fffffu\) : \1\)"
+
+
+def name_fract_cap(text):
+    return re.sub(FRACT_CAP, r"fract_cap(\1)", text)
+
+
 def fract_without_upper_bound(text):
-    return re.sub(r"min\((frac\(asfloat\(v1\)\)),asfloat\(0x3f7fffffu\)\)", r"\1", text)
+    return re.sub(r"fract_cap\((frac\(asfloat\(v1\)\))\)", r"\1", text)
+
+
+def fract_cap_as_min(text):
+    # The old cap. D3D min returns the cap for a NaN fraction, so a NaN input would not stay a NaN.
+    return re.sub(r"fract_cap\((frac\(asfloat\(v1\)\))\)", r"min(\1,asfloat(0x3f7fffffu))", text)
 
 
 def frac_as_x_minus_trunc(text):
@@ -725,6 +747,9 @@ def check_float_math(assembler, objcopy, library):
         assert instructions[0][1] == asm, (instructions[0][1], asm)
         shader = translate("consumer", instructions, code)
         assert ("saturate(" in shader) == asm.endswith(" clamp"), asm
+        if asm.startswith("v_fract_f32"):
+            assert len(re.findall(FRACT_CAP, shader)) == 1 and "min(" not in shader, shader
+            shader = name_fract_cap(shader)
         assert float_row_mismatches(shader, rows) == [], asm
         shaders[asm] = (shader, rows)
     # Each wrong lowering must disagree with the tabulated words on exactly these rows.
@@ -733,6 +758,13 @@ def check_float_math(assembler, objcopy, library):
         mutated = mutate(shader)
         assert mutated != shader, asm
         assert float_row_mismatches(mutated, rows) == expected_rows, (asm, expected_rows)
+    # A NaN input must stay a NaN (any NaN word is accepted). The cap written as min turns it into 0x3f7fffff.
+    shader, _ = shaders["v_fract_f32_e32 v0, v1"]
+    for nan in (0x7fc00000, 0x7fc00001, 0xffc00000):
+        out = eval_generated(shader, dict(v1=nan, v2=0, **FLOAT_MODEL))["v0"]
+        assert (out & 0x7f800000) == 0x7f800000 and out & 0x7fffff, hex(out)
+        old = eval_generated(fract_cap_as_min(shader), dict(v1=nan, v2=0, **FLOAT_MODEL))["v0"]
+        assert old == 0x3f7fffff, hex(old)
     for bad_tokens, bad_mods, bad_mnemonic in (
         (["v0", "v1", "v2"], "", "v_sqrt_f32_e64"),      # one source too many
         (["v0", "v1"], "", "v_subrev_f32_e32"),          # one source missing
