@@ -219,6 +219,7 @@ int main(int argc, char** argv)
         !ok(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)), arg(&allocator))) ||
         !ok(invoke(device, 73, arg(list_desc), arg(allocator), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list))))
         return 7;
+    if (!ok(invoke(list, 10, arg(allocator), 0))) return 8;
 
     const D3D12_CPU_DESCRIPTOR_HANDLE pair[] = {rtv[0], rtv[1]};
     Stats seen = Stats::read();
