@@ -23039,6 +23039,21 @@ def check_sampler_descriptor_refusals():
         else:
             raise AssertionError("comparison sampler %s was accepted" % (words,))
 
+    # A gather offset must be a static 6-bit X/Y pair: an absent operand and any bit outside
+    # 0x3f3f are refused, and a legal pair decodes with the sign centred on 32.
+    for bad in (None, 0x40, 0x4040):
+        try:
+            pixel_aot.gather_offset(bad)
+        except ValueError as error:
+            assert "static packed XY offset" in str(error), (bad, error)
+        else:
+            raise AssertionError("gather offset %r was accepted" % (bad,))
+    assert pixel_aot.gather_offset(0x0101) == (1, 1), pixel_aot.gather_offset(0x0101)
+    # 0x3f in X decodes to -1 and 0x1f in Y to +31: the pair is centred on 32, not truncated.
+    assert pixel_aot.gather_offset(0x1f3f) == (-1, 31), pixel_aot.gather_offset(0x1f3f)
+    # 0x20 in Y decodes to -32, the other end of the signed range.
+    assert pixel_aot.gather_offset(0x203f) == (-1, -32), pixel_aot.gather_offset(0x203f)
+
 
 def main():
     if len(sys.argv) == 1:
