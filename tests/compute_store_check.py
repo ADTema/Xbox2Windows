@@ -171,6 +171,19 @@ PITCH = [
     "s_endpgm",
 ]
 INDEX_BINDING = dict(table_reg=7, group_reg=11, descriptor_offset=48, stride=12)
+
+# The indexed kernel with a whole-register immediate write of the scratch base in front. Nothing in the
+# kernel reads FLAT_SCR_LO or touches scratch memory, so the write is a no-op and the readback must match the
+# untouched fixture word for word, guards included.
+SCRATCH_BASE_WRITE_LINES = ["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0"] + INDEXED
+SCRATCH_STORE = "scratch_store_dword off, v15, s0"
+SCRATCH_STORE_LINES = SCRATCH_BASE_WRITE_LINES[:-1] + [SCRATCH_STORE, "s_endpgm"]
+# LLVM spells an immediate whose bit pattern looks like a float as an inline float, and that spelling is the
+# one the disassembler hands to lower(). Both spellings must lower identically and read back identically.
+SCRATCH_BASE_WRITE_SPELLINGS = ["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 1.0",
+                                "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0.15915494"]
+SCRATCH_BASE_WRITE_CASES = [("indexed", [spelling] + INDEXED, 32, INDEX_BINDING)
+                            for spelling in [SCRATCH_BASE_WRITE_LINES[0]] + SCRATCH_BASE_WRITE_SPELLINGS]
 FIXED_BINDING = dict(table_reg=8, descriptor_offset=0)
 RUNTIME_BINDING = dict(FIXED_BINDING, constant_descriptor=32)
 TILE_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, stride=72)
@@ -247,6 +260,21 @@ def controls():
     must_reject(lambda: aot.lower(INDEXED[:7] + ["s_mov_b32 s21, 0"] + INDEXED[7:], 32, **INDEX_BINDING))
     must_reject(lambda: aot.lower(FIXED, 32, **FIXED_BINDING))
     must_reject(lambda: aot.lower(["s_endpgm"], 1, **FIXED_BINDING))
+    # The scratch-base write is accepted only while the program cannot observe the base (#1648): a read of
+    # either half, a scratch memory form anywhere in the program, or a write to any other hardware register
+    # keeps it refused.
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0",
+                                      "s_getreg_b32 s9, hwreg(HW_REG_FLAT_SCR_LO)"] + INDEXED,
+                                 32, **INDEX_BINDING))
+    rejects(f"Unsupported compute instruction: {SCRATCH_STORE}", aot.lower,
+            SCRATCH_STORE_LINES, 32, **INDEX_BINDING)
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400"] + INDEXED, 32,
+                                 **dict(INDEX_BINDING, stride=8)))
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_MODE), 0"] + INDEXED, 32,
+                                 **INDEX_BINDING))
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(4), 0x41"] + INDEXED, 32, **INDEX_BINDING))
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), s9"] + INDEXED, 32,
+                                 **INDEX_BINDING))
 
     # Read a constant word directly into v10 before the constant-load wait.
     must_reject(lambda: aot.lower(
@@ -264,6 +292,11 @@ def controls():
     assert "    outputData.Store3(20u, uint3(0xffff8000u, 0x00000017u, 0xfffffffeu));" in (
         aot.lower(movk_boundary, 1, **FIXED_BINDING).splitlines())
     must_reject(lambda: aot.lower(FIXED, 1, **dict(FIXED_BINDING, constant_descriptor=8)))
+    # Positive coverage, so the raw and binary modes exercise the accepted form as well as the Windows draw
+    # mode: every accepted spelling lowers to exactly the untouched kernel, both scratch halves included.
+    untouched = aot.lower(INDEXED, 32, **INDEX_BINDING)
+    for lines in [SCRATCH_BASE_WRITE_LINES] + [[spelling] + INDEXED for spelling in SCRATCH_BASE_WRITE_SPELLINGS]:
+        assert aot.lower(lines, 32, **INDEX_BINDING) == untouched, lines[0]
 
     # Overlapping store spans in one invocation are rejected.
     must_reject(lambda: aot.lower(
@@ -330,6 +363,7 @@ def controls():
     alu_controls()
     f32_controls()
     scalar_alu_controls()
+    mbcnt_controls()
 
 
 def grid_controls():
@@ -1072,7 +1106,7 @@ def alu_controls():
         (unsupported + "v_max_i32_e32", (("v_min_u32_e32", "v_max_i32_e32"),)),
         (unsupported + "v_mul_hi_u32_e32", (("v_lshrrev_b32_e32", "v_mul_hi_u32_e32"),)),
         (unsupported + "v_xnor_b32_e32", (("v_and_b32_e32", "v_xnor_b32_e32"),)),
-        (unsupported + "v_mad_i32_i24", ((mad, "v_mad_i32_i24 v1, v2, v1, v0"),)),
+        (unsupported + "v_mul_i32_i24_e32", ((mad, "v_mul_i32_i24_e32 v1, v2, v1"),)),
         (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
         # Wrong operand widths: 16-bit, 64-bit and sub-dword (SDWA) forms, and a register range.
         (unsupported + "v_min_u16_e32", (("v_min_u32_e32", "v_min_u16_e32"),)),
@@ -1257,6 +1291,114 @@ SCALAR_WORD = ("min(((((((params[0].y + 0xfffffff0u) - 0x00010000u) & 0xffffffe0
                " >> (0x00000003u & 31u)), ")
 
 SCALAR_CASES = [("read_scalar", READ_SCALAR, 32, READ_BINDING)]
+
+# v_mbcnt_lo/hi_u32_b32 in one 64-thread group, two wave32 waves. Each thread stores three words: the lane index
+# (mbcnt_lo of -1 plus 0), the bits of a sparse literal mask below its lane plus 7, and mbcnt_hi of -1 on top of
+# the lane index, which a wave32 lane leaves unchanged.
+MBCNT = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_mbcnt_lo_u32_b32 v4, -1, 0",
+    "v_mbcnt_lo_u32_b32 v5, 0x5a5a5a5a, 7",
+    "v_mbcnt_hi_u32_b32 v6, -1, v4",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx3 v[4:6], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+MBCNT_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=12, wave_size=32)
+MBCNT_MASK = 0x5a5a5a5a
+MBCNT_LANE = "(1u << (gindex & 31u)) - 1u"
+
+
+def mbcnt_words(*, lane=lambda flat: flat % 32, mask=MBCNT_MASK, base=7):
+    """Independent reference for one MBCNT group: per thread, the bits of -1 and of the mask below its lane."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        below = (1 << lane(flat)) - 1
+        count = bin(0xffffffff & below).count("1")
+        words[3 * flat:3 * flat + 3] = [count, bin(mask & below).count("1") + base, count]
+    return words
+
+
+def mbcnt_controls():
+    """Lane counts: exact output, the wave statement, and one rejection per operand outside the subset."""
+    lines = aot.lower(MBCNT, 64, **MBCNT_BINDING).splitlines()
+    assert lines[2].endswith(", uint gindex : SV_GroupIndex) {"), lines
+    assert lines[3] == (f"    outputData.Store3(tid.x * 12u + 0u, uint3((countbits(0xffffffffu & ({MBCNT_LANE})) + 0x00000000u), "
+                        f"(countbits(0x5a5a5a5au & ({MBCNT_LANE})) + 0x00000007u), "
+                        f"(countbits(0xffffffffu & ({MBCNT_LANE})) + 0x00000000u)));"), lines
+    # More than 32 threads may form a wave64: the lane index needs the caller's wave32 statement.
+    unstated = dict(MBCNT_BINDING)
+    del unstated["wave_size"]
+    rejects("Unverified lane count operand or wave size", aot.lower, MBCNT, 64, **unstated)
+    rejects("Unsupported wave size statement", aot.lower, MBCNT, 64, **MBCNT_BINDING | dict(wave_size=64))
+    # One group of 32 threads is one wave of either size: no statement needed.
+    single = variant(MBCNT, ("s10, 6, v0", "s10, 5, v0"))
+    assert "countbits(0xffffffffu" in aot.lower(single, 32, **unstated)
+    # The mask must be uniform: a VGPR, a scalar still loading and an unknown scalar are refused.
+    rejects("Unsupported compute instruction", aot.lower,
+            variant(MBCNT, ("v4, -1, 0", "v4, v0, 0")), 64, **MBCNT_BINDING)
+    rejects("Unverified lane count operand", aot.lower,
+            variant(MBCNT, ("v4, -1, 0", "v4, s12, 0")), 64, **MBCNT_BINDING)
+    rejects("Unverified lane count operand", aot.lower,
+            variant(MBCNT, ("v4, -1, 0", "v4, s30, 0")), 64, **MBCNT_BINDING)
+    rejects("Unverified lane count operand", aot.lower,
+            variant(MBCNT, ("v5, 0x5a5a5a5a, 7", "v5, 0x5a5a5a5a, v40")), 64, **MBCNT_BINDING)
+
+
+def mbcnt_binary(directory, assembler, objcopy, library):
+    """The assembled MBCNT program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, MBCNT), library, offsets=True))
+    assert [line for line in decoded if line.startswith("v_mbcnt")] == [
+        line for line in MBCNT if line.startswith("v_mbcnt")], decoded
+    assert aot.lower(decoded, 64, **MBCNT_BINDING) == aot.lower(MBCNT, 64, **MBCNT_BINDING)
+
+
+def mbcnt_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("mbcnt.hlsl", "mbcnt.cso", "mbcnt.case")]
+    source = aot.lower(MBCNT, 64, **MBCNT_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = mbcnt_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    # Reference controls: a lane that keeps counting into the second wave first differs at thread 32, a wrong
+    # mask in thread 1's second word (thread 0 counts no bits), a lost base in thread 0's second word, and a
+    # word past the group in the first untouched word.
+    off = list(expected)
+    off[192] ^= 1
+    for label, reference, word in (("flat index as lane", mbcnt_words(lane=lambda flat: flat), 96),
+                                   ("inverted mask", mbcnt_words(mask=MBCNT_MASK ^ 0xffffffff), 4),
+                                   ("base dropped", mbcnt_words(base=0), 1),
+                                   ("untouched word", off, 192)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"mbcnt: reference '{label}' escaped detection\n{bad.stderr}")
+    # Translation controls: a lane that stops at 31 instead of wrapping into the second wave, bits counted from
+    # the wrong side, a lost base, and mbcnt_hi adding a full low half must fail on the device. (A lane taken
+    # modulo 64 is no control: HLSL masks a 32-bit shift count to five bits, so it equals the modulo-32 lane.)
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    hi_term = f"(countbits(0xffffffffu & ({MBCNT_LANE})) + 0x00000000u)));"
+    for label, mutated in (("lane saturates at 31", source.replace("gindex & 31u", "min(gindex, 31u)")),
+                           ("bits above the lane", source.replace(f"({MBCNT_LANE})", "~((2u << (gindex & 31u)) - 1u)")),
+                           ("base dropped", source.replace("+ 0x00000007u", "+ 0x00000000u")),
+                           ("hi adds the low half", source.replace(hi_term, hi_term.replace("0x00000000u)))",
+                                                                                            "32u)))")))):
+        if mutated == source:
+            raise AssertionError(f"mbcnt: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"mbcnt: mutation '{label}' escaped detection")
+    return 0
 
 
 def scalar_alu_controls():
@@ -3486,6 +3628,7 @@ def binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_d16_cases(), "buffer_load_")
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
+    mbcnt_binary(directory, assembler, objcopy, library)
     mubuf_subword_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_store_cases(), "buffer_store_")
     ds_controls()
@@ -3507,6 +3650,11 @@ def binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library,
                    [(f"image_atomic_{name}", lines, binding)
                     for name, _, _, _, lines, binding in mimg_atomic_counter_cases()],
+                   "image_atomic_", group=MIMG_STORE_GROUP)
+    mimg_atomic_float_controls()
+    gfx1030_binary(directory, assembler, objcopy, library,
+                   [(f"image_atomic_{name}", lines, binding)
+                    for name, _, _, _, lines, binding in mimg_atomic_float_cases()],
                    "image_atomic_", group=MIMG_STORE_GROUP)
     mimg_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library,
@@ -3552,6 +3700,15 @@ def binary(directory, assembler, objcopy, library):
                "--llvm", library, *options]
         subprocess.run(cli, check=True)
         assert output.read_text() == aot.lower(lines, width, **binding)
+        if name == "indexed":
+            # Feed the CLI a real scratch store after the otherwise accepted scratch-base write.
+            scratch_code = assemble(directory, assembler, objcopy, [".text", *SCRATCH_STORE_LINES])
+            container.write_bytes(store_container(scratch_code, dims))
+            output.unlink()
+            bad = subprocess.run(cli, capture_output=True, text=True)
+            diagnostic = f"ValueError: Unsupported compute instruction: {SCRATCH_STORE}"
+            assert bad.returncode == 1 and bad.stderr.rstrip().endswith(diagnostic), bad.stderr
+            assert not output.exists()
         if name in {case[0] for case in GUARD_CASES}:
             # The decoded branch lands where the guarded store ends. Retarget it to the store (inside
             # the guarded block), into the store's second word, and past the restore or the exit.
@@ -5087,7 +5244,7 @@ def mimg_atomic_controls(*, suite="integer"):
         rejects("Unsupported image atomic target or binding", aot.lower, case, MIMG_STORE_GROUP,
                 **(case_binding | {"image_format": wrong_format}))
     for op in ("fcmpswap", "fmin", "fmax"):
-        rejects("Unsupported compute instruction", aot.lower,
+        rejects("Unsupported image atomic target or binding", aot.lower,
                 variant(lines, ("image_atomic_" + base_op, "image_atomic_" + op)), MIMG_STORE_GROUP, **binding)
     rejects("Unsupported image store target", aot.lower,
             variant(lines, ("image_atomic_" + base_op, "image_store")), MIMG_STORE_GROUP, **binding)
@@ -5128,7 +5285,7 @@ def mimg_atomic_reference(op, contended, groups, *, compare_store=(MIMG_ATOMIC_C
     return mimg_atomic_words(before_words, update, contended, groups)
 
 
-def mimg_atomic_words(before_words, update, contended, groups):
+def mimg_atomic_words(before_words, update, contended, groups, *, second_update=None):
     initial, expected = [], []
     for level in range(3):
         for y in range(TEXTURE_HEIGHT >> level):
@@ -5139,7 +5296,7 @@ def mimg_atomic_words(before_words, update, contended, groups):
                     before = before_words[(x + y - 1) % len(before_words)]
                     after = update(before)
                     if contended:
-                        after = update(after)
+                        after = (second_update or update)(after)
                 initial.append(before)
                 expected.append(after & 0xffffffff)
     return initial, expected
@@ -5320,6 +5477,153 @@ def mimg_atomic_counter(directory, compiler, renderer=None, backend=None):
     if record:
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text("image_atomic_dec\nimage_atomic_inc\n", encoding="utf-8")
+    return 0
+
+
+MIMG_FLOAT_COMPARE = 0x00800000
+MIMG_FLOAT_REPLACEMENT = 0xff7fffff
+MIMG_FLOAT_NEGATIVE = 0xbf800011
+MIMG_FLOAT_POSITIVE = 0x3f800011
+
+
+def mimg_atomic_float_cases():
+    templates = {name: (lines, binding) for name, _, lines, binding in mimg_atomic_cases()}
+    templates.update((name, (lines, binding)) for name, _, lines, binding in mimg_atomic_cases(suite="exchange"))
+    for op, contended in (("fcmpswap", False), ("fmin", False), ("fmax", False),
+                          ("fmin", True), ("fmax", True)):
+        name = op + ("_contended" if contended else "")
+        if op == "fcmpswap":
+            template, binding = templates["cmpswap"]
+            lines = variant(template, ("image_atomic_cmpswap", "image_atomic_fcmpswap"),
+                            (f"{MIMG_ATOMIC_REPLACEMENT:#x}", f"{MIMG_FLOAT_REPLACEMENT:#x}"),
+                            (f"{MIMG_ATOMIC_COMPARE:#x}", f"{MIMG_FLOAT_COMPARE:#x}"))
+            values = (MIMG_FLOAT_REPLACEMENT, MIMG_FLOAT_COMPARE)
+        else:
+            template, binding = templates["add_contended" if contended else "add"]
+            value = MIMG_FLOAT_NEGATIVE if op == "fmin" else MIMG_FLOAT_POSITIVE
+            load = f"v_mov_b32_e32 v14, {value:#x}"
+            values = (value,)
+            if contended:
+                load = f"v_lshl_add_u32 v5, s11, 1, v1\nv_add_nc_u32_e32 v14, {value:#x}, v5"
+                values += (value + 1,)
+            lines = variant(template, ("image_atomic_add", f"image_atomic_{op}"),
+                            (f"v_mov_b32_e32 v14, {MIMG_ATOMIC_VALUE:#x}", load))
+        yield name, op, values, contended, lines, binding | {
+            "image_format": "R32_FLOAT", "image_float_domain": "finite-normal"}
+
+
+def mimg_atomic_float_controls():
+    for name, op, _, _, lines, binding in mimg_atomic_float_cases():
+        atomic = lines[-3]
+        rejects("The finite-normal image domain requires", aot.lower, lines, MIMG_STORE_GROUP,
+                **(binding | {"image_float_domain": None}))
+        if name != op:
+            continue
+        for flag in MIMG_ATOMIC_FORBIDDEN_FLAGS:
+            rejects("Unsupported compute instruction", aot.lower,
+                    variant(lines, (atomic, f"{atomic} {flag}")), MIMG_STORE_GROUP, **binding)
+        mask = "0x3" if op == "fcmpswap" else "0x1"
+        rejects("Unverified image atomic data range or mask", aot.lower,
+                variant(lines, (f"dmask:{mask}", "dmask:0xf")), MIMG_STORE_GROUP, **binding)
+        if op == "fcmpswap":
+            rejects("Unverified image atomic data range or mask", aot.lower,
+                    variant(lines, (atomic, atomic.replace("v[14:15]", "v[255:256]"))), MIMG_STORE_GROUP, **binding)
+        rejects("Unverified image atomic descriptor", aot.lower,
+                lines[:-4] + lines[-3:], MIMG_STORE_GROUP, **binding)
+        integer_op = "cmpswap" if op == "fcmpswap" else "add"
+        rejects("Unsupported image atomic target or binding", aot.lower,
+                variant(lines, (f"image_atomic_{op}", f"image_atomic_{integer_op}")), MIMG_STORE_GROUP, **binding)
+        rejects("Invalid image UAV binding", aot.lower, lines, MIMG_STORE_GROUP,
+                **(binding | {"image_uav_mip": 1}))
+        rejects("The finite-normal image domain requires", aot.lower, lines, MIMG_STORE_GROUP,
+                **(binding | {"image_format": "R32_UINT"}))
+
+
+def mimg_float_reference(op, values, contended, groups, *, reversed_operands=False):
+    def f32(word):
+        assert 0 < ((word >> 23) & 0xff) < 0xff
+        return struct.unpack("<f", struct.pack("<I", word))[0]
+
+    before = {"fcmpswap": (MIMG_FLOAT_COMPARE, MIMG_FLOAT_REPLACEMENT, 0x00800001, 0x80800000),
+              "fmin": (0x7f7fffff, MIMG_FLOAT_NEGATIVE, 0xff7fffff, 0x80800000),
+              "fmax": (0xff7fffff, MIMG_FLOAT_POSITIVE, 0x7f7fffff, 0x00800000)}[op]
+    second_update = None
+    if op == "fcmpswap":
+        replacement, compare = reversed(values) if reversed_operands else values
+        update = lambda old: replacement if f32(old) == f32(compare) else old
+    else:
+        less = (op == "fmin") != reversed_operands
+        better = operator.lt if less else operator.gt
+
+        def update_from(value):
+            numeric = f32(value)
+            return lambda old: value if better(numeric, f32(old)) else old
+
+        update = update_from(values[0])
+        if contended:
+            second_update = update_from(values[1])
+    initial, expected = mimg_atomic_words(before, update, contended, groups, second_update=second_update)
+    assert all(0 < ((word >> 23) & 0xff) < 0xff for word in (*initial, *expected, *values))
+    return initial, expected
+
+
+def mimg_float_mutation(op, contended):
+    if op == "fcmpswap":
+        compare, replacement = f"{MIMG_FLOAT_COMPARE:#010x}u", f"{MIMG_FLOAT_REPLACEMENT:#010x}u"
+        return (f", {compare}, {replacement});", f", {replacement}, {compare});")
+    if contended:
+        return ("while (observed != expected)", "while (false)")
+    comparison, opposite = ("<", ">") if op == "fmin" else (">", "<")
+    return (f"valueKey {comparison} oldKey", f"valueKey {opposite} oldKey")
+
+
+def mimg_atomic_float(directory, compiler, renderer=None, backend=None):
+    record_path = os.environ.get("FORM_COVERAGE_RECORD") if renderer else None
+    record = Path(record_path) if record_path else None
+    if record:
+        record.unlink(missing_ok=True)
+    mimg_atomic_float_controls()
+    completed = set()
+    for name, op, values, contended, lines, binding in mimg_atomic_float_cases():
+        src, cso, case = (directory / f"image_atomic_{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        code = aot.lower(lines, MIMG_STORE_GROUP, **binding)
+        src.write_text(code, encoding="ascii")
+        compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        listing = src.with_suffix(".ll")
+        subprocess.run([*compile_shader, "-Fc", listing], check=True)
+        dxil = listing.read_text()
+        assert "call i32 @dx.op.atomicCompareExchange.i32(" in dxil
+        assert "@dx.op.textureLoad" not in dxil
+        for groups in (1, 2):
+            initial, expected = mimg_float_reference(op, values, contended, groups)
+            assert len(initial) == len(expected) == 336 and initial != expected
+            if renderer:
+                # The native float words are bound as R32_UINT and require only typed CAS support.
+                case.write_bytes(struct.pack("<674I", groups | MIMG_ATOMIC_CAS_FLAG, 0, *initial, *expected))
+                run = [renderer, backend, "--compute-texture-store-case", cso, case]
+                print(f"image_atomic_{name} groups={groups}", flush=True)
+                result = subprocess.run(run)
+                if result.returncode:
+                    return result.returncode
+        correct, wrong = mimg_float_mutation(op, contended)
+        assert code.count(correct) == 1
+        src.write_text(code.replace(correct, wrong), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        # A CAS against the zero seed cannot update a finite-normal texel without retrying.
+        mutant = initial if contended else mimg_float_reference(op, values, contended, groups,
+                                                                 reversed_operands=True)[1]
+        first = next(i for i, (ref, bad) in enumerate(zip(expected, mutant, strict=True)) if ref != bad)
+        assert first == TEXTURE_WIDTH
+        if renderer:
+            mismatch = f"mip=0 word={first} expected={expected[first]:08x} actual={mutant[first]:08x}"
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or mismatch not in bad.stderr:
+                raise AssertionError(f"{name}: float image atomic mutation escaped detection\n{bad.stderr}")
+            print(f"{name} float image atomic mutation: {bad.stderr}", end="")
+        completed.add(f"image_atomic_{op}")
+    if record:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text("\n".join(sorted(completed)) + "\n", encoding="utf-8")
     return 0
 
 
@@ -5947,6 +6251,17 @@ def draw_mul_lo(cmd, case):
     return 0
 
 
+
+def draw_scratch_base_write(directory, compiler, renderer, backend):
+    """The scratch-base write must leave the generated HLSL byte for byte identical to the untouched kernel,
+    then run on the GPU so the readback and the untouched guards are checked as for the original case."""
+    control = aot.lower(INDEXED, 32, **INDEX_BINDING)
+    for name, lines, width, binding in SCRATCH_BASE_WRITE_CASES:
+        written = aot.lower(lines, width, **binding)
+        if control != written:
+            raise AssertionError("the scratch-base write changed the generated HLSL: " + lines[0])
+    return draw(directory, compiler, renderer, backend, cases=SCRATCH_BASE_WRITE_CASES)
+
 def draw(directory, compiler, renderer, backend, cases=None):
     for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
@@ -6022,6 +6337,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
+                 "draw-scratch-base-write": draw_scratch_base_write,
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mubuf-reduction": mubuf_reduction_draw,
                  "draw-mubuf-csub": lambda d, *a: mubuf_counter_draw(d, *a, csub=True),
@@ -6050,6 +6366,8 @@ if __name__ == "__main__":
                  "draw-mimg-atomic-exchange": lambda d, *a: mimg_atomic_integer(d, *a, suite="exchange"),
                  "compile-mimg-atomic-counter": lambda d, compiler: mimg_atomic_counter(d, compiler),
                  "draw-mimg-atomic-counter": mimg_atomic_counter,
+                 "compile-mimg-atomic-float": lambda d, compiler: mimg_atomic_float(d, compiler),
+                 "draw-mimg-atomic-float": mimg_atomic_float,
                  "draw-mimg-packed-store": lambda d, *a: mimg_store_draw(d, *a, packed=True),
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
@@ -6061,6 +6379,7 @@ if __name__ == "__main__":
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
                  "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
+                 "draw-mbcnt": mbcnt_draw,
                  "draw-mtbuf-store": mtbuf_store_draw,
                  "draw-mubuf-subword-store": mubuf_subword_store_draw,
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES),

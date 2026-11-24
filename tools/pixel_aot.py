@@ -112,7 +112,7 @@ def _check_two_exits(code, llvm, *, cpu, features):
                             "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
                             "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
                             "s_bitreplicate_b64_b32", "s_bitset0_b64", "s_bitset1_b64",
-                            "s_setreg_imm32_b32")):
+                            "s_setreg_imm32_b32", "s_setreg_b32", "s_getreg_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
     # A direct branch may skip alignment NOPs. Keep them in the original span.
@@ -586,12 +586,22 @@ def vgpr_span(token, count):
     return [f"v{n}" for n in range(first, last + 1)]
 
 
-HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
+HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f, "s_incperflevel": 0xf, "s_decperflevel": 0xf,
+               "s_ttracedata_imm": 0xffff}
+# Operandless hints: instruction cache invalidation, a thread-trace marker that reads M0, and the wakeup of waves
+# sleeping in s_sleep. None changes a register, memory or the exported result.
+OPERANDLESS_HINTS = ("s_icache_inv", "s_ttracedata", "s_wakeup")
 
-# s_setreg_imm32_b32 is accepted for two targets only.
+# s_setreg_imm32_b32 and s_setreg_b32 are accepted for two targets only; s_getreg_b32 reads back the first only.
 # MODE[3:2] is the rounding mode shared by binary16 and binary64 results (LLVM SIDefines.h, FP_ROUND_MODE_DP):
 # 0 is round to nearest even, which the binary16 lowerings assume and shader entry is taken to hold, and 3 is
-# round toward zero. The directed modes 1 and 2 are refused.
+# round toward zero. The directed modes 1 and 2 are refused. s_setreg_b32 writes the low `size` bits of an SGPR into
+# the field (LLVM 15 SIISelLowering.cpp:4354-4417 builds SetMask = WidthMask << Offset and takes ImmVal & 0xf for the
+# four-bit round field); it is accepted only when the SGPR holds a known integer that is exactly 0 or 3, the same
+# values as the immediate form, so a value with higher bits set is refused rather than truncated.
+# s_getreg_b32 of the field returns the field right-aligned with every other bit zero (SIISelLowering.cpp:3553-3572
+# reads the one-bit TRAPSTS.MEM_VIOL field and compares the whole register with zero). The entry value of MODE is only
+# assumed, so the read is accepted once the program has itself written the field, and the result is that known value.
 HALF_ROUNDING = {"0": "nearest even", "3": "toward zero"}
 # Under round toward zero no rounding binary16 or binary64 form has a lowering. These two do not depend on the
 # mode: the widening is exact and the pack always truncates.
@@ -603,9 +613,9 @@ HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32")
 # The lowering itself never reads MODE; the declaration only scopes the claim to preserved denormals.
 HALF_DENORM_PRESERVE = "preserve"
 # FLAT_SCR_LO and FLAT_SCR_HI hold the scratch base address. Only scratch_* and flat_* memory instructions and
-# s_getreg_b32 can observe it. scratch_* and s_getreg_b32 are not lowered, and the one lowered flat form,
-# flat_load_dword, reads only through the title ranges below (no private aperture), so a whole-register write
-# changes no result.
+# s_getreg_b32 can observe it. scratch_* and s_getreg_b32 of these registers are not lowered, and the one lowered flat
+# form, flat_load_dword, reads only through the title ranges below (no private aperture), so a whole-register write
+# (an immediate or any SGPR value) changes no result.
 FLAT_SCRATCH = ("HW_REG_FLAT_SCR_LO", "HW_REG_FLAT_SCR_HI")
 
 # flat_load_dword and global_load_dword with `off` read one DWORD at a 64-bit title address: the address pair
@@ -725,9 +735,11 @@ INTEGER = {
     "bfe_i32": (3, "s_bfe_i32({0}, ({1} & 31u) | (({2} & 31u) << 16u))"),
     "bfm_b32": (2, "(((1u << ({0} & 31u)) - 1u) << ({1} & 31u))"),
     "bcnt_u32_b32": (2, "(countbits({0}) + {1})"),
-    # Sums of absolute differences, all unsigned and modulo 2^32 (AMD RDNA 2 ISA reference, VOP3 opcodes 347,
+    # Sums of absolute differences, all unsigned and modulo 2^32 (AMD RDNA 2 ISA reference, VOP3 opcodes 346 to
     # 349 and 369). src1 is the reference: v_msad_u8 leaves out each byte lane whose src1 byte is zero.
+    "sad_u8": (3, "sad4_u8({0}, {1}, false) + {2}"),
     "sad_hi_u8": (3, "(sad4_u8({0}, {1}, false) << 16u) + {2}"),
+    "sad_u16": (3, "sad2_u16({0}, {1}) + {2}"),
     "sad_u32": (3, "(max({0}, {1}) - min({0}, {1})) + {2}"),
     "msad_u8": (3, "sad4_u8({0}, {1}, true) + {2}"),
 }
@@ -758,7 +770,7 @@ MUL24_HELPERS = {
 }
 # Two-source integer operations that exist in the VOP3 encoding only on gfx10.
 INTEGER_VOP3_ONLY = ("cvt_pk_u16_u32", "cvt_pk_i16_i32", "bfm_b32", "bcnt_u32_b32", "pack_b32_f16")
-SAD_HELPERS = {"sad_hi_u8": ("sad4_u8",), "msad_u8": ("sad4_u8",)}
+SAD_HELPERS = {"sad_u8": ("sad4_u8",), "sad_hi_u8": ("sad4_u8",), "sad_u16": ("sad2_u16",), "msad_u8": ("sad4_u8",)}
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 
 
@@ -1199,6 +1211,12 @@ uint class64(uint lo, uint hi) {
         "    return sum;\n"
         "}"
     ),
+    "sad2_u16": (
+        "uint sad2_u16(uint a, uint b) {\n"
+        "    uint lo_a = a & 0xffffu, lo_b = b & 0xffffu, hi_a = a >> 16u, hi_b = b >> 16u;\n"
+        "    return (lo_a > lo_b ? lo_a - lo_b : lo_b - lo_a) + (hi_a > hi_b ? hi_a - hi_b : hi_b - hi_a);\n"
+        "}"
+    ),
     "mul24_u32": (
         "uint mul24_u32(uint a, uint b) {\n"
         "    return (a & 0xffffffu) * (b & 0xffffffu);\n"
@@ -1268,6 +1286,9 @@ DPP_CVT = {
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
     "bfrev_b32": (1, "reversebits({0})", None),
+    # Each signed halfword clamped to [0, 255] into bits 7:0 and 15:8, as the e32 form (INTEGER).
+    "sat_pk_u8_i16": (1, "(uint(clamp(asint({0} << 16) >> 16, 0, 255)) | "
+                         "(uint(clamp(asint({0}) >> 16, 0, 255)) << 8))", None),
     "ffbl_b32": (1, "firstbitlow({0})", None),
     "ffbh_u32": (1, "dpp_ffbh_u32({0})", "dpp_ffbh_u32"),
     "ffbh_i32": (1, "dpp_ffbh_i32({0})", "dpp_ffbh_i32"),
@@ -1956,6 +1977,32 @@ def cvt_f64_f32_words(bits):
     if exponent == 0xff:
         return 0, (sign << 31) | 0x7ff00000
     return (fraction & 7) << 29, (sign << 31) | ((exponent - 127 + 1023) << 20) | (fraction >> 3)
+
+
+def cvt_f32_f64_exact_bits(low, high):
+    """Return the binary32 bits of the binary64 words (low, high), or raise ValueError.
+
+    Only a value that is exactly a normal binary32 or a signed zero is accepted: the narrowing is then exact and does
+    not depend on either rounding field (MODE[1:0] or MODE[3:2]) or either denorm field (MODE[5:4] or MODE[7:6]). The value is narrowed with
+    struct, then widened again with cvt_f64_f32_words, and the result must equal the input words bit for bit.
+    Both infinities and NaNs ("is not finite"), a subnormal binary32 ("is a subnormal") and any value that needs
+    rounding, including one that overflows or underflows binary32 ("requires rounding"), are refused.
+    """
+    if (high >> 20) & 0x7ff == 0x7ff:
+        raise ValueError(f"v_cvt_f32_f64 source 0x{high:08x}{low:08x} is not finite")
+    value, = struct.unpack("<d", struct.pack("<II", low, high))
+    try:
+        bits, = struct.unpack("<I", struct.pack("<f", value))
+    except OverflowError:
+        raise ValueError(f"v_cvt_f32_f64 source 0x{high:08x}{low:08x} requires rounding") from None
+    narrowed, = struct.unpack("<f", struct.pack("<I", bits))
+    if struct.pack("<d", narrowed) != struct.pack("<II", low, high):
+        raise ValueError(f"v_cvt_f32_f64 source 0x{high:08x}{low:08x} requires rounding")
+    if (bits >> 23) & 0xff == 0 and bits & 0x7fffff:
+        raise ValueError(f"v_cvt_f32_f64 source 0x{high:08x}{low:08x} is a subnormal binary32")
+    if cvt_f64_f32_words(bits) != (low, high):
+        raise ValueError(f"v_cvt_f32_f64 source 0x{high:08x}{low:08x} requires rounding")
+    return bits
 
 
 def cvt_f64_f32_source_bits(base, scalar, vector, pending, sample_dest, known_ssa_bits):
@@ -2969,7 +3016,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     # The record names what the pair holds: ("i32" | "u32", name of the uint source of v_cvt_f64_i32 | v_cvt_f64_u32)
     # or ("static", low, high) for v_cvt_f64_f32 of a statically known source. Every word value is an immutable
     # HLSL temporary, so an overwritten word names another SSA value and loses its entry; v_mov_b32 and a join of
-    # equal entries are the only ways the entry travels. v_cvt_i32_f64 and v_cvt_u32_f64 read it.
+    # equal entries are the only ways the entry travels. v_cvt_i32_f64, v_cvt_u32_f64 and v_cvt_f32_f64 read it.
     f64_words: dict[str, tuple] = {}
     known_half: dict[str, int] = {}  # half16 result name -> proven binary16 bits
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
@@ -3044,9 +3091,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     scc = None
     helpers = set()
     half_rounding = HALF_ROUNDING["0"]
+    mode_rounding = None  # MODE[3:2] as this program last wrote it; None while only the assumed entry value exists
     mask = "entry"
     wqm_width = None
     samples = 0
+    sampled_textures = set()
     sample_kind = None  # "plain", "comparison" or "gather" resource interpretation
     vector_loads = 0  # image samples and title loads issued, in vmcnt order
     title_loads = False
@@ -3245,11 +3294,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry":
                 raise ValueError("Unexpected v_nop with non-entry mask")
             continue
-        # Scheduling hints with no effect on results. Each operand is limited to the width
-        # of its RDNA 2 field: clause length minus one, wave priority and sleep duration.
-        if m := match(r"(s_clause|s_setprio|s_sleep) (0x[0-9a-f]+|\d+)"):
+        # v_pipeflush flushes a VALU destination cache and v_clrexcp clears the wave's exception state, which only
+        # s_getreg_b32 of the trap status could observe and which is not lowered; LLVM 15 prints both encodings of
+        # each without a suffix (#1791).
+        if line in ("v_clrexcp", "v_clrexcp_e64", "v_pipeflush", "v_pipeflush_e64"):
+            if mask != "entry":
+                raise ValueError(f"Unexpected {line} with non-entry mask")
+            continue
+        # Scheduling, performance and trace hints with no effect on results. Each operand is limited to the width of
+        # its RDNA 2 field: clause length minus one, wave priority, sleep duration, the performance counter in
+        # SIMM16[3:0], and the 16-bit trace data.
+        if m := match(rf"({'|'.join(HINT_LIMITS)}) (0x[0-9a-f]+|\d+)"):
             if int(m[2], 0) > HINT_LIMITS[m[1]]:
                 raise ValueError(f"Invalid {m[1]} operand")
+            continue
+        if line in OPERANDLESS_HINTS:
             continue
         # A hardware register write is state, not a hint: it is accepted only where its effect on the
         # lowered program is known, and every other register, field or value is refused.
@@ -3265,6 +3324,45 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if value not in HALF_ROUNDING:
                 raise ValueError(f"Unsupported binary16 rounding mode: {line}")
             half_rounding = HALF_ROUNDING[value]
+            mode_rounding = int(value)
+            continue
+        # The register forms. The source SGPR is read, so it must be bound, resolved and defined on every path; the
+        # shared check at the end of the loop is skipped by `continue`, hence the explicit test here. Neither form can
+        # run in a masked region (they are not in REGION_SALU), so the tracked state is straight-line.
+        if line == "s_setreg_b32" or line.startswith("s_setreg_b32 "):
+            if not (m := match(r"s_setreg_b32 hwreg\((\w+)(?:, (\d+), (\d+))?\), (s\d+)")):
+                raise ValueError(f"Malformed s_setreg_b32 operands: {line}")
+            register, offset, size, source = m.groups()
+            sgpr_name(source)
+            whole_scratch = register in FLAT_SCRATCH and offset is None
+            if not whole_scratch and (register, offset, size) != ("HW_REG_MODE", "2", "2"):
+                raise ValueError(f"Unsupported hardware register write: {line}")
+            if source in pending:
+                raise ValueError("Unresolved scalar memory dependency")
+            value = scalar[source]
+            if source in scalar_conditional:
+                raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
+            if not whole_scratch:
+                if type(value) is not int:
+                    raise ValueError(f"Unsupported binary16 rounding mode, the SGPR is not a known integer: {line}")
+                if str(value) not in HALF_ROUNDING:
+                    raise ValueError(f"Unsupported binary16 rounding mode: {line}")
+                half_rounding = HALF_ROUNDING[str(value)]
+                mode_rounding = value
+            continue
+        if line == "s_getreg_b32" or line.startswith("s_getreg_b32 "):
+            if not (m := match(r"s_getreg_b32 (s\d+), hwreg\((\w+)(?:, (\d+), (\d+))?\)")):
+                raise ValueError(f"Malformed s_getreg_b32 operands: {line}")
+            dst, register, offset, size = m.groups()
+            sgpr_name(dst)
+            if (register, offset, size) != ("HW_REG_MODE", "2", "2"):
+                raise ValueError(f"Unsupported hardware register read: {line}")
+            if mode_rounding is None:
+                raise ValueError(f"MODE rounding is read before the program writes it: {line}")
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            scalar[dst] = mode_rounding
+            scalar_mask[dst] = mode_rounding
             continue
         if (half_rounding != HALF_ROUNDING["0"] and re.match(r"v_\w*_f(?:16|64)", line)
                 and not line.startswith(HALF_ROUNDING_EXEMPT)):
@@ -4262,6 +4360,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     call = f"Sample(samp, {coordinate}{offset_arg})"
             lines.append(f"    float4 sample{i} = {texture}.{call};")
             samples += 1
+            sampled_textures.add(texture)
             vector_loads += 1
             for ch, n in zip(channels, dest):
                 vector[f"v{n}"] = f"sample{i}.{ch}"
@@ -4289,6 +4388,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                          f"tex.CalculateLevelOfDetailUnclamped(samp, {coord}));")
             sample_kind = "plain"
             samples += 1
+            sampled_textures.add(bindings[texture_offset])
             vector_loads += 1
             for channel, n in zip("xy", dest):
                 vector[f"v{n}"] = f"sample{i}.{channel}"
@@ -4357,6 +4457,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             method = "SampleCmpLevelZero" if explicit_zero else "SampleCmp"
             lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), {reference}{offset_arg});")
             samples += 1
+            sampled_textures.add("tex")
             vector_loads += 1
             vector[dst] = f"sample{i}"
             sample_dest[dst] = vector_loads
@@ -4419,6 +4520,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    float4 sample{i} = {function}(float2({u}, {v}), int2({xoff}, {yoff}), {mip}, {operand});")
             sample_kind = "gather"
             samples += 1
+            sampled_textures.add("tex")
             vector_loads += 1
             for lane, reg in zip("xyzw", dest):
                 vector[f"v{reg}"] = f"sample{i}.{lane}"
@@ -4880,6 +4982,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             else:
                 expression = record[1]
             lines.append(f"    precise float alu{i} = asfloat({expression});")
+            vector[dst] = f"alu{i}"
+        elif m := match(r"v_cvt_f32_f64(?:_e32)? (v\d+), v\[(0|[1-9]\d*):(0|[1-9]\d*)\]"):
+            # Binary64 to binary32 narrowing, for the pair of a v_cvt_f64_f32 of a static source only (a record
+            # ("static", low, high) on both words, the low word as word 0 and the high word as word 1), and only when the
+            # value is exactly a normal binary32 or a signed zero (cvt_f32_f64_exact_bits: narrowed and widened again it
+            # returns the same words). The result is that binary32 word, computed here and emitted as a constant, so no
+            # HLSL double is used and neither the rounding mode nor the denorm mode is read. Infinities, NaNs,
+            # subnormals, a value that would need rounding, a pair of integer origin (v_cvt_f64_i32 or v_cvt_f64_u32,
+            # even where the integer would fit), a pair of unknown provenance, a pair with one overwritten word or
+            # words of different pairs, the _e64 spelling and every modifier are refused (the last fall through to the
+            # unsupported error). Which MODE field governs the binary64 narrowing is not decided here.
+            dst, first, last = m.groups()
+            first, last = int(first), int(last)
+            names = (f"v{first}", f"v{last}")
+            if (mask != "entry" or last != first + 1 or last > 255 or int(dst[1:]) > 255 or dst in sample_dest
+                    or any(name in sample_dest or name in pending for name in names)):
+                raise ValueError("Invalid binary64 to binary32 conversion")
+            low_word, high_word = (f64_words.get(vector.get(name)) for name in names)
+            if (low_word is None or high_word is None or low_word[0] != high_word[0]
+                    or (low_word[1], high_word[1]) != (0, 1)):
+                raise ValueError(f"Unproven binary64 source v[{first}:{last}] at v_cvt_f32_f64")
+            record = low_word[0]
+            if record[0] != "static":
+                raise ValueError(f"v_cvt_f32_f64 of a v_cvt_f64_{record[0]} pair (integer origin) is not supported")
+            lines.append(f"    precise float alu{i} = asfloat({cvt_f32_f64_exact_bits(record[1], record[2])}u);")
             vector[dst] = f"alu{i}"
         elif m := match(rf"v_(add|sub|subrev)_co_ci_u32_(e32|e64) (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+), {LANE_MASK}"):
             # The carry-out add and subtracts above with a carry or borrow of each lane read from a lane mask.
@@ -6082,7 +6209,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Program ends inside a masked region")
     if gather_mips is not None and sample_kind != "gather":
         raise ValueError("Expected one gather for the declared view")
-    if not ended or samples != len(bindings):
+    if not ended or sampled_textures != set(bindings.values()):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
