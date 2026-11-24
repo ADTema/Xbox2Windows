@@ -674,14 +674,22 @@ class Stage:
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
-        if word_complement:
-            # A lane mask here is the whole wave's mask, and SCC is set when any bit of the
-            # complemented 32-bit result is; the per-lane projection below cannot show that.
+        word_pack = base == 's_pack_hh_b32_b16'
+        if word_complement or word_pack:
+            # The per-lane mask cannot supply the full word needed by these operations.
             def lane_mask(t):
                 r = reg_range(t)
-                return t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or bool(r and r[0] == 's' and r[1] in self.masks)
+                return (t in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
+                        or bool(r and r[0] == 's' and r[1] in self.masks))
             if lane_mask(dname) or any(lane_mask(t) for t in srcs):
                 raise Unsupported('%s on a lane mask' % base)
+        if word_pack:
+            if dname != 'm0' and (dst is None or dst[0] != 's' or dst[1] > 105):
+                raise Unsupported('%s destination %s' % (base, dname))
+            for source in srcs:
+                reg = reg_range(source)
+                if reg and (reg[0] != 's' or reg[1] > 105):
+                    raise Unsupported('%s source %s' % (base, source))
         if pair and ('m0' in srcs or dname == 'm0'):
             raise Unsupported('64-bit scalar operand m0')
         def src_sym(t):
@@ -693,6 +701,8 @@ class Stage:
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if word_complement:
                 raise Unsupported('scc from descriptor data')
+            if word_pack:
+                raise Unsupported('%s on descriptor data' % base)
             if dname == 'm0':
                 if scc:
                     raise Unsupported('scc from descriptor data')
@@ -1726,6 +1736,7 @@ SCA = {
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
     's_bfe_u32': ('({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 127)) - 1)', '$ != 0'),
     's_brev_b32': ('reversebits({0})', None),
+    's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
 }
