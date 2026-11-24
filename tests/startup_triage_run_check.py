@@ -321,7 +321,8 @@ def _check_endpoint_complete(failures: list[str]) -> None:
             + HEARTBEAT_FAILURES.format(second=20, a=1, b=2)
             + HEARTBEAT_COMMIT.format(second=290, peak=16208, current=15000)
             + HEARTBEAT_COMMIT.format(second=299, peak=14000, current=13000)  # a lower peak after a higher one
-            + HEARTBEAT_FAILURES.format(second=299, a=7, b=9),
+            + HEARTBEAT_FAILURES.format(second=299, a=7, b=9)
+            + HEARTBEAT_FAILURES.format(second=50, a=99, b=99),
             "events.txt": ENDPOINT_EVENTS,
         }
     )
@@ -329,9 +330,10 @@ def _check_endpoint_complete(failures: list[str]) -> None:
         "### Run End-Point",
         "| Peak commit (maximum of the `commit peak=` values) | `16208` MiB |",
         "| Last heartbeat | `299` s |",
-        "| First stop event | `0xe06d7363` (first-chance) |",
-        "| Last stop event | `0xc0000005` (second-chance) |",
-        "| Stop events | `2` |",
+        "| Confirmed debugger stop | not reported |",
+        "| First observed exception | `0xe06d7363` (first-chance) |",
+        "| Last observed exception | `0xc0000005` (second-chance) |",
+        "| Observed exceptions | `2` |",
         "at heartbeat second `299`",
         "| read-at-or-past-eof | 7 |",
         "| read-other | 9 |",
@@ -353,8 +355,8 @@ def _check_endpoint_without_commit(failures: list[str]) -> None:
     for want in [
         "| Peak commit (maximum of the `commit peak=` values) | not reported |",
         "| Last heartbeat | `40` s |",
-        "| First stop event | not reported |",
-        "| Stop events | `0` |",
+        "| Confirmed debugger stop | not reported |",
+        "| Observed exceptions | `0` |",
         "at heartbeat second `40`",
     ]:
         if want not in report:
@@ -373,15 +375,37 @@ def _check_endpoint_second_stop(failures: list[str]) -> None:
     events = (
         "  10.000 exception 0xC0000005 access violation at a.dll+0x1 first-chance params=[]\n"
         "  11.000 exception 0xC0000005 access violation at a.dll+0x1 second-chance params=[]\n"
+        "debugger stop 0xc0000005 second-chance\n"
     )
     report = _endpoint_report({"events.txt": events})
     for want in [
-        "| First stop event | `0xc0000005` (first-chance) |",
-        "| Last stop event | `0xc0000005` (second-chance) |",
-        "| Stop events | `2` |",
+        "| First observed exception | `0xc0000005` (first-chance) |",
+        "| Last observed exception | `0xc0000005` (second-chance) |",
+        "| Confirmed debugger stop | `0xc0000005` (second-chance) |",
+        "| Observed exceptions | `2` |",
     ]:
         if want not in report:
             failures.append(f"run end-point with a second stop: missing {want!r}")
+
+
+def _check_endpoint_breakpoint(failures: list[str]) -> None:
+    events = (
+        "  1.000 exception 0x80000003 breakpoint at ntdll.dll+0x13 first-chance params=[]\n"
+        "  2.000 exception 0x80000003 breakpoint at app.exe+0x20 first-chance params=[]\n"
+    )
+    modern = _endpoint_report({"events.txt": events + "debugger stop 0x80000003 first-chance\n"})
+    legacy = _endpoint_report({
+        "events.txt": events,
+        "run.out": "stopped at breakpoint (0x80000003) at app.exe+0x20 after 2.00 s (first chance) params=[]\n",
+    })
+    unfinished = _endpoint_report({"events.txt": events})
+    for report in (modern, legacy):
+        if "| Confirmed debugger stop | `0x80000003` (first-chance) |" not in report:
+            failures.append("run end-point: stopping breakpoint was lost")
+        if "| Observed exceptions | `0` |" not in report or "app.exe" in report:
+            failures.append("run end-point: loader or assertion breakpoint details were counted or copied")
+    if "| Confirmed debugger stop | not reported |" not in unfinished:
+        failures.append("run end-point: first-chance event alone was classified as a stop")
 
 
 def _check_endpoint_private_lines(failures: list[str]) -> None:
@@ -396,7 +420,7 @@ def _check_endpoint_private_lines(failures: list[str]) -> None:
     for needle in ["alice", "secret", "acme", "widget", "deadbeef", "leak", "http", "99 |"]:
         if needle in report:
             failures.append(f"run end-point copied hostile text {needle!r}\n{report}")
-    if "| Stop events | `1` |" not in report or "`0xc0000005` (second-chance)" not in report:
+    if "| Observed exceptions | `1` |" not in report or "`0xc0000005` (second-chance)" not in report:
         failures.append("run end-point: only the well-formed 32-bit code should be reported")
     if "| Peak commit (maximum of the `commit peak=` values) | not reported |" not in report:
         failures.append("run end-point: a non-decimal peak must not be reported")
@@ -408,6 +432,7 @@ def _endpoint_failures() -> list[str]:
         _check_endpoint_complete,
         _check_endpoint_without_commit,
         _check_endpoint_second_stop,
+        _check_endpoint_breakpoint,
         _check_endpoint_private_lines,
     ):
         check(failures)
@@ -420,11 +445,12 @@ def check_run_endpoint(failures: list[str]) -> None:
     mutations = {
         "peak taken from the last line instead of the maximum": ("_keep_peak", lambda old, new: new),
         "an earlier cause line replaces a later one": ("_is_later_sample", lambda old, new: old is None),
+        "an out-of-order cause line replaces a later one": ("_is_later_sample", lambda old, new: True),
         "the exception code is not limited to 32 bits": (
-            "RE_STOP_EVENT",
+            "RE_EXCEPTION",
             re.compile(r"^\s*\d+\.\d+\s+exception\s+(0x[0-9a-fA-F]+)\b.*?\b(first|second)-chance\b"),
         ),
-        "every exception is a stop, including stepped-over ones": ("NON_STOP_EXCEPTIONS", set()),
+        "stepped-over exceptions are counted": ("FILTERED_FIRST_CHANCE", set()),
     }
     for label, (name, replacement) in mutations.items():
         original = getattr(triage_run, name)

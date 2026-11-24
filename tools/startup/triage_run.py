@@ -96,15 +96,18 @@ FAILURE_CAUSES = (
     "bcpack",
     "other",
 )
-# Codes debug_launch.py logs as exceptions but steps over (loader breakpoint, assertion continuation, single step,
-# thread names, debug prints); they are not run stops.
-NON_STOP_EXCEPTIONS = {"0x80000003", "0x80000004", "0x406d1388", "0x40010006"}
+# Omit common debugger events from the observed exception list unless they are second-chance.
+FILTERED_FIRST_CHANCE = {"0x80000003", "0x80000004", "0x406d1388", "0x40010006"}
 RE_HEARTBEAT_SECOND = re.compile(r"x2w-dstorage heartbeat (\d{1,10}) s:")
 RE_COMMIT_PEAK = re.compile(r"x2w-dstorage heartbeat \d{1,10} s: .*?\bcommit peak=(\d{1,10}) MiB\b")
 RE_FAILURE_CAUSES = re.compile(r"x2w-dstorage heartbeat (\d{1,10}) s: failed requests by cause ((?:[a-z-]+=\d{1,10}(?:\s+|$))+)")
 RE_CAUSE_COUNT = re.compile(r"([a-z-]+)=(\d{1,10})")
 # debug_launch.py events.txt: "<seconds> exception <code> <name> at <where> first|second-chance params=[...]".
-RE_STOP_EVENT = re.compile(r"^\s*\d+\.\d+\s+exception\s+(0x[0-9a-fA-F]{8})\b.*?\b(first|second)-chance\b")
+RE_EXCEPTION = re.compile(r"^\s*\d+\.\d+\s+exception\s+(0x[0-9a-fA-F]{8})\b.*?\b(first|second)-chance\b")
+RE_DEBUGGER_STOP = re.compile(r"^debugger stop (0x[0-9a-fA-F]{8}) (first|second)-chance$")
+RE_STOP_SUMMARY = re.compile(
+    r"^stopped at [^(]+\((0x[0-9a-fA-F]{8})\) at .+ after \d+\.\d+ s \((first|second) chance\) params=\["
+)
 
 
 def _keep_peak(old: int | None, new: int) -> int:
@@ -123,9 +126,10 @@ class RunEndpoint:
     last_heartbeat_s: int | None = None
     failure_second: int | None = None
     failure_counts: dict[str, int] = field(default_factory=dict)
-    first_stop: tuple[str, str] | None = None
-    last_stop: tuple[str, str] | None = None
-    stop_events: int = 0
+    first_exception: tuple[str, str] | None = None
+    last_exception: tuple[str, str] | None = None
+    exception_events: int = 0
+    confirmed_stop: tuple[str, str] | None = None
 
     def observe(self, line: str) -> None:
         m = RE_HEARTBEAT_SECOND.search(line)
@@ -143,13 +147,17 @@ class RunEndpoint:
                     name: int(count) for name, count in RE_CAUSE_COUNT.findall(causes.group(2)) if name in FAILURE_CAUSES
                 }
             return
-        m = RE_STOP_EVENT.match(line)
-        if m and m.group(1).lower() not in NON_STOP_EXCEPTIONS:
-            stop = (m.group(1).lower(), m.group(2))
-            self.stop_events += 1
-            if self.first_stop is None:
-                self.first_stop = stop
-            self.last_stop = stop
+        m = RE_DEBUGGER_STOP.match(line) or RE_STOP_SUMMARY.match(line)
+        if m:
+            self.confirmed_stop = (m.group(1).lower(), m.group(2))
+            return
+        m = RE_EXCEPTION.match(line)
+        if m and (m.group(2) == "second" or m.group(1).lower() not in FILTERED_FIRST_CHANCE):
+            exception = (m.group(1).lower(), m.group(2))
+            self.exception_events += 1
+            if self.first_exception is None:
+                self.first_exception = exception
+            self.last_exception = exception
 
 
 def _dec(text: str | None) -> str:
@@ -477,9 +485,10 @@ def format_endpoint(endpoint: RunEndpoint) -> list[str]:
         "| --- | --- |",
         f"| Peak commit (maximum of the `commit peak=` values) | {peak} |",
         f"| Last heartbeat | {beat} |",
-        f"| First stop event | {_stop_text(endpoint.first_stop)} |",
-        f"| Last stop event | {_stop_text(endpoint.last_stop)} |",
-        f"| Stop events | `{endpoint.stop_events}` |",
+        f"| Confirmed debugger stop | {_stop_text(endpoint.confirmed_stop)} |",
+        f"| First observed exception | {_stop_text(endpoint.first_exception)} |",
+        f"| Last observed exception | {_stop_text(endpoint.last_exception)} |",
+        f"| Observed exceptions | `{endpoint.exception_events}` |",
         "",
     ]
     if endpoint.failure_second is None:

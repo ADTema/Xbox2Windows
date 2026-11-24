@@ -461,11 +461,11 @@ outcome (`aliased`, `not_aliased`, `failed`) in a separate table, and a line wit
 The `Run End-Point` section says how far a run got and how it ended, so that reports of runs with different
 memory caps can be told apart. It gives the largest `commit peak=` value of the `x2w-dstorage heartbeat` lines (not
 the last one), the highest heartbeat second, the counts of the last `failed requests by cause` heartbeat line (the
-eight fixed cause names, each with its decimal count, and the second of that line), and the first and last stop event of
-`events.txt` as a 32-bit exception code with `first` or `second` chance. Exceptions that `debug_launch.py` steps over
-(the loader and assertion breakpoints, single step, thread names, debug prints) are not stop events. A value the log
-does not carry is reported as `not reported`. Nothing else of those lines is copied: no module name, path, address or
-exception parameter.
+eight fixed cause names, each with its decimal count, and the second of that line). It reports the first and last observed
+exception and separately reports a confirmed debugger stop. Common first-chance debugger events, such as the loader
+breakpoint, are excluded from the observed exception count. The debugger emits an explicit stop record even for a
+first-chance breakpoint. For older logs, include the debug launcher's `.out` summary in the input directory to confirm
+the stop. The report copies only the 32-bit exception code and whether it was first- or second-chance.
 Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 `startup_triage_run`).
 

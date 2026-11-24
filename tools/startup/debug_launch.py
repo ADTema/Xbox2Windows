@@ -612,6 +612,7 @@ def main():
             elif (not first) or stop_first or (ex_code == 0x80000003 and main_base and
                                                   main_base <= ex_addr < main_base + 0x10000000):
                 stop = (ex_code, ex_addr, tid, first, params)
+                log(f"debugger stop {ex_code:#010x} {'first' if first else 'second'}-chance")
                 break
             elif ex_code in (0x406D1388, 0x40010006):
                 status = DBG_CONTINUE
