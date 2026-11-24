@@ -21,8 +21,8 @@ def vertex(z_bits):
 def check(directory, consumer, backend):
     cache = directory / "cache"
     cache.mkdir()
-    vs_front, vs_back, ps_green, ps_red, root = (
-        directory / name for name in ("vs_front", "vs_back", "ps_green", "ps_red", "root")
+    vs_front, vs_back, ps_green, ps_red, root, ps_empty = (
+        directory / name for name in ("vs_front", "vs_back", "ps_green", "ps_red", "root", "ps_empty")
     )
     out_pos, out_neg, out_depthonly, out_readonly, out_rtv_depth, out_dsv_target, out_bounds = (
         directory / name for name in ("pixels_pos", "pixels_neg", "pixels_depthonly", "pixels_readonly",
@@ -32,10 +32,11 @@ def check(directory, consumer, backend):
     vs_back.write_bytes(vertex(0x3f400000))   # z = 0.75f
     ps_green.write_bytes(pixel(True))
     ps_red.write_bytes(pixel(False))
+    ps_empty.write_bytes(container(0, [0xbf810000]))  # exports nothing: the depth-only pass declares no SV_Target0
 
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_D3D12_DEBUG="1", X2W_SHADER_CACHE=str(cache))
-    base_args = [consumer, str(vs_front), str(vs_back), str(ps_green), str(ps_red), str(root), backend]
+    base_args = [consumer, str(vs_front), str(vs_back), str(ps_green), str(ps_red), str(root), backend, str(ps_empty)]
     req = subprocess.run(base_args, env=env, capture_output=True, text=True)
     if backend == "hardware" and req.returncode == 77:
         print("No D3D12 feature-level 12 hardware adapter")
