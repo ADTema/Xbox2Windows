@@ -48,7 +48,7 @@ INTEGER_HEADER = """#include <array>
 using std::memcpy;
 using std::memset;
 using word = uint64_t;
-static_assert(sizeof(void*) == sizeof(word));
+static_assert(sizeof(void*) == sizeof(word), "lowered code needs 64-bit pointers");
 // A read of host data, or of the lowered function's own frame array, which cannot fault.
 template<class T> T load(word address) {
     T v; memcpy(&v, reinterpret_cast<const void*>(address), sizeof v); return v;

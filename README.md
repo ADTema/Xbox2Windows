@@ -42,7 +42,7 @@ Both Windows jobs on `main` must pass before CI publishes a new chart. The image
 
 ## First build
 
-On x64 Windows, install Python 3.11 or newer and Visual Studio's **Desktop development with C++** workload, including x64 MSVC, CMake, Ninja, and Windows SDK 10.0.26100 with DXC. Windows CI uses Python 3.12. Open PowerShell and run the following commands. If you already have a clone, start at `.\tools\dev.ps1`.
+On x64 Windows, install Python 3.11 or newer and Visual Studio's **Desktop development with C++** workload, including x64 MSVC, CMake, Ninja, and Windows SDK 10.0.26100 with DXC. Windows CI uses Python 3.12. Visual Studio 2019 Build Tools (MSVC 14.29) build every target except the five CRT-free TLS EXE fixtures (`cpu_exe_tls*`), because that compiler leaves their thread-local initializers to the C runtime. For the same reason `cpu_native_tls_value` fails there, `cpu_package_main_image` lacks its fixture, and `xmem_attribute_scan` also sees the unused delay-load jump thunk that the 14.29 linker emits. Open PowerShell and run the following commands. If you already have a clone, start at `.\tools\dev.ps1`.
 
 ```powershell
 git clone https://github.com/R0Y00/Xbox2Windows.git
