@@ -6603,6 +6603,8 @@ Repeat with the `release` preset.
 
 Windows 10 22H2 build `19045.6456`, GTX 1060 6 GB driver `32.0.15.6094` and in-box WARP `10.0.19041.5794` passed in Debug and Release. Both adapters returned `S_OK` for the heap request. Neither reported a view-heap size through OPTIONS19. The first readback was `13579bdf,a5a5a5a5`. The second was `13579bdf,2468ace0` normally and `13579bdf,13579bdf` with the stale binding. The D3D12 debug layer reported zero errors and warnings. The tests skip on adapters without Shader Model 6.0.
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (device `7d51`, driver `32.0.101.8132`) passed both cases and, unlike the two adapters above, does report a view-heap size through OPTIONS19: `max_view_descriptor_heap_size=1000000`. Its readbacks were `13579bdf,a5a5a5a5` after fence 1 and `13579bdf,2468ace0` after fence 2, and `13579bdf,13579bdf` for the stale binding, with zero D3D12 debug errors and warnings.
+
 ```powershell
 cmake --preset dev
 cmake --build --preset dev --target offscreen_check
