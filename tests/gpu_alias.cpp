@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 
 using namespace bvh_fixture;
@@ -111,12 +112,30 @@ bool check_gpu_alias(ID3D12Device* device)
     }
     check(hr, "Open the title allocation as a D3D12 heap");
 
-    // Failure case: a pointer inside the allocation is not the start of an allocation. open must
-    // reject it before calling D3D12, so the debug layer reports no error for this control.
+    // Failure cases: interior pointer, bad arguments, oversized span, address-space wrap, and a
+    // partially committed reservation. open must reject all of them before calling D3D12, so the
+    // debug layer reports no error for these controls.
     era_gpu_alias::Alias interior;
     const HRESULT interior_hr = era_gpu_alias::open(device, base + 0x1000, allocation_bytes - 0x1000, interior);
-    if (interior_hr != E_INVALIDARG || interior.heap || interior.buffer)
+    if (interior_hr != E_INVALIDARG || interior.heap || interior.buffer || interior.size != 0)
         throw std::runtime_error("an interior pointer was not rejected with E_INVALIDARG");
+    if (era_gpu_alias::open(nullptr, base, allocation_bytes, interior) != E_INVALIDARG ||
+        era_gpu_alias::open(device, nullptr, allocation_bytes, interior) != E_INVALIDARG ||
+        era_gpu_alias::open(device, base, 0, interior) != E_INVALIDARG ||
+        era_gpu_alias::open(device, base, allocation_bytes + 0x10000, interior) != E_INVALIDARG ||
+        era_gpu_alias::open(device, base, (std::numeric_limits<std::uint64_t>::max)(), interior) != E_INVALIDARG) {
+        throw std::runtime_error("invalid open arguments or oversized span were not rejected with E_INVALIDARG");
+    }
+    constexpr std::size_t partial_bytes = 128 * 1024;
+    void* partial = VirtualAlloc(nullptr, partial_bytes, MEM_RESERVE, PAGE_READWRITE);
+    if (!partial) throw std::runtime_error("reserve-only VirtualAlloc failed");
+    const bool partial_committed = VirtualAlloc(partial, 64 * 1024, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    const HRESULT partial_hr =
+        partial_committed ? era_gpu_alias::open(device, partial, partial_bytes, interior) : E_FAIL;
+    VirtualFree(partial, 0, MEM_RELEASE);
+    if (!partial_committed || partial_hr != E_INVALIDARG || interior.heap || interior.buffer) {
+        throw std::runtime_error("a partially committed reservation was not rejected with E_INVALIDARG");
+    }
 
     era_title_va::Table table;
     const auto title_begin = reinterpret_cast<std::uint64_t>(base);

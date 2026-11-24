@@ -1,5 +1,8 @@
 #include "era_gpu_alias.h"
 
+#include <algorithm>
+#include <limits>
+
 namespace era_gpu_alias {
 HRESULT open(ID3D12Device* device, void* base, std::uint64_t size, Alias& alias) noexcept
 {
@@ -7,12 +10,28 @@ HRESULT open(ID3D12Device* device, void* base, std::uint64_t size, Alias& alias)
     if (!device || !base || size == 0) {
         return E_INVALIDARG;
     }
-    // OpenExistingHeapFromAddress requires the base of an allocation (debug layer message 1088
-    // otherwise). Reject anything else here so an invalid pointer never reaches D3D12.
-    MEMORY_BASIC_INFORMATION info{};
-    if (VirtualQuery(base, &info, sizeof(info)) != sizeof(info) || info.AllocationBase != base ||
-        info.State != MEM_COMMIT) {
+    const auto start = reinterpret_cast<std::uintptr_t>(base);
+    if (size > (std::numeric_limits<std::uintptr_t>::max)() - start) {
         return E_INVALIDARG;
+    }
+    // OpenExistingHeapFromAddress requires the base of a committed allocation (debug layer message
+    // 1088 otherwise). Walk [base, base + size) here so under-committed, foreign, or oversized spans
+    // never reach D3D12.
+    std::uint64_t remaining = size;
+    auto cursor = start;
+    while (remaining > 0) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) != sizeof(info) ||
+            info.AllocationBase != base || info.State != MEM_COMMIT || info.RegionSize == 0) {
+            return E_INVALIDARG;
+        }
+        const auto offset = cursor - reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+        if (info.RegionSize <= offset) {
+            return E_INVALIDARG;
+        }
+        const auto covered = std::min<std::uint64_t>(info.RegionSize - offset, remaining);
+        remaining -= covered;
+        cursor += covered;
     }
     D3D12_FEATURE_DATA_EXISTING_HEAPS existing{};
     if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &existing, sizeof(existing))) ||
