@@ -172,7 +172,7 @@ def lower(assembly):
     valid_of = {}
     label = None
     origin = None
-    # A QWORD access splits its block, so a successor phi must name the block that now ends in the terminator.
+    # A guarded access splits its block, so a successor phi must name the block that now ends in the terminator.
     final_label = {}
     source_phis = []
     wide_accesses = 0
@@ -282,6 +282,7 @@ def lower(assembly):
                 f"{result} = OpPhi %uint {stem}_old {stem}_issue %c0 {label}",
             ])
             label = stem + "_merge"
+            final_label[origin] = label
             continue
         if line == model:
             line = "OpMemoryModel Logical GLSL450"

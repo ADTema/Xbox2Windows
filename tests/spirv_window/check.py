@@ -206,6 +206,15 @@ with tempfile.TemporaryDirectory() as folder:
     assert "%copied = OpPhi %ulong %result %x2w_store_2_merge" in phi_lowered.splitlines()
     validate_sampler(Path(folder), "phi_qword_lowered", phi_lowered)
 
+    mixed = phi_qword.replace("OpBranch %exit\n",
+                              "%atomic_ptr = OpConvertUToPtr %_ptr_PSB_uint %base\n"
+                              "%old_word = OpAtomicIAdd %uint %atomic_ptr %c1 %c0 %c1\nOpBranch %exit\n")
+    assert mixed != phi_qword
+    validate_sampler(Path(folder), "phi_mixed_original", mixed)
+    mixed_lowered = window.lower(mixed)
+    assert "%copied = OpPhi %ulong %result %x2w_atomic_old_word_merge" in mixed_lowered.splitlines()
+    validate_sampler(Path(folder), "phi_mixed_lowered", mixed_lowered)
+
 for source, reason in (
     (qword.replace("%value = OpLoad %ulong %source Aligned 8", "%value = OpAtomicIAdd %ulong %source %c1 %c0 %increment"),
      "physical word pointer"),
