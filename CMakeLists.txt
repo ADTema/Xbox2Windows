@@ -2121,6 +2121,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # reference words and one mutated lowering per operation (v_cvt_f16_f32 through DXC only).
     add_test(NAME startup_gfx2hlsl_cvt_alu_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_alu_check.py")
+    # Startup shader translator: signed and unsigned three-source integer min, max and median.
+    add_test(NAME startup_gfx2hlsl_int_med3_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_int_med3_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_gfx2hlsl_cvt_alu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_alu_check.py" draw "${DXC_EXECUTABLE}"
