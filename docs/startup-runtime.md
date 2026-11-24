@@ -169,6 +169,10 @@ These are measured on one executable; treat them as hypotheses for others.
   Wrapped sampler heaps keep the 16-byte title stride separate from the desktop descriptor increment
   for CPU handles and descriptor copies.
   The source-built readback uses `ctest --preset dev --no-tests=error -R '^startup_sampler_heap_' -V`.
+- The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
+  `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
+  gather, clamp, cube, array, 1D and `unorm` forms are refused. Only the translation is checked
+  (`python -B tests/startup_image_sample_l_check.py`); a WARP readback of distinct mip levels is still open.
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
   complete shader containers and a wrapped root through WARP, runs `gfx2hlsl.py --pending`, and
   reloads the compiled stages. A second fixture draws a clipped triangle through the translated
