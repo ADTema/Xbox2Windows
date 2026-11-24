@@ -1066,6 +1066,18 @@ foreach(adapter IN ITEMS warp hardware)
     add_test(NAME startup_plane_size_device_${adapter} COMMAND startup_plane_size_device_check ${adapter})
 endforeach()
 set_tests_properties(startup_plane_size_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# Committed buffers through the device wrapper (slot 127) on the default, upload and readback heaps:
+# upload and readback must start in GENERIC_READ and COPY_DEST, which the Windows 10 runtime enforces.
+# The mutated run asks for a 2D texture on an upload heap, which no runtime creates (negative control).
+add_executable(startup_committed_heap_state_check tests/startup_committed_heap_state_check.cpp)
+target_compile_features(startup_committed_heap_state_check PRIVATE cxx_std_17)
+target_link_libraries(startup_committed_heap_state_check PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME startup_committed_heap_state_${adapter} COMMAND startup_committed_heap_state_check ${adapter})
+endforeach()
+add_test(NAME startup_committed_heap_state_upload_texture_control COMMAND startup_committed_heap_state_check warp --mutate upload-texture)
+set_tests_properties(startup_committed_heap_state_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(startup_committed_heap_state_upload_texture_control PROPERTIES WILL_FAIL TRUE)
 # Opt-in BC7 4 KiB standard surfaces (src/startup_stubs/bc7_4k_s.h): accepted descriptions, padded
 # sizes, block order and detile; the mutated run (x-first bit order) is the negative control.
 add_executable(startup_bc7_4k_s_check tests/startup_bc7_4k_s_check.cpp)

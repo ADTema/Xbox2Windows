@@ -3133,7 +3133,9 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
 // heap flags (8, ALLOW_DISPLAY, for the 4K render targets), resource desc, an initial state or
 // layout, clear value, then three zero words (protected session, castable count and formats in the
 // desktop method), riid and ppv. Desktop: CreateCommittedResource with the sanitized desc in
-// COMMON; when desktop rejects the clear value it is retried without one.
+// COMMON, GENERIC_READ on an upload heap and COPY_DEST on a readback heap (the initial states D3D12
+// requires there; the Windows 10 runtime refuses COMMON with E_INVALIDARG). When desktop rejects the
+// clear value it is retried without one.
 HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
                                             const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
                                             void* session, UINT castable_count, const void* castable, const GUID* iid,
@@ -3149,14 +3151,15 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     check_device("Device before slot", 127);
     void* const title_memory = info.SizeInBytes != ~0ull ? title_resource_memory(info.SizeInBytes, info.Alignment) : nullptr;
     ID3D12Resource* resource = nullptr;
+    const D3D12_RESOURCE_STATES initial = props->Type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
+                                          : props->Type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                                                                    : D3D12_RESOURCE_STATE_COMMON;
     HRESULT hr = kind_for(*iid) == resource_kind
-        ? device_of(self)->CreateCommittedResource(props, flags, &copy, D3D12_RESOURCE_STATE_COMMON, clear,
-                                                   IID_PPV_ARGS(&resource))
+        ? device_of(self)->CreateCommittedResource(props, flags, &copy, initial, clear, IID_PPV_ARGS(&resource))
         : E_NOINTERFACE;
     bool cleared = clear != nullptr;
     if (FAILED(hr) && clear && kind_for(*iid) == resource_kind) {
-        hr = device_of(self)->CreateCommittedResource(props, flags, &copy, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                      IID_PPV_ARGS(&resource));
+        hr = device_of(self)->CreateCommittedResource(props, flags, &copy, initial, nullptr, IID_PPV_ARGS(&resource));
         cleared = false;
     }
     static LONG calls;
