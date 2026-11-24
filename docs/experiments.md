@@ -3386,7 +3386,7 @@ public sources:
 |---|---|---|
 | `GS_ALLOC_REQ` | `s_sendmsg` message 9; `m0 = primitives << 12 \| vertices` | LLVM AMDGPU `ID_GS_ALLOC_REQ`; Mesa NGG allocation request; same split in `tools/mesh_entry_aot.py` |
 | Primitive export | target 20; three 10-bit slots at bits 0, 10, 20, each a 9-bit index with the edge flag in bit 9; bit 31 null | LLVM AMDGPU `prim` target; Mesa gfx10 primitive export packing |
-| Wave index | bits 24..27 of the merged wave info in `s3` | Mesa NGG wave id in the thread group |
+| Wave index | bits 24..27 of the merged wave info, held in `s3` | bits: Mesa NGG wave id in the thread group; `s3`: `tools/mesh_entry_aot.py` |
 | Opcodes | `v_mbcnt_lo/hi_u32_b32` 0x365/0x366, `v_lshl_or_b32` 0x36f, `v_cmpx_gt_u32` 0xd4, SOP/DS/EXP formats | LLVM AMDGPU gfx10 encodings |
 
 These are pinned as literal anchors (the `GS_ALLOC_REQ` and primitive-export

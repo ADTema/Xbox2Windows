@@ -14,8 +14,9 @@ sources they follow (LLVM's AMDGPU backend and Mesa's radv/radeonsi NGG code):
   primitive word   export target 20 (LLVM's "prim" target); three 10-bit slots at bits 0, 10 and 20, each a 9-bit
                    group vertex index with the edge flag in its bit 9, and bit 31 the null-primitive flag (Mesa's
                    gfx10 primitive export packing). Edge flags are left clear here.
-  wave index       bits 24..27 of the merged wave info in s3 (Mesa's NGG wave id in the thread group), read here
-                   with s_bfe_u32 s10, s3, 0x40018
+  wave index       bits 24..27 of the merged wave info (Mesa's NGG wave id in the thread group); the merged wave
+                   info sits in s3 as in tools/mesh_entry_aot.py (s3 = wave << 24), read here with
+                   s_bfe_u32 s10, s3, 0x40018
   opcodes          VOP3 v_mbcnt_lo/hi_u32_b32 0x365/0x366 and v_lshl_or_b32 0x36f, VOPC v_cmpx_gt_u32 0xd4, and the
                    SOP1/SOP2/SOPC/SOPK/SOPP, DS and EXP formats of LLVM's gfx10 encodings
 
