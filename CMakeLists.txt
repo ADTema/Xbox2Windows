@@ -1230,6 +1230,22 @@ target_compile_features(startup_local_log_check PRIVATE cxx_std_17)
 add_test(NAME startup_local_log COMMAND startup_local_log_check)
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
 set_tests_properties(startup_local_log_guard_drop_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME startup_local_log_reopen_control COMMAND startup_local_log_check --mutate reopen)
+set_tests_properties(startup_local_log_reopen_control PROPERTIES WILL_FAIL TRUE)
+# Negative control: the same check built against a generated copy of trap.h whose append_log keeps a
+# failed open forever. Only the two open-failure recovery cases may fail; the copy exists only in
+# the test build.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs/trap.h" trap_log_text)
+string(REPLACE "now + log_retry_ms));  // x2w-seam: failed-open" "~0ull >> 1));" trap_log_cache_text "${trap_log_text}")
+if(trap_log_cache_text STREQUAL trap_log_text)
+    message(FATAL_ERROR "trap.h lost the failed-open anchor used by startup_local_log_cache_failure_control")
+endif()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/trap_log_cache_failure/startup_stubs/trap.h" "${trap_log_cache_text}")
+add_executable(startup_local_log_cache_failure_check tests/startup_local_log_check.cpp)
+target_include_directories(startup_local_log_cache_failure_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/trap_log_cache_failure" src)
+target_compile_features(startup_local_log_cache_failure_check PRIVATE cxx_std_17)
+add_test(NAME startup_local_log_cache_failure_control COMMAND startup_local_log_cache_failure_check --mutate cache-failure)
+set_tests_properties(startup_local_log_cache_failure_control PROPERTIES WILL_FAIL TRUE)
 # Trap-by-default export macros and env switches (src/startup_stubs/trap.h, #1149).
 add_executable(startup_trap_header_check tests/startup_trap_header_check.cpp)
 target_include_directories(startup_trap_header_check PRIVATE src)
