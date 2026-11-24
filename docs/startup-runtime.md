@@ -163,7 +163,11 @@ These are measured on one executable; treat them as hypotheses for others.
 - **Struct-returning methods.** When both register arguments of a wrapped method look like objects,
   the one on the calling thread's stack is the return buffer.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
-  `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers.
+  `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
+  pixel stage checks all four manifest words, rejects a mask width from a root constant, and
+  decodes the folded words with the stand-in's static sampler path. The clamp sampler reads
+  column 1 at x=1.25, while the wrap control reads column 0. Run
+  `ctest --preset release --no-tests=error -R "^startup_inline_sampler_"`.
 - **3D images.** `image_sample` with `dim:SQ_RSRC_IMG_3D` becomes a `Texture3D<float4>` sampled with
   a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
