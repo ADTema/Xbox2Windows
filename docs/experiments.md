@@ -194,8 +194,11 @@ queue wait, then calls `RSSetViewports` on a second recording of the same list. 
 fail. An immediately following `Reset` with a compute allocator must create a usable
 recording on the same shim handle. The test closes it, signals the wait, and checks queue
 completion, device removal status, and debug-layer errors after the deliberate failures.
-The normal and forced submit-fence failure variants also retain the previous render-target
-and allocator-reuse checks. [D3D12 command-list recording and allocator lifetimes](https://learn.microsoft.com/windows/win32/direct3d12/recording-command-lists-and-bundles)
+The recovery uses a different desktop allocator when the failed recording still owns
+the current one. Once the failed list is retired and the allocator is idle, a successful
+allocator Reset makes it reusable. The fixture checks the pool size before and after reuse.
+The normal and forced submit-fence failure variants run with the debug layer on and off;
+all four retain the render-target and allocator-reuse checks. [D3D12 command-list recording and allocator lifetimes](https://learn.microsoft.com/windows/win32/direct3d12/recording-command-lists-and-bundles)
 
 ```powershell
 cmake --build --preset dev --target startup_list_resubmit
