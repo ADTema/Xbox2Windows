@@ -423,6 +423,8 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME startup_descriptor_increment_${adapter} COMMAND startup_descriptor_increment ${adapter})
 endforeach()
 set_tests_properties(startup_descriptor_increment_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(startup_descriptor_increment_hardware startup_descriptor_increment_warp PROPERTIES TIMEOUT 60
+    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
 # Which heap type values slot 15 forwards to desktop (src/startup_stubs/descriptor_heap_type.h), without a
 # device. The mutated runs are the negative controls.
 add_executable(startup_descriptor_heap_type_check tests/startup_descriptor_heap_type_check.cpp)
