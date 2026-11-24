@@ -1313,6 +1313,8 @@ DPP_CVT = {
     "cvt_off_f32_i4": (False, "(float(asint({0} << 28) >> 28) * 0.0625f)", None),
     "cvt_i32_f32": (True, "asfloat(cvt_i32_f32({0}))", "cvt_i32_f32"),
     "cvt_u32_f32": (True, "asfloat(cvt_u32_f32({0}))", "cvt_u32_f32"),
+    "cvt_flr_i32_f32": (True, "asfloat(cvt_flr_i32_f32({0}))", "cvt_flr_i32_f32"),
+    "cvt_rpi_i32_f32": (True, "asfloat(cvt_rpi_i32_f32({0}))", "cvt_rpi_i32_f32"),
 }
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
@@ -5607,6 +5609,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 helpers.add(helper)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {template.format(bits)};")
+        elif m := match(r"v_cvt_pkrtz_f16_f32_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 compressed-export pack: src0 is swizzled across the quad,
+            # src1 stays on the current lane, DPP16 allows abs/neg on either source, and the
+            # destination holds the same (lo, hi) compressed-export pair as v_cvt_pkrtz_f16_f32_e32.
+            dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid pack DPP operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 2)
+            s0_val, abs0, neg0 = dpp_vgpr(tokens[0], vector, sample_dest, allow_mods=not is_dpp8)
+            s1_val, abs1, neg1 = dpp_vgpr(tokens[1], vector, sample_dest, allow_mods=not is_dpp8)
+            s0_bits = emit_quad_swizzle_u32(lines, i, s0_val, perm)
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffffffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x80000000u)"
+            s1_bits = f"asuint({s1_val})"
+            if abs1:
+                s1_bits = f"({s1_bits} & 0x7fffffffu)"
+            if neg1:
+                s1_bits = f"({s1_bits} ^ 0x80000000u)"
+            lines.append(f"    precise float alu{i}_lo = asfloat({s0_bits});")
+            lines.append(f"    precise float alu{i}_hi = asfloat({s1_bits});")
+            vector[dst] = (f"alu{i}_lo", f"alu{i}_hi")
         elif m := match(rf"({'|'.join(DPP_EXTRA)}) (v\d+), (.+)"):
             op, dst, rest = m.groups()
             if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
