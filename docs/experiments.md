@@ -2921,6 +2921,25 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 
 Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`.
 
+### gfx1030 MUBUF cache-invalidation rejection
+
+The compute store profile rejects `buffer_gl0_inv` and `buffer_gl1_inv`
+with an opcode-specific diagnostic. The AMD RDNA 2 Shader ISA, section
+12.14, describes GL0 writeback and invalidation and GL1 invalidation as
+separate operations with acknowledgments. The desktop profile has no
+mapping for their cache scopes or acknowledgments.
+
+The LLVM 15 fixture places each instruction and a following `vmcnt(0)`
+inside an otherwise supported indexed store container. It checks the
+disassembly, the diagnostic and the absence of emitted HLSL. Replacing
+the invalidation with `s_nop 0` must emit the original indexed-store
+HLSL. This fixture checks translation rejection and records no semantic
+coverage for either opcode.
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### Indexed gfx1030 typed-buffer reads
 
 The `gfx1030` compute store profile lowers `tbuffer_load_format_x` with
