@@ -288,7 +288,7 @@ These are measured on one executable; treat them as hypotheses for others.
   limits so far are 1,000,000 descriptors on both adapters. Reproduce with
   `ctest --preset release --no-tests=error -R '^startup_(view_heap|logical_view)_' -V`, which skips (77) on an
   adapter that accepts the full request.
-- BCPack requests are completed with zero-filled destinations (blank textures).
+- BCPack DirectStorage requests are decoded for BC7 and BC1 streams into destination memory as single atomic texture payloads; each request decompresses a complete multi-lane rANS chunk directly into its destination buffer and is excluded from chunk continuation caching. Unhandled formats fall back to zero-filled destinations.
 - The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
   reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
   `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
