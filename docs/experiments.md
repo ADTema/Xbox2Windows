@@ -2856,13 +2856,16 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hard
 ### gfx1030 2D image loads
 
 The `gfx1030` compute store profile lowers the typed MIMG form
-`image_load vD, v[x:y], s[A:A+7] dmask:0x1|0x3|0x7|0xf
+`image_load vD, v[x:y], s[A:A+7] dmask:0x1..0xf
 dim:SQ_RSRC_IMG_2D`, with the `unorm` flag optional, and its packed-address
 `a16` spelling `image_load vD, vP, s[A:A+7] ... unorm a16`. The lowering is one
-`Texture2D<uint4>.Load(int3(x, y, 0))` from `t0`; the DMASK-selected leading
-components are written to consecutive destination VGPRs in ascending channel
-order and stored to the output UAV. The accepted form requires a `gfx1030`
-target, `dim:SQ_RSRC_IMG_2D`, known address values and a contiguous DMASK.
+`Texture2D<uint4>.Load(int3(x, y, 0))` from `t0`. The DMASK-selected
+components are packed into consecutive destination VGPRs in ascending
+channel order and stored to the output UAV. For example, `dmask:0xa` writes Y and W to the first and
+second destination registers. A zero mask, bits outside XYZW and a mismatch
+between the destination tuple width and the number of enabled channels are
+rejected. The accepted form requires a `gfx1030` target,
+`dim:SQ_RSRC_IMG_2D` and known address values.
 Without `a16` the address is two consecutive VGPRs (x then y); with `a16` it
 is one VGPR holding x in bits [15:0] and y in bits [31:16]. `d16`, `tfe`,
 `glc`, `slc`, `dlc`, `r128` and the NSA address spelling are refused, as is
@@ -2886,18 +2889,19 @@ that behavior is not measured here.
 
 The source-built wave32 fixture uses an 8x8 thread group and a 32x8
 `R32G32B32A32_UINT` source texture whose words are carried in the case file.
-Dispatches of four, two, one and one groups exercise `dmask:0x1`, `0x3`,
-`0x7` and `0xf` and fill the 320-word output UAV, once with the two-dword
-address and once with the packed `a16` address; the packed address is built
-from `tid.y * 0x10000 + tid.x`. The independent CPU reference recomputes every
+Dispatches of four, two, one and one groups exercise one-, two-, three- and
+four-channel results for all 15 nonzero DMASKs. Each mask runs once with the
+two-dword address and once with the packed `a16` address built from
+`tid.y * 0x10000 + tid.x`. The independent CPU reference recomputes every
 written word and expects the sentinel in the untouched words. A single flipped
 written word (`word=0`) and a single flipped untouched word (`word=300`) must
 both be reported. Each mutated translation must differ at a named word:
 reordering the emitted components fails at word 0, swapping the two address
 registers fails at word 4, and reading the whole packed address as the y
-coordinate fails at word 4. The LLVM 15 binary check assembles and decodes
-every DMASK form in both address families and lowers the decoded program
-through the CLI. These are desktop DXIL executions, not native runs of the
+coordinate fails at word 4. Treating `dmask:0xa` as `0x3` must fail at word 0
+in both address families and both opcodes. The LLVM 15 binary check assembles
+and decodes every DMASK form in both address families and lowers the decoded
+program through the CLI. These are desktop DXIL executions, not native runs of the
 assembled gfx1030 program.
 
 ```powershell
@@ -2911,7 +2915,7 @@ VGPR packs x and y as above, and the low 16 bits of the second VGPR hold the
 mip level. The high 16 bits of that second VGPR are ignored. The translator
 emits `Texture2D<uint4>.Load(int3(x, y, mip))`. The caller guarantees that the
 mip and the coordinates are in range for the selected subresource. The
-lowering covers the same contiguous DMASKs and refuses other dimensions,
+lowering covers the same nonzero DMASKs and refuses other dimensions,
 NSA, `d16`, `tfe` and the cache policy flags.
 
 The mip fixture uploads a 32×8 base image and 16×4 and 8×2 mips. Every
