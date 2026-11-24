@@ -122,6 +122,7 @@ jobs:
           python -B tests/startup_flat_param_check.py
           python -B tests/startup_gfx2hlsl_bit_alu_check.py
           python -B tests/startup_inline_sampler_check.py
+          python -B tests/startup_gfx2hlsl_root_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
