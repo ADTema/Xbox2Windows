@@ -135,8 +135,26 @@ submitted (the public API makes the whole update atomic at submit). An update cl
 submit changes nothing. At submit every write goes to a staging file and every delete is checked
 first; then each old file is moved aside, the new one put in place and, on any failure, everything
 is put back, so a failing action publishes none of the update. This holds for failures inside this
-process; a crash in the middle of the replacement can still leave some blobs replaced and `.x2w-old`
-files behind, and a reader can see the blobs of a submit one after the other.
+process.
+
+Readers and publication share one cross-process lock per container, a file named
+`<container>.x2w-lock` beside the container directory (the suffix is reserved like the other two).
+The replacement of the blobs of a submit, a blob or container delete, and every read take it
+(`LockFileEx` on Windows, `flock` elsewhere, in `src/startup_stubs/file_lock.h`). Publication takes
+it exclusively and releases it only after the last blob is in place; `read_blobs` reads several
+blobs under one shared hold, so a reader in another process sees the whole previous generation or the
+whole new one, never a missing old blob or a mix. Staging files are written before the lock is taken,
+so readers wait only for the renames. The wait is bounded (5 seconds by default, a `Store`
+parameter): on timeout the operation returns `busy` and changes nothing, and a holder that dies is
+harmless because the system drops its lock when its handle closes. This was preferred over a
+manifest or generation directory published by one rename because it keeps the layout the earlier
+commits of this work already write (one directory per container, one file per blob). A reader that
+does not use this store (another program reading the files directly) is not covered.
+
+Separate limitation, crash recovery: if the writing process is killed in the middle of the
+replacement, the lock is released but nothing rolls the update back or completes it. The container
+can then hold some blobs of the new generation and some of the old one, with `.x2w-old` and
+`.x2w-part` files left behind, and the next reader sees that state. There is no recovery pass yet.
 
 The slot numbers and argument layouts follow the public header order and stay a hypothesis.
 Persisted: create container (16), delete container (10, 11), create and close update (23, 24), blob
@@ -147,6 +165,14 @@ report no blob, and the enumerations and queries (12 to 15, 18, 19) still report
 slots call, not the slots: it writes in one process and reads in a second, including a close without
 submit, a failing second action, a second process that sees only committed state, and a redirected
 container directory.
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_publish_'` pauses a writer, in a second
+process, at each step of the publication of a two-blob update (an old blob moved aside, a new one in
+place) through a handshake of files. While it is paused another process must be refused with `busy`
+(never shown a mix or a missing blob) and one that waits must see the whole new generation. The
+existing failing-second-action control checks that the previous generation stays whole, and a lock
+holder that ends without unlocking checks the bounded wait and the recovery. The `_unlocked` test runs
+the same checks on a generated copy of the headers whose lock does nothing and must be caught (a reader
+sees a mixed or incomplete generation). The pause points and that copy exist only in the test build.
 
 Slot 28 first asks the Windows gaming runtime to accept the caller's async block. On rejection it returns before taking staged actions. Once accepted it commits the files and calls `XAsyncComplete` with the status for that block. Slot 29 retrieves the status with the matching operation identity. File publication is synchronous within slot 28. The caller's completion routine can run inline or through its selected completion queue. [XAsyncBegin](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasyncbegin) · [XAsyncComplete](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasynccomplete) · [PC GDK async interface slots](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L57-L64)
 

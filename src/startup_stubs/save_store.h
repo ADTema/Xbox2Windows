@@ -17,16 +17,20 @@
 #include <thread>
 #include <vector>
 
+#include "file_lock.h"
+
 namespace x2w_save {
 
 namespace fs = std::filesystem;
 
-enum class Status { ok, bad_name, too_large, not_found, io_error };
+enum class Status { ok, bad_name, too_large, not_found, io_error, busy };
 
 constexpr std::size_t max_name_bytes = 128;
 constexpr std::size_t max_blob_bytes = std::size_t{64} << 20;
 constexpr std::string_view part_suffix = ".x2w-part";  // a file being written
 constexpr std::string_view old_suffix = ".x2w-old";    // the file a commit replaced, kept until the commit is whole
+constexpr std::string_view lock_suffix = ".x2w-lock";  // beside a container directory: the lock of its publication point
+constexpr std::chrono::milliseconds default_lock_timeout{5000};
 
 // A name becomes one path component. Anything that could address another place is refused: empty,
 // too long, separators, drive letters and streams (':'), control characters, characters Windows
@@ -42,7 +46,7 @@ inline bool valid_name(std::string_view name) noexcept
     if (name.find("..") != std::string_view::npos) return false;
     if (name.back() == '.' || name.back() == ' ' || name.front() == ' ') return false;
     // Case-insensitive: on Windows "X.X2W-PART" and "X.x2w-part" are the same file.
-    for (const std::string_view suffix : {part_suffix, old_suffix}) {
+    for (const std::string_view suffix : {part_suffix, old_suffix, lock_suffix}) {
         if (name.size() < suffix.size()) continue;
         const std::string_view tail = name.substr(name.size() - suffix.size());
         bool same = true;
@@ -182,7 +186,8 @@ private:
 
 class Store {
 public:
-    explicit Store(fs::path root) : root_(std::move(root)) {}
+    explicit Store(fs::path root, std::chrono::milliseconds lock_timeout = default_lock_timeout)
+        : root_(std::move(root)), lock_timeout_(lock_timeout) {}
 
     // An existing container directory counts as success; a redirected one is refused.
     Status create_container(std::string_view container) const
@@ -205,6 +210,8 @@ public:
         const fs::file_status state = fs::symlink_status(dir, ec);
         if (!fs::exists(state)) return Status::not_found;
         if (!fs::is_directory(state) || redirected(state)) return Status::bad_name;
+        FileLock publication;
+        if (const Status locked = lock_container(publication, container, true); locked != Status::ok) return locked;
         fs::remove_all(dir, ec);
         return ec ? Status::io_error : Status::ok;
     }
@@ -212,8 +219,11 @@ public:
     // Publishes a whole update or nothing. Every write goes to a staging file first and every
     // delete is checked; only then are the blobs replaced, each old file moved aside first, and
     // any failure puts everything back. A later action on a blob wins over an earlier one. This
-    // keeps the disk unchanged when an action fails inside this process; a crash in the middle of
-    // the replacement can still leave some blobs replaced and ".x2w-old" files behind.
+    // keeps the disk unchanged when an action fails inside this process. The replacement runs under
+    // an exclusive lock on the container that readers (read_blobs, read_blob) share, so another
+    // process sees the whole old state or the whole new one. A crash in the middle of the
+    // replacement can still leave some blobs replaced and ".x2w-old" files behind: the lock is
+    // released by the system, but nothing completes or rolls back the interrupted commit.
     Status commit(std::string_view container, const std::vector<Action>& actions) const
     {
         if (actions.empty()) return Status::ok;
@@ -229,7 +239,7 @@ public:
             if (!seen) last.push_back(&action);
         }
         if (const Status made = create_container(container); made != Status::ok) return made;
-        static std::mutex commit_lock;  // one commit or rename at a time in this process
+        static std::mutex commit_lock;  // one commit at a time in this process; the file lock below covers other processes
         const std::lock_guard<std::mutex> guard(commit_lock);
         struct Step {
             fs::path file, part, old;
@@ -245,17 +255,11 @@ public:
             Step step;
             step.file = dir / action->blob;
             step.remove = action->remove;
-            const fs::file_status state = fs::symlink_status(step.file, ec);
-            if (redirected(state) || (fs::exists(state) && !fs::is_regular_file(state))) {
+            if (const Status target = check_target(step.file, step.remove); target != Status::ok) {
                 discard_parts();
-                return Status::bad_name;
+                return target;
             }
-            if (action->remove) {
-                if (!fs::exists(state)) {
-                    discard_parts();
-                    return Status::not_found;
-                }
-            } else {
+            if (!action->remove) {
                 step.part = step.file;
                 step.part += unique_name(part_suffix);
                 std::ofstream out(step.part, std::ios::binary | std::ios::trunc);
@@ -275,6 +279,18 @@ public:
             }
             steps.push_back(step);
         }
+        // The publication point: readers hold this lock shared, so they see the blobs before the
+        // first replacement or after the last one, never in between. The staging above ran outside it.
+        FileLock publication;
+        if (const Status locked = lock_container(publication, container, true); locked != Status::ok) {
+            discard_parts();
+            return locked;
+        }
+        for (const Step& step : steps)
+            if (const Status target = check_target(step.file, step.remove); target != Status::ok) {
+                discard_parts();
+                return target;
+            }
         const auto undo = [&] {
             for (auto it = steps.rbegin(); it != steps.rend(); ++it) {
                 if (it->installed) fs::remove(it->file, ec);
@@ -292,14 +308,18 @@ public:
                 }
                 step.moved_old = true;
             }
-            if (step.remove) continue;
-            if (!rename_with_retry(step.part, step.file)) {
-                undo();
-                return Status::io_error;
+            // x2w-seam: moved-aside
+            if (!step.remove) {
+                if (!rename_with_retry(step.part, step.file)) {
+                    undo();
+                    return Status::io_error;
+                }
+                step.installed = true;
+                step.part.clear();
             }
-            step.installed = true;
-            step.part.clear();
+            // x2w-seam: published
         }
+        publication.release();
         for (const Step& step : steps)
             if (step.moved_old) fs::remove(step.old, ec);
         return Status::ok;
@@ -316,13 +336,58 @@ public:
         return commit(container, {action});
     }
 
-    // not_found only when the blob is truly absent; any other failure is io_error.
+    // not_found only when the blob is truly absent; any other failure is io_error. busy: the
+    // publication point stayed locked for the whole lock timeout.
     Status read_blob(std::string_view container, std::string_view blob, std::vector<unsigned char>& bytes) const
+    {
+        std::vector<std::vector<unsigned char>> one;
+        const Status status = read_blobs(container, {std::string(blob)}, one);
+        if (status == Status::ok) bytes = std::move(one.front());
+        return status;
+    }
+
+    // Several blobs of one container as one generation: a commit from any process is seen whole or
+    // not at all. All or nothing; a blob missing from the container is not_found.
+    Status read_blobs(std::string_view container, const std::vector<std::string>& blobs, std::vector<std::vector<unsigned char>>& out) const
+    {
+        const fs::path dir = container_dir(container);
+        if (dir.empty()) return Status::bad_name;
+        for (const std::string& blob : blobs)
+            if (!valid_name(blob)) return Status::bad_name;
+        std::error_code ec;
+        const fs::file_status dir_state = fs::symlink_status(dir, ec);
+        if (redirected(dir_state)) return Status::bad_name;
+        if (!fs::exists(dir_state)) return Status::not_found;
+        FileLock publication;
+        if (const Status locked = lock_container(publication, container, false); locked != Status::ok) return locked;
+        std::vector<std::vector<unsigned char>> all(blobs.size());
+        for (std::size_t i = 0; i < blobs.size(); ++i)
+            if (const Status status = read_file(dir / blobs[i], all[i]); status != Status::ok) return status;
+        out = std::move(all);
+        return Status::ok;
+    }
+
+    Status delete_blob(std::string_view container, std::string_view blob) const
     {
         const fs::path file = blob_file(container, blob);
         if (file.empty()) return Status::bad_name;
         std::error_code ec;
-        if (redirected(fs::symlink_status(file.parent_path(), ec))) return Status::bad_name;
+        const fs::file_status dir_state = fs::symlink_status(file.parent_path(), ec);
+        if (redirected(dir_state)) return Status::bad_name;
+        if (!fs::exists(dir_state)) return Status::not_found;
+        FileLock publication;
+        if (const Status locked = lock_container(publication, container, true); locked != Status::ok) return locked;
+        const fs::file_status state = fs::symlink_status(file, ec);
+        if (!fs::exists(state)) return Status::not_found;
+        if (redirected(state) || !fs::is_regular_file(state)) return Status::bad_name;
+        return fs::remove(file, ec) && !ec ? Status::ok : Status::io_error;
+    }
+
+private:
+    // A blob file that is missing is not_found; one that is not a plain file is io_error.
+    static Status read_file(const fs::path& file, std::vector<unsigned char>& bytes)
+    {
+        std::error_code ec;
         const fs::file_status state = fs::symlink_status(file, ec);
         if (!fs::exists(state)) return Status::not_found;
         if (redirected(state) || !fs::is_regular_file(state)) return Status::io_error;
@@ -335,19 +400,29 @@ public:
         return Status::ok;
     }
 
-    Status delete_blob(std::string_view container, std::string_view blob) const
+    // What a commit step needs of its blob file: not a link or a directory, and present when it is a delete.
+    static Status check_target(const fs::path& file, bool remove)
     {
-        const fs::path file = blob_file(container, blob);
-        if (file.empty()) return Status::bad_name;
         std::error_code ec;
-        if (redirected(fs::symlink_status(file.parent_path(), ec))) return Status::bad_name;
         const fs::file_status state = fs::symlink_status(file, ec);
-        if (!fs::exists(state)) return Status::not_found;
-        if (redirected(state) || !fs::is_regular_file(state)) return Status::bad_name;
-        return fs::remove(file, ec) && !ec ? Status::ok : Status::io_error;
+        if (redirected(state) || (fs::exists(state) && !fs::is_regular_file(state))) return Status::bad_name;
+        return remove && !fs::exists(state) ? Status::not_found : Status::ok;
     }
 
-private:
+    // Locks the publication point of a container: a file beside its directory, so deleting the
+    // directory never touches it. The lock outlives nothing: the system drops it when the process ends.
+    Status lock_container(FileLock& held, std::string_view container, bool exclusive) const
+    {
+        fs::path file = container_dir(container);
+        if (file.empty()) return Status::bad_name;
+        file += lock_suffix;
+        switch (held.acquire(file, exclusive, lock_timeout_)) {
+        case LockResult::locked: return Status::ok;
+        case LockResult::timeout: return Status::busy;
+        default: return Status::io_error;
+        }
+    }
+
     // Replacing or moving a file another writer holds can fail on Windows (access denied or a
     // sharing violation instead of last-writer-wins), so a few retries with a growing pause.
     static bool rename_with_retry(const fs::path& from, const fs::path& to)
@@ -375,6 +450,7 @@ private:
     }
 
     fs::path root_;
+    std::chrono::milliseconds lock_timeout_;
 };
 
 }  // namespace x2w_save
