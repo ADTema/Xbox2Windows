@@ -26,7 +26,7 @@ fifth and later) and floating-point arguments are not supported.
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
 CMOVcc) in one straight-line run that no edge enters. Overflow and low-byte
 parity conditions use the producer operand width, including narrow arithmetic.
-Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc, and
+Instructions that leave the flags unchanged (moves, LEA, NOT, BSWAP, SETcc, CMOVcc, and
 CBW, CWDE, CDQE, CDQ and CQO) may sit between them.
 
 SHL, SHR and SAR produce flags only with an immediate count whose masked value
@@ -37,6 +37,38 @@ refused, and SAR by such a count with them. CF is the last bit
 shifted out and ZF, SF and PF come from the result. OF is defined only for a
 count of 1 (MSB of the result XOR CF for SHL, MSB of the operand for SHR, 0 for
 SAR), so O, NO, L, GE, LE and G are refused after a larger count.
+
+BT, BTS, BTR and BTC take a 16-, 32- or 64-bit register or memory bit base and
+a register or immediate bit offset. The offset is taken modulo the operand
+width, except that a register offset into memory addresses a bit string
+outside the operand, which is refused. CF is the selected bit before the
+write; the Intel SDM leaves ZF unaffected and the other flags undefined, so
+only the B and AE conditions may read it.
+
+POPCNT, LZCNT and TZCNT take a 16-, 32- or 64-bit register or memory source.
+LZCNT and TZCNT return the operand width for a zero source. As the Intel SDM
+defines their flags, POPCNT sets ZF for a zero source and clears OF, SF, AF, CF
+and PF, so every condition may read them. LZCNT and TZCNT set CF for a zero
+source and ZF for a zero result and leave OF, SF, AF and PF undefined, so only
+B, AE, E, NE, BE and A may read them. The host must support the instructions
+whose results the original computes: without ABM and BMI1 a processor runs
+LZCNT and TZCNT as BSR and BSF.
+
+BSF and BSR take a 16-, 32- or 64-bit register destination and a register or
+memory source of the same width. A nonzero source gives the index of its lowest
+(BSF) or highest (BSR) set bit and clears ZF. For a zero source ZF is set and
+the destination is left unchanged. The Intel SDM calls that destination
+undefined; AMD documents it as unchanged, and the translation follows the
+unchanged behaviour of the processors measured, 32-bit destinations included:
+a zero source does not clear bits 63:32. A nonzero source zero-extends a 32-bit
+result and keeps bits 63:16 of a 16-bit destination. CF, OF, SF, PF and AF are
+undefined, so only the E and NE conditions may read them and every other
+condition is refused. The destination is read, so it must be defined.
+
+BSWAP takes a 32- or 64-bit register and reverses its bytes in place; no flag changes.
+A 32-bit BSWAP zero-extends its result into the 64-bit register like any other 32-bit
+write. The 16-bit form (operand-size prefix) is refused: the Intel SDM leaves its
+result undefined.
 
 One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
 and RDX without naming them. Products of up to 32-bit factors are computed in
@@ -191,6 +223,12 @@ MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
 ROTATES = {M.ROL: "true", M.ROR: "false"}
+# Bit tests, by the C++ operator that writes the selected bit (BT writes nothing).
+BIT_TESTS = {M.BT: None, M.BTS: "|", M.BTR: "& ~", M.BTC: "^"}
+# Bit scans, by the PRELUDE helper that computes the index of the bit found in a nonzero source.
+BIT_SCANS = {M.BSF: "trailing_zeros", M.BSR: "highest_bit"}
+# Bit counts, by the PRELUDE helper that computes each.
+BIT_COUNTS = {M.POPCNT: "count_ones", M.LZCNT: "leading_zeros", M.TZCNT: "trailing_zeros"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
@@ -209,9 +247,9 @@ STRING_TRANSFERS = {
 }
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
+FLAG_NEUTRAL = {M.CLZERO, M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, M.BSWAP, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
                 M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS, *BIT_COUNTS, *BIT_SCANS}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -948,6 +986,36 @@ class Lifter:
 
     def condition(self, producer, jcc):
         code = CONDITIONS.get(jcc.condition_code)
+        if producer.mnemonic in BIT_TESTS:
+            # fb is CF, the selected bit. ZF is unaffected and OF, SF, AF and PF are undefined.
+            if code not in ("b", "ae"):
+                raise ValueError(f"only CF is defined after {str(producer).split()[0].upper()} at RVA {jcc.ip:#x}")
+            return "fb != 0" if code == "b" else "fb == 0"
+        if producer.mnemonic in BIT_SCANS:
+            # fa is the source. ZF is set for a zero source; CF, OF, SF, PF and AF are undefined.
+            if code not in ("e", "ne"):
+                name = str(producer).split()[0].upper()
+                raise ValueError(f"only ZF is defined after {name} at RVA {jcc.ip:#x}")
+            source_zero = f"static_cast<{unsigned(self.width(producer))}>(fa) == 0"
+            return source_zero if code == "e" else f"!({source_zero})"
+        if producer.mnemonic in BIT_COUNTS:
+            # fa is the source and fb the result.
+            source_zero = f"static_cast<{unsigned(self.width(producer))}>(fa) == 0"
+            if producer.mnemonic == M.POPCNT:
+                # ZF is set for a zero source; OF, SF, AF, CF and PF are cleared.
+                table = {"e": source_zero, "be": source_zero, "le": source_zero, "o": "false", "b": "false",
+                         "s": "false", "p": "false", "l": "false"}
+            else:
+                result_zero = f"static_cast<{unsigned(self.width(producer))}>(fb) == 0"
+                table = {"b": source_zero, "e": result_zero, "be": f"{source_zero} || {result_zero}"}
+            for negated, base in (("no", "o"), ("ae", "b"), ("ne", "e"), ("a", "be"), ("ns", "s"), ("np", "p"),
+                                  ("ge", "l"), ("g", "le")):
+                if base in table:
+                    table[negated] = f"!({table[base]})"
+            if code not in table:
+                name = str(producer).split()[0].upper()
+                raise ValueError(f"OF, SF and PF are undefined after {name} at RVA {jcc.ip:#x}")
+            return table[code]
         width = self.width(producer)
         u, s = unsigned(width), signed(width)
         a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
@@ -1030,6 +1098,14 @@ class Lifter:
         sets_flags records the flag inputs for a later consumer; producer is the
         instruction whose flags a SETcc or CMOVcc reads."""
         mnemonic = ins.mnemonic
+        if mnemonic == M.CLZERO:
+            if ins.len != 3:
+                raise ValueError(f"unsupported CLZERO prefix or address size at RVA {ins.ip:#x}")
+            address = self.reg(R.RAX)
+            # One aligned cache line per executed instruction. Volatile retains writes
+            # even when a following iteration or caller overwrites the same line.
+            return (f"{{ auto* line = reinterpret_cast<volatile unsigned char*>({address} & ~63ull); "
+                    "for (unsigned i = 0; i < 64; ++i) line[i] = 0; }", {R.RAX: 8}, {})
         if ins.code in STRING_TRANSFERS:
             kind, width = STRING_TRANSFERS[ins.code]
             if (ins.has_segment_prefix or ins.has_repne_prefix or ins.has_lock_prefix
@@ -1139,6 +1215,51 @@ class Lifter:
                 self.flags = True
                 line = f"fa = static_cast<{unsigned(width)}>({value}); " + line
             return line, reads, writes
+        if mnemonic in BIT_TESTS:
+            if ins.op0_kind == OpKind.MEMORY and ins.op1_kind == OpKind.REGISTER:
+                raise ValueError(f"unsupported bit-string operand at RVA {ins.ip:#x}")
+            note(0, 1)
+            bits = width * 8
+            a = self.operand(ins, 0, width)
+            offset = (f"(static_cast<std::uint64_t>({self.operand(ins, 1, width)}) & {bits - 1}u)"
+                      if ins.op1_kind == OpKind.REGISTER else f"{ins.immediate(1) & (bits - 1)}u")
+            lines = []
+            if sets_flags:
+                self.flags = True
+                lines.append(f"fb = (static_cast<std::uint64_t>({a}) >> {offset}) & 1u;")
+            if mnemonic == M.BT:
+                writes.clear()
+            else:
+                lines.append(self.write(ins, width, f"{a} {BIT_TESTS[mnemonic]}(1ull << {offset})"))
+            return " ".join(lines), reads, writes
+        if mnemonic == M.BSWAP:
+            if width not in (4, 8) or ins.op0_kind != OpKind.REGISTER:
+                raise ValueError(f"unsupported BSWAP operands at RVA {ins.ip:#x}: the 16-bit form is undefined")
+            note(0)
+            return self.write(ins, width, f"byte_swap<{unsigned(width)}>({self.operand(ins, 0, width)})"), reads, writes
+        if mnemonic in BIT_SCANS:
+            if width not in (2, 4, 8) or ins.op0_kind != OpKind.REGISTER or ins.op1_kind not in (OpKind.REGISTER, OpKind.MEMORY):
+                raise ValueError(f"unsupported {str(ins).split()[0].upper()} operands at RVA {ins.ip:#x}")
+            note(1)
+            # A zero source leaves the whole destination register as it was, so it is read: 16 bits for a
+            # 16-bit destination, all 64 otherwise (a 32-bit result zero-extends only for a nonzero source).
+            destination = full(ins.op0_register)
+            reads[destination] = max(reads.get(destination, 0), 2 if width == 2 else 8)
+            u = unsigned(width)
+            source = self.operand(ins, 1, width)
+            found = self.write(ins, width, f"{BIT_SCANS[mnemonic]}<{u}>(source)")
+            if sets_flags:
+                self.flags = True
+                return f"fa = {source}; {{ const {u} source = static_cast<{u}>(fa); if (source != 0) {{ {found} }} }}", reads, writes
+            return f"{{ const {u} source = {source}; if (source != 0) {{ {found} }} }}", reads, writes
+        if mnemonic in BIT_COUNTS:
+            note(1)
+            source = self.operand(ins, 1, width)
+            value = f"{BIT_COUNTS[mnemonic]}<{unsigned(width)}>({source})"
+            if not sets_flags:
+                return self.write(ins, width, value), reads, writes
+            self.flags = True
+            return (f"fa = {source}; fb = {value}; " + self.write(ins, width, "fb")), reads, writes
         if mnemonic in (*SHIFTS, *ROTATES):
             if sets_flags:
                 if mnemonic in ROTATES:
@@ -1954,6 +2075,32 @@ template <class T> static inline T rotate_bits(T value, word count, bool left) {
     const unsigned amount = left ? shift : bits - shift;
     const word wide = value;
     return static_cast<T>((wide << amount) | (wide >> (bits - amount)));
+}
+// POPCNT, LZCNT and TZCNT, at the width of T; LZCNT and TZCNT of 0 are the width.
+template <class T> static inline T count_ones(T value) {
+    unsigned count = 0;
+    for (word bits = value; bits != 0; bits &= bits - 1) ++count;
+    return static_cast<T>(count);
+}
+template <class T> static inline T leading_zeros(T value) {
+    unsigned count = 0;
+    while (count < sizeof(T) * 8 && ((static_cast<word>(value) >> (sizeof(T) * 8 - 1 - count)) & 1u) == 0) ++count;
+    return static_cast<T>(count);
+}
+template <class T> static inline T trailing_zeros(T value) {
+    unsigned count = 0;
+    while (count < sizeof(T) * 8 && ((static_cast<word>(value) >> count) & 1u) == 0) ++count;
+    return static_cast<T>(count);
+}
+// BSR of a nonzero value: the index of its highest set bit.
+template <class T> static inline T highest_bit(T value) {
+    return static_cast<T>(sizeof(T) * 8 - 1 - leading_zeros<T>(value));
+}
+// BSWAP: reverse the bytes of a 32- or 64-bit value.
+template <class T> static inline T byte_swap(T value) {
+    T result = 0;
+    for (unsigned i = 0; i < sizeof(T); ++i) result = static_cast<T>((result << 8) | ((static_cast<word>(value) >> (8 * i)) & 0xffu));
+    return result;
 }
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {

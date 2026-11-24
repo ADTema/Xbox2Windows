@@ -20,6 +20,38 @@ class Unsupported(Exception):
 
 PREFETCH = bytes.fromhex('0300a0bf')
 
+# SDWA (sub-dword addressing) selections, with the same meaning as tools/pixel_aot.py: a source
+# selection is zero-extended, or sign-extended under sext(); a destination selection writes the low
+# bits of the result into that field, UNUSED_PAD zeroes the others and UNUSED_PRESERVE keeps them.
+SDWA_SEL = {'BYTE_0': (0, 8), 'BYTE_1': (8, 8), 'BYTE_2': (16, 8), 'BYTE_3': (24, 8),
+            'WORD_0': (0, 16), 'WORD_1': (16, 16), 'DWORD': (0, 32)}
+
+
+def sdwa_source(word, sel, sext):
+    """The uint expression a source selection reads out of a 32-bit register."""
+    offset, width = SDWA_SEL[sel]
+    if width == 32:
+        return word
+    if sext:
+        return 'asuint(asint(%s << %du) >> %du)' % (word, 32 - offset - width, 32 - width)
+    return '((%s >> %du) & %#xu)' % (word, offset, (1 << width) - 1)
+
+
+def sdwa_dest(result, sel, unused, old):
+    """The uint expression a destination selection writes back into a 32-bit register."""
+    offset, width = SDWA_SEL[sel]
+    if width == 32:
+        return result
+    if unused == 'UNUSED_SEXT':
+        raise Unsupported('SDWA UNUSED_SEXT')
+    field = '((%s & %#xu) << %du)' % (result, (1 << width) - 1, offset)
+    if unused == 'UNUSED_PAD':
+        return field
+    if unused != 'UNUSED_PRESERVE':
+        raise Unsupported('SDWA dst_unused %s' % unused)
+    keep = ~(((1 << width) - 1) << offset) & 0xffffffff
+    return '((asuint(%s) & %#xu) | %s)' % (old, keep, field)
+
 
 def strip_header(code):
     at = code.find(PREFETCH, 0, 0x80)
@@ -33,6 +65,13 @@ def decode(code):
             n, name, asm, _ = D.decode_instruction(code, off)
         except Exception as error:
             raise Unsupported('undecodable word at +0x%x: %s' % (off, error))
+        if name == 'image_load_mip':
+            # The shared disassembler does not expose these gfx10 MIMG flags.
+            word0, word1 = struct.unpack_from('<2I', code, off)
+            if word0 & (1 << 16):
+                raise Unsupported('image_load_mip tfe')
+            if word1 & (1 << 30):
+                raise Unsupported('image_load_mip a16')
         out.append((off, n, name, asm))
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
@@ -145,7 +184,7 @@ class Stage:
                 return '0x%08xu' % (s[1] & 0xffffffff)
             if s[0] == 'ud':
                 return 'ud%d' % s[1]
-            if s[0] == 'execcopy':
+            if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
@@ -199,6 +238,7 @@ class Stage:
         self.lines.append(text)
 
     def set_v(self, n, expr):
+        self.uniform_v.discard(n)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
@@ -234,10 +274,27 @@ class Stage:
         r = reg_range(tok)
         s = self.sym.get(r[1]) if r else None
         if s and s[0] == 'desc':
-            return s[1], s[2]
+            # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
+            # descriptors): its offset is the load's offset plus the first register's dword index.
+            return s[1], (None if s[2] is None else s[2] + 4 * s[3])
         if s and s[0] == 'ptr':
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
+
+    def heap_sampler(self, tok):
+        """'qh[...]' when the four sampler words of tok came from one run-time sampler heap load."""
+        r = reg_range(tok)
+        if not r or r[2] - r[1] != 3:
+            return None
+        first = self.sym.get(r[1])
+        if not first or first[0] != 'smpheap':
+            return None
+        if any(self.sym.get(r[1] + i) != ('smpheap', first[1], i) for i in range(4)):
+            raise Unsupported('sampler operand %s mixes sampler heap words' % tok)
+        self.pipe.uses_sampler_heap = True
+        # Sampler descriptors are 16 bytes; x2w_sampler_entry() maps the byte offset to its entry and
+        # sends unaligned or out-of-range offsets to the fallback entry.
+        return 'qh[x2w_sampler_entry(s%d)]' % first[1]
 
     def const_words(self, tok):
         r = reg_range(tok)
@@ -251,6 +308,8 @@ class Stage:
             if name.startswith('s_cbranch') or name == 's_branch':
                 targets.add(int(parse(asm)[1][0].split('_')[1], 16))
         self.blocks = []          # (offset, [lines], terminator)
+        self.uniform_v = set()
+        self.has_branches = bool(targets)
         start = 0
         for off, n, name, asm in self.ins:
             if off in targets and off != start:
@@ -268,7 +327,7 @@ class Stage:
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f', 's_wqm_b64', 's_wqm_b32',
-                    's_setreg_imm32_b32', 's_code_end'):
+                    's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None
         if base == 's_endpgm':
             return ('end',)
@@ -285,6 +344,8 @@ class Stage:
             return handler(ops, mods)
         if base.startswith('v_cmp'):
             return self.compare(base, ops)
+        if base.endswith('_sdwa'):
+            return self.sdwa(base[:-len('_sdwa')], ops, mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
             args = [self.f(o) for o in ops[1:1 + arity]]
@@ -299,6 +360,42 @@ class Stage:
         if base in SCA:
             return self.scalar(base, ops)
         raise Unsupported(base)
+
+    # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
+    # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged;
+    # float forms are not lowered yet, and dst_unused UNUSED_SEXT has no lowering.
+    def sdwa(self, base, ops, mods):
+        fields = {}
+        for m in mods:
+            key, _, value = m.partition(':')
+            if key in ('src0_sel', 'src1_sel', 'src2_sel', 'dst_sel', 'dst_unused') and value:
+                fields[key] = value
+            else:
+                raise Unsupported('%s with SDWA modifier %s' % (base, m))
+        if base not in VEC_U:
+            raise Unsupported('SDWA form of %s' % base)
+        arity, text = VEC_U[base]
+        sources = []
+        for index in range(arity):
+            token = ops[1 + index]
+            sext = token.startswith('sext(') and token.endswith(')')
+            if sext:
+                token = token[len('sext('):-1]
+            selection = fields.get('src%d_sel' % index)
+            if not selection:
+                raise Unsupported('%s SDWA without src%d_sel' % (base, index))
+            sources.append(sdwa_source(self.u(token), selection, sext))
+        result = text.format(*sources)
+        select = fields.get('dst_sel')
+        if not select:
+            raise Unsupported('%s SDWA without dst_sel' % base)
+        # The operation's HLSL carries its own operators, so it has to be grouped before the
+        # destination field masks it: "v7 | v8 & 0xffff" would otherwise bind as "v7 | (v8 & 0xffff)".
+        if SDWA_SEL[select][1] < 32:
+            result = '(%s)' % result
+        destination = reg_range(ops[0])[1]
+        self.set_v(destination, sdwa_dest(result, select, fields.get('dst_unused', 'UNUSED_PAD'),
+                                          'v%d' % destination))
 
     # scalar ALU with descriptor-word bookkeeping
     def scalar(self, base, ops):
@@ -433,8 +530,17 @@ class Stage:
         try:
             off = int(ops[2], 0)
         except ValueError:
+            if p[1] == ('smpheap',) and self.pipe.sampler_heap and count == 4:
+                # A sampler picked at run time from the sampler heap: keep the byte offset in the
+                # first destination register; image() indexes the heap table with it.
+                d = dst[1]
+                self.used_s.add(d)
+                self.emit('s%d = %s;' % (d, self.u(ops[2])))
+                for i in range(count):
+                    self.sym[d + i] = ('smpheap', d, i)
+                return
             if p[1] == ('smpheap',):
-                # A sampler picked at run time from the sampler heap: shortcut, a fixed default sampler.
+                # Shortcut (default unless X2W_SAMPLER_HEAP=1): a fixed default sampler.
                 for i in range(count):
                     self.sym[dst[1] + i] = ('const', 0)
                 self.pipe.notes.add('dynamic sampler index replaced by a default sampler')
@@ -486,6 +592,8 @@ class Stage:
         offset = self.u(ops[2])
         for i in range(count):
             self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, 4 * i))
+            if not mods and re.fullmatch(r'0x[0-9a-f]+|\d+', ops[2]):
+                self.sym[dst[1] + i] = ('fixed_buffer_word',)
 
     def op_s_buffer_load_dwordx2(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 2)
@@ -541,6 +649,7 @@ class Stage:
         table = {'BUF_FMT_8_8_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)', 'U((w >> 24) / 255.0)']),
                  'BUF_FMT_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', '0u', '0u', 'U(1.0)']),
+                 'BUF_FMT_8_UINT': ('{0}.Load(a & ~3u) >> ((a & 3u) * 8u)', ['w & 255u', '0u', '0u', '1u']),
                  'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
                  'BUF_FMT_32_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', '{0}.Load(a + 12)']),
@@ -571,27 +680,56 @@ class Stage:
         dst = reg_range(ops[0])
         dim = [m for m in mods if m.startswith('dim:')][0][4:]
         dmask = int([m for m in mods if m.startswith('dmask:')][0][6:], 0)
-        if dim not in ('SQ_RSRC_IMG_2D', 'SQ_RSRC_IMG_3D'):
+        kinds = {'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
+        if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
-        three = dim == 'SQ_RSRC_IMG_3D'
+        # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
+        # Load on a Texture2DArray take it in the same place, so only the declared type differs.
+        three = dim != 'SQ_RSRC_IMG_2D'
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex3d' if three else 'tex2d')
-        if how == 'load':
-            if three:
-                call = '%s.Load(int4(%s, %s, %s, 0))' % (tex, self.u(cs[0]), self.u(cs[1]), self.u(cs[2]))
-            else:
-                call = '%s.Load(int3(%s, %s, 0))' % (tex, self.u(cs[0]), self.u(cs[1]))
+        lod = None
+        if how == 'l':
+            # Address dwords are the coordinates and then the explicit level; offsets, bias, clamp and derivatives
+            # would add dwords or modifiers this lowering does not read, so they are refused. Only the cache-policy
+            # bits (glc, slc, dlc), which never change the sampled value, are accepted next to dim and dmask;
+            # unorm, r128, tfe, lwe, a16, d16 and reserved bits would each change the address, resource or result
+            # layout and are refused by name.
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+                    raise Unsupported('image_sample_l modifier %s' % m)
+            if dmask == 0:
+                raise Unsupported('image_sample_l with an empty dmask')
+            if len(cs) != (4 if three else 3):
+                raise Unsupported('image_sample_l with %d address registers' % len(cs))
+            lod, cs = cs[-1], cs[:-1]
+        tex = self.pipe.resource(self.descriptor(ops[2]), kinds[dim])
+        if how in ('load', 'load_mip'):
+            # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
+            # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
+            axes = 3 if three else 2
+            mip = '0'
+            if how == 'load_mip':
+                unsupported = [m for m in mods if not m.startswith(('dim:', 'dmask:'))
+                               and m not in ('unorm', 'glc', 'slc', 'dlc')]
+                if unsupported or len(cs) != axes + 1 or not dmask:
+                    raise Unsupported('image_load_mip address or modifiers: %s' % ' '.join(mods))
+                mip = self.u(cs[axes])
+            address = [self.u(c) for c in cs[:axes]] + [mip]
+            call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address))
         else:
-            words = self.const_words(ops[3])
-            smp = self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
+            heap = self.heap_sampler(ops[3])
+            words = None if heap else self.const_words(ops[3])
+            smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
             uv = ('float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
                   else 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1])))
-            if how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
+            if how == 'l':
+                call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
+            elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
@@ -608,8 +746,30 @@ class Stage:
     def op_image_sample_lz(self, ops, mods):
         self.image(ops, mods, 'lz')
 
+    def op_image_sample_l(self, ops, mods):
+        self.image(ops, mods, 'l')
+
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
+
+    def op_image_load_mip(self, ops, mods):
+        self.image(ops, mods, 'load_mip')
+
+    def op_v_cvt_i32_f32(self, ops, mods):
+        if mods:
+            raise Unsupported('v_cvt_i32_f32 with modifiers')
+        dst = reg_range(ops[0])[1]
+        self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
+        src = reg_range(ops[1])
+        if self.exec_known and src and src[0] == 's' and self.sym.get(src[1]) == ('fixed_buffer_word',):
+            self.uniform_v.add(dst)
+
+    def op_v_readfirstlane_b32(self, ops, mods):
+        src, dst = reg_range(ops[1]), reg_range(ops[0])
+        if (mods or self.has_branches or not self.exec_known or not dst or dst[0] != 's' or
+                not src or src[0] != 'v' or src[1] not in self.uniform_v):
+            raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        self.set_s(reg_range(ops[0])[1], self.u(ops[1]))
 
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
@@ -627,7 +787,7 @@ class Stage:
 
     def op_v_interp_mov_f32(self, ops, mods):
         attr, comp = self.note_attr(ops[2], 'flat')
-        self.set_v(reg_range(ops[0])[1], 'U(i.fparam%d.%s)' % (attr, comp))
+        self.set_v(reg_range(ops[0])[1], 'i.fparam%d.%s' % (attr, comp))
 
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)
@@ -705,16 +865,35 @@ class Stage:
         target, vals, flags = m.group(1), [v.strip() for v in m.group(2).split(',')], m.group(3).split()
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
-        if 'compr' in flags:
-            a, b = self.u(vals[0]), self.u(vals[2])
-            exprs = ['f16tof32(%s)' % a, 'f16tof32(%s >> 16)' % a, 'f16tof32(%s)' % b, 'f16tof32(%s >> 16)' % b]
-        else:
-            exprs = ['0.0' if v == 'off' else 'F(%s)' % self.u(v) for v in vals]
         name = {'pos0': 'pos'}.get(target, target)
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
             raise Unsupported('export target %s' % target)
+        kind = self.pipe.mrt_kind(int(name[3:])) if name.startswith('mrt') else 'float'
+        if 'compr' in flags:
+            if kind in ('uint', 'int'):
+                raise Unsupported('packed integer export %s' % name)
+            a, b = self.u(vals[0]), self.u(vals[2])
+            exprs = ['f16tof32(%s)' % a, 'f16tof32(%s >> 16)' % a, 'f16tof32(%s)' % b, 'f16tof32(%s >> 16)' % b]
+            words = ['U(%s)' % e for e in exprs]
+        elif kind in ('uint', 'int'):
+            exprs = ['0u' if v == 'off' else self.u(v) for v in vals]
+            words = exprs
+        elif kind == 'bits':
+            ud = self.pipe.ud(('mrtbits',))
+            exprs = ['0.0' if v == 'off' else 'F((%s) ^ ud%d)' % (self.u(v), ud) for v in vals]
+            words = None
+        else:
+            exprs = ['0.0' if v == 'off' else 'F(%s)' % self.u(v) for v in vals]
+            words = ['0u' if v == 'off' else self.u(v) for v in vals]
         self.exports[name] = True
-        self.emit('o.%s = float4(%s);' % (name, ', '.join(exprs)))
+        expr = '%s(%s)' % ('uint4' if kind in ('uint', 'int') else 'float4', ', '.join(exprs))
+        self.emit('o.%s = %s;' % (name, 'asint(%s)' % expr if kind == 'int' else expr))
+        if name.startswith('param'):
+            # The flat copy read by v_interp_mov_f32 carries the register words. A float copy would let
+            # FXC fold asfloat() of a constant and flush integer bit patterns that are binary32
+            # denormals (#1259). hlsl_vs() drops the line for attributes the pixel stage reads only
+            # interpolated.
+            self.emit('o.f%s = uint4(%s);' % (name, ', '.join(words)))
         return None
 
     # ---- output ------------------------------------------------------------------------------
@@ -784,7 +963,7 @@ VEC_U = {
     'v_ashrrev_i32': (2, 'uint(int({1}) >> ({0} & 31))'), 'v_min_u32': (2, 'min({0}, {1})'), 'v_max_u32': (2, 'max({0}, {1})'),
     'v_min_i32': (2, 'uint(min(int({0}), int({1})))'), 'v_max_i32': (2, 'uint(max(int({0}), int({1})))'),
     'v_cvt_f32_u32': (1, 'U(float({0}))'), 'v_cvt_f32_i32': (1, 'U(float(int({0})))'),
-    'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'), 'v_cvt_i32_f32': (1, 'uint(int(F({0})))'),
+    'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'),
     'v_cvt_f32_ubyte0': (1, 'U(float({0} & 255))'), 'v_cvt_f32_ubyte1': (1, 'U(float(({0} >> 8) & 255))'),
     'v_cvt_f32_ubyte2': (1, 'U(float(({0} >> 16) & 255))'), 'v_cvt_f32_ubyte3': (1, 'U(float({0} >> 24))'),
     'v_cvt_f32_f16': (1, 'U(f16tof32({0}))'), 'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
@@ -841,9 +1020,35 @@ def parse_root(blob):
     raise Unsupported('no RTS0 part')
 
 
+# Run-time sampler heap indexing: an s_load from the sampler heap with a register offset becomes a
+# read of a bounded table, SamplerState qh[SAMPLER_HEAP_SIZE] : register(s0, space1), the form a
+# desktop SM 5.1 / 6.0 shader can index at run time. Opt-in with X2W_SAMPLER_HEAP=1 until the
+# stand-in binds that table; otherwise such a load keeps the default-sampler shortcut.
+#
+# Contract at the manifest boundary ('smpheap <count> <space> fallback <entry>'):
+# - entries 0 .. SAMPLER_HEAP_FALLBACK - 1 hold the title's sampler-heap entries, entry n at byte
+#   offset 16 * n;
+# - entry SAMPLER_HEAP_FALLBACK is reserved: the host fills it with a fallback sampler;
+# - the shader computes the entry itself (x2w_sampler_entry): a byte offset that is not a multiple
+#   of 16, or that lies at or past 16 * SAMPLER_HEAP_FALLBACK, reads the fallback entry. The host
+#   cannot check the offset, which is computed in the shader, so the guard is in the shader.
+SAMPLER_HEAP_SIZE = 2048  # D3D12's limit for a shader-visible sampler heap
+SAMPLER_HEAP_SPACE = 1
+SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
+
+
+# DXGI_FORMAT values for integer RTVs and the binary32 float targets.
+UINT_RTVS = frozenset((3, 7, 12, 17, 25, 30, 36, 42, 50, 57, 62))
+SINT_RTVS = frozenset((4, 8, 14, 18, 32, 38, 43, 52, 59, 64))
+FLOAT32_RTVS = frozenset((2, 6, 16, 41))
+
+
 class Pipeline:
-    def __init__(self, vs_code, ps_code, root_blob):
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=()):
         self.root = parse_root(root_blob)
+        self.rtv_formats = rtv_formats
+        self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
+        self.uses_sampler_heap = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -859,6 +1064,20 @@ class Pipeline:
             raise Unsupported('pixel stage reads attributes %s the vertex stage does not export' % missing)
         if 'pos' not in self.vs.exports:
             raise Unsupported('vertex stage exports no position')
+
+    def mrt_kind(self, slot):
+        if slot >= len(self.rtv_formats):
+            return 'float'
+        fmt = self.rtv_formats[slot]
+        if fmt in UINT_RTVS:
+            if fmt != 42:
+                raise Unsupported('unverified UINT RTV format %d' % fmt)
+            return 'uint'
+        if fmt in SINT_RTVS:
+            if fmt != 43:
+                raise Unsupported('unverified SINT RTV format %d' % fmt)
+            return 'int'
+        return 'bits' if fmt in FLOAT32_RTVS else 'float'
 
     def ud(self, source):
         if source not in self.uds:
@@ -884,9 +1103,13 @@ class Pipeline:
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
-            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex2d': 'Texture2D<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
+            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('SamplerState q%d : register(s%d);' % (i, i))
+        if self.uses_sampler_heap:
+            out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
+            out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
+                       % (16 * SAMPLER_HEAP_FALLBACK, SAMPLER_HEAP_FALLBACK))
         return out
 
     def interface(self, for_pixel):
@@ -895,7 +1118,7 @@ class Pipeline:
             fields.append('    float4 param%d : PARAM%d;' % (p, p))
         # Attributes read without interpolation get a second, flat copy of the vertex output.
         for p in self.flat:
-            fields.append('    nointerpolation float4 fparam%d : FPARAM%d;' % (p, p))
+            fields.append('    nointerpolation uint4 fparam%d : FPARAM%d;' % (p, p))
         fields.append('    float4 pos : SV_Position;')
         return fields
 
@@ -903,7 +1126,9 @@ class Pipeline:
         s = self.vs
         out = self.common() + ['struct VSOut {'] + self.interface(False) + ['};', 'VSOut body(uint vid) {', '    VSOut o = (VSOut)0;']
         s.used_v.add(0)
-        out += s.declarations() + ['    v0 = vid;'] + s.body() + ['    o.fparam%d = o.param%d;' % (p, p) for p in self.flat] + ['    return o;', '}',
+        flat = re.compile(r'\s*o\.fparam(\d+) = ')
+        body = [line for line in s.body() if not (flat.match(line) and int(flat.match(line).group(1)) not in self.flat)]
+        out += s.declarations() + ['    v0 = vid;'] + body + ['    return o;', '}',
             '// Rectangle lists arrive as six vertices per rectangle: corners 0 1 2, 0 2 and the fourth corner 0 + 2 - 1.',
             'VSOut main(uint vid : SV_VertexID) {',
             '    if (ud%d == 0) return body(vid);' % self.rect,
@@ -922,7 +1147,10 @@ class Pipeline:
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
         out = self.common() + ['struct PSIn {'] + self.interface(True) + ['};', 'struct PSOut {']
-        out += ['    float4 mrt%d : SV_Target%d;' % (t, t) for t in targets] + ['};', 'PSOut main(PSIn i) {', '    PSOut o = (PSOut)0;']
+        for t in targets:
+            kind = self.mrt_kind(t)
+            out.append('    %s mrt%d : SV_Target%d;' % ({'int': 'int4', 'uint': 'uint4'}.get(kind, 'float4'), t, t))
+        out += ['};', 'PSOut main(PSIn i) {', '    PSOut o = (PSOut)0;']
         out += s.declarations() + s.body() + ['    return o;', '}']
         return '\n'.join(out) + '\n'
 
@@ -939,6 +1167,8 @@ class Pipeline:
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
         for key, i in self.samplers.items():
             lines.append('smp %d %s' % (i, ' '.join('0x%x' % w for w in key)))
+        if self.uses_sampler_heap:
+            lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
         lines.append('targets %s' % ' '.join(k[3:] for k in sorted(self.ps.exports) if k.startswith('mrt')))
         return '\n'.join(lines) + '\n'
@@ -951,19 +1181,21 @@ def fnv(data, h=1469598103934665603):
 
 
 def pipeline_key(vs_code, ps_code, root_blob):
-    """Must match the runtime: FNV-1a over the three blobs, chained."""
-    return fnv(root_blob, fnv(ps_code, fnv(vs_code)))
+    """Hash the startup translation revision and the three blobs in runtime order."""
+    return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-3'))))
 
 
 FXC = os.environ.get('X2W_FXC', r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe')
 
 
-def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True):
+def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request=''):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob)
+        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats)
         vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
+        if rtv_request:
+            manifest += rtv_request + '\n'
     except Unsupported as reason:
         open(name + '.fail', 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
@@ -977,7 +1209,10 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True):
             if r.returncode:
                 open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, r.stderr[-2000:]))
                 return 'fxc %s failed: %s' % (stage, r.stderr.strip().splitlines()[-1] if r.stderr.strip() else '?')
-    open(name + '.txt', 'w').write(manifest)
+    temporary = '%s.txt.%d.tmp' % (name, os.getpid())
+    with open(temporary, 'w') as result:
+        result.write(manifest)
+    os.replace(temporary, name + '.txt')
     return 'ok'
 
 
@@ -987,10 +1222,24 @@ def classify(blob):
 
 
 def translate_request(out_dir, key):
-    """Translate <dir>/req_<key>.{a,b,root} (the two code blobs of a pipeline, in description order)."""
+    """Translate a base shader request or an RTV variant referencing its source blobs."""
     name = os.path.join(out_dir, 'req_%016x' % key)
-    a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
+    request = ''
+    formats = ()
     try:
+        base = key
+        if os.path.isfile(name + '.rtv'):
+            with open(name + '.rtv', encoding='ascii') as file:
+                request = file.read(256)
+            if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or fnv(request.encode('ascii')) != key:
+                raise Unsupported('invalid RTV variant request')
+            base, *formats = map(int, request.split()[1:])
+            if base > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
+                raise Unsupported('invalid RTV variant values')
+            name = os.path.join(out_dir, 'req_%016x' % base)
+        a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
+        if request and pipeline_key(a, b, root) != base:
+            raise Unsupported('RTV variant source key mismatch')
         if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
             # Slot 86 records complete containers in canonical (VS, PS) order.
             # Keep the container bytes in the cache key; translate only the bounded native code.
@@ -1007,13 +1256,13 @@ def translate_request(out_dir, key):
             kinds = {'vs': a, 'ps': b}
         else:
             kinds = {classify(a): a, classify(b): b}
-    except Unsupported as reason:
+    except (Unsupported, OSError, UnicodeError) as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
     if set(kinds) != {'vs', 'ps'}:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
-    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root)
+    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request)
 
 
 def main():
@@ -1040,13 +1289,13 @@ def main():
             if not a or not b or len(a) != q[6] or len(b) != q[10]:
                 print('pso %x: code not captured' % (w & 0xffffff))
                 continue
-            key = fnv(root, fnv(b, fnv(a)))
+            key = pipeline_key(a, b, root)
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
     # translate every request that has no result yet
     for name in sorted(os.listdir(out_dir)):
-        m = re.fullmatch(r'req_([0-9a-f]{16})\.a', name)
+        m = re.fullmatch(r'req_([0-9a-f]{16})\.(?:a|rtv)', name)
         if not m:
             continue
         key = int(m.group(1), 16)

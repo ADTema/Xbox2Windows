@@ -110,6 +110,12 @@ def decode_v_reg64(reg_id: int) -> str:
     return decode_s_reg64(reg_id)
 
 
+def decode_v_reg128(reg_id: int) -> str:
+    """Decode a 128-bit VOP operand that only a VGPR quad can hold (a scalar source is refused by the caller)."""
+    vreg = reg_id - 256
+    return f"v[{vreg}:{vreg + 3}]" if vreg <= 252 else "<invalid VGPR quad>"
+
+
 def _format_operand_modifiers(val: str, is_abs: int, is_neg: int) -> str:
     """Wrap a disassembled operand with inline abs (`|...|`) and neg (`-`) modifiers."""
     if is_abs and is_neg:
@@ -932,6 +938,7 @@ VOP3_NATIVE_OPS = {
     0x172: ("v_qsad_pk_u16_u8", "V_QSAD_PK_U16_U8 (VOP3A)", 3, False, 2, (2, 1, 2)),
     0x173: ("v_mqsad_pk_u16_u8", "V_MQSAD_PK_U16_U8 (VOP3A)", 3, False, 2, (2, 1, 2)),
     0x174: ("v_trig_preop_f64", "V_TRIG_PREOP_F64 (VOP3A)", 2, False, 2, (2, 1)),
+    0x175: ("v_mqsad_u32_u8", "V_MQSAD_U32_U8 (VOP3A)", 3, False, 4, (2, 1, 4)),
     0x176: ("v_mad_u64_u32", "V_MAD_U64_U32 (VOP3B)", 3, True, 2, (1, 1, 2)),
     0x177: ("v_mad_i64_i32", "V_MAD_I64_I32 (VOP3B)", 3, True, 2, (1, 1, 2)),
     0x178: ("v_xor3_b32", "V_XOR3_B32 (VOP3A)", 3, False, 1, (1, 1, 1)),
@@ -1003,11 +1010,19 @@ VOP3_RESTRICTED_MODIFIERS = {
     "v_mul_lo_i32": (False, False),
     "v_qsad_pk_u16_u8": (True, False),
     "v_mqsad_pk_u16_u8": (True, False),
+    "v_mqsad_u32_u8": (True, False),
     "v_interp_mov_f32_e64": (True, True),
 }
 
 # The v_interp_mov_f32_e64 parameter selector (src1 field): p10, p20 and p0.
 VINTRP_MOV_PARAMS = ("p10", "p20", "p0")
+
+
+def _format_vop3_vgpr_dst(vdst: int, width: int) -> str:
+    """Format a VOP3 VGPR destination of 1, 2 or 4 registers; a group running past v255 is flagged, not printed."""
+    if vdst + width > 256:
+        return {2: "<invalid VGPR pair>", 4: "<invalid VGPR quad>"}[width]
+    return _format_vgpr_range(vdst, width)
 
 
 def _vop3_output_modifiers(clamp: int, omod: int) -> str:
@@ -1024,6 +1039,9 @@ def _vop3_restricted_encoding_is_valid(op_name: str, arity: int, w0: int, w1: in
     if ((w0 >> 15) & 1 and not allow_clamp) or ((w1 >> 27) & 0x3 and not allow_omod):
         return False
     if arity < 3 and (w1 >> 18) & 0x1ff:
+        return False
+    if op_name == "v_mqsad_u32_u8" and not 256 <= (w1 >> 18) & 0x1ff <= 511:
+        # The accumulator is a VGPR quad: llvm-mc rejects an SGPR, constant or special-register src2.
         return False
     if op_name == "v_interp_mov_f32_e64":
         # src0 holds attr[5:0] and channel[7:6] only; src1 selects p10, p20 or p0.
@@ -2184,6 +2202,84 @@ def _decode_interp_f16(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
     return (8, name, asm, comment)
 
 
+# VOP3 32-bit interpolation (issue #938). gfx10/gfx1013 encodes v_interp_p1_f32_e64,
+# v_interp_p2_f32_e64 and v_interp_mov_f32_e64 at 0x200, 0x201 and 0x202
+# (LLVM 15 llvm/lib/Target/AMDGPU/VOP3Instructions.td:1045-1047), not at the gfx8/gfx9 opcodes
+# 0x270-0x272 that the VI branch below still handles. The VOP3_INTERP / VOP3_INTERP_MOV operand
+# profiles (VOP3Instructions.td:55-105) print
+# "$vdst, $src0_modifiers, $attr$attrchan$clamp$omod" (the mov form prints its InterpSlot
+# instead of a register), and VOP3Interp_gfx10 (llvm/lib/Target/AMDGPU/VOPInstructions.td:296-312)
+# places attr in SRC0[5:0], attrchan in SRC0[7:6], the data VGPR in SRC1, and fixes SRC0[8] (the
+# f16-only high bit), the SRC2 field and every abs/neg bit except index 1 to zero. The vectors
+# this layout was derived from are VOP3_INTERP_F32_E64_VECTORS in tests/rdna2_tools_check.py.
+INTERP_F32_E64_OPS = {
+    0x200: ("v_interp_p1_f32_e64", "Interpolate f32 attribute, P1 stage (VOP3A)"),
+    0x201: ("v_interp_p2_f32_e64", "Interpolate f32 attribute, P2 stage (VOP3A)"),
+}
+
+
+def _decode_interp_f32_e64(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
+    """Decode the gfx10/gfx1013 VOP3 spelling of v_interp_p1_f32 or v_interp_p2_f32.
+
+    SRC0 is the attribute operand, so the data source keeps the abs/neg bits of index 1 (w0[9]
+    and w1[30]); the modifier bits of index 0 (the attribute) and index 2 (the operand this
+    profile does not have), the f16-only high bit and the SRC2 field are fixed zero and are
+    reported as an unsupported encoding when set, because LLVM's TableGen decoder only matches
+    the zeroes. The data source in SRC1 is a VGPR_32 (VOPInterp_gfx10 fixes it to a VGPR, unlike
+    the VRegSrc_32 of _decode_interp_f16), so only source codes 256..511 are legal there.
+    """
+    name, comment = INTERP_F32_E64_OPS[op]
+    attr, attrchan = w1 & 0x3f, (w1 >> 6) & 0x3
+    source_code = (w1 >> 9) & 0x1ff
+    abs_bits, neg_bits = (w0 >> 8) & 0x7, (w1 >> 29) & 0x7
+    # SRC1 is a VGPR_32 field, so codes 0..255 -- SGPRs, inline constants, literals, and every code
+    # in INTERP_F16_REFUSED_SOURCES -- are not a legal data operand. LLVM's gfx1013 disassembler
+    # marks them as an invalid register instead of printing an operand, so refuse them.
+    if abs_bits & 0x5 or neg_bits & 0x5 or w1 & 0x100 or (w1 >> 18) & 0x1ff \
+            or not 256 <= source_code <= 511:
+        return (8, f"{name}_unsupported", f"{name} <unsupported VOP3 encoding>",
+                f"LLVM 15 refuses this {name} encoding for gfx1013")
+
+    is_abs, is_neg = (abs_bits >> 1) & 1, (neg_bits >> 1) & 1
+    source = _format_operand_modifiers(decode_v_reg(source_code), is_abs, is_neg)
+    asm = f"{name} v{w0 & 0xff}, {source}, attr{attr}.{'xyzw'[attrchan]}"
+    asm += _vop3_output_modifiers((w0 >> 15) & 1, (w1 >> 27) & 0x3)
+    return (8, name, asm, comment)
+
+
+# VOP3 lane permutes (issue #1298). LLVM 15 defines v_permlane16_b32 and v_permlanex16_b32 for gfx10 at
+# VOP3 0x377 and 0x378 with the operand profile `vdst, src0, src1, src2 op_sel:[fi,bound_ctrl]`: src0 is a
+# VGPR, src1 and src2 are scalar lane selects, and op_sel[0] (w0[11]) and op_sel[1] (w0[12]) carry the
+# fetch-inactive and bound_ctrl flags. Only the forms the LLVM 15 assembler accepts are decoded. Its
+# disassembler also prints words this decoder refuses (an SGPR or immediate src0, a VGPR, literal or other
+# refused lane select) and silently drops abs, neg and op_sel[2:3]; those words keep their record length and are
+# reported as unsupported encodings until their meaning is established.
+PERMLANE_OPS = {
+    0x377: ("v_permlane16_b32", "Permute lanes within each row of 16 (VOP3A)"),
+    0x378: ("v_permlanex16_b32", "Permute lanes across the two rows of 16 (VOP3A)"),
+}
+# Lane-select source codes the LLVM 15 gfx1013 assembler does not accept (measured by assembling the
+# disassembler's spelling of every code 0..255): the reserved codes, the SDWA/DPP markers, LDS direct and
+# the literal.
+PERMLANE_REFUSED_SELECTS = frozenset([*range(209, 235), 249, 250, 254, 255])
+
+
+def _decode_permlane(op: int, w0: int, w1: int, length: int) -> tuple[int, str, str, str]:
+    """Decode v_permlane16_b32 / v_permlanex16_b32; length is 12 when a source names the literal."""
+    name, comment = PERMLANE_OPS[op]
+    src0, src1, src2 = w1 & 0x1ff, (w1 >> 9) & 0x1ff, (w1 >> 18) & 0x1ff
+    # abs (w0[10:8]), op_sel[2:3] (w0[14:13]), clamp (w0[15]), omod (w1[28:27]) and neg (w1[31:29]).
+    if (w0 & 0xe700 or w1 & 0xf8000000 or not 256 <= src0 <= 511
+            or src1 > 255 or src2 > 255 or src1 in PERMLANE_REFUSED_SELECTS or src2 in PERMLANE_REFUSED_SELECTS):
+        return (length, f"{name}_unsupported", f"{name} <unsupported VOP3A encoding>",
+                f"{name} word outside the forms the gfx1013 LLVM 15 assembler accepts")
+    asm = f"{name} v{w0 & 0xff}, {decode_v_reg(src0)}, {decode_s_reg(src1)}, {decode_s_reg(src2)}"
+    fi, bound_ctrl = (w0 >> 11) & 1, (w0 >> 12) & 1
+    if fi or bound_ctrl:
+        asm += f" op_sel:[{fi},{bound_ctrl}]"
+    return (8, name, asm, comment)
+
+
 def _packed_addr_regs(count: int) -> int:
     """Registers LLVM 15 prints for a packed (non-NSA) MIMG address of count dwords.
 
@@ -2641,12 +2737,20 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("slc")
         if r128:
             mods.append("r128")
-        if (w0 >> 14) & 1:
-            mods.append("lwe")
         if (w0 >> 7) & 1:
             mods.append("dlc")
+        if (w0 >> 16) & 1:
+            mods.append("tfe")
+        if (w0 >> 17) & 1:
+            mods.append("lwe")
+        if (w1 >> 30) & 1:
+            mods.append("a16")
         if d16:
             mods.append("d16")
+        # Word 0 bits 6 and 14 and word 1 bits 29:26 are reserved on gfx10: LLVM assembles none of them and
+        # ignores them when disassembling, so a set bit is surfaced instead of vanishing from the listing.
+        if (w0 & 0x4040) or (w1 >> 26) & 0xf:
+            mods.append("reserved")
         asm = f"{op_name} {', '.join(operands)} {' '.join(mods)}"
         comment = "Image memory load/store/sample operation"
         return (length, op_name, asm, comment)
@@ -2814,6 +2918,14 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if op in INTERP_F16_OPS:
             return _decode_interp_f16(op, w0, w1)
 
+        if op in PERMLANE_OPS:
+            if 255 in (src0, src1, src2):
+                # Keep the twelve-byte record of a literal operand, as the generic VOP3 path does.
+                if offset + 12 > len(data):
+                    return (8, "vop3_truncated", f"{PERMLANE_OPS[op][0]} <truncated>", "Incomplete VOP3 literal")
+                return _decode_permlane(op, w0, w1, 12)
+            return _decode_permlane(op, w0, w1, 8)
+
         is_vopc = False
         is_vop3b = False
         if op < 0x100:
@@ -2874,7 +2986,20 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 else:
                     dst_width = 1
                     src_widths = (1,)
+        elif 0x200 <= op < 0x203:
+            # gfx10/gfx1013 VOP3 interpolation (see INTERP_F32_E64_OPS). The p1/p2 forms are
+            # decoded here; the mov form keeps its table-driven, restricted-modifier decode
+            # below, whose second operand is an InterpSlot (p10/p20/p0), not a register.
+            if op == 0x202:
+                op_name, comment, arity, is_vop3b, dst_width, src_widths = VOP3_NATIVE_OPS[op]
+            else:
+                return _decode_interp_f32_e64(op, w0, w1)
         elif 0x270 <= op < 0x274:
+            # gfx8/gfx9 (VI) range, not gfx1013: LLVM 15 defines these three as
+            # VOP3Interp_Real_vi at 0x270-0x272 under AssemblerPredicate = isGFX8GFX9
+            # (VOP3Instructions.td:1365-1367). No gfx10 instruction uses them (gfx1013 puts the
+            # same three forms at 0x200-0x202 above), so the branch is kept only so gfx8/gfx9
+            # words still render the way LLVM's VI tests show.
             vintrp_names = {0: "v_interp_p1_f32_e64", 1: "v_interp_p2_f32_e64", 2: "v_interp_mov_f32_e64"}
             vop_int = op - 0x270
             op_name = vintrp_names.get(vop_int, f"v_interp_{vop_int}_e64")
@@ -2944,6 +3069,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 val = f"0x{literal:x}"
             elif width == 2:
                 val = decode_v_reg64(reg_id)
+            elif width == 4:
+                val = decode_v_reg128(reg_id)
             else:
                 val = decode_v_reg(reg_id)
             return _format_operand_modifiers(val, is_abs, is_neg)
@@ -2956,10 +3083,10 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             asm = f"{op_name} {dst_str}, {', '.join(src_strs)}"
         elif is_vop3b:
             sdst_str = decode_s_reg(sdst)
-            dst_str = f"v[{vdst}:{vdst + 1}]" if dst_width == 2 and vdst < 255 else (f"<invalid VGPR pair>" if dst_width == 2 else f"v{vdst}")
+            dst_str = _format_vop3_vgpr_dst(vdst, dst_width)
             asm = f"{op_name} {dst_str}, {sdst_str}, {', '.join(src_strs)}"
         else:
-            dst_str = f"v[{vdst}:{vdst + 1}]" if dst_width == 2 and vdst < 255 else (f"<invalid VGPR pair>" if dst_width == 2 else f"v{vdst}")
+            dst_str = _format_vop3_vgpr_dst(vdst, dst_width)
             asm = f"{op_name} {dst_str}, {', '.join(src_strs)}"
 
         if any(op_sel):

@@ -18,12 +18,29 @@ from cpu_xsave_aot import lift_code, translate
 GUARD_PRE = bytes(0xA0 + (i % 16) for i in range(64))
 GUARD_POST = bytes(0xC0 + (i % 16) for i in range(64))
 BUF_LEN = 960
+DEFAULT_MXCSR = 0x1F80
 FILL = b"\x5A" * BUF_LEN
 
 CANONICAL_EXPORTS = (
     "op_xsave_only",
     "op_xsave64_only",
 )
+
+XSAVEC_EXPORTS = (
+    "op_xrstor64_xsavec",
+    "op_xrstor64_xsavec64",
+    "op_xrstor64_xsavec64_sse",
+    "op_xrstor64_xsavec64_x87_avx",
+)
+DYNMASK_EXPORT = "op_xsavec64_dynmask"
+XSAVEOPT_EXPORTS = (
+    "op_xrstor64_xsaveopt",
+    "op_xrstor64_xsaveopt64",
+    "op_xrstor64_xsaveopt64_sse",
+    "op_xrstor64_xsaveopt64_x87_avx",
+    "op_xrstor64_xsaveopt64_avx",
+)
+XSAVEOPT_DYNMASK_EXPORT = "op_xsaveopt64_dynmask"
 
 DEFINED_EXPORTS = (
     "op_xrstor_xsave",
@@ -34,7 +51,7 @@ DEFINED_EXPORTS = (
     "op_xrstor64_mask_sse",
     "op_vzeroupper_xsave64",
     "op_pipeline",
-)
+) + XSAVEC_EXPORTS + XSAVEOPT_EXPORTS
 
 EXPORTS = CANONICAL_EXPORTS + DEFINED_EXPORTS
 
@@ -43,6 +60,10 @@ ALTERED_DEFINED_EXPORTS = (
     "op_xrstor_xsave64",
     "op_xrstor64_disp",
     "op_pipeline",
+    "op_xrstor64_xsavec64",
+    "op_xrstor64_xsavec64_sse",
+    "op_xrstor64_xsaveopt64",
+    "op_xrstor64_xsaveopt64_sse",
 )
 
 ALTERED_CANONICAL_EXPORTS = ("op_xrstor64_mask_sse",)
@@ -59,6 +80,15 @@ EXPORT_MODES = {
     "op_xrstor64_mask_sse": (True, True, 2, 0),
     "op_vzeroupper_xsave64": (True, True, 7, 0),
     "op_pipeline": (True, True, 7, 0),
+    "op_xrstor64_xsavec": (True, False, 7, 0),
+    "op_xrstor64_xsavec64": (True, True, 7, 0),
+    "op_xrstor64_xsavec64_sse": (True, True, 2, 0),
+    "op_xrstor64_xsavec64_x87_avx": (True, True, 5, 0),
+    "op_xrstor64_xsaveopt": (True, False, 7, 0),
+    "op_xrstor64_xsaveopt64": (True, True, 7, 0),
+    "op_xrstor64_xsaveopt64_sse": (True, True, 2, 0),
+    "op_xrstor64_xsaveopt64_x87_avx": (True, True, 5, 0),
+    "op_xrstor64_xsaveopt64_avx": (True, True, 4, 0),
 }
 
 
@@ -385,6 +415,33 @@ class XStateModel:
             for i in range(16):
                 dst[offset + 576 + i * 16 : offset + 576 + i * 16 + 16] = self.ymm_hi[i]
 
+    def xsavec(self, dst: bytearray, offset: int, rfbm: int, is64: bool, track_mxcsr: bool = True) -> None:
+        """SDM vol.1 13.4.3 compacted format: only XINUSE & RFBM components are stored.
+
+        SDM vol.1 13.6: XINUSE[1] is also set while MXCSR differs from 0x1F80; track_mxcsr=False is the mutation
+        control that forgets this rule.
+        """
+        rfbm &= 7
+        sse_live = 2 if track_mxcsr and self.mxcsr != DEFAULT_MXCSR else 0
+        used = rfbm & (self.xinuse | sse_live)
+        self.xsave(dst, offset, used, is64)
+        struct.pack_into("<QQ", dst, offset + 512, used, (1 << 63) | rfbm)
+
+    def xsaveopt(self, dst: bytearray, offset: int, rfbm: int, is64: bool, track_mxcsr: bool = True) -> None:
+        """SDM vol.2 XSAVEOPT, init optimization only: components not in use are left untouched in memory.
+
+        XSTATE_BV = (old & ~RFBM) | (XINUSE & RFBM); MXCSR and MXCSR_MASK are stored when RFBM selects SSE or AVX.
+        track_mxcsr=False is the mutation control that forgets that a non-default MXCSR keeps SSE in use.
+        """
+        rfbm &= 7
+        sse_live = 2 if track_mxcsr and self.mxcsr != DEFAULT_MXCSR else 0
+        in_use = self.xinuse | sse_live
+        self.xsave(dst, offset, rfbm & in_use, is64)
+        if rfbm & 6:
+            struct.pack_into("<II", dst, offset + 24, self.mxcsr, self.mxcsr_mask)
+        old_bv = struct.unpack_from("<Q", dst, offset + 512)[0]
+        struct.pack_into("<Q", dst, offset + 512, (old_bv & ~rfbm) | (in_use & rfbm))
+
     def vzeroupper(self) -> None:
         self.ymm_hi = [bytearray(16) for _ in range(16)]
         self.xinuse &= ~4
@@ -442,6 +499,20 @@ def reference(
         m.xrstor(a, rfbm=7, is64=True)
         m.vzeroupper()
         m.xsave(out, 0, rfbm=7, is64=True)
+    elif name in XSAVEC_EXPORTS:
+        m.xrstor(a, rfbm=7, is64=True)
+        rfbm = {"op_xrstor64_xsavec64_sse": 2, "op_xrstor64_xsavec64_x87_avx": 5}.get(name, 7)
+        if altered and name == "op_xrstor64_xsavec64":
+            m.xsave(out, 0, rfbm=7, is64=True)
+        else:
+            m.xsavec(out, 0, rfbm=7 if altered else rfbm, is64=name != "op_xrstor64_xsavec")
+    elif name in XSAVEOPT_EXPORTS:
+        m.xrstor(a, rfbm=7, is64=True)
+        rfbm = {"op_xrstor64_xsaveopt64_sse": 2, "op_xrstor64_xsaveopt64_x87_avx": 5, "op_xrstor64_xsaveopt64_avx": 4}.get(name, 7)
+        if altered and name == "op_xrstor64_xsaveopt64":
+            m.xsave(out, 0, rfbm=7, is64=True)
+        else:
+            m.xsaveopt(out, 0, rfbm=7 if altered else rfbm, is64=name != "op_xrstor64_xsaveopt")
     elif name == "op_pipeline":
         m.xrstor(a, rfbm=7, is64=True)
         mm0 = struct.unpack_from("<Q", b, 8 if altered else 0)[0]
@@ -522,6 +593,10 @@ def xsave_pairs(mxcsr_mask: int):
         (4, 0x037F, 0x0000, 0x00, 0x0000, 0x0000000000000000, 0, 0x0000000000000000, 0, 0x1F80, 14),
         (6, 0x037F, 0x0000, 0x00, 0x0000, 0x0000000000000000, 0, 0x0000000000000000, 0, 0x9FC0, 15),
         (7, 0xFFFF, 0x7F7F, 0x55, 0x1234, 0xFFFF800011223344, 0, 0x00007FFF55667788, 0, 0x5F80, 16),
+        # XSTATE_BV[1] clear with a non-default MXCSR: SSE is still in use (SDM vol.1 13.6), so xsavec must save it.
+        (0, 0x037F, 0x0000, 0x00, 0x0000, 0x0000000000000000, 0, 0x0000000000000000, 0, 0x3F80, 17),
+        (4, 0x037F, 0x0000, 0x00, 0x0000, 0x0000000000000000, 0, 0x0000000000000000, 0, 0x3F80, 18),
+        (1, 0x027F, 0x0000, 0xAA, 0x0357, 0x00007FFF12345678, 0, 0x00007FFF87654321, 0, 0x7FC0, 19),
     ]
     pairs = []
     for xbv, fcw, fsw, ftw, fop, fip, fcs, fdp, fds, mxcsr, seed in specs:
@@ -619,12 +694,79 @@ def _xsave_header_flex(name: str) -> tuple[int, int] | None:
     return None
 
 
+XSAVEOPT_COMPONENTS = (
+    (1, ((0, 24), (32, 160))),
+    (2, ((160, 416),)),
+    (4, ((576, 832),)),
+)
+INIT_X87_HEADER = struct.pack("<HHBBH", 0x037F, 0, 0, 0, 0) + bytes(16)
+
+
+def native_xsaveopt_matches(got: bytes, want: bytes, rfbm: int) -> bool:
+    """Native xsaveopt comparison: components in use stay compared byte for byte.
+
+    A component the reference leaves out may be stored by the host only in its initial configuration, with its
+    XSTATE_BV bit set. SSE that is in use only through a non-default MXCSR holds zero XMM state, which a host
+    without that rule may leave unwritten.
+    """
+    got_bv = struct.unpack_from("<Q", got, 512)[0]
+    want_bv = struct.unpack_from("<Q", want, 512)[0]
+    used = want_bv & rfbm
+    loose = bytearray(want)
+    for bit, spans in XSAVEOPT_COMPONENTS:
+        if not rfbm & bit:
+            continue
+        stored = bool(got_bv & bit)
+        if bit & used:
+            mxcsr_only = (
+                bit == 2
+                and want[160:416] == bytes(256)
+                and struct.unpack_from("<I", want, 24)[0] != DEFAULT_MXCSR
+            )
+            relaxed = mxcsr_only and not stored and all(got[lo:hi] == FILL[lo:hi] for lo, hi in spans)
+        else:
+            init = {(0, 24): INIT_X87_HEADER}
+            relaxed = stored and all(got[lo:hi] == init.get((lo, hi), bytes(hi - lo)) for lo, hi in spans)
+        if relaxed:
+            for lo, hi in spans:
+                loose[lo:hi] = got[lo:hi]
+            loose[512:520] = struct.pack("<Q", (struct.unpack_from("<Q", loose, 512)[0] & ~bit) | (got_bv & bit))
+    return got == bytes(loose)
+
+
 def assert_equal_output(label: str, name: str, idx, got: bytes, want: bytes) -> None:
     if got == want:
         return
     # Per Intel SDM Vol. 1 Ch. 13.5.1, XSAVE may report XSTATE_BV[1:0] = 1 for initialized
     # legacy x87/SSE components when RFBM selects them (e.g. hybrid E-cores vs P-cores).
-    if label == "native":
+    if label == "native" and name in XSAVEC_EXPORTS:
+        # The CPU may also store initialized x87/SSE slots, and MXCSR is only specified with the SSE slot.
+        got_bv = struct.unpack_from("<Q", got, 512)[0]
+        want_bv = struct.unpack_from("<Q", want, 512)[0]
+        loose = bytearray(want)
+        # Only components the reference leaves initialized may carry extra host bytes; active x87/SSE payloads
+        # (control words, ST and XMM registers) stay compared. x87 pointer fields are adapted by expected_native_output.
+        for bit, spans in ((1, ((0, 24), (32, 160))), (2, ((160, 416),))):
+            if got_bv & bit and not want_bv & bit:
+                for lo, hi in spans:
+                    loose[lo:hi] = got[lo:hi]
+        if not want_bv & 2:
+            loose[24:32] = got[24:32]
+        loose[512:520] = got[512:520]
+        # A host-reported SSE component the reference leaves out must sit at its reset value: a non-default MXCSR
+        # means the reference lost live state (SDM vol.1 13.6), so it is never tolerated.
+        sse_extra_is_reset = not (got_bv & 2 and not want_bv & 2) or struct.unpack_from("<I", got, 24)[0] == DEFAULT_MXCSR
+        if (
+            sse_extra_is_reset
+            and want_bv & ~got_bv == 0
+            and got_bv & ~want_bv & ~3 == 0
+            and got == bytes(loose)
+        ):
+            return
+    elif label == "native" and name in XSAVEOPT_EXPORTS:
+        if native_xsaveopt_matches(got, want, EXPORT_MODES[name][2]):
+            return
+    elif label == "native":
         flex_spec = _xsave_header_flex(name)
         if flex_spec is not None:
             hdr_off, rfbm = flex_spec
@@ -640,6 +782,15 @@ def assert_equal_output(label: str, name: str, idx, got: bytes, want: bytes) -> 
         f"{label} {name} case {idx}: first mismatch at byte {diff}: "
         f"got {got[diff : diff + 16].hex()} != want {want[diff : diff + 16].hex()}"
     )
+
+
+def native_exports_for_host(native: dict, has_xsavec: bool, has_xsaveopt: bool = True) -> dict:
+    """Drop native xsavec/xsaveopt fixtures on hosts without them: executing them would raise #UD."""
+    return {
+        name: fn
+        for name, fn in native.items()
+        if (has_xsavec or name not in XSAVEC_EXPORTS) and (has_xsaveopt or name not in XSAVEOPT_EXPORTS)
+    }
 
 
 def bind_exports(dll_path: Path, prefix: str = "", names=EXPORTS):
@@ -675,6 +826,25 @@ def check_fault_controls(
                     assert "access violation reading 0xffffffffffffffff" in str(exc).lower(), (name, label, off, exc)
                 else:
                     raise AssertionError(f"{label} {name} accepted +{off} misaligned output")
+                assert check_guards_and_read(buf_out, pre, p_off, post, label) == FILL
+                _ = buf_a
+                misalign_checks += 1
+
+        for name in XSAVEC_EXPORTS + XSAVEOPT_EXPORTS:
+            for label, is_native, fn in (("native", True, native_fns.get(name)), ("lifted", False, lifted_fns[name])):
+                if fn is None:
+                    continue  # host without XSAVEC/XSAVEOPT: native fixture is not executed
+                buf_a, ptr_a, _, _, _ = alloc_aligned_buffer(valid_a)
+                buf_out, ptr_out, pre, p_off, post = alloc_aligned_buffer(FILL, offset=off)
+                try:
+                    if is_native:
+                        harness.call_native(fn, ptr_a, ptr_a, ptr_out)
+                    else:
+                        fn(ptr_a, ptr_a, ptr_out)
+                except OSError as exc:
+                    assert "access violation reading 0xffffffffffffffff" in str(exc).lower(), (name, label, off, exc)
+                else:
+                    raise AssertionError(f"{label} {name} accepted +{off} misaligned xsavec/xsaveopt output")
                 assert check_guards_and_read(buf_out, pre, p_off, post, label) == FILL
                 _ = buf_a
                 misalign_checks += 1
@@ -730,6 +900,34 @@ def check_fault_controls(
                 header_mxcsr_checks += 1
 
     return misalign_checks, header_mxcsr_checks
+
+
+def check_xsavec_dynamic_mask(
+    fn, mxcsr_mask: int, deprecates_cs_ds: bool, export: str = DYNMASK_EXPORT, save: str = "xsavec"
+) -> int:
+    """Request masks arrive through RAX/RDX: valid ones match the model, unsupported bits fault with no store."""
+    a = xsave_pairs(mxcsr_mask)[6][0]
+    for mask in (1, 2, 3, 4, 6):
+        want = bytearray(FILL)
+        model = XStateModel(mxcsr_mask, deprecates_cs_ds)
+        model.xrstor(a, rfbm=7, is64=True)
+        getattr(model, save)(want, 0, rfbm=mask, is64=True)
+        got = invoke_lifted(fn, a, struct.pack("<QQ", mask, 0).ljust(BUF_LEN, b"\x00"))
+        assert_equal_output("lifted", export, mask, got, bytes(want))
+    bad_masks = ((8, 0), (0x80, 0), (0xFFFFFFF8, 0), (7, 1), (0, 1 << 31))
+    for lo, hi in bad_masks:
+        buf_a, ptr_a, _, _, _ = alloc_aligned_buffer(a)
+        buf_b, ptr_b, _, _, _ = alloc_aligned_buffer(struct.pack("<QQ", lo, hi).ljust(BUF_LEN, b"\x00"))
+        buf_out, ptr_out, pre, p_off, post = alloc_aligned_buffer(FILL)
+        try:
+            fn(ptr_a, ptr_b, ptr_out)
+        except OSError as exc:
+            assert "access violation reading 0xffffffffffffffff" in str(exc).lower(), (lo, hi, exc)
+        else:
+            raise AssertionError(f"lifted {save} accepted unsupported request mask {hi:#x}:{lo:#x}")
+        assert check_guards_and_read(buf_out, pre, p_off, post, "dynmask") == FILL
+        _ = (buf_a, buf_b)
+    return len(bad_masks)
 
 
 def check_discarded_read(
@@ -920,6 +1118,202 @@ def check_entry_state_contracts(
     _ = part_buf
 
 
+def sdm_xsavec_header(image: bytes, rfbm: int, mxcsr_mask: int) -> tuple[int, bytes]:
+    """XSTATE_BV and the MXCSR words xsavec must write after xrstor of image, straight from SDM vol.1 13.6.
+
+    Written without XStateModel so it is an independent oracle: x87 and AVX are in use when their restore bit is
+    set, and SSE is in use when its restore bit is set or MXCSR is not the reset value 0x1F80.
+    """
+    restore_bv = struct.unpack_from("<Q", image, 512)[0]
+    mxcsr = struct.unpack_from("<I", image, 24)[0]
+    in_use = restore_bv & 5
+    if restore_bv & 2 or mxcsr != DEFAULT_MXCSR:
+        in_use |= 2
+    used = in_use & rfbm
+    words = struct.pack("<II", mxcsr, mxcsr_mask) if used & 2 else FILL[24:32]
+    return used, words
+
+
+def check_xsavec_mxcsr_liveness(harness, native: dict, lifted: dict, mxcsr_mask: int, deprecates_cs_ds: bool) -> int:
+    """Non-default MXCSR keeps SSE in use for xsavec even when the restore image has XSTATE_BV[1] clear."""
+    checks = 0
+    for name, rfbm in (("op_xrstor64_xsavec64", 7), ("op_xrstor64_xsavec64_sse", 2)):
+        for idx, (a, b) in enumerate(xsave_pairs(mxcsr_mask)):
+            used, words = sdm_xsavec_header(a, rfbm, mxcsr_mask)
+            got = invoke_lifted(lifted[name], a, b)
+            assert struct.unpack_from("<Q", got, 512)[0] == used, f"lifted {name} case {idx}: XSTATE_BV word"
+            assert got[24:32] == words, f"lifted {name} case {idx}: MXCSR word"
+            if name in native:
+                got_n = invoke_native(harness, native[name], a, b)
+                got_bv = struct.unpack_from("<Q", got_n, 512)[0]
+                assert got_bv & used == used, f"native {name} case {idx}: XSTATE_BV {got_bv:#x} lacks {used:#x}"
+                if used & 2:
+                    assert got_n[24:32] == words, f"native {name} case {idx}: MXCSR word"
+            checks += 1
+
+    # Mutation control: a reference that ignores MXCSR must fail at the MXCSR word (byte 24, the first lost state)
+    # and also differ in the XSTATE_BV word (byte 512), for lifted and native.
+    a, b = xsave_pairs(mxcsr_mask)[7]
+    name = "op_xrstor64_xsavec64"
+    assert sdm_xsavec_header(a, 7, mxcsr_mask)[0] == 2, "control needs XSTATE_BV[1] clear in the image and MXCSR non-default"
+    right = reference(name, a, b, mxcsr_mask, deprecates_cs_ds)
+    model = XStateModel(mxcsr_mask, deprecates_cs_ds)
+    model.xrstor(a, rfbm=7, is64=True)
+    blind = bytearray(FILL)
+    model.xsavec(blind, 0, rfbm=7, is64=True, track_mxcsr=False)
+    assert right[512:520] != bytes(blind)[512:520], "MXCSR-blind reference must also lose XSTATE_BV[1]"
+    for label in ("lifted", "native"):
+        try:
+            assert_equal_output(label, name, 7, right, bytes(blind))
+        except AssertionError as err:
+            if "first mismatch at byte 24:" not in str(err):
+                raise AssertionError(f"MXCSR-blind reference failed at the wrong word: {err}") from err
+        else:
+            raise AssertionError(f"{label} comparison accepted a reference that ignores non-default MXCSR")
+    return checks + 2
+
+
+def sdm_xsaveopt_layout(image: bytes, rfbm: int, mxcsr_mask: int) -> tuple[int, list[tuple[int, int]], bytes]:
+    """XSTATE_BV, the spans xsaveopt may write and the MXCSR words after xrstor of image, straight from the SDM.
+
+    Written without XStateModel so it is an independent oracle: x87 and AVX are in use when their restore bit is set,
+    SSE is in use when its restore bit is set or MXCSR is not the reset value, and a component that is not in use
+    is not written. MXCSR and MXCSR_MASK are stored whenever RFBM selects SSE or AVX.
+    """
+    restore_bv = struct.unpack_from("<Q", image, 512)[0]
+    mxcsr = struct.unpack_from("<I", image, 24)[0]
+    in_use = restore_bv & 5
+    if restore_bv & 2 or mxcsr != DEFAULT_MXCSR:
+        in_use |= 2
+    used = in_use & rfbm
+    spans = [(512, 520)]
+    for bit, parts in XSAVEOPT_COMPONENTS:
+        if used & bit:
+            spans.extend(parts)
+    words = struct.pack("<II", mxcsr, mxcsr_mask) if rfbm & 6 else FILL[24:32]
+    if rfbm & 6:
+        spans.append((24, 32))
+    old_bv = struct.unpack_from("<Q", FILL, 512)[0]
+    return (old_bv & ~rfbm) | used, spans, words
+
+
+def check_xsaveopt_layout(harness, native: dict, lifted: dict, mxcsr_mask: int) -> int:
+    """Readback of every byte xsaveopt may touch: the lifted store writes exactly the SDM layout, nothing else."""
+    checks = 0
+    for name in XSAVEOPT_EXPORTS:
+        rfbm = EXPORT_MODES[name][2]
+        for idx, (a, b) in enumerate(xsave_pairs(mxcsr_mask)):
+            bv, spans, words = sdm_xsaveopt_layout(a, rfbm, mxcsr_mask)
+            got = invoke_lifted(lifted[name], a, b)
+            assert struct.unpack_from("<Q", got, 512)[0] == bv, f"lifted {name} case {idx}: XSTATE_BV word"
+            assert got[24:32] == words, f"lifted {name} case {idx}: MXCSR word"
+            for pos in range(BUF_LEN):
+                if not any(lo <= pos < hi for lo, hi in spans):
+                    assert got[pos] == FILL[pos], f"lifted {name} case {idx}: byte {pos} written outside the layout"
+            if name in native:
+                got_n = invoke_native(harness, native[name], a, b)
+                host_bv = struct.unpack_from("<Q", got_n, 512)[0]
+                mxcsr_only = not struct.unpack_from("<Q", a, 512)[0] & 2
+                required = bv & rfbm & ~(2 if mxcsr_only else 0)
+                assert host_bv & required == required, f"native {name} case {idx}: XSTATE_BV {host_bv:#x}"
+                if rfbm & 6:
+                    assert got_n[24:32] == words, f"native {name} case {idx}: MXCSR word"
+            checks += 1
+    return checks
+
+
+def check_xsaveopt_controls(mxcsr_mask: int, deprecates_cs_ds: bool) -> int:
+    """Mutation controls: each wrong lowering or comparator shortcut must fail at a precise word."""
+    name = "op_xrstor64_xsaveopt64"
+    all_a, all_b = xsave_pairs(mxcsr_mask)[6]
+    only_avx_a, only_avx_b = xsave_pairs(mxcsr_mask)[4]
+    live_a, live_b = xsave_pairs(mxcsr_mask)[7]
+    right = reference(name, all_a, all_b, mxcsr_mask, deprecates_cs_ds)
+    right_avx = reference(name, only_avx_a, only_avx_b, mxcsr_mask, deprecates_cs_ds)
+    right_live = reference(name, live_a, live_b, mxcsr_mask, deprecates_cs_ds)
+    controls = 0
+
+    def must_fail(label, got, want, expect_byte=None):
+        nonlocal controls
+        for side in ("lifted", "native"):
+            try:
+                assert_equal_output(side, name, label, got, want)
+            except AssertionError as err:
+                if expect_byte is not None and f"first mismatch at byte {expect_byte}:" not in str(err):
+                    raise AssertionError(f"{label} failed at the wrong word: {err}") from err
+            else:
+                raise AssertionError(f"{side} comparison accepted mutation {label}")
+            controls += 1
+
+    # Active x87, SSE and AVX payload and XSTATE_BV flips fail for lifted and native alike.
+    for pos in (0, 32, 160, 576, 512):
+        flipped = bytearray(right)
+        flipped[pos] ^= 0x01
+        must_fail(f"flip{pos}", bytes(flipped), right, pos)
+    # Standard xsave (every component stored) instead of xsaveopt: the unused components differ at the first one.
+    model = XStateModel(mxcsr_mask, deprecates_cs_ds)
+    model.xrstor(only_avx_a, rfbm=7, is64=True)
+    plain = bytearray(FILL)
+    model.xsave(plain, 0, rfbm=7, is64=True)
+    assert bytes(plain) != right_avx, "control needs components that are not in use"
+    must_fail("xsave_instead_of_xsaveopt", bytes(plain), right_avx)
+    # XSTATE_BV that keeps XINUSE bits outside RFBM: the sse-only request must not report x87 or AVX.
+    sse_name = "op_xrstor64_xsaveopt64_sse"
+    right_sse = reference(sse_name, all_a, all_b, mxcsr_mask, deprecates_cs_ds)
+    unmasked = bytearray(right_sse)
+    struct.pack_into("<Q", unmasked, 512, struct.unpack_from("<Q", right_sse, 512)[0] | 5)
+    for side in ("lifted", "native"):
+        try:
+            assert_equal_output(side, sse_name, "bv_without_rfbm", bytes(unmasked), right_sse)
+        except AssertionError as err:
+            assert "first mismatch at byte 512:" in str(err), err
+        else:
+            raise AssertionError(f"{side} comparison accepted XSTATE_BV that ignores RFBM")
+        controls += 1
+    # A reference that ignores non-default MXCSR loses the SSE slot: lifted must fail at the XMM bytes.
+    model = XStateModel(mxcsr_mask, deprecates_cs_ds)
+    model.xrstor(live_a, rfbm=7, is64=True)
+    blind = bytearray(FILL)
+    model.xsaveopt(blind, 0, rfbm=7, is64=True, track_mxcsr=False)
+    assert right_live[512:520] != bytes(blind)[512:520], "MXCSR-blind reference must also lose XSTATE_BV[1]"
+    try:
+        assert_equal_output("lifted", name, "mxcsr_blind", right_live, bytes(blind))
+    except AssertionError as err:
+        assert "first mismatch at byte 160:" in str(err), err
+    else:
+        raise AssertionError("lifted comparison accepted a reference that ignores non-default MXCSR")
+    controls += 1
+    # Native may store an initialized component the reference leaves out, but not live bytes in its place.
+    host_init = bytearray(right_avx)
+    struct.pack_into("<Q", host_init, 512, struct.unpack_from("<Q", right_avx, 512)[0] | 3)
+    host_init[0:24] = INIT_X87_HEADER
+    host_init[32:416] = bytes(384)
+    assert_equal_output("native", name, "host_init", bytes(host_init), right_avx)
+    host_live = bytearray(host_init)
+    host_live[32] = 0x7F
+    try:
+        assert_equal_output("native", name, "host_live", bytes(host_live), right_avx)
+    except AssertionError:
+        controls += 1
+    else:
+        raise AssertionError("native comparison accepted live bytes in a component the reference leaves out")
+    # A host that omits SSE held only by a non-default MXCSR (zero XMM) passes; one that omits live XMM does not.
+    host_omit = bytearray(right_live)
+    host_omit[160:416] = FILL[160:416]
+    struct.pack_into("<Q", host_omit, 512, struct.unpack_from("<Q", right_live, 512)[0] & ~2)
+    assert_equal_output("native", name, "host_omit_mxcsr_sse", bytes(host_omit), right_live)
+    omit_live = bytearray(right)
+    omit_live[160:416] = FILL[160:416]
+    struct.pack_into("<Q", omit_live, 512, struct.unpack_from("<Q", right, 512)[0] & ~2)
+    try:
+        assert_equal_output("native", name, "omit_live_xmm", bytes(omit_live), right)
+    except AssertionError:
+        controls += 1
+    else:
+        raise AssertionError("native comparison accepted a host that omitted live XMM state")
+    return controls + 1
+
+
 def check_differential(
     native_path: Path,
     lifted_path: Path,
@@ -928,12 +1322,23 @@ def check_differential(
     canonical_altered_path: Path,
     native_altered_path: Path,
 ) -> None:
-    lifted_lib, lifted = bind_exports(lifted_path, "lifted_", DEFINED_EXPORTS)
+    lifted_lib, lifted = bind_exports(lifted_path, "lifted_", DEFINED_EXPORTS + (DYNMASK_EXPORT, XSAVEOPT_DYNMASK_EXPORT))
     lifted_lib.host_has_xsave.argtypes = []
     lifted_lib.host_has_xsave.restype = ctypes.c_uint32
     if not lifted_lib.host_has_xsave():
         print("Host CPU lacks XSAVE/OSXSAVE/AVX (XCR0 & 7 == 7); skipping native differential check.")
         raise SystemExit(77)
+
+    lifted_lib.host_has_xsavec.argtypes = []
+    lifted_lib.host_has_xsavec.restype = ctypes.c_uint32
+    has_xsavec = bool(lifted_lib.host_has_xsavec())
+    lifted_lib.host_has_xsaveopt.argtypes = []
+    lifted_lib.host_has_xsaveopt.restype = ctypes.c_uint32
+    has_xsaveopt = bool(lifted_lib.host_has_xsaveopt())
+    if not has_xsaveopt:
+        print("Host CPU lacks XSAVEOPT (CPUID.(0xD,1):EAX[0]); native xsaveopt fixtures are skipped, lifted xsaveopt still checked.")
+    if not has_xsavec:
+        print("Host CPU lacks XSAVEC (CPUID.(0xD,1):EAX[1]); native xsavec fixtures are skipped, lifted xsavec still checked.")
 
     lifted_lib.host_xsave_area_size.argtypes = []
     lifted_lib.host_xsave_area_size.restype = ctypes.c_uint32
@@ -952,6 +1357,7 @@ def check_differential(
     mxcsr_mask = int(lifted_lib.host_mxcsr_mask())
 
     _, native = bind_exports(native_path)
+    native = native_exports_for_host(native, has_xsavec, has_xsaveopt)
     _, native_altered = bind_exports(native_altered_path, "", ALTERED_CANONICAL_EXPORTS)
     altered_lib, altered = bind_exports(altered_path, "lifted_", ALTERED_DEFINED_EXPORTS)
     canonical_lib, canonical = bind_exports(canonical_path, "lifted_", CANONICAL_EXPORTS)
@@ -981,6 +1387,10 @@ def check_differential(
         )
         check_discarded_read(harness, native_path, lifted_path, mxcsr_mask, deprecates_cs_ds, fp_caps)
         check_lifted_preserves_host_state(harness, lifted, mxcsr_mask)
+        mask_checks = check_xsavec_dynamic_mask(lifted[DYNMASK_EXPORT], mxcsr_mask, deprecates_cs_ds)
+        mask_checks += check_xsavec_dynamic_mask(
+            lifted[XSAVEOPT_DYNMASK_EXPORT], mxcsr_mask, deprecates_cs_ds, XSAVEOPT_DYNMASK_EXPORT, "xsaveopt"
+        )
 
         total = 0
         for name in EXPORTS:
@@ -993,9 +1403,10 @@ def check_differential(
                     if name in CANONICAL_EXPORTS
                     else expected_native_output(want, a, name, fp_caps)
                 )
-                got_n = invoke_native(harness, native[name], a, b)
                 got_l = invoke_lifted(lifted_fn, a, b)
-                assert_equal_output("native", name, idx, got_n, want_native)
+                if name in native:
+                    got_n = invoke_native(harness, native[name], a, b)
+                    assert_equal_output("native", name, idx, got_n, want_native)
                 assert_equal_output("lifted", name, idx, got_l, want)
                 total += 1
 
@@ -1027,6 +1438,53 @@ def check_differential(
         else:
             raise AssertionError("mutated output was not caught by comparator")
 
+        # XSAVEC word controls: XCOMP_BV[63], XSTATE_BV, a reserved header byte and the AVX slot must each be caught.
+        xc_a, xc_b = xsave_pairs(mxcsr_mask)[6]
+        xc_name = "op_xrstor64_xsavec64"
+        xc_want = reference(xc_name, xc_a, xc_b, mxcsr_mask, deprecates_cs_ds)
+        for pos, flip in ((519, 0x80), (512, 0x04), (528, 0x01), (576, 0x01)):
+            xc_bad = bytearray(xc_want)
+            xc_bad[pos] ^= flip
+            try:
+                assert_equal_output("mutation", xc_name, pos, bytes(xc_bad), xc_want)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(f"mutated xsavec byte {pos} was not caught by comparator")
+
+        liveness_checks = check_xsavec_mxcsr_liveness(harness, native, lifted, mxcsr_mask, deprecates_cs_ds)
+        layout_checks = check_xsaveopt_layout(harness, native, lifted, mxcsr_mask)
+        opt_controls = check_xsaveopt_controls(mxcsr_mask, deprecates_cs_ds)
+
+        # Native comparison keeps active x87/SSE payloads: a flipped FCW, ST0 or XMM0 byte must fail, while an
+        # initialized component carrying extra host bytes must still pass.
+        want_bv = struct.unpack_from("<Q", xc_want, 512)[0]
+        assert want_bv & 3 == 3, "native-strictness control needs active x87 and SSE components"
+        for pos in (0, 32, 160):
+            flipped = bytearray(xc_want)
+            flipped[pos] ^= 0x01
+            try:
+                assert_equal_output("native", xc_name, pos, bytes(flipped), xc_want)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(f"native comparison accepted a flipped active-component byte {pos}")
+        sse_name = "op_xrstor64_xsavec64_sse"
+        sse_a, sse_b = xsave_pairs(mxcsr_mask)[6]
+        sse_want = reference(sse_name, sse_a, sse_b, mxcsr_mask, deprecates_cs_ds)
+        assert struct.unpack_from("<Q", sse_want, 512)[0] & 1 == 0
+        sse_host = bytearray(sse_want)
+        struct.pack_into("<Q", sse_host, 512, struct.unpack_from("<Q", sse_want, 512)[0] | 1)
+        sse_host[0:24] = bytes(range(1, 25))
+        sse_host[32:160] = bytes(range(128))
+        assert_equal_output("native", sse_name, 0, bytes(sse_host), sse_want)
+
+        # A host without XSAVEC must not be handed native xsavec fixtures.
+        gated = native_exports_for_host(native, False, False)
+        unsupported = set(XSAVEC_EXPORTS) | set(XSAVEOPT_EXPORTS)
+        assert not unsupported & set(gated) and set(native) - unsupported == set(gated)
+        check_fault_controls(harness, gated, lifted, canonical, mxcsr_mask)
+
         es0_64 = fp_caps[(True, True, False)][:3]
         es1_64 = fp_caps[(True, True, True)][:3]
         print(
@@ -1034,8 +1492,10 @@ def check_differential(
             f"(mxcsr_mask={mxcsr_mask:#x}, deprecates_fpu_cs_ds={deprecates_cs_ds}, "
             f"fp_cpuid={fp_cpuid:#x}, fp_es0={es0_64}, fp_es1={es1_64}); "
             f"ALTER_OP diverged on {diverged}; {misalign_checks} misalignment #GP checks, "
-            f"{hdr_mxcsr_checks} header/MXCSR #GP checks, entry-state contract, non-default entry controls, "
-            f"dead-read, host-state, and output mutation controls passed"
+            f"{hdr_mxcsr_checks} header/MXCSR #GP checks, {mask_checks} unsupported-mask #GP checks, entry-state contract, non-default entry controls, "
+            f"dead-read, host-state, and output mutation controls passed; "
+            f"{liveness_checks} xsavec MXCSR-liveness checks passed; "
+            f"{layout_checks} xsaveopt layout readbacks and {opt_controls} xsaveopt mutation controls passed"
         )
     finally:
         harness.close()
@@ -1047,6 +1507,7 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
     mov_eax_1 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 1)
     mov_eax_2 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 2)
     mov_eax_3 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 3)
+    mov_eax_4 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 4)
     mov_eax_7 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 7)
     xor_edx = Instruction.create_reg_reg(Code.XOR_R32_RM32, R.EDX, R.EDX)
     ret_ins = Instruction.create(Code.RETNQ)
@@ -1082,9 +1543,39 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
             Instruction.create(Code.EMMS),
             ret_ins)),
     ]
+    alt_accept.append(("xrstor_xsavec64", (
+        mov_eax_7,
+        xor_edx,
+        Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+        Instruction.create_mem(Code.XSAVEC64_MEM, MemoryOperand(R.R8)),
+        ret_ins)))
+    alt_accept.append(("xrstor_xsaveopt64", (
+        mov_eax_7,
+        xor_edx,
+        Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+        Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)),
+        ret_ins)))
+    # MXCSR is defined by a restore selecting SSE or AVX; an x87-only save stores no MXCSR.
+    alt_accept.append(("xrstor_avx_vzeroupper_xsaveopt64_avx", (
+        mov_eax_4,
+        xor_edx,
+        Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+        Instruction.create(Code.VEX_VZEROUPPER),
+        Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)),
+        ret_ins)))
+    alt_accept.append(("xrstor_x87_xsaveopt64_x87", (
+        mov_eax_1,
+        xor_edx,
+        Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+        Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)),
+        ret_ins)))
     alt_expected = {
         "xrstor_r9_saved_rdx": "op_xrstor(state, r9, rax, rdx, true);",
         "xrstor3_vzeroupper_xsave7": "op_vzeroupper(state);",
+        "xrstor_xsavec64": "op_xsavec(state, r8, rax, rdx, true);",
+        "xrstor_xsaveopt64": "op_xsaveopt(state, r8, rax, rdx, true);",
+        "xrstor_avx_vzeroupper_xsaveopt64_avx": "op_xsaveopt(state, r8, rax, rdx, true);",
+        "xrstor_x87_xsaveopt64_x87": "op_xsaveopt(state, r8, rax, rdx, true);",
         "vmovdqa_ymm_roundtrip": "load256(rcx, true)",
         "movdqa_xmm_roundtrip": "store128(r8, get_xmm(state, 3), true);",
         "movq_mm_gpr_roundtrip": "op_emms(state);",
@@ -1137,14 +1628,28 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
                      Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins),
          "requires explicit --entry-state canonical"),
         # Out-of-scope XSAVE-family & FXSAVE/FXRSTOR forms
-        ("xsaveopt", _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEOPT_MEM, MemoryOperand(R.R8)), ret_ins),
-         "unsupported XSAVE-family"),
-        ("xsaveopt64", _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins),
-         "unsupported XSAVE-family"),
-        ("xsavec", _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEC_MEM, MemoryOperand(R.R8)), ret_ins),
-         "unsupported XSAVE-family"),
-        ("xsavec64", _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEC64_MEM, MemoryOperand(R.R8)), ret_ins),
-         "unsupported XSAVE-family"),
+        ("bare_xsaveopt_default",
+         _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEOPT_MEM, MemoryOperand(R.R8)), ret_ins),
+         "requires explicit --entry-state canonical"),
+        ("xsaveopt_outside_r8",
+         _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.RCX)), ret_ins),
+         "non-r8 store memory operand"),
+        ("vzeroupper_xsaveopt64_avx_mxcsr_undefined",
+         _encode_seq(Instruction.create(Code.VEX_VZEROUPPER), mov_eax_4, xor_edx,
+                     Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "stores MXCSR before any restore defined it"),
+        ("x87_restore_vzeroupper_xsaveopt64_x87_avx_mxcsr_undefined",
+         _encode_seq(mov_eax_1, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+                     Instruction.create(Code.VEX_VZEROUPPER),
+                     Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 5),
+                     Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "MXCSR"),
+        ("bare_xsavec_default",
+         _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEC64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "requires explicit --entry-state canonical"),
+        ("xsavec_outside_r8",
+         _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEC_MEM, MemoryOperand(R.RCX)), ret_ins),
+         "non-r8 store memory operand"),
         ("xsaves", _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVES_MEM, MemoryOperand(R.R8)), ret_ins),
          "unsupported XSAVE-family"),
         ("xrstors64", _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XRSTORS64_MEM, MemoryOperand(R.RCX)), ret_ins),
@@ -1239,8 +1744,8 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
 
     unit_map = {lbl: raw for lbl, raw, _ in unit_cases}
     pe_patches = [
-        ("pe_xsaveopt", unit_map["xsaveopt"], "unsupported XSAVE-family"),
-        ("pe_xsavec64", unit_map["xsavec64"], "unsupported XSAVE-family"),
+        ("pe_xsaveopt_outside_r8", unit_map["xsaveopt_outside_r8"], "non-r8 store memory operand"),
+        ("pe_xsavec_outside_r8", unit_map["xsavec_outside_r8"], "non-r8 store memory operand"),
         ("pe_fxsave", unit_map["fxsave"], "unsupported FXSAVE/FXRSTOR"),
         ("pe_evex", unit_map["evex_vmovdqu64"], "unsupported EVEX instruction"),
         ("pe_nonvol_ymm6", unit_map["nonvol_ymm6"], "nonvolatile vector register"),
