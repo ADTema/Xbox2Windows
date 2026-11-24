@@ -128,6 +128,11 @@ struct IGameInput {
         return reinterpret_cast<Fn>(vtbl[9])(this, device, kind, statusFilter, enumerationKind, context, callback,
                                              token);
     }
+    HRESULT FindDevice(int slot, const void* arg, IGameInputDevice** device)
+    {
+        using Fn = HRESULT(__stdcall*)(IGameInput*, const void*, IGameInputDevice**);
+        return reinterpret_cast<Fn>(vtbl[slot])(this, arg, device);
+    }
     bool UnregisterCallback(std::uint64_t token, std::uint64_t timeoutUs)
     {
         using Fn = bool(__stdcall*)(IGameInput*, std::uint64_t, std::uint64_t);
@@ -292,6 +297,91 @@ int main(int argc, char** argv)
         combo->Release();
     }
 
+    // 5b. Extended scan-code prefixes survive; generic modifier aliases are not reported as keys.
+    SetEnvironmentVariableA("X2W_INPUT_KEYS", "25,64,A3,A5");  // Left, Numpad4, RCtrl, RAlt
+    IGameInputReading* ext = nullptr;
+    hr = input->GetCurrentReading(kind_keyboard, kbd_device, &ext);
+    failures += check(hr == S_OK && ext != nullptr, "extended-key reading should succeed");
+    if (ext) {
+        KeyState ek[8]{};
+        failures += check(ext->GetKeyState(8, ek) == 4, "extended-key reading should report 4 keys");
+        failures += check(ek[0].scanCode == 0xE04B, "Left Arrow scan code should keep the E0 prefix");
+        failures += check(ek[1].scanCode == 0x4B, "Numpad 4 scan code should have no prefix");
+        failures += check(ek[2].scanCode == 0xE01D, "Right Ctrl scan code should keep the E0 prefix");
+        failures += check(ek[3].scanCode == 0xE038, "Right Alt scan code should keep the E0 prefix");
+        ext->Release();
+    }
+    SetEnvironmentVariableA("X2W_INPUT_KEYS", "10,11,12,A0,A2");  // generic Shift/Ctrl/Alt, then LShift, LCtrl
+    hr = input->GetCurrentReading(kind_keyboard, kbd_device, &ext);
+    failures += check(hr == S_OK && ext != nullptr, "modifier reading should succeed");
+    if (ext) {
+        KeyState mk[8]{};
+        const std::uint32_t n = ext->GetKeyState(8, mk);
+        failures += check(n == 2 && ext->GetKeyCount() == 2, "generic modifier aliases should be skipped");
+        failures += check(n == 2 && mk[0].virtualKey == 0xA0 && mk[1].virtualKey == 0xA2, "left modifiers should remain");
+        ext->Release();
+    }
+
+    // 5c. History traversal is filtered by device: keyboard-only changes are invisible to a gamepad caller.
+    SetEnvironmentVariableA("X2W_INPUT_KEYS", nullptr);
+    HANDLE pad_map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 16, L"Local\\x2w_input_pad");
+    auto* pad_words = pad_map ? static_cast<volatile std::uint32_t*>(MapViewOfFile(pad_map, FILE_MAP_ALL_ACCESS, 0, 0, 16)) : nullptr;
+    failures += check(pad_words != nullptr, "shared pad block should be mappable");
+    if (pad_words) {
+        pad_words[1] = 2;  // buttons: View
+        IGameInputReading *pad_a = nullptr, *pad_b = nullptr, *pad_c = nullptr, *tmp = nullptr;
+        failures += check(input->GetCurrentReading(kind_gamepad, pad_device, &pad_a) == S_OK && pad_a, "pad_a reading");
+        const std::uint64_t base = pad_a ? pad_a->GetSequenceNumber(kind_gamepad) : 0;
+        SetEnvironmentVariableA("X2W_INPUT_KEYS", "51");
+        input->GetCurrentReading(kind_keyboard, kbd_device, &tmp);
+        if (tmp) tmp->Release();
+        SetEnvironmentVariableA("X2W_INPUT_KEYS", "52");
+        input->GetCurrentReading(kind_keyboard, kbd_device, &tmp);
+        if (tmp) tmp->Release();
+        tmp = nullptr;
+        failures += check(input->GetNextReading(pad_a, kind_gamepad, pad_device, &tmp) == reading_not_found && tmp == nullptr,
+                          "keyboard-only changes must not be a next gamepad reading");
+        pad_words[1] = 4;  // buttons: A
+        input->GetCurrentReading(kind_keyboard, kbd_device, &pad_c);  // records the pad change
+        failures += check(input->GetNextReading(pad_a, kind_gamepad, pad_device, &pad_b) == S_OK && pad_b, "next gamepad reading");
+        if (pad_b) {
+            GamepadState gs{};
+            failures += check(pad_b->GetGamepadState(&gs) && gs.buttons == 4, "next gamepad reading carries the new buttons");
+            failures += check(pad_b->GetSequenceNumber(kind_gamepad) == base + 3, "next gamepad reading skips keyboard-only entries");
+            IGameInputReading* back = nullptr;
+            failures += check(input->GetPreviousReading(pad_b, kind_gamepad, pad_device, &back) == S_OK && back, "previous gamepad reading");
+            if (back) {
+                failures += check(back->GetSequenceNumber(kind_gamepad) == base, "previous gamepad reading skips keyboard-only entries");
+                back->Release();
+            }
+            IGameInputReading* kback = nullptr;
+            failures += check(input->GetPreviousReading(pad_b, kind_keyboard, kbd_device, &kback) == S_OK && kback, "previous keyboard reading");
+            if (kback) {
+                failures += check(kback->GetSequenceNumber(kind_keyboard) == base + 2, "previous keyboard reading skips pad-only entries");
+                kback->Release();
+            }
+            pad_b->Release();
+        }
+        if (pad_a) pad_a->Release();
+        if (pad_c) pad_c->Release();
+        pad_words[1] = 0;
+        UnmapViewOfFile(const_cast<std::uint32_t*>(pad_words));
+    }
+    if (pad_map) CloseHandle(pad_map);
+    SetEnvironmentVariableA("X2W_INPUT_KEYS", "42");
+
+    // 5d. Device lookups: by id, and an opaque platform handle that must never be dereferenced.
+    using GetInfoFn = const unsigned char*(__stdcall*)(IGameInputDevice*);
+    if (kbd_device) {
+        const unsigned char* kinfo = reinterpret_cast<GetInfoFn>(kbd_device->vtbl[3])(kbd_device);
+        IGameInputDevice* found = nullptr;
+        failures += check(input->FindDevice(16, kinfo + 0x20, &found) == S_OK && found == kbd_device, "FindDeviceFromId(keyboard id)");
+        found = nullptr;
+        failures += check(input->FindDevice(18, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(4)), &found) == device_not_found &&
+                              found == nullptr,
+                          "FindDeviceFromPlatformHandle(0x4) should fail without dereferencing the handle");
+    }
+
     // 6. Negative controls: null out, wrong kind, mismatched device, null reference for GetPreviousReading.
     IGameInputReading* bad = nullptr;
     failures += check(input->GetCurrentReading(kind_keyboard, nullptr, nullptr) == E_POINTER,
@@ -313,9 +403,12 @@ int main(int argc, char** argv)
         failures += check((hr == device_not_found || hr == reading_not_found) && bad == nullptr,
                           "GetCurrentReading(fake_device) should fail");
         // No next reading past latest.
-        failures += check(input->GetNextReading(r2, kind_keyboard, kbd_device, &bad) == reading_not_found &&
+        IGameInputReading* latest = nullptr;
+        failures += check(input->GetCurrentReading(kind_keyboard, kbd_device, &latest) == S_OK && latest, "latest reading");
+        failures += check(input->GetNextReading(latest, kind_keyboard, kbd_device, &bad) == reading_not_found &&
                               bad == nullptr,
                           "GetNextReading(latest) should return reading_not_found");
+        if (latest) latest->Release();
     }
 
     if (r0) r0->Release();

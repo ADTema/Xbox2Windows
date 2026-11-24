@@ -186,12 +186,14 @@ std::uint32_t sample_keys(KeyState* out, std::size_t capacity)
 {
     std::uint32_t count = 0;
     auto push_vk = [&](std::uint32_t vk) {
-        if (count >= capacity || vk == 0 || vk > 0xFE) return;
+        // VK_SHIFT/VK_CONTROL/VK_MENU are aliases of the left/right keys, never a physical key of their own.
+        if (count >= capacity || vk == 0 || vk > 0xFE || vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU) return;
         const auto vkey = static_cast<std::uint8_t>(vk);
         for (std::uint32_t i = 0; i < count; ++i)
             if (out[i].virtualKey == vkey) return;
         KeyState ks{};
-        ks.scanCode = static_cast<std::uint32_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+        // _EX keeps the 0xE0/0xE1 prefix, so Left Arrow (0xE04B) differs from keypad 4 (0x4B).
+        ks.scanCode = static_cast<std::uint32_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX));
         const UINT ch = MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR);
         if ((ch & 0x80000000u) == 0 && (ch & 0xFFFFu) != 0) ks.codePoint = ch & 0xFFFFu;
         ks.virtualKey = vkey;
@@ -273,11 +275,13 @@ struct Reading : Object {
     KeyState keys[max_keys];
     u64 sequence, timestamp;
 };
+constexpr std::uint32_t history_pad = 1, history_keys = 2;
 struct HistoryEntry {
     u64 sequence, timestamp;
     GamepadState pad;
     std::uint32_t key_count;
     KeyState keys[max_keys];
+    std::uint32_t changed;  // history_pad / history_keys: which device's state differs from the previous entry
 };
 Table<32> reading_table;
 volatile LONG64 sequence_counter;
@@ -360,13 +364,13 @@ HistoryEntry capture_current()
     const std::uint32_t key_count = sample_keys(keys, max_keys);
 
     AcquireSRWLockExclusive(&state_lock);
-    bool changed = (history_count == 0);
+    std::uint32_t changed = (history_count == 0) ? (history_pad | history_keys) : 0;
     if (!changed) {
         const HistoryEntry& latest = history_ring[static_cast<u64>(sequence_counter) % history_capacity];
-        if (std::memcmp(&pad, &latest.pad, sizeof(pad)) != 0 || key_count != latest.key_count ||
-            (key_count > 0 && std::memcmp(keys, latest.keys, key_count * sizeof(KeyState)) != 0)) {
-            changed = true;
-        }
+        if (std::memcmp(&pad, &latest.pad, sizeof(pad)) != 0) changed |= history_pad;
+        if (key_count != latest.key_count ||
+            (key_count > 0 && std::memcmp(keys, latest.keys, key_count * sizeof(KeyState)) != 0))
+            changed |= history_keys;
     }
     if (changed) {
         ++sequence_counter;
@@ -374,6 +378,7 @@ HistoryEntry capture_current()
         slot.sequence = static_cast<u64>(sequence_counter);
         slot.timestamp = now_microseconds();
         slot.pad = pad;
+        slot.changed = changed;
         slot.key_count = key_count;
         if (key_count > 0) std::memcpy(slot.keys, keys, key_count * sizeof(KeyState));
         if (history_count < history_capacity) ++history_count;
@@ -383,22 +388,39 @@ HistoryEntry capture_current()
     return result;
 }
 
-// Returns 0 on hit, -1 if sequence does not exist (not found), -2 if evicted (too old).
-int find_history(u64 seq, HistoryEntry& out)
+std::uint32_t history_mask(std::uint32_t reading_kind)
+{
+    return ((reading_kind & kind_gamepad) ? history_pad : 0) | ((reading_kind & kind_keyboard) ? history_keys : 0);
+}
+
+// Walks the history from `start` in `step` (+1 / -1) to the nearest entry that changed the wanted device(s).
+// Returns 0 on hit, -1 if there is none (not found), -2 if the walk ran past the evicted end (too old).
+int find_history(u64 start, int step, std::uint32_t mask, HistoryEntry& out)
 {
     AcquireSRWLockShared(&state_lock);
-    if (history_count == 0 || seq == 0 || seq > static_cast<u64>(sequence_counter)) {
-        ReleaseSRWLockShared(&state_lock);
-        return -1;
+    int result = -1;
+    const u64 latest = static_cast<u64>(sequence_counter);
+    if (history_count != 0 && start != 0 && start <= latest) {
+        const u64 oldest = latest - history_count + 1;
+        if (start < oldest) {
+            result = -2;
+        } else {
+            for (u64 seq = start; seq >= oldest && seq <= latest; seq += static_cast<u64>(static_cast<long long>(step))) {
+                const HistoryEntry& entry = history_ring[seq % history_capacity];
+                if (entry.changed & mask) {
+                    out = entry;
+                    result = 0;
+                    break;
+                }
+                if (step < 0 && seq == oldest) {
+                    result = oldest > 1 ? -2 : -1;
+                    break;
+                }
+            }
+        }
     }
-    const u64 oldest = static_cast<u64>(sequence_counter) - history_count + 1;
-    if (seq < oldest) {
-        ReleaseSRWLockShared(&state_lock);
-        return -2;
-    }
-    out = history_ring[seq % history_capacity];
     ReleaseSRWLockShared(&state_lock);
-    return 0;
+    return result;
 }
 
 Reading* make_reading(const HistoryEntry& entry, std::uint32_t kind, Object* device)
@@ -453,7 +475,7 @@ HRESULT __stdcall input_next_reading(Object*, Reading* reference, std::uint32_t 
     if (FAILED(check_hr)) return check_hr;
     capture_current();
     HistoryEntry entry{};
-    const int found = find_history(reference->sequence + 1, entry);
+    const int found = find_history(reference->sequence + 1, 1, history_mask(resolve_reading_kind(kind, device)), entry);
     if (found == -2) return reading_too_old;
     if (found != 0) return reading_not_found;
     *out = make_reading(entry, kind, device);
@@ -470,7 +492,7 @@ HRESULT __stdcall input_previous_reading(Object*, Reading* reference, std::uint3
     if (FAILED(check_hr)) return check_hr;
     if (reference->sequence <= 1) return reading_not_found;
     HistoryEntry entry{};
-    const int found = find_history(reference->sequence - 1, entry);
+    const int found = find_history(reference->sequence - 1, -1, history_mask(resolve_reading_kind(kind, device)), entry);
     if (found == -2) return reading_too_old;
     if (found != 0) return reading_not_found;
     *out = make_reading(entry, kind, device);
@@ -513,10 +535,10 @@ HRESULT __stdcall input_register_short_callback(Object*, Object*, void*, void*, 
 }
 void __stdcall input_stop_callback(Object*, u64) {}
 bool __stdcall input_unregister_callback(Object*, u64, u64) { return true; }
-HRESULT __stdcall input_find_device(Object*, const void* id, Object** device)
+HRESULT __stdcall input_find_device_by_id(Object*, const void* id, Object** device)
 {
     static LONG calls;
-    note("GameInput::FindDeviceFrom*", calls);
+    note("GameInput::FindDeviceFromId", calls);
     if (!device) return E_POINTER;
     if (id && (std::memcmp(id, keyboard_device_info + 0x20, 32) == 0 ||
                std::memcmp(id, keyboard_device_info + 0x40, 32) == 0)) {
@@ -524,6 +546,25 @@ HRESULT __stdcall input_find_device(Object*, const void* id, Object** device)
         *device = &the_keyboard_device;
         return S_OK;
     }
+    InterlockedIncrement(&the_device.refs);
+    *device = &the_device;
+    return S_OK;
+}
+// FindDeviceFromPlatformHandle: the argument is an opaque OS handle, never a pointer; no device is bound to one.
+HRESULT __stdcall input_find_device_by_handle(Object*, void*, Object** device)
+{
+    static LONG calls;
+    note("GameInput::FindDeviceFromPlatformHandle", calls);
+    if (!device) return E_POINTER;
+    *device = nullptr;
+    return device_not_found;
+}
+// FindDeviceFromObject / FindDeviceFromPlatformString: the argument is not read; the virtual pad answers.
+HRESULT __stdcall input_find_device_other(Object*, const void*, Object** device)
+{
+    static LONG calls;
+    note("GameInput::FindDeviceFrom{Object,PlatformString}", calls);
+    if (!device) return E_POINTER;
     InterlockedIncrement(&the_device.refs);
     *device = &the_device;
     return S_OK;
@@ -558,7 +599,10 @@ void build()
     input_table.slots[11] = reinterpret_cast<void*>(&input_register_short_callback);   // RegisterKeyboardLayoutCallback
     input_table.slots[12] = reinterpret_cast<void*>(&input_stop_callback);
     input_table.slots[13] = reinterpret_cast<void*>(&input_unregister_callback);
-    for (int slot = 16; slot <= 19; ++slot) input_table.slots[slot] = reinterpret_cast<void*>(&input_find_device);
+    input_table.slots[16] = reinterpret_cast<void*>(&input_find_device_by_id);
+    input_table.slots[17] = reinterpret_cast<void*>(&input_find_device_other);
+    input_table.slots[18] = reinterpret_cast<void*>(&input_find_device_by_handle);
+    input_table.slots[19] = reinterpret_cast<void*>(&input_find_device_other);
     input_table.slots[21] = reinterpret_cast<void*>(&input_set_focus_policy);
     // IGameInputDevice.
     device_table.slots[3] = reinterpret_cast<void*>(&device_get_info);
