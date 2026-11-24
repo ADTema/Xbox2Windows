@@ -15,7 +15,7 @@ AXES = "xyz"
 # Unsigned VOPC compares a lane guard may use: v_cmp_<op>_u32 a, b is (a <op> b) per lane.
 GUARD_COMPARES = {"gt": ">", "lt": "<", "ge": ">=", "le": "<="}
 # The data ALU subset: the unsigned 32-bit operations the LLVM 15 code generator emits for the
-# read-compute-write fixture, on known words only. v_and_b32 and v_lshrrev_b32 (src1 >> src0[4:0])
+# read-compute-write fixture, on known words only. v_and_b32, v_or_b32, v_xor_b32 and v_lshrrev_b32 (src1 >> src0[4:0])
 # reuse the pixel profile's integer templates, as does v_mul_lo_u32. v_lshlrev_b32 and v_ashrrev_i32 shift src1
 # by src0[4:0], the latter arithmetically; v_sub_nc_u32 is src0 - src1 and v_subrev_nc_u32 src1 - src0, both
 # modulo 2^32. v_mad_u32_u24 is
@@ -28,6 +28,10 @@ ALU = {
     "v_sub_nc_u32_e32": "({0} - {1})",
     "v_subrev_nc_u32_e32": "({1} - {0})",
     "v_min_u32_e32": "min({0}, {1})",
+    "v_max_u32_e32": "max({0}, {1})",
+    "v_add_nc_u32_e32": "({0} + {1})",
+    "v_or_b32_e32": f"({INTEGER['or_b32'][1]})",
+    "v_xor_b32_e32": f"({INTEGER['xor_b32'][1]})",
     "v_mul_lo_u32": INTEGER["mul_lo_u32"][1],
     "v_mad_u32_u24": "((({0} & 0xffffffu) * ({1} & 0xffffffu)) + {2})",
 }
@@ -704,8 +708,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                                  r"(?(ret)v\[(?P<dst_first>\d+):(?P<dst_last>\d+)\], )"
                                  r"v(?P<addr>\d+), v\[(?P<src_first>\d+):(?P<src_last>\d+)\]"
                                  r"(?: offset:(?P<offset>0|8))?", line))
-              and ((op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64")
-                   or not m["ret"] and op in ("xor_b64", "min_i64", "max_i64", "min_u64", "max_u64"))):
+              and ((op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64",
+                                        "xor_b64", "min_i64", "max_i64", "min_u64", "max_u64"))):
             addr, first, last = (int(m[key]) for key in ("addr", "src_first", "src_last"))
             destination = tuple(int(m[key]) for key in ("dst_first", "dst_last")) if m["ret"] else None
             slot = int(m["offset"] or 0) // 4
@@ -876,7 +880,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
-        elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
+        elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
               and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):

@@ -768,6 +768,14 @@ READ_MUL_LO = variant(
     ("v_mad_u32_u24 v1, v2, v1, v0", "v_mul_lo_u32 v1, s0, v1"),
     ("v_min_u32_e32 v1, s0, v1", ""),
 )
+# The remaining unsigned VOP2 operations of the subset, chained so each result feeds the next: the cap constant added
+# to the product (it wraps for most lanes), a high-bit OR and a high-bit XOR, then the unsigned maximum of the product
+# and the chain (the product wins for some lanes and the chain for others).
+READ_VOP2 = variant(
+    READ_COMPUTE,
+    ("v_min_u32_e32 v1, s0, v1", "v_add_nc_u32_e32 v2, s0, v1\nv_or_b32_e32 v2, 0x80000010, v2\n"
+                                 "v_xor_b32_e32 v2, 0x80000001, v2\nv_max_u32_e32 v1, v1, v2"),
+)
 # The shift and subtract operations of the subset on a computed word: the product is shifted left until its
 # bit 14 is the sign bit, shifted right arithmetically, subtracted from the cap (src0 - src1), and the literal
 # 0x1234 is reverse-subtracted (src1 - src0).
@@ -780,6 +788,7 @@ ALU_CASES = [
     ("read_compute", READ_COMPUTE, 32, READ_BINDING),
     ("read_mad24", READ_MAD24, 32, READ_BINDING),
     ("read_mul_lo", READ_MUL_LO, 32, READ_BINDING),
+    ("read_vop2", READ_VOP2, 32, READ_BINDING),
     ("read_shift_sub", READ_SHIFT_SUB, 32, READ_BINDING),
 ]
 
@@ -998,6 +1007,11 @@ def alu_controls():
     load = READ_LOADS["read_copy"]
     assert (f"min(params[0].y, (((0x0000012cu & 0xffffffu) * ((0xfffffff0u & {load}) & 0xffffffu)) + params[0].y)"
             in alu(("0xffff, v1", "-16, v1"), (mad, "v_mad_u32_u24 v1, 0x12c, v2, s0"))[-3])
+    # Add, or, xor and max apply in order: max(cap, 0x80000001 ^ (cap | (7 + mad))); src0 prints first.
+    mad_word = ALU_WORD.split(", ", 1)[1][:-1]
+    vop2 = aot.lower(READ_VOP2, 32, **READ_BINDING).splitlines()
+    assert vop2[-3] == ("        outputData.Store(tid.x * 4u + 0u, max(" + mad_word + ", (0x80000001u ^ (0x80000010u | "
+                        f"(params[0].y + {mad_word})))));"), vop2
     # Shift and subtract in order; src0 prints first for the reversed-operand forms, so each operand order is pinned.
     shift_sub = aot.lower(READ_SHIFT_SUB, 32, **READ_BINDING).splitlines()
     product = f"((((0x0000ffffu & {load}) & 0xffffffu) * (({load} >> (0x00000010u & 31u)) & 0xffffffu)) + tid.x)"
@@ -1020,9 +1034,9 @@ def alu_controls():
     for message, changes in (
         # Wrong opcodes: signed or other operations, and a carry form that would write vcc.
         (unsupported + "v_min_i32_e32", (("v_min_u32_e32", "v_min_i32_e32"),)),
-        (unsupported + "v_max_u32_e32", (("v_min_u32_e32", "v_max_u32_e32"),)),
+        (unsupported + "v_max_i32_e32", (("v_min_u32_e32", "v_max_i32_e32"),)),
         (unsupported + "v_mul_hi_u32_e32", (("v_lshrrev_b32_e32", "v_mul_hi_u32_e32"),)),
-        (unsupported + "v_or_b32_e32", (("v_and_b32_e32", "v_or_b32_e32"),)),
+        (unsupported + "v_xnor_b32_e32", (("v_and_b32_e32", "v_xnor_b32_e32"),)),
         (unsupported + "v_mad_i32_i24", ((mad, "v_mad_i32_i24 v1, v2, v1, v0"),)),
         (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
         # Wrong operand widths: 16-bit, 64-bit and sub-dword (SDWA) forms, and a register range.
@@ -1045,12 +1059,6 @@ def alu_controls():
         (operand, (("s0, v1", "s8, v1"),)),
         (operand, (("s0, v1", "s2, v1"),)),
         (operand, (("16, v1", "16, v5"),)),
-        (operand, (("v_min_u32_e32 v1, s0, v1", "v_ashrrev_i32_e32 v1, 20, v5"),)),
-        (operand, (("v_min_u32_e32 v1, s0, v1", "v_sub_nc_u32_e32 v1, s20, v1"),)),
-        (operand, (("v_min_u32_e32 v1, s0, v1", "v_subrev_nc_u32_e32 v256, 7, v1"),)),
-        (unsupported + "v_sub_nc_u32_e32", (("v_min_u32_e32 v1, s0, v1", "v_sub_nc_u32_e32 v1, v1, s0"),)),
-        (unsupported + "v_ashrrev_i32_e32", (("v_min_u32_e32 v1, s0, v1", "v_ashrrev_i32_e32 v1, 20, v[1:2]"),)),
-        (unsupported + "v_subrev_nc_u32_e32", (("v_min_u32_e32 v1, s0, v1", "v_subrev_nc_u32_e32 v1, 7, v1 clamp"),)),
         (operand, (("0xffff, v1", "0x1ffffffff, v1"),)),
         (operand, (("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v256, s0, v1"),)),
         (operand, (("v_and_b32_e32 v2, 0xffff, v1", "v_lshlrev_b32_e32 v3, 2, v0\nv_and_b32_e32 v2, 0xffff, v3"),)),
@@ -1721,7 +1729,7 @@ LDS_QWORD_UPDATES = {
 }
 
 
-LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in ("ds_add_u64", "ds_sub_u64", "ds_rsub_u64", "ds_and_b64", "ds_or_b64")
+LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in LDS_QWORD_UPDATES
                      for stem, width in [op.rsplit("_", 1)]}
 
 
@@ -2887,6 +2895,77 @@ def draw_alu(directory, compiler, cmd, case, name):
     return 0
 
 
+VOP2_CAP = 0xe0000000  # large enough that the product plus the cap wraps for many lanes
+
+
+def vop2_word(gid, *, pick="max", skip=()):
+    """Independent CPU reference of the read_vop2 result for one lane: the product p is added to the cap (wrapping),
+    OR-ed and XOR-ed with high-bit constants, and the unsigned maximum of p and that chain is stored."""
+    word = source_word(gid)
+    product = ((word & 0xffff) * (word >> 16) + gid) & 0xffffffff
+    chain = product if "add" in skip else (product + VOP2_CAP) & 0xffffffff
+    chain = chain if "or" in skip else chain | 0x80000010
+    chain = chain if "xor" in skip else chain ^ 0x80000001
+    if pick == "signed":
+        return max(product, chain, key=lambda v: v - (1 << 32) if v >> 31 else v)
+    return min(product, chain) if pick == "min" else max(product, chain)
+
+
+def vop2_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = vop2_word(gid, **reference)
+    return words
+
+
+def draw_vop2(directory, compiler, cmd, case, name):
+    """Chained add, or, xor and unsigned max against vop2_word, from the 320-word case format."""
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = VOP2_CAP
+    groups, bound = READ_RUNS[-1]
+
+    def write(words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, *constants[1:]))
+
+    expected = vop2_words(groups, bound)
+    products = [((source_word(g) & 0xffff) * (source_word(g) >> 16) + g) & 0xffffffff for g in range(bound)]
+    # Inputs must show an add that wraps, the max choosing each operand, and a signed max that would differ.
+    assert any(p + VOP2_CAP >= 1 << 32 for p in products), "no lane wraps the add"
+    assert any(e == p for e, p in zip(expected, products)), "no lane takes the product"
+    assert any(e != p for e, p in zip(expected, products)), "no lane takes the chain"
+    assert expected != vop2_words(groups, bound, pick="signed"), "a signed max would go unseen"
+    write(expected)
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    # Each wrong reference must fail the run at the first word where it differs from the right one.
+    for label, reference in (("signed max", vop2_words(groups, bound, pick="signed")),
+                             ("min for max", vop2_words(groups, bound, pick="min")),
+                             ("add dropped", vop2_words(groups, bound, skip=("add",))),
+                             ("or dropped", vop2_words(groups, bound, skip=("or",))),
+                             ("xor dropped", vop2_words(groups, bound, skip=("xor",)))):
+        word = next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b)
+        write(reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(expected)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, old, new in (("min for max", "max(((((", "min((((("), ("xor dropped", "0x80000001u ^", "0x00000000u ^"),
+                            ("or dropped", "0x80000010u |", "0x00000000u |"),
+                            ("add dropped", "(params[0].y + (", "(0u + (")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+    return 0
+
+
 SHIFT_SUB_CAP = 0x0badf00d
 
 
@@ -3036,7 +3115,8 @@ def draw(directory, compiler, renderer, backend, cases=None):
             continue
         if name.startswith(("guard_", "read_")):
             result = (draw_guard if name.startswith("guard_") else draw_alu if name == "read_compute"
-                      else draw_shift_sub if name == "read_shift_sub" else draw_read)(directory, compiler, cmd, case, name)
+                      else draw_vop2 if name == "read_vop2" else draw_shift_sub if name == "read_shift_sub"
+                      else draw_read)(directory, compiler, cmd, case, name)
             if result:
                 return result
             continue
