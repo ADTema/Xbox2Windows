@@ -116,6 +116,23 @@ All ten formats matched on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (dr
 ctest --preset dev --no-tests=error -R '^startup_vertex_fetch_formats_(controls|warp|hardware)$' -V
 ```
 
+### Combined `idxen` + `offen`, scalar `soffset` and MUBUF/MTBUF modifier checks
+
+In RDNA 2 MUBUF (`buffer_load_dword*`) and MTBUF (`tbuffer_load_format_*`) instructions, `idxen` and `offen` can be enabled at the same time: `vaddr` is then a two-VGPR pair `v[n:n+1]` holding `(vindex, voffset)`, and the effective byte address is `vindex * stride + voffset + soffset + inst_offset`. `Stage.buffer_address()` in `tools/startup/gfx2hlsl.py` previously used an `if 'idxen' in mods / elif 'offen' in mods` branch, which read `v[n]` as the index and silently dropped `v[n+1]`. It also ignored `tfe`, raised `IndexError` on `lds` (whose disassembly omits `vdata`), and raised `ValueError` when `soffset` named an SGPR or non-integer operand instead of an integer literal.
+
+`Stage.buffer_address()` now lowers combined `idxen` + `offen` (`v[n] * stride + v[n+1]`) as well as SGPR `soffset` (`s0`..`s105`), accepts the cache-policy flags (`glc`, `slc`, `dlc`) without changing the address expression, and refuses `lds`, `tfe`, out-of-range VGPR pairs (`v[255:256]`) and non-SGPR/non-uint `soffset` forms (`vcc_lo`, `m0`, `null`, negative inline integers, inline floats, reserved scalar codes, or descriptor-holding SGPRs) with `Unsupported`.
+
+`tests/startup_buffer_address_check.py` builds synthetic MUBUF and MTBUF encodings from the RDNA 2 field layout and runs three 16-vertex readback cases through `offscreen_check --compute-store-case` (plus `fxc` `vs_5_1`/`ps_5_1` compilation when `fxc.exe` is present):
+- `buffer_load_dwordx4` with `idxen` + `offen` + root-constant SGPR `soffset` + immediate `offset`;
+- `tbuffer_load_format_xyzw` (`BUF_FMT_8_8_8_8_UNORM`) with `idxen` + `offen` + SGPR `soffset` + unaligned `ldu()` byte offsets;
+- `buffer_load_dwordx4` with `offen` + SGPR `soffset` + immediate `offset`.
+
+Four wrong references (omitting `voffset` or `soffset`) and four translation mutations (including the pre-fix dropped-`voffset` form and swapping `vindex` with `voffset`) must fail the GPU readback. Verified with zero mismatches and zero D3D12 debug-layer errors or warnings on Windows 11 26H2 (build 26300.9974) across WARP 10.0.26100.9818 and an AMD Radeon RX 9070 XT (driver 32.0.32029.2010).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_buffer_address_(controls|warp|hardware)$' -V
+```
+
 ## Packed render targets: 5-6-5 and arrays
 
 `packed_target_stand_in` now also covers B5G6R5_UNORM and 2D arrays of 2 to 2048 slices (a cube map is six). When the adapter lacks render-target (or typed UAV) support for the packed format and has it for R8G8B8A8_UNORM, the texture is created as R8G8B8A8_UNORM with the same slice and mip counts. Zero slices, more than 2048, 3D, buffers and multisampled textures keep their format. The stand-in has 8 bits a channel and an alpha channel that B5G6R5 lacks. Texels the executable writes in the 16-bit layout are not converted. The device-free check covers 61 rows against adapters described by their support bits, and four mutated runs (wrong stand-in format, arrays left alone, B5G6R5 left alone, view kept packed) must fail. The WARP and hardware readback draws a B5G6R5 target; an array target is not drawn.

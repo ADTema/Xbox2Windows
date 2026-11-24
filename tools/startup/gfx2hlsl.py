@@ -666,21 +666,58 @@ class Stage:
         self.op_s_buffer_load_dword(ops, mods, 16)
 
     def buffer_address(self, ops, mods):
+        # MUBUF and MTBUF share the same address calculation: optional index * stride (idxen),
+        # optional byte VGPR offset (offen), scalar byte offset (soffset) and 12-bit immediate
+        # offset. Cache-policy flags (glc, slc, dlc) do not change the loaded bytes; lds, tfe
+        # and any other modifier change the destination or operand layout and are refused first.
+        offset = 0
+        for m in mods:
+            if m.startswith('offset:') and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
+                offset += int(m[7:], 0)
+            elif m not in ('idxen', 'offen', 'glc', 'slc', 'dlc'):
+                raise Unsupported('buffer modifier %s' % m)
+        if len(ops) != 4:
+            raise Unsupported('buffer load with %d operands' % len(ops))
         key = self.descriptor(ops[2])
         buf = self.pipe.resource(key, 'buf')
-        offset = int(ops[3], 0)
-        for m in mods:
-            if m.startswith('offset:'):
-                offset += int(m[7:], 0)
-        if 'idxen' in mods:
+        soffset = None
+        if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
+            offset += int(ops[3], 0)
+        else:
+            sreg = reg_range(ops[3])
+            if not sreg or sreg[0] != 's' or sreg[1] != sreg[2] or sreg[1] > 105:
+                raise Unsupported('buffer soffset %s' % ops[3])
+            soffset = self.S(sreg[1])
+        idxen, offen = 'idxen' in mods, 'offen' in mods
+        terms = []
+        if idxen and offen:
             if key in self.pipe.modified:
                 raise Unsupported('indexed load through a modified descriptor')
-            address = '%s * ud%d + %d' % (self.u(ops[1]), self.pipe.ud(('stride',) + (self.pipe.resources[key]['index'],)), offset)
-        elif 'offen' in mods:
-            address = '%s + %d' % (self.u(ops[1]), offset)
-        else:
-            address = '%d' % offset
-        return buf, address
+            r = reg_range(ops[1])
+            if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
+                raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
+            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            terms.append('%s * ud%d' % (self.u('v%d' % r[1]), stride))
+            terms.append(self.u('v%d' % r[2]))
+        elif idxen:
+            if key in self.pipe.modified:
+                raise Unsupported('indexed load through a modified descriptor')
+            r = reg_range(ops[1])
+            if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
+                raise Unsupported('buffer vaddr %s for idxen' % ops[1])
+            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            terms.append('%s * ud%d' % (self.u(ops[1]), stride))
+        elif offen:
+            r = reg_range(ops[1])
+            if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
+                raise Unsupported('buffer vaddr %s for offen' % ops[1])
+            terms.append(self.u(ops[1]))
+        elif ops[1] != 'off':
+            raise Unsupported('buffer vaddr %s without idxen or offen' % ops[1])
+        if soffset is not None:
+            terms.append(soffset)
+        terms.append('%d' % offset)
+        return buf, ' + '.join(terms)
 
     def op_buffer_load_dword(self, ops, mods, count=1):
         dst = reg_range(ops[0])
