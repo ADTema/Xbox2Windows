@@ -1068,6 +1068,14 @@ def check_region_scalar_load_controls():
                                                              "s_waitcnt lgkmcnt(0)", *after)))
             else:
                 translate(region_load_program(REGION_LOAD_INSIDE, opener, skip, after=after))
+            if not skip:
+                # No wave can skip this region, so its load supersedes an earlier conditional write of the register:
+                # one in the same region and one left by an earlier region.
+                redefined = ("s_mov_b32 s72, 0", "s_buffer_load_dword s72, s[68:71], 0x20", "s_waitcnt lgkmcnt(0)")
+                translate(region_load_program(redefined, opener, skip, after=("v_mov_b32_e32 v15, s72",)))
+                save, restore = REGION_WAIT_OPENERS[opener]
+                reload = ("s_buffer_load_dword s72, s[68:71], 0x20", "s_waitcnt lgkmcnt(0)", "v_mov_b32_e32 v13, s72")
+                translate(region_load_program(reload, opener, skip, before=(*save, "s_mov_b32 s72, 0", restore)))
             # Reading a loaded word before any wait stays refused, inside the region too.
             expect_value_error(translate, region_load_program(
                 ("s_buffer_load_dword s72, s[68:71], 0x20", "v_mov_b32_e32 v13, s72"), opener, skip),

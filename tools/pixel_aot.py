@@ -5185,6 +5185,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError(f"Unsupported masked-region scalar load {i}: {line}")
                 if region["skip"] is not None:
                     region["scalar_written"].update(scalar_alu)
+                else:
+                    # No wave can skip the region, so the load defines these registers on every wave and
+                    # supersedes any earlier conditional write of them.
+                    region["scalar_written"].difference_update(scalar_alu)
+                    scalar.conditional.difference_update(scalar_alu)
             elif scalar_alu:
                 destination = REGION_SALU_DEST.match(line)
                 scalar_writes = {k for k in set(scalar) | set(old_scalar)
