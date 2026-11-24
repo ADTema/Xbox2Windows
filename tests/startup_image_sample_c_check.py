@@ -323,6 +323,27 @@ def controls():
     # 0 and the maximum has no static-sampler equivalent and is refused.
     check_call(pipeline('c_max0').hlsl_ps(), 'SampleCmpLevelZero', 'v1', 'v2', 'v0')
     refused('c_max_partial', 'sampler MAX_LOD')
+    # An unrestricted implicit comparison whose derivatives cannot be represented (exec not proven, or inside a
+    # block) is refused instead of being sampled at level zero, which would pick a different mip.
+    for label, setup in (('exec uncertain', lambda st: setattr(st, 'exec_known', False)),
+                         ('inside a block', lambda st: st.blocks.append(None))):
+        original = G.Stage.image_compare
+
+        def patched(self, ops, mods, how, setup=setup, original=original):
+            saved = (self.exec_known, list(self.blocks))
+            setup(self)
+            try:
+                return original(self, ops, mods, how)
+            finally:
+                self.exec_known, self.blocks[:] = saved
+        G.Stage.image_compare = patched
+        try:
+            refused('c', 'implicit derivatives')
+            refused('c_nsa', 'implicit derivatives')
+            check_call(pipeline('c_max0').hlsl_ps(), 'SampleCmpLevelZero', 'v1', 'v2', 'v0')
+        finally:
+            G.Stage.image_compare = original
+        print('unrestricted implicit comparison refused when %s; proven MAX_LOD 0 kept' % label)
     assert 'Texture2D<float4> r0' in lz.hlsl_ps() and 'srv 0 tex2d table 0 0' in lz.manifest()
     assert manifest_samplers(lz) == ['smpc 0 0x%x 0x0 0x0 0x0' % (POINT | LESS)], manifest_samplers(lz)
     print('lz: reference v0 at (v1, v2); NSA reference v3 at (v0, v1); c uses SampleCmp; sampler smpc')

@@ -796,8 +796,12 @@ class Stage:
         max_lod = (words[1] >> 12) & 0xfff
         if how == 'c' and max_lod not in (0, 0xfff):
             raise Unsupported('%s with a sampler MAX_LOD of %#x' % (base, max_lod))
-        # Implicit derivatives exist only in a pixel stage, as for image_sample.
-        if how == 'c' and max_lod and self.exec_known and self.kind == 'ps' and len(self.blocks) == 0:
+        # Implicit derivatives exist only in a pixel stage with a known exec outside any block, as for image_sample.
+        # Where they cannot be represented, level zero would silently pick a different mip when the sampler does not
+        # limit the LOD, so that form is refused; a proven MAX_LOD of 0 is exactly level zero.
+        if how == 'c' and max_lod:
+            if not (self.exec_known and self.kind == 'ps' and len(self.blocks) == 0):
+                raise Unsupported('%s with implicit derivatives that cannot be represented here (unrestricted MAX_LOD)' % base)
             call = '%s.SampleCmp(%s)' % (tex, args)
         else:
             call = '%s.SampleCmpLevelZero(%s)' % (tex, args)
