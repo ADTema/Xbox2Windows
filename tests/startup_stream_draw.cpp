@@ -57,6 +57,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(list, 25, arg(pso));
     invoke(list, 12, 3, 1);
+    if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
+        extern int draw_address_srvs(ID3D12Device*, void*, void*);
+        if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
+    }
     invoke(list, 9);
     invoke(queue, 10, 1, arg(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), 1)))) return 24;
