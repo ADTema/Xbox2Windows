@@ -164,7 +164,7 @@ def check_cmp_modes(native_path, lifted_path, harness_path):
     for quirk, name in CMP_QUIRKS:
         mode = ref.Mode(ref.RN, True, False) if quirk == "ignore_daz" else ref.DEFAULT_MODE
         caught = sum(
-            cmp_reference(name, a, b, mode, quirk) != seen[(name, mode.rc, mode.daz, mode.ftz, idx)]
+            cmp_reference(name, a, b, mode, quirk=quirk) != seen[(name, mode.rc, mode.daz, mode.ftz, idx)]
             for idx, (a, b) in enumerate(pairs))
         if not caught:
             raise AssertionError(f"reference quirk {quirk} on {name} [{mode.label()}] was never detected")
