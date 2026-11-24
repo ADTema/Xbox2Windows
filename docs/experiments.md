@@ -5979,6 +5979,8 @@ by exactly that increment. The fixture does not require a non-zero GPU start for
 heap: the local hardware reports zero, while WARP mirrors the CPU address. Only shader-visible
 heaps are required to have a GPU start and are passed to `SetDescriptorHeaps`.
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) reports a non-zero GPU start for the non-visible heaps too: `0x28cc499e00000140` for the 16-descriptor CBV/SRV/UAV heap and `0x28cc49a100000011` for the 8-descriptor sampler heap, with increments of 64 and 16 bytes. Three behaviours are therefore observed for that field so far - zero on the local NVIDIA hardware, the CPU address on WARP, and a tagged non-zero address here - which is why the fixture must not require a particular value for it.
+
 The CBV, SRV, UAV and sampler descriptors are first written into the non-visible heaps at
 slots 2, 6, 11 and 1. `CopyDescriptors` copies the CBV and SRV with two explicit ranges;
 `CopyDescriptorsSimple` copies the UAV and the sampler. The destination slots are 5, 9, 13 and
