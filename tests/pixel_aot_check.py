@@ -11252,7 +11252,7 @@ F16_TO_INT_U16_VALUES = (
     0x3c00, 0x3e00, 0x4100, 0x4900,              # 1, 1.5, 2.5, 10
     0x63ff, 0x6400, 0x67ff, 0x6800,              # 1023.5, 1024, 2047, 2048
     0x5bff, 0x7400, 0x77ff, 0x7800,              # 255.875, 16384, 32752, 32768 (above the signed limit)
-    0x7801, 0x7bfd, 0x7bfe, 0x7bff,              # 32800, 65472 and 65504: the largest values below 65536
+    0x7801, 0x7bf0, 0x7bfe, 0x7bff,              # 32800, 65024, 65472 and 65504: the largest values below 65536
 )
 F16_TO_INT_I16_VALUES = (
     0x0000, 0x8000, 0xb800, 0x3800,              # +0, -0, -0.5 and 0.5: 0
@@ -11438,6 +11438,10 @@ def check_f16_to_int_mutation_coverage():
     for kind, index in F16_TO_INT_PROGRAMS:
         words = f16_to_int_expected(kind, index)
         assert len(words) == 4 and None not in words, (kind, index)
+        # write_case stores each expected word as a binary32, which quiets a signaling NaN pattern and would turn a
+        # correct export into a mismatch; no expected word may be one.
+        for word in words:
+            assert not (word & 0x7f800000 == 0x7f800000 and word & 0x7fffff and not word & 0x400000), (kind, index, hex(word))
     for mutation in F16_TO_INT_MUTATIONS:
         key = f16_to_int_detecting_program(mutation)
         f16_to_int_mutated(mutation, f16_to_int_program(*key))
