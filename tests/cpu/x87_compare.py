@@ -353,7 +353,7 @@ def check_rejections():
         "f2xm1": (attempt(f"{fld} d9 f0 dd d8 c3"), "unsupported x87 operation"),
         "fptan": (attempt(f"{fld} d9 f2 dd d8 c3"), "unsupported x87 operation"),
         "frstor m108": (attempt(f"{fld} dd 21 dd d8 c3"), "unsupported x87 operation"),
-        "fnstsw m16": (attempt(f"{fld} dd 3a dd d8 c3"), "unsupported x87 operand"),
+        "fnstsw m16": (attempt(f"{fld} dd 3a dd d8 c3"), "stores status-word bits"),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:
