@@ -2789,6 +2789,10 @@ The store profile accepts these unsigned 32-bit vector operations on known words
 |---|---|
 | `v_and_b32_e32 vD, a, vB` | `a & b` |
 | `v_lshrrev_b32_e32 vD, a, vB` | `b >> (a & 31)`, logical |
+| `v_lshlrev_b32_e32 vD, a, vB` | `b << (a & 31)`, on a known word that is not a dispatch index |
+| `v_ashrrev_i32_e32 vD, a, vB` | `b >> (a & 31)`, arithmetic: the sign bit fills from the left |
+| `v_sub_nc_u32_e32 vD, a, vB` | `a - b`, modulo 2^32 |
+| `v_subrev_nc_u32_e32 vD, a, vB` | `b - a`, modulo 2^32 |
 | `v_mad_u32_u24 vD, a, b, c` | `(a & 0xffffff) * (b & 0xffffff) + c`, modulo 2^32 |
 | `v_min_u32_e32 vD, a, vB` | unsigned minimum |
 | `v_mul_lo_u32 vD, a, b` | low 32 bits of `a * b` |
@@ -2797,7 +2801,7 @@ A source is a VGPR, an SGPR that holds a known word, an integer inline constant 
 
 Results are data only. They can be stored or copied, but they cannot form a store or read address. A result or a word read from t0 is also rejected as a lane-guard compare operand. These instructions leave `vcc` intact, so the guard compare stays valid. A result written under the guard is unknown after the restore, like any other register.
 
-Anything else stops the lowering at that instruction, with the instruction in the error. This includes signed and other operations (`v_min_i32`, `v_max_u32`, `v_ashrrev_i32`, `v_or_b32`, `v_mad_i32_i24`), carry forms that write `vcc` (`v_add_co_u32`), 16-bit, 64-bit and SDWA forms, register ranges, an SGPR as a VOP2 second source, and output modifiers such as `clamp`.
+Anything else stops the lowering at that instruction, with the instruction in the error. This includes signed and other operations (`v_min_i32`, `v_max_u32`, `v_or_b32`, `v_mad_i32_i24`), carry forms that write `vcc` (`v_add_co_u32`), 16-bit, 64-bit and SDWA forms, register ranges, an SGPR as a VOP2 second source, and output modifiers such as `clamp`.
 
 The fixture is unchanged LLVM 15 code generator output for an original `amdgpu_cs` source, with the read bindings and `cap = params[0].y`:
 
@@ -2821,6 +2825,10 @@ first multiplicand and bit 25 in the second. It enables lane zero only and
 sets the cap to UINT_MAX. The full 320-word readback requires word 0 to be
 `0x0df050e1` with all other words unchanged. Removing source truncation
 individually yields `0xfef050e1` and `0xeff050e1`; each must fail at word 0.
+
+#### Shift and subtract chain
+
+A `v_lshlrev_b32` of a dispatch index is still the byte offset of a store or read address. Of any other known word, it is data. A second Windows fixture chains the four new operations on the product of the fixture above: the product is shifted left by 17 so that its bit 14 becomes the sign bit, shifted right by 20 arithmetically, subtracted from the cap (`cap - x`), and `0x1234` is reverse-subtracted (`x - 0x1234`). The cap is `0x0badf00d`. The expected words come from a CPU model written from the instruction definitions, not from the lowering. On five groups with `n = 150`, each of these must fail at the first word where it differs: a logical instead of an arithmetic right shift (word 1), a left shift of 16, no left shift, `x - cap` instead of `cap - x`, and `0x1234 - x` instead of `x - 0x1234`. So must recompiled HLSL with a logical right shift, a left shift of 16, the cap subtraction replaced by `0u -`, or the `0x1234` replaced by zero. The Windows run is the `draw-guard-read` entry. Without a Windows GPU, only the exact-text and rejection checks run: shifting an unknown VGPR, a source or destination outside the profile, an SGPR as the second source of `v_sub_nc_u32`, a register range and an output modifier each stop the lowering.
 
 #### Guarded full-width integer multiply
 
