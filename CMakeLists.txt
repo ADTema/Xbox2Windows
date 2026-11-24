@@ -419,6 +419,15 @@ target_include_directories(startup_audio_pacing PRIVATE src)
 target_link_libraries(startup_audio_pacing PRIVATE ole32)
 add_test(NAME startup_audio_pacing COMMAND startup_audio_pacing)
 set_tests_properties(startup_audio_pacing PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
+# Voice-lifecycle control: one client, two explicit providers (a diagnostic recorder and the system
+# XAudio2 called directly), verifying the diagnostic window observes the same lifecycle before any
+# timing number from it is used.
+add_executable(startup_audio_provider tests/startup_audio_provider.cpp)
+target_compile_features(startup_audio_provider PRIVATE cxx_std_17)
+target_include_directories(startup_audio_provider PRIVATE src)
+target_link_libraries(startup_audio_provider PRIVATE ole32 xaudio2)
+add_test(NAME startup_audio_provider COMMAND startup_audio_provider)
+set_tests_properties(startup_audio_provider PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 target_compile_features(startup_dump_fence_check PRIVATE cxx_std_17)
 target_include_directories(startup_dump_fence_check PRIVATE src)
 target_link_libraries(startup_dump_fence_check PRIVATE d3d12 dxgi)
