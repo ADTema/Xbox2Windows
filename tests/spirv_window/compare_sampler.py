@@ -113,6 +113,178 @@ EXPECTED = [0x3f800000, 0x00000000, 0x3ec00000] + [0xc5c5c5c5] * 13
 EXPECTED_LAYER1 = [0x3f800000, 0x3f800000, 0x3ea00000] + [0xc5c5c5c5] * 13
 
 
+# ---- Gather fixtures whose four returned values are read back (Windows stage only) -------------------------
+# A source-built 2x2 case: t0 is a depth-like R32_FLOAT texture, t1 an R32G32_FLOAT texture. Texels are given
+# by (x, y) with y growing downwards; every texel differs in each texture and R differs from G in t1.
+#   t0 depth:   (0,0)=0.5    (1,0)=0.75   (0,1)=0.25   (1,1)=1.0
+#   t1 (R, G):  (0,0)=(0.125, 0.5)  (1,0)=(0.25, 0.875)  (0,1)=(0.375, 0.0625)  (1,1)=(0.625, 0.75)
+# Every value is a binary fraction, so the float bits are exact. B and A of an R32G32 texel read as 0 and 1.
+DEPTH_TEXELS = {(0, 0): 0.5, (1, 0): 0.75, (0, 1): 0.25, (1, 1): 1.0}
+VALUE_TEXELS = {(0, 0): (0.125, 0.5), (1, 0): (0.25, 0.875), (0, 1): (0.375, 0.0625), (1, 1): (0.625, 0.75)}
+# Gather returns x, y, z, w from the texels (0,1), (1,1), (1,0), (0,0): bottom-left, bottom-right, top-right,
+# top-left of the footprint (the order D3D12 and Vulkan share). The coordinate (0.5, 0.5) is the corner shared
+# by the four texels of the 2x2 texture: 0.5 * 2 - 0.5 = 0.5, whose floor 0 starts the footprint at texel 0.
+GATHER_ORDER = ((0, 1), (1, 1), (1, 0), (0, 0))
+GATHER_GUARD = 0xc5c5c5c5
+# (name, OpImageGather component or None, OpImageDrefGather reference or None). The component picks the
+# value texture's channel, the reference is compared with the depth texels by the s2 LESS_EQUAL sampler
+# (the comparison passes when reference <= texel). A reference between the texels gives a 0/1 pattern.
+GATHER_CASES = (("gather_green", 1, None), ("gather_red", 0, None),
+                ("compare_gather_ref_0375", None, 0.375), ("compare_gather_ref_0875", None, 0.875),
+                ("gather_green_and_compare_ref_0375", 1, 0.375))
+
+
+def gather_case_module(component=None, reference=None):
+    """The base module (two comparison samples at words 0-1) with gathers that store all four returned values.
+
+    A plain gather replaces the ordinary sample and fills words 2-5; a comparison gather on the depth texture
+    follows (words 3-6 beside the ordinary sample at word 2, words 6-9 after a plain gather).
+    """
+    assert component is not None or reference is not None
+    types = ("%type_sampled_image = OpTypeSampledImage %type_2d_image\n"
+             "%float_0_5 = OpConstant %float 0.5\n"
+             "%gather_uv = OpConstantComposite %v2float %float_0_5 %float_0_5\n"
+             + "".join(f"%uint_{word} = OpConstant %uint {word}\n" for word in range(3, 10)))
+    if component is not None:
+        types += f"%gather_component = OpConstant %int {component}\n"
+    if reference is not None:
+        types += f"%gather_ref = OpConstant %float {reference}\n"
+
+    text = substitute(SHARED, "%type_sampled_image = OpTypeSampledImage %type_2d_image\n", types)
+    after = ""
+    next_word = 3
+    if component is not None:
+        text = substitute(text, ORDINARY_SAMPLE, "%43 = OpImageGather %v4float %42 %gather_uv %gather_component")
+        # Word 2 keeps the base module's extract and store of component 0 of the result; words 3-5 follow.
+        after += "".join(f"%pg_e{k} = OpCompositeExtract %float %43 {k}\n"
+                         f"%pg_p{k} = OpAccessChain %_ptr_StorageBuffer_float %results %int_0 %uint_{2 + k}\n"
+                         f"OpStore %pg_p{k} %pg_e{k}\n" for k in range(1, 4))
+        next_word = 6
+    if reference is not None:
+        after += ("%cg_image = OpSampledImage %type_sampled_image %32 %33\n"
+                  "%cg_result = OpImageDrefGather %v4float %cg_image %gather_uv %gather_ref\n")
+        after += "".join(f"%cg_e{k} = OpCompositeExtract %float %cg_result {k}\n"
+                         f"%cg_p{k} = OpAccessChain %_ptr_StorageBuffer_float %results %int_0 %uint_{next_word + k}\n"
+                         f"OpStore %cg_p{k} %cg_e{k}\n" for k in range(4))
+    return substitute(text, "OpStore %45 %44", "OpStore %45 %44\n" + after)
+
+
+def float_bits(value):
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def model_gather(component):
+    """The four words of a plain gather: channel `component` of the value texels in GATHER_ORDER."""
+    return [float_bits((*VALUE_TEXELS[texel], 0.0, 1.0)[component]) for texel in GATHER_ORDER]
+
+
+def model_gather_cmp(reference):
+    """The four words of a comparison gather: 1.0 where reference <= depth texel (LESS_EQUAL), else 0.0."""
+    return [float_bits(1.0 if reference <= DEPTH_TEXELS[texel] else 0.0) for texel in GATHER_ORDER]
+
+
+def model_words(component=None, reference=None):
+    """All 16 readback words of a gather case from its parameters, without looking at any module."""
+    words = [GATHER_GUARD] * 16
+    words[0] = float_bits(1.0 if 0.25 <= DEPTH_TEXELS[(0, 0)] else 0.0)
+    words[1] = float_bits(1.0 if 0.75 <= DEPTH_TEXELS[(0, 0)] else 0.0)
+    # The ordinary sample at (0.25, 0.25) point-samples texel (0,0): its R channel.
+    words[2] = float_bits(VALUE_TEXELS[(0, 0)][0])
+    next_word = 3
+    if component is not None:
+        words[2:6] = model_gather(component)
+        next_word = 6
+    if reference is not None:
+        words[next_word:next_word + 4] = model_gather_cmp(reference)
+    return words
+
+
+def case_file(expected):
+    """What the host reads for the gather variant: the 16 expected words, then t0 (4 floats) and t1 (4 R, G pairs)."""
+    texels = [DEPTH_TEXELS[(x, y)] for y in range(2) for x in range(2)]
+    texels += [channel for y in range(2) for x in range(2) for channel in VALUE_TEXELS[(x, y)]]
+    return struct.pack("<16I", *expected) + struct.pack("<12f", *texels)
+
+
+def readback_mismatches(expected, actual):
+    """The lines the host prints for words that differ (the check the Windows stage makes on the readback)."""
+    return [f"word={i} expected={e:08x} actual={a:08x}" for i, (e, a) in enumerate(zip(expected, actual)) if e != a]
+
+
+def module_parameters(assembly):
+    """The component and comparison reference a gather module really contains, read from its text."""
+    def constant(name, kind):
+        found = re.search(rf"^\s*{re.escape(name)} = OpConstant %{kind} (\S+)$", assembly, re.M)
+        assert found, name
+        return found[1]
+    gather = re.search(r"OpImageGather %v4float %\w+ %gather_uv (%\w+)", assembly)
+    compare = re.search(r"OpImageDrefGather %v4float %\w+ %gather_uv (%\w+)", assembly)
+    assert re.search(r"^\s*%gather_uv = OpConstantComposite %v2float %float_0_5 %float_0_5$", assembly, re.M)
+    assert constant("%float_0_5", "float") == "0.5"
+    return (int(constant(gather[1], "int")) if gather else None,
+            float(constant(compare[1], "float")) if compare else None)
+
+
+def gather_module_mismatches(assembly, expected):
+    """Expected words against what the module's own gather instructions should read back."""
+    component, reference = module_parameters(assembly)
+    return readback_mismatches(expected, model_words(component, reference))
+
+
+def gather_readback_controls():
+    # Hand arithmetic. Order x, y, z, w = texels (0,1), (1,1), (1,0), (0,0).
+    #   Red   0.375, 0.625, 0.25, 0.125  = 3ec00000 3f200000 3e800000 3e000000
+    #   Green 0.0625, 0.75, 0.875, 0.5   = 3d800000 3f400000 3f600000 3f000000
+    #   Blue  0, 0, 0, 0 (missing channel)   Alpha 1, 1, 1, 1 (missing channel)
+    #   Reference 0.375 <= (0.25, 1.0, 0.75, 0.5): 0, 1, 1, 1      Reference 0.875 <= same: 0, 1, 0, 0
+    #   Word 0: 0.25 <= 0.5 passes = 1.0; word 1: 0.75 <= 0.5 fails = 0; ordinary sample at texel (0,0) R = 0.125
+    guard = [GATHER_GUARD]
+    one, zero = 0x3f800000, 0
+    assert model_words(component=1) == [one, zero, 0x3d800000, 0x3f400000, 0x3f600000, 0x3f000000] + guard * 10
+    assert model_words(component=0) == [one, zero, 0x3ec00000, 0x3f200000, 0x3e800000, 0x3e000000] + guard * 10
+    assert model_words(component=2)[2:6] == [zero] * 4 and model_words(component=3)[2:6] == [one] * 4
+    assert model_words(reference=0.375) == [one, zero, 0x3e000000, zero, one, one, one] + guard * 9
+    assert model_words(reference=0.875) == [one, zero, 0x3e000000, zero, one, zero, zero] + guard * 9
+    assert model_words(1, 0.375) == [one, zero, 0x3d800000, 0x3f400000, 0x3f600000, 0x3f000000,
+                                     zero, one, one, one] + guard * 6
+    # Every texel differs, in each channel that is read, so a wrong texel or a wrong order shows.
+    assert len(set(DEPTH_TEXELS.values())) == 4
+    for channel in (0, 1):
+        assert len({texel[channel] for texel in VALUE_TEXELS.values()}) == 4
+    assert all(texel[0] != texel[1] for texel in VALUE_TEXELS.values())
+    assert len(case_file(model_words(component=1))) == 16 * 4 + 12 * 4
+    # The comparison patterns are not symmetric: reversing them, swapping rows or swapping columns changes them.
+    for reference in (0.375, 0.875):
+        pattern = model_gather_cmp(reference)
+        for other in (pattern[::-1], [pattern[3], pattern[2], pattern[1], pattern[0]],
+                      [pattern[1], pattern[0], pattern[3], pattern[2]]):
+            assert other != pattern, reference
+    # Each case's module holds the parameters its expectation was modelled from.
+    for name, component, reference in GATHER_CASES:
+        assembly = gather_case_module(component, reference)
+        assert module_parameters(assembly) == (component, reference), name
+        assert gather_module_mismatches(assembly, model_words(component, reference)) == [], name
+        assert split_comparison_sampler(assembly, ORDINARY_BINDING)[1]["ordinary_binding"] == ORDINARY_BINDING, name
+    # Negative controls. A module that gathers component 2 (Blue) or 0 (Red) where Green is expected, and one
+    # that compares against another reference, do not match the original expectation: the check names the
+    # words and the host would print the same lines.
+    green, red = model_words(component=1), model_words(component=0)
+    for wrong in (0, 2, 3):
+        words = gather_module_mismatches(gather_case_module(component=wrong), green)
+        assert [line.split()[0] for line in words] == [f"word={i}" for i in range(2, 6)], (wrong, words)
+    assert gather_module_mismatches(gather_case_module(component=0), red) == []
+    assert gather_module_mismatches(gather_case_module(component=0), green) == readback_mismatches(green, red)
+    assert readback_mismatches(green, red)[0] == "word=2 expected=3d800000 actual=3ec00000"
+    for expected in ([*green[:2], *green[2:6][::-1], *green[6:]], [*green[:2], *red[2:6], *green[6:]]):
+        assert gather_module_mismatches(gather_case_module(component=1), expected), expected
+    low, high = model_words(reference=0.375), model_words(reference=0.875)
+    assert gather_module_mismatches(gather_case_module(reference=0.875), low) == [
+        "word=5 expected=3f800000 actual=00000000", "word=6 expected=3f800000 actual=00000000"]
+    assert gather_module_mismatches(gather_case_module(reference=0.375), high) == [
+        "word=5 expected=00000000 actual=3f800000", "word=6 expected=00000000 actual=3f800000"]
+    assert gather_module_mismatches(gather_case_module(reference=0.375), low) == []
+
+
 def rejected(assembly, binding, reason):
     try:
         split_comparison_sampler(assembly, binding)
@@ -279,6 +451,7 @@ def gather_controls():
 
 def controls(directory):
     gather_controls()
+    gather_readback_controls()
     lowered, mapping = split_comparison_sampler(SHARED, ORDINARY_BINDING)
     assert mapping == {"descriptor_set": 0, "comparison_binding": 2, "ordinary_binding": ORDINARY_BINDING}, mapping
     # A Texture3D value image with a float3 coordinate splits like the 2D module: same mapping, only the
@@ -415,7 +588,8 @@ def detected(check, *arguments):
 
 
 # Modules with a comparison gather. Their HLSL needs GatherCmp, which older SPIRV-Cross refuses to write.
-COMPARISON_GATHER_MODULES = {"lowered_dref_gather", "lowered_gather_both", "unsplit_dref_gather"}
+COMPARISON_GATHER_MODULES = {"lowered_dref_gather", "lowered_gather_both", "unsplit_dref_gather",
+                             *(f"lowered_g4_{name}" for name, _, reference in GATHER_CASES if reference is not None)}
 NO_GATHER_CMP = "GatherCmp does not exist in HLSL"
 
 
@@ -446,7 +620,10 @@ def emit(directory, assembler, validator, cross):
                            ("lowered_gather_both", split_comparison_sampler(SHARED_GATHER_BOTH, ORDINARY_BINDING)[0]),
                            ("unsplit_dref_gather", DREF_GATHER_ONLY),
                            *((f"lowered_{name}", split_comparison_sampler(module, ORDINARY_BINDING)[0])
-                             for name, module in gathers)):
+                             for name, module in gathers),
+                           *((f"lowered_g4_{name}",
+                              split_comparison_sampler(gather_case_module(component, reference), ORDINARY_BINDING)[0])
+                             for name, component, reference in GATHER_CASES)):
         text = directory / f"{name}.spvasm"
         text.write_text(assembly, encoding="utf-8")
         module = directory / f"{name}.spv"
@@ -502,6 +679,14 @@ def emit(directory, assembler, validator, cross):
         check_gather_hlsl(outputs["lowered_gather_both"].read_text(encoding="utf-8"), "GatherRed", comparison_gather=True)
     for n, name in enumerate(GATHER_NAMES):
         check_gather_hlsl(outputs[f"lowered_gather_{n}"].read_text(encoding="utf-8"), name)
+    # The gather cases that are read back: the plain gather reads its component on the plain sampler, a
+    # comparison gather is GatherCmp on the comparison sampler (those two have no HLSL on an old SPIRV-Cross).
+    for name, component, reference in GATHER_CASES:
+        if f"lowered_g4_{name}" not in outputs:
+            continue
+        check_gather_hlsl(outputs[f"lowered_g4_{name}"].read_text(encoding="utf-8"),
+                          GATHER_NAMES[component] if component is not None else "SampleLevel",
+                          comparison_gather=reference is not None)
     # Not split: the same gather on the comparison sampler is what the check rejects, and a module with no
     # ordinary use keeps its comparison gather and plain sample untouched.
     detected(check_gather_hlsl, outputs["shared_gather"].read_text(encoding="utf-8"), "GatherGreen")
@@ -537,11 +722,20 @@ def compile_dxil(directory, dxc, outputs):
     if shared.returncode == 0 or "no matching member function for call to 'SampleLevel'" not in shared.stderr:
         raise AssertionError(f"Expected the Texture3D shared-sampler DXC diagnostic\n{shared.stdout}\n{shared.stderr}")
     print("Texture3D shared-sampler HLSL: DXC rejected SampleLevel as expected", flush=True)
+    # The gather modules are required here: with this path DXC must accept them, so a module whose HLSL
+    # SPIRV-Cross could not write (no GatherCmp in an older one) fails instead of being skipped as on Linux.
+    gather_modules = ["lowered_gather", "lowered_dref_gather", "lowered_gather_both",
+                      *(f"lowered_gather_{n}" for n in range(4)), *(f"lowered_g4_{name}" for name, _, _ in GATHER_CASES)]
+    missing = [name for name in gather_modules if name not in outputs]
+    if missing:
+        raise AssertionError(f"No HLSL for {missing}: the DXC path needs a SPIRV-Cross that writes GatherCmp")
     dxil = {}
-    for name in ("lowered", "lowered_lod1", "lowered_lod075", "lowered_lod_computed", "lowered_volume", "lowered_array", "lowered_array_layer1", "lowered_multi", "lowered_multi_swapped"):
+    for name in ("lowered", "lowered_lod1", "lowered_lod075", "lowered_lod_computed", "lowered_volume", "lowered_array", "lowered_array_layer1", "lowered_multi", "lowered_multi_swapped",
+                 *gather_modules):
         dxil[name] = directory / f"{name}.dxil"
         subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", dxil[name], outputs[name]], check=True)
-    print("DXC compiled the lowered module and both arrayed lowered modules (layers 0 and 1)", flush=True)
+    print("DXC compiled the lowered module, both arrayed lowered modules (layers 0 and 1) and "
+          f"{len(gather_modules)} gather modules (plain and comparison)", flush=True)
     return dxil
 
 
@@ -636,11 +830,37 @@ DRAWS = [
 ]
 
 
+def gather_draw(name, component, reference, expected_component, expected_reference):
+    """One gather case; the expectation may be modelled from other parameters than the module's (a control)."""
+    module = f"lowered_g4_{[n for n, c, r in GATHER_CASES if (c, r) == (component, reference)][0]}"
+    actual = model_words(component, reference)
+    expected = model_words(expected_component, expected_reference)
+    return (name, module, "gather", expected, readback_mismatches(expected, actual))
+
+
+# The gathers are read back from source-built 2x2 textures (see case_file), all four returned values per case.
+# The controls model the expectation from a wrong component or reference and expect exactly the words that differ.
+GATHER_DRAWS = [
+    gather_draw("gather green", 1, None, 1, None),
+    gather_draw("gather red", 0, None, 0, None),
+    gather_draw("gather green vs red expectation", 1, None, 0, None),
+    # The right words in the wrong order (texel order reversed) differ at every gathered word.
+    ("gather green vs reversed order expectation", "lowered_g4_gather_green", "gather",
+     [*model_words(component=1)[:2], *model_words(component=1)[2:6][::-1], *model_words(component=1)[6:]],
+     readback_mismatches([*model_words(component=1)[:2], *model_words(component=1)[2:6][::-1],
+                          *model_words(component=1)[6:]], model_words(component=1))),
+    gather_draw("compare gather ref 0.375", None, 0.375, None, 0.375),
+    gather_draw("compare gather ref 0.875", None, 0.875, None, 0.875),
+    gather_draw("compare gather ref 0.375 vs ref 0.875 expectation", None, 0.375, None, 0.875),
+    gather_draw("gather green and compare gather", 1, 0.375, 1, 0.375),
+]
+
+
 def draw(directory, dxil, renderer, adapter):
     reference = directory / "reference.bin"
-    for name, module, variant, expected, mismatches in [*DRAWS, *VOLUME_DRAWS, *MULTI_DRAWS]:
+    for name, module, variant, expected, mismatches in [*DRAWS, *VOLUME_DRAWS, *MULTI_DRAWS, *GATHER_DRAWS]:
         registers = ",".join(map(str, MULTI_BINDINGS)) if variant.startswith("multi") else str(ORDINARY_BINDING)
-        reference.write_bytes(struct.pack("<16I", *expected))
+        reference.write_bytes(case_file(expected) if variant == "gather" else struct.pack("<16I", *expected))
         run = subprocess.run([renderer, adapter, "--spirv-compare-sampler", dxil[module], registers,
                               reference, variant], capture_output=True, text=True)
         print(f"[{name}]", run.stdout, run.stderr, flush=True)
@@ -655,6 +875,8 @@ def draw(directory, dxil, renderer, adapter):
           f"s{ORDINARY_BINDING} changes only word 2", flush=True)
     print("Texture2DArray: layer 0 and layer 1 each read their own texels (layer 1 vs layer 0 differs at words 1-2); "
           f"on layer 1, s2 changes only words 0-1 and s{ORDINARY_BINDING} only word 2 (layer 1's mip 1)", flush=True)
+    print("gathers: all four returned values of a plain gather and of a comparison gather are read back from 2x2 "
+          "textures; a wrong component or reference differs at exactly the modelled words", flush=True)
     print("Texture3D: the ordinary sample reads slice 1 (a slice 0 reference differs at word 2 only); "
           "s2 changes only words 0-1 and the ordinary sampler's MinLOD 1 only word 2", flush=True)
     return 0

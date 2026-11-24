@@ -7306,9 +7306,35 @@ while both `SampleCmpLevelZero` calls stay on s2; components 0 to 3 give `Gather
 `GatherBlue` and `GatherAlpha`. A module with a comparison `OpImageDrefGather` and an ordinary sample is split
 for the sample only (`GatherCmp` stays on s2), and one with no ordinary use is returned unchanged. The same
 gather left on the comparison sampler (the unsplit module) is rejected by the HLSL check, and the refusals above
-each have a negative control. Not run here: the Windows stage. The WARP draw does not read gathered texels: the
-existing fixture's textures are not extended, so a gather that read the wrong component or texel would not be
-caught by it; DXC acceptance of the gather calls is not checked either (`spirv_compare_sampler_warp`).
+each have a negative control. These Linux checks cannot show DXC acceptance or the order of the readback.
+
+On the Windows path (when DXC is given) the gathers are required, not skipped. DXC must compile the plain gathers
+(`lowered_gather`, the four components), the comparison gather (`lowered_dref_gather`), the module holding both
+(`lowered_gather_both`) and the cases below as `cs_6_0`; a module whose HLSL an older SPIRV-Cross could not
+write (no `GatherCmp`) fails there, while on Linux the same module only skips its HLSL checks. The WARP draw then
+reads back all four returned values of five cases from a source-built 2x2 fixture: a depth-like `R32_FLOAT` t0
+with texels (x, y) (0,0) 0.5, (1,0) 0.75, (0,1) 0.25, (1,1) 1.0 and an `R32G32_FLOAT` t1 with (R, G) (0,0)
+(0.125, 0.5), (1,0) (0.25, 0.875), (0,1) (0.375, 0.0625), (1,1) (0.625, 0.75), so every texel differs and R
+differs from G. The case file passes the texels and the expected words to the host, the point sampler clamps and
+the gather coordinate is (0.5, 0.5), the corner shared by the four texels. A gather returns the texels (0,1),
+(1,1), (1,0), (0,0), the bottom-left to top-left order that D3D12 and Vulkan share (stated from memory of the
+specification, not checked on a GPU here). Expected words (guards 0xc5c5c5c5 after them; words 0 and 1 stay the two
+comparison samples, 1.0 and 0.0):
+
+- Green (component 1), words 2-5: 3d800000 3f400000 3f600000 3f000000 (0.0625, 0.75, 0.875, 0.5); Red (component 0):
+  3ec00000 3f200000 3e800000 3e000000 (0.375, 0.625, 0.25, 0.125).
+- Comparison gather, reference 0.375 against 0.25, 1.0, 0.75, 0.5 (passes when reference <= texel): 0, 1, 1, 1 at
+  words 3-6 (word 2 is the ordinary sample, 0.125). Reference 0.875: 0, 1, 0, 0. Both kinds in one module put the
+  Green gather at words 2-5 and the 0.375 comparison gather at words 6-9.
+
+A Python model derives these words from the component and reference alone; the Linux test checks it against the
+hand arithmetic above, reads the parameters back out of each generated module and shows that a module gathering
+component 0, 2 or 3 does not match the Green words, that a different reference differs at words 5 and 6, and that
+a reversed order or the Red words are rejected. The Windows stage repeats the controls against the readback: a
+Green gather checked against the Red words, a 0.375 comparison checked against the 0.875 words and Green words
+in reversed order each report exactly the modelled mismatching words. Not run here: that Windows stage
+(`spirv_compare_sampler_warp`); no DXC, D3D12 or WARP was available, so DXC acceptance of the gather calls, the
+gather order on a real adapter and the host change itself (checked only by a MinGW syntax check) are unconfirmed.
 
 The Linux check `python3 -B tests/spirv_window/check.py` generates four more
 variants, `Texture1D`, `Texture1DArray`, `TextureCube` and `TextureCubeArray`.
