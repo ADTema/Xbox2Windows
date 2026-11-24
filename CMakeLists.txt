@@ -1881,10 +1881,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     set(cpu_xsave_state_original_exports
         "op_xrstor_xsave,op_xrstor64_xsave64,op_xrstor_xsave64,op_xrstor64_xsave,"
         "op_xrstor64_disp,op_xrstor64_mask_sse,op_vzeroupper_xsave64,op_pipeline,"
-        "op_discarded_read")
+        "op_discarded_read,op_xrstor64_xsavec,op_xrstor64_xsavec64,"
+        "op_xrstor64_xsavec64_sse,op_xrstor64_xsavec64_x87_avx,op_xsavec64_dynmask")
     string(CONCAT cpu_xsave_state_original_exports ${cpu_xsave_state_original_exports})
     set(cpu_xsave_state_altered_exports
-        "op_xrstor64_xsave64,op_xrstor_xsave64,op_xrstor64_disp,op_pipeline")
+        "op_xrstor64_xsave64,op_xrstor_xsave64,op_xrstor64_disp,op_pipeline,"
+        "op_xrstor64_xsavec64,op_xrstor64_xsavec64_sse")
     string(CONCAT cpu_xsave_state_altered_exports ${cpu_xsave_state_altered_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_xsave_state_${variant} xsave_state)
