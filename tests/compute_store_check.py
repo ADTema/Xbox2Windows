@@ -365,6 +365,7 @@ def controls():
     alu_controls()
     f32_controls()
     scalar_alu_controls()
+    salu_i32_controls()
     mbcnt_controls()
     bcnt_exec_controls()
     vadd_nc_i32_controls()
@@ -2193,6 +2194,175 @@ def scalar_alu_controls():
         ("ALU expression too large", (("s_lshr_b32 s21, s20, 3", "s_lshr_b32 s21, s20, 3" + "\ns_add_u32 s21, s21, s21" * 8),)),
     ):
         rejects(message, scalar, *changes)
+
+
+SALU_I32 = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_add_i32 s16, 0x7fffffff, 1",
+    "s_add_i32 s17, s16, 0x80000000",
+    "s_add_i32 s20, s17, -15",
+    "s_sub_i32 s18, 0x80000000, 1",
+    "s_sub_i32 s19, 5, s18",
+    "s_sub_i32 s21, s19, -10",
+    "s_abs_i32 s22, 0x80000000",
+    "s_abs_i32 s24, -15",
+    "s_abs_i32 s25, 17",
+    "s_abs_i32 s26, 0",
+    "s_sub_i32 s27, s24, s25",
+    "s_add_i32 s23, s27, s26",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_nc_u32_e32 v4, s20, v3",
+    "v_add_nc_u32_e32 v5, s21, v3",
+    "v_add_nc_u32_e32 v6, s22, v3",
+    "v_add_nc_u32_e32 v7, s23, v3",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[4:7], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+SALU_I32_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+
+
+def _i32(word):
+    word &= 0xffffffff
+    return word - 0x100000000 if word >= 0x80000000 else word
+
+
+def salu_i32_words(*, sat_abs_min=False, swap_sub=False, sat_add=False):
+    """Independent RDNA2 ISA model for SALU_I32 across 64 threads (4 words per thread, 64 sentinels)."""
+    def s_add_i32(a, b):
+        s = _i32(a) + _i32(b)
+        if sat_add:
+            return max(-0x80000000, min(0x7fffffff, s)) & 0xffffffff
+        return s & 0xffffffff
+
+    def s_sub_i32(a, b):
+        return (_i32(a) - _i32(b)) & 0xffffffff
+
+    def s_abs_i32(a):
+        v = _i32(a)
+        if sat_abs_min and v == -0x80000000:
+            return 0x7fffffff
+        return (-v if v < 0 else v) & 0xffffffff
+
+    s16 = s_add_i32(0x7fffffff, 1)
+    s17 = s_add_i32(s16, 0x80000000)
+    s20 = s_add_i32(s17, -15)
+    s18 = s_sub_i32(0x80000000, 1)
+    s19 = s_sub_i32(s18, 5) if swap_sub else s_sub_i32(5, s18)
+    s21 = s_sub_i32(s19, -10)
+    s22 = s_abs_i32(0x80000000)
+    s24 = s_abs_i32(-15)
+    s25 = s_abs_i32(17)
+    s26 = s_abs_i32(0)
+    s27 = s_sub_i32(s24, s25)
+    s23 = s_add_i32(s27, s26)
+
+    words = [SENTINEL] * 320
+    for tid in range(64):
+        base = tid * 4
+        words[base + 0] = (s20 + tid) & 0xffffffff
+        words[base + 1] = (s21 + tid) & 0xffffffff
+        words[base + 2] = (s22 + tid) & 0xffffffff
+        words[base + 3] = (s23 + tid) & 0xffffffff
+    return words
+
+
+def salu_i32_controls():
+    """s_add_i32 / s_sub_i32 / s_abs_i32: exact HLSL and one refusal per unsupported operand or modifier."""
+    lines = aot.lower(SALU_I32, 64, **SALU_I32_BINDING).splitlines()
+    expected_s20 = "(((0x7fffffffu + 0x00000001u) + 0x80000000u) + 0xfffffff1u)"
+    expected_s21 = "((0x00000005u - (0x80000000u - 0x00000001u)) - 0xfffffff6u)"
+    expected_s22 = "asuint(abs(asint(0x80000000u)))"
+    expected_s23 = "((asuint(abs(asint(0xfffffff1u))) - asuint(abs(asint(0x00000011u)))) + asuint(abs(asint(0x00000000u))))"
+    assert lines[3] == (
+        f"    outputData.Store4(tid.x * 16u + 0u, uint4("
+        f"({expected_s20} + tid.x), ({expected_s21} + tid.x), ({expected_s22} + tid.x), ({expected_s23} + tid.x)));"
+    ), lines
+
+    unsupported, operand = "Unsupported compute instruction: ", "Unverified scalar ALU operand"
+    for message, changes in (
+        # Unknown or pending source:
+        (operand, (("s_add_i32 s16, 0x7fffffff, 1", "s_add_i32 s16, s30, 1"),)),
+        (operand, (("s_sub_i32 s18, 0x80000000, 1", "s_sub_i32 s18, s12, 1"),)),
+        (operand, (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, s30"),)),
+        # Invalid or pending destination:
+        (operand, (("s_add_i32 s16, 0x7fffffff, 1", "s_add_i32 s106, 0x7fffffff, 1"),)),
+        (operand, (("s_sub_i32 s18, 0x80000000, 1", "s_sub_i32 s106, 0x80000000, 1"),)),
+        (operand, (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s106, 0x80000000"),)),
+        # Source wider than 32 bits or vector source:
+        (operand, (("s_add_i32 s16, 0x7fffffff, 1", "s_add_i32 s16, 0x1ffffffff, 1"),)),
+        (unsupported + "s_add_i32", (("s_add_i32 s16, 0x7fffffff, 1", "s_add_i32 s16, v0, 1"),)),
+        (unsupported + "s_abs_i32", (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, v0"),)),
+        # Modifiers (clamp, omod, neg/abs) and other spellings / SCC consumer:
+        (unsupported + "s_add_i32", (("s_add_i32 s16, 0x7fffffff, 1", "s_add_i32 s16, 0x7fffffff, 1 clamp"),)),
+        (unsupported + "s_sub_i32", (("s_sub_i32 s18, 0x80000000, 1", "s_sub_i32 s18, 0x80000000, 1 mul:2"),)),
+        (unsupported + "s_abs_i32", (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, |s16|"),)),
+        (unsupported + "s_abs_i32", (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, -s16"),)),
+        (unsupported + "s_add_i32_e64", (("s_add_i32 s16, 0x7fffffff, 1", "s_add_i32_e64 s16, 0x7fffffff, 1"),)),
+        (unsupported + "s_abs_u32", (("s_abs_i32 s22, 0x80000000", "s_abs_u32 s22, 0x80000000"),)),
+        (unsupported + "s_cselect_b32", (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, 0x80000000\ns_cselect_b32 s22, 1, 2"),)),
+    ):
+        rejects(message, lambda *c: aot.lower(variant(SALU_I32, *c), 64, **SALU_I32_BINDING), *changes)
+    # Pending constant-buffer load as source or destination:
+    pending_cbv = variant(SALU_I32, (
+        "s_load_dwordx4 s[12:15], s[8:9], null",
+        "s_load_dwordx4 s[12:15], s[8:9], null\ns_load_dwordx4 s[4:7], s[8:9], 0x10\ns_waitcnt lgkmcnt(0)",
+    ))
+    for changes in (
+        (("s_abs_i32 s22, 0x80000000", "s_buffer_load_dword s28, s[4:7], null\ns_abs_i32 s22, s28"),),
+        (("s_abs_i32 s22, 0x80000000", "s_buffer_load_dword s22, s[4:7], null\ns_abs_i32 s22, 1"),),
+    ):
+        rejects(operand, lambda *c: aot.lower(variant(pending_cbv, *c), 64,
+                **(SALU_I32_BINDING | dict(constant_descriptor=16))), *changes)
+
+
+def salu_i32_binary(directory, assembler, objcopy, library):
+    """The assembled SALU_I32 program decodes and lowers to the same HLSL as its text."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, SALU_I32), library, offsets=True))
+    assert [line for line in decoded if line.startswith(("s_add_i32", "s_sub_i32", "s_abs_i32"))] == [
+        line for line in SALU_I32 if line.startswith(("s_add_i32", "s_sub_i32", "s_abs_i32"))], decoded
+    assert aot.lower(decoded, 64, **SALU_I32_BINDING) == aot.lower(SALU_I32, 64, **SALU_I32_BINDING)
+
+
+def salu_i32_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("salu_i32.hlsl", "salu_i32.cso", "salu_i32.case")]
+    source = aot.lower(SALU_I32, 64, **SALU_I32_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = salu_i32_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    for label, reference, word in (
+            ("INT_MIN abs saturated to INT_MAX", salu_i32_words(sat_abs_min=True), 2),
+            ("s_sub_i32 sources swapped", salu_i32_words(swap_sub=True), 1),
+            ("s_add_i32 saturated instead of wrapped", salu_i32_words(sat_add=True), 0),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"salu_i32: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("abs dropped on INT_MIN", source.replace("asuint(abs(asint(0x80000000u)))", "0x7fffffffu")),
+            ("sub turned into add", source.replace("0x00000005u - (0x80000000u - 0x00000001u)",
+                                                   "0x00000005u + (0x80000000u - 0x00000001u)")),
+            ("add turned into sub", source.replace("0x7fffffffu + 0x00000001u", "0x7fffffffu - 0x00000001u"))):
+        if mutated == source:
+            raise AssertionError(f"salu_i32: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"salu_i32: mutation '{label}' escaped detection")
+    return 0
 
 
 def assemble(directory, assembler, objcopy, lines, *, cpu="gfx1013", features=None):
@@ -4380,6 +4550,7 @@ def binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_d16_cases(), "buffer_load_")
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
+    salu_i32_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
     vadd_nc_i32_binary(directory, assembler, objcopy, library)
@@ -7700,6 +7871,7 @@ if __name__ == "__main__":
                  "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
                  "draw-cvt-u32-f32": cvt_u32_f32_draw,
                  "draw-mbcnt": mbcnt_draw,
+                 "draw-salu_i32": salu_i32_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
                  "draw-vadd_nc_i32": vadd_nc_i32_draw,
                  "draw-ff1-exec": ff1_exec_draw,
