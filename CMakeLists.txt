@@ -44,9 +44,13 @@ add_test(NAME desktop_bvh_root_flags COMMAND d3d12_sdk_check bvh-flags)
 add_executable(era_heap_check tests/era_heap_check.cpp src/era_heap.cpp)
 target_include_directories(era_heap_check PRIVATE src)
 target_compile_features(era_heap_check PRIVATE cxx_std_20)
-foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words large_alignment graphics_types)
+foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words large_alignment graphics_types
+        decode_fields)
     add_test(NAME era_heap_${scenario} COMMAND era_heap_check ${scenario})
 endforeach()
+# Negative control: expects a 13-bit object type, so the widest object type must make it fail.
+add_test(NAME era_heap_decode_fields_control COMMAND era_heap_check decode_fields_control)
+set_tests_properties(era_heap_decode_fields_control PROPERTIES WILL_FAIL TRUE)
 
 add_executable(memory_query_check tests/memory_query_check.cpp)
 target_compile_features(memory_query_check PRIVATE cxx_std_17)
