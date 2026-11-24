@@ -1338,6 +1338,32 @@ class Stage:
         # refuse it rather than emit a predicate computed from the unselected operands.
         if mods and not base.endswith('_sdwa'):
             raise Unsupported('%s with %s' % (base, mods))
+        # v_cmp_class_f32 / v_cmpx_class_f32 test the binary32 class of the value in SRC0 against the
+        # class-bit mask in SRC1 (the ISA order: the float operand first, the integer mask second).
+        if base in ('v_cmp_class_f32', 'v_cmpx_class_f32'):
+            if len(ops) == 3:
+                dst, value, mask = ops
+            elif base == 'v_cmpx_class_f32' and len(ops) == 2:
+                # The _e32 spelling writes EXEC implicitly and prints no destination.
+                dst, (value, mask) = 'exec', ops
+            else:
+                raise Unsupported('%s with %d operands' % (base, len(ops)))
+            cond = '(class32(%s) & %s) != 0u' % (self.f(value), self.u(mask))
+            predicate = '((%s) ? 1u : 0u)' % cond
+            # A narrowed EXEC must stay narrowed: intersect with it, as the generic compare path does.
+            if not self.exec_known:
+                predicate = '(exec & %s)' % predicate
+            if base == 'v_cmpx_class_f32' or dst in ('exec', 'exec_lo'):
+                self.exec_known = False
+                self.emit('exec = %s;' % predicate)
+            elif dst in ('vcc', 'vcc_lo'):
+                self.emit('vcc = %s;' % predicate)
+            else:
+                d = reg_range(dst)[1]
+                self.set_s(d, predicate)
+                self.masks.add(d)
+            return None
+
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32)(_sdwa)?', base)
         if not m:
             raise Unsupported(base)
@@ -1681,6 +1707,14 @@ class Pipeline:
                '    return ftz32(sum);',
                '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
+               'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
+               ' bool negative = bits >= 0x80000000u;'
+               ' if (magnitude > 0x7f800000u) return (bits & 0x00400000u) != 0u ? 0x2u : 0x1u;'
+               ' if (magnitude == 0x7f800000u) return negative ? 0x4u : 0x200u;'
+               ' if (magnitude >= 0x00800000u) return negative ? 0x8u : 0x100u;'
+               ' if (magnitude != 0u) return negative ? 0x10u : 0x80u;'
+               ' return negative ? 0x20u : 0x40u; }',
                # The 64-bit shifts (issue #1815): a pair of words, so the count never reaches 32 in a 32-bit
                # shift and an in-place destination keeps the original value (the caller passes both words in).
                'uint2 shl64(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'

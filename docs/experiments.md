@@ -6019,6 +6019,15 @@ uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed 
 restored path keeps the source selection, the `dst_sel`/`dst_unused` write and the `U(...)` wrapper, and a
 conversion's output modifier inside an SDWA form is still refused rather than dropped.
 
+**The binary32 class comparison.** `v_cmp_class_f32` and `v_cmpx_class_f32` had no lowering, so both census
+forms were refused - 2 of the remaining refused shaders in the first main-game loading-screen cache (#870,
+issue #1797). They now lower to a ten-class helper carried in the shader preamble (ported from
+`tools/pixel_aot.py`), testing `class32(value) & mask`: the class bits are, in encoding order, signaling NaN,
+quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal and +inf. The mask is read as an integer
+operand (the census form uses the inline `-1`, i.e. every class) and the value as a float; the `_e32` and
+`_e64` spellings share the path, and the `v_cmpx_` form writes EXEC and clears the straight-line assumption.
+Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cmp_class$' -V`.
+
 **An `op_sel` the lowering does not model is refused.** `set_vf()` used to accept an `op_sel` modifier and emit
 the same text as without it. `op_sel` selects which half of a packed source the operation reads, so dropping
 it silently changes the operand; the float path now refuses it (#1754). The same test pins the exact shift,
