@@ -61,6 +61,8 @@ void test_exit_code()
     check(x2w_trap::exit_code(0u, 0u) == 0xE2570000u, "exit_code zero module and index");
     check(x2w_trap::exit_code(0x12u, 0x34u) == 0xE2571234u, "exit_code encodes module and index");
     check(x2w_trap::exit_code(0xFFu, 0xFFu) == 0xE257FFFFu, "exit_code max 8-bit fields");
+    check(x2w_trap::exit_code(0x100u, 0u) == 0xE2570000u, "exit_code masks module overflow bits");
+    check(x2w_trap::exit_code(0u, 0x100u) == 0xE2570000u, "exit_code masks index overflow bits");
     check(x2w_trap::exit_code(0x1ABu, 0x2CDu) == 0xE257ABCDu, "exit_code masks module and index to 8 bits");
 }
 
@@ -129,7 +131,8 @@ void test_export_modes(bool fail_first_mutate)
     check(dir_len > 0 && dir_len < MAX_PATH, "GetTempPathW succeeds");
     if (!dir_len || dir_len >= MAX_PATH) return;
 
-    const auto folder = std::wstring(temp_dir) + L"x2w_trap_hdr_" + std::to_wstring(GetCurrentProcessId());
+    const auto folder = std::wstring(temp_dir) + L"x2w_trap_hdr_" + std::to_wstring(GetCurrentProcessId()) +
+                        L"_" + std::to_wstring(GetTickCount64());
     const auto log_path = folder + L"\\trap.log";
     const auto err_path = folder + L"\\stderr.txt";
     const auto child_err_path = folder + L"\\child_stderr.txt";
@@ -230,10 +233,13 @@ void test_export_modes(bool fail_first_mutate)
                 const DWORD wait = WaitForSingleObject(pi.hProcess, 10000);
                 DWORD child_exit = 0;
                 const BOOL got_code = GetExitCodeProcess(pi.hProcess, &child_exit);
+                if (wait != WAIT_OBJECT_0) {
+                    TerminateProcess(pi.hProcess, 1);
+                }
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
                 check(wait == WAIT_OBJECT_0, "child trap terminates promptly");
-                check(got_code && child_exit == x2w_trap::exit_code(0x42u, 0x07u),
+                check(got_code && child_exit == 0xE2574207u,
                       "child trap exits with encoded module/index exit code");
             }
         }
