@@ -725,6 +725,33 @@ uint mul_hi_i32(uint a, uint b) {
     return mul_hi_u32(a, b) - ((a >> 31) != 0u ? b : 0u) - ((b >> 31) != 0u ? a : 0u);
 }
 """,
+    "cmp_f64": """// v_cmp_*_f64 and v_cmp_class_f64 on the raw (low, high) words of binary64 sources; no HLSL double is used.
+// num64: the encoding is not a NaN. key64: an unsigned (low, high) key with the order of the non-NaN values, in
+// which -0 and +0 share one key; the high words decide unless equal. Denormals compare as their values.
+bool num64(uint lo, uint hi) {
+    uint magnitude = hi & 0x7fffffffu;
+    return magnitude < 0x7ff00000u || (magnitude == 0x7ff00000u && lo == 0u);
+}
+uint2 key64(uint lo, uint hi) {
+    if (((hi & 0x7fffffffu) | lo) == 0u) return uint2(0u, 0x80000000u);
+    return hi >= 0x80000000u ? uint2(~lo, ~hi) : uint2(lo, hi | 0x80000000u);
+}
+bool lt64(uint2 a, uint2 b) {
+    return a.y < b.y || (a.y == b.y && a.x < b.x);
+}
+bool eq64(uint2 a, uint2 b) {
+    return a.y == b.y && a.x == b.x;
+}
+// The ten binary64 classes of LLVM SIInstrFlags::ClassFlags, in the order of class32.
+uint class64(uint lo, uint hi) {
+    uint magnitude = hi & 0x7fffffffu;
+    bool negative = hi >= 0x80000000u;
+    if (!num64(lo, hi)) return (hi & 0x00080000u) != 0u ? 0x2u : 0x1u;
+    if (magnitude == 0x7ff00000u) return negative ? 0x4u : 0x200u;
+    if (magnitude >= 0x00100000u) return negative ? 0x8u : 0x100u;
+    if ((magnitude | lo) != 0u) return negative ? 0x10u : 0x80u;
+    return negative ? 0x20u : 0x40u;
+}""",
     "s_lshl_b64": (
         "uint2 s_lshl_b64(uint2 v, uint s) {\n"
         "    s &= 63u;\n"
@@ -1974,6 +2001,46 @@ def int64_operand(token, scalar, vector, pending, sample_dest, *, signed, encodi
         high = f"{value >> 32}u"
         return f"{value & 0xffffffff}u", f"asint({high})" if signed else high
     raise invalid
+
+
+# Inline constants a binary64 comparison source accepts, as high words (the low word is 0). The integer 0 is +0.0
+# under either reading of an integer inline constant on a binary64 operand; other integers and 1/(2*pi) are refused.
+F64_INLINE_HIGH = {"0": 0x00000000, "0.5": 0x3fe00000, "-0.5": 0xbfe00000, "1.0": 0x3ff00000, "-1.0": 0xbff00000,
+                   "2.0": 0x40000000, "-2.0": 0xc0000000, "4.0": 0x40100000, "-4.0": 0xc0100000}
+# Ordered binary64 relations on the key64 keys {a} and {b}; the n* predicates are their negations, true on NaN.
+F64_RELATION = {"lt": "lt64({a}, {b})", "eq": "eq64({a}, {b})", "le": "!lt64({b}, {a})", "gt": "lt64({b}, {a})",
+                "lg": "!eq64({a}, {b})", "ge": "!lt64({a}, {b})"}
+F64_NEGATED = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
+
+
+def f64_operand(token, scalar, vector, pending, sample_dest, *, encoding, position, allow_mods=True):
+    """Return the (low, high) HLSL words of a binary64 comparison source.
+
+    Registers follow int64_operand. Inline constants are 0 and the binary64 values in F64_INLINE_HIGH. The e64
+    neg (-x) and abs (|x|) modifiers act on the sign bit of the high word, as binary64 operand modifiers do.
+    """
+    invalid = ValueError(f"Invalid 64-bit comparison operand: {token}")
+    raw, negate, absolute = token, False, False
+    if raw.startswith("-") and raw not in F64_INLINE_HIGH:
+        raw, negate = raw[1:], True
+    if m := re.fullmatch(r"\|([^|]+)\|", raw):
+        raw, absolute = m[1], True
+    if (negate or absolute) and (encoding != "e64" or not allow_mods):
+        raise invalid
+    if raw in F64_INLINE_HIGH:
+        if encoding == "e32" and position == 1:
+            raise ValueError("64-bit comparison e32 src1 must be a VGPR pair")
+        low, high = "0u", f"{F64_INLINE_HIGH[raw]}u"
+    elif re.fullmatch(r"-?\d+", raw):
+        raise invalid
+    else:
+        low, high = int64_operand(raw, scalar, vector, pending, sample_dest, signed=False,
+                                  encoding=encoding, position=position)
+    if absolute:
+        high = f"({high} & 0x7fffffffu)"
+    if negate:
+        high = f"({high} ^ 0x80000000u)"
+    return low, high
 
 
 def int64_comparison(i, op, kind, tokens, encoding, scalar, vector, pending, sample_dest):
@@ -4386,6 +4453,53 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             declarations, expr = int64_comparison(i, op, kind, tokens, enc, scalar, vector, pending, sample_dest)
             lines.extend(declarations)
             lines.append(f"    bool cmp{i} = {expr};")
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+        elif m := (match(rf"v_cmp_({'|'.join(COMPARE)})_f64_(e32|e64) {LANE_MASK}, ([^,]+), ([^,]+)")
+                   or match(rf"v_cmp_(class)_f64_(e32|e64) {LANE_MASK}, ([^,]+), ([^,]+)")):
+            # binary64 comparisons on the source words (cmp_f64 helpers). MODE[7:6] also decides whether binary64
+            # denormal inputs are flushed, so the forms need the declared preserving entry state.
+            op, enc, dst, *tokens = m.groups()
+            check_vopc_e32_dst("_" + enc, dst)
+            regs = lane_mask(dst)
+            if dst.startswith("s["):
+                sgpr_pair(dst)
+            elif dst.startswith("s"):
+                sgpr_name(dst)
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary64 denormal mode unknown at entry")
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            helpers.add("cmp_f64")
+            if op == "class":
+                low, high = f64_operand(tokens[0], scalar, vector, pending, sample_dest, encoding=enc, position=0,
+                                        allow_mods=False)
+                classes = tokens[1]
+                if enc == "e32" and not re.fullmatch(r"v\d+", classes):
+                    raise ValueError("VOPC e32 src1 must be a VGPR")
+                if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+                    bits = f"{int(classes, 0) & 0xffffffff}u"
+                elif re.fullmatch(r"[vs]\d+", classes):
+                    bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
+                else:
+                    raise ValueError("Unsupported class mask")
+                lines.append(f"    bool cmp{i} = (class64({low}, {high}) & {bits}) != 0u;")
+            else:
+                words = [f64_operand(t, scalar, vector, pending, sample_dest, encoding=enc, position=n)
+                         for n, t in enumerate(tokens)]
+                for name, value in zip(("l0", "h0", "l1", "h1"), (*words[0], *words[1])):
+                    lines.append(f"    uint cmp{i}_{name} = {value};")
+                lines += [f"    bool cmp{i}_o = num64(cmp{i}_l0, cmp{i}_h0) && num64(cmp{i}_l1, cmp{i}_h1);",
+                          f"    uint2 cmp{i}_a = key64(cmp{i}_l0, cmp{i}_h0);",
+                          f"    uint2 cmp{i}_b = key64(cmp{i}_l1, cmp{i}_h1);"]
+                keys = {"a": f"cmp{i}_a", "b": f"cmp{i}_b"}
+                if op in F64_RELATION:
+                    expr = f"cmp{i}_o && {F64_RELATION[op].format(**keys)}"
+                elif op in F64_NEGATED:
+                    expr = f"!(cmp{i}_o && {F64_RELATION[F64_NEGATED[op]].format(**keys)})"
+                else:
+                    expr = {"o": f"cmp{i}_o", "u": f"!cmp{i}_o"}.get(op, COMPARE[op])
+                lines.append(f"    bool cmp{i} = {expr};")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32_sdwa {LANE_MASK}, ([^,]+), ([^,]+) src0_sel:DWORD src1_sel:DWORD"):

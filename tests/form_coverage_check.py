@@ -383,8 +383,8 @@ def check_shader_records():
         sdwa_unary_forms = {("SDWA", f"v_{op}_f32_sdwa") for op in (
             "exp", "log", "rcp", "rcp_iflag", "rsq", "sqrt", "sin", "cos", "rndne", "frexp_mant")}
         assert sdwa_unary_forms <= covered, (name, sdwa_unary_forms - covered)
-    # Integer and binary16 comparisons: e32 counts as VOPC and e64 as VOP3, for every 16-, 32- and 64-bit
-    # predicate the translator lowers; the rejected exec-writing neighbours stay out.
+    # Integer, binary16, binary32 and binary64 comparisons: e32 counts as VOPC and e64 as VOP3, for every predicate
+    # the translator lowers; the rejected exec-writing neighbours stay out.
     narrow_int = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
                   for kind in ("i16", "u16", "i32", "u32")}
     narrow_int |= {f"v_cmp_{op}_{kind}" for op in ("f", "t") for kind in ("i32", "u32")}
@@ -394,14 +394,15 @@ def check_shader_records():
     int_compares = narrow_int | int64
     f16_compares = {f"v_cmp_{op}_f16" for op in pixel.PREDICATES} | {"v_cmp_class_f16"}
     f32_compares = {f"v_cmp_{op}_f32" for op in pixel.PREDICATES} | {"v_cmp_class_f32"}
-    all_compares = int_compares | f16_compares | f32_compares
+    f64_compares = {f"v_cmp_{op}_f64" for op in pixel.PREDICATES} | {"v_cmp_class_f64"}
+    all_compares = int_compares | f16_compares | f32_compares | f64_compares
     compare_forms = ({("VOPC", form) for form in all_compares}
                      | {("VOP3", f"{form}_e64") for form in all_compares})
-    # Each name is counted once as VOPC and once as VOP3; the four sets must not share a name.
-    assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares) + len(f32_compares)), len(compare_forms)
-    # Issue #932 moved the VOPC e32 v_cmpx forms on binary32 and on 16-, 32- and 64-bit integers out of this set;
-    # the exec-writing compares on binary16, binary64 and classes stay rejected.
-    compare_neighbours = {"v_cmpx_lt_f16", "v_cmpx_class_f32", "v_cmp_class_f64", "v_cmp_lt_f64"}
+    # Each name is counted once as VOPC and once as VOP3; the five sets must not share a name.
+    assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares) + len(f32_compares)
+                                      + len(f64_compares)), len(compare_forms)
+    # VOPC e32 regions support binary32 and integer predicates, but not binary16, binary64 or classes.
+    compare_neighbours = {"v_cmpx_lt_f16", "v_cmpx_lt_f64", "v_cmpx_class_f32", "v_cmpx_class_f64"}
     # v_cmpx regions (issue #932): every binary32 and integer predicate counts in VOPC (e32) only.
     cmpx_forms = ({("VOPC", f"v_cmpx_{op}_f32") for op in pixel.PREDICATES}
                   | {("VOPC", f"v_cmpx_{op}_{kind}") for op in pixel.INT_PREDICATES
