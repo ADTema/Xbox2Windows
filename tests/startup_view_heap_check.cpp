@@ -25,6 +25,14 @@ HRESULT create_wrapper(IUnknown* adapter, REFIID iid, void** out)
     return D3D12XboxCreateDevice(adapter, parameters, iid, out);
 }
 
+SIZE_T guest_cpu_base(ID3D12DescriptorHeap* heap)
+{
+    // The console ABI returns this one-word handle in RAX.
+    using GetCpuBase = SIZE_T(__stdcall*)(void*, void*);
+    auto** table = *reinterpret_cast<void***>(heap);
+    return reinterpret_cast<GetCpuBase>(table[9])(heap, nullptr);
+}
+
 int count_shortcut_lines(const wchar_t* path)
 {
     FILE* file = nullptr;
@@ -92,11 +100,23 @@ int main(int argc, char** argv)
     heap.guest_address = reinterpret_cast<SIZE_T>(guest);
     heap.guest_bytes = bytes;
 
+    void* unsupported = nullptr;
+    const HRESULT unsupported_hr = wrapper->CreateDescriptorHeap(&heap.desc, __uuidof(ID3D12Resource), &unsupported);
+    if (unsupported_hr != E_NOINTERFACE || unsupported) {
+        std::printf("oversized request accepted an unsupported heap interface: 0x%08lx\n",
+                    static_cast<unsigned long>(unsupported_hr));
+        VirtualFree(guest, 0, MEM_RELEASE);
+        return 1;
+    }
+
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> wrapped;
     HRESULT hr = wrapper->CreateDescriptorHeap(&heap.desc, IID_PPV_ARGS(&wrapped));
     int status = 0;
     if (FAILED(hr)) {
         std::printf("oversized heap refused: 0x%08lx\n", static_cast<unsigned long>(hr));
+        status = 1;
+    } else if (guest_cpu_base(wrapped.Get()) != heap.guest_address) {
+        std::puts("oversized heap lost its logical CPU descriptor base");
         status = 1;
     } else {
         // A second oversized request must not log the shortcut again. It carries its own extension
@@ -110,7 +130,10 @@ int main(int argc, char** argv)
         second_desc.guest_address = heap.guest_address;
         second_desc.guest_bytes = heap.guest_bytes;
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> second;
-        if (SUCCEEDED(wrapper->CreateDescriptorHeap(&second_desc.desc, IID_PPV_ARGS(&second))) && log_path[0]) {
+        if (FAILED(wrapper->CreateDescriptorHeap(&second_desc.desc, IID_PPV_ARGS(&second)))) {
+            std::puts("second oversized heap request failed");
+            status = 1;
+        } else if (log_path[0]) {
             const int lines = count_shortcut_lines(log_path);
             if (lines != 1) {
                 std::printf("shortcut logged %d times, expected 1\n", lines);
