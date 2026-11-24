@@ -21,6 +21,12 @@ building `startup_stream_consumer`. The source-built shader writes to half of an
 On A8 the parent preserves the zero clear and the child writes alpha 255. R8 records red 0 or
 255 according to the input shader. The untouched half stays zero in all four cases.
 
+The patch scan itself also has a device-free check. Build `startup_derived_blend_check` and run
+`ctest --preset dev --no-tests=error -R "^startup_derived_blend(_first_wins_control)?$" -V`.
+It covers what the draw cannot observe: the logged descriptor offset (4 bytes into the record),
+a byte-for-byte copy of the descriptor, and refusal of a null list or one that is not whole
+records. The control expects the first blend patch to win and must fail.
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
