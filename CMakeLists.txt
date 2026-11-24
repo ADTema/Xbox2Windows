@@ -751,6 +751,34 @@ foreach(adapter IN ITEMS warp hardware)
     set_tests_properties(d3d12x_compute_list_${adapter} PROPERTIES TIMEOUT 30)
 endforeach()
 set_tests_properties(d3d12x_compute_list_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
+# D3D12.X graphics command list: one source-built triangle through a VS/PS PSO (#XCL-12).
+foreach(stage IN ITEMS vs ps)
+    string(TOUPPER "${stage}" entry)
+    set(d3d12x_graphics_header "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_graphics_${stage}.h")
+    add_custom_command(OUTPUT "${d3d12x_graphics_header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${stage}_6_0 -E ${entry}Main -Vn d3d12x_graphics_${stage}
+                -Fh "${d3d12x_graphics_header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_graphics_${stage}.cso"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_graphics.hlsl"
+        DEPENDS tests/d3d12x_graphics.hlsl
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_graphics_${stage}.cso" VERBATIM)
+    set(d3d12x_graphics_${stage} "${d3d12x_graphics_header}")
+endforeach()
+add_custom_target(d3d12x_graphics_shader DEPENDS
+    "${d3d12x_graphics_vs}"
+    "${d3d12x_graphics_ps}")
+add_executable(d3d12x_graphics_list_check tests/d3d12x_graphics_list_check.cpp tests/desktop_gpu.cpp
+    "${d3d12x_graphics_vs}" "${d3d12x_graphics_ps}")
+add_dependencies(d3d12x_graphics_list_check d3d12_xs_shim d3d12x_graphics_shader)
+target_include_directories(d3d12x_graphics_list_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(d3d12x_graphics_list_check PRIVATE cxx_std_17)
+target_link_libraries(d3d12x_graphics_list_check PRIVATE d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME d3d12x_graphics_list_${adapter} COMMAND d3d12x_graphics_list_check
+        "$<TARGET_FILE:d3d12_xs_shim>" ${adapter})
+    set_tests_properties(d3d12x_graphics_list_${adapter} PROPERTIES TIMEOUT 60)
+endforeach()
+set_tests_properties(d3d12x_graphics_list_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
 set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
 add_custom_command(OUTPUT "${vm_translation_header}"

@@ -4771,6 +4771,84 @@ rules. The command list, shader and buffers are source-built desktop fixtures.
 [ClearUnorderedAccessViewUint](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-clearunorderedaccessviewuint) ·
 [Resource barriers](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12) ·
 [Xbox ATG SimpleDeviceAndSwapChain12](https://github.com/microsoft/Xbox-ATG-Samples/blob/main/XDKSamples/IntroGraphics/SimpleDeviceAndSwapChain12/SimpleDeviceAndSwapChain.cpp)
+#### D3D12.X graphics command list (XCL-12)
+
+The public Microsoft D3D12 and Xbox material and the Windows SDK `d3d12.h` expose no
+`D3D12Xbox...CommandList` creation or recording export. `D3D12XboxCreateDevice` returns an
+`ID3D12Device`; `CreateCommandAllocator`, `CreateCommandList` and the
+`ID3D12GraphicsCommandList` methods are the documented desktop methods on that device. The
+observed console vtable inventory in `src/d3d12x_device_slots.h` is unchanged.
+
+The question comes from the pinned XCL reference (`ivall/xcl@38b05b7b6954cfa5bd21cec72f68823603ca2227`);
+no XCL code, table or generated output is used. The implementation and all fixtures are
+source-built under this repository's MIT licence.
+
+`tests/d3d12x_graphics.hlsl` is a source-built VS/PS pair compiled by DXC. `VSMain` passes a
+clip-space triangle through and `PSMain` returns `(0.2, 0.4, 0.6, 1.0)`.
+`tests/d3d12x_graphics_list_check.cpp` loads the built `d3d12_xs.dll` by explicit path, verifies
+that the export belongs to that module, and creates the device through `D3D12XboxCreateDevice`
+with `parameters == nullptr` and `IID_ID3D12Device`. It then creates a DIRECT queue, a DIRECT
+command allocator and a graphics command list; an empty v1.0 root signature with
+`ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT`; and a VS/PS PSO with one `POSITION` input element,
+`R8G8B8A8_UNORM`, no depth/stencil, no cull and no blend.
+
+The target is a 32x32 `R8G8B8A8_UNORM` texture with `ALLOW_RENDER_TARGET`, created in `COMMON`
+state with clear value `(0, 0, 0, 0)`. The upload vertex buffer holds three `float4` positions
+`(-1, -1)`, `(3, -1)` and `(-1, 3)` in clip space. The triangle's hypotenuse is `x + y = 2`;
+the farthest 32x32 pixel center is `x + y = 1.9375`, so all 1,024 pixel centers are strictly
+inside and the CPU reference is one color for every pixel.
+
+The command list records, in order: `SetGraphicsRootSignature`, `SetPipelineState`, a
+`COMMON -> RENDER_TARGET` transition, `ClearRenderTargetView`, `RSSetViewports` (0,0,32,32),
+`RSSetScissorRects` (0,0,32,32), `OMSetRenderTargets`, `IASetPrimitiveTopology(TRIANGLELIST)`,
+`IASetVertexBuffers`, `DrawInstanced(3, 1, 0, 0)`, an unbind, a `RENDER_TARGET -> COPY_SOURCE`
+transition, `CopyTextureRegion` into a readback buffer, and a `COPY_SOURCE -> COMMON` transition.
+A fence waits for completion. `GetCopyableFootprints` reports a 256-byte row pitch for the
+128-byte rows; the fixture checks the footprint shape, copies rows out of the mapped readback
+buffer and compares all 1,024 RGBA words.
+
+The expected UNORM bytes are R=51, G=102, B=153 and A=255, i.e. the little-endian word
+`0xff996633`; the clear word is `0x00000000`. The fixture prints the FNV-1a 32-bit hash over the
+1,024 words, the mismatch count and the first differing pixel.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `d3d12x_graphics_list_warp` | Full fixture on WARP: positive triangle, omitted-draw control, empty-scissor control and wrong-state control. |
+| `d3d12x_graphics_list_hardware` | Same fixture on the first non-software adapter, or the one selected by `XBOX2WINDOWS_ADAPTER`; skips (77) without a physical adapter. |
+
+The negative image controls record the same list but either omit `DrawInstanced` or set the
+scissor rectangle to (0,0,0,0). The clear still covers the target, so the readback must contain
+1,024 clear pixels: 1,024 mismatches against the triangle reference, with the first at (0,0).
+The wrong-state control records without the `COMMON -> RENDER_TARGET` transition. The fixture's
+source-owned state audit stops before `ClearRenderTargetView` with
+`wrong_state render_target=COMMON expected=RENDER_TARGET operation=ClearRenderTargetView(rtv)`.
+This is a fixture policy, not a claim that the in-box runtime rejects the command without the
+debug layer; the debug layer was unavailable in these runs.
+
+Measured on 2026-11-24 with Windows 10 Pro 26H2, build 26300.10075, DXC 1.8.2502.11 and the
+debug layer unavailable:
+
+- WARP: Microsoft Basic Render Driver, vendor 1414, device 008c, driver 10.0.26100.10068.
+  Positive: 1,024 pixels, 0 mismatches, hash `0xff2379c5`. Omitted draw and empty scissor:
+  1,024 mismatches, all clear, hash `0x1f116dc5`.
+- AMD Radeon RX 9060 XT, vendor 1002, device 7590, driver 32.0.32029.2010. The same positive
+  and negative numbers and hashes.
+
+Run `ctest --preset dev --no-tests=error -R '^d3d12x_graphics_list_' -V`. The full D3D12.X
+filter `ctest --preset dev --no-tests=error -R '^d3d12x_' -V` passed 17/17.
+
+This fixture covers the desktop graphics-list path on a device created by the XCL-08 entry. It
+does not establish a console command-list interface, console vtable slots, PresentX, bundle or
+multi-queue semantics. The PSO draws one constant color: it does not measure interpolation,
+texture sampling, depth, blending or MSAA. The state audit is source-owned and the runtime
+validation path was not exercised without the debug layer. The shaders and all resources are
+source-built desktop fixtures.
+
+[Microsoft CreateCommandList](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createcommandlist) ·
+[Recording command lists](https://learn.microsoft.com/en-us/windows/win32/direct3d12/recording-command-lists-and-bundles) ·
+[DrawInstanced](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-drawinstanced) ·
+[CopyTextureRegion](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-copytextureregion) ·
+[Resource barriers](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12)
 
 #### D3D12ConfigureVirtualMemoryX call shape (#874)
 
