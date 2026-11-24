@@ -315,6 +315,12 @@ class TestRdna2Disasm(unittest.TestCase):
             ("000084f400000000", "s_dcache_wb", "s_dcache_wb"),
             ("000190f400000000", "s_memtime", "s_memtime s[4:5]"),
             ("000194f400000000", "s_memrealtime", "s_memrealtime s[4:5]"),
+            # Timer destinations keep the named 64-bit specials (spelling matches LLVM)
+            ("401f90f400000000", "s_memtime", "s_memtime null"),
+            ("801a90f400000000", "s_memtime", "s_memtime vcc"),
+            ("001b90f400000000", "s_memtime", "s_memtime ttmp[0:1]"),
+            ("401f94f400000000", "s_memrealtime", "s_memrealtime null"),
+            ("801a94f400000000", "s_memrealtime", "s_memrealtime vcc"),
             ("c20198f4100000fa", "s_atc_probe", "s_atc_probe 7, s[4:5], 0x10"),
             ("c2019cf4100000fa", "s_atc_probe_buffer", "s_atc_probe_buffer 7, s[4:7], 0x10"),
             ("c20198f400000004", "s_atc_probe", "s_atc_probe 7, s[4:5], s2"),

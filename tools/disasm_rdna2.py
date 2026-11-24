@@ -2011,7 +2011,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             sdata_str = decode_s_reg(sdata) if data_width == 1 else f"s[{sdata}:{sdata + data_width - 1}]"
         if base_width == 0:
             # s_memtime / s_memrealtime read no memory address: only the destination pair.
-            return (8, op_name, f"{op_name} {sdata_str}", "Read a 64-bit hardware timer")
+            # Named 64-bit specials (vcc, ttmp pairs, null) keep their spelling.
+            timer_dst = decode_s_reg64(sdata) if sdata >= 106 else sdata_str
+            return (8, op_name, f"{op_name} {timer_dst}", "Read a 64-bit hardware timer")
         if base_width == 2 and sbase == 106:
             sbase_str = "vcc"
         else:
