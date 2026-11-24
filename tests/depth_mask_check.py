@@ -43,8 +43,10 @@ CMPX = {
 CMPX_CASES = ((7, 17 / 64), (29, 49 / 64))
 
 
-def program(extended=False, op=None, cmpx="v_cmpx_lt_f32_e32"):
-    extended = extended or op is not None or cmpx != "v_cmpx_lt_f32_e32"
+def program(extended=False, op=None, cmpx=None):
+    # Any named form, including the lt compare, runs the extended (Y-sampling) fixture.
+    extended = extended or op is not None or cmpx is not None
+    cmpx = cmpx or "v_cmpx_lt_f32_e32"
     # Original fixture. The offsets here are instruction addresses in a decoded stream.
     prefix = [
         "s_mov_b32 s7, 0",
@@ -164,8 +166,8 @@ def cmpx_source(name):
     return text
 
 
-def source(extended=False, op=None, cmpx="v_cmpx_lt_f32_e32"):
-    extended = extended or op is not None or cmpx != "v_cmpx_lt_f32_e32"
+def source(extended=False, op=None, cmpx=None):
+    extended = extended or op is not None or cmpx is not None
     lines = program(extended, op, cmpx)
     decoded = decoded_stream(lines)
     offsets = [pc for pc, _ in decoded]
