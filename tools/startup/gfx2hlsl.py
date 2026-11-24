@@ -356,6 +356,8 @@ class Stage:
             arity, text = VEC_U[base]
             if mods:
                 raise Unsupported('%s with %s' % (base, mods))
+            if len(ops) != arity + 1:
+                raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
             return self.set_v(reg_range(ops[0])[1], text.format(*[self.u(o) for o in ops[1:1 + arity]]))
         if base in SCA:
             return self.scalar(base, ops)
@@ -972,6 +974,16 @@ VEC_U = {
     'v_or3_b32': (3, '{0} | {1} | {2}'), 'v_and_or_b32': (3, '({0} & {1}) | {2}'), 'v_lshl_or_b32': (3, '({0} << ({1} & 31)) | {2}'),
     'v_xad_u32': (3, '({0} ^ {1}) + {2}'), 'v_bfi_b32': (3, '({0} & {1}) | (~{0} & {2})'),
     'v_mul_u32_u24': (2, '({0} & 0xffffffu) * ({1} & 0xffffffu)'),
+    # Per-lane bit operations (AMD RDNA 2 ISA reference). The bitscan results count from the most significant
+    # bit for the "h" forms and read 0xffffffff when no bit qualifies; firstbitlow(0) is already 0xffffffff.
+    # v_bfe_i32 extracts a field at S1[4:0] of width S2[4:0] (0 reads 0) and sign-extends it from its top bit,
+    # taking the bits above bit 31 as copies of bit 31; v_bcnt_u32_b32 adds S1 to the population count of S0.
+    'v_bfe_i32': (3, '(({2} & 31u) == 0u ? 0u : asuint(asint({0} << (32u - min(({1} & 31u) + ({2} & 31u), 32u))) '
+                     '>> (32u - min(({1} & 31u) + ({2} & 31u), 32u) + ({1} & 31u))))'),
+    'v_bcnt_u32_b32': (2, 'countbits({0}) + {1}'), 'v_ffbl_b32': (1, 'firstbitlow({0})'),
+    'v_ffbh_u32': (1, '({0} == 0u ? 0xffffffffu : 31u - firstbithigh({0}))'),
+    'v_ffbh_i32': (1, '({0} == 0u || {0} == 0xffffffffu ? 0xffffffffu : 31u - firstbithigh(asint({0}) < 0 ? ~{0} : {0}))'),
+    'v_bfrev_b32': (1, 'reversebits({0})'),
 }
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
 SCA = {
