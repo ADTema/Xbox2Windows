@@ -802,6 +802,21 @@ READ_SHIFT_SUB = variant(
     ("v_min_u32_e32 v1, s0, v1", "v_lshlrev_b32_e32 v2, 17, v1\nv_ashrrev_i32_e32 v2, 20, v2\n"
                                  "v_sub_nc_u32_e32 v3, s0, v2\nv_subrev_nc_u32_e32 v1, 0x1234, v3"),
 )
+DPP_QUAD_PERM = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_load_dwordx8 s[8:15], s[0:1], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_lshlrev_b32_e32 v3, 2, v0",
+    "buffer_load_dword v1, v3, s[12:15], 0 offen",
+    "s_waitcnt vmcnt(0)",
+    "v_or_b32_dpp v2, v1, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "buffer_store_dword v2, v0, s[8:11], 0 idxen",
+    "s_endpgm",
+]
 ALU_CASES = [
     ("read_compute", READ_COMPUTE, 32, READ_BINDING),
     ("read_mad24", READ_MAD24, 32, READ_BINDING),
@@ -809,6 +824,7 @@ ALU_CASES = [
     ("read_vop2", READ_VOP2, 32, READ_BINDING),
     ("read_shift_sub", READ_SHIFT_SUB, 32, READ_BINDING),
 ]
+DPP_CASES = [("read_dpp_quad_perm", DPP_QUAD_PERM, 32, READ_BINDING)]
 F32_CASES = [("read_f32", READ_F32, 32, READ_BINDING)]
 
 
@@ -1102,6 +1118,59 @@ def alu_controls():
     assert alu(*restored, ("s_or_b32 exec_lo, exec_lo, s2", "s_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v1, 9"),
                stride=8)[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
                                   "    outputData.Store(tid.x * 8u + 4u, 0x00000009u);", "}"]
+
+
+def dpp_controls():
+    """Check the narrow compute DPP16 slice and reject controls outside its proven domain."""
+    instruction = DPP_QUAD_PERM[10]
+    source = "inputData.Load((tid.x << 2u) + 0u)"
+
+    def lower(lines=DPP_QUAD_PERM, group=32, **binding):
+        return aot.lower(lines, group, **(READ_BINDING | binding)).splitlines()
+
+    lines = lower()
+    assert lines[-2] == "    outputData.Store(tid.x * 4u + 0u, dpp0_value);", lines
+    assert lines[6:14] == [
+        "    uint dpp0_lane = local.x & 31u;",
+        "    uint dpp0_quad = dpp0_lane & 3u;",
+        "    dpp_stage[local.x] = " + source + ";",
+        "    GroupMemoryBarrierWithGroupSync();",
+        "    uint dpp0_source_thread = (local.x & ~3u) | (((dpp0_quad == 0u) ? 1u : 0u) | "
+        "((dpp0_quad == 1u) ? 0u : 0u) | ((dpp0_quad == 2u) ? 3u : 0u) | ((dpp0_quad == 3u) ? 2u : 0u));",
+        "    uint dpp0_source = dpp_stage[dpp0_source_thread];",
+        "    GroupMemoryBarrierWithGroupSync();",
+        "    uint dpp0_value = dpp0_source | tid.x;",
+    ], lines
+    for perm in ("[0,1,2,3]", "[2,0,3,1]", "[3,2,1,0]"):
+        changed = variant(DPP_QUAD_PERM, ("quad_perm:[1,0,3,2]", f"quad_perm:{perm}"))
+        output = "\n".join(lower(changed))
+        assert f"dpp_stage[dpp0_source_thread]" in output
+        assert f"quad_perm:{perm}" not in output
+        for lane, selected in enumerate(map(int, perm[1:-1].split(","))):
+            assert f"((dpp0_quad == {lane}u) ? {selected}u : 0u)" in output
+
+    unsupported = "Unsupported compute instruction: v_or_b32_dpp"
+    for mutation in (
+        instruction.replace("row_mask:0xf", "row_mask:0x7"),
+        instruction.replace("bank_mask:0xf", "bank_mask:0x7"),
+        instruction.replace("row_mask:0xf bank_mask:0xf", "row_shr:1"),
+        instruction.replace("quad_perm:[1,0,3,2]", "quad_perm:[1,0,3,2] bound_ctrl:0"),
+        instruction.replace("v1, v0 quad_perm", "s0, v0 quad_perm"),
+    ):
+        rejects(unsupported, lower, variant(DPP_QUAD_PERM, (instruction, mutation)))
+    rejects("Unsupported compute instruction:", lower,
+            variant(DPP_QUAD_PERM, (instruction, instruction.replace("v_or_b32_dpp", "v_xor_b32_dpp"))))
+    partial = variant(DPP_QUAD_PERM, ("v_lshl_add_u32 v0, s2, 5, v0", "v_lshl_add_u32 v0, s2, 1, v0"))
+    rejects("Unsupported or masked DPP16 quad permutation", lower, partial, group=2)
+    two_dimensional = variant(
+        DPP_QUAD_PERM, ("v_lshl_add_u32 v0, s2, 5, v0", "v_lshl_add_u32 v0, s2, 3, v0"))
+    rejects("Unsupported or masked DPP16 quad permutation", lower, two_dimensional, group=(8, 2, 1))
+    rejects("Unsupported or masked DPP16 quad permutation", lower, cpu="gfx1030")
+    rejects("Unsupported or masked DPP16 quad permutation", lower,
+            variant(DPP_QUAD_PERM, ("v1, v0 quad_perm", "v256, v0 quad_perm")))
+    guarded = variant(READ_COMPUTE,
+                      ("v_min_u32_e32 v1, s0, v1", instruction + "\nv_min_u32_e32 v1, s0, v1"))
+    rejects("Unsupported or masked DPP16 quad permutation", lower, guarded)
 
 
 F32_CAP = 0x41a00000  # the float 20.0
@@ -3342,6 +3411,19 @@ def scalar_alu_binary(directory, assembler, objcopy, library):
     assert aot.lower(decoded, 32, **READ_BINDING) == aot.lower(READ_SCALAR, 32, **READ_BINDING)
 
 
+def dpp_binary(directory, assembler, objcopy, library):
+    """Round-trip the accepted DPP16 encoding through LLVM 15 and the translator."""
+    src, obj, raw = [directory / x for x in ("dpp.s", "dpp.o", "dpp.bin")]
+    src.write_text("\n".join(DPP_QUAD_PERM) + "\n", encoding="ascii")
+    subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj],
+                   check=True)
+    subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+    decoded = aot.labelled(disassemble(raw.read_bytes(), library, offsets=True))
+    dpp = next(line for line in decoded if line.startswith("v_or_b32_dpp"))
+    assert dpp == DPP_QUAD_PERM[10], dpp
+    assert aot.lower(decoded, 32, **READ_BINDING) == aot.lower(DPP_QUAD_PERM, 32, **READ_BINDING)
+
+
 def mimg_load_binary(directory, assembler, objcopy, library):
     """Assemble and decode each dmask form, then lower the decoded program through the CLI."""
     mimg_load_controls()
@@ -3382,6 +3464,8 @@ def mubuf_cache_invalidate_binary(directory, assembler, objcopy, library):
 
 
 def binary(directory, assembler, objcopy, library):
+    dpp_controls()
+    dpp_binary(directory, assembler, objcopy, library)
     mubuf_cache_invalidate_binary(directory, assembler, objcopy, library)
     mubuf_reduction_controls()
     mubuf_reduction_x2_controls()
@@ -5594,6 +5678,44 @@ def draw_vop2(directory, compiler, cmd, case, name):
     return 0
 
 
+def draw_dpp(directory, compiler, renderer, backend):
+    """Check DPP against a logical-thread reference and prove full group participation."""
+    lane_words = [source_word(lane) for lane in range(32)]
+    if len(set(lane_words)) != 32 or any(len(set(lane_words[start:start + 4])) != 4
+                                         for start in range(0, 32, 4)):
+        raise AssertionError("DPP fixture values must be unique within and between quads")
+    source = aot.lower(DPP_QUAD_PERM, 32, **READ_BINDING)
+    instrumentation = (
+        "    outputData.Store(128u + tid.x * 4u, local.x);\n"
+    )
+    if source.count("\n}\n") != 1:
+        raise AssertionError("DPP fixture has an unexpected entry point shape")
+    source = source.replace("\n}\n", "\n" + instrumentation + "}\n")
+    src, cso, case = [directory / name for name in ("dpp.hlsl", "dpp.cso", "dpp.case")]
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    constants = [0x5eed0000 + i for i in range(16)]
+    case.write_bytes(struct.pack("<337I", 1, *([SENTINEL] * 320), *constants))
+    cmd = [renderer, backend, "--compute-store-dpp-case", cso, case]
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+
+    # Reading each thread's own staged value is an identity mutant and must fail.
+    mutant = source.replace(
+        "dpp_stage[dpp0_source_thread]", "dpp_stage[local.x]")
+    if mutant == source:
+        raise AssertionError("DPP negative control did not alter the generated shader")
+    mutant_src, mutant_cso = directory / "dpp-mutant.hlsl", directory / "dpp-mutant.cso"
+    mutant_src.write_text(mutant, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mutant_cso, mutant_src], check=True)
+    bad = subprocess.run([*cmd[:3], mutant_cso, case], capture_output=True, text=True)
+    if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+        raise AssertionError(f"DPP no-shuffle negative control escaped detection\n{bad.stderr}")
+    print(bad.stderr, end="")
+    return 0
+
+
 def f32_value(bits):
     return struct.unpack("<f", struct.pack("<I", bits))[0]
 
@@ -5941,5 +6063,6 @@ if __name__ == "__main__":
                  "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
                  "draw-mtbuf-store": mtbuf_store_draw,
                  "draw-mubuf-subword-store": mubuf_subword_store_draw,
-                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES)}
+                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES),
+                 "draw-dpp": draw_dpp}
         sys.exit(modes[mode](Path(tmp), *args))

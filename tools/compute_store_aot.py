@@ -362,6 +362,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     lds_address_shift = None
     lds_m0_zero = False
     ds_wait = False
+    dpp_step_count = 0
     written_spans = []
     layout = None
     # One per-lane guard: v_cmp into vcc_lo, s_and_saveexec_b32, the stores under the mask, then
@@ -1141,6 +1142,33 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
+        elif m := re.fullmatch(r"v_or_b32_dpp v(\d+), v(\d+), v(\d+) quad_perm:\[([0-3]),([0-3]),([0-3]),([0-3])\] row_mask:0xf bank_mask:0xf", line):
+            dst, src0, src1 = map(int, m.groups()[:3])
+            # This lowering indexes the guest's logical 1D quad through group-shared memory.
+            if (cpu != "gfx1013" or max(dst, src0, src1) > 255 or guard_span is not None
+                    or dims[1] != 1 or dims[2] != 1 or dims[0] % 4):
+                raise ValueError("Unsupported or masked DPP16 quad permutation")
+            values = (vector.get(src0), vector.get(src1))
+            if not all(is_word(value) for value in values):
+                raise ValueError("Unverified DPP16 operand")
+            perm = tuple(map(int, m.groups()[3:]))
+            step = dpp_step_count
+            dpp_step_count += 1
+            lane, quad = f"dpp{step}_lane", f"dpp{step}_quad"
+            source_thread = f"dpp{step}_source_thread"
+            source, value = f"dpp{step}_source", f"dpp{step}_value"
+            selectors = " | ".join(
+                f"(({quad} == {index}u) ? {perm[index]}u : 0u)" for index in range(4))
+            slot = "dpp_stage"
+            staged_steps.append((slot, f"    uint {lane} = local.x & 31u;\n"
+                                 f"    uint {quad} = {lane} & 3u;\n"
+                                 f"    {slot}[local.x] = {hlsl_word(values[0])};\n"
+                                 "    GroupMemoryBarrierWithGroupSync();\n"
+                                 f"    uint {source_thread} = (local.x & ~3u) | ({selectors});\n"
+                                 f"    uint {source} = {slot}[{source_thread}];\n"
+                                 "    GroupMemoryBarrierWithGroupSync();\n"
+                                 f"    uint {value} = {source} | {hlsl_word(values[1])};"))
+            vector[dst] = ("alu", value)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32|v_max3_u32|v_min3_u32|v_med3_u32|v_med3_i32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
@@ -1659,8 +1687,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     local = ""
     if staged_steps:
         body = "\n".join([*(step for _, step in staged_steps), body])
-        shared = [slot for slot, _ in staged_steps if slot is not None]
-        cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot in shared)
+        shared = list(dict.fromkeys(slot for slot, _ in staged_steps if slot is not None))
+        cbuffer += "".join(f"groupshared uint {slot}[{dims[0]}];\n" for slot in shared)
         if shared:
             local = ", uint3 local : SV_GroupThreadID"
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.

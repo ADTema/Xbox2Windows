@@ -3219,6 +3219,18 @@ With `--rsrc2 <COMPUTE_PGM_RSRC2>` (`rsrc2=` in `lower`), the translation places
 
 `tests/compute_entry_layout_check.py` uses source-built gfx1013 programs that name the group IDs only by the registers this layout gives them. The cases enable X with Z (Y omitted), Y with Z (X omitted), Z alone, all three axes, and X behind four user SGPRs. Each thread stores its dispatch coordinates as a record at its own address; the dispatches use different group counts per axis, and all 320 words are compared with the record layout, including the sentinels between and after the records. Swapping two stored coordinates must mismatch. Each case translates to the same source as with its group registers named by hand. The translation refuses a program whose register names an omitted or moved group ID, a local ID beyond `TIDIG_COMP_CNT`, a table outside the user SGPRs, `TG_SIZE_EN`, and `rsrc2` combined with group registers. Run `ctest --preset dev --no-tests=error -R '^compute_entry_layout_'`.
 
+### gfx1013 compute DPP16 quad permutation
+
+The compute profile lowers `v_or_b32_dpp` only when it has a 32-bit VGPR destination and sources, `quad_perm:[a,b,c,d]`, and both full masks (`row_mask:0xf bank_mask:0xf`). It selects the source from a logical four-thread quad using SV_GroupThreadID.x and group-shared staging. The other OR operand is local to the current thread. Only 1D groups with X divisible by four are accepted, and DPP inside a lane-guarded region is refused. Other DPP opcodes, row/bank shifts, partial masks and DPP8 remain unsupported.
+
+The binary-mode check assembles and disassembles the source-built gfx1013 program through LLVM 15 in CI, then compares lowering of the disassembly with lowering of the assembly text.
+
+The GPU fixture uses 32 unique lane words, distinct across quads. The result records the logical thread ID so the CPU oracle can verify all 32 threads participated. The oracle derives each selected source from those logical IDs. The identity-read mutant must fail. With the D3D12 debug layer enabled, HLSL compilation and readback matched on Windows 11 build 26300 on WARP (Microsoft Basic Render Driver, driver 10.0.26100.9818) and the NVIDIA GeForce RTX 3060 Laptop GPU (driver 32.0.16.2124), with zero debug errors and warnings. These results cover the tested D3D12 adapters, not Xbox hardware.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_dpp_(warp|hardware)$' -V
+```
+
 ### gfx1030 MUBUF cache-invalidation rejection
 
 The compute store profile rejects `buffer_gl0_inv` and `buffer_gl1_inv`
