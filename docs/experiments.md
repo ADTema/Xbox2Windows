@@ -1289,6 +1289,72 @@ For 249 input pairs both callers match the provider's observed arguments, guarde
 
 The local Bink DLL imports ordinal 1 from XAudio2_9.dll. A read-only check confirmed an executable export at that ordinal in this workstation's System32 provider. The Bink call's argument and result contract remains unverified.
 
+## SSE FXSAVE/FXRSTOR state save and restore
+
+[The SSE FXSAVE/FXRSTOR translator](../tools/cpu_sse_fxsave_aot.py) lifts bounded
+straight-line Windows x64 leaf functions exercising the four legacy SSE state forms from
+`docs/coverage/x64_zen2.tsv` group `SSE`:
+
+- State save (`fxsave`, `fxsave64`): store the 416 architectural bytes of the 512-byte
+  16-byte-aligned FXSAVE area to `[r8 + disp]` (`FCW`, `FSW & 0x7F7F`, `FTW`, `FOP & 0x7FF`,
+  `FIP`/`FDP` at 32-bit vs 64-bit widths with `FCS`/`FDS` gated on `CPUID.7.0:EBX[13]`,
+  `MXCSR`, host `MXCSR_MASK`, `ST0..ST7`, and `XMM0..XMM15`), zeroing reserved byte 5,
+  `ST/MM[10..15]`, and 32-bit reserved words `[14..15]`/`[22..23]`, while leaving `[416..511]`
+  untouched.
+- State restore (`fxrstor`, `fxrstor64`): validate 16-byte alignment and `MXCSR` reserved bits
+  against host `MXCSR_MASK` (`#GP` before mutating state), normalize `FCW` reserved bits
+  (`(fcw & 0x1F7F) | 0x0040`), mask `FOP` to 11 bits (`0x7FF`), clear `FSW` bits 15 and 7
+  (`0x7F7F`), and zero-extend (32-bit) or preserve 64-bit `FIP`/`FDP`.
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned buffers
+and models the full FXSAVE state in a portable local `FxState` struct (leaving host
+`XMM6`..`15`, x87/MMX, and `MXCSR` untouched across lifted calls). Entry-state contracts are
+explicit via `--entry-state {defined,canonical}` and exported via
+`lifted_entry_state_profile()` / `lifted_requires_canonical_entry()`: the default `defined`
+profile requires a supported `fxrstor`/`fxrstor64` before any `fxsave`/`fxsave64` (rejecting
+bare entry-state saves), while the opt-in `canonical` profile permits entry-state
+`fxsave`/`fxsave64` provided the native caller establishes canonical architectural FX state
+(`FCW=0x037F`, `FSW=0`, `FTW=0`, `FOP=0`, `FIP=0`, `FCS=0`, `FDP=0`, `FDS=0`, `MXCSR=0x1F80`,
+zero `ST0..7`/`XMM0..15`). Transport and ABI glue covers `movdqa`/`movdqu` (`XMM0`..`XMM5`),
+`paddd` (`XMM0`..`XMM5`), `movq` (`MM0`..`MM7` <-> `m64`/volatile scratch GPRs), `emms`, 64-bit
+volatile `mov`, and terminal `ret`. The lifted DLL exports `host_has_fxsr()`
+(`CPUID.01H:EDX.FXSR[24]`, returning exit code 77 when absent), `host_deprecates_fpu_cs_ds()`
+(`CPUID.7.0:EBX[13]`), `host_fp_err_cpuid_info()`, and `host_mxcsr_mask()`.
+`XSAVE`-family instructions (`xsave*`, `xrstor*`), `VEX`/`EVEX`/`XOP` encodings,
+`maskmovq`/`maskmovdqu`, nonvolatile registers (`XMM6`..`15`, `RBX`/`RBP`/`RSI`/`RDI`/
+`R12`..`R15`/`RSP`), non-argument memory bases, stores outside `r8`, RIP-relative
+addressing, prefixes, branches, unclosed MMX state before `ret`, undefined registers, and
+trailing bytes reject.
+
+```powershell
+cmake --build --preset dev --target cpu_sse_fxsave_original cpu_sse_fxsave_original_lifted cpu_sse_fxsave_altered cpu_sse_fxsave_altered_lifted cpu_sse_fxsave_canonical_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fxsave$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/sse_fxsave.asm) exports 9 functions covering opt-in
+canonical-entry `fxsave`/`fxsave64` (`cpu_sse_fxsave_canonical_lifted`), all four 32/64-bit
+`fxrstor*` -> `fxsave*` combinations, displaced `[rcx+64]`/`[r8+64]` operands, a chained
+`fxrstor64` + `movq` MMX GPR bridge + `paddd` + `fxsave64` + `emms` pipeline, and a
+discarded-read fault-ordering control (`op_discarded_read`). [The differential
+check](../tests/cpu/sse_fxsave_check.py) skips with exit code 77 if `CPUID.01H:EDX.FXSR[24]`
+is 0, probes native `(rstor64, save64, FSW.ES)` `FOP`/`FIP`/`FDP` preservation on the running
+host so comparisons remain strict for fields established on that host while checking `lifted`
+against the full architectural model, runs native calls through an isolated caller-state
+trampoline, and verifies 40 cases across 8 exports bit-for-bit against both the native MASM
+DLL and an independent Python reference model with 64-byte pre/post buffer guards across
+`dev` and `release` (`/O2`) builds, plus explicit entry-state contract metadata, a
+non-default entry distinguishing control (`MXCSR=0x7FA0`, `XMM6=0x12345678`), 8 `+8`
+misaligned `#GP` controls, 4 invalid `MXCSR` (`0x11F80`) `#GP` controls, lifted host-canary
+preservation, dead-read fault ordering (`op_discarded_read` for readable, unmapped `rdx=0`,
+and `0x11F80` `MXCSR`), 4 `ALTER_OP` divergence controls, an output-mutation control, 4
+alternate-encoding lift checks, 49 unit rejection controls (including default-profile bare
+`fxsave`/`fxsave64` rejections), and 12 PE-patched DLL rejection controls.
+
+Not covered by this experiment: non-canonical 64-bit `FIP` sign-extension differences across
+CPU vendors, `XSAVE`-family state management, control flow, and title CPU code execution.
+
 ## x87 in the shared lowering
 
 `lower(..., x87=True)` in `tools/ffx_version_query.py` accepts an opt-in x87 leaf-function profile. The default (`x87=False`) still rejects every x87 instruction, so existing callers are unchanged. The profile accepts `fld` and `fstp` with an m32, m64 or m80 memory operand, `fst` with an m32 or m64 operand, `fld st(i)`, `fst st(i)`, `fstp st(i)`, `fxch st(i)`, `fchs`, `fabs`, `fsqrt`, `frndint`, `fxtract` and `fscale`, the constant loads `fld1`, `fldz`, `fldpi`, `fldl2t`, `fldl2e`, `fldlg2` and `fldln2`, `fild`, `fistp` and `fisttp` with an m16, m32 or m64 integer operand, `fist` with m16 or m32, `fbstp` with an m80 packed BCD operand, `fcomi`, `fcomip`, `fucomi` and `fucomip` with `st, st(i)`, `fcmovb`, `fcmove`, `fcmovbe`, `fcmovnb`, `fcmovne`, `fcmovnbe`, `fcmovu` and `fcmovnu` with `st, st(i)`, `fcom` and `fcomp` with `st(i)` or an m32 or m64 operand, `fcompp`, `fucom` and `fucomp` with `st(i)`, `fucompp`, `fnstsw ax`, and five forms of each of `fadd`, `fsub`, `fsubr`, `fmul`, `fdiv` and `fdivr`: an m32 or m64 operand, `st, st(i)`, `st(i), st`, and the popping form (`faddp`, `fsubp`, `fsubrp`, `fmulp`, `fdivp`, `fdivrp`) with `st(i), st` for `i` from 1 to 7. It also accepts `fiadd`, `fisub`, `fisubr`, `fimul`, `fidiv` and `fidivr` with an m16 or m32 integer operand, `fnstcw` and `fstcw` with an m16 operand, which store the fixed control word `0x027F`, and `wait`, which does nothing because every exception is masked. A popping form with `st(0)` as the destination is rejected. A function enters with control word 0x027F (53-bit precision, round to nearest-even, all exceptions masked), TOP 0, all eight registers empty and a clear status word, and it must return with the stack empty. The stack depth before each instruction is fixed at translation time (`tools/x87_lower.py`), so each register becomes a C++ slot and no TOP exists at run time. Translation rejects any other x87 instruction, including `fldcw`, `fninit` and `fbld` (which only the checked entry below accepts), `ffree`, `fnstsw` with a memory operand, and environment access; a ninth push; a pop, an `st(i)` operand or `faddp` without enough values; depths that differ where control flow joins; an x87 instruction that is not reachable from the entry through direct edges; and a nonempty stack at a return, a call, an indirect branch or an external edge.
