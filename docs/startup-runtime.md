@@ -856,7 +856,10 @@ B8G8R8A8/B8G8R8X8 (87-93) families. Both allocation-info entries (slots 25 and 1
 answer for them.
 
 Verification status: the device-independent reference sizes in `tests/startup_plane_size_check.cpp`
-(`startup_plane_size`) cover R24G8 and the added colour families. `startup_plane_size_device_`
+(`startup_plane_size`) cover R24G8 and the added colour families. They include the first and last
+format of each multisampled colour family, B8G8R8A8 at 1920 x 1080, format 118 with four samples,
+format 120, a description at 64 KiB alignment, a desktop answer of the same size at 4 MiB alignment,
+and the zero-width, too-tall and too-many-slices shapes the rule refuses. `startup_plane_size_device_`
 checks that the wrapper answers the helper's result for the adapter's own desktop answer; it passed
 on Windows Server 2025 (WARP and the hardware case) in Debug and Release. It does not show that the
 console layout fits the answered size for these formats; no console reference sizes are listed for
