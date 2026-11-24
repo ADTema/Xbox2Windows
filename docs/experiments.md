@@ -11212,6 +11212,7 @@ python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_scalar_m0_(controls|warp|hardware)$' -V
 python -B tests/startup_gfx2hlsl_scalar_m0_check.py binary llvm-mc-15
+```
 
 ## Startup translator: uniform sources of v_readfirstlane_b32
 
