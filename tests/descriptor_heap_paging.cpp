@@ -154,11 +154,12 @@ void check_descriptor_heap_paging(ID3D12Device* device, bool swapped)
         throw std::runtime_error("Descriptor paging did not split the logical ranges across separate pages");
     }
 
-    const auto output = make_buffer(device, sizeof(Words), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    const auto output = make_buffer(device, sizeof(Words), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     const auto readback = make_buffer(device, sizeof(Words), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     ComputeCommands commands(device, pipeline.Get());
     auto* list = commands.list.Get();
+    transition(list, output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->SetComputeRootSignature(root.Get());
     ID3D12DescriptorHeap* visible[]{shared.Get()};
     list->SetDescriptorHeaps(1, visible);
