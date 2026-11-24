@@ -157,7 +157,9 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                                     export(mapped[provider], symbol.encode("ascii")))
                     if not imports[key]:
                         raise ValueError(f"{image}: mapped export {provider}!{symbol} unavailable")
-                elif image == report["entry"] and is_host_create_thread(terminal["dll"], symbol):
+                elif (image == report["entry"]
+                      and terminal["dll"].casefold() not in shims
+                      and is_host_create_thread(terminal["dll"], symbol)):
                     imports[key] = enroll
                 else:
                     imports[key] = addresses[terminal["dll"].casefold(), symbol]

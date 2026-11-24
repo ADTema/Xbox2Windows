@@ -15,6 +15,7 @@ Under the previous pe_map_run start, every slot-0 check in the guest log failed
 """
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -80,6 +81,19 @@ def check(mapper, exe):
         if result != expected_result:
             raise AssertionError(f"runner result {result!r}, expected {expected_result!r}")
         print(f"runner: LOG:{log} exit {result['exit_code']:#x}, equal to the Windows launch")
+
+        # Register the real Windows library as an explicit provider. Unlike a host default
+        # route, its CreateThread must survive import resolution untouched.
+        kernel = Path(os.environ["SystemRoot"]) / "System32" / "kernel32.dll"
+        explicit = subprocess.run(command + ["--system", "kernel32.dll",
+                                             "--shim", "kernel32.dll", str(kernel)],
+                                  capture_output=True, text=True, timeout=TIMEOUT, check=True)
+        explicit_log = guest_log(explicit.stdout)
+        explicit_result = json.loads(explicit.stdout[explicit.stdout.index("{"):])
+        if (explicit.stderr or explicit_log != "m1=yy m:yyyy a:n--- b:n--- X=2"
+                or explicit_result != {**expected_result, "exit_code": 2}):
+            raise AssertionError(f"runner replaced the explicit CreateThread provider: {explicit!r}")
+        print("explicit kernel32 provider: entry owns slot 0; unwrapped workers remain unenrolled")
     print("package main-image checks passed")
 
 
