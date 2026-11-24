@@ -433,6 +433,22 @@ foreach(entry IN ITEMS Wave64Emulate Wave64Emulate64 Wave64EmulateSkew)
         BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
     target_sources(offscreen_check PRIVATE "${header}")
 endforeach()
+target_sources(offscreen_check PRIVATE tests/shader_wave.cpp)
+foreach(width IN ITEMS 0 32 64)
+    if(width)
+        set(entry ShaderWave${width})
+        set(wave_args -T cs_6_6 -D WAVE_SIZE=${width})
+    else()
+        set(entry ShaderWave)
+        set(wave_args -T cs_6_0)
+    endif()
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
+    add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" ${wave_args} -E WaveWidth -Vn ${entry}
+        -Fh "${header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/shader_wave.hlsl" DEPENDS tests/shader_wave.hlsl
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
+    target_sources(offscreen_check PRIVATE "${header}")
+endforeach()
 foreach(entry IN ITEMS CopyBlocks FillBlocks NumberBlocks CopySpan ResetBounds)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
     add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E ${entry} -Vn ${entry}
@@ -701,6 +717,12 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(wave_shuffle_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME wave64_emulate_${adapter} COMMAND offscreen_check ${adapter} --wave64-emulate)
     set_tests_properties(wave64_emulate_${adapter} PROPERTIES TIMEOUT 45)
+    add_test(NAME shader_wave_${adapter} COMMAND offscreen_check ${adapter} --shader-wave)
+    set_tests_properties(shader_wave_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    foreach(width IN ITEMS 32 64)
+        add_test(NAME shader_wave${width}_${adapter} COMMAND offscreen_check ${adapter} --shader-wave${width})
+        set_tests_properties(shader_wave${width}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
     set_tests_properties(bvh_buffer_ops_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(dxr_query_${adapter} dxr_pipeline_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(offscreen_${adapter} PROPERTIES TIMEOUT 45)
@@ -714,6 +736,36 @@ set_tests_properties(bvh_reads_hardware bvh_waves_hardware bvh_hits_hardware PRO
 # The cs_6_5 fixtures skip on a WARP below SM 6.5. The Windows 10 in-box WARP reports SM 6.2.
 set_tests_properties(bvh_reads_warp bvh_waves_warp bvh_hits_warp bvh_packed_warp
     bvh_numeric_warp bvh_atomics_warp PROPERTIES SKIP_RETURN_CODE 77)
+# CRT-free startup attempt for a forced-wave compute pipeline (Refs #870; the desktop readback is #1132).
+# One EXE per shader variant and adapter, so the entry point takes no arguments. Each prints the
+# D3D12_OPTIONS1 lane range, the exact CreateComputePipelineState HRESULT and the debug-layer messages,
+# and reads back WaveGetLaneCount() when creation succeeds. An adapter whose range excludes the forced
+# width must refuse the pipeline and exits 77 with the HRESULT; creation that contradicts the range fails.
+foreach(width IN ITEMS 0 4 32)
+    set(variant_dir "${CMAKE_CURRENT_BINARY_DIR}/wave_startup_${width}")
+    set(defines)
+    if(width)
+        set(defines -D WAVE_STARTUP_WIDTH=${width})
+    endif()
+    add_custom_command(OUTPUT "${variant_dir}/wave_startup_cs.h"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${variant_dir}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_6 -E main ${defines} -Vn wave_startup_cs
+                -Fh "${variant_dir}/wave_startup_cs.h" "${CMAKE_CURRENT_SOURCE_DIR}/tests/wave_startup.hlsl"
+        DEPENDS tests/wave_startup.hlsl VERBATIM)
+    foreach(adapter IN ITEMS warp hardware)
+        set(target wave_startup_${width}_${adapter})
+        add_executable(${target} tests/wave_startup_exe.cpp "${variant_dir}/wave_startup_cs.h")
+        target_include_directories(${target} PRIVATE "${variant_dir}")
+        string(COMPARE EQUAL "${adapter}" warp is_warp)
+        target_compile_definitions(${target} PRIVATE WAVE_STARTUP_WIDTH=${width} WAVE_STARTUP_WARP=$<BOOL:${is_warp}>)
+        target_compile_options(${target} PRIVATE /GS- /Zl)
+        target_link_options(${target} PRIVATE /ENTRY:fixture_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
+            /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE kernel32 d3d12 dxgi)
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
 
 add_test(NAME bvh_differential_pipeline_warp COMMAND offscreen_check warp --bvh-differential-pipeline)
 set_tests_properties(bvh_differential_pipeline_warp PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
@@ -1347,6 +1399,42 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_pcmpstr_original_lifted>"
         "$<TARGET_FILE:cpu_avx_pcmpstr_altered_lifted>")
     set_tests_properties(cpu_aot_avx_pcmpstr PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_xsave_state_original_exports
+        "op_xrstor_xsave,op_xrstor64_xsave64,op_xrstor_xsave64,op_xrstor64_xsave,"
+        "op_xrstor64_disp,op_xrstor64_mask_sse,op_vzeroupper_xsave64,op_pipeline,"
+        "op_discarded_read")
+    string(CONCAT cpu_xsave_state_original_exports ${cpu_xsave_state_original_exports})
+    set(cpu_xsave_state_altered_exports
+        "op_xrstor64_xsave64,op_xrstor_xsave64,op_xrstor64_disp,op_pipeline")
+    string(CONCAT cpu_xsave_state_altered_exports ${cpu_xsave_state_altered_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_xsave_state_${variant} xsave_state)
+        cpu_translation(cpu_xsave_state_${variant} cpu_xsave_aot "${cpu_xsave_state_${variant}_exports}")
+    endforeach()
+    target_compile_definitions(cpu_xsave_state_altered PRIVATE ALTER_OP)
+    set(cpu_xsave_state_canonical_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_canonical_lifted.cpp")
+    add_custom_command(OUTPUT "${cpu_xsave_state_canonical_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_xsave_aot.py"
+            "$<TARGET_FILE:cpu_xsave_state_original>" "op_xsave_only,op_xsave64_only"
+            "${cpu_xsave_state_canonical_cpp}" --entry-state canonical
+        DEPENDS cpu_xsave_state_original tools/cpu_xsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_xsave_state_canonical_lifted SHARED "${cpu_xsave_state_canonical_cpp}")
+    set(cpu_xsave_state_canonical_altered_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_canonical_altered_lifted.cpp")
+    add_custom_command(OUTPUT "${cpu_xsave_state_canonical_altered_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_xsave_aot.py"
+            "$<TARGET_FILE:cpu_xsave_state_altered>" "op_xrstor64_mask_sse"
+            "${cpu_xsave_state_canonical_altered_cpp}" --entry-state canonical
+        DEPENDS cpu_xsave_state_altered tools/cpu_xsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_xsave_state_canonical_altered_lifted SHARED "${cpu_xsave_state_canonical_altered_cpp}")
+    add_test(NAME cpu_aot_xsave_state COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xsave_state_check.py"
+        "$<TARGET_FILE:cpu_xsave_state_original>"
+        "$<TARGET_FILE:cpu_xsave_state_original_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_altered_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_canonical_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_canonical_altered_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_altered>")
+    set_tests_properties(cpu_aot_xsave_state PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_pcmpstr64_exports
         "pcmpestri64_ub_eqany_pos_lsb,pcmpestri64_sw_ranges_neg_msb,"
         "pcmpestri64_mem_sb_eqeach_mpos_msb,pcmpestri64_alias_xmm0,"
@@ -1491,6 +1579,29 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_integer_flags_altered_lifted>"
         "$<TARGET_FILE:cpu_integer_flags_controls>")
     set_tests_properties(cpu_aot_integer_flags PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_sse_fxsave_exports
+        "op_fxrstor_fxsave,op_fxrstor64_fxsave64,op_fxrstor_fxsave64,"
+        "op_fxrstor64_fxsave,op_fxrstor64_disp,op_pipeline,op_discarded_read")
+    string(CONCAT cpu_sse_fxsave_exports ${cpu_sse_fxsave_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse_fxsave_${variant} sse_fxsave)
+        cpu_translation(cpu_sse_fxsave_${variant} cpu_sse_fxsave_aot "${cpu_sse_fxsave_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse_fxsave_altered PRIVATE ALTER_OP)
+    set(cpu_sse_fxsave_canonical_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse_fxsave_canonical_lifted.cpp")
+    add_custom_command(OUTPUT "${cpu_sse_fxsave_canonical_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_sse_fxsave_aot.py"
+            "$<TARGET_FILE:cpu_sse_fxsave_original>" "op_fxsave_only,op_fxsave64_only"
+            "${cpu_sse_fxsave_canonical_cpp}" --entry-state canonical
+        DEPENDS cpu_sse_fxsave_original tools/cpu_sse_fxsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_sse_fxsave_canonical_lifted SHARED "${cpu_sse_fxsave_canonical_cpp}")
+    add_test(NAME cpu_aot_sse_fxsave COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fxsave_check.py"
+        "$<TARGET_FILE:cpu_sse_fxsave_original>"
+        "$<TARGET_FILE:cpu_sse_fxsave_original_lifted>"
+        "$<TARGET_FILE:cpu_sse_fxsave_altered_lifted>"
+        "$<TARGET_FILE:cpu_sse_fxsave_canonical_lifted>")
+    set_tests_properties(cpu_aot_sse_fxsave PROPERTIES SKIP_RETURN_CODE 77)
     # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
     # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
     set(tail_files)

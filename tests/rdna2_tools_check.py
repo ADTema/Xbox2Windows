@@ -14,7 +14,7 @@ import unittest
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from disasm_rdna2 import SOPK_OPS, SOPP_OPS, disasm_rdna2, decode_instruction, disassemble_binary
+from disasm_rdna2 import SMEM_OPS, SOPK_OPS, SOPP_OPS, disasm_rdna2, decode_instruction, disassemble_binary
 from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
 from pixel_aot import VOP3_INT16, VOP3_INT16_TERNARY, fma_mix_operand, lower, native_program, parse_fma_mix
 from scan_unsupported_shaders import (
@@ -308,6 +308,23 @@ class TestRdna2Disasm(unittest.TestCase):
             ("01050cf445230100", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], s0 offset:0x12345"),
             ("420120f400000000", "s_buffer_load_dword", "s_buffer_load_dword s5, s[4:7], s0"),
             ("020528f4200000fa", "s_buffer_load_dwordx4", "s_buffer_load_dwordx4 s[20:23], s[4:7], 0x20"),
+            ("420160f400000000", "s_buffer_store_dword", "s_buffer_store_dword s5, s[4:7], s0"),
+            ("020164f4200000fa", "s_buffer_store_dwordx2", "s_buffer_store_dwordx2 s[4:5], s[4:7], 0x20"),
+            ("020168f4200000fa", "s_buffer_store_dwordx4", "s_buffer_store_dwordx4 s[4:7], s[4:7], 0x20"),
+            ("00007cf400000000", "s_gl1_inv", "s_gl1_inv"),
+            ("000080f400000000", "s_dcache_inv", "s_dcache_inv"),
+            ("000084f400000000", "s_dcache_wb", "s_dcache_wb"),
+            ("000190f400000000", "s_memtime", "s_memtime s[4:5]"),
+            ("000194f400000000", "s_memrealtime", "s_memrealtime s[4:5]"),
+            # Timer destinations keep the named 64-bit specials (spelling matches LLVM)
+            ("401f90f400000000", "s_memtime", "s_memtime null"),
+            ("801a90f400000000", "s_memtime", "s_memtime vcc"),
+            ("001b90f400000000", "s_memtime", "s_memtime ttmp[0:1]"),
+            ("401f94f400000000", "s_memrealtime", "s_memrealtime null"),
+            ("801a94f400000000", "s_memrealtime", "s_memrealtime vcc"),
+            ("c20198f4100000fa", "s_atc_probe", "s_atc_probe 7, s[4:5], 0x10"),
+            ("c2019cf4100000fa", "s_atc_probe_buffer", "s_atc_probe_buffer 7, s[4:7], 0x10"),
+            ("c20198f400000004", "s_atc_probe", "s_atc_probe 7, s[4:5], s2"),
             # MIMG: contiguous and NSA encodings
             ("001f00f000000000", "image_load", "image_load v[0:3], v0, s[0:7] dmask:0xf dim:SQ_RSRC_IMG_1D unorm"),
             ("080100f002000000", "image_load", "image_load v0, v[2:3], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D"),
@@ -704,6 +721,30 @@ class TestRdna2Disasm(unittest.TestCase):
                 )
         self.assertEqual(decode_instruction(bytes.fromhex("0000a6bf"), 0)[:3],
                          (4, "s_sopp_26", "s_sopp_26 0x0"))
+
+    def test_sop1_relative_scalar_moves(self):
+        # Words from `llvm-mc -arch=amdgcn -mcpu=gfx1010 -show-encoding`; M0 supplies the index, so it is not printed.
+        vectors = (
+            ("022e81be", "s_movrels_b32 s1, s2"),
+            ("042f82be", "s_movrels_b64 s[2:3], s[4:5]"),
+            ("023081be", "s_movreld_b32 s1, s2"),
+            ("043182be", "s_movreld_b64 s[2:3], s[4:5]"),
+            ("024981be", "s_movrelsd_2_b32 s1, s2"),
+        )
+        for raw, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                records = disasm_rdna2(bytes.fromhex(raw + "000081bf"))
+                self.assertEqual(
+                    [(r["offset"], r["length"], r["opcode"], r["assembly"]) for r in records],
+                    [(0, 4, assembly.split()[0], assembly), (4, 4, "s_endpgm", "s_endpgm")],
+                )
+                self.assertTrue(is_opcode_recognized(assembly.split()[0]))
+        # The neighbouring SOP1 opcode 0x32 is not one of them and stays an unknown record.
+        self.assertEqual(decode_instruction(bytes.fromhex("023281be"), 0)[:2], (4, "s_sop1_32"))
+        # A literal source consumes the trailing dword.
+        records = disasm_rdna2(bytes.fromhex("ff2e81be78563412000081bf"))
+        self.assertEqual([(r["length"], r["assembly"]) for r in records],
+                         [(8, "s_movrels_b32 s1, 0x12345678"), (4, "s_endpgm")])
 
     def test_hwreg_operands_use_llvm_spelling(self):
         """Issue #938: hwreg operands and s_setreg_imm32_b32 literals print as LLVM 15 prints them for gfx1013.
@@ -2495,6 +2536,17 @@ class TestRdna2Disasm(unittest.TestCase):
             "s_load_dwordx8 s[20:27], s[2:3], 0x0",
             "s_buffer_load_dword s5, s[4:7], s0",
             "s_buffer_load_dwordx4 s[20:23], s[4:7], 0x20",
+            "s_buffer_store_dword s5, s[4:7], s0",
+            "s_buffer_store_dwordx2 s[4:5], s[4:7], 0x20",
+            "s_buffer_store_dwordx4 s[4:7], s[4:7], 0x20",
+            "s_gl1_inv",
+            "s_dcache_inv",
+            "s_dcache_wb",
+            "s_memtime s[4:5]",
+            "s_memrealtime s[4:5]",
+            "s_atc_probe 7, s[4:5], 0x10",
+            "s_atc_probe_buffer 7, s[4:7], 0x10",
+            "s_atc_probe 7, s[4:5], s2",
             "image_load v0, v[2:3], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D",
             "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
             "image_sample_lz v[64:66], [v32, v16], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY",
@@ -3042,6 +3094,11 @@ class TestRdna2Extractor(unittest.TestCase):
 
 class TestRdna2Scanner(unittest.TestCase):
     """Test scanner instruction recognition vs full shader translator acceptance."""
+
+    def test_decoded_scalar_memory_forms_are_recognized(self):
+        """Every mnemonic the decoder prints for SMEM is recognized by the scanner, decoding only."""
+        missing = sorted(name for name in SMEM_OPS.values() if not is_opcode_recognized(name))
+        self.assertEqual(missing, [])
 
     def test_decoded_scalar_control_forms_are_recognized(self):
         """Every mnemonic the decoder prints for SOPP and SOPK is recognized by the scanner, decoding only."""
