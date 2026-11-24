@@ -224,6 +224,10 @@ class Stage:
         # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
         if tok.startswith('-') and not re.match(r'-[\d.]', tok):
             return '(%s ^ 0x80000000u)' % self.u(tok[1:])
+        if tok.startswith('-') and re.match(r'-[\d.]', tok):
+            # The disassembler prints both `src 193` (the literal -1) and `src 129` with NEG (inline 1 with
+            # its sign bit flipped, 0x80000001) as `-1`, so the printed operand does not identify the value.
+            raise Unsupported('negated integer constant %r is ambiguous' % tok)
         return self.u(tok)
 
     def f(self, tok):
