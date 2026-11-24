@@ -514,6 +514,15 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_nv12_draw_${backend} PROPERTIES
         ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${backend}" TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
+# The same header without a GPU (src/startup_stubs/slice_footprints.h): accepted NV12 descriptions,
+# re-read intervals and size cap, the footprint request and the bytes up to the end of the last row.
+# The mutated run is the negative control.
+add_executable(startup_slice_footprints_check tests/startup_slice_footprints_check.cpp)
+target_include_directories(startup_slice_footprints_check PRIVATE src)
+target_compile_features(startup_slice_footprints_check PRIVATE cxx_std_17)
+add_test(NAME startup_slice_footprints COMMAND startup_slice_footprints_check)
+add_test(NAME startup_slice_footprints_padded_control COMMAND startup_slice_footprints_check --mutate padded-last-row)
+set_tests_properties(startup_slice_footprints_padded_control PROPERTIES WILL_FAIL TRUE)
 
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
