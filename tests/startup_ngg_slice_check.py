@@ -28,7 +28,7 @@ interpretations, and each contrast differs from the model in exactly the fields 
   null        + two primitives are allocated and the second is exported as null
   two_waves   66 vertices, 22 primitives in a group of two waves: wave 1 learns the counts only through LDS
 
-Negative controls: five planted model faults (10-bit index fields read as 8-bit fields at 8-bit steps, the null bit ignored, the
+Negative controls: a changed DS offset must fail the decode comparison, and five planted model faults (10-bit index fields read as 8-bit fields at 8-bit steps, the null bit ignored, the
 vertex and primitive counts swapped, the wave offset of the thread index dropped, s_barrier ignored with wave 1
 run first) must each change at least one expected result. The expected results are written out below from the
 encoding, not computed by the model.
@@ -437,9 +437,10 @@ class Group:
         else:
             counts = self.alloc
             nv, npr = counts
-            assert set(self.vertices) == set(range(nv)) and set(self.prims) == set(range(npr)), 'exports do not match the allocation'
+            if self.mode == 'ngg':
+                assert set(self.vertices) == set(range(nv)) and set(self.prims) == set(range(npr)),                     'exports do not match the allocation'
             tris = []
-            for t in range(npr):
+            for t in sorted(k for k in self.prims if k < npr):
                 word = self.prims[t]
                 if word >> 31 and self.fault != 'ignore_null':
                     continue
@@ -480,8 +481,9 @@ PREDICTED = {
     'broadcast': {'pass': {'params'}, 'lane': {'params'}},
     'reversed': {'pass': {'prims', 'winding'}, 'lane': set()},
     'null': {'pass': {'counts'}, 'lane': set()},
+    # wave 1 never learns the counts: vertices 64 and 65 are missing, so primitive 21 (63, 64, 65) is invalid
     'two_waves': {'pass': {'counts', 'positions', 'params', 'prims', 'winding'},
-                  'lane': {'counts', 'positions', 'params', 'prims', 'winding'}},
+                  'lane': {'positions', 'params', 'winding'}},
 }
 FAULTS = ('index_bits', 'ignore_null', 'swap_counts', 'lane_index', 'no_barrier')
 
@@ -496,6 +498,13 @@ def evaluate(blob, case, mode='ngg', fault=None):
 def main():
     failures = []
     blobs = {case: check_decode(program(case)) for case in EXPECTED}
+    bad = program(None)
+    bad[11][1] = ds('ds_write_b32', 'v3', data='v2', offset=8)  # count word written one slot too far
+    try:
+        check_decode(bad)
+        failures.append('a changed DS offset still decoded to the source text')
+    except AssertionError:
+        pass
     for case, blob in blobs.items():
         ref = evaluate(blob, case)
         if ref != EXPECTED[case]:

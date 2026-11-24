@@ -3236,6 +3236,41 @@ Guest amplification code, a multi-group mesh dispatch, a translated mesh payload
 and the meshlet command stream are not translated. The fixture above is source
 built; it makes no console mesh-shader ABI claim.
 
+## NGG primitive-shader cases
+
+`tests/startup_ngg_slice_check.py` separates an identity NGG triangle from
+single-change contrasts before any NGG lowering is attempted (#1723). Each case
+is one gfx1013 program in the NGG form: lane 0 of wave 0 writes the vertex and
+primitive counts to LDS, waits at `s_barrier` and sends `GS_ALLOC_REQ`
+(`m0 = primitives << 12 | vertices`); the other waves read the counts back after
+the barrier. Thread `t = 64 * wave + lane` exports vertex `t` when `t` is below
+the vertex count and primitive `t` (export target 20, three 10-bit indices, bit
+31 null) when `t` is below the primitive count. The programs are encoded from
+the `disasm_rdna2` opcode tables, decoded again (the text must match the
+source), and run by a Python reference model and by two candidate
+interpretations: `pass` (lane-private LDS, counts and primitive exports ignored,
+triangle list in thread order) and `lane` (lane-private LDS, counts and
+primitive exports honoured).
+
+| Case | Change from identity | `pass` differs in | `lane` differs in |
+|---|---|---|---|
+| identity | 3 vertices, primitive (0,1,2), own-lane LDS round trip | nothing | nothing |
+| broadcast | lane 0 writes one LDS word; all lanes add it after `s_barrier` | parameters | parameters |
+| reversed | primitive (2,1,0) | primitives, winding | nothing |
+| null | two primitives allocated, the second null | counts | nothing |
+| two_waves | 66 vertices and 22 primitives over two waves | every field | positions, parameters, winding |
+
+The expected results are written out from the encoding. A changed DS offset
+must fail the decode comparison, and five planted model faults (8-bit index
+fields, the null bit ignored, swapped counts, no wave offset in the thread
+index, `s_barrier` ignored with wave 1 first) must each change an expected
+result. The words have not been reassembled with LLVM; there is no `binary`
+mode yet. The fixture is a classification aid, not a lowering.
+
+```sh
+python3 -B tests/startup_ngg_slice_check.py
+```
+
 ## Compute UAV stores from a native container
 
 `tools/compute_store_aot.py` accepts a local extracted DXBC compute container. It checks the stage in both the DXIL and PSV0 parts, the group dimensions, the FSSM v0x101 extent and termination, then decodes the gfx1013 instructions with LLVM. The store profile translates one or more non-overlapping raw UAV stores of one to four known 32-bit constant words per invocation, including constants loaded via `s_mov_b32`, `s_movk_i32`, and `v_mov_b32` register copies, along with `s_clause` hints and combined `lgkmcnt(0)`/`vmcnt(0)` waits. A test binding maps one four-word descriptor to u0. Its table pointer has a known low register and a zero high word. Scalar loads must complete before use. For an indexed store the caller also supplies the group-X register and byte stride, v0 carries local X, and the decoded shift and add must produce the dispatch-thread index. The tests bind in-range raw buffers with no swizzle, format conversion or out-of-range accesses. The original descriptor contents and dispatch configuration require separate evidence.
