@@ -997,6 +997,14 @@ class Stage:
         target, vals, flags = m.group(1), [v.strip() for v in m.group(2).split(',')], m.group(3).split()
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
+        if target == 'mrtz':
+            if (self.kind != 'ps' or self.has_branches or self.blocks or not self.exec_known or 'depth' in self.exports
+                    or 'compr' in flags or len(vals) != 4 or not re.fullmatch(r'v\d+', vals[0])
+                    or vals[1:] != ['off', 'off', 'off']):
+                raise Unsupported('MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC')
+            self.exports['depth'] = True
+            self.emit('o.depth = %s;' % self.f(vals[0]))
+            return None
         name = {'pos0': 'pos'}.get(target, target)
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
             raise Unsupported('export target %s' % target)
@@ -1309,11 +1317,14 @@ class Pipeline:
     def hlsl_ps(self):
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
+        depth = 'depth' in s.exports
         out = self.common() + ['struct PSIn {'] + self.interface(True) + ['};']
-        if not targets:  # depth-only: no output struct, so the pipeline declares no SV_Target
+        if not targets and not depth:
             out += ['void main(PSIn i) {'] + s.declarations() + s.body() + ['}']
             return '\n'.join(out) + '\n'
         out.append('struct PSOut {')
+        if depth:
+            out.append('    float depth : SV_Depth;')
         for t in targets:
             kind = self.mrt_kind(t)
             out.append('    %s mrt%d : SV_Target%d;' % ({'int': 'int4', 'uint': 'uint4'}.get(kind, 'float4'), t, t))
