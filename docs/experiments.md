@@ -2,6 +2,16 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## Offline store context forwarding
+
+The fake-user runtime creates an offline store context token. Unimplemented methods receiving
+that token in any of their first four arguments return `E_FAIL` before entering the desktop
+runtime, which cannot interpret the token as an object. This does not implement store services.
+The `startup_stubs` source-built control uses a desktop method returning a sentinel: all four
+token positions must be refused, while a different value must reach that method unchanged.
+Build `startup_stub_consumer` and run
+`ctest --preset dev --no-tests=error -R '^startup_stubs$' --output-on-failure`.
+
 ## Typed startup colour exports
 
 The [startup draw fixture](startup-runtime.md) uses a source-built gfx1013 pixel shader
