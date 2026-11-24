@@ -127,3 +127,5 @@ These are measured on one executable; treat them as hypotheses for others.
   `ctest --preset release --no-tests=error -R "^startup_stream_(request|draw)_"`.
   Other stage combinations and full stream rasterizer/depth state remain open.
 - Audio produces no output.
+
+The single-lane shader translator accepts `v_readfirstlane_b32` in straight-line code when its active VGPR holds an integer conversion of a fixed-offset scalar buffer value. Run `python -B tests/startup_uniform_lane_check.py` to check the producer and the varying-source, register-clobber, mask and branch controls.
