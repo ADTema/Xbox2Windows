@@ -10,6 +10,7 @@ looked at nothing.
 
 import pathlib
 import sys
+import tempfile
 
 DEFAULT_DIRECTORY = "tools/startup"
 
@@ -20,11 +21,10 @@ def compile_sources(directory):
     problems = []
     for path in files:
         try:
-            # utf-8-sig, not utf-8: Python accepts a UTF-8 BOM in source, so treating one as a syntax error
-            # would fail a file that the interpreter runs.
-            source = path.read_text(encoding="utf-8-sig")
-        except (OSError, UnicodeDecodeError) as error:
-            problems.append("{}: unreadable or not UTF-8: {}".format(path, error))
+            # Compiling bytes lets Python honor its own BOM and encoding-cookie rules.
+            source = path.read_bytes()
+        except OSError as error:
+            problems.append("{}: unreadable: {}".format(path, error))
             continue
         try:
             compile(source, str(path), "exec", dont_inherit=True)
@@ -34,19 +34,17 @@ def compile_sources(directory):
 
 
 def self_test():
-    """Proves this harness rejects a broken snippet and accepts a valid one."""
-    failures = []
-    try:
-        compile("def broken(:\n", "<control>", "exec", dont_inherit=True)
-    except SyntaxError:
-        pass
-    else:
-        failures.append("control: a snippet that cannot be parsed was accepted")
-    try:
-        compile("def fine():\n    return 1\n", "<control>", "exec", dont_inherit=True)
-    except SyntaxError as error:
-        failures.append("control: a valid snippet was rejected ({})".format(error))
-    return failures
+    """Check the file-scanning path with valid encodings and invalid syntax."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        broken = root / "broken.py"
+        broken.write_bytes(b"\ndef broken(:\n")
+        (root / "utf8_bom.py").write_bytes(b"\xef\xbb\xbfanswer = 1\n")
+        (root / "latin1.py").write_bytes(b"# coding: latin-1\nword = '\xe9'\n")
+        files, problems = compile_sources(root)
+        if len(files) != 3 or len(problems) != 1 or not problems[0].startswith(f"{broken}:2: "):
+            return [f"control: expected only the syntax error at {broken}:2, got {problems}"]
+    return []
 
 
 def main(argv):
