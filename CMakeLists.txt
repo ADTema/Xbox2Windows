@@ -404,6 +404,17 @@ target_compile_features(startup_storage_refusal_order PRIVATE cxx_std_17)
 add_dependencies(startup_storage_refusal_order startup_stub_xcrdapi)
 add_test(NAME startup_storage_refusal_order COMMAND startup_storage_refusal_order "$<TARGET_FILE:startup_stub_xcrdapi>")
 set_tests_properties(startup_storage_refusal_order PROPERTIES TIMEOUT 60)
+# Failed requests counted by cause for the heartbeat (#1198): at or past EOF, crossing EOF, other read
+# failure, destination capacity, non-writable destination, zlib, BCPack, other. The test compiles the
+# stand-in's source into itself to read the counters; the one-bucket expectations are the negative control.
+add_executable(startup_storage_failure_counts tests/startup_storage_failure_counts.cpp)
+target_compile_features(startup_storage_failure_counts PRIVATE cxx_std_17)
+target_include_directories(startup_storage_failure_counts PRIVATE src)
+target_link_libraries(startup_storage_failure_counts PRIVATE psapi)
+add_test(NAME startup_storage_failure_counts COMMAND startup_storage_failure_counts)
+add_test(NAME startup_storage_failure_counts_one_bucket_control COMMAND startup_storage_failure_counts --mutate one-bucket)
+set_tests_properties(startup_storage_failure_counts startup_storage_failure_counts_one_bucket_control PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_storage_failure_counts_one_bucket_control PROPERTIES WILL_FAIL TRUE)
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
