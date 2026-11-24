@@ -1636,9 +1636,15 @@ caller establishes canonical architectural XSAVE state (`FCW=0x037F`, `FSW=0`, `
 `vzeroupper`, `movdqa`/`movdqu`, `paddd`, `movq` (`MM0`..`7`), `emms`, 32/64-bit volatile GPR
 `mov`/`xor` (with pointer provenance and constant-mask tracking), and terminal `ret`. The
 lifted DLL exports `host_has_xsave()` (`CPUID.1:ECX[26..28]` and `XGETBV(0) & 7 == 7`,
-returning exit code 77 when absent), `host_deprecates_fpu_cs_ds()`,
-`host_fp_err_cpuid_info()`, and `host_mxcsr_mask()`. `xsaveopt*`, `xsavec*`,
-`xsaves*`/`xrstors*`, `fxsave*`/`fxrstor*`, EVEX encodings, nonvolatile registers, unclosed
+returning exit code 77 when absent), `host_has_xsavec()` (`CPUID.(0DH,1):EAX[1]`; without it the
+native `xsavec` fixtures are skipped and only the lifted path is checked), `host_deprecates_fpu_cs_ds()`,
+`host_fp_err_cpuid_info()`, and `host_mxcsr_mask()`. `xsavec`/`xsavec64` store the compacted
+format: a component is written only when `XINUSE & RFBM` selects it (SSE is in use when an XMM register is
+live or `MXCSR` differs from `0x1F80`, so a restored non-default `MXCSR` with `XSTATE_BV[1]=0` is still saved), `XSTATE_BV = XINUSE & RFBM`,
+`XCOMP_BV = bit 63 | RFBM`, the reserved header bytes and legacy bytes `[416..511]` are left
+untouched, and `MXCSR` is stored with the SSE component. With only `x87|SSE|AVX` the compacted
+offsets equal the standard ones (AVX at 576), so the offset rule is not separately observable.
+Alignment and mask faults are raised before the first store. `xsaveopt*`, `xsaves*`/`xrstors*`, `fxsave*`/`fxrstor*`, EVEX encodings, nonvolatile registers, unclosed
 MMX state before `ret`, non-`r8` stores, prefixes, RIP-relative or indexed addressing, and
 branches reject.
 
@@ -1651,7 +1657,7 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_xsave_state$' -V
 
 The native harness probes whether the host preserves the 16-bit FCS and FDS values in the non-REX.W legacy area after XRSTOR/XSAVE. A measured zero is expected only at the corresponding native selector bytes. Lifted results still follow the separately specified CPUID-based profile.
 
-The [MASM fixture](../tests/cpu/xsave_state.asm) exports 11 functions covering opt-in
+The [MASM fixture](../tests/cpu/xsave_state.asm) exports 16 functions covering opt-in
 canonical-entry `xsave`/`xsave64` (`cpu_xsave_state_canonical_lifted`), `xrstor`/`xrstor64`
 roundtrips, displaced `[rcx+64]`/`[r8+64]`, `RFBM = 2` SSE-only masking (and `ALTER_OP`
 `RFBM = 2 -> 7` under `cpu_xsave_state_canonical_altered_lifted`), `vzeroupper` clearing
@@ -1675,8 +1681,18 @@ alternate-encoding lift checks, 39 unit rejection controls (including default-pr
 entry-only and partial-restore/save rejections), and 10 end-to-end PE-patched DLL rejection
 controls.
 
-Not covered by this experiment: compacted/supervisor formats (`xsavec*`, `xsaves*`,
-`xrstors*`), `xsaveopt*`, AVX-512/PKRU state components beyond `XCR0[2:0]`, control flow,
+The `xsavec` exports (`op_xrstor64_xsavec`, `op_xrstor64_xsavec64`, `_sse`, `_x87_avx`,
+and the lifted-only `op_xsavec64_dynmask`) are compared with the native instruction on
+the XSTATE_BV subsets above. The native comparison accepts extra initialized legacy
+components and an unwritten or written `MXCSR` when SSE is not in use and `MXCSR` is the
+default, because those are implementation choices; a non-default `MXCSR` is checked against the
+SDM rule with an independent oracle; `ALTER_OP` (standard `xsave64` instead of `xsavec64`, request mask
+ignored) and header/word mutations must fail. The harness has not run on Windows yet: run
+`ctest --preset dev -R '^cpu_aot_xsave_state$'` (Debug and `/O2`), which is outside `--preset pr`.
+
+Not covered by this experiment: supervisor formats (`xsaves*`, `xrstors*`), compacted
+`xrstor`, components beyond x87/SSE/AVX (so no packed offsets or 64-byte component alignment),
+`xsaveopt*`, AVX-512/PKRU state components beyond `XCR0[2:0]`, control flow,
 and title CPU code execution.
 
 ## Mapping an image without LoadLibrary
@@ -5381,6 +5397,14 @@ How the shader lookup works:
 | `gpu_alias_lookup_writes_warp`, `gpu_alias_lookup_writes_hardware` | The same four allocations. A compute shader runs 2,331 records through the lookup: 14 stores (range starts, middles, each last valid word, and the words on either side of the 4 GiB line, all distinct); 256 contending threads each for add, sub, float min and float max on one word per operation; signed-zero records on nine more words (see below); and nine rejected records (stores to unmapped addresses, a store and a float min on the tail-crossing word, misaligned store, add and sub inside ranges), which must report 0. Every word of all four allocations is then compared with the CPU expectation through the title pointers, so rejected writes, including the in-range bytes of the tail-crossing word, must leave the backing words unchanged. A compare-exchange loop that does not retry after losing a race passes on WARP, which showed no conflicting update. It fails on hardware. Before the fixture, a probe on four plain zeroed buffers in the same kind of UAV table has 256 threads each add 1 through a per-thread array index; each buffer must read 64, and the expected and actual counts are always printed. The fixture then runs in full and reports two groups, each with a mismatch count and its first mismatch: the shared add and sub words, and everything else (the per-record results and every other word). Wrong probe counts or any mismatch fail the test. It returns 77 only when the adapter does not support existing heaps. |
 | `gpu_alias_window_warp`, `gpu_alias_window_hardware` | A 256 KiB memory-type-1 allocation is opened as an existing heap and covered by one `era_title_va::Table` range. Pages 0, 1 and 2 resolve to the same window-relative offsets, and the low 16 bits of each CPU and GPU address are identical. A span of `0x1e000` bytes at offset `0x11234` starts in page 1, is not 64 KiB aligned, and ends in page 2. The fixture copies it CPU-to-GPU-to-readback and GPU-to-CPU through the title pointer; every byte and 64 guard bytes on each side must match. Negative controls: a page at the end of the window returns `E_BOUNDS`; `resolve_pages` at `base + 0x1000` returns `E_INVALIDARG`; a reserved page in a partially committed range returns `ERROR_INVALID_ADDRESS`, and `era_gpu_alias::open` on a reserve-only page returns `E_INVALIDARG`. None records a command list or changes a sentinel readback. Returns 77 when the adapter does not support existing heaps. |
 
+The `gpu_alias_warp` and `gpu_alias_hardware` cases also assign two separate heaps
+synthetic guest addresses that differ only in bit 40. A shader reads the low range
+and writes 4,096 words through the full destination address into the high range.
+Clearing bit 40 deliberately selects the low range for the same write. CPU checks
+cover every destination word, the untouched allocation and the surrounding guards.
+Unregistering the high range leaves the low address valid. Run
+`ctest --preset release --no-tests=error -R '^gpu_alias_(warp|hardware)$' -V`.
+
 The window acceptance is window-relative: for each page and for the non-page-aligned span,
 `gpu - gpu_base == cpu - cpu_base` and the low 16 address bits match. The absolute bases differ
 because desktop D3D12 chooses the GPU virtual address. The fixture proves that the two addresses
@@ -8505,4 +8529,14 @@ of 16,384 pixels for BC3 and 15,360 for BC7.
 ```powershell
 cmake --build --preset release --target startup_stream_consumer startup_stub_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error --output-on-failure -R '^(startup_address_(bc_view|srv)_(hardware|warp)|startup_xg_bc7_layout|bc7_tile_swizzle)$'
+```
+
+### Six BC5/BC7 mips on a 64 KiB standard layout
+
+`startup_xg_bc_chain_{warp,hardware}` uses a source-built 1024×1024 BC5_UNORM or BC7_UNORM texture with six mip levels, one slice, one sample, explicit layout `0x109` (64 KiB standard, no XOR), default alignment and zero flags. The guest chain occupies `0x160000` bytes. The six offsets starting at mip 0 are `0x60000, 0x20000, 0x10000, 0x8000, 0x4000, 0x2000`. The three smallest mips share tile zero. These offsets and all 87,360 visible block addresses were checked with `Addr2ComputeSurfaceInfo` and `Addr2ComputeSurfaceAddrFromCoord` on the pinned Navi21 configuration. [AMD addrlib revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib) · [XCL comparison](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/gpu/tiling.rs)
+
+The fixture checks the XG layout, tile spans, block offsets, copy in and out, and preserved row/tile padding. It binds the resulting buffer as a six-level address SRV. Each backend reads back 6,144 pixels sampled across the six mips and 6,144 pixels from a control draw region forced to mip zero. For both formats the control changes 5,120 pixels. The hardware run used an RTX 4060 Laptop GPU (32.0.16.1656), alongside Microsoft WARP (10.0.26100.9818) on Windows 11 build 26200.9974 with the debug layer off.
+
+```powershell
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_bc_chain_'
 ```

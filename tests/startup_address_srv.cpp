@@ -115,3 +115,30 @@ int draw_bc_address_srvs(void* guest, void* list)
     }
     return 0;
 }
+
+// The backing is produced by XG CopyIntoSubresource from a source-built block texture.
+int draw_bc_chain(void* guest, void* list)
+{
+    wchar_t path[MAX_PATH]{};
+    const DWORD size = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", path, MAX_PATH);
+    if (!size || size >= MAX_PATH) return 43;
+    static std::array<char, 0x160000 + 0xffff> storage{};
+    char* backing = reinterpret_cast<char*>((ptr(storage.data()) + 0xffff) & ~Word{0xffff});
+    std::ifstream input(path, std::ios::binary);
+    if (!input.read(backing, 0x160000) || input.peek() != std::char_traits<char>::eof()) return 43;
+    const bool bc5 = GetEnvironmentVariableW(L"X2W_TEST_BC5", nullptr, 0) != 0;
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1024, 1024, 1, 6,
+        bc5 ? DXGI_FORMAT_BC5_UNORM : DXGI_FORMAT_BC7_UNORM, {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(0x109),
+        D3D12_RESOURCE_FLAG_NONE};
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    ViewAt v{};
+    v.address = ptr(backing);
+    v.view.Format = desc.Format;
+    v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.view.Texture2D.MipLevels = desc.MipLevels;
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    invoke(list, 12, 3, 1);
+    return 0;
+}
