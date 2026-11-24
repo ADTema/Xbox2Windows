@@ -1432,6 +1432,16 @@ target_include_directories(startup_bc64_supports_check PRIVATE src)
 add_test(NAME startup_bc64_supports COMMAND startup_bc64_supports_check)
 add_test(NAME startup_bc64_supports_layout_control COMMAND startup_bc64_supports_check --mutate layout)
 set_tests_properties(startup_bc64_supports_layout_control PROPERTIES WILL_FAIL TRUE)
+# Slot-10 tile plan for layout 0x10a (src/startup_stubs/tile64_plan.h) without a device: tile shapes,
+# accepted descriptions and hand-worked plans. The mutated runs are negative controls.
+add_executable(startup_tile64_plan_check tests/startup_tile64_plan_check.cpp)
+target_compile_features(startup_tile64_plan_check PRIVATE cxx_std_17)
+target_include_directories(startup_tile64_plan_check PRIVATE src)
+add_test(NAME startup_tile64_plan COMMAND startup_tile64_plan_check)
+foreach(mutation IN ITEMS bc4 width clamp)
+    add_test(NAME startup_tile64_plan_${mutation}_control COMMAND startup_tile64_plan_check --mutate ${mutation})
+    set_tests_properties(startup_tile64_plan_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 add_test(NAME xg_swizzle_select COMMAND xg_swizzle_select_check)
 set_tests_properties(xg_swizzle_select PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 # Mutation control: the same comparison must identify all nine mismatches.

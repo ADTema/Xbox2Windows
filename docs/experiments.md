@@ -10853,9 +10853,12 @@ The rule was fitted to texture pool files of one console package, read with the 
 
 `startup_xg_tile64_tiling` checks 18 source-described shapes and 120 queries: tile totals, the packed-mip record, the tile shape, the entries of the standard mips at their positions in the requested range, array slices, and sentinel bytes over packed entries and the rest of the caller's array. The expected values are written out in the test and recomputed there by an independent Python model. As a control it checks that the desktop order for the 2048×2048 case is not what the stand-in returns; run against a build without the plan, the test fails on the first shape.
 
+`startup_tile64_plan` checks the header without the XG DLL or a device. It lists the tile shape of every format the plan takes and three formats it must refuse (unknown, 8-byte and 1-bit texels); the descriptions on each side of every bound in `Plan::supports` (16384 and 16385 texels in each direction, a width that is 256 when cut to 32 bits, no slices, no mips, 16 and 17 mips, two samples, other dimensions, layout `0x109`, the desktop 64 KiB standard swizzle and an unknown layout, an unknown format); and seven hand-worked plans: 1024×1 and 1×1024 RGBA8 chains whose one-texel side stays one texel (and one tile) at every mip, a six-slice BC4 chain with a whole-tile mip, an R16 mip one texel more than half a tile wide, a BGRA8 mip exactly half a tile wide and one tile high, and single mips that cover 2×3 and 2×1 tiles. Three mutated runs (`--mutate bc4`, `width` and `clamp`) expect a wrong answer and are registered as negative controls.
+
 ```powershell
-cmake --build --preset release --target startup_stub_xg_xs
+cmake --build --preset release --target startup_stub_xg_xs startup_tile64_plan_check
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_(tile64|bc)_tiling$'
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_tile64_plan'
 ```
 
 One console executable was run under the startup debugger with a scripted first-run input, before and after this change, on a clang-cl build under Wine 11.0 with vkd3d-proton (RTX 4070 Ti SUPER, driver 550.163.1). Both builds had the open DirectStorage changes #1429 and #1390 merged onto `main` at `bb6c9a0c`, and a local switch that delivers the first part of a zlib stream longer than its destination (#1198). The executable made 177 distinct slot-10 queries, all two-dimensional with layout `0x10a`.
