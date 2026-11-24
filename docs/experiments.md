@@ -3021,6 +3021,29 @@ An `s_branch` that skips an alignment NOP at the start is still accepted, and th
 
 These are fixture results only. The 1,002 multi-exit CS records in the [fixed-profile rescan](#fixed-profile-archive-rescan) have not been split by marker count, so it is not known how many have exactly two exits or this layout. Their counts have not been remeasured after this change.
 
+### Indexed gfx1030 typed-buffer writes
+
+The `gfx1030` store profile lowers `tbuffer_store_format_{x,xy,xyz,xyzw}`
+with matching 32-bit UINT components to `RWByteAddressBuffer.Store{,2,3,4}`.
+The format must describe exactly as many 32-bit unsigned components as the
+opcode writes. The accepted address uses `idxen`, a proven dispatch-thread
+index, zero scalar offset, and a DWORD-aligned instruction offset. All
+words must fit inside the explicit `--stride`. The same descriptor wait,
+disjoint address and overlap checks apply to typed and raw stores.
+
+The binding assumes valid unswizzled native descriptors and in-range
+accesses. It does not emulate descriptor bounds checks or format conversion.
+The source-built wave32 fixtures write distinct per-channel and per-lane
+values after a sentinel DWORD in each record. The CPU reference compares
+all 320 UAV words for one and two groups. An otherwise valid translation
+shifted one DWORD earlier must mismatch at word 0. The LLVM 15 binary
+check assembles and decodes each opcode before repeating the lowering check.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_store_(warp|hardware)$' -V
+```
+
 ### Per-lane guards around compute stores
 
 A per-lane bound such as `if (gid < n) store` compiles under LLVM 15 to one exit, with no early `s_endpgm`. A `v_cmp` sets `vcc_lo`, `s_and_saveexec_b32` saves `exec_lo` and masks it, and an optional `s_cbranch_execz` skips the masked block when no lane passes. `s_or_b32 exec_lo, exec_lo, sN` then restores the mask, or the program exits with the mask still applied. The store profile lowers this form as control flow: the stores issued under the mask go inside an HLSL `if`, and stores after the restore stay outside it.
