@@ -8,6 +8,19 @@ from pixel_aot import container_code, disassemble
 from resource_inventory import parts
 
 
+# Plain binary32 VOP2 forms. src0 may be a constant, scalar word or VGPR; vsrc1 is
+# always a VGPR. subrev swaps the operands. The fixtures keep values finite and
+# normal, so NaN and subnormal behavior is not claimed.
+BINARY_F32 = {
+    "v_add_f32_e32": lambda x, y: f"({x} + {y})",
+    "v_sub_f32_e32": lambda x, y: f"({x} - {y})",
+    "v_subrev_f32_e32": lambda x, y: f"({y} - {x})",
+    "v_mul_f32_e32": lambda x, y: f"({x} * {y})",
+    "v_min_f32_e32": lambda x, y: f"min({x}, {y})",
+    "v_max_f32_e32": lambda x, y: f"max({x}, {y})",
+}
+
+
 def lower(decoded, tables):
     if (
         len(tables) != 2
@@ -40,6 +53,8 @@ def lower(decoded, tables):
 
     def fp(token):
         if re.fullmatch(r"v\d+", token):
+            if int(token[1:]) not in vector:
+                raise ValueError("Unwritten vector register")
             return vector[int(token[1:])]
         if re.fullmatch(r"-?\d+\.\d+", token):
             return token + "f"
@@ -134,6 +149,9 @@ def lower(decoded, tables):
             elif op == "v_mul_legacy_f32_e32" and len(args) == 3:
                 x, y = map(fp, args[1:])
                 expr = f"(({x} == 0 || {y} == 0) ? 0.0f : {x} * {y})"
+            elif op in BINARY_F32 and len(args) == 3 and re.fullmatch(r"v\d+", args[2]):
+                x, y = map(fp, args[1:])
+                expr = BINARY_F32[op](x, y)
             elif op == "v_fmac_f32_e32" and len(args) == 3:
                 expr = f"mad({fp(args[1])}, {fp(args[2])}, {vector[dest]})"
             elif op == "v_fract_f32_e32" and len(args) == 2:
