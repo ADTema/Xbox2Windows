@@ -3166,6 +3166,18 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 
 Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`. On Windows 11 build 26300.9974, the Intel Arc 140T (32.0.101.8132) matched all 320 words after one and after three indexed groups, with zero D3D12 debug errors and warnings.
 
+### gfx1013 compute DPP16 quad permutation
+
+The compute profile lowers `v_or_b32_dpp` only when it has a 32-bit VGPR destination and sources, `quad_perm:[a,b,c,d]`, and both full masks (`row_mask:0xf bank_mask:0xf`). It computes the current lane's quad base from `WaveGetLaneIndex()` and reads the selected source with `WaveReadLaneAt`; the other OR operand remains lane-local. The entire group size must be divisible by four, and DPP inside a lane-guarded region is refused so every selected source lane is active. Other DPP opcodes, row/bank shifts, partial masks and DPP8 remain unsupported.
+
+The binary-mode check assembles and disassembles the source-built gfx1013 program through LLVM 15 in CI, then compares lowering of the disassembly with lowering of the assembly text.
+
+The GPU fixture uses 32 unique lane words, distinct across quads. It records each thread's wave-lane index, wave width and `WaveActiveBallot` mask in the same dispatch as the translated result. The CPU oracle uses that lane map to verify all four source lanes in each quad are active and checks the selected source word; a no-shuffle mutant must fail. With the D3D12 debug layer enabled, HLSL compilation and readback matched on Windows 11 build 26300 on WARP (Microsoft Basic Render Driver, driver 10.0.26100.9818) and the NVIDIA GeForce RTX 3060 Laptop GPU (driver 32.0.16.2124), with zero debug errors and warnings. These results cover the tested D3D12 adapters, not Xbox hardware.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_dpp_(warp|hardware)$' -V
+```
+
 ### gfx1030 MUBUF cache-invalidation rejection
 
 The compute store profile rejects `buffer_gl0_inv` and `buffer_gl1_inv`

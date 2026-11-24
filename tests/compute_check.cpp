@@ -177,7 +177,8 @@ struct StoreCase {
 static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE shader,
                         D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false,
                         const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr,
-                        DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN, ID3D12Resource* rendered_texture = nullptr)
+                        DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN, ID3D12Resource* rendered_texture = nullptr,
+                        bool dpp_case = false)
 {
     if ((texels || rendered_texture) && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
     ComPtr<ID3D12RootSignature> signature;
@@ -229,9 +230,64 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
         std::printf("immediate_uint=0x%08x immediate_int=0x%08x\n", words[0], words[1]);
     const UINT active = conversion_pair ? 2 : count;
     for (UINT i = 0; i < capacity; ++i) {
-        const UINT expected = store ? store->expected[i] : i >= active ? sentinel : conversion_pair ? (i == 0 ? 0xffffffffu : 0x7fffffffu)
+        UINT expected = store ? store->expected[i] : i >= active ? sentinel : conversion_pair ? (i == 0 ? 0xffffffffu : 0x7fffffffu)
             : (input_word(i) * 33u) ^ (key + i * constants[1]);
-        if (words[i] != expected) {
+        bool mismatch = words[i] != expected;
+        if (dpp_case) {
+            if (i < 32) {
+                const UINT lane = words[32 + i];
+                const UINT lane_count = words[64 + i];
+                constexpr UINT perm[4]{1, 0, 3, 2};
+                mismatch = lane_count < 4 || lane_count > 128 || lane >= lane_count;
+                if (!mismatch) {
+                    const UINT source_lane = (lane & ~3u) | perm[lane & 3u];
+                    mismatch = source_lane >= lane_count;
+                    if (!mismatch) {
+                        const UINT quad_base = lane & ~3u;
+                        for (UINT quad_lane = 0; quad_lane < 4 && !mismatch; ++quad_lane) {
+                            const UINT member = quad_base + quad_lane;
+                            if (member >= lane_count) {
+                                mismatch = true;
+                                break;
+                            }
+                            const UINT active_word = words[96 + i * 4 + member / 32];
+                            mismatch = !(active_word & (1u << (member % 32)));
+                        }
+                        expected = input_word(source_lane) | lane;
+                        mismatch = mismatch || words[i] != expected;
+                    }
+                }
+            } else if (i < 64) {
+                const UINT lane = words[i];
+                const UINT lane_count = words[64 + i - 32];
+                mismatch = lane_count < 4 || lane_count > 128 || lane >= lane_count;
+            } else if (i < 96) {
+                const UINT lane = words[32 + i - 64];
+                const UINT lane_count = words[i];
+                mismatch = lane_count < 4 || lane_count > 128 || lane >= lane_count;
+            } else if (i < 224) {
+                const UINT thread = (i - 96) / 4;
+                const UINT lane = words[32 + thread];
+                const UINT lane_count = words[64 + thread];
+                mismatch = lane_count < 4 || lane_count > 128 || lane >= lane_count;
+                if (!mismatch) {
+                    const UINT quad_base = lane & ~3u;
+                    for (UINT quad_lane = 0; quad_lane < 4 && !mismatch; ++quad_lane) {
+                        const UINT member = quad_base + quad_lane;
+                        if (member >= lane_count) {
+                            mismatch = true;
+                            break;
+                        }
+                        const UINT active_word = words[96 + thread * 4 + member / 32];
+                        mismatch = !(active_word & (1u << (member % 32)));
+                    }
+                }
+            } else {
+                expected = sentinel;
+                mismatch = words[i] != expected;
+            }
+        }
+        if (mismatch) {
             if (!mismatches)
                 std::fprintf(stderr, "word=%u expected=%08x actual=%08x\n", i, expected, words[i]);
             ++mismatches;
@@ -255,7 +311,8 @@ void check_compute(ID3D12Device* device, bool tables)
     run_compute(device, tables, shader, shader);
 }
 
-void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference)
+void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference,
+                        bool dpp_case)
 {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error(std::string("Could not open compute shader: ") + path);
@@ -274,12 +331,15 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
         if (!file || store.groups >> 24 || !store.axis(0) || store.axis(0) > 5 || store.axis(1) > 5 ||
             store.axis(2) > 5)
             throw std::runtime_error("Invalid compute store reference");
+        if (dpp_case && store.groups != 1)
+            throw std::runtime_error("Invalid compute DPP reference dispatch");
         if (file.peek() != std::char_traits<char>::eof()) {
             file.read(reinterpret_cast<char*>(store.root_constants.data()), sizeof(store.root_constants));
             if (!file || file.peek() != std::char_traits<char>::eof())
                 throw std::runtime_error("Invalid compute store constants");
         }
-        run_compute(device, false, shader, {compute_root, sizeof(compute_root)}, false, &store);
+        run_compute(device, false, shader, {compute_root, sizeof(compute_root)}, false, &store, nullptr,
+                    DXGI_FORMAT_UNKNOWN, nullptr, dpp_case);
     } else {
         run_compute(device, false, shader, shader, conversion_pair);
     }
