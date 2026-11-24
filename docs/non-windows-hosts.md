@@ -249,10 +249,11 @@ set(CMAKE_MT llvm-mt-19)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES XWIN LIBCASE)
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
-set(inc "/imsvc ${XWIN}/crt/include /imsvc ${XWIN}/sdk/include/ucrt /imsvc ${XWIN}/sdk/include/um /imsvc ${XWIN}/sdk/include/shared /imsvc ${XWIN}/sdk/include/winrt")
+# The paths are quoted inside the flag strings so that a directory with spaces stays one argument.
+set(inc "/imsvc \"${XWIN}/crt/include\" /imsvc \"${XWIN}/sdk/include/ucrt\" /imsvc \"${XWIN}/sdk/include/um\" /imsvc \"${XWIN}/sdk/include/shared\" /imsvc \"${XWIN}/sdk/include/winrt\"")
 # /EHa last: CMake's own default would add /EHsc, and the stand-ins probe memory inside __try.
 set(CMAKE_CXX_FLAGS "${inc} /DWIN32 /D_WINDOWS /clang:-fbracket-depth=2048 /EHa" CACHE STRING "" FORCE)
-set(lib "/libpath:${XWIN}/crt/lib/x86_64 /libpath:${XWIN}/sdk/lib/um/x86_64 /libpath:${XWIN}/sdk/lib/ucrt/x86_64 /libpath:${LIBCASE}")
+set(lib "\"/libpath:${XWIN}/crt/lib/x86_64\" \"/libpath:${XWIN}/sdk/lib/um/x86_64\" \"/libpath:${XWIN}/sdk/lib/ucrt/x86_64\" \"/libpath:${LIBCASE}\"")
 set(CMAKE_EXE_LINKER_FLAGS "${lib}" CACHE STRING "" FORCE)
 set(CMAKE_SHARED_LINKER_FLAGS "${lib}" CACHE STRING "" FORCE)
 set(CMAKE_MODULE_LINKER_FLAGS "${lib}" CACHE STRING "" FORCE)
@@ -267,6 +268,10 @@ cmake -S . -B out/build/clang -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build out/build/clang --target xmem_shim d3d12_xs_shim startup_stub_acphal startup_stub_chad \
   startup_stub_xapu startup_stub_xcrdapi startup_stub_xg_xs startup_stub_gameinput
 ```
+
+The toolchain file quotes the SDK and `LIBCASE` paths inside its flag strings, so the checkout,
+the splat and the build directory may contain spaces (checked with all three in directories whose
+names have a space).
 
 Four things differ from an MSVC build:
 
