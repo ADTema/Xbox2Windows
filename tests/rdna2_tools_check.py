@@ -4443,8 +4443,8 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_low16_binary16_e32_scanner_support(self):
-        """The ten plain binary16 e32 forms pixel_aot lowers (low 16 bits only) are supported; modifiers, e64 and
-        sources the translator refuses are not."""
+        """The ten plain binary16 e32 forms pixel_aot lowers (low 16 bits only) are supported; modifiers, the e64
+        spelling of the integer conversions and sources the translator refuses are not."""
         supported = []
         for op in ("add", "sub", "subrev", "mul"):
             supported += [f"v_{op}_f16_e32 v24, v18, v19", f"v_{op}_f16_e32 v24, 1.0, v19",
@@ -4466,12 +4466,10 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_add_f16_e32 v24, 3.0, v19",          # not a binary16 inline constant
             "v_add_f16_e32 v24, v256, v19",
             "v_add_f16_e32 v24, v18, v19 clamp",
-            "v_mul_f16_e64 v24, v18, v19",
             "v_add_f16 v24, v18, v19",
             "v_add_f16_e32 v24, v18",
             "v_floor_f16_e32 v24, -v18",
             "v_floor_f16_e32 v24, v18 clamp",
-            "v_floor_f16_e64 v24, v18",
             "v_fract_f16_e32 v24, v18",
             "v_cvt_f16_i16_e32 v24, 65",
             "v_cvt_f16_u16_e32 v24, 0x10000",
@@ -4483,6 +4481,54 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertFalse(is_instruction_supported(line), line)
         for opcode in ("v_add_f16", "v_subrev_f16", "v_rndne_f16", "v_cvt_f16_u16"):
             self.assertIn(opcode, KNOWN_RDNA2_BASE_OPCODES)
+
+    def test_binary16_e64_scanner_translator_agreement(self):
+        """The scanner accepts the plain binary16 VOP2 and VOP1 rounding e64 forms exactly when pixel_aot lowers them."""
+        import pixel_aot
+        from pixel_aot_check import uncompressed_export
+
+        prelude = ["s_mov_b32 s60, 0x3c00", "v_mov_b32_e32 v18, 0x3c00", "v_mov_b32_e32 v19, 0x4000"]
+
+        def translator_accepts(line):
+            program = uncompressed_export([*prelude, line, "v_cvt_f32_f16_e32 v12, v24"])
+            try:
+                pixel_aot.lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                                half_denorm=pixel_aot.HALF_DENORM_PRESERVE)
+            except ValueError:
+                return False
+            return True
+
+        accepted = []
+        for op in ("add", "sub", "subrev", "mul"):
+            accepted += [f"v_{op}_f16_e64 v24, v18, v19", f"v_{op}_f16_e64 v24, v18, 1.0",
+                         f"v_{op}_f16_e64 v24, s60, v19", f"v_{op}_f16_e64 v24, 0.5, -2.0",
+                         f"v_{op}_f16_e64 v24, 0x3555, s60", f"v_{op}_f16_e64 v24, 0, v19"]
+        for op in ("floor", "ceil", "trunc", "rndne"):
+            accepted += [f"v_{op}_f16_e64 v24, v18", f"v_{op}_f16_e64 v24, s60", f"v_{op}_f16_e64 v24, 2.0",
+                         f"v_{op}_f16_e64 v24, 0x4248"]
+        refused = [
+            "v_add_f16_e64 v24, -v18, v19", "v_add_f16_e64 v24, v18, -v19", "v_add_f16_e64 v24, |v18|, v19",
+            "v_add_f16_e64 v24, abs(v18), v19", "v_add_f16_e64 v24, neg(v18), v19",
+            "v_add_f16_e64 v24, v18, v19 clamp", "v_add_f16_e64 v24, v18, v19 mul:2",
+            "v_add_f16_e64 v24, v18, v19 div:2", "v_add_f16_e64 v24, v18, v19 op_sel:[1,0]",
+            "v_add_f16_e64 v24, 3, v19", "v_add_f16_e64 v24, v18, 3", "v_add_f16_e64 v24, 3.0, v19",
+            "v_add_f16_e64 v24, 0x10000, v19", "v_add_f16_e64 v24, v256, v19", "v_add_f16_e64 v256, v18, v19",
+            "v_add_f16_e64 v24, s106, v19", "v_add_f16_e64 v24, v18", "v_add_f16_e64 v24, v18, v19, v19",
+            "v_fma_f16_e64 v24, v18, v19, v19", "v_fract_f16_e64 v24, v18", "v_mul_f16_e64 v24, v18, v19 clamp",
+            "v_floor_f16_e64 v24, -v18", "v_floor_f16_e64 v24, |v18|", "v_floor_f16_e64 v24, v18 clamp",
+            "v_floor_f16_e64 v24, v18 mul:2", "v_floor_f16_e64 v24, 3", "v_floor_f16_e64 v24, 0x10000",
+            "v_floor_f16_e64 v24, v256", "v_floor_f16_e64 v24, v18, v19", "v_rndne_f16_e64 v24",
+        ]
+        for line in accepted:
+            self.assertTrue(is_instruction_supported(line), line)
+            self.assertTrue(translator_accepts(line), line)
+        for line in refused:
+            self.assertFalse(is_instruction_supported(line), line)
+            self.assertFalse(translator_accepts(line), line)
+        result = analyze_shader_instructions("f16_e64", [*accepted, "s_endpgm"])
+        self.assertEqual((result["supported_instructions"], result["unsupported_count"]), (len(accepted) + 1, 0))
+        result = analyze_shader_instructions("f16_e64_refused", [*refused, "s_endpgm"])
+        self.assertEqual(result["unsupported_count"], len(refused))
 
     def test_sopk_s_version(self):
         """s_version with a 16-bit immediate is supported and known; larger, negative and register operands are not."""
