@@ -29,6 +29,11 @@ NAMES = {0x80000003: "breakpoint", 0x80000004: "single step", 0xC0000005: "acces
 REGS = ["Rax", "Rcx", "Rdx", "Rbx", "Rsp", "Rbp", "Rsi", "Rdi", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15", "Rip"]
 
 
+def read_qword(read, address):
+    data = read(address, 8)
+    return int.from_bytes(data, "little") if len(data) == 8 else None
+
+
 def final_path(handle):
     buf = ctypes.create_unicode_buffer(1024)
     n = k32.GetFinalPathNameByHandleW(wt.HANDLE(handle), buf, 1024, 0)
@@ -266,20 +271,21 @@ def main():
         rsp = regs["Rsp"]
         if addr in hooks:
             name, arg = hooks[addr]
-            ret = struct.unpack("<Q", read(rsp, 8) or b"\0" * 8)[0]
+            ret = read_qword(read, rsp) or 0
             if arg == "valloc":
                 # NtAllocateVirtualMemory(process, &base, zero bits, &size, type, protect) and
                 # NtAllocateVirtualMemoryEx(process, &base, &size, type, protect, ...).
                 extended = name.endswith("Ex")
-                size = struct.unpack("<Q", read(regs["R8" if extended else "R9"], 8) or b"\0" * 8)[0]
-                if size >= valloc_min:
-                    base = struct.unpack("<Q", read(regs["Rdx"], 8) or b"\0" * 8)[0]
+                size = read_qword(read, regs["R8" if extended else "R9"])
+                if size is not None and size >= valloc_min:
+                    base = read_qword(read, regs["Rdx"])
+                    requested = "unreadable" if base is None else hex(base)
                     stack_args = struct.unpack("<2Q", (read(rsp + 0x28, 16) or b"").ljust(16, b"\0"))
                     kind, protect = (regs["R9"], stack_args[0]) if extended else stack_args
                     words = struct.unpack_from("<200Q", (read(rsp, 8 * 200) or b"").ljust(8 * 200, b"\0"))
                     chain = [where(w) for w in words if any(b <= w < b + 0x10000000 for b in modules)]
                     chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
-                    file_log.write(f"{time.time() - start:7.3f} VALLOC {name} requested={base:#x} size={size:#x} "
+                    file_log.write(f"{time.time() - start:7.3f} VALLOC {name} requested={requested} size={size:#x} "
                                    f"type={kind & 0xffffffff:#x} protect={protect & 0xffffffff:#x} callers: {' '.join(chain[:10])}\n")
                     file_log.flush()
                 desc = None

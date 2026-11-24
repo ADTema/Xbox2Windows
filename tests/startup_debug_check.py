@@ -30,6 +30,13 @@ def text(path):
 
 
 def main(probe):
+    sys.path.insert(0, str(DEBUG.parent))
+    from debug_launch import read_qword
+    word = bytes.fromhex("ab cd ef 01 23 45 67 89")
+    for readable in range(8):
+        assert read_qword(lambda address, size: word[:readable], 0) is None
+    assert read_qword(lambda address, size: word[:size], 0) == 0x8967452301efcdab
+    assert read_qword(lambda address, size: bytes(size), 0) == 0
     probe = Path(probe).resolve()
     image = probe.name
     with tempfile.TemporaryDirectory() as temporary:
