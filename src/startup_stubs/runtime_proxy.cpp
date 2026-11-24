@@ -249,7 +249,8 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
     }
     bool local = false;
     if (FAILED(hr) && out && provider && fake_user() && InterlockedCompareExchange(&local_active, 0, 0)) {
-        // The providers the fake layer answers (user, gamertag, save, package, title, connectivity, store).
+        // The providers the fake layer answers: user (its gamertag interface included), game save, package,
+        // title, connectivity and store.
         static constexpr unsigned long answered[] = {user_provider_data1, save_provider_data1, 0xaf406016, 0x973a344e,
                                                      0x37e56907, 0x0dd112ac};
         for (unsigned long id : answered) local = local || provider->Data1 == id;
