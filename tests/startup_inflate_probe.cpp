@@ -10,7 +10,8 @@
 // usage: startup_inflate_probe batch <records> <results>
 // Runs inflate_zlib_ex on every record (u32 capacity, u32 size, size stream bytes, little endian)
 // and writes per record the status (u8), the reported size (u32) and that many output bytes. Prints
-// the record count, the output bytes of ok records and the time spent in the decoder.
+// the record count, the output bytes of ok records, the time spent in the decoder and the sum of the
+// Adler-32 values of the ok outputs (tests/startup_inflate_check.py --bench checks it).
 //
 // In both modes the stream and the destination each end at a no-access page, so a read past the
 // input or a write past the capacity faults (exit code 0xC0000005).
@@ -65,6 +66,7 @@ int batch(const char* records_path, const char* results_path)
                std::uint32_t{records[at + 3]} << 24;
     };
     std::size_t count = 0, total = 0;
+    std::uint32_t checksum = 0;
     std::chrono::steady_clock::duration spent{};
     for (std::size_t at = 0; at < records.size(); ++count) {
         if (records.size() - at < 8 || records.size() - at - 8 < u32(at + 4)) {
@@ -80,7 +82,10 @@ int batch(const char* records_path, const char* results_path)
         const auto status = x2w_inflate::inflate_zlib_ex(input.data(), size, destination.data(), capacity, produced);
         spent += std::chrono::steady_clock::now() - start;
         at += 8 + size;
-        if (status == x2w_inflate::InflateStatus::ok) total += produced;
+        if (status == x2w_inflate::InflateStatus::ok) {
+            total += produced;
+            checksum += x2w_inflate::adler32(destination.data(), produced);
+        }
         const unsigned char head[5] = {static_cast<unsigned char>(status), static_cast<unsigned char>(produced),
                                        static_cast<unsigned char>(produced >> 8), static_cast<unsigned char>(produced >> 16),
                                        static_cast<unsigned char>(produced >> 24)};
@@ -91,8 +96,9 @@ int batch(const char* records_path, const char* results_path)
         std::fprintf(stderr, "cannot write %s\n", results_path);
         return 2;
     }
-    std::printf("batch %zu records, %zu bytes out, %lld us in the decoder\n", count, total,
-                static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(spent).count()));
+    std::printf("batch %zu records, %zu bytes out, %lld us in the decoder, output checksum %08x\n", count, total,
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(spent).count()),
+                static_cast<unsigned>(checksum));
     return 0;
 }
 

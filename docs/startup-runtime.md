@@ -367,6 +367,19 @@ are needed:
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 ```
 
+The same script measures throughput; it is not a ctest. It decodes 16 MiB seeded streams (stored,
+fixed Huffman, dynamic Huffman word text, dynamic Huffman bytes of about 7.3 bits of entropy), three
+per run, through the probe's batch mode and prints decoded MiB/s next to CPython's zlib on the same
+data. Probes given together run interleaved; the first of six rounds is dropped and the best of the
+other five is kept. Each run prints the sum of the Adler-32 values of its outputs, which must match
+the input's, so the decoding cannot be skipped. Only time inside the decoder counts; the zlib column
+includes CPython's call overhead. To compare two commits, build the probe of each and pass both:
+
+```powershell
+cmake --build --preset release --target startup_inflate_probe
+.\out\pe-env\Scripts\python.exe -B tests/startup_inflate_check.py --bench out/build/release/startup_inflate_probe.exe
+```
+
 ## DirectStorage destinations that are not writable
 
 A request whose destination (a plain pointer, not 64 KiB page tokens) is not writable up to its declared capacity fails before any byte is written: the stand-in walks the destination with `VirtualQuery`, and a page that is uncommitted, read-only, `PAGE_GUARD` or `PAGE_NOACCESS` refuses the whole request. The log line ends `destination not writable`, `requests_failed` counts it, the next status entry reports `E_FAIL` and the queue goes on with later requests. Before this check, a destination shorter in memory than its declared capacity faulted inside the stand-in's copy (#870). The check covers the whole declared capacity, not only the bytes the request would write. Cost: one `VirtualQuery` per region the destination spans, per request that reaches the copy.

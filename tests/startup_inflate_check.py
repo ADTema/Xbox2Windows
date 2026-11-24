@@ -23,13 +23,20 @@ A boundary case runs small streams at every capacity up to one past their size a
 length: matches at distances 1 to 16 around the decoder's copy widths, stored blocks of 0 and 65535
 bytes and stored blocks at every bit position. tests/startup_inflate_probe.cpp runs the decoder; no GPU
 and no game files are involved.
+
+With --bench and one or more probe builds, it instead prints decoded MiB/s for 16 MiB seeded streams
+of four kinds (stored, fixed Huffman copies, dynamic Huffman word text, dynamic Huffman bytes of about
+7.3 bits of entropy) next to CPython's zlib: the builds run interleaved, the first round is dropped and
+the best of the next five is kept, and each run's output checksum must match the input's.
 """
+import os
 from pathlib import Path
 import random
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import zlib
 
 
@@ -464,9 +471,73 @@ def main(probe, bitwise, faulty, faulty_margin, faulty_input_margin, faulty_dist
     print("inflate.h matches zlib %s in 8 cases and rejects 3 controls" % zlib.ZLIB_RUNTIME_VERSION)
 
 
+BENCH_SIZE, BENCH_REPEATS, BENCH_ROUNDS = 16 << 20, 3, 5
+
+
+def bench_words(rng, size):
+    # Words from a 2000-word vocabulary: matches and a sparse literal alphabet.
+    vocabulary = [bytes(rng.choices(b"abcdefghijklmnopqrstuvwxyz", k=rng.randint(2, 10))) for _ in range(2000)]
+    out = bytearray()
+    while len(out) < size:
+        out += rng.choice(vocabulary) + b" "
+    return bytes(out[:size])
+
+
+def bench_skewed(rng, size):
+    # Near-incompressible but not random, about 7.3 bits per byte: dynamic blocks of mostly literals.
+    table = rng.choices(range(256), [1.0 / (1 + i) ** 0.6 for i in range(256)], k=1 << 16)
+    out = bytearray()
+    while len(out) < size:
+        out += bytes(table[b] for b in rng.randbytes(min(1 << 16, size - len(out))))
+    return bytes(out)
+
+
+def bench(probes):
+    probes = [str(Path(probe).resolve()) for probe in probes]
+    rng = random.Random(20261124)
+    kinds = [("stored", 0, lambda: compress(rng.randbytes(BENCH_SIZE), 0)),
+             ("fixed", 1, lambda: compress(corpus(rng, BENCH_SIZE), 6, zlib.Z_FIXED)),
+             ("dynamic_text", 2, lambda: compress(bench_words(rng, BENCH_SIZE), 6)),
+             ("dynamic_skewed", 2, lambda: compress(bench_skewed(rng, BENCH_SIZE), 6))]
+    print("decoded MiB/s, %d MiB streams, best of %d rounds after one dropped" % (BENCH_SIZE >> 20, BENCH_ROUNDS))
+    print("%-15s %s %10s" % ("", " ".join("%10s" % ("build %d" % i) for i in range(len(probes))), "zlib"))
+    with tempfile.TemporaryDirectory() as temporary:
+        records = Path(temporary) / "bench.records"
+        for name, block_type, make in kinds:
+            stream = make()
+            data = zlib.decompress(stream)
+            assert len(data) == BENCH_SIZE and first_block_type(stream) == block_type, name
+            records.write_bytes((struct.pack("<II", BENCH_SIZE, len(stream)) + stream) * BENCH_REPEATS)
+            checksum = "%08x" % (zlib.adler32(data) * BENCH_REPEATS & 0xFFFFFFFF)
+            best = [float("inf")] * (len(probes) + 1)
+            for turn in range(BENCH_ROUNDS + 1):
+                for index, probe in enumerate(probes):
+                    result = subprocess.run([probe, "batch", str(records), os.devnull], capture_output=True,
+                                            text=True, check=True)
+                    # "batch N records, B bytes out, T us in the decoder, output checksum C"
+                    words_out = result.stdout.split()
+                    assert words_out[-1] == checksum, "%s: %s" % (probe, result.stdout)
+                    if turn:
+                        best[index] = min(best[index], int(words_out[6]) / 1e6)
+                start = time.perf_counter()
+                for _ in range(BENCH_REPEATS):
+                    zlib.decompress(stream, 15, BENCH_SIZE)
+                if turn:
+                    best[-1] = min(best[-1], time.perf_counter() - start)
+            mib = BENCH_SIZE * BENCH_REPEATS / (1 << 20)
+            print("%-15s %s" % (name, " ".join("%10.1f" % (mib / seconds) for seconds in best)), flush=True)
+    for index, probe in enumerate(probes):
+        print("build %d: %s" % (index, probe))
+    print("zlib: CPython %s, zlib %s" % (sys.version.split()[0], zlib.ZLIB_RUNTIME_VERSION))
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--bench":
+        bench(sys.argv[2:])
+        sys.exit()
     if len(sys.argv) != 7:
         sys.exit("usage: startup_inflate_check.py <startup_inflate_probe.exe> <startup_inflate_probe_bitwise.exe> "
                  "<startup_inflate_probe_faulty.exe> <startup_inflate_probe_faulty_margin.exe> "
-                 "<startup_inflate_probe_faulty_input_margin.exe> <startup_inflate_probe_faulty_distance.exe>")
+                 "<startup_inflate_probe_faulty_input_margin.exe> <startup_inflate_probe_faulty_distance.exe>\n"
+                 "       startup_inflate_check.py --bench <startup_inflate_probe.exe>...")
     main(*sys.argv[1:])
