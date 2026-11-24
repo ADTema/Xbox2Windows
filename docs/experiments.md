@@ -8255,3 +8255,14 @@ checked against LLVM 19.1.7 only, and that check skips itself when the LLVM in u
 Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
 measurement on hardware or in a Windows run backs the descriptions. `v_interp_p1_f32_e64` and `v_interp_p2_f32_e64`
 (0x200 and 0x201 on gfx1013) are not decoded by this change.
+
+## Desktop audio render sink
+
+`startup_audio_output` drives a small WASAPI shared-mode render sink ([`audio_sink.h`](../src/startup_stubs/audio_sink.h)) with generated PCM blocks. It is the first slice of [issue #1145](https://github.com/R0Y00/Xbox2Windows/issues/1145). The sink takes `submit(format, frames, bytes)`, converts the block to the endpoint mix format (32-bit float or 16-bit PCM only) and records the first accepted block, the submitted format, per-block frame counts and peaks, consumed frames (submitted minus `GetCurrentPadding`), the `IAudioClock` position, the drained interval and the recovery. The fixture runs three cases in one process: no submission; eight 40 ms blocks with distinct amplitudes, one of them intentionally silent; and a producer that withholds the next block until the queue is empty, then resumes.
+
+```powershell
+cmake --build --preset release --target startup_audio_output
+ctest --preset release --no-tests=error -R '^startup_audio_output$' -V
+```
+
+Exit code 77 is a capability skip (no render endpoint, an endpoint that does not initialise, or an unsupported mix format); it is not a pass. A failed padding query during a case fails the run. The glitch count is reported as "not available" because the render API exposes no discontinuity flag, and it is kept apart from the drained interval and the recovery. Not covered: capture-path verification of the tone, any layout of the console audio command queue (`xapu.cpp` is not decoded), and sample-rate conversion. The result of a run on a machine with an endpoint (adapter, Windows build, commit, per-case counters) is not recorded here yet.
