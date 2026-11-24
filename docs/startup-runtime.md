@@ -1291,13 +1291,14 @@ memory spent rather than by elapsed time. A physical page holds a slot from its 
 or a DirectStorage write) until its grant is released; `xmem.dll` publishes that count through the
 experimental `x2w_xmem_page_stats` export.
 
-The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab is
-created with the default `CreateFileMappingW` commit behaviour, so all of it is charged to commit when it is
-created, and it is closed only when the process ends: freeing pages returns slots, not commit. A released
-slot is reused lowest first. The experimental `x2w_xmem_slab_stats` export reports the slabs open, the slots
-in use and the slots free in the open slabs, which are the units that matter for commit now. This only
-reports; it does not change when commit is charged. `xmem_slab_slots` checks the bookkeeping on any platform
-without Windows calls. The heartbeat also prints while the request counters are unchanged
+The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab reserves
+its capacity with `SEC_RESERVE`. Each slot commits on the first mapping or write. A freed slot remains
+committed, is zeroed on reuse, and is chosen before a fresh slot. The experimental `x2w_xmem_slab_stats`
+export reports open slabs and used and free slots. `xmem_slab_slots` checks the bookkeeping without Windows
+calls. `xmem_mapped_pages_commit` measures commit for a small map, and `xmem_mapped_pages_commit_failure`
+injects a commitment failure and checks that the reservation and slab counts are unchanged and the pages
+can be mapped on retry. Caller-owned placeholders must already match the requested view size. The
+heartbeat also prints while the request counters are unchanged
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed
 by a line of failed requests by cause and a line of page-destination requests by end (see
 DirectStorage failure causes and DirectStorage page-request ends under Findings).
@@ -1312,7 +1313,7 @@ the launcher's concurrent-hook limitation.
 
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check
-ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|startup_heartbeat_commit)$' -V
+ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|xmem_mapped_pages_commit(_failure)?|startup_heartbeat_commit)$' -V
 ```
 
 The `startup_heartbeat_commit` check starts the heartbeat before loading the page provider, then
