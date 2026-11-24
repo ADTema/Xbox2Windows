@@ -17062,6 +17062,7 @@ def _run_controls_serial():
 
 
 def check_controls(directory, *, parallel=True):
+    check_sampler_descriptor_refusals()
     tasks = _control_tasks()
     cpu_count = os.cpu_count() or 1
     # ProcessPoolExecutor on Windows enforces max_workers <= 61 (_MAX_WINDOWS_WORKERS).
@@ -22953,6 +22954,32 @@ def check_e64_render(directory, compiler, renderer, backend):
     check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend)
     check_cvt_float_int_draw(directory, compiler, renderer, backend)
     return 0
+
+
+def check_sampler_descriptor_refusals():
+    """The two sampler-descriptor profiles refuse a field they cannot model."""
+    pixel_aot.check_gather_sampler((0x12, 0, 0x04500000, 0), 1, comparison=False)
+    for words in ((0x13, 0, 0x04500000, 0), (0x12, 0x800, 0x04500000, 0), (0x12, 0, 0x04500001, 0)):
+        try:
+            pixel_aot.check_gather_sampler(words, 1, comparison=False)
+        except ValueError as error:
+            assert "Unsupported gather sampler" in str(error), (words, error)
+        else:
+            raise AssertionError("gather sampler %s was accepted" % (words,))
+
+    magazine = min(pixel_aot.COMPARISON_FILTERS)
+    # Point filtering is the pair the translator accepts with TRUNC_COORD set (word 0 bit 27).
+    legal_w0 = 0x12 | (1 << 27)
+    legal_w2 = (magazine << 20) | (magazine << 22)
+    pixel_aot.comparison_sampler_state((legal_w0, 0, legal_w2, 0))
+    for mip, extra in ((3, 0), (0, 1 << 28)):
+        words = (legal_w0, 0, legal_w2 | (mip << 26) | extra, 0)
+        try:
+            pixel_aot.comparison_sampler_state(words)
+        except ValueError as error:
+            assert "Unsupported mip filter" in str(error), (words, error)
+        else:
+            raise AssertionError("comparison sampler %s was accepted" % (words,))
 
 
 def main():
