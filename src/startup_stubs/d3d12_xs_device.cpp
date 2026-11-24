@@ -20,6 +20,7 @@
 #include "startup_stubs/draw_dump_tracking.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/bc7_4k_s.h"
+#include "startup_stubs/derived_blend.h"
 
 #include "startup_stubs/slice_footprints.h"
 
@@ -75,6 +76,7 @@ struct WrapperOwn {
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
+    bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     void* pass;       // CommandList (render mode): recording state (Pass)
     std::uint64_t pad;  // keeps the size a multiple of 16: the title uses aligned loads on objects
@@ -1584,6 +1586,7 @@ struct TextureWrite {
     UINT bc7_width = 0, bc7_height = 0;
 };
 std::unordered_map<u64, TextureWrite>& written_textures();
+ID3D12Resource* sampled_address_texture(Wrapper* resource);
 #include "startup_stubs/d3d12_draw.inl"
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
@@ -2120,10 +2123,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         // stands in, not aliased with the title address. The clear value is dropped if refused.
         D3D12_RESOURCE_DESC texture = sanitized(*desc);
         if (x2w_startup::supports_bc7_4k_s(*desc) && x2w_local::env_on("X2W_XG_BC7_4K_S_LAYOUT")) {
-            const x2w_startup::Bc7Surface surface(*desc);
+            const x2w_startup::Bc16Surface surface(*desc);
             // Desktop BC7 allocations require whole blocks at the top mip.
-            texture.Width = surface.columns * x2w_startup::Bc7Surface::block_texels;
-            texture.Height = surface.rows * x2w_startup::Bc7Surface::block_texels;
+            texture.Width = surface.columns * x2w_startup::Bc16Surface::block_texels;
+            texture.Height = surface.rows * x2w_startup::Bc16Surface::block_texels;
         }
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
         const auto* clear_value = static_cast<const D3D12_CLEAR_VALUE*>(clear);
@@ -2424,9 +2427,8 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     return S_OK;
 }
 
-// Device slot 55 (Xbox order): (existing object, 1, desc*, riid, ppv) with the ID3D12PipelineState
-// IID: a pipeline derived from an existing one. Placeholder PipelineState, like the other creators.
-HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, u64 count, const void* desc, const GUID* iid,
+// CreateDerivedPipelineStateX: base, number of fixed-size state patches, patches, IID, result.
+HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT count, const void* desc, const GUID* iid,
                                                  void** out)
 {
     Timed timed(time_pipeline);
@@ -2434,18 +2436,21 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, u64 count
     guid_text(iid, text, sizeof(text));
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
-    dump_pipeline("derived", 55, desc, 0x100);
+    if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
+    if (count > 64) return E_INVALIDARG;
+    const std::size_t bytes_in_patches = count * x2w_derived_blend::record_size;
+    if (bytes_in_patches && (!desc || !x2w_local::readable(desc, bytes_in_patches))) return E_INVALIDARG;
+    dump_pipeline("derived", 55, desc, bytes_in_patches);
     static LONG calls;
     if (first_calls(calls, 3)) {
         Wrapper* w = as_wrapper(base);
         char bytes[3 * 64 + 1];
-        hex_text(desc, 64, bytes, sizeof(bytes));
-        log("x2w-d3d12 Device::slot55(derived pipeline?) base=%p (%s) count=%llu desc=[%s] riid=%s -> placeholder", base,
+        hex_text(desc, count ? 64 : 0, bytes, sizeof(bytes));
+        log("x2w-d3d12 Device::slot55(derived pipeline) base=%p (%s) count=%u desc=[%s] riid=%s -> placeholder", base,
             w ? kind_names[w->own().kind] : "not a wrapper", count, bytes, text);
     }
-    if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
-    note_pipeline(static_cast<Wrapper*>(*out), 55, base, desc, 0x100);
+    note_pipeline(static_cast<Wrapper*>(*out), 55, base, desc, bytes_in_patches);
     return S_OK;
 }
 

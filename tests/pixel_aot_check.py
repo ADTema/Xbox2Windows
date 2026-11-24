@@ -35,6 +35,17 @@ SOP2_LSHL_ADD_OPS = (
 SOP2_ABSDIFF_OPS = (
     "s_absdiff_i32",
 )
+SCALAR_ALU_SOP1_OPS = (
+    "s_bcnt0_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b32", "s_bcnt1_i32_b64",
+    "s_ff0_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b32", "s_ff1_i32_b64",
+    "s_flbit_i32", "s_flbit_i32_b32", "s_flbit_i32_b64", "s_flbit_i32_i64",
+    "s_sext_i32_i8", "s_sext_i32_i16", "s_abs_i32",
+)
+SCALAR_ALU_SOP2_OPS = (
+    "s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16",
+    "s_mul_hi_i32", "s_mul_hi_u32",
+)
+SCALAR_ALU_OPS = SCALAR_ALU_SOP1_OPS + SCALAR_ALU_SOP2_OPS
 VOP2_INT_OPS = (
     "v_lshrrev_b32_e32", "v_ashrrev_i32_e32", "v_lshlrev_b32_e32",
     "v_and_b32_e32", "v_or_b32_e32", "v_xor_b32_e32",
@@ -9439,10 +9450,34 @@ def check_pack_int16_lowering():
         "v_cvt_pknorm_i16_f16 v12, s44, v18",
         "v_cvt_pknorm_u16_f16 v12, s44, v18",
         "v_cvt_pk_u8_f32 v12, s44, v18, v18",
-        "v_sat_pk_u8_i16_e32 v12, v18",
-        "v_sat_pk_u8_i16_e64 v12, v18",
     ):
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", neighbour]))
+
+
+def sat_pack_u8_program():
+    return uncompressed_export([
+        "v_mov_b32_e32 v18, s45",
+        "v_mov_b32_e32 v15, s47",
+        "v_sat_pk_u8_i16_e32 v12, s44",
+        "v_sat_pk_u8_i16_e64 v13, v18",
+        "v_sat_pk_u8_i16_e32 v14, s46",
+        "v_sat_pk_u8_i16_e64 v15, v15",
+    ])
+
+
+def check_sat_pack_u8_lowering():
+    program = sat_pack_u8_program()
+    canonical = translate_int(program)
+    assert translate_int([line.replace("v_sat_pk_u8_i16_e32", "v_sat_pk_u8_i16")
+                          for line in program]) == canonical
+    for invalid in (
+        "v_sat_pk_u8_i16_e64 v12, v18 clamp",
+        "v_sat_pk_u8_i16_e64 v12, -v18",
+        "v_sat_pk_u8_i16_e32 v12, v18, s44",
+        "v_sat_pk_u8_i16_e32 v12, 0x100000000",
+        "v_sat_pk_u8_i16_sdwa v12, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+    ):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", invalid]))
 
 
 def check_pack_b32_lowering():
@@ -12493,6 +12528,7 @@ def check_controls(directory):
     check_carry_in_lowering()
     check_sdwa_integer_lowering()
     check_pack_int16_lowering()
+    check_sat_pack_u8_lowering()
     check_pack_b32_lowering()
     check_sad_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
@@ -12532,6 +12568,37 @@ def check_controls(directory):
         "s_absdiff_i32 v12, s44, s45",
     ):
         must_reject(translate, with_constants([bad_absdiff]))
+    for halves in PACK_HALVES:
+        translate(scalar_pack_values(halves))
+    for width in (32, 64):
+        translate(scalar_bit_count_values(width))
+        translate(scalar_first_bit_values(width))
+        translate(scalar_leading_bit_values(width))
+    translate(scalar_mul_hi_values("i32"))
+    translate(scalar_mul_hi_values("u32"))
+    translate(sext_values())
+    translate_int(sop1_scalar_ops())
+    assert set(SCALAR_ALU_OPS) <= ACCEPTED
+    for bad_scalar_alu in (
+        "s_bcnt0_i32_b32 s62, v12",
+        "s_bcnt0_i32_b32 s62, s[44:45]",
+        "s_bcnt0_i32_b64 s62, s44",
+        "s_bcnt0_i32_b64 s62, s[45:46]",
+        "s_bcnt0_i32_b64 s62, v[12:13]",
+        "s_ff0_i32_b32 s62, v12",
+        "s_ff0_i32_b32 s62, s[44:45]",
+        "s_ff0_i32_b64 s62, s44",
+        "s_ff0_i32_b64 s62, s[45:46]",
+        "s_flbit_i32 s62, v12",
+        "s_flbit_i32_b32 s62, v12",
+        "s_flbit_i32_b64 s62, s44",
+        "s_flbit_i32_i64 s62, s[45:46]",
+        "s_sext_i32_i8 s62, v12",
+        "s_sext_i32_i16 s62, s[44:45]",
+        "s_pack_ll_b32_b16 s62, v12, s45",
+        "s_mul_hi_i32 s62, v12, s45",
+    ):
+        must_reject(translate, with_constants([bad_scalar_alu]))
     rgb = rgb_sample()
     translate(rgb)
     rga = translate([line.replace("dmask:0x7", "dmask:0xb") for line in rgb])
@@ -14377,6 +14444,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(carry_in_group(op)), translate_int) for op in CARRY_IN_OPS)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
+    fixtures.append((sat_pack_u8_program(), translate_int))
     fixtures.append((uncompressed_export(pack_b32_group()), translate_int))
     fixtures.append((uncompressed_export(pack_b32_inline_group()), translate_int))
     fixtures.extend((uncompressed_export(sad_group(group)), translate_int) for group in SAD_BODIES)
@@ -17692,7 +17760,42 @@ def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend
         raise AssertionError("RGB sample with an overwritten alpha register escaped detection")
 
 
+def check_sat_pack_u8_draw(directory, compiler, renderer, backend):
+    source = directory / "sat_pack_u8.hlsl"
+    shader = directory / "sat_pack_u8.cso"
+    source.write_text(translate_int(sat_pack_u8_program()), encoding="ascii")
+    compile_shader(compiler, source, shader)
+
+    # Each input packs two signed i16 values, low lane first. The references are full uint32 words.
+    rows = (
+        ((0x80007fff, 0x0100ffff, 0x00ff0000, 0x0011002a), (0x00ff, 0xff00, 0xff00, 0x112a)),
+        ((0x00fe00ff, 0x00010100, 0xffff8000, 0x01000001), (0xfeff, 0x01ff, 0x0000, 0xff01)),
+    )
+    cases = []
+
+    def add_case(inputs, expected, status):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *inputs)
+        path = directory / f"sat_pack_u8-{len(cases)}.case"
+        path.write_bytes(constants + struct.pack("<4I", *expected) * 64 + b"\x01")
+        cases.append((path, status))
+
+    for inputs, expected in rows:
+        add_case(inputs, expected, "pass")
+    inputs, expected = rows[0]
+    for channel, value in ((0, 0xff00), (1, 0xffff), (3, 0x0011112a)):
+        wrong = list(expected)
+        wrong[channel] = value  # swapped lanes, unsigned source, or stale high word
+        add_case(inputs, wrong, "mismatch")
+    result = run_pixel_batch(renderer, backend, shader, cases)
+    for line in result.stdout.splitlines():
+        if line.startswith(("backend=", "adapter=", "driver=", "debug_errors=")):
+            print(line)
+    print("sat_pack_u8: 2 matching draws, 3 wrong references rejected")
+
+
 def check_core_vector_draws(directory, compiler, renderer, backend):
+    check_sat_pack_u8_draw(directory, compiler, renderer, backend)
     check_dpp_int32_draw(directory, compiler, renderer, backend)
     check_dpp_draw(directory, compiler, renderer, backend)
     check_vop3p_draw(directory, compiler, renderer, backend)

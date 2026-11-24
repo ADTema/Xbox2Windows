@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <dxgiformat.h>
 
 struct IDXGIAdapter;
 
@@ -11,5 +12,5 @@ struct StartupBc7Input {
 };
 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels,
-                      const StartupBc7Input* bc7 = nullptr, std::uint32_t format = 0,
+                      const StartupBc7Input* bc7 = nullptr, DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
                       std::uint32_t export_word = 0);
