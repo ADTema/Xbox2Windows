@@ -1827,7 +1827,6 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     const u64 desktop = desktop_cpu_handle(handle);
     const ResolvedView view = resolve_view(desktop, 20);
     ID3D12Resource* target = view.resource;
-    if (!target && !view.wrong_kind) target = view_target(desktop, 20);
     static LONG logged;
     if (first_calls(logged, 4))
         log("x2w-render ClearRenderTargetView view=0x%llx target=%p colour=%.3f %.3f %.3f %.3f rects=%u", handle,
@@ -1882,7 +1881,15 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     ID3D12Resource* targets[8]{};
     DXGI_FORMAT formats[8]{};
     for (UINT i = 0; i < count; ++i) {
-        const u64 title = single_range ? handles[0].ptr + u64{i} * stride : handles[i].ptr;
+        const u64 step = u64{i} * stride;
+        if (single_range && handles[0].ptr > (~u64{0}) - step) {
+            InterlockedIncrement(&render_target_unresolved);
+            if (first_calls(unresolved_logged, 6))
+                log("x2w-d3d12 OMSetRenderTargets refused: render target %u handle overflow (0x%llx + %llu)", i,
+                    static_cast<unsigned long long>(handles[0].ptr), static_cast<unsigned long long>(step));
+            return;
+        }
+        const u64 title = single_range ? handles[0].ptr + step : handles[i].ptr;
         desktop[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(title));
         const ResolvedView view = resolve_view(desktop[i].ptr, 20);
         if (view.wrong_kind && first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: render target %u is not a render target view", i);

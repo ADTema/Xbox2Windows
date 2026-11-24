@@ -216,7 +216,7 @@ single-range flag dropped the bind without a message, so every later draw on the
 
 A bind is refused, as before, when a handle holds a view of the wrong kind, a depth view has one read-only plane, a depth
 handle resolves to nothing, or the count is above eight. What changed is that the refusals are visible: each handle
-that holds no view (render target or depth), and a count above eight, adds to `render target binds N (unresolved M)` in
+that holds no view (render target or depth), and a count above eight, adds to `target binds N (unresolved M)` in
 the `x2w-render totals` line and logs one line (the first six of each kind), for example
 `OMSetRenderTargets refused: render target 1 (0x...) holds no view`. A depth pointer whose handle maps to no
 descriptor still binds no depth, now with a count and a log line.

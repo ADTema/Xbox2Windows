@@ -234,6 +234,12 @@ int main(int argc, char** argv)
     if (!step("5 single range reaching the empty view", 0, 1, seen)) return 14;
     invoke(list, 50, 1, arg(&rtv[2]), FALSE, 0);
     if (!step("6 the empty view alone", 0, 1, seen)) return 15;
+    invoke(list, 50, 0, 0, TRUE, 0);
+    if (!step("6b single range, count 0, null handles", 0, 0, seen)) return 16;
+    invoke(list, 50, 9, arg(&rtv[0]), TRUE, 0);
+    if (!step("6c single range, count above 8", 0, 1, seen)) return 17;
+    invoke(list, 52, rtv[2].ptr, arg(red));
+    if (!step("6d clear on the empty view", 0, 1, seen)) return 18;
 
     // A copied descriptor: the empty slot now holds view 0, so it binds and clears that target.
     invoke(device, 24, 1, rtv[2].ptr, staging.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);

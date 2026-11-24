@@ -10854,7 +10854,7 @@ Not covered by this experiment: host segment-base writes (`wrfsbase`/`wrgsbase`,
 message, which skipped every following draw on the list; `ClearRenderTargetView` (slot 52) ignored a render target
 view that the title had copied to another descriptor. The stand-in now expands a single range at the title's descriptor
 stride, resolves the clear through the descriptor's shadow record, and counts and logs every render target or depth handle
-that holds no view (`render target binds N (unresolved M)` in the `x2w-render totals` line). See
+that holds no view (`target binds N (unresolved M)` in the `x2w-render totals` line). See
 [Render target binds and clears](startup-runtime.md#render-target-binds-and-clears).
 
 ```powershell
