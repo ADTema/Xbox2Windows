@@ -3546,6 +3546,46 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_format_' -V
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### Indexed gfx1030 formatted UINT buffer writes
+
+The compute store profile lowers `buffer_store_format_x`, `_xy`, `_xyz` and
+`_xyzw` to stores of one to four consecutive DWORDs in the desktop raw `u0`.
+The [AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+(§8.1.4 and MUBUF opcodes 4–7) takes the format and destination selectors from
+V#. The caller uses `--output-format` to declare `BUF_FMT_32_UINT`,
+`BUF_FMT_32_32_UINT`, `BUF_FMT_32_32_32_UINT` or `BUF_FMT_32_32_32_32_UINT`
+with identity selectors for that width. The number of source VGPRs must
+match the declared format exactly. This keeps each write to a whole texel
+and leaves the record padding untouched.
+
+The store requires a ready output descriptor, consecutive ready data VGPRs,
+`idxen` with a verified dispatch-thread index, a zero scalar offset and a
+DWORD-aligned immediate. The translator checks that every invocation in the
+group has its own record and that the complete write fits the declared
+stride without overlapping another store. The caller supplies a DWORD-aligned
+view base and fully in-range, unswizzled records with thread-ID addition
+disabled in the descriptor and no address wrap or external writers. Partial
+texel writes, packed D16 data, other formats and cache modifiers are refused.
+
+The wave32 fixtures dispatch one and two groups of 16 threads. Each thread
+writes distinct channel words after one padding DWORD. A CPU reference
+compares all 320 output words, including the padding and untouched tail.
+A shifted `x` store must fail first at word 0. Swapping the first and last
+channels of each vector store must fail first at word 1. Rejection controls
+check descriptor and VGPR waits, mismatched formats, bad register ranges,
+misalignment, record overruns and store overlap. The LLVM 15 test assembles
+and disassembles every form and compares the compute-container CLI output
+with direct lowering. The GPU fixtures execute the translated desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_store_format_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### Per-lane guards around compute stores
 
 A per-lane bound such as `if (gid < n) store` compiles under LLVM 15 to one exit, with no early `s_endpgm`. A `v_cmp` sets `vcc_lo`, `s_and_saveexec_b32` saves `exec_lo` and masks it, and an optional `s_cbranch_execz` skips the masked block when no lane passes. `s_or_b32 exec_lo, exec_lo, sN` then restores the mask, or the program exits with the mask still applied. The store profile lowers this form as control flow: the stores issued under the mask go inside an HLSL `if`, and stores after the restore stay outside it.
