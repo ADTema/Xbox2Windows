@@ -219,7 +219,18 @@ It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment 
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
-socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). It writes:
+socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
+
+A process that Windows creates under a debugger normally gets the debug heap: the loader sets the
+heap tail-check, free-check and parameter-validation flags and the low-fragmentation heap is not
+used, so every allocation and free costs more. The debugger starts the process with
+`_NO_DEBUG_HEAP=1` unless the environment already sets `_NO_DEBUG_HEAP`; set `_NO_DEBUG_HEAP=0` to
+keep the debug heap, for example to look for heap corruption. In one local startup run on Windows 11
+the debug heap spent about 8.9 s freeing the nodes of a 99,776-entry map built by a single
+`XMemMapPhysicalPages` call; without it the whole call took 0.46 s and the first DirectStorage batch
+completed about 20 s earlier. `startup_debug` checks both settings on its probe.
+
+It writes:
 
 | File | Content |
 |---|---|
