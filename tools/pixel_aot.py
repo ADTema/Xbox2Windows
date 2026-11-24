@@ -2421,6 +2421,17 @@ def f16_comparison(op, tokens, scalar, vector, pending, sample_dest, *, allow_mo
               for t in tokens]
     raw = [f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=True)
            for t in tokens]
+    return f16_comparison_bits(op, raw, values)
+
+
+def f16_comparison_bits(op, raw, values=None):
+    """The predicate of a binary16 comparison from low-16-bit uint expressions.
+
+    `values` optionally supplies the widened operands when the caller applies abs/neg before widening;
+    otherwise each raw field is widened directly. The predicate tables and the num16 rule are shared.
+    """
+    if values is None:
+        values = [f"widen16({word})" for word in raw]
     ordered = f"(num16({raw[0]}) && num16({raw[1]}))"
     direct = {"lt": "lt", "eq": "eq", "le": "le", "gt": "gt", "lg": "lg", "ge": "ge"}
     negated = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
@@ -2444,7 +2455,12 @@ def f16_class(value, classes, scalar, vector, pending, sample_dest, *, allow_mod
     else:
         raise ValueError("Unsupported class mask")
     operand = f16_cmp_operand(value, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=True)
-    return f"(class16({operand}) & {bits}) != 0u"
+    return f16_class_bits(operand, bits)
+
+
+def f16_class_bits(operand, classes):
+    """The class test of a low-16-bit operand expression against an already selected class mask."""
+    return f"(class16({operand}) & {classes}) != 0u"
 
 
 def parse_vop3p_f16(rest, arity):
@@ -2780,6 +2796,40 @@ def sdwa_dest(result, sel, unused, old):
         raise ValueError("UNUSED_PRESERVE needs a tracked numeric destination")
     keep = ~(((1 << width) - 1) << offset) & 0xffffffff
     return f"((asuint({old}) & {keep:#x}u) | {field})"
+
+
+# VOPC SDWA has a destination field for one lane mask (vcc/vcc_lo or one SGPR) and only the two
+# source-selection fields; llvm-mc rejects dst_sel/dst_unused on a comparison. The pattern accepts
+# the source spellings LLVM prints, including sext() around a register or constant.
+SDWA_CMP_OPERANDS = re.compile(
+    r"(?:(sext)\(([^(),]+)\)|([^(),]+)), (?:(sext)\(([^(),]+)\)|([^(),]+)) "
+    r"src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD) src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD)")
+
+
+def sdwa_cmp_operands(rest):
+    """Parse `src0, src1 src0_sel:... src1_sel:...` into (token, selection, sext) pairs."""
+    m = SDWA_CMP_OPERANDS.fullmatch(rest)
+    if not m:
+        raise ValueError(f"Unsupported SDWA comparison operands: {rest}")
+    sext0, inner0, plain0, sext1, inner1, plain1, sel0, sel1 = m.groups()
+    return (inner0 if sext0 else plain0, sel0, bool(sext0)), (inner1 if sext1 else plain1, sel1, bool(sext1))
+
+
+def sdwa_lane_mask(token):
+    """A VOPC SDWA destination: vcc/vcc_lo or one scalar register, never a pair."""
+    if token in ("vcc", "vcc_lo"):
+        return ["vcc"]
+    if token.startswith("s["):
+        raise ValueError("VOPC SDWA destination cannot be an SGPR pair")
+    sgpr_name(token)
+    return [token]
+
+
+def sdwa_cmp_bits(token, sel, sext, scalar, vector, pending, sample_dest, *, f16):
+    """The selected source field as a zero- or sign-extended 32-bit uint expression."""
+    word = (vop3p_f16_word(token, scalar, vector, pending, sample_dest) if f16
+            else int_operand(token, scalar, vector, pending, sample_dest, signed=False))
+    return sdwa_source(word, sel, sext)
 # Binary32 arithmetic with SDWA forms on gfx1013 (docs/coverage/gfx1013.tsv): the exact operations, then the
 # remaining unary ones. Each reuses its e32/e64 entry in ALU unchanged.
 SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", "ceil", "fract", "trunc",
@@ -5134,6 +5184,59 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {expr};")
+        elif m := match(rf"v_cmp_class_(f16|f32)_sdwa ({LANE_MASK}), (.+)"):
+            kind, _, dst, rest = m.groups()
+            regs = sdwa_lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            (value, sel0, sext0), (classes, sel1, sext1) = sdwa_cmp_operands(rest)
+            value_bits = sdwa_cmp_bits(value, sel0, sext0, scalar, vector, pending, sample_dest,
+                                       f16=kind == "f16")
+            class_bits = sdwa_cmp_bits(classes, sel1, sext1, scalar, vector, pending, sample_dest, f16=False)
+            if kind == "f16":
+                expr = f16_class_bits(value_bits, class_bits)
+            else:
+                expr = f"(class32(asfloat({value_bits})) & {class_bits}) != 0u"
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {expr};")
+        elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f16_sdwa ({LANE_MASK}), (.+)"):
+            op, _, dst, rest = m.groups()
+            regs = sdwa_lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            (src0, sel0, sext0), (src1, sel1, sext1) = sdwa_cmp_operands(rest)
+            raw = [sdwa_cmp_bits(src0, sel0, sext0, scalar, vector, pending, sample_dest, f16=True),
+                   sdwa_cmp_bits(src1, sel1, sext1, scalar, vector, pending, sample_dest, f16=True)]
+            expr = f16_comparison_bits(op, raw)
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {expr};")
+        elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32)_sdwa ({LANE_MASK}), (.+)"):
+            op, kind, _, dst, rest = m.groups()
+            regs = sdwa_lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            (src0, sel0, sext0), (src1, sel1, sext1) = sdwa_cmp_operands(rest)
+            raw = [sdwa_cmp_bits(src0, sel0, sext0, scalar, vector, pending, sample_dest, f16=False),
+                   sdwa_cmp_bits(src1, sel1, sext1, scalar, vector, pending, sample_dest, f16=False)]
+            values = [f"asint({word})" if kind == "i32" else word for word in raw]
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {INT_COMPARE[op].format(*values)};")
+        elif m := match(rf"v_cmp_(eq|ne|lt|le|gt|ge)_(i16|u16)_sdwa ({LANE_MASK}), (.+)"):
+            op, kind, _, dst, rest = m.groups()
+            regs = sdwa_lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            (src0, sel0, sext0), (src1, sel1, sext1) = sdwa_cmp_operands(rest)
+            raw = [sdwa_cmp_bits(src0, sel0, sext0, scalar, vector, pending, sample_dest, f16=False),
+                   sdwa_cmp_bits(src1, sel1, sext1, scalar, vector, pending, sample_dest, f16=False)]
+            values = [f"(asint({word} << 16) >> 16)" if kind == "i16" else f"({word} & 0xffffu)"
+                      for word in raw]
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {INT_COMPARE[op].format(*values)};")
         elif m := match(rf"v_cndmask_b32(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+), {LANE_MASK}"):
             dst, unset, chosen, source = m.groups()
             regs = lane_mask(source)
