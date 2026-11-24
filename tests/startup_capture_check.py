@@ -139,6 +139,7 @@ def check_damaged_files():
     refuses(FILE + body_cut, "b'MEM '", 'offset %d' % len(FILE))
     refuses(FILE + chunk(b'ZZZZ', b'\0' * 8), 'unknown', 'ZZZZ', 'offset %d' % len(FILE))
     refuses(FILE + chunk(b'\xff\xfe\x00\x01'), 'unknown', 'offset %d' % len(FILE))
+    refuses(FILE + chunk(b'FRAM', b'\0' * 4), "b'FRAM'", 'offset %d' % len(FILE))
     refuses(FILE + chunk(b'CALL', b'\0' * 20), "b'CALL'", 'offset %d' % len(FILE))   # header shorter than the struct
 
 

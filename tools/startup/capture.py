@@ -80,7 +80,8 @@ class Capture:
                 raise ValueError('bad %r chunk at offset %d: %s' % (tag, start, error)) from error
 
     def on_FRAM(self, h, b):
-        pass
+        if len(h) < struct.calcsize('<II'):
+            raise struct.error('frame header requires the frame number and reserved word')
 
     def on_CALL(self, h, b):
         frame, seq, tid, slot, lst = struct.unpack_from('<IIIIQ', h, 0)
