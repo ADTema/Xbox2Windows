@@ -35,6 +35,13 @@ CASES = [
     ("hn_0f1d_mem", "0F 1D [rax]", bytes.fromhex("0f1d00"), True),
     ("hn_0f1e_mem", "0F 1E [rax]", bytes.fromhex("0f1e00"), True),
     ("hn_0f1f_disp8", "0F 1F [rax+8]", bytes.fromhex("0f1f4008"), True),
+    # The prefixed and non-32-bit operand-size forms are accepted too; the Python check covers them, and
+    # these run them natively against the lifted body on Windows.
+    ("hn_f3_0f1e", "F3 0F 1E [rax]", bytes.fromhex("f30f1e00"), True),
+    ("hn_0f19_16", "66 0F 19 [rax], 16-bit operand size", bytes.fromhex("660f1900"), True),
+    ("hn_0f1e_16", "66 0F 1E [rax], 16-bit operand size", bytes.fromhex("660f1e00"), True),
+    ("hn_0f19_64", "48 0F 19 [rax], 64-bit operand size", bytes.fromhex("480f1900"), True),
+    ("hn_0f1e_64", "48 0F 1E [rax], 64-bit operand size", bytes.fromhex("480f1e00"), True),
 ]
 
 TEST_MAIN = r"""
