@@ -43,8 +43,8 @@ XSAVEOPT_EXPORTS = (
     "op_xrstor64_xsaveopt64_sse",
     "op_xrstor64_xsaveopt64_x87_avx",
     "op_xrstor64_xsaveopt64_avx",
-    "op_xrstor64_sse_compacted_avx_xsaveopt64_avx",
 )
+SSE_COMPACTED_CONTROL_EXPORT = "op_xrstor64_sse_compacted_avx_xsaveopt64_avx"
 XSAVEOPT_DYNMASK_EXPORT = "op_xsaveopt64_dynmask"
 
 # XSAVEC then XRSTOR of the same buffer: (xsavec RFBM, xrstor RFBM). The save mask leaves a component out of XCOMP_BV
@@ -825,7 +825,9 @@ def assert_equal_output(label: str, name: str, idx, got: bytes, want: bytes) -> 
             and got == bytes(loose)
         ):
             return
-    elif label == "native" and (name in XSAVEOPT_EXPORTS or name == "op_xrstor64_avx_xsaveopt64_avx"):
+    elif label == "native" and (
+        name in XSAVEOPT_EXPORTS or name in ("op_xrstor64_avx_xsaveopt64_avx", SSE_COMPACTED_CONTROL_EXPORT)
+    ):
         if native_xsaveopt_matches(got, want, EXPORT_MODES[name][2]):
             return
     elif label == "native":
@@ -856,7 +858,10 @@ def native_exports_for_host(native: dict, has_xsavec: bool, has_xsaveopt: bool =
         name: fn
         for name, fn in native.items()
         if (has_xsavec or (name not in XSAVEC_EXPORTS and name not in COMPACTED_EXPORTS))
-        and (has_xsaveopt or (name not in XSAVEOPT_EXPORTS and name != "op_xrstor64_avx_xsaveopt64_avx"))
+        and (
+            has_xsaveopt
+            or (name not in XSAVEOPT_EXPORTS and name not in ("op_xrstor64_avx_xsaveopt64_avx", SSE_COMPACTED_CONTROL_EXPORT))
+        )
     }
 
 
@@ -1713,7 +1718,9 @@ def check_differential(
     native_altered_path: Path,
 ) -> None:
     lifted_lib, lifted = bind_exports(
-        lifted_path, "lifted_", DEFINED_EXPORTS + (DYNMASK_EXPORT, XSAVEOPT_DYNMASK_EXPORT) + COMPACTED_EXPORTS
+        lifted_path,
+        "lifted_",
+        DEFINED_EXPORTS + (DYNMASK_EXPORT, XSAVEOPT_DYNMASK_EXPORT, SSE_COMPACTED_CONTROL_EXPORT) + COMPACTED_EXPORTS,
     )
     lifted_lib.host_has_xsave.argtypes = []
     lifted_lib.host_has_xsave.restype = ctypes.c_uint32
@@ -1748,7 +1755,7 @@ def check_differential(
     fp_cpuid = int(lifted_lib.host_fp_err_cpuid_info())
     mxcsr_mask = int(lifted_lib.host_mxcsr_mask())
 
-    _, native = bind_exports(native_path, "", EXPORTS + COMPACTED_EXPORTS)
+    _, native = bind_exports(native_path, "", EXPORTS + COMPACTED_EXPORTS + (SSE_COMPACTED_CONTROL_EXPORT,))
     native = native_exports_for_host(native, has_xsavec, has_xsaveopt)
     _, native_altered = bind_exports(native_altered_path, "", ALTERED_CANONICAL_EXPORTS)
     altered_lib, altered = bind_exports(altered_path, "lifted_", ALTERED_DEFINED_EXPORTS + ALTERED_COMPACTED_EXPORTS)
