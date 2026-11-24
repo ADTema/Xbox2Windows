@@ -692,6 +692,55 @@ def unary_binary(tmp, tools):
     raise AssertionError("two-source unary")
 
 
+# Fract of a tiny negative input. x - floor(x) rounds to 1.0 in binary32, but v_fract_f32 returns at most 0x3f7fffff.
+# Both encodings get their own input (-2^-30 and -2^-28), so the two emitted expressions stay distinct. Each result
+# is moved by -1.0 first, which makes it exact (-2^-24, or zero when the clamp is missing).
+FRACT_TINY = [(("v_fract_f32_e32", 0xB0800000), "v_fract_f32_e32"), (("v_fract_f32_e64", 0xB1800000), "v_fract_f32_e64")]
+
+
+def fract_tiny_program():
+    program = PROGRAM.copy()
+    body = ["v_sub_f32_e32 v5, v3, v3"]
+    for i, ((op, word), _) in enumerate(FRACT_TINY):
+        body += [
+            f"v_add_f32_e32 v{40 + i}, 0x{word:08x}, v5",
+            f"{op} v{20 + i}, v{40 + i}",
+            f"v_add_f32_e32 v{20 + i}, 0xbf800000, v{20 + i}",
+            f"v_add_f32_e32 v3, v{20 + i}, v3",
+        ]
+    program[-2:-2] = body
+    return program
+
+
+def fract_tiny_reference():
+    # The RDNA rule in binary32: fract(x) = min(x - floor(x), 0x3f7fffff). The bare difference is 1.0 for both inputs.
+    top = F32(struct.unpack("<f", struct.pack("<I", 0x3F7FFFFF))[0])
+    z = F32(0.125) + F32(0.375)  # pointData y plus the matrix value
+    for (_, word), _ in FRACT_TINY:
+        x = F32(struct.unpack("<f", struct.pack("<I", word))[0])
+        assert F32(x - math.floor(x)) == 1.0
+        z = z + (F32(min(F32(x - math.floor(x)), top)) - F32(1.0))
+    return z
+
+
+def fract_tiny_binary(tmp, tools):
+    inputs, reference = triangle_inputs(), fract_tiny_reference()
+    assert reference == 0.5 - 2**-23, reference
+    text = binary(tmp, *tools, program=fract_tiny_program(), words=[4099])
+    assert evaluate_depth(text, inputs) == reference, text
+    cap = r"min\((frac\([^;]*?\)), asfloat\(0x3f7fffffu\)\)"
+    assert len(re.findall(cap, text)) == 2, text
+    # Without the cap, either encoding alone moves the depth, and dropping both moves it further.
+    for count in (1, 2):
+        for first in (True, False):
+            matches = list(re.finditer(cap, text))
+            chosen = matches[:count] if first else matches[-count:]
+            mutated = text
+            for m in reversed(chosen):
+                mutated = mutated[: m.start()] + m[1] + mutated[m.end() :]
+            assert evaluate_depth(mutated, inputs) != reference, (count, first, mutated)
+
+
 def offset_draw():
     program = PROGRAM.copy()
     program[program.index("s_buffer_load_dword s30, s[16:19], 0x4")] = (
@@ -739,6 +788,7 @@ if __name__ == "__main__":
             float_binary(Path(directory), sys.argv[2:])
             cvt_minmax_binary(Path(directory), sys.argv[2:])
             unary_binary(Path(directory), sys.argv[2:])
+            fract_tiny_binary(Path(directory), sys.argv[2:])
             sys.exit(0)
         if sys.argv[1] == "draw-cvt-minmax":
             args = sys.argv[2:]

@@ -2672,7 +2672,9 @@ conversions that need rounding are not exercised.
 The translator also lowers the one-source binary32 math and rounding forms
 `v_rcp_f32`, `v_rsq_f32`, `v_sqrt_f32`, `v_floor_f32`, `v_trunc_f32`,
 `v_rndne_f32` and `v_fract_f32` (`_e32` and `_e64`) to `1.0f / x`,
-`rsqrt`, `sqrt`, `floor`, `trunc`, `round` (half to even) and `frac`. Source
+`rsqrt`, `sqrt`, `floor`, `trunc`, `round` (half to even) and `frac` capped at
+`0x3f7fffff`, so that `v_fract_f32` of -2^-30 is the largest binary32 below 1.0 and not 1.0 (the
+same rule as the pixel and dispatch translators). Source
 modifiers, `clamp`, output modifiers and a second source are refused. The
 precision of reciprocal, reciprocal square root and square root is not
 claimed, because D3D allows each of them an error. The test program does not

@@ -33,7 +33,8 @@ UNARY_F32_EXPR = {
     "v_floor_f32": "floor({x})",
     "v_trunc_f32": "trunc({x})",
     "v_rndne_f32": "round({x})",
-    "v_fract_f32": "frac({x})",
+    # v_fract_f32 is x - floor(x) clamped to 0x3f7fffff: a tiny negative input must not round up to 1.0.
+    "v_fract_f32": "min(frac({x}), asfloat(0x3f7fffffu))",
 }
 UNARY_F32 = {f"{name}_e{width}": expr for name, expr in UNARY_F32_EXPR.items() for width in (32, 64)}
 
