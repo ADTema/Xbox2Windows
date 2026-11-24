@@ -635,6 +635,10 @@ These are measured on one executable; treat them as hypotheses for others.
   draw of a 4x4 texture of two slices with three mips whose cells all differ, with mutants that exchange
   slice and mip, ignore the mip, or shift it by one. The draw was written without a Windows run. Cube maps
   are still refused for `image_load_mip`.
+- **Packed 2D load coordinates.** Plain 2D `image_load` with `a16` reads unsigned x and y from the low and
+  high halves of one VGPR and reads mip zero. The packed form requires one address VGPR without an
+  NSA extension. Plain loads refuse an empty `dmask`, `r128`, `lwe`, `d16`, `tfe` and reserved bits.
+  The source-built startup mip-load check covers this translation on Linux.
 - **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
   `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
   the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`

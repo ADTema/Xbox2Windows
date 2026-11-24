@@ -10802,6 +10802,16 @@ Tests: `startup_gfx2hlsl_cvt_alu_controls`, `startup_gfx2hlsl_cvt_alu_warp` and 
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
 
+## Startup translator: packed 2D image-load coordinates
+
+For plain 2D `image_load`, the startup translator reads `a16` coordinates from the low and high unsigned
+halves of one VGPR and emits `Texture2D.Load` at mip zero. The synthetic case in
+`python -B tests/startup_image_load_mip_check.py` packs x=1 and y=2 into v0 and assigns 63 to v1, which the
+old lowering used as y. Full-width loads still accept cache-policy flags. Plain loads refuse an empty
+`dmask`, `r128`, `lwe`, `d16`, `tfe` and reserved bits. The fixture also checks that 3D `a16` and a
+patched 2D `a16` instruction carrying an unexpected NSA extension are refused, and that the runtime
+and offline cache keys use the same revision. The check verifies translation on the CPU.
+
 ## Startup translator: pixel depth export
 
 The startup translator emits `SV_Depth` for an uncompressed `exp mrtz vN, off, off, off` in a straight-line pixel shader that still uses its entry execution mask. Color exports in the same shader keep their `SV_Target` outputs. Additional MRTZ channels, packed exports, multiple depth exports, branches and changes to the execution mask before the depth export are refused.
