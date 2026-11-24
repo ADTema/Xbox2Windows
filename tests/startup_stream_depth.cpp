@@ -163,16 +163,13 @@ int clear_depth_desktop(ID3D12Device* desktop, ID3D12Resource* depth_tex)
 
 int execute_guest_list(void* queue, void* list, void* fence, UINT64 fence_value)
 {
-    if (FAILED(static_cast<HRESULT>(invoke(list, 10)))) return 50;
+    if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 50;
     void* lists[] = {list};
-    invoke(queue, 11, 1, ptr_arg(lists));
-    if (FAILED(static_cast<HRESULT>(invoke(queue, 15, ptr_arg(fence), fence_value)))) return 51;
-    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!ev) return 52;
-    const bool ok = SUCCEEDED(static_cast<HRESULT>(invoke(fence, 10, fence_value, reinterpret_cast<Word>(ev)))) &&
-                    WaitForSingleObject(ev, 10000) == WAIT_OBJECT_0;
-    CloseHandle(ev);
-    return ok ? 0 : 53;
+    invoke(queue, 10, 1, ptr_arg(lists));
+    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, ptr_arg(fence), fence_value)))) return 51;
+    const auto deadline = GetTickCount64() + 10000;
+    while (invoke(fence, 8) < fence_value && GetTickCount64() < deadline) Sleep(1);
+    return invoke(fence, 8) >= fence_value ? 0 : 53;
 }
 
 }  // namespace
