@@ -75,6 +75,14 @@ FLOAT_INLINE = {
     "0.5": 0x3f000000, "-0.5": 0xbf000000, "1.0": 0x3f800000, "-1.0": 0xbf800000, "2.0": 0x40000000,
     "-2.0": 0xc0000000, "4.0": 0x40800000, "-4.0": 0xc0800000, "0.15915494": 0x3e22f983,
 }
+# v_cvt_pk_u8_f32 D, S0, S1, S2 (VOP3A opcode 350 of the RDNA 1.0 and RDNA 2 ISA guides): D = (S2 & ~(0xff << 8 * S1[1:0]))
+# | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0]). The guides leave flt32_to_uint8 undefined: its rounding, its bounds and
+# its NaN and negative results are not stated. The lowering holds only where every reading agrees, a binary32 S0 that is
+# +0.0 or an integer in [1, 255]. A constant S0 outside that set is refused; a word read from memory is not known
+# statically, so the caller must keep it inside the set.
+CVT_PK_U8 = {
+    "v_cvt_pk_u8_f32": "(({2} & ~(0xffu << (({1} & 3u) << 3u))) | ((uint(asfloat({0})) & 0xffu) << (({1} & 3u) << 3u)))",
+}
 FLOAT_SOURCE = r"(s\d+|v\d+|-?\d+\.\d+|0x[0-9a-f]+|-?\d+)"
 SALU_SOURCE = r"(s\d+|-?\d+|0x[0-9a-f]+)"
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
@@ -1130,6 +1138,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 vector[regs[0]] = lds_word
             lds_word = ("alu", expression)
             ds_wait = True
+        elif m := re.fullmatch(rf"(v_cvt_pk_u8_f32) v(\d+), {FLOAT_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line):
+            # VOP3 without input or output modifiers. S0 is the binary32 value, S1 the byte select, S2 the other bytes.
+            op, dst = m[1], int(m[2])
+            words = [float_word(m[3], scalar, vector, pending),
+                     *(alu_word(token, scalar, vector, pending) for token in m.groups()[3:])]
+            if (dst > 255 or None in words or isinstance(words[0], int)
+                    and not (words[0] == 0 or 0x3f800000 <= words[0] <= 0x437f0000
+                             and struct.unpack("<f", struct.pack("<I", words[0]))[0].is_integer())):
+                raise ValueError("Unverified ALU operand")
+            expression = CVT_PK_U8[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), v(\d+), (\d+), v(\d+)", line):
             dst, row, shift, column = map(int, m.groups())
             row_tag, column_tag = vector.get(row), vector.get(column)
