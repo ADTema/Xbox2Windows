@@ -2414,6 +2414,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "op_minpd,op_minpd_mem,op_minpd_mem_disp,op_minpd_self,"
         "op_maxpd,op_maxpd_mem,op_maxpd_mem_disp,op_maxpd_self,"
         "op_sqrtpd,op_sqrtpd_mem,op_sqrtpd_mem_disp,op_sqrtpd_self,"
+        "op_cmppd_0,op_cmppd_1,op_cmppd_2,op_cmppd_3,op_cmppd_4,op_cmppd_5,op_cmppd_6,op_cmppd_7,"
+        "op_cmppd_mem,op_cmppd_mem_disp,op_cmppd_self,"
         "op_pd_pipeline")
     string(CONCAT cpu_sse_fp_pd_exports ${cpu_sse_fp_pd_exports})
     foreach(variant IN ITEMS original altered)

@@ -8914,9 +8914,9 @@ second, made quiet), so a compiler that swaps the operands of an addition cannot
 and `maxps` use the host instruction unchanged, which returns the second source operand for equal values
 (signed zeros included) and for any NaN. A guest `ldmxcsr` is not lifted and exception flags are not observed.
 The packed double arithmetic forms are described in the next subsection; the other packed double forms
-(compares, logic, conversions), the scalar forms, `rcpps` and `rsqrtps` stay rejected.
+(logic, conversions), the scalar forms, `rcpps` and `rsqrtps` stay rejected; the packed double compare `cmppd` is described in its own subsection below.
 
-The translator explicitly rejects VEX/EVEX encodings, `cmpps`/`cmpss` predicates
+The translator explicitly rejects VEX/EVEX encodings, `cmpps`/`cmpss`/`cmppd` predicates
 `imm8 >= 8`, nonvolatile vector registers (`xmm6`..`xmm15`), nonvolatile or non-argument
 memory base registers, non-`r8` store destinations, unaligned 16-byte memory operands,
 undefined register reads/merges, `lock`/`rep`/segment prefixes, unsupported instructions,
@@ -9016,7 +9016,7 @@ operand when it is a NaN, else the second, made quiet); `minpd` and `maxpd` use 
 (second source operand for equal values and for any NaN); `sqrtpd` returns a NaN source quiet with its payload
 and only writes its destination. A guest `ldmxcsr` is still not lifted and exception flags are not observed.
 VEX and EVEX forms, scalar forms (`F2`/`F3` prefixes with the same opcodes are `addsd`, `addss`, `sqrtsd`,
-`sqrtss`), `cmppd`, `andpd`, `cvtps2pd` and the other packed double forms stay rejected. These forms add no
+`sqrtss`), `andpd`, `cvtps2pd`, `cvtpd2ps` and the other packed double forms stay rejected. These forms add no
 store: the results leave through the `movaps` stores the fixture already used.
 
 [The fixture](../tests/cpu/sse_fp_pd.asm) has four exports per operation (register source, `m128` at `[rdx]`, `m128`
@@ -9048,6 +9048,44 @@ mutants (add as subtract, subtract with swapped operands, multiply as divide, di
 swapped `minpd` and `maxpd` operands, `sqrtpd` or the NaN rule not quieting, the NaN rule picking the second operand,
 `sqrtpd` as a doubling) each fail on a named word of a named export, for example `lifted op_addpd case 1`. The MSVC
 build and `ctest` run of `cpu_aot_sse_fp_pd` are left to CI. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fp_pd$' -V`.
+
+#### Packed double compare
+
+The same translator lifts the legacy SSE2 form `cmppd xmm, xmm/m128, imm8` with the eight predicates `0..7`
+(EQ, LT, LE, UNORD, NEQ, NLT, NLE, ORD). Each 64-bit lane of the destination becomes all ones or all zero. The
+source is an `xmm` register or a 16-byte aligned `m128`; a displacement that is not a multiple of 16 rejects at
+translation time. `imm8 >= 8` selects the AVX-only predicates (`8..31`) and is not defined for the legacy
+encoding, so it rejects at translation time instead of being masked to three bits. The lowering runs the
+matching `_mm_cmp*_pd` intrinsic of `emmintrin.h` on run-time operands read through volatile copies, so the processor
+decides NaN operands and, under DAZ, treats a denormal operand as a zero of the same sign; C comparison operators and the
+C library are not used. A NaN in either operand makes EQ, LT and LE false and UNORD, NEQ, NLT and NLE true, ORD is false,
+and `+0` equals `-0`. A compare produces no number, so rounding mode and FTZ do not change it; this is checked, not assumed.
+The form adds no store: results leave through the existing `movaps` store. VEX and EVEX `vcmppd`, the scalar `cmpsd` and
+the other packed double forms stay rejected.
+
+The fixture [`sse_fp_pd.asm`](../tests/cpu/sse_fp_pd.asm) has 11 compare exports (one per predicate on a register source, plus
+`m128` at `[rdx]`, `m128` at `[rdx+16]` and the same register as both operands). [The check](../tests/cpu/sse_fp_pd_check.py)
+compares native code, translated code and a [reference written from the predicate rules](../tests/cpu/sse_fp_pd_ref.py)
+(integer bit patterns and exact values, no host floating point) on the 412 inputs of the arithmetic check (every ordered pair of 28 edge
+values: signed zeros, infinities, quiet and signaling NaNs with payloads, denormals, equal, smaller and larger values, plus random vectors),
+then under the 16 control words (four rounding modes, each with neither, DAZ, FTZ or both).
+
+Negative controls: the `ALTER_IMM` build assembles predicate `n xor 4` (EQ and NEQ, LT and NLT, LE and NLE, UNORD and ORD swap) and
+must match its own reference and differ from the original on every compare export; rounding mode and FTZ must change no result; DAZ
+must change every export except UNORD, ORD and the self compare (which cannot depend on it); fourteen wrong reference rules (NaN treated as ordered,
+signed zeros unequal, NEQ as EQ, LE as LT, UNORD and ORD swapped, 32-bit masks, numeric results, DAZ ignored) must each disagree with the processor on
+some call; 13 translator rejection controls cover `imm8` 8, `0x1f` and `0xff`, `vcmppd` (VEX 128-bit, VEX 256-bit, EVEX), nonvolatile and
+undefined registers, unaligned `m128` displacements and a non-argument memory base; two of them (`imm8` 8 and an unaligned `m128`) are also patched into a copy of the linked DLL.
+Three alternate encodings (`xmm4`/`xmm5`, a negative displacement, an `rcx` source) lift to the expected statement. The packed single check, which used `cmppd` as its unsupported instruction, now uses `cvtpd2ps`, which still rejects.
+
+Measured on Linux x86-64 on 24 November 2026 (a QEMU virtual x86-64 processor, not the Windows CI machine): the fixture was assembled with
+`llvm-ml-19` and linked with `lld-link-19`, the native code was run through a Windows-ABI caller, and the translation was built with
+`clang++-19` at `-O0`, `-O2` and `-O3` (and with MinGW `g++` at the same levels without warnings). All three passed: 4,532 default-mode compare
+cases over 11 exports and 72,512 compare runs in 16 control words, 61 unit and 11 PE-patched rejection controls. The translator from `origin/main`
+fails on the same fixture with `unsupported instruction at RVA 0x1187: cmpeqpd xmm0,xmm1`. Seven translator mutants (NEQ as EQ, LE as LT,
+UNORD as ORD, a 32-bit mask, a numeric result, NaN treated as ordered, and a software compare that ignores DAZ) each fail on a named word of a named
+export, for example `lifted op_cmppd_4 case 0`. The MSVC build and `ctest` run are left to CI.
+Run `ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fp(_pd)?$' -V` (and `--preset release`).
 
 ## Legacy SSE/MMX conversion, shuffle, and masked/non-temporal stores
 
