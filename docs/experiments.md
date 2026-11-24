@@ -69,10 +69,15 @@ ctest --preset dev --no-tests=error -R '^startup_present_view' -V
 
 ## CPU-written R8 planes across frames
 
-The startup draw uploader checks a single-mip, single-slice R8_UNORM texture of up to 32 MiB
-on its first bind in each new frame. The texture may change through direct CPU stores between
-uses of the same decoder buffer. Unchanged bytes reuse the desktop copy. Other formats retain
-the existing 15-frame polling interval and explicit XG write notifications still trigger a check.
+The startup draw uploader checks a single-mip, single-slice R8_UNORM or A8_UNORM texture of up
+to 32 MiB on its first bind in each new frame. The texture may change through direct CPU stores
+between uses of the same decoder buffer, or when glyphs are added to an alpha atlas between draws.
+Unchanged bytes reuse the desktop copy. Other formats retain the existing 15-frame polling interval
+and explicit XG write notifications still trigger a check.
+
+In a local diagnostic run, the only texture other than R8 decoder planes whose contents changed
+without a write notification was a 2048×2048 single-mip A8_UNORM texture, changing as new screens
+added text. At the 15-frame interval newly added characters appeared late; at one frame they did not.
 
 Build `startup_plane_refresh` and run `ctest --preset release --no-tests=error -R '^startup_plane_refresh_' -V`.
 The fixture rotates three 17×3 desktop R8 textures through six CPU images. Each adapter must read

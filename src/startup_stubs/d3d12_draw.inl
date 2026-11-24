@@ -591,7 +591,7 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 o
 // surface must be detiled into the footprint first. A texture is uploaded on its first bind and
 // again when its memory changed: XG copies announce themselves (x2w_d3d12_texture_written), and
 // CPU-backed textures up to 32 MiB are also re-hashed for writes the title makes on its own.
-// Recheck single-mip R8 planes on their first bind each frame and other textures every 15 frames.
+// Recheck single-mip R8 and A8 planes on their first bind each frame and other textures every 15 frames.
 // Targets and UAVs are GPU-written and never uploaded.
 struct TextureUpload {
     u64 hash = 0, generation = ~0ull;
