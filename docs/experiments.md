@@ -2075,8 +2075,8 @@ must fail. The patched pointer is never called. The original fixtures and test
 are MIT source; no game inputs are included.
 
 ```powershell
-cmake --build out/native --target pe_map cpu_reloc_original cpu_import_provider --parallel 4
-ctest --test-dir out/native --no-tests=error -R '^cpu_native_highlow$' -V
+cmake --build --preset dev --target pe_map cpu_reloc_original cpu_import_provider --parallel 4
+ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V
 ```
 
 Measured on Windows 11 build 26300.9974 with MSVC/ML64 19.44.35230 and
@@ -2497,8 +2497,8 @@ from a compare before the transfer. Macro-generated instruction forms are record
 from the decoded functions only after all comparisons and controls succeed.
 
 ```powershell
-cmake --build out/native --target cpu_switch_strings_lifted cpu_switch_strings_lifted_o2 cpu_switch_strings_mutants cpu_string_probe cpu_guarded_call --parallel 4
-ctest --test-dir out/native --no-tests=error -R '^cpu_aot_switch_strings$' -V
+cmake --build --preset dev --target cpu_switch_strings_lifted cpu_switch_strings_lifted_o2 cpu_switch_strings_mutants cpu_string_probe cpu_guarded_call --parallel 4
+ctest --preset dev --no-tests=error -R '^cpu_aot_switch_strings$' -V
 ```
 
 Windows 11 build 26300.9974, MSVC/ML64 19.44.35230 and Python 3.12.8:
