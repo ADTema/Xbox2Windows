@@ -5134,11 +5134,25 @@ Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_bcnt_exec_(warp|
 
 #### First active lane of a full wave
 
-`s_ff1_i32_b64 sD, exec` and `s_ff1_i32_b32 sD, exec_lo` return the index of the lowest set bit of `exec` (64-bit) or `exec_lo` (32-bit) in the single 32-bit SGPR `sD`, preserving `SCC`. Outside a guarded region, lane 0 of every wave is active for any group of at least 1 thread (and for wave32 the high half of `exec` is 0), so both forms fold to the known scalar word `0`. Uses inside a guarded region (`s_and_saveexec_b32` through `exec` restore), any other source (`vcc`, `exec_hi`, SGPRs, literals, or mismatched width), and invalid or pending destinations (`s106`, `s12`, or an SGPR pair) are refused.
+`s_ff1_i32_b64 sD, exec` and `s_ff1_i32_b32 sD, exec_lo` return the index of the lowest set bit of `exec` (64-bit) or `exec_lo` (32-bit) in the single 32-bit SGPR `sD`, preserving `SCC`. Outside a guarded region, lane 0 of every wave is active for any group of at least 1 thread (and for wave32 the high half of `exec` is 0), so both forms fold to the known scalar word `0`. Uses inside a guarded region (`s_and_saveexec_b32` through `exec` restore), any other exec-mask source (`vcc`, `exec_hi`, or the wrong width), a literal, an SGPR that does not hold a known data word, and invalid or pending destinations (`s106`, `s12`, or an SGPR pair) are refused. A tracked general SGPR is a separate case below and is not folded to the active lane.
 
 The fixture runs one 64-thread group storing `(tid.x << 8) + s4 + s5`, where `s4` comes from `s_ff1_i32_b64 s4, exec` and `s5` from `s_ff1_i32_b32 s5, exec_lo`. All 320 words are compared against a Python reference. Reference controls must fail for: the result taken as `1` (word 0), the result taken as the lane index (word 1), and a changed sentinel past the group (word 64). Recompiled HLSL must also fail on the device with `1` in place of `0`.
 
 Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_ff1_exec_(warp|hardware)$' -V`.
+
+#### Find-first-one of a tracked scalar
+
+`s_ff1_i32_b32 sD, sS` and `s_ff1_i32_b64 sD, s[S:S+1]` write the index of the lowest set bit of a tracked data word, or `0xffffffff` when that word is 0. `b64` reads an even SGPR pair and scans all 64 bits: a set low half hides the high half, and a zero low half adds 32 to the high half's index. The source has to be a known data word, the same set scalar ALU already accepts (an immediate moved into an SGPR, or a scalar ALU result). `SCC` is preserved by the instruction and stays unmodelled, so a later `s_cselect_b32` is still refused.
+
+LLVM 15.0.7 selects both opcodes as `AMDGPUffbl_b32` (`SOPInstructions.td` lines 259-264) and defines that node as count-trailing-zeros with `-1` when the input is zero (`AMDGPUISelLowering.h` line 433). Mesa 23.3.6 defines `find_lsb` as that scan, returning `-1` when no bit is set (`nir_opcodes.py` lines 550-558), and ACO selects a scalar 32-bit source to `s_ff1_i32_b32` and a scalar 64-bit source to `s_ff1_i32_b64` (`aco_instruction_selection.cpp` lines 1757-1764). HLSL `firstbitlow` is that result: `0xffffffff` for zero. The `exec` / `exec_lo` fold above is unchanged.
+
+Refused, each with its own control: an untracked SGPR, a group id, a pending load, a descriptor word, the saved `exec` mask, a literal, a VGPR, `vcc`, `exec_hi`, a mismatched width, a single register or an odd or mis-sized pair for `b64`, `s_ff0_i32_b32`, an `s_cselect_b32` that would read `SCC`, and a destination of `s106` or a pending `s12`.
+
+The fixture is hand-assembled gfx1013. One group of 32 threads stores four words: `s_ff1_i32_b32` of 0, of 1 (bit 0) and of `0x80000000` (bit 31), and `s_ff1_i32_b64` of a pair whose low half is 0 and whose high half is `0x80000000` (bit 63). The Python reference is a bit scan, not the HLSL text. All 320 words are compared. Reference controls must fail for: zero read as 0 (word 0), bit 0 read as 1 (word 1), bit 31 read as 0 (word 2), the high half read as 31 (word 3), and a changed sentinel past the group (word 128). Recompiled HLSL must also fail on the device when `firstbitlow(0)` is replaced by 0, and when the high half is not shifted by 32. Dropping the scalar lowering makes the translation control raise `Unsupported first active lane source`.
+
+Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_ff1_scalar_(warp|hardware)$' -V`.
+
+[LLVM 15.0.7 SOPInstructions.td](https://github.com/llvm/llvm-project/blob/llvmorg-15.0.7/llvm/lib/Target/AMDGPU/SOPInstructions.td#L259-L264) · [LLVM 15.0.7 AMDGPUISelLowering.h](https://github.com/llvm/llvm-project/blob/llvmorg-15.0.7/llvm/lib/Target/AMDGPU/AMDGPUISelLowering.h#L433) · [Mesa 23.3.6 nir_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-23.3.6/src/compiler/nir/nir_opcodes.py#L550-L558) · [Mesa 23.3.6 aco_instruction_selection.cpp](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-23.3.6/src/amd/compiler/aco_instruction_selection.cpp#L1757-L1764)
 
 #### Writing one lane of a vector register
 
