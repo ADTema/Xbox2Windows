@@ -640,6 +640,7 @@ requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
 then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
+For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
 
 ## Input script
 
@@ -1297,6 +1298,14 @@ without Windows calls. The heartbeat also prints while the request counters are 
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed
 by a line of failed requests by cause and a line of page-destination requests by end (see
 DirectStorage failure causes and DirectStorage page-request ends under Findings).
+
+The live log window also shows DirectStorage heartbeat lines and `x2w-render totals` as they
+arrive. It reports frame counts and FPS from the graphics heartbeat without inferring whether
+draws were executed. Network refusals are shown when observed; the window does not establish
+that all network activity is blocked. To check this presentation with generated logs, run
+`python -B tests/startup_live_telemetry_check.py`. See [#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)
+for memory accounting and [#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281) for
+the launcher's concurrent-hook limitation.
 
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check

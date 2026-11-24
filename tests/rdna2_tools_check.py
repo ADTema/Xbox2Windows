@@ -1198,6 +1198,20 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(insns[0]["assembly"], "v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD")
         self.assertEqual(disasm_rdna2(sdwa[:4])[0]["opcode"], "vopc_truncated")
 
+        # VOPC DPP16, DPP8 and DPP8 FI extension dwords are consumed with the instruction, so the
+        # following s_endpgm stays at offset 8 (the operands are not decoded).
+        for raw_hex, opcode, form in (
+            ("fa02087c00010000", "vopc_dpp16", "DPP16"),
+            ("e902087c00010000", "vopc_dpp8", "DPP8"),
+            ("ea02087c00010000", "vopc_dpp8", "DPP8"),
+        ):
+            insns = disasm_rdna2(bytes.fromhex(raw_hex + "000081bf"))
+            self.assertEqual([i["opcode"] for i in insns], [opcode, "s_endpgm"], raw_hex)
+            self.assertEqual([i["offset"] for i in insns], [0, 8], raw_hex)
+            self.assertEqual(insns[0]["length"], 8, raw_hex)
+            self.assertEqual(insns[0]["assembly"], f"v_cmp_gt_f32_dpp <unsupported {form}>", raw_hex)
+        self.assertEqual(disasm_rdna2(bytes.fromhex("fa02087c"))[0]["opcode"], "vopc_truncated")
+
         # Truncated VOPC literal
         w0_lit = 0x7c000000 | (0x01 << 17) | (2 << 9) | 255
         insns = disasm_rdna2(struct.pack("<I", w0_lit))
@@ -5022,6 +5036,19 @@ class TestRdna2Scanner(unittest.TestCase):
                 stream.write(".long 0\n")
             result = scan()
             self.assertIn("Full Shaders Accepted by Translator:       0", result.stdout)
+
+    def test_parse_assembly_file_skips_bom_and_commented_labels(self):
+        """A UTF-8 BOM and llc-style commented labels are not instructions; a ':' in a comment keeps the line."""
+        from scan_unsupported_shaders import parse_assembly_file
+        with tempfile.TemporaryDirectory() as tmp:
+            bom = Path(tmp) / "bom.s"
+            bom.write_bytes(b"\xef\xbb\xbfs_endpgm\n")
+            self.assertEqual(parse_assembly_file(bom), ["s_endpgm"])
+            labels = Path(tmp) / "labels.s"
+            labels.write_text("pixel:                                  ; @pixel\n"
+                              ".LBB0_1:                                ; %bb.1\n"
+                              "s_endpgm ; done:\n", encoding="utf-8")
+            self.assertEqual(parse_assembly_file(labels), ["s_endpgm ; done:"])
 
     def test_binary_scan_recognizes_vop1_cvt_off_sat_pack_and_swap_opcodes(self):
         """The scan report names the four VOP1 forms instead of listing v_vop1_NN as unknown opcodes."""

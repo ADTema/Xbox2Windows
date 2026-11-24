@@ -1038,6 +1038,17 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^pixel_aot_region_scalar_load_(warp|hardware)$' -V
 ```
 
+In a masked if/else, outstanding work joins at the end of each arm that can
+be skipped. A load issued in an unskippable then arm can still be pending
+after the restore if the else arm skips its wait. A wait in an unskippable
+else arm resolves pending work even when the wave skipped the then arm. The
+translation controls cover both openers, both restores and all four skip
+shapes, plus removing the else wait or moving it after the in-arm read.
+The LLVM 15 round trip covers both openers with either arm skippable. The
+scalar-load draw also compares the two single-skip variants under mixed,
+full and empty masks, with a reference that gives every lane the else value
+as a mismatch control.
+
 ### SPIR-V physical addresses in a D3D12 buffer window
 
 An optional offline experiment accepts validated Vulkan 1.2 SPIR-V assembly with the named user-data and physical DWORD pointer types emitted by [Leonida at `f85582e`](https://github.com/ItsNotRexed/Leonida/blob/f85582e23d4ab9e19acbf694358f137d6b8531b1/tools/rdna2spirv.py). [SPIRV-Cross at `57e4efc`](https://github.com/KhronosGroup/SPIRV-Cross/tree/57e4efcc84112abcd426dc5ec248b5339bee04f2) rejects the physical addressing model on its HLSL path. The [window adapter](../tools/spirv_address_window.py) converts direct DWORD loads, stores and array element addresses to logical storage-buffer accesses. It validates the input and the result before publishing the output module.
@@ -6132,11 +6143,14 @@ Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_opsel$' -V`.
 
 **VOPC SDWA compares (#1906).** `compare()` refused every `v_cmp*_sdwa` and `v_cmpx*_sdwa`. It now lowers the
 SDWA forms of its 32-bit table. An i32 or u32 source reads its `src0_sel`/`src1_sel` field through `sdwa_source`,
-sign-extended under `sext()`, and the compare reads that 32-bit value as its type. f32 compares stay refused
-in their SDWA form until their predicates are verified for NaN independently of the non-SDWA text (#1920). The
+sign-extended under `sext()`, and the compare reads that 32-bit value as its type. Binary32 class compares read
+a DWORD float from SRC0 and select the integer class mask from SRC1. Ordinary f32 predicates stay refused
+in their SDWA form until their NaN behavior is verified (#1920). The
 destination is `vcc_lo`, the SGPR the decoder prints, or EXEC for `v_cmpx` with the same EXEC masking as before.
-Class compares, f32 compares, a missing or repeated select and any other SDWA modifier
-(`clamp`, `dst_sel`, an output modifier) are refused. `startup_gfx2hlsl_vopc_sdwa` evaluates the emitted HLSL of
+A sub-dword class value, a missing or repeated select and unsupported SDWA modifiers are refused.
+`startup_gfx2hlsl_vopc_sdwa` evaluates the emitted class predicate for 42 forms across all ten binary32 classes,
+including both active and inactive lanes. Its readback fixture selects the mask for `-1.0` from `BYTE_1` and
+checks that a mutation using the whole dword produces a different image. The test also evaluates the emitted HLSL of
 all 32 integer compares (v_cmp into `vcc_lo` and into an SGPR, v_cmpx into EXEC) times every select and `sext()`
 on both sources, 9408 forms, over 64 source pairs each, against a plain integer reference. The draws
 `startup_gfx2hlsl_vopc_sdwa_{warp,hardware}` keep or discard each of 16 x 16 pixels with
@@ -6708,7 +6722,7 @@ The plain VOP1 (`_e32`) and VOP3 (`_e64`) encodings of the same four moves (`v_m
 
 `v_swaprel_b32` (VOP1 only, `7e18d118` decodes as `v_swaprel_b32 v12, v24` for gfx1013 and gfx1030) exchanges VGPR[vdst + `m0[25:16]`] and VGPR[vsrc + `m0[9:0]`], the same split as `v_movrelsd_2_b32` (#1795). That reading follows the RDNA 2 naming and LLVM's definition; it has not been measured on RDNA hardware. The lowering uses the movrel `m0` rules (static, or dynamic with a proven bit mask; the same refusals). It reads both reachable sides before writing, and then gives each reachable register the source value when the destination offset selects it, the old destination value when the source offset selects it, and its old value otherwise, so a swap of a register with itself changes nothing. `SWAPREL_BODY` runs a dynamic swap between two banks (`m0` = word 3 & `0x30003`, which differs between the two `DPP_MOVREL_SETS`), then, in a second pair of banks, an overlapping swap inside one bank (`m0` = `0x30001`), a swap of a register with itself (`0x20002`) and a static swap between the banks (`0x20001`). The four bank sums (816, 117, 338, 125 and 218, 128, 338, 125) come from an independent list-swap reference. On WARP (driver 10.0.26100.8972) and an NVIDIA Quadro M1000M (driver 32.0.15.7371) on Windows 11 build 26100, with the debug layer unavailable, all 4096 pixels matched with zero error for both sets. Three controls must mismatch, and did on both adapters: a one-way `v_movrelsd_2_b32_e32` in place of the dynamic swap, swapped static `m0` halves, and the dynamic `m0` replaced by 0. The translation controls check five refusals. They also pin the generated selects without a GPU: for a static swap of v25 and v26, and for a dynamic swap with `m0` masked to `0x30001`, the swap lines must match an expected text with the temporaries renamed in order of appearance. So swapped `m0` halves, a source side that reads the wrong old value, source offsets taken from the wrong half, or a missing destination select each fail `python -B tests/pixel_aot_check.py`, not only the draw. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_swaprel_" -V`.
 
-The SDWA encodings of the four moves (`v_movreld_b32_sdwa`, `v_movrels_b32_sdwa`, `v_movrelsd_b32_sdwa`, `v_movrelsd_2_b32_sdwa`; LLVM 15 decodes `7e1886f9 00001518` as `v_movrels_b32_sdwa v12, v24 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_0` for gfx1013 and gfx1030 alike) lower through the same movrel block (#1917). The source selection, with an optional `sext(...)`, applies to the indexed source word, and the destination selection to each indexed destination, as `v_mov_b32_sdwa` applies them (`sdwa_source`, `sdwa_dest`); that order follows the RDNA 2 naming and the other movrel forms and has not been measured on RDNA hardware. `UNUSED_PAD` zeroes the unselected bits and `UNUSED_PRESERVE` keeps them from that destination's own tracked old value, so under a dynamic `m0` every reachable destination merges its own word. Under a dynamic `m0` every reachable destination must hold a tracked numeric word, also for `UNUSED_PAD`, as for the other movrel forms. `UNUSED_SEXT`, `UNUSED_PRESERVE` into an untracked destination, `clamp`, 16-bit (low-half) values as source or kept destination, SGPR sources and the movrel refusals are refused. `SDWA_MOVREL_BODY` runs each move with a dynamic and a static `m0` over integer banks, mixing BYTE, WORD and DWORD selections, `sext`, `UNUSED_PAD` and `UNUSED_PRESERVE`, and exports four words through the bit-exact R32G32B32A32_UINT target. They must equal an independent SDWA model on both `DPP_MOVREL_SETS`; the expected words are (`0x008856aa 0x3600ffbb 0xffffffdd 0x332143bb` and `0x00cc56aa 0x3600ffb9 0x0048ffdd 0x887743bb`), which they did on WARP (driver 10.0.26100.8972) and an NVIDIA Quadro M1000M (driver 32.0.15.7371) on Windows 11 build 26100. Five controls must mismatch, and did on both adapters: a dropped source selection, `UNUSED_PRESERVE` turned into `UNUSED_PAD`, an ignored dynamic `m0`, the wrong source byte and a missing `sext`. The translation controls check nine refusals, the entry mask and a dynamic `UNUSED_PRESERVE` move inside one bank, where each reachable register merges its own old word, and the body is in the LLVM 15 round trip. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_sdwa_movrel_" -V`.
+The SDWA encodings of the four moves (`v_movreld_b32_sdwa`, `v_movrels_b32_sdwa`, `v_movrelsd_b32_sdwa`, `v_movrelsd_2_b32_sdwa`; LLVM 15 decodes `7e1886f9 00001518` as `v_movrels_b32_sdwa v12, v24 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_0` for gfx1013 and gfx1030 alike) lower through the same movrel block (#1917). The source selection, with an optional `sext(...)`, applies to the indexed source word, and the destination selection to each indexed destination, as `v_mov_b32_sdwa` applies them (`sdwa_source`, `sdwa_dest`); that order follows the RDNA 2 naming and the other movrel forms and has not been measured on RDNA hardware. `UNUSED_PAD` zeroes the unselected bits and `UNUSED_PRESERVE` keeps them from that destination's own tracked old value, so under a dynamic `m0` every reachable destination merges its own word. Under a dynamic `m0` every reachable destination must hold a tracked numeric word, also for `UNUSED_PAD`, as for the other movrel forms. `UNUSED_SEXT`, `UNUSED_PRESERVE` into an untracked destination, `clamp`, 16-bit (low-half) values as source or kept destination, SGPR sources and the movrel refusals are refused. `SDWA_MOVREL_BODY` runs each move with a dynamic and a static `m0` over integer banks, mixing BYTE, WORD and DWORD selections, `sext`, `UNUSED_PAD` and `UNUSED_PRESERVE`, and exports four words through the bit-exact R32G32B32A32_UINT target. They must equal an independent SDWA model on both `DPP_MOVREL_SETS`; the expected words are (`0x008856aa 0x3600ffbb 0xffffffdd 0x332143bb` and `0x00cc56aa 0x3600ffb9 0x0048ffdd 0x887743bb`), which they did on WARP (driver 10.0.26100.8972) and an NVIDIA Quadro M1000M (driver 32.0.15.7371) on Windows 11 build 26100. Five controls must mismatch, and did on both adapters: a dropped source selection, `UNUSED_PRESERVE` turned into `UNUSED_PAD`, an ignored dynamic `m0`, the wrong source byte and a missing `sext`. The translation controls check nine refusals, the entry mask and a dynamic `UNUSED_PRESERVE` move inside one bank, where each reachable register merges its own old word, and the body is in the LLVM 15 round trip. The device-free run also pins every selection in the body: `SDWA_MOVREL_PINS` lists the exact expression each source and destination selection produces (temporaries as `\d+`) and how often it must appear, so a dropped source or destination selection, an ignored `sext` or `UNUSED_PRESERVE` treated as `UNUSED_PAD` fails `python -B tests/pixel_aot_check.py`, not only the draw. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_sdwa_movrel_" -V`.
 
 The scalar relative moves `s_movrels_b32`, `s_movrels_b64`, `s_movreld_b32`, `s_movreld_b64` and `s_movrelsd_2_b32` (SOP1; LLVM 15 decodes `be942e28` as `s_movrels_b32 s20, s40` and the others alike for gfx1013 and gfx1030) lower with the same `m0` split as the vector forms (#1882): `s_movrels` reads SGPR[src + m0], `s_movreld` writes SGPR[dst + m0], and `s_movrelsd_2_b32` reads with `m0[9:0]` and writes with `m0[25:16]`; `_b64` moves a pair, with `m0` counted in dwords. That reading follows the RDNA 2 naming and the vector forms; it has not been measured on RDNA hardware. With a static `m0` the move is an `s_mov` from or to the indexed SGPR, so its tracked value (constant, expression, descriptor or pointer word) and bit mask carry over: moving the texture descriptor pointer with `s_movrels_b64 s[72:73], s[16:17]` and `m0` = 4 translates exactly like two `s_mov_b32`. A dynamic `m0` with a proven bit mask becomes a bounded select, and only over plain numeric SGPRs, so no resource depends on a runtime index; for `s_movreld` each reachable destination keeps its old value unless selected. An unbounded or non-numeric `m0`, an index past s105, a write into an outstanding scalar load, a symbolic source or destination under a dynamic `m0` and a `_b64` pair base that could be odd (a static odd offset, or a dynamic mask that allows bit 0) are refused. Every source is read before any destination is written: self-moves, overlapping pairs and a dynamic `s_movreld` whose source lies in its own destination bank are pinned by the exported constants or the generated selects. `SMOVREL_BODY` moves cbuffer-indexed words with each form, static and dynamic, and exports weighted sums (60, 67, 805, 193 and 80, 63, 244, 165 on the two `DPP_MOVREL_SETS`) from an independent reference. On WARP (driver 10.0.26100.8972) and an NVIDIA Quadro M1000M (driver 32.0.15.7371) on Windows 11 build 26100, with the debug layer unavailable, all 4096 pixels matched with zero error for both sets. Four controls must mismatch, and did on both adapters: the dynamic `m0` replaced by 0 for `s_movrels_b32`, `s_movreld_b32` and `s_movreld_b64`, and swapped static halves for `s_movrelsd_2_b32`. The translation controls check the descriptor move, the overlaps and ten refusals. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_smovrel_" -V`.
 
@@ -11472,6 +11486,28 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_' -V
 python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
 ```
 
+## Startup translator: refusal census
+
+The startup shader translator normally stops a pipeline at its first refusal. Fixing that refusal can expose gaps that were previously hidden, as documented in the [issue #1723 census](https://github.com/R0Y00/Xbox2Windows/issues/1723).
+
+`python -B tools/startup/gfx2hlsl.py --refusals <cache-dir> [--json]` surveys an existing cache directory, including requests that already have a `.txt` or `.fail`. The diagnostic writes nothing and translates in memory without invoking fxc. On older translator revisions, `--refusals DIR` is treated as `--pending DIR` and writes into that directory.
+
+The text and JSON reports show two views.
+
+- **Per request key** includes RTV variants. Each reason and scope row counts requests containing that refusal, requests where it was the first site reached, and requests where it was the only distinct reason. Repeating the same reason at several sites still counts toward Only. The refusal sites per request histogram counts each site reached. **No refusal recorded (not compiled)** counts requests with zero recorded sites.
+- **Per code pair** groups base requests by a hash of their `.a` and `.b` bytes and excludes RTV variants. For each reason and scope, the report counts pairs where it was reached under every observed root signature and pairs where it was reached under some but fewer than all observed roots. Multiple requests for the same pair and root contribute their combined reasons.
+
+The Scope column distinguishes `decode`, vertex lowering (`vs`), pixel lowering (`ps`), and `pipeline`. A refusal for an instruction of known length skips that instruction and continues. An undecodable word, or a refusal during request loading, pipeline construction, or output generation ends the pipeline, with the same reason the default path would write to `.fail`. For a pipeline-scope Only row, the single observed reason is a lower bound on what may be present. Counts after the first refusal are approximate because skipped instructions leave later state unmodelled.
+
+An unexpected handler exception after an earlier refusal or crash is reported as `internal error in <operation>: <exception type>`, a possible follow-on effect. With no earlier refusal it is reported as `translator crash in <operation>: <exception type>`, which identifies a translator bug. The reports contain no request keys, raw disassembly, register numbers or immediates. Cause numbers such as a format ID, operand width, or shader model remain visible.
+
+The `startup_gfx2hlsl_refusals` check covers skip and resume, a control that stops at the first refusal, file and decoding failures, count semantics, both flag orders and the `--refusals=DIR` spelling, and unchanged cache files in diagnostic mode.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_refusals$' -V
+python -B tools/startup/gfx2hlsl.py --refusals out/startup/shader_cache
+```
+
 ## Startup translator: SMEM offset operands
 
 `tools/startup/gfx2hlsl.py` accepts these offset operands for the scalar memory loads ([issue #1674](https://github.com/R0Y00/Xbox2Windows/issues/1674)):
@@ -11769,4 +11805,45 @@ Command-list slot 34 no longer sets a title root signature flagged `CBV_SRV_UAV_
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer startup_heap_indexed_root_check
 ctest --preset dev --no-tests=error -R "^startup_(heap_indexed_root.*|root_heap_(warp|hardware))$" -V
+```
+
+## Startup range provenance
+
+[Issue #870](https://github.com/R0Y00/Xbox2Windows/issues/870) asks which producer last wrote the range a
+draw binds, and whether that write was visible once its submission fence had completed. The fixture
+(`tests/startup_range_provenance.cpp` and `tests/startup_range_provenance.hlsl`) is a source-built model of
+that question with no title data: one committed buffer of four 64-element `RGBA32F` ranges and one bound
+window. Range A `[0, 64)` is red, written by a `CopyBufferRegion`; range B `[64, 128)` is green, written by a
+draw whose pixel shader stores it through a structured UAV; range C `[128, 192)` is never written and keeps
+the zeros D3D12 gives a committed default-heap buffer; `[192, 256)` lies outside every window and is never
+sampled. The bound range is a `StructuredBuffer` SRV whose `FirstElement` and `NumElements` select one range,
+because a buffer SRV is the desktop view that carries an explicit offset and scope, where a 2D SRV has no
+texel offset at all; a neighbouring window is the next range along the same buffer.
+
+Each producer is submitted and waited on a fence of its own before the consumer list is recorded, and the
+completed value is checked at that point, not after the readback. The consumer draws 64×1 pixels, one element
+of its window each, and copies the target to a readback on the same list; the whole buffer is copied to a
+second readback after the last submission, so the log reports what the producers wrote as well as what the
+draw sampled. A CPU model of the buffer, built from the same writes and the same window, predicts every
+sampled pixel. Each case prints one line with the write class, the relation of the bound window to that write,
+the submission order with its fence values, and the sampled colour.
+
+| case | writer | bound | sampled |
+|---|---|---|---|
+| exact | copy | `[0, 64)` | red |
+| neighbouring | draw | `[64, 128)` | green |
+| stale | copy | `[0, 64)` | red, although a blue rewrite is submitted after the consumer's fence |
+| empty | none | `[128, 192)` | zero, never written |
+| cleared | clear | `[128, 192)` | zero, written by a whole-store clear |
+
+The empty and cleared cases sample the same colour, which is the ambiguity the issue raises: a readback alone
+cannot separate a zero fill from a range no producer ever wrote, and only the printed writer class and
+submission order can. Two mutants run against the unchanged model and must each mismatch: the exact case
+bound to the neighbouring range, and the stale case with its blue rewrite submitted before the consumer.
+
+On an AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`) and on in-box WARP (`10.0.26100.9818`), both tests pass and every case matches its model: 0 sampled mismatches out of 64 and 0 store mismatches out of 256 in all five cases. The stale case is the one that separates the two readings: after the blue rewrite is submitted and its fence completes, the whole-buffer readback holds blue in range A while the consumer's readback still holds the red it sampled, so the draw read the bytes that were there at its own submission and not the later write. Both mutants mismatch on every pixel, 64 of 64: the exact case bound to the neighbouring range samples green instead of red, and the stale case with the rewrite moved before the consumer samples blue. The cleared and empty cases sample the same zero, which is the ambiguity the issue raises, so a reported zero is classified by the printed writer class and submission order rather than by the readback alone.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^startup_range_provenance' -V
 ```
