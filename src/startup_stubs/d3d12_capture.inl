@@ -139,18 +139,11 @@ PlacementIndex& placement_group(u64 width)
     return placement_index[width > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT];
 }
 
-void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes, Placement placement = Placement::none,
-                   const Wrapper* device = nullptr)
+void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
 {
     if (!w || !console) return;
-    AcquireSRWLockExclusive(&note_lock);
-    resource_infos()[w] = ResourceInfo{*console, bytes, placement, device};
-    if (placement != Placement::none) {
-        auto& group = placement_group(bytes);
-        group.by_start.emplace(reinterpret_cast<u64>(w->own().title_memory), w);
-        group.max_width = (std::max)(group.max_width, bytes);
-    }
-    ReleaseSRWLockExclusive(&note_lock);
+    x2w_startup::ExclusiveNoteLock guard(note_lock);
+    resource_infos()[w] = ResourceInfo{*console, bytes};
 }
 void retire_placement(Wrapper* w)
 {

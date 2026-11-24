@@ -8548,6 +8548,8 @@ ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_bc_c
 The fixture records draws reading the last valid DWORD, updates that word before submission and verifies the GPU sees the new value. An eight-byte view starting at the last DWORD is rejected. Its shader reads only offset zero from the null descriptor. After a fence, the high range is released and a larger buffer is registered at the same address. The second draw reads both the end of the new range and an address common to the old and new registrations. The RTX 4060 Laptop GPU (32.0.16.1656) and WARP (10.0.26100.9818) each read back all 64 pixels on Windows 11 build 26200.9974 with the debug layer off.
 
 ```powershell
-cmake --build --preset release --target startup_stream_consumer
-ctest --preset release --no-tests=error --output-on-failure -R '^startup_placed_vertex_'
+cmake --build --preset release --target startup_stream_consumer startup_placement_alloc
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_(placement_alloc|placed_vertex_)'
 ```
+
+`startup_placement_alloc` fails each allocation made while adding a second buffer. It checks that the operation returns `E_OUTOFMEMORY`, the existing resource and index remain intact, the lock can be reacquired, and registration at the same address succeeds on retry.

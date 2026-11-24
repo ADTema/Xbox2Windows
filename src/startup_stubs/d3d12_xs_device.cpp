@@ -22,6 +22,7 @@
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/derived_blend.h"
+#include "startup_stubs/placement_publish.h"
 
 #include "startup_stubs/slice_footprints.h"
 
@@ -33,7 +34,6 @@
 
 #include <algorithm>
 #include <array>
-#include <map>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -2225,7 +2225,19 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     if (FAILED(hr)) return hr;
     Wrapper* w = wrap(resource, resource_kind);
     w->own().title_memory = address;
-    note_resource(w, desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self);
+    const ResourceInfo record{*desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self};
+    auto& group = placement_group(desc->Width);
+    hr = x2w_startup::publish_placement(note_lock, resource_infos, group.by_start, group.max_width,
+        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record);
+    if (FAILED(hr)) {
+        // The caller has never received this wrapper; release its desktop resource and storage.
+        AcquireSRWLockExclusive(&registry_lock);
+        registry().erase(w);
+        ReleaseSRWLockExclusive(&registry_lock);
+        resource->Release();
+        _aligned_free(&w->own());
+        return hr;
+    }
     *out = w;
     return S_OK;
 }
