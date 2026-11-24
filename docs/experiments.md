@@ -8432,6 +8432,13 @@ only. Physical-adapter claims remain separate and require the adapter, driver,
 Windows build, DXC version and flags, debug-layer status, and runtime reported
 explicitly.
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (8086:7d51), driver
+32.0.101.8132, DXC 1.8.2502.11, debug layer enabled, passed the same target for
+translated SPIR-V and the direct HLSL control: clamp 1 read mip 1 and the stale
+mip-2 reference reported its mismatch at pixel (0, 0). The integer-clamp cases of
+`spirv_minlod_levels_*` read mips 0, 1, 2 and 3 at clamps 0 to 3 on the same
+adapter, with zero D3D12 debug errors and warnings.
+
 `spirv_minlod_levels_*` compiles at `ps_6_0`:
 
 - With point mip filtering, each integer clamp from 0 through 3 selects its
