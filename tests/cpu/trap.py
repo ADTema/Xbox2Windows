@@ -21,7 +21,7 @@ from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges
 from ffx_version_query import INTEGER_HEADER, lower, region
 
-EXPORTS = ("trap_int3", "trap_ud2", "trap_branch", "trap_ud1_reg", "trap_ud1_mem")
+EXPORTS = ("trap_int3", "trap_ud2", "trap_branch", "trap_ud1_reg", "trap_ud1_mem", "trap_ud1_disp")
 UD1 = (Code.UD1_R16_RM16, Code.UD1_R32_RM32, Code.UD1_R64_RM64)
 BREAKPOINT, ILLEGAL = 0x80000003, 0xC000001D
 FILL = 0xA5A5A5A5A5A5A5A5
@@ -33,12 +33,14 @@ EXPECT = {
     ("trap_branch", 0): (0, 7, 1, 2),
     ("trap_ud1_reg", 0): (ILLEGAL, 0, 1, FILL),
     ("trap_ud1_mem", "noaccess"): (ILLEGAL, 0, 1, FILL),
+    ("trap_ud1_disp", "noaccess"): (ILLEGAL, 0, 1, FILL),
 }
 # The trap instructions each export must keep in an optimized translation.
 TRAPS = {"trap_int3": [Code.INT3], "trap_ud2": [Code.UD2], "trap_branch": [Code.INT3],
-         "trap_ud1_reg": [Code.UD1_R32_RM32], "trap_ud1_mem": [Code.UD1_R32_RM32]}
+         "trap_ud1_reg": [Code.UD1_R32_RM32], "trap_ud1_mem": [Code.UD1_R32_RM32],
+         "trap_ud1_disp": [Code.UD1_R32_RM32]}
 # The trap instruction each export has in the translation: UD1 is lowered to __ud2(), which compiles to UD2.
-LIFTED_TRAPS = {**TRAPS, "trap_ud1_reg": [Code.UD2], "trap_ud1_mem": [Code.UD2]}
+LIFTED_TRAPS = {**TRAPS, "trap_ud1_reg": [Code.UD2], "trap_ud1_mem": [Code.UD2], "trap_ud1_disp": [Code.UD2]}
 # Encodings that stay refused, with the text the refusal must contain: INT 3 in its two-byte form, the
 # fast-fail interrupt, INT1, INTO (invalid in 64-bit mode), and UD0, whose length differs between AMD (no
 # ModRM) and iced's default decoding.

@@ -4,3 +4,4 @@ EXPORTS
     trap_branch
     trap_ud1_reg
     trap_ud1_mem
+    trap_ud1_disp
