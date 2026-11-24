@@ -66,8 +66,11 @@ VGPRs later. The count reaches the highest component read: five records read onl
 count 3, mask 0x8 with count 4), and all components up to that one are loaded. None of the 1,355 programs without
 the call has a record.
 
-Refused: a header of any other size, a record of another kind, a mask whose highest bit is not its count,
-overlapping registers, a per-instance element and an unknown format. Components a format lacks read
+Refused: a header of any other size, a record of another kind, a mask whose highest bit is not its count, and
+overlapping registers. A fetched element is also refused when it is per-instance, has an unknown format, or is
+appended (`D3D12_APPEND_ALIGNED_ELEMENT`) after an element of unknown size or one that ends off a 4-byte boundary,
+because the packing there is not measured. Elements that no record fetches are not checked. An unreadable layout
+is logged, and the translation is requested without it. Components a format lacks read
 as 0, 0, 0 and 1, as in the existing vertex-fetch table; that default is not measured for this path.
 
 A shader that starts with the call and has no layout is refused. So is one that reads a register that neither

@@ -11,6 +11,7 @@ Cases on an 8x4 target cleared to blue with a red pixel shader:
             rectangle [0, 4) x [0, 1) instead, so the exact check above fails.
   no layout: the same stream without the INPUT_LAYOUT subobject is refused by the translator and not drawn.
   unwritten: a vertex shader that exports v12, which no record fetches, is refused.
+  z only:   a record that reads only z (mask 0x4) with count 3 translates; with count 2 it is refused.
 """
 import os
 from pathlib import Path
@@ -31,14 +32,14 @@ INPUTS = [("POSITION", 0, 0x7), ("TEXCOORD", 1, 0x7)]
 LAYOUT_LINE = "x2w-draw stream input layout: 2 elements (format/slot/offset/class) 6/0/0/0 6/0/4294967295/0"
 
 
-def vertex(param_first=8):
+def vertex(param_first=8, records=RECORDS):
     # exp pos0 v4, v5, v6, v7 done; exp param0 v<first>, v<first+1>, v<first+2>, v7.
     words = [SWAPPC, PREFETCH, vop1(1, 7, 242), WAIT_VM, 0xf80008cf, 0x07060504,
              0xf800020f, param_first | (param_first + 1) << 8 | (param_first + 2) << 16 | 7 << 24, ENDPGM]
-    return fetch_container(words)
+    return fetch_container(words, records)
 
 
-def fetch_container(words):
+def fetch_container(words, records):
     """A vertex container with an FSSM header of 0x2f8 bytes (fetch records at +0x138) and an ISG1 part."""
     code = struct.pack("<%dI" % len(words), *words)
     base = 0x2f8
@@ -48,7 +49,7 @@ def fetch_container(words):
     struct.pack_into("<I", image, 4, 0x101)
     struct.pack_into("<QQ", image, 192, base, extent)
     struct.pack_into("<Q", image, 232, len(image))
-    for i, record in enumerate(RECORDS):
+    for i, record in enumerate(records):
         image[0x138 + 5 * i:0x13d + 5 * i] = bytes(record)
     image[base + 40:base + 40 + len(code)] = code
     padding = (len(image) - base - 40 - len(code)) // 4
@@ -178,6 +179,14 @@ def check(directory, consumer, backend):
     status = gfx2hlsl.translate_request(str(unwritten.cache), unwritten.key)
     assert status == "unsupported: vertex stage reads v12, which neither the fetch nor the program writes", status
     print(f"{backend} unwritten register: refused ({status[13:]})")
+
+    # z only: the count reaches the highest component read; a mask above the count is refused.
+    for count, want in ((3, "ok"), (2, "unsupported: unverified vertex fetch record 0600040401")):
+        records = [(6, 0, 0x4, 4, count - 1), RECORDS[1]]
+        z_only = Run(directory / ("z%d" % count), consumer, backend, vertex(records=records), True)
+        status = gfx2hlsl.translate_request(str(z_only.cache), z_only.key)
+        assert status == want, status
+    print(f"{backend} z-only record: count 3 translates, count 2 refused")
     return 0
 
 

@@ -293,7 +293,11 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
                 if (bounds) return nullptr;
             }
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
-            if (!stream_input_layout(stream + at, layout)) return nullptr;
+            // Unreadable: translate without it; gfx2hlsl refuses a vertex shader that needs it.
+            if (!stream_input_layout(stream + at, layout)) {
+                layout.clear();
+                log("x2w-draw stream input layout unreadable; requesting the translation without it");
+            }
         } else if (type == 16) {  // DEPTH_STENCIL_FORMAT (8B)
             DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
             std::memcpy(&fmt, stream + at + sizeof(type), sizeof(fmt));

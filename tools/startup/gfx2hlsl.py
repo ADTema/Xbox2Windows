@@ -104,16 +104,15 @@ def parse_input_layout(text):
         if not m:
             raise Unsupported('invalid input layout element')
         name, index, fmt, slot, offset, cls, step = m.group(1).upper(), *map(int, m.groups()[1:])
-        if fmt not in FETCH_DXGI:
-            raise Unsupported('input layout format %d' % fmt)
-        if cls != 0 or step != 0:
-            raise Unsupported('per-instance input layout element')
-        if slot > 15:
-            raise Unsupported('input layout slot %d' % slot)
         if offset == 0xffffffff:  # D3D12_APPEND_ALIGNED_ELEMENT: right after the previous element of the slot
+            # shortcut: unknown when an earlier size is unknown or ends off a dword (packing not measured).
             offset = ends.get(slot, 0)
-        ends[slot] = offset + FETCH_DXGI[fmt][1]
-        elements.append(dict(name=name, index=index, format=fmt, slot=slot, offset=offset))
+            if offset is not None and offset % 4:
+                offset = None
+        size = FETCH_DXGI[fmt][1] if fmt in FETCH_DXGI else None
+        ends[slot] = None if offset is None or size is None else offset + size
+        # Format, class and slot are checked in stream_fetch, only for the elements a record fetches.
+        elements.append(dict(name=name, index=index, format=fmt, slot=slot, offset=offset, cls=cls, step=step))
     return elements
 
 
@@ -151,7 +150,16 @@ def stream_fetch(vs_container, layout_text):
         match = [e for e in layout if (e['name'], e['index']) == (name, index)]
         if len(match) != 1:
             raise Unsupported('input layout has %d elements for vertex input register %d' % (len(match), register))
-        fetch.append(dict(match[0], vgpr=vgpr, count=count))
+        e = match[0]
+        if e['format'] not in FETCH_DXGI:
+            raise Unsupported('input layout format %d' % e['format'])
+        if e['cls'] != 0 or e['step'] != 0:
+            raise Unsupported('per-instance input layout element')
+        if e['slot'] > 15:
+            raise Unsupported('input layout slot %d' % e['slot'])
+        if e['offset'] is None:
+            raise Unsupported('appended input layout element after an element of unknown or unaligned size')
+        fetch.append(dict(e, vgpr=vgpr, count=count))
         at += 5
     if not fetch:
         raise Unsupported('vertex stage calls a fetch routine and its container lists no fetched inputs')
