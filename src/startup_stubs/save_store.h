@@ -25,7 +25,8 @@ enum class Status { ok, bad_name, too_large, not_found, io_error };
 
 constexpr std::size_t max_name_bytes = 128;
 constexpr std::size_t max_blob_bytes = std::size_t{64} << 20;
-constexpr std::string_view part_suffix = ".x2w-part";
+constexpr std::string_view part_suffix = ".x2w-part";  // a file being written
+constexpr std::string_view old_suffix = ".x2w-old";    // the file a commit replaced, kept until the commit is whole
 
 // A name becomes one path component. Anything that could address another place is refused: empty,
 // too long, separators, drive letters and streams (':'), control characters, characters Windows
@@ -41,11 +42,12 @@ inline bool valid_name(std::string_view name) noexcept
     if (name.find("..") != std::string_view::npos) return false;
     if (name.back() == '.' || name.back() == ' ' || name.front() == ' ') return false;
     // Case-insensitive: on Windows "X.X2W-PART" and "X.x2w-part" are the same file.
-    if (name.size() >= part_suffix.size()) {
-        const std::string_view tail = name.substr(name.size() - part_suffix.size());
+    for (const std::string_view suffix : {part_suffix, old_suffix}) {
+        if (name.size() < suffix.size()) continue;
+        const std::string_view tail = name.substr(name.size() - suffix.size());
         bool same = true;
         for (std::size_t i = 0; i < tail.size() && same; ++i)
-            same = std::tolower(static_cast<unsigned char>(tail[i])) == part_suffix[i];
+            same = std::tolower(static_cast<unsigned char>(tail[i])) == suffix[i];
         if (same) return false;
     }
     std::string stem(name.substr(0, name.find('.')));
@@ -57,13 +59,32 @@ inline bool valid_name(std::string_view name) noexcept
     return true;
 }
 
-// A staging file name nobody can predict or share: process-wide counter plus a clock reading.
-inline std::string unique_part_name()
+// A file name nobody can predict or share: process-wide counter plus a clock reading, then a
+// reserved suffix (valid_name refuses names that end in it).
+inline std::string unique_name(std::string_view suffix)
 {
     static std::atomic<unsigned long long> counter{0};
     const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
-    return "." + std::to_string(counter.fetch_add(1) + 1) + "-" + std::to_string(static_cast<long long>(ticks)) + std::string(part_suffix);
+    return "." + std::to_string(counter.fetch_add(1) + 1) + "-" + std::to_string(static_cast<long long>(ticks)) + std::string(suffix);
 }
+
+// A symbolic link, or on Windows a junction (both redirect a path somewhere else). Only the
+// storage root itself is trusted; a container directory or blob that redirects is refused.
+inline bool redirected(const fs::file_status& state) noexcept
+{
+#ifdef _MSC_VER
+    if (state.type() == fs::file_type::junction) return true;
+#endif
+    return fs::is_symlink(state);
+}
+
+// One action of an update, staged in memory until it is submitted.
+struct Action {
+    bool remove = false;
+    std::string blob;
+    std::vector<unsigned char> data;
+};
+constexpr std::size_t max_staged_bytes = std::size_t{256} << 20;  // per update
 
 // Container handles of the game-save stand-in: a fixed table indexed by the low bits of the handle,
 // with a reference count per entry so closed containers give their slot back. The caller holds the
@@ -109,8 +130,29 @@ public:
         if (update >= capacity || !updates_[update]) return;
         const std::size_t container = static_cast<std::size_t>(updates_[update] - 1);
         updates_[update] = 0;
+        staged_[update].clear();  // an update closed without a submit leaves nothing behind
+        staged_bytes_[update] = 0;
         reclaim(container);
     }
+    // Keeps an action with the update until it is submitted. False: no such update, or too much staged.
+    bool stage(std::size_t update, Action action)
+    {
+        if (update >= capacity || !updates_[update]) return false;
+        if (action.data.size() > max_staged_bytes - staged_bytes_[update]) return false;
+        staged_bytes_[update] += action.data.size();
+        staged_[update].push_back(std::move(action));
+        return true;
+    }
+    // The staged actions in order; the update starts empty again.
+    std::vector<Action> take(std::size_t update)
+    {
+        std::vector<Action> actions;
+        if (update >= capacity || !updates_[update]) return actions;
+        actions.swap(staged_[update]);
+        staged_bytes_[update] = 0;
+        return actions;
+    }
+    std::size_t staged_count(std::size_t update) const { return update < capacity ? staged_[update].size() : 0; }
     // Name of the container behind an open update, or empty.
     std::string update_container(std::size_t update) const
     {
@@ -134,22 +176,25 @@ private:
     std::string names_[capacity];
     int refs_[capacity]{};
     int updates_[capacity]{};  // container index + 1 of an open update, 0 = free
+    std::vector<Action> staged_[capacity];
+    std::size_t staged_bytes_[capacity]{};
 };
 
 class Store {
 public:
     explicit Store(fs::path root) : root_(std::move(root)) {}
 
-    // An existing container directory counts as success.
+    // An existing container directory counts as success; a redirected one is refused.
     Status create_container(std::string_view container) const
     {
         const fs::path dir = container_dir(container);
         if (dir.empty()) return Status::bad_name;
         std::error_code ec;
-        if (fs::is_symlink(fs::symlink_status(dir, ec))) return Status::bad_name;
+        if (redirected(fs::symlink_status(dir, ec))) return Status::bad_name;
         if (fs::is_directory(dir, ec)) return Status::ok;
         fs::create_directories(dir, ec);
-        return !ec && fs::is_directory(dir, ec) ? Status::ok : Status::io_error;
+        if (ec || redirected(fs::symlink_status(dir, ec))) return Status::io_error;
+        return fs::is_directory(dir, ec) ? Status::ok : Status::io_error;
     }
 
     Status delete_container(std::string_view container) const
@@ -159,49 +204,116 @@ public:
         std::error_code ec;
         const fs::file_status state = fs::symlink_status(dir, ec);
         if (!fs::exists(state)) return Status::not_found;
-        if (!fs::is_directory(state) || fs::is_symlink(state)) return Status::bad_name;
+        if (!fs::is_directory(state) || redirected(state)) return Status::bad_name;
         fs::remove_all(dir, ec);
         return ec ? Status::io_error : Status::ok;
     }
 
-    // Writes to a side file and renames it over the blob, so a reader sees the old or the new bytes.
+    // Publishes a whole update or nothing. Every write goes to a staging file first and every
+    // delete is checked; only then are the blobs replaced, each old file moved aside first, and
+    // any failure puts everything back. A later action on a blob wins over an earlier one. This
+    // keeps the disk unchanged when an action fails inside this process; a crash in the middle of
+    // the replacement can still leave some blobs replaced and ".x2w-old" files behind.
+    Status commit(std::string_view container, const std::vector<Action>& actions) const
+    {
+        if (actions.empty()) return Status::ok;
+        const fs::path dir = container_dir(container);
+        if (dir.empty()) return Status::bad_name;
+        std::vector<const Action*> last;  // the final action of each blob, in first-seen order
+        for (const Action& action : actions) {
+            if (!valid_name(action.blob)) return Status::bad_name;
+            if (!action.remove && action.data.size() > max_blob_bytes) return Status::too_large;
+            bool seen = false;
+            for (const Action*& slot : last)
+                if (slot->blob == action.blob) slot = &action, seen = true;
+            if (!seen) last.push_back(&action);
+        }
+        if (const Status made = create_container(container); made != Status::ok) return made;
+        static std::mutex commit_lock;  // one commit or rename at a time in this process
+        const std::lock_guard<std::mutex> guard(commit_lock);
+        struct Step {
+            fs::path file, part, old;
+            bool remove = false, moved_old = false, installed = false;
+        };
+        std::vector<Step> steps;
+        std::error_code ec;
+        const auto discard_parts = [&] {
+            for (const Step& step : steps)
+                if (!step.part.empty()) fs::remove(step.part, ec);
+        };
+        for (const Action* action : last) {
+            Step step;
+            step.file = dir / action->blob;
+            step.remove = action->remove;
+            const fs::file_status state = fs::symlink_status(step.file, ec);
+            if (redirected(state) || (fs::exists(state) && !fs::is_regular_file(state))) {
+                discard_parts();
+                return Status::bad_name;
+            }
+            if (action->remove) {
+                if (!fs::exists(state)) {
+                    discard_parts();
+                    return Status::not_found;
+                }
+            } else {
+                step.part = step.file;
+                step.part += unique_name(part_suffix);
+                std::ofstream out(step.part, std::ios::binary | std::ios::trunc);
+                steps.push_back(step);  // recorded first so that a failure removes the partial file
+                if (!out) {
+                    discard_parts();
+                    return Status::io_error;
+                }
+                if (!action->data.empty())
+                    out.write(reinterpret_cast<const char*>(action->data.data()), static_cast<std::streamsize>(action->data.size()));
+                if (!out.flush()) {
+                    out.close();
+                    discard_parts();
+                    return Status::io_error;
+                }
+                continue;
+            }
+            steps.push_back(step);
+        }
+        const auto undo = [&] {
+            for (auto it = steps.rbegin(); it != steps.rend(); ++it) {
+                if (it->installed) fs::remove(it->file, ec);
+                if (it->moved_old) rename_with_retry(it->old, it->file);
+            }
+            discard_parts();
+        };
+        for (Step& step : steps) {
+            if (fs::exists(fs::symlink_status(step.file, ec))) {
+                step.old = step.file;
+                step.old += unique_name(old_suffix);
+                if (!rename_with_retry(step.file, step.old)) {
+                    undo();
+                    return Status::io_error;
+                }
+                step.moved_old = true;
+            }
+            if (step.remove) continue;
+            if (!rename_with_retry(step.part, step.file)) {
+                undo();
+                return Status::io_error;
+            }
+            step.installed = true;
+            step.part.clear();
+        }
+        for (const Step& step : steps)
+            if (step.moved_old) fs::remove(step.old, ec);
+        return Status::ok;
+    }
+
+    // One blob, published at once: the same as a commit of a single write.
     Status write_blob(std::string_view container, std::string_view blob, const void* data, std::size_t size) const
     {
         if (size > max_blob_bytes) return Status::too_large;
         if (size && !data) return Status::io_error;
-        const fs::path file = blob_file(container, blob);
-        if (file.empty()) return Status::bad_name;
-        if (const Status made = create_container(container); made != Status::ok) return made;
-        std::error_code ec;
-        if (fs::is_symlink(fs::symlink_status(file, ec))) return Status::bad_name;
-        // A staging file of its own for every write: two writers never share one, and an old link
-        // left at a guessable name is never opened. An existing entry at the name is refused.
-        fs::path part = file;
-        part += unique_part_name();
-        if (fs::symlink_status(part, ec).type() != fs::file_type::not_found) return Status::io_error;
-        {
-            std::ofstream out(part, std::ios::binary | std::ios::trunc);
-            if (!out) return Status::io_error;
-            if (size) out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
-            if (!out.flush()) {
-                out.close();
-                fs::remove(part, ec);
-                return Status::io_error;
-            }
-        }
-        // Replacing a file another writer is replacing at the same moment can fail on Windows
-        // (access denied or a sharing violation instead of last-writer-wins), so the rename is
-        // serialised in this process and, for another process, retried a few times.
-        static std::mutex commit;
-        const std::lock_guard<std::mutex> guard(commit);
-        for (int attempt = 0;; ++attempt) {
-            fs::rename(part, file, ec);
-            if (!ec) return Status::ok;
-            if (attempt == 8) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(5 << (attempt < 4 ? attempt : 4)));
-        }
-        fs::remove(part, ec);
-        return Status::io_error;
+        Action action;
+        action.blob = std::string(blob);
+        action.data.assign(static_cast<const unsigned char*>(data), static_cast<const unsigned char*>(data) + size);
+        return commit(container, {action});
     }
 
     // not_found only when the blob is truly absent; any other failure is io_error.
@@ -210,9 +322,10 @@ public:
         const fs::path file = blob_file(container, blob);
         if (file.empty()) return Status::bad_name;
         std::error_code ec;
+        if (redirected(fs::symlink_status(file.parent_path(), ec))) return Status::bad_name;
         const fs::file_status state = fs::symlink_status(file, ec);
         if (!fs::exists(state)) return Status::not_found;
-        if (!fs::is_regular_file(state)) return Status::io_error;
+        if (redirected(state) || !fs::is_regular_file(state)) return Status::io_error;
         const std::uintmax_t size = fs::file_size(file, ec);
         if (ec || size > max_blob_bytes) return ec ? Status::io_error : Status::too_large;
         std::ifstream in(file, std::ios::binary);
@@ -227,13 +340,27 @@ public:
         const fs::path file = blob_file(container, blob);
         if (file.empty()) return Status::bad_name;
         std::error_code ec;
+        if (redirected(fs::symlink_status(file.parent_path(), ec))) return Status::bad_name;
         const fs::file_status state = fs::symlink_status(file, ec);
         if (!fs::exists(state)) return Status::not_found;
-        if (!fs::is_regular_file(state)) return Status::bad_name;
+        if (redirected(state) || !fs::is_regular_file(state)) return Status::bad_name;
         return fs::remove(file, ec) && !ec ? Status::ok : Status::io_error;
     }
 
 private:
+    // Replacing or moving a file another writer holds can fail on Windows (access denied or a
+    // sharing violation instead of last-writer-wins), so a few retries with a growing pause.
+    static bool rename_with_retry(const fs::path& from, const fs::path& to)
+    {
+        std::error_code ec;
+        for (int attempt = 0;; ++attempt) {
+            fs::rename(from, to, ec);
+            if (!ec) return true;
+            if (attempt == 8) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5 << (attempt < 4 ? attempt : 4)));
+        }
+    }
+
     // Empty path when the name is not acceptable. The result is always root/<container>.
     fs::path container_dir(std::string_view container) const
     {

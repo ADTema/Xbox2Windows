@@ -25,6 +25,13 @@ std::vector<unsigned char> payload(unsigned seed, std::size_t size)
 }
 
 // Second process: exit 0 when the blob holds payload(seed, size), else a code that says why.
+// "exists <root> <blob>" answers whether a blob of slot-a is there at all.
+int exists_reader(const char* root, const char* blob)
+{
+    std::vector<unsigned char> bytes;
+    return x2w_save::Store(root).read_blob("slot-a", blob, bytes) == Status::ok ? 0 : exit_missing;
+}
+
 int reader(const char* root, const char* seed_text)
 {
     const unsigned seed = static_cast<unsigned>(std::strtoul(seed_text, nullptr, 10));
@@ -34,9 +41,9 @@ int reader(const char* root, const char* seed_text)
     return status == Status::ok && bytes == payload(seed, 300) ? 0 : exit_mismatch;
 }
 
-int run_reader(const std::string& self, const fs::path& root, unsigned seed)
+int run_child(const std::string& self, const std::string& arguments)
 {
-    std::string command = "\"" + self + "\" read \"" + root.string() + "\" " + std::to_string(seed);
+    std::string command = "\"" + self + "\" " + arguments;
 #ifdef _WIN32
     command = "\"" + command + "\"";  // cmd.exe drops the outer quotes
 #endif
@@ -45,6 +52,30 @@ int run_reader(const std::string& self, const fs::path& root, unsigned seed)
     return code;
 #else
     return code == -1 ? -1 : (code >> 8) & 0xff;
+#endif
+}
+
+int run_reader(const std::string& self, const fs::path& root, unsigned seed)
+{
+    return run_child(self, "read \"" + root.string() + "\" " + std::to_string(seed));
+}
+// 0: the blob is there, exit_missing: it is not.
+int run_exists(const std::string& self, const fs::path& root, const std::string& blob)
+{
+    return run_child(self, "exists \"" + root.string() + "\" " + blob);
+}
+
+// A directory that redirects to another one: a symbolic link, or a junction on Windows.
+bool make_redirect(const fs::path& link, const fs::path& target)
+{
+    std::error_code error;
+#ifdef _WIN32
+    const std::string command = "\"mklink /J \"" + link.string() + "\" \"" + target.string() + "\" >nul 2>&1\"";
+    std::system(command.c_str());
+    return fs::is_directory(link, error);
+#else
+    fs::create_directory_symlink(target, link, error);
+    return !error;
 #endif
 }
 
@@ -61,6 +92,7 @@ void expect(bool ok, const char* what)
 int main(int argc, char** argv)
 {
     if (argc == 4 && std::strcmp(argv[1], "read") == 0) return reader(argv[2], argv[3]);
+    if (argc == 4 && std::strcmp(argv[1], "exists") == 0) return exists_reader(argv[2], argv[3]);
     if (argc != 1) return 2;
 
     std::error_code ec;
@@ -181,6 +213,67 @@ int main(int argc, char** argv)
         expect(u >= 0 && table.update_container(static_cast<std::size_t>(u)) == "held-0", "an open update keeps its container entry after close");
         table.end_update(static_cast<std::size_t>(u));
         expect(table.open("now-free") >= 0, "the entry is reclaimed once the update ends");
+    }
+
+    // An update is staged until it is submitted: nothing reaches the disk before, an update closed
+    // without a submit changes nothing, and a second process only ever sees committed state.
+    {
+        const fs::path shared = root / "store";
+        expect(store.create_container("slot-a") == Status::ok && store.write_blob("slot-a", "profile.dat", first.data(), first.size()) == Status::ok, "update fixture: first state");
+        x2w_save::ContainerTable table;
+        const long container = table.open("slot-a");
+        const long update = table.begin_update(static_cast<std::size_t>(container));
+        x2w_save::Action write{false, "profile.dat", second};
+        x2w_save::Action extra{false, "extra.dat", second};
+        expect(table.stage(static_cast<std::size_t>(update), write) && table.stage(static_cast<std::size_t>(update), extra), "actions are staged");
+        expect(run_reader(self, shared, 1) == 0 && run_exists(self, shared, "extra.dat") == exit_missing, "second process sees nothing of a staged update");
+        // (a) closed without a submit: still the first state, and nothing is left staged.
+        table.end_update(static_cast<std::size_t>(update));
+        const long again = table.begin_update(static_cast<std::size_t>(container));
+        expect(table.staged_count(static_cast<std::size_t>(again)) == 0, "a closed update leaves nothing staged");
+        expect(run_reader(self, shared, 1) == 0 && run_exists(self, shared, "extra.dat") == exit_missing, "close without submit leaves the disk unchanged");
+        table.end_update(static_cast<std::size_t>(again));
+
+        // (b) the second action fails: the first is not published either.
+        std::vector<x2w_save::Action> failing{write, x2w_save::Action{true, "absent.dat", {}}};
+        expect(store.commit("slot-a", failing) == Status::not_found, "a failing second action fails the commit");
+        expect(run_reader(self, shared, 1) == 0, "the first action was not published");
+        failing[1] = x2w_save::Action{false, "a/b", {}};  // a bad name is refused before anything is touched
+        expect(store.commit("slot-a", failing) == Status::bad_name && run_reader(self, shared, 1) == 0, "a bad second action publishes nothing");
+        fs::create_directory(shared / "slot-a" / "blocked.dat");  // a directory where a blob should go
+        failing[1] = x2w_save::Action{false, "blocked.dat", second};
+        expect(store.commit("slot-a", failing) != Status::ok && run_reader(self, shared, 1) == 0, "a blob that cannot be replaced publishes nothing");
+        fs::remove(shared / "slot-a" / "blocked.dat", ec);
+        std::size_t leftovers = 0;
+        for (const auto& item : fs::directory_iterator(shared / "slot-a", ec)) { (void)item; ++leftovers; }
+        expect(leftovers == 1, "failed commits leave no staging or backup file");
+
+        // (c) the whole update at once; a later action on a blob wins, a delete in the same update works.
+        std::vector<x2w_save::Action> whole{write, extra, x2w_save::Action{false, "profile.dat", first}, x2w_save::Action{false, "profile.dat", second}};
+        expect(store.commit("slot-a", whole) == Status::ok, "a whole update commits");
+        expect(run_reader(self, shared, 2) == 0 && run_exists(self, shared, "extra.dat") == 0, "second process sees the committed update");
+        expect(store.commit("slot-a", {x2w_save::Action{true, "extra.dat", {}}, x2w_save::Action{false, "more.dat", first}}) == Status::ok &&
+                   run_exists(self, shared, "extra.dat") == exit_missing && run_exists(self, shared, "more.dat") == 0, "delete and write commit together");
+        std::size_t after = 0;
+        for (const auto& item : fs::directory_iterator(shared / "slot-a", ec)) { (void)item; ++after; }
+        expect(after == 2, "a commit leaves no staging or backup file");
+        expect(!x2w_save::valid_name("a.X2W-OLD"), "the backup suffix is reserved too");
+    }
+
+    // A redirected container directory is refused by every operation, and nothing happens behind it.
+    {
+        const fs::path outside = root / "outside-dir";
+        fs::create_directories(outside, ec);
+        std::ofstream(outside / "profile.dat", std::ios::binary) << "behind the link";
+        if (!make_redirect(root / "store" / "slot-r", outside)) std::puts("note: a directory link cannot be made here, redirect control skipped");
+        else {
+            expect(store.read_blob("slot-r", "profile.dat", bytes) == Status::bad_name, "read through a redirected container is refused");
+            expect(store.delete_blob("slot-r", "profile.dat") == Status::bad_name && fs::exists(outside / "profile.dat"), "delete through a redirected container is refused");
+            expect(store.write_blob("slot-r", "new.dat", first.data(), first.size()) != Status::ok && !fs::exists(outside / "new.dat"), "write through a redirected container is refused");
+            expect(store.commit("slot-r", {x2w_save::Action{true, "profile.dat", {}}}) != Status::ok && fs::exists(outside / "profile.dat"), "commit through a redirected container is refused");
+            expect(store.create_container("slot-r") == Status::bad_name, "a redirected container cannot be created over");
+            expect(store.delete_container("slot-r") == Status::bad_name && fs::exists(outside / "profile.dat"), "a redirected container is not deleted through");
+        }
     }
 
     fs::remove_all(root, ec);

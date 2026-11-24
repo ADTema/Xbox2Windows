@@ -126,14 +126,27 @@ With `X2W_FAKE_USER=1`, the game-save stand-in keeps containers and blobs below
 `X2W_STORAGE_PATH`, in `x2w-gamesave`: one directory per container, one file per blob
 ([#1200](https://github.com/R0Y00/Xbox2Windows/issues/1200)). Opening a container whose directory
 exists succeeds. Names must be one plain path component of at most 128 bytes (no separators, `:`,
-`..`, control characters or device names) and a blob is at most 64 MiB, so nothing is created
-outside that folder. The slot numbers and argument layouts follow the public header order and stay a
-hypothesis. Persisted: create container (16), delete container (10, 11), create and close update
-(23, 24), and blob write and delete through an open update (25, 26, applied at once, so submit is a
-no-op). Not yet persisted, because their argument layout is not established: blob reads (20 to 22)
-still report no blob, and the enumerations and queries (12 to 15, 18, 19) still report nothing.
-`ctest --preset dev --no-tests=error -R '^startup_gamesave_persist$' -V` writes a blob in one
-process and reads it back in a second. It tests the storage code the slots call, not the slots.
+`..`, control characters, device names or the reserved suffixes `.x2w-part` and `.x2w-old`, in any
+case) and a blob is at most 64 MiB. The storage root itself is trusted; a container directory or blob
+that is a symbolic link or, on Windows, a junction is refused by every operation.
+
+Blob writes and deletes are kept with the update and reach the disk only when the update is
+submitted (the public API makes the whole update atomic at submit). An update closed without a
+submit changes nothing. At submit every write goes to a staging file and every delete is checked
+first; then each old file is moved aside, the new one put in place and, on any failure, everything
+is put back, so a failing action publishes none of the update. This holds for failures inside this
+process; a crash in the middle of the replacement can still leave some blobs replaced and `.x2w-old`
+files behind, and a reader can see the blobs of a submit one after the other.
+
+The slot numbers and argument layouts follow the public header order and stay a hypothesis.
+Persisted: create container (16), delete container (10, 11), create and close update (23, 24), blob
+write and delete staged in an update (25, 26) and published by submit (27, 28 with its result in 29).
+Not yet persisted, because their argument layout is not established: blob reads (20 to 22) still
+report no blob, and the enumerations and queries (12 to 15, 18, 19) still report nothing.
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_persist$' -V` checks the storage code the
+slots call, not the slots: it writes in one process and reads in a second, including a close without
+submit, a failing second action, a second process that sees only committed state, and a redirected
+container directory.
 
 ## Findings
 

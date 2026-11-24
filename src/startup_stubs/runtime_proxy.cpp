@@ -347,6 +347,21 @@ std::string update_container(u64 update)
     ReleaseSRWLockShared(&save_lock);
     return name;
 }
+u64 last_submit_status;  // what the last asynchronous submit returned (hypothesis: one at a time)
+// Publishes what an update has staged, all or nothing. The update itself stays open.
+u64 submit_update(u64 update)
+{
+    if (update < save_update_handle || update - save_update_handle >= max_save_handles) return 0;
+    const std::size_t index = static_cast<std::size_t>(update - save_update_handle);
+    AcquireSRWLockExclusive(&save_lock);
+    const std::string container = save_table.update_container(index);
+    std::vector<x2w_save::Action> actions = save_table.take(index);
+    ReleaseSRWLockExclusive(&save_lock);
+    if (container.empty() || actions.empty()) return 0;
+    const x2w_save::Status status = save_store().commit(container, actions);
+    if (status != x2w_save::Status::ok) x2w_local::logf("x2w-runtime game save: update refused, nothing published (status %d)", static_cast<int>(status));
+    return save_status(status);
+}
 u64 complete_async(u64 async_block)
 {
     Proxy* user = user_provider >= 0 ? proxies[user_provider] : nullptr;
@@ -435,29 +450,43 @@ bool save_call(int slot, u64* args, u64* result)
     }
     case 25: case 26: {
         // Hypothesis (public header order): SubmitBlobWrite(update, blob name, data, size) and
-        // SubmitBlobDelete(update, blob name), applied at once. Only an open update is acted on;
-        // any other argument is accepted and dropped as before.
-        const std::string container = update_container(args[0]);
+        // SubmitBlobDelete(update, blob name). The action is only kept with the update; nothing
+        // reaches the disk before the update is submitted, and an update closed without a submit
+        // leaves the save as it was. Only an open update is acted on; any other argument is
+        // accepted and dropped as before.
         std::string blob;
-        if (container.empty() || !read_save_name(args[1], blob)) return true;
-        if (slot == 26) {
-            save_store().delete_blob(container, blob);
-            return true;
-        }
-        const std::size_t size = static_cast<std::size_t>(args[3]);
-        if (size > x2w_save::max_blob_bytes || (size && x2w_local::probe_readable(static_cast<std::uintptr_t>(args[2]), size) != size)) {
+        if (update_container(args[0]).empty() || !read_save_name(args[1], blob)) return true;
+        x2w_save::Action action;
+        action.remove = slot == 26;
+        action.blob = blob;
+        if (!x2w_save::valid_name(blob)) {
             *result = e_invalidarg;
             return true;
         }
-        const x2w_save::Status status = save_store().write_blob(container, blob, reinterpret_cast<const void*>(args[2]), size);
-        *result = save_status(status);
-        if (status != x2w_save::Status::ok) x2w_local::logf("x2w-runtime game save: blob write refused (status %d)", static_cast<int>(status));
+        if (!action.remove) {
+            const std::size_t size = static_cast<std::size_t>(args[3]);
+            if (size > x2w_save::max_blob_bytes || (size && x2w_local::probe_readable(static_cast<std::uintptr_t>(args[2]), size) != size)) {
+                *result = e_invalidarg;
+                return true;
+            }
+            const auto* bytes = reinterpret_cast<const unsigned char*>(args[2]);
+            if (size) action.data.assign(bytes, bytes + size);
+        }
+        AcquireSRWLockExclusive(&save_lock);
+        const bool staged = args[0] >= save_update_handle && save_table.stage(static_cast<std::size_t>(args[0] - save_update_handle), std::move(action));
+        ReleaseSRWLockExclusive(&save_lock);
+        if (!staged) *result = e_outofmemory;
         return true;
     }
-    case 27: case 29:  // submit update, submit result: accepted (writes were applied already)
+    case 27:  // XGameSaveSubmitUpdate(update): publishes the staged actions, all or none
+        *result = submit_update(args[0]);
         return true;
     case 28:  // XGameSaveSubmitUpdateAsync(update, async)
+        last_submit_status = submit_update(args[0]);
         *result = complete_async(args[1]);
+        return true;
+    case 29:  // XGameSaveSubmitUpdateResult(async): the status of the last asynchronous submit
+        *result = last_submit_status;
         return true;
     default:
         *result = 0x80004001;  // E_NOTIMPL
