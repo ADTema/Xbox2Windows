@@ -431,6 +431,8 @@ ctest --preset dev --no-tests=error -R '^pso_(readiness_check|root_signature_war
 
 Add `--llvm <AMDGPU LLVM library>` to disassemble referenced native pixel and mesh code. The pixel stage uses the existing scanner and lowering probe. The mesh stage retains byte offsets for wave64 branches and runs the mesh entry lowerer with the synthetic triangle profile: 128 threads, geometry word `0x1003` and output limits of three vertices and one primitive. A mesh rejection describes the limits of that profile. The native code manifest supplies neither the real dispatch declaration nor the geometry bindings.
 
+The compute stage is disassembled for gfx1013 and each opcode is checked against the scanner's recognized RDNA 2 set. A compute pipeline never reaches `needs_pso_validation`: `compute_store_aot.lower` needs a table register, descriptor offsets, group registers and a thread group size that neither the native code nor the manifest supplies, so the lowering is not run and the stage reports `compute_isa_recognized` with that reason as its detail. An unrecognized opcode is an `unsupported_opcodes` blocker, and an unexpected failure while scanning is reported as `compute_scan_failed` instead of aborting the report.
+
 Each unique stage/hash pair is assessed once. A known missing root signature takes precedence over shader diagnostics. Missing references, unassessed stages and unknown signature status require more evidence. A pipeline with all stage probes passed and a present root signature still awaits PSO validation.
 
 ```sh

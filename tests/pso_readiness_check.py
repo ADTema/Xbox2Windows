@@ -174,6 +174,44 @@ def check_mesh():
     print("PSO mesh probe passed (1 lowered, 2 lowering rejections, 2 disassembly failures)")
 
 
+def check_compute():
+    from compute_store_check import READ_COPY
+    code = b"synthetic compute"
+    digest = hashlib.sha256(code).hexdigest()
+    compute = {"stage": "compute", "sha256": digest}
+    manifest = {"shaders": [dict(compute, native_file="compute.bin")]}
+    pipelines = {"pipelines": [
+        {"id": "compute", "effective_root_signature": "present", "shaders": [compute]},
+        {"id": "compute-missing-root", "effective_root_signature": "missing", "shaders": [compute]},
+    ]}
+    program = [line for line in READ_COPY if not line.endswith(":")]
+    mutated = [line.replace("buffer_load_dword", "buffer_load_imaginary") for line in program]
+    assert mutated != program
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "compute.bin").write_bytes(code)
+        for decoded, status, pipeline_status, detail in (
+                (program, "compute_isa_recognized", "needs_evidence", "ISA recognized; bindings not assessed"),
+                (mutated, "unsupported_opcodes", "blocked", "buffer_load_imaginary"),
+                ([], "disassembly_failed", "blocked", "empty instruction stream"),
+                (ValueError("Unknown instruction at byte 8"), "disassembly_failed", "blocked",
+                 "Unknown instruction at byte 8"),
+                ([None], "compute_scan_failed", "needs_evidence", "scan failed unexpectedly: AttributeError")):
+            patch_args = {"side_effect": decoded} if isinstance(decoded, Exception) else {"return_value": decoded}
+            with patch("pixel_aot.disassemble", **patch_args) as scan:
+                row, missing = report(manifest, pipelines, root, "test-llvm")["pipelines"]
+            actual = row["shaders"]["compute"]
+            assert (actual["sha256"], actual["archive_records"], actual["status"]) == (digest, 1, status), row
+            assert (actual["detail"] or "").startswith(detail), row
+            assert row["status"] == pipeline_status, row
+            assert missing["first_blocker"] == {"reason": "missing_root_signature"}, missing
+            scan.assert_called_once_with(code, "test-llvm")
+        untested = report(manifest, pipelines, root)["pipelines"][0]
+        assert untested["shaders"]["compute"]["status"] == "compute_scan_untested", untested
+        assert untested["status"] == "needs_evidence", untested
+    print("PSO compute probe passed (1 recognized, 1 unsupported opcode, 2 disassembly failures, 1 scan failure)")
+
+
 def check():
     check_scanner_tracks_pixel_aot()
     code = b"synthetic native bytes"
@@ -253,4 +291,5 @@ def check():
 
 if __name__ == "__main__":
     check_mesh()
+    check_compute()
     check()
