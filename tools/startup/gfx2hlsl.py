@@ -583,6 +583,11 @@ class Stage:
             return self.set_v(reg_range(ops[0])[1], text.format(*[self.u(o) for o in ops[1:1 + arity]]))
         if base in SCA:
             return self.scalar(base, ops)
+        if base in ('buffer_load_format_x', 'buffer_load_format_xy',
+                    'buffer_load_format_xyz', 'buffer_load_format_xyzw'):
+            # MUBUF formatted loads take both fields from V# word 3. The startup request carries
+            # the root signature layout, while the descriptor table is supplied at draw time.
+            raise Unsupported('%s requires descriptor FORMAT and DST_SEL' % base)
         raise Unsupported(base)
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place

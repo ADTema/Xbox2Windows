@@ -1138,9 +1138,11 @@ routing and sample format.
 With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
 and `XApuDisconnect`, refuses null outputs (`E_POINTER`) and unknown or disconnected
 handles (`E_HANDLE`), and queues one completion entry per `XApuEnqueueCommand` call so
-`XApuGetResultCount` and `XApuDequeueResult` retire commands cleanly (zeroing the
-`0x58`-byte result buffer without fabricating unmeasured fields, and returning `E_FAIL`
-when the queue is empty). The all-zero result is a placeholder: its type field (`+0`) is not a measured
+`XApuGetResultCount` and `XApuDequeueResult` can retire commands. A successful dequeue zeroes the
+`0x58`-byte result buffer. An empty queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves
+the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
+
+The all-zero result is a placeholder: its type field (`+0`) is not a measured
 completion value, and no caller has been observed consuming it. Entries are counters only, so memory does
 not grow per command. Handles are never reused. Default non-permissive mode still traps on every export
 (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
