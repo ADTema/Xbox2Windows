@@ -176,6 +176,8 @@ INDEX_BINDING = dict(table_reg=7, group_reg=11, descriptor_offset=48, stride=12)
 # kernel reads FLAT_SCR_LO or touches scratch memory, so the write is a no-op and the readback must match the
 # untouched fixture word for word, guards included.
 SCRATCH_BASE_WRITE_LINES = ["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0"] + INDEXED
+SCRATCH_STORE = "scratch_store_dword off, v15, s0"
+SCRATCH_STORE_LINES = SCRATCH_BASE_WRITE_LINES[:-1] + [SCRATCH_STORE, "s_endpgm"]
 # LLVM spells an immediate whose bit pattern looks like a float as an inline float, and that spelling is the
 # one the disassembler hands to lower(). Both spellings must lower identically and read back identically.
 SCRATCH_BASE_WRITE_SPELLINGS = ["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 1.0",
@@ -264,8 +266,8 @@ def controls():
     must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0",
                                       "s_getreg_b32 s9, hwreg(HW_REG_FLAT_SCR_LO)"] + INDEXED,
                                  32, **INDEX_BINDING))
-    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0",
-                                      "scratch_store_dword off, v0"] + INDEXED, 32, **INDEX_BINDING))
+    rejects(f"Unsupported compute instruction: {SCRATCH_STORE}", aot.lower,
+            SCRATCH_STORE_LINES, 32, **INDEX_BINDING)
     must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400"] + INDEXED, 32,
                                  **dict(INDEX_BINDING, stride=8)))
     must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_MODE), 0"] + INDEXED, 32,
@@ -3583,6 +3585,15 @@ def binary(directory, assembler, objcopy, library):
                "--llvm", library, *options]
         subprocess.run(cli, check=True)
         assert output.read_text() == aot.lower(lines, width, **binding)
+        if name == "indexed":
+            # Feed the CLI a real scratch store after the otherwise accepted scratch-base write.
+            scratch_code = assemble(directory, assembler, objcopy, [".text", *SCRATCH_STORE_LINES])
+            container.write_bytes(store_container(scratch_code, dims))
+            output.unlink()
+            bad = subprocess.run(cli, capture_output=True, text=True)
+            diagnostic = f"ValueError: Unsupported compute instruction: {SCRATCH_STORE}"
+            assert bad.returncode == 1 and bad.stderr.rstrip().endswith(diagnostic), bad.stderr
+            assert not output.exists()
         if name in {case[0] for case in GUARD_CASES}:
             # The decoded branch lands where the guarded store ends. Retarget it to the store (inside
             # the guarded block), into the store's second word, and past the restore or the exit.
