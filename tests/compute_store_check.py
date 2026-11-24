@@ -1059,13 +1059,16 @@ def alu_controls():
 
 
 # The read-compute-write fixture with a scalar chain over the cap word s0 and the bound s3 feeding the min:
-# add, sub, and, or (with a 32-bit literal), xor and a logical shift right, each reading the previous result.
-SCALAR_CHAIN = ("s_add_u32 s16, s0, 7\ns_sub_u32 s17, s16, s3\ns_and_b32 s18, s17, 0xff0\n"
-                "s_or_b32 s19, s18, 0x100000\ns_xor_b32 s20, s19, s0\ns_lshr_b32 s21, s20, 3")
+# add and sub that both wrap, and with a literal, or, xor with the bound and a logical shift right, each reading the
+# previous result.
+SCALAR_CHAIN = ("s_add_u32 s16, s0, -16\ns_sub_u32 s17, s16, 0x10000\ns_and_b32 s18, s17, 0xffffffe0\n"
+                "s_or_b32 s19, s18, 10\ns_xor_b32 s20, s19, s3\ns_lshr_b32 s21, s20, 3")
 READ_SCALAR = variant(READ_COMPUTE, ("v_and_b32_e32 v2, 0xffff, v1", SCALAR_CHAIN + "\nv_and_b32_e32 v2, 0xffff, v1"),
                       ("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v1, s21, v1"))
-SCALAR_WORD = ("min(((((((params[0].y + 0x00000007u) - params[0].x) & 0x00000ff0u) | 0x00100000u) ^ params[0].y)"
+SCALAR_WORD = ("min(((((((params[0].y + 0xfffffff0u) - 0x00010000u) & 0xffffffe0u) | 0x0000000au) ^ params[0].x)"
                " >> (0x00000003u & 31u)), ")
+
+SCALAR_CASES = [("read_scalar", READ_SCALAR, 32, READ_BINDING)]
 
 
 def scalar_alu_controls():
@@ -1084,20 +1087,20 @@ def scalar_alu_controls():
         # Opcodes outside the subset: signed, carry-in and 64-bit forms.
         (unsupported + "s_ashr_i32", (("s_lshr_b32 s21", "s_ashr_i32 s21"),)),
         (unsupported + "s_addc_u32", (("s_add_u32 s16", "s_addc_u32 s16"),)),
-        (unsupported + "s_and_b64", (("s_and_b32 s18, s17, 0xff0", "s_and_b64 s[18:19], s[16:17], 0xff0"),)),
+        (unsupported + "s_and_b64", (("s_and_b32 s18, s17, 0xffffffe0", "s_and_b64 s[18:19], s[16:17], 0xffffffe0"),)),
         # Sources that are not known words: an unwritten SGPR, a descriptor SGPR, the saved exec mask, and a
         # constant word still waiting for its s_waitcnt.
-        (operand, (("s_add_u32 s16, s0, 7", "s_add_u32 s16, s30, 7"),)),
-        (operand, (("s_add_u32 s16, s0, 7", "s_add_u32 s16, s8, 7"),)),
-        (operand, (("s_add_u32 s16, s0, 7", "s_add_u32 s16, s2, 7"),)),
-        (operand, (("s_add_u32 s16, s0, 7", "s_buffer_load_dword s23, s[4:7], 0x8\ns_add_u32 s16, s23, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s30, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s8, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s2, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_buffer_load_dword s23, s[4:7], 0x8\ns_add_u32 s16, s23, 7"),)),
         # A destination past s105, and a pending destination.
-        (operand, (("s_add_u32 s16, s0, 7", "s_add_u32 s106, s0, 7"),)),
-        (operand, (("s_add_u32 s16, s0, 7", "s_buffer_load_dword s16, s[4:7], 0x8\ns_add_u32 s16, s0, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s106, s0, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_buffer_load_dword s16, s[4:7], 0x8\ns_add_u32 s16, s0, 7"),)),
         # A source wider than 32 bits.
-        (operand, (("s_add_u32 s16, s0, 7", "s_add_u32 s16, s0, 0x1ffffffff"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s0, 0x1ffffffff"),)),
         # A vector register is not a scalar source.
-        (unsupported + "s_add_u32", (("s_add_u32 s16, s0, 7", "s_add_u32 s16, s0, v1"),)),
+        (unsupported + "s_add_u32", (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s0, v1"),)),
         # Overwriting the saved exec mask breaks the guard restore.
         ("Unverified lane guard restore", (("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", "s_add_u32 s2, s0, 7"),
                                            ("s_endpgm", "s_or_b32 exec_lo, exec_lo, s2\ns_endpgm"))),
@@ -2933,6 +2936,85 @@ def draw_alu(directory, compiler, cmd, case, name):
     return 0
 
 
+SCALAR_CAP = 0x8068  # cap + 0xfffffff0 and then - 0x10000 both wrap; bits 5 and 6 survive the and mask
+
+
+def scalar_chain(cap, bound, *, skip=(), shift=3, bound_word=None):
+    """Independent CPU reference of the scalar chain: add -16, sub 0x10000, and, or 10, xor the bound, shift."""
+    word = (cap + 0xfffffff0) & 0xffffffff if "add" not in skip else cap
+    word = (word - 0x10000) & 0xffffffff if "sub" not in skip else word
+    word = word & 0xffffffe0 if "and" not in skip else word
+    word = word | 10 if "or" not in skip else word
+    word = word ^ (bound if bound_word is None else bound_word) if "xor" not in skip else word
+    return word >> shift
+
+
+def scalar_word(gid, bound, *, pick=min, **chain):
+    """Reference of read_scalar for one lane: the unsigned minimum of the chain and the product plus the lane index."""
+    word = source_word(gid)
+    product = ((word & 0xffff) * (word >> 16) + gid) & 0xffffffff
+    return pick(product, scalar_chain(SCALAR_CAP, bound, **chain))
+
+
+def scalar_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = scalar_word(gid, bound, **reference)
+    return words
+
+
+def draw_scalar(directory, compiler, cmd, case, name):
+    """Scalar chain against scalar_word, from the 320-word case format, with wrong references and mutated sources."""
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = SCALAR_CAP
+
+    def write(groups, bound, words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, *constants[1:]))
+
+    for groups, bound in READ_RUNS:
+        write(groups, bound, scalar_words(groups, bound))
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    groups, bound = READ_RUNS[-1]
+    expected = scalar_words(groups, bound)
+    products = [scalar_word(g, bound, pick=lambda p, c: p) for g in range(bound)]
+    chain = scalar_chain(SCALAR_CAP, bound)
+    # Inputs must show both add and sub wrapping, and the minimum taking each operand.
+    assert SCALAR_CAP + 0xfffffff0 >= 1 << 32 and (SCALAR_CAP + 0xfffffff0) & 0xffffffff < 0x10000, "no wrap"
+    assert any(p < chain for p in products) and any(p >= chain for p in products), "min takes one operand only"
+    controls = (("max for min", dict(pick=max)), ("add dropped", dict(skip=("add",))),
+                ("sub dropped", dict(skip=("sub",))), ("and dropped", dict(skip=("and",))),
+                ("or dropped", dict(skip=("or",))), ("xor dropped", dict(skip=("xor",))),
+                ("shift by 2", dict(shift=2)), ("cap for bound", dict(bound_word=SCALAR_CAP)))
+    for label, reference in controls:
+        wrong = scalar_words(groups, bound, **reference)
+        word = next(i for i, (a, b) in enumerate(zip(expected, wrong)) if a != b)
+        write(groups, bound, wrong)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(groups, bound, expected)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, old, new in (("max for min", "min(((((((params", "max(((((((params"),
+                            ("add dropped", "(params[0].y + 0xfffffff0u)", "params[0].y"),
+                            ("sub dropped", "- 0x00010000u)", "- 0x00000000u)"),
+                            ("and dropped", "& 0xffffffe0u", "& 0xffffffffu"),
+                            ("or dropped", "| 0x0000000au", "| 0x00000000u"),
+                            ("xor dropped", "^ params[0].x", "^ 0x00000000u"),
+                            ("shift by 2", ">> (0x00000003u", ">> (0x00000002u")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+    return 0
+
+
 def draw_mad24(directory, compiler, cmd, case):
     # Dispatch one group, enable only lane zero and leave all 319 other words
     # at their sentinel. With cap = UINT_MAX the entire multiply is observable.
@@ -3008,6 +3090,11 @@ def draw(directory, compiler, renderer, backend, cases=None):
             if result:
                 return result
             continue
+        if name == "read_scalar":
+            result = draw_scalar(directory, compiler, cmd, case, name)
+            if result:
+                return result
+            continue
         if name == "read_mad24":
             result = draw_mad24(directory, compiler, cmd, case)
             if result:
@@ -3075,5 +3162,5 @@ if __name__ == "__main__":
                  "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
-                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES)}
+                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))
