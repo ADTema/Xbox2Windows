@@ -191,6 +191,12 @@ socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do no
 | `<log>/stderr.txt` | the stand-ins' logs (`x2w-d3d12`, `x2w-dstorage`, `x2w-xmem`, `x2w-runtime`, ...) |
 | `<log>/files.txt` | every file the process opened |
 
+`run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
+the process could not be created, 0 when the debugger finished its report, whatever the process
+did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_ps1`): on Windows it
+runs the script on a stub debugger under Windows PowerShell and `pwsh`, elsewhere it checks the
+script text only.
+
 `tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
 
