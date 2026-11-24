@@ -31,6 +31,30 @@ records. The control expects the first blend patch to win and must fail.
 
 Command-list slot 24 (`OMSetStencilRef`, the desktop slot) passes its reference to the desktop list, as slots 21 to 23 do for viewports, scissors and the blend factor, so a translated draw whose pipeline enables the stencil test compares against it. A closed list ignores the call. The slot number is the desktop one and has not been seen in a title log; `startup_stream_depth_{warp,hardware}` checks the references 0x5A, 0x5B, 0 and 0xFF against a stencil cleared to the matching value.
 
+## Occlusion queries
+
+Which console methods sit at command-list slots 28 to 30 is not established by any fixture here. The repository
+shows only that four console methods sit in 26 to 31 (32 is `SetDescriptorHeaps`, desktop 28 plus four) and that
+the plus-four run has ended by 61 (`ExecuteIndirect`, desktop 59 plus two). As a hypothesis, slots 28 to 30 are
+implemented as `BeginQuery(heap, type, index)`, `EndQuery(heap, type, index)` and
+`ResolveQueryData(heap, type, start, count, buffer, offset)`. The fixture below calls those slots directly, so it
+checks the forwarding, the refusals and the end at Close, not the numbering.
+
+The query heap comes from device slot 39 with the desktop desc, which the stand-in keeps. Only occlusion and
+binary-occlusion queries on an occlusion heap are forwarded to the desktop list. These calls are refused and logged
+(`x2w-render ... refused`, the first 16 of each method): an index outside the heap, an `EndQuery` without a
+`BeginQuery` on the same list, and a resolve over a query still open on the list, to anything but a committed
+readback buffer without title memory, or past that buffer's end. A query still open at Close is ended there, since
+the desktop Close would otherwise fail and drop the list. The readback buffer stays in `COPY_DEST` and is not moved
+through the list's state tracking.
+
+`startup_list_queries_{warp,hardware}` resolves a query around a draw over an 8x8 target (64 samples) and an empty
+one (0) into a readback buffer filled with a sentinel, reads it through the console `Map`, checks that six
+mismatched calls are refused without a debug-layer error, and leaves one query open at Close.
+`startup_list_queries_ignored_{warp,hardware}_control` runs it with `X2W_TEST_QUERY_IGNORE=1`, which leaves the
+three slots as no-ops; it must report the untouched sentinel in the first word. `command_list_slot_names.h` still
+names 56 to 58 as the query methods by the plus-four rule.
+
 ## Default viewport and scissor
 
 A desktop command list that never sets a viewport or scissor rectangle draws no pixel. A translated

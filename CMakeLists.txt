@@ -915,6 +915,19 @@ foreach(backend IN ITEMS warp hardware)
 endforeach()
 set_tests_properties(startup_indirect_dispatch_hardware startup_indirect_root_constants_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
+# Occlusion queries recorded through command-list slots 28 to 30 reach the readback buffer (#870).
+add_executable(startup_list_queries tests/startup_list_queries.cpp tests/desktop_gpu.cpp)
+target_compile_features(startup_list_queries PRIVATE cxx_std_17)
+target_link_libraries(startup_list_queries PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_list_queries_${backend} COMMAND startup_list_queries ${backend})
+    set_tests_properties(startup_list_queries_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    # Negative control: with the query slots left as no-ops the buffer keeps its sentinel.
+    add_test(NAME startup_list_queries_ignored_${backend}_control COMMAND startup_list_queries ${backend})
+    set_tests_properties(startup_list_queries_ignored_${backend}_control PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "word 0: got 0xa5a5a5a5a5a5a5a5" ENVIRONMENT "X2W_TEST_QUERY_IGNORE=1")
+endforeach()
+
 add_executable(startup_indirect_draw_indexed tests/startup_indirect_draw_indexed.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_indirect_draw_indexed PRIVATE cxx_std_17)
 target_link_libraries(startup_indirect_draw_indexed PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
