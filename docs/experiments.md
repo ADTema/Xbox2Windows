@@ -133,6 +133,35 @@ Four wrong references (omitting `voffset` or `soffset`) and four translation mut
 ctest --preset dev --no-tests=error -R '^startup_buffer_address_(controls|warp|hardware)$' -V
 ```
 
+### Descriptor format for startup MUBUF formatted loads
+
+For `buffer_load_format_{x,xy,xyz,xyzw}`, the RDNA 2 buffer resource descriptor
+supplies both `FORMAT` (bits 18:12 of word 3) and `DST_SEL` (bits 11:0 of word 3).
+The opcode determines how many components the instruction returns. An MTBUF
+`tbuffer_load_format_*` encodes the format in the instruction and uses identity
+selectors. [AMD RDNA 2 Shader ISA, §8.1.4 and §8.1.8](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
+The startup graphics request contains the two shaders, the root signature and
+an optional input layout. `gfx2hlsl` records a scalar load from a descriptor
+table as a table index, byte offset and dword index. The descriptor words are
+available to `draw_translated()` when it reads the bound table, after it has
+loaded a desktop translation. The raw buffer binder uses the base address,
+stride and record count from a native descriptor and passes no format or
+selectors to the translated shader. A wrapped view token follows a separate
+binding path. A formatted lowering needs the actual bound descriptor state
+and a verified channel mapping, alignment and bounds policy for the forms it
+accepts.
+
+The translator reports `<mnemonic> requires descriptor FORMAT and DST_SEL`
+in the request's `.fail` file. The source-built control submits all four
+`off` forms with a scalar descriptor-table load and checks the named refusal
+and absence of a translation. The same table entry and address produce HLSL
+for `buffer_load_dwordx3` and `tbuffer_load_format_xyz` as positive controls.
+
+```sh
+python3 -B tests/startup_buffer_address_check.py controls
+```
+
 ## Startup translator: SMEM combined register and immediate offsets
 
 In RDNA 2 SMEM instructions (`s_load_dword*` and `s_buffer_load_dword*`), a scalar register `SOFFSET` (`s0`..`s105` or `m0`) and a non-zero 21-bit signed immediate `OFFSET` (`w1[20:0]`) can be active at the same time: [`tools/disasm_rdna2.py`](../tools/disasm_rdna2.py) prints the register in `ops[2]` and `offset:0x...` in `mods`. Previously, `Stage.op_s_buffer_load_dword()` and `Stage.op_s_load_dwordx4()` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) ignored `mods`, silently dropping `offset:0x...` on register-addressed buffer and dynamic sampler-heap loads, accepting unknown modifiers, reading negative 21-bit signed encodings (`0x100000`..`0x1fffff`) as `+1`..`2` MiB, and overwriting a runtime SGPR `soffset` mid-load when a multi-dword `s_buffer_load_dwordx*` wrote into that register first.
