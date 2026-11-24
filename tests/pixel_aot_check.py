@@ -4509,6 +4509,23 @@ def check_sdwa_cmp_controls(directory):
     assert not missing, missing
     # Subtracting the correct high word from a WORD_1 source is present in the emitted HLSL.
     assert ">> 16u" in source
+    # Device-free guards for the signedness, 16-bit narrowing and class selections. The GPU draws below
+    # cover the same models, but these fail on Linux when a branch loses asint, the shift or the mask.
+    model = translate_int(uncompressed_export([
+        "v_mov_b32_e32 v18, s45",
+        "v_cmp_eq_i32_sdwa vcc_lo, s44, v18 src0_sel:BYTE_1 src1_sel:DWORD",
+        "v_cmp_lt_u32_sdwa vcc_lo, s44, v18 src0_sel:WORD_1 src1_sel:DWORD",
+        "v_cmp_lt_i16_sdwa vcc_lo, sext(s44), v18 src0_sel:BYTE_1 src1_sel:WORD_0",
+        "v_cmp_lt_u16_sdwa vcc_lo, s44, v18 src0_sel:WORD_1 src1_sel:BYTE_2",
+        "v_cmp_class_f16_sdwa vcc_lo, s44, v18 src0_sel:WORD_1 src1_sel:DWORD",
+        "v_cmp_class_f32_sdwa vcc_lo, s44, v18 src0_sel:BYTE_2 src1_sel:DWORD",
+    ]))
+    assert "asint(((params[0].w >> 8u) & 0xffu))" in model
+    assert "((params[0].w >> 16u) & 0xffffu) < asuint(" in model
+    assert "<< 16u) >> 16)" in model
+    assert "0xffffu) & 0xffffu)" in model
+    assert "class16(((params[0].w >> 16u) & 0xffffu))" in model
+    assert "class32(asfloat(((params[0].w >> 16u) & 0xffu)))" in model
     # VOPC SDWA has no destination field beyond the lane mask: dst_sel/dst_unused never assemble.
     for extra in ("dst_sel:WORD_0 dst_unused:UNUSED_PAD ", "dst_sel:DWORD dst_unused:UNUSED_SEXT ",
                   "dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE "):

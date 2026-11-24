@@ -10896,4 +10896,3 @@ Command-list slot 34 no longer sets a title root signature flagged `CBV_SRV_UAV_
 cmake --build --preset dev --target startup_stream_consumer startup_heap_indexed_root_check
 ctest --preset dev --no-tests=error -R "^startup_(heap_indexed_root.*|root_heap_(warp|hardware))$" -V
 ```
-
