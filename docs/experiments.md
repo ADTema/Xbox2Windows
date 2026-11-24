@@ -3225,6 +3225,20 @@ through the CLI and pins the lowered line, and changing that one instruction wor
 to another form must change the line. On a Linux host only the LLVM part and the
 reference arithmetic were run; no WARP or GPU readback of these six forms exists yet.
 
+The discard compare may be any of `v_cmpx_lt_f32_e32`, `v_cmpx_le_f32_e32`,
+`v_cmpx_gt_f32_e32` and `v_cmpx_ge_f32_e32` (scalar first source, VGPR second
+source); a lane is discarded when `src0 OP vsrc1` holds. These are the ordered
+binary32 compares, false when either operand is NaN like the HLSL operators; the
+unordered `n*` forms, other widths, integer compares and e64 forms reject
+translation. `depth_mask_cmpx_draw_*` draws each compare at two seeds with
+thresholds that equal one row's value exactly, against a CPU reference written
+with Python operators, so lt and le (and gt and ge) differ in one row of 32 pixels
+and the lt/gt pair in 992 or more. Every other compare's reference must fail on
+exactly those pixels. LLVM CI also assembles each compare, translates it through
+the CLI and pins the lowered line, and changing that one instruction word to
+another compare must change the line. On a Linux host only the LLVM part and the
+reference pictures were run; no WARP or GPU readback of these four forms exists yet.
+
 The Windows fixture binds distinct seeds and thresholds, changes each separately,
 then exchanges the two root CBV addresses. It checks all 1,024 D32_FLOAT
 pixels and requires comparison against the old reference to fail after the
@@ -3233,7 +3247,7 @@ synthetic container through the CLI.
 
 ```text
 python3 -B tests/depth_mask_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-ctest --preset dev --no-tests=error -R "^depth_mask_(ops_)?draw_" -V
+ctest --preset dev --no-tests=error -R "^depth_mask_(ops_|cmpx_)?draw_" -V
 ```
 
 In a local inventory based on main `933cbad`, 354 of 12,101 PS records
