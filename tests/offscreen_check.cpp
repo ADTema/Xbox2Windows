@@ -1091,6 +1091,15 @@ OperationResult run_startup_cb_blend(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-composite-provenance: source, destination before and destination after a composite draw on one
+// list distinguish a drawn centre, a clipped centre and a UV that selects the source corner (#1628).
+OperationResult run_startup_composite_provenance(const OperationContext& ctx)
+{
+    if (check_startup_composite_provenance(ctx.device) != 0)
+        return {OutcomeKind::fail, "composite provenance differs from the model or a mutant matched"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 template<bool Swapped>
 OperationResult run_startup_sampler_x(const OperationContext& ctx)
 {
@@ -1130,7 +1139,8 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1);
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1,
+                           std::strcmp(ctx.argv[2], "--startup-image-1d") == 0);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1280,6 +1290,7 @@ const OperationSpec kOperations[] = {
     // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
+    {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
@@ -1378,6 +1389,7 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
     {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
+    {"--startup-composite-provenance", 3, 3, nullptr, kNoGate, run_startup_composite_provenance},
     {"--startup-cb-blend-swapped", 3, 3, nullptr, kNoGate, run_startup_cb_blend<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
     {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},

@@ -141,6 +141,37 @@ by reading a render log. The device prints the counts by cause value, so
 checks without a device that each cause lands in the slot printed under its label, and that the
 header's names follow the same order. The control swaps the buffer and token slots and must fail.
 
+## Composite provenance fixture
+
+Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was
+already there. `tests/startup_composite_provenance.cpp` is a source-built model of that question, not a trace
+of the title. One command list draws a 64×64 RGBA32F source:
+- a blue base;
+- a green centre block, `[16, 48)²`;
+- a red corner block, `[0, 8)²`.
+
+It then clears the destination to magenta and runs the composite, which `Load`s the exact source texel at
+`floor(position) × scale + offset`. The source, the destination immediately before the composite draw and the
+destination immediately after it are copied to readback buffers on the same list, behind one fence. A CPU
+model built from the first two readbacks predicts every pixel of the third.
+
+The three cases leave three different destination centres:
+
+| case | scissor | UV | centre after |
+|---|---|---|---|
+| drawn centre | full | identity | green |
+| clipped centre | top 16 rows | identity | magenta (retained) |
+| UV selects the corner | full | constant texel (2, 2) | red |
+
+Each case reports viewport, scissor, blend (off) and write mask. Two mutants run against the unchanged model
+and must mismatch: the corner case with its UV moved to the source centre, and the drawn case with a write
+mask of red and alpha only.
+
+On an AMD Radeon RX 9070 XT (driver 32.0.31044.16) and WARP 10.0.26100.9818, Windows 11 build 26300.9974,
+debug layer enabled, all 4,096 pixels of each case matched the model. The UV mutant mismatched 4,096 pixels
+and the mask mutant 1,088, with zero debug errors or warnings
+(`ctest --preset dev --no-tests=error -R '^startup_composite_provenance_(hardware|warp)$' -V`).
+
 ## What is measured
 
 With the switches below, an x64 console executable on an AMD RDNA4 GPU (Windows 11, release
@@ -401,7 +432,7 @@ These are measured on one executable; treat them as hypotheses for others.
   so a fence never completes before the wait ends. Other queue slots that are given a fence are
   still treated as Signals. The slot numbers are inferred from that layout; no title call to slot
   17 has been logged yet. Run
-  `ctest --preset dev --no-tests=error -R "^startup_queue_wait_"`.
+  `ctest --preset dev --no-tests=error -R "^startup_queue_wait_"`. On Windows 11 build 26300.9974 both backends separate the two slots the way this mapping assumes: on the RTX 5080 Laptop (32.0.15.8142) and on the Microsoft Basic Render Driver, routing the wait through slot 15 leaves `G=1` before `F` is signalled because that slot acts as a Signal, while routing it through slot 17 leaves `G=0` until `F` reaches 1 from the CPU.
 - **Resubmitted lists.** In render mode a closed list can be submitted again until its own Reset.
   Each title allocator stands for a pool of desktop allocators. The title's Reset resets the current
   one only if no list holds a recording on it and every queue has passed its last submit; otherwise
@@ -516,7 +547,7 @@ These are measured on one executable; treat them as hypotheses for others.
   graphics draws; other consumers need their own binding path. Drivers refuse the request
   with different codes for the same condition (`E_INVALIDARG` on a GTX 1660 SUPER, `E_OUTOFMEMORY` on
   an RTX 3060), so any failure of an oversized shader-visible view heap takes this path. The measured
-  limits so far are 1,000,000 descriptors on both adapters. Reproduce with
+  limits so far are 1,000,000 descriptors on both adapters. On Windows 11 build 26300.9974 an RTX 5080 Laptop (32.0.15.8142) also reports 1,000,000, so the fixtures' 1,245,184-descriptor request takes the shortcut above and the remaining 245,184 descriptors stay in title memory. Reproduce with
   `ctest --preset release --no-tests=error -R '^startup_(view_heap|logical_view)_' -V`, which skips (77) on an
   adapter that accepts the full request. WARP 10.0.26100.9818 and an RX 6600 (driver 32.0.21045.29003)
   accept it, so those draws do not reach the table bounds there. `ctest --preset dev --no-tests=error -R '^startup_logical_view_table$' -V` checks
