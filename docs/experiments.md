@@ -6349,6 +6349,8 @@ fixture policy, not an Xbox ABI claim.
 
 On Windows 11 build 26300.9974, the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) passed the heap, table and negative cases: the table dispatch read back `0.125, 0.125, 0.09375, 1.0` as expected with `descriptor_table_bound=yes`, and the count-zero, descriptor-size-zero and sampler-in-CBV-table records each returned `0x80070057` as expected.
 
+The same adapter reports `max_view_descriptor_heap=1000000` and `max_sampler_descriptor_heap=4000` from OPTIONS19, with 64-byte CBV/SRV/UAV and 16-byte sampler increments, and its heap case performs the four copies as two `CopyDescriptors` ranges and two `CopyDescriptorsSimple` calls.
+
 The console-interface boundary is the XCL-08 device path only. No console descriptor format,
 heap metadata, range table or `D3D12Xbox` descriptor-heap entry point is claimed. The root
 signature, shader and resources are source-built desktop fixtures. The observed vtable slot 14
