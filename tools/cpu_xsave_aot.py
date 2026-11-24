@@ -928,8 +928,9 @@ def lift_code(name, start, raw, *, entry_state="defined"):
             rdx_val = const_gpr.get("rdx")
             if rdx_val == 0 and rax_val is not None and (rax_val & ~7) == 0:
                 defined_xcomp |= rax_val & 7
-                # xrstor loads MXCSR whenever RFBM selects SSE or AVX.
-                if rax_val & 6:
+                # Only RFBM[1] (SSE) guarantees MXCSR is defined across both standard and compacted XRSTOR;
+                # compacted format with RFBM=4 (AVX only) leaves MXCSR unchanged.
+                if rax_val & 2:
                     defined_mxcsr = True
             defined_xmm.update(range(6))
             defined_ymm.update(range(6))

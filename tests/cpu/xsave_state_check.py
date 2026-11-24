@@ -1913,12 +1913,14 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
         Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.R8)),
         Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)),
         ret_ins)))
-    # MXCSR is defined by a restore selecting SSE or AVX; an x87-only save stores no MXCSR.
-    alt_accept.append(("xrstor_avx_vzeroupper_xsaveopt64_avx", (
-        mov_eax_4,
+    # MXCSR is defined by a restore selecting SSE (RFBM[1]); an x87-only save stores no MXCSR, and
+    # compacted XRSTOR with RFBM=4 (AVX only) leaves MXCSR unchanged.
+    alt_accept.append(("xrstor_sse_vzeroupper_xsaveopt64_avx", (
+        mov_eax_2,
         xor_edx,
         Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
         Instruction.create(Code.VEX_VZEROUPPER),
+        mov_eax_4,
         Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)),
         ret_ins)))
     alt_accept.append(("xrstor_x87_xsaveopt64_x87", (
@@ -1933,7 +1935,7 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
         "xrstor_xsavec64": "op_xsavec(state, r8, rax, rdx, true);",
         "xsavec_then_xrstor_same_buffer": "op_xrstor(state, r8, rax, rdx, true);",
         "xrstor_xsaveopt64": "op_xsaveopt(state, r8, rax, rdx, true);",
-        "xrstor_avx_vzeroupper_xsaveopt64_avx": "op_xsaveopt(state, r8, rax, rdx, true);",
+        "xrstor_sse_vzeroupper_xsaveopt64_avx": "op_xsaveopt(state, r8, rax, rdx, true);",
         "xrstor_x87_xsaveopt64_x87": "op_xsaveopt(state, r8, rax, rdx, true);",
         "vmovdqa_ymm_roundtrip": "load256(rcx, true)",
         "movdqa_xmm_roundtrip": "store128(r8, get_xmm(state, 3), true);",
@@ -1951,6 +1953,17 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
     canon_raw = _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins)
     canon_src, canon_count = lift_code("canon_bare", 0x1000, canon_raw, entry_state="canonical")
     assert canon_count == 4 and "Entry-state profile: canonical" in canon_src
+    for label, seq in (
+        ("xrstor_avx_xsaveopt64_avx", (
+            mov_eax_4, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+            Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins)),
+        ("xrstor_avx_vzeroupper_xsaveopt64_avx", (
+            mov_eax_4, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+            Instruction.create(Code.VEX_VZEROUPPER),
+            Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins)),
+    ):
+        src, count = lift_code(label, 0x1000, _encode_seq(*seq), entry_state="canonical")
+        assert count == len(seq) and "Entry-state profile: canonical" in src, label
 
     # Also verify runtime #GP for bounded mask contract (EDX != 0 / EAX & ~7 != 0)
     # and acceptance of invalid MXCSR when RFBM == 1 (RFBM & 6 == 0).
@@ -1995,6 +2008,15 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
          "non-r8 store memory operand"),
         ("vzeroupper_xsaveopt64_avx_mxcsr_undefined",
          _encode_seq(Instruction.create(Code.VEX_VZEROUPPER), mov_eax_4, xor_edx,
+                     Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "stores MXCSR before any restore defined it"),
+        ("xrstor_avx_xsaveopt64_avx_mxcsr_undefined",
+         _encode_seq(mov_eax_4, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+                     Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "stores MXCSR before any restore defined it"),
+        ("xrstor_avx_vzeroupper_xsaveopt64_avx_mxcsr_undefined",
+         _encode_seq(mov_eax_4, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+                     Instruction.create(Code.VEX_VZEROUPPER),
                      Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins),
          "stores MXCSR before any restore defined it"),
         ("x87_restore_vzeroupper_xsaveopt64_x87_avx_mxcsr_undefined",
