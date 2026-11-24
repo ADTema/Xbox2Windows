@@ -21,7 +21,7 @@ from spirv_address_window import lower
 
 SOURCE = Path(__file__).with_suffix(".spvasm").read_text(encoding="utf-8")
 FLAG = "--spirv-address-window-signed"
-MIN, MAX = "%x2w_signed_old_min", "%x2w_signed_old_max"
+MIN, MAX = "%x2w_signed_result_old_min", "%x2w_signed_result_old_max"
 
 # name, (old, new) edit of the lowered module, case, first diverging word
 CONTROLS = (
@@ -45,7 +45,7 @@ CONTROLS = (
 )
 # A guarded access: the branch condition that must precede its issue block.
 GUARDS = {MIN: "%x2w_address_min_target_checked", MAX: "%x2w_address_max_target_checked",
-          "%x2w_signed_loaded": "%x2w_address_load_target_checked",
+          "%x2w_signed_result_loaded": "%x2w_address_load_target_checked",
           "%x2w_signed_store_1": "%x2w_address_output_first_valid",
           "%x2w_signed_store_2": "%x2w_address_output_second_valid",
           "%x2w_signed_store_3": "%x2w_address_output_third_valid"}
@@ -95,6 +95,22 @@ def build(directory, name, assembly):
     return hlsl
 
 
+# The source's entry block, branching into a loop whose header loads through a signed pointer before OpLoopMerge.
+LOOP_HEADER = """OpBranch %header
+%header = OpLabel
+%in_header = OpLoad %int %load_target Aligned 4
+%in_loop = OpSLessThan %bool %in_header %operand
+OpLoopMerge %exit %back None
+OpBranch %body
+%body = OpLabel
+OpBranchConditional %in_loop %exit %back
+%back = OpLabel
+OpBranch %header
+%exit = OpLabel
+OpReturn
+OpFunctionEnd"""
+
+
 def expect_rejection(old, new, message):
     try:
         lower(edit(SOURCE, old, new))
@@ -123,10 +139,26 @@ with tempfile.TemporaryDirectory() as folder:
                              ("a volatile load", ("OpLoad %int %load_target Aligned 4", "OpLoad %int %load_target Volatile")),
                              ("an unaligned store", ("OpStore %output_first %old_min Aligned 4",
                                                      "OpStore %output_first %old_min Aligned 2")),
+                             ("a signed load in a loop header", ("OpReturn\nOpFunctionEnd", LOOP_HEADER)),
                              ("a missing signed array", ("OpDecorate %rt_int ArrayStride 4\n", ""))):
-        expect_rejection(old, new, "unhandled physical word pointer use" if "array" not in name
-                         else "unsupported physical pointer or scalar layout")
+        expect_rejection(old, new, {"a missing signed array": "unsupported physical pointer or scalar layout",
+                                    "a signed load in a loop header": "share a block with OpLoopMerge"}.get(
+                                        name, "unhandled physical word pointer use"))
         print(f"rejected {name}")
+    # Release semantics are legal on the atomic but not on the compare-exchange failure path; a source result named
+    # like a generated store stem must not collide with it.
+    for name, (old, new) in (("acquire-release semantics", ("%c4 = OpConstant %uint 4\n", "%c4 = OpConstant %uint 4\n%c72 = OpConstant %uint 72\n")),
+                             ("a result named like a store", ("%loaded", "%store_1"))):
+        variant = SOURCE.replace(old, new)
+        if name == "acquire-release semantics":
+            variant = variant.replace("%max_target %c1 %c0 %operand", "%max_target %c1 %c72 %operand")
+        path = directory / "variant.spvasm"
+        source.write_text(variant, encoding="utf-8")
+        assemble(source, directory / "variant.spv")
+        path.write_text(lower(variant), encoding="utf-8")
+        assemble(path, directory / "variant.spv")
+        print(f"validated {name}")
+    source.write_text(SOURCE, encoding="utf-8")
     for name, (old, new), _, _ in CONTROLS:
         if not shape_errors(edit(lowered, old, new)):
             sys.exit(f"shape check missed '{name}'")

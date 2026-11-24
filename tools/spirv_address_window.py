@@ -19,6 +19,7 @@ SIGNED_POINTER_TYPES = ("%_ptr_PSB_int = OpTypePointer PhysicalStorageBuffer %in
 SIGNED_ARRAY_DECLARATIONS = ("%int = OpTypeInt 32 1", "%rt_int = OpTypeRuntimeArray %int", "OpDecorate %rt_int ArrayStride 4")
 # A signed DWORD access is a plain load or store of one naturally aligned 32-bit value.
 SIGNED_MEMORY_OPERANDS = ([], ["Aligned", "4"])
+CONSTANT = re.compile(rf"({ID}) = OpConstant %uint (\d+)")
 SIGNED_ATOMICS = {"OpAtomicSMin": "OpSLessThan", "OpAtomicSMax": "OpSGreaterThan"}
 WIDE_ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_ulong ({ID}) ({ID})")
 WIDE_POINTER_TYPE = "%_ptr_PSB_ulong = OpTypePointer PhysicalStorageBuffer %ulong"
@@ -126,7 +127,18 @@ def wide_access(kind, stem, valid, label, word, fields):
     return lines, stem + "_merge"
 
 
-def signed_access(fields, pointers, valid_of, words, label, stem):
+def failure_semantics(name, value):
+    """Return the ID and any new declaration of the compare-exchange failure semantics for an atomic's semantics.
+
+    The failure path may not release, so Release is dropped and AcquireRelease becomes Acquire. The memory-class
+    bits stay."""
+    failure = value & ~0xc | (0x2 if value & 0x8 else 0)
+    if failure == value:
+        return name, []
+    return f"%x2w_failure_{failure}", [f"%x2w_failure_{failure} = OpConstant %uint {failure}"]
+
+
+def signed_access(fields, pointers, valid_of, words, label, stem, failures):
     """Lower a signed DWORD load, store, SMin or SMax into a branch taken only for a valid address.
 
     The heap holds unsigned words, so the value is bit-cast. A signed atomic min or max is a compare-exchange
@@ -162,7 +174,7 @@ def signed_access(fields, pointers, valid_of, words, label, stem):
             f"{stem}_cur_int = OpBitcast %int {stem}_cur",
             f"{stem}_pick = {SIGNED_ATOMICS[fields[2]]} %bool {stem}_cur_int {value}",
             f"{stem}_want = OpSelect %uint {stem}_pick {stem}_cur {stem}_value",
-            f"{stem}_seen = OpAtomicCompareExchange %uint {ptr} {scope} {semantics} {semantics} {stem}_want {stem}_cur",
+            f"{stem}_seen = OpAtomicCompareExchange %uint {ptr} {scope} {semantics} {failures[semantics]} {stem}_want {stem}_cur",
             f"{stem}_done = OpIEqual %bool {stem}_seen {stem}_cur",
             f"OpBranchConditional {stem}_done {stem}_exit {stem}_cont", f"{stem}_cont = OpLabel", f"OpBranch {stem}_head",
             f"{stem}_exit = OpLabel", f"OpBranch {stem}_merge", f"{stem}_merge = OpLabel",
@@ -259,7 +271,23 @@ def lower(assembly):
                          "%x2w_shift_half = OpConstant %uint 32", "%x2w_mask_wide = OpConstant %ulong 7",
                          # The last valid QWORD ends at the same DWORD as the last valid DWORD access.
                          "%x2w_end_wide = OpConstant %ulong 4294967288"]
+    # A guarded access splits its block, which would strand an OpLoopMerge in the generated merge block.
+    loop_headers, start = set(), 0
+    for number, line in enumerate(lines):
+        if line.endswith(" = OpLabel"):
+            start = number
+        elif line.startswith("OpLoopMerge "):
+            loop_headers.update(range(start, number))
+    constants = {m[1]: int(m[2]) for m in map(CONSTANT.fullmatch, lines) if m}
+    failures = {}
     for line in lines:
+        fields = line.split()
+        if len(fields) == 8 and fields[2] in SIGNED_ATOMICS:
+            if fields[6] not in constants:
+                raise ValueError("signed atomic semantics must be a constant")
+            failures[fields[6]], new = failure_semantics(fields[6], constants[fields[6]])
+            declarations.extend(line for line in new if line not in declarations)
+    for number, line in enumerate(lines):
         if line in ('OpExtension "SPV_KHR_physical_storage_buffer"', "OpCapability PhysicalStorageBufferAddresses",
                     "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                     WIDE_POINTER_TYPE, WIDE_ARRAY_POINTER_TYPE, *SIGNED_POINTER_TYPES):
@@ -317,6 +345,8 @@ def lower(assembly):
             label = origin = opened[1]
         ids = set(re.findall(ID, line))
         wide_used = ids & physical_qwords
+        if (wide_used or ids & physical_ints) and number in loop_headers:
+            raise ValueError("a guarded physical access cannot share a block with OpLoopMerge")
         if wide_used:
             fields = line.split()
             wide_load = fields[1:4] == ["=", "OpLoad", "%ulong"] and fields[4:5] and fields[4] in wide_used
@@ -338,8 +368,8 @@ def lower(assembly):
                 raise ValueError("unhandled physical word pointer use")
             fields = line.split()
             signed_stores += fields[0] == "OpStore"
-            stem = "%x2w_signed_" + (fields[0][1:] if fields[0] != "OpStore" else f"store_{signed_stores}")
-            new, label = signed_access(fields, ids & physical_ints, valid_of, signed_words, label, stem)
+            stem = "%x2w_signed_" + (f"result_{fields[0][1:]}" if fields[0] != "OpStore" else f"store_{signed_stores}")
+            new, label = signed_access(fields, ids & physical_ints, valid_of, signed_words, label, stem, failures)
             final_label[origin] = label
             output.extend(new)
             continue
@@ -356,6 +386,8 @@ def lower(assembly):
             if not (reads_word or writes_word or atomic_word) or len(used) != 1:
                 raise ValueError("unhandled physical word pointer use")
         if atomic_word:
+            if number in loop_headers:
+                raise ValueError("a guarded physical access cannot share a block with OpLoopMerge")
             # An address outside the window must not issue an atomic at the substitute index, so the atomic runs
             # only in a branch taken for a valid address; otherwise the result is zero and nothing is written.
             result = fields[0]
