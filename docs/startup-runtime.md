@@ -356,9 +356,12 @@ leaves anything else (end of block, codes longer than 10 bits, invalid symbols a
 bit-at-a-time loop, and gives back the whole bytes it loaded but did not use, so that loop, stored
 blocks and the Adler-32 trailer start at the same bit position as before. The bit-at-a-time build
 has neither this loop nor the 8-byte match copy and the one-memcpy stored block; it copies a byte at
-a time. Its negative control is the probe built with `X2W_INFLATE_FAULTY_MARGIN`,
-which enters the loop one output byte short of the longest match; it writes past a destination in
-the boundary case. No GPU and no game files are needed:
+a time. Three negative controls must each be caught: `X2W_INFLATE_FAULTY_MARGIN` enters the loop
+one output byte short of the longest match and writes past a destination in the boundary case;
+`X2W_INFLATE_FAULTY_INPUT_MARGIN` enters it with 7 input bytes left and reads past an input in the
+random case; `X2W_INFLATE_FAULTY_DISTANCE` drops the loop's distance check and does not reject the
+match that starts before the output when input and capacity are to spare. No GPU and no game files
+are needed:
 
 ```powershell
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V

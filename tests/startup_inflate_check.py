@@ -383,17 +383,27 @@ def expect_faulty_caught(faulty, work, cases, reference):
     print("faulty-table control: %d of %d random cases differ from bit-at-a-time decoding, caught" % (wrong, len(cases)))
 
 
-def expect_margin_caught(faulty, work, cases):
-    # The fast loop entered one output byte short of the longest match: a 258-byte match 257 bytes before
-    # the capacity writes past the destination.
-    got = run_batch(faulty, work, "boundary_margin", cases, overrun=True)
-    assert isinstance(got, str), "the faulty-margin control decoded every boundary case within its destination"
-    print("faulty-margin control: %s, caught" % got)
+def expect_overrun_caught(name, faulty, work, label, cases):
+    # A fast loop entered one output byte short of the longest match writes past a destination when a
+    # 258-byte match starts 257 bytes before the capacity; one entered with 7 input bytes left loads a
+    # byte past the input.
+    got = run_batch(faulty, work, name, cases, overrun=True)
+    assert isinstance(got, str), "the %s control stayed within every input and destination" % name
+    print("%s control: %s in the %s case, caught" % (name, got, label))
 
 
-def main(probe, bitwise, faulty, faulty_margin):
+def expect_distance_caught(faulty, work):
+    # A fast loop without its distance check copies the match that starts before the first output byte.
+    result, _ = run(faulty, work, "faulty_distance", fixed_match_block(b"ABCD", 4, 1, 0) + bytes(32), 4096, "raw")
+    got = result.stdout.strip()
+    assert got != "rejected after 4 bytes", "the faulty-distance control rejected the match before copying"
+    print("faulty-distance control: %s instead of rejected after 4 bytes, caught" % (got or "exit 0x%X" % result.returncode))
+
+
+def main(probe, bitwise, faulty, faulty_margin, faulty_input_margin, faulty_distance):
     probe, bitwise, faulty = Path(probe).resolve(), Path(bitwise).resolve(), Path(faulty).resolve()
-    faulty_margin = Path(faulty_margin).resolve()
+    faulty_margin, faulty_input_margin = Path(faulty_margin).resolve(), Path(faulty_input_margin).resolve()
+    faulty_distance = Path(faulty_distance).resolve()
     rng = random.Random(1149)
     text = corpus(rng, 96 * 1024)
     noise = rng.randbytes(70000)
@@ -443,14 +453,17 @@ def main(probe, bitwise, faulty, faulty_margin):
 
         cases, reference = expect_differential(probe, bitwise, work, rng)
         expect_faulty_caught(faulty, work, cases, reference)
+        expect_overrun_caught("faulty-input-margin", faulty_input_margin, work, "random", cases)
         # Its own seed, so the random case keeps its streams.
         cases, _ = expect_boundaries(probe, bitwise, work, random.Random(1149 + 1))
-        expect_margin_caught(faulty_margin, work, cases)
+        expect_overrun_caught("faulty-margin", faulty_margin, work, "boundary", cases)
+        expect_distance_caught(faulty_distance, work)
     print("inflate.h matches zlib %s in 8 cases and rejects 3 controls" % zlib.ZLIB_RUNTIME_VERSION)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 5:
+    if len(sys.argv) != 7:
         sys.exit("usage: startup_inflate_check.py <startup_inflate_probe.exe> <startup_inflate_probe_bitwise.exe> "
-                 "<startup_inflate_probe_faulty.exe> <startup_inflate_probe_faulty_margin.exe>")
+                 "<startup_inflate_probe_faulty.exe> <startup_inflate_probe_faulty_margin.exe> "
+                 "<startup_inflate_probe_faulty_input_margin.exe> <startup_inflate_probe_faulty_distance.exe>")
     main(*sys.argv[1:])

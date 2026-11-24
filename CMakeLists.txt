@@ -535,11 +535,15 @@ add_executable(startup_inflate_probe_faulty tests/startup_inflate_probe.cpp)
 target_compile_features(startup_inflate_probe_faulty PRIVATE cxx_std_17)
 target_include_directories(startup_inflate_probe_faulty PRIVATE src)
 target_compile_definitions(startup_inflate_probe_faulty PRIVATE X2W_INFLATE_FAULTY_TABLE)
-# A control for the fast loop's output margin: entered one byte short of the longest match.
-add_executable(startup_inflate_probe_faulty_margin tests/startup_inflate_probe.cpp)
-target_compile_features(startup_inflate_probe_faulty_margin PRIVATE cxx_std_17)
-target_include_directories(startup_inflate_probe_faulty_margin PRIVATE src)
-target_compile_definitions(startup_inflate_probe_faulty_margin PRIVATE X2W_INFLATE_FAULTY_MARGIN)
+# Controls for the fast loop: entered one output byte short of the longest match, entered with 7
+# input bytes left, and without its distance check.
+foreach(control IN ITEMS margin input_margin distance)
+    add_executable(startup_inflate_probe_faulty_${control} tests/startup_inflate_probe.cpp)
+    target_compile_features(startup_inflate_probe_faulty_${control} PRIVATE cxx_std_17)
+    target_include_directories(startup_inflate_probe_faulty_${control} PRIVATE src)
+    string(TOUPPER "${control}" control_macro)
+    target_compile_definitions(startup_inflate_probe_faulty_${control} PRIVATE X2W_INFLATE_FAULTY_${control_macro})
+endforeach()
 
 add_executable(startup_dump_fence_check tests/startup_dump_fence.cpp tests/desktop_gpu.cpp)
 add_executable(startup_overlay_window tests/startup_overlay_window.cpp)
@@ -1628,11 +1632,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The stand-in's zlib decoder (src/startup_stubs/inflate.h) against CPython's zlib (#1149): stored,
     # fixed and dynamic blocks, a sync flush, and rejected short, truncated and out-of-window streams;
     # then seeded random streams against the bit-at-a-time build and a faulty-table control, and small
-    # streams at every capacity and truncation against it and a faulty-margin control.
+    # streams at every capacity and truncation against it and three fast-loop controls.
     add_test(NAME startup_inflate COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_inflate_check.py" "$<TARGET_FILE:startup_inflate_probe>"
         "$<TARGET_FILE:startup_inflate_probe_bitwise>" "$<TARGET_FILE:startup_inflate_probe_faulty>"
-        "$<TARGET_FILE:startup_inflate_probe_faulty_margin>")
+        "$<TARGET_FILE:startup_inflate_probe_faulty_margin>" "$<TARGET_FILE:startup_inflate_probe_faulty_input_margin>"
+        "$<TARGET_FILE:startup_inflate_probe_faulty_distance>")
     set_tests_properties(startup_inflate PROPERTIES TIMEOUT 60)
     add_test(NAME startup_live_view COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_live_view_check.py")

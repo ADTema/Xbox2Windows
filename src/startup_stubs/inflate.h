@@ -31,6 +31,11 @@ constexpr std::size_t fast_out_margin = 258;  // the longest match
 #else  // negative control for tests/startup_inflate_check.py: one byte short of the longest match
 constexpr std::size_t fast_out_margin = 257;
 #endif
+#ifndef X2W_INFLATE_FAULTY_INPUT_MARGIN
+constexpr std::size_t fast_in_margin = 8;  // one 8-byte load
+#else  // negative control: the load reads one byte past the input
+constexpr std::size_t fast_in_margin = 7;
+#endif
 
 struct Stream {
     const unsigned char* in;
@@ -160,12 +165,12 @@ inline bool codes(Stream& s, const Huffman& lencode, const Huffman& distcode) no
         // tables decode; anything else (end of block, a longer code, an invalid symbol or distance) is
         // left unconsumed for the careful loop below. On exit the whole bytes pulled in but not consumed
         // go back to in_pos, so bit_count is below 8 again as decode(), stored() and the trailer expect.
-        if (fast_bits > 0 && s.in_size - s.in_pos >= 8 && s.out_size - s.out_pos >= fast_out_margin) {
+        if (fast_bits > 0 && s.in_size - s.in_pos >= fast_in_margin && s.out_size - s.out_pos >= fast_out_margin) {
             constexpr std::uint64_t mask = (std::uint64_t{1} << fast_bits) - 1;
             std::uint64_t buffer = s.bit_buffer;
             int count = s.bit_count;
             std::size_t in_pos = s.in_pos, out_pos = s.out_pos;
-            while (s.in_size - in_pos >= 8 && s.out_size - out_pos >= fast_out_margin) {
+            while (s.in_size - in_pos >= fast_in_margin && s.out_size - out_pos >= fast_out_margin) {
                 std::uint64_t next;
                 std::memcpy(&next, s.in + in_pos, 8);  // little endian: first input bit lowest
                 buffer |= next << count;
@@ -190,7 +195,9 @@ inline bool codes(Stream& s, const Huffman& lencode, const Huffman& distcode) no
                 used += dist_entry & 15;
                 const std::size_t distance = dist_base[symbol] + ((buffer >> used) & ((1u << dist_extra[symbol]) - 1));
                 used += dist_extra[symbol];
+#ifndef X2W_INFLATE_FAULTY_DISTANCE  // negative control: no distance check in this loop
                 if (distance > out_pos) break;
+#endif
                 buffer >>= used;
                 count -= used;
                 copy_match(s.out + out_pos, distance, length);
