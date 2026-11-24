@@ -40,6 +40,28 @@ constexpr WindowCase atomic_cases[] = {
 
 constexpr UINT arena_fill = 0xcba98765u;
 
+// A signed case: base low, operand bits, destination byte address, base high. The shader runs SMin on the DWORD at
+// base + 4, SMax at base + 8 and a plain load at base + 12, then stores the three old values at the destination
+// address and the two DWORDs after it.
+struct SignedCase {
+    const char* name;
+    std::array<UINT, 4> parameters;
+};
+
+constexpr SignedCase signed_cases[] = {
+    {"signed positive operand", {8, 2, 44, 0}},
+    {"signed negative operand", {8, 0xfffffff6u, 44, 0}},
+    {"signed minimum operand", {8, 0x80000000u, 44, 0}},
+    {"signed maximum operand", {8, 0x7fffffffu, 44, 0}},
+    {"signed misaligned base", {9, 2, 44, 0}},
+    {"signed window end", {0xfffffff4u, 2, 44, 0}},
+    {"signed index addition wraps", {0xfffffffcu, 2, 44, 0xffffffffu}},
+    {"signed misaligned write", {8, 2, 45, 0}},
+    {"signed write beyond descriptor", {8, 2, 64, 0}},
+    {"signed write above the window", {8, 2, 0xfffffffcu, 0}},
+    {"signed write straddling the end of the descriptor", {8, 2, 60, 0}},
+};
+
 // A QWORD case: base low, source QWORD index, destination byte address, base high. The shader adds the index
 // scaled by eight to the base, loads a QWORD there, adds one and stores it at the destination address.
 struct QwordCase {
@@ -92,6 +114,38 @@ void apply_dword_case(const WindowCase& test, std::array<UINT, 16>& expected)
     }
     const UINT destination = test.parameters[2];
     if (destination % 4 == 0 && destination < sizeof(expected)) expected[destination / 4] = result;
+}
+
+// Negative words, so that a signed and an unsigned compare choose differently against a small positive operand.
+void init_signed_arena(std::array<UINT, 16>& words)
+{
+    words.fill(arena_fill);
+    words[3] = static_cast<UINT>(-3);
+    words[4] = static_cast<UINT>(-7);
+    words[5] = 0x80000000u;
+}
+
+// Independent CPU model of the signed accesses. An address is used only when it is a multiple of four, below the
+// window end, and the base plus the offset does not wrap. The 64-byte view then returns zero for a read past it and
+// discards a write past it. Every old value is stored, as zero when its address was not used.
+void apply_signed_case(const SignedCase& test, std::array<UINT, 16>& words)
+{
+    const uint64_t base = (static_cast<uint64_t>(test.parameters[3]) << 32) | test.parameters[0];
+    const int32_t operand = static_cast<int32_t>(test.parameters[1]);
+    UINT old[3]{};
+    for (uint64_t k = 0; k < 3; ++k) {
+        const uint64_t address = base + 4 * (k + 1);
+        if (address < base || address % 4 != 0 || address >= 0xfffffffcull || address + 4 > sizeof(words)) continue;
+        UINT& word = words[address / 4];
+        old[k] = word;
+        const int32_t value = static_cast<int32_t>(word);
+        if (k == 0) word = static_cast<UINT>(operand < value ? operand : value);
+        if (k == 1) word = static_cast<UINT>(operand > value ? operand : value);
+    }
+    for (uint64_t k = 0; k < 3; ++k) {
+        const uint64_t address = static_cast<uint64_t>(test.parameters[2]) + 4 * k;
+        if (address % 4 == 0 && address < 0xfffffffcull && address + 4 <= sizeof(words)) words[address / 4] = old[k];
+    }
 }
 
 // Two QWORDs whose halves differ, the first carrying from the low into the high half when one is added.
@@ -223,6 +277,11 @@ void check_spirv_window(ID3D12Device* device, const char* shader_path)
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path)
 {
     check_window_cases(device, shader_path, atomic_cases, init_dword_arena, apply_dword_case);
+}
+
+void check_spirv_window_signed(ID3D12Device* device, const char* shader_path)
+{
+    check_window_cases(device, shader_path, signed_cases, init_signed_arena, apply_signed_case);
 }
 
 void check_spirv_window_qword(ID3D12Device* device, const char* shader_path)
