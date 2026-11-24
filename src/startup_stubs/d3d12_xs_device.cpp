@@ -1076,6 +1076,10 @@ struct DesktopAllocator {
     // A submit whose completion fence could not be created or signalled: the GPU may still run it
     // and nothing would say when it ends, so the allocator is never reset or reused again.
     bool untracked;
+    // A command list recorded on this allocator failed Close(). Do not open another list on it
+    // until it is idle and Reset(); hardware drivers can fault if a second recording starts on
+    // an allocator whose failed recording is still attached.
+    bool close_failed;
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1093,7 +1097,7 @@ TitleAllocator& title_allocator(Wrapper* allocator)
 {
     TitleAllocator& title = title_allocators[allocator];
     if (!title.current) {
-        title.current = new DesktopAllocator{static_cast<ID3D12CommandAllocator*>(allocator->own().real), 0, {}, false};
+        title.current = new DesktopAllocator{static_cast<ID3D12CommandAllocator*>(allocator->own().real), 0, {}, false, false};
         title.pool.push_back(title.current);
     }
     return title;
@@ -1125,7 +1129,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
             ID3D12CommandAllocator* created = nullptr;
             hr = device_of(the_device)->CreateCommandAllocator(title.type, IID_PPV_ARGS(&created));
             if (SUCCEEDED(hr)) {
-                next = new DesktopAllocator{created, 0, {}, false};
+                next = new DesktopAllocator{created, 0, {}, false, false};
                 title.pool.push_back(next);
                 InterlockedIncrement(&allocator_creates);
             }
@@ -1135,6 +1139,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
         hr = next->real->Reset();
         if (SUCCEEDED(hr)) {
             next->submits.clear();
+            next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
             title.current = next;
         }
@@ -1218,21 +1223,48 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     if (a && a->own().kind == allocator_kind && previous) {
         TitleAllocator& title = title_allocator(a);
         const auto type = previous->GetType();
-        if (state.list_close_failed) {
-            ID3D12GraphicsCommandList* replacement = nullptr;
-            hr = device_of(state.list_device)->CreateCommandList(state.list_node_mask, type, title.current->real,
-                                                               nullptr, IID_PPV_ARGS(&replacement));
-            if (SUCCEEDED(hr)) {
-                // Keep the old object through recording cleanup. In-flight GPU work keeps
-                // its allocator and submitted descriptors through the existing fence tracking.
-                replaced.Attach(previous);
-                state.real = replacement;
-                state.list_close_failed = false;
+        DesktopAllocator* target = title.current;
+        if (target->close_failed && title.type == type) {
+            target = nullptr;
+            for (DesktopAllocator* spare : title.pool) {
+                if (spare != title.current && allocator_idle(spare) && SUCCEEDED(spare->real->Reset())) {
+                    spare->submits.clear();
+                    spare->close_failed = false;
+                    target = spare;
+                    break;
+                }
             }
-        } else {
-            hr = previous->Reset(title.current->real, nullptr);
+            if (!target) {
+                ID3D12CommandAllocator* created = nullptr;
+                hr = device_of(state.list_device)->CreateCommandAllocator(type, IID_PPV_ARGS(&created));
+                if (SUCCEEDED(hr)) {
+                    target = new DesktopAllocator{created, 0, {}, false, false};
+                    title.pool.push_back(target);
+                    InterlockedIncrement(&allocator_creates);
+                }
+            }
+        }
+        if (target) {
+            if (state.list_close_failed) {
+                ID3D12GraphicsCommandList* replacement = nullptr;
+                hr = device_of(state.list_device)->CreateCommandList(state.list_node_mask, type, target->real,
+                                                                   nullptr, IID_PPV_ARGS(&replacement));
+                if (SUCCEEDED(hr)) {
+                    // Keep the old object through recording cleanup. In-flight GPU work keeps
+                    // its allocator and submitted descriptors through the existing fence tracking.
+                    replaced.Attach(previous);
+                    state.real = replacement;
+                    state.list_close_failed = false;
+                }
+            } else {
+                hr = previous->Reset(target->real, nullptr);
+            }
         }
         if (SUCCEEDED(hr)) {
+            if (target != title.current) {
+                InterlockedIncrement(&allocator_swaps);
+                title.current = target;
+            }
             title.type = type;
             DesktopAllocator*& on = list_recordings[self];
             if (on) --on->lists;
@@ -1270,6 +1302,10 @@ HRESULT __stdcall list_close(Wrapper* self)
     state.list_open = false;
     state.list_ready = SUCCEEDED(hr);
     state.list_close_failed = FAILED(hr);
+    if (FAILED(hr)) {
+        if (const auto found = list_recordings.find(self); found != list_recordings.end() && found->second)
+            found->second->close_failed = true;
+    }
     ReleaseSRWLockExclusive(&allocator_lock);
     InterlockedIncrement(&render_closes);
     if (FAILED(hr)) {
