@@ -1454,7 +1454,7 @@ class TestRdna2Disasm(unittest.TestCase):
                 self.assertEqual(insns[1]["assembly"], "v_mov_b32_e32 v3, v4")
 
     def test_vop1_vop2_dpp_llvm_round_trip(self):
-        """VOP1/VOP2 DPP8 and DPP16 golden encodings and refusals match LLVM 15."""
+        """Compare accepted DPP encodings and document LLVM 15's different boundary."""
         if not os.environ.get("LLVM_LIB"):
             self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
         resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
@@ -1463,11 +1463,41 @@ class TestRdna2Disasm(unittest.TestCase):
             with self.subTest(llvm_decoded=raw_hex):
                 self.assertEqual(llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib, offsets=True),
                                  [(0, expected), (8, "v_mov_b32_e32 v3, v4")])
+        llvm_dpp_warnings = {
+            "fa020a7e01300100": "wave_shl is not supported starting from GFX10",
+            "fa020a7e01340100": "wave_rol is not supported starting from GFX10",
+            "fa020a7e01380100": "wave_shr is not supported starting from GFX10",
+            "fa020a7e013c0100": "wave_ror is not supported starting from GFX10",
+            "fa020a7e01420100": "row_bcast is not supported starting from GFX10",
+            "fa020a7e01430100": "row_bcast is not supported starting from GFX10",
+            "fa020a7e01000100": "Invalid dpp_ctrl value",
+            "fa020a7e01100100": "Invalid dpp_ctrl value",
+            "fa020a7e01200100": "Invalid dpp_ctrl value",
+        }
+        llvm_other_dpp = {
+            "fa040a02011b4000": "v_cndmask_b32_dpp v5, v1, v2, vcc_lo quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0",
+            "fa040a76011b4000": "v_ldexp_f16_dpp v5, v1, sext(v2) quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0",
+        }
         for raw_hex, _ in self.VOP1_VOP2_DPP_LLVM_REFUSED:
             with self.subTest(llvm_refused=raw_hex):
-                with self.assertRaisesRegex(ValueError, "at byte 0$"):
-                    llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib)
-        assembler, objcopy = resolve_llvm_assembler_tools()
+                raw = bytes.fromhex(raw_hex) + mov
+                if raw_hex == "e982007e0088c6fa":
+                    # LLVM interprets the bytes as a standalone VOP1 and the following export.
+                    self.assertEqual(llvm_disassemble(raw, resolved_lib, offsets=True),
+                                     [(0, "v_clrexcp"), (4, "exp mrt0 off, off, off, off done")])
+                elif raw_hex in llvm_dpp_warnings or raw_hex in llvm_other_dpp:
+                    if raw_hex in llvm_dpp_warnings:
+                        warning = llvm_dpp_warnings[raw_hex]
+                        expected = f"v_mov_b32_dpp v5, v1 /* {warning} */ row_mask:0x0 bank_mask:0x0"
+                    else:
+                        expected = llvm_other_dpp[raw_hex]
+                    self.assertEqual(llvm_disassemble(raw, resolved_lib, offsets=True),
+                                     [(0, expected), (8, "v_mov_b32_e32 v3, v4")])
+                else:
+                    with self.assertRaisesRegex(ValueError, "at byte 0$"):
+                        llvm_disassemble(raw, resolved_lib)
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
         if not assembler or not objcopy:
             self.skipTest("LLVM_MC/LLVM_OBJCOPY environment variables not set; checked decode only")
         source = [asm for _, asm in self.VOP1_VOP2_DPP_DECODED] + ["s_endpgm"]
