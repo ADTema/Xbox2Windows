@@ -1008,10 +1008,12 @@ class Stage:
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair or an inline int."""
         pair = reg_range(tok)
         if pair and pair[2] == pair[1] + 1:
-            if pair[0] == 'v':
+            if pair[0] == 'v' and pair[2] <= 255:
                 return self.u('v%d' % pair[1]), self.u('v%d' % pair[2])
-            return self.u('s%d' % pair[1]), self.u('s%d' % pair[2])
-        if re.fullmatch(r'-?\d+', tok) and -16 <= int(tok) <= 64:
+            if pair[0] == 's' and pair[1] % 2 == 0 and pair[2] <= 105:
+                return self.u('s%d' % pair[1]), self.u('s%d' % pair[2])
+            raise Unsupported('64-bit source %s' % tok)
+        if re.fullmatch(r'0|-?[1-9]\d*', tok) and -16 <= int(tok) <= 64:
             value = int(tok) & 0xffffffffffffffff
             return '%du' % (value & 0xffffffff), '%du' % (value >> 32)
         raise Unsupported('64-bit source %s' % tok)
@@ -1019,13 +1021,21 @@ class Stage:
     def shift64(self, ops, mods, helper):
         if mods:
             raise Unsupported('64-bit shift with %s' % mods)
+        if len(ops) != 3:
+            raise Unsupported('64-bit shift with %d operands, expected 3' % len(ops))
         dst = reg_range(ops[0])
-        if not dst or dst[0] != 'v' or dst[2] != dst[1] + 1:
+        if not dst or dst[0] != 'v' or dst[2] != dst[1] + 1 or dst[2] > 255:
             raise Unsupported('64-bit shift destination %s' % ops[0])
+        sr = reg_range(ops[1])
+        if (sr and (sr[1] != sr[2] or (sr[0] == 'v' and sr[1] > 255) or (sr[0] == 's' and sr[1] > 105))
+                or ops[1] in ('vcc', 'exec') or ops[1] in FLOATS):
+            raise Unsupported('64-bit shift amount %s' % ops[1])
         amount = self.u(ops[1])
         low, high = self.i64_words(ops[2])
         body = '{ uint2 t = %s(%s, %s, %s); v%d = t.x; v%d = t.y; }' % (
             helper, low, high, amount, dst[1], dst[2])
+        self.uniform_v.discard(dst[1])
+        self.uniform_v.discard(dst[2])
         self.used_v.update((dst[1], dst[2]))
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
