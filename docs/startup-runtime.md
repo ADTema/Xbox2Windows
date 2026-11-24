@@ -560,6 +560,13 @@ These are measured on one executable; treat them as hypotheses for others.
   resources (for example the video frame planes) at the same offset in the second. On the console
   the second is a GPU view of the first. Mapping each page's section into both views makes those
   resources readable; without it, a YUV video shows a solid green screen (all-zero planes).
+- **DirectStorage status arrays (#1843).** A new status array's slots are complete with `S_OK`, so
+  `IsComplete` is true and `GetHResult` is `S_OK` for a slot nothing has been enqueued into.
+  `EnqueueStatus` makes its slot pending (`E_PENDING`) until the entries before it have run, and leaves
+  the other slots as they are. This follows Microsoft's Win32 implementation of the API in
+  Xbox-GDK-Samples (MIT), `SimpleDirectStorageCombo/DirectStorageWin32/DirectStorageWin32WrapperStatusArray.cpp`.
+  The `startup_stubs` check covers a fresh array, a slot held pending behind a fence signal while the
+  others stay complete, and that slot's completion.
 - **DirectStorage ordering.** Requests must run after `Submit`, in order with status and fence
   entries. Titles fill destination page-array entries after `EnqueueRequest`, and also replace
   entries filled earlier, so the whole page array is read again when the request runs. The
