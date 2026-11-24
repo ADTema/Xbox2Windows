@@ -2610,6 +2610,11 @@ old pair into the destination. The fixture aliases the destination with
 the data pair and exports all four dwords for one and two groups. Replacing
 the returned pair with the post-update pair must fail the CPU comparison.
 
+The returning min, max and XOR forms also return the old qword. The fixtures
+alias both destination VGPRs with the source pair and compare the returned pair
+and the updated LDS pair separately, using the same signed and unsigned cases
+as the non-returning forms.
+
 ### Paired exchanges and a full-wave LDS counter
 
 The compute profile lowers the returning dword exchange within a 16-byte

@@ -1701,7 +1701,7 @@ LDS_QWORD_UPDATES = {
 }
 
 
-LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in ("ds_add_u64", "ds_sub_u64", "ds_rsub_u64", "ds_and_b64", "ds_or_b64")
+LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in LDS_QWORD_UPDATES
                      for stem, width in [op.rsplit("_", 1)]}
 
 
