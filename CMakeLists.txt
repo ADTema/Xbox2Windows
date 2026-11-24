@@ -1786,6 +1786,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_int_ymm_addsub>"
         "$<TARGET_FILE:cpu_avx_int_ymm_addsub_lifted>")
     set_tests_properties(cpu_aot_avx_int_ymm_addsub PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_avx_int_ymm_minmax_exports
+        "op_vpmaxsb_ymm,op_vpmaxsw_ymm,op_vpmaxsd_ymm,op_vpmaxub_ymm,op_vpmaxuw_ymm,op_vpmaxud_ymm,"
+        "op_vpminsb_ymm,op_vpminsw_ymm,op_vpminsd_ymm,op_vpminub_ymm,op_vpminuw_ymm,op_vpminud_ymm,"
+        "op_vpmaxsd_ymm_dst_src2,op_vpminuw_ymm_dst_src1,op_vpmaxub_ymm_then_xmm_minsb")
+    string(CONCAT cpu_avx_int_ymm_minmax_exports ${cpu_avx_int_ymm_minmax_exports})
+    cpu_asm_fixture(cpu_avx_int_ymm_minmax avx_int_ymm_minmax)
+    cpu_translation(cpu_avx_int_ymm_minmax cpu_avx_int_aot "${cpu_avx_int_ymm_minmax_exports}")
+    add_test(NAME cpu_aot_avx_int_ymm_minmax COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_ymm_minmax_check.py"
+        "$<TARGET_FILE:cpu_avx_int_ymm_minmax>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_minmax_lifted>")
+    set_tests_properties(cpu_aot_avx_int_ymm_minmax PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_avx_move_exports
         "op_andpd_xmm,op_andpd_ymm,op_andps_xmm,op_andps_ymm,op_andnpd_xmm,op_andnpd_ymm,"
         "op_andnps_xmm,op_andnps_ymm,op_orpd_xmm,op_orpd_ymm,op_orps_xmm,op_orps_ymm,"
