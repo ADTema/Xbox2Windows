@@ -29,8 +29,24 @@ OPS = {
 }
 
 
-def program(extended=False, op=None):
-    extended = extended or op is not None
+# One ordered binary32 compare per fixture: it discards the lanes where threshold OP v7
+# holds, v7 being the fractional position. The CPU reference is written with Python
+# operators, the HLSL line is pinned literally, and `{a}` is the register v_fract wrote.
+CMPX = {
+    "v_cmpx_lt_f32_e32": (lambda t, v: t < v, "if (asfloat(second[0].x) < value{a}) discard;"),
+    "v_cmpx_le_f32_e32": (lambda t, v: t <= v, "if (asfloat(second[0].x) <= value{a}) discard;"),
+    "v_cmpx_gt_f32_e32": (lambda t, v: t > v, "if (asfloat(second[0].x) > value{a}) discard;"),
+    "v_cmpx_ge_f32_e32": (lambda t, v: t >= v, "if (asfloat(second[0].x) >= value{a}) discard;"),
+}
+# Odd multiples of 1/64 are exactly the values v7 takes, so each threshold lands on
+# one row's value: that row tells lt from le and gt from ge.
+CMPX_CASES = ((7, 17 / 64), (29, 49 / 64))
+
+
+def program(extended=False, op=None, cmpx=None):
+    # Any named form, including the lt compare, runs the extended (Y-sampling) fixture.
+    extended = extended or op is not None or cmpx is not None
+    cmpx = cmpx or "v_cmpx_lt_f32_e32"
     # Original fixture. The offsets here are instruction addresses in a decoded stream.
     prefix = [
         "s_mov_b32 s7, 0",
@@ -57,7 +73,7 @@ def program(extended=False, op=None):
     if op:
         prefix.append(f"{op} v6, 0.5, v7")
     exits = [
-        f"v_cmpx_lt_f32_e32 s31, {'v6' if op else 'v7'}",
+        f"{cmpx} s31, {'v6' if op else 'v7'}",
         "s_andn2_b64 s[22:23], s[22:23], exec",
         "s_cbranch_scc0 4",
         "s_and_b64 exec, s[24:25], s[22:23]",
@@ -114,9 +130,45 @@ def op_source(op):
     return text
 
 
-def source(extended=False, op=None):
-    extended = extended or op is not None
-    lines = program(extended, op)
+def cmpx_source(name):
+    """Lower one compare, pin its line, then change that one instruction word."""
+    lines = program(cmpx=name)
+    word = lines.index(f"{name} s31, v7")
+
+    def hlsl(form):
+        return "    " + CMPX[form][1].format(a=word - 1)
+
+    def lowered(replacement):
+        changed = decoded_stream(lines)
+        changed[word] = (changed[word][0], replacement)
+        return lower(changed, TABLES)
+
+    text = source(cmpx=name)
+    assert hlsl(name) in text.splitlines()
+    for other in CMPX:
+        if other != name:
+            wrong = lowered(f"{other} s31, v7")
+            assert hlsl(other) in wrong.splitlines() and hlsl(name) not in wrong, other
+    for bad in (
+        name.replace("_lt_", "_nlt_").replace("_le_", "_nle_").replace("_gt_", "_ngt_").replace("_ge_", "_nge_") + " s31, v7",  # true for NaN
+        name.replace("_f32_", "_f16_") + " s31, v7",  # other width
+        name.replace("_f32_", "_i32_") + " s31, v7",  # integer compare
+        name.replace("_e32", "_e64") + " s31, v7",  # other encoding
+        f"{name} s31, v9",  # vsrc1 was never written
+        f"{name} s31, s30",  # vsrc1 is a VGPR in every e32 form
+        f"{name} s31",  # missing operand
+    ):
+        try:
+            lowered(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"Invalid compare accepted: {bad}")
+    return text
+
+
+def source(extended=False, op=None, cmpx=None):
+    extended = extended or op is not None or cmpx is not None
+    lines = program(extended, op, cmpx)
     decoded = decoded_stream(lines)
     offsets = [pc for pc, _ in decoded]
     tables = TABLES
@@ -203,6 +255,17 @@ def op_picture(op, seed, threshold):
     return bytes(values)
 
 
+def cmpx_picture(name, seed, threshold):
+    """Independent CPU reference for the compare fixtures: survivors keep depth 0.75."""
+    function = CMPX[name][0]
+    values = bytearray()
+    for row in range(32):
+        v7 = ((row + 0.5 + ((seed + 12) & 31)) % 32) / 32
+        depth = 0.9375 if function(threshold, v7) else 0.75
+        values += struct.pack("<f", depth) * 32
+    return bytes(values)
+
+
 def run_depth_mask(renderer, adapter, tmp, vs, ps, seed, threshold, reference):
     a, b = bytearray(2048), bytearray(2048)
     struct.pack_into("<I", a, 0x18, seed)
@@ -219,19 +282,30 @@ def run_depth_mask(renderer, adapter, tmp, vs, ps, seed, threshold, reference):
 def draw_ops(dxc, renderer, adapter, tmp):
     """Each binary32 form against its CPU reference, then against every other form's."""
     cases = ((7, 0.25), (29, 0.75))
-    pictures = {op: [op_picture(op, *case) for case in cases] for op in OPS}
-    # Every form must be visible: no other form may leave the same two pictures.
+    return draw_forms(dxc, renderer, adapter, tmp, OPS, op_picture, op_source, cases)
+
+
+def draw_cmpx(dxc, renderer, adapter, tmp):
+    """Each ordered compare against its CPU reference, then against every other's."""
+    return draw_forms(
+        dxc, renderer, adapter, tmp, CMPX, cmpx_picture, cmpx_source, CMPX_CASES
+    )
+
+
+def draw_forms(dxc, renderer, adapter, tmp, forms, picture, lowered, cases):
+    pictures = {op: [picture(op, *case) for case in cases] for op in forms}
+    # Every form must be visible: no other form may leave the same pictures.
     for op, shown in pictures.items():
-        assert all(shown != pictures[other] for other in OPS if other != op), op
-    for op in OPS:
-        vs, ps = compile_pair(dxc, tmp, op_source(op))
+        assert all(shown != pictures[other] for other in forms if other != op), op
+    for op in forms:
+        vs, ps = compile_pair(dxc, tmp, lowered(op))
         for (seed, threshold), reference in zip(cases, pictures[op]):
             result = run_depth_mask(renderer, adapter, tmp, vs, ps, seed, threshold, reference)
             if result.returncode == 77:
                 return 77
             result.check_returncode()
         # A reference from another form must fail with exactly the pixels where they differ.
-        for other in OPS:
+        for other in forms:
             if other == op:
                 continue
             for (seed, threshold), right, wrong in zip(
@@ -316,6 +390,8 @@ def binary(tmp, assembler, objcopy, library):
     translate(tmp, assembler, objcopy, library, program(), source())
     for op in OPS:
         translate(tmp, assembler, objcopy, library, program(op=op), op_source(op))
+    for name in CMPX:
+        translate(tmp, assembler, objcopy, library, program(cmpx=name), cmpx_source(name))
 
 
 def translate(tmp, assembler, objcopy, library, lines, expected):
@@ -380,6 +456,8 @@ if __name__ == "__main__":
             sys.exit(0)
         if sys.argv[1] == "ops":
             sys.exit(draw_ops(*sys.argv[2:], Path(directory)))
+        if sys.argv[1] == "cmpx":
+            sys.exit(draw_cmpx(*sys.argv[2:], Path(directory)))
         draw_args = (*sys.argv[1:], Path(directory))
         result = draw(*draw_args, source(), 4, lambda x, y, seed: ((x + seed) / 8) % 1)
         if result:
