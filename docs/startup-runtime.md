@@ -167,8 +167,9 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 (`src/startup_stubs/inflate.h`) through the source-built `tests/startup_inflate_probe.cpp`. CPython's
 zlib encodes seeded synthetic data as stored, fixed and dynamic Huffman blocks, with matches up to
 the 32 KiB window and a sync flush between blocks; each result must equal the input. A stream with
-one byte too little capacity, a truncated stream and a match that starts before the output must be
-rejected without writes outside the destination. No GPU and no game files are needed:
+one byte too little capacity and a truncated stream must be rejected without writes past the
+destination. On bare deflate data, a match that starts at the first output byte decodes and one that
+starts a byte earlier is rejected before it copies anything. No GPU and no game files are needed:
 
 ```powershell
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V

@@ -6,10 +6,12 @@ This check decodes streams that CPython's zlib encodes from seeded synthetic dat
 fixed and dynamic Huffman blocks (including a sparse alphabet whose block header needs all three
 code-length repeat codes), back-references across the 32 KiB window and a sync flush between
 blocks. Each decoded result must equal the input. The controls are streams the decoder must reject
-without writing outside the destination: one byte too little capacity, a truncated stream, and a
-hand-built fixed block whose first match reaches before the start of the output (the same block
-with distance 1 decodes). tests/startup_inflate_probe.cpp runs the decoder; no GPU and no game
-files are involved.
+without writing past the destination: one byte too little capacity and a truncated stream.
+
+The distance bound is checked on bare deflate data, so neither the zlib header nor the Adler-32
+check can reject it: after four literals, a match at distance 4 decodes and the same block with
+distance 5 is rejected before the match copies anything. tests/startup_inflate_probe.cpp runs the
+decoder; no GPU and no game files are involved.
 """
 from pathlib import Path
 import random
@@ -39,8 +41,8 @@ def compress(data, level=9, strategy=zlib.Z_DEFAULT_STRATEGY):
     return encoder.compress(data) + encoder.flush()
 
 
-def first_block_type(stream):
-    return (stream[2] >> 1) & 3
+def first_block_type(stream, mode="zlib"):
+    return (stream[2 if mode == "zlib" else 0] >> 1) & 3
 
 
 class Bits:
@@ -70,44 +72,61 @@ def words(rng, size):
     return bytes(out[:size])
 
 
-def fixed_match_stream(distance_code, checksum_of):
-    # zlib header, one final fixed block: literal "A", a length-3 match, end of block.
+def fixed_match_block(literals, distance_code, extra_bits, extra_value):
+    # Bare deflate data, one final fixed block: the literals, a length-3 match, end of block.
     bits = Bits()
     bits.put(1, 1)
     bits.put(1, 2)
-    bits.code(0x30 + ord("A"), 8)
+    for literal in literals:
+        bits.code(0x30 + literal, 8)
     bits.code(257 - 256, 7)
     bits.code(distance_code, 5)
+    bits.put(extra_value, extra_bits)
     bits.code(256 - 256, 7)
-    return b"\x78\x01" + bits.to_bytes() + zlib.adler32(checksum_of).to_bytes(4, "big")
+    return bits.to_bytes()
 
 
-def run(probe, work, name, stream, capacity):
-    source, output = work / (name + ".zlib"), work / (name + ".out")
+def reference(stream, mode):
+    return zlib.decompress(stream, 15 if mode == "zlib" else -15)
+
+
+def reference_rejects(stream, mode="zlib"):
+    try:
+        reference(stream, mode)
+    except zlib.error:
+        return True
+    return False
+
+
+def run(probe, work, name, stream, capacity, mode):
+    source, output = work / (name + "." + mode), work / (name + ".out")
     source.write_bytes(stream)
-    result = subprocess.run([str(probe), str(source), str(capacity), str(output)],
+    result = subprocess.run([str(probe), mode, str(source), str(capacity), str(output)],
                             capture_output=True, text=True, timeout=60)
     return result, output
 
 
-def expect_decoded(probe, work, name, stream, data, capacity=None):
-    assert zlib.decompress(stream) == data, name + ": the reference decoder disagrees with the input"
+def expect_decoded(probe, work, name, stream, data, capacity=None, mode="zlib"):
+    assert reference(stream, mode) == data, name + ": the reference decoder disagrees with the input"
     capacity = len(data) if capacity is None else capacity
-    result, output = run(probe, work, name, stream, capacity)
+    result, output = run(probe, work, name, stream, capacity, mode)
     assert result.returncode == 0, "%s: exit %d: %s%s" % (name, result.returncode, result.stdout, result.stderr)
     assert result.stdout.strip() == "inflated %d" % len(data), "%s: %s" % (name, result.stdout.strip())
     decoded = output.read_bytes()
     if decoded != data:
         first = next((i for i, (a, b) in enumerate(zip(decoded, data)) if a != b), min(len(decoded), len(data)))
         raise AssertionError("%s: first mismatch at byte %d of %d" % (name, first, len(data)))
-    print("%-22s block %d, %6d -> %6d bytes, decoded" % (name, first_block_type(stream), len(stream), len(data)))
+    print("%-22s block %d, %6d -> %6d bytes, decoded" % (name, first_block_type(stream, mode), len(stream), len(data)))
 
 
-def expect_rejected(probe, work, name, stream, capacity):
-    result, _ = run(probe, work, name, stream, capacity)
-    assert result.returncode == 1 and result.stdout.strip() == "rejected", \
+def expect_rejected(probe, work, name, stream, capacity, mode="zlib", decoded_before=None, invalid=True):
+    # invalid: the stream itself is damaged, so the reference decoder must reject it too.
+    assert not invalid or reference_rejects(stream, mode), name + ": the reference decoder accepted the stream"
+    result, _ = run(probe, work, name, stream, capacity, mode)
+    want = "rejected" if decoded_before is None else "rejected after %d bytes" % decoded_before
+    assert result.returncode == 1 and result.stdout.strip() == want, \
         "%s: exit %d: %s%s" % (name, result.returncode, result.stdout, result.stderr)
-    print("%-22s %6d bytes, capacity %6d, rejected" % (name, len(stream), capacity))
+    print("%-22s %6d bytes, capacity %6d, %s" % (name, len(stream), capacity, want))
 
 
 def main(probe):
@@ -145,29 +164,16 @@ def main(probe):
         expect_decoded(probe, work, "sync_flush", flushed, head + tail)
 
         expect_decoded(probe, work, "empty", zlib.compress(b""), b"")
-        near = fixed_match_stream(0, b"AAAA")
-        expect_decoded(probe, work, "fixed_distance_1", near, b"AAAA")
 
         # Controls: streams that do not fit or cannot be decoded are rejected.
-        expect_rejected(probe, work, "dynamic_short_capacity", dynamic, len(text) - 1)
-        truncated = dynamic[:len(dynamic) // 2]
-        try:
-            zlib.decompress(truncated)
-        except zlib.error:
-            pass
-        else:
-            raise AssertionError("the reference decoder accepted the truncated stream")
-        expect_rejected(probe, work, "dynamic_truncated", truncated, len(text))
-        # The probe's guard before the destination holds 0xA5. The checksum matches what a decoder that
-        # copied from there would produce, so only the distance check can reject this stream.
-        far = fixed_match_stream(1, b"A\xa5A\xa5")
-        try:
-            zlib.decompress(far)
-        except zlib.error:
-            pass
-        else:
-            raise AssertionError("the reference decoder accepted a match before the output start")
-        expect_rejected(probe, work, "fixed_distance_2", far, 4)
+        expect_rejected(probe, work, "dynamic_short_capacity", dynamic, len(text) - 1, invalid=False)
+        expect_rejected(probe, work, "dynamic_truncated", dynamic[:len(dynamic) // 2], len(text))
+
+        # The distance bound, on bare deflate data with room to spare: after "ABCD", distance 4 (code 3)
+        # starts the match at the first output byte; distance 5 (code 4, extra bit 0) starts it one byte
+        # before the output and must be rejected with only the four literals decoded.
+        expect_decoded(probe, work, "raw_distance_4", fixed_match_block(b"ABCD", 3, 0, 0), b"ABCDABC", 64, "raw")
+        expect_rejected(probe, work, "raw_distance_5", fixed_match_block(b"ABCD", 4, 1, 0), 64, "raw", 4)
     print("inflate.h matches zlib %s in 8 cases and rejects 3 controls" % zlib.ZLIB_RUNTIME_VERSION)
 
 
