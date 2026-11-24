@@ -8822,7 +8822,7 @@ def check_dpp_f16_draw(directory, compiler, renderer, backend):
     return 0
 
 
-# Quad-local DPP16 and DPP8 integer/bitwise/shift/bit-scan fixture covering 23 VOP1/VOP2 DPP forms.
+# Quad-local DPP16 and DPP8 integer/bitwise/shift/bit-scan/saturate fixture covering 24 VOP1/VOP2 DPP forms.
 # Derives integer quad lane ID {0, 1, 2, 3} from interpolated uv.x/uv.y (v8/v9), verifies quad
 # swizzles across lanes, folds all 23 ops into a 32-bit accumulator, and exports all 4 bytes as
 # exact [0, 255] integers.
@@ -8868,6 +8868,8 @@ DPP_INT32_BODY = [
     "v_ffbl_b32_dpp v43, v27 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
     "v_ffbh_u32_dpp v44, v27 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
     "v_ffbh_i32_dpp v45, v25 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_sat_pk_u8_i16_dpp v54, v25 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_sat_pk_u8_i16_dpp v55, v26 dpp8:[1,0,3,2,5,4,7,6]",
     "v_add_nc_u32_dpp v30, v21, v22 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
     "v_add_nc_u32_dpp v30, v30, v23 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
     "v_add_nc_u32_dpp v30, v30, v24 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
@@ -8884,6 +8886,8 @@ DPP_INT32_BODY = [
     "v_xor_b32_dpp v30, v30, v43 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
     "v_add_nc_u32_dpp v30, v30, v44 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
     "v_xor_b32_dpp v30, v30, v45 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v54 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v55 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
     "v_mov_b32_e32 v46, 0xff",
     "v_mov_b32_e32 v47, 8",
     "v_mov_b32_e32 v48, 16",
@@ -8958,6 +8962,14 @@ def dpp_int32_reference(a, b, c, shift):
     v44 = ffbh_u(c)
     v45 = ffbh_i(a)
 
+    def sat_pk_u8_i16(x):
+        lo, hi = x & 0xffff, (x >> 16) & 0xffff
+        lo, hi = (v - 0x10000 if v & 0x8000 else v for v in (lo, hi))
+        return min(max(lo, 0), 255) | (min(max(hi, 0), 255) << 8)
+
+    v54 = sat_pk_u8_i16(a)
+    v55 = sat_pk_u8_i16(b)
+
     acc = (v21 + v22 + v23 + v24) & m32
     acc = (acc ^ v33) & m32
     acc = (acc + v34) & m32
@@ -8972,6 +8984,8 @@ def dpp_int32_reference(a, b, c, shift):
     acc = (acc ^ v43) & m32
     acc = (acc + v44) & m32
     acc = (acc ^ v45) & m32
+    acc = (acc + v54) & m32
+    acc = (acc ^ v55) & m32
     return tuple(float((acc >> (8 * k)) & 0xff) for k in range(4))
 
 
@@ -9089,6 +9103,7 @@ def check_dpp_int32_draw(directory, compiler, renderer, backend):
         (0, "v_ashrrev_i32_dpp v41, v28, v25", "v_lshrrev_b32_dpp v41, v28, v25", "ashrrev vs lshrrev"),
         (0, "v_mul_hi_i32_i24_dpp v35", "v_mul_hi_u32_u24_dpp v35", "mul_hi signed vs unsigned"),
         (0, "v_ffbh_i32_dpp v45, v25", "v_ffbh_u32_dpp v45, v25", "ffbh signed vs unsigned"),
+        (0, "v_sat_pk_u8_i16_dpp v54, v25", "v_sat_pk_u8_i16_dpp v54, v26", "saturate the wrong source"),
     ):
         mutated = [line.replace(old, new) for line in program]
         assert mutated != program, label
