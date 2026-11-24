@@ -10272,6 +10272,23 @@ def check_masked_else_controls():
                        "Read of a register defined only on the masked path")
     translate(uncompressed_export([*save, "s_mov_b32 s62, s45", "v_mov_b32_e32 v13, s45", transition,
                                    "v_mov_b32_e32 v14, s62", restore]))
+    # A wait in a then arm the wave may skip does not resolve loads for the else arm: the descriptor loaded
+    # before the region is still outstanding there unless the else arm waits too (review of #1371).
+    def waited(then_skip, else_wait):
+        lines = uncompressed_export([
+            "s_load_dwordx4 s[68:71], s[20:21], 0x40", *save, *(["s_cbranch_execz 0"] if then_skip else []),
+            "s_waitcnt lgkmcnt(0)", "v_mov_b32_e32 v13, s45", transition,
+            *(["s_waitcnt lgkmcnt(0)"] if else_wait else []),
+            "s_buffer_load_dword s72, s[68:71], 0x20", "s_waitcnt lgkmcnt(0)", "v_mov_b32_e32 v14, s72", restore])
+        pairs = offset_pairs(lines)
+        for j, (offset, line) in enumerate(pairs):
+            if line == "s_cbranch_execz 0":
+                destination = next(o for o, text in pairs if text == transition)
+                pairs[j] = (offset, f"s_cbranch_execz {(destination - offset - 4) // 4}")
+        return pairs
+    translate(waited(False, False))
+    expect_value_error(translate, waited(True, False), "Unresolved constant buffer binding")
+    translate(waited(True, True))
     # Memory and side effects stay refused in the else arm.
     for extra in ("image_sample v[16:19], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
                   "exp mrt0 v12, v13, v14, v15 done vm", "v_readfirstlane_b32 s62, v12"):

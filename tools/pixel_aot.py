@@ -3213,8 +3213,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 else:
                     vector[dst] = outer
             if region["skip"] is not None:
-                # A wave that skipped the then arm did not run its scalar writes before the else arm.
+                # A wave that skipped the then arm did not run its scalar writes or its waits before the else arm:
+                # what was outstanding at the opener may still be outstanding here.
                 scalar.conditional.update(region["scalar_written"])
+                before_pending, before_samples = region["outstanding"]
+                pending.update(before_pending)
+                sample_dest.update(before_samples)
             region["skip"] = None
             region["else"] = region["arm_start"] = i
             scc = None
