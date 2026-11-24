@@ -47,9 +47,14 @@ IMAGE = {
     'gather': 'image_gather4_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
     'cube': 'image_sample_l v[4:7], v[0:3], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_CUBE',
     'a16': 'image_sample_l v[4:7], v[0:1], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D a16',
+    'tfe': 'image_sample_l v[4:5], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D tfe',
     'unorm': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D unorm',
 }
 WORDS = {
+    'tfe': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf080191f00004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
     'a16': bytes.fromhex(
         '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
         '0000803ef202047ef402067e7fc08cbf080f90f00004c440703f8cbf0f1800f8'
@@ -140,8 +145,9 @@ def controls():
     refused('gather', 'image_gather4_l')
     refused('cube', 'image dimension SQ_RSRC_IMG_CUBE')
     refused('unorm', 'image_sample_l modifier unorm')
+    refused('tfe', 'image_sample_l modifier tfe')  # the extra status register is not modelled
     refused('a16', 'image_sample_l modifier a16')  # packed 16-bit address: v[0:1] holds u, v and the level as halves
-    print('refused: offset, compare, gather, cube, unorm, a16')
+    print('refused: offset, compare, gather, cube, unorm, a16, tfe')
 
 
 def check_binary(llvm_mc):
