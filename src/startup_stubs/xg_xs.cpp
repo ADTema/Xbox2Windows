@@ -22,7 +22,7 @@
 // standard 4 KiB tiled geometry for layout queries.
 namespace {
 using u64 = std::uint64_t;
-using x2w_startup::Bc7Surface;
+using x2w_startup::Bc16Surface;
 
 bool permissive() noexcept { return x2w_local::env_on("X2W_D3D12_PERMISSIVE"); }
 
@@ -88,22 +88,22 @@ void put32(unsigned char* at, std::uint32_t value) { std::memcpy(at, &value, siz
 
 void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layout)
 {
-    const Bc7Surface surface(desc);
+    const Bc16Surface surface(desc);
     const u64 bytes = surface.size();
 
     put64(layout + 0x00, bytes);
-    put64(layout + 0x08, Bc7Surface::tile_bytes);
+    put64(layout + 0x08, Bc16Surface::tile_bytes);
     put32(layout + 0x10, 1);
     put32(layout + 0x14, 1);
     auto* plane = layout + layout_header;
     put64(plane + 0x08, bytes);
-    put64(plane + 0x18, Bc7Surface::tile_bytes);
+    put64(plane + 0x18, Bc16Surface::tile_bytes);
     auto* mip = plane + mip_base;
     put64(mip + 0x00, bytes);
     put64(mip + 0x10, bytes);
     put32(mip + 0x18, surface.padded_width());
     put32(mip + 0x1c, surface.padded_row_bytes());
-    put32(mip + 0x20, Bc7Surface::tile_bytes);
+    put32(mip + 0x20, Bc16Surface::tile_bytes);
     put32(mip + 0x24, surface.padded_width());
     put32(mip + 0x28, surface.padded_height());
     put32(mip + 0x2c, 1);
@@ -116,8 +116,8 @@ void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layou
 HRESULT copy_bc7_4k_s(const D3D12_RESOURCE_DESC& desc, unsigned char* dest, const unsigned char* source,
                      UINT row_pitch, UINT slice_pitch)
 {
-    const Bc7Surface surface(desc);
-    const UINT row_bytes = surface.columns * Bc7Surface::block_bytes;
+    const Bc16Surface surface(desc);
+    const UINT row_bytes = surface.columns * Bc16Surface::block_bytes;
     const u64 source_bytes = u64{surface.rows - 1} * row_pitch + row_bytes;
     if (!dest || !source || row_pitch < row_bytes || (slice_pitch && slice_pitch < source_bytes))
         return E_INVALIDARG;
@@ -133,7 +133,7 @@ HRESULT copy_bc7_4k_s(const D3D12_RESOURCE_DESC& desc, unsigned char* dest, cons
     for (UINT y = 0; y < surface.rows; ++y) {
         const auto* row = source + u64{y} * row_pitch;
         for (UINT x = 0; x < surface.columns; ++x)
-            std::memcpy(dest + surface.block_offset(x, y), row + x * Bc7Surface::block_bytes, Bc7Surface::block_bytes);
+            std::memcpy(dest + surface.block_offset(x, y), row + x * Bc16Surface::block_bytes, Bc16Surface::block_bytes);
     }
     return S_OK;
 }

@@ -75,6 +75,7 @@ struct WrapperOwn {
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
+    bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     void* pass;       // CommandList (render mode): recording state (Pass)
     std::uint64_t pad;  // keeps the size a multiple of 16: the title uses aligned loads on objects
@@ -1584,6 +1585,7 @@ struct TextureWrite {
     UINT bc7_width = 0, bc7_height = 0;
 };
 std::unordered_map<u64, TextureWrite>& written_textures();
+ID3D12Resource* sampled_address_texture(Wrapper* resource);
 #include "startup_stubs/d3d12_draw.inl"
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
@@ -2120,10 +2122,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         // stands in, not aliased with the title address. The clear value is dropped if refused.
         D3D12_RESOURCE_DESC texture = sanitized(*desc);
         if (x2w_startup::supports_bc7_4k_s(*desc) && x2w_local::env_on("X2W_XG_BC7_4K_S_LAYOUT")) {
-            const x2w_startup::Bc7Surface surface(*desc);
+            const x2w_startup::Bc16Surface surface(*desc);
             // Desktop BC7 allocations require whole blocks at the top mip.
-            texture.Width = surface.columns * x2w_startup::Bc7Surface::block_texels;
-            texture.Height = surface.rows * x2w_startup::Bc7Surface::block_texels;
+            texture.Width = surface.columns * x2w_startup::Bc16Surface::block_texels;
+            texture.Height = surface.rows * x2w_startup::Bc16Surface::block_texels;
         }
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
         const auto* clear_value = static_cast<const D3D12_CLEAR_VALUE*>(clear);

@@ -8351,3 +8351,33 @@ interior, and mismatched addresses after a successful publication.
 cmake --build --preset release --target startup_stream_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^startup_address_srv_' -V
 ```
+
+### Sample address-only BC3/BC7 textures in translated draws
+
+The translated draw path can sample a read-only BC3_UNORM or BC7_UNORM SRV
+published through device slot 70 without a prior resource object. The tested
+layout is 0x105, 4 KiB standard non-XOR. Width and height must be multiples of
+64 texels, with one mip, one slice, and one sample. Each tile holds 16 by 16
+compressed blocks. The runtime copies the 16-byte blocks to their desktop
+footprint rows before uploading them. Ordinary placed R8 views and the XG
+BC7 layout probe retain their existing behavior.
+
+Keep the complete tiled guest allocation readable for the view's sampling
+lifetime. The producer stores the view identity in the title heap. The
+translated sampler materializes a desktop texture on first use and copies
+changed bytes on subsequent binds. A same-address republication invalidates
+the cached upload. Direct use of the persistent desktop heap by untracked
+commands is outside this profile.
+
+Each source-built test draws four complete 128 by 128 panels per format from
+four 4 KiB tiles. The second address exchanges neighboring tiles. A zero
+address must retain that view, and publishing the first address again must
+restore the first image. On Windows 11 26200.9974 with the debug layer off,
+RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818) each matched
+65,536 RGBA pixels per format. The swapped-tile control changed 16,384
+of 16,384 pixels for BC3 and 15,360 for BC7.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer startup_stub_consumer d3d12_xs_shim
+ctest --preset release --no-tests=error --output-on-failure -R '^(startup_address_(bc_view|srv)_(hardware|warp)|startup_xg_bc7_layout|bc7_tile_swizzle)$'
+```

@@ -2,6 +2,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <vector>
 
 using Word = std::uint64_t;
@@ -14,6 +16,20 @@ struct ViewAt {
     Word tail[2];
 };
 static_assert(offsetof(ViewAt, address) == 0x28 && sizeof(ViewAt) == 0x40);
+
+bool bind_view_table(void* guest, void* list, Word& cpu)
+{
+    struct Extended {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word address, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    void* heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&heap))))) return false;
+    cpu = invoke(heap, 9);
+    invoke(list, 32, 1, ptr(&heap));
+    invoke(list, 36, 0, invoke(heap, 10));
+    return true;
+}
 }
 
 // Two separately placed R8 planes have the same descriptor and different row
@@ -37,16 +53,8 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
         if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(planes[i].data()), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
                                                0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[i]))))) return 41;
     }
-    struct Extended {
-        D3D12_DESCRIPTOR_HEAP_DESC desc;
-        Word address, bytes;
-    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
-    void* heap = nullptr;
-    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&heap))))) return 42;
-    const Word cpu = invoke(heap, 9);
-    const Word gpu = invoke(heap, 10);
-    invoke(list, 32, 1, ptr(&heap));
-    invoke(list, 36, 0, gpu);
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
     ViewAt v{};
     v.view.Format = DXGI_FORMAT_R8_UNORM;
     v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -72,5 +80,38 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     publish(wrong_desc, ptr(planes[0].data())); draw(5);
     publish(desc, ptr(planes[0].data()) + 1); draw(6); // Interior address, not the registered base.
     publish(desc, ptr(planes[0].data())); draw(7);
+    return 0;
+}
+
+int draw_bc_address_srvs(void* guest, void* list)
+{
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return 43;
+    const bool bc3 = GetEnvironmentVariableW(L"X2W_TEST_BC3", nullptr, 0) != 0;
+    constexpr UINT tile = 4096, width = 128, height = 128;
+    alignas(4096) static std::array<std::array<char, 4 * tile>, 2> backing{};
+    std::ifstream input(path, std::ios::binary);
+    if (!input.read(backing[0].data(), 4 * tile) || input.peek() != std::char_traits<char>::eof()) return 43;
+    for (UINT i = 0; i < 4; ++i)
+        std::memcpy(backing[1].data() + i * tile, backing[0].data() + (i ^ 1) * tile, tile);
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
+        bc3 ? DXGI_FORMAT_BC3_UNORM : DXGI_FORMAT_BC7_UNORM, {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(0x105),
+        bc3 ? D3D12_RESOURCE_FLAG_NONE : static_cast<D3D12_RESOURCE_FLAGS>(0x300000)};
+    ViewAt v{};
+    v.view.Format = desc.Format;
+    v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.view.Texture2D.MipLevels = 1;
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    const Word addresses[] = {ptr(backing[0].data()), ptr(backing[1].data()), 0, ptr(backing[0].data())};
+    for (LONG i = 0; i < 4; ++i) {
+        v.address = addresses[i];
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        const D3D12_RECT region{i * LONG(width), 0, (i + 1) * LONG(width), LONG(height)};
+        invoke(list, 22, 1, ptr(&region));
+        invoke(list, 12, 3, 1);
+    }
     return 0;
 }

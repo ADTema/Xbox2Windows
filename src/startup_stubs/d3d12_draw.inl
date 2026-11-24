@@ -449,7 +449,7 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, bool have, u64 offset, std::s
 struct TextureUpload {
     u64 hash = 0, generation = ~0ull;
     LONG checked_frame = -1000;
-    bool done = false, tiled_bc7 = false;
+    bool done = false, tiled = false;
 };
 std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
 LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
@@ -492,21 +492,27 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end())
         written = found->second;
     ReleaseSRWLockShared(&written_lock);
-    const bool tiled_bc7 = written.bc7_width != 0;
+    const bool tiled_address = resource->own().tiled_address_srv;
+    const bool tiled_bc7 = !tiled_address && written.bc7_width != 0;
+    const bool tiled = tiled_bc7 || tiled_address;
     const auto generation = written.generation;
-    const x2w_startup::Bc7Surface bc7(written.bc7_width, written.bc7_height);
+    const x2w_startup::Bc16Surface surface(tiled_bc7 ? written.bc7_width : static_cast<UINT>(desc.Width),
+                                         tiled_bc7 ? written.bc7_height : desc.Height);
     if (tiled_bc7) {
         const auto* original = resource_info(resource);
         if (!original || !x2w_startup::supports_bc7_4k_s(original->console) ||
             original->console.Width != written.bc7_width || original->console.Height != written.bc7_height ||
-            desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != bc7.columns * bc7.block_texels ||
-            desc.Height != bc7.rows * bc7.block_texels || plan.count != 1 ||
-            plan.rows[0] != bc7.rows || plan.row_bytes[0] != u64{bc7.columns} * bc7.block_bytes) return;
+            desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != surface.columns * surface.block_texels ||
+            desc.Height != surface.rows * surface.block_texels) return;
     }
-    const u64 total = tiled_bc7 ? bc7.size() : stride * (slices - 1) + slice_total;
+    if (tiled && (plan.count != 1 || plan.rows[0] != surface.rows ||
+                  plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return;
+    const u64 total = tiled ? surface.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
-    if (state.done && !announced && !x2w_startup::recheck_cpu_texture(desc, total, elapsed)) return;
+    const bool recheck = tiled_address ? elapsed != 0
+        : x2w_startup::recheck_cpu_texture(desc, total, elapsed);
+    if (state.done && !announced && !recheck) return;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
         state.done = true;
@@ -515,12 +521,12 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     state.checked_frame = frame_number;
     const u64 hash = hash_memory(memory, static_cast<std::size_t>(total));
-    if (state.done && hash == state.hash && state.tiled_bc7 == tiled_bc7) {
+    if (state.done && hash == state.hash && state.tiled == tiled) {
         state.generation = generation;
         return;
     }
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (tiled_bc7) {
+    if (tiled) {
         u64 offset = 0;
         const auto bytes = plan.bytes(0);
         auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
@@ -529,7 +535,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             return;
         }
         std::memset(rows, 0, static_cast<std::size_t>(bytes));
-        bc7.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
+        surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
         plan.upload(list, texture, upload_ring, 1, 1, 0, 0, offset);
     } else {
         for (UINT s = 0; s < slices; ++s)
@@ -546,7 +552,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     state.hash = hash;
     state.generation = generation;
-    state.tiled_bc7 = tiled_bc7;
+    state.tiled = tiled;
     state.done = true;
     InterlockedIncrement(&textures_uploaded);
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
@@ -718,7 +724,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             desc.ViewDimension = srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
             desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             desc.Texture2D.MipLevels = 1;  // same offset as Texture3D.MipLevels
-            ID3D12Resource* texture = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
+            ID3D12Resource* texture = sampled_address_texture(resource);
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
