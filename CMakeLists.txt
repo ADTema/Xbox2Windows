@@ -145,7 +145,7 @@ target_link_libraries(windows_placeholder_partition_check PRIVATE OneCore)
 add_test(NAME windows_placeholder_partition COMMAND windows_placeholder_partition_check)
 
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
-add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12_xs_shim.def)
+add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12x_device_slots.cpp src/d3d12_xs_shim.def)
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
@@ -457,6 +457,21 @@ target_compile_features(d3d12_xs_shim_check PRIVATE cxx_std_17)
 foreach(scenario IN ITEMS exports serialize deserialize warp_root)
     add_test(NAME d3d12_xs_shim_${scenario} COMMAND d3d12_xs_shim_check ${scenario})
 endforeach()
+# D3D12XboxCreateDevice device-slot inventory and source-built creation fixture (#XCL-08).
+add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp)
+add_dependencies(d3d12x_device_check d3d12_xs_shim)
+target_compile_features(d3d12x_device_check PRIVATE cxx_std_17)
+target_link_libraries(d3d12x_device_check PRIVATE d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME d3d12x_device_create_${adapter} COMMAND d3d12x_device_check
+        "$<TARGET_FILE:d3d12_xs_shim>" create ${adapter})
+    add_test(NAME d3d12x_device_negative_${adapter} COMMAND d3d12x_device_check
+        "$<TARGET_FILE:d3d12_xs_shim>" negative ${adapter})
+endforeach()
+set_tests_properties(d3d12x_device_create_hardware d3d12x_device_negative_hardware PROPERTIES
+    SKIP_RETURN_CODE 77)
+set_tests_properties(d3d12x_device_negative_warp d3d12x_device_negative_hardware PROPERTIES
+    PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice: unsupported IID \\{7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01\\}")
 # The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
 set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
 add_custom_command(OUTPUT "${vm_translation_header}"

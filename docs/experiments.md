@@ -4104,6 +4104,34 @@ This covers only the two root-signature imports observed in the pre-executable D
 | `d3d12_xs_shim_deserialize` | Round-trips a sanitized blob from `d3d12_xs.dll` and reads the embedded `RTS0` part of `pso_compute_embedded`; rejects `pso_compute_stripped` and empty/null buffers with `E_INVALIDARG`. |
 | `d3d12_xs_shim_warp_root` | Serializes a v1.1 `SRV(t0),UAV(u0),RootConstants(16,b0)` descriptor tagged with `0x03000000` through `d3d12_xs.dll` (verified rejected by desktop `d3d12.dll`), creates a WARP `ID3D12RootSignature`, and builds a compute PSO with `pso_compute_stripped`. |
 
+#### D3D12XboxCreateDevice slot inventory and fixture
+
+`src/d3d12x_device_slots.h` and `.cpp` keep a source-owned, ordered inventory of device creation
+IIDs and observed vtable slots. The creation-IID rows are the only rows consulted by
+`D3D12XboxCreateDevice`: `IID_ID3D12Device` is implemented; `IID_ID3D12Device1`,
+`IID_ID3D12Device3` and the observed slots 14 (`+0x70`, `CreateDescriptorHeap`), 28 (`+0xe0`,
+`CreateHeap`) and 76 (`+0x260`, `CreateCommittedResource`) are recorded as documented or observed
+but not implemented. The vtable rows are diagnostic inventory, not a claimed console ABI. The
+public [Xbox-GDK-Samples DeviceResources.cpp](https://github.com/microsoft/Xbox-GDK-Samples/blob/main/Samples/Live/InGameStore/DeviceResources.cpp)
+passes `D3D12XBOX_CREATE_DEVICE_PARAMETERS` and `IID_GRAPHICS_PPV_ARGS`, which requests
+`IID_ID3D12Device1`; this path still accepts only `nullptr` parameters and `IID_ID3D12Device`.
+Accepting the public parameter block or `IID_ID3D12Device1` remains a follow-up decision.
+
+`tests/d3d12x_device_check.cpp` loads the built `d3d12_xs.dll` by explicit path, verifies that the
+resolved `D3D12XboxCreateDevice` belongs to that module, and runs a source-built WARP or hardware
+fixture with `parameters == nullptr`. The positive case checks a non-null device, the adapter LUID,
+`GetNodeCount() == 1` and `CreateFence(..., IID_PPV_ARGS(&fence)) == S_OK`. The negative case sends
+the fixture GUID `{7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01}` and requires `E_NOINTERFACE`, a cleared
+output and the line `D3D12XboxCreateDevice: unsupported IID {7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01}`.
+It also keeps a non-null parameter block at `E_INVALIDARG`.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `d3d12x_device_create_warp`, `d3d12x_device_create_hardware` | Resolves `D3D12XboxCreateDevice` inside `d3d12_xs.dll`, creates a device with null parameters and `IID_ID3D12Device`, checks the adapter LUID, one node and a zero-valued fence. The hardware case skips (77) without a physical adapter. |
+| `d3d12x_device_negative_warp`, `d3d12x_device_negative_hardware` | A non-null parameter block returns `E_INVALIDARG`; the unknown fixture IID returns `E_NOINTERFACE`, clears the output and prints the exact lowercase GUID. The hardware case skips (77) without a physical adapter. |
+
+Run `ctest --preset dev --no-tests=error -R '^d3d12x_device_' -V`.
+
 #### D3D12ConfigureVirtualMemoryX call shape (#874)
 
 The main executable imports `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` and calls it once, before the D3D12 device is created. A static read of the call site shows:
