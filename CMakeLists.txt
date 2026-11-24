@@ -346,6 +346,15 @@ target_link_libraries(startup_storage_alloc_failure PRIVATE psapi)
 add_dependencies(startup_storage_alloc_failure startup_stub_xcrdapi)
 add_test(NAME startup_storage_alloc_failure COMMAND startup_storage_alloc_failure "$<TARGET_FILE:startup_stub_xcrdapi>")
 set_tests_properties(startup_storage_alloc_failure PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+# A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
+# throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
+# The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
+add_executable(startup_storage_worker_start tests/startup_storage_worker_start.cpp)
+target_compile_features(startup_storage_worker_start PRIVATE cxx_std_17)
+target_include_directories(startup_storage_worker_start PRIVATE src)
+target_link_libraries(startup_storage_worker_start PRIVATE psapi)
+add_test(NAME startup_storage_worker_start COMMAND startup_storage_worker_start)
+set_tests_properties(startup_storage_worker_start PROPERTIES TIMEOUT 60)
 target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
 # APU heap stand-in: ApuFree reuse, coalescing, refused requests and concurrent callers (docs/startup-runtime.md).

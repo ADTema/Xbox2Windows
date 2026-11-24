@@ -412,6 +412,20 @@ These are measured on one executable; treat them as hypotheses for others.
   then a correct result for a normal request on the same queue. It returns 77 where the limit is
   not enforced.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_alloc_failure$' -V`.
+  A queue builds its work (three `std::deque`s, whose constructors allocate and can throw
+  `std::bad_alloc` even under `new (std::nothrow)`) and starts its worker separately. Enqueue
+  only records an entry, in the work when it exists, otherwise in a small record that needs no
+  queue storage; it never completes a status entry or signals a fence. Submit retries the
+  construction and the worker start (a committed-stack attempt, then a default-stack one). If the
+  worker runs, the entries proceed as usual. If it cannot start, every recorded entry fails there:
+  its status entry takes the pending failure (`E_OUTOFMEMORY` when nothing worse is pending) and
+  its fence is signaled, so nothing is left at `E_PENDING`. An entry that could not even be
+  recorded loses its request bytes, so it fails at Submit even if the worker starts then; only when
+  the small record itself cannot be allocated is the entry failed inside Enqueue.
+  `startup_storage_worker_start` compiles the stand-in into the test, redirects `CreateThread`
+  and replaces `operator new` to make both failures on demand, and checks pending status and an
+  unsignaled fence before Submit, failure status and a signaled fence after it, and a correct
+  request on the same queue afterwards.
 
 ## Shortcuts that are known to be wrong
 

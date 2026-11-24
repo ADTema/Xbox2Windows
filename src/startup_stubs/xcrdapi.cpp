@@ -52,6 +52,8 @@ struct Object {
     LONG* results;      // StatusArray: one HRESULT per index, E_PENDING until a status is enqueued
     LONG pending;       // Queue: worst HRESULT of the requests since the last status
     struct QueueWork* work = nullptr;  // Queue: entries waiting for Submit and the worker running them
+    struct Unrecorded* unrecorded_head = nullptr;  // Queue: entries no queue storage could hold, see push()
+    struct Unrecorded* unrecorded_tail = nullptr;
 };
 
 // A queue entry as enqueued: a request (its 0x48 bytes copied, and a snapshot of its destination page
@@ -82,6 +84,7 @@ struct QueueWork {
     std::mutex mutex;
     std::condition_variable wake;
     std::deque<Entry> waiting, submitted;
+    bool worker_started = false;  // guarded by the setup mutex
     u64 next_entry_id = 0;
     u64 next_submission_id = 0;
     static constexpr std::size_t max_cached_streams = 16;
@@ -666,49 +669,136 @@ DWORD WINAPI queue_worker(void* parameter)
     }
 }
 
+// Guards queue setup: building a queue's work, starting its worker and the unrecorded list.
+std::mutex& setup_mutex()
+{
+    static std::mutex setup;
+    return setup;
+}
+
+// Builds the queue's work once. The three deques allocate in their constructors, so even
+// new (std::nothrow) can throw std::bad_alloc from here: that is treated like a null result, and
+// nothing escapes to the title. The failure is logged after the handler has left.
 QueueWork* ensure_work(Object* self)
 {
-    static std::mutex create;
-    const std::lock_guard guard(create);
+    const std::lock_guard guard(setup_mutex());
     if (self->work) return self->work;
-    auto* work = new (std::nothrow) QueueWork;
+    QueueWork* work = nullptr;
+    try {
+        work = new (std::nothrow) QueueWork;
+    } catch (const std::bad_alloc&) {
+        work = nullptr;
+    }
     if (!work) {
         log("x2w-dstorage queue work allocation failed");
         return nullptr;
     }
+    self->work = work;
+    return work;
+}
+
+// Starts the queue's worker unless it runs. The worker is created suspended with a committed stack,
+// then once more with the default stack; false when neither thread could be created, which leaves
+// the queue as it was so a later call tries again.
+bool start_worker(Object* self, QueueWork* work)
+{
+    const std::lock_guard guard(setup_mutex());
+    if (work->worker_started) return true;
     HANDLE worker = CreateThread(nullptr, worker_stack_commit, queue_worker, self, CREATE_SUSPENDED, nullptr);
     if (!worker) worker = CreateThread(nullptr, 0, queue_worker, self, CREATE_SUSPENDED, nullptr);
     if (!worker) {
         log("x2w-dstorage queue worker not started: error %lu", GetLastError());
-        delete work;
-        return nullptr;
+        return false;
     }
-    self->work = work;
+    work->worker_started = true;
     ResumeThread(worker);
     CloseHandle(worker);
-    return work;
+    return true;
 }
 
-void fail_unstarted_entry(Object* self, const Entry& entry)
+// What an entry that could not be stored needs in order to fail at Submit: no request bytes, since a
+// request only counts as failed.
+struct Unrecorded {
+    Unrecorded* next;
+    Entry::Type type;
+    Object* array;
+    unsigned index;
+    void* fence;
+    u64 value;
+};
+
+// Fails an entry that will not run: a request counts as failed, a status entry completes with the
+// pending failure (E_OUTOFMEMORY when nothing worse is pending), a fence is signaled.
+void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned index, void* fence, u64 value)
 {
-    if (entry.type == Entry::request) {
+    if (type == Entry::request) {
         InterlockedIncrement(&requests_failed);
         InterlockedCompareExchange(&self->pending, static_cast<LONG>(E_OUTOFMEMORY), S_OK);
-    } else if (entry.type == Entry::status_entry) {
+    } else if (type == Entry::status_entry) {
         const LONG pending = InterlockedExchange(&self->pending, S_OK);
-        if (entry.array && entry.array->results && entry.index < entry.array->capacity) {
-            InterlockedExchange(&entry.array->results[entry.index],
+        if (array && array->results && index < array->capacity) {
+            InterlockedExchange(&array->results[index],
                                 pending < 0 ? pending : static_cast<LONG>(E_OUTOFMEMORY));
         }
     } else {
-        signal_fence(entry.fence, entry.value);
+        signal_fence(fence, value);
     }
 }
 
+// An entry the queue has no room for (its work could not be built or grown): remembered in a small
+// record that needs no queue storage, failed by the next Submit. Only when even that record cannot be
+// allocated is the entry failed here, because nothing is left to remember it with.
+void defer_unrecorded(Object* self, const Entry& entry)
+{
+    auto* node = new (std::nothrow) Unrecorded{nullptr, entry.type, entry.array, entry.index, entry.fence, entry.value};
+    if (!node) {
+        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        return;
+    }
+    const std::lock_guard guard(setup_mutex());
+    (self->unrecorded_tail ? self->unrecorded_tail->next : self->unrecorded_head) = node;
+    self->unrecorded_tail = node;
+}
+
+void fail_unrecorded(Object* self)
+{
+    Unrecorded* node;
+    {
+        const std::lock_guard guard(setup_mutex());
+        node = self->unrecorded_head;
+        self->unrecorded_head = self->unrecorded_tail = nullptr;
+    }
+    while (node) {
+        Unrecorded* const next = node->next;
+        fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value);
+        delete node;
+        node = next;
+    }
+}
+
+// Submit: entries that could not be stored fail now; waiting entries go to the worker, which is
+// started if it is not running yet (resources may have recovered since Enqueue). If it still cannot
+// be started, the waiting entries fail too: their status entries and fences complete here, not
+// earlier in Enqueue.
 void submit(Object* self)
 {
     QueueWork* work = ensure_work(self);
+    const bool started = work && start_worker(self, work);
+    fail_unrecorded(self);
     if (!work) return;
+    if (!started) {
+        for (;;) {
+            Entry entry{};
+            {
+                const std::lock_guard guard(work->mutex);
+                if (work->waiting.empty()) break;
+                entry = std::move(work->waiting.front());
+                work->waiting.pop_front();
+            }
+            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        }
+        return;
+    }
     {
         const std::lock_guard guard(work->mutex);
         const u64 submission_id = ++work->next_submission_id;
@@ -721,19 +811,28 @@ void submit(Object* self)
     work->wake.notify_one();
 }
 
+// Enqueue only records the entry, whether or not a worker runs; nothing completes before Submit.
 void push(Object* self, Entry&& entry)
 {
     QueueWork* work = ensure_work(self);
     if (!work) {
-        fail_unstarted_entry(self, entry);
+        defer_unrecorded(self, entry);
         return;
     }
-    bool full;
-    {
+    start_worker(self, work);  // a failure shows at Submit
+    bool recorded = false;
+    bool full = false;
+    try {
         const std::lock_guard guard(work->mutex);
         entry.id = ++work->next_entry_id;
         work->waiting.push_back(std::move(entry));
+        recorded = true;
         full = self->capacity && work->waiting.size() >= self->capacity;
+    } catch (const std::bad_alloc&) {
+    }
+    if (!recorded) {
+        defer_unrecorded(self, entry);
+        return;
     }
     if (full) submit(self);  // a full queue submits itself, as on PC
 }
