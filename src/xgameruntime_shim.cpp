@@ -118,13 +118,16 @@ static_assert(not_implemented == E_NOTIMPL);
 constexpr std::uint64_t synthetic_user_id = 0x0009000000000001ull;
 constexpr std::size_t user_capacity = 8;
 constexpr std::size_t provider_capacity = 4;
-constexpr std::size_t container_capacity = 4;
+constexpr std::size_t container_store_capacity = 8;
+constexpr std::size_t container_handle_capacity = 8;
 constexpr std::size_t update_capacity = 4;
 constexpr std::size_t blob_capacity = 4;
 constexpr std::size_t container_name_capacity = 257;
 constexpr std::size_t blob_name_capacity = 64;
 constexpr std::size_t blob_bytes_capacity = 1024;
 constexpr HRESULT e_gs_invalid_container_name = static_cast<HRESULT>(0x80830001L);
+// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2610
+constexpr HRESULT e_gs_handle_expired = static_cast<HRESULT>(0x8083000DL);
 
 // Synthetic identity and storage policy. There is exactly one XUser identity,
 // and XGameSave state lives only in this process. Nothing is persisted to disk.
@@ -228,27 +231,44 @@ struct BlobSlot {
 
 struct XGameSaveProviderStorage {
     bool live = false;
+    std::uint64_t scope = 0;
 };
 
-struct XGameSaveContainerStorage {
+struct ContainerStore {
     bool live = false;
-    XGameSaveProviderStorage* provider = nullptr;
+    std::uint64_t id = 0;
+    std::uint64_t provider_scope = 0;
     char name[container_name_capacity]{};
     std::array<BlobSlot, blob_capacity> blobs{};
 };
 
+struct XGameSaveContainerStorage {
+    bool live = false;
+    std::uint64_t id = 0;
+    XGameSaveProviderStorage* provider = nullptr;
+    std::uint64_t provider_scope = 0;
+    std::uint64_t store_id = 0;
+    char name[container_name_capacity]{};
+};
+
 struct XGameSaveUpdateStorage {
     bool live = false;
-    XGameSaveContainerStorage* container = nullptr;
+    std::uint64_t container_handle_id = 0;
+    std::uint64_t provider_scope = 0;
+    std::uint64_t store_id = 0;
     char display_name[container_name_capacity]{};
     std::array<BlobSlot, blob_capacity> staged{};
 };
 
 struct RuntimeState {
     SRWLOCK lock = SRWLOCK_INIT;
+    std::uint64_t next_provider_scope = 1;
+    std::uint64_t next_store_id = 1;
+    std::uint64_t next_container_handle_id = 1;
     std::array<XUserHandleStorage, user_capacity> users{};
     std::array<XGameSaveProviderStorage, provider_capacity> providers{};
-    std::array<XGameSaveContainerStorage, container_capacity> containers{};
+    std::array<ContainerStore, container_store_capacity> container_stores{};
+    std::array<XGameSaveContainerStorage, container_handle_capacity> containers{};
     std::array<XGameSaveUpdateStorage, update_capacity> updates{};
 };
 
@@ -316,6 +336,33 @@ BlobSlot* free_blob(std::array<BlobSlot, blob_capacity>& blobs) noexcept
 {
     for (auto& blob : blobs) {
         if (!blob.live) return &blob;
+    }
+    return nullptr;
+}
+
+ContainerStore* find_store_by_name(std::uint64_t provider_scope, const char* name) noexcept
+{
+    for (auto& store : runtime_state.container_stores) {
+        if (store.live && store.provider_scope == provider_scope &&
+            std::strcmp(store.name, name) == 0) {
+            return &store;
+        }
+    }
+    return nullptr;
+}
+
+ContainerStore* find_store_by_id(std::uint64_t store_id) noexcept
+{
+    for (auto& store : runtime_state.container_stores) {
+        if (store.live && store.id == store_id) return &store;
+    }
+    return nullptr;
+}
+
+XGameSaveContainerStorage* find_container_by_id(std::uint64_t handle_id) noexcept
+{
+    for (auto& handle : runtime_state.containers) {
+        if (handle.live && handle.id == handle_id) return &handle;
     }
     return nullptr;
 }
@@ -418,7 +465,9 @@ HRESULT game_save_initialize_provider(XUserHandle requesting_user, const char* c
     }
     for (auto& slot : runtime_state.providers) {
         if (!slot.live) {
+            slot = XGameSaveProviderStorage{};
             slot.live = true;
+            slot.scope = runtime_state.next_provider_scope++;
             *provider = &slot;
             ReleaseSRWLockExclusive(&runtime_state.lock);
             return S_OK;
@@ -440,23 +489,53 @@ HRESULT game_save_create_container(XGameSaveProviderHandle provider, const char*
         ReleaseSRWLockExclusive(&runtime_state.lock);
         return E_HANDLE;
     }
-    for (auto& slot : runtime_state.containers) {
-        if (!slot.live) {
-            slot = XGameSaveContainerStorage{};
-            slot.live = true;
-            slot.provider = found_provider;
-            if (!copy_text(slot.name, sizeof(slot.name), container_name)) {
-                slot = XGameSaveContainerStorage{};
-                ReleaseSRWLockExclusive(&runtime_state.lock);
-                return E_INVALIDARG;
-            }
-            *container = &slot;
-            ReleaseSRWLockExclusive(&runtime_state.lock);
-            return S_OK;
+    XGameSaveContainerStorage* free_handle = nullptr;
+    for (auto& handle : runtime_state.containers) {
+        if (!handle.live) {
+            free_handle = &handle;
+            break;
         }
     }
+    if (!free_handle) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_OUTOFMEMORY;
+    }
+    auto* store = find_store_by_name(found_provider->scope, container_name);
+    if (!store) {
+        for (auto& candidate : runtime_state.container_stores) {
+            if (!candidate.live) {
+                store = &candidate;
+                break;
+            }
+        }
+        if (!store) {
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return E_OUTOFMEMORY;
+        }
+        *store = ContainerStore{};
+        store->live = true;
+        store->id = runtime_state.next_store_id++;
+        store->provider_scope = found_provider->scope;
+        if (!copy_text(store->name, sizeof(store->name), container_name)) {
+            *store = ContainerStore{};
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return E_INVALIDARG;
+        }
+    }
+    *free_handle = XGameSaveContainerStorage{};
+    free_handle->live = true;
+    free_handle->id = runtime_state.next_container_handle_id++;
+    free_handle->provider = found_provider;
+    free_handle->provider_scope = found_provider->scope;
+    free_handle->store_id = store->id;
+    if (!copy_text(free_handle->name, sizeof(free_handle->name), container_name)) {
+        *free_handle = XGameSaveContainerStorage{};
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_INVALIDARG;
+    }
+    *container = free_handle;
     ReleaseSRWLockExclusive(&runtime_state.lock);
-    return E_OUTOFMEMORY;
+    return S_OK;
 }
 
 HRESULT game_save_create_update(XGameSaveContainerHandle container, const char* display_name,
@@ -475,7 +554,9 @@ HRESULT game_save_create_update(XGameSaveContainerHandle container, const char* 
         if (!slot.live) {
             slot = XGameSaveUpdateStorage{};
             slot.live = true;
-            slot.container = found_container;
+            slot.container_handle_id = found_container->id;
+            slot.provider_scope = found_container->provider_scope;
+            slot.store_id = found_container->store_id;
             if (!copy_text(slot.display_name, sizeof(slot.display_name), display_name)) {
                 slot = XGameSaveUpdateStorage{};
                 ReleaseSRWLockExclusive(&runtime_state.lock);
@@ -520,12 +601,18 @@ HRESULT game_save_submit_update(XGameSaveUpdateHandle update) noexcept
         ReleaseSRWLockExclusive(&runtime_state.lock);
         return E_HANDLE;
     }
-    const auto container = find_live(runtime_state.containers, found->container);
-    if (!container) {
+    const auto container_handle = find_container_by_id(found->container_handle_id);
+    if (!container_handle || container_handle->provider_scope != found->provider_scope ||
+        container_handle->store_id != found->store_id) {
         ReleaseSRWLockExclusive(&runtime_state.lock);
-        return E_HANDLE;
+        return e_gs_handle_expired;
     }
-    auto next = container->blobs;
+    const auto store = find_store_by_id(found->store_id);
+    if (!store || store->provider_scope != found->provider_scope) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return e_gs_handle_expired;
+    }
+    auto next = store->blobs;
     for (const auto& staged : found->staged) {
         if (!staged.live) continue;
         auto destination = find_blob(next, staged.name);
@@ -536,7 +623,7 @@ HRESULT game_save_submit_update(XGameSaveUpdateHandle update) noexcept
         }
         *destination = staged;
     }
-    container->blobs = next;
+    store->blobs = next;
     found->staged = {};
     ReleaseSRWLockExclusive(&runtime_state.lock);
     return S_OK;
@@ -558,9 +645,16 @@ HRESULT game_save_read_blob_data(XGameSaveContainerHandle container, const char*
         ReleaseSRWLockShared(&runtime_state.lock);
         return E_HANDLE;
     }
+    const auto provider = find_live(runtime_state.providers, found_container->provider);
+    const auto store = find_store_by_id(found_container->store_id);
+    if (!provider || provider->scope != found_container->provider_scope || !store ||
+        store->provider_scope != found_container->provider_scope) {
+        ReleaseSRWLockShared(&runtime_state.lock);
+        return e_gs_handle_expired;
+    }
     std::size_t total = requested * sizeof(XGameSaveBlob);
     for (std::uint32_t i = 0; i < requested; ++i) {
-        const auto blob = find_blob(found_container->blobs, blob_names[i]);
+        const auto blob = find_blob(store->blobs, blob_names[i]);
         if (!blob) {
             ReleaseSRWLockShared(&runtime_state.lock);
             return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
@@ -573,7 +667,7 @@ HRESULT game_save_read_blob_data(XGameSaveContainerHandle container, const char*
     }
     auto cursor = reinterpret_cast<std::uint8_t*>(blob_data + requested);
     for (std::uint32_t i = 0; i < requested; ++i) {
-        const auto blob = find_blob(found_container->blobs, blob_names[i]);
+        const auto blob = find_blob(store->blobs, blob_names[i]);
         blob_data[i].info.name = blob->name;
         blob_data[i].info.size = blob->size;
         blob_data[i].data = cursor;
@@ -590,7 +684,16 @@ HRESULT game_save_close_provider(XGameSaveProviderHandle provider) noexcept
     if (!provider) return E_HANDLE;
     AcquireSRWLockExclusive(&runtime_state.lock);
     const auto found = find_live(runtime_state.providers, provider);
-    if (found) *found = XGameSaveProviderStorage{};
+    if (found) {
+        const auto scope = found->scope;
+        *found = XGameSaveProviderStorage{};
+        for (auto& store : runtime_state.container_stores) {
+            if (store.live && store.provider_scope == scope) store = ContainerStore{};
+        }
+        for (auto& handle : runtime_state.containers) {
+            if (handle.live && handle.provider_scope == scope) handle = XGameSaveContainerStorage{};
+        }
+    }
     ReleaseSRWLockExclusive(&runtime_state.lock);
     return found ? S_OK : E_HANDLE;
 }

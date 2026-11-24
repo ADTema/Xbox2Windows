@@ -23,6 +23,7 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr HRESULT not_implemented = static_cast<HRESULT>(0x80004001L);
+constexpr HRESULT e_gs_handle_expired = static_cast<HRESULT>(0x8083000DL);
 constexpr std::uint64_t synthetic_user_id = 0x0009000000000001ull;
 
 struct XAsyncBlock;
@@ -175,34 +176,100 @@ bool contract_checks(HMODULE module)
     close_user(duplicate);
 
     XGameSaveProviderHandle provider = nullptr;
-    XGameSaveContainerHandle container = nullptr;
-    XGameSaveUpdateHandle update = nullptr;
+    XGameSaveContainerHandle slot_a_first = nullptr;
+    XGameSaveContainerHandle slot_a_second = nullptr;
+    XGameSaveContainerHandle slot_a_reopened = nullptr;
+    XGameSaveContainerHandle slot_b = nullptr;
+    XGameSaveUpdateHandle player_update = nullptr;
+    XGameSaveUpdateHandle stale_update = nullptr;
+    XGameSaveUpdateHandle slot_b_update = nullptr;
     constexpr char configuration_id[] = "synthetic-scid";
-    constexpr char container_name[] = "slot";
-    constexpr char blob_name[] = "save.bin";
-    constexpr std::uint8_t payload[] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
+    constexpr char slot_a_name[] = "slot-a";
+    constexpr char slot_b_name[] = "slot-b";
+    constexpr char player_blob[] = "player.bin";
+    constexpr char slot_b_blob[] = "slot-b.bin";
+    constexpr char stale_blob[] = "stale.bin";
+    constexpr std::uint8_t player_payload[] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
+    constexpr std::uint8_t slot_b_payload[] = {0xA0, 0xB0, 0xC0};
+    constexpr std::uint8_t stale_payload[] = {0xEE, 0xFF};
+
+    auto read_payload = [&](XGameSaveContainerHandle container, const char* blob_name,
+                            const std::uint8_t* expected, std::size_t expected_size) {
+        alignas(XGameSaveBlob) std::uint8_t storage[512]{};
+        auto* blobs = reinterpret_cast<XGameSaveBlob*>(storage);
+        const char* names[] = {blob_name};
+        std::uint32_t count = 1;
+        if (FAILED(read_blob_data(container, names, &count, sizeof(storage), blobs)) ||
+            count != 1 || !blobs[0].info.name || std::strcmp(blobs[0].info.name, blob_name) != 0 ||
+            blobs[0].info.size != expected_size || !blobs[0].data ||
+            std::memcmp(blobs[0].data, expected, expected_size) != 0) {
+            std::printf("FAIL: XGameSave read contract for %s\n", blob_name);
+            return false;
+        }
+        return true;
+    };
+
+    auto read_missing = [&](XGameSaveContainerHandle container, const char* blob_name) {
+        alignas(XGameSaveBlob) std::uint8_t storage[512]{};
+        auto* blobs = reinterpret_cast<XGameSaveBlob*>(storage);
+        const char* names[] = {blob_name};
+        std::uint32_t count = 1;
+        const HRESULT result = read_blob_data(container, names, &count, sizeof(storage), blobs);
+        return result == HRESULT_FROM_WIN32(ERROR_NOT_FOUND) && count == 0;
+    };
+
     if (FAILED(initialize_provider(user, configuration_id, false, &provider)) || !provider ||
-        FAILED(create_container(provider, container_name, &container)) || !container ||
-        FAILED(create_update(container, container_name, &update)) || !update ||
-        FAILED(submit_blob_write(update, blob_name, payload, sizeof(payload))) ||
-        FAILED(submit_update(update))) {
+        FAILED(create_container(provider, slot_a_name, &slot_a_first)) || !slot_a_first ||
+        FAILED(create_update(slot_a_first, slot_a_name, &player_update)) || !player_update ||
+        FAILED(submit_blob_write(player_update, player_blob, player_payload,
+                                 sizeof(player_payload))) ||
+        FAILED(submit_update(player_update))) {
         std::printf("FAIL: XGameSave initialize or write contract\n");
         return false;
     }
+    close_update(player_update);
 
-    alignas(XGameSaveBlob) std::uint8_t storage[512]{};
-    auto* blobs = reinterpret_cast<XGameSaveBlob*>(storage);
-    const char* blob_names[] = {blob_name};
-    std::uint32_t count = 1;
-    if (FAILED(read_blob_data(container, blob_names, &count, sizeof(storage), blobs)) ||
-        count != 1 || !blobs[0].info.name || std::strcmp(blobs[0].info.name, blob_name) != 0 ||
-        blobs[0].info.size != sizeof(payload) || !blobs[0].data ||
-        std::memcmp(blobs[0].data, payload, sizeof(payload)) != 0) {
-        std::printf("FAIL: XGameSave read contract\n");
+    if (!read_payload(slot_a_first, player_blob, player_payload, sizeof(player_payload)) ||
+        FAILED(create_container(provider, slot_a_name, &slot_a_second)) || !slot_a_second ||
+        !read_payload(slot_a_second, player_blob, player_payload, sizeof(player_payload))) {
+        std::printf("FAIL: second slot-a handle did not share process-local data\n");
         return false;
     }
-    close_update(update);
-    close_container(container);
+    close_container(slot_a_first);
+    close_container(slot_a_second);
+
+    if (FAILED(create_container(provider, slot_a_name, &slot_a_reopened)) || !slot_a_reopened ||
+        !read_payload(slot_a_reopened, player_blob, player_payload, sizeof(player_payload))) {
+        std::printf("FAIL: slot-a data did not survive both closed handles\n");
+        return false;
+    }
+
+    // Bind the update to the now-open slot-a handle, then close that handle.
+    // The create-container call below can reuse the same handle slot for slot-b.
+    if (FAILED(create_update(slot_a_reopened, slot_a_name, &stale_update)) || !stale_update ||
+        FAILED(submit_blob_write(stale_update, stale_blob, stale_payload, sizeof(stale_payload)))) {
+        std::printf("FAIL: could not stage stale update\n");
+        return false;
+    }
+    close_container(slot_a_reopened);
+
+    if (FAILED(create_container(provider, slot_b_name, &slot_b)) || !slot_b ||
+        FAILED(create_update(slot_b, slot_b_name, &slot_b_update)) || !slot_b_update ||
+        FAILED(submit_blob_write(slot_b_update, slot_b_blob, slot_b_payload,
+                                 sizeof(slot_b_payload))) ||
+        FAILED(submit_update(slot_b_update))) {
+        std::printf("FAIL: independent slot-b write contract\n");
+        return false;
+    }
+    close_update(slot_b_update);
+
+    if (!read_payload(slot_b, slot_b_blob, slot_b_payload, sizeof(slot_b_payload)) ||
+        submit_update(stale_update) != e_gs_handle_expired || !read_missing(slot_b, stale_blob)) {
+        std::printf("FAIL: stale update crossed into slot-b\n");
+        return false;
+    }
+    close_update(stale_update);
+    close_container(slot_b);
     close_provider(provider);
     close_user(user);
 
@@ -223,7 +290,7 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
         !find_proc(module, "XGameRuntimeShimClearLog", clear_log)) {
         return false;
     }
-    std::array<XGameRuntimeShimLogEntry, 32> entries{};
+    std::array<XGameRuntimeShimLogEntry, 48> entries{};
     const std::size_t count = get_log(entries.data(), entries.size());
     if (count != expected_calls) {
         std::printf("FAIL: log has %zu entries, expected %zu\n", count, expected_calls);
@@ -233,6 +300,8 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
     bool saw_save = false;
     bool saw_package = false;
     bool saw_game = false;
+    bool saw_expired_submit = false;
+    bool saw_missing_read = false;
     constexpr const char* implemented_names[] = {
         "XUserFindUserById", "XUserGetId", "XUserDuplicateHandle", "XUserCloseHandle",
         "XGameSaveInitializeProvider", "XGameSaveCreateContainer", "XGameSaveCreateUpdate",
@@ -256,6 +325,14 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
         if (std::strcmp(entry.function, "XGameGetXboxTitleId") == 0) {
             saw_game = entry.result == not_implemented;
         }
+        if (std::strcmp(entry.function, "XGameSaveSubmitUpdate") == 0 &&
+            entry.result == e_gs_handle_expired) {
+            saw_expired_submit = true;
+        }
+        if (std::strcmp(entry.function, "XGameSaveReadBlobData") == 0 &&
+            entry.result == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+            saw_missing_read = true;
+        }
         for (std::size_t j = 0; j < std::size(implemented_names); ++j) {
             if (std::strcmp(entry.function, implemented_names[j]) == 0) {
                 if (entry.result == not_implemented) {
@@ -266,7 +343,8 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
             }
         }
     }
-    if (!saw_user || !saw_save || !saw_package || !saw_game ||
+    if (!saw_user || !saw_save || !saw_package || !saw_game || !saw_expired_submit ||
+        !saw_missing_read ||
         std::find(implemented_seen.begin(), implemented_seen.end(), false) != implemented_seen.end()) {
         std::printf("FAIL: log does not contain positive and negative controls\n");
         return false;
@@ -285,7 +363,7 @@ bool run(const wchar_t* dll_path, const wchar_t* fixture_dir, const wchar_t* nor
     ClearLog clear_log = nullptr;
     const bool has_log = find_proc(module, "XGameRuntimeShimClearLog", clear_log);
     if (has_log) clear_log();
-    const bool passed = has_log && contract_checks(module) && log_checks(module, 17);
+    const bool passed = has_log && contract_checks(module) && log_checks(module, 35);
     FreeLibrary(module);
     return passed;
 }
@@ -298,7 +376,11 @@ int wmain(int argc, wchar_t** argv)
         return 2;
     }
     const bool passed = run(argv[1], argv[2], argv[3]);
-    std::printf("xgameruntime contracts: user=implemented game-save=implemented "
-                "negative=E_NOTIMPL x2 %s\n", passed ? "PASS" : "FAIL");
+    if (passed) {
+        std::printf("xgameruntime contracts: user=implemented game-save=implemented "
+                    "reopen=ok stale=E_GS_HANDLE_EXPIRED negative=E_NOTIMPL x2 PASS\n");
+    } else {
+        std::printf("xgameruntime contracts: FAIL\n");
+    }
     return passed ? 0 : 1;
 }

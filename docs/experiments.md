@@ -6323,6 +6323,16 @@ the close functions) stores up to four blobs of 1,024 bytes per in-memory
 container. It does not persist to disk, synchronize with Xbox services, or claim
 the full provider semantics.
 
+Container data is keyed by provider scope and container name, separately from
+open container handles. A second `XGameSaveCreateContainer` call for `slot-a`
+opens the same in-memory data, and the data remains readable after all handles
+to that container are closed. An update records both its parent container-handle
+identity and the store identity. Submitting it after that parent handle is
+closed or its slot is reused fails with `E_GS_HANDLE_EXPIRED` (`0x8083000D`) and
+does not write into any newly created container such as `slot-b`. The contract
+test covers both controls plus independent `slot-a`/`slot-b` names on one
+provider.
+
 `XUserAddAsync` and `XGameSaveInitializeProviderAsync` remain explicit stubs.
 Their completion contract requires the public `XAsyncBlock`, `XUserAddResult`,
 and `XGameSaveInitializeProviderResult` queue/callback/result semantics, which
