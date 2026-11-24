@@ -7221,6 +7221,8 @@ Each scene sends the same 136 rays through a double-precision brute-force CPU te
 
 RTX 2060 and WARP each completed 408 comparisons. In fault controls only the custom shader's input changes. Swapping child 0 and 32 addresses changed four results, replaying the previous scene changed 102 and aliasing invalid address high bits changed one. Each fault must alter its designated witness ray. The GTX 1060 with driver 32.0.15.6094 on Windows 10 build 19045.6456 matched all 408 comparisons through DispatchRays. App-local WARP 1.0.22 with Agility SDK 1.620.2 matched all 408 through each DXR path. All three fault witnesses fired in each run. The five-ray and differential checks reported zero D3D12 debug warnings and errors. In-box WARP 10.0.19041.5794 reports no DXR and skips these checks.
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (32.0.101.8132) matched all 408 comparisons through its inline ray-query backend, 136 per epoch with 96, 43 and 92 hits. The fault controls kept their signature: swapping the child 0 and 32 addresses changed four results at witness 0, replaying the previous scene changed 102 at witness 1, and aliasing the high address bits changed one at witness 31, with zero D3D12 debug errors and warnings.
+
 ```powershell
 $env:XBOX2WINDOWS_ADAPTER = 'GTX 1060'
 cmake --build --preset dev --target offscreen_check
