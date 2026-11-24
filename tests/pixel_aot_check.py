@@ -10022,6 +10022,118 @@ def cvt_f64_f32_exported(words, mask):
     return (CVT_F64_F32_SENTINELS[0], lo ^ mask, hi ^ mask, CVT_F64_F32_SENTINELS[1])
 
 
+# v_cvt_i32_f64 and v_cvt_u32_f64 (issue 1492, restricted slice): the conversions back from a binary64 VGPR pair, lowered
+# only for a pair whose provenance the translator proves (LLVM 15 VOP1Instructions.td; not checked against the ISA
+# document here and not measured on a console). Accepted: v_cvt_f64_i32 then v_cvt_i32_f64 and v_cvt_f64_u32 then
+# v_cvt_u32_f64 (the round trip returns the source word), and v_cvt_f64_f32 of a static source then either conversion
+# (computed at translation time, truncated toward zero) when the value is finite and the truncated result fits the
+# destination. Everything else is refused: the controls are in check_cvt_int_f64_lowering.
+# Bodies for uncompressed_export() as in the f64 modes: s44 = x, s45 = XOR mask, s46 and s47 the sentinels; the pair is
+# v[16:17], its copy v[20:21], the two results are v13 (read from the pair) and v14 (read from the copy), exported as
+# result ^ M so that every exported word is a normal binary32 or zero.
+CVT_INT_F64_RT_BODIES = {
+    kind: [*CVT_F64_INT_HEAD, f"v_cvt_f64_{kind} v[16:17], s44", f"v_cvt_{kind}_f64 v13, v[16:17]",
+           "v_mov_b32_e32 v20, v16", "v_mov_b32_e32 v21, v17", f"v_cvt_{kind}_f64_e32 v14, v[20:21]", *CVT_F64_INT_TAIL]
+    for kind in ("i32", "u32")}
+# 0, INT_MIN, INT_MAX, -1 (UINT_MAX), 0x7fffffff, UINT_MAX - 1, and the values around 2^24 with their negative
+# counterparts, the round-trip rows of issue 1363.
+CVT_INT_F64_RT_ROWS = (0, 0x80000000, 0x7FFFFFFF, 0xFFFFFFFF, 1, 0xFFFFFFFE, 0x00FFFFFF, 0x01000000, 0x01000001,
+                       0xFF000001, 0xFF000000, 0xFEFFFFFF, 0x80000001)
+# Statically known binary32 sources: +-0, +-1.5, +-0.75, +-1.0, just above 2^23 and 2^24, the largest binary32 below 2^31
+# (2147483520) and below 2^32 (4294967040), -2^31, and for u32 the values 2^31 and just above it. A fraction below one
+# truncates to 0, which fits u32 (-0.75 and -0.0).
+CVT_INT_F64_STATIC_ROWS = {
+    "i32": (0x00000000, 0x80000000, 0x3FC00000, 0xBFC00000, 0x3F400000, 0xBF400000, 0x3F800000, 0xBF800000,
+            0x4B000001, 0x4B800001, 0x4EFFFFFF, 0xCEFFFFFF, 0xCF000000),
+    "u32": (0x00000000, 0x80000000, 0x3FC00000, 0x3F400000, 0xBF400000, 0x3F800000, 0x4B000001, 0x4B800001,
+            0x4EFFFFFF, 0x4F000000, 0x4F000001, 0x4F7FFFFF),
+}
+CVT_INT_F64_SENTINELS = CVT_F64_INT_SENTINELS
+
+
+def cvt_int_f64_static_lines(kind, bits, pair=16, copy=20, dest=("v13", "v14")):
+    """One row: the pair v[pair:pair+1] from a static literal, its conversion, a copy pair and the copy's conversion."""
+    spelled = CVT_F64_F32_INLINE_TEXT.get(bits, f"0x{bits:08x}")
+    return [f"v_cvt_f64_f32_e32 v[{pair}:{pair + 1}], {spelled}", f"v_cvt_{kind}_f64 {dest[0]}, v[{pair}:{pair + 1}]",
+            f"v_mov_b32_e32 v{copy}, v{pair}", f"v_mov_b32_e32 v{copy + 1}, v{pair + 1}",
+            f"v_cvt_{kind}_f64_e32 {dest[1]}, v[{copy}:{copy + 1}]"]
+
+
+def cvt_int_f64_static_program(kind, bits):
+    return uncompressed_export([*CVT_F64_INT_HEAD, *cvt_int_f64_static_lines(kind, bits), *CVT_F64_INT_TAIL])
+
+
+def cvt_int_f64_static_binary_program(kind):
+    """Every static row of a kind in one program (pairs v[24:25], v[26:27], ...; results v100 and up): the binary round
+    trip compares the translation of the disassembly with that of the text."""
+    lines = []
+    for k, bits in enumerate(CVT_INT_F64_STATIC_ROWS[kind]):
+        lines += cvt_int_f64_static_lines(kind, bits, 24 + 4 * k, 26 + 4 * k, (f"v{100 + 2 * k}", f"v{101 + 2 * k}"))
+    return uncompressed_export(lines)
+
+
+def cvt_int_f64_rt_binary_program(kind):
+    return uncompressed_export(CVT_INT_F64_RT_BODIES[kind])
+
+
+def cvt_int_f64_static_ref(kind, bits):
+    """(destination word, exact truncated integer, binary32 value) of a static row, from Python's own float and int()."""
+    value = struct.unpack("<f", struct.pack("<I", bits))[0]
+    truncated = int(value)
+    low, high = (-0x80000000, 0x7FFFFFFF) if kind == "i32" else (0, 0xFFFFFFFF)
+    assert low <= truncated <= high, (kind, hex(bits), truncated)
+    return truncated & 0xFFFFFFFF, truncated, value
+
+
+def cvt_int_f64_row(kind, source, static):
+    """The facts of one row: right word, the pair words, and the wrong words a faulty lowering would give."""
+    if static:
+        right, truncated, value = cvt_int_f64_static_ref(kind, source)
+        pair = cvt_f64_f32_ref(source)
+        rounded = round(value) & 0xFFFFFFFF
+    else:
+        right = source
+        truncated = _sext32(source) if kind == "i32" else source
+        pair = cvt_f64_int_ref(kind == "i32", source)
+        rounded = right
+    # The other signedness: the u32 conversion of an i32 value clamps below zero, the i32 conversion of a u32 value
+    # clamps above INT_MAX.
+    other = max(truncated, 0) & 0xFFFFFFFF if kind == "i32" else min(truncated, 0x7FFFFFFF)
+    return {"right": right, "pair": pair, "signedness": other, "rounding": rounded if static else right}
+
+
+def cvt_int_f64_mask(row):
+    words = [row["right"], row["right"] ^ 1, row["signedness"], row["rounding"], *row["pair"]]
+    for exponent in range(1, 255):
+        mask = exponent << 23
+        exported = [word ^ mask for word in words]
+        if all(binary32_normal_or_zero(word) for word in exported) and not set(CVT_INT_F64_SENTINELS) & set(exported):
+            return mask
+    raise AssertionError(row)
+
+
+def cvt_int_f64_exported(row, mask, first=None, second=None):
+    """The four exported words: sentinel, v13 ^ M, v14 ^ M, sentinel; first and second override v13 and v14."""
+    first = row["right"] if first is None else first
+    second = row["right"] if second is None else second
+    return (CVT_INT_F64_SENTINELS[0], first ^ mask, second ^ mask, CVT_INT_F64_SENTINELS[1])
+
+
+def cvt_int_f64_wrongs(row, mask, static):
+    """(kind, exported words) of every wrong reference that must report a mismatch; entries equal to the right ones
+    are dropped (the controls are only drawn where they differ)."""
+    right = cvt_int_f64_exported(row, mask)
+    lo, hi = row["pair"]
+    wrongs = [("signedness", cvt_int_f64_exported(row, mask, row["signedness"], row["signedness"])),
+              ("word", cvt_int_f64_exported(row, mask, lo, lo)), ("word", cvt_int_f64_exported(row, mask, hi, hi)),
+              ("copy slot", cvt_int_f64_exported(row, mask, None, row["right"] ^ 1)),
+              ("copy slot", cvt_int_f64_exported(row, mask, row["right"] ^ 1, None)),
+              ("sentinel", (lo ^ mask, *right[1:])), ("sentinel", (*right[:3], hi ^ mask))]
+    if static:
+        wrongs.append(("rounding", cvt_int_f64_exported(row, mask, row["rounding"], row["rounding"])))
+    return [(kind, words) for kind, words in wrongs if words != right]
+
+
 # v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32: the carry-out add and subtracts above, plus the carry or
 # borrow of each lane read from a lane mask. Bodies for uncompressed_export(): A, B, C and D are the constants in
 # s44 to s47, v18 = B and v19 = D. The carry-out form of the same operation leaves the carry of op(A, B) in vcc_lo
@@ -10951,9 +11063,11 @@ def check_cvt_f64_int_lowering():
                     f"v_cvt_f64_{op} v[12:13], v99", f"v_cvt_f64_{op} v[12:13], s60", f"v_cvt_f64_{op} v[12:13], 1e9"):
             must_reject(translate_int, program(bad))
     translate_f64(program("v_cvt_f64_i32 v[12:13], v18", "v_cmp_lt_f64_e64 s52, v[12:13], v[12:13]"))
-    # Arithmetic on the pair and the conversions back are refused.
+    # Arithmetic on the pair and the conversions back are refused. v_cvt_i32_f64 of this i32 pair was refused here
+    # before the provenance-restricted round trip (check_cvt_int_f64_lowering) was admitted: it is that supported
+    # round trip now and moved there; the cross-signedness v_cvt_u32_f64 stays refused.
     for consumer in ("v_add_f64 v[14:15], v[12:13], v[12:13]", "v_mul_f64 v[14:15], v[12:13], v[12:13]",
-                     "v_cvt_f32_f64_e32 v14, v[12:13]", "v_cvt_i32_f64_e32 v14, v[12:13]",
+                     "v_cvt_f32_f64_e32 v14, v[12:13]",
                      "v_cvt_u32_f64_e32 v14, v[12:13]", "v_mov_b32_e32 v14, v[12:13]"):
         must_reject(translate_int, program("v_cvt_f64_i32 v[12:13], v18", consumer))
     # The conversion is refused inside a masked region, like the other integer arithmetic.
@@ -11071,13 +11185,213 @@ def check_cvt_f64_f32_lowering():
                 "v_cvt_f64_f32 v[12:13], v99", "v_cvt_f64_f32 v[12:13], s60", "v_cvt_f64_f32 v[12:13], s106"):
         must_reject(translate_int, program(bad))
     # Arithmetic on the pair and the conversions back are refused, and so is the conversion in a masked region.
+    # v_cvt_i32_f64 and v_cvt_u32_f64 of this pair of 1.0 were refused here before the static truncation
+    # (check_cvt_int_f64_lowering) was admitted: 1.0 is finite and fits both destinations, so both are that
+    # supported case now and moved there.
     for consumer in ("v_add_f64 v[14:15], v[12:13], v[12:13]", "v_mul_f64 v[14:15], v[12:13], v[12:13]",
-                     "v_cvt_f32_f64_e32 v14, v[12:13]", "v_cvt_i32_f64_e32 v14, v[12:13]",
-                     "v_cvt_u32_f64_e32 v14, v[12:13]", "v_mov_b32_e32 v14, v[12:13]"):
+                     "v_cvt_f32_f64_e32 v14, v[12:13]", "v_mov_b32_e32 v14, v[12:13]"):
         must_reject(translate_int, program("v_cvt_f64_f32 v[12:13], 1.0", consumer))
     must_reject(translate_int, uncompressed_export([
         *MAD64_PREFIX, "v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc",
         "v_cvt_f64_f32 v[12:13], 1.0", MASKED_OR_RESTORE]))
+
+
+def check_cvt_int_f64_lowering():
+    """Static checks for v_cvt_i32_f64 and v_cvt_u32_f64: the accepted round trips and static truncations, and the
+    controls that must be refused (cross-signedness, a clobbered word, divergent joins, raw constants, special and
+    out-of-range values, modifiers and every other spelling)."""
+    assert set(CVT_INT_F64_RT_BODIES) == {"i32", "u32"}
+
+    def program(*lines):
+        return uncompressed_export([*MAD64_PREFIX, *lines])
+
+    def result_expressions(source):
+        """The expressions assigned to the float temporaries by 'asfloat(<uint variable or constant>)', in order."""
+        return re.findall(r"precise float alu\d+ = asfloat\((c\d+x|\d+u)\);", source.split("uint4 main")[1])
+
+    # Round trips: the result is the uint source variable of the matching v_cvt_f64_* itself, with no double and no
+    # runtime conversion in the result.
+    for kind in ("i32", "u32"):
+        source = translate_int(uncompressed_export(CVT_INT_F64_RT_BODIES[kind]))
+        variables = re.findall(r"uint (c\d+x) = ", source)
+        assert len(variables) == 1, (kind, variables)
+        assert result_expressions(source) == [variables[0]] * 2, (kind, result_expressions(source))
+        assert "double" not in source and "asdouble" not in source, kind
+        translate_int(program(f"v_cvt_f64_{kind} v[24:25], v18", f"v_cvt_{kind}_f64 v13, v[24:25]"))
+        translate_int(program(f"v_cvt_f64_{kind} v[24:25], v18", f"v_cvt_{kind}_f64_e32 v13, v[24:25]"))
+    # A copy of both words, in either order, into any other pair keeps the provenance; so does a copy of a copy.
+    translate_int(program("v_cvt_f64_i32 v[24:25], s44", "v_mov_b32_e32 v27, v25", "v_mov_b32_e32 v26, v24",
+                          "v_cvt_i32_f64 v13, v[26:27]"))
+    translate_int(program("v_cvt_f64_u32 v[24:25], s44", "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25",
+                          "v_mov_b32_e32 v30, v26", "v_mov_b32_e32 v31, v27", "v_cvt_u32_f64 v13, v[30:31]"))
+    # An unaligned pair, the highest register pair, a destination equal to a pair word and the pair read twice.
+    translate_int(program("v_cvt_f64_i32 v[25:26], s44", "v_cvt_i32_f64 v13, v[25:26]", "v_cvt_i32_f64 v14, v[25:26]"))
+    translate_int(program("v_cvt_f64_i32 v[254:255], s44", "v_cvt_i32_f64 v255, v[254:255]"))
+    translate_int(program("v_cvt_f64_i32 v[24:25], s44", "v_cvt_i32_f64 v24, v[24:25]"))
+    # The result of the round trip is a numeric register to later readers.
+    translate_int(program("v_cvt_f64_i32 v[24:25], s44", "v_cvt_i32_f64 v13, v[24:25]", "v_add_f32_e32 v14, v13, v13"))
+    # Static sources: the constant is the truncation of the binary32 value, computed here from Python's own int().
+    for kind, rows in CVT_INT_F64_STATIC_ROWS.items():
+        for bits in rows:
+            word = cvt_int_f64_static_ref(kind, bits)[0]
+            source = translate_int(cvt_int_f64_static_program(kind, bits))
+            assert result_expressions(source)[-2:] == [f"{word}u"] * 2, (kind, hex(bits), word, result_expressions(source))
+            assert "double" not in source and "firstbithigh" not in source.split("uint4 main")[1], (kind, hex(bits))
+        translate_int(cvt_int_f64_static_binary_program(kind))
+        translate_int(cvt_int_f64_rt_binary_program(kind))
+    # Independent hand-computed truncations: toward zero, not to nearest.
+    assert cvt_int_f64_static_ref("i32", 0x3FC00000)[0] == 1 and cvt_int_f64_static_ref("i32", 0xBFC00000)[0] == 0xFFFFFFFF
+    assert cvt_int_f64_static_ref("i32", 0x3F400000)[0] == 0 and cvt_int_f64_static_ref("i32", 0xBF400000)[0] == 0
+    assert cvt_int_f64_static_ref("u32", 0xBF400000)[0] == 0 and cvt_int_f64_static_ref("u32", 0x80000000)[0] == 0
+    assert cvt_int_f64_static_ref("i32", 0x4EFFFFFF)[0] == 2147483520 and cvt_int_f64_static_ref("u32", 0x4F7FFFFF)[0] == 4294967040
+    assert cvt_int_f64_static_ref("i32", 0xCF000000)[0] == 0x80000000
+    # Cross-signedness is refused both ways.
+    expect_value_error(translate_int, program("v_cvt_f64_u32 v[24:25], s44", "v_cvt_i32_f64 v13, v[24:25]"),
+                       "is not a supported round trip")
+    expect_value_error(translate_int, program("v_cvt_f64_i32 v[24:25], s44", "v_cvt_u32_f64 v13, v[24:25]"),
+                       "is not a supported round trip")
+    # One overwritten word ends the provenance, whichever word and whatever writes it.
+    for clobber in ("v_mov_b32_e32 v24, s46", "v_mov_b32_e32 v25, s46", "v_mov_b32_e32 v24, 0", "v_mov_b32_e32 v25, 0x3ff00000",
+                    "v_add_f32_e32 v24, v24, v24", "v_add_f32_e32 v25, v25, v25", "v_mov_b32_e32 v25, v24",
+                    "v_mov_b32_e32 v24, v25", "v_swap_b32 v24, v25", "v_swap_b32 v25, v20", "v_swap_b32 v24, v20"):
+        expect_value_error(translate_int, program("v_cvt_f64_i32 v[24:25], s44", clobber, "v_cvt_i32_f64 v13, v[24:25]"),
+                           "Unproven binary64 source")
+    # The clobber of the source pair does not reach a copy made before it, and a clobbered copy does not reach the source.
+    translate_int(program("v_cvt_f64_i32 v[24:25], s44", "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25",
+                          "v_mov_b32_e32 v24, s46", "v_cvt_i32_f64 v13, v[26:27]"))
+    translate_int(program("v_cvt_f64_i32 v[24:25], s44", "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25",
+                          "v_mov_b32_e32 v26, s46", "v_cvt_i32_f64 v13, v[24:25]"))
+    expect_value_error(translate_int, program("v_cvt_f64_i32 v[24:25], s44", "v_mov_b32_e32 v26, v24",
+                                              "v_mov_b32_e32 v27, v25", "v_mov_b32_e32 v26, s46",
+                                              "v_cvt_i32_f64 v13, v[26:27]"), "Unproven binary64 source")
+    # Words that do not belong together: the two words swapped in the copy, one word of each of two pairs, a pair read
+    # at an offset, and the words of two conversions of the same register (two pairs, not interchangeable).
+    expect_value_error(translate_int, program("v_cvt_f64_i32 v[24:25], s44", "v_mov_b32_e32 v26, v25",
+                                              "v_mov_b32_e32 v27, v24", "v_cvt_i32_f64 v13, v[26:27]"),
+                       "Unproven binary64 source")
+    expect_value_error(translate_int, program("v_cvt_f64_i32 v[24:25], s44", "v_cvt_f64_i32 v[28:29], s46",
+                                              "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v29",
+                                              "v_cvt_i32_f64 v13, v[26:27]"), "Unproven binary64 source")
+    expect_value_error(translate_int, program("v_cvt_f64_i32 v[24:25], s44", "v_cvt_i32_f64 v13, v[25:26]"),
+                       "Unproven binary64 source")
+    expect_value_error(translate_int, program("v_cvt_f64_i32 v[24:25], s44", "v_cvt_f64_i32 v[28:29], s44",
+                                              "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v29",
+                                              "v_cvt_i32_f64 v13, v[26:27]"), "Unproven binary64 source")
+    # Raw words, constants and registers carry no provenance, even when they spell the binary64 of an integer.
+    for raw in (("v_mov_b32_e32 v24, 0", "v_mov_b32_e32 v25, 0x3ff00000"),
+                ("v_mov_b32_e32 v24, 0", "v_mov_b32_e32 v25, 0"),
+                ("v_mov_b32_e32 v24, s46", "v_mov_b32_e32 v25, s47"),
+                ("v_mov_b32_e32 v24, v18", "v_mov_b32_e32 v25, v21"), ()):
+        for op in ("i32", "u32"):
+            expect_value_error(translate_int, program(*raw, f"v_cvt_{op}_f64 v13, v[24:25]"), "Unproven binary64 source")
+    for kind in ("i32", "u32"):
+        expect_value_error(translate_int, program(f"v_cvt_{kind}_f64 v13, v[0:1]"), "Unproven binary64 source")
+        expect_value_error(translate_int, program(f"v_cvt_{kind}_f64 v13, v[12:13]"), "Unproven binary64 source")
+        # A pair of which one word was rewritten by a conversion is not the pair of the conversion.
+        expect_value_error(translate_int, program("v_cvt_f64_f32_e32 v[24:25], 1.0", "v_cvt_f32_i32_e32 v24, v18",
+                                                  f"v_cvt_{kind}_f64 v13, v[24:25]"), "Unproven binary64 source")
+    # Static values outside the destination, and the special values, are refused.
+    for kind, bits, message in (("i32", 0x4F000000, "out of range"), ("i32", 0xCF000001, "out of range"),
+                                ("i32", 0x4F800000, "out of range"), ("i32", 0x7F7FFFFF, "out of range"),
+                                ("u32", 0xBF800000, "out of range"), ("u32", 0xBFC00000, "out of range"),
+                                ("u32", 0x4F800000, "out of range"), ("u32", 0xFF7FFFFF, "out of range"),
+                                ("i32", 0x7F800000, "not finite"), ("i32", 0xFF800000, "not finite"),
+                                ("u32", 0x7F800000, "not finite"), ("u32", 0xFF800000, "not finite")):
+        literal = CVT_F64_F32_INLINE_TEXT.get(bits, f"0x{bits:08x}")
+        expect_value_error(translate_int, program(f"v_cvt_f64_f32 v[24:25], {literal}", f"v_cvt_{kind}_f64 v13, v[24:25]"),
+                           message)
+        expect_value_error(translate_int, program(f"v_cvt_f64_f32 v[24:25], {literal}", "v_mov_b32_e32 v26, v24",
+                                                  "v_mov_b32_e32 v27, v25", f"v_cvt_{kind}_f64_e32 v13, v[26:27]"), message)
+    # A NaN never becomes a pair, and a pair from a runtime source is not static.
+    expect_value_error(translate_int, program("v_cvt_f64_f32 v[24:25], 0x7fc00000", "v_cvt_i32_f64 v13, v[24:25]"), "is a NaN")
+    expect_value_error(translate_int, program("v_cvt_f64_f32 v[24:25], v18", "v_cvt_i32_f64 v13, v[24:25]"),
+                       "Unproven runtime input")
+    # Modifiers and spellings: the _e64 form with and without a modifier, clamp, omod, the source modifiers, DPP and SDWA.
+    for op in ("i32", "u32"):
+        for pair_text in ("v_cvt_f64_i32 v[24:25], s44", "v_cvt_f64_u32 v[24:25], s44", "v_cvt_f64_f32 v[24:25], 1.0"):
+            for bad in (f"v_cvt_{op}_f64_e64 v13, v[24:25]", f"v_cvt_{op}_f64_e64 v13, v[24:25] clamp",
+                        f"v_cvt_{op}_f64 v13, v[24:25] clamp", f"v_cvt_{op}_f64_e64 v13, -v[24:25]",
+                        f"v_cvt_{op}_f64_e64 v13, |v[24:25]|", f"v_cvt_{op}_f64_e64 v13, -|v[24:25]|",
+                        f"v_cvt_{op}_f64_e64 v13, v[24:25] mul:2", f"v_cvt_{op}_f64_e64 v13, v[24:25] div:2",
+                        f"v_cvt_{op}_f64 v13, v[24:25] mul:2", f"v_cvt_{op}_f64 v13, -v[24:25]",
+                        f"v_cvt_{op}_f64_dpp v13, v[24:25] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                        f"v_cvt_{op}_f64 v13, v[24:25] row_shl:1",
+                        f"v_cvt_{op}_f64_sdwa v13, v[24:25] src0_sel:WORD_1", f"v_cvt_{op}_f64 v13, v[24:25] src0_sel:WORD_1"):
+                must_reject(translate_int, program(pair_text, bad))
+    # Operand shapes: a one-register source, an inverted, wide or degenerate range, an out-of-range register, a
+    # non-VGPR destination or source, an extra or missing operand.
+    for bad in ("v_cvt_i32_f64 v13, v24", "v_cvt_i32_f64 v13, v[25:24]", "v_cvt_i32_f64 v13, v[24:26]",
+                "v_cvt_i32_f64 v13, v[24:24]", "v_cvt_i32_f64 v13, v[255:256]", "v_cvt_i32_f64 v13, v[256:257]",
+                "v_cvt_i32_f64 v256, v[24:25]", "v_cvt_i32_f64 v[13:14], v[24:25]", "v_cvt_i32_f64 s13, v[24:25]",
+                "v_cvt_i32_f64 v13, s[44:45]", "v_cvt_i32_f64 v13, 1.0", "v_cvt_i32_f64 v13, v[024:25]",
+                "v_cvt_i32_f64 v13, v[24:25], v[24:25]", "v_cvt_i32_f64 v13", "v_cvt_i32_f64 vcc_lo, v[24:25]"):
+        must_reject(translate_int, program("v_cvt_f64_i32 v[24:25], s44", bad))
+        must_reject(translate_int, program("v_cvt_f64_u32 v[24:25], s44", bad.replace("i32_f64", "u32_f64")))
+    # Not inside a masked region, like the other conversions.
+    must_reject(translate_int, uncompressed_export([
+        *MAD64_PREFIX, "v_cvt_f64_i32 v[24:25], s44", "v_cmp_lt_f32_e64 vcc_lo, v12, s44",
+        "s_and_saveexec_b64 s[60:61], vcc", "v_cvt_i32_f64 v13, v[24:25]", MASKED_OR_RESTORE]))
+    # Joins. The pairs: P = v[24:25] and its copy v[26:27] (i32 of s44), Q = v[28:29] (i32 of s46), R = v[30:31] (u32 of
+    # s44). A join keeps the provenance of a word only if every path (the region and the pre-region value, or both arms)
+    # carries the same record; any other join refuses the conversion.
+    pre = ["v_cvt_f64_i32 v[24:25], s44", "v_cvt_f64_i32 v[28:29], s46", "v_cvt_f64_u32 v[30:31], s44",
+           "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25"]
+    opener = ["v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc"]
+    post = ["v_cvt_i32_f64 v13, v[26:27]"]
+    copy_p = ("v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25")
+    copy_q = ("v_mov_b32_e32 v26, v28", "v_mov_b32_e32 v27, v29")
+    copy_r = ("v_mov_b32_e32 v26, v30", "v_mov_b32_e32 v27, v31")
+
+    def one_arm(*body):
+        return uncompressed_export([*MAD64_PREFIX, *pre, *opener, *body, MASKED_OR_RESTORE, *post])
+
+    def two_arms(then, other):
+        return uncompressed_export([*MAD64_PREFIX, *pre, *opener, *then, ELSE_TRANSITION, *other, MASKED_MOV_RESTORE, *post])
+
+    # Same record on every path: accepted, and the result is still the source variable of P.
+    for accepted in (one_arm(*copy_p), one_arm(copy_p[1]), one_arm(copy_p[0]), two_arms(copy_p, copy_p),
+                     two_arms(copy_p, (copy_p[1], copy_p[0]))):
+        source = translate_int(accepted)
+        assert result_expressions(source)[-1] == re.findall(r"uint (c\d+x) = ", source)[0], result_expressions(source)
+    # A different source, a different signedness or a single diverging word is refused, in a one-arm region and in
+    # either arm of an if/else.
+    for refused in (one_arm(*copy_q), one_arm(*copy_r), one_arm(copy_q[0]), one_arm(copy_q[1]),
+                    one_arm(copy_r[0]), one_arm(copy_r[1]),
+                    two_arms(copy_p, copy_q), two_arms(copy_q, copy_p), two_arms(copy_p, copy_r),
+                    two_arms(copy_q, (copy_q[0], copy_p[1])),
+                    two_arms((copy_p[0], copy_q[1]), copy_p),
+                    two_arms(copy_p, ("v_mov_b32_e32 v26, s46", "v_mov_b32_e32 v27, s47")),
+                    one_arm("v_mov_b32_e32 v26, s46"), one_arm("v_add_f32_e32 v27, v27, v27")):
+        expect_value_error(translate_int, refused, "Unproven binary64 source")
+    # The same programs without the region are the plain cases above: a join is what loses the provenance.
+    translate_int(program(*pre, *copy_p, *post))
+    expect_value_error(translate_int, program(*pre, *copy_q, "v_cvt_u32_f64 v13, v[26:27]"), "is not a supported round trip")
+    # A static pair joins only with an equal one: the same value on both paths is kept, a different value is refused.
+    static_pre = ["v_cvt_f64_f32_e32 v[24:25], 0x3fc00000", "v_cvt_f64_f32_e32 v[28:29], 0x3fc00000",
+                  "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25"]
+    other_pre = ["v_cvt_f64_f32_e32 v[24:25], 0x3fc00000", "v_cvt_f64_f32_e32 v[28:29], 0x40100000",
+                 "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25"]
+    translate_int(uncompressed_export([*MAD64_PREFIX, *static_pre, *opener, *copy_q, MASKED_OR_RESTORE, *post]))
+    expect_value_error(translate_int, uncompressed_export([*MAD64_PREFIX, *other_pre, *opener, *copy_q, MASKED_OR_RESTORE,
+                                                           *post]), "Unproven binary64 source")
+    # Bookkeeping of the draws: every exported word is a normal binary32 or zero and the controls are not vacuous.
+    for kind in ("i32", "u32"):
+        for source, static in [(x, False) for x in CVT_INT_F64_RT_ROWS] + [(b, True) for b in CVT_INT_F64_STATIC_ROWS[kind]]:
+            row = cvt_int_f64_row(kind, source, static)
+            mask = cvt_int_f64_mask(row)
+            assert all(binary32_normal_or_zero(word) for word in cvt_int_f64_exported(row, mask)), (kind, hex(source))
+            assert cvt_int_f64_wrongs(row, mask, static), (kind, hex(source))
+    # Reference sanity: the other signedness differs on a value a signed or unsigned reading splits, and rounding
+    # differs from truncation on a fraction of one half or more.
+    assert cvt_int_f64_row("u32", 0xFFFFFFFF, False)["signedness"] == 0x7FFFFFFF != 0xFFFFFFFF
+    assert cvt_int_f64_row("i32", 0xFFFFFFFF, False)["signedness"] == 0 != 0xFFFFFFFF
+    assert cvt_int_f64_row("i32", 0xBFC00000, True)["rounding"] == 0xFFFFFFFE != cvt_int_f64_row("i32", 0xBFC00000, True)["right"]
+    assert cvt_int_f64_row("i32", 0x3FC00000, True)["rounding"] == 2 != cvt_int_f64_row("i32", 0x3FC00000, True)["right"]
+    assert cvt_int_f64_row("i32", 0x3F400000, True)["rounding"] == 1 != cvt_int_f64_row("i32", 0x3F400000, True)["right"]
+    assert {0, 0x80000000, 0x7FFFFFFF, 0xFFFFFFFF, 0x00FFFFFF, 0x01000000, 0x01000001} <= set(CVT_INT_F64_RT_ROWS)
+    for kind, bits in (("i32", 0x4EFFFFFF), ("u32", 0x4F7FFFFF), ("i32", 0xCF000000), ("i32", 0xBFC00000), ("i32", 0x3FC00000),
+                       ("i32", 0x80000000), ("i32", 0x3F400000), ("i32", 0xBF400000)):
+        assert bits in CVT_INT_F64_STATIC_ROWS[kind], (kind, hex(bits))
 
 
 def check_carry_in_lowering():
@@ -14316,6 +14630,7 @@ def check_controls(directory):
     check_mad64_lowering()
     check_cvt_f64_int_lowering()
     check_cvt_f64_f32_lowering()
+    check_cvt_int_f64_lowering()
     check_sdwa_integer_lowering()
     check_pack_int16_lowering()
     check_sat_pack_u8_lowering()
@@ -15963,6 +16278,50 @@ def check_cvt_f64_f32_binary(directory, assembler, objcopy, library):
         must_reject(translate_int, uncompressed_export([*MAD64_PREFIX, text.replace("[13:14]", "[12:13]")]))
 
 
+def check_cvt_int_f64_binary(directory, assembler, objcopy, library):
+    """LLVM 15 gfx1013 encodings of v_cvt_i32_f64 and v_cvt_u32_f64: the VOP1 word, the spellings LLVM prints (the
+    unmodified form as _e32 whether or not the source spelled it, every _e64 form with its suffix), the VOP3 modifier
+    bits, and the forms the assembler cannot encode (DPP, SDWA). Only the printed _e32 spelling is lowered."""
+    source, obj, binary = directory / "cvt_int_f64.s", directory / "cvt_int_f64.o", directory / "cvt_int_f64.bin"
+
+    def assemble(line):
+        source.write_text(line + chr(10) + "s_endpgm" + chr(10), encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", source, "-o", obj], check=True,
+                       capture_output=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+        code = binary.read_bytes()
+        return code[:-4], disassemble(code, library)[0]
+
+    for line, encoded, text in (
+            ("v_cvt_i32_f64 v13, v[20:21]", "14071a7e", "v_cvt_i32_f64_e32 v13, v[20:21]"),
+            ("v_cvt_i32_f64_e32 v13, v[20:21]", "14071a7e", "v_cvt_i32_f64_e32 v13, v[20:21]"),
+            ("v_cvt_u32_f64_e32 v14, v[20:21]", "142b1c7e", "v_cvt_u32_f64_e32 v14, v[20:21]"),
+            ("v_cvt_u32_f64 v14, v[20:21]", "142b1c7e", "v_cvt_u32_f64_e32 v14, v[20:21]"),
+            ("v_cvt_i32_f64_e64 v13, v[20:21]", "0d0083d514010000", "v_cvt_i32_f64_e64 v13, v[20:21]"),
+            ("v_cvt_u32_f64 v13, v[20:21] clamp", "0d8095d514010000", "v_cvt_u32_f64_e64 v13, v[20:21] clamp"),
+            ("v_cvt_i32_f64 v13, -v[20:21]", "0d0083d514010020", "v_cvt_i32_f64_e64 v13, -v[20:21]"),
+            ("v_cvt_u32_f64 v13, |v[20:21]|", "0d0195d514010000", "v_cvt_u32_f64_e64 v13, |v[20:21]|"),
+            ("v_cvt_i32_f64_e64 v13, v[20:21] mul:2", "0d0083d514010008", "v_cvt_i32_f64_e64 v13, v[20:21] mul:2"),
+            ("v_cvt_i32_f64 v13, s[44:45]", "2c061a7e", "v_cvt_i32_f64_e32 v13, s[44:45]")):
+        code, decoded = assemble(line)
+        assert (code.hex(), decoded) == (encoded, text), (line, code.hex(), decoded)
+    # DPP and SDWA do not assemble for this opcode, so neither can reach the translator from LLVM 15 output.
+    for line in ("v_cvt_i32_f64 v13, v[20:21] row_shl:1", "v_cvt_i32_f64_sdwa v13, v[20:21] src0_sel:WORD_1"):
+        try:
+            assemble(line)
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            raise AssertionError(f"LLVM 15 assembled {line}")
+    # The decoded spellings that are not lowered are refused behind a pair that is lowered.
+    for kind in ("i32", "u32"):
+        for text in (f"v_cvt_{kind}_f64_e64 v13, v[20:21]", f"v_cvt_{kind}_f64_e64 v13, v[20:21] clamp",
+                     f"v_cvt_{kind}_f64_e64 v13, -v[20:21]", f"v_cvt_{kind}_f64_e64 v13, |v[20:21]|",
+                     f"v_cvt_{kind}_f64_e64 v13, v[20:21] mul:2"):
+            must_reject(translate_int, uncompressed_export([*MAD64_PREFIX, f"v_cvt_f64_{kind} v[20:21], s44", text]))
+            must_reject(translate_int, uncompressed_export([*MAD64_PREFIX, "v_cvt_f64_f32 v[20:21], 1.0", text]))
+
+
 def check_f16_round_binary(directory, assembler, objcopy, library):
     """LLVM 15 gfx1013 encodings of the binary16 VOP1 rounding forms, the integer folding of a 16-bit literal, and the
     clamp, omod and modifier spellings that assemble on e64 and that the lowering must refuse."""
@@ -16294,6 +16653,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(mad64_group(group)), translate_int) for group in MAD64_BODIES)
     fixtures.extend((cvt_f64_int_group(group), translate_int) for group in CVT_F64_INT_BODIES)
     fixtures.extend((cvt_f64_f32_binary_program(group), translate_int) for group in CVT_F64_F32_GROUPS)
+    fixtures.extend((cvt_int_f64_rt_binary_program(kind), translate_int) for kind in CVT_INT_F64_RT_BODIES)
+    fixtures.extend((cvt_int_f64_static_binary_program(kind), translate_int) for kind in CVT_INT_F64_STATIC_ROWS)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
     fixtures.append((sat_pack_u8_program(), translate_int))
@@ -16371,6 +16732,7 @@ def check_binary(directory, assembler, objcopy, library):
     check_wave32_mask_binary(directory, assembler, objcopy, library)
     check_exp_en_decoding(directory, assembler, objcopy, library)
     check_cvt_f64_f32_binary(directory, assembler, objcopy, library)
+    check_cvt_int_f64_binary(directory, assembler, objcopy, library)
     check_cli_partial_export(directory, assembler, objcopy, library)
 
 
@@ -17283,6 +17645,74 @@ def check_cvt_f64_f32_draws(directory, compiler, renderer, backend):
     assert {0, 0x80000000} <= set(cvt_f64_f32_rows("vnegabs")) and 0x80000000 in cvt_f64_f32_rows("lnegabs")
     assert {0, 0x80000000, 0x3F800000, 0xBF800000, 0x7F7FFFFF, 0x00800000, 0x80800000, 0x7F800000, 0xFF800000,
             0x3F800001} <= set(cvt_f64_f32_rows("lit"))
+    return 0
+
+
+def check_cvt_int_f64_draws(directory, compiler, renderer, backend):
+    """Draw v_cvt_i32_f64 and v_cvt_u32_f64 through the integer readback target, bit for bit.
+
+    Round trips: the programs of CVT_INT_F64_RT_BODIES take the integer from the constant buffer, convert it to a pair,
+    convert the pair (v13) and a copy of the pair (v14) back, one program per signedness, every row in one batch.
+    Static truncations: one program per row of CVT_INT_F64_STATIC_ROWS (a v_cvt_f64_f32 of a literal), also v13 and v14.
+    Each batch draws the right words and then wrong references that must report a mismatch: the other signedness, the
+    rounded instead of the truncated value, a pair word instead of the result, one result slot off by a bit and a
+    sentinel replaced by a pair word. The shader uses no double, so the draws need no capability. On a desktop GPU the
+    draws establish that the translated shader computes the stated operation, not what the console does. The words are
+    exported as result ^ M because the readback needs normal binary32 words or zero.
+    """
+    source = directory / "cvt_int_f64.hlsl"
+    shader = directory / "cvt_int_f64.cso"
+    drawn = {"signedness": 0, "word": 0, "copy slot": 0, "sentinel": 0, "rounding": 0}
+
+    def add_case(cases, x, mask, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, x, mask, *CVT_INT_F64_SENTINELS)
+        case = directory / f"cvt_int_f64-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64)
+        cases.append((case, status))
+
+    def draw(cases):
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+        return 0
+
+    for kind in ("i32", "u32"):
+        source.write_text(translate_int(uncompressed_export(CVT_INT_F64_RT_BODIES[kind])), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for x in CVT_INT_F64_RT_ROWS:
+            row = cvt_int_f64_row(kind, x, False)
+            mask = cvt_int_f64_mask(row)
+            right = cvt_int_f64_exported(row, mask)
+            add_case(cases, x, mask, right, "pass")
+            for label, words in cvt_int_f64_wrongs(row, mask, False):
+                add_case(cases, x, mask, words, "mismatch")
+                drawn[label] += 1
+        if draw(cases) == 77:
+            return 77
+        for bits in CVT_INT_F64_STATIC_ROWS[kind]:
+            source.write_text(translate_int(cvt_int_f64_static_program(kind, bits)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            row = cvt_int_f64_row(kind, bits, True)
+            mask = cvt_int_f64_mask(row)
+            cases = []
+            add_case(cases, 0, mask, cvt_int_f64_exported(row, mask), "pass")
+            for label, words in cvt_int_f64_wrongs(row, mask, True):
+                add_case(cases, 0, mask, words, "mismatch")
+                drawn[label] += 1
+            if draw(cases) == 77:
+                return 77
+    # The controls are not vacuous: every kind was drawn, and the rows the task names are in the draws.
+    assert all(drawn.values()), drawn
+    assert {0, 0x80000000, 0x7FFFFFFF, 0xFFFFFFFF, 0x00FFFFFF, 0x01000000, 0x01000001} <= set(CVT_INT_F64_RT_ROWS)
+    for kind in ("i32", "u32"):
+        assert {0x3FC00000, 0x3F400000, 0x80000000, 0x4B800001} <= set(CVT_INT_F64_STATIC_ROWS[kind]), kind
+    assert {0xBFC00000, 0xBF400000, 0xCF000000, 0x4EFFFFFF} <= set(CVT_INT_F64_STATIC_ROWS["i32"])
+    assert {0x4F7FFFFF, 0x4F000000} <= set(CVT_INT_F64_STATIC_ROWS["u32"])
     return 0
 
 
@@ -21483,7 +21913,7 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-cvt-f64-int", "draw-cvt-f64-f32", "draw-pack-int16", "draw-pack-b32",
+                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-cvt-f64-int", "draw-cvt-f64-f32", "draw-cvt-int-f64", "draw-pack-int16", "draw-pack-b32",
                     "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
@@ -21505,6 +21935,7 @@ def main():
                         "draw-mad64": check_mad64_draws,
                         "draw-cvt-f64-int": check_cvt_f64_int_draws,
                         "draw-cvt-f64-f32": check_cvt_f64_f32_draws,
+                        "draw-cvt-int-f64": check_cvt_int_f64_draws,
                         "draw-sdwa-integer": check_sdwa_integer_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-brev": check_brev_draw,
