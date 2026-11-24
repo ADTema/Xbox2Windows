@@ -505,7 +505,7 @@ The logon script runs only inside the VM, so `-ExecutionPolicy Bypass` and write
 
 Every file in `OUT` is written by untrusted code. Read it; do not execute anything from it on the host. Do not rebuild or check out another revision of the mapped repository while a run is in progress: the VM reads `tools/` and the build from it.
 
-**Cost of the loop.** Every pass retries each request that has no `<key>.txt`, including those that already have a `.fail`, and re-runs `fxc` for fxc failures. That load falls on the run being measured, so choose the interval accordingly.
+**Cost of the loop.** Every pass retries each request without a complete result, including those that already have a `.fail`, and re-runs `fxc` for fxc failures. A result is complete when `<key>.txt` exists and, unless `X2W_FXC` is empty (manifest only), both `.cso` files hold bytecode. That load falls on the run being measured, so choose the interval accordingly.
 
 ### 2. Keep the shader cache between runs
 
@@ -513,7 +513,7 @@ Archive each run's logs together with a copy of `shader_cache/`, and leave the c
 
 When the translator handles more, the next `--pending` pass retries the waiting requests from the same cache. This holds only while the pipeline key is unchanged. The key hashes a translation revision string (`x2w-startup-shader-N`, in `pipeline_key` in `gfx2hlsl.py` and in the runtime). After a revision change the runtime asks for new keys, and the old requests stay in the cache.
 
-A `.fail` is not removed when its request later translates. On a kept cache, the `.fail` categories in `triage.md` therefore include pipelines that now have a `.txt`. That table counts category tokens over all `.fail` files, up to `--max-items`.
+When `fxc` is available, a request that later translates loses its `.fail`. In manifest-only mode (`X2W_FXC` empty) the old `.fail` stays, so on a kept cache the `.fail` categories in `triage.md` can include pipelines that now have a `.txt`. That table counts category tokens over all `.fail` files, up to `--max-items`.
 
 ### 3. Measure a run against the previous one
 
