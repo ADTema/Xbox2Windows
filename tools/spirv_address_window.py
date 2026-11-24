@@ -113,6 +113,10 @@ def lower(assembly):
     arrays = {}
     valid_of = {}
     label = None
+    origin = None
+    # An atomic splits its block, so a successor phi must name the block that now ends in the terminator.
+    final_label = {}
+    source_phis = []
     physical_words = set()
     for line in lines:
         cast = CAST.fullmatch(line)
@@ -145,7 +149,7 @@ def lower(assembly):
             output.extend(new)
             continue
         if opened := re.fullmatch(rf"({ID}) = OpLabel", line):
-            label = opened[1]
+            label = origin = opened[1]
         used = set(re.findall(ID, line)) & physical_words
         atomic_word = False
         if used:
@@ -173,6 +177,7 @@ def lower(assembly):
                 f"{result} = OpPhi %uint {stem}_old {stem}_issue %c0 {label}",
             ])
             label = stem + "_merge"
+            final_label[origin] = label
             continue
         if line == model:
             line = "OpMemoryModel Logical GLSL450"
@@ -186,7 +191,13 @@ def lower(assembly):
             line = line.replace("PushConstant", "StorageBuffer")
         elif any(word in line for word in ("PhysicalStorageBuffer", "OpConvertUToPtr", "OpConvertPtrToU", "%_ptr_PSB_arr")):
             raise ValueError("unhandled physical pointer operation")
+        if " = OpPhi " in line:
+            source_phis.append(len(output))
         output.append(line)
+    for at in source_phis:
+        fields = output[at].split()
+        fields[5::2] = [final_label.get(parent, parent) for parent in fields[5::2]]
+        output[at] = " ".join(fields)
     return merge_pointer_types(output)
 
 

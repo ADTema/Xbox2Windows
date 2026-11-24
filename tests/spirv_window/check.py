@@ -56,6 +56,28 @@ def check_sampler_dimensions(directory):
         validate_sampler(directory, f"{texture}_split", lowered)
         print(f"{texture}: shared and split SPIR-V validated")
 
+def check_phi_parent(directory, tool, direct):
+    """An atomic splits its block, so a phi in a successor must name the block that now ends in the branch."""
+    source = (direct
+        .replace("%main = OpFunction",
+                 "%atomic_rmw = OpConstant %uint 72\n"
+                 "%main = OpFunction", 1)
+        .replace("OpStore %p2 %d Aligned 4",
+                 "%old_add = OpAtomicIAdd %uint %p1 %c1 %atomic_rmw %d\n"
+                 "OpBranch %next\n"
+                 "%next = OpLabel\n"
+                 "%carried = OpPhi %uint %old_add %entry\n"
+                 "OpStore %p2 %carried Aligned 4", 1))
+    assert "%carried = OpPhi" in source
+    path = Path(directory) / "phi_parent.spvasm"
+    path.write_text(source, encoding="utf-8")
+    target = Path(directory) / "phi_parent.spv"
+    # The tool assembles and validates the lowered module, so a stale phi parent fails here.
+    subprocess.run([*tool, path, target], check=True)
+    assert target.read_bytes()[:4] == bytes.fromhex("03022307")
+    assert "%carried = OpPhi %uint %old_add %x2w_atomic_old_add_merge" in window.lower(source).splitlines()
+
+
 fixture = Path(__file__).with_name("subtract.spvasm")
 original = fixture.read_text(encoding="utf-8")
 adapted = window.lower(original)
@@ -162,6 +184,8 @@ with tempfile.TemporaryDirectory(dir=output) as directory:
     assert "OpMemoryModel Logical GLSL450" in lowered
     assert "OpGroupNonUniformBallotBitExtract" not in lowered
     assert "OpConvertUToPtr" not in lowered
+
+    check_phi_parent(directory, tool, direct)
 
     lowered_atomics = window.lower(atomics).splitlines()
     for pointer in ("p1", "p2"):
