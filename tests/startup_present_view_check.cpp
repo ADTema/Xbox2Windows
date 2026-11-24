@@ -101,6 +101,14 @@ void surface_support()
     zero_samples.SampleDesc.Count = 0;
     expect_supported("samples0 refused", zero_samples, false);
 
+    D3D12_RESOURCE_DESC zero_width = tex2d;
+    zero_width.Width = 0;
+    expect_supported("width0 refused", zero_width, false);
+
+    D3D12_RESOURCE_DESC zero_height = tex2d;
+    zero_height.Height = 0;
+    expect_supported("height0 refused", zero_height, false);
+
     D3D12_RESOURCE_DESC unknown_fmt = tex2d;
     unknown_fmt.Format = DXGI_FORMAT_UNKNOWN;
     expect_supported("unknown fmt refused", unknown_fmt, false);
@@ -327,7 +335,7 @@ int main(int argc, char** argv)
             std::printf("startup_present_view: %d FAILED\n", failures);
             return 1;
         }
-        std::printf("startup_present_view: PASS (4 mapped, 6 typed, 18 refused, 2 invalid, 11 surface checks)\n");
+        std::printf("startup_present_view: PASS (4 mapped, 6 typed, 18 refused, 2 invalid, 13 surface checks)\n");
         return 0;
     }
     try {
