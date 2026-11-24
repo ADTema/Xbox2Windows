@@ -269,6 +269,7 @@ cmake --build --preset release --target xmem_shim startup_stub_xcrdapi
 ctest --preset release --no-tests=error -R '^(xmem_page_stats|startup_heartbeat_commit)$' -V
 ```
 
-The `startup_heartbeat_commit` check starts the heartbeat from a source-built process with two
-synthetic sections mapped and waits for the first 10 s report; it compares the reported values with
-`GetProcessMemoryInfo` in the same process.
+The `startup_heartbeat_commit` check starts the heartbeat before loading the page provider, then
+maps two synthetic sections and compares the reported values with `GetProcessMemoryInfo` in the
+same process. It releases a separate commit allocation to check that a current-only change
+produces another report.

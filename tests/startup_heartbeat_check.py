@@ -15,7 +15,7 @@ WIN_RELEASE = 0x8000
 NOACCESS = 1
 HEARTBEAT = re.compile(
     r"x2w-dstorage heartbeat (\d+) s: .*?commit peak=(\d+) MiB current=(\d+) MiB, "
-    r"live physical-page sections=(\d+)")
+    r"live physical-page sections=(\d+|unknown)")
 
 
 class MemoryCounters(C.Structure):
@@ -49,18 +49,34 @@ def process_commit():
     return counters.PagefileUsage, counters.PeakPagefileUsage
 
 
+def wait_for_sample(log, predicate):
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        for match in HEARTBEAT.finditer(log.read_text(errors="replace")):
+            seconds, peak, current, sections = match.groups()
+            sample = int(seconds), int(peak), int(current), sections
+            if predicate(sample):
+                return sample
+        time.sleep(0.2)
+    raise AssertionError("no matching heartbeat sample: " + log.read_text(errors="replace")[-1200:])
+
+
 def main(xmem_path, xcrdapi_path):
     log = Path(tempfile.gettempdir()) / f"x2w-heartbeat-{os.getpid()}.txt"
     log.write_bytes(b"")
     os.environ["X2W_TRAP_LOG"] = str(log)
-    library = C.WinDLL(str(Path(xmem_path).resolve()), use_last_error=True, winmode=0x900)
     xcrdapi = C.WinDLL(str(Path(xcrdapi_path).resolve()), use_last_error=True, winmode=0x900)
     kernel = C.WinDLL("kernelbase.dll", use_last_error=True)
     pointer, number = C.c_void_p, C.c_size_t
+    get_factory = bind(xcrdapi, "DStorageGetFactory", [pointer, C.POINTER(pointer)], C.c_long)
+    factory = pointer()
+    assert get_factory(None, C.byref(factory)) == 0 and factory.value, "DStorageGetFactory failed"
+    first_sample = wait_for_sample(log, lambda sample: sample[3] == "unknown")
+    library = C.WinDLL(str(Path(xmem_path).resolve()), use_last_error=True, winmode=0x900)
     allocate = bind(library, "XMemAllocatePhysicalPages", [number, C.POINTER(number), C.POINTER(number)], C.c_int)
     release = bind(library, "XMemFreePhysicalPages", [number, C.POINTER(number)], C.c_int)
     contiguous = bind(library, "XMemMapPhysicalPages", [pointer, number, C.POINTER(number)], pointer)
-    get_factory = bind(xcrdapi, "DStorageGetFactory", [C.c_void_p, C.POINTER(C.c_void_p)], C.c_long)
+    commit = bind(kernel, "VirtualAlloc", [pointer, number, C.c_ulong, C.c_ulong], pointer)
     reserve = bind(kernel, "VirtualAlloc2", [pointer, pointer, number, C.c_ulong, C.c_ulong, pointer, C.c_ulong],
                    pointer)
     free = bind(kernel, "VirtualFree", [pointer, number, C.c_ulong], C.c_int)
@@ -70,7 +86,10 @@ def main(xmem_path, xcrdapi_path):
     assert first and second, C.get_last_error()
     count, pages = number(2), (number * 2)()
     one, other = number(0), number(0)
+    extra = None
     try:
+        extra = commit(None, 16 << 20, 0x3000, 4)  # MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE
+        assert extra, C.get_last_error()
         # Two live sections are visible while the heartbeat samples.
         assert allocate(PHYSICAL_64K, C.byref(count), pages) and count.value == 2
         one.value, other.value = pages[0], pages[1]
@@ -78,29 +97,21 @@ def main(xmem_path, xcrdapi_path):
         assert contiguous(second, 1, C.byref(other)) == second
         _, earlier_peak = process_commit()
 
-        factory = C.c_void_p()
-        assert get_factory(None, C.byref(factory)) == 0 and factory.value, "DStorageGetFactory failed"
-
-        deadline = time.monotonic() + 25
-        match = None
-        while match is None and time.monotonic() < deadline:
-            match = HEARTBEAT.search(log.read_text(errors="replace"))
-            if match is None:
-                time.sleep(0.2)
-        assert match, "no heartbeat line with commit peak and physical-page sections: " + \
-            log.read_text(errors="replace")[-1200:]
-        second_mark, peak_mib, current_mib, sections = (int(value) for value in match.groups())
+        second_mark, peak_mib, current_mib, sections = wait_for_sample(
+            log, lambda sample: sample[0] > first_sample[0] and sample[3] == "2")
         _, later_peak = process_commit()
-        line = log.read_text(errors="replace").splitlines()
-        line = next(text for text in line if "x2w-dstorage heartbeat" in text and "commit peak=" in text)
         assert peak_mib >= current_mib > 0, f"implausible commit: peak={peak_mib} MiB current={current_mib} MiB"
-        assert sections == 2, f"heartbeat counted {sections} live sections, expected 2"
-        assert peak_mib >= earlier_peak // (1 << 20), "heartbeat peak predates the process peak"
-        assert peak_mib <= later_peak // (1 << 20), "heartbeat peak exceeds the process peak read afterwards"
-        print(f"heartbeat at {second_mark} s: commit peak={peak_mib} MiB current={current_mib} MiB, "
-              f"live physical-page sections={sections}")
-        print(line.strip())
+        assert earlier_peak // (1 << 20) <= peak_mib <= later_peak // (1 << 20)
+
+        assert free(extra, 0, WIN_RELEASE), C.get_last_error()
+        extra = None
+        released = wait_for_sample(log, lambda sample: sample[0] > second_mark and sample[3] == "2")
+        assert released[1] == peak_mib and released[2] <= current_mib - 8, (peak_mib, current_mib, released)
+        print(f"sections unknown at {first_sample[0]} s, then {sections} at {second_mark} s; "
+              f"commit fell from {current_mib} to {released[2]} MiB at unchanged peak {peak_mib} MiB")
     finally:
+        if extra:
+            free(extra, 0, WIN_RELEASE)
         if count.value:
             contiguous(first, 1, None)
             contiguous(second, 1, None)

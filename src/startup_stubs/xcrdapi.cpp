@@ -791,11 +791,12 @@ MemorySample memory_sample() noexcept
         sample.commit_known = true;
     }
     using PageStats = BOOL(WINAPI*)(ULONGLONG*);
-    static const PageStats page_stats = [] {
-        const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
-        return xmem ? reinterpret_cast<PageStats>(GetProcAddress(xmem, "x2w_xmem_page_stats")) : nullptr;
-    }();
-    sample.sections_known = page_stats && page_stats(&sample.sections);
+    HMODULE xmem = nullptr;
+    if (GetModuleHandleExW(0, L"xmem.dll", &xmem)) {
+        const auto page_stats = reinterpret_cast<PageStats>(GetProcAddress(xmem, "x2w_xmem_page_stats"));
+        sample.sections_known = page_stats && page_stats(&sample.sections);
+        FreeLibrary(xmem);
+    }
     return sample;
 }
 
@@ -812,20 +813,22 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     // what the run spends (#1199), including while requests are stalled.
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
-        ULONGLONG last_peak_mib = 0, last_sections = 0;
+        MemorySample last_memory;
         for (int second = 10;; second += 10) {
             Sleep(10000);
             const LONG total = requests_done + requests_compressed + requests_failed;
             const LONG total2 = total + requests_bcpack_blank;
             const MemorySample sample = memory_sample();
             const ULONGLONG peak_mib = sample.peak_commit >> 20;
-            const ULONGLONG sections = sample.sections_known ? sample.sections : 0;
-            if (total2 != last || peak_mib != last_peak_mib || sections != last_sections) {
+            const ULONGLONG current_mib = sample.commit >> 20;
+            if (total2 != last || peak_mib != (last_memory.peak_commit >> 20) ||
+                current_mib != (last_memory.commit >> 20) || sample.sections != last_memory.sections ||
+                sample.commit_known != last_memory.commit_known || sample.sections_known != last_memory.sections_known) {
                 char memory[96];
                 if (sample.commit_known)
                     std::snprintf(memory, sizeof(memory), "commit peak=%llu MiB current=%llu MiB",
                                   static_cast<unsigned long long>(peak_mib),
-                                  static_cast<unsigned long long>(sample.commit >> 20));
+                                  static_cast<unsigned long long>(current_mib));
                 else
                     std::snprintf(memory, sizeof(memory), "commit unknown");
                 char section_text[24];
@@ -839,8 +842,7 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                     requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, memory,
                     section_text);
                 last = total2;
-                last_peak_mib = peak_mib;
-                last_sections = sections;
+                last_memory = sample;
             }
         }
     }, nullptr, 0, nullptr);
