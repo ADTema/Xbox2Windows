@@ -1188,7 +1188,7 @@ class Stage:
 
     # VOPC with sub-dword addressing (tools/disasm_rdna2.py _decode_vopc_sdwa prints it): each source
     # reads its src0_sel/src1_sel field, zero-extended or, under sext(), sign-extended, and the
-    # compare then reads that 32-bit value as its type. Float sources keep the whole dword only.
+    # compare then reads that 32-bit value as its type. Integer compares only (see compare()).
     def compare_sdwa_sources(self, base, typ, ops, mods):
         fields = {}
         for m in mods:
@@ -1201,13 +1201,6 @@ class Stage:
             selection = fields.get('src%d_sel' % index)
             if not selection:
                 raise Unsupported('%s SDWA without src%d_sel' % (base, index))
-            if typ == 'f32':
-                # The decoder prints neg/abs on float sources and never sext(); a byte or word of a
-                # float source has no lowering here.
-                if selection != 'DWORD':
-                    raise Unsupported('%s with src%d_sel:%s on a float source' % (base, index, selection))
-                sources.append(self.f(token))
-                continue
             sext = token.startswith('sext(') and token.endswith(')')
             if sext:
                 token = token[len('sext('):-1]
@@ -1227,6 +1220,10 @@ class Stage:
         # Conditions outside the table, v_cmp_class_* among them, stay refused in both forms.
         if cond not in table:
             raise Unsupported(base)
+        if sdwa and typ == 'f32':
+            # The f32 predicates are shared with the non-SDWA forms, whose lg/nlg do not yet follow the
+            # ordered RDNA 2 definition for NaN (#1920). SDWA keeps them refused until that is verified.
+            raise Unsupported('%s: f32 SDWA compares are not lowered' % base)
         if sdwa:
             # v_cmpx_*_sdwa prints its two sources and writes EXEC (gfx10 forbids sdst_en there);
             # v_cmp_*_sdwa first prints vcc_lo or the SGPR it writes.

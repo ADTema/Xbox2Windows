@@ -673,9 +673,9 @@ These are measured on one executable; treat them as hypotheses for others.
   stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
   The VOPC SDWA compares (`v_cmp_*_sdwa`, `v_cmpx_*_sdwa`) of the existing 32-bit compare table lower
   too: i32 and u32 sources take their `src0_sel`/`src1_sel` field, sign-extended under `sext()`, and
-  the compare reads the extended value as its type; f32 sources take whole-dword selects only. The
+  the compare reads the extended value as its type. f32 SDWA compares stay refused (#1920). The
   result goes to `vcc_lo`, the printed SGPR, or EXEC for `v_cmpx`, as in the non-SDWA forms. Class
-  compares, a byte or word select on a float source and any other SDWA modifier are refused. Run
+  compares, f32 compares and any other SDWA modifier are refused. Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vopc_sdwa"`: the controls evaluate every
   integer form against an integer reference, and the draws on WARP and hardware check 16 x 16 pixels
   that a `v_cmpx_le_i32_sdwa` on a sign-extended byte keeps or discards, with translations that drop

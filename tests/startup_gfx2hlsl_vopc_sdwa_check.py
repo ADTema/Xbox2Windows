@@ -21,8 +21,8 @@ bytes and words differ from the whole dword and carry the sign bit. The referenc
 arithmetic from the ISA meaning: the selected field, zero- or sign-extended to 32 bits, compared as the type says.
 The value set is checked to separate a lowering that ignores the select or sext() from the reference.
 
-Float compares: only whole-dword selects are lowered, and their text equals the non-SDWA form's (the existing float
-source handling, neg and abs included). A byte or word select on a float source is refused.
+Float compares are refused in their SDWA form: their predicates are shared with the non-SDWA forms, whose lg/nlg do
+not yet follow the ordered RDNA 2 definition for NaN (#1920), so no f32 SDWA lowering is claimed here.
 
 Refused: class compares, a float source with a sub-dword select, an SDWA modifier the decoder does not print for
 compares, a missing or repeated select, and a destination that is not vcc_lo, EXEC or an SGPR.
@@ -258,8 +258,8 @@ def controls():
           and all(expr.run({'s3': a, 'v2': b})[0] == int(field(a, 'BYTE_3', True) != field(b, 'WORD_1', False))
                   for a, b in PAIRS), str((asm, stage.lines)))
 
-    # 6. Float compares: DWORD selects lower exactly as the non-SDWA form, neg and abs included.
-    wrong, float_forms = [], 0
+    # 6. Float compares stay refused in their SDWA form, with every modifier and destination.
+    accepted, float_forms = [], 0
     modifiers = [(False, False), (True, False), (False, True), (True, True)]
     for op, (cmpx, cond, typ) in sorted(COMPARES.items()):
         if typ != 'f32' or cond in ('class', 'tru'):
@@ -268,16 +268,11 @@ def controls():
             for destination in (('exec',) if cmpx else ('vcc', 'sgpr')):
                 code = vopc_sdwa(op, source('v', 1, neg=neg0, absolute=abs0), source('v', 2, neg=neg1, absolute=abs1),
                                  SGPR_DST if destination == 'sgpr' else None)
-                asm, stage = translate(code)
-                name, operands = asm.split(' src0_sel', 1)[0].split(' ', 1)
-                plain = Probe()
-                plain_name = name[:-len('_sdwa')] + '_e64'
-                plain.one(plain_name, '%s %s' % (plain_name, operands))
+                name, asm = decode_one(code)
                 float_forms += 1
-                if stage.lines != plain.lines:
-                    wrong.append((asm, stage.lines, plain.lines))
-    check('%d float DWORD forms match the non-SDWA lowering' % float_forms, not wrong and float_forms == 15 * 16 * 3,
-          str(wrong[:2]))
+                if refusal(name, asm) != '%s: f32 SDWA compares are not lowered' % name:
+                    accepted.append(asm)
+    check('%d float SDWA forms refused' % float_forms, not accepted and float_forms == 15 * 16 * 3, str(accepted[:2]))
 
     # 7. Refusals, each with its own message.
     def expect(label, name, asm, message):
@@ -293,8 +288,7 @@ def controls():
         for sel in SELS[:-1]:
             sels = ('DWORD', sel) if index else (sel, 'DWORD')
             name, asm = decode_one(vopc_sdwa(0x01, source('v', 1), source('v', 2), None, *sels))
-            expect('float src%d_sel:%s' % (index, sel), name, asm,
-                   'v_cmp_lt_f32_sdwa with src%d_sel:%s on a float source' % (index, sel))
+            expect('float src%d_sel:%s' % (index, sel), name, asm, 'v_cmp_lt_f32_sdwa: f32 SDWA compares are not lowered')
     base = 'v_cmp_lt_i32_sdwa vcc_lo, v1, v2'
     for extra in ('clamp', 'dst_sel:DWORD', 'dst_unused:UNUSED_PAD', 'src2_sel:DWORD', 'mul:2'):
         expect('modifier %s' % extra, 'v_cmp_lt_i32_sdwa', '%s src0_sel:DWORD src1_sel:DWORD %s' % (base, extra),

@@ -5899,10 +5899,10 @@ conversion's output modifier inside an SDWA form is still refused rather than dr
 
 **VOPC SDWA compares (#1906).** `compare()` refused every `v_cmp*_sdwa` and `v_cmpx*_sdwa`. It now lowers the
 SDWA forms of its 32-bit table. An i32 or u32 source reads its `src0_sel`/`src1_sel` field through `sdwa_source`,
-sign-extended under `sext()`, and the compare reads that 32-bit value as its type. An f32 source accepts only a
-`DWORD` select and keeps the existing float operand handling, so its text equals the non-SDWA form's. The
+sign-extended under `sext()`, and the compare reads that 32-bit value as its type. f32 compares stay refused
+in their SDWA form until their predicates are verified for NaN independently of the non-SDWA text (#1920). The
 destination is `vcc_lo`, the SGPR the decoder prints, or EXEC for `v_cmpx` with the same EXEC masking as before.
-Class compares, a byte or word select on a float source, a missing or repeated select and any other SDWA modifier
+Class compares, f32 compares, a missing or repeated select and any other SDWA modifier
 (`clamp`, `dst_sel`, an output modifier) are refused. `startup_gfx2hlsl_vopc_sdwa` evaluates the emitted HLSL of
 all 32 integer compares (v_cmp into `vcc_lo` and into an SGPR, v_cmpx into EXEC) times every select and `sext()`
 on both sources, 9408 forms, over 64 source pairs each, against a plain integer reference. The draws
