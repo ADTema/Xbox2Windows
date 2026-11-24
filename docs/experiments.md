@@ -10865,11 +10865,12 @@ ctest --preset dev --no-tests=error -R "^startup_rtv_bind_(warp|hardware)$" -V
 ### Measured results and open scope
 
 The fixture (`tests/startup_rtv_bind.cpp`) expects one accepted bind each for the array form, the single range with
-one handle, the single range with two handles and the two-handle array, and one unresolved handle each for a range that
-reaches an empty view and for an empty view alone, with no accepted bind. It then copies a view with
-`CopyDescriptorsSimple`, clears the copy red and requires target 0 to read back `ff0000ff`. It was compiled with
-MinGW (syntax only) and has not been run on a Windows desktop device. Not covered: a draw after a single-range bind
-(the fixture does not draw), and what a title does with a bind that stays refused for the other reasons (wrong
+one handle, the single range with two handles and the two-handle array, no change for count zero with a null handle
+array, and one unresolved handle each for a range that reaches an empty view, an empty view alone, a count above eight,
+and a clear on an empty view, with no accepted bind. It then copies a view with `CopyDescriptorsSimple`, clears the copy
+red and requires target 0 to read back `ff0000ff`. Passed on Windows Server 2025 (Build 26100, MSVC 14.44.35207, D3D12
+WARP) in both `dev` and `release` (`/O2`) presets. Not covered: physical hardware adapters, a draw after a single-range
+bind (the fixture does not draw), and what a title does with a bind that stays refused for the other reasons (wrong
 kind, one read-only depth plane).
 
 ## VEX scalar comparison parity differential
