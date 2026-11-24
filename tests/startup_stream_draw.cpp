@@ -293,6 +293,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         const D3D12_VERTEX_BUFFER_VIEW view{reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(vertices), sizeof(vertices), sizeof(vertices[0])};
         invoke(list, 48, 0, 1, arg(&view));
         invoke(list, 12, 6, 1);
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
+        extern int draw_root_reset(void*, void*);
+        if (const int result = draw_root_reset(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FRAME_COPY", nullptr, 0)) {
         extern int draw_frame_copies(ID3D12Device*, void*, void*, UINT, UINT);
         if (const int result = draw_frame_copies(desktop.Get(), guest, list, width, height)) return result;
