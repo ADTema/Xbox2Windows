@@ -226,7 +226,7 @@ int main(int argc, char** argv)
     // DepthBoundsTestEnable has no translated equivalent: the pipeline is refused for drawing, not translated without it.
     void* pso_front_bounds = create_stream_pso(guest, root, vs_front, ps_green, ds_less, true, TRUE);
     if (!pso_front_bounds || !pso_front_less || !pso_back_less || !pso_front_off || !pso_back_off || !pso_front_depth_only) return 9;
-    if (argc == 7) return 0;
+    if (argc == 8) return 0;
 
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
