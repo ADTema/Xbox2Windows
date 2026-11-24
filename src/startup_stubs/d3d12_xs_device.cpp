@@ -33,6 +33,7 @@
 #include "null_texture_view.h"
 #include "packed_target_format.h"
 #include "state_block_blend.h"
+#include "title_heap_memory.h"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
@@ -2107,10 +2108,14 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     std::uint64_t title_memory = extra[0] >= 0x10000 && extra[1] == bytes ? extra[0] : 0;
     // The title copies descriptors between heaps with its own memory copies. A view heap without
     // title memory therefore gets plain memory of ours as its CPU side, so that the view ids written
-    // there (note_view) travel with those copies; the desktop heap behind it is still filled.
-    if (!title_memory && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && bytes)
-        title_memory = reinterpret_cast<std::uint64_t>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    if (did_clamp && !title_memory) { heap->Release(); return E_OUTOFMEMORY; }
+    // there (note_view) travel with those copies; the desktop heap behind it is still filled. A heap
+    // of another type gets the same when its desktop start is not an address (title_heap_memory.h).
+    if (!x2w_startup::ensure_title_heap_memory(desc->Type, desktop, bytes, title_memory, [](u64 size) {
+        return reinterpret_cast<u64>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    })) {
+        heap->Release();
+        return E_OUTOFMEMORY;
+    }
     Wrapper* w = wrap(heap, descriptor_heap_kind);
     if (title_memory) {
         w->own().title_cpu = title_memory;

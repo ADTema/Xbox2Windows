@@ -78,6 +78,30 @@ Checks:
   drawn as controls and never substituted; a packed view of a plain R8G8B8A8_UNORM texture and a
   B5G5R5A1 view of a B4G4R4A4 target must be refused.
 
+## Descriptor heap starts that are not addresses
+
+A console executable treats the CPU start of a descriptor heap as an address. A desktop handle is
+opaque, and a translation layer may keep tag bits in its low bits: through vkd3d-proton a sampler
+heap starts at `...007`. With such a start for a heap created without memory of its own, the
+source handle the executable later passed to `CopyDescriptorsSimple` for its shader-visible
+sampler heap had `0xfd` in its top byte, and the copy faulted inside the layer 1.4 s into a run.
+
+A heap whose desktop start is not pointer-aligned therefore gets plain memory of ours as the
+start the executable sees, the way view heaps already do
+(`src/startup_stubs/title_heap_memory.h`); handles inside it are translated to the desktop heap
+on each call. Heaps whose desktop start is an address are unchanged, so nothing changes on an
+adapter whose handles are addresses.
+
+- `ctest --preset release --no-tests=error -R '^startup_title_heap(_tags_control)?$' -V`: the
+  rule, without a device.
+- `ctest --preset release --no-tests=error -R '^startup_title_heap_device_' -V`: through the
+  wrapper, the starts of two sampler heaps, a render-target heap and a depth heap must be aligned
+  addresses, a heap whose desktop start is tagged must have memory of its own, and three samplers
+  are created and copied through handles computed from the starts.
+
+How the executable arrives at the damaged handle is not known; only the handle and the fault were
+observed.
+
 ## Null bindings in translated draws
 
 The `x2w-render totals` line reports `null bindings N`, then the same count split by cause as
