@@ -2695,13 +2695,21 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
         draw_overlay(frame, (now - started) / 1000.0);
     }
+    // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
+    LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
+    if (render_mode() && frame % 300 == 0) {
+        AcquireSRWLockExclusive(&draw_lock);
+        null_total = null_bindings;
+        for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
+        ReleaseSRWLockExclusive(&draw_lock);
+    }
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
             "textures uploaded %ld (%ld KiB, unreadable %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_executes, render_draws, render_draws_skipped,
-            translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings,
-            null_by_cause[0], null_by_cause[1], null_by_cause[2], null_by_cause[3], null_by_cause[4], textures_uploaded,
+            translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
+            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
             texture_bytes_uploaded, textures_unreadable);
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.

@@ -33,6 +33,9 @@ inline bool null_binding_cause_cases()
     if (!count(f, NullCause::table_entry)) return false;
     f = buf;
     f.entry_readable = false;
+    f.bound = true;  // the identity fallback bound an upload-ring view in place of the unreadable entry
+    if (!count(f, NullCause::none)) return false;
+    f.bound = false;
     if (!count(f, NullCause::table_entry)) return false;
     f = buf;
     f.bound = false;
@@ -43,6 +46,8 @@ inline bool null_binding_cause_cases()
     f = buf;
     f.token_magic = true;
     f.token_known = false;
+    f.bound = true;  // same, for an unknown token
+    if (!count(f, NullCause::none)) return false;
     f.bound = false;
     if (!count(f, NullCause::unknown_token)) return false;
     f = tex;

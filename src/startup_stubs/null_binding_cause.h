@@ -27,6 +27,8 @@ struct BindingFacts {
 
 inline NullCause classify_null_binding(const BindingFacts& f)
 {
+    // A buffer that ended up bound (also through the identity fallback) is not a null binding.
+    if (!f.texture && f.bound) return NullCause::none;
     if (f.from_table && !f.entry_readable) return NullCause::table_entry;
     if (f.from_table && f.token_magic && !f.token_known) return NullCause::unknown_token;
     if (f.texture) {
