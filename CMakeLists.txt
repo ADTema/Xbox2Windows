@@ -4104,10 +4104,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME cpu_archive_directory_gpu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_directory_gpu_check.py" "$<TARGET_FILE:pe_map>"
             "${directory_exe}" "$<TARGET_FILE:archive_directory_lifted>" "$<TARGET_FILE:archive_directory_gpu>")
-        set_tests_properties(cpu_archive_directory_gpu_${adapter} PROPERTIES TIMEOUT 90
+        add_test(NAME cpu_archive_sixteen_page_gpu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/archive_directory_multipage_check.py" "$<TARGET_FILE:pe_map>"
+            "${directory_exe}" "$<TARGET_FILE:archive_directory_lifted>" "$<TARGET_FILE:archive_directory_gpu>")
+        set_tests_properties(cpu_archive_directory_gpu_${adapter} cpu_archive_sixteen_page_gpu_${adapter} PROPERTIES TIMEOUT 90
             ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter}")
     endforeach()
-    set_tests_properties(cpu_archive_directory_gpu_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(cpu_archive_directory_gpu_hardware cpu_archive_sixteen_page_gpu_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
     function(crc_line_program target polynomial)
         # Use the same CRC object optimization flags in Debug and Release.
