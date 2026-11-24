@@ -34,7 +34,10 @@ int draw_logical_tables(ID3D12Device* desktop, void* guest, void* list)
         ComPtr<ID3D12DescriptorHeap> probe;
         return SUCCEEDED(desktop->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&probe)));
     };
-    if (accepts(count)) return 77;
+    if (accepts(count)) {
+        std::printf("adapter accepts %u descriptors directly; the logical view tables are not needed here\n", count);
+        return 77;
+    }
     UINT boundary = 0, upper = 1048577;
     while (upper - boundary > 1) {
         const UINT n = boundary + (upper - boundary) / 2;
