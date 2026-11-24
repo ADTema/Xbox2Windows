@@ -10,6 +10,14 @@
 //   ordinary-min-lod1   the ordinary sampler clamps MinLOD to 1, selecting t1's 1x1 mip (0.625);
 //                       only word 2 should change.
 //
+// A "multi" prefix (multi, multi-<control>) runs the two-sampler module shared_sampler_multi.spvasm: comparison
+// samplers s2 and s6, each also feeding one ordinary sample, whose two lowered samplers sit at the two
+// registers given as "<first>,<second>" (first for the sampler declared first, cmpA at s2). Outputs are
+// word 0 SampleCmp(cmpA, texel 0.5, ref 0.25), word 1 SampleCmp(cmpB, texel 0.75, ref 0.875), word 2
+// ordinary A (0.375) and word 3 ordinary B (0.875). One static sampler changes per control, each moving
+// only its own word: comparison-a-greater (word 0), comparison-b-greater (word 1), ordinary-a-min-lod1
+// (word 2, to 0.625) and ordinary-b-min-lod1 (word 3, to 0.625); the other 12 words are guards.
+//
 // An "array-" prefix (array, array-comparison-greater, array-ordinary-min-lod1) makes t0 and t1
 // two-layer Texture2DArray resources for the arrayed module (shared_sampler_array.spvasm). Layer 0
 // holds the texels above; layer 1 holds a different top-left texel in each texture (depth 0.875, so
@@ -29,6 +37,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 constexpr UINT comparison_register = 2;
+constexpr UINT second_comparison_register = 6;
 constexpr UINT output_words = 16;
 constexpr UINT guard = 0xc5c5c5c5u;
 
@@ -43,18 +52,43 @@ std::vector<char> read_file(const char* path, const char* what)
 void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, const char* ordinary_register,
                                  const char* reference_path, const char* descriptors)
 {
-    char* end = nullptr;
-    const unsigned long ordinary = std::strtoul(ordinary_register, &end, 10);
-    if (!*ordinary_register || *end || ordinary == comparison_register || ordinary > 15)
-        throw std::runtime_error("Ordinary sampler register must be 0-15 and differ from s2");
     const std::string_view variant = descriptors ? descriptors : "baseline";
+    // "multi" alone is the two-sampler baseline; "multi-<v>" is control v on it.
+    const bool multi = variant == "multi" || variant.substr(0, 6) == "multi-";
+    std::vector<UINT> ordinary_registers;
+    for (const char* cursor = ordinary_register;;) {
+        char* end = nullptr;
+        const unsigned long value = std::strtoul(cursor, &end, 10);
+        if (end == cursor || value > 15 || (*end && *end != ','))
+            throw std::runtime_error("Ordinary sampler registers must be numbers 0-15 separated by commas");
+        ordinary_registers.push_back(static_cast<UINT>(value));
+        if (!*end) break;
+        cursor = end + 1;
+    }
+    if (ordinary_registers.size() != (multi ? 2u : 1u))
+        throw std::runtime_error("Ordinary sampler registers: one for a single module, two for multi");
+    for (UINT i = 0; i < ordinary_registers.size(); ++i) {
+        if (ordinary_registers[i] == comparison_register || (multi && ordinary_registers[i] == second_comparison_register))
+            throw std::runtime_error("Ordinary sampler register must differ from the comparison samplers");
+        for (UINT j = 0; j < i; ++j)
+            if (ordinary_registers[i] == ordinary_registers[j])
+                throw std::runtime_error("Ordinary sampler registers must be distinct");
+    }
     // "array" alone is the arrayed baseline; "array-<v>" is variant v on the arrayed textures.
     const bool arrayed = variant == "array" || variant.substr(0, 6) == "array-";
-    const std::string_view samplers_variant = variant == "array" ? "baseline" : arrayed ? variant.substr(6) : variant;
-    if (samplers_variant != "baseline" && samplers_variant != "comparison-greater" &&
-        samplers_variant != "ordinary-min-lod1")
+    const std::string_view samplers_variant = variant == "array" || variant == "multi" ? "baseline"
+                                              : arrayed || multi ? variant.substr(variant.find('-') + 1) : variant;
+    if (multi) {
+        if (samplers_variant != "baseline" && samplers_variant != "comparison-a-greater" &&
+            samplers_variant != "comparison-b-greater" && samplers_variant != "ordinary-a-min-lod1" &&
+            samplers_variant != "ordinary-b-min-lod1")
+            throw std::runtime_error("Multi descriptor variant must be multi or multi-<comparison-a-greater, "
+                                     "comparison-b-greater, ordinary-a-min-lod1 or ordinary-b-min-lod1>");
+    } else if (samplers_variant != "baseline" && samplers_variant != "comparison-greater" &&
+               samplers_variant != "ordinary-min-lod1") {
         throw std::runtime_error("Descriptor variant must be baseline, comparison-greater or ordinary-min-lod1, "
-                                 "optionally as array or array-<variant>");
+                                 "optionally as array or array-<variant>, or a multi variant");
+    }
     const UINT layers = arrayed ? 2 : 1;
     const auto shader = read_file(shader_path, "comparison-sampler shader");
     const auto reference_bytes = read_file(reference_path, "comparison-sampler reference");
@@ -69,20 +103,27 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
     parameters[0].DescriptorTable = {1, &textures};
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     parameters[1].Descriptor = {4, 0};
-    D3D12_STATIC_SAMPLER_DESC samplers[2]{};
-    for (UINT i = 0; i < 2; ++i) {
+    // Per module: a comparison sampler followed by its ordinary sampler, once (single) or twice (multi).
+    D3D12_STATIC_SAMPLER_DESC samplers[4]{};
+    const UINT sampler_count = multi ? 4 : 2;
+    for (UINT i = 0; i < sampler_count; ++i) {
         auto& s = samplers[i];
-        const bool comparison = i == 0;
+        const UINT pair = i / 2;
+        const bool comparison = i % 2 == 0;
         s.Filter = comparison ? D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_POINT;
         s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         s.MaxAnisotropy = 1;
         s.ComparisonFunc = comparison ? D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS;
         s.MaxLOD = D3D12_FLOAT32_MAX;
-        s.ShaderRegister = comparison ? comparison_register : static_cast<UINT>(ordinary);
+        s.ShaderRegister = comparison ? (pair == 0 ? comparison_register : second_comparison_register)
+                                      : ordinary_registers[pair];
     }
-    if (samplers_variant == "comparison-greater") samplers[0].ComparisonFunc = D3D12_COMPARISON_FUNC_GREATER;
-    if (samplers_variant == "ordinary-min-lod1") samplers[1].MinLOD = 1.0f;
-    D3D12_ROOT_SIGNATURE_DESC root_desc{2, parameters, 2, samplers, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    if (samplers_variant == "comparison-greater" || samplers_variant == "comparison-a-greater")
+        samplers[0].ComparisonFunc = D3D12_COMPARISON_FUNC_GREATER;
+    if (samplers_variant == "ordinary-min-lod1" || samplers_variant == "ordinary-a-min-lod1") samplers[1].MinLOD = 1.0f;
+    if (samplers_variant == "comparison-b-greater") samplers[2].ComparisonFunc = D3D12_COMPARISON_FUNC_GREATER;
+    if (samplers_variant == "ordinary-b-min-lod1") samplers[3].MinLOD = 1.0f;
+    D3D12_ROOT_SIGNATURE_DESC root_desc{2, parameters, sampler_count, samplers, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> root_bytes, error;
     check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &root_bytes, &error),
           "Serialize comparison-sampler root signature");
@@ -206,8 +247,11 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
         std::fprintf(stderr, "word=%u expected=%08x actual=%08x\n", i, expected[i], actual[i]);
         ++mismatches;
     }
-    std::printf("descriptors=%.*s outputs=%08x,%08x,%08x sampler_registers=s%u,s%lu compared_words=%u mismatches=%u\n",
-                static_cast<int>(variant.size()), variant.data(), actual[0], actual[1], actual[2],
-                comparison_register, ordinary, output_words, mismatches);
+    std::string registers = "s" + std::to_string(comparison_register);
+    if (multi) registers += ",s" + std::to_string(second_comparison_register);
+    for (const UINT ordinary : ordinary_registers) registers += ",s" + std::to_string(ordinary);
+    std::printf("descriptors=%.*s outputs=%08x,%08x,%08x,%08x sampler_registers=%s compared_words=%u mismatches=%u\n",
+                static_cast<int>(variant.size()), variant.data(), actual[0], actual[1], actual[2], actual[3],
+                registers.c_str(), output_words, mismatches);
     if (mismatches) throw std::runtime_error("Comparison-sampler readback differs from CPU reference");
 }

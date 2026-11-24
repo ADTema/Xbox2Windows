@@ -12,8 +12,22 @@ from resource_inventory import parts
 # Coverage comparisons: the compare kills the lanes for which it is true, so
 # the generated discard uses the same relation with the scalar limit first.
 KILL_RELATIONS = {"lt": "<", "le": "<=", "gt": ">", "ge": ">="}
-SAMPLED_PRODUCTS = ("v_mul_legacy_f32_e32", "v_mul_f32_e32")
-COVERAGE_COMPARES = tuple(f"v_cmpx_{name}_f32_e32" for name in KILL_RELATIONS)
+# Both the VOP2 (e32) and the VOP3 (e64) spellings are accepted. Only the plain
+# register form is lowered: the e64 encoding also carries clamp, output scale
+# and input negate or absolute value, which the lowering does not model.
+FORMS = ("e32", "e64")
+SAMPLED_PRODUCTS = tuple(
+    f"v_mul{kind}_f32_{form}" for kind in ("_legacy", "") for form in FORMS
+)
+COVERAGE_COMPARES = tuple(
+    f"v_cmpx_{name}_f32_{form}" for name in KILL_RELATIONS for form in FORMS
+)
+
+
+def plain(bank, *tokens):
+    # One unmodified register of the bank, so a modifier suffix or prefix, a
+    # special register or an inline constant is rejected rather than ignored.
+    return all(re.fullmatch(bank + r"\d+", token) for token in tokens)
 
 
 def regs(token, bank, width):
@@ -238,6 +252,10 @@ def lower(decoded, bindings):
             pending_sample.add(match[1])
             samples += 1
         elif op in SAMPLED_PRODUCTS:
+            if len(args) != 3 or not (
+                plain("v", args[0], args[2]) and plain("s", args[1])
+            ):
+                raise ValueError("Unsupported multiply operands or modifiers")
             dst, src, v = args
             scale, value = read(src), vector[v]
             if (
@@ -251,8 +269,10 @@ def lower(decoded, bindings):
                 raise ValueError("Unresolved sampled product")
             # The legacy multiply returns zero when either input is zero; the
             # IEEE multiply keeps NaN for zero times infinity.
-            vector[dst] = ("product", scale[1], value[1], op == SAMPLED_PRODUCTS[0])
+            vector[dst] = ("product", scale[1], value[1], op.startswith("v_mul_legacy_"))
         elif op in COVERAGE_COMPARES:
+            if len(args) != 2 or not (plain("s", args[0]) and plain("v", args[1])):
+                raise ValueError("Unsupported compare operands or modifiers")
             limit, product = read(args[0]), vector[args[1]]
             if (
                 pending
@@ -267,7 +287,7 @@ def lower(decoded, bindings):
                 raise ValueError("Unresolved coverage predicate")
             coverage_exit(decoded[i + 1 :], scalar)
             _, scale, sampled, legacy = product
-            relation = KILL_RELATIONS[op[len("v_cmpx_") : -len("_f32_e32")]]
+            relation = KILL_RELATIONS[op.split("_")[2]]
             multiply = (
                 f"({scale} == 0 || alpha == 0) ? 0.0f : {scale} * alpha"
                 if legacy

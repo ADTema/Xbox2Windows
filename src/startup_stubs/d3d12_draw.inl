@@ -146,6 +146,67 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
         tr.key, tr.uds.size(), tr.srvs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
 
+// draw_lock held. Both pipeline forms use the same request writer and shader cache.
+Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
+                                const std::vector<unsigned char>& root_blob)
+{
+    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes)));
+    auto& entry = translation_by_key()[key];
+    if (!entry) {
+        entry = new Translation;
+        entry->key = key;
+        load_translation(*entry, a, a_bytes, b, b_bytes, root_blob);
+    }
+    return entry;
+}
+
+// Resolve the shader pointers and wrapped root while the caller still owns the stream.
+Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3D12_BLEND_DESC& blend, bool& has_blend)
+{
+    const auto* stream = static_cast<const unsigned char*>(desc.pPipelineStateSubobjectStream);
+    if (!desc.SizeInBytes || desc.SizeInBytes > 0x2000 || desc.SizeInBytes % 8 ||
+        !x2w_local::readable(stream, desc.SizeInBytes)) return nullptr;
+
+    const Wrapper* root = nullptr;
+    D3D12_SHADER_BYTECODE stages[2]{};
+    unsigned seen = 0;
+    for (std::size_t at = 0; at < desc.SizeInBytes;) {
+        unsigned type;
+        std::memcpy(&type, stream + at, sizeof(type));
+        if (type >= std::size(stream_sizes) || stream_sizes[type] > desc.SizeInBytes - at || (seen & (1u << type)))
+            return nullptr;
+        seen |= 1u << type;
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+            std::memcpy(&root, stream + at + 8, sizeof(root));
+        } else if (type >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+            D3D12_SHADER_BYTECODE shader;
+            std::memcpy(&shader, stream + at + 8, sizeof(shader));
+            if (shader.pShaderBytecode || shader.BytecodeLength) {
+                if (type > D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS || shader.BytecodeLength < 32 ||
+                    shader.BytecodeLength > (1u << 20) || !x2w_local::readable(shader.pShaderBytecode, shader.BytecodeLength) ||
+                    std::memcmp(shader.pShaderBytecode, "DXBC", 4)) return nullptr;
+                stages[type - D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS] = shader;
+            }
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) {
+            std::memcpy(&blend, stream + at + sizeof(type), sizeof(blend));
+            has_blend = true;
+        }
+        at += stream_sizes[type];
+    }
+    if (!root || !stages[0].pShaderBytecode || !stages[1].pShaderBytecode) return nullptr;
+    std::vector<unsigned char> root_blob;
+    AcquireSRWLockShared(&note_lock);
+    const auto found = root_blobs().find(root);
+    if (found != root_blobs().end()) root_blob = found->second;
+    ReleaseSRWLockShared(&note_lock);
+    if (root_blob.empty()) return nullptr;
+    AcquireSRWLockExclusive(&draw_lock);
+    auto* result = cached_translation(stages[0].pShaderBytecode, stages[0].BytecodeLength,
+                                      stages[1].pShaderBytecode, stages[1].BytecodeLength, root_blob);
+    ReleaseSRWLockExclusive(&draw_lock);
+    return result;
+}
+
 // draw_lock held.
 BoundPipeline* translation_for(Wrapper* pipeline)
 {
@@ -162,7 +223,10 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         std::size_t where = 0;
         const char* from = "none";
         if (own && own != info && find_blend(own->desc, &bound->blend, &where)) from = "derived description";
-        else if (info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
+        else if (info && info->has_stream_blend) {
+            from = "stream blend subobject";
+            bound->blend = info->stream_blend;
+        } else if (info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
         else if (info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
         bound->has_blend = from[0] != 'n';
         static LONG logged;
@@ -185,6 +249,7 @@ BoundPipeline* translation_for(Wrapper* pipeline)
             }
         }
     }
+    if (info && info->path == 86) result = info->stream_translation;
     if (info && info->path == 57 && info->desc.size() >= 0x60) {
         u64 words[12];
         std::memcpy(words, info->desc.data(), sizeof(words));
@@ -201,17 +266,7 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         const std::size_t a_bytes = static_cast<std::size_t>(words[6]), b_bytes = static_cast<std::size_t>(words[10]);
         if (!root_blob.empty() && a_bytes && b_bytes && a_bytes <= (1u << 20) && b_bytes <= (1u << 20) && x2w_local::readable(a, a_bytes) &&
             x2w_local::readable(b, b_bytes)) {
-            const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes)));
-            auto& by_key = translation_by_key();
-            const auto found = by_key.find(key);
-            if (found != by_key.end()) {
-                result = found->second;
-            } else {
-                result = new Translation;
-                result->key = key;
-                by_key[key] = result;
-                load_translation(*result, a, a_bytes, b, b_bytes, root_blob);
-            }
+            result = cached_translation(a, a_bytes, b, b_bytes, root_blob);
         }
     }
     by_pipeline[pipeline] = bound;
@@ -424,10 +479,8 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const UINT mips = desc.MipLevels ? desc.MipLevels : 1;
     const UINT slices = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
     if (mips > 15) return;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[15];
-    UINT rows[15];
-    UINT64 row_bytes[15], slice_total = 0;
-    device_of(the_device)->GetCopyableFootprints(&desc, 0, mips, 0, footprints, rows, row_bytes, &slice_total);
+    const x2w_startup::SliceFootprints plan(device_of(the_device), desc, mips);
+    const UINT64 slice_total = plan.size;
     if (slice_total == ~0ull || !slice_total) return;
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
     const u64 total = slices > 1 ? stride * (slices - 1) + slice_total : slice_total;
@@ -451,22 +504,21 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         state.generation = generation;
         return;
     }
+    require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
+    for (UINT s = 0; s < slices; ++s)
+        for (UINT i = 0; i < plan.count; ++i) {
+            const auto& fp = plan.placed[i];
+            const u64 bytes = plan.bytes(i);
+            u64 offset = 0;
+            if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
+                state.done = false;
+                return;
+            }
+            plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
+        }
     state.hash = hash;
     state.generation = generation;
     state.done = true;
-    require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
-    for (UINT s = 0; s < slices; ++s)
-        for (UINT m = 0; m < mips; ++m) {
-            const auto& fp = footprints[m];
-            const u64 bytes = u64{fp.Footprint.RowPitch} * rows[m] * fp.Footprint.Depth;
-            u64 offset = 0;
-            if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) continue;
-            D3D12_TEXTURE_COPY_LOCATION source{upload_ring, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            source.PlacedFootprint = {offset, fp.Footprint};
-            D3D12_TEXTURE_COPY_LOCATION target{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            target.SubresourceIndex = m + s * mips;
-            list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
-        }
     InterlockedIncrement(&textures_uploaded);
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
     static LONG shown;

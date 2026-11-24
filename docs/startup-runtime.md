@@ -88,6 +88,7 @@ adds memory dumps to the stop report.
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
+| `X2W_XG_BC7_4K_S_LAYOUT=1` | opts into the BC7 layout-query diagnostic when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
 ## Findings
@@ -118,7 +119,13 @@ These are measured on one executable; treat them as hypotheses for others.
 ## Shortcuts that are known to be wrong
 
 - BCPack requests are completed with zero-filled destinations (blank textures).
-- XG layouts are the desktop copyable-footprint layout, not the console tiling.
+- The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
+  reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
+  `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
+  The diagnostic selects the profile explicitly. Native XG selector values still need
+  independent evidence. `CopyIntoSubresource` returns `E_NOTIMPL` for this profile because
+  the copy and upload paths still use desktop footprints. The reported pitch describes the
+  padded block-row extent of the surface.
 - The default translator uses a static default sampler for a dynamically indexed sampler-heap load.
   With the sampler-heap opt-in, translated draws snapshot the bound heap's 16-byte sampler entries and
   bind a private desktop table beside the static samplers. Missing, out-of-range, or unreadable entries
@@ -127,5 +134,33 @@ These are measured on one executable; treat them as hypotheses for others.
   Wrapped sampler heaps keep the 16-byte title stride separate from the desktop descriptor increment
   for CPU handles and descriptor copies.
   The source-built readback uses `ctest --preset dev --no-tests=error -R '^startup_sampler_heap_' -V`.
-- Stream pipelines (console subobject streams) have no shader translation.
+- Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
+  complete shader containers and a wrapped root through WARP, runs `gfx2hlsl.py --pending`, and
+  reloads the compiled stages. A second fixture draws a clipped triangle through the translated
+  pipeline, submits the wrapped list, waits for its fence and checks all 32 RGBA pixels on WARP and
+  hardware. Swapping the red/green shader changes the 16 covered pixels. Reproduce with
+  `ctest --preset release --no-tests=error -R "^startup_stream_(request|draw)_"`.
+  Other stage combinations and full stream rasterizer/depth state remain open.
+- Translating the captured console colour-blend register state blocks remains open (#1216).
+  A graphics stream can supply a desktop `D3D12_BLEND_DESC` directly. `src/startup_stubs/cb_blend.h`
+  decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It
+  refuses forms D3D12 can't express (`BOTH_SRC_ALPHA`, constant alpha without alpha blend factor
+  support, MIN/MAX with factors other than ONE). Its draws match a CPU model of the register fields
+  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`). Where those registers sit in the
+  state block is not measured yet, so the draw path doesn't call it.
 - Audio produces no output.
+
+
+## NV12 plane upload
+
+For a single-mip, single-sample, even-sized 2D NV12 image the desktop stand-in
+reports two linear footprints. XG copies luma and interleaved chroma separately,
+and the draw uploader addresses both D3D12 subresources. NV12 arrays remain
+unsupported. The source-built draw compares a synthetic image and its U/V-swapped
+control against the same integer colour conversion on the CPU. This verifies
+the stand-in path; the texture format used in the reported video remains to be confirmed.
+
+```powershell
+cmake --build --preset release --target startup_nv12_draw d3d12_xs_shim
+ctest --preset release --no-tests=error -R '^startup_nv12_draw_' -V
+```
