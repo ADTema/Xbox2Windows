@@ -151,6 +151,46 @@ def source():
     return lower(decoded, [0x1003], (3, 1))
 
 
+ALU_PROGRAM = PROGRAM.copy()
+ALU_PROGRAM[-2:-2] = [
+    # Carry out of an add and no borrow from a subtract; multiplies keep SCC.
+    "s_add_u32 s5, 1, 0xffffffff",
+    "s_mul_i32 s6, s5, 7",
+    "s_cselect_b32 s14, 0x3e800000, 0",
+    "s_sub_u32 s9, 11, 3",
+    "s_mul_i32 s6, s9, 0x07800000",
+    "s_cselect_b32 s4, 0, 0x3e000000",
+    "v_mov_b32_e32 v11, 0x3f000000",
+    "v_or_b32_e32 v11, 0x200000, v11",
+    "v_xor_b32_e32 v12, 0x600000, v11",
+    "v_min_u32_e32 v13, v11, v12",
+    "v_max_u32_e32 v14, v11, v12",
+    "v_mov_b32_e32 v16, 0x100000",
+    "v_sub_nc_u32_e32 v15, v14, v16",
+    # The sign bit makes these differ from signed comparisons.
+    "v_max_u32_e32 v17, 0xbfc00000, v13",
+    "v_min_u32_e32 v18, 0xbfc00000, v13",
+    "v_add_f32_e32 v3, s14, v3",
+    "v_add_f32_e32 v3, s4, v3",
+    "v_add_f32_e32 v3, s6, v3",
+    "v_add_f32_e32 v3, v15, v3",
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v17, v3",
+]
+# Operands of the float adds above, as bit patterns.
+ALU_OPERANDS = (0x3e800000, 0x3e000000, 0x3c000000, 0x3f300000, 0x3f200000, 0xbfc00000)
+
+
+def alu_draw():
+    # 0.5 + 0.25 + 0.125 + 2**-7 + 0.6875 + 0.625 - 1.5, all exact in binary32.
+    depth = 0.6953125
+    positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
+    return (
+        lower(enumerate_pcs(ALU_PROGRAM), [4099], (3, 1)),
+        [(triangle_inputs(), positions, True)],
+    )
+
+
 def binary(tmp, assembler, objcopy, library, *, program=None, words=None, header=None):
     from pixel_aot_check import envelope
     from pixel_aot import _read_named_container
@@ -221,6 +261,7 @@ def binary(tmp, assembler, objcopy, library, *, program=None, words=None, header
         subprocess.run([*command, "--compute-fallback"], check=True)
         expected = lower(enumerate_pcs(program), words, (3, 1), header, compute_fallback=True)
         assert translated.read_text() == expected
+    return translated.read_text()
 
 
 def offset_draw():
@@ -258,6 +299,11 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as directory:
         if sys.argv[1] == "binary":
             binary(Path(directory), *sys.argv[2:])
+            text = binary(
+                Path(directory), *sys.argv[2:], program=ALU_PROGRAM, words=[4099]
+            )
+            for operand in ALU_OPERANDS:
+                assert f"asfloat(0x{operand:08x}u)" in text, hex(operand)
             sys.exit(0)
         clipped = triangle_inputs()
         struct.pack_into("<f", clipped, 4, -0.625)  # Plus 0.375 gives Z = -0.25.
@@ -277,4 +323,5 @@ if __name__ == "__main__":
                 pixel_source=winding_pixel,
             )
             or draw(*sys.argv[1:], Path(directory), *offset_draw())
+            or draw(*sys.argv[1:], Path(directory), *alu_draw())
         )
