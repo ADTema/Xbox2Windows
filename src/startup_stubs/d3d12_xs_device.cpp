@@ -104,21 +104,107 @@ struct DescriptorRange {
     std::uint64_t desktop;
     UINT title_stride;
     UINT desktop_stride;
+    // How many title descriptors the desktop heap covers. Normally the whole heap; shorter only when
+    // the console heap was larger than the driver accepts and the stand-in emulated the remainder.
+    std::uint64_t desktop_descriptors;
 };
 SRWLOCK descriptor_lock = SRWLOCK_INIT;
 std::vector<DescriptorRange> descriptor_ranges;
+
+// Desktop rejects a shader-visible CBV/SRV/UAV heap above a driver-specific descriptor count: the
+// API documents 1,048,576, but a driver may accept fewer (1,000,000 on the GTX 1660 SUPER here), so
+// the accepted maximum is measured once and cached rather than assumed.
+constexpr std::uint64_t view_heap_probe_floor = 65536;
+
+void log(const char* format, ...);
+bool first_calls(LONG& counter, LONG limit);
+std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
 
 std::uint64_t desktop_cpu_handle(std::uint64_t handle)
 {
     AcquireSRWLockShared(&descriptor_lock);
     std::uint64_t result = handle;
+    bool past_limit = false;
+    std::uint64_t past_index = 0, past_capacity = 0;
     for (const auto& r : descriptor_ranges) {
         if (handle < r.title || handle - r.title >= r.bytes) continue;
         const auto offset = handle - r.title;
+        if (r.title_stride) {
+            const std::uint64_t index = offset / r.title_stride;
+            if (index >= r.desktop_descriptors) {
+                // The title addressed a descriptor the desktop heap does not cover. Report it rather
+                // than translate to an address outside the allocation.
+                past_limit = true;
+                past_index = index;
+                past_capacity = r.desktop_descriptors;
+                continue;
+            }
+        }
         result = r.desktop + offset / r.title_stride * r.desktop_stride + offset % r.title_stride;
     }
+    // The lock is released before logging: log() opens the trap log, and holding the lock across a
+    // file append would serialise every descriptor translation behind it.
     ReleaseSRWLockShared(&descriptor_lock);
+    if (past_limit) {
+        static LONG reported;
+        if (first_calls(reported, 4))
+            log("x2w-d3d12 descriptor beyond the emulated heap: index=%llu desktop_holds=%llu "
+                "(console heap is larger; the title must not place views here)", past_index, past_capacity);
+    }
     return result;
+}
+
+// Measure, once per process, the largest shader-visible CBV/SRV/UAV heap this driver creates. The
+// documented ceiling is 1,048,576 descriptors, but drivers may accept fewer, so halve from the
+// ceiling until a create succeeds and then bisect upward. Each probe heap is released before the next
+// one, so at most one probe holds memory at a time.
+std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask)
+{
+    static std::uint64_t cached;
+    static LONG state;  // 0 none, 1 measuring, 2 measured
+    if (InterlockedCompareExchange(&state, 0, 0) == 2) return cached;
+    if (InterlockedCompareExchange(&state, 1, 0) != 0) {
+        // Another thread is measuring; wait for it rather than create a second set of probe heaps.
+        for (int spin = 0; spin < 2000 && InterlockedCompareExchange(&state, 0, 0) != 2; ++spin) Sleep(1);
+        return InterlockedCompareExchange(&state, 0, 0) == 2 ? cached : 0;
+    }
+
+    const auto probe = [device, node_mask](std::uint64_t count) {
+        D3D12_DESCRIPTOR_HEAP_DESC desc{};
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        desc.NumDescriptors = static_cast<UINT>(count);
+        desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        desc.NodeMask = node_mask;
+        ID3D12DescriptorHeap* heap = nullptr;
+        const bool ok = SUCCEEDED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap))) && heap;
+        if (heap) heap->Release();
+        return ok;
+    };
+
+    // Halve from the documented ceiling, testing the floor too: a driver whose maximum is below the
+    // floor must not be recorded as accepting it, or the retry would ask for a size it rejects again.
+    std::uint64_t accepted = 0;
+    for (std::uint64_t size = 1048576; size >= view_heap_probe_floor; size /= 2) {
+        if (probe(size)) {
+            accepted = size;
+            break;
+        }
+    }
+    if (!accepted) {
+        InterlockedExchange(&state, 2);
+        log("x2w-d3d12 no probe size at or above %llu was accepted; the view heap shortcut is declined",
+            view_heap_probe_floor);
+        return 0;
+    }
+    std::uint64_t low = accepted, high = accepted * 2;
+    while (low + 1 < high && high <= 1048576) {
+        const std::uint64_t mid = low + (high - low) / 2;
+        if (probe(mid)) low = mid; else high = mid;
+    }
+    cached = low;
+    InterlockedExchange(&state, 2);
+    log("x2w-d3d12 measured the shader-visible view heap limit: %llu descriptors", cached);
+    return cached;
 }
 
 UINT title_descriptor_stride(u64 handle, UINT desktop_stride)
@@ -1721,8 +1807,31 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     *out = nullptr;
     const auto* extra = reinterpret_cast<const std::uint64_t*>(desc + 1);
     ID3D12DescriptorHeap* heap = nullptr;
-    const HRESULT hr = kind_for(*iid) == descriptor_heap_kind
+    HRESULT hr = kind_for(*iid) == descriptor_heap_kind
         ? device_of(self)->CreateDescriptorHeap(desc, IID_PPV_ARGS(&heap)) : E_NOINTERFACE;
+    // A console view heap can be larger than the driver accepts. Measure the accepted maximum, create
+    // the desktop heap at it, and keep the title's own full-size memory; descriptors past the desktop
+    // heap stay in title memory and any use of them is reported by desktop_cpu_handle.
+    // The refusal code differs between drivers (E_INVALIDARG on a GTX 1660 SUPER, E_OUTOFMEMORY on an
+    // RTX 3060). Preserve errors unrelated to capacity, including unsupported interface IDs.
+    D3D12_DESCRIPTOR_HEAP_DESC clamped = *desc;
+    bool did_clamp = false;
+    if ((hr == E_INVALIDARG || hr == E_OUTOFMEMORY) && (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+        && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        && desc->NumDescriptors > view_heap_probe_floor) {
+        const std::uint64_t limit = accepted_view_heap_descriptors(device_of(self), desc->NodeMask);
+        if (limit && limit < desc->NumDescriptors) {
+            clamped.NumDescriptors = static_cast<UINT>(limit);
+            did_clamp = true;
+            hr = device_of(self)->CreateDescriptorHeap(&clamped, IID_PPV_ARGS(&heap));
+            static LONG shortcuts;
+            if (SUCCEEDED(hr) && first_calls(shortcuts, 1))
+                log("x2w-d3d12 Device::CreateDescriptorHeap: shortcut - title asked for %u shader-visible "
+                    "view descriptors, this driver accepts %u; the rest stay in title memory",
+                    desc->NumDescriptors, clamped.NumDescriptors);
+        }
+    }
+    const D3D12_DESCRIPTOR_HEAP_DESC* request = did_clamp ? &clamped : desc;
     const std::uint64_t desktop = heap ? heap->GetCPUDescriptorHandleForHeapStart().ptr : 0;
     static LONG calls;
     if (first_calls(calls, 16))
@@ -1747,7 +1856,8 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     if (title_memory) {
         w->own().title_cpu = title_memory;
         AcquireSRWLockExclusive(&descriptor_lock);
-        descriptor_ranges.push_back({title_memory, bytes, desktop, title_stride, desktop_stride});
+        descriptor_ranges.push_back({title_memory, bytes, desktop, title_stride, desktop_stride,
+                                     static_cast<std::uint64_t>(request->NumDescriptors)});
         ReleaseSRWLockExclusive(&descriptor_lock);
     }
     const u64 sampler_cpu = raw_samplers ? title_memory : 0;

@@ -73,6 +73,11 @@ SALU_SOURCE = r"(s\d+|-?\d+|0x[0-9a-f]+)"
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
+# Caller guarantees for a MIMG image descriptor: an 8-dword resource descriptor that names a 2D,
+# linear (non-swizzled) image of the listed format. The translator checks where the eight words were
+# loaded from, not the 9-bit GFX10 format, type, swizzle, level or size fields inside them; the two
+# 16-byte descriptor slots are bound to t0. Value: (HLSL texel type, channel count).
+IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4)}
 # Template operands are the old LDS word and the source VGPR, both HLSL uints.
 LDS_RMW = {
     "ds_add_u32": "({0} + {1})",
@@ -175,12 +180,15 @@ def labelled(decoded):
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
-          source_stride=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
+          source_stride=None, image_descriptor=None, image_format=None,
+          cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
     group dimension is larger than one. Descriptors name u0 and optionally b0 and a read-only raw
-    source t0; source_stride is the t0 byte stride that indexed reads use.
+    source t0; source_stride is the t0 byte stride that indexed reads use. image_descriptor is the
+    table byte offset of the 8-dword image descriptor; image_format is the caller's statement of
+    the image format inside it, and the texel is bound to t0.
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
@@ -202,6 +210,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     if source_stride is not None and (source_descriptor is None or not 4 <= source_stride <= 0x3fff
                                       or source_stride % 4):
         raise ValueError("Indexed reads require a source binding and aligned stride")
+    if image_descriptor is not None or image_format is not None:
+        # The 8-dword image descriptor occupies two 16-byte slots, both bound to t0.
+        if (image_format not in IMAGE_FORMATS or image_descriptor is None or source_descriptor is not None
+                or not 0 <= image_descriptor < 1 << 20 or image_descriptor % 4
+                or any(image_descriptor + half in descriptor_bindings for half in (0, 16))
+                or any(abs(image_descriptor + half - offset) < 16
+                       for half in (0, 16) for offset in descriptor_bindings)):
+            raise ValueError("Invalid or overlapping image descriptor binding")
+        descriptor_bindings[image_descriptor] = ("image", 0)
+        descriptor_bindings[image_descriptor + 16] = ("image", 1)
     group_regs = {axis: reg for axis, reg in enumerate((group_reg, group_reg_y, group_reg_z)) if reg is not None}
     if (any(not 0 <= reg <= 105 or reg == table_reg for reg in group_regs.values())
             or len(set(group_regs.values())) != len(group_regs)):
@@ -217,7 +235,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
-    ds_steps = []
+    # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
+    staged_steps = []
+    ds_step_count = 0
+    image_step_count = 0
     lds_enabled = ds_group and 128 <= lds_bytes <= 65536
     lds_word = None
     lds_strided_words = {}
@@ -472,13 +493,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             value = vector.get(src)
             if (not ds_group or guard_span is not None or max(dst, addr, src) > 255
                     or not isinstance(address, tuple) or address[0] != "ds_address" or not is_word(value)
-                    or len(ds_steps) >= 64):
+                    or ds_step_count >= 64):
                 raise ValueError("Unverified DS lane routing")
             # The bijective address is (local X + bias) mod 32. Scatter reads from its inverse.
             bias = address[1] if op == "bpermute" else (-address[1]) % 32
-            slot = f"ds_stage_{len(ds_steps)}"
-            result = f"ds_result_{len(ds_steps)}"
-            ds_steps.append((slot, f"    {slot}[local.x] = {hlsl_word(value)};\n"
+            slot = f"ds_stage_{ds_step_count}"
+            result = f"ds_result_{ds_step_count}"
+            ds_step_count += 1
+            staged_steps.append((slot, f"    {slot}[local.x] = {hlsl_word(value)};\n"
                                    f"    GroupMemoryBarrierWithGroupSync();\n"
                                    f"    uint {result} = {slot}[(local.x + {bias}u) & 31u];"))
             vector[dst] = ("alu", result)
@@ -531,10 +553,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unverified private LDS floating-point access")
             old, src = map(hlsl_word, (lds_word, value))
             if op.startswith("add"):
-                if len(ds_steps) >= 64:
+                if ds_step_count >= 64:
                     raise ValueError("Too many private LDS floating-point steps")
-                name = f"ds_f32_{len(ds_steps)}"
-                ds_steps.append((None, f"    precise float {name} = asfloat({old}) + asfloat({src});"))
+                name = f"ds_f32_{ds_step_count}"
+                ds_step_count += 1
+                staged_steps.append((None, f"    precise float {name} = asfloat({old}) + asfloat({src});"))
                 expression = f"asuint({name})"
             else:
                 condition = {"min": "<", "max": ">", "cmpst": "=="}[op]
@@ -568,9 +591,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if not all(map(is_word, cmp_word + new_word)):
                 raise ValueError("Unverified private LDS binary64 source")
             inputs = tuple(map(hlsl_word, prev + cmp_word + new_word))
-            if len(ds_steps) >= 64 or any(len(word) > ALU_EXPRESSION_LIMIT for word in inputs):
+            if ds_step_count >= 64 or any(len(word) > ALU_EXPRESSION_LIMIT for word in inputs):
                 raise ValueError("LDS expression exceeds the profile limit")
-            prefix = f"ds_f64_{len(ds_steps)}"
+            prefix = f"ds_f64_{ds_step_count}"
+            ds_step_count += 1
             old_lo, old_hi, cmp_lo, cmp_hi, new_lo, new_hi = (
                 f"{prefix}_{suffix}" for suffix in ("old_lo", "old_hi", "cmp_lo", "cmp_hi", "new_lo", "new_hi")
             )
@@ -591,7 +615,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             take = f"{prefix}_take"
             statements = [f"    uint {name} = {word};" for name, word in zip(names, inputs)]
             statements.append(f"    bool {take} = {condition};")
-            ds_steps.append((None, "\n".join(statements)))
+            staged_steps.append((None, "\n".join(statements)))
             update = (f"({take} ? {new_lo} : {old_lo})", f"({take} ? {new_hi} : {old_hi})")
             if dest:
                 vector.update(zip(ranges[-1], prev))
@@ -745,15 +769,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         elif m := re.fullmatch(r"ds_(append|consume) v(\d+)(?: offset:0)?", line):
             op, dst = m[1], int(m[2])
             if (not lds_m0_zero or guard_span is not None or dst > 255
-                    or lds_address_shift != 2 or not is_word(lds_word) or len(ds_steps) >= 64):
+                    or lds_address_shift != 2 or not is_word(lds_word) or ds_step_count >= 64):
                 raise ValueError("Unverified LDS wave counter")
             old = hlsl_word(lds_word)
-            slot = f"ds_stage_{len(ds_steps)}"
-            previous = f"ds_result_{len(ds_steps)}"
+            slot = f"ds_stage_{ds_step_count}"
+            previous = f"ds_result_{ds_step_count}"
+            ds_step_count += 1
             # LDS byte zero is lane zero's word. Snapshot it once per group,
             # then only change that lane's word in the private layout.
             operator = "+" if op == "append" else "-"
-            ds_steps.append((slot, f"    if (local.x == 0u) {slot}[0] = {old};\n"
+            staged_steps.append((slot, f"    if (local.x == 0u) {slot}[0] = {old};\n"
                              "    GroupMemoryBarrierWithGroupSync();\n"
                              f"    uint {previous} = {slot}[0];"))
             vector[dst] = ("alu", previous)
@@ -1096,6 +1121,50 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                         field = f"(({field} ^ {sign}) - {sign})"
                     word = ("alu", field)
                 loading[reg] = word
+        elif m := re.fullmatch(r"image_load (v\d+|v\[\d+:\d+\]), (?:v\[(\d+):(\d+)\]|v(\d+)), "
+                               r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D( unorm)?( a16)?", line):
+            # One typed 2D read. Without a16 x and y use separate address dwords. With a16 one word
+            # holds x in bits [15:0] and y in bits [31:16]. dmask selects the leading
+            # components of the caller-declared texel format in ascending order. LLVM 15 encodes
+            # non-sampler loads with the unorm (un-normalized address) flag, which has no effect here.
+            x = int(m[2]) if m[2] else None
+            y = int(m[3]) if m[3] else None
+            packed = int(m[4]) if m[4] else None
+            base, high = int(m[5]), int(m[6])
+            dmask = int(m[7], 16)
+            count = bin(dmask).count("1")
+            a16 = bool(m[9])
+            destination = [int(n) for n in re.findall(r"\d+", m[1])]
+            first, last = destination[0], destination[-1]
+            if (cpu != "gfx1030" or image_format is None or guard_span is not None
+                    or a16 != (packed is not None) or last != first + count - 1
+                    or dmask != (1 << count) - 1 or count > IMAGE_FORMATS[image_format][1]
+                    or (not a16 and y != x + 1)
+                    or any(first + index > 255 or first + index in loading for index in range(count))):
+                raise ValueError("Unsupported image load target")
+            if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
+                raise ValueError("Unresolved image descriptor")
+            if tuple(scalar.get(base + index) for index in range(8)) != tuple(
+                    (("image", index // 4), index % 4) for index in range(8)):
+                raise ValueError("Unverified image descriptor")
+            if a16:
+                coordinate = vector.get(packed)
+                if not is_word(coordinate):
+                    raise ValueError("Unverified image coordinates")
+                address = (f"int3(asint({hlsl_word(coordinate)} & 0xffffu), "
+                           f"asint({hlsl_word(coordinate)} >> 16u), 0)")
+            else:
+                coordinates = (vector.get(x), vector.get(y))
+                if not all(is_word(value) for value in coordinates):
+                    raise ValueError("Unverified image coordinates")
+                address = f"int3(asint({hlsl_word(coordinates[0])}), asint({hlsl_word(coordinates[1])}), 0)"
+            name = f"image_load_{image_step_count}"
+            image_step_count += 1
+            staged_steps.append((None, f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});"))
+            for index in range(count):
+                reg = first + index
+                vector.pop(reg, None)
+                loading[reg] = ("alu", f"{name}.{'xyzw'[index]}")
         elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|"
                                r"tbuffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), s\[(\d+):(\d+)\], 0"
@@ -1214,11 +1283,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                if constant_descriptor is not None else "")
     if source_descriptor is not None:
         cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
+    if image_descriptor is not None:
+        cbuffer += f"Texture2D<{IMAGE_FORMATS[image_format][0]}> imageData : register(t0);\n"
     local = ""
-    if ds_steps:
-        shared = [slot for slot, _ in ds_steps if slot is not None]
+    if staged_steps:
+        body = "\n".join([*(step for _, step in staged_steps), body])
+        shared = [slot for slot, _ in staged_steps if slot is not None]
         cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot in shared)
-        body = "\n".join([*(step for _, step in ds_steps), body])
         if shared:
             local = ", uint3 local : SV_GroupThreadID"
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
@@ -1248,6 +1319,10 @@ def main():
     parser.add_argument("--source-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset bound to stable read-only t0, with no overlap with u0")
     parser.add_argument("--source-stride", type=int, help="Indexed t0 byte stride")
+    parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
+                        help="Table byte offset of the 8-dword image descriptor bound to t0")
+    parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS),
+                        help="Caller statement of the format inside the image descriptor")
     args = parser.parse_args()
     if args.output.suffix.lower() != ".hlsl" or args.output.resolve() == args.container.resolve():
         parser.error("Choose an HLSL destination distinct from the input")
@@ -1261,7 +1336,8 @@ def main():
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
-                   source_stride=args.source_stride, cpu=args.cpu, lds_bytes=args.lds_bytes,
+                   source_stride=args.source_stride, image_descriptor=args.image_descriptor,
+                   image_format=args.image_format, cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
