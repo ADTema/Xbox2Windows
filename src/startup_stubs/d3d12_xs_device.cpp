@@ -34,6 +34,7 @@
 #include <d3d12.h>
 #include "command_list_slot_names.h"
 #include "console_plane_size.h"
+#include "descriptor_heap_type.h"
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
@@ -994,6 +995,20 @@ void* __stdcall device_custom_heap_properties(void* a, void* b, UINT node_mask, 
 }
 
 // Device slot 43, desktop GetAdapterLuid(), returned by value.
+
+// Device slot 15, desktop GetDescriptorHandleIncrementSize(type). A type desktop has is forwarded as before. Any
+// other value makes desktop answer 0 and the debug layer report an error (#870): the stand-in logs the value once
+// and answers 0 itself, with no increment made up for it.
+static_assert(x2w_startup::desktop_descriptor_heap_type_count == D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES);
+UINT __stdcall device_descriptor_increment_size(Wrapper* self, UINT type)
+{
+    if (!x2w_startup::is_valid_desktop_descriptor_heap_type(type)) {
+        static LONG calls;
+        if (first_calls(calls, 1)) log("x2w-d3d12 Device::slot15 out-of-range heap type 0x%x -> 0", type);
+        return 0;
+    }
+    return static_cast<UINT>(forward_slot<device_kind, 15>(self, type, 0, 0, 0, 0, 0, 0, 0));
+}
 
 // Device slots 34/35, desktop MakeResident/Evict(count, objects).
 template <int N>
@@ -3630,7 +3645,7 @@ void build_tables()
     enable_create<device_kind, 12, 4>();                 // CreateCommandList(node, type, allocator, pso, riid, ppv)
     enable_forward<device_kind, 13>();                   // CheckFeatureSupport
     tables[device_kind][14] = reinterpret_cast<void*>(&device_create_descriptor_heap);
-    enable_forward<device_kind, 15>();                   // GetDescriptorHandleIncrementSize
+    tables[device_kind][15] = reinterpret_cast<void*>(&device_descriptor_increment_size);  // GetDescriptorHandleIncrementSize(type)
     enable_create<device_kind, 16, 3>();                 // CreateRootSignature(node, blob, size, riid, ppv)
     tables[device_kind][17] = reinterpret_cast<void*>(&view_slot<17, 1>);  // CreateConstantBufferView(desc, dest)
     tables[device_kind][18] = reinterpret_cast<void*>(&view_slot<18, 2>);  // CreateShaderResourceView(res, desc, dest)
