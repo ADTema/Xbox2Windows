@@ -2371,7 +2371,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "op_discarded_read,op_xrstor64_xsavec,op_xrstor64_xsavec64,"
         "op_xrstor64_xsavec64_sse,op_xrstor64_xsavec64_x87_avx,op_xsavec64_dynmask,"
         "op_xrstor64_xsaveopt,op_xrstor64_xsaveopt64,op_xrstor64_xsaveopt64_sse,"
-        "op_xrstor64_xsaveopt64_x87_avx,op_xrstor64_xsaveopt64_avx,op_xsaveopt64_dynmask")
+        "op_xrstor64_xsaveopt64_x87_avx,op_xrstor64_xsaveopt64_avx,op_xsaveopt64_dynmask,"
+        "op_xrstor64_avx_xsaveopt64_avx")
     string(CONCAT cpu_xsave_state_original_exports ${cpu_xsave_state_original_exports})
     set(cpu_xsave_state_altered_exports
         "op_xrstor64_xsave64,op_xrstor_xsave64,op_xrstor64_disp,op_pipeline,"
@@ -2383,11 +2384,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         cpu_translation(cpu_xsave_state_${variant} cpu_xsave_aot "${cpu_xsave_state_${variant}_exports}")
     endforeach()
     target_compile_definitions(cpu_xsave_state_altered PRIVATE ALTER_OP)
+    set(cpu_xsave_state_compacted_exports
+        "op_xrstor64_sse_compacted_avx_xsaveopt64_avx,"
+        "op_xsavec_xrstor_all,op_xsavec_xrstor_x87_avx,op_xsavec_xrstor_x87_sse,"
+        "op_xsavec_xrstor_avx_only,op_xsavec_xrstor_sse_only,op_xrstor64_compacted_dynmask")
+    string(CONCAT cpu_xsave_state_compacted_exports ${cpu_xsave_state_compacted_exports})
+    set(cpu_xsave_state_compacted_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_compacted_lifted.cpp")
+    add_custom_command(OUTPUT "${cpu_xsave_state_compacted_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_xsave_aot.py"
+            "$<TARGET_FILE:cpu_xsave_state_original>" "${cpu_xsave_state_compacted_exports}"
+            "${cpu_xsave_state_compacted_cpp}" --compacted-xrstor
+        DEPENDS cpu_xsave_state_original tools/cpu_xsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_xsave_state_compacted_lifted SHARED "${cpu_xsave_state_compacted_cpp}")
+    set(cpu_xsave_state_compacted_altered_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_compacted_altered_lifted.cpp")
+    add_custom_command(OUTPUT "${cpu_xsave_state_compacted_altered_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_xsave_aot.py"
+            "$<TARGET_FILE:cpu_xsave_state_altered>" "op_xsavec_xrstor_all,op_xsavec_xrstor_avx_only"
+            "${cpu_xsave_state_compacted_altered_cpp}" --compacted-xrstor
+        DEPENDS cpu_xsave_state_altered tools/cpu_xsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_xsave_state_compacted_altered_lifted SHARED "${cpu_xsave_state_compacted_altered_cpp}")
     set(cpu_xsave_state_canonical_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_canonical_lifted.cpp")
     add_custom_command(OUTPUT "${cpu_xsave_state_canonical_cpp}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_xsave_aot.py"
-            "$<TARGET_FILE:cpu_xsave_state_original>" "op_xsave_only,op_xsave64_only"
-            "${cpu_xsave_state_canonical_cpp}" --entry-state canonical
+            "$<TARGET_FILE:cpu_xsave_state_original>" "op_xsave_only,op_xsave64_only,op_xrstor64_avx_xsaveopt64_avx"
+            "${cpu_xsave_state_canonical_cpp}" --entry-state canonical --compacted-xrstor
         DEPENDS cpu_xsave_state_original tools/cpu_xsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
     add_library(cpu_xsave_state_canonical_lifted SHARED "${cpu_xsave_state_canonical_cpp}")
     set(cpu_xsave_state_canonical_altered_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_canonical_altered_lifted.cpp")
@@ -2404,7 +2424,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_xsave_state_altered_lifted>"
         "$<TARGET_FILE:cpu_xsave_state_canonical_lifted>"
         "$<TARGET_FILE:cpu_xsave_state_canonical_altered_lifted>"
-        "$<TARGET_FILE:cpu_xsave_state_altered>")
+        "$<TARGET_FILE:cpu_xsave_state_altered>"
+        "$<TARGET_FILE:cpu_xsave_state_compacted_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_compacted_altered_lifted>")
     set_tests_properties(cpu_aot_xsave_state PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_pcmpstr64_exports
         "pcmpestri64_ub_eqany_pos_lsb,pcmpestri64_sw_ranges_neg_msb,"

@@ -1687,7 +1687,8 @@ group `XSAVE`:
   (`EDX == 0` and `(EAX & ~7) == 0`); raise `#GP` before mutating state on non-zero
   `XCOMP_BV`, non-zero reserved header bytes `[528..535]`, `(XSTATE_BV & ~7) != 0`, or
   `(RFBM & 6) != 0` with invalid `MXCSR & ~MXCSR_MASK`; restore or initialize each
-  requested component and update `XINUSE[2:0]`
+  requested component and update `XINUSE[2:0]`. A header with `XCOMP_BV[63]` set selects
+  the compacted format that `xsavec` writes; its rules are listed under "Compacted XRSTOR" below
 
 Per Intel SDM Vol. 1 Ch. 13.5.1, hardware `XSAVE` may report `XSTATE_BV[1:0] = 1` for
 initialized legacy x87/SSE components when selected by `RFBM` (observed directly on hybrid
@@ -1746,9 +1747,55 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_xsave_state$' -V
 
 ### Measured results and open scope
 
+#### Compacted XRSTOR
+
+`xrstor` and `xrstor64` restore the compacted format when `XCOMP_BV[63]` is set. Only x87 (bit 0), SSE (bit 1)
+and AVX (bit 2) exist in the model, so the legacy area keeps x87 and SSE and the AVX slot is the first extended
+slot, offset 576. The rules below were measured with a small native program on one host, an `AuthenticAMD`
+KVM guest that reports itself as "QEMU Virtual CPU version 2.5+" (family 15, model 107, `XCR0 = 7`, an
+832-byte area, `CPUID.(0DH,1):EAX = 7`: XSAVEOPT, XSAVEC and XGETBV(1), no XSAVES). Every combination was run in a
+child process, a fault being the child's SIGSEGV, after a restore of a different live state, so a component
+that is left alone, initialized or restored can be told apart:
+
+| Header and request | Result on the host |
+|---|---|
+| `XCOMP_BV[62:0]` has any of bits 3 to 9 or 62 | `#GP` |
+| `XSTATE_BV` has a bit `XCOMP_BV[62:0]` does not (bit 63 and bit 3 included) | `#GP` |
+| any non-zero byte of `[528..575]` (all 48 bytes tried) | `#GP` |
+| 64-byte misaligned address (+8, +16, +32) | `#GP` |
+| `XCOMP_BV[63]` clear and any other `XCOMP_BV` bit set | `#GP` (the standard-format rule) |
+| `XCOMP_BV = bit 63` alone, `RFBM = 7` | valid, every component initialized |
+| `RFBM` has a component and `XSTATE_BV` and `XCOMP_BV` both list it | restored from its slot |
+| `RFBM` has a component and `XSTATE_BV` does not list it, or `XCOMP_BV` leaves it out | initialized |
+| `RFBM` does not have a component | untouched |
+| MXCSR, `RFBM[1]` and `XSTATE_BV[1]` set | loaded, and `#GP` for reserved bits |
+| MXCSR, `RFBM[1]` set and `XSTATE_BV[1]` clear | reset to `0x1F80`, the image word is not read |
+| MXCSR, `RFBM[1]` clear (also `RFBM = 4`) | untouched |
+
+The 216 combinations of `XCOMP_BV[2:0]`, `XSTATE_BV` (a subset of it) and `RFBM` follow these rules. The
+standard format on the same host loads MXCSR whenever `RFBM[2:1]` is not 0, as the model already did, and checks only
+`[528..535]` of the header. `xsavec` leaves `[528..575]` alone, so a program that restores a buffer `xsavec` filled
+must zero those bytes first; the round-trip fixtures do. A request bit outside `XCR0` is masked by the host
+instead of faulting; the translator keeps its bound (`#GP` for `RFBM` bits above 2), checked on lifted code only.
+`XGETBV(1)` after each restore agreed with the `XINUSE` bookkeeping of the model, which does not model `XMODIFIED`.
+Only this one vendor and CPU family was measured: the MXCSR rule matches what `xsavec` writes (MXCSR is stored with
+the SSE component only), but an Intel result could differ and no Intel host was available.
+
+`cpu_aot_xsave_state` covers it with six more exports in [the fixture](../tests/cpu/xsave_state.asm): five
+`xsavec` to `xrstor` round trips of the same buffer (RFBM 7 to 7, x87|AVX to 7, x87|SSE to 7, 7 to AVX and 7 to
+SSE) with a second live state restored in between, and one that restores a hand-built compacted image with its request
+mask read from the image. The check runs them on ten states: 50 round trips (one also against a direct restore of
+the saved image), the 216-combination matrix plus four MXCSR cases, 25 `#GP` controls (each invalid header field,
+misalignment, request masks outside x87|SSE|AVX) with the output left untouched, and `ALTER_OP` variants of two
+round trips that must diverge. Eleven mutation controls drop one rule from the reference model, the subset check, the
+reserved bytes, the `XCOMP_BV` bit check and the compacted MXCSR rule, and the comparison must catch each. Native runs
+are gated on `CPUID.(0DH,1):EAX[1]` like the `xsavec` fixtures, because a compacted restore needs it. The native
+comparison accepts a host that reports `XSTATE_BV[1]` clear for SSE held only by a non-default MXCSR over zero XMM
+state, the quirk recorded for `xsaveopt`.
+
 The native harness probes whether the host preserves the 16-bit FCS and FDS values in the non-REX.W legacy area after XRSTOR/XSAVE. A measured zero is expected only at the corresponding native selector bytes. Lifted results still follow the separately specified CPUID-based profile.
 
-The [MASM fixture](../tests/cpu/xsave_state.asm) exports 22 functions covering opt-in
+The [MASM fixture](../tests/cpu/xsave_state.asm) exports 28 functions covering opt-in
 canonical-entry `xsave`/`xsave64` (`cpu_xsave_state_canonical_lifted`), `xrstor`/`xrstor64`
 roundtrips, displaced `[rcx+64]`/`[r8+64]`, `RFBM = 2` SSE-only masking (and `ALTER_OP`
 `RFBM = 2 -> 7` under `cpu_xsave_state_canonical_altered_lifted`), `vzeroupper` clearing
