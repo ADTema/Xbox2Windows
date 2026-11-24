@@ -807,7 +807,9 @@ def check_junit_errors():
     The record window needs one CTest run, so a merged <testsuites> file is refused rather than guessed."""
     import subprocess
     tool = Path(fc.__file__)
-    valid = '<testsuite time="1" timestamp="2026-11-21T21:05:21"><testcase name="a" status="run"/></testsuite>'
+    passed = '<testcase name="a" status="run"/>'
+    failed = '<testcase name="a" status="fail"><failure/></testcase>'
+    valid = f'<testsuite time="1" timestamp="2026-11-21T21:05:21">{passed}</testsuite>'
     cases = {
         "missing.xml": (None, "No such file"),
         "malformed.xml": ("not xml", "syntax error: line 1, column 0"),
@@ -817,6 +819,12 @@ def check_junit_errors():
         "bad_time.xml": ('<testsuite time="soon" timestamp="2026-11-21T21:05:21"/>', "time"),
         "valid.xml": (valid, None),
     }
+    # Names from different CTest directories can be identical. Neither order
+    # can identify which test produced the name-keyed coverage record.
+    for label, cases_xml in (("fail_then_pass", failed + passed), ("pass_then_fail", passed + failed)):
+        cases[f"duplicate_{label}.xml"] = (
+            valid.replace(passed, cases_xml), "duplicate CTest <testcase> name 'a'",
+        )
     cases.update({
         f"time_{value}.xml": (valid.replace('time="1"', f'time="{value}"'), "finite and nonnegative")
         for value in ("nan", "inf", "-1")

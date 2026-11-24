@@ -1,5 +1,6 @@
 #include "../desktop_gpu.h"
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -37,8 +38,91 @@ constexpr WindowCase atomic_cases[] = {
     {"atomic index addition wraps", {0xfffffffcu, 7, 44, 0xffffffffu}, 0},
 };
 
-template <size_t Count>
-void check_window_cases(ID3D12Device* device, const char* shader_path, const WindowCase (&cases)[Count])
+constexpr UINT arena_fill = 0xcba98765u;
+
+// A QWORD case: base low, source QWORD index, destination byte address, base high. The shader adds the index
+// scaled by eight to the base, loads a QWORD there, adds one and stores it at the destination address.
+struct QwordCase {
+    const char* name;
+    std::array<UINT, 4> parameters;
+};
+
+// The first QWORD that must not be accessed. The production window ends at the last QWORD below the final DWORD;
+// the narrow window ends inside the 64-byte view so a stray access to an address past it would be visible.
+constexpr uint64_t qword_window_end = 0xfffffff8u;
+constexpr uint64_t narrow_window_end = 40;
+
+constexpr QwordCase qword_cases[] = {
+    {"qword baseline", {0, 1, 32, 0}},
+    {"qword second source", {0, 3, 40, 0}},
+    {"qword base offset", {8, 0, 32, 0}},
+    {"qword load aligned to a DWORD only", {4, 1, 32, 0}},
+    {"qword load above the window", {0xfffffff8u, 0, 32, 0}},
+    {"qword load above 4 GiB", {0, 1, 32, 1}},
+    {"qword index addition wraps", {0xfffffff8u, 3, 32, 0xffffffffu}},
+    {"qword store aligned to a DWORD only", {0, 1, 36, 0}},
+    {"qword store above the window", {0, 1, 0xfffffff8u, 0}},
+    {"qword store beyond descriptor", {0, 1, 64, 0}},
+    {"qword store in the last descriptor QWORD", {0, 1, 56, 0}},
+};
+
+constexpr QwordCase narrow_cases[] = {
+    {"narrow load below the end", {0, 4, 16, 0}},
+    {"narrow load at the end", {0, 5, 16, 0}},
+    {"narrow load past the end", {0, 6, 16, 0}},
+    {"narrow store below the end", {0, 1, 32, 0}},
+    {"narrow store at the end", {0, 1, 40, 0}},
+    {"narrow store past the end", {0, 1, 48, 0}},
+};
+
+void init_dword_arena(std::array<UINT, 16>& words)
+{
+    words.fill(arena_fill);
+    words[3] = left;
+    words[7] = right;
+}
+
+void apply_dword_case(const WindowCase& test, std::array<UINT, 16>& expected)
+{
+    UINT result = test.expected;
+    if (test.atomic_word >= 0) {
+        auto& word = expected[static_cast<size_t>(test.atomic_word)];
+        result = word;
+        word += test.parameters[1];
+    }
+    const UINT destination = test.parameters[2];
+    if (destination % 4 == 0 && destination < sizeof(expected)) expected[destination / 4] = result;
+}
+
+// Two QWORDs whose halves differ, the first carrying from the low into the high half when one is added.
+void init_qword_arena(std::array<UINT, 16>& words)
+{
+    words.fill(arena_fill);
+    words[2] = 0xffffffffu;
+    words[3] = 0x00000001u;
+    words[6] = 0x89abcdefu;
+    words[7] = 0x01234567u;
+}
+
+// Independent CPU model of the bounded 64-bit access. A QWORD is accessed only when its address is a multiple of
+// eight, below the window end, and the base plus the scaled index does not wrap. The 64-byte view then returns zero
+// for a read past it and discards a write past it; a QWORD never straddles the end of the view.
+void apply_qword_case(const QwordCase& test, std::array<UINT, 16>& expected, uint64_t window_end)
+{
+    const uint64_t base = (static_cast<uint64_t>(test.parameters[3]) << 32) | test.parameters[0];
+    const uint64_t source = base + static_cast<uint64_t>(test.parameters[1]) * 8;
+    const bool source_ok = source >= base && source % 8 == 0 && source < window_end;
+    uint64_t value = 0;
+    if (source_ok && source + 8 <= sizeof(expected)) std::memcpy(&value, reinterpret_cast<BYTE*>(expected.data()) + source, 8);
+    value += 1;
+    const uint64_t destination = test.parameters[2];
+    const bool destination_ok = destination % 8 == 0 && destination < window_end;
+    if (destination_ok && destination + 8 <= sizeof(expected))
+        std::memcpy(reinterpret_cast<BYTE*>(expected.data()) + destination, &value, 8);
+}
+
+template <typename Case, size_t Count, typename Init, typename Apply>
+void check_window_cases(ID3D12Device* device, const char* shader_path, const Case (&cases)[Count], Init init, Apply apply)
 {
     std::ifstream shader(shader_path, std::ios::binary);
     if (!shader) throw std::runtime_error("Cannot open address-window shader");
@@ -65,9 +149,7 @@ void check_window_cases(ID3D12Device* device, const char* shader_path, const Win
 
     for (const auto& test : cases) {
         std::array<UINT, 16> expected;
-        expected.fill(0xcba98765u);
-        expected[3] = left;
-        expected[7] = right;
+        init(expected);
         auto upload = make_buffer(device, 128, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         auto arena = make_buffer(device, sizeof(expected), D3D12_HEAP_TYPE_DEFAULT,
                                  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -78,14 +160,7 @@ void check_window_cases(ID3D12Device* device, const char* shader_path, const Win
         std::memcpy(mapped, test.parameters.data(), sizeof(test.parameters));
         std::memcpy(static_cast<BYTE*>(mapped) + 64, expected.data(), sizeof(expected));
         upload->Unmap(0, nullptr);
-        UINT result = test.expected;
-        if (test.atomic_word >= 0) {
-            auto& word = expected[static_cast<size_t>(test.atomic_word)];
-            result = word;
-            word += test.parameters[1];
-        }
-        const UINT destination = test.parameters[2];
-        if (destination % 4 == 0 && destination < sizeof(expected)) expected[destination / 4] = result;
+        apply(test, expected);
 
         D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
@@ -142,10 +217,26 @@ void check_window_cases(ID3D12Device* device, const char* shader_path, const Win
 
 void check_spirv_window(ID3D12Device* device, const char* shader_path)
 {
-    check_window_cases(device, shader_path, cases);
+    check_window_cases(device, shader_path, cases, init_dword_arena, apply_dword_case);
 }
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path)
 {
-    check_window_cases(device, shader_path, atomic_cases);
+    check_window_cases(device, shader_path, atomic_cases, init_dword_arena, apply_dword_case);
+}
+
+void check_spirv_window_qword(ID3D12Device* device, const char* shader_path)
+{
+    check_window_cases(device, shader_path, qword_cases, init_qword_arena,
+                       [](const QwordCase& test, std::array<UINT, 16>& words) {
+                           apply_qword_case(test, words, qword_window_end);
+                       });
+}
+
+void check_spirv_window_qword_narrow(ID3D12Device* device, const char* shader_path)
+{
+    check_window_cases(device, shader_path, narrow_cases, init_qword_arena,
+                       [](const QwordCase& test, std::array<UINT, 16>& words) {
+                           apply_qword_case(test, words, narrow_window_end);
+                       });
 }

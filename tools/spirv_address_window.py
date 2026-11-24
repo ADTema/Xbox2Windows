@@ -11,8 +11,14 @@ from spirv_sampler_views import split_sampler_views
 
 
 ID = r"%[A-Za-z0-9_]+"
-CAST = re.compile(rf"({ID}) = OpConvertUToPtr %_ptr_PSB_(arr|uint) ({ID})")
+CAST = re.compile(rf"({ID}) = OpConvertUToPtr %_ptr_PSB_(arr64|arr|ulong|uint) ({ID})")
 ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_uint ({ID}) ({ID})")
+WIDE_ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_ulong ({ID}) ({ID})")
+WIDE_POINTER_TYPE = "%_ptr_PSB_ulong = OpTypePointer PhysicalStorageBuffer %ulong"
+WIDE_ARRAY_POINTER_TYPE = "%_ptr_PSB_arr64 = OpTypePointer PhysicalStorageBuffer %rt_ulong"
+WIDE_ARRAY_DECLARATIONS = ("%rt_ulong = OpTypeRuntimeArray %ulong", "OpDecorate %rt_ulong ArrayStride 8")
+# A QWORD access is the plain load or store of one 64-bit value, naturally aligned.
+WIDE_MEMORY_OPERANDS = ([], ["Aligned", "8"])
 POINTER = re.compile(rf"({ID}) = OpTypePointer (\w+) ({ID})")
 WORD_ATOMIC_OPERANDS = {
     "OpAtomicIAdd": 4,
@@ -26,25 +32,33 @@ WORD_ATOMIC_OPERANDS = {
 }
 
 
-def word_pointer(dst, base, index):
+def address_name(dst):
+    # Keep address temporaries separate from the generated x2w_ballot_ IDs.
+    return "%x2w_address_" + dst[1:]
+
+
+def word_pointer(dst, base, index, wide=False):
     """Select the last DWORD offset for an unaligned or unrepresentable address.
 
-    Returns the lines and the ID of the boolean that is true only for an aligned, in-window address."""
-    # Keep address temporaries separate from the generated x2w_ballot_ IDs.
-    name = "%x2w_address_" + dst[1:]
+    Returns the lines and the ID of the boolean that is true only for an aligned, in-window address.
+    A wide (QWORD) pointer selects no substitute: it defines only the DWORD index {address}_word, and the
+    access issues in a branch taken for a valid address."""
+    name = address_name(dst)
+    scale, mask, end = ("%x2w_shift_wide", "%x2w_mask_wide", "%x2w_end_wide") if wide else (
+        "%x2w_shift", "%x2w_mask", "%x2w_end")
     lines = []
     addr = base
     if index:
         addr = name + "_address"
         lines.extend([
             f"{name}_index = OpUConvert %ulong {index}",
-            f"{name}_delta = OpShiftLeftLogical %ulong {name}_index %x2w_shift",
+            f"{name}_delta = OpShiftLeftLogical %ulong {name}_index {scale}",
             f"{addr} = OpIAdd %ulong {base} {name}_delta",
         ])
     lines.extend([
-        f"{name}_low = OpBitwiseAnd %ulong {addr} %x2w_mask",
+        f"{name}_low = OpBitwiseAnd %ulong {addr} {mask}",
         f"{name}_aligned = OpIEqual %bool {name}_low %x2w_zero64",
-        f"{name}_range = OpULessThan %bool {addr} %x2w_end",
+        f"{name}_range = OpULessThan %bool {addr} {end}",
         f"{name}_valid = OpLogicalAnd %bool {name}_aligned {name}_range",
     ])
     valid = name + "_valid"
@@ -57,10 +71,52 @@ def word_pointer(dst, base, index):
     lines.extend([
         f"{name}_word64 = OpShiftRightLogical %ulong {addr} %x2w_shift",
         f"{name}_word = OpUConvert %uint {name}_word64",
+    ])
+    if wide:
+        return lines, valid
+    lines.extend([
         f"{name}_selected = OpSelect %uint {valid} {name}_word %x2w_invalid",
         f"{dst} = OpAccessChain %_ptr_PSB_uint %x2w_heap %c0 {name}_selected",
     ])
     return lines, valid
+
+
+def wide_access(kind, stem, valid, label, word, fields):
+    """Lower a QWORD load or store into two DWORD accesses inside a branch taken only for a valid address.
+
+    A load yields zero and a store changes nothing otherwise. Returns the lines and the label that follows."""
+    heap = "%_ptr_PSB_uint %x2w_heap %c0"
+    lines = [
+        f"OpSelectionMerge {stem}_merge None",
+        f"OpBranchConditional {valid} {stem}_issue {stem}_merge",
+        f"{stem}_issue = OpLabel",
+        f"{stem}_next = OpIAdd %uint {word} %x2w_one",
+        f"{stem}_low_ptr = OpAccessChain {heap} {word}",
+        f"{stem}_high_ptr = OpAccessChain {heap} {stem}_next",
+    ]
+    if kind == "load":
+        lines.extend([
+            f"{stem}_low = OpLoad %uint {stem}_low_ptr",
+            f"{stem}_high = OpLoad %uint {stem}_high_ptr",
+            f"{stem}_low64 = OpUConvert %ulong {stem}_low",
+            f"{stem}_high64 = OpUConvert %ulong {stem}_high",
+            f"{stem}_high_shifted = OpShiftLeftLogical %ulong {stem}_high64 %x2w_shift_half",
+            f"{stem}_value = OpBitwiseOr %ulong {stem}_low64 {stem}_high_shifted",
+            f"OpBranch {stem}_merge",
+            f"{stem}_merge = OpLabel",
+            f"{fields[0]} = OpPhi %ulong {stem}_value {stem}_issue %x2w_zero64 {label}",
+        ])
+    else:
+        lines.extend([
+            f"{stem}_low = OpUConvert %uint {fields[2]}",
+            f"{stem}_high64 = OpShiftRightLogical %ulong {fields[2]} %x2w_shift_half",
+            f"{stem}_high = OpUConvert %uint {stem}_high64",
+            f"OpStore {stem}_low_ptr {stem}_low Aligned 4",
+            f"OpStore {stem}_high_ptr {stem}_high Aligned 4",
+            f"OpBranch {stem}_merge",
+            f"{stem}_merge = OpLabel",
+        ])
+    return lines, stem + "_merge"
 
 
 def merge_pointer_types(lines):
@@ -111,21 +167,38 @@ def lower(assembly):
                     "%x2w_invalid = OpConstant %uint 1073741823"]
     output = []
     arrays = {}
+    wide_arrays = {}
+    wide_words = {}
     valid_of = {}
     label = None
     origin = None
-    # An atomic splits its block, so a successor phi must name the block that now ends in the terminator.
+    # A guarded access splits its block, so a successor phi must name the block that now ends in the terminator.
     final_label = {}
     source_phis = []
+    wide_accesses = 0
     physical_words = set()
+    physical_qwords = set()
     for line in lines:
         cast = CAST.fullmatch(line)
         access = ACCESS.fullmatch(line)
+        wide = WIDE_ACCESS.fullmatch(line)
         if access or cast and cast[2] == "uint":
             physical_words.add((access or cast)[1])
+        if wide or cast and cast[2] == "ulong":
+            physical_qwords.add((wide or cast)[1])
+    uses_arrays64 = any(cast and cast[2] == "arr64" for cast in map(CAST.fullmatch, lines))
+    if physical_qwords and WIDE_POINTER_TYPE not in lines or uses_arrays64 and (
+            WIDE_ARRAY_POINTER_TYPE not in lines or not set(WIDE_ARRAY_DECLARATIONS) <= set(lines)):
+        raise ValueError("unsupported physical pointer or scalar layout")
+    if physical_qwords:
+        declarations += ["%x2w_one = OpConstant %uint 1", "%x2w_shift_wide = OpConstant %uint 3",
+                         "%x2w_shift_half = OpConstant %uint 32", "%x2w_mask_wide = OpConstant %ulong 7",
+                         # The last valid QWORD ends at the same DWORD as the last valid DWORD access.
+                         "%x2w_end_wide = OpConstant %ulong 4294967288"]
     for line in lines:
         if line in ('OpExtension "SPV_KHR_physical_storage_buffer"', "OpCapability PhysicalStorageBufferAddresses",
-                    "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint"):
+                    "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
+                    WIDE_POINTER_TYPE, WIDE_ARRAY_POINTER_TYPE):
             continue
         if line.startswith("OpDecorate ") and annotations:
             output.extend(annotations)
@@ -137,6 +210,12 @@ def lower(assembly):
             dst, kind, addr = cast.groups()
             if kind == "arr":
                 arrays[dst] = addr
+            elif kind == "arr64":
+                wide_arrays[dst] = addr
+            elif kind == "ulong":
+                new, valid_of[dst] = word_pointer(dst, addr, None, True)
+                wide_words[dst] = address_name(dst) + "_word"
+                output.extend(new)
             else:
                 new, valid_of[dst] = word_pointer(dst, addr, None)
                 output.extend(new)
@@ -148,9 +227,35 @@ def lower(assembly):
             new, valid_of[dst] = word_pointer(dst, arrays[pointer], index)
             output.extend(new)
             continue
+        if wide := WIDE_ACCESS.fullmatch(line):
+            dst, pointer, index = wide.groups()
+            if pointer not in wide_arrays:
+                raise ValueError("unknown physical array pointer")
+            new, valid_of[dst] = word_pointer(dst, wide_arrays[pointer], index, True)
+            wide_words[dst] = address_name(dst) + "_word"
+            output.extend(new)
+            continue
         if opened := re.fullmatch(rf"({ID}) = OpLabel", line):
             label = origin = opened[1]
-        used = set(re.findall(ID, line)) & physical_words
+        ids = set(re.findall(ID, line))
+        wide_used = ids & physical_qwords
+        if wide_used:
+            fields = line.split()
+            wide_load = fields[1:4] == ["=", "OpLoad", "%ulong"] and fields[4:5] and fields[4] in wide_used
+            wide_store = fields[0] == "OpStore" and fields[1] in wide_used and fields[2] not in wide_used
+            operands = fields[5:] if wide_load else fields[3:]
+            if ids & physical_words or len(wide_used) != 1 or not (wide_load or wide_store) \
+                    or operands not in WIDE_MEMORY_OPERANDS:
+                raise ValueError("unhandled physical word pointer use")
+            wide_accesses += 1
+            kind = "load" if wide_load else "store"
+            pointer = fields[4] if wide_load else fields[1]
+            stem = "%x2w_" + (f"load_{fields[0][1:]}" if wide_load else f"store_{wide_accesses}")
+            new, label = wide_access(kind, stem, valid_of[pointer], label, wide_words[pointer], fields)
+            final_label[origin] = label
+            output.extend(new)
+            continue
+        used = ids & physical_words
         atomic_word = False
         if used:
             fields = line.split()
