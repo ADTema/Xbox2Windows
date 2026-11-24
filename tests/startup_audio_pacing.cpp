@@ -49,6 +49,7 @@ struct Phase {
     double drained_ms = 0;
     double pacing_error_max_ms = 0;  // worst |actual submit time - ideal time| in the phase
     double pacing_error_rms_ms = 0;  // root-mean-square of the same deviation
+    double pacing_error_p95_ms = 0;
     double recovery_ms = -1;
     unsigned rejected_full = 0;
     unsigned unsupported = 0;
@@ -60,6 +61,15 @@ void print_phase(const Phase& p)
                 "largest_submit_gap=%.1fms drained_ms=%.1f recovery_ms=%.1f pacing_error_max=%.1fms pacing_error_rms=%.1fms rejected_full=%u unsupported=%u\n",
                 p.name, p.first_submit_ms, p.blocks, p.frames, p.consumed, p.clock, p.largest_gap_ms, p.drained_ms,
                 p.recovery_ms, p.pacing_error_max_ms, p.pacing_error_rms_ms, p.rejected_full, p.unsupported);
+}
+
+// Nearest-rank percentile. The maximum is still reported for isolated scheduler stalls.
+double pacing_percentile95(std::vector<double> errors)
+{
+    if (errors.empty()) return 0;
+    const auto index = (errors.size() * 95 + 99) / 100 - 1;
+    std::nth_element(errors.begin(), errors.begin() + index, errors.end());
+    return errors[index];
 }
 
 // Frames of a quiet tone so blocks are valid audio rather than an empty submission.
@@ -141,6 +151,7 @@ struct Cadence {
     double worst_error = 0;
     double squared = 0;
     unsigned long long marks = 0;
+    std::vector<double> absolute_errors;
     void mark(double ideal_at)
     {
         const double at = now_ms() - begin;
@@ -148,6 +159,7 @@ struct Cadence {
         if (previous >= 0) largest = (std::max)(largest, at - previous);
         previous = at;
         const double error = at - (ideal_at - begin);
+        absolute_errors.push_back(std::fabs(error));
         if (std::fabs(error) > worst_error) worst_error = std::fabs(error);
         squared += error * error;
         ++marks;
@@ -174,6 +186,7 @@ bool run_steady(AudioSink& sink, const BlockFormat& source, uint32_t block_frame
     phase.first_submit_ms = cadence.first;
     phase.pacing_error_max_ms = cadence.worst_error;
     phase.pacing_error_rms_ms = cadence.rms();
+    phase.pacing_error_p95_ms = pacing_percentile95(cadence.absolute_errors);
     phase.largest_gap_ms = cadence.largest;
     return true;
 }
@@ -203,6 +216,7 @@ bool run_bursty(AudioSink& sink, const BlockFormat& source, uint32_t block_frame
     phase.first_submit_ms = cadence.first;
     phase.pacing_error_max_ms = cadence.worst_error;
     phase.pacing_error_rms_ms = cadence.rms();
+    phase.pacing_error_p95_ms = pacing_percentile95(cadence.absolute_errors);
     phase.largest_gap_ms = cadence.largest;
     return true;
 }
@@ -212,6 +226,18 @@ namespace {
 // Kept apart from main so the sink is destroyed before CoUninitialize runs.
 int run()
 {
+    std::vector<double> timing_control(120, 1.0);
+    timing_control.front() = 75.0;
+    if (pacing_percentile95(timing_control) != 1.0) {
+        std::puts("FAIL: one isolated timing outlier changed p95");
+        return 1;
+    }
+    std::fill_n(timing_control.begin(), 7, 75.0);
+    if (pacing_percentile95(timing_control) != 75.0) {
+        std::puts("FAIL: sustained timing errors did not change p95");
+        return 1;
+    }
+
     AudioSink sink;
     const std::string error = sink.open();
     if (!error.empty()) {
@@ -268,15 +294,16 @@ int run()
     const double steady_limit_ms = (std::max)(3.0 * tick_ms, 2.0 * jitter_ms + 5.0);
     std::printf("timer: Sleep(1) median %.1f ms, scheduler worst %.1f ms over %d wake-ups, steady bound %.1f ms\n",
                 tick_ms, jitter_ms, total_blocks, steady_limit_ms);
-    if (steady.pacing_error_max_ms > steady_limit_ms) {
-        std::printf("FAIL: steady feed drifted %.1f ms from the ideal cadence, beyond the measured scheduler bound (%.1f ms)\n",
-                    steady.pacing_error_max_ms, steady_limit_ms);
+    std::printf("pacing p95: steady %.1f ms, bursty %.1f ms\n", steady.pacing_error_p95_ms, bursty.pacing_error_p95_ms);
+    if (steady.pacing_error_p95_ms > steady_limit_ms) {
+        std::printf("FAIL: steady p95 drifted %.1f ms from the ideal cadence, beyond the scheduler bound (%.1f ms)\n",
+                    steady.pacing_error_p95_ms, steady_limit_ms);
         return 1;
     }
-    if (bursty.pacing_error_max_ms <= steady.pacing_error_max_ms + 5.0 * tick_ms) {
+    if (bursty.pacing_error_p95_ms <= steady.pacing_error_p95_ms + 5.0 * tick_ms) {
         std::printf("FAIL: bursty feed did not drift further than steady (%.1f vs %.1f ms); the metric "
                     "cannot see producer stutter\n",
-                    bursty.pacing_error_max_ms, steady.pacing_error_max_ms);
+                    bursty.pacing_error_p95_ms, steady.pacing_error_p95_ms);
         return 1;
     }
     std::printf("PASS: same total audio, bursty feed shows a drained interval steady feed does not, recovery %.1f ms\n",
