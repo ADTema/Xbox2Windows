@@ -1,20 +1,35 @@
 """Exercise large batches of physical pages in the production xmem shim.
 
-Pages are slots of shared sections, and adjacent pages of one batch share a view. This check maps
-a batch that spans two sections, unmaps pages from the middle of it, moves them elsewhere, reuses
-freed pages, and reads a page from a second thread while the main thread unmaps its neighbours.
+Pages are slots of shared sections, and adjacent pages of one batch share a view (a run). This
+check covers a batch that spans two sections, holes punched into it, pages moved and reused, what
+VirtualQuery reports before and after a run is split, two views of the same pages, failures while
+a run is being taken apart, and a reader on a page whose neighbour is unmapped again and again.
+
 usage: xmem_page_runs_check.py <xmem.dll> [pages]
+Two cases have to end in an access violation. They run in a child process (--child ...), and the
+parent requires exactly that outcome after the child has announced the step it is about to take.
 """
 import ctypes as C
+import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
 
-PAGE_BYTES = 65536
+PAGE = 65536
 PHYSICAL_64K = 0x20400000
 STARTUP_RESERVE = 0x20402000
 WIN_RELEASE = 0x8000
+MEM_COMMIT, MEM_RESERVE, MEM_MAPPED = 0x1000, 0x2000, 0x40000
+ACCESS_VIOLATION = 0xC0000005
+ERROR_INVALID_ADDRESS = 487
+
+
+class MemoryBasicInformation(C.Structure):
+    _fields_ = [("BaseAddress", C.c_void_p), ("AllocationBase", C.c_void_p), ("AllocationProtect", C.c_ulong),
+                ("PartitionId", C.c_ushort), ("RegionSize", C.c_size_t), ("State", C.c_ulong), ("Protect", C.c_ulong),
+                ("Type", C.c_ulong)]
 
 
 def bind(library, name, args, result):
@@ -23,101 +38,280 @@ def bind(library, name, args, result):
     return function
 
 
-def main(path, total=6000):
-    library = C.WinDLL(str(Path(path).resolve()), use_last_error=True, winmode=0x900)
-    kernel = C.WinDLL("kernelbase.dll", use_last_error=True)
-    pointer, number, dword = C.c_void_p, C.c_size_t, C.c_ulong
-    allocate = bind(library, "XMemAllocatePhysicalPages", [number, C.POINTER(number), C.POINTER(number)], C.c_int)
-    release = bind(library, "XMemFreePhysicalPages", [number, C.POINTER(number)], C.c_int)
-    contiguous = bind(library, "XMemMapPhysicalPages", [pointer, number, C.POINTER(number)], pointer)
-    scatter = bind(library, "XMemMapPhysicalPagesScatter", [C.POINTER(pointer), number, C.POINTER(number)], C.c_int)
-    reserve_startup = bind(library, "XMemVirtualAlloc", [pointer, number, dword, number, dword], pointer)
-    free = bind(kernel, "VirtualFree", [pointer, number, dword], C.c_int)
+class Shim:
+    def __init__(self, path):
+        library = C.WinDLL(str(Path(path).resolve()), use_last_error=True, winmode=0x900)
+        kernel = C.WinDLL("kernelbase.dll", use_last_error=True)
+        pointer, number, dword = C.c_void_p, C.c_size_t, C.c_ulong
+        self.pointer, self.number = pointer, number
+        self.allocate_pages = bind(library, "XMemAllocatePhysicalPages", [number, C.POINTER(number), C.POINTER(number)], C.c_int)
+        self.release = bind(library, "XMemFreePhysicalPages", [number, C.POINTER(number)], C.c_int)
+        self.contiguous = bind(library, "XMemMapPhysicalPages", [pointer, number, C.POINTER(number)], pointer)
+        self.scatter = bind(library, "XMemMapPhysicalPagesScatter", [C.POINTER(pointer), number, C.POINTER(number)], C.c_int)
+        self.reserve_startup = bind(library, "XMemVirtualAlloc", [pointer, number, dword, number, dword], pointer)
+        self.free = bind(kernel, "VirtualFree", [pointer, number, dword], C.c_int)
+        self.query_raw = bind(kernel, "VirtualQuery", [pointer, C.POINTER(MemoryBasicInformation), number], number)
+        self.whole = self.reserve_startup(None, 16 << 30, STARTUP_RESERVE, 0x21, 4)
+        assert self.whole, C.get_last_error()
 
-    def word(address):
-        return C.c_uint32.from_address(address)
+    def close(self):
+        self.free(self.whole, 0, WIN_RELEASE)
 
+    def pages(self, count):
+        got, tokens = self.number(count), (self.number * count)()
+        assert self.allocate_pages(PHYSICAL_64K, C.byref(got), tokens) and got.value == count
+        return tokens
+
+    def unmap(self, addresses):
+        array = (self.pointer * len(addresses))(*addresses)
+        return self.scatter(array, len(addresses), None)
+
+    def query(self, address):
+        info = MemoryBasicInformation()
+        assert self.query_raw(address, C.byref(info), C.sizeof(info)) == C.sizeof(info)
+        return info.AllocationBase, info.BaseAddress, info.RegionSize, info.State, info.Type
+
+
+def word(address):
+    return C.c_uint32.from_address(address)
+
+
+def mark(base, count, tag):
+    for i in range(count):
+        word(base + i * PAGE).value = tag + i
+        word(base + i * PAGE + PAGE - 4).value = i
+
+
+def marked(base, count, tag, skip=()):
+    return all(i in skip or (word(base + i * PAGE).value == tag + i and word(base + i * PAGE + PAGE - 4).value == i)
+               for i in range(count))
+
+
+def large_batch(shim, base, total):
+    """A batch across the 4096-page section boundary: holes, moved pages, reuse. Returns the map time."""
     assert total > 4200, "the batch has to span two 4096-page sections"
-    whole = reserve_startup(None, 16 << 30, STARTUP_RESERVE, 0x21, 4)
-    assert whole, C.get_last_error()
-    base = whole + PAGE_BYTES
+    tokens = shim.pages(total)
+    started = time.perf_counter()
+    assert shim.contiguous(base, total, tokens) == base, C.get_last_error()
+    mapped_in = time.perf_counter() - started
+    mark(base, total, 0xC0DE0000)
+    assert marked(base, total, 0xC0DE0000)
+    holes = [100, 101, 4095, 4096, total - 1]
+    assert shim.unmap([base + i * PAGE for i in holes]), C.get_last_error()
+    assert marked(base, total, 0xC0DE0000, skip=set(holes)), "a page beside a hole lost its bytes"
+    elsewhere = base + (total + 16) * PAGE
+    moved = (shim.number * len(holes))(*[tokens[i] for i in holes])
+    assert shim.contiguous(elsewhere, len(holes), moved) == elsewhere, C.get_last_error()
+    for slot, i in enumerate(holes):
+        assert word(elsewhere + slot * PAGE).value == 0xC0DE0000 + i, f"moved page {i}"
+    assert shim.contiguous(elsewhere, len(holes), None) == elsewhere
+    addresses = (shim.pointer * len(holes))(*[base + i * PAGE for i in holes])
+    assert shim.scatter(addresses, len(holes), moved), C.get_last_error()
+    assert marked(base, total, 0xC0DE0000)
+    assert not shim.release(total, tokens), "released a mapped grant"
+    assert shim.contiguous(base, total, None) == base
+    assert shim.release(total, tokens)
+    fresh = shim.pages(64)
+    assert shim.contiguous(base, 64, fresh) == base, C.get_last_error()
+    for i in range(64):
+        assert word(base + i * PAGE).value == 0 and word(base + i * PAGE + PAGE - 4).value == 0, f"reused page {i} is not zero"
+    assert shim.contiguous(base, 64, None) == base and shim.release(64, fresh)
+    return mapped_in, len(holes)
+
+
+def query_before_and_after_split(shim, base):
+    """What VirtualQuery reports for a run of eight pages, and for its pieces after page 3 is unmapped.
+    For an address inside a view it answers the view's base as AllocationBase and the bytes from the
+    queried page to the end of the view as RegionSize."""
+    tokens = shim.pages(8)
+    assert shim.contiguous(base, 8, tokens) == base
+
+    def view(page, first, last):
+        at = base + page * PAGE
+        return shim.query(at) == (base + first * PAGE, at, (last + 1 - page) * PAGE, MEM_COMMIT, MEM_MAPPED)
+
+    for i in (0, 3, 7):
+        assert view(i, 0, 7), f"whole run, page {i}: {shim.query(base + i * PAGE)}"
+    assert shim.unmap([base + 3 * PAGE])
+    # Pages 0-2 and 4-7 are now two views with their own allocation bases; page 3 is a placeholder.
+    for i in (0, 2):
+        assert view(i, 0, 2), f"lower piece, page {i}: {shim.query(base + i * PAGE)}"
+    for i in (4, 7):
+        assert view(i, 4, 7), f"upper piece, page {i}: {shim.query(base + i * PAGE)}"
+    hole = shim.query(base + 3 * PAGE)
+    assert hole[1] == base + 3 * PAGE and hole[2] == PAGE and hole[3] == MEM_RESERVE, hole
+    # Mapping the page again does not join the pieces: three views.
+    assert shim.contiguous(base + 3 * PAGE, 1, C.byref(shim.number(tokens[3]))) == base + 3 * PAGE
+    assert view(3, 3, 3) and view(2, 0, 2) and view(4, 4, 7)
+    assert shim.contiguous(base, 8, None) == base and shim.release(8, tokens)
+
+
+def two_views(shim, base):
+    """The same six pages in two runs: writes through either are seen through the other, and
+    unmapping a page of one run leaves the other run's page of the same backing in place."""
+    tokens = shim.pages(6)
+    first, second = base, base + 32 * PAGE
+    assert shim.contiguous(first, 6, tokens) == first and shim.contiguous(second, 6, tokens) == second
+    assert shim.query(first)[2] == 6 * PAGE and shim.query(second)[2] == 6 * PAGE, f"each mapping is one view: {shim.query(first)} {shim.query(second)}"
+    for i in range(6):
+        word(first + i * PAGE + 8).value = 0xA0000000 + i
+        assert word(second + i * PAGE + 8).value == 0xA0000000 + i, f"first to second, page {i}"
+        word(second + i * PAGE + 12).value = 0xB0000000 + i
+        assert word(first + i * PAGE + 12).value == 0xB0000000 + i, f"second to first, page {i}"
+    assert shim.unmap([first + 2 * PAGE])
+    word(second + 2 * PAGE + 8).value = 0x5EC0
+    for i in (1, 3):
+        word(first + i * PAGE + 16).value = 0xC0000000 + i
+        assert word(second + i * PAGE + 16).value == 0xC0000000 + i, f"after the split, page {i}"
+    assert shim.contiguous(first + 2 * PAGE, 1, C.byref(shim.number(tokens[2]))) == first + 2 * PAGE
+    assert word(first + 2 * PAGE + 8).value == 0x5EC0, "bytes written through the other view while this page was unmapped"
+    assert not shim.release(6, tokens), "released pages that two views still show"
+    assert shim.contiguous(first, 6, None) == first
+    assert not shim.release(6, tokens), "released pages that one view still shows"
+    assert shim.contiguous(second, 6, None) == second and shim.release(6, tokens)
+
+
+def two_runs(shim, base, tag):
+    """Two runs of eight pages with a gap between them."""
+    a, b = base, base + 16 * PAGE
+    ta, tb = shim.pages(8), shim.pages(8)
+    assert shim.contiguous(a, 8, ta) == a and shim.contiguous(b, 8, tb) == b
+    mark(a, 8, tag)
+    mark(b, 8, tag + 0x100)
+    return a, b, ta, tb
+
+
+def failures(shim, base):
+    """One step of an unmap refused (X2W_XMEM_TEST_FAULT): what is mapped and what the shim records must agree."""
+    # An unmap refused after one run is already gone: that run comes back and nothing changes.
+    a, b, ta, tb = two_runs(shim, base, 0x11110000)
+    os.environ["X2W_XMEM_TEST_FAULT"] = "1:1"
+    C.set_last_error(0)
+    assert not shim.unmap([a + 3 * PAGE, b + 3 * PAGE]), "a refused unmap reported success"
+    assert C.get_last_error() == ERROR_INVALID_ADDRESS, C.get_last_error()
+    del os.environ["X2W_XMEM_TEST_FAULT"]
+    assert marked(a, 8, 0x11110000) and marked(b, 8, 0x11110100), "pages changed although the unmap was refused"
+    assert shim.query(a)[3] == MEM_COMMIT and shim.query(a + 3 * PAGE)[3] == MEM_COMMIT
+    assert not shim.release(8, ta), "the refused unmap dropped the views from the record"
+    assert shim.unmap([a + 3 * PAGE, b + 3 * PAGE]), "the same unmap without the fault"
+    assert marked(a, 8, 0x11110000, skip={3}) and marked(b, 8, 0x11110100, skip={3})
+    assert shim.contiguous(a, 3, None) == a and shim.unmap([a + i * PAGE for i in range(4, 8)])
+    assert shim.contiguous(b, 3, None) == b and shim.unmap([b + i * PAGE for i in range(4, 8)])
+    assert shim.release(8, ta) and shim.release(8, tb)
+
+    # Surviving pages cannot be mapped again: the page asked for is unmapped, the survivors are
+    # forgotten, not left recorded without a view, and the call fails.
+    base += 64 * PAGE
+    a, b, ta, tb = two_runs(shim, base, 0x22220000)
+    os.environ["X2W_XMEM_TEST_FAULT"] = "2:0"
+    assert not shim.unmap([a + 3 * PAGE]), "a failed remap reported success"
+    del os.environ["X2W_XMEM_TEST_FAULT"]
+    for i in range(8):
+        assert shim.query(a + i * PAGE)[3] != MEM_COMMIT, f"page {i} of the broken run still has a view"
+    assert marked(b, 8, 0x22220100), "the other run changed"
+    # The record agrees: those pages are free to be mapped, here or elsewhere, and kept their bytes.
+    assert shim.contiguous(a, 8, ta) == a, C.get_last_error()
+    assert marked(a, 8, 0x22220000), "forgotten pages lost their bytes"
+    forgotten = a
+    assert shim.contiguous(a, 8, None) == a and shim.contiguous(b, 8, None) == b
+    assert shim.release(8, ta) and shim.release(8, tb)
+
+    # An unmap refused and the restore refused as well: the run that was already unmapped is
+    # forgotten, the other run is untouched, and the call fails with the unmap's error.
+    base += 64 * PAGE
+    a, b, ta, tb = two_runs(shim, base, 0x33330000)
+    os.environ["X2W_XMEM_TEST_FAULT"] = "3:1"
+    C.set_last_error(0)
+    assert not shim.unmap([a + 3 * PAGE, b + 3 * PAGE])
+    assert C.get_last_error() == ERROR_INVALID_ADDRESS, C.get_last_error()
+    del os.environ["X2W_XMEM_TEST_FAULT"]
+    assert shim.query(a)[3] != MEM_COMMIT and marked(b, 8, 0x33330100)
+    assert shim.release(8, ta), "the forgotten run's pages are still recorded as mapped"
+    assert shim.contiguous(b, 8, None) == b and shim.release(8, tb)
+    return forgotten
+
+
+def reader_while_toggling(shim, base, seconds, announce=None):
+    """A second thread reads one page while the main thread unmaps and maps its neighbour, which
+    shares its view: every unmap takes the reader's view away for a moment."""
+    tokens = shim.pages(64)
+    assert shim.contiguous(base, 64, tokens) == base
+    mark(base, 64, 0x44440000)
+    reader_page, toggled = 20, 21
+    stop, seen, wrong = threading.Event(), [0], [0]
+
+    def read_loop():
+        at = base + reader_page * PAGE
+        while not stop.is_set():
+            if word(at).value != 0x44440000 + reader_page:
+                wrong[0] += 1
+            seen[0] += 1
+
+    if announce:
+        print(announce, flush=True)
+    reader = threading.Thread(target=read_loop)
+    reader.start()
+    one_address, one_page = (shim.pointer * 1)(base + toggled * PAGE), (shim.number * 1)(tokens[toggled])
+    toggles, deadline = 0, time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        assert shim.scatter(one_address, 1, None), C.get_last_error()
+        assert shim.scatter(one_address, 1, one_page), C.get_last_error()
+        toggles += 1
+    stop.set()
+    reader.join(10)
+    assert not reader.is_alive() and seen[0] > 0 and wrong[0] == 0, (seen[0], wrong[0])
+    assert marked(base, 64, 0x44440000)
+    assert shim.contiguous(base, 64, None) == base and shim.release(64, tokens)
+    return toggles, seen[0]
+
+
+def child(path, mode):
+    shim = Shim(path)
+    base = shim.whole + PAGE
+    if mode == "reader-without-retry":
+        # The parent set X2W_XMEM_NO_FAULT_RETRY=1: the reader's first fault ends the process.
+        reader_while_toggling(shim, base, 20.0, announce="child: reader starts")
+        print("child: reader survived", flush=True)
+    elif mode == "read-forgotten":
+        # A page inside the range of the last break that the shim has forgotten: the handler must
+        # pass the fault on instead of retrying it for ever.
+        forgotten = failures(shim, base)
+        print("child: reading a forgotten page", flush=True)
+        word(forgotten).value
+        print("child: the read returned", flush=True)
+    return 0
+
+
+def expect_access_violation(path, mode, marker, environment=()):
+    env = dict(os.environ)
+    env.update(environment)
+    result = subprocess.run([sys.executable, "-B", __file__, "--child", mode, str(path)], capture_output=True, text=True,
+                            timeout=120, env=env)
+    code = result.returncode & 0xFFFFFFFF
+    assert marker in result.stdout, f"{mode}: the child stopped before its step: {result.stdout!r} {result.stderr[-400:]!r}"
+    assert "survived" not in result.stdout and "returned" not in result.stdout, f"{mode}: no fault: {result.stdout!r}"
+    assert code == ACCESS_VIOLATION, f"{mode}: exit code {code:#x}, expected an access violation: {result.stderr[-400:]!r}"
+
+
+def main(path, total=6000):
+    shim = Shim(path)
+    base = shim.whole + PAGE
     try:
-        count, pages = number(total), (number * total)()
-        assert allocate(PHYSICAL_64K, C.byref(count), pages) and count.value == total
-        started = time.perf_counter()
-        assert contiguous(base, total, pages) == base, C.get_last_error()
-        mapped_in = time.perf_counter() - started
-        for i in range(total):
-            word(base + i * PAGE_BYTES).value = 0xC0DE0000 + i
-            word(base + i * PAGE_BYTES + PAGE_BYTES - 4).value = i
-
-        def intact(skip=()):
-            for i in range(total):
-                if i in skip:
-                    continue
-                at = base + i * PAGE_BYTES
-                assert word(at).value == 0xC0DE0000 + i and word(at + PAGE_BYTES - 4).value == i, f"page {i} lost its bytes"
-
-        intact()
-        # Unmap single pages from the middle of the batch, on both sides of the section boundary.
-        holes = [100, 101, 4095, 4096, total - 1]
-        addresses = (pointer * len(holes))(*[base + i * PAGE_BYTES for i in holes])
-        assert scatter(addresses, len(holes), None), C.get_last_error()
-        intact(skip=set(holes))
-        # The same pages mapped somewhere else show the bytes written through the batch.
-        elsewhere = base + (total + 16) * PAGE_BYTES
-        moved = (number * len(holes))(*[pages[i] for i in holes])
-        assert contiguous(elsewhere, len(holes), moved) == elsewhere, C.get_last_error()
-        for slot, i in enumerate(holes):
-            assert word(elsewhere + slot * PAGE_BYTES).value == 0xC0DE0000 + i, f"moved page {i}"
-        assert contiguous(elsewhere, len(holes), None) == elsewhere
-        # And back where they were: the batch is whole again.
-        assert scatter(addresses, len(holes), moved), C.get_last_error()
-        intact()
-
-        # A reader on one page while its neighbour is unmapped and mapped again and again. The
-        # neighbour shares a view with the reader's page, so every unmap takes that view away for a
-        # moment; the reader must only ever see its own bytes.
-        reader_page, toggled = 2000, 2001
-        stop, seen, wrong = threading.Event(), [0], [0]
-
-        def read_loop():
-            at = base + reader_page * PAGE_BYTES
-            while not stop.is_set():
-                if word(at).value != 0xC0DE0000 + reader_page:
-                    wrong[0] += 1
-                seen[0] += 1
-
-        reader = threading.Thread(target=read_loop)
-        reader.start()
-        one_address, one_page = (pointer * 1)(base + toggled * PAGE_BYTES), (number * 1)(pages[toggled])
-        toggles = 0
-        deadline = time.perf_counter() + 2.0
-        while time.perf_counter() < deadline:
-            assert scatter(one_address, 1, None), C.get_last_error()
-            assert scatter(one_address, 1, one_page), C.get_last_error()
-            toggles += 1
-        stop.set()
-        reader.join(10)
-        assert not reader.is_alive() and seen[0] > 0 and wrong[0] == 0, (seen[0], wrong[0])
-        intact()
-
-        # Freed pages come back zero-filled.
-        assert not release(total, pages), "released a mapped grant"
-        assert contiguous(base, total, None) == base
-        assert release(total, pages)
-        again, fresh = number(64), (number * 64)()
-        assert allocate(PHYSICAL_64K, C.byref(again), fresh) and again.value == 64
-        assert contiguous(base, 64, fresh) == base, C.get_last_error()
-        for i in range(64):
-            at = base + i * PAGE_BYTES
-            assert word(at).value == 0 and word(at + PAGE_BYTES - 4).value == 0, f"reused page {i} is not zero"
-        assert contiguous(base, 64, None) == base and release(64, fresh)
+        mapped_in, holes = large_batch(shim, base, total)
+        query_before_and_after_split(shim, base)
+        two_views(shim, base)
+        failures(shim, base + 256 * PAGE)
+        toggles, reads = reader_while_toggling(shim, base, 2.0)
     finally:
-        free(whole, 0, WIN_RELEASE)
-    print(f"xmem_page_runs: PASS ({total} pages mapped in {mapped_in * 1000:.0f} ms, {len(holes)} holes, "
-          f"{toggles} neighbour toggles under {seen[0]} reads, reuse zeroed)")
+        shim.close()
+    # Controls that must end in an access violation, each in a child process.
+    expect_access_violation(path, "reader-without-retry", "child: reader starts", {"X2W_XMEM_NO_FAULT_RETRY": "1"})
+    expect_access_violation(path, "read-forgotten", "child: reading a forgotten page")
+    print(f"xmem_page_runs: PASS ({total} pages mapped in {mapped_in * 1000:.0f} ms, {holes} holes, VirtualQuery before and "
+          f"after a split, two views, 3 refused steps, {toggles} neighbour toggles under {reads} reads, 2 access-violation controls)")
 
 
 if __name__ == "__main__":
+    if sys.argv[1] == "--child":
+        sys.exit(child(sys.argv[3], sys.argv[2]))
     main(sys.argv[1], *(int(a) for a in sys.argv[2:3]))

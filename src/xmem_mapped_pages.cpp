@@ -4,6 +4,7 @@
 
 #include "era_physical.h"
 
+#include <cstdlib>
 #include <cstring>
 #include "startup_stubs/local_log.h"
 
@@ -14,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <new>
+#include <set>
 
 namespace {
 struct Backing {
@@ -39,12 +41,12 @@ struct PhysicalMemory {
     std::map<ULONG_PTR, SIZE_T> runs;  // OS views: base -> bytes
     std::vector<HANDLE> slabs;
     ULONG64 slab_used = 0;
-    std::vector<std::pair<HANDLE, ULONG64>> free_slots;
+    std::set<std::pair<HANDLE, ULONG64>> free_slots;  // ordered, so that pages reused together are adjacent slots again
 
     ~PhysicalMemory()
     {
-        for (const auto& view : views)
-            UnmapViewOfFile(reinterpret_cast<void*>(view.first));
+        for (const auto& run : runs)
+            UnmapViewOfFile(reinterpret_cast<void*>(run.first));
         for (const HANDLE slab : slabs)
             CloseHandle(slab);
     }
@@ -78,13 +80,13 @@ HANDLE section_for(ULONG_PTR page)
         return existing->second.section;
     constexpr ULONG64 slab_bytes = 4096 * ULONG64{page_bytes};
     if (!memory.free_slots.empty()) {
-        const auto [section, offset] = memory.free_slots.back();
+        const auto [section, offset] = *memory.free_slots.begin();
         void* view = MapViewOfFile(section, FILE_MAP_WRITE, static_cast<DWORD>(offset >> 32), static_cast<DWORD>(offset), page_bytes);
         if (!view) return nullptr;
         std::memset(view, 0, page_bytes);  // a reused slot starts zero-filled, as a fresh section did
         UnmapViewOfFile(view);
         memory.backings.emplace(page, Backing{section, 0, offset});
-        memory.free_slots.pop_back();
+        memory.free_slots.erase(memory.free_slots.begin());
         return section;
     }
     if (memory.slabs.empty() || memory.slab_used == slab_bytes) {
@@ -174,22 +176,145 @@ void coalesce_unused(const std::map<ULONG_PTR, ULONG_PTR>& batch)
 }
 
 // Unmapping a page inside a run unmaps the whole run and maps its other pages again (map_pages).
-// A thread that touches one of those pages in between faults; this handler waits for the remap
-// (the mutex) and retries the access. It answers only for an address whose page is mapped.
+// A thread that touches one of those pages in between faults. The break records the address
+// ranges of the runs it takes apart and a generation that is odd while it is in progress.
+struct RemapWindow {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<std::pair<ULONG_PTR, SIZE_T>> ranges;  // the runs of the break in progress, or of the last one
+    ULONG64 generation = 0;
+};
+RemapWindow remap_window;
+
+void begin_break(const std::map<ULONG_PTR, SIZE_T>& broken)
+{
+    AcquireSRWLockExclusive(&remap_window.lock);
+    remap_window.ranges.assign(broken.begin(), broken.end());
+    ++remap_window.generation;
+    ReleaseSRWLockExclusive(&remap_window.lock);
+}
+void end_break()
+{
+    AcquireSRWLockExclusive(&remap_window.lock);
+    ++remap_window.generation;
+    ReleaseSRWLockExclusive(&remap_window.lock);
+}
+
+// Retries an access violation only when all of this holds: the address is inside a run that the
+// break in progress, or the last finished one, took apart; after that break has finished (the
+// mutex) the page is recorded and covered by a view; and this thread has not already retried this
+// page for this break. Everything else is passed on, so a fault that is not the transient one is
+// reported after at most one retry.
 thread_local bool mapping_thread = false;
 LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
 {
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || mapping_thread)
         return EXCEPTION_CONTINUE_SEARCH;
-    const ULONG_PTR page = record->ExceptionInformation[1] & ~(ULONG_PTR{page_bytes} - 1);
-    const std::lock_guard guard(memory.mutex);
-    return memory.views.count(page) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    const ULONG_PTR address = record->ExceptionInformation[1];
+    const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
+    bool inside = false;
+    AcquireSRWLockShared(&remap_window.lock);
+    const ULONG64 seen = remap_window.generation;
+    for (const auto& [base, size] : remap_window.ranges)
+        inside |= address - base < size;
+    ReleaseSRWLockShared(&remap_window.lock);
+    if (!inside || seen == 0) return EXCEPTION_CONTINUE_SEARCH;
+    const ULONG64 break_id = seen | 1;  // the break in progress, or the one that just finished
+    thread_local ULONG_PTR retried_page = 0;
+    thread_local ULONG64 retried_break = 0;
+    if (retried_page == page && retried_break == break_id) return EXCEPTION_CONTINUE_SEARCH;
+    bool mapped = false;
+    {
+        const std::lock_guard guard(memory.mutex);  // held by the mapping thread until its break is over
+        auto run = memory.runs.upper_bound(page);
+        mapped = memory.views.count(page) && run != memory.runs.begin() && page - std::prev(run)->first < std::prev(run)->second;
+    }
+    if (!mapped) return EXCEPTION_CONTINUE_SEARCH;
+    retried_page = page;
+    retried_break = break_id;
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 struct MappingThread {
     MappingThread() { mapping_thread = true; }
     ~MappingThread() { mapping_thread = false; }
 };
+
+// Test control (tests/xmem_page_runs_check.py): X2W_XMEM_TEST_FAULT=<stage>:<skip> makes one step of
+// the next unmap fail as if Windows had refused it, after skipping <skip> such steps. Stage 1 is
+// unmapping a run, stage 2 mapping surviving pages again, stage 3 both the unmap and the restore.
+struct TestFault {
+    unsigned stage = 0, skip = 0;
+    TestFault()
+    {
+        char text[32];
+        if (GetEnvironmentVariableA("X2W_XMEM_TEST_FAULT", text, sizeof(text)) && text[0] >= '1' && text[0] <= '3' && text[1] == ':') {
+            stage = static_cast<unsigned>(text[0] - '0');
+            skip = static_cast<unsigned>(std::strtoul(text + 2, nullptr, 10));
+        }
+    }
+    bool hit(unsigned at)
+    {
+        if (stage != at && !(stage == 3 && at == 1)) return false;
+        if (skip) {
+            --skip;
+            return false;
+        }
+        if (stage != 3) stage = 0;      // one failure
+        else if (at == 1) return true;  // stage 3: the unmap now, the restore next
+        return true;
+    }
+};
+
+// Drops a page that has no view any more from the registry, so that the registry never names a
+// page Windows does not show.
+void forget_page(ULONG_PTR address)
+{
+    const auto live = memory.views.find(address);
+    if (live == memory.views.end()) return;
+    --memory.backings.at(live->second).views;
+    memory.views.erase(live);
+}
+
+// Maps every recorded page of [base, base + size) that has no view: neighbours on adjacent slots
+// together, one page at a time when a group is refused. A page that cannot be mapped is forgotten
+// and counted. fail is true when the test control refuses this range.
+ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail)
+{
+    ULONG_PTR lost = 0;
+    ULONG_PTR at = base;
+    while (at < base + size) {
+        const auto live = memory.views.find(at);
+        if (live == memory.views.end()) {
+            at += page_bytes;
+            continue;
+        }
+        const Backing head = memory.backings.at(live->second);
+        SIZE_T bytes = page_bytes;
+        for (; at + bytes < base + size; bytes += page_bytes) {
+            const auto next = memory.views.find(at + bytes);
+            if (next == memory.views.end()) break;
+            const Backing& b = memory.backings.at(next->second);
+            if (b.section != head.section || b.offset != head.offset + bytes) break;
+        }
+        std::vector<std::pair<ULONG_PTR, SIZE_T>> made;
+        if (fail || !map_run(at, head, bytes, made)) {
+            // map_run may have mapped some pages one at a time before it stopped; keep those.
+            for (SIZE_T done = 0; done < bytes; done += page_bytes) {
+                if (memory.runs.count(at + done)) continue;
+                Backing one = head;
+                one.offset += done;
+                if (!fail && map_view(at + done, one)) {
+                    memory.runs[at + done] = page_bytes;
+                } else {
+                    forget_page(at + done);
+                    ++lost;
+                }
+            }
+        }
+        at += bytes;
+    }
+    return lost;
+}
 
 // Destinations must be caller-owned, page-sized Windows placeholders. Live views
 // are owned by this shim until it unmaps them. The caller must not replace them.
@@ -249,7 +374,12 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
                 ++memory.backings.at(page).views;
             memory.views.merge(batch);
         } else {
-            // Unmap every run that holds a page of the batch, then map the surviving pages of those runs again.
+            // Unmap every run that holds a page of the batch, then map the surviving pages of those
+            // runs again. The registry (views, runs) matches what Windows shows on every way out:
+            // - an unmap is refused: the runs already unmapped are mapped again whole, nothing is
+            //   removed, and the call fails with that error;
+            // - a surviving page cannot be mapped again: it is forgotten, the batch is unmapped, and
+            //   the call fails.
             std::map<ULONG_PTR, SIZE_T> broken;
             for (const auto& [address, page] : batch) {
                 auto run = memory.runs.upper_bound(address);
@@ -257,34 +387,44 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
                 --run;
                 if (address - run->first < run->second) broken.insert(*run);
             }
+            TestFault test;
+            begin_break(broken);
+            struct EndBreak {
+                ~EndBreak() { end_break(); }
+            } const end;
+            DWORD error = ERROR_SUCCESS;
+            std::vector<std::pair<ULONG_PTR, SIZE_T>> unmapped;
             for (const auto& [base, size] : broken) {
-                if (!UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER))
-                    return FALSE;
+                if (test.hit(1)) {
+                    error = ERROR_INVALID_ADDRESS;
+                    break;
+                }
+                if (!UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER)) {
+                    error = GetLastError();
+                    break;
+                }
                 memory.runs.erase(base);
+                unmapped.emplace_back(base, size);
             }
-            for (const auto& [address, page] : batch) {
-                --memory.backings.at(page).views;
-                memory.views.erase(address);
-            }
-            std::vector<std::pair<ULONG_PTR, SIZE_T>> made;
-            for (const auto& [base, size] : broken) {
-                ULONG_PTR at = base;
-                while (at < base + size) {
-                    const auto live = memory.views.find(at);
-                    if (live == memory.views.end()) { at += page_bytes; continue; }
-                    const Backing& head = memory.backings.at(live->second);
-                    SIZE_T bytes = page_bytes;
-                    for (; at + bytes < base + size; bytes += page_bytes) {
-                        const auto next = memory.views.find(at + bytes);
-                        if (next == memory.views.end()) break;
-                        const Backing& b = memory.backings.at(next->second);
-                        if (b.section != head.section || b.offset != head.offset + bytes) break;
-                    }
-                    if (!map_run(at, head, bytes, made)) return FALSE;
-                    at += bytes;
+            const bool refused = error != ERROR_SUCCESS;
+            if (!refused) {
+                for (const auto& [address, page] : batch) {
+                    --memory.backings.at(page).views;
+                    memory.views.erase(address);
                 }
             }
-            coalesce_unused(batch);
+            ULONG_PTR lost = 0;
+            for (const auto& [base, size] : unmapped)
+                lost += map_recorded(base, size, refused ? test.stage == 3 && test.hit(3) : test.hit(2));
+            if (!refused) coalesce_unused(batch);
+            if (refused || lost) {
+                x2w_local::logf("x2w-xmem unmap of %llu page(s) failed (error %lu): %s; %llu surviving page(s) could not be mapped "
+                                "again and were forgotten", static_cast<unsigned long long>(batch.size()),
+                                static_cast<unsigned long>(error), refused ? "an unmap was refused and no page of the batch was removed" : "the pages were unmapped",
+                                static_cast<unsigned long long>(lost));
+                SetLastError(refused ? error : ERROR_NOT_ENOUGH_MEMORY);
+                return FALSE;
+            }
         }
     } catch (const std::bad_alloc&) {
         return physical_result(era_physical::Status::exhausted);
@@ -485,7 +625,7 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto backing = memory.backings.find(pages[i]);
             if (backing != memory.backings.end()) {
-                memory.free_slots.emplace_back(backing->second.section, backing->second.offset);
+                memory.free_slots.emplace(backing->second.section, backing->second.offset);
                 memory.backings.erase(backing);
             }
         }

@@ -313,6 +313,15 @@ add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
 # Input for the launcher containment check (docs/startup-runtime.md): writes known bytes to both
 # streams and the trap log, reports a known exit code, or holds memory, spawns a child or stays
 # alive so the launch tool's job limits have to stop it.
+# Placed buffers at the boundary between two views of physical pages (src/xmem_mapped_pages.cpp).
+add_executable(xmem_page_runs_device_check tests/xmem_page_runs_device_check.cpp)
+target_compile_features(xmem_page_runs_device_check PRIVATE cxx_std_17)
+target_link_libraries(xmem_page_runs_device_check PRIVATE xmem_shim d3d12_xs_shim d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME xmem_page_runs_device_${adapter} COMMAND xmem_page_runs_device_check ${adapter})
+    set_tests_properties(xmem_page_runs_device_${adapter} PROPERTIES TIMEOUT 120)
+endforeach()
+set_tests_properties(xmem_page_runs_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(startup_launch_probe tests/startup_launch_probe.cpp)
 target_compile_features(startup_launch_probe PRIVATE cxx_std_17)
 
@@ -1213,11 +1222,6 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME xmem_shim_page_runs COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_page_runs_check.py" "$<TARGET_FILE:xmem_shim>")
     set_tests_properties(xmem_shim_page_runs PROPERTIES TIMEOUT 300)
-    # Control: without the fault-retry handler the reader in the same check takes an access violation.
-    add_test(NAME xmem_shim_page_runs_no_retry_control COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_SOURCE_DIR}/tests/xmem_page_runs_check.py" "$<TARGET_FILE:xmem_shim>")
-    set_tests_properties(xmem_shim_page_runs_no_retry_control PROPERTIES TIMEOUT 300 WILL_FAIL TRUE
-        ENVIRONMENT "X2W_XMEM_NO_FAULT_RETRY=1")
     add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")
     # Compile-only: outcome classification and GVN pass shares, no wall-time threshold (#775).

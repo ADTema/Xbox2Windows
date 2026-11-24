@@ -320,12 +320,30 @@ slow for a start-up batch of about 100,000 pages (measured under Wine: 42.9 s fo
 82 ms with shared sections and views).
 
 Unmapping a page inside a shared view unmaps that view and maps its other pages again. A thread
-that touches one of those pages in between takes an access violation; a vectored handler waits
-for the remap and retries the access, and answers only for a page that is mapped. A freed slot is
-zeroed when it is reused. `VirtualQuery` on a page of a shared view reports the view's base and
-size, not the page's.
+that touches one of those pages in between takes an access violation. A vectored handler retries
+it only when the address is inside a view that the unmap in progress, or the last finished one,
+took apart, the page is recorded and covered by a view once that unmap is over, and the thread
+has not already retried that page for that unmap. Any other fault is passed on, after at most one
+retry.
 
-`ctest --preset release --no-tests=error -R '^xmem_shim_(mapped_pages|page_runs)' -V` runs the
-earlier contract check and a batch that spans two sections, with holes punched in it, pages moved
-and reused, and a second thread reading a page while its neighbour is unmapped and mapped again.
-The `no_retry_control` variant leaves the handler out and must fail.
+What the shim records always matches what Windows shows. If an unmap is refused part of the way,
+the views already unmapped are mapped again whole, nothing is removed and the call fails with
+that error. If a surviving page cannot be mapped again, it is forgotten (its bytes stay in the
+section), the batch is unmapped and the call fails. A freed slot is zeroed when it is reused, and
+freed slots are reused in address order so that pages reused together share a view again.
+
+`VirtualQuery` on a page of a shared view reports the view's base as the allocation base and the
+bytes from the queried page to the end of the view, not one page. A placed buffer on such memory
+is not affected: section-backed pages already took the committed, not-aliased path.
+
+- `ctest --preset release --no-tests=error -R '^xmem_shim_(mapped_pages|page_runs)$' -V` runs the
+  earlier contract check and `tests/xmem_page_runs_check.py`: a batch across two sections with
+  holes, moved and reused pages; `VirtualQuery` before and after a view is split; two views of
+  the same pages with writes seen both ways; an unmap refused at each of three steps
+  (`X2W_XMEM_TEST_FAULT`); and a reader on a page while its neighbour is unmapped and mapped
+  again. Two cases must end in an access violation, the reader without the handler
+  (`X2W_XMEM_NO_FAULT_RETRY=1`) and a read of a forgotten page; each runs in a child process
+  whose exit code the parent checks.
+- `ctest --preset release --no-tests=error -R '^xmem_page_runs_device_' -V` places a buffer
+  (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
+  sections, and single-page views.
