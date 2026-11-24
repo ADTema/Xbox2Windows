@@ -7886,6 +7886,14 @@ mip clamp produced the expected differences at word 1, words 0–1 and word 2,
 respectively. All runs reported zero D3D12 warnings and errors. App-local WARP
 returned the same words with the original SM 6.6 build.
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (32.0.101.8132) returned
+1.0, 0.0 and 0.375 for the baseline, with `s2` and `s5` as the sampler registers
+and all 16 words matching. A reference that claims the second comparison passed
+produced exactly one mismatch, at word 1. `GREATER` on `s2` exchanged the two
+comparison words and changed nothing else, and clamping the ordinary sampler to
+`MinLOD` 1 changed only the ordinary word, to 0.625. Every run reported zero
+D3D12 debug errors and warnings.
+
 ```powershell
 ctest --preset dev --no-tests=error -R '^spirv_compare_sampler_' -V
 ```
