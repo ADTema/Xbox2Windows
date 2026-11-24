@@ -87,6 +87,21 @@ def run_unit_tests():
         assert launch_mod.check_shader_cache_warning({"X2W_SHADER_CACHE": str(root / "cache_missing")}) is None
         assert launch_mod.check_shader_cache_warning({}) is None
 
+        # 3b. Relative cache resolves against the child cwd; unlistable cache never raises.
+        child = root / "child_cwd"
+        (child / "rel_cache").mkdir(parents=True)
+        (child / "rel_cache" / "req.dxil").write_text("cached", encoding="utf-8")
+        assert launch_mod.check_shader_cache_warning({"X2W_SHADER_CACHE": "rel_cache"}, str(child)), "relative cache not resolved against cwd"
+        assert launch_mod.check_shader_cache_warning({"X2W_SHADER_CACHE": "rel_cache"}, str(root)) is None
+        real_scandir = os.scandir
+        def denied(_path):
+            raise PermissionError("denied")
+        os.scandir = denied
+        try:
+            assert launch_mod.check_shader_cache_warning({"X2W_SHADER_CACHE": str(non_empty_cache)}) is None
+        finally:
+            os.scandir = real_scandir
+
         # 4. Fast-fail diagnostic emission on quick non-zero exit vs silence on zero exit or slow exit.
         diag = launch_mod.format_fast_fail_diagnostic(
             7, 0.25, str(logdir / "trap.log"),

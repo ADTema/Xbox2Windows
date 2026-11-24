@@ -66,15 +66,25 @@ def prepare_storage_path(env, logdir, default_storage="S:\\", exists_fn=os.path.
     return f"X2W_STORAGE_PATH unset and {default_storage} missing; created fallback storage: {fallback}"
 
 
-def check_shader_cache_warning(env):
-    """Warn if X2W_SHADER_CACHE points to an existing non-empty directory."""
+def check_shader_cache_warning(env, cwd=None):
+    """Warn if X2W_SHADER_CACHE points to an existing non-empty directory.
+
+    A relative value is resolved against the child's working directory, as the child sees it.
+    Inspection failures are advisory only and never stop the launch.
+    """
     shader_cache = env.get("X2W_SHADER_CACHE", "").strip()
-    if not shader_cache or not os.path.isdir(shader_cache):
+    if not shader_cache:
         return None
-    with os.scandir(shader_cache) as entries:
-        if any(entries):
-            return (f"warning: X2W_SHADER_CACHE ({shader_cache}) is non-empty; "
-                    "cached translated shaders from an older build may be stale")
+    inspected = os.path.join(cwd, shader_cache) if cwd and not os.path.isabs(shader_cache) else shader_cache
+    try:
+        if not os.path.isdir(inspected):
+            return None
+        with os.scandir(inspected) as entries:
+            if any(entries):
+                return (f"warning: X2W_SHADER_CACHE ({shader_cache}) is non-empty; "
+                        "cached translated shaders from an older build may be stale")
+    except OSError:
+        return None
     return None
 
 
@@ -133,7 +143,7 @@ def main():
     storage_note = prepare_storage_path(env, logdir)
     if storage_note:
         print(storage_note)
-    shader_warning = check_shader_cache_warning(env)
+    shader_warning = check_shader_cache_warning(env, cwd)
     if shader_warning:
         print(shader_warning)
     block = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
