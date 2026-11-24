@@ -383,7 +383,7 @@ add_test(NAME startup_placed_allocation_cache_unchecked_control COMMAND startup_
 add_test(NAME startup_placed_allocation_cache_address_only_control
     COMMAND startup_placed_allocation_cache_check --mutate address-only)
 set_tests_properties(startup_placed_allocation_cache_unchecked_control startup_placed_allocation_cache_address_only_control
-    PROPERTIES WILL_FAIL TRUE)
+    PROPERTIES WILL_FAIL TRUE SKIP_RETURN_CODE 77)
 add_executable(startup_storage_file_range tests/startup_storage_file_range.cpp)
 target_compile_features(startup_storage_file_range PRIVATE cxx_std_17)
 target_include_directories(startup_storage_file_range PRIVATE src)

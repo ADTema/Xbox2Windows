@@ -951,7 +951,9 @@ remembered allocation; no stand-in decommits part of an allocation.
   and replaced by a 1 MiB block at the same base must refuse a buffer that ends past the new end and
   one that starts past it; a mapped view is refused every time and not remembered; pages committed
   after the first measurement are seen. The two `_control` runs disable the check
-  (`--mutate none`) or query only the buffer's address (`--mutate address-only`) and must fail.
+  (`--mutate none`) or query only the buffer's address (`--mutate address-only`) and must fail,
+  each only through its own stale acceptance; any other failure makes the control fail, and a refused
+  allocation or mapping is a capability skip (77).
 
 ## Buffer memory SRVs (device slot 70)
 

@@ -10,8 +10,13 @@
 // 3. A mapped view is refused every time and never remembered.
 // 4. Pages committed after the first measurement are seen by the next placement that needs them.
 //
-// --mutate none skips the check of remembered extents and --mutate address-only checks only the
-// region at the placement address; both must fail case 2.
+// The two controls run with WILL_FAIL and must fail only for their stated reason. --mutate none skips
+// the check of remembered extents: it exits 1 only if case 2 serves the placement past the new end
+// from the stale extent. --mutate address-only checks only the region at the placement address: it
+// exits 1 only if case 2 serves the placement that ends past the new end from the stale extent while
+// the placement past the new end is still refused. Either exits 0 (so the control fails) when that
+// does not happen or when any other case fails. A setup step the system refuses (an allocation, a
+// mapping) is a capability skip, 77, in the controls and a failure in the main check.
 #include "startup_stubs/placed_allocation_cache.h"
 
 #include <cstdio>
@@ -25,11 +30,21 @@ using x2w_startup::PlacedAllocationCache;
 constexpr SIZE_T page = 0x10000;
 constexpr SIZE_T block_bytes = 64u << 20;
 int failures;
+int setup_failures;
+int replaced_failures;   // failures inside case 2
+bool stale_ending;       // case 2 accepted the buffer ending past the new end, unlike the uncached path
+bool stale_past;         // case 2 accepted the buffer past the new end, unlike the uncached path
 
 void fail(const char* what, const void* address)
 {
     std::fprintf(stderr, "placed allocation cache: %s (address %p)\n", what, address);
     ++failures;
+}
+
+void setup_fail(const char* what, const void* address)
+{
+    std::fprintf(stderr, "placed allocation cache: setup: %s (address %p, error %lu)\n", what, address, GetLastError());
+    ++setup_failures;
 }
 
 // The rules slot 133 applies to a measured extent before it places a buffer.
@@ -78,23 +93,29 @@ void replaced_block(ExtentCheck check)
 {
     PlacedAllocationCache cache(check);
     char* block = striped_block();
-    if (!block) return fail("cannot allocate the striped block", nullptr);
+    if (!block) return setup_fail("cannot allocate the striped block", nullptr);
+    const int before = failures;
     place(cache, block, page, "replaced: first placement");
     VirtualFree(block, 0, MEM_RELEASE);
     char* smaller = static_cast<char*>(VirtualAlloc(block, 1u << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    if (smaller != block) return fail("cannot allocate the smaller block at the same base", block);
+    if (smaller != block) return setup_fail("cannot allocate the smaller block at the same base", block);
     // A buffer wholly inside the new block is accepted as the uncached path accepts it.
     if (!place(cache, smaller + 2 * page, page, "replaced: placement inside the new block first", false))
         fail("placement inside the new block refused", smaller + 2 * page);
     // First a buffer that starts inside the new block: the region at its address still belongs to the
     // same base, so only the region at its last byte shows the change. Then one past the new end.
-    if (place(cache, smaller + (512u << 10), 1u << 20, "replaced: placement ending past the new end"))
+    if (place(cache, smaller + (512u << 10), 1u << 20, "replaced: placement ending past the new end")) {
+        stale_ending = true;
         fail("placement ending past the new end accepted", smaller + (512u << 10));
-    if (place(cache, smaller + (2u << 20), page, "replaced: placement past the new end"))
+    }
+    if (place(cache, smaller + (2u << 20), page, "replaced: placement past the new end")) {
+        stale_past = true;
         fail("placement past the new end accepted", smaller + (2u << 20));
+    }
     if (!place(cache, smaller + page, page, "replaced: placement inside the new block"))
         fail("placement inside the new block refused", smaller + page);
     VirtualFree(smaller, 0, MEM_RELEASE);
+    replaced_failures = failures - before;
 }
 } // namespace
 
@@ -111,12 +132,12 @@ int main(int argc, char** argv)
     }
 
     // Case 1: 256 placements into one striped block, widths of one to four pages.
-    {
+    do {
         PlacedAllocationCache cache(check);
         char* block = striped_block();
         if (!block) {
-            fail("cannot allocate the striped block", nullptr);
-            return 1;
+            setup_fail("cannot allocate the striped block", nullptr);
+            break;
         }
         int accepted_count = 0;
         for (SIZE_T i = 0; i < 256; ++i) {
@@ -132,7 +153,7 @@ int main(int argc, char** argv)
         // The placement past the end does not fit the remembered extent and is measured again.
         if (cache.walks() != 2 || cache.hits() != 256 || cache.entries() != 1) fail("walk count", block);
         VirtualFree(block, 0, MEM_RELEASE);
-    }
+    } while (false);
 
     // Case 2: a stale extent at a reused base.
     replaced_block(check);
@@ -143,7 +164,7 @@ int main(int argc, char** argv)
         HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 1u << 20, nullptr);
         void* view = mapping ? MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0) : nullptr;
         if (!view) {
-            fail("cannot map a view", nullptr);
+            setup_fail("cannot map a view", nullptr);
         } else {
             for (int i = 0; i < 2; ++i)
                 if (place(cache, view, page, "mapped placement")) fail("mapped placement accepted", view);
@@ -158,13 +179,13 @@ int main(int argc, char** argv)
         PlacedAllocationCache cache(check);
         auto* reserved = static_cast<char*>(VirtualAlloc(nullptr, 4u << 20, MEM_RESERVE, PAGE_NOACCESS));
         if (!reserved || !VirtualAlloc(reserved, 1u << 20, MEM_COMMIT, PAGE_READWRITE)) {
-            fail("cannot commit the reservation", reserved);
+            setup_fail("cannot commit the reservation", reserved);
         } else {
             place(cache, reserved, page, "partly committed: first placement");
             if (place(cache, reserved + (1u << 20), page, "partly committed: past the committed run"))
                 fail("placement into reserved pages accepted", reserved + (1u << 20));
             if (!VirtualAlloc(reserved + (1u << 20), 1u << 20, MEM_COMMIT, PAGE_READWRITE)) {
-                fail("cannot commit the second megabyte", reserved);
+                setup_fail("cannot commit the second megabyte", reserved);
             } else {
                 if (!place(cache, reserved + (1u << 20), page, "partly committed: after the second commit"))
                     fail("placement into newly committed pages refused", reserved + (1u << 20));
@@ -175,8 +196,17 @@ int main(int argc, char** argv)
         if (reserved) VirtualFree(reserved, 0, MEM_RELEASE);
     }
 
-    if (failures) {
-        std::fprintf(stderr, "placed allocation cache: %d failure(s)\n", failures);
+    if (check != ExtentCheck::full) {
+        if (setup_failures) return 77;
+        const bool stated = failures == replaced_failures &&
+                            (check == ExtentCheck::none ? stale_past : stale_ending && !stale_past);
+        std::fprintf(stderr, "placed allocation cache control: %d failure(s), %d in case 2, stale ending %d, "
+                     "stale past %d -> %s\n", failures, replaced_failures, stale_ending, stale_past,
+                     stated ? "failed for the stated reason" : "did NOT fail for the stated reason");
+        return stated ? 1 : 0;
+    }
+    if (failures || setup_failures) {
+        std::fprintf(stderr, "placed allocation cache: %d failure(s), %d setup failure(s)\n", failures, setup_failures);
         return 1;
     }
     std::printf("placed allocation cache: all cases match the uncached path\n");
