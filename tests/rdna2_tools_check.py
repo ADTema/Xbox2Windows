@@ -649,6 +649,61 @@ class TestRdna2Disasm(unittest.TestCase):
                 self.assertEqual([(i["offset"], i["length"], i["opcode"]) for i in insns],
                                  [(0, 8, f"{name}_unsupported"), (8, 4, "s_endpgm")])
 
+    def test_sopk_compare_and_call_opcodes(self):
+        vectors = (
+            ("feff04b3", "s_cmpk_ge_i32 s4, 0xfffe"),
+            ("feff84b3", "s_cmpk_lt_i32 s4, 0xfffe"),
+            ("feff04b4", "s_cmpk_le_i32 s4, 0xfffe"),
+            ("ffff84b4", "s_cmpk_eq_u32 s4, 0xffff"),
+            ("ffff04b5", "s_cmpk_lg_u32 s4, 0xffff"),
+            ("ffff84b5", "s_cmpk_gt_u32 s4, 0xffff"),
+            ("ffff04b6", "s_cmpk_ge_u32 s4, 0xffff"),
+            ("ffff84b6", "s_cmpk_lt_u32 s4, 0xffff"),
+            ("ffff04b7", "s_cmpk_le_u32 s4, 0xffff"),
+            ("feff04bb", "s_call_b64 s[4:5], 65534"),
+        )
+        for raw, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                records = disasm_rdna2(bytes.fromhex(raw + "000081bf"))
+                self.assertEqual(
+                    [(r["offset"], r["length"], r["opcode"], r["assembly"]) for r in records],
+                    [(0, 4, assembly.split()[0], assembly), (4, 4, "s_endpgm", "s_endpgm")],
+                )
+
+    def test_sopp_system_opcodes(self):
+        # Fixed gfx1013 encodings. Keep raw message and dependency-control
+        # immediates independent of LLVM's version-specific symbolic spelling.
+        vectors = (
+            ("000083bf", "s_wakeup"),
+            ("01008bbf", "s_setkill 1"),
+            ("01008dbf", "s_sethalt 1"),
+            ("07008ebf", "s_sleep 7"),
+            ("02008fbf", "s_setprio 2"),
+            ("030090bf", "s_sendmsg 0x3"),
+            ("030091bf", "s_sendmsghalt 0x3"),
+            ("070092bf", "s_trap 7"),
+            ("000093bf", "s_icache_inv"),
+            ("010094bf", "s_incperflevel 1"),
+            ("010095bf", "s_decperflevel 1"),
+            ("000096bf", "s_ttracedata"),
+            ("00009bbf", "s_endpgm_saved"),
+            ("00009ebf", "s_endpgm_ordered_ps_done"),
+            ("0000a2bf", "s_wait_idle"),
+            ("e3ffa3bf", "s_waitcnt_depctr 0xffe3"),
+            ("0900a4bf", "s_round_mode 0x9"),
+            ("0900a5bf", "s_denorm_mode 9"),
+            ("3412a8bf", "s_ttracedata_imm 0x1234"),
+        )
+        for raw, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                records = disasm_rdna2(bytes.fromhex(raw + "000081bf"))
+                self.assertEqual(
+                    [(r["offset"], r["length"], r["opcode"], r["assembly"]) for r in records],
+                    [(0, 4, assembly.split()[0], assembly), (4, 4, "s_endpgm", "s_endpgm")],
+                )
+        self.assertEqual(decode_instruction(bytes.fromhex("0000a6bf"), 0)[:3],
+                         (4, "s_sopp_26", "s_sopp_26 0x0"))
+
     def test_hwreg_operands_use_llvm_spelling(self):
         """Issue #938: hwreg operands and s_setreg_imm32_b32 literals print as LLVM 15 prints them for gfx1013.
 

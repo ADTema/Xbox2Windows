@@ -126,6 +126,7 @@ SOPP_OPS = {
     0x00: ("s_nop", "No operation (wait cycles)"),
     0x01: ("s_endpgm", "Terminate shader execution"),
     0x02: ("s_branch", "Unconditional branch"),
+    0x03: ("s_wakeup", "Wake a sleeping wave"),
     0x04: ("s_cbranch_scc0", "Branch if SCC == 0"),
     0x05: ("s_cbranch_scc1", "Branch if SCC == 1"),
     0x06: ("s_cbranch_vccz", "Branch if VCC is zero"),
@@ -133,10 +134,28 @@ SOPP_OPS = {
     0x08: ("s_cbranch_execz", "Branch if EXEC is zero"),
     0x09: ("s_cbranch_execnz", "Branch if EXEC is non-zero"),
     0x0a: ("s_barrier", "Synchronize wavefronts in workgroup"),
+    0x0b: ("s_setkill", "Set the wave kill bit"),
     0x0c: ("s_waitcnt", "Wait for memory operations"),
+    0x0d: ("s_sethalt", "Set the wave halt bit"),
+    0x0e: ("s_sleep", "Suspend the wave temporarily"),
+    0x0f: ("s_setprio", "Set wave priority"),
+    0x10: ("s_sendmsg", "Send a message"),
+    0x11: ("s_sendmsghalt", "Send a message and halt the wave"),
+    0x12: ("s_trap", "Raise a trap"),
+    0x13: ("s_icache_inv", "Invalidate the instruction cache"),
+    0x14: ("s_incperflevel", "Increment the selected performance counter"),
+    0x15: ("s_decperflevel", "Decrement the selected performance counter"),
+    0x16: ("s_ttracedata", "Emit thread trace data"),
+    0x1b: ("s_endpgm_saved", "Terminate the wave and signal that its context was saved"),
+    0x1e: ("s_endpgm_ordered_ps_done", "Terminate an ordered pixel shader wave"),
     0x1f: ("s_code_end", "Code end marker"),
     0x20: ("s_inst_prefetch", "Instruction cache prefetch"),
     0x21: ("s_clause", "Begin hard clause"),
+    0x22: ("s_wait_idle", "Wait for outstanding operations to finish"),
+    0x23: ("s_waitcnt_depctr", "Wait for dependency counters"),
+    0x24: ("s_round_mode", "Set floating-point rounding mode"),
+    0x25: ("s_denorm_mode", "Set floating-point denormal mode"),
+    0x28: ("s_ttracedata_imm", "Emit immediate thread trace data"),
 }
 
 SOP1_OPS = {
@@ -250,11 +269,21 @@ SOPK_OPS = {
     0x03: ("s_cmpk_eq_i32", "Scalar compare equal immediate"),
     0x04: ("s_cmpk_lg_i32", "Scalar compare not-equal immediate"),
     0x05: ("s_cmpk_gt_i32", "Scalar compare greater immediate"),
+    0x06: ("s_cmpk_ge_i32", "Scalar signed compare greater-or-equal immediate"),
+    0x07: ("s_cmpk_lt_i32", "Scalar signed compare less immediate"),
+    0x08: ("s_cmpk_le_i32", "Scalar signed compare less-or-equal immediate"),
+    0x09: ("s_cmpk_eq_u32", "Scalar unsigned compare equal immediate"),
+    0x0a: ("s_cmpk_lg_u32", "Scalar unsigned compare not-equal immediate"),
+    0x0b: ("s_cmpk_gt_u32", "Scalar unsigned compare greater immediate"),
+    0x0c: ("s_cmpk_ge_u32", "Scalar unsigned compare greater-or-equal immediate"),
+    0x0d: ("s_cmpk_lt_u32", "Scalar unsigned compare less immediate"),
+    0x0e: ("s_cmpk_le_u32", "Scalar unsigned compare less-or-equal immediate"),
     0x0f: ("s_addk_i32", "Scalar add immediate"),
     0x10: ("s_mulk_i32", "Scalar multiply immediate"),
     0x12: ("s_getreg_b32", "Read a hardware register field into an SGPR"),
     0x13: ("s_setreg_b32", "Write a hardware register field from an SGPR"),
     0x15: ("s_setreg_imm32_b32", "Write a hardware register field from a 32-bit literal"),
+    0x16: ("s_call_b64", "Call a PC-relative target and save the return address"),
     0x17: ("s_waitcnt_vscnt", "Wait for vector store counter"),
     0x18: ("s_waitcnt_vmcnt", "Wait for vector memory counter"),
     0x19: ("s_waitcnt_expcnt", "Wait for export counter"),
@@ -1691,10 +1720,16 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_info = SOPP_OPS.get(op, (f"s_sopp_{op:02x}", "Unknown SOPP"))
         op_name, comment = op_info
 
-        if op_name in {"s_endpgm", "s_code_end"}:
+        if op_name in {
+            "s_endpgm", "s_code_end", "s_wakeup", "s_icache_inv", "s_ttracedata",
+            "s_endpgm_saved", "s_endpgm_ordered_ps_done", "s_wait_idle",
+        }:
             asm = op_name
-        elif op_name == "s_nop":
-            asm = f"s_nop {simm}"
+        elif op_name in {
+            "s_nop", "s_setkill", "s_sethalt", "s_sleep", "s_setprio", "s_trap",
+            "s_incperflevel", "s_decperflevel", "s_denorm_mode",
+        }:
+            asm = f"{op_name} {simm}"
         elif op_name == "s_waitcnt":
             # GFX10 split: vmcnt is simm16[3:0] plus [15:14], expcnt [6:4], lgkmcnt [13:8].
             # Like LLVM, omit counters at their "no wait" maximum unless all three are.
@@ -1788,6 +1823,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if op_name == "s_version":
             # No destination operand; the SDST field is not printed.
             return (4, op_name, f"{op_name} 0x{simm:x}", comment)
+        if op_name == "s_call_b64":
+            return (4, op_name, f"{op_name} {decode_s_reg64(sdst)}, {simm}", comment)
         asm = f"{op_name} {decode_s_reg(sdst)}, 0x{simm:x}"
         return (4, op_name, asm, comment)
 
