@@ -481,6 +481,20 @@ target_include_directories(startup_placement_publish_check PRIVATE src)
 add_test(NAME startup_placement_publish COMMAND startup_placement_publish_check)
 add_test(NAME startup_placement_publish_shrink_control COMMAND startup_placement_publish_check --mutate shrink)
 set_tests_properties(startup_placement_publish_shrink_control PROPERTIES WILL_FAIL TRUE)
+# Device slot 133 proves that the allocation is committed from its base to the end of the buffer with
+# one region-information call when the whole private allocation is committed, else with a walk that
+# stops at the end of the buffer; every alias or refusal must equal the full walk's on the same memory,
+# including a decommitted page before the buffer and a block replaced at the same base, and a large
+# touched block must need no VirtualQuery (src/startup_stubs/placed_buffer_range.h). The mutated runs
+# are the negative controls.
+add_executable(startup_placed_buffer_range_check tests/startup_placed_buffer_range_check.cpp)
+target_compile_features(startup_placed_buffer_range_check PRIVATE cxx_std_17)
+target_include_directories(startup_placed_buffer_range_check PRIVATE src)
+add_test(NAME startup_placed_buffer_range COMMAND startup_placed_buffer_range_check)
+add_test(NAME startup_placed_buffer_range_region_only_control COMMAND startup_placed_buffer_range_check --mutate region-only)
+add_test(NAME startup_placed_buffer_range_walk_only_control COMMAND startup_placed_buffer_range_check --mutate walk-only)
+set_tests_properties(startup_placed_buffer_range_region_only_control startup_placed_buffer_range_walk_only_control
+    PROPERTIES WILL_FAIL TRUE SKIP_RETURN_CODE 77)
 add_executable(startup_storage_file_range tests/startup_storage_file_range.cpp)
 target_compile_features(startup_storage_file_range PRIVATE cxx_std_17)
 target_include_directories(startup_storage_file_range PRIVATE src)
@@ -929,11 +943,22 @@ foreach(adapter IN ITEMS warp hardware)
 endforeach()
 target_compile_features(offscreen_check PRIVATE cxx_std_17)
 # Link the production placement index into this fixture without adding a DLL export.
-target_sources(offscreen_check PRIVATE src/startup_stubs/d3d12_xs_device.cpp)
 set_property(SOURCE src/startup_stubs/d3d12_xs_device.cpp APPEND PROPERTY COMPILE_OPTIONS /bigobj)
+set(OFFSCREEN_AGILITY_620_DIR "" CACHE PATH "Agility SDK 1.620.2 x64 DLL directory for debug validation")
+# offscreen_check and cpu_placed_dxr_provider compile this file with the same flags (default CRT, the
+# desktop SDK headers), so they link one object set instead of compiling the 3,400-line file twice.
+# With OFFSCREEN_AGILITY_620_DIR the fixture compiles against the Agility headers instead: it keeps its
+# own copy below and the provider keeps its own. d3d12_xs_shim uses the static CRT and is not shared.
+if(NOT OFFSCREEN_AGILITY_620_DIR)
+    add_library(d3d12_xs_device_obj OBJECT src/startup_stubs/d3d12_xs_device.cpp)
+    target_include_directories(d3d12_xs_device_obj PRIVATE src)
+    target_compile_features(d3d12_xs_device_obj PRIVATE cxx_std_17)
+    target_sources(offscreen_check PRIVATE $<TARGET_OBJECTS:d3d12_xs_device_obj>)
+else()
+    target_sources(offscreen_check PRIVATE src/startup_stubs/d3d12_xs_device.cpp)
+endif()
 target_link_libraries(offscreen_check PRIVATE d3d12 dxgi dxguid d3dcompiler user32 gdi32)
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-set(OFFSCREEN_AGILITY_620_DIR "" CACHE PATH "Agility SDK 1.620.2 x64 DLL directory for debug validation")
 if(OFFSCREEN_AGILITY_620_DIR)
     if(EXISTS "${OFFSCREEN_AGILITY_620_DIR}/sdk.nupkg")
         set(agility_headers "${CMAKE_CURRENT_BINARY_DIR}/agility-headers")
@@ -2014,6 +2039,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     # lowering of the same selections.
     add_test(NAME startup_gfx2hlsl_sdwa COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_check.py")
+    # The binary32 class comparison (#1795).
+    add_test(NAME startup_gfx2hlsl_cmp_class COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_cmp_class_check.py")
+    # op_sel on a translated float operation is refused, not dropped (#1735).
+    add_test(NAME startup_gfx2hlsl_opsel COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_opsel_check.py")
     # The 64-bit vector shifts (#1815).
     add_test(NAME startup_gfx2hlsl_b64_shift COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_b64_shift_check.py")
@@ -2021,7 +2052,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_sdwa_cvt COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_cvt_check.py")
     # VOPC SDWA compares (#1906): every integer compare, select and sext() evaluated against an integer
-    # reference; float compares with whole-dword selects; refusals. The draws are registered below.
+    # reference; floating-point SDWA forms and unsupported modifiers are refused. The draws are registered below.
     add_test(NAME startup_gfx2hlsl_vopc_sdwa COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_vopc_sdwa_check.py")
     # A negated source on the vector select flips that source's sign bit (#1709).
@@ -2033,6 +2064,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # A typed buffer load of BUF_FMT_16_16_16_16_FLOAT reads four halves from one 8-byte element (#1695).
     add_test(NAME startup_gfx2hlsl_tbuffer_16f COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_tbuffer_16f_check.py")
+    # 32-bit scalar complement logic: s_nand_b32, s_nor_b32 and s_xnor_b32 against an integer reference (#1919).
+    add_test(NAME startup_gfx2hlsl_sop2_complement COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sop2_complement_check.py")
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
     # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
     find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")
@@ -5560,8 +5594,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         DEPENDS cpu_shim_startup tests/cpu/translate_shim_startup.py tools/cpu_switch_aot.py
             tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
     add_library(cpu_placed_dxr_provider SHARED tests/cpu/placed_dxr_provider.cpp tests/dxr_check.cpp
-        tests/desktop_gpu.cpp src/era_title_va.cpp src/startup_stubs/d3d12_xs_device.cpp
+        tests/desktop_gpu.cpp src/era_title_va.cpp
         "${ray_header}" "${ray_pipeline_header}" "${candidates_header}" "${candidates_pipeline_header}")
+    if(TARGET d3d12_xs_device_obj)
+        target_sources(cpu_placed_dxr_provider PRIVATE $<TARGET_OBJECTS:d3d12_xs_device_obj>)
+    else()
+        target_sources(cpu_placed_dxr_provider PRIVATE src/startup_stubs/d3d12_xs_device.cpp)
+    endif()
     target_include_directories(cpu_placed_dxr_provider PRIVATE tests src "${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(cpu_placed_dxr_provider PRIVATE d3d12 dxgi dxguid d3dcompiler user32 gdi32)
     target_compile_features(cpu_placed_dxr_provider PRIVATE cxx_std_17)
@@ -6898,6 +6937,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_comparisons_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_comparisons_${adapter}.txt")
+        add_test(NAME pixel_aot_sdwa_cmp_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-sdwa-cmp "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_sdwa_cmp_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_sdwa_cmp_${adapter}.txt")
         add_test(NAME pixel_aot_get_lod_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_get_lod_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -7302,8 +7346,26 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(pe_run_package_trap_missing PROPERTIES TIMEOUT 60)
     add_test(NAME bink_heap_aot_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bink_heap_aot_check.py")
+    # Documented in the AGENTS platform-independent list but never registered here, so ctest did
+    # not run them locally while the CI Python job did.
+    add_test(NAME bidi_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/bidi_controls_check.py")
+    add_test(NAME compat_report COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/compat_report_check.py")
+    add_test(NAME form_coverage COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/form_coverage_check.py")
+    add_test(NAME gpu_report_format COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/gpu_report_format_check.py")
+    add_test(NAME hardware_reports COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/hardware_reports_check.py")
+    add_test(NAME shader_corpus_report COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/shader_corpus_report_check.py")
+    add_test(NAME xgameruntime_table COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xgameruntime_table_check.py")
     add_test(NAME ffx_create_context_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/ffx_create_context_check.py")
+    add_test(NAME ffx_device_init_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/ffx_device_init_check.py")
 else()
     message(WARNING
         "Python-driven tests, including the CPU fixtures, are disabled because "

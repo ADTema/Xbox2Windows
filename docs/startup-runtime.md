@@ -1363,6 +1363,41 @@ is not affected: section-backed pages already took the committed, not-aliased pa
   (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
   sections, and single-page views.
 
+## Placed buffer allocation walk (device slot 133)
+
+Slot 133 aliases a buffer only when every byte from the base of the allocation holding the address
+to the end of the buffer is committed in that allocation, and the memory is private. It used to
+measure the whole committed run from the base with one `VirtualQuery` per region and compare the
+buffer with that length. `VirtualQuery` scans page-table entries from the queried address to the end
+of the run of identical attributes, so on a large private region with touched pages each call costs
+milliseconds (about 5 ms per GiB with one touched page per 64 KiB, measured on Windows 10 19045).
+
+`src/startup_stubs/placed_buffer_range.h` first asks `QueryVirtualMemoryInformation`
+(`MemoryRegionInfo`, Windows 10 1607 and later, resolved at run time) for the allocation's base, size
+and committed bytes, which come from the allocation's bookkeeping without that scan. When the
+allocation is private and its committed bytes equal its size, every page is committed, so the full
+walk's run is the whole allocation and the decision follows from base and size. Otherwise (a partly
+committed or mapped allocation, a free address, the call missing) it walks the regions from the base
+and stops at the end of the buffer, because regions after it cannot change the answer. The alias or
+refusal is the same as before; nothing is remembered between placements, so a page decommitted,
+released or replaced directly through the Windows API is seen by the next placement. The alignment,
+memory-type and state rules are unchanged. The five-second `x2w-d3d12 views noted` line in
+`stderr.txt` reports `placed buffers <n> (region-information proofs <n>, region queries <n>)`.
+
+- `ctest --preset release --no-tests=error -R '^startup_placed_buffer_range$' -V` compares every
+  decision with the full walk on the same memory: 256 buffers spread over a 64 MiB private block
+  whose alternating 64 KiB pages have different protections (it prints the region queries per
+  placement of both walks); a middle page decommitted under a buffer, before a buffer and five pages
+  before a buffer, then committed again; a block released and replaced by a 1 MiB block at the same
+  base; a mapped view; a reservation committed in two steps; and a placeholder piece replaced by
+  committed private memory. Each case places a buffer before changing the memory, so state kept
+  between placements would show up as a mismatch. A 512 MiB committed block with one touched page per
+  64 KiB must be proven without any `VirtualQuery` call; the check prints the time per placement of
+  the full walk, the bounded walk and the proof. `_region_only_control` trusts the allocation size
+  without the committed-bytes check and must fail only in the partly committed cases;
+  `_walk_only_control` never uses the region information and must fail only that call count. A
+  refused allocation or mapping is a capability skip (77) in the controls.
+
 ## Buffer memory SRVs (device slot 70)
 
 Device slot 70 (`src/startup_stubs/d3d12_memory_srv.inl`, validation in
