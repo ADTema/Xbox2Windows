@@ -5737,6 +5737,16 @@ control mismatching. The D3D12 debug layer was unavailable.
 [Leonida RDNA2 measurements](https://github.com/ItsNotRexed/Leonida/pull/1685) ·
 [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
+**Negated sources on the vector select.** A VOP3 `v_cndmask_b32` can carry the `-` source modifier,
+which in an integer instruction is that source's sign bit flipped. The select handler passed the printed
+operand to the uint helper, so `v_cndmask_b32_e64 v31, v30, -v30` was refused - 2 of the 29 refused
+shaders in the first main-game loading-screen cache (#870, issue #1709). The select now reads both sources
+through a helper that flips the sign bit for a `-` operand and emits the same text as before when there is
+none. Plain negative constants retain the existing bit pattern. NEG on inline or literal constants is
+refused from the encoded source fields, because plain inline -1 and inline 1 with NEG both disassemble
+as `-1`. Another integer instruction carrying the same register modifier still refuses it. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cndmask_neg$' -V`.
+
 **Output modifiers on float-result conversions.** The float-result conversions (`v_cvt_f32_i32`,
 `v_cvt_f32_u32`, `v_cvt_f32_ubyte0..3`, `v_cvt_f32_f16`) sat in the uint-result table, whose dispatch
 refused every modifier, so `v_cvt_f32_i32_e64 v1, v1 mul:2` did not translate - 5 of the 29 refused
