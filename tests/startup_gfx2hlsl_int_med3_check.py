@@ -78,6 +78,11 @@ def main():
                 ordered = sorted((a, b, c), key=signed if is_signed else None)
                 assert result == ordered[rank], (asm, (a, b, c), result, ordered[rank])
 
+    # Inline-constant and literal sources go through the shared u() path as 32-bit words.
+    lines = translate('v_med3_i32 v1, v2, -1, 0x80000000')
+    expected = ('v1 = uint(max(min(int(v2), int(0xffffffffu)), min(max(int(v2), int(0xffffffffu)), '
+                'int(0x80000000u))));')
+    assert lines == [expected], lines
     refused('v_med3_i32_e64 v1, v2, v3, v4 clamp', "v_med3_i32 with ['clamp']")
     refused('v_med3_i32_e64 v1, -v2, v3, v4', "operand '-v2'")
     entries = {op: gfx2hlsl.VEC_U.pop(op) for op in OPS}
