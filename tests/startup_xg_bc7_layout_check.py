@@ -65,6 +65,11 @@ def check_copy(computer, copy, width, height, tiled, linear):
         expect(f"{label} {case} HRESULT", result & 0xFFFFFFFF, 0x80070057)
         expect_bytes(f"{label} {case} preserves destination", target.raw, GUARD + expected + GUARD)
 
+    # A source that cannot be read is refused before the copy instead of faulting inside it.
+    result = copy(computer, dest, 0, 0, ctypes.cast(1, PTR), row_pitch, slice_pitch)
+    expect(f"{label} unreadable source HRESULT", result & 0xFFFFFFFF, 0x80004005)
+    expect_bytes(f"{label} unreadable source preserves destination", target.raw, GUARD + expected + GUARD)
+
     os.environ["X2W_D3D12_RENDER"] = "1"
     try:
         result = copy(computer, dest, 0, 0, source, row_pitch, slice_pitch)
