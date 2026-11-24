@@ -85,11 +85,11 @@ int main()
            "res{unreadable} view{unreadable} dest=0x0 dest_in_view_heap=0 address=0x0 address_readable=0");
 
     // A small buffer is cut, never overrun, and stays terminated.
-    char small[40];
-    std::memset(small, 'x', sizeof(small));
-    x2w_startup::report_refused_memory_srv(small, sizeof(small), "unsupported memory SRV arguments", "null_address", &bc7,
+    char tiny_buf[40];
+    std::memset(tiny_buf, 'x', sizeof(tiny_buf));
+    x2w_startup::report_refused_memory_srv(tiny_buf, sizeof(tiny_buf), "unsupported memory SRV arguments", "null_address", &bc7,
                                            &array, 0, false, 0x1000, true);
-    if (std::memchr(small, 0, sizeof(small)) == nullptr) {
+    if (std::memchr(tiny_buf, 0, sizeof(tiny_buf)) == nullptr) {
         ++failures;
         std::printf("FAIL truncated line is not terminated\n");
     }
