@@ -451,9 +451,10 @@ ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?
 | Variable | Effect |
 |---|---|
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
+| `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
-| `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` |
+| `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards the [single-record indirect compute dispatch](experiments.md#gpu-written-indirect-dispatch-arguments) for a desktop compute pipeline and a tracked placed buffer |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` and no manifest; `X2W_FXC=` (empty) skips compilation and publishes the manifest alone. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
@@ -462,7 +463,7 @@ ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
-| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
+| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
@@ -560,6 +561,13 @@ These are measured on one executable; treat them as hypotheses for others.
   resources (for example the video frame planes) at the same offset in the second. On the console
   the second is a GPU view of the first. Mapping each page's section into both views makes those
   resources readable; without it, a YUV video shows a solid green screen (all-zero planes).
+- **DirectStorage status arrays (#1843).** A new status array's slots are complete with `S_OK`, so
+  `IsComplete` is true and `GetHResult` is `S_OK` for a slot nothing has been enqueued into.
+  `EnqueueStatus` makes its slot pending (`E_PENDING`) until the entries before it have run, and leaves
+  the other slots as they are. This follows Microsoft's Win32 implementation of the API in
+  Xbox-GDK-Samples (MIT), `SimpleDirectStorageCombo/DirectStorageWin32/DirectStorageWin32WrapperStatusArray.cpp`.
+  The `startup_stubs` check covers a fresh array, a slot held pending behind a fence signal while the
+  others stay complete, and that slot's completion.
 - **DirectStorage ordering.** Requests must run after `Submit`, in order with status and fence
   entries. Titles fill destination page-array entries after `EnqueueRequest`, and also replace
   entries filled earlier, so the whole page array is read again when the request runs. The
@@ -627,6 +635,10 @@ These are measured on one executable; treat them as hypotheses for others.
   draw of a 4x4 texture of two slices with three mips whose cells all differ, with mutants that exchange
   slice and mip, ignore the mip, or shift it by one. The draw was written without a Windows run. Cube maps
   are still refused for `image_load_mip`.
+- **Packed 2D load coordinates.** Plain 2D `image_load` with `a16` reads unsigned x and y from the low and
+  high halves of one VGPR and reads mip zero. The packed form requires one address VGPR without an
+  NSA extension. Plain loads refuse an empty `dmask`, `r128`, `lwe`, `d16`, `tfe` and reserved bits.
+  The source-built startup mip-load check covers this translation on Linux.
 - **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
   `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
   the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`
@@ -699,6 +711,24 @@ These are measured on one executable; treat them as hypotheses for others.
   expects every failure under one cause and must fail. The counts cover the run as a whole; they do
   not say which failure came first or what the title expects for a refused request.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_failure_counts' -V`.
+- **DirectStorage page-request ends (#1198).** After the failure causes, the heartbeat prints
+  `x2w-dstorage heartbeat <n> s: page requests by end against the first 64 KiB page` with
+  `inside-completed`, `inside-failed`, `at-page-end-completed`, `at-page-end-failed`,
+  `past-completed` and `past-failed`. It covers requests with a page destination (option bit 21)
+  and classifies each by `page_offset + destination_size`, formed in 64 bits so it cannot wrap:
+  below 0x10000 is inside the first page, 0x10000 is at its end, above is past it. A destination
+  size of 0 ends at its offset, so inside. A request is counted once, when it runs: completed when
+  it is written, failed under the same rule that sets `failed=` on the totals line, including a page
+  array unreadable at run and an entry that threw. An `empty` request (source size 0) is neither, and
+  an entry that never started is not counted. Outcomes, statuses and the per-request text are
+  unchanged. The `startup_storage_page_end_counts` fixture compiles the stand-in into itself, loads
+  the xmem shim for page writes, submits page requests of every end that complete and that fail at
+  each failure site, plus an `empty` and two linear-destination requests, and checks each count, that
+  the page counts match the totals less the linear requests, the logged outcome of every failure, the
+  heartbeat line text and edge ends where a 32-bit sum would wrap. Its `one_bucket_control` expects
+  every page request at the page end and must fail. The counts describe a run's request shapes; they
+  do not say why a request of one shape fails or what the title expects for it.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_page_end_counts' -V`.
 - **DirectStorage allocation failure (#1199, item 3).** A queue worker runs each entry inside
   a handler that turns any exception, including `std::bad_alloc` from a buffer sized by a request
   field, into a failed request: the next status entry reports `E_FAIL`, the destination is
@@ -997,7 +1027,8 @@ elapsed time. A physical-page section exists from a page's first use (a mapping 
 write) until its grant is released; `xmem.dll` publishes that count through the experimental
 `x2w_xmem_page_stats` export. The heartbeat also prints while the request counters are unchanged
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed
-by a line of failed requests by cause (see DirectStorage failure causes under Findings).
+by a line of failed requests by cause and a line of page-destination requests by end (see
+DirectStorage failure causes and DirectStorage page-request ends under Findings).
 
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi
@@ -1116,10 +1147,11 @@ is not affected: section-backed pages already took the committed, not-aliased pa
   the same pages with writes seen both ways; an unmap refused at each of three steps
   (`X2W_XMEM_TEST_FAULT`); and a reader on a page while its neighbour is unmapped and mapped
   again. Two cases must end in an access violation, the reader without the handler
-  (`X2W_XMEM_NO_FAULT_RETRY=1`) and a read of a forgotten page; each runs in a child process
+  (`X2W_XMEM_NO_FAULT_RETRY=1`, with `X2W_XMEM_TEST_HOLD_WINDOW` holding the unmap until the
+  reader has read the unmapped page) and a read of a forgotten page; each runs in a child process
   whose exit code the parent checks. Those controls and `X2W_XMEM_TEST_FAULT` exist only in a
   second build of the shim (`xmem_shim_test_controls`, `X2W_XMEM_TEST_CONTROLS`); the check shows
-  that the deployed `xmem.dll` ignores both switches. Four more children cover the lifetime on
+  that the deployed `xmem.dll` ignores these switches. Four more children cover the lifetime on
   the deployed shim: without the opt-in, pages mapped with a view each and the shim unloading
   after that mapping, twice; with it, an unused shim unloads, a used one stays loaded through `FreeLibrary` with an
   unrelated handled access violation still delivered and the handler still working; `FreeLibrary`
