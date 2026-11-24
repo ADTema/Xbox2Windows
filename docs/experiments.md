@@ -53,6 +53,16 @@ dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 
 Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
+**Optional compiler cache:** set `X2W_USE_SCCACHE=1` before `.\tools\dev.ps1` to cache compiles with [sccache](https://github.com/mozilla/sccache). When `sccache` is on `PATH`, the script fills `$X2wSccacheCmakeArgs` with four definitions: the C and C++ compiler launchers, `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded` (so `/Zi` PDB files do not block the cache) and `CMAKE_POLICY_DEFAULT_CMP0141=NEW` (CMake ignores the format variable otherwise). Pass them when configuring. If `sccache` is missing the script warns and sets the variable to two empty definitions, `-DCMAKE_C_COMPILER_LAUNCHER=` and `-DCMAKE_CXX_COMPILER_LAUNCHER=`, so that a build directory configured earlier with `sccache` stops calling it (`-D` updates cache entries but never deletes them). Without `X2W_USE_SCCACHE=1` the variable is removed and the script and the `cmake` commands are exactly as before; a launcher left in the cache by an earlier opt-in run is not touched, so reset the cache entries by hand or opt in once without `sccache` to clear them.
+
+```powershell
+$env:X2W_USE_SCCACHE = '1'
+.\tools\dev.ps1
+cmake --preset dev @X2wSccacheCmakeArgs
+```
+
+A maintainer outside this project measured one compile at 3.51 s without the cache and 0.29 s with a warm cache (Windows Server 2025, MSVC 14.44, sccache 0.20.0). This project has not repeated that measurement. `python -B tests/dev_ps1_sccache_check.py` checks the arguments with `pwsh`; it does not run MSVC.
+
 [`pe_run_package.py`](../tools/pe_run_package.py) starts a source-built x64 EXE with acyclic bundled DLL dependencies. Pass the path to `pe_map.dll`, a package directory and an EXE path relative to that directory. Use `--system kernel32.dll` or `--shim DLL PATH` for explicit external providers. `--preflight-only` resolves those external exports without mapping any guest image. In execution mode the runner attaches DLLs in dependency order, starts the EXE, and releases the images in reverse. The EXE is started as the main image with `pe_map_run_main` (see [Main-image TLS slot 0](#main-image-tls-slot-0)), and its host `CreateThread` imports (`kernel32.dll`, `kernelbase.dll` or an `api-ms-win-core-processthreads-*` contract) are bound to `pe_map_main_create_thread` on a default host route. An explicit `--shim` keeps its original export. `cpu_package_main_image` runs the `/GA` slot-0 EXE through the runner and requires the Windows launch's guest log and exit code. With the former `pe_map_run` start every slot-0 check failed, and without the `CreateThread` binding both workers' checks failed. A returning fixture must join any workers before it returns. The runner rejects cycles and self imports. It now resolves bundled ordinal imports,
 including ordinal-only (`NONAME`) DLL exports and forwarder chains ending in an
 ordinal, using `pe_map_export_ordinal` on the mapped provider. `cpu_native_startup` checks the same two-DLL fixture under this runner and the Windows loader.
@@ -2808,16 +2818,19 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hard
 
 The `gfx1030` compute store profile lowers one typed MIMG form:
 `image_load vD, v[x:y], s[A:A+7] dmask:0x1|0x3|0x7|0xf
-dim:SQ_RSRC_IMG_2D`, with the `unorm` flag optional. The lowering is one
+dim:SQ_RSRC_IMG_2D`, with the `unorm` flag optional, and its packed-address
+`a16` spelling `image_load vD, vP, s[A:A+7] ... unorm a16`. The lowering is one
 `Texture2D<uint4>.Load(int3(x, y, 0))` from `t0`; the DMASK-selected leading
 components are written to consecutive destination VGPRs in ascending channel
 order and stored to the output UAV. The accepted form requires a `gfx1030`
-target, `dim:SQ_RSRC_IMG_2D`, two consecutive known address VGPRs (x then y),
-and a contiguous DMASK. `a16`, `d16`, `tfe`, `glc`, `slc`, `dlc`, `r128` and
-the NSA address spelling are refused. The eight descriptor words must come
-from one tracked `s_load_dwordx8` at `--image-descriptor`, its scalar load
-must complete before the image load, and the loaded registers may only be
-read after `s_waitcnt vmcnt(0)`.
+target, `dim:SQ_RSRC_IMG_2D`, known address values and a contiguous DMASK.
+Without `a16` the address is two consecutive VGPRs (x then y); with `a16` it
+is one VGPR holding x in bits [15:0] and y in bits [31:16]. `d16`, `tfe`,
+`glc`, `slc`, `dlc`, `r128` and the NSA address spelling are refused, as is
+the `a16` flag on a two-register address or the packed spelling without it.
+The eight descriptor words must come from one tracked `s_load_dwordx8` at
+`--image-descriptor`, its scalar load must complete before the image load,
+and the loaded registers may only be read after `s_waitcnt vmcnt(0)`.
 
 The 8-dword image resource descriptor (T#) is runtime data. The caller
 guarantees through `--image-format R32G32B32A32_UINT` that its 9-bit GFX10
@@ -2834,15 +2847,18 @@ that behavior is not measured here.
 The source-built wave32 fixture uses an 8x8 thread group and a 32x8
 `R32G32B32A32_UINT` source texture whose words are carried in the case file.
 Dispatches of four, two, one and one groups exercise `dmask:0x1`, `0x3`,
-`0x7` and `0xf` and fill the 320-word output UAV. The independent CPU
-reference recomputes every written word and expects the sentinel in the
-untouched words. A single flipped written word (`word=0`) and a single
-flipped untouched word (`word=300`) must both be reported. Two mutated
-translations must each differ at a named word: reordering the emitted
-components fails at word 0, and swapping the two address registers fails at
-word 4. The LLVM 15 binary check assembles and decodes each DMASK form and
-lowers the decoded program through the CLI. These are desktop DXIL
-executions, not native runs of the assembled gfx1030 program.
+`0x7` and `0xf` and fill the 320-word output UAV, once with the two-dword
+address and once with the packed `a16` address; the packed address is built
+from `tid.y * 0x10000 + tid.x`. The independent CPU reference recomputes every
+written word and expects the sentinel in the untouched words. A single flipped
+written word (`word=0`) and a single flipped untouched word (`word=300`) must
+both be reported. Each mutated translation must differ at a named word:
+reordering the emitted components fails at word 0, swapping the two address
+registers fails at word 4, and reading the whole packed address as the y
+coordinate fails at word 4. The LLVM 15 binary check assembles and decodes
+every DMASK form in both address families and lowers the decoded program
+through the CLI. These are desktop DXIL executions, not native runs of the
+assembled gfx1030 program.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
@@ -8255,3 +8271,18 @@ checked against LLVM 19.1.7 only, and that check skips itself when the LLVM in u
 Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
 measurement on hardware or in a Windows run backs the descriptions. `v_interp_p1_f32_e64` and `v_interp_p2_f32_e64`
 (0x200 and 0x201 on gfx1013) are not decoded by this change.
+
+## Startup translator: explicit-LOD image sampling
+
+`tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
+
+## Desktop audio render sink
+
+`startup_audio_output` drives a small WASAPI shared-mode render sink ([`audio_sink.h`](../src/startup_stubs/audio_sink.h)) with generated PCM blocks. It is the first slice of [issue #1145](https://github.com/R0Y00/Xbox2Windows/issues/1145). The sink takes `submit(format, frames, bytes)`, converts the block to the endpoint mix format (32-bit float or 16-bit PCM only) and records the first accepted block, the submitted format, per-block frame counts and peaks, consumed frames (submitted minus `GetCurrentPadding`), the `IAudioClock` position, the drained interval and the recovery. The fixture runs three cases in one process: no submission; eight 40 ms blocks with distinct amplitudes, one of them intentionally silent; and a producer that withholds the next block until the queue is empty, then resumes.
+
+```powershell
+cmake --build --preset release --target startup_audio_output
+ctest --preset release --no-tests=error -R '^startup_audio_output$' -V
+```
+
+Exit code 77 is a capability skip (no render endpoint, an endpoint that does not initialise, or an unsupported mix format); it is not a pass. A failed padding query during a case fails the run. The glitch count is reported as "not available" because the render API exposes no discontinuity flag, and it is kept apart from the drained interval and the recovery. Not covered: capture-path verification of the tone, any layout of the console audio command queue (`xapu.cpp` is not decoded), and sample-rate conversion. The result of a run on a machine with an endpoint (adapter, Windows build, commit, per-case counters) is not recorded here yet.
