@@ -61,7 +61,7 @@ Limits:
 - Quantization. The stand-in keeps 8 bits a channel where the packed formats keep 5, 4 or 1.
   Rendered values are not rounded to the packed precision, so a read of the target can differ
   from the console's in the low bits: a channel cleared to 0.45 reads 115 from the stand-in and
-  119 from B4G4R4A4; one cleared to 0.2 reads 51 and, from B5G5R5A1, 49.
+  119 from B4G4R4A4.
 - CPU-authored texels. Data the executable writes or reads itself in the 16-bit layout (uploads,
   copies to or from buffers, mapped reads) is not converted. Only textures that are rendered to
   and then sampled are covered.

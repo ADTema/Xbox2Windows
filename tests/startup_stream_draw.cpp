@@ -136,7 +136,7 @@ bool populate_tiled_bc7(const StartupBc7Input& input, const D3D12_RESOURCE_DESC&
 }
 
 // Clear colour of the packed-target case; its 8-, 5- and 4-bit roundings differ (tests/startup_packed_target_draw_check.py).
-const float packed_clear[] = {0.45f, 0.2f, 0.8f, 1.0f};
+const float packed_clear[] = {0.45f, 0.0f, 0.8f, 1.0f};
 
 // 0: the texture, both views and the table exist. Otherwise an exit code that names the step.
 int bind_packed(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)

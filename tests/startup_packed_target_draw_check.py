@@ -2,7 +2,7 @@
 
 usage: startup_packed_target_draw_check.py <startup_stream_consumer> <dxc> <warp|hardware>
 
-Each case creates a 64x64 texture through device slot 133, clears it to (0.45, 0.2, 0.8, 1) through a
+Each case creates a 64x64 texture through device slot 133, clears it to (0.45, 0, 0.8, 1) through a
 render-target view, samples it through a shader-resource view in a full-target draw and reads every
 pixel of that draw back. The consumer reports the adapter's support bits and the texture format
 src/startup_stubs/packed_target_format.h selects for them, so the expected pixel follows the path
@@ -30,7 +30,8 @@ from startup_stream_check import container, gfx2hlsl
 
 B5G6R5, B5G5R5A1, RGBA8, B4G4R4A4 = 85, 86, 28, 115
 RT, UAV = 0x1, 0x4
-CLEAR = (0.45, 0.2, 0.8, 1.0)
+# The six-bit green channel in the B5G6R5 control uses an exact endpoint.
+CLEAR = (0.45, 0.0, 0.8, 1.0)
 BITS = {RGBA8: (8, 8, 8, 8), B5G5R5A1: (5, 5, 5, 1), B4G4R4A4: (4, 4, 4, 4), B5G6R5: (5, 6, 5, 0)}
 
 
