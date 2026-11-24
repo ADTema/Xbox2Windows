@@ -40,8 +40,8 @@ except ImportError:
     disasm_rdna2 = None
 
 # Entry bindings passed to pixel_aot.lower() for every record. The scan carries no per-record binding contract,
-# so translator acceptance is measured under these bindings only, and a program that reads another entry register
-# is reported as an unbound operand rather than as an instruction the translator refuses.
+# so translator acceptance is measured under these bindings only. A read of a register lower() holds no value for
+# under these inputs is reported as an unbound operand rather than as an instruction the translator refuses.
 SCAN_BINDINGS = {"texture_sgpr": 20, "interp_sgpr": 24, "sampler": (1, 2, 3, 4), "constant_descriptor": None}
 SCAN_BINDINGS_TEXT = ("texture descriptor table at s20, interpolation base at s24, sampler words 1 2 3 4, "
                       "no constant buffers")
@@ -658,7 +658,7 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str], *,
             lower_error = str(e)
             lower_error_type = type(e).__name__
             if isinstance(e, pixel_aot.UnboundOperand):
-                # A binding the scan does not supply, not an instruction the translator refuses.
+                # A register with no tracked value under the scanned inputs, not an instruction the translator refuses.
                 lower_error_kind = "unbound_operand"
                 lower_unbound = {"bank": e.bank, "register": e.register, "instruction_index": e.index,
                                  "byte_offset": e.offset, "instruction": e.instruction}
@@ -1065,7 +1065,8 @@ def generate_reports(results: list[dict], output_dir: Path):
             "partially_supported": partially_supported,
             "completely_unsupported": unsupported_completely,
             "unique_unsupported_opcodes_count": len(global_unsupported_opcodes),
-            # Every record lower() rejected, by cause; the unbound counts are missing bindings, not instructions.
+            # Every record lower() rejected, by cause; the unbound counts are reads of registers with no tracked value
+            # under the scanned inputs, not instructions the translator refuses.
             "translator_rejections_by_cause": rejection_causes,
             # translator_accepted and the rejection counts hold only under these fixed entry bindings.
             "translator_bindings": dict(SCAN_BINDINGS, sampler=list(SCAN_BINDINGS["sampler"])),
@@ -1089,12 +1090,11 @@ def generate_reports(results: list[dict], output_dir: Path):
         f.write(f"- **Opcodes Recognized by Scanner, but Rejected by Translator:** {opcodes_recognized_only}\n")
         f.write("  *(Valid RDNA 2 opcodes whose program structure, preamble, or bindings differ from `pixel_aot` straight-line single-texture template)*\n")
         f.write("- **Translator Rejections by Cause** (every record `lower()` rejected):\n")
-        f.write(f"  - Unbound scalar operand (entry binding not supplied by the scan): {rejection_causes['unbound_scalar_operand']}\n")
-        f.write(f"  - Unbound vector operand (entry binding not supplied by the scan): {rejection_causes['unbound_vector_operand']}\n")
+        f.write(f"  - Unbound scalar operand under the scanned inputs: {rejection_causes['unbound_scalar_operand']}\n")
+        f.write(f"  - Unbound vector operand under the scanned inputs: {rejection_causes['unbound_vector_operand']}\n")
         f.write(f"  - Other translator rejection: {rejection_causes['translator_rejection']}\n")
         f.write(f"  - Unexpected translator error: {rejection_causes['unexpected_error']}\n")
-        f.write(f"  *(Acceptance and rejection totals are conditional on the fixed entry bindings this scan supplies to every record: {SCAN_BINDINGS_TEXT}. "
-                "A record that reads another entry register needs a binding contract, not a new instruction.)*\n")
+        f.write(f"  *(Acceptance and rejection totals are conditional on the fixed entry bindings this scan supplies to every record: {SCAN_BINDINGS_TEXT}.)*\n")
         f.write(f"- **Contains Unrecognized Opcodes:** {unsupported_opcodes_count}\n")
         f.write(f"- **Unique Missing Opcodes:** {len(global_unsupported_opcodes)}\n\n")
 

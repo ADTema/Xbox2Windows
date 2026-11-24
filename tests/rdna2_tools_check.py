@@ -4939,8 +4939,8 @@ class TestRdna2Scanner(unittest.TestCase):
                              {"texture_sgpr": 20, "interp_sgpr": 24, "sampler": [1, 2, 3, 4],
                               "constant_descriptor": None})
             report = md_file.read_text(encoding="utf-8")
-            self.assertIn("  - Unbound scalar operand (entry binding not supplied by the scan): 1\n", report)
-            self.assertIn("  - Unbound vector operand (entry binding not supplied by the scan): 1\n", report)
+            self.assertIn("  - Unbound scalar operand under the scanned inputs: 1\n", report)
+            self.assertIn("  - Unbound vector operand under the scanned inputs: 1\n", report)
             self.assertIn("  - Other translator rejection: 1\n", report)
             self.assertIn("  - Unexpected translator error: 1\n", report)
             self.assertIn("Acceptance and rejection totals are conditional on the fixed entry bindings", report)
