@@ -306,14 +306,8 @@ int main(int argc, char** argv)
     if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &dsv_tex_desc,
             D3D12_RESOURCE_STATE_COMMON, &dsv_clear, IID_PPV_ARGS(&depth_tex)))) return 21;
 
-    ComPtr<ID3D12Resource> stencil_tex;
     const D3D12_RESOURCE_DESC stencil_tex_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
         DXGI_FORMAT_D24_UNORM_S8_UINT, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
-    D3D12_CLEAR_VALUE stencil_clear{};
-    stencil_clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    stencil_clear.DepthStencil = {1.0f, 0};
-    if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &stencil_tex_desc,
-            D3D12_RESOURCE_STATE_COMMON, &stencil_clear, IID_PPV_ARGS(&stencil_tex)))) return 21;
 
     const struct { D3D12_DESCRIPTOR_HEAP_DESC desc; Word backing, bytes; }
         rtv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0},
@@ -336,7 +330,6 @@ int main(int argc, char** argv)
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv_stencil{dsv_read_only.ptr + desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV)};
     const D3D12_DEPTH_STENCIL_VIEW_DESC dsv_stencil_view{DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_DSV_DIMENSION_TEXTURE2D,
         D3D12_DSV_FLAG_NONE, {}};
-    invoke(guest, 21, ptr_arg(stencil_tex.Get()), ptr_arg(&dsv_stencil_view), dsv_stencil.ptr);
 
     D3D12_COMMAND_QUEUE_DESC qd{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -393,6 +386,14 @@ int main(int argc, char** argv)
     // reference. A pixel is drawn only if the reference reached the desktop list. `closed_call` sets a reference
     // on the list after it was closed, which must be ignored.
     auto run_stencil_case = [&](UINT64 fence_val, const char* out_path, UINT8 stored, UINT reference, bool closed_call) -> int {
+        // Each case clears to its own value without producing a diagnostic about a mismatched optimized clear.
+        ComPtr<ID3D12Resource> stencil_tex;
+        D3D12_CLEAR_VALUE stencil_clear{};
+        stencil_clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        stencil_clear.DepthStencil = {1.0f, stored};
+        if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &stencil_tex_desc,
+                D3D12_RESOURCE_STATE_COMMON, &stencil_clear, IID_PPV_ARGS(&stencil_tex)))) return 21;
+        invoke(guest, 21, ptr_arg(stencil_tex.Get()), ptr_arg(&dsv_stencil_view), dsv_stencil.ptr);
         if (const int rc = clear_stencil_desktop(desktop.Get(), stencil_tex.Get(), stored)) return rc;
         if (FAILED(static_cast<HRESULT>(invoke(state.allocator, 8)))) return 24;
         if (FAILED(static_cast<HRESULT>(invoke(state.list, 139, ptr_arg(state.allocator))))) return 25;
