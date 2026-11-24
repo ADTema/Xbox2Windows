@@ -397,6 +397,9 @@ add_test(NAME startup_gamesave_lock_errors COMMAND startup_gamesave_lock_errors)
 add_executable(startup_gamesave_submit tests/startup_gamesave_submit.cpp)
 target_include_directories(startup_gamesave_submit PRIVATE src)
 target_compile_features(startup_gamesave_submit PRIVATE cxx_std_17)
+add_executable(startup_gamesave_read_async tests/startup_gamesave_read_async.cpp)
+target_include_directories(startup_gamesave_read_async PRIVATE src)
+target_compile_features(startup_gamesave_read_async PRIVATE cxx_std_17)
 
 # Input for the launcher containment check (docs/startup-runtime.md): writes known bytes to both
 # streams and the trap log, reports a known exit code, or holds memory, spawns a child or stays
@@ -1356,6 +1359,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_gamesave_submit_${scheduler} PROPERTIES TIMEOUT 30)
     endforeach()
     set_tests_properties(startup_gamesave_submit_system PROPERTIES SKIP_RETURN_CODE 77)
+    foreach(scheduler IN ITEMS controlled system)
+        add_test(NAME startup_gamesave_read_async_${scheduler} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gamesave_read_async_check.py" "$<TARGET_FILE:startup_gamesave_read_async>" ${scheduler})
+        set_tests_properties(startup_gamesave_read_async_${scheduler} PROPERTIES TIMEOUT 30)
+    endforeach()
+    set_tests_properties(startup_gamesave_read_async_system PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME startup_stubs COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stub_check.py"
         "$<TARGET_FILE:startup_stub_consumer>" "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs"
         "$<TARGET_FILE:startup_stub_acphal>" "$<TARGET_FILE:startup_stub_chad>" "$<TARGET_FILE:startup_stub_xapu>"
