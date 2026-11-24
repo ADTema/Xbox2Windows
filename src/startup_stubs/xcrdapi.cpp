@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <vector>
@@ -60,10 +61,17 @@ struct Object {
 // tokens), a status entry or a fence signal. Entries run in order on the queue's worker after Submit,
 // like DirectStorage; a destination page token that was 0 at enqueue is read again at the entry's turn
 // (titles fill those in after EnqueueRequest).
+//
+// An Entry is default-constructed, moved and move-assigned on the Enqueue/Submit path, where an
+// allocation may fail and nothing may escape. Those operations are implicitly noexcept, so no member
+// may allocate in them: std::vector does in MSVC's debug iterator mode (its default and move
+// constructors allocate a container proxy), and a bad_alloc there is std::terminate. The page tokens
+// are therefore a plain array, allocated once with new (std::nothrow) at EnqueueRequest.
 struct Entry {
     enum Type { request, status_entry, signal } type;
     unsigned char bytes[0x48];
-    std::vector<ULONG_PTR> tokens;
+    std::unique_ptr<ULONG_PTR[]> tokens;
+    std::size_t token_count = 0;
     Object* array;
     unsigned index;
     void* fence;
@@ -569,31 +577,32 @@ void run_entry(Object* self, Entry& entry)
 {
     if (entry.type == Entry::request) {
         const u64 options = *reinterpret_cast<const u64*>(entry.bytes);
-        if ((options & (1ull << 21)) && !entry.tokens.empty()) {
+        if ((options & (1ull << 21)) && entry.token_count) {
             const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(entry.bytes + 0x08);
             // The title's page array is read again in full when the request runs: entries are filled,
             // and also replaced, after enqueue. Writing through a token captured at enqueue put data
             // into a page the title had already reassigned. The caller has to keep the array readable
             // until the request runs; if it is not, the request fails before any page is written, so
             // no token captured at enqueue is ever used.
-            const std::size_t bytes = entry.tokens.size() * sizeof(ULONG_PTR);
+            const std::size_t bytes = entry.token_count * sizeof(ULONG_PTR);
             if (!title || !x2w_local::readable(title, bytes)) {
                 InterlockedIncrement(&requests_failed);
                 if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
                 static LONG unreadable;
                 if (InterlockedIncrement(&unreadable) <= 12)
                     log("x2w-dstorage   options=0x%llx page array %p (%zu entries) unreadable when the request runs -> failed", options,
-                        static_cast<const void*>(title), entry.tokens.size());
+                        static_cast<const void*>(title), entry.token_count);
                 return;
             }
-            std::vector<ULONG_PTR> now(title, title + entry.tokens.size());  // one snapshot of the whole array
-            for (std::size_t i = 0; i < now.size(); ++i) {
-                if (entry.tokens[i] && now[i] != entry.tokens[i]) InterlockedIncrement(&tokens_replaced_after_enqueue);
-                if (!now[i]) InterlockedIncrement(&zero_tokens_at_run);
+            // Overwrite in place: the queue entry is kept free of allocations on this path.
+            for (std::size_t i = 0; i < entry.token_count; ++i) {
+                const ULONG_PTR now = title[i];
+                if (entry.tokens[i] && now != entry.tokens[i]) InterlockedIncrement(&tokens_replaced_after_enqueue);
+                if (!now) InterlockedIncrement(&zero_tokens_at_run);
+                entry.tokens[i] = now;
             }
-            entry.tokens = std::move(now);
         }
-        execute_request(self, entry.bytes, entry.tokens.empty() ? nullptr : entry.tokens.data(), entry.id, entry.submission_id);
+        execute_request(self, entry.bytes, entry.token_count ? entry.tokens.get() : nullptr, entry.id, entry.submission_id);
     } else if (entry.type == Entry::status_entry) {
         const LONG result = InterlockedExchange(&self->pending, S_OK);
         InterlockedExchange(&entry.array->results[entry.index], result);
@@ -865,14 +874,16 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
         const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
         const std::size_t pages = (std::size_t{page_offset} + destination_size + 0xFFFF) / 0x10000;
         if (title && pages && x2w_local::readable(title, pages * sizeof(ULONG_PTR))) {
-            try {
-                entry.tokens.assign(title, title + pages);
-            } catch (const std::bad_alloc&) {
+            entry.tokens.reset(new (std::nothrow) ULONG_PTR[pages]);
+            if (!entry.tokens) {
                 defer_unrecorded(self, entry);  // fails at Submit; nothing leaves Enqueue
                 return;
             }
-            for (ULONG_PTR token : entry.tokens)
-                if (!token) InterlockedIncrement(&zero_tokens_at_enqueue);
+            entry.token_count = pages;
+            for (std::size_t i = 0; i < pages; ++i) {
+                entry.tokens[i] = title[i];
+                if (!title[i]) InterlockedIncrement(&zero_tokens_at_enqueue);
+            }
         }
     }
     push(self, std::move(entry));

@@ -33,13 +33,28 @@
 #include <cstdlib>
 #include <exception>
 #include <new>
+#include <typeinfo>
 #include <vector>
 
 namespace {
 std::atomic<bool> fail_thread_creation{false};
 std::atomic<int> thread_attempts{0};
 thread_local int fail_countdown = 0;  // 0: disarmed; N: the N-th throwing-form allocation throws
+std::atomic<int> global_countdown{0};  // same, counted over every thread of the process
+bool sweep_all_threads = false;        // which of the two countdowns arm() sets
 std::atomic<int> thrown{0};
+DWORD main_thread_id = 0;
+
+void arm(int nth)
+{
+    if (sweep_all_threads) global_countdown = nth;
+    else fail_countdown = nth;
+}
+void disarm()
+{
+    fail_countdown = 0;
+    global_countdown = 0;
+}
 
 HANDLE WINAPI creator_under_test(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack, LPTHREAD_START_ROUTINE start,
                                  LPVOID parameter, DWORD flags, LPDWORD id)
@@ -56,6 +71,10 @@ HANDLE WINAPI creator_under_test(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack,
 void* operator new(std::size_t size)
 {
     if (fail_countdown > 0 && --fail_countdown == 0) {
+        ++thrown;
+        throw std::bad_alloc();
+    }
+    if (global_countdown.load(std::memory_order_relaxed) > 0 && global_countdown.fetch_sub(1) == 1) {
         ++thrown;
         throw std::bad_alloc();
     }
@@ -210,18 +229,41 @@ bool untouched_bytes(const std::vector<unsigned char>& bytes)
 // allocation to fail during the whole sequence (0: none).
 constexpr int requests_per_run = 4;
 
+// Every step of a sweep names itself on stderr before it runs, so the last line before a crash names
+// the exact sweep, allocation number and call.
+const char* sweep_name = "none";
+int sweep_n = 0, sweep_m = 0;
+void trace(const char* step, int index = -1)
+{
+    if (index >= 0)
+        std::fprintf(stderr, "sweep=%s N=%d submit_N=%d all_threads=%d step=%s #%d\n", sweep_name, sweep_n, sweep_m,
+                     sweep_all_threads ? 1 : 0, step, index);
+    else
+        std::fprintf(stderr, "sweep=%s N=%d submit_N=%d all_threads=%d step=%s\n", sweep_name, sweep_n, sweep_m,
+                     sweep_all_threads ? 1 : 0, step);
+    std::fflush(stderr);
+}
+
 bool enqueue_without_effects(Fixture& f, Fixture::Queue& q, std::vector<unsigned char>& destination, int fail_nth)
 {
     try {
-        fail_countdown = fail_nth;
-        for (int i = 0; i < requests_per_run; ++i) f.request(q, destination);
+        trace("arm_enqueue");
+        arm(fail_nth);
+        for (int i = 0; i < requests_per_run; ++i) {
+            trace("enqueue_request", i + 1);
+            f.request(q, destination);
+        }
+        trace("enqueue_status");
         f.status_entry(q, 0);
+        trace("enqueue_signal");
         f.signal(q, 7);
-        fail_countdown = 0;
+        disarm();
+        trace("enqueue_done");
     } catch (...) {
-        fail_countdown = 0;
+        disarm();
         return fail("an exception left an Enqueue call");
     }
+    trace("check_enqueue");
     if (f.complete(q, 0) || f.hresult(q, 0) != pending_status) return fail("the status entry completed inside Enqueue");
     if (q.fence.signals != 0 || q.fence.value != 0) return fail("the fence was signaled inside Enqueue");
     if (!untouched_bytes(destination)) return fail("the destination changed inside Enqueue");
@@ -288,23 +330,36 @@ bool worker_starts_at_submit(Fixture& f)
 // entries in order and failures are completed inside Submit.
 bool one_allocation_fails(Fixture& f, int fail_enqueue, int fail_submit, int& thrown_at_enqueue, int& thrown_at_submit)
 {
+    sweep_n = fail_enqueue;
+    sweep_m = fail_submit;
+    sweep_name = fail_submit == 0 ? "enqueue" : fail_enqueue == 0 ? "submit" : "both";
+    trace("create");
     Fixture::Queue q;
     if (!f.create(q, f.vtables)) return fail("cannot create the queue");
     std::vector<unsigned char> destination(f.plain.size(), untouched);
     thrown = 0;
-    if (!enqueue_without_effects(f, q, destination, fail_enqueue)) return false;
+    // On every thread, the queue's worker must not run during Enqueue, or its own allocations would
+    // be counted: the creator hook holds it off until Submit.
+    fail_thread_creation = sweep_all_threads;
+    const bool enqueued = enqueue_without_effects(f, q, destination, fail_enqueue);
+    fail_thread_creation = false;
+    if (!enqueued) return false;
     thrown_at_enqueue += thrown;
     thrown = 0;
     try {
-        fail_countdown = fail_submit;
+        trace("submit");
+        arm(fail_submit);
         f.submit(q);
-        fail_countdown = 0;
+        disarm();
+        trace("submit_done");
     } catch (...) {
-        fail_countdown = 0;
+        disarm();
         return fail("an exception left Submit");
     }
     thrown_at_submit += thrown;
+    trace("serve_next_request");
     if (!serves_next_request(f, q)) return false;
+    trace("check_result");
     if (!f.complete(q, 0)) return fail("the status entry stayed pending after later work completed");
     if (f.hresult(q, 0) == 0) {
         if (destination != f.plain) return fail("a successful status entry has no data");
@@ -315,10 +370,12 @@ bool one_allocation_fails(Fixture& f, int fail_enqueue, int fail_submit, int& th
     return true;
 }
 
-// Every allocation point of Enqueue and of Submit is failed once, alone and in combination.
-bool every_allocation_can_fail(Fixture& f)
+// Every allocation point of Enqueue and of Submit is failed once, alone and in combination. The
+// first stage fails allocations of the calling thread only; the second counts allocations of every
+// thread of the process (the queue's worker included once Submit starts it).
+bool allocation_sweep(Fixture& f, int sweep, bool all_threads)
 {
-    constexpr int sweep = 10;
+    sweep_all_threads = all_threads;
     int thrown_at_enqueue = 0, thrown_at_submit = 0;
     for (int at_enqueue = 0; at_enqueue <= sweep; ++at_enqueue)
         for (int at_submit = 0; at_submit <= sweep; ++at_submit)
@@ -328,15 +385,24 @@ bool every_allocation_can_fail(Fixture& f)
             }
     if (thrown_at_enqueue == 0 || thrown_at_submit == 0)
         return fail("the control never failed an allocation: the sweep did not reach the queue's storage");
-    std::printf("allocation sweep: %d failures at Enqueue, %d at Submit\n", thrown_at_enqueue, thrown_at_submit);
+    std::printf("allocation sweep (%s): %d failures at Enqueue, %d at Submit\n", all_threads ? "all threads" : "main thread",
+                thrown_at_enqueue, thrown_at_submit);
+    sweep_all_threads = false;
     return true;
 }
+
+bool every_allocation_can_fail(Fixture& f) { return allocation_sweep(f, 10, false); }
+bool every_allocation_on_every_thread_can_fail(Fixture& f) { return allocation_sweep(f, 12, true); }
 
 // A request with page tokens copies them into a vector at Enqueue: that allocation may fail too.
 bool page_tokens_allocation_fails(Fixture& f)
 {
     static ULONG_PTR title[1] = {0x10000};
+    sweep_name = "tokens";
+    sweep_m = 0;
     for (int fail_nth = 1; fail_nth <= 10; ++fail_nth) {
+        sweep_n = fail_nth;
+        trace("create");
         Fixture::Queue q;
         if (!f.create(q, f.vtables)) return fail("cannot create the queue");
         unsigned char bytes[0x48] = {};
@@ -344,12 +410,15 @@ bool page_tokens_allocation_fails(Fixture& f)
         *reinterpret_cast<ULONG_PTR**>(bytes + 0x08) = title;
         *reinterpret_cast<unsigned*>(bytes + 0x18) = 16;
         try {
-            fail_countdown = fail_nth;
+            trace("arm_enqueue");
+            arm(fail_nth);
+            trace("enqueue_request", 1);
             reinterpret_cast<EnqueueRequestFn>(q.queue->vtable[3])(q.queue, bytes);
+            trace("enqueue_status");
             f.status_entry(q, 0);
-            fail_countdown = 0;
+            disarm();
         } catch (...) {
-            fail_countdown = 0;
+            disarm();
             return fail("an exception left EnqueueRequest with page tokens");
         }
         if (f.complete(q, 0)) return fail("the status entry completed inside Enqueue");
@@ -360,9 +429,53 @@ bool page_tokens_allocation_fails(Fixture& f)
 // A crash is never silent: whatever ends the process names the stage it was in.
 const char* volatile current_stage = "start";
 
+// Nothing here allocates: fixed buffers and fprintf only, and both countdowns are disarmed first.
+void print_frame(const void* address)
+{
+    HMODULE module = nullptr;
+    char path[MAX_PATH] = "?";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(address), &module) &&
+        module) {
+        const DWORD length = GetModuleFileNameA(module, path, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH) std::snprintf(path, sizeof path, "?");
+        const char* name = path;
+        for (const char* p = path; *p; ++p)
+            if (*p == '\\' || *p == '/') name = p + 1;
+        std::fprintf(stderr, "    %s+0x%llx\n", name,
+                     static_cast<unsigned long long>(static_cast<const char*>(address) - reinterpret_cast<const char*>(module)));
+    } else {
+        std::fprintf(stderr, "    %p\n", address);
+    }
+}
+
 void report_end(const char* what, unsigned long code)
 {
+    const int armed_here = fail_countdown;
+    const int armed_global = global_countdown.load();
+    disarm();
     std::fprintf(stderr, "FAIL: %s (0x%08lx) during stage \"%s\"\n", what, code, current_stage);
+    std::fprintf(stderr, "  last sweep=%s N=%d submit_N=%d all_threads=%d\n", sweep_name, sweep_n, sweep_m,
+                 sweep_all_threads ? 1 : 0);
+    std::fprintf(stderr, "  thread=%lu main_thread=%lu on_main=%d countdown_this_thread=%d countdown_global=%d thrown=%d\n",
+                 GetCurrentThreadId(), main_thread_id, GetCurrentThreadId() == main_thread_id ? 1 : 0, armed_here,
+                 armed_global, thrown.load());
+    std::exception_ptr in_flight = std::current_exception();
+    if (!in_flight) {
+        std::fprintf(stderr, "  no in-flight exception: noexcept/destructor/thread-entry/rethrow-without-active\n");
+    } else {
+        try {
+            std::rethrow_exception(in_flight);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "  in-flight exception: %s: %s\n", typeid(error).name(), error.what());
+        } catch (...) {
+            std::fprintf(stderr, "  in-flight exception: non-std exception\n");
+        }
+    }
+    void* frames[32] = {};
+    const USHORT count = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+    std::fprintf(stderr, "  stack (%u frames, module+offset):\n", static_cast<unsigned>(count));
+    for (USHORT i = 0; i < count; ++i) print_frame(frames[i]);
     std::fflush(stderr);
 }
 
@@ -417,6 +530,7 @@ bool stage(const char* name, bool (*run)(Fixture&), Fixture& f)
 
 int main()
 {
+    main_thread_id = GetCurrentThreadId();
     install_crash_reports();
     void* factory = nullptr;
     if (DStorageGetFactory(nullptr, &factory) != 0 || !factory) return fail("cannot get the factory"), 1;
@@ -429,6 +543,7 @@ int main()
     if (!stage("worker_cannot_start", worker_cannot_start, f)) return 1;
     if (!stage("worker_starts_at_submit", worker_starts_at_submit, f)) return 1;
     if (!stage("every_allocation_can_fail", every_allocation_can_fail, f)) return 1;
+    if (!stage("every_allocation_on_every_thread_can_fail", every_allocation_on_every_thread_can_fail, f)) return 1;
     if (!stage("page_tokens_allocation_fails", page_tokens_allocation_fails, f)) return 1;
     std::puts("a queue that cannot start its worker or allocate completes status and fences at Submit, and recovers");
     return 0;
