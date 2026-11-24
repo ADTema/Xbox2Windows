@@ -2728,7 +2728,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             deriv_addrs = 0
         addr_count = base_addrs + extra_addrs + deriv_addrs
         a16 = (w1 >> 30) & 1
-        if a16 and op_name == "image_load" and dim_name == "SQ_RSRC_IMG_2D":
+        packed_load_2d = a16 and op_name == "image_load" and dim_name == "SQ_RSRC_IMG_2D"
+        if packed_load_2d:
             addr_count = 1  # The two unsigned coordinates share a VGPR.
         d16 = (w1 >> 31) & 1
         # A gather returns the four texels of the selected component whatever the one-hot mask is.
@@ -2772,6 +2773,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("a16")
         if d16:
             mods.append("d16")
+        if packed_load_2d and nsize:
+            mods.append("invalid_nsa")  # A single address VGPR requires no NSA extension.
         # Word 0 bits 6 and 14 and word 1 bits 29:26 are reserved on gfx10: LLVM assembles none of them and
         # ignores them when disassembling, so a set bit is surfaced instead of vanishing from the listing.
         if (w0 & 0x4040) or (w1 >> 26) & 0xf:

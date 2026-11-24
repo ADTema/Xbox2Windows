@@ -10756,8 +10756,10 @@ Tests: `startup_gfx2hlsl_cvt_alu_controls`, `startup_gfx2hlsl_cvt_alu_warp` and 
 For plain 2D `image_load`, the startup translator reads `a16` coordinates from the low and high unsigned
 halves of one VGPR and emits `Texture2D.Load` at mip zero. The synthetic case in
 `python -B tests/startup_image_load_mip_check.py` packs x=1 and y=2 into v0 and assigns 63 to v1, which the
-old lowering used as y. It also checks that full-width loads still accept cache-policy flags and that
-plain `d16`, `tfe`, and 3D `a16` loads are refused. This check verifies translation on the CPU.
+old lowering used as y. Full-width loads still accept cache-policy flags. Plain loads refuse an empty
+`dmask`, `r128`, `lwe`, `d16`, `tfe` and reserved bits. The fixture also checks that 3D `a16` and a
+patched 2D `a16` instruction carrying an unexpected NSA extension are refused, and that the runtime
+and offline cache keys use the same revision. The check verifies translation on the CPU.
 
 ## Startup translator: pixel depth export
 

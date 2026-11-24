@@ -1,6 +1,7 @@
 """Check explicit mip operands in source-built gfx1013 texture loads."""
 import argparse
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -55,16 +56,34 @@ def check_plain_load_layouts(llvm_mc):
     assert 'r0.Load(int3(v0, v1, 0))' in shader(bytes.fromhex('882f00f000040400')).hlsl_ps()
 
     old_key = G.fnv(root, G.fnv(ps_code, G.fnv(VS_WORDS, G.fnv(b'x2w-startup-shader-4'))))
-    assert G.pipeline_key(VS_WORDS, ps_code, root) != old_key, 'cached pre-fix shader would be reused'
+    key = G.pipeline_key(VS_WORDS, ps_code, root)
+    assert key != old_key, 'cached pre-fix shader would be reused'
+    runtime = Path(__file__).resolve().parents[1] / 'src' / 'startup_stubs' / 'd3d12_draw.inl'
+    revision = re.search(rb'constexpr char revision\[\] = "([^"]+)";', runtime.read_bytes())
+    assert revision, 'desktop startup cache revision missing'
+    runtime_key = G.fnv(root, G.fnv(ps_code, G.fnv(VS_WORDS, G.fnv(revision[1]))))
+    assert key == runtime_key, 'offline and desktop startup cache revisions differ'
+
+    # LLVM accepts [v0] as the same packed encoding and rejects a second address VGPR.
+    # Patch the length field and append a fake NSA word to check that the decoder preserves the refusal.
+    invalid_nsa = '0a0f00f00004044001000000'
 
     for flag, encoded in (('d16', '080f00f000040480'), ('tfe', '080f01f000040400'),
-                          ('a16', '100f00f000040440')):
+                          ('r128', '088f00f000040400'), ('lwe', '080f02f000040400'),
+                          ('reserved', '084f00f000040400'), ('dmask:0x0', '080000f000040400'),
+                          ('a16', '100f00f000040440'), ('invalid_nsa', invalid_nsa)):
         try:
             shader(bytes.fromhex(encoded))
         except G.Unsupported as error:
             assert 'image_load' in str(error) and flag in str(error), error
         else:
             raise AssertionError(f'{flag} image load accepted with unsupported layout')
+    try:
+        pipe.ps.image(['v[4:7]', '[v0, v1]', 's[16:23]'], ['dim:SQ_RSRC_IMG_2D', 'dmask:0xf', 'a16'], 'load')
+    except G.Unsupported as error:
+        assert 'image_load address' in str(error), error
+    else:
+        raise AssertionError('A16 image load accepted two address registers')
     print('plain 2D load: packed A16 coordinates, cache policy unchanged, unsupported layouts refused')
 
 
