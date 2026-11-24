@@ -8289,6 +8289,33 @@ all 64 pixels at every clamp, and translated and direct HLSL agreed in every
 case. Neither adapter shows the Windows 10 in-box WARP behavior.
 [RX 9060 XT report](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7111499476)
 
+An Intel Arc 140T (8086:7d51, driver 32.0.101.8132) behaves like the Windows 10
+in-box WARP above and unlike every other adapter measured here: it reads the mip
+below the clamp. Nineteen clamps from 0.4375 to 3.75 were swept at `ps_6_6` with
+`MIN_MAG_MIP_POINT` on Windows 11 build 26300.9974, DXC 1.8.2502.11 and
+SPIRV-Tools 2025.5 with the debug layer enabled, and each cell is the mip that
+filled all 64 pixels for the translated SPIR-V sample and for the direct HLSL
+control:
+
+| Clamp | Arc 140T | RTX 5080 Laptop, 32.0.15.8142 | In-box WARP, 10.0.26100.9818 |
+|---|---|---|---|
+| 0.5 | **0** | 1 | 1 |
+| 0.99 | **0** | 1 | 1 |
+| 1.5 | **1** | 2 | 2 |
+| 1.5625 | **1** | 2 | 2 |
+| 1.99 | **1** | 2 | 2 |
+| 2.5 | **2** | 3 | 3 |
+| 3.5 | **3** | 3 | 3 |
+
+Every one of the 19 clamps follows those two rules exactly: the Arc reads
+`floor(clamp)` and the RTX and WARP read `floor(clamp + 0.5)`. Translated and
+direct HLSL agreed in all 57 cells, so the split is the adapter's mip selection,
+not the `MinLod` clamp translation or the readback. Two consequences for the
+fixtures: the stale-reference control at 1.5625 cannot reject on this adapter,
+because the adapter genuinely reads mip 1 there, while the wrong-mip control at
+clamp 1 still rejects on all three because both rules agree at an exact mip.
+[Measurement](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7119349577)
+
 Mip-linear results (`MIN_MAG_POINT_MIP_LINEAR`, `ps_6_6`, debug layer): WARP
 1.0.22 and the RTX on Windows 10 build 19045 with Agility SDK 1.620.2 and DXC
 1.9.2609; the Radeon and in-box WARP on Windows 11 build 26200.9974 with DXC
