@@ -1742,6 +1742,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_switch_bit_counts>" "$<TARGET_FILE:cpu_switch_bit_counts_lifted>")
     # A host without POPCNT, BMI1 or ABM cannot run the original as the reference describes it.
     set_tests_properties(cpu_aot_switch_bit_counts PROPERTIES SKIP_RETURN_CODE 77)
+    # BSF and BSR; the swapped build assembles three exports with the other scan and must follow the exchanged reference.
+    foreach(variant IN ITEMS original swapped)
+        cpu_asm_fixture(cpu_switch_bit_scans_${variant} switch_bit_scans)
+        cpu_translation(cpu_switch_bit_scans_${variant} cpu_switch_aot
+            bsf16_reg,bsf16_mem,bsf32_reg,bsf32_mem,bsf64_reg,bsf64_mem,bsr16_reg,bsr16_mem,bsr32_reg,bsr32_mem,bsr64_reg,bsr64_mem,bsr32_self,bsf16_self,jcc_bsf_e,jcc_bsr_ne,cmov_scans)
+    endforeach()
+    target_compile_definitions(cpu_switch_bit_scans_swapped PRIVATE SWAP_SCANS)
+    add_test(NAME cpu_aot_switch_bit_scans COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_bit_scans_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_bit_scans_original>" "$<TARGET_FILE:cpu_switch_bit_scans_original_lifted>"
+        "$<TARGET_FILE:cpu_switch_bit_scans_swapped_lifted>")
     # Divides whose results are unused: the translation is also built with /O2, where the compiler would remove a
     # divide that the generated C++ let it remove, and both builds are compared with the original's exception codes.
     cpu_asm_fixture(cpu_dead_div dead_div)
