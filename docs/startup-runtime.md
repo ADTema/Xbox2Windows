@@ -197,13 +197,18 @@ These are measured on one executable; treat them as hypotheses for others.
   hardware. Swapping the red/green shader changes the 16 covered pixels. Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_stream_(request|draw)_"`.
   Other stage combinations and full stream rasterizer/depth state remain open.
-- Translating the captured console colour-blend register state blocks remains open (#1216).
+- Colour-blend registers reach the draw path for pipelines created through device slot 57 only
+  (#1216): state block A holds the eight `CB_BLENDn_CONTROL` words at +0xD0, and
+  `src/startup_stubs/state_block_blend.h` decodes them into the translated pipeline's blend
+  state. `CB_TARGET_MASK` is not located, so all four channels are written. A word the decoder
+  refuses on render target 0 leaves the pipeline opaque, as before, and is logged
+  (`ctest --preset release --no-tests=error -R "^startup_state_block_blend$"`). A draw through a
+  slot 57 pipeline that tells blended from opaque output is still missing.
   A graphics stream can supply a desktop `D3D12_BLEND_DESC` directly. `src/startup_stubs/cb_blend.h`
   decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It
   refuses forms D3D12 can't express (`BOTH_SRC_ALPHA`, constant alpha without alpha blend factor
   support, MIN/MAX with factors other than ONE). Its draws match a CPU model of the register fields
-  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`). Where those registers sit in the
-  state block is not measured yet, so the draw path doesn't call it.
+  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`).
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 

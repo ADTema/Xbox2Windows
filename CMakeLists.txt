@@ -479,6 +479,12 @@ add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" 
 target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sampler_x_cs}")
 target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
+# Blend state of slot 57 pipelines from state block A (src/startup_stubs/state_block_blend.h, #1216).
+add_executable(startup_state_block_blend_check tests/startup_state_block_blend_check.cpp)
+target_include_directories(startup_state_block_blend_check PRIVATE src)
+target_compile_features(startup_state_block_blend_check PRIVATE cxx_std_17)
+add_test(NAME startup_state_block_blend COMMAND startup_state_block_blend_check)
+
 # Colour-blend register decoding (src/startup_stubs/cb_blend.h, #1216): decoder table plus draws
 # compared with a CPU model of the register fields.
 set(startup_cb_blend_vs "${CMAKE_CURRENT_BINARY_DIR}/startup_cb_blend_vs.h")
