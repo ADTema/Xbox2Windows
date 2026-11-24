@@ -13,6 +13,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -286,7 +287,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 outcome = "zlib failed";
                 data = nullptr;
                 static LONG diagnosed;
-                if (InterlockedIncrement(&diagnosed) <= 12) {
+                if (destination_size <= (16u << 20) && InterlockedIncrement(&diagnosed) <= 12) {
                     std::vector<unsigned char> big(std::size_t{destination_size} * 8 + 0x40000);
                     std::size_t big_produced = 0;
                     const bool big_ok = x2w_inflate::inflate_zlib(input, source_size, big.data(), big.size(), &big_produced);
@@ -376,7 +377,18 @@ QueueWork& work_of(Object* self)
                     entry = std::move(work.submitted.front());
                     work.submitted.pop_front();
                 }
-                run_entry(self, entry);
+                // Buffers are sized from request fields; a failed allocation fails that request
+                // instead of ending the process (an exception leaving a thread calls terminate).
+                try {
+                    run_entry(self, entry);
+                } catch (const std::exception& error) {
+                    InterlockedIncrement(&requests_failed);
+                    InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+                    static LONG reported;
+                    if (InterlockedIncrement(&reported) <= 12)
+                        log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), error.what(),
+                            entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
+                }
             }
         }).detach();
     }
