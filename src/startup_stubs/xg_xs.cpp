@@ -16,10 +16,9 @@
 // stand in for the console texture-layout library; otherwise they trap.
 //
 // The title describes a texture with a D3D12_RESOURCE_DESC-shaped block (0x38 bytes; the Layout
-// field holds a console swizzle mode) and asks a "texture computer" for its memory layout. The
-// console layouts are swizzled; this stand-in answers with the desktop's linear layout instead, so
-// the sizes and offsets the title uses are consistent with each other, but texel data it copies or
-// reads through them is not in the console arrangement.
+// field holds a console swizzle mode) and asks a "texture computer" for its memory layout.
+// The default layout uses desktop copyable footprints. A separate BC7 diagnostic profile reports
+// standard 4 KiB tiled geometry for layout queries.
 namespace {
 using u64 = std::uint64_t;
 
@@ -64,6 +63,7 @@ struct Computer {
     void* const* vtable;
     D3D12_RESOURCE_DESC desc;
     LONG refs;
+    bool bc7_4k_s_layout;
 };
 
 // Slot 2: (layout*) -> HRESULT. Layout as the title reads it: a 0x18-byte header (taken as total
@@ -75,10 +75,60 @@ struct Computer {
 constexpr std::size_t layout_header = 0x18, plane_bytes = 0x6c8, mip_base = 0x38, mip_bytes = 0x70;
 constexpr int max_mips = 15;
 
+bool use_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc)
+{
+    return x2w_local::env_on("X2W_XG_BC7_4K_S_LAYOUT") &&
+           desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           desc.Format == DXGI_FORMAT_BC7_UNORM && desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+           desc.Width > 0 && desc.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+           desc.Height > 0 && desc.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+           desc.DepthOrArraySize == 1 && desc.MipLevels == 1 && desc.SampleDesc.Count == 1 &&
+           desc.SampleDesc.Quality == 0 && desc.Alignment == 0 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
+}
+
+void put64(unsigned char* at, u64 value) { std::memcpy(at, &value, sizeof(value)); }
+void put32(unsigned char* at, std::uint32_t value) { std::memcpy(at, &value, sizeof(value)); }
+
+void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layout)
+{
+    // The standard tile contains 16 by 16 BC7 blocks. Each block is 4 by 4
+    // texels and 16 bytes. The pitch describes the padded block-row extent.
+    constexpr UINT tile_texels = 64, tile_bytes = 4096;
+    const UINT padded_width = (static_cast<UINT>(desc.Width) + tile_texels - 1) / tile_texels * tile_texels;
+    const UINT padded_height = (desc.Height + tile_texels - 1) / tile_texels * tile_texels;
+    const UINT pitch_bytes = padded_width / 4 * 16;
+    const u64 bytes = u64{pitch_bytes} * (padded_height / 4);
+
+    put64(layout + 0x00, bytes);
+    put64(layout + 0x08, tile_bytes);
+    put32(layout + 0x10, 1);
+    put32(layout + 0x14, 1);
+    auto* plane = layout + layout_header;
+    put64(plane + 0x08, bytes);
+    put64(plane + 0x18, tile_bytes);
+    auto* mip = plane + mip_base;
+    put64(mip + 0x00, bytes);
+    put64(mip + 0x10, bytes);
+    put32(mip + 0x18, padded_width);
+    put32(mip + 0x1c, pitch_bytes);
+    put32(mip + 0x20, tile_bytes);
+    put32(mip + 0x24, padded_width);
+    put32(mip + 0x28, padded_height);
+    put32(mip + 0x2c, 1);
+    put32(mip + 0x30, static_cast<UINT>(desc.Width));
+    put32(mip + 0x34, desc.Height);
+    put32(mip + 0x38, 1);
+    put32(mip + 0x3c, 1);
+}
+
 long __stdcall computer_layout(Computer* self, unsigned char* layout)
 {
     if (!layout) return static_cast<long>(0x80004003);
     std::memset(layout, 0, layout_header + 4 * plane_bytes + 8);
+    if (self->bc7_4k_s_layout) {
+        write_bc7_4k_s_layout(self->desc, layout);
+        return S_OK;
+    }
     ID3D12Device* device = layout_device();
     if (!device) return static_cast<long>(0x80004005);
     const D3D12_RESOURCE_DESC desc = desktop_desc(self->desc);
@@ -95,8 +145,6 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
     const u64 total = stride * slices;
 
-    auto put64 = [](unsigned char* at, u64 value) { std::memcpy(at, &value, 8); };
-    auto put32 = [](unsigned char* at, std::uint32_t value) { std::memcpy(at, &value, 4); };
     put64(layout + 0x00, total);
     put64(layout + 0x08, 0x10000);
     put32(layout + 0x10, mips);
@@ -184,6 +232,7 @@ void __stdcall computer_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INF
 long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned plane, unsigned subresource,
                                   const unsigned char* linear, unsigned row_pitch, unsigned slice_pitch)
 {
+    if (self->bc7_4k_s_layout) return E_NOTIMPL;
     static LONG calls, refused;
     ID3D12Device* device = layout_device();
     const D3D12_RESOURCE_DESC desc = desktop_desc(self->desc);
@@ -277,7 +326,7 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
         *reinterpret_cast<Computer**>(rdx) = nullptr;
         return E_NOTIMPL;
     }
-    auto* computer = new Computer{table.data(), desc, 1};
+    auto* computer = new Computer{table.data(), desc, 1, use_bc7_4k_s_layout(desc)};
     *reinterpret_cast<Computer**>(rdx) = computer;
     static LONG calls;
     if (InterlockedIncrement(&calls) <= 3)

@@ -87,6 +87,7 @@ adds memory dumps to the stop report.
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
+  | `X2W_XG_BC7_4K_S_LAYOUT=1` | opts into the BC7 layout-query diagnostic when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
 ## Findings
@@ -117,7 +118,13 @@ These are measured on one executable; treat them as hypotheses for others.
 ## Shortcuts that are known to be wrong
 
 - BCPack requests are completed with zero-filled destinations (blank textures).
-- XG layouts are the desktop copyable-footprint layout, not the console tiling.
+- The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
+  reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
+  `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
+  The diagnostic selects the profile explicitly. Native XG selector values still need
+  independent evidence. `CopyIntoSubresource` returns `E_NOTIMPL` for this profile because
+  the copy and upload paths still use desktop footprints. The reported pitch describes the
+  padded block-row extent of the surface.
 - Dynamically indexed sampler-heap loads become a default sampler.
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
   complete shader containers and a wrapped root through WARP, runs `gfx2hlsl.py --pending`, and
