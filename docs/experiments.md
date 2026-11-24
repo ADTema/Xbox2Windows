@@ -11224,6 +11224,28 @@ ctest --preset dev --no-tests=error -R '^(startup_image_sample_c|startup_sampler
 
 Not covered: a physical-adapter run of `startup_image_2d_array_hardware` (only WARP was run locally); a single-slice 2D view bound to an array declaration; 3D, cube and 1D comparisons; explicit-level comparison (`image_sample_c_l`), which needs a provable constant level 0 or shader model 6.7.
 
+## Startup translator: fixed-mip texture gathers
+
+The startup pixel translator lowers gfx1013 `image_gather4_lz` for a 2D
+texture with two contiguous coordinate registers. A one-hot `dmask` selects
+`GatherRed`, `GatherGreen`, `GatherBlue`, or `GatherAlpha`. The four taps go
+to consecutive destination registers in order: lower left, lower right,
+upper right, upper left.
+
+Both the guest `_lz` instruction and Direct3D gather use mip zero of the
+bound view. For a view that starts at a later resource mip, view mip zero
+is that first visible mip. The translator validates a constant sampler
+with normalized clamp addressing, bilinear XY, point mip filtering, and
+zero minimum LOD and bias. Implicit, explicit-LOD, comparison, offset,
+and non-2D forms remain outside this slice.
+[RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture) ·
+[Direct3D gather semantics](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#Gather4)
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_image_gather_lz(_warp|_hardware)?$' -V
+```
+
 ## Startup translator: per-lane bit operations
 
 `tools/startup/gfx2hlsl.py` now lowers six gfx1013 per-lane bit operations that it used to refuse: `v_bfe_i32`, `v_bcnt_u32_b32`, `v_ffbl_b32`, `v_ffbh_u32`, `v_ffbh_i32` and `v_bfrev_b32`. They become single HLSL expressions, so no helper function is added to the output: `countbits(a) + b`, `firstbitlow(a)`, `reversebits(a)`, and, for the two high scans, `a == 0u ? 0xffffffffu : 31u - firstbithigh(a)` (the signed form scans `~a` for a negative value and reads 0xffffffff for 0 and -1). `v_bfe_i32` takes the offset from bits 4:0 of source 1 and the width from bits 4:0 of source 2, reads 0 for a width of 0, and sign-extends the field from its top bit; when offset plus width passes 32, the bits above bit 31 repeat bit 31, which is an arithmetic shift of the whole word. The formulas and edge cases are the ones `tools/pixel_aot.py` already draws on WARP. `v_bfe_i32` and `v_bcnt_u32_b32` exist only as VOP3 on gfx1013 (llvm-mc 19 rejects `_e32`); the other four assemble in both `_e32` and `_e64`. Source modifiers, `clamp`, output modifiers, `op_sel` and a wrong operand count are refused with `Unsupported`; the operand count is now checked for every integer operation in this table, where a missing operand used to raise `IndexError`. Not lowered here: the 64-bit carry forms, `v_bfm_b32`, the 24-bit multiplies and `v_alignbit_b32`.
