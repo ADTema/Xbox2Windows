@@ -122,7 +122,10 @@ def check_example():
     for spelling in ("3", "3h", "03h"):
         assert fc.masm_mnemonics(f"    int {spelling}\n    ud2\n") == {"int3", "ud2"}, spelling
     assert fc.masm_mnemonics("    int 29h\n") == {"int"}
+    # ML64 assembles FSETPM as DB E4 with no WAIT, the reference's fnsetpm; FCLEX keeps its 9B WAIT.
+    assert fc.masm_mnemonics("    fsetpm\n    FSETPM\n    fclex\n") == {"fnsetpm", "fclex"}
     reference = fc.load_reference("x64_zen2.tsv")
+    assert fc.x64_forms({"fnsetpm"}, reference) == {("x87", "fnsetpm")}
     assert fc.x64_forms(branch, reference) == {("Integer", m) for m in branch}
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1286,19 +1289,22 @@ def check_sse_fp_native_driver():
 
 def check_swap_coverage():
     """v_swap_b32 is VOP1 in both references and counts as covered only through the accepted spelling.
-    The _e64, DPP and SDWA spellings reach only rejections, and the neighbouring v_swaprel_b32 stays uncovered."""
+    The _e64, DPP and SDWA spellings reach only rejections. The neighbouring v_swaprel_b32 is lowered since #1795
+    and is covered through its own accepted spelling, not through v_swap_b32."""
     import pixel_aot_check as pixel
     _controls_accepted()
     assert "v_swap_b32" in pixel.ACCEPTED
-    assert not {"v_swap_b32_e64", "v_swap_b32_dpp", "v_swap_b32_sdwa", "v_swaprel_b32"} & pixel.ACCEPTED
+    assert "v_swaprel_b32" in pixel.ACCEPTED
+    assert not {"v_swap_b32_e64", "v_swap_b32_dpp", "v_swap_b32_sdwa"} & pixel.ACCEPTED
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert ("VOP1", "v_swap_b32") in reference, name
         covered = fc.gfx_forms(pixel.ACCEPTED, reference)
         assert ("VOP1", "v_swap_b32") in covered, name
-        assert ("VOP1", "v_swaprel_b32") not in covered, name
-        # Control: without the accepted word the form is not covered.
+        assert ("VOP1", "v_swaprel_b32") in covered, name
+        # Controls: without the accepted word the form is not covered, and each form needs its own word.
         assert ("VOP1", "v_swap_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"v_swap_b32"}, reference), name
+        assert ("VOP1", "v_swaprel_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"v_swaprel_b32"}, reference), name
 
 
 def check_pk_fmac_coverage():
