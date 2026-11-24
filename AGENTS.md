@@ -104,6 +104,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/bcpack_symbols_check.py
 ./out/pe-env/bin/python -B tests/bc7_blocks_check.py
 ./out/pe-env/bin/python -B tests/bc7_tiles_check.py
+./out/pe-env/bin/python -B tests/gfx10_texture_roundtrip_check.py
 ./out/pe-env/bin/python -B tests/form_coverage_check.py
 ./out/pe-env/bin/python -B tests/resource_ranges_check.py
 ./out/pe-env/bin/python -B tests/ttpf_batch_export_check.py
