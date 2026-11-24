@@ -5849,6 +5849,8 @@ with a null `pRootSignature` must also return `E_INVALIDARG` and no PSO.
 
 Run `ctest --preset dev --no-tests=error -R '^d3d12x_pso_' -V`.
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) created the root signature and the PSO (`pso_blob_bytes=208`, both non-null) while the desktop-tagged variant was refused with `0x80070057`, and it reported the static sampler as `filter=0x15 address=1/3/4 comparison=7 border=2 min_lod=1.5 max_lod=9`.
+
 This fixture covers creation only. It dispatches no work, binds no descriptor heap and reads nothing
 back, so it does not establish that a dispatch using this root signature produces correct results.
 It also makes no console descriptor or vtable claim: the public
