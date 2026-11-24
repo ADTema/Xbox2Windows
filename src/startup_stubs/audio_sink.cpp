@@ -124,7 +124,8 @@ Submit AudioSink::submit(const BlockFormat& in, uint32_t frames, const void* byt
 {
     const uint32_t call = calls_++;
     if (!p_) return Submit::NotOpen;
-    if (!convert_block(in, bytes, frames, mix_, conv_buf_)) {
+    ResampleState trial = resample_;  // committed only once the block is accepted
+    if (!convert_block(in, bytes, frames, mix_, conv_buf_, &trial)) {
         ++r_.unsupported;
         return Submit::Unsupported;
     }
@@ -137,10 +138,13 @@ Submit AudioSink::submit(const BlockFormat& in, uint32_t frames, const void* byt
     }
     observe(false);
     if (timer_.drained_start >= 0) timer_.resume(now_ms(), r_.consumed_frames);  // the producer is back
-    BYTE* dst = nullptr;
-    if (FAILED(p_->render->GetBuffer(out_frames, &dst)) || !dst) return Submit::NotOpen;
-    std::memcpy(dst, conv_buf_.data(), conv_buf_.size());
-    if (FAILED(p_->render->ReleaseBuffer(out_frames, 0))) return Submit::NotOpen;
+    if (out_frames > 0) {
+        BYTE* dst = nullptr;
+        if (FAILED(p_->render->GetBuffer(out_frames, &dst)) || !dst) return Submit::NotOpen;
+        std::memcpy(dst, conv_buf_.data(), conv_buf_.size());
+        if (FAILED(p_->render->ReleaseBuffer(out_frames, 0))) return Submit::NotOpen;
+    }
+    resample_ = std::move(trial);
     if (r_.first_block < 0) {
         r_.first_block = call;
         r_.submitted = in;

@@ -148,7 +148,8 @@ int run()
         if (d.submit(ch6_44, 441, blk6.data()) != Submit::Accepted)
             return fail("case d 5.1 44.1 kHz block not accepted", 13);
         const Report rd = d.report();
-        if (rd.unsupported != 1 || rd.submitted_frames != resampled_frame_count(441, 44100, mix.rate))
+        if (rd.unsupported != 1 || rd.submitted_frames + 2 < resampled_frame_count(441, 44100, mix.rate) ||
+            rd.submitted_frames > resampled_frame_count(441, 44100, mix.rate))
             return fail("case d report counts mismatch", 14);
     }
     std::puts("startup_audio_output: PASS (no capture-path verification; glitch count not available from the render API)");

@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace x2w_audio {
@@ -102,10 +103,9 @@ inline float read_channel_mapped_sample(const BlockFormat& in, const void* src, 
         left += kItuSurroundCoeff * sl;
         right += kItuSurroundCoeff * sr;
     }
-    left = std::clamp(left, -1.0f, 1.0f);
-    right = std::clamp(right, -1.0f, 1.0f);
+    // Mono: average the unclipped stereo sums, clamp only the final value.
     if (out_channels == 1u) return std::clamp(0.5f * (left + right), -1.0f, 1.0f);
-    return out_ch == 0u ? left : right;
+    return std::clamp(out_ch == 0u ? left : right, -1.0f, 1.0f);
 }
 
 inline uint32_t resampled_frame_count(uint32_t frames, uint32_t in_rate, uint32_t out_rate)
@@ -118,50 +118,110 @@ inline uint32_t resampled_frame_count(uint32_t frames, uint32_t in_rate, uint32_
     return static_cast<uint32_t>(scaled);
 }
 
+// Resampler memory carried between accepted blocks of one stream: the exact fractional read
+// position (in 1/out_rate input-frame units, relative to the next block's first frame; -out_rate
+// <= phase_num means the next output sits between `last` and the next block's first frame) and the
+// last channel-mapped input frame. Cleared on any input/output format change.
+struct ResampleState {
+    bool valid = false;
+    BlockFormat in{}, out{};
+    int64_t phase_num = 0;
+    std::vector<float> last;
+    void reset() { *this = ResampleState{}; }
+};
+
 // Converts a submitted block to the endpoint format, supporting mono/stereo/5.1/7.1 channel mapping
-// (ITU-R BS.775-1 fold-down with clamping) and linear sample-rate resampling.
+// (ITU-R BS.775-1 fold-down, clamped after the final fold-down) and linear sample-rate resampling.
 // Preserves exact bit-for-bit behavior for matching-rate 1:1 and mono-to-N paths.
+// With state == nullptr each block is converted on its own (tail frames clamp to the last input
+// frame). With a state, consecutive blocks form one stream: the fractional phase and the boundary
+// frame carry over, so the output does not depend on how the input was split into blocks; the
+// final interpolation point waits for the next block, so a block may yield fewer (even zero)
+// frames and convert_block then returns true with an empty dst.
 inline bool convert_block(const BlockFormat& in, const void* src, uint32_t frames, const BlockFormat& out,
-                          std::vector<uint8_t>& dst)
+                          std::vector<uint8_t>& dst, ResampleState* state = nullptr)
 {
     if (!src || frames == 0) return false;
     if (!is_valid_sample_rate(in.rate) || !is_valid_sample_rate(out.rate)) return false;
     if (!is_supported_channel_conversion(in.channels, out.channels)) return false;
 
-    const uint32_t out_frames = resampled_frame_count(frames, in.rate, out.rate);
-    if (out_frames == 0) return false;
-    const uint64_t total_bytes = static_cast<uint64_t>(out_frames) * out.frame_bytes();
-    if (total_bytes > (std::numeric_limits<size_t>::max)()) return false;
-    dst.resize(static_cast<size_t>(total_bytes));
+    const bool same_rate = in.rate == out.rate;
+    const bool carry = state && !same_rate;
+    if (state && (!state->valid || state->in.kind != in.kind || state->in.channels != in.channels ||
+                  state->in.rate != in.rate || state->out.kind != out.kind ||
+                  state->out.channels != out.channels || state->out.rate != out.rate || same_rate))
+        state->reset();
 
-    if (in.rate == out.rate) {
-        if (in.channels == out.channels || in.channels == 1u) {
+    if (!carry) {
+        const uint32_t out_frames = resampled_frame_count(frames, in.rate, out.rate);
+        if (out_frames == 0) return false;
+        const uint64_t total_bytes = static_cast<uint64_t>(out_frames) * out.frame_bytes();
+        if (total_bytes > (std::numeric_limits<size_t>::max)()) return false;
+        dst.resize(static_cast<size_t>(total_bytes));
+
+        if (same_rate) {
+            if (in.channels == out.channels || in.channels == 1u) {
+                for (size_t f = 0; f < frames; ++f)
+                    for (size_t c = 0; c < out.channels; ++c)
+                        write_sample(out, dst.data(), f * out.channels + c,
+                                     read_sample(in, src, f * in.channels + (in.channels == 1u ? 0 : c)));
+                return true;
+            }
             for (size_t f = 0; f < frames; ++f)
-                for (size_t c = 0; c < out.channels; ++c)
+                for (uint32_t c = 0; c < out.channels; ++c)
                     write_sample(out, dst.data(), f * out.channels + c,
-                                 read_sample(in, src, f * in.channels + (in.channels == 1u ? 0 : c)));
+                                 read_channel_mapped_sample(in, src, f, c, out.channels));
             return true;
         }
-        for (size_t f = 0; f < frames; ++f)
-            for (uint32_t c = 0; c < out.channels; ++c)
-                write_sample(out, dst.data(), f * out.channels + c,
-                             read_channel_mapped_sample(in, src, f, c, out.channels));
+
+        const double step = static_cast<double>(in.rate) / static_cast<double>(out.rate);
+        for (uint32_t f = 0; f < out_frames; ++f) {
+            const double pos = static_cast<double>(f) * step;
+            const uint32_t i0 = (std::min)(static_cast<uint32_t>(pos), frames - 1u);
+            const uint32_t i1 = (std::min)(i0 + 1u, frames - 1u);
+            const float frac = static_cast<float>(pos - static_cast<double>(i0));
+            for (uint32_t c = 0; c < out.channels; ++c) {
+                const float s0 = read_channel_mapped_sample(in, src, i0, c, out.channels);
+                const float s1 = (i1 == i0) ? s0 : read_channel_mapped_sample(in, src, i1, c, out.channels);
+                const float interp = std::clamp(s0 + frac * (s1 - s0), -1.0f, 1.0f);
+                write_sample(out, dst.data(), static_cast<size_t>(f) * out.channels + c, interp);
+            }
+        }
         return true;
     }
 
-    const double step = static_cast<double>(in.rate) / static_cast<double>(out.rate);
-    for (uint32_t f = 0; f < out_frames; ++f) {
-        const double pos = static_cast<double>(f) * step;
-        const uint32_t i0 = (std::min)(static_cast<uint32_t>(pos), frames - 1u);
-        const uint32_t i1 = (std::min)(i0 + 1u, frames - 1u);
-        const float frac = static_cast<float>(pos - static_cast<double>(i0));
+    // Streaming path. Output n reads input position n * in_rate / out_rate; phase_num is that
+    // position in 1/out_rate units relative to this block's first frame (may be negative).
+    const int64_t orate = out.rate;
+    const int64_t span = static_cast<int64_t>(frames) * orate;
+    int64_t phase = state->valid ? state->phase_num : 0;
+    // Emit while the right-hand neighbour (floor(pos) + 1) lies inside this block: pos < frames - 1.
+    int64_t count = 0;
+    if (phase < span - orate) count = (span - orate - phase + in.rate - 1) / in.rate;
+    const uint64_t total_bytes = static_cast<uint64_t>(count) * out.frame_bytes();
+    if (count > static_cast<int64_t>((std::numeric_limits<uint32_t>::max)()) ||
+        total_bytes > (std::numeric_limits<size_t>::max)())
+        return false;
+    dst.resize(static_cast<size_t>(total_bytes));
+    const bool have_last = state->valid && state->last.size() == out.channels;
+    for (int64_t f = 0; f < count; ++f, phase += in.rate) {
+        const int64_t base = phase >= 0 ? phase / orate : -((-phase + orate - 1) / orate);
+        const float frac = static_cast<float>(static_cast<double>(phase - base * orate) / static_cast<double>(orate));
         for (uint32_t c = 0; c < out.channels; ++c) {
-            const float s0 = read_channel_mapped_sample(in, src, i0, c, out.channels);
-            const float s1 = (i1 == i0) ? s0 : read_channel_mapped_sample(in, src, i1, c, out.channels);
+            const float s0 = base < 0 ? (have_last ? state->last[c] : 0.0f)
+                                      : read_channel_mapped_sample(in, src, static_cast<size_t>(base), c, out.channels);
+            const float s1 = read_channel_mapped_sample(in, src, static_cast<size_t>(base + 1), c, out.channels);
             const float interp = std::clamp(s0 + frac * (s1 - s0), -1.0f, 1.0f);
             write_sample(out, dst.data(), static_cast<size_t>(f) * out.channels + c, interp);
         }
     }
+    state->in = in;
+    state->out = out;
+    state->phase_num = phase - span;
+    state->last.assign(out.channels, 0.0f);
+    for (uint32_t c = 0; c < out.channels; ++c)
+        state->last[c] = read_channel_mapped_sample(in, src, frames - 1u, c, out.channels);
+    state->valid = true;
     return true;
 }
 
@@ -244,6 +304,7 @@ private:
     Report r_;
     StarvationTimer timer_;
     std::vector<uint8_t> conv_buf_;
+    ResampleState resample_;
 };
 #endif
 

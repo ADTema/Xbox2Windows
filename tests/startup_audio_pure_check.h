@@ -112,6 +112,54 @@ inline int check_pure()
         if (std::fabs(read_sample(stereo_f, out.data(), 1) - exp_r) > 1e-5f) return 49;
     }
 
+    // Mono fold-down clamps only the final value: FL=1, FR=-1, FC=1 -> sqrt(0.5), not 0.3536.
+    {
+        const BlockFormat ch6_f{SampleKind::Float32, 6, 48000};
+        const float fold[6] = {1.0f, -1.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+        if (!convert_block(ch6_f, fold, 1, mono_f, out) || out.size() != 4) return 60;
+        if (std::fabs(read_sample(mono_f, out.data(), 0) - 0.5f * kItuSurroundCoeff * 2.0f) > 1e-5f) return 61;
+        // Stereo targets still clamp each channel (FL = 1 + 0.7071 clips to 1).
+        if (!convert_block(ch6_f, fold, 1, stereo_f, out) || out.size() != 8) return 62;
+        if (read_sample(stereo_f, out.data(), 0) != 1.0f) return 63;
+    }
+
+    // Streaming resampler: output must not depend on how the input is split into blocks.
+    {
+        const BlockFormat in44{SampleKind::Float32, 1, 44100};
+        std::vector<float> ramp(44100);
+        for (size_t i = 0; i < ramp.size(); ++i) ramp[i] = static_cast<float>(i) / 50000.0f;
+        std::vector<uint8_t> whole, piece;
+        ResampleState one, many;
+        if (!convert_block(in44, ramp.data(), 44100, mono_f, whole, &one)) return 64;
+        std::vector<uint8_t> joined;
+        for (size_t at = 0; at < ramp.size(); at += 128) {
+            const uint32_t n = static_cast<uint32_t>((std::min)(size_t{128}, ramp.size() - at));
+            if (!convert_block(in44, ramp.data() + at, n, mono_f, piece, &many)) return 65;
+            joined.insert(joined.end(), piece.begin(), piece.end());
+        }
+        if (joined.size() != whole.size()) return 66;
+        for (size_t i = 0; i < whole.size() / 4; ++i)
+            if (std::fabs(read_sample(mono_f, joined.data(), i) - read_sample(mono_f, whole.data(), i)) > 1e-5f) return 67;
+        if (joined.size() / 4 < 48000 - 2 || joined.size() / 4 > 48000) return 68;  // no per-block rounding drift
+
+        // 24 -> 48 kHz ramp split at a boundary keeps the interpolation sample between the blocks.
+        const BlockFormat in24{SampleKind::Float32, 1, 24000};
+        const float r8[8] = {0, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f};
+        ResampleState st;
+        std::vector<uint8_t> a, b;
+        if (!convert_block(in24, r8, 4, mono_f, a, &st) || !convert_block(in24, r8 + 4, 4, mono_f, b, &st)) return 69;
+        a.insert(a.end(), b.begin(), b.end());
+        if (a.size() != 14 * 4) return 70;
+        for (size_t i = 0; i < 14; ++i)
+            if (std::fabs(read_sample(mono_f, a.data(), i) - 0.05f * static_cast<float>(i)) > 1e-5f) return 71;
+
+        // A format change drops the carried state: the new stream starts at its own first frame.
+        const BlockFormat in16{SampleKind::Float32, 1, 16000};
+        const float flat[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+        if (!convert_block(in16, flat, 4, mono_f, a, &st)) return 72;
+        if (a.empty() || std::fabs(read_sample(mono_f, a.data(), 0) - 0.5f) > 1e-6f) return 73;
+    }
+
     // Negative controls: 0 rate, out-of-range rate, 0 channels, unsupported channel count, empty block, null ptr.
     if (convert_block({SampleKind::Pcm16, 1, 0}, tone.data(), 480, mono_f, out)) return 50;
     if (convert_block(mono16, tone.data(), 480, {SampleKind::Float32, 1, 0}, out)) return 51;
