@@ -278,6 +278,15 @@ def smem_mods(mods):
     return imm
 
 
+# Each conversion uses only its input bits (including byte extraction for ubyte0).
+# Multiply, fused multiply-add (including the literal form), and reciprocal use only
+# local arithmetic. Move copies its input bits. None reads a lane ID or another lane.
+UNIFORM_VALU = frozenset((
+    'v_cvt_u32_f32', 'v_cvt_i32_f32', 'v_cvt_f32_ubyte0', 'v_mul_f32',
+    'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_mov_b32',
+))
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -428,8 +437,29 @@ class Stage:
             expr = 'saturate(%s)' % expr
         self.set_v(n, 'U(%s)' % expr)
 
+    def scalar_expr_uniform(self, expr):
+        # These identifiers are runtime inputs in the scalar expressions emitted below.
+        # In particular, a compare can carry a lane mask into an otherwise scalar select.
+        for token in re.findall(r'\b(?:s\d+|v\d+|vcc|exec|m0|scc)\b', expr):
+            if token == 'scc':
+                if not self.scc_uniform:
+                    return False
+            elif not self.uniform_source(token):
+                return False
+        return True
+
+    def set_scc(self, expr):
+        if hasattr(self, 'varying_s'):
+            self.scc_uniform = self.scalar_expr_uniform(expr)
+        self.emit('scc = %s;' % expr)
+
     def set_s(self, n, expr, sym=None, scc=None):
         """Assign scalar register n at run time and/or symbolically."""
+        if hasattr(self, 'varying_s') and (sym is None or sym[0] == 'const'):
+            if self.scalar_expr_uniform(expr):
+                self.varying_s.discard(n)
+            else:
+                self.varying_s.add(n)
         if sym is not None:
             self.sym[n] = sym
             if sym[0] != 'const':
@@ -439,7 +469,7 @@ class Stage:
         self.used_s.add(n)
         self.emit('s%d = %s;' % (n, expr))
         if scc:
-            self.emit('scc = %s;' % scc.replace('$', 's%d' % n))
+            self.set_scc(scc.replace('$', 's%d' % n))
 
     def descriptor(self, tok):
         """Resource key for a descriptor operand like s[8:11]: (source, byte offset or None)."""
@@ -481,6 +511,8 @@ class Stage:
                 targets.add(int(parse(asm)[1][0].split('_')[1], 16))
         self.blocks = []          # (offset, [lines], terminator)
         self.uniform_v = set()
+        self.varying_s = set()
+        self.scc_uniform = True
         self.has_branches = bool(targets)
         start = 0
         for off, n, name, asm in self.ins:
@@ -495,9 +527,49 @@ class Stage:
         if self.lines:
             self.blocks.append((start, self.lines, None))
 
+    def uniform_source(self, tok):
+        r = reg_range(tok)
+        if r:
+            kind, lo, hi = r
+            if lo != hi:
+                return False
+            if kind == 'v':
+                return lo in self.uniform_v
+            sym = self.sym.get(lo)
+            if sym:
+                return sym[0] in ('const', 'ud', 'fixed_buffer_word')
+            return lo not in self.varying_s
+        if tok in FLOATS:
+            return True
+        try:
+            int(tok, 0)
+        except ValueError:
+            return False
+        return True
+
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
+        # Compute the proof before lowering, since a destination can also be a source.
+        dst = None
+        # Unit probes build a Stage without __init__: without the tracking state, prove nothing.
+        if (base in UNIFORM_VALU and ops and hasattr(self, 'uniform_v') and
+                not getattr(self, 'has_branches', True) and getattr(self, 'exec_known', False) and
+                (not mods or (base in VEC_F or base in VEC_U_TO_F) and
+                 all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods))):
+            candidate = reg_range(ops[0])
+            if candidate and candidate[0] == 'v' and candidate[1] == candidate[2]:
+                sources = ops[1:]
+                if base in VEC_F:
+                    sources = [re.sub(r'^-(?=[^\d.])', '', tok).strip('|') for tok in sources]
+                if sources and all(self.uniform_source(tok) for tok in sources):
+                    dst = candidate[1]
+        term = self.lower(base, asm, ops, mods)
+        if dst is not None:
+            self.uniform_v.add(dst)
+        return term
+
+    def lower(self, base, asm, ops, mods):
         if getattr(self, 'fetched', False):  # unit probes build a Stage without __init__
             # Behind a fetch call the definite-assignment guard relies on exec_known: every exec write must clear it.
             # s_wqm of exec into itself only adds lanes, so it stays a no-op; other s_wqm forms (a no-op here) and
@@ -664,7 +736,7 @@ class Stage:
                 self.exec_known = False
             self.emit('%s = (%s) & 1;' % (var, expr))
             if scc:
-                self.emit('scc = %s;' % scc.replace('$', var))
+                self.set_scc(scc.replace('$', var))
             return None
         d = reg_range(dname)[1]
         is_mask = pair or any(t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or (reg_range(t) and reg_range(t)[0] == 's' and reg_range(t)[1] in self.masks)
@@ -1183,14 +1255,11 @@ class Stage:
             raise Unsupported('v_cvt_i32_f32 with modifiers')
         dst = reg_range(ops[0])[1]
         self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
-        src = reg_range(ops[1])
-        if self.exec_known and src and src[0] == 's' and self.sym.get(src[1]) == ('fixed_buffer_word',):
-            self.uniform_v.add(dst)
 
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
-        if (mods or self.has_branches or not self.exec_known or not dst or dst[0] != 's' or
-                not src or src[0] != 'v' or src[1] not in self.uniform_v):
+        if (mods or self.has_branches or not self.exec_known or not dst or dst[0] != 's' or dst[1] != dst[2] or
+                not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
         self.set_s(reg_range(ops[0])[1], self.u(ops[1]))
 
@@ -1207,6 +1276,7 @@ class Stage:
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
     def op_v_interp_p1_f32(self, ops, mods):
+        self.uniform_v.discard(reg_range(ops[0])[1])
         self.note_attr(ops[2], 'linear')
 
     def op_v_interp_p2_f32(self, ops, mods):
@@ -1531,7 +1601,7 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
         def _make(op=_op, cast=_cast):
             def handler(self, ops, mods):
-                self.emit('scc = %s;' % (cast % op).format(self.u(ops[0]), self.u(ops[1])))
+                self.set_scc((cast % op).format(self.u(ops[0]), self.u(ops[1])))
             return handler
         setattr(Stage, 'op_s_cmp_%s_%s' % (_name, _typ), _make())
         setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make())
