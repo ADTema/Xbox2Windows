@@ -47,7 +47,11 @@ Both Windows jobs on `main` must pass before CI publishes a new chart. The image
 
 ## First build
 
-On x64 Windows, install Python 3.11 or newer and Visual Studio's **Desktop development with C++** workload, including x64 MSVC, CMake, Ninja, and Windows SDK 10.0.26100 with DXC. Windows CI uses Python 3.12. Visual Studio 2019 Build Tools (MSVC 14.29) build every target except the five CRT-free TLS EXE fixtures (`cpu_exe_tls*`), because that compiler leaves their thread-local initializers to the C runtime. For the same reason `cpu_native_tls_value` fails there, `cpu_package_main_image` lacks its fixture, and `xmem_attribute_scan` also sees the unused delay-load jump thunk that the 14.29 linker emits. Open PowerShell and run the following commands. If you already have a clone, start at `.\tools\dev.ps1`.
+On x64 Windows, install Python 3.11 or newer and Visual Studio's **Desktop development with C++** workload, including x64 MSVC, CMake, Ninja, and the Windows SDK with DXC. Windows CI uses Python 3.12.
+
+Use Windows SDK 10.0.26100 for new installations. A contributor using SDK 10.0.22621.0, MSVC 19.44 and the bundled DXC 1.6.2112.16 [completed `cmake --build --preset dev`](https://github.com/R0Y00/Xbox2Windows/pull/1369). In the full test suite, `dxc_compile_time_gvn` failed because that DXC rejects `-ftime-report`. See [Windows build notes](#windows-build-notes) to select a different DXC.
+
+Visual Studio 2019 Build Tools (MSVC 14.29) build every target except the five CRT-free TLS EXE fixtures (`cpu_exe_tls*`), because that compiler leaves their thread-local initializers to the C runtime. For the same reason `cpu_native_tls_value` fails there, `cpu_package_main_image` lacks its fixture, and `xmem_attribute_scan` also sees the unused delay-load jump thunk that the 14.29 linker emits. Open PowerShell and run the following commands. If you already have a clone, start at `.\tools\dev.ps1`.
 
 ```powershell
 git clone https://github.com/R0Y00/Xbox2Windows.git
