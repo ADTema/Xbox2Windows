@@ -3977,6 +3977,88 @@ class TestRdna2Scanner(unittest.TestCase):
             lower(b32_shader, 20, 24, [1, 2, 3, 4], wave_profile="wave32")
         self.assertIsNotNone(lower(b32_shader, 20, 24, [1, 2, 3, 4], wave_size=32))
 
+    def test_pixel_cb_read_trace_follows_translator_scalar_alu_and_waits(self):
+        """The constant-buffer trace continues over the scalar ALU, wait and scratch-register lines pixel_aot lowers."""
+        from pixel_aot import lower
+        from pixel_aot_check import assembly
+        from pixel_cb_read import Descriptor, Read, first_descriptor, first_read, scalar_writes
+
+        base = list(assembly(False))
+        at = base.index("s_mov_b32 s43, 4") + 1
+
+        def translator_accepts(line):
+            shader = list(base)
+            shader.insert(at, line)
+            try:
+                lower(shader, 20, 24, [1, 2, 3, 4])
+                return True
+            except Exception:
+                return False
+
+        cases = [
+            ("s_lshl_b32 s44, s40, 2", True), ("s_lshr_b32 s44, s40, s41", True),
+            ("s_and_b32 s44, s40, 3", True), ("s_and_b32 s44, s40, 0x7f", True),
+            ("s_or_b32 s44, s40, s41", True), ("s_xor_b32 s44, s40, -1", True),
+            ("s_and_b64 s[44:45], s[40:41], 3", True),
+            ("s_or_b32 s44, s40, 1.0", True), ("s_and_b32 s44, s40, -0.5", True),
+            ("s_xor_b32 s44, 2.0, s41", True), ("s_lshl_b32 s44, s40, 0.125", True),
+            ("s_or_b32 s44, s40, 1e3", False), ("s_or_b32 s44, s40, 0x1ffffffff", False),
+            ("s_and_b64 s[44:45], s[40:41], 1.0", False),
+            ("s_and_b32 m0, s40, 3", False), ("s_and_b32 exec_lo, s40, 3", False),
+            ("s_and_b32 exec, vcc_lo, s40", False), ("s_or_b32 vcc_lo, s40, s41", False),
+            ("s_waitcnt lgkmcnt(0) vmcnt(0)", True), ("s_waitcnt vmcnt(0) lgkmcnt(0)", True),
+            ("s_waitcnt vmcnt(1)", True), ("s_waitcnt lgkmcnt(1) expcnt(0)", True), ("s_waitcnt 0", True),
+            ("s_waitcnt vmcnt(0) vmcnt(1)", False), ("s_waitcnt vmcnt(64)", False),
+            ("s_waitcnt expcnt(8)", False), ("s_waitcnt", False), ("s_waitcnt vscnt(0)", False),
+            ("s_waitcnt_depctr 0xffe3", False),
+            ("s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0x10", True),
+            ("s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), -5", True),
+            ("s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0x100000000", False),
+            ("s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), -2147483649", False),
+        ]
+        for line, expected in cases:
+            self.assertEqual(translator_accepts(line), expected, f"translator mismatch on {line}")
+            if re.fullmatch(r"s_waitcnt( .*)?", line):
+                probe = ["s_mov_b32 s3, 0", "s_load_dwordx4 s[4:7], s[2:3], 0x10", line,
+                         "s_waitcnt lgkmcnt(0)", "s_buffer_load_dword s8, s[4:7], 0x10", "s_waitcnt lgkmcnt(0)"]
+                found = first_descriptor(probe)
+                continues = bool(found) and first_read(probe, found) == Read(1, 16)
+            else:
+                continues = scalar_writes(line) is not None
+            self.assertEqual(continues, expected, f"trace mismatch on {line}")
+        self.assertEqual(scalar_writes("s_and_b32 s44, s40, 3"), range(44, 45))
+        self.assertEqual(scalar_writes("s_and_b64 s[44:45], s[40:41], 3"), range(44, 46))
+        self.assertEqual(scalar_writes("s_and_b64 exec, exec, s[50:51]"), ())
+
+        prefix = ["s_mov_b32 s3, 0", "s_and_b32 s10, s2, 3", "s_lshl_b32 s11, s10, 2", "s_or_b32 s12, s11, s10",
+                  "s_xor_b32 s13, s12, 1", "s_lshr_b32 s14, s13, 1", "s_and_b64 s[16:17], s[10:11], 3",
+                  "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0x10"]
+        load = "s_load_dwordx4 s[4:7], s[2:3], 0x10"
+        read = "s_buffer_load_dword s8, s[4:7], 0x10"
+        program = prefix + [load, "s_waitcnt lgkmcnt(0) vmcnt(0)", read, "s_waitcnt vmcnt(0) lgkmcnt(0)"]
+        descriptor = first_descriptor(program)
+        self.assertEqual(descriptor, Descriptor(2, 0x10, 4, len(prefix)))
+        self.assertEqual(first_read(program, descriptor), Read(1, 16))
+
+        def traced(lines):
+            found = first_descriptor(lines)
+            return found and first_read(lines, found)
+
+        after_load = len(prefix) + 1
+        mutations = {
+            "table low half overwritten": prefix + ["s_and_b32 s2, s2, 3"] + program[len(prefix):],
+            "table high half no longer zero": prefix + ["s_or_b32 s3, s3, 1"] + program[len(prefix):],
+            "pending load read by ALU": program[:after_load] + ["s_and_b32 s20, s4, 1"] + program[after_load:],
+            "pending load written by ALU": program[:after_load] + ["s_and_b32 s5, s20, 1"] + program[after_load:],
+            "descriptor never drained": prefix + [load, "s_waitcnt vmcnt(0)", read, "s_waitcnt lgkmcnt(0)"],
+            "partial lgkm drain": prefix + [load, "s_waitcnt lgkmcnt(1) vmcnt(0)", read, "s_waitcnt lgkmcnt(0)"],
+            "duplicate counter": prefix + [load, "s_waitcnt lgkmcnt(0) lgkmcnt(0)", read, "s_waitcnt lgkmcnt(0)"],
+            "read result clobbered": program[:-1] + ["s_and_b32 s8, s8, 1", program[-1]],
+            "read never drained": program[:-1],
+        }
+        for name, lines in mutations.items():
+            self.assertIsNone(traced(lines), name)
+
     def test_rounding_instructions_accepted(self):
         """v_ceil_f32 and v_rndne_f32 are known RDNA 2 opcodes that pixel_aot lowers."""
         canonical = [
