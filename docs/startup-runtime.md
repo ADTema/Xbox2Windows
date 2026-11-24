@@ -729,6 +729,31 @@ These are measured on one executable; treat them as hypotheses for others.
   every page request at the page end and must fail. The counts describe a run's request shapes; they
   do not say why a request of one shape fails or what the title expects for it.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_page_end_counts' -V`.
+- **DirectStorage refused page request, consumer view (#1198).** The `startup_storage_consumer_pair`
+  fixture follows one refused page-destination request from enqueue to the release of its pages,
+  next to a successful request of the same shape. It loads the stand-in DLL and the xmem shim under
+  `X2W_XMEM_PERMISSIVE`, takes two page tokens from `XMemAllocatePhysicalPages`, reserves a view
+  with `XMemVirtualAlloc` and maps the pages into it with `XMemMapPhysicalPages`; every read goes
+  through that view. Each page gets its own sentinel pattern. One Submit carries two zlib requests
+  from memory with `page_offset` 0xF000 and `destination_size` 0x1000, so each ends at its page's
+  end, each followed by its status entry and an `EnqueueSignal` fence. S inflates to exactly 0x1000
+  bytes and R to 0x1800. Checkpoints: S's status is `S_OK` and R's `E_FAIL`; each fence runs after
+  its own status entry and before the next request's; at each fence (read in the fence callback)
+  and again after both, S's page shows its sentinel below 0xF000 and the exact inflated bytes from
+  there, while every byte of R's page is still R's sentinel and no byte of R's destination equals
+  R's stream prefix; the log names `inflated` for S and `destination capacity exceeded` for R. The
+  pages are then unmapped and freed (the shim's live page backings drop by two), one page is
+  allocated again and mapped at the same address, reads zero-filled, and a follow-up request of S's
+  shape on the same queue completes with the exact bytes. Its `accept_refused_control` takes R's
+  destination as data, expects R's stream prefix there, and must print that check's failure. A
+  manual mutant that writes R's first 0x1000 inflated bytes before the capacity refusal fails the
+  fixture on R's sentinel. The file-source refusals and their fence order are covered by
+  `startup_storage_refusal_order`, non-writable linear destinations by `startup_dstorage_destination`,
+  and a single short or missing-grant page request read through a mapped view, with one fill byte and
+  no fence or release, by the `dstorage` case of `startup_stubs` (`tests/startup_stub_consumer.cpp`).
+  The fixture shows what a consumer of the stand-in reads; it does not show what the title does with a
+  refused request.
+  Reproduce with `ctest --preset dev --no-tests=error -R '^startup_storage_consumer_pair' -V`.
 - **DirectStorage allocation failure (#1199, item 3).** A queue worker runs each entry inside
   a handler that turns any exception, including `std::bad_alloc` from a buffer sized by a request
   field, into a failed request: the next status entry reports `E_FAIL`, the destination is
