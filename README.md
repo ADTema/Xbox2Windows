@@ -4,7 +4,7 @@
 
 Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. You can run the public tests without a game installation.
 
-> **Current status.** The full-package DXIL compilation scan found a compiled route for 26,500 of 26,503 shader records. Local main-executable diagnostics reach D3D12 pipeline creation, with a verified rendered frame still pending. [Live startup progress #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
+> **Current status.** The full-package DXIL compilation scan found a compiled route for 26,500 of 26,503 shader records. The author of [#1135](https://github.com/R0Y00/Xbox2Windows/pull/1135) reports a visible intro on an RX 9070 XT with permissive startup switches. Colours are incorrect, and frames turn black after the intro. A separate WARP run created six graphics pipelines. The first reference-checked frame remains open. [Live startup progress #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
 
 ## Community and contributions
 
@@ -75,6 +75,7 @@ verified on the host, without loading an EXE or DLL. [Scope and synthetic tests]
 - **Path length.** Clone to a short path such as `C:\Users\<name>\Documents\Xbox2Windows`. In a checkout about 150 characters deep, CMake's compiler check fails with MSVC error C1041 because the object paths under `out/build/dev` pass the 260-character limit.
 - **Independent build.** A Windows 11 contributor reproduced the three smoke tests from a clean checkout at `71bb9f4` and again after an incremental rebuild at `2465837`. [Toolchain, full-suite results and capability skips](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821)
 - **Zig cache.** The two Zig fixtures are built by `python -m ziglang build-exe`. If that step stops the build with `error: AccessDenied`, point both Zig caches at writable directories before configuring: `$env:ZIG_GLOBAL_CACHE_DIR = 'out/zig-global'` and `$env:ZIG_LOCAL_CACHE_DIR = 'out/zig-local'`. [Reproduction and measured before/after](docs/experiments.md#two-record-archive-reader-from-standard-startup)
+- **Carrier temp directory.** The TLS and `exe_aot_convert` fixtures create their carrier under `GetTempPathW`. If they fail with `cannot create the TLS carrier directory (error 5)`, that directory is not writable for the built executables on that host: set `TMP` and `TEMP` to a writable directory before running them. [Measured case](docs/experiments.md#tls-callbacks-and-the-entry-point)
 
 ## Choose an experiment
 

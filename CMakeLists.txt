@@ -308,6 +308,12 @@ add_custom_command(OUTPUT "${descriptor_window_cs}" COMMAND "${DXC_EXECUTABLE}" 
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/descriptor_window_submissions.hlsl"
     DEPENDS tests/descriptor_window_submissions.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/descriptor_window_submissions.cpp "${descriptor_window_cs}")
+set(startup_sampler_x_cs "${CMAKE_CURRENT_BINARY_DIR}/startup_sampler_x_cs.h")
+add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main
+    -Vn startup_sampler_x_cs -Fh "${startup_sampler_x_cs}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_sampler_x.hlsl"
+    DEPENDS tests/startup_sampler_x.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sampler_x_cs}")
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp tests/ffx_recurrent_views.cpp)
 target_sources(offscreen_check PRIVATE tests/ffx_rcas_views.cpp)
 foreach(storage IN ITEMS Native Packed)
@@ -424,6 +430,22 @@ foreach(entry IN ITEMS Wave64Emulate Wave64Emulate64 Wave64EmulateSkew)
     add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" ${emulate_args} -E Emulate -Vn ${entry}
         -I "${CMAKE_CURRENT_SOURCE_DIR}/src" -Fh "${header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/wave64_emulate.hlsl" DEPENDS tests/wave64_emulate.hlsl src/wave64_emulate.hlsli
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
+    target_sources(offscreen_check PRIVATE "${header}")
+endforeach()
+target_sources(offscreen_check PRIVATE tests/shader_wave.cpp)
+foreach(width IN ITEMS 0 32 64)
+    if(width)
+        set(entry ShaderWave${width})
+        set(wave_args -T cs_6_6 -D WAVE_SIZE=${width})
+    else()
+        set(entry ShaderWave)
+        set(wave_args -T cs_6_0)
+    endif()
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
+    add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" ${wave_args} -E WaveWidth -Vn ${entry}
+        -Fh "${header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/shader_wave.hlsl" DEPENDS tests/shader_wave.hlsl
         BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
     target_sources(offscreen_check PRIVATE "${header}")
 endforeach()
@@ -695,6 +717,12 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(wave_shuffle_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME wave64_emulate_${adapter} COMMAND offscreen_check ${adapter} --wave64-emulate)
     set_tests_properties(wave64_emulate_${adapter} PROPERTIES TIMEOUT 45)
+    add_test(NAME shader_wave_${adapter} COMMAND offscreen_check ${adapter} --shader-wave)
+    set_tests_properties(shader_wave_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    foreach(width IN ITEMS 32 64)
+        add_test(NAME shader_wave${width}_${adapter} COMMAND offscreen_check ${adapter} --shader-wave${width})
+        set_tests_properties(shader_wave${width}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
     set_tests_properties(bvh_buffer_ops_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(dxr_query_${adapter} dxr_pipeline_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(offscreen_${adapter} PROPERTIES TIMEOUT 45)
@@ -708,6 +736,36 @@ set_tests_properties(bvh_reads_hardware bvh_waves_hardware bvh_hits_hardware PRO
 # The cs_6_5 fixtures skip on a WARP below SM 6.5. The Windows 10 in-box WARP reports SM 6.2.
 set_tests_properties(bvh_reads_warp bvh_waves_warp bvh_hits_warp bvh_packed_warp
     bvh_numeric_warp bvh_atomics_warp PROPERTIES SKIP_RETURN_CODE 77)
+# CRT-free startup attempt for a forced-wave compute pipeline (Refs #870; the desktop readback is #1132).
+# One EXE per shader variant and adapter, so the entry point takes no arguments. Each prints the
+# D3D12_OPTIONS1 lane range, the exact CreateComputePipelineState HRESULT and the debug-layer messages,
+# and reads back WaveGetLaneCount() when creation succeeds. An adapter whose range excludes the forced
+# width must refuse the pipeline and exits 77 with the HRESULT; creation that contradicts the range fails.
+foreach(width IN ITEMS 0 4 32)
+    set(variant_dir "${CMAKE_CURRENT_BINARY_DIR}/wave_startup_${width}")
+    set(defines)
+    if(width)
+        set(defines -D WAVE_STARTUP_WIDTH=${width})
+    endif()
+    add_custom_command(OUTPUT "${variant_dir}/wave_startup_cs.h"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${variant_dir}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_6 -E main ${defines} -Vn wave_startup_cs
+                -Fh "${variant_dir}/wave_startup_cs.h" "${CMAKE_CURRENT_SOURCE_DIR}/tests/wave_startup.hlsl"
+        DEPENDS tests/wave_startup.hlsl VERBATIM)
+    foreach(adapter IN ITEMS warp hardware)
+        set(target wave_startup_${width}_${adapter})
+        add_executable(${target} tests/wave_startup_exe.cpp "${variant_dir}/wave_startup_cs.h")
+        target_include_directories(${target} PRIVATE "${variant_dir}")
+        string(COMPARE EQUAL "${adapter}" warp is_warp)
+        target_compile_definitions(${target} PRIVATE WAVE_STARTUP_WIDTH=${width} WAVE_STARTUP_WARP=$<BOOL:${is_warp}>)
+        target_compile_options(${target} PRIVATE /GS- /Zl)
+        target_link_options(${target} PRIVATE /ENTRY:fixture_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
+            /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE kernel32 d3d12 dxgi)
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
 
 add_test(NAME bvh_differential_pipeline_warp COMMAND offscreen_check warp --bvh-differential-pipeline)
 set_tests_properties(bvh_differential_pipeline_warp PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
@@ -726,6 +784,14 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(descriptor_heap_paging_swapped_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "descriptor_paging swapped=0")
+endforeach()
+foreach(adapter IN ITEMS hardware warp)
+    add_test(NAME startup_sampler_x_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-x)
+    add_test(NAME startup_sampler_x_swapped_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-x-swapped)
+    set_tests_properties(startup_sampler_x_${adapter} startup_sampler_x_swapped_${adapter}
+        PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    set_tests_properties(startup_sampler_x_swapped_${adapter}
+        PROPERTIES FAIL_REGULAR_EXPRESSION "startup_sampler_x swapped=0")
 endforeach()
 
 set(SIMPLE_TRIANGLE_DIR "${CMAKE_SOURCE_DIR}/out/reference/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/IntroGraphics/SimpleTriangle"
@@ -1032,8 +1098,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fuzz_frames>" "$<TARGET_FILE:cpu_fuzz_frames_lifted>" "${cpu_fuzz_frames_o2}"
         --area frames --mutant "$<TARGET_FILE:cpu_fuzz_frames_mutant>")
     set_tests_properties(cpu_aot_fuzz_frames PROPERTIES TIMEOUT 60)
+    # Direct calls and tail jumps to leaf and frame callees, shared callees and a planted call retarget.
     set(CPU_FUZZ_CALLS_SEED "0xCA11" CACHE STRING "Seed for the CPU differential fuzz call test")
-    set(CPU_FUZZ_CALLS_FUNCTIONS "16" CACHE STRING "Number of exported functions in the CPU differential fuzz call test")
+    set(CPU_FUZZ_CALLS_FUNCTIONS "16" CACHE STRING "Number of generated callers in the CPU differential fuzz call test")
     set(cpu_fuzz_calls_asm "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_calls.asm")
     set(cpu_fuzz_calls_def "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_calls.def")
     add_custom_command(OUTPUT "${cpu_fuzz_calls_asm}" "${cpu_fuzz_calls_def}"
@@ -1071,6 +1138,46 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fuzz_calls>" "$<TARGET_FILE:cpu_fuzz_calls_lifted>" "${cpu_fuzz_calls_o2}"
         --area calls --mutant "$<TARGET_FILE:cpu_fuzz_calls_mutant>")
     set_tests_properties(cpu_aot_fuzz_calls PROPERTIES TIMEOUT 60)
+    # Call chains through unexported callees, skipped conditional calls and tail jumps, with swapped call arguments planted.
+    set(CPU_FUZZ_CHAINS_SEED "0xCA11" CACHE STRING "Seed for the CPU differential fuzz chain test")
+    set(CPU_FUZZ_CHAINS_FUNCTIONS "16" CACHE STRING "Number of exported functions in the CPU differential fuzz chain test")
+    set(cpu_fuzz_chains_asm "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_chains.asm")
+    set(cpu_fuzz_chains_def "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_chains.def")
+    add_custom_command(OUTPUT "${cpu_fuzz_chains_asm}" "${cpu_fuzz_chains_def}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" emit
+            "${CPU_FUZZ_CHAINS_SEED}" "${CPU_FUZZ_CHAINS_FUNCTIONS}" "${cpu_fuzz_chains_asm}"
+            "${cpu_fuzz_chains_def}" --area chains
+        DEPENDS tools/fuzz_cpu.py VERBATIM)
+    add_library(cpu_fuzz_chains SHARED "${cpu_fuzz_chains_asm}" "${cpu_fuzz_chains_def}")
+    set_target_properties(cpu_fuzz_chains PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_fuzz_chains PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO /OPT:NOICF)
+    set(cpu_fuzz_chains_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_chains_lifted.cpp")
+    set(cpu_fuzz_chains_mutant "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_chains_mutant.cpp")
+    foreach(variant lifted mutant)
+        set(mutant_flag "")
+        if(variant STREQUAL "mutant")
+            set(mutant_flag "--mutant")
+        endif()
+        add_custom_command(OUTPUT "${cpu_fuzz_chains_${variant}}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" translate
+                "${CPU_FUZZ_CHAINS_SEED}" "${CPU_FUZZ_CHAINS_FUNCTIONS}" "$<TARGET_FILE:cpu_fuzz_chains>"
+                "${cpu_fuzz_chains_${variant}}" --area chains ${mutant_flag}
+            DEPENDS cpu_fuzz_chains tools/fuzz_cpu.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py
+                tools/cpu_call_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_fuzz_chains_${variant} SHARED "${cpu_fuzz_chains_${variant}}")
+        target_compile_features(cpu_fuzz_chains_${variant} PRIVATE cxx_std_20)
+    endforeach()
+    set(cpu_fuzz_chains_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_chains_lifted_o2.dll")
+    add_custom_command(OUTPUT "${cpu_fuzz_chains_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${cpu_fuzz_chains_lifted}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_chains_lifted_o2.obj" "/Fe${cpu_fuzz_chains_o2}"
+        DEPENDS "${cpu_fuzz_chains_lifted}" VERBATIM)
+    add_custom_target(cpu_fuzz_chains_lifted_o2 ALL DEPENDS "${cpu_fuzz_chains_o2}")
+    add_test(NAME cpu_aot_fuzz_chains COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_CHAINS_SEED}" "${CPU_FUZZ_CHAINS_FUNCTIONS}"
+        "$<TARGET_FILE:cpu_fuzz_chains>" "$<TARGET_FILE:cpu_fuzz_chains_lifted>" "${cpu_fuzz_chains_o2}"
+        --area chains --mutant "$<TARGET_FILE:cpu_fuzz_chains_mutant>")
+    set_tests_properties(cpu_aot_fuzz_chains PROPERTIES TIMEOUT 60)
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_asm_fixture(cpu_switch_strings switch_strings)
     cpu_asm_fixture(cpu_string_probe string_probe)
@@ -1372,6 +1479,42 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_pcmpstr_original_lifted>"
         "$<TARGET_FILE:cpu_avx_pcmpstr_altered_lifted>")
     set_tests_properties(cpu_aot_avx_pcmpstr PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_xsave_state_original_exports
+        "op_xrstor_xsave,op_xrstor64_xsave64,op_xrstor_xsave64,op_xrstor64_xsave,"
+        "op_xrstor64_disp,op_xrstor64_mask_sse,op_vzeroupper_xsave64,op_pipeline,"
+        "op_discarded_read")
+    string(CONCAT cpu_xsave_state_original_exports ${cpu_xsave_state_original_exports})
+    set(cpu_xsave_state_altered_exports
+        "op_xrstor64_xsave64,op_xrstor_xsave64,op_xrstor64_disp,op_pipeline")
+    string(CONCAT cpu_xsave_state_altered_exports ${cpu_xsave_state_altered_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_xsave_state_${variant} xsave_state)
+        cpu_translation(cpu_xsave_state_${variant} cpu_xsave_aot "${cpu_xsave_state_${variant}_exports}")
+    endforeach()
+    target_compile_definitions(cpu_xsave_state_altered PRIVATE ALTER_OP)
+    set(cpu_xsave_state_canonical_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_canonical_lifted.cpp")
+    add_custom_command(OUTPUT "${cpu_xsave_state_canonical_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_xsave_aot.py"
+            "$<TARGET_FILE:cpu_xsave_state_original>" "op_xsave_only,op_xsave64_only"
+            "${cpu_xsave_state_canonical_cpp}" --entry-state canonical
+        DEPENDS cpu_xsave_state_original tools/cpu_xsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_xsave_state_canonical_lifted SHARED "${cpu_xsave_state_canonical_cpp}")
+    set(cpu_xsave_state_canonical_altered_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_canonical_altered_lifted.cpp")
+    add_custom_command(OUTPUT "${cpu_xsave_state_canonical_altered_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_xsave_aot.py"
+            "$<TARGET_FILE:cpu_xsave_state_altered>" "op_xrstor64_mask_sse"
+            "${cpu_xsave_state_canonical_altered_cpp}" --entry-state canonical
+        DEPENDS cpu_xsave_state_altered tools/cpu_xsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_xsave_state_canonical_altered_lifted SHARED "${cpu_xsave_state_canonical_altered_cpp}")
+    add_test(NAME cpu_aot_xsave_state COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xsave_state_check.py"
+        "$<TARGET_FILE:cpu_xsave_state_original>"
+        "$<TARGET_FILE:cpu_xsave_state_original_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_altered_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_canonical_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_canonical_altered_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_altered>")
+    set_tests_properties(cpu_aot_xsave_state PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_pcmpstr64_exports
         "pcmpestri64_ub_eqany_pos_lsb,pcmpestri64_sw_ranges_neg_msb,"
         "pcmpestri64_mem_sb_eqeach_mpos_msb,pcmpestri64_alias_xmm0,"
@@ -1516,6 +1659,29 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_integer_flags_altered_lifted>"
         "$<TARGET_FILE:cpu_integer_flags_controls>")
     set_tests_properties(cpu_aot_integer_flags PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_sse_fxsave_exports
+        "op_fxrstor_fxsave,op_fxrstor64_fxsave64,op_fxrstor_fxsave64,"
+        "op_fxrstor64_fxsave,op_fxrstor64_disp,op_pipeline,op_discarded_read")
+    string(CONCAT cpu_sse_fxsave_exports ${cpu_sse_fxsave_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse_fxsave_${variant} sse_fxsave)
+        cpu_translation(cpu_sse_fxsave_${variant} cpu_sse_fxsave_aot "${cpu_sse_fxsave_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse_fxsave_altered PRIVATE ALTER_OP)
+    set(cpu_sse_fxsave_canonical_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse_fxsave_canonical_lifted.cpp")
+    add_custom_command(OUTPUT "${cpu_sse_fxsave_canonical_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_sse_fxsave_aot.py"
+            "$<TARGET_FILE:cpu_sse_fxsave_original>" "op_fxsave_only,op_fxsave64_only"
+            "${cpu_sse_fxsave_canonical_cpp}" --entry-state canonical
+        DEPENDS cpu_sse_fxsave_original tools/cpu_sse_fxsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_sse_fxsave_canonical_lifted SHARED "${cpu_sse_fxsave_canonical_cpp}")
+    add_test(NAME cpu_aot_sse_fxsave COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fxsave_check.py"
+        "$<TARGET_FILE:cpu_sse_fxsave_original>"
+        "$<TARGET_FILE:cpu_sse_fxsave_original_lifted>"
+        "$<TARGET_FILE:cpu_sse_fxsave_altered_lifted>"
+        "$<TARGET_FILE:cpu_sse_fxsave_canonical_lifted>")
+    set_tests_properties(cpu_aot_sse_fxsave PROPERTIES SKIP_RETURN_CODE 77)
     # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
     # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
     set(tail_files)
@@ -2613,6 +2779,34 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_mxcsr COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
         check "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr>" "$<TARGET_FILE:cpu_mxcsr_lifted>"
         ${mxcsr_controls} "${mxcsr_o2}")
+    # VLDMXCSR and VSTMXCSR: the translated part runs without AVX and never skips; the native comparison is its
+    # own test and exits 77 on a host that cannot execute VEX instructions.
+    cpu_asm_fixture(cpu_vmxcsr vmxcsr)
+    set(vmxcsr_controls)
+    foreach(variant IN ITEMS lifted noload fixed)
+        set(vmxcsr_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_${variant}.cpp")
+        add_custom_command(OUTPUT "${vmxcsr_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
+                emit "$<TARGET_FILE:cpu_vmxcsr>" "${vmxcsr_fixture}" ${variant}
+            DEPENDS cpu_vmxcsr tests/cpu/vmxcsr.py tests/cpu/mxcsr.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_vmxcsr_${variant} SHARED "${vmxcsr_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND vmxcsr_controls "$<TARGET_FILE:cpu_vmxcsr_${variant}>")
+        endif()
+    endforeach()
+    set(vmxcsr_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_lifted_o2.dll")
+    add_custom_command(OUTPUT "${vmxcsr_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /EHsc /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_lifted_o2.obj" "/Fe${vmxcsr_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_vmxcsr_lifted_o2 ALL DEPENDS "${vmxcsr_o2}")
+    add_test(NAME cpu_aot_vmxcsr COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
+        check translated "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_vmxcsr>" "$<TARGET_FILE:cpu_vmxcsr_lifted>"
+        ${vmxcsr_controls} "${vmxcsr_o2}")
+    add_test(NAME cpu_aot_vmxcsr_native COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
+        check native "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_vmxcsr>" "$<TARGET_FILE:cpu_vmxcsr_lifted>")
+    set_tests_properties(cpu_aot_vmxcsr_native PROPERTIES SKIP_RETURN_CODE 77)
     # FTZ and DAZ in the profile's denormals opt-in: the lifted DLL, the sim variant that must keep every rule,
     # the noftz, nodaz and nomask controls that must break one, and an /O2 build of the translation.
     cpu_asm_fixture(cpu_mxcsr_denormals mxcsr_denormals)
