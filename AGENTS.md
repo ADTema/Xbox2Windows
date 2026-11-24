@@ -169,6 +169,18 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_stream_fetch_check.py
 ./out/pe-env/bin/python -B tests/compute_entry_layout_check.py
 ./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
+./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
+./out/pe-env/bin/python -B tests/startup_image_gather_lz_check.py
+./out/pe-env/bin/python -B tests/startup_image_sample_c_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_alu_check.py
+./out/pe-env/bin/python -B tests/startup_triage_run_check.py
+./out/pe-env/bin/python -B tests/startup_run_ps1_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_bit_alu_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_shift64_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_vopc_sdwa_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_lg_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_nan_check.py
+./out/pe-env/bin/python -B tests/run_checks_parallel_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support
