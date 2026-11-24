@@ -2,12 +2,15 @@
 // executable in a kill-on-close job with a timeout, a commit cap and captured stdout/stderr, and
 // this fixture is the only executable the check needs: it writes known bytes to both streams and
 // the trap log, reports a known exit code, or holds memory, spawns a child or stays alive so the
-// job limits have to stop it.
+// job limits have to stop it. Paths stay UTF-16 throughout: the launcher passes a Unicode trap-log
+// path, and its build or temp folder can hold characters the active ANSI code page cannot.
 #include <windows.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <iterator>
 
 namespace {
 void stream(FILE* out, const char* text)
@@ -18,22 +21,22 @@ void stream(FILE* out, const char* text)
 
 void write_trap_log(const char* text)
 {
-    char path[MAX_PATH]{};
-    if (!GetEnvironmentVariableA("X2W_TRAP_LOG", path, MAX_PATH)) return;
-    if (FILE* file = std::fopen(path, "w")) {
+    const wchar_t* const path = _wgetenv(L"X2W_TRAP_LOG");
+    if (!path) return;
+    if (FILE* file = _wfopen(path, L"w")) {
         std::fputs(text, file);
         std::fclose(file);
     }
 }
 
-void spawn_second_process(const char* self)
+void spawn_second_process(const wchar_t* self)
 {
-    char command[MAX_PATH + 16]{};
-    std::snprintf(command, sizeof(command), "\"%s\" noop", self);
-    STARTUPINFOA startup{};
+    wchar_t command[MAX_PATH + 16]{};
+    std::swprintf(command, std::size(command), L"\"%ls\" noop", self);
+    STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION child{};
-    if (!CreateProcessA(nullptr, command, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &child)) {
+    if (!CreateProcessW(nullptr, command, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &child)) {
         std::printf("spawn failed error=%lu\n", GetLastError());
         return;
     }
@@ -71,8 +74,8 @@ int main(int argc, char** argv)
         return 0;
     }
     if (std::strcmp(mode, "spawn") == 0) {
-        char self[MAX_PATH]{};
-        if (!GetModuleFileNameA(nullptr, self, MAX_PATH)) return 65;
+        wchar_t self[MAX_PATH]{};
+        if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return 65;
         spawn_second_process(self);
         return 0;
     }
