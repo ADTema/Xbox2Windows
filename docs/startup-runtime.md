@@ -413,7 +413,7 @@ debugger round trip.
 
 | Instruction | Rewritten as |
 |---|---|
-| `CLWB m8` | `CLFLUSHOPT m8` (one ModRM bit) |
+| `CLWB m8` | `CLFLUSHOPT m8` (one ModRM bit); one `NOP` of the same length once a `CLFLUSHOPT` has faulted on this host |
 | `MONITORX`, `MWAITX` | a 3-byte `NOP`; `PAUSE` and `NOP` (the wait may end at any time) |
 | `CLZERO` | a jump to a stub that stores 64 zero bytes at `rax & ~63` |
 | `INSERTQ xmm, xmm, len, idx`, `EXTRQ xmm, len, idx` (xmm0-7) | a jump to a stub that does the field move in integer registers |
@@ -425,7 +425,9 @@ refused (register-count `INSERTQ`/`EXTRQ`, xmm8-15, fields past bit 63).
 
 `python -B tests/startup_host_cpu_check.py` assembles source-built functions, patches them the same
 way and calls them on the host: 288 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
-moved `lea` and a moved rip-relative load, and decoded `CLWB` and wait rewrites. Stubs that zero 56
+moved `lea` and a moved rip-relative load, and decoded `CLWB` and wait rewrites, including the
+`NOP` form for every addressing mode. The fall-back from `CLFLUSHOPT` to `NOP` in the debugger is
+not exercised here: it needs a host without `CLFLUSHOPT`. Stubs that zero 56
 or 72 bytes, and a stub for another bit offset, fail it. On a processor that has SSE4a or CLZERO
 the unpatched functions are compared as well. It exits 77 on a host that is not x86-64.
 

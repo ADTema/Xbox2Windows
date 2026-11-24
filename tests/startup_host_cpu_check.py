@@ -201,6 +201,29 @@ def rewrites():
         assert after.mnemonic == iced_x86.Mnemonic.CLFLUSHOPT and after.len == before.len == len(code), code.hex()
         for field in ("memory_base", "memory_index", "memory_index_scale", "memory_displacement", "memory_segment"):
             assert getattr(after, field) == getattr(before, field), (code.hex(), field)
+        # A host without CLFLUSHOPT: one NOP of the same length, for the CLWB and for its rewrite.
+        for flush in (code, code[:offset] + byte + code[offset + 1:]):
+            nop = host_cpu.flush_nop(flush)
+            assert host_cpu.flush_length(flush) == before.len and len(nop) == before.len, flush.hex()
+            decoded = one(nop)
+            assert decoded.mnemonic == iced_x86.Mnemonic.NOP and decoded.len == len(nop), (flush.hex(), nop.hex())
+    # Every addressing form: the length must match the decoder's, or a NOP would cut an instruction.
+    lengths = set()
+    for rex in (b"", b"\x41", b"\x42", b"\x43"):
+        for modrm in range(0xC0):
+            if (modrm >> 3) & 7 not in (6, 7):
+                continue
+            for sib in ((0x24, 0x25, 0xC8, 0xCD) if modrm & 7 == 4 else (0,)):
+                code = b"\x66" + rex + b"\x0f\xae" + bytes([modrm]) + (bytes([sib]) if modrm & 7 == 4 else b"") + bytes(8)
+                decoded = one(code)
+                assert decoded.mnemonic in (iced_x86.Mnemonic.CLWB, iced_x86.Mnemonic.CLFLUSHOPT), code.hex()
+                assert host_cpu.flush_length(code) == decoded.len, (code.hex(), decoded.len)
+                assert one(host_cpu.flush_nop(code)).len == decoded.len
+                lengths.add(decoded.len)
+    assert lengths == set(host_cpu.NOPS), sorted(lengths)
+    for refused in (bytes.fromhex("0fae3000"), bytes.fromhex("660faef0"), bytes.fromhex("660fae28"),  # /5
+                    bytes.fromhex("660fae"), bytes.fromhex("660fae742408")[:5]):                      # cut short
+        assert host_cpu.flush_length(refused) is None and host_cpu.flush_nop(refused) is None, refused.hex()
     for refused in (bytes.fromhex("660fae38"),      # clflushopt already
                     bytes.fromhex("0fae3000"),      # xsaveopt: no 66 prefix
                     bytes.fromhex("660faef0"),      # register form
@@ -250,7 +273,7 @@ def main():
 
     native = ", ".join(sorted(features)) or "none"
     print(f"startup_host_cpu: PASS ({checked} insertq/extrq results, clzero with two moved-instruction forms, "
-          f"5 clwb and 2 wait rewrites; native comparison: {native})")
+          f"5 clwb and 2 wait rewrites, clwb/clflushopt NOPs for every addressing form; native comparison: {native})")
     return 0
 
 

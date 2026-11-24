@@ -4,7 +4,9 @@ The startup debugger (debug_launch.py, X2W_HOST_CPU=1) calls these when the main
 illegal-instruction exception. Each site is rewritten once, in the running process only:
 
 - CLWB m8 (66 [REX] 0F AE /6) becomes CLFLUSHOPT m8 (/7): same bytes apart from one ModRM bit.
-  Both write the line back; CLFLUSHOPT also evicts it, which no program can observe.
+  Both write the line back; CLFLUSHOPT also evicts it, which no program can observe. A host
+  older than CLFLUSHOPT faults on that as well; the site then becomes one NOP of the same length
+  (flush_nop), and so does every later CLWB. A write-back hint has no effect a process can observe.
 - MONITORX (0F 01 FA) becomes a 3-byte NOP and MWAITX (0F 01 FB) becomes PAUSE; NOP. MWAITX may
   return at any time, so a caller already has to re-check its condition in a loop.
 - CLZERO (0F 01 FC) and the immediate SSE4a forms INSERTQ xmm, xmm, len, idx (F2 0F 78 /r ib ib)
@@ -38,6 +40,41 @@ def clwb_rewrite(code):
     if (modrm >> 3) & 7 != 6 or modrm >> 6 == 3:
         return None
     return at + 2, bytes([modrm | 0x08])
+
+
+def flush_length(code):
+    """Length of the CLWB m8 or CLFLUSHOPT m8 at the start of code (66 [REX] 0F AE /6 or /7), or None."""
+    if len(code) < 4 or code[0] != 0x66:
+        return None
+    at = 2 if 0x40 <= code[1] <= 0x4F else 1
+    if code[at:at + 2] != b"\x0f\xae" or len(code) <= at + 2:
+        return None
+    modrm = code[at + 2]
+    mod, rm = modrm >> 6, modrm & 7
+    if (modrm >> 3) & 7 not in (6, 7) or mod == 3:
+        return None
+    length = at + 3
+    if rm == 4:
+        if len(code) <= length:
+            return None
+        if mod == 0 and code[length] & 7 == 5:
+            length += 4  # SIB without a base: disp32
+        length += 1
+    elif mod == 0 and rm == 5:
+        length += 4      # rip-relative
+    length += (0, 1, 4)[mod]
+    return length if len(code) >= length else None
+
+
+# One NOP instruction for each length a CLWB m8 can have.
+NOPS = {4: "0f1f4000", 5: "0f1f440000", 6: "660f1f440000", 7: "0f1f8000000000", 8: "0f1f840000000000",
+        9: "660f1f840000000000", 10: "662e0f1f840000000000"}
+
+
+def flush_nop(code):
+    """A single NOP as long as the CLWB m8 or CLFLUSHOPT m8 at the start of code, or None."""
+    length = flush_length(code)
+    return bytes.fromhex(NOPS[length]) if length in NOPS else None
 
 
 def wait_rewrite(code):
