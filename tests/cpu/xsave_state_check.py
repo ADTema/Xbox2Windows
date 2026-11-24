@@ -1120,20 +1120,27 @@ def check_entry_state_contracts(
     canonical_fns,
     canonical_altered_lib,
     canonical_altered_fns,
+    compacted_lib,
+    compacted_fns,
+    compacted_altered_lib,
     mxcsr_mask: int,
     deprecates_cs_ds: bool,
 ) -> None:
     """Verify explicit entry-state contract metadata and non-default entry controls."""
-    for lib, expected_profile, expected_flag in (
-        (lifted_lib, b"defined", 0),
-        (altered_lib, b"defined", 0),
-        (canonical_lib, b"canonical", 1),
-        (canonical_altered_lib, b"canonical", 1),
+    for lib, expected_profile, expected_flag, expected_compacted in (
+        (lifted_lib, b"defined", 0, 0),
+        (altered_lib, b"defined", 0, 0),
+        (canonical_lib, b"canonical", 1, 1),
+        (canonical_altered_lib, b"canonical", 1, 0),
+        (compacted_lib, b"defined", 0, 1),
+        (compacted_altered_lib, b"defined", 0, 1),
     ):
         lib.lifted_entry_state_profile.restype = ctypes.c_char_p
         lib.lifted_requires_canonical_entry.restype = ctypes.c_uint32
+        lib.lifted_allows_compacted_xrstor.restype = ctypes.c_uint32
         assert lib.lifted_entry_state_profile() == expected_profile
         assert lib.lifted_requires_canonical_entry() == expected_flag
+        assert lib.lifted_allows_compacted_xrstor() == expected_compacted
 
     # 1) Non-default incoming SSE state on entry-only XSAVE/XSAVE64 exports:
     #    SSE in use (XSTATE_BV=2), MXCSR=0x3F80, low XMM0 lane=0x3F800000.
@@ -1188,17 +1195,27 @@ def check_entry_state_contracts(
     assert (struct.unpack_from("<Q", got_l_alt, 512)[0] & 5) == 0
     assert got_n_alt != got_l_alt
 
-    # 3) Non-default entry-MXCSR control for AVX-only compacted XRSTOR -> XSAVEOPT64(4):
-    #    compacted XRSTOR(4) leaves MXCSR untouched, so native retains caller's 0x3F80 while
-    #    canonical-lifted supplies 0x1F80; standard-format XRSTOR(4) and SSE-defined XRSTOR(2)->XRSTOR(4)
-    #    controls still load 0x5F80 from the image and never observe caller MXCSR.
+    # 3) Non-default entry-MXCSR control for AVX-only XRSTOR(4) -> XSAVEOPT64(4):
+    #    - Default defined standard-only path accepts AVX-only XRSTOR(4) -> XSAVEOPT64(4), loads 0x5F80 from
+    #      standard_avx (ignoring caller's 0x3F80), and #GPs on compacted_avx.
+    #    - Opt-in compacted + canonical path handles both: compacted_avx leaves caller's 0x3F80 untouched
+    #      natively while canonical-lifted supplies 0x1F80; standard_avx loads 0x5F80.
+    #    - Opt-in compacted + defined SSE-defined positive (XRSTOR(2) -> XRSTOR(4) -> XSAVEOPT64(4))
+    #      loads 0x5F80 from sse_in before compacted_avx and matches native.
     compacted_avx = compacted_image(mxcsr_mask, 4, COMPACTED_BIT | 4, 4, mxcsr=0x5F80 & mxcsr_mask, seed=303)
     standard_avx = make_xsave_image(mxcsr_mask, xstate_bv=4, mxcsr=0x5F80 & mxcsr_mask, seed=304)
+    got_l_def_std = invoke_lifted(lifted_fns["op_xrstor64_avx_xsaveopt64_avx"], standard_avx, dummy)
+    assert struct.unpack_from("<I", got_l_def_std, 24)[0] == (0x5F80 & mxcsr_mask)
+    def_comp_faulted, _ = run_compacted(
+        "default_standard_only_rejects_compacted", None, lifted_fns["op_xrstor64_avx_xsaveopt64_avx"], compacted_avx, dummy
+    )
+    assert def_comp_faulted, "standard-only default path must #GP on compacted header"
     got_l_comp = invoke_lifted(canonical_fns["op_xrstor64_avx_xsaveopt64_avx"], compacted_avx, dummy)
     assert struct.unpack_from("<I", got_l_comp, 24)[0] == 0x1F80
     got_l_std = invoke_lifted(canonical_fns["op_xrstor64_avx_xsaveopt64_avx"], standard_avx, dummy)
     assert struct.unpack_from("<I", got_l_std, 24)[0] == (0x5F80 & mxcsr_mask)
-    got_l_sse = invoke_lifted(lifted_fns["op_xrstor64_sse_compacted_avx_xsaveopt64_avx"], sse_in, compacted_avx)
+    assert_equal_output("default_vs_canonical_std", "op_xrstor64_avx_xsaveopt64_avx", 0, got_l_def_std, got_l_std)
+    got_l_sse = invoke_lifted(compacted_fns["op_xrstor64_sse_compacted_avx_xsaveopt64_avx"], sse_in, compacted_avx)
     assert struct.unpack_from("<I", got_l_sse, 24)[0] == (0x5F80 & mxcsr_mask)
     if "op_xrstor64_avx_xsaveopt64_avx" in native_fns:
         got_n_comp = invoke_native(
@@ -1210,6 +1227,7 @@ def check_entry_state_contracts(
             harness, native_fns["op_xrstor64_avx_xsaveopt64_avx"], standard_avx, dummy, entry_ptr=sse_ptr
         )
         assert struct.unpack_from("<I", got_n_std, 24)[0] == (0x5F80 & mxcsr_mask)
+        assert_equal_output("native_default_std", "op_xrstor64_avx_xsaveopt64_avx", 0, got_n_std, got_l_def_std)
         assert_equal_output("native", "op_xrstor64_avx_xsaveopt64_avx", 0, got_n_std, got_l_std)
     if "op_xrstor64_sse_compacted_avx_xsaveopt64_avx" in native_fns:
         got_n_sse = invoke_native(
@@ -1716,11 +1734,13 @@ def check_differential(
     canonical_path: Path,
     canonical_altered_path: Path,
     native_altered_path: Path,
+    compacted_path: Path,
+    compacted_altered_path: Path,
 ) -> None:
     lifted_lib, lifted = bind_exports(
         lifted_path,
         "lifted_",
-        DEFINED_EXPORTS + (DYNMASK_EXPORT, XSAVEOPT_DYNMASK_EXPORT, SSE_COMPACTED_CONTROL_EXPORT) + COMPACTED_EXPORTS,
+        DEFINED_EXPORTS + (DYNMASK_EXPORT, XSAVEOPT_DYNMASK_EXPORT, "op_xrstor64_avx_xsaveopt64_avx"),
     )
     lifted_lib.host_has_xsave.argtypes = []
     lifted_lib.host_has_xsave.restype = ctypes.c_uint32
@@ -1758,10 +1778,16 @@ def check_differential(
     _, native = bind_exports(native_path, "", EXPORTS + COMPACTED_EXPORTS + (SSE_COMPACTED_CONTROL_EXPORT,))
     native = native_exports_for_host(native, has_xsavec, has_xsaveopt)
     _, native_altered = bind_exports(native_altered_path, "", ALTERED_CANONICAL_EXPORTS)
-    altered_lib, altered = bind_exports(altered_path, "lifted_", ALTERED_DEFINED_EXPORTS + ALTERED_COMPACTED_EXPORTS)
+    altered_lib, altered = bind_exports(altered_path, "lifted_", ALTERED_DEFINED_EXPORTS)
     canonical_lib, canonical = bind_exports(canonical_path, "lifted_", CANONICAL_EXPORTS)
     canonical_altered_lib, canonical_altered = bind_exports(
         canonical_altered_path, "lifted_", ALTERED_CANONICAL_EXPORTS
+    )
+    compacted_lib, compacted_lifted = bind_exports(
+        compacted_path, "lifted_", COMPACTED_EXPORTS + (SSE_COMPACTED_CONTROL_EXPORT,)
+    )
+    compacted_altered_lib, compacted_altered = bind_exports(
+        compacted_altered_path, "lifted_", ALTERED_COMPACTED_EXPORTS
     )
 
     harness = NativeHarness(host_area_size, mxcsr_mask)
@@ -1778,6 +1804,9 @@ def check_differential(
             canonical,
             canonical_altered_lib,
             canonical_altered,
+            compacted_lib,
+            compacted_lifted,
+            compacted_altered_lib,
             mxcsr_mask,
             deprecates_cs_ds,
         )
@@ -1854,7 +1883,9 @@ def check_differential(
         liveness_checks = check_xsavec_mxcsr_liveness(harness, native, lifted, mxcsr_mask, deprecates_cs_ds)
         layout_checks = check_xsaveopt_layout(harness, native, lifted, mxcsr_mask)
         opt_controls = check_xsaveopt_controls(mxcsr_mask, deprecates_cs_ds)
-        compacted = check_compacted_xrstor(harness, native, lifted, altered, mxcsr_mask, deprecates_cs_ds)
+        compacted = check_compacted_xrstor(
+            harness, native, compacted_lifted, compacted_altered, mxcsr_mask, deprecates_cs_ds
+        )
 
         # Native comparison keeps active x87/SSE payloads: a flipped FCW, ST0 or XMM0 byte must fail, while an
         # initialized component carrying extra host bytes must still pass.
@@ -1971,8 +2002,15 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
         Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.R8)),
         Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)),
         ret_ins)))
-    # MXCSR is defined by a restore selecting SSE (RFBM[1]); an x87-only save stores no MXCSR, and
-    # compacted XRSTOR with RFBM=4 (AVX only) leaves MXCSR unchanged.
+    # Default standard-only XRSTOR defines MXCSR when RFBM selects SSE or AVX;
+    # opt-in --compacted-xrstor requires RFBM[1] (SSE) because compacted RFBM=4 leaves MXCSR unchanged.
+    alt_accept.append(("xrstor_avx_vzeroupper_xsaveopt64_avx", (
+        mov_eax_4,
+        xor_edx,
+        Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+        Instruction.create(Code.VEX_VZEROUPPER),
+        Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)),
+        ret_ins)))
     alt_accept.append(("xrstor_sse_vzeroupper_xsaveopt64_avx", (
         mov_eax_2,
         xor_edx,
@@ -1988,11 +2026,12 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
         Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)),
         ret_ins)))
     alt_expected = {
-        "xrstor_r9_saved_rdx": "op_xrstor(state, r9, rax, rdx, true);",
+        "xrstor_r9_saved_rdx": "op_xrstor(state, r9, rax, rdx, true, false);",
         "xrstor3_vzeroupper_xsave7": "op_vzeroupper(state);",
         "xrstor_xsavec64": "op_xsavec(state, r8, rax, rdx, true);",
-        "xsavec_then_xrstor_same_buffer": "op_xrstor(state, r8, rax, rdx, true);",
+        "xsavec_then_xrstor_same_buffer": "op_xrstor(state, r8, rax, rdx, true, false);",
         "xrstor_xsaveopt64": "op_xsaveopt(state, r8, rax, rdx, true);",
+        "xrstor_avx_vzeroupper_xsaveopt64_avx": "op_xsaveopt(state, r8, rax, rdx, true);",
         "xrstor_sse_vzeroupper_xsaveopt64_avx": "op_xsaveopt(state, r8, rax, rdx, true);",
         "xrstor_x87_xsaveopt64_x87": "op_xsaveopt(state, r8, rax, rdx, true);",
         "vmovdqa_ymm_roundtrip": "load256(rcx, true)",
@@ -2020,7 +2059,16 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
             Instruction.create(Code.VEX_VZEROUPPER),
             Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins)),
     ):
-        src, count = lift_code(label, 0x1000, _encode_seq(*seq), entry_state="canonical")
+        raw = _encode_seq(*seq)
+        src_def, count_def = lift_code(label, 0x1000, raw)
+        assert count_def == len(seq) and "Entry-state profile: defined" in src_def, label
+        try:
+            lift_code(label, 0x1000, raw, compacted_xrstor=True)
+        except ValueError as exc:
+            assert "stores MXCSR before any restore defined it" in str(exc), exc
+        else:
+            raise AssertionError(f"{label}: compacted_xrstor=True unexpectedly accepted under defined profile")
+        src, count = lift_code(label, 0x1000, raw, entry_state="canonical", compacted_xrstor=True)
         assert count == len(seq) and "Entry-state profile: canonical" in src, label
 
     # Also verify runtime #GP for bounded mask contract (EDX != 0 / EAX & ~7 != 0)
@@ -2211,21 +2259,23 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
             else:
                 raise AssertionError(f"{label}: PE translate accepted rejected patch")
 
-    for path, export_name in (
-        (original_path, "op_xsave_only"),
-        (original_path, "op_xsave64_only"),
-        (original_path, "op_xrstor64_avx_xsaveopt64_avx"),
-        (altered_path, "op_xrstor64_mask_sse"),
+    for path, export_name, compacted_opt in (
+        (original_path, "op_xsave_only", False),
+        (original_path, "op_xsave64_only", False),
+        (original_path, "op_xrstor64_avx_xsaveopt64_avx", True),
+        (altered_path, "op_xrstor64_mask_sse", False),
     ):
         try:
-            translate(path, [export_name])
+            translate(path, [export_name], compacted_xrstor=compacted_opt)
         except ValueError as exc:
             if "requires explicit --entry-state canonical" not in str(exc):
                 raise AssertionError(f"{export_name}: unexpected error {exc!r}") from exc
         else:
             raise AssertionError(f"{export_name}: default profile unexpectedly accepted uninitialized entry save")
 
-    canon_pe_src, _ = translate(original_path, list(CANONICAL_EXPORTS), entry_state="canonical")
+    def_avx_src, _ = translate(original_path, ["op_xrstor64_avx_xsaveopt64_avx"])
+    assert "Entry-state profile: defined" in def_avx_src
+    canon_pe_src, _ = translate(original_path, list(CANONICAL_EXPORTS), entry_state="canonical", compacted_xrstor=True)
     assert "Entry-state profile: canonical" in canon_pe_src
     canon_alt_src, _ = translate(altered_path, ["op_xrstor64_mask_sse"], entry_state="canonical")
     assert "Entry-state profile: canonical" in canon_alt_src
@@ -2237,6 +2287,8 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
 
 
 if __name__ == "__main__":
-    orig, lifted, alt, canonical, canonical_alt, native_alt = (Path(p) for p in sys.argv[1:7])
+    orig, lifted, alt, canonical, canonical_alt, native_alt, compacted, compacted_alt = (
+        Path(p) for p in sys.argv[1:9]
+    )
     check_alt_encodings_and_rejections(orig, native_alt)
-    check_differential(orig, lifted, alt, canonical, canonical_alt, native_alt)
+    check_differential(orig, lifted, alt, canonical, canonical_alt, native_alt, compacted, compacted_alt)
