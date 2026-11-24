@@ -67,9 +67,11 @@ def strip_header(code):
 # Checked offline against the input signatures of every readable vertex program of one title's shader archive
 # that starts with the call: each record's register and mask match a signature input (the mask is the read
 # mask; the count reaches its highest component), the first VGPR is v4 and each next record is 4 VGPRs on.
-# Programs without the call have no records. Any other header size or record kind is refused.
+# Programs without the call have no records. The header's u32 at +0x1d8 holds the record count.
+# Any other header size, record kind or count is refused.
 FETCH_CALL = 0xbe842104  # s_swappc_b64 s[4:5], s[4:5]
-FETCH_HEADER_BASE, FETCH_RECORDS, FETCH_KIND = 0x2f8, 0x138, 6
+FETCH_HEADER_BASE, FETCH_RECORDS, FETCH_KIND, FETCH_COUNT = 0x2f8, 0x138, 6, 0x1d8
+FETCH_SLOTS = 8  # vertex-buffer slots the stand-in binds (D3D12_VERTEX_BUFFER_VIEW vb[8])
 # DXGI format -> (BUF_FMT name in FETCH_FORMATS, bytes per element).
 FETCH_DXGI = {2: ('BUF_FMT_32_32_32_32_FLOAT', 16), 6: ('BUF_FMT_32_32_32_FLOAT', 12), 16: ('BUF_FMT_32_32_FLOAT', 8),
               41: ('BUF_FMT_32_FLOAT', 4), 28: ('BUF_FMT_8_8_8_8_UNORM', 4), 49: ('BUF_FMT_8_8_UNORM', 2),
@@ -155,14 +157,17 @@ def stream_fetch(vs_container, layout_text):
             raise Unsupported('input layout format %d' % e['format'])
         if e['cls'] != 0 or e['step'] != 0:
             raise Unsupported('per-instance input layout element')
-        if e['slot'] > 15:
-            raise Unsupported('input layout slot %d' % e['slot'])
+        if e['slot'] >= FETCH_SLOTS:
+            raise Unsupported('input layout slot %d: the stand-in binds vertex-buffer slots 0 to %d' % (e['slot'], FETCH_SLOTS - 1))
         if e['offset'] is None:
             raise Unsupported('appended input layout element after an element of unknown or unaligned size')
         fetch.append(dict(e, vgpr=vgpr, count=count))
         at += 5
     if not fetch:
         raise Unsupported('vertex stage calls a fetch routine and its container lists no fetched inputs')
+    stored = struct.unpack_from('<I', image, FETCH_COUNT)[0]
+    if stored != len(fetch):
+        raise Unsupported('vertex fetch header counts %d records, the table holds %d' % (stored, len(fetch)))
     taken = [r for e in fetch for r in range(e['vgpr'], e['vgpr'] + e['count'])]
     if len(taken) != len(set(taken)):
         raise Unsupported('vertex fetch records overlap')

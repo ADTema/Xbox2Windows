@@ -2,16 +2,21 @@
 
 Source-built gfx1013 code only. The vertex shader begins with s_swappc_b64 s[4:5], s[4:5], then s_inst_prefetch, and
 exports pos0 from v4-v7 and param0 from v8-v10. Its container lists two fetch records (input register 0 -> v4,
-register 1 -> v8, three components each) and its input signature names them POSITION and TEXCOORD. The stream's
-input layout declares TEXCOORD at offset 0 and POSITION after it (D3D12_APPEND_ALIGNED_ELEMENT), both float3.
+register 1 -> v8, three components each; the header counts 2) and its input signature names them POSITION and
+TEXCOORD. The stream's input layout declares TEXCOORD in slot 0 and POSITION in slot 1
+(D3D12_APPEND_ALIGNED_ELEMENT), both float3.
 
-Cases on an 8x4 target cleared to blue with a red pixel shader:
-  fetch:    POSITION covers pixels [1, 3) x [1, 3); exactly those are red.
-  swapped:  the generated fetch with the two records' registers exchanged (a mutation) draws the TEXCOORD
-            rectangle [0, 4) x [0, 1) instead, so the exact check above fails.
+Two draws on an 8x4 target cleared to blue with a red pixel shader (tests/startup_stream_draw.cpp): one from start
+vertex 3, one indexed (indices 4-9, base vertex 5), so the fetch index must include the base-vertex entry value.
+  fetch:     POSITION covers pixels [1, 3) x [1, 3) and column 0; exactly those are red.
+  swapped:   the generated fetch with the two records' registers exchanged (a mutation) draws the TEXCOORD
+             rectangles, row 0 of [0, 4) and pixel (3, 3), so the exact check above fails.
+  one slot:  the generated fetch reading both elements from slot 0 (a mutation) also draws the TEXCOORD rectangles.
   no layout: the same stream without the INPUT_LAYOUT subobject is refused by the translator and not drawn.
   unwritten: a vertex shader that exports v12, which no record fetches, is refused.
-  z only:   a record that reads only z (mask 0x4) with count 3 translates; with count 2 it is refused.
+  z only:    a record that reads only z (mask 0x4) with count 3 translates; with count 2 it is refused.
+  refused:   a fetched element in vertex-buffer slot 8 (the stand-in binds 0 to 7), and a header record count that
+             disagrees with the table.
 """
 import os
 from pathlib import Path
@@ -29,7 +34,8 @@ RED, BLUE = bytes((255, 0, 0, 255)), bytes((0, 0, 255, 255))
 SWAPPC, PREFETCH, WAIT_VM, ENDPGM = 0xbe842104, 0xbfa00003, 0xbf8c3f70, 0xbf810000
 RECORDS = [(6, 0, 0x7, 4, 2), (6, 1, 0x7, 8, 2)]
 INPUTS = [("POSITION", 0, 0x7), ("TEXCOORD", 1, 0x7)]
-LAYOUT_LINE = "x2w-draw stream input layout: 2 elements (format/slot/offset/class) 6/0/0/0 6/0/4294967295/0"
+LAYOUT_TEXT = "ia1 2\nTEXCOORD 0 6 0 0 0 0\nPOSITION 0 6 1 4294967295 0 0\n"
+LAYOUT_LINE = "x2w-draw stream input layout: 2 elements (format/slot/offset/class) 6/0/0/0 6/1/4294967295/0"
 
 
 def vertex(param_first=8, records=RECORDS):
@@ -39,7 +45,7 @@ def vertex(param_first=8, records=RECORDS):
     return fetch_container(words, records)
 
 
-def fetch_container(words, records):
+def fetch_container(words, records, header_count=None):
     """A vertex container with an FSSM header of 0x2f8 bytes (fetch records at +0x138) and an ISG1 part."""
     code = struct.pack("<%dI" % len(words), *words)
     base = 0x2f8
@@ -51,6 +57,7 @@ def fetch_container(words, records):
     struct.pack_into("<Q", image, 232, len(image))
     for i, record in enumerate(records):
         image[0x138 + 5 * i:0x13d + 5 * i] = bytes(record)
+    struct.pack_into("<I", image, 0x1d8, len(records) if header_count is None else header_count)
     image[base + 40:base + 40 + len(code)] = code
     padding = (len(image) - base - 40 - len(code)) // 4
     image[base + 40 + len(code):] = struct.pack("<I", 0xbf9f0000) * padding
@@ -85,8 +92,8 @@ def first_difference(actual, want):
     return None
 
 
-FETCHED = expected(lambda x, y: 1 <= x < 3 and 1 <= y < 3)
-SWAPPED = expected(lambda x, y: 0 <= x < 4 and y < 1)
+FETCHED = expected(lambda x, y: (1 <= x < 3 and 1 <= y < 3) or x == 0)
+SWAPPED = expected(lambda x, y: (0 <= x < 4 and y < 1) or (x, y) == (3, 3))
 
 
 class Run:
@@ -121,7 +128,7 @@ def check(directory, consumer, backend):
     run = Run(directory / "fetch", consumer, backend, vertex(), True)
     name = run.cache / ("req_%016x" % run.key)
     layout = (name.parent / (name.name + ".ia")).read_bytes()
-    assert layout == b"ia1 2\nTEXCOORD 0 6 0 0 0 0\nPOSITION 0 6 0 4294967295 0 0\n", layout
+    assert layout == LAYOUT_TEXT.encode(), layout
     assert run.key == gfx2hlsl.pipeline_key(run.vs.read_bytes(), (run.vs.parent / "ps").read_bytes(),
                                             run.root.read_bytes(), layout), "request key does not include the layout"
     status = gfx2hlsl.translate_request(str(run.cache), run.key)
@@ -130,8 +137,8 @@ def check(directory, consumer, backend):
     if backend == "hardware" and result.returncode == 77:
         print("No D3D12 feature-level 12 hardware adapter")
         return 77
-    if result.returncode or "-> drawn;" not in result.stderr:
-        raise RuntimeError(f"fetch draw failed on {backend}: {result.returncode}\n{result.stderr}")
+    if result.returncode or result.stderr.count("-> drawn;") < 2:
+        raise RuntimeError(f"fetch draws failed on {backend}: {result.returncode}\n{result.stderr}")
     if LAYOUT_LINE not in result.stderr:
         raise AssertionError("missing layout diagnostic:\n" + result.stderr)
     difference = first_difference(run.output.read_bytes(), FETCHED)
@@ -139,30 +146,37 @@ def check(directory, consumer, backend):
         raise AssertionError(f"fetch: {difference}")
     print(f"{backend} fetch: all {WIDTH * HEIGHT} pixels exact")
 
-    # swapped: the same request translated with the records' registers exchanged must not pass.
-    swapped = Run(directory / "swapped", consumer, backend, vertex(), True)
-    original = gfx2hlsl.stream_fetch
-
-    def exchange(*args):
-        fetch = original(*args)
+    # Mutations of the generated fetch: each must fail the exact check and draw the TEXCOORD rectangles instead.
+    def exchange(fetch):
         fetch[0]["vgpr"], fetch[1]["vgpr"] = fetch[1]["vgpr"], fetch[0]["vgpr"]
-        return fetch
-    gfx2hlsl.stream_fetch = exchange
-    try:
-        status = gfx2hlsl.translate_request(str(swapped.cache), swapped.key)
-    finally:
-        gfx2hlsl.stream_fetch = original
-    assert status == "ok", status
-    result = swapped.draw()
-    if result.returncode or "-> drawn;" not in result.stderr:
-        raise RuntimeError(f"swapped draw failed on {backend}: {result.returncode}\n{result.stderr}")
-    actual = swapped.output.read_bytes()
-    if not first_difference(actual, FETCHED):
-        raise AssertionError("swapped: the mutated fetch passed the exact check")
-    difference = first_difference(actual, SWAPPED)
-    if difference:
-        raise AssertionError(f"swapped: {difference}")
-    print(f"{backend} swapped registers: the exact check fails; the TEXCOORD rectangle is drawn instead")
+
+    def one_slot(fetch):
+        for element in fetch:
+            element["slot"] = 0
+    for label, mutate in (("swapped registers", exchange), ("one slot", one_slot)):
+        mutated = Run(directory / label.replace(" ", "_"), consumer, backend, vertex(), True)
+        original = gfx2hlsl.stream_fetch
+
+        def patched(*args):
+            fetch = original(*args)
+            mutate(fetch)
+            return fetch
+        gfx2hlsl.stream_fetch = patched
+        try:
+            status = gfx2hlsl.translate_request(str(mutated.cache), mutated.key)
+        finally:
+            gfx2hlsl.stream_fetch = original
+        assert status == "ok", status
+        result = mutated.draw()
+        if result.returncode or "-> drawn;" not in result.stderr:
+            raise RuntimeError(f"{label} draw failed on {backend}: {result.returncode}\n{result.stderr}")
+        actual = mutated.output.read_bytes()
+        if not first_difference(actual, FETCHED):
+            raise AssertionError(f"{label}: the mutated fetch passed the exact check")
+        difference = first_difference(actual, SWAPPED)
+        if difference:
+            raise AssertionError(f"{label}: {difference}")
+        print(f"{backend} {label}: the exact check fails; the TEXCOORD rectangles are drawn instead")
 
     # no layout: refused by the translator, so the runtime has no translation and draws nothing.
     bare = Run(directory / "bare", consumer, backend, vertex(), False)
@@ -187,6 +201,20 @@ def check(directory, consumer, backend):
         status = gfx2hlsl.translate_request(str(z_only.cache), z_only.key)
         assert status == want, status
     print(f"{backend} z-only record: count 3 translates, count 2 refused")
+
+    # refused: slot 8 is never bound by the stand-in; the header's record count must match the table.
+    slot8 = LAYOUT_TEXT.replace("POSITION 0 6 1 ", "POSITION 0 6 8 ")
+    for container, text, want in (
+            (vertex(), slot8, "input layout slot 8: the stand-in binds vertex-buffer slots 0 to 7"),
+            (fetch_container([SWAPPC, ENDPGM], RECORDS, header_count=3), LAYOUT_TEXT,
+             "vertex fetch header counts 3 records, the table holds 2")):
+        try:
+            gfx2hlsl.stream_fetch(container, text)
+        except gfx2hlsl.Unsupported as reason:
+            assert str(reason) == want, reason
+        else:
+            raise AssertionError("accepted: " + want)
+    print(f"{backend} slot 8 and a mismatched record count: refused")
     return 0
 
 

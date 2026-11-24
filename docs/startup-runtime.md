@@ -64,10 +64,11 @@ archive (local files only, not in the repository). 628 programs start with the c
 that input's read mask. Records follow register order. The first record starts at v4, and each next one starts 4
 VGPRs later. The count reaches the highest component read: five records read only z or only w (mask 0x4 with
 count 3, mask 0x8 with count 4), and all components up to that one are loaded. None of the 1,355 programs without
-the call has a record.
+the call has a record. In all 1,983 programs the header's u32 at +0x1d8 equals the number of records.
 
-Refused: a header of any other size, a record of another kind, a mask whose highest bit is not its count, and
-overlapping registers. A fetched element is also refused when it is per-instance, has an unknown format, or is
+Refused: a header of any other size, a record of another kind, a mask whose highest bit is not its count,
+overlapping registers, and a record count that disagrees with +0x1d8. A fetched element is also refused when it is
+per-instance, sits in a vertex-buffer slot above 7 (the stand-in binds slots 0 to 7), has an unknown format, or is
 appended (`D3D12_APPEND_ALIGNED_ELEMENT`) after an element of unknown size or one that ends off a 4-byte boundary,
 because the packing there is not measured. Elements that no record fetches are not checked. An unreadable layout
 is logged, and the translation is requested without it. Components a format lacks read
@@ -79,11 +80,13 @@ every input read as zero. The draw then had zero area and wrote no pixel. Progra
 as before.
 
 Run `ctest --preset release --no-tests=error -R "^startup_stream_fetch_(warp|hardware)$" -V` after building
-`startup_stream_consumer`. The source-built shader declares POSITION and TEXCOORD, the stream lists them in the
-other order, and POSITION uses `D3D12_APPEND_ALIGNED_ELEMENT`. On an 8×4 target exactly the 2×2 position
-rectangle is drawn. The same translation with the two records' registers exchanged draws the TEXCOORD
-rectangle instead and fails the exact check. Without the layout the shader is refused and not drawn. A variant
-that exports an unfetched register is refused.
+`startup_stream_consumer`. The source-built shader declares POSITION and TEXCOORD. The stream lists them in the
+other order, TEXCOORD in slot 0 and POSITION in slot 1 at `D3D12_APPEND_ALIGNED_ELEMENT`. Two draws go to an 8×4
+target: one from start vertex 3, and one indexed with indices 4 to 9 and base vertex 5. Exactly the two position
+rectangles are drawn. Two mutations of the generated fetch must fail the exact check and draw the TEXCOORD
+rectangles instead: the records' registers exchanged, and both elements read from slot 0. Leaving the base vertex
+out of the fetch index also fails it. Refused cases: no layout (not drawn either), an export of an unfetched
+register, a z-only record whose count stops below z, an element in slot 8, and a mismatched record count.
 
 The pixel stage still reads attribute N from vertex output N. It does not yet pair the two by semantic, so a
 pixel shader that reads only some of the vertex outputs can receive the wrong one. That is a separate problem.

@@ -34,15 +34,16 @@ struct alignas(8) Layout {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
     D3D12_INPUT_LAYOUT_DESC desc;
 };
-// X2W_TEST_INPUT_LAYOUT: the stream also declares two per-vertex float3 elements in slot 0, in the opposite
-// order of the vertex shader's input signature, the second at D3D12_APPEND_ALIGNED_ELEMENT (startup_stream_fetch_check.py).
+// X2W_TEST_INPUT_LAYOUT: the stream also declares two per-vertex float3 elements, TEXCOORD in slot 0 and POSITION in
+// slot 1 at D3D12_APPEND_ALIGNED_ELEMENT, in the opposite order of the vertex shader's input signature
+// (startup_stream_fetch_check.py).
 struct LayoutStream {
     Layout layout;
     Stream stream;
 };
 static const D3D12_INPUT_ELEMENT_DESC layout_elements[] = {
     {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-    {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
 };
 
 namespace {
