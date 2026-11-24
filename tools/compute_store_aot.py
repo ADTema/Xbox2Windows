@@ -77,7 +77,7 @@ ALU_EXPRESSION_LIMIT = 1024
 # linear (non-swizzled) image of the listed format. The translator checks where the eight words were
 # loaded from, not the 9-bit GFX10 format, type, swizzle, level or size fields inside them; the two
 # 16-byte descriptor slots are bound to t0. Value: (HLSL texel type, channel count).
-IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4)}
+IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4), "R8G8B8A8_UINT": ("uint4", 4)}
 # Template operands are the old LDS word and the source VGPR, both HLSL uints.
 LDS_RMW = {
     "ds_add_u32": "({0} + {1})",
@@ -1155,7 +1155,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                             raise ValueError("D16 buffer read expression is too large")
                     word = ("alu", field)
                 loading[reg] = word
-        elif m := re.fullmatch(r"image_load(_mip)? (v\d+|v\[\d+:\d+\]), (v\d+|v\[\d+:\d+\]), "
+        elif m := re.fullmatch(r"image_load(_mip)?(?:_pck(?:_sgn)?)? (v\d+|v\[\d+:\d+\]), (v\d+|v\[\d+:\d+\]), "
                                r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?( a16)?", line):
             # The non-sampler 2D address is (x, y[, mip]). A16 packs x and y into the first
             # dword and takes the mip from the low half of the second dword when present.
@@ -1175,6 +1175,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or not 0 < dmask < (1 << IMAGE_FORMATS[image_format][1])
                     or any(first + index > 255 or first + index in loading for index in range(count))):
                 raise ValueError("Unsupported image load target")
+            opcode = line.split(" ", 1)[0]
+            if ("_pck" in opcode) != (image_format == "R8G8B8A8_UINT"):
+                raise ValueError("Image load opcode does not match the image format")
             if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
                 raise ValueError("Unresolved image descriptor")
             if tuple(scalar.get(base + index) for index in range(8)) != tuple(
@@ -1196,6 +1199,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             name = f"image_load_{image_step_count}"
             image_step_count += 1
             staged_steps.append((None, f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});"))
+            if opcode.endswith("_sgn"):
+                # The UINT SRV exposes raw bytes. Extend each byte from bit 7 to a full VGPR.
+                staged_steps.append((None, f"    {name} = asuint(asint({name} << 24u) >> 24u);"))
             for index, component in enumerate(channels):
                 reg = first + index
                 vector.pop(reg, None)
