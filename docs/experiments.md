@@ -4856,6 +4856,20 @@ A lane taken modulo 64 is no control: HLSL masks a 32-bit shift count to five bi
 
 Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_mbcnt_(warp|hardware)$' -V`.
 
+#### Active lane count of a full wave
+
+`s_bcnt1_i32_b32 sD, exec_lo` writes the number of set bits in `exec_lo` to `sD` and sets `SCC` to `sD != 0` (`SCC` is unread in this subset, and instructions that read `SCC` are refused). Outside a guarded region, `exec` is the whole wave, so the translator folds `sD` to a known scalar word: for a group of at most 32 threads (`dims[0] * dims[1] * dims[2] <= 32`), the result is the group thread count; for a larger group, only `wave_size=32` with a thread count that is a multiple of 32 is accepted, and the result is `32`. Groups larger than 32 without `wave_size=32`, group sizes not divisible by 32 above 32, uses inside a guarded region (`s_and_saveexec_b32` through `exec` restore), any source other than `exec_lo` (`exec_hi`, `exec`, `vcc_lo`), and destinations outside `s0..s105` (or pending loads) are refused.
+
+The fixture runs one group of 64 threads with `wave_size=32`, where each thread stores `tid.x * 64 + s4` (all 64 words unique). The readback compares all 320 words against the Python reference. Reference controls must fail for:
+
+- the count off by one (`33`, word 0);
+- the group size used instead of `32` (`64`, word 0);
+- a changed sentinel past the group (word 64).
+
+The LLVM 15 round trip assembles and disassembles the fixture as for the other forms.
+
+Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_bcnt_exec_(warp|hardware)$' -V`.
+
 ### Scalar ALU on known words
 
 The store profile also accepts these scalar 32-bit operations. Both sources are known words: an SGPR that holds one, an integer inline constant or a 32-bit literal.
