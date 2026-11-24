@@ -10,7 +10,8 @@ without writing past the destination: one byte too little capacity and a truncat
 
 The distance bound is checked on bare deflate data, so neither the zlib header nor the Adler-32
 check can reject it: after four literals, a match at distance 4 decodes and the same block with
-distance 5 is rejected before the match copies anything.
+distance 5 is rejected before the match copies anything. A hand-built dynamic block with a single
+1-bit distance code, the one incomplete code set zlib accepts, must decode with and without the table.
 
 The decoder looks Huffman codes up to 10 bits long up in a table. A differential case decodes 900
 seeded random streams (sources, levels, strategies and flushes mixed; some with codes longer than the
@@ -92,6 +93,34 @@ def fixed_match_block(literals, distance_code, extra_bits, extra_value):
     bits.put(extra_value, extra_bits)
     bits.code(256 - 256, 7)
     return bits.to_bytes()
+
+
+def single_distance_block():
+    # Bare deflate data, one final dynamic block whose only distance code is distance 1 with a 1-bit
+    # code: the one incomplete set zlib accepts. Literals A and B, end of block and length 3 have
+    # 2-bit codes 00, 01, 10, 11; eight copies of A plus a length-3 match, then 16 B's.
+    bits = Bits()
+    bits.put(1, 1)
+    bits.put(2, 2)
+    bits.put(258 - 257, 5)  # HLIT: symbols 0..257
+    bits.put(0, 5)  # HDIST: one distance code
+    bits.put(18 - 4, 4)  # HCLEN: code-length codes up to symbol 1 in the transmission order
+    order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1]
+    for symbol in order:
+        bits.put(2 if symbol in (1, 2, 17, 18) else 0, 3)
+    cl = {1: 0, 2: 1, 17: 2, 18: 3}  # code-length codes, all 2 bits
+    for symbol, extra, count in [(18, 65 - 11, 7), (2, 0, 0), (2, 0, 0), (18, 138 - 11, 7), (18, 51 - 11, 7),
+                                 (2, 0, 0), (2, 0, 0), (1, 0, 0)]:
+        bits.code(cl[symbol], 2)
+        bits.put(extra, count)
+    for _ in range(8):
+        bits.code(0, 2)  # A
+        bits.code(3, 2)  # length 3
+        bits.code(0, 1)  # distance 1
+    for _ in range(16):
+        bits.code(1, 2)  # B
+    bits.code(2, 2)  # end of block
+    return bits.to_bytes(), b"AAAA" * 8 + b"B" * 16
 
 
 def reference(stream, mode):
@@ -331,9 +360,15 @@ def main(probe, bitwise, faulty):
         expect_decoded(probe, work, "raw_distance_4", fixed_match_block(b"ABCD", 3, 0, 0), b"ABCDABC", 64, "raw")
         expect_rejected(probe, work, "raw_distance_5", fixed_match_block(b"ABCD", 4, 1, 0), 64, "raw", 4)
 
+        # A distance code set with a single 1-bit code is incomplete; zlib accepts it, so the table and
+        # the bit-at-a-time loop must both decode it.
+        single, single_data = single_distance_block()
+        expect_decoded(probe, work, "raw_single_distance", single, single_data, 64, "raw")
+        expect_decoded(bitwise, work, "raw_single_distance_bw", single, single_data, 64, "raw")
+
         cases, reference = expect_differential(probe, bitwise, work, rng)
         expect_faulty_caught(faulty, work, cases, reference)
-    print("inflate.h matches zlib %s in 8 cases and rejects 3 controls" % zlib.ZLIB_RUNTIME_VERSION)
+    print("inflate.h matches zlib %s in 10 cases and rejects 3 controls" % zlib.ZLIB_RUNTIME_VERSION)
 
 
 if __name__ == "__main__":
