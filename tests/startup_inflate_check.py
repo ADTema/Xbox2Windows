@@ -208,11 +208,14 @@ def expected_status(stream, capacity):
     return OK, out
 
 
-def run_batch(probe, work, name, cases):
+def run_batch(probe, work, name, cases, overrun=False):
+    # overrun: a write past a destination (probe exit 3) returns the probe's report instead of failing.
     records, results = work / (name + ".records"), work / (name + ".results")
     records.write_bytes(b"".join(struct.pack("<II", capacity, len(stream)) + stream for stream, capacity in cases))
     result = subprocess.run([str(probe), "batch", str(records), str(results)], capture_output=True, text=True,
                             timeout=60)
+    if overrun and result.returncode == 3:
+        return result.stdout.strip()
     assert result.returncode == 0, "%s: exit %d: %s%s" % (name, result.returncode, result.stdout, result.stderr)
     data, at, decoded = results.read_bytes(), 0, []
     for _ in cases:
@@ -377,8 +380,17 @@ def expect_faulty_caught(faulty, work, cases, reference):
     print("faulty-table control: %d of %d random cases differ from bit-at-a-time decoding, caught" % (wrong, len(cases)))
 
 
-def main(probe, bitwise, faulty):
+def expect_margin_caught(faulty, work, cases):
+    # The fast loop entered one output byte short of the longest match: a 258-byte match 257 bytes before
+    # the capacity writes past the destination.
+    got = run_batch(faulty, work, "boundary_margin", cases, overrun=True)
+    assert isinstance(got, str), "the faulty-margin control decoded every boundary case within its destination"
+    print("faulty-margin control: %s, caught" % got)
+
+
+def main(probe, bitwise, faulty, faulty_margin):
     probe, bitwise, faulty = Path(probe).resolve(), Path(bitwise).resolve(), Path(faulty).resolve()
+    faulty_margin = Path(faulty_margin).resolve()
     rng = random.Random(1149)
     text = corpus(rng, 96 * 1024)
     noise = rng.randbytes(70000)
@@ -426,12 +438,13 @@ def main(probe, bitwise, faulty):
         cases, reference = expect_differential(probe, bitwise, work, rng)
         expect_faulty_caught(faulty, work, cases, reference)
         # Its own seed, so the random case keeps its streams.
-        expect_boundaries(probe, bitwise, work, random.Random(1149 + 1))
+        cases, _ = expect_boundaries(probe, bitwise, work, random.Random(1149 + 1))
+        expect_margin_caught(faulty_margin, work, cases)
     print("inflate.h matches zlib %s in 8 cases and rejects 3 controls" % zlib.ZLIB_RUNTIME_VERSION)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
+    if len(sys.argv) != 5:
         sys.exit("usage: startup_inflate_check.py <startup_inflate_probe.exe> <startup_inflate_probe_bitwise.exe> "
-                 "<startup_inflate_probe_faulty.exe>")
+                 "<startup_inflate_probe_faulty.exe> <startup_inflate_probe_faulty_margin.exe>")
     main(*sys.argv[1:])

@@ -1,7 +1,8 @@
 // Experimental (docs/startup-runtime.md): a small zlib (RFC 1950) / deflate (RFC 1951)
 // decoder for the DirectStorage stand-in. Written from the RFCs. Huffman codes up to fast_bits long
 // decode with one table lookup; longer codes and the last byte of input take canonical-code decoding
-// one bit at a time.
+// one bit at a time. While 8 input bytes and 258 output bytes remain, codes() decodes whole symbols
+// from a 64-bit bit buffer without per-symbol bounds checks.
 #pragma once
 
 #include <cstddef>
@@ -16,6 +17,11 @@
 namespace x2w_inflate {
 
 constexpr int fast_bits = X2W_INFLATE_FAST_BITS;
+#ifndef X2W_INFLATE_FAULTY_MARGIN
+constexpr std::size_t fast_out_margin = 258;  // the longest match
+#else  // negative control for tests/startup_inflate_check.py: one byte short of the longest match
+constexpr std::size_t fast_out_margin = 257;
+#endif
 
 struct Stream {
     const unsigned char* in;
@@ -139,6 +145,53 @@ inline bool codes(Stream& s, const Huffman& lencode, const Huffman& distcode) no
     static const std::uint8_t dist_extra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
                                                 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
     for (;;) {
+        // While 8 input bytes and the longest match of output remain, one 8-byte load refills a 64-bit
+        // buffer to at least 56 bits, more than a symbol with its extra bits takes (2 * fast_bits + 18),
+        // and no symbol can overflow the output. This loop takes only whole valid symbols that both
+        // tables decode; anything else (end of block, a longer code, an invalid symbol or distance) is
+        // left unconsumed for the careful loop below. On exit the whole bytes pulled in but not consumed
+        // go back to in_pos, so bit_count is below 8 again as decode(), stored() and the trailer expect.
+        if (fast_bits > 0 && s.in_size - s.in_pos >= 8 && s.out_size - s.out_pos >= fast_out_margin) {
+            constexpr std::uint64_t mask = (std::uint64_t{1} << fast_bits) - 1;
+            std::uint64_t buffer = s.bit_buffer;
+            int count = s.bit_count;
+            std::size_t in_pos = s.in_pos, out_pos = s.out_pos;
+            while (s.in_size - in_pos >= 8 && s.out_size - out_pos >= fast_out_margin) {
+                std::uint64_t next;
+                std::memcpy(&next, s.in + in_pos, 8);  // x64: little endian, first input bit lowest
+                buffer |= next << count;
+                in_pos += (63 - count) >> 3;
+                count |= 56;
+                const int entry = lencode.fast[buffer & mask];
+                if (!entry) break;
+                int used = entry & 15, symbol = entry >> 4;
+                if (symbol < 256) {
+                    s.out[out_pos++] = static_cast<unsigned char>(symbol);
+                    buffer >>= used;
+                    count -= used;
+                    continue;
+                }
+                symbol -= 257;
+                if (symbol < 0 || symbol >= 29) break;
+                const std::size_t length = length_base[symbol] + ((buffer >> used) & ((1u << length_extra[symbol]) - 1));
+                used += length_extra[symbol];
+                const int dist_entry = distcode.fast[(buffer >> used) & mask];
+                symbol = dist_entry >> 4;
+                if (!dist_entry || symbol >= 30) break;
+                used += dist_entry & 15;
+                const std::size_t distance = dist_base[symbol] + ((buffer >> used) & ((1u << dist_extra[symbol]) - 1));
+                used += dist_extra[symbol];
+                if (distance > out_pos) break;
+                buffer >>= used;
+                count -= used;
+                copy_match(s.out + out_pos, distance, length);
+                out_pos += length;
+            }
+            s.in_pos = in_pos - (count >> 3);
+            s.bit_count = count & 7;
+            s.bit_buffer = static_cast<std::uint32_t>(buffer) & ((1u << s.bit_count) - 1);
+            s.out_pos = out_pos;
+        }
         int symbol = decode(s, lencode);
         if (symbol < 0) return false;
         if (symbol < 256) {

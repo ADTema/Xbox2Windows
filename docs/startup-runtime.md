@@ -347,8 +347,17 @@ flush; stored blocks of 0, 1 and 300 bytes at each of the eight bit positions af
 one stored block of 65535 bytes. Status, size and bytes must equal the bit-at-a-time build and
 CPython's zlib. The exception is a truncated stored block that would not fit either: the decoder
 checks the block's length against the input first and reports `corrupt_stream` where zlib reports
-insufficient output (809 cases). The 16 guard bytes after each destination must stay intact. No GPU and
-no game files are needed:
+insufficient output (809 cases). The 16 guard bytes after each destination must stay intact, and
+each stream ends at a no-access page, so a read past the input faults.
+
+While at least 8 input bytes and 258 output bytes (the longest match) remain, the decoder takes whole
+symbols from a 64-bit bit buffer that one 8-byte load refills, with no per-symbol bounds check. It
+leaves anything else (end of block, codes longer than 10 bits, invalid symbols and distances) to the
+bit-at-a-time loop, and gives back the whole bytes it loaded but did not use, so that loop, stored
+blocks and the Adler-32 trailer start at the same bit position as before. The bit-at-a-time build
+does not have this loop. Its negative control is the probe built with `X2W_INFLATE_FAULTY_MARGIN`,
+which enters the loop one output byte short of the longest match; it writes past a destination in
+the boundary case. No GPU and no game files are needed:
 
 ```powershell
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V

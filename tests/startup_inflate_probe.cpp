@@ -11,8 +11,11 @@
 // usage: startup_inflate_probe batch <records> <results>
 // Runs inflate_zlib_ex on every record (u32 capacity, u32 size, size stream bytes, little endian)
 // and writes per record the status (u8), the reported size (u32) and that many output bytes. Prints
-// the record count, the output bytes of ok records and the time spent in the decoder.
+// the record count, the output bytes of ok records and the time spent in the decoder. Each stream ends
+// at a no-access page, so a read past the input faults.
 #include "startup_stubs/inflate.h"
+
+#include <windows.h>
 
 #include <chrono>
 #include <cstdint>
@@ -47,11 +50,21 @@ int batch(const char* records_path, const char* results_path)
         }
         const std::size_t capacity = u32(at), size = u32(at + 4);
         destination.assign(capacity + guard, 0xA5);
+        const std::size_t page = 4096, span = (size + page - 1) / page * page;
+        auto* const pages =
+            static_cast<unsigned char*>(VirtualAlloc(nullptr, span + page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        DWORD old_protect;
+        if (!pages || !VirtualProtect(pages + span, page, PAGE_NOACCESS, &old_protect)) {
+            std::fprintf(stderr, "cannot map record %zu\n", count);
+            return 2;
+        }
+        unsigned char* const input = pages + span - size;
+        if (size) std::memcpy(input, records.data() + at + 8, size);
         std::size_t produced = 0;
         const auto start = std::chrono::steady_clock::now();
-        const auto status =
-            x2w_inflate::inflate_zlib_ex(records.data() + at + 8, size, destination.data(), capacity, produced);
+        const auto status = x2w_inflate::inflate_zlib_ex(input, size, destination.data(), capacity, produced);
         spent += std::chrono::steady_clock::now() - start;
+        VirtualFree(pages, 0, MEM_RELEASE);
         at += 8 + size;
         for (std::size_t i = capacity; i < destination.size(); ++i) {
             if (destination[i] != 0xA5) {
