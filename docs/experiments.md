@@ -10848,6 +10848,30 @@ The [MASM fixture](../tests/cpu/switch_fsgsbase_rdpid.asm) exports 9 translated 
 
 Not covered by this experiment: host segment-base writes (`wrfsbase`/`wrgsbase`, which require an explicit isolation/restoration profile), cross-thread `FS_BASE`/`GS_BASE` migration, and title CPU code execution.
 
+## Render target binds with a single descriptor range
+
+`OMSetRenderTargets` (command-list slot 50) with `RTsSingleHandleToDescriptorRange` true used to be dropped without a
+message, which skipped every following draw on the list; `ClearRenderTargetView` (slot 52) ignored a render target
+view that the title had copied to another descriptor. The stand-in now expands a single range at the title's descriptor
+stride, resolves the clear through the descriptor's shadow record, and counts and logs every render target or depth handle
+that holds no view (`render target binds N (unresolved M)` in the `x2w-render totals` line). See
+[Render target binds and clears](startup-runtime.md#render-target-binds-and-clears).
+
+```powershell
+cmake --build --preset dev --target startup_rtv_bind
+ctest --preset dev --no-tests=error -R "^startup_rtv_bind_(warp|hardware)$" -V
+```
+
+### Measured results and open scope
+
+The fixture (`tests/startup_rtv_bind.cpp`) expects one accepted bind each for the array form, the single range with
+one handle, the single range with two handles and the two-handle array, and one unresolved handle each for a range that
+reaches an empty view and for an empty view alone, with no accepted bind. It then copies a view with
+`CopyDescriptorsSimple`, clears the copy red and requires target 0 to read back `ff0000ff`. It was compiled with
+MinGW (syntax only) and has not been run on a Windows desktop device. Not covered: a draw after a single-range bind
+(the fixture does not draw), and what a title does with a bind that stays refused for the other reasons (wrong
+kind, one read-only depth plane).
+
 ## VEX scalar comparison parity differential
 
 The [MASM fixture](../tests/cpu/vex_parity.asm) and [differential check](../tests/cpu/vex_parity.py) compare native, translated, and explicitly optimized DLLs. The 1,618 cases cover the four VEX scalar compare forms and parity consumers, including unordered inputs, signed zero, register and memory operands, control-flow joins, and memory-read failure controls. The check sets masked `MXCSR=0x1f80` around the comparison and restores the caller's state. It also requires the stale-parity and swapped-operand mutants to differ, and tests rejection when a path lacks a modeled parity definition.
@@ -10873,27 +10897,3 @@ Command-list slot 34 no longer sets a title root signature flagged `CBV_SRV_UAV_
 cmake --build --preset dev --target startup_stream_consumer startup_heap_indexed_root_check
 ctest --preset dev --no-tests=error -R "^startup_(heap_indexed_root.*|root_heap_(warp|hardware))$" -V
 ```
-
-## Render target binds with a single descriptor range
-
-`OMSetRenderTargets` (command-list slot 50) with `RTsSingleHandleToDescriptorRange` true used to be dropped without a
-message, which skipped every following draw on the list; `ClearRenderTargetView` (slot 52) ignored a render target
-view that the title had copied to another descriptor. The stand-in now expands a single range at the title's descriptor
-stride, resolves the clear through the descriptor's shadow record, and counts and logs every render target or depth handle
-that holds no view (`render target binds N (unresolved M)` in the `x2w-render totals` line). See
-[Render target binds and clears](startup-runtime.md#render-target-binds-and-clears).
-
-```powershell
-cmake --build --preset dev --target startup_rtv_bind
-ctest --preset dev --no-tests=error -R "^startup_rtv_bind_(warp|hardware)$" -V
-```
-
-### Measured results and open scope
-
-The fixture (`tests/startup_rtv_bind.cpp`) expects one accepted bind each for the array form, the single range with
-one handle, the single range with two handles and the two-handle array, and one unresolved handle each for a range that
-reaches an empty view and for an empty view alone, with no accepted bind. It then copies a view with
-`CopyDescriptorsSimple`, clears the copy red and requires target 0 to read back `ff0000ff`. It was compiled with
-MinGW (syntax only) and has not been run on a Windows desktop device. Not covered: a draw after a single-range bind
-(the fixture does not draw), and what a title does with a bind that stays refused for the other reasons (wrong
-kind, one read-only depth plane).
