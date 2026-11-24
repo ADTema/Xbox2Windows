@@ -191,7 +191,25 @@ void three_windows(bool full_last_window)
     expect(requests.size() == 3 && buffer_request(requests[0], window32) && buffer_request(requests[1], window32) &&
                buffer_request(requests[2], last),
            "three buffer windows of 4 GiB - 64 KiB, 4 GiB - 64 KiB and 192 KiB are requested");
-    expect(range->GetSize() == size && range->GetWindowSize() == window32 && range->GetWindowCount() == 3,
+    // QueryInterface answers for the two interfaces the range implements and refuses everything else,
+    // clearing the out pointer first so a failed call cannot be mistaken for a result.
+    {
+        void* queried = reinterpret_cast<void*>(std::uintptr_t{1});
+        expect(range->QueryInterface(__uuidof(IX2WGpuRange), &queried) == S_OK && queried == range,
+               "QueryInterface(IX2WGpuRange) returns the range");
+        queried = reinterpret_cast<void*>(std::uintptr_t{1});
+        expect(range->QueryInterface(__uuidof(IUnknown), &queried) == S_OK && queried == range,
+               "QueryInterface(IUnknown) returns the range");
+        // Each successful query takes a reference the way COM does; give both back so the release
+        // accounting below still sees the count the rest of the fixture expects.
+        range->Release();
+        range->Release();
+        queried = reinterpret_cast<void*>(std::uintptr_t{1});
+        expect(range->QueryInterface(__uuidof(ID3D12Device), &queried) == E_NOINTERFACE && !queried,
+               "QueryInterface(other) is refused and clears the output");
+        expect(range->QueryInterface(__uuidof(IX2WGpuRange), nullptr) == E_POINTER,
+               "QueryInterface with a null output is refused");
+    }    expect(range->GetSize() == size && range->GetWindowSize() == window32 && range->GetWindowCount() == 3,
            "the range reports 0x2'0001'0000 bytes in 3 windows of 0xffff'0000 bytes");
 
     va(range, 0, 1, base(0));
