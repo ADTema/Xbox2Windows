@@ -410,18 +410,19 @@ def check_shader_records():
     # Each name is counted once as VOPC and once as VOP3; the five sets must not share a name.
     assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares) + len(f32_compares)
                                       + len(f64_compares)), len(compare_forms)
-    # VOPC e32 regions support every binary16, binary32, binary64 and integer predicate and the binary16, binary32 and
-    # binary64 class tests, so no VOPC v_cmpx form is left as a neighbour; the e64 spellings stay uncovered (below).
+    # v_cmpx regions support every binary16, binary32, binary64 and integer predicate and the binary16, binary32 and
+    # binary64 class tests in both encodings, so no v_cmpx form is left as a neighbour.
     compare_neighbours = set()
-    # v_cmpx regions (issue #932): every binary16, binary32, binary64 and integer predicate and the three class tests
-    # count in VOPC (e32) only.
+    # v_cmpx regions (issue #932): every binary16, binary32, binary64 and integer predicate and the three class tests,
+    # counted once in VOPC (e32) and once in VOP3 (e64).
     cmpx_forms = ({("VOPC", f"v_cmpx_{op}_{kind}") for op in pixel.PREDICATES for kind in ("f16", "f32", "f64")}
                   | {("VOPC", f"v_cmpx_{op}_{kind}") for op in pixel.INT_PREDICATES
                      for kind in ("i32", "u32", "i64", "u64")}
                   | {("VOPC", f"v_cmpx_{op}_{kind}") for op in ("eq", "ne", "lt", "le", "gt", "ge")
                      for kind in ("i16", "u16")}
                   | {("VOPC", f"v_cmpx_class_{kind}") for kind in ("f16", "f32", "f64")})
-    assert len(cmpx_forms) == 95, len(cmpx_forms)
+    cmpx_forms |= {("VOP3", f"{form}_e64") for _, form in cmpx_forms}
+    assert len(cmpx_forms) == 190, len(cmpx_forms)
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert compare_forms | {("VOPC", n) for n in compare_neighbours} <= reference, name
@@ -429,7 +430,6 @@ def check_shader_records():
         assert compare_forms <= covered, (name, sorted(compare_forms - covered))
         assert not {form for _, form in covered} & (compare_neighbours | {f"{n}_e64" for n in compare_neighbours})
         assert cmpx_forms <= reference and cmpx_forms <= covered, (name, sorted(cmpx_forms - covered))
-        assert not {("VOP3", f"{form}_e64") for _, form in cmpx_forms} & covered, name
         assert {form for _, form in covered if form.startswith("v_cmpx_")} == {form for _, form in cmpx_forms}, name
     # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
     # reject (s_addc_u32, s_cmp_lt_u64, s_getreg_b32) stay out.

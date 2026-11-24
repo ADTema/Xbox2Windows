@@ -3360,8 +3360,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32|i64|u64)"
                         rf"|(eq|ne|lt|le|gt|ge)_(i16|u16)|(class)_f32"
                         rf"|({'|'.join(COMPARE)})_f16|(class)_f16"
-                        rf"|({'|'.join(COMPARE)}|class)_f64)_e32 ([^,]+), ([^,]+)"):
-            # A masked-if opened by a VOPC e32 compare that writes EXEC (issue #932). It must directly
+                        rf"|({'|'.join(COMPARE)}|class)_f64)_(e32|e64) ([^,]+), ([^,]+)"):
+            # A masked-if opened by a VOPC compare that writes EXEC (issue #932). It must directly
             # follow `s_mov_b64 s[a:b], exec` of the known entry mask, so EXEC becomes the entry mask
             # intersected with the comparison, as after s_and_saveexec_b64. v_cmpx writes neither VCC nor
             # SCC, so both keep their tracked values; the region closes with s_mov_b64 or s_or_b64.
@@ -3370,8 +3370,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # as the e32 v_cmp_class_f32 does. The binary16 forms and v_cmpx_class_f16 read the low 16 bits
             # of each source through the lowering of the e32 v_cmp_f16 and v_cmp_class_f16. The binary64 forms
             # (and v_cmpx_class_f64) lower as the e32 v_cmp_*_f64 and need the same declared binary64 denormal
-            # entry state.
-            fop, iop, kind, op16, kind16, cls, hop, hcls, f64op, src0, src1 = m.groups()
+            # entry state. The VOP3 (e64) forms write only EXEC on gfx10, as e32 does: they take no SGPR
+            # destination, and accept an SGPR or constant src1 and, on the float forms, neg and abs, as the
+            # e64 v_cmp of the same type does.
+            fop, iop, kind, op16, kind16, cls, hop, hcls, f64op, enc, src0, src1 = m.groups()
             if op16 is not None:
                 iop, kind = op16, kind16
             previous = instructions[i - 1] if i else ""
@@ -3384,28 +3386,32 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # VOPC e32 encodes VSRC1 as a VGPR (a VGPR pair at 64 bits) and carries no source modifiers.
             wide = kind in ("i64", "u64") or f64op not in (None, "class")
             vsrc1 = r"v\[\d+:\d+\]" if wide else r"v\d+"
-            if not re.fullmatch(vsrc1, src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0):
+            if enc == "e32" and (not re.fullmatch(vsrc1, src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0)):
                 raise ValueError(f"Invalid VOPC e32 operands: {line}")
+            if cls is not None and not re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}|[vs]\d+", src1):
+                raise ValueError("Unsupported class mask")
             if fop is not None:
                 expr = f32_comparison(fop, [src0, src1], scalar, vector, pending, sample_dest)
             elif hop is not None or hcls is not None:
                 if hcls is not None:
-                    expr = f16_class(src0, src1, scalar, vector, pending, sample_dest, allow_mods=False)
+                    expr = f16_class(src0, src1, scalar, vector, pending, sample_dest, allow_mods=enc == "e64")
                 else:
-                    expr = f16_comparison(hop, [src0, src1], scalar, vector, pending, sample_dest, allow_mods=False)
+                    expr = f16_comparison(hop, [src0, src1], scalar, vector, pending, sample_dest,
+                                          allow_mods=enc == "e64")
             elif f64op is not None:
                 if half_denorm != HALF_DENORM_PRESERVE:
                     raise ValueError("binary64 denormal mode unknown at entry")
                 helpers.add("cmp_f64")
-                declarations, expr = f64_comparison(i, f64op, [src0, src1], "e32", scalar, vector, pending,
+                declarations, expr = f64_comparison(i, f64op, [src0, src1], enc, scalar, vector, pending,
                                                     sample_dest)
                 lines.extend(declarations)
             elif cls is not None:
                 operand = fp_operand(src0, scalar, vector, pending, sample_dest)
-                bits = fp_operand(src1, scalar, vector, pending, sample_dest)
-                expr = f"(class32({operand}) & asuint({bits})) != 0u"
+                bits = (f"{int(src1, 0) & 0xffffffff}u" if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", src1)
+                        else f"asuint({fp_operand(src1, scalar, vector, pending, sample_dest)})")
+                expr = f"(class32({operand}) & {bits}) != 0u"
             elif kind in ("i64", "u64"):
-                declarations, expr = int64_comparison(i, iop, kind, [src0, src1], "e32",
+                declarations, expr = int64_comparison(i, iop, kind, [src0, src1], enc,
                                                       scalar, vector, pending, sample_dest)
                 lines.extend(declarations)
             else:
