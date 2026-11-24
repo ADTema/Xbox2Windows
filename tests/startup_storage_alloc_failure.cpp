@@ -38,9 +38,23 @@ using CreateStatusArrayFn = long(__stdcall*)(void*, unsigned, const char*, const
 using CreateQueueFn = long(__stdcall*)(void*, const void*, const void*, void**);
 using EnqueueRequestFn = void(__stdcall*)(void*, const void*);
 using EnqueueStatusFn = void(__stdcall*)(void*, void*, unsigned);
+using EnqueueSignalFn = void(__stdcall*)(void*, void*, u64);
 using SubmitFn = void(__stdcall*)(void*);
 using IsCompleteFn = bool(__stdcall*)(void*, unsigned);
 using GetHResultFn = long(__stdcall*)(void*, unsigned);
+
+struct MockFence {
+    void** vtable;
+    bool signaled = false;
+    u64 value = 0;
+    static long __stdcall signal(void* self, u64 val)
+    {
+        auto* f = static_cast<MockFence*>(self);
+        f->signaled = true;
+        f->value = val;
+        return 0;
+    }
+};
 
 std::uint32_t adler32(const unsigned char* data, std::size_t size)
 {
@@ -180,6 +194,80 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "the worker did not serve a request after the failure (hr 0x%08lx)\n", static_cast<unsigned long>(hr));
         return 1;
     }
+
+    // Also verify that if worker thread creation fails on a fresh queue under commit exhaustion,
+    // enqueued status/signal entries complete with failure instead of hanging at E_PENDING, and
+    // the queue recovers once commit is freed.
+    Queue recovery_queue;
+    void* status2_ptr = nullptr;
+    void* queue2_ptr = nullptr;
+    if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "Status2", nullptr, &status2_ptr) != 0 ||
+        reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue2_ptr) != 0) {
+        std::fprintf(stderr, "cannot create the recovery queue\n");
+        return 1;
+    }
+    recovery_queue.status = static_cast<Object*>(status2_ptr);
+    recovery_queue.queue = static_cast<Object*>(queue2_ptr);
+
+    std::vector<unsigned char> during_exhaustion(plain.size(), 0xAA);
+    std::vector<unsigned char> after_recovery(plain.size(), 0xAA);
+    std::vector<void*> held;
+    held.reserve(4096);
+    for (SIZE_T chunk : {SIZE_T{1} << 20, SIZE_T{64} << 10}) {
+        while (held.size() < held.capacity()) {
+            void* p = VirtualAlloc(nullptr, chunk, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (!p) break;
+            held.push_back(p);
+        }
+    }
+    if (held.size() < held.capacity()) {
+        if (void* region = VirtualAlloc(nullptr, SIZE_T{64} << 10, MEM_RESERVE, PAGE_READWRITE)) {
+            held.push_back(region);
+            for (SIZE_T off = 0; off < (SIZE_T{64} << 10); off += 4096) {
+                if (!VirtualAlloc(static_cast<unsigned char*>(region) + off, 4096, MEM_COMMIT, PAGE_READWRITE)) break;
+            }
+        }
+    }
+
+    void* fence_vtable[11] = {};
+    fence_vtable[10] = reinterpret_cast<void*>(&MockFence::signal);
+    MockFence fence{fence_vtable};
+
+    unsigned char req[0x48] = {};
+    *reinterpret_cast<u64*>(req + 0x00) = 1 | 0x400000;
+    *reinterpret_cast<unsigned char**>(req + 0x08) = during_exhaustion.data();
+    *reinterpret_cast<unsigned*>(req + 0x18) = static_cast<unsigned>(during_exhaustion.size());
+    *reinterpret_cast<const unsigned char**>(req + 0x20) = stream.data();
+    *reinterpret_cast<unsigned*>(req + 0x30) = static_cast<unsigned>(stream.size());
+    *reinterpret_cast<unsigned*>(req + 0x38) = plain_size;
+
+    reinterpret_cast<EnqueueRequestFn>(recovery_queue.queue->vtable[3])(recovery_queue.queue, req);
+    reinterpret_cast<EnqueueStatusFn>(recovery_queue.queue->vtable[4])(recovery_queue.queue, recovery_queue.status, 0);
+    reinterpret_cast<EnqueueSignalFn>(recovery_queue.queue->vtable[5])(recovery_queue.queue, &fence, 0x1234ull);
+    reinterpret_cast<SubmitFn>(recovery_queue.queue->vtable[6])(recovery_queue.queue);
+
+    const bool completed_immediately =
+        reinterpret_cast<IsCompleteFn>(recovery_queue.status->vtable[3])(recovery_queue.status, 0);
+    const long exhausted_hr =
+        reinterpret_cast<GetHResultFn>(recovery_queue.status->vtable[4])(recovery_queue.status, 0);
+
+    for (void* p : held) VirtualFree(p, 0, MEM_RELEASE);
+    held.clear();
+
+    if (!completed_immediately || exhausted_hr >= 0 || !fence.signaled || fence.value != 0x1234ull) {
+        std::fprintf(stderr,
+                     "worker-startup failure did not fail cleanly (complete=%d hr=0x%08lx signaled=%d val=0x%llx)\n",
+                     completed_immediately ? 1 : 0, static_cast<unsigned long>(exhausted_hr), fence.signaled ? 1 : 0,
+                     static_cast<unsigned long long>(fence.value));
+        return 1;
+    }
+
+    if (!recovery_queue.run(after_recovery, stream, plain_size, 1, hr) || hr != 0 || after_recovery != plain) {
+        std::fprintf(stderr, "the queue did not recover after worker startup failure (hr 0x%08lx)\n",
+                     static_cast<unsigned long>(hr));
+        return 1;
+    }
+
     std::puts("allocation failure failed the request; the worker served the next one");
     return 0;
 }

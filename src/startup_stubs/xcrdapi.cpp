@@ -666,44 +666,74 @@ DWORD WINAPI queue_worker(void* parameter)
     }
 }
 
-QueueWork& work_of(Object* self)
+QueueWork* ensure_work(Object* self)
 {
     static std::mutex create;
     const std::lock_guard guard(create);
-    if (!self->work) {
-        self->work = new QueueWork;
-        HANDLE worker = CreateThread(nullptr, worker_stack_commit, queue_worker, self, 0, nullptr);
-        if (!worker) worker = CreateThread(nullptr, 0, queue_worker, self, 0, nullptr);
-        if (worker) CloseHandle(worker);
-        else log("x2w-dstorage queue worker not started: error %lu", GetLastError());
+    if (self->work) return self->work;
+    auto* work = new (std::nothrow) QueueWork;
+    if (!work) {
+        log("x2w-dstorage queue work allocation failed");
+        return nullptr;
     }
-    return *self->work;
+    HANDLE worker = CreateThread(nullptr, worker_stack_commit, queue_worker, self, CREATE_SUSPENDED, nullptr);
+    if (!worker) worker = CreateThread(nullptr, 0, queue_worker, self, CREATE_SUSPENDED, nullptr);
+    if (!worker) {
+        log("x2w-dstorage queue worker not started: error %lu", GetLastError());
+        delete work;
+        return nullptr;
+    }
+    self->work = work;
+    ResumeThread(worker);
+    CloseHandle(worker);
+    return work;
+}
+
+void fail_unstarted_entry(Object* self, const Entry& entry)
+{
+    if (entry.type == Entry::request) {
+        InterlockedIncrement(&requests_failed);
+        InterlockedCompareExchange(&self->pending, static_cast<LONG>(E_OUTOFMEMORY), S_OK);
+    } else if (entry.type == Entry::status_entry) {
+        const LONG pending = InterlockedExchange(&self->pending, S_OK);
+        if (entry.array && entry.array->results && entry.index < entry.array->capacity) {
+            InterlockedExchange(&entry.array->results[entry.index],
+                                pending < 0 ? pending : static_cast<LONG>(E_OUTOFMEMORY));
+        }
+    } else {
+        signal_fence(entry.fence, entry.value);
+    }
 }
 
 void submit(Object* self)
 {
-    QueueWork& work = work_of(self);
+    QueueWork* work = ensure_work(self);
+    if (!work) return;
     {
-        const std::lock_guard guard(work.mutex);
-        const u64 submission_id = ++work.next_submission_id;
-        for (auto& entry : work.waiting) {
+        const std::lock_guard guard(work->mutex);
+        const u64 submission_id = ++work->next_submission_id;
+        for (auto& entry : work->waiting) {
             entry.submission_id = submission_id;
-            work.submitted.push_back(std::move(entry));
+            work->submitted.push_back(std::move(entry));
         }
-        work.waiting.clear();
+        work->waiting.clear();
     }
-    work.wake.notify_one();
+    work->wake.notify_one();
 }
 
 void push(Object* self, Entry&& entry)
 {
-    QueueWork& work = work_of(self);
+    QueueWork* work = ensure_work(self);
+    if (!work) {
+        fail_unstarted_entry(self, entry);
+        return;
+    }
     bool full;
     {
-        const std::lock_guard guard(work.mutex);
-        entry.id = ++work.next_entry_id;
-        work.waiting.push_back(std::move(entry));
-        full = self->capacity && work.waiting.size() >= self->capacity;
+        const std::lock_guard guard(work->mutex);
+        entry.id = ++work->next_entry_id;
+        work->waiting.push_back(std::move(entry));
+        full = self->capacity && work->waiting.size() >= self->capacity;
     }
     if (full) submit(self);  // a full queue submits itself, as on PC
 }
