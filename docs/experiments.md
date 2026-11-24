@@ -4170,23 +4170,29 @@ The compute store profile accepts `buffer_store_format_d16_x`, `_xy` and
 `BUF_FMT_16_16_16_16_UINT`, respectively. The caller declares the format and
 identity destination selectors. The [AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
 (§8.1.4 and MUBUF opcodes 132–135) sends packed 16-bit channels to the
-texture unit, low half first. The profile requires a whole texel. The ISA
-format table has no three-channel 16-bit UINT format, and the `xyz` form
-with a four-channel descriptor still needs a native fourth-channel check.
+texture unit, low half first. The default profile accepts whole texels.
 
-The D16 forms use the same verified `idxen`, zero scalar offset,
-DWORD alignment and record bounds as the ordinary UINT forms. For `x`,
-the raw UAV lowering reserves the containing DWORD and preserves its high
-half with a read/modify/write. The caller supplies an in-range, exclusively
-owned DWORD even though the original instruction writes two bytes. The
-translator refuses any store that overlaps that DWORD, including an
-otherwise disjoint halfword write.
+An experimental `--mubuf-d16-xyz-mode preserve-w` contract allows
+`buffer_store_format_d16_xyz` with `--output-format BUF_FMT_16_16_16_16_UINT`.
+The caller verifies that the original instruction with this descriptor keeps
+W unchanged. The lowering writes XY and replaces the low half of the next
+DWORD with Z. The candidate requires native gfx1030 readback with distinct
+initial W and input W values before it is counted in form coverage.
 
-The shared formatted store fixture compares all 320 output words on
-WARP and a physical adapter at one and two groups. The CPU reference copies
-selected bytes into the initial output. Clearing the preserved half for
-`x` or swapping the first two channels for `xy` and `xyzw` must produce a
-difference at word 1. LLVM 15 also exercises each encoding through the
+All D16 forms require `idxen`, zero scalar offset, DWORD alignment and a
+verified record layout. The raw UAV lowering for `x` and the experimental
+`xyz` form reserves the entire containing DWORD for each partial write. The
+caller supplies an in-range record and exclusive ownership of each DWORD
+across invocations. The translator refuses overlapping stores, including an
+otherwise disjoint halfword write within the preserved DWORD.
+
+The formatted store fixtures compare all 320 output words on WARP and a
+physical adapter at one and two groups. The CPU reference copies selected
+bytes into the initial output. Clearing the preserved half for `x` or
+swapping the first two channels for `xy` and `xyzw` must produce a difference
+at word 1. The separate `xyz` fixture replaces the instruction with `xyzw`
+and requires the first difference at word 2, expected `c5c54567`, actual
+`01234567`. LLVM 15 exercises all these encodings through the synthetic
 compute-container CLI.
 
 ```powershell
@@ -4197,6 +4203,22 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_store_format_' 
 ```sh
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
+
+For independent native readback on Linux, select a gfx1030 device in
+`rocminfo`. Build the source fixture with LLVM and LLD 15, then launch
+it through HIP:
+
+```sh
+sh tests/gfx1030_mubuf_d16/build.sh gfx1030
+python3 -B tests/gfx1030_mubuf_d16/check.py --target gfx1030 --device 0
+```
+
+The fixture checks 448 halfwords at one, two and three workgroups. Its
+XYZW control overwrites W with `ca5e`, where the XYZ reference preserves
+`8103` in the first record. The out-of-bounds control first differs at
+halfword 256 (`8200` preserved versus `1317` written). Use `--model-only`
+for the CPU reference and controls. The optional `gfx1100` target uses
+its own descriptor encoding and provides a separate RDNA 3 comparison.
 
 ### Per-lane guards around compute stores
 
