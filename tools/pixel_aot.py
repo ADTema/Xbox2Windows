@@ -3294,6 +3294,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry":
                 raise ValueError("Unexpected v_nop with non-entry mask")
             continue
+        # v_pipeflush flushes a VALU destination cache and v_clrexcp clears the wave's exception state, which only
+        # s_getreg_b32 of the trap status could observe and which is not lowered; LLVM 15 prints both encodings of
+        # each without a suffix (#1791).
+        if line in ("v_clrexcp", "v_clrexcp_e64", "v_pipeflush", "v_pipeflush_e64"):
+            if mask != "entry":
+                raise ValueError(f"Unexpected {line} with non-entry mask")
+            continue
         # Scheduling, performance and trace hints with no effect on results. Each operand is limited to the width of
         # its RDNA 2 field: clause length minus one, wave priority, sleep duration, the performance counter in
         # SIMM16[3:0], and the 16-bit trace data.
