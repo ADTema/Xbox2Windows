@@ -4807,6 +4807,28 @@ The fixture `tests/compute_alu_cvt_pk_u8_check.py` is the guarded read-compute-w
 
 The readback uses the read harness and its three dispatches and compares all 320 words. Each of these references must fail at its first differing word: one with the byte order reversed, the other S2 bytes not cleared, the float bits taken for its value, or bit 0 of the byte select dropped. So must a changed sentinel word at the bound and at word 319. Recompiled HLSL must also fail with each of these changes: bit 0 of the select dropped, S2 not cleared, the float bits for its value, a `0x7f` byte mask, 254.0 for the literal 255.0, the cap read from `params[0].z`, or the guard `>` made `>=`. Fractional, negative, out-of-range and NaN inputs are not dispatched. Their results on hardware remain unmeasured. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_alu_cvt_pk_u8_(warp|hardware)$' -V`.
 
+#### Lane counts with a uniform mask
+
+`v_mbcnt_lo_u32_b32 vD, mask, base` is `D = popcount(mask & ((1 << lane) - 1)) + base`. It counts the bits of the mask below the lane and does not read `exec`. gfx10 numbers the lanes of a wave by the flat local thread index modulo the wave size, so the lowering takes the lane from `SV_GroupIndex & 31` rather than from a desktop wave intrinsic: the result does not depend on the desktop wave width. `v_mbcnt_hi_u32_b32 vD, mask, base` counts the high half of the mask below the lane. A wave32 lane has no bit there, so it lowers to `base`. A group of at most 32 threads is one wave of either size. A larger group is accepted only with the caller's statement `wave_size=32` (`--wave-size 32`). Without it, the program might run as wave64 and is refused with `Unverified lane count operand or wave size`; wave64 itself is refused. The mask must be uniform: an integer inline constant, a 32-bit literal or an SGPR that holds a known word. A VGPR mask, a scalar still loading, an unknown scalar and an unknown base are refused.
+
+The fixture runs one group of 64 threads, two wave32 waves. Each thread stores three words: `mbcnt_lo(-1, 0)` (the lane index), `mbcnt_lo(0x5a5a5a5a, 7)`, and `mbcnt_hi(-1, lane)`. The expected words come from a Python model that counts bits below `flat % 32`. The readback compares all 320 words. Each of these references must fail at the first word where it differs:
+
+- the flat index used as the lane (word 96, the first thread of the second wave);
+- the mask inverted (word 4);
+- the base dropped (word 1);
+- a changed sentinel past the group (word 192).
+
+So must recompiled HLSL with:
+
+- a lane that saturates at 31 instead of wrapping;
+- the bits above the lane counted instead of below;
+- the base dropped;
+- `mbcnt_hi` adding 32.
+
+A lane taken modulo 64 is no control: HLSL masks a 32-bit shift count to five bits. The LLVM 15 round trip assembles and disassembles the fixture as for the other forms.
+
+Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_mbcnt_(warp|hardware)$' -V`.
+
 ### Scalar ALU on known words
 
 The store profile also accepts these scalar 32-bit operations. Both sources are known words: an SGPR that holds one, an integer inline constant or a 32-bit literal.
