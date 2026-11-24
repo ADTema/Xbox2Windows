@@ -30,6 +30,11 @@ NAMES = {0x80000003: "breakpoint", 0x80000004: "single step", 0xC0000005: "acces
 REGS = ["Rax", "Rcx", "Rdx", "Rbx", "Rsp", "Rbp", "Rsi", "Rdi", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15", "Rip"]
 
 
+def read_qword(read, address):
+    data = read(address, 8)
+    return int.from_bytes(data, "little") if len(data) == 8 else None
+
+
 def final_path(handle):
     buf = ctypes.create_unicode_buffer(1024)
     n = k32.GetFinalPathNameByHandleW(wt.HANDLE(handle), buf, 1024, 0)
@@ -253,6 +258,16 @@ def main():
             addr = k32.GetProcAddress(ntdll, name.encode())
             if addr:
                 hooks[addr] = (name, arg)
+    # X2W_VALLOC_MIN=<hex bytes>: log every virtual-memory allocation of at least that size with the
+    # main-image and stand-in return addresses found on the caller's stack (files.txt, "VALLOC").
+    # The call is logged on entry: "requested" is the address the caller asked for (0 for any), not
+    # the address it got.
+    valloc_min = int(os.environ.get("X2W_VALLOC_MIN") or "0", 16)
+    if valloc_min and trace:
+        for name in ("NtAllocateVirtualMemory", "NtAllocateVirtualMemoryEx"):
+            addr = k32.GetProcAddress(ntdll, name.encode())
+            if addr:
+                hooks[addr] = (name, "valloc")
     bink_counts, bink_state = {}, {}
     hit_counts = {}
     redirects = {}
@@ -336,8 +351,25 @@ def main():
         rsp = regs["Rsp"]
         if addr in hooks:
             name, arg = hooks[addr]
-            ret = struct.unpack("<Q", read(rsp, 8) or b"\0" * 8)[0]
-            if arg == "count":
+            ret = read_qword(read, rsp) or 0
+            if arg == "valloc":
+                # NtAllocateVirtualMemory(process, &base, zero bits, &size, type, protect) and
+                # NtAllocateVirtualMemoryEx(process, &base, &size, type, protect, ...).
+                extended = name.endswith("Ex")
+                size = read_qword(read, regs["R8" if extended else "R9"])
+                if size is not None and size >= valloc_min:
+                    base = read_qword(read, regs["Rdx"])
+                    requested = "unreadable" if base is None else hex(base)
+                    stack_args = struct.unpack("<2Q", (read(rsp + 0x28, 16) or b"").ljust(16, b"\0"))
+                    kind, protect = (regs["R9"], stack_args[0]) if extended else stack_args
+                    words = struct.unpack_from("<200Q", (read(rsp, 8 * 200) or b"").ljust(8 * 200, b"\0"))
+                    chain = [where(w) for w in words if any(b <= w < b + 0x10000000 for b in modules)]
+                    chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
+                    file_log.write(f"{time.time() - start:7.3f} VALLOC {name} requested={requested} size={size:#x} "
+                                   f"type={kind & 0xffffffff:#x} protect={protect & 0xffffffff:#x} callers: {' '.join(chain[:10])}\n")
+                    file_log.flush()
+                desc = None
+            elif arg == "count":
                 # Title function hit counter: first hits are logged with registers and the caller.
                 hit_counts[name] = hit_counts.get(name, 0) + 1
                 desc = None
@@ -453,6 +485,12 @@ def main():
     watches = [(int(r, 16), int(n or "8", 16)) for r, _, n in
                (item.partition(":") for item in filter(None, os.environ.get("X2W_WATCH", "").split(",")))]
     watch_values, watch_next = {}, 0.0
+    # X2W_DUMP_AT=<seconds>[,...]: write every thread's stack to threads_<seconds>.txt at those times,
+    # for a run that stalls before a watchdog or a timeout ends it.
+    dump_at = sorted(float(t) for t in filter(None, os.environ.get("X2W_DUMP_AT", "").split(",")))
+    # X2W_STOP_AT=<rva>[,...]: stop at a main-image breakpoint at one of these addresses even while
+    # --continue-asserts would step over it, and write threads_stop.txt.
+    stop_at = {int(r, 16) for r in filter(None, os.environ.get("X2W_STOP_AT", "").split(","))}
 
     def poll_watches():
         for rva, size in watches:
@@ -462,6 +500,8 @@ def main():
                 log(f"{time.time() - start:7.3f} watch +{rva:#x} = {blob.hex(' ')}")
 
     while time.time() - start < timeout:
+        if dump_at and time.time() - start >= dump_at[0]:
+            dump_threads(os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
         if watches and time.time() >= watch_next:
             watch_next = time.time() + 1.0
             poll_watches()
@@ -562,7 +602,7 @@ def main():
                 for addr in hooks:
                     arm(addr)
             elif (ex_code == 0x80000003 and first and main_base and main_base <= ex_addr < main_base + 0x10000000
-                  and sum(asserts_seen.values()) < skip_asserts):
+                  and sum(asserts_seen.values()) < skip_asserts and (ex_addr - main_base) not in stop_at):
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
                 status = DBG_CONTINUE  # rip is already past the int3
             elif (not first) or stop_first or (ex_code == 0x80000003 and main_base and
@@ -576,6 +616,8 @@ def main():
         k32.ContinueDebugEvent(pid, tid, status)
 
     elapsed = time.time() - start
+    if stop and stop_at:
+        dump_threads(os.path.join(logdir, "threads_stop.txt"))
     if stop:
         ex_code, ex_addr, tid, first, params = stop
         print(f"stopped at {NAMES.get(ex_code, hex(ex_code))} ({ex_code:#010x}) at {where(ex_addr)} after {elapsed:.2f} s "
