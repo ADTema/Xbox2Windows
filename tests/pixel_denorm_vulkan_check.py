@@ -12,7 +12,11 @@ A device without `shaderDenormPreserveFloat32` is reported as a capability skip,
 the driver refuses (or that spirv-val rejects) as a validation refusal. Neither counts as a mismatch.
 
 Exit code: 0 all devices conform, 1 a mismatch or a tool error, 77 every device was a capability skip,
-78 a validation refusal and no mismatch.
+78 a validation refusal and no measured mismatch. A preserve readback that differs from IEEE exits 1 even when
+the ftz build is refused.
+
+Without arguments the script runs only the device-free controls of the classification (preserve mismatch with an
+ftz refusal, an ftz control that matches preserve, and the nominal cases); the Linux Python checks job runs it so.
 """
 
 import argparse
@@ -78,6 +82,50 @@ def ieee(a, b, op):
     return bits32({"a * b": x * y, "a + b": x + y, "a - b": x - y}[op])
 
 
+def classify(preserve, ftz):
+    """Combine the two readbacks into ok, mismatch, refused or error.
+
+    Each argument is "error", "refused" or the list of result words. A measured preserve mismatch is reported
+    even when the ftz build is refused. Returns (status, preserve conforms, names of the cases where ftz
+    differs, or None when ftz has no readback).
+    """
+    wants = [case[4] for case in CASES]
+    preserved = preserve == wants if isinstance(preserve, list) else None
+    if isinstance(preserve, list) and not preserved:
+        differing = [c[0] for c, got in zip(CASES, ftz) if got != c[4]] if isinstance(ftz, list) else None
+        return "mismatch", False, differing
+    if "error" in (preserve, ftz):
+        return "error", preserved, None
+    if "refused" in (preserve, ftz):
+        return "refused", preserved, None
+    differing = [c[0] for c, got in zip(CASES, ftz) if got != c[4]]
+    return ("ok" if differing else "mismatch"), True, differing
+
+
+def controls():
+    """Device-free controls of the classification (mismatch and error exit 1, refused 78, ok 0)."""
+    wants = [case[4] for case in CASES]
+    bad = [wants[0] ^ 1] + wants[1:]
+    flushed = [0] + wants[1:]
+    expected = [
+        ((wants, flushed), "ok"),
+        ((wants, wants), "mismatch"),  # ftz control indistinguishable from preserve
+        ((bad, flushed), "mismatch"),
+        ((bad, "refused"), "mismatch"),  # a measured preserve mismatch is not hidden by an ftz refusal
+        ((bad, "error"), "mismatch"),
+        ((wants, "refused"), "refused"),
+        (("refused", flushed), "refused"),
+        (("refused", "refused"), "refused"),
+        ((wants, "error"), "error"),
+        (("error", "refused"), "error"),
+    ]
+    for (preserve, ftz), want in expected:
+        got = classify(preserve, ftz)[0]
+        if got != want:
+            raise ValueError(f"classify({preserve!r}, {ftz!r}) is {got}, expected {want}")
+    print(f"classification controls: {len(expected)} cases passed")
+
+
 def pixel_source():
     arms = "\n".join(f"        case {i}: r = asuint({op}); break;" for i, (_, _, _, op, _) in enumerate(CASES))
     return PIXEL % (WIDTH, arms)
@@ -123,11 +171,16 @@ def run_mode(dxc, spirv_val, host, device, vs, work, mode, constants, texture):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("dxc", type=Path)
-    parser.add_argument("host", type=Path, help="vk_pixel_draw binary, or tests/vk_pixel_draw.c to build it")
+    parser.add_argument("dxc", type=Path, nargs="?", help="DXC binary (omit with host to run only the device-free controls)")
+    parser.add_argument("host", type=Path, nargs="?", help="vk_pixel_draw binary, or tests/vk_pixel_draw.c to build it")
     parser.add_argument("--device", action="append", default=None,
                         help="Substring of the Vulkan device name (repeatable; default: first device)")
     args = parser.parse_args()
+    controls()
+    if args.dxc is None and args.host is None:
+        return 0
+    if args.dxc is None or args.host is None:
+        parser.error("dxc and host go together")
     for _, a, b, op, want in CASES:
         if ieee(a, b, op) != want:
             raise ValueError("The IEEE table disagrees with the Python reference")
@@ -177,20 +230,17 @@ def main():
                 for (name, a, b, op, want), got in zip(CASES, words):
                     print(f"    {name:12} {a:08x} {op} {b:08x} -> {got:08x} (IEEE {want:08x}) "
                           f"{'match' if got == want else 'DIFFER'}")
-            if "error" in results.values():
-                statuses.append("error")
-            elif "refused" in results.values():
+            status, preserved, differing = classify(results["preserve"], results["ftz"])
+            if status == "refused":
                 print("  validation refusal: reported apart from mismatches")
-                statuses.append("refused")
-            else:
-                wants = [case[4] for case in CASES]
-                preserved = results["preserve"] == wants
-                differing = [case[0] for case, got in zip(CASES, results["ftz"]) if got != case[4]]
+            elif status != "error":
                 print(f"  preserve: {'conforms to IEEE on all cases' if preserved else 'MISMATCH'}")
-                print(f"  ftz control: {len(differing)} of {len(CASES)} cases differ ({', '.join(differing) or 'none'})")
-                if not differing:
-                    print("  FAIL: the ftz control matched IEEE, so this probe cannot tell preserve from flush")
-                statuses.append("ok" if preserved and differing else "mismatch")
+                if differing is not None:
+                    print(f"  ftz control: {len(differing)} of {len(CASES)} cases differ "
+                          f"({', '.join(differing) or 'none'})")
+                    if not differing and preserved:
+                        print("  FAIL: the ftz control matched IEEE, so this probe cannot tell preserve from flush")
+            statuses.append(status)
     if "mismatch" in statuses or "error" in statuses:
         raise SystemExit(1)
     if "refused" in statuses:
