@@ -381,6 +381,13 @@ uint class16(uint bits) {
 bool num16(uint bits) {
     return (bits & 0x7fffu) <= 0x7c00u;
 }
+// v_med3_f32: the median of three. If any operand is NaN, the RDNA 2 ISA returns V_MIN3_F32 of the three, which with
+// IEEE mode off is the smallest operand that is not NaN; desktop min and max alone would skip only the NaN operand.
+// The NaN test is on the encoding, because some desktop compilers fold float NaN tests.
+float med3_32(float a, float b, float c) {
+    uint top = max(max(asuint(a) & 0x7fffffffu, asuint(b) & 0x7fffffffu), asuint(c) & 0x7fffffffu);
+    return top > 0x7f800000u ? min(min(a, b), c) : max(min(a, b), min(max(a, b), c));
+}
 // v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
 // D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
 float fract32(float value) {
@@ -666,7 +673,7 @@ ALU = {
     "mad": (3, "mad32({0}, {1}, {2})"), "mac": (3, "mad32({0}, {1}, {2})"),
     # Each result is one of the operands, so finite inputs need no rounding.
     "min3": (3, "min(min({0}, {1}), {2})"), "max3": (3, "max(max({0}, {1}), {2})"),
-    "med3": (3, "max(min({0}, {1}), min(max({0}, {1}), {2}))"),
+    "med3": (3, "med3_32({0}, {1}, {2})"),
 }
 # LLVM 15 sets HasExtDPP = 0 for v_mac_legacy_f32, and fma, mad, mad_legacy, min3, max3 and med3 are VOP3-only, so
 # none of them has a DPP form (llvm-mc for gfx1013: "dpp variant of this instruction is not supported").
@@ -1369,6 +1376,9 @@ DPP_EXTRA = {
 # Quad-local DPP16/DPP8 relative VGPR-indexing move instructions.
 DPP_MOVREL = ("v_movreld_b32_dpp", "v_movrels_b32_dpp", "v_movrelsd_b32_dpp", "v_movrelsd_2_b32_dpp")
 DPP_MOVREL_PATTERN = re.compile(rf"({'|'.join(DPP_MOVREL)}) (.+)")
+# The plain VOP1 (e32) and VOP3 (e64) encodings of the same four moves, as LLVM 15 prints them for gfx1013 and
+# gfx1030 (two VGPR operands; the VOP3 form takes no clamp, omod or source modifier in that spelling).
+PLAIN_MOVREL_PATTERN = re.compile(r"(v_movreld_b32|v_movrels_b32|v_movrelsd_b32|v_movrelsd_2_b32)_e(?:32|64) (v\d+), (v\d+)")
 
 
 def scalar_const_u32(token, scalar, pending):
@@ -5225,24 +5235,32 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := DPP_MOVREL_PATTERN.fullmatch(line):
-            op, rest = m.groups()
-            if mask != "entry":
-                raise ValueError("Invalid DPP movrel outside entry mask")
-            ops, perm, _ = parse_dpp(rest, 2)
-            if not all(re.fullmatch(r"v\d+", t) for t in ops):
-                raise ValueError(f"Expected two VGPR operands without modifiers for {op}")
+        elif (m := DPP_MOVREL_PATTERN.fullmatch(line)) or (plain := PLAIN_MOVREL_PATTERN.fullmatch(line)):
+            # The plain forms index exactly as the DPP forms do, each lane reading its own VGPRs (no swizzle).
+            if m:
+                op, rest = m.groups()
+                if mask != "entry":
+                    raise ValueError("Invalid DPP movrel outside entry mask")
+                ops, perm, _ = parse_dpp(rest, 2)
+                if not all(re.fullmatch(r"v\d+", t) for t in ops):
+                    raise ValueError(f"Expected two VGPR operands without modifiers for {op}")
+            else:
+                op, *ops = plain.groups()
+                perm = None
+                if mask != "entry":
+                    raise ValueError(f"Invalid {op} outside entry mask")
+            kind = op if op.endswith("_dpp") else f"{op}_dpp"  # the indexing rule is the same for both encodings
             dst_base, src_base = int(ops[0][1:]), int(ops[1][1:])
             if not (0 <= dst_base <= 255 and 0 <= src_base <= 255):
                 raise ValueError(f"VGPR base out of range for {op}")
             m0 = scalar.get("m0")
             if isinstance(m0, int):
                 m0_u = m0 & 0xffffffff
-                if op == "v_movreld_b32_dpp":
+                if kind == "v_movreld_b32_dpp":
                     src_offsets, dst_offsets = [0], [m0_u]
-                elif op == "v_movrels_b32_dpp":
+                elif kind == "v_movrels_b32_dpp":
                     src_offsets, dst_offsets = [m0_u], [0]
-                elif op == "v_movrelsd_b32_dpp":
+                elif kind == "v_movrelsd_b32_dpp":
                     src_offsets, dst_offsets = [m0_u], [m0_u]
                 else:
                     src_offsets, dst_offsets = [m0_u & 0x3ff], [(m0_u >> 16) & 0x3ff]
@@ -5254,13 +5272,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError(f"Dynamic m0 offset is unbounded for {op}")
                 m0_mask = scalar_mask["m0"]
                 m0_expr = m0[1]
-                if op == "v_movreld_b32_dpp":
+                if kind == "v_movreld_b32_dpp":
                     src_offsets, dst_offsets = [0], masked_offsets(m0_mask)
                     soff_expr, doff_expr = None, m0_expr
-                elif op == "v_movrels_b32_dpp":
+                elif kind == "v_movrels_b32_dpp":
                     src_offsets, dst_offsets = masked_offsets(m0_mask), [0]
                     soff_expr, doff_expr = m0_expr, None
-                elif op == "v_movrelsd_b32_dpp":
+                elif kind == "v_movrelsd_b32_dpp":
                     offs = masked_offsets(m0_mask)
                     src_offsets, dst_offsets = offs, offs
                     soff_expr, doff_expr = m0_expr, m0_expr
@@ -5278,14 +5296,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # Read all reachable source VGPRs before any destination update (supports overlapping banks).
             src_exprs = [(k, movrel_vgpr(src_base + k, vector, sample_dest)) for k in src_offsets]
             if len(src_exprs) == 1:
-                swizzled = emit_quad_swizzle_u32(lines, i, src_exprs[0][1], perm)
+                swizzled = (f"asuint({src_exprs[0][1]})" if perm is None
+                            else emit_quad_swizzle_u32(lines, i, src_exprs[0][1], perm))
             else:
                 lines.append(f"    uint dpp_soff{i} = {soff_expr};")
                 sel = f"asuint({src_exprs[-1][1]})"
                 for k, expr in reversed(src_exprs[:-1]):
                     sel = f"(dpp_soff{i} == {k}u ? asuint({expr}) : {sel})"
                 lines.append(f"    precise float dpp_src{i} = asfloat({sel});")
-                swizzled = emit_quad_swizzle_u32(lines, i, f"dpp_src{i}", perm)
+                swizzled = (f"asuint(dpp_src{i})" if perm is None
+                            else emit_quad_swizzle_u32(lines, i, f"dpp_src{i}", perm))
             if len(dst_offsets) == 1:
                 dst_reg = f"v{dst_base + dst_offsets[0]}"
                 vector[dst_reg] = f"alu{i}"
@@ -5298,6 +5318,51 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     dst_reg = f"v{dst_base + k}"
                     vector[dst_reg] = f"alu{i}_{k}"
                     lines.append(f"    precise float alu{i}_{k} = (dpp_doff{i} == {k}u) ? asfloat(dpp_val{i}) : {prev};")
+        elif m := match(r"v_swaprel_b32 (v\d+), (v\d+)"):
+            # VGPR[vdst + m0[25:16]] and VGPR[vsrc + m0[9:0]] exchange their values (#1795), with the m0 rules of
+            # the movrel forms: both sides are read before either is written, so a pair naming one register is
+            # unchanged.
+            if mask != "entry":
+                raise ValueError("Invalid v_swaprel_b32 outside entry mask")
+            dst_base, src_base = int(m.group(1)[1:]), int(m.group(2)[1:])
+            m0 = scalar.get("m0")
+            if isinstance(m0, int):
+                m0_u = m0 & 0xffffffff
+                src_offsets, dst_offsets = [m0_u & 0x3ff], [(m0_u >> 16) & 0x3ff]
+                if src_offsets[0] > 255 or dst_offsets[0] > 255:
+                    raise ValueError("Static m0 offset out of range for v_swaprel_b32")
+                soff_expr, doff_expr = f"{src_offsets[0]}u", f"{dst_offsets[0]}u"
+            elif isinstance(m0, tuple) and len(m0) == 2 and m0[0] == "uint":
+                if "m0" not in scalar_mask:
+                    raise ValueError("Dynamic m0 offset is unbounded for v_swaprel_b32")
+                m0_mask = scalar_mask["m0"]
+                src_offsets = masked_offsets(m0_mask & 0x3ff)
+                dst_offsets = masked_offsets((m0_mask >> 16) & 0x3ff)
+                soff_expr, doff_expr = f"({m0[1]} & 0x3ffu)", f"(({m0[1]} >> 16) & 0x3ffu)"
+            else:
+                raise ValueError("Unsupported m0 value for v_swaprel_b32")
+            if any(src_base + k > 255 for k in src_offsets) or any(dst_base + k > 255 for k in dst_offsets):
+                raise ValueError("Indexed VGPR exceeds 255 for v_swaprel_b32")
+            touched = sorted({dst_base + k for k in dst_offsets} | {src_base + k for k in src_offsets})
+            if any(f"v{r}" in sample_dest for r in touched):
+                raise ValueError("Write overlaps an outstanding sample")
+            old = {r: movrel_vgpr(r, vector, sample_dest) for r in touched}
+            lines.append(f"    uint swap_soff{i} = {soff_expr};")
+            lines.append(f"    uint swap_doff{i} = {doff_expr};")
+            for side, base, offsets, offset in (("s", src_base, src_offsets, f"swap_soff{i}"),
+                                                ("d", dst_base, dst_offsets, f"swap_doff{i}")):
+                value = f"asuint({old[base + offsets[-1]]})"
+                for k in reversed(offsets[:-1]):
+                    value = f"({offset} == {k}u ? asuint({old[base + k]}) : {value})"
+                lines.append(f"    uint swap_{side}val{i} = {value};")
+            for r in touched:
+                value = old[r]
+                if r - src_base in src_offsets:
+                    value = f"(swap_soff{i} == {r - src_base}u ? asfloat(swap_dval{i}) : {value})"
+                if r - dst_base in dst_offsets:
+                    value = f"(swap_doff{i} == {r - dst_base}u ? asfloat(swap_sval{i}) : {value})"
+                vector[f"v{r}"] = f"alu{i}_r{r}"
+                lines.append(f"    precise float alu{i}_r{r} = {value};")
         elif m := match(rf"v_({'|'.join(DPP_CVT)})_dpp (v\d+), (.+)"):
             op, dst, rest = m.groups()
             float_source, template, helper = DPP_CVT[op]

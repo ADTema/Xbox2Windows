@@ -1781,12 +1781,13 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
 {
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
-    // A different root signature leaves no descriptor table bound; the same one keeps them.
-    if (pass.root != (w ? root_info(w) : nullptr))
-        for (auto& table : pass.view_tables) table = {};
     const auto* params = w ? root_info(w) : nullptr;
-    if (pass.root != params)
+    // A different root signature invalidates the title's cached root arguments.
+    if (pass.root != params) {
+        for (auto& table : pass.view_tables) table = {};
         std::fill_n(pass.root_address, 16, 0);
+        std::memset(pass.constants, 0, sizeof(pass.constants));
+    }
     pass.root = params;
     pass.srv_bound = 0;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real;
