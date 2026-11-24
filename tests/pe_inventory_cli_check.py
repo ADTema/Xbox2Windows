@@ -246,13 +246,24 @@ class PeInventoryNegativeTests(unittest.TestCase):
                 pe_inventory.main(argv)
         return exc.exception.code, stdout.getvalue(), stderr.getvalue()
 
-    def test_changes_schema_mismatch_raises_value_error(self):
+    def test_changes_schema_and_structure_validation_raises_value_error(self):
         base = {"schema": 1, "images": {}, "imports": []}
         other = {"schema": 2, "images": {}, "imports": []}
         with self.assertRaisesRegex(ValueError, "Inventory schema mismatch"):
             pe_inventory.changes(base, other)
         with self.assertRaisesRegex(ValueError, "Inventory schema mismatch"):
             pe_inventory.changes({}, base)
+        with self.assertRaisesRegex(ValueError, "Inventory schema mismatch"):
+            pe_inventory.changes([], base)
+        for bad in (
+            {"schema": 1, "images": [], "imports": []},
+            {"schema": 1, "images": {}, "imports": {}},
+            {"schema": 1},
+        ):
+            with self.assertRaisesRegex(ValueError, "Invalid inventory structure"):
+                pe_inventory.changes(bad, base)
+            with self.assertRaisesRegex(ValueError, "Invalid inventory structure"):
+                pe_inventory.changes(base, bad)
 
     def test_missing_empty_and_malformed_input_dirs_exit_1_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -264,6 +275,15 @@ class PeInventoryNegativeTests(unittest.TestCase):
             self.assertEqual(proc_missing.returncode, 1, proc_missing.stderr)
             self.assertNotIn("Traceback", proc_missing.stderr)
             self.assertTrue(proc_missing.stderr.strip())
+            self.assertFalse(out_json.exists())
+
+            # Regular file instead of directory
+            not_a_dir = root / "not_a_dir.txt"
+            not_a_dir.write_text("file", encoding="utf-8")
+            code_file, _, err_file = self._run_main_in_process([str(not_a_dir), "--output", str(out_json)])
+            self.assertEqual(code_file, 1)
+            self.assertNotIn("Traceback", err_file)
+            self.assertIn("Not a directory:", err_file)
             self.assertFalse(out_json.exists())
 
             # Directory with no DLLs/EXEs
@@ -324,6 +344,27 @@ class PeInventoryNegativeTests(unittest.TestCase):
             self.assertNotIn("Traceback", proc_mm.stderr)
             self.assertIn("Inventory schema mismatch", proc_mm.stderr)
             self.assertFalse(out_json.exists())
+
+    def test_malformed_baseline_structure_is_refused_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / "pkg"
+            pkg.mkdir()
+            (pkg / "app.exe").write_bytes(build_synthetic_pe([
+                ("normal", "kernel32.dll", "ExitProcess"),
+            ]))
+            base = pe_inventory.scan(pkg)
+            out_json = root / "out.json"
+            for idx, bad in enumerate((dict(base, images=[]), dict(base, imports={}))):
+                bad_baseline = root / f"bad_structure_{idx}.json"
+                bad_baseline.write_text(json.dumps(bad), encoding="utf-8")
+                proc = self._run_cli_subprocess(
+                    str(pkg), "--output", str(out_json), "--baseline", str(bad_baseline),
+                )
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertIn("Invalid inventory structure", proc.stderr)
+                self.assertFalse(out_json.exists())
 
     def test_output_inside_input_or_aliasing_baseline_exits_2_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
