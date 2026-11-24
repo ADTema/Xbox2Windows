@@ -4791,6 +4791,16 @@ The result becomes an inline HLSL expression, like a vector result, and a vector
 
 The check assembles one fixture that chains all six operations over the cap word and the bound, and requires the decoded program to lower to the same HLSL as its text.
 
+#### Scalar absolute difference
+
+`s_absdiff_i32 sD, a, b` (SOP2 opcode 44) takes the same two scalar sources. The RDNA 1 (25 September 2020) and RDNA 2 (30 November 2020) ISA references define it as `D.i = S0.i - S1.i; if (D.i < 0) D.i = -D.i; SCC = (D.i != 0)`. The subtraction and the negation both wrap at 32 bits. So `(0x80000000, 0)` gives `0x80000000` ("result is negative!" in the references), and `(0x7fffffff, 0x80000000)` gives 1, not `2^32 - 1`. It lowers to `asuint(abs(asint(a - b)))`, with an unsigned subtraction. DXC 1.8.2502 emits that as a plain `sub` and `IMax(d, 0 - d)`, which keeps `0x80000000`. SCC is written but not modelled, so a consumer such as `s_cselect_b32` or `s_cbranch_scc0` is still refused.
+
+`tests/compute_salu_absdiff_check.py` holds the fixture, gfx1013 text in LLVM 15 spelling. Each lane below the bound stores four results as one 16-byte element: `|c1 - c2|`, `|c3 - c4|`, `|c5 - 0x80000000|` with a literal, and `|-7 - r0|` with an inline constant and the first result. The constant words come from the case file. Three dispatches use three constant sets: `(2, 5, 0x80000000, 0, 0x7fffffff)` gives `3, 0x80000000, 1, 10`; `(0x12345678, 0x12345678, 0x80000000, 0xffffffff, 0x80000000)` gives `0, 0x7fffffff, 0, 7`; and `(-10, 5, 5, -10, 0)` gives `15, 15, 0x80000000, 22`. The expected words were worked out by hand and match a Python model of the ISA pseudocode, which also reproduces the six functional examples in the references. The model does not use the lowering. Four wrong definitions must each fail at their first differing word: no absolute value, an unsigned comparison, a difference not wrapped to 32 bits, and INT_MIN saturated to `0x7fffffff`. Three mutated translations must also fail: `abs` dropped, the literal changed, and the inline constant changed. In the `controls` mode, which needs no GPU, the following are refused: an unwritten, descriptor, exec-mask or pending source; a literal wider than 32 bits; a destination past s105 or still waiting for a load; a vector or float-constant source; a 64-bit destination; `s_absdiff_u32`; SCC consumers; a result used as a store address or a guard compare; and an expression over the limit.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_absdiff_warp$' -V
+```
+
 ### Two- and three-dimensional thread groups
 
 The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits

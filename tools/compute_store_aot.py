@@ -50,6 +50,8 @@ ALU = {
 # shift of src0 by src1[4:0].
 SALU = {
     "s_add_u32": "({0} + {1})",
+    # |S0.i - S1.i| on the 32-bit wrapped difference, so 0x80000000 stays 0x80000000; SCC = result != 0, unread.
+    "s_absdiff_i32": "asuint(abs(asint({0} - {1})))",
     "s_sub_u32": "({0} - {1})",
     "s_and_b32": "({0} & {1})",
     "s_or_b32": "({0} | {1})",
@@ -507,7 +509,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if not -(1 << 31) <= value <= 0xffffffff:
                     raise ValueError("Invalid scalar immediate")
                 scalar[dst] = value & 0xffffffff
-        elif m := re.fullmatch(rf"(s_(?:add_u32|sub_u32|and_b32|or_b32|xor_b32|lshr_b32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
+        elif m := re.fullmatch(rf"(s_(?:add_u32|sub_u32|and_b32|or_b32|xor_b32|lshr_b32|absdiff_i32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
                                line):
             op, dst = m[1], int(m[2])
             words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
