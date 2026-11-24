@@ -48,6 +48,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <string>
 #include <unordered_map>

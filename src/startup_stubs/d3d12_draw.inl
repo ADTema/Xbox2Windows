@@ -584,16 +584,22 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset)
     u64 fresh = 0;
     auto* ring = reserve_upload_ring(bytes, &fresh);
     if (!ring) return false;
-    // Snapshot first and fill the ring from the snapshot, so the ring slice and the stored bytes cannot differ
-    // when the title writes the memory on another thread.
-    std::vector<unsigned char> content(title, title + bytes);
-    std::memcpy(ring, content.data(), bytes);
+    // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
+    const unsigned char* source = title;
+    try {
+        std::vector<unsigned char> content(title, title + bytes);
+        // Use the stored snapshot to fill the ring so the GPU bytes and subsequent comparisons agree.
+        auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, fresh, std::move(content)});
+        source = entry.first->second.content.data();
+    } catch (const std::bad_alloc&) {
+        // The ring slice is already reserved. The draw can proceed without another CPU allocation.
+    }
+    std::memcpy(ring, source, bytes);
     if (known) {
         static LONG refreshed;
         if (first_calls(refreshed, 4))
             log("x2w-draw frame copy of 0x%llx (%zu bytes) refreshed: the title changed it since an earlier draw of this frame", address, bytes);
     }
-    frame_copies()[key] = FrameCopy{address, fresh, std::move(content)};
     *offset = fresh;
     return true;
 }
