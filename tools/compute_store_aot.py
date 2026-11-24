@@ -1046,7 +1046,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"(?:buffer_load_dword|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
+        elif m := re.fullmatch(r"(?:buffer_load_(?:dword|(?P<subword>[us](?:byte|short)))"
+                               r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?"
@@ -1059,6 +1060,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
+            subword = m["subword"]
+            width = 4 if subword is None else 1 if subword.endswith("byte") else 2
+            if subword and (cpu != "gfx1030" or not idxen or offen):
+                raise ValueError("Unsupported subword buffer read target or address mode")
             if channels and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported typed buffer read target or address mode")
             # The three-component D16 form uses the four-component 16-bit format.
@@ -1076,7 +1081,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Reads from the stored UAV are not supported")
             if kinds != tuple(("srv", i) for i in range(4)):
                 raise ValueError("Unverified buffer read descriptor")
-            if offset % 4 or offset > 4095:
+            if offset % width or offset > 4095:
                 raise ValueError("Unverified read offset")
             tag = vector.get(int(addr[1:])) if addr != "off" else None
             if addr == "off" and not idxen and not offen:
@@ -1088,16 +1093,26 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             elif (idxen and not offen and source_stride is not None and isinstance(tag, tuple)
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
-                if offset + 4 * count > source_stride:
+                if offset + width * count > source_stride:
                     raise ValueError("Read leaves its source element")
-                addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {offset + 4*i}u" for i in range(count)]
+                aligned = offset & ~3
+                addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {aligned + 4*i}u" for i in range(count)]
             else:
                 raise ValueError("Unsupported read address")
             for reg, address in enumerate(addresses, dst):
                 vector.pop(reg, None)
-                # Track only the low half of an odd trailing component. Whole-word consumers cannot read it.
+                # Whole-word consumers cannot read the undefined upper half of an odd D16 result.
                 kind = "source_low16" if packed and components % 2 and reg == dst + count - 1 else "source"
-                loading[reg] = (kind, address)
+                word = (kind, address)
+                if subword:
+                    # The stride and SRV base are DWORD-aligned, so the enclosing word stays in the record.
+                    bits, shift = width * 8, (offset % 4) * 8
+                    field = f"(({hlsl_word(word)} >> {shift}u) & {((1 << bits) - 1):#x}u)"
+                    if subword.startswith("s"):
+                        sign = f"{1 << (bits - 1):#x}u"
+                        field = f"(({field} ^ {sign}) - {sign})"
+                    word = ("alu", field)
+                loading[reg] = word
         elif m := re.fullmatch(r"image_load (v\d+|v\[\d+:\d+\]), v\[(\d+):(\d+)\], "
                                r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D( unorm)?", line):
             # One typed 2D read: (x, y) come from two packed address dwords, and dmask selects the

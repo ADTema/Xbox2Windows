@@ -4,6 +4,14 @@
 #include <cstdint>
 
 namespace x2w_startup {
+// Called for a CPU-backed 2D texture already uploaded, without a new XG write notification.
+// A decoder can write R8 planes directly while cycling through its frame buffers.
+inline bool recheck_cpu_texture(const D3D12_RESOURCE_DESC& desc, UINT64 bytes, UINT elapsed_frames)
+{
+    const bool plane = desc.Format == DXGI_FORMAT_R8_UNORM && desc.MipLevels == 1 && desc.DepthOrArraySize == 1;
+    return bytes <= (UINT64{32} << 20) && elapsed_frames >= (plane ? 1u : 15u);
+}
+
 // GetCopyableFootprints orders a single NV12 image as Y followed by UV.
 // Keep this layout identical in the XG writer and the desktop draw uploader.
 struct SliceFootprints {
