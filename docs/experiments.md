@@ -6859,6 +6859,14 @@ Full compute binding, additional signature forms and title execution remain
 tracked in [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759) and
 [#1412](https://github.com/R0Y00/Xbox2Windows/issues/1412).
 
+On Windows WARP with the debug layer enabled (Microsoft Basic Render Driver
+10.0.26100.33648), the guest fixture read back `0x31415f02` for `(4, 3, 2)`
+and `0x31415c08` for `(2, 3, 2)`. The omitted writer and all three refusals
+preserved `0x31415926`. Removing the slot-61 forwarding hook made the first
+case fail at the result word with that same sentinel. Physical adapter coverage
+for the guest path is pending.
+[Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45473674036)
+
 #### D3D12.X graphics command list (XCL-12)
 
 The public Microsoft D3D12 and Xbox material and the Windows SDK `d3d12.h` expose no
