@@ -3276,9 +3276,16 @@ A full store writes those two words and two distinct constants into 16 unique
 texels in destination mip 0. The readback checks all 1,344 DWORDs across three
 mips, including 1,280 sentinels in the surrounding texels and untouched mips.
 Swapping the sparse load's register order or forcing mip zero independently
-changes the readback. A sparse store is a translation refusal control. The
+changes the readback. A sparse store is a translation refusal control. So are
+a plain `image_load` and an `image_store_mip`, SRV descriptors that overlap or
+misalign with the UAV descriptor, a UINT UAV format and the gfx1030 target. The
 LLVM 15 job checks the recorded machine words, disassembly, and synthetic
 container CLI output.
+
+The words pass through `asuint` and `asfloat` unchanged, but every fixture
+value is a normal binary32 number. NaN payloads, denormals and negative zero
+are not tested; D3D12 does not promise to preserve them bit-exactly through
+typed float UAV stores on every adapter.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check -j 2

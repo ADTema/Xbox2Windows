@@ -51,9 +51,20 @@ def controls():
             changed = instruction.replace("IMG_2D", f"IMG_{dimension}")
             rejects("Unsupported compute instruction", aot.lower,
                     variant(LINES, (instruction, changed)), GROUP, **BINDING)
-    for offset in (0x40, 0x50):
+    # Only image_store (no mip) and image_load_mip are lowered on gfx1013.
+    plain_load = LOAD.replace("image_load_mip v[14:15], v[8:10]", "image_load v[14:15], v[8:9]")
+    store_mip = STORE.replace("image_store v[14:17], v[8:9]", "image_store_mip v[14:17], v[8:10]")
+    rejects("Unsupported image load target", aot.lower, variant(LINES, (LOAD, plain_load)), GROUP, **BINDING)
+    rejects("Unsupported image store target", aot.lower, variant(LINES, (STORE, store_mip)), GROUP, **BINDING)
+    # The SRV descriptor must be aligned and clear of both 16-byte halves of the UAV descriptor at 0x40.
+    for offset in (0x30, 0x34, 0x40, 0x41, 0x50, 0x62):
         rejects("overlapping image SRV descriptor", aot.lower, LINES, GROUP,
                 **(BINDING | {"image_srv_descriptor": offset}))
+    # The separate SRV needs a gfx1013 RGBA32 FLOAT UAV.
+    for change in ({"image_format": "R32G32B32A32_UINT"}, {"cpu": "gfx1030"}):
+        rejects("Invalid image UAV binding", aot.lower, LINES, GROUP, **(BINDING | change))
+    raw_output = {key: value for key, value in BINDING.items() if key != "image_uav_mip"} | {"descriptor_offset": 0}
+    rejects("A separate image SRV requires a gfx1013 RGBA32 FLOAT image UAV", aot.lower, LINES, GROUP, **raw_output)
     print("translation controls passed", flush=True)
     return source
 
