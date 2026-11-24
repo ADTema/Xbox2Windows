@@ -328,6 +328,11 @@ class TestRdna2Disasm(unittest.TestCase):
             # SMEM: register widths per op and soffset vs immediate offset
             ("01050cf4000000fa", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], 0x0"),
             ("01050cf445230100", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], s0 offset:0x12345"),
+            # SMEM OFFSET[20:0] is a signed 21-bit byte offset
+            ("000000f4ffff1ffa", "s_load_dword", "s_load_dword s0, s[0:1], -0x1"),
+            ("000000f4000010fa", "s_load_dword", "s_load_dword s0, s[0:1], -0x100000"),
+            ("000000f4ffff0ffa", "s_load_dword", "s_load_dword s0, s[0:1], 0xfffff"),
+            ("000000f4ffff1f00", "s_load_dword", "s_load_dword s0, s[0:1], s0 offset:-0x1"),
             ("420120f400000000", "s_buffer_load_dword", "s_buffer_load_dword s5, s[4:7], s0"),
             ("020528f4200000fa", "s_buffer_load_dwordx4", "s_buffer_load_dwordx4 s[20:23], s[4:7], 0x20"),
             ("420160f400000000", "s_buffer_store_dword", "s_buffer_store_dword s5, s[4:7], s0"),
@@ -3532,6 +3537,36 @@ class TestRdna2Disasm(unittest.TestCase):
         )
         self.assertIn("s_nop 0", res.stdout)
         self.assertIn("s_endpgm", res.stdout)
+
+    def test_cli_hex_output_and_input_errors(self):
+        script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "listing.txt"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), "--hex", "000080bf", "--output", str(out)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("s_nop 0", out.read_text(encoding="utf-8"))
+
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), "--hex", "0000810"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 2)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertIn("--hex", res.stderr)
+
+            missing = Path(tmp) / "nonexist.bin"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), str(missing)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("not found", res.stderr)
 
     def test_llvm_comparison(self):
         llvm_lib_env = os.environ.get("LLVM_LIB")

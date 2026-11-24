@@ -30,10 +30,13 @@
 #include "startup_stubs/memory_srv_buffer.h"
 
 #include "startup_stubs/slice_footprints.h"
+#include "startup_stubs/present_signature_sampler.h"
 
 #include <d3d12.h>
 #include "command_list_slot_names.h"
+#include "command_signature_filter.h"
 #include "console_plane_size.h"
+#include "descriptor_heap_type.h"
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
@@ -314,7 +317,7 @@ void hex_text(const void* data, std::size_t bytes, char* out, std::size_t size)
     for (std::size_t i = 0; i < bytes && used + 4 < size; ++i) used += std::snprintf(out + used, size - used, "%02x ", p[i]);
 }
 
-bool first_calls(LONG& counter, LONG limit = 3) { return InterlockedIncrement(&counter) <= limit; }
+bool first_calls(LONG& counter, LONG limit = 3) { return x2w_local::first_calls(counter, limit); }
 
 // X2W_D3D12_DEBUG=1: the desktop debug layer's messages are drained into the log after forwarded
 // calls, tagged with the call that preceded them, and a device removal is reported once with its reason.
@@ -900,10 +903,29 @@ void __stdcall device_copyable_footprints(Wrapper* self, const D3D12_RESOURCE_DE
 }
 
 // Device slot 41, desktop CreateCommandSignature(desc, root, riid, ppv); on failure the descriptor and
-// its argument descriptors are logged.
+// its argument descriptors are logged. The observed console-only type 0x69 gets a placeholder before
+// desktop validation. Other types still reach the desktop even when they postdate DISPATCH_MESH.
 u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND_SIGNATURE_DESC* desc, u64 root,
                                               u64 iid, u64 out)
 {
+    void** output = reinterpret_cast<void**>(out);
+    const bool readable_args = x2w_local::readable(desc, sizeof(*desc)) &&
+        x2w_local::readable(desc->pArgumentDescs, std::size_t{desc->NumArgumentDescs} * sizeof(*desc->pArgumentDescs));
+    if (output && readable_args && x2w_startup::has_console_indirect_arg_type(desc->pArgumentDescs, desc->NumArgumentDescs) &&
+        x2w_local::writable(output, sizeof(*output))) {
+        static LONG placeholders;
+        if (first_calls(placeholders, 8)) {
+            log("x2w-d3d12   CreateCommandSignature: console argument type -> placeholder (stride=%u args=%u)",
+                desc->ByteStride, desc->NumArgumentDescs);
+            for (UINT i = 0; i < desc->NumArgumentDescs && i < 8; ++i) {
+                char bytes[3 * 16 + 1];
+                hex_text(&desc->pArgumentDescs[i], sizeof(D3D12_INDIRECT_ARGUMENT_DESC), bytes, sizeof(bytes));
+                log("x2w-d3d12     arg[%u]=[%s]", i, bytes);
+            }
+        }
+        *output = wrap(nullptr, command_signature_kind);
+        return S_OK;
+    }
     const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
     if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && !root && desc->NumArgumentDescs == 1) {
         auto* signature = *reinterpret_cast<Wrapper**>(out);
@@ -922,7 +944,7 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
         }
     }
     static LONG failures;
-    if (FAILED(static_cast<HRESULT>(result)) && desc && first_calls(failures, 8)) {
+    if (FAILED(static_cast<HRESULT>(result)) && readable_args && first_calls(failures, 8)) {
         log("x2w-d3d12   CreateCommandSignature failed: stride=%u args=%u node=0x%x root=0x%llx", desc->ByteStride,
             desc->NumArgumentDescs, desc->NodeMask, root);
         for (UINT i = 0; i < desc->NumArgumentDescs && i < 8; ++i) {
@@ -931,15 +953,14 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
             log("x2w-d3d12     arg[%u]=[%s]", i, bytes);
         }
     }
-    // Argument types outside the desktop enumeration (0x69 seen, stride 12) cannot be created on
-    // desktop; the title gets a placeholder CommandSignature.
-    bool console_type = false;
-    for (UINT i = 0; desc && i < desc->NumArgumentDescs; ++i)
-        console_type |= static_cast<UINT>(desc->pArgumentDescs[i].Type) > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
-    if (FAILED(static_cast<HRESULT>(result)) && console_type && out) {
-        log("x2w-d3d12   CreateCommandSignature: console argument type -> placeholder");
-        *reinterpret_cast<void**>(out) = wrap(nullptr, command_signature_kind);
-        return S_OK;
+    // Preserve the existing fallback for unknown types only after desktop has refused the real request.
+    if (FAILED(static_cast<HRESULT>(result)) && readable_args && output && x2w_local::writable(output, sizeof(*output))) {
+        for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
+            if (static_cast<UINT>(desc->pArgumentDescs[i].Type) > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) {
+                *output = wrap(nullptr, command_signature_kind);
+                return S_OK;
+            }
+        }
     }
     return result;
 }
@@ -994,6 +1015,20 @@ void* __stdcall device_custom_heap_properties(void* a, void* b, UINT node_mask, 
 }
 
 // Device slot 43, desktop GetAdapterLuid(), returned by value.
+
+// Device slot 15, desktop GetDescriptorHandleIncrementSize(type). A type desktop has is forwarded as before. Any
+// other value makes desktop answer 0 and the debug layer report an error (#870): the stand-in logs the value once
+// and answers 0 itself, with no increment made up for it.
+static_assert(x2w_startup::desktop_descriptor_heap_type_count == D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES);
+UINT __stdcall device_descriptor_increment_size(Wrapper* self, UINT type)
+{
+    if (!x2w_startup::is_valid_desktop_descriptor_heap_type(type)) {
+        static LONG calls;
+        if (first_calls(calls, 1)) log("x2w-d3d12 Device::slot15 out-of-range heap type 0x%x -> 0", type);
+        return 0;
+    }
+    return static_cast<UINT>(forward_slot<device_kind, 15>(self, type, 0, 0, 0, 0, 0, 0, 0));
+}
 
 // Device slots 34/35, desktop MakeResident/Evict(count, objects).
 template <int N>
@@ -1479,7 +1514,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     const LONG count = InterlockedIncrement(&shown_frames);
     std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
                   desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
-    if (count <= 3 || count % 40 == 0) log("x2w-render presented %s", shown_note);
+    if ((count > 0 && count <= 3) || count % 40 == 0) log("x2w-render presented %s", shown_note);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2338,7 +2373,7 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
         const LONG n = InterlockedIncrement(&render_draws);
-        if (n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
+        if (n > 0 && n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
     } else {
         InterlockedIncrement(&render_draws_skipped);
     }
@@ -3105,7 +3140,7 @@ void dump_pipeline(const char* what, int slot, const void* desc, std::size_t byt
         return GetEnvironmentVariableA("X2W_D3D12_DUMP_PSO", value, sizeof(value)) && value[0] == '1';
     }();
     static LONG dumped[512];
-    if (!enabled || !desc || InterlockedIncrement(&dumped[slot & 511]) > 4) return;
+    if (!enabled || !desc || !first_calls(dumped[slot & 511], 4)) return;
     if (!x2w_local::readable(desc, bytes)) return;
     const auto* words = static_cast<const u64*>(desc);
     log("x2w-pso %s slot %d desc %p, %llu bytes", what, slot, desc, static_cast<unsigned long long>(bytes));
@@ -3463,6 +3498,41 @@ void draw_overlay(LONG frame, double seconds)
 
 #include "startup_stubs/d3d12_present.inl"
 
+// Render mode: a coarse signature of the presented picture for input-script waits (present_signature.h,
+// present_signature_sampler.h). The block always counts presents; samples are taken every 4 presents
+// only while a script with a picture wait has asked for them (request_sampling). X2W_PRESENT_SIGNATURE_EVERY=<n>
+// samples every n presents from the start without a request, and 0 turns the signature off.
+// 18 one-texel rows are copied on the presenting queue and read back on a later present; nothing waits.
+void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
+{
+    static const int explicit_every = [] {
+        char value[16]{};
+        return GetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", value, sizeof(value)) ? std::atoi(value) : -1;
+    }();
+    if (explicit_every == 0) return;
+    static const int every = explicit_every > 0 ? explicit_every : 4;
+    static x2w_present_signature::Block* const block = [] {
+        auto* created = x2w_present_signature::create_block(GetCurrentProcessId(), static_cast<std::uint32_t>(every));
+        log("x2w-present picture signature: Local\\x2w_present_signature_%lu, every %d presents %s",
+            static_cast<unsigned long>(GetCurrentProcessId()), every,
+            explicit_every > 0 ? "from the start (X2W_PRESENT_SIGNATURE_EVERY)" : "once a script wait asks for it");
+        return created;
+    }();
+    // Kept until the process ends, so a copy in flight never loses the objects it uses.
+    static auto* const sampler = new x2w_present_signature::Sampler(every, explicit_every > 0);
+    ID3D12Resource* real = surface && surface->own().kind == resource_kind ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
+    const bool published = sampler->present(device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), real, frame, block);
+    static LONG first, refused, failed;
+    if (published && first_calls(first, 1))
+        log("x2w-present picture signature: first sample published at present %ld in Local\\x2w_present_signature_%lu (every %d presents)",
+            frame, static_cast<unsigned long>(GetCurrentProcessId()), every);
+    if (sampler->unsupported_format() != DXGI_FORMAT_UNKNOWN && first_calls(refused, 1))
+        log("x2w-present picture signature: surface format %d is not sampled", sampler->unsupported_format());
+    if (sampler->failed() && first_calls(failed, 1))
+        log(sampler->stranded() ? "x2w-present picture signature: Signal failed after a copy was submitted; sampling stopped, its surface stays referenced"
+                                : "x2w-present picture signature: setup failed, no samples");
+}
+
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
@@ -3497,6 +3567,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         // Render mode: the presented surface goes to the title's window through a swap chain.
         if (render_mode() && surface && surface->own().kind == resource_kind && surface->own().real)
             shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
+        if (render_mode()) present_signature(self, surface, frame);
     }
     const ULONGLONG now = GetTickCount64();
     if (frame == 1) started = last_report = now;
@@ -3630,7 +3701,7 @@ void build_tables()
     enable_create<device_kind, 12, 4>();                 // CreateCommandList(node, type, allocator, pso, riid, ppv)
     enable_forward<device_kind, 13>();                   // CheckFeatureSupport
     tables[device_kind][14] = reinterpret_cast<void*>(&device_create_descriptor_heap);
-    enable_forward<device_kind, 15>();                   // GetDescriptorHandleIncrementSize
+    tables[device_kind][15] = reinterpret_cast<void*>(&device_descriptor_increment_size);  // GetDescriptorHandleIncrementSize(type)
     enable_create<device_kind, 16, 3>();                 // CreateRootSignature(node, blob, size, riid, ppv)
     tables[device_kind][17] = reinterpret_cast<void*>(&view_slot<17, 1>);  // CreateConstantBufferView(desc, dest)
     tables[device_kind][18] = reinterpret_cast<void*>(&view_slot<18, 2>);  // CreateShaderResourceView(res, desc, dest)

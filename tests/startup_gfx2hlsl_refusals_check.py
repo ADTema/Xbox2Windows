@@ -301,7 +301,10 @@ def check_normalization():
             ('SampleCmpLevel needs shader model 6.7', 'SampleCmpLevel needs shader model 6.7'),
             ('s_load_dword s[4:7], v8, 0x10, 16, -1.5', 's_load_dword s[N:N], vN, N, N, N'),
             ('operand s4, v[2:5]', 'operand sN, v[N:N]'),
-            ('word_0xdeadbeef', 'word_N')):
+            ('word_0xdeadbeef', 'word_N'),
+            # A bare literal outside an operand position: the operand rule above does not reach it.
+            ('v_mov_b32 with literal 0x3f800000', 'v_mov_b32 with literal N'),
+            ('unexpected value 0x7fc00000 in source', 'unexpected value N in source')):
         check('normalization of ' + normalized, G.normalize_refusal(raw) == normalized)
 
 
