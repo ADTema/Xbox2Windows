@@ -3799,21 +3799,21 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(archive_codec SHARED "${archive_src}/codec.cpp" "${archive_src}/texture_stdout.cpp")
     target_link_libraries(archive_codec PRIVATE blast_source)
     set_target_properties(archive_codec PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
-    function(build_archive_reader entry exe cpp)
+    function(build_archive_reader entry exe cpp provider translator)
         add_custom_command(OUTPUT "${exe}"
             COMMAND "${INTAKE_PYTHON}" -m ziglang build-exe "${entry}"
-                "-L$<TARGET_LINKER_FILE_DIR:archive_codec>" -target x86_64-windows-gnu
+                "-L$<TARGET_LINKER_FILE_DIR:${provider}>" -target x86_64-windows-gnu
                 -O ReleaseSmall -fsingle-threaded -funwind-tables "-femit-bin=${exe}"
-            DEPENDS archive_codec "${entry}" ${ARGN} VERBATIM)
+            DEPENDS ${provider} "${entry}" ${ARGN} VERBATIM)
         add_custom_command(OUTPUT "${cpp}"
             COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools"
-                "${INTAKE_PYTHON}" -B "${archive_src}/translate_reader.py" "${exe}" "${cpp}"
-            DEPENDS "${exe}" "${archive_src}/translate_reader.py" tools/cpu_stdio_exe_aot.py
+                "${INTAKE_PYTHON}" -B "${archive_src}/${translator}" "${exe}" "${cpp}"
+            DEPENDS "${exe}" "${archive_src}/${translator}" tools/cpu_stdio_exe_aot.py
                 tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
     endfunction()
     set(archive_exe "${CMAKE_CURRENT_BINARY_DIR}/archive_reader.exe")
     set(archive_cpp "${CMAKE_CURRENT_BINARY_DIR}/archive_reader_lifted.cpp")
-    build_archive_reader("${archive_src}/reader.zig" "${archive_exe}" "${archive_cpp}")
+    build_archive_reader("${archive_src}/reader.zig" "${archive_exe}" "${archive_cpp}" archive_codec translate_reader.py)
     add_executable(archive_reader_lifted "${archive_cpp}")
     target_link_libraries(archive_reader_lifted PRIVATE archive_codec ntdll)
     add_test(NAME cpu_native_archive_reader COMMAND "${INTAKE_PYTHON}" -B
@@ -3829,7 +3829,7 @@ if(EXISTS "${INTAKE_PYTHON}")
 
     set(texture_exe "${CMAKE_CURRENT_BINARY_DIR}/archive_texture_reader.exe")
     set(texture_cpp "${CMAKE_CURRENT_BINARY_DIR}/archive_texture_reader_lifted.cpp")
-    build_archive_reader("${archive_src}/texture_reader.zig" "${texture_exe}" "${texture_cpp}"
+    build_archive_reader("${archive_src}/texture_reader.zig" "${texture_exe}" "${texture_cpp}" archive_codec translate_reader.py
         "${archive_src}/reader.zig")
     add_executable(archive_texture_lifted "${texture_cpp}")
     target_link_libraries(archive_texture_lifted PRIVATE archive_codec_lifted ntdll)
@@ -3874,6 +3874,26 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter}")
     endforeach()
     set_tests_properties(cpu_archive_texture_gpu_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_library(archive_directory_gpu SHARED "${archive_src}/directory_gpu.cpp" "${archive_src}/quad_frames.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_vs.h" "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_ps.h")
+    target_include_directories(archive_directory_gpu PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_compile_features(archive_directory_gpu PRIVATE cxx_std_17)
+    target_link_libraries(archive_directory_gpu PRIVATE startup_stub_xcrdapi dxgi d3d12)
+    set(directory_exe "${CMAKE_CURRENT_BINARY_DIR}/archive_directory_reader.exe")
+    set(directory_cpp "${CMAKE_CURRENT_BINARY_DIR}/archive_directory_lifted.cpp")
+    build_archive_reader("${archive_src}/directory_reader.zig" "${directory_exe}" "${directory_cpp}"
+        archive_directory_gpu translate_directory.py)
+    add_executable(archive_directory_lifted "${directory_cpp}")
+    target_link_libraries(archive_directory_lifted PRIVATE archive_directory_gpu ntdll)
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME cpu_archive_directory_gpu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_directory_gpu_check.py" "$<TARGET_FILE:pe_map>"
+            "${directory_exe}" "$<TARGET_FILE:archive_directory_lifted>" "$<TARGET_FILE:archive_directory_gpu>")
+        set_tests_properties(cpu_archive_directory_gpu_${adapter} PROPERTIES TIMEOUT 90
+            ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter}")
+    endforeach()
+    set_tests_properties(cpu_archive_directory_gpu_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
     function(crc_line_program target polynomial)
         # Use the same CRC object optimization flags in Debug and Release.

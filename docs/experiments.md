@@ -174,6 +174,17 @@ cmake --build --preset dev --target archive_texture_gpu_lifted archive_gpu_reade
 ctest --preset dev --no-tests=error -R '^cpu_archive_texture_gpu_(warp|hardware)$' -V
 ```
 
+### Directory offsets through a Windows storage queue and BC7 draw
+
+A Zig 0.13 EXE reads three adjacent RDS5 directory words from a fixture provider. Its internal function derives each absolute source offset from the low 26 bits in 256-byte units and subtracts the leading entry's declared padding from the stored span to get the compressed length. The EXE calls that function twice. Native execution, `pe_map` and AOT use the same provider DLL, which enqueues both file reads on the startup DirectStorage queue, submits once, waits for both statuses, uploads the two 4096-byte regions as a 64×128 BC7 texture and draws to a 128×128 RGBA8 target. [EXE source](../tests/cpu/archive/directory_reader.zig) · [Windows comparison](../tests/cpu/archive_directory_gpu_check.py)
+
+Two source-built ETPF metadata sizes move the first stream from `0x8100` to `0xe8100`. The second record has a different compressed length. A test input adds 896 KiB to the first offset only and selects a valid alternate stream of the original length. All three runners return 0 and the top 8192 pixels change. Selecting EOF for the first request returns exit 6, preserves its destination and still decodes the second record correctly. Both successful cases require fence 1 and zero device references on release.
+
+```powershell
+cmake --build --preset dev --target archive_directory_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_archive_directory_gpu_(warp|hardware)$' -V
+```
+
 ### Recompiling the blast decoder
 
 The `cpu_native_archive_blast` test starts from the same archive reader and builds the unmodified blast 1.3 C file into a separate scalar x64 DLL with MSVC /Od. The [fixture translator](../tests/cpu/archive/translate_blast.py) follows direct calls from its PE export through the bit reader, Huffman table construction, symbol decoder and decompression loop. It reuses the x64 instruction lifter and frame analysis. Only generated C++ is compiled into the translated decoder. Its initialized data, including relocated table pointers, is separate from the native module. This profile uses per-thread tables, a bounded invocation stack, the six-argument blast ABI and two typed callback targets. The host supplies setjmp/longjmp semantics for a single active recovery point. The file I/O and allocation callbacks remain native.
