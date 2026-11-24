@@ -3211,6 +3211,28 @@ reference index caused the comparison to fail. Tested on Windows build
 26200.9974, RTX 4060 Laptop driver 32.0.16.1656 and WARP 10.0.26100.9818,
 with the debug layer enabled.
 
+## Runtime mesh geometry input fixture
+
+The source-built `tests/mesh_dynamic_geometry.s` computes a triangle or quad
+from two geometry buffer words. One word packs the vertex and primitive counts
+for `GS_ALLOC_REQ`. The other supplies the second primitive's indices. The
+CPU check runs the same instructions with six inputs and compares the
+allocation, vertex positions, attributes and complete index triples. Zero
+counts, a count above the declared maximum and an out-of-range index produce
+an empty allocation. Replacing the last index of the second triangle changes
+the exported triple and keeps the two-primitive allocation.
+
+```text
+python3 -B tests/mesh_dynamic_geometry_check.py
+python3 -B tests/mesh_dynamic_geometry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_dynamic_geometry_cpu$" -V
+```
+
+The binary check compares the LLVM-assembled bytes with the embedded fixture
+and compares the normalized Python and LLVM instruction listings. Both modes
+exercise the existing CPU wave model. A future dynamic lowerer can reuse the
+assembly and input cases for D3D12 readback in [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
+
 ## Amplification and mesh pipeline forms
 
 `tests/mesh_amplified_check.py` builds an amplification shader (`as_6_5`) and a
