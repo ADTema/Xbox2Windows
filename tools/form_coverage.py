@@ -84,6 +84,7 @@ CPU_FIXTURES = {
     "avx_int_regs": "cpu_aot_avx_int_regs",
     "avx_int_ymm_addsub": "cpu_aot_avx_int_ymm_addsub",
     "avx_int_ymm_minmax": "cpu_aot_avx_int_ymm_minmax",
+    "avx_int_ymm_sat": "cpu_aot_avx_int_ymm_sat",
     "avx_move_regs": "cpu_aot_avx_move_regs",
     "avx_move_mem": "cpu_aot_avx_move_mem",
     "call_pair": "cpu_aot_call_pair",
