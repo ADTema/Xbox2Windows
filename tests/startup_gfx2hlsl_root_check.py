@@ -3,6 +3,7 @@
 Each bad request gets a .fail file with a reason; the run exits 0 and still translates a valid
 request that sorts after a bad one.
 """
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -62,8 +63,10 @@ def main():
                 (directory / ("req_%016x%s" % (keys[name], ext))).write_bytes(data)
         # --pending visits requests in key order; the valid one must come after a bad one.
         assert keys["valid"] > min(keys[name] for name in BAD), "valid request does not sort after a bad one"
+        # The empty X2W_FXC publishes the manifest without compiling, so the valid request is
+        # translated the same way on a host without fxc.exe.
         result = subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", str(directory)],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, env=dict(os.environ, X2W_FXC=""))
         output = result.stdout + result.stderr
         assert result.returncode == 0, output
         for name, (_, reason) in BAD.items():
