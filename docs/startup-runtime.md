@@ -324,6 +324,21 @@ the debug heap spent about 8.9 s freeing the nodes of a 99,776-entry map built b
 `XMemMapPhysicalPages` call; without it the whole call took 0.46 s and the first DirectStorage batch
 completed about 20 s earlier. `startup_debug` checks both settings on its probe.
 
+A second local comparison on Windows 11 build 26200.9974 used a custom debugger
+with the same runtime DLL, saved state and warm cache in both runs. Times are seconds
+from process creation. The ordinary-heap run also recorded process audio levels.
+
+| Startup milestone | Debugger default (variable unset) | Ordinary heap (`_NO_DEBUG_HEAP=1`) |
+|---|---:|---:|
+| First captured window frame, including black | 30.14 | 7.40 |
+| First opening-movie open request | 132.98 | 86.72 |
+| First language selection screen matched | 152.16 | 105.24 |
+
+There was one run per setting. Measure the window and the first visible content
+separately when repeating this comparison. Time from the first recorded button
+release to language selection was about 17 seconds in both runs. For the public
+heap-flag regression, run `ctest --preset dev --no-tests=error -R '^startup_debug$'`.
+
 It writes:
 
 | File | Content |
