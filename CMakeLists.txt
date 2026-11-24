@@ -6448,6 +6448,14 @@ foreach(adapter IN ITEMS warp hardware)
         vm_raw_uav_${adapter}
         PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
+# Window validation and touching-window boundaries of resolve_raw_uav_store (src/raw_buffer_uav.h),
+# without a device. The mutated run is the negative control.
+add_executable(raw_buffer_uav_check tests/raw_buffer_uav_check.cpp)
+target_include_directories(raw_buffer_uav_check PRIVATE src)
+target_compile_features(raw_buffer_uav_check PRIVATE cxx_std_17)
+add_test(NAME raw_buffer_uav COMMAND raw_buffer_uav_check)
+add_test(NAME raw_buffer_uav_adjacent_control COMMAND raw_buffer_uav_check --mutate adjacent)
+set_tests_properties(raw_buffer_uav_adjacent_control PROPERTIES WILL_FAIL TRUE)
 
 if(EXISTS "${INTAKE_PYTHON}")
     add_executable(rcas_coordinate_readback tests/rcas_coordinate_readback/readback.cpp)
