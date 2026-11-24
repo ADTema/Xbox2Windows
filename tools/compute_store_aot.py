@@ -97,6 +97,7 @@ MUBUF_ATOMIC_METHODS = {
     "add": "Add", "sub": "Add", "and": "And", "or": "Or", "xor": "Xor",
     "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
     "swap": "Exchange", "cmpswap": "CompareExchange",
+    "inc": "CompareExchange", "dec": "CompareExchange",
 }
 
 IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax"
@@ -1380,8 +1381,21 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if op == "cmpswap":
                 # The ISA places replacement before compare, unlike the HLSL argument order.
                 word = f"{operands[1]}, {word}"
-            stores.extend((f"    {kind} ignoredAtomic;",
-                           f"    outputData.Interlocked{method}({offset}u, {word}, ignoredAtomic);"))
+            if op in ("inc", "dec"):
+                one, zero = ("1ull", "0ull") if wide else ("1u", "0u")
+                if op == "inc":
+                    desired = f"expected >= limit ? {zero} : expected + {one}"
+                else:
+                    desired = f"expected == {zero} || expected > limit ? limit : expected - {one}"
+                # Seed the first compare with zero. A failed CAS returns the word for the next try.
+                stores.extend((f"    const {kind} limit = {word};", f"    {kind} observed = {zero};",
+                               f"    {kind} expected;", "    [allow_uav_condition] do {",
+                               "        expected = observed;", f"        {kind} next = {desired};",
+                               f"        outputData.Interlocked{method}({offset}u, expected, next, observed);",
+                               "    } while (observed != expected);"))
+            else:
+                stores.extend((f"    {kind} ignoredAtomic;",
+                               f"    outputData.Interlocked{method}({offset}u, {word}, ignoredAtomic);"))
             atomic_update = True
         elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
                                r"(?P<typed>t)?buffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
