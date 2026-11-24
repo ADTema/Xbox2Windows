@@ -1158,7 +1158,6 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         stores[start:end] = [f"    if ({hlsl_word(left)} {GUARD_COMPARES[op]} {hlsl_word(right)}) {{",
                              *("    " + store for store in stores[start:end]), "    }"]
     body = "\n".join(stores)
-    helpers = "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
     cbuffer = (f"cbuffer Constants : register(b0) {{ uint4 params[{CONSTANT_WORDS // 4}]; }};\n"
                if constant_descriptor is not None else "")
     if source_descriptor is not None:
@@ -1170,7 +1169,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         body = "\n".join([*(step for _, step in ds_steps), body])
         if shared:
             local = ", uint3 local : SV_GroupThreadID"
-    cbuffer += helpers
+    # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
+    cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
     return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 

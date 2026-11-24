@@ -1125,6 +1125,10 @@ def f32_controls():
                    ("v_subrev_f32_e32 v6, 0x40490fdb, v5", "v_mul_f32_e32 v6, 0x40490fdb, v5"),
                    ("v_add_f32_e32 v1, 1.0, v6", "v_mul_f32_e32 v1, 1.0, v6"), ("v_subrev_f32_e32 v1, -4.0, v1", "v_mul_f32_e32 v1, -4.0, v1"))
     assert [line.split("(")[0] for line in only_mul if line.startswith("uint f32_")] == ["uint f32_mul"]
+    # A helper used only inside an LDS statement is still defined.
+    in_lds = aot.lower(variant(lds_f32_program("ds_add_f32"), ("ds_add_f32 v5, v7", "v_mul_f32_e32 v7, 2.0, v7\nds_add_f32 v5, v7")),
+                       32, **LDS_F32_BINDING).splitlines()
+    assert any(line.startswith("uint f32_mul(") for line in in_lds), in_lds
     # v_sub_f32 is src0 - src1 and v_subrev_f32 is src1 - src0. A bare sign flip or an exchange is another program.
     assert f32(("v_sub_f32_e32 v5, s0, v4", "v_subrev_f32_e32 v5, s0, v4")) != lines
     assert f32(("v_subrev_f32_e32 v6, 0x40490fdb, v5", "v_sub_f32_e32 v6, 0x40490fdb, v5")) != lines
