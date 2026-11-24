@@ -110,6 +110,12 @@ def decode_v_reg64(reg_id: int) -> str:
     return decode_s_reg64(reg_id)
 
 
+def decode_v_reg128(reg_id: int) -> str:
+    """Decode a 128-bit VOP operand that only a VGPR quad can hold (a scalar source is refused by the caller)."""
+    vreg = reg_id - 256
+    return f"v[{vreg}:{vreg + 3}]" if vreg <= 252 else "<invalid VGPR quad>"
+
+
 def _format_operand_modifiers(val: str, is_abs: int, is_neg: int) -> str:
     """Wrap a disassembled operand with inline abs (`|...|`) and neg (`-`) modifiers."""
     if is_abs and is_neg:
@@ -932,6 +938,7 @@ VOP3_NATIVE_OPS = {
     0x172: ("v_qsad_pk_u16_u8", "V_QSAD_PK_U16_U8 (VOP3A)", 3, False, 2, (2, 1, 2)),
     0x173: ("v_mqsad_pk_u16_u8", "V_MQSAD_PK_U16_U8 (VOP3A)", 3, False, 2, (2, 1, 2)),
     0x174: ("v_trig_preop_f64", "V_TRIG_PREOP_F64 (VOP3A)", 2, False, 2, (2, 1)),
+    0x175: ("v_mqsad_u32_u8", "V_MQSAD_U32_U8 (VOP3A)", 3, False, 4, (2, 1, 4)),
     0x176: ("v_mad_u64_u32", "V_MAD_U64_U32 (VOP3B)", 3, True, 2, (1, 1, 2)),
     0x177: ("v_mad_i64_i32", "V_MAD_I64_I32 (VOP3B)", 3, True, 2, (1, 1, 2)),
     0x178: ("v_xor3_b32", "V_XOR3_B32 (VOP3A)", 3, False, 1, (1, 1, 1)),
@@ -1003,11 +1010,19 @@ VOP3_RESTRICTED_MODIFIERS = {
     "v_mul_lo_i32": (False, False),
     "v_qsad_pk_u16_u8": (True, False),
     "v_mqsad_pk_u16_u8": (True, False),
+    "v_mqsad_u32_u8": (True, False),
     "v_interp_mov_f32_e64": (True, True),
 }
 
 # The v_interp_mov_f32_e64 parameter selector (src1 field): p10, p20 and p0.
 VINTRP_MOV_PARAMS = ("p10", "p20", "p0")
+
+
+def _format_vop3_vgpr_dst(vdst: int, width: int) -> str:
+    """Format a VOP3 VGPR destination of 1, 2 or 4 registers; a group running past v255 is flagged, not printed."""
+    if vdst + width > 256:
+        return {2: "<invalid VGPR pair>", 4: "<invalid VGPR quad>"}[width]
+    return _format_vgpr_range(vdst, width)
 
 
 def _vop3_output_modifiers(clamp: int, omod: int) -> str:
@@ -1024,6 +1039,9 @@ def _vop3_restricted_encoding_is_valid(op_name: str, arity: int, w0: int, w1: in
     if ((w0 >> 15) & 1 and not allow_clamp) or ((w1 >> 27) & 0x3 and not allow_omod):
         return False
     if arity < 3 and (w1 >> 18) & 0x1ff:
+        return False
+    if op_name == "v_mqsad_u32_u8" and not 256 <= (w1 >> 18) & 0x1ff <= 511:
+        # The accumulator is a VGPR quad: llvm-mc rejects an SGPR, constant or special-register src2.
         return False
     if op_name == "v_interp_mov_f32_e64":
         # src0 holds attr[5:0] and channel[7:6] only; src1 selects p10, p20 or p0.
@@ -3051,6 +3069,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 val = f"0x{literal:x}"
             elif width == 2:
                 val = decode_v_reg64(reg_id)
+            elif width == 4:
+                val = decode_v_reg128(reg_id)
             else:
                 val = decode_v_reg(reg_id)
             return _format_operand_modifiers(val, is_abs, is_neg)
@@ -3063,10 +3083,10 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             asm = f"{op_name} {dst_str}, {', '.join(src_strs)}"
         elif is_vop3b:
             sdst_str = decode_s_reg(sdst)
-            dst_str = f"v[{vdst}:{vdst + 1}]" if dst_width == 2 and vdst < 255 else (f"<invalid VGPR pair>" if dst_width == 2 else f"v{vdst}")
+            dst_str = _format_vop3_vgpr_dst(vdst, dst_width)
             asm = f"{op_name} {dst_str}, {sdst_str}, {', '.join(src_strs)}"
         else:
-            dst_str = f"v[{vdst}:{vdst + 1}]" if dst_width == 2 and vdst < 255 else (f"<invalid VGPR pair>" if dst_width == 2 else f"v{vdst}")
+            dst_str = _format_vop3_vgpr_dst(vdst, dst_width)
             asm = f"{op_name} {dst_str}, {', '.join(src_strs)}"
 
         if any(op_sel):
