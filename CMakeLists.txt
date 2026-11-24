@@ -526,6 +526,15 @@ target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
 add_executable(startup_inflate_probe tests/startup_inflate_probe.cpp)
 target_compile_features(startup_inflate_probe PRIVATE cxx_std_17)
 target_include_directories(startup_inflate_probe PRIVATE src)
+# The same probe decoding one bit at a time (the reference), and with one wrong table entry (the control).
+add_executable(startup_inflate_probe_bitwise tests/startup_inflate_probe.cpp)
+target_compile_features(startup_inflate_probe_bitwise PRIVATE cxx_std_17)
+target_include_directories(startup_inflate_probe_bitwise PRIVATE src)
+target_compile_definitions(startup_inflate_probe_bitwise PRIVATE X2W_INFLATE_FAST_BITS=0)
+add_executable(startup_inflate_probe_faulty tests/startup_inflate_probe.cpp)
+target_compile_features(startup_inflate_probe_faulty PRIVATE cxx_std_17)
+target_include_directories(startup_inflate_probe_faulty PRIVATE src)
+target_compile_definitions(startup_inflate_probe_faulty PRIVATE X2W_INFLATE_FAULTY_TABLE)
 
 add_executable(startup_dump_fence_check tests/startup_dump_fence.cpp tests/desktop_gpu.cpp)
 add_executable(startup_overlay_window tests/startup_overlay_window.cpp)
@@ -1612,9 +1621,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_storage_directory_batch.py" "$<TARGET_FILE:startup_stub_consumer>")
     set_tests_properties(startup_storage_directory_batch PROPERTIES TIMEOUT 30)
     # The stand-in's zlib decoder (src/startup_stubs/inflate.h) against CPython's zlib (#1149): stored,
-    # fixed and dynamic blocks, a sync flush, and rejected short, truncated and out-of-window streams.
+    # fixed and dynamic blocks, a sync flush, and rejected short, truncated and out-of-window streams;
+    # then seeded random streams against the bit-at-a-time build and a faulty-table control.
     add_test(NAME startup_inflate COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_inflate_check.py" "$<TARGET_FILE:startup_inflate_probe>")
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_inflate_check.py" "$<TARGET_FILE:startup_inflate_probe>"
+        "$<TARGET_FILE:startup_inflate_probe_bitwise>" "$<TARGET_FILE:startup_inflate_probe_faulty>")
     set_tests_properties(startup_inflate PROPERTIES TIMEOUT 60)
     add_test(NAME startup_live_view COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_live_view_check.py")

@@ -326,7 +326,19 @@ zlib encodes seeded synthetic data as stored, fixed and dynamic Huffman blocks, 
 the 32 KiB window and a sync flush between blocks; each result must equal the input. A stream with
 one byte too little capacity and a truncated stream must be rejected without writes past the
 destination. On bare deflate data, a match that starts at the first output byte decodes and one that
-starts a byte earlier is rejected before it copies anything. No GPU and no game files are needed:
+starts a byte earlier is rejected before it copies anything.
+
+The decoder looks Huffman codes of up to 10 bits up in a table filled when the code is built; longer
+codes and the last byte of input are decoded one bit at a time. A differential case decodes 900
+seeded random streams (random, repetitive, word and geometric-byte data; levels 0-9; all five zlib
+strategies; some with a sync or full flush), of which 92 have codes longer than 10 bits. Each runs at
+exact capacity, one byte short, truncated, and with one to three bits flipped: 3597 cases in all.
+Status, size and bytes must equal those of the same probe built with `X2W_INFLATE_FAST_BITS=0`
+(bit-at-a-time only), and those of CPython's zlib. The one exception allowed is a stream where
+`inflate.h` decodes past an incomplete code set that zlib rejects; with this seed, no case needs it.
+The negative control is the probe built with
+`X2W_INFLATE_FAULTY_TABLE`, where codes exactly 10 bits long decode as the next symbol. It must
+differ from the reference in at least one case; it differs in 265. No GPU and no game files are needed:
 
 ```powershell
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V
