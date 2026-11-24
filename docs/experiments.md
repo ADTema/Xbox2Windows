@@ -3257,34 +3257,54 @@ built; it makes no console mesh-shader ABI claim.
 
 `tests/startup_ngg_slice_check.py` separates an identity NGG triangle from
 single-change contrasts before any NGG lowering is attempted (#1723). Each case
-is one gfx1013 program in the NGG form: lane 0 of wave 0 writes the vertex and
-primitive counts to LDS, waits at `s_barrier` and sends `GS_ALLOC_REQ`
-(`m0 = primitives << 12 | vertices`); the other waves read the counts back after
-the barrier. Thread `t = 64 * wave + lane` exports vertex `t` when `t` is below
-the vertex count and primitive `t` (export target 20, three 10-bit indices as
-`tools/mesh_entry_aot.py` decodes them) when `t` is below the primitive count.
-Bit 31 as the null-primitive flag is an assumption of the model; only the
-`null` case depends on it. The programs are encoded from
-the `disasm_rdna2` opcode tables, decoded again (the text must match the
-source), and run by a Python reference model and by two candidate
-interpretations: `pass` (lane-private LDS, counts and primitive exports ignored,
-triangle list in thread order) and `lane` (lane-private LDS, counts and
-primitive exports honoured).
+is one gfx1013 program in the pattern this fixture models: lane 0 of wave 0
+writes the vertex and primitive counts to LDS, waits at `s_barrier` and sends
+`GS_ALLOC_REQ`; the other waves read the counts back after the barrier. Thread
+`t = 64 * wave + lane` exports vertex `t` when `t` is below the vertex count and
+primitive `t` when `t` is below the primitive count. The field layouts follow
+public sources:
 
-| Case | Change from identity | `pass` differs in | `lane` differs in |
-|---|---|---|---|
-| identity | 3 vertices, primitive (0,1,2), own-lane LDS round trip | nothing | nothing |
-| broadcast | lane 0 writes one LDS word; all lanes add it after `s_barrier` | parameters | parameters |
-| reversed | primitive (2,1,0) | primitives, winding | nothing |
-| null | two primitives allocated, the second null | counts | nothing |
-| two_waves | 66 vertices and 22 primitives over two waves | every field | positions, parameters, winding |
+| Field | Layout | Source |
+|---|---|---|
+| `GS_ALLOC_REQ` | `s_sendmsg` message 9; `m0 = primitives << 12 \| vertices` | LLVM AMDGPU `ID_GS_ALLOC_REQ`; Mesa NGG allocation request; same split in `tools/mesh_entry_aot.py` |
+| Primitive export | target 20; three 10-bit slots at bits 0, 10, 20, each a 9-bit index with the edge flag in bit 9; bit 31 null | LLVM AMDGPU `prim` target; Mesa gfx10 primitive export packing |
+| Wave index | bits 24..27 of the merged wave info in `s3` | Mesa NGG wave id in the thread group |
+| Opcodes | `v_mbcnt_lo/hi_u32_b32` 0x365/0x366, `v_lshl_or_b32` 0x36f, `v_cmpx_gt_u32` 0xd4, SOP/DS/EXP formats | LLVM AMDGPU gfx10 encodings |
+
+These are pinned as literal anchors (the `GS_ALLOC_REQ` and primitive-export
+words, the wave-index field operand, the expected `m0` values and the expected
+primitive words), so changing the encoder and the model together fails. The
+programs are encoded, decoded again with `disasm_rdna2` (the text must match the
+source), compared with golden vectors of `rdna2_tools_check`, and run by a
+Python reference model with the waves in forward and in reverse order, which
+must agree. Three candidate interpretations run on the same words: `pass`
+(lane-private LDS, counts and primitive exports ignored, triangle list in thread
+order), `lane` (lane-private LDS, counts and primitive exports honoured) and
+`shared` (group-shared LDS with `s_barrier`, counts and primitive exports
+honoured).
+
+| Case | Change from identity | `pass` differs in | `lane` differs in | `shared` differs in |
+|---|---|---|---|---|
+| identity | 3 vertices, primitive (0,1,2), own-lane LDS round trip | nothing | nothing | nothing |
+| broadcast | lane 0 writes one LDS word; all lanes add it after `s_barrier` | parameters | parameters | nothing |
+| reversed | primitive (2,1,0) | primitives, winding | nothing | nothing |
+| null | two primitives allocated, the second null | counts | nothing | nothing |
+| two_waves | 66 vertices and 22 primitives over two waves | every field | positions, parameters, winding | nothing |
+| masked_alu | `v5 += 4.0` with only lane 0 active | nothing | nothing | nothing |
+
+The separation holds between these three interpretations only. The `broadcast`
+and `two_waves` differences under `pass` and `lane` come from their lane-private
+LDS; `shared` is the reference semantics without its consistency assertions.
+Winding is the sign of the triangle's area in raw position x/y with y up, not a
+D3D front-face result after a viewport transform.
 
 The expected results are written out from the encoding. A changed DS offset
-must fail the decode comparison, and five planted model faults (8-bit index
-fields, the null bit ignored, swapped counts, no wave offset in the thread
-index, `s_barrier` ignored with wave 1 first) must each change an expected
-result. The words have not been reassembled with LLVM; there is no `binary`
-mode yet. The fixture is a classification aid, not a lowering.
+must fail the decode comparison, and six planted model faults must each change
+an expected result: index slots read at 8-bit steps, the null bit ignored,
+swapped counts, no wave offset in the thread index, `s_barrier` as a no-op
+(caught by the reverse wave order alone) and exec ignored by vector ALU
+instructions. The words have not been reassembled with LLVM; there is no
+`binary` mode yet. The fixture is a classification aid, not a lowering.
 
 ```sh
 python3 -B tests/startup_ngg_slice_check.py

@@ -2,41 +2,61 @@
 
   (no arguments)        encode, decode and run every case, pure Python
 
-The vertex programs of the shader-archive census that tools/startup/gfx2hlsl.py refuses use the gfx10 NGG
-protocol: one lane of wave 0 writes the vertex and primitive counts to LDS, waits on s_barrier and sends
-GS_ALLOC_REQ (s_sendmsg 9, m0 = primitives << 12 | vertices); the other waves of the group read the counts back
-after the barrier. Thread t = 64 * wave + lane exports vertex t (pos0, param0) when t < vertices and primitive t
-(export target 20) when t < primitives. The primitive word holds three 10-bit group vertex indices at bits 0, 10
-and 20, the layout tools/mesh_entry_aot.py already decodes (with the same m0 split). Bit 31 as the null-primitive
-flag is a modelling assumption of this fixture, not checked against hardware or a cited source here; only the
-'null' case depends on it. Edge-flag bits are not used.
+The fixture models this NGG primitive-shader pattern (no claim is made here about any shader archive): one
+lane of wave 0 writes the vertex and primitive counts to LDS, waits on s_barrier and sends GS_ALLOC_REQ; the other
+waves of the group read the counts back after the barrier. Thread t = 64 * wave + lane exports vertex t (pos0,
+param0) when t < vertices and primitive t (export target 20) when t < primitives. Field layouts, with the public
+sources they follow (LLVM's AMDGPU backend and Mesa's radv/radeonsi NGG code):
+
+  GS_ALLOC_REQ     s_sendmsg message id 9 (LLVM SendMsg ID_GS_ALLOC_REQ); m0 = primitives << 12 | vertices
+                   (Mesa's NGG allocation request; tools/mesh_entry_aot.py uses the same split, word 0x1003 for
+                   three vertices and one primitive)
+  primitive word   export target 20 (LLVM's "prim" target); three 10-bit slots at bits 0, 10 and 20, each a 9-bit
+                   group vertex index with the edge flag in its bit 9, and bit 31 the null-primitive flag (Mesa's
+                   gfx10 primitive export packing). Edge flags are left clear here.
+  wave index       bits 24..27 of the merged wave info in s3 (Mesa's NGG wave id in the thread group), read here
+                   with s_bfe_u32 s10, s3, 0x40018
+  opcodes          VOP3 v_mbcnt_lo/hi_u32_b32 0x365/0x366 and v_lshl_or_b32 0x36f, VOPC v_cmpx_gt_u32 0xd4, and the
+                   SOP1/SOP2/SOPC/SOPK/SOPP, DS and EXP formats of LLVM's gfx10 encodings
+
+ANCHORS below pins these as literal words and values, written from those sources and not from the model or the
+encoder, so changing the encoder and the model together still fails.
 
 Every case is one program built from documented gfx1013 encodings, decoded with tools/disasm_rdna2.py (the
 decoded text must equal the source line) and executed by a small reference model of those semantics: wave64,
-exec masks, scalar branches, one LDS per group, s_barrier, GS_ALLOC_REQ and the three export kinds. The same
-decoded words also run under two candidate interpretations of what a lowering could do:
+exec masks, scalar branches, one LDS per group, s_barrier, GS_ALLOC_REQ and the three export kinds. Each case
+runs with the waves scheduled in forward and in reverse order and both must agree, so the barrier is what orders
+the LDS traffic. The disassembler prints vcc_lo for the compare result; the model keeps the full 64-bit mask. The
+same decoded words also run under three candidate interpretations of what a lowering could do:
 
-  pass  - each lane alone: LDS is private to the lane, GS_ALLOC_REQ and primitive exports are ignored, and the
-          exported vertices form a triangle list in thread order;
-  lane  - each lane alone as above, but the allocated counts and the primitive exports are honoured.
+  pass    - each lane alone: LDS is private to the lane, GS_ALLOC_REQ and primitive exports are ignored, and the
+            exported vertices form a triangle list in thread order;
+  lane    - LDS private to the lane as above, but the allocated counts and the primitive exports are honoured;
+  shared  - LDS shared by the group with s_barrier, counts and primitive exports honoured: the reference semantics
+            without its consistency assertions, the candidate a lowering would use.
 
-The cases separate cleanly when the identity triangle gives the same result under the model and both
-interpretations, and each contrast differs from the model in exactly the fields its single change predicts:
+The separation shown here is between these three only. The cases separate cleanly when the identity triangle gives
+the same result under the model and every interpretation, and each contrast differs from the model in exactly the
+fields its single change predicts (shared never differs):
 
   identity    3 vertices, 1 primitive (0,1,2), parameters from the lane's own index, an own-lane LDS round trip
   broadcast   + lane 0 writes one LDS word, s_barrier, every lane adds it to its parameter
   reversed    + the primitive is (2,1,0)
   null        + two primitives are allocated and the second is exported as null
   two_waves   66 vertices, 22 primitives in a group of two waves: wave 1 learns the counts only through LDS
+  masked_alu  + under exec = lane 0 only, v5 += 4.0 (a vector ALU result that must not reach other lanes)
 
-Negative controls: a changed DS offset must fail the decode comparison, and five planted model faults (10-bit index fields read as 8-bit fields at 8-bit steps, the null bit ignored, the
-vertex and primitive counts swapped, the wave offset of the thread index dropped, s_barrier ignored with wave 1
-run first) must each change at least one expected result. The expected results are written out below from the
-encoding, not computed by the model.
+Winding is the sign of the triangle's area in raw position x/y (y up), not D3D front-face terms after a viewport.
 
-The words are not reassembled here: no llvm-mc binary mode yet, so the encodings rest on the opcode tables of
-tools/disasm_rdna2.py. This is a semantic fixture for classification; it is not a lowering and it makes no
-claim about the console's own compiler beyond the protocol above.
+Negative controls: a changed DS offset must fail the decode comparison, and six planted model faults must each
+change at least one expected result: index slots read at 8-bit steps, the null bit ignored, the vertex and
+primitive counts swapped, the wave offset of the thread index dropped, s_barrier treated as a no-op (caught by the
+reverse wave order alone), and exec ignored by vector ALU instructions. The expected results are written out below
+from the encoding, not computed by the model.
+
+The words are not reassembled here (no llvm-mc binary mode yet); they are checked against the decoder, against
+golden vectors of tests/rdna2_tools_check.py and against ANCHORS. This is a semantic fixture for classification;
+it is not a lowering and makes no claim about any console compiler.
 """
 import struct
 import sys
@@ -141,6 +161,52 @@ GOLDEN = [
 ]
 
 
+# Field layouts from the public sources named in the module docstring, as literal values (not derived from the
+# encoder or the model).
+def merged_wave_info(wave):
+    return wave << 24  # wave id in the thread group: bits 24..27 of the merged wave info
+
+
+def decode_alloc(m0):
+    return m0 & 0xfff, m0 >> 12  # (vertices, primitives)
+
+
+def decode_prim(word, bits=10):
+    """-> (i0, i1, i2, null): 9-bit indices in 10-bit slots (bit 9 of each slot is the edge flag), null at bit 31"""
+    return tuple(word >> (bits * k) & ((1 << (bits - 1)) - 1) for k in range(3)) + (bool(word >> 31),)
+
+
+ANCHORS = dict(
+    sendmsg_gs_alloc_req=0xbf900009,          # s_sendmsg, message id 9
+    export_prim_done_en1=0xf8000941,          # exp target 20, done, first source enabled
+    wave_id_field=0x00040018,                 # s_bfe_u32 operand: width 4, offset 24
+    m0={None: 0x1003, 'null': 0x2003, 'two_waves': 0x16042},
+    prim_words={None: {0: 0x00200400}, 'reversed': {0: 0x00000402}, 'null': {0: 0x00200400, 1: 0x80501003}},
+)
+
+
+def check_anchors(blobs, runs):
+    out = []
+    if decode_alloc(0x1003) != (3, 1) or merged_wave_info(1) != 0x01000000:
+        out.append('allocation or wave-id field layout moved')
+    if (decode_prim(0x00200400), decode_prim(0x00200600), decode_prim(0x80501003)) != \
+            ((0, 1, 2, False), (0, 1, 2, False), (3, 4, 5, True)):
+        out.append('primitive word layout moved')
+    for case, blob in blobs.items():
+        ws = struct.unpack('<%dI' % (len(blob) // 4), blob)
+        for key in ('sendmsg_gs_alloc_req', 'export_prim_done_en1', 'wave_id_field'):
+            if ANCHORS[key] not in ws:
+                out.append('%s: no literal word 0x%08x (%s)' % (case, ANCHORS[key], key))
+        group = runs[case]
+        want_m0 = ANCHORS['m0'].get(case, ANCHORS['m0'][None])
+        if group.m0_raw != want_m0:
+            out.append('%s: GS_ALLOC_REQ m0 %r, anchored 0x%x' % (case, group.m0_raw, want_m0))
+        want = ANCHORS['prim_words'].get(case)
+        if want and {t: group.prims.get(t) for t in want} != want:
+            out.append('%s: primitive words %r, anchored %r' % (case, group.prims, want))
+    return out
+
+
 # ---------------------------------------------------------------- the cases
 def program(change=None):
     """-> list of (expected disassembly, words); change is None or one contrast name"""
@@ -186,6 +252,12 @@ def program(change=None):
         ('ds_read_b32 v5, v8 offset:16', ds('ds_read_b32', 'v8', dst='v5', offset=16)),
         ('s_waitcnt lgkmcnt(0)', None),
     ]
+    if change == 'masked_alu':
+        code += [
+            ('s_mov_b64 exec, 1', sop1('s_mov_b64', 's126', 1)),
+            ('v_add_f32_e32 v5, 4.0, v5', vop2('v_add_f32_e32', 'v5', '4.0', 'v5')),
+            ('s_mov_b64 exec, -1', sop1('s_mov_b64', 's126', -1)),
+        ]
     if change == 'broadcast':
         code += [
             ('s_mov_b64 exec, 1', sop1('s_mov_b64', 's126', 1)),
@@ -281,7 +353,7 @@ def check_decode(code):
 
 # ---------------------------------------------------------------- reference model and interpretations
 class Group:
-    """One NGG thread group. mode: 'ngg' (reference), 'pass' or 'lane'; fault: planted model error or None."""
+    """One NGG thread group. mode: 'ngg' (reference), 'pass', 'lane' or 'shared'; fault: planted model error."""
 
     def __init__(self, blob, waves, mode='ngg', fault=None):
         self.ins, off = {}, 0
@@ -291,17 +363,20 @@ class Group:
             off += n
         self.mode, self.fault, self.nwaves = mode, fault, waves
         self.lds = {}
-        self.alloc = None
+        self.alloc = self.m0_raw = None
         self.vertices, self.params, self.prims = {}, {}, {}
 
-    def run(self):
-        waves = [dict(pc=0, s={3: w << 24}, v=[{} for _ in range(64)], exec=WAVE, scc=0, vcc=0, m0=0, w=w, done=False)
-                 for w in range(self.nwaves)]
-        order = waves[::-1] if self.fault == 'no_barrier' else waves
+    def run(self, reverse=False):
+        waves = [dict(pc=0, s={3: merged_wave_info(w)}, v=[{} for _ in range(64)], exec=WAVE, scc=0, vcc=0, m0=0,
+                      w=w, done=False, barriers=0) for w in range(self.nwaves)]
+        # round-robin, one barrier interval per wave per round: a wave stops at s_barrier until the others arrive
+        order = waves[::-1] if reverse else waves
         while not all(w['done'] for w in waves):
             for w in order:
                 while not w['done'] and not self.step(w):
                     pass
+        if self.mode == 'ngg':
+            assert len({w['barriers'] for w in waves}) == 1, 'waves reach different numbers of s_barrier'
         return self.result()
 
     # operand access
@@ -337,6 +412,7 @@ class Group:
         if name == 's_endpgm':
             w['done'] = True
         elif name == 's_barrier':
+            w['barriers'] += 1
             return self.fault != 'no_barrier'
         elif name in ('s_waitcnt',):
             pass
@@ -349,8 +425,8 @@ class Group:
             assert op == ['0x9'], asm
             if self.mode != 'pass':
                 assert w['w'] == 0 and self.alloc is None, 'GS_ALLOC_REQ outside wave 0 or repeated'
-                m0 = w['m0']
-                v, p = m0 & 0xfff, m0 >> 12
+                self.m0_raw = w['m0']
+                v, p = decode_alloc(w['m0'])
                 self.alloc = (p, v) if self.fault == 'swap_counts' else (v, p)
         elif name == 's_mov_b64':
             val = self.sval(w, op[1]) & WAVE if op[1] in ('exec',) or op[1].startswith('s[') else (
@@ -396,7 +472,7 @@ class Group:
         elif name.startswith('ds_'):
             off = int(asm.split('offset:')[1]) if 'offset:' in asm else 0
             for i in self.lanes(w):
-                lds = self.lds if self.mode == 'ngg' else self.lds.setdefault((w['w'], i), {})
+                lds = self.lds if self.mode in ('ngg', 'shared') else self.lds.setdefault((w['w'], i), {})
                 if name == 'ds_write_b32':
                     lds[self.vval(w, op[0], i) + off] = self.vval(w, op[1], i)
                 else:
@@ -413,7 +489,7 @@ class Group:
                 else:
                     raise AssertionError('model lacks ' + asm)
         elif name.startswith('v_'):
-            for i in self.lanes(w):
+            for i in (range(64) if self.fault == 'ignore_exec_valu' else self.lanes(w)):
                 a = [self.vval(w, t, i) for t in op[1:]]
                 if name == 'v_mov_b32_e32':
                     r = a[0]
@@ -447,7 +523,7 @@ class Group:
         return False
 
     def result(self):
-        bits = 8 if self.fault == 'index_bits' else 10
+        bits = 8 if self.fault == 'index_bits' else 10  # fault: slots read at 8-bit steps
         if self.mode == 'pass':
             nv = len(self.vertices)
             counts = (nv, nv // 3)
@@ -459,10 +535,10 @@ class Group:
                 assert set(self.vertices) == set(range(nv)) and set(self.prims) == set(range(npr)),                     'exports do not match the allocation'
             tris = []
             for t in sorted(k for k in self.prims if k < npr):
-                word = self.prims[t]
-                if word >> 31 and self.fault != 'ignore_null':
+                *tri, null = decode_prim(self.prims[t], bits)
+                if null and self.fault != 'ignore_null':
                     continue
-                tris.append(tuple(word >> (bits * k) & ((1 << bits) - 1) for k in range(3)))
+                tris.append(tuple(tri))
         verts = [self.vertices.get(t) for t in range(counts[0])]
         winding = []
         for tri in tris:
@@ -487,6 +563,7 @@ EXPECTED = {
     None: IDENTITY,
     'broadcast': dict(IDENTITY, params=[4.0, 5.0, 6.0]),
     'reversed': dict(IDENTITY, prims=[(2, 1, 0)], winding=['ccw']),
+    'masked_alu': dict(IDENTITY, params=[4.0, 1.0, 2.0]),
     'null': dict(IDENTITY, counts=(3, 2)),
     'two_waves': dict(counts=(66, 22), positions=[pos(t) for t in range(66)], params=[float(t) for t in range(66)],
                       prims=[(3 * t, 3 * t + 1, 3 * t + 2) for t in range(22)],
@@ -502,13 +579,25 @@ PREDICTED = {
     # wave 1 never learns the counts: vertices 64 and 65 are missing, so primitive 21 (63, 64, 65) is invalid
     'two_waves': {'pass': {'counts', 'positions', 'params', 'prims', 'winding'},
                   'lane': {'positions', 'params', 'winding'}},
+    'masked_alu': {'pass': set(), 'lane': set()},
 }
-FAULTS = ('index_bits', 'ignore_null', 'swap_counts', 'lane_index', 'no_barrier')
+for _case in PREDICTED.values():
+    _case['shared'] = set()
+MODES = ('pass', 'lane', 'shared')
+FAULTS = ('index_bits', 'ignore_null', 'swap_counts', 'lane_index', 'no_barrier', 'ignore_exec_valu')
 
 
-def evaluate(blob, case, mode='ngg', fault=None):
+def evaluate(blob, case, mode='ngg', fault=None, keep=None):
+    """result of one case, run in forward and reverse wave order; the two must agree"""
     try:
-        return Group(blob, WAVES.get(case, 1), mode, fault).run()
+        results = []
+        for reverse in (False, True):
+            group = Group(blob, WAVES.get(case, 1), mode, fault)
+            results.append(group.run(reverse))
+            if keep is not None and not reverse:
+                keep[case] = group
+        assert results[0] == results[1], 'the result depends on the wave order'
+        return results[0]
     except AssertionError as error:
         return dict(error=str(error))
 
@@ -524,16 +613,18 @@ def main():
         failures.append('a changed DS offset still decoded to the source text')
     except AssertionError:
         pass
+    runs = {}
     for case, blob in blobs.items():
-        ref = evaluate(blob, case)
+        ref = evaluate(blob, case, keep=runs)
         if ref != EXPECTED[case]:
             failures.append('%s: reference model %r' % (case, {k: v for k, v in ref.items() if EXPECTED[case].get(k) != v}))
             continue
-        for mode in ('pass', 'lane'):
+        for mode in MODES:
             got = evaluate(blob, case, mode)
             diff = {k for k in ref if got.get(k) != ref[k]}
             if diff != PREDICTED[case][mode]:
                 failures.append('%s/%s differs in %s, predicted %s' % (case, mode, sorted(diff), sorted(PREDICTED[case][mode])))
+    failures += check_anchors(blobs, runs)
     for fault in FAULTS:
         caught = [case for case, blob in blobs.items() if evaluate(blob, case, fault=fault) != EXPECTED[case]]
         if not caught:
@@ -541,7 +632,8 @@ def main():
     if failures:
         print('\n'.join(failures))
         return 1
-    print('%d cases decoded and separated; %d planted model faults detected' % (len(blobs), len(FAULTS)))
+    print('%d cases decoded, anchored and separated under %d interpretations; %d planted model faults detected'
+          % (len(blobs), len(MODES), len(FAULTS)))
     return 0
 
 
