@@ -4002,7 +4002,11 @@ any pairing. The e64 form is lowered only as plain registers: clamp, output
 scale (`mul:`, `div:`), negate and absolute value, a swapped operand order,
 a special register such as `vcc_lo` or `null`, and an inline constant are
 rejected, as are the other element types and `v_cmp_*`. A comparison with NaN
-kills no pixel. The textures have one mip.
+kills no pixel. The sample is `image_sample` or `image_sample_lz`, with one
+2D coordinate pair, a single-channel `dmask` and no other modifier. The
+second lowers to `SampleLevel(samp,uv,0)` instead of `Sample(samp,uv)`; one
+sample per program is still required, whichever spelling it uses. The
+textures have one mip.
 
 The JSON bindings used by the source-built fixture are constructed by
 `bindings(slot)` in `tests/sampled_coverage_check.py`. A descriptor entry lists
@@ -4041,8 +4045,23 @@ pairing with LLVM and requires the same HLSL as the e32 program. It also
 assembles each modifier, constant and special-register form above and requires
 the translator command to refuse it and write no output. The CTest limit of
 `sampled_coverage_<adapter>` is raised from 60 to 150 seconds for the extra
-draws. The
-Windows readback has not been run on a GPU adapter by the author; the CI result
+draws.
+
+The explicit-level sample has no extra readback that can tell it from the
+implicit one: the textures have one mip and the draw maps texels one to one, so
+`SampleLevel(…,0)` and `Sample` return the same values there, and the
+fixture only repeats the first readback with the `image_sample_lz` program on
+the first texture. The Linux step requires the lowered source to contain
+`SampleLevel(samp,uv,0)` and no `Sample(` call (a lowering of the
+implicit form fails that check), the same program as the implicit lowering with
+only that call replaced, on both textures and for the red channel, and refusal
+of a second sample in any order. It assembles `tfe`, `a16`, `lwe`, `d16`,
+`r128`, `unorm`, `glc`, `slc`, `dlc`, a two-channel `dmask`, a 3D
+dimension, `image_sample_o`-style offsets and `image_sample_l` for both
+opcodes with LLVM 19 and requires the translator command to refuse each and
+write no output. `da` and a 2D array dimension are refused at the
+translator-level check only, because LLVM 19 does not assemble them in this form.
+The Windows readback has not been run on a GPU adapter by the author; the CI result
 on the pull request is the first measurement.
 
 #### Intel first-full-query diagnostic
