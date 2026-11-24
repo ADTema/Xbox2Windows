@@ -10089,6 +10089,27 @@ python3 -B tests/rdna2_tools_check.py
 Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
 measurement on hardware or in a Windows run backs the descriptions.
 
+## gfx1013 VOP1 v_cvt_off_f32_i4, v_sat_pk_u8_i16, v_swap_b32 and v_swaprel_b32 decoding
+
+`tools/disasm_rdna2.py` decodes four more VOP1 opcodes that printed as `v_vop1_NN` (and, through VOP3, as `v_vop1_NN`
+at 0x180 + opcode): `v_cvt_off_f32_i4` (0x0e), `v_sat_pk_u8_i16` (0x62), `v_swap_b32` (0x65) and `v_swaprel_b32` (0x68). The
+first two decode in the `_e32`, `_e64`, SDWA and DPP spellings llvm-mc accepts. The two swaps exist only as 32-bit VOP1:
+their VOP3A, SDWA and DPP spellings are eight-byte `<unsupported ...>` records, as llvm-mc refuses them, and the next
+instruction keeps its offset. They print without a suffix, as llvm-mc does, and a non-VGPR source prints like any other
+VOP1 source (llvm-mc prints it with an invalid-register note). `tools/scan_unsupported_shaders.py` already recognized
+three of the names and now also recognizes `v_swaprel_b32`.
+```sh
+python3 -B tests/rdna2_tools_check.py
+```
+
+The expected texts are the gfx1013 disassembly of words assembled with llvm-mc. A sweep of 3,000 random e32 and e64 words
+over the four opcodes found the same classes of difference from llvm-mc as existing integer-source VOP1 opcodes such as
+`v_cvt_f32_i32` (e64 modifier bits that llvm-mc refuses and the decoder prints, and `s230` against LLVM 23's
+`src_flat_scratch_base_lo`).
+
+Scope: decoding and scanner recognition only. `pixel_aot` already lowers the first three; nothing lowers `v_swaprel_b32`,
+and no measurement on hardware backs the descriptions.
+
 ## gfx1013 VOP3 and MUBUF decoding: integer multiply, quad SAD, interpolation move, high-half format buffer ops
 
 `tools/disasm_rdna2.py` decodes six more gfx1013 forms (issue #938): the VOP3 opcodes `v_mul_lo_i32` (0x16b),

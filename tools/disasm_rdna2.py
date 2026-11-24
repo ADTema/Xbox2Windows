@@ -593,6 +593,7 @@ VOP1_OPS = {
     0x0b: ("v_cvt_f32_f16_e32", "Convert float16 to float32"),
     0x0c: ("v_cvt_rpi_i32_f32_e32", "Convert float32 to int32 (round to +inf)"),
     0x0d: ("v_cvt_flr_i32_f32_e32", "Convert float32 to int32 (floor)"),
+    0x0e: ("v_cvt_off_f32_i4_e32", "Convert 4-bit signed offset to float32"),
     0x0f: ("v_cvt_f32_f64_e32", "Convert float64 to float32"),
     0x10: ("v_cvt_f64_f32_e32", "Convert float32 to float64"),
     0x11: ("v_cvt_f32_ubyte0_e32", "Convert unsigned byte 0 to float32"),
@@ -635,8 +636,11 @@ VOP1_OPS = {
     0x5d: ("v_trunc_f16_e32", "Truncate toward zero float16"),
     0x5e: ("v_rndne_f16_e32", "Round to nearest even float16"),
     0x5f: ("v_fract_f16_e32", "Fractional part float16"),
+    0x62: ("v_sat_pk_u8_i16_e32", "Saturate int16 pair to packed uint8"),
     0x63: ("v_cvt_norm_i16_f16_e32", "Convert float16 to normalized int16"),
     0x64: ("v_cvt_norm_u16_f16_e32", "Convert float16 to normalized uint16"),
+    0x65: ("v_swap_b32", "Swap the 32-bit values of two VGPRs"),
+    0x68: ("v_swaprel_b32", "Swap two VGPRs, relative to M0"),
 }
 
 VOPC_OPS = {
@@ -3025,6 +3029,11 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             return (8, "v_readfirstlane_b32_unsupported",
                     "v_readfirstlane_b32 <unsupported VOP3A encoding>",
                     "VOP3A encoding of v_readfirstlane_b32 is not available on gfx1013")
+
+        if op_name in ("v_swap_b32", "v_swaprel_b32"):
+            # These two exist only as 32-bit VOP1: llvm-mc rejects the e64 spelling. Keep the eight-byte boundary.
+            return (8, f"{op_name}_unsupported", f"{op_name} <unsupported VOP3A encoding>",
+                    f"{op_name} has no VOP3A encoding on gfx1013")
 
         if op_name == "v_nop":
             return (8, "v_nop", "v_nop", "Vector no-op (VOP3A)")
