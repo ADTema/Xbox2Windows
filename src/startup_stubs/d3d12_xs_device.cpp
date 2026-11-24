@@ -19,6 +19,7 @@
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
 #include "startup_stubs/translated_sampler_bindings.h"
+#include "startup_stubs/bc7_4k_s.h"
 
 #include "startup_stubs/slice_footprints.h"
 
@@ -1354,7 +1355,7 @@ D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes
     u64 offset = 0;
     return ring_copy(title_address, bytes, &offset) ? upload_ring->GetGPUVirtualAddress() + offset : 0;
 }
-bool ring_copy(u64 title_address, std::size_t bytes, u64* offset)
+unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset)
 {
     constexpr u64 ring_bytes = u64{256} << 20;
     ID3D12Resource*& ring = upload_ring;
@@ -1383,12 +1384,19 @@ bool ring_copy(u64 title_address, std::size_t bytes, u64* offset)
         }
         ReleaseSRWLockExclusive(&lock);
     }
-    if (!ring || bytes == 0 || bytes > ring_bytes / 4) return false;
+    if (!ring || bytes == 0 || bytes > ring_bytes / 4) return nullptr;
     const u64 rounded = (bytes + 511) & ~u64{511};  // 512: texture footprints are placed in the ring too
     u64 start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded))) % ring_bytes;
     if (start + rounded > ring_bytes) start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded) + (ring_bytes - start))) % ring_bytes, start = 0;
-    std::memcpy(mapped + start, reinterpret_cast<const void*>(title_address), bytes);
     *offset = start;
+    return mapped + start;
+}
+
+bool ring_copy(u64 title_address, std::size_t bytes, u64* offset)
+{
+    auto* dest = reserve_upload_ring(bytes, offset);
+    if (!dest) return false;
+    std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
 }
 
@@ -1571,7 +1579,11 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
 }
 
 extern SRWLOCK written_lock;
-std::unordered_map<u64, u64>& written_textures();
+struct TextureWrite {
+    u64 generation = 0;
+    UINT bc7_width = 0, bc7_height = 0;
+};
+std::unordered_map<u64, TextureWrite>& written_textures();
 #include "startup_stubs/d3d12_draw.inl"
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
@@ -2106,7 +2118,13 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         // Textures cannot be placed on title memory on desktop: a committed default-heap texture
         // stands in, not aliased with the title address. The clear value is dropped if refused.
-        const D3D12_RESOURCE_DESC texture = sanitized(*desc);
+        D3D12_RESOURCE_DESC texture = sanitized(*desc);
+        if (x2w_startup::supports_bc7_4k_s(*desc) && x2w_local::env_on("X2W_XG_BC7_4K_S_LAYOUT")) {
+            const x2w_startup::Bc7Surface surface(*desc);
+            // Desktop BC7 allocations require whole blocks at the top mip.
+            texture.Width = surface.columns * x2w_startup::Bc7Surface::block_texels;
+            texture.Height = surface.rows * x2w_startup::Bc7Surface::block_texels;
+        }
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
         const auto* clear_value = static_cast<const D3D12_CLEAR_VALUE*>(clear);
         ID3D12Resource* created = nullptr;
@@ -2193,6 +2211,8 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     *out = w;
     return S_OK;
 }
+
+#include "d3d12_memory_srv.inl"
 
 // The title exports __XMemAllocationHooks__ = {alloc(size, attributes), free(ptr, attributes), ...}.
 // Its alloc routine selects a hook chain by allocatorId (attribute bits 16-23). Around the creation
@@ -2757,6 +2777,7 @@ void build_tables()
     (void)&device_adapter_luid;
     // Xbox order from here.
     tables[device_kind][48] = reinterpret_cast<void*>(&device_create_command_queue_x);
+    tables[device_kind][70] = reinterpret_cast<void*>(&device_memory_srv);
     tables[device_kind][73] = reinterpret_cast<void*>(&device_create_command_list_x);
     tables[device_kind][78] = reinterpret_cast<void*>(&device_frame_interval);
     tables[device_kind][79] = reinterpret_cast<void*>(&device_frame_event);
@@ -2827,16 +2848,29 @@ void build_tables()
 }
 
 SRWLOCK written_lock = SRWLOCK_INIT;
-std::unordered_map<u64, u64>& written_textures() { static std::unordered_map<u64, u64> m; return m; }  // title base -> generation
+std::unordered_map<u64, TextureWrite>& written_textures() { static std::unordered_map<u64, TextureWrite> m; return m; }
+
+void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
+{
+    AcquireSRWLockExclusive(&written_lock);
+    auto& written = written_textures()[reinterpret_cast<u64>(base)];
+    ++written.generation;
+    written.bc7_width = bc7_width;
+    written.bc7_height = bc7_height;
+    ReleaseSRWLockExclusive(&written_lock);
+}
 }  // namespace
 
 // Called by the XG stand-in after it filled texture memory at a title address.
 extern "C" __declspec(dllexport) void x2w_d3d12_texture_written(void* base, unsigned long long bytes)
 {
     (void)bytes;
-    AcquireSRWLockExclusive(&written_lock);
-    ++written_textures()[reinterpret_cast<u64>(base)];
-    ReleaseSRWLockExclusive(&written_lock);
+    note_texture_write(base, 0, 0);
+}
+
+extern "C" __declspec(dllexport) void x2w_d3d12_bc7_4k_s_written(void* base, UINT width, UINT height)
+{
+    note_texture_write(base, width, height);
 }
 
 bool x2w_d3d12_permissive()

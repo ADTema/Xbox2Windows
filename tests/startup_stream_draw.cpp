@@ -5,9 +5,15 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <iterator>
+#include <vector>
+
+#include "startup_stream_draw.h"
 
 using Microsoft::WRL::ComPtr;
+extern "C" __declspec(dllimport) HRESULT XGCreateTextureComputer(const D3D12_RESOURCE_DESC*, void***, UINT64, UINT64);
 
 // The components under test receive the guest ABI's vtable slots. The observation
 // queue and its readback buffer are desktop objects owned only by the fixture.
@@ -107,14 +113,94 @@ int draw_logical_tables(ID3D12Device* desktop, void* guest, void* list)
     return 0;
 }
 
-int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels,
-                      DXGI_FORMAT format, UINT export_word)
+namespace {
+struct Bc7Binding {
+    std::vector<unsigned char> backing, views;
+    UINT64 table = 0;
+};
+
+bool populate_tiled_bc7(const StartupBc7Input& input, const D3D12_RESOURCE_DESC& desc,
+                        const std::vector<unsigned char>& blocks, UINT row_bytes, Bc7Binding& binding)
 {
+    void** computer = nullptr;
+    if (FAILED(XGCreateTextureComputer(&desc, &computer, 0, 0)) || !computer) return false;
+    const auto table = static_cast<void**>(computer[0]);
+    using Query = HRESULT(*)(void*, unsigned char*);
+    using Write = HRESULT(*)(void*, unsigned char*, UINT, UINT, const unsigned char*, UINT, UINT);
+    std::array<unsigned char, 0x18 + 4 * 0x6c8 + 8> layout{};
+    UINT64 span = 0;
+    HRESULT hr = reinterpret_cast<Query>(table[2])(computer, layout.data());
+    if (SUCCEEDED(hr)) std::memcpy(&span, layout.data(), sizeof span);
+    const UINT64 expected = input.width == 64 ? 4096 : 16384;
+    if (span != expected) hr = E_FAIL;
+    if (SUCCEEDED(hr)) {
+        binding.backing.resize(static_cast<std::size_t>(span), 0xa5);
+        hr = reinterpret_cast<Write>(table[8])(computer, binding.backing.data(), 0, 0, blocks.data(),
+                                                row_bytes, static_cast<UINT>(blocks.size()));
+    }
+    reinterpret_cast<UINT64(*)(void*)>(table[1])(computer);
+    return SUCCEEDED(hr);
+}
+
+bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
+{
+    std::ifstream file(input.blocks, std::ios::binary);
+    const std::vector<unsigned char> blocks{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>{}};
+    const UINT columns = (input.width + 3) / 4, rows = (input.height + 3) / 4, row_bytes = columns * 16;
+    if (blocks.size() != static_cast<std::size_t>(row_bytes) * rows) return false;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, input.width, input.height, 1, 1,
+        DXGI_FORMAT_BC7_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    if (input.tiled) {
+        if (!populate_tiled_bc7(input, desc, blocks, row_bytes, binding)) return false;
+    } else {
+        auto aligned = desc;
+        aligned.Width = columns * 4;
+        aligned.Height = rows * 4;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT64 size = 0;
+        desktop->GetCopyableFootprints(&aligned, 0, 1, 0, &footprint, nullptr, nullptr, &size);
+        if (!size || size == UINT64_MAX || footprint.Footprint.RowPitch < row_bytes) return false;
+        binding.backing.resize(static_cast<std::size_t>(size));
+        for (UINT y = 0; y < rows; ++y)
+            std::memcpy(binding.backing.data() + footprint.Offset + y * footprint.Footprint.RowPitch,
+                        blocks.data() + y * row_bytes, row_bytes);
+    }
+
+    void* texture = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(binding.backing.data()), arg(&desc),
+        D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&texture))))) return false;
+
+    const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT entries = (32 + increment - 1) / increment;
+    binding.views.resize(static_cast<std::size_t>(entries) * increment);
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, entries, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+                arg(binding.views.data()), binding.views.size()};
+    void* heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, arg(&heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&heap)))))
+        return false;
+    const auto cpu = invoke(heap, 9);
+    if (cpu != arg(binding.views.data())) return false;
+    invoke(guest, 18, arg(texture), 0, cpu);
+    binding.table = invoke(heap, 10);
+    return binding.table != 0;
+}
+}  // namespace
+
+int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
+                      std::uint32_t format_value, std::uint32_t export_word)
+{
+    const auto format = static_cast<DXGI_FORMAT>(format_value);
     const bool legacy = format == DXGI_FORMAT_UNKNOWN;
     const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
-    const UINT width = legacy ? 8 : 1, height = legacy ? 4 : 1, count = integer ? 2 : 1;
+    const UINT width = bc7 ? bc7->width : legacy ? 8 : 1, height = bc7 ? bc7->height : legacy ? 4 : 1;
+    const UINT count = integer ? 2 : 1;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
+    Bc7Binding binding;
+    if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     // The wrapped heap gives the stand-in a descriptor shadow for the typed RTV.
     const struct {
@@ -156,18 +242,22 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         FAILED(static_cast<HRESULT>(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&fence))))) return 23;
 
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
-    const D3D12_RECT left{0, 0, static_cast<LONG>(legacy ? width / 2 : width), static_cast<LONG>(height)};
+    const D3D12_RECT rect{0, 0, static_cast<LONG>(legacy && !bc7 ? width / 2 : width), static_cast<LONG>(height)};
     invoke(list, 139, arg(allocator));
     for (UINT i = 0; i < count; ++i) invoke(list, 52, rtvs[i].ptr, arg(clear));
     invoke(list, 50, count, arg(rtvs.data()));
     invoke(list, 21, 1, arg(&viewport));
-    invoke(list, 22, 1, arg(&left));
+    invoke(list, 22, 1, arg(&rect));
     invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(list, 25, arg(pso));
     if (export_word) invoke(list, 40, 0, 1, arg(&export_word), 0);
     if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
         if (int result = draw_logical_tables(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
+        extern int draw_address_srvs(ID3D12Device*, void*, void*);
+        if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
     } else {
+        if (bc7) invoke(list, 36, 0, binding.table);
         invoke(list, 12, 3, 1);
     }
     invoke(list, 9);
