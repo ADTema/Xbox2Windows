@@ -119,6 +119,10 @@ def main():
     create.restype = HRESULT
     check_layout(create, 81, 69, 128, 128)
     check_layout(create, 64, 64, 64, 64)
+    # A shape whose padded extent is not square: both padded fields are asserted against the
+    # expected pair, so a swapped or duplicated width/height is caught only here (the two shapes
+    # above pad to a square, where the two fields hold the same number).
+    check_layout(create, 200, 72, 256, 128)
 
 
 if __name__ == "__main__":
