@@ -9237,12 +9237,83 @@ DPP_CVT_TO_FLOAT = [
     "v_fma_f32 v14, 0x41000000, v27, v14",
     "v_cvt_off_f32_i4_dpp v15, v22 dpp8:[1,0,3,2,5,4,7,6]",
 ]
+DPP_CVT_FLR_RPI = [
+    *DPP_CVT_LANES,
+    "v_add_f32_e32 v21, 0.5, v20",
+    "v_cvt_flr_i32_f32_dpp v22, v21 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_cvt_rpi_i32_f32_dpp v23, v21 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    *[f"v_cvt_f32_i32_dpp v{24+lane}, v22 quad_perm:[{lane},{lane},{lane},{lane}] row_mask:0xf bank_mask:0xf"
+      for lane in range(4)],
+    *[f"v_cvt_f32_i32_dpp v{28+lane}, v23 quad_perm:[{lane},{lane},{lane},{lane}] row_mask:0xf bank_mask:0xf"
+      for lane in range(4)],
+    "v_fma_f32 v13, 4.0, v25, v24",
+    "v_fma_f32 v13, 0x41800000, v26, v13",
+    "v_fma_f32 v13, 0x42800000, v27, v13",
+    "v_fma_f32 v15, 4.0, v29, v28",
+    "v_fma_f32 v15, 0x41800000, v30, v15",
+    "v_fma_f32 v15, 0x42800000, v31, v15",
+    "v_mov_b32_e32 v40, s44",
+    "v_mov_b32_e32 v41, s45",
+    "v_cvt_flr_i32_f32_dpp v12, -v40 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_cvt_rpi_i32_f32_dpp v14, v41 dpp8:[2,3,0,1,6,7,4,5]",
+]
+
+
+def dpp_pkrtz_program():
+    body = [
+        *DPP_CVT_LANES,
+        "v_add_f32_e32 v22, 1.0, v20",
+        "v_mov_b32_e32 v24, s44",
+        "v_mov_b32_e32 v25, s45",
+    ]
+    program = with_constants(body)
+    i16 = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
+    i17 = program.index("v_cvt_pkrtz_f16_f32_e32 v17, v14, v15")
+    program[i16] = "v_cvt_pkrtz_f16_f32_dpp v16, -v22, |v25| quad_perm:[3,3,3,3] row_mask:0xf bank_mask:0xf"
+    program[i17] = "v_cvt_pkrtz_f16_f32_dpp v17, v22, v24 dpp8:[2,2,2,2,6,6,6,6]"
+    return program
 
 
 def check_dpp_cvt_refusals():
+    # Positive static checks: lower flr/rpi and pkrtz DPP fixtures so form_coverage_check counts all 6 forms
+    # and pin that pkrtz swizzles src0 only (never src1) and accepts RTZ HW_REG_MODE.
+    flr_rpi_hlsl = translate_int(uncompressed_export(DPP_CVT_FLR_RPI))
+    assert "cvt_flr_i32_f32(" in flr_rpi_hlsl and "cvt_rpi_i32_f32(" in flr_rpi_hlsl
+    pkrtz_hlsl = translate(dpp_pkrtz_program())
+    assert "QuadReadLaneAt(" in pkrtz_hlsl and "export16(" in pkrtz_hlsl
+    hi_lines = [line for line in pkrtz_hlsl.splitlines() if "_hi = " in line]
+    assert len(hi_lines) == 2 and all("QuadRead" not in line for line in hi_lines), hi_lines
+    rtz_pkrtz = list(dpp_pkrtz_program())
+    nop_pkrtz = list(dpp_pkrtz_program())
+    rtz_pos = rtz_pkrtz.index("v_cvt_pkrtz_f16_f32_dpp v16, -v22, |v25| quad_perm:[3,3,3,3] row_mask:0xf bank_mask:0xf")
+    rtz_pkrtz.insert(rtz_pos, "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3")
+    nop_pkrtz.insert(rtz_pos, "s_nop 0")
+    assert translate(rtz_pkrtz) == translate(nop_pkrtz)
     for instruction, message in (
         ("v_cvt_f32_i32_dpp v256, v12 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
          "Invalid conversion DPP operation"),
+        ("v_cvt_flr_i32_f32_dpp v256, v12 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+         "Invalid conversion DPP operation"),
+        ("v_cvt_rpi_i32_f32_dpp v12, -v12 dpp8:[1,0,3,2,5,4,7,6]",
+         "Source modifiers are not allowed"),
+        ("v_cvt_flr_i32_f32_dpp v12, |v12| dpp8:[1,0,3,2,5,4,7,6]",
+         "Source modifiers are not allowed"),
+        ("v_cvt_flr_i32_f32_dpp v12, v12 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0x3",
+         "Unsupported DPP16 modifier"),
+        ("v_cvt_rpi_i32_f32_dpp v12, v255 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+         "DPP operand v255 is read before it is written"),
+        ("v_cvt_pkrtz_f16_f32_dpp v256, v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+         "Invalid pack DPP operation"),
+        ("v_cvt_pkrtz_f16_f32_dpp v16, v12 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+         "Invalid DPP operand count"),
+        ("v_cvt_pkrtz_f16_f32_dpp v16, -v12, v13 dpp8:[1,0,3,2,5,4,7,6]",
+         "Source modifiers are not allowed"),
+        ("v_cvt_pkrtz_f16_f32_dpp v16, v12, |v13| dpp8:[1,0,3,2,5,4,7,6]",
+         "Source modifiers are not allowed"),
+        ("v_cvt_pkrtz_f16_f32_dpp v16, v12, v255 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+         "DPP operand v255 is read before it is written"),
+        ("v_cvt_pkrtz_f16_f32_dpp v16, v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf bound_ctrl:1",
+         "Unsupported DPP16 modifier"),
         ("v_cvt_i16_f16_dpp v55, v12 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
          "Unsupported instruction"),
         ("v_cvt_f32_i32_dpp v12, v255 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
@@ -9269,6 +9340,13 @@ def check_dpp_cvt_refusals():
          "Source modifiers are not allowed"),
     ):
         expect_value_error(translate, with_constants([instruction]), message)
+    # Packed pair from v_cvt_pkrtz_f16_f32_dpp stays refused as a numeric ALU operand (export-only contract).
+    expect_value_error(
+        translate,
+        with_constants(["v_cvt_pkrtz_f16_f32_dpp v20, v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                        "v_add_f32_e32 v12, v20, v13"]),
+        "Expected a numeric register",
+    )
 
 
 def check_dpp_cvt_draw(directory, compiler, renderer, backend):
@@ -9288,6 +9366,14 @@ def check_dpp_cvt_draw(directory, compiler, renderer, backend):
         ((0xffffffff, 0xffffffff, 0x87654325),
          (bits(-1), bits(4294967296), bits(37 + 2*67 + 4*101 + 8*135), bits(0.3125))),
     ]
+    flr_rpi_rows = [
+        ((0x3fc00000, 0xbf000000), (0xfffffffe, bits(57), 0, bits(163))),
+        ((0xbf000000, 0x3f000000), (0, bits(57), 1, bits(163))),
+        ((0xbf800001, 0xbf000001), (1, bits(57), 0xffffffff, bits(163))),
+        ((0x7f800000, 0x4f000000), (0x80000000, bits(57), 0x7fffffff, bits(163))),
+        ((0x7fc00001, 0xffc00001), (0x80000000, bits(57), 0x80000000, bits(163))),
+        ((0xffc00001, 0x7fc00001), (0x7fffffff, bits(57), 0x7fffffff, bits(163))),
+    ]
     for name, body, rows, mutations in (
         ("from_float", DPP_CVT_FROM_FLOAT, from_float_rows, (
             ("dpp8:[1,2,3,0,5,6,7,4]", "dpp8:[3,0,1,2,7,4,5,6]"),
@@ -9296,6 +9382,13 @@ def check_dpp_cvt_draw(directory, compiler, renderer, backend):
         )),
         ("to_float", DPP_CVT_TO_FLOAT, to_float_rows, (
             ("v_cvt_f32_ubyte0_dpp", "v_cvt_f32_ubyte1_dpp"),
+        )),
+        ("flr_rpi", DPP_CVT_FLR_RPI, flr_rpi_rows, (
+            ("dpp8:[1,2,3,0,5,6,7,4]", "dpp8:[3,0,1,2,7,4,5,6]"),
+            ("v23, v21 quad_perm:[2,3,0,1]", "v23, v21 quad_perm:[1,0,3,2]"),
+            ("v_cvt_rpi_i32_f32_dpp v23", "v_cvt_flr_i32_f32_dpp v23"),
+            ("v12, -v40", "v12, v40"),
+            ("v_cvt_flr_i32_f32_dpp v12", "v_cvt_i32_f32_dpp v12"),
         )),
     ):
         src = directory / f"dpp_cvt_{name}.hlsl"
@@ -9318,6 +9411,42 @@ def check_dpp_cvt_draw(directory, compiler, renderer, backend):
             src.write_text(translate_int(changed), encoding="ascii")
             compile_shader(compiler, src, shader)
             run_pixel_batch(renderer, backend, shader, [(cases[0][0], "mismatch")])
+
+    # Compressed-export draw for v_cvt_pkrtz_f16_f32_dpp (DPP16 with -/|.| and DPP8 broadcast).
+    pkrtz_prog = dpp_pkrtz_program()
+    pkrtz_src = directory / "dpp_cvt_pkrtz.hlsl"
+    pkrtz_shader = directory / "dpp_cvt_pkrtz.cso"
+    pkrtz_src.write_text(translate(pkrtz_prog), encoding="ascii")
+    compile_shader(compiler, pkrtz_src, pkrtz_shader)
+    pkrtz_rows = (
+        ((0x3f801800, 0xc0200000), (-4.0, 2.5, 3.0, 1.0)),
+        ((0xbf801800, 0x40500000), (-4.0, 3.25, 3.0, -1.0)),
+    )
+    pkrtz_cases = []
+    for i, (inputs, expected) in enumerate(pkrtz_rows):
+        constants = bytearray(256)
+        struct.pack_into("<2I", constants, 12, *inputs)
+        case = directory / f"dpp_cvt_pkrtz_{i}.case"
+        write_case(case, constants, expected)
+        pkrtz_cases.append((case, "pass"))
+    # RNE instead of RTZ on 0x3f801800 (1 + 1.5*2^-11) would export 1.0009765625 instead of 1.0.
+    rne_constants = bytearray(256)
+    struct.pack_into("<2I", rne_constants, 12, *pkrtz_rows[0][0])
+    rne_wrong = directory / "dpp_cvt_pkrtz_rne_wrong.case"
+    write_case(rne_wrong, rne_constants, (-4.0, 2.5, 3.0, 1.0009765625))
+    pkrtz_cases.insert(-1, (rne_wrong, "mismatch"))
+    run_pixel_batch(renderer, backend, pkrtz_shader, pkrtz_cases)
+    for old, new in (
+        ("quad_perm:[3,3,3,3]", "quad_perm:[1,1,1,1]"),
+        ("dpp8:[2,2,2,2,6,6,6,6]", "dpp8:[0,0,0,0,4,4,4,4]"),
+        ("-v22, |v25|", "v22, |v25|"),
+        ("-v22, |v25|", "-v22, v25"),
+    ):
+        changed = [line.replace(old, new) for line in pkrtz_prog]
+        assert changed != pkrtz_prog, old
+        pkrtz_src.write_text(translate(changed), encoding="ascii")
+        compile_shader(compiler, pkrtz_src, pkrtz_shader)
+        run_pixel_batch(renderer, backend, pkrtz_shader, [(pkrtz_cases[0][0], "mismatch")])
     return 0
 
 
@@ -15968,7 +16097,7 @@ def _check_controls_inline(directory):
     for bad in ("v_cvt_u32_f32_e64 v12, s44 clamp", "v_cvt_i32_f32_e64 v12, s44 omod:2",
                 "v_cvt_flr_i32_f32_e64 v12, s44 clamp", "v_cvt_rpi_i32_f32_e64 v12, s44 omod:2",
                 "v_cvt_i32_f32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD",
-                "v_cvt_flr_i32_f32_dpp v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                "v_cvt_flr_i32_f32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD",
                 "v_cvt_rpi_i32_f32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD",
                 "v_cvt_u32_f32_e32 v12, 0.5", "v_cvt_u32_f32_e32 v12, 1", "v_cvt_i32_f32_e32 v12, -1",
                 "v_cvt_flr_i32_f32_e32 v12, 0.5", "v_cvt_rpi_i32_f32_e32 v12, -1",
@@ -18122,7 +18251,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
     fixtures.append((vop1_nop_program(), translate))
     fixtures.extend((uncompressed_export(body), translate_int, "gfx1013")
-                    for body in (DPP_CVT_FROM_FLOAT, DPP_CVT_TO_FLOAT))
+                    for body in (DPP_CVT_FROM_FLOAT, DPP_CVT_TO_FLOAT, DPP_CVT_FLR_RPI))
+    fixtures.append((dpp_pkrtz_program(), translate, "gfx1013"))
     fixtures.append((with_constants(DPP_EXTRA_BODY), translate, "gfx1013"))
     fixtures.append((with_constants(DPP_EXTRA_SEMANTICS_BODY), translate, "gfx1013"))
     fixtures.append((uncompressed_export(DPP_EXTRA_SUBNORMAL_BODY), translate_int, "gfx1013"))
