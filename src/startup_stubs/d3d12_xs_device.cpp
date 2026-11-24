@@ -25,6 +25,7 @@
 #include "startup_stubs/placement_publish.h"
 #include "startup_stubs/placed_build.h"
 #include "startup_stubs/memory_srv_report.h"
+#include "startup_stubs/memory_srv_buffer.h"
 
 #include "startup_stubs/slice_footprints.h"
 
