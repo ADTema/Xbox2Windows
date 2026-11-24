@@ -1301,6 +1301,26 @@ class Stage:
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
 
+    def op_v_swap_b32(self, ops, mods):
+        # VOP1 only (llvm-mc rejects the e64, DPP and SDWA spellings for gfx1013). Both registers exchange
+        # their old values, so one is read into a temporary before either is written. The ISA allows no
+        # input or output modifier and no scalar or constant operand: both operands are plain VGPRs.
+        if mods:
+            raise Unsupported('v_swap_b32 with %s' % mods)
+        if len(ops) != 2:
+            raise Unsupported('v_swap_b32 with %d operands, expected 2' % len(ops))
+        regs = [reg_range(o) for o in ops]
+        if any(not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255 for r in regs):
+            raise Unsupported('v_swap_b32 operands %s, %s: expected two single VGPRs' % (ops[0], ops[1]))
+        dst, src = regs[0][1], regs[1][1]
+        body = '{ uint t = v%d; v%d = v%d; v%d = t; }' % (dst, dst, src, src)
+        # Uniformity travels with the value; under an unknown exec mask neither register keeps the proof.
+        uniform = (dst in self.uniform_v and self.exec_known, src in self.uniform_v and self.exec_known)
+        for reg, flag in zip((src, dst), uniform):
+            (self.uniform_v.add if flag else self.uniform_v.discard)(reg)
+        self.used_v.update((dst, src))
+        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+
     def op_v_cndmask_b32(self, ops, mods):
         # The select takes no output modifier: a clamp or mul on it would change the value, so a
         # modifier that reaches here is refused rather than dropped from the emitted text.

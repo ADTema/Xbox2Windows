@@ -11465,6 +11465,12 @@ ctest --preset release --no-tests=error -R '^startup_image_gather_lz(_warp|_hard
 
 The binary32 table (`VEC_F`) applies the same operand-count rule. Before this change, a form one source short (`v_add_f32 v1, v2`) raised `IndexError` in `Stage.one` instead of `Unsupported`. A form with one source too many (`v_med3_f32 v1, v2, v3, v4, v5`) translated with the extra source dropped. `tests/startup_gfx2hlsl_operand_count_check.py` (`startup_gfx2hlsl_operand_count`) checks every operation of both tables: one source fewer and one source more are refused, and the exact count translates. It also checks that the constant and accumulator forms (`v_fmac_f32`, `v_mac_f32`, `v_fmamk_f32`, `v_fmaak_f32`, `v_madmk_f32`, `v_madak_f32`) keep translating with their usual operands. As a control, it loads the translator with the new `VEC_F` guard removed and requires both old failures to come back.
 
+## Startup translator: v_swap_b32
+
+`tools/startup/gfx2hlsl.py` now lowers `v_swap_b32` (VOP1, opcode 101), which it used to refuse. Both VGPRs exchange their old values, so the lowering reads the destination into a temporary before either register is written: `{ uint t = v1; v1 = v2; v2 = t; }`. The RDNA 2 ISA allows no input or output modifier on it, and LLVM 15 assembles only the 32-bit VOP1 spelling for gfx1013 (the `_e64`, `_dpp` and `_sdwa` forms and a scalar, constant, negated or 64-bit operand are rejected), so the translator refuses all of those and a modifier. A register-to-itself swap assembles and keeps its value. A proven-uniform register keeps that proof across the swap only while the exec mask is known.
+
+`tests/startup_gfx2hlsl_swap_check.py` (`startup_gfx2hlsl_swap`) decodes the documented VOP1 words, evaluates the translated text of seven programs on the CPU against a plain exchange of two list entries, and checks the refusals. Two mutations (write before read, only one destination written) are loaded from the translator source and must fail the fixtures. `python -B tests/startup_gfx2hlsl_swap_check.py binary llvm-mc-15` also reassembles the source lines. This is translation only; no draw was run.
+
 ## Non-fused multiply-add in the startup translator
 
 The gfx1013 `v_mad_f32`, `v_mac_f32`, `v_madmk_f32`, `v_madak_f32` and
