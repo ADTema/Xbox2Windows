@@ -1548,6 +1548,47 @@ def f16_pk_fmac_lane_result(a, b, c):
     return sign | ((exponent + 15) << 10) | (count - 0x400)
 
 
+# Plain binary16 VOP2 forms with an accumulator or an integer exponent (issue #839), lowered under the rules of VOP2_F16
+# arithmetic: v_fmac_f16 is D = S0 * S1 + D rounded once, and v_ldexp_f16 is D = S0 * 2^S1 with S1 a signed 16-bit
+# integer (AMD RDNA 2 ISA, VOP2 opcodes 54 and 59; LLVM 15 VOP2Instructions.td VOP_F16_F16_I16). Plain e32 only.
+VOP2_F16_FUSED_SCALE = ("fmac", "ldexp")
+# The exponent of v_ldexp_f16 must be statically known and within this magnitude. Hardware behaviour for an exponent
+# beyond it (clamping) is not stated by the ISA reference, and 2^64 times the smallest binary16 is a binary32 normal.
+LDEXP_F16_EXPONENT_LIMIT = 64
+
+
+def f16_ldexp_result(bits, exponent):
+    """Exact binary16 result bits of v_ldexp_f16 (bits * 2^exponent) on a finite operand, or None on overflow.
+
+    One round to nearest even on the binary16 grid (a result below the smallest subnormal rounds to a signed zero), and
+    a zero operand keeps its sign. Used at translation time so that a chained result stays a proven value.
+    """
+    sign, exponent_bits, mantissa = bits & 0x8000, (bits >> 10) & 0x1f, bits & 0x3ff
+    if exponent_bits == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {bits:#06x}")
+    magnitude = (Fraction(mantissa, 1 << 24) if exponent_bits == 0
+                 else Fraction(mantissa | 0x400) * Fraction(2) ** (exponent_bits - 25)) * Fraction(2) ** exponent
+    if magnitude == 0:
+        return sign
+    if magnitude >= 65520:  # halfway between 65504 and 2^16: ties to even rounds up to infinity
+        return None
+    top = max(magnitude.numerator.bit_length() - magnitude.denominator.bit_length(), -14)
+    while magnitude < Fraction(2) ** top and top > -14:
+        top -= 1
+    while magnitude >= Fraction(2) ** (top + 1):
+        top += 1
+    scaled = magnitude / Fraction(2) ** (top - 10)
+    count = scaled.numerator // scaled.denominator
+    remainder = scaled - count
+    if remainder > Fraction(1, 2) or (remainder == Fraction(1, 2) and count & 1):
+        count += 1
+    if count >= 0x800:
+        count, top = 0x400, top + 1
+    if count < 0x400:  # subnormal, or rounded to zero keeping the sign of the operand
+        return sign | count
+    return sign | ((top + 15) << 10) | (count - 0x400)
+
+
 def pk_fmac_f16_source(token, scalar, vector, pending, sample_dest, known_ssa_bits):
     """Return (HLSL uint word expression, 32-bit packed bits) for one v_pk_fmac_f16 source operand.
 
@@ -1662,6 +1703,26 @@ def f16_cvt_int_result(signed, value):
     if top > 15:
         return None
     return sign | ((top + 15) << 10) | (count & 0x3ff)
+
+
+def f16_to_int_result(signed, bits):
+    """Low 16 bits of v_cvt_i16_f16 (signed) or v_cvt_u16_f16 of a finite binary16 value, or None when the result is not
+    in range.
+
+    LLVM 15.0.7 VOP1Instructions.td L436-437 selects fp_to_sint and fp_to_uint, and AMD RDNA 2 section 12.8 (VOP1 entries
+    82 and 83) specifies truncation toward zero. The range check applies to the truncated integer: -32768 to 32767 for
+    the signed op, 0 to 65535 for the unsigned one, so -0.5 truncates to 0 and is valid for both, while -1 is out of range
+    for the unsigned op. Exact integer arithmetic on the operand in units of 2^-24, used at translation time. The result
+    is the two's-complement low half; a non-finite operand is an error because the caller requires a finite proof first.
+    """
+    exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+    if exponent == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {bits:#06x}")
+    units = mantissa if exponent == 0 else (mantissa | 0x400) << (exponent - 1)
+    value = -(units >> 24) if bits & 0x8000 else units >> 24
+    if not (-0x8000 <= value <= 0x7fff if signed else 0 <= value <= 0xffff):
+        return None
+    return value & 0xffff
 
 
 def int16_known_value(token, scalar, vector, known_ssa_bits):
@@ -4871,6 +4932,58 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
             vector[dst] = ("half16", f"alu{i}")
             known_half[f"alu{i}"] = result
+        elif m := match(r"v_(fmac|ldexp)_f16(?:_e32)? (v\d+), ([^,\s]+), ([^,\s]+)"):
+            # Plain e32 binary16 fused multiply-accumulate (D = S0 * S1 + D) and scaling by a power of two (D = S0 * 2^S1,
+            # S1 a signed 16-bit integer), under the rules of the VOP2 arithmetic above: statically proven finite
+            # operands, no overflow, the declared entry profile, no modifier, clamp or omod (the _e64, DPP and SDWA
+            # spellings fall through to the generic refusal). The fused form reads the accumulator as a third proven
+            # operand and rounds once in integer arithmetic (fma16_rne). The scaling form needs a statically known
+            # exponent: the binary32 product of a widened half and a power of two is exact (the multiplier and the
+            # product are normals), and narrow16 rounds it once. Only bits 15:0 of S1 are read. The result is
+            # ("half16", alu): only bits 15:0 are defined.
+            name, dst, src0, src1 = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 arithmetic operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if not re.fullmatch(r"v\d+", src1):
+                raise ValueError("Binary16 e32 src1 must be a VGPR")
+            if name == "fmac":
+                words, proven = zip(*(half16_arith_source(tok, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+                                      for tok in (src0, src1, dst)))
+                result = f16_pk_fmac_lane_result(*proven)
+                if result is None:
+                    raise ValueError("binary16 result overflows: v_fmac_f16")
+                for k, word in enumerate(words):
+                    lines.append(f"    uint hf{i}_{k} = ({word}) & 0xffffu;")
+                lines.append(f"    uint hm{i} = fma16_rne(hf{i}_0, hf{i}_1, hf{i}_2);")
+                helpers.add("fma16_rne")
+                lines.append(f"    precise float alu{i} = asfloat(hm{i});")
+            else:
+                word, proven = half16_arith_source(src0, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+                if not 0 <= int(src1[1:]) <= 255:
+                    raise ValueError(f"Register out of range: {src1}")
+                if src1 not in vector:
+                    raise ValueError(f"Untracked 16-bit source: {src1}")
+                int16_operand(src1, scalar, vector, pending, sample_dest, signed=True)
+                known = int16_known_value(src1, scalar, vector, known_ssa_bits)
+                if known is None:
+                    raise ValueError(f"binary16 ldexp exponent lacks a proof: {src1}")
+                exponent = known - 0x10000 if known & 0x8000 else known
+                if abs(exponent) > LDEXP_F16_EXPONENT_LIMIT:
+                    raise ValueError(f"binary16 ldexp exponent out of range: {exponent}")
+                result = f16_ldexp_result(proven, exponent)
+                if result is None:
+                    raise ValueError("binary16 result overflows: v_ldexp_f16")
+                lines.append(f"    uint hf{i}_0 = ({word}) & 0xffffu;")
+                lines.append(f"    precise float hs{i} = widen16(hf{i}_0) * asfloat({(127 + exponent) << 23}u);")
+                lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
         elif m := match(rf"v_({'|'.join(VOP1_F16_ROUND)})_f16(_e32|_e64)? (v\d+), ([^,\s]+)"):
             # Plain binary16 VOP1 rounding under the rules of the VOP2 arithmetic above: a statically proven finite
             # source, the declared entry profile, no modifier, clamp or omod (those fall through to the generic
@@ -4932,6 +5045,32 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector[dst] = ("half16", f"alu{i}")
             if result is not None:
                 known_half[f"alu{i}"] = result
+        elif m := match(r"v_cvt_(i16|u16)_f16(_e32|_e64)? (v\d+), ([^,\s]+)"):
+            # Binary16 to integer (issue #839): LLVM 15.0.7 VOP1Instructions.td L436-437 selects fp_to_sint and fp_to_uint,
+            # and AMD RDNA 2 section 12.8 (VOP1 entries 82 and 83) specifies truncation toward zero. The source must be a
+            # statically proven finite low half under the declared entry profile (half16_arith_source), and the truncated
+            # integer must lie in the destination range (f16_to_int_result), so the lowering needs no NaN, infinity or
+            # saturation rule. The half is widened exactly and truncated in binary32, which is exact. The result is
+            # ("low16", alu): bits 15:0 are the two's-complement integer, bits 31:16 are unspecified, so the audited 16-bit
+            # integer readers read it and the binary16 readers refuse it. Modifiers, clamp and omod never match the
+            # anchored operands.
+            kind, encoding, dst, token = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 to integer conversion operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            word, proven = half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            if f16_to_int_result(kind == "i16", proven) is None:
+                raise ValueError(f"binary16 value out of range: v_cvt_{kind}_f16")
+            lines.append(f"    uint hf{i}_0 = ({word}) & 0xffffu;")
+            lines.append(f"    precise float hs{i} = widen16(hf{i}_0);")
+            lines.append(f"    int cv{i}_0 = int(trunc(hs{i}));")
+            lines.append(f"    precise float alu{i} = asfloat(asuint(cv{i}_0) & 0xffffu);")
+            vector[dst] = ("low16", f"alu{i}")
         elif m := match(r"v_cvt_off_f32_i4(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
             # Bits 3:0 of the source as a signed nibble in units of 1/16, so 0x7 gives 0.4375
             # and 0x8 gives -0.5. The source is read as bits, so float modifiers do not apply.

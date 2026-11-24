@@ -19,6 +19,8 @@
 #include "ffx_provider_loop.h"
 #include "desktop_gpu.h"
 
+void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
+
 #ifdef OFFSCREEN_AGILITY_620
 extern "C" {
 __declspec(dllexport) extern const UINT D3D12SDKVersion = 620;
@@ -28,6 +30,8 @@ __declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
 
 using Microsoft::WRL::ComPtr;
 constexpr UINT side = 64;
+
+void check_descriptor_heap_paging(ID3D12Device* device, bool swapped);
 
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
@@ -508,6 +512,12 @@ OperationResult run_spirv_address_window(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_spirv_address_window_atomic(const OperationContext& ctx)
+{
+    check_spirv_window_atomic(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_spirv_compare_sampler(const OperationContext& ctx)
 {
     check_spirv_compare_sampler(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
@@ -908,6 +918,19 @@ OperationResult run_wave_shuffle(const OperationContext& ctx)
         "skip: wave shuffle fixture requires SM 6.6 and a supported forced wave width");
 }
 
+template<bool Swapped>
+OperationResult run_descriptor_heap_paging(const OperationContext& ctx)
+{
+    check_descriptor_heap_paging(ctx.device, Swapped);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_wave64_emulate(const OperationContext& ctx)
+{
+    check_wave64_emulate(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
 constexpr CapabilityGate kNoGate{};
 constexpr CapabilityGate kGateSm60BufferOps{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -984,6 +1007,7 @@ const OperationSpec kOperations[] = {
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
+    {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
@@ -1053,7 +1077,10 @@ const OperationSpec kOperations[] = {
     {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
     {"--gpu-alias-registry", 3, 3, nullptr, kNoGate, run_gpu_alias_registry},
     {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
+    {"--descriptor-heap-paging", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<false>},
+    {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
+    {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
 };
 
 struct DiagnosticTarget {
