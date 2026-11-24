@@ -4,7 +4,7 @@
 
 Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. You can run the public tests without a game installation.
 
-> **Current status.** The full-package DXIL compilation scan found a compiled route for 26,500 of 26,503 shader records. Local main-executable diagnostics reach D3D12 pipeline creation, with a verified rendered frame still pending. [Live startup progress #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
+> **Current status.** The full-package DXIL compilation scan found a compiled route for 26,500 of 26,503 shader records. The author of [#1135](https://github.com/R0Y00/Xbox2Windows/pull/1135) reports a visible intro on an RX 9070 XT with permissive startup switches. Colours are incorrect, and frames turn black after the intro. A separate WARP run created six graphics pipelines. The first reference-checked frame remains open. [Live startup progress #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
 
 ## Community and contributions
 
@@ -42,7 +42,7 @@ Both Windows jobs on `main` must pass before CI publishes a new chart. The image
 
 ## First build
 
-On x64 Windows, install Python 3.11 or newer and Visual Studio's **Desktop development with C++** workload, including x64 MSVC, CMake, Ninja, and Windows SDK 10.0.26100 with DXC. Windows CI uses Python 3.12. Open PowerShell and run the following commands. If you already have a clone, start at `.\tools\dev.ps1`.
+On x64 Windows, install Python 3.11 or newer and Visual Studio's **Desktop development with C++** workload, including x64 MSVC, CMake, Ninja, and Windows SDK 10.0.26100 with DXC. Windows CI uses Python 3.12. Visual Studio 2019 Build Tools (MSVC 14.29) build every target except the five CRT-free TLS EXE fixtures (`cpu_exe_tls*`), because that compiler leaves their thread-local initializers to the C runtime. For the same reason `cpu_native_tls_value` fails there, `cpu_package_main_image` lacks its fixture, and `xmem_attribute_scan` also sees the unused delay-load jump thunk that the 14.29 linker emits. Open PowerShell and run the following commands. If you already have a clone, start at `.\tools\dev.ps1`.
 
 ```powershell
 git clone https://github.com/R0Y00/Xbox2Windows.git
@@ -75,6 +75,7 @@ verified on the host, without loading an EXE or DLL. [Scope and synthetic tests]
 - **Path length.** Clone to a short path such as `C:\Users\<name>\Documents\Xbox2Windows`. In a checkout about 150 characters deep, CMake's compiler check fails with MSVC error C1041 because the object paths under `out/build/dev` pass the 260-character limit.
 - **Independent build.** A Windows 11 contributor reproduced the three smoke tests from a clean checkout at `71bb9f4` and again after an incremental rebuild at `2465837`. [Toolchain, full-suite results and capability skips](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821)
 - **Zig cache.** The two Zig fixtures are built by `python -m ziglang build-exe`. If that step stops the build with `error: AccessDenied`, point both Zig caches at writable directories before configuring: `$env:ZIG_GLOBAL_CACHE_DIR = 'out/zig-global'` and `$env:ZIG_LOCAL_CACHE_DIR = 'out/zig-local'`. [Reproduction and measured before/after](docs/experiments.md#two-record-archive-reader-from-standard-startup)
+- **Carrier temp directory.** The TLS and `exe_aot_convert` fixtures create their carrier under `GetTempPathW`. If they fail with `cannot create the TLS carrier directory (error 5)`, that directory is not writable for the built executables on that host: set `TMP` and `TEMP` to a writable directory before running them. [Measured case](docs/experiments.md#tls-callbacks-and-the-entry-point)
 
 ## Choose an experiment
 
@@ -109,9 +110,10 @@ The control-flow CPU translator supports [source-built string memory transfers](
 | Compute shader recompilation | Translate fixed, indexed and row-pitch raw UAV stores for 1D, 2D and 3D thread groups, including an optional runtime constant buffer, and compare the complete buffer on D3D12. [Bindings and commands](docs/experiments.md#compute-uav-stores-from-a-native-container) · [Bounded gfx1030 DS lane routing](docs/experiments.md#bounded-gfx1030-ds-lane-routing) · [Private gfx1030 LDS access and updates, including 64-bit min/max and xor](docs/experiments.md#private-gfx1030-lds-word-access) | `ctest --preset dev --no-tests=error -R '^compute_store_aot_'` |
 | Static shader recompilation | Translate pixel shader fixtures to desktop DXIL and check the output, including all 32 bits of an unsigned conversion. Select a local record by name and, for duplicate names, by decoded DXBC SHA-256. [Supported instructions and bindings](docs/experiments.md#offline-pixel-shader-recompilation) · [Float-to-uint readback and entry inputs](docs/experiments.md#unsigned-pixel-conversion-and-entry-inputs) · [DS swizzle and no-op](docs/experiments.md#quad-local-ds-swizzle-in-pixel-shaders) | `ctest --preset dev -R '^pixel_aot_' -V` |
 | Guarded compute ALU | Verify a raw buffer read, the [full-width multiply](docs/experiments.md#guarded-full-width-integer-multiply), and the guarded UAV store against a CPU reference. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_guard_read_'` |
+| gfx1030 typed-buffer reads | Lower [indexed `tbuffer_load_format_x` with `BUF_FMT_32_UINT`](docs/experiments.md#indexed-gfx1030-typed-buffer-reads) and compare the UAV readback against a CPU reference. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_'` |
 | Shader census | [Distinguish archive records, header digests and cache-index entries](docs/experiments.md#reporting-shader-census-populations) before choosing a coverage denominator. | `ctest --preset dev --no-tests=error -R "^shader_metadata_census$" -V` |
 | Shader effect metadata | Inventory the [candidate programs for a named SGD5 effect](docs/experiments.md#candidate-programs-for-a-named-sgd5-effect) using independently located archive ranges. | `ctest --preset dev --no-tests=error -R "^sgd5_effect_candidates$" -V` |
-| Pipeline readiness | Join explicit pipeline references to the native shader manifest and identify blockers for PSO creation. [Inputs and WARP control](docs/experiments.md#pipeline-readiness-from-shader-manifests) | `ctest --preset dev -R '^pso_' -V` |
+| Pipeline readiness | Join explicit pipeline references to the native shader manifest and optionally probe pixel and mesh lowering. [Inputs and WARP control](docs/experiments.md#pipeline-readiness-from-shader-manifests) | `ctest --preset dev -R '^pso_' -V` |
 | D3D12 and ray tracing | Compare the CPU reference, custom BVH shader and DXR on another adapter. Record the driver and native wave width. | `ctest --preset dev -R '^bvh_(differential\|wave64)_hardware$' -V` |
 | Upscaler memory accounting | Compare [post-query counter writes](docs/experiments.md#upscaler-working-set-counter-updates) on success and failure. | `ctest --preset dev --no-tests=error -R 'working_set_delta$'` |
 | Windows runtime | Add a source-built allocation case with a measurable Windows result. | `ctest --preset dev -R 'era_heap\|desktop_memory_query'` |

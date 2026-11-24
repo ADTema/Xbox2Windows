@@ -48,7 +48,7 @@ INTEGER_HEADER = """#include <array>
 using std::memcpy;
 using std::memset;
 using word = uint64_t;
-static_assert(sizeof(void*) == sizeof(word));
+static_assert(sizeof(void*) == sizeof(word), "lowered code needs 64-bit pointers");
 // A read of host data, or of the lowered function's own frame array, which cannot fault.
 template<class T> T load(word address) {
     T v; memcpy(&v, reinterpret_cast<const void*>(address), sizeof v); return v;
@@ -948,7 +948,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         elif i.code == C.UD2:
             # UD2 (0F 0B) raises the host's STATUS_ILLEGAL_INSTRUCTION; UD0 and UD1 stay refused.
             stmt = "__ud2();"
-        elif op == M.LDMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+        elif op in (M.LDMXCSR, M.VLDMXCSR) and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+            # VLDMXCSR (VEX.128, vvvv 1111; iced decodes every other VEX form as invalid) behaves the same.
             # The opt-in host-MXCSR profile: the requested word is checked before it reaches the host register,
             # so a refused word changes nothing and no later guest instruction runs.
             stmt = (f"{{ const uint32_t want = {guest('uint32_t')}; "
@@ -957,7 +958,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                     f"if (want & {'~mxcsr_mask' if host_mxcsr.denormals else '0x8040u'}) "
                     f"{host_mxcsr.leave('unsupported')} "
                     f"_mm_setcsr(want); }}")
-        elif op == M.STMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+        elif op in (M.STMXCSR, M.VSTMXCSR) and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             stmt = f"store<uint32_t>({address()}, _mm_getcsr());"
         elif op == M.XGETBV and host_cpu:
             # The host's extended control register ECX into EDX:EAX, flags kept. Any ECX is passed through, but
