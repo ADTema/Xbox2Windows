@@ -50,9 +50,15 @@ int draw_root_reset(void* guest, void* list)
     if (!std::strcmp(mode, "same_root")) {
         invoke(list, 34, root);
     } else if (!std::strcmp(mode, "switch_root")) {
-        const StreamWord alternate = word_of(stream_alternate_root_signature());
-        if (!alternate) return 40;
-        invoke(list, 34, alternate);
+        const D3D12_ROOT_SIGNATURE_DESC empty{};
+        Microsoft::WRL::ComPtr<ID3DBlob> blob;
+        void* alternate = nullptr;
+        if (FAILED(D3D12SerializeRootSignature(&empty, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr)) ||
+            FAILED(static_cast<HRESULT>(invoke(guest, 16, 0, word_of(blob->GetBufferPointer()), blob->GetBufferSize(),
+                                               word_of(&__uuidof(ID3D12RootSignature)), word_of(&alternate)))) ||
+            !alternate)
+            return 40;
+        invoke(list, 34, word_of(alternate));
         invoke(list, 34, root);
     } else if (!std::strcmp(mode, "out_of_range")) {
         static std::uint32_t words[10];
