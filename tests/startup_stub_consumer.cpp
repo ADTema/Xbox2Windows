@@ -71,6 +71,73 @@ std::vector<unsigned char> make_stored_zlib(const unsigned char* data, size_t si
     return out;
 }
 
+struct BitWriter {
+    std::vector<unsigned char> bytes;
+    unsigned bit_buf = 0;
+    int bit_cnt = 0;
+
+    void put_bit(int b) {
+        bit_buf |= (b & 1) << bit_cnt++;
+        if (bit_cnt == 8) {
+            bytes.push_back(static_cast<unsigned char>(bit_buf));
+            bit_buf = 0;
+            bit_cnt = 0;
+        }
+    }
+
+    void put_code_msb(unsigned code, int bits) {
+        for (int i = bits - 1; i >= 0; --i) {
+            put_bit((code >> i) & 1);
+        }
+    }
+
+    void flush() {
+        if (bit_cnt > 0) {
+            bytes.push_back(static_cast<unsigned char>(bit_buf));
+            bit_buf = 0;
+            bit_cnt = 0;
+        }
+    }
+};
+
+std::vector<unsigned char> make_fixed_deflate_zlib(unsigned char val, size_t count) {
+    BitWriter bw;
+    bw.bytes.push_back(0x78);
+    bw.bytes.push_back(0x01);
+    bw.put_bit(1);
+    bw.put_bit(1);
+    bw.put_bit(0);
+    bw.put_code_msb(48 + val, 8);
+
+    size_t remaining = count - 1;
+    while (remaining >= 258) {
+        bw.put_code_msb(197, 8); // symbol 285 = length 258
+        bw.put_code_msb(0, 5);   // distance 1
+        remaining -= 258;
+    }
+    while (remaining >= 3) {
+        size_t len = remaining > 10 ? 10 : remaining;
+        unsigned sym = static_cast<unsigned>(257 + (len - 3));
+        bw.put_code_msb(sym - 256, 7);
+        bw.put_code_msb(0, 5);
+        remaining -= len;
+    }
+    while (remaining > 0) {
+        bw.put_code_msb(48 + val, 8);
+        --remaining;
+    }
+    bw.put_code_msb(0, 7); // end of block
+    bw.flush();
+
+    std::vector<unsigned char> plain(count, val);
+    uint32_t a = adler32_calc(plain.data(), count);
+    bw.bytes.push_back(static_cast<unsigned char>((a >> 24) & 0xFF));
+    bw.bytes.push_back(static_cast<unsigned char>((a >> 16) & 0xFF));
+    bw.bytes.push_back(static_cast<unsigned char>((a >> 8) & 0xFF));
+    bw.bytes.push_back(static_cast<unsigned char>(a & 0xFF));
+    return bw.bytes;
+}
+
 struct Object {
     void** vtable;
 };
@@ -464,6 +531,111 @@ bool dstorage_checks() {
         }
         for (unsigned char b : dest2) {
             if (b != 0x77) return false;
+        }
+    }
+
+    // Control: standalone stream with damaged checksum at matching offset fails and leaves destination unchanged (Refs #1214)
+    {
+        const size_t stream_plain_size = 128 * 1024;
+        const auto comp1 = make_fixed_deflate_zlib(0x33, stream_plain_size);
+        auto comp_bad = make_fixed_deflate_zlib(0x77, stream_plain_size);
+        // Corrupt the Adler-32 checksum in comp_bad:
+        comp_bad.back() ^= 0xFF;
+        const unsigned shared_compressed_size = static_cast<unsigned>(comp1.size());
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        const size_t offset_bad = 64 * 1024; // Matching continuation offset (0 + 64 KiB)
+        std::vector<unsigned char> file_bytes(offset_bad + comp_bad.size(), 0);
+        std::memcpy(file_bytes.data(), comp1.data(), comp1.size());
+        std::memcpy(file_bytes.data() + offset_bad, comp_bad.data(), comp_bad.size());
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "DamagedStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest1(64 * 1024, 0);
+        std::vector<unsigned char> dest_bad(64 * 1024, 0xBB); // Sentinel
+
+        // Stream 1 piece 0: offset 0, compressed size S, destination 64 KiB (inflates 128 KiB of 0x33, caches stream)
+        unsigned char req1[0x48] = {};
+        *reinterpret_cast<u64*>(req1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1 + 0x08) = dest1.data();
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = shared_compressed_size;
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        // Standalone stream at matching continuation offset 64 KiB with damaged checksum
+        unsigned char req_bad[0x48] = {};
+        *reinterpret_cast<u64*>(req_bad + 0x00) = 1;
+        *reinterpret_cast<void**>(req_bad + 0x08) = dest_bad.data();
+        *reinterpret_cast<unsigned*>(req_bad + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req_bad + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_bad + 0x28) = offset_bad;
+        *reinterpret_cast<unsigned*>(req_bad + 0x30) = shared_compressed_size;
+        *reinterpret_cast<unsigned*>(req_bad + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_bad);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1)) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        long hr_bad = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        // Stream 1 piece 0 must succeed; the damaged standalone stream must fail with non-zero HRESULT
+        if (hr0 != 0 || hr_bad == 0) return false;
+        for (unsigned char b : dest1) {
+            if (b != 0x33) return false;
+        }
+        // Destination buffer of the damaged stream must remain completely unchanged (sentinel 0xBB)
+        for (unsigned char b : dest_bad) {
+            if (b != 0xBB) return false;
         }
     }
 

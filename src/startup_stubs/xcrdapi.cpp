@@ -343,6 +343,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         data = input;
         if (zlib) {
             bool direct_decoded = false;
+            bool decode_error = false;
             if (has_zlib_header(input, source_size)) {
                 // With BCPack after it, the inflated size is not given; the destination size bounds it.
                 // DirectStorage provides UncompressedSize at request + 0x38. When destination is smaller
@@ -387,13 +388,16 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                         outcome = produced == destination_size || bcpack ? "inflated" : "inflated (larger/short)";
                     }
                     direct_decoded = true;
+                } else {
+                    decode_error = true;
                 }
             }
 
             // If not directly decoded from a standalone stream, check if this request is a continuation
             // slice of an already-inflated chunked stream on this queue (Refs #1136, #1214).
-            // Memory requests stay strictly on direct decode.
-            if (!direct_decoded && !memory_source && self && self->work) {
+            // A request presenting a zlib header that failed decode (e.g. damaged checksum) is an actual
+            // decode error and must stay distinct from a proven continuation. Memory requests stay strictly on direct decode.
+            if (!direct_decoded && !decode_error && !memory_source && self && self->work) {
                 auto* file_object = reinterpret_cast<Object*>(source);
                 if (file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE) {
                     QueueWork& work = *self->work;
