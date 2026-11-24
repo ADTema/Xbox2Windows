@@ -11,6 +11,7 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
 
 // The guest root signature that prepare_stream_pipeline created (null before it ran).
 void* stream_root_signature();
+void* stream_alternate_root_signature();
 
 struct StreamAttachment {
     Microsoft::WRL::ComPtr<ID3D12Resource> texture, readback;

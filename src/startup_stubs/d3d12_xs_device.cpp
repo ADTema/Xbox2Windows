@@ -1711,8 +1711,12 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
 void __stdcall list_graphics_root(Wrapper* self, void* root)
 {
     Wrapper* w = as_wrapper(root);
-    pass_of(self).root = w ? root_info(w) : nullptr;
-    pass_of(self).srv_bound = 0;
+    Pass& pass = pass_of(self);
+    const auto* params = w ? root_info(w) : nullptr;
+    if (pass.root != params)
+        std::fill_n(pass.root_address, 16, 0);
+    pass.root = params;
+    pass.srv_bound = 0;
     if (auto* list = recording(self); list && w && w->own().kind == root_signature_kind && w->own().real)
         list->SetGraphicsRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
 }

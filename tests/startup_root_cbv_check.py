@@ -30,6 +30,8 @@ def check(directory, consumer, backend):
         ("bound", bytes((255, 255, 0, 255)), 0),   # the colour the title bound
         ("unbound", bytes(4), 0),                  # no call: the shader reads zeros
         ("null", bytes(4), 0),                     # binding 0 after a valid address clears it
+        ("same_root", bytes((255, 255, 0, 255)), 0),
+        ("switch_root", bytes(4), 0),
         ("wrong_type", bytes(4), 1),               # an SRV parameter ignores the call, with one log line for two calls
     )
     for mode, drawn, lines in cases:

@@ -32,8 +32,10 @@ struct Stream {
 
 namespace {
 void* stream_root = nullptr;
+void* stream_alternate_root = nullptr;
 }
 void* stream_root_signature() { return stream_root; }
+void* stream_alternate_root_signature() { return stream_alternate_root; }
 
 int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char* root_path,
                             bool hardware, bool textured, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter,
@@ -103,6 +105,14 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     if (FAILED(reinterpret_cast<CreateRoot>(slots[16])(device, 0, blob->GetBufferPointer(), blob->GetBufferSize(),
                                                         __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&root)))) return 7;
     stream_root = root;
+    if (std::strcmp(cbv_mode, "switch_root") == 0) {
+        root_cbv.Descriptor.ShaderRegister = 1;
+        ComPtr<ID3DBlob> alternate;
+        if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &alternate, nullptr)) ||
+            FAILED(reinterpret_cast<CreateRoot>(slots[16])(device, 0, alternate->GetBufferPointer(),
+                                                            alternate->GetBufferSize(), __uuidof(ID3D12RootSignature),
+                                                            &stream_alternate_root))) return 7;
+    }
 
     Stream stream{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}},
                   {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},

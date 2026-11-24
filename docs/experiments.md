@@ -10590,7 +10590,7 @@ ctest --preset release --no-tests=error -R '^cpu_aot_vex_parity$' -V
 
 ## Startup root constant buffer views
 
-Command-list slot 42 records the address of a root parameter declared as a CBV, so a translated shader reading through its root pointer sees it. The fixture (`tests/startup_root_cbv.cpp`, driven by `tests/startup_root_cbv_check.py`) is synthetic only: it uses generated command streams and no title data, and the slot number is derived from the desktop order and the console shift, not seen in a title log. It checks a bound call, an unbound call, a null overwrite that clears the slot, and a wrong-type call that is ignored with `root CBV N ignored`. Details are in [startup-runtime.md](startup-runtime.md#root-constant-buffer-views).
+Command-list slot 42 records the address of a root parameter declared as a CBV, so a translated shader reading through its root pointer sees it. The fixture (`tests/startup_root_cbv.cpp`, driven by `tests/startup_root_cbv_check.py`) is synthetic only: it uses generated command streams and no title data, and the slot number is derived from the desktop order and the console shift, not seen in a title log. It checks a bound call, an unbound call, a null overwrite that clears the slot, a wrong-type call that is ignored with `root CBV N ignored`, a redundant root bind that preserves the address, and a signature switch that clears it. Details are in [startup-runtime.md](startup-runtime.md#root-constant-buffer-views).
 
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer

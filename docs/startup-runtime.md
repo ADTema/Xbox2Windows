@@ -152,7 +152,8 @@ address. The call is ignored when the parameter is out of range or is not a CBV 
 a null or unreadable address clears the slot to zero so a previous binding is not left stale. It is not forwarded to the
 desktop list and does not set the vertex-fetch bit of `srv_bound`. The slot number is derived from the desktop order and
 the console shift, not yet seen in a title log; `startup_root_cbv_{warp,hardware}` checks the handler with a bound, an
-unbound, a null-overwrite and a wrong-type call.
+unbound, a null-overwrite and a wrong-type call. Rebinding the same root signature keeps
+the address. Switching to a different signature invalidates the stored root addresses.
 
 ## Composite provenance fixture
 
