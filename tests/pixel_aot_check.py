@@ -8651,6 +8651,7 @@ def e64_spelling_programs():
 
 def check_e64_spelling_lowering():
     """Static checks: each e64 spelling lowers exactly like the e32 form, and nothing wider is accepted."""
+    check_vop1_nop_lowering()
     for name, program, function, plain in e64_spelling_programs():
         assert sum(line.startswith("v_interp_") and "_e64 " in line for line in program) in (2, 4, 8), name
         assert program.count("v_nop_e64") == 1, name
@@ -8692,6 +8693,62 @@ def check_e64_spelling_lowering():
     must_reject(translate, plain[:-1] + ["v_nop_e64", plain[-1]])
     must_reject(translate, plain[:3] + ["v_nop_e64"] + plain[3:])
     must_reject(translate, plain[:3] + ["v_nop"] + plain[3:])
+
+
+# v_clrexcp and v_pipeflush, in both encodings, as no-ops in the entry mask (#1791).
+VOP1_NOPS = ("v_clrexcp", "v_clrexcp_e64", "v_pipeflush", "v_pipeflush_e64")
+
+
+def vop1_nop_program(*, clobber=False, plain=False):
+    """The standard sampled program with the four no-op spellings after the sample wait, where v12 to v15 are
+    live. clobber replaces v_pipeflush with a write to v13, the control that a lowered register write is visible;
+    plain puts v_nop in each place, so the temporaries, which are numbered by line, line up."""
+    program = assembly(False)
+    at = program.index("s_waitcnt vmcnt(0)") + 1
+    nops = ["v_mov_b32_e32 v13, 0" if clobber and op == "v_pipeflush" else "v_nop" if plain else op
+            for op in VOP1_NOPS]
+    return program[:at] + nops + program[at:]
+
+
+def check_vop1_nop_lowering():
+    """Static checks: the no-ops lower to nothing, and nothing wider is accepted."""
+    assert translate(vop1_nop_program()) == translate(vop1_nop_program(plain=True))
+    for op in VOP1_NOPS:
+        program = assembly(False)
+        at = program.index("s_wqm_b64 exec, exec") + 1
+        try:
+            translate(program[:at] + [op] + program[at:])
+        except ValueError as error:
+            assert "non-entry mask" in str(error), (op, error)
+        else:
+            raise AssertionError(f"{op} accepted in the whole-quad mask")
+        for wider in (f"{op} v0", f"{op} v0, v1"):
+            try:
+                translate(assembly(False)[:10] + [wider] + assembly(False)[10:])
+            except ValueError as error:
+                assert str(error).startswith("Unsupported instruction"), (wider, error)
+            else:
+                raise AssertionError(f"{wider} accepted")
+
+
+def check_vop1_nop_draws(directory, compiler, renderer, backend):
+    """Draw the no-op program against the sampled texture reference; the clobber control must mismatch."""
+    source = directory / "vop1_nops.hlsl"
+    shader = directory / "vop1_nops.cso"
+    draw = [renderer, backend, "--check-pixel", shader, "rgba"]
+    source.write_text(translate(vop1_nop_program()), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    result = subprocess.run(draw)
+    if result.returncode:
+        return result.returncode
+    print(f"vop1 no-ops: {', '.join(VOP1_NOPS)} matched the sampled reference")
+    source.write_text(translate(vop1_nop_program(clobber=True)), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A no-op lowered as a register write escaped detection")
+    print("control v_pipeflush as a write to v13: pixel mismatch, as required")
+    return 0
 
 
 def check_e64_spelling_draws(directory, compiler, renderer, backend):
@@ -17589,6 +17646,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
     fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
+    fixtures.append((vop1_nop_program(), translate))
     fixtures.extend((uncompressed_export(body), translate_int, "gfx1013")
                     for body in (DPP_CVT_FROM_FLOAT, DPP_CVT_TO_FLOAT))
     fixtures.append((with_constants(DPP_EXTRA_BODY), translate, "gfx1013"))
@@ -22981,6 +23039,21 @@ def check_sampler_descriptor_refusals():
         else:
             raise AssertionError("comparison sampler %s was accepted" % (words,))
 
+    # A gather offset must be a static 6-bit X/Y pair: an absent operand and any bit outside
+    # 0x3f3f are refused, and a legal pair decodes with the sign centred on 32.
+    for bad in (None, 0x40, 0x4040):
+        try:
+            pixel_aot.gather_offset(bad)
+        except ValueError as error:
+            assert "static packed XY offset" in str(error), (bad, error)
+        else:
+            raise AssertionError("gather offset %r was accepted" % (bad,))
+    assert pixel_aot.gather_offset(0x0101) == (1, 1), pixel_aot.gather_offset(0x0101)
+    # 0x3f in X decodes to -1 and 0x1f in Y to +31: the pair is centred on 32, not truncated.
+    assert pixel_aot.gather_offset(0x1f3f) == (-1, 31), pixel_aot.gather_offset(0x1f3f)
+    # 0x20 in Y decodes to -32, the other end of the signed range.
+    assert pixel_aot.gather_offset(0x203f) == (-1, -32), pixel_aot.gather_offset(0x203f)
+
 
 def main():
     if len(sys.argv) == 1:
@@ -23113,6 +23186,8 @@ def main():
                 raise
         if mode == "draw-e64-spellings":
             return check_e64_spelling_draws(directory, *args)
+        if mode == "draw-vop1-nops":
+            return check_vop1_nop_draws(directory, *args)
         if mode == "draw-e64":
             # The controls already run in the binary and draw modes; this mode only draws.
             return check_e64_render(directory, *args)
