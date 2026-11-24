@@ -610,6 +610,16 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        lod = None
+        if how == 'l':
+            # Address dwords are the coordinates and then the explicit level; offsets, bias, clamp and derivatives
+            # would add dwords or modifiers this lowering does not read, so they are refused.
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc')):
+                    raise Unsupported('image_sample_l modifier %s' % m)
+            if dmask == 0:
+                raise Unsupported('image_sample_l with an empty dmask')
+            lod, cs = cs[-1], cs[:-1]
         tex = self.pipe.resource(self.descriptor(ops[2]), 'tex3d' if three else 'tex2d')
         if how == 'load':
             if three:
@@ -622,7 +632,9 @@ class Stage:
             smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
             uv = ('float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
                   else 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1])))
-            if how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
+            if how == 'l':
+                call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
+            elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
@@ -638,6 +650,9 @@ class Stage:
 
     def op_image_sample_lz(self, ops, mods):
         self.image(ops, mods, 'lz')
+
+    def op_image_sample_l(self, ops, mods):
+        self.image(ops, mods, 'l')
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
