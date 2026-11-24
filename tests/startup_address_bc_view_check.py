@@ -91,16 +91,25 @@ def check(directory, consumer, backend, fmt, width, height):
         if unpadded == 0:
             raise AssertionError("The unpadded tile pitch did not change the image")
     log = trap_log.read_text(errors="replace")
-    refusal = (rf"Device::slot70 unsupported memory SRV arguments: reason=unsupported_description "
-               rf"res\{{dim=3 fmt={77 if fmt == 'BC3' else 98} size={width - 2}x{height}x1 ")
-    if not re.search(refusal, log):
-        raise AssertionError(f"{fmt}: no refusal for {width - 2}x{height} (not whole blocks)")
-    partial = re.findall(r"partial-tile BC view (\d+)x(\d+) .*: published, XG-announced write 0", log)
-    # One line per first publication at an address: the first backing and the exchanged one.
-    if partial != ([] if width % 64 == 0 and height % 64 == 0 else [(str(width), str(height))] * 2):
-        raise AssertionError(f"{fmt}: partial-tile lines {partial}")
+    code = 77 if fmt == "BC3" else 98
+    partial = width % 64 or height % 64
+    tiled_bytes = 16384  # 2 x 2 tiles of 4 KiB, partial or not
+    refusals = [("unsupported_description", width - 2, height), ("unsupported_description", width, height - 2),
+                ("partial_tile_beyond_xg_size", 1028, 1028)]
+    if partial:
+        refusals.append(("partial_tile_xg_rows", width, height))
+    for reason, w, h in refusals:
+        if not re.search(rf"Device::slot70 .*: reason={reason} res\{{dim=3 fmt={code} size={w}x{h}x1 ", log):
+            raise AssertionError(f"{fmt}: no {reason} refusal for {w}x{h}")
+    lines = re.findall(r"partial-tile BC view (\d+x\d+) format \d+ layout 0x105: (\w+), (\d+) tiled bytes", log)
+    # One line per first publication at an address (the first backing and the exchanged one), and one
+    # for the announced backing, which stays refused.
+    view = f"{width}x{height}"
+    expected = [(view, "published", str(tiled_bytes))] * 2 + [(view, "partial_tile_xg_rows", str(tiled_bytes))]
+    if lines != (expected if partial else []):
+        raise AssertionError(f"{fmt}: partial-tile lines {lines}, expected {expected if partial else []}")
     print(f"{backend} {fmt} {width}x{height}: {4 * WIDTH * HEIGHT} RGBA pixels exact; exchanged tiles differ in "
-          f"{swapped} texels; unpadded tile pitch differs in {unpadded}; {width - 2}x{height} refused")
+          f"{swapped} texels; unpadded tile pitch differs in {unpadded}; {len(refusals)} refusals as expected")
     return 0
 
 

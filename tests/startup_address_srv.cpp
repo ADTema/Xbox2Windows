@@ -9,6 +9,7 @@
 
 using Word = std::uint64_t;
 Word invoke(void*, unsigned, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0);
+extern "C" __declspec(dllimport) void x2w_d3d12_texture_written(void* base, unsigned long long bytes);
 namespace {
 template<class T> Word ptr(T* value) { return reinterpret_cast<Word>(value); }
 struct ViewAt {
@@ -170,9 +171,27 @@ int draw_bc_address_srvs(void* guest, void* list)
         invoke(list, 22, 1, ptr(&region));
         invoke(list, 12, 3, 1);
     }
-    // Not whole 4x4 blocks: refused (the check reads the log), with nothing drawn after it.
-    desc.Width -= 2;
-    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    // Refused, with nothing drawn after them (the check reads the log): not whole 4x4 blocks in either
+    // direction, and padded tiles past the size XG reports (1028 x 1028 pads to 1,183,744 bytes; the
+    // footprint rounded to 64 KiB is 1,179,648).
+    const auto refused = [&](UINT64 w, UINT h) {
+        auto shape = desc;
+        shape.Width = w;
+        shape.Height = h;
+        v.address = ptr(backing[0].data());
+        invoke(guest, 70, ptr(&shape), ptr(&v), cpu);
+    };
+    refused(width - 2, height);
+    refused(width, height - 2);
+    refused(1028, 1028);
+    // A partial-tile view over memory the XG stand-in announced as written (desktop-footprint rows) stays
+    // refused. A full-tile view is not affected, so only the partial size is published here.
+    if (width % 64 || height % 64) {
+        alignas(4096) static std::array<char, 4 * tile> announced{};
+        x2w_d3d12_texture_written(announced.data(), announced.size());
+        v.address = ptr(announced.data());
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    }
     return 0;
 }
 
