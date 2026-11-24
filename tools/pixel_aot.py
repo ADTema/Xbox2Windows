@@ -1976,6 +1976,17 @@ def int64_operand(token, scalar, vector, pending, sample_dest, *, signed, encodi
     raise invalid
 
 
+def int64_comparison(i, op, kind, tokens, encoding, scalar, vector, pending, sample_dest):
+    """HLSL word declarations and the predicate of a 64-bit integer v_cmp or v_cmpx of `tokens`."""
+    words = [int64_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i64",
+                           encoding=encoding, position=n) for n, t in enumerate(tokens)]
+    word_type = "int" if kind == "i64" else "uint"
+    names = [f"cmp{i}_l0", f"cmp{i}_h0", f"cmp{i}_l1", f"cmp{i}_h1"]
+    lines = [f"    {'uint' if name[-2] == 'l' else word_type} {name} = {value};"
+             for name, value in zip(names, (words[0][0], words[0][1], words[1][0], words[1][1]))]
+    return lines, INT64_COMPARE[op].format(l0=names[0], h0=names[1], l1=names[2], h1=names[3])
+
+
 def dpp_vgpr(token, vector, sample_dest, *, allow_mods):
     """Parse one DPP VGPR operand (allowing completed uv.* interpolation outputs in DPP)."""
     neg = False
@@ -3062,13 +3073,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector.masked = True
             scalar.masked = True
             scc = None
-        elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32))_e32 "
-                        r"([^,]+), ([^,]+)"):
+        elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32|i64|u64)"
+                        rf"|(eq|ne|lt|le|gt|ge)_(i16|u16))_e32 ([^,]+), ([^,]+)"):
             # A masked-if opened by a VOPC e32 compare that writes EXEC (issue #932). It must directly
             # follow `s_mov_b64 s[a:b], exec` of the known entry mask, so EXEC becomes the entry mask
             # intersected with the comparison, as after s_and_saveexec_b64. v_cmpx writes neither VCC nor
             # SCC, so both keep their tracked values; the region closes with s_mov_b64 or s_or_b64.
-            fop, iop, kind, src0, src1 = m.groups()
+            # The integer forms compare as the v_cmp of the same width (gfx10 has no f/t forms at 16 bits).
+            fop, iop, kind, op16, kind16, src0, src1 = m.groups()
+            if op16 is not None:
+                iop, kind = op16, kind16
             previous = instructions[i - 1] if i else ""
             previous = previous[1] if isinstance(previous, tuple) else previous
             saved = re.fullmatch(r"s_mov_b64 (s\[\d+:\d+\]), exec", previous)
@@ -3076,13 +3090,19 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if (region is not None or mask != "entry" or pair is None
                     or [scalar.get(r) for r in pair] != [("entry", 0), ("entry", 1)]):
                 raise ValueError("Unsupported v_cmpx execution mask save")
-            # VOPC e32 encodes VSRC1 as a VGPR and carries no source modifiers.
-            if not re.fullmatch(r"v\d+", src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0):
+            # VOPC e32 encodes VSRC1 as a VGPR (a VGPR pair at 64 bits) and carries no source modifiers.
+            vsrc1 = r"v\[\d+:\d+\]" if kind in ("i64", "u64") else r"v\d+"
+            if not re.fullmatch(vsrc1, src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0):
                 raise ValueError(f"Invalid VOPC e32 operands: {line}")
             if fop is not None:
                 expr = f32_comparison(fop, [src0, src1], scalar, vector, pending, sample_dest)
+            elif kind in ("i64", "u64"):
+                declarations, expr = int64_comparison(i, iop, kind, [src0, src1], "e32",
+                                                      scalar, vector, pending, sample_dest)
+                lines.extend(declarations)
             else:
-                values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
+                read = int16_operand if kind in ("i16", "u16") else int_operand
+                values = [read(t, scalar, vector, pending, sample_dest, signed=kind in ("i32", "i16"))
                           for t in (src0, src1)]
                 expr = INT_COMPARE[iop].format(*values)
             lines.append(f"    bool cmp{i} = {expr};")
@@ -4324,13 +4344,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 sgpr_name(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            words = [int64_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i64",
-                                   encoding=enc, position=n) for n, t in enumerate(tokens)]
-            word_type = "int" if kind == "i64" else "uint"
-            names = [f"cmp{i}_l0", f"cmp{i}_h0", f"cmp{i}_l1", f"cmp{i}_h1"]
-            for name, value in zip(names, (words[0][0], words[0][1], words[1][0], words[1][1])):
-                lines.append(f"    {'uint' if name[-2] == 'l' else word_type} {name} = {value};")
-            lines.append(f"    bool cmp{i} = {INT64_COMPARE[op].format(l0=names[0], h0=names[1], l1=names[2], h1=names[3])};")
+            declarations, expr = int64_comparison(i, op, kind, tokens, enc, scalar, vector, pending, sample_dest)
+            lines.extend(declarations)
+            lines.append(f"    bool cmp{i} = {expr};")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32_sdwa {LANE_MASK}, ([^,]+), ([^,]+) src0_sel:DWORD src1_sel:DWORD"):

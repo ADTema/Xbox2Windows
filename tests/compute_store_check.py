@@ -3067,6 +3067,8 @@ def binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_cases(), "buffer_load_")
     mubuf_vector_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_vector_cases(), "buffer_load_")
+    mubuf_format_d16_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, mubuf_format_d16_cases(), "buffer_load_format_d16_")
     mubuf_d16_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_d16_cases(), "buffer_load_")
     mtbuf_store_binary(directory, assembler, objcopy, library)
@@ -3312,7 +3314,7 @@ def mubuf_subword_controls():
     for new, diagnostic in (
         (load + " glc", "Unsupported compute instruction"),
         (load + " tfe", "Unsupported compute instruction"),
-        (load.replace("load_ubyte", "load_format_d16_x"), "Unsupported compute instruction"),
+        (load.replace("load_ubyte", "load_format_d16_x"), "Formatted buffer reads require a source format"),
         (load.replace(", 0 idxen", ", s13 idxen"), "Unsupported compute instruction"),
         (load.replace("idxen", "offen"), "Unsupported subword buffer read target or address mode"),
         (load.replace("idxen", "idxen offen"), "Unsupported subword buffer read target or address mode"),
@@ -3368,6 +3370,108 @@ def mubuf_subword_draw(directory, compiler, renderer, backend):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(f"buffer_load_{name}\n" for name in MUBUF_SUBWORD), encoding="utf-8")
+    return 0
+
+
+MUBUF_RGBA16_UINT = "BUF_FMT_16_16_16_16_UINT"
+
+
+def mubuf_format_d16_cases():
+    for components in range(1, 5):
+        count = (components + 1) // 2
+        name = f"buffer_load_format_d16_{'xyzw'[:components]}"
+        data = "v8" if count == 1 else "v[8:9]"
+        store = "buffer_store_dword" if count == 1 else "buffer_store_dwordx2"
+        last = 7 + count
+        mask = [f"v_and_b32_e32 v{last}, 0xffff, v{last}"] if components % 2 else []
+        # The index aliases the first load destination. The store has its own index.
+        yield name, [
+            "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+            "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+            "s_load_dwordx4 s[16:19], s[12:13], 0x40",
+            "v_lshl_add_u32 v8, s11, 5, v0", "v_lshl_add_u32 v15, s11, 5, v0",
+            "s_waitcnt lgkmcnt(0)", f"{name} {data}, v8, s[16:19], 0 idxen offset:8",
+            "s_waitcnt vmcnt(0)", *mask, f"{store} {data}, v15, s[20:23], 0 idxen offset:4", "s_endpgm",
+        ], DS_BINDING | {"stride": 4 * (count + 1), "source_descriptor": 0x40,
+                          "source_stride": 16, "source_format": MUBUF_RGBA16_UINT}
+
+
+def mubuf_format_d16_controls():
+    cases = list(mubuf_format_d16_cases())
+    _, lines, binding = cases[0]
+    load = lines[7]
+    for replacement, diagnostic in (
+        (load.replace("idxen", "offen"), "Unsupported formatted buffer read target or address mode"),
+        (load.replace(", 0 idxen", ", s0 idxen"), "Unsupported compute instruction"),
+        (load + " tfe", "Unsupported compute instruction"),
+        (load.replace("offset:8", "offset:4"), "Unverified read offset"),
+        (load.replace("offset:8", "offset:16"), "Read leaves its source element"),
+        (load.replace("s[16:19]", "s[20:23]"), "Reads from the stored UAV"),
+        (load.replace("v8, v8", "v[8:9], v8"), "Unverified buffer read destination"),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, (load, replacement)), 32, **binding)
+    for options, diagnostic in (
+        ({"source_format": None}, "Formatted buffer reads require a source format"),
+        ({"source_format": MUBUF_RGBA_UINT}, "Formatted buffer read does not match source format"),
+        ({"source_format": "BUF_FMT_16_UINT"}, "Unsupported formatted source binding"),
+        ({"source_stride": 12}, "Unsupported formatted source binding"),
+    ):
+        rejects(diagnostic, aot.lower, lines, 32, **(binding | options))
+    rejects("Unverified buffer read descriptor", aot.lower,
+            variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
+    for _, lines, binding in cases:
+        rejects("Vector load result used or overwritten before s_waitcnt vmcnt(0)", aot.lower,
+                variant(lines, ("s_waitcnt vmcnt(0)", "")), 32, **binding)
+    for _, lines, binding in (cases[0], cases[2]):
+        mask = lines[9]
+        rejects("Store data is not a known word", aot.lower, variant(lines, (mask, "")), 32, **binding)
+        rejects("Unverified ALU operand", aot.lower, variant(lines, ("0xffff", "0x1ffff")), 32, **binding)
+    _, lines, binding = cases[-1]
+    rejects("Unverified buffer read destination", aot.lower,
+            variant(lines, (lines[7], lines[7].replace("v[8:9]", "v[255:256]"))), 32, **binding)
+    rejects("Vector load result used or overwritten before s_waitcnt vmcnt(0)", aot.lower,
+            variant(lines, ("s_waitcnt vmcnt(0)", "v_mov_b32_e32 v9, 0\ns_waitcnt vmcnt(0)")), 32, **binding)
+
+
+def mubuf_format_d16_draw(directory, compiler, renderer, backend):
+    mubuf_format_d16_controls()
+    src, cso, case = (directory / f"mubuf-format-d16.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+    run = [renderer, backend, "--compute-store-case", cso, case]
+    data = struct.pack("<320I", *(source_word(i) for i in range(320)))
+    accepted = []
+    for name, lines, binding in mubuf_format_d16_cases():
+        print(name, flush=True)
+        components = len(name.rsplit("_", 1)[-1])
+        count = (components + 1) // 2
+        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for groups in (1, 2):
+            words = [SENTINEL] * 320
+            for gid in range(32 * groups):
+                element = 16 * gid + 8
+                texel = data[element:element + 2 * components]
+                output = gid * (count + 1) + 1
+                words[output:output + count] = [int.from_bytes(texel[i:i + 4], "little")
+                                                for i in range(0, len(texel), 4)]
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        # Selecting the preceding texel is a valid translation with a wrong immediate.
+        changed = variant(lines, (" idxen offset:8", " idxen"))
+        src.write_text(aot.lower(changed, 32, **binding), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        result = subprocess.run(run, capture_output=True, text=True)
+        actual = int.from_bytes(data[:min(components * 2, 4)], "little")
+        if result.returncode != 1 or f"word=1 expected={words[1]:08x} actual={actual:08x}" not in result.stderr:
+            raise AssertionError(f"{name}: wrong texel escaped detection\n{result.stderr}")
+        print(result.stderr, end="")
+        accepted.append(name)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
     return 0
 
 
@@ -3570,7 +3674,7 @@ def mubuf_format_controls():
         (load + " offset:16", "Read leaves its source element"),
         (load.replace("v8, v8", "v[8:9], v8"), "Unverified buffer read destination"),
         (load.replace("s[16:19]", "s[20:23]"), "Reads from the stored UAV"),
-        (load.replace("buffer_load_format_x", "buffer_load_format_d16_x"), "Unsupported compute instruction"),
+        (load.replace("buffer_load_format_x", "buffer_load_format_d16_x"), "Formatted buffer read does not match source format"),
     ):
         rejects(diagnostic, aot.lower, variant(lines, (load, replacement)), 32, **binding)
     for options, diagnostic in (
@@ -4807,6 +4911,7 @@ if __name__ == "__main__":
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mubuf-vector": mubuf_vector_draw,
                  "draw-mubuf-d16": mubuf_d16_draw,
+                 "draw-mubuf-load-format-d16": mubuf_format_d16_draw,
                  "draw-mubuf-format": mubuf_format_draw,
                  "draw-mubuf-format-store": mubuf_format_store_draw,
                  "draw-mtbuf-load": mtbuf_load_draw,

@@ -181,6 +181,9 @@ def labelled(decoded):
 MUBUF_UINT_FORMATS = tuple(f"BUF_FMT_{'32_' * count}UINT" for count in range(1, 5))
 MUBUF_SOURCE_FORMAT = MUBUF_UINT_FORMATS[-1]
 MUBUF_TEXEL_BYTES = 16
+MUBUF_D16_SOURCE_FORMAT = "BUF_FMT_16_16_16_16_UINT"
+MUBUF_D16_TEXEL_BYTES = 8
+MUBUF_SOURCE_TEXELS = {MUBUF_SOURCE_FORMAT: MUBUF_TEXEL_BYTES, MUBUF_D16_SOURCE_FORMAT: MUBUF_D16_TEXEL_BYTES}
 
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
@@ -217,8 +220,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     if source_stride is not None and (source_descriptor is None or not 4 <= source_stride <= 0x3fff
                                       or source_stride % 4):
         raise ValueError("Indexed reads require a source binding and aligned stride")
-    if source_format is not None and (source_format != MUBUF_SOURCE_FORMAT or cpu != "gfx1030"
-                                      or source_stride is None or source_stride % MUBUF_TEXEL_BYTES):
+    source_texel_bytes = MUBUF_SOURCE_TEXELS.get(source_format)
+    if source_format is not None and (source_texel_bytes is None or cpu != "gfx1030"
+                                      or source_stride is None or source_stride % source_texel_bytes):
         raise ValueError("Unsupported formatted source binding")
     if image_descriptor is not None or image_format is not None:
         # The 8-dword image descriptor occupies two 16-byte slots, both bound to t0.
@@ -1066,21 +1070,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         elif m := re.fullmatch(r"(?:buffer_load_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>[us](?:byte|short))"
                                r"|(?P<d16_kind>[us]byte|short)_d16(?P<hi>_hi)?)"
                                r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))"
-                               r"|buffer_load_format_(?P<resource_channels>x|xy|xyz|xyzw)) "
+                               r"|buffer_load_format_(?P<resource_channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?"
                                r"(?: offset:(?P<offset>\d+))?", line):
-            channels = m["channels"]
-            packed = channels is not None and channels.startswith("d16_")
+            channels, resource_channels = m["channels"], m["resource_channels"]
+            suffix = channels or resource_channels
+            packed = suffix is not None and suffix.startswith("d16_")
             raw_count = m["raw_count"]
-            resource_channels = m["resource_channels"]
-            if channels:
-                components = len(channels.removeprefix("d16_"))
-            elif resource_channels:
-                components = len(resource_channels)
-            else:
-                components = int(raw_count or 1)
+            components = len(suffix.removeprefix("d16_")) if suffix else int(raw_count or 1)
             count = (components + 1) // 2 if packed else components
             dst, *last = map(int, re.findall(r"\d+", m["dst"]))
             base, high = int(m["base"]), int(m["high"])
@@ -1100,6 +1099,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("Unsupported formatted buffer read target or address mode")
                 if source_format is None:
                     raise ValueError("Formatted buffer reads require a source format")
+                expected = MUBUF_D16_SOURCE_FORMAT if packed else MUBUF_SOURCE_FORMAT
+                if source_format != expected:
+                    raise ValueError("Formatted buffer read does not match source format")
             # The three-component D16 form uses the four-component 16-bit format.
             format_components = 4 if packed and components == 3 else components
             if channels and m["format"] != f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT":
@@ -1118,7 +1120,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Reads from the stored UAV are not supported")
             if kinds != tuple(("srv", i) for i in range(4)):
                 raise ValueError("Unverified buffer read descriptor")
-            alignment = MUBUF_TEXEL_BYTES if resource_channels else width
+            alignment = source_texel_bytes if resource_channels else width
             if offset % alignment or offset > 4095:
                 raise ValueError("Unverified read offset")
             tag = vector.get(int(addr[1:])) if addr != "off" else None
@@ -1132,7 +1134,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
                 # A formatted load selects a prefix of a complete four-component texel.
-                read_bytes = MUBUF_TEXEL_BYTES if resource_channels else width * count
+                read_bytes = source_texel_bytes if resource_channels else width * count
                 if offset + read_bytes > source_stride:
                     raise ValueError("Read leaves its source element")
                 aligned = offset & ~3
@@ -1390,7 +1392,7 @@ def main():
     parser.add_argument("--source-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset bound to stable read-only t0, with no overlap with u0")
     parser.add_argument("--source-stride", type=int, help="Indexed t0 byte stride")
-    parser.add_argument("--source-format", choices=(MUBUF_SOURCE_FORMAT,),
+    parser.add_argument("--source-format", choices=MUBUF_SOURCE_TEXELS,
                         help="Caller-declared MUBUF t0 descriptor format with identity channel selectors")
     parser.add_argument("--output-format", choices=MUBUF_UINT_FORMATS,
                         help="Caller-declared MUBUF u0 descriptor format with identity channel selectors")
