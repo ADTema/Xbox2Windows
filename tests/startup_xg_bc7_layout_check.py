@@ -84,6 +84,8 @@ def check_layout(create, width, height, padded_width, padded_height):
         raise RuntimeError("XGCreateTextureComputer returned a null object")
     vtable = ctypes.cast(computer, ctypes.POINTER(ctypes.POINTER(PTR)))[0]
     try:
+        # A null destination is refused with E_POINTER before anything is written.
+        expect("GetResourceLayout(null) HRESULT", LAYOUT(vtable[2])(computer, None) & 0xFFFFFFFF, 0x80004003)
         storage = ctypes.create_string_buffer(GUARD + b"\xa5" * LAYOUT_BYTES + GUARD)
         expect("GetResourceLayout HRESULT", LAYOUT(vtable[2])(computer, ctypes.byref(storage, len(GUARD))), 0)
         expect("prefix guard", bytes(storage[:len(GUARD)]), GUARD)
