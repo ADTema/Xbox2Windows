@@ -18,7 +18,7 @@ Entry-state contract (`--entry-state`):
     on entry (FCW=0x037F, FSW=0, FTW=0, FOP=0, FIP=0, FCS=0, FDP=0, FDS=0,
     MXCSR=0x1F80, ST0..7=0, XMM0..15=0, YMM_HI0..15=0, XINUSE=0).
 
-Supported XSAVE state instructions (4 forms from docs/coverage/x64_zen2.tsv
+Supported XSAVE state instructions (6 forms from docs/coverage/x64_zen2.tsv
 group XSAVE):
   - xsave / xsave64:   require 64-byte-aligned [base + disp] and bounded mask
                        (edx == 0 && (eax & ~7) == 0); write requested legacy
@@ -26,6 +26,15 @@ group XSAVE):
                        legacy [416..511], XCOMP_BV [520..527], and header
                        [528..575] untouched, and updating XSTATE_BV[2:0] =
                        (old & ~rfbm) | (xinuse & rfbm).
+  - xsavec / xsavec64: same alignment and mask contract as xsave; write the
+                       compacted format: only components with XINUSE & RFBM set
+                       are stored (x87/SSE in the legacy region, AVX at the
+                       first extended offset 576, which is also its compacted
+                       offset because x87/SSE own no extended slot), header
+                       XSTATE_BV = XINUSE & RFBM, XCOMP_BV = bit 63 | RFBM, and
+                       the 48 reserved header bytes [528..575] cleared; MXCSR
+                       and MXCSR_MASK are stored when RFBM selects SSE or AVX.
+                       Every check runs before the first store.
   - xrstor / xrstor64: require 64-byte-aligned [base + disp] and bounded mask
                        (edx == 0 && (eax & ~7) == 0); validate XCOMP_BV == 0,
                        header [528..535] == 0, (XSTATE_BV & ~7) == 0, and
@@ -37,7 +46,7 @@ Transport/ABI glue: vmovdqa/vmovdqu (XMM0..5, YMM0..5), vzeroupper,
 movdqa/movdqu (XMM0..5), paddd (XMM0..5), movq (MM0..7 <-> m64 / volatile
 scratch r64), emms, 32/64-bit volatile GPR mov/xor, and terminal ret.
 
-XSAVEOPT/XSAVEC/XSAVES/XRSTORS, FXSAVE/FXRSTOR, EVEX encodings, nonvolatile
+XSAVEOPT/XSAVES/XRSTORS, compacted XRSTOR, FXSAVE/FXRSTOR, EVEX encodings, nonvolatile
 registers (XMM6..15, YMM6..15, ZMM0..15, RBX/RBP/RSI/RDI/R12..R15/RSP),
 non-argument memory bases, stores outside r8, RIP-relative/indexed addressing,
 prefixes, branches, unclosed MMX state before ret, and trailing bytes reject.
@@ -93,14 +102,16 @@ XRSTOR_CODES = {
     Code.XRSTOR_MEM: False,
     Code.XRSTOR64_MEM: True,
 }
+XSAVEC_CODES = {
+    Code.XSAVEC_MEM: False,
+    Code.XSAVEC64_MEM: True,
+}
 ENTRY_STATES = ("defined", "canonical")
 XCOMP_NAMES = ((1, "x87"), (2, "sse"), (4, "avx"))
 
 REJECT_XSAVE_FAMILY_CODES = {
     Code.XSAVEOPT_MEM,
     Code.XSAVEOPT64_MEM,
-    Code.XSAVEC_MEM,
-    Code.XSAVEC64_MEM,
     Code.XSAVES_MEM,
     Code.XSAVES64_MEM,
     Code.XRSTORS_MEM,
@@ -153,6 +164,7 @@ ALLOWED_CODES = {
     Code.XOR_R32_RM32,
     Code.XOR_RM32_R32,
     *XSAVE_CODES,
+    *XSAVEC_CODES,
     *XRSTOR_CODES,
     *VEX_LOAD_CODES,
     *VEX_STORE_CODES,
@@ -574,6 +586,20 @@ static inline void op_xsave(const XState& state, word address, word rax_val, wor
     }
     std::atomic_signal_fence(std::memory_order_seq_cst);
 }
+
+static inline void op_xsavec(const XState& state, word address, word rax_val, word rdx_val, bool is64) {
+    // Every fault check precedes the first store, so a rejected call leaves memory intact.
+    if ((address & 63ull) != 0ull) raise_gp();
+    if (static_cast<std::uint32_t>(rdx_val) != 0u || (static_cast<std::uint32_t>(rax_val) & ~7u) != 0u) raise_gp();
+    const std::uint64_t rfbm = static_cast<std::uint64_t>(rax_val) & 7ull;
+    const std::uint64_t used = rfbm & state.xinuse;
+    op_xsave(state, address, used, 0ull, is64);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    auto* dst = reinterpret_cast<volatile std::uint64_t*>(address);
+    dst[64] = used;
+    dst[65] = (1ull << 63) | rfbm;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+}
 """
 
 
@@ -751,8 +777,9 @@ def lift_code(name, start, raw, *, entry_state="defined"):
             statements.append("return;")
             returned = True
 
-        elif ins.code in XSAVE_CODES:
-            is64 = XSAVE_CODES[ins.code]
+        elif ins.code in XSAVE_CODES or ins.code in XSAVEC_CODES:
+            is64 = {**XSAVE_CODES, **XSAVEC_CODES}[ins.code]
+            op_name = "op_xsavec" if ins.code in XSAVEC_CODES else "op_xsave"
             require_xsave_masks(ins)
             addr = flat_address(ins, ptr_origins, write=True)
             rax_val = const_gpr.get("rax")
@@ -770,7 +797,7 @@ def lift_code(name, start, raw, *, entry_state="defined"):
                         f"requires explicit --entry-state canonical at RVA {ins.ip:#x}: {ins}"
                     )
                 used_canonical_entry = True
-            statements.append(f"op_xsave(state, {addr}, rax, rdx, {'true' if is64 else 'false'});")
+            statements.append(f"{op_name}(state, {addr}, rax, rdx, {'true' if is64 else 'false'});")
 
         elif ins.code in XRSTOR_CODES:
             is64 = XRSTOR_CODES[ins.code]
