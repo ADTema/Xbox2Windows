@@ -51,19 +51,21 @@ void test_env_on()
     const DWORD unset_err = GetLastError();
     check(!unset_res && unset_err == 0x12345678u, "env_on unset returns false and preserves GetLastError");
 
-    for (const char* val : {"", "0", "2", "true", "on"}) {
+    for (const char* val : {"", "0", "2", "01", " 1", "true", "on", "yes"}) {
         SetEnvironmentVariableA(var_name, val);
         SetLastError(0x0BAD0001u);
         const bool res = x2w_local::env_on(var_name);
         const DWORD err = GetLastError();
-        check(!res && err == 0x0BAD0001u, "env_on non-1 value returns false and preserves GetLastError");
+        check(!res && err == 0x0BAD0001u, "env_on value without a leading 1 returns false and preserves GetLastError");
     }
 
-    SetEnvironmentVariableA(var_name, "1");
-    SetLastError(0x0CAFE002u);
-    const bool on_res = x2w_local::env_on(var_name);
-    const DWORD on_err = GetLastError();
-    check(on_res && on_err == 0x0CAFE002u, "env_on '1' returns true and preserves GetLastError");
+    for (const char* val : {"1", "10", "1x", "100"}) {
+        SetEnvironmentVariableA(var_name, val);
+        SetLastError(0x0CAFE002u);
+        const bool on_res = x2w_local::env_on(var_name);
+        const DWORD on_err = GetLastError();
+        check(on_res && on_err == 0x0CAFE002u, "env_on leading 1 returns true and preserves GetLastError");
+    }
 
     SetEnvironmentVariableA(var_name, nullptr);
 }
@@ -100,57 +102,84 @@ void test_first_calls()
 
 void test_logf()
 {
-    // Silence stderr during logf checks so the test output stays clean.
-    const HANDLE saved_stderr = GetStdHandle(STD_ERROR_HANDLE);
-    HANDLE nul_handle = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (nul_handle != INVALID_HANDLE_VALUE) SetStdHandle(STD_ERROR_HANDLE, nul_handle);
-
     wchar_t prev_trap_log[MAX_PATH]{};
     const DWORD prev_len = GetEnvironmentVariableW(L"X2W_TRAP_LOG", prev_trap_log, MAX_PATH);
 
     wchar_t temp_dir[MAX_PATH]{};
     const DWORD dir_len = GetTempPathW(MAX_PATH, temp_dir);
     check(dir_len > 0 && dir_len < MAX_PATH, "GetTempPathW succeeds");
-
-    wchar_t log_path[MAX_PATH]{};
-    std::swprintf(log_path, MAX_PATH, L"%lsx2w_local_log_test_%lu.log", temp_dir,
-                  static_cast<unsigned long>(GetCurrentProcessId()));
-    DeleteFileW(log_path);
+    if (!dir_len || dir_len >= MAX_PATH) return;
+    const auto folder = std::wstring(temp_dir) + L"x2w_local_log_" + std::to_wstring(GetCurrentProcessId());
+    const auto log_path = folder + L"\\trap.log";
+    if (log_path.size() >= MAX_PATH) {
+        check(false, "temporary folder has space for the log names");
+        return;
+    }
+    if (!CreateDirectoryW(folder.c_str(), nullptr)) {
+        check(false, "create temporary log folder");
+        return;
+    }
+    const auto err_path = folder + L"\\stderr";
+    const auto max_name = MAX_PATH - 2 - folder.size();
+    const auto fit_path = folder + L"\\" + std::wstring(max_name, L'f');
+    const auto long_path = folder + L"\\" + std::wstring(max_name + 1, L'g');
+    const HANDLE saved_stderr = GetStdHandle(STD_ERROR_HANDLE);
+    HANDLE stderr_file = CreateFileW(err_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                     CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const bool captured = stderr_file != INVALID_HANDLE_VALUE &&
+                          SetStdHandle(STD_ERROR_HANDLE, stderr_file) != FALSE;
+    check(captured, "capture the stderr stream");
 
     SetEnvironmentVariableW(L"X2W_TRAP_LOG", nullptr);
     SetLastError(0x13572468u);
     x2w_local::logf("unset-path-%d", 1);
     check(GetLastError() == 0x13572468u, "logf preserves GetLastError when X2W_TRAP_LOG is unset");
 
-    SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path);
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
     SetLastError(0x0BADF00Du);
     x2w_local::logf("first-%d", 42);
     check(GetLastError() == 0x0BADF00Du, "logf preserves GetLastError when X2W_TRAP_LOG is set");
 
     x2w_local::logf("second-%s", "line");
 
-    const std::string two_lines = read_file_bytes(log_path);
+    const std::string two_lines = read_file_bytes(log_path.c_str());
     check(two_lines == "first-42\r\nsecond-line\r\n", "logf appends CRLF lines to X2W_TRAP_LOG");
 
-    // Truncation check: line[1536] reserves 2 bytes for "\r\n" and 1 for NUL -> 1533 payload bytes.
-    DeleteFileW(log_path);
-    const std::string long_msg(2000, 'A');
-    x2w_local::logf("%s", long_msg.c_str());
-    const std::string truncated = read_file_bytes(log_path);
-    const std::string expected_truncated = std::string(1533, 'A') + "\r\n";
-    check(truncated == expected_truncated, "logf truncates long messages to 1533 payload bytes + CRLF");
+    std::string expected_log = "first-42\r\nsecond-line\r\n";
+    for (std::size_t length : {1532, 1533, 1534, 2000}) {
+        const std::string message(length, 'A');
+        x2w_local::logf("%s", message.c_str());
+        expected_log += message.substr(0, 1533) + "\r\n";
+    }
+    check(read_file_bytes(log_path.c_str()) == expected_log, "logf clamps only beyond 1533 payload bytes");
 
-    DeleteFileW(log_path);
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", fit_path.c_str());
+    x2w_local::logf("path at limit");
+    check(read_file_bytes(fit_path.c_str()) == "path at limit\r\n", "logf accepts a path of MAX_PATH minus one");
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", long_path.c_str());
+    x2w_local::logf("path over limit");
+    check(read_file_bytes(log_path.c_str()) == expected_log &&
+              GetFileAttributesW(long_path.substr(0, MAX_PATH - 1).c_str()) == INVALID_FILE_ATTRIBUTES,
+          "logf leaves prior logs alone and declines an overlong path");
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", folder.c_str());
+    SetLastError(0x13572468u);
+    x2w_local::logf("path is a directory");
+    check(GetLastError() == 0x13572468u, "logf preserves the last error on open failure");
+
     if (prev_len > 0 && prev_len < MAX_PATH) {
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", prev_trap_log);
     } else {
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", nullptr);
     }
-    if (nul_handle != INVALID_HANDLE_VALUE) {
+    if (captured) {
         SetStdHandle(STD_ERROR_HANDLE, saved_stderr);
-        CloseHandle(nul_handle);
     }
+    if (stderr_file != INVALID_HANDLE_VALUE) CloseHandle(stderr_file);
+    check(read_file_bytes(err_path.c_str()) == "unset-path-1\r\n" + expected_log +
+              "path at limit\r\npath over limit\r\npath is a directory\r\n",
+          "stderr still receives every formatted line");
+    for (const auto* path : {&err_path, &log_path, &fit_path}) DeleteFileW(path->c_str());
+    check(RemoveDirectoryW(folder.c_str()) != FALSE, "clean up only the expected files");
 }
 
 void test_probe_and_access(bool guard_drop_mutate)
