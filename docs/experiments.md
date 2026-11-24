@@ -2830,7 +2830,7 @@ The store profile also accepts these scalar 32-bit operations. Both sources are 
 | `s_add_u32 sD, a, b` | `a + b`, modulo 2^32 |
 | `s_sub_u32 sD, a, b` | `a - b`, modulo 2^32 |
 | `s_and_b32 sD, a, b` | `a & b` |
-| `s_or_b32 sD, a, b` | `a | b` |
+| `s_or_b32 sD, a, b` | `a \| b` |
 | `s_xor_b32 sD, a, b` | `a ^ b` |
 | `s_lshr_b32 sD, a, b` | `a >> (b & 31)`, logical |
 
