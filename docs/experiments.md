@@ -1289,6 +1289,72 @@ For 249 input pairs both callers match the provider's observed arguments, guarde
 
 The local Bink DLL imports ordinal 1 from XAudio2_9.dll. A read-only check confirmed an executable export at that ordinal in this workstation's System32 provider. The Bink call's argument and result contract remains unverified.
 
+## SSE FXSAVE/FXRSTOR state save and restore
+
+[The SSE FXSAVE/FXRSTOR translator](../tools/cpu_sse_fxsave_aot.py) lifts bounded
+straight-line Windows x64 leaf functions exercising the four legacy SSE state forms from
+`docs/coverage/x64_zen2.tsv` group `SSE`:
+
+- State save (`fxsave`, `fxsave64`): store the 416 architectural bytes of the 512-byte
+  16-byte-aligned FXSAVE area to `[r8 + disp]` (`FCW`, `FSW & 0x7F7F`, `FTW`, `FOP & 0x7FF`,
+  `FIP`/`FDP` at 32-bit vs 64-bit widths with `FCS`/`FDS` gated on `CPUID.7.0:EBX[13]`,
+  `MXCSR`, host `MXCSR_MASK`, `ST0..ST7`, and `XMM0..XMM15`), zeroing reserved byte 5,
+  `ST/MM[10..15]`, and 32-bit reserved words `[14..15]`/`[22..23]`, while leaving `[416..511]`
+  untouched.
+- State restore (`fxrstor`, `fxrstor64`): validate 16-byte alignment and `MXCSR` reserved bits
+  against host `MXCSR_MASK` (`#GP` before mutating state), normalize `FCW` reserved bits
+  (`(fcw & 0x1F7F) | 0x0040`), mask `FOP` to 11 bits (`0x7FF`), clear `FSW` bits 15 and 7
+  (`0x7F7F`), and zero-extend (32-bit) or preserve 64-bit `FIP`/`FDP`.
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned buffers
+and models the full FXSAVE state in a portable local `FxState` struct (leaving host
+`XMM6`..`15`, x87/MMX, and `MXCSR` untouched across lifted calls). Entry-state contracts are
+explicit via `--entry-state {defined,canonical}` and exported via
+`lifted_entry_state_profile()` / `lifted_requires_canonical_entry()`: the default `defined`
+profile requires a supported `fxrstor`/`fxrstor64` before any `fxsave`/`fxsave64` (rejecting
+bare entry-state saves), while the opt-in `canonical` profile permits entry-state
+`fxsave`/`fxsave64` provided the native caller establishes canonical architectural FX state
+(`FCW=0x037F`, `FSW=0`, `FTW=0`, `FOP=0`, `FIP=0`, `FCS=0`, `FDP=0`, `FDS=0`, `MXCSR=0x1F80`,
+zero `ST0..7`/`XMM0..15`). Transport and ABI glue covers `movdqa`/`movdqu` (`XMM0`..`XMM5`),
+`paddd` (`XMM0`..`XMM5`), `movq` (`MM0`..`MM7` <-> `m64`/volatile scratch GPRs), `emms`, 64-bit
+volatile `mov`, and terminal `ret`. The lifted DLL exports `host_has_fxsr()`
+(`CPUID.01H:EDX.FXSR[24]`, returning exit code 77 when absent), `host_deprecates_fpu_cs_ds()`
+(`CPUID.7.0:EBX[13]`), `host_fp_err_cpuid_info()`, and `host_mxcsr_mask()`.
+`XSAVE`-family instructions (`xsave*`, `xrstor*`), `VEX`/`EVEX`/`XOP` encodings,
+`maskmovq`/`maskmovdqu`, nonvolatile registers (`XMM6`..`15`, `RBX`/`RBP`/`RSI`/`RDI`/
+`R12`..`R15`/`RSP`), non-argument memory bases, stores outside `r8`, RIP-relative
+addressing, prefixes, branches, unclosed MMX state before `ret`, undefined registers, and
+trailing bytes reject.
+
+```powershell
+cmake --build --preset dev --target cpu_sse_fxsave_original cpu_sse_fxsave_original_lifted cpu_sse_fxsave_altered cpu_sse_fxsave_altered_lifted cpu_sse_fxsave_canonical_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fxsave$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/sse_fxsave.asm) exports 9 functions covering opt-in
+canonical-entry `fxsave`/`fxsave64` (`cpu_sse_fxsave_canonical_lifted`), all four 32/64-bit
+`fxrstor*` -> `fxsave*` combinations, displaced `[rcx+64]`/`[r8+64]` operands, a chained
+`fxrstor64` + `movq` MMX GPR bridge + `paddd` + `fxsave64` + `emms` pipeline, and a
+discarded-read fault-ordering control (`op_discarded_read`). [The differential
+check](../tests/cpu/sse_fxsave_check.py) skips with exit code 77 if `CPUID.01H:EDX.FXSR[24]`
+is 0, probes native `(rstor64, save64, FSW.ES)` `FOP`/`FIP`/`FDP` preservation on the running
+host so comparisons remain strict for fields established on that host while checking `lifted`
+against the full architectural model, runs native calls through an isolated caller-state
+trampoline, and verifies 40 cases across 8 exports bit-for-bit against both the native MASM
+DLL and an independent Python reference model with 64-byte pre/post buffer guards across
+`dev` and `release` (`/O2`) builds, plus explicit entry-state contract metadata, a
+non-default entry distinguishing control (`MXCSR=0x7FA0`, `XMM6=0x12345678`), 8 `+8`
+misaligned `#GP` controls, 4 invalid `MXCSR` (`0x11F80`) `#GP` controls, lifted host-canary
+preservation, dead-read fault ordering (`op_discarded_read` for readable, unmapped `rdx=0`,
+and `0x11F80` `MXCSR`), 4 `ALTER_OP` divergence controls, an output-mutation control, 4
+alternate-encoding lift checks, 49 unit rejection controls (including default-profile bare
+`fxsave`/`fxsave64` rejections), and 12 PE-patched DLL rejection controls.
+
+Not covered by this experiment: non-canonical 64-bit `FIP` sign-extension differences across
+CPU vendors, `XSAVE`-family state management, control flow, and title CPU code execution.
+
 ## x87 in the shared lowering
 
 `lower(..., x87=True)` in `tools/ffx_version_query.py` accepts an opt-in x87 leaf-function profile. The default (`x87=False`) still rejects every x87 instruction, so existing callers are unchanged. The profile accepts `fld` and `fstp` with an m32, m64 or m80 memory operand, `fst` with an m32 or m64 operand, `fld st(i)`, `fst st(i)`, `fstp st(i)`, `fxch st(i)`, `fchs`, `fabs`, `fsqrt`, `frndint`, `fxtract` and `fscale`, the constant loads `fld1`, `fldz`, `fldpi`, `fldl2t`, `fldl2e`, `fldlg2` and `fldln2`, `fild`, `fistp` and `fisttp` with an m16, m32 or m64 integer operand, `fist` with m16 or m32, `fbstp` with an m80 packed BCD operand, `fcomi`, `fcomip`, `fucomi` and `fucomip` with `st, st(i)`, `fcmovb`, `fcmove`, `fcmovbe`, `fcmovnb`, `fcmovne`, `fcmovnbe`, `fcmovu` and `fcmovnu` with `st, st(i)`, `fcom` and `fcomp` with `st(i)` or an m32 or m64 operand, `fcompp`, `fucom` and `fucomp` with `st(i)`, `fucompp`, `fnstsw ax`, and five forms of each of `fadd`, `fsub`, `fsubr`, `fmul`, `fdiv` and `fdivr`: an m32 or m64 operand, `st, st(i)`, `st(i), st`, and the popping form (`faddp`, `fsubp`, `fsubrp`, `fmulp`, `fdivp`, `fdivrp`) with `st(i), st` for `i` from 1 to 7. It also accepts `fiadd`, `fisub`, `fisubr`, `fimul`, `fidiv` and `fidivr` with an m16 or m32 integer operand, `fnstcw` and `fstcw` with an m16 operand, which store the fixed control word `0x027F`, and `wait`, which does nothing because every exception is masked. A popping form with `st(0)` as the destination is rejected. A function enters with control word 0x027F (53-bit precision, round to nearest-even, all exceptions masked), TOP 0, all eight registers empty and a clear status word, and it must return with the stack empty. The stack depth before each instruction is fixed at translation time (`tools/x87_lower.py`), so each register becomes a C++ slot and no TOP exists at run time. Translation rejects any other x87 instruction, including `fldcw`, `fninit` and `fbld` (which only the checked entry below accepts), `ffree`, `fnstsw` with a memory operand, and environment access; a ninth push; a pop, an `st(i)` operand or `faddp` without enough values; depths that differ where control flow joins; an x87 instruction that is not reachable from the entry through direct edges; and a nonempty stack at a return, a call, an indirect branch or an external edge.
@@ -1461,6 +1527,90 @@ The native and recompiled DLLs matched the reference for the output blocks and g
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_aot_x87_(compare|fcmov|iarith|fnstcw)$' -V
 ```
+
+## XSAVE and XRSTOR extended processor state slice
+
+[The XSAVE state leaf translator](../tools/cpu_xsave_aot.py) lifts bounded straight-line
+Windows x64 leaf functions covering four uncovered forms from `docs/coverage/x64_zen2.tsv`
+group `XSAVE`:
+
+- `xsave` and `xsave64`: require 64-byte-aligned `[base + disp]` and bounded mask
+  (`EDX == 0` and `(EAX & ~7) == 0`); write requested legacy x87/SSE regions (`[0..415]`,
+  with `FCS`/`FDS` matching `CPUID.7.0:EBX[13]` and `MXCSR_MASK` at `[28..31]`) and AVX
+  `YMM[255:128]` (`[576..831]`), leave `[416..511]`, `XCOMP_BV` (`[520..527]`), and
+  header `[528..575]` untouched, and update `XSTATE_BV[2:0] = (old & ~RFBM) | (XINUSE & RFBM)`
+- `xrstor` and `xrstor64`: require 64-byte-aligned `[base + disp]` and bounded mask
+  (`EDX == 0` and `(EAX & ~7) == 0`); raise `#GP` before mutating state on non-zero
+  `XCOMP_BV`, non-zero reserved header bytes `[528..535]`, `(XSTATE_BV & ~7) != 0`, or
+  `(RFBM & 6) != 0` with invalid `MXCSR & ~MXCSR_MASK`; restore or initialize each
+  requested component and update `XINUSE[2:0]`
+
+Per Intel SDM Vol. 1 Ch. 13.5.1, hardware `XSAVE` may report `XSTATE_BV[1:0] = 1` for
+initialized legacy x87/SSE components when selected by `RFBM` (observed directly on hybrid
+P-core vs E-core scheduling: `XSTATE_BV` after clean `XRSTOR` was `0..7` on P-core CPU 0
+vs `XSTATE_BV[1:0] = 3` on E-core CPU 15 while `XSTATE_BV[2]` AVX init-tracking matched
+uniformly). The lifted translator matches the deterministic `XINUSE` model bit-for-bit,
+and the native comparator verifies exact byte equality across all payload/header bytes
+while allowing `XSTATE_BV[1:0]` to be `0` or `1` on native runs only when `RFBM` selects
+an initialized legacy component.
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat
+buffers and models the 832-byte standard-format `x87|SSE|AVX` `XState` locally without
+mutating host nonvolatile `XMM6`..`XMM15`, `x87`, or `MXCSR`. Entry-state contracts are
+explicit via `--entry-state {defined,canonical}` and exported via
+`lifted_entry_state_profile()` / `lifted_requires_canonical_entry()`: the default `defined`
+profile tracks per-component (`x87`, `sse`, `avx`) initialization from `xrstor`/`xrstor64`
+and `vzeroupper` (`avx`) and rejects any `xsave`/`xsave64` (including entry-only saves and
+partially initialized restore/save paths) that reads uninitialized entry components, while
+the opt-in `canonical` profile permits entry-state `xsave`/`xsave64` provided the native
+caller establishes canonical architectural XSAVE state (`FCW=0x037F`, `FSW=0`, `FTW=0`,
+`FOP=0`, `FIP=0`, `FCS=0`, `FDP=0`, `FDS=0`, `MXCSR=0x1F80`, zero `ST`/`XMM`/`YMM_HI`,
+`XINUSE=0`). Transport and ABI glue covers `vmovdqa`/`vmovdqu` (`XMM0`..`5`, `YMM0`..`5`),
+`vzeroupper`, `movdqa`/`movdqu`, `paddd`, `movq` (`MM0`..`7`), `emms`, 32/64-bit volatile GPR
+`mov`/`xor` (with pointer provenance and constant-mask tracking), and terminal `ret`. The
+lifted DLL exports `host_has_xsave()` (`CPUID.1:ECX[26..28]` and `XGETBV(0) & 7 == 7`,
+returning exit code 77 when absent), `host_deprecates_fpu_cs_ds()`,
+`host_fp_err_cpuid_info()`, and `host_mxcsr_mask()`. `xsaveopt*`, `xsavec*`,
+`xsaves*`/`xrstors*`, `fxsave*`/`fxrstor*`, EVEX encodings, nonvolatile registers, unclosed
+MMX state before `ret`, non-`r8` stores, prefixes, RIP-relative or indexed addressing, and
+branches reject.
+
+```powershell
+cmake --build --preset dev --target cpu_xsave_state_original cpu_xsave_state_original_lifted cpu_xsave_state_altered cpu_xsave_state_altered_lifted cpu_xsave_state_canonical_lifted cpu_xsave_state_canonical_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_xsave_state$' -V
+```
+
+### Measured results and open scope
+
+The native harness probes whether the host preserves the 16-bit FCS and FDS values in the non-REX.W legacy area after XRSTOR/XSAVE. A measured zero is expected only at the corresponding native selector bytes. Lifted results still follow the separately specified CPUID-based profile.
+
+The [MASM fixture](../tests/cpu/xsave_state.asm) exports 11 functions covering opt-in
+canonical-entry `xsave`/`xsave64` (`cpu_xsave_state_canonical_lifted`), `xrstor`/`xrstor64`
+roundtrips, displaced `[rcx+64]`/`[r8+64]`, `RFBM = 2` SSE-only masking (and `ALTER_OP`
+`RFBM = 2 -> 7` under `cpu_xsave_state_canonical_altered_lifted`), `vzeroupper` clearing
+`XINUSE[2]`, a chained `xrstor64` + `movq` + `vmovdqu` + `paddd` + `xsave64` + `emms`
+pipeline, and a dead-read fault-ordering control (`op_discarded_read`). [The differential
+check](../tests/cpu/xsave_state_check.py) probes native `(rstor64, save64, FSW.ES)`
+`FOP`/`FIP`/`FDP` preservation on the running host so comparisons remain strict for fields
+established on that host while checking `lifted` against the full architectural model,
+verifies 70 cases across the 10 differential exports bit-for-bit across `XSTATE_BV` subsets
+`{0, 1, 2, 3, 4, 6, 7}` (with non-zero component payloads when `XSTATE_BV[i] == 1`) against
+both the native MASM DLL (via a `VirtualAlloc` + `RtlAddFunctionTable` SEH caller-state
+harness) and an independent Python reference model with 64-byte pre/post buffer guards
+across `dev` and `release` (`/O2`) builds, alongside explicit entry-state contract metadata,
+non-default entry distinguishing controls for both entry-only (`SSE`/`MXCSR=0x3F80`/
+`XMM0=0x3F800000`) and partially initialized (`x87+AVX` with `op_xrstor64_mask_sse` vs
+`ALTER_OP`) paths, 16 misalignment `#GP` checks (`+16` and `+8`), 16 header/MXCSR `#GP` checks
+(`XCOMP_BV != 0`, nonzero `header[16:23]`, unsupported `XSTATE_BV`, invalid `MXCSR`),
+dead-read fault ordering across unmapped/`#GP` modes, host nonvolatile state preservation, 5
+`ALTER_OP` divergence controls (`3`, `3`, `3`, `7`, `7`), an output-mutation control, 5
+alternate-encoding lift checks, 39 unit rejection controls (including default-profile
+entry-only and partial-restore/save rejections), and 10 end-to-end PE-patched DLL rejection
+controls.
+
+Not covered by this experiment: compacted/supervisor formats (`xsavec*`, `xsaves*`,
+`xrstors*`), `xsaveopt*`, AVX-512/PKRU state components beyond `XCR0[2:0]`, control flow,
+and title CPU code execution.
 
 ## Mapping an image without LoadLibrary
 
@@ -3186,7 +3336,10 @@ through a buffer word, samples an interpolated UV and compares the scaled sample
 with a threshold. Both exits export only coverage. The selector, table pointers
 and point-clamp sampler are specialized for a supplied snapshot. The texture
 and two comparison inputs remain GPU resources. Changing the selector requires
-another translation. The tested inputs are finite and the textures have one mip.
+another translation. The product is `v_mul_legacy_f32_e32` (zero when either input
+is zero) or `v_mul_f32_e32` (IEEE, so zero times infinity is NaN), and the
+kill comparison is one of `v_cmpx_{lt,le,gt,ge}_f32_e32` with the scalar limit
+first. A comparison with NaN kills no pixel. The textures have one mip.
 
 The JSON bindings used by the source-built fixture are constructed by
 `bindings(slot)` in `tests/sampled_coverage_check.py`. A descriptor entry lists
@@ -3206,6 +3359,17 @@ then checks all 64 pixel locations with individual scissored draws. The color
 target must retain its clear value. It exercises both bound textures, mixed
 coverage, full survival and full rejection. A reference computed for the
 opposite texture must fail at the sample comparison.
+
+A second readback runs the IEEE multiply with each of the four comparisons on
+both textures. Its reference is computed on the CPU in binary32 and does not
+share code with the translator. The scale and limit pairs include equality at
+the exact sample values 0 and 1, a negative scale, negative zero, and an
+infinite scale with and without a zero sample. For every comparison the reference
+of each other comparison must fail at the pixel readback, and on the first
+texture so must the reference of the legacy multiply. The Linux step checks
+that these references differ and that malformed variants are rejected. The
+Windows readback has not been run on a GPU adapter by the author; the CI result
+on the pull request is the first measurement.
 
 #### Intel first-full-query diagnostic
 
@@ -4877,6 +5041,30 @@ Measured on `31f9ebb` with this change, Windows 10 build 19045, debug layer enab
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^wave64_emulate_' -V
+```
+
+### Forced wave size at pipeline creation
+
+`wave_startup_<width>_<adapter>` is a CRT-free EXE (`/ENTRY:fixture_entry /NODEFAULTLIB`) that, from its entry point, enables the debug layer when installed, creates a device, reads `D3D12_OPTIONS1.WaveLaneCountMin/Max` and calls `CreateComputePipelineState` once. Its [shader](../tests/wave_startup.hlsl) compiles as `cs_6_6` with no attribute (`0`), `[WaveSize(4)]` or `[WaveSize(32)]`. The EXE prints the exact HRESULT and every debug-layer message stored by the call. When creation succeeds it dispatches one 64-thread group and reads back `WaveGetLaneCount()` from every invocation. It passes when the outcome matches the reported range, and exits 77 when a forced width lies outside the range and the pipeline is refused. A pipeline created outside the range, or refused inside it, fails. `XBOX2WINDOWS_DEBUG_LAYER=off` repeats the attempt without the layer. The desktop readback of wave operations at native and forced widths is `shader_wave` ([#1132](https://github.com/R0Y00/Xbox2Windows/pull/1132)). This fixture answers only whether creation is refused, with which HRESULT and message.
+
+Measured on Windows 11 build 26200.9974, MSVC 19.44, DXC from Windows SDK 10.0.26100, `dev` and `release`, three CTest runs each with the debug layer and three without:
+
+| Adapter | Lane range | No attribute | `[WaveSize(4)]` | `[WaveSize(32)]` |
+| --- | --- | --- | --- | --- |
+| WARP (in-box, 10.0.26100.9818) | 4..4 | `S_OK`, readback 4 | `S_OK`, readback 4 | `0x80070057` (`E_INVALIDARG`), skip 77 |
+| NVIDIA GeForce RTX 3070 (32.0.16.2101) | 32..32 | `S_OK`, readback 32 | `0x80070057` (`E_INVALIDARG`), skip 77 | `S_OK`, readback 32 |
+
+Every readback had 64 invocations agreeing on one width. The refusals return the same HRESULT without the debug layer. With it, each refusal stores exactly one message, D3D12 error 622, and successful creation and dispatch store none:
+
+```text
+ID3D12Device::CreateComputeShader: Shader wants wave lane count of 32 but maximum wave lane count for device is 4. To check for support, check device caps via the CheckFeatureSupport() API
+ID3D12Device::CreateComputeShader: Shader wants wave lane count of 4 but minimum wave lane count for device is 32. To check for support, check device caps via the CheckFeatureSupport() API
+```
+
+Two local mutations were caught: an EXE expecting width 32 around the unforced shader created a pipeline on WARP that its 4..4 range excludes, and an EXE expecting 32 around the `[WaveSize(4)]` shader was refused on the RTX 3070 inside its 32..32 range. Both exited 1. A forced-wave32 pipeline is therefore refused by the in-box WARP at creation, as a capability limit of its 4..4 range, before any translated code runs. Not tested: AMD or Intel hardware, the app-local WARP or Agility SDK runtimes, `[WaveSize(64)]`, and the pipeline under `pe_map`.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^wave_startup_' -V
 ```
 
 ## Mapped DLL draw with a Windows reference
@@ -7360,13 +7548,26 @@ with backface culling enabled (`D3D12_CULL_MODE_BACK`):
 Not covered by this experiment: geometry or tessellation shader stages preceding the
 input assembler, primitive ID generation in pixel shaders, runtime driver hooking, and title CPU code execution.
 
+## gfx1013 SOP1 relative scalar moves
+
+`tools/disasm_rdna2.py` decodes the five relative scalar moves of the `SOP1` encoding (issue #938):
+`s_movrels_b32` and `s_movrels_b64` (opcodes 0x2e and 0x2f), `s_movreld_b32` and `s_movreld_b64`
+(0x30 and 0x31) and `s_movrelsd_2_b32` (0x49). The index comes from `M0` and is not printed; the
+`_b64` forms print SGPR pairs and a literal source consumes the trailing dword. The opcode values
+match LLVM's gfx10 encodings. `tools/scan_unsupported_shaders.py` recognizes the same mnemonics.
+```sh
+python3 -B tests/rdna2_tools_check.py
+```
+
+Scope: decoding and scanner recognition only. The translator does not lower these scalar forms, so
+there is no draw or readback, and no measurement on hardware backs the descriptions.
+
 ## gfx1013 binary16 VOP1 and VOP2 scanner recognition
 
 `tools/scan_unsupported_shaders.py` recognizes the binary16 VOP1 and VOP2 mnemonics that `tools/disasm_rdna2.py` decodes
 (`v_cvt_u16_f16`, `v_cvt_i16_f16`, `v_fract_f16`, `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, `v_fmac_f16`, `v_max_f16`,
 `v_min_f16`, `v_ldexp_f16` and `v_pk_fmac_f16`), so they are not reported as unknown. The rejected VOP3 spelling of
 `v_pk_fmac_f16` (`v_pk_fmac_f16_unsupported`) stays unrecognized.
-
 ```sh
 python3 -B tests/rdna2_tools_check.py
 ```
