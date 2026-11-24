@@ -1187,6 +1187,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_stream_draw_${backend} PROPERTIES TIMEOUT 90)
+        foreach(compiler IN ITEMS fxc dxc)
+            add_test(NAME startup_mrt_${compiler}_${backend} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mrt_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}")
+            set_tests_properties(startup_mrt_${compiler}_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        endforeach()
         add_test(NAME startup_logical_view_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_logical_view_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
