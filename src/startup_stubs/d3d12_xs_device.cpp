@@ -1788,16 +1788,21 @@ struct ResolvedView {
     ID3D12Resource* resource = nullptr;
     UINT dsv_flags = 0;
     bool wrong_kind = false;
+    bool skipped = false;
 };
 ResolvedView resolve_view(u64 handle, int slot)
 {
     ResolvedView out;
     ViewRecord record{};
     bool known = false;
+    bool materialized = false;
     if (const std::uint32_t id = shadow_id(handle)) {
         AcquireSRWLockShared(&note_lock);
         known = id - 1 < view_records().size();
-        if (known) record = view_records()[id - 1];
+        if (known) {
+            record = view_records()[id - 1];
+            materialized = id - 1 < view_materialized().size() && view_materialized()[id - 1] != 0;
+        }
         ReleaseSRWLockShared(&note_lock);
     }
     if (!known) {
@@ -1806,6 +1811,10 @@ ResolvedView resolve_view(u64 handle, int slot)
     }
     if (static_cast<int>(record.slot) != slot) {
         out.wrong_kind = true;
+        return out;
+    }
+    if (!materialized) {
+        out.skipped = true;
         return out;
     }
     out.resource = record.resource ? reinterpret_cast<ID3D12Resource*>(unwrap(record.resource)) : nullptr;
@@ -1836,7 +1845,8 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-d3d12 ClearRenderTargetView skipped: view 0x%llx is %s", handle,
-                view.wrong_kind ? "not a render target view" : "not a known render target view");
+                view.wrong_kind ? "not a render target view"
+                                : view.skipped ? "a skipped render target view" : "not a known render target view");
         return;
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
@@ -1897,7 +1907,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         if (!targets[i]) {
             InterlockedIncrement(&render_target_unresolved);
             if (!view.wrong_kind && first_calls(unresolved_logged, 6))
-                log("x2w-d3d12 OMSetRenderTargets refused: render target %u (0x%llx) holds no view", i, static_cast<unsigned long long>(title));
+                log("x2w-d3d12 OMSetRenderTargets refused: render target %u (0x%llx) %s", i, static_cast<unsigned long long>(title),
+                    view.skipped ? "holds a skipped view" : "holds no view");
             return;
         }
         formats[i] = view_format_of(desktop[i].ptr, targets[i]);
@@ -1920,7 +1931,9 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             if (!dsv_target) {
                 InterlockedIncrement(&render_target_unresolved);
                 if (first_calls(refused, 6))
-                    log("x2w-d3d12 OMSetRenderTargets refused: depth handle is %s", view.wrong_kind ? "not a depth stencil view" : "not a known depth stencil view");
+                    log("x2w-d3d12 OMSetRenderTargets refused: depth handle is %s",
+                        view.wrong_kind ? "not a depth stencil view"
+                                        : view.skipped ? "a skipped depth stencil view" : "not a known depth stencil view");
                 return;
             }
             dsv_format = view_format_of(resolved, dsv_target);
@@ -2413,13 +2426,13 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     const u64 title_dest = args[D];
     args[D] = desktop_cpu_handle(args[D]);
     if (!args[D]) return 0;
-    {
+    const auto record_view = [&](bool materialized) {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
         const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? 40 : N == 19 ? 40 : N == 20 ? 20 : 16;
         note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(raw[described]),
-                  described_bytes, title_dest, args[D]);
-    }
+                  described_bytes, title_dest, args[D], materialized);
+    };
     const char* skip = nullptr;
     if (N == 17) skip = "constant buffer view (title GPU address)";
     if (N >= 18 && N <= 21 && args[0]) {
@@ -2430,6 +2443,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         if (N == 21 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) skip = "resource lacks depth stencil";
     }
     if (skip) {
+        record_view(false);
         static LONG skipped;
         if (first_calls(skipped, 6)) log("x2w-d3d12 Device::slot%d view skipped: %s", N, skip);
         return 0;
@@ -2447,6 +2461,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             auto* const resource = reinterpret_cast<ID3D12Resource*>(args[0]);
             const auto verdict = x2w_startup::packed_view(mapped, resource->GetDesc().Format, x2w_startup::packed_stand_in_of(resource));
             if (verdict == x2w_startup::PackedView::refused) {
+                record_view(false);
                 static LONG refused;
                 if (first_calls(refused, 6))
                     log("x2w-d3d12 Device::slot%d view skipped: packed format %d on a texture of format %d that does not stand in for it",
@@ -2475,6 +2490,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             args[1] = reinterpret_cast<u64>(&null_rtv);
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
+    record_view(true);
     if ((N == 20 || N == 21) && args[0]) note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]), N);
     check_device("Device view", N);
     static LONG calls;

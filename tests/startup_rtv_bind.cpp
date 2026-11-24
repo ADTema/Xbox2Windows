@@ -15,8 +15,10 @@
 //   6. view 2 as the only target                   refused    (counted)
 //
 // Then view 0 is copied into the empty slot 2 with CopyDescriptorsSimple, ClearRenderTargetView(slot 2) clears
-// the copy red, the copy is bound, and the list is submitted: target 0 must read back red, which it does not if
-// the clear looks the copied view up in the creation-time table only.
+// the copy red, the copy is bound, and a valid view for target 1 is copied into slot 4 with CopyDescriptors and
+// cleared green. A packed-format RTV that view_slot<20> skips is placed in slot 3 and copied into slot 5 with
+// CopyDescriptors: clearing or binding either skipped view (directly or in a single range) must be refused and
+// leave target 2 untouched.
 //
 // The desktop device must not be removed and the debug layer must store no errors.
 //
@@ -39,15 +41,17 @@ extern "C" __declspec(dllimport) void x2w_d3d12_render_target_stats(unsigned* bi
 namespace {
 using Word = std::uint64_t;
 template <class T> Word arg(T* value) { return reinterpret_cast<Word>(value); }
-Word invoke(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Word d = 0, Word e = 0)
+Word invoke(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Word d = 0, Word e = 0, Word f = 0, Word g = 0)
 {
-    using Slot = Word (WINAPI*)(void*, Word, Word, Word, Word, Word);
-    return reinterpret_cast<Slot>((*static_cast<void***>(object))[index])(object, a, b, c, d, e);
+    using Slot = Word (WINAPI*)(void*, Word, Word, Word, Word, Word, Word, Word);
+    return reinterpret_cast<Slot>((*static_cast<void***>(object))[index])(object, a, b, c, d, e, f, g);
 }
 bool ok(Word hr) { return SUCCEEDED(static_cast<HRESULT>(hr)); }
 
 constexpr float red[] = {1, 0, 0, 1};
 constexpr std::uint32_t red_bits = 0xff0000ff;
+constexpr float green[] = {0, 1, 0, 1};
+constexpr std::uint32_t green_bits = 0xff00ff00;
 
 struct Stats {
     unsigned binds = 0, unresolved = 0;
@@ -175,12 +179,12 @@ int main(int argc, char** argv)
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), __uuidof(ID3D12Device), &device))) return 4;
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&probe.desktop)))) return 4;
 
-    // Two 1x1 RGBA8 targets and the readback buffer for one texel.
+    // Three 1x1 RGBA8 targets and the readback buffer for one texel.
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
                                           D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
     const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 0}};
-    ComPtr<ID3D12Resource> targets[2];
+    ComPtr<ID3D12Resource> targets[3];
     for (auto& target : targets)
         if (FAILED(probe.desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &target_desc, D3D12_RESOURCE_STATE_COMMON,
                                                           &clear, IID_PPV_ARGS(&target)))) return 5;
@@ -192,7 +196,8 @@ int main(int argc, char** argv)
     if (FAILED(probe.desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
                                                       nullptr, IID_PPV_ARGS(&probe.readback)))) return 5;
 
-    // The RTV heap: views 0 and 1 over the two targets, slot 2 empty; and a one-descriptor staging heap.
+    // The RTV heap: views 0 and 1 over targets 0 and 1, slot 2 empty, slot 3 a refused packed-format view of
+    // target 2, slots 4 and 5 empty for CopyDescriptors; plus a two-descriptor staging heap.
     const auto make_heap = [&](UINT count, void** out) {
         const struct {
             D3D12_DESCRIPTOR_HEAP_DESC desc;
@@ -201,15 +206,22 @@ int main(int argc, char** argv)
         return ok(invoke(device, 14, arg(&desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(out)));
     };
     void *rtv_heap = nullptr, *staging_heap = nullptr;
-    if (!make_heap(3, &rtv_heap) || !make_heap(1, &staging_heap)) return 6;
+    if (!make_heap(6, &rtv_heap) || !make_heap(2, &staging_heap)) return 6;
     const UINT stride = probe.desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const D3D12_CPU_DESCRIPTOR_HANDLE first{static_cast<SIZE_T>(invoke(rtv_heap, 9))};
-    const std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 3> rtv{{first, {first.ptr + stride}, {first.ptr + 2 * stride}}};
-    const D3D12_CPU_DESCRIPTOR_HANDLE staging{static_cast<SIZE_T>(invoke(staging_heap, 9))};
+    const std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 6> rtv{{
+        first, {first.ptr + stride}, {first.ptr + 2 * stride}, {first.ptr + 3 * stride}, {first.ptr + 4 * stride},
+        {first.ptr + 5 * stride},
+    }};
+    const D3D12_CPU_DESCRIPTOR_HANDLE staging_first{static_cast<SIZE_T>(invoke(staging_heap, 9))};
+    const std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 2> staging{{staging_first, {staging_first.ptr + stride}}};
     D3D12_RENDER_TARGET_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
+    D3D12_RENDER_TARGET_VIEW_DESC refused_view{DXGI_FORMAT_B5G5R5A1_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
     invoke(device, 20, arg(targets[0].Get()), arg(&view), rtv[0].ptr);
     invoke(device, 20, arg(targets[1].Get()), arg(&view), rtv[1].ptr);
-    invoke(device, 20, arg(targets[0].Get()), arg(&view), staging.ptr);
+    invoke(device, 20, arg(targets[2].Get()), arg(&refused_view), rtv[3].ptr);
+    invoke(device, 20, arg(targets[0].Get()), arg(&view), staging[0].ptr);
+    invoke(device, 20, arg(targets[1].Get()), arg(&view), staging[1].ptr);
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -242,16 +254,46 @@ int main(int argc, char** argv)
     invoke(list, 52, rtv[2].ptr, arg(red));
     if (!step("6d clear on the empty view", 0, 1, seen)) return 18;
 
-    // A copied descriptor: the empty slot now holds view 0, so it binds and clears that target.
-    invoke(device, 24, 1, rtv[2].ptr, staging.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    // Refused shadow RTV (desktop creation skipped): clear and bind must both be skipped.
+    invoke(list, 52, rtv[3].ptr, arg(red));
+    if (!step("6e clear on a refused view", 0, 1, seen)) return 19;
+    invoke(list, 50, 1, arg(&rtv[3]), FALSE, 0);
+    if (!step("6f bind a refused view", 0, 1, seen)) return 20;
+
+    // A copied descriptor: the empty slot 2 now holds view 0, so it binds and clears target 0 red.
+    invoke(device, 24, 1, rtv[2].ptr, staging[0].ptr, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     invoke(list, 52, rtv[2].ptr, arg(red));
     invoke(list, 50, 1, arg(&rtv[2]), FALSE, 0);
-    if (!step("7 copied view, bound after the clear", 1, 0, seen)) return 21;
+    if (!step("7 copied view (CopyDescriptorsSimple), bound after the clear", 1, 0, seen)) return 21;
+
+    // Single range reaching the refused view in slot 3 (now that slot 2 is populated): must be refused.
+    invoke(list, 50, 4, arg(&rtv[0]), TRUE, 0);
+    if (!step("7b single range reaching a refused view", 0, 1, seen)) return 24;
+
+    // CopyDescriptors (slot 23): copy a valid view into slot 4 and the refused view into slot 5.
+    const UINT one = 1;
+    invoke(device, 23, 1, arg(&rtv[4]), arg(&one), 1, arg(&staging[1]), arg(&one), D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    invoke(list, 52, rtv[4].ptr, arg(green));
+    invoke(list, 50, 1, arg(&rtv[4]), FALSE, 0);
+    if (!step("7c copied valid view (CopyDescriptors), bound after the clear", 1, 0, seen)) return 25;
+
+    invoke(device, 23, 1, arg(&rtv[5]), arg(&one), 1, arg(&rtv[3]), arg(&one), D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    invoke(list, 52, rtv[5].ptr, arg(red));
+    if (!step("7d clear on a copied refused view", 0, 1, seen)) return 26;
+    invoke(list, 50, 1, arg(&rtv[5]), FALSE, 0);
+    if (!step("7e bind a copied refused view", 0, 1, seen)) return 27;
+
     invoke(list, 9);
     if (!probe.submit(list)) return 22;
-    const std::uint32_t bits = probe.texel(targets[0].Get());
-    std::printf("8 target 0 after clearing the copied view: %08x (expected %08x)\n", bits, red_bits);
-    if (bits != red_bits) return 23;
+    const std::uint32_t bits0 = probe.texel(targets[0].Get());
+    const std::uint32_t bits1 = probe.texel(targets[1].Get());
+    const std::uint32_t bits2 = probe.texel(targets[2].Get());
+    std::printf("8 target 0 after clearing the CopyDescriptorsSimple view: %08x (expected %08x)\n", bits0, red_bits);
+    std::printf("9 target 1 after clearing the CopyDescriptors view: %08x (expected %08x)\n", bits1, green_bits);
+    std::printf("10 target 2 after skipped refused clears: %08x (expected 00000000)\n", bits2);
+    if (bits0 != red_bits) return 23;
+    if (bits1 != green_bits) return 28;
+    if (bits2 != 0) return 29;
 
     const HRESULT removed = probe.desktop->GetDeviceRemovedReason();
     const UINT64 errors = probe.debug_errors();
