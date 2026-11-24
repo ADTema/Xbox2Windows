@@ -6801,6 +6801,33 @@ rules. The command list, shader and buffers are source-built desktop fixtures.
 [ClearUnorderedAccessViewUint](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-clearunorderedaccessviewuint) ·
 [Resource barriers](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12) ·
 [Xbox ATG SimpleDeviceAndSwapChain12](https://github.com/microsoft/Xbox-ATG-Samples/blob/main/XDKSamples/IntroGraphics/SimpleDeviceAndSwapChain12/SimpleDeviceAndSwapChain.cpp)
+
+#### GPU-written indirect dispatch arguments
+
+[`startup_indirect_dispatch.cpp`](../tests/startup_indirect_dispatch.cpp) uses the
+desktop device path through `D3D12XboxCreateDevice`. A source-built compute
+shader writes a `(4, 3, 2)` dispatch record after a guard word in a default-heap
+buffer. The command list transitions that buffer from `UNORDERED_ACCESS` to
+`INDIRECT_ARGUMENT`, then executes one dispatch at byte offset 4. The consumer
+adds a value derived from each group ID into a separate UAV. The fence-ordered
+readback checks the three argument words, both guards and the accumulated value
+against a CPU reference. With the writer omitted, the input is `(0, 3, 2)` and
+the output remains at its sentinel value.
+
+```powershell
+cmake --build --preset dev --target startup_indirect_dispatch
+ctest --preset dev --no-tests=error -R '^startup_indirect_dispatch_(warp|hardware)$' -V
+```
+
+On Windows 11 build 26300.9711 with the debug layer unavailable, WARP (Microsoft
+Basic Render Driver, 10.0.26100.9711) and an NVIDIA GeForce RTX 4070
+(32.0.16.2114) both read back `0x31415f02` with the writer and `0x31415926` with
+the writer omitted. Both cases passed. The hardware case returns 77 if there is
+no physical D3D12 adapter. The fixture covers the desktop dispatch signature
+for the producer and consumer in [#1412](https://github.com/R0Y00/Xbox2Windows/issues/1412).
+Forwarding console command lists and aliasing console argument buffers remain
+separate implementation work.
+
 #### D3D12.X graphics command list (XCL-12)
 
 The public Microsoft D3D12 and Xbox material and the Windows SDK `d3d12.h` expose no
