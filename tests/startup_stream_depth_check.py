@@ -24,8 +24,9 @@ def check(directory, consumer, backend):
     vs_front, vs_back, ps_green, ps_red, root = (
         directory / name for name in ("vs_front", "vs_back", "ps_green", "ps_red", "root")
     )
-    out_pos, out_neg, out_depthonly = (
-        directory / name for name in ("pixels_pos", "pixels_neg", "pixels_depthonly")
+    out_pos, out_neg, out_depthonly, out_readonly, out_rtv_depth, out_dsv_target, out_bounds = (
+        directory / name for name in ("pixels_pos", "pixels_neg", "pixels_depthonly", "pixels_readonly",
+                                      "pixels_rtv_as_depth", "pixels_dsv_as_target", "pixels_bounds")
     )
     vs_front.write_bytes(vertex(0x3e800000))  # z = 0.25f
     vs_back.write_bytes(vertex(0x3f400000))   # z = 0.75f
@@ -43,7 +44,8 @@ def check(directory, consumer, backend):
         raise RuntimeError(f"request run failed on {backend}: {req.returncode}\n{req.stderr}")
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
 
-    run = subprocess.run(base_args + [str(out_pos), str(out_neg), str(out_depthonly)],
+    run = subprocess.run(base_args + [str(out_pos), str(out_neg), str(out_depthonly), str(out_readonly),
+                                      str(out_rtv_depth), str(out_dsv_target), str(out_bounds)],
                          env=env, capture_output=True, text=True)
     print(run.stdout, end="")
     for line in run.stderr.splitlines():
@@ -63,6 +65,11 @@ def check(directory, consumer, backend):
     assert out_pos.read_bytes() == expected_pos, f"pos: {out_pos.read_bytes().hex()}"
     assert out_neg.read_bytes() == expected_neg, f"neg: {out_neg.read_bytes().hex()}"
     assert out_depthonly.read_bytes() == expected_depthonly, f"depthonly: {out_depthonly.read_bytes().hex()}"
+    # A read-only DSV tests but never writes: the far red triangle is not occluded by the near green one.
+    assert out_readonly.read_bytes() == expected_neg, f"readonly: {out_readonly.read_bytes().hex()}"
+    # Wrong descriptor kind and DepthBoundsTestEnable refuse the draw instead of drawing something else.
+    for name, path in (("rtv as depth", out_rtv_depth), ("dsv as target", out_dsv_target), ("depth bounds", out_bounds)):
+        assert path.read_bytes() == clear * 32, f"{name}: {path.read_bytes().hex()}"
     print(f"{backend}: depth LESS occluded far red (green), DepthEnable=FALSE overwrote (red), count=0 depth-only occluded far red (clear)")
     return 0
 

@@ -991,22 +991,27 @@ bool render_mode()
 
 // Render-target view handle (desktop) -> the resource it views, recorded when the view is created.
 SRWLOCK target_lock = SRWLOCK_INIT;
-std::unordered_map<u64, ID3D12Resource*>& view_targets()
+struct ViewTarget {
+    ID3D12Resource* resource;
+    int slot;  // 20 RTV, 21 DSV
+};
+std::unordered_map<u64, ViewTarget>& view_targets()
 {
-    static std::unordered_map<u64, ID3D12Resource*> map;
+    static std::unordered_map<u64, ViewTarget> map;
     return map;
 }
-void note_view_target(u64 handle, ID3D12Resource* resource)
+void note_view_target(u64 handle, ID3D12Resource* resource, int slot)
 {
     AcquireSRWLockExclusive(&target_lock);
-    view_targets()[handle] = resource;
+    view_targets()[handle] = {resource, slot};
     ReleaseSRWLockExclusive(&target_lock);
 }
-ID3D12Resource* view_target(u64 handle)
+// slot 0: either kind. A handle created as the other kind yields nothing.
+ID3D12Resource* view_target(u64 handle, int slot = 0)
 {
     AcquireSRWLockShared(&target_lock);
     const auto found = view_targets().find(handle);
-    ID3D12Resource* resource = found == view_targets().end() ? nullptr : found->second;
+    ID3D12Resource* resource = found == view_targets().end() || (slot && found->second.slot != slot) ? nullptr : found->second.resource;
     ReleaseSRWLockShared(&target_lock);
     return resource;
 }
@@ -1665,6 +1670,14 @@ void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATE
     transition(list, resource, D3D12_RESOURCE_STATE_COMMON, state);
     pass.states.emplace_back(resource, state);
 }
+// State for a draw that samples `resource`: a depth texture also bound as a read-only DSV keeps DEPTH_READ.
+D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
+{
+    for (const auto& known : pass_of(self).states)
+        if (known.first == resource && (known.second & D3D12_RESOURCE_STATE_DEPTH_READ))
+            return D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+}
 void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
 void release_targets(Wrapper* self)
 {
@@ -1713,7 +1726,44 @@ DXGI_FORMAT view_format_of(u64 desktop_handle, ID3D12Resource* target)
     }
     return format;
 }
+// The view a descriptor holds now, read from its shadow record so copies are followed. A record of the
+// other kind is wrong_kind; a handle with no record falls back to the creation-time map (render targets only).
+struct ResolvedView {
+    ID3D12Resource* resource = nullptr;
+    UINT dsv_flags = 0;
+    bool wrong_kind = false;
+};
+ResolvedView resolve_view(u64 handle, int slot)
+{
+    ResolvedView out;
+    ViewRecord record{};
+    bool known = false;
+    if (const std::uint32_t id = shadow_id(handle)) {
+        AcquireSRWLockShared(&note_lock);
+        known = id - 1 < view_records().size();
+        if (known) record = view_records()[id - 1];
+        ReleaseSRWLockShared(&note_lock);
+    }
+    if (!known) {
+        if (slot == 20) out.resource = view_target(handle, slot);
+        return out;
+    }
+    if (static_cast<int>(record.slot) != slot) {
+        out.wrong_kind = true;
+        return out;
+    }
+    out.resource = record.resource ? reinterpret_cast<ID3D12Resource*>(unwrap(record.resource)) : nullptr;
+    if (slot == 21 && record.desc_bytes >= 12) std::memcpy(&out.dsv_flags, record.desc + 8, 4);
+    return out;
+}
+bool format_has_stencil(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+           format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_R32G8X24_TYPELESS;
+}
 // List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
+// A descriptor of the wrong kind, a DSV with only one plane read-only (needs per-plane states), or a
+// depth view that resolves to nothing refuses the whole bind: nothing is set and draws are skipped.
 void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL single_range,
                             const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
 {
@@ -1725,12 +1775,15 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
     if (!list || count > 8 || single_range) return;
     if (count && !x2w_local::readable(handles, count * sizeof(*handles))) return;
+    static LONG refused;
     D3D12_CPU_DESCRIPTOR_HANDLE desktop[8];
     ID3D12Resource* targets[8]{};
     DXGI_FORMAT formats[8]{};
     for (UINT i = 0; i < count; ++i) {
         desktop[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(handles[i].ptr));
-        targets[i] = view_target(desktop[i].ptr);
+        const ResolvedView view = resolve_view(desktop[i].ptr, 20);
+        if (view.wrong_kind && first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: render target %u is not a render target view", i);
+        targets[i] = view.resource;
         if (!targets[i]) return;
         formats[i] = view_format_of(desktop[i].ptr, targets[i]);
     }
@@ -1738,13 +1791,27 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     const D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = nullptr;
     ID3D12Resource* dsv_target = nullptr;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
+    D3D12_RESOURCE_STATES dsv_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     if (depth && x2w_local::readable(depth, sizeof(*depth))) {
         const u64 resolved = desktop_cpu_handle(depth->ptr);
-        dsv_target = resolved ? view_target(resolved) : nullptr;
-        if (dsv_target) {
+        if (resolved) {
+            const ResolvedView view = resolve_view(resolved, 21);
+            dsv_target = view.resource;
+            if (!dsv_target) {
+                if (first_calls(refused, 6))
+                    log("x2w-d3d12 OMSetRenderTargets refused: depth handle is %s", view.wrong_kind ? "not a depth stencil view" : "not a known depth stencil view");
+                return;
+            }
+            dsv_format = view_format_of(resolved, dsv_target);
+            const bool read_depth = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0;
+            const bool read_stencil = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0 || !format_has_stencil(dsv_format);
+            if (read_depth != read_stencil) {
+                if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: depth stencil view with one read-only plane (flags 0x%x)", view.dsv_flags);
+                return;
+            }
+            if (read_depth) dsv_state = D3D12_RESOURCE_STATE_DEPTH_READ;
             desktop_dsv.ptr = static_cast<SIZE_T>(resolved);
             dsv_ptr = &desktop_dsv;
-            dsv_format = view_format_of(resolved, dsv_target);
         }
     }
     if (!count && !dsv_ptr) return;
@@ -1753,7 +1820,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         pass.target_formats[i] = formats[i];
         if (i == 0) pass.target0 = targets[i];
     }
-    if (dsv_target) require_state(self, dsv_target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    if (dsv_target) require_state(self, dsv_target, dsv_state);
     pass.target_count = count;
     pass.dsv_format = dsv_format;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
@@ -2242,7 +2309,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             args[1] = reinterpret_cast<u64>(&null_rtv);
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
-    if ((N == 20 || N == 21) && args[0]) note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]));
+    if ((N == 20 || N == 21) && args[0]) note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]), N);
     check_device("Device view", N);
     static LONG calls;
     if (first_calls(calls))

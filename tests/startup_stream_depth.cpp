@@ -93,7 +93,8 @@ int pick_adapter(bool hardware, ComPtr<IDXGIAdapter>& adapter)
 }
 
 void* create_stream_pso(void* device, ID3D12RootSignature* root, const std::vector<char>& vs,
-                        const std::vector<char>& ps, const D3D12_DEPTH_STENCIL_DESC& ds, bool use_ds1)
+                        const std::vector<char>& ps, const D3D12_DEPTH_STENCIL_DESC& ds, bool use_ds1,
+                        BOOL depth_bounds = FALSE)
 {
     using CreateStream = HRESULT (WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
     auto create = reinterpret_cast<CreateStream>((*static_cast<void***>(device))[86]);
@@ -103,7 +104,7 @@ void* create_stream_pso(void* device, ID3D12RootSignature* root, const std::vect
             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}},
             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}},
-            {static_cast<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>(21), ds, FALSE},
+            {static_cast<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>(21), ds, depth_bounds},
             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT_D32_FLOAT},
         };
         const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
@@ -176,7 +177,7 @@ int execute_guest_list(void* queue, void* list, void* fence, UINT64 fence_value)
 
 int main(int argc, char** argv)
 {
-    if (argc != 7 && argc != 10) return 2;
+    if (argc != 7 && argc != 14) return 2;
     std::vector<char> vs_front, vs_back, ps_green, ps_red;
     if (!read_bytes(argv[1], vs_front) || !read_bytes(argv[2], vs_back) ||
         !read_bytes(argv[3], ps_green) || !read_bytes(argv[4], ps_red)) return 3;
@@ -184,6 +185,15 @@ int main(int argc, char** argv)
 
     ComPtr<IDXGIAdapter> adapter;
     if (const int rc = pick_adapter(hardware, adapter)) return rc;
+    {
+        DXGI_ADAPTER_DESC desc{};
+        LARGE_INTEGER driver{};
+        if (FAILED(adapter->GetDesc(&desc))) return 4;
+        adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver);
+        std::printf("adapter=%ls vendor=%04x device=%04x driver=%u.%u.%u.%u\n", desc.Description, desc.VendorId, desc.DeviceId,
+            HIWORD(driver.HighPart), LOWORD(driver.HighPart), HIWORD(driver.LowPart), LOWORD(driver.LowPart));
+        std::fflush(stdout);
+    }
 
     std::array<unsigned char, 64> parameters{};
     void* guest = nullptr;
@@ -212,7 +222,9 @@ int main(int argc, char** argv)
     void* pso_front_off = create_stream_pso(guest, root, vs_front, ps_green, ds_disabled, false);
     void* pso_back_off = create_stream_pso(guest, root, vs_back, ps_red, ds_disabled, false);
     void* pso_front_ds1 = create_stream_pso(guest, root, vs_front, ps_green, ds_less, true);
-    if (!pso_front_less || !pso_back_less || !pso_front_off || !pso_back_off || !pso_front_ds1) return 9;
+    // DepthBoundsTestEnable has no translated equivalent: the pipeline is refused for drawing, not translated without it.
+    void* pso_front_bounds = create_stream_pso(guest, root, vs_front, ps_green, ds_less, true, TRUE);
+    if (!pso_front_bounds || !pso_front_less || !pso_back_less || !pso_front_off || !pso_back_off || !pso_front_ds1) return 9;
     if (argc == 7) return 0;
 
     ComPtr<ID3D12Device> desktop;
@@ -242,7 +254,7 @@ int main(int argc, char** argv)
 
     const struct { D3D12_DESCRIPTOR_HEAP_DESC desc; Word backing, bytes; }
         rtv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0},
-        dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1}, 0, 0};
+        dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2}, 0, 0};
     void* dsv_heap = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr_arg(&rtv_heap_desc), ptr_arg(&__uuidof(ID3D12DescriptorHeap)), ptr_arg(&state.rtv_heap)))) ||
         FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr_arg(&dsv_heap_desc), ptr_arg(&__uuidof(ID3D12DescriptorHeap)), ptr_arg(&dsv_heap))))) return 22;
@@ -253,6 +265,11 @@ int main(int argc, char** argv)
     const D3D12_DEPTH_STENCIL_VIEW_DESC dsv_view{DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_DSV_FLAG_NONE, {}};
     invoke(guest, 20, ptr_arg(state.attachments[0].texture.Get()), ptr_arg(&rtv_view), rtv.ptr);
     invoke(guest, 21, ptr_arg(depth_tex.Get()), ptr_arg(&dsv_view), dsv.ptr);
+    // A second view of the same texture, read-only: depth tests but is never written.
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv_read_only{dsv.ptr + desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV)};
+    const D3D12_DEPTH_STENCIL_VIEW_DESC dsv_read_only_view{DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2D,
+        D3D12_DSV_FLAG_READ_ONLY_DEPTH, {}};
+    invoke(guest, 21, ptr_arg(depth_tex.Get()), ptr_arg(&dsv_read_only_view), dsv_read_only.ptr);
 
     D3D12_COMMAND_QUEUE_DESC qd{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -264,7 +281,9 @@ int main(int argc, char** argv)
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     const D3D12_RECT rect{0, 0, 4, static_cast<LONG>(height)};
 
-    auto run_case = [&](UINT64 fence_val, const char* out_path, bool depth_only, void* first_pso, void* second_pso) -> int {
+    enum class Bind { normal, depth_only, read_only_depth, rtv_as_depth, dsv_as_target };
+    auto run_case = [&](UINT64 fence_val, const char* out_path, Bind bind, void* first_pso, void* second_pso) -> int {
+        const bool depth_only = bind == Bind::depth_only;
         if (const int rc = clear_depth_desktop(desktop.Get(), depth_tex.Get())) return rc;
         if (FAILED(static_cast<HRESULT>(invoke(state.allocator, 8)))) return 24;
         if (FAILED(static_cast<HRESULT>(invoke(state.list, 139, ptr_arg(state.allocator))))) return 25;
@@ -274,6 +293,12 @@ int main(int argc, char** argv)
         invoke(state.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         if (depth_only) {
             invoke(state.list, 50, 0, 0, FALSE, ptr_arg(&dsv));
+        } else if (bind == Bind::read_only_depth) {
+            invoke(state.list, 50, 1, ptr_arg(&rtv), FALSE, ptr_arg(&dsv_read_only));
+        } else if (bind == Bind::rtv_as_depth) {
+            invoke(state.list, 50, 1, ptr_arg(&rtv), FALSE, ptr_arg(&rtv));  // an RTV where a DSV belongs
+        } else if (bind == Bind::dsv_as_target) {
+            invoke(state.list, 50, 1, ptr_arg(&dsv), FALSE, ptr_arg(&dsv));  // a DSV where an RTV belongs
         } else {
             invoke(state.list, 50, 1, ptr_arg(&rtv), FALSE, ptr_arg(&dsv));
         }
@@ -288,8 +313,13 @@ int main(int argc, char** argv)
         return read_stream_target(desktop.Get(), state, out_path);
     };
 
-    if (const int rc = run_case(1, argv[7], false, pso_front_less, pso_back_less)) return rc;
-    if (const int rc = run_case(2, argv[8], false, pso_front_off, pso_back_off)) return rc;
-    if (const int rc = run_case(3, argv[9], true, pso_front_ds1, pso_back_less)) return rc;
+    if (const int rc = run_case(1, argv[7], Bind::normal, pso_front_less, pso_back_less)) return rc;
+    if (const int rc = run_case(2, argv[8], Bind::normal, pso_front_off, pso_back_off)) return rc;
+    if (const int rc = run_case(3, argv[9], Bind::depth_only, pso_front_ds1, pso_back_less)) return rc;
+    if (const int rc = run_case(4, argv[10], Bind::read_only_depth, pso_front_less, pso_back_less)) return rc;
+    // Controls: nothing may be drawn for a wrong descriptor kind or an enabled depth bounds test.
+    if (const int rc = run_case(5, argv[11], Bind::rtv_as_depth, pso_front_less, pso_back_less)) return rc;
+    if (const int rc = run_case(6, argv[12], Bind::dsv_as_target, pso_front_less, pso_back_less)) return rc;
+    if (const int rc = run_case(7, argv[13], Bind::normal, pso_front_bounds, pso_front_bounds)) return rc;
     return 0;
 }

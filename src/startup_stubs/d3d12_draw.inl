@@ -248,6 +248,11 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
         } else if (type == 11 || type == 21) {  // DEPTH_STENCIL (56B) / DEPTH_STENCIL1 (64B)
             std::memcpy(&depth_stencil, stream + at + sizeof(type), sizeof(depth_stencil));
             has_depth_stencil = true;
+            if (type == 21) {  // DEPTH_STENCIL1 appends DepthBoundsTestEnable; it has no translated equivalent
+                BOOL bounds = FALSE;
+                std::memcpy(&bounds, stream + at + sizeof(type) + sizeof(depth_stencil), sizeof(bounds));
+                if (bounds) return nullptr;
+            }
         } else if (type == 16) {  // DEPTH_STENCIL_FORMAT (8B)
             DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
             std::memcpy(&fmt, stream + at + sizeof(type), sizeof(fmt));
@@ -915,7 +920,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 }
             }
             if (texture) upload_texture(self, resource, texture);
-            if (texture) require_state(self, texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (texture) require_state(self, texture, sampled_state(self, texture));
             const bool had_texture = texture != nullptr;
             bool mismatched = false;
             static LONG shown;
