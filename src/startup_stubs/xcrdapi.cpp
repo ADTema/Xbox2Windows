@@ -570,14 +570,25 @@ void run_entry(Object* self, Entry& entry)
             const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(entry.bytes + 0x08);
             // The title's page array is read again in full when the request runs: entries are filled,
             // and also replaced, after enqueue. Writing through a token captured at enqueue put data
-            // into a page the title had already reassigned.
-            for (std::size_t i = 0; i < entry.tokens.size(); ++i)
-                if (title && x2w_local::readable(title + i, sizeof(ULONG_PTR))) {
-                    const ULONG_PTR now = title[i];
-                    if (entry.tokens[i] && now != entry.tokens[i]) InterlockedIncrement(&tokens_replaced_after_enqueue);
-                    entry.tokens[i] = now;
-                    if (!entry.tokens[i]) InterlockedIncrement(&zero_tokens_at_run);
-                }
+            // into a page the title had already reassigned. The caller has to keep the array readable
+            // until the request runs; if it is not, the request fails before any page is written, so
+            // no token captured at enqueue is ever used.
+            const std::size_t bytes = entry.tokens.size() * sizeof(ULONG_PTR);
+            if (!title || !x2w_local::readable(title, bytes)) {
+                InterlockedIncrement(&requests_failed);
+                if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+                static LONG unreadable;
+                if (InterlockedIncrement(&unreadable) <= 12)
+                    log("x2w-dstorage   options=0x%llx page array %p (%zu entries) unreadable when the request runs -> failed", options,
+                        static_cast<const void*>(title), entry.tokens.size());
+                return;
+            }
+            std::vector<ULONG_PTR> now(title, title + entry.tokens.size());  // one snapshot of the whole array
+            for (std::size_t i = 0; i < now.size(); ++i) {
+                if (entry.tokens[i] && now[i] != entry.tokens[i]) InterlockedIncrement(&tokens_replaced_after_enqueue);
+                if (!now[i]) InterlockedIncrement(&zero_tokens_at_run);
+            }
+            entry.tokens = std::move(now);
         }
         execute_request(self, entry.bytes, entry.tokens.empty() ? nullptr : entry.tokens.data(), entry.id, entry.submission_id);
     } else if (entry.type == Entry::status_entry) {
