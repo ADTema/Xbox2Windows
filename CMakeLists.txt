@@ -1590,6 +1590,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: descriptor offsets inside wide scalar loads (no game data).
     add_test(NAME startup_translator COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_translator_check.py")
+    add_test(NAME startup_triage_run COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_triage_run_check.py")
     add_test(NAME xmem_shim_mapped_pages COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_check.py" "$<TARGET_FILE:xmem_shim>")
     # Large batches: pages as slots of shared sections, adjacent pages in one view.
