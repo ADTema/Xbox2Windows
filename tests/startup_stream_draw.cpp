@@ -193,13 +193,14 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
                       DXGI_FORMAT format, std::uint32_t export_word)
 {
     const bool bc = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
+    const bool bc_chain = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", nullptr, 0) != 0;
     const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
     const bool single = integer || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
     const bool legacy = !single;
     const bool narrow = format == DXGI_FORMAT_A8_UNORM || format == DXGI_FORMAT_R8_UNORM;
-    const UINT width = bc7 ? bc7->width : bc ? 4 * 128 : single ? 1 : 8;
-    const UINT height = bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
+    const UINT width = bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     const UINT count = integer ? 2 : 1;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
@@ -247,7 +248,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         FAILED(static_cast<HRESULT>(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&fence))))) return 23;
 
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
-    const D3D12_RECT rect{0, 0, static_cast<LONG>(legacy && !bc7 ? width / 2 : width), static_cast<LONG>(height)};
+    const D3D12_RECT rect{0, 0, static_cast<LONG>(legacy && !bc7 && !bc_chain ? width / 2 : width), static_cast<LONG>(height)};
     invoke(list, 139, arg(allocator));
     for (UINT i = 0; i < count; ++i) invoke(list, 52, rtvs[i].ptr, arg(clear));
     invoke(list, 50, count, arg(rtvs.data()));
@@ -258,6 +259,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     if (export_word) invoke(list, 40, 0, 1, arg(&export_word), 0);
     if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
         if (int result = draw_logical_tables(desktop.Get(), guest, list)) return result;
+    } else if (bc_chain) {
+        extern int draw_bc_chain(void*, void*);
+        if (const int result = draw_bc_chain(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
         extern int draw_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;

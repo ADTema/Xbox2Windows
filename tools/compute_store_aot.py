@@ -1132,25 +1132,22 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                             raise ValueError("D16 buffer read expression is too large")
                     word = ("alu", field)
                 loading[reg] = word
-        elif m := re.fullmatch(r"image_load (v\d+|v\[\d+:\d+\]), (?:v\[(\d+):(\d+)\]|v(\d+)), "
-                               r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D( unorm)?( a16)?", line):
-            # One typed 2D read. Without a16 x and y use separate address dwords. With a16 one word
-            # holds x in bits [15:0] and y in bits [31:16]. dmask selects the leading
-            # components of the caller-declared texel format in ascending order. LLVM 15 encodes
-            # non-sampler loads with the unorm (un-normalized address) flag, which has no effect here.
-            x = int(m[2]) if m[2] else None
-            y = int(m[3]) if m[3] else None
-            packed = int(m[4]) if m[4] else None
-            base, high = int(m[5]), int(m[6])
-            dmask = int(m[7], 16)
+        elif m := re.fullmatch(r"image_load(_mip)? (v\d+|v\[\d+:\d+\]), (v\d+|v\[\d+:\d+\]), "
+                               r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?( a16)?", line):
+            # The non-sampler 2D address is (x, y[, mip]). A16 packs x and y into the first
+            # dword and takes the mip from the low half of the second dword when present.
+            mip, a16 = bool(m[1]), bool(m[7])
+            vaddr = [int(n) for n in re.findall(r"\d+", m[3])]
+            address_words = (1 if a16 else 2) + int(mip)
+            base, high = int(m[4]), int(m[5])
+            dmask = int(m[6], 16)
             count = bin(dmask).count("1")
-            a16 = bool(m[9])
-            destination = [int(n) for n in re.findall(r"\d+", m[1])]
+            destination = [int(n) for n in re.findall(r"\d+", m[2])]
             first, last = destination[0], destination[-1]
             if (cpu != "gfx1030" or image_format is None or guard_span is not None
-                    or a16 != (packed is not None) or last != first + count - 1
+                    or len(vaddr) != min(address_words, 2) or vaddr[-1] != vaddr[0] + address_words - 1
+                    or vaddr[-1] > 255 or last != first + count - 1
                     or dmask != (1 << count) - 1 or count > IMAGE_FORMATS[image_format][1]
-                    or (not a16 and y != x + 1)
                     or any(first + index > 255 or first + index in loading for index in range(count))):
                 raise ValueError("Unsupported image load target")
             if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
@@ -1158,17 +1155,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if tuple(scalar.get(base + index) for index in range(8)) != tuple(
                     (("image", index // 4), index % 4) for index in range(8)):
                 raise ValueError("Unverified image descriptor")
+            coordinates = [vector.get(reg) for reg in range(vaddr[0], vaddr[-1] + 1)]
+            if not all(is_word(value) for value in coordinates):
+                raise ValueError("Unverified image coordinates")
             if a16:
-                coordinate = vector.get(packed)
-                if not is_word(coordinate):
-                    raise ValueError("Unverified image coordinates")
-                address = (f"int3(asint({hlsl_word(coordinate)} & 0xffffu), "
-                           f"asint({hlsl_word(coordinate)} >> 16u), 0)")
+                packed = hlsl_word(coordinates[0])
+                x, y = f"{packed} & 0xffffu", f"{packed} >> 16u"
             else:
-                coordinates = (vector.get(x), vector.get(y))
-                if not all(is_word(value) for value in coordinates):
-                    raise ValueError("Unverified image coordinates")
-                address = f"int3(asint({hlsl_word(coordinates[0])}), asint({hlsl_word(coordinates[1])}), 0)"
+                x, y = map(hlsl_word, coordinates[:2])
+            lod = "0"
+            if mip:
+                mip_word = hlsl_word(coordinates[-1])
+                lod = f"asint({mip_word}{' & 0xffffu' if a16 else ''})"
+            address = f"int3(asint({x}), asint({y}), {lod})"
             name = f"image_load_{image_step_count}"
             image_step_count += 1
             staged_steps.append((None, f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});"))
