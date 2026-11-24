@@ -1653,6 +1653,10 @@ struct Pass {
     // Whether the title set a viewport / scissor on this list; without them a desktop list draws no pixel.
     bool viewport_set = false;
     bool scissor_set = false;
+    // Size of the automatic full-target default already forwarded to the desktop list (0 = none yet). Kept apart from
+    // the title flags above so a later render target 0 of another size gets a fresh default.
+    UINT64 default_viewport_w = 0, default_scissor_w = 0;
+    UINT default_viewport_h = 0, default_scissor_h = 0;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
 
@@ -1701,6 +1705,8 @@ void reset_viewport_state(Wrapper* self)
     if (!self->own().pass) return;
     pass_of(self).viewport_set = false;
     pass_of(self).scissor_set = false;
+    pass_of(self).default_viewport_w = pass_of(self).default_scissor_w = 0;
+    pass_of(self).default_viewport_h = pass_of(self).default_scissor_h = 0;
 }
 
 // List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list (no desktop draw yet).

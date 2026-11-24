@@ -1057,15 +1057,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
     if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {
         const D3D12_RESOURCE_DESC target = pass.target0->GetDesc();
-        if (!pass.viewport_set) {
+        // Only the title's own calls set the flags; an automatic default is regenerated when render target 0 changes size.
+        if (!pass.viewport_set && (pass.default_viewport_w != target.Width || pass.default_viewport_h != target.Height)) {
             const D3D12_VIEWPORT full{0.0f, 0.0f, static_cast<float>(target.Width), static_cast<float>(target.Height), 0.0f, 1.0f};
             list->RSSetViewports(1, &full);
-            pass.viewport_set = true;
+            pass.default_viewport_w = target.Width;
+            pass.default_viewport_h = target.Height;
         }
-        if (!pass.scissor_set) {
+        if (!pass.scissor_set && (pass.default_scissor_w != target.Width || pass.default_scissor_h != target.Height)) {
             const D3D12_RECT full{0, 0, static_cast<LONG>(target.Width), static_cast<LONG>(target.Height)};
             list->RSSetScissorRects(1, &full);
-            pass.scissor_set = true;
+            pass.default_scissor_w = target.Width;
+            pass.default_scissor_h = target.Height;
         }
     }
     list->SetPipelineState(pipeline);
