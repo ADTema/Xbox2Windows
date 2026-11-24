@@ -2380,15 +2380,8 @@ class TestRdna2Disasm(unittest.TestCase):
             repro[0]["assembly"],
             "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]",
         )
-        operands, op_sel, op_sel_hi, clamp = parse_fma_mix(repro[0]["assembly"].split(" ", 2)[2])
-        self.assertEqual((operands, op_sel, op_sel_hi, clamp), (["|s44|", "-v19", "v20"], [1, 1, 0], [1, 0, 0], False))
-        scalar = {"s44": "params[0].x"}
-        vector = {"v19": "alu_19", "v20": "alu_20"}
-        lowered = [
-            fma_mix_operand(tok, bool(f16), bool(hi), scalar, vector, set(), set())
-            for tok, f16, hi in zip(operands, op_sel, op_sel_hi)
-        ]
-        self.assertEqual(lowered, ["abs(widen16(asuint(params[0].x) >> 16))", "(-widen16(asuint(alu_19)))", "alu_20"])
+        with self.assertRaisesRegex(ValueError, "High-half selection requires an f16 operand"):
+            parse_fma_mix(repro[0]["assembly"].split(" ", 2)[2])
 
         def encode_fma_mix(op, vdst, src0, src1, src2, abs_bits=(0, 0, 0), neg_bits=(0, 0, 0),
                            sel=(0, 0, 0), sel_hi=(0, 0, 0), use_clamp=False, literal=None):
@@ -2430,8 +2423,8 @@ class TestRdna2Disasm(unittest.TestCase):
             ((0, 0, 0), (1, 0, 0), (0, 0, 0), (0, 0, 0), False, "-v2, v3, v4", ""),
             ((0, 0, 0), (0, 1, 0), (0, 0, 0), (0, 0, 0), False, "v2, -v3, v4", ""),
             ((0, 0, 0), (0, 0, 1), (0, 0, 0), (0, 0, 0), False, "v2, v3, -v4", ""),
-            ((1, 1, 1), (1, 0, 1), (1, 1, 1), (1, 0, 1), True,
-             "-|v2|, |v3|, -|v4|", " op_sel:[1,1,1] op_sel_hi:[1,0,1] clamp"),
+            ((1, 1, 1), (1, 0, 1), (1, 0, 1), (1, 1, 1), True,
+             "-|v2|, |v3|, -|v4|", " op_sel:[1,0,1] op_sel_hi:[1,1,1] clamp"),
         )
         vec = {"v2": "alu_2", "v3": "alu_3", "v4": "alu_4"}
         for op, name in opcodes:
@@ -2447,8 +2440,21 @@ class TestRdna2Disasm(unittest.TestCase):
                     self.assertTrue(is_instruction_supported(asm))
                     parsed_ops, parsed_sel, parsed_hi, parsed_clamp = parse_fma_mix(asm.split(" ", 2)[2])
                     self.assertEqual((parsed_sel, parsed_hi, parsed_clamp), (list(sel), list(sel_hi), use_clamp))
-                    for tok, f16, hi in zip(parsed_ops, parsed_sel, parsed_hi):
+                    for tok, f16, hi in zip(parsed_ops, parsed_hi, parsed_sel):
                         fma_mix_operand(tok, bool(f16), bool(hi), {}, vec, set(), set())
+
+        # LLVM prints these forms for three low or three high f16 register halves.
+        for selectors, shift in (
+            ("op_sel_hi:[1,1,1]", ""),
+            ("op_sel:[1,1,1] op_sel_hi:[1,1,1]", " >> 16"),
+        ):
+            with self.subTest(selectors=selectors):
+                ops, sel, sel_hi, _ = parse_fma_mix(f"v2, v3, v4 {selectors}")
+                lowered = [
+                    fma_mix_operand(tok, f16, hi, {}, vec, set(), set())
+                    for tok, f16, hi in zip(ops, sel_hi, sel)
+                ]
+                self.assertEqual(lowered, [f"widen16(asuint(alu_{i}){shift})" for i in (2, 3, 4)])
 
         # Literal operand with combined -|literal| modifiers must consume trailing DWORD and round-trip.
         lit_raw = encode_fma_mix(0x20, 1, 255, 259, 260, abs_bits=(1, 0, 0), neg_bits=(1, 0, 0), literal=0x3f800000)
@@ -2470,7 +2476,7 @@ class TestRdna2Disasm(unittest.TestCase):
         for bad_tail in (
             "s44, v19, v20 neg_lo:[0,1,0]",
             "s44, v19, v20 neg_hi:[1,0,0]",
-            "v2, v3, v4 op_sel:[0,0,0] op_sel_hi:[1,0,0]",
+            "v2, v3, v4 op_sel:[1,0,0]",
         ):
             with self.assertRaises(ValueError):
                 parse_fma_mix(bad_tail)
@@ -2518,7 +2524,7 @@ class TestRdna2Disasm(unittest.TestCase):
                 struct.pack("<I", 0x7e000000 | (9 << 17) | (0x01 << 9) | 30),         # v_mov_b32_e32 v9, s30
                 struct.pack("<I", 0x7e000000 | (10 << 17) | (0x01 << 9) | 31),        # v_mov_b32_e32 v10, s31
                 encode_fma_mix(0x20, 12, 28, 256 + 8, 256 + 9, abs_bits=abs_b, neg_bits=neg_b,
-                               sel=(1, 1, 0), sel_hi=(1, 0, 0)),
+                               sel=(1, 0, 0), sel_hi=(1, 1, 0)),
                 encode_fma_mix(0x22, 10, 256 + 8, 256 + 12, 256 + 9, abs_bits=(1, 0, 0), neg_bits=(1, 0, 0),
                                sel=(1, 0, 0), sel_hi=(1, 0, 0), use_clamp=True),
                 struct.pack("<I", 0x7e000000 | (13 << 17) | (0x0b << 9) | (256 + 10)),  # v_cvt_f32_f16_e32 v13, v10
@@ -2534,8 +2540,8 @@ class TestRdna2Disasm(unittest.TestCase):
 
         shader_asm = [rec["assembly"] for rec in disasm_rdna2(build_fma_mix_shader(False))]
         swapped_asm = [rec["assembly"] for rec in disasm_rdna2(build_fma_mix_shader(True))]
-        self.assertIn("v_fma_mix_f32 v12, |s28|, -v8, v9 op_sel:[1,1,0] op_sel_hi:[1,0,0]", shader_asm)
-        self.assertIn("v_fma_mix_f32 v12, -s28, |v8|, v9 op_sel:[1,1,0] op_sel_hi:[1,0,0]", swapped_asm)
+        self.assertIn("v_fma_mix_f32 v12, |s28|, -v8, v9 op_sel:[1,0,0] op_sel_hi:[1,1,0]", shader_asm)
+        self.assertIn("v_fma_mix_f32 v12, -s28, |v8|, v9 op_sel:[1,0,0] op_sel_hi:[1,1,0]", swapped_asm)
         self.assertIn("v_fma_mixhi_f16 v10, -|v8|, v12, v9 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp", shader_asm)
         self.assertIn("v_pk_add_f16 v11, s28, v8 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[0,1]", shader_asm)
         self.assertIn("v_pk_mul_f16 v11, v11, v9 neg_hi:[1,0]", shader_asm)
@@ -2548,7 +2554,7 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertIn("saturate(mad((-abs(widen16(asuint(alu5) >> 16))), alu8, alu6))", hlsl)
 
         bad_shader_asm = [
-            "v_fma_mix_f32 v12, s28, v8, v9 op_sel:[1,1,0] neg_lo:[0,1,0]"
+            "v_fma_mix_f32 v12, s28, v8, v9 op_sel:[1,0,0] op_sel_hi:[1,1,0] neg_lo:[0,1,0]"
             if line.startswith("v_fma_mix_f32 v12,") else line
             for line in shader_asm
         ]
@@ -3701,7 +3707,7 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_pk_add_u16 v4, v3, 1",
             "v_pk_add_f16 v22, s44, v19 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[0,1]",
             "v_pk_mul_f16 v23, v22, v20 neg_hi:[1,0]",
-            "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]",
+            "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,0,0] op_sel_hi:[1,1,0]",
             "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp",
             "v_cmp_lt_f32_e32 vcc_lo, v1, v2",
             "v_cmp_eq_u32_e32 vcc_lo, s1, v2",
