@@ -18,11 +18,13 @@ SamplerComparisonState comparison[2] : register(s1, space3);
 void main(uint3 dispatch_thread : SV_DispatchThreadID, uint3 group : SV_GroupID)
 {
 #if defined(INDEX_FROM_GROUP_ID)
-    const uint index = group.x;
+    const uint sampler_index = group.x;
 #else
-    const uint index = dispatch_thread.x;
+    const uint sampler_index = dispatch_thread.x;
 #endif
+    const uint output_index = dispatch_thread.x;
     const float2 uv = float2(1.25, 0.5);
-    results.Store(index * 4, asuint(depth_texture.SampleLevel(ordinary[index], uv, 0).x));
-    results.Store((index + 2) * 4, asuint(depth_texture.SampleCmpLevelZero(comparison[index], uv, 0.5)));
+    results.Store(output_index * 4, asuint(depth_texture.SampleLevel(ordinary[sampler_index], uv, 0).x));
+    results.Store((output_index + 2) * 4,
+                  asuint(depth_texture.SampleCmpLevelZero(comparison[sampler_index], uv, 0.5)));
 }

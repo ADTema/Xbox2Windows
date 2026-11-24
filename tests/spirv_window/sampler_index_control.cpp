@@ -103,6 +103,12 @@ void check_sampler_index_control(ID3D12Device* device,
     auto output = make_buffer(device, 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto readback = make_buffer(device, 16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    const std::array<float, 4> sentinels{-1.0f, -2.0f, -3.0f, -4.0f};
+    auto reset = make_buffer(device, sizeof(sentinels), D3D12_HEAP_TYPE_UPLOAD,
+                             D3D12_RESOURCE_STATE_GENERIC_READ);
+    check(reset->Map(0, &empty, &mapped), "Map sampler index control sentinels");
+    std::memcpy(mapped, sentinels.data(), sizeof(sentinels));
+    reset->Unmap(0, nullptr);
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     ComPtr<ID3D12DescriptorHeap> views, samplers;
@@ -155,8 +161,10 @@ void check_sampler_index_control(ID3D12Device* device,
                 transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             }
-            transition(list, output.Get(), output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            transition(list, output.Get(), output_state, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(output.Get(), 0, reset.Get(), 0, sizeof(sentinels));
+            transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             list->SetComputeRootSignature(root.Get());
             ID3D12DescriptorHeap* heaps[] = {views.Get(), samplers.Get()};
             list->SetDescriptorHeaps(2, heaps);
