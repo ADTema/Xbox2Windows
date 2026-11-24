@@ -527,18 +527,22 @@ add_custom_command(OUTPUT "${d3d12x_pso_header}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_pso.hlsl"
     DEPENDS tests/d3d12x_pso.hlsl
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.cso" VERBATIM)
-add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp "${d3d12x_pso_header}")
+add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp src/d3d12x_struct_return.cpp "${d3d12x_pso_header}")
 add_dependencies(d3d12x_device_check d3d12_xs_shim)
 target_include_directories(d3d12x_device_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(d3d12x_device_check PRIVATE cxx_std_17)
+target_include_directories(d3d12x_device_check PRIVATE src)
 target_link_libraries(d3d12x_device_check PRIVATE d3d12 dxgi)
 foreach(adapter IN ITEMS warp hardware)
     add_test(NAME d3d12x_device_create_${adapter} COMMAND d3d12x_device_check
         "$<TARGET_FILE:d3d12_xs_shim>" create ${adapter})
     add_test(NAME d3d12x_device_negative_${adapter} COMMAND d3d12x_device_check
         "$<TARGET_FILE:d3d12_xs_shim>" negative ${adapter})
+    add_test(NAME d3d12x_device_struct_return_${adapter} COMMAND d3d12x_device_check
+        "$<TARGET_FILE:d3d12_xs_shim>" struct-return ${adapter})
 endforeach()
-set_tests_properties(d3d12x_device_create_hardware d3d12x_device_negative_hardware PROPERTIES
+set_tests_properties(d3d12x_device_create_hardware d3d12x_device_negative_hardware
+    d3d12x_device_struct_return_hardware PROPERTIES
     SKIP_RETURN_CODE 77)
 set_tests_properties(d3d12x_device_negative_warp d3d12x_device_negative_hardware PROPERTIES
     PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice: unsupported IID \\{7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01\\}")
@@ -550,6 +554,33 @@ endforeach()
 add_test(NAME d3d12x_pso_reject_warp COMMAND d3d12x_device_check
     "$<TARGET_FILE:d3d12_xs_shim>" reject warp)
 set_tests_properties(d3d12x_pso_static_sampler_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
+# D3D12.X descriptor heaps, CPU/GPU handles and descriptor table records (#XCL-09).
+set(d3d12x_descriptor_cs "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_descriptor_cs.h")
+add_custom_command(OUTPUT "${d3d12x_descriptor_cs}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Vn d3d12x_descriptor_cs
+            -Fh "${d3d12x_descriptor_cs}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_descriptor_cs.cso"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_descriptor.hlsl"
+    DEPENDS tests/d3d12x_descriptor.hlsl
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_descriptor_cs.cso" VERBATIM)
+add_custom_target(d3d12x_descriptor_shader DEPENDS "${d3d12x_descriptor_cs}")
+add_executable(d3d12x_descriptor_check tests/d3d12x_descriptor_check.cpp "${d3d12x_descriptor_cs}")
+add_dependencies(d3d12x_descriptor_check d3d12_xs_shim d3d12x_descriptor_shader)
+target_include_directories(d3d12x_descriptor_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(d3d12x_descriptor_check PRIVATE cxx_std_17)
+target_link_libraries(d3d12x_descriptor_check PRIVATE d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME d3d12x_descriptor_heap_${adapter} COMMAND d3d12x_descriptor_check
+        "$<TARGET_FILE:d3d12_xs_shim>" heap ${adapter})
+    add_test(NAME d3d12x_descriptor_table_${adapter} COMMAND d3d12x_descriptor_check
+        "$<TARGET_FILE:d3d12_xs_shim>" table ${adapter})
+    add_test(NAME d3d12x_descriptor_negative_${adapter} COMMAND d3d12x_descriptor_check
+        "$<TARGET_FILE:d3d12_xs_shim>" negative ${adapter})
+    set_tests_properties(d3d12x_descriptor_heap_${adapter} d3d12x_descriptor_table_${adapter}
+        d3d12x_descriptor_negative_${adapter} PROPERTIES TIMEOUT 30)
+endforeach()
+set_tests_properties(d3d12x_descriptor_heap_hardware d3d12x_descriptor_table_hardware
+    d3d12x_descriptor_negative_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
 set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
 add_custom_command(OUTPUT "${vm_translation_header}"
@@ -3716,8 +3747,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # by Windows and started with pe_map_run; the startup log and exit code must match (Refs #165, #870).
     # The _early variant starts a thread inside its first process-attach callback (mapped only).
     foreach(target IN ITEMS cpu_exe_tls cpu_exe_tls_early)
-        add_executable(${target} tests/cpu/exe_tls.cpp)
-        target_compile_options(${target} PRIVATE /GS- /Zl)
+        add_executable(${target} tests/cpu/exe_tls.cpp tests/cpu/exe_tls_template.asm)
+        target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/GS-;/Zl;/Zc:tlsGuards->")
         target_link_options(${target} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
             /INCREMENTAL:NO)
         target_link_libraries(${target} PRIVATE kernel32)
@@ -3732,8 +3763,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The _pause variant leaves a worker paused inside the image for the release refusal (mapped only). The
     # _enroll variant starts a probe worker whose enrollment or installation the host makes fail.
     foreach(target IN ITEMS cpu_exe_tls_slot0 cpu_exe_tls_slot0_pause cpu_exe_tls_slot0_enroll)
-        add_executable(${target} tests/cpu/exe_tls_slot0.cpp)
-        target_compile_options(${target} PRIVATE /GS- /Zl /GA)
+        add_executable(${target} tests/cpu/exe_tls_slot0.cpp tests/cpu/exe_tls_template.asm)
+        target_compile_definitions(${target} PRIVATE $<$<COMPILE_LANGUAGE:ASM_MASM>:TLS_SLOT0_ARRAY>)
+        target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/GS-;/Zl;/GA;/Zc:tlsGuards->")
         target_link_options(${target} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
             /INCREMENTAL:NO)
         target_link_libraries(${target} PRIVATE kernel32)
@@ -4334,6 +4366,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-round "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_f16_round_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME pixel_aot_f16_fmac_ldexp_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-fmac-ldexp "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_f16_fmac_ldexp_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_f16_cvt_int16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-cvt-int16 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -4514,6 +4550,8 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_arith_${adapter}.txt")
         set_tests_properties(pixel_aot_f16_round_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_round_${adapter}.txt")
+        set_tests_properties(pixel_aot_f16_fmac_ldexp_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_fmac_ldexp_${adapter}.txt")
         set_tests_properties(pixel_aot_f16_cvt_int16_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_cvt_int16_${adapter}.txt")
         set_tests_properties(pixel_aot_f16_to_int16_${adapter} PROPERTIES
