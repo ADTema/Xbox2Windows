@@ -58,7 +58,7 @@ def check_refusal_lines(log):
         + " " + R8_VIEW + rf" dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
         prefix + r"unavailable texture at the supplied base and layout: reason=texture_unavailable " + R8_RESOURCE % 2
         + " " + R8_VIEW + rf" dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
-        prefix + r"unsupported memory SRV arguments: reason=unsupported_description "
+        prefix + r"unavailable buffer at the supplied address: reason=buffer_unavailable "
         + r"res\{dim=1 fmt=0 size=256x1x1 mips=1 layout=0x1 flags=0x0 align=0 samples=1/0\} "
         + r"view\{dim=1 fmt=0 map=0x1688 first=0 count=64 stride=4 flags=0x0 \(buffer views are not supported\)\} "
         + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",

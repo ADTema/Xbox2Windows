@@ -37,7 +37,9 @@ void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);
 void check_dual_uav(ID3D12Device* device);
 enum class DescriptorWindowCase { direct, stale_window, copied_record, stale_record, unknown_record };
+void check_stream_root_srv(ID3D12Device* device);
 void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowCase scenario);
+void check_cpu_srv_refresh(ID3D12Device* device, bool stale);
 enum class MeshConstantBinding { root, root_pair, swapped_root_pair, table, swapped_table };
 enum class MeshDrawMode { color, textured, depth_pair };
 struct MeshTextureProducers {
@@ -64,11 +66,12 @@ struct PixelMismatch : std::runtime_error {
 };
 
 void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr,
-                            UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL);
+                            UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL, const char* rawReadback = nullptr);
 void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg);
 void check_compute_to_pixel(ID3D12Device* device, const char* compute, const char* pixel,
                             const char* reference, const char* previous);
-void check_pixel_quad_lod(ID3D12Device* device, const char* shader);
+void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* rawReadback = nullptr,
+                         bool allowUpperRawLodStep = false);
 void check_pixel_mip_clamp(ID3D12Device* device, const char* shader, unsigned expectedLevel);
 void check_pixel_mip_blend(ID3D12Device* device, const char* shader, float clamp, float tolerance);
 void check_pixel_compare(ID3D12Device* device, const char* shader, const char* reference);

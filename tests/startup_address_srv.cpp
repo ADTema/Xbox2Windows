@@ -243,3 +243,90 @@ void release_placed_vertices(bool done)
         p.resource[0] = nullptr;
     }
 }
+
+int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
+{
+    static std::array<std::uint8_t, 65536 + 256> raw_buf0{};
+    static std::array<std::uint8_t, 65536 + 256> raw_buf1{};
+    auto* const buf0 = reinterpret_cast<std::uint32_t*>((ptr(raw_buf0.data()) + 0xffff) & ~Word{0xffff});
+    auto* const buf1 = reinterpret_cast<std::uint32_t*>((ptr(raw_buf1.data()) + 0xffff) & ~Word{0xffff});
+    std::memset(buf0, 0, 256);
+    std::memset(buf1, 0, 256);
+    buf0[0] = 17;
+    buf0[1] = 99;
+    buf0[4] = 63;
+    buf1[4] = 141;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    void* placed[2]{};
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf0), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[0]))))) return 47;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf1), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[1]))))) return 47;
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+
+    const auto draw = [&](LONG x) {
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+
+    ViewAt raw{};
+    raw.view.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    raw.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    raw.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    raw.view.Buffer.NumElements = 4;
+
+    raw.address = ptr(buf0);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(0);
+
+    raw.address = ptr(buf0 + 4);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(1);
+
+    raw.address = ptr(buf1);
+    raw.view.Buffer.FirstElement = 4;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(2);
+
+    // Unaligned interior address for a raw buffer must be refused and keep the previous descriptor.
+    raw.view.Buffer.FirstElement = 0;
+    raw.address = ptr(buf0 + 1);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(3);
+
+    ViewAt structured{};
+    structured.view.Format = DXGI_FORMAT_UNKNOWN;
+    structured.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    structured.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    structured.view.Buffer.FirstElement = 1;
+    structured.view.Buffer.NumElements = 1;
+    structured.view.Buffer.StructureByteStride = 4;
+    structured.address = ptr(buf0);
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
+    // An acceleration-structure view is refused; draw(4) proves the structured descriptor stayed in place.
+    ViewAt as_view{};
+    as_view.view.Format = DXGI_FORMAT_UNKNOWN;
+    as_view.view.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(11);
+    as_view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    as_view.address = ptr(buf0);
+    invoke(guest, 70, ptr(&desc), ptr(&as_view), cpu);
+    draw(4);
+
+    raw.address = ptr(buf0);
+    raw.view.Buffer.FirstElement = 0;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(5);
+    draw(6);
+    draw(7);
+    return 0;
+}

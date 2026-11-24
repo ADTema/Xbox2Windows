@@ -162,6 +162,11 @@ public:
     {
         return update < capacity && updates_[update] ? names_[updates_[update] - 1] : std::string();
     }
+    // Name of an open container, or empty. The caller holds the lock.
+    std::string container_name(std::size_t index) const
+    {
+        return index < capacity && refs_[index] > 0 ? names_[index] : std::string();
+    }
     std::size_t in_use() const
     {
         std::size_t used = 0;

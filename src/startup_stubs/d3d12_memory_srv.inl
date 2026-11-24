@@ -24,6 +24,8 @@ bool tiled_bc_srv(const D3D12_RESOURCE_DESC& r)
 
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
+    if (r.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        return x2w_startup::supports_buffer_memory_srv(r, v);
     if (x2w_startup::bc64::supports(r)) {
         if (v.Format != r.Format || v.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)
             return false;
@@ -73,6 +75,41 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
         if (reinterpret_cast<u64>(wrapper->own().title_memory) != address ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0 ||
             !same_texture_description(desc, info.console)) continue;
+        if (match) {
+            match = nullptr;
+            break;
+        }
+        match = const_cast<Wrapper*>(wrapper);
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return match;
+}
+
+Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
+{
+    if (!address || !bytes) return nullptr;
+    const auto placed = placed_buffer_range(device, address, bytes);
+    if (placed.reject) return nullptr;
+    if (placed.owner) {
+        if (InterlockedCompareExchange(&placed.owner->own().refs, 0, 0) <= 0) return nullptr;
+        const auto* info = resource_info(placed.owner);
+        if (!info || info->console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            (info->console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+            return nullptr;
+        return const_cast<Wrapper*>(placed.owner);
+    }
+    Wrapper* match = nullptr;
+    AcquireSRWLockShared(&note_lock);
+    for (const auto& [wrapper, info] : resource_infos()) {
+        if (info.placement != Placement::none ||
+            info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            (info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+            InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
+            continue;
+        const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
+        const u64 width = info.console.Width;
+        if (!base || address < base || address - base >= width || bytes > width - (address - base))
+            continue;
         if (match) {
             match = nullptr;
             break;
@@ -174,6 +211,23 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     static LONG refused;
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         if (first_calls(refused, 8)) log_refused_memory_srv("unsupported memory SRV arguments", reason, resource, input, destination);
+        return;
+    }
+    if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        const u64 elem_bytes = x2w_startup::buffer_srv_element_bytes(input->view);
+        const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
+        Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
+        const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
+        D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
+        if (!buffer || !info ||
+            !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
+                                                  info->console.Width, input->address, input->view, adjusted)) {
+            if (first_calls(refused, 8))
+                log_refused_memory_srv("unavailable buffer at the supplied address", "buffer_unavailable",
+                                       resource, input, destination);
+            return;
+        }
+        view_slot<18, 2>(self, reinterpret_cast<u64>(buffer), reinterpret_cast<u64>(&adjusted), destination, 0);
         return;
     }
     Wrapper* texture = (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)

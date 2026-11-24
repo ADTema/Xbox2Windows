@@ -522,7 +522,7 @@ OperationResult run_compute_texture_msaa_case(const OperationContext& ctx)
 OperationResult run_compute_texture_store_case(const OperationContext& ctx)
 {
     return skip_if_false(check_compute_texture_store_file(ctx.device, ctx.argv[3], ctx.argv[4]),
-                         "Typed UAV store unavailable for the image case format");
+                         "Required typed UAV operations unavailable for the image case format");
 }
 
 OperationResult run_spirv_sampler_views(const OperationContext& ctx)
@@ -641,9 +641,21 @@ OperationResult run_dual_uav(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_stream_root_srv(const OperationContext& ctx)
+{
+    check_stream_root_srv(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_descriptor_window_submissions(const OperationContext& ctx)
 {
     check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::direct);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_cpu_srv_refresh(const OperationContext& ctx)
+{
+    check_cpu_srv_refresh(ctx.device, std::string_view(ctx.argv[2]) == "--cpu-srv-stale");
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -719,7 +731,8 @@ OperationResult run_check_pixel_compare(const OperationContext& ctx)
 
 OperationResult run_check_pixel_case(const OperationContext& ctx)
 {
-    check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4]);
+    check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4], D3D12_COLOR_WRITE_ENABLE_ALL,
+                           ctx.argc == 6 ? ctx.argv[5] : nullptr);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -750,7 +763,13 @@ OperationResult run_check_pixel_attribute_rg(const OperationContext& ctx)
 
 OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
 {
-    check_pixel_quad_lod(ctx.device, ctx.argv[3]);
+    check_pixel_quad_lod(ctx.device, ctx.argv[3], ctx.argc == 5 ? ctx.argv[4] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_get_lod_upper(const OperationContext& ctx)
+{
+    check_pixel_quad_lod(ctx.device, ctx.argv[3], ctx.argv[4], true);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1256,7 +1275,10 @@ const OperationSpec kOperations[] = {
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
     {"--dual-uav", 3, 3, nullptr, kNoGate, run_dual_uav},
+    {"--stream-root-srv", 3, 3, nullptr, kGateSm60BufferOps, run_stream_root_srv},
     {"--descriptor-window-submissions", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_submissions},
+    {"--cpu-srv-refresh", 3, 3, nullptr, kGateSm60BufferOps, run_cpu_srv_refresh},
+    {"--cpu-srv-stale", 3, 3, nullptr, kGateSm60BufferOps, run_cpu_srv_refresh},
     {"--descriptor-window-stale", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_stale},
     {"--descriptor-record-copy", 4, 4, validate_descriptor_record_args, kGateSm60BufferOps, run_descriptor_record_copy},
     {"--texture-mips", 3, 3, nullptr, kNoGate, run_texture_mips},
@@ -1267,12 +1289,13 @@ const OperationSpec kOperations[] = {
     {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
-    {"--check-pixel-case", 5, 5, nullptr, kNoGate, run_check_pixel_case},
+    {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
     {"--check-pixel-case-rg", 5, 5, nullptr, kNoGate, run_check_pixel_case_rg},
     {"--compute-to-pixel", 6, 7, nullptr, kNoGate, run_compute_to_pixel},
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
-    {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--check-pixel-quad-lod", 4, 5, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--check-pixel-get-lod-upper", 5, 5, nullptr, kNoGate, run_check_pixel_get_lod_upper},
     {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm60MinLodSmoke, run_check_pixel_quad_lod},
     // Keep the fractional point-filter fixture on its existing gate (#809).
     {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},

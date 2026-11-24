@@ -46,15 +46,16 @@ directory to exercise both slots on hardware and WARP.
 
 ## 16-bit packed targets
 
-A description that asks for a B5G5R5A1_UNORM or B4G4R4A4_UNORM render target is created as
+A description that asks for a B5G5R5A1_UNORM, B4G4R4A4_UNORM or B5G6R5_UNORM render target is created as
 R8G8B8A8_UNORM when the adapter lacks that use for the packed format and has it for
 R8G8B8A8_UNORM (`src/startup_stubs/packed_target_format.h`). Without this the description is
 refused, its allocation-info answer is all ones and the executable gets no texture. The first
 four stand-ins are logged.
 
-The rule covers the roles that were measured and nothing else: a single-sample 2D texture with
-one array slice that is a render target, alone or with unordered access. Other dimensions,
-arrays, multisampled textures and textures without the render-target flag keep their format.
+The rule covers a single-sample 2D texture or 2D array (2 to 2048 slices; a cube map is six) that is
+a render target, alone or with unordered access. Only the format changes: slice count, mip count
+and the view dimensions are kept. Other dimensions, zero or more than 2048 slices, multisampled
+textures and textures without the render-target flag keep their format.
 
 A stand-in texture carries the format it was asked for as private data. A view that names that
 format on that texture is created as R8G8B8A8_UNORM, both when the executable creates the view
@@ -71,17 +72,23 @@ Limits:
 - CPU-authored texels. Data the executable writes or reads itself in the 16-bit layout (uploads,
   copies to or from buffers, mapped reads) is not converted. Only textures that are rendered to
   and then sampled are covered.
-- Unordered-access writes to a stand-in are not exercised by a fixture.
+- B5G6R5_UNORM has no alpha; its stand-in does, so the alpha of a sampled stand-in is whatever was
+  rendered, not 1.
+- Unordered-access writes to a stand-in and array or cube stand-ins through the wrapper are not
+  exercised by a fixture; the selection rule and the view verdicts for them are checked without a device.
 
 Checks:
 
 - `ctest --preset release --no-tests=error -R '^startup_packed_target$' -V`: the selection rule
-  against adapters described by their support bits, and the view verdicts, without a device.
+  against adapters described by their support bits (B5G6R5_UNORM, arrays of 2, 6, 16 and 2048
+  slices, and the refused 0, 2049, multisampled and 3D cases), and the view verdicts, without a
+  device. The four `startup_packed_target_*_control` runs perturb the helper's answer (wrong
+  stand-in format, arrays left alone, B5G6R5_UNORM left alone, view kept packed) and must fail.
 - `ctest --preset release --no-tests=error -R '^startup_packed_target_draw_' -V`: through the
   wrapper, a texture of each packed format is created (slot 133), cleared through a render-target
   view, sampled in a draw and read back. The expected pixel follows the format this adapter
-  gets, so the check holds with and without the stand-in. B5G6R5_UNORM and R8G8B8A8_UNORM are
-  drawn as controls and never substituted; a packed view of a plain R8G8B8A8_UNORM texture and a
+  gets, so the check holds with and without the stand-in. R8G8B8A8_UNORM is drawn as a control
+  and never substituted; a packed view of a plain R8G8B8A8_UNORM texture and a
   B5G5R5A1 view of a B4G4R4A4 target must be refused.
 
 ## Descriptor heap starts that are not addresses
@@ -178,13 +185,26 @@ socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do no
 `tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
 
+`tools/startup/triage_run.py` summarizes a log directory (and optional `--shader-cache <dir>`)
+into an allowlist-only Markdown report: known reason and outcome tokens, decimal IDs and counts,
+hex HRESULT/format/flag codes, slot numbers and known shader-failure categories (`Device::slot70`
+refusals, unhandled `x2w-d3d12` / trap slots, `x2w-d3d12-debug` severity/ID counts, `x2w-dstorage`
+failures and status HRESULTs, `x2w-runtime` failing slots, and `.fail` shader categories). Any other
+text is grouped as `other (text omitted)` and never copied; raw snippets stay in the local logs.
+Check with `python3 -B tests/startup_triage_run_check.py` (ctest
+`startup_triage_run`).
+
 ## Launcher check
 
 `tests/startup_launch_check.py` (ctest `startup_launch`) drives `tools/startup/launch.py` on the
 source-built `tests/startup_launch_probe.cpp`. A finished run reports the child's exit code and saves
 its stdout, stderr and trap log; a child that outlives `--timeout` is terminated; `--memory-gib` and
 `--max-processes` stop an over-limit allocation and a helper process, and the same requests succeed
-under larger limits; a missing executable is reported instead of looking like a finished run. No GPU
+under larger limits; a missing executable is reported instead of looking like a finished run. When
+`X2W_STORAGE_PATH` is unset and `S:\` does not exist, `launch.py` creates `<logdir>\storage` as a
+per-run fallback (preserving `X2W_STORAGE_PATH` when set); it warns without deleting when
+`X2W_SHADER_CACHE` points to a non-empty directory, and prints a fast-fail diagnostic line pointing
+to `trap.log`, `X2W_STORAGE_PATH` and `X2W_SHADER_CACHE` on a sub-second non-zero exit. No GPU
 and no game files are needed, and the `pr` preset builds the probe and runs the test:
 
 ```powershell
@@ -194,7 +214,9 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 ## zlib decoder check
 
 `tests/startup_inflate_check.py` (ctest `startup_inflate`) runs the DirectStorage stand-in's decoder
-(`src/startup_stubs/inflate.h`) through the source-built `tests/startup_inflate_probe.cpp`. CPython's
+(`src/startup_stubs/inflate.h`) through the source-built `tests/startup_inflate_probe.cpp`, and
+`startup_inflate_status` (`tests/startup_inflate_status.cpp`) verifies `InflateStatus` classification
+in `inflate_zlib_ex` (`ok`, `insufficient_output`, `corrupt_stream`, `bad_checksum`). CPython's
 zlib encodes seeded synthetic data as stored, fixed and dynamic Huffman blocks, with matches up to
 the 32 KiB window and a sync flush between blocks; each result must equal the input. A stream with
 one byte too little capacity and a truncated stream must be rejected without writes past the
@@ -203,6 +225,23 @@ starts a byte earlier is rejected before it copies anything. No GPU and no game 
 
 ```powershell
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V
+```
+
+## Local switches, logging, and memory probing
+
+`tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
+control `startup_local_log_guard_drop_control`) verifies `src/startup_stubs/local_log.h`:
+`env_on` (a leading `1` in values up to three characters, preserving `GetLastError`), atomic
+`first_calls` countdowns, `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
+truncation, `MAX_PATH` boundary behavior, and `GetLastError` preservation on file-open failure),
+`probe_readable` (invalid-pointer and zero-length refusals, multi-page reads, `PAGE_NOACCESS` /
+`MEM_RESERVE` prefix truncation, and `PAGE_GUARD` re-arming verified by `VirtualQuery` and a
+second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
+`PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`. No GPU is required:
+
+```powershell
+cmake --build --preset dev --target startup_local_log_check
+ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?$' -V
 ```
 
 ## Switches
@@ -220,7 +259,7 @@ ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 | `X2W_AUDIO_PERMISSIVE=1` | audio HAL / APU stand-ins accept their calls (no output) |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user |
-| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return |
+| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is handed to the executable with a trailing separator, added when missing, because the executable appends names to it as it is; up to 258 characters, a longer value is refused with a log line and `S:\` is used (`src/startup_stubs/storage_root.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`) |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
@@ -230,13 +269,6 @@ ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 | `X2W_DUMP_AT=<seconds>[,...]` | the startup debugger writes every thread's stack to `threads_<seconds>.txt` at those times, for a run that stalls before a watchdog or the timeout ends it |
 | `X2W_VALLOC_MIN=<hex bytes>` | the startup debugger logs each virtual-memory allocation of at least that size to `files.txt` (`VALLOC`), with the requested address (0 for any, unreadable for an incomplete read), size, type, protection and the main-image and stand-in return addresses on the caller's stack |
 | `X2W_HOST_CPU=1` (`run.ps1 -HostCpu`) | the startup debugger rewrites main-image instructions the host processor lacks at their first fault: see [Host processors without the console's instructions](#host-processors-without-the-consoles-instructions) |
-
-The stand-ins share one switch reader and line logger (`src/startup_stubs/local_log.h`): a value
-that starts with `1` is on; `0`, an empty value and another first character are off. Neither changes
-the caller's last error, and each line ends in CRLF on stderr and is appended to `X2W_TRAP_LOG`.
-`ctest --preset dev --no-tests=error -R '^startup_local_log$' -V` checks those switch values, the kept
-last error and the exact bytes on stderr and in the log, including a line cut to 1,533 bytes, an
-existing log that keeps its contents and log paths at and past `MAX_PATH`.
 
 The startup shader cache key includes the translator revision. After updating from
 an earlier translation revision, run the recording build once to emit
@@ -284,8 +316,8 @@ can then hold some blobs of the new generation and some of the old one, with `.x
 The slot numbers and argument layouts follow the public header order and stay a hypothesis.
 Persisted: create container (16), delete container (10, 11), create and close update (23, 24), blob
 write and delete staged in an update (25, 26) and published by submit (27, 28 with its result in 29).
-Not yet persisted, because their argument layout is not established: blob reads (20 to 22) still
-report no blob, and the enumerations and queries (12 to 15, 18, 19) still report nothing.
+Asynchronous read (21, with its result in 22) returns committed blobs. Slot 20 still reports no blob.
+The enumerations and queries (12 to 15, 18, 19) still report nothing.
 `ctest --preset dev --no-tests=error -R '^startup_gamesave_persist$' -V` checks the storage code the
 slots call, not the slots: it writes in one process and reads in a second, including a close without
 submit, a failing second action, a second process that sees only committed state, and a redirected
@@ -302,6 +334,10 @@ sees a mixed or incomplete generation). The pause points and that copy exist onl
 Slot 28 first asks the Windows gaming runtime to accept the caller's async block. On rejection it returns before taking staged actions. Once accepted it commits the files and calls `XAsyncComplete` with the status for that block. Slot 29 retrieves the status with the matching operation identity. File publication is synchronous within slot 28. The caller's completion routine can run inline or through its selected completion queue. [XAsyncBegin](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasyncbegin) · [XAsyncComplete](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasynccomplete) · [PC GDK async interface slots](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L57-L64)
 
 `ctest --preset dev --no-tests=error -R '^startup_gamesave_submit_'` checks denied starts and retries, two overlapping blocks and completion that reads the file and slot 29 before slot 28 returns. The system variant uses the installed Windows gaming runtime with an immediate work/completion queue. It reports a capability skip when the runtime or queue is unavailable.
+
+Slot 21 reserves the caller's async block on that same XAsync service, with its own operation identity (`local XGameSaveReadBlobData`). If the service rejects the block, slot 21 returns before it reads. Once the block is accepted, it snapshots the named blobs through `read_blobs` (one shared file lock for the set), packs them, and completes with the status and the number of bytes slot 22 needs. It does not use the user service, and no save lock is held across `XAsyncComplete`. The packed bytes are an array of 24-byte records, payload pointer at offset 16, then each name, a NUL and the payload. Slot 22 copies that into the caller's buffer and reports the count. A short buffer returns `0x80830007` and a missing blob returns `0x80830008`; neither writes the caller's count or bytes. A busy snapshot, and any other storage failure, uses the same status as submit (`0x80004005`); a bad name is `0x80070057`. [XGameSaveReadBlobDataResult](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavereadblobdataresult)
+
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_read_async_'` commits two blobs in one process and reads them in a second through slots 21 and 22. It checks the completion callback, the required size, the count and the exact bytes, a missing blob, a short buffer that leaves the output unchanged, and two overlapping reads. The controlled fixture always runs. The system variant uses an immediate Windows gaming runtime queue and skips only when that runtime is unavailable.
 
 ## Findings
 
@@ -428,6 +464,14 @@ These are measured on one executable; treat them as hypotheses for others.
   stand-in must be loaded for render-mode copies. The reported pitch describes the padded
   block-row extent of the surface. Synthetic copy and draw checks run with
   `ctest --preset dev --no-tests=error -R '^startup_xg_bc7_' -V`.
+  Those checks use only accepted descriptions at 81x69 and 64x64 (square 2x2 and 1x1 tile grids),
+  and the draw check tiles and detiles with the same block offsets. `tests/startup_bc7_4k_s_check.cpp`
+  covers `src/startup_stubs/bc7_4k_s.h` without a device. It compares every block offset with the
+  documented bit order on partial and non-square tile grids (200x72 is 4x2 tiles). It checks the
+  padded sizes from 1x1 to 16384x16384 and detile at three row pitches with guard bytes. It also
+  refuses each description with one field changed, such as two mips or 4 KiB alignment. Run
+  `ctest --preset dev --no-tests=error -R '^startup_bc7_4k_s' -V`; the `_x_first_control` run
+  checks an x-first order and must fail.
 - The default translator uses a static default sampler for a dynamically indexed sampler-heap load.
   With the sampler-heap opt-in, translated draws snapshot the bound heap's 16-byte sampler entries and
   bind a private desktop table beside the static samplers. Missing, out-of-range, or unreadable entries
@@ -436,6 +480,12 @@ These are measured on one executable; treat them as hypotheses for others.
   Wrapped sampler heaps keep the 16-byte title stride separate from the desktop descriptor increment
   for CPU handles and descriptor copies.
   The source-built readback uses `ctest --preset dev --no-tests=error -R '^startup_sampler_heap_' -V`.
+  The readback samples only wrap, clamp and border samplers along U. A device-free check covers the
+  rest of the sampler word decoding (each address mode on each axis, filters, anisotropy and border
+  colour), the `smpheap` manifest lines that are refused, snapshot counts and unreadable records, and
+  snapshot equality: build `startup_translated_sampler_bindings_check` and run
+  `ctest --preset dev --no-tests=error -R "^startup_translated_sampler_bindings(_shared_axis_control)?$" -V`.
+  The control expects all three axes to use the U field and must fail.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
   gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
@@ -487,7 +537,10 @@ routing and sample format.
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
 converts each submitted block (format, frame count, bytes) to it, and writes it through
-`IAudioRenderClient`. Consumed frames are the submitted frames minus `GetCurrentPadding`; the
+`IAudioRenderClient`. `convert_block` supports mono, stereo, 5.1, and 7.1 inputs (using ITU-R BS.775-1
+fold-down coefficients with clamping when downmixing to stereo or mono) and linear sample-rate
+resampling when the submitted rate differs from the endpoint mix rate (rejecting invalid rates,
+unsupported channel counts, or empty blocks as `Submit::Unsupported`). Consumed frames are the submitted frames minus `GetCurrentPadding`; the
 `IAudioClock` position is reported next to them. It records the first accepted block, the
 submitted format, per-block frame counts and peak amplitude, the drained interval (queue empty
 while the producer withholds data) and the recovery (resume until consumption advances). The
@@ -561,6 +614,12 @@ the stand-in path; the texture format used in the reported video remains to be c
 cmake --build --preset release --target startup_nv12_draw d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^startup_nv12_draw_' -V
 ```
+
+`ctest --preset dev --no-tests=error -R '^startup_slice_footprints' -V` checks
+`src/startup_stubs/slice_footprints.h` without a GPU. It covers NV12 descriptions refused for odd or zero
+sizes, mips, layers, samples or dimension; the one-frame R8 plane and 15-frame re-read intervals and the
+inclusive 32 MiB cap; the footprint request for 15 and 16 mips and without a device; and the bytes up to
+the end of the last row. The padded-last-row control must fail.
 
 ## Host processors without the console's instructions
 
@@ -740,3 +799,34 @@ is not affected: section-backed pages already took the committed, not-aliased pa
 - `ctest --preset release --no-tests=error -R '^xmem_page_runs_device_' -V` places a buffer
   (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
   sections, and single-page views.
+
+## Buffer memory SRVs (device slot 70)
+
+Device slot 70 (`src/startup_stubs/d3d12_memory_srv.inl`, validation in
+`src/startup_stubs/memory_srv_buffer.h`) also accepts `D3D12_RESOURCE_DIMENSION_BUFFER`
+descriptions with:
+
+- `D3D12_SRV_DIMENSION_BUFFER` (raw `R32_TYPELESS`, structured `Format == UNKNOWN` with a stride that is a multiple of 4 up to
+  2048, or typed buffers). It resolves an existing live placed (slot 133) or committed (slot 127)
+  buffer covering `[address, address + (FirstElement + NumElements) * element_bytes)`, checks
+  alignment and bounds, adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards
+  to `CreateShaderResourceView` (slot 18).
+
+Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`) are not
+supported and are refused. A view needs an actual built structure with the placed AS role and
+lifecycle checks, which has no device test yet.
+
+Typed element bytes come from the format (1 to 16 bytes). Formats that cannot back a typed buffer SRV
+(sRGB, BGRA, block-compressed, depth/stencil, typeless, planar) are refused with
+`unsupported_description` and leave the destination descriptor unchanged. Translated draws bind typed
+views with the format's element size and stride. The refusal reasons are listed in
+`docs/experiments.md` ("Name the cause of a refused slot 70 call").
+
+Checks:
+
+`startup_memory_srv_buffer` is device-free and owns every rejection (bounds, alignment, format,
+stride). `startup_address_buffer_srv_*` exercises only the resolve path with valid addresses on a
+device, so it does not cover the rejections.
+
+- `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer)$' -V`
+- `ctest --preset release --no-tests=error -R '^startup_address_(srv|buffer_srv)_' -V`

@@ -78,7 +78,7 @@ ALU_EXPRESSION_LIMIT = 1024
 # loaded from, not the 9-bit GFX10 format, type, swizzle, level or size fields inside them; the two
 # 16-byte descriptor slots are bound to t0 for reads or u0 for writes.
 # Value: (HLSL texel type, channel count).
-IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4), "R8G8B8A8_UINT": ("uint4", 4), "R32_UINT": ("uint", 1)}
+IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4), "R8G8B8A8_UINT": ("uint4", 4)}
 # Template operands are the old LDS word and the source VGPR, both HLSL uints.
 LDS_RMW = {
     "ds_add_u32": "({0} + {1})",
@@ -98,6 +98,8 @@ MUBUF_ATOMIC_METHODS = {
     "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
     "swap": "Exchange", "cmpswap": "CompareExchange",
 }
+
+IMAGE_ATOMIC_OPS = "add|sub|and|or|xor"
 
 
 def checked_group(group):
@@ -208,8 +210,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     for formatted MUBUF stores. Both declarations require identity channel selectors.
     image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
     the caller's statement of the image format inside it. The image binds to t0 for loads or u0
-    for stores, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
-    R32_UINT declares the 4-sample Texture2DMS profile for image_msaa_load.
+    for writes, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
+    R32_UINT selects the 4-sample Texture2DMS profile for an SRV or the
+    non-returning 2D integer atomic profile for a UAV.
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
@@ -218,12 +221,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if not 0 <= table_reg <= 105:
         raise ValueError("Invalid table or thread group binding")
     image_output = image_uav_mip is not None
-    image_msaa = image_format == "R32_UINT"
+    image_msaa = not image_output and image_format == "R32_UINT"
     if image_msaa and cpu != "gfx1030":
         raise ValueError("The R32_UINT MSAA image binding requires gfx1030")
+    image_atomic = image_output and image_format == "R32_UINT"
     if image_output:
         if (cpu != "gfx1030" or descriptor_offset is not None or stride is not None
-                or image_descriptor is None or image_format not in ("R32G32B32A32_UINT", "R8G8B8A8_UINT")
+                or image_descriptor is None or (image_format not in IMAGE_FORMATS and not image_atomic)
+                or (image_atomic and image_uav_mip != 0)
                 or not 0 <= image_uav_mip <= 15):
             raise ValueError("Invalid image UAV binding")
         descriptor_bindings = {}
@@ -250,7 +255,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unsupported formatted source binding")
     if image_descriptor is not None or image_format is not None:
         # The 8-dword image descriptor occupies two 16-byte slots.
-        if (image_format not in IMAGE_FORMATS or image_descriptor is None or source_descriptor is not None
+        if (not (image_format in IMAGE_FORMATS or image_msaa or image_atomic)
+                or image_descriptor is None or source_descriptor is not None
                 or not 0 <= image_descriptor < 1 << 20 or image_descriptor % 4
                 or any(image_descriptor + half in descriptor_bindings for half in (0, 16))
                 or any(abs(image_descriptor + half - offset) < 16
@@ -1219,6 +1225,32 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 vector.pop(reg, None)
                 loading[reg] = ("alu", name)
             image_step_count += 1
+        elif m := re.fullmatch(rf"image_atomic_(?P<op>{IMAGE_ATOMIC_OPS}) v(?P<data>\d+), "
+                               r"v\[(?P<x>\d+):(?P<y>\d+)\], s\[(?P<base>\d+):(?P<high>\d+)\] "
+                               r"dmask:0x(?P<mask>[0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?", line):
+            op = m["op"]
+            if not image_atomic or guard_span is not None or stores:
+                raise ValueError("Unsupported image atomic target or binding")
+            data = int(m["data"])
+            if int(m["mask"], 16) != 1 or data > 255:
+                raise ValueError("Unverified image atomic data range or mask")
+            base, high = int(m["base"]), int(m["high"])
+            if (high != base + 7 or base % 4 or pending.intersection(range(base, high + 1))
+                    or tuple(scalar.get(base + index) for index in range(8)) != tuple(
+                        (("image", index // 4), index % 4) for index in range(8))):
+                raise ValueError("Unverified image atomic descriptor")
+            x, y = int(m["x"]), int(m["y"])
+            coords = [vector.get(reg) for reg in (x, y)]
+            if y != x + 1 or y > 255 or not all(map(is_word, coords)):
+                raise ValueError("Unverified image atomic coordinates")
+            source = vector.get(data)
+            if not is_word(source):
+                raise ValueError("Unverified image atomic data")
+            destination = f"outputData[uint2({', '.join(map(hlsl_word, coords))})]"
+            value = hlsl_word(source)
+            if op == "sub":
+                value = f"(0u - {value})"
+            stores.append(f"    Interlocked{MUBUF_ATOMIC_METHODS[op]}({destination}, {value});")
         elif m := re.fullmatch(r"image_(?P<kind>load|store|get_resinfo)(?P<mip>_mip)?(?P<packed>_pck(?:_sgn)?)? "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\] dmask:0x(?P<mask>[0-9a-f]+) "
@@ -1236,7 +1268,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             count = len(channels)
             data = [int(n) for n in re.findall(r"\d+", m["data"])]
             first, last = data[0], data[-1]
-            if (cpu != "gfx1030" or image_format is None or image_msaa or guard_span is not None or write != image_output
+            if (cpu != "gfx1030" or image_format not in IMAGE_FORMATS or guard_span is not None or write != image_output
                     or len(vaddr) != min(address_words, 2) or vaddr[-1] != vaddr[0] + address_words - 1
                     or vaddr[-1] > 255 or last != first + count - 1
                     or not 0 < dmask < (1 << IMAGE_FORMATS[image_format][1])
@@ -1503,7 +1535,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             local = ", uint3 local : SV_GroupThreadID"
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
     cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
-    uav = "RWTexture2D<uint4>" if image_output else "RWByteAddressBuffer"
+    uav = f"RWTexture2D<{'uint' if image_atomic else 'uint4'}>" if image_output else "RWByteAddressBuffer"
     return (f"{cbuffer}{uav} outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 
@@ -1537,8 +1569,8 @@ def main():
                         help="Table byte offset of the 8-dword image descriptor bound to t0 or u0")
     parser.add_argument("--image-uav-mip", type=int,
                         help="Bind the image to u0 at this mip instead of binding a raw output descriptor")
-    parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS),
-                        help="Caller-declared image format (R32_UINT selects the 4-sample image_msaa_load profile)")
+    parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS.keys() | {"R32_UINT"}),
+                        help="Caller-declared image format (R32_UINT selects MSAA for an SRV or atomics for a UAV)")
     args = parser.parse_args()
     if (args.descriptor_offset is None) == (args.image_uav_mip is None):
         parser.error("Choose either --descriptor-offset or --image-uav-mip")
