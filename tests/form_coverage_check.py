@@ -324,6 +324,9 @@ def check_shader_records():
     mad64_forms = {("VOP3", "v_mad_u64_u32"), ("VOP3", "v_mad_i64_i32")}
     # The exact 32-bit integer to binary64 conversions are VOP1, accepted in their plain and _e32 spellings.
     cvt_f64_int_forms = {("VOP1", "v_cvt_f64_i32"), ("VOP1", "v_cvt_f64_u32")}
+    # The binary32 to binary64 conversion of a statically known source: VOP1 in its plain and _e32 spellings, and the
+    # VOP3 (_e64) spelling LLVM 15 prints for a source modifier.
+    cvt_f64_f32_forms = {("VOP1", "v_cvt_f64_f32"), ("VOP3", "v_cvt_f64_f32_e64")}
     mul24_forms = {
         ("VOP2", "v_mul_i32_i24"), ("VOP3", "v_mul_i32_i24_e64"),
         ("VOP2", "v_mul_u32_u24"), ("VOP3", "v_mul_u32_u24_e64"),
@@ -369,6 +372,7 @@ def check_shader_records():
         assert sad_forms <= covered, (name, sad_forms - covered)
         assert mad64_forms <= covered, (name, mad64_forms - covered)
         assert cvt_f64_int_forms <= covered, (name, cvt_f64_int_forms - covered)
+        assert cvt_f64_f32_forms <= covered, (name, cvt_f64_f32_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)

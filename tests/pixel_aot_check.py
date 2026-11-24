@@ -9491,6 +9491,114 @@ def cvt_f64_int_exported(signed, x, mask=None):
     return (CVT_F64_INT_SENTINELS[0], lo ^ mask, hi ^ mask, CVT_F64_INT_SENTINELS[1])
 
 
+# v_cvt_f64_f32: exact conversion of a statically known binary32 to binary64 in a VGPR pair (LLVM 15 VOP1Instructions.td,
+# the VOP1 opcode for v_cvt_f64_f32; every finite binary32 is exact in binary64; not checked against the ISA document
+# here and not measured on a console). The translator computes both words at translation time and emits constants, so
+# the source has to be static and cannot come from the constant buffer: each row is its own program, and the constant
+# buffer carries only the xor mask (s45) and the sentinels (s46, s47). The programs follow the int mode (v12 and v15
+# are the sentinels next to the unaligned pair v[13:14]; the pair is exported as lo ^ M and hi ^ M so that every
+# exported word is a normal binary32 or zero, which the test asserts). The references are struct.pack('<d', float) of
+# Python's own binary32 value, independent of the lowering.
+# Groups: the unmodified e32 form from a literal or inline constant, a SGPR (s_mov_b32) and a VGPR (v_mov_b32), and the
+# VOP3 spellings LLVM 15 prints with a source modifier: -x, |x| and -|x| from a VGPR, -x from a SGPR, and neg(0xL),
+# |0xL| and -|0xL| from a literal. The hardware order is abs first, then neg (the ISA's input modifier order; the
+# swapped order is drawn as a control that must mismatch on a signed zero).
+CVT_F64_F32_PLAIN_ROWS = (0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x7F7FFFFF, 0xFF7FFFFF, 0x00800000,
+                          0x80800000, 0x7F800000, 0xFF800000, 0x3F800001, 0xBF800001)
+CVT_F64_F32_MOD_ROWS = (0x00000000, 0x80000000, 0x3F800001, 0x00800000, 0xFF800000)
+CVT_F64_F32_GROUPS = {
+    "lit": (CVT_F64_F32_PLAIN_ROWS, False, False),
+    "sgpr": (CVT_F64_F32_PLAIN_ROWS, False, False),
+    "vgpr": (CVT_F64_F32_PLAIN_ROWS, False, False),
+    "vneg": (CVT_F64_F32_MOD_ROWS, False, True),
+    "vabs": (CVT_F64_F32_MOD_ROWS, True, False),
+    "vnegabs": (CVT_F64_F32_MOD_ROWS, True, True),
+    "sneg": (CVT_F64_F32_MOD_ROWS, False, True),
+    "lneg": (CVT_F64_F32_MOD_ROWS, False, True),
+    "labs": (CVT_F64_F32_MOD_ROWS, True, False),
+    "lnegabs": (CVT_F64_F32_MOD_ROWS, True, True),
+}
+# LLVM 15 prints a literal that equals one of these as the inline constant.
+CVT_F64_F32_INLINE_TEXT = {0x00000000: "0", 0x3F800000: "1.0", 0xBF800000: "-1.0"}
+CVT_F64_F32_SENTINELS = (0x3E123457, 0x40490FDB)
+_CVT_F64_F32_MASKS = (0x3F800000, 0x40000000, 0x20000000, 0x10000000)
+
+
+def cvt_f64_f32_rows(group):
+    """The rows of a group that its program can spell and the draw can carry.
+
+    A VGPR holds a float, so only a normal word or zero is moved through one. A SGPR copy takes only 0 of the values
+    LLVM folds to an inline constant (s_mov_b32 of 1.0 is not tracked), and a literal modifier form takes none.
+    """
+    rows = CVT_F64_F32_GROUPS[group][0]
+    if group.startswith("v"):
+        return [x for x in rows if binary32_normal_or_zero(x)]
+    if group.startswith("s"):
+        return [x for x in rows if x not in CVT_F64_F32_INLINE_TEXT or x == 0]
+    if group.startswith("l") and group != "lit":
+        return [x for x in rows if x not in CVT_F64_F32_INLINE_TEXT]
+    return list(rows)
+
+
+def cvt_f64_f32_lines(group, x, pair="v[13:14]"):
+    """The instructions of one row, spelled as LLVM 15 prints them."""
+    literal = f"0x{x:08x}"
+    spelled = CVT_F64_F32_INLINE_TEXT.get(x, literal)
+    return {
+        "lit": [f"v_cvt_f64_f32_e32 {pair}, {spelled}"],
+        "sgpr": [f"s_mov_b32 s60, {spelled}", f"v_cvt_f64_f32 {pair}, s60"],
+        "vgpr": [f"v_mov_b32_e32 v18, {spelled}", f"v_cvt_f64_f32 {pair}, v18"],
+        "vneg": [f"v_mov_b32_e32 v18, {spelled}", f"v_cvt_f64_f32_e64 {pair}, -v18"],
+        "vabs": [f"v_mov_b32_e32 v18, {spelled}", f"v_cvt_f64_f32_e64 {pair}, |v18|"],
+        "vnegabs": [f"v_mov_b32_e32 v18, {spelled}", f"v_cvt_f64_f32_e64 {pair}, -|v18|"],
+        "sneg": [f"s_mov_b32 s60, {spelled}", f"v_cvt_f64_f32_e64 {pair}, -s60"],
+        "lneg": [f"v_cvt_f64_f32_e64 {pair}, neg({literal})"],
+        "labs": [f"v_cvt_f64_f32_e64 {pair}, |{literal}|"],
+        "lnegabs": [f"v_cvt_f64_f32_e64 {pair}, -|{literal}|"],
+    }[group]
+
+
+def cvt_f64_f32_program(group, x):
+    return uncompressed_export([*CVT_F64_INT_HEAD, *cvt_f64_f32_lines(group, x), *CVT_F64_INT_TAIL])
+
+
+def cvt_f64_f32_binary_program(group):
+    """Every row of a group in one program, into the pairs v[20:21], v[22:23], ...: the binary round trip compares the
+    translation of the disassembly with that of the text."""
+    lines = []
+    for k, x in enumerate(cvt_f64_f32_rows(group)):
+        lines += cvt_f64_f32_lines(group, x, f"v[{20 + 2 * k}:{21 + 2 * k}]")
+    return uncompressed_export(lines)
+
+
+def cvt_f64_f32_ref(x, has_abs=False, has_neg=False, abs_first=True):
+    """(low, high) binary64 words of the binary32 bits x from Python's own double, modifiers applied on the value."""
+    value = struct.unpack("<f", struct.pack("<I", x))[0]
+    if not abs_first and has_neg:
+        value = -value
+    if has_abs:
+        value = abs(value)
+    if abs_first and has_neg:
+        value = -value
+    return struct.unpack("<II", struct.pack("<d", value))
+
+
+def cvt_f64_f32_group_ref(group, x, abs_first=True):
+    _, has_abs, has_neg = CVT_F64_F32_GROUPS[group]
+    return cvt_f64_f32_ref(x, has_abs, has_neg, abs_first)
+
+
+def cvt_f64_f32_mask(words):
+    """A mask M with both words normal or zero after the xor."""
+    return next(m for m in _CVT_F64_F32_MASKS if all(binary32_normal_or_zero(word ^ m) for word in words))
+
+
+def cvt_f64_f32_exported(words, mask):
+    """The four exported words: sentinel, low ^ M, high ^ M, sentinel."""
+    lo, hi = words
+    return (CVT_F64_F32_SENTINELS[0], lo ^ mask, hi ^ mask, CVT_F64_F32_SENTINELS[1])
+
+
 # v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32: the carry-out add and subtracts above, plus the carry or
 # borrow of each lane read from a lane mask. Bodies for uncompressed_export(): A, B, C and D are the constants in
 # s44 to s47, v18 = B and v19 = D. The carry-out form of the same operation leaves the carry of op(A, B) in vcc_lo
@@ -10441,6 +10549,112 @@ def check_cvt_f64_int_lowering():
     assert cvt_f64_int_ref(True, 0x80000000) == (0, 0xC1E00000) and cvt_f64_int_ref(False, 0x80000000) == (0, 0x41E00000)
     assert cvt_f64_int_ref(False, 0xFFFFFFFF) == (0xFFE00000, 0x41EFFFFF) and cvt_f64_int_ref(True, 0xFFFFFFFF) == (0, 0xBFF00000)
     assert cvt_f64_int_ref(False, 0) == cvt_f64_int_ref(True, 0) == (0, 0)
+
+
+def check_cvt_f64_f32_lowering():
+    """Static checks for v_cvt_f64_f32 as written by cvt_f64_f32_program()."""
+    assert set(CVT_F64_F32_GROUPS) == {"lit", "sgpr", "vgpr", "vneg", "vabs", "vnegabs", "sneg", "lneg", "labs", "lnegabs"}
+    for group in CVT_F64_F32_GROUPS:
+        rows = cvt_f64_f32_rows(group)
+        assert rows and set(rows) <= set(CVT_F64_F32_GROUPS[group][0]), group
+        for x in rows:
+            source = translate_int(cvt_f64_f32_program(group, x))
+            words = cvt_f64_f32_group_ref(group, x)
+            # Both result words are constants of the right value; no double and no runtime conversion.
+            assert re.search(rf"float alu\d+l = asfloat\({words[0]}u\);\s+precise float alu\d+h = asfloat\({words[1]}u\);",
+                             source), (group, hex(x), words)
+            assert "double" not in source and "firstbithigh" not in source.split("uint4 main")[1], (group, hex(x))
+            exported = cvt_f64_f32_exported(words, cvt_f64_f32_mask(words))
+            assert all(binary32_normal_or_zero(word) for word in exported), (group, hex(x), [hex(w) for w in exported])
+            assert not set(CVT_F64_F32_SENTINELS) & set(exported[1:3]), (group, hex(x))
+        translate_int(cvt_f64_f32_binary_program(group))
+    assert {"v_cvt_f64_f32", "v_cvt_f64_f32_e32", "v_cvt_f64_f32_e64"} <= ACCEPTED
+    # Reference sanity: independent, hand-computed words (exponent rebased 127 -> 1023, fraction at the top).
+    assert cvt_f64_f32_ref(0x3F800000) == (0, 0x3FF00000) and cvt_f64_f32_ref(0xBF800000) == (0, 0xBFF00000)
+    assert cvt_f64_f32_ref(0) == (0, 0) and cvt_f64_f32_ref(0x80000000) == (0, 0x80000000)
+    assert cvt_f64_f32_ref(0x7F800000) == (0, 0x7FF00000) and cvt_f64_f32_ref(0xFF800000) == (0, 0xFFF00000)
+    assert cvt_f64_f32_ref(0x3F800001) == (0x20000000, 0x3FF00000)
+    assert cvt_f64_f32_ref(0x00800000) == (0, 0x38100000) and cvt_f64_f32_ref(0x80800000) == (0, 0xB8100000)
+    assert cvt_f64_f32_ref(0x7F7FFFFF) == (0xE0000000, 0x47EFFFFF)
+    # The modifier order is observable: abs first, then neg. -|-0| is -0 where neg first would give +0, and the other
+    # way round for +0, so a swapped order is a different pair of words on both signed zeros.
+    assert cvt_f64_f32_ref(0x80000000, True, True) == (0, 0x80000000) != cvt_f64_f32_ref(0x80000000, True, True, False)
+    assert cvt_f64_f32_ref(0, True, True) == (0, 0x80000000) != cvt_f64_f32_ref(0, True, True, False)
+
+    def program(*lines):
+        return uncompressed_export([*MAD64_PREFIX, *lines])
+
+    for good in ("v_cvt_f64_f32 v[12:13], 1.0", "v_cvt_f64_f32_e32 v[12:13], 0", "v_cvt_f64_f32 v[12:13], -0.5",
+                 "v_cvt_f64_f32 v[12:13], 0.15915494", "v_cvt_f64_f32 v[12:13], 4.0",
+                 "v_cvt_f64_f32 v[12:13], 0x3f800001", "v_cvt_f64_f32 v[254:255], 0x80000000",
+                 "v_cvt_f64_f32 v[0:1], 0x7f800000", "v_cvt_f64_f32_e64 v[12:13], -|0x80000000|",
+                 "v_cvt_f64_f32_e64 v[12:13], neg(0x3f800001)"):
+        translate_int(program(good))
+    translate_int(program("s_mov_b32 s60, 0x3f800001", "v_cvt_f64_f32 v[12:13], s60"))
+    translate_int(program("v_mov_b32_e32 v19, 0x3f800001", "v_cvt_f64_f32_e64 v[12:13], -|v19|"))
+    # A copy chain of a known constant is still static; the source is read before the pair is written.
+    translate_int(program("v_mov_b32_e32 v19, 0x3f800001", "v_mov_b32_e32 v20, v19", "v_cvt_f64_f32 v[19:20], v20"))
+    # A word of the pair is an ordinary numeric register to a later float reader and to the f64 comparisons.
+    translate_int(program("v_cvt_f64_f32 v[12:13], 1.0", "v_add_f32_e32 v14, v12, v13"))
+    translate_f64(program("v_cvt_f64_f32 v[12:13], 1.0", "v_cmp_lt_f64_e64 s52, v[12:13], v[12:13]"))
+    # Refusals with a named reason: a subnormal (the f32 denorm mode has no declared profile), a NaN (#312) and a
+    # register that is not statically known.
+    for literal in ("0x00000001", "0x807fffff", "0x007fffff", "0x80000001"):
+        expect_value_error(translate_int, program(f"v_cvt_f64_f32 v[12:13], {literal}"), "is a subnormal")
+        expect_value_error(translate_int, program(f"v_mov_b32_e32 v19, {literal}", "v_cvt_f64_f32 v[12:13], v19"),
+                           "is a subnormal")
+        expect_value_error(translate_int, program(f"v_cvt_f64_f32_e64 v[12:13], -|{literal}|"), "is a subnormal")
+    for literal in ("0x7fc00000", "0x7f800001", "0xffc00000", "0xffffffff"):
+        expect_value_error(translate_int, program(f"v_cvt_f64_f32 v[12:13], {literal}"), "is a NaN")
+        expect_value_error(translate_int, program(f"s_mov_b32 s60, {literal}", "v_cvt_f64_f32 v[12:13], s60"), "is a NaN")
+        expect_value_error(translate_int, program(f"v_cvt_f64_f32_e64 v[12:13], |{literal}|"), "is a NaN")
+    for unproven in ("v_cvt_f64_f32 v[12:13], v12",                          # the interpolated sample x
+                     "v_cvt_f64_f32 v[12:13], v18",                          # a copy of a constant-buffer word
+                     "v_cvt_f64_f32 v[12:13], s44",                          # a loaded SGPR
+                     "v_cvt_f64_f32_e64 v[12:13], -v18", "v_cvt_f64_f32_e64 v[12:13], |v12|",
+                     "v_cvt_f64_f32_e64 v[12:13], -|s44|"):
+        expect_value_error(translate_int, program(unproven), "Unproven runtime input")
+    # An unproven register stays unproven after the conversion of another value; a literal after it does not help.
+    expect_value_error(translate_int, program("v_cvt_f64_f32 v[12:13], 1.0", "v_cvt_f64_f32 v[14:15], v12"),
+                       "Unproven runtime input")
+    # Integer inline constants other than 0 are subnormal or NaN bit patterns, and other decimals are no inline
+    # constants: all refused.
+    for bad_inline in ("1", "64", "-1", "-16", "3.0", "0.25", "1e9", "-0", "0x1"):
+        must_reject(translate_int, program(f"v_cvt_f64_f32 v[12:13], {bad_inline}"))
+    # Only the unmodified VOP1 spellings and the printed VOP3 modifier spellings are lowered.
+    for bad in ("v_cvt_f64_f32_e64 v[12:13], 0x3f800001", "v_cvt_f64_f32_e64 v[12:13], 1.0",
+                "v_cvt_f64_f32_e64 v[12:13], v18", "v_cvt_f64_f32_e64 v[12:13], -0x3f800001",
+                "v_cvt_f64_f32_e64 v[12:13], neg(v18)", "v_cvt_f64_f32_e64 v[12:13], abs(v18)",
+                "v_cvt_f64_f32_e64 v[12:13], |v18", "v_cvt_f64_f32_e64 v[12:13], v18|",
+                "v_cvt_f64_f32_e64 v[12:13], -|v18", "v_cvt_f64_f32_e64 v[12:13], ||v18||",
+                "v_cvt_f64_f32_e64 v[12:13], |-v18|", "v_cvt_f64_f32_e64 v[12:13], --v18",
+                "v_cvt_f64_f32_e64 v[12:13], -1.0", "v_cvt_f64_f32_e64 v[12:13], neg(1.0)",
+                "v_cvt_f64_f32_e64 v[12:13], neg(neg(0x3f800001))",
+                "v_cvt_f64_f32 v[12:13], -v18", "v_cvt_f64_f32 v[12:13], |v18|",
+                "v_cvt_f64_f32_e32 v[12:13], -0x3f800001", "v_cvt_f64_f32 v[12:13], abs(0x3f800001)",
+                "v_cvt_f64_f32_e64 v[12:13], v18 clamp", "v_cvt_f64_f32_e64 v[12:13], -v18 clamp",
+                "v_cvt_f64_f32 v[12:13], v18 clamp", "v_cvt_f64_f32_e64 v[12:13], v18 mul:2",
+                "v_cvt_f64_f32_e64 v[12:13], -v18 mul:2", "v_cvt_f64_f32_e64 v[12:13], v18 div:2",
+                "v_cvt_f64_f32 v[12:13], 0x3f800001 clamp", "v_cvt_f64_f32_e64 v[12:13], -0x3f800001 clamp",
+                "v_cvt_f64_f32_dpp v[12:13], v18 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                "v_cvt_f64_f32 v[12:13], v18 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                "v_cvt_f64_f32_sdwa v[12:13], v18 dst_sel:DWORD src0_sel:WORD_1",
+                "v_cvt_f64_f32 v[12:13], v18 src0_sel:WORD_1",
+                "v_cvt_f64_f32 v12, 1.0", "v_cvt_f64_f32 v[12:12], 1.0", "v_cvt_f64_f32 v[12:14], 1.0",
+                "v_cvt_f64_f32 v[13:12], 1.0", "v_cvt_f64_f32 v[255:256], 1.0", "v_cvt_f64_f32 v[256:257], 1.0",
+                "v_cvt_f64_f32 s[12:13], 1.0", "v_cvt_f64_f32 v[012:13], 1.0", "v_cvt_f64_f32 v[12:13]",
+                "v_cvt_f64_f32 v[12:13], 1.0, 1.0", "v_cvt_f64_f32 v[12:13], v[18:19]",
+                "v_cvt_f64_f32 v[12:13], s[44:45]", "v_cvt_f64_f32 v[12:13], vcc_lo",
+                "v_cvt_f64_f32 v[12:13], v99", "v_cvt_f64_f32 v[12:13], s60", "v_cvt_f64_f32 v[12:13], s106"):
+        must_reject(translate_int, program(bad))
+    # Arithmetic on the pair and the conversions back are refused, and so is the conversion in a masked region.
+    for consumer in ("v_add_f64 v[14:15], v[12:13], v[12:13]", "v_mul_f64 v[14:15], v[12:13], v[12:13]",
+                     "v_cvt_f32_f64_e32 v14, v[12:13]", "v_cvt_i32_f64_e32 v14, v[12:13]",
+                     "v_cvt_u32_f64_e32 v14, v[12:13]", "v_mov_b32_e32 v14, v[12:13]"):
+        must_reject(translate_int, program("v_cvt_f64_f32 v[12:13], 1.0", consumer))
+    must_reject(translate_int, uncompressed_export([
+        *MAD64_PREFIX, "v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc",
+        "v_cvt_f64_f32 v[12:13], 1.0", MASKED_OR_RESTORE]))
 
 
 def check_carry_in_lowering():
@@ -13631,6 +13845,7 @@ def check_controls(directory):
     check_carry_in_lowering()
     check_mad64_lowering()
     check_cvt_f64_int_lowering()
+    check_cvt_f64_f32_lowering()
     check_sdwa_integer_lowering()
     check_pack_int16_lowering()
     check_sat_pack_u8_lowering()
@@ -15221,6 +15436,63 @@ def check_f16_literal_fold(directory, assembler, objcopy, library):
         "v_add_f16_e32 v5, 0, v3", "v_add_f16_e32 v6, 1.0, v3"]
 
 
+def check_cvt_f64_f32_binary(directory, assembler, objcopy, library):
+    """LLVM 15 gfx1013 encodings of v_cvt_f64_f32: the VOP1 word, the VOP3 source-modifier bits (abs in bit 8 of the
+    first dword's high half, neg in bit 29 of the second dword, so -|x| sets both and the order is abs then neg), the
+    spellings LLVM prints (the plain form as _e32, the modifier forms as _e64, a literal negation as neg(0xL)), and the
+    forms the assembler cannot encode (DPP, SDWA)."""
+    source, obj, binary = directory / "cvt_f64_f32.s", directory / "cvt_f64_f32.o", directory / "cvt_f64_f32.bin"
+
+    def assemble(line):
+        source.write_text(line + chr(10) + "s_endpgm" + chr(10), encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", source, "-o", obj], check=True,
+                       capture_output=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+        code = binary.read_bytes()
+        return code[:-4], disassemble(code, library)[0]
+
+    for line, encoded, text in (
+            ("v_cvt_f64_f32 v[13:14], v1", "01211a7e", "v_cvt_f64_f32_e32 v[13:14], v1"),
+            ("v_cvt_f64_f32_e32 v[13:14], s44", "2c201a7e", "v_cvt_f64_f32_e32 v[13:14], s44"),
+            ("v_cvt_f64_f32 v[13:14], 1.0", "f2201a7e", "v_cvt_f64_f32_e32 v[13:14], 1.0"),
+            ("v_cvt_f64_f32 v[13:14], 0x3f800001", "ff201a7e0100803f", "v_cvt_f64_f32_e32 v[13:14], 0x3f800001"),
+            ("v_cvt_f64_f32 v[13:14], 0x00000001", "81201a7e", "v_cvt_f64_f32_e32 v[13:14], 1"),  # folds to an integer
+            ("v_cvt_f64_f32 v[13:14], 0xffffffff", "c1201a7e", "v_cvt_f64_f32_e32 v[13:14], -1"),
+            ("v_cvt_f64_f32 v[13:14], -v1", "0d0090d501010020", "v_cvt_f64_f32_e64 v[13:14], -v1"),
+            ("v_cvt_f64_f32 v[13:14], |v1|", "0d0190d501010000", "v_cvt_f64_f32_e64 v[13:14], |v1|"),
+            ("v_cvt_f64_f32 v[13:14], -|v1|", "0d0190d501010020", "v_cvt_f64_f32_e64 v[13:14], -|v1|"),
+            ("v_cvt_f64_f32 v[13:14], -s44", "0d0090d52c000020", "v_cvt_f64_f32_e64 v[13:14], -s44"),
+            ("v_cvt_f64_f32_e64 v[13:14], neg(0x3f800001)", "0d0090d5ff0000200100803f",
+             "v_cvt_f64_f32_e64 v[13:14], neg(0x3f800001)"),
+            ("v_cvt_f64_f32_e64 v[13:14], |0x3f800001|", "0d0190d5ff0000000100803f",
+             "v_cvt_f64_f32_e64 v[13:14], |0x3f800001|"),
+            ("v_cvt_f64_f32_e64 v[13:14], -|0x3f800001|", "0d0190d5ff0000200100803f",
+             "v_cvt_f64_f32_e64 v[13:14], -|0x3f800001|"),
+            # The assembler folds -0x... as an integer negation of the literal, with no modifier: the lowering refuses it.
+            ("v_cvt_f64_f32_e64 v[13:14], -0x3f800001", "0d0090d5ff000000ffff7fc0",
+             "v_cvt_f64_f32_e64 v[13:14], 0xc07fffff"),
+            ("v_cvt_f64_f32_e64 v[13:14], v1", "0d0090d501010000", "v_cvt_f64_f32_e64 v[13:14], v1"),
+            ("v_cvt_f64_f32 v[13:14], v1 clamp", "0d8090d501010000", "v_cvt_f64_f32_e64 v[13:14], v1 clamp"),
+            ("v_cvt_f64_f32 v[13:14], -v1 clamp", "0d8090d501010020", "v_cvt_f64_f32_e64 v[13:14], -v1 clamp"),
+            ("v_cvt_f64_f32_e64 v[13:14], v1 mul:2", "0d0090d501010008", "v_cvt_f64_f32_e64 v[13:14], v1 mul:2")):
+        code, decoded = assemble(line)
+        assert (code.hex(), decoded) == (encoded, text), (line, code.hex(), decoded)
+    # DPP and SDWA do not assemble for this opcode, so neither can reach the translator from LLVM 15 output.
+    for line in ("v_cvt_f64_f32 v[13:14], v1 row_shl:1", "v_cvt_f64_f32_sdwa v[13:14], v1 src0_sel:WORD_1"):
+        try:
+            assemble(line)
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            raise AssertionError(f"LLVM 15 assembled {line}")
+    # The decoded spellings that are not lowered are refused: an unmodified _e64, the folded literal negation, clamp, omod.
+    for text in ("v_cvt_f64_f32_e64 v[13:14], v1", "v_cvt_f64_f32_e64 v[13:14], 0xc07fffff",
+                 "v_cvt_f64_f32_e64 v[13:14], v1 clamp", "v_cvt_f64_f32_e64 v[13:14], -v1 clamp",
+                 "v_cvt_f64_f32_e64 v[13:14], v1 mul:2", "v_cvt_f64_f32_e32 v[13:14], 1",
+                 "v_cvt_f64_f32_e32 v[13:14], -1"):
+        must_reject(translate_int, uncompressed_export([*MAD64_PREFIX, text.replace("[13:14]", "[12:13]")]))
+
+
 def check_f16_round_binary(directory, assembler, objcopy, library):
     """LLVM 15 gfx1013 encodings of the binary16 VOP1 rounding forms, the integer folding of a 16-bit literal, and the
     clamp, omod and modifier spellings that assemble on e64 and that the lowering must refuse."""
@@ -15551,6 +15823,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(carry_in_group(op)), translate_int) for op in CARRY_IN_OPS)
     fixtures.extend((uncompressed_export(mad64_group(group)), translate_int) for group in MAD64_BODIES)
     fixtures.extend((cvt_f64_int_group(group), translate_int) for group in CVT_F64_INT_BODIES)
+    fixtures.extend((cvt_f64_f32_binary_program(group), translate_int) for group in CVT_F64_F32_GROUPS)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
     fixtures.append((sat_pack_u8_program(), translate_int))
@@ -15620,6 +15893,7 @@ def check_binary(directory, assembler, objcopy, library):
             check_container_selector(directory, native, library)
     check_wave32_mask_binary(directory, assembler, objcopy, library)
     check_exp_en_decoding(directory, assembler, objcopy, library)
+    check_cvt_f64_f32_binary(directory, assembler, objcopy, library)
     check_cli_partial_export(directory, assembler, objcopy, library)
 
 
@@ -16464,6 +16738,74 @@ def check_cvt_f64_int_draws(directory, compiler, renderer, backend):
             if error.returncode == 77:
                 return 77
             raise
+    return 0
+
+
+def check_cvt_f64_f32_draws(directory, compiler, renderer, backend):
+    """Draw v_cvt_f64_f32 through the integer readback target, bit for bit.
+
+    The source is static, so each row of each group of cvt_f64_f32_program() is its own program, compiled once and drawn
+    in one renderer batch: the right words of Python's own double, then negative controls that must report a mismatch:
+    the two words swapped, the sign of a zero or an operand lost, an infinity exported as a NaN, the exponent one too
+    high, one fraction bit flipped, a sentinel replaced by a pair word (so a write next to the pair would show) and, for
+    the -|x| groups, the words of the swapped modifier order. The shader uses no double, so the draws need no
+    capability. On a desktop GPU the draws establish that the translated shader computes the stated operation, not
+    what the console does. The words are exported as lo ^ M and hi ^ M because the readback needs normal binary32
+    words or zero; the controls are built from the same masked words.
+    """
+    source = directory / "cvt_f64_f32.hlsl"
+    shader = directory / "cvt_f64_f32.cso"
+    drawn = {"swapped words": 0, "sign lost": 0, "infinity as NaN": 0, "exponent": 0, "fraction": 0, "sentinel": 0,
+             "modifier order": 0}
+
+    def add_case(cases, mask, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, 0, mask, *CVT_F64_F32_SENTINELS)
+        case = directory / f"cvt_f64_f32-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64)
+        cases.append((case, status))
+
+    for group in CVT_F64_F32_GROUPS:
+        for x in cvt_f64_f32_rows(group):
+            source.write_text(translate_int(cvt_f64_f32_program(group, x)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            words = cvt_f64_f32_group_ref(group, x)
+            mask = cvt_f64_f32_mask(words)
+            first, low, high, last = right = cvt_f64_f32_exported(words, mask)
+            cases = []
+            add_case(cases, mask, right, "pass")
+            wrong = []
+            if words[0] != words[1]:
+                wrong.append(("swapped words", (first, high, low, last)))
+            if words[1] & 0x80000000:
+                wrong.append(("sign lost", (first, low, high ^ 0x80000000, last)))
+            if words[1] & 0x7FFFFFFF == 0x7FF00000:
+                wrong.append(("infinity as NaN", (first, low, high ^ 0x00080000, last)))
+            if words[1] & 0x7FFFFFFF:
+                wrong.append(("exponent", (first, low, ((high ^ mask) + 0x00100000 & 0xFFFFFFFF) ^ mask, last)))
+                wrong.append(("fraction", (first, low ^ 1, high, last)))
+            wrong.append(("sentinel", (low, low, high, last)))
+            wrong.append(("sentinel", (first, low, high, high)))
+            if group.endswith("negabs"):
+                swapped = cvt_f64_f32_group_ref(group, x, abs_first=False)
+                assert swapped != words, (group, hex(x))
+                wrong.append(("modifier order", cvt_f64_f32_exported(swapped, mask)))
+            for kind, bad in wrong:
+                assert bad != right, (group, hex(x), kind)
+                add_case(cases, mask, bad, "mismatch")
+                drawn[kind] += 1
+            try:
+                run_pixel_batch(renderer, backend, shader, cases)
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 77:
+                    return 77
+                raise
+    # The controls are not vacuous: every kind was drawn, the modifier order on both signed zeros and the rows the
+    # task names (largest and smallest normal, both infinities, a fraction ending in the lowest bit) are in the plain draw.
+    assert all(drawn.values()), drawn
+    assert {0, 0x80000000} <= set(cvt_f64_f32_rows("vnegabs")) and 0x80000000 in cvt_f64_f32_rows("lnegabs")
+    assert {0, 0x80000000, 0x3F800000, 0xBF800000, 0x7F7FFFFF, 0x00800000, 0x80800000, 0x7F800000, 0xFF800000,
+            0x3F800001} <= set(cvt_f64_f32_rows("lit"))
     return 0
 
 
@@ -20664,7 +21006,7 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-cvt-f64-int", "draw-pack-int16", "draw-pack-b32",
+                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-cvt-f64-int", "draw-cvt-f64-f32", "draw-pack-int16", "draw-pack-b32",
                     "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
@@ -20685,6 +21027,7 @@ def main():
                         "draw-carry-in": check_carry_in_draws,
                         "draw-mad64": check_mad64_draws,
                         "draw-cvt-f64-int": check_cvt_f64_int_draws,
+                        "draw-cvt-f64-f32": check_cvt_f64_f32_draws,
                         "draw-sdwa-integer": check_sdwa_integer_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-brev": check_brev_draw,
