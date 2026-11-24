@@ -4348,28 +4348,29 @@ another compare must change the line. On a Linux host only the LLVM part and the
 reference pictures were run; no WARP or GPU readback of these four forms exists yet.
 
 The program may also apply the one-source binary32 forms `v_rcp_f32_e32`,
-`v_rsq_f32_e32`, `v_sqrt_f32_e32`, `v_floor_f32_e32`, `v_trunc_f32_e32` and
-`v_rndne_f32_e32` (VGPR destination; constant, scalar word or VGPR source). They
-lower to `1.0f / x`, `rsqrt`, `sqrt`, `floor`, `trunc` and `round` (half to
-even). Source modifiers, `clamp`, output modifiers and a second source reject
-translation. The precision of reciprocal, reciprocal square root
-and square root is not claimed, since D3D allows each an error, and a zero or
-negative operand of the last two, NaN, infinity, denormals and signed zero are not
-exercised. `depth_mask_unary_draw_*` (`unary` mode) therefore feeds the three
-approximate forms an input whose exact result is an integer (1/8, 1/4 and 9), through
+`v_rsq_f32_e32`, `v_sqrt_f32_e32`, `v_floor_f32_e32`, `v_trunc_f32_e32`,
+`v_rndne_f32_e32`, `v_ceil_f32_e32`, `v_exp_f32_e32` and `v_log_f32_e32` (VGPR
+destination; constant, scalar word or VGPR source). They lower to `1.0f / x`,
+`rsqrt`, `sqrt`, `floor`, `trunc`, `round` (half to even), `ceil`, `exp2` and `log2`. Source modifiers, `clamp`, output modifiers and a second source reject
+translation. The precision of reciprocal, reciprocal square root,
+square root, `exp2` and `log2` is not claimed, since D3D allows each an error, and a zero or
+negative operand of those, `log2` of zero or a negative value, an `exp2` overflow, NaN, infinity,
+denormals, denormal flushing and signed zero are not exercised. `depth_mask_unary_draw_*` (`unary` mode) therefore feeds the five
+approximate forms an input whose exact result is an integer (1/8, 1/4, 9, 5 for `exp2`
+and 32 for `log2`), through
 a zero the compiler cannot prove (`v7 - v7`) so the opcode really runs on WARP, rounds
-the result (add 0.5, floor) and scales v7 by it. Floor, truncation and round-to-even
+the result (add 0.5, floor) and scales v7 by it. Floor, ceiling, truncation and round-to-even
 are compared exactly on `4 * (v7 - 0.5)`, an odd multiple of 1/16 that is never a tie
 or an integer, with thresholds where each sibling gives different pixels. The CPU
 reference is written with Python arithmetic, and every other form's reference must
 fail on exactly the pixels where the two differ. LLVM CI also assembles each form,
 translates it through the CLI, pins the lowered line, and changing that one
-instruction word to each of the other five forms must change the line. On a Linux
+instruction word to each of the other eight forms must change the line. On a Linux
 host only the LLVM part (LLVM 19; LLVM 15 was not run) and the reference pictures
-were run; no WARP readback of these six forms exists yet.
+were run; no WARP readback of the ceil, exp and log forms exists yet.
 
 Every form above also has a plain VOP3 spelling that translates: `v_add_f32_e64`
-and the other five binary32 operations, the six one-source forms, `v_fract_f32_e64`,
+and the other five binary32 operations, the nine one-source forms, `v_fract_f32_e64`,
 `v_mul_legacy_f32_e64`, `v_fmac_f32_e64` and the four `v_cmpx_*_f32_e64`
 compares (the destination of a VOP3 `v_cmpx` is the implicit EXEC; LLVM 19 prints
 `v_cmpx_lt_f32_e64 s31, v7`). The translator rewrites the spelling to its e32 form
