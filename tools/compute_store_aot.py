@@ -24,6 +24,9 @@ ALU = {
     "v_and_b32_e32": f"({INTEGER['and_b32'][1]})",
     "v_lshrrev_b32_e32": f"({INTEGER['lshrrev_b32'][1]})",
     "v_lshlrev_b32_e32": f"({INTEGER['lshlrev_b32'][1]})",
+    # v_max3_u32 and v_min3_u32 are the unsigned maximum and minimum of the three sources, max(max(a, b), c).
+    "v_max3_u32": "max(max({0}, {1}), {2})",
+    "v_min3_u32": "min(min({0}, {1}), {2})",
     "v_ashrrev_i32_e32": INTEGER["ashrrev_i32"][1],
     "v_sub_nc_u32_e32": "({0} - {1})",
     # v_med3_u32 and v_med3_i32 (VOP3) are the median of src0, src1 and src2, compared unsigned or signed.
@@ -31,6 +34,7 @@ ALU = {
     "v_med3_i32": "asuint(max(min(asint({0}), asint({1})), min(max(asint({0}), asint({1})), asint({2}))))",
     "v_subrev_nc_u32_e32": "({1} - {0})",
     "v_min_u32_e32": "min({0}, {1})",
+    "v_xor3_b32": "({0} ^ {1} ^ {2})",  # VOP3 src0 ^ src1 ^ src2 (RDNA2 ISA: D.u = S0.u ^ S1.u ^ S2.u)
     "v_max_u32_e32": "max({0}, {1})",
     "v_add_nc_u32_e32": "({0} + {1})",
     "v_or_b32_e32": f"({INTEGER['or_b32'][1]})",
@@ -100,10 +104,10 @@ MUBUF_ATOMIC_METHODS = {
     "add": "Add", "sub": "Add", "and": "And", "or": "Or", "xor": "Xor",
     "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
     "swap": "Exchange", "cmpswap": "CompareExchange",
-    "inc": "CompareExchange", "dec": "CompareExchange",
+    "inc": "CompareExchange", "dec": "CompareExchange", "csub": "CompareExchange",
 }
 
-IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap"
+IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap|inc|dec"
 IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int"}
 
 
@@ -1087,7 +1091,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             vector[dst] = ("alu", expression)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
-              or (m := re.fullmatch(rf"(v_mad_u32_u24|v_med3_u32|v_med3_i32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32|v_max3_u32|v_min3_u32|v_med3_u32|v_med3_i32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
               and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
             # VOP2 takes a VGPR as src1. A v_mad_u32_u24 with an address operand is a row pitch below.
             op, dst = m[1], int(m[2])
@@ -1264,7 +1268,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unverified image atomic data")
             destination = f"outputData[uint2({', '.join(map(hlsl_word, coords))})]"
             value = hlsl_word(sources[0])
-            if compare_swap:
+            if op in ("inc", "dec"):
+                condition = "expected >= limit" if op == "inc" else "expected == 0u || expected > limit"
+                wrap, step = ("0u", "+") if op == "inc" else ("limit", "-")
+                # A failed CAS supplies the observed value for the next attempt.
+                stores.extend((f"    uint limit = {value};", "    uint observed = 0u;", "    uint expected;",
+                               "    [allow_uav_condition] do {", "        expected = observed;",
+                               f"        uint next = ({condition}) ? {wrap} : expected {step} 1u;",
+                               f"        InterlockedCompareExchange({destination}, expected, next, observed);",
+                               "    } while (observed != expected);"))
+            elif compare_swap:
                 # RDNA stores VDATA on a match against VDATA+1; HLSL takes the comparison first.
                 stores.append(f"    InterlockedCompareStore({destination}, {hlsl_word(sources[1])}, {value});")
             else:
@@ -1359,12 +1372,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 vector.pop(reg, None)
                 loading[reg] = ("alu", f"{name}.{component}")
         elif m := re.fullmatch(rf"buffer_atomic_({'|'.join(MUBUF_ATOMIC_METHODS)})(_x2)? "
-                               r"(v\d+|v\[\d+:\d+\]), off, s\[(\d+):(\d+)\], 0(?: offset:(\d+))?", line):
+                               r"(v\d+|v\[\d+:\d+\]), off, s\[(\d+):(\d+)\], 0(?: offset:(\d+))?( glc)?", line):
             if cpu != "gfx1030" or stride is not None or output_format is not None or image_output:
                 raise ValueError("Unsupported atomic reduction target or binding")
             if stores:
                 raise ValueError("An atomic reduction must be the only UAV operation")
             op, wide = m[1], bool(m[2])
+            if op == "csub" and (wide or not m[7]):
+                raise ValueError("Conditional subtract requires 32-bit glc")
+            if op != "csub" and m[7]:
+                raise ValueError(f"Unsupported compute instruction: {line}")
             base, high = int(m[4]), int(m[5])
             offset = int(m[6] or 0)
             if (high != base + 3 or base % 4 or pending.intersection(range(base, high + 1))
@@ -1395,12 +1412,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if op == "cmpswap":
                 # The ISA places replacement before compare, unlike the HLSL argument order.
                 word = f"{operands[1]}, {word}"
-            if op in ("inc", "dec"):
+            if op in ("inc", "dec", "csub"):
                 one, zero = ("1ull", "0ull") if wide else ("1u", "0u")
                 if op == "inc":
                     desired = f"expected >= limit ? {zero} : expected + {one}"
-                else:
+                elif op == "dec":
                     desired = f"expected == {zero} || expected > limit ? limit : expected - {one}"
+                else:
+                    desired = "expected < limit ? 0u : expected - limit"
+                    # GLC overwrites the data VGPR. Track its wait and reject consumers of the
+                    # old value until the profile can emit a value-producing atomic.
+                    vector.pop(src, None)
+                    loading[src] = None
                 # Seed the first compare with zero. A failed CAS returns the word for the next try.
                 stores.extend((f"    const {kind} limit = {word};", f"    {kind} observed = {zero};",
                                f"    {kind} expected;", "    [allow_uav_condition] do {",

@@ -337,7 +337,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork",
     "s_getreg_b32", "s_setreg_b32", "s_setreg_imm32_b32", "s_version",
     # VOP1
-    "v_nop", "v_mov_b32", "v_swap_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
+    "v_nop", "v_mov_b32", "v_swap_b32", "v_swaprel_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",
     "v_sin_f32", "v_cos_f32", "v_bfrev_b32", "v_ffbh_u32", "v_ffbl_b32", "v_ffbh_i32", "v_rcp_iflag_f32",
     "v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_i32_f32", "v_cvt_u32_f32",
@@ -488,15 +488,33 @@ def classify_isa_category(opcode: str) -> str:
     return "Other / Unknown"
 
 
+_STAGE_TAGS = (
+    ("pixel", "pixel", "ps"),
+    ("compute", "compute", "cs"),
+    ("vertex", "vertex", "vs"),
+)
+_STAGE_DELIMITERS = re.compile(r"[_.\-]")
+
+
 def detect_shader_stage(name_or_path: str) -> str:
-    """Classify shader stage from path or filename."""
-    lower = name_or_path.lower().replace("\\", "/")
-    if "/pixel/" in lower or "/ps/" in lower or "ps_" in lower or lower.startswith("ps_") or "_ps" in lower:
-        return "pixel"
-    if "/compute/" in lower or "/cs/" in lower or "cs_" in lower or lower.startswith("cs_") or "_cs" in lower:
-        return "compute"
-    if "/vertex/" in lower or "/vs/" in lower or "vs_" in lower or lower.startswith("vs_") or "_vs" in lower:
-        return "vertex"
+    """Classify shader stage from path or filename.
+
+    A stage tag (`ps`, `cs`, `vs`) matches only as a whole token of a path
+    component, where tokens are delimited by `_`, `.` or `-` (`ps_draw.bin`,
+    `blur_cs.s`, `a/vs/x.s`), so a tag inside another word (`loops_cs`,
+    `bumps_vs`, `ps5`) does not match. The long names (`pixel`, `compute`,
+    `vertex`) match only as a whole directory component. Matching is case
+    insensitive. If one path carries tags of several stages, the first stage
+    in the order pixel, compute, vertex wins.
+    """
+    parts = [p for p in name_or_path.lower().replace("\\", "/").split("/") if p]
+    directories = set(parts[:-1])
+    tokens = set()
+    for part in parts:
+        tokens.update(t for t in _STAGE_DELIMITERS.split(part) if t)
+    for stage, long_name, short_name in _STAGE_TAGS:
+        if long_name in directories or short_name in tokens:
+            return stage
     return "other"
 
 
