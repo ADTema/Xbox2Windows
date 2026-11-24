@@ -178,15 +178,20 @@ def labelled(decoded):
     return [item for pc, line in lines for item in ([f".L{pc}:"] if pc in targets else []) + [line]]
 
 
+MUBUF_SOURCE_FORMAT = "BUF_FMT_32_32_32_32_UINT"
+MUBUF_TEXEL_BYTES = 16
+
+
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
-          source_stride=None, image_descriptor=None, image_format=None,
+          source_stride=None, source_format=None, image_descriptor=None, image_format=None,
           cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
     group dimension is larger than one. Descriptors name u0 and optionally b0 and a read-only raw
-    source t0; source_stride is the t0 byte stride that indexed reads use. image_descriptor is the
+    source t0; source_stride is the t0 byte stride that indexed reads use. source_format declares
+    the MUBUF source descriptor format with identity channel selectors. image_descriptor is the
     table byte offset of the 8-dword image descriptor; image_format is the caller's statement of
     the image format inside it, and the texel is bound to t0.
     """
@@ -210,6 +215,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     if source_stride is not None and (source_descriptor is None or not 4 <= source_stride <= 0x3fff
                                       or source_stride % 4):
         raise ValueError("Indexed reads require a source binding and aligned stride")
+    if source_format is not None and (source_format != MUBUF_SOURCE_FORMAT or cpu != "gfx1030"
+                                      or source_stride is None or source_stride % MUBUF_TEXEL_BYTES):
+        raise ValueError("Unsupported formatted source binding")
     if image_descriptor is not None or image_format is not None:
         # The 8-dword image descriptor occupies two 16-byte slots, both bound to t0.
         if (image_format not in IMAGE_FORMATS or image_descriptor is None or source_descriptor is not None
@@ -1052,7 +1060,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
         elif m := re.fullmatch(r"(?:buffer_load_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>[us](?:byte|short))"
                                r"|(?P<d16_kind>[us]byte|short)_d16(?P<hi>_hi)?)"
-                               r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
+                               r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))"
+                               r"|buffer_load_format_(?P<resource_channels>x|xy|xyz|xyzw)) "
                                r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?"
@@ -1060,7 +1069,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             channels = m["channels"]
             packed = channels is not None and channels.startswith("d16_")
             raw_count = m["raw_count"]
-            components = len(channels.removeprefix("d16_")) if channels else int(raw_count or 1)
+            resource_channels = m["resource_channels"]
+            if channels:
+                components = len(channels.removeprefix("d16_"))
+            elif resource_channels:
+                components = len(resource_channels)
+            else:
+                components = int(raw_count or 1)
             count = (components + 1) // 2 if packed else components
             dst, *last = map(int, re.findall(r"\d+", m["dst"]))
             base, high = int(m["base"]), int(m["high"])
@@ -1075,6 +1090,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported vector buffer read target or address mode")
             if channels and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported typed buffer read target or address mode")
+            if resource_channels:
+                if cpu != "gfx1030" or not idxen or offen:
+                    raise ValueError("Unsupported formatted buffer read target or address mode")
+                if source_format is None:
+                    raise ValueError("Formatted buffer reads require a source format")
             # The three-component D16 form uses the four-component 16-bit format.
             format_components = 4 if packed and components == 3 else components
             if channels and m["format"] != f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT":
@@ -1093,7 +1113,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Reads from the stored UAV are not supported")
             if kinds != tuple(("srv", i) for i in range(4)):
                 raise ValueError("Unverified buffer read descriptor")
-            if offset % width or offset > 4095:
+            alignment = MUBUF_TEXEL_BYTES if resource_channels else width
+            if offset % alignment or offset > 4095:
                 raise ValueError("Unverified read offset")
             tag = vector.get(int(addr[1:])) if addr != "off" else None
             if addr == "off" and not idxen and not offen:
@@ -1105,7 +1126,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             elif (idxen and not offen and source_stride is not None and isinstance(tag, tuple)
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
-                if offset + width * count > source_stride:
+                # A formatted load selects a prefix of a complete four-component texel.
+                read_bytes = MUBUF_TEXEL_BYTES if resource_channels else width * count
+                if offset + read_bytes > source_stride:
                     raise ValueError("Read leaves its source element")
                 aligned = offset & ~3
                 addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {aligned + 4*i}u" for i in range(count)]
@@ -1345,6 +1368,8 @@ def main():
     parser.add_argument("--source-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset bound to stable read-only t0, with no overlap with u0")
     parser.add_argument("--source-stride", type=int, help="Indexed t0 byte stride")
+    parser.add_argument("--source-format", choices=(MUBUF_SOURCE_FORMAT,),
+                        help="Caller-declared MUBUF t0 descriptor format with identity channel selectors")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset of the 8-dword image descriptor bound to t0")
     parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS),
@@ -1362,8 +1387,8 @@ def main():
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
-                   source_stride=args.source_stride, image_descriptor=args.image_descriptor,
-                   image_format=args.image_format, cpu=args.cpu, lds_bytes=args.lds_bytes,
+                   source_stride=args.source_stride, source_format=args.source_format,
+                   image_descriptor=args.image_descriptor, image_format=args.image_format, cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
