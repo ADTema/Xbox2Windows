@@ -127,6 +127,7 @@ def check_fxc_discovery(failures):
         on_path = os.path.join(work, 'path')
         os.makedirs(on_path)
         open(os.path.join(on_path, 'fxc.exe'), 'w').close()
+        os.chmod(os.path.join(on_path, 'fxc.exe'), 0o755)  # a PATH search outside Windows needs the execute bit
         explicit = os.path.join(work, 'explicit.exe')
         open(explicit, 'w').close()
         for configured, path, want, label in ((None, '', newest, 'newest Windows Kits version'),
