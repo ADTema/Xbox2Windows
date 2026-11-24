@@ -51,11 +51,23 @@ class Shim:
         self.reserve_startup = bind(library, "XMemVirtualAlloc", [pointer, number, dword, number, dword], pointer)
         self.free = bind(kernel, "VirtualFree", [pointer, number, dword], C.c_int)
         self.query_raw = bind(kernel, "VirtualQuery", [pointer, C.POINTER(MemoryBasicInformation), number], number)
+        self.library, self.name = library, Path(path).name
         self.whole = self.reserve_startup(None, 16 << 30, STARTUP_RESERVE, 0x21, 4)
         assert self.whole, C.get_last_error()
 
     def close(self):
         self.free(self.whole, 0, WIN_RELEASE)
+
+    def unload(self):
+        """Frees the reservation and the module; the module must be gone afterwards."""
+        self.close()
+        kernel32 = C.WinDLL("kernel32", use_last_error=True)
+        free_library = bind(kernel32, "FreeLibrary", [C.c_void_p], C.c_int)
+        loaded = bind(kernel32, "GetModuleHandleW", [C.c_wchar_p], C.c_void_p)
+        handle = self.library._handle
+        del self.library
+        assert free_library(handle), C.get_last_error()
+        assert loaded(self.name) is None, "the module is still loaded after FreeLibrary"
 
     def pages(self, count):
         got, tokens = self.number(count), (self.number * count)()
@@ -265,7 +277,40 @@ def reader_while_toggling(shim, base, seconds, announce=None):
     return toggles, seen[0]
 
 
+def handled_exception():
+    """An access violation that has nothing to do with the shim, raised and handled the usual way."""
+    try:
+        C.string_at(1, 1)
+    except OSError:
+        return True
+    return False
+
+
+def unload_and_reload(path):
+    """Use the shim so that its fault handler is registered, unload it, take an unrelated handled
+    exception, load it again and use the handler, unload it again."""
+    shim = Shim(path)
+    base = shim.whole + PAGE
+    tokens = shim.pages(16)
+    assert shim.contiguous(base, 16, tokens) == base and shim.unmap([base + 5 * PAGE])
+    assert shim.scatter((shim.pointer * 1)(base + 5 * PAGE), 1, (shim.number * 1)(tokens[5]))
+    assert shim.contiguous(base, 16, None) == base and shim.release(16, tokens)
+    shim.unload()
+    print("child: unloaded", flush=True)
+    assert handled_exception(), "the access violation was not delivered to its handler"
+    print("child: handled exception delivered", flush=True)
+    shim = Shim(path)
+    toggles, reads = reader_while_toggling(shim, shim.whole + PAGE, 0.5)
+    assert toggles > 0 and reads > 0
+    shim.unload()
+    assert handled_exception(), "the access violation was not delivered after the second unload"
+    print("child: reloaded, used and unloaded again", flush=True)
+
+
 def child(path, mode):
+    if mode == "unload-reload":
+        unload_and_reload(path)
+        return 0
     shim = Shim(path)
     base = shim.whole + PAGE
     if mode == "reader-without-retry":
@@ -282,14 +327,19 @@ def child(path, mode):
     return 0
 
 
-def expect_access_violation(path, mode, marker, environment=()):
+def run_child(path, mode, environment=()):
     env = dict(os.environ)
     env.update(environment)
-    result = subprocess.run([sys.executable, "-B", __file__, "--child", mode, str(path)], capture_output=True, text=True,
-                            timeout=120, env=env)
+    return subprocess.run([sys.executable, "-B", __file__, "--child", mode, str(path)], capture_output=True, text=True,
+                          timeout=120, env=env)
+
+
+def expect_access_violation(path, mode, marker, environment=()):
+    result = run_child(path, mode, environment)
     code = result.returncode & 0xFFFFFFFF
     assert marker in result.stdout, f"{mode}: the child stopped before its step: {result.stdout!r} {result.stderr[-400:]!r}"
-    assert "survived" not in result.stdout and "returned" not in result.stdout, f"{mode}: no fault: {result.stdout!r}"
+    for finished in ("survived", "returned", "delivered"):
+        assert finished not in result.stdout, f"{mode}: no fault: {result.stdout!r}"
     assert code == ACCESS_VIOLATION, f"{mode}: exit code {code:#x}, expected an access violation: {result.stderr[-400:]!r}"
 
 
@@ -307,8 +357,21 @@ def main(path, total=6000):
     # Controls that must end in an access violation, each in a child process.
     expect_access_violation(path, "reader-without-retry", "child: reader starts", {"X2W_XMEM_NO_FAULT_RETRY": "1"})
     expect_access_violation(path, "read-forgotten", "child: reading a forgotten page")
+    # Unload and reload in a process of its own: the handler is removed with the module, an unrelated
+    # handled exception is delivered normally afterwards, and the handler works again after a reload.
+    result = run_child(path, "unload-reload")
+    assert result.returncode == 0 and "child: reloaded, used and unloaded again" in result.stdout, (
+        f"unload-reload: exit code {result.returncode & 0xFFFFFFFF:#x}: {result.stdout!r} {result.stderr[-600:]!r}")
+    # Control: with the removal skipped, the registration outlives the module and the same exception
+    # is dispatched into unloaded code.
+    # How that ends is not defined (the dispatcher calls an address that is no longer code), so this
+    # control requires only that the child got as far as unloading, never saw its exception
+    # delivered, and did not exit normally.
+    result = run_child(path, "unload-reload", {"X2W_XMEM_KEEP_FAULT_RETRY": "1"})
+    assert "child: unloaded" in result.stdout and "delivered" not in result.stdout and result.returncode != 0, (
+        f"stale-handler control: exit code {result.returncode & 0xFFFFFFFF:#x}: {result.stdout!r}")
     print(f"xmem_page_runs: PASS ({total} pages mapped in {mapped_in * 1000:.0f} ms, {holes} holes, VirtualQuery before and "
-          f"after a split, two views, 3 refused steps, {toggles} neighbour toggles under {reads} reads, 2 access-violation controls)")
+          f"after a split, two views, 3 refused steps, {toggles} neighbour toggles under {reads} reads, unload and reload with its stale-handler control, 2 access-violation controls)")
 
 
 if __name__ == "__main__":

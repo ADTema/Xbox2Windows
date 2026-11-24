@@ -205,8 +205,13 @@ void end_break()
 // page for this break. Everything else is passed on, so a fault that is not the transient one is
 // reported after at most one retry.
 thread_local bool mapping_thread = false;
+volatile LONG fault_retry_in_flight;  // callbacks currently inside retry_remapped_page
 LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
 {
+    struct InFlight {
+        InFlight() { InterlockedIncrement(&fault_retry_in_flight); }
+        ~InFlight() { InterlockedDecrement(&fault_retry_in_flight); }
+    } const in_flight;
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || mapping_thread)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -238,6 +243,48 @@ struct MappingThread {
     MappingThread() { mapping_thread = true; }
     ~MappingThread() { mapping_thread = false; }
 };
+
+// The handler's registration lasts from the first mapping call to the unloading of this module.
+// Windows keeps a vectored handler registered after FreeLibrary, so it is removed here, in a
+// static destructor that runs before `memory` goes away, and the removal waits for callbacks
+// that are still inside the handler: they use this module's code and state.
+//
+// X2W_XMEM_NO_FAULT_RETRY=1 leaves the handler out, and X2W_XMEM_KEEP_FAULT_RETRY=1 skips the
+// removal; tests/xmem_page_runs_check.py uses both as controls.
+struct FaultRetry {
+    SRWLOCK lock = SRWLOCK_INIT;
+    void* handle = nullptr;
+    bool tried = false;
+
+    void add()
+    {
+        AcquireSRWLockExclusive(&lock);
+        if (!tried) {
+            tried = true;
+            if (!x2w_local::env_on("X2W_XMEM_NO_FAULT_RETRY")) handle = AddVectoredExceptionHandler(1, retry_remapped_page);
+        }
+        ReleaseSRWLockExclusive(&lock);
+    }
+    void remove()
+    {
+        AcquireSRWLockExclusive(&lock);
+        void* const registered = handle;
+        handle = nullptr;
+        tried = false;
+        ReleaseSRWLockExclusive(&lock);
+        if (!registered || x2w_local::env_on("X2W_XMEM_KEEP_FAULT_RETRY")) return;
+        RemoveVectoredExceptionHandler(registered);
+        // During process termination the other threads are already gone; one of them may have
+        // been stopped inside the handler, and nothing can call it any more.
+        using ShutdownInProgress = BOOLEAN (NTAPI*)();
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        const auto shutting_down = ntdll ? reinterpret_cast<ShutdownInProgress>(GetProcAddress(ntdll, "RtlDllShutdownInProgress")) : nullptr;
+        if (shutting_down && shutting_down()) return;
+        while (InterlockedCompareExchange(&fault_retry_in_flight, 0, 0) != 0) SwitchToThread();
+    }
+    ~FaultRetry() { remove(); }
+};
+FaultRetry fault_retry;
 
 // Test control (tests/xmem_page_runs_check.py): X2W_XMEM_TEST_FAULT=<stage>:<skip> makes one step of
 // the next unmap fail as if Windows had refused it, after skipping <skip> such steps. Stage 1 is
@@ -324,11 +371,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
     if (!count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
     try {
-        // X2W_XMEM_NO_FAULT_RETRY=1 leaves the handler out; tests/xmem_page_runs_check.py uses it as
-        // the control that shows a reader does fault while a run is being broken.
-        static const void* const handler =
-            x2w_local::env_on("X2W_XMEM_NO_FAULT_RETRY") ? nullptr : AddVectoredExceptionHandler(1, retry_remapped_page);
-        (void)handler;
+        fault_retry.add();
         const MappingThread marker;
         const std::lock_guard guard(memory.mutex);
         std::map<ULONG_PTR, ULONG_PTR> batch;

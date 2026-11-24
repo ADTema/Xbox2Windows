@@ -326,6 +326,10 @@ took apart, the page is recorded and covered by a view once that unmap is over, 
 has not already retried that page for that unmap. Any other fault is passed on, after at most one
 retry.
 
+The handler is registered by the first mapping call and removed when `xmem.dll` is unloaded: a
+static destructor removes it before the shim's state goes away and waits for callbacks that are
+still inside it. Windows would otherwise keep the registration after `FreeLibrary`.
+
 What the shim records always matches what Windows shows. If an unmap is refused part of the way,
 the views already unmapped are mapped again whole, nothing is removed and the call fails with
 that error. If a surviving page cannot be mapped again, it is forgotten (its bytes stay in the
@@ -343,7 +347,10 @@ is not affected: section-backed pages already took the committed, not-aliased pa
   (`X2W_XMEM_TEST_FAULT`); and a reader on a page while its neighbour is unmapped and mapped
   again. Two cases must end in an access violation, the reader without the handler
   (`X2W_XMEM_NO_FAULT_RETRY=1`) and a read of a forgotten page; each runs in a child process
-  whose exit code the parent checks.
+  whose exit code the parent checks. Another child uses the shim, unloads it, takes an unrelated
+  handled access violation, loads the shim again, uses the handler and unloads it again; with
+  the removal skipped (`X2W_XMEM_KEEP_FAULT_RETRY=1`) the same child must not survive that
+  exception.
 - `ctest --preset release --no-tests=error -R '^xmem_page_runs_device_' -V` places a buffer
   (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
   sections, and single-page views.
