@@ -64,6 +64,11 @@ target_compile_features(era_query_check PRIVATE cxx_std_17)
 foreach(scenario IN ITEMS fields tail registry short)
     add_test(NAME era_query_${scenario} COMMAND era_query_check ${scenario})
 endforeach()
+# A clear tail flag overwrites a stale byte, and another process's page at a registered address
+# has it clear. The mutated run, which expects the flag set there, is the negative control.
+add_test(NAME era_query_clear COMMAND era_query_check clear)
+add_test(NAME era_query_clear_foreign_control COMMAND era_query_check clear --mutate foreign)
+set_tests_properties(era_query_clear_foreign_control PROPERTIES WILL_FAIL TRUE)
 
 # Title GPU address to desktop GPU virtual address table (no GPU needed).
 add_executable(era_title_va_check tests/era_title_va_check.cpp src/era_title_va.cpp)
