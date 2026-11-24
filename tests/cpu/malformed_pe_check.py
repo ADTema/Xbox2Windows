@@ -36,6 +36,11 @@ def main():
             expect_refusal(f"{tool} with a short directory table", result)
             if "runtime-function" not in result.stderr:
                 raise AssertionError((tool, result.stderr[-300:]))
+
+        # The EXE translator reports a missing file or an unsupported image the same way.
+        for label, image in (("missing image", folder / "absent.exe"), ("DLL image", whole)):
+            result = run(TOOLS / "cpu_exe_aot.py", image, folder / "io.dll", folder / "mix.dll", folder / "exe.cpp")
+            expect_refusal(f"cpu_exe_aot with a {label}", result)
     print("ok")
 
 
