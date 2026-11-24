@@ -28,6 +28,7 @@ ALU = {
     "v_sub_nc_u32_e32": "({0} - {1})",
     "v_subrev_nc_u32_e32": "({1} - {0})",
     "v_min_u32_e32": "min({0}, {1})",
+    "v_xor3_b32": "({0} ^ {1} ^ {2})",  # VOP3 src0 ^ src1 ^ src2 (RDNA2 ISA: D.u = S0.u ^ S1.u ^ S2.u)
     "v_max_u32_e32": "max({0}, {1})",
     "v_add_nc_u32_e32": "({0} + {1})",
     "v_or_b32_e32": f"({INTEGER['or_b32'][1]})",
@@ -1098,7 +1099,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             vector[dst] = ("alu", expression)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
-              or (m := re.fullmatch(rf"(v_mad_u32_u24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
               and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
             # VOP2 takes a VGPR as src1. A v_mad_u32_u24 with an address operand is a row pitch below.
             op, dst = m[1], int(m[2])
