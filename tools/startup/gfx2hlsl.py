@@ -184,49 +184,60 @@ CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
                             0x3e22f983)  # 1/(2*pi)
 
 
-def decode(code):
+def check_encoding(code, off, n, name, asm):
+    if name == 'image_load_mip':
+        # The shared disassembler does not expose these gfx10 MIMG flags.
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        if word0 & (1 << 16):
+            raise Unsupported('image_load_mip tfe')
+        if word1 & (1 << 30):
+            raise Unsupported('image_load_mip a16')
+    if name == 'v_cndmask_b32_e64':
+        # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        for i in range(2):
+            source = (word1 >> (9 * i)) & 0x1ff
+            if not (128 <= source <= 208 or 240 <= source <= 248 or source == 255):
+                continue
+            if word0 & (1 << (8 + i)):
+                raise Unsupported('v_cndmask_b32_e64 ABS on an immediate')
+            if not word1 & (1 << (29 + i)):
+                continue
+            if source <= 192:
+                bits = source - 128
+            elif source <= 208:
+                bits = (192 - source) & 0xffffffff
+            elif source <= 248:
+                bits = CNDMASK_INLINE_FLOAT_BITS[source - 240]
+            else:
+                if n != 12 or off + n > len(code):
+                    raise Unsupported('v_cndmask_b32_e64 missing literal dword')
+                bits, = struct.unpack_from('<I', code, off + 8)
+            # Preserve the other operand spellings and any modifiers on the final operand.
+            fields = asm.split(',', 3)
+            if len(fields) != 4:
+                raise Unsupported('malformed v_cndmask_b32_e64 operands')
+            operand = fields[i + 1]
+            fields[i + 1] = operand[:len(operand) - len(operand.lstrip())] + '0x%08x' % (bits ^ 0x80000000)
+            asm = ','.join(fields)
+    return asm
+
+
+def decode(code, refusals=None):
     out, off = [], 0
     while off + 4 <= len(code):
         try:
             n, name, asm, _ = D.decode_instruction(code, off)
         except Exception as error:
             raise Unsupported('undecodable word at +0x%x: %s' % (off, error))
-        if name == 'image_load_mip':
-            # The shared disassembler does not expose these gfx10 MIMG flags.
-            word0, word1 = struct.unpack_from('<2I', code, off)
-            if word0 & (1 << 16):
-                raise Unsupported('image_load_mip tfe')
-            if word1 & (1 << 30):
-                raise Unsupported('image_load_mip a16')
-        if name == 'v_cndmask_b32_e64':
-            # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
-            word0, word1 = struct.unpack_from('<2I', code, off)
-            for i in range(2):
-                source = (word1 >> (9 * i)) & 0x1ff
-                if not (128 <= source <= 208 or 240 <= source <= 248 or source == 255):
-                    continue
-                if word0 & (1 << (8 + i)):
-                    raise Unsupported('v_cndmask_b32_e64 ABS on an immediate')
-                if not word1 & (1 << (29 + i)):
-                    continue
-                if source <= 192:
-                    bits = source - 128
-                elif source <= 208:
-                    bits = (192 - source) & 0xffffffff
-                elif source <= 248:
-                    bits = CNDMASK_INLINE_FLOAT_BITS[source - 240]
-                else:
-                    if n != 12 or off + n > len(code):
-                        raise Unsupported('v_cndmask_b32_e64 missing literal dword')
-                    bits, = struct.unpack_from('<I', code, off + 8)
-                # Preserve the other operand spellings and any modifiers on the final operand.
-                fields = asm.split(',', 3)
-                if len(fields) != 4:
-                    raise Unsupported('malformed v_cndmask_b32_e64 operands')
-                operand = fields[i + 1]
-                fields[i + 1] = operand[:len(operand) - len(operand.lstrip())] + '0x%08x' % (bits ^ 0x80000000)
-                asm = ','.join(fields)
-        out.append((off, n, name, asm))
+        try:
+            asm = check_encoding(code, off, n, name, asm)
+        except Unsupported as reason:
+            if refusals is None:
+                raise
+            refusals.append((str(reason), 'decode'))
+        else:
+            out.append((off, n, name, asm))
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
     return out[:last + 1]
@@ -305,9 +316,13 @@ def smem_mods(mods):
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
-    def __init__(self, pipe, kind, code):
+    def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
-        self.ins = decode(strip_header(code))
+        self.refusals = refusals
+        if refusals is None:
+            self.ins = decode(strip_header(code))
+        else:
+            self.ins = decode(strip_header(code), refusals) if decoded is None else decoded
         self.lines = []           # body statements (per block)
         self.sym = {}             # scalar register -> symbolic value
         self.used_s, self.used_v = set(), set()
@@ -509,12 +524,24 @@ class Stage:
         self.uniform_v = set()
         self.has_branches = bool(targets)
         start = 0
+        refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         for off, n, name, asm in self.ins:
             if off in targets and off != start:
                 self.blocks.append((start, self.lines, None))
                 self.lines, start = [], off
             self.pc = off
-            term = self.one(name, asm)
+            try:
+                term = self.one(name, asm)
+            except Unsupported as reason:
+                if refusals is None:
+                    raise
+                refusals.append((str(reason), self.kind))
+                continue
+            except Exception as error:
+                if refusals is None:
+                    raise
+                refusals.append((handler_error(name, error, refusals), self.kind))
+                continue
             if term:
                 self.blocks.append((start, self.lines, term))
                 self.lines, start = [], off + n
@@ -1729,7 +1756,8 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 
 
 class Pipeline:
-    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None):
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
+                 refusals=None, decoded=None):
         self.root = parse_root(root_blob)
         self.vs_fetch = vs_fetch  # stream_fetch(): the loads the vertex stage's entry call stands for
         self.packed_position_vgpr = None
@@ -1751,8 +1779,13 @@ class Pipeline:
         self.notes = set()    # shortcuts taken (written to the manifest as comments)
         self.modified = set()
         self.rect = self.ud(('rect',))
-        self.vs = Stage(self, 'vs', vs_code)
-        self.ps = Stage(self, 'ps', ps_code)
+        if refusals is None:
+            self.vs = Stage(self, 'vs', vs_code)
+            self.ps = Stage(self, 'ps', ps_code)
+        else:
+            decoded = {} if decoded is None else decoded
+            self.vs = Stage(self, 'vs', vs_code, refusals=refusals, decoded=decoded.get('vs'))
+            self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps'))
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         missing = [a for a in self.ps.attrs if a not in self.params]
@@ -2007,52 +2040,75 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     return 'ok'
 
 
-def classify(blob):
-    text = ' '.join(x[3] for x in decode(strip_header(blob)) if x[2] == 'exp')
+def classify_decoded(ins):
+    text = ' '.join(x[3] for x in ins if x[2] == 'exp')
     return 'vs' if 'pos' in text else 'ps' if 'mrt' in text or not text else 'other'  # no export: a depth-only pixel shader
+
+
+def classify(blob):
+    return classify_decoded(decode(strip_header(blob)))
+
+
+def load_request(out_dir, key, refusals=None, pair_info=None):
+    """Read a base request or an RTV variant and classify the source stages."""
+    decoded = {}
+
+    def classify_stage(blob):
+        if refusals is None:
+            return classify(blob)
+        ins = decode(strip_header(blob), refusals)
+        kind = classify_decoded(ins)
+        decoded[kind] = ins
+        return kind
+
+    name = os.path.join(out_dir, 'req_%016x' % key)
+    request = ''
+    formats = ()
+    base = key
+    if os.path.isfile(name + '.rtv'):
+        with open(name + '.rtv', encoding='ascii') as file:
+            request = file.read(256)
+        if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or fnv(request.encode('ascii')) != key:
+            raise Unsupported('invalid RTV variant request')
+        base, *formats = map(int, request.split()[1:])
+        if base > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
+            raise Unsupported('invalid RTV variant values')
+        name = os.path.join(out_dir, 'req_%016x' % base)
+    a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
+    if pair_info is not None and not request:
+        import hashlib
+        pair_info.append((hashlib.sha256(struct.pack('<Q', len(a)) + a + b).digest(), root))
+    # A stream with an input layout publishes it as .ia (before .a) and hashes it into the key.
+    layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
+    if request and pipeline_key(a, b, root, layout) != base:
+        raise Unsupported('RTV variant source key mismatch')
+    fetch = None
+    if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
+        # Slot 86 records complete containers in canonical (VS, PS) order.
+        # Keep the container bytes in the cache key; translate only the bounded native code.
+        import zlib
+        from pixel_aot import container_code
+        from resource_inventory import parts
+        try:
+            container = a
+            a, b = (container_code(parts(blob)[b'DXIL'], stage=stage)
+                    for blob, stage in ((a, 1), (b, 0)))
+            if starts_with_fetch_call(a):
+                fetch = stream_fetch(container, layout.decode('ascii') if layout else None)
+        except (KeyError, ValueError, IndexError, struct.error, zlib.error) as error:
+            raise Unsupported('invalid stream shader: %s' % error) from error
+        if classify_stage(a) != 'vs' or classify_stage(b) != 'ps':
+            raise Unsupported('stream stage and shader export disagree')
+        kinds = {'vs': a, 'ps': b}
+    else:
+        kinds = {classify_stage(a): a, classify_stage(b): b}
+    return kinds, root, formats, request, fetch, decoded
 
 
 def translate_request(out_dir, key):
     """Translate a base shader request or an RTV variant referencing its source blobs."""
-    name = os.path.join(out_dir, 'req_%016x' % key)
-    request = ''
-    formats = ()
     try:
-        base = key
-        if os.path.isfile(name + '.rtv'):
-            with open(name + '.rtv', encoding='ascii') as file:
-                request = file.read(256)
-            if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or fnv(request.encode('ascii')) != key:
-                raise Unsupported('invalid RTV variant request')
-            base, *formats = map(int, request.split()[1:])
-            if base > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
-                raise Unsupported('invalid RTV variant values')
-            name = os.path.join(out_dir, 'req_%016x' % base)
-        a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
-        # A stream with an input layout publishes it as .ia (before .a) and hashes it into the key.
-        layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
-        if request and pipeline_key(a, b, root, layout) != base:
-            raise Unsupported('RTV variant source key mismatch')
-        fetch = None
-        if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
-            # Slot 86 records complete containers in canonical (VS, PS) order.
-            # Keep the container bytes in the cache key; translate only the bounded native code.
-            import zlib
-            from pixel_aot import container_code
-            from resource_inventory import parts
-            try:
-                container = a
-                a, b = (container_code(parts(blob)[b'DXIL'], stage=stage)
-                        for blob, stage in ((a, 1), (b, 0)))
-                if starts_with_fetch_call(a):
-                    fetch = stream_fetch(container, layout.decode('ascii') if layout else None)
-            except (KeyError, ValueError, IndexError, struct.error, zlib.error) as error:
-                raise Unsupported('invalid stream shader: %s' % error) from error
-            if classify(a) != 'vs' or classify(b) != 'ps':
-                raise Unsupported('stream stage and shader export disagree')
-            kinds = {'vs': a, 'ps': b}
-        else:
-            kinds = {classify(a): a, classify(b): b}
+        kinds, root, formats, request, fetch, _ = load_request(out_dir, key)
     except (Unsupported, OSError, UnicodeError) as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
@@ -2062,7 +2118,154 @@ def translate_request(out_dir, key):
     return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request, vs_fetch=fetch)
 
 
+REFUSALS_CAVEAT = ('Counts after the first refusal are approximate. Skipped instructions leave later state '
+                   'unmodelled and can cause follow-on errors. A pipeline-scope refusal ends the pipeline, '
+                   'so Only counts at pipeline scope reflect a lower bound on the reasons reached.')
+
+
+def request_keys(out_dir):
+    for name in sorted(os.listdir(out_dir)):
+        match = re.fullmatch(r'req_([0-9a-f]{16})\.(?:a|rtv)', name)
+        if match:
+            yield int(match.group(1), 16)
+
+
+def normalize_refusal(reason):
+    # Opaque decoder/container details can contain input bytes or disassembly.
+    for label in ('undecodable word', 'invalid stream shader', 'unverified vertex fetch record',
+                  'unreadable shader request', 'invalid binary shader request'):
+        if reason.startswith(label):
+            return label
+    reason = re.sub(r'\b([sv])\[\d+(?::(\d+))?\]', lambda m: m[1] + ('[N:N]' if m[2] else '[N]'), reason)
+    reason = re.sub(r'\b([sv])\d+\b', r'\1N', reason)
+    reason = re.sub(r'\b(pos|param|mrt)\d+\b', r'\1N', reason)
+    reason = re.sub(r'\blabel_[0-9a-f]+\b', 'label_N', reason, flags=re.IGNORECASE)
+    reason = re.sub(r'\bword_0x[0-9a-f]+\b', 'word_N', reason, flags=re.IGNORECASE)
+    # Preserve cause numbers. Redact hex operands and offsets, and decimal operands
+    # in instruction operand lists, symbolic values, and named operand fields.
+    number = r'[+-]?(?:0x[0-9a-f]+|(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)'
+    reason = re.sub(r'(?<!\w)[+-]?0x[0-9a-f]+\b', 'N', reason, flags=re.IGNORECASE)
+    reason = re.sub(r'(^[a-z]\w*_\w+\s+)(' + number + r')(?=\s*(?:,|$))', r'\1N', reason)
+    reason = re.sub(r'([,\[(]\s*|\b(?:offset|operand|destination|source|amount|selector|vaddr|soffset|register|attributes|dmask|op_sel|offset0|offset1)[: ]+)([\'"]?)'
+                    + number + r'(?![\w.-])', r'\1\2N', reason, flags=re.IGNORECASE)
+    return reason
+
+
+def handler_error(op, error, refusals):
+    label = 'internal error' if refusals else 'translator crash'
+    return '%s in %s: %s' % (label, op, type(error).__name__)
+
+
+def request_refusals(out_dir, key, pair_info=None):
+    """Collect reached refusal sites for one request without publishing a translation."""
+    refusals = []
+    try:
+        kinds, root, formats, _, fetch, decoded = load_request(out_dir, key, refusals, pair_info)
+    except Unsupported as reason:
+        refusals.append((str(reason), 'pipeline'))
+        return refusals
+    except struct.error:
+        refusals.append(('invalid binary shader request', 'pipeline'))
+        return refusals
+    except (OSError, UnicodeError):
+        # File errors can include the cache path and request key.
+        refusals.append(('unreadable shader request', 'pipeline'))
+        return refusals
+    except Exception as error:
+        refusals.append((handler_error('request loading', error, refusals), 'pipeline'))
+        return refusals
+
+    op = 'Pipeline'
+    try:
+        if set(kinds) != {'vs', 'ps'}:
+            raise Unsupported('stages %s' % sorted(kinds))
+        pipe = Pipeline(kinds['vs'], kinds['ps'], root, rtv_formats=formats, vs_fetch=fetch,
+                        refusals=refusals, decoded=decoded)
+        op = 'hlsl_vs'
+        pipe.hlsl_vs()
+        op = 'hlsl_ps'
+        pipe.hlsl_ps()
+        op = 'manifest'
+        pipe.manifest()
+    except Unsupported as reason:
+        refusals.append((str(reason), 'pipeline'))
+    except Exception as error:
+        refusals.append((handler_error(op, error, refusals), 'pipeline'))
+    return refusals
+
+
+def refusals_report(out_dir):
+    histogram, rows, pairs = {}, {}, {}
+    for key in dict.fromkeys(request_keys(out_dir)):
+        pair_info = []
+        sites = [(normalize_refusal(reason), scope) for reason, scope in request_refusals(out_dir, key, pair_info)]
+        count = len(sites)
+        histogram[count] = histogram.get(count, 0) + 1
+        distinct = len({reason for reason, _ in sites})
+        for reason, scope in set(sites):
+            row = rows.setdefault((reason, scope), dict(reason=reason, scope=scope, containing=0, first=0, only=0))
+            row['containing'] += 1
+            row['first'] += (reason, scope) == sites[0]
+            row['only'] += distinct == 1
+        if pair_info:
+            pair, root = pair_info[0]
+            pairs.setdefault(pair, {}).setdefault(root, set()).update(sites)
+
+    pair_rows = {}
+    for roots in pairs.values():
+        every = set.intersection(*roots.values())
+        for reason, scope in set.union(*roots.values()):
+            row = pair_rows.setdefault((reason, scope), dict(reason=reason, scope=scope,
+                                                            under_every_root=0, under_some_roots=0))
+            column = 'under_every_root' if (reason, scope) in every else 'under_some_roots'
+            row[column] += 1
+
+    return dict(per_request=dict(examined=sum(histogram.values()), no_refusal=histogram.get(0, 0),
+                                 refusal_sites_per_request=[dict(sites=count, requests=histogram[count])
+                                                            for count in sorted(histogram)],
+                                 reasons=sorted(rows.values(), key=lambda row: (-row['containing'], row['reason'], row['scope']))),
+                per_code_pair=dict(examined=len(pairs),
+                                   reasons=sorted(pair_rows.values(), key=lambda row: (row['reason'], row['scope']))),
+                caveat=REFUSALS_CAVEAT)
+
+
+def refusals_main(argv):
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description='Read-only diagnostic for all cached requests.',
+                                     epilog=REFUSALS_CAVEAT, allow_abbrev=False)
+    parser.add_argument('--refusals', required=True, metavar='CACHE_DIR')
+    parser.add_argument('--json', action='store_true', help='emit the report as JSON')
+    args = parser.parse_args(argv)
+    if not os.path.isdir(args.refusals):
+        parser.error('CACHE_DIR must be an existing directory')
+    report = refusals_report(args.refusals)
+    if args.json:
+        print(json.dumps(report))
+        return
+    requests = report['per_request']
+    print('Per request key')
+    print('Requests examined: %d' % requests['examined'])
+    print('No refusal recorded (not compiled): %d' % requests['no_refusal'])
+    print('Refusal sites per request (sites, requests):')
+    for bucket in requests['refusal_sites_per_request']:
+        print('%d\t%d' % (bucket['sites'], bucket['requests']))
+    print('Containing\tFirst\tOnly\tScope\tReason')
+    for row in requests['reasons']:
+        print('%(containing)d\t%(first)d\t%(only)d\t%(scope)s\t%(reason)s' % row)
+    pairs = report['per_code_pair']
+    print('Per code pair (excluding RTV variants)')
+    print('Code pairs examined: %d' % pairs['examined'])
+    print('Under every root\tUnder some roots\tScope\tReason')
+    for row in pairs['reasons']:
+        print('%(under_every_root)d\t%(under_some_roots)d\t%(scope)s\t%(reason)s' % row)
+    print(REFUSALS_CAVEAT)
+
+
 def main():
+    if any(arg == '--refusals' or arg.startswith('--refusals=') for arg in sys.argv[1:]):
+        return refusals_main(sys.argv[1:])
     out_dir = sys.argv[2]
     os.makedirs(out_dir, exist_ok=True)
     if sys.argv[1] == '--capture':
