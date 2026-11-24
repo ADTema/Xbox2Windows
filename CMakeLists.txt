@@ -150,6 +150,43 @@ set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
 
+# Fixture-only desktop xgameruntime.dll skeleton. Every exported thunk is
+# generated from the single X-macro table in xgameruntime_shim.cpp and returns
+# E_NOTIMPL. Keep it out of the normal shim directory so a package cannot treat
+# the production-named DLL as a provider.
+add_library(xgameruntime_shim SHARED src/xgameruntime_shim.cpp src/xgameruntime_shim.def)
+set(xgameruntime_fixture_dir "${CMAKE_BINARY_DIR}/fixture-shims")
+set_target_properties(xgameruntime_shim PROPERTIES
+    OUTPUT_NAME xgameruntime
+    RUNTIME_OUTPUT_DIRECTORY "${xgameruntime_fixture_dir}"
+    LIBRARY_OUTPUT_DIRECTORY "${xgameruntime_fixture_dir}"
+    ARCHIVE_OUTPUT_DIRECTORY "${xgameruntime_fixture_dir}")
+target_compile_features(xgameruntime_shim PRIVATE cxx_std_17)
+
+add_executable(xgameruntime_shim_check tests/xgameruntime_thunks_check.cpp)
+add_dependencies(xgameruntime_shim_check xgameruntime_shim)
+target_compile_features(xgameruntime_shim_check PRIVATE cxx_std_17)
+add_test(NAME xgameruntime_thunks COMMAND xgameruntime_shim_check
+    "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
+    "$<TARGET_FILE_DIR:xmem_shim>")
+set_tests_properties(xgameruntime_thunks PROPERTIES TIMEOUT 30)
+
+# A real source-built EXE import fixture. The import library below only names
+# xgameruntime.dll; no build product or test package copies the fixture DLL.
+set(xgameruntime_import_def "${CMAKE_CURRENT_SOURCE_DIR}/tests/xgameruntime_import.def")
+set(xgameruntime_import_lib "${CMAKE_CURRENT_BINARY_DIR}/xgameruntime_fixture_import.lib")
+add_custom_command(OUTPUT "${xgameruntime_import_lib}"
+    COMMAND "${CMAKE_AR}" /nologo /machine:x64 "/def:${xgameruntime_import_def}"
+            "/out:${xgameruntime_import_lib}"
+    DEPENDS tests/xgameruntime_import.def VERBATIM)
+add_executable(xgameruntime_preflight_exe tests/xgameruntime_preflight_exe.cpp)
+target_sources(xgameruntime_preflight_exe PRIVATE "${xgameruntime_import_lib}")
+target_link_libraries(xgameruntime_preflight_exe PRIVATE "${xgameruntime_import_lib}")
+target_compile_features(xgameruntime_preflight_exe PRIVATE cxx_std_17)
+target_compile_options(xgameruntime_preflight_exe PRIVATE /GS-)
+target_link_options(xgameruntime_preflight_exe PRIVATE /ENTRY:fixture_entry /NODEFAULTLIB
+    /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
@@ -490,6 +527,11 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(descriptor_window_stale_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "descriptor_windows submit=2 slot=[1-9]")
+    foreach(scenario IN ITEMS live stale unknown)
+        add_test(NAME descriptor_record_copy_${scenario}_${adapter}
+            COMMAND offscreen_check ${adapter} --descriptor-record-copy ${scenario})
+        set_tests_properties(descriptor_record_copy_${scenario}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME texture_mips_${adapter} COMMAND offscreen_check ${adapter} --texture-mips)
     set_tests_properties(dual_uav_${adapter} texture_mips_${adapter} PROPERTIES TIMEOUT 45)
     add_test(NAME dxr_query_${adapter} COMMAND offscreen_check ${adapter} --ray-query)
@@ -642,7 +684,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     foreach(adapter IN ITEMS hardware warp)
         foreach(bridge IN ITEMS address_window:draw sampler_views:sampler ballot_extract:ballot
                                 compaction:compaction compare_sampler:compare_sampler minlod:minlod
-                                minlod_levels:minlod_levels minlod_fractional:minlod_fractional)
+                                minlod_exact:minlod_exact minlod_levels:minlod_levels
+                                minlod_fractional:minlod_fractional)
             string(REPLACE ":" ";" bridge "${bridge}")
             list(GET bridge 0 name)
             list(GET bridge 1 driver)
@@ -1300,6 +1343,31 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_mmx_original>"
         "$<TARGET_FILE:cpu_sse_mmx_original_lifted>"
         "$<TARGET_FILE:cpu_sse_mmx_altered_lifted>")
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_integer_flags_${variant} integer_flags)
+        set(cpu_integer_flags_${variant}_lifted_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_integer_flags_${variant}_lifted.cpp")
+        add_custom_command(OUTPUT "${cpu_integer_flags_${variant}_lifted_cpp}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py"
+                emit "$<TARGET_FILE:cpu_integer_flags_${variant}>" "${cpu_integer_flags_${variant}_lifted_cpp}"
+            DEPENDS cpu_integer_flags_${variant} tests/cpu/integer_flags_check.py tools/ffx_version_query.py
+                tools/x87_lower.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_integer_flags_${variant}_lifted SHARED "${cpu_integer_flags_${variant}_lifted_cpp}")
+    endforeach()
+    target_compile_definitions(cpu_integer_flags_altered PRIVATE ALTER_IMM)
+    set(cpu_integer_flags_controls_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_integer_flags_controls.cpp")
+    add_custom_command(OUTPUT "${cpu_integer_flags_controls_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py"
+            emit-controls "$<TARGET_FILE:cpu_integer_flags_original>" "${cpu_integer_flags_controls_cpp}"
+        DEPENDS cpu_integer_flags_original tests/cpu/integer_flags_check.py tools/ffx_version_query.py
+            tools/x87_lower.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_integer_flags_controls SHARED "${cpu_integer_flags_controls_cpp}")
+    add_test(NAME cpu_aot_integer_flags COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py" check
+        "$<TARGET_FILE:cpu_integer_flags_original>"
+        "$<TARGET_FILE:cpu_integer_flags_original_lifted>"
+        "$<TARGET_FILE:cpu_integer_flags_altered_lifted>"
+        "$<TARGET_FILE:cpu_integer_flags_controls>")
+    set_tests_properties(cpu_aot_integer_flags PROPERTIES SKIP_RETURN_CODE 77)
     # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
     # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
     set(tail_files)
@@ -2397,6 +2465,35 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_mxcsr COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
         check "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr>" "$<TARGET_FILE:cpu_mxcsr_lifted>"
         ${mxcsr_controls} "${mxcsr_o2}")
+    # FTZ and DAZ in the profile's denormals opt-in: the lifted DLL, the sim variant that must keep every rule,
+    # the noftz, nodaz and nomask controls that must break one, and an /O2 build of the translation.
+    cpu_asm_fixture(cpu_mxcsr_denormals mxcsr_denormals)
+    set(mxcsr_denormals_extras)
+    foreach(variant IN ITEMS lifted noftz nodaz sim nomask)
+        set(den_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_${variant}.cpp")
+        add_custom_command(OUTPUT "${den_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr_denormals.py"
+                emit "$<TARGET_FILE:cpu_mxcsr_denormals>" "${den_fixture}" ${variant}
+            DEPENDS cpu_mxcsr_denormals tests/cpu/mxcsr_denormals.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_mxcsr_denormals_${variant} SHARED "${den_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND mxcsr_denormals_extras "$<TARGET_FILE:cpu_mxcsr_denormals_${variant}>")
+        endif()
+    endforeach()
+    set(den_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_lifted_o2.dll")
+    add_custom_command(OUTPUT "${den_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /EHsc /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_lifted_o2.obj" "/Fe${den_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_denormals_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_mxcsr_denormals_lifted_o2 ALL DEPENDS "${den_o2}")
+    add_test(NAME cpu_aot_mxcsr_denormals COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr_denormals.py"
+        check-ftz "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr_denormals>"
+        "$<TARGET_FILE:cpu_mxcsr_denormals_lifted>" ${mxcsr_denormals_extras} "${den_o2}")
+    add_test(NAME cpu_aot_mxcsr_denormals_daz COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr_denormals.py"
+        check-daz "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr_denormals>"
+        "$<TARGET_FILE:cpu_mxcsr_denormals_lifted>" ${mxcsr_denormals_extras} "${den_o2}")
+    set_tests_properties(cpu_aot_mxcsr_denormals_daz PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
@@ -4353,6 +4450,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/dependency_paths_check.py")
     add_test(NAME pe_package_import_closure COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pe_package_preflight_check.py")
+    add_test(NAME xgameruntime_preflight_stub_refused COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xgameruntime_preflight_check.py"
+        "$<TARGET_FILE:xgameruntime_preflight_exe>" "$<TARGET_FILE:xmem_shim>"
+        "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
+        "$<TARGET_FILE_DIR:xmem_shim>")
+    set_tests_properties(xgameruntime_preflight_stub_refused PROPERTIES TIMEOUT 30)
 else()
     message(WARNING
         "Python-driven tests, including the CPU fixtures, are disabled because "
