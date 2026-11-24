@@ -2,14 +2,18 @@
 from pathlib import Path
 import re
 import struct
+import subprocess
 import sys
 import tempfile
 
 from bc7_draw_check import make_block as bc7_block
 from bc7_tiles_check import block_index
-from startup_address_srv_check import draw_texture
+from startup_address_srv_check import prepare_draw_cache
 
 WIDTH, HEIGHT = 128, 128
+HLSL = ("Texture2D<float4> t : register(t0);\n"
+        "float4 main(float4 p : SV_Position) : SV_Target {\n"
+        f"  return t.Load(int3(uint(p.x) % {WIDTH}, uint(p.y), 0));\n}}\n")
 
 
 def bc3_block(x, y):
@@ -56,18 +60,35 @@ def expected_panels(rgba, width, height, tile_pitch):
     return bytes(image)  # texels outside the texture load as zero
 
 
-def check(directory, consumer, backend, fmt, width, height):
+class Drawer:
+    """Translates the pipeline once, then draws each case with the same shader cache."""
+
+    def __init__(self, directory, consumer, backend):
+        self.directory, self.consumer, self.backend, self.prepared = directory, consumer, backend, None
+
+    def __call__(self, modes):
+        if self.prepared is None:
+            self.prepared = prepare_draw_cache(self.directory, self.consumer, HLSL, modes, "srv 0 tex2d table 0 0")
+        env, args, output = self.prepared
+        env = {key: value for key, value in env.items() if key != "X2W_TEST_BC3"}  # the consumer tests presence
+        result = subprocess.run([*args, self.backend, output], env={**env, **modes}, capture_output=True, text=True)
+        print(result.stdout, end="")
+        if result.returncode == 77:
+            return None
+        if result.returncode:
+            raise RuntimeError(f"consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
+        return output.read_bytes()
+
+
+def check(directory, draw, backend, fmt, width, height):
     tiled, rgba = make_surface(bc3_block if fmt == "BC3" else bc7_block)
     source = directory / "tiled.bin"
     source.write_bytes(tiled)
-    hlsl = ("Texture2D<float4> t : register(t0);\n"
-            "float4 main(float4 p : SV_Position) : SV_Target {\n"
-            f"  return t.Load(int3(uint(p.x) % {WIDTH}, uint(p.y), 0));\n}}\n")
     trap_log = directory / "trap.log"
     modes = {"X2W_TEST_BC_VIEW": str(source), "X2W_TEST_BC_SIZE": f"{width}x{height}", "X2W_TRAP_LOG": str(trap_log)}
     if fmt == "BC3":
         modes["X2W_TEST_BC3"] = "1"
-    actual = draw_texture(directory, consumer, backend, hlsl, modes)
+    actual = draw(modes)
     if actual is None:
         return 77
     if len(actual) != WIDTH * 4 * HEIGHT * 4:
@@ -114,8 +135,11 @@ def check(directory, consumer, backend, fmt, width, height):
 
 
 if __name__ == "__main__":
-    for fmt, width, height in (("BC3", 128, 128), ("BC7", 128, 128), ("BC3", 100, 68), ("BC7", 100, 68)):
-        with tempfile.TemporaryDirectory() as temporary:
-            result = check(Path(temporary), *sys.argv[1:], fmt, width, height)
-            if result:
-                sys.exit(result)
+    consumer, backend = sys.argv[1:3]
+    with tempfile.TemporaryDirectory() as shared:
+        draw = Drawer(Path(shared), consumer, backend)
+        for fmt, width, height in (("BC3", 128, 128), ("BC7", 128, 128), ("BC3", 100, 68), ("BC7", 100, 68)):
+            with tempfile.TemporaryDirectory() as temporary:
+                result = check(Path(temporary), draw, backend, fmt, width, height)
+                if result:
+                    sys.exit(result)
