@@ -22,6 +22,7 @@
 #include <objbase.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -43,7 +44,7 @@ struct VoiceState {
 // One entry per lifecycle or submission event, in order. Kept independent of wall-clock time so two
 // arms running on different clocks can be compared event for event.
 struct Event {
-    const char* kind;  // "create", "submit", "start", "stop", "callback", "destroy"
+    const char* kind;  // "create", "submit", "start", "stop"
     unsigned long long arg = 0;
     bool operator==(const Event& other) const { return std::strcmp(kind, other.kind) == 0 && arg == other.arg; }
 };
@@ -68,6 +69,7 @@ public:
     virtual void stop() = 0;
     virtual VoiceState state() = 0;
     virtual Trace& trace() = 0;
+    virtual bool callback_failed() const = 0;
 };
 
 class Provider {
@@ -107,9 +109,6 @@ public:
     {
         trace_.stopped = true;
         trace_.events.push_back({"stop", 0});
-        // Stopping discards whatever is queued, which is what the system voice does on Stop().
-        queue_ = 0;
-        in_flight_ = 0;
     }
     VoiceState state() override
     {
@@ -119,6 +118,7 @@ public:
         return s;
     }
     Trace& trace() override { return trace_; }
+    bool callback_failed() const override { return false; }
 
     // The plan calls this once per submission period, so the virtual clock advances in the same steps
     // as the real one would and the callbacks line up with the same submissions.
@@ -131,7 +131,6 @@ public:
         while (in_flight_ > 0 && played_ >= next_callback_at_) {
             --in_flight_;
             ++trace_.callbacks;
-            trace_.events.push_back({"callback", 0});
             next_callback_at_ += block_frames_;
         }
         trace_.queue_depth_max = (std::max)(trace_.queue_depth_max, queue_);
@@ -149,6 +148,7 @@ private:
 
 class DiagnosticProvider final : public Provider {
 public:
+    ~DiagnosticProvider() override { close(); }
     const char* name() const override { return "diagnostic"; }
     std::string open() override { return {}; }
     Voice* create_voice(const Format& format) override
@@ -202,9 +202,11 @@ public:
         if (submit_index_ >= max_blocks) return false;
         XAUDIO2_BUFFER& buffer = buffers_[submit_index_];
         buffer = {};
-        buffer.AudioBytes = frames * (format_.bits / 8) * format_.channels;
+        const size_t bytes = static_cast<size_t>(frames) * (format_.bits / 8) * format_.channels;
+        if (bytes > pcm_.size() || bytes > UINT32_MAX) return false;
+        buffer.AudioBytes = static_cast<UINT32>(bytes);
         buffer.pAudioData = pcm_.data();  // one shared quiet block; content is never recorded
-        buffer.Flags = XAUDIO2_END_OF_STREAM * 0;
+        buffer.pContext = &buffer;
         const HRESULT hr = voice_->SubmitSourceBuffer(&buffer);
         if (FAILED(hr)) {
             ++trace_.drops;
@@ -225,9 +227,10 @@ public:
     }
     void stop() override
     {
-        voice_->Stop(0);
-        trace_.stopped = true;
-        trace_.events.push_back({"stop", 0});
+        if (SUCCEEDED(voice_->Stop(0))) {
+            trace_.stopped = true;
+            trace_.events.push_back({"stop", 0});
+        }
     }
     VoiceState state() override
     {
@@ -240,29 +243,31 @@ public:
         trace_.clock_frames = out.played_frames;
         return out;
     }
-    Trace& trace() override { return trace_; }
+    Trace& trace() override
+    {
+        trace_.callbacks = completed_.load();
+        return trace_;
+    }
+    bool callback_failed() const override { return callback_error_.load(); }
     void prepare(unsigned block_frames)
     {
         block_frames_ = block_frames;
-        pcm_.assign(block_frames * format_.channels, 0);
+        pcm_.assign(static_cast<size_t>(block_frames) * format_.channels * (format_.bits / 8), 0);
         buffers_ = new XAUDIO2_BUFFER[max_blocks]{};
     }
-    IXAudio2SourceVoice* voice() const { return voice_; }
-
-    // IXAudio2VoiceCallback: count and record; nothing else.
+    // Voice callbacks update only atomics; the driving thread owns the trace.
     void __stdcall OnVoiceProcessingPassStart(UINT32) override {}
     void __stdcall OnVoiceProcessingPassEnd() override {}
     void __stdcall OnStreamEnd() override {}
     void __stdcall OnBufferStart(void*) override {}
-    void __stdcall OnBufferEnd(void*) override
+    void __stdcall OnBufferEnd(void* context) override
     {
-        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&ended_));
-        ++trace_.callbacks;
-        trace_.events.push_back({"callback", 0});
+        const unsigned index = completed_.load();
+        if (index >= max_blocks || context != &buffers_[index]) callback_error_.store(true);
+        completed_.fetch_add(1);
     }
     void __stdcall OnLoopEnd(void*) override {}
-    void __stdcall OnVoiceError(void*, HRESULT) override {}
-    long ended() const { return ended_; }
+    void __stdcall OnVoiceError(void*, HRESULT) override { callback_error_.store(true); }
 
 private:
     static constexpr int max_blocks = 256;
@@ -274,11 +279,13 @@ private:
     int submit_index_ = 0;
     unsigned block_frames_ = 480;
     Trace trace_;
-    long ended_ = 0;
+    std::atomic<unsigned> completed_{0};
+    std::atomic<bool> callback_error_{false};
 };
 
 class SystemProvider final : public Provider {
 public:
+    ~SystemProvider() override { close(); }
     const char* name() const override { return "system"; }
     std::string open() override
     {
@@ -336,13 +343,14 @@ bool run_plan(Provider& provider, const Plan& plan, Trace& trace, unsigned long 
     auto* system_voice = dynamic_cast<SystemVoice*>(voice);
     if (system_voice) system_voice->prepare(plan.block_frames);
     voice->start();
+    if (!voice->trace().started) return false;
 
     const ULONGLONG begin = GetTickCount64();
     int submitted = 0;
     while (submitted < plan.blocks) {
         const int batch = plan.bursty ? 6 : 1;
         for (int i = 0; i < batch && submitted < plan.blocks; ++i) {
-            if (!voice->submit(plan.block_frames)) break;
+            if (voice->callback_failed() || !voice->submit(plan.block_frames)) return false;
             ++submitted;
             // The clock is advanced only while waiting, not between back-to-back submits: playback
             // consumes during the wait, which is what makes the callback order match the system arm.
@@ -369,8 +377,9 @@ bool run_plan(Provider& provider, const Plan& plan, Trace& trace, unsigned long 
     voice->stop();
     trace = voice->trace();
     elapsed_ms = GetTickCount64() - begin;
+    const bool complete = trace.stopped && trace.callbacks == trace.submitted_buffers && !voice->callback_failed();
     provider.close();
-    return true;
+    return complete;
 }
 
 bool same_lifecycle(const Trace& a, const Trace& b, std::string& why)
@@ -388,15 +397,8 @@ bool same_lifecycle(const Trace& a, const Trace& b, std::string& why)
     }
     return true;
 }
-}  // namespace
-
-int main()
+int run()
 {
-    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
-        std::printf("skip: COM initialisation failed\n");
-        return skip_no_device;
-    }
-
     bool ok = true;
     for (const Plan& plan : {Plan{"steady", false, 120, 480, 0}, Plan{"bursty", true, 120, 480, 150}}) {
         // Both arms run the same plan; the diagnostic arm is the window being validated.
@@ -435,11 +437,22 @@ int main()
         }
     }
 
-    CoUninitialize();
     if (!ok) {
         std::printf("FAIL: the diagnostic arm did not observe the same lifecycle as the system arm\n");
         return 1;
     }
     std::printf("PASS: diagnostic and system providers observed the same lifecycle and buffer arguments\n");
     return 0;
+}
+}  // namespace
+
+int main()
+{
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+        std::printf("COM initialisation failed\n");
+        return 2;
+    }
+    const int result = run();
+    CoUninitialize();
+    return result;
 }
