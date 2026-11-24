@@ -1002,8 +1002,12 @@ cube-array view, and widths, first elements, addresses and destinations above 4 
 Checks:
 
 `startup_memory_srv_buffer` is device-free and owns every rejection (bounds, alignment, format,
-stride). `startup_address_buffer_srv_*` exercises only the resolve path with valid addresses on a
-device, so it does not cover the rejections.
+stride). It changes each buffer description and view field alone, checks the element bytes of every
+typed format, views that end exactly at the end of the buffer, raw alignment of the adjusted first
+element, and widths, addresses and first elements above 4 GiB. Its `_control` runs (`height`,
+`exact-fit`, `first-32`) expect wrong answers and must fail. `startup_address_buffer_srv_*` exercises
+only the resolve path with valid addresses on a device, so it does not cover the rejections.
 
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer)$' -V`
+- `ctest --preset release --no-tests=error -R '^startup_memory_srv_buffer_.*_control$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_address_(srv|buffer_srv)_' -V`

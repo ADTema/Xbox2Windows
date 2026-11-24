@@ -809,11 +809,16 @@ endforeach()
 add_test(NAME startup_present_view_srgb_control COMMAND startup_present_view_check warp --mutate srgb)
 set_tests_properties(startup_present_view_identity_control startup_present_view_srgb_control PROPERTIES WILL_FAIL TRUE)
 set_tests_properties(startup_present_view_hardware PROPERTIES SKIP_RETURN_CODE 77)
-# Buffer and raytracing acceleration-structure memory SRV validation (src/startup_stubs/memory_srv_buffer.h).
+# Buffer memory SRV validation for device slot 70 (src/startup_stubs/memory_srv_buffer.h); the mutated
+# runs are negative controls.
 add_executable(startup_memory_srv_buffer_check tests/startup_memory_srv_buffer_check.cpp)
 target_include_directories(startup_memory_srv_buffer_check PRIVATE src)
 target_compile_features(startup_memory_srv_buffer_check PRIVATE cxx_std_17)
 add_test(NAME startup_memory_srv_buffer COMMAND startup_memory_srv_buffer_check)
+foreach(mutation IN ITEMS height exact-fit first-32)
+    add_test(NAME startup_memory_srv_buffer_${mutation}_control COMMAND startup_memory_srv_buffer_check --mutate ${mutation})
+    set_tests_properties(startup_memory_srv_buffer_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # Console allocation sizes for depth-with-stencil and multisampled textures
 # (src/startup_stubs/console_plane_size.h); the mutated run is the negative control.
 add_executable(startup_plane_size_check tests/startup_plane_size_check.cpp)
