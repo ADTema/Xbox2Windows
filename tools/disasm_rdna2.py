@@ -463,6 +463,10 @@ VOP1_OPS = {
     0x39: ("v_ffbh_u32_e32", "Find first bit high uint32"),
     0x3a: ("v_ffbl_b32_e32", "Find first bit low uint32"),
     0x3b: ("v_ffbh_i32_e32", "Find first bit high int32"),
+    0x42: ("v_movreld_b32_e32", "Vector copy with relative destination"),
+    0x43: ("v_movrels_b32_e32", "Vector copy with relative source"),
+    0x44: ("v_movrelsd_b32_e32", "Vector copy with relative source and destination"),
+    0x48: ("v_movrelsd_2_b32_e32", "Vector copy with relative source and destination (extended form)"),
 }
 
 VOPC_OPS = {
@@ -697,8 +701,10 @@ VOP2_OPS = {
     0x2c: ("v_fmamk_f32", "Vector fused multiply-add with literal multiplier"),
     0x2d: ("v_fmaak_f32", "Vector fused multiply-add with literal addend"),
     0x2f: ("v_cvt_pkrtz_f16_f32_e32", "Convert two float32 to packed float16 (round to zero)"),
+    0x36: ("v_fmac_f16_e32", "Vector fused multiply-accumulate float16"),
     0x37: ("v_fmamk_f16", "Vector fused multiply-add float16 with literal multiplier"),
     0x38: ("v_fmaak_f16", "Vector fused multiply-add float16 with literal addend"),
+    0x3b: ("v_ldexp_f16_e32", "Vector scale float16 by a power of two"),
 }
 
 VOP3_NATIVE_OPS = {

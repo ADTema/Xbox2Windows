@@ -114,6 +114,39 @@ def envelope(code: bytes, name: bytes = b"fixture_ps") -> bytes:
 class TestRdna2Disasm(unittest.TestCase):
     """Test pure-Python RDNA 2 disassembler and verify against golden vectors and LLVM."""
 
+    # GFX1013 e32 encodings from llvm-mc 19 -show-encoding.
+    VOP1_VOP2_E32_VECTORS = (
+        ("050f066c", "v_fmac_f16_e32 v3, v5, v7"),
+        ("0d231676", "v_ldexp_f16_e32 v11, v13, v17"),
+        ("1785267e", "v_movreld_b32_e32 v19, v23"),
+        ("1f873a7e", "v_movrels_b32_e32 v29, v31"),
+        ("29894a7e", "v_movrelsd_b32_e32 v37, v41"),
+        ("2f91567e", "v_movrelsd_2_b32_e32 v43, v47"),
+    )
+
+    def test_vop1_vop2_e32_gfx1013(self):
+        for encoding, assembly in self.VOP1_VOP2_E32_VECTORS:
+            with self.subTest(assembly=assembly):
+                record, = disasm_rdna2(bytes.fromhex(encoding))
+                self.assertEqual(record["assembly"], assembly)
+
+    def test_vop1_vop2_e32_llvm_round_trip(self):
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"VOP1/VOP2 round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        source = [assembly for _, assembly in self.VOP1_VOP2_E32_VECTORS]
+        expected = bytes.fromhex("".join(encoding for encoding, _ in self.VOP1_VOP2_E32_VECTORS))
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        self.assertEqual(emitted, expected)
+        decoded = [record["assembly"] for record in disasm_rdna2(emitted)]
+        self.assertEqual(decoded, llvm_disassemble(emitted, resolved_lib))
+        self.assertEqual(decoded, source)
+        self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
+
     def test_golden_vectors(self):
         vectors = [
             # (hex_bytes, expected_opcode, expected_mnemonic)
