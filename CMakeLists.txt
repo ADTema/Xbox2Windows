@@ -631,6 +631,15 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
 endforeach()
 
+add_executable(startup_upload_arena tests/startup_upload_arena.cpp)
+target_compile_features(startup_upload_arena PRIVATE cxx_std_17)
+target_include_directories(startup_upload_arena PRIVATE src)
+target_link_libraries(startup_upload_arena PRIVATE d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_upload_arena_${backend} COMMAND startup_upload_arena ${backend})
+    set_tests_properties(startup_upload_arena_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+endforeach()
+
 # OMSetRenderTargets with a single descriptor range, handles that hold no view, and a cleared copied descriptor.
 add_executable(startup_rtv_bind tests/startup_rtv_bind.cpp)
 target_compile_features(startup_rtv_bind PRIVATE cxx_std_17)
