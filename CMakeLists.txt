@@ -1264,6 +1264,14 @@ else()
 endif()
 add_test(NAME xg_bc64_tiling_reference COMMAND xg_swizzle_select_check --bc64-tiling)
 set_tests_properties(xg_bc64_tiling_reference PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+# Which descriptions take the 64 KiB standard BC chain (src/startup_stubs/bc64_chain.h), without addrlib
+# or a device. The mutated run expects layout UNKNOWN to be accepted and is the negative control.
+add_executable(startup_bc64_supports_check tests/startup_bc64_supports_check.cpp)
+target_compile_features(startup_bc64_supports_check PRIVATE cxx_std_17)
+target_include_directories(startup_bc64_supports_check PRIVATE src)
+add_test(NAME startup_bc64_supports COMMAND startup_bc64_supports_check)
+add_test(NAME startup_bc64_supports_layout_control COMMAND startup_bc64_supports_check --mutate layout)
+set_tests_properties(startup_bc64_supports_layout_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME xg_swizzle_select COMMAND xg_swizzle_select_check)
 set_tests_properties(xg_swizzle_select PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 # Mutation control: the same comparison must identify all nine mismatches.
