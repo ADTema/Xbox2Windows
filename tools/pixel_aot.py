@@ -75,9 +75,9 @@ def _bounded_code(image, start):
     return image[start:end]
 
 
-def _check_two_exits(code, llvm):
+def _check_two_exits(code, llvm, *, cpu, features):
     """Both decoded exits must be reachable from the single entry."""
-    instructions = dict(disassemble(code, llvm, offsets=True))
+    instructions = dict(disassemble(code, llvm, offsets=True, cpu=cpu, features=features))
     exits = [pc for pc, line in instructions.items() if line == "s_endpgm"]
     if len(exits) != 2 or exits[-1] + 4 != len(code):
         raise ValueError("Expected two decoded exits")
@@ -121,7 +121,8 @@ def _check_two_exits(code, llvm):
         raise ValueError("Unreachable code or unverified alternate exit")
 
 
-def native_program(archive: Path, record: str, *, container_sha256: str | None = None, llvm=None) -> tuple[bytes, bytes]:
+def native_program(archive: Path, record: str, *, container_sha256: str | None = None, llvm=None,
+                   cpu=b"gfx1013", features=b"") -> tuple[bytes, bytes]:
     name = record.encode("ascii")
     if not 0 < len(name) < 255 or b"\0" in name:
         raise ValueError("Invalid length-prefixed record name")
@@ -139,10 +140,10 @@ def native_program(archive: Path, record: str, *, container_sha256: str | None =
             blob = _read_named_container(data, end)
         else:
             blob = _select_named_container(data, needle, container_sha256.lower())
-    return blob, container_code(parts(blob)[b"DXIL"], stage=0, llvm=llvm)
+    return blob, container_code(parts(blob)[b"DXIL"], stage=0, llvm=llvm, cpu=cpu, features=features)
 
 
-def container_code(program, *, stage, llvm=None):
+def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
     """Extract the stage-specific instruction stream from a DXIL program part."""
     if len(program) < 24 or struct.unpack_from("<H", program, 2)[0] != stage:
         raise ValueError("Unexpected shader stage")
@@ -174,7 +175,7 @@ def container_code(program, *, stage, llvm=None):
         # Exactly two exits, verified for pixel (0) and compute (5) only. Mesh and other
         # stages, and three or more markers, stay rejected.
         if stage in (0, 5) and markers == 2 and llvm is not None:
-            _check_two_exits(code, llvm)
+            _check_two_exits(code, llvm, cpu=cpu, features=features)
             return code
         raise ValueError("Unverified multi-exit program")
     # Older fixtures lack the section extent; preserve their unique-marker rule.
@@ -225,6 +226,23 @@ SamplerState samp : register(s0);"""
 DEPTH_COMPARE = ("NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_EQUAL", "ALWAYS")
 # D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT and D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT.
 COMPARISON_FILTERS = {0: ("point", 0x80), 1: ("bilinear", 0x94)}
+
+
+def sample_offset_arg(reg, vector, sample_dest, known_ssa_bits):
+    if reg in sample_dest:
+        raise ValueError("Sample offset used before vmcnt wait")
+    value = vector.get(reg)
+    if not isinstance(value, str) or value not in known_ssa_bits:
+        raise ValueError("Sample offset must be a known packed integer word")
+    packed = known_ssa_bits[value]
+    # RDNA 2 packs signed six-bit X and Y at bits [5:0] and [13:8].
+    if packed & ~0x3f3f:
+        raise ValueError("Sample offset must be a canonical 2D offset word")
+    x = ((packed & 0x3f) ^ 0x20) - 0x20
+    y = (((packed >> 8) & 0x3f) ^ 0x20) - 0x20
+    if not (-8 <= x <= 7 and -8 <= y <= 7):
+        raise ValueError("Sample offset is outside the DXIL immediate range [-8, 7]")
+    return f", int2({x}, {y})"
 
 
 def comparison_sampler_state(words):
@@ -632,6 +650,9 @@ INTEGER = {
     "cvt_pk_u16_u32": (2, "min({0}, 65535u) | (min({1}, 65535u) << 16u)"),
     "cvt_pk_i16_i32": (2, "(asuint(clamp(asint({0}), -32768, 32767)) & 0xffffu) | "
                           "(asuint(clamp(asint({1}), -32768, 32767)) << 16u)"),
+    # Clamp both signed halfwords independently and write a full dword with bits 31:16 clear.
+    "sat_pk_u8_i16": (1, "uint(clamp(asint({0} << 16) >> 16, 0, 255)) | "
+                         "(uint(clamp(asint({0}) >> 16, 0, 255)) << 8)"),
     "alignbit_b32": (3, "(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))"),
     "alignbyte_b32": (3, "(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - (({2} & 3u) * 8u)))))"),
     "add3_u32": (3, "({0} + {1} + {2})"),
@@ -722,6 +743,33 @@ uint mul_hi_i32(uint a, uint b) {
     return mul_hi_u32(a, b) - ((a >> 31) != 0u ? b : 0u) - ((b >> 31) != 0u ? a : 0u);
 }
 """,
+    "cmp_f64": """// v_cmp_*_f64 and v_cmp_class_f64 on the raw (low, high) words of binary64 sources; no HLSL double is used.
+// num64: the encoding is not a NaN. key64: an unsigned (low, high) key with the order of the non-NaN values, in
+// which -0 and +0 share one key; the high words decide unless equal. Denormals compare as their values.
+bool num64(uint lo, uint hi) {
+    uint magnitude = hi & 0x7fffffffu;
+    return magnitude < 0x7ff00000u || (magnitude == 0x7ff00000u && lo == 0u);
+}
+uint2 key64(uint lo, uint hi) {
+    if (((hi & 0x7fffffffu) | lo) == 0u) return uint2(0u, 0x80000000u);
+    return hi >= 0x80000000u ? uint2(~lo, ~hi) : uint2(lo, hi | 0x80000000u);
+}
+bool lt64(uint2 a, uint2 b) {
+    return a.y < b.y || (a.y == b.y && a.x < b.x);
+}
+bool eq64(uint2 a, uint2 b) {
+    return a.y == b.y && a.x == b.x;
+}
+// The ten binary64 classes of LLVM SIInstrFlags::ClassFlags, in the order of class32.
+uint class64(uint lo, uint hi) {
+    uint magnitude = hi & 0x7fffffffu;
+    bool negative = hi >= 0x80000000u;
+    if (!num64(lo, hi)) return (hi & 0x00080000u) != 0u ? 0x2u : 0x1u;
+    if (magnitude == 0x7ff00000u) return negative ? 0x4u : 0x200u;
+    if (magnitude >= 0x00100000u) return negative ? 0x8u : 0x100u;
+    if ((magnitude | lo) != 0u) return negative ? 0x10u : 0x80u;
+    return negative ? 0x20u : 0x40u;
+}""",
     "s_lshl_b64": (
         "uint2 s_lshl_b64(uint2 v, uint s) {\n"
         "    s &= 63u;\n"
@@ -1835,6 +1883,63 @@ def require_proven_i32_f32_range(base, has_abs, has_neg, scalar, vector, known_s
     return eff_bits
 
 
+CVT_F64_F32_INLINE = {"0": 0x00000000, "0.5": 0x3f000000, "-0.5": 0xbf000000, "1.0": 0x3f800000, "-1.0": 0xbf800000,
+                      "2.0": 0x40000000, "-2.0": 0xc0000000, "4.0": 0x40800000, "-4.0": 0xc0800000,
+                      "0.15915494": 0x3e22f983}
+CVT_F64_F32_E64_SOURCE = re.compile(r"neg\((0x[0-9a-f]{1,8})\)|(-?)(\|?)([vs]\d+|0x[0-9a-f]{1,8})(\|?)")
+
+
+def cvt_f64_f32_words(bits):
+    """Return the (low, high) binary64 words of the exact conversion of binary32 bits, or raise ValueError.
+
+    Exact for every finite normal value: sign kept, exponent rebased from 127 to 1023, the 23-bit fraction placed at
+    the top of the 52-bit fraction. Zero keeps its sign (hi 0x80000000 for -0) and infinity maps to exponent 0x7ff
+    with a zero fraction. A subnormal input is refused because the f32 denorm mode (MODE[5:4]) has no declared
+    profile in this translator, and a NaN is refused (issue 312).
+    """
+    sign, exponent, fraction = bits >> 31, (bits >> 23) & 0xff, bits & 0x7fffff
+    if exponent == 0xff and fraction:
+        raise ValueError(f"v_cvt_f64_f32 source 0x{bits:08x} is a NaN")
+    if exponent == 0 and fraction:
+        raise ValueError(f"v_cvt_f64_f32 source 0x{bits:08x} is a subnormal")
+    if exponent == 0:
+        return 0, sign << 31
+    if exponent == 0xff:
+        return 0, (sign << 31) | 0x7ff00000
+    return (fraction & 7) << 29, (sign << 31) | ((exponent - 127 + 1023) << 20) | (fraction >> 3)
+
+
+def cvt_f64_f32_source_bits(base, scalar, vector, pending, sample_dest, known_ssa_bits):
+    """Return the statically known binary32 bits of the source of v_cvt_f64_f32, or raise ValueError.
+
+    The domain is the one of require_proven_i32_f32_range: a hex literal, a binary32 inline constant, a SGPR that
+    holds a tracked integer, or a VGPR whose bits known_ssa_bits records. Any other register is an unproven runtime
+    input. An integer inline constant other than 0 is a subnormal (1..64) or an all-ones NaN pattern (-16..-1),
+    never a float, and is refused with the other unlisted spellings.
+    """
+    if base in CVT_F64_F32_INLINE:
+        return CVT_F64_F32_INLINE[base]
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", base):
+        return int(base, 16)
+    if not (m := re.fullmatch(r"([vs])(\d+)", base)):
+        raise ValueError(f"Unsupported v_cvt_f64_f32 source {base}")
+    if int(m.group(2)) > (255 if m.group(1) == "v" else 105):
+        raise ValueError(f"Register out of range: {base}")
+    if base in pending:
+        raise ValueError("Constant read before load completion")
+    if base in sample_dest:
+        raise ValueError("Sample used before vmcnt wait")
+    if m.group(1) == "s":
+        value = scalar.get(base)
+        if not isinstance(value, int):
+            raise ValueError(f"Unproven runtime input {base} at v_cvt_f64_f32")
+        return value & 0xffffffff
+    ssa = vector.get(base)
+    if not isinstance(ssa, str) or ssa not in known_ssa_bits:
+        raise ValueError(f"Unproven runtime input {base} at v_cvt_f64_f32")
+    return known_ssa_bits[ssa] & 0xffffffff
+
+
 def fp_operand(token, scalar, vector, pending, sample_dest, *,
                quad_values: dict[str, bool] | None = None, ignore_sign=False):
     if re.fullmatch(r"-\d+", token):
@@ -1971,6 +2076,92 @@ def int64_operand(token, scalar, vector, pending, sample_dest, *, signed, encodi
         high = f"{value >> 32}u"
         return f"{value & 0xffffffff}u", f"asint({high})" if signed else high
     raise invalid
+
+
+# Inline constants a binary64 comparison source accepts, as high words (the low word is 0). The integer 0 is +0.0
+# under either reading of an integer inline constant on a binary64 operand; other integers and 1/(2*pi) are refused.
+F64_INLINE_HIGH = {"0": 0x00000000, "0.5": 0x3fe00000, "-0.5": 0xbfe00000, "1.0": 0x3ff00000, "-1.0": 0xbff00000,
+                   "2.0": 0x40000000, "-2.0": 0xc0000000, "4.0": 0x40100000, "-4.0": 0xc0100000}
+# Ordered binary64 relations on the key64 keys {a} and {b}; the n* predicates are their negations, true on NaN.
+F64_RELATION = {"lt": "lt64({a}, {b})", "eq": "eq64({a}, {b})", "le": "!lt64({b}, {a})", "gt": "lt64({b}, {a})",
+                "lg": "!eq64({a}, {b})", "ge": "!lt64({a}, {b})"}
+F64_NEGATED = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
+
+
+def f64_operand(token, scalar, vector, pending, sample_dest, *, encoding, position, allow_mods=True):
+    """Return the (low, high) HLSL words of a binary64 comparison source.
+
+    Registers follow int64_operand. Inline constants are 0 and the binary64 values in F64_INLINE_HIGH. The e64
+    neg (-x) and abs (|x|) modifiers act on the sign bit of the high word, as binary64 operand modifiers do.
+    """
+    invalid = ValueError(f"Invalid 64-bit comparison operand: {token}")
+    raw, negate, absolute = token, False, False
+    if raw.startswith("-") and raw not in F64_INLINE_HIGH:
+        raw, negate = raw[1:], True
+    if m := re.fullmatch(r"\|([^|]+)\|", raw):
+        raw, absolute = m[1], True
+    if (negate or absolute) and (encoding != "e64" or not allow_mods):
+        raise invalid
+    if raw in F64_INLINE_HIGH:
+        if encoding == "e32" and position == 1:
+            raise ValueError("64-bit comparison e32 src1 must be a VGPR pair")
+        low, high = "0u", f"{F64_INLINE_HIGH[raw]}u"
+    elif re.fullmatch(r"-?\d+", raw):
+        raise invalid
+    else:
+        low, high = int64_operand(raw, scalar, vector, pending, sample_dest, signed=False,
+                                  encoding=encoding, position=position)
+    if absolute:
+        high = f"({high} & 0x7fffffffu)"
+    if negate:
+        high = f"({high} ^ 0x80000000u)"
+    return low, high
+
+
+def f64_comparison(i, op, tokens, encoding, scalar, vector, pending, sample_dest):
+    """HLSL word declarations and the predicate of a binary64 v_cmp or v_cmpx of `tokens` (op may be "class").
+
+    The predicates compare the raw (low, high) words with the cmp_f64 helpers and use no HLSL double; the caller
+    adds the helpers and checks the binary64 denormal entry state.
+    """
+    if op == "class":
+        low, high = f64_operand(tokens[0], scalar, vector, pending, sample_dest, encoding=encoding, position=0,
+                                allow_mods=False)
+        classes = tokens[1]
+        if encoding == "e32" and not re.fullmatch(r"v\d+", classes):
+            raise ValueError("VOPC e32 src1 must be a VGPR")
+        if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+            bits = f"{int(classes, 0) & 0xffffffff}u"
+        elif re.fullmatch(r"[vs]\d+", classes):
+            bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
+        else:
+            raise ValueError("Unsupported class mask")
+        return [], f"(class64({low}, {high}) & {bits}) != 0u"
+    words = [f64_operand(t, scalar, vector, pending, sample_dest, encoding=encoding, position=n)
+             for n, t in enumerate(tokens)]
+    lines = [f"    uint cmp{i}_{name} = {value};" for name, value in zip(("l0", "h0", "l1", "h1"), (*words[0], *words[1]))]
+    lines += [f"    bool cmp{i}_o = num64(cmp{i}_l0, cmp{i}_h0) && num64(cmp{i}_l1, cmp{i}_h1);",
+              f"    uint2 cmp{i}_a = key64(cmp{i}_l0, cmp{i}_h0);",
+              f"    uint2 cmp{i}_b = key64(cmp{i}_l1, cmp{i}_h1);"]
+    keys = {"a": f"cmp{i}_a", "b": f"cmp{i}_b"}
+    if op in F64_RELATION:
+        expr = f"cmp{i}_o && {F64_RELATION[op].format(**keys)}"
+    elif op in F64_NEGATED:
+        expr = f"!(cmp{i}_o && {F64_RELATION[F64_NEGATED[op]].format(**keys)})"
+    else:
+        expr = {"o": f"cmp{i}_o", "u": f"!cmp{i}_o"}.get(op, COMPARE[op])
+    return lines, expr
+
+
+def int64_comparison(i, op, kind, tokens, encoding, scalar, vector, pending, sample_dest):
+    """HLSL word declarations and the predicate of a 64-bit integer v_cmp or v_cmpx of `tokens`."""
+    words = [int64_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i64",
+                           encoding=encoding, position=n) for n, t in enumerate(tokens)]
+    word_type = "int" if kind == "i64" else "uint"
+    names = [f"cmp{i}_l0", f"cmp{i}_h0", f"cmp{i}_l1", f"cmp{i}_h1"]
+    lines = [f"    {'uint' if name[-2] == 'l' else word_type} {name} = {value};"
+             for name, value in zip(names, (words[0][0], words[0][1], words[1][0], words[1][1]))]
+    return lines, INT64_COMPARE[op].format(l0=names[0], h0=names[1], l1=names[2], h1=names[3])
 
 
 def dpp_vgpr(token, vector, sample_dest, *, allow_mods):
@@ -2132,6 +2323,38 @@ def f16_cmp_operand(token, scalar, vector, pending, sample_dest, *, allow_mods, 
     if neg:
         expr = f"(-{expr})"
     return expr
+
+
+def f16_comparison(op, tokens, scalar, vector, pending, sample_dest, *, allow_mods):
+    """The predicate of a binary16 v_cmp or v_cmpx of `tokens`: ordered relations also require num16 of both."""
+    values = [f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=False)
+              for t in tokens]
+    raw = [f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=True)
+           for t in tokens]
+    ordered = f"(num16({raw[0]}) && num16({raw[1]}))"
+    direct = {"lt": "lt", "eq": "eq", "le": "le", "gt": "gt", "lg": "lg", "ge": "ge"}
+    negated = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
+    if op in direct:
+        return f"({ordered} && ({COMPARE[op].format(*values)}))"
+    if op in negated:
+        return f"!({ordered} && ({COMPARE[negated[op]].format(*values)}))"
+    if op == "o":
+        return ordered
+    if op == "u":
+        return f"!{ordered}"
+    return COMPARE[op]
+
+
+def f16_class(value, classes, scalar, vector, pending, sample_dest, *, allow_mods):
+    """The predicate of a binary16 v_cmp_class or v_cmpx_class: the class of the low 16 bits of `value` in the mask."""
+    if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+        bits = f"{int(classes, 0) & 0xffffffff}u"
+    elif re.fullmatch(r"[vs]\d+", classes):
+        bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
+    else:
+        raise ValueError("Unsupported class mask")
+    operand = f16_cmp_operand(value, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=True)
+    return f"(class16({operand}) & {bits}) != 0u"
 
 
 def parse_vop3p_f16(rest, arity):
@@ -2523,6 +2746,10 @@ REGION_SALU_DEST = re.compile(r"s_(?:mov_b32|movk_i32|add_i32|mul_i32|cselect_b3
 # Stage 1 of issue #987: scalar instructions that leave every tracked register and counter unchanged may also sit
 # in a region, because skipping them with the whole wave (s_cbranch_execz) or running them changes nothing.
 REGION_NOP = re.compile(r"s_nop (?:0x[0-9a-f]+|\d+)")
+# Stage 3 of issue #987: scalar loads run whatever the execution mask, so the constant and pointer loads the
+# translator already lowers may sit in a region. Group 1 is a single destination SGPR, groups 2 and 3 a range.
+REGION_SLOAD = re.compile(
+    r"s_(?:buffer_)?load_dword(?:x(?:2|4|8))? (?:s(\d+)|s\[(\d+):(\d+)\]), s\[\d+:\d+\], (?:0x[0-9a-f]+|null)")
 WAIT_COUNTERS = {"vmcnt": "vm", "lgkmcnt": "lgkm", "expcnt": "exp", "vscnt": "vs"}
 
 
@@ -2543,6 +2770,34 @@ def wait_counters(line):
     return None
 
 
+SCALAR_OPERAND = re.compile(r"s(?:\d|[1-9]\d|10[0-5])|vcc")
+VECTOR_OPERAND = re.compile(r"v(?:\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])")
+
+
+class UnboundOperand(ValueError):
+    """A guest register is read while lower() holds no value for it.
+
+    The register is an entry register the caller did not bind (only the texture table, the interpolation base,
+    v0, v1 and the entry registers of the constant contract start bound) or a register no earlier instruction
+    wrote. bank is "scalar" or "vector", index the 0-based instruction number, offset its byte offset when lower()
+    received (offset, text) pairs and None otherwise. Only s0-s105, vcc and v0-v255 are reported this way: any
+    other missing key in the register state is an internal lookup error and stays a KeyError.
+    """
+
+    def __init__(self, bank, register, index, offset, instruction):
+        self.bank, self.register = bank, register
+        self.index, self.offset, self.instruction = index, offset, instruction
+        where = "" if offset is None else f" (byte offset {offset:#x})"
+        super().__init__(f"Unbound {bank} operand {register} at instruction {index}{where}: {instruction}")
+
+
+def unbound_operand(registers, key, pattern, bank):
+    """Raise UnboundOperand for a missing guest register read inside an instruction, else a plain KeyError."""
+    if registers.site is not None and isinstance(key, str) and pattern.fullmatch(key):
+        raise UnboundOperand(bank, key, *registers.site)
+    raise KeyError(key)
+
+
 class TrackedVector(VectorRegisters):
     """Vector register names that record reads, so a conditionally-written register can be refused."""
 
@@ -2551,10 +2806,14 @@ class TrackedVector(VectorRegisters):
         self.reads = []
         self.masked = False
         self.conditional = set()
+        self.site = None  # (index, byte offset or None, text) of the instruction being lowered
 
     def __getitem__(self, key):
         self.reads.append(key)
         return super().__getitem__(key)
+
+    def __missing__(self, key):
+        unbound_operand(self, key, VECTOR_OPERAND, "vector")
 
     def get(self, key, default=None):
         self.reads.append(key)
@@ -2575,10 +2834,14 @@ class TrackedScalar(dict):
         self.reads = []
         self.masked = False
         self.conditional = set()
+        self.site = None  # as TrackedVector.site
 
     def __getitem__(self, key):
         self.reads.append(key)
         return super().__getitem__(key)
+
+    def __missing__(self, key):
+        unbound_operand(self, key, SCALAR_OPERAND, "scalar")
 
     def get(self, key, default=None):
         self.reads.append(key)
@@ -2619,6 +2882,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     half_denorm declares the binary16 denormal state at shader entry (MODE[7:6]). Only "preserve" is accepted; None
     means unknown, and the plain binary16 VOP2 arithmetic forms are then refused. The caller takes it from validated
     guest state; the translator does not measure or track it.
+    A read of a guest register that holds no tracked value raises UnboundOperand, a ValueError that names the
+    register and the instruction, so a missing entry binding is not mistaken for an unsupported instruction.
     """
     if title_ranges is not None and (isinstance(title_ranges, bool) or not isinstance(title_ranges, int)
                                      or not 1 <= title_ranges <= 0xffffffff):
@@ -2761,7 +3026,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if (region is None or pair != region["save"]
                 or (region["skip"] is not None and region["skip"] != i)):
             raise ValueError("Unexpected execution mask restore")
-        for dst, outer in region["written"].items():
+        if region["else"] is not None:
+            # Join of an if/else (issue #1315): each register takes its then-arm value where the condition holds
+            # and its else-arm value elsewhere, the pre-region value standing in for an arm that did not write it.
+            # A register undefined before the region and on either arm stays undefined after the join.
+            else_written = region["else_written"]
+            for dst in [*region["written"], *(d for d in else_written if d not in region["written"])]:
+                outer = region["written"][dst] if dst in region["written"] else else_written[dst]
+                in_then, in_else = dst in region["then"], dst in else_written
+                if dst in vector.conditional or (outer is MISSING and not (in_then and in_else)):
+                    vector.conditional.add(dst)
+                    continue
+                if outer is not MISSING and (not isinstance(outer, str) or outer in ("bary_i", "bary_j")):
+                    raise ValueError("Masked region rewrites a register without a numeric value")
+                then_value = region["then"][dst] if in_then else outer
+                else_value = dict.get(vector, dst) if in_else else outer
+                lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {then_value} : {else_value});")
+                vector[dst] = f"alu{i}_{dst}"
+        for dst, outer in ({} if region["else"] is not None else region["written"]).items():
             if outer is MISSING or dst in vector.conditional:
                 vector.conditional.add(dst)
                 continue
@@ -2770,6 +3052,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             inner = vector[dst]
             lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
             vector[dst] = f"alu{i}_{dst}"
+        if region["skipped"]:
+            # A wave that skipped the region (or one arm) never ran its waits, so what was outstanding at the opener
+            # still is.
+            before_pending, before_samples = region["outstanding"]
+            pending.update(before_pending)
+            sample_dest.update(before_samples)
         vector.masked = False
         vector.reads.clear()
         scalar.masked = False
@@ -2778,8 +3066,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scc = None
 
     for i, (offset, line) in enumerate(positioned):
+        if region is not None and region["opener"] == "scc" and i == region["end"]:
+            # A uniform skip block ends where its branch lands, before that instruction runs and is checked.
+            close_region(i, None)
+            region = None
         vector.reads.clear()
         scalar.reads.clear()
+        scalar.site = vector.site = (i, offset, line)
         conditional = set(vector.conditional)
         scalar_conditional = set(scalar.conditional)
         def match(pattern):
@@ -2792,30 +3085,46 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("ds_swizzle_b32 requires an immediate s_waitcnt lgkmcnt(0)")
             ds_needs_wait = False
         rstate = None
-        if region is not None:
-            if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]", line):
+        if region is not None and region["opener"] == "scc":
+            # A uniform skip block (issue #1413) admits only per-lane vector ALU and s_nop: no memory, EXEC,
+            # scalar or wave updates and no nested branch or region.
+            if REGION_NOP.fullmatch(line):
                 pass
-            elif region["opener"] == "cmpx" and re.fullmatch(r"s_mov_b64 exec, s\[\d+:\d+\]", line):
+            elif not REGION_ALU.match(line):
+                raise ValueError(f"Instruction cannot run in a uniform skip block: {line}")
+            else:
+                rstate = (dict(scalar), dict(vector), scc, set(pending), dict(sample_dest),
+                          exported, ended, mask, attribute_input, interpolated,
+                          dict(quad_values), samples, False)
+        elif region is not None:
+            if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]|s_mov_b64 exec, s\[\d+:\d+\]", line):
+                pass
+            elif re.fullmatch(r"s_andn2_b64 exec, s\[\d+:\d+\], exec", line):
                 pass
             elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
-                    and i == region["start"] + 1 and region["skip"] is None):
+                    and i == region["arm_start"] + 1 and region["skip"] is None):
                 pass
             elif REGION_NOP.fullmatch(line):
                 pass
             elif (counters := wait_counters(line)) is not None:
                 if re.match(r"s_waitcnt_expcnt\s+s\d+,", line):
                     raise ValueError(f"Unsupported s_waitcnt_expcnt SGPR operand in a masked region: {line}")
-                # A wait is admitted only if every counter it names is already satisfied in the tracked state, so
-                # it resolves nothing whether the wave runs or skips it. Loads leave sample_dest and pending only
-                # through a wait, and overwriting an outstanding destination is refused, so empty means nothing is
-                # outstanding. No export can be outstanding (only s_endpgm may follow one). Scratch stores are
-                # not tracked on the store counter, so vscnt is unknown once any store has been lowered.
-                busy = sorted(name for name, outstanding in (("vm", sample_dest), ("lgkm", pending))
-                              if name in counters and outstanding)
-                if busy:
-                    raise ValueError(f"Wait would resolve outstanding {'/'.join(busy)} work in a masked region: {line}")
+                # A wait is a scalar instruction: it runs whatever the execution mask, so the main wait handler
+                # below resolves outstanding vm/lgkm work exactly as it does outside a region. A region that the
+                # whole wave may skip (s_cbranch_execz) leaves that work outstanding on the skipping path, so
+                # close_region puts the pre-region outstanding state back after such a region. No export can be
+                # outstanding (only s_endpgm may follow one). Scratch stores are not tracked on the store
+                # counter, so vscnt is unknown once any store has been lowered.
                 if "vs" in counters and scratch_written:
                     raise ValueError(f"Store counter state is unknown after a scratch store in a masked region: {line}")
+            elif sload := REGION_SLOAD.fullmatch(line):
+                loaded = ({f"s{sload[1]}"} if sload[1] is not None
+                          else {f"s{n}" for n in range(int(sload[2]), int(sload[3]) + 1)})
+                if loaded.intersection(region["save"]):
+                    raise ValueError(f"Masked scalar load overwrites the saved execution pair: {line}")
+                rstate = (dict(scalar), dict(vector), scc, set(pending), dict(sample_dest),
+                          exported, ended, mask, attribute_input, interpolated,
+                          dict(quad_values), samples, loaded)
             elif REGION_SALU.fullmatch(line):
                 destination = REGION_SALU_DEST.match(line)
                 if destination and destination[1] in region["save"]:
@@ -2997,9 +3306,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             wqm_width = None
             scc = None
         elif region is not None and (m := match(r"s_mov_b64 exec, (s\[\d+:\d+\])")):
-            # The v_cmpx region closes with an exact copy of the saved mask. Unlike s_or_b64 it leaves SCC.
-            if region["opener"] != "cmpx":
-                raise ValueError("Unexpected execution mask restore")
+            # Either opener may close with an exact copy of the saved pair (issue #1315 for s_and_saveexec_b64).
+            # EXEC inside the region is a subset of the saved entry mask, so this restores the same mask as
+            # s_or_b64 exec, exec, s[a:b]. Unlike s_or_b64 it leaves SCC; after s_and_saveexec_b64, which wrote
+            # SCC from the new EXEC, SCC is already untracked, so no reader can follow either close.
             close_region(i, sgpr_pair(m[1]))
             region = None
         elif m := match(r"s_mov_b64 (?:exec|exec_lo), (s\[\d+:\d+\])"):
@@ -3040,18 +3350,30 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                         != [(*condition[:2], j, len(regs)) for j in range(len(regs))]):
                 raise ValueError("Unsupported execution mask save")
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
-            region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i,
-                      "scalar_written": set(), "scc_written": False, "opener": "saveexec"}
+            region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
+                      "else_undefined": set(), "skipped": False,
+                      "scalar_written": set(), "scc_written": False, "opener": "saveexec",
+                      "outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
             scc = None
-        elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32))_e32 "
-                        r"([^,]+), ([^,]+)"):
+        elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32|i64|u64)"
+                        rf"|(eq|ne|lt|le|gt|ge)_(i16|u16)|(class)_f32"
+                        rf"|({'|'.join(COMPARE)})_f16|(class)_f16"
+                        rf"|({'|'.join(COMPARE)}|class)_f64)_e32 ([^,]+), ([^,]+)"):
             # A masked-if opened by a VOPC e32 compare that writes EXEC (issue #932). It must directly
             # follow `s_mov_b64 s[a:b], exec` of the known entry mask, so EXEC becomes the entry mask
             # intersected with the comparison, as after s_and_saveexec_b64. v_cmpx writes neither VCC nor
             # SCC, so both keep their tracked values; the region closes with s_mov_b64 or s_or_b64.
-            fop, iop, kind, src0, src1 = m.groups()
+            # The integer forms compare as the v_cmp of the same width (gfx10 has no f/t forms at 16 bits).
+            # v_cmpx_class_f32 tests the class of the raw binary32 encoding in src0 against the mask in VSRC1,
+            # as the e32 v_cmp_class_f32 does. The binary16 forms and v_cmpx_class_f16 read the low 16 bits
+            # of each source through the lowering of the e32 v_cmp_f16 and v_cmp_class_f16. The binary64 forms
+            # (and v_cmpx_class_f64) lower as the e32 v_cmp_*_f64 and need the same declared binary64 denormal
+            # entry state.
+            fop, iop, kind, op16, kind16, cls, hop, hcls, f64op, src0, src1 = m.groups()
+            if op16 is not None:
+                iop, kind = op16, kind16
             previous = instructions[i - 1] if i else ""
             previous = previous[1] if isinstance(previous, tuple) else previous
             saved = re.fullmatch(r"s_mov_b64 (s\[\d+:\d+\]), exec", previous)
@@ -3059,26 +3381,73 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if (region is not None or mask != "entry" or pair is None
                     or [scalar.get(r) for r in pair] != [("entry", 0), ("entry", 1)]):
                 raise ValueError("Unsupported v_cmpx execution mask save")
-            # VOPC e32 encodes VSRC1 as a VGPR and carries no source modifiers.
-            if not re.fullmatch(r"v\d+", src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0):
+            # VOPC e32 encodes VSRC1 as a VGPR (a VGPR pair at 64 bits) and carries no source modifiers.
+            wide = kind in ("i64", "u64") or f64op not in (None, "class")
+            vsrc1 = r"v\[\d+:\d+\]" if wide else r"v\d+"
+            if not re.fullmatch(vsrc1, src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0):
                 raise ValueError(f"Invalid VOPC e32 operands: {line}")
             if fop is not None:
                 expr = f32_comparison(fop, [src0, src1], scalar, vector, pending, sample_dest)
+            elif hop is not None or hcls is not None:
+                if hcls is not None:
+                    expr = f16_class(src0, src1, scalar, vector, pending, sample_dest, allow_mods=False)
+                else:
+                    expr = f16_comparison(hop, [src0, src1], scalar, vector, pending, sample_dest, allow_mods=False)
+            elif f64op is not None:
+                if half_denorm != HALF_DENORM_PRESERVE:
+                    raise ValueError("binary64 denormal mode unknown at entry")
+                helpers.add("cmp_f64")
+                declarations, expr = f64_comparison(i, f64op, [src0, src1], "e32", scalar, vector, pending,
+                                                    sample_dest)
+                lines.extend(declarations)
+            elif cls is not None:
+                operand = fp_operand(src0, scalar, vector, pending, sample_dest)
+                bits = fp_operand(src1, scalar, vector, pending, sample_dest)
+                expr = f"(class32({operand}) & asuint({bits})) != 0u"
+            elif kind in ("i64", "u64"):
+                declarations, expr = int64_comparison(i, iop, kind, [src0, src1], "e32",
+                                                      scalar, vector, pending, sample_dest)
+                lines.extend(declarations)
             else:
-                values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
+                read = int16_operand if kind in ("i16", "u16") else int_operand
+                values = [read(t, scalar, vector, pending, sample_dest, signed=kind in ("i32", "i16"))
                           for t in (src0, src1)]
                 expr = INT_COMPARE[iop].format(*values)
             lines.append(f"    bool cmp{i} = {expr};")
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
-            region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i,
-                      "scalar_written": set(), "scc_written": False, "opener": "cmpx"}
+            region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
+                      "else_undefined": set(), "skipped": False,
+                      "scalar_written": set(), "scc_written": False, "opener": "cmpx",
+                      "outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
+        elif m := match(r"s_cbranch_scc([01]) (-?0x[0-9a-f]+|-?\d+)"):
+            # A forward branch on a tracked scalar compare (issue #1413). SCC is a wave value, so the whole wave
+            # skips the block or runs it. The block's vector writes merge with a select on the condition under
+            # which it runs: SCC for s_cbranch_scc0, !SCC for s_cbranch_scc1. Offsets count from the next
+            # instruction, and the target must be a later instruction boundary.
+            if region is not None or mask != "entry" or offset is None:
+                raise ValueError("Unsupported uniform branch")
+            if not isinstance(scc, str) or not re.fullmatch(r"scc\d+", scc):
+                raise ValueError("Uniform branch requires a tracked scalar compare")
+            imm = int(m[2], 0)
+            if not -0x8000 <= imm <= 0x7fff:
+                raise ValueError("Uniform branch displacement out of range")
+            end = offset_index.get(offset + 4 + imm * 4)
+            if end is None or end <= i:
+                raise ValueError("Uniform branch targets no later instruction boundary")
+            region = {"save": None, "cond": scc if m[1] == "0" else f"(!{scc})", "written": {}, "skip": None,
+                      "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
+                      "else_undefined": set(), "skipped": False, "scalar_written": set(), "scc_written": False,
+                      "opener": "scc", "end": end, "outstanding": (set(pending), dict(sample_dest))}
+            vector.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
-            # The whole-wave empty-mask skip may sit right after the save; its target must be
-            # the matching restore exactly. Offsets count from the next instruction.
-            if (region is None or offset is None or i != region["start"] + 1
-                    or region["skip"] is not None or seen_skip):
+            # The whole-wave empty-mask skip may sit right after the save, or right after the else transition
+            # (issue #1315); its target must be the matching restore exactly, or for the skip after the save of a
+            # region with an else, that transition. Offsets count from the next instruction. Only the arms of one
+            # region may carry skips.
+            if (region is None or offset is None or i != region["arm_start"] + 1
+                    or region["skip"] is not None or (seen_skip and not region["skipped"])):
                 raise ValueError("Unsupported execution skip")
             imm = int(m[1], 0)
             if not -0x8000 <= imm <= 0x7fff:
@@ -3088,12 +3457,39 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Execution skip targets no instruction boundary")
             target = instructions[restore][1] if isinstance(instructions[restore], tuple) else instructions[restore]
             rm = re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)
-            if rm is None and region["opener"] == "cmpx":
+            if rm is None:
                 rm = re.fullmatch(r"s_mov_b64 exec, s\[(\d+):(\d+)\]", target)
+            if rm is None and region["else"] is None:
+                rm = re.fullmatch(r"s_andn2_b64 exec, s\[(\d+):(\d+)\], exec", target)
             if rm is None or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
                 raise ValueError("Execution skip does not target the matching restore")
             region["skip"] = restore
+            region["skipped"] = True
             seen_skip = True
+        elif region is not None and (m := match(r"s_andn2_b64 exec, (s\[\d+:\d+\]), exec")):
+            # The else transition (issue #1315): EXEC becomes saved & ~EXEC, the saved lanes whose condition is
+            # false. The else arm starts from the pre-region vector state; a register first defined by the then
+            # arm is undefined there. A then-arm skip must land exactly here. s_andn2_b64 writes SCC from the new
+            # EXEC, which is untracked.
+            if (sgpr_pair(m[1]) != region["save"] or region["else"] is not None
+                    or (region["skip"] is not None and region["skip"] != i)):
+                raise ValueError("Unexpected execution mask else transition")
+            region["then"] = {dst: dict.get(vector, dst) for dst in region["written"]}
+            for dst, outer in region["written"].items():
+                if outer is MISSING:
+                    region["else_undefined"].add(dst)
+                else:
+                    vector[dst] = outer
+            if region["skip"] is not None:
+                # A wave that skipped the then arm did not run its scalar writes or its waits before the else arm:
+                # what was outstanding at the opener may still be outstanding here.
+                scalar.conditional.update(region["scalar_written"])
+                before_pending, before_samples = region["outstanding"]
+                pending.update(before_pending)
+                sample_dest.update(before_samples)
+            region["skip"] = None
+            region["else"] = region["arm_start"] = i
+            scc = None
         elif m := match(r"s_or_b64 exec, exec, (s\[\d+:\d+\])"):
             close_region(i, sgpr_pair(m[1]))
             region = None
@@ -3656,12 +4052,15 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"(image_sample(?:_lz|_l|_b)?) (?:v\[(\d+):(\d+)\]|v(\d+)), v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
+        elif m := match(r"(image_sample(?:_lz|_l|_b)?(?:_o)?) (?:v\[(\d+):(\d+)\]|v(\d+)), "
+                        r"v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
             op, dst_first, dst_last, dst_single, *rest, dmask_hex = m.groups()
             dmask = int(dmask_hex, 16)
             if op != "image_sample" and dmask != 0xf:
                 raise ValueError(f"{op} requires dmask:0xf")
-            coord_width = 3 if op in ("image_sample_l", "image_sample_b") else 2
+            base_op = op.removesuffix("_o")
+            has_offset = base_op != op
+            coord_width = (3 if base_op in ("image_sample_l", "image_sample_b") else 2) + has_offset
             channels = ["xyzw"[bit] for bit in range(4) if (dmask >> bit) & 1]
             if len(channels) == 1:
                 if dst_single is None:
@@ -3691,6 +4090,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if op != "image_sample" and second_texture_offset is not None:
                 raise ValueError(f"{op} requires a single texture binding")
             coord_regs = [f"v{n}" for n in coords]
+            offset_arg = ""
+            if has_offset:
+                offset_arg = sample_offset_arg(coord_regs.pop(0), vector, sample_dest, known_ssa_bits)
             if any(reg not in vector for reg in coord_regs):
                 raise ValueError("Unsupported texture coordinate")
 
@@ -3702,26 +4104,53 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     return value
                 return fp_operand(reg, scalar, vector, pending, sample_dest)
 
-            if op in ("image_sample_lz", "image_sample_l"):
+            if base_op in ("image_sample_lz", "image_sample_l"):
                 u, v = [sample_coord(reg) for reg in coord_regs[:2]]
-                lod = sample_coord(coord_regs[2]) if op == "image_sample_l" else "0.0f"
-                call = f"SampleLevel(samp, float2({u}, {v}), {lod})"
+                lod = sample_coord(coord_regs[2]) if base_op == "image_sample_l" else "0.0f"
+                call = f"SampleLevel(samp, float2({u}, {v}), {lod}{offset_arg})"
             else:
                 # RDNA2 places bias before the UV pair. Only UV contributes derivatives.
                 uv = [vector[reg] for reg in coord_regs[-2:]]
                 if any(value not in quad_values for value in uv):
                     raise ValueError("Unsupported texture coordinate")
                 coordinate = f"float2({', '.join(uv)})"
-                if op == "image_sample_b":
+                if base_op == "image_sample_b":
                     bias = sample_coord(coord_regs[0])
-                    call = f"SampleBias(samp, {coordinate}, {bias})"
+                    call = f"SampleBias(samp, {coordinate}, {bias}{offset_arg})"
                 else:
-                    call = f"Sample(samp, {coordinate})"
+                    call = f"Sample(samp, {coordinate}{offset_arg})"
             lines.append(f"    float4 sample{i} = {texture}.{call};")
             samples += 1
             vector_loads += 1
             for ch, n in zip(channels, dest):
                 vector[f"v{n}"] = f"sample{i}.{ch}"
+                sample_dest[f"v{n}"] = vector_loads
+        elif m := match(r"image_get_lod v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], "
+                        r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x3 dim:SQ_RSRC_IMG_2D"):
+            dest, coords, image, state = [registers(*m.groups()[k:k+2], width)
+                                          for k, width in zip((0, 2, 4, 6), (2, 2, 8, 4))]
+            if dest.stop > 256 or coords.stop > 256:
+                raise ValueError("Texture LOD VGPR out of range")
+            if any(f"v{n}" in sample_dest for n in dest):
+                raise ValueError("Write overlaps an outstanding sample")
+            descriptor = [scalar.get(f"s{n}") for n in image]
+            if (mask != "entry" or sampler is None or sample_kind == "comparison"
+                    or second_texture_offset is not None
+                    or descriptor != [(bindings[texture_offset], j) for j in range(8)]
+                    or any(f"s{n}" in pending for n in (*image, *state))
+                    or [scalar.get(f"s{n}") for n in state] != list(sampler)):
+                raise ValueError("Unsupported texture LOD image or sampler binding")
+            uv = [vector.get(f"v{n}") for n in coords]
+            if any(value not in quad_values for value in uv):
+                raise ValueError("Texture LOD requires coordinates with quad provenance")
+            coord = f"float2({', '.join(uv)})"
+            lines.append(f"    float2 sample{i} = float2(tex.CalculateLevelOfDetail(samp, {coord}), "
+                         f"tex.CalculateLevelOfDetailUnclamped(samp, {coord}));")
+            sample_kind = "plain"
+            samples += 1
+            vector_loads += 1
+            for channel, n in zip("xy", dest):
+                vector[f"v{n}"] = f"sample{i}.{channel}"
                 sample_dest[f"v{n}"] = vector_loads
         elif m := match(r"(flat|global)_load_dword (v\d+), v\[(\d+):(\d+)\](, off)?(?: offset:(-?\d+))?"):
             # One DWORD through a 64-bit title address. Cache-policy bits, the global saddr form and
@@ -3745,14 +4174,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector_loads += 1
             vector[dst] = f"alu{i}"
             sample_dest[dst] = vector_loads
-        elif m := match(r"image_sample_c_lz (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
+        elif m := match(r"(image_sample_c(?:_lz)?(?:_o)?) (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
                         r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
-            # Depth comparison at LOD zero. The RDNA2 address order puts the reference before the
-            # coordinates, so the operands are (reference, u, v), in one VGPR range or the NSA form.
-            dst, first, last, *nsa = m.groups()[:6]
-            image = registers(*m.groups()[6:8], 8)
-            state = registers(*m.groups()[8:10], 4)
-            address = ([f"v{n}" for n in registers(first, last, 3)] if first is not None else nsa)
+            # The optional packed offset precedes the reference, followed by the UV pair.
+            op, dst, first, last, *nsa = m.groups()[:7]
+            image = registers(*m.groups()[7:9], 8)
+            state = registers(*m.groups()[9:11], 4)
+            has_offset = op.endswith("_o")
+            explicit_zero = op.removesuffix("_o") == "image_sample_c_lz"
+            if first is None and op != "image_sample_c_lz":
+                raise ValueError("Comparison sample requires a contiguous address")
+            address = ([f"v{n}" for n in registers(first, last, 3 + has_offset)]
+                       if first is not None else nsa)
             if any(int(reg[1:]) > 255 for reg in (dst, *address)):
                 raise ValueError("Comparison sample VGPR out of range")
             if sampler is None or second_texture_offset is not None or sample_kind == "plain":
@@ -3764,6 +4197,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or descriptor != [("tex", j) for j in range(8)]
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
+            if not explicit_zero and sampler[1] & 0xfff000:
+                raise ValueError("Implicit comparison sampling requires MAX_LOD 0")
+            offset_arg = sample_offset_arg(address.pop(0), vector, sample_dest, known_ssa_bits) if has_offset else ""
+            if not explicit_zero and any(vector.get(reg) not in quad_values for reg in address[1:]):
+                raise ValueError("Implicit comparison sampling requires coordinates with quad provenance")
             if sample_kind is None:
                 lines[lines.index(SAMPLED_RESOURCES)] = comparison_resources(comparison_sampler_state(sampler))
             sample_kind = "comparison"
@@ -3775,7 +4213,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 if not isinstance(value, str) or not (value in quad_values or value.startswith(("sample", "alu", "params"))):
                     raise ValueError("Unsupported comparison sample operand")
             reference, u, v = values
-            lines.append(f"    float sample{i} = tex.SampleCmpLevelZero(samp, float2({u}, {v}), {reference});")
+            method = "SampleCmpLevelZero" if explicit_zero else "SampleCmp"
+            lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), {reference}{offset_arg});")
             samples += 1
             vector_loads += 1
             vector[dst] = f"sample{i}"
@@ -4062,18 +4501,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
-                bits = f"{int(classes, 0) & 0xffffffff}u"
-            elif re.fullmatch(r"[vs]\d+", classes):
-                bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
-            else:
-                raise ValueError("Unsupported class mask")
-            operand = f16_cmp_operand(
-                value, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=True
-            )
+            expr = f16_class(value, classes, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
-            lines.append(f"    bool cmp{i} = (class16({operand}) & {bits}) != 0u;")
+            lines.append(f"    bool cmp{i} = {expr};")
 
         elif m := (match(r"v_(add|sub|subrev)_nc_u32(?:_e32|_e64)? (v\d+), ([^,\s]+), ([^,\s]+)")
                    or match(r"v_(add|sub)_nc_i32 (v\d+), ([^,\s]+), ([^,\s]+)")):
@@ -4104,6 +4535,109 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             vector[dst] = f"alu{i}"
+        elif m := match(r"v_mad_(u64_u32|i64_i32) v\[(\d+):(\d+)\], ([^,\s]+), ([^,\s]+), ([^,\s]+), ([^,\s]+)"):
+            # 64-bit multiply-add of two 32-bit factors: D = S0 * S1 + S2 modulo 2^64, with S2 a 64-bit pair.
+            # The unsigned form zero-extends the factors and writes the carry-out of the 64-bit add (the wrapped
+            # sum is below S2) to the lane mask. The signed form sign-extends the factors; its carry-out is not
+            # established here, so it is accepted only with the discarding `null` destination and never leaves
+            # a lane mask behind. Every operand is read before the destination is written. gfx10 encodes both as
+            # VOP3 only; a trailing clamp or modifier is left to the fall-through, a literal S2 is refused.
+            kind, first, last, carry, src0, src1, src2 = m.groups()
+            signed = kind == "i64_i32"
+            first, last = int(first), int(last)
+            if signed != (carry == "null"):
+                raise ValueError("64-bit multiply-add carry-out must be null for the signed form and a lane mask otherwise")
+            regs = []
+            if not signed:
+                if not re.fullmatch(LANE_MASK, carry):
+                    raise ValueError("Invalid 64-bit multiply-add carry-out")
+                regs = lane_mask(carry)
+                if re.fullmatch(r"s\d+", carry):
+                    sgpr_name(carry)
+            names = (f"v{first}", f"v{last}")
+            if (mask != "entry" or last != first + 1 or last > 255 or pending.intersection(regs)
+                    or any(name in sample_dest for name in names)):
+                raise ValueError("Invalid 64-bit multiply-add")
+            a = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+            b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+            c_lo, c_hi = int64_operand(src2, scalar, vector, pending, sample_dest, signed=False,
+                                       encoding="e64", position=2)
+            helpers.add("scalar_mul_hi")
+            high = "mul_hi_i32" if signed else "mul_hi_u32"
+            for word, value in (("a", a), ("b", b), ("cl", c_lo), ("ch", c_hi)):
+                lines.append(f"    uint m{i}{word} = {value};")
+            lines.append(f"    uint m{i}pl = m{i}a * m{i}b;")
+            lines.append(f"    uint m{i}ph = {high}(m{i}a, m{i}b);")
+            lines.append(f"    uint m{i}lo = m{i}pl + m{i}cl;")
+            lines.append(f"    uint m{i}h1 = m{i}ph + m{i}ch;")
+            lines.append(f"    uint m{i}hi = m{i}h1 + (m{i}lo < m{i}pl ? 1u : 0u);")
+            if not signed:
+                lines.append(f"    bool cmp{i} = m{i}h1 < m{i}ph || m{i}hi < m{i}h1;")
+                for j, reg in enumerate(regs):
+                    scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    precise float alu{i}l = asfloat(m{i}lo);")
+            lines.append(f"    precise float alu{i}h = asfloat(m{i}hi);")
+            vector[names[0]], vector[names[1]] = f"alu{i}l", f"alu{i}h"
+        elif m := match(r"v_cvt_f64_(i32|u32)(?:_e32)? v\[(0|[1-9]\d*):(0|[1-9]\d*)\], ([^,\s]+)"):
+            # Exact 32-bit integer to binary64 conversion into a VGPR pair v[d:d+1]. Every 32-bit integer is
+            # representable, so there is no rounding: the two binary64 words are built from uint operations (sign,
+            # exponent 1023 + the index of the highest set bit, the bits below it shifted to the top of the 52-bit
+            # fraction) and no HLSL double is used. Zero gives +0.0 (both words 0); INT_MIN gives 0xc1e00000_00000000.
+            # Only the unmodified VOP1 forms are lowered (plain and _e32, as LLVM 15 prints them); an _e64 suffix, clamp,
+            # omod, DPP and SDWA are left to the fall-through. The source is read before the pair is written. The two
+            # words are ordinary numeric registers, including for the supported binary64 comparisons.
+            kind, first, last, src = m.groups()
+            first, last = int(first), int(last)
+            names = (f"v{first}", f"v{last}")
+            if (mask != "entry" or last != first + 1 or last > 255 or any(name in sample_dest for name in names)):
+                raise ValueError("Invalid 32-bit integer to binary64 conversion")
+            signed = kind == "i32"
+            lines.append(f"    uint c{i}x = {int_operand(src, scalar, vector, pending, sample_dest, signed=False)};")
+            if signed:
+                lines.append(f"    uint c{i}s = c{i}x & 0x80000000u;")
+                lines.append(f"    uint c{i}u = c{i}s != 0u ? 0u - c{i}x : c{i}x;")
+            else:
+                lines.append(f"    uint c{i}s = 0u;")
+                lines.append(f"    uint c{i}u = c{i}x;")
+            lines.append(f"    uint c{i}n = c{i}u == 0u ? 0u : firstbithigh(c{i}u);")
+            lines.append(f"    uint c{i}f = (c{i}u << (31u - c{i}n)) & 0x7fffffffu;")
+            lines.append(f"    precise float alu{i}l = asfloat(c{i}u == 0u ? 0u : c{i}f << 21);")
+            lines.append(f"    precise float alu{i}h = asfloat(c{i}u == 0u ? 0u : c{i}s | ((1023u + c{i}n) << 20) | (c{i}f >> 11));")
+            vector[names[0]], vector[names[1]] = f"alu{i}l", f"alu{i}h"
+        elif m := match(r"v_cvt_f64_f32(_e32|_e64)? v\[(0|[1-9]\d*):(0|[1-9]\d*)\], ([^,\s]+)"):
+            # Exact binary32 to binary64 conversion into a VGPR pair v[d:d+1], for a statically known source only
+            # (cvt_f64_f32_source_bits). Both result words are computed here, in Python, and emitted as constants:
+            # no HLSL double, no runtime input. Finite normal values, +-0 and +-infinity convert exactly;
+            # subnormals, NaNs and unproven registers are refused. LLVM 15 prints the unmodified VOP1 form as _e32;
+            # the only VOP3 (_e64) spellings it prints for this opcode are -x, |x|, -|x| and neg(0xLITERAL), and
+            # those are accepted here (abs is applied first, then neg, as in require_proven_i32_f32_range; the order is not checked against the ISA document). An _e64 form without a
+            # modifier, clamp, omod, DPP and SDWA are left to the fall-through.
+            suffix, first, last, src = m.groups()
+            first, last = int(first), int(last)
+            names = (f"v{first}", f"v{last}")
+            if (mask != "entry" or last != first + 1 or last > 255 or any(name in sample_dest for name in names)):
+                raise ValueError("Invalid 32-bit float to binary64 conversion")
+            has_abs = has_neg = False
+            if suffix == "_e64":
+                parts = CVT_F64_F32_E64_SOURCE.fullmatch(src)
+                if not parts:
+                    raise ValueError(f"Unsupported v_cvt_f64_f32_e64 source {src}")
+                if parts.group(1):
+                    src, has_neg = parts.group(1), True
+                else:
+                    neg, bar_open, src, bar_close = parts.groups()[1:]
+                    if bar_open != bar_close or (neg == "" and bar_open == "") or (neg and not bar_open and src.startswith("0x")):
+                        raise ValueError(f"Unsupported v_cvt_f64_f32_e64 source {src}")
+                    has_abs, has_neg = bool(bar_open), bool(neg)
+            bits = cvt_f64_f32_source_bits(src, scalar, vector, pending, sample_dest, known_ssa_bits)
+            if has_abs:
+                bits &= 0x7fffffff
+            if has_neg:
+                bits ^= 0x80000000
+            low, high = cvt_f64_f32_words(bits)
+            lines.append(f"    precise float alu{i}l = asfloat({low}u);")
+            lines.append(f"    precise float alu{i}h = asfloat({high}u);")
+            vector[names[0]], vector[names[1]] = f"alu{i}l", f"alu{i}h"
         elif m := match(rf"v_(add|sub|subrev)_co_ci_u32_(e32|e64) (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+), {LANE_MASK}"):
             # The carry-out add and subtracts above with a carry or borrow of each lane read from a lane mask.
             # LLVM 15 prints both encodings with their suffix. The VOP2 (e32) encoding reads and writes VCC and
@@ -4199,27 +4733,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            values = [
-                f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=False)
-                for t in tokens
-            ]
-            raw = [
-                f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=True)
-                for t in tokens
-            ]
-            ordered = f"(num16({raw[0]}) && num16({raw[1]}))"
-            direct = {"lt": "lt", "eq": "eq", "le": "le", "gt": "gt", "lg": "lg", "ge": "ge"}
-            negated = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
-            if op in direct:
-                expr = f"({ordered} && ({COMPARE[op].format(*values)}))"
-            elif op in negated:
-                expr = f"!({ordered} && ({COMPARE[negated[op]].format(*values)}))"
-            elif op == "o":
-                expr = ordered
-            elif op == "u":
-                expr = f"!{ordered}"
-            else:
-                expr = COMPARE[op]
+            expr = f16_comparison(op, tokens, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {expr};")
@@ -4263,13 +4777,30 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 sgpr_name(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            words = [int64_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i64",
-                                   encoding=enc, position=n) for n, t in enumerate(tokens)]
-            word_type = "int" if kind == "i64" else "uint"
-            names = [f"cmp{i}_l0", f"cmp{i}_h0", f"cmp{i}_l1", f"cmp{i}_h1"]
-            for name, value in zip(names, (words[0][0], words[0][1], words[1][0], words[1][1])):
-                lines.append(f"    {'uint' if name[-2] == 'l' else word_type} {name} = {value};")
-            lines.append(f"    bool cmp{i} = {INT64_COMPARE[op].format(l0=names[0], h0=names[1], l1=names[2], h1=names[3])};")
+            declarations, expr = int64_comparison(i, op, kind, tokens, enc, scalar, vector, pending, sample_dest)
+            lines.extend(declarations)
+            lines.append(f"    bool cmp{i} = {expr};")
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+        elif m := (match(rf"v_cmp_({'|'.join(COMPARE)})_f64_(e32|e64) {LANE_MASK}, ([^,]+), ([^,]+)")
+                   or match(rf"v_cmp_(class)_f64_(e32|e64) {LANE_MASK}, ([^,]+), ([^,]+)")):
+            # binary64 comparisons on the source words (cmp_f64 helpers). MODE[7:6] also decides whether binary64
+            # denormal inputs are flushed, so the forms need the declared preserving entry state.
+            op, enc, dst, *tokens = m.groups()
+            check_vopc_e32_dst("_" + enc, dst)
+            regs = lane_mask(dst)
+            if dst.startswith("s["):
+                sgpr_pair(dst)
+            elif dst.startswith("s"):
+                sgpr_name(dst)
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary64 denormal mode unknown at entry")
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            helpers.add("cmp_f64")
+            declarations, expr = f64_comparison(i, op, tokens, enc, scalar, vector, pending, sample_dest)
+            lines.extend(declarations)
+            lines.append(f"    bool cmp{i} = {expr};")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32_sdwa {LANE_MASK}, ([^,]+), ([^,]+) src0_sel:DWORD src1_sel:DWORD"):
@@ -5245,12 +5776,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             ended = True
         else:
             raise ValueError(f"Unsupported instruction {i}: {line}")
+        if region is not None and region["else"] is not None and region["else_undefined"].intersection(vector.reads):
+            raise ValueError(f"Else arm reads a register defined only in the then arm {i}: {line}")
         if rstate is not None:
             (old_scalar, old_vector, old_scc, old_pending, old_sample_dest, old_exported,
              old_ended, old_mask, old_attribute, old_interpolated, old_quad, old_samples, scalar_alu) = rstate
             writes = {k for k in set(vector) | set(old_vector)
                       if old_vector.get(k, MISSING) != dict.get(vector, k, MISSING)}
-            if scalar_alu:
+            if isinstance(scalar_alu, set):
+                # A scalar load may only add its own destinations: they become outstanding and change nothing else.
+                scalar_writes = {k for k in set(scalar) | set(old_scalar)
+                                 if old_scalar.get(k, MISSING) != dict.get(scalar, k, MISSING)}
+                if (not scalar_writes.issubset(scalar_alu) or writes or scc != old_scc
+                        or pending != old_pending | scalar_alu or sample_dest != old_sample_dest
+                        or exported != old_exported or ended != old_ended or mask != old_mask
+                        or attribute_input != old_attribute or interpolated != old_interpolated
+                        or quad_values != old_quad or samples != old_samples):
+                    raise ValueError(f"Unsupported masked-region scalar load {i}: {line}")
+                if region["skip"] is not None:
+                    region["scalar_written"].update(scalar_alu)
+                else:
+                    # No wave can skip the region, so the load defines these registers on every wave and
+                    # supersedes any earlier conditional write of them.
+                    region["scalar_written"].difference_update(scalar_alu)
+                    scalar.conditional.difference_update(scalar_alu)
+            elif scalar_alu:
                 destination = REGION_SALU_DEST.match(line)
                 scalar_writes = {k for k in set(scalar) | set(old_scalar)
                                  if old_scalar.get(k, MISSING) != dict.get(scalar, k, MISSING)}
@@ -5275,12 +5825,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                         or quad_values != old_quad or samples != old_samples or not writes
                         or any(not isinstance(dict.get(vector, k), str) for k in writes)):
                     raise ValueError(f"Unsupported masked-region operation {i}: {line}")
+                arm = region["written"] if region["else"] is None else region["else_written"]
                 for k in writes:
-                    region["written"].setdefault(k, old_vector.get(k, MISSING))
+                    arm.setdefault(k, old_vector.get(k, MISSING))
+                region["else_undefined"].difference_update(writes)
         if conditional.intersection(vector.reads):
             raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
         if scalar_conditional.intersection(scalar.reads):
             raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
+    # Reads after the last instruction are not operand reads: a missing key there stays a KeyError.
+    scalar.site = vector.site = None
     if region is not None:
         raise ValueError("Program ends inside a masked region")
     if not ended or samples != len(bindings):
@@ -5305,6 +5859,8 @@ def main():
     parser.add_argument("record")
     parser.add_argument("--container-sha256", help="SHA-256 of the full decoded DXBC container to select by name")
     parser.add_argument("--llvm", required=True, help="LLVM C library with AMDGPU support")
+    parser.add_argument("--cpu", choices=("gfx1013", "gfx1030"), default="gfx1013",
+                        help="Source instruction set (gfx1030 uses the wave64 pixel profile)")
     parser.add_argument("--texture-sgpr", type=int, required=True, help="Entry register for the low descriptor-table address")
     parser.add_argument("--interp-sgpr", type=int, required=True, help="Entry register for the interpolation base")
     profile = parser.add_mutually_exclusive_group(required=True)
@@ -5333,8 +5889,11 @@ def main():
     if dest.suffix.lower() != ".hlsl" or dest == args.archive.resolve():
         parser.error("Choose an HLSL destination distinct from the input")
     try:
-        blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256, llvm=args.llvm)
-        instructions = disassemble(code, args.llvm, offsets=True)
+        cpu = args.cpu.encode()
+        features = b"+wavefrontsize64,-wavefrontsize32" if cpu == b"gfx1030" else b""
+        blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256,
+                                    llvm=args.llvm, cpu=cpu, features=features)
+        instructions = disassemble(code, args.llvm, offsets=True, cpu=cpu, features=features)
         if args.rt0_write_mask and any(line.startswith("exp ") and "compr" in line.split()
                                        for _, line in instructions):
             raise ValueError("--rt0-write-mask only supports uncompressed exports")

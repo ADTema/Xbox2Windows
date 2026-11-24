@@ -124,24 +124,25 @@ def check_rejections() -> None:
     jp_self = "7a 00"         # jp $+2
     ret = "c3"
 
-    undef_msg = "reads PF, which no instruction defines on every path from the entry"
-    model_msg = "reads PF, which the integer lowering models only after"
-    indirect_msg = "PF consumers require known control-flow joins"
+    undef_msg = "reads PF, which no modeled PF producer defines on every path from the entry"
+    indirect_msg = "unbound branch at"
 
     rejected = {
         "SETP AL at entry": (attempt(f"{setp_al} {ret}"), undef_msg),
         "CMOVP EAX, EDX at entry": (attempt(f"{cmovp} {ret}"), undef_msg),
         "JP at entry": (attempt(f"{jp_self} {ret}"), undef_msg),
-        "VCOMISS + ADD + SETP": (attempt(f"{vcomiss} 01 d0 {setp_al} {ret}"), model_msg),
-        "VUCOMISS + CMP + CMOVNP": (attempt(f"{vucomiss} 39 d0 {cmovnp} {ret}"), model_msg),
-        "VCOMISD + INC + JP": (attempt(f"{vcomisd} ff c0 {jp_self} {ret}"), model_msg),
-        "VUCOMISD + TEST32 + SETNP": (attempt(f"{vucomisd} 85 c0 {setnp_al} {ret}"), model_msg),
-        "VCOMISS + SHL + CMOVP": (attempt(f"{vcomiss} d1 e0 {cmovp} {ret}"), model_msg),
+        "VCOMISS + ADD + SETP": (attempt(f"{vcomiss} 01 d0 {setp_al} {ret}"), undef_msg),
+        "VUCOMISS + CMP + CMOVNP": (attempt(f"{vucomiss} 39 d0 {cmovnp} {ret}"), undef_msg),
+        "VCOMISD + INC + JP": (attempt(f"{vcomisd} ff c0 {jp_self} {ret}"), undef_msg),
+        "VUCOMISD + TEST32 + SETNP": (attempt(f"{vucomisd} 85 c0 {setnp_al} {ret}"), undef_msg),
+        "VCOMISS + SHL + CMOVP": (attempt(f"{vcomiss} d1 e0 {cmovp} {ret}"), undef_msg),
         "VCOMISS + CALL + SETP": (attempt(f"{vcomiss} e8 00 00 00 00 {setp_al} {ret}", calls={0x1004: ";"}), undef_msg),
         # JRCXZ (e3 04) skips VCOMISS (4 bytes) + JMP+2 (2 bytes -> e3 06) into ADD (01 d0).
-        "join VCOMISS path and ADD path": (attempt(f"e3 06 {vcomiss} eb 02 01 d0 {setp_al} {ret}"), model_msg),
+        "join VCOMISS path and ADD path": (attempt(f"e3 06 {vcomiss} eb 02 01 d0 {setp_al} {ret}"), undef_msg),
         # JRCXZ skips VCOMISS + JMP+2 into MOV EAX, EDX (leaves PF undefined).
         "join VCOMISS path and MOV path": (attempt(f"e3 06 {vcomiss} eb 02 89 d0 {cmovp} {ret}"), undef_msg),
+        "join VCOMISS path and TEST AL, AL path": (attempt(f"e3 06 {vcomiss} eb 02 84 c0 {setnp_al} {ret}"), undef_msg),
+        "VCOMISS + 8-bit AND CL, 1 + CMOVNP": (attempt(f"{vcomiss} 80 e1 01 {cmovnp} {ret}"), undef_msg),
         # VCOMISS + SETP + JMP RAX (indirect branch).
         "indirect branch with PF consumer": (attempt(f"{vcomiss} {setp_al} ff e0"), indirect_msg),
         # host_ops replacing a NOP invalidates tracked flags/PF.
@@ -154,8 +155,6 @@ def check_rejections() -> None:
     accepted = {
         "VCOMISS + MOV + LEA + VZEROUPPER + SETP": f"{vcomiss} 89 d0 8d 40 01 c5 f8 77 {setp_al} {ret}",
         "join VCOMISS path and VUCOMISD path": f"e3 06 {vcomiss} eb 04 {vucomisd} {cmovp} {ret}",
-        "join VCOMISS path and TEST AL, AL path": f"e3 06 {vcomiss} eb 02 84 c0 {setnp_al} {ret}",
-        "VCOMISS + 8-bit AND CL, 1 + CMOVNP": f"{vcomiss} 80 e1 01 {cmovnp} {ret}",
     }
     for case, hex_bytes in accepted.items():
         body = decode_check(hex_bytes)
