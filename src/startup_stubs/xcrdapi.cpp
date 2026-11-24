@@ -371,7 +371,8 @@ enum class StorageFailure : unsigned {
     read_at_or_past_eof, read_crossing_eof, read_other, destination_capacity, destination_not_writable,
     zlib, bcpack, other, count
 };
-LONG storage_failures[static_cast<unsigned>(StorageFailure::count)];
+using StorageFailureCounts = LONG[static_cast<unsigned>(StorageFailure::count)];
+StorageFailureCounts storage_failures;
 
 void count_failure(StorageFailure cause) noexcept
 {
@@ -401,11 +402,18 @@ StorageFailure read_failure_cause(const Object* file_object, u64 offset, u64 cou
 // The heartbeat's line of failure causes. It is a line of its own after the totals line, whose text
 // stays as it was; it carries no "inflated=", "options=" or "commit peak=" text, which
 // tools/startup/live_view.py, tools/startup/triage_run.py and tests/startup_heartbeat_check.py match.
-int format_failure_causes(char* out, std::size_t size, int second) noexcept
+LONG sample_failure_counts(StorageFailureCounts& counts) noexcept
 {
-    LONG n[static_cast<unsigned>(StorageFailure::count)];
-    for (unsigned i = 0; i < static_cast<unsigned>(StorageFailure::count); ++i)
-        n[i] = InterlockedCompareExchange(&storage_failures[i], 0, 0);
+    ULONG total = 0;
+    for (unsigned i = 0; i < static_cast<unsigned>(StorageFailure::count); ++i) {
+        counts[i] = InterlockedCompareExchange(&storage_failures[i], 0, 0);
+        total += static_cast<ULONG>(counts[i]);
+    }
+    return static_cast<LONG>(total);
+}
+
+int format_failure_causes(char* out, std::size_t size, int second, const StorageFailureCounts& n) noexcept
+{
     return std::snprintf(out, size,
                          "x2w-dstorage heartbeat %d s: failed requests by cause read-at-or-past-eof=%ld "
                          "read-crossing-eof=%ld read-other=%ld destination-capacity=%ld destination-not-writable=%ld "
@@ -1327,7 +1335,10 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
         MemorySample last_memory;
         for (int second = 10;; second += 10) {
             Sleep(10000);
-            const LONG total = requests_done + requests_compressed + requests_failed;
+            // Reuse one counter sample for both lines, even while the worker is reporting new failures.
+            StorageFailureCounts failure_counts;
+            const LONG failed = sample_failure_counts(failure_counts);
+            const LONG total = requests_done + requests_compressed + failed;
             const LONG total2 = total + requests_bcpack_blank;
             const MemorySample sample = memory_sample();
             const ULONGLONG peak_mib = sample.peak_commit >> 20;
@@ -1352,10 +1363,10 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
                     "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
-                    requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
+                    failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
                     section_text);
                 char causes[384];
-                if (format_failure_causes(causes, sizeof(causes), second) > 0) log("%s", causes);
+                if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
                 last = total2;
                 last_memory = sample;
             }

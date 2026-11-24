@@ -286,10 +286,10 @@ int main(int argc, char** argv)
         expected[static_cast<unsigned>(C::other)] = expected_failed;
     }
 
-    LONG sum = 0;
+    StorageFailureCounts failure_counts;
+    const LONG sum = sample_failure_counts(failure_counts);
     for (unsigned cause = 0; cause < cause_count; ++cause) {
-        const LONG got = InterlockedCompareExchange(&storage_failures[cause], 0, 0);
-        sum += got;
+        const LONG got = failure_counts[cause];
         char what[128];
         std::snprintf(what, sizeof what, "cause %s counted %ld, expected %ld", cause_name(cause), got, expected[cause]);
         ok = expect(got == expected[cause], what) && ok;
@@ -303,7 +303,10 @@ int main(int argc, char** argv)
 
     // The heartbeat's line, through the stand-in's formatter, against text written out here.
     char line[384], want[384];
-    format_failure_causes(line, sizeof line, 20);
+    // A worker can publish a new failure after the totals line is emitted.
+    // The breakdown for that same heartbeat must still use the earlier sample.
+    count_failure(C::other);
+    format_failure_causes(line, sizeof line, 20, failure_counts);
     std::snprintf(want, sizeof want,
                   "x2w-dstorage heartbeat 20 s: failed requests by cause read-at-or-past-eof=%ld read-crossing-eof=%ld "
                   "read-other=%ld destination-capacity=%ld destination-not-writable=%ld zlib=%ld bcpack=%ld other=%ld",
