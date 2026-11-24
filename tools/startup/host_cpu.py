@@ -14,6 +14,15 @@ illegal-instruction exception. Each site is rewritten once, in the running proce
   stubs keep every other register and the flags. Instructions the 5-byte jump overwrites are moved
   behind the stub (plan_replacement).
 
+- MOVNTSS and MOVNTSD (F3/F2 [REX] 0F 2B /r) become MOVSS and MOVSD stores (opcode 11): the same
+  bytes reach memory without the non-temporal hint.
+- RDPRU (0F 01 FD) becomes RDTSC; NOP: the time-stamp counter stands in for MPERF and APERF.
+- RDPID r64 becomes a jump to a stub that runs RDTSCP and moves its ecx (the same IA32_TSC_AUX
+  value) to the target register.
+- The SHA extensions (SHA1RNDS4, SHA1NEXTE, SHA1MSG1, SHA1MSG2, SHA256RNDS2, SHA256MSG1,
+  SHA256MSG2) are not rewritten: sha_apply performs one on register values the debugger reads from
+  the stopped thread, at every hit. That is a debugger round trip per instruction.
+
 Limits: xmm0-7 only for the SSE4a forms (no REX prefix); the register forms of INSERTQ and EXTRQ
 (0F 79) are not handled; bits 127:64 of an SSE4a destination, undefined after the original
 instruction, keep their value. A thread that is inside the overwritten bytes of a jump site while
@@ -86,6 +95,48 @@ def wait_rewrite(code):
     return None
 
 
+def nt_store_rewrite(code):
+    """(offset, byte) that turns MOVNTSS/MOVNTSD m, xmm (F3/F2 [REX] 0F 2B /r) into MOVSS/MOVSD m, xmm
+    (opcode 11), or None. The non-temporal hint is dropped; the bytes stored are the same."""
+    if len(code) < 4 or code[0] not in (0xF2, 0xF3):
+        return None
+    at = 2 if 0x40 <= code[1] <= 0x4F else 1
+    if code[at:at + 2] != b"\x0f\x2b" or len(code) <= at + 2 or code[at + 2] >> 6 == 3:
+        return None
+    return at + 1, b"\x11"
+
+
+def rdpru_rewrite(code):
+    """Three bytes for RDPRU (0F 01 FD), or None: RDTSC and a NOP. RDPRU returns MPERF (ecx 0) or
+    APERF (ecx 1) in edx:eax; the time-stamp counter stands in for both, so their ratio reads 1."""
+    return b"\x0f\x31\x90" if code[:3] == b"\x0f\x01\xfd" else None
+
+
+def rdpid_stub(code):
+    """(length, stub) for RDPID r64 (F3 [REX] 0F C7 /7, register form), or None. The stub runs RDTSCP,
+    whose ecx is the same IA32_TSC_AUX value, and keeps rax, rdx and rcx unless one is the target."""
+    if len(code) < 4 or code[0] != 0xF3:
+        return None
+    rex = code[1] if 0x40 <= code[1] <= 0x4F else 0
+    at = 2 if rex else 1
+    if code[at:at + 2] != b"\x0f\xc7" or len(code) <= at + 2:
+        return None
+    modrm = code[at + 2]
+    if modrm >> 6 != 3 or (modrm >> 3) & 7 != 7:
+        return None
+    dest = (modrm & 7) | (8 if rex & 1 else 0)
+    if dest == 4:
+        return None  # rsp: the stub's own stack
+    # push rax; push rcx; push rdx; rdtscp
+    stub = b"\x50\x51\x52\x0f\x01\xf9"
+    saved = {2: 0, 1: 8, 0: 16}  # where rdx, rcx and rax sit on the stack
+    if dest in saved:
+        stub += bytes([0x48, 0x89, 0x4C, 0x24, saved[dest]])              # mov [rsp + slot], rcx
+    else:
+        stub += bytes([0x48 | (1 if dest >= 8 else 0), 0x89, 0xC8 | (dest & 7)])  # mov dest, rcx
+    return at + 3, stub + b"\x5a\x59\x58"                                 # pop rdx; pop rcx; pop rax
+
+
 def sse4a_stub(code):
     """Stub for the immediate INSERTQ or EXTRQ at the start of code (6 bytes), or None."""
     if len(code) < 6 or code[1:3] != b"\x0f\x78" or code[0] not in (0xF2, 0x66) or code[3] < 0xC0:
@@ -118,6 +169,9 @@ def stub_for(code):
     """(instruction length, stub bytes) for an instruction that needs a stub, or None."""
     if code[:3] == CLZERO:
         return 3, CLZERO_STUB
+    rdpid = rdpid_stub(code)
+    if rdpid:
+        return rdpid
     stub = sse4a_stub(code)
     return (6, stub) if stub else None
 
@@ -156,3 +210,146 @@ def plan_replacement(code, site, length, stub, stub_address):
     if not -2**31 <= forward < 2**31:
         return None
     return stub + moved, b"\xe9" + struct.pack("<i", forward) + b"\x90" * (total - 5)
+
+
+# ---- SHA extensions ------------------------------------------------------------------------------
+# No stub: the startup debugger performs these on the stopped thread's context at every hit
+# (sha_apply). 128-bit values are Python integers; dword 0 is bits 31:0, as in an XMM register.
+# The operations follow the Intel SDM's pseudocode for each instruction.
+M32 = 0xFFFFFFFF
+
+
+def _dwords(value):
+    return [value >> (32 * i) & M32 for i in range(4)]
+
+
+def _pack(dwords):
+    return sum((d & M32) << (32 * i) for i, d in enumerate(dwords))
+
+
+def _rol(value, count):
+    return (value << count | value >> (32 - count)) & M32
+
+
+def _ror(value, count):
+    return (value >> count | value << (32 - count)) & M32
+
+
+def sha1rnds4(dest, source, function):
+    d, c, b, a = _dwords(dest)
+    w = _dwords(source)[::-1]  # W0 (with E added) first
+    constant = (0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6)[function & 3]
+
+    def f(x, y, z):
+        if function & 3 == 0:
+            return (x & y) ^ (~x & z)
+        if function & 3 == 2:
+            return (x & y) ^ (x & z) ^ (y & z)
+        return x ^ y ^ z
+
+    e = 0
+    for i in range(4):
+        a, b, c, d, e = (f(b, c, d) + _rol(a, 5) + w[i] + e + constant) & M32, a, _rol(b, 30), c, d
+    return _pack([d, c, b, a])
+
+
+def sha1nexte(dest, source):
+    s = _dwords(source)
+    return _pack([s[0], s[1], s[2], s[3] + _rol(_dwords(dest)[3], 30)])
+
+
+def sha1msg1(dest, source):
+    w3, w2, w1, w0 = _dwords(dest)
+    s = _dwords(source)
+    w5, w4 = s[2], s[3]
+    return _pack([w5 ^ w3, w4 ^ w2, w3 ^ w1, w2 ^ w0])
+
+
+def sha1msg2(dest, source):
+    d = _dwords(dest)
+    w15, w14, w13 = _dwords(source)[:3]
+    w16 = _rol(d[3] ^ w13, 1)
+    w17 = _rol(d[2] ^ w14, 1)
+    w18 = _rol(d[1] ^ w15, 1)
+    w19 = _rol(d[0] ^ w16, 1)
+    return _pack([w19, w18, w17, w16])
+
+
+def sha256rnds2(dest, source, xmm0):
+    h, g, d, c = _dwords(dest)
+    f, e, b, a = _dwords(source)
+    for wk in _dwords(xmm0)[:2]:
+        t1 = (h + (_ror(e, 6) ^ _ror(e, 11) ^ _ror(e, 25)) + ((e & f) ^ (~e & g)) + wk) & M32
+        t2 = ((_ror(a, 2) ^ _ror(a, 13) ^ _ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) & M32
+        a, b, c, d, e, f, g, h = (t1 + t2) & M32, a, b, c, (d + t1) & M32, e, f, g
+    return _pack([f, e, b, a])
+
+
+def _sigma0(x):
+    return _ror(x, 7) ^ _ror(x, 18) ^ x >> 3
+
+
+def _sigma1(x):
+    return _ror(x, 17) ^ _ror(x, 19) ^ x >> 10
+
+
+def sha256msg1(dest, source):
+    w = _dwords(dest) + [_dwords(source)[0]]
+    return _pack([w[i] + _sigma0(w[i + 1]) for i in range(4)])
+
+
+def sha256msg2(dest, source):
+    d = _dwords(dest)
+    s = _dwords(source)
+    w16 = (d[0] + _sigma1(s[2])) & M32
+    w17 = (d[1] + _sigma1(s[3])) & M32
+    return _pack([w16, w17, d[2] + _sigma1(w16), d[3] + _sigma1(w17)])
+
+
+def sha_apply(code, rip, read_gpr, read_xmm, read_memory):
+    """Performs the SHA instruction at the start of code. Returns (length, xmm index, new value), or
+    None when it is not one, the operands are not the legacy forms, or a memory operand cannot be
+    read. read_gpr(n) and read_xmm(n) return register values; read_memory(address, 16) returns 16
+    bytes or fewer. Needs iced-x86."""
+    import iced_x86
+    instruction = iced_x86.Decoder(64, bytes(code), ip=rip).decode()
+    operations = {iced_x86.Mnemonic.SHA1RNDS4: sha1rnds4, iced_x86.Mnemonic.SHA1NEXTE: sha1nexte,
+                  iced_x86.Mnemonic.SHA1MSG1: sha1msg1, iced_x86.Mnemonic.SHA1MSG2: sha1msg2,
+                  iced_x86.Mnemonic.SHA256RNDS2: sha256rnds2, iced_x86.Mnemonic.SHA256MSG1: sha256msg1,
+                  iced_x86.Mnemonic.SHA256MSG2: sha256msg2}
+    operation = operations.get(instruction.mnemonic)
+    if operation is None or instruction.op0_kind != iced_x86.OpKind.REGISTER:
+        return None
+    xmm0, rax, rip_register = iced_x86.Register.XMM0, iced_x86.Register.RAX, iced_x86.Register.RIP
+    dest = instruction.op0_register - xmm0
+    if not 0 <= dest <= 15:
+        return None
+    if instruction.op1_kind == iced_x86.OpKind.REGISTER:
+        source = read_xmm(instruction.op1_register - xmm0)
+    elif instruction.op1_kind == iced_x86.OpKind.MEMORY:
+        if instruction.segment_prefix != iced_x86.Register.NONE:
+            return None  # fs: and gs: bases are not known here
+        address = instruction.memory_displacement  # absolute already for a rip-relative operand
+        base, index = instruction.memory_base, instruction.memory_index
+        if base not in (iced_x86.Register.NONE, rip_register):
+            if not 0 <= base - rax <= 15:
+                return None
+            address += read_gpr(base - rax)
+        if index != iced_x86.Register.NONE:
+            if not 0 <= index - rax <= 15:
+                return None
+            address += read_gpr(index - rax) * instruction.memory_index_scale
+        raw = read_memory(address & (1 << 64) - 1, 16)
+        if raw is None or len(raw) != 16:
+            return None
+        source = int.from_bytes(raw, "little")
+    else:
+        return None
+    value = read_xmm(dest)
+    if instruction.mnemonic == iced_x86.Mnemonic.SHA1RNDS4:
+        result = sha1rnds4(value, source, instruction.immediate8)
+    elif instruction.mnemonic == iced_x86.Mnemonic.SHA256RNDS2:
+        result = sha256rnds2(value, source, read_xmm(0))
+    else:
+        result = operation(value, source)
+    return instruction.len, dest, result
