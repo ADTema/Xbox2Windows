@@ -65,6 +65,13 @@ def decode(code):
             n, name, asm, _ = D.decode_instruction(code, off)
         except Exception as error:
             raise Unsupported('undecodable word at +0x%x: %s' % (off, error))
+        if name == 'image_load_mip':
+            # The shared disassembler does not expose these gfx10 MIMG flags.
+            word0, word1 = struct.unpack_from('<2I', code, off)
+            if word0 & (1 << 16):
+                raise Unsupported('image_load_mip tfe')
+            if word1 & (1 << 30):
+                raise Unsupported('image_load_mip a16')
         out.append((off, n, name, asm))
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
@@ -681,11 +688,17 @@ class Stage:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
         tex = self.pipe.resource(self.descriptor(ops[2]), 'tex3d' if three else 'tex2d')
-        if how == 'load':
-            if three:
-                call = '%s.Load(int4(%s, %s, %s, 0))' % (tex, self.u(cs[0]), self.u(cs[1]), self.u(cs[2]))
-            else:
-                call = '%s.Load(int3(%s, %s, 0))' % (tex, self.u(cs[0]), self.u(cs[1]))
+        if how in ('load', 'load_mip'):
+            axes = 3 if three else 2
+            mip = '0'
+            if how == 'load_mip':
+                unsupported = [m for m in mods if not m.startswith(('dim:', 'dmask:'))
+                               and m not in ('unorm', 'glc', 'slc', 'dlc')]
+                if unsupported or len(cs) != axes + 1 or not dmask:
+                    raise Unsupported('image_load_mip address or modifiers: %s' % ' '.join(mods))
+                mip = self.u(cs[axes])
+            address = [self.u(c) for c in cs[:axes]] + [mip]
+            call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address))
         else:
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
@@ -711,6 +724,9 @@ class Stage:
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
+
+    def op_image_load_mip(self, ops, mods):
+        self.image(ops, mods, 'load_mip')
 
     def op_v_cvt_i32_f32(self, ops, mods):
         if mods:
