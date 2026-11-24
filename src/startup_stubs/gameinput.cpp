@@ -450,7 +450,7 @@ int find_history(const Reading& ref, int step, std::uint32_t mask, HistoryEntry&
         const std::uint32_t bit = i == 0 ? history_pad : history_keys;
         if (!(mask & bit)) continue;
         const KindRing& ring = i == 0 ? pad_ring : key_ring;
-        const bool same_kind_only = (mask == bit) && ((ref_mask & bit) != 0);
+        const bool same_kind_only = (mask == bit) && (ref_mask == bit);
         HistoryEntry candidate{};
         const int found = find_in_ring(ring, i == 0 ? ref.pad_sequence : ref.key_sequence, ref.order, step,
                                        same_kind_only, candidate);

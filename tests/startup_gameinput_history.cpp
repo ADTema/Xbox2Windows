@@ -213,6 +213,22 @@ int main(int argc, char** argv)
         r3->Release();
     }
 
+    // A combined reference captured the later keyboard event. The pad's second
+    // reading precedes that event and remains the closest gamepad match.
+    IGameInputReading* combined = nullptr;
+    failures += check(SUCCEEDED(input->GetCurrentReading(kind_gamepad | kind_keyboard, nullptr, &combined)) && combined,
+                      "combined GetCurrentReading after the second keyboard change");
+    if (combined) {
+        IGameInputReading* prev = nullptr;
+        const HRESULT hr = input->GetPreviousReading(combined, kind_gamepad, pad_dev, &prev);
+        GamepadState state{};
+        failures += check(hr == S_OK && prev && prev->GetSequenceNumber(kind_gamepad) == seq2 &&
+                          prev->GetGamepadState(&state) && state.buttons == 4,
+                          "combined reference must retain the gamepad reading before its keyboard event");
+        if (prev) prev->Release();
+        combined->Release();
+    }
+
     if (r2) r2->Release();
     if (r1) r1->Release();
     UnmapViewOfFile(shared);
