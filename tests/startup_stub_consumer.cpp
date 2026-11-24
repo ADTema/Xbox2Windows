@@ -147,11 +147,27 @@ using CreateStatusArrayFn = long(__stdcall*)(void*, unsigned, const char*, const
 using CreateQueueFn = long(__stdcall*)(void*, const void*, const void*, void**);
 using EnqueueRequestFn = void(__stdcall*)(void*, const void*);
 using EnqueueStatusFn = void(__stdcall*)(void*, void*, unsigned);
+using EnqueueSignalFn = void(__stdcall*)(void*, void*, u64);
 using SubmitFn = void(__stdcall*)(void*);
 using IsCompleteFn = bool(__stdcall*)(void*, unsigned);
 using GetHResultFn = long(__stdcall*)(void*, unsigned);
 using OpenFileFn = long(__stdcall*)(void*, const wchar_t*, const void*, void**);
 using CloseFileFn = void(__stdcall*)(void*);
+
+struct SubmitGate {
+    void** vtable = nullptr;
+    HANDLE entered = nullptr;
+    HANDLE resume = nullptr;
+    volatile LONG resumed = 0;
+};
+
+long __stdcall hold_worker(void* fence, u64) {
+    auto& gate = *static_cast<SubmitGate*>(fence);
+    SetEvent(gate.entered);
+    if (WaitForSingleObject(gate.resume, 5000) != WAIT_OBJECT_0) return E_FAIL;
+    InterlockedExchange(&gate.resumed, 1);
+    return S_OK;
+}
 
 bool dstorage_checks() {
     _putenv("X2W_XMEM_PERMISSIVE=1");
@@ -964,7 +980,7 @@ bool dstorage_checks() {
 
     // Control: deterministic boundary test across two Submit() calls (Refs #1214, #1235)
     // First Submit(): compressed stream into undersized destination buffer (no continuation in this batch).
-    // Second Submit(): immediate matching non-zlib request at continuation offset.
+    // Second Submit(): matching non-zlib request at the continuation offset, queued while the first batch is gated.
     // Both requests must fail cleanly, and both destination sentinel buffers must remain untouched.
     {
         const size_t stream_plain_size = 128 * 1024;
@@ -1036,9 +1052,23 @@ bool dstorage_checks() {
         *reinterpret_cast<unsigned*>(req_undersized + 0x30) = comp_size;
         *reinterpret_cast<unsigned*>(req_undersized + 0x38) = static_cast<unsigned>(stream_plain_size);
 
+        // The signal callback holds the worker at the head of the first batch. It uses static
+        // storage so even a failed test can exit without abandoning a pointer to the stack.
+        static SubmitGate gate;
+        static void* fence_vtable[11] = {};
+        fence_vtable[10] = reinterpret_cast<void*>(&hold_worker);
+        gate.vtable = fence_vtable;
+        gate.entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        gate.resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!gate.entered || !gate.resume) return false;
+        reinterpret_cast<EnqueueSignalFn>(queue->vtable[5])(queue, &gate, 1);
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_undersized);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status1, 0);
         reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        if (WaitForSingleObject(gate.entered, 3000) != WAIT_OBJECT_0) {
+            SetEvent(gate.resume);
+            return false;
+        }
 
         // Immediately in second Submit: matching non-zlib request at continuation offset
         unsigned char req_matching[0x48] = {};
@@ -1053,6 +1083,7 @@ bool dstorage_checks() {
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_matching);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status2, 0);
         reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        SetEvent(gate.resume);
 
         for (int i = 0; i < 200; ++i) {
             if (reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 0) &&
@@ -1063,12 +1094,16 @@ bool dstorage_checks() {
         bool complete2 = reinterpret_cast<IsCompleteFn>(status2->vtable[3])(status2, 0);
         long hr1 = complete1 ? reinterpret_cast<GetHResultFn>(status1->vtable[4])(status1, 0) : 0;
         long hr2 = complete2 ? reinterpret_cast<GetHResultFn>(status2->vtable[4])(status2, 0) : 0;
+        if (complete1 && complete2) {
+            CloseHandle(gate.resume);
+            CloseHandle(gate.entered);
+        }
 
         reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
         DeleteFileW(temp_file);
 
         // Both requests must fail cleanly
-        if (!complete1 || hr1 == 0) return false;
+        if (!complete1 || hr1 == 0 || !InterlockedCompareExchange(&gate.resumed, 0, 0)) return false;
         if (!complete2 || hr2 == 0) return false;
 
         // Both sentinels must remain completely untouched
