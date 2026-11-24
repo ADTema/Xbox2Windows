@@ -3635,6 +3635,8 @@ The SDWA forms of the 16 `v_cmp_*_f32` predicates are lowered when both `src0_se
 
 Binary32 floating-point vector comparisons (`v_cmp_{f,lt,eq,le,gt,lg,ge,o,u,nge,nlg,ngt,nle,neq,nlt,tru}_f32` in e32, e64, and whole-dword SDWA forms) evaluate the 16 IEEE-754 relations against scalar and vector operands, including subnormals, signed zeroes, infinities, and quiet/signaling NaNs. The e32 (VOPC) encoding requires destination `vcc` or `vcc_lo`; SGPR destinations (`s52`, `s[52:53]`) are accepted on suffix-less and explicit `_e64` (VOP3) encodings. Source modifiers (`neg`, `abs`) are accepted on e64 operands (`-s44`, `|v18|`, `-|s44|`), while `clamp` and `op_sel` remain rejected on comparisons. Rejection controls verify that untracked source registers, SGPR destinations on explicit e32, and sub-dword SDWA selections (`src0_sel:WORD_0`, `src1_sel:BYTE_2`) raise `ValueError`. The synthetic fixture `f32_compares()` verifies all 16 predicates across e32, e64, and whole-dword SDWA, validating them against an exact reference oracle (`f32_compares_reference()`). Mutating predicates or modifiers produces a mismatch.
 
+The original [#958](https://github.com/R0Y00/Xbox2Windows/issues/958) report at `0f0c3eb` recorded a strict comparison mismatch on an RX 9070 XT. Predicate bit 18 compares binary32 subnormal `0x00000001` with `-0.0` and should be clear. The hardware readback set it while WARP and the separate denormal-preservation control passed. The strict expectation and predicate mutation controls are unchanged. Reproduce with `ctest --preset dev --no-tests=error -R '^pixel_aot_comparisons_(warp|hardware)$' -V`. See the reduced desktop DXIL measurements below and the additional adapter results in #958.
+
 Scalar comparison lowering covers 18 RDNA2 SOPC instructions: 32-bit signed comparisons (`s_cmp_eq_i32`, `s_cmp_lg_i32`, `s_cmp_gt_i32`, `s_cmp_ge_i32`, `s_cmp_lt_i32`, `s_cmp_le_i32`), 32-bit unsigned comparisons (`s_cmp_eq_u32`, `s_cmp_lg_u32`, `s_cmp_gt_u32`, `s_cmp_ge_u32`, `s_cmp_lt_u32`, `s_cmp_le_u32`), 64-bit scalar comparisons (`s_cmp_eq_u64`, `s_cmp_lg_u64`), 32-bit bit comparisons (`s_bitcmp0_b32`, `s_bitcmp1_b32`), and 64-bit bit comparisons (`s_bitcmp0_b64`, `s_bitcmp1_b64`). Each comparison sets the scalar condition code boolean (`scc`) to the comparison outcome, making it available for subsequent conditional moves (`s_cmov_b64`). Signed integer comparisons cast operands with `asint`, 64-bit comparisons inspect both low and high dwords across even-aligned SGPR pairs, and bit comparisons mask by `src1 & 31u` (selecting low or high dword via bit 5 for 64-bit forms). Unaligned register pairs, out-of-range registers (`s106`), and unsupported comparison types (`s_cmp_gt_u64`, `s_cmp_eq_i64`) are rejected.
 
 Scalar ALU instructions act on uniform 32-bit values: immediates, loaded constant words and earlier scalar results. Each result becomes an HLSL `uint` local, and a vector move or operand reads it through `asfloat`. Supported forms are `s_add_u32`, `s_sub_u32`, `s_add_i32`, `s_sub_i32`, `s_absdiff_i32`, `s_mul_i32`, `s_min_u32`, `s_max_u32`, `s_min_i32`, `s_max_i32`, `s_and_b32`, `s_or_b32`, `s_xor_b32`, `s_andn2_b32`, `s_orn2_b32`, `s_not_b32`, `s_nand_b32`, `s_nor_b32`, `s_xnor_b32`, `s_lshl_b32`, `s_lshr_b32`, `s_ashr_i32`, the scaled addition family (`s_lshl1_add_u32`, `s_lshl2_add_u32`, `s_lshl3_add_u32`, `s_lshl4_add_u32`), the six `s_cmp_*_i32` and six `s_cmp_*_u32` relations, and `s_cselect_b32`, besides the existing `s_mov_b32` and `s_movk_i32`. SCC follows the RDNA definitions: carry or borrow for the unsigned add, shifted additions and subtract, signed overflow for the signed ones, the comparison for min, max and `s_cmp_*`, and a nonzero result for the bitwise, shift, and absolute difference forms. For `s_lshl<K>_add_u32`, SCC records whether the 64-bit sum `(S0 << K) + S1` generated a carry out of bit 31, evaluated in 32-bit unsigned arithmetic as `(S0 >> (32 - K) != 0) || (dest < S1)`. `s_mul_i32` leaves it unchanged. A shift uses the low five bits of its count. `s_cselect_b32` is rejected unless the lowerer saw SCC written, and `s_wqm_b64` and the exec restore clear the tracked SCC. Scalar results are not folded to constants, so they cannot supply a texture address or sampler word. Carry-in, 64-bit, high-half multiply, bitfield, `s_cmpk_*`, `s_bitcmp*` and `s_cmov*` forms remain unsupported. The draw test packs 23 SCC outcomes and a 17-bit hash of the 32-bit results into four channels, ten bits each, exported as 1 + k/1024, which binary16 holds exactly. The program is drawn with two sets of constant words, including negative and sign-bit inputs, and every select takes a different arm between the sets. A CPU interpreter written from the instruction definitions supplies the expected color. Replacing `s_ashr_i32` with `s_lshr_b32`, `s_cmp_lt_i32` with `s_cmp_lt_u32`, `s_nand_b32` with `s_and_b32`, `s_nor_b32` with `s_or_b32`, `s_xnor_b32` with `s_xor_b32`, or swapping the subtraction's sources must produce a mismatch. In addition, `check_lshl_add_u32_draw` verifies `s_lshl[1-4]_add_u32` end-to-end via `R32G32B32A32_UINT` readback across small values, shift-wrap, and add-wrap arithmetic cases, alongside selective SCC carry-out cases through `s_cselect_b32`; corrupted expectation words and inverted carry flags report pixel mismatches. `check_absdiff_i32_draw` verifies `s_absdiff_i32` end-to-end via `R32G32B32A32_UINT` readback across positive, negative, zero (clearing SCC), double-negative, mixed-sign, INT_MIN edge, and (2^31, 2^32) overflow-wrap cases alongside SCC nonzero checks; corrupted expectation words report pixel mismatches.
@@ -4394,6 +4396,14 @@ ctest --preset dev --no-tests=error -R '^descriptor_window_' -V
 
 Repeat with the `release` preset.
 
+#### CPU-copied binding records
+
+`descriptor_record_copy` reuses the same shader and submission sequence. After fence 1, the test copies a 32-byte CPU binding record into the second record with `memcpy`. The live path reads the copied ID and uses `CopyDescriptorsSimple` to transfer its SRV from a CPU-only staging heap to shader-visible slot 999,999. The stale control reads a saved record while binding that same GPU slot. The records contain fixture-defined IDs and are independent of the opaque D3D12 descriptors. [Startup observation on #870](https://github.com/R0Y00/Xbox2Windows/issues/870#issuecomment-7116272710) · [Microsoft descriptor-copy guidance](https://learn.microsoft.com/en-us/windows/win32/direct3d12/copying-descriptors)
+
+The first snapshot is `13579bdf,a5a5a5a5` in all cases. The live copy reads `13579bdf,2468ace0` at fence 2. The stale mirror repeats the old word and reads `13579bdf,13579bdf`. An unknown ID must leave the descriptor copy count, submitted list count, completed fence and readback unchanged. The corrected record then produces the same result as the live path.
+
+Build `offscreen_check` as above and run `ctest --preset dev --no-tests=error -R '^descriptor_record_copy_' -V`. Repeat with `release`. These tests use Shader Model 6.0 and skip when the adapter lacks it.
+
 ### Desktop GPU addresses for xmem graphics allocations
 
 `era_title_gpu` (`src/era_title_gpu.cpp`) is a process-wide registry that connects `xmem.dll` to the GPU address pieces above.
@@ -4868,6 +4878,43 @@ On success the caller exits with `0x8AC`, also with `CPU_CRC_TEST_LIVE_WORKER=1`
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_acphal_hal$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_acphal_hal$' -V
+
+### XApu command-queue caller and recorder
+
+A source-built caller ([`xapu_queue_caller.asm`](../tests/cpu/xapu_queue_caller.asm)) imports the five `xapu.dll` command-queue functions by name (`XApuConnect`, `XApuEnqueueCommand`, `XApuGetResultCount`, `XApuDequeueResult`, `XApuDisconnect`), plus `finish_exe` from `cpu_exe_io.dll`, and starts through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). A test-only recording provider ([`xapu_queue_provider.cpp`](../tests/cpu/xapu_queue_provider.cpp)) serves the five names. This is not a production `xapu.dll`, and this change adds no binding.
+
+No public source gives these signatures. The [GDK Learn index at `f8c3438`](https://github.com/microsoft/XBOX-GDK-dotnet/blob/f8c3438aa366fbbb662d8a5e724021a9d0b65f5d/eng/gdk-learn-index.json) names the functions and the types `XApuConnectInputParameters`, `XApuConnectOutputParameters`, `XApuCommandId` and `XApuResult`, but lists all of them under `restricted`. DirectXTK12 at `f3555e3` has no `XApu*` reference. The caller and provider therefore share a fixture convention. These symbols and signatures are fixture policy until there is an independent reference, and they are not the console contract:
+
+| Function | Fixture convention |
+|---|---|
+| `XApuConnect` | `HRESULT (UINT64* client)`. Writes a new nonzero handle. Handles are never reused. |
+| `XApuEnqueueCommand` | `HRESULT (UINT64 client, UINT64 id, UINT32 payload)`. The command completes at once, and its result holds the ID, `payload + 0x1000` and `S_OK`. |
+| `XApuGetResultCount` | `HRESULT (UINT64 client, UINT32* count)` |
+| `XApuDequeueResult` | `HRESULT (UINT64 client, result*)`, with a 16-byte result `{UINT64 id; UINT32 value; HRESULT status}`. Results leave in submission order. |
+| `XApuDisconnect` | `HRESULT (UINT64 client)` |
+
+An unknown, zero or disconnected handle fails with `E_HANDLE`. A dequeue from an empty queue fails with `HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS)` (`0x80070103`). A failed call leaves its output untouched. These codes are fixture choices too. When the provider refuses a call that has an output, it reads the output without writing it and records the first 8 bytes (4 for a count).
+
+1. **Connect:** `S_OK` and a nonzero handle.
+2. **Enqueue:** three commands (IDs `0x101` to `0x103`, payloads `0x11`, `0x22`, `0x33`) each return `S_OK`, and the result count is 3.
+3. **Observable result:** three dequeues return IDs `0x101`, `0x102`, `0x103` in that order, each with `payload + 0x1000` and `S_OK`, and the count falls 2, 1, 0.
+4. **Refusal (empty queue):** a fourth dequeue returns `0x80070103` and leaves the caller's sentinel result unchanged.
+5. **Refusal (handle):** an enqueue and a dequeue on an unknown handle and a count on handle 0 each return `E_HANDLE` with outputs unchanged. The live client's queue stays empty.
+6. **Disconnect:** `S_OK`. A second disconnect and a later enqueue on the same handle return `E_HANDLE`.
+7. The caller checks its own provider's counts: 1 connect, 1 disconnect, no live client, 3 enqueued, 3 dequeued, 6 refusals. It then exits with `0x8B0`.
+
+The check runs the EXE under the Windows loader, with and without a live worker at exit, and under `pe_map`. Both loaders exit with `0x8B0`. The mapped run records the IDs in the same order on enqueue and dequeue, and 19 provider calls in total. The provider saw the caller's sentinel in the output at each of the three refusals that have one (empty dequeue, unknown-handle dequeue, zero-handle count). It also runs these controls:
+
+- A lenient provider build (`XAPU_TEST_LENIENT`) accepts unknown handles. Under both loaders the caller stops at the handle step with `0xF05`, and the provider records the foreign command `0x1EE`.
+- A LIFO provider build (`XAPU_TEST_LIFO`) returns the newest result first. Under both loaders the caller stops at the order step with `0xF03`, and the first dequeued ID is `0x103`.
+- Without `xapu.dll` beside it, the Windows loader refuses the process with `STATUS_DLL_NOT_FOUND` (`0xC0000135`).
+- Without the provider, or with any one of the five queue imports withheld, `pe_map` stops at import resolution before entry (`unresolved import xapu.dll!...`). The provider records no calls.
+
+The fixture shows that a caller can tell FIFO delivery, handle refusal and empty-queue refusal apart, and that both loaders give the same result. It does not establish the console signatures, the parameter and result layouts, the handle type, the error codes, whether commands complete asynchronously, or which commands the startup path submits. The `chad.dll` XDsp stream lifecycle is separate.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_xapu_queue$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_xapu_queue$' -V
 ```
 
 ### GameInput ordinal 1 caller and recorder

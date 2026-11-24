@@ -527,6 +527,11 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(descriptor_window_stale_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "descriptor_windows submit=2 slot=[1-9]")
+    foreach(scenario IN ITEMS live stale unknown)
+        add_test(NAME descriptor_record_copy_${scenario}_${adapter}
+            COMMAND offscreen_check ${adapter} --descriptor-record-copy ${scenario})
+        set_tests_properties(descriptor_record_copy_${scenario}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME texture_mips_${adapter} COMMAND offscreen_check ${adapter} --texture-mips)
     set_tests_properties(dual_uav_${adapter} texture_mips_${adapter} PROPERTIES TIMEOUT 45)
     add_test(NAME dxr_query_${adapter} COMMAND offscreen_check ${adapter} --ray-query)
@@ -3789,6 +3794,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_gameinput_provider_shifted_layout>" "$<TARGET_FILE:cpu_gameinput_provider_wrong>"
         "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_gameinput PROPERTIES TIMEOUT 120)
+
+    add_library(cpu_xapu_queue_provider SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
+    add_library(cpu_xapu_queue_provider_lenient SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
+    target_compile_definitions(cpu_xapu_queue_provider_lenient PRIVATE XAPU_TEST_LENIENT)
+    add_library(cpu_xapu_queue_provider_lifo SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
+    target_compile_definitions(cpu_xapu_queue_provider_lifo PRIVATE XAPU_TEST_LIFO)
+    add_executable(cpu_xapu_queue_caller tests/cpu/xapu_queue_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_xapu_queue_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_xapu_queue_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_xapu_queue_caller PRIVATE cpu_xapu_queue_provider cpu_exe_io)
+    add_test(NAME cpu_native_xapu_queue COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xapu_queue_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_xapu_queue_caller>" "$<TARGET_FILE:cpu_xapu_queue_provider>"
+        "$<TARGET_FILE:cpu_xapu_queue_provider_lenient>" "$<TARGET_FILE:cpu_xapu_queue_provider_lifo>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_xapu_queue PROPERTIES TIMEOUT 60)
 
     add_library(cpu_dstorage_provider SHARED tests/cpu/dstorage_provider.cpp tests/cpu/dstorage_provider.def)
     add_executable(cpu_dstorage_caller tests/cpu/dstorage_caller.asm tests/cpu/exe_startup.asm)
