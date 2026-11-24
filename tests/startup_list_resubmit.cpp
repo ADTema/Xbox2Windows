@@ -10,12 +10,16 @@
 //   2. submit B, then A again            red    a closed list stays submittable
 //   3. Reset allocator a, submit B, A    red    A's recording survives its allocator's Reset
 //   4. Reset A on a, clear blue, submit  blue   the list records on the allocator now in use
+//   5. queue Wait on H (slot 17), submit A behind it, Reset A on b (clear green), Reset allocator a,
+//      then signal H on the CPU          blue   a submit the GPU has not passed survives the Reset
+//      submit A again                    green
 //
-// The desktop device must not be removed. On a stand-in that submits a closed list only once,
-// step 2 reads green.
+// The desktop device must not be removed and the debug layer must store no errors. On a stand-in
+// that submits a closed list only once, step 2 reads green.
 //
 // Exit codes: 0 pass, 77 no physical adapter, other values name the failing step.
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
@@ -23,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -36,6 +41,11 @@ Word invoke(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Wo
     return reinterpret_cast<Slot>((*static_cast<void***>(object))[index])(object, a, b, c, d, e);
 }
 bool ok(Word hr) { return SUCCEEDED(static_cast<HRESULT>(hr)); }
+void* make_fence(void* device)
+{
+    void* fence = nullptr;
+    return ok(invoke(device, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&fence))) ? fence : nullptr;
+}
 
 constexpr float red[] = {1, 0, 0, 1}, green[] = {0, 1, 0, 1}, blue[] = {0, 0, 1, 1};
 constexpr std::uint32_t red_bits = 0xff0000ff, green_bits = 0xff00ff00, blue_bits = 0xffff0000;
@@ -56,18 +66,41 @@ struct Probe {
         invoke(list, 52, rtv.ptr, arg(colour));
         invoke(list, 9);
     }
-    // Submit lists through the console queue and wait for the GPU.
-    bool submit(void* list)
+    // Submit a list through the console queue and, unless told not to, wait for the GPU.
+    bool submit(void* list, bool wait = true)
     {
         void* lists[] = {list};
         invoke(queue, 10, 1, arg(lists));
         if (!ok(invoke(queue, 14, arg(fence), ++fence_value))) return false;
+        return !wait || reached();
+    }
+    bool reached()
+    {
         const auto deadline = GetTickCount64() + 10000;
         while (invoke(fence, 8) < fence_value) {
             if (GetTickCount64() >= deadline) return false;
             Sleep(1);
         }
         return true;
+    }
+    // Errors and corruption messages the D3D12 debug layer stored for the device.
+    UINT64 debug_errors()
+    {
+        ComPtr<ID3D12InfoQueue> info;
+        if (FAILED(desktop.As(&info))) return 0;
+        UINT64 errors = 0;
+        for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
+            SIZE_T bytes = 0;
+            if (FAILED(info->GetMessage(i, nullptr, &bytes))) continue;
+            std::vector<char> storage(bytes);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+            if (FAILED(info->GetMessage(i, message, &bytes))) continue;
+            if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+                ++errors;
+                std::printf("debug layer: %.*s\n", static_cast<int>(message->DescriptionByteLength), message->pDescription);
+            }
+        }
+        return errors;
     }
     // The target's one texel, copied on a desktop queue.
     std::uint32_t texel()
@@ -199,7 +232,25 @@ int main(int argc, char** argv)
     if (!probe.submit(list_a)) return 40;
     if (!expect(probe, "4 A reset on a, clear blue", blue_bits)) return 41;
 
+    // 5. The GPU has not passed a's last submit at its Reset: the queue waits on H (slot 17), A (blue,
+    // on a) is submitted behind the wait, then A is reset on b, so no list holds a recording on a.
+    // Resetting a's allocator then would discard the pending submit; the stand-in must move to
+    // another one. After the CPU signals H, the pending submit draws blue.
+    void* h = make_fence(device);
+    if (!h || !ok(invoke(probe.queue, 17, arg(h), 1))) return 50;
+    if (!probe.submit(list_a, false)) return 51;
+    probe.record(list_a, b, green);
+    if (!ok(invoke(a, 8))) return 52;
+    if (invoke(probe.fence, 8) >= probe.fence_value) return 53;  // the submit is still behind the wait
+    if (!ok(invoke(h, 10, 1))) return 54;                         // fence H Signal(1) from the CPU
+    if (!probe.reached()) return 55;
+    if (!expect(probe, "5 Reset while the GPU waits, pending submit of A", blue_bits)) return 56;
+    if (!probe.submit(list_a)) return 57;
+    if (!expect(probe, "5 A re-recorded on b", green_bits)) return 58;
+
     const HRESULT removed = probe.desktop->GetDeviceRemovedReason();
-    std::printf("device removed reason: 0x%08lx\n", static_cast<unsigned long>(removed));
-    return removed == S_OK ? 0 : 50;
+    const UINT64 errors = probe.debug_errors();
+    std::printf("device removed reason: 0x%08lx, debug layer errors: %llu\n", static_cast<unsigned long>(removed),
+                static_cast<unsigned long long>(errors));
+    return removed == S_OK && errors == 0 ? 0 : 60;
 }

@@ -161,7 +161,8 @@ constexpr UINT64 asOffset = 2 * D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALI
 static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const std::vector<Vertex>& vertices,
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances, const std::vector<Ray>& rays,
     Backend backend, const SceneUpdate* update, const std::vector<D3D12_RAYTRACING_GEOMETRY_FLAGS>* triangleGeometries,
-    const AddressScene* addressScene, PlacedBuildScene* placedScene = nullptr) {
+    const AddressScene* addressScene, PlacedBuildScene* placedScene = nullptr, const ResolvedBatch* resolved = nullptr,
+    BuildCounts* counts = nullptr) {
     const bool usePipeline = backend == Backend::pipeline;
     if (usePipeline) {
         if (triangleGeometries && (triangleGeometries->empty() || triangleGeometries->size() > 4))
@@ -233,7 +234,17 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     const UINT64 prefix = addressScene ? asOffset : 0;
     const UINT64 blasBytes = prefix + bottom_size.ResultDataMaxSizeInBytes;
     ComPtr<ID3D12Resource> blas, tlas, scratch;
-    if (placedScene) {
+    if (resolved) {
+        const auto apply = [](const ResolvedBuild& input, const auto& measured, auto& build) {
+            if (input.sizes.ResultDataMaxSizeInBytes != measured.ResultDataMaxSizeInBytes ||
+                input.sizes.ScratchDataSizeInBytes != measured.ScratchDataSizeInBytes)
+                throw std::runtime_error("Submitted geometry sizes differ from the prevalidated batch");
+            build.DestAccelerationStructureData = input.dest;
+            build.ScratchAccelerationStructureData = input.scratch;
+        };
+        apply(resolved->at(0), bottom_size, bottom);
+        apply(resolved->at(1), top_size, top);
+    } else if (placedScene) {
         placedScene->prepare(device, bottom_size, top_size, bottom, top);
     } else {
         blas = make_buffer(device, blasBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
@@ -310,12 +321,14 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     order.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     // Order both the BLAS write and the reused scratch storage before building the TLAS.
     list->BuildRaytracingAccelerationStructure(&bottom, 0, nullptr);
+    if (counts) ++counts->records;
     list->ResourceBarrier(1, &order);
     if (addressScene) {
         list->BuildRaytracingAccelerationStructure(&otherBuild, 0, nullptr);
         list->ResourceBarrier(1, &order);
     }
     list->BuildRaytracingAccelerationStructure(&top, 0, nullptr);
+    if (counts) ++counts->records;
     ComPtr<ID3D12Resource> updatedVertices, updatedInstances;
     if (update) {
         updatedVertices = bvh_fixture::upload(device, update->vertices);
@@ -349,6 +362,7 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     transition(list.Get(), results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), 0, results.Get(), 0, result_bytes);
     commands.submit_and_wait(device);
+    if (counts) ++counts->submissions;
 
     return bvh_fixture::read(readback.Get(), rays.size()*4);
 }
@@ -393,14 +407,20 @@ bool check_dxr_address_ranges(ID3D12Device* device) {
     return true;
 }
 
+std::vector<UINT32> dxr_fixture::trace_placed_triangle(ID3D12Device* device, const ResolvedBatch* resolved,
+                                                       PlacedBuildScene* placement, BuildCounts* counts) {
+    using namespace dxr_fixture;
+    const std::vector<Vertex> vertices{{-1,-1,1}, {1,-1,1}, {0,1,1}};
+    const std::vector<Ray> rays{{0,0,0,.01f,0,0,1,4,1}, {4,0,0,.01f,0,0,1,4,1}, {0,0,0,.01f,0,0,1,4,2}};
+    return trace_scene(device, vertices, {instance(7,1)}, rays, Backend::pipeline,
+                       nullptr, nullptr, nullptr, placement, resolved, counts);
+}
+
 bool check_dxr_placed_build(ID3D12Device* device) {
     using namespace dxr_fixture;
     if (!supported(device, Backend::pipeline)) return false;
     PlacedBuildScene placement;
-    const std::vector<Vertex> vertices{{-1,-1,1}, {1,-1,1}, {0,1,1}};
-    const std::vector<Ray> rays{{0,0,0,.01f,0,0,1,4,1}, {4,0,0,.01f,0,0,1,4,1}, {0,0,0,.01f,0,0,1,4,2}};
-    const auto output = trace_scene(device, vertices, {instance(7,1)}, rays, Backend::pipeline,
-        nullptr, nullptr, nullptr, &placement);
+    const auto output = trace_placed_triangle(device, nullptr, &placement);
     const std::vector<bvh_fixture::Word> expected{1,7,0,0x3f800000, 0,0,0,0, 0,0,0,0};
     if (output != expected) throw std::runtime_error("Placed BLAS/TLAS ray output differs from hit7@1, miss, masked miss");
     std::puts("Slot 133 placed BLAS/TLAS: hit7@1, miss, masked miss; 12/12 words matched");

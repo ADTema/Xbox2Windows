@@ -84,6 +84,7 @@ struct WrapperOwn {
     bool list_open;   // CommandList (render mode): recording between reset and close
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
+    volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
 };
@@ -1057,10 +1058,12 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
         }
     }
     if (next) {
-        next->submits.clear();
         hr = next->real->Reset();
-        if (next != title.current) InterlockedIncrement(&allocator_swaps);
-        if (SUCCEEDED(hr)) title.current = next;
+        if (SUCCEEDED(hr)) {
+            next->submits.clear();
+            if (next != title.current) InterlockedIncrement(&allocator_swaps);
+            title.current = next;
+        }
     }
     const auto pool = title.pool.size();
     ReleaseSRWLockExclusive(&allocator_lock);
@@ -1802,8 +1805,8 @@ HRESULT __stdcall queue_timestamp_frequency(Wrapper* self, UINT64* frequency)
 }
 
 // Queue slots whose Xbox meaning is unknown, dispatched by argument shape:
-// - (fence wrapper, value): Signal on the desktop queue. Wait has the same shape; treating it as a
-//   signal can complete a fence early but cannot leave the title waiting forever.
+// - (fence wrapper, value): Signal on the desktop queue. Slot 17 (Wait) has the same shape and is
+//   handled by queue_wait below; on other slots a wait would complete the fence early.
 // - (count, array of command-list wrappers): ExecuteCommandLists (not submitted while lists are no-ops).
 // Anything else logs its first call and returns 0. Each shape logs the slot it arrived on.
 template <int N>
@@ -1814,8 +1817,12 @@ __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
     const bool log_it = first_calls(calls, 2);
     if (Wrapper* fence = as_wrapper(reinterpret_cast<void*>(rdx)); fence && fence->own().kind == fence_kind) {
         const HRESULT hr = static_cast<ID3D12CommandQueue*>(self->own().real)->Signal(static_cast<ID3D12Fence*>(fence->own().real), r8);
-        if (render_mode() && SUCCEEDED(hr)) complete_when_reached(fence, r8);
-        else fence_reached(fence, r8);
+        if (SUCCEEDED(hr)) {
+            if (render_mode() || InterlockedCompareExchange(&self->own().queue_wait_seen, 0, 0))
+                complete_when_reached(fence, r8);
+            else
+                fence_reached(fence, r8);
+        }
         if (log_it)
             log("x2w-d3d12 CommandQueue::slot%d(fence=%p, value=0x%llx) -> Signal 0x%08lx", N, static_cast<void*>(fence), r8,
                 static_cast<unsigned long>(hr));
@@ -1847,6 +1854,23 @@ __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
                          r9, _ReturnAddress());
     }
     return 0;
+}
+
+// Queue slot 17 (Xbox order): (fence, value) -> HRESULT, Wait. The console queue has two methods
+// before the desktop's Signal and Wait (desktop slots 14 and 15), so Signal is slot 16 and Wait is
+// slot 17; slot 18 (GetTimestampFrequency) and slot 32 (present) follow the same layout. The desktop
+// queue waits on the GPU for the fence value. Any other argument shape keeps the shape dispatch.
+u64 __stdcall queue_wait(Wrapper* self, u64 rdx, u64 r8, u64 r9)
+{
+    Wrapper* fence = as_wrapper(reinterpret_cast<void*>(rdx));
+    if (!fence || fence->own().kind != fence_kind) return queue_dynamic<17>(self, rdx, r8, r9);
+    InterlockedExchange(&self->own().queue_wait_seen, 1);
+    const HRESULT hr = static_cast<ID3D12CommandQueue*>(self->own().real)->Wait(static_cast<ID3D12Fence*>(fence->own().real), r8);
+    static LONG calls;
+    if (first_calls(calls, 2))
+        log("x2w-d3d12 CommandQueue::slot17(fence=%p, value=0x%llx) -> Wait 0x%08lx", static_cast<void*>(fence), r8,
+            static_cast<unsigned long>(hr));
+    return static_cast<u64>(hr);
 }
 
 template <std::size_t... I>
@@ -2204,10 +2228,18 @@ HRESULT __stdcall device_create_command_list_x(Wrapper* self, const void* desc, 
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
     ID3D12GraphicsCommandList* list = nullptr;
+    // Create on the allocator the title's allocator currently stands for: after a Reset that moved
+    // it to another desktop allocator, the first one may still be in use.
+    auto* desktop_allocator = reinterpret_cast<ID3D12CommandAllocator*>(unwrap(reinterpret_cast<u64>(allocator)));
+    if (Wrapper* a = as_wrapper(allocator); a && a->own().kind == allocator_kind) {
+        AcquireSRWLockExclusive(&allocator_lock);
+        desktop_allocator = title_allocator(a).current->real;
+        ReleaseSRWLockExclusive(&allocator_lock);
+    }
     HRESULT hr = kind_for(*iid) == list_kind
         ? device_of(self)->CreateCommandList(0, desc ? *static_cast<const D3D12_COMMAND_LIST_TYPE*>(desc)
                                                      : D3D12_COMMAND_LIST_TYPE_DIRECT,
-              reinterpret_cast<ID3D12CommandAllocator*>(unwrap(reinterpret_cast<u64>(allocator))),
+              desktop_allocator,
               reinterpret_cast<ID3D12PipelineState*>(unwrap(reinterpret_cast<u64>(pso))), IID_PPV_ARGS(&list))
         : E_NOINTERFACE;
     if (SUCCEEDED(hr)) list->Close();
@@ -2997,6 +3029,7 @@ void build_tables()
     // Queue: not the desktop order (slot 18 is GetTimestampFrequency, desktop 16). Slots are
     // dispatched by argument shape until the order is known; see queue_dynamic.
     fill_queue_dynamic(tables[queue_kind], std::make_index_sequence<64>{});
+    tables[queue_kind][17] = reinterpret_cast<void*>(&queue_wait);
     tables[queue_kind][18] = reinterpret_cast<void*>(&queue_timestamp_frequency);
     tables[queue_kind][32] = reinterpret_cast<void*>(&queue_present);
 
