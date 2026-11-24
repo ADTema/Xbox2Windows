@@ -1,6 +1,8 @@
 """Two descriptor tables, depth export, and a physical CBV swap."""
 
 from pathlib import Path
+import math
+import re
 import struct
 import subprocess
 import sys
@@ -386,7 +388,68 @@ def draw(dxc, renderer, adapter, tmp, shader, word_offset, noise, *, thresholds=
     return 0
 
 
+def f32(value):
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def from_bits(bits):
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def fract_reference(bits):
+    """v_fract_f32 on binary32 bits: x - floor(x) capped at 0x3f7fffff, a NaN stays a NaN."""
+    x = from_bits(bits)
+    if not math.isfinite(x):
+        return math.nan
+    return min(f32(x - math.floor(x)), from_bits(0x3F7FFFFF))
+
+
+def evaluate_fract(expression, bits):
+    """Evaluate one emitted v_fract expression on binary32 bits with D3D semantics."""
+    x = from_bits(bits)
+    frac = f32(x - math.floor(x)) if math.isfinite(x) else math.nan
+    cap = from_bits(0x3F7FFFFF)
+    if re.fullmatch(r"\(frac\((\w+)\) >= 1\.0f \? asfloat\(0x3f7fffffu\) : frac\(\1\)\)", expression):
+        return cap if frac >= 1.0 else frac  # NaN fails the comparison and passes through
+    if re.fullmatch(r"min\(frac\((\w+)\), asfloat\(0x3f7fffffu\)\)", expression):
+        return cap if frac != frac else min(frac, cap)  # D3D min returns the non-NaN operand
+    if re.fullmatch(r"frac\((\w+)\)", expression):
+        return frac
+    raise AssertionError(expression)
+
+
+def same_word(got, want):
+    return (got != got and want != want) or struct.pack("<f", got) == struct.pack("<f", want)
+
+
+def fract_nan():
+    """The v_fract_f32 cap keeps a NaN a NaN and caps -2^-30, and each wrong cap is caught."""
+    lines = program()
+    index = lines.index("v_fract_f32_e32 v7, v7")
+    prefix = f"    precise float value{index} = "
+    line = next(l for l in lower(decoded_stream(lines), TABLES).splitlines() if l.startswith(prefix))
+    expression = line[len(prefix) : -1]
+    argument = re.search(r"frac\((\w+)\)", expression)[1]
+    assert expression == f"(frac({argument}) >= 1.0f ? asfloat(0x3f7fffffu) : frac({argument}))", line
+    nan, tiny = (0x7FC00000, 0x7FC00001, 0xFF800000), (0xB0800000, 0xB1800000)
+    ordinary = (0x3F000000, 0xBF000000, 0x00000000, 0x80000000, 0x3F800000, 0xBF800000)
+    for bits in nan + tiny + ordinary:
+        assert same_word(evaluate_fract(expression, bits), fract_reference(bits)), hex(bits)
+    # The reference itself: a NaN stays a NaN and -2^-30 gives 0x3f7fffff, not 1.0.
+    assert all(fract_reference(b) != fract_reference(b) for b in nan)
+    assert all(fract_reference(b) == from_bits(0x3F7FFFFF) for b in tiny)
+    # Previous min cap: a NaN input becomes finite. No cap: a tiny negative input becomes 1.0.
+    old = f"min(frac({argument}), asfloat(0x3f7fffffu))"
+    bare = f"frac({argument})"
+    for bits in nan:
+        assert not same_word(evaluate_fract(old, bits), fract_reference(bits)), hex(bits)
+    for bits in tiny:
+        assert not same_word(evaluate_fract(bare, bits), fract_reference(bits)), hex(bits)
+    assert all(same_word(evaluate_fract(old, b), fract_reference(b)) for b in tiny + ordinary)
+
+
 def binary(tmp, assembler, objcopy, library):
+    fract_nan()
     translate(tmp, assembler, objcopy, library, program(), source())
     for op in OPS:
         translate(tmp, assembler, objcopy, library, program(op=op), op_source(op))
