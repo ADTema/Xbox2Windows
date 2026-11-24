@@ -2075,8 +2075,8 @@ must fail. The patched pointer is never called. The original fixtures and test
 are MIT source; no game inputs are included.
 
 ```powershell
-cmake --build out/native --target pe_map cpu_reloc_original cpu_import_provider --parallel 4
-ctest --test-dir out/native --no-tests=error -R '^cpu_native_highlow$' -V
+cmake --build --preset dev --target pe_map cpu_reloc_original cpu_import_provider --parallel 4
+ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V
 ```
 
 Measured on Windows 11 build 26300.9974 with MSVC/ML64 19.44.35230 and
@@ -2497,8 +2497,8 @@ from a compare before the transfer. Macro-generated instruction forms are record
 from the decoded functions only after all comparisons and controls succeed.
 
 ```powershell
-cmake --build out/native --target cpu_switch_strings_lifted cpu_switch_strings_lifted_o2 cpu_switch_strings_mutants cpu_string_probe cpu_guarded_call --parallel 4
-ctest --test-dir out/native --no-tests=error -R '^cpu_aot_switch_strings$' -V
+cmake --build --preset dev --target cpu_switch_strings_lifted cpu_switch_strings_lifted_o2 cpu_switch_strings_mutants cpu_string_probe cpu_guarded_call --parallel 4
+ctest --preset dev --no-tests=error -R '^cpu_aot_switch_strings$' -V
 ```
 
 Windows 11 build 26300.9974, MSVC/ML64 19.44.35230 and Python 3.12.8:
@@ -3693,7 +3693,8 @@ first at mip 0, word 33. The exchange fixture covers matched and unmatched
 compares at both group counts. Reversing the HLSL comparison and replacement
 arguments in the two-group control must fail first at
 `mip=0 word=32 expected=a5a51f3f actual=fffffff0`. Only a complete suite
-records coverage. Returning atomics and float atomics are outside this profile.
+records coverage. Returning atomics are outside this profile. The finite-normal
+float profile is described below.
 
 The LLVM 15 test assembles, disassembles and translates the cases through the
 synthetic-container CLI. The standalone compile modes check the generated
@@ -3750,6 +3751,56 @@ $env:TEMP = $env:TMP
 python -B tests/compute_store_check.py compile-mimg-atomic-counter $Dxc
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_counter_(warp|hardware)$' -V
+```
+
+### gfx1030 2D float image atomics
+
+`image_atomic_fcmpswap`, `image_atomic_fmin` and `image_atomic_fmax` use a
+linear 2D native `R32_FLOAT` image at mip 0 with `glc` clear. Pass
+`--image-format R32_FLOAT --image-float-domain finite-normal --image-uav-mip 0`
+to declare the profile and bind a desktop `R32_UINT` UAV containing raw
+binary32 words. The caller supplies in-bounds coordinates and guarantees that
+all accessed texels and data VGPRs hold finite normal values. Zeros,
+subnormals, infinities and NaNs are outside
+the profile. Returning forms and other dimensions and mips remain unsupported.
+
+The [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+defines floating compare-swap with replacement in `VDATA` and compare in
+`VDATA+1` (`dmask:0x3`). Binary32 numeric equality reduces to bit equality
+on this domain, so `cs_6_0` uses integer `InterlockedCompareStore`. Min and max
+take one word (`dmask:0x1`) and replace the old word on a strict comparison.
+They compare unsigned keys formed by inverting every bit of negative words
+and toggling the sign bit of positive words. A compare-exchange loop writes
+the selected original bits. Its zero seed obtains the first texel value
+through the atomic result without a typed UAV load. The fixture requires the
+same typed `UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE` support bit on
+`R32_UINT` as the bounded counters.
+
+Five source-built cases compare all 336 words across three mips at one and
+two dispatched groups. They cover
+matching and neighboring nonmatching compare operands, both signs, finite
+normal endpoints, exact ties, and two lanes with distinct operands sharing a
+texel. Swapping the compare-swap operands, reversing either ordering
+predicate, or dropping either retry must fail first at mip 0, word 32.
+LLVM checks assembly, disassembly and synthetic-container translation. The
+DXC check compiles the five shaders and five mutations and checks for integer
+compare-exchange and no typed UAV load in the original DXIL. The GPU tests
+record the three forms after the positive cases and mutation controls pass.
+The compile and container checks run offline. The readback command runs the
+translated DXIL on WARP or desktop hardware. Native execution and native
+special-value behavior remain unmeasured.
+
+```powershell
+$Dxc = (Get-Command dxc -ErrorAction Stop).Source
+$env:TMP = (Resolve-Path out).Path
+$env:TEMP = $env:TMP
+python -B tests/compute_store_check.py compile-mimg-atomic-float $Dxc
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_float_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
 ### Bounded gfx1030 DS lane routing
@@ -4565,6 +4616,23 @@ The CPU controls reject a missing or wrong restore, a saved mask overwritten und
 
 `shader_profile_audit.py` is unchanged. It does not bind b0, so it does not try guards that read their bound from a constant, and it does not label branches.
 
+### Lane-pattern masks from s_bitreplicate_b64_b32
+
+`s_bitreplicate_b64_b32 s[d:d+1], imm` copies each source bit into two adjacent destination bits: for i in 0..31, `D.u64[2i] = D.u64[2i+1] = S0.u32[i]`, so `0x0f0f` becomes `0x00ff00ff` and `0x3f3f3f3f` becomes `0x0fff0fff0fff0fff`. The store profile folds it when the source is an integer inline constant or a 32-bit literal. Both halves become known words: the low one replicates bits 0-15 and the high one bits 16-31. They can be copied or used by the scalar and vector ALU forms like any other known word. The destination must be an even-aligned pair at or below s105 that is not waiting for a load. An SGPR, VGPR or float source is refused with `Unverified lane mask source`, even an SGPR that holds a known word.
+
+`v_cndmask_b32_e64 vD, a, b, sM` consumes such a mask: lane L gets `b` where bit L of `sM` is set and `a` where it is clear (`D = mask[lane] ? S1 : S0`). This is the wave32 spelling, with the mask in one SGPR. The mask must hold a statically known word, either a replicated half or an immediate moved there. A constant-buffer word, a computed word, a descriptor, the group ID or the saved exec mask is refused with `Unverified lane mask`. `a` and `b` are known words, and the result is data, like the ALU results. The lowering is `((mask >> (tid.x % X)) & 1) != 0 ? b : a` for a group of X threads.
+
+The lane of a thread is its local X ID only when the group is one wave. A one-dimensional group of at most 32 threads is one wave at either wave size. Past lane 31, the same encoding reads the high mask word in a wave64 program, and the translator cannot tell the wave size from the code. Larger groups and two- or three-dimensional groups are therefore refused with `Lane mask select requires a one-dimensional group of at most 32 threads`. The wave64 pair spelling `s[m:m+1]`, `vcc_lo` or `exec_lo` as the mask, the e32 form, a source modifier or `clamp`, and a mask written to exec (`s_mov_b32 exec_lo`, `s_and_saveexec_b32` from an SGPR) stay unsupported.
+
+The source-built fixture is gfx1013 text in LLVM 15 spelling with `--table-reg 0 --descriptor-offset 0 --group-reg 1 --stride 16`. It replicates `0x3f3f3f3f`, the pattern of the measured sites, and `0x9c3a5e17`, whose halves differ. One `buffer_store_dwordx4` per thread writes `m.lo[lane] ? 0x600d : gid`, `n.lo[lane] ? gid : 0xbeef`, `n.hi[lane] ? gid : 0xffffffff` and the word `n.hi`, from a VGPR, a literal, an SGPR and the inline constant -1. It runs with groups of 32 (one and two groups) and of 16 (one, three and five groups). The expected 320 words come from a bit-by-bit Python model of the ISA text that shares no code with the lowering. On the largest dispatch of each group size, every one of these references must fail at its first differing word: the source used without replication, the high half for the low half, the low half for the high half, the select arms exchanged, the lane plus one, and, for the group of 16, the dispatch index as the lane. With a group of 32, a changed sentinel past the last thread must also fail. Recompiled HLSL with the arms exchanged, the unreplicated source, the mask bit inverted, the lane plus one or the dispatch index as the lane (group of 16) must fail too. The translator controls check the model on `0x0f0f` and `0x80000001`, the exact HLSL of both programs, the lowered masks of `-1`, `0`, `0xffff` and `0xffff0000`, and each refusal listed above.
+
+On Windows 11 build 26300.9974 on parent commit 6c0e5380 with the D3D12 debug layer enabled and zero debug errors, WARP 10.0.26100.9818 matched all 320 words on the five dispatches, and every wrong reference and mutated source mismatched. The semantics of both instructions come from the [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf). That a one-wave group places local X in lane X is an assumption about the console that this fixture does not measure.
+
+```sh
+python -B tests/compute_lane_mask_check.py controls
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lane_mask_(warp|hardware)$' -V
+```
+
 ### Vector reads from a second raw buffer
 
 The store profile can copy one word per read from a second, read-only raw buffer to the store. The caller binds it with `--source-descriptor`, the table byte offset of its four-word descriptor, which becomes `ByteAddressBuffer inputData : register(t0)`. `--source-stride` gives its byte stride for indexed reads. The descriptor may come from its own `s_load_dwordx4` or from one `s_load_dwordx8` with a neighbouring bound descriptor, which is how the LLVM 15 code generator loads u0 and the source together. The word read is stored, copied with `v_mov_b32`, or used by the small integer ALU subset of the next subsection.
@@ -4739,6 +4807,16 @@ The store profile also accepts these scalar 32-bit operations. Both sources are 
 The result becomes an inline HLSL expression, like a vector result, and a vector instruction can read it as a source. SCC is not modelled: no accepted instruction reads it. A destination past s105, a destination or source that waits for a load, a source that is not a known word (an unwritten SGPR, a descriptor, the saved exec mask), a vector source and the carry-in, signed, 64-bit and inverted forms stop the lowering, as does an expression over 1024 characters. A scalar result is data only: it cannot form an address or be a lane-guard compare operand. Overwriting the saved exec mask is rejected at the guard restore.
 
 The check assembles one fixture that chains all six operations over the cap word and the bound, and requires the decoded program to lower to the same HLSL as its text.
+
+#### Scalar absolute difference
+
+`s_absdiff_i32 sD, a, b` (SOP2 opcode 44) takes the same two scalar sources. The RDNA 1 (25 September 2020) and RDNA 2 (30 November 2020) ISA references define it as `D.i = S0.i - S1.i; if (D.i < 0) D.i = -D.i; SCC = (D.i != 0)`. The subtraction and the negation both wrap at 32 bits. So `(0x80000000, 0)` gives `0x80000000` ("result is negative!" in the references), and `(0x7fffffff, 0x80000000)` gives 1, not `2^32 - 1`. It lowers to `asuint(abs(asint(a - b)))`, with an unsigned subtraction. DXC 1.8.2502 emits that as a plain `sub` and `IMax(d, 0 - d)`, which keeps `0x80000000`. SCC is written but not modelled, so a consumer such as `s_cselect_b32` or `s_cbranch_scc0` is still refused.
+
+`tests/compute_salu_absdiff_check.py` holds the fixture, gfx1013 text in LLVM 15 spelling. Each lane below the bound stores four results as one 16-byte element: `|c1 - c2|`, `|c3 - c4|`, `|c5 - 0x80000000|` with a literal, and `|-7 - r0|` with an inline constant and the first result. The constant words come from the case file. Three dispatches use three constant sets: `(2, 5, 0x80000000, 0, 0x7fffffff)` gives `3, 0x80000000, 1, 10`; `(0x12345678, 0x12345678, 0x80000000, 0xffffffff, 0x80000000)` gives `0, 0x7fffffff, 0, 7`; and `(-10, 5, 5, -10, 0)` gives `15, 15, 0x80000000, 22`. The expected words were worked out by hand and match a Python model of the ISA pseudocode, which also reproduces the six functional examples in the references. The model does not use the lowering. Four wrong definitions must each fail at their first differing word: no absolute value, an unsigned comparison, a difference not wrapped to 32 bits, and INT_MIN saturated to `0x7fffffff`. Three mutated translations must also fail: `abs` dropped, the literal changed, and the inline constant changed. In the `controls` mode, which needs no GPU, the following are refused: an unwritten, descriptor, exec-mask or pending source; a literal wider than 32 bits; a destination past s105 or still waiting for a load; a vector or float-constant source; a 64-bit destination; `s_absdiff_u32`; SCC consumers; a result used as a store address or a guard compare; and an expression over the limit.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_absdiff_warp$' -V
+```
 
 ### Two- and three-dimensional thread groups
 
@@ -5659,6 +5737,30 @@ control mismatching. The D3D12 debug layer was unavailable.
 [Leonida RDNA2 measurements](https://github.com/ItsNotRexed/Leonida/pull/1685) ·
 [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
+**Negated sources on the vector select.** A VOP3 `v_cndmask_b32` can carry the `-` source modifier,
+which in an integer instruction is that source's sign bit flipped. The select handler passed the printed
+operand to the uint helper, so `v_cndmask_b32_e64 v31, v30, -v30` was refused - 2 of the 29 refused
+shaders in the first main-game loading-screen cache (#870, issue #1709). The select now reads both sources
+through a helper that flips the sign bit for a `-` operand and emits the same text as before when there is
+none. Plain negative constants retain the existing bit pattern. NEG on inline or literal constants is
+refused from the encoded source fields, because plain inline -1 and inline 1 with NEG both disassemble
+as `-1`. Another integer instruction carrying the same register modifier still refuses it. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cndmask_neg$' -V`.
+
+**Output modifiers on float-result conversions.** The float-result conversions (`v_cvt_f32_i32`,
+`v_cvt_f32_u32`, `v_cvt_f32_ubyte0..3`, `v_cvt_f32_f16`) sat in the uint-result table, whose dispatch
+refused every modifier, so `v_cvt_f32_i32_e64 v1, v1 mul:2` did not translate - 5 of the 29 refused
+shaders in the first main-game loading-screen cache (#870, issue #1705). They are now their own table,
+lowered through the float path, and accept exactly `clamp`, `mul:2`, `mul:4` and `div:2`; without a
+modifier the emitted text is unchanged. `op_sel` and source modifiers are still refused on a conversion
+rather than silently ignored, and a uint-result conversion such as `v_cvt_f16_f32` keeps refusing output
+modifiers. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_vcvt_omod$' -V`.
+
+The SDWA forms of those conversions read the same table: after the split, `sdwa()` still looked only at the
+uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed at both (#1727). The
+restored path keeps the source selection, the `dst_sel`/`dst_unused` write and the `U(...)` wrapper, and a
+conversion's output modifier inside an SDWA form is still refused rather than dropped.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
@@ -6407,7 +6509,8 @@ It also keeps a non-null parameter block at `E_INVALIDARG`.
 |---|---|
 | `d3d12x_device_create_warp`, `d3d12x_device_create_hardware` | Resolves `D3D12XboxCreateDevice` inside `d3d12_xs.dll`, creates a device with null parameters and `IID_ID3D12Device`, checks the adapter LUID, one node and a zero-valued fence. The hardware case skips (77) without a physical adapter. |
 | `d3d12x_device_negative_warp`, `d3d12x_device_negative_hardware` | A non-null parameter block returns `E_INVALIDARG`; the unknown fixture IID returns `E_NOINTERFACE`, clears the output and prints the exact lowercase GUID. The hardware case skips (77) without a physical adapter. |
-| `d3d12x_device_struct_return_warp`, `d3d12x_device_struct_return_hardware` | Calls a source-built `GetCustomHeapProperties` adapter with the device and output buffer in both orders. Each case compares all five returned words to the direct desktop method, checks the returned output pointer and verifies guard words. The return-buffer-first control seeds the output with the device's vtable pointer. The hardware case skips (77) without a physical adapter. |
+| `d3d12x_device_struct_return_warp`, `d3d12x_device_struct_return_hardware` | Calls a source-built `GetCustomHeapProperties` adapter with the device and output buffer in both orders. Each case compares all five returned words to the direct desktop method, checks the returned output pointer and verifies guard words. The return-buffer-first control seeds the output with the device's vtable pointer. The `DEFAULT` and `READBACK` heap types repeat both orders, so the heap type must reach the device. Five unresolvable calls (a null first or second candidate, the device twice, two buffers and no device, a null live device) must return `nullptr` and leave both vtable-seeded buffers unchanged. The hardware case skips (77) without a physical adapter. |
+| `d3d12x_device_struct_return_neither_control_warp` | Builds the same check against a build-tree copy of the adapter that writes through the second candidate when neither candidate is the device. It passes only on the line `FAIL: struct_return reject neither_is_device: returned`. |
 
 Run `ctest --preset dev --no-tests=error -R '^d3d12x_device_' -V`.
 
@@ -10515,6 +10618,17 @@ measurement on hardware or in a Windows run backs the descriptions. `v_interp_p1
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
 
+## Startup translator: pixel depth export
+
+The startup translator emits `SV_Depth` for an uncompressed `exp mrtz vN, off, off, off` in a straight-line pixel shader that still uses its entry execution mask. Color exports in the same shader keep their `SV_Target` outputs. Additional MRTZ channels, packed exports, multiple depth exports, branches and changes to the execution mask before the depth export are refused.
+
+The source-built stream fixture draws green at vertex depth 0.25 and red at 0.75, with a writable DSV and `LESS`. Vertex depth alone leaves all 16 covered pixels green. Adding a pixel export of 0.125 preserves green in all 16, and changing just that export to 0.875 leaves all 16 red. Every variant checks the 16 clear pixels and retains the existing depth-disabled and read-only DSV controls.
+
+```powershell
+cmake --build --preset release --target startup_stream_depth
+ctest --preset release --no-tests=error -R '^startup_stream_depth_(warp|hardware)$' -V
+```
+
 ## Startup translator: depth-comparison image sampling
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_c_lz` and `image_sample_c` forms of a 2D texture to `tex.SampleCmpLevelZero(smp, float2(u, v), reference)` and; `image_sample_c` is lowered to `SampleCmpLevelZero` only when the sampler MAX_LOD is 0, and any other MAX_LOD is refused because the comparison sampler state ignores the mip filter and implicit mip selection is not lowered. The first address register is the reference, then u and v: `v[0:2]` compares `v0` at `(v1, v2)`, and the NSA list `[v3, v0, v1]` compares `v3` at `(v0, v1)`. Only `dmask:0x1` is lowered, and the result is the one float the comparison returns. The sampler must be four constant words that `pixel_aot.comparison_sampler_state` accepts (CLAMP_LAST_TEXEL, point or bilinear XY filter with the matching TRUNC_COORD, no anisotropy or bias); the comparison function is word 0 bits 14:12. It is bound as a `SamplerComparisonState` and written to the manifest as `smpc N w0 w1 w2 w3` beside the existing `smp` lines, so a sampler used by an ordinary sample and by a comparison gets two bindings. `src/startup_stubs/translated_sampler_bindings.h` builds the matching D3D12 static sampler (comparison filter 0x80 or 0x94, function = hardware function + 1) and keeps manifest order as register order.
@@ -10770,4 +10884,13 @@ Command-list slot 42 records the address of a root parameter declared as a CBV, 
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_root_cbv_(warp|hardware)$" -V
+```
+
+## Startup heap-indexed root signatures
+
+Command-list slot 34 no longer sets a title root signature flagged `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` or `SAMPLER_HEAP_DIRECTLY_INDEXED` on the desktop list, because the title's heaps are not forwarded there (debug layer message ID 1419). Real draws under such a root are refused with a specific reason. The decision matrix (`tests/startup_heap_indexed_root_check.cpp`) runs without a device; its two mutated runs must fail. The draw fixture (`tests/startup_root_heap_check.py`) is synthetic only and reuses the root CBV draw with the debug layer on; a plain desktop list with the same root signature must first report ID 1419 for each flag, or the run is a capability skip. Details are in [startup-runtime.md](startup-runtime.md#heap-indexed-root-signatures).
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer startup_heap_indexed_root_check
+ctest --preset dev --no-tests=error -R "^startup_(heap_indexed_root.*|root_heap_(warp|hardware))$" -V
 ```
