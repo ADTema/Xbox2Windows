@@ -7339,6 +7339,17 @@ independently of the desktop device's wave size. On RTX 4060 Laptop and WARP, bo
 readbacks matched 128 output words and 192 guards. Exchanging expected positions
 31 and 32 produced exactly two mismatches on each adapter.
 
+The same lowering handles `OpGroupNonUniformBallotFindLSB %uint %scope %ballot`, which SPIRV-Cross
+rejects for HLSL (the 2021.01.15 package stops with "Cannot trivially implement BallotFindLSB in
+HLSL"). Each of the four ballot words goes through GLSL `FindILsb`, offset by 0, 32,
+64 and 96. An empty word stays all ones, and the smallest candidate wins, so an empty ballot gives
+`0xffffffff`. The scope must be a Subgroup constant, the result type `%uint`, and an existing
+`GLSL.std.450` import is reused. The readback fixture gives each of 128 threads a one-bit ballot at its
+own index, plus a two-bit ballot (empty on every eighth thread) in a second output range, and compares
+all words with a bit-scan reference. Four faulty lowerings (wrong offset, swapped words, highest instead
+of lowest bit, no empty-word fill) must each be caught at their first differing word. The ballot
+operand is built from the thread index, so the result does not depend on the adapter's wave width.
+
 With SPIRV-Tools and SPIRV-Cross available at configure time, run
 `ctest --preset dev --no-tests=error -R spirv_ballot_extract -V`.
 
