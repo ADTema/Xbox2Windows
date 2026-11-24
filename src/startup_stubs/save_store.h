@@ -427,10 +427,17 @@ public:
         std::error_code ec;
         const fs::file_status dir_state = fs::symlink_status(dir, ec);
         if (redirected(dir_state)) return Status::bad_name;
-        if (!fs::exists(dir_state)) return Status::not_found;
+        if (!fs::exists(dir_state))
+            return (ec && dir_state.type() != fs::file_type::not_found) ? Status::io_error : Status::not_found;
         if (!fs::is_directory(dir_state)) return Status::io_error;
         FileLock publication;
         if (const Status locked = lock_container(publication, container, false); locked != Status::ok) return locked;
+        // Re-check under the lock: a concurrent delete_container or redirect swap can happen while waiting.
+        const fs::file_status locked_state = fs::symlink_status(dir, ec);
+        if (redirected(locked_state)) return Status::bad_name;
+        if (!fs::exists(locked_state))
+            return (ec && locked_state.type() != fs::file_type::not_found) ? Status::io_error : Status::not_found;
+        if (!fs::is_directory(locked_state)) return Status::io_error;
         std::vector<BlobEntry> found;
         for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
             const fs::file_status state = it->symlink_status(ec);

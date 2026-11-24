@@ -24,6 +24,7 @@
 namespace fs = std::filesystem;
 namespace x2w_save {
 // Only the test compares entries; found by argument-dependent lookup inside std::equal.
+inline bool operator==(const ContainerEntry& a, const ContainerEntry& b) { return a.name == b.name; }
 inline bool operator==(const BlobEntry& a, const BlobEntry& b) { return a.name == b.name && a.bytes == b.bytes; }
 }  // namespace x2w_save
 using x2w_save::BlobEntry;
@@ -126,6 +127,20 @@ int holder(const char* root, const char* dir)
     return wait_for(fs::path(dir) / "release") ? 0 : 2;
 }
 
+// Second process: holds slot-gone's exclusive lock, deletes its directory after a short pause, and releases.
+int deleter(const char* root, const char* dir)
+{
+    x2w_save::FileLock lock;
+    const fs::path container = fs::path(root) / "slot-gone";
+    const fs::path file = fs::path(root) / ("slot-gone" + std::string(x2w_save::lock_suffix));
+    if (lock.acquire(file, true, std::chrono::seconds(10)) != x2w_save::LockResult::locked) return 1;
+    touch(fs::path(dir) / "held");
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    std::error_code ec;
+    fs::remove_all(container, ec);
+    return ec ? 2 : 0;
+}
+
 // Second process: publishes generations 1..rounds of slot-g, two blobs each, one commit per generation.
 int writer(const char* root, const char* rounds_text)
 {
@@ -156,6 +171,7 @@ bool containers_are(const std::vector<ContainerEntry>& found, const std::vector<
 int main(int argc, char** argv)
 {
     if (argc == 4 && std::strcmp(argv[1], "hold") == 0) return holder(argv[2], argv[3]);
+    if (argc == 4 && std::strcmp(argv[1], "delete") == 0) return deleter(argv[2], argv[3]);
     if (argc == 4 && std::strcmp(argv[1], "write") == 0) return writer(argv[2], argv[3]);
     if (argc != 1) return 2;
 
@@ -235,11 +251,28 @@ int main(int argc, char** argv)
     blobs = sentinel_blobs;
     expect(store.list_blobs("slot-missing", blobs) == Status::not_found && blobs == sentinel_blobs,
            "a missing container is not_found and the output is untouched");
+    expect(store.list_blobs("stray-file", blobs) == Status::io_error && blobs == sentinel_blobs,
+           "a regular file in the root is io_error and the output is untouched");
     expect(store.list_blobs("bad:name", blobs) == Status::bad_name && blobs == sentinel_blobs,
            "an invalid container name is bad_name and the output is untouched");
     expect(store.list_blobs("", blobs) == Status::bad_name && blobs == sentinel_blobs, "an empty container name is bad_name");
     expect(store.list_blobs("slot-a.x2w-lock", blobs) == Status::bad_name && blobs == sentinel_blobs,
            "the lock suffix is not a container name");
+    {
+        const fs::path file_root = base / "file-root";
+        touch(file_root);
+        containers = sentinel_containers;
+        expect(x2w_save::Store(file_root).list_containers(containers) == Status::io_error &&
+                   containers == sentinel_containers,
+               "a regular-file root is io_error and the output is untouched");
+        const fs::path link_root = base / "link-root";
+        if (make_redirect(link_root, root, true)) {
+            containers = sentinel_containers;
+            expect(x2w_save::Store(link_root).list_containers(containers) == Status::bad_name &&
+                       containers == sentinel_containers,
+                   "a redirected root is bad_name and the output is untouched");
+        }
+    }
 
     // A blob over the limit is reported, not listed.
     expect(store.create_container("slot-big") == Status::ok, "create slot-big");
@@ -283,6 +316,22 @@ int main(int argc, char** argv)
         expect(holder_code == 0, "the holder process ended cleanly");
         expect(impatient.list_blobs("slot-a", blobs) == Status::ok && names_are(blobs, {{"alpha.dat", 300}, {"zeta.dat", 12}}),
                "the listing succeeds once the lock is gone");
+    }
+
+    // A container deleted while list_blobs waits for the publication lock reports not_found (not io_error)
+    // and leaves the output untouched.
+    {
+        expect(store.write_blob("slot-gone", "a.dat", bytes_of(4, 1).data(), 4) == Status::ok, "create slot-gone");
+        const fs::path sync = base / "sync-delete";
+        fs::create_directories(sync, ec);
+        int deleter_code = -1;
+        std::thread del([&] { deleter_code = run_child(self, "delete " + quoted(root) + " " + quoted(sync)); });
+        expect(wait_for(sync / "held"), "the deleter process took the lock");
+        blobs = sentinel_blobs;
+        expect(store.list_blobs("slot-gone", blobs) == Status::not_found && blobs == sentinel_blobs,
+               "a container deleted while waiting for the lock is not_found and the output is untouched");
+        del.join();
+        expect(deleter_code == 0, "the deleter process ended cleanly");
     }
 
     // A second process publishes two-blob generations while this one lists: every listing shows both
