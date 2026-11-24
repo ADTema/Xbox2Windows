@@ -92,6 +92,7 @@ jobs:
           python -B tests/layout_chunks_check.py
           python -B tests/dependency_paths_check.py
           python -B tests/pe_package_preflight_check.py
+          python -B tests/host_commit_check.py
           python -B tests/pe_package_ordinal_plan_check.py
           python -B tests/compat_report_check.py
           python -B tests/intake/paths_check.py
