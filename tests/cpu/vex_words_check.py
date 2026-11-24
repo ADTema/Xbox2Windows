@@ -257,10 +257,10 @@ def main():
     # The altered fixture replaces one arithmetic shift with a logical one in shift_edges.
     differing = 0
     for a, b in pairs:
-        reference = call(altered["shift_edges"], a, b)
-        if call(altered_lifted["shift_edges"], a, b) != reference:
+        shift_original = call(altered["shift_edges"], a, b)
+        if call(altered_lifted["shift_edges"], a, b) != shift_original:
             raise AssertionError("altered shift_edges: lifted differs from its native build")
-        differing += reference != call(native["shift_edges"], a, b)
+        differing += shift_original != call(native["shift_edges"], a, b)
     if not differing:
         raise AssertionError("replacing vpsraw with vpsrlw changed no output")
     for name in ("widen_mix", "word_ops", "store_reload", "aligned_ops", "byte_pack_reload",
