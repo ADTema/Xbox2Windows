@@ -978,6 +978,7 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // when the desktop GPU finishes, and the presented surface is read back and shown in the window.
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
+void reset_viewport_state(Wrapper* self);
 void discard_draw_sampler_heaps(Wrapper* self);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
@@ -1198,6 +1199,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     }
     if (SUCCEEDED(hr)) {
         self->own().list_ready = false;
+        reset_viewport_state(self);
         discard_draw_sampler_heaps(self);
         if (draw_dump_frame()) draw_dumps().discard(static_cast<ID3D12CommandList*>(self->own().real));
     }
@@ -1648,6 +1650,13 @@ struct Pass {
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
     x2w_startup::ComPtr<ID3D12DescriptorHeap> sampler_heap;
     ID3D12DescriptorHeap* bound_sampler_heap = nullptr;
+    // Whether the title set a viewport / scissor on this list; without them a desktop list draws no pixel.
+    bool viewport_set = false;
+    bool scissor_set = false;
+    // Size of the automatic full-target default already forwarded to the desktop list (0 = none yet). Kept apart from
+    // the title flags above so a later render target 0 of another size gets a fresh default.
+    UINT64 default_viewport_w = 0, default_scissor_w = 0;
+    UINT default_viewport_h = 0, default_scissor_h = 0;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
 
@@ -1688,6 +1697,16 @@ void release_targets(Wrapper* self)
     for (const auto& known : pass.states)
         transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
     pass = Pass{};
+}
+
+// A reset list starts without a viewport or scissor, whatever the previous recording set.
+void reset_viewport_state(Wrapper* self)
+{
+    if (!self->own().pass) return;
+    pass_of(self).viewport_set = false;
+    pass_of(self).scissor_set = false;
+    pass_of(self).default_viewport_w = pass_of(self).default_scissor_w = 0;
+    pass_of(self).default_viewport_h = pass_of(self).default_scissor_h = 0;
 }
 
 // List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list (no desktop draw yet).
@@ -1837,13 +1856,18 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
 // List slots 21 / 22 / 23, RSSetViewports / RSSetScissorRects / OMSetBlendFactor.
 void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* viewports)
 {
-    if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports)))
+    // Only a viewport that is forwarded counts as set; a call with no viewports leaves the state as it was.
+    if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports))) {
         list->RSSetViewports(count, viewports);
+        pass_of(self).viewport_set = true;
+    }
 }
 void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
 {
-    if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects)))
+    if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects))) {
         list->RSSetScissorRects(count, rects);
+        pass_of(self).scissor_set = true;
+    }
 }
 void __stdcall list_blend_factor(Wrapper* self, const float* factor)
 {

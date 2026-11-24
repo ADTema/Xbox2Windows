@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <wrl/client.h>
 
 #include <array>
@@ -243,8 +244,17 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     invoke(list, 139, arg(allocator));
     for (UINT i = 0; i < count; ++i) invoke(list, 52, rtvs[i].ptr, arg(clear));
     invoke(list, 50, count, arg(rtvs.data()));
-    invoke(list, 21, 1, arg(&viewport));
-    invoke(list, 22, 1, arg(&rect));
+    // X2W_TEST_VIEWPORT: "none" and "grow" never set a viewport or scissor; "rect" and "reset" set a rectangle smaller than the target.
+    wchar_t mode[8] = L"";
+    GetEnvironmentVariableW(L"X2W_TEST_VIEWPORT", mode, 8);
+    const bool none = std::wcscmp(mode, L"none") == 0 || std::wcscmp(mode, L"grow") == 0;
+    const bool inset = std::wcscmp(mode, L"rect") == 0 || std::wcscmp(mode, L"reset") == 0;
+    const D3D12_VIEWPORT inner{2, 1, 4, 2, 0, 1};
+    const D3D12_RECT inner_rect{2, 1, 6, 3};
+    if (!none) {
+        invoke(list, 21, 1, inset ? arg(&inner) : arg(&viewport));
+        invoke(list, 22, 1, inset ? arg(&inner_rect) : arg(&rect));
+    }
     invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(list, 25, arg(pso));
     return 0;

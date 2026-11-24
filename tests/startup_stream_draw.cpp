@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <iterator>
 #include <vector>
@@ -290,12 +291,62 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         extern int draw_bc_address_srvs(void*, void*);
         if (const int result = draw_bc_address_srvs(guest, list)) return result;
     }
-    invoke(list, 9);
-    invoke(queue, 10, 1, arg(&list));
-    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), 1)))) return 24;
-    const auto deadline = GetTickCount64() + 10000;
-    while (invoke(fence, 8) == 0 && GetTickCount64() < deadline) Sleep(1);
-    if (invoke(fence, 8) != 1) return 25;
+    const auto submit = [&](UINT64 value) {
+        invoke(list, 9);
+        invoke(queue, 10, 1, arg(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), value)))) return 24;
+        const auto deadline = GetTickCount64() + 10000;
+        while (invoke(fence, 8) < value && GetTickCount64() < deadline) Sleep(1);
+        return invoke(fence, 8) == value ? 0 : 25;
+    };
+    // X2W_TEST_VIEWPORT=reset: the list above drew inside a small rectangle. Record a second list on the same
+    // object after Reset that sets neither a viewport nor a scissor; it must not inherit the first rectangle.
+    wchar_t viewport_mode[8] = L"";
+    GetEnvironmentVariableW(L"X2W_TEST_VIEWPORT", viewport_mode, 8);
+    UINT64 last = 1;
+    // X2W_TEST_VIEWPORT=grow: no viewport or scissor anywhere. After the draw above on the small target, the same
+    // list switches to a target twice as large and draws again; the default must follow the new target.
+    if (std::wcscmp(viewport_mode, L"grow") == 0) {
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            Word backing, bytes;
+        } big_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0};
+        void* big_heap = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 14, arg(&big_heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&big_heap))))) return 36;
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width * 2, height * 2, 1, 1,
+            format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+        const float clear[] = {0, 0, 1, 1};
+        const D3D12_CLEAR_VALUE optimized_clear{format, {clear[0], clear[1], clear[2], clear[3]}};
+        StreamAttachment big;
+        if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COMMON, &optimized_clear, IID_PPV_ARGS(&big.texture)))) return 37;
+        D3D12_RENDER_TARGET_VIEW_DESC view{format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(big_heap, 9))};
+        invoke(guest, 20, arg(big.texture.Get()), arg(&view), rtv.ptr);
+        big.row_bytes = width * 2 * 4;
+        invoke(list, 52, rtv.ptr, arg(clear));
+        invoke(list, 50, 1, arg(&rtv));
+        invoke(list, 12, 3, 1);
+        // Read back the larger target only; the small one stays alive in slot 1 until the list has executed.
+        frame.attachments[1] = std::move(frame.attachments[0]);
+        frame.attachments[0] = std::move(big);
+        frame.count = 1;
+    }
+    if (std::wcscmp(viewport_mode, L"reset") == 0) {
+        if (const int rc = submit(1)) return rc;
+        const float clear[] = {0, 0, 1, 1};
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(frame.rtv_heap, 9))};
+        if (FAILED(static_cast<HRESULT>(invoke(frame.allocator, 8))) ||
+            FAILED(static_cast<HRESULT>(invoke(list, 139, arg(frame.allocator))))) return 35;
+        invoke(list, 52, rtv.ptr, arg(clear));
+        invoke(list, 50, 1, arg(&rtv));
+        invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        invoke(list, 25, arg(pso));
+        invoke(list, 12, 3, 1);
+        last = 2;
+    }
+    if (const int rc = submit(last)) return rc;
 
     return read_stream_target(desktop.Get(), frame, pixels);
 }
