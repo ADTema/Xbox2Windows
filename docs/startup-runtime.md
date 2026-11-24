@@ -214,6 +214,22 @@ starts a byte earlier is rejected before it copies anything. No GPU and no game 
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 ```
 
+## Local switches, logging, and memory probing
+
+`tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
+control `startup_local_log_guard_drop_control`) verifies `src/startup_stubs/local_log.h`:
+`env_on` (`"1"`-only gating while preserving `GetLastError`), atomic `first_calls` countdowns,
+`logf` (`GetLastError` preservation, 1533-byte payload truncation, and `X2W_TRAP_LOG` append),
+`probe_readable` (invalid-pointer and zero-length refusals, multi-page reads, `PAGE_NOACCESS` /
+`MEM_RESERVE` prefix truncation, and `PAGE_GUARD` re-arming verified by `VirtualQuery` and a
+second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
+`PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`. No GPU is required:
+
+```powershell
+cmake --build --preset dev --target startup_local_log_check
+ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
