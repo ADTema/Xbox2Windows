@@ -629,6 +629,15 @@ add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" 
     DEPENDS tests/startup_sampler_x.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sampler_x_cs}")
 target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp)
+# Sampler word decoding, manifest lines and title sampler snapshots behind those draws
+# (src/startup_stubs/translated_sampler_bindings.h), without a device. The mutated run is the negative control.
+add_executable(startup_translated_sampler_bindings_check tests/startup_translated_sampler_bindings_check.cpp)
+target_include_directories(startup_translated_sampler_bindings_check PRIVATE src)
+target_compile_features(startup_translated_sampler_bindings_check PRIVATE cxx_std_17)
+add_test(NAME startup_translated_sampler_bindings COMMAND startup_translated_sampler_bindings_check)
+add_test(NAME startup_translated_sampler_bindings_shared_axis_control
+    COMMAND startup_translated_sampler_bindings_check --mutate shared-axis)
+set_tests_properties(startup_translated_sampler_bindings_shared_axis_control PROPERTIES WILL_FAIL TRUE)
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_flat_param.cpp)
 # Stand-in format for 16-bit packed targets the adapter cannot use (src/startup_stubs/packed_target_format.h).
