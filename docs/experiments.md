@@ -1,6 +1,29 @@
 # Experiment notes and reproduction commands
 
+### Packed pixel position in a source-built shader
+
+Run `ctest --preset dev --no-tests=error -R '^startup_packed_screen_position_(hardware|warp)$' -V`.
+The fixture supplies matching PS input-enable and input-address masks. One preceding scalar input
+places packed X/Y in v1; one preceding IJ pair places it in v2. Each draw exports the selected
+word, and readback checks all four channels at each of 91 pixel positions. Missing metadata,
+a different input register, and a disabled position input each produce a detectable mismatch.
+The fixture rejects differing enable/address masks. Production startup requests still omit these
+arguments. Identifying both masks for the affected pipeline remains open. [Refs #1629](https://github.com/R0Y00/Xbox2Windows/issues/1629)
+
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
+
+## Offline store context forwarding
+
+The fake-user runtime creates an offline store context token. Unimplemented methods receiving
+that token in any of their first four arguments return `E_FAIL` before entering the desktop
+runtime, which cannot interpret the token as an object. This does not implement store services.
+The `startup_stubs` source-built control uses a desktop method returning a sentinel: all four
+token positions must be refused, while a different value must reach that method unchanged.
+
+```powershell
+cmake --build --preset dev --target startup_stub_consumer startup_stub_acphal startup_stub_xapu startup_stub_xcrdapi startup_stub_gameinput
+ctest --preset dev --no-tests=error -R '^startup_stubs$' --output-on-failure
+```
 
 ## UTF-8 persistent storage root
 
@@ -6351,6 +6374,8 @@ fixture policy, not an Xbox ABI claim.
 
 On Windows 11 build 26300.9974, the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) passed the heap, table and negative cases: the table dispatch read back `0.125, 0.125, 0.09375, 1.0` as expected with `descriptor_table_bound=yes`, and the count-zero, descriptor-size-zero and sampler-in-CBV-table records each returned `0x80070057` as expected.
 
+The same adapter reports `max_view_descriptor_heap=1000000` and `max_sampler_descriptor_heap=4000` from OPTIONS19, with 64-byte CBV/SRV/UAV and 16-byte sampler increments, and its heap case performs the four copies as two `CopyDescriptors` ranges and two `CopyDescriptorsSimple` calls.
+
 The console-interface boundary is the XCL-08 device path only. No console descriptor format,
 heap metadata, range table or `D3D12Xbox` descriptor-heap entry point is claimed. The root
 signature, shader and resources are source-built desktop fixtures. The observed vtable slot 14
@@ -6778,6 +6803,7 @@ Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer una
 - Signed zeros in `gpu_alias_lookup_writes`. Float min and max replace only on a strict `<` or `>`, so `-0.0` and `+0.0` tie and the stored word is kept. The fixture expects this, not IEEE `minNum`/`maxNum`, and compares raw bits. Four words get one record each: min and max, each from `+0` with a `-0` candidate and from `-0` with a `+0` candidate. All four must keep their starting bits. Four more words start at a signed zero and have 256 contenders each. Every third contender alternates `-0` and `+0`, and the rest are strictly negative or strictly positive inputs. On two of these words a strictly smaller (min) or larger (max) input must win. On the other two every contender ties or loses, so the starting zero must survive. A zero that could win is never contended by the opposite zero, so every expected word is deterministic. A ninth max word has only negative contenders and is seeded at negative infinity, because under a strict `>` no negative input can replace a zero. The highest negative must win. On Windows 11 build 26300 with the debug layer enabled, WARP 10.0.26100.10068 and an NVIDIA GeForce RTX 3060 (driver 32.0.16.1742) passed in the `dev` and `release` presets: 2,331 records and 0 mismatches. An Intel UHD Graphics 770 (driver 32.0.101.7092) matched all 2,331 records and all nine signed-zero words too, but failed as before on the array-atomics probe (`256,192,128,64`, [#369](https://github.com/R0Y00/Xbox2Windows/issues/369)). Replacing on equality (`<=`/`>=`) gave 5 mismatches on both adapters, all on signed-zero words. A compare-exchange loop without retry still passed on WARP. On the RTX 3060 it failed in 3 of 3 runs with 5 mismatches: the original min and max words and the three contended words a strict input must win.
 - At commit `06e2ff78` on Windows 11 build 26300.9974 with the debug layer enabled, an Intel Arc 140T (device `7d51`, driver 32.0.101.8132) reproduces the Intel per-buffer pattern recorded below for the UHD Graphics 770: the four buffers read 256, 192, 128 and 64 against 64 expected, so the over-count differs per buffer instead of repeating one value. The rest of the fixture matches: the add and sub words keep their expected values, and the 2,331-record title-address run checks 147,456 words with zero mismatches.
 - On Windows 11 build 26300.9974 at the same commit, the same Intel Arc 140T passes `gpu_alias_lookup_hardware` on the read path: 4 ranges, 150 records, 108 hits and 42 misses, mismatches 0. So only the atomics probe fails on this adapter; the lookup itself resolves every record.
+- On Windows 11 build 26300.9974 at the same commit, the same Intel Arc 140T passes `gpu_alias_registry_hardware`: 15 records, 12 hits, mismatches 0, with the partial attach refused at `0x80070057`.
 
 - The [RX 6500 report](https://github.com/R0Y00/Xbox2Windows/pull/793) used
   commit `a4ade3032fec08767ed411cc83834a3543c626f2`, driver 32.0.21045.29003,
@@ -6894,6 +6920,8 @@ Build the same `xg_swizzle_select_check` target and run both factory tests with 
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
 
 The GPU check report includes the adapter's shader-visible CBV/SRV/UAV descriptor heap limit from D3D12 OPTIONS19. Compare the `max_view_descriptor_heap_size` line in `ctest --preset dev --no-tests=error -R '^offscreen_(hardware|warp)$' -V`. The report says `not reported` when the runtime does not provide a limit.
+
+On Windows 11 build 26300.9974 the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) reports `max_view_descriptor_heap_size=1000000` and matches all 4,096 pixels with a 512-byte row pitch.
 
 The original test machine had Windows Graphics Tools installed. A second build in `out/build/agility` used Microsoft Agility SDK 1.620.2. Set `-DOFFSCREEN_AGILITY_620_DIR=<directory containing the x64 SDK DLLs>` to reproduce it. This configuration verifies debug interface activation. [Agility SDK package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
 
@@ -7092,7 +7120,7 @@ ctest --preset release --no-tests=error --output-on-failure -R '^dxr_address_ran
 
 `dxr_placed_build_{hardware,warp}` creates four buffers through device slot 133. The BLAS and TLAS destinations start 512 bytes into their own buffers. Each build uses a separate UAV scratch buffer at offset 768. The internal desktop build preparation shares the vertex-binding placement lookup and checks the roles and byte ranges using the device's prebuild sizes. The destination is created in the acceleration-structure state. The fixture checks the offsets against the GPU addresses resolved at the allocation bases, records both builds, and calls `DispatchRays`. An unregistered destination, swapped buffer roles and a scratch extent one byte short of the TLAS requirement are rejected before command recording. The console build command encoding remains unverified. [Microsoft DXR memory requirements](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_build_raytracing_acceleration_structure_desc)
 
-On Windows 11 build 26200.9974, the RTX 4060 Laptop (32.0.16.1656) required 2,304/1,920 result/scratch bytes for the BLAS and 2,048/2,176 bytes for the TLAS. WARP (10.0.26100.9818) required 100/120 and 168/212 respectively. Both returned all 12 expected ray result words for a hit at distance one, a spatial miss and a masked miss, with the debug layer enabled and zero errors or warnings. The check compares the hit distance within 1e-5 of 1, as `dxr_query_*` and `dxr_pipeline_*` do, and the other 11 words exactly: at `153bb5f6` on Windows 11 build 26300.9974, an AMD Radeon RX 6600 (driver 32.0.21045.29003, 720/300 and 1,424/860 bytes) returned distance `0x3f7fffff`, one ULP below 1, with the other 11 words as expected, debug layer enabled and zero errors or warnings, in 3 of 3 runs. Before the tolerance, that distance failed the test.
+On Windows 11 build 26200.9974, the RTX 4060 Laptop (32.0.16.1656) required 2,304/1,920 result/scratch bytes for the BLAS and 2,048/2,176 bytes for the TLAS. WARP (10.0.26100.9818) required 100/120 and 168/212 respectively. Both returned all 12 expected ray result words for a hit at distance one, a spatial miss and a masked miss, with the debug layer enabled and zero errors or warnings. At `153bb5f6` on Windows 11 build 26300.9974, an AMD Radeon RX 6600 (driver 32.0.21045.29003, 720/300 and 1,424/860 bytes) returned distance `0x3f7fffff`, one ULP below 1, with the other 11 words as expected, in 3 of 3 runs. Instead of a distance tolerance, the check now traces a direct-address reference on the same adapter (issue #874). It uses the same geometry, build and instance inputs, rays and readback, with desktop GPU addresses given directly, bypassing only the placed-address resolver. Hit, instance and primitive must match the fixed hit/miss/masked-miss expectations. All 12 words, distance included, must equal the reference. A wrong-routing control builds a decoy BLAS from a triangle 4 units to the right, placed and resolved through the same slot-133 path, and routes the instance to it. Its rows must differ from the reference. The fixture prints the three row sets (`placed_dxr_rows`) and the distance against `0x3f800000` (`placed_dxr_distance`). On an AMD Radeon RX 9070 XT (driver 32.0.31044.16) the placed and direct paths both return `0x3f7fffff`. On WARP 10.0.26100.9818 both return `0x3f800000`. The decoy routing turns ray 0 into a miss and ray 1 into a hit on both. That holds on Windows 11 build 26300.9974 with the debug layer enabled and zero errors or warnings.
 
 ```powershell
 cmake --build --preset release --target offscreen_check
@@ -10218,6 +10246,27 @@ python3 -B tests/rdna2_tools_check.py
 
 Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
 measurement on hardware or in a Windows run backs the descriptions.
+
+## gfx1013 VOP1 v_cvt_off_f32_i4, v_sat_pk_u8_i16, v_swap_b32 and v_swaprel_b32 decoding
+
+`tools/disasm_rdna2.py` decodes four more VOP1 opcodes that printed as `v_vop1_NN` (and, through VOP3, as `v_vop1_NN`
+at 0x180 + opcode): `v_cvt_off_f32_i4` (0x0e), `v_sat_pk_u8_i16` (0x62), `v_swap_b32` (0x65) and `v_swaprel_b32` (0x68). The
+first two decode in the `_e32`, `_e64`, SDWA and DPP spellings llvm-mc accepts. The two swaps exist only as 32-bit VOP1:
+their VOP3A, SDWA and DPP spellings are eight-byte `<unsupported ...>` records, as llvm-mc refuses them, and the next
+instruction keeps its offset. They print without a suffix, as llvm-mc does, and a non-VGPR source prints like any other
+VOP1 source (llvm-mc prints it with an invalid-register note). `tools/scan_unsupported_shaders.py` already recognized
+three of the names and now also recognizes `v_swaprel_b32`.
+```sh
+python3 -B tests/rdna2_tools_check.py
+```
+
+The expected texts are the gfx1013 disassembly of words assembled with llvm-mc. A sweep of 3,000 random e32 and e64 words
+over the four opcodes found the same classes of difference from llvm-mc as existing integer-source VOP1 opcodes such as
+`v_cvt_f32_i32` (e64 modifier bits that llvm-mc refuses and the decoder prints, and `s230` against LLVM 23's
+`src_flat_scratch_base_lo`).
+
+Scope: decoding and scanner recognition only. `pixel_aot` already lowers the first three; nothing lowers `v_swaprel_b32`,
+and no measurement on hardware backs the descriptions.
 
 ## gfx1013 VOP3 and MUBUF decoding: integer multiply, quad SAD, interpolation move, high-half format buffer ops
 

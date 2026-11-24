@@ -389,6 +389,23 @@ add_executable(startup_inflate_status tests/startup_inflate_status.cpp)
 target_compile_features(startup_inflate_status PRIVATE cxx_std_17)
 target_include_directories(startup_inflate_status PRIVATE src)
 add_test(NAME startup_inflate_status COMMAND startup_inflate_status)
+# An allocation failure on the DirectStorage stand-in's worker fails that request, and the worker
+# serves the next one (#1199). Skips (77) where the system does not enforce a job commit limit.
+add_executable(startup_storage_alloc_failure tests/startup_storage_alloc_failure.cpp)
+target_compile_features(startup_storage_alloc_failure PRIVATE cxx_std_17)
+target_link_libraries(startup_storage_alloc_failure PRIVATE psapi)
+add_dependencies(startup_storage_alloc_failure startup_stub_xcrdapi)
+add_test(NAME startup_storage_alloc_failure COMMAND startup_storage_alloc_failure "$<TARGET_FILE:startup_stub_xcrdapi>")
+set_tests_properties(startup_storage_alloc_failure PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+# A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
+# throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
+# The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
+add_executable(startup_storage_worker_start tests/startup_storage_worker_start.cpp)
+target_compile_features(startup_storage_worker_start PRIVATE cxx_std_17)
+target_include_directories(startup_storage_worker_start PRIVATE src)
+target_link_libraries(startup_storage_worker_start PRIVATE psapi)
+add_test(NAME startup_storage_worker_start COMMAND startup_storage_worker_start)
+set_tests_properties(startup_storage_worker_start PROPERTIES TIMEOUT 60)
 target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
 target_include_directories(startup_stub_consumer PRIVATE src)
 target_sources(startup_stub_consumer PRIVATE src/startup_stubs/runtime_proxy.cpp)
@@ -1603,6 +1620,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_flat_param_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_flat_param_check.py")
     foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_packed_screen_position_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_packed_position_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_packed_screen_position_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_flat_param_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_flat_param_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
@@ -4677,6 +4698,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_check.py" "$<TARGET_FILE:pe_map>"
         "${archive_exe}" "$<TARGET_FILE:archive_all_lifted>" "$<TARGET_FILE:archive_codec>"
         "$<TARGET_FILE:blast_source>" "$<TARGET_FILE:blast_lifted>" "$<TARGET_FILE:archive_codec_lifted>")
+    # 77: Control Flow Guard enforced for the pe_map runner, whose blast longjmp cases then cannot run (#1293).
+    set_tests_properties(cpu_native_archive_blast PROPERTIES SKIP_RETURN_CODE 77)
 
     set(texture_exe "${CMAKE_CURRENT_BINARY_DIR}/archive_texture_reader.exe")
     set(texture_cpp "${CMAKE_CURRENT_BINARY_DIR}/archive_texture_reader_lifted.cpp")
@@ -4688,6 +4711,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_texture_check.py" "$<TARGET_FILE:pe_map>"
         "${texture_exe}" "$<TARGET_FILE:archive_texture_lifted>" "$<TARGET_FILE:archive_codec>"
         "$<TARGET_FILE:blast_source>")
+    # 77: Control Flow Guard enforced for the pe_map runner, whose blast longjmp cases then cannot run (#1293).
+    set_tests_properties(cpu_archive_texture_publication PROPERTIES SKIP_RETURN_CODE 77)
 
     # The same reader image drawing each completed record through D3D12 (#830). The GPU codec keeps
     # the name archive_codec.dll in its own directory, next to copies of the reader and blast.
@@ -4721,10 +4746,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_texture_gpu_check.py" "$<TARGET_FILE:pe_map>"
             "${archive_gpu_reader}" "$<TARGET_FILE:archive_texture_gpu_lifted>"
             "$<TARGET_FILE:archive_codec_gpu>" "$<TARGET_FILE:blast_source>")
-        set_tests_properties(cpu_archive_texture_gpu_${adapter} PROPERTIES TIMEOUT 180
+        # 77: no physical adapter (hardware), or Control Flow Guard enforced for the pe_map runner (#1293).
+        set_tests_properties(cpu_archive_texture_gpu_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
             ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter}")
     endforeach()
-    set_tests_properties(cpu_archive_texture_gpu_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
     add_library(archive_directory_gpu SHARED "${archive_src}/directory_gpu.cpp" "${archive_src}/quad_frames.cpp"
         "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_vs.h" "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_ps.h")
