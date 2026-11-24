@@ -2118,6 +2118,41 @@ def f64_operand(token, scalar, vector, pending, sample_dest, *, encoding, positi
     return low, high
 
 
+def f64_comparison(i, op, tokens, encoding, scalar, vector, pending, sample_dest):
+    """HLSL word declarations and the predicate of a binary64 v_cmp or v_cmpx of `tokens` (op may be "class").
+
+    The predicates compare the raw (low, high) words with the cmp_f64 helpers and use no HLSL double; the caller
+    adds the helpers and checks the binary64 denormal entry state.
+    """
+    if op == "class":
+        low, high = f64_operand(tokens[0], scalar, vector, pending, sample_dest, encoding=encoding, position=0,
+                                allow_mods=False)
+        classes = tokens[1]
+        if encoding == "e32" and not re.fullmatch(r"v\d+", classes):
+            raise ValueError("VOPC e32 src1 must be a VGPR")
+        if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+            bits = f"{int(classes, 0) & 0xffffffff}u"
+        elif re.fullmatch(r"[vs]\d+", classes):
+            bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
+        else:
+            raise ValueError("Unsupported class mask")
+        return [], f"(class64({low}, {high}) & {bits}) != 0u"
+    words = [f64_operand(t, scalar, vector, pending, sample_dest, encoding=encoding, position=n)
+             for n, t in enumerate(tokens)]
+    lines = [f"    uint cmp{i}_{name} = {value};" for name, value in zip(("l0", "h0", "l1", "h1"), (*words[0], *words[1]))]
+    lines += [f"    bool cmp{i}_o = num64(cmp{i}_l0, cmp{i}_h0) && num64(cmp{i}_l1, cmp{i}_h1);",
+              f"    uint2 cmp{i}_a = key64(cmp{i}_l0, cmp{i}_h0);",
+              f"    uint2 cmp{i}_b = key64(cmp{i}_l1, cmp{i}_h1);"]
+    keys = {"a": f"cmp{i}_a", "b": f"cmp{i}_b"}
+    if op in F64_RELATION:
+        expr = f"cmp{i}_o && {F64_RELATION[op].format(**keys)}"
+    elif op in F64_NEGATED:
+        expr = f"!(cmp{i}_o && {F64_RELATION[F64_NEGATED[op]].format(**keys)})"
+    else:
+        expr = {"o": f"cmp{i}_o", "u": f"!cmp{i}_o"}.get(op, COMPARE[op])
+    return lines, expr
+
+
 def int64_comparison(i, op, kind, tokens, encoding, scalar, vector, pending, sample_dest):
     """HLSL word declarations and the predicate of a 64-bit integer v_cmp or v_cmpx of `tokens`."""
     words = [int64_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i64",
@@ -2288,6 +2323,38 @@ def f16_cmp_operand(token, scalar, vector, pending, sample_dest, *, allow_mods, 
     if neg:
         expr = f"(-{expr})"
     return expr
+
+
+def f16_comparison(op, tokens, scalar, vector, pending, sample_dest, *, allow_mods):
+    """The predicate of a binary16 v_cmp or v_cmpx of `tokens`: ordered relations also require num16 of both."""
+    values = [f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=False)
+              for t in tokens]
+    raw = [f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=True)
+           for t in tokens]
+    ordered = f"(num16({raw[0]}) && num16({raw[1]}))"
+    direct = {"lt": "lt", "eq": "eq", "le": "le", "gt": "gt", "lg": "lg", "ge": "ge"}
+    negated = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
+    if op in direct:
+        return f"({ordered} && ({COMPARE[op].format(*values)}))"
+    if op in negated:
+        return f"!({ordered} && ({COMPARE[negated[op]].format(*values)}))"
+    if op == "o":
+        return ordered
+    if op == "u":
+        return f"!{ordered}"
+    return COMPARE[op]
+
+
+def f16_class(value, classes, scalar, vector, pending, sample_dest, *, allow_mods):
+    """The predicate of a binary16 v_cmp_class or v_cmpx_class: the class of the low 16 bits of `value` in the mask."""
+    if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+        bits = f"{int(classes, 0) & 0xffffffff}u"
+    elif re.fullmatch(r"[vs]\d+", classes):
+        bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
+    else:
+        raise ValueError("Unsupported class mask")
+    operand = f16_cmp_operand(value, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=True)
+    return f"(class16({operand}) & {bits}) != 0u"
 
 
 def parse_vop3p_f16(rest, arity):
@@ -3291,15 +3358,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scalar.masked = True
             scc = None
         elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32|i64|u64)"
-                        rf"|(eq|ne|lt|le|gt|ge)_(i16|u16)|(class)_f32)_e32 ([^,]+), ([^,]+)"):
+                        rf"|(eq|ne|lt|le|gt|ge)_(i16|u16)|(class)_f32"
+                        rf"|({'|'.join(COMPARE)})_f16|(class)_f16"
+                        rf"|({'|'.join(COMPARE)}|class)_f64)_e32 ([^,]+), ([^,]+)"):
             # A masked-if opened by a VOPC e32 compare that writes EXEC (issue #932). It must directly
             # follow `s_mov_b64 s[a:b], exec` of the known entry mask, so EXEC becomes the entry mask
             # intersected with the comparison, as after s_and_saveexec_b64. v_cmpx writes neither VCC nor
             # SCC, so both keep their tracked values; the region closes with s_mov_b64 or s_or_b64.
             # The integer forms compare as the v_cmp of the same width (gfx10 has no f/t forms at 16 bits).
             # v_cmpx_class_f32 tests the class of the raw binary32 encoding in src0 against the mask in VSRC1,
-            # as the e32 v_cmp_class_f32 does.
-            fop, iop, kind, op16, kind16, cls, src0, src1 = m.groups()
+            # as the e32 v_cmp_class_f32 does. The binary16 forms and v_cmpx_class_f16 read the low 16 bits
+            # of each source through the lowering of the e32 v_cmp_f16 and v_cmp_class_f16. The binary64 forms
+            # (and v_cmpx_class_f64) lower as the e32 v_cmp_*_f64 and need the same declared binary64 denormal
+            # entry state.
+            fop, iop, kind, op16, kind16, cls, hop, hcls, f64op, src0, src1 = m.groups()
             if op16 is not None:
                 iop, kind = op16, kind16
             previous = instructions[i - 1] if i else ""
@@ -3310,11 +3382,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or [scalar.get(r) for r in pair] != [("entry", 0), ("entry", 1)]):
                 raise ValueError("Unsupported v_cmpx execution mask save")
             # VOPC e32 encodes VSRC1 as a VGPR (a VGPR pair at 64 bits) and carries no source modifiers.
-            vsrc1 = r"v\[\d+:\d+\]" if kind in ("i64", "u64") else r"v\d+"
+            wide = kind in ("i64", "u64") or f64op not in (None, "class")
+            vsrc1 = r"v\[\d+:\d+\]" if wide else r"v\d+"
             if not re.fullmatch(vsrc1, src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0):
                 raise ValueError(f"Invalid VOPC e32 operands: {line}")
             if fop is not None:
                 expr = f32_comparison(fop, [src0, src1], scalar, vector, pending, sample_dest)
+            elif hop is not None or hcls is not None:
+                if hcls is not None:
+                    expr = f16_class(src0, src1, scalar, vector, pending, sample_dest, allow_mods=False)
+                else:
+                    expr = f16_comparison(hop, [src0, src1], scalar, vector, pending, sample_dest, allow_mods=False)
+            elif f64op is not None:
+                if half_denorm != HALF_DENORM_PRESERVE:
+                    raise ValueError("binary64 denormal mode unknown at entry")
+                helpers.add("cmp_f64")
+                declarations, expr = f64_comparison(i, f64op, [src0, src1], "e32", scalar, vector, pending,
+                                                    sample_dest)
+                lines.extend(declarations)
             elif cls is not None:
                 operand = fp_operand(src0, scalar, vector, pending, sample_dest)
                 bits = fp_operand(src1, scalar, vector, pending, sample_dest)
@@ -4416,18 +4501,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
-                bits = f"{int(classes, 0) & 0xffffffff}u"
-            elif re.fullmatch(r"[vs]\d+", classes):
-                bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
-            else:
-                raise ValueError("Unsupported class mask")
-            operand = f16_cmp_operand(
-                value, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=True
-            )
+            expr = f16_class(value, classes, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
-            lines.append(f"    bool cmp{i} = (class16({operand}) & {bits}) != 0u;")
+            lines.append(f"    bool cmp{i} = {expr};")
 
         elif m := (match(r"v_(add|sub|subrev)_nc_u32(?:_e32|_e64)? (v\d+), ([^,\s]+), ([^,\s]+)")
                    or match(r"v_(add|sub)_nc_i32 (v\d+), ([^,\s]+), ([^,\s]+)")):
@@ -4656,27 +4733,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            values = [
-                f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=False)
-                for t in tokens
-            ]
-            raw = [
-                f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=True)
-                for t in tokens
-            ]
-            ordered = f"(num16({raw[0]}) && num16({raw[1]}))"
-            direct = {"lt": "lt", "eq": "eq", "le": "le", "gt": "gt", "lg": "lg", "ge": "ge"}
-            negated = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
-            if op in direct:
-                expr = f"({ordered} && ({COMPARE[op].format(*values)}))"
-            elif op in negated:
-                expr = f"!({ordered} && ({COMPARE[negated[op]].format(*values)}))"
-            elif op == "o":
-                expr = ordered
-            elif op == "u":
-                expr = f"!{ordered}"
-            else:
-                expr = COMPARE[op]
+            expr = f16_comparison(op, tokens, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {expr};")
@@ -4741,35 +4798,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
             helpers.add("cmp_f64")
-            if op == "class":
-                low, high = f64_operand(tokens[0], scalar, vector, pending, sample_dest, encoding=enc, position=0,
-                                        allow_mods=False)
-                classes = tokens[1]
-                if enc == "e32" and not re.fullmatch(r"v\d+", classes):
-                    raise ValueError("VOPC e32 src1 must be a VGPR")
-                if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
-                    bits = f"{int(classes, 0) & 0xffffffff}u"
-                elif re.fullmatch(r"[vs]\d+", classes):
-                    bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
-                else:
-                    raise ValueError("Unsupported class mask")
-                lines.append(f"    bool cmp{i} = (class64({low}, {high}) & {bits}) != 0u;")
-            else:
-                words = [f64_operand(t, scalar, vector, pending, sample_dest, encoding=enc, position=n)
-                         for n, t in enumerate(tokens)]
-                for name, value in zip(("l0", "h0", "l1", "h1"), (*words[0], *words[1])):
-                    lines.append(f"    uint cmp{i}_{name} = {value};")
-                lines += [f"    bool cmp{i}_o = num64(cmp{i}_l0, cmp{i}_h0) && num64(cmp{i}_l1, cmp{i}_h1);",
-                          f"    uint2 cmp{i}_a = key64(cmp{i}_l0, cmp{i}_h0);",
-                          f"    uint2 cmp{i}_b = key64(cmp{i}_l1, cmp{i}_h1);"]
-                keys = {"a": f"cmp{i}_a", "b": f"cmp{i}_b"}
-                if op in F64_RELATION:
-                    expr = f"cmp{i}_o && {F64_RELATION[op].format(**keys)}"
-                elif op in F64_NEGATED:
-                    expr = f"!(cmp{i}_o && {F64_RELATION[F64_NEGATED[op]].format(**keys)})"
-                else:
-                    expr = {"o": f"cmp{i}_o", "u": f"!cmp{i}_o"}.get(op, COMPARE[op])
-                lines.append(f"    bool cmp{i} = {expr};")
+            declarations, expr = f64_comparison(i, op, tokens, enc, scalar, vector, pending, sample_dest)
+            lines.extend(declarations)
+            lines.append(f"    bool cmp{i} = {expr};")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32_sdwa {LANE_MASK}, ([^,]+), ([^,]+) src0_sel:DWORD src1_sel:DWORD"):
