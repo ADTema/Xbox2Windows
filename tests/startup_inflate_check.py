@@ -208,14 +208,17 @@ def expected_status(stream, capacity):
     return OK, out
 
 
+ACCESS_VIOLATION = 0xC0000005  # the probe's input and destination each end at a no-access page
+
+
 def run_batch(probe, work, name, cases, overrun=False):
-    # overrun: a write past a destination (probe exit 3) returns the probe's report instead of failing.
+    # overrun: an access past an input or destination returns a message instead of failing.
     records, results = work / (name + ".records"), work / (name + ".results")
     records.write_bytes(b"".join(struct.pack("<II", capacity, len(stream)) + stream for stream, capacity in cases))
     result = subprocess.run([str(probe), "batch", str(records), str(results)], capture_output=True, text=True,
                             timeout=60)
-    if overrun and result.returncode == 3:
-        return result.stdout.strip()
+    if overrun and result.returncode == ACCESS_VIOLATION:
+        return "access violation past an input or destination"
     assert result.returncode == 0, "%s: exit %d: %s%s" % (name, result.returncode, result.stdout, result.stderr)
     data, at, decoded = results.read_bytes(), 0, []
     for _ in cases:
