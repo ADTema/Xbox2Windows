@@ -520,6 +520,22 @@ cmake --build --preset dev --target startup_local_log_check
 ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?$' -V
 ```
 
+## Trap-by-default header check
+
+`tests/startup_trap_header_check.cpp` (device-free ctest `startup_trap_header`, 41 cases, with
+`WILL_FAIL` negative controls `startup_trap_header_prefix_control` and
+`startup_trap_header_precedence_control`, Refs #1149) verifies `src/startup_stubs/trap.h`:
+`exit_code` 8-bit module/index bit-masking (`0xE2570000 | ...`), `listed` comma-separated,
+exact-match, wildcard `*`, and 2047/2048-byte buffer boundaries, `X2W_TRAP_EXPORT` behavior under
+`X2W_TRAP_CONTINUE` (returns `0`, logs `x2w-continue`), `X2W_TRAP_FAIL` (returns `0x80004005`, logs
+`x2w-fail`), continue-over-fail precedence, and child-process default `fire` termination (`exit_code`
+and matching `x2w-trap` lines on `stderr` and `X2W_TRAP_LOG`). No GPU is required:
+
+```powershell
+cmake --build --preset dev --target startup_trap_header_check
+ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_precedence_control)?$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
