@@ -1001,6 +1001,39 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, True)
 
+    def i64_words(self, tok):
+        """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair or an inline int."""
+        pair = reg_range(tok)
+        if pair and pair[2] == pair[1] + 1:
+            if pair[0] == 'v':
+                return self.u('v%d' % pair[1]), self.u('v%d' % pair[2])
+            return self.u('s%d' % pair[1]), self.u('s%d' % pair[2])
+        if re.fullmatch(r'-?\d+', tok) and -16 <= int(tok) <= 64:
+            value = int(tok) & 0xffffffffffffffff
+            return '%du' % (value & 0xffffffff), '%du' % (value >> 32)
+        raise Unsupported('64-bit source %s' % tok)
+
+    def shift64(self, ops, mods, helper):
+        if mods:
+            raise Unsupported('64-bit shift with %s' % mods)
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[2] != dst[1] + 1:
+            raise Unsupported('64-bit shift destination %s' % ops[0])
+        amount = self.u(ops[1])
+        low, high = self.i64_words(ops[2])
+        body = '{ uint2 t = %s(%s, %s, %s); v%d = t.x; v%d = t.y; }' % (
+            helper, low, high, amount, dst[1], dst[2])
+        self.used_v.update((dst[1], dst[2]))
+        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+
+    def op_v_lshlrev_b64(self, ops, mods):
+        self.shift64(ops, mods, 'shl64')
+
+    def op_v_lshrrev_b64(self, ops, mods):
+        self.shift64(ops, mods, 'shr64u')
+
+    def op_v_ashrrev_i64(self, ops, mods):
+        self.shift64(ops, mods, 'shr64i')
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
 
@@ -1331,6 +1364,17 @@ class Pipeline:
                '    return ftz32(sum);',
                '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               # The 64-bit shifts (issue #1815): a pair of words, so the count never reaches 32 in a 32-bit
+               # shift and an in-place destination keeps the original value (the caller passes both words in).
+               'uint2 shl64(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
+               ' uint cy = sb == 0u ? 0u : (lo >> sc);'
+               ' return uint2(sh < 32u ? (lo << sb) : 0u, sh < 32u ? ((hi << sb) | cy) : (lo << sb)); }',
+               'uint2 shr64u(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
+               ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = hi >> sb;'
+               ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : 0u); }',
+               'uint2 shr64i(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
+               ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = asuint(asint(hi) >> sb);'
+               ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : asuint(asint(hi) >> 31u)); }',
                'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
