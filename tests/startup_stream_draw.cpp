@@ -325,7 +325,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         invoke(list, 52, rtv.ptr, arg(clear));
         invoke(list, 50, 1, arg(&rtv));
         invoke(list, 12, 3, 1);
-        // Read back the larger target only.
+        // Read back the larger target only; the small one stays alive in slot 1 until the list has executed.
+        frame.attachments[1] = std::move(frame.attachments[0]);
         frame.attachments[0] = std::move(big);
         frame.count = 1;
     }
