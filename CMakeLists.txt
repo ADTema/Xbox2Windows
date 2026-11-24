@@ -1551,6 +1551,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_counted_clzero COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/counted_clzero.py" "$<TARGET_FILE:cpu_clzero>" "$<TARGET_FILE:cpu_clzero_lifted>"
         "${CMAKE_SOURCE_DIR}/tools/cpu_switch_aot.py" "${CMAKE_CURRENT_BINARY_DIR}")
+    set_tests_properties(cpu_counted_clzero PROPERTIES
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_counted_clzero.txt")
 
     foreach(variant IN ITEMS original inverted)
         cpu_asm_fixture(cpu_leaf_${variant} branch)
