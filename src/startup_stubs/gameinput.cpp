@@ -277,21 +277,33 @@ struct Reading : Object {
     GamepadState state;
     std::uint32_t key_count;
     KeyState keys[max_keys];
-    u64 sequence, timestamp;
+    u64 timestamp;
+    u64 pad_sequence, key_sequence;  // per-kind sequence numbers, as GameInput documents them
 };
 constexpr std::uint32_t history_pad = 1, history_keys = 2;
 struct HistoryEntry {
-    u64 sequence, timestamp;
+    u64 order;  // internal ordering across kinds; never exposed to the title
+    u64 pad_sequence, key_sequence;
+    u64 timestamp;
     GamepadState pad;
     std::uint32_t key_count;
     KeyState keys[max_keys];
-    std::uint32_t changed;  // history_pad / history_keys: which device's state differs from the previous entry
+};
+// One retention ring per kind, indexed by that kind's own sequence: keyboard traffic never evicts gamepad history.
+struct KindRing {
+    HistoryEntry entries[history_capacity];
+    u64 latest;  // latest sequence of this kind (0 = none yet)
+    std::size_t count;
 };
 Table<32> reading_table;
-volatile LONG64 sequence_counter;
-HistoryEntry history_ring[history_capacity];
-std::size_t history_count;
+KindRing pad_ring, key_ring;
+u64 order_counter;
+HistoryEntry latest_entry;
 SRWLOCK state_lock = SRWLOCK_INIT;
+
+bool wants_gamepad(std::uint32_t kind) { return (kind & (kind_gamepad | kind_controller_bits)) != 0; }
+bool wants_keyboard(std::uint32_t kind) { return (kind & kind_keyboard) != 0; }
+bool wants_any(std::uint32_t kind) { return wants_gamepad(kind) || wants_keyboard(kind); }
 
 u64 __stdcall reading_release(Reading* self)
 {
@@ -300,7 +312,12 @@ u64 __stdcall reading_release(Reading* self)
     return static_cast<u64>(left);
 }
 std::uint32_t __stdcall reading_kind(Reading* self) { return self->kind; }
-u64 __stdcall reading_sequence(Reading* self, std::uint32_t) { return self->sequence; }
+u64 __stdcall reading_sequence(Reading* self, std::uint32_t kind)
+{
+    if ((kind & kind_keyboard) && (self->kind & kind_keyboard)) return self->key_sequence;
+    if (wants_gamepad(kind) && wants_gamepad(self->kind)) return self->pad_sequence;
+    return 0;
+}
 u64 __stdcall reading_timestamp(Reading* self) { return self->timestamp; }
 void __stdcall reading_device(Reading* self, Object** device)
 {
@@ -347,9 +364,6 @@ bool __stdcall reading_gamepad(Reading* self, GamepadState* out)
     return true;
 }
 
-bool wants_gamepad(std::uint32_t kind) { return (kind & (kind_gamepad | kind_controller_bits)) != 0; }
-bool wants_keyboard(std::uint32_t kind) { return (kind & kind_keyboard) != 0; }
-bool wants_any(std::uint32_t kind) { return wants_gamepad(kind) || wants_keyboard(kind); }
 
 std::uint32_t resolve_reading_kind(std::uint32_t requested, Object* device)
 {
@@ -368,59 +382,73 @@ HistoryEntry capture_current()
     const std::uint32_t key_count = sample_keys(keys, max_keys);
 
     AcquireSRWLockExclusive(&state_lock);
-    std::uint32_t changed = (history_count == 0) ? (history_pad | history_keys) : 0;
+    std::uint32_t changed = (order_counter == 0) ? (history_pad | history_keys) : 0;
     if (!changed) {
-        const HistoryEntry& latest = history_ring[static_cast<u64>(sequence_counter) % history_capacity];
-        if (std::memcmp(&pad, &latest.pad, sizeof(pad)) != 0) changed |= history_pad;
-        if (key_count != latest.key_count ||
-            (key_count > 0 && std::memcmp(keys, latest.keys, key_count * sizeof(KeyState)) != 0))
+        if (std::memcmp(&pad, &latest_entry.pad, sizeof(pad)) != 0) changed |= history_pad;
+        if (key_count != latest_entry.key_count ||
+            (key_count > 0 && std::memcmp(keys, latest_entry.keys, key_count * sizeof(KeyState)) != 0))
             changed |= history_keys;
     }
     if (changed) {
-        ++sequence_counter;
-        HistoryEntry& slot = history_ring[static_cast<u64>(sequence_counter) % history_capacity];
-        slot.sequence = static_cast<u64>(sequence_counter);
-        slot.timestamp = now_microseconds();
-        slot.pad = pad;
-        slot.changed = changed;
-        slot.key_count = key_count;
-        if (key_count > 0) std::memcpy(slot.keys, keys, key_count * sizeof(KeyState));
-        if (history_count < history_capacity) ++history_count;
+        latest_entry.order = ++order_counter;
+        latest_entry.timestamp = now_microseconds();
+        latest_entry.pad = pad;
+        latest_entry.key_count = key_count;
+        if (key_count > 0) std::memcpy(latest_entry.keys, keys, key_count * sizeof(KeyState));
+        if (changed & history_pad) latest_entry.pad_sequence = ++pad_ring.latest;
+        if (changed & history_keys) latest_entry.key_sequence = ++key_ring.latest;
+        if (changed & history_pad) {
+            pad_ring.entries[pad_ring.latest % history_capacity] = latest_entry;
+            if (pad_ring.count < history_capacity) ++pad_ring.count;
+        }
+        if (changed & history_keys) {
+            key_ring.entries[key_ring.latest % history_capacity] = latest_entry;
+            if (key_ring.count < history_capacity) ++key_ring.count;
+        }
     }
-    const HistoryEntry result = history_ring[static_cast<u64>(sequence_counter) % history_capacity];
+    const HistoryEntry result = latest_entry;
     ReleaseSRWLockExclusive(&state_lock);
     return result;
 }
 
 std::uint32_t history_mask(std::uint32_t reading_kind)
 {
-    return ((reading_kind & kind_gamepad) ? history_pad : 0) | ((reading_kind & kind_keyboard) ? history_keys : 0);
+    return (wants_gamepad(reading_kind) ? history_pad : 0) | ((reading_kind & kind_keyboard) ? history_keys : 0);
 }
 
-// Walks the history from `start` in `step` (+1 / -1) to the nearest entry that changed the wanted device(s).
-// Returns 0 on hit, -1 if there is none (not found), -2 if the walk ran past the evicted end (too old).
-int find_history(u64 start, int step, std::uint32_t mask, HistoryEntry& out)
+// Looks `step` (+1 / -1) kinds-sequence away from `ref_sequence` in one kind's ring.
+// Returns 0 on hit, -1 if there is none (not found), -2 if the wanted entry was already evicted (too old).
+int find_in_ring(const KindRing& ring, u64 ref_sequence, int step, HistoryEntry& out)
+{
+    if (ring.count == 0) return -1;
+    const u64 target = step > 0 ? ref_sequence + 1 : ref_sequence - 1;
+    if (target == 0 || target > ring.latest) return -1;
+    if (target < ring.latest - ring.count + 1) return -2;
+    out = ring.entries[target % history_capacity];
+    return 0;
+}
+
+// Nearest entry in `step` direction that changed any wanted kind; ordering across kinds uses the internal order.
+int find_history(const Reading& ref, int step, std::uint32_t mask, HistoryEntry& out)
 {
     AcquireSRWLockShared(&state_lock);
     int result = -1;
-    const u64 latest = static_cast<u64>(sequence_counter);
-    if (history_count != 0 && start != 0 && start <= latest) {
-        const u64 oldest = latest - history_count + 1;
-        if (start < oldest) {
+    bool have = false;
+    for (int i = 0; i < 2; ++i) {
+        const std::uint32_t bit = i == 0 ? history_pad : history_keys;
+        if (!(mask & bit)) continue;
+        const KindRing& ring = i == 0 ? pad_ring : key_ring;
+        HistoryEntry candidate{};
+        const int found = find_in_ring(ring, i == 0 ? ref.pad_sequence : ref.key_sequence, step, candidate);
+        if (found == -2) {
             result = -2;
-        } else {
-            for (u64 seq = start; seq >= oldest && seq <= latest; seq += static_cast<u64>(static_cast<long long>(step))) {
-                const HistoryEntry& entry = history_ring[seq % history_capacity];
-                if (entry.changed & mask) {
-                    out = entry;
-                    result = 0;
-                    break;
-                }
-                if (step < 0 && seq == oldest) {
-                    result = oldest > 1 ? -2 : -1;
-                    break;
-                }
-            }
+            have = false;
+            break;
+        }
+        if (found == 0 && (!have || (step > 0 ? candidate.order < out.order : candidate.order > out.order))) {
+            out = candidate;
+            have = true;
+            result = 0;
         }
     }
     ReleaseSRWLockShared(&state_lock);
@@ -436,7 +464,8 @@ Reading* make_reading(const HistoryEntry& entry, std::uint32_t kind, Object* dev
     reading->state = entry.pad;
     reading->key_count = entry.key_count;
     if (entry.key_count > 0) std::memcpy(reading->keys, entry.keys, entry.key_count * sizeof(KeyState));
-    reading->sequence = entry.sequence;
+    reading->pad_sequence = entry.pad_sequence;
+    reading->key_sequence = entry.key_sequence;
     reading->timestamp = entry.timestamp;
     return reading;
 }
@@ -479,7 +508,7 @@ HRESULT __stdcall input_next_reading(Object*, Reading* reference, std::uint32_t 
     if (FAILED(check_hr)) return check_hr;
     capture_current();
     HistoryEntry entry{};
-    const int found = find_history(reference->sequence + 1, 1, history_mask(resolve_reading_kind(kind, device)), entry);
+    const int found = find_history(*reference, 1, history_mask(resolve_reading_kind(kind, device)), entry);
     if (found == -2) return reading_too_old;
     if (found != 0) return reading_not_found;
     *out = make_reading(entry, kind, device);
@@ -494,9 +523,8 @@ HRESULT __stdcall input_previous_reading(Object*, Reading* reference, std::uint3
     if (!reference) return E_INVALIDARG;
     const HRESULT check_hr = validate_kind_and_device(kind, device);
     if (FAILED(check_hr)) return check_hr;
-    if (reference->sequence <= 1) return reading_not_found;
     HistoryEntry entry{};
-    const int found = find_history(reference->sequence - 1, -1, history_mask(resolve_reading_kind(kind, device)), entry);
+    const int found = find_history(*reference, -1, history_mask(resolve_reading_kind(kind, device)), entry);
     if (found == -2) return reading_too_old;
     if (found != 0) return reading_not_found;
     *out = make_reading(entry, kind, device);

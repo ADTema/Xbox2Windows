@@ -334,7 +334,34 @@ int main(int argc, char** argv)
         const std::uint64_t base = pad_a ? pad_a->GetSequenceNumber(kind_gamepad) : 0;
         SetEnvironmentVariableA("X2W_INPUT_KEYS", "51");
         input->GetCurrentReading(kind_keyboard, kbd_device, &tmp);
+        const std::uint64_t key51 = tmp ? tmp->GetSequenceNumber(kind_keyboard) : 0;
         if (tmp) tmp->Release();
+        SetEnvironmentVariableA("X2W_INPUT_KEYS", "52");
+        input->GetCurrentReading(kind_keyboard, kbd_device, &tmp);
+        if (tmp) tmp->Release();
+        tmp = nullptr;
+        // Control: repeated keyboard-only reads never move the gamepad kind's sequence number.
+        for (int i = 0; i < 3; ++i) {
+            SetEnvironmentVariableA("X2W_INPUT_KEYS", i % 2 ? "53" : "54");
+            input->GetCurrentReading(kind_keyboard, kbd_device, &tmp);
+            if (tmp) tmp->Release();
+            tmp = nullptr;
+        }
+        SetEnvironmentVariableA("X2W_INPUT_KEYS", "52");
+        IGameInputReading* pad_same = nullptr;
+        failures += check(input->GetCurrentReading(kind_gamepad, pad_device, &pad_same) == S_OK && pad_same &&
+                              pad_same->GetSequenceNumber(kind_gamepad) == base,
+                          "gamepad sequence is unchanged after repeated keyboard-only reads");
+        if (pad_same) pad_same->Release();
+        // Control: keyboard-only traffic beyond the ring size must not age out the gamepad reference.
+        for (int i = 0; i < 100; ++i) {
+            char keys[8];
+            std::snprintf(keys, sizeof keys, "%X", 0x30 + i % 2);
+            SetEnvironmentVariableA("X2W_INPUT_KEYS", keys);
+            input->GetCurrentReading(kind_keyboard, kbd_device, &tmp);
+            if (tmp) tmp->Release();
+            tmp = nullptr;
+        }
         SetEnvironmentVariableA("X2W_INPUT_KEYS", "52");
         input->GetCurrentReading(kind_keyboard, kbd_device, &tmp);
         if (tmp) tmp->Release();
@@ -347,7 +374,7 @@ int main(int argc, char** argv)
         if (pad_b) {
             GamepadState gs{};
             failures += check(pad_b->GetGamepadState(&gs) && gs.buttons == 4, "next gamepad reading carries the new buttons");
-            failures += check(pad_b->GetSequenceNumber(kind_gamepad) == base + 3, "next gamepad reading skips keyboard-only entries");
+            failures += check(pad_b->GetSequenceNumber(kind_gamepad) == base + 1, "next gamepad reading carries the next gamepad sequence");
             IGameInputReading* back = nullptr;
             failures += check(input->GetPreviousReading(pad_b, kind_gamepad, pad_device, &back) == S_OK && back, "previous gamepad reading");
             if (back) {
@@ -357,7 +384,8 @@ int main(int argc, char** argv)
             IGameInputReading* kback = nullptr;
             failures += check(input->GetPreviousReading(pad_b, kind_keyboard, kbd_device, &kback) == S_OK && kback, "previous keyboard reading");
             if (kback) {
-                failures += check(kback->GetSequenceNumber(kind_keyboard) == base + 2, "previous keyboard reading skips pad-only entries");
+                failures += check(kback->GetSequenceNumber(kind_keyboard) < pad_b->GetSequenceNumber(kind_keyboard) &&
+                                      kback->GetSequenceNumber(kind_keyboard) > key51, "previous keyboard reading skips pad-only entries");
                 kback->Release();
             }
             pad_b->Release();
