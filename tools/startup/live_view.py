@@ -88,6 +88,13 @@ def on_shim(line):
             say("storage", f"read batch complete: {m.group(1)} compressed chunks decompressed so far, {m.group(2)} failed")
     elif "EnqueueRequest" in line or "options=" in line or "Queue::Submit" in line or "IsComplete" in line:
         return
+    elif line.startswith("x2w-dstorage heartbeat "):
+        m = re.search(r"\binflated=(\d+)", line)
+        if m:
+            counts["chunks"] = int(m.group(1))
+        say("storage", line)
+    elif line.startswith("x2w-render totals:"):
+        say("render", line)
     elif "heartbeat" in line:
         m = re.search(r"heartbeat: (\d+) frames presented in ([\d.]+) s \(([\d.]+) fps", line)
         if m:
@@ -119,7 +126,7 @@ sources = {"events.txt": on_event, "files.txt": on_file, "trap.log": on_shim}
 positions = {name: 0 for name in sources}
 partial = {name: "" for name in sources}
 print("Xbox2Windows local startup experiment: live log of " + os.path.abspath(rundir))
-print("Columns: time since this window opened, category, detail. The game runs offline (network opens are refused).")
+print("Columns: time since this window opened, category, detail. Network refusals are shown when observed.")
 print("-" * 110, flush=True)
 finished = os.path.join(rundir, "finished.txt")
 ended = False
