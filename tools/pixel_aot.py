@@ -3139,7 +3139,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
 
     for i, (offset, line) in enumerate(positioned):
         if region is not None and region["opener"] == "scc" and i == region["end"]:
-            # A uniform skip block ends where its branch lands, before that instruction runs and is checked.
+            if region["join"] is not None and region["else"] is None:
+                # Block A's terminal s_branch (issue #1413 stage 2): switch to block B, which starts from the
+                # incoming vector state. A register first defined by A is undefined in B until B writes it.
+                region["then"] = {dst: dict.get(vector, dst) for dst in region["written"]}
+                for dst, outer in region["written"].items():
+                    if outer is MISSING:
+                        region["else_undefined"].add(dst)
+                    else:
+                        vector[dst] = outer
+                region["else"] = region["arm_start"] = i
+                region["end"] = region["join"]
+                continue
+            # A uniform skip block, or a diamond at JOIN, ends where its branch lands, before that instruction
+            # runs and is checked.
             close_region(i, None)
             region = None
         vector.reads.clear()
@@ -3514,10 +3527,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             end = offset_index.get(offset + 4 + imm * 4)
             if end is None or end <= i:
                 raise ValueError("Uniform branch targets no later instruction boundary")
+            # Stage 2: when the instruction just before the target is a forward s_branch, the branch selects
+            # between block A (up to that s_branch, run when not taken) and block B (from the target to the
+            # s_branch's JOIN, run when taken). JOIN must be a later boundary after B's first instruction.
+            join = None
+            last = instructions[end - 1]
+            last_offset, last_line = last if isinstance(last, tuple) else (None, last)
+            if end - 1 > i and (jm := re.fullmatch(r"s_branch (-?0x[0-9a-f]+|-?\d+)", last_line)):
+                jimm = int(jm[1], 0)
+                join = (offset_index.get(last_offset + 4 + jimm * 4)
+                        if last_offset is not None and -0x8000 <= jimm <= 0x7fff else None)
+                if join is None or join <= end:
+                    raise ValueError("Uniform branch join targets no later instruction boundary")
             region = {"save": None, "cond": scc if m[1] == "0" else f"(!{scc})", "written": {}, "skip": None,
                       "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False, "scalar_written": set(), "scc_written": False,
-                      "opener": "scc", "end": end, "outstanding": (set(pending), dict(sample_dest))}
+                      "opener": "scc", "end": end - 1 if join is not None else end, "join": join,
+                      "outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
             # The whole-wave empty-mask skip may sit right after the save, or right after the else transition

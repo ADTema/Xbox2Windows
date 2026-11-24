@@ -251,13 +251,14 @@ def check_shader_records():
         os.utime(record, (now - 3600, now - 3600))
         assert fc.read_records(record.parent, (now - 60, now + 60)) == {}
     # The same holds in the real controls. The scheduling-hint fixtures translate programs with s_nop
-    # and the hints, so those forms are recorded; s_branch reaches only must_reject and stays out.
+    # and the hints, so those forms are recorded; s_code_end reaches only rejections and stays out. Since
+    # issue #1413 stage 2, s_branch is recorded as the terminal branch of a uniform if/else diamond.
     assert ("SOPP", "s_branch") in gfx
     pixel.ACCEPTED.clear()
     with tempfile.TemporaryDirectory() as tmp:
         pixel.check_controls(Path(tmp))
     assert {"s_nop", "s_clause", "s_setprio", "s_sleep", "image_sample"} <= pixel.ACCEPTED
-    assert "s_branch" not in pixel.ACCEPTED and "s_code_end" not in pixel.ACCEPTED
+    assert "s_branch" in pixel.ACCEPTED and "s_code_end" not in pixel.ACCEPTED
     # The mode-register fixture records the immediate write; the register forms reach only rejections.
     assert ("SOPK", "s_setreg_imm32_b32") in gfx and "s_setreg_imm32_b32" in pixel.ACCEPTED
     assert not {"s_setreg_b32", "s_getreg_b32"} & pixel.ACCEPTED
@@ -278,8 +279,8 @@ def check_shader_records():
         assert shift64_forms <= fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name)), name
     masked_forms = {("SOP1", "s_and_saveexec_b64"), ("SOPP", "s_cbranch_execz")}
     assert masked_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
-    # Forward skips on a tracked scalar compare (issue #1413).
-    scc_skip_forms = {("SOPP", "s_cbranch_scc0"), ("SOPP", "s_cbranch_scc1")}
+    # Forward skips and if/else diamonds on a tracked scalar compare (issue #1413).
+    scc_skip_forms = {("SOPP", "s_cbranch_scc0"), ("SOPP", "s_cbranch_scc1"), ("SOPP", "s_branch")}
     assert scc_skip_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
     scalar64_forms = {
         ("SOP1", "s_cmov_b64"), ("SOP1", "s_not_b64"), ("SOP1", "s_brev_b64"),

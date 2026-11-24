@@ -805,6 +805,131 @@ def check_scc_skip_draw(directory, compiler, renderer, backend):
             source.write_text(translate(program), encoding="ascii")
             compile_shader(compiler, source, shader)
             run_pixel_batch(renderer, backend, shader, [case(label, flag, runs, "mismatch") for flag, runs in flags])
+    check_scc_diamond_draw(directory, compiler, renderer, backend)
+
+
+# Uniform if/else diamonds (issue #1413 stage 2). Block A runs when the branch is not taken and writes v13 and
+# v14; its terminal s_branch jumps over block B to JOIN. Block B runs when the branch is taken, writes v13 from
+# s44 and reads v14 into v15, so it must see v14's incoming value.
+SCC_DIAMOND_A = ("v_mov_b32_e32 v13, s45", "v_mov_b32_e32 v14, s46")
+SCC_DIAMOND_B = ("v_mov_b32_e32 v13, s44", "v_mul_f32_e32 v15, 0.5, v14")
+
+
+def scc_diamond(compare="s_cmp_eq_u32 s47, 0", branch="scc1", a=SCC_DIAMOND_A, b=SCC_DIAMOND_B, after=(),
+                cond_imm=None, join_imm=None, keep_branch=True):
+    """The diamond as (offset, text) pairs. By default the conditional branch lands on B's first instruction and
+    the s_branch at the end of A lands on JOIN, right after B; cond_imm and join_imm override the dword
+    displacements. Without keep_branch, A has no terminal s_branch (the dropped-branch mutant)."""
+    lines = uncompressed_export([compare, f"s_cbranch_{branch} 0", *a, *(["s_branch 0"] if keep_branch else []),
+                                 *b, *after])
+    pairs = offset_pairs(lines)
+    k = next(j for j, (_, line) in enumerate(pairs) if line.startswith("s_cbranch_scc"))
+    sb = k + 1 + len(a)
+    b0 = sb + 1 if keep_branch else sb
+    imm = (pairs[b0][0] - pairs[k][0] - 4) // 4 if cond_imm is None else cond_imm
+    pairs[k] = (pairs[k][0], f"s_cbranch_{branch} {imm}")
+    if keep_branch:
+        imm = (pairs[b0 + len(b)][0] - pairs[sb][0] - 4) // 4 if join_imm is None else join_imm
+        pairs[sb] = (pairs[sb][0], f"s_branch {imm}")
+    return pairs
+
+
+def scc_diamond_asm(compare, branch):
+    """scc_diamond as assembler text with .Lscc_else and .Lscc_join labels."""
+    program = [line for _, line in scc_diamond(compare, branch)]
+    k = next(j for j, line in enumerate(program) if line.startswith("s_cbranch_scc"))
+    sb = k + 1 + len(SCC_DIAMOND_A)
+    program[k] = f"s_cbranch_{branch} .Lscc_else"
+    program[sb] = "s_branch .Lscc_join"
+    program.insert(sb + 1 + len(SCC_DIAMOND_B), ".Lscc_join:")
+    program.insert(sb + 1, ".Lscc_else:")
+    return program
+
+
+def scc_diamond_pixels(runs_a, *, stale_a=False):
+    """A: (x, 0.25, 0.75, 1). B: (x, 0.5, incoming b, 0.5 * incoming b); stale_a models B reading A's v14."""
+    outer_b = single(128 / 255)
+    if runs_a:
+        return [(single(r / 255), 0.25, 0.75, 1) for g in MASKED_RAMP for r in MASKED_RAMP]
+    return [(single(r / 255), 0.5, outer_b, single(0.5 * (0.75 if stale_a else outer_b)))
+            for g in MASKED_RAMP for r in MASKED_RAMP]
+
+
+def check_scc_diamond_draw(directory, compiler, renderer, backend):
+    """Draw uniform if/else diamonds (issue #1413 stage 2) with A and B taken, plus the mutants."""
+    source = directory / "diamond.hlsl"
+    shader = directory / "diamond.cso"
+    constants = bytearray(256)
+
+    def case(name, flag, pixels, outcome):
+        struct.pack_into("<3fI", constants, 12, 0.5, 0.25, 0.75, flag)
+        path = directory / f"diamond-{name}-{flag}.case"
+        write_case(path, constants, pixels)
+        return path, outcome
+
+    for name, (compare, branch) in SCC_SKIP_FORMS.items():
+        source.write_text(translate(scc_diamond(compare, branch)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        # s47 = 0 takes the branch to B; 1 and 7 run A.
+        run_pixel_batch(renderer, backend, shader, [
+            case(name, 0, scc_diamond_pixels(False), "pass"), case(name, 1, scc_diamond_pixels(True), "pass"),
+            case(name, 7, scc_diamond_pixels(True), "pass"),
+            # The correct shader against a B that reads A's v14 must mismatch.
+            case(f"{name}-stale-a", 0, scc_diamond_pixels(False, stale_a=True), "mismatch")])
+    flipped = {"scc0": "scc1", "scc1": "scc0"}
+    for name, (compare, branch) in SCC_SKIP_FORMS.items():
+        mutants = (
+            (f"{name}-polarity", scc_diamond(compare, flipped[branch]), ((0, False), (1, True))),
+            # Without A's s_branch, A falls through into B whenever A runs.
+            (f"{name}-dropped", scc_diamond(compare, branch, keep_branch=False), ((1, True),)),
+        )
+        for label, program, flags in mutants:
+            source.write_text(translate(program), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            run_pixel_batch(renderer, backend, shader,
+                            [case(label, flag, scc_diamond_pixels(runs_a), "mismatch") for flag, runs_a in flags])
+
+
+def check_scc_diamond_controls():
+    """Issue #1413 stage 2: a single structured forward SCC if/else diamond over vector ALU."""
+    for name, (compare, branch) in SCC_SKIP_FORMS.items():
+        source = translate(scc_diamond(compare, branch))
+        condition = "((!scc" if branch == "scc1" else "(scc"
+        for register in ("v13", "v14", "v15"):
+            assert f"_{register} = {condition}" in source, (name, register)
+        assert "(0.5f * sample16.z)" in source, name  # B reads v14's incoming value
+    # Malformed targets: the conditional edge must enter B right after A's s_branch, which must land after B.
+    pairs = scc_diamond()
+    k = next(j for j, (_, line) in enumerate(pairs) if line.startswith("s_cbranch_scc"))
+    sb = k + 1 + len(SCC_DIAMOND_A)
+    onto_branch = (pairs[sb][0] - pairs[k][0] - 4) // 4
+    onto_join = (pairs[sb + 1 + len(SCC_DIAMOND_B)][0] - pairs[k][0] - 4) // 4
+    expect_value_error(translate, scc_diamond(cond_imm=onto_branch), "Unsupported instruction")
+    expect_value_error(translate, scc_diamond(cond_imm=onto_join),
+                       "Instruction cannot run in a uniform skip block: s_branch")
+    for imm in (0, -3, 400):  # onto B's first instruction, backward, outside the program
+        expect_value_error(translate, scc_diamond(join_imm=imm), "Uniform branch join targets no later instruction boundary")
+    expect_value_error(translate, scc_diamond(a=(*SCC_DIAMOND_A, "s_branch 1", "v_mov_b32_e32 v15, s45")),
+                       "Instruction cannot run in a uniform skip block: s_branch 1")
+    for block in ("a", "b"):
+        nested = {block: (*(SCC_DIAMOND_A if block == "a" else SCC_DIAMOND_B), "s_cbranch_scc0 0")}
+        expect_value_error(translate, scc_diamond(**nested), "Instruction cannot run in a uniform skip block")
+    expect_value_error(translate, scc_diamond(b=(*SCC_DIAMOND_B, "s_buffer_load_dword s70, s[44:47], 0x10")),
+                       "Instruction cannot run in a uniform skip block: s_buffer_load_dword")
+    # B starts from the incoming state: a register first defined by A is undefined in B until B writes it.
+    expect_value_error(translate, scc_diamond(a=("v_mov_b32_e32 v30, s45",), b=("v_add_f32_e32 v13, v30, s45",)),
+                       "Else arm reads a register defined only in the then arm")
+    translate(scc_diamond(a=("v_mov_b32_e32 v30, s45",), b=("v_mov_b32_e32 v30, s44", "v_add_f32_e32 v13, v30, s45")))
+    # Undefined on entry and written by one block only stays undefined after JOIN; written by both, it is defined.
+    for a, b in ((("v_mov_b32_e32 v30, s45",), ("v_mov_b32_e32 v13, s44",)),
+                 (("v_mov_b32_e32 v13, s45",), ("v_mov_b32_e32 v30, s44",))):
+        expect_value_error(translate, scc_diamond(a=a, b=b, after=("v_add_f32_e32 v13, v30, s45",)),
+                           "Read of a register defined only on the masked path")
+    translate(scc_diamond(a=("v_mov_b32_e32 v30, s45",), b=("v_mov_b32_e32 v30, s44",),
+                          after=("v_add_f32_e32 v13, v30, s45",)))
+    # SCC and VCC keep their tracked values across the diamond; empty blocks are allowed.
+    translate(scc_diamond(after=("s_cselect_b32 s62, 1.0, 0", "v_mov_b32_e32 v15, s62")))
+    translate(scc_diamond(a=()))
 
 
 def check_scc_skip_controls():
@@ -14425,6 +14550,7 @@ def check_controls(directory):
     check_masked_mov_close_controls()
     check_masked_else_controls()
     check_scc_skip_controls()
+    check_scc_diamond_controls()
     check_cmpx_controls()
     check_shift64_controls()
     check_region_body_controls()
@@ -16677,6 +16803,7 @@ def check_binary(directory, assembler, objcopy, library):
                     fixtures.append((else_region_asm(opener, restore, skips), translate, "gfx1013", "", pairs))
     for compare, branch in SCC_SKIP_FORMS.values():
         fixtures.append((scc_skip_asm(compare, branch), translate, "gfx1013", "", scc_skip(compare, branch)))
+        fixtures.append((scc_diamond_asm(compare, branch), translate, "gfx1013", "", scc_diamond(compare, branch)))
     fixtures.extend((program, translate) for program in (
         cmpx_region(), cmpx_region(CMPX_OR_RESTORE), cmpx_observables(),
         *(cmpx_predicate_group(kind, first, encoding) for kind, first in CMPX_PREDICATE_GROUPS
