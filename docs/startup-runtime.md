@@ -133,6 +133,13 @@ These are measured on one executable; treat them as hypotheses for others.
   hardware. Swapping the red/green shader changes the 16 covered pixels. Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_stream_(request|draw)_"`.
   Other stage combinations and full stream rasterizer/depth state remain open.
+- Translated pipelines are created without a blend state: the captured state blocks hold console
+  colour-blend register values, not a desktop `D3D12_BLEND_DESC` (#1216). `src/startup_stubs/cb_blend.h`
+  decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It
+  refuses forms D3D12 can't express (`BOTH_SRC_ALPHA`, constant alpha without alpha blend factor
+  support, MIN/MAX with factors other than ONE). Its draws match a CPU model of the register fields
+  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`). Where those registers sit in the
+  state block is not measured yet, so the draw path doesn't call it.
 - Audio produces no output.
 
 
