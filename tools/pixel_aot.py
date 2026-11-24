@@ -2924,6 +2924,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scc = None
 
     for i, (offset, line) in enumerate(positioned):
+        if region is not None and region["opener"] == "scc" and i == region["end"]:
+            # A uniform skip block ends where its branch lands, before that instruction runs and is checked.
+            close_region(i, None)
+            region = None
         vector.reads.clear()
         scalar.reads.clear()
         scalar.site = vector.site = (i, offset, line)
@@ -2939,7 +2943,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("ds_swizzle_b32 requires an immediate s_waitcnt lgkmcnt(0)")
             ds_needs_wait = False
         rstate = None
-        if region is not None:
+        if region is not None and region["opener"] == "scc":
+            # A uniform skip block (issue #1413) admits only per-lane vector ALU and s_nop: no memory, EXEC,
+            # scalar or wave updates and no nested branch or region.
+            if REGION_NOP.fullmatch(line):
+                pass
+            elif not REGION_ALU.match(line):
+                raise ValueError(f"Instruction cannot run in a uniform skip block: {line}")
+            else:
+                rstate = (dict(scalar), dict(vector), scc, set(pending), dict(sample_dest),
+                          exported, ended, mask, attribute_input, interpolated,
+                          dict(quad_values), samples, False)
+        elif region is not None:
             if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]|s_mov_b64 exec, s\[\d+:\d+\]", line):
                 pass
             elif re.fullmatch(r"s_andn2_b64 exec, s\[\d+:\d+\], exec", line):
@@ -3246,6 +3261,26 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                       "outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
+        elif m := match(r"s_cbranch_scc([01]) (-?0x[0-9a-f]+|-?\d+)"):
+            # A forward branch on a tracked scalar compare (issue #1413). SCC is a wave value, so the whole wave
+            # skips the block or runs it. The block's vector writes merge with a select on the condition under
+            # which it runs: SCC for s_cbranch_scc0, !SCC for s_cbranch_scc1. Offsets count from the next
+            # instruction, and the target must be a later instruction boundary.
+            if region is not None or mask != "entry" or offset is None:
+                raise ValueError("Unsupported uniform branch")
+            if not isinstance(scc, str) or not re.fullmatch(r"scc\d+", scc):
+                raise ValueError("Uniform branch requires a tracked scalar compare")
+            imm = int(m[2], 0)
+            if not -0x8000 <= imm <= 0x7fff:
+                raise ValueError("Uniform branch displacement out of range")
+            end = offset_index.get(offset + 4 + imm * 4)
+            if end is None or end <= i:
+                raise ValueError("Uniform branch targets no later instruction boundary")
+            region = {"save": None, "cond": scc if m[1] == "0" else f"(!{scc})", "written": {}, "skip": None,
+                      "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
+                      "else_undefined": set(), "skipped": False, "scalar_written": set(), "scc_written": False,
+                      "opener": "scc", "end": end, "outstanding": (set(pending), dict(sample_dest))}
+            vector.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
             # The whole-wave empty-mask skip may sit right after the save, or right after the else transition
             # (issue #1315); its target must be the matching restore exactly, or for the skip after the save of a

@@ -735,6 +735,119 @@ def check_masked_else_draw(directory, compiler, renderer, backend):
         run_pixel_batch(renderer, backend, shader, [(case, "mismatch")])
 
 
+# Uniform skips (issue #1413): a forward s_cbranch_scc0/scc1 on a tracked scalar compare jumps over a block of
+# vector ALU. The flag in constant word 6 (s47) decides per draw whether the block runs. The block writes v13 and
+# v14, and an instruction after the target reads the merged v14 into v15.
+SCC_SKIP_FORMS = {
+    # name: (compare, branch); both skip the block exactly when s47 == 0.
+    "eq-scc1": ("s_cmp_eq_u32 s47, 0", "scc1"),
+    "lg-scc0": ("s_cmp_lg_u32 s47, 0", "scc0"),
+}
+SCC_SKIP_BODY = ("v_mov_b32_e32 v13, s45", "v_mov_b32_e32 v14, s46")
+SCC_SKIP_AFTER = ("v_mul_f32_e32 v15, 0.5, v14",)
+
+
+def scc_skip(compare="s_cmp_eq_u32 s47, 0", branch="scc1", body=SCC_SKIP_BODY, after=SCC_SKIP_AFTER, before=(),
+             target=None):
+    """The skip program as (offset, text) pairs; the branch lands on the first instruction after body unless
+    target names another displacement in dwords."""
+    lines = uncompressed_export([*before, compare, f"s_cbranch_{branch} 0", *body, *after])
+    pairs = offset_pairs(lines)
+    k = next(j for j, (_, line) in enumerate(pairs) if line.startswith("s_cbranch_scc"))
+    imm = (pairs[k + 1 + len(body)][0] - pairs[k][0] - 4) // 4 if target is None else target
+    pairs[k] = (pairs[k][0], f"s_cbranch_{branch} {imm}")
+    return pairs
+
+
+def scc_skip_asm(compare, branch):
+    """scc_skip as assembler text: the branch names a label on its target."""
+    program = [line for _, line in scc_skip(compare, branch)]
+    k = next(j for j, line in enumerate(program) if line.startswith("s_cbranch_scc"))
+    program[k] = f"s_cbranch_{branch} .Lscc_skip"
+    program.insert(k + 1 + len(SCC_SKIP_BODY), ".Lscc_skip:")
+    return program
+
+
+def scc_skip_pixels(runs):
+    outer_b = single(128 / 255)
+    b = 0.75 if runs else outer_b
+    return [(single(r / 255), 0.25 if runs else single(g / 255), b, single(0.5 * b))
+            for g in MASKED_RAMP for r in MASKED_RAMP]
+
+
+def check_scc_skip_draw(directory, compiler, renderer, backend):
+    """Draw uniform skips (issue #1413) with the block taken and skipped, plus polarity and dropped-branch mutants."""
+    source = directory / "scc.hlsl"
+    shader = directory / "scc.cso"
+    constants = bytearray(256)
+
+    def case(name, flag, runs, outcome):
+        struct.pack_into("<3fI", constants, 12, 0.0, 0.25, 0.75, flag)
+        path = directory / f"scc-{name}-{flag}.case"
+        write_case(path, constants, scc_skip_pixels(runs))
+        return path, outcome
+
+    for name, (compare, branch) in SCC_SKIP_FORMS.items():
+        source.write_text(translate(scc_skip(compare, branch)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        # s47 = 0 skips the block; 1 and 7 run it.
+        run_pixel_batch(renderer, backend, shader,
+                        [case(name, 0, False, "pass"), case(name, 1, True, "pass"), case(name, 7, True, "pass")])
+    flipped = {"scc0": "scc1", "scc1": "scc0"}
+    for name, (compare, branch) in SCC_SKIP_FORMS.items():
+        mutants = (
+            # The opposite polarity runs the block exactly when it should be skipped.
+            (f"{name}-polarity", scc_skip(compare, flipped[branch]), ((0, False), (1, True))),
+            # Without the branch the block always runs, which shows when the flag asks for the skip.
+            (f"{name}-dropped", uncompressed_export([compare, *SCC_SKIP_BODY, *SCC_SKIP_AFTER]), ((0, False),)),
+        )
+        for label, program, flags in mutants:
+            source.write_text(translate(program), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            run_pixel_batch(renderer, backend, shader, [case(label, flag, runs, "mismatch") for flag, runs in flags])
+
+
+def check_scc_skip_controls():
+    """Issue #1413 stage 1: one forward SCC-led skip over vector ALU, merged with selects."""
+    for name, (compare, branch) in SCC_SKIP_FORMS.items():
+        source = translate(scc_skip(compare, branch))
+        # The block runs under !SCC for scc1 and under SCC for scc0.
+        condition = "((!scc" if branch == "scc1" else "(scc"
+        assert f"_v13 = {condition}" in source and f"_v14 = {condition}" in source, name
+        assert "(0.5f * alu" in source, source  # the instruction after the target reads the merged v14
+    # The condition must be a tracked scalar compare.
+    expect_value_error(translate, scc_skip("s_and_b32 s60, s47, 1"), "Uniform branch requires a tracked scalar compare")
+    expect_value_error(translate, scc_skip("s_add_u32 s60, s47, 1"), "Uniform branch requires a tracked scalar compare")
+    translate(scc_skip("s_bitcmp1_b32 s47, 0"))
+    # The target is a later instruction boundary, checked on real offsets.
+    expect_value_error(translate, [line for _, line in scc_skip()], "Unsupported uniform branch")
+    for imm in (-1, -3, 400):
+        expect_value_error(translate, scc_skip(target=imm), "Uniform branch targets no later instruction boundary")
+    # Memory, EXEC, scalar and wave updates, waits and nesting stay out of the block.
+    for extra in ("image_sample v[16:19], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+                  "s_buffer_load_dword s70, s[44:47], 0x10", "s_mov_b32 s60, s45", "s_cmp_eq_u32 s45, s46",
+                  "s_mov_b64 exec, s[60:61]", "s_and_saveexec_b64 s[60:61], vcc", "s_waitcnt lgkmcnt(0)",
+                  "exp mrt0 v12, v13, v14, v15 done vm", "v_readfirstlane_b32 s62, v12"):
+        expect_value_error(translate, scc_skip(body=(*SCC_SKIP_BODY, extra)),
+                           f"Instruction cannot run in a uniform skip block: {extra}")
+    nested = scc_skip(body=(*SCC_SKIP_BODY, "s_cbranch_scc1 0"))
+    expect_value_error(translate, nested, "Instruction cannot run in a uniform skip block: s_cbranch_scc1")
+    # Inside a masked region the branch is refused by the region gate.
+    expect_value_error(translate, offset_pairs(uncompressed_export([
+        "s_cmp_eq_u32 s47, 0", "v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc",
+        "s_cbranch_scc1 1", "v_mov_b32_e32 v13, s45", MASKED_OR_RESTORE])),
+        "Instruction cannot run in a masked region: s_cbranch_scc1 1")
+    # A VGPR first written in the block is undefined after it, also at the target, until written on every path.
+    for after in (("v_add_f32_e32 v13, v30, s45",), ("v_mov_b32_e32 v14, s46", "v_add_f32_e32 v13, v30, s45")):
+        expect_value_error(translate, scc_skip(body=("v_mov_b32_e32 v30, s45",), after=after),
+                           "Read of a register defined only on the masked path")
+    translate(scc_skip(body=("v_mov_b32_e32 v30, s45",), after=("v_mov_b32_e32 v30, s46", "v_add_f32_e32 v13, v30, s45")))
+    # The block writes no scalar state, so SCC and VCC keep their tracked values after it.
+    translate(scc_skip(after=("s_cselect_b32 s62, 1.0, 0", "v_mov_b32_e32 v15, s62")))
+    # An empty block is a no-op skip.
+    translate(scc_skip(body=()))
+
+
 # v_cmpx regions (issue #932): `s_mov_b64 s[a:b], exec` saves the entry mask, a VOPC e32 v_cmpx intersects EXEC
 # with its comparison, and `s_mov_b64 exec, s[a:b]` (or `s_or_b64 exec, exec, s[a:b]`) closes the region.
 CMPX_SAVE = "s_mov_b64 s[60:61], exec"
@@ -13429,6 +13542,7 @@ def check_controls(directory):
     check_masked_controls()
     check_masked_mov_close_controls()
     check_masked_else_controls()
+    check_scc_skip_controls()
     check_cmpx_controls()
     check_shift64_controls()
     check_region_body_controls()
@@ -15573,6 +15687,8 @@ def check_binary(directory, assembler, objcopy, library):
                     fixtures.append(([line for _, line in pairs], translate))
                 else:
                     fixtures.append((else_region_asm(opener, restore, skips), translate, "gfx1013", "", pairs))
+    for compare, branch in SCC_SKIP_FORMS.values():
+        fixtures.append((scc_skip_asm(compare, branch), translate, "gfx1013", "", scc_skip(compare, branch)))
     fixtures.extend((program, translate) for program in (
         cmpx_region(), cmpx_region(CMPX_OR_RESTORE), cmpx_observables(),
         *(cmpx_predicate_group(kind, first) for kind, first in CMPX_PREDICATE_GROUPS)))
@@ -20670,7 +20786,7 @@ def main():
                     "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions",
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-scc-skip",
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers",
@@ -20711,6 +20827,7 @@ def main():
                         "draw-title-loads": check_title_load_draws,
                         "draw-ds-swizzle": check_ds_swizzle_draw,
                         "draw-exec-regions": check_masked_draw,
+                        "draw-scc-skip": check_scc_skip_draw,
                         "draw-cmpx-regions": check_cmpx_draw,
                         "draw-region-body": check_region_body_draw,
                         "draw-region-waits": check_region_wait_draw,
