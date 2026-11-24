@@ -86,9 +86,10 @@ def trap_key(name):
             or Path(dll).name != dll or "/" in dll or "\\" in dll):
         raise ValueError(f"--trap-callable expects DLL!SYMBOL or DLL!#ORDINAL, got {name!r}")
     if symbol.startswith("#"):
-        ordinal = symbol[1:]
-        if not (ordinal.isascii() and ordinal.isdigit() and 1 <= int(ordinal) <= 0xFFFF):
+        ordinal = symbol[1:].lstrip("0")
+        if not (1 <= len(ordinal) <= 5 and ordinal.isascii() and ordinal.isdigit() and int(ordinal) <= 0xFFFF):
             raise ValueError(f"--trap-callable expects DLL!SYMBOL or DLL!#ORDINAL, got {name!r}")
+        symbol = "#" + ordinal
     return dll.casefold(), symbol
 
 

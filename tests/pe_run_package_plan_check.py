@@ -128,6 +128,7 @@ class RunPackagePlanChecks(unittest.TestCase):
     def test_trap_key_valid_and_invalid_inputs(self):
         self.assertEqual(trap_key("User32.dll!MessageBoxW"), ("user32.dll", "MessageBoxW"))
         self.assertEqual(trap_key("KERNEL32.DLL!#42"), ("kernel32.dll", "#42"))
+        self.assertEqual(trap_key("KERNEL32.DLL!#00042"), ("kernel32.dll", "#42"))
         self.assertEqual(trap_key("shim.dll!#65535"), ("shim.dll", "#65535"))
 
         for bad in (
@@ -141,6 +142,8 @@ class RunPackagePlanChecks(unittest.TestCase):
             "user32.dll!#",
             "user32.dll!#abc",
             "user32.dll!#0",
+            "user32.dll!#00000",
+            "user32.dll!#" + "9" * 5000,
             "user32.dll!#65536",
         ):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
