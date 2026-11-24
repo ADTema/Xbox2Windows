@@ -218,7 +218,7 @@ STRING_TRANSFERS = {
 }
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
+FLAG_NEUTRAL = {M.CLZERO, M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
                 M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
 FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS}
 MAX_FLAG_DISTANCE = 16
@@ -1044,6 +1044,14 @@ class Lifter:
         sets_flags records the flag inputs for a later consumer; producer is the
         instruction whose flags a SETcc or CMOVcc reads."""
         mnemonic = ins.mnemonic
+        if mnemonic == M.CLZERO:
+            if ins.len != 3:
+                raise ValueError(f"unsupported CLZERO prefix or address size at RVA {ins.ip:#x}")
+            address = self.reg(R.RAX)
+            # One aligned cache line per executed instruction. Volatile retains writes
+            # even when a following iteration or caller overwrites the same line.
+            return (f"{{ auto* line = reinterpret_cast<volatile unsigned char*>({address} & ~63ull); "
+                    "for (unsigned i = 0; i < 64; ++i) line[i] = 0; }", {R.RAX: 8}, {})
         if ins.code in STRING_TRANSFERS:
             kind, width = STRING_TRANSFERS[ins.code]
             if (ins.has_segment_prefix or ins.has_repne_prefix or ins.has_lock_prefix

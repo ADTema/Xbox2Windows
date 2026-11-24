@@ -2,6 +2,12 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## Counted cache-line zero loops
+
+`cpu_switch_aot.py` accepts the three-byte CLZERO with full-width RAX addressing for 64-byte guest cache lines. A translated instruction zeroes the aligned line containing RAX. It preserves RAX and flags. The original function controls advancement and termination with ADD, CMP and JB. The supported memory domain is ordinary writable host-backed storage; this test checks final memory, registers and conditions on a single thread.
+
+Build `cpu_clzero_lifted`, then run `ctest --preset release --no-tests=error -R '^cpu_counted_clzero$' -V`. The Windows Release comparison covers six aligned, unaligned, equal, reversed, overshooting and multi-line bounds. It compares the entire guarded region and final RAX against a source-built x64 integer-store reference. Four compact loops use different bound registers; a fifth checks flag preservation across CLZERO and the final comparison. Address-size overrides and undefined RAX inputs must be rejected.
+
 ## Local tools
 
 For optional static dependency inspection, build Microsoft's pinned version of xbdepends from PowerShell with x64 Visual Studio Build Tools, CMake and the Windows SDK.
