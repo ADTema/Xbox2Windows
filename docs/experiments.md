@@ -4116,11 +4116,17 @@ any pairing. The e64 form is lowered only as plain registers: clamp, output
 scale (`mul:`, `div:`), negate and absolute value, a swapped operand order,
 a special register such as `vcc_lo` or `null`, and an inline constant are
 rejected, as are the other element types and `v_cmp_*`. A comparison with NaN
-kills no pixel. The sample is `image_sample` or `image_sample_lz`, with one
-2D coordinate pair, a single-channel `dmask` and no other modifier. The
-second lowers to `SampleLevel(samp,uv,0)` instead of `Sample(samp,uv)`; one
-sample per program is still required, whichever spelling it uses. The
-textures have one mip.
+kills no pixel. The sample is `image_sample`, `image_sample_lz` or
+`image_sample_l`, with one 2D coordinate pair, a single-channel `dmask` and
+no other modifier. `image_sample_lz` lowers to `SampleLevel(samp,uv,0)`
+instead of `Sample(samp,uv)`. `image_sample_l` takes the level as the third
+address register, `v[u:lod]`, and lowers to `SampleLevel(samp,uv,<level>)`.
+The level register must hold a value copied by `v_mov_b32_e32 vN, sM` from a
+buffered float that the program loaded and waited for; an inline constant, a
+literal, a vector or special-register source, a non-float scalar, the VOP3
+spelling and a level that was never defined are refused. One sample per
+program is still required, whichever spelling it uses. The textures have one
+mip.
 
 The JSON bindings used by the source-built fixture are constructed by
 `bindings(slot)` in `tests/sampled_coverage_check.py`. A descriptor entry lists
@@ -4161,22 +4167,32 @@ the translator command to refuse it and write no output. The CTest limit of
 `sampled_coverage_<adapter>` is raised from 60 to 150 seconds for the extra
 draws.
 
-The explicit-level sample has no extra readback that can tell it from the
+The explicit-level samples have no extra readback that can tell them from the
 implicit one: the textures have one mip and the draw maps texels one to one, so
 `SampleLevel(…,0)` and `Sample` return the same values there, and the
 fixture only repeats the first readback with the `image_sample_lz` program on
-the first texture. The Linux step requires the lowered source to contain
+the first texture. It also repeats it with an `image_sample_l` program whose
+level word holds 3, past the only mip, which must clamp to mip 0. The Linux step requires the lowered source to contain
 `SampleLevel(samp,uv,0)` and no `Sample(` call (a lowering of the
 implicit form fails that check), the same program as the implicit lowering with
 only that call replaced, on both textures and for the red channel, and refusal
-of a second sample in any order. It assembles `tfe`, `a16`, `lwe`, `d16`,
+of a second sample in any order. For `image_sample_l` it lowers the level
+copied from each of four buffered words and requires the `SampleLevel`
+argument, evaluated against distinct constants by a separate reader of the
+HLSL, to equal the word the load addresses. The same program with
+`image_sample_lz`, or with the implicit opcode, must not read that word. It
+also refuses a missing, misplaced or unwaited level, and every move source
+above, with LLVM 19 assembling each refused program. It assembles `tfe`, `a16`, `lwe`, `d16`,
 `r128`, `unorm`, `glc`, `slc`, `dlc`, a two-channel `dmask`, a 3D
-dimension, `image_sample_o`-style offsets and `image_sample_l` for both
-opcodes with LLVM 19 and requires the translator command to refuse each and
+dimension, and `image_sample_o`-style offsets for all
+three opcodes with LLVM 19 and requires the translator command to refuse each and
 write no output. `da` and a 2D array dimension are refused at the
 translator-level check only, because LLVM 19 does not assemble them in this form.
-The Windows readback has not been run on a GPU adapter by the author; the CI result
-on the pull request is the first measurement.
+There is still no readback with a mip chain: the fixture renderer builds one
+mip, so the choice between mips by an explicit level is checked at the
+translation level only, not on a GPU. The Windows readback has not been run on
+a GPU adapter by the author; the CI result on the pull request is the first
+measurement.
 
 #### Intel first-full-query diagnostic
 
