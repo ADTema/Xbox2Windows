@@ -554,10 +554,19 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
     return true;
 }
 
-// Copies of title memory made for the current frame: (address, bytes) -> ring offset.
-std::unordered_map<u64, u64>& frame_copies() { static std::unordered_map<u64, u64> m; return m; }
+// Copies of title memory made for the current frame, found by (address, bytes). A title may rewrite the same
+// address between two draws of one frame (a dynamic constant buffer, a reused vertex or index range), so an
+// entry keeps the bytes it was made from and is reused only while the title's memory still matches them. The
+// upload ring is write-combined memory that is slow to read, so the comparison is against this copy, not the ring.
+struct FrameCopy {
+    u64 address = 0;
+    u64 offset = 0;
+    std::vector<unsigned char> content;
+};
+std::unordered_map<u64, FrameCopy>& frame_copies() { static std::unordered_map<u64, FrameCopy> m; return m; }
 LONG frame_copies_frame = -1;
 
+// Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
 bool frame_copy(u64 address, std::size_t bytes, u64* offset)
 {
     if (frame_copies_frame != frame_number) {
@@ -565,13 +574,27 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset)
         frame_copies_frame = frame_number;
     }
     const u64 key = address * 1099511628211ull ^ bytes;
+    const auto* title = reinterpret_cast<const unsigned char*>(address);
     const auto found = frame_copies().find(key);
-    if (found != frame_copies().end()) {
-        *offset = found->second;
+    const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
+    if (known && std::memcmp(found->second.content.data(), title, bytes) == 0) {
+        *offset = found->second.offset;
         return true;
     }
-    if (!ring_copy(address, bytes, offset)) return false;
-    frame_copies()[key] = *offset;
+    u64 fresh = 0;
+    auto* ring = reserve_upload_ring(bytes, &fresh);
+    if (!ring) return false;
+    // Snapshot first and fill the ring from the snapshot, so the ring slice and the stored bytes cannot differ
+    // when the title writes the memory on another thread.
+    std::vector<unsigned char> content(title, title + bytes);
+    std::memcpy(ring, content.data(), bytes);
+    if (known) {
+        static LONG refreshed;
+        if (first_calls(refreshed, 4))
+            log("x2w-draw frame copy of 0x%llx (%zu bytes) refreshed: the title changed it since an earlier draw of this frame", address, bytes);
+    }
+    frame_copies()[key] = FrameCopy{address, fresh, std::move(content)};
+    *offset = fresh;
     return true;
 }
 
