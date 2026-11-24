@@ -701,23 +701,21 @@ is not affected: section-backed pages already took the committed, not-aliased pa
   (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
   sections, and single-page views.
 
-## Buffer and raytracing acceleration-structure memory SRVs (device slot 70)
+## Buffer memory SRVs (device slot 70)
 
 Device slot 70 (`src/startup_stubs/d3d12_memory_srv.inl`, validation in
 `src/startup_stubs/memory_srv_buffer.h`) also accepts `D3D12_RESOURCE_DIMENSION_BUFFER`
 descriptions with:
 
-- `D3D12_SRV_DIMENSION_BUFFER` (raw `R32_TYPELESS`, structured `Format == UNKNOWN` with stride up to
+- `D3D12_SRV_DIMENSION_BUFFER` (raw `R32_TYPELESS`, structured `Format == UNKNOWN` with a stride that is a multiple of 4 up to
   2048, or typed buffers). It resolves an existing live placed (slot 133) or committed (slot 127)
   buffer covering `[address, address + (FirstElement + NumElements) * element_bytes)`, checks
   alignment and bounds, adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards
   to `CreateShaderResourceView` (slot 18).
-- `D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE` (`Format == UNKNOWN`). When the adapter
-  reports raytracing support (`D3D12_FEATURE_D3D12_OPTIONS5::RaytracingTier != NOT_SUPPORTED`), it
-  resolves the buffer at `address`, verifies 256-byte alignment on both the title address and the
-  resolved desktop GPU virtual address, sets `RaytracingAccelerationStructure.Location`, and
-  forwards to slot 18 with `pResource == nullptr`. Adapters without raytracing support refuse the
-  call cleanly (`raytracing_unsupported`) without removing the device.
+
+Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`) are not
+supported and are refused. A view needs an actual built structure with the placed AS role and
+lifecycle checks, which has no device test yet.
 
 Typed element bytes come from the format (1 to 16 bytes). Formats that cannot back a typed buffer SRV
 (sRGB, BGRA, block-compressed, depth/stencil, typeless, planar) are refused with
@@ -726,6 +724,10 @@ views with the format's element size and stride. The refusal reasons are listed 
 `docs/experiments.md` ("Name the cause of a refused slot 70 call").
 
 Checks:
+
+`startup_memory_srv_buffer` is device-free and owns every rejection (bounds, alignment, format,
+stride). `startup_address_buffer_srv_*` exercises only the resolve path with valid addresses on a
+device, so it does not cover the rejections.
 
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer)$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_address_(srv|buffer_srv)_' -V`

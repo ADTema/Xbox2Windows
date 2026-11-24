@@ -1,5 +1,5 @@
-// Pure validation and offset/GPU-address resolution for buffer and raytracing
-// acceleration-structure memory SRVs (device slot 70).
+// Pure validation and offset resolution for buffer memory SRVs (device slot 70).
+// Acceleration-structure views are not handled here.
 #pragma once
 
 #include <d3d12.h>
@@ -7,8 +7,6 @@
 #include <cstdint>
 
 namespace x2w_startup {
-
-constexpr std::uint32_t srv_dimension_rt_acceleration_structure = 11;
 
 // Byte size of a single element for typed buffer SRVs; 0 when unknown or invalid for typed buffers.
 inline std::uint32_t typed_buffer_format_bytes(DXGI_FORMAT format)
@@ -90,7 +88,9 @@ inline std::uint32_t buffer_srv_element_bytes(const D3D12_SHADER_RESOURCE_VIEW_D
         return 4;
     }
     if (v.Buffer.StructureByteStride != 0) {
-        if (v.Format != DXGI_FORMAT_UNKNOWN || v.Buffer.StructureByteStride > 2048) return 0;
+        if (v.Format != DXGI_FORMAT_UNKNOWN || v.Buffer.StructureByteStride > 2048 ||
+            v.Buffer.StructureByteStride % 4 != 0)
+            return 0;
         return v.Buffer.StructureByteStride;
     }
     return typed_buffer_format_bytes(v.Format);
@@ -99,10 +99,6 @@ inline std::uint32_t buffer_srv_element_bytes(const D3D12_SHADER_RESOURCE_VIEW_D
 inline bool supports_buffer_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
     if (!valid_buffer_resource_desc(r)) return false;
-    if (static_cast<std::uint32_t>(v.ViewDimension) == srv_dimension_rt_acceleration_structure) {
-        return v.Format == DXGI_FORMAT_UNKNOWN &&
-               v.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    }
     const std::uint32_t elem_bytes = buffer_srv_element_bytes(v);
     if (!elem_bytes) return false;
     const std::uint64_t total_elements = r.Width / elem_bytes;
@@ -128,28 +124,6 @@ inline bool resolve_buffer_srv_desc(std::uint64_t buffer_title_base, std::uint64
         return false;
     resolved = view;
     resolved.Buffer.FirstElement = adjusted_first;
-    return true;
-}
-
-inline bool resolve_rt_as_srv_desc(std::uint64_t buffer_title_base, std::uint64_t buffer_width,
-                                   D3D12_GPU_VIRTUAL_ADDRESS buffer_gpu_base, std::uint64_t address,
-                                   std::uint64_t view_width, const D3D12_SHADER_RESOURCE_VIEW_DESC& view,
-                                   D3D12_SHADER_RESOURCE_VIEW_DESC& resolved)
-{
-    constexpr std::uint64_t alignment = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
-    if (static_cast<std::uint32_t>(view.ViewDimension) != srv_dimension_rt_acceleration_structure ||
-        view.Format != DXGI_FORMAT_UNKNOWN ||
-        view.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)
-        return false;
-    if (!buffer_title_base || !buffer_gpu_base || address < buffer_title_base || !view_width) return false;
-    if (address % alignment != 0) return false;
-    const std::uint64_t offset = address - buffer_title_base;
-    if (offset >= buffer_width || view_width > buffer_width - offset) return false;
-    if (offset > UINT64_MAX - buffer_gpu_base) return false;
-    const D3D12_GPU_VIRTUAL_ADDRESS gpu_location = buffer_gpu_base + offset;
-    if (gpu_location % alignment != 0) return false;
-    resolved = view;
-    resolved.RaytracingAccelerationStructure.Location = gpu_location;
     return true;
 }
 

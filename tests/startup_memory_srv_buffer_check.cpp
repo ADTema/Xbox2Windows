@@ -64,15 +64,6 @@ D3D12_SHADER_RESOURCE_VIEW_DESC typed_view(DXGI_FORMAT format, UINT64 first_elem
     return v;
 }
 
-D3D12_SHADER_RESOURCE_VIEW_DESC rt_as_view(DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN)
-{
-    D3D12_SHADER_RESOURCE_VIEW_DESC v{};
-    v.Format = format;
-    v.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(x2w_startup::srv_dimension_rt_acceleration_structure);
-    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    return v;
-}
-
 }  // namespace
 
 int main()
@@ -108,6 +99,8 @@ int main()
     auto str_bad_fmt = str_ok;
     str_bad_fmt.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     check("structured bad format", !x2w_startup::supports_buffer_memory_srv(buf, str_bad_fmt));
+    check("structured stride not multiple of 4", !x2w_startup::supports_buffer_memory_srv(buf, structured_view(0, 1, 6)));
+    check("structured stride 4 ok", x2w_startup::supports_buffer_memory_srv(buf, structured_view(0, 1, 4)));
     check("structured stride too large", !x2w_startup::supports_buffer_memory_srv(buf, structured_view(0, 1, 2052)));
     check("structured resolve interior",
           x2w_startup::resolve_buffer_srv_desc(0x10000, 1024, 0x10020, str_ok, resolved) &&
@@ -138,24 +131,7 @@ int main()
     denied_buf.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
     check("denied srv flag", !x2w_startup::supports_buffer_memory_srv(denied_buf, raw_ok));
 
-    // Raytracing acceleration structure SRV validation and GPU VA mapping.
-    const auto as_ok = rt_as_view();
-    check("rt as valid", x2w_startup::supports_buffer_memory_srv(buf, as_ok));
-    check("rt as bad format", !x2w_startup::supports_buffer_memory_srv(buf, rt_as_view(DXGI_FORMAT_R32_TYPELESS)));
-    check("rt as resolve base",
-          x2w_startup::resolve_rt_as_srv_desc(0x10000, 1024, 0x80000000ull, 0x10000, 256, as_ok, resolved) &&
-              resolved.RaytracingAccelerationStructure.Location == 0x80000000ull);
-    check("rt as resolve aligned interior",
-          x2w_startup::resolve_rt_as_srv_desc(0x10000, 1024, 0x80000000ull, 0x10100, 256, as_ok, resolved) &&
-              resolved.RaytracingAccelerationStructure.Location == 0x80000100ull);
-    check("rt as unaligned address",
-          !x2w_startup::resolve_rt_as_srv_desc(0x10000, 1024, 0x80000000ull, 0x10080, 256, as_ok, resolved));
-    check("rt as unaligned gpu base",
-          !x2w_startup::resolve_rt_as_srv_desc(0x10000, 1024, 0x80000080ull, 0x10000, 256, as_ok, resolved));
-    check("rt as oob",
-          !x2w_startup::resolve_rt_as_srv_desc(0x10000, 1024, 0x80000000ull, 0x10300, 512, as_ok, resolved));
-
     if (failures) return 1;
-    std::printf("slot 70 buffer and rt-as memory SRV validation: all checks passed\n");
+    std::printf("slot 70 buffer memory SRV validation: all checks passed\n");
     return 0;
 }

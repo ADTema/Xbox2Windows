@@ -9609,17 +9609,15 @@ array size, mips, layout, flags, alignment and sample count and quality; view di
 component mapping, with the mip, plane and array fields for 2D and 2D-array views and the first
 element, count, stride and flags for buffer views (any other dimension prints its six raw words);
 the destination handle and whether it is a descriptor of a known CBV/SRV/UAV heap; the address and
-whether its first byte is readable. Textures (2D) and buffers are supported, plus raytracing acceleration-structure views on adapters that
-report raytracing support (see "Buffer and raytracing acceleration-structure memory SRVs" in
-`docs/startup-runtime.md`). A buffer view must name a live placed or committed buffer, with a raw,
-structured (stride up to 2048) or typed format; typed element sizes come from the format, and formats
+whether its first byte is readable. Textures (2D) and buffers are supported (see "Buffer memory SRVs" in
+`docs/startup-runtime.md`); acceleration-structure views are refused. A buffer view must name a live placed or committed buffer, with a raw,
+structured (stride a multiple of 4, up to 2048) or typed format; typed element sizes come from the format, and formats
 that cannot back a typed buffer SRV (sRGB, block-compressed, depth/stencil, typeless, BGRA) are refused
-with `unsupported_description`. An acceleration-structure view on an adapter without raytracing is
-refused with `raytracing_unsupported`. Translated draws bind typed buffer views with the format's
+with `unsupported_description`. Translated draws bind typed buffer views with the format's
 element size and stride.
 
 `startup_memory_srv_report` compares the line field by field for buffer, acceleration-structure
-and array views and for unreadable arguments. `startup_address_srv_hardware` and
+(refused) and array views and for unreadable arguments. `startup_address_srv_hardware` and
 `startup_address_srv_warp` also match the five lines of their refused calls (zero address, other
 width, interior address, a buffer view, a destination off the heap) and show the descriptor unchanged.
 

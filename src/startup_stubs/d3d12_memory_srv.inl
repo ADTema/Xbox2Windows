@@ -214,31 +214,6 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         return;
     }
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        if (static_cast<std::uint32_t>(input->view.ViewDimension) == x2w_startup::srv_dimension_rt_acceleration_structure) {
-            D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5{};
-            if (FAILED(device_of(self)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opts5, sizeof(opts5))) ||
-                opts5.RaytracingTier == D3D12_RAYTRACING_TIER_NOT_SUPPORTED) {
-                if (first_calls(refused, 8))
-                    log_refused_memory_srv("raytracing acceleration structure views are not supported on this adapter",
-                                           "raytracing_unsupported", resource, input, destination);
-                return;
-            }
-            Wrapper* buffer = existing_memory_buffer(self, input->address, resource->Width);
-            const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
-            auto* desktop_res = buffer ? static_cast<ID3D12Resource*>(buffer->own().real) : nullptr;
-            D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
-            if (!buffer || !info || !desktop_res ||
-                !x2w_startup::resolve_rt_as_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
-                                                     info->console.Width, desktop_res->GetGPUVirtualAddress(),
-                                                     input->address, resource->Width, input->view, adjusted)) {
-                if (first_calls(refused, 8))
-                    log_refused_memory_srv("unavailable buffer at the supplied address", "buffer_unavailable",
-                                           resource, input, destination);
-                return;
-            }
-            view_slot<18, 2>(self, 0, reinterpret_cast<u64>(&adjusted), destination, 0);
-            return;
-        }
         const u64 elem_bytes = x2w_startup::buffer_srv_element_bytes(input->view);
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
