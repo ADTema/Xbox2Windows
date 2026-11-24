@@ -2386,11 +2386,7 @@ def lds_controls():
             lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
-def ds_binary(directory, assembler, objcopy, library):
-    cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES + LDS_STRIDED_CASES
-    cases += LDS_WIDE_REPLACEMENT_CASES
-    cases += LDS_QWORD_CASES
-    cases += LDS_FLOAT_CASES
+def gfx1030_binary(directory, assembler, objcopy, library, cases, prefix):
     for name, lines, binding in cases:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -2400,16 +2396,24 @@ def ds_binary(directory, assembler, objcopy, library):
         code = raw.read_bytes()
         decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=b"gfx1030",
                                           features=DS_FEATURES.encode()))
-        assert [line for line in decoded if line.startswith("ds_")] == [
-            line for line in lines if line.startswith("ds_")]
+        assert [line for line in decoded if line.startswith(prefix)] == [
+            line for line in lines if line.startswith(prefix)]
         expected = aot.lower(lines, 32, **binding)
         assert aot.lower(decoded, 32, **binding) == expected
-        container, output = directory / "ds.dxbc", directory / "ds-cli.hlsl"
+        container, output = directory / f"{name}.dxbc", directory / f"{name}-cli.hlsl"
         container.write_bytes(store_container(code, (32, 1, 1)))
         options = [item for key, value in binding.items() for item in ("--" + key.replace("_", "-"), str(value))]
         subprocess.run([sys.executable, "-B", aot.__file__, container, "--output", output,
                         "--llvm", library, *options], check=True)
         assert output.read_text() == expected
+
+
+def ds_binary(directory, assembler, objcopy, library):
+    cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES + LDS_STRIDED_CASES
+    cases += LDS_WIDE_REPLACEMENT_CASES
+    cases += LDS_QWORD_CASES
+    cases += LDS_FLOAT_CASES
+    gfx1030_binary(directory, assembler, objcopy, library, cases, "ds_")
 
 
 def ds_mutants(name, lines, binding, source):
@@ -2686,6 +2690,8 @@ def binary(directory, assembler, objcopy, library):
     ds_controls()
     lds_controls()
     ds_binary(directory, assembler, objcopy, library)
+    mtbuf_load_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, MTBUF_LOAD_CASES, "tbuffer_")
     two_exits(directory, assembler, objcopy, library)
     for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
@@ -2887,6 +2893,69 @@ def draw_guard(directory, compiler, cmd, case, name):
 def source_word(i):
     """t0 as the harness fills it: 320 known words, then 320 sentinel words."""
     return (0x8b02a7f1 + i * 0x413b1) & 0xffffffff if i < 320 else SENTINEL
+
+
+MTBUF_LOAD = "tbuffer_load_format_x v10, v8, s[16:19], 0 format:[BUF_FMT_32_UINT] idxen offset:4"
+MTBUF_LOAD_CASES = [("mtbuf_load_x", [
+    "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+    "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+    "s_load_dwordx4 s[16:19], s[12:13], 0x40",
+    "v_lshl_add_u32 v8, s11, 5, v0", "s_waitcnt lgkmcnt(0)",
+    MTBUF_LOAD, "s_waitcnt vmcnt(0)",
+    "buffer_store_dword v10, v8, s[20:23], 0 idxen offset:4", "s_endpgm",
+], DS_BINDING | {"stride": 8, "source_descriptor": 0x40, "source_stride": 12})]
+
+
+def mtbuf_load_controls():
+    _, lines, binding = MTBUF_LOAD_CASES[0]
+    for old, new, diagnostic in (
+        ("BUF_FMT_32_UINT", "BUF_FMT_32_FLOAT", "Unsupported compute instruction"),
+        (" format:[BUF_FMT_32_UINT]", "", "Unsupported compute instruction"),
+        (" offset:4", " offset:4 glc", "Unsupported compute instruction"),
+        ("], 0 format:", "], s13 format:", "Unsupported compute instruction"),
+        ("idxen offset:4", "offen offset:4", "Unsupported typed buffer read target or address mode"),
+        ("v10, v8", "v10, v0", "Unsupported read address"),
+        ("s[16:19]", "s[20:23]", "Reads from the stored UAV"),
+        ("offset:4", "offset:2", "Unverified read offset"),
+        ("offset:4", "offset:12", "Read leaves its source element"),
+    ):
+        rejects(diagnostic, aot.lower, [line.replace(old, new) if line == MTBUF_LOAD else line for line in lines],
+                32, **binding)
+    rejects("before s_waitcnt vmcnt(0)", aot.lower, variant(lines, ("s_waitcnt vmcnt(0)", "")), 32, **binding)
+    rejects("Unverified buffer read descriptor", aot.lower,
+            variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
+    rejects("Unsupported read address", aot.lower, lines, 32, **(binding | {"source_stride": None}))
+    rejects("Unsupported typed buffer read target", aot.lower, lines, 32, **(binding | {"cpu": "gfx1013"}))
+
+
+def mtbuf_load_draw(directory, compiler, renderer, backend):
+    mtbuf_load_controls()
+    for name, lines, binding in MTBUF_LOAD_CASES:
+        src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        subprocess.run(compile, check=True)
+        run = [renderer, backend, "--compute-store-case", cso, case]
+        for groups in (1, 3):
+            words = [SENTINEL] * 320
+            for gid in range(32 * groups):
+                words[2 * gid + 1] = source_word(3 * gid + 1)
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        # Stride 8 still admits the aligned read. Only lanes after lane 0 expose the error.
+        src.write_text(aot.lower(lines, 32, **(binding | {"source_stride": 8})), encoding="ascii")
+        subprocess.run(compile, check=True)
+        bad = subprocess.run(run, capture_output=True, text=True)
+        if bad.returncode != 1 or "word=3 expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: incorrect source stride escaped detection\n{bad.stderr}")
+        print(bad.stderr, end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("tbuffer_load_format_x\n", encoding="utf-8")
+    return 0
 
 
 def read_words(name, groups, bound):
@@ -3371,6 +3440,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
+                 "draw-mtbuf-load": mtbuf_load_draw,
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
                  "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),
