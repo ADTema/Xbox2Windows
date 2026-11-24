@@ -668,11 +668,22 @@ foreach(adapter IN ITEMS warp hardware)
 endforeach()
 target_compile_features(offscreen_check PRIVATE cxx_std_17)
 # Link the production placement index into this fixture without adding a DLL export.
-target_sources(offscreen_check PRIVATE src/startup_stubs/d3d12_xs_device.cpp)
 set_property(SOURCE src/startup_stubs/d3d12_xs_device.cpp APPEND PROPERTY COMPILE_OPTIONS /bigobj)
+set(OFFSCREEN_AGILITY_620_DIR "" CACHE PATH "Agility SDK 1.620.2 x64 DLL directory for debug validation")
+# offscreen_check and cpu_placed_dxr_provider compile this file with the same flags (default CRT, the
+# desktop SDK headers), so they link one object set instead of compiling the 3,400-line file twice.
+# With OFFSCREEN_AGILITY_620_DIR the fixture compiles against the Agility headers instead: it keeps its
+# own copy below and the provider keeps its own. d3d12_xs_shim uses the static CRT and is not shared.
+if(NOT OFFSCREEN_AGILITY_620_DIR)
+    add_library(d3d12_xs_device_obj OBJECT src/startup_stubs/d3d12_xs_device.cpp)
+    target_include_directories(d3d12_xs_device_obj PRIVATE src)
+    target_compile_features(d3d12_xs_device_obj PRIVATE cxx_std_17)
+    target_sources(offscreen_check PRIVATE $<TARGET_OBJECTS:d3d12_xs_device_obj>)
+else()
+    target_sources(offscreen_check PRIVATE src/startup_stubs/d3d12_xs_device.cpp)
+endif()
 target_link_libraries(offscreen_check PRIVATE d3d12 dxgi dxguid d3dcompiler user32 gdi32)
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-set(OFFSCREEN_AGILITY_620_DIR "" CACHE PATH "Agility SDK 1.620.2 x64 DLL directory for debug validation")
 if(OFFSCREEN_AGILITY_620_DIR)
     if(EXISTS "${OFFSCREEN_AGILITY_620_DIR}/sdk.nupkg")
         set(agility_headers "${CMAKE_CURRENT_BINARY_DIR}/agility-headers")
@@ -5106,8 +5117,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         DEPENDS cpu_shim_startup tests/cpu/translate_shim_startup.py tools/cpu_switch_aot.py
             tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
     add_library(cpu_placed_dxr_provider SHARED tests/cpu/placed_dxr_provider.cpp tests/dxr_check.cpp
-        tests/desktop_gpu.cpp src/era_title_va.cpp src/startup_stubs/d3d12_xs_device.cpp
+        tests/desktop_gpu.cpp src/era_title_va.cpp
         "${ray_header}" "${ray_pipeline_header}" "${candidates_header}" "${candidates_pipeline_header}")
+    if(TARGET d3d12_xs_device_obj)
+        target_sources(cpu_placed_dxr_provider PRIVATE $<TARGET_OBJECTS:d3d12_xs_device_obj>)
+    else()
+        target_sources(cpu_placed_dxr_provider PRIVATE src/startup_stubs/d3d12_xs_device.cpp)
+    endif()
     target_include_directories(cpu_placed_dxr_provider PRIVATE tests src "${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(cpu_placed_dxr_provider PRIVATE d3d12 dxgi dxguid d3dcompiler user32 gdi32)
     target_compile_features(cpu_placed_dxr_provider PRIVATE cxx_std_17)
