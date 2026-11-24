@@ -3798,6 +3798,31 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_avx_scalar_fp COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/avx_scalar_fp.py"
         check "$<TARGET_FILE:cpu_avx_scalar_fp>" "$<TARGET_FILE:cpu_avx_scalar_fp_lifted>")
     set_tests_properties(cpu_aot_avx_scalar_fp PROPERTIES SKIP_RETURN_CODE 77)
+    cpu_asm_fixture(cpu_vex_parity vex_parity)
+    # The lifted DLL, an explicit /O2 build, and two mutated controls (stalepf, swap) that must mismatch.
+    set(vex_parity_control_files "")
+    foreach(variant IN ITEMS lifted stalepf swap)
+        set(vex_parity_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_vex_parity_${variant}.cpp")
+        add_custom_command(OUTPUT "${vex_parity_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vex_parity.py"
+                emit "$<TARGET_FILE:cpu_vex_parity>" "${vex_parity_fixture}" ${variant}
+            DEPENDS cpu_vex_parity tests/cpu/vex_parity.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_vex_parity_${variant} SHARED "${vex_parity_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND vex_parity_control_files "$<TARGET_FILE:cpu_vex_parity_${variant}>")
+        endif()
+    endforeach()
+    set(vex_parity_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_vex_parity_lifted_o2.dll")
+    add_custom_command(OUTPUT "${vex_parity_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /EHsc /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_vex_parity_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_vex_parity_lifted_o2.obj" "/Fe${vex_parity_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_vex_parity_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_vex_parity_lifted_o2 ALL DEPENDS "${vex_parity_o2}")
+    add_test(NAME cpu_aot_vex_parity COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vex_parity.py"
+        check "$<TARGET_FILE:cpu_guarded_call>" "$<TARGET_FILE:cpu_vex_parity>"
+        "$<TARGET_FILE:cpu_vex_parity_lifted>" "${vex_parity_o2}" ${vex_parity_control_files})
+    set_tests_properties(cpu_aot_vex_parity PROPERTIES SKIP_RETURN_CODE 77)
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
