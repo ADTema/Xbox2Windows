@@ -111,6 +111,14 @@ print(f"dstorage page-array control: exit={run.returncode} {'ok' if ok else 'MIS
 if not ok:
     failures.append(f"dstorage page-array control: exit {run.returncode}, stdout {run.stdout.strip()!r}")
 
+# File::GetFileInformation after Close returns ERROR_INVALID_HANDLE, with the trap log unset and set.
+run = subprocess.run([consumer, "dstorage-file-information"], capture_output=True, text=True, env=env, timeout=20)
+print(run.stdout.strip())
+ok = run.returncode == 0 and "dstorage-file-information ok" in run.stdout and "x2w-trap" not in run.stderr
+print(f"dstorage file-information control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+if not ok:
+    failures.append(f"dstorage file-information control: exit {run.returncode}, stdout {run.stdout.strip()!r}")
+
 if failures:
     print("FAIL")
     for f in failures:
