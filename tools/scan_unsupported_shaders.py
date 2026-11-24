@@ -347,6 +347,12 @@ KNOWN_RDNA2_BASE_OPCODES = {
 }
 
 
+# Scalar-memory store, cache-control, timer and probe forms the disassembler decodes: recognition only, no lowering.
+KNOWN_RDNA2_BASE_OPCODES |= {
+    "s_buffer_store_dword", "s_buffer_store_dwordx2", "s_buffer_store_dwordx4", "s_gl1_inv", "s_dcache_inv",
+    "s_dcache_wb", "s_memtime", "s_memrealtime", "s_atc_probe", "s_atc_probe_buffer",
+}
+
 # Scalar program-control and compare-immediate forms the disassembler decodes: recognition only, no lowering.
 KNOWN_RDNA2_BASE_OPCODES |= {
     "s_wakeup", "s_setkill", "s_sethalt", "s_sendmsg", "s_sendmsghalt", "s_icache_inv", "s_incperflevel",
