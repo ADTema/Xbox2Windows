@@ -1,8 +1,8 @@
-// Loads the built xgameruntime.dll from its fixture-only directory, resolves
-// every thunk in the public table, calls each one, and checks the shim's
-// deterministic call log. It also rejects a DLL elsewhere or a copy in the
-// normal shim directory. The unknown-export lookup is a negative control: a
-// missing export returns null, while a present skeleton thunk returns E_NOTIMPL.
+// Loads the built xgameruntime.dll from its fixture-only directory, checks the
+// seven explicit stub exports retained from the skeleton, and validates the
+// deterministic E_NOTIMPL call log. It also rejects a DLL elsewhere or a copy
+// in the normal shim directory. The unknown-export lookup is a negative
+// control: a missing export returns null.
 #include <array>
 #include <cstddef>
 #include <cstdint>

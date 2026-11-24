@@ -1664,6 +1664,26 @@ def f16_cvt_int_result(signed, value):
     return sign | ((top + 15) << 10) | (count & 0x3ff)
 
 
+def f16_to_int_result(signed, bits):
+    """Low 16 bits of v_cvt_i16_f16 (signed) or v_cvt_u16_f16 of a finite binary16 value, or None when the result is not
+    in range.
+
+    LLVM 15.0.7 VOP1Instructions.td L436-437 selects fp_to_sint and fp_to_uint, and AMD RDNA 2 section 12.8 (VOP1 entries
+    82 and 83) specifies truncation toward zero. The range check applies to the truncated integer: -32768 to 32767 for
+    the signed op, 0 to 65535 for the unsigned one, so -0.5 truncates to 0 and is valid for both, while -1 is out of range
+    for the unsigned op. Exact integer arithmetic on the operand in units of 2^-24, used at translation time. The result
+    is the two's-complement low half; a non-finite operand is an error because the caller requires a finite proof first.
+    """
+    exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+    if exponent == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {bits:#06x}")
+    units = mantissa if exponent == 0 else (mantissa | 0x400) << (exponent - 1)
+    value = -(units >> 24) if bits & 0x8000 else units >> 24
+    if not (-0x8000 <= value <= 0x7fff if signed else 0 <= value <= 0xffff):
+        return None
+    return value & 0xffff
+
+
 def int16_known_value(token, scalar, vector, known_ssa_bits):
     """Low 16 bits of a 16-bit integer source whose value is statically known, else None.
 
@@ -4932,6 +4952,32 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector[dst] = ("half16", f"alu{i}")
             if result is not None:
                 known_half[f"alu{i}"] = result
+        elif m := match(r"v_cvt_(i16|u16)_f16(_e32|_e64)? (v\d+), ([^,\s]+)"):
+            # Binary16 to integer (issue #839): LLVM 15.0.7 VOP1Instructions.td L436-437 selects fp_to_sint and fp_to_uint,
+            # and AMD RDNA 2 section 12.8 (VOP1 entries 82 and 83) specifies truncation toward zero. The source must be a
+            # statically proven finite low half under the declared entry profile (half16_arith_source), and the truncated
+            # integer must lie in the destination range (f16_to_int_result), so the lowering needs no NaN, infinity or
+            # saturation rule. The half is widened exactly and truncated in binary32, which is exact. The result is
+            # ("low16", alu): bits 15:0 are the two's-complement integer, bits 31:16 are unspecified, so the audited 16-bit
+            # integer readers read it and the binary16 readers refuse it. Modifiers, clamp and omod never match the
+            # anchored operands.
+            kind, encoding, dst, token = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 to integer conversion operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            word, proven = half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            if f16_to_int_result(kind == "i16", proven) is None:
+                raise ValueError(f"binary16 value out of range: v_cvt_{kind}_f16")
+            lines.append(f"    uint hf{i}_0 = ({word}) & 0xffffu;")
+            lines.append(f"    precise float hs{i} = widen16(hf{i}_0);")
+            lines.append(f"    int cv{i}_0 = int(trunc(hs{i}));")
+            lines.append(f"    precise float alu{i} = asfloat(asuint(cv{i}_0) & 0xffffu);")
+            vector[dst] = ("low16", f"alu{i}")
         elif m := match(r"v_cvt_off_f32_i4(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
             # Bits 3:0 of the source as a signed nibble in units of 1/16, so 0x7 gives 0.4375
             # and 0x8 gives -0.5. The source is read as bits, so float modifiers do not apply.

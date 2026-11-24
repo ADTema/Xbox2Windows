@@ -382,8 +382,14 @@ SMEM_WIDTHS = {
 MIMG_OPS = {
     0x00: ("image_load", False, 0),
     0x01: ("image_load_mip", False, 1),
+    0x02: ("image_load_pck", False, 0),
+    0x03: ("image_load_pck_sgn", False, 0),
+    0x04: ("image_load_mip_pck", False, 1),
+    0x05: ("image_load_mip_pck_sgn", False, 1),
     0x08: ("image_store", False, 0),
     0x09: ("image_store_mip", False, 1),
+    0x0a: ("image_store_pck", False, 0),
+    0x0b: ("image_store_mip_pck", False, 1),
     0x0e: ("image_get_resinfo", False, 0),
     0x0f: ("image_atomic_swap", False, 0),
     0x10: ("image_atomic_cmpswap", False, 0),
@@ -404,23 +410,106 @@ MIMG_OPS = {
     0x20: ("image_sample", True, 0),
     0x21: ("image_sample_cl", True, 1),
     0x22: ("image_sample_d", True, 0),
+    0x23: ("image_sample_d_cl", True, 1),
     0x24: ("image_sample_l", True, 1),
     0x25: ("image_sample_b", True, 1),
     0x26: ("image_sample_b_cl", True, 2),
     0x27: ("image_sample_lz", True, 0),
     0x28: ("image_sample_c", True, 1),
+    0x29: ("image_sample_c_cl", True, 2),
+    0x2a: ("image_sample_c_d", True, 1),
+    0x2b: ("image_sample_c_d_cl", True, 2),
     0x2c: ("image_sample_c_l", True, 2),
     0x2d: ("image_sample_c_b", True, 2),
+    0x2e: ("image_sample_c_b_cl", True, 3),
     0x2f: ("image_sample_c_lz", True, 1),
     0x30: ("image_sample_o", True, 1),
+    0x31: ("image_sample_cl_o", True, 2),
+    0x32: ("image_sample_d_o", True, 1),
+    0x33: ("image_sample_d_cl_o", True, 2),
     0x34: ("image_sample_l_o", True, 2),
     0x35: ("image_sample_b_o", True, 2),
+    0x36: ("image_sample_b_cl_o", True, 3),
     0x37: ("image_sample_lz_o", True, 1),
+    0x38: ("image_sample_c_o", True, 2),
+    0x39: ("image_sample_c_cl_o", True, 3),
+    0x3a: ("image_sample_c_d_o", True, 2),
+    0x3b: ("image_sample_c_d_cl_o", True, 3),
+    0x3c: ("image_sample_c_l_o", True, 3),
+    0x3d: ("image_sample_c_b_o", True, 3),
+    0x3e: ("image_sample_c_b_cl_o", True, 4),
+    0x3f: ("image_sample_c_lz_o", True, 2),
     0x40: ("image_gather4", True, 0),
+    0x41: ("image_gather4_cl", True, 1),
     0x44: ("image_gather4_l", True, 1),
+    0x45: ("image_gather4_b", True, 1),
+    0x46: ("image_gather4_b_cl", True, 2),
     0x47: ("image_gather4_lz", True, 0),
+    0x48: ("image_gather4_c", True, 1),
+    0x49: ("image_gather4_c_cl", True, 2),
+    0x4c: ("image_gather4_c_l", True, 2),
+    0x4d: ("image_gather4_c_b", True, 2),
+    0x4e: ("image_gather4_c_b_cl", True, 3),
+    0x4f: ("image_gather4_c_lz", True, 1),
+    0x50: ("image_gather4_o", True, 1),
+    0x51: ("image_gather4_cl_o", True, 2),
+    0x54: ("image_gather4_l_o", True, 2),
+    0x55: ("image_gather4_b_o", True, 2),
+    0x56: ("image_gather4_b_cl_o", True, 3),
+    0x57: ("image_gather4_lz_o", True, 1),
+    0x58: ("image_gather4_c_o", True, 2),
+    0x59: ("image_gather4_c_cl_o", True, 3),
+    0x5c: ("image_gather4_c_l_o", True, 3),
+    0x5d: ("image_gather4_c_b_o", True, 3),
+    0x5e: ("image_gather4_c_b_cl_o", True, 4),
+    0x5f: ("image_gather4_c_lz_o", True, 2),
     0x60: ("image_get_lod", True, 0),
+    0x68: ("image_sample_cd", True, 0),
+    0x69: ("image_sample_cd_cl", True, 1),
+    0x6a: ("image_sample_c_cd", True, 1),
+    0x6b: ("image_sample_c_cd_cl", True, 2),
+    0x6c: ("image_sample_cd_o", True, 1),
+    0x6d: ("image_sample_cd_cl_o", True, 2),
+    0x6e: ("image_sample_c_cd_o", True, 2),
+    0x6f: ("image_sample_c_cd_cl_o", True, 3),
+    0x80: ("image_msaa_load", False, 0),
+    0xa2: ("image_sample_d_g16", True, 0),
+    0xa3: ("image_sample_d_cl_g16", True, 1),
+    0xaa: ("image_sample_c_d_g16", True, 1),
+    0xab: ("image_sample_c_d_cl_g16", True, 2),
+    0xb2: ("image_sample_d_o_g16", True, 1),
+    0xb3: ("image_sample_d_cl_o_g16", True, 2),
+    0xba: ("image_sample_c_d_o_g16", True, 2),
+    0xbb: ("image_sample_c_d_cl_o_g16", True, 3),
+    0xe8: ("image_sample_cd_g16", True, 0),
+    0xe9: ("image_sample_cd_cl_g16", True, 1),
+    0xea: ("image_sample_c_cd_g16", True, 1),
+    0xeb: ("image_sample_c_cd_cl_g16", True, 2),
+    0xec: ("image_sample_cd_o_g16", True, 1),
+    0xed: ("image_sample_cd_cl_o_g16", True, 2),
+    0xee: ("image_sample_c_cd_o_g16", True, 2),
+    0xef: ("image_sample_c_cd_cl_o_g16", True, 3),
 }
+
+# Sampling ops whose address carries explicit derivatives (the _d and _cd families).
+MIMG_DERIV_OPS = frozenset({
+    0x22, 0x23, 0x2a, 0x2b, 0x32, 0x33, 0x3a, 0x3b,
+    0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f,
+})
+# The _g16 forms take packed 16-bit derivatives: address dwords per dimension code.
+MIMG_G16_DERIV_OPS = frozenset({
+    0xa2, 0xa3, 0xaa, 0xab, 0xb2, 0xb3, 0xba, 0xbb,
+    0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
+})
+MIMG_G16_DERIV_ADDRS = (2, 2, 4, 2, 2, 2, 2, 2)
+
+# Ray-intersection ops: opcode -> (name, address dwords, address dwords with a16).
+MIMG_BVH_OPS = {
+    0xe6: ("image_bvh_intersect_ray", 11, 8),
+    0xe7: ("image_bvh64_intersect_ray", 12, 9),
+}
+# Word 0 of a BVH op with the opcode field masked out (r128, unorm and dmask 0xf are implied).
+MIMG_BVH_W0 = 0xf0009f01
 
 MIMG_DIMS = {
     0: ("SQ_RSRC_IMG_1D", 1, 2),
@@ -1701,6 +1790,42 @@ def _decode_interp_f16(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
     return (8, name, asm, comment)
 
 
+def _packed_addr_regs(count: int) -> int:
+    """Registers LLVM 15 prints for a packed (non-NSA) MIMG address of count dwords.
+
+    LLVM 15 has no tuple class for 9 to 15 registers and prints those as 16, so the printed tuple is wider than the
+    number of address dwords the instruction consumes.
+    """
+    return count if count <= 8 else 16
+
+
+def _decode_mimg_bvh(op: int, w0: int, w1: int, length: int, data: bytes = b"",
+                     offset: int = 0) -> tuple[int, str, str, str]:
+    """Decode image_bvh_intersect_ray and image_bvh64_intersect_ray.
+
+    The hardware fixes every modifier field of these ops except the non-sequential-address length in w0[2:1], so
+    anything else is reported as unsupported with the record length intact. A non-sequential-address form lists
+    one VGPR per address dword, the first from the instruction word and the rest from the appended bytes.
+    """
+    op_name, addr_dwords, addr_dwords_a16 = MIMG_BVH_OPS[op]
+    a16 = (w1 >> 30) & 1
+    if (w0 & ~((0x7f << 18) | 0x6)) != MIMG_BVH_W0 or (w1 >> 31) or (w1 >> 21) & 0x1f:
+        return (length, f"{op_name}_unsupported", f"{op_name} <unsupported MIMG modifier bits>",
+                "Modifier bits the ray-intersection encoding does not allow")
+    vaddr = w1 & 0xff
+    vdata = (w1 >> 8) & 0xff
+    srsrc = ((w1 >> 16) & 0x1f) * 4
+    count = addr_dwords_a16 if a16 else addr_dwords
+    if (w0 >> 1) & 0x3:
+        appended = list(data[offset + 8:offset + length])
+        vaddr_str = "[" + ", ".join(f"v{r}" for r in [vaddr] + appended[:count - 1]) + "]"
+    else:
+        vaddr_str = f"v[{vaddr}:{vaddr + _packed_addr_regs(count) - 1}]"
+    asm = (f"{op_name} v[{vdata}:{vdata + 3}], {vaddr_str}, "
+           f"s[{srsrc}:{srsrc + 3}]" + (" a16" if a16 else ""))
+    return (length, op_name, asm, "Ray-box and ray-triangle intersection against a BVH")
+
+
 def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
     """
     Decode one RDNA 2 instruction at given offset.
@@ -2034,14 +2159,21 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if offset + length > len(data):
             return (len(data) - offset, "mimg_truncated", "mimg <truncated>", "Incomplete MIMG instruction")
         w1, = struct.unpack_from("<I", data, offset + 4)
-        op = (w0 >> 18) & 0x7f
+        op = ((w0 >> 18) & 0x7f) | ((w0 & 1) << 7)
+        if op in MIMG_BVH_OPS:
+            return _decode_mimg_bvh(op, w0, w1, length, data, offset)
         op_name, has_sampler, extra_addrs = MIMG_OPS.get(op, (f"image_mimg_{op:02x}", False, 0))
         dmask = (w0 >> 8) & 0xf
         dim_code = (w0 >> 3) & 0x7
         dim_name, base_addrs, deriv_addrs = MIMG_DIMS[dim_code]
-        addr_count = base_addrs + extra_addrs + (deriv_addrs if op == 0x22 else 0)
+        if op in MIMG_G16_DERIV_OPS:
+            deriv_addrs = MIMG_G16_DERIV_ADDRS[dim_code]
+        elif op not in MIMG_DERIV_OPS:
+            deriv_addrs = 0
+        addr_count = base_addrs + extra_addrs + deriv_addrs
         d16 = (w1 >> 31) & 1
-        n_data = max(1, bin(dmask).count("1"))
+        # A gather returns the four texels of the selected component whatever the one-hot mask is.
+        n_data = 4 if op_name.startswith("image_gather4") else max(1, bin(dmask).count("1"))
         if d16:
             n_data = (n_data + 1) // 2
         vaddr0 = w1 & 0xff
@@ -2055,7 +2187,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             addrs = [vaddr0] + extra_bytes[:max(0, addr_count - 1)]
             vaddr_str = "[" + ", ".join(f"v{r}" for r in addrs) + "]"
         else:
-            vaddr_str = f"v{vaddr0}" if addr_count == 1 else f"v[{vaddr0}:{vaddr0 + addr_count - 1}]"
+            addr_regs = _packed_addr_regs(addr_count)
+            vaddr_str = f"v{vaddr0}" if addr_regs == 1 else f"v[{vaddr0}:{vaddr0 + addr_regs - 1}]"
         srsrc_width = 4 if r128 else 8
         srsrc_str = f"s[{srsrc}:{srsrc + srsrc_width - 1}]"
         operands = [vdata_str, vaddr_str, srsrc_str]

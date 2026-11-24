@@ -150,10 +150,10 @@ set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
 
-# Fixture-only desktop xgameruntime.dll skeleton. Every exported thunk is
-# generated from the single X-macro table in xgameruntime_shim.cpp and returns
-# E_NOTIMPL. Keep it out of the normal shim directory so a package cannot treat
-# the production-named DLL as a provider.
+# Fixture-only desktop xgameruntime.dll. The single X-macro table in
+# xgameruntime_shim.cpp distinguishes implemented synchronous contracts from
+# logged E_NOTIMPL stubs. Keep it out of the normal shim directory so a package
+# cannot treat the production-named DLL as a provider.
 add_library(xgameruntime_shim SHARED src/xgameruntime_shim.cpp src/xgameruntime_shim.def)
 set(xgameruntime_fixture_dir "${CMAKE_BINARY_DIR}/fixture-shims")
 set_target_properties(xgameruntime_shim PROPERTIES
@@ -171,6 +171,14 @@ add_test(NAME xgameruntime_thunks COMMAND xgameruntime_shim_check
     "$<TARGET_FILE_DIR:xmem_shim>")
 set_tests_properties(xgameruntime_thunks PROPERTIES TIMEOUT 30)
 
+add_executable(xgameruntime_contracts_check tests/xgameruntime_contracts_check.cpp)
+target_link_libraries(xgameruntime_contracts_check PRIVATE xgameruntime_shim)
+target_compile_features(xgameruntime_contracts_check PRIVATE cxx_std_17)
+add_test(NAME xgameruntime_contracts COMMAND xgameruntime_contracts_check
+    "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
+    "$<TARGET_FILE_DIR:xmem_shim>")
+set_tests_properties(xgameruntime_contracts PROPERTIES TIMEOUT 30)
+
 # A real source-built EXE import fixture. The import library below only names
 # xgameruntime.dll; no build product or test package copies the fixture DLL.
 set(xgameruntime_import_def "${CMAKE_CURRENT_SOURCE_DIR}/tests/xgameruntime_import.def")
@@ -186,6 +194,24 @@ target_compile_features(xgameruntime_preflight_exe PRIVATE cxx_std_17)
 target_compile_options(xgameruntime_preflight_exe PRIVATE /GS-)
 target_link_options(xgameruntime_preflight_exe PRIVATE /ENTRY:fixture_entry /NODEFAULTLIB
     /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+
+# pe_run_package --trap-callable fixtures. The import library only names trap_fixture.dll;
+# nothing builds or copies a DLL under that name. The _data variant adds a data import.
+set(trap_missing_import_def "${CMAKE_CURRENT_SOURCE_DIR}/tests/trap_missing_import.def")
+set(trap_missing_import_lib "${CMAKE_CURRENT_BINARY_DIR}/trap_missing_fixture_import.lib")
+add_custom_command(OUTPUT "${trap_missing_import_lib}"
+    COMMAND "${CMAKE_AR}" /nologo /machine:x64 "/def:${trap_missing_import_def}"
+            "/out:${trap_missing_import_lib}"
+    DEPENDS tests/trap_missing_import.def VERBATIM)
+foreach(target IN ITEMS trap_missing_exe trap_missing_data_exe)
+    add_executable(${target} tests/trap_missing_exe.cpp)
+    target_sources(${target} PRIVATE "${trap_missing_import_lib}")
+    target_link_libraries(${target} PRIVATE "${trap_missing_import_lib}" kernel32)
+    target_compile_options(${target} PRIVATE /GS-)
+    target_link_options(${target} PRIVATE /ENTRY:fixture_entry /NODEFAULTLIB
+        /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+endforeach()
+target_compile_definitions(trap_missing_data_exe PRIVATE TRAP_DATA_IMPORT)
 
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
@@ -450,6 +476,25 @@ add_test(NAME pso_root_signature_warp COMMAND pso_root_check)
 add_custom_target(pso_compute_headers DEPENDS
     "${CMAKE_CURRENT_BINARY_DIR}/pso_compute_embedded.h"
     "${CMAKE_CURRENT_BINARY_DIR}/pso_compute_stripped.h")
+foreach(stage IN ITEMS vs ps)
+    string(TOUPPER "${stage}" entry)
+    set(rect_header "${CMAKE_CURRENT_BINARY_DIR}/rectlist_${stage}.h")
+    add_custom_command(OUTPUT "${rect_header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${stage}_6_0 -E ${entry}Main -Vn rectlist_${stage}
+                -Fh "${rect_header}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/rectlist_quad.hlsl"
+        DEPENDS tests/rectlist_quad.hlsl VERBATIM)
+    set(rectlist_shader_${stage} "${rect_header}")
+endforeach()
+add_custom_target(rectlist_headers DEPENDS
+    "${rectlist_shader_vs}"
+    "${rectlist_shader_ps}")
+add_executable(rectlist_draw_check tests/rectlist_draw_check.cpp
+    "${rectlist_shader_vs}"
+    "${rectlist_shader_ps}")
+add_dependencies(rectlist_draw_check rectlist_headers)
+target_compile_features(rectlist_draw_check PRIVATE cxx_std_17)
+target_include_directories(rectlist_draw_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(rectlist_draw_check PRIVATE d3d12 dxgi)
 add_executable(d3d12_xs_shim_check tests/d3d12_xs_shim_check.cpp)
 add_dependencies(d3d12_xs_shim_check pso_compute_headers)
 target_link_libraries(d3d12_xs_shim_check PRIVATE d3d12_xs_shim dxgi)
@@ -459,8 +504,16 @@ foreach(scenario IN ITEMS exports serialize deserialize warp_root)
     add_test(NAME d3d12_xs_shim_${scenario} COMMAND d3d12_xs_shim_check ${scenario})
 endforeach()
 # D3D12XboxCreateDevice device-slot inventory and source-built creation fixture (#XCL-08).
-add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp)
+set(d3d12x_pso_header "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.h")
+add_custom_command(OUTPUT "${d3d12x_pso_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Qstrip_rootsignature -Vn d3d12x_pso_cs
+            -Fh "${d3d12x_pso_header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.cso"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_pso.hlsl"
+    DEPENDS tests/d3d12x_pso.hlsl
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.cso" VERBATIM)
+add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp "${d3d12x_pso_header}")
 add_dependencies(d3d12x_device_check d3d12_xs_shim)
+target_include_directories(d3d12x_device_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(d3d12x_device_check PRIVATE cxx_std_17)
 target_link_libraries(d3d12x_device_check PRIVATE d3d12 dxgi)
 foreach(adapter IN ITEMS warp hardware)
@@ -473,6 +526,14 @@ set_tests_properties(d3d12x_device_create_hardware d3d12x_device_negative_hardwa
     SKIP_RETURN_CODE 77)
 set_tests_properties(d3d12x_device_negative_warp d3d12x_device_negative_hardware PROPERTIES
     PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice: unsupported IID \\{7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01\\}")
+# Static-sampler root signature and compute PSO through D3D12XboxCreateDevice (#XCL-19).
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME d3d12x_pso_static_sampler_${adapter} COMMAND d3d12x_device_check
+        "$<TARGET_FILE:d3d12_xs_shim>" pso ${adapter})
+endforeach()
+add_test(NAME d3d12x_pso_reject_warp COMMAND d3d12x_device_check
+    "$<TARGET_FILE:d3d12_xs_shim>" reject warp)
+set_tests_properties(d3d12x_pso_static_sampler_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
 set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
 add_custom_command(OUTPUT "${vm_translation_header}"
@@ -1320,7 +1381,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "op_cvttps2pi_reg,op_cvttps2pi_mem,"
         "op_pshufw_reg_e4,op_pshufw_reg_1b,op_pshufw_reg_00,"
         "op_pshufw_reg_ff,op_pshufw_mem_4e,op_pshufw_mem_39,"
-        "op_movntq,op_movntq_disp,op_movq_gpr_bridge,op_discarded_read,op_pipeline")
+        "op_movntq,op_movntq_disp,op_movq_gpr_bridge,op_discarded_read,op_pipeline,"
+        "op_maskmovq,op_maskmovdqu,op_maskmov_pipeline")
     string(CONCAT cpu_sse_mmx_exports ${cpu_sse_mmx_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_sse_mmx_${variant} sse_mmx)
@@ -3676,6 +3738,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_exe_tls_slot0_enroll COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_tls_slot0_check.py" enroll "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_tls_slot0_enroll>" "$<TARGET_FILE:cpu_exe_tls_slot0_host>")
+    # pe_run_package starts the same /GA EXE as the package's main image; its log must equal the Windows launch.
+    add_test(NAME cpu_package_main_image COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/package_main_image_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_tls_slot0>")
+    set_tests_properties(cpu_package_main_image PROPERTIES TIMEOUT 60)
     # Lifecycle fixtures: two DLLs with the static MSVC runtime (B imports A) and a CRT-free event sink.
     add_library(cpu_life_sink SHARED tests/cpu/life_sink.cpp)
     target_compile_options(cpu_life_sink PRIVATE /GS- /Zl)
@@ -3799,6 +3866,26 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_acphal_hal_caller>" "$<TARGET_FILE:cpu_acphal_hal_provider>"
         "$<TARGET_FILE:cpu_acphal_hal_provider_faulty>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_acphal_hal PROPERTIES TIMEOUT 60)
+
+    add_library(cpu_gameinput_provider SHARED tests/cpu/gameinput_provider.cpp tests/cpu/gameinput_provider.def)
+    foreach(variant IN ITEMS create_fail other_thread shifted_layout)
+        string(TOUPPER "${variant}" variant_define)
+        add_library(cpu_gameinput_provider_${variant} SHARED
+            tests/cpu/gameinput_provider.cpp tests/cpu/gameinput_provider.def)
+        target_compile_definitions(cpu_gameinput_provider_${variant} PRIVATE GAMEINPUT_TEST_${variant_define})
+    endforeach()
+    add_library(cpu_gameinput_provider_wrong SHARED tests/cpu/gameinput_provider.cpp tests/cpu/gameinput_provider_wrong.def)
+    add_executable(cpu_gameinput_caller tests/cpu/gameinput_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_gameinput_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_gameinput_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_gameinput_caller PRIVATE cpu_gameinput_provider cpu_exe_io)
+    add_test(NAME cpu_native_gameinput COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/gameinput_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_gameinput_caller>" "$<TARGET_FILE:cpu_gameinput_provider>"
+        "$<TARGET_FILE:cpu_gameinput_provider_create_fail>" "$<TARGET_FILE:cpu_gameinput_provider_other_thread>"
+        "$<TARGET_FILE:cpu_gameinput_provider_shifted_layout>" "$<TARGET_FILE:cpu_gameinput_provider_wrong>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_gameinput PROPERTIES TIMEOUT 120)
 
     add_library(cpu_xapu_queue_provider SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
     add_library(cpu_xapu_queue_provider_lenient SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
@@ -4222,6 +4309,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-cvt-int16 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_f16_cvt_int16_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME pixel_aot_f16_to_int16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-to-int16 "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_f16_to_int16_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_swap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-swap "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -4396,6 +4487,8 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_round_${adapter}.txt")
         set_tests_properties(pixel_aot_f16_cvt_int16_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_cvt_int16_${adapter}.txt")
+        set_tests_properties(pixel_aot_f16_to_int16_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_to_int16_${adapter}.txt")
         set_tests_properties(pixel_aot_vop3_ternary_int_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_vop3_ternary_int_${adapter}.txt")
     endforeach()
@@ -4434,6 +4527,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${DXC_BIN_DIR}/dxil.dll" "$<TARGET_FILE:root_device_probe>" "$<TARGET_FILE:offscreen_check>" hardware)
     set_tests_properties(dxil_retarget_probe_hardware PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     add_test(NAME dxil_retarget_controls COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/dxil_retarget_check.py")
+    add_test(NAME rectlist_topology COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/rectlist_topology_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME rectlist_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/rectlist_topology_check.py"
+            --draw "$<TARGET_FILE:rectlist_draw_check>" ${adapter})
+        set_tests_properties(rectlist_draw_${adapter} PROPERTIES TIMEOUT 60)
+    endforeach()
+    set_tests_properties(rectlist_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME conditional_import_paths COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/intake/paths_check.py")
     add_library(intake_provider SHARED tests/intake/provider.cpp tests/intake/provider.def)
     add_library(intake_delay SHARED tests/intake/provider.cpp tests/intake/delay.def)
@@ -4470,6 +4571,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
         "$<TARGET_FILE_DIR:xmem_shim>")
     set_tests_properties(xgameruntime_preflight_stub_refused PROPERTIES TIMEOUT 30)
+    add_test(NAME pe_run_package_trap_missing COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/trap_missing_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:trap_missing_exe>" "$<TARGET_FILE:trap_missing_data_exe>")
+    set_tests_properties(pe_run_package_trap_missing PROPERTIES TIMEOUT 60)
 else()
     message(WARNING
         "Python-driven tests, including the CPU fixtures, are disabled because "
