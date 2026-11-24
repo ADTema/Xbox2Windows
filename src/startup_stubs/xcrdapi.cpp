@@ -316,7 +316,7 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
-LONG zero_tokens_at_enqueue, zero_tokens_at_run;
+LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
 void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens, u64 entry_id, u64 submission_id)
 {
     if (!request) return;
@@ -568,9 +568,14 @@ void run_entry(Object* self, Entry& entry)
         const u64 options = *reinterpret_cast<const u64*>(entry.bytes);
         if ((options & (1ull << 21)) && !entry.tokens.empty()) {
             const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(entry.bytes + 0x08);
+            // The title's page array is read again in full when the request runs: entries are filled,
+            // and also replaced, after enqueue. Writing through a token captured at enqueue put data
+            // into a page the title had already reassigned.
             for (std::size_t i = 0; i < entry.tokens.size(); ++i)
-                if (!entry.tokens[i] && title && x2w_local::readable(title + i, sizeof(ULONG_PTR))) {
-                    entry.tokens[i] = title[i];
+                if (title && x2w_local::readable(title + i, sizeof(ULONG_PTR))) {
+                    const ULONG_PTR now = title[i];
+                    if (entry.tokens[i] && now != entry.tokens[i]) InterlockedIncrement(&tokens_replaced_after_enqueue);
+                    entry.tokens[i] = now;
                     if (!entry.tokens[i]) InterlockedIncrement(&zero_tokens_at_run);
                 }
         }
@@ -854,8 +859,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
-                    requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, memory,
+                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
+                    requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
                     section_text);
                 last = total2;
                 last_memory = sample;
