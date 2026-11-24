@@ -92,6 +92,10 @@ int run(std::string_view scenario)
     queue->EnqueueRequest(&request);
     queue->EnqueueStatus(status.Get(), 0);
     queue->EnqueueSetEvent(event);
+    if (WaitForSingleObject(codec->GetEvent(), 0) != WAIT_TIMEOUT ||
+        WaitForSingleObject(event, 0) != WAIT_TIMEOUT ||
+        !std::all_of(output.begin(), output.end(), [sentinel](BYTE b) { return b == sentinel; }))
+        throw std::runtime_error("Queue changed before manual Submit");
     queue->Submit();
     if (WaitForSingleObject(codec->GetEvent(), 10000) != WAIT_OBJECT_0) throw std::runtime_error("Dequeue timeout");
     if (WaitForSingleObject(event, 0) != WAIT_TIMEOUT || status->IsComplete(0))
