@@ -6233,6 +6233,8 @@ through the SDK method. It exercises adaptation for a device with known identity
 console-facing vtable and establishing its slot numbers require separate evidence.
 [Windows x64 calling convention](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention?view=msvc-170)
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) passes all three orderings the fixture supplies - device first, return buffer first, and return buffer first with a stale vtable - each reporting that the properties and guards match.
+
 #### D3D12.X static-sampler compute PSO (XCL-19)
 
 [`tests/d3d12x_pso.hlsl`](../tests/d3d12x_pso.hlsl) is a source-built `cs_6_0` shader with
