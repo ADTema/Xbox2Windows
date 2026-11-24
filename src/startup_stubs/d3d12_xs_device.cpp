@@ -1017,6 +1017,9 @@ struct DesktopAllocator {
     ID3D12CommandAllocator* real;
     LONG lists;                                             // lists whose recording is on this allocator
     std::vector<std::pair<ID3D12Fence*, UINT64>> submits;  // per queue fence: the last submit's value
+    // A submit whose completion fence could not be created or signalled: the GPU may still run it
+    // and nothing would say when it ends, so the allocator is never reset or reused again.
+    bool untracked;
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1034,7 +1037,7 @@ TitleAllocator& title_allocator(Wrapper* allocator)
 {
     TitleAllocator& title = title_allocators[allocator];
     if (!title.current) {
-        title.current = new DesktopAllocator{static_cast<ID3D12CommandAllocator*>(allocator->own().real), 0, {}};
+        title.current = new DesktopAllocator{static_cast<ID3D12CommandAllocator*>(allocator->own().real), 0, {}, false};
         title.pool.push_back(title.current);
     }
     return title;
@@ -1043,7 +1046,7 @@ TitleAllocator& title_allocator(Wrapper* allocator)
 // allocator_lock held.
 bool allocator_idle(const DesktopAllocator* allocator)
 {
-    if (allocator->lists) return false;
+    if (allocator->lists || allocator->untracked) return false;
     for (const auto& submit : allocator->submits)
         if (submit.first->GetCompletedValue() < submit.second) return false;
     return true;
@@ -1066,7 +1069,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
             ID3D12CommandAllocator* created = nullptr;
             hr = device_of(the_device)->CreateCommandAllocator(title.type, IID_PPV_ARGS(&created));
             if (SUCCEEDED(hr)) {
-                next = new DesktopAllocator{created, 0, {}};
+                next = new DesktopAllocator{created, 0, {}, false};
                 title.pool.push_back(next);
                 InterlockedIncrement(&allocator_creates);
             }
@@ -1089,13 +1092,21 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
     return hr;
 }
 
-// draw_lock held. After a submit on queue, each list's allocator holds a fence value the queue
-// must pass before the allocator can be reset.
+// X2W_TEST_SUBMIT_FENCE_FAIL=1 (fixtures only): treat every submit fence as failed.
+bool submit_fence_fails()
+{
+    static const bool on = GetEnvironmentVariableW(L"X2W_TEST_SUBMIT_FENCE_FAIL", nullptr, 0) != 0;
+    return on;
+}
+
+// draw_lock held, after the lists were executed on queue. Each list's allocator holds a fence value
+// the queue must pass before the allocator can be reset. If that fence cannot be created or
+// signalled, the work is on the GPU all the same: the allocators are marked untracked instead.
 void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
 {
     AcquireSRWLockExclusive(&allocator_lock);
     auto& [fence, value] = queue_submits[queue];
-    if (!fence) {
+    if (!fence && !submit_fence_fails()) {
         ID3D12Device* device = nullptr;
         if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device)))) {
             if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) fence = nullptr;
@@ -1113,10 +1124,24 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
             else same->second = value;
         }
     } else {
+        for (Wrapper* list : lists)
+            if (const auto found = list_recordings.find(list); found != list_recordings.end()) found->second->untracked = true;
         static LONG failures;
-        if (first_calls(failures, 2)) log("x2w-render submit fence for allocator reuse failed");
+        if (first_calls(failures, 2)) log("x2w-render submit fence for allocator reuse failed; the allocators are not reused");
     }
     ReleaseSRWLockExclusive(&allocator_lock);
+}
+
+// Fixtures: the number of desktop allocators a title allocator stands for (0 if it has none yet).
+extern "C" __declspec(dllexport) unsigned x2w_d3d12_allocator_pool_size(void* allocator)
+{
+    Wrapper* a = as_wrapper(allocator);
+    if (!a || a->own().kind != allocator_kind) return 0;
+    AcquireSRWLockShared(&allocator_lock);
+    const auto found = title_allocators.find(a);
+    const unsigned size = found == title_allocators.end() ? 0 : static_cast<unsigned>(found->second.pool.size());
+    ReleaseSRWLockShared(&allocator_lock);
+    return size;
 }
 
 // List slot 139 (Xbox order): (allocator, 0, 0), the per-frame reset.

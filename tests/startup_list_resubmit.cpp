@@ -13,6 +13,13 @@
 //   5. queue Wait on H (slot 17), submit A behind it, Reset A on b (clear green), Reset allocator a,
 //      then signal H on the CPU          blue   a submit the GPU has not passed survives the Reset
 //      submit A again                    green
+//   6. A on a, submit, Reset allocator a red    the earlier allocator, now idle, is reused: two
+//      desktop allocators behind a; A on it, clear blue, submit                   blue
+//
+//   startup_list_resubmit <warp|hardware> untracked   (also X2W_TEST_SUBMIT_FENCE_FAIL=1)
+//
+// runs the same steps with the stand-in unable to track any submit. Steps 1-5 must read the same;
+// nothing may be reused, so step 6 finds four desktop allocators behind a.
 //
 // The desktop device must not be removed and the debug layer must store no errors. On a stand-in
 // that submits a closed list only once, step 2 reads green.
@@ -31,6 +38,7 @@
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+extern "C" __declspec(dllimport) unsigned x2w_d3d12_allocator_pool_size(void* allocator);
 
 namespace {
 using Word = std::uint64_t;
@@ -145,7 +153,8 @@ bool expect(Probe& probe, const char* step, std::uint32_t wanted)
 
 int main(int argc, char** argv)
 {
-    if (argc != 2) return 2;
+    if (argc != 2 && !(argc == 3 && std::strcmp(argv[2], "untracked") == 0)) return 2;
+    const bool untracked = argc == 3;
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
     ComPtr<IDXGIAdapter> adapter;
@@ -248,9 +257,24 @@ int main(int argc, char** argv)
     if (!probe.submit(list_a)) return 57;
     if (!expect(probe, "5 A re-recorded on b", green_bits)) return 58;
 
+    // 6. Reuse: A records on a again and is submitted, so a's current allocator holds a recording at
+    // the next Reset. The earlier allocator the GPU has now passed is reused, so the pool keeps two.
+    // With X2W_TEST_SUBMIT_FENCE_FAIL=1 no submit can be tracked, nothing is reused and every Reset
+    // that has to move adds an allocator: four by now.
+    probe.record(list_a, a, red);
+    if (!probe.submit(list_a)) return 60;
+    if (!expect(probe, "6 A on a, clear red", red_bits)) return 61;
+    if (!ok(invoke(a, 8))) return 62;
+    const unsigned pool = x2w_d3d12_allocator_pool_size(a), wanted_pool = untracked ? 4 : 2;
+    std::printf("6 desktop allocators behind a: %u (expected %u)\n", pool, wanted_pool);
+    if (pool != wanted_pool) return 63;
+    probe.record(list_a, a, blue);
+    if (!probe.submit(list_a)) return 64;
+    if (!expect(probe, "6 A after the Reset, clear blue", blue_bits)) return 65;
+
     const HRESULT removed = probe.desktop->GetDeviceRemovedReason();
     const UINT64 errors = probe.debug_errors();
     std::printf("device removed reason: 0x%08lx, debug layer errors: %llu\n", static_cast<unsigned long>(removed),
                 static_cast<unsigned long long>(errors));
-    return removed == S_OK && errors == 0 ? 0 : 60;
+    return removed == S_OK && errors == 0 ? 0 : 70;
 }
