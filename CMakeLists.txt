@@ -1275,6 +1275,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
     add_test(NAME startup_image_sample_l COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_l_check.py")
+    # Rewrites for instructions the host processor lacks (tools/startup/host_cpu.py), run on the host.
+    add_test(NAME startup_host_cpu COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_host_cpu_check.py")
+    set_tests_properties(startup_host_cpu PROPERTIES SKIP_RETURN_CODE 77)
     # tools/startup/capture.py against synthetic capture.bin files laid out like the writer's (#1149).
     add_test(NAME startup_capture COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_capture_check.py")

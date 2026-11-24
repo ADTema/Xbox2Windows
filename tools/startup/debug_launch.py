@@ -19,6 +19,7 @@ k32.CreateJobObjectW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
+import host_cpu  # noqa: E402
 
 EXCEPTION, CREATE_THREAD, CREATE_PROCESS, EXIT_THREAD, EXIT_PROCESS, LOAD_DLL, UNLOAD_DLL, OUTPUT_STRING, RIP = range(1, 10)
 DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED = 0x00010002, 0x80010001
@@ -50,6 +51,11 @@ def main():
     stop_first = opts.get("--stop-first-chance") == "1"
     skip_asserts = int(opts.get("--continue-asserts", "0"))  # main-image int3s to log and continue past
     asserts_seen = {}
+    # X2W_HOST_CPU=1: rewrite main-image instructions the host processor lacks (host_cpu.py).
+    host_cpu_on = os.environ.get("X2W_HOST_CPU") == "1"
+    host_cpu_sites = {}
+    flushopt_missing = [False]  # set when a CLFLUSHOPT faults: CLWB then becomes a NOP instead
+    stub_area = [0, 0]  # next free address and end of the block the stubs go to
     os.makedirs(logdir, exist_ok=True)
     trap_log = os.path.join(logdir, "trap.log")
     for stale in (trap_log, os.path.join(logdir, "finished.txt")):  # a reused run directory starts clean
@@ -126,6 +132,45 @@ def main():
         k32.VirtualProtectEx(wt.HANDLE(pi.hProcess), ctypes.c_void_p(addr), len(data), old.value, ctypes.byref(old))
         k32.FlushInstructionCache(wt.HANDLE(pi.hProcess), ctypes.c_void_p(addr), len(data))
         return ok
+
+    def rewrite_for_host(address):
+        """Rewrites the instruction at a faulting main-image address; returns its name, or None."""
+        code = read(address, 48)
+        clwb = host_cpu.clwb_rewrite(code)
+        if clwb and not flushopt_missing[0]:
+            return "clwb" if write(address + clwb[0], clwb[1]) else None
+        nop = host_cpu.flush_nop(code)
+        if nop:
+            # CLFLUSHOPT itself faulted (a host older than it), or a CLWB after that was seen.
+            flushopt_missing[0] = True
+            return ("clwb-nop" if clwb else "clflushopt-nop") if write(address, nop) else None
+        wait = host_cpu.wait_rewrite(code)
+        if wait:
+            return ("mwaitx" if code[2] == 0xFB else "monitorx") if write(address, wait) else None
+        found = host_cpu.stub_for(code)
+        if not found:
+            return None
+        length, stub = found
+        if stub_area[0] + len(stub) + 64 > stub_area[1]:
+            # A block within rel32 reach of the image: the first free 64 KiB below its base.
+            k32.VirtualAllocEx.restype = ctypes.c_void_p
+            for step in range(1, 4096):
+                block = k32.VirtualAllocEx(wt.HANDLE(pi.hProcess), ctypes.c_void_p(main_base - step * 0x10000),
+                                           0x10000, 0x3000, 0x40)
+                if block:
+                    stub_area[:] = [block, block + 0x10000]
+                    break
+            else:
+                return None
+        try:
+            plan = host_cpu.plan_replacement(code, address, length, stub, stub_area[0])
+        except Exception as error:  # iced-x86 missing, or an instruction it cannot move
+            log(f"{time.time() - start:7.3f} host-cpu no replacement at {where(address)}: {error}")
+            plan = None
+        if not plan or not write(stub_area[0], plan[0]) or not write(address, plan[1]):
+            return None
+        stub_area[0] += (len(plan[0]) + 15) & ~15
+        return "clzero" if length == 3 else ("insertq" if code[0] == 0xF2 else "extrq")
 
     ctx_raw = (ctypes.c_ubyte * (1232 + 16))()
     ctx_addr = (ctypes.addressof(ctx_raw) + 15) & ~15
@@ -464,6 +509,15 @@ def main():
                     write(addr, b"\xcc")
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                 continue
+            if (ex_code == 0xC000001D and first and host_cpu_on and not stop_first and main_base
+                    and main_base <= ex_addr < main_base + 0x10000000):
+                name = rewrite_for_host(ex_addr)
+                if name:
+                    host_cpu_sites[name] = host_cpu_sites.get(name, 0) + 1
+                    if sum(host_cpu_sites.values()) <= 40:
+                        log(f"{time.time() - start:7.3f} host-cpu {name} at {where(ex_addr)} rewritten")
+                    k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
+                    continue
             log(f"{time.time() - start:7.3f} exception {ex_code:#010x} {label} at {where(ex_addr)} "
                 f"{'first' if first else 'second'}-chance params={[hex(p) for p in params]}")
             if ex_code == 0x80000003 and not loader_break_seen:
@@ -582,6 +636,8 @@ def main():
               ", ".join(f"{k} x{v}" for k, v in sorted(tops.items(), key=lambda kv: -kv[1])[:8]))
         if asserts_seen:
             print("  asserts continued: " + ", ".join(f"{where(a)} x{n}" for a, n in asserts_seen.items()))
+    if host_cpu_sites:
+        print("  host-cpu sites rewritten: " + ", ".join(f"{name} x{n}" for name, n in sorted(host_cpu_sites.items())))
     bink_report()
     if os.environ.get("X2W_COUNT"):
         print("  hit counts: " + ", ".join(f"+{item} x{hit_counts.get('+' + item, 0)}"

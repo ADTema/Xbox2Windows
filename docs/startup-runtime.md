@@ -142,6 +142,7 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
+| `X2W_HOST_CPU=1` (`run.ps1 -HostCpu`) | the startup debugger rewrites main-image instructions the host processor lacks at their first fault: see [Host processors without the console's instructions](#host-processors-without-the-consoles-instructions) |
 
 The startup shader cache key includes the translator revision. After updating from
 an earlier translation revision, run the recording build once to emit
@@ -408,6 +409,38 @@ the stand-in path; the texture format used in the reported video remains to be c
 cmake --build --preset release --target startup_nv12_draw d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^startup_nv12_draw_' -V
 ```
+
+## Host processors without the console's instructions
+
+A console executable is built for one processor. On a host that lacks CLWB, CLZERO, MONITORX,
+MWAITX or SSE4a, the first such instruction ends a startup run with an illegal-instruction
+exception. With `X2W_HOST_CPU=1` the startup debugger rewrites the faulting instruction in the
+running process and continues; the executable on disk is not changed, and each site costs one
+debugger round trip.
+
+| Instruction | Rewritten as |
+|---|---|
+| `CLWB m8` | `CLFLUSHOPT m8` (one ModRM bit); one `NOP` of the same length once a `CLFLUSHOPT` has faulted on this host |
+| `MONITORX`, `MWAITX` | a 3-byte `NOP`; `PAUSE` and `NOP` (the wait may end at any time) |
+| `CLZERO` | a jump to a stub that stores 64 zero bytes at `rax & ~63` |
+| `INSERTQ xmm, xmm, len, idx`, `EXTRQ xmm, len, idx` (xmm0-7) | a jump to a stub that does the field move in integer registers |
+
+The stubs keep the other registers and the flags. Instructions that the 5-byte jump overwrites
+are re-encoded behind the stub with iced-x86. `events.txt` names the first 40 rewritten sites and
+the summary counts them by instruction. `tools/startup/host_cpu.py` lists the forms that are
+refused (register-count `INSERTQ`/`EXTRQ`, xmm8-15, fields past bit 63).
+
+`python -B tests/startup_host_cpu_check.py` assembles source-built functions, patches them the same
+way and calls them on the host: 288 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
+moved `lea` and a moved rip-relative load, and decoded `CLWB` and wait rewrites, including the
+`NOP` form for every addressing mode. The fall-back from `CLFLUSHOPT` to `NOP` in the debugger is
+not exercised here: it needs a host without `CLFLUSHOPT`. Stubs that zero 56
+or 72 bytes, and a stub for another bit offset, fail it. On a processor that has SSE4a or CLZERO
+the unpatched functions are compared as well. It exits 77 on a host that is not x86-64.
+
+Measured so far on one host without these instructions; the rewrites of `EXTRQ` have only run in
+the check. A thread that is executing inside the bytes of a jump site while another thread faults
+on it is not handled.
 
 ## Startup memory accounting
 
