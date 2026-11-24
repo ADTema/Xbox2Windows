@@ -292,6 +292,10 @@ hex HRESULT/format/flag codes, slot numbers and known shader-failure categories 
 refusals, unhandled `x2w-d3d12` / trap slots, `x2w-d3d12-debug` severity/ID counts, `x2w-dstorage`
 failures and status HRESULTs, `x2w-runtime` failing slots, and `.fail` shader categories). Any other
 text is grouped as `other (text omitted)` and never copied; raw snippets stay in the local logs.
+`Device::slot133` (the console placed-resource call) logs each handled placement with a trailing
+`aliased` or `not aliased` field. Those lines are not counted as unhandled; they are counted by
+outcome (`aliased`, `not_aliased`, `failed`) in a separate table, and a line with an HRESULT other than 0
+(or an uncommitted address) still counts as `failed` and as an unhandled `Device::slot133` event.
 Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 `startup_triage_run`).
 
