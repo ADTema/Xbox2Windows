@@ -73,8 +73,23 @@ BOOL physical_result(era_physical::Status status) noexcept
 }
 
 // Pages are slots of 256 MiB pagefile-backed sections rather than one section each: one handle and
-// one view per page is what makes large batches slow. A freed slot is zeroed when it is reused, as
-// a fresh section was.
+// one view per page is what makes large batches slow. A slab is created with SEC_RESERVE, so it costs
+// no commit until a slot is used; a slot is committed here, when its page is first mapped or written,
+// and stays committed after it is freed so that reuse cannot fail for lack of commit. A freed slot is
+// zeroed when it is reused, as a fresh section was. Fails with the system error (for instance
+// ERROR_COMMITMENT_LIMIT) when the slot cannot be committed, leaving no state changed.
+bool commit_slot(HANDLE slab, ULONG64 offset, bool zero)
+{
+    void* view = MapViewOfFile(slab, FILE_MAP_WRITE, static_cast<DWORD>(offset >> 32), static_cast<DWORD>(offset), page_bytes);
+    if (!view) return false;
+    bool ok = VirtualAlloc(view, page_bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    if (ok && zero) std::memset(view, 0, page_bytes);  // a reused slot starts zero-filled
+    UnmapViewOfFile(view);
+    if (!ok) SetLastError(error);
+    return ok;
+}
+
 HANDLE section_for(ULONG_PTR page)
 {
     const auto existing = memory.backings.find(page);
@@ -82,21 +97,24 @@ HANDLE section_for(ULONG_PTR page)
         return existing->second.section;
     x2w_xmem::SlabSlots<HANDLE>::Slot slot;
     if (memory.slots.lowest_free(slot)) {
-        void* view = MapViewOfFile(slot.slab, FILE_MAP_WRITE, static_cast<DWORD>(slot.offset >> 32), static_cast<DWORD>(slot.offset), page_bytes);
-        if (!view) return nullptr;
-        std::memset(view, 0, page_bytes);  // a reused slot starts zero-filled, as a fresh section did
-        UnmapViewOfFile(view);
+        if (!commit_slot(slot.slab, slot.offset, true)) return nullptr;
         memory.backings.emplace(page, Backing{slot.slab, 0, slot.offset, slot.slab_index});
         memory.slots.take_lowest_free();
         return slot.slab;
     }
     const ULONG64 slab_bytes = memory.slots.slab_bytes();
     const auto make_slab = [slab_bytes](HANDLE& slab) {
-        slab = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+        slab = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                   static_cast<DWORD>(slab_bytes >> 32), static_cast<DWORD>(slab_bytes), nullptr);
         return slab != nullptr;
     };
     if (!memory.slots.take_fresh(make_slab, [](HANDLE slab) { CloseHandle(slab); }, slot)) return nullptr;
+    if (!commit_slot(slot.slab, slot.offset, false)) {
+        const DWORD error = GetLastError();
+        memory.slots.unwind_fresh(slot);
+        SetLastError(error);
+        return nullptr;
+    }
     try {
         memory.backings.emplace(page, Backing{slot.slab, 0, slot.offset, slot.slab_index});
     } catch (...) {
@@ -722,8 +740,8 @@ extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
 }
 
 // Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
-// in the open slabs. A slab is charged to commit when it is created and closed only when the process ends, so
-// these numbers show how much commit the slabs hold, not how much of it the title touches.
+// in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and it is closed only at process end, so
+// a slot freed by a grant stays committed and these numbers do not show the commit held.
 extern "C" BOOL WINAPI x2w_xmem_slab_stats(ULONGLONG* slabs, ULONGLONG* slots_in_use, ULONGLONG* slots_free)
 {
     if (!slabs || !slots_in_use || !slots_free) return FALSE;
