@@ -11,6 +11,7 @@
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_file_read.h"
+#include "startup_stubs/bcpack_decoder.h"
 
 #include <psapi.h>
 
@@ -470,13 +471,29 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
         }
+        bool bcpack_decoded = false;
         if (data && bcpack) {
-            // shortcut: BCPack is not decoded yet; the texels are left zero (a blank texture) so the
-            // title's loading continues. Counted as bcpack_blank.
-            output.assign(destination_size, 0);
-            data = output.data();
-            decode_length = destination_size;
-            outcome = "BCPack not decoded: zero-filled";
+            if (bcpack == 7 || bcpack == 1) {
+                std::vector<unsigned char> decoded(destination_size);
+                std::size_t produced = 0;
+                if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
+                    output = std::move(decoded);
+                    data = output.data();
+                    decode_length = produced;
+                    outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
+                    bcpack_decoded = true;
+                } else {
+                    outcome = "bcpack failed";
+                    data = nullptr;
+                }
+            } else {
+                // shortcut for formats not decoded yet: texels are left zero (a blank texture) so the
+                // title's loading continues. Counted as bcpack_blank.
+                output.assign(destination_size, 0);
+                data = output.data();
+                decode_length = destination_size;
+                outcome = "BCPack not decoded: zero-filled";
+            }
         }
         if (data) {
             // Track decode length and destination capacity as separate values (Refs #1144).
@@ -523,9 +540,9 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 std::memcpy(destination, data, decode_length);
             }
             if (written) {
-                if (bcpack) {
+                if (bcpack && !bcpack_decoded) {
                     InterlockedIncrement(&requests_bcpack_blank);
-                } else if (zlib) {
+                } else if (zlib || bcpack) {
                     InterlockedIncrement(&requests_compressed);
                 } else {
                     InterlockedIncrement(&requests_done);

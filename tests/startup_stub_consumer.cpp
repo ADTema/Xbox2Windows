@@ -5,7 +5,7 @@
 //   chad     -> XDspActivate(0x11, 0x22, 0x33, 0x44)
 //   xg_xs    -> XGSuggestSwizzleMode(0x55, 0, 0, 0)
 //   physical -> XMemAllocatePhysicalPages/XMemFreePhysicalPages round trip (no trap expected)
-//   dstorage -> DirectStorage multi-page RFC 1950 zlib request and failure controls (Refs #1144)
+//   dstorage -> DirectStorage multi-page RFC 1950 zlib request, BCPack decode and failure controls (Refs #1139, #1144)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -1143,6 +1143,93 @@ bool dstorage_checks() {
         }
         for (unsigned char b : dest_matching) {
             if (b != 0xB6) return false;
+        }
+    }
+
+    // Test: BCPack DirectStorage requests decode into destination memory and malformed streams fail (Refs #1139)
+    {
+        // 2-block BC7 Mode 6 stream from tests/bc7_mode6_multiblock_check.py (104 bytes)
+        const unsigned char bc7_packed[] = {
+            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x05, 0x05, 0x05, 0x05,
+            0x05, 0x05, 0x06, 0x06, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x20, 0x02, 0x02, 0x75, 0x46,
+            0x28, 0x18, 0x00, 0x00, 0x03, 0x03, 0xdf, 0x5f, 0x4b, 0x7c, 0x05, 0x21,
+            0x03, 0x03, 0x50, 0x78, 0x23, 0x37, 0x04, 0x31, 0x10, 0x10, 0x10, 0x10,
+            0x10, 0x10, 0x10, 0x10, 0x06, 0x05, 0x06, 0x05, 0x05, 0x05, 0x05, 0x05,
+            0x10, 0x10, 0x01, 0x01, 0x01, 0x01, 0x01, 0x10, 0x20, 0x08, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x08, 0xe4, 0xdb, 0x27, 0xa4,
+            0x21, 0x09, 0x02, 0x94, 0xfe, 0x6b, 0x02, 0x04, 0x31, 0x33, 0x04, 0x04,
+            0xc4, 0xfb, 0x37, 0x25, 0x02, 0x02, 0xbd, 0x19, 0x50, 0x0f, 0x03, 0x41,
+            0x41, 0x05, 0x09, 0x34, 0xf4, 0xcb, 0x07, 0x05, 0x02, 0x41, 0x41, 0x11
+        };
+        const unsigned char bc7_expected[32] = {
+            0x40, 0x31, 0x72, 0x04, 0xa5, 0x68, 0x19, 0xbe,
+            0x02, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x40, 0x0a, 0x94, 0x37, 0x77, 0xa3, 0xc8, 0x78,
+            0x11, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe
+        };
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest_valid(32, 0xAA);
+        std::vector<unsigned char> dest_truncated(32, 0xCC);
+
+        // Request 0: valid BC7 memory request (options = (7 << 1) | 0x400000)
+        unsigned char req0[0x48] = {};
+        *reinterpret_cast<u64*>(req0 + 0x00) = (7ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req0 + 0x08) = dest_valid.data();
+        *reinterpret_cast<u64*>(req0 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x18) = 32;
+        *reinterpret_cast<const unsigned char**>(req0 + 0x20) = bc7_packed;
+        *reinterpret_cast<u64*>(req0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x30) = sizeof(bc7_packed);
+        *reinterpret_cast<unsigned*>(req0 + 0x38) = 32;
+
+        // Request 1: truncated BC7 memory request (negative control: 32 bytes instead of 104)
+        unsigned char req1[0x48] = {};
+        *reinterpret_cast<u64*>(req1 + 0x00) = (7ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req1 + 0x08) = dest_truncated.data();
+        *reinterpret_cast<u64*>(req1 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 32;
+        *reinterpret_cast<const unsigned char**>(req1 + 0x20) = bc7_packed;
+        *reinterpret_cast<u64*>(req1 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = 32;
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = 32;
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1)) {
+            return false;
+        }
+
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        long hr1 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
+
+        if (hr0 != 0 || std::memcmp(dest_valid.data(), bc7_expected, 32) != 0) return false;
+        if (hr1 == 0) return false;
+        for (unsigned char b : dest_truncated) {
+            if (b != 0xCC) return false;
         }
     }
 
