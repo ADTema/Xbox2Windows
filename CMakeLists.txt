@@ -527,18 +527,22 @@ add_custom_command(OUTPUT "${d3d12x_pso_header}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_pso.hlsl"
     DEPENDS tests/d3d12x_pso.hlsl
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.cso" VERBATIM)
-add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp "${d3d12x_pso_header}")
+add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp src/d3d12x_struct_return.cpp "${d3d12x_pso_header}")
 add_dependencies(d3d12x_device_check d3d12_xs_shim)
 target_include_directories(d3d12x_device_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(d3d12x_device_check PRIVATE cxx_std_17)
+target_include_directories(d3d12x_device_check PRIVATE src)
 target_link_libraries(d3d12x_device_check PRIVATE d3d12 dxgi)
 foreach(adapter IN ITEMS warp hardware)
     add_test(NAME d3d12x_device_create_${adapter} COMMAND d3d12x_device_check
         "$<TARGET_FILE:d3d12_xs_shim>" create ${adapter})
     add_test(NAME d3d12x_device_negative_${adapter} COMMAND d3d12x_device_check
         "$<TARGET_FILE:d3d12_xs_shim>" negative ${adapter})
+    add_test(NAME d3d12x_device_struct_return_${adapter} COMMAND d3d12x_device_check
+        "$<TARGET_FILE:d3d12_xs_shim>" struct-return ${adapter})
 endforeach()
-set_tests_properties(d3d12x_device_create_hardware d3d12x_device_negative_hardware PROPERTIES
+set_tests_properties(d3d12x_device_create_hardware d3d12x_device_negative_hardware
+    d3d12x_device_struct_return_hardware PROPERTIES
     SKIP_RETURN_CODE 77)
 set_tests_properties(d3d12x_device_negative_warp d3d12x_device_negative_hardware PROPERTIES
     PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice: unsupported IID \\{7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01\\}")
