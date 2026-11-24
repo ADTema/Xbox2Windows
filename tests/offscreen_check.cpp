@@ -20,6 +20,8 @@
 #include "desktop_gpu.h"
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_qword(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_qword_narrow(ID3D12Device* device, const char* shader_path);
 
 #ifdef OFFSCREEN_AGILITY_620
 extern "C" {
@@ -518,6 +520,18 @@ OperationResult run_spirv_address_window_atomic(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_spirv_address_window_qword(const OperationContext& ctx)
+{
+    check_spirv_window_qword(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_qword_narrow(const OperationContext& ctx)
+{
+    check_spirv_window_qword_narrow(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_spirv_compare_sampler(const OperationContext& ctx)
 {
     check_spirv_compare_sampler(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
@@ -1008,6 +1022,8 @@ const OperationSpec kOperations[] = {
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
+    {"--spirv-address-window-qword", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword},
+    {"--spirv-address-window-qword-narrow", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword_narrow},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
