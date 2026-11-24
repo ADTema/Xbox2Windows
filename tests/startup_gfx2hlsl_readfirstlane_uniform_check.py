@@ -129,7 +129,7 @@ REFUSED = [
 EARLIER = {'op_sel overwrite': 'modifier op_sel:[0,0]'}
 for label, instructions in REFUSED:
     got = run(*instructions)
-    check(f'{label} refused', got in (REFUSAL, EARLIER.get(label)), repr(got))
+    check(f'{label} refused', got == EARLIER.get(label, REFUSAL), repr(got))
 # SCC written through m0 (#1931 review): a compare mask carried into m0 makes SCC varying, so the
 # select that reads it, and a VGPR copied from that select, stay unproven; EXEC is left unchanged.
 got = run('v_cmp_lt_f32_e32 vcc_lo, v0, v1', 's_and_b32 m0, vcc_lo, -1', 's_cselect_b32 s2, 1, 0',
@@ -137,7 +137,16 @@ got = run('v_cmp_lt_f32_e32 vcc_lo, v0, v1', 's_and_b32 m0, vcc_lo, -1', 's_csel
 check('compare mask through m0 into SCC refused', got == REFUSAL, repr(got))
 # The same chain from a uniform scalar still proves the copy uniform.
 got = run('s_and_b32 m0, s2, 0xff', 's_cselect_b32 s3, 1, 0', 'v_mov_b32_e32 v7, s3', READ)
-check('uniform m0 write into SCC accepted', got != REFUSAL and got[-1:] == ['s9 = v7;'], repr(got))
+check('uniform m0 write into SCC accepted',
+      got == ['m0 = s2 & 0x000000ffu;', 'scc = m0 != 0;', 's3 = scc ? 0x00000001u : 0x00000000u;',
+              'v7 = s3;', 's9 = v7;'], repr(got))
+# Every other SCC write either updates the proof or invalidates it: ops whose SCC result is not
+# modelled (carry, selected source), s_wqm, and the symbolic descriptor path, which emits nothing.
+for label, first in (('unmodelled carry', 's_add_u32 s3, s2, 1'),
+                     ('whole quad mode', 's_wqm_b64 exec, exec'),
+                     ('symbolic descriptor word', 's_and_b32 s10, s4, 0xff')):
+    got = run(first, 's_cselect_b32 s3, 1, 0', 'v_mov_b32_e32 v7, s3', READ)
+    check(f'select after {label} refused', got == REFUSAL, repr(got))
 got = run('v_mov_b32_e32 v7, s2', READ, exec_known=False)
 check('unknown exec refused', got == REFUSAL, repr(got))
 

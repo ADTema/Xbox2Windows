@@ -619,6 +619,8 @@ class Stage:
         if base in ('s_wqm_b32', 's_wqm_b64'):
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
+            if hasattr(self, 'scc_uniform'):
+                self.scc_uniform = False  # the hardware SCC result is not modelled
             return None
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f',
                     's_setreg_imm32_b32', 's_code_end', 's_setprio'):
@@ -718,6 +720,8 @@ class Stage:
     # scalar ALU with descriptor-word bookkeeping
     def scalar(self, base, ops):
         text, scc = SCA[base]
+        if base in SCC_UNMODELLED and self.tracks_uniformity():
+            self.scc_uniform = False
         dst = reg_range(ops[0])
         pair = base.endswith('_b64')
         srcs = ops[1:]
@@ -745,6 +749,8 @@ class Stage:
             return self.sym.get(r[1]) if r and r[0] == 's' else None
         syms = [src_sym(t) for t in srcs]
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+            if scc and self.tracks_uniformity():
+                self.scc_uniform = False  # nothing is emitted here, so the run-time scc is stale
             if word_complement:
                 raise Unsupported('scc from descriptor data')
             if dname == 'm0':
@@ -1725,6 +1731,12 @@ VEC_U = {
     'v_bfrev_b32': (1, 'reversebits({0})'),
 }
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
+# Scalar ops that write SCC on the hardware (carry, overflow, or which source was selected) but have
+# no SCC template here: the emitted scc keeps its previous value, so the uniformity proof stops
+# trusting it.
+SCC_UNMODELLED = frozenset(('s_add_i32', 's_add_u32', 's_sub_i32', 's_sub_u32',
+                            's_min_i32', 's_min_u32', 's_max_i32', 's_max_u32'))
+
 SCA = {
     's_mov_b32': ('{0}', None), 's_mov_b64': ('{0}', None), 's_movk_i32': ('{0}', None),
     's_and_b32': ('{0} & {1}', '$ != 0'), 's_or_b32': ('{0} | {1}', '$ != 0'), 's_xor_b32': ('{0} ^ {1}', '$ != 0'),
