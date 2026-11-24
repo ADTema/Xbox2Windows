@@ -39,7 +39,7 @@ from tempfile import TemporaryDirectory
 
 import pefile
 
-from exe_process import launch
+from exe_process import launch, thread_ids
 from native_map_check import Mapper, STATUS
 
 IO = "cpu_exe_io.dll"
@@ -71,12 +71,14 @@ class SecurityAttributes(ctypes.Structure):
     _fields_ = [("length", wintypes.DWORD), ("descriptor", ctypes.c_void_p), ("inherit", wintypes.BOOL)]
 
 
-def launch_cfg(image, policy, timeout=30):
+def launch_cfg(image, policy, timeout=15):
     """Start image under the Windows loader with an explicit per-process CFG policy ("on" or "off").
 
     A /guard:cf image otherwise inherits the host's CFG setting, and with system CFG off the loader keeps the
     image's own slots. The child's effective EnableControlFlowGuard bit is read from its handle after it ends.
-    stdin is NUL; stdout and stderr go to files beside the image.
+    stdin is NUL; stdout and stderr go to files beside the image. The child inherits only these three handles.
+    The four launches together stay well inside the test's CTest timeout; a launch that does not end records
+    the child's live threads before it is terminated.
     """
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.restype = wintypes.HANDLE
@@ -99,28 +101,33 @@ def launch_cfg(image, policy, timeout=30):
     image = Path(image)
     paths = {stream: image.with_name(f"{image.stem}.{policy}.{stream}") for stream in ("stdout", "stderr")}
     inherit = SecurityAttributes(ctypes.sizeof(SecurityAttributes), None, True)
-    handles = [kernel.CreateFileW("NUL", 0x80000000, 3, ctypes.byref(inherit), 3, 0x80, None)]  # GENERIC_READ
-    handles += [kernel.CreateFileW(str(paths[stream]), 0x40000000, 1, ctypes.byref(inherit), 2, 0x80, None)
-                for stream in ("stdout", "stderr")]  # GENERIC_WRITE, CREATE_ALWAYS
-    if any(handle in (None, wintypes.HANDLE(-1).value) for handle in handles):
-        error = ctypes.WinError(ctypes.get_last_error())
-        for handle in handles:
-            if handle not in (None, wintypes.HANDLE(-1).value):
-                kernel.CloseHandle(handle)
-        raise error
+    opens = [("NUL", 0x80000000, 3, 3)] + [(str(paths[stream]), 0x40000000, 1, 2) for stream in ("stdout", "stderr")]
+    handles = []
+    for name, access, share, disposition in opens:  # GENERIC_READ OPEN_EXISTING, GENERIC_WRITE CREATE_ALWAYS
+        handle = kernel.CreateFileW(name, access, share, ctypes.byref(inherit), disposition, 0x80, None)
+        if handle in (None, wintypes.HANDLE(-1).value):
+            error = ctypes.WinError(ctypes.get_last_error())  # read before any other call can replace it
+            for opened in handles:
+                kernel.CloseHandle(opened)
+            raise OSError(f"opening {name} for the child: {error}")
+        handles.append(handle)
     size = ctypes.c_size_t()
-    kernel.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+    kernel.InitializeProcThreadAttributeList(None, 2, 0, ctypes.byref(size))
     attributes = ctypes.create_string_buffer(size.value)
     value = ctypes.c_uint64(CFG_POLICY[policy])
+    inherited = (wintypes.HANDLE * len(handles))(*handles)
     info, process = StartupInfoEx(), ProcessInformation()
     info.cb, info.flags = ctypes.sizeof(info), 0x100  # STARTF_USESTDHANDLES
     info.stdin, info.stdout, info.stderr = handles
     try:
-        if not kernel.InitializeProcThreadAttributeList(attributes, 1, 0, ctypes.byref(size)):
+        if not kernel.InitializeProcThreadAttributeList(attributes, 2, 0, ctypes.byref(size)):
             raise ctypes.WinError(ctypes.get_last_error())
         try:
             if not kernel.UpdateProcThreadAttribute(attributes, 0, 0x20007, ctypes.byref(value), 8, None, None):
                 raise ctypes.WinError(ctypes.get_last_error())  # PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+            if not kernel.UpdateProcThreadAttribute(attributes, 0, 0x20002, inherited, ctypes.sizeof(inherited),
+                                                    None, None):
+                raise ctypes.WinError(ctypes.get_last_error())  # PROC_THREAD_ATTRIBUTE_HANDLE_LIST
             info.attributes = ctypes.addressof(attributes)
             # EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW; the parent's error mode is inherited.
             if not kernel.CreateProcessW(str(image), None, None, None, True, 0x00080000 | 0x08000000, None,
@@ -131,9 +138,11 @@ def launch_cfg(image, policy, timeout=30):
     finally:
         for handle in handles:
             kernel.CloseHandle(handle)
+    live_threads = None
     try:
         signaled = kernel.WaitForSingleObject(process.process, timeout * 1000) == 0
         if not signaled:
+            live_threads = thread_ids(process.pid)
             kernel.TerminateProcess(process.process, 1)
             kernel.WaitForSingleObject(process.process, 5000)
         code, flags = wintypes.DWORD(), wintypes.DWORD()
@@ -143,8 +152,8 @@ def launch_cfg(image, policy, timeout=30):
     finally:
         kernel.CloseHandle(process.thread)
         kernel.CloseHandle(process.process)
-    return {"process_signaled": signaled, "code": code.value, "cfg": bool(flags.value & 1),
-            **{stream: {"bytes": path.read_bytes()} for stream, path in paths.items()}}
+    return {"process_signaled": signaled, "code": code.value, "cfg": bool(flags.value & 1), "pid": process.pid,
+            "live_threads": live_threads, **{stream: {"bytes": path.read_bytes()} for stream, path in paths.items()}}
 
 
 def words(a, b, c, calls, d):
