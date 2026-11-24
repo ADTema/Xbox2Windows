@@ -2522,6 +2522,44 @@ class TestRdna2Disasm(unittest.TestCase):
     # llvm-mc 15 and 19 both print this word; llvm-mc 19 refuses to assemble attr62, so it is a decode-only vector.
     VINTRP_MOV_ATTR62_VECTOR = ("040002d67e000018", "v_interp_mov_f32_e64 v4, p10, attr62.y div:2")
 
+    # Golden vectors transcribed from LLVM 15.0.7 llvm/test/MC/AMDGPU/gfx10_asm_vop3.s, which
+    # pins the gfx10/gfx1013 VOP3 interp opcodes 0x200-0x202 (LLVM's VOP3Instructions.td:1045-1047)
+    # and the printed operand order of VOP3_INTERP / VOP3_INTERP_MOV (VOP3Instructions.td:55-105).
+    # Each entry is (encoding, LLVM assembly, "gfx10_asm_vop3.s:<line of the encoding>").
+    VOP3_INTERP_F32_E64_VECTORS = (
+        # gfx10_asm_vop3.s:13065-13107 — v_interp_p1_f32_e64
+        ("050000d600040200", "v_interp_p1_f32_e64 v5, v2, attr0.x", "gfx10_asm_vop3.s:13065"),
+        ("050000d61f040200", "v_interp_p1_f32_e64 v5, v2, attr31.x", "gfx10_asm_vop3.s:13074"),
+        ("050000d620040200", "v_interp_p1_f32_e64 v5, v2, attr32.x", "gfx10_asm_vop3.s:13077"),
+        ("050000d600fe0300", "v_interp_p1_f32_e64 v5, v255, attr0.x", "gfx10_asm_vop3.s:13080"),
+        ("050000d600040240", "v_interp_p1_f32_e64 v5, -v2, attr0.x", "gfx10_asm_vop3.s:13083"),
+        ("050200d600040200", "v_interp_p1_f32_e64 v5, |v2|, attr0.x", "gfx10_asm_vop3.s:13086"),
+        ("050000d640040200", "v_interp_p1_f32_e64 v5, v2, attr0.y", "gfx10_asm_vop3.s:13089"),
+        ("050000d6c0040200", "v_interp_p1_f32_e64 v5, v2, attr0.w", "gfx10_asm_vop3.s:13095"),
+        ("058000d600040200", "v_interp_p1_f32_e64 v5, v2, attr0.x clamp", "gfx10_asm_vop3.s:13098"),
+        ("050000d600040208", "v_interp_p1_f32_e64 v5, v2, attr0.x mul:2", "gfx10_asm_vop3.s:13101"),
+        ("050000d600040210", "v_interp_p1_f32_e64 v5, v2, attr0.x mul:4", "gfx10_asm_vop3.s:13104"),
+        ("050000d600040218", "v_interp_p1_f32_e64 v5, v2, attr0.x div:2", "gfx10_asm_vop3.s:13107"),
+        # gfx10_asm_vop3.s:13110-13152 — v_interp_p2_f32_e64
+        ("050001d600040200", "v_interp_p2_f32_e64 v5, v2, attr0.x", "gfx10_asm_vop3.s:13110"),
+        ("ff0001d600040200", "v_interp_p2_f32_e64 v255, v2, attr0.x", "gfx10_asm_vop3.s:13113"),
+        ("050001d620040200", "v_interp_p2_f32_e64 v5, v2, attr32.x", "gfx10_asm_vop3.s:13122"),
+        ("050001d640040200", "v_interp_p2_f32_e64 v5, v2, attr0.y", "gfx10_asm_vop3.s:13134"),
+        ("058001d600040200", "v_interp_p2_f32_e64 v5, v2, attr0.x clamp", "gfx10_asm_vop3.s:13143"),
+        ("050001d600040210", "v_interp_p2_f32_e64 v5, v2, attr0.x mul:4", "gfx10_asm_vop3.s:13149"),
+        # gfx10_asm_vop3.s:13155-13194 — v_interp_mov_f32_e64 (InterpSlot p10/p20/p0 first operand)
+        ("050002d600000000", "v_interp_mov_f32_e64 v5, p10, attr0.x", "gfx10_asm_vop3.s:13155"),
+        ("ff0002d600000000", "v_interp_mov_f32_e64 v255, p10, attr0.x", "gfx10_asm_vop3.s:13158"),
+        ("050002d620000000", "v_interp_mov_f32_e64 v5, p10, attr32.x", "gfx10_asm_vop3.s:13167"),
+        ("050002d600020000", "v_interp_mov_f32_e64 v5, p20, attr0.x", "gfx10_asm_vop3.s:13170"),
+        ("050002d600040000", "v_interp_mov_f32_e64 v5, p0, attr0.x", "gfx10_asm_vop3.s:13173"),
+        ("050002d6c0000000", "v_interp_mov_f32_e64 v5, p10, attr0.w", "gfx10_asm_vop3.s:13182"),
+        ("058002d600000000", "v_interp_mov_f32_e64 v5, p10, attr0.x clamp", "gfx10_asm_vop3.s:13185"),
+        ("050002d600000008", "v_interp_mov_f32_e64 v5, p10, attr0.x mul:2", "gfx10_asm_vop3.s:13188"),
+        ("050002d600000010", "v_interp_mov_f32_e64 v5, p10, attr0.x mul:4", "gfx10_asm_vop3.s:13191"),
+        ("050002d600000018", "v_interp_mov_f32_e64 v5, p10, attr0.x div:2", "gfx10_asm_vop3.s:13194"),
+    )
+
     # llvm-mc 19.1.7 encodes and prints these; llvm-mc 15 does not know the two opcodes on gfx1013.
     MUBUF_D16_HI_FORMAT_VECTORS = (
         ("000098e000010100", "buffer_load_format_d16_hi_x v1, off, s[4:7], s0"),
@@ -2650,6 +2688,75 @@ class TestRdna2Disasm(unittest.TestCase):
                                         self.assertEqual([record["assembly"]], expected)
         # The grid really contains accepted words, so a decoder that refused everything would fail here.
         self.assertGreater(accepted, 20)
+
+    def test_vop3_interp_f32_e64_golden_vectors(self):
+        """Issue #938: the gfx1013 VOP3 interp spellings at 0x200-0x202 print as LLVM's MC tests do."""
+        for encoding, assembly, provenance in self.VOP3_INTERP_F32_E64_VECTORS:
+            with self.subTest(source=provenance, assembly=assembly):
+                records = disasm_rdna2(bytes.fromhex(encoding))
+                self.assertEqual(len(records), 1)
+                record = records[0]
+                self.assertEqual(record["assembly"], assembly)
+                self.assertEqual(record["opcode"], assembly.split()[0])
+                self.assertEqual(record["length"], len(encoding) // 2)
+                self.assertFalse(record["opcode"].endswith("_unsupported"))
+                # These are VINTRP instructions, and the scan tools must recognize the mnemonics.
+                self.assertTrue(is_opcode_recognized(record["opcode"]))
+                self.assertEqual(classify_isa_category(record["opcode"]),
+                                 "VINTRP (Parameter Interpolation)")
+        # The opcode just past the gfx10 interp range is not an interpolation.
+        record, = disasm_rdna2(bytes.fromhex("050003d600040200"))
+        self.assertEqual(record["opcode"], "v_vop3_203")
+        self.assertEqual(record["length"], 8)
+
+    def test_vop3_interp_f32_e64_fixed_zero_fields_are_refused(self):
+        """Issue #938: VOP3Interp_gfx10 fixes modifier bits and the SRC2 field that LLVM only matches clear."""
+        w0_base = 0xd6000000 | (0x200 << 16) | 5  # op 0x200, vdst v5
+        w1_base = 258 << 9  # src1 = v2, attr0.x
+        refused = {
+            # VOP3Interp_gfx10: Inst{8} = 0, so abs index 0 (the attribute operand) is not modifiable.
+            "abs on the attribute operand": (w0_base | (1 << 8), w1_base),
+            # Inst{10} = 0: there is no third source, so abs index 2 cannot be set.
+            "abs on the absent third source": (w0_base | (1 << 10), w1_base),
+            # Inst{40} = 0: the f16 high bit has no operand in the f32 profile.
+            "high bit": (w0_base, w1_base | (1 << 8)),
+            # Inst{61} = 0 and Inst{63} = 0: neg index 0 and index 2 are fixed zero.
+            "neg on the attribute operand": (w0_base, w1_base | (1 << 29)),
+            "neg on the absent third source": (w0_base, w1_base | (1 << 31)),
+            # Inst{58-50} = 0: no third source field.
+            "third source field": (w0_base, w1_base | (0x104 << 18)),
+        }
+        end = struct.pack("<I", 0xbf810000)
+        for label, (w0, w1) in refused.items():
+            with self.subTest(field=label):
+                records = disasm_rdna2(struct.pack("<2I", w0, w1) + end)
+                self.assertEqual([r["length"] for r in records], [8, 4])
+                self.assertTrue(records[0]["opcode"].endswith("_unsupported"), records[0])
+                self.assertIn("<unsupported VOP3 encoding>", records[0]["assembly"])
+                self.assertEqual(records[1]["opcode"], "s_endpgm")
+        # abs and neg on the data source are allowed, at index 1, and print as LLVM does.
+        for w0_extra, w1_extra, expected in ((1 << 9, 0, "|v2|"), (0, 1 << 30, "-v2"),
+                                             (1 << 9, 1 << 30, "-|v2|")):
+            with self.subTest(modifier=expected):
+                record, = disasm_rdna2(struct.pack("<2I", w0_base | w0_extra, w1_base | w1_extra))
+                self.assertEqual(record["assembly"], f"v_interp_p1_f32_e64 v5, {expected}, attr0.x")
+
+    def test_vop3_interp_f32_e64_llvm_round_trip(self):
+        """Issue #938: the vectors re-assemble to the same bytes and disassemble to the same strings on LLVM."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"VOP3 interp round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        source = [assembly for _, assembly, _ in self.VOP3_INTERP_F32_E64_VECTORS]
+        expected = bytes.fromhex("".join(encoding for encoding, _, _ in self.VOP3_INTERP_F32_E64_VECTORS))
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        self.assertEqual(emitted, expected)
+        decoded = [record["assembly"] for record in disasm_rdna2(emitted)]
+        self.assertEqual(decoded, llvm_disassemble(emitted, resolved_lib))
+        self.assertEqual(decoded, source)
 
     def test_buffer_format_d16_hi_x_golden_vectors(self):
         """Issue #938: buffer_load_format_d16_hi_x and buffer_store_format_d16_hi_x print as LLVM 19 does."""
