@@ -2354,9 +2354,13 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
 
 
 def disassemble_binary(data: bytes, shader_name: str = "shader") -> list[dict]:
-    """Disassemble raw binary RDNA 2 shader into structured instruction records."""
+    """Decode the complete span and mark records after the first s_endpgm.
+
+    after_endpgm describes byte order only. A branch can still reach a later record.
+    """
     instructions = []
     offset = 0
+    after_endpgm = False
     while offset < len(data):
         length, op_name, asm, comment = decode_instruction(data, offset)
         hex_bytes = data[offset:offset + length].hex()
@@ -2367,16 +2371,11 @@ def disassemble_binary(data: bytes, shader_name: str = "shader") -> list[dict]:
             "opcode": op_name,
             "assembly": asm,
             "comment": comment,
-            "after_endpgm": True,
+            "after_endpgm": after_endpgm,
         })
         offset += length
         if op_name == "s_endpgm":
-            # Mark the post-endpgm boundary.  Callers that need to stop
-            # there (e.g. scan_unsupported_shaders) may use this field.
-            # The decoder itself matches LLVM 15 by continuing past the
-            # terminator so every byte in the binary is decoded.
-            for entry in instructions:
-                entry["after_endpgm"] = False
+            after_endpgm = True
     return instructions
 
 

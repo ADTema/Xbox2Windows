@@ -845,6 +845,12 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(insns2[2]["opcode"], "s_endpgm")
         self.assertEqual(insns2[3]["after_endpgm"], True)
 
+        # A second terminator cannot move the first boundary.
+        repeated = disasm_rdna2(stream + bytes.fromhex("000081bf0103007e"))
+        self.assertEqual([ins["after_endpgm"] for ins in repeated], [False, True, True, True])
+        unterminated = disasm_rdna2(bytes.fromhex("0103007e000080bf"))
+        self.assertEqual([ins["after_endpgm"] for ins in unterminated], [False, False])
+
     def test_second_dword_forms_keep_the_stream_aligned(self):
         # Independent GFX10 encodings from LLVM MC 15.0.7 test/MC/AMDGPU (gfx10_asm_vop1.s,
         # gfx10_asm_vop2.s, gfx10_asm_dpp8.s, gfx10_asm_sop.s). Each is one 8-byte instruction.
