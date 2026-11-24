@@ -536,8 +536,11 @@ These are measured on one executable; treat them as hypotheses for others.
   `Texture2DArray.SampleCmpLevelZero(smp, float3(u, v, slice), reference)` on the same constant comparison
   sampler as the 2D form. Before, they were refused with `image_sample_c[_lz] on SQ_RSRC_IMG_2D_ARRAY`.
   `python -B tests/startup_image_sample_c_check.py` translates the fixtures (words checked against `llvm-mc`) and
-  fails seven edited array lowerings. No draw runs this form yet, so the compare result on WARP or hardware is
-  not measured; `image_sample_c_l` stays refused (shader model 6.7).
+  fails seven edited array lowerings. `tests/startup_image_2d_array_check.py` also compiles and draws both
+  comparison forms through `offscreen_check --startup-image-2d-array` against a two-slice `R32_FLOAT` 2D array
+  (depths `0.25` and `0.75` at texel `(1, 0)`, reference `0.5`, `LESS` via the manifest `smpc` line) and requires
+  always-slice-zero and swapped-slice controls to differ (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`).
+  `image_sample_c_l` stays refused (shader model 6.7).
 - **Flat parameters.** `v_interp_mov_f32` reads a `nointerpolation uint4` copy written from the
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
