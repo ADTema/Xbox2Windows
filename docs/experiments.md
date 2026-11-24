@@ -2728,7 +2728,11 @@ The GTX 1060 and Windows 10 in-box WARP matched all 128 export bytes and all
 1,024 pixels with one producer and with the second of two producers selected.
 Selecting the first texture against the second texture's reference changed
 exactly 276 pixels while the exports matched. The debug layer reported zero
-warnings and errors.
+warnings and errors. On Windows 11 build 26300.9974, the Intel Arc 140T
+(32.0.101.8132) matched the same 128 export bytes and 1,024 pixels with one
+producer and with the second of two producers selected, and the stale-binding
+control changed exactly 276 pixels with matching exports, again with zero
+D3D12 debug errors and warnings.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^compute_mesh_texture_fallback_' -V
