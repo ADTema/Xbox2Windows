@@ -77,7 +77,8 @@ class HostCommitChecks(unittest.TestCase):
         self.assertTrue(require_commit_budget(0, budget)["meets_minimum"])
 
     def test_winapi_failure_and_unsupported_host(self):
-        with self.assertRaisesRegex(OSError, "Windows host"):
+        with patch("host_commit.sys.platform", "linux"), \
+                self.assertRaisesRegex(OSError, "Windows host"):
             read_host_commit()
         native = NativeGetPerformance(success=False)
         with patch("host_commit.sys.platform", "win32"), \
