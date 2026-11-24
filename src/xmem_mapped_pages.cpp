@@ -80,6 +80,15 @@ BOOL physical_result(era_physical::Status status) noexcept
 // ERROR_COMMITMENT_LIMIT) when the slot cannot be committed, leaving no state changed.
 bool commit_slot(HANDLE slab, ULONG64 offset, bool zero)
 {
+#ifdef X2W_XMEM_TEST_CONTROLS
+    // Refuse the first commit in a dedicated test process without consuming system commit.
+    static bool refuse_commit = x2w_local::env_on("X2W_XMEM_TEST_COMMIT_FAILURE");
+    if (refuse_commit) {
+        refuse_commit = false;
+        SetLastError(ERROR_COMMITMENT_LIMIT);
+        return false;
+    }
+#endif
     void* view = MapViewOfFile(slab, FILE_MAP_WRITE, static_cast<DWORD>(offset >> 32), static_cast<DWORD>(offset), page_bytes);
     if (!view) return false;
     bool ok = VirtualAlloc(view, page_bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
@@ -103,13 +112,21 @@ HANDLE section_for(ULONG_PTR page)
         return slot.slab;
     }
     const ULONG64 slab_bytes = memory.slots.slab_bytes();
-    const auto make_slab = [slab_bytes](HANDLE& slab) {
+    bool first_slot_committed = false;
+    const auto make_slab = [slab_bytes, &first_slot_committed](HANDLE& slab) {
         slab = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                   static_cast<DWORD>(slab_bytes >> 32), static_cast<DWORD>(slab_bytes), nullptr);
-        return slab != nullptr;
+        if (!slab) return false;
+        first_slot_committed = commit_slot(slab, 0, false);
+        if (!first_slot_committed) {
+            const DWORD error = GetLastError();
+            CloseHandle(slab);
+            SetLastError(error);
+        }
+        return first_slot_committed;
     };
     if (!memory.slots.take_fresh(make_slab, [](HANDLE slab) { CloseHandle(slab); }, slot)) return nullptr;
-    if (!commit_slot(slot.slab, slot.offset, false)) {
+    if (!first_slot_committed && !commit_slot(slot.slab, slot.offset, false)) {
         const DWORD error = GetLastError();
         memory.slots.unwind_fresh(slot);
         SetLastError(error);
@@ -132,15 +149,18 @@ auto owned_reservation(ULONG_PTR address)
     return address - it->first < it->second ? it : memory.reservations.end();
 }
 
-// MEM_REPLACE_PLACEHOLDER needs a placeholder of exactly the view's size. When the range sits inside a
-// larger placeholder (ours or the caller's), split it off first and map again. If the split is refused
-// the range is not a placeholder, so the error of the first map is the one to report.
+// Only split a reservation owned by the shim. Caller-owned placeholders must already match the view.
+// Once a split succeeds, report the retry's result even if it fails for a different reason.
 template <class Map>
 bool map_split(void* target, SIZE_T bytes, Map map)
 {
     if (map()) return true;
     const DWORD error = GetLastError();
-    if (VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) && map()) return true;
+    const auto address = reinterpret_cast<ULONG_PTR>(target);
+    const auto reservation = owned_reservation(address);
+    if (reservation != memory.reservations.end() && bytes <= reservation->second - (address - reservation->first) &&
+        VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+        return map();
     SetLastError(error);
     return false;
 }
