@@ -466,6 +466,10 @@ foreach(mutation IN ITEMS tight wrap size-image)
     add_test(NAME startup_draw_bmp_${mutation}_control COMMAND startup_draw_bmp_check --mutate ${mutation})
     set_tests_properties(startup_draw_bmp_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Names the x2w-noop log gives to command list slots (src/startup_stubs/command_list_slot_names.h, #870).
+add_executable(startup_command_list_slot_names tests/startup_command_list_slot_names.cpp)
+target_compile_features(startup_command_list_slot_names PRIVATE cxx_std_17)
+add_test(NAME startup_command_list_slot_names COMMAND startup_command_list_slot_names)
 # Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.
 add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
 target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
