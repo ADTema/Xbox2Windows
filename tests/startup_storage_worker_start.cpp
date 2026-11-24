@@ -74,7 +74,11 @@ void* operator new(std::size_t size)
         ++thrown;
         throw std::bad_alloc();
     }
-    if (global_countdown.load(std::memory_order_relaxed) > 0 && global_countdown.fetch_sub(1) == 1) {
+    // On the queue's worker only buffer-sized allocations are counted: a small one there is the container
+    // proxy that MSVC's debug mode allocates inside a noexcept vector constructor, which has no recovery
+    // (std::terminate), while a failed buffer allocation fails the request.
+    const bool countable = size >= 4096 || GetCurrentThreadId() == main_thread_id;
+    if (countable && global_countdown.load(std::memory_order_relaxed) > 0 && global_countdown.fetch_sub(1) == 1) {
         ++thrown;
         throw std::bad_alloc();
     }
