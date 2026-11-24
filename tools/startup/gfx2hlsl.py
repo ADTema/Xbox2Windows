@@ -673,9 +673,10 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
-        word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32') or base in SHIFT_ADD
+        shift_add = base in SHIFT_ADD
+        word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         word_pack = base == 's_pack_hh_b32_b16'
-        if word_complement or word_pack:
+        if shift_add or word_complement or word_pack:
             # The per-lane mask cannot supply the full word needed by these operations.
             def lane_mask(t):
                 r = reg_range(t)
@@ -683,6 +684,8 @@ class Stage:
                         or bool(r and r[0] == 's' and r[1] in self.masks))
             if lane_mask(dname) or any(lane_mask(t) for t in srcs):
                 raise Unsupported('%s on a lane mask' % base)
+        if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
+            raise Unsupported('%s destination %s' % (base, dname))
         if word_pack:
             if dname != 'm0' and (dst is None or dst[0] != 's' or dst[1] > 105):
                 raise Unsupported('%s destination %s' % (base, dname))
@@ -699,7 +702,7 @@ class Stage:
             return self.sym.get(r[1]) if r and r[0] == 's' else None
         syms = [src_sym(t) for t in srcs]
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
-            if word_complement:
+            if shift_add or word_complement:
                 raise Unsupported('scc from descriptor data')
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
@@ -728,7 +731,7 @@ class Stage:
             return None
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
-        if base in SHIFT_ADD:
+        if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]
             self.emit('scc = (%s >> %d) != 0 || (%s) < %s;' % (values[0], 32 - n, expr, values[1]))
@@ -1743,7 +1746,7 @@ SCA = {
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
-    # s_lshlN_add_u32: (S0 << N) + S1. SCC is the carry out of the 33-bit-wide sum, written from SHIFT_ADD below.
+    # s_lshlN_add_u32: low 32 bits of (S0 << N) + S1. SHIFT_ADD also supplies SCC for wide overflow.
     's_lshl1_add_u32': ('({0} << 1) + {1}', None), 's_lshl2_add_u32': ('({0} << 2) + {1}', None),
     's_lshl3_add_u32': ('({0} << 3) + {1}', None), 's_lshl4_add_u32': ('({0} << 4) + {1}', None),
 }

@@ -29,7 +29,7 @@ SPECIAL = [0, MASK, 0xaaaaaaaa, 0x55555555, 0x80000000, 0x7fffffff, 1, 0xfffffff
 VALUES = SPECIAL + [1 << k for k in range(32)] + [~(1 << k) & MASK for k in range(32)]
 PAIRS = [(a, b) for a in SPECIAL for b in VALUES] + [(a, b) for a in VALUES for b in SPECIAL]
 SCC_UNSET = 2
-VCC_LO, M0, EXEC_LO, LITERAL = 106, 124, 126, 255
+VCC_LO, M0, NULL, EXEC_LO, LITERAL = 106, 124, 125, 126, 255
 INLINE = {128: 0, 129: 1, 193: MASK}
 # (sdst, ssrc0, ssrc1, literal)
 FORMS = [(3, 1, 2, None), (1, 1, 2, None), (2, 1, 2, None), (3, 1, 1, None), (3, 128, 2, None),
@@ -117,6 +117,9 @@ for n in NAMES:
     refused = [translate(sop2(NAMES[n], *form))[0] for form in MASK_FORMS]
     check('%s refuses lane-mask sources and destinations' % NAMES[n],
           all(r.startswith('refused: ') for r in refused), str(refused))
+    refused_null = translate(sop2(NAMES[n], NULL, 129, 129))
+    check('%s refuses the discard destination without raising a translator error' % NAMES[n],
+          refused_null == ['refused: %s destination null' % NAMES[n]], str(refused_null))
 
 if failures:
     print('FAILED: %s' % ', '.join(failures))
