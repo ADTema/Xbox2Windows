@@ -1,23 +1,40 @@
-// Fixture-only desktop xgameruntime.dll skeleton. It is built into the test
-// fixture directory, never beside the normal shims, and does not claim ABI
-// completeness: every public thunk below records its component and function,
-// then returns E_NOTIMPL until a real implementation lands.
+// Fixture-only desktop xgameruntime.dll. It is built into the test fixture
+// directory, never beside the normal shims. The table below distinguishes
+// implemented synchronous contracts from logged E_NOTIMPL stubs. This is not
+// an ABI-complete XGameRuntime provider.
 //
-// The public names and signatures are taken from the Microsoft GDK reference:
+// Public GDK references used for the names and signatures:
 //   XUserAddAsync                       https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xuser/functions/xuseraddasync?view=gdk-2604
+//   XUserFindUserById                   https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xuser/functions/xuserfinduserbyid?view=gdk-2610
+//   XUserGetId                          https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xuser/functions/xusergetid?view=gdk-2610
+//   XUserDuplicateHandle                https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xuser/functions/xuserduplicatehandle?view=gdk-2604
+//   XUserCloseHandle                    https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xuser/functions/xuserclosehandle?view=gdk-2604
 //   XGameSaveInitializeProviderAsync    https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveinitializeproviderasync?view=gdk-2610
+//   XGameSaveInitializeProvider         https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveinitializeprovider?view=gdk-2604
+//   XGameSaveCreateContainer            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavecreatecontainer?view=gdk-2604
+//   XGameSaveCreateUpdate               https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavecreateupdate?view=gdk-2610
+//   XGameSaveSubmitBlobWrite            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavesubmitblobwrite?view=gdk-2604
+//   XGameSaveSubmitUpdate               https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavesubmitupdate?view=gdk-2610
+//   XGameSaveReadBlobData               https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavereadblobdata?view=gdk-2604
+//   XGameSaveCloseProvider              https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavecloseprovider?view=gdk-2610
+//   XGameSaveCloseContainer             https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveclosecontainer?view=gdk-2610
+//   XGameSaveCloseUpdate                https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavecloseupdate?view=gdk-2610
 //   XPackageMountWithUiAsync            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackagemountwithuiasync?view=gdk-2610
 //   XSystemGetConsoleId                 https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xsystem/functions/xsystemgetconsoleid?view=gdk-2604
 //   XGameGetXboxTitleId                 https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgame/functions/xgamegetxboxtitleid?view=gdk-2604
 //   XAsyncGetStatus                     https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasyncgetstatus?view=gdk-2604
 //   XTaskQueueCreate                    https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuecreate?view=gdk-2604
 //
-// The opaque types stand in for the public headers so this skeleton has no GDK
-// SDK dependency. WINAPI is explicit on x64 Windows; the platform has one
-// function calling convention.
+// Async gap: XUserAddAsync and XGameSaveInitializeProviderAsync remain stubs.
+// Their public completion contract depends on XAsyncBlock plus
+// XUserAddResult/XGameSaveInitializeProviderResult queue, callback and result
+// semantics. This repository has no GDK headers, so the shim does not invent
+// that async completion state. The synchronous XUser/XGameSave subset below is
+// the implemented surface.
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -28,16 +45,33 @@
 #include <windows.h>
 
 struct XAsyncBlock;
+namespace xgameruntime_shim {
 struct XUserHandleStorage;
-using XUserHandle = XUserHandleStorage*;
+struct XGameSaveProviderStorage;
+struct XGameSaveContainerStorage;
+struct XGameSaveUpdateStorage;
+}
+using XUserHandle = xgameruntime_shim::XUserHandleStorage*;
 struct XTaskQueueHandleStorage;
 using XTaskQueueHandle = XTaskQueueHandleStorage*;
+using XGameSaveProviderHandle = xgameruntime_shim::XGameSaveProviderStorage*;
+using XGameSaveContainerHandle = xgameruntime_shim::XGameSaveContainerStorage*;
+using XGameSaveUpdateHandle = xgameruntime_shim::XGameSaveUpdateStorage*;
 enum XUserAddOptions : std::uint32_t;
 enum XTaskQueueDispatchMode : std::uint32_t;
 
-// Shim-only observability interface. It is not a GDK API. GetLog returns the
-// number of entries in the bounded log and copies the oldest available entries;
-// ClearLog is used by the load test and for repeatable diagnostics.
+// Public XGameSave.h structures used by the synchronous read contract.
+struct XGameSaveBlobInfo {
+    const char* name;
+    std::uint32_t size;
+};
+
+struct XGameSaveBlob {
+    XGameSaveBlobInfo info;
+    std::uint8_t* data;
+};
+
+// Shim-only observability interface. It is not a GDK API.
 struct XGameRuntimeShimLogEntry {
     std::uint32_t sequence;
     HRESULT result;
@@ -51,37 +85,58 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, result) == 4);
 static_assert(offsetof(XGameRuntimeShimLogEntry, component) == 8);
 static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
 
-// This one list is expanded to define the exported thunks and to populate the
-// inspectable metadata table. Adding an entry cannot change one without the
-// other. The signatures are the public GDK signatures documented above.
+// Each row has one export name and one component. The state is either stub or
+// implemented_{hr,void}; implemented rows name an internal function and its
+// arguments, while stub rows deliberately have no implementation arguments.
+// The same row list defines the exports and the inspectable metadata table.
 #define XGAMERUNTIME_THUNK_TABLE(X) \
-    X(XUserAddAsync, XUser, (XUserAddOptions, XAsyncBlock*)) \
-    X(XGameSaveInitializeProviderAsync, XGameSave, (XUserHandle, const char*, bool, XAsyncBlock*)) \
-    X(XPackageMountWithUiAsync, XPackage, (const char*, XAsyncBlock*)) \
-    X(XSystemGetConsoleId, XSystem, (std::size_t, char*, std::size_t*)) \
-    X(XGameGetXboxTitleId, XGame, (std::uint32_t*)) \
-    X(XAsyncGetStatus, XAsync, (XAsyncBlock*, bool)) \
-    X(XTaskQueueCreate, XTaskQueue, (XTaskQueueDispatchMode, XTaskQueueDispatchMode, XTaskQueueHandle*))
+    X(XUserAddAsync, XUser, HRESULT, (XUserAddOptions, XAsyncBlock*), stub, (), stub) \
+    X(XUserFindUserById, XUser, HRESULT, (std::uint64_t userId, XUserHandle* handle), implemented_hr, (userId, handle), user_find_by_id) \
+    X(XUserGetId, XUser, HRESULT, (XUserHandle user, std::uint64_t* userId), implemented_hr, (user, userId), user_get_id) \
+    X(XUserDuplicateHandle, XUser, HRESULT, (XUserHandle handle, XUserHandle* duplicatedHandle), implemented_hr, (handle, duplicatedHandle), user_duplicate_handle) \
+    X(XUserCloseHandle, XUser, void, (XUserHandle user), implemented_void, (user), user_close_handle) \
+    X(XGameSaveInitializeProviderAsync, XGameSave, HRESULT, (XUserHandle, const char*, bool, XAsyncBlock*), stub, (), stub) \
+    X(XGameSaveInitializeProvider, XGameSave, HRESULT, (XUserHandle requestingUser, const char* configurationId, bool syncOnDemand, XGameSaveProviderHandle* provider), implemented_hr, (requestingUser, configurationId, syncOnDemand, provider), game_save_initialize_provider) \
+    X(XGameSaveCreateContainer, XGameSave, HRESULT, (XGameSaveProviderHandle provider, const char* containerName, XGameSaveContainerHandle* containerContext), implemented_hr, (provider, containerName, containerContext), game_save_create_container) \
+    X(XGameSaveCreateUpdate, XGameSave, HRESULT, (XGameSaveContainerHandle container, const char* containerDisplayName, XGameSaveUpdateHandle* updateContext), implemented_hr, (container, containerDisplayName, updateContext), game_save_create_update) \
+    X(XGameSaveSubmitBlobWrite, XGameSave, HRESULT, (XGameSaveUpdateHandle updateContext, const char* blobName, const std::uint8_t* data, std::size_t byteCount), implemented_hr, (updateContext, blobName, data, byteCount), game_save_submit_blob_write) \
+    X(XGameSaveSubmitUpdate, XGameSave, HRESULT, (XGameSaveUpdateHandle updateContext), implemented_hr, (updateContext), game_save_submit_update) \
+    X(XGameSaveReadBlobData, XGameSave, HRESULT, (XGameSaveContainerHandle container, const char** blobNames, std::uint32_t* countOfBlobs, std::size_t blobsSize, XGameSaveBlob* blobData), implemented_hr, (container, blobNames, countOfBlobs, blobsSize, blobData), game_save_read_blob_data) \
+    X(XGameSaveCloseProvider, XGameSave, void, (XGameSaveProviderHandle provider), implemented_void, (provider), game_save_close_provider) \
+    X(XGameSaveCloseContainer, XGameSave, void, (XGameSaveContainerHandle context), implemented_void, (context), game_save_close_container) \
+    X(XGameSaveCloseUpdate, XGameSave, void, (XGameSaveUpdateHandle context), implemented_void, (context), game_save_close_update) \
+    X(XPackageMountWithUiAsync, XPackage, HRESULT, (const char*, XAsyncBlock*), stub, (), stub) \
+    X(XSystemGetConsoleId, XSystem, HRESULT, (std::size_t, char*, std::size_t*), stub, (), stub) \
+    X(XGameGetXboxTitleId, XGame, HRESULT, (std::uint32_t*), stub, (), stub) \
+    X(XAsyncGetStatus, XAsync, HRESULT, (XAsyncBlock*, bool), stub, (), stub) \
+    X(XTaskQueueCreate, XTaskQueue, HRESULT, (XTaskQueueDispatchMode, XTaskQueueDispatchMode, XTaskQueueHandle*), stub, (), stub)
 
 namespace xgameruntime_shim {
 constexpr HRESULT not_implemented = static_cast<HRESULT>(0x80004001L);
 static_assert(not_implemented == E_NOTIMPL);
 
+constexpr std::uint64_t synthetic_user_id = 0x0009000000000001ull;
+constexpr std::size_t user_capacity = 8;
+constexpr std::size_t provider_capacity = 4;
+constexpr std::size_t container_capacity = 4;
+constexpr std::size_t update_capacity = 4;
+constexpr std::size_t blob_capacity = 4;
+constexpr std::size_t container_name_capacity = 257;
+constexpr std::size_t blob_name_capacity = 64;
+constexpr std::size_t blob_bytes_capacity = 1024;
+constexpr HRESULT e_gs_invalid_container_name = static_cast<HRESULT>(0x80830001L);
+
+// Synthetic identity and storage policy. There is exactly one XUser identity,
+// and XGameSave state lives only in this process. Nothing is persisted to disk.
+
+enum class FunctionState { stub, implemented_hr, implemented_void };
+
 struct ThunkEntry {
     const char* name;
     const char* component;
     const char* function;
+    FunctionState state;
 };
-
-#define XGAMERUNTIME_COUNT_THUNK(name, component, parameters) +1
-inline constexpr std::size_t thunk_count = 0 XGAMERUNTIME_THUNK_TABLE(XGAMERUNTIME_COUNT_THUNK);
-#undef XGAMERUNTIME_COUNT_THUNK
-
-#define XGAMERUNTIME_TABLE_ROW(name, component, parameters) ThunkEntry{#name, #component, #name},
-inline constexpr std::array<ThunkEntry, thunk_count> thunks = {
-    XGAMERUNTIME_THUNK_TABLE(XGAMERUNTIME_TABLE_ROW)
-};
-#undef XGAMERUNTIME_TABLE_ROW
 
 constexpr bool same_text(const char* left, const char* right) noexcept
 {
@@ -91,6 +146,17 @@ constexpr bool same_text(const char* left, const char* right) noexcept
     }
     return *left == *right;
 }
+
+#define XGAMERUNTIME_COUNT_THUNK(name, component, return_type, parameters, state, args, implementation) +1
+inline constexpr std::size_t thunk_count = 0 XGAMERUNTIME_THUNK_TABLE(XGAMERUNTIME_COUNT_THUNK);
+#undef XGAMERUNTIME_COUNT_THUNK
+
+#define XGAMERUNTIME_TABLE_ROW(name, component, return_type, parameters, state, args, implementation) \
+    ThunkEntry{#name, #component, #name, FunctionState::state},
+inline constexpr std::array<ThunkEntry, thunk_count> thunks = {
+    XGAMERUNTIME_THUNK_TABLE(XGAMERUNTIME_TABLE_ROW)
+};
+#undef XGAMERUNTIME_TABLE_ROW
 
 constexpr bool valid_thunk_table(const std::array<ThunkEntry, thunk_count>& table) noexcept
 {
@@ -115,8 +181,25 @@ constexpr bool has_component(const std::array<ThunkEntry, thunk_count>& table,
     return false;
 }
 
-// A malformed table fails at compile time rather than producing an ambiguous
-// export at load time.
+constexpr bool has_implemented(const std::array<ThunkEntry, thunk_count>& table,
+                               const char* component) noexcept
+{
+    for (const auto& entry : table) {
+        if (same_text(entry.component, component) && entry.state != FunctionState::stub) return true;
+    }
+    return false;
+}
+
+constexpr bool has_stub(const std::array<ThunkEntry, thunk_count>& table, const char* name) noexcept
+{
+    for (const auto& entry : table) {
+        if (same_text(entry.name, name)) return entry.state == FunctionState::stub;
+    }
+    return false;
+}
+
+// A malformed table fails at compile time. The async functions stay explicit
+// stubs: no result structure or completion queue is fabricated.
 static_assert(valid_thunk_table(thunks), "XGameRuntime thunk table has an empty or duplicate name");
 static_assert(has_component(thunks, "XUser"));
 static_assert(has_component(thunks, "XGameSave"));
@@ -125,7 +208,418 @@ static_assert(has_component(thunks, "XSystem"));
 static_assert(has_component(thunks, "XGame"));
 static_assert(has_component(thunks, "XAsync"));
 static_assert(has_component(thunks, "XTaskQueue"));
+static_assert(has_implemented(thunks, "XUser"));
+static_assert(has_implemented(thunks, "XGameSave"));
+static_assert(has_stub(thunks, "XUserAddAsync"));
+static_assert(has_stub(thunks, "XGameSaveInitializeProviderAsync"));
 
+struct XUserHandleStorage {
+    std::uint64_t id = 0;
+    std::uint32_t references = 0;
+    bool live = false;
+};
+
+struct BlobSlot {
+    bool live = false;
+    char name[blob_name_capacity]{};
+    std::uint32_t size = 0;
+    std::array<std::uint8_t, blob_bytes_capacity> data{};
+};
+
+struct XGameSaveProviderStorage {
+    bool live = false;
+};
+
+struct XGameSaveContainerStorage {
+    bool live = false;
+    XGameSaveProviderStorage* provider = nullptr;
+    char name[container_name_capacity]{};
+    std::array<BlobSlot, blob_capacity> blobs{};
+};
+
+struct XGameSaveUpdateStorage {
+    bool live = false;
+    XGameSaveContainerStorage* container = nullptr;
+    char display_name[container_name_capacity]{};
+    std::array<BlobSlot, blob_capacity> staged{};
+};
+
+struct RuntimeState {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::array<XUserHandleStorage, user_capacity> users{};
+    std::array<XGameSaveProviderStorage, provider_capacity> providers{};
+    std::array<XGameSaveContainerStorage, container_capacity> containers{};
+    std::array<XGameSaveUpdateStorage, update_capacity> updates{};
+};
+
+RuntimeState runtime_state;
+
+template <typename T, std::size_t N>
+T* find_live(std::array<T, N>& slots, const void* pointer) noexcept
+{
+    for (auto& slot : slots) {
+        if (slot.live && &slot == pointer) return &slot;
+    }
+    return nullptr;
+}
+
+bool copy_text(char* destination, std::size_t capacity, const char* source) noexcept
+{
+    if (!destination || !source) return false;
+    const std::size_t length = std::strlen(source);
+    if (length == 0 || length >= capacity) return false;
+    std::memcpy(destination, source, length + 1);
+    return true;
+}
+
+bool valid_container_name(const char* name) noexcept
+{
+    if (!name) return false;
+    const std::size_t length = std::strlen(name);
+    if (length == 0 || length >= container_name_capacity) return false;
+    const char* slash = std::strrchr(name, '/');
+    const char* filename = slash ? slash + 1 : name;
+    if (!*filename || filename[std::strlen(filename) - 1] == '.') return false;
+    for (const char* cursor = name; *cursor; ++cursor) {
+        const bool in_filename = cursor >= filename;
+        const char c = *cursor;
+        const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool digit = c >= '0' && c <= '9';
+        if (in_filename) {
+            if (!(alpha || digit || c == '_' || c == '.' || c == '-')) return false;
+        } else if (!(alpha || digit || c == '_' || c == '/')) {
+            return false;
+        }
+    }
+    for (const char* cursor = filename; cursor[0] && cursor[1]; ++cursor) {
+        if (cursor[0] == '.' && cursor[1] == '.') return false;
+    }
+    return true;
+}
+
+bool valid_blob_name(const char* name) noexcept
+{
+    if (!name) return false;
+    const std::size_t length = std::strlen(name);
+    return length > 0 && length < blob_name_capacity;
+}
+
+BlobSlot* find_blob(std::array<BlobSlot, blob_capacity>& blobs, const char* name) noexcept
+{
+    for (auto& blob : blobs) {
+        if (blob.live && std::strcmp(blob.name, name) == 0) return &blob;
+    }
+    return nullptr;
+}
+
+BlobSlot* free_blob(std::array<BlobSlot, blob_capacity>& blobs) noexcept
+{
+    for (auto& blob : blobs) {
+        if (!blob.live) return &blob;
+    }
+    return nullptr;
+}
+
+bool set_blob(BlobSlot& blob, const char* name, const std::uint8_t* data,
+              std::size_t byte_count) noexcept
+{
+    if (!valid_blob_name(name) || byte_count > blob_bytes_capacity ||
+        (byte_count != 0 && !data)) {
+        return false;
+    }
+    blob = BlobSlot{};
+    std::memcpy(blob.name, name, std::strlen(name) + 1);
+    blob.size = static_cast<std::uint32_t>(byte_count);
+    if (byte_count) std::memcpy(blob.data.data(), data, byte_count);
+    blob.live = true;
+    return true;
+}
+
+HRESULT user_find_by_id(std::uint64_t user_id, XUserHandle* handle) noexcept
+{
+    if (!handle) return E_POINTER;
+    *handle = nullptr;
+    if (user_id != synthetic_user_id) return E_INVALIDARG;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    for (auto& slot : runtime_state.users) {
+        if (!slot.live) {
+            slot = XUserHandleStorage{synthetic_user_id, 1, true};
+            *handle = &slot;
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return S_OK;
+        }
+    }
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return E_OUTOFMEMORY;
+}
+
+HRESULT user_get_id(XUserHandle user, std::uint64_t* user_id) noexcept
+{
+    if (!user_id) return E_POINTER;
+    *user_id = 0;
+    AcquireSRWLockShared(&runtime_state.lock);
+    const auto found = find_live(runtime_state.users, user);
+    if (found) *user_id = found->id;
+    ReleaseSRWLockShared(&runtime_state.lock);
+    return found ? S_OK : E_HANDLE;
+}
+
+HRESULT user_duplicate_handle(XUserHandle handle, XUserHandle* duplicated_handle) noexcept
+{
+    if (!duplicated_handle) return E_POINTER;
+    *duplicated_handle = nullptr;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const auto source = find_live(runtime_state.users, handle);
+    if (!source) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    for (auto& slot : runtime_state.users) {
+        if (!slot.live) {
+            slot = XUserHandleStorage{source->id, 1, true};
+            *duplicated_handle = &slot;
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return S_OK;
+        }
+    }
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return E_OUTOFMEMORY;
+}
+
+HRESULT user_close_handle(XUserHandle user) noexcept
+{
+    if (!user) return E_HANDLE;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const auto found = find_live(runtime_state.users, user);
+    if (!found) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    if (found->references > 1) {
+        --found->references;
+    } else {
+        *found = XUserHandleStorage{};
+    }
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return S_OK;
+}
+
+HRESULT game_save_initialize_provider(XUserHandle requesting_user, const char* configuration_id,
+                                      bool sync_on_demand, XGameSaveProviderHandle* provider) noexcept
+{
+    (void)sync_on_demand;
+    if (!provider) return E_POINTER;
+    *provider = nullptr;
+    if (!configuration_id || !configuration_id[0]) return E_INVALIDARG;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    if (!find_live(runtime_state.users, requesting_user)) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    for (auto& slot : runtime_state.providers) {
+        if (!slot.live) {
+            slot.live = true;
+            *provider = &slot;
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return S_OK;
+        }
+    }
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return E_OUTOFMEMORY;
+}
+
+HRESULT game_save_create_container(XGameSaveProviderHandle provider, const char* container_name,
+                                   XGameSaveContainerHandle* container) noexcept
+{
+    if (!container) return E_POINTER;
+    *container = nullptr;
+    if (!valid_container_name(container_name)) return e_gs_invalid_container_name;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const auto found_provider = find_live(runtime_state.providers, provider);
+    if (!found_provider) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    for (auto& slot : runtime_state.containers) {
+        if (!slot.live) {
+            slot = XGameSaveContainerStorage{};
+            slot.live = true;
+            slot.provider = found_provider;
+            if (!copy_text(slot.name, sizeof(slot.name), container_name)) {
+                slot = XGameSaveContainerStorage{};
+                ReleaseSRWLockExclusive(&runtime_state.lock);
+                return E_INVALIDARG;
+            }
+            *container = &slot;
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return S_OK;
+        }
+    }
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return E_OUTOFMEMORY;
+}
+
+HRESULT game_save_create_update(XGameSaveContainerHandle container, const char* display_name,
+                                XGameSaveUpdateHandle* update) noexcept
+{
+    if (!update) return E_POINTER;
+    *update = nullptr;
+    if (!display_name || std::strlen(display_name) >= container_name_capacity) return E_INVALIDARG;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const auto found_container = find_live(runtime_state.containers, container);
+    if (!found_container) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    for (auto& slot : runtime_state.updates) {
+        if (!slot.live) {
+            slot = XGameSaveUpdateStorage{};
+            slot.live = true;
+            slot.container = found_container;
+            if (!copy_text(slot.display_name, sizeof(slot.display_name), display_name)) {
+                slot = XGameSaveUpdateStorage{};
+                ReleaseSRWLockExclusive(&runtime_state.lock);
+                return E_INVALIDARG;
+            }
+            *update = &slot;
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return S_OK;
+        }
+    }
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return E_OUTOFMEMORY;
+}
+
+HRESULT game_save_submit_blob_write(XGameSaveUpdateHandle update, const char* blob_name,
+                                    const std::uint8_t* data, std::size_t byte_count) noexcept
+{
+    if (!update) return E_HANDLE;
+    if (!valid_blob_name(blob_name) || (byte_count != 0 && !data) ||
+        byte_count > blob_bytes_capacity) {
+        return E_INVALIDARG;
+    }
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const auto found = find_live(runtime_state.updates, update);
+    if (!found) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    auto destination = find_blob(found->staged, blob_name);
+    if (!destination) destination = free_blob(found->staged);
+    const bool copied = destination && set_blob(*destination, blob_name, data, byte_count);
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return copied ? S_OK : E_OUTOFMEMORY;
+}
+
+HRESULT game_save_submit_update(XGameSaveUpdateHandle update) noexcept
+{
+    if (!update) return E_HANDLE;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const auto found = find_live(runtime_state.updates, update);
+    if (!found) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    const auto container = find_live(runtime_state.containers, found->container);
+    if (!container) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    auto next = container->blobs;
+    for (const auto& staged : found->staged) {
+        if (!staged.live) continue;
+        auto destination = find_blob(next, staged.name);
+        if (!destination) destination = free_blob(next);
+        if (!destination) {
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return E_OUTOFMEMORY;
+        }
+        *destination = staged;
+    }
+    container->blobs = next;
+    found->staged = {};
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return S_OK;
+}
+
+// This subset reads an explicit non-empty name list into a caller-owned buffer.
+// It does not implement the null-list enumeration variant from the full GDK API.
+HRESULT game_save_read_blob_data(XGameSaveContainerHandle container, const char** blob_names,
+                                 std::uint32_t* count_of_blobs, std::size_t blobs_size,
+                                 XGameSaveBlob* blob_data) noexcept
+{
+    if (!count_of_blobs) return E_POINTER;
+    const std::uint32_t requested = *count_of_blobs;
+    *count_of_blobs = 0;
+    if (!container || !blob_names || !blob_data || requested == 0) return E_INVALIDARG;
+    AcquireSRWLockShared(&runtime_state.lock);
+    const auto found_container = find_live(runtime_state.containers, container);
+    if (!found_container) {
+        ReleaseSRWLockShared(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    std::size_t total = requested * sizeof(XGameSaveBlob);
+    for (std::uint32_t i = 0; i < requested; ++i) {
+        const auto blob = find_blob(found_container->blobs, blob_names[i]);
+        if (!blob) {
+            ReleaseSRWLockShared(&runtime_state.lock);
+            return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        }
+        total += blob->size;
+    }
+    if (total > blobs_size) {
+        ReleaseSRWLockShared(&runtime_state.lock);
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
+    auto cursor = reinterpret_cast<std::uint8_t*>(blob_data + requested);
+    for (std::uint32_t i = 0; i < requested; ++i) {
+        const auto blob = find_blob(found_container->blobs, blob_names[i]);
+        blob_data[i].info.name = blob->name;
+        blob_data[i].info.size = blob->size;
+        blob_data[i].data = cursor;
+        if (blob->size) std::memcpy(cursor, blob->data.data(), blob->size);
+        cursor += blob->size;
+    }
+    *count_of_blobs = requested;
+    ReleaseSRWLockShared(&runtime_state.lock);
+    return S_OK;
+}
+
+HRESULT game_save_close_provider(XGameSaveProviderHandle provider) noexcept
+{
+    if (!provider) return E_HANDLE;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const auto found = find_live(runtime_state.providers, provider);
+    if (found) *found = XGameSaveProviderStorage{};
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return found ? S_OK : E_HANDLE;
+}
+
+HRESULT game_save_close_container(XGameSaveContainerHandle container) noexcept
+{
+    if (!container) return E_HANDLE;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const auto found = find_live(runtime_state.containers, container);
+    if (found) *found = XGameSaveContainerStorage{};
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return found ? S_OK : E_HANDLE;
+}
+
+HRESULT game_save_close_update(XGameSaveUpdateHandle update) noexcept
+{
+    if (!update) return E_HANDLE;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const auto found = find_live(runtime_state.updates, update);
+    if (found) *found = XGameSaveUpdateStorage{};
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return found ? S_OK : E_HANDLE;
+}
+
+}  // namespace xgameruntime_shim
+
+// The handle implementations above are intentionally small and explicit. The
+// table wrappers below add the bounded log without duplicating public names.
+namespace xgameruntime_shim {
 constexpr std::size_t log_capacity = 64;
 
 struct LogState {
@@ -138,7 +632,7 @@ struct LogState {
 
 LogState log_state;
 
-HRESULT record_call(const char* component, const char* function) noexcept
+HRESULT record_result(const char* component, const char* function, HRESULT result) noexcept
 {
     AcquireSRWLockExclusive(&log_state.lock);
     if (log_state.count == log_state.entries.size()) {
@@ -147,10 +641,15 @@ HRESULT record_call(const char* component, const char* function) noexcept
     }
     const auto index = (log_state.first + log_state.count) % log_state.entries.size();
     log_state.entries[index] = XGameRuntimeShimLogEntry{
-        log_state.next_sequence++, not_implemented, component, function};
+        log_state.next_sequence++, result, component, function};
     ++log_state.count;
     ReleaseSRWLockExclusive(&log_state.lock);
-    return not_implemented;
+    return result;
+}
+
+HRESULT record_stub(const char* component, const char* function) noexcept
+{
+    return record_result(component, function, not_implemented);
 }
 
 std::size_t copy_log(XGameRuntimeShimLogEntry* output, std::size_t capacity) noexcept
@@ -176,12 +675,33 @@ void clear_log() noexcept
 }
 }  // namespace xgameruntime_shim
 
-#define XGAMERUNTIME_DEFINE_THUNK(name, component, parameters) \
-    extern "C" __declspec(dllexport) HRESULT WINAPI name parameters noexcept \
+#define XGAMERUNTIME_DEFINE_THUNK(name, component, return_type, parameters, state, args, implementation) \
+    XGAMERUNTIME_DEFINE_THUNK_##state(name, component, return_type, parameters, args, implementation)
+
+#define XGAMERUNTIME_DEFINE_THUNK_stub(name, component, return_type, parameters, args, implementation) \
+    extern "C" __declspec(dllexport) return_type WINAPI name parameters noexcept \
     { \
-        return ::xgameruntime_shim::record_call(#component, #name); \
+        return ::xgameruntime_shim::record_stub(#component, #name); \
     }
+
+#define XGAMERUNTIME_DEFINE_THUNK_implemented_hr(name, component, return_type, parameters, args, implementation) \
+    extern "C" __declspec(dllexport) return_type WINAPI name parameters noexcept \
+    { \
+        const HRESULT x2w_result = ::xgameruntime_shim::implementation args; \
+        return ::xgameruntime_shim::record_result(#component, #name, x2w_result); \
+    }
+
+#define XGAMERUNTIME_DEFINE_THUNK_implemented_void(name, component, return_type, parameters, args, implementation) \
+    extern "C" __declspec(dllexport) void WINAPI name parameters noexcept \
+    { \
+        const HRESULT x2w_result = ::xgameruntime_shim::implementation args; \
+        ::xgameruntime_shim::record_result(#component, #name, x2w_result); \
+    }
+
 XGAMERUNTIME_THUNK_TABLE(XGAMERUNTIME_DEFINE_THUNK)
+#undef XGAMERUNTIME_DEFINE_THUNK_implemented_void
+#undef XGAMERUNTIME_DEFINE_THUNK_implemented_hr
+#undef XGAMERUNTIME_DEFINE_THUNK_stub
 #undef XGAMERUNTIME_DEFINE_THUNK
 
 extern "C" __declspec(dllexport) std::size_t WINAPI XGameRuntimeShimGetLog(

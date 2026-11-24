@@ -6310,6 +6310,32 @@ omitting the 2Sum midpoint correction (double-rounding), or flushing intermediat
 subnormals (`ftz`) report pixel mismatches under `--check-pixel-case`.
 
 
+## Fixture-only XGameRuntime synchronous contracts
+
+The fixture-only `src/xgameruntime_shim.cpp` now distinguishes logged stubs from
+synchronous implementations in its single X-macro table. The synthetic XUser
+identity is `0x0009000000000001`; `XUserFindUserById`, `XUserGetId`,
+`XUserDuplicateHandle`, and `XUserCloseHandle` expose its handle lifecycle. The
+XGameSave synchronous subset (`XGameSaveInitializeProvider`,
+`XGameSaveCreateContainer`, `XGameSaveCreateUpdate`,
+`XGameSaveSubmitBlobWrite`, `XGameSaveSubmitUpdate`, `XGameSaveReadBlobData`, and
+the close functions) stores up to four blobs of 1,024 bytes per in-memory
+container. It does not persist to disk, synchronize with Xbox services, or claim
+the full provider semantics.
+
+`XUserAddAsync` and `XGameSaveInitializeProviderAsync` remain explicit stubs.
+Their completion contract requires the public `XAsyncBlock`, `XUserAddResult`,
+and `XGameSaveInitializeProviderResult` queue/callback/result semantics, which
+this repository does not model without GDK headers. `xgameruntime_contracts`
+exercises the synchronous subset and checks that no XUser/XGameSave call logs
+`E_NOTIMPL`; it then calls XPackage and XGame stubs as negative controls. The
+DLL remains under `out/build/dev/fixture-shims/` and is loaded by explicit path.
+
+```powershell
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check
+ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
+```
+
 ## Offline package PE import closure
 
 `tools/pe_package_preflight.py` reads PE import and export tables from a
@@ -6335,10 +6361,10 @@ unverified. This is not a prediction that the image will start or run correctly.
 
 `pe_run_package.plan(report, allow_external=False)` adds a strict closed-package
 check. Every reachable import must terminate in a bundled export; an
-`external_unverified` import, including the fixture-only XGameRuntime stub, is
+`external_unverified` import, including the fixture-only XGameRuntime DLL, is
 refused before any image is loaded or mapped. The default `plan(report)` keeps
 the earlier permissive behavior because the offline preflight does not inspect
-host providers. The XGameRuntime skeleton is built under
+host providers. The XGameRuntime fixture is built under
 `out/build/dev/fixture-shims/`, never beside `xmem.dll` or `d3d12_xs.dll`. A
 source-built EXE importing `xgameruntime.dll!XUserAddAsync` is packaged with the
 normal shims but without that fixture DLL; `xgameruntime_preflight_stub_refused`
