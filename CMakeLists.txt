@@ -19,10 +19,31 @@ if(DSTORAGE_SDK_ROOT)
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${dstorage_native}/bin/x64/dstorage.dll"
             "${dstorage_native}/bin/x64/dstoragecore.dll" "$<TARGET_FILE_DIR:dstorage_rfc1950_check>"
         VERBATIM)
-    foreach(scenario IN ITEMS success truncated checksum trailing oversize undersize)
+    foreach(scenario IN ITEMS success truncated checksum trailing oversize undersize refusals)
         add_test(NAME dstorage_rfc1950_${scenario} COMMAND dstorage_rfc1950_check ${scenario})
         set_tests_properties(dstorage_rfc1950_${scenario} PROPERTIES TIMEOUT 30)
     endforeach()
+    # Negative control for the refusals case: a build-tree copy of the adapter without the 32-bit
+    # bound on SrcSize. The check must report that request as decoded instead of refused.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/dstorage_rfc1950.cpp)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/dstorage_rfc1950.cpp" dstorage_rfc1950_text)
+    string(REPLACE "request.SrcSize > ULONG_MAX || " "" dstorage_rfc1950_control_text "${dstorage_rfc1950_text}")
+    if(dstorage_rfc1950_control_text STREQUAL dstorage_rfc1950_text)
+        message(FATAL_ERROR "dstorage_rfc1950.cpp lost the anchor used by dstorage_rfc1950_refusals_truncation_control")
+    endif()
+    set(dstorage_rfc1950_control "${CMAKE_CURRENT_BINARY_DIR}/dstorage_rfc1950_control/dstorage_rfc1950.cpp")
+    file(WRITE "${dstorage_rfc1950_control}" "${dstorage_rfc1950_control_text}")
+    add_executable(dstorage_rfc1950_truncation_control tests/dstorage_rfc1950_check.cpp "${dstorage_rfc1950_control}")
+    target_compile_features(dstorage_rfc1950_truncation_control PRIVATE cxx_std_17)
+    target_include_directories(dstorage_rfc1950_truncation_control PRIVATE src "${dstorage_native}/include")
+    target_link_libraries(dstorage_rfc1950_truncation_control PRIVATE "${dstorage_native}/lib/x64/dstorage.lib" ZLIB::ZLIB)
+    add_custom_command(TARGET dstorage_rfc1950_truncation_control POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${dstorage_native}/bin/x64/dstorage.dll"
+            "${dstorage_native}/bin/x64/dstoragecore.dll" "$<TARGET_FILE_DIR:dstorage_rfc1950_truncation_control>"
+        VERBATIM)
+    add_test(NAME dstorage_rfc1950_refusals_truncation_control COMMAND dstorage_rfc1950_truncation_control refusals)
+    set_tests_properties(dstorage_rfc1950_refusals_truncation_control PROPERTIES TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "FAIL: refusals src_over_ulong_max: status 0x8007000d")
 endif()
 add_executable(guest_content_root_check tests/guest_content_root_check.cpp)
 target_compile_features(guest_content_root_check PRIVATE cxx_std_17)
