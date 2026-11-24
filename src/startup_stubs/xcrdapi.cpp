@@ -424,6 +424,52 @@ int format_failure_causes(char* out, std::size_t size, int second, const Storage
                          second, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]);
 }
 
+// Page-destination requests (option bit 21) by where their destination ends against the first 64 KiB
+// page, each split into completed and failed, for the heartbeat (#1198). The end is page_offset (+0x10,
+// low 16 bits) plus destination_size (+0x18, u32), formed in 64 bits so it cannot wrap. A request is
+// counted once, when it runs: by execute_request for every outcome but "empty" (which is neither
+// completed nor failed), and as failed when its page array is unreadable at run or its run threw. An
+// entry that never started is not counted (it failed in Submit, without running). Fixed counters, no
+// allocation; nothing here changes an outcome.
+enum class PageEnd : unsigned { inside, at_page_end, past, count };
+using PageEndCounts = LONG[static_cast<unsigned>(PageEnd::count)][2];  // [end][0 completed, 1 failed]
+PageEndCounts page_end_counts;
+
+PageEnd page_end(unsigned page_offset, unsigned destination_size) noexcept
+{
+    const u64 end = u64{page_offset} + destination_size;
+    if (end < 0x10000) return PageEnd::inside;
+    if (end == 0x10000) return PageEnd::at_page_end;
+    return PageEnd::past;
+}
+
+void count_page_request(const unsigned char* request, bool failed) noexcept
+{
+    const u64 options = *reinterpret_cast<const u64*>(request);
+    if (!(options & (1ull << 21))) return;
+    const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
+    const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
+    InterlockedIncrement(&page_end_counts[static_cast<unsigned>(page_end(page_offset, destination_size))][failed ? 1 : 0]);
+}
+
+void sample_page_end_counts(PageEndCounts& counts) noexcept
+{
+    for (unsigned end = 0; end < static_cast<unsigned>(PageEnd::count); ++end)
+        for (unsigned failed = 0; failed < 2; ++failed)
+            counts[end][failed] = InterlockedCompareExchange(&page_end_counts[end][failed], 0, 0);
+}
+
+// The heartbeat's line of page-destination requests by end, after the failure causes. Like that line it
+// carries no "inflated=", "options=" or "commit peak=" text.
+int format_page_ends(char* out, std::size_t size, int second, const PageEndCounts& n) noexcept
+{
+    return std::snprintf(out, size,
+                         "x2w-dstorage heartbeat %d s: page requests by end against the first 64 KiB page "
+                         "inside-completed=%ld inside-failed=%ld at-page-end-completed=%ld at-page-end-failed=%ld "
+                         "past-completed=%ld past-failed=%ld",
+                         second, n[0][0], n[0][1], n[1][0], n[1][1], n[2][0], n[2][1]);
+}
+
 LONG bcpack_requests[16], bcpack_blank[16];
 LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
 
@@ -710,8 +756,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             }
         }
     }
-    const bool failed = (data == nullptr || !written) && std::strcmp(outcome, "empty") != 0;
+    const bool empty = std::strcmp(outcome, "empty") == 0;
+    const bool failed = (data == nullptr || !written) && !empty;
     if (failed) count_failure(failure);
+    if (!empty) count_page_request(request, failed);
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG summaries, failures;
     if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
@@ -735,6 +783,7 @@ void run_entry(Object* self, Entry& entry)
             const std::size_t bytes = entry.token_count * sizeof(ULONG_PTR);
             if (!title || !x2w_local::readable(title, bytes)) {
                 count_failure(StorageFailure::other);
+                count_page_request(entry.bytes, true);
                 if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
                 static LONG unreadable;
                 if (InterlockedIncrement(&unreadable) <= 12)
@@ -778,6 +827,7 @@ void copy_reason(char (&reason)[96], const char* text) noexcept
 void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
 {
     count_failure(StorageFailure::other);
+    if (entry.type == Entry::request) count_page_request(entry.bytes, true);
     InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG reported;
     if (InterlockedIncrement(&reported) <= 12)
@@ -1332,15 +1382,18 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     // Heartbeat: the request counters every 10 s, so a run shows whether loading still progresses
     // after the per-call logs have gone quiet. Peak commit and the live physical-page sections show
     // what the run spends (#1199), including while requests are stalled. A second line splits the
-    // failed requests by cause (#1198).
+    // failed requests by cause, a third the page-destination requests by end (#1198).
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
         MemorySample last_memory;
         for (int second = 10;; second += 10) {
             Sleep(10000);
-            // Reuse one counter sample for both lines, even while the worker is reporting new failures.
+            // Sample the counters once for every line of this report, even while the worker is reporting
+            // new failures.
             StorageFailureCounts failure_counts;
             const LONG failed = sample_failure_counts(failure_counts);
+            PageEndCounts page_ends;
+            sample_page_end_counts(page_ends);
             const LONG total = requests_done + requests_compressed + failed;
             const LONG total2 = total + requests_bcpack_blank;
             const MemorySample sample = memory_sample();
@@ -1370,6 +1423,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                     section_text);
                 char causes[384];
                 if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
+                char ends[384];
+                if (format_page_ends(ends, sizeof(ends), second, page_ends) > 0) log("%s", ends);
                 last = total2;
                 last_memory = sample;
             }
