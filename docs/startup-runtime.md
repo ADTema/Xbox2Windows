@@ -30,6 +30,10 @@ records. The control expects the first blend patch to win and must fail.
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
+The presenter only samples non-empty single-sample 2D surfaces without
+`D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE` and with a supported view format
+(`src/startup_stubs/present_view_format.h`), and marks itself failed if
+closing its command list fails.
 When a present cannot show its surface, the GDI fallback selects a visible,
 unowned guest window in the same process. If only the presenter is visible,
 the fallback leaves it alone. To exercise both z-orders with source-built
@@ -130,7 +134,10 @@ the five parts add up to N:
 The classification lives in `src/startup_stubs/null_binding_cause.h`. The source-built
 `startup_null_views_check` fixture checks every cause, that the parts sum to the total, and that
 valid bindings add nothing. It does not draw, so the counters in the totals line itself are checked
-by reading a render log.
+by reading a render log. The device prints the counts by cause value, so
+`ctest --preset dev --no-tests=error -R "^startup_null_cause_labels(_buffer_token_control)?$" -V`
+checks without a device that each cause lands in the slot printed under its label, and that the
+header's names follow the same order. The control swaps the buffer and token slots and must fail.
 
 ## What is measured
 
@@ -231,8 +238,9 @@ ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 
 `tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
 control `startup_local_log_guard_drop_control`) verifies `src/startup_stubs/local_log.h`:
-`env_on` (`"1"`-only gating while preserving `GetLastError`), atomic `first_calls` countdowns,
-`logf` (`GetLastError` preservation, 1533-byte payload truncation, and `X2W_TRAP_LOG` append),
+`env_on` (a leading `1` in values up to three characters, preserving `GetLastError`), atomic
+`first_calls` countdowns, `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
+truncation, `MAX_PATH` boundary behavior, and `GetLastError` preservation on file-open failure),
 `probe_readable` (invalid-pointer and zero-length refusals, multi-page reads, `PAGE_NOACCESS` /
 `MEM_RESERVE` prefix truncation, and `PAGE_GUARD` re-arming verified by `VirtualQuery` and a
 second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
@@ -427,6 +435,9 @@ These are measured on one executable; treat them as hypotheses for others.
 - **DirectStorage file ranges.** A nonempty file request checks its byte offset and length against
   the current file size before allocating the staging buffer. A range ending at EOF is valid.
   An overrun or short read fails the queue request and preserves the destination.
+  `ctest --preset dev --no-tests=error -R '^startup_dstorage_file_read' -V` reads
+  `src/startup_stubs/dstorage_file_read.h` at offsets above 2 GiB, across 4 GiB and at EOF above
+  4 GiB in a sparse temporary file, and skips (77) where the temporary folder has no sparse files.
   The `startup_storage_directory_batch` fixture submits ten requests across two synthetic RDS5/ETPF
   files on one queue. In each file, moving the first absolute source offset by 896 KiB selects a
   different valid 28-byte zlib stream. Both return success and produce 4096 bytes. Comparing the
@@ -532,6 +543,16 @@ While a permissive XApu connection is open, the desktop shim requests 1 ms Windo
 timer resolution for the mix worker's short refill waits. The last disconnect
 releases the request. This affects scheduling and preserves the existing audio
 routing and sample format.
+
+With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
+and `XApuDisconnect`, refuses null outputs (`E_POINTER`) and unknown or disconnected
+handles (`E_HANDLE`), and queues one completion entry per `XApuEnqueueCommand` call so
+`XApuGetResultCount` and `XApuDequeueResult` retire commands cleanly (zeroing the
+`0x58`-byte result buffer without fabricating unmeasured fields, and returning `E_FAIL`
+when the queue is empty). The all-zero result is a placeholder: its type field (`+0`) is not a measured
+completion value, and no caller has been observed consuming it. Entries are counters only, so memory does
+not grow per command. Handles are never reused. Default non-permissive mode still traps on every export
+(`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
@@ -820,6 +841,9 @@ Typed element bytes come from the format (1 to 16 bytes). Formats that cannot ba
 `unsupported_description` and leave the destination descriptor unchanged. Translated draws bind typed
 views with the format's element size and stride. The refusal reasons are listed in
 `docs/experiments.md` ("Name the cause of a refused slot 70 call").
+`ctest --preset dev --no-tests=error -R '^startup_memory_srv_report$' -V` checks the refusal line
+without a device, with a distinct value in each 2D and 2D-array view field, the raw words of a
+cube-array view, and widths, first elements, addresses and destinations above 4 GiB.
 
 Checks:
 
