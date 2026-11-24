@@ -180,7 +180,11 @@ int main(int argc, char** argv)
     expect(store.write_blob("slot-a", "zeta.dat", bytes_of(12, 2).data(), 12) == Status::ok, "write slot-a/zeta.dat");
     expect(store.write_blob("slot-a", "alpha.dat", bytes_of(300, 3).data(), 300) == Status::ok, "write slot-a/alpha.dat");
 
-    expect(store.list_containers(containers) == Status::ok && containers_are(containers, {"slot-a", "slot-b"}),
+    // Created out of order, and enough of them that the order of the directory itself is unlikely to be the listing order.
+    const std::vector<std::string> all_containers = {"aa-first", "mm-mid", "slot-a", "slot-b", "zz-last"};
+    for (const char* name : {"zz-last", "mm-mid", "aa-first"})
+        expect(store.create_container(name) == Status::ok, "create an extra container");
+    expect(store.list_containers(containers) == Status::ok && containers_are(containers, all_containers),
            "containers listed by name");
     std::vector<BlobEntry> blobs = sentinel_blobs;
     expect(store.list_blobs("slot-a", blobs) == Status::ok && names_are(blobs, {{"alpha.dat", 300}, {"zeta.dat", 12}}),
@@ -206,7 +210,7 @@ int main(int argc, char** argv)
     touch(root / "stray-file");  // a plain file in the root is not a container
     expect(store.list_blobs("slot-a", blobs) == Status::ok && names_are(blobs, {{"alpha.dat", 300}, {"zeta.dat", 12}}),
            "staging, old, lock, invalid-name and directory entries are not blobs");
-    expect(store.list_containers(containers) == Status::ok && containers_are(containers, {"slot-a", "slot-b"}),
+    expect(store.list_containers(containers) == Status::ok && containers_are(containers, all_containers),
            "lock files, suffixed or invalid names, and plain files are not containers");
 
     // Links are not followed or listed: a blob that links to a real file, a container that links to a directory.
@@ -220,7 +224,7 @@ int main(int argc, char** argv)
                "a linked blob is not listed");
     else std::printf("note: no link could be created here; the blob link control was skipped\n");
     if (container_link) {
-        expect(store.list_containers(containers) == Status::ok && containers_are(containers, {"slot-a", "slot-b"}),
+        expect(store.list_containers(containers) == Status::ok && containers_are(containers, all_containers),
                "a linked container is not listed");
         blobs = sentinel_blobs;
         expect(store.list_blobs("linked-container", blobs) == Status::bad_name && blobs == sentinel_blobs,
