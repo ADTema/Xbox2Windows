@@ -308,6 +308,18 @@ bool worker_cannot_start(Fixture& f)
     if (attempts < 2) return fail("the worker start did not try both stack sizes");
     if (!failed_at_submit(f, q)) return false;
     if (!untouched_bytes(destination)) return fail("the failed request changed its destination");
+    // Acquire the event after the failure to exercise the queue's initial signal state without a worker.
+    HANDLE event = queue_error_event(q.queue);
+    if (!event) return fail("GetErrorEvent failed after Submit without a worker");
+    const DWORD notified = WaitForSingleObject(event, 0);
+    StorageErrorRecord record{};
+    queue_retrieve_error_record(q.queue, &record);
+    const DWORD reset = WaitForSingleObject(event, 0);
+    CloseHandle(event);
+    if (notified != WAIT_OBJECT_0 || reset != WAIT_TIMEOUT || record.failure_count != requests_per_run ||
+        record.first_failure.result != E_OUTOFMEMORY || record.first_failure.destination != destination.data() ||
+        record.first_failure.source != f.stream.data() || record.first_failure.source_size != f.stream.size())
+        return fail("failed request's record or event was wrong after Submit without a worker");
     return serves_next_request(f, q);
 }
 

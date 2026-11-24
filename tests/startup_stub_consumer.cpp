@@ -7,6 +7,7 @@
 //   physical -> XMemAllocatePhysicalPages/XMemFreePhysicalPages round trip (no trap expected)
 //   dstorage -> DirectStorage multi-page RFC 1950 zlib request, BCPack decode and failure controls (Refs #1139, #1144)
 //   dstorage-pages -> page-array entries replaced, or made unreadable, between EnqueueRequest and Submit
+//   dstorage-error-record -> queue-local error events and the first failed request record
 //   store    -> XStoreCreateContext for the local user, a mutated provider, and a non-local user (Refs #1147)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -15,6 +16,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "startup_stubs/dstorage_error_record.h"
 #include <cstdint>
 #include <cstdio>
 #include <array>
@@ -158,6 +160,9 @@ using IsCompleteFn = bool(__stdcall*)(void*, unsigned);
 using GetHResultFn = long(__stdcall*)(void*, unsigned);
 using OpenFileFn = long(__stdcall*)(void*, const wchar_t*, const void*, void**);
 using CloseFileFn = void(__stdcall*)(void*);
+using GetErrorEventFn = HANDLE(__stdcall*)(void*);
+using RetrieveErrorRecordFn = void(__stdcall*)(void*, x2w_startup::StorageErrorRecord*);
+using ReleaseFn = unsigned long(__stdcall*)(void*);
 
 struct SubmitGate {
     void** vtable = nullptr;
@@ -172,6 +177,149 @@ long __stdcall hold_worker(void* fence, u64) {
     if (WaitForSingleObject(gate.resume, 5000) != WAIT_OBJECT_0) return E_FAIL;
     InterlockedExchange(&gate.resumed, 1);
     return S_OK;
+}
+
+bool dstorage_error_record_checks()
+{
+    using x2w_startup::StorageErrorRecord;
+    using x2w_startup::StorageRequest;
+    auto check = [](bool condition, const char* label) {
+        if (!condition) std::fprintf(stderr, "dstorage error record: %s\n", label);
+        return condition;
+    };
+    HMODULE dll = LoadLibraryW(L"XCRDAPI.dll");
+    if (!check(dll != nullptr, "load XCRDAPI")) return false;
+    auto factory_export = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(dll, "DStorageGetFactory"));
+    void* factory_ptr = nullptr;
+    if (!check(factory_export && factory_export(nullptr, &factory_ptr) == S_OK && factory_ptr, "get factory"))
+        return false;
+    auto* factory = static_cast<Object*>(factory_ptr);
+
+    wchar_t workdir[MAX_PATH]{}, filename[MAX_PATH]{};
+    const DWORD dir_chars = GetCurrentDirectoryW(MAX_PATH, workdir);
+    if (!check(dir_chars && dir_chars < MAX_PATH, "get fixture directory")) return false;
+    if (!GetTempFileNameW(workdir, L"x2w", 0, filename)) {
+        std::fprintf(stderr, "dstorage error record: create source path (Win32 %lu)\n", GetLastError());
+        return false;
+    }
+    const std::array<unsigned char, 4> input{0x12, 0x34, 0x56, 0x78};
+    HANDLE writer = CreateFileW(filename, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD written = 0;
+    const bool wrote = writer != INVALID_HANDLE_VALUE &&
+        WriteFile(writer, input.data(), static_cast<DWORD>(input.size()), &written, nullptr) && written == input.size();
+    if (writer != INVALID_HANDLE_VALUE) CloseHandle(writer);
+    void* file_ptr = nullptr;
+    const bool opened = wrote &&
+        reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, filename, nullptr, &file_ptr) == S_OK && file_ptr;
+    DeleteFileW(filename);  // The stand-in's open handle shares delete access.
+    if (!check(opened, "open source-built file")) return false;
+    auto* file = static_cast<Object*>(file_ptr);
+
+    struct Queue {
+        Object* object = nullptr;
+        Object* status = nullptr;
+        HANDLE event = nullptr;
+        ~Queue() {
+            if (event) CloseHandle(event);
+            if (object) reinterpret_cast<ReleaseFn>(object->vtable[2])(object);
+        }
+        void enqueue(const StorageRequest& request) const {
+            reinterpret_cast<EnqueueRequestFn>(object->vtable[3])(object, &request);
+        }
+        HRESULT submit() const {
+            reinterpret_cast<EnqueueStatusFn>(object->vtable[4])(object, status, 0);
+            reinterpret_cast<SubmitFn>(object->vtable[6])(object);
+            auto complete = reinterpret_cast<IsCompleteFn>(status->vtable[3]);
+            const auto start = GetTickCount64();
+            while (!complete(status, 0) && GetTickCount64() - start < 5000) Sleep(1);
+            return reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        }
+        void retrieve(StorageErrorRecord& record) const {
+            reinterpret_cast<RetrieveErrorRecordFn>(object->vtable[10])(object, &record);
+        }
+    } failing, successful;
+
+    auto create_queue = [&](Queue& q) {
+        alignas(u64) unsigned char desc[40]{};
+        const std::uint16_t capacity = 16;
+        std::memcpy(desc + 8, &capacity, sizeof capacity);
+        void* ptr = nullptr;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &ptr) != S_OK || !ptr)
+            return false;
+        q.object = static_cast<Object*>(ptr);
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "ErrorStatus", nullptr, &ptr) != S_OK || !ptr)
+            return false;
+        q.status = static_cast<Object*>(ptr);
+        q.event = reinterpret_cast<GetErrorEventFn>(q.object->vtable[9])(q.object);
+        return q.event && WaitForSingleObject(q.event, 0) == WAIT_TIMEOUT;
+    };
+    if (!check(create_queue(failing) && create_queue(successful), "new queues have unsignaled events")) return false;
+
+    const std::array<unsigned char, 4> sentinel{0xaa, 0xaa, 0xaa, 0xaa};
+    auto first_dest = sentinel, next_dest = sentinel, good_dest = sentinel;
+    const StorageRequest first{1, first_dest.data(), 0, 4, file, 8, 3, 0, 0x1020304050607080ull, "first read"};
+    const StorageRequest next{0, next_dest.data(), 0, 4, file, 3, 4, 0, 0x2233445566778899ull, "crossing read"};
+    const StorageRequest good{0, good_dest.data(), 0, 4, file, 0, 4, 0, 0, "good read"};
+    failing.enqueue(first);
+    failing.enqueue(next);
+    if (!check(WaitForSingleObject(failing.event, 0) == WAIT_TIMEOUT, "event signaled before Submit")) return false;
+    if (!check(failing.submit() == E_FAIL && first_dest == sentinel && next_dest == sentinel,
+               "out-of-range requests failed and preserved their destinations")) return false;
+    if (!check(WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0 &&
+               WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0, "failed request did not leave the error event signaled"))
+        return false;
+    successful.enqueue(good);
+    if (!check(successful.submit() == S_OK && good_dest == input, "success-only queue returned the file bytes") ||
+        !check(WaitForSingleObject(successful.event, 0) == WAIT_TIMEOUT, "success-only queue's event was signaled"))
+        return false;
+    reinterpret_cast<CloseFileFn>(file->vtable[3])(file);
+
+    struct {
+        StorageErrorRecord record;
+        u64 after;
+    } buffer{{}, 0xabcdef0123456789ull};
+    auto retrieve = [&](const Queue& q) -> const StorageErrorRecord& {
+        std::memset(&buffer.record, 0xaa, sizeof buffer.record);
+        q.retrieve(buffer.record);
+        return buffer.record;
+    };
+    auto empty_record = [&] {
+        const unsigned char zero[sizeof(StorageErrorRecord)]{};
+        return std::memcmp(&buffer.record, zero, sizeof zero) == 0 && buffer.after == 0xabcdef0123456789ull;
+    };
+
+    const auto& record = retrieve(failing);
+    const auto& details = record.first_failure;
+    if (!check(buffer.after == 0xabcdef0123456789ull && record.failure_count == 2, "expected two failures and an intact guard") ||
+        !check(details.result == E_FAIL && details.options == first.options && details.destination == first.destination &&
+               details.destination_size == first.destination_size && details.file_offset == first.file_offset &&
+               details.source == nullptr && details.source_size == first.source_size &&
+               details.cancellation_tag == first.cancellation_tag &&
+               wcsncmp(details.filename, filename, std::size(details.filename)) == 0 &&
+               strncmp(details.name, first.name, std::size(details.name)) == 0, "record did not preserve the first file request"))
+        return false;
+    if (!check(WaitForSingleObject(failing.event, 0) == WAIT_TIMEOUT, "retrieve did not reset the event")) return false;
+    retrieve(failing);
+    if (!check(empty_record(), "second retrieve did not clear the failure count and first record")) return false;
+    retrieve(successful);
+    if (!check(empty_record(), "success-only queue returned a failure record")) return false;
+
+    auto memory = sentinel;
+    auto source = input;
+    const StorageRequest too_small{1ull << 22, memory.data(), 0, 2, source.data(), 0, 4, 0, 0xaabbccddull, "memory read"};
+    failing.enqueue(too_small);
+    if (!check(failing.submit() == E_FAIL && memory == sentinel, "short memory destination was not refused") ||
+        !check(WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0, "next failure did not re-signal the event")) return false;
+    const auto& memory_failure = retrieve(failing).first_failure;
+    return check(buffer.record.failure_count == 1 && memory_failure.result == E_FAIL &&
+                 memory_failure.options == too_small.options && memory_failure.destination == too_small.destination &&
+                 memory_failure.destination_size == too_small.destination_size && memory_failure.filename[0] == 0 &&
+                 memory_failure.file_offset == 0 && memory_failure.source == too_small.source &&
+                 memory_failure.source_size == too_small.source_size &&
+                 memory_failure.cancellation_tag == too_small.cancellation_tag &&
+                 strncmp(memory_failure.name, too_small.name, std::size(memory_failure.name)) == 0 &&
+                 buffer.after == 0xabcdef0123456789ull && WaitForSingleObject(failing.event, 0) == WAIT_TIMEOUT,
+                 "record did not restart with the next memory request");
 }
 
 // Page-destination requests whose page array changes between EnqueueRequest and Submit:
@@ -1643,6 +1791,11 @@ int main(int argc, char** argv)
         return 0;
     }
     if (!std::strcmp(which, "dstorage-directory")) return dstorage_directory_batches() ? 0 : 8;
+    if (!std::strcmp(which, "dstorage-error-record")) {
+        if (!dstorage_error_record_checks()) return 10;
+        std::puts("dstorage-error-record ok");
+        return 0;
+    }
     if (!std::strcmp(which, "dstorage-pages")) {
         if (!dstorage_page_array_checks()) return 9;
         std::puts("dstorage-pages ok");
