@@ -2490,8 +2490,11 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if src0 in VOP_EXTENSION_FORMS:
             return _vop_extension(data, offset, "vop1", op_name, src0)
         length = 4
-        wide_dst = op_name.startswith(("v_cvt_f64_i32", "v_cvt_f64_u32", "v_cvt_f64_f32")) or op_name.endswith(("_f64_e32", "_f64"))
-        wide_src0 = op_name.startswith(("v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64", "v_frexp_exp_i32_f64")) or op_name.endswith(("_f64_e32", "_f64"))
+        # A 32-bit result from a binary64 source: the name ends in _f64 but the destination is one VGPR.
+        narrow_dst = op_name.startswith(("v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64", "v_frexp_exp_i32_f64"))
+        wide_dst = op_name.startswith(("v_cvt_f64_i32", "v_cvt_f64_u32", "v_cvt_f64_f32")) or (
+            op_name.endswith(("_f64_e32", "_f64")) and not narrow_dst)
+        wide_src0 = narrow_dst or op_name.endswith(("_f64_e32", "_f64"))
         if src0 == 255:
             if offset + 8 > len(data):
                 return (4, "vop1_truncated", f"{op_name} <truncated>", "Incomplete VOP1 literal")
