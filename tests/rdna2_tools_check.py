@@ -6009,5 +6009,51 @@ class TestRdna2Scanner(unittest.TestCase):
             lower(["v_div_scale_f32 v12, vcc_lo, v19, v19, v20", *div_shader], 20, 24, [1, 2, 3, 4])
 
 
+class TestDisasmSop1BitsetWidths(unittest.TestCase):
+    """Verify operand widths for SOP1 64-bit bitset ops."""
+
+    def test_sop1_bitset_b64_src0_is_32bit(self):
+        cases = [
+            # SOP1 64-bit bitset takes a 32-bit scalar bit-index src0 (must not emit s[4:5] or vcc)
+            (0xbe800000 | (2 << 16) | (0x1c << 8) | 4, "s_bitset0_b64 s[2:3], s4"),
+            (0xbe800000 | (2 << 16) | (0x1c << 8) | 106, "s_bitset0_b64 s[2:3], vcc_lo"),
+            (0xbe800000 | (2 << 16) | (0x1e << 8) | 4, "s_bitset1_b64 s[2:3], s4"),
+            # Positive controls: s_not_b64 (64-bit dst & src0) and s_bitreplicate_b64_b32 (64-bit dst, 32-bit src0)
+            (0xbe800000 | (2 << 16) | (0x08 << 8) | 4, "s_not_b64 s[2:3], s[4:5]"),
+            (0xbe800000 | (2 << 16) | (0x3b << 8) | 4, "s_bitreplicate_b64_b32 s[2:3], s4"),
+        ]
+        for w0, expected in cases:
+            rec = disasm_rdna2(struct.pack("<I", w0))[0]
+            self.assertEqual(rec["assembly"], expected)
+
+        llvm_mc = resolve_tool("LLVM_MC", ["llvm-mc-19", "llvm-mc-15", "llvm-mc"])
+        if llvm_mc:
+            for w0, expected in cases:
+                res = subprocess.run(
+                    [llvm_mc, "-triple=amdgcn--", "-mcpu=gfx1013", "-show-encoding"],
+                    input=expected + "\n",
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(res.returncode, 0, f"{expected}: {res.stderr}")
+                enc_match = re.search(r"encoding:\s*\[([^\]]+)\]", res.stdout)
+                self.assertIsNotNone(enc_match, f"Missing encoding for {expected}: {res.stdout}")
+                encoded = bytes(int(tok.strip(), 16) for tok in enc_match.group(1).split(","))
+                self.assertEqual(encoded, struct.pack("<I", w0), f"Encoding mismatch for {expected}")
+            # Negative controls: wide src0 is rejected by llvm-mc for SOP1 64-bit bitset ops
+            for bad in (
+                "s_bitset0_b64 s[2:3], s[4:5]",
+                "s_bitset0_b64 s[2:3], vcc",
+                "s_bitset1_b64 s[2:3], s[4:5]",
+            ):
+                res = subprocess.run(
+                    [llvm_mc, "-triple=amdgcn--", "-mcpu=gfx1013", "-show-encoding"],
+                    input=bad + "\n",
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertNotEqual(res.returncode, 0, f"Expected failure for {bad}")
+
+
 if __name__ == "__main__":
     unittest.main()
