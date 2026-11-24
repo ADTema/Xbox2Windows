@@ -167,9 +167,10 @@ def signed_access(fields, pointers, valid_of, words, label, stem, failures):
     if atomic:
         scope, semantics, value = fields[5:8]
         lines.extend([
-            f"{stem}_value = OpBitcast %uint {value}", f"{stem}_first = OpLoad %uint {ptr}", f"OpBranch {stem}_head",
-            f"{stem}_head = OpLabel",
-            f"{stem}_cur = OpPhi %uint {stem}_first {stem}_issue {stem}_seen {stem}_cont",
+            f"{stem}_value = OpBitcast %uint {value}", f"OpBranch {stem}_head", f"{stem}_head = OpLabel",
+            # The first guess is zero, not a read: a plain load would race with another invocation's atomic, and a
+            # wrong guess only costs one more trip round the loop.
+            f"{stem}_cur = OpPhi %uint %c0 {stem}_issue {stem}_seen {stem}_cont",
             f"OpLoopMerge {stem}_exit {stem}_cont None", f"OpBranch {stem}_body", f"{stem}_body = OpLabel",
             f"{stem}_cur_int = OpBitcast %int {stem}_cur",
             f"{stem}_pick = {SIGNED_ATOMICS[fields[2]]} %bool {stem}_cur_int {value}",
@@ -282,7 +283,7 @@ def lower(assembly):
     failures = {}
     for line in lines:
         fields = line.split()
-        if len(fields) == 8 and fields[2] in SIGNED_ATOMICS:
+        if len(fields) == 8 and fields[2] in SIGNED_ATOMICS and fields[4] in physical_ints:
             if fields[6] not in constants:
                 raise ValueError("signed atomic semantics must be a constant")
             failures[fields[6]], new = failure_semantics(fields[6], constants[fields[6]])

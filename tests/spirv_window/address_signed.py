@@ -158,6 +158,20 @@ with tempfile.TemporaryDirectory() as folder:
         path.write_text(lower(variant), encoding="utf-8")
         assemble(path, directory / "variant.spv")
         print(f"validated {name}")
+    # A workgroup signed atomic is not a physical access, so it passes through with its own semantics constant.
+    variant = SOURCE.replace(
+        "OpEntryPoint GLCompute %main \"main\" %user_data", "OpEntryPoint GLCompute %main \"main\" %user_data %shared").replace(
+        "%words = OpTypeArray", "%_ptr_WG_int = OpTypePointer Workgroup %int\n%shared = OpVariable %_ptr_WG_int Workgroup\n"
+        "%relaxed = OpConstant %int 0\n%words = OpTypeArray").replace(
+        "OpStore %output_first", "%local_old = OpAtomicSMin %int %shared %c2 %relaxed %operand\nOpStore %output_first")
+    source.write_text(variant, encoding="utf-8")
+    assemble(source, directory / "variant.spv")
+    path = directory / "variant.spvasm"
+    path.write_text(lower(variant), encoding="utf-8")
+    assemble(path, directory / "variant.spv")
+    if "%local_old = OpAtomicSMin %int %shared %c2 %relaxed %operand" not in path.read_text(encoding="utf-8"):
+        sys.exit("the workgroup atomic was not preserved")
+    print("validated a workgroup signed atomic")
     source.write_text(SOURCE, encoding="utf-8")
     for name, (old, new), _, _ in CONTROLS:
         if not shape_errors(edit(lowered, old, new)):
