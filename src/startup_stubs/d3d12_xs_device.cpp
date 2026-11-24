@@ -29,6 +29,7 @@
 #include "startup_stubs/memory_srv_buffer.h"
 
 #include "startup_stubs/slice_footprints.h"
+#include "startup_stubs/command_list_slot_names.h"
 
 #include <d3d12.h>
 #include "console_plane_size.h"
@@ -520,7 +521,9 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
     static LONG calls;
     if (first_calls(calls, 1)) {
         char name[64];
-        std::snprintf(name, sizeof(name), "%s::slot%d", kind_names[K], N);
+        const char* known = K == list_kind ? x2w_list_slots::name(N) : nullptr;
+        if (known) std::snprintf(name, sizeof(name), "%s::slot%d(%s)", kind_names[K], N, known);
+        else std::snprintf(name, sizeof(name), "%s::slot%d", kind_names[K], N);
         x2w_trap::record("x2w-noop", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, rcx, rdx, r8, r9,
                          _ReturnAddress());
     }
