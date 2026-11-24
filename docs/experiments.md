@@ -6117,6 +6117,8 @@ A static read of the main executable shows that, after device creation, it keeps
 
 On Windows 10 19045 with D3D12 10.0.19041.7291, both device cases passed on in-box WARP 10.0.19041.7811 and on an RTX 3080 Ti (driver 32.0.16.1047). The second placed buffer's address following `B + offset` is observed on these adapters; D3D12 does not document it for placed resources. Both sequence cases passed on the same adapters, in-box WARP 10.0.19041.7811 reporting 32 GPU virtual address bits per resource and 47 per process, and the RTX 3080 Ti 40 and 40. The range case passed on the RTX 3080 Ti (eight 4 GiB windows) and on WARP 1.0.22 loaded app-locally. On in-box WARP 10.0.19041.7811 (nine 4095 MiB windows), `range_warp` skips at the capability check. The lifetime and partial-failure cases passed on both adapters. With the range open, the released device kept 8 references on the RTX and 9 on in-box WARP.
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) reported 44 GPU virtual address bits per resource and 48 per process, and passed both device cases: a reserve-only range and an address inside the allocation both returned `0x80070057`, and shifting `B` by one 64 KiB page missed the intended destination in all 1,024 words.
+
 Because reserve-only ranges and addresses inside an allocation cannot be opened, the committed-heap layout of the device cases needs all of A committed and wrapped once. A 16 or 24 GiB range would be committed in full, and separately opened pieces would each get their own GPU base. The range uses reserved buffers instead, filled by copy. Neither the CPU range A nor the title's device is connected to it yet.
 
 Run `ctest --preset dev --no-tests=error -R '^vm_translation_' -V`.
