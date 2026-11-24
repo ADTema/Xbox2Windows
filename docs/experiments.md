@@ -4463,6 +4463,20 @@ ctest --preset dev --no-tests=error -R '^descriptor_window_' -V
 
 Repeat with the `release` preset.
 
+#### CPU input changes between submissions
+
+The source-built compute fixture binds one `R16_UINT` SRV over an upload buffer
+for both submissions. After fence 1 the CPU changes two elements. Refreshing
+the same upload range before submission 2 changes the shader readback from
+`1398 2467` to `8765 fe01` (hex). The stale control omits that refresh and
+reads the first pair again. An incomplete fence, an out-of-range write and an
+unreadable source page are rejected before the live data changes.
+
+Build `offscreen_check` and run
+`ctest --preset release --no-tests=error -R '^cpu_srv_' -V`.
+The caller owns source lifetime and must retire all queues reading an upload
+range before refreshing it.
+
 #### CPU-copied binding records
 
 `descriptor_record_copy` reuses the same shader and submission sequence. After fence 1, the test copies a 32-byte CPU binding record into the second record with `memcpy`. The live path reads the copied ID and uses `CopyDescriptorsSimple` to transfer its SRV from a CPU-only staging heap to shader-visible slot 999,999. The stale control reads a saved record while binding that same GPU slot. The records contain fixture-defined IDs and are independent of the opaque D3D12 descriptors. [Startup observation on #870](https://github.com/R0Y00/Xbox2Windows/issues/870#issuecomment-7116272710) · [Microsoft descriptor-copy guidance](https://learn.microsoft.com/en-us/windows/win32/direct3d12/copying-descriptors)
