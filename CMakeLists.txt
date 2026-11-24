@@ -3834,6 +3834,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The same reader image drawing each completed record through D3D12 (#830). The GPU codec keeps
     # the name archive_codec.dll in its own directory, next to copies of the reader and blast.
     set(archive_gpu_dir "${CMAKE_CURRENT_BINARY_DIR}/archive_gpu")
+    # The native reader runs from this folder; give it the same app-local WARP as the lifted EXE.
+    offscreen_app_local_warp("${OFFSCREEN_WARP_DIR}" "${archive_gpu_dir}")
     set(archive_gpu_sources "${archive_src}/codec.cpp" "${archive_src}/texture_gpu.cpp"
         "${archive_src}/quad_frames.cpp" "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_vs.h"
         "${CMAKE_CURRENT_BINARY_DIR}/tex_quad_ps.h")
