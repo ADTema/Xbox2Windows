@@ -82,8 +82,8 @@ bool heap_give(const void* virtual_address)
 {
     bool done = false;
     const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(virtual_address);
-    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(heap_base);
     AcquireSRWLockExclusive(&heap_lock);
+    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(heap_base);
     if (heap_base && address >= base + heap_start && address - base < heap_bytes) {
         const u64 offset = address - base;
         std::size_t lo = 0, hi = extent_count;
@@ -149,17 +149,24 @@ extern "C" __declspec(noinline) long ApuCreateHeap(u64 rcx, u64 rdx, u64 r8, u64
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "ApuCreateHeap", 4, rcx, rdx, r8, r9, _ReturnAddress());
     const u64 cached = static_cast<std::uint32_t>(rcx), non_cached = static_cast<std::uint32_t>(rdx);
     long hr = 0;
+    // Creation and publication are one locked step: base, size and the initial free extent become
+    // visible together, and a repeat call finds the heap and leaves live blocks alone.
+    AcquireSRWLockExclusive(&heap_lock);
     if (!heap_base) {
         const u64 bytes = ((cached + non_cached) + 0xFFFF) & ~u64{0xFFFF};
-        heap_base = static_cast<unsigned char*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-        AcquireSRWLockExclusive(&heap_lock);
-        heap_bytes = heap_base ? bytes : 0;
-        heap_reset();
-        ReleaseSRWLockExclusive(&heap_lock);
-        if (!heap_base) hr = static_cast<long>(0x8007000E);  // E_OUTOFMEMORY
+        void* memory = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (memory) {
+            heap_bytes = bytes;
+            heap_reset();
+            heap_base = static_cast<unsigned char*>(memory);
+        } else {
+            hr = static_cast<long>(0x8007000E);  // E_OUTOFMEMORY
+        }
     }
+    unsigned char* const published = heap_base;
+    ReleaseSRWLockExclusive(&heap_lock);
     x2w_local::logf("x2w-audio ApuCreateHeap cached=0x%llx non_cached=0x%llx -> 0x%08lx base=%p", cached, non_cached,
-                    static_cast<unsigned long>(hr), static_cast<void*>(heap_base));
+                    static_cast<unsigned long>(hr), static_cast<void*>(published));
     return hr;
 }
 
@@ -218,8 +225,7 @@ extern "C" __declspec(noinline) long AcpHalCreate(u64 rcx, u64 rdx, u64 r8, u64 
 // ApuAlloc(&virtualAddress, apuAddress* or null, size, alignment, flags) -> HRESULT (first call:
 // size 0x222e00, alignment 0x800, null APU-address output). Size and alignment are taken as 32 bits.
 // First fit; ApuFree returns blocks, and a reused block is zeroed as fresh heap memory is.
-// A null output is E_POINTER, size 0 or an alignment that is not a power of two is E_INVALIDARG
-// (0 and anything below 16 mean 16), and no room is E_OUTOFMEMORY; a failure leaves the heap as it was.
+// A null output is E_POINTER, size 0 is E_INVALIDARG; an alignment below 16 or not a power of two means 16, and no room is E_OUTOFMEMORY; a failure leaves the heap as it was.
 extern "C" __declspec(noinline) long ApuAlloc(void** virtual_address, std::uint32_t* apu_address, u64 size, u64 alignment,
                                               u64 flags)
 {
@@ -228,8 +234,8 @@ extern "C" __declspec(noinline) long ApuAlloc(void** virtual_address, std::uint3
                        reinterpret_cast<u64>(apu_address), size, alignment, _ReturnAddress());
     const u64 bytes = static_cast<std::uint32_t>(size);
     u64 align = static_cast<std::uint32_t>(alignment);
-    if (align < 16) align = 16;
-    const bool valid = bytes && !(align & (align - 1));
+    if (align < 16 || (align & (align - 1))) align = 16;
+    const bool valid = bytes != 0;
     unsigned char* memory = virtual_address && valid ? heap_take(bytes, align) : nullptr;
     const long hr = memory ? 0 : static_cast<long>(!virtual_address ? 0x80004003 : valid ? 0x8007000E : 0x80070057);
     if (virtual_address) *virtual_address = memory;

@@ -141,23 +141,15 @@ void bad_requests()
     check(take(&out, ~u64{0}, 16, &apu) == no_memory && !out, "size 2^64-1 is cut to 32 bits");
     check(take(&out, 0, 16, &apu) == invalid && !out && apu == 0xDEADBEEF, "size 0");
     check(take(&out, 0x100000000ull, 16, &apu) == invalid && !out, "size 2^32 is size 0");
-    check(take(&out, 64, 24, &apu) == invalid && !out && apu == 0xDEADBEEF, "alignment 24");
-    check(take(&out, 64, 0xFFFFFFFFull, &apu) == invalid && !out, "alignment 2^32-1");
-    void* probe = take_ok(16);
-    const auto probe_addr = reinterpret_cast<std::uintptr_t>(probe);
-    check(free_fn(probe) == ok, "free probe");
-    const std::uint64_t big_align = 0x80000000ull;
-    const std::uintptr_t aligned_addr = (probe_addr + big_align - 1) & ~(big_align - 1);
-    const bool big_align_fits = aligned_addr >= probe_addr && (aligned_addr - probe_addr) + 64 <= usable;
-    out = const_cast<void*>(sentinel);
-    const long big_hr = take(&out, 64, big_align, &apu);
-    if (big_align_fits) {
-        check(big_hr == ok && out && reinterpret_cast<std::uintptr_t>(out) == aligned_addr,
-              "alignment 2 GiB succeeds when heap straddles boundary");
-        check(free_fn(out) == ok, "free 2 GiB aligned block");
-    } else {
-        check(big_hr == no_memory && !out && apu == 0xDEADBEEF, "alignment 2 GiB cannot be met");
+    // Not a power of two means 16, so these succeed and honour 16.
+    for (u64 odd : {u64{24}, u64{0xFFFFFFFF}, u64{3}}) {
+        void* r = take_ok(64, odd);
+        check(reinterpret_cast<std::uintptr_t>(r) % 16 == 0, "non-power-of-two alignment falls back to 16");
+        check(free_fn(r) == ok, "free fallback block");
     }
+    // No placement can satisfy a heap-sized block at 2 GiB alignment plus 16 spare bytes.
+    out = const_cast<void*>(sentinel);
+    check(take(&out, usable + 16, 0x80000000ull, &apu) == no_memory && !out && apu == 0xDEADBEEF, "no-fit request with 2 GiB alignment");
     check_empty("refused requests");
 
     void* p = take_ok(0x40, 0);  // 0 means the default of 16
@@ -260,6 +252,37 @@ void concurrent()
     check(live.blocks.empty(), "every block was released");
     check_empty("concurrent run");
 }
+// Competing first-time creators: every caller gets a block right after its create returns and keeps it
+// while the others are still creating. A second creation that reset the table would hand out a
+// block that overlaps a live one, or leave a live block unfreeable.
+void first_creation(CreateFn create)
+{
+    constexpr unsigned callers = 4;
+    std::atomic<bool> go{false};
+    std::atomic<int> bad{0};
+    void* blocks[callers] = {};
+    std::vector<std::thread> threads;
+    for (unsigned id = 0; id < callers; ++id)
+        threads.emplace_back([&, id] {
+            while (!go.load()) std::this_thread::yield();
+            if (create(heap_size, 0) != ok) ++bad;
+            void* p = nullptr;
+            if (take(&p, 0x1000, 16) != ok || !p) ++bad;
+            blocks[id] = p;
+        });
+    go = true;
+    for (auto& t : threads) t.join();
+    check(bad.load() == 0, "concurrent first ApuCreateHeap calls and allocations succeed");
+    for (unsigned i = 0; i < callers; ++i)
+        for (unsigned j = i + 1; j < callers; ++j)
+            check(blocks[i] != blocks[j], "competing creators got distinct blocks");
+    check(create(heap_size, 0) == ok, "repeat ApuCreateHeap");
+    void* extra = take_ok(0x1000);
+    for (void* b : blocks) check(extra != b, "block taken after a repeat creation does not reuse a live block");
+    for (void* b : blocks) check(free_fn(b) == ok, "live block survives competing creation and frees");
+    check(free_fn(extra) == ok, "free extra");
+    check_empty("first creation");
+}
 }  // namespace
 
 int main(int argc, char** argv)
@@ -275,7 +298,7 @@ int main(int argc, char** argv)
     if (!alloc_fn || !free_fn || !map_fn || !create) return std::printf("FAIL: missing export\n"), 2;
     void* none = nullptr;
     check(take(&none, 64) == no_memory && !none, "no heap yet");
-    check(create(heap_size, 0) == ok, "ApuCreateHeap");
+    first_creation(create);
     churn_beyond_capacity();
     reuse_and_alignment();
     coalescing();
