@@ -655,12 +655,14 @@ def assert_equal_output(label: str, name: str, idx, got: bytes, want: bytes) -> 
     if label == "native" and name in XSAVEC_EXPORTS:
         # The CPU may also store initialized x87/SSE slots, and MXCSR is only specified with the SSE slot.
         got_bv = struct.unpack_from("<Q", got, 512)[0]
+        want_bv = struct.unpack_from("<Q", want, 512)[0]
         loose = bytearray(want)
+        # Only components the reference leaves initialized may carry extra host bytes; active x87/SSE payloads
+        # (control words, ST and XMM registers) stay compared. x87 pointer fields are adapted by expected_native_output.
         for bit, spans in ((1, ((0, 24), (32, 160))), (2, ((160, 416),))):
-            if got_bv & bit:
+            if got_bv & bit and not want_bv & bit:
                 for lo, hi in spans:
                     loose[lo:hi] = got[lo:hi]
-        want_bv = struct.unpack_from("<Q", want, 512)[0]
         if not want_bv & 2:
             loose[24:32] = got[24:32]
         loose[512:520] = got[512:520]
@@ -682,6 +684,11 @@ def assert_equal_output(label: str, name: str, idx, got: bytes, want: bytes) -> 
         f"{label} {name} case {idx}: first mismatch at byte {diff}: "
         f"got {got[diff : diff + 16].hex()} != want {want[diff : diff + 16].hex()}"
     )
+
+
+def native_exports_for_host(native: dict, has_xsavec: bool) -> dict:
+    """Drop native xsavec fixtures on hosts without XSAVEC: executing them would raise #UD."""
+    return {name: fn for name, fn in native.items() if has_xsavec or name not in XSAVEC_EXPORTS}
 
 
 def bind_exports(dll_path: Path, prefix: str = "", names=EXPORTS):
@@ -722,7 +729,9 @@ def check_fault_controls(
                 misalign_checks += 1
 
         for name in XSAVEC_EXPORTS:
-            for label, is_native, fn in (("native", True, native_fns[name]), ("lifted", False, lifted_fns[name])):
+            for label, is_native, fn in (("native", True, native_fns.get(name)), ("lifted", False, lifted_fns[name])):
+                if fn is None:
+                    continue  # host without XSAVEC: native fixture is not executed
                 buf_a, ptr_a, _, _, _ = alloc_aligned_buffer(valid_a)
                 buf_out, ptr_out, pre, p_off, post = alloc_aligned_buffer(FILL, offset=off)
                 try:
@@ -1020,6 +1029,12 @@ def check_differential(
         print("Host CPU lacks XSAVE/OSXSAVE/AVX (XCR0 & 7 == 7); skipping native differential check.")
         raise SystemExit(77)
 
+    lifted_lib.host_has_xsavec.argtypes = []
+    lifted_lib.host_has_xsavec.restype = ctypes.c_uint32
+    has_xsavec = bool(lifted_lib.host_has_xsavec())
+    if not has_xsavec:
+        print("Host CPU lacks XSAVEC (CPUID.(0xD,1):EAX[1]); native xsavec fixtures are skipped, lifted xsavec still checked.")
+
     lifted_lib.host_xsave_area_size.argtypes = []
     lifted_lib.host_xsave_area_size.restype = ctypes.c_uint32
     host_area_size = int(lifted_lib.host_xsave_area_size())
@@ -1037,6 +1052,7 @@ def check_differential(
     mxcsr_mask = int(lifted_lib.host_mxcsr_mask())
 
     _, native = bind_exports(native_path)
+    native = native_exports_for_host(native, has_xsavec)
     _, native_altered = bind_exports(native_altered_path, "", ALTERED_CANONICAL_EXPORTS)
     altered_lib, altered = bind_exports(altered_path, "lifted_", ALTERED_DEFINED_EXPORTS)
     canonical_lib, canonical = bind_exports(canonical_path, "lifted_", CANONICAL_EXPORTS)
@@ -1079,9 +1095,10 @@ def check_differential(
                     if name in CANONICAL_EXPORTS
                     else expected_native_output(want, a, name, fp_caps)
                 )
-                got_n = invoke_native(harness, native[name], a, b)
                 got_l = invoke_lifted(lifted_fn, a, b)
-                assert_equal_output("native", name, idx, got_n, want_native)
+                if name in native:
+                    got_n = invoke_native(harness, native[name], a, b)
+                    assert_equal_output("native", name, idx, got_n, want_native)
                 assert_equal_output("lifted", name, idx, got_l, want)
                 total += 1
 
@@ -1126,6 +1143,34 @@ def check_differential(
                 pass
             else:
                 raise AssertionError(f"mutated xsavec byte {pos} was not caught by comparator")
+
+        # Native comparison keeps active x87/SSE payloads: a flipped FCW, ST0 or XMM0 byte must fail, while an
+        # initialized component carrying extra host bytes must still pass.
+        want_bv = struct.unpack_from("<Q", xc_want, 512)[0]
+        assert want_bv & 3 == 3, "native-strictness control needs active x87 and SSE components"
+        for pos in (0, 32, 160):
+            flipped = bytearray(xc_want)
+            flipped[pos] ^= 0x01
+            try:
+                assert_equal_output("native", xc_name, pos, bytes(flipped), xc_want)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(f"native comparison accepted a flipped active-component byte {pos}")
+        sse_name = "op_xrstor64_xsavec64_sse"
+        sse_a, sse_b = xsave_pairs(mxcsr_mask)[6]
+        sse_want = reference(sse_name, sse_a, sse_b, mxcsr_mask, deprecates_cs_ds)
+        assert struct.unpack_from("<Q", sse_want, 512)[0] & 1 == 0
+        sse_host = bytearray(sse_want)
+        struct.pack_into("<Q", sse_host, 512, struct.unpack_from("<Q", sse_want, 512)[0] | 1)
+        sse_host[0:24] = bytes(range(1, 25))
+        sse_host[32:160] = bytes(range(128))
+        assert_equal_output("native", sse_name, 0, bytes(sse_host), sse_want)
+
+        # A host without XSAVEC must not be handed native xsavec fixtures.
+        gated = native_exports_for_host(native, False)
+        assert not set(XSAVEC_EXPORTS) & set(gated) and set(native) - set(XSAVEC_EXPORTS) == set(gated)
+        check_fault_controls(harness, gated, lifted, canonical, mxcsr_mask)
 
         es0_64 = fp_caps[(True, True, False)][:3]
         es1_64 = fp_caps[(True, True, True)][:3]

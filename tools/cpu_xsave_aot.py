@@ -190,6 +190,16 @@ extern "C" __declspec(dllexport) std::uint32_t host_has_xsave() {
     return (_xgetbv(0) & 7u) == 7u ? 1u : 0u;
 }
 
+extern "C" __declspec(dllexport) std::uint32_t host_has_xsavec() {
+    if (host_has_xsave() == 0u) return 0u;
+    int info0[4]{};
+    __cpuid(info0, 0);
+    if (info0[0] < 0xD) return 0u;
+    int sub[4]{};
+    __cpuidex(sub, 0xD, 1);
+    return (sub[0] & 2) != 0 ? 1u : 0u;  // CPUID.(0DH,1):EAX[1] = XSAVEC
+}
+
 extern "C" __declspec(dllexport) std::uint64_t host_xcr0() {
     if (host_has_xsave() == 0u) return 0ull;
     return _xgetbv(0);
