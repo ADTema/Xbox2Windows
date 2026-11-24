@@ -282,6 +282,15 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_BUFFER_SRV", nullptr, 0)) {
         extern int draw_address_buffer_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_buffer_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_VERTEX_FETCH", nullptr, 0)) {
+        // Six vertices of 24 bytes in slot 0: TEXCOORD float3, then POSITION float3. The positions cover pixels
+        // [1, 3) x [1, 3) of the 8x4 target; the texture coordinates, read as positions, would cover [0, 4) x [0, 1).
+        static const float vertices[6][6] = {
+            {-1.0f, 1.0f, 0.5f, -0.75f, 0.5f, 0.5f}, {0.0f, 1.0f, 0.5f, -0.25f, 0.5f, 0.5f}, {-1.0f, 0.5f, 0.5f, -0.75f, -0.5f, 0.5f},
+            {0.0f, 1.0f, 0.5f, -0.25f, 0.5f, 0.5f}, {0.0f, 0.5f, 0.5f, -0.25f, -0.5f, 0.5f}, {-1.0f, 0.5f, 0.5f, -0.75f, -0.5f, 0.5f}};
+        const D3D12_VERTEX_BUFFER_VIEW view{reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(vertices), sizeof(vertices), sizeof(vertices[0])};
+        invoke(list, 48, 0, 1, arg(&view));
+        invoke(list, 12, 6, 1);
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FRAME_COPY", nullptr, 0)) {
         extern int draw_frame_copies(ID3D12Device*, void*, void*, UINT, UINT);
         if (const int result = draw_frame_copies(desktop.Get(), guest, list, width, height)) return result;

@@ -143,8 +143,8 @@ def native_program(archive: Path, record: str, *, container_sha256: str | None =
     return blob, container_code(parts(blob)[b"DXIL"], stage=0, llvm=llvm, cpu=cpu, features=features)
 
 
-def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
-    """Extract the stage-specific instruction stream from a DXIL program part."""
+def container_image(program, *, stage):
+    """Inflate the native FSSM image of a DXIL program part."""
     if len(program) < 24 or struct.unpack_from("<H", program, 2)[0] != stage:
         raise ValueError("Unexpected shader stage")
     table = program.index(b"XDAT", 24)
@@ -164,6 +164,12 @@ def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
     image = inflate(program[offset+24:offset+length], size, 15)
     if len(image) < 196 or image[:4] != b"FSSM":
         raise ValueError("Invalid native program header")
+    return image
+
+
+def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
+    """Extract the stage-specific instruction stream from a DXIL program part."""
+    image = container_image(program, stage=stage)
     start = struct.unpack_from("<I", image, 192)[0] + 40
     if start < 196 or start % 4 or start + 4 > len(image):
         raise ValueError("Invalid native code offset")

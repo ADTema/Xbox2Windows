@@ -55,7 +55,110 @@ def sdwa_dest(result, sel, unused, old):
 
 def strip_header(code):
     at = code.find(PREFETCH, 0, 0x80)
+    # A call (s_swappc_b64) just before the prefetch is the program's first instruction, not header: keep it.
+    if at >= 4 and at % 4 == 0 and struct.unpack_from('<I', code, at - 4)[0] & 0xff80ff00 == 0xbe802100:
+        at -= 4
     return code[at:] if at >= 0 and at % 4 == 0 else code
+
+
+# A stream vertex shader whose inputs come from a fetch routine the driver builds from the input layout starts
+# with this call; the routine's address arrives in s[4:5]. Its FSSM header lists, from +0x138, one 5-byte record
+# per fetched input: kind (6), input-signature register, component mask, first VGPR, component count - 1.
+# Checked offline against the input signatures of every readable vertex program of one title's shader archive
+# that starts with the call: each record's register and mask match a signature input (the mask is the read
+# mask; the count reaches its highest component), the first VGPR is v4 and each next record is 4 VGPRs on.
+# Programs without the call have no records. Any other header size or record kind is refused.
+FETCH_CALL = 0xbe842104  # s_swappc_b64 s[4:5], s[4:5]
+FETCH_HEADER_BASE, FETCH_RECORDS, FETCH_KIND = 0x2f8, 0x138, 6
+# DXGI format -> (BUF_FMT name in FETCH_FORMATS, bytes per element).
+FETCH_DXGI = {2: ('BUF_FMT_32_32_32_32_FLOAT', 16), 6: ('BUF_FMT_32_32_32_FLOAT', 12), 16: ('BUF_FMT_32_32_FLOAT', 8),
+              41: ('BUF_FMT_32_FLOAT', 4), 28: ('BUF_FMT_8_8_8_8_UNORM', 4), 49: ('BUF_FMT_8_8_UNORM', 2),
+              61: ('BUF_FMT_8_UNORM', 1), 34: ('BUF_FMT_16_16_FLOAT', 4), 35: ('BUF_FMT_16_16_UNORM', 4)}
+# Typed buffer loads: (word load or None, the four component expressions). Components a format lacks read as
+# 0, 0, 0, 1 here, as in the existing tbuffer translation; that default is an assumption, not a measurement.
+FETCH_FORMATS = {
+    'BUF_FMT_8_8_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)', 'U((w >> 24) / 255.0)']),
+    'BUF_FMT_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', '0u', 'U(1.0)']),
+    'BUF_FMT_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', '0u', '0u', 'U(1.0)']),
+    'BUF_FMT_8_UINT': ('{0}.Load(a & ~3u) >> ((a & 3u) * 8u)', ['w & 255u', '0u', '0u', '1u']),
+    'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
+    'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
+    'BUF_FMT_32_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', '{0}.Load(a + 12)']),
+    'BUF_FMT_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', 'U(1.0)']),
+    'BUF_FMT_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '0u', 'U(1.0)']),
+    'BUF_FMT_32_FLOAT': (None, ['{0}.Load(a)', '0u', '0u', 'U(1.0)'])}
+
+
+def starts_with_fetch_call(code):
+    return len(code) >= 4 and struct.unpack_from('<I', code)[0] == FETCH_CALL
+
+
+def parse_input_layout(text):
+    """'ia1 <n>' then one '<semantic> <index> <format> <slot> <offset> <class> <step>' line per element."""
+    lines = text.split('\n')
+    if not re.fullmatch(r'ia1 ([1-9]|[12][0-9]|3[0-2])', lines[0]) or lines[-1] != '' or len(lines) != int(lines[0][4:]) + 2:
+        raise Unsupported('invalid input layout request')
+    elements, ends = [], {}
+    for line in lines[1:-1]:
+        m = re.fullmatch(r'([A-Za-z_][A-Za-z0-9_]{0,62}) (\d{1,10}) (\d{1,10}) (\d{1,2}) (\d{1,10}) (\d) (\d{1,10})', line)
+        if not m:
+            raise Unsupported('invalid input layout element')
+        name, index, fmt, slot, offset, cls, step = m.group(1).upper(), *map(int, m.groups()[1:])
+        if fmt not in FETCH_DXGI:
+            raise Unsupported('input layout format %d' % fmt)
+        if cls != 0 or step != 0:
+            raise Unsupported('per-instance input layout element')
+        if slot > 15:
+            raise Unsupported('input layout slot %d' % slot)
+        if offset == 0xffffffff:  # D3D12_APPEND_ALIGNED_ELEMENT: right after the previous element of the slot
+            offset = ends.get(slot, 0)
+        ends[slot] = offset + FETCH_DXGI[fmt][1]
+        elements.append(dict(name=name, index=index, format=fmt, slot=slot, offset=offset))
+    return elements
+
+
+def signature_inputs(isg1):
+    """ISG1 part -> {register: (semantic name, semantic index, system value)}."""
+    count, first = struct.unpack_from('<II', isg1, 0)
+    out = {}
+    for i in range(count):
+        _, name_at, index, system, _, register, _ = struct.unpack_from('<6IB', isg1, first + 32 * i)
+        out[register] = (isg1[name_at:isg1.index(b'\0', name_at)].decode('ascii').upper(), index, system)
+    return out
+
+
+def stream_fetch(vs_container, layout_text):
+    """The fetch a stream vertex shader expects before its first instruction: [dict(vgpr, count, ...layout)]."""
+    from pixel_aot import container_image
+    from resource_inventory import parts
+    if layout_text is None:
+        raise Unsupported('vertex stage calls a fetch routine and the pipeline declares no input layout')
+    sections = parts(vs_container)
+    image = container_image(sections[b'DXIL'], stage=1)
+    if len(image) < FETCH_HEADER_BASE or struct.unpack_from('<Q', image, 192)[0] != FETCH_HEADER_BASE:
+        raise Unsupported('unverified FSSM header for a vertex fetch table')
+    inputs, layout = signature_inputs(sections[b'ISG1']), parse_input_layout(layout_text)
+    fetch, at = [], FETCH_RECORDS
+    while image[at] != 0:
+        kind, register, mask, vgpr, last = image[at:at + 5]
+        count = last + 1
+        # The count reaches the highest component the shader reads (mask 0x4 comes with count 3): load all of them.
+        if kind != FETCH_KIND or mask >> last != 1 or not 1 <= count <= 4 or vgpr < 1 or len(fetch) == 16:
+            raise Unsupported('unverified vertex fetch record %s' % image[at:at + 5].hex())
+        if register not in inputs:
+            raise Unsupported('vertex fetch record for input register %d outside the signature' % register)
+        name, index, _ = inputs[register]
+        match = [e for e in layout if (e['name'], e['index']) == (name, index)]
+        if len(match) != 1:
+            raise Unsupported('input layout has %d elements for vertex input register %d' % (len(match), register))
+        fetch.append(dict(match[0], vgpr=vgpr, count=count))
+        at += 5
+    if not fetch:
+        raise Unsupported('vertex stage calls a fetch routine and its container lists no fetched inputs')
+    taken = [r for e in fetch for r in range(e['vgpr'], e['vgpr'] + e['count'])]
+    if len(taken) != len(set(taken)):
+        raise Unsupported('vertex fetch records overlap')
+    return fetch
 
 
 def decode(code):
@@ -147,6 +250,7 @@ class Stage:
         self.attrs = {}           # pixel: attr index -> 'linear' | 'flat'
         self.uses_pos = False
         self.masks = set()        # scalar registers currently holding lane masks
+        self.fetched = False      # vertex: the entry call into the fetch routine was translated as loads
         self.setup_entry()
         self.translate()
 
@@ -658,23 +762,31 @@ class Stage:
         fmt = formats[0][8:-1] if formats else 'BUF_FMT_8_UNORM'  # the disassembler omits the default format
         buf, address = self.buffer_address(ops, [m for m in mods if not m.startswith('format:')])
         self.emit('a = %s;' % address)
-        table = {'BUF_FMT_8_8_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)', 'U((w >> 24) / 255.0)']),
-                 'BUF_FMT_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', '0u', 'U(1.0)']),
-                 'BUF_FMT_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', '0u', '0u', 'U(1.0)']),
-                 'BUF_FMT_8_UINT': ('{0}.Load(a & ~3u) >> ((a & 3u) * 8u)', ['w & 255u', '0u', '0u', '1u']),
-                 'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
-                 'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
-                 'BUF_FMT_32_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', '{0}.Load(a + 12)']),
-                 'BUF_FMT_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', 'U(1.0)']),
-                 'BUF_FMT_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '0u', 'U(1.0)']),
-                 'BUF_FMT_32_FLOAT': (None, ['{0}.Load(a)', '0u', '0u', 'U(1.0)'])}
-        if fmt not in table:
+        self.load_format(fmt, buf, dst[1], count)
+
+    def load_format(self, fmt, buf, first, count):
+        if fmt not in FETCH_FORMATS:
             raise Unsupported('buffer format %s' % fmt)
-        load, comps = table[fmt]
+        load, comps = FETCH_FORMATS[fmt]
         if load:
             self.emit('w = %s;' % load.format(buf))
         for i in range(count):
-            self.set_v(dst[1] + i, comps[i].format(buf))
+            self.set_v(first + i, comps[i].format(buf))
+
+    def op_s_swappc_b64(self, ops, mods):
+        # Only the entry call into the driver's fetch routine is translated: as the loads that routine makes.
+        if self.kind != 'vs' or self.pc != 0 or ops != ['s[4:5]', 's[4:5]']:
+            raise Unsupported('s_swappc_b64 %s at +0x%x' % (', '.join(ops), self.pc))
+        if not self.pipe.vs_fetch:
+            raise Unsupported('vertex stage calls a fetch routine and the pipeline declares no input layout')
+        base = self.pipe.ud(('basevertex',))
+        for e in self.pipe.vs_fetch:
+            key = (('vbtab',), 16 * e['slot'])
+            buf = self.pipe.resource(key, 'buf')
+            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            self.emit('a = (vid + ud%d) * ud%d + %d;' % (base, stride, e['offset']))
+            self.load_format(FETCH_DXGI[e['format']][0], buf, e['vgpr'], e['count'])
+        self.fetched = True
 
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
@@ -1138,8 +1250,9 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 
 
 class Pipeline:
-    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None):
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None):
         self.root = parse_root(root_blob)
+        self.vs_fetch = vs_fetch  # stream_fetch(): the loads the vertex stage's entry call stands for
         self.packed_position_vgpr = None
         if ps_hw_inputs is not None:
             ena, addr = ps_hw_inputs
@@ -1234,6 +1347,17 @@ class Pipeline:
         s.used_v.add(0)
         flat = re.compile(r'\s*o\.fparam(\d+) = ')
         body = [line for line in s.body() if not (flat.match(line) and int(flat.match(line).group(1)) not in self.flat)]
+        if s.fetched:
+            # Behind a fetch call every input register comes from the fetch: a read of anything else written by
+            # nothing earlier (v0 aside) would silently be 0, so refuse it.
+            written = {0}
+            for line in body:
+                target = re.match(r'\s*(?:if \(exec & 1\) )?v(\d+) = (.*)', line)
+                unwritten = {int(n) for n in re.findall(r'\bv(\d+)\b', target.group(2) if target else line)} - written
+                if unwritten:
+                    raise Unsupported('vertex stage reads v%d, which neither the fetch nor the program writes' % min(unwritten))
+                if target:
+                    written.add(int(target.group(1)))
         out += s.declarations() + ['    v0 = vid;'] + body + ['    return o;', '}',
             '// Rectangle lists arrive as six vertices per rectangle: corners 0 1 2, 0 2 and the fourth corner 0 + 2 - 1.',
             'VSOut main(uint vid : SV_VertexID) {',
@@ -1291,9 +1415,10 @@ def fnv(data, h=1469598103934665603):
     return h
 
 
-def pipeline_key(vs_code, ps_code, root_blob):
-    """Hash the startup translation revision and the three blobs in runtime order."""
-    return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-3'))))
+def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
+    """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-3'))))
+    return fnv(layout, key) if layout else key
 
 
 DEFAULT_FXC = r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe'
@@ -1326,14 +1451,14 @@ def find_fxc():
     return shutil.which('fxc.exe')
 
 
-def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request=''):
+def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
     With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
     check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats)
+        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch)
         vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
         if rtv_request:
             manifest += rtv_request + '\n'
@@ -1384,8 +1509,11 @@ def translate_request(out_dir, key):
                 raise Unsupported('invalid RTV variant values')
             name = os.path.join(out_dir, 'req_%016x' % base)
         a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
-        if request and pipeline_key(a, b, root) != base:
+        # A stream with an input layout publishes it as .ia (before .a) and hashes it into the key.
+        layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
+        if request and pipeline_key(a, b, root, layout) != base:
             raise Unsupported('RTV variant source key mismatch')
+        fetch = None
         if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
             # Slot 86 records complete containers in canonical (VS, PS) order.
             # Keep the container bytes in the cache key; translate only the bounded native code.
@@ -1393,9 +1521,12 @@ def translate_request(out_dir, key):
             from pixel_aot import container_code
             from resource_inventory import parts
             try:
+                container = a
                 a, b = (container_code(parts(blob)[b'DXIL'], stage=stage)
                         for blob, stage in ((a, 1), (b, 0)))
-            except (KeyError, ValueError, struct.error, zlib.error) as error:
+                if starts_with_fetch_call(a):
+                    fetch = stream_fetch(container, layout.decode('ascii') if layout else None)
+            except (KeyError, ValueError, IndexError, struct.error, zlib.error) as error:
                 raise Unsupported('invalid stream shader: %s' % error) from error
             if classify(a) != 'vs' or classify(b) != 'ps':
                 raise Unsupported('stream stage and shader export disagree')
@@ -1408,7 +1539,7 @@ def translate_request(out_dir, key):
     if set(kinds) != {'vs', 'ps'}:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
-    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request)
+    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request, vs_fetch=fetch)
 
 
 def main():
