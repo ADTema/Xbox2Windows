@@ -75,7 +75,7 @@ IMAGE = {
     'r128': 'image_sample_c_lz v4, v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D r128',
 }
 # SQ_IMG_SAMP_WORD1 bits 23:12 are MAX_LOD (4.8 fixed point). The translated static sampler never limits the
-# LOD, so an implicit-derivative comparison is lowered to SampleCmp only when the source does not limit it either.
+# LOD, so an implicit comparison is lowered only when the source limits it to level zero.
 MAX_LOD_FULL = 0xfff << 12
 W1 = {'c': MAX_LOD_FULL, 'c_nsa': MAX_LOD_FULL, 'c_max_partial': 1 << 12}
 # name -> (image key, sampler word 0, sampler word 2)
@@ -317,36 +317,15 @@ def controls():
     lz = pipeline('lz')
     check_call(lz.hlsl_ps(), 'SampleCmpLevelZero', 'v1', 'v2', 'v0')  # contiguous: reference first, then u, v
     check_call(pipeline('lz_nsa').hlsl_ps(), 'SampleCmpLevelZero', 'v0', 'v1', 'v3')  # NSA: v3 is the reference
-    check_call(pipeline('c').hlsl_ps(), 'SampleCmp', 'v1', 'v2', 'v0')  # implicit derivatives in a pixel stage
-    check_call(pipeline('c_nsa').hlsl_ps(), 'SampleCmp', 'v0', 'v1', 'v3')
-    # MAX_LOD 0 limits the source to level zero, so the implicit form is exactly SampleCmpLevelZero; a limit between
-    # 0 and the maximum has no static-sampler equivalent and is refused.
+    # Implicit mip selection is not lowered: the comparison sampler state ignores the mip filter, so any source that
+    # does not limit the LOD to zero is refused. MAX_LOD 0 is exactly level zero.
     check_call(pipeline('c_max0').hlsl_ps(), 'SampleCmpLevelZero', 'v1', 'v2', 'v0')
-    refused('c_max_partial', 'sampler MAX_LOD')
-    # An unrestricted implicit comparison whose derivatives cannot be represented (exec not proven, or inside a
-    # block) is refused instead of being sampled at level zero, which would pick a different mip.
-    for label, setup in (('exec uncertain', lambda st: setattr(st, 'exec_known', False)),
-                         ('inside a block', lambda st: st.blocks.append(None))):
-        original = G.Stage.image_compare
-
-        def patched(self, ops, mods, how, setup=setup, original=original):
-            saved = (self.exec_known, list(self.blocks))
-            setup(self)
-            try:
-                return original(self, ops, mods, how)
-            finally:
-                self.exec_known, self.blocks[:] = saved
-        G.Stage.image_compare = patched
-        try:
-            refused('c', 'implicit derivatives')
-            refused('c_nsa', 'implicit derivatives')
-            check_call(pipeline('c_max0').hlsl_ps(), 'SampleCmpLevelZero', 'v1', 'v2', 'v0')
-        finally:
-            G.Stage.image_compare = original
-        print('unrestricted implicit comparison refused when %s; proven MAX_LOD 0 kept' % label)
+    refused('c', 'implicit mip selection')
+    refused('c_nsa', 'implicit mip selection')
+    refused('c_max_partial', 'implicit mip selection')
     assert 'Texture2D<float4> r0' in lz.hlsl_ps() and 'srv 0 tex2d table 0 0' in lz.manifest()
     assert manifest_samplers(lz) == ['smpc 0 0x%x 0x0 0x0 0x0' % (POINT | LESS)], manifest_samplers(lz)
-    print('lz: reference v0 at (v1, v2); NSA reference v3 at (v0, v1); c uses SampleCmp; sampler smpc')
+    print('lz: reference v0 at (v1, v2); NSA reference v3 at (v0, v1); implicit c refused; sampler smpc')
 
     # The comparison function travels in word 0 bits 14:12, one function per fixture.
     for n in range(8):
@@ -398,7 +377,6 @@ def negative_controls():
     """
     good = pipeline('lz').hlsl_ps()
     nsa = pipeline('lz_nsa').hlsl_ps()
-    implicit = pipeline('c').hlsl_ps()
     exact = ('SampleCmpLevelZero', 'v1', 'v2', 'v0')
     mutants = (
         ('reference read from the last address register', good.replace('F(v2)), F(v0))', 'F(v1)), F(v2))'), exact),
@@ -408,8 +386,6 @@ def negative_controls():
         ('ordinary SamplerState instead of SamplerComparisonState',
          good.replace('SamplerComparisonState', 'SamplerState'), exact),
         ('SampleCmp instead of SampleCmpLevelZero', good.replace('SampleCmpLevelZero', 'SampleCmp'), exact),
-        ('SampleCmpLevelZero instead of SampleCmp', implicit.replace('SampleCmp(', 'SampleCmpLevelZero('),
-         ('SampleCmp', 'v1', 'v2', 'v0')),
         ('SampleLevel instead of a comparison',
          good.replace('SampleCmpLevelZero(q0, float2(F(v1), F(v2)), F(v0))', 'SampleLevel(q0, float2(F(v1), F(v2)), 0).x'),
          exact),

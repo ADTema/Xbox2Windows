@@ -790,21 +790,13 @@ class Stage:
         tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
         args = '%s, float2(%s, %s), %s' % (smp, self.f(cs[1]), self.f(cs[2]), self.f(cs[0]))
-        # MAX_LOD (word 1 bits 23:12) is not carried into the static sampler, which never limits the LOD. Level
-        # zero is the exact lowering when the source limits it to 0; an implicit comparison cannot express any
-        # other limit below the maximum.
+        # MAX_LOD (word 1 bits 23:12) is not carried into the static sampler, and the comparison-state mapping ignores
+        # the mip filter and uses level zero. Only a source limited to level zero is therefore exact for the implicit
+        # form; any other limit would need mip selection and blending that is not lowered in this slice, so it is refused.
         max_lod = (words[1] >> 12) & 0xfff
-        if how == 'c' and max_lod not in (0, 0xfff):
-            raise Unsupported('%s with a sampler MAX_LOD of %#x' % (base, max_lod))
-        # Implicit derivatives exist only in a pixel stage with a known exec outside any block, as for image_sample.
-        # Where they cannot be represented, level zero would silently pick a different mip when the sampler does not
-        # limit the LOD, so that form is refused; a proven MAX_LOD of 0 is exactly level zero.
         if how == 'c' and max_lod:
-            if not (self.exec_known and self.kind == 'ps' and len(self.blocks) == 0):
-                raise Unsupported('%s with implicit derivatives that cannot be represented here (unrestricted MAX_LOD)' % base)
-            call = '%s.SampleCmp(%s)' % (tex, args)
-        else:
-            call = '%s.SampleCmpLevelZero(%s)' % (tex, args)
+            raise Unsupported('%s with implicit mip selection (sampler MAX_LOD %#x)' % (base, max_lod))
+        call = '%s.SampleCmpLevelZero(%s)' % (tex, args)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % call)
 
     def op_image_sample_c(self, ops, mods):
