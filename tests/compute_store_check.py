@@ -3055,10 +3055,10 @@ def mimg_load_binary(directory, assembler, objcopy, library):
     """Assemble and decode each dmask form, then lower the decoded program through the CLI."""
     mimg_load_controls()
     mimg_a16_controls()
-    cases = []
-    for a16 in (False, True):
-        cases += [(f"mimg_load{'_a16' if a16 else ''}_{count}", lines, MIMG_BINDING)
-                  for count, groups, shift, lines in mimg_load_cases(a16)]
+    mimg_mip_controls()
+    cases = [(f"{op}{'_a16' if a16 else ''}_{count}", lines, MIMG_BINDING)
+             for op in ("image_load", "image_load_mip") for a16 in (False, True)
+             for count, _, _, lines in mimg_load_cases(a16, mip=op == "image_load_mip")]
     gfx1030_binary(directory, assembler, objcopy, library, cases, "image_", group=(8, 8, 1))
 
 
@@ -3676,7 +3676,7 @@ def texture_word(x, y, channel):
     return TEXTURE_WORDS[y * TEXTURE_WIDTH + x][channel]
 
 
-def mimg_load_cases(a16=False):
+def mimg_load_cases(a16=False, *, mip=False):
     """dmask x/xy/xyz/xyzw on one descriptor, with dispatch counts that fill the 320-word UAV.
 
     The a16 spelling packs both coordinates into one address VGPR: x in bits [15:0], y in [31:16].
@@ -3692,14 +3692,24 @@ def mimg_load_cases(a16=False):
             "v_lshl_add_u32 v8, s10, 3, v0",
             "v_lshl_add_u32 v9, s11, 3, v1",
         ]
-        if a16:
+        if mip:
+            # Use all three levels within a dispatch. X/4 and Y/4 fit the smallest mip.
+            # Preserve the original X/Y for UAV addressing. The a16 LOD high half is padding.
+            lines += ["v_lshrrev_b32_e32 v16, 2, v8", "v_lshrrev_b32_e32 v17, 2, v9",
+                      "v_min_u32_e32 v18, 2, v9"]
+            if a16:
+                lines += ["v_mad_u32_u24 v17, v17, 0x10000, v16",
+                          "v_or_b32_e32 v18, 0xabcd0000, v18"]
+            addr = "v[17:18]" if a16 else "v[16:18]"
+        elif a16:
             lines.append("v_mad_u32_u24 v10, v9, 0x10000, v8")
-        lines.append("s_waitcnt lgkmcnt(0)")
-        if a16:
-            lines.append(f"image_load {data}, v10, s[24:31] dmask:0x{mask:x} "
-                         "dim:SQ_RSRC_IMG_2D unorm a16")
+            addr = "v10"
         else:
-            lines.append(f"image_load {data}, v[8:9], s[24:31] dmask:0x{mask:x} dim:SQ_RSRC_IMG_2D")
+            addr = "v[8:9]"
+        lines.append("s_waitcnt lgkmcnt(0)")
+        op = "image_load_mip" if mip else "image_load"
+        flags = " unorm a16" if a16 else ""
+        lines.append(f"{op} {data}, {addr}, s[24:31] dmask:0x{mask:x} dim:SQ_RSRC_IMG_2D{flags}")
         lines += [
             "v_mov_b32_e32 v12, v9",
             f"v_lshlrev_b32_e32 v13, {shift}, v8",
@@ -3710,7 +3720,14 @@ def mimg_load_cases(a16=False):
         yield count, groups, shift, lines
 
 
-def mimg_load_words(count, shift, groups):
+def mimg_mip_texels():
+    """Additional subresources in mip order. Distinct level, channel, row and column bits."""
+    return [((channel + 1) << 28) | (level << 24) | (y << 12) | (x << 4) | channel
+            for level in (1, 2) for y in range(TEXTURE_HEIGHT >> level)
+            for x in range(TEXTURE_WIDTH >> level) for channel in range(TEXTURE_CHANNELS)]
+
+
+def mimg_load_words(count, shift, groups, *, mip=False):
     """Independent readback: lane (tid.x, tid.y) stores its texel at tid.y*32 + tid.x*step."""
     step = 1 << (shift - 2)
     words = [SENTINEL] * 320
@@ -3718,7 +3735,11 @@ def mimg_load_words(count, shift, groups):
         for x in range(8 * groups):
             base = y * 32 + x * step
             for channel in range(count):
-                words[base + channel] = texture_word(x, y, channel)
+                if mip:
+                    level = min(y, 2)
+                    words[base + channel] = texture_word(x // 4, y // 4, channel) | (level << 24)
+                else:
+                    words[base + channel] = texture_word(x, y, channel)
     return words
 
 
@@ -3799,7 +3820,26 @@ def mimg_a16_controls():
             (8, 8, 1), **MIMG_BINDING)
 
 
-def mimg_load_draw(directory, compiler, renderer, backend):
+def mimg_mip_controls():
+    for a16 in (False, True):
+        _, _, _, lines = next(mimg_load_cases(a16, mip=True))
+        image = next(line for line in lines if line.startswith("image_load_mip"))
+        addr = "v[17:18]" if a16 else "v[16:18]"
+        for original, replacement, diagnostic in (
+            (addr, "v[16:18]" if a16 else "v[17:18]", "Unsupported image load target"),
+            (addr, "v[17:19]" if not a16 else "v[18:19]", "Unverified image coordinates"),
+            (addr, "[v16,v17,v18]", "Unsupported compute instruction"),
+            (image, image + " tfe", "Unsupported compute instruction"),
+            ("s_waitcnt vmcnt(0)", "", "before s_waitcnt vmcnt(0)"),
+        ):
+            rejects(diagnostic, aot.lower, variant(lines, (original, replacement)), (8, 8, 1), **MIMG_BINDING)
+
+
+def mimg_mip_draw(directory, compiler, renderer, backend):
+    return mimg_load_draw(directory, compiler, renderer, backend, mip=True)
+
+
+def mimg_load_draw(directory, compiler, renderer, backend, *, mip=False):
     mimg_load_controls()
     mimg_a16_controls()
     # Each mutation is a translation mistake that must change the readback at a named word: the
@@ -3814,18 +3854,23 @@ def mimg_load_draw(directory, compiler, renderer, backend):
         }),
         (True, {4: [("packed high half", ">> 16u", ">> 0u", 4)]}),
     )
+    if mip:
+        mimg_mip_controls()
+        families = ((False, {}), (True, {}))
     texture = [word for texel in TEXTURE_WORDS for word in texel]
+    if mip:
+        texture += mimg_mip_texels()
     packed_texture = struct.pack(f"<{len(texture)}I", *texture)
     for a16, mutations in families:
-        for count, groups, shift, lines in mimg_load_cases(a16):
-            stem = f"mimg_load{'_a16' if a16 else ''}_{count}"
+        for count, groups, shift, lines in mimg_load_cases(a16, mip=mip):
+            stem = f"mimg_load{'_mip' if mip else ''}{'_a16' if a16 else ''}_{count}"
             src, cso, case = (directory / f"{stem}.{ext}" for ext in ("hlsl", "cso", "case"))
             source = aot.lower(lines, (8, 8, 1), **MIMG_BINDING)
             src.write_text(source, encoding="ascii")
             compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
             subprocess.run(compile_shader, check=True)
             run = [renderer, backend, "--compute-texture-case", cso, case]
-            expected = mimg_load_words(count, shift, groups)
+            expected = mimg_load_words(count, shift, groups, mip=mip)
             reference = struct.pack("<321I", groups, *expected) + packed_texture
             case.write_bytes(reference)
             result = subprocess.run(run)
@@ -3841,7 +3886,15 @@ def mimg_load_draw(directory, compiler, renderer, backend):
                     raise AssertionError(f"{stem}: wrong word {word} escaped detection\n{bad.stderr}")
                 print(bad.stderr, end="")
             case.write_bytes(reference)
-            for label, old, new, word in mutations.get(count, ()):
+            controls = mutations.get(count, ())
+            if mip and count == 4:
+                load = next(line for line in source.splitlines() if "imageData.Load" in line)
+                zero_lod = load[:load.rindex(", asint(")] + ", 0));"
+                controls = [("fixed LOD", load, zero_lod, 32)]
+                if a16:
+                    high_lod = load[:load.rindex(" & 0xffffu")] + " >> 16u)));"
+                    controls.append(("packed LOD high half", load, high_lod, 0))
+            for label, old, new, word in controls:
                 mutated = source.replace(old, new)
                 assert mutated != source, label
                 src.write_text(mutated, encoding="ascii")
@@ -3853,7 +3906,7 @@ def mimg_load_draw(directory, compiler, renderer, backend):
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("image_load\n", encoding="utf-8")
+        path.write_text("image_load_mip\n" if mip else "image_load\n", encoding="utf-8")
     return 0
 
 
@@ -4444,6 +4497,7 @@ if __name__ == "__main__":
                  "draw-mubuf-d16": mubuf_d16_draw,
                  "draw-mtbuf-load": mtbuf_load_draw,
                  "draw-mimg-load": mimg_load_draw,
+                 "draw-mimg-mip": mimg_mip_draw,
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
                  "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),

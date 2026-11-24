@@ -162,7 +162,11 @@ def main():
                     break
             else:
                 return None
-        plan = host_cpu.plan_replacement(code, address, length, stub, stub_area[0])
+        try:
+            plan = host_cpu.plan_replacement(code, address, length, stub, stub_area[0])
+        except Exception as error:  # iced-x86 missing, or an instruction it cannot move
+            log(f"{time.time() - start:7.3f} host-cpu no replacement at {where(address)}: {error}")
+            plan = None
         if not plan or not write(stub_area[0], plan[0]) or not write(address, plan[1]):
             return None
         stub_area[0] += (len(plan[0]) + 15) & ~15
