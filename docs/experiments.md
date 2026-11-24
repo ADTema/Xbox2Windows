@@ -6615,9 +6615,10 @@ report one deterministic synthetic app path under the process temporary
 directory, `%TEMP%\xbox-recomp-pls\x2w-synthetic-title-0001`. The shim creates
 that directory but writes no title data; `xgameruntime_pls_xpackage` writes and
 removes a small test-owned marker to prove the reported path is usable on disk.
-Space information is fixed at 32 MiB available, 48 MiB total free, and 64 MiB
-total, so a second call reports the same values. `XPersistentLocalStorageGetPath`
-returns `E_INVALIDARG` for a buffer smaller than the reported size and
+Space information is fixed at 32 MiB available, 48 MiB total free, 16 MiB
+used, and 64 MiB total, so a second call reports the same values. `XPersistentLocalStorageGetPath`
+returns `HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)` for a buffer smaller
+than the reported size and
 `E_POINTER` for a null path or null size output.
 
 `XPackageMount` (documented synchronous, deprecated in favor of

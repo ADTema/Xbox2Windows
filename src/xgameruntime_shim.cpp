@@ -74,15 +74,16 @@ enum XUserAddOptions : std::uint32_t;
 enum XTaskQueueDispatchMode : std::uint32_t;
 
 // Public XPersistentLocalStorage.h structure used by the synchronous space
-// contract. The three fields are the documented available and free/total byte
-// counts.
+// contract. The four fields follow the documented order and width.
 struct XPersistentLocalStorageSpaceInfo {
     std::uint64_t availableFreeBytes;
     std::uint64_t totalFreeBytes;
+    std::uint64_t usedBytes;
     std::uint64_t totalBytes;
 };
 
-static_assert(sizeof(XPersistentLocalStorageSpaceInfo) == 24);
+static_assert(sizeof(XPersistentLocalStorageSpaceInfo) == 32);
+static_assert(offsetof(XPersistentLocalStorageSpaceInfo, totalBytes) == 24);
 
 // Public XGameSave.h structures used by the synchronous read contract.
 struct XGameSaveBlobInfo {
@@ -134,7 +135,7 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
     X(XPersistentLocalStorageGetSpaceInfo, XPersistentLocalStorage, HRESULT, (XPersistentLocalStorageSpaceInfo* info), implemented_hr, (info), pls_get_space_info) \
     X(XPackageMount, XPackage, HRESULT, (const char* packageIdentifier, XPackageMountHandle* mountHandle), implemented_hr, (packageIdentifier, mountHandle), xpackage_mount) \
     X(XPackageGetMountPathSize, XPackage, HRESULT, (XPackageMountHandle mountHandle, std::size_t* pathSize), implemented_hr, (mountHandle, pathSize), xpackage_get_mount_path_size) \
-    X(XPackageGetMountPath, XPackage, HRESULT, (XPackageMountHandle mountHandle, std::size_t pathSize, char* path, std::size_t* pathUsed), implemented_hr, (mountHandle, pathSize, path, pathUsed), xpackage_get_mount_path) \
+    X(XPackageGetMountPath, XPackage, HRESULT, (XPackageMountHandle mountHandle, std::size_t pathSize, char* path), implemented_hr, (mountHandle, pathSize, path), xpackage_get_mount_path) \
     X(XPackageCloseMountHandle, XPackage, void, (XPackageMountHandle mountHandle), implemented_void, (mountHandle), xpackage_close_mount_handle) \
     X(XPackageMountWithUiAsync, XPackage, HRESULT, (const char*, XAsyncBlock*), stub, (), stub) \
     X(XSystemGetConsoleId, XSystem, HRESULT, (std::size_t, char*, std::size_t*), stub, (), stub) \
@@ -591,7 +592,7 @@ HRESULT pls_get_path(std::size_t path_size, char* path, std::size_t* path_used) 
     std::string expected;
     if (!pls_path_utf8(expected)) return E_FAIL;
     const std::size_t required = expected.size() + 1;
-    if (path_size < required) return E_INVALIDARG;
+    if (path_size < required) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     std::memcpy(path, expected.c_str(), required);
     if (path_used) *path_used = required;
     return S_OK;
@@ -604,6 +605,7 @@ HRESULT pls_get_space_info(XPersistentLocalStorageSpaceInfo* info) noexcept
     if (!pls_path_utf8(path)) return E_FAIL;
     *info = XPersistentLocalStorageSpaceInfo{synthetic_pls_available_free_bytes,
                                               synthetic_pls_total_free_bytes,
+                                              synthetic_pls_total_bytes - synthetic_pls_total_free_bytes,
                                               synthetic_pls_total_bytes};
     return S_OK;
 }
@@ -654,9 +656,8 @@ HRESULT xpackage_get_mount_path_size(XPackageMountHandle mount_handle,
 }
 
 HRESULT xpackage_get_mount_path(XPackageMountHandle mount_handle, std::size_t path_size,
-                                char* path, std::size_t* path_used) noexcept
+                                char* path) noexcept
 {
-    if (path_used) *path_used = 0;
     if (!path) return E_POINTER;
     char identifier[package_identifier_capacity]{};
     AcquireSRWLockShared(&runtime_state.lock);
@@ -670,7 +671,6 @@ HRESULT xpackage_get_mount_path(XPackageMountHandle mount_handle, std::size_t pa
     const std::size_t required = expected.size() + 1;
     if (path_size < required) return E_INVALIDARG;
     std::memcpy(path, expected.c_str(), required);
-    if (path_used) *path_used = required;
     return S_OK;
 }
 

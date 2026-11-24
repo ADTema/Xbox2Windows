@@ -34,6 +34,7 @@ constexpr std::size_t expected_log_entries = 29;
 struct XPersistentLocalStorageSpaceInfo {
     std::uint64_t availableFreeBytes;
     std::uint64_t totalFreeBytes;
+    std::uint64_t usedBytes;
     std::uint64_t totalBytes;
 };
 
@@ -53,8 +54,7 @@ using PlsGetPath = HRESULT(WINAPI*)(std::size_t, char*, std::size_t*);
 using PlsGetSpaceInfo = HRESULT(WINAPI*)(XPersistentLocalStorageSpaceInfo*);
 using PackageMount = HRESULT(WINAPI*)(const char*, XPackageMountHandle*);
 using PackageGetMountPathSize = HRESULT(WINAPI*)(XPackageMountHandle, std::size_t*);
-using PackageGetMountPath = HRESULT(WINAPI*)(XPackageMountHandle, std::size_t, char*,
-                                             std::size_t*);
+using PackageGetMountPath = HRESULT(WINAPI*)(XPackageMountHandle, std::size_t, char*);
 using PackageCloseMountHandle = void(WINAPI*)(XPackageMountHandle);
 using PackageMountWithUiAsync = HRESULT(WINAPI*)(const char*, XAsyncBlock*);
 using SystemGetConsoleId = HRESULT(WINAPI*)(std::size_t, char*, std::size_t*);
@@ -186,8 +186,8 @@ bool pls_checks(PlsGetPathSize get_path_size, PlsGetPath get_path,
         return false;
     }
 
-    if (get_path(first_size - 1, buffer.data(), &used) != E_INVALIDARG) {
-        std::printf("FAIL: PLS invalid size did not return E_INVALIDARG\n");
+    if (get_path(first_size - 1, buffer.data(), &used) != HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
+        std::printf("FAIL: PLS short buffer did not return ERROR_INSUFFICIENT_BUFFER\n");
         return false;
     }
     if (get_path(first_size, nullptr, &used) != E_POINTER) {
@@ -199,9 +199,15 @@ bool pls_checks(PlsGetPathSize get_path_size, PlsGetPath get_path,
         return false;
     }
 
-    XPersistentLocalStorageSpaceInfo first_space{};
+    constexpr std::uint64_t guard = 0x0123456789ABCDEFull;
+    struct GuardedSpaceInfo {
+        std::uint64_t before = guard;
+        XPersistentLocalStorageSpaceInfo space{};
+        std::uint64_t after = guard;
+    } guarded;
+    const auto& first_space = guarded.space;
     XPersistentLocalStorageSpaceInfo second_space{};
-    if (get_space_info(&first_space) != S_OK || get_space_info(&second_space) != S_OK) {
+    if (get_space_info(&guarded.space) != S_OK || get_space_info(&second_space) != S_OK) {
         std::printf("FAIL: PLS space-info call failed\n");
         return false;
     }
@@ -209,8 +215,13 @@ bool pls_checks(PlsGetPathSize get_path_size, PlsGetPath get_path,
         std::printf("FAIL: PLS space info changed between calls\n");
         return false;
     }
+    if (guarded.before != guard || guarded.after != guard) {
+        std::printf("FAIL: PLS space info wrote past its documented structure\n");
+        return false;
+    }
     if (first_space.availableFreeBytes != synthetic_available_free_bytes ||
         first_space.totalFreeBytes != synthetic_total_free_bytes ||
+        first_space.usedBytes != 16ull * 1024 * 1024 ||
         first_space.totalBytes != synthetic_total_bytes) {
         std::printf("FAIL: PLS space info is not the documented synthetic value\n");
         return false;
@@ -271,8 +282,7 @@ bool package_checks(PackageMount mount, PackageGetMountPathSize get_path_size,
         return false;
     }
     std::vector<char> buffer(first_size);
-    std::size_t used = 0;
-    if (get_path(first, first_size, buffer.data(), &used) != S_OK || used != first_size) {
+    if (get_path(first, first_size, buffer.data()) != S_OK) {
         std::printf("FAIL: XPackageGetMountPath failed\n");
         return false;
     }
@@ -297,9 +307,8 @@ bool package_checks(PackageMount mount, PackageGetMountPathSize get_path_size,
         return false;
     }
     std::vector<char> second_buffer(second_size);
-    std::size_t second_used = 0;
-    if (get_path(second, second_size, second_buffer.data(), &second_used) != S_OK ||
-        second_used != used || std::memcmp(buffer.data(), second_buffer.data(), first_size) != 0) {
+    if (get_path(second, second_size, second_buffer.data()) != S_OK ||
+         std::memcmp(buffer.data(), second_buffer.data(), first_size) != 0) {
         std::printf("FAIL: second mount path differs\n");
         return false;
     }
@@ -309,7 +318,7 @@ bool package_checks(PackageMount mount, PackageGetMountPathSize get_path_size,
         std::printf("FAIL: unmounted handle did not return E_HANDLE from path size\n");
         return false;
     }
-    if (get_path(first, first_size, buffer.data(), &used) != E_HANDLE) {
+    if (get_path(first, first_size, buffer.data()) != E_HANDLE) {
         std::printf("FAIL: unmounted handle did not return E_HANDLE from path\n");
         return false;
     }
@@ -337,7 +346,7 @@ bool package_checks(PackageMount mount, PackageGetMountPathSize get_path_size,
         std::printf("FAIL: null mount handle did not return E_HANDLE\n");
         return false;
     }
-    if (get_path(first, first_size, nullptr, &used) != E_POINTER) {
+    if (get_path(first, first_size, nullptr) != E_POINTER) {
         std::printf("FAIL: null package path did not return E_POINTER\n");
         return false;
     }
@@ -394,7 +403,7 @@ bool log_checks(HMODULE module)
                 std::printf("FAIL: unexpected PLS function %s\n", entry.function);
                 return false;
             }
-            if (entry.result == E_INVALIDARG) saw_pls_invalid = true;
+            if (entry.result == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) saw_pls_invalid = true;
             if (entry.result == E_POINTER) saw_pls_pointer = true;
         }
         if (package) {
