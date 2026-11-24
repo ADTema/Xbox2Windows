@@ -17,6 +17,8 @@
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
 
+#include "startup_stubs/slice_footprints.h"
+
 #include <d3d12.h>
 #include "null_texture_view.h"
 #include <d3d12sdklayers.h>
