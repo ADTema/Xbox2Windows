@@ -1091,6 +1091,15 @@ OperationResult run_startup_cb_blend(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-composite-provenance: source, destination before and destination after a composite draw on one
+// list distinguish a drawn centre, a clipped centre and a UV that selects the source corner (#1628).
+OperationResult run_startup_composite_provenance(const OperationContext& ctx)
+{
+    if (check_startup_composite_provenance(ctx.device) != 0)
+        return {OutcomeKind::fail, "composite provenance differs from the model or a mutant matched"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 template<bool Swapped>
 OperationResult run_startup_sampler_x(const OperationContext& ctx)
 {
@@ -1380,6 +1389,7 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
     {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
+    {"--startup-composite-provenance", 3, 3, nullptr, kNoGate, run_startup_composite_provenance},
     {"--startup-cb-blend-swapped", 3, 3, nullptr, kNoGate, run_startup_cb_blend<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
     {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
