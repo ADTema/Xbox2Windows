@@ -191,12 +191,16 @@ def read_results(junit):
     status = {"run": "pass", "fail": "fail", "notrun": "skip"}
     results = {}
     for case in suite.iter("testcase"):
+        name = case.get("name")
+        if name in results:
+            # Coverage records have only the test name, not its CTest directory.
+            raise ValueError(f"duplicate CTest <testcase> name {name!r}; coverage records require unique names")
         state = status.get(case.get("status"), "fail")
         if case.find("failure") is not None or case.find("error") is not None:
             state = "fail"
         elif state == "pass" and case.find("skipped") is not None:
             state = "skip"
-        results[case.get("name")] = state
+        results[name] = state
     return results, (start - 1, start + duration + 2)
 
 
