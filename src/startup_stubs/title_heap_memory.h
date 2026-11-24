@@ -18,4 +18,13 @@ inline bool heap_needs_title_memory(D3D12_DESCRIPTOR_HEAP_TYPE type, std::uint64
 {
     return type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || (desktop_cpu_start & (alignof(void*) - 1)) != 0;
 }
+// An opaque start cannot be exposed as CPU memory if the required allocation fails.
+template <class Allocate>
+bool ensure_title_heap_memory(D3D12_DESCRIPTOR_HEAP_TYPE type, std::uint64_t desktop_cpu_start,
+                              std::uint64_t bytes, std::uint64_t& title_memory, Allocate allocate)
+{
+    if (title_memory || !heap_needs_title_memory(type, desktop_cpu_start)) return true;
+    if (bytes) title_memory = allocate(bytes);
+    return title_memory != 0;
+}
 }  // namespace x2w_startup

@@ -38,11 +38,26 @@ int rule(bool mutate)
     expect("render-target heap, aligned start", needs(targets, 0x74bdf260), false);
     expect("depth heap, aligned start", needs(depth, 0x74bff760), false);
     expect("render-target heap, tagged start", needs(targets, 0x74bdf261), true);
+    std::uint64_t memory = 0;
+    unsigned allocations = 0;
+    const auto fail_allocation = [&](std::uint64_t) -> std::uint64_t {
+        ++allocations;
+        return 0;
+    };
+    expect("tagged sampler without backing rejects OOM",
+           x2w_startup::ensure_title_heap_memory(samplers, 0x74adb007, 64, memory, fail_allocation), false);
+    expect("failure leaves backing empty", memory == 0 && allocations == 1, true);
+    expect("aligned sampler has no backing requirement",
+           x2w_startup::ensure_title_heap_memory(samplers, 0x74adb000, 64, memory, fail_allocation), true);
+    memory = 0x10000;
+    expect("keeps caller-provided CPU memory",
+           x2w_startup::ensure_title_heap_memory(samplers, 0x74adb007, 64, memory, fail_allocation), true);
+    expect("no alternate allocation after validation", memory == 0x10000 && allocations == 1, true);
     if (failures) {
         std::printf("startup_title_heap: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_title_heap: PASS (9 starts)\n");
+    std::printf("startup_title_heap: PASS (9 starts and backing allocation controls)\n");
     return 0;
 }
 
