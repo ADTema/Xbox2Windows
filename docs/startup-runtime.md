@@ -114,7 +114,7 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 | `X2W_STOP_AT=<rva>[,...]` | the startup debugger stops at a main-image breakpoint at one of these addresses even while `-ContinueAsserts` steps over the others, and writes every thread's stack to `threads_stop.txt` |
 | `X2W_DUMP_AT=<seconds>[,...]` | the startup debugger writes every thread's stack to `threads_<seconds>.txt` at those times, for a run that stalls before a watchdog or the timeout ends it |
-| `X2W_VALLOC_MIN=<hex bytes>` | the startup debugger logs each virtual-memory allocation of at least that size to `files.txt` (`VALLOC`), with the main-image and stand-in return addresses on the caller's stack |
+| `X2W_VALLOC_MIN=<hex bytes>` | the startup debugger logs each virtual-memory allocation of at least that size to `files.txt` (`VALLOC`), with the requested address (0 for any), size, type, protection and the main-image and stand-in return addresses on the caller's stack |
 
 ## Findings
 

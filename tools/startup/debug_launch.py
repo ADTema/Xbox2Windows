@@ -175,7 +175,9 @@ def main():
                 hooks[addr] = (name, arg)
     # X2W_VALLOC_MIN=<hex bytes>: log every virtual-memory allocation of at least that size with the
     # main-image and stand-in return addresses found on the caller's stack (files.txt, "VALLOC").
-    valloc_min = int(os.environ.get("X2W_VALLOC_MIN", "0"), 16)
+    # The call is logged on entry: "requested" is the address the caller asked for (0 for any), not
+    # the address it got.
+    valloc_min = int(os.environ.get("X2W_VALLOC_MIN") or "0", 16)
     if valloc_min and trace:
         for name in ("NtAllocateVirtualMemory", "NtAllocateVirtualMemoryEx"):
             addr = k32.GetProcAddress(ntdll, name.encode())
@@ -277,7 +279,7 @@ def main():
                     words = struct.unpack_from("<200Q", (read(rsp, 8 * 200) or b"").ljust(8 * 200, b"\0"))
                     chain = [where(w) for w in words if any(b <= w < b + 0x10000000 for b in modules)]
                     chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
-                    file_log.write(f"{time.time() - start:7.3f} VALLOC {name} base={base:#x} size={size:#x} "
+                    file_log.write(f"{time.time() - start:7.3f} VALLOC {name} requested={base:#x} size={size:#x} "
                                    f"type={kind & 0xffffffff:#x} protect={protect & 0xffffffff:#x} callers: {' '.join(chain[:10])}\n")
                     file_log.flush()
                 desc = None

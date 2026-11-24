@@ -68,11 +68,14 @@ def main(probe):
         out, logdir = run(probe, work, "valloc", {"X2W_VALLOC_MIN": "10000000"})
         lines = [line for line in text(logdir / "files.txt").splitlines() if " VALLOC " in line]
         ours = [line for line in lines if "size=0x10000000" in line and "type=0x2000" in line]
-        assert len(ours) == 1 and image in ours[0].split("callers:")[1], lines
+        assert len(ours) == 1 and "requested=0x0" in ours[0] and image in ours[0].split("callers:")[1], lines
         out, logdir = run(probe, work, "valloc-control", {"X2W_VALLOC_MIN": "20000000"})
         assert "process exited with 0x00000000" in out and " VALLOC " not in text(logdir / "files.txt"), out
+        # An empty value is the same as unset.
+        out, logdir = run(probe, work, "valloc-empty", {"X2W_VALLOC_MIN": ""})
+        assert "process exited with 0x00000000" in out and " VALLOC " not in text(logdir / "files.txt"), out
 
-    print("startup_debug: PASS (stop at a chosen assert, timed thread dump, large-allocation log; 4 controls)")
+    print("startup_debug: PASS (stop at a chosen assert, timed thread dump, large-allocation log; 5 controls)")
     return 0
 
 
