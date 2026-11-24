@@ -3233,10 +3233,11 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hard
 ### gfx1013 2D float image stores and mip loads
 
 The fixed compute profile accepts a 2D `R32G32B32A32_FLOAT` `image_store`
-with full-width coordinates and data. The caller declares the eight-word
-descriptor with `--image-descriptor` and binds `--image-uav-mip 0` at `u0`.
-DMASK consumes consecutive VGPRs for the selected X, Y, Z, W channels in order.
-The typed `RWTexture2D<float4>` write supplies +0 for each omitted channel.
+with full-width coordinates and data and requires DMASK `0xf`. Four
+consecutive VGPRs supply R, G, B and A. The caller declares the eight-word
+descriptor with `--image-descriptor`, binds `--image-uav-mip 0` at `u0` and
+supplies a distinct destination texel for each invocation. All other store
+masks are refused.
 
 `image_load_mip` reads a matching `Texture2D<float4>` at `t0`. It passes the
 last full-width address VGPR as the view-relative mip in `Load(int3(x,y,mip))`.
@@ -3247,11 +3248,14 @@ case. Wait for descriptors with `lgkmcnt(0)` and the load with `vmcnt(0)`.
 This profile refuses same-descriptor reads and writes, sample instructions,
 atomics, A16, D16 and non-2D dimensions.
 
-The source-built fixture copies red and blue from mip 1 into green and alpha
-of mip 0 on a separate texture. It compares all 1,344 DWORDs across three mips,
-including the untouched texels. Full DMASK and forced mip zero both change the
-readback. The LLVM 15 job checks the recorded machine words, disassembly,
-and synthetic-container CLI output.
+The source-built fixture loads red and blue from mip 1 into consecutive VGPRs.
+A full store writes those two words and two distinct constants into 16 unique
+texels in destination mip 0. The readback checks all 1,344 DWORDs across three
+mips, including 1,280 sentinels in the surrounding texels and untouched mips.
+Swapping the sparse load's register order or forcing mip zero independently
+changes the readback. A sparse store is a translation refusal control. The
+LLVM 15 job checks the recorded machine words, disassembly, and synthetic
+container CLI output.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check -j 2

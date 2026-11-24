@@ -212,8 +212,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     source t0; source_stride is the t0 byte stride that indexed reads use. source_format declares
     the MUBUF source descriptor format, and output_format declares the u0 descriptor format
     for formatted MUBUF stores. Both declarations require identity channel selectors.
-    gfx1013 uses RGBA32 FLOAT for image_store or image_load_mip. When both are
-    used, image_srv_descriptor supplies the separate t0 descriptor.
+    gfx1013 uses RGBA32 FLOAT for full-mask image_store or image_load_mip. When
+    both are used, image_srv_descriptor supplies the separate t0 descriptor.
     mubuf_d16_xyz_mode opts into a caller-verified W-preserving RGBA16 store.
     image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
     the caller's statement of the image format inside it. The image binds to t0 for loads or u0
@@ -1317,6 +1317,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                      or (m["kind"], mip) not in (("store", False), ("load", True))):
                 raise ValueError(f"Unsupported image {m['kind']} target: "
                                  "gfx1013 requires full-width 2D RGBA32 FLOAT image_store or image_load_mip")
+            if rgba32_float_image and write and dmask != 0xf:
+                raise ValueError("gfx1013 RGBA32 FLOAT image_store requires full DMASK 0xf")
             separate_srv = not write and image_srv_descriptor is not None
             if ((image_format not in IMAGE_FORMATS and not rgba32_float_image) or guard_span is not None
                     or (write != image_output and not separate_srv)
@@ -1358,11 +1360,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if m["packed"]:
                     # Raw RGBA8 stores take the low byte of each enabled channel's VGPR.
                     words = [f"({word} & 0xffu)" for word in words]
-                selected = dict(zip(channels, words))
-                texel = ", ".join(selected.get(channel, "0u") for channel in "xyzw")
-                value = f"uint4({texel})"
                 if rgba32_float_image:
-                    value = f"asfloat({value})"
+                    value = f"asfloat(uint4({', '.join(words)}))"
+                else:
+                    selected = dict(zip(channels, words))
+                    texel = ", ".join(selected.get(channel, "0u") for channel in "xyzw")
+                    value = f"uint4({texel})"
                 stores.append(f"    outputData[uint2({x}, {y})] = {value};")
                 continue
             if resinfo:

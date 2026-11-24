@@ -18,10 +18,11 @@ STORE = next(line for line in LINES if line.startswith("image_store"))
 WORDS = bytes.fromhex(
     "07038cbe 80038dbe 06060cf4 400000fa 06080cf4 600000fa 080046d7 0a040104"
     " 090046d7 0b020504 8102147e 7fc08cbf 080504f0 080e0800 703f8cbf ff02207e 00008140"
-    " ff02227e 010081bf 080a20f0 080e0600 000081bf"
+    " ff02227e 010081bf 080f20f0 080e0600 000081bf"
 )
 GROUPS = 2
 FLOAT_TEXTURE_FLAG = 1 << 30  # tests/compute_check.cpp texture_rgba32_float_flag
+STORE_TAIL = (0x40810000, 0xBF810001)
 
 
 def controls():
@@ -29,7 +30,11 @@ def controls():
     assert "Texture2D<float4> imageData : register(t0);" in source, source
     assert "RWTexture2D<float4> outputData : register(u0);" in source, source
     assert "asuint(imageData.Load(int3(asint(tid.x), asint(tid.y), asint(0x00000001u))))" in source, source
-    assert "asfloat(uint4(0u, image_load_0.x, 0u, image_load_0.z))" in source, source
+    assert ("outputData[uint2(tid.x, tid.y)] = "
+            "asfloat(uint4(image_load_0.x, image_load_0.z, 0x40810000u, 0xbf810001u));") in source, source
+    sparse_store = STORE.replace("v[14:17]", "v[14:15]").replace("dmask:0xf", "dmask:0x5")
+    rejects("image_store requires full DMASK 0xf", aot.lower,
+            variant(LINES, (STORE, sparse_store)), GROUP, **BINDING)
     for old, new, message in (
         (STORE, STORE + " d16", "Unsupported compute instruction"),
         (LOAD, LOAD + " d16", "Unsupported compute instruction"),
@@ -85,9 +90,9 @@ def reference():
                 sentinel = [word | 0x80000000 for word in words]
                 initial.extend(sentinel)
                 if mip == 0 and x < 4 * GROUPS and y < 2:
-                    # Mip 1 R and B become mip 0 G and A. All the other mip 0
-                    # words and the two higher mip levels keep their sentinels.
-                    expected.extend((0, input_word(1, x, y, 0), 0, input_word(1, x, y, 2)))
+                    # The sparse mip 1 load must pack R and B into v14 and v15.
+                    # The full store writes those words and the constants in v16/v17.
+                    expected.extend((input_word(1, x, y, 0), input_word(1, x, y, 2), *STORE_TAIL))
                 else:
                     expected.extend(sentinel)
     return initial + expected + texels
@@ -99,13 +104,12 @@ def draw(directory, compiler, renderer, backend, source):
     case.write_bytes(struct.pack(f"<2I{len(payload)}I", GROUPS | FLOAT_TEXTURE_FLAG, 0, *payload))
     controls = (
         ("translated", source, None),
-        ("ignore DMASK",
-         aot.lower(variant(LINES, (STORE, STORE.replace("v[14:15]", "v[14:17]").replace("0xa", "0xf"))),
-                   GROUP, **BINDING),
-         "mip=0 word=0 expected=00000000 actual=3f100000"),
+        ("swap sparse-load channels",
+         source.replace("image_load_0.x, image_load_0.z", "image_load_0.z, image_load_0.x"),
+         "mip=0 word=0 expected=3f100000 actual=3f100004"),
         ("force mip zero", aot.lower(variant(LINES, ("v_mov_b32_e32 v10, 1", "v_mov_b32_e32 v10, 0")),
                                     GROUP, **BINDING),
-         "mip=0 word=1 expected=3f100000 actual=3f000000"),
+         "mip=0 word=0 expected=3f100000 actual=3f000000"),
     )
     for name, hlsl_source, mismatch in controls:
         assert (hlsl_source == source) == (mismatch is None), name
@@ -122,6 +126,7 @@ def draw(directory, compiler, renderer, backend, source):
             assert result.returncode == 0 and "compared_words=1344 mismatches=0" in result.stdout, name
         else:
             assert result.returncode == 1 and mismatch in result.stderr, name
+            assert "compared_words=1344 mismatches=32" in result.stdout, name
     return 0
 
 
