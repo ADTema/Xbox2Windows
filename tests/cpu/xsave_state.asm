@@ -234,6 +234,30 @@ op_xrstor64_xsaveopt64_avx PROC FRAME
     ret
 op_xrstor64_xsaveopt64_avx ENDP
 
+; RFBM = AVX alone from [rcx]: standard format defines MXCSR, compacted format leaves caller MXCSR untouched;
+; requires --entry-state canonical so the compacted path cannot observe entry MXCSR under the default profile.
+op_xrstor64_avx_xsaveopt64_avx PROC FRAME
+    .endprolog
+    mov eax, 4
+    xor edx, edx
+    xrstor64 [rcx]
+    xsaveopt64 [r8]
+    ret
+op_xrstor64_avx_xsaveopt64_avx ENDP
+
+; SSE restore defines MXCSR before an AVX-only (compacted or standard) restore and XSAVEOPT64(4).
+op_xrstor64_sse_compacted_avx_xsaveopt64_avx PROC FRAME
+    .endprolog
+    mov r10, rdx
+    mov eax, 2
+    xor edx, edx
+    xrstor64 [rcx]
+    mov eax, 4
+    xrstor64 [r10]
+    xsaveopt64 [r8]
+    ret
+op_xrstor64_sse_compacted_avx_xsaveopt64_avx ENDP
+
 ; The request mask comes from input_b (RAX = [rdx], RDX = [rdx+8]).
 op_xsaveopt64_dynmask PROC FRAME
     .endprolog

@@ -21,9 +21,13 @@ BUF_LEN = 960
 DEFAULT_MXCSR = 0x1F80
 FILL = b"\x5A" * BUF_LEN
 
-CANONICAL_EXPORTS = (
+ENTRY_ONLY_CANONICAL_EXPORTS = (
     "op_xsave_only",
     "op_xsave64_only",
+)
+
+CANONICAL_EXPORTS = ENTRY_ONLY_CANONICAL_EXPORTS + (
+    "op_xrstor64_avx_xsaveopt64_avx",
 )
 
 XSAVEC_EXPORTS = (
@@ -39,6 +43,7 @@ XSAVEOPT_EXPORTS = (
     "op_xrstor64_xsaveopt64_sse",
     "op_xrstor64_xsaveopt64_x87_avx",
     "op_xrstor64_xsaveopt64_avx",
+    "op_xrstor64_sse_compacted_avx_xsaveopt64_avx",
 )
 XSAVEOPT_DYNMASK_EXPORT = "op_xsaveopt64_dynmask"
 
@@ -103,6 +108,8 @@ EXPORT_MODES = {
     "op_xrstor64_xsaveopt64_sse": (True, True, 2, 0),
     "op_xrstor64_xsaveopt64_x87_avx": (True, True, 5, 0),
     "op_xrstor64_xsaveopt64_avx": (True, True, 4, 0),
+    "op_xrstor64_avx_xsaveopt64_avx": (True, True, 4, 0),
+    "op_xrstor64_sse_compacted_avx_xsaveopt64_avx": (True, True, 4, 0),
 }
 
 
@@ -554,6 +561,13 @@ def reference(
             m.xsave(out, 0, rfbm=7, is64=True)
         else:
             m.xsavec(out, 0, rfbm=7 if altered else rfbm, is64=name != "op_xrstor64_xsavec")
+    elif name == "op_xrstor64_avx_xsaveopt64_avx":
+        m.xrstor(a, rfbm=4, is64=True)
+        m.xsaveopt(out, 0, rfbm=4, is64=True)
+    elif name == "op_xrstor64_sse_compacted_avx_xsaveopt64_avx":
+        m.xrstor(a, rfbm=2, is64=True)
+        m.xrstor(b, rfbm=4, is64=True)
+        m.xsaveopt(out, 0, rfbm=4, is64=True)
     elif name in XSAVEOPT_EXPORTS:
         m.xrstor(a, rfbm=7, is64=True)
         rfbm = {"op_xrstor64_xsaveopt64_sse": 2, "op_xrstor64_xsaveopt64_x87_avx": 5, "op_xrstor64_xsaveopt64_avx": 4}.get(name, 7)
@@ -811,7 +825,7 @@ def assert_equal_output(label: str, name: str, idx, got: bytes, want: bytes) -> 
             and got == bytes(loose)
         ):
             return
-    elif label == "native" and name in XSAVEOPT_EXPORTS:
+    elif label == "native" and (name in XSAVEOPT_EXPORTS or name == "op_xrstor64_avx_xsaveopt64_avx"):
         if native_xsaveopt_matches(got, want, EXPORT_MODES[name][2]):
             return
     elif label == "native":
@@ -842,7 +856,7 @@ def native_exports_for_host(native: dict, has_xsavec: bool, has_xsaveopt: bool =
         name: fn
         for name, fn in native.items()
         if (has_xsavec or (name not in XSAVEC_EXPORTS and name not in COMPACTED_EXPORTS))
-        and (has_xsaveopt or name not in XSAVEOPT_EXPORTS)
+        and (has_xsaveopt or (name not in XSAVEOPT_EXPORTS and name != "op_xrstor64_avx_xsaveopt64_avx"))
     }
 
 
@@ -866,7 +880,7 @@ def check_fault_controls(
 
     misalign_checks = 0
     for off in (16, 8):
-        for name in CANONICAL_EXPORTS:
+        for name in ENTRY_ONLY_CANONICAL_EXPORTS:
             for label, is_native, fn in (("native", True, native_fns[name]), ("canonical-lifted", False, canonical_fns[name])):
                 buf_a, ptr_a, _, _, _ = alloc_aligned_buffer(valid_a)
                 buf_out, ptr_out, pre, p_off, post = alloc_aligned_buffer(FILL, offset=off)
@@ -1124,7 +1138,7 @@ def check_entry_state_contracts(
     struct.pack_into("<I", nondefault_sse, 160, 0x3F800000)
     sse_buf, sse_ptr, _, _, _ = alloc_aligned_buffer(bytes(nondefault_sse), align=64)
     dummy = b"\x00" * BUF_LEN
-    for name in CANONICAL_EXPORTS:
+    for name in ENTRY_ONLY_CANONICAL_EXPORTS:
         got_n = invoke_native(harness, native_fns[name], dummy, dummy, entry_ptr=sse_ptr)
         got_l = invoke_lifted(canonical_fns[name], dummy, dummy)
         assert struct.unpack_from("<I", got_n, 24)[0] == (0x3F80 & mxcsr_mask)
@@ -1168,6 +1182,38 @@ def check_entry_state_contracts(
     assert struct.unpack_from("<I", got_l_alt, 576)[0] == 0
     assert (struct.unpack_from("<Q", got_l_alt, 512)[0] & 5) == 0
     assert got_n_alt != got_l_alt
+
+    # 3) Non-default entry-MXCSR control for AVX-only compacted XRSTOR -> XSAVEOPT64(4):
+    #    compacted XRSTOR(4) leaves MXCSR untouched, so native retains caller's 0x3F80 while
+    #    canonical-lifted supplies 0x1F80; standard-format XRSTOR(4) and SSE-defined XRSTOR(2)->XRSTOR(4)
+    #    controls still load 0x5F80 from the image and never observe caller MXCSR.
+    compacted_avx = compacted_image(mxcsr_mask, 4, COMPACTED_BIT | 4, 4, mxcsr=0x5F80 & mxcsr_mask, seed=303)
+    standard_avx = make_xsave_image(mxcsr_mask, xstate_bv=4, mxcsr=0x5F80 & mxcsr_mask, seed=304)
+    got_l_comp = invoke_lifted(canonical_fns["op_xrstor64_avx_xsaveopt64_avx"], compacted_avx, dummy)
+    assert struct.unpack_from("<I", got_l_comp, 24)[0] == 0x1F80
+    got_l_std = invoke_lifted(canonical_fns["op_xrstor64_avx_xsaveopt64_avx"], standard_avx, dummy)
+    assert struct.unpack_from("<I", got_l_std, 24)[0] == (0x5F80 & mxcsr_mask)
+    got_l_sse = invoke_lifted(lifted_fns["op_xrstor64_sse_compacted_avx_xsaveopt64_avx"], sse_in, compacted_avx)
+    assert struct.unpack_from("<I", got_l_sse, 24)[0] == (0x5F80 & mxcsr_mask)
+    if "op_xrstor64_avx_xsaveopt64_avx" in native_fns:
+        got_n_comp = invoke_native(
+            harness, native_fns["op_xrstor64_avx_xsaveopt64_avx"], compacted_avx, dummy, entry_ptr=sse_ptr
+        )
+        assert struct.unpack_from("<I", got_n_comp, 24)[0] == (0x3F80 & mxcsr_mask)
+        assert got_n_comp != got_l_comp
+        got_n_std = invoke_native(
+            harness, native_fns["op_xrstor64_avx_xsaveopt64_avx"], standard_avx, dummy, entry_ptr=sse_ptr
+        )
+        assert struct.unpack_from("<I", got_n_std, 24)[0] == (0x5F80 & mxcsr_mask)
+        assert_equal_output("native", "op_xrstor64_avx_xsaveopt64_avx", 0, got_n_std, got_l_std)
+    if "op_xrstor64_sse_compacted_avx_xsaveopt64_avx" in native_fns:
+        got_n_sse = invoke_native(
+            harness, native_fns["op_xrstor64_sse_compacted_avx_xsaveopt64_avx"], sse_in, compacted_avx, entry_ptr=sse_ptr
+        )
+        assert struct.unpack_from("<I", got_n_sse, 24)[0] == (0x5F80 & mxcsr_mask)
+        assert_equal_output("native", "op_xrstor64_sse_compacted_avx_xsaveopt64_avx", 0, got_n_sse, got_l_sse)
+
+    _ = sse_buf
     _ = part_buf
 
 
@@ -2156,6 +2202,7 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
     for path, export_name in (
         (original_path, "op_xsave_only"),
         (original_path, "op_xsave64_only"),
+        (original_path, "op_xrstor64_avx_xsaveopt64_avx"),
         (altered_path, "op_xrstor64_mask_sse"),
     ):
         try:
