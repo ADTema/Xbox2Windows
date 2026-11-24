@@ -3930,11 +3930,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_link_libraries(archive_codec PRIVATE blast_source)
     set_target_properties(archive_codec PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
     function(build_archive_reader entry exe cpp provider translator)
+        cmake_parse_arguments(READER "EXPORT_SYMBOLS" "" "" ${ARGN})
+        set(export_flags)
+        if(READER_EXPORT_SYMBOLS)
+            # Publish the directory lookup's leaf entry for the function-boundary verifier.
+            set(export_flags -rdynamic)
+        endif()
         add_custom_command(OUTPUT "${exe}"
             COMMAND "${INTAKE_PYTHON}" -m ziglang build-exe "${entry}"
                 "-L$<TARGET_LINKER_FILE_DIR:${provider}>" -target x86_64-windows-gnu
-                -O ReleaseSmall -fsingle-threaded -funwind-tables "-femit-bin=${exe}"
-            DEPENDS ${provider} "${entry}" ${ARGN} VERBATIM)
+                -O ReleaseSmall -fsingle-threaded -funwind-tables ${export_flags} "-femit-bin=${exe}"
+            DEPENDS ${provider} "${entry}" ${READER_UNPARSED_ARGUMENTS} VERBATIM)
         add_custom_command(OUTPUT "${cpp}"
             COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools"
                 "${INTAKE_PYTHON}" -B "${archive_src}/${translator}" "${exe}" "${cpp}"
@@ -4013,7 +4019,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     set(directory_exe "${CMAKE_CURRENT_BINARY_DIR}/archive_directory_reader.exe")
     set(directory_cpp "${CMAKE_CURRENT_BINARY_DIR}/archive_directory_lifted.cpp")
     build_archive_reader("${archive_src}/directory_reader.zig" "${directory_exe}" "${directory_cpp}"
-        archive_directory_gpu translate_directory.py)
+        archive_directory_gpu translate_directory.py EXPORT_SYMBOLS)
     add_executable(archive_directory_lifted "${directory_cpp}")
     target_link_libraries(archive_directory_lifted PRIVATE archive_directory_gpu ntdll)
     foreach(adapter IN ITEMS warp hardware)

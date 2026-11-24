@@ -2,9 +2,12 @@
 #include "quad_frames.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <fcntl.h>
+#include <io.h>
 #include <cstdint>
 
 using Word = std::uint64_t;
@@ -18,7 +21,9 @@ Result invoke(Ptr self, Args... args)
 {
     return reinterpret_cast<Result(WINAPI*)(Ptr, Args...)>(self->slots[slot])(self, args...);
 }
-struct Inputs { Word first, second, end, first_bias; };
+struct Inputs { const Word* words; Word bytes, file_size; unsigned first, second; Word bias; };
+alignas(8) std::array<Word, 8192> prefix;
+const wchar_t* archive_name;
 Inputs inputs{};
 Ptr file = nullptr, queue = nullptr, status = nullptr;
 constexpr unsigned page = 4096;
@@ -39,42 +44,57 @@ public:
 
 extern "C" __declspec(dllexport) const Inputs* directory_input()
 {
-    // Read the first three compressed boundary words verbatim, after the raw metadata boundary.
-    std::ifstream input("fixture.ttpf", std::ios::binary);
-    char tag[4]{};
-    unsigned boundaries = 0;
-    if (!input.read(tag, 4) || std::memcmp(tag, "RDS5", 4) ||
-        !input.read(reinterpret_cast<char*>(&boundaries), sizeof(boundaries)) || boundaries < 4) return nullptr;
-    input.seekg(24);
-    if (!input.read(reinterpret_cast<char*>(&inputs), 3 * sizeof(Word)) ||
-        std::fread(&inputs.first_bias, sizeof(Word), 1, stdin) != 1) return nullptr;
+    // A fixed-size byte window limits the input to the EXE. Only the EXE interprets its directory.
+    if (_setmode(_fileno(stdin), _O_BINARY) == -1) return nullptr;
+    unsigned selector = 0;
+    if (std::fread(&inputs.first, sizeof(inputs.first), 1, stdin) != 1 ||
+        std::fread(&inputs.second, sizeof(inputs.second), 1, stdin) != 1 ||
+        std::fread(&inputs.bias, sizeof(inputs.bias), 1, stdin) != 1 ||
+        std::fread(&selector, sizeof(selector), 1, stdin) != 1 || selector > 1) return nullptr;
+    archive_name = selector ? L"../alternate.ttpf" : L"../fixture.ttpf";
+    std::ifstream input(archive_name, std::ios::binary | std::ios::ate);
+    if (!input || input.tellg() < 0) return nullptr;
+    inputs.file_size = static_cast<Word>(input.tellg());
+    input.seekg(0);
+    inputs.words = prefix.data();
+    inputs.bytes = (std::min)(inputs.file_size, static_cast<Word>(sizeof(prefix)));
+    if (!input.read(reinterpret_cast<char*>(prefix.data()), inputs.bytes)) return nullptr;
+    return &inputs;
+}
+
+bool begin_batch()
+{
     void* result = nullptr;
-    if (FAILED(DStorageGetFactory(nullptr, &result)) || !result) return nullptr;
+    if (FAILED(DStorageGetFactory(nullptr, &result)) || !result) return false;
     auto factory = static_cast<Ptr>(result);
     const GUID* iid = nullptr;
-    const HRESULT file_result = invoke<4, HRESULT>(factory, L"fixture.ttpf", iid, &file);
+    const HRESULT file_result = invoke<4, HRESULT>(factory, archive_name, iid, &file);
     const HRESULT queue_result = invoke<10, HRESULT>(factory, static_cast<const void*>(nullptr), iid, &queue);
     const HRESULT status_result = invoke<5, HRESULT>(factory, 2u, "BC pages", iid, &status);
     invoke<2, unsigned>(factory);
     trace = std::fopen("ranges.txt", "w");
-    if (FAILED(file_result) || FAILED(queue_result) || FAILED(status_result) || !trace) {
+    BY_HANDLE_FILE_INFORMATION identity{};
+    if (FAILED(file_result) || FAILED(queue_result) || FAILED(status_result) || !trace ||
+        FAILED((invoke<4, HRESULT>(file, &identity)))) {
         CloseBatch cleanup;
-        return nullptr;
+        return false;
     }
+    const Word id = (Word{identity.nFileIndexHigh} << 32) | identity.nFileIndexLow;
+    std::fprintf(trace, "file %016llx\n", id);
     blocks.fill(0xa5);
-    return &inputs;
+    return true;
 }
 
-extern "C" __declspec(dllexport) unsigned enqueue_page(Word offset, unsigned size)
+extern "C" __declspec(dllexport) unsigned enqueue_page(unsigned index, Word offset, unsigned size)
 {
-    if (count >= 2 || !size) return 0;
+    if (count >= 2 || !size || (!count && !begin_batch())) return 0;
     alignas(8) unsigned char record[0x48]{};
     const Word fields[]{1, reinterpret_cast<Word>(blocks.data() + page * count), 0, page,
                         reinterpret_cast<Word>(file), offset, size};
     std::memcpy(record, fields, sizeof(fields));
     invoke<3, void>(queue, record);
     invoke<4, void>(queue, status, count++);
-    std::fprintf(trace, "request %llu %u\n", static_cast<unsigned long long>(offset), size);
+    std::fprintf(trace, "request %u %llu %u\n", index, static_cast<unsigned long long>(offset), size);
     return size;
 }
 
