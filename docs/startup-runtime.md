@@ -260,3 +260,23 @@ the stand-in path; the texture format used in the reported video remains to be c
 cmake --build --preset release --target startup_nv12_draw d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^startup_nv12_draw_' -V
 ```
+
+## Startup memory accounting
+
+The DirectStorage heartbeat (`x2w-dstorage heartbeat <n> s:` in `stderr.txt`) reports this
+process's peak and current commit charge in MiB and the number of live 64 KiB physical-page
+sections, so runs that stop at different points can be compared by memory spent rather than by
+elapsed time. A physical-page section exists from a page's first use (a mapping or a DirectStorage
+write) until its grant is released; `xmem.dll` publishes that count through the experimental
+`x2w_xmem_page_stats` export. The heartbeat also prints while the request counters are unchanged
+when either memory value changed, so the cost of a stalled load is visible.
+
+```powershell
+cmake --build --preset release --target xmem_shim startup_stub_xcrdapi
+ctest --preset release --no-tests=error -R '^(xmem_page_stats|startup_heartbeat_commit)$' -V
+```
+
+The `startup_heartbeat_commit` check starts the heartbeat before loading the page provider, then
+maps two synthetic sections and compares the reported values with `GetProcessMemoryInfo` in the
+same process. It releases a separate commit allocation to check that a current-only change
+produces another report.

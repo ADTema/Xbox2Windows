@@ -135,6 +135,16 @@ target_include_directories(xmem_commit_protection_check PRIVATE src)
 target_compile_features(xmem_commit_protection_check PRIVATE cxx_std_20)
 add_test(NAME xmem_commit_protection COMMAND xmem_commit_protection_check)
 set_tests_properties(xmem_commit_protection PROPERTIES TIMEOUT 30)
+if(EXISTS "${INTAKE_PYTHON}")
+    # Startup memory accounting (#1199): the live physical-page section snapshot, and the peak commit
+    # and section count the DirectStorage heartbeat reports from it.
+    add_test(NAME xmem_page_stats COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_page_stats_check.py" "$<TARGET_FILE:xmem_shim>")
+    add_test(NAME startup_heartbeat_commit COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_heartbeat_check.py"
+        "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:startup_stub_xcrdapi>")
+    set_tests_properties(startup_heartbeat_commit PROPERTIES TIMEOUT 60)
+endif()
 # Mutation controls: each run flips one expected value and passes only when the
 # named check reports it. An unknown mutation name or an overall PASS fails.
 foreach(mutation_and_check
@@ -266,6 +276,8 @@ endforeach()
 # link the shims statically so they never use its runtime (constexpr std::mutex layout).
 target_link_libraries(startup_stub_xg_xs PRIVATE d3d12 dxguid)
 target_link_libraries(startup_stub_gameinput PRIVATE user32)
+# The DirectStorage heartbeat reports this process's peak commit (#1199).
+target_link_libraries(startup_stub_xcrdapi PRIVATE psapi)
 target_sources(startup_stub_gameinput PRIVATE src/startup_stubs/runtime_proxy.cpp)
 target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi)
 target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
