@@ -623,8 +623,12 @@ u64 async_read(int slot, u64 container, u64 names, u64 count_or_size, u64 block_
     }
     auto* async = reinterpret_cast<void*>(block_or_buffer);
     if (!async) return e_fail;
-    auto* state = new (std::nothrow) ReadAsync;
-    if (!state) return e_outofmemory;
+    ReadAsync* state;
+    try {
+        state = new ReadAsync;
+    } catch (const std::bad_alloc&) {
+        return e_outofmemory;
+    }
     using Begin = HRESULT(WINAPI*)(void*, void*, void*, const void*, const char*, decltype(&read_provider));
     const auto begun = reinterpret_cast<Begin>(methods[7])(service, async, state, read_identity, read_identity, read_provider);
     if (FAILED(begun)) {
