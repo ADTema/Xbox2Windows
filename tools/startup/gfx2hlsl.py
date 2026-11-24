@@ -1126,7 +1126,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob):
     """Hash the startup translation revision and the three blobs in runtime order."""
-    return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-srv-2'))))
+    return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-3'))))
 
 
 FXC = os.environ.get('X2W_FXC', r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe')

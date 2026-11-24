@@ -127,7 +127,7 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
 The startup shader cache key includes the translator revision. After updating from
-the earlier wide-descriptor translation, run the recording build once to emit
+an earlier translation revision, run the recording build once to emit
 requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
 then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
