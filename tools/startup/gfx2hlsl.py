@@ -418,7 +418,9 @@ class Stage:
             elif m == 'div:2':
                 scale *= 0.5
             elif m.startswith('op_sel'):
-                pass
+                # op_sel selects which half of a packed source the operation reads. This path does not
+                # model that, so dropping it would change the operand: refuse instead of ignoring it.
+                raise Unsupported('modifier %s' % m)
             else:
                 raise Unsupported('modifier %s' % m)
         if scale != 1.0:
@@ -1331,6 +1333,11 @@ class Stage:
         return sources
 
     def compare(self, base, ops, mods=()):
+        # A comparison reads its two operands directly, so a modifier that arrives here is one this
+        # lowering does not model (op_sel selects a packed half, clamp/omod have no place in a compare):
+        # refuse it rather than emit a predicate computed from the unselected operands.
+        if mods and not base.endswith('_sdwa'):
+            raise Unsupported('%s with %s' % (base, mods))
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32)(_sdwa)?', base)
         if not m:
             raise Unsupported(base)
