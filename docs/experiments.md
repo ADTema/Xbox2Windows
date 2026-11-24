@@ -780,6 +780,14 @@ Debug and Release with zero D3D12 warnings and errors. The original `cs_6_6`
 fixture skipped on both in-box adapters and passed the same cases on app-local
 WARP.
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (32.0.101.8132) matched all 128
+words across the same eight cases and all 64 words across the four atomic cases,
+with zero D3D12 debug errors and warnings. The eight are the baseline, a swapped
+pair, a moved output, a high address, an unaligned read, an index addition that
+wraps, an unaligned write and a write beyond the descriptor; the atomic cases cover
+a valid word, a misaligned one, one outside the window and a wrapping index
+addition.
+
 The SPIR-V bridge GPU tests (`spirv_{address_window,sampler_views,ballot_extract,compaction,compare_sampler}_{hardware,warp}`)
 need `spirv-as`, `spirv-val` and `spirv-cross`. `tools/setup-spirv-tools.ps1` builds them from pinned
 SPIRV-Tools, SPIRV-Headers and SPIRV-Cross revisions into `out/tools/spirv/bin`, where CMake looks
