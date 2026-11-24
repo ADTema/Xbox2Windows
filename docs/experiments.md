@@ -6748,7 +6748,7 @@ Console hardware accepts `0x11` representing rectangles specified by three verti
 $(v_0, v_1, v_2)$ as a defined input precondition:
 - $v_0$ is the primary origin corner.
 - $v_1$ is an adjacent corner sharing an edge with $v_0$.
-- $v_2$ is diagonally opposite to $v_1$ (sharing an edge with $v_1$).
+- $v_2$ is diagonally opposite to $v_0$ and shares an edge with $v_1$.
 
 The primitive setup engine synthesizes the fourth corner algebraically as:
 $$v_3 = v_0 + v_2 - v_1$$
@@ -6787,7 +6787,7 @@ and negative control cases:
   and dropped triangle vertices.
 
 [The D3D12 draw fixture](../tests/rectlist_draw_check.cpp) and [shaders](../tests/rectlist_quad.hlsl)
-render the lowered triangles into a 64x64 target under Direct3D 12 WARP and physical hardware
+render the actual output of the Python lowerer into a 64x64 target under Direct3D 12 WARP and physical hardware
 with backface culling enabled (`D3D12_CULL_MODE_BACK`):
 - Positive draw: renders lowered CCW triangles $(v_0, v_1, v_2)$ and $(v_0, v_2, v_3)$ with
   distinct interpolated vertex colors (RGBA). Pixel readback matches the separate analytical
