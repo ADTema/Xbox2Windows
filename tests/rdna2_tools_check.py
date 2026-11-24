@@ -14,7 +14,8 @@ import unittest
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from disasm_rdna2 import SMEM_OPS, SOPK_OPS, SOPP_OPS, disasm_rdna2, decode_instruction, disassemble_binary
+from disasm_rdna2 import (SMEM_OPS, SOPK_OPS, SOPP_OPS, VOP1_OPS, VOP2_OPS, disasm_rdna2, decode_instruction,
+                           disassemble_binary)
 from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
 from pixel_aot import VOP3_INT16, VOP3_INT16_TERNARY, fma_mix_operand, lower, native_program, parse_fma_mix
 from scan_unsupported_shaders import (
@@ -123,6 +124,24 @@ class TestRdna2Disasm(unittest.TestCase):
         ("1f873a7e", "v_movrels_b32_e32 v29, v31"),
         ("29894a7e", "v_movrelsd_b32_e32 v37, v41"),
         ("2f91567e", "v_movrelsd_2_b32_e32 v43, v47"),
+        ("050f0664", "v_add_f16_e32 v3, v5, v7"),
+        ("0d231666", "v_sub_f16_e32 v11, v13, v17"),
+        ("173b2668", "v_subrev_f16_e32 v19, v23, v29"),
+        ("25533e6a", "v_mul_f16_e32 v31, v37, v41"),
+        ("2f6b5672", "v_max_f16_e32 v43, v47, v53"),
+        ("3d877674", "v_min_f16_e32 v59, v61, v67"),
+        ("499f8e78", "v_pk_fmac_f16 v71, v73, v79"),
+        ("59b7a67e", "v_floor_f16_e32 v83, v89"),
+        ("65b9c27e", "v_ceil_f16_e32 v97, v101"),
+        ("6bbbce7e", "v_trunc_f16_e32 v103, v107"),
+        ("71bdda7e", "v_rndne_f16_e32 v109, v113"),
+        ("83bffe7e", "v_fract_f16_e32 v127, v131"),
+        ("8ba1127f", "v_cvt_f16_u16_e32 v137, v139"),
+        ("97a32a7f", "v_cvt_f16_i16_e32 v149, v151"),
+        ("a3a53a7f", "v_cvt_u16_f16_e32 v157, v163"),
+        ("ada74e7f", "v_cvt_i16_f16_e32 v167, v173"),
+        ("b5c7667f", "v_cvt_norm_i16_f16_e32 v179, v181"),
+        ("c1c97e7f", "v_cvt_norm_u16_f16_e32 v191, v193"),
     )
 
     def test_vop1_vop2_e32_gfx1013(self):
@@ -616,6 +635,49 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(
             (vop3a[1]["offset"], vop3a[1]["length"], vop3a[1]["opcode"]),
             (8, 4, "s_endpgm"),
+        )
+
+    def test_vop3_rejects_packed_fmac_f16_but_keeps_other_vop2_forms(self):
+        # gfx1013 has no VOP3 form of v_pk_fmac_f16 (llvm-mc 15 and 19 report
+        # "e64 variant of this instruction is not supported" for the e64
+        # spelling), so opcode 0x13c must not decode as the VOP2 instruction.
+        # The record keeps the real length (8 bytes, 12 with a literal) so the
+        # next instruction stays aligned, and no lowerer receives it.
+        raw = bytes.fromhex(
+            "01003cd5 02070200"           # opcode 0x13c, v1, v2, v3
+            "01003cd5 ff060200 78563412"  # same opcode with a literal src0
+            "000081bf"                    # s_endpgm
+        )
+        insns = disasm_rdna2(raw)
+        self.assertEqual(
+            [(i["offset"], i["length"], i["opcode"]) for i in insns],
+            [
+                (0, 8, "v_pk_fmac_f16_unsupported"),
+                (8, 12, "v_pk_fmac_f16_unsupported"),
+                (20, 4, "s_endpgm"),
+            ],
+        )
+        for insn in insns[:2]:
+            self.assertEqual(insn["assembly"], "v_pk_fmac_f16 <unsupported VOP3A encoding>")
+            self.assertFalse(is_opcode_recognized(insn["opcode"]))
+            self.assertFalse(is_instruction_supported(insn["assembly"]))
+
+        # Controls (encodings assembled with llvm-mc for gfx1013): the VOP2
+        # operations next to it that do have a VOP3 form still decode.
+        ctl = disasm_rdna2(bytes.fromhex(
+            "010036d5 02070200"  # v_fmac_f16_e64 v1, v2, v3
+            "010039d5 02070200"  # v_max_f16_e64 v1, v2, v3
+            "01003ad5 02070200"  # v_min_f16_e64 v1, v2, v3
+            "01003bd5 02070200"  # v_ldexp_f16_e64 v1, v2, v3
+        ))
+        self.assertEqual(
+            [i["assembly"] for i in ctl],
+            [
+                "v_fmac_f16_e64 v1, v2, v3",
+                "v_max_f16_e64 v1, v2, v3",
+                "v_min_f16_e64 v1, v2, v3",
+                "v_ldexp_f16_e64 v1, v2, v3",
+            ],
         )
 
     def test_sopc_literal_keeps_the_following_instruction_aligned(self):
@@ -3341,6 +3403,15 @@ class TestRdna2Extractor(unittest.TestCase):
 
 class TestRdna2Scanner(unittest.TestCase):
     """Test scanner instruction recognition vs full shader translator acceptance."""
+
+    def test_decoded_binary16_vop1_vop2_forms_are_recognized(self):
+        """Every binary16 VOP1/VOP2 mnemonic the decoder prints is recognized by the scanner, decoding only."""
+        vop1 = (0x50, 0x51, 0x52, 0x53, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x63, 0x64)
+        vop2 = (0x32, 0x33, 0x34, 0x35, 0x36, 0x39, 0x3a, 0x3b, 0x3c)
+        names = [VOP1_OPS[op][0] for op in vop1] + [VOP2_OPS[op][0] for op in vop2]
+        self.assertEqual(sorted(name for name in names if not is_opcode_recognized(name)), [])
+        # The nonexistent VOP3 form of the packed fused multiply-accumulate stays unrecognized.
+        self.assertFalse(is_opcode_recognized("v_pk_fmac_f16_unsupported"))
 
     def test_decoded_scalar_memory_forms_are_recognized(self):
         """Every mnemonic the decoder prints for SMEM is recognized by the scanner, decoding only."""
