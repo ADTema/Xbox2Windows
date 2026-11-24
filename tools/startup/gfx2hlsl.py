@@ -410,7 +410,8 @@ class Stage:
         self.lines.append(text)
 
     def set_v(self, n, expr):
-        self.uniform_v.discard(n)
+        if hasattr(self, 'uniform_v'):
+            self.uniform_v.discard(n)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
@@ -449,14 +450,16 @@ class Stage:
         return True
 
     def set_scc(self, expr):
-        if hasattr(self, 'varying_s'):
+        if self.tracks_uniformity():
             self.scc_uniform = self.scalar_expr_uniform(expr)
         self.emit('scc = %s;' % expr)
 
-    def set_s(self, n, expr, sym=None, scc=None):
+    def set_s(self, n, expr, sym=None, scc=None, uniform=None):
         """Assign scalar register n at run time and/or symbolically."""
-        if hasattr(self, 'varying_s') and (sym is None or sym[0] == 'const'):
-            if self.scalar_expr_uniform(expr):
+        if self.tracks_uniformity() and (sym is None or sym[0] == 'const'):
+            if uniform is None:
+                uniform = self.scalar_expr_uniform(expr)
+            if uniform:
                 self.varying_s.discard(n)
             else:
                 self.varying_s.add(n)
@@ -527,6 +530,9 @@ class Stage:
         if self.lines:
             self.blocks.append((start, self.lines, None))
 
+    def tracks_uniformity(self):
+        return all(hasattr(self, name) for name in ('uniform_v', 'varying_s', 'scc_uniform'))
+
     def uniform_source(self, tok):
         r = reg_range(tok)
         if r:
@@ -553,7 +559,7 @@ class Stage:
         # Compute the proof before lowering, since a destination can also be a source.
         dst = None
         # Unit probes build a Stage without __init__: without the tracking state, prove nothing.
-        if (base in UNIFORM_VALU and ops and hasattr(self, 'uniform_v') and
+        if (base in UNIFORM_VALU and ops and self.tracks_uniformity() and
                 not getattr(self, 'has_branches', True) and getattr(self, 'exec_known', False) and
                 (not mods or (base in VEC_F or base in VEC_U_TO_F) and
                  all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods))):
@@ -580,7 +586,11 @@ class Stage:
                     ops[0] == 'exec_hi' or not (base in SCA or base.startswith('v_cmp') or
                                                 (base in ('s_cselect_b32', 's_cselect_b64') and ops[0] == 'exec'))):
                 raise Unsupported('%s into %s after a fetch call' % (base, ops[0]))
-        if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f', 's_wqm_b64', 's_wqm_b32',
+        if base in ('s_wqm_b32', 's_wqm_b64'):
+            if hasattr(self, 'uniform_v'):
+                self.uniform_v.clear()
+            return None
+        if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f',
                     's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None
         if base == 's_endpgm':
@@ -713,6 +723,8 @@ class Stage:
                         self.sym[d + 1] = hi
                     else:
                         self.sym.pop(d + 1, None)
+                        if self.tracks_uniformity():
+                            self.varying_s.add(d + 1)
             elif own and own[0] in ('desc', 'ptr', 'ptrhi') and any(s == own for s in syms):
                 if own[0] == 'desc':
                     self.pipe.modified.add((own[1], own[2]))
@@ -754,18 +766,25 @@ class Stage:
             self.masks.add(d)
             if pair:
                 self.sym.pop(d + 1, None)
+                if self.tracks_uniformity():
+                    self.varying_s.add(d + 1)
             return None
         if is_mask:
             expr = '(%s) & 1' % expr
             self.masks.add(d)
         else:
             self.masks.discard(d)
+        if base == 's_mov_b64':
+            r = reg_range(ops[1])
+            high = r[2] if r and r[1] != r[2] else None
+            # Classify the source high word before a destination write can change its status.
+            high_source = 's%d' % high if high is not None else srcs[0]
+            high_uniform = self.tracks_uniformity() and self.uniform_source(high_source)
         self.set_s(d, expr, scc=scc)
         if pair and base != 's_mov_b64':
             self.set_s(d + 1, '0u')
         elif pair:
-            r = reg_range(ops[1])
-            self.set_s(d + 1, self.S(r[2]) if r and r[1] != r[2] else '0u')
+            self.set_s(d + 1, self.S(high) if high is not None else '0u', uniform=high_uniform)
         return None
 
     def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}'):
@@ -778,6 +797,8 @@ class Stage:
         self.masks.add(d)
         self.exec_known = False
         self.emit('exec = (%s) & 1; scc = exec != 0;' % text.format(self.u(src)))
+        if hasattr(self, 'scc_uniform'):
+            self.scc_uniform = False
 
     op_s_and_saveexec_b32 = op_s_and_saveexec_b64
 
@@ -797,6 +818,8 @@ class Stage:
         src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
         self.exec_known = False
         self.emit('exec = (%s & ~exec) & 1; scc = exec != 0;' % self.u(src))
+        if hasattr(self, 'scc_uniform'):
+            self.scc_uniform = False
         self.set_s(d, 'exec')
         self.masks.add(d)
 
@@ -960,8 +983,10 @@ class Stage:
             if sreg and offset == ('s%d' % sreg[1]) and dst[1] <= sreg[1] < dst[2]:
                 self.emit('a = %s;' % offset)
                 offset = 'a'
+        # All words use the original offset, even when a destination overwrites its register.
+        uniform = self.tracks_uniformity() and self.uniform_source(token)
         for i in range(count):
-            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i))
+            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i), uniform=uniform)
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
 
@@ -1258,7 +1283,8 @@ class Stage:
 
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
-        if (mods or self.has_branches or not self.exec_known or not dst or dst[0] != 's' or dst[1] != dst[2] or
+        if (mods or not self.tracks_uniformity() or getattr(self, 'has_branches', True) or
+                not getattr(self, 'exec_known', False) or not dst or dst[0] != 's' or dst[1] != dst[2] or
                 not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
         self.set_s(reg_range(ops[0])[1], self.u(ops[1]))
@@ -1276,7 +1302,8 @@ class Stage:
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
     def op_v_interp_p1_f32(self, ops, mods):
-        self.uniform_v.discard(reg_range(ops[0])[1])
+        if hasattr(self, 'uniform_v'):
+            self.uniform_v.discard(reg_range(ops[0])[1])
         self.note_attr(ops[2], 'linear')
 
     def op_v_interp_p2_f32(self, ops, mods):
@@ -1351,8 +1378,9 @@ class Stage:
         low, high = self.i64_words(ops[2])
         body = '{ uint2 t = %s(%s, %s, %s); v%d = t.x; v%d = t.y; }' % (
             helper, low, high, amount, dst[1], dst[2])
-        self.uniform_v.discard(dst[1])
-        self.uniform_v.discard(dst[2])
+        if hasattr(self, 'uniform_v'):
+            self.uniform_v.discard(dst[1])
+            self.uniform_v.discard(dst[2])
         self.used_v.update((dst[1], dst[2]))
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 

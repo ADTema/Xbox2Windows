@@ -23,6 +23,9 @@ class Pipe:
 
 REFUSAL = 'v_readfirstlane_b32 requires a proven uniform source'
 READ = 'v_readfirstlane_b32 s9, v7'
+MOVE = 'v_mov_b32_e32 v7, s2'
+COMPARE = 'v_cmp_lt_f32_e64 s2, v0, v1'
+ALIAS_LOAD = 's_buffer_load_dwordx2 s[2:3], s[4:7], s2'
 
 
 def run(*instructions, exec_known=True):
@@ -55,6 +58,14 @@ ACCEPTED = [
      ['v7 = U(float(s2 & 255));']),
     ('multiply', ('v_mul_f32_e64 v7, s2, 2.0',),
      ['v7 = U(F(s2) * 2.0);']),
+    ('clamped multiply', ('v_mul_f32_e64 v7, s2, 2.0 clamp',),
+     ['v7 = U(saturate(F(s2) * 2.0));']),
+    ('scaled multiply', ('v_mul_f32_e64 v7, s2, 2.0 mul:2',),
+     ['v7 = U((F(s2) * 2.0) * 2.0);']),
+    ('negated scalar source', ('v_mul_f32_e64 v7, -s2, 2.0',),
+     ['v7 = U((-F(s2)) * 2.0);']),
+    ('absolute scalar source', ('v_mul_f32_e64 v7, |s2|, 2.0',),
+     ['v7 = U(abs(F(s2)) * 2.0);']),
     ('fused multiply-add', ('v_fma_f32 v7, s2, 2.0, 1.0',),
      ['v7 = U(F(s2) * 2.0 + 1.0);']),
     ('literal multiply-add', ('v_fmaak_f32 v7, s2, 2.0, 0x3f800000',),
@@ -65,15 +76,33 @@ ACCEPTED = [
     ('literal move', ('v_mov_b32_e32 v7, 0x1234',), ['v7 = 0x00001234u;']),
     ('chain with an in-place write', ('v_mul_f32_e64 v7, s2, 2.0', 'v_cvt_u32_f32_e32 v7, v7'),
      ['v7 = U(F(s2) * 2.0);', 'v7 = uint(max(F(v7), 0.0));']),
+    ('cross-register chain', (MOVE, 'v_mul_f32_e64 v8, v7, 2.0'),
+     ['v7 = s2;', 'v8 = U(F(v7) * 2.0);'], 8),
 ]
-for label, instructions, lines in ACCEPTED:
-    got = run(*instructions, READ)
-    check(label, got == lines + ['s9 = v7;'], repr(got))
+for label, instructions, lines, *source in ACCEPTED:
+    reg = source[0] if source else 7
+    got = run(*instructions, 'v_readfirstlane_b32 s9, v%d' % reg)
+    check(label, got == lines + ['s9 = v%d;' % reg], repr(got))
 
 REFUSED = [
-    ('entry VGPR', ('v_mov_b32_e32 v7, v0', READ)),
-    ('vcc', ('v_mov_b32_e32 v7, vcc_lo', READ)),
-    ('exec', ('v_mov_b32_e32 v7, exec_lo', READ)),
+    ('entry VGPR', (MOVE, 'v_mov_b32_e32 v7, v0', READ)),
+    ('vcc', (MOVE, 'v_mov_b32_e32 v7, vcc_lo', READ)),
+    ('exec', (MOVE, 'v_mov_b32_e32 v7, exec_lo', READ)),
+    ('WQM', (MOVE, 's_wqm_b64 exec, exec', READ)),
+    ('compare writes exec', (MOVE, 'v_cmpx_lt_f32_e32 v0, v1', READ)),
+    ('saveexec writes exec', (MOVE, 's_and_saveexec_b32 s8, s2', READ)),
+    ('high word of saved exec', ('s_mov_b64 s[2:3], exec', 'v_mov_b32_e32 v7, s3', READ)),
+    ('compare into SGPR', (COMPARE, MOVE, READ)),
+    ('aliased load first word', (COMPARE, ALIAS_LOAD, MOVE, READ)),
+    ('aliased load second word', (COMPARE, ALIAS_LOAD, 'v_mov_b32_e32 v7, s3', READ)),
+    ('varying scalar buffer offset',
+     (COMPARE, 's_buffer_load_dword s3, s[4:7], s2', 'v_mov_b32_e32 v7, s3', READ)),
+    ('listed op with varying source', (MOVE, 'v_mul_f32_e64 v7, v0, 2.0', READ)),
+    ('op_sel overwrite', (MOVE, 'v_mul_f32_e64 v7, s2, 2.0 op_sel:[0,0]', READ)),
+    ('modified move overwrite', (MOVE, 'v_mov_b32_e32 v7, s2 clamp', READ)),
+    ('multi-register read destination', (MOVE, 'v_readfirstlane_b32 s[8:9], v7')),
+    ('multi-register read source',
+     (MOVE, 'v_mov_b32_e32 v6, s2', 'v_readfirstlane_b32 s9, v[6:7]')),
     ('saved exec', ('s_mov_b32 s2, exec_lo', 'v_mov_b32_e32 v7, s2', READ)),
     ('mask through scalar arithmetic',
      ('s_mov_b32 s2, vcc_lo', 's_add_u32 s3, s2, 1', 'v_mov_b32_e32 v7, s3', READ)),
@@ -83,7 +112,8 @@ REFUSED = [
     ('SDWA overwrite', ('v_mov_b32_e32 v7, s2',
                         'v_cvt_f32_ubyte0_sdwa v7, s2 src0_sel:DWORD dst_sel:DWORD', READ)),
     ('interpolant overwrite', ('v_mov_b32_e32 v7, s2', 'v_interp_mov_f32 v7, p0, attr0.x', READ)),
-    ('VGPR buffer address', ('buffer_load_dword v7, v0, s[4:7], 0 offen', READ)),
+    ('interpolation p1 overwrite', (MOVE, 'v_interp_p1_f32_e32 v7, v0, attr0.x', READ)),
+    ('VGPR buffer address', (MOVE, 'buffer_load_dword v7, v0, s[4:7], 0 offen', READ)),
     ('branch after read', ('v_mov_b32_e32 v7, s2', READ, 's_branch label_000C', 's_endpgm')),
 ]
 for label, instructions in REFUSED:
@@ -92,12 +122,32 @@ for label, instructions in REFUSED:
 got = run('v_mov_b32_e32 v7, s2', READ, exec_known=False)
 check('unknown exec refused', got == REFUSAL, repr(got))
 
+# Older probes may provide either no tracker or only part of the tracking state.
+for present in ((), ('uniform_v',), ('uniform_v', 'varying_s')):
+    s = G.Stage.__new__(G.Stage)
+    s.sym, s.attrs, s.lines = {}, {}, []
+    s.used_s, s.used_v = set(), set()
+    s.has_branches, s.exec_known = False, True
+    for name in present:
+        setattr(s, name, set())
+    s.one('v_mov_b32_e32', MOVE)
+    check('partial tracker %r proves nothing' % (present,), not getattr(s, 'uniform_v', ()))
+    s.one('v_interp_p1_f32_e32', 'v_interp_p1_f32_e32 v7, v0, attr0.x')
+    try:
+        s.one('v_readfirstlane_b32', READ)
+    except G.Unsupported as error:
+        got = str(error)
+    else:
+        got = 'accepted'
+    check('partial tracker %r refuses read' % (present,), got == REFUSAL, got)
+
 # Remove the allowlist and require the same successful instruction sequences to refuse.
 original = G.UNIFORM_VALU
 G.UNIFORM_VALU = frozenset()
 try:
-    for label, instructions, _ in ACCEPTED:
-        got = run(*instructions, READ)
+    for label, instructions, _, *source in ACCEPTED:
+        reg = source[0] if source else 7
+        got = run(*instructions, 'v_readfirstlane_b32 s9, v%d' % reg)
         check(f'control: {label} refused without tracking', got == REFUSAL, repr(got))
 finally:
     G.UNIFORM_VALU = original
