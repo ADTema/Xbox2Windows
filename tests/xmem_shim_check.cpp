@@ -457,7 +457,13 @@ bool aggregation_checks()
         {"alias_disagrees", {domain(64 * mib, {basic}), domain(32 * mib, {basic})}, true, std::nullopt},
         {"unidentified_with_active", {domain(64 * mib, {gpu_a}), domain(64 * mib)}, true, std::nullopt},
         {"linked_partial_overlap", {domain(64 * mib, {gpu_a, gpu_b}), domain(64 * mib, {gpu_a})}, true, std::nullopt},
+        // The rules do not depend on adapter order: the two cases above with the adapters swapped.
+        {"unidentified_first", {domain(64 * mib), domain(64 * mib, {gpu_a})}, true, std::nullopt},
+        {"linked_partial_overlap_second", {domain(64 * mib, {gpu_a}), domain(64 * mib, {gpu_a, gpu_b})}, true,
+         std::nullopt},
         {"overflow", {domain(UINT64_MAX, {gpu_a}), domain(1, {gpu_b})}, true, std::nullopt},
+        // A sum of exactly UINT64_MAX fits, so it is published.
+        {"sum_fits_exactly", {domain(UINT64_MAX - 1, {gpu_a}), domain(1, {gpu_b})}, true, UINT64_MAX},
         // Registry keys match ignoring case, so a case variant of a key is the same device.
         {"mixed_case_alias", {domain(64 * mib, {gpu_a}), domain(64 * mib, {gpu_a_lower})}, true, 64 * mib},
         {"mixed_case_alias_disagrees", {domain(64 * mib, {gpu_a}), domain(32 * mib, {gpu_a_lower})}, true,
