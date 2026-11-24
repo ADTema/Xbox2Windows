@@ -391,6 +391,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     lds_m0_zero = False
     ds_wait = False
     dpp_step_count = 0
+    readlane_step_count = 0
     written_spans = []
     layout = None
     # One per-lane guard: v_cmp into vcc_lo, s_and_saveexec_b32, the stores under the mask, then
@@ -530,6 +531,24 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Invalid scalar destination or movk immediate")
             signed = value - 0x10000 if value >= 0x8000 else value
             scalar[dst] = signed & 0xffffffff
+        elif m := re.fullmatch(r"s_bcnt1_i32_b32 s(\d+), (\S+)", line):
+            # Active lane count of a full wave: sD = popcount(exec_lo), SCC = sD != 0 (SCC is unread in this
+            # subset). Outside a guarded region exec covers the whole wave: at most 32 threads is one wave of
+            # either size, larger groups need wave_size=32 and a multiple of 32 threads.
+            dst, src = int(m[1]), m[2]
+            if src != "exec_lo":
+                raise ValueError("Unsupported active lane count source: " + src)
+            if dst in pending or dst > 105:
+                raise ValueError("Invalid scalar destination or pending load")
+            if guard is not None:
+                raise ValueError("Active lane count inside guarded region")
+            threads = dims[0] * dims[1] * dims[2]
+            if threads <= 32:
+                scalar[dst] = threads
+            elif wave_size == 32 and threads % 32 == 0:
+                scalar[dst] = 32
+            else:
+                raise ValueError("Unverified active lane count wave size or group size")
         elif m := re.fullmatch(r"s_bitreplicate_b64_b32 s\[(\d+):(\d+)\], (\S+)", line):
             # Each source bit fills two adjacent bits of the pair: D[2i] = D[2i + 1] = S0[i]. With an immediate
             # source both halves are known words; the low one replicates bits 0-15 and the high one bits 16-31.
@@ -599,6 +618,27 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             for word, reg in enumerate(regs, offset // 4):
                 scalar[reg] = ("constant_word", word)
             pending.update(regs)
+        elif m := re.fullmatch(r"v_readlane_b32 s(\d+), v(\d+), (s\d+|-?\d+|0x[0-9a-f]+)", line):
+            # A wave-wide SGPR read is emulated from logical 1D wave32 groupshared storage. Dynamic lane
+            # selectors and incomplete logical waves are refused so every selected source is defined.
+            dst, src = int(m[1]), int(m[2])
+            lane = alu_word(m[3], scalar, vector, pending)
+            threads = dims[0] * dims[1] * dims[2]
+            if (dst > 105 or dst in pending or src > 255 or guard_span is not None
+                    or dims[1:] != (1, 1) or not isinstance(lane, int) or not 0 <= lane < 32
+                    or (threads <= 32 and lane >= threads)
+                    or (threads > 32 and (wave_size != 32 or threads % 32))):
+                raise ValueError("Unverified readlane operand or wave layout")
+            value = vector.get(src)
+            if not is_word(value):
+                raise ValueError("Unverified readlane source")
+            step = readlane_step_count
+            readlane_step_count += 1
+            slot, result = f"readlane_stage_{step}", f"readlane_value_{step}"
+            staged_steps.append((slot, f"    {slot}[gindex] = {hlsl_word(value)};\n"
+                                 "    GroupMemoryBarrierWithGroupSync();\n"
+                                 f"    uint {result} = {slot}[(gindex & ~31u) + {lane}u];"))
+            scalar[dst] = ("alu", result)
         elif m := re.fullmatch(rf"v_mbcnt_(lo|hi)_u32_b32 v(\d+), {SALU_SOURCE}, {ALU_SOURCE}", line):
             # D = popcount(S0 & lanes below this one, in the low or high half of the mask) + S1. A wave32 lane
             # has no bit in the high half, so v_mbcnt_hi adds nothing. gfx10 numbers lanes by the flat local
@@ -617,6 +657,33 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if len(expression) > ALU_EXPRESSION_LIMIT:
                     raise ValueError("ALU expression too large")
                 vector[dst] = ("alu", expression)
+        elif m := re.fullmatch(rf"v_writelane_b32 v(\d+), {SALU_SOURCE}, {SALU_SOURCE}", line):
+            # D[lane & 31] = S, leaving other lanes unchanged; exec is ignored. gfx10 numbers lanes by
+            # SV_GroupIndex modulo the wave size: at most 32 threads is one wave of either size, a larger
+            # group requires the wave32 statement.
+            dst = int(m[1])
+            src = alu_word(m[2], scalar, vector, pending)
+            lane = alu_word(m[3], scalar, vector, pending)
+            old = vector.get(dst)
+            if dst > 255:
+                raise ValueError("Invalid writelane vector destination")
+            if guard is not None:
+                raise ValueError("v_writelane_b32 inside guarded region")
+            if dims[0] * dims[1] * dims[2] > 32 and wave_size != 32:
+                raise ValueError("Unverified writelane wave size")
+            if src is None:
+                raise ValueError("Unverified writelane scalar source")
+            if lane is None:
+                raise ValueError("Unverified writelane lane")
+            if wave_size != 32 and (not isinstance(lane, int) or not 0 <= lane <= 31):
+                raise ValueError("Unverified writelane lane")
+            if not is_word(old):
+                raise ValueError("Unverified writelane old value")
+            lane_hlsl = f"({hlsl_word(lane)} & 31u)" if wave_size == 32 else hlsl_word(lane)
+            expression = f"(((gindex & 31u) == {lane_hlsl}) ? {hlsl_word(src)} : {hlsl_word(old)})"
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(r"v_mov_b32(?:_e32|_e64)? v(\d+), (s\d+|v\d+|-?\d+|0x[0-9a-f]+)", line):
             dst, src = int(m[1]), m[2]
             if dst > 255:

@@ -8830,6 +8830,24 @@ def translate_buffer_color(instructions):
     return lower(instructions, 9, 24, None, 0)
 
 
+def min_num(*values):
+    """HLSL min, and V_MIN_F32 with IEEE mode off: a NaN operand gives the other operand."""
+    numbers = [v for v in values if v == v]
+    return min(numbers) if numbers else math.nan
+
+
+def max_num(*values):
+    numbers = [v for v in values if v == v]
+    return max(numbers) if numbers else math.nan
+
+
+def med3_f32(a, b, c):
+    """V_MED3_F32 (RDNA 2 ISA): the median, or V_MIN3_F32 of the three operands when any of them is NaN."""
+    if any(v != v for v in (a, b, c)):
+        return min_num(a, b, c)
+    return sorted((a, b, c))[1]
+
+
 def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
     """Expected colors for three_way(); no rounding occurs before the half export."""
     case = bytearray(256)
@@ -8837,8 +8855,8 @@ def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
     for y in RAMP:
         for x in RAMP:
             r, g, b = single(x / 255), single(y / 255), single(128 / 255)
-            clamped = sorted((r, low, high))[1]
-            color = (clamped, min(abs(cap), g, clamped), max(r, b, g), sorted((middle, g, r))[1])
+            clamped = med3_f32(r, low, high)
+            color = (clamped, min(abs(cap), g, clamped), max(r, b, g), med3_f32(middle, g, r))
             case.extend(struct.pack("<4f", *map(half_rtz, color)))
     path = directory / name
     path.write_bytes(case)
@@ -8846,15 +8864,24 @@ def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
 
 
 def check_three_way_templates():
-    """The HLSL forms must pick the expected operand for every operand order."""
-    values = (-1.5, 0.0, 0.25, 0.25, 3.0)
+    """The HLSL forms must pick the expected operand for every operand order, NaN operands included."""
+    names = {"min": min_num, "max": max_num, "asuint": lambda x: struct.unpack("<I", struct.pack("<f", x))[0]}
+    # Evaluate the med3_32 helper of the preamble: its NaN test on the encoding, then the selected form.
+    helper = (r"^float med3_32\(float a, float b, float c\) \{\n    uint top = (.+);\n"
+              r"    return top > (0x[0-9a-f]+)u \? (.+) : (.+);\n\}")
+    for top, limit, nan_form, finite_form in re.findall(helper, pixel_aot.PREAMBLE, re.M):
+        top = re.sub(r"(0x[0-9a-f]+)u\b", r"\1", top)
+        names["med3_32"] = lambda a, b, c: eval(
+            nan_form if eval(top, names, {"a": a, "b": b, "c": c}) > int(limit, 16) else finite_form,
+            names, {"a": a, "b": b, "c": c})
+    values = (-1.5, 0.0, 0.25, 0.25, 3.0, math.nan)
     for a in values:
         for b in values:
             for c in values:
-                pick = {name: eval(ALU[name][1].format("a", "b", "c"), {"min": min, "max": max},
-                                   {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
-                assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
-                                "med3": sorted((a, b, c))[1]}, (a, b, c)
+                for name, expected in (("min3", min_num(a, b, c)), ("max3", max_num(a, b, c)),
+                                       ("med3", med3_f32(a, b, c))):
+                    pick = eval(ALU[name][1].format("a", "b", "c"), names, {"a": a, "b": b, "c": c})
+                    assert pick == expected or pick != pick and expected != expected, (name, a, b, c, pick)
 # Give the four invocations lane IDs 0, 1, 2, 3, then gather the converted values
 # using the author's injective base-4 weights. This witnesses every routed lane.
 DPP_CVT_LANES = [
@@ -15679,25 +15706,31 @@ def _check_controls_inline(directory):
     # Post-modifier in-range control: -(+2^31) = -2^31 is exact in signed i32.
     translate(with_constants(["v_cvt_flr_i32_f32_e64 v12, neg(0x4f000000)"]))
     translate(with_constants(["v_cvt_rpi_i32_f32_e64 v12, -|0x4f000000|"]))
-    # Explicit refusals for unproven runtime inputs and exceptional/out-of-range constants (including after modifiers).
-    for unproven in ("v_cvt_flr_i32_f32_e32 v12, s44", "v_cvt_rpi_i32_f32_e64 v12, -s44",
-                     "v_cvt_flr_i32_f32_e32 v12, v12", "v_cvt_rpi_i32_f32_e64 v12, |v12|"):
-        expect_value_error(translate, with_constants([unproven]), "Unproven runtime input")
-    expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s44", "v_cvt_flr_i32_f32_e32 v12, v18"]),
-                       "Unproven runtime input")
-    expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, 0x3f800000", "v_add_f32_e32 v18, v18, v18",
-                                                           "v_cvt_rpi_i32_f32_e32 v12, v18"]),
-                       "Unproven runtime input")
-    for bad_const in ("v_cvt_flr_i32_f32_e32 v12, 0x7fc00000", "v_cvt_rpi_i32_f32_e32 v12, 0xff800001",
-                      "v_cvt_flr_i32_f32_e32 v12, 0x7f800000", "v_cvt_rpi_i32_f32_e32 v12, 0xff800000",
-                      "v_cvt_flr_i32_f32_e32 v12, 0x4f000000", "v_cvt_rpi_i32_f32_e32 v12, 0xcf000001",
-                      "v_cvt_flr_i32_f32_e64 v12, |0xcf000000|", "v_cvt_rpi_i32_f32_e64 v12, neg(0xcf000000)",
-                      "v_cvt_flr_i32_f32_e64 v12, -|0x7f800000|"):
-        expect_value_error(translate, with_constants([bad_const]), "Unproven exceptional or out-of-range input")
-    expect_value_error(translate_int, uncompressed_export(["s_mov_b32 s44, 0xcf000000", "v_cvt_flr_i32_f32_e64 v12, |s44|"]),
-                       "Unproven exceptional or out-of-range input")
-    expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, 0x4f000000", "v_cvt_rpi_i32_f32_e32 v12, v18"]),
-                       "Unproven exceptional or out-of-range input")
+    # Runtime inputs and exceptional or out-of-range constants (also after modifiers) lower through the same helpers,
+    # which define NaN, infinities and overflow (issue #1772); the raw word reaches the helper unchanged.
+    for runtime, call in (("v_cvt_flr_i32_f32_e32 v12, s44", "cvt_flr_i32_f32(asuint(params[0].w))"),
+                          ("v_cvt_rpi_i32_f32_e64 v12, -s44", "cvt_rpi_i32_f32((asuint(params[0].w) ^ 0x80000000u))"),
+                          ("v_cvt_flr_i32_f32_e32 v12, v12", "cvt_flr_i32_f32(asuint(sample16.x))"),
+                          ("v_cvt_rpi_i32_f32_e64 v12, |v12|", "cvt_rpi_i32_f32((asuint(sample16.x) & 0x7fffffffu))")):
+        hlsl = translate(with_constants([runtime]))
+        assert call in hlsl.split("float4 main", 1)[1], (runtime, hlsl)
+        assert hlsl.count(f"uint {call.split('(', 1)[0]}(uint bits)") == 1, runtime
+    for body in (["v_mov_b32_e32 v18, s44", "v_cvt_flr_i32_f32_e32 v12, v18"],
+                 ["v_mov_b32_e32 v18, 0x3f800000", "v_add_f32_e32 v18, v18, v18", "v_cvt_rpi_i32_f32_e32 v12, v18"],
+                 ["s_mov_b32 s44, 0xcf000000", "v_cvt_flr_i32_f32_e64 v12, |s44|"],
+                 ["v_mov_b32_e32 v18, 0x4f000000", "v_cvt_rpi_i32_f32_e32 v12, v18"]):
+        assert "_i32_f32(" in translate_int(uncompressed_export(body)).split("uint4 main", 1)[1], body
+    for exceptional in ("v_cvt_flr_i32_f32_e32 v12, 0x7fc00000", "v_cvt_rpi_i32_f32_e32 v12, 0xff800001",
+                        "v_cvt_flr_i32_f32_e32 v12, 0x7f800000", "v_cvt_rpi_i32_f32_e32 v12, 0xff800000",
+                        "v_cvt_flr_i32_f32_e32 v12, 0x4f000000", "v_cvt_rpi_i32_f32_e32 v12, 0xcf000001",
+                        "v_cvt_flr_i32_f32_e64 v12, |0xcf000000|", "v_cvt_rpi_i32_f32_e64 v12, neg(0xcf000000)",
+                        "v_cvt_flr_i32_f32_e64 v12, -|0x7f800000|"):
+        assert "_i32_f32(" in translate(with_constants([exceptional])).split("float4 main", 1)[1], exceptional
+    # No cast in either helper reads a NaN or an out-of-range value: the NaN word is replaced and the value clamped.
+    for helper in ("cvt_flr_i32_f32", "cvt_rpi_i32_f32"):
+        text = pixel_aot.SALU_HELPERS[helper]
+        assert "float x = asfloat(nan ? 0u : bits);" in text and "return nan ? 0x7fffffffu + (bits >> 31) : word;" in text
+        assert len(re.findall(r"\bint\(", text)) == 1 and "asuint(int(r))" in text and "2147483520.0f)" in text, helper
     # e64 source modifiers apply bitwise sign-bit ops before the shared helper, never FP abs/neg.
     e64_mod_hlsl = translate_int(uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY))
     assert e64_mod_hlsl.count("uint cvt_i32_f32(uint bits)") == 1
@@ -15911,9 +15944,9 @@ def _check_controls_inline(directory):
                      ("v_add_f32_e32 v19, s44, v13", "v_add_f32_e32 v19, v13")):
         must_reject(translate, [line.replace(old, new) for line in shaping()])
     source = translate(three_way())
-    for expected in ("max(min(params[1].z, sample16.y), min(max(params[1].z, sample16.y), sample16.x))",
+    for expected in ("med3_32(params[1].z, sample16.y, sample16.x)",
                      "max(max(sample16.x, sample16.z), sample16.y)",
-                     "max(min(sample16.x, params[0].w), min(max(sample16.x, params[0].w), params[1].x))",
+                     "med3_32(sample16.x, params[0].w, params[1].x)",
                      "min(min(abs(params[1].y), sample16.y), alu"):
         assert expected in source, expected
     for old, new in (("v_med3_f32 v12, v12, s44, s45", "v_med3_f32 v12, v12, s44"),
@@ -16342,6 +16375,119 @@ def _check_controls_inline(directory):
     plain_hlsl = translate(assembly(False))
     for sym in ("dpp_frexp_mant_f32(", "dpp_frexp_exp_i32_f32(", "dpp_dot4c_i32_i8(", "QuadRead"):
         assert sym not in plain_hlsl, sym
+
+    # Plain VOP1/VOP3 v_movrel* (#1739): the same m0 rules as the DPP forms, without a quad swizzle. Overlapping
+    # source and destination banks are read before any write; the refusals match the DPP forms.
+    plain_hlsl = translate(with_constants(PLAIN_MOVREL_BODY))
+    assert "dpp_soff" in plain_hlsl and "dpp_doff" in plain_hlsl and "QuadRead" not in plain_hlsl
+    assert "dpp_doff" in translate(with_constants([
+        "s_mov_b32 s64, s44",
+        "s_mov_b32 s65, 0",
+        "s_and_b64 s[64:65], s[64:65], 0x30003",
+        "s_mov_b32 m0, s64",
+        "v_movrelsd_2_b32_e32 v12, v12",
+    ]))
+    plain_bank = ["v_mov_b32_e32 v24, 1.0", "v_mov_b32_e32 v25, 2.0"]
+    for bad_seq, message in (
+        (["v_movrels_b32_e32 v12, v12"], "Unsupported m0 value for v_movrels_b32"),
+        (plain_bank + ["s_mov_b32 m0, s44", "v_movrels_b32_e64 v12, v24"], "Unsupported m0 value"),
+        (plain_bank + ["s_mov_b32 m0, 0x100", "v_movreld_b32_e32 v12, v24"], "Static m0 offset out of range"),
+        (plain_bank + ["s_mov_b32 m0, 200", "v_movrels_b32_e32 v12, v100"], "Indexed VGPR exceeds 255"),
+        (plain_bank + ["s_mov_b32 m0, 5", "v_movrels_b32_e32 v12, v24"], "Expected a numeric VGPR at v29"),
+    ):
+        try:
+            translate(with_constants(bad_seq))
+        except ValueError as error:
+            assert message in str(error), (bad_seq, error)
+        else:
+            raise AssertionError(f"Plain movrel accepted {bad_seq}")
+
+    # Scalar s_movrel* (#1882): a static move keeps a tracked descriptor pointer, and the refusals.
+    moved, copied = smovrel_descriptor_programs()
+    assert translate(moved) == translate(copied)
+    sbank = ["s_mov_b32 s60, 10", "s_mov_b32 s61, 20", "s_mov_b32 s62, 40", "s_mov_b32 s63, 80"]
+    # Overlaps, with the moved constant visible in the export: every source is read before any write.
+    export = ["v_cvt_f32_u32_e32 v12, s60", "v_cvt_f32_u32_e32 v13, s61", "v_cvt_f32_u32_e32 v14, s62",
+              "v_cvt_f32_u32_e32 v15, s63"]
+    for label, moves, words in (
+        ("a register moved onto itself", ["s_mov_b32 m0, 1", "s_movreld_b32 s60, s61"], (10, 20, 40, 80)),
+        ("a pair moved onto an overlapping pair", ["s_mov_b32 m0, 1", "s_movreld_b64 s[60:61], s[60:61]"], None),
+        ("a pair read from an overlapping pair", ["s_mov_b32 m0, 2", "s_movrels_b64 s[62:63], s[60:61]"],
+         (10, 20, 40, 80)),
+        ("s_movrelsd_2 within one bank", ["s_mov_b32 m0, 0x10002", "s_movrelsd_2_b32 s60, s60"], (10, 40, 40, 80)),
+        ("a pair shifted inside one bank", ["s_mov_b32 m0, 2", "s_movreld_b64 s[60:61], s[60:61]"],
+         (10, 20, 10, 20)),
+    ):
+        try:
+            hlsl = translate(with_constants(sbank + moves + export))
+        except ValueError as error:
+            assert words is None and "Odd 64-bit SGPR pair base" in str(error), (label, error)
+            continue
+        assert words is not None, f"{label} was accepted"
+        got = re.findall(r"float\(asuint\(asfloat\((\d+)u\)\)\)", hlsl)
+        assert tuple(map(int, got[-4:])) == words, (label, got)
+    # A dynamic s_movreld whose source lies in its own destination bank writes the source's old value.
+    overlap = translate(with_constants(sbank + ["s_bfe_u32 s56, s44, 0x20000", "s_mov_b32 m0, s56",
+                                                "s_movreld_b32 s60, s61"] + export))
+    for reg, old in ((60, 10), (61, 20), (62, 40), (63, 80)):
+        assert re.search(rf"uint salu\d+_d{reg} = \(smov_doff\d+ == {reg - 60}u \? 20u : {old}u\);", overlap), reg
+    for bad_seq, message in (
+        (["s_movrels_b32 s70, s60"], "Unsupported m0 value for s_movrels_b32"),
+        (sbank + ["s_mov_b32 m0, s44", "s_movrels_b32 s70, s60"], "Unsupported m0 value"),
+        (sbank + ["s_add_u32 s56, s44, 1", "s_mov_b32 m0, s56", "s_movrels_b32 s70, s60"],
+         "Dynamic m0 offset is unbounded"),
+        (sbank + ["s_mov_b32 m0, 50", "s_movrels_b32 s70, s60"], "Indexed SGPR exceeds s105"),
+        (sbank + ["s_mov_b32 m0, 1", "s_movrels_b64 s[70:71], s[60:61]"], "Odd 64-bit SGPR pair base"),
+        # A dynamic index may only select plain numeric words: s20 holds the descriptor table pointer.
+        (sbank + ["s_bfe_u32 s56, s44, 0x20000", "s_mov_b32 m0, s56", "s_movrels_b32 s70, s18"],
+         "Expected a numeric scalar register"),
+        # ... and may only overwrite plain numeric words, which keep their old value when not selected.
+        (sbank + ["s_bfe_u32 s56, s44, 0x20000", "s_mov_b32 m0, s56", "s_movreld_b32 s20, s60"],
+         "Expected a numeric scalar register"),
+        (sbank + ["s_mov_b32 m0, 10", "s_movreld_b32 s100, s60"], "Indexed SGPR exceeds s105"),
+        # A dynamic offset whose mask allows an odd value would give an odd pair base.
+        (sbank + ["s_bfe_u32 s56, s44, 0x20000", "s_mov_b32 m0, s56", "s_movrels_b64 s[70:71], s[60:61]"],
+         "Odd 64-bit SGPR pair base"),
+    ):
+        try:
+            translate(with_constants(bad_seq))
+        except ValueError as error:
+            assert message in str(error), (bad_seq, error)
+        else:
+            raise AssertionError(f"Scalar movrel accepted {bad_seq}")
+    # The indexed SGPRs of an outstanding scalar load are not read before its s_waitcnt: s45 is still loading.
+    early = with_constants([])
+    at = early.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc") + 1
+    try:
+        translate(early[:at] + ["s_mov_b32 m0, 1", "s_movrels_b32 s70, s44"] + early[at:])
+    except ValueError as error:
+        assert "Unresolved scalar memory dependency" in str(error), error
+    else:
+        raise AssertionError("Scalar movrel read an outstanding scalar load")
+
+    # v_swaprel_b32 (#1795): bounded selects on both sides, and the movrel refusals.
+    assert "swap_doff" in translate(with_constants(SWAPREL_BODY))
+    # Dynamic offsets whose two banks overlap: v24..v27 is both the source and the destination range.
+    overlap = translate(with_constants(SWAPREL_BODY[:8] + [
+        "s_mov_b32 s64, s47", "s_mov_b32 s65, 0", "s_and_b64 s[64:65], s[64:65], 0x30003", "s_mov_b32 m0, s64",
+        "v_swaprel_b32 v24, v24"]))
+    assert all(f"_r{r} = " in overlap for r in range(24, 28)), "each register of the overlapping bank is selected"
+    swap_bank = ["v_mov_b32_e32 v24, 1.0", "v_mov_b32_e32 v25, 2.0"]
+    for bad_seq, message in (
+        (["v_swaprel_b32 v12, v12"], "Unsupported m0 value for v_swaprel_b32"),
+        (swap_bank + ["s_mov_b32 m0, s44", "v_swaprel_b32 v24, v25"], "Unsupported m0 value"),
+        (swap_bank + ["s_mov_b32 m0, 0x1000000", "v_swaprel_b32 v24, v25"], "Static m0 offset out of range"),
+        (swap_bank + ["s_mov_b32 m0, 0x00c8", "v_swaprel_b32 v24, v100"], "Indexed VGPR exceeds 255"),
+        (swap_bank + ["s_mov_b32 m0, 0x50000", "v_swaprel_b32 v24, v25"], "Expected a numeric VGPR at v29"),
+        (swap_bank + ["s_add_u32 s64, s47, 1", "s_mov_b32 m0, s64", "v_swaprel_b32 v24, v25"],
+         "Dynamic m0 offset is unbounded"),
+    ):
+        try:
+            translate(with_constants(bad_seq))
+        except ValueError as error:
+            assert message in str(error), (bad_seq, error)
+        else:
+            raise AssertionError(f"v_swaprel_b32 accepted {bad_seq}")
 
     # Quad-local DPP16/DPP8 v_movrel* controls (static and bounded dynamic m0).
     movrel_prog = with_constants(DPP_MOVREL_BODY)
@@ -17642,6 +17788,10 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
     fixtures.append((with_constants(DPP_MOVREL_BODY), translate))
+    fixtures.append((with_constants(PLAIN_MOVREL_BODY), translate))
+    fixtures.append((with_constants(swap_movrel_encodings(PLAIN_MOVREL_BODY)), translate))
+    fixtures.append((with_constants(SWAPREL_BODY), translate))
+    fixtures.append((with_constants(SMOVREL_BODY), translate))
     fixtures.append((uncompressed_export(DPP_F16_CVT_LANES), translate_f16))
     fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
@@ -19838,22 +19988,62 @@ def check_cvt_float_int_e64_draw(directory, compiler, renderer, backend):
                 raise AssertionError(f"Modifier mutation ({label}) escaped detection")
 
 
+def cvt_flr_rpi_saturate(word, integer):
+    """Saturate an exact integer result to i32; a NaN takes its sign bit (issue #1772, RDNA 2 gfx1036 and RDNA 4)."""
+    if integer is None:
+        return 0x80000000 if word >> 31 else 0x7FFFFFFF
+    return min(max(integer, -2**31), 2**31 - 1) & 0xFFFFFFFF
+
+
 def cvt_flr_i32_ref(word):
-    """Reference for finite in-range v_cvt_flr_i32_f32: floor(x) in [-2^31, 2^31)."""
+    """Reference for v_cvt_flr_i32_f32: floor(x), saturated to i32 (infinities included); NaN by sign bit."""
     x = struct.unpack("<f", struct.pack("<I", word))[0]
-    assert math.isfinite(x) and -2.0**31 <= x < 2.0**31, hex(word)
-    return math.floor(x) & 0xFFFFFFFF
+    if math.isinf(x):
+        return cvt_flr_rpi_saturate(word, 2**31 if x > 0 else -2**31 - 1)
+    return cvt_flr_rpi_saturate(word, None if math.isnan(x) else math.floor(x))
 
 
 def cvt_rpi_i32_ref(word):
-    """Reference for finite in-range v_cvt_rpi_i32_f32: floor(x + 0.5) in [-2^31, 2^31)."""
+    """Reference for v_cvt_rpi_i32_f32: floor of the exact x + 0.5 (binary64 holds it), saturated; NaN by sign bit."""
     x = struct.unpack("<f", struct.pack("<I", word))[0]
-    assert math.isfinite(x) and -2.0**31 <= x < 2.0**31, hex(word)
-    return math.floor(x + 0.5) & 0xFFFFFFFF
+    if math.isinf(x):
+        return cvt_flr_rpi_saturate(word, 2**31 if x > 0 else -2**31 - 1)
+    return cvt_flr_rpi_saturate(word, None if math.isnan(x) else math.floor(x + 0.5))
+
+
+# Hand-worked (word, flr, rpi) rows. Rows without "by rule" repeat raw words measured natively on RDNA 2 gfx1036
+# and RDNA 4 (the sources cited in issue #1772); rows marked "by rule" apply its saturation rule or, for 2^31 - 128,
+# the finite formula. Every row also matches a native gfx1032 readback (docs/experiments.md). None is gfx1013.
+CVT_FLR_RPI_EXCEPTIONAL = (
+    (0x7fc00000, 0x7fffffff, 0x7fffffff),  # +qNaN
+    (0xffc00000, 0x80000000, 0x80000000),  # -qNaN
+    (0x7f800001, 0x7fffffff, 0x7fffffff),  # +sNaN
+    (0xff800001, 0x80000000, 0x80000000),  # -sNaN
+    (0x7fffffff, 0x7fffffff, 0x7fffffff),  # +NaN, all payload bits set
+    (0xffffffff, 0x80000000, 0x80000000),  # -NaN, all payload bits set
+    (0x7f800000, 0x7fffffff, 0x7fffffff),  # +inf
+    (0xff800000, 0x80000000, 0x80000000),  # -inf
+    (0x4f000000, 0x7fffffff, 0x7fffffff),  # 2^31
+    (0xcf000000, 0x80000000, 0x80000000),  # -2^31, in range
+    (0x4f000001, 0x7fffffff, 0x7fffffff),  # 2^31 + 256, by rule
+    (0xcf000001, 0x80000000, 0x80000000),  # -2^31 - 256, by rule
+    (0x4effffff, 0x7fffff80, 0x7fffff80),  # 2^31 - 128, the largest in-range binary32, by rule
+    (0x5f000000, 0x7fffffff, 0x7fffffff),  # 2^63, by rule
+    (0xdf000000, 0x80000000, 0x80000000),  # -2^63, by rule
+    (0x7f7fffff, 0x7fffffff, 0x7fffffff),  # largest finite binary32, by rule
+    (0xff7fffff, 0x80000000, 0x80000000),  # most negative finite binary32, by rule
+    (0x3effffff, 0x00000000, 0x00000000),  # 0.49999997
+    (0x3f000000, 0x00000000, 0x00000001),  # 0.5
+    (0xbf000000, 0xffffffff, 0x00000000),  # -0.5
+    (0xbf000001, 0xffffffff, 0xffffffff),  # -0.50000006
+    (0x4b000001, 0x00800001, 0x00800001),  # 2^23 + 1
+    (0xcb000001, 0xff7fffff, 0xff7fffff),  # -(2^23 + 1)
+    (0x4b7fffff, 0x00ffffff, 0x00ffffff),  # 2^24 - 1
+)
 
 
 def cvt_flr_rpi_pair_body(w0, w1, *, e64):
-    """Build a proven-constant SGPR/VGPR shader converting two finite in-range binary32 words."""
+    """Build a constant-source SGPR/VGPR shader converting two binary32 words with flr and rpi."""
     suf = "_e64" if e64 else "_e32"
     return [
         f"s_mov_b32 s44, {w0:#010x}",
@@ -19981,6 +20171,87 @@ def check_cvt_flr_rpi_draw(directory, compiler, renderer, backend):
                                    capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError(f"{kind} modifier mutation ({label}) escaped detection")
+
+    # Exceptional inputs (issue #1772): NaN by sign bit, saturated infinities and out-of-range values.
+    for word, flr, rpi in CVT_FLR_RPI_EXCEPTIONAL:
+        assert (cvt_flr_i32_ref(word), cvt_rpi_i32_ref(word)) == (flr, rpi), hex(word)
+
+    def make_runtime_case(name, input_words, expected_words):
+        path = directory / f"cvt_flr_rpi_{name}.case"
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *input_words)
+        for word in expected_words:
+            assert struct.unpack("<I", struct.pack("<f", as_float(word)))[0] == word, hex(word)
+        write_case(path, bytes(constants), tuple(as_float(word) for word in expected_words), integer_rt=True)
+        return path
+
+    # Runtime sources: s44 and s45 come from the constant buffer, so DXC cannot fold the conversion.
+    words = [word for word, _, _ in CVT_FLR_RPI_EXCEPTIONAL]
+    pairs = list(zip(words[0::2], words[1::2]))
+    for tag, e64 in (("e32", False), ("e64", True)):
+        body = cvt_flr_rpi_pair_body(0, 0, e64=e64)[2:]
+        assert not any(line.startswith("s_mov_b32") for line in body)
+        source.write_text(translate_int(uncompressed_export(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        batch = []
+        for idx, (w0, w1) in enumerate(pairs):
+            expected = (cvt_flr_i32_ref(w0), cvt_rpi_i32_ref(w0), cvt_flr_i32_ref(w1), cvt_rpi_i32_ref(w1))
+            batch.append((make_runtime_case(f"runtime_{tag}_{idx}", (w0, w1, 0, 0), expected), "pass"))
+        # Negative control: a NaN converted as v_cvt_i32_f32 does it (0) must not pass.
+        batch.append((make_runtime_case(f"runtime_{tag}_nan_zero", (0x7fc00000, 0xffc00000, 0, 0), (0, 0, 0, 0)),
+                      "mismatch"))
+        run_pixel_batch(renderer, backend, shader, batch)
+    nan_case = make_runtime_case("runtime_nan_ref", (0x7fc00000, 0xffc00000, 0, 0),
+                                 (0x7fffffff, 0x7fffffff, 0x80000000, 0x80000000))
+    inf_case = make_runtime_case("runtime_inf_ref", (0x7f800000, 0x4f000001, 0, 0), (0x7fffffff,) * 4)
+
+    # Helper mutants on the runtime e32 shader: each must fail on the NaN or the +inf case.
+    runtime_hlsl = translate_int(uncompressed_export(cvt_flr_rpi_pair_body(0, 0, e64=False)[2:]))
+    for label, old, new, case in (
+        ("drop the NaN sign select", "return nan ? 0x7fffffffu + (bits >> 31) : word;", "return word;", nan_case),
+        ("reverse the NaN sign select", "0x7fffffffu + (bits >> 31)", "0x80000000u - (bits >> 31)", nan_case),
+        ("drop the 2^31 saturation", "x >= 2147483648.0f ? 0x7fffffffu : ", "", inf_case),
+    ):
+        assert runtime_hlsl.count(old) == 2, label
+        source.write_text(runtime_hlsl.replace(old, new), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, case], capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Helper mutation ({label}) escaped detection")
+
+    # Runtime e64 modifiers flip the sign of a NaN or an infinity before the conversion.
+    runtime_mod_sets = (
+        (0xffc00000, 0x7fc00000, 0x7f800001, 0xffffffff),  # |-qNaN|, -(+qNaN), -|+sNaN|, -(-NaN)
+        (0xff800000, 0x7f800000, 0x4f000001, 0xcf000001),  # |-inf|, -(+inf), -|2^31+256|, -(-2^31-256)
+    )
+    for kind, ref_fn in (("flr_i32", cvt_flr_i32_ref), ("rpi_i32", cvt_rpi_i32_ref)):
+        body = cvt_flr_rpi_mod_body(kind, (0, 0, 0, 0))[4:]
+        assert not any(line.startswith("s_mov_b32") for line in body)
+        source.write_text(translate_int(uncompressed_export(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for idx, words in enumerate(runtime_mod_sets):
+            expected = tuple(ref_fn(apply_f32_mod(w, abs_mod=a, neg_mod=n)) for w, (a, n) in zip(words, chan_mods))
+            cases.append(make_runtime_case(f"runtime_{kind}_mod_{idx}", words, expected))
+        run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases])
+        for old, new, label in mutations[:2]:
+            mutated = [line.replace(old, new) for line in body]
+            assert mutated != body, label
+            source.write_text(translate_int(uncompressed_export(mutated)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[0]],
+                                   capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                raise AssertionError(f"{kind} runtime modifier mutation ({label}) escaped detection")
+
+    # Constant sources: exceptional literal words that DXC may fold at compile time.
+    for idx, (w0, w1) in enumerate(((0x7fc00000, 0xffc00000), (0x7f800000, 0xff800000),
+                                    (0x4f000001, 0xcf000001), (0x4f000000, 0xff7fffff))):
+        source.write_text(translate_int(uncompressed_export(cvt_flr_rpi_pair_body(w0, w1, e64=False))),
+                          encoding="ascii")
+        compile_shader(compiler, source, shader)
+        expected = (cvt_flr_i32_ref(w0), cvt_rpi_i32_ref(w0), cvt_flr_i32_ref(w1), cvt_rpi_i32_ref(w1))
+        run_pixel_batch(renderer, backend, shader, [(make_case(f"const_exceptional_{idx}", expected), "pass")])
 
 
 def check_int_minmax_draws(directory, compiler, renderer, backend):
@@ -20331,10 +20602,20 @@ def check_three_way_draw(directory, compiler, renderer, backend):
     source.write_text(translate(three_way()), encoding="ascii")
     compile_shader(compiler, source, shader)
     cases = []
-    for idx, constants in enumerate(((.25, .75, .375, .5), (.625, .125, -.3125, .5))):
+    # The second case makes the bounds of the first med3 and the first operand of the second NaN.
+    for idx, constants in enumerate(((.25, .75, .375, .5), (math.nan, .75, .375, math.nan), (.625, .125, -.3125, .5))):
         case = three_way_case(directory, *constants, name=f"three_way-{idx}.case")
         cases.append((case, "pass"))
     run_pixel_batch(renderer, backend, shader, cases)
+    # Desktop min and max alone skip a NaN operand instead of taking V_MIN3_F32 of the rest.
+    text = source.read_text(encoding="ascii")
+    nan_ignored = text.replace("? min(min(a, b), c) :", "? max(min(a, b), min(max(a, b), c)) :")
+    assert nan_ignored != text
+    source.write_text(nan_ignored, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[1][0]], capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A median that ignores a NaN operand escaped detection")
     draw = [renderer, backend, "--check-pixel-case", shader, cases[-1][0]]
     without_abs = [line.replace("|s46|", "s46") for line in three_way()]
     source.write_text(translate(without_abs), encoding="ascii")
@@ -20542,6 +20823,396 @@ def check_dpp_movrel_draw(directory, compiler, renderer, backend):
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
+    return 0
+
+# Plain VOP1 (e32) and VOP3 (e64) v_movrel* fixture (#1739): the same four moves as DPP_MOVREL_BODY without
+# the quad swizzle, each lane indexing its own VGPRs. Each channel runs the e32 form with a runtime-dynamic m0
+# (bounded by s_bfe_u32 or s_and_b64, changing across the two constant sets) and the e64 form with a static m0.
+PLAIN_MOVREL_BODY = [
+    # Source bank v24..v27 = 10, 20, 40, 80.
+    "v_mov_b32_e32 v24, 0x41200000",
+    "v_mov_b32_e32 v25, 0x41a00000",
+    "v_mov_b32_e32 v26, 0x42200000",
+    "v_mov_b32_e32 v27, 0x42a00000",
+    # Channel R (v12): v_movrels (dynamic m0 = word0 & 3, then static m0 = 2).
+    "s_bfe_u32 s60, s44, 0x20000",
+    "s_mov_b32 m0, s60",
+    "v_movrels_b32_e32 v32, v24",
+    "s_mov_b32 m0, 2",
+    "v_movrels_b32_e64 v33, v24",
+    "v_add_f32_e32 v12, v32, v33",
+    # Channel G (v13): v_movreld into the bank v28..v31 = 1, 2, 3, 4 (dynamic m0 = word1 & 3, then m0 = 1).
+    "v_mov_b32_e32 v28, 1.0",
+    "v_mov_b32_e32 v29, 2.0",
+    "v_mov_b32_e32 v30, 0x40400000",
+    "v_mov_b32_e32 v31, 4.0",
+    "s_bfe_u32 s61, s45, 0x20000",
+    "s_mov_b32 m0, s61",
+    "v_movreld_b32_e32 v28, v25",
+    "s_mov_b32 m0, 1",
+    "v_movreld_b32_e64 v28, v24",
+    "v_fma_f32 v34, 2.0, v29, v28",
+    "v_fma_f32 v34, 4.0, v30, v34",
+    "v_fma_f32 v13, 0x41000000, v31, v34",
+    # Channel B (v14): v_movrelsd into v36..v39 = 1, 2, 3, 4 (dynamic m0 = word2 & 3, then m0 = 2).
+    "v_mov_b32_e32 v36, 1.0",
+    "v_mov_b32_e32 v37, 2.0",
+    "v_mov_b32_e32 v38, 0x40400000",
+    "v_mov_b32_e32 v39, 4.0",
+    "s_bfe_u32 s62, s46, 0x20000",
+    "s_mov_b32 m0, s62",
+    "v_movrelsd_b32_e32 v36, v24",
+    "s_mov_b32 m0, 2",
+    "v_movrelsd_b32_e64 v36, v24",
+    "v_fma_f32 v35, 2.0, v37, v36",
+    "v_fma_f32 v35, 4.0, v38, v35",
+    "v_fma_f32 v14, 0x41000000, v39, v35",
+    # Channel A (v15): v_movrelsd_2 into v40..v43 = 1, 2, 3, 4 (source m0[9:0], destination m0[25:16];
+    # dynamic m0 = word3 & 0x30003, then static m0 = 0x20001).
+    "v_mov_b32_e32 v40, 1.0",
+    "v_mov_b32_e32 v41, 2.0",
+    "v_mov_b32_e32 v42, 0x40400000",
+    "v_mov_b32_e32 v43, 4.0",
+    "s_mov_b32 s64, s47",
+    "s_mov_b32 s65, 0",
+    "s_and_b64 s[64:65], s[64:65], 0x30003",
+    "s_mov_b32 m0, s64",
+    "v_movrelsd_2_b32_e32 v40, v24",
+    "s_mov_b32 m0, 0x20001",
+    "v_movrelsd_2_b32_e64 v40, v24",
+    "v_fma_f32 v44, 2.0, v41, v40",
+    "v_fma_f32 v44, 4.0, v42, v44",
+    "v_fma_f32 v15, 0x41000000, v43, v44",
+]
+
+
+def plain_movrel_reference(w0, w1, w2, w3):
+    """Independent per-lane reference for PLAIN_MOVREL_BODY (the same value in every pixel)."""
+    src = [10.0, 20.0, 40.0, 80.0]
+    weighted = lambda bank: bank[0] + 2.0 * bank[1] + 4.0 * bank[2] + 8.0 * bank[3]
+    r = src[w0 & 3] + src[2]
+    g_bank = [1.0, 2.0, 3.0, 4.0]
+    g_bank[w1 & 3] = src[1]
+    g_bank[1] = src[0]
+    b_bank = [1.0, 2.0, 3.0, 4.0]
+    b_bank[w2 & 3] = src[w2 & 3]
+    b_bank[2] = src[2]
+    a_bank = [1.0, 2.0, 3.0, 4.0]
+    a_bank[(w3 >> 16) & 3] = src[w3 & 3]
+    a_bank[2] = src[1]
+    expected = (r, weighted(g_bank), weighted(b_bank), weighted(a_bank))
+    for x in expected:
+        assert single(x) == x == half_rtz(x), x
+    return expected
+
+
+def swap_movrel_encodings(body):
+    """PLAIN_MOVREL_BODY with each move's _e32 and _e64 spellings exchanged, so every form runs with both m0 kinds."""
+    swap = {"_b32_e32 ": "_b32_e64 ", "_b32_e64 ": "_b32_e32 "}
+    return [re.sub(r"_b32_e(?:32|64) ", lambda m: swap[m.group(0)], line) if line.startswith("v_movrel") else line
+            for line in body]
+
+
+def check_plain_movrel_draw(directory, compiler, renderer, backend):
+    for label, body in (("e32 dynamic, e64 static", PLAIN_MOVREL_BODY),
+                        ("e64 dynamic, e32 static", swap_movrel_encodings(PLAIN_MOVREL_BODY))):
+        check_plain_movrel_body(directory, compiler, renderer, backend, body, label)
+    return 0
+
+
+def check_plain_movrel_body(directory, compiler, renderer, backend, body, variant):
+    program = with_constants(body)
+    source = directory / "plain_movrel.hlsl"
+    shader = directory / "plain_movrel.cso"
+    case = directory / "plain_movrel.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    hlsl = translate(program)
+    if "QuadRead" in hlsl or "WaveGetLaneIndex" in hlsl:
+        raise AssertionError("A plain movrel was lowered with a quad swizzle")
+    source.write_text(hlsl, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    references = [plain_movrel_reference(*words) for words in DPP_MOVREL_SETS]
+    if references[0] == references[1]:
+        raise AssertionError("The two constant sets do not tell the dynamic m0 offsets apart")
+    for words, expected in zip(DPP_MOVREL_SETS, references):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    print(f"plain movrel ({variant}): matched {references} for the two constant sets")
+    # Controls on set 1: a dynamic m0 the translation ignores (offset 0) and swapped v_movrelsd_2 halves.
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *DPP_MOVREL_SETS[0])
+    case.write_bytes(constants + struct.pack("<4f", *references[0]) * 64)
+    for old, new, label in (
+        ("s_mov_b32 m0, s60", "s_mov_b32 m0, 0", "v_movrels_b32 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, s61", "s_mov_b32 m0, 0", "v_movreld_b32 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, s62", "s_mov_b32 m0, 0", "v_movrelsd_b32 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, 0x20001", "s_mov_b32 m0, 0x10002", "v_movrelsd_2_b32 with the static m0 halves swapped"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Control {label} ({variant}) escaped detection")
+        print(f"control {label} ({variant}): pixel mismatch, as required")
+
+
+# v_swaprel_b32 (#1795): VGPR[vdst + m0[25:16]] and VGPR[vsrc + m0[9:0]] exchange. R and G are the two banks of
+# a dynamic swap (m0 = word3 & 0x30003); B and A are the two banks of a static swap that follows an overlapping
+# swap inside one bank and a swap of a register with itself.
+SWAPREL_SETS = DPP_MOVREL_SETS
+SWAPREL_BODY = [
+    "v_mov_b32_e32 v24, 0x41200000",
+    "v_mov_b32_e32 v25, 0x41a00000",
+    "v_mov_b32_e32 v26, 0x42200000",
+    "v_mov_b32_e32 v27, 0x42a00000",
+    "v_mov_b32_e32 v28, 1.0",
+    "v_mov_b32_e32 v29, 2.0",
+    "v_mov_b32_e32 v30, 0x40400000",
+    "v_mov_b32_e32 v31, 4.0",
+    "s_mov_b32 s64, s47",
+    "s_mov_b32 s65, 0",
+    "s_and_b64 s[64:65], s[64:65], 0x30003",
+    "s_mov_b32 m0, s64",
+    "v_swaprel_b32 v24, v28",
+    "v_fma_f32 v32, 2.0, v25, v24",
+    "v_fma_f32 v32, 4.0, v26, v32",
+    "v_fma_f32 v12, 0x41000000, v27, v32",
+    "v_fma_f32 v33, 2.0, v29, v28",
+    "v_fma_f32 v33, 4.0, v30, v33",
+    "v_fma_f32 v13, 0x41000000, v31, v33",
+    "v_mov_b32_e32 v36, 0x41200000",
+    "v_mov_b32_e32 v37, 0x41a00000",
+    "v_mov_b32_e32 v38, 0x42200000",
+    "v_mov_b32_e32 v39, 0x42a00000",
+    "v_mov_b32_e32 v40, 1.0",
+    "v_mov_b32_e32 v41, 2.0",
+    "v_mov_b32_e32 v42, 0x40400000",
+    "v_mov_b32_e32 v43, 4.0",
+    "s_mov_b32 m0, 0x30001",
+    "v_swaprel_b32 v36, v36",
+    "s_mov_b32 m0, 0x20002",
+    "v_swaprel_b32 v36, v36",
+    "s_mov_b32 m0, 0x20001",
+    "v_swaprel_b32 v36, v40",
+    "v_fma_f32 v34, 2.0, v37, v36",
+    "v_fma_f32 v34, 4.0, v38, v34",
+    "v_fma_f32 v14, 0x41000000, v39, v34",
+    "v_fma_f32 v35, 2.0, v41, v40",
+    "v_fma_f32 v35, 4.0, v42, v35",
+    "v_fma_f32 v15, 0x41000000, v43, v35",
+]
+
+
+def swaprel_reference(w0, w1, w2, w3):
+    """Independent reference for SWAPREL_BODY: list swaps, read both sides before writing."""
+    weighted = lambda bank: bank[0] + 2.0 * bank[1] + 4.0 * bank[2] + 8.0 * bank[3]
+    regs = {24 + k: v for k, v in enumerate((10.0, 20.0, 40.0, 80.0, 1.0, 2.0, 3.0, 4.0))}
+    regs.update({36 + k: v for k, v in enumerate((10.0, 20.0, 40.0, 80.0, 1.0, 2.0, 3.0, 4.0))})
+
+    def swap(dst, src, m0):
+        d, s = dst + ((m0 >> 16) & 0x3ff), src + (m0 & 0x3ff)
+        regs[d], regs[s] = regs[s], regs[d]
+
+    swap(24, 28, w3 & 0x30003)
+    swap(36, 36, 0x30001)
+    swap(36, 36, 0x20002)
+    swap(36, 40, 0x20001)
+    expected = tuple(weighted([regs[b + k] for k in range(4)]) for b in (24, 28, 36, 40))
+    for x in expected:
+        assert single(x) == x == half_rtz(x), x
+    return expected
+
+
+# Scalar s_movrel* (#1882): each channel moves cbuffer-indexed SGPR words and exports their weighted sum.
+# R: s_movrels_b32 (dynamic m0 = word0 & 3, static m0 = 2). G: s_movreld_b32 into s64..s67 (dynamic m0 = word1 & 3,
+# static m0 = 1). B: the _b64 forms (static s_movrels_b64 with m0 = 2; s_movreld_b64 with the even dynamic
+# m0 = (word0 & 1) * 2) into s76..s79. A: s_movrelsd_2_b32 into s80..s83 (dynamic m0 = word3 & 0x30003, static
+# m0 = 0x20001).
+SMOVREL_BODY = [
+    "s_mov_b32 s60, 10",
+    "s_mov_b32 s61, 20",
+    "s_mov_b32 s62, 40",
+    "s_mov_b32 s63, 80",
+    # R
+    "s_bfe_u32 s56, s44, 0x20000",
+    "s_mov_b32 m0, s56",
+    "s_movrels_b32 s70, s60",
+    "s_mov_b32 m0, 2",
+    "s_movrels_b32 s71, s60",
+    "v_cvt_f32_u32_e32 v20, s70",
+    "v_cvt_f32_u32_e32 v21, s71",
+    "v_add_f32_e32 v12, v20, v21",
+    # G
+    "s_mov_b32 s64, 1",
+    "s_mov_b32 s65, 2",
+    "s_mov_b32 s66, 3",
+    "s_mov_b32 s67, 4",
+    "s_mov_b32 s72, 5",
+    "s_bfe_u32 s57, s45, 0x20000",
+    "s_mov_b32 m0, s57",
+    "s_movreld_b32 s64, s72",
+    "s_mov_b32 s72, 7",
+    "s_mov_b32 m0, 1",
+    "s_movreld_b32 s64, s72",
+    "v_cvt_f32_u32_e32 v24, s64",
+    "v_cvt_f32_u32_e32 v25, s65",
+    "v_cvt_f32_u32_e32 v26, s66",
+    "v_cvt_f32_u32_e32 v27, s67",
+    "v_fma_f32 v28, 2.0, v25, v24",
+    "v_fma_f32 v28, 4.0, v26, v28",
+    "v_fma_f32 v13, 0x41000000, v27, v28",
+    # B
+    "s_mov_b32 s76, 1",
+    "s_mov_b32 s77, 2",
+    "s_mov_b32 s78, 3",
+    "s_mov_b32 s79, 4",
+    "s_mov_b32 m0, 2",
+    "s_movrels_b64 s[74:75], s[60:61]",
+    "s_mov_b32 s68, s44",
+    "s_mov_b32 s69, 0",
+    "s_and_b64 s[68:69], s[68:69], 1",
+    "s_lshl_b64 s[68:69], s[68:69], 1",
+    "s_mov_b32 m0, s68",
+    "s_movreld_b64 s[76:77], s[74:75]",
+    "v_cvt_f32_u32_e32 v32, s76",
+    "v_cvt_f32_u32_e32 v33, s77",
+    "v_cvt_f32_u32_e32 v34, s78",
+    "v_cvt_f32_u32_e32 v35, s79",
+    "v_fma_f32 v36, 2.0, v33, v32",
+    "v_fma_f32 v36, 4.0, v34, v36",
+    "v_fma_f32 v14, 0x41000000, v35, v36",
+    # A
+    "s_mov_b32 s80, 1",
+    "s_mov_b32 s81, 2",
+    "s_mov_b32 s82, 3",
+    "s_mov_b32 s83, 4",
+    "s_mov_b32 s84, s47",
+    "s_mov_b32 s85, 0",
+    "s_and_b64 s[84:85], s[84:85], 0x30003",
+    "s_mov_b32 m0, s84",
+    "s_movrelsd_2_b32 s80, s60",
+    "s_mov_b32 m0, 0x20001",
+    "s_movrelsd_2_b32 s80, s60",
+    "v_cvt_f32_u32_e32 v40, s80",
+    "v_cvt_f32_u32_e32 v41, s81",
+    "v_cvt_f32_u32_e32 v42, s82",
+    "v_cvt_f32_u32_e32 v43, s83",
+    "v_fma_f32 v44, 2.0, v41, v40",
+    "v_fma_f32 v44, 4.0, v42, v44",
+    "v_fma_f32 v15, 0x41000000, v43, v44",
+]
+
+
+def smovrel_reference(w0, w1, w2, w3):
+    """Independent reference for SMOVREL_BODY on a list of SGPR words."""
+    bank = [10, 20, 40, 80]
+    weighted = lambda b: b[0] + 2 * b[1] + 4 * b[2] + 8 * b[3]
+    r = bank[w0 & 3] + bank[2]
+    g = [1, 2, 3, 4]
+    g[w1 & 3] = 5
+    g[1] = 7
+    b = [1, 2, 3, 4]
+    off = (w0 & 1) * 2
+    b[off], b[off + 1] = bank[2], bank[3]
+    a = [1, 2, 3, 4]
+    a[(w3 >> 16) & 3] = bank[w3 & 3]
+    a[2] = bank[1]
+    expected = tuple(float(x) for x in (r, weighted(g), weighted(b), weighted(a)))
+    for x in expected:
+        assert single(x) == x == half_rtz(x), x
+    return expected
+
+
+def smovrel_descriptor_programs():
+    """The sampled program with its texture descriptor pointer first moved to s[72:73], once by s_movrels_b64 with a
+    static m0 and once by two s_mov_b32: the translations must be equal, so a static move keeps a tracked pointer."""
+    def program(move):
+        base = assembly(False)
+        at = base.index("s_mov_b32 s21, 0") + 1
+        moved = base[:at] + move + base[at:]
+        return [line.replace("s_load_dwordx8 s[28:35], s[20:21], null", "s_load_dwordx8 s[28:35], s[72:73], null")
+                for line in moved]
+    return (program(["s_mov_b32 m0, 4", "s_movrels_b64 s[72:73], s[16:17]"]),
+            program(["s_mov_b32 s72, s20", "s_mov_b32 s73, s21"]))
+
+
+def check_smovrel_draw(directory, compiler, renderer, backend):
+    program = with_constants(SMOVREL_BODY)
+    source = directory / "smovrel.hlsl"
+    shader = directory / "smovrel.cso"
+    case = directory / "smovrel.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    references = [smovrel_reference(*words) for words in DPP_MOVREL_SETS]
+    if references[0] == references[1]:
+        raise AssertionError("The two constant sets do not tell the dynamic m0 offsets apart")
+    for words, expected in zip(DPP_MOVREL_SETS, references):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    print(f"scalar movrel: static and dynamic s_movrels/s_movreld (b32, b64) and s_movrelsd_2 matched {references}")
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *DPP_MOVREL_SETS[0])
+    case.write_bytes(constants + struct.pack("<4f", *references[0]) * 64)
+    for old, new, label in (
+        ("s_mov_b32 m0, s56", "s_mov_b32 m0, 0", "s_movrels_b32 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, s57", "s_mov_b32 m0, 0", "s_movreld_b32 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, s68", "s_mov_b32 m0, 0", "s_movreld_b64 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, 0x20001", "s_mov_b32 m0, 0x10002", "s_movrelsd_2_b32 with the static m0 halves swapped"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Control {label} escaped detection")
+        print(f"control {label}: pixel mismatch, as required")
+    return 0
+
+
+def check_swaprel_draw(directory, compiler, renderer, backend):
+    program = with_constants(SWAPREL_BODY)
+    source = directory / "swaprel.hlsl"
+    shader = directory / "swaprel.cso"
+    case = directory / "swaprel.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    hlsl = translate(program)
+    if "QuadRead" in hlsl or "swap_soff" not in hlsl:
+        raise AssertionError("v_swaprel_b32 was not lowered through the per-lane swap")
+    source.write_text(hlsl, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    references = [swaprel_reference(*words) for words in SWAPREL_SETS]
+    if references[0] == references[1]:
+        raise AssertionError("The two constant sets do not tell the dynamic m0 offsets apart")
+    for words, expected in zip(SWAPREL_SETS, references):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    print(f"swaprel: dynamic, overlapping, equal-index and static swaps matched {references}")
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *SWAPREL_SETS[0])
+    case.write_bytes(constants + struct.pack("<4f", *references[0]) * 64)
+    for old, new, label in (
+        ("v_swaprel_b32 v24, v28", "v_movrelsd_2_b32_e32 v24, v28", "a one-way move instead of the dynamic swap"),
+        ("s_mov_b32 m0, 0x20001", "s_mov_b32 m0, 0x10002", "the static m0 halves swapped"),
+        ("s_mov_b32 m0, s64", "s_mov_b32 m0, 0", "the dynamic m0 ignored"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Control {label} escaped detection")
+        print(f"control {label}: pixel mismatch, as required")
     return 0
 
 
@@ -23074,11 +23745,14 @@ def main():
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers", "draw-sopk-hwreg",
-                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
+                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-smovrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-cvt": check_dpp_cvt_draw,
                         "draw-dpp-movrel": check_dpp_movrel_draw,
+                        "draw-plain-movrel": check_plain_movrel_draw,
+                        "draw-swaprel": check_swaprel_draw,
+                        "draw-smovrel": check_smovrel_draw,
                         "draw-dpp-extra": check_dpp_extra_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
