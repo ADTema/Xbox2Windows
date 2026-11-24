@@ -127,7 +127,7 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
 The startup shader cache key includes the translator revision. After updating from
-the earlier wide-descriptor translation, run the recording build once to emit
+an earlier translation revision, run the recording build once to emit
 requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
 then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
@@ -168,6 +168,12 @@ These are measured on one executable; treat them as hypotheses for others.
   a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
   (`ctest --preset release --no-tests=error -R "^startup_image_3d_"`).
+- **Flat parameters.** `v_interp_mov_f32` reads a `nointerpolation uint4` copy written from the
+  exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
+  constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
+  ([#1259](https://github.com/R0Y00/Xbox2Windows/issues/1259)). Colour exports of constant integer
+  words still go through `float4` and have the same loss. Reproduce with
+  `ctest --preset release --no-tests=error -R "^startup_flat_param_"`.
 - **Stream-cache identity.** A cached zlib stream is served only to the exact queued
   continuation entries in the same DirectStorage queue. The lookup checks the enqueued request
   id, the source, the compressed size and the destination chunk size. A later independent
