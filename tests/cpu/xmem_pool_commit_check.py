@@ -3,7 +3,7 @@
 tests/cpu/xmem_pool_commit.asm imports XMemVirtualAlloc by name from xmem.dll, VirtualQuery,
 VirtualFree, SetLastError and GetLastError from kernel32.dll, and finish_exe (exe_startup.asm) from
 cpu_exe_io.dll. Its body returns 0x870 when every step passes, or 0xF00 + the first failing step. The
-reserve_only, dirty, accepted_refusal, host_fit and skip_release variants are negative controls with
+reserve_only, misaligned, dirty, accepted_refusal, host_fit and skip_release variants are negative controls with
 known failing steps. A provider without XMemVirtualAlloc must stop the mapping before the entry point.
 """
 import ctypes
@@ -18,7 +18,7 @@ from exe_process import launch
 from native_map_check import Mapper, STATUS, kernel
 
 PASS = 0x870
-EXPECTED = {"original": PASS, "reserve_only": 0xF02, "dirty": 0xF03, "accepted_refusal": 0xF0F,
+EXPECTED = {"original": PASS, "reserve_only": 0xF02, "misaligned": 0xF02, "dirty": 0xF03, "accepted_refusal": 0xF0F,
             "host_fit": 0xF17, "skip_release": 0xF19}
 EXPORT = "XMemVirtualAlloc"
 XMEM, IO = "xmem.dll", "cpu_exe_io.dll"
@@ -69,8 +69,9 @@ def mapped(mapper_path, image, xmem, io, omit=""):
     return json.loads(result.stdout)
 
 
-def main(mapper_path, original, reserve_only, dirty, accepted_refusal, host_fit, skip_release, xmem, io):
-    images = {"original": original, "reserve_only": reserve_only, "dirty": dirty,
+def main(mapper_path, original, reserve_only, misaligned, dirty, accepted_refusal, host_fit, skip_release,
+         xmem, io):
+    images = {"original": original, "reserve_only": reserve_only, "misaligned": misaligned, "dirty": dirty,
               "accepted_refusal": accepted_refusal, "host_fit": host_fit, "skip_release": skip_release}
     with TemporaryDirectory() as temp:
         for name, image in images.items():

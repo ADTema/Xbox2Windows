@@ -3619,8 +3619,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_xmem_physical_skip_release>" "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_xmem_physical_pair PROPERTIES TIMEOUT 120)
     # An EXE that imports XMemVirtualAlloc by name and uses the three reserve+commit startup call shapes
-    # (#870), started by Windows and by pe_map. The five variants after original are negative controls.
-    foreach(variant IN ITEMS original reserve_only dirty accepted_refusal host_fit skip_release)
+    # (#870), started by Windows and by pe_map. The six variants after original are negative controls.
+    foreach(variant IN ITEMS original reserve_only misaligned dirty accepted_refusal host_fit skip_release)
         add_executable(cpu_xmem_pool_${variant} tests/cpu/xmem_pool_commit.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_xmem_pool_${variant} PROPERTIES LINKER_LANGUAGE CXX)
         target_link_options(cpu_xmem_pool_${variant} PRIVATE /ENTRY:native_startup
@@ -3628,6 +3628,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         target_link_libraries(cpu_xmem_pool_${variant} PRIVATE xmem_shim cpu_exe_io kernel32)
     endforeach()
     target_compile_definitions(cpu_xmem_pool_reserve_only PRIVATE RESERVE_ONLY)
+    target_compile_definitions(cpu_xmem_pool_misaligned PRIVATE MISALIGNED)
     target_compile_definitions(cpu_xmem_pool_dirty PRIVATE DIRTY)
     target_compile_definitions(cpu_xmem_pool_accepted_refusal PRIVATE ACCEPTED_REFUSAL)
     target_compile_definitions(cpu_xmem_pool_host_fit PRIVATE HOST_FIT)
@@ -3635,6 +3636,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_xmem_pool_commit COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/xmem_pool_commit_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_xmem_pool_original>" "$<TARGET_FILE:cpu_xmem_pool_reserve_only>"
+        "$<TARGET_FILE:cpu_xmem_pool_misaligned>"
         "$<TARGET_FILE:cpu_xmem_pool_dirty>" "$<TARGET_FILE:cpu_xmem_pool_accepted_refusal>"
         "$<TARGET_FILE:cpu_xmem_pool_host_fit>" "$<TARGET_FILE:cpu_xmem_pool_skip_release>"
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:cpu_exe_io>")

@@ -7,8 +7,11 @@
 ; Synthetic sizes and patterns only. The body returns 870h when every step passes, otherwise
 ; 0F00h + the number of the first failing step. For each block (A: steps 1-4, B: 5-8, C: 9-12):
 ;   +0  XMemVirtualAlloc returns a block (A 4 MiB, B 2 MiB + 64 KiB, C 1 MiB + 192 KiB)
-;   +1  64 KiB aligned; VirtualQuery: base and allocation base, exact size, MEM_COMMIT,
-;       PAGE_READWRITE, MEM_PRIVATE
+;   +1  aligned to 2 MiB (A, B: MEM_LARGE_PAGES type) or 64 KiB (C: MEM_64K_PAGES type);
+;       VirtualQuery: base and allocation base, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE, and a
+;       region size equal to the requested size; the byte just past the block belongs to another
+;       allocation or none, so the reservation is not rounded up (B's size is not a multiple of
+;       2 MiB)
 ;   +2  every byte reads zero
 ;   +3  a block-specific pattern written to the first and last QWORD of each 64 KiB page (so also
 ;       the first and last QWORD of the block) reads back
@@ -29,7 +32,8 @@
 ;   24  A, B and C still hold their patterns
 ;   25  VirtualFree releases A, B and C, and each then reads as MEM_FREE
 ; Negative controls: RESERVE_ONLY takes A from the accepted reserve-only call (16 GiB, 20402000h,
-; 21h, PAGE_READWRITE) and must fail at step 2 (expected 0F02h); DIRTY writes one nonzero QWORD at
+; 21h, PAGE_READWRITE) and must fail at step 2 (expected 0F02h); MISALIGNED applies A's 2 MiB check
+; to A + 64 KiB, a base that is 64 KiB aligned but not 2 MiB aligned (0F02h); DIRTY writes one nonzero QWORD at
 ; the end of A before step 3 (0F03h); ACCEPTED_REFUSAL passes A's pair at step 15 (0F0Fh); HOST_FIT
 ; uses a 4 MiB size at step 23 (0F17h); SKIP_RELEASE does not free A at step 25 (0F19h).
 EXTERN __imp_XMemVirtualAlloc:QWORD
@@ -44,6 +48,7 @@ SIZE_A          EQU 400000h
 SIZE_B          EQU 210000h
 SIZE_C          EQU 130000h
 PAGE_64K        EQU 10000h
+ALIGN_2M        EQU 200000h
 PATTERN         EQU 5A3C96E187F00F78h
 MEM_COMMIT      EQU 1000h
 MEM_FREE        EQU 10000h
@@ -92,10 +97,16 @@ QUERY MACRO address
     jne failed
 ENDM
 
-; Steps +1 to +3 for a block held in `block` with size `bytes`.
-VERIFY MACRO block, bytes
+; Steps +1 to +3 for a block held in `block` with size `bytes` and base alignment `align`.
+VERIFY MACRO block, bytes, align
     inc ebx
-    test block, PAGE_64K - 1
+    mov rax, block
+IFDEF MISALIGNED
+  IFIDNI <block>, <r12>
+    add rax, PAGE_64K
+  ENDIF
+ENDIF
+    test rax, align - 1
     jnz failed
     QUERY block
     cmp [rsp+MBI_BASE], block
@@ -111,6 +122,11 @@ VERIFY MACRO block, bytes
     jne failed
     cmp DWORD PTR [rsp+MBI_TYPE], MEM_PRIVATE
     jne failed
+    mov rax, bytes
+    add rax, block
+    QUERY rax
+    cmp [rsp+MBI_ALLOC_BASE], block
+    je failed
     inc ebx
 IFDEF DIRTY
   IFIDNI <block>, <r12>
@@ -236,21 +252,21 @@ ENDIF
     test rax, rax
     jz failed
     mov r12, rax
-    VERIFY r12, SIZE_A              ; steps 2-4
+    VERIFY r12, SIZE_A, ALIGN_2M    ; steps 2-4
 
     inc ebx                         ; step 5
     XVA 0, SIZE_B, POOL_TYPE, 283h, 2404h
     test rax, rax
     jz failed
     mov r13, rax
-    VERIFY r13, SIZE_B              ; steps 6-8
+    VERIFY r13, SIZE_B, ALIGN_2M    ; steps 6-8
 
     inc ebx                         ; step 9
     XVA 0, SIZE_C, PAGES_64K_TYPE, 181h, PAGE_READWRITE
     test rax, rax
     jz failed
     mov r14, rax
-    VERIFY r14, SIZE_C              ; steps 10-12
+    VERIFY r14, SIZE_C, PAGE_64K    ; steps 10-12
 
     REFUSE 0, SIZE_A, 20002000h, 183h, 22004h               ; step 13
     REFUSE 0, SIZE_C, 20402000h, 181h, PAGE_READWRITE       ; step 14

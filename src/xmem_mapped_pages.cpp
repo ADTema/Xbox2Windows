@@ -235,13 +235,17 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
 // for type 0x20003000 with 0x183/0x22004 or 0x283/0x2404, and later startup code for type
 // 0x20403000 (64 KiB pages) with 0x181/PAGE_READWRITE, each with a null base. Proposed
 // desktop policy: commit a fresh block of ordinary zero-filled read/write pages, whose size
-// must be a nonzero multiple of 64 KiB. The page-size request and the console protection bits
-// above PAGE_READWRITE are not reproduced. A host failure returns NULL with the host error.
+// must be a nonzero multiple of 64 KiB and is committed exactly, without rounding. The
+// MEM_LARGE_PAGES type gets a 2 MiB-aligned base (the x64 large-page size); the
+// MEM_64K_PAGES type (MEM_LARGE_PAGES | MEM_PHYSICAL) keeps the 64 KiB allocation
+// granularity. Large pages themselves and the console protection bits above PAGE_READWRITE
+// are not reproduced. A host failure returns NULL with the host error.
 static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG attributes,
                                   DWORD protection) noexcept
 {
     constexpr SIZE_T granularity = SIZE_T{64} << 10;
-    const bool supported = allocation_type == 0x20003000
+    const bool large_pages = allocation_type == 0x20003000;
+    const bool supported = large_pages
                                ? (attributes == 0x183 && protection == 0x22004)
                                      || (attributes == 0x283 && protection == 0x2404)
                                : attributes == 0x181 && protection == PAGE_READWRITE;
@@ -249,7 +253,14 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!large_pages) return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    MEM_ADDRESS_REQUIREMENTS requirements{};
+    requirements.Alignment = SIZE_T{2} << 20;
+    MEM_EXTENDED_PARAMETER parameter{};
+    parameter.Type = MemExtendedParameterAddressRequirements;
+    parameter.Pointer = &requirements;
+    return VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
+                         &parameter, 1);
 }
 
 // The startup commit profile above, and the reserve-only desktop profile from the source-built
