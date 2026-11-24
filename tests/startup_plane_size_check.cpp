@@ -69,19 +69,37 @@ int main(int argc, char** argv)
     answered("d32s8 1x1 4 samples", texture(19, 1, 1, 4), {0x400000, 0x400000}, 0x20000);
     answered("rgba8 1920x1080 4 samples", texture(28, 1920, 1080, 4), {0x2000000, 0x400000}, pad(0x1FE0000, 0x1FB0000));
     answered("rgba16f 64x64 2 samples, 3 slices", texture(10, 64, 64, 2, 3), {0x400000, 0x400000}, 0x30000);
+    // Additional MSAA colour families (R32G32B32A32, R16G16, R32, R16, R8) and D24_UNORM_S8_UINT.
+    answered("rgba32f 100x100 4 samples", texture(2, 100, 100, 4), {0x400000, 0x400000}, pad(0x100000, 0xA0000));
+    answered("rgba32f at the largest dimensions", texture(2, 16384, 16384, 8, 2048), {0x500000000000, 0x400000}, 0x400000000000);
+    answered("rg16f 1920x1080 4 samples", texture(34, 1920, 1080, 4), {0x2000000, 0x400000}, pad(0x1FE0000, 0x1FB0000));
+    answered("rg16_typeless 64x64 4 samples", texture(33, 64, 64, 4), {0x400000, 0x400000}, 0x10000);
+    answered("r32f 1280x720 2 samples", texture(41, 1280, 720, 2), {0x800000, 0x400000}, pad(0x780000, 0x710000));
+    answered("r32_typeless 128x128 4 samples", texture(39, 128, 128, 4), {0x400000, 0x400000}, 0x40000);
+    answered("r16f 300x200 4 samples", texture(54, 300, 200, 4), {0x400000, 0x400000}, pad(0xC0000, 0x80000));
+    answered("r8 256x256 4 samples", texture(61, 256, 256, 4), {0x400000, 0x400000}, 0x40000);
+    answered("r8 300x300 2 samples", texture(61, 300, 300, 2), {0x400000, 0x400000}, pad(0x60000, 0x30000));
+    answered("d24s8 1x1 4 samples", texture(45, 1, 1, 4), {0x400000, 0x400000}, 0x20000);
+    answered("d24s8 2560x1440 4 samples", texture(45, 2560, 1440, 4), {0x4C00000, 0x400000}, pad(0x4880000, 0x4650000));
+    answered("r24g8_typeless 1024x1024", texture(44, 1024, 1024), {0x800000, 0x10000}, 0x500000);
 
     // Left alone: formats with the same size on both sides, mip chains, other dimensions, sample
     // counts and formats outside the rule, and a console size that is not smaller.
     left_alone("rgba8 single sample", texture(28, 2560, 1440), {0xF00000, 0x10000});
+    left_alone("rg16f single sample", texture(34, 1024, 1024), {0x400000, 0x10000});
     left_alone("d32 without stencil", texture(40, 2560, 1440), {0xF00000, 0x10000});
-    left_alone("d24s8", texture(45, 2560, 1440), {0xF00000, 0x10000});
+    left_alone("d24s8 single sample already smaller", texture(45, 2560, 1440), {0xF00000, 0x10000});
     left_alone("d32s8 with mips", texture(19, 1024, 1024, 1, 1, 3), {0xA80000, 0x10000});
-    left_alone("r8 4 samples", texture(61, 256, 256, 4), {0x400000, 0x400000});
+    left_alone("bc1 4 samples", texture(71, 256, 256, 4), {0x400000, 0x400000});
+    left_alone("rgb32f 4 samples", texture(6, 256, 256, 4), {0x400000, 0x400000});
     left_alone("rgba8 3 samples", texture(28, 256, 256, 3), {0x400000, 0x400000});
+    left_alone("rgba32f 3 samples", texture(2, 256, 256, 3), {0x400000, 0x400000});
     left_alone("d32s8 already smaller", texture(19, 2048, 2048), {0x1400000, 0x10000});
     // A desktop failure is kept for desktop formats, valid shape or not.
     left_alone("d32s8 after a desktop failure", texture(19, 2048, 2048), {~0ull, 0});
+    left_alone("d24s8 after a desktop failure", texture(45, 2048, 2048), {~0ull, 0});
     left_alone("rgba8 4 samples after a desktop failure", texture(28, 256, 256, 4), {~0ull, 0});
+    left_alone("rgba32f 4 samples after a desktop failure", texture(2, 256, 256, 4), {~0ull, 0});
     // Shapes outside the rule keep whatever desktop said, including for the console-only formats.
     D3D12_RESOURCE_DESC shape = texture(19, 2048, 2048);
     shape.Width = ~0ull;  // would wrap while padding to a tile
@@ -131,6 +149,6 @@ int main(int argc, char** argv)
         std::printf("startup_plane_size: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_plane_size: PASS (13 answered, 25 left alone)\n");
+    std::printf("startup_plane_size: PASS (24 answered, 29 left alone)\n");
     return 0;
 }
