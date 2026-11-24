@@ -110,7 +110,9 @@ on each call. Heaps whose desktop start is an address are unchanged, so nothing 
 adapter whose handles are addresses.
 
 - `ctest --preset release --no-tests=error -R '^startup_title_heap(_tags_control)?$' -V`: the
-  rule, without a device.
+  rule, without a device. `ctest --preset release --no-tests=error -R '^startup_title_heap$' -V`
+  also checks that for an aligned view heap and a tagged sampler heap without memory of their own,
+  the allocator is asked for the whole heap's size and its address becomes the heap's memory.
 - `ctest --preset release --no-tests=error -R '^startup_title_heap_device_' -V`: through the
   wrapper, the starts of two sampler heaps, a render-target heap and a depth heap must be aligned
   addresses, a heap whose desktop start is tagged must have memory of its own, and three samplers
@@ -179,6 +181,9 @@ Then:
 ```
 
 `run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
+It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment exists, because
+`-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
+`PATH`.
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
 socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). It writes:
 
@@ -188,6 +193,12 @@ socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do no
 | `<log>/events.txt` | module loads and every exception with its time |
 | `<log>/stderr.txt` | the stand-ins' logs (`x2w-d3d12`, `x2w-dstorage`, `x2w-xmem`, `x2w-runtime`, ...) |
 | `<log>/files.txt` | every file the process opened |
+
+`run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
+the process could not be created, 0 when the debugger finished its report, whatever the process
+did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_ps1`): on Windows it
+runs the script on a stub debugger under Windows PowerShell and `pwsh`, elsewhere it checks the
+script text only.
 
 `tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
@@ -266,7 +277,7 @@ ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?
 | `X2W_AUDIO_PERMISSIVE=1` | audio HAL / APU stand-ins accept their calls (no output) |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
-| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is handed to the executable with a trailing separator, added when missing, because the executable appends names to it as it is; up to 258 characters, a longer value is refused with a log line and `S:\` is used (`src/startup_stubs/storage_root.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`) |
+| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
@@ -605,9 +616,11 @@ longer exhausts the heap. While nothing has been freed the offsets are the ones 
   already freed) is `E_INVALIDARG` and changes nothing.
 - `ApuIsVirtualAddressValid` and the two map calls still test the whole heap range, not live blocks.
 
-The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4) is unchanged. The source-built
-check loads the stub, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment, coalescing and every refused
-call, then runs 4 threads of 1000 rounds against an interval map of live blocks:
+The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4) returns `E_NOTIMPL`,
+rolling back any already allocated XMA block and zeroing its output pointer and APU address. The source-built
+check loads the stub, checks non-permissive traps, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment,
+coalescing, every refused call, shape-context allocation and partial-failure rollback, `AcpHalCreate`, and the
+address validity/mapping exports, then runs 4 threads of 1000 rounds against an interval map of live blocks:
 
 ```
 ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V

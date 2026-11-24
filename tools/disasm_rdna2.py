@@ -2372,7 +2372,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         length = 4
         is_64 = op_name.endswith(("_b64", "_u64", "_i64"))
         dst_64 = (is_64 and not op_name.startswith(("s_bcnt0_i32_", "s_bcnt1_i32_", "s_ff0_i32_", "s_ff1_i32_", "s_flbit_i32_"))) or op_name == "s_bitreplicate_b64_b32"
-        src0_64 = is_64 and op_name != "s_bitreplicate_b64_b32"
+        src0_64 = is_64 and op_name not in ("s_bitreplicate_b64_b32", "s_bitset0_b64", "s_bitset1_b64")
         if ssrc0 == 255:
             if offset + 8 > len(data):
                 return (4, "sop1_truncated", f"{op_name} <truncated>", "Incomplete SOP1 literal")
@@ -2490,8 +2490,11 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if src0 in VOP_EXTENSION_FORMS:
             return _vop_extension(data, offset, "vop1", op_name, src0)
         length = 4
-        wide_dst = op_name.startswith(("v_cvt_f64_i32", "v_cvt_f64_u32", "v_cvt_f64_f32")) or op_name.endswith(("_f64_e32", "_f64"))
-        wide_src0 = op_name.startswith(("v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64", "v_frexp_exp_i32_f64")) or op_name.endswith(("_f64_e32", "_f64"))
+        # A 32-bit result from a binary64 source: the name ends in _f64 but the destination is one VGPR.
+        narrow_dst = op_name.startswith(("v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64", "v_frexp_exp_i32_f64"))
+        wide_dst = op_name.startswith(("v_cvt_f64_i32", "v_cvt_f64_u32", "v_cvt_f64_f32")) or (
+            op_name.endswith(("_f64_e32", "_f64")) and not narrow_dst)
+        wide_src0 = narrow_dst or op_name.endswith(("_f64_e32", "_f64"))
         if src0 == 255:
             if offset + 8 > len(data):
                 return (4, "vop1_truncated", f"{op_name} <truncated>", "Incomplete VOP1 literal")
