@@ -113,6 +113,21 @@ inline int decode(Stream& s, const Huffman& h) noexcept
     return -1;
 }
 
+// Writes length bytes from distance back (distance >= 1, both already checked) and nothing past them.
+inline void copy_match(unsigned char* out, std::size_t distance, std::size_t length) noexcept
+{
+    const unsigned char* from = out - distance;
+    if (fast_bits > 0 && distance >= 8 && length >= 8) {
+        // No chunk overlaps its source; the last one ends at the match end and rewrites bytes already final.
+        for (; length > 8; length -= 8, out += 8, from += 8) std::memcpy(out, from, 8);
+        std::memcpy(out + length - 8, from + length - 8, 8);
+    } else if (fast_bits > 0 && distance == 1) {
+        std::memset(out, from[0], length);
+    } else {
+        for (std::size_t i = 0; i < length; ++i) out[i] = from[i];
+    }
+}
+
 inline bool codes(Stream& s, const Huffman& lencode, const Huffman& distcode) noexcept
 {
     static const std::uint16_t length_base[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
@@ -146,7 +161,8 @@ inline bool codes(Stream& s, const Huffman& lencode, const Huffman& distcode) no
                 s.overflow = true;
                 return false;
             }
-            for (std::size_t i = 0; i < length; ++i, ++s.out_pos) s.out[s.out_pos] = s.out[s.out_pos - distance];
+            copy_match(s.out + s.out_pos, distance, length);
+            s.out_pos += length;
         }
     }
 }
