@@ -338,7 +338,7 @@ bool dstorage_status_initial_checks() {
 
     // Hold the queue's worker in a fence signal, then enqueue a status into slot 2 behind it.
     void* queue_ptr = nullptr;
-    unsigned char desc[0x20] = {};
+    alignas(void*) unsigned char desc[40] = {};
     *reinterpret_cast<uint16_t*>(desc + 8) = 16;
     if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr)
         return false;
