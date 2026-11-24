@@ -5023,6 +5023,19 @@ class TestRdna2Scanner(unittest.TestCase):
             result = scan()
             self.assertIn("Full Shaders Accepted by Translator:       0", result.stdout)
 
+    def test_parse_assembly_file_skips_bom_and_commented_labels(self):
+        """A UTF-8 BOM and llc-style commented labels are not instructions; a ':' in a comment keeps the line."""
+        from scan_unsupported_shaders import parse_assembly_file
+        with tempfile.TemporaryDirectory() as tmp:
+            bom = Path(tmp) / "bom.s"
+            bom.write_bytes(b"\xef\xbb\xbfs_endpgm\n")
+            self.assertEqual(parse_assembly_file(bom), ["s_endpgm"])
+            labels = Path(tmp) / "labels.s"
+            labels.write_text("pixel:                                  ; @pixel\n"
+                              ".LBB0_1:                                ; %bb.1\n"
+                              "s_endpgm ; done:\n", encoding="utf-8")
+            self.assertEqual(parse_assembly_file(labels), ["s_endpgm ; done:"])
+
     def test_binary_scan_recognizes_vop1_cvt_off_sat_pack_and_swap_opcodes(self):
         """The scan report names the four VOP1 forms instead of listing v_vop1_NN as unknown opcodes."""
         shader = bytes.fromhex(
