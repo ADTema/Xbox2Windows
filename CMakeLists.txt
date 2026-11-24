@@ -1075,6 +1075,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(startup_stubs PROPERTIES TIMEOUT 120)
     add_test(NAME startup_uniform_lane COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
+    # VOP1/VOP2 sub-dword addressing (SDWA) in the translator (#1141), checked against the pixel AOT
+    # lowering of the same selections.
+    add_test(NAME startup_gfx2hlsl_sdwa COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_check.py")
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
     # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
     find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")
@@ -1133,7 +1137,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Registered unconditionally: without the tools the wrapper reports a skip (77) rather than the
     # tests silently disappearing. Hosted CI sets X2W_REQUIRE_SPIRV_TOOLS=1 to turn skips into failures.
     foreach(adapter IN ITEMS hardware warp)
-        foreach(bridge IN ITEMS address_window:draw address_window_atomic:atomic address_window_qword:qword
+        foreach(bridge IN ITEMS address_window:draw address_window_atomic:atomic address_window_signed:address_signed
+                                address_window_qword:qword
                                 sampler_views:sampler ballot_extract:ballot
                                 compaction:compaction compare_sampler:compare_sampler minlod:minlod
                                 minlod_exact:minlod_exact minlod_levels:minlod_levels
@@ -2087,7 +2092,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_float_${variant} scalar_float)
         cpu_translation(cpu_float_${variant} cpu_sse_aot
-            "blend_ss=f:ffqf,blend_sd=d:ddqd,convert=q:fdq,from_int=d:qq,classify_ss=q:ff,classify_sd=q:dq,round_trip=f:f,zero_xorps=d:d,zero_pxor=d:d,zero_xorpd=d:d,probe_ss=q:qff,neg_jcc=q:q,setcc_mix=q:qqq,cmovcc_mix=q:qqq")
+            "blend_ss=f:ffqf,blend_sd=d:ddqd,convert=q:fdq,from_int=d:qq,classify_ss=q:ff,classify_sd=q:dq,round_trip=f:f,zero_xorps=d:d,zero_pxor=d:d,zero_xorpd=d:d,probe_ss=q:qff,neg_jcc=q:q,setcc_mix=q:qqq,cmovcc_mix=q:qqq,min_ss=f:ffq,max_ss=f:ffq,min_sd=d:ddq,max_sd=d:ddq,root_ss=f:fq,root_sd=d:dq,root_const_ss=f:,root_const_sd=d:")
         add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cpu_float_${variant}_lifted.cpp" APPEND
             DEPENDS tools/cpu_switch_aot.py)
     endforeach()
@@ -2095,7 +2100,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_scalar_float COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/scalar_float_check.py"
         "$<TARGET_FILE:cpu_float_original>" "$<TARGET_FILE:cpu_float_original_lifted>"
-        "$<TARGET_FILE:cpu_float_swapped>" "$<TARGET_FILE:cpu_float_swapped_lifted>")
+        "$<TARGET_FILE:cpu_float_swapped>" "$<TARGET_FILE:cpu_float_swapped_lifted>" "$<TARGET_FILE:cpu_mxcsr_harness>")
     set(cpu_fma3_exports
         "op_vfmadd132ps_xmm,op_vfmadd132ps_ymm,op_vfmadd132pd_xmm,op_vfmadd132pd_ymm,op_vfmadd132ss,op_vfmadd132sd,"
         "op_vfmadd213ps_xmm,op_vfmadd213ps_ymm,op_vfmadd213pd_xmm,op_vfmadd213pd_ymm,op_vfmadd213ss,op_vfmadd213sd,"
@@ -3051,6 +3056,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The opt-in host-MXCSR profile: the lifted DLL, the noload and fixed controls that must break a rule, and
     # an /O2 build of the translation.
     cpu_asm_fixture(cpu_mxcsr_harness mxcsr_harness)
+    # The scalar float check loads the harness, and $<TARGET_FILE:> adds no build dependency, so the
+    # two translations the documented build names must build it too.
+    add_dependencies(cpu_float_original_lifted cpu_mxcsr_harness)
+    add_dependencies(cpu_float_swapped_lifted cpu_mxcsr_harness)
     cpu_asm_fixture(cpu_mxcsr mxcsr)
     set(mxcsr_controls)
     foreach(variant IN ITEMS lifted noload fixed)
