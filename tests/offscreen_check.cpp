@@ -999,6 +999,22 @@ OperationResult run_startup_sampler_x(const OperationContext& ctx)
                          "skip: R32_FLOAT does not report filtered sampling with mips");
 }
 
+// --startup-sampler-heap <vs.cso> <ps.cso> <byte offset> <expected red bits>: draws one pixel with a
+// gfx2hlsl pixel shader that indexes its sampler table at run time (tests/startup_sampler_heap.cpp).
+OperationResult run_startup_sampler_heap(const OperationContext& ctx)
+{
+    const auto offset = static_cast<std::uint32_t>(std::stoul(ctx.argv[5], nullptr, 0));
+    const auto expected = static_cast<std::uint32_t>(std::stoul(ctx.argv[6], nullptr, 16));
+    const float red = check_startup_sampler_heap(ctx.device, ctx.argv[3], ctx.argv[4], offset);
+    std::uint32_t bits;
+    std::memcpy(&bits, &red, sizeof(bits));
+    if (bits != expected) {
+        std::fprintf(stderr, "startup_sampler_heap mismatch offset=%u expected=%08x actual=%08x\n", offset, expected, bits);
+        return {OutcomeKind::fail, "sampler heap readback differs"};
+    }
+    return {OutcomeKind::pass, nullptr};
+}
+
 constexpr CapabilityGate kNoGate{};
 constexpr CapabilityGate kGateSm60BufferOps{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -1091,6 +1107,7 @@ const OperationSpec kOperations[] = {
     // Two builds that differ only in the sampler descriptor index source (#1115): the
     // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
+    {"--startup-sampler-heap", 7, 7, nullptr, kNoGate, run_startup_sampler_heap},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},

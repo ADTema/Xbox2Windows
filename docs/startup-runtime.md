@@ -86,6 +86,7 @@ adds memory dumps to the stop report.
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
+| `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into a bounded table, `SamplerState qh[2048] : register(s0, space1)` indexed by offset / 16, and writes `smpheap 2048 1` to the manifest. The stand-in does not bind that table yet, so leave this off for startup runs ([#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143)) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
@@ -118,6 +119,6 @@ These are measured on one executable; treat them as hypotheses for others.
 
 - BCPack requests are completed with zero-filled destinations (blank textures).
 - XG layouts are the desktop copyable-footprint layout, not the console tiling.
-- Dynamically indexed sampler-heap loads become a default sampler.
+- Dynamically indexed sampler-heap loads become a default sampler. `X2W_SAMPLER_HEAP=1` translates them into an indexed table instead (`tests/startup_sampler_heap_check.py`), and binding that table in the stand-in is the remaining step. Constant sampler-heap offsets are still refused.
 - Stream pipelines (console subobject streams) have no shader translation.
 - Audio produces no output.

@@ -1,5 +1,6 @@
 #pragma once
 #include <d3d12.h>
+#include <cstdint>
 #include <stdexcept>
 #include <vector>
 #include <wrl/client.h>
@@ -14,6 +15,8 @@ void check_compute(ID3D12Device* device, bool tables);
 void check_sampler_views(ID3D12Device* device, const char* shader_path);
 bool check_startup_sampler_x(ID3D12Device* device, bool swapped);
 void check_dynamic_sampler_index(ID3D12Device* device);
+float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                                 std::uint32_t byte_offset);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
                   const char* bytes, const char* out_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
