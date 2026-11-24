@@ -663,6 +663,12 @@ add_executable(startup_state_block_blend_check tests/startup_state_block_blend_c
 target_include_directories(startup_state_block_blend_check PRIVATE src)
 target_compile_features(startup_state_block_blend_check PRIVATE cxx_std_17)
 add_test(NAME startup_state_block_blend COMMAND startup_state_block_blend_check)
+# Root table handles resolved against a logical view heap, and the records a translated draw reads
+# from the window (src/startup_stubs/logical_view_table.h).
+add_executable(startup_logical_view_table_check tests/startup_logical_view_table_check.cpp)
+target_include_directories(startup_logical_view_table_check PRIVATE src)
+target_compile_features(startup_logical_view_table_check PRIVATE cxx_std_17)
+add_test(NAME startup_logical_view_table COMMAND startup_logical_view_table_check)
 
 # Colour-blend register decoding (src/startup_stubs/cb_blend.h, #1216): decoder table plus draws
 # compared with a CPU model of the register fields.
