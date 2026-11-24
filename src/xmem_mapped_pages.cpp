@@ -464,7 +464,7 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
 }
 
 // Reserve+commit desktop profile for the startup blocks observed on #870: the pool loop asks
-// for type 0x20003000 with 0x183/0x22004 or 0x283/0x2404, and later startup code for type
+// for type 0x20003000 with 0x183/0x22004, 0x283/0x2404 or 0x283/0x2004, and later startup code for type
 // 0x20403000 (64 KiB pages) with 0x181/PAGE_READWRITE, each with a null base. Proposed
 // desktop policy: commit a fresh block of ordinary zero-filled read/write pages, whose size
 // must be a nonzero multiple of 64 KiB and is committed exactly, without rounding. The
@@ -479,7 +479,7 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
     const bool large_pages = allocation_type == 0x20003000;
     const bool supported = large_pages
                                ? (attributes == 0x183 && protection == 0x22004)
-                                     || (attributes == 0x283 && protection == 0x2404)
+                                     || (attributes == 0x283 && (protection == 0x2404 || protection == 0x2004))
                                : attributes == 0x181 && protection == PAGE_READWRITE;
     if (!bytes || bytes % granularity || !supported) {
         SetLastError(ERROR_INVALID_PARAMETER);

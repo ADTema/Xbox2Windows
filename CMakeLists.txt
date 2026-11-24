@@ -4250,7 +4250,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_xmem_physical_original>" "$<TARGET_FILE:cpu_xmem_physical_full_count>"
         "$<TARGET_FILE:cpu_xmem_physical_skip_release>" "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_xmem_physical_pair PROPERTIES TIMEOUT 120)
-    # An EXE that imports XMemVirtualAlloc by name and uses the three reserve+commit startup call shapes
+    # An EXE that imports XMemVirtualAlloc by name and uses the four reserve+commit startup call shapes
     # (#870), started by Windows and by pe_map. The six variants after original are negative controls.
     foreach(variant IN ITEMS original reserve_only misaligned dirty accepted_refusal host_fit skip_release)
         add_executable(cpu_xmem_pool_${variant} tests/cpu/xmem_pool_commit.asm tests/cpu/exe_startup.asm)
