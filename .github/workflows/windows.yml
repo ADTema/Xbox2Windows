@@ -81,6 +81,7 @@ jobs:
               (["tests/startup_gfx2hlsl_mad_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_shift64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_inline_sampler_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_smem_address_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
           ]
 
@@ -189,6 +190,7 @@ jobs:
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
+            tests/startup_smem_address_check.py \
             tests/startup_stream_fetch_check.py \
             tests/compute_entry_layout_check.py \
             tests/run_checks_parallel_check.py

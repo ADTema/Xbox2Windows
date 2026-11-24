@@ -133,6 +133,19 @@ Four wrong references (omitting `voffset` or `soffset`) and four translation mut
 ctest --preset dev --no-tests=error -R '^startup_buffer_address_(controls|warp|hardware)$' -V
 ```
 
+## Startup translator: SMEM combined register and immediate offsets
+
+In RDNA 2 SMEM instructions (`s_load_dword*` and `s_buffer_load_dword*`), a scalar register `SOFFSET` (`s0`..`s105` or `m0`) and a non-zero 21-bit signed immediate `OFFSET` (`w1[20:0]`) can be active at the same time: [`tools/disasm_rdna2.py`](../tools/disasm_rdna2.py) prints the register in `ops[2]` and `offset:0x...` in `mods`. Previously, `Stage.op_s_buffer_load_dword()` and `Stage.op_s_load_dwordx4()` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) ignored `mods`, silently dropping `offset:0x...` on register-addressed buffer and dynamic sampler-heap loads, accepting unknown modifiers, reading negative 21-bit signed encodings (`0x100000`..`0x1fffff`) as `+1`..`2` MiB, and overwriting a runtime SGPR `soffset` mid-load when a multi-dword `s_buffer_load_dwordx*` wrote into that register first.
+
+`gfx2hlsl.py` now parses and validates SMEM modifiers (`glc`, `dlc` and at most one non-negative 21-bit signed `offset:` up to `0xfffff`), adds the immediate byte offset to register-addressed `s_buffer_load_dword*` and opt-in sampler-heap `s_load_dwordx4` loads, saves an overlapping runtime SGPR `soffset` into `a` before writing destination registers, and validates non-SGPR/`m0` `soffset` operands (`vcc_lo`, `exec_lo`, `ttmp*`, VGPRs, register ranges, or descriptor-holding SGPRs) across `s_buffer_load_dword*` and both sampler-heap modes of `s_load_dwordx4`. Negative 21-bit signed immediates (`0x100000`..`0x1fffff` or negative literals) — which hardware `s_load_*` sign-extends — remain an unlowered translator gap and are refused by name rather than silently reading at `+1`..`2` MiB.
+
+[`tests/startup_smem_address_check.py`](../tests/startup_smem_address_check.py) checks `llvm-mc` encoding parity, pure-Python controls, two 16-vertex buffer-load readback cases (`s_buffer_load_dwordx4` with `SGPR` + `offset:0x18` at two runtime offsets, plus `m0` + `offset:0x14 dlc`, constant-SGPR + `offset:0x08` and destination-overlapping `s[20:21]` + `offset:0x1c glc`) and a full-screen dynamic sampler-heap pixel draw (`s_load_dwordx4` with `s9` + `offset:0x10` under both DXC and FXC). Wrong references and translation mutations (including the pre-fix dropped-`offset:` form and reading the clobbered `s20` word instead of `a`) must fail readback. Verified with zero mismatches and zero D3D12 debug-layer errors or warnings on Windows 11 26H2 (build 26300.9974) across WARP 10.0.26100.9818 and an AMD Radeon RX 9070 XT (driver 32.0.32029.2010).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_smem_address_(controls|warp|hardware)$' -V
+python -B tests/startup_smem_address_check.py binary llvm-mc-15
+```
+
 ## Packed render targets: 5-6-5 and arrays
 
 `packed_target_stand_in` now also covers B5G6R5_UNORM and 2D arrays of 2 to 2048 slices (a cube map is six). When the adapter lacks render-target (or typed UAV) support for the packed format and has it for R8G8B8A8_UNORM, the texture is created as R8G8B8A8_UNORM with the same slice and mip counts. Zero slices, more than 2048, 3D, buffers and multisampled textures keep their format. The stand-in has 8 bits a channel and an alpha channel that B5G6R5 lacks. Texels the executable writes in the 16-bit layout are not converted. The device-free check covers 61 rows against adapters described by their support bits, and four mutated runs (wrong stand-in format, arrays left alone, B5G6R5 left alone, view kept packed) must fail. The WARP and hardware readback draws a B5G6R5 target; an array target is not drawn.
