@@ -18,6 +18,8 @@ from spirv_sampler_views import split_sampler_views
 
 ORDINARY_BINDING = 5
 SHARED = Path(__file__).with_name("shared_sampler.spvasm").read_text(encoding="utf-8")
+# The same module with arrayed (Texture2DArray) images and a float3 coordinate (u, v, layer 0).
+SHARED_ARRAY = Path(__file__).with_name("shared_sampler_array.spvasm").read_text(encoding="utf-8")
 # 0.25 <= 0.5 passes, 0.75 <= 0.5 fails, ordinary sample of 0.375; the other 13 words are guards.
 EXPECTED = [0x3f800000, 0x00000000, 0x3ec00000] + [0xc5c5c5c5] * 13
 
@@ -39,6 +41,11 @@ def rejected(assembly, binding, reason):
 def controls(directory):
     lowered, mapping = split_comparison_sampler(SHARED, ORDINARY_BINDING)
     assert mapping == {"descriptor_set": 0, "comparison_binding": 2, "ordinary_binding": ORDINARY_BINDING}, mapping
+    # The arrayed variant splits to the same mapping and only the ordinary load moves.
+    array_lowered, array_mapping = split_comparison_sampler(SHARED_ARRAY, ORDINARY_BINDING)
+    assert array_mapping == mapping, array_mapping
+    assert "%x2w_plain_sampler_0 = OpLoad %type_sampler %x2w_plain_sampler" in array_lowered.splitlines()
+    assert "OpTypeImage %float 2D 2 1 0 1 Unknown" in array_lowered
     # Modules without a mixed standalone sampler come back byte-for-byte, whatever else they contain.
     separated = substitute(SHARED, "%41 = OpLoad %type_sampler %cmpSampler", "%41 = OpLoad %type_sampler %plainSampler")
     separated_lod = substitute(separated, "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0",
@@ -86,9 +93,13 @@ def controls(directory):
     rejected(SHARED, -1, "Ordinary sampler binding must be nonnegative")
     rejected(substitute(SHARED, "OpEntryPoint GLCompute", "OpEntryPoint Fragment"),
              ORDINARY_BINDING, "requires a single GLCompute entry point")
-    rejected(substitute(SHARED, "OpTypeImage %float 2D 2 0 0 1 Unknown",
-                        "OpTypeImage %float 2D 2 1 0 1 Unknown"),
-             ORDINARY_BINDING, "only non-array float32 Texture2D sampling is supported")
+    # Only Texture2D and Texture2DArray are in the profile: multisampled and 3D images stay rejected.
+    for image in ("OpTypeImage %float 2D 2 0 1 1 Unknown", "OpTypeImage %float 3D 2 0 0 1 Unknown"):
+        rejected(substitute(SHARED, "OpTypeImage %float 2D 2 0 0 1 Unknown", image),
+                 ORDINARY_BINDING, "only float32 Texture2D and Texture2DArray sampling is supported")
+    rejected(substitute(SHARED_ARRAY, "OpTypeImage %float 2D 2 1 0 1 Unknown",
+                        "OpTypeImage %float 2D 2 1 1 1 Unknown"),
+             ORDINARY_BINDING, "only float32 Texture2D and Texture2DArray sampling is supported")
     rejected(substitute(SHARED, " %cmpSampler %plainSampler %results", " %plainSampler %results"),
              ORDINARY_BINDING, "sampler must be listed in the entry-point interface")
     rejected(substitute(SHARED, "%float_0 = OpConstant %float 0",
@@ -122,7 +133,9 @@ def controls(directory):
 def emit(directory, assembler, validator, cross):
     lowered = controls(directory)
     outputs = {}
-    for name, assembly in (("shared", SHARED), ("lowered", lowered)):
+    array_lowered = split_comparison_sampler(SHARED_ARRAY, ORDINARY_BINDING)[0]
+    for name, assembly in (("shared", SHARED), ("lowered", lowered),
+                           ("shared_array", SHARED_ARRAY), ("lowered_array", array_lowered)):
         text = directory / f"{name}.spvasm"
         text.write_text(assembly, encoding="utf-8")
         module = directory / f"{name}.spv"
@@ -137,6 +150,12 @@ def emit(directory, assembler, validator, cross):
     assert comparison and ordinary, source
     assert source.count(f"SampleCmpLevelZero({comparison[1]},") == 2, source
     assert source.count(f"SampleLevel({ordinary[1]},") == 1, source
+    array_source = outputs["lowered_array"].read_text(encoding="utf-8")
+    comparison = re.search(r"SamplerComparisonState\s+(\w+)\s*:\s*register\(s2\b", array_source)
+    ordinary = re.search(rf"SamplerState\s+(\w+)\s*:\s*register\(s{ORDINARY_BINDING}\b", array_source)
+    assert comparison and ordinary and "Texture2DArray" in array_source, array_source
+    assert array_source.count(f"SampleCmpLevelZero({comparison[1]},") == 2, array_source
+    assert array_source.count(f"SampleLevel({ordinary[1]},") == 1, array_source
     print(f"shared and lowered SPIR-V validated; comparison s2, ordinary s{ORDINARY_BINDING}; controls passed",
           flush=True)
     return outputs
