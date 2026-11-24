@@ -248,17 +248,26 @@ class Stage:
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
     def set_vf(self, n, expr, mods=()):
+        # The hardware applies the output modifier before the clamp, but the disassembler prints `clamp`
+        # first, so the order of `mods` is not the order of the operations: scale first, saturate last.
+        scale = 1.0
+        clamp = False
         for m in mods:
             if m == 'clamp':
-                expr = 'saturate(%s)' % expr
+                clamp = True
             elif m in ('mul:2', 'mul:4'):
-                expr = '(%s) * %s.0' % (expr, m[-1])
+                scale *= float(m[-1])
             elif m == 'div:2':
-                expr = '(%s) * 0.5' % expr
+                scale *= 0.5
             elif m.startswith('op_sel'):
                 pass
             else:
                 raise Unsupported('modifier %s' % m)
+        if scale != 1.0:
+            factor = ('%d.0' % int(scale)) if scale == int(scale) else ('%g' % scale)
+            expr = '(%s) * %s' % (expr, factor)
+        if clamp:
+            expr = 'saturate(%s)' % expr
         self.set_v(n, 'U(%s)' % expr)
 
     def set_s(self, n, expr, sym=None, scc=None):

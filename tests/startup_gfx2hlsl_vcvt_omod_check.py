@@ -100,6 +100,12 @@ asm, emitted = translate(encode_vop1_e64(VOP1_CVT_F32_I32, 1, V1, omod='div:2'))
 check('div:2 halves', 'U((float(int(v1))) * 0.5)' in emitted, emitted)
 asm, emitted = translate(encode_vop1_e64(VOP1_CVT_F32_I32, 1, V1, clamp=1))
 check('clamp saturates', 'U(saturate(float(int(v1))))' in emitted, emitted)
+# With both, the hardware applies the output modifier first and clamps the result; the disassembler
+# prints `clamp` before `mul:2`, so a translation that follows that text order would clamp early.
+asm, emitted = translate(encode_vop1_e64(VOP1_CVT_F32_I32, 1, V1, omod='mul:2', clamp=1))
+check('clamp applies after the scaling', 'U(saturate((float(int(v1))) * 2.0))' in emitted, emitted)
+asm, emitted = translate(encode_vop1_e64(VOP1_CVT_F32_I32, 1, V1, omod='div:2', clamp=1))
+check('clamp applies after the halving', 'U(saturate((float(int(v1))) * 0.5))' in emitted, emitted)
 
 # 4. The other float-result conversions take the same modifiers.
 asm, emitted = translate(encode_vop1_e64(VOP1_CVT_F32_U32, 2, V1, omod='mul:2'))
