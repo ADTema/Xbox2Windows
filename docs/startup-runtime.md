@@ -460,6 +460,99 @@ outcome (`aliased`, `not_aliased`, `failed`) in a separate table, and a line wit
 Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 `startup_triage_run`).
 
+## Iterating on start-up runs
+
+This is one way to turn repeated start-up runs into a list of translator work that others can pick up. It combines the tools above (`run.ps1`, `gfx2hlsl.py`, `triage_run.py`) with Windows Sandbox and a logon script that you write yourself; the script is not in this repository. Nothing from a run (executable, package, logs, shaders, captures) is committed or posted. Only instruction names, refusal reasons and counts leave the machine.
+
+### 1. Run the executable in a disposable VM
+
+Treat a console executable as untrusted input. Windows Sandbox gives a throw-away VM and can share the host GPU. It requires Windows 10 or 11 Pro, Enterprise or Education, with virtualization enabled and the optional feature "Windows Sandbox" turned on. Its state is discarded when the window closes.
+
+The configuration file (`.wsb`) below turns off what the run does not need. vGPU is a deliberate exception, needed for hardware D3D12 rendering; Microsoft documents that it increases the sandbox's attack surface. Only one folder is writable. The paths in capitals are placeholders. Map the Python install and the Windows SDK folder that contains `fxc.exe` at the same paths as on the host, so `out/pe-env` resolves inside the VM.
+
+```xml
+<Configuration>
+  <Networking>Disable</Networking>
+  <vGPU>Enable</vGPU>
+  <MemoryInMB>MEMORY_MB</MemoryInMB>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <PrinterRedirection>Disable</PrinterRedirection>
+  <AudioInput>Disable</AudioInput>
+  <VideoInput>Disable</VideoInput>
+  <ProtectedClient>Enable</ProtectedClient>
+  <MappedFolders>
+    <MappedFolder><HostFolder>PACKAGE</HostFolder><SandboxFolder>C:\pkg</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+    <MappedFolder><HostFolder>REPO</HostFolder><SandboxFolder>C:\x2w\repo</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+    <MappedFolder><HostFolder>STAGE</HostFolder><SandboxFolder>C:\x2w\stage</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+    <MappedFolder><HostFolder>PYTHON_INSTALL</HostFolder><SandboxFolder>PYTHON_INSTALL</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+    <MappedFolder><HostFolder>SDK_BIN_X64</HostFolder><SandboxFolder>SDK_BIN_X64</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+    <MappedFolder><HostFolder>OUT</HostFolder><SandboxFolder>C:\x2w\out</SandboxFolder><ReadOnly>false</ReadOnly></MappedFolder>
+  </MappedFolders>
+  <LogonCommand><Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\x2w\stage\run_in_sandbox.ps1</Command></LogonCommand>
+</Configuration>
+```
+
+`REPO` holds a release build and `out/pe-env`. `STAGE` holds the logon script and anything it copies into the VM. `MEMORY_MB` must leave room for `run.ps1 -MemoryGiB` plus the VM itself.
+
+The logon script runs only inside the VM, so `-ExecutionPolicy Bypass` and writes to the VM's `System32` affect nothing on the host. It does the following:
+
+1. If the title uses the system gaming runtime, copies the host's `xgameruntime.dll` from `STAGE` into the VM's `System32`.
+2. Maps the package to the console's package drive with `subst G: C:\pkg`. Copies the package's top-level `.exe` and `.dll` files into a run folder; the data stays read-only.
+3. Sets `X2W_FXC` to `fxc.exe` in the mapped SDK folder. `run.ps1` does not set it, and the VM has no SDK of its own.
+4. Starts a background loop of `gfx2hlsl.py --pending C:\x2w\out\shader_cache`, so new pipeline requests are translated while the title runs.
+5. Runs `tools/startup/run.ps1` with `-Render`, `-ShaderCache C:\x2w\out\shader_cache`, `-StoragePath` under `C:\x2w\out` and the usual switches (see [Run](#run)). Its offline debugger stays on; the VM is a second barrier around it.
+6. Stops the loop. Writes the output of `triage_run.py <log> --shader-cache <cache>` to `C:\x2w\out` with `Out-File -Encoding utf8`; Windows PowerShell's `>` writes UTF-16.
+
+Every file in `OUT` is written by untrusted code. Read it; do not execute anything from it on the host. Do not rebuild or check out another revision of the mapped repository while a run is in progress: the VM reads `tools/` and the build from it.
+
+**Cost of the loop.** Every pass retries each request that has no `<key>.txt`, including those that already have a `.fail`, and re-runs `fxc` for fxc failures. That load falls on the run being measured, so choose the interval accordingly.
+
+### 2. Keep the shader cache between runs
+
+Archive each run's logs together with a copy of `shader_cache/`, and leave the cache in place for the next run. With a cold cache, every draw whose pipeline has not been translated yet is counted as "not drawn" and is missing from the frame.
+
+When the translator handles more, the next `--pending` pass retries the waiting requests from the same cache. This holds only while the pipeline key is unchanged. The key hashes a translation revision string (`x2w-startup-shader-N`, in `pipeline_key` in `gfx2hlsl.py` and in the runtime). After a revision change the runtime asks for new keys, and the old requests stay in the cache.
+
+A `.fail` is not removed when its request later translates. On a kept cache, the `.fail` categories in `triage.md` therefore include pipelines that now have a `.txt`. That table counts category tokens over all `.fail` files, up to `--max-items`.
+
+### 3. Measure a run against the previous one
+
+With `-Render`, `d3d12_xs` prints a running total to `stderr.txt` every 300 frames:
+
+```
+x2w-render totals: ... translated draws N (not drawn M), pipelines translated P / missing Q, ...
+```
+
+Compare the last line of each run. More translated draws and fewer "not drawn" mean a translator change reached real draws. "missing" is a live count of pipelines still waiting for a manifest. It can grow while things improve, if the run gets further and requests new pipelines.
+
+### 4. Census, then rank
+
+The first refusal hides the rest. Run the [refusal census](experiments.md#startup-translator-refusal-census) on a copy of the cache:
+
+```powershell
+python -B tools/startup/gfx2hlsl.py --refusals <copy of shader_cache> --json | Out-File -Encoding utf8 census.json
+```
+
+There are two views:
+
+- `per_code_pair.reasons` counts vertex/pixel code pairs, without RTV variants. Each row has `reason`, `scope` (`decode`, `vs`, `ps` or `pipeline`), `under_every_root` and `under_some_roots`. The sum of the last two is the number of pairs where the reason appears.
+- `per_request.reasons` counts request keys, RTV variants included. Each row has `containing`, `first` and `only`.
+
+Counts after the first refusal are approximate, and a pipeline-scope `only` is a lower bound (the `caveat` field).
+
+Rank by the number of pairs a reason appears in, not by first refusals: when most pairs contain several reasons, fixing the most frequent first refusal alone draws few new pipelines. Reasons that share a design, such as descriptor tracking or resource-heap loads, are better handled together.
+
+### 5. Pick work that nobody holds
+
+Before taking a reason:
+
+- search open pull requests and the `help wanted` issues for the instruction name;
+- prefer self-contained instructions with clear semantics (scalar ALU, operand modifiers, inline constants) over design topics;
+- check the semantics against a primary source, such as the AMD RDNA 2 ISA reference or LLVM's AMDGPU backend for assembler field meanings (state the version), not against another translator in this repository;
+- add a negative control that fails when the lowering is removed or its semantics change.
+
+After the change is merged, step 3 on the next run shows whether draws moved.
+
 ## Launcher check
 
 `tests/startup_launch_check.py` (ctest `startup_launch`) drives `tools/startup/launch.py` on the
