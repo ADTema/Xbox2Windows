@@ -3087,7 +3087,10 @@ def binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library, MTBUF_LOAD_CASES, "tbuffer_")
     two_exits(directory, assembler, objcopy, library)
     mubuf_format_store_controls()
-    gfx1030_binary(directory, assembler, objcopy, library, mubuf_format_store_cases(), "buffer_store_format_", group=16)
+    mubuf_format_d16_store_controls()
+    for packed in (False, True):
+        gfx1030_binary(directory, assembler, objcopy, library, mubuf_format_store_cases(packed),
+                       "buffer_store_format_", group=16)
     mubuf_format_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_format_cases(), "buffer_load_format_")
     for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES + F32_CASES:
@@ -3741,16 +3744,18 @@ def mubuf_format_draw(directory, compiler, renderer, backend):
 MUBUF_STORE_WORDS = (0x89abcdef, 0x01234567, 0xdcbafed0, 0x76543210)
 
 
-def mubuf_format_store_cases():
-    for count in range(1, 5):
-        name = f"buffer_store_format_{'xyzw'[:count]}"
+def mubuf_format_store_cases(packed=False):
+    for components in ((1, 2, 4) if packed else range(1, 5)):
+        name = f"buffer_store_format_{'d16_' if packed else ''}{'xyzw'[:components]}"
+        count = (components + 1) // 2 if packed else components
+        component_format = "16_" if packed else "32_"
         data = "v10" if count == 1 else f"v[10:{9 + count}]"
         lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
                  "s_load_dwordx4 s[20:23], s[12:13], 0x30",
                  "v_lshl_add_u32 v8, s11, 4, v0", "s_waitcnt lgkmcnt(0)"]
         lines += [f"v_xor_b32_e32 v{10 + i}, {word:#x}, v8" for i, word in enumerate(MUBUF_STORE_WORDS[:count])]
         yield name, [*lines, f"{name} {data}, v8, s[20:23], 0 idxen offset:4", "s_endpgm"], DS_BINDING | {
-            "stride": 4 * (count + 1), "output_format": f"BUF_FMT_{'32_' * count}UINT"}
+            "stride": 4 * (count + 1), "output_format": f"BUF_FMT_{component_format * components}UINT"}
 
 
 def mubuf_format_store_controls():
@@ -3760,7 +3765,7 @@ def mubuf_format_store_controls():
     for replacement, diagnostic in (
         (store.replace("idxen", "offen"), "Unsupported formatted buffer store target or address mode"),
         (store.replace("idxen", "idxen offen"), "Unsupported formatted buffer store target or address mode"),
-        (store.replace("format_x", "format_d16_x"), "Unsupported formatted buffer store target or address mode"),
+        (store.replace("format_x", "format_d16_x"), "Formatted buffer store width does not match output format"),
         (store.replace(", 0 idxen", ", s0 idxen"), "Unsupported compute instruction"),
         (store + " glc", "Unsupported compute instruction"),
         (store.replace("offset:4", "offset:2"), "Unverified raw UAV store"),
@@ -3795,36 +3800,76 @@ def mubuf_format_store_controls():
     aot.lower(variant(lines, (store, "s_waitcnt vmcnt(0)\n" + store)), 16, **binding)
 
 
+def mubuf_format_d16_store_controls():
+    cases = list(mubuf_format_store_cases(packed=True))
+    _, lines, binding = cases[0]
+    store = lines[-2]
+    for replacement, diagnostic in (
+        (store.replace("idxen", "offen"), "Unsupported formatted buffer store target or address mode"),
+        (store.replace("offset:4", "offset:6"), "Unverified raw UAV store"),
+        (store.replace("offset:4", "offset:8"), "Unsupported store address"),
+        (store + "\nbuffer_store_short v10, v8, s[20:23], 0 idxen offset:6", "Overlapping raw UAV stores"),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, (store, replacement)), 16, **binding)
+    rejects("Formatted buffer store width does not match output format", aot.lower, lines, 16,
+            **(binding | {"output_format": "BUF_FMT_16_16_UINT"}))
+    rejects("Unverified raw UAV store", aot.lower, variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 16, **binding)
+
+    _, lines, binding = cases[-1]
+    rejects("Formatted D16 buffer store requires a matching whole-texel format", aot.lower,
+            variant(lines, ("buffer_store_format_d16_xyzw", "buffer_store_format_d16_xyz")), 16, **binding)
+    rejects("Unverified raw UAV store", aot.lower, variant(lines, ("v[10:11]", "v10")), 16, **binding)
+
+
 def mubuf_format_store_draw(directory, compiler, renderer, backend):
+    mubuf_format_d16_store_controls()
     mubuf_format_store_controls()
     src, cso, case = (directory / f"mubuf-format-store.{ext}" for ext in ("hlsl", "cso", "case"))
     compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
     run = [renderer, backend, "--compute-store-case", cso, case]
     accepted = []
-    for name, lines, binding in mubuf_format_store_cases():
+    for name, lines, binding in (*mubuf_format_store_cases(), *mubuf_format_store_cases(packed=True)):
         print(f"{name} ({binding['output_format']})", flush=True)
-        count = len(name.rsplit("_", 1)[1])
+        components = len(name.rsplit("_", 1)[1])
+        packed = "_d16_" in name
+        count = (components + 1) // 2 if packed else components
         store = lines[-2]
-        src.write_text(aot.lower(lines, 16, **binding), encoding="ascii")
+        source = aot.lower(lines, 16, **binding)
+        src.write_text(source, encoding="ascii")
         subprocess.run(compile_shader, check=True)
         for groups in (1, 2):
             words = [SENTINEL] * 320
             for gid in range(16 * groups):
                 start = gid * (count + 1) + 1
-                words[start:start + count] = [word ^ gid for word in MUBUF_STORE_WORDS[:count]]
+                if packed:
+                    payload = struct.pack(f"<{count}I", *(word ^ gid for word in MUBUF_STORE_WORDS[:count]))
+                    reference = bytearray(SENTINEL.to_bytes(4, "little") * count)
+                    reference[:2 * components] = payload[:2 * components]
+                    words[start:start + count] = struct.unpack(f"<{count}I", reference)
+                else:
+                    words[start:start + count] = [word ^ gid for word in MUBUF_STORE_WORDS[:count]]
             case.write_bytes(struct.pack("<321I", groups, *words))
             result = subprocess.run(run)
             if result.returncode:
                 return result.returncode
-        if count == 1:
-            mutant = variant(lines, (store, store.removesuffix(" offset:4")))
+        if packed and components == 1:
+            changed = source.replace("& 0xffff0000u", "& 0u")
+            mismatch, actual = 1, MUBUF_STORE_WORDS[0] & 0xffff
+        elif packed:
+            swapped = "v_lshlrev_b32_e32 v22, 16, v10\nv_lshrrev_b32_e32 v23, 16, v10\nv_or_b32_e32 v10, v22, v23"
+            changed = aot.lower(variant(lines, (store, swapped + "\n" + store)), 16, **binding)
+            mismatch, actual = 1, 0xcdef89ab
+        elif count == 1:
+            changed = aot.lower(variant(lines, (store, store.removesuffix(" offset:4"))), 16, **binding)
             mismatch, actual = 0, MUBUF_STORE_WORDS[0]
         else:
             first, last = lines[5], lines[4 + count]
             mutant = variant(lines, (first, first.replace("v10,", f"v{9 + count},")),
                              (last, last.replace(f"v{9 + count},", "v10,")))
+            changed = aot.lower(mutant, 16, **binding)
             mismatch, actual = 1, MUBUF_STORE_WORDS[count - 1]
-        src.write_text(aot.lower(mutant, 16, **binding), encoding="ascii")
+        assert changed != source
+        src.write_text(changed, encoding="ascii")
         subprocess.run(compile_shader, check=True)
         bad = subprocess.run(run, capture_output=True, text=True)
         if bad.returncode != 1 or f"word={mismatch} expected={words[mismatch]:08x} actual={actual:08x}" not in bad.stderr:

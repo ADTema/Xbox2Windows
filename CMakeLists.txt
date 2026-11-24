@@ -589,6 +589,23 @@ target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sa
 target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_flat_param.cpp)
+# Console allocation sizes for depth-with-stencil and multisampled textures
+# (src/startup_stubs/console_plane_size.h); the mutated run is the negative control.
+add_executable(startup_plane_size_check tests/startup_plane_size_check.cpp)
+target_include_directories(startup_plane_size_check PRIVATE src)
+target_compile_features(startup_plane_size_check PRIVATE cxx_std_17)
+add_test(NAME startup_plane_size COMMAND startup_plane_size_check)
+add_test(NAME startup_plane_size_packed_control COMMAND startup_plane_size_check --mutate packed)
+set_tests_properties(startup_plane_size_packed_control PROPERTIES WILL_FAIL TRUE)
+# The same rule through the device wrapper: allocation-info slots 25 and 108, then a placed texture
+# (slot 133) over memory of the answered size.
+add_executable(startup_plane_size_device_check tests/startup_plane_size_device_check.cpp)
+target_compile_features(startup_plane_size_device_check PRIVATE cxx_std_17)
+target_link_libraries(startup_plane_size_device_check PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME startup_plane_size_device_${adapter} COMMAND startup_plane_size_device_check ${adapter})
+endforeach()
+set_tests_properties(startup_plane_size_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # Blend state of slot 57 pipelines from state block A (src/startup_stubs/state_block_blend.h, #1216).
 add_executable(startup_state_block_blend_check tests/startup_state_block_blend_check.cpp)
 target_include_directories(startup_state_block_blend_check PRIVATE src)
@@ -3805,9 +3822,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_fnstcw>"
         "$<TARGET_FILE:cpu_x87_fnstcw_lifted>" ${x87_fnstcw_control_files})
     cpu_asm_fixture(cpu_x87_examine x87_examine)
-    # The lifted DLL and four mutated controls that the check requires to mismatch.
+    # The lifted DLL and six mutated controls that the check requires to mismatch.
     set(x87_examine_control_files "")
-    foreach(variant IN ITEMS lifted normal unsigned positive legacy)
+    foreach(variant IN ITEMS lifted normal unsigned positive legacy ffreep fftop)
         set(x87_examine_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_examine_${variant}.cpp")
         add_custom_command(OUTPUT "${x87_examine_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_examine.py"

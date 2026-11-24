@@ -1505,6 +1505,8 @@ Seven native-only exports move on the caller's flags. `fcmovb` and `fcmove` move
 
 The profile also accepts the 8087/287 controls `fneni`, `fndisi` and `fnsetpm`, which the 80387 and later execute as `fnop`; `feni` and `fdisi` decode as `wait` and the no-wait form, and ML64 assembles `fsetpm` as `fnsetpm` without a `wait` and has no `fnsetpm` spelling. A fifth export, `legacy_controls`, runs `feni`, `fneni`, `fdisi`, `fndisi` and `fsetpm` between a load and a store, so the check now has 5 exports and 816 cases. On Windows 10 build 19045 the native run stored the loaded value unchanged and returned with control word 0x027F and an empty stack in every case, as the translation does. A fourth control, which flips the sign of ST(0) at `fnsetpm`, gave 34 mismatches, one per `legacy_controls` case, and translation rejects a reader of C0 after `fneni` or `fnsetpm`.
 
+The profile also accepts `ffreep st(0)` on a nonempty stack: it tags ST(0) empty and pops it, like `fstp st(0)` without a store, so TOP moves up by one. On an empty stack it is rejected. `ffree`, `ffreep` with another register, `fincstp` and `fdecstp` stay outside the profile: they would free a register below ST(0), or move TOP without changing occupancy, and the profile derives TOP from a contiguous depth. Like every other x87 instruction, `ffreep` leaves C0 to C3 undefined. A sixth export, `ffreep_top`, pushes the input, 1.0 and 0.0, and then runs `ffreep st(0)` at depths 3, 2 and 1. It records TOP after each `fnstsw ax` (AH masked to TOP) and stores the values left below. The check now has 6 exports and 850 cases. On Windows 11 build 26100 the native run gave TOP 5, 6, 7 and 0 and the values unchanged, as the translation does. Two more controls must mismatch: one where `ffreep` also overwrites the deepest register with the one above it, which gave 33 mismatches (the input 1.0 hides it), and one where TOP stays 5 after the first `ffreep`, which gave 34. Translation rejects `ffreep` on an empty stack, a reader of C0 or C1 after `ffreep`, `ffreep st(2)`, `ffree st(0)`, `ffree st(1)`, `fincstp` and `fdecstp`.
+
 `lower(..., x87=x87_lower.Checked(reject))` is the checked entry of the profile. It also accepts `fldcw m16`, and keeps the control word in a local of the lowered function, `fninit` and `finit`, which load `0x037F`, clear C0 to C3 and empty every register, `fbld` (`cpu_aot_x87_bcd`), and `fprem` and `fprem1` (`cpu_aot_x87_fprem`). The arithmetic, `fsqrt`, `fscale`, `frndint`, `fist` and `fistp`, the m32 and m64 stores, `fnstcw` and the five inexact constant loads all follow that word. The precision control applies only to the arithmetic and `fsqrt`. `fldcw` accepts a word with all six exceptions masked and precision control 00, 10 or 11 (24, 53 or 64 bits). It keeps the word as `fnstcw` reads it back: bit 6 reads as 1, bits 7 and 13 to 15 as 0, and bit 12 is kept. The lowered function leaves through the caller's `reject` statement with a status in these cases:
 
 - status 1, at an `fldcw` whose word unmasks an exception;
@@ -3644,7 +3646,7 @@ group has its own record and that the complete write fits the declared
 stride without overlapping another store. The caller supplies a DWORD-aligned
 view base and fully in-range, unswizzled records with thread-ID addition
 disabled in the descriptor and no address wrap or external writers. Partial
-texel writes, packed D16 data, other formats and cache modifiers are refused.
+texel writes, other format combinations and cache modifiers are refused.
 
 The wave32 fixtures dispatch one and two groups of 16 threads. Each thread
 writes distinct channel words after one padding DWORD. A CPU reference
@@ -3655,6 +3657,41 @@ check descriptor and VGPR waits, mismatched formats, bad register ranges,
 misalignment, record overruns and store overlap. The LLVM 15 test assembles
 and disassembles every form and compares the compute-container CLI output
 with direct lowering. The GPU fixtures execute the translated desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_store_format_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+### Indexed gfx1030 formatted D16 UINT buffer writes
+
+The compute store profile accepts `buffer_store_format_d16_x`, `_xy` and
+`_xyzw` with `--output-format BUF_FMT_16_UINT`, `BUF_FMT_16_16_UINT` or
+`BUF_FMT_16_16_16_16_UINT`, respectively. The caller declares the format and
+identity destination selectors. The [AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+(§8.1.4 and MUBUF opcodes 132–135) sends packed 16-bit channels to the
+texture unit, low half first. The profile requires a whole texel. The ISA
+format table has no three-channel 16-bit UINT format, and the `xyz` form
+with a four-channel descriptor still needs a native fourth-channel check.
+
+The D16 forms use the same verified `idxen`, zero scalar offset,
+DWORD alignment and record bounds as the ordinary UINT forms. For `x`,
+the raw UAV lowering reserves the containing DWORD and preserves its high
+half with a read/modify/write. The caller supplies an in-range, exclusively
+owned DWORD even though the original instruction writes two bytes. The
+translator refuses any store that overlaps that DWORD, including an
+otherwise disjoint halfword write.
+
+The shared formatted store fixture compares all 320 output words on
+WARP and a physical adapter at one and two groups. The CPU reference copies
+selected bytes into the initial output. Clearing the preserved half for
+`x` or swapping the first two channels for `xy` and `xyzw` must produce a
+difference at word 1. LLVM 15 also exercises each encoding through the
+compute-container CLI.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
@@ -4081,11 +4118,17 @@ any pairing. The e64 form is lowered only as plain registers: clamp, output
 scale (`mul:`, `div:`), negate and absolute value, a swapped operand order,
 a special register such as `vcc_lo` or `null`, and an inline constant are
 rejected, as are the other element types and `v_cmp_*`. A comparison with NaN
-kills no pixel. The sample is `image_sample` or `image_sample_lz`, with one
-2D coordinate pair, a single-channel `dmask` and no other modifier. The
-second lowers to `SampleLevel(samp,uv,0)` instead of `Sample(samp,uv)`; one
-sample per program is still required, whichever spelling it uses. The
-textures have one mip.
+kills no pixel. The sample is `image_sample`, `image_sample_lz` or
+`image_sample_l`, with one 2D coordinate pair, a single-channel `dmask` and
+no other modifier. `image_sample_lz` lowers to `SampleLevel(samp,uv,0)`
+instead of `Sample(samp,uv)`. `image_sample_l` takes the level as the third
+address register, `v[u:lod]`, and lowers to `SampleLevel(samp,uv,<level>)`.
+The level register must hold a value copied by `v_mov_b32_e32 vN, sM` from a
+buffered float that the program loaded and waited for; an inline constant, a
+literal, a vector or special-register source, a non-float scalar, the VOP3
+spelling and a level that was never defined are refused. One sample per
+program is still required, whichever spelling it uses. The textures have one
+mip.
 
 The JSON bindings used by the source-built fixture are constructed by
 `bindings(slot)` in `tests/sampled_coverage_check.py`. A descriptor entry lists
@@ -4126,22 +4169,32 @@ the translator command to refuse it and write no output. The CTest limit of
 `sampled_coverage_<adapter>` is raised from 60 to 150 seconds for the extra
 draws.
 
-The explicit-level sample has no extra readback that can tell it from the
+The explicit-level samples have no extra readback that can tell them from the
 implicit one: the textures have one mip and the draw maps texels one to one, so
 `SampleLevel(…,0)` and `Sample` return the same values there, and the
 fixture only repeats the first readback with the `image_sample_lz` program on
-the first texture. The Linux step requires the lowered source to contain
+the first texture. It also repeats it with an `image_sample_l` program whose
+level word holds 3, past the only mip, which must clamp to mip 0. The Linux step requires the lowered source to contain
 `SampleLevel(samp,uv,0)` and no `Sample(` call (a lowering of the
 implicit form fails that check), the same program as the implicit lowering with
 only that call replaced, on both textures and for the red channel, and refusal
-of a second sample in any order. It assembles `tfe`, `a16`, `lwe`, `d16`,
+of a second sample in any order. For `image_sample_l` it lowers the level
+copied from each of four buffered words and requires the `SampleLevel`
+argument, evaluated against distinct constants by a separate reader of the
+HLSL, to equal the word the load addresses. The same program with
+`image_sample_lz`, or with the implicit opcode, must not read that word. It
+also refuses a missing, misplaced or unwaited level, and every move source
+above, with LLVM 19 assembling each refused program. It assembles `tfe`, `a16`, `lwe`, `d16`,
 `r128`, `unorm`, `glc`, `slc`, `dlc`, a two-channel `dmask`, a 3D
-dimension, `image_sample_o`-style offsets and `image_sample_l` for both
-opcodes with LLVM 19 and requires the translator command to refuse each and
+dimension, and `image_sample_o`-style offsets for all
+three opcodes with LLVM 19 and requires the translator command to refuse each and
 write no output. `da` and a 2D array dimension are refused at the
 translator-level check only, because LLVM 19 does not assemble them in this form.
-The Windows readback has not been run on a GPU adapter by the author; the CI result
-on the pull request is the first measurement.
+There is still no readback with a mip chain: the fixture renderer builds one
+mip, so the choice between mips by an explicit level is checked at the
+translation level only, not on a GPU. The Windows readback has not been run on
+a GPU adapter by the author; the CI result on the pull request is the first
+measurement.
 
 #### Intel first-full-query diagnostic
 
@@ -4213,8 +4266,8 @@ The discard compare may be any of `v_cmpx_lt_f32_e32`, `v_cmpx_le_f32_e32`,
 `v_cmpx_gt_f32_e32` and `v_cmpx_ge_f32_e32` (scalar first source, VGPR second
 source); a lane is discarded when `src0 OP vsrc1` holds. These are the ordered
 binary32 compares, false when either operand is NaN like the HLSL operators; the
-unordered `n*` forms, other widths, integer compares and e64 forms reject
-translation. `depth_mask_cmpx_draw_*` draws each compare at two seeds with
+unordered `n*` forms, other widths, integer compares and the `v_cmp_*_e64`
+compares with a scalar mask destination reject translation. `depth_mask_cmpx_draw_*` draws each compare at two seeds with
 thresholds that equal one row's value exactly, against a CPU reference written
 with Python operators, so lt and le (and gt and ge) differ in one row of 32 pixels
 and the lt/gt pair in 992 or more. Every other compare's reference must fail on
@@ -4227,8 +4280,8 @@ The program may also apply the one-source binary32 forms `v_rcp_f32_e32`,
 `v_rsq_f32_e32`, `v_sqrt_f32_e32`, `v_floor_f32_e32`, `v_trunc_f32_e32` and
 `v_rndne_f32_e32` (VGPR destination; constant, scalar word or VGPR source). They
 lower to `1.0f / x`, `rsqrt`, `sqrt`, `floor`, `trunc` and `round` (half to
-even). Source modifiers, `clamp`, output modifiers, a second source and the e64
-encodings reject translation. The precision of reciprocal, reciprocal square root
+even). Source modifiers, `clamp`, output modifiers and a second source reject
+translation. The precision of reciprocal, reciprocal square root
 and square root is not claimed, since D3D allows each an error, and a zero or
 negative operand of the last two, NaN, infinity, denormals and signed zero are not
 exercised. `depth_mask_unary_draw_*` (`unary` mode) therefore feeds the three
@@ -4243,6 +4296,30 @@ translates it through the CLI, pins the lowered line, and changing that one
 instruction word to each of the other five forms must change the line. On a Linux
 host only the LLVM part (LLVM 19; LLVM 15 was not run) and the reference pictures
 were run; no WARP readback of these six forms exists yet.
+
+Every form above also has a plain VOP3 spelling that translates: `v_add_f32_e64`
+and the other five binary32 operations, the six one-source forms, `v_fract_f32_e64`,
+`v_mul_legacy_f32_e64`, `v_fmac_f32_e64` and the four `v_cmpx_*_f32_e64`
+compares (the destination of a VOP3 `v_cmpx` is the implicit EXEC; LLVM 19 prints
+`v_cmpx_lt_f32_e64 s31, v7`). The translator rewrites the spelling to its e32 form
+after checking that every operand is a plain register, scalar word or constant, so
+both spellings give the same HLSL and the same operand rules, including a VGPR
+second source for the binary32 operations and compares even though VOP3 would allow
+a scalar there. `clamp`, output modifiers (`mul:2`, `div:2`), absolute value, negation
+(`|v1|`, `-v1`, `neg(v1)`), any other suffix, other `_e64` instructions and the
+`v_cmp_*_e64` compares with a scalar mask destination reject translation.
+`tests/depth_mask_check.py` assembles every fixture program with llvm-mc, once with
+each e32 form and once with all of them spelled e64, and requires the translator's
+output from the real machine code to equal the e32 lowering byte for byte. It also
+respells each instruction alone and requires the same text, refuses every modified
+spelling (clamp, `mul:2`, `div:2`, `mul:4`, abs, neg on each register source) of
+every instruction, and refuses the unlisted forms. A mutation control swaps in a
+normaliser that silently drops each modifier and requires the same refusals to be
+accepted, and so detected. The draw fixtures are unchanged: the HLSL of an e64
+spelling is identical to the one they draw, and `source`, `op_source`,
+`cmpx_source` and `unary_source`, which the draw modes call, now also assert that
+identity. On a Linux host only the LLVM part (llvm-mc 19) was run; no WARP readback
+was run for this change.
 
 The Windows fixture binds distinct seeds and thresholds, changes each separately,
 then exchanges the two root CBV addresses. It checks all 1,024 D32_FLOAT
@@ -6041,7 +6118,7 @@ ctest --test-dir out/build/w10 --no-tests=error
 
 `dxr_address_ranges_{hardware,warp}` builds two bottom-level acceleration structures for different triangles, and a top-level structure containing two masked instances. Two synthetic title ranges have identical low 40 bits and bases 1 TiB apart. Each maps through `era_title_va::Table` to its own desktop result buffer. Both BLAS destinations, both instance references and the TLAS GPU binding point 512 bytes into their buffers. The selected byte span must fit the registered range.
 
-Four rays return the hit flag, instance ID, primitive index and distance. The full-address lookup gives instance 7 at distance 1, two misses, and instance 11 at distance 2. A second dispatch deliberately drops the high address bits before resolving the instance references, so both point to the valid first BLAS. The third ray now hits instance 11 at distance 1, and the fourth misses. This measures host range translation and DXR traversal on synthetic guest addresses. The encoding of addresses stored in an external acceleration structure remains unmeasured.
+Four rays return the hit flag, instance ID, primitive index and distance. The full-address lookup gives instance 7 at distance 1, two misses, and instance 11 at distance 2. A second dispatch deliberately drops the high address bits before resolving the instance references, so both point to the valid first BLAS. The third ray now hits instance 11 at distance 1, and the fourth misses. A native control traces the same triangles, masks, rays and transforms with the two BLAS GPU addresses given to the builds and the TLAS directly, without the range table. For the truncation control, both instances name the first BLAS. Hit flag, instance ID and primitive index must match the fixed expectations above. All four words of every ray, distance bits included, must equal the direct-address result. A third dispatch routes the high instance to the low backing on purpose and must differ from that result. Both rows are printed (`dxr_address_rows`), with the distance bits of rays 0 and 3 and of the truncated ray 2 (`dxr_address_distance`). On WARP 10.0.26100.9818 the distances are exactly `0x3f800000` and `0x40000000`. On an AMD Radeon RX 9070 XT (driver 32.0.31044.16, Windows 11 build 26300.9974) the title and direct paths both give `0x3f7fffff` and `0x3fffffff`, one ULP below. That difference therefore comes from the device's triangle intersection, not from address translation (issue #874). This measures host range translation and DXR traversal on synthetic guest addresses. The encoding of addresses stored in an external acceleration structure remains unmeasured.
 
 ```powershell
 cmake --build --preset release --target offscreen_check
