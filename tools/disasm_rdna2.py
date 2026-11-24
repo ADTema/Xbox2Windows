@@ -207,6 +207,8 @@ SOP2_OPS = {
     0x01: ("s_sub_u32", "Scalar sub unsigned 32-bit"),
     0x02: ("s_add_i32", "Scalar add signed 32-bit"),
     0x03: ("s_sub_i32", "Scalar sub signed 32-bit"),
+    0x04: ("s_addc_u32", "Scalar add unsigned 32-bit with carry in SCC"),
+    0x05: ("s_subb_u32", "Scalar sub unsigned 32-bit with borrow in SCC"),
     0x06: ("s_min_i32", "Scalar minimum signed 32-bit"),
     0x07: ("s_min_u32", "Scalar minimum unsigned 32-bit"),
     0x08: ("s_max_i32", "Scalar maximum signed 32-bit"),
@@ -221,6 +223,14 @@ SOP2_OPS = {
     0x13: ("s_xor_b64", "Scalar bitwise XOR 64-bit"),
     0x14: ("s_andn2_b32", "Scalar AND with NOT 32-bit"),
     0x15: ("s_andn2_b64", "Scalar AND with NOT 64-bit"),
+    0x16: ("s_orn2_b32", "Scalar OR with NOT 32-bit"),
+    0x17: ("s_orn2_b64", "Scalar OR with NOT 64-bit"),
+    0x18: ("s_nand_b32", "Scalar bitwise NAND 32-bit"),
+    0x19: ("s_nand_b64", "Scalar bitwise NAND 64-bit"),
+    0x1a: ("s_nor_b32", "Scalar bitwise NOR 32-bit"),
+    0x1b: ("s_nor_b64", "Scalar bitwise NOR 64-bit"),
+    0x1c: ("s_xnor_b32", "Scalar bitwise XNOR 32-bit"),
+    0x1d: ("s_xnor_b64", "Scalar bitwise XNOR 64-bit"),
     0x1e: ("s_lshl_b32", "Scalar logical shift left 32-bit"),
     0x1f: ("s_lshl_b64", "Scalar logical shift left 64-bit"),
     0x20: ("s_lshr_b32", "Scalar logical shift right 32-bit"),
@@ -239,6 +249,9 @@ SOP2_OPS = {
     0x2f: ("s_lshl2_add_u32", "Scalar shift left 2 and add 32-bit"),
     0x30: ("s_lshl3_add_u32", "Scalar shift left 3 and add 32-bit"),
     0x31: ("s_lshl4_add_u32", "Scalar shift left 4 and add 32-bit"),
+    0x32: ("s_pack_ll_b32_b16", "Scalar pack low halves of two sources into 32-bit"),
+    0x33: ("s_pack_lh_b32_b16", "Scalar pack low half and high half into 32-bit"),
+    0x34: ("s_pack_hh_b32_b16", "Scalar pack high halves of two sources into 32-bit"),
     0x35: ("s_mul_hi_u32", "Scalar multiply high unsigned 32-bit"),
     0x36: ("s_mul_hi_i32", "Scalar multiply high signed 32-bit"),
 }
@@ -463,6 +476,10 @@ VOP1_OPS = {
     0x39: ("v_ffbh_u32_e32", "Find first bit high uint32"),
     0x3a: ("v_ffbl_b32_e32", "Find first bit low uint32"),
     0x3b: ("v_ffbh_i32_e32", "Find first bit high int32"),
+    0x42: ("v_movreld_b32_e32", "Vector copy with relative destination"),
+    0x43: ("v_movrels_b32_e32", "Vector copy with relative source"),
+    0x44: ("v_movrelsd_b32_e32", "Vector copy with relative source and destination"),
+    0x48: ("v_movrelsd_2_b32_e32", "Vector copy with relative source and destination (extended form)"),
 }
 
 VOPC_OPS = {
@@ -697,8 +714,10 @@ VOP2_OPS = {
     0x2c: ("v_fmamk_f32", "Vector fused multiply-add with literal multiplier"),
     0x2d: ("v_fmaak_f32", "Vector fused multiply-add with literal addend"),
     0x2f: ("v_cvt_pkrtz_f16_f32_e32", "Convert two float32 to packed float16 (round to zero)"),
+    0x36: ("v_fmac_f16_e32", "Vector fused multiply-accumulate float16"),
     0x37: ("v_fmamk_f16", "Vector fused multiply-add float16 with literal multiplier"),
     0x38: ("v_fmaak_f16", "Vector fused multiply-add float16 with literal addend"),
+    0x3b: ("v_ldexp_f16_e32", "Vector scale float16 by a power of two"),
 }
 
 VOP3_NATIVE_OPS = {
@@ -2354,9 +2373,13 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
 
 
 def disassemble_binary(data: bytes, shader_name: str = "shader") -> list[dict]:
-    """Disassemble raw binary RDNA 2 shader into structured instruction records."""
+    """Decode the complete span and mark records after the first s_endpgm.
+
+    after_endpgm describes byte order only. A branch can still reach a later record.
+    """
     instructions = []
     offset = 0
+    after_endpgm = False
     while offset < len(data):
         length, op_name, asm, comment = decode_instruction(data, offset)
         hex_bytes = data[offset:offset + length].hex()
@@ -2367,8 +2390,11 @@ def disassemble_binary(data: bytes, shader_name: str = "shader") -> list[dict]:
             "opcode": op_name,
             "assembly": asm,
             "comment": comment,
+            "after_endpgm": after_endpgm,
         })
         offset += length
+        if op_name == "s_endpgm":
+            after_endpgm = True
     return instructions
 
 

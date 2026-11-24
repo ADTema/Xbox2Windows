@@ -1590,6 +1590,17 @@ LDS_STRIDED_PROGRAMS = {
         "ds_read2st64_b64 v[10:13], v5 offset0:2 offset1:1", "s_waitcnt lgkmcnt(0)",
         "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
     ],
+    "lds_st64_xchg_b64": DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 3, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
+        "v_mov_b32_e32 v10, 0x12345678", "v_mov_b32_e32 v11, 0x9abcdef0",
+        "ds_write2st64_b64 v5, v[6:7], v[10:11] offset0:1 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v12, 0x11111111", "v_mov_b32_e32 v13, 0x22222222",
+        "v_mov_b32_e32 v14, 0x33333333", "v_mov_b32_e32 v15, 0x44444444",
+        "ds_wrxchg2st64_rtn_b64 v[12:15], v5, v[12:13], v[14:15] offset0:2 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "ds_read2st64_b64 v[16:19], v5 offset0:1 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[12:15], v8, s[20:23], 0 idxen",
+        "buffer_store_dwordx4 v[16:19], v8, s[20:23], 0 idxen offset:16", "s_endpgm",
+    ],
     "lds_st64_xchg": DS_PREFIX + [
         "v_lshlrev_b32_e32 v5, 2, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
         "ds_write2st64_b32 v5, v6, v7 offset0:2 offset1:3", "s_waitcnt lgkmcnt(0)",
@@ -1599,7 +1610,7 @@ LDS_STRIDED_PROGRAMS = {
         "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
     ],
 }
-LDS_STRIDED_CASES = [(name, lines, LDS_BINDING | {"lds_bytes": 1280, "stride": 8 if name.endswith("b32") else 16})
+LDS_STRIDED_CASES = [(name, lines, LDS_BINDING | {"lds_bytes": 1280, "stride": {"lds_st64_b32": 8, "lds_st64_xchg_b64": 32}.get(name, 16)})
                      for name, lines in LDS_STRIDED_PROGRAMS.items()]
 
 
@@ -1609,6 +1620,9 @@ def lds_strided_reference(name, groups):
         first = 0x76543210 + lane
         if name == "lds_st64_b32":
             words.extend((0x89abcdef, first))
+        elif name == "lds_st64_xchg_b64":
+            words.extend((0x12345678, 0x9abcdef0, first, 0x89abcdef,
+                          0x33333333, 0x44444444, 0x11111111, 0x22222222))
         elif name == "lds_st64_b64":
             words.extend((0x12345678, 0x9abcdef0, first, 0x89abcdef))
         else:
@@ -1770,6 +1784,13 @@ LDS_WIDE_PROGRAMS = {
         "ds_write_b96 v5, v[16:18]", "s_waitcnt lgkmcnt(0)",
         "ds_read_b96 v[10:12], v5", "s_waitcnt lgkmcnt(0)",
     ],
+    "lds_xchg2_b32": [
+        "v_mov_b32_e32 v16, v6", "v_mov_b32_e32 v17, v7", "v_mov_b32_e32 v18, v9",
+        "ds_write_b96 v5, v[16:18]", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v10, 0x13572468", "v_mov_b32_e32 v11, 0x24681357",
+        "ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:2", "s_waitcnt lgkmcnt(0)",
+        "ds_read2_b32 v[12:13], v5 offset0:2", "s_waitcnt lgkmcnt(0)",
+    ],
     "lds_read2_b32": [
         "v_mov_b32_e32 v16, v6", "v_mov_b32_e32 v17, v7", "v_mov_b32_e32 v18, v9",
         "ds_write_b96 v5, v[16:18]", "s_waitcnt lgkmcnt(0)",
@@ -1785,8 +1806,10 @@ def lds_wide_program(name):
         return LDS_WIDE_SETUP + LDS_WIDE_QUAD_SETUP + ds + [
             "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
         ]
+    store = ("buffer_store_dwordx4 v[10:13]" if name == "lds_xchg2_b32"
+             else "buffer_store_dwordx3 v[10:12]")
     return LDS_WIDE_SETUP + LDS_WIDE_PROGRAMS[name] + [
-        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen", "s_endpgm",
+        store + ", v8, s[20:23], 0 idxen", "s_endpgm",
     ]
 
 
@@ -1794,6 +1817,9 @@ def lds_wide_reference(name, groups):
     words = []
     for lane in range(groups * 32):
         data = 0x12345670 + lane
+        if name == "lds_xchg2_b32":
+            words.extend((0x76543210, data, 0x13572468, 0x24681357))
+            continue
         if name in LDS_WIDE_QUADS:
             words.extend({
                 "lds_b128": (data, 0x89abcdef, 0x76543210, 0xf0e1d2c3),
@@ -1806,7 +1832,8 @@ def lds_wide_reference(name, groups):
     return words
 
 
-LDS_PACKED_CASES = [(name, lds_wide_program(name), LDS_WIDE_BINDING) for name in LDS_WIDE_PROGRAMS]
+LDS_PACKED_CASES = [(name, lds_wide_program(name), LDS_WIDE_BINDING | {"stride": 16} if name == "lds_xchg2_b32"
+                     else LDS_WIDE_BINDING) for name in LDS_WIDE_PROGRAMS]
 LDS_PACKED_CASES += [(name, lds_wide_program(name), LDS_WIDE_BINDING | {"stride": 16}) for name in LDS_WIDE_QUADS]
 
 
@@ -1943,6 +1970,29 @@ LDS_F64_CASES = [(op, lds_f64_cmpst(op), LDS_WIDE_BINDING | {"stride": 16 if "_r
 LDS_FLOAT_CASES = LDS_F32_CASES + LDS_F64_CASES
 
 
+LDS_WAVE_COUNTER = DS_PREFIX + [
+    "s_mov_b32 m0, 0", "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0xfffffff0", "ds_write_b32 v5, v6", "s_waitcnt lgkmcnt(0)",
+    "ds_append v10", "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v11, v5", "s_waitcnt lgkmcnt(0)",
+    "ds_consume v12", "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v13, v5", "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
+]
+LDS_CASES += [("lds_wave_counter", LDS_WAVE_COUNTER, LDS_BINDING | {"stride": 16})]
+
+
+def lds_wave_counter_reference(groups):
+    words = []
+    for lane in range(groups * 32):
+        first = lane // 32 * 32
+        seed = (0xfffffff0 + first) & 0xffffffff
+        incremented = (seed + 32) & 0xffffffff
+        private = (0xfffffff0 + lane) & 0xffffffff
+        words.extend((seed, incremented if lane == first else private, incremented, private))
+    return words
+
+
 def lds_controls():
     op, lines, binding = LDS_WIDE_REPLACEMENT_CASES[1]
     target = lds_wide_replacement_instruction(op)
@@ -2042,6 +2092,21 @@ def lds_controls():
     ):
         rejects(message, aot.lower, variant(lines, (before, after)), 32, **binding)
     rejects("Unverified private strided LDS access", aot.lower, lines, 32, **(binding | {"lds_bytes": 1279}))
+    for old, bad, message in (
+        ("s_mov_b32 m0, 0", "s_nop 0", "Unverified LDS wave counter"),
+        ("s_mov_b32 m0, 0", "s_mov_b32 m0, 4", "Unsupported compute instruction"),
+        ("ds_write_b32 v5, v6", "s_nop 0", "Unverified LDS wave counter"),
+        ("ds_append v10", "ds_append v10 gds", "Unsupported compute instruction"),
+        ("ds_consume v12", "ds_consume v12 offset:4", "Unsupported compute instruction"),
+        ("ds_append v10", "ds_append v10\ns_nop 0", "Expected immediate s_waitcnt lgkmcnt(0) after DS"),
+    ):
+        rejects(message, aot.lower, variant(LDS_WAVE_COUNTER, (old, bad)), 32, **LDS_BINDING)
+    lines = lds_wide_program("lds_xchg2_b32")
+    rejects("Unverified private paired dword exchange", aot.lower,
+            variant(lines, ("v10, v11 offset0:2", "v10, v11")), 32, **LDS_WIDE_BINDING)
+    rejects("Uninitialized private paired dword exchange", aot.lower,
+            variant(lines, ("ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:2",
+                            "ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:3")), 32, **LDS_WIDE_BINDING)
     wide = lds_wide_program("lds_b96")
     rejects("Unverified dispatch byte offset", aot.lower, wide, 32, **LDS_BINDING)
     for old, bad, message in (
@@ -2272,6 +2337,9 @@ def ds_mutants(name, lines, binding, source):
         if name in ("ds_read_i8_d16", "ds_read_i8_d16_hi"):
             changed = variant(lines, (f"{name} v10, v5", f"{name.replace('i8', 'u8')} v10, v5"))
             yield aot.lower(changed, 32, **binding), 0
+    elif name == "lds_wave_counter":
+        yield aot.lower(variant(lines, ("ds_append v10", "ds_consume v10")), 32, **binding), 1
+        yield aot.lower(variant(lines, ("ds_consume v12", "ds_append v12")), 32, **binding), 3
     elif name in LDS_QWORD_RETURNS:
         # Substitute the post-update word pair for the returned pre-update pair.
         changed = variant(lines, ("v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v12, v10"),
@@ -2318,7 +2386,10 @@ def ds_mutants(name, lines, binding, source):
             word = 0
         yield aot.lower(variant(lines, change), 32, **binding), word
     elif name in LDS_WIDE_PROGRAMS:
-        if name == "lds_read2_b32":
+        if name == "lds_xchg2_b32":
+            change = ("ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:2",
+                      "ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset1:2")
+        elif name == "lds_read2_b32":
             change = ("offset0:2 offset1:1", "offset0:1 offset1:2")
         elif name == "lds_b64":
             change = ("ds_read_b64 v[10:11], v5 offset:8", "ds_read_b64 v[10:11], v5")
@@ -2347,6 +2418,7 @@ def ds_mutants(name, lines, binding, source):
             "lds_st64_b32": ("offset0:3 offset1:2", "offset0:2 offset1:3"),
             "lds_st64_b64": ("offset0:2 offset1:1", "offset0:1 offset1:2"),
             "lds_st64_xchg": ("offset0:3 offset1:2", "offset0:2 offset1:3"),
+            "lds_st64_xchg_b64": ("offset0:2 offset1:1", "offset0:1 offset1:2"),
         }[name]
         yield aot.lower(variant(lines, change), 32, **binding), 0
     elif name in LDS_WIDE_REPLACEMENTS:
@@ -2399,10 +2471,14 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
         # Four words per lane fill the fixed 320-word readback before three groups.
-        four_words = (name in LDS_QWORD_RETURNS or name in LDS_WIDE_QUADS or name in LDS_STRIDED_PROGRAMS
+        four_words = (name in ("lds_wave_counter", "lds_xchg2_b32") or name in LDS_QWORD_RETURNS
+                      or name in LDS_WIDE_QUADS or name in LDS_STRIDED_PROGRAMS
                       or name in LDS_F64_CMPST and "_rtn" in name
                       or name in LDS_WIDE_REPLACEMENTS and "_rtn" in name)
-        for groups in (1, 2) if four_words else (1, 3):
+        group_counts = (1, 2) if four_words else (1, 3)
+        if name == "lds_st64_xchg_b64":
+            group_counts = (1,)
+        for groups in group_counts:
             if name in LDS_UPDATES or name in LDS_RETURN_UPDATES:
                 words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
             elif name in LDS_SUBWORDS:
@@ -2417,6 +2493,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = [base + lane for lane in range(groups * 32) for base in (0x12345670, 0x89abcdef)]
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)
+            elif name == "lds_wave_counter":
+                words = lds_wave_counter_reference(groups)
             elif name in LDS_QWORD_UPDATES or name in LDS_QWORD_RETURNS:
                 words = lds_qword_reference(name, groups)
             elif name in LDS_WIDE_PROGRAMS or name in LDS_WIDE_QUADS:

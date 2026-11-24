@@ -145,7 +145,7 @@ target_link_libraries(windows_placeholder_partition_check PRIVATE OneCore)
 add_test(NAME windows_placeholder_partition COMMAND windows_placeholder_partition_check)
 
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
-add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12_xs_shim.def)
+add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12x_device_slots.cpp src/d3d12_xs_shim.def)
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
@@ -457,6 +457,21 @@ target_compile_features(d3d12_xs_shim_check PRIVATE cxx_std_17)
 foreach(scenario IN ITEMS exports serialize deserialize warp_root)
     add_test(NAME d3d12_xs_shim_${scenario} COMMAND d3d12_xs_shim_check ${scenario})
 endforeach()
+# D3D12XboxCreateDevice device-slot inventory and source-built creation fixture (#XCL-08).
+add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp)
+add_dependencies(d3d12x_device_check d3d12_xs_shim)
+target_compile_features(d3d12x_device_check PRIVATE cxx_std_17)
+target_link_libraries(d3d12x_device_check PRIVATE d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME d3d12x_device_create_${adapter} COMMAND d3d12x_device_check
+        "$<TARGET_FILE:d3d12_xs_shim>" create ${adapter})
+    add_test(NAME d3d12x_device_negative_${adapter} COMMAND d3d12x_device_check
+        "$<TARGET_FILE:d3d12_xs_shim>" negative ${adapter})
+endforeach()
+set_tests_properties(d3d12x_device_create_hardware d3d12x_device_negative_hardware PROPERTIES
+    SKIP_RETURN_CODE 77)
+set_tests_properties(d3d12x_device_negative_warp d3d12x_device_negative_hardware PROPERTIES
+    PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice: unsupported IID \\{7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01\\}")
 # The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
 set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
 add_custom_command(OUTPUT "${vm_translation_header}"
@@ -527,6 +542,11 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(descriptor_window_stale_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "descriptor_windows submit=2 slot=[1-9]")
+    foreach(scenario IN ITEMS live stale unknown)
+        add_test(NAME descriptor_record_copy_${scenario}_${adapter}
+            COMMAND offscreen_check ${adapter} --descriptor-record-copy ${scenario})
+        set_tests_properties(descriptor_record_copy_${scenario}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME texture_mips_${adapter} COMMAND offscreen_check ${adapter} --texture-mips)
     set_tests_properties(dual_uav_${adapter} texture_mips_${adapter} PROPERTIES TIMEOUT 45)
     add_test(NAME dxr_query_${adapter} COMMAND offscreen_check ${adapter} --ray-query)
@@ -679,7 +699,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     foreach(adapter IN ITEMS hardware warp)
         foreach(bridge IN ITEMS address_window:draw sampler_views:sampler ballot_extract:ballot
                                 compaction:compaction compare_sampler:compare_sampler minlod:minlod
-                                minlod_levels:minlod_levels minlod_fractional:minlod_fractional)
+                                minlod_exact:minlod_exact minlod_levels:minlod_levels
+                                minlod_fractional:minlod_fractional)
             string(REPLACE ":" ";" bridge "${bridge}")
             list(GET bridge 0 name)
             list(GET bridge 1 driver)
@@ -1301,6 +1322,31 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_mmx_original>"
         "$<TARGET_FILE:cpu_sse_mmx_original_lifted>"
         "$<TARGET_FILE:cpu_sse_mmx_altered_lifted>")
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_integer_flags_${variant} integer_flags)
+        set(cpu_integer_flags_${variant}_lifted_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_integer_flags_${variant}_lifted.cpp")
+        add_custom_command(OUTPUT "${cpu_integer_flags_${variant}_lifted_cpp}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py"
+                emit "$<TARGET_FILE:cpu_integer_flags_${variant}>" "${cpu_integer_flags_${variant}_lifted_cpp}"
+            DEPENDS cpu_integer_flags_${variant} tests/cpu/integer_flags_check.py tools/ffx_version_query.py
+                tools/x87_lower.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_integer_flags_${variant}_lifted SHARED "${cpu_integer_flags_${variant}_lifted_cpp}")
+    endforeach()
+    target_compile_definitions(cpu_integer_flags_altered PRIVATE ALTER_IMM)
+    set(cpu_integer_flags_controls_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_integer_flags_controls.cpp")
+    add_custom_command(OUTPUT "${cpu_integer_flags_controls_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py"
+            emit-controls "$<TARGET_FILE:cpu_integer_flags_original>" "${cpu_integer_flags_controls_cpp}"
+        DEPENDS cpu_integer_flags_original tests/cpu/integer_flags_check.py tools/ffx_version_query.py
+            tools/x87_lower.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_integer_flags_controls SHARED "${cpu_integer_flags_controls_cpp}")
+    add_test(NAME cpu_aot_integer_flags COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py" check
+        "$<TARGET_FILE:cpu_integer_flags_original>"
+        "$<TARGET_FILE:cpu_integer_flags_original_lifted>"
+        "$<TARGET_FILE:cpu_integer_flags_altered_lifted>"
+        "$<TARGET_FILE:cpu_integer_flags_controls>")
+    set_tests_properties(cpu_aot_integer_flags PROPERTIES SKIP_RETURN_CODE 77)
     # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
     # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
     set(tail_files)
@@ -3744,6 +3790,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_acphal_hal_provider_faulty>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_acphal_hal PROPERTIES TIMEOUT 60)
 
+    add_library(cpu_xapu_queue_provider SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
+    add_library(cpu_xapu_queue_provider_lenient SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
+    target_compile_definitions(cpu_xapu_queue_provider_lenient PRIVATE XAPU_TEST_LENIENT)
+    add_library(cpu_xapu_queue_provider_lifo SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
+    target_compile_definitions(cpu_xapu_queue_provider_lifo PRIVATE XAPU_TEST_LIFO)
+    add_executable(cpu_xapu_queue_caller tests/cpu/xapu_queue_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_xapu_queue_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_xapu_queue_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_xapu_queue_caller PRIVATE cpu_xapu_queue_provider cpu_exe_io)
+    add_test(NAME cpu_native_xapu_queue COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xapu_queue_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_xapu_queue_caller>" "$<TARGET_FILE:cpu_xapu_queue_provider>"
+        "$<TARGET_FILE:cpu_xapu_queue_provider_lenient>" "$<TARGET_FILE:cpu_xapu_queue_provider_lifo>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_xapu_queue PROPERTIES TIMEOUT 60)
+
     add_library(cpu_dstorage_provider SHARED tests/cpu/dstorage_provider.cpp tests/cpu/dstorage_provider.def)
     add_executable(cpu_dstorage_caller tests/cpu/dstorage_caller.asm tests/cpu/exe_startup.asm)
     set_target_properties(cpu_dstorage_caller PROPERTIES LINKER_LANGUAGE CXX)
@@ -3817,6 +3879,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/bc7_blocks_check.py")
     add_test(NAME bc7_tile_swizzle COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bc7_tiles_check.py")
+    add_test(NAME gfx10_texture_roundtrip COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/gfx10_texture_roundtrip_check.py" roundtrip)
+    add_test(NAME gfx10_texture_roundtrip_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/gfx10_texture_roundtrip_check.py" controls)
     add_test(NAME resource_range_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/resource_ranges_check.py")
     add_test(NAME ttpf_batch_export COMMAND "${INTAKE_PYTHON}" -B
@@ -4033,6 +4099,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_region_waits_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_region_waits_${adapter}.txt")
+        add_test(NAME pixel_aot_region_scalar_alu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-region-scalar-alu "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_region_scalar_alu_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_region_scalar_alu_${adapter}.txt")
         add_test(NAME pixel_position_centers_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_position_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

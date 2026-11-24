@@ -2472,6 +2472,13 @@ REGION_ALU = re.compile(
     r"v_(?:mov_b32|(?:add|sub|subrev|mul|min|max)_f32)(?:_e32|_e64)? "
     r"|v_(?:fmac|mac|rcp|rsq|sqrt)_f32_e32 |v_cvt_f32_ubyte[0-3]_e32 |v_mul_legacy_f32_e(?:32|64) "
     r"|v_(?:fma|mad|med3)_f32 ")
+# Only scalar ALU whose lowerings already validate their operands and effects may run in a region.
+REGION_SALU = re.compile(
+    r"s_(?:mov_b32|movk_i32) s\d+, (?:s\d+|0x[0-9a-f]+|\d+)"
+    r"|s_(?:add|mul)_i32 s\d+, [^,]+, [^,]+"
+    r"|s_cmp_(?:eq|lg|gt|ge|lt|le)_i32 [^,]+, [^,]+"
+    r"|s_cselect_b32 s\d+, [^,]+, [^,]+")
+REGION_SALU_DEST = re.compile(r"s_(?:mov_b32|movk_i32|add_i32|mul_i32|cselect_b32) (s\d+),")
 # Stage 1 of issue #987: scalar instructions that leave every tracked register and counter unchanged may also sit
 # in a region, because skipping them with the whole wave (s_cbranch_execz) or running them changes nothing.
 REGION_NOP = re.compile(r"s_nop (?:0x[0-9a-f]+|\d+)")
@@ -2495,18 +2502,6 @@ def wait_counters(line):
     return None
 
 
-class TrackedScalar(dict):
-    """Scalar register map that clears tracked bitmasks whenever a register is overwritten."""
-
-    def __init__(self, initial, mask_map):
-        super().__init__(initial)
-        self._mask_map = mask_map
-
-    def __setitem__(self, key, value):
-        self._mask_map.pop(key, None)
-        super().__setitem__(key, value)
-
-
 class TrackedVector(VectorRegisters):
     """Vector register names that record reads, so a conditionally-written register can be refused."""
 
@@ -2525,6 +2520,31 @@ class TrackedVector(VectorRegisters):
         return super().get(key, default)
 
     def __setitem__(self, key, value):
+        if not self.masked:
+            self.conditional.discard(key)
+        super().__setitem__(key, value)
+
+
+class TrackedScalar(dict):
+    """Track conditional scalar definitions and invalidate bitmasks on writes."""
+
+    def __init__(self, initial, mask_map):
+        super().__init__(initial)
+        self._mask_map = mask_map
+        self.reads = []
+        self.masked = False
+        self.conditional = set()
+
+    def __getitem__(self, key):
+        self.reads.append(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self.reads.append(key)
+        return super().get(key, default)
+
+    def __setitem__(self, key, value):
+        self._mask_map.pop(key, None)
         if not self.masked:
             self.conditional.discard(key)
         super().__setitem__(key, value)
@@ -2696,6 +2716,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
 
     def close_region(i, pair):
         """Merge every register the open region rewrote with a per-lane select on its condition."""
+        nonlocal scc
         if (region is None or pair != region["save"]
                 or (region["skip"] is not None and region["skip"] != i)):
             raise ValueError("Unexpected execution mask restore")
@@ -2710,10 +2731,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector[dst] = f"alu{i}_{dst}"
         vector.masked = False
         vector.reads.clear()
+        scalar.masked = False
+        scalar.conditional.update(region["scalar_written"])
+        if region["scc_written"]:
+            scc = None
 
     for i, (offset, line) in enumerate(positioned):
         vector.reads.clear()
+        scalar.reads.clear()
         conditional = set(vector.conditional)
+        scalar_conditional = set(scalar.conditional)
         def match(pattern):
             return re.fullmatch(pattern, line)
 
@@ -2748,12 +2775,19 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError(f"Wait would resolve outstanding {'/'.join(busy)} work in a masked region: {line}")
                 if "vs" in counters and scratch_written:
                     raise ValueError(f"Store counter state is unknown after a scratch store in a masked region: {line}")
+            elif REGION_SALU.fullmatch(line):
+                destination = REGION_SALU_DEST.match(line)
+                if destination and destination[1] in region["save"]:
+                    raise ValueError(f"Masked scalar ALU overwrites the saved execution pair: {line}")
+                rstate = (dict(scalar), dict(vector), scc, set(pending), dict(sample_dest),
+                          exported, ended, mask, attribute_input, interpolated,
+                          dict(quad_values), samples, True)
             elif not REGION_ALU.match(line):
                 raise ValueError(f"Instruction cannot run in a masked region: {line}")
             else:
                 rstate = (dict(scalar), dict(vector), scc, set(pending), dict(sample_dest),
                           exported, ended, mask, attribute_input, interpolated,
-                          dict(quad_values), samples)
+                          dict(quad_values), samples, False)
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
             continue
         # SOPK s_version K (gfx10+) has no destination and does not write SCC: a marker with no effect.
@@ -2966,8 +3000,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Unsupported execution mask save")
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
             region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i,
-                      "opener": "saveexec"}
+                      "scalar_written": set(), "scc_written": False, "opener": "saveexec"}
             vector.masked = True
+            scalar.masked = True
             scc = None
         elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32))_e32 "
                         r"([^,]+), ([^,]+)"):
@@ -2995,8 +3030,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    bool cmp{i} = {expr};")
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
             region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i,
-                      "opener": "cmpx"}
+                      "scalar_written": set(), "scc_written": False, "opener": "cmpx"}
             vector.masked = True
+            scalar.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
             # The whole-wave empty-mask skip may sit right after the save; its target must be
             # the matching restore exactly. Offsets count from the next instruction.
@@ -5118,19 +5154,39 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             raise ValueError(f"Unsupported instruction {i}: {line}")
         if rstate is not None:
             (old_scalar, old_vector, old_scc, old_pending, old_sample_dest, old_exported,
-             old_ended, old_mask, old_attribute, old_interpolated, old_quad, old_samples) = rstate
+             old_ended, old_mask, old_attribute, old_interpolated, old_quad, old_samples, scalar_alu) = rstate
             writes = {k for k in set(vector) | set(old_vector)
                       if old_vector.get(k, MISSING) != dict.get(vector, k, MISSING)}
-            if (scalar != old_scalar or scc != old_scc or pending != old_pending
-                    or sample_dest != old_sample_dest or exported != old_exported
-                    or ended != old_ended or mask != old_mask
-                    or attribute_input != old_attribute or interpolated != old_interpolated
-                    or quad_values != old_quad or samples != old_samples or not writes
-                    or any(not isinstance(dict.get(vector, k), str) for k in writes)):
-                raise ValueError(f"Unsupported masked-region operation {i}: {line}")
-            for k in writes:
-                region["written"].setdefault(k, old_vector.get(k, MISSING))
+            if scalar_alu:
+                destination = REGION_SALU_DEST.match(line)
+                scalar_writes = {k for k in set(scalar) | set(old_scalar)
+                                 if old_scalar.get(k, MISSING) != dict.get(scalar, k, MISSING)}
+                expected_scalar_writes = {destination[1]} if destination else set()
+                writes_scc = scc != old_scc
+                expected_scc_write = line.startswith(("s_add_i32 ", "s_cmp_"))
+                if (not scalar_writes.issubset(expected_scalar_writes)
+                        or (scalar != old_scalar and scalar_writes != expected_scalar_writes)
+                        or writes_scc != expected_scc_write or writes
+                        or pending != old_pending or sample_dest != old_sample_dest
+                        or exported != old_exported or ended != old_ended or mask != old_mask
+                        or attribute_input != old_attribute or interpolated != old_interpolated
+                        or quad_values != old_quad or samples != old_samples):
+                    raise ValueError(f"Unsupported masked-region scalar ALU operation {i}: {line}")
+                region["scalar_written"].update(expected_scalar_writes)
+                region["scc_written"] |= writes_scc
+            else:
+                if (scalar != old_scalar or scc != old_scc or pending != old_pending
+                        or sample_dest != old_sample_dest or exported != old_exported
+                        or ended != old_ended or mask != old_mask
+                        or attribute_input != old_attribute or interpolated != old_interpolated
+                        or quad_values != old_quad or samples != old_samples or not writes
+                        or any(not isinstance(dict.get(vector, k), str) for k in writes)):
+                    raise ValueError(f"Unsupported masked-region operation {i}: {line}")
+                for k in writes:
+                    region["written"].setdefault(k, old_vector.get(k, MISSING))
         if conditional.intersection(vector.reads):
+            raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
+        if scalar_conditional.intersection(scalar.reads):
             raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
     if region is not None:
         raise ValueError("Program ends inside a masked region")

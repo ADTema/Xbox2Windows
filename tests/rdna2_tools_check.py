@@ -114,6 +114,39 @@ def envelope(code: bytes, name: bytes = b"fixture_ps") -> bytes:
 class TestRdna2Disasm(unittest.TestCase):
     """Test pure-Python RDNA 2 disassembler and verify against golden vectors and LLVM."""
 
+    # GFX1013 e32 encodings from llvm-mc 19 -show-encoding.
+    VOP1_VOP2_E32_VECTORS = (
+        ("050f066c", "v_fmac_f16_e32 v3, v5, v7"),
+        ("0d231676", "v_ldexp_f16_e32 v11, v13, v17"),
+        ("1785267e", "v_movreld_b32_e32 v19, v23"),
+        ("1f873a7e", "v_movrels_b32_e32 v29, v31"),
+        ("29894a7e", "v_movrelsd_b32_e32 v37, v41"),
+        ("2f91567e", "v_movrelsd_2_b32_e32 v43, v47"),
+    )
+
+    def test_vop1_vop2_e32_gfx1013(self):
+        for encoding, assembly in self.VOP1_VOP2_E32_VECTORS:
+            with self.subTest(assembly=assembly):
+                record, = disasm_rdna2(bytes.fromhex(encoding))
+                self.assertEqual(record["assembly"], assembly)
+
+    def test_vop1_vop2_e32_llvm_round_trip(self):
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"VOP1/VOP2 round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        source = [assembly for _, assembly in self.VOP1_VOP2_E32_VECTORS]
+        expected = bytes.fromhex("".join(encoding for encoding, _ in self.VOP1_VOP2_E32_VECTORS))
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        self.assertEqual(emitted, expected)
+        decoded = [record["assembly"] for record in disasm_rdna2(emitted)]
+        self.assertEqual(decoded, llvm_disassemble(emitted, resolved_lib))
+        self.assertEqual(decoded, source)
+        self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
+
     def test_golden_vectors(self):
         vectors = [
             # (hex_bytes, expected_opcode, expected_mnemonic)
@@ -684,12 +717,14 @@ class TestRdna2Disasm(unittest.TestCase):
                 (4, 4, "sopk_truncated", "s_setreg_imm32_b32 <truncated>"),
             ],
         )
-        # A 32-bit literal equal to s_endpgm (0xbf810000) belongs to s_setreg_imm32_b32.
+        # Boundary control: a 32-bit literal equal to s_endpgm (0xbf810000) belongs to
+        # s_setreg_imm32_b32.  Trailing bytes after s_endpgm are still decoded and marked
+        # with after_endpgm=True (matches LLVM 15 decode-through-end behaviour).
         stream = bytes.fromhex(
             "810880ba000081bf"  # s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0xbf810000
             "01f804b9"          # s_getreg_b32 s4, hwreg(HW_REG_MODE)
             "000081bf"          # s_endpgm
-            "810884b9"          # s_setreg_b32 after s_endpgm is still in the supplied span
+            "810884b9"          # trailing instruction decoded past s_endpgm
         )
         insns = disasm_rdna2(stream)
         self.assertEqual(
@@ -815,6 +850,39 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(result["supported_instructions"], len(scan_source))
         self.assertFalse(result["translator_accepted"])
         self.assertEqual(result["lower_error"], "Instruction follows program end")
+
+    def test_decode_continues_past_s_endpgm(self):
+        """Issue #938 step 4: disasm_rdna2 must decode past s_endpgm (LLVM 15 behaviour).
+
+        Verifies that instructions after s_endpgm are decoded, and that the
+        after_endpgm field distinguishes pre/post terminator instructions.
+        """
+        # s_endpgm followed by a valid instruction — must NOT stop at offset 4.
+        stream = bytes.fromhex("000081bf" + "0103007e")  # s_endpgm | v_mov_b32_e32 v0, v1
+        insns = disasm_rdna2(stream)
+        self.assertEqual(len(insns), 2)
+        self.assertEqual(insns[0]["opcode"], "s_endpgm")
+        self.assertEqual(insns[1]["opcode"], "v_mov_b32_e32")
+        self.assertFalse(insns[0]["after_endpgm"])
+        self.assertTrue(insns[1]["after_endpgm"])
+
+        # Instruction sequence: v_mov_b32_e32 v0, v1 | s_nop 0 | s_endpgm | v_mov_b32_e32 v2, v3
+        stream2 = bytes.fromhex(
+            "0103007e" +  # v_mov_b32_e32 v0, v1
+            "000080bf" +  # s_nop 0
+            "000081bf" +  # s_endpgm
+            "0307007e"    # v_mov_b32_e32 v2, v3
+        )
+        insns2 = disasm_rdna2(stream2)
+        self.assertGreaterEqual(len(insns2), 4)
+        self.assertEqual(insns2[2]["opcode"], "s_endpgm")
+        self.assertEqual(insns2[3]["after_endpgm"], True)
+
+        # A second terminator cannot move the first boundary.
+        repeated = disasm_rdna2(stream + bytes.fromhex("000081bf0103007e"))
+        self.assertEqual([ins["after_endpgm"] for ins in repeated], [False, True, True, True])
+        unterminated = disasm_rdna2(bytes.fromhex("0103007e000080bf"))
+        self.assertEqual([ins["after_endpgm"] for ins in unterminated], [False, False])
 
     def test_second_dword_forms_keep_the_stream_aligned(self):
         # Independent GFX10 encodings from LLVM MC 15.0.7 test/MC/AMDGPU (gfx10_asm_vop1.s,
@@ -1345,6 +1413,38 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(len(insns), 1, f"Failed decoding SOP2 op 0x{op:02x}")
             self.assertEqual(insns[0]["opcode"], expected_name)
             self.assertEqual(insns[0]["length"], 4)
+
+    # Encodings and spellings from llvm-mc gfx1013 (identical text on LLVM 15 and 19).
+    SOP2_CARRY_LOGIC_PACK_FORMS = (
+            ("01020082", "s_addc_u32 s0, s1, s2"),
+            ("01028082", "s_subb_u32 s0, s1, s2"),
+            ("0102008b", "s_orn2_b32 s0, s1, s2"),
+            ("0204808b", "s_orn2_b64 s[0:1], s[2:3], s[4:5]"),
+            ("0102008c", "s_nand_b32 s0, s1, s2"),
+            ("0204808c", "s_nand_b64 s[0:1], s[2:3], s[4:5]"),
+            ("0102008d", "s_nor_b32 s0, s1, s2"),
+            ("0204808d", "s_nor_b64 s[0:1], s[2:3], s[4:5]"),
+            ("0102008e", "s_xnor_b32 s0, s1, s2"),
+            ("0204808e", "s_xnor_b64 s[0:1], s[2:3], s[4:5]"),
+            ("01020099", "s_pack_ll_b32_b16 s0, s1, s2"),
+            ("01028099", "s_pack_lh_b32_b16 s0, s1, s2"),
+            ("0102009a", "s_pack_hh_b32_b16 s0, s1, s2"),
+    )
+
+    def test_sop2_carry_logic_pack_forms(self):
+        """Issue #938: SOP2 carry, inverted-logic and 16-bit pack ops decode to LLVM's text and re-assemble to the same bytes."""
+        raw = b"".join(bytes.fromhex(h) for h, _ in self.SOP2_CARRY_LOGIC_PACK_FORMS)
+        expected = [text for _, text in self.SOP2_CARRY_LOGIC_PACK_FORMS]
+        self.assertEqual([rec["assembly"] for rec in disasm_rdna2(raw)], expected)
+        if not os.environ.get("LLVM_LIB"):
+            return
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"SOP2 round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        self.assertEqual(assemble_with_llvm_mc(expected, assembler, objcopy), raw)
+        self.assertEqual(llvm_disassemble(raw, resolved_lib), expected)
 
     def test_vop2_integer_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import VOP2_OPS
