@@ -5787,6 +5787,13 @@ It also keeps a non-null parameter block at `E_INVALIDARG`.
 
 Run `ctest --preset dev --no-tests=error -R '^d3d12x_device_' -V`.
 
+Those device fixtures request only `IID_ID3D12Device` and the fixture GUID, so
+`ctest --preset dev --no-tests=error -R '^d3d12x_device_slots' -V` checks the inventory without a
+device. It checks the rows and acceptance for the Windows SDK `__uuidof` values of `ID3D12Device`,
+`ID3D12Device1` and `ID3D12Device3`, refuses every IID one byte away from `ID3D12Device` and the
+null IID of the vtable rows, and compares `format_iid` with hand-written lowercase text. The
+`d3d12x_device_slots_device1_control` run expects `ID3D12Device1` to be accepted and must fail.
+
 The struct-return adapter compares the two candidate addresses with the live device supplied
 by the fixture. A vtable match alone is ambiguous because the first word of the stack buffer can
 also contain that vtable address. The fixture supplies the two explicit pointer orders and forwards
