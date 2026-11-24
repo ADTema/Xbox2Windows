@@ -3078,6 +3078,10 @@ def binary(directory, assembler, objcopy, library):
     ds_binary(directory, assembler, objcopy, library)
     mtbuf_load_controls()
     mimg_load_binary(directory, assembler, objcopy, library)
+    mimg_packed_controls()
+    gfx1030_binary(directory, assembler, objcopy, library,
+                   [(name, lines, MIMG_PACKED_BINDING) for name, _, _, _, _, _, _, lines in mimg_packed_cases()],
+                   "image_", group=(8, 8, 1))
     gfx1030_binary(directory, assembler, objcopy, library, MTBUF_LOAD_CASES, "tbuffer_")
     two_exits(directory, assembler, objcopy, library)
     for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES + F32_CASES:
@@ -3845,6 +3849,98 @@ def mimg_mip_controls():
             rejects(diagnostic, aot.lower, variant(lines, (original, replacement)), (8, 8, 1), **MIMG_BINDING)
 
 
+MIMG_PACKED_BINDING = MIMG_BINDING | {"image_format": "R8G8B8A8_UINT"}
+MIMG_PACKED_OPS = ("image_load_pck", "image_load_pck_sgn", "image_load_mip_pck", "image_load_mip_pck_sgn")
+MIMG_PACKED_CASE_FLAG = 1 << 24
+
+
+def mimg_packed_cases():
+    for op in MIMG_PACKED_OPS:
+        mip, signed = "_mip" in op, op.endswith("_sgn")
+        for a16 in (False, True):
+            for mask, channels, groups, shift, lines in mimg_load_cases(a16, mip=mip):
+                if mask not in (0x1, 0xa, 0xf):
+                    continue
+                original = "image_load_mip" if mip else "image_load"
+                lines = variant(lines, (original + " ", op + " "))
+                name = f"{op}{'_a16' if a16 else ''}_{mask:x}"
+                yield name, mip, signed, mask, channels, groups, shift, lines
+
+
+def mimg_packed_channel(level, x, y, channel):
+    return (0x80 + 29 * level + 13 * x + 19 * y + 63 * channel) % 256
+
+
+def mimg_packed_words(channels, shift, groups, mip, signed):
+    words = [SENTINEL] * 320
+    for y in range(TEXTURE_HEIGHT):
+        for x in range(8 * groups):
+            level, tx, ty = (min(y, 2), x // 4, y // 4) if mip else (0, x, y)
+            base = y * 32 + x * (1 << (shift - 2))
+            for offset, channel in enumerate(channels):
+                raw = mimg_packed_channel(level, tx, ty, channel)
+                value = int.from_bytes(bytes([raw]), "little", signed=signed)
+                words[base + offset] = value % (1 << 32)
+    return words
+
+
+def mimg_packed_controls():
+    *_, lines = next(mimg_packed_cases())
+    rejects("Image load opcode does not match the image format", aot.lower, lines, (8, 8, 1), **MIMG_BINDING)
+    rejects("Image load opcode does not match the image format", aot.lower,
+            variant(lines, ("image_load_pck ", "image_load ")), (8, 8, 1), **MIMG_PACKED_BINDING)
+    rejects("Unsupported compute instruction", aot.lower,
+            variant(lines, ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D d16")), (8, 8, 1), **MIMG_PACKED_BINDING)
+    rejects("Unresolved image descriptor", aot.lower,
+            variant(lines, ("s_waitcnt lgkmcnt(0)", "")), (8, 8, 1), **MIMG_PACKED_BINDING)
+    rejects("before s_waitcnt vmcnt(0)", aot.lower,
+            variant(lines, ("s_waitcnt vmcnt(0)", "")), (8, 8, 1), **MIMG_PACKED_BINDING)
+
+
+def mimg_packed_draw(directory, compiler, renderer, backend):
+    mimg_packed_controls()
+    texture = bytes(mimg_packed_channel(level, x, y, channel)
+                    for level in range(3) for y in range(TEXTURE_HEIGHT >> level)
+                    for x in range(TEXTURE_WIDTH >> level) for channel in range(TEXTURE_CHANNELS))
+    for name, mip, signed, mask, channels, groups, shift, lines in mimg_packed_cases():
+        src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        source = aot.lower(lines, (8, 8, 1), **MIMG_PACKED_BINDING)
+        expected = mimg_packed_words(channels, shift, groups, mip, signed)
+        # Bit 24 marks the RGBA8 case payload. XYZ dispatch still occupies the low 24 bits.
+        case.write_bytes(struct.pack("<321I", groups | MIMG_PACKED_CASE_FLAG, *expected) + texture)
+        compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        run = [renderer, backend, "--compute-texture-case", cso, case]
+        src.write_text(source, encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        result = subprocess.run(run)
+        if result.returncode:
+            return result.returncode
+        if mask != 0xf:
+            continue
+        load = next(line for line in source.splitlines() if "imageData.Load" in line)
+        extension = "    image_load_0 = asuint(asint(image_load_0 << 24u) >> 24u);\n"
+        mutation = source.replace(extension, "") if signed else source.replace(load, load + "\n" + extension.rstrip())
+        mismatch = "word=0 expected=ffffff80 actual=00000080" if signed else "word=0 expected=00000080 actual=ffffff80"
+        mutants = [("wrong extension", mutation, mismatch)]
+        if mip:
+            base_lod = load[:load.rindex(", asint(")] + ", 0));"
+            mismatch = "word=32 expected=ffffff9d actual=ffffff80" if signed else "word=32 expected=0000009d actual=00000080"
+            mutants.append(("fixed LOD", source.replace(load, base_lod), mismatch))
+        for label, mutation, mismatch in mutants:
+            assert mutation != source, label
+            src.write_text(mutation, encoding="ascii")
+            subprocess.run(compile_shader, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or mismatch not in bad.stderr:
+                raise AssertionError(f"{name}: {label} escaped detection\n{bad.stderr}")
+            print(f"{name} {label}: {bad.stderr}", end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(MIMG_PACKED_OPS) + "\n", encoding="utf-8")
+    return 0
+
+
 def mimg_mip_draw(directory, compiler, renderer, backend):
     return mimg_load_draw(directory, compiler, renderer, backend, mip=True)
 
@@ -4512,6 +4608,7 @@ if __name__ == "__main__":
                  "draw-mtbuf-load": mtbuf_load_draw,
                  "draw-mimg-load": mimg_load_draw,
                  "draw-mimg-mip": mimg_mip_draw,
+                 "draw-mimg-packed": mimg_packed_draw,
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
                  "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),

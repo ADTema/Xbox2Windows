@@ -2934,6 +2934,34 @@ program. WARP and hardware execute the translated desktop DXIL.
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_mip_(warp|hardware)$' -V
 ```
 
+#### Packed RGBA8 image reads
+
+`image_load_pck`, `image_load_pck_sgn`, `image_load_mip_pck` and
+`image_load_mip_pck_sgn` use the same 2D address, DMASK and wait rules. The
+caller selects `--image-format R8G8B8A8_UINT` and supplies the linear
+`8_8_8_8_UINT` GFX10 format (60) with the same resource type, base mip,
+level and identity channel selects. The desktop SRV uses
+`DXGI_FORMAT_R8G8B8A8_UINT`. Its `Texture2D<uint4>.Load` zero-extends each
+byte. The `_sgn` forms sign-extend each selected byte from bit 7 to the full
+32-bit destination VGPR. Format conversion and other image formats are outside
+this profile. See the MIMG opcode table in the
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+
+The fixture runs all four opcodes with both address widths, DMASKs `0x1`,
+`0xa` and `0xf`, and dispatches of four, two and one groups, respectively.
+The CPU reference checks all 320 UAV words, including the untouched tail.
+LLVM 15 assembles and disassembles the 24 variants, and the synthetic-container
+CLI reproduces the text path's HLSL. The GPU tests run the translated desktop
+DXIL. Reversing the byte extension rule must first differ at word 0
+(`00000080` versus `ffffff80`). Forcing mip zero must first differ at word 32
+(`0000009d` versus `00000080` for unsigned loads). The rejection checks include
+a mismatched format, `d16`, and missing descriptor and image waits.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_packed_(warp|hardware)$' -V
+```
+
 ### Bounded gfx1030 DS lane routing
 
 The `gfx1030` compute profile lowers `ds_bpermute_b32` (gather) and
