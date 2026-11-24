@@ -204,26 +204,6 @@ def check_empty_and_missing_dirs(failures: list[str]) -> None:
                 failures.append(f"expected '_None observed._' for {target}")
 
 
-def check_cli_invocation(failures: list[str]) -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        log_file = Path(tmp) / "single.log"
-        log_file.write_text(
-            "x2w-dstorage   options=0x1 dest=0x0000018000001000 dest_size=0x10 "
-            "source=0x1 offset=0x0 size=0x10 -> read failed\n",
-            encoding="utf-8",
-        )
-        proc = subprocess.run(
-            [sys.executable, "-B", str(TOOLS_STARTUP / "triage_run.py"), str(log_file), "--max-items", "4"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if proc.returncode != 0:
-            failures.append(f"CLI exited with {proc.returncode}: {proc.stderr}")
-        elif "| 1 | read failed |" not in proc.stdout:
-            failures.append(f"CLI output missing expected row: {proc.stdout!r}")
-
-
 def check_slot133_outcomes(failures: list[str]) -> None:
     # Device::slot133 logs every handled placement with a trailing "aliased|not aliased gpuva=..." field.
     prefix = "x2w-d3d12 Device::slot133(CreatePlacedResourceX?) "
@@ -261,14 +241,34 @@ def check_slot133_outcomes(failures: list[str]) -> None:
         failures.append(f"control did not reproduce the old unhandled noise: {dict(old)}")
 
 
+def check_cli_invocation(failures: list[str]) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        log_file = Path(tmp) / "single.log"
+        log_file.write_text(
+            "x2w-dstorage   options=0x1 dest=0x0000018000001000 dest_size=0x10 "
+            "source=0x1 offset=0x0 size=0x10 -> read failed\n",
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            [sys.executable, "-B", str(TOOLS_STARTUP / "triage_run.py"), str(log_file), "--max-items", "4"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            failures.append(f"CLI exited with {proc.returncode}: {proc.stderr}")
+        elif "| 1 | read failed |" not in proc.stdout:
+            failures.append(f"CLI output missing expected row: {proc.stdout!r}")
+
+
 def main() -> int:
     failures: list[str] = []
     check_aggregation_and_redaction(failures)
     check_private_text_never_echoed(failures)
     check_review_regressions(failures)
-    check_slot133_outcomes(failures)
     check_empty_and_missing_dirs(failures)
     check_cli_invocation(failures)
+    check_slot133_outcomes(failures)
     for item in failures:
         print("FAIL", item)
     print(f"startup triage_run checks: {len(failures)} failed")
