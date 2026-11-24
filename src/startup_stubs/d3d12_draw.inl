@@ -440,15 +440,17 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, bool have, u64 offset, std::s
     if (!have) InterlockedIncrement(&null_bindings);
 }
 
-// Texture contents. The XG stand-in reports the desktop copyable-footprint layout to the title
-// (mip footprints from GetCopyableFootprints, array slices every 64 KiB-aligned slice size), so a
-// texture's title memory is already in a layout CopyTextureRegion can read: each subresource is
-// copied through the upload ring as a placed footprint. A texture is uploaded on its first bind and
+// Texture contents. Linear backing uses desktop copyable footprints; an announced BC7 4 KiB
+// surface must be detiled into the footprint first. A texture is uploaded on its first bind and
 // again when its memory changed: XG copies announce themselves (x2w_d3d12_texture_written), and
 // CPU-backed textures up to 32 MiB are also re-hashed for writes the title makes on its own.
 // Recheck single-mip R8 planes on their first bind each frame and other textures every 15 frames.
 // Targets and UAVs are GPU-written and never uploaded.
-struct TextureUpload { u64 hash = 0; u64 generation = ~0ull; LONG checked_frame = -1000; bool done = false; };
+struct TextureUpload {
+    u64 hash = 0, generation = ~0ull;
+    LONG checked_frame = -1000;
+    bool done = false, tiled_bc7 = false;
+};
 std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
 LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
 u64 hash_memory(const unsigned char* data, std::size_t bytes)
@@ -484,12 +486,24 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const UINT64 slice_total = plan.size;
     if (slice_total == ~0ull || !slice_total) return;
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
-    const u64 total = slices > 1 ? stride * (slices - 1) + slice_total : slice_total;
     TextureUpload& state = texture_uploads()[texture];
-    u64 generation = 0;
+    TextureWrite written;
     AcquireSRWLockShared(&written_lock);
-    if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end()) generation = found->second;
+    if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end())
+        written = found->second;
     ReleaseSRWLockShared(&written_lock);
+    const bool tiled_bc7 = written.bc7_width != 0;
+    const auto generation = written.generation;
+    const x2w_startup::Bc7Surface bc7(written.bc7_width, written.bc7_height);
+    if (tiled_bc7) {
+        const auto* original = resource_info(resource);
+        if (!original || !x2w_startup::supports_bc7_4k_s(original->console) ||
+            original->console.Width != written.bc7_width || original->console.Height != written.bc7_height ||
+            desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != bc7.columns * bc7.block_texels ||
+            desc.Height != bc7.rows * bc7.block_texels || plan.count != 1 ||
+            plan.rows[0] != bc7.rows || plan.row_bytes[0] != u64{bc7.columns} * bc7.block_bytes) return;
+    }
+    const u64 total = tiled_bc7 ? bc7.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
     if (state.done && !announced && !x2w_startup::recheck_cpu_texture(desc, total, elapsed)) return;
@@ -501,24 +515,38 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     state.checked_frame = frame_number;
     const u64 hash = hash_memory(memory, static_cast<std::size_t>(total));
-    if (state.done && hash == state.hash) {
+    if (state.done && hash == state.hash && state.tiled_bc7 == tiled_bc7) {
         state.generation = generation;
         return;
     }
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
-    for (UINT s = 0; s < slices; ++s)
-        for (UINT i = 0; i < plan.count; ++i) {
-            const auto& fp = plan.placed[i];
-            const u64 bytes = plan.bytes(i);
-            u64 offset = 0;
-            if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
-                state.done = false;
-                return;
-            }
-            plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
+    if (tiled_bc7) {
+        u64 offset = 0;
+        const auto bytes = plan.bytes(0);
+        auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
+        if (!rows) {
+            state.done = false;
+            return;
         }
+        std::memset(rows, 0, static_cast<std::size_t>(bytes));
+        bc7.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
+        plan.upload(list, texture, upload_ring, 1, 1, 0, 0, offset);
+    } else {
+        for (UINT s = 0; s < slices; ++s)
+            for (UINT i = 0; i < plan.count; ++i) {
+                const auto& fp = plan.placed[i];
+                const u64 bytes = plan.bytes(i);
+                u64 offset = 0;
+                if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
+                    state.done = false;
+                    return;
+                }
+                plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
+            }
+    }
     state.hash = hash;
     state.generation = generation;
+    state.tiled_bc7 = tiled_bc7;
     state.done = true;
     InterlockedIncrement(&textures_uploaded);
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
