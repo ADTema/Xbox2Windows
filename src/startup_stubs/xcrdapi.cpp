@@ -10,6 +10,7 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
+#include "startup_stubs/dstorage_file_read.h"
 
 #include <psapi.h>
 
@@ -351,13 +352,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         input = reinterpret_cast<const unsigned char*>(source);
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
-        packed.resize(source_size);
-        OVERLAPPED overlapped{};
-        overlapped.Offset = static_cast<DWORD>(offset);
-        overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
-        DWORD read = 0;
         if (file_object && file_object->kind == file &&
-            ReadFile(file_object->handle, packed.data(), source_size, &read, &overlapped) && read == source_size)
+            x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed))
             input = packed.data();
         else
             outcome = "read failed";

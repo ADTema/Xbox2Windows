@@ -332,6 +332,37 @@ bool dstorage_checks() {
         }
         auto* queue = static_cast<Object*>(queue_ptr);
 
+        // The last four bytes are zero padding. Only the first request writes;
+        // the short read fails, and the existing empty-request path succeeds.
+        const u64 offsets[]{file_bytes.size() - 4, file_bytes.size() - 3, UINT64_MAX};
+        const unsigned counts[]{4, 4, 0};
+        unsigned char destinations[3][6];
+        std::memset(destinations, 0xa5, sizeof(destinations));
+        for (unsigned i = 0; i < 3; ++i) {
+            alignas(8) unsigned char req[0x48]{};
+            *reinterpret_cast<void**>(req + 0x08) = destinations[i] + 1;
+            *reinterpret_cast<unsigned*>(req + 0x18) = 4;
+            *reinterpret_cast<void**>(req + 0x20) = file_obj;
+            *reinterpret_cast<u64*>(req + 0x28) = offsets[i];
+            *reinterpret_cast<unsigned*>(req + 0x30) = counts[i];
+            reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req);
+            reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, i);
+        }
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        for (int i = 0; i < 200 && !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2); ++i) Sleep(10);
+        bool bounds_ok = true;
+        for (unsigned i = 0; i < 3; ++i) {
+            const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
+            bounds_ok &= hr == (i == 1 ? E_FAIL : S_OK);
+            for (unsigned j = 0; j < 6; ++j)
+                bounds_ok &= destinations[i][j] == (i == 0 && j >= 1 && j <= 4 ? 0 : 0xa5);
+        }
+        if (!bounds_ok) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+
         std::vector<std::vector<unsigned char>> chunks(total_chunks, std::vector<unsigned char>(chunk_dest_size, 0));
         for (size_t k = 0; k < total_chunks; ++k) {
             unsigned char req[0x48] = {};

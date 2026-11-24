@@ -336,6 +336,8 @@ def check_shader_records():
     sop2_absdiff_forms = {
         ("SOP2", "s_absdiff_i32"),
     }
+    sop1_scalar_alu_forms = {("SOP1", op) for op in pixel.SCALAR_ALU_SOP1_OPS}
+    sop2_scalar_alu_forms = {("SOP2", op) for op in pixel.SCALAR_ALU_SOP2_OPS}
     rejected_forms = {
         "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
         "v_mul_i32_i24_sdwa",
@@ -364,6 +366,10 @@ def check_shader_records():
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)
+        assert sop1_scalar_alu_forms <= covered, (name, sop1_scalar_alu_forms - covered)
+        assert sop2_scalar_alu_forms <= covered, (name, sop2_scalar_alu_forms - covered)
+        stripped = pixel.ACCEPTED - set(pixel.SCALAR_ALU_OPS)
+        assert not sop2_scalar_alu_forms & fc.gfx_forms(stripped, fc.load_reference(name)), name
         assert pack_int16_forms <= covered, (name, pack_int16_forms - covered)
         assert pack_b32_forms <= covered, (name, pack_b32_forms - covered)
         # v_mac_f32 is in the gfx1013 list only.
