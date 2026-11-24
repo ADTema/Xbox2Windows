@@ -562,6 +562,13 @@ These are measured on one executable; treat them as hypotheses for others.
   survives its allocator's Reset, as on the console. If the fence that tracks a submit cannot be
   created or signalled, that submit's allocator is never reset or reused again. Run
   `ctest --preset dev --no-tests=error -R "^startup_list_resubmit_"`.
+- **Failed command-list Close.** A desktop list that fails Close cannot be reopened by desktop
+  Reset. The renderer reports the failed HRESULT and excludes the failed recording from queue
+  submission. The next Reset creates a fresh list of the same type on the requested allocator
+  while keeping the console-facing handle. If creation fails, another Reset can retry. The
+  resubmission fixture issues an invalid viewport command on a compute list while an older
+  valid submit is waiting on a fence. It verifies the failed Close and wrong-type Reset, then
+  closes and submits a recovered recording and lets the queue finish both valid submissions.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and

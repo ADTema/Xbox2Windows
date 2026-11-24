@@ -80,7 +80,7 @@ const char* const kind_names[kind_count] = {
 // state lives in front of the object, out of the title's reach, and the zero-filled area behind the
 // vtable pointer is sized per kind (64 KiB for command lists).
 struct Wrapper;
-struct WrapperOwn {
+struct alignas(16) WrapperOwn {
     IUnknown* real;
     LONG refs;
     Kind kind;
@@ -90,11 +90,13 @@ struct WrapperOwn {
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
+    bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
+    UINT list_node_mask;
 };
 static_assert(sizeof(WrapperOwn) % 16 == 0, "the title-visible object must stay 16-byte aligned");
 struct Wrapper {
@@ -712,7 +714,10 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
         if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN)
             x2w_startup::mark_packed_stand_in(static_cast<ID3D12Resource*>(*out), requested_format);
         Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
-        if (K == device_kind && kind == list_kind) child->own().list_device = self;
+        if (K == device_kind && kind == list_kind) {
+            child->own().list_device = self;
+            if (N == 12) child->own().list_node_mask = static_cast<UINT>(a);
+        }
         *out = child;
     }
     static LONG calls;
@@ -981,7 +986,7 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
 void reset_viewport_state(Wrapper* self);
-void discard_draw_sampler_heaps(Wrapper* self);
+void discard_draw_sampler_heaps(ID3D12CommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
 bool shader_dump_dir(wchar_t* out, DWORD size);
@@ -1137,12 +1142,11 @@ bool submit_fence_fails()
     return on;
 }
 
-// draw_lock held, after the lists were executed on queue. Each list's allocator holds a fence value
+// draw_lock and allocator_lock held, after the lists were executed on queue. Each list's allocator holds a fence value
 // the queue must pass before the allocator can be reset. If that fence cannot be created or
 // signalled, the work is on the GPU all the same: the allocators are marked untracked instead.
 void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
 {
-    AcquireSRWLockExclusive(&allocator_lock);
     auto& [fence, value] = queue_submits[queue];
     if (!fence && !submit_fence_fails()) {
         ID3D12Device* device = nullptr;
@@ -1167,7 +1171,6 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
         static LONG failures;
         if (first_calls(failures, 2)) log("x2w-render submit fence for allocator reuse failed; the allocators are not reused");
     }
-    ReleaseSRWLockExclusive(&allocator_lock);
 }
 
 // Fixtures: how many OMSetRenderTargets calls bound targets, and how many render target or depth handles
@@ -1195,49 +1198,74 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
 {
     Wrapper* a = as_wrapper(allocator);
     HRESULT hr = E_INVALIDARG;
-    if (a && a->own().kind == allocator_kind && self->own().real) {
-        auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
-        AcquireSRWLockExclusive(&allocator_lock);
+    x2w_startup::ComPtr<ID3D12GraphicsCommandList> replaced;
+    AcquireSRWLockExclusive(&allocator_lock);
+    auto& state = self->own();
+    auto* previous = static_cast<ID3D12GraphicsCommandList*>(state.real);
+    if (a && a->own().kind == allocator_kind && previous) {
         TitleAllocator& title = title_allocator(a);
-        title.type = list->GetType();
-        hr = list->Reset(title.current->real, nullptr);
+        const auto type = previous->GetType();
+        if (state.list_close_failed) {
+            ID3D12GraphicsCommandList* replacement = nullptr;
+            hr = device_of(state.list_device)->CreateCommandList(state.list_node_mask, type, title.current->real,
+                                                               nullptr, IID_PPV_ARGS(&replacement));
+            if (SUCCEEDED(hr)) {
+                // Keep the old object through recording cleanup. In-flight GPU work keeps
+                // its allocator and submitted descriptors through the existing fence tracking.
+                replaced.Attach(previous);
+                state.real = replacement;
+                state.list_close_failed = false;
+            }
+        } else {
+            hr = previous->Reset(title.current->real, nullptr);
+        }
         if (SUCCEEDED(hr)) {
+            title.type = type;
             DesktopAllocator*& on = list_recordings[self];
             if (on) --on->lists;
             on = title.current;
             ++on->lists;
+            state.list_ready = false;
+            state.list_open = true;
         }
-        ReleaseSRWLockExclusive(&allocator_lock);
     }
+    ReleaseSRWLockExclusive(&allocator_lock);
     if (SUCCEEDED(hr)) {
-        self->own().list_ready = false;
         reset_viewport_state(self);
-        discard_draw_sampler_heaps(self);
-        if (draw_dump_frame()) draw_dumps().discard(static_cast<ID3D12CommandList*>(self->own().real));
+        discard_draw_sampler_heaps(previous);
+        if (draw_dump_frame()) draw_dumps().discard(previous);
     }
-    self->own().list_open = SUCCEEDED(hr);
     InterlockedIncrement(SUCCEEDED(hr) ? &render_resets : &render_reset_failures);
     static LONG failures;
     if (FAILED(hr) && first_calls(failures, 6))
         log("x2w-render list Reset failed 0x%08lx (allocator %p)", static_cast<unsigned long>(hr), allocator);
-    return S_OK;
+    return hr;
 }
 
 // List slot 9, desktop Close().
 HRESULT __stdcall list_close(Wrapper* self)
 {
-    if (self->own().list_open) {
-        release_targets(self);
-        const HRESULT hr = static_cast<ID3D12GraphicsCommandList*>(self->own().real)->Close();
-        self->own().list_open = false;
-        self->own().list_ready = SUCCEEDED(hr);
-        if (FAILED(hr)) discard_draw_sampler_heaps(self);
-        if (FAILED(hr) && draw_dump_frame()) draw_dumps().discard(static_cast<ID3D12CommandList*>(self->own().real));
-        InterlockedIncrement(&render_closes);
-        static LONG failures;
-        if (FAILED(hr) && first_calls(failures, 6)) log("x2w-render list Close failed 0x%08lx", static_cast<unsigned long>(hr));
+    AcquireSRWLockExclusive(&allocator_lock);
+    auto& state = self->own();
+    if (!state.list_open) {
+        ReleaseSRWLockExclusive(&allocator_lock);
+        return S_OK;
     }
-    return S_OK;
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(state.real);
+    release_targets(self);
+    const HRESULT hr = list->Close();
+    state.list_open = false;
+    state.list_ready = SUCCEEDED(hr);
+    state.list_close_failed = FAILED(hr);
+    ReleaseSRWLockExclusive(&allocator_lock);
+    InterlockedIncrement(&render_closes);
+    if (FAILED(hr)) {
+        discard_draw_sampler_heaps(list);
+        if (draw_dump_frame()) draw_dumps().discard(list);
+        static LONG failures;
+        if (first_calls(failures, 6)) log("x2w-render list Close failed 0x%08lx", static_cast<unsigned long>(hr));
+    }
+    return hr;
 }
 
 // A fence signalled on a queue completes when the desktop GPU reaches it.
@@ -2081,6 +2109,9 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         // A closed list stays submittable until its next Reset, as on the desktop.
         std::vector<ID3D12CommandList*> ready;
         std::vector<Wrapper*> submitted;
+        // Pin the closed recording and its allocator through submission bookkeeping.
+        AcquireSRWLockExclusive(&draw_lock);
+        AcquireSRWLockExclusive(&allocator_lock);
         for (UINT i = 0; i < count; ++i) {
             Wrapper* w = as_wrapper(lists[i]);
             if (w && w->own().kind == list_kind && w->own().list_ready) {
@@ -2091,7 +2122,6 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         if (!ready.empty()) {
             auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
             const UINT ready_count = static_cast<UINT>(ready.size());
-            AcquireSRWLockExclusive(&draw_lock);
             if (draw_dump_frame()) {
                 const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
                 if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
@@ -2100,9 +2130,10 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             }
             retire_draw_sampler_heaps(queue, ready);
             note_submits(queue, submitted);
-            ReleaseSRWLockExclusive(&draw_lock);
             InterlockedIncrement(&render_executes);
         }
+        ReleaseSRWLockExclusive(&allocator_lock);
+        ReleaseSRWLockExclusive(&draw_lock);
         check_device("CommandQueue execute", 35);
         return;
     }
@@ -2605,7 +2636,10 @@ HRESULT __stdcall device_create_command_list_x(Wrapper* self, const void* desc, 
               desktop_allocator,
               reinterpret_cast<ID3D12PipelineState*>(unwrap(reinterpret_cast<u64>(pso))), IID_PPV_ARGS(&list))
         : E_NOINTERFACE;
-    if (SUCCEEDED(hr)) list->Close();
+    if (SUCCEEDED(hr)) {
+        hr = list->Close();
+        if (FAILED(hr)) list->Release();
+    }
     static LONG calls;
     if (first_calls(calls, 4))
         log("x2w-d3d12 Device::slot73(CreateCommandList?) desc=[%s] allocator=%p pso=%p riid=%s -> 0x%08lx", bytes,
