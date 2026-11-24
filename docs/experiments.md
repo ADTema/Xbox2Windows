@@ -5363,6 +5363,36 @@ python3 -B tests/pixel_sample_offset_check.py binary llvm-mc-15 llvm-objcopy-15 
 ctest --preset dev --no-tests=error -R '^pixel_aot_sample_offset_' -V
 ```
 
+The same pixel profile lowers `image_sample_d`, `image_sample_d_o`,
+`image_sample_d_g16`, and `image_sample_d_o_g16` to `SampleGrad`. For `gfx1030`,
+use `--cpu gfx1030` with wave64 input. Each instruction uses contiguous 2D
+addresses and `dmask:0xf`. After the optional packed offset word, the
+full-precision address has four gradient words in `du/dx`, `dv/dx`, `du/dy`,
+`dv/dy` order, followed by 32-bit UV. G16 uses one packed word per screen axis
+instead. Each word holds the binary16 U slope in bits `[15:0]` and the V slope
+in `[31:16]`. The lowerer widens both halves exactly before passing the two
+vectors to `SampleGrad`. Explicit gradients do not require whole-quad UVs in
+the source program. Offset bounds and the integer mip sampling assumption are
+the same as for the ordinary offset forms.
+
+LLVM 15 requires an eight-VGPR tuple in the packed full-precision assembly and
+prints only the six or seven active registers on disassembly. The binary
+fixture round-trips every mnemonic through the pixel CLI and asks `llc` to
+confirm the G16 lane order and its independent 32-bit UVs. The draw fixture
+uses the existing two-mip texture to distinguish a nonzero horizontal V or
+vertical U slope from zero gradients. It also checks a larger slope against
+mip 2 of a four-mip texture and both offset forms against the spatial ramp.
+Zero gradients must change the first covered pixel from green to red. Zero
+offset must change the ramp's first red value from `0x3d808000` to `0x00000000`.
+
+```bash
+python3 -B tests/pixel_sample_gradient_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
+```
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_sample_gradient_' -j1 -V
+```
+
 Depth-comparison sampling covers one form: `image_sample_c_lz vD, v[a:a+2], ... dmask:0x1 dim:SQ_RSRC_IMG_2D` and its NSA spelling `[vR, vU, vV]`. In RDNA 2 the reference comes before the coordinates. The result lowers to `tex.SampleCmpLevelZero(samp, float2(u, v), reference)` on `Texture2D<float> tex : register(t0)` and `SamplerComparisonState samp : register(s0)`. The four sampler words must still match the caller binding. `comparison_sampler_state()` decodes them, and the generated HLSL names the desktop state it needs in a comment. The compare function comes from word 0 bits 14:12, in the same order as `D3D12_COMPARISON_FUNC` minus one, and the result is `reference OP texel`. One point or bilinear XY filter maps to `D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT` or `..._MIN_MAG_LINEAR_MIP_POINT`. Other values are refused, each with its own message:
 - X/Y addressing other than `CLAMP_LAST_TEXEL`;
 - anisotropy, unnormalized coordinates, `MC_COORD_TRUNC` or `FORCE_DEGAMMA`;

@@ -4052,15 +4052,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"(image_sample(?:_lz|_l|_b)?(?:_o)?) (?:v\[(\d+):(\d+)\]|v(\d+)), "
+        elif m := match(r"(image_sample(?:(?:_lz|_l|_b)?(?:_o)?|_d(?:_o)?(?:_g16)?)) (?:v\[(\d+):(\d+)\]|v(\d+)), "
                         r"v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
             op, dst_first, dst_last, dst_single, *rest, dmask_hex = m.groups()
             dmask = int(dmask_hex, 16)
             if op != "image_sample" and dmask != 0xf:
                 raise ValueError(f"{op} requires dmask:0xf")
-            base_op = op.removesuffix("_o")
-            has_offset = base_op != op
-            coord_width = (3 if base_op in ("image_sample_l", "image_sample_b") else 2) + has_offset
+            g16 = op.endswith("_g16")
+            sample_op = op.removesuffix("_g16")
+            base_op = sample_op.removesuffix("_o")
+            has_offset = sample_op != base_op
+            if base_op == "image_sample_d":
+                # LLVM disassembly lists only the live address operands.
+                coord_width = (4 if g16 else 6) + has_offset
+            else:
+                coord_width = (3 if base_op in ("image_sample_l", "image_sample_b") else 2) + has_offset
             channels = ["xyzw"[bit] for bit in range(4) if (dmask >> bit) & 1]
             if len(channels) == 1:
                 if dst_single is None:
@@ -4104,7 +4110,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     return value
                 return fp_operand(reg, scalar, vector, pending, sample_dest)
 
-            if base_op in ("image_sample_lz", "image_sample_l"):
+            if base_op == "image_sample_d":
+                u, v = [sample_coord(reg) for reg in coord_regs[-2:]]
+                # Two coordinate slopes per screen axis, horizontal first. G16 packs
+                # U in the low half and V in the high half of each gradient word.
+                if g16:
+                    h, vert = [int_operand(reg, scalar, vector, pending, sample_dest, signed=False)
+                               for reg in coord_regs[:2]]
+                    ddx = f"float2(widen16({h}), widen16({h} >> 16))"
+                    ddy = f"float2(widen16({vert}), widen16({vert} >> 16))"
+                else:
+                    dudx, dvdx, dudy, dvdy = [sample_coord(reg) for reg in coord_regs[:4]]
+                    ddx = f"float2({dudx}, {dvdx})"
+                    ddy = f"float2({dudy}, {dvdy})"
+                call = f"SampleGrad(samp, float2({u}, {v}), {ddx}, {ddy}{offset_arg})"
+            elif base_op in ("image_sample_lz", "image_sample_l"):
                 u, v = [sample_coord(reg) for reg in coord_regs[:2]]
                 lod = sample_coord(coord_regs[2]) if base_op == "image_sample_l" else "0.0f"
                 call = f"SampleLevel(samp, float2({u}, {v}), {lod}{offset_arg})"
