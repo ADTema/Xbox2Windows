@@ -2817,7 +2817,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if (region is None or pair != region["save"]
                 or (region["skip"] is not None and region["skip"] != i)):
             raise ValueError("Unexpected execution mask restore")
-        for dst, outer in region["written"].items():
+        if region["else"] is not None:
+            # Join of an if/else (issue #1315): each register takes its then-arm value where the condition holds
+            # and its else-arm value elsewhere, the pre-region value standing in for an arm that did not write it.
+            # A register undefined before the region and on either arm stays undefined after the join.
+            else_written = region["else_written"]
+            for dst in [*region["written"], *(d for d in else_written if d not in region["written"])]:
+                outer = region["written"][dst] if dst in region["written"] else else_written[dst]
+                in_then, in_else = dst in region["then"], dst in else_written
+                if dst in vector.conditional or (outer is MISSING and not (in_then and in_else)):
+                    vector.conditional.add(dst)
+                    continue
+                if outer is not MISSING and (not isinstance(outer, str) or outer in ("bary_i", "bary_j")):
+                    raise ValueError("Masked region rewrites a register without a numeric value")
+                then_value = region["then"][dst] if in_then else outer
+                else_value = dict.get(vector, dst) if in_else else outer
+                lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {then_value} : {else_value});")
+                vector[dst] = f"alu{i}_{dst}"
+        for dst, outer in ({} if region["else"] is not None else region["written"]).items():
             if outer is MISSING or dst in vector.conditional:
                 vector.conditional.add(dst)
                 continue
@@ -2826,8 +2843,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             inner = vector[dst]
             lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
             vector[dst] = f"alu{i}_{dst}"
-        if region["skip"] is not None:
-            # A wave that skipped the region never ran its waits, so what was outstanding at the opener still is.
+        if region["skipped"]:
+            # A wave that skipped the region (or one arm) never ran its waits, so what was outstanding at the opener
+            # still is.
             before_pending, before_samples = region["outstanding"]
             pending.update(before_pending)
             sample_dest.update(before_samples)
@@ -2857,8 +2875,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if region is not None:
             if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]|s_mov_b64 exec, s\[\d+:\d+\]", line):
                 pass
+            elif re.fullmatch(r"s_andn2_b64 exec, s\[\d+:\d+\], exec", line):
+                pass
             elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
-                    and i == region["start"] + 1 and region["skip"] is None):
+                    and i == region["arm_start"] + 1 and region["skip"] is None):
                 pass
             elif REGION_NOP.fullmatch(line):
                 pass
@@ -3106,7 +3126,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                         != [(*condition[:2], j, len(regs)) for j in range(len(regs))]):
                 raise ValueError("Unsupported execution mask save")
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
-            region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i,
+            region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
+                      "else_undefined": set(), "skipped": False,
                       "scalar_written": set(), "scc_written": False, "opener": "saveexec",
                       "outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
@@ -3146,16 +3167,19 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expr = INT_COMPARE[iop].format(*values)
             lines.append(f"    bool cmp{i} = {expr};")
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
-            region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i,
+            region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
+                      "else_undefined": set(), "skipped": False,
                       "scalar_written": set(), "scc_written": False, "opener": "cmpx",
                       "outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
-            # The whole-wave empty-mask skip may sit right after the save; its target must be
-            # the matching restore exactly. Offsets count from the next instruction.
-            if (region is None or offset is None or i != region["start"] + 1
-                    or region["skip"] is not None or seen_skip):
+            # The whole-wave empty-mask skip may sit right after the save, or right after the else transition
+            # (issue #1315); its target must be the matching restore exactly, or for the skip after the save of a
+            # region with an else, that transition. Offsets count from the next instruction. Only the arms of one
+            # region may carry skips.
+            if (region is None or offset is None or i != region["arm_start"] + 1
+                    or region["skip"] is not None or (seen_skip and not region["skipped"])):
                 raise ValueError("Unsupported execution skip")
             imm = int(m[1], 0)
             if not -0x8000 <= imm <= 0x7fff:
@@ -3167,10 +3191,33 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             rm = re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)
             if rm is None:
                 rm = re.fullmatch(r"s_mov_b64 exec, s\[(\d+):(\d+)\]", target)
+            if rm is None and region["else"] is None:
+                rm = re.fullmatch(r"s_andn2_b64 exec, s\[(\d+):(\d+)\], exec", target)
             if rm is None or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
                 raise ValueError("Execution skip does not target the matching restore")
             region["skip"] = restore
+            region["skipped"] = True
             seen_skip = True
+        elif region is not None and (m := match(r"s_andn2_b64 exec, (s\[\d+:\d+\]), exec")):
+            # The else transition (issue #1315): EXEC becomes saved & ~EXEC, the saved lanes whose condition is
+            # false. The else arm starts from the pre-region vector state; a register first defined by the then
+            # arm is undefined there. A then-arm skip must land exactly here. s_andn2_b64 writes SCC from the new
+            # EXEC, which is untracked.
+            if (sgpr_pair(m[1]) != region["save"] or region["else"] is not None
+                    or (region["skip"] is not None and region["skip"] != i)):
+                raise ValueError("Unexpected execution mask else transition")
+            region["then"] = {dst: dict.get(vector, dst) for dst in region["written"]}
+            for dst, outer in region["written"].items():
+                if outer is MISSING:
+                    region["else_undefined"].add(dst)
+                else:
+                    vector[dst] = outer
+            if region["skip"] is not None:
+                # A wave that skipped the then arm did not run its scalar writes before the else arm.
+                scalar.conditional.update(region["scalar_written"])
+            region["skip"] = None
+            region["else"] = region["arm_start"] = i
+            scc = None
         elif m := match(r"s_or_b64 exec, exec, (s\[\d+:\d+\])"):
             close_region(i, sgpr_pair(m[1]))
             region = None
@@ -5361,6 +5408,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             ended = True
         else:
             raise ValueError(f"Unsupported instruction {i}: {line}")
+        if region is not None and region["else"] is not None and region["else_undefined"].intersection(vector.reads):
+            raise ValueError(f"Else arm reads a register defined only in the then arm {i}: {line}")
         if rstate is not None:
             (old_scalar, old_vector, old_scc, old_pending, old_sample_dest, old_exported,
              old_ended, old_mask, old_attribute, old_interpolated, old_quad, old_samples, scalar_alu) = rstate
@@ -5408,8 +5457,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                         or quad_values != old_quad or samples != old_samples or not writes
                         or any(not isinstance(dict.get(vector, k), str) for k in writes)):
                     raise ValueError(f"Unsupported masked-region operation {i}: {line}")
+                arm = region["written"] if region["else"] is None else region["else_written"]
                 for k in writes:
-                    region["written"].setdefault(k, old_vector.get(k, MISSING))
+                    arm.setdefault(k, old_vector.get(k, MISSING))
+                region["else_undefined"].difference_update(writes)
         if conditional.intersection(vector.reads):
             raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
         if scalar_conditional.intersection(scalar.reads):

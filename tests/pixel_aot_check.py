@@ -633,6 +633,104 @@ def check_masked_draw(directory, compiler, renderer, backend):
         case = directory / f"masked-{mutant[0]}.case"
         write_case(case, constants, expected)
         run_pixel_batch(renderer, backend, shader, [(case, "mismatch")])
+    check_masked_else_draw(directory, compiler, renderer, backend)
+
+
+# If/else regions (issue #1315 Stage B): `s_andn2_b64 exec, s[60:61], exec` switches a region to the saved lanes
+# whose condition is false. The then arm writes v13 and v14; the else arm writes v13 and reads v14 into v15, so it
+# must see v14's pre-region value. v13 merges both arms, v14 only the then arm and v15 only the else arm.
+ELSE_TRANSITION = "s_andn2_b64 exec, s[60:61], exec"
+ELSE_THEN_BODY = ("v_mov_b32_e32 v13, s45", "v_mov_b32_e32 v14, s46")
+ELSE_ELSE_BODY = ("v_mov_b32_e32 v13, s47", "v_mul_f32_e32 v15, 0.5, v14")
+ELSE_OPENERS = {
+    "saveexec": ("v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc"),
+    "cmpx": ("s_mov_b64 s[60:61], exec", "v_cmpx_gt_f32_e32 s44, v12"),
+}
+ELSE_SKIPS = ("none", "then", "else", "both")
+
+
+def else_region(opener="saveexec", restore=MASKED_MOV_RESTORE, skips="none", *, then_body=ELSE_THEN_BODY,
+                else_body=ELSE_ELSE_BODY, transition=ELSE_TRANSITION):
+    """The if/else region as (offset, text) pairs; each requested skip lands on its arm's end."""
+    program = uncompressed_export([*ELSE_OPENERS[opener], *then_body, transition, *else_body, restore])
+    arms = []
+    if skips in ("then", "both"):
+        arms.append((program.index(ELSE_OPENERS[opener][1]), transition))
+    if skips in ("else", "both"):
+        arms.append((program.index(transition), restore))
+    for after, target in reversed(arms):
+        program.insert(after + 1, "s_cbranch_execz 0")
+    pairs = offset_pairs(program)
+    for k, (offset, line) in enumerate(pairs):
+        if line == "s_cbranch_execz 0":
+            # The skip after the save lands on the transition; the one after the transition lands on the close.
+            target = transition if pairs[k - 1][1] == ELSE_OPENERS[opener][1] else restore
+            destination = next(o for o, text in pairs[k + 1:] if text == target)
+            pairs[k] = (offset, f"s_cbranch_execz {(destination - offset - 4) // 4}")
+    return pairs
+
+
+def else_region_asm(opener="saveexec", restore=MASKED_MOV_RESTORE, skips="none"):
+    """else_region as assembler text: each skip names a label on its target."""
+    program = [line for _, line in else_region(opener, restore, skips)]
+    labels = {ELSE_TRANSITION: ".Lelse_transition", restore: ".Lelse_close"}
+    for k, line in enumerate(program):
+        if line.startswith("s_cbranch_execz"):
+            target = ELSE_TRANSITION if program[k - 1] == ELSE_OPENERS[opener][1] else restore
+            program[k] = f"s_cbranch_execz {labels[target]}"
+    for target, label in labels.items():
+        if any(label in line for line in program):
+            program.insert(program.index(target), f"{label}:")
+    return program
+
+
+def else_pixels(threshold, *, stale_then=False):
+    """Expected pixels: g from either arm, b from the then arm only, a from the else arm only."""
+    outer_b = single(128 / 255)
+    pixels = []
+    for g in MASKED_RAMP:
+        for r in MASKED_RAMP:
+            x = single(r / 255)
+            if x < threshold:
+                pixels.append((x, 0.25, 0.75, 1))
+            else:
+                # stale_then models a wrong lowering whose else arm reads the then arm's v14.
+                pixels.append((x, 0.5, outer_b, single(0.5 * (0.75 if stale_then else outer_b))))
+    return pixels
+
+
+def check_masked_else_draw(directory, compiler, renderer, backend):
+    """Draw if/else regions (issue #1315): both openers and closes, every skip shape, mixed, full and empty masks."""
+    source = directory / "else.hlsl"
+    shader = directory / "else.cso"
+    constants = bytearray(256)
+    variants = [(opener, restore, skips) for opener in ELSE_OPENERS for restore in (MASKED_MOV_RESTORE,
+                MASKED_OR_RESTORE) for skips in ELSE_SKIPS]
+    for opener, restore, skips in variants:
+        source.write_text(translate(else_region(opener, restore, skips)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for threshold in (0.5, 10.0, -1.0):
+            struct.pack_into("<4f", constants, 12, threshold, 0.25, 0.75, 0.5)
+            case = directory / f"else-{opener}-{'mov' if restore == MASKED_MOV_RESTORE else 'or'}-{skips}-{len(cases)}.case"
+            write_case(case, constants, else_pixels(threshold))
+            cases.append((case, "pass"))
+        run_pixel_batch(renderer, backend, shader, cases)
+    struct.pack_into("<4f", constants, 12, 0.5, 0.25, 0.75, 0.5)
+    base = [line for _, line in else_region()]
+    mutants = (
+        # The else body runs on the then lanes when the transition is dropped.
+        ("no-transition", [line for line in base if line != ELSE_TRANSITION], else_pixels(0.5)),
+        ("reversed", [line.replace("v_cmp_lt_f32_e64", "v_cmp_ge_f32_e64") for line in base], else_pixels(0.5)),
+        # A correct shader against the stale-then expectation: the draw must tell the two apart.
+        ("stale-then", base, else_pixels(0.5, stale_then=True)),
+    )
+    for label, program, expected in mutants:
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        case = directory / f"else-mutant-{label}.case"
+        write_case(case, constants, expected)
+        run_pixel_batch(renderer, backend, shader, [(case, "mismatch")])
 
 
 # v_cmpx regions (issue #932): `s_mov_b64 s[a:b], exec` saves the entry mask, a VOPC e32 v_cmpx intersects EXEC
@@ -10073,11 +10171,14 @@ def check_masked_mov_close_controls():
     expect_value_error(translate, [(offset, "s_mov_b64 exec, s[58:59]" if line == MASKED_MOV_RESTORE else line)
                                    for offset, line in masked_skip(MASKED_MOV_RESTORE)],
                        "Execution skip does not target the matching restore")
-    # The else transition and a wave32 copy stay outside this stage.
-    for extra in ("s_andn2_b64 exec, s[60:61], exec", "s_mov_b32 exec_lo, s60"):
-        changed = list(region)
-        changed.insert(changed.index(MASKED_MOV_RESTORE), extra)
-        expect_value_error(translate, changed, f"Instruction cannot run in a masked region: {extra}")
+    # A wave32 copy stays outside the region forms. The else transition is admitted since issue #1315 Stage B
+    # (check_masked_else_controls) but only on the saved pair.
+    changed = list(region)
+    changed.insert(changed.index(MASKED_MOV_RESTORE), "s_mov_b32 exec_lo, s60")
+    expect_value_error(translate, changed, "Instruction cannot run in a masked region: s_mov_b32 exec_lo, s60")
+    changed = list(region)
+    changed.insert(changed.index(MASKED_MOV_RESTORE), "s_andn2_b64 exec, s[58:59], exec")
+    expect_value_error(translate, changed, "Unexpected execution mask else transition")
     # s_mov_b64 leaves SCC, but s_and_saveexec_b64 already wrote it from the new EXEC, which is untracked, so an SCC
     # reader after the MOV close rejects exactly as after the s_or_b64 close. (cmpx_observables draws the v_cmpx
     # case, where SCC is tracked through the region and survives the MOV close.)
@@ -10088,6 +10189,94 @@ def check_masked_mov_close_controls():
     # An SCC written after the close is tracked again.
     translate(uncompressed_export([*masked_region_body(MASKED_MOV_RESTORE), "s_cmp_eq_u32 s44, s45",
                                    "s_cmov_b64 s[44:45], s[46:47]"]))
+
+
+def check_masked_else_controls():
+    """Issue #1315 Stage B: one structured wave64 else per region on the exact saved pair."""
+    transition, restore = ELSE_TRANSITION, MASKED_MOV_RESTORE
+
+    def renumbered(source):
+        """Name temporaries in order of appearance: a skip shifts the instruction index in each name."""
+        names = {}
+        return re.sub(r"\b(alu|cmp)(\d+)", lambda m: names.setdefault(m[0], f"{m[1]}#{len(names)}"), source)
+    for opener in ELSE_OPENERS:
+        for close in (MASKED_MOV_RESTORE, MASKED_OR_RESTORE):
+            sources = {renumbered(translate(else_region(opener, close, skips))) for skips in ELSE_SKIPS}
+            # The skips change control flow only: every skip shape lowers to the same selects.
+            assert len(sources) == 1, (opener, close)
+    source = translate(else_region())
+    # The else arm reads v14's pre-region value, and each register merges on the region condition.
+    assert "(0.5f * sample16.z)" in source, source
+    assert "_v13 = (cmp" in source and "_v14 = (cmp" in source and "_v15 = (cmp" in source, source
+    save = ELSE_OPENERS["saveexec"]
+    # A register first defined by the then arm is undefined in the else arm until the else arm writes it...
+    expect_value_error(translate, uncompressed_export([*save, "v_mov_b32_e32 v30, s45", transition,
+                                                       "v_add_f32_e32 v13, v30, s45", restore]),
+                       "Else arm reads a register defined only in the then arm")
+    translate(uncompressed_export([*save, "v_mov_b32_e32 v30, s45", transition, "v_mov_b32_e32 v30, s46",
+                                   "v_add_f32_e32 v13, v30, s45", restore]))
+    # ...and a register undefined before the region and on either arm stays undefined at the join.
+    for then_body, else_body in ((["v_mov_b32_e32 v30, s45"], []), ([], ["v_mov_b32_e32 v30, s45"])):
+        expect_value_error(translate, uncompressed_export([*save, *then_body, transition, *else_body, restore,
+                                                           "v_add_f32_e32 v13, v30, s45"]),
+                           "Read of a register defined only on the masked path")
+    translate(uncompressed_export([*save, "v_mov_b32_e32 v30, s45", transition, "v_mov_b32_e32 v30, s46", restore,
+                                   "v_add_f32_e32 v13, v30, s45"]))
+    # The transition names the saved pair, once, inside an open region; wave32 stays refused.
+    expect_value_error(translate, else_region(transition="s_andn2_b64 exec, s[58:59], exec"),
+                       "Unexpected execution mask else transition")
+    expect_value_error(translate, uncompressed_export([*save, *ELSE_THEN_BODY, transition, "v_mov_b32_e32 v13, s47",
+                                                       transition, restore]),
+                       "Unexpected execution mask else transition")
+    for program in (uncompressed_export([transition, *save, *ELSE_THEN_BODY, restore]),
+                    uncompressed_export([*save, *ELSE_THEN_BODY, restore, transition])):
+        expect_value_error(translate, program, f"Unsupported instruction")
+    expect_value_error(translate, else_region(transition="s_andn2_b32 exec_lo, s60, exec_lo"),
+                       "Instruction cannot run in a masked region: s_andn2_b32 exec_lo, s60, exec_lo")
+    # Both skip destinations sit on real instruction boundaries: the save's skip on the transition, the
+    # transition's skip on the close, each directly after its arm opener.
+    def retarget(skips, imm, insert_nop=False):
+        lines = [line for _, line in else_region(skips=skips)]
+        k = next(j for j, line in enumerate(lines) if line.startswith("s_cbranch_execz"))
+        if insert_nop:
+            lines.insert(k, "s_nop 0")
+            k += 1
+        lines[k] = f"s_cbranch_execz {imm}"
+        return offset_pairs(lines)
+    # The save's skip landing on the close of a region that has an else transition.
+    pairs = else_region(skips="then")
+    k = next(j for j, (_, line) in enumerate(pairs) if line.startswith("s_cbranch_execz"))
+    close = next(offset for offset, line in pairs if line == restore)
+    pairs[k] = (pairs[k][0], f"s_cbranch_execz {(close - pairs[k][0] - 4) // 4}")
+    expect_value_error(translate, pairs, "Unexpected execution mask else transition")
+    expect_value_error(translate, retarget("else", 1), "Execution skip does not target the matching restore")
+    expect_value_error(translate, retarget("else", 3), "Execution skip does not target the matching restore")
+    expect_value_error(translate, retarget("else", 2, insert_nop=True),
+                       "Instruction cannot run in a masked region: s_cbranch_execz 2")
+    # Skips stay limited to the arms of one region.
+    two = [*save, "s_cbranch_execz 1", "v_mov_b32_e32 v13, s45", restore,
+           *save, "s_cbranch_execz 1", "v_mov_b32_e32 v14, s45", restore]
+    expect_value_error(translate, offset_pairs(uncompressed_export(two)), "Unsupported execution skip")
+    # SCC: v_cmpx keeps it through the then arm, the transition makes it unknown until the else arm redefines it.
+    cmpx = ELSE_OPENERS["cmpx"]
+    translate(uncompressed_export(["s_cmp_lt_u32 s44, s46", *cmpx, "s_cselect_b32 s62, 1.0, 0", transition, restore]))
+    expect_value_error(translate, uncompressed_export(["s_cmp_lt_u32 s44, s46", *cmpx, transition,
+                                                       "s_cselect_b32 s62, 1.0, 0", restore]),
+                       "Select condition is not a tracked scalar result")
+    translate(uncompressed_export(["s_cmp_lt_u32 s44, s46", *cmpx, transition, "s_cmp_lt_i32 s45, s46",
+                                   "s_cselect_b32 s62, 1.0, 0", restore]))
+    # A scalar written in a then arm the wave may skip is not defined for the else arm; without the skip it is.
+    expect_value_error(translate, offset_pairs(uncompressed_export([*save, "s_cbranch_execz 2", "s_mov_b32 s62, s45",
+                                                                    "v_mov_b32_e32 v13, s45", transition,
+                                                                    "v_mov_b32_e32 v14, s62", restore])),
+                       "Read of a register defined only on the masked path")
+    translate(uncompressed_export([*save, "s_mov_b32 s62, s45", "v_mov_b32_e32 v13, s45", transition,
+                                   "v_mov_b32_e32 v14, s62", restore]))
+    # Memory and side effects stay refused in the else arm.
+    for extra in ("image_sample v[16:19], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+                  "exp mrt0 v12, v13, v14, v15 done vm", "v_readfirstlane_b32 s62, v12"):
+        expect_value_error(translate, uncompressed_export([*save, transition, extra, restore]),
+                           f"Instruction cannot run in a masked region: {extra}")
 
 
 def check_masked_controls():
@@ -10327,7 +10516,7 @@ def check_cmpx_controls():
                   "exp mrt0 v12, v13, v14, v15 done vm",
                   "image_sample v[16:19], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
                   "v_cmp_eq_f32_e64 vcc_lo, v12, v13", "v_readfirstlane_b32 s62, v12",
-                  "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13", "s_andn2_b64 exec, s[60:61], exec"):
+                  "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13", "s_andn2_b64 exec, s[58:59], exec"):
         must_reject(translate, region[:inside + 1] + [extra] + region[inside + 1:])
     # Since issue #1315 the s_mov_b64 restore also closes an s_and_saveexec_b64 region on the same pair, lowering as
     # the s_or_b64 close does (check_masked_mov_close_controls); a copy of a different pair still does not close it.
@@ -12748,6 +12937,7 @@ def check_controls(directory):
     check_smem_pointer_controls()
     check_masked_controls()
     check_masked_mov_close_controls()
+    check_masked_else_controls()
     check_cmpx_controls()
     check_shift64_controls()
     check_region_body_controls()
@@ -14880,6 +15070,14 @@ def check_binary(directory, assembler, objcopy, library):
         fixtures.append((masked_region(restore), translate))
         fixtures.append((masked_complementary(restore), translate))
         fixtures.append((masked_skip_asm(restore), translate, "gfx1013", "", masked_skip(restore)))
+    for opener in ELSE_OPENERS:
+        for restore in (MASKED_MOV_RESTORE, MASKED_OR_RESTORE):
+            for skips in ELSE_SKIPS:
+                pairs = else_region(opener, restore, skips)
+                if skips == "none":
+                    fixtures.append(([line for _, line in pairs], translate))
+                else:
+                    fixtures.append((else_region_asm(opener, restore, skips), translate, "gfx1013", "", pairs))
     fixtures.extend((program, translate) for program in (
         cmpx_region(), cmpx_region(CMPX_OR_RESTORE), cmpx_observables(),
         *(cmpx_predicate_group(kind, first) for kind, first in CMPX_PREDICATE_GROUPS)))
