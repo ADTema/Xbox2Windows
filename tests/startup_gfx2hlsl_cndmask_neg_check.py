@@ -38,10 +38,10 @@ AND_B32 = 0x1b
 V30 = 256 + 30  # VGPR operands are encoded from 256 upwards
 
 
-def encode_vop2_e64(op, vdst, src0, src1, *, neg0=0, neg1=0):
+def encode_vop2_e64(op, vdst, src0, src1, *, neg0=0, neg1=0, clamp=0, omod=0):
     """Encode a VOP2 instruction in its VOP3A (e64) form."""
-    w0 = (0b110101 << 26) | ((VOP2_E64_BASE + op) << 16) | (vdst & 0xff)
-    w1 = ((src0 & 0x1ff) | ((src1 & 0x1ff) << 9) | ((neg0 & 1) << 29) | ((neg1 & 1) << 30))
+    w0 = ((0b110101 << 26) | ((VOP2_E64_BASE + op) << 16) | ((clamp & 1) << 15) | (vdst & 0xff))
+    w1 = ((src0 & 0x1ff) | ((src1 & 0x1ff) << 9) | ((omod & 0x3) << 27) | ((neg0 & 1) << 29) | ((neg1 & 1) << 30))
     return struct.pack('<II', w0, w1)
 
 
@@ -100,7 +100,9 @@ asm, emitted = translate(encode_vop2_e64(CNDMASK, 31, V30, V30))
 check('no negation is unchanged', emitted == 'v31 = (s0 & 1) ? v30 : v30;', emitted)
 
 # 4. The negation is only modelled where the handler asks for it: another integer instruction carrying the
-#    same modifier stays refused rather than silently flipping a bit.
+#    same modifier stays refused rather than silently flipping a bit. (`llvm-mc` rejects `-v30` on
+#    `v_and_b32_e64`, so this encoding is not one an assembler produces; the property under test is that the
+#    decoder's negated text is refused by a handler that does not model it.)
 check('a negation on another integer op stays refused',
       refused(encode_vop2_e64(AND_B32, 1, V30, V30, neg1=1)))
 
@@ -117,6 +119,18 @@ check('NEG on inline integer remains refused', refused(encode_vop2_e64(CNDMASK, 
 check('NEG on inline float remains refused', refused(encode_vop2_e64(CNDMASK, 31, V30, 242, neg1=1)))
 check('NEG on literal remains refused', refused(encode_vop2_e64(CNDMASK, 31, V30, 255, neg1=1)
                                               + struct.pack('<I', 0x12345678)))
+# 6. Every edge of the refused immediate ranges, plus the constants just inside them: a mutation moving a
+#    range boundary by one has to fail one of these.
+for edge in (128, 208, 240, 248):
+    check('NEG on the immediate at %d is refused' % edge,
+          refused(encode_vop2_e64(CNDMASK, 31, edge, V30, neg0=1)))
+asm, emitted = translate(encode_vop2_e64(CNDMASK, 31, 240, V30))
+check('plain 0.5 still translates',
+      asm == ['v_cndmask_b32_e64 v31, 0.5, v30, s0'] and '0x3f000000u' in emitted, emitted)
+
+# 7. The select takes no output modifier; one that reaches it is refused rather than dropped from the text.
+check('a clamp on the select is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, clamp=1)))
+check('a mul:2 on the select is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, omod=1)))
 
 if failures:
     print('FAIL')

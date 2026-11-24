@@ -894,6 +894,10 @@ class Stage:
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
 
     def op_v_cndmask_b32(self, ops, mods):
+        # The select takes no output modifier: a clamp or mul on it would change the value, so a
+        # modifier that reaches here is refused rather than dropped from the emitted text.
+        if mods:
+            raise Unsupported('v_cndmask_b32 with %s' % mods)
         mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
         self.set_v(reg_range(ops[0])[1],
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
