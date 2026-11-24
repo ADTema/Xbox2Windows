@@ -301,11 +301,11 @@ def smem_mods(mods):
     for m in mods:
         if m in ('glc', 'dlc'):
             continue
-        if m.startswith('offset:') and imm is None and re.fullmatch(r'0[xX][0-9a-fA-F]+|\d+', m[7:]):
-            # SMEM OFFSET[20:0] is signed two's complement on RDNA 2; disasm_rdna2 prints w1 & 0x1fffff
-            # unsigned, so 0x100000..0x1fffff are negative byte offsets and must not read at +1..2 MiB.
-            value = int(m[7:], 0)
-            if value > 0xfffff:
+        if m.startswith('offset:') and imm is None and re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|\d+)', m[7:]):
+            # Reject signed negative offsets and older unsigned spellings with bit 20 set.
+            token = m[7:]
+            value = int(token, 16 if '0x' in token.lower() else 10)
+            if not 0 <= value <= 0xfffff:
                 raise Unsupported('SMEM immediate offset %s' % m)
             imm = value
         else:
