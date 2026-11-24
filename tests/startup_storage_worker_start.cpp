@@ -653,7 +653,10 @@ bool suffix_waits_for_prefix(Fixture& f, bool hold_deferred)
             f.status_entry(q, 1);
             f.submit(q);
             Sleep(200);  // time for a Submit that completes ahead of the held prefix
-            early = f.complete(q, 0) || f.complete(q, 1) || suffix_fence.signals != 0 || second_fence.signals != 0;
+            if (hold_deferred)  // the first status entry precedes the held fence, so it may be complete
+                early = f.complete(q, 1) || suffix_fence.signals != 0 || second_fence.signals != 0;
+            else
+                early = f.complete(q, 0) || f.complete(q, 1) || suffix_fence.signals != 0 || second_fence.signals != 0;
         }
         SetEvent(hold_release);
         WaitForSingleObject(thread, completion_timeout_ms);
