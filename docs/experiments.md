@@ -125,6 +125,10 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^stream_root_srv_' -V
 ```
 
+## DirectStorage destination that is not writable
+
+A storage request into memory that is not writable to its declared capacity (a guard, read-only or no-access page, or fewer committed pages than declared) is now refused with `destination not writable`, and writes nothing. It replaces a write fault in the stand-in's copy that ended a long streaming run. Run `ctest --preset release --no-tests=error -R '^startup_dstorage_destination$' -V`; the details are in [startup-runtime.md](startup-runtime.md#directstorage-destinations-that-are-not-writable).
+
 ## Local tools
 
 For optional static dependency inspection, build Microsoft's pinned version of xbdepends from PowerShell with x64 Visual Studio Build Tools, CMake and the Windows SDK.
