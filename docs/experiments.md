@@ -2,6 +2,17 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## CPU-written R8 planes across frames
+
+The startup draw uploader checks a single-mip, single-slice R8_UNORM texture of up to 32 MiB
+on its first bind in each new frame. The texture may change through direct CPU stores between
+uses of the same decoder buffer. Unchanged bytes reuse the desktop copy. Other formats retain
+the existing 15-frame polling interval and explicit XG write notifications still trigger a check.
+
+Build `startup_plane_refresh` and run `ctest --preset release --no-tests=error -R '^startup_plane_refresh_' -V`.
+The fixture rotates three 17×3 desktop R8 textures through six CPU images. Each adapter must read
+back all 306 current pixels. Suppressing the refresh on the second rotation leaves exactly 153 stale pixels.
+
 ## Startup vertex fetch from an unsigned byte
 
 `gfx2hlsl` reads `BUF_FMT_8_UINT` from the aligned dword containing the requested byte and zero-extends it. Missing Y, Z and W components read as integer 0, 0 and 1. The source-built fixture loads vertex-buffer slot 1 with stride 3 and byte offset 1. It compiles the generated vertex shader and calls its vertex body from a compute wrapper to read all four register values without interpolation. All 16 vertex indices agree with a little-endian byte reference on WARP and hardware, and switching the instruction to R8_UNORM changes the readback.

@@ -305,7 +305,14 @@ add_executable(startup_nv12_draw tests/startup_nv12_draw.cpp tests/desktop_gpu.c
 target_compile_features(startup_nv12_draw PRIVATE cxx_std_17)
 target_include_directories(startup_nv12_draw PRIVATE src)
 target_link_libraries(startup_nv12_draw PRIVATE startup_stub_xg_xs d3d12 dxgi d3dcompiler)
+add_executable(startup_plane_refresh tests/startup_plane_refresh.cpp tests/desktop_gpu.cpp)
+target_compile_features(startup_plane_refresh PRIVATE cxx_std_17)
+target_include_directories(startup_plane_refresh PRIVATE src)
+target_link_libraries(startup_plane_refresh PRIVATE d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_plane_refresh_${backend} COMMAND startup_plane_refresh)
+    set_tests_properties(startup_plane_refresh_${backend} PROPERTIES
+        ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${backend}" TIMEOUT 60 SKIP_RETURN_CODE 77)
     add_test(NAME startup_nv12_draw_${backend} COMMAND startup_nv12_draw)
     set_tests_properties(startup_nv12_draw_${backend} PROPERTIES
         ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${backend}" TIMEOUT 60 SKIP_RETURN_CODE 77)
