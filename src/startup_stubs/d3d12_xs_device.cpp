@@ -33,6 +33,7 @@
 
 #include <d3d12.h>
 #include "command_list_slot_names.h"
+#include "command_signature_filter.h"
 #include "console_plane_size.h"
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
@@ -909,10 +910,29 @@ void __stdcall device_copyable_footprints(Wrapper* self, const D3D12_RESOURCE_DE
 }
 
 // Device slot 41, desktop CreateCommandSignature(desc, root, riid, ppv); on failure the descriptor and
-// its argument descriptors are logged.
+// its argument descriptors are logged. Argument types outside the desktop enumeration (0x69 seen,
+// stride 12) cannot be created on desktop: they are recognised before the desktop call, which the debug
+// layer would report as an error, and the title gets a placeholder CommandSignature (command lists are
+// not executed).
 u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND_SIGNATURE_DESC* desc, u64 root,
                                               u64 iid, u64 out)
 {
+    const bool console_type = desc && x2w_startup::has_console_indirect_arg_type(
+        desc->pArgumentDescs, desc->NumArgumentDescs, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
+    if (console_type && out) {
+        static LONG placeholders;
+        if (first_calls(placeholders, 8)) {
+            log("x2w-d3d12   CreateCommandSignature: console argument type -> placeholder (stride=%u args=%u)",
+                desc->ByteStride, desc->NumArgumentDescs);
+            for (UINT i = 0; i < desc->NumArgumentDescs && i < 8; ++i) {
+                char bytes[3 * 16 + 1];
+                hex_text(&desc->pArgumentDescs[i], sizeof(D3D12_INDIRECT_ARGUMENT_DESC), bytes, sizeof(bytes));
+                log("x2w-d3d12     arg[%u]=[%s]", i, bytes);
+            }
+        }
+        *reinterpret_cast<void**>(out) = wrap(nullptr, command_signature_kind);
+        return S_OK;
+    }
     const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
     if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && !root && desc->NumArgumentDescs == 1) {
         auto* signature = *reinterpret_cast<Wrapper**>(out);
@@ -939,16 +959,6 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
             hex_text(&desc->pArgumentDescs[i], sizeof(D3D12_INDIRECT_ARGUMENT_DESC), bytes, sizeof(bytes));
             log("x2w-d3d12     arg[%u]=[%s]", i, bytes);
         }
-    }
-    // Argument types outside the desktop enumeration (0x69 seen, stride 12) cannot be created on
-    // desktop; the title gets a placeholder CommandSignature.
-    bool console_type = false;
-    for (UINT i = 0; desc && i < desc->NumArgumentDescs; ++i)
-        console_type |= static_cast<UINT>(desc->pArgumentDescs[i].Type) > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
-    if (FAILED(static_cast<HRESULT>(result)) && console_type && out) {
-        log("x2w-d3d12   CreateCommandSignature: console argument type -> placeholder");
-        *reinterpret_cast<void**>(out) = wrap(nullptr, command_signature_kind);
-        return S_OK;
     }
     return result;
 }
