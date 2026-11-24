@@ -46,7 +46,7 @@ def run_block(pwsh, block, env_value, with_sccache, work):
     env = {k: v for k, v in os.environ.items() if k != "X2W_USE_SCCACHE"}
     # Only the stub directory and pwsh itself: a real sccache must not leak in.
     env["PATH"] = os.pathsep.join([str(bindir), os.path.dirname(pwsh)] +
-                                  ([os.path.join(env["SystemRoot"], "System32")] if os.name == "nt" else []))
+                                  ([os.path.join(os.environ["SystemRoot"], "System32")] if os.name == "nt" else []))
     if env_value is not None:
         env["X2W_USE_SCCACHE"] = env_value
     out = subprocess.run([pwsh, "-NoProfile", "-File", str(script)], env=env,
