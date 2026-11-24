@@ -479,6 +479,12 @@ These are measured on one executable; treat them as hypotheses for others.
   Wrapped sampler heaps keep the 16-byte title stride separate from the desktop descriptor increment
   for CPU handles and descriptor copies.
   The source-built readback uses `ctest --preset dev --no-tests=error -R '^startup_sampler_heap_' -V`.
+  The readback samples only wrap, clamp and border samplers along U. A device-free check covers the
+  rest of the sampler word decoding (each address mode on each axis, filters, anisotropy and border
+  colour), the `smpheap` manifest lines that are refused, snapshot counts and unreadable records, and
+  snapshot equality: build `startup_translated_sampler_bindings_check` and run
+  `ctest --preset dev --no-tests=error -R "^startup_translated_sampler_bindings(_shared_axis_control)?$" -V`.
+  The control expects all three axes to use the U field and must fail.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
   gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
