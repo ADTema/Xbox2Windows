@@ -239,6 +239,21 @@ class Stage:
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
 
+    def heap_sampler(self, tok):
+        """'qh[...]' when the four sampler words of tok came from one run-time sampler heap load."""
+        r = reg_range(tok)
+        if not r or r[2] - r[1] != 3:
+            return None
+        first = self.sym.get(r[1])
+        if not first or first[0] != 'smpheap':
+            return None
+        if any(self.sym.get(r[1] + i) != ('smpheap', first[1], i) for i in range(4)):
+            raise Unsupported('sampler operand %s mixes sampler heap words' % tok)
+        self.pipe.uses_sampler_heap = True
+        # Sampler descriptors are 16 bytes; x2w_sampler_entry() maps the byte offset to its entry and
+        # sends unaligned or out-of-range offsets to the fallback entry.
+        return 'qh[x2w_sampler_entry(s%d)]' % first[1]
+
     def const_words(self, tok):
         r = reg_range(tok)
         words = [self.is_const(n) for n in range(r[1], r[2] + 1)]
@@ -433,8 +448,17 @@ class Stage:
         try:
             off = int(ops[2], 0)
         except ValueError:
+            if p[1] == ('smpheap',) and self.pipe.sampler_heap and count == 4:
+                # A sampler picked at run time from the sampler heap: keep the byte offset in the
+                # first destination register; image() indexes the heap table with it.
+                d = dst[1]
+                self.used_s.add(d)
+                self.emit('s%d = %s;' % (d, self.u(ops[2])))
+                for i in range(count):
+                    self.sym[d + i] = ('smpheap', d, i)
+                return
             if p[1] == ('smpheap',):
-                # A sampler picked at run time from the sampler heap: shortcut, a fixed default sampler.
+                # Shortcut (default unless X2W_SAMPLER_HEAP=1): a fixed default sampler.
                 for i in range(count):
                     self.sym[dst[1] + i] = ('const', 0)
                 self.pipe.notes.add('dynamic sampler index replaced by a default sampler')
@@ -587,8 +611,9 @@ class Stage:
             else:
                 call = '%s.Load(int3(%s, %s, 0))' % (tex, self.u(cs[0]), self.u(cs[1]))
         else:
-            words = self.const_words(ops[3])
-            smp = self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
+            heap = self.heap_sampler(ops[3])
+            words = None if heap else self.const_words(ops[3])
+            smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
             uv = ('float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
                   else 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1])))
             if how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
@@ -841,9 +866,28 @@ def parse_root(blob):
     raise Unsupported('no RTS0 part')
 
 
+# Run-time sampler heap indexing: an s_load from the sampler heap with a register offset becomes a
+# read of a bounded table, SamplerState qh[SAMPLER_HEAP_SIZE] : register(s0, space1), the form a
+# desktop SM 5.1 / 6.0 shader can index at run time. Opt-in with X2W_SAMPLER_HEAP=1 until the
+# stand-in binds that table; otherwise such a load keeps the default-sampler shortcut.
+#
+# Contract at the manifest boundary ('smpheap <count> <space> fallback <entry>'):
+# - entries 0 .. SAMPLER_HEAP_FALLBACK - 1 hold the title's sampler-heap entries, entry n at byte
+#   offset 16 * n;
+# - entry SAMPLER_HEAP_FALLBACK is reserved: the host fills it with a fallback sampler;
+# - the shader computes the entry itself (x2w_sampler_entry): a byte offset that is not a multiple
+#   of 16, or that lies at or past 16 * SAMPLER_HEAP_FALLBACK, reads the fallback entry. The host
+#   cannot check the offset, which is computed in the shader, so the guard is in the shader.
+SAMPLER_HEAP_SIZE = 2048  # D3D12's limit for a shader-visible sampler heap
+SAMPLER_HEAP_SPACE = 1
+SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
+
+
 class Pipeline:
-    def __init__(self, vs_code, ps_code, root_blob):
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None):
         self.root = parse_root(root_blob)
+        self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
+        self.uses_sampler_heap = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -887,6 +931,10 @@ class Pipeline:
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex2d': 'Texture2D<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('SamplerState q%d : register(s%d);' % (i, i))
+        if self.uses_sampler_heap:
+            out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
+            out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
+                       % (16 * SAMPLER_HEAP_FALLBACK, SAMPLER_HEAP_FALLBACK))
         return out
 
     def interface(self, for_pixel):
@@ -939,6 +987,8 @@ class Pipeline:
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
         for key, i in self.samplers.items():
             lines.append('smp %d %s' % (i, ' '.join('0x%x' % w for w in key)))
+        if self.uses_sampler_heap:
+            lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
         lines.append('targets %s' % ' '.join(k[3:] for k in sorted(self.ps.exports) if k.startswith('mrt')))
         return '\n'.join(lines) + '\n'
