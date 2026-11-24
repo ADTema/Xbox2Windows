@@ -3492,6 +3492,46 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_d16_' -V
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### Indexed gfx1030 formatted D16 UINT buffer reads
+
+The compute store profile lowers `buffer_load_format_d16_x`, `_xy`, `_xyz`
+and `_xyzw` for `--source-format BUF_FMT_16_16_16_16_UINT`. The caller declares
+that the source descriptor uses this format and identity XYZW selectors.
+The [AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+(§8.1.2, §8.1.4 and MUBUF opcodes 128–131) packs the selected components in
+order, low half first, into one or two consecutive VGPRs. The lowerer
+tracks only the low half of the final VGPR for `x` and `xyz`. The accepted
+consumer for that final half is an explicit `v_and_b32_e32` with `0xffff`.
+
+The descriptor must be ready at `lgkmcnt(0)`, and all destination VGPRs
+remain pending until `vmcnt(0)`. The verified dispatch-thread index may
+alias the first destination. The instruction requires `idxen`, a zero
+scalar offset, and a whole eight-byte texel at an eight-byte-aligned
+immediate within the declared source stride. The caller provides a stable,
+in-range, unswizzled and eight-byte-aligned source view and stride with
+thread-ID addition disabled, disjoint from the UAV. Other source formats,
+address modes and modifiers are refused.
+
+The wave32 fixtures select the second texel of each 16-byte source record
+and write the packed words after one padding DWORD in the output record.
+A CPU reference reads the selected bytes and compares all 320 output
+words, including padding and the untouched tail, at one and two groups.
+Loading the preceding texel must fail first at output word 1. Controls
+also require rejection of missing waits, whole-word consumption of a
+partial VGPR, mismatched formats and reads outside the source record.
+LLVM 15 assembles and disassembles all four forms. The compute-container
+CLI emits the same HLSL as direct lowering, and the GPU fixtures execute
+the translated DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_load_format_d16_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### Indexed gfx1030 formatted UINT buffer reads
 
 The compute store profile lowers `buffer_load_format_x`,
