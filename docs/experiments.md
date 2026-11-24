@@ -10336,6 +10336,36 @@ python3 -B tests/rdna2_tools_check.py
 
 Scope: recognition only. No translator lowers these forms through this change, and no hardware or Windows run backs them.
 
+## gfx1013 VOP1 rounding, frexp and operand-free opcodes
+
+`tools/disasm_rdna2.py` named only part of the VOP1 table; eleven opcodes in two contiguous gaps printed as `v_vop1_NN`
+(and as `v_vop1_NN` through the VOP3 spelling at 0x180 + opcode). They now decode, in the `_e32`, `_e64`, SDWA and DPP
+spellings the assembler accepts for each:
+
+- 0x17 to 0x1a: `v_trunc_f64`, `v_ceil_f64`, `v_rndne_f64`, `v_floor_f64` (binary64 pair destination and source).
+- 0x3c to 0x3e: `v_frexp_exp_i32_f64` (one VGPR result), `v_frexp_mant_f64`, `v_fract_f64`.
+- 0x3f and 0x40: `v_frexp_exp_i32_f32` and `v_frexp_mant_f32`.
+- 0x1b and 0x41: `v_pipeflush` and `v_clrexcp`, which have no operands. They print as the bare mnemonic and, like llvm-mc,
+  take no literal dword when SRC0 is 255. The decoder does not check that their VDST field is zero (it does not for
+  `v_nop` either); llvm-mc refuses a non-zero VDST.
+
+The binary64 ops have no SDWA or DPP form, nor do the two operand-free ones, so those spellings stay eight-byte
+`<unsupported SDWA>` and `<unsupported DPP16>` records, as llvm-mc refuses them. `tools/scan_unsupported_shaders.py`
+recognizes `v_pipeflush`, `v_clrexcp` and `v_frexp_exp_i32_f32` as well (the other names were already known), so a scan
+no longer lists the eleven as unknown opcodes. The change stacks on the VOP1 binary64-source conversion fix: it
+reuses that change's one-register result for `v_frexp_exp_i32_f64`.
+```sh
+python3 -B tests/rdna2_tools_check.py
+```
+
+The expected texts are the gfx1013 disassembly of words assembled with llvm-mc. A sweep of 3,000 random e32 and e64
+words over the eleven opcodes, with random register, modifier and source fields, found the same classes of difference from
+llvm-mc that the existing `v_rcp_f64`, `v_rsq_f64` and `v_sqrt_f64` forms already have (a VGPR pair that would end past
+v255, an SGPR pair named by its odd register, e64 modifier bits that llvm-mc refuses and the decoder prints).
+
+Scope: decoding and scanner recognition only. No translator lowers the binary64 ops, `v_pipeflush`, `v_clrexcp` or
+`v_frexp_exp_i32_f32`, and no measurement on hardware backs the descriptions.
+
 ## gfx1013 SOPK and SOPP decoding
 
 `tools/disasm_rdna2.py` decodes 29 more scalar forms: the nine `s_cmpk_*` compare-immediate ops
