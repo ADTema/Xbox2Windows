@@ -1748,6 +1748,13 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
             return handler
         setattr(Stage, 'op_s_cmp_%s_%s' % (_name, _typ), _make())
         setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make())
+# s_bitcmp1_b32 / s_bitcmp0_b32: SCC = S0[S1[4:0]] == 1 / == 0.
+for _bit in (0, 1):
+    def _make_bitcmp(bit=_bit):
+        def handler(self, ops, mods):
+            self.emit('scc = ((%s >> (%s & 31)) & 1u) == %du;' % (self.u(ops[0]), self.u(ops[1]), bit))
+        return handler
+    setattr(Stage, 'op_s_bitcmp%d_b32' % _bit, _make_bitcmp())
 
 
 def parse_root(blob):
