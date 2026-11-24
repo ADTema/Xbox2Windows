@@ -5567,6 +5567,43 @@ comparison and class draws (`v_cmp_*` f16, i16, i32, u32 and SDWA groups and
 references and expected-mismatch controls are unchanged; only the CTest entry
 that runs them moved.
 
+The comparison entry also reports one adapter family where the subnormal
+immediate reads flushed. `pixel_aot_comparisons_hardware` fails on the
+subnormal-immediate case (case 2 of the f32 group) on an AMD Radeon RX 9070 XT
+(`1002:7550`, RDNA 4, driver `32.0.32029.2010`, Windows 11 build 26200.9974),
+2 of 2 runs, `expected pass, got mismatch`, while `pixel_aot_comparisons_warp`
+passes 2 of 2 on the same build. The case compares the integer immediate `1`
+as a binary32 subnormal under a guard, and the adapter answers as if it had
+been flushed. Two controls keep the compiler build and the driver build from
+being the variable on this adapter: DXC `1.8.2502.8` and `1.9.2602.17` produce
+the same RGA ISA, identical at the sha256 of each shape's listing, over the
+32-shape matrix built around the case, and two Adrenalin packages (UMD
+`8.18.10.0504` with driver `32.0.31041.3013`, and UMD `8.18.10.0514` with
+driver `32.0.32029.2010`) give the same verdict on all 32. On this adapter 17
+of the 32 shapes read the flushed answer and 15 read IEEE. In the ISA
+`gfx1200` carries `s_denorm_mode 14` before the `fcmp` and `15` after, around a
+lane mask, for 17 of the 32 shapes; the other 15 compare without that window.
+Those listings come from RGA 2.15.0.30 in DX12 mode, compiled for the `gfx1200`
+target on the machine of the runs above: the target is the compiler's, and the
+adapter reports `gfx1201`. The 17 share the shape of the consumer rather than
+one consumer: the compare result is widened to a lane mask
+(`s_cselect_b64 <reg>, exec, 0`) through `and i1` (8 shapes), `or i1` (4),
+`xor i1` (2), a `zext` followed by an `add` (2), or a `zext` feeding the value
+operand of a `select` (1). The 15 that compare without the window store the
+`zext` directly, use the compare as a `select` condition, or reach a `phi`
+after a branch. In all 32 the mode switch and at least one lane-mask select
+appear exactly in the 17 shapes that read the flushed word, and the DXIL keeps
+`"fp32-denorm-mode"="preserve"` in all 32. The case passes on the adapters
+reported in
+[issue #958](https://github.com/R0Y00/Xbox2Windows/issues/958): an RX 6600
+(RDNA 2) and an RX 590 (Polaris) both run `pixel_aot_comparisons_hardware`
+green, and an RX 7800 XT (RDNA 3) reports the 32-shape matrix reading IEEE on
+all 32. The comparison, its references and the existing denormal profile stay
+unchanged while the cross-device cause is open; driver and OS are not
+controlled between those reporters, and each reports a single adapter. The
+D3D12 debug layer was unavailable on the RX 9070 XT run that produced the
+matrix above; the RX 6600 and RX 7800 XT runs listed here had it enabled.
+
 The `draw-core` entry was also close to its 60 s limit on an RTX 3050 Laptop
 GPU (56–58.5 s in the runs reported on #448). Its DPP, VOP3P, bitwise, FMA-mix
 and dot-product draws now run as the separate `draw-core-vector` mode,
@@ -6001,7 +6038,7 @@ The table gives word 0 of the first pixel the renderer reports; words 1 to 3 wer
 Radeon GPU Analyzer 2.15.0.30 in DX12 mode shows a mode switch that accounts for it. For the guarded shader the driver compiler emits `s_denorm_mode 14` before `s_cmp_eq_f32` and `s_denorm_mode 15` after it. Mode 15 keeps binary32 input denormals, as the DXIL attribute `"fp32-denorm-mode"="preserve"` requests, and mode 14 flushes them, which would read `0x00000001` as zero for that one compare. The plain and `guarded-runtime` shaders contain no mode change, and neither do the `-denorm ftz` builds of the plain, guarded and `guarded-runtime` shaders. The two listings come from different reporters and drivers: `gfx1200` is the RX 9060 XT of the table on driver 32.0.32029.2010 with DXC 1.9.2602.17, and `gfx1201` is a second RX 9070 XT on driver 32.0.31044.16 with DXC 1.8.2502.11, not the RX 9070 XT of the table, which has no ISA measurement. Both show the same two instructions; on `gfx1200` the switch was also present in five more `and i1` shaders, including `G && (1.0f == r)` and `G && (asfloat(0x00800000u) == r)`, whose constants are normal. RGA compiles its own pipeline object around the shader blob, with its own blend, rasterizer and sample state. The ISA listings and the draws are therefore two separate pieces of evidence, not a capture of the same pipeline: the listings are the driver's code for these shaders, and the draws are what `offscreen_check`'s pipeline read back. On the RX 9060 XT, the one machine with both, they agree. On that second RX 9070 XT the plain, guarded and `guarded-runtime` draws, with the debug layer enabled, gave the same three words on driver 32.0.31044.16, and the fixture failed identically on 32.0.31035.1003. The DXIL of the guarded and plain shaders contains the same `fcmp oeq float %x, 0x36A0000000000000`, so the mode switch comes from the driver compiler, not from DXC.
 [gfx1201 ISA](https://github.com/R0Y00/Xbox2Windows/issues/958#issuecomment-7114124670) · [gfx1200 ISA](https://github.com/R0Y00/Xbox2Windows/issues/958#issuecomment-7114359860) · [RX 9070 XT, two more drivers](https://github.com/R0Y00/Xbox2Windows/issues/958#issuecomment-7113578912)
 
-Not established: why the driver compiler selects mode 14 for this shape; whether consumers other than `and i1` (`or`, `select`) trigger it; the `and i1` rows with two data operands on any driver other than 32.0.32029.2010; any non-RDNA 4 Radeon; and whether another vendor shows it for these exact shapes, since the RTX 3070 was not run on this table. One RX 9070 XT observation was not re-measured: two shaders differing only in whether the literal is bound to a local gave opposite answers in a four-channel probe. The shape rule in the linked comment attributes that to the reduction changing the DXIL shape; the pair itself was not run again. "Feeds an `and i1`" describes the shaders listed here. None of this addresses native gfx1013 compare behavior or the console.
+Not established: why the driver compiler selects mode 14 for this shape; the `and i1` rows with two data operands on any driver other than 32.0.32029.2010; any non-RDNA 4 Radeon; and whether another vendor shows it for these exact shapes, since the RTX 3070 was not run on this table. The consumer set is no longer open: the `pixel_aot_comparisons` entry above records the 17 flushed shapes and the five consumer shapes behind them on the RX 9070 XT. One RX 9070 XT observation was not re-measured: two shaders differing only in whether the literal is bound to a local gave opposite answers in a four-channel probe. The shape rule in the linked comment attributes that to the reduction changing the DXIL shape; the pair itself was not run again. "Feeds an `and i1`" describes the shaders listed here. None of this addresses native gfx1013 compare behavior or the console.
 
 A case file may carry a trailer after the 64 expected colors: one flags byte, whose bit 0 selects a `R32G32B32A32_UINT` readback target, followed by 64 per-texel mask bytes whose bit ch accepts a NaN of any sign or payload on that channel. A masked channel passes when the expected word and the exported word are both NaN, and the renderer logs a `nan_class` line with both raw words even on pass; masking a channel whose expected word is not NaN is a case-format error. Unmasked channels stay strict bitwise, comparison-predicate results stay strict, and integer moves, bit operations and bitcasts round-trip bit-for-bit through the integer readback. Any normalization observed on the float render target is specific to that path. The fixtures never claim a payload, sign or quieting rule for NaN results, only the class.
 
