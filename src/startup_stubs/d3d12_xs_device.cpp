@@ -14,6 +14,7 @@
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
 #include "startup_stubs/translated_sampler_bindings.h"
@@ -2373,26 +2374,9 @@ HRESULT __stdcall device_wait_frame_event(Wrapper*, UINT type, UINT timeout, voi
 // Diagnostic overlay: while nothing is rendered, the title window would stay blank. Every few
 // presents a status text is drawn into it with GDI so the state is visible. This is not game output.
 LONG draw_calls_seen;
-HWND title_window()
-{
-    static HWND window = nullptr;
-    if (window && IsWindow(window)) return window;
-    window = nullptr;
-    EnumWindows([](HWND candidate, LPARAM out) -> BOOL {
-        DWORD process = 0;
-        GetWindowThreadProcessId(candidate, &process);
-        if (process == GetCurrentProcessId() && IsWindowVisible(candidate) && !GetWindow(candidate, GW_OWNER)) {
-            *reinterpret_cast<HWND*>(out) = candidate;
-            return FALSE;
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&window));
-    return window;
-}
-
 void draw_overlay(LONG frame, double seconds)
 {
-    HWND window = title_window();
+    HWND window = x2w_startup::overlay_window();
     if (!window) return;
     HDC dc = GetDC(window);
     if (!dc) return;

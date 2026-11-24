@@ -38,7 +38,7 @@ DWORD WINAPI output_window_thread(void* ready)
         return DefWindowProcW(window, message, w, l);
     };
     cls.hInstance = GetModuleHandleW(nullptr);
-    cls.lpszClassName = L"X2WOutputWindow";
+    cls.lpszClassName = x2w_startup::presenter_class;
     cls.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     RegisterClassW(&cls);
     RECT area{0, 0, 1600, 900};

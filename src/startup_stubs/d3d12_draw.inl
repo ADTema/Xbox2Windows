@@ -445,7 +445,8 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, bool have, u64 offset, std::s
 // texture's title memory is already in a layout CopyTextureRegion can read: each subresource is
 // copied through the upload ring as a placed footprint. A texture is uploaded on its first bind and
 // again when its memory changed: XG copies announce themselves (x2w_d3d12_texture_written), and
-// textures up to 32 MiB are also re-hashed every 15 frames for writes the title makes on its own.
+// CPU-backed textures up to 32 MiB are also re-hashed for writes the title makes on its own.
+// Recheck single-mip R8 planes on their first bind each frame and other textures every 15 frames.
 // Targets and UAVs are GPU-written and never uploaded.
 struct TextureUpload { u64 hash = 0; u64 generation = ~0ull; LONG checked_frame = -1000; bool done = false; };
 std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
@@ -490,8 +491,8 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end()) generation = found->second;
     ReleaseSRWLockShared(&written_lock);
     const bool announced = state.generation != generation;
-    const bool recheck = state.done && !announced && total <= (u64{32} << 20) && frame_number - state.checked_frame >= 15;
-    if (state.done && !announced && !recheck) return;
+    const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
+    if (state.done && !announced && !x2w_startup::recheck_cpu_texture(desc, total, elapsed)) return;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
         state.done = true;

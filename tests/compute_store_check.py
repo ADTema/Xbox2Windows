@@ -2975,6 +2975,8 @@ def mimg_load_binary(directory, assembler, objcopy, library):
 
 
 def binary(directory, assembler, objcopy, library):
+    mubuf_subword_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_cases(), "buffer_load_")
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
     ds_controls()
@@ -3184,6 +3186,87 @@ def draw_guard(directory, compiler, cmd, case, name):
 def source_word(i):
     """t0 as the harness fills it: 320 known words, then 320 sentinel words."""
     return (0x8b02a7f1 + i * 0x413b1) & 0xffffffff if i < 320 else SENTINEL
+
+
+MUBUF_SUBWORD = {"ubyte": (1, False, 1), "sbyte": (1, True, 5), "ushort": (2, False, 6), "sshort": (2, True, 0)}
+
+
+def mubuf_subword_cases():
+    for name, (_, _, offset) in MUBUF_SUBWORD.items():
+        suffix = f" offset:{offset}" if offset else ""
+        yield name, [
+            "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+            "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+            "s_load_dwordx4 s[16:19], s[12:13], 0x40",
+            "v_lshl_add_u32 v8, s11, 5, v0", "s_waitcnt lgkmcnt(0)",
+            f"buffer_load_{name} v10, v8, s[16:19], 0 idxen{suffix}", "s_waitcnt vmcnt(0)",
+            "buffer_store_dword v10, v8, s[20:23], 0 idxen offset:4", "s_endpgm",
+        ], DS_BINDING | {"stride": 8, "source_descriptor": 0x40, "source_stride": 8}
+
+
+def mubuf_subword_controls():
+    _, lines, binding = next(mubuf_subword_cases())
+    load = lines[6]
+    for new, diagnostic in (
+        (load + " glc", "Unsupported compute instruction"),
+        (load + " tfe", "Unsupported compute instruction"),
+        (load.replace("load_ubyte", "load_ubyte_d16"), "Unsupported compute instruction"),
+        (load.replace(", 0 idxen", ", s13 idxen"), "Unsupported compute instruction"),
+        (load.replace("idxen", "offen"), "Unsupported subword buffer read target or address mode"),
+        (load.replace("idxen", "idxen offen"), "Unsupported subword buffer read target or address mode"),
+        (load.replace("load_ubyte", "load_ushort"), "Unverified read offset"),
+        (load.replace("s[16:19]", "s[20:23]"), "Reads from the stored UAV"),
+        (load.replace("offset:1", "offset:8"), "Read leaves its source element"),
+        (load.replace("offset:1", "offset:4096"), "Unverified read offset"),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, (load, new)), 32, **binding)
+    for wait, diagnostic in (("s_waitcnt lgkmcnt(0)", "Unverified buffer read descriptor"),
+                             ("s_waitcnt vmcnt(0)", "before s_waitcnt vmcnt(0)")):
+        rejects(diagnostic, aot.lower, variant(lines, (wait, "")), 32, **binding)
+    rejects("Unsupported read address", aot.lower, lines, 32, **(binding | {"source_stride": None}))
+    rejects("Unsupported subword buffer read target", aot.lower, lines, 32, **(binding | {"cpu": "gfx1013"}))
+
+
+def mubuf_subword_draw(directory, compiler, renderer, backend):
+    mubuf_subword_controls()
+    src, cso, case = (directory / f"mubuf-subword.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+    run = [renderer, backend, "--compute-store-case", cso, case]
+    data = struct.pack("<320I", *(source_word(i) for i in range(320)))
+    for name, lines, binding in mubuf_subword_cases():
+        width, signed, offset = MUBUF_SUBWORD[name]
+        print(f"{name}: CPU reference", flush=True)
+        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        subprocess.run(compile, check=True)
+        for groups in (1, 3):
+            words = [SENTINEL] * 320
+            for gid in range(32 * groups):
+                start = gid * 8 + offset
+                words[2 * gid + 1] = int.from_bytes(data[start:start + width], "little", signed=signed) & 0xffffffff
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        load = lines[6]
+        # Flip the subword lane, or drop sign extension for a signed load.
+        stem = load.split(" offset:")[0]
+        other = offset ^ width
+        mutants = [stem + (f" offset:{other}" if other else "")]
+        if signed:
+            mutants.append(load.replace(f"load_{name}", f"load_u{name[1:]}"))
+        for wrong in mutants:
+            print(f"{name}: negative control {wrong}", flush=True)
+            src.write_text(aot.lower(variant(lines, (load, wrong)), 32, **binding), encoding="ascii")
+            subprocess.run(compile, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or "word=1 expected=" not in bad.stderr:
+                raise AssertionError(f"{name}: incorrect subword load escaped detection\n{bad.stderr}")
+            print(bad.stderr, end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"buffer_load_{name}\n" for name in MUBUF_SUBWORD), encoding="utf-8")
+    return 0
 
 
 MTBUF_LOAD = "tbuffer_load_format_x v10, v8, s[16:19], 0 format:[BUF_FMT_32_UINT] idxen offset:4"
@@ -4085,6 +4168,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
+                 "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mtbuf-load": mtbuf_load_draw,
                  "draw-mimg-load": mimg_load_draw,
                  "draw-ds-route": ds_draw,
