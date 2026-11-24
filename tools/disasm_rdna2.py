@@ -2690,6 +2690,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("lwe")
         if (w0 >> 7) & 1:
             mods.append("dlc")
+        if (w1 >> 30) & 1:
+            mods.append("a16")
         if d16:
             mods.append("d16")
         asm = f"{op_name} {', '.join(operands)} {' '.join(mods)}"
