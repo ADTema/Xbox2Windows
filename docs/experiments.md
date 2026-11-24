@@ -5746,6 +5746,11 @@ modifier the emitted text is unchanged. `op_sel` and source modifiers are still 
 rather than silently ignored, and a uint-result conversion such as `v_cvt_f16_f32` keeps refusing output
 modifiers. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_vcvt_omod$' -V`.
 
+The SDWA forms of those conversions read the same table: after the split, `sdwa()` still looked only at the
+uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed at both (#1727). The
+restored path keeps the source selection, the `dst_sel`/`dst_unused` write and the `U(...)` wrapper, and a
+conversion's output modifier inside an SDWA form is still refused rather than dropped.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
@@ -6494,7 +6499,8 @@ It also keeps a non-null parameter block at `E_INVALIDARG`.
 |---|---|
 | `d3d12x_device_create_warp`, `d3d12x_device_create_hardware` | Resolves `D3D12XboxCreateDevice` inside `d3d12_xs.dll`, creates a device with null parameters and `IID_ID3D12Device`, checks the adapter LUID, one node and a zero-valued fence. The hardware case skips (77) without a physical adapter. |
 | `d3d12x_device_negative_warp`, `d3d12x_device_negative_hardware` | A non-null parameter block returns `E_INVALIDARG`; the unknown fixture IID returns `E_NOINTERFACE`, clears the output and prints the exact lowercase GUID. The hardware case skips (77) without a physical adapter. |
-| `d3d12x_device_struct_return_warp`, `d3d12x_device_struct_return_hardware` | Calls a source-built `GetCustomHeapProperties` adapter with the device and output buffer in both orders. Each case compares all five returned words to the direct desktop method, checks the returned output pointer and verifies guard words. The return-buffer-first control seeds the output with the device's vtable pointer. The hardware case skips (77) without a physical adapter. |
+| `d3d12x_device_struct_return_warp`, `d3d12x_device_struct_return_hardware` | Calls a source-built `GetCustomHeapProperties` adapter with the device and output buffer in both orders. Each case compares all five returned words to the direct desktop method, checks the returned output pointer and verifies guard words. The return-buffer-first control seeds the output with the device's vtable pointer. The `DEFAULT` and `READBACK` heap types repeat both orders, so the heap type must reach the device. Five unresolvable calls (a null first or second candidate, the device twice, two buffers and no device, a null live device) must return `nullptr` and leave both vtable-seeded buffers unchanged. The hardware case skips (77) without a physical adapter. |
+| `d3d12x_device_struct_return_neither_control_warp` | Builds the same check against a build-tree copy of the adapter that writes through the second candidate when neither candidate is the device. It passes only on the line `FAIL: struct_return reject neither_is_device: returned`. |
 
 Run `ctest --preset dev --no-tests=error -R '^d3d12x_device_' -V`.
 
@@ -10891,4 +10897,13 @@ Command-list slot 42 records the address of a root parameter declared as a CBV, 
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_root_cbv_(warp|hardware)$" -V
+```
+
+## Startup heap-indexed root signatures
+
+Command-list slot 34 no longer sets a title root signature flagged `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` or `SAMPLER_HEAP_DIRECTLY_INDEXED` on the desktop list, because the title's heaps are not forwarded there (debug layer message ID 1419). Real draws under such a root are refused with a specific reason. The decision matrix (`tests/startup_heap_indexed_root_check.cpp`) runs without a device; its two mutated runs must fail. The draw fixture (`tests/startup_root_heap_check.py`) is synthetic only and reuses the root CBV draw with the debug layer on; a plain desktop list with the same root signature must first report ID 1419 for each flag, or the run is a capability skip. Details are in [startup-runtime.md](startup-runtime.md#heap-indexed-root-signatures).
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer startup_heap_indexed_root_check
+ctest --preset dev --no-tests=error -R "^startup_(heap_indexed_root.*|root_heap_(warp|hardware))$" -V
 ```
