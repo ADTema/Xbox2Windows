@@ -2551,7 +2551,11 @@ pixel differences, and a stale palette with 992 pixel differences and matching
 exports. DXC 1.9.2602.17 compiled all stages
 at Shader Model 6.0. The debug layer reported zero errors and warnings.
 All seven native and fallback mesh tests also passed on app-local WARP 1.0.22
-with Agility SDK 1.620.2.
+with Agility SDK 1.620.2. On Windows 11 build 26300.9974, the Intel Arc 140T
+(32.0.101.8132) matched the same 128 export bytes and 1,024 pixels in each
+baseline draw and reproduced all three controls: the changed guard kept zero
+pixel differences, the collapsed index produced 276 and the stale palette 992
+with matching exports. The debug layer reported zero errors and warnings.
 
 This fallback covers the single-group specialization below. The supported
 shape has three vertices, one triangle and optional PARAM0. The hardware's
