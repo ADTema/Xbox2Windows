@@ -163,8 +163,8 @@ target_link_libraries(windows_placeholder_partition_check PRIVATE OneCore)
 add_test(NAME windows_placeholder_partition COMMAND windows_placeholder_partition_check)
 
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
-add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12x_device_slots.cpp src/d3d12_xs_shim.def
-    src/startup_stubs/d3d12_xs_device.cpp)
+add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12x_device_slots.cpp
+    src/d3d12_xs_iids.cpp src/d3d12_xs_shim.def src/startup_stubs/d3d12_xs_device.cpp)
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_include_directories(d3d12_xs_shim PRIVATE src)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
@@ -296,6 +296,16 @@ add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp tests/s
 target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim d3d12 dxgi)
 
+add_executable(startup_nv12_draw tests/startup_nv12_draw.cpp tests/desktop_gpu.cpp)
+target_compile_features(startup_nv12_draw PRIVATE cxx_std_17)
+target_include_directories(startup_nv12_draw PRIVATE src)
+target_link_libraries(startup_nv12_draw PRIVATE startup_stub_xg_xs d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_nv12_draw_${backend} COMMAND startup_nv12_draw)
+    set_tests_properties(startup_nv12_draw_${backend} PROPERTIES
+        ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${backend}" TIMEOUT 60 SKIP_RETURN_CODE 77)
+endforeach()
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
@@ -420,6 +430,18 @@ add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" 
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_sampler_x.hlsl"
     DEPENDS tests/startup_sampler_x.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sampler_x_cs}")
+target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp)
+# Colour-blend register decoding (src/startup_stubs/cb_blend.h, #1216): decoder table plus draws
+# compared with a CPU model of the register fields.
+set(startup_cb_blend_vs "${CMAKE_CURRENT_BINARY_DIR}/startup_cb_blend_vs.h")
+set(startup_cb_blend_ps "${CMAKE_CURRENT_BINARY_DIR}/startup_cb_blend_ps.h")
+add_custom_command(OUTPUT "${startup_cb_blend_vs}" COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E vs_main
+    -Vn startup_cb_blend_vs -Fh "${startup_cb_blend_vs}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cb_blend.hlsl"
+    DEPENDS tests/startup_cb_blend.hlsl VERBATIM)
+add_custom_command(OUTPUT "${startup_cb_blend_ps}" COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E ps_main
+    -Vn startup_cb_blend_ps -Fh "${startup_cb_blend_ps}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cb_blend.hlsl"
+    DEPENDS tests/startup_cb_blend.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE tests/startup_cb_blend.cpp "${startup_cb_blend_vs}" "${startup_cb_blend_ps}")
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp tests/ffx_recurrent_views.cpp)
 target_sources(offscreen_check PRIVATE tests/ffx_rcas_views.cpp)
 foreach(storage IN ITEMS Native Packed)
@@ -655,7 +677,7 @@ add_dependencies(d3d12_xs_shim_check pso_compute_headers)
 target_link_libraries(d3d12_xs_shim_check PRIVATE d3d12_xs_shim dxgi)
 target_include_directories(d3d12_xs_shim_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(d3d12_xs_shim_check PRIVATE cxx_std_17)
-foreach(scenario IN ITEMS exports serialize deserialize warp_root)
+foreach(scenario IN ITEMS exports serialize deserialize iids warp_root)
     add_test(NAME d3d12_xs_shim_${scenario} COMMAND d3d12_xs_shim_check ${scenario})
 endforeach()
 # D3D12XboxCreateDevice device-slot inventory and source-built creation fixture (#XCL-08).
@@ -741,6 +763,34 @@ foreach(adapter IN ITEMS warp hardware)
     set_tests_properties(d3d12x_compute_list_${adapter} PROPERTIES TIMEOUT 30)
 endforeach()
 set_tests_properties(d3d12x_compute_list_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
+# D3D12.X graphics command list: one source-built triangle through a VS/PS PSO (#XCL-12).
+foreach(stage IN ITEMS vs ps)
+    string(TOUPPER "${stage}" entry)
+    set(d3d12x_graphics_header "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_graphics_${stage}.h")
+    add_custom_command(OUTPUT "${d3d12x_graphics_header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${stage}_6_0 -E ${entry}Main -Vn d3d12x_graphics_${stage}
+                -Fh "${d3d12x_graphics_header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_graphics_${stage}.cso"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_graphics.hlsl"
+        DEPENDS tests/d3d12x_graphics.hlsl
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_graphics_${stage}.cso" VERBATIM)
+    set(d3d12x_graphics_${stage} "${d3d12x_graphics_header}")
+endforeach()
+add_custom_target(d3d12x_graphics_shader DEPENDS
+    "${d3d12x_graphics_vs}"
+    "${d3d12x_graphics_ps}")
+add_executable(d3d12x_graphics_list_check tests/d3d12x_graphics_list_check.cpp tests/desktop_gpu.cpp
+    "${d3d12x_graphics_vs}" "${d3d12x_graphics_ps}")
+add_dependencies(d3d12x_graphics_list_check d3d12_xs_shim d3d12x_graphics_shader)
+target_include_directories(d3d12x_graphics_list_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(d3d12x_graphics_list_check PRIVATE cxx_std_17)
+target_link_libraries(d3d12x_graphics_list_check PRIVATE d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME d3d12x_graphics_list_${adapter} COMMAND d3d12x_graphics_list_check
+        "$<TARGET_FILE:d3d12_xs_shim>" ${adapter})
+    set_tests_properties(d3d12x_graphics_list_${adapter} PROPERTIES TIMEOUT 60)
+endforeach()
+set_tests_properties(d3d12x_graphics_list_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
 set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
 add_custom_command(OUTPUT "${vm_translation_header}"
@@ -925,6 +975,9 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_sampler_x_swapped_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "startup_sampler_x swapped=0")
+    add_test(NAME startup_cb_blend_${adapter} COMMAND offscreen_check ${adapter} --startup-cb-blend)
+    add_test(NAME startup_cb_blend_swapped_${adapter} COMMAND offscreen_check ${adapter} --startup-cb-blend-swapped)
+    set_tests_properties(startup_cb_blend_${adapter} startup_cb_blend_swapped_${adapter} PROPERTIES TIMEOUT 60)
 endforeach()
 
 set(SIMPLE_TRIANGLE_DIR "${CMAKE_SOURCE_DIR}/out/reference/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/IntroGraphics/SimpleTriangle"
@@ -1008,8 +1061,24 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stub_gameinput>"
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>")
     set_tests_properties(startup_stubs PROPERTIES TIMEOUT 120)
-    find_program(STARTUP_FXC fxc)
-    add_test(NAME startup_uniform_lane COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
+    add_test(NAME startup_uniform_lane COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
+    # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
+    # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
+    find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")
+    add_test(NAME startup_sampler_heap_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_sampler_heap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_sampler_heap_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+    add_test(NAME startup_xg_bc7_layout COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_xg_bc7_layout_check.py" "$<TARGET_FILE:startup_stub_xg_xs>")
+    set_tests_properties(startup_xg_bc7_layout PROPERTIES TIMEOUT 30
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_XG_BC7_4K_S_LAYOUT=1")
+
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
     foreach(backend IN ITEMS warp hardware)
@@ -1127,6 +1196,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             target_link_libraries(${BIND_NAME} PRIVATE ${BIND_SECOND_PROVIDER})
         endif()
     endfunction()
+    cpu_asm_fixture(cpu_clzero counted_clzero)
+    cpu_translation(cpu_clzero cpu_switch_aot counted,loop_dx,loop_r8,loop_r9,loop_r10)
+    add_test(NAME cpu_counted_clzero COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/counted_clzero.py" "$<TARGET_FILE:cpu_clzero>" "$<TARGET_FILE:cpu_clzero_lifted>"
+        "${CMAKE_SOURCE_DIR}/tools/cpu_switch_aot.py" "${CMAKE_CURRENT_BINARY_DIR}")
+
     foreach(variant IN ITEMS original inverted)
         cpu_asm_fixture(cpu_leaf_${variant} branch)
         cpu_translation(cpu_leaf_${variant} cpu_leaf_aot branch_value)
@@ -1494,6 +1569,20 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_switch_shift_flags COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_shift_flags_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_switch_shift_flags>" "$<TARGET_FILE:cpu_switch_shift_flags_lifted>")
+    cpu_asm_fixture(cpu_switch_bit_tests switch_bit_tests)
+    cpu_translation(cpu_switch_bit_tests cpu_switch_aot
+        bt16_reg,bt32_reg,bt64_reg,bts16_reg,bts32_reg,bts64_reg,btr16_reg,btr32_reg,btr64_reg,btc16_reg,btc32_reg,btc64_reg,bt16_imm,bt32_imm,bt64_imm,bts16_imm,bts32_imm,bts64_imm,btr16_imm,btr32_imm,btr64_imm,btc16_imm,btc32_imm,btc64_imm,bt16_mem,bt32_mem,bt64_mem,bts16_mem,bts32_mem,bts64_mem,btr16_mem,btr32_mem,btr64_mem,btc16_mem,btc32_mem,btc64_mem,jcc_bt,jcc_btr_nc,cmov_bt)
+    add_test(NAME cpu_aot_switch_bit_tests COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_bit_tests_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_bit_tests>" "$<TARGET_FILE:cpu_switch_bit_tests_lifted>")
+    cpu_asm_fixture(cpu_switch_bit_counts switch_bit_counts)
+    cpu_translation(cpu_switch_bit_counts cpu_switch_aot
+        popcnt16_reg,popcnt16_mem,popcnt32_reg,popcnt32_mem,popcnt64_reg,popcnt64_mem,lzcnt16_reg,lzcnt16_mem,lzcnt32_reg,lzcnt32_mem,lzcnt64_reg,lzcnt64_mem,tzcnt16_reg,tzcnt16_mem,tzcnt32_reg,tzcnt32_mem,tzcnt64_reg,tzcnt64_mem,jcc_tzcnt_b,jcc_lzcnt_e,jcc_popcnt_ne,cmov_counts)
+    add_test(NAME cpu_aot_switch_bit_counts COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_bit_counts_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_bit_counts>" "$<TARGET_FILE:cpu_switch_bit_counts_lifted>")
+    # A host without POPCNT, BMI1 or ABM cannot run the original as the reference describes it.
+    set_tests_properties(cpu_aot_switch_bit_counts PROPERTIES SKIP_RETURN_CODE 77)
     # Divides whose results are unused: the translation is also built with /O2, where the compiler would remove a
     # divide that the generated C++ let it remove, and both builds are compared with the original's exception codes.
     cpu_asm_fixture(cpu_dead_div dead_div)
@@ -4785,7 +4874,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME sampled_coverage_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/sampled_coverage_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(sampled_coverage_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        set_tests_properties(sampled_coverage_${adapter} PROPERTIES TIMEOUT 150 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_attribute_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_attribute_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

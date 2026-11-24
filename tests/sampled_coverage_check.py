@@ -74,7 +74,33 @@ OP_PROGRAMS = {
     relation: variant("v_mul_f32_e32", f"v_cmpx_{relation}_f32_e32")
     for relation in RELATIONS
 }
-PROGRAMS = [PROGRAM, *OP_PROGRAMS.values()]
+
+
+def spelled(legacy, multiply_form, compare_form, relation):
+    kind = "_legacy" if legacy else ""
+    return variant(
+        f"v_mul{kind}_f32_{multiply_form}", f"v_cmpx_{relation}_f32_{compare_form}"
+    )
+
+
+# The VOP3 (e64) spellings of both multiplies and all four kills, and the two
+# mixed pairings, keyed by (legacy, multiply form, compare form, relation).
+E64_PROGRAMS = {
+    (legacy, "e64", "e64", relation): spelled(legacy, "e64", "e64", relation)
+    for legacy in (False, True)
+    for relation in RELATIONS
+}
+MIXED_PROGRAMS = {
+    (index % 2 == 1, *forms, relation): spelled(index % 2 == 1, *forms, relation)
+    for index, relation in enumerate(RELATIONS)
+    for forms in (("e32", "e64"), ("e64", "e32"))
+}
+PROGRAMS = [
+    PROGRAM,
+    *OP_PROGRAMS.values(),
+    *E64_PROGRAMS.values(),
+    *MIXED_PROGRAMS.values(),
+]
 
 
 def bindings(slot):
@@ -103,6 +129,7 @@ def decoded(lines):
         pc += (
             8
             if line.startswith(("exp ", "s_load_", "s_buffer_load_", "image_sample"))
+            or line.split(" ")[0].endswith("_e64")
             else 4
         )
     return result
@@ -180,6 +207,16 @@ def controls():
                     distinguishing_case(slot, relation, False, other, False)
     for relation in RELATIONS:
         distinguishing_case(0, relation, False, relation, True)
+    # Each e64 readback needs a case that tells every wrong reference apart,
+    # drawn from its smaller case list.
+    for legacy in (False, True):
+        for relation in RELATIONS:
+            for other in RELATIONS:
+                if relation != other:
+                    distinguishing_case(0, relation, legacy, other, legacy, E64_CASES)
+            distinguishing_case(0, relation, legacy, relation, not legacy, E64_CASES)
+
+    spelling_controls()
 
     wrong_quad_source = source.replace(
         "s_wqm_b64 s[54:55], s[48:49]", "s_wqm_b64 s[54:55], s[52:53]"
@@ -187,34 +224,160 @@ def controls():
     must_reject(lower, decoded(wrong_quad_source.splitlines()), bindings(0))
 
 
+def reject_with(lines, message, slot=0):
+    # The rejection has to come from the operand check, not an unrelated one.
+    try:
+        lower(decoded(lines), bindings(slot))
+    except ValueError as error:
+        assert message in str(error), error
+    else:
+        raise AssertionError("The translator accepted " + repr(lines))
+
+
+MULTIPLY_MESSAGE = "Unsupported multiply operands or modifiers"
+COMPARE_MESSAGE = "Unsupported compare operands or modifiers"
+
+
+def modifier_mutations():
+    # Every row replaces one line of an e64 program with a form LLVM can print
+    # but the lowering does not model: clamp, output scale, negate, absolute
+    # value, a swapped or special-register operand, or an inline constant.
+    rows = []
+    for mul in ("v_mul_legacy_f32_e64", "v_mul_f32_e64"):
+        line = f"{mul} v11, s3, v10"
+        for text in (
+            f"{mul} v11, s3, v10 clamp",
+            f"{mul} v11, s3, v10 mul:2",
+            f"{mul} v11, s3, v10 div:2",
+            f"{mul} v11, -s3, v10",
+            f"{mul} v11, s3, -v10",
+            f"{mul} v11, |s3|, v10",
+            f"{mul} v11, s3, |v10|",
+            f"{mul} v11, v10, s3",
+            f"{mul} v11, vcc_lo, v10",
+            f"{mul} v11, s3, null",
+            f"{mul} v11, s3, 1.0",
+        ):
+            rows.append((mul, line, text, MULTIPLY_MESSAGE))
+    for relation in RELATIONS:
+        compare = f"v_cmpx_{relation}_f32_e64"
+        line = f"{compare} s9, v11"
+        for text in (
+            f"{compare} s9, v11 clamp",
+            f"{compare} s9, -v11",
+            f"{compare} s9, |v11|",
+            f"{compare} -s9, v11",
+            f"{compare} v11, s9",
+            f"{compare} vcc_lo, v11",
+            f"{compare} exec_lo, v11",
+            f"{compare} null, v11",
+            f"{compare} 1.0, v11",
+        ):
+            rows.append((compare, line, text, COMPARE_MESSAGE))
+    return rows
+
+
+def mutation_source(line):
+    legacy = "_legacy_" in line
+    relation = line.split("_")[2] if line.startswith("v_cmpx_") else "lt"
+    return "\n".join(spelled(legacy, "e64", "e64", relation))
+
+
+def spelling_controls():
+    # Every e64 and mixed spelling lowers on both textures to the same program
+    # as its e32 counterpart. The readback fixtures check that program against
+    # a CPU reference for each relation and multiply.
+    for (legacy, multiply, compare, relation), program in [
+        *E64_PROGRAMS.items(),
+        *MIXED_PROGRAMS.items(),
+    ]:
+        for slot in range(2):
+            assert lower(decoded(program), bindings(slot)) == lower(
+                decoded(spelled(legacy, "e32", "e32", relation)), bindings(slot)
+            ), (legacy, multiply, compare, relation)
+    for _, line, text, message in modifier_mutations():
+        reject_with(mutation_source(line).replace(line, text).splitlines(), message)
+    legacy_e64 = "\n".join(E64_PROGRAMS[(True, "e64", "e64", "lt")])
+    ieee_e64 = "\n".join(E64_PROGRAMS[(False, "e64", "e64", "lt")])
+    for source in (ieee_e64, legacy_e64):
+        for old, new in [
+            ("v_cmpx_lt_f32_e64 s9, v11", "v_cmpx_lt_f64_e64 s9, v11"),
+            ("v_cmpx_lt_f32_e64 s9, v11", "v_cmpx_lg_f32_e64 s9, v11"),
+            ("v_cmpx_lt_f32_e64 s9, v11", "v_cmp_lt_f32_e64 s[2:3], s9, v11"),
+            ("v_cmpx_lt_f32_e64 s9, v11", "v_cmpx_class_f32_e64 s9, v11"),
+            ("v_mul_f32_e64 v11, s3, v10", "v_mul_f16_e64 v11, s3, v10"),
+            ("v_mul_legacy_f32_e64 v11, s3, v10", "v_mul_f16_e64 v11, s3, v10"),
+            ("v_mul_f32_e64 v11, s3, v10", "v_add_f32_e64 v11, s3, v10"),
+            ("v_mul_legacy_f32_e64 v11, s3, v10", "v_sub_f32_e64 v11, s3, v10"),
+            ("v_mul_f32_e64 v11, s3, v10", "v_mul_f32_e64 v11, s3"),
+            ("v_cmpx_lt_f32_e64 s9, v11", "v_cmpx_lt_f32_e64 s9"),
+        ]:
+            if old in source:
+                must_reject(lower, decoded(source.replace(old, new).splitlines()), bindings(0))
+    # A product read before the sample wait is still refused in the e64 form.
+    for legacy in (False, True):
+        program = "\n".join(E64_PROGRAMS[(legacy, "e64", "e64", "gt")])
+        mul = f"v_mul{'_legacy' if legacy else ''}_f32_e64 v11, s3, v10"
+        must_reject(
+            lower,
+            decoded(
+                program.replace(
+                    f"s_waitcnt vmcnt(0)\n{mul}", f"{mul}\ns_waitcnt vmcnt(0)"
+                ).splitlines()
+            ),
+            bindings(0),
+        )
+
+
 def binary(tmp, *tools):
     for program in PROGRAMS:
         binary_program(tmp, program, *tools)
+    binary_modifiers(tmp, *tools)
 
 
-def binary_program(tmp, program, assembler, objcopy, library):
+def binary_modifiers(tmp, assembler, objcopy, library):
+    # The same mutations, assembled by the real LLVM and disassembled again, so
+    # the refusal does not depend on this file's guess of how LLVM prints them.
+    tool = Path(__file__).resolve().parents[1] / "tools/sampled_coverage_aot.py"
+    for _, line, text, _ in modifier_mutations():
+        mutated = mutation_source(line).replace(line, text).splitlines()
+        container = assemble(tmp, mutated, assembler, objcopy)
+        manifest = tmp / "bindings.json"
+        manifest.write_text(json.dumps(bindings(0)))
+        out = tmp / "refused.hlsl"
+        out.unlink(missing_ok=True)
+        result = subprocess.run(
+            [sys.executable, "-B", tool, container, "--bindings", manifest,
+             "--llvm", library, "--output", out],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2 and "Unsupported coverage input" in result.stderr, (
+            text,
+            result.returncode,
+            result.stderr,
+        )
+        assert not out.exists(), text
+
+
+def assemble(tmp, program, assembler, objcopy):
     src, obj, raw = (tmp / n for n in ("synthetic.s", "synthetic.o", "synthetic.bin"))
     src.write_text("\n".join(program) + "\n")
     subprocess.run(
-        [
-            assembler,
-            "-triple=amdgcn--amdpal",
-            "-mcpu=gfx1013",
-            "-filetype=obj",
-            src,
-            "-o",
-            obj,
-        ],
+        [assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj],
         check=True,
     )
-    subprocess.run(
-        [objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True
-    )
+    subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
     code = raw.read_bytes()
     padded = code + bytes.fromhex("00009fbf") * (4 - (len(code) // 4 + 10) % 4)
     container = tmp / "test.dxbc"
     record = envelope(padded, directory_end=(40 + len(padded), 288 + len(padded)))
     container.write_bytes(_read_named_container(record, len(b"fixture") + 2))
+    return container
+
+
+def binary_program(tmp, program, assembler, objcopy, library):
+    container = assemble(tmp, program, assembler, objcopy)
     for slot in range(2):
         manifest = tmp / "bindings.json"
         manifest.write_text(json.dumps(bindings(slot)))
@@ -308,8 +471,8 @@ def op_case(slot, scale, limit, relation, legacy=False):
     return cb + ref
 
 
-def distinguishing_case(slot, relation, legacy, other, other_legacy):
-    for scale, limit in OP_CASES:
+def distinguishing_case(slot, relation, legacy, other, other_legacy, cases=OP_CASES):
+    for scale, limit in cases:
         if op_case(slot, scale, limit, relation, legacy) != op_case(
             slot, scale, limit, other, other_legacy
         ):
@@ -317,25 +480,40 @@ def distinguishing_case(slot, relation, legacy, other, other_legacy):
     raise AssertionError(f"{relation} and {other} are not told apart on texture {slot}")
 
 
+# The e64 readbacks use the cases that separate equality, sign, infinity and
+# the legacy zero rule, so the larger program set stays inside the CTest limit.
+E64_CASES = (OP_CASES[1], OP_CASES[2], OP_CASES[4], OP_CASES[6], OP_CASES[7])
+
+
 def draw_ops(tmp, dxc, renderer, adapter):
-    for relation, program in OP_PROGRAMS.items():
-        for slot in range(2):
+    # (program, texture slots, legacy multiply, relation, cases)
+    runs = [
+        (program, range(2), False, relation, OP_CASES)
+        for relation, program in OP_PROGRAMS.items()
+    ] + [
+        (program, range(1), legacy, relation, E64_CASES)
+        for (legacy, _, _, relation), program in E64_PROGRAMS.items()
+    ]
+    for program, slots, legacy, relation, cases in runs:
+        for slot in slots:
             src, ps, ref = tmp / "draw.hlsl", tmp / "draw.dxil", tmp / "samples.bin"
             src.write_text(lower(decoded(program), bindings(slot)))
             subprocess.run([dxc, "-T", "ps_6_0", "-E", "main", "-Fo", ps, src], check=True)
             args = [renderer, adapter, "--sampled-coverage", ps, ref]
-            for scale, limit in OP_CASES:
-                ref.write_bytes(op_case(slot, scale, limit, relation))
+            for scale, limit in cases:
+                ref.write_bytes(op_case(slot, scale, limit, relation, legacy))
                 result = subprocess.run(args)
                 if result.returncode == 77:
                     return 77
                 result.check_returncode()
-            wrong = [(other, False) for other in RELATIONS if other != relation]
+            wrong = [(other, legacy) for other in RELATIONS if other != relation]
             if slot == 0:
-                wrong.append((relation, True))
-            for other, legacy in wrong:
-                scale, limit = distinguishing_case(slot, relation, False, other, legacy)
-                ref.write_bytes(op_case(slot, scale, limit, other, legacy))
+                wrong.append((relation, not legacy))
+            for other, other_legacy in wrong:
+                scale, limit = distinguishing_case(
+                    slot, relation, legacy, other, other_legacy, cases
+                )
+                ref.write_bytes(op_case(slot, scale, limit, other, other_legacy))
                 result = subprocess.run(args, capture_output=True, text=True)
                 if result.returncode != 1 or "Sample coverage mismatch" not in result.stderr:
                     raise AssertionError(
