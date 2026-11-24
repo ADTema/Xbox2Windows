@@ -110,7 +110,7 @@ void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowC
     std::memcpy(mapped, initial.data(), sizeof(initial));
     const D3D12_RANGE input_written{0, sizeof(initial)};
     upload->Unmap(0, &input_written);
-    const auto output = make_buffer(device, sizeof(Words), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
+    const auto output = make_buffer(device, sizeof(Words), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     const auto readback = make_buffer(device, sizeof(Words), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
@@ -156,6 +156,7 @@ void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowC
     ComPtr<ID3D12Fence> fence;
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create descriptor-window fence");
     auto* list = commands.list.Get();
+    transition(list, output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(output.Get(), 0, upload.Get(), guard_index * word_bytes, sizeof(Words));
     const auto second_expected = stale_window || stale_record ? first_word : second_word;
     const std::array<Words, 2> expected{Words{first_word, untouched}, Words{first_word, second_expected}};
