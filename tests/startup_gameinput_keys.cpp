@@ -1,0 +1,329 @@
+// Source-built verification of GameInput.dll keyboard readings, GetPreviousReading/GetNextReading
+// history chain, GetKeyCount/GetKeyState, and negative controls.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+
+namespace {
+
+constexpr std::uint32_t kind_keyboard = 0x00000010;
+constexpr std::uint32_t kind_gamepad = 0x00040000;
+constexpr std::uint32_t kind_mouse = 0x00000020;
+constexpr std::uint32_t status_connected = 0x00000001;
+constexpr std::uint32_t blocking_enumeration = 2;
+constexpr HRESULT reading_not_found = static_cast<HRESULT>(0x838A0003L);
+constexpr HRESULT device_not_found = static_cast<HRESULT>(0x838A0002L);
+
+struct KeyState {
+    std::uint32_t scanCode;
+    std::uint32_t codePoint;
+    std::uint8_t virtualKey;
+    bool isDeadKey;
+};
+static_assert(sizeof(KeyState) == 12, "KeyState layout");
+
+struct GamepadState {
+    std::uint32_t buttons;
+    float leftTrigger, rightTrigger;
+    float leftThumbstickX, leftThumbstickY, rightThumbstickX, rightThumbstickY;
+};
+static_assert(sizeof(GamepadState) == 28, "GamepadState layout");
+
+// Minimal vtable-matching C++ views of GameInput v0 COM interfaces.
+struct IGameInputDeviceVtbl;
+struct IGameInputDevice {
+    const void* const* vtbl;
+};
+
+struct IGameInputReading {
+    const void* const* vtbl;
+
+    std::uint32_t AddRef()
+    {
+        using Fn = std::uint64_t(__stdcall*)(IGameInputReading*);
+        return static_cast<std::uint32_t>(reinterpret_cast<Fn>(vtbl[1])(this));
+    }
+    std::uint32_t Release()
+    {
+        using Fn = std::uint64_t(__stdcall*)(IGameInputReading*);
+        return static_cast<std::uint32_t>(reinterpret_cast<Fn>(vtbl[2])(this));
+    }
+    std::uint32_t GetInputKind()
+    {
+        using Fn = std::uint32_t(__stdcall*)(IGameInputReading*);
+        return reinterpret_cast<Fn>(vtbl[3])(this);
+    }
+    std::uint64_t GetSequenceNumber(std::uint32_t kind)
+    {
+        using Fn = std::uint64_t(__stdcall*)(IGameInputReading*, std::uint32_t);
+        return reinterpret_cast<Fn>(vtbl[4])(this, kind);
+    }
+    void GetDevice(IGameInputDevice** device)
+    {
+        using Fn = void(__stdcall*)(IGameInputReading*, IGameInputDevice**);
+        reinterpret_cast<Fn>(vtbl[6])(this, device);
+    }
+    std::uint32_t GetKeyCount()
+    {
+        using Fn = std::uint32_t(__stdcall*)(IGameInputReading*);
+        return reinterpret_cast<Fn>(vtbl[14])(this);
+    }
+    std::uint32_t GetKeyState(std::uint32_t count, KeyState* states)
+    {
+        using Fn = std::uint32_t(__stdcall*)(IGameInputReading*, std::uint32_t, KeyState*);
+        return reinterpret_cast<Fn>(vtbl[15])(this, count, states);
+    }
+    bool GetGamepadState(GamepadState* state)
+    {
+        using Fn = bool(__stdcall*)(IGameInputReading*, GamepadState*);
+        return reinterpret_cast<Fn>(vtbl[22])(this, state);
+    }
+};
+
+using DeviceCallback = void(__stdcall*)(std::uint64_t token, void* context, IGameInputDevice* device,
+                                        std::uint64_t timestamp, std::uint32_t currentStatus,
+                                        std::uint32_t previousStatus);
+
+struct IGameInput {
+    const void* const* vtbl;
+
+    std::uint32_t Release()
+    {
+        using Fn = std::uint64_t(__stdcall*)(IGameInput*);
+        return static_cast<std::uint32_t>(reinterpret_cast<Fn>(vtbl[2])(this));
+    }
+    HRESULT GetCurrentReading(std::uint32_t kind, IGameInputDevice* device, IGameInputReading** reading)
+    {
+        using Fn = HRESULT(__stdcall*)(IGameInput*, std::uint32_t, IGameInputDevice*, IGameInputReading**);
+        return reinterpret_cast<Fn>(vtbl[4])(this, kind, device, reading);
+    }
+    HRESULT GetNextReading(IGameInputReading* reference, std::uint32_t kind, IGameInputDevice* device,
+                           IGameInputReading** reading)
+    {
+        using Fn = HRESULT(__stdcall*)(IGameInput*, IGameInputReading*, std::uint32_t, IGameInputDevice*,
+                                       IGameInputReading**);
+        return reinterpret_cast<Fn>(vtbl[5])(this, reference, kind, device, reading);
+    }
+    HRESULT GetPreviousReading(IGameInputReading* reference, std::uint32_t kind, IGameInputDevice* device,
+                               IGameInputReading** reading)
+    {
+        using Fn = HRESULT(__stdcall*)(IGameInput*, IGameInputReading*, std::uint32_t, IGameInputDevice*,
+                                       IGameInputReading**);
+        return reinterpret_cast<Fn>(vtbl[6])(this, reference, kind, device, reading);
+    }
+    HRESULT RegisterDeviceCallback(IGameInputDevice* device, std::uint32_t kind, std::uint32_t statusFilter,
+                                   std::uint32_t enumerationKind, void* context, DeviceCallback callback,
+                                   std::uint64_t* token)
+    {
+        using Fn = HRESULT(__stdcall*)(IGameInput*, IGameInputDevice*, std::uint32_t, std::uint32_t,
+                                       std::uint32_t, void*, DeviceCallback, std::uint64_t*);
+        return reinterpret_cast<Fn>(vtbl[9])(this, device, kind, statusFilter, enumerationKind, context, callback,
+                                             token);
+    }
+    bool UnregisterCallback(std::uint64_t token, std::uint64_t timeoutUs)
+    {
+        using Fn = bool(__stdcall*)(IGameInput*, std::uint64_t, std::uint64_t);
+        return reinterpret_cast<Fn>(vtbl[13])(this, token, timeoutUs);
+    }
+};
+
+struct CallbackCapture {
+    int count = 0;
+    IGameInputDevice* devices[4] = {};
+    std::uint32_t supported_inputs[4] = {};
+};
+
+void __stdcall on_device_callback(std::uint64_t, void* context, IGameInputDevice* device, std::uint64_t,
+                                  std::uint32_t current_status, std::uint32_t)
+{
+    auto* cap = static_cast<CallbackCapture*>(context);
+    if (!cap || (current_status & status_connected) == 0 || cap->count >= 4) return;
+    using GetInfoFn = const unsigned char*(__stdcall*)(IGameInputDevice*);
+    const unsigned char* info = reinterpret_cast<GetInfoFn>(device->vtbl[3])(device);
+    std::uint32_t supported = 0;
+    if (info) std::memcpy(&supported, info + 0x68, sizeof(supported));
+    cap->devices[cap->count] = device;
+    cap->supported_inputs[cap->count] = supported;
+    ++cap->count;
+}
+
+int check(bool cond, const char* msg)
+{
+    if (!cond) {
+        std::fprintf(stderr, "FAIL: %s\n", msg);
+        return 1;
+    }
+    return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv)
+{
+    const char* dll_path = argc > 1 ? argv[1] : "GameInput.dll";
+    HMODULE mod = LoadLibraryA(dll_path);
+    if (!mod) {
+        std::fprintf(stderr, "FAIL: LoadLibraryA(%s) failed (%lu)\n", dll_path, GetLastError());
+        return 1;
+    }
+
+    using CreateFn = HRESULT(__stdcall*)(void**);
+    auto create_fn = reinterpret_cast<CreateFn>(GetProcAddress(mod, MAKEINTRESOURCEA(1)));
+    if (!create_fn) {
+        std::fprintf(stderr, "FAIL: GameInputCreate ordinal 1 not found\n");
+        FreeLibrary(mod);
+        return 1;
+    }
+
+    int failures = 0;
+    void* raw_input = nullptr;
+    failures += check(create_fn(nullptr) == E_POINTER, "GameInputCreate(nullptr) should return E_POINTER");
+    failures += check(create_fn(&raw_input) == S_OK && raw_input != nullptr, "GameInputCreate(&input) should succeed");
+    auto* input = static_cast<IGameInput*>(raw_input);
+
+    // 1. RegisterDeviceCallback enumerates keyboard and gamepad devices.
+    CallbackCapture cap{};
+    std::uint64_t token = 0;
+    HRESULT hr = input->RegisterDeviceCallback(nullptr, kind_keyboard | kind_gamepad, status_connected,
+                                               blocking_enumeration, &cap, &on_device_callback, &token);
+    failures += check(hr == S_OK && token != 0, "RegisterDeviceCallback(keyboard|gamepad) should succeed");
+    failures += check(cap.count == 2, "RegisterDeviceCallback should enumerate 2 devices (gamepad + keyboard)");
+    IGameInputDevice* kbd_device = nullptr;
+    IGameInputDevice* pad_device = nullptr;
+    for (int i = 0; i < cap.count; ++i) {
+        if (cap.supported_inputs[i] & kind_keyboard) kbd_device = cap.devices[i];
+        if (cap.supported_inputs[i] & kind_gamepad) pad_device = cap.devices[i];
+    }
+    failures += check(kbd_device != nullptr && pad_device != nullptr && kbd_device != pad_device,
+                      "Distinct keyboard and gamepad devices should be enumerated");
+    failures += check(input->UnregisterCallback(token, 0), "UnregisterCallback should succeed");
+
+    // 2. Empty keyboard reading (no X2W_INPUT_KEYS).
+    SetEnvironmentVariableA("X2W_INPUT_KEYS", nullptr);
+    IGameInputReading* r0 = nullptr;
+    hr = input->GetCurrentReading(kind_keyboard, kbd_device, &r0);
+    failures += check(hr == S_OK && r0 != nullptr, "GetCurrentReading(kind_keyboard) should succeed");
+    if (r0) {
+        failures += check((r0->GetInputKind() & kind_keyboard) != 0, "r0 kind should include keyboard");
+        failures += check(r0->GetKeyCount() == 0, "r0 key count should be 0 when no keys are pressed");
+        KeyState buf[4]{};
+        failures += check(r0->GetKeyState(4, buf) == 0, "r0 GetKeyState should return 0 when empty");
+        failures += check(r0->GetKeyState(0, buf) == 0, "r0 GetKeyState(0, buf) should return 0");
+        failures += check(r0->GetKeyState(4, nullptr) == 0, "r0 GetKeyState(4, nullptr) should return 0");
+        GamepadState gp{};
+        failures += check(!r0->GetGamepadState(&gp), "keyboard-only reading should reject GetGamepadState");
+    }
+
+    // 3. Inject first key set ("41,57" -> 'A', 'W') and verify GetKeyCount / GetKeyState.
+    SetEnvironmentVariableA("X2W_INPUT_KEYS", "41,57");
+    IGameInputReading* r1 = nullptr;
+    hr = input->GetCurrentReading(kind_keyboard, kbd_device, &r1);
+    failures += check(hr == S_OK && r1 != nullptr, "r1 GetCurrentReading should succeed");
+    if (r1) {
+        failures += check(r1->GetKeyCount() == 2, "r1 GetKeyCount should be 2");
+        KeyState single[1]{};
+        failures += check(r1->GetKeyState(1, single) == 1 && single[0].virtualKey == 0x41,
+                          "r1 GetKeyState(1) should truncate to first key (0x41)");
+        KeyState keys[4]{};
+        const std::uint32_t got = r1->GetKeyState(4, keys);
+        failures += check(got == 2, "r1 GetKeyState(4) should return 2");
+        failures += check(keys[0].virtualKey == 0x41 && keys[1].virtualKey == 0x57,
+                          "r1 keys should be 0x41 and 0x57");
+        failures += check(keys[0].scanCode != 0 && !keys[0].isDeadKey, "r1 key 0 scanCode should be populated");
+        if (r0) {
+            failures += check(r1->GetSequenceNumber(kind_keyboard) > r0->GetSequenceNumber(kind_keyboard),
+                              "r1 sequence should advance after key change");
+        }
+    }
+
+    // 4. Inject second key set ("42" -> 'B') and test GetPreviousReading / GetNextReading chain.
+    SetEnvironmentVariableA("X2W_INPUT_KEYS", "42");
+    IGameInputReading* r2 = nullptr;
+    hr = input->GetCurrentReading(kind_keyboard, kbd_device, &r2);
+    failures += check(hr == S_OK && r2 != nullptr, "r2 GetCurrentReading should succeed");
+    if (r2) {
+        failures += check(r2->GetKeyCount() == 1, "r2 GetKeyCount should be 1");
+        KeyState k2[2]{};
+        failures += check(r2->GetKeyState(2, k2) == 1 && k2[0].virtualKey == 0x42, "r2 key should be 0x42");
+
+        IGameInputReading* prev = nullptr;
+        hr = input->GetPreviousReading(r2, kind_keyboard, kbd_device, &prev);
+        failures += check(hr == S_OK && prev != nullptr, "GetPreviousReading(r2) should succeed");
+        if (prev) {
+            KeyState pk[4]{};
+            failures += check(prev->GetKeyCount() == 2, "prev key count should be 2");
+            failures += check(prev->GetKeyState(4, pk) == 2 && pk[0].virtualKey == 0x41 && pk[1].virtualKey == 0x57,
+                              "prev keys should match r1 (0x41, 0x57)");
+            if (r1) {
+                failures += check(prev->GetSequenceNumber(kind_keyboard) == r1->GetSequenceNumber(kind_keyboard),
+                                  "prev sequence should match r1");
+            }
+
+            IGameInputReading* next = nullptr;
+            hr = input->GetNextReading(prev, kind_keyboard, kbd_device, &next);
+            failures += check(hr == S_OK && next != nullptr, "GetNextReading(prev) should succeed");
+            if (next) {
+                KeyState nk[2]{};
+                failures += check(next->GetKeyCount() == 1 && next->GetKeyState(2, nk) == 1 &&
+                                      nk[0].virtualKey == 0x42,
+                                  "next keys should match r2 (0x42)");
+                next->Release();
+            }
+            prev->Release();
+        }
+    }
+
+    // 5. Combined kind_keyboard | kind_gamepad reading + gamepad preservation.
+    IGameInputReading* combo = nullptr;
+    hr = input->GetCurrentReading(kind_keyboard | kind_gamepad, nullptr, &combo);
+    failures += check(hr == S_OK && combo != nullptr, "GetCurrentReading(keyboard|gamepad) should succeed");
+    if (combo) {
+        GamepadState gp{};
+        failures += check(combo->GetGamepadState(&gp), "combo reading should support GetGamepadState");
+        failures += check(combo->GetKeyCount() == 1, "combo reading should report 1 pressed key");
+        combo->Release();
+    }
+
+    // 6. Negative controls: null out, wrong kind, mismatched device, null reference for GetPreviousReading.
+    IGameInputReading* bad = nullptr;
+    failures += check(input->GetCurrentReading(kind_keyboard, nullptr, nullptr) == E_POINTER,
+                      "GetCurrentReading(null out) should return E_POINTER");
+    failures += check(input->GetCurrentReading(kind_mouse, nullptr, &bad) == reading_not_found && bad == nullptr,
+                      "GetCurrentReading(mouse) should return reading_not_found");
+    failures += check(input->GetCurrentReading(kind_keyboard, pad_device, &bad) == reading_not_found && bad == nullptr,
+                      "GetCurrentReading(keyboard, pad_device) should return reading_not_found");
+    failures += check(input->GetCurrentReading(kind_gamepad, kbd_device, &bad) == reading_not_found && bad == nullptr,
+                      "GetCurrentReading(gamepad, kbd_device) should return reading_not_found");
+    failures += check(input->GetPreviousReading(nullptr, kind_keyboard, nullptr, &bad) == E_INVALIDARG && bad == nullptr,
+                      "GetPreviousReading(null ref) should return E_INVALIDARG");
+    failures += check(input->GetPreviousReading(r2, kind_keyboard, nullptr, nullptr) == E_POINTER,
+                      "GetPreviousReading(null out) should return E_POINTER");
+    if (r2) {
+        // Unknown device pointer should fail with device_not_found or reading_not_found.
+        IGameInputDevice fake_device{nullptr};
+        hr = input->GetCurrentReading(kind_keyboard, &fake_device, &bad);
+        failures += check((hr == device_not_found || hr == reading_not_found) && bad == nullptr,
+                          "GetCurrentReading(fake_device) should fail");
+        // No next reading past latest.
+        failures += check(input->GetNextReading(r2, kind_keyboard, kbd_device, &bad) == reading_not_found &&
+                              bad == nullptr,
+                          "GetNextReading(latest) should return reading_not_found");
+    }
+
+    if (r0) r0->Release();
+    if (r1) r1->Release();
+    if (r2) r2->Release();
+    SetEnvironmentVariableA("X2W_INPUT_KEYS", nullptr);
+    input->Release();
+    FreeLibrary(mod);
+    if (failures == 0) std::printf("PASS: startup_gameinput_keys\n");
+    return failures == 0 ? 0 : 1;
+}

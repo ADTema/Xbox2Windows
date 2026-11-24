@@ -23,9 +23,22 @@
 
 namespace {
 using u64 = std::uint64_t;
+constexpr HRESULT device_not_found = static_cast<HRESULT>(0x838A0002);
 constexpr HRESULT reading_not_found = static_cast<HRESULT>(0x838A0003);
+constexpr HRESULT reading_too_old = static_cast<HRESULT>(0x838A0004);
+constexpr std::uint32_t kind_keyboard = 0x00000010;
 constexpr std::uint32_t kind_gamepad = 0x00040000, kind_controller_bits = 0x0000000E;
 constexpr std::uint32_t status_connected = 0x47;  // connected, input enabled, output enabled, synchronized
+constexpr std::size_t max_keys = 32;
+constexpr std::size_t history_capacity = 64;
+
+struct KeyState {
+    std::uint32_t scanCode;
+    std::uint32_t codePoint;
+    std::uint8_t virtualKey;
+    bool isDeadKey;
+};
+static_assert(sizeof(KeyState) == 12, "KeyState layout");
 
 struct GamepadState {
     std::uint32_t buttons;
@@ -169,6 +182,38 @@ GamepadState sample()
     return s;
 }
 
+std::uint32_t sample_keys(KeyState* out, std::size_t capacity)
+{
+    std::uint32_t count = 0;
+    auto push_vk = [&](std::uint32_t vk) {
+        if (count >= capacity || vk == 0 || vk > 0xFE) return;
+        const auto vkey = static_cast<std::uint8_t>(vk);
+        for (std::uint32_t i = 0; i < count; ++i)
+            if (out[i].virtualKey == vkey) return;
+        KeyState ks{};
+        ks.scanCode = static_cast<std::uint32_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+        const UINT ch = MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR);
+        if ((ch & 0x80000000u) == 0 && (ch & 0xFFFFu) != 0) ks.codePoint = ch & 0xFFFFu;
+        ks.virtualKey = vkey;
+        ks.isDeadKey = false;
+        out[count++] = ks;
+    };
+
+    char env[256]{};
+    if (GetEnvironmentVariableA("X2W_INPUT_KEYS", env, sizeof(env)) > 0) {
+        for (char* item = std::strtok(env, ", "); item && count < capacity; item = std::strtok(nullptr, ", ")) {
+            unsigned vk = 0;
+            if (std::sscanf(item, "%x", &vk) == 1) push_vk(vk);
+        }
+    }
+    if (process_has_focus()) {
+        for (std::uint32_t vk = 0x08; vk <= 0xFE && count < capacity; ++vk) {
+            if ((GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0) push_vk(vk);
+        }
+    }
+    return count;
+}
+
 struct Object {
     void* const* vtable;
     LONG refs;
@@ -202,27 +247,42 @@ void fill_unknown(void** slots, std::index_sequence<I...>)
 }
 
 // ---- device ------------------------------------------------------------------------------
+struct DeviceObj : Object {
+    const unsigned char* info;
+};
 Table<32> device_table;
-Object the_device{device_table.slots, 1};
 unsigned char device_info[0x400];
+unsigned char keyboard_device_info[0x400];
+DeviceObj the_device{{device_table.slots, 1}, device_info};
+DeviceObj the_keyboard_device{{device_table.slots, 1}, keyboard_device_info};
 
-const void* __stdcall device_get_info(Object*)
+const void* __stdcall device_get_info(DeviceObj* self)
 {
     static LONG calls;
     note("Device::GetDeviceInfo", calls);
-    return device_info;
+    return self->info;
 }
 std::uint32_t __stdcall device_get_status(Object*) { return status_connected; }
 void __stdcall device_set_rumble(Object*, const void*) {}
 
 // ---- readings ----------------------------------------------------------------------------
 struct Reading : Object {
+    std::uint32_t kind;
     GamepadState state;
+    std::uint32_t key_count;
+    KeyState keys[max_keys];
     u64 sequence, timestamp;
+};
+struct HistoryEntry {
+    u64 sequence, timestamp;
+    GamepadState pad;
+    std::uint32_t key_count;
+    KeyState keys[max_keys];
 };
 Table<32> reading_table;
 volatile LONG64 sequence_counter;
-GamepadState last_state;
+HistoryEntry history_ring[history_capacity];
+std::size_t history_count;
 SRWLOCK state_lock = SRWLOCK_INIT;
 
 u64 __stdcall reading_release(Reading* self)
@@ -231,22 +291,39 @@ u64 __stdcall reading_release(Reading* self)
     if (left == 0) delete self;
     return static_cast<u64>(left);
 }
-std::uint32_t __stdcall reading_kind(Reading*) { return kind_gamepad; }
+std::uint32_t __stdcall reading_kind(Reading* self) { return self->kind; }
 u64 __stdcall reading_sequence(Reading* self, std::uint32_t) { return self->sequence; }
 u64 __stdcall reading_timestamp(Reading* self) { return self->timestamp; }
-void __stdcall reading_device(Reading*, Object** device)
+void __stdcall reading_device(Reading* self, Object** device)
 {
     if (device) {
-        InterlockedIncrement(&the_device.refs);
-        *device = &the_device;
+        DeviceObj* d = (self->kind == kind_keyboard) ? &the_keyboard_device : &the_device;
+        InterlockedIncrement(&d->refs);
+        *device = d;
     }
+}
+std::uint32_t __stdcall reading_key_count(Reading* self)
+{
+    static LONG calls;
+    note("Reading::GetKeyCount", calls);
+    if ((self->kind & kind_keyboard) == 0) return 0;
+    return self->key_count;
+}
+std::uint32_t __stdcall reading_key_state(Reading* self, std::uint32_t state_array_count, KeyState* state_array)
+{
+    static LONG calls;
+    note("Reading::GetKeyState", calls, state_array_count);
+    if ((self->kind & kind_keyboard) == 0 || !state_array || state_array_count == 0) return 0;
+    const std::uint32_t count = self->key_count < state_array_count ? self->key_count : state_array_count;
+    std::memcpy(state_array, self->keys, count * sizeof(KeyState));
+    return count;
 }
 const ULONGLONG loaded_at = GetTickCount64();
 bool __stdcall reading_gamepad(Reading* self, GamepadState* out)
 {
     static LONG calls, presses;
     note("Reading::GetGamepadState", calls);
-    if (!out) return false;
+    if (!out || (self->kind & (kind_gamepad | kind_controller_bits)) == 0) return false;
     *out = self->state;
     // Each new button combination the title reads is logged once per change (at most 64 lines).
     static volatile LONG last_logged;
@@ -262,26 +339,92 @@ bool __stdcall reading_gamepad(Reading* self, GamepadState* out)
     return true;
 }
 
-// The current state as a reading; the sequence number advances when the state changes.
-Reading* current_reading()
+bool wants_gamepad(std::uint32_t kind) { return (kind & (kind_gamepad | kind_controller_bits)) != 0; }
+bool wants_keyboard(std::uint32_t kind) { return (kind & kind_keyboard) != 0; }
+bool wants_any(std::uint32_t kind) { return wants_gamepad(kind) || wants_keyboard(kind); }
+
+std::uint32_t resolve_reading_kind(std::uint32_t requested, Object* device)
 {
-    const GamepadState now = sample();
+    if (device == &the_device) return kind_gamepad;
+    if (device == &the_keyboard_device) return kind_keyboard;
+    std::uint32_t result = 0;
+    if (wants_gamepad(requested)) result |= kind_gamepad;
+    if (wants_keyboard(requested)) result |= kind_keyboard;
+    return result;
+}
+
+HistoryEntry capture_current()
+{
+    const GamepadState pad = sample();
+    KeyState keys[max_keys]{};
+    const std::uint32_t key_count = sample_keys(keys, max_keys);
+
     AcquireSRWLockExclusive(&state_lock);
-    if (std::memcmp(&now, &last_state, sizeof(now)) != 0 || sequence_counter == 0) {
-        last_state = now;
-        ++sequence_counter;
+    bool changed = (history_count == 0);
+    if (!changed) {
+        const HistoryEntry& latest = history_ring[static_cast<u64>(sequence_counter) % history_capacity];
+        if (std::memcmp(&pad, &latest.pad, sizeof(pad)) != 0 || key_count != latest.key_count ||
+            (key_count > 0 && std::memcmp(keys, latest.keys, key_count * sizeof(KeyState)) != 0)) {
+            changed = true;
+        }
     }
-    const u64 sequence = static_cast<u64>(sequence_counter);
+    if (changed) {
+        ++sequence_counter;
+        HistoryEntry& slot = history_ring[static_cast<u64>(sequence_counter) % history_capacity];
+        slot.sequence = static_cast<u64>(sequence_counter);
+        slot.timestamp = now_microseconds();
+        slot.pad = pad;
+        slot.key_count = key_count;
+        if (key_count > 0) std::memcpy(slot.keys, keys, key_count * sizeof(KeyState));
+        if (history_count < history_capacity) ++history_count;
+    }
+    const HistoryEntry result = history_ring[static_cast<u64>(sequence_counter) % history_capacity];
     ReleaseSRWLockExclusive(&state_lock);
+    return result;
+}
+
+// Returns 0 on hit, -1 if sequence does not exist (not found), -2 if evicted (too old).
+int find_history(u64 seq, HistoryEntry& out)
+{
+    AcquireSRWLockShared(&state_lock);
+    if (history_count == 0 || seq == 0 || seq > static_cast<u64>(sequence_counter)) {
+        ReleaseSRWLockShared(&state_lock);
+        return -1;
+    }
+    const u64 oldest = static_cast<u64>(sequence_counter) - history_count + 1;
+    if (seq < oldest) {
+        ReleaseSRWLockShared(&state_lock);
+        return -2;
+    }
+    out = history_ring[seq % history_capacity];
+    ReleaseSRWLockShared(&state_lock);
+    return 0;
+}
+
+Reading* make_reading(const HistoryEntry& entry, std::uint32_t kind, Object* device)
+{
     auto* reading = new Reading{};
     reading->vtable = reading_table.slots;
     reading->refs = 1;
-    reading->state = now;
-    reading->sequence = sequence;
-    reading->timestamp = now_microseconds();
+    reading->kind = resolve_reading_kind(kind, device);
+    reading->state = entry.pad;
+    reading->key_count = entry.key_count;
+    if (entry.key_count > 0) std::memcpy(reading->keys, entry.keys, entry.key_count * sizeof(KeyState));
+    reading->sequence = entry.sequence;
+    reading->timestamp = entry.timestamp;
     return reading;
 }
-bool wants_gamepad(std::uint32_t kind) { return (kind & (kind_gamepad | kind_controller_bits)) != 0; }
+
+HRESULT validate_kind_and_device(std::uint32_t kind, Object* device)
+{
+    if (!wants_any(kind)) return reading_not_found;
+    if (device) {
+        if (device != &the_device && device != &the_keyboard_device) return device_not_found;
+        if (device == &the_device && !wants_gamepad(kind)) return reading_not_found;
+        if (device == &the_keyboard_device && !wants_keyboard(kind)) return reading_not_found;
+    }
+    return S_OK;
+}
 
 // ---- IGameInput ---------------------------------------------------------------------------
 Table<32> input_table;
@@ -294,8 +437,9 @@ HRESULT __stdcall input_current_reading(Object*, std::uint32_t kind, Object* dev
     note("GameInput::GetCurrentReading", calls, kind, reinterpret_cast<u64>(device));
     if (!out) return E_POINTER;
     *out = nullptr;
-    if (!wants_gamepad(kind) || (device && device != &the_device)) return reading_not_found;
-    *out = current_reading();
+    const HRESULT check_hr = validate_kind_and_device(kind, device);
+    if (FAILED(check_hr)) return check_hr;
+    *out = make_reading(capture_current(), kind, device);
     return S_OK;
 }
 HRESULT __stdcall input_next_reading(Object*, Reading* reference, std::uint32_t kind, Object* device, Reading** out)
@@ -304,19 +448,33 @@ HRESULT __stdcall input_next_reading(Object*, Reading* reference, std::uint32_t 
     note("GameInput::GetNextReading", calls, reinterpret_cast<u64>(reference), kind);
     if (!out) return E_POINTER;
     *out = nullptr;
-    if (!wants_gamepad(kind) || (device && device != &the_device)) return reading_not_found;
-    Reading* now = current_reading();
-    if (reference && now->sequence <= reference->sequence) {
-        reading_release(now);
-        return reading_not_found;
-    }
-    *out = now;
+    if (!reference) return E_INVALIDARG;
+    const HRESULT check_hr = validate_kind_and_device(kind, device);
+    if (FAILED(check_hr)) return check_hr;
+    capture_current();
+    HistoryEntry entry{};
+    const int found = find_history(reference->sequence + 1, entry);
+    if (found == -2) return reading_too_old;
+    if (found != 0) return reading_not_found;
+    *out = make_reading(entry, kind, device);
     return S_OK;
 }
-HRESULT __stdcall input_previous_reading(Object*, Reading*, std::uint32_t, Object*, Reading** out)
+HRESULT __stdcall input_previous_reading(Object*, Reading* reference, std::uint32_t kind, Object* device, Reading** out)
 {
-    if (out) *out = nullptr;
-    return reading_not_found;
+    static LONG calls;
+    note("GameInput::GetPreviousReading", calls, reinterpret_cast<u64>(reference), kind);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!reference) return E_INVALIDARG;
+    const HRESULT check_hr = validate_kind_and_device(kind, device);
+    if (FAILED(check_hr)) return check_hr;
+    if (reference->sequence <= 1) return reading_not_found;
+    HistoryEntry entry{};
+    const int found = find_history(reference->sequence - 1, entry);
+    if (found == -2) return reading_too_old;
+    if (found != 0) return reading_not_found;
+    *out = make_reading(entry, kind, device);
+    return S_OK;
 }
 using DeviceCallback = void(__stdcall*)(u64 token, void* context, Object* device, u64 timestamp, std::uint32_t current, std::uint32_t previous);
 HRESULT __stdcall input_register_device_callback(Object*, Object* device, std::uint32_t kind, std::uint32_t status_filter, std::uint32_t enumeration,
@@ -326,9 +484,14 @@ HRESULT __stdcall input_register_device_callback(Object*, Object* device, std::u
     note("GameInput::RegisterDeviceCallback", calls, kind, status_filter, enumeration);
     const u64 value = static_cast<u64>(InterlockedIncrement(&tokens));
     if (token) *token = value;
-    // Any enumeration request reports the one gamepad at once (connected).
-    if (callback && enumeration != 0 && wants_gamepad(kind) && (!device || device == &the_device))
-        callback(value, context, &the_device, now_microseconds(), status_connected, 0);
+    // Any enumeration request reports matching virtual devices at once (connected).
+    if (callback && enumeration != 0) {
+        const u64 ts = now_microseconds();
+        if (wants_gamepad(kind) && (!device || device == &the_device))
+            callback(value, context, &the_device, ts, status_connected, 0);
+        if (wants_keyboard(kind) && (!device || device == &the_keyboard_device))
+            callback(value, context, &the_keyboard_device, ts, status_connected, 0);
+    }
     return S_OK;
 }
 HRESULT __stdcall input_register_callback(Object*, u64 a, u64 b, u64 c, u64 d, u64 e, u64* token)
@@ -350,11 +513,17 @@ HRESULT __stdcall input_register_short_callback(Object*, Object*, void*, void*, 
 }
 void __stdcall input_stop_callback(Object*, u64) {}
 bool __stdcall input_unregister_callback(Object*, u64, u64) { return true; }
-HRESULT __stdcall input_find_device(Object*, const void*, Object** device)
+HRESULT __stdcall input_find_device(Object*, const void* id, Object** device)
 {
     static LONG calls;
     note("GameInput::FindDeviceFrom*", calls);
     if (!device) return E_POINTER;
+    if (id && (std::memcmp(id, keyboard_device_info + 0x20, 32) == 0 ||
+               std::memcmp(id, keyboard_device_info + 0x40, 32) == 0)) {
+        InterlockedIncrement(&the_keyboard_device.refs);
+        *device = &the_keyboard_device;
+        return S_OK;
+    }
     InterlockedIncrement(&the_device.refs);
     *device = &the_device;
     return S_OK;
@@ -401,6 +570,8 @@ void build()
     reading_table.slots[4] = reinterpret_cast<void*>(&reading_sequence);
     reading_table.slots[5] = reinterpret_cast<void*>(&reading_timestamp);
     reading_table.slots[6] = reinterpret_cast<void*>(&reading_device);
+    reading_table.slots[14] = reinterpret_cast<void*>(&reading_key_count);
+    reading_table.slots[15] = reinterpret_cast<void*>(&reading_key_state);
     reading_table.slots[22] = reinterpret_cast<void*>(&reading_gamepad);
     // GameInputDeviceInfo: size, vendor/product of a standard pad, a fixed device id, family, capabilities, supported input.
     std::uint32_t size = sizeof(device_info);
@@ -411,6 +582,14 @@ void build()
     for (int i = 0; i < 32; ++i) device_info[0x40 + i] = static_cast<unsigned char>(0xA0 + i);  // deviceRootId
     const std::uint32_t tail[4] = {2 /* family: Xbox One */, 0, kind_gamepad | kind_controller_bits, 0xF /* rumble motors */};
     std::memcpy(device_info + 0x60, tail, sizeof(tail));
+    // Virtual keyboard device info.
+    std::memcpy(keyboard_device_info, &size, 4);
+    const std::uint16_t kbd_ids[2] = {0x045E, 0x07A5};
+    std::memcpy(keyboard_device_info + 4, kbd_ids, 4);
+    for (int i = 0; i < 32; ++i) keyboard_device_info[0x20 + i] = static_cast<unsigned char>(0xB0 + i);
+    for (int i = 0; i < 32; ++i) keyboard_device_info[0x40 + i] = static_cast<unsigned char>(0xB0 + i);
+    const std::uint32_t kbd_tail[4] = {0 /* family: unknown/PC */, 0, kind_keyboard, 0};
+    std::memcpy(keyboard_device_info + 0x60, kbd_tail, sizeof(kbd_tail));
 }
 }  // namespace
 
