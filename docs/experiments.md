@@ -5903,6 +5903,8 @@ It also keeps a non-null parameter block at `E_INVALIDARG`.
 
 Run `ctest --preset dev --no-tests=error -R '^d3d12x_device_' -V`.
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) created the device with null parameters and `IID_ID3D12Device` returning `S_OK`, reported one node, and created the fence with `S_OK`. Its negative case reported `null_device=E_POINTER` and `unknown_iid=E_NOINTERFACE`, with a null output.
+
 Those device fixtures request only `IID_ID3D12Device` and the fixture GUID, so
 `ctest --preset dev --no-tests=error -R '^d3d12x_device_slots' -V` checks the inventory without a
 device. It checks the rows and acceptance for the Windows SDK `__uuidof` values of `ID3D12Device`,
