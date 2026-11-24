@@ -1388,7 +1388,7 @@ class TestRdna2Disasm(unittest.TestCase):
         ("f9d60b0601060686", "v_add_f32_sdwa v5, v1, src_shared_base dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"),
     )
 
-    # Reserved/unsupported VOP1/VOP2 SDWA bit patterns (all refused by LLVM 15; sel==7 excluded from LLVM call).
+    # Reserved or unsupported VOP1/VOP2 SDWA bit patterns. The local profile refuses all of these.
     VOP1_VOP2_SDWA_LLVM_REFUSED = (
         "f9040a7e01060600",  # v_readfirstlane_b32 has no SDWA form
         "f982007e00060600",  # v_clrexcp has no SDWA form
@@ -1456,7 +1456,7 @@ class TestRdna2Disasm(unittest.TestCase):
                 self.assertEqual(insns[1]["assembly"], "v_mov_b32_e32 v3, v4")
 
     def test_vop1_vop2_sdwa_llvm_round_trip(self):
-        """VOP1/VOP2 SDWA golden encodings and refusals match LLVM 15."""
+        """Compare accepted SDWA encodings and document LLVM 15's different boundary."""
         if not os.environ.get("LLVM_LIB"):
             self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
         resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
@@ -1465,11 +1465,23 @@ class TestRdna2Disasm(unittest.TestCase):
             with self.subTest(llvm_decoded=raw_hex):
                 self.assertEqual(llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib, offsets=True),
                                  [(0, expected), (8, "v_mov_b32_e32 v3, v4")])
+        llvm_scalar_movrel = {
+            "f986007e02068600": "v_movrels_b32_sdwa v0, s2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+            "f988007e02068600": "v_movrelsd_b32_sdwa v0, s2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+        }
         for raw_hex in self.VOP1_VOP2_SDWA_LLVM_REFUSED:
             with self.subTest(llvm_refused=raw_hex):
-                with self.assertRaisesRegex(ValueError, "at byte 0$"):
-                    llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib)
-        assembler, objcopy = resolve_llvm_assembler_tools()
+                raw = bytes.fromhex(raw_hex) + mov
+                if raw_hex in llvm_scalar_movrel:
+                    self.assertEqual(llvm_disassemble(raw, resolved_lib, offsets=True),
+                                     [(0, llvm_scalar_movrel[raw_hex]), (8, "v_mov_b32_e32 v3, v4")])
+                else:
+                    # LLVM consumes v_clrexcp as a four-byte opcode before rejecting the tail.
+                    at = 4 if raw_hex == "f982007e00060600" else 0
+                    with self.assertRaisesRegex(ValueError, f"at byte {at}$"):
+                        llvm_disassemble(raw, resolved_lib)
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
         if not assembler or not objcopy:
             self.skipTest("LLVM_MC/LLVM_OBJCOPY environment variables not set; checked decode only")
         source = [asm for _, asm in self.VOP1_VOP2_SDWA_DECODED] + ["s_endpgm"]
