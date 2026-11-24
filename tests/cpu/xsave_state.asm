@@ -8,7 +8,9 @@
 ;   R8  = void*       output  (64-byte aligned; 960+ bytes)
 .code
 
-; --- Entry-state XSAVE / XSAVE64 ---
+; --- Entry-state XSAVE / XSAVE64 (opt-in canonical-entry profile) ---
+; Native callers targeting lifted canonical exports must establish canonical XSAVE state
+; (FCW=0x037F, FSW=0, FTW=0, FOP=0, FIP=0, FCS=0, FDP=0, FDS=0, MXCSR=0x1F80, zero ST/XMM/YMM_HI, XINUSE=0).
 
 op_xsave_only PROC FRAME
     .endprolog

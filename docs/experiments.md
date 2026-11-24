@@ -6577,38 +6577,55 @@ an initialized legacy component.
 
 Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat
 buffers and models the 832-byte standard-format `x87|SSE|AVX` `XState` locally without
-mutating host nonvolatile `XMM6`..`XMM15`, `x87`, or `MXCSR`. Transport and ABI glue
-covers `vmovdqa`/`vmovdqu` (`XMM0`..`5`, `YMM0`..`5`), `vzeroupper`, `movdqa`/`movdqu`,
-`paddd`, `movq` (`MM0`..`7`), `emms`, 32/64-bit volatile GPR `mov`/`xor` (with pointer
-provenance tracking across register saves), and terminal `ret`. The lifted DLL exports
-`host_has_xsave()` (`CPUID.1:ECX[26..28]` and `XGETBV(0) & 7 == 7`, returning exit code
-77 when absent), `host_deprecates_fpu_cs_ds()`, and `host_mxcsr_mask()`. `xsaveopt*`,
-`xsavec*`, `xsaves*`/`xrstors*`, `fxsave*`/`fxrstor*`, EVEX encodings, nonvolatile
-registers, unclosed MMX state before `ret`, non-`r8` stores, prefixes, RIP-relative or
-indexed addressing, and branches reject.
+mutating host nonvolatile `XMM6`..`XMM15`, `x87`, or `MXCSR`. Entry-state contracts are
+explicit via `--entry-state {defined,canonical}` and exported via
+`lifted_entry_state_profile()` / `lifted_requires_canonical_entry()`: the default `defined`
+profile tracks per-component (`x87`, `sse`, `avx`) initialization from `xrstor`/`xrstor64`
+and `vzeroupper` (`avx`) and rejects any `xsave`/`xsave64` (including entry-only saves and
+partially initialized restore/save paths) that reads uninitialized entry components, while
+the opt-in `canonical` profile permits entry-state `xsave`/`xsave64` provided the native
+caller establishes canonical architectural XSAVE state (`FCW=0x037F`, `FSW=0`, `FTW=0`,
+`FOP=0`, `FIP=0`, `FCS=0`, `FDP=0`, `FDS=0`, `MXCSR=0x1F80`, zero `ST`/`XMM`/`YMM_HI`,
+`XINUSE=0`). Transport and ABI glue covers `vmovdqa`/`vmovdqu` (`XMM0`..`5`, `YMM0`..`5`),
+`vzeroupper`, `movdqa`/`movdqu`, `paddd`, `movq` (`MM0`..`7`), `emms`, 32/64-bit volatile GPR
+`mov`/`xor` (with pointer provenance and constant-mask tracking), and terminal `ret`. The
+lifted DLL exports `host_has_xsave()` (`CPUID.1:ECX[26..28]` and `XGETBV(0) & 7 == 7`,
+returning exit code 77 when absent), `host_deprecates_fpu_cs_ds()`,
+`host_fp_err_cpuid_info()`, and `host_mxcsr_mask()`. `xsaveopt*`, `xsavec*`,
+`xsaves*`/`xrstors*`, `fxsave*`/`fxrstor*`, EVEX encodings, nonvolatile registers, unclosed
+MMX state before `ret`, non-`r8` stores, prefixes, RIP-relative or indexed addressing, and
+branches reject.
 
 ```powershell
-cmake --build --preset dev --target cpu_xsave_state_original cpu_xsave_state_original_lifted cpu_xsave_state_altered cpu_xsave_state_altered_lifted
+cmake --build --preset dev --target cpu_xsave_state_original cpu_xsave_state_original_lifted cpu_xsave_state_altered cpu_xsave_state_altered_lifted cpu_xsave_state_canonical_lifted cpu_xsave_state_canonical_altered_lifted
 ctest --preset dev --no-tests=error -R '^cpu_aot_xsave_state$' -V
 ```
 
 ### Measured results and open scope
 
-The [MASM fixture](../tests/cpu/xsave_state.asm) exports 11 functions covering `xsave`,
-`xsave64`, `xrstor`, `xrstor64`, displaced `[rcx+64]`/`[r8+64]`, `RFBM = 2` SSE-only
-masking, `vzeroupper` clearing `XINUSE[2]`, a chained `xrstor64` + `movq` + `vmovdqu` +
-`paddd` + `xsave64` + `emms` pipeline, and a dead-read fault-ordering control
-(`op_discarded_read`). [The differential check](../tests/cpu/xsave_state_check.py)
-verifies 70 cases across the 10 differential exports bit-for-bit across `XSTATE_BV`
-subsets `{0, 1, 2, 3, 4, 6, 7}` (with non-zero component payloads when `XSTATE_BV[i] == 1`)
-against both the native MASM DLL (via a `VirtualAlloc` + `RtlAddFunctionTable` SEH
-caller-state harness) and an independent Python reference model with 64-byte pre/post
-buffer guards across `dev` and `release` (`/O2`) builds, alongside 16 misalignment `#GP`
-checks (`+16` and `+8`), 16 header/MXCSR `#GP` checks (`XCOMP_BV != 0`, nonzero
-`header[16:23]`, unsupported `XSTATE_BV`, invalid `MXCSR`), dead-read fault ordering
-across unmapped/`#GP` modes, host nonvolatile state preservation, 5 `ALTER_OP` divergence
-controls (`3`, `3`, `3`, `7`, `7`), an output-mutation control, 4 alternate-encoding lift
-checks, 32 unit rejection controls, and 10 end-to-end PE-patched DLL rejection controls.
+The [MASM fixture](../tests/cpu/xsave_state.asm) exports 11 functions covering opt-in
+canonical-entry `xsave`/`xsave64` (`cpu_xsave_state_canonical_lifted`), `xrstor`/`xrstor64`
+roundtrips, displaced `[rcx+64]`/`[r8+64]`, `RFBM = 2` SSE-only masking (and `ALTER_OP`
+`RFBM = 2 -> 7` under `cpu_xsave_state_canonical_altered_lifted`), `vzeroupper` clearing
+`XINUSE[2]`, a chained `xrstor64` + `movq` + `vmovdqu` + `paddd` + `xsave64` + `emms`
+pipeline, and a dead-read fault-ordering control (`op_discarded_read`). [The differential
+check](../tests/cpu/xsave_state_check.py) probes native `(rstor64, save64, FSW.ES)`
+`FOP`/`FIP`/`FDP` preservation on the running host so comparisons remain strict for fields
+established on that host while checking `lifted` against the full architectural model,
+verifies 70 cases across the 10 differential exports bit-for-bit across `XSTATE_BV` subsets
+`{0, 1, 2, 3, 4, 6, 7}` (with non-zero component payloads when `XSTATE_BV[i] == 1`) against
+both the native MASM DLL (via a `VirtualAlloc` + `RtlAddFunctionTable` SEH caller-state
+harness) and an independent Python reference model with 64-byte pre/post buffer guards
+across `dev` and `release` (`/O2`) builds, alongside explicit entry-state contract metadata,
+non-default entry distinguishing controls for both entry-only (`SSE`/`MXCSR=0x3F80`/
+`XMM0=0x3F800000`) and partially initialized (`x87+AVX` with `op_xrstor64_mask_sse` vs
+`ALTER_OP`) paths, 16 misalignment `#GP` checks (`+16` and `+8`), 16 header/MXCSR `#GP` checks
+(`XCOMP_BV != 0`, nonzero `header[16:23]`, unsupported `XSTATE_BV`, invalid `MXCSR`),
+dead-read fault ordering across unmapped/`#GP` modes, host nonvolatile state preservation, 5
+`ALTER_OP` divergence controls (`3`, `3`, `3`, `7`, `7`), an output-mutation control, 5
+alternate-encoding lift checks, 39 unit rejection controls (including default-profile
+entry-only and partial-restore/save rejections), and 10 end-to-end PE-patched DLL rejection
+controls.
 
 Not covered by this experiment: compacted/supervisor formats (`xsavec*`, `xsaves*`,
 `xrstors*`), `xsaveopt*`, AVX-512/PKRU state components beyond `XCR0[2:0]`, control flow,

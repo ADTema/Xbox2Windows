@@ -20,9 +20,12 @@ GUARD_POST = bytes(0xC0 + (i % 16) for i in range(64))
 BUF_LEN = 960
 FILL = b"\x5A" * BUF_LEN
 
-EXPORTS = (
+CANONICAL_EXPORTS = (
     "op_xsave_only",
     "op_xsave64_only",
+)
+
+DEFINED_EXPORTS = (
     "op_xrstor_xsave",
     "op_xrstor64_xsave64",
     "op_xrstor_xsave64",
@@ -33,13 +36,30 @@ EXPORTS = (
     "op_pipeline",
 )
 
-ALTERED_EXPORTS = (
+EXPORTS = CANONICAL_EXPORTS + DEFINED_EXPORTS
+
+ALTERED_DEFINED_EXPORTS = (
     "op_xrstor64_xsave64",
     "op_xrstor_xsave64",
     "op_xrstor64_disp",
-    "op_xrstor64_mask_sse",
     "op_pipeline",
 )
+
+ALTERED_CANONICAL_EXPORTS = ("op_xrstor64_mask_sse",)
+
+# (rstor64, save64, save_rfbm, offset)
+EXPORT_MODES = {
+    "op_xsave_only": (True, False, 7, 0),
+    "op_xsave64_only": (True, True, 7, 0),
+    "op_xrstor_xsave": (False, False, 7, 0),
+    "op_xrstor64_xsave64": (True, True, 7, 0),
+    "op_xrstor_xsave64": (False, True, 7, 0),
+    "op_xrstor64_xsave": (True, False, 7, 0),
+    "op_xrstor64_disp": (True, True, 7, 64),
+    "op_xrstor64_mask_sse": (True, True, 2, 0),
+    "op_vzeroupper_xsave64": (True, True, 7, 0),
+    "op_pipeline": (True, True, 7, 0),
+}
 
 
 # --- Native XSAVE64/XRSTOR64 caller-state trampoline ---
@@ -88,6 +108,19 @@ class NativeHarness:
             Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
             Instruction.create(Code.RETNQ),
         )
+        # 32-bit XSAVE/XRSTOR stubs for bounded RFBM=7 host FOP/FIP/FDP probing.
+        save32_code = _encode_seq(
+            Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 7),
+            Instruction.create_reg_reg(Code.XOR_R32_RM32, R.EDX, R.EDX),
+            Instruction.create_mem(Code.XSAVE_MEM, MemoryOperand(R.RCX)),
+            Instruction.create(Code.RETNQ),
+        )
+        rstor32_code = _encode_seq(
+            Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 7),
+            Instruction.create_reg_reg(Code.XOR_R32_RM32, R.EDX, R.EDX),
+            Instruction.create_mem(Code.XRSTOR_MEM, MemoryOperand(R.RCX)),
+            Instruction.create(Code.RETNQ),
+        )
         # fn_call(rcx=target_fn, rdx=args_block) with SEH unwind metadata:
         #   prolog: push rbx (1B); sub rsp, 32 (4B) -> 5B total
         call_code = _encode_seq(
@@ -113,10 +146,15 @@ class NativeHarness:
             Instruction.create_reg(Code.POP_R64, R.RBX),
             Instruction.create(Code.RETNQ),
         )
-        call_off = len(save_code) + len(rstor_code)
+        rstor_off = len(save_code)
+        save32_off = rstor_off + len(rstor_code)
+        rstor32_off = save32_off + len(save32_code)
+        call_off = rstor32_off + len(rstor32_code)
         blob = bytearray(544)
-        blob[0 : len(save_code)] = save_code
-        blob[len(save_code) : call_off] = rstor_code
+        blob[0:rstor_off] = save_code
+        blob[rstor_off:save32_off] = rstor_code
+        blob[save32_off:rstor32_off] = save32_code
+        blob[rstor32_off:call_off] = rstor32_code
         blob[call_off : call_off + len(call_code)] = call_code
         # RUNTIME_FUNCTION at +512, UNWIND_INFO at +528 (push rbx + sub rsp, 32).
         struct.pack_into("<III", blob, 512, call_off, call_off + len(call_code), 528)
@@ -131,7 +169,9 @@ class NativeHarness:
         if not k32.RtlAddFunctionTable(self._rt_func, 1, mem):
             raise ctypes.WinError(ctypes.get_last_error())
         self.save_fn = ctypes.CFUNCTYPE(None, ctypes.c_uint64)(mem)
-        self.rstor_fn = ctypes.CFUNCTYPE(None, ctypes.c_uint64)(mem + len(save_code))
+        self.rstor_fn = ctypes.CFUNCTYPE(None, ctypes.c_uint64)(mem + rstor_off)
+        self.save32_fn = ctypes.CFUNCTYPE(None, ctypes.c_uint64)(mem + save32_off)
+        self.rstor32_fn = ctypes.CFUNCTYPE(None, ctypes.c_uint64)(mem + rstor32_off)
         self.call_fn = ctypes.CFUNCTYPE(None, ctypes.c_uint64, ctypes.c_uint64)(mem + call_off)
 
         self._save_buf, self._save_ptr, _, _, _ = alloc_aligned_buffer(b"\x00" * 4096, align=64)
@@ -144,18 +184,72 @@ class NativeHarness:
             self._k32.VirtualFree(self._mem, 0, 0x8000)
             self._mem = None
 
-    def call_native(self, fn, ptr_a: int, ptr_b: int, ptr_out: int) -> None:
+    def call_native(self, fn, ptr_a: int, ptr_b: int, ptr_out: int, entry_ptr: int | None = None) -> None:
         fn_addr = ctypes.cast(fn, ctypes.c_void_p).value
         self._args[0] = ptr_a
         self._args[1] = ptr_b
         self._args[2] = ptr_out
         self._args[3] = self._save_ptr
-        self._args[4] = self._clean_ptr
+        self._args[4] = self._clean_ptr if entry_ptr is None else entry_ptr
         self.save_fn(self._save_ptr)
         try:
             self.call_fn(fn_addr, ctypes.addressof(self._args))
         finally:
             self.rstor_fn(self._save_ptr)
+
+    def probe_xsave_err_ptrs(self, mxcsr_mask: int) -> dict[tuple[bool, bool, bool], tuple[bool, bool, bool]]:
+        """Observe whether native XRSTOR* -> XSAVE* preserves FOP/FIP/FDP for (rstor64, save64, FSW.ES)."""
+        caps: dict[tuple[bool, bool, bool], tuple[bool, bool, bool]] = {}
+        seed_fop = 0x0357
+        seed_fip = 0x00007FFF12345678
+        seed_fdp = 0x00007FFF87654321
+        exp_fop = struct.pack("<H", seed_fop)
+        for rstor64 in (False, True):
+            eff_fip = seed_fip if rstor64 else (seed_fip & 0xFFFFFFFF)
+            eff_fdp = seed_fdp if rstor64 else (seed_fdp & 0xFFFFFFFF)
+            for save64 in (False, True):
+                width = 8 if save64 else 4
+                exp_fip = struct.pack("<Q", eff_fip)[:width]
+                exp_fdp = struct.pack("<Q", eff_fdp)[:width]
+                for es in (False, True):
+                    img = make_xsave_image(
+                        mxcsr_mask,
+                        xstate_bv=7,
+                        fsw=0x0080 if es else 0x0000,
+                        fop=seed_fop,
+                        fip=seed_fip,
+                        fdp=seed_fdp,
+                        mxcsr=0x1F80,
+                        seed=1,
+                        poison_reserved=False,
+                    )
+                    in_buf, in_ptr, _, _, _ = alloc_aligned_buffer(img)
+                    out_buf, out_ptr, _, out_off, out_post = alloc_aligned_buffer(b"\x00" * BUF_LEN)
+                    self.save_fn(self._save_ptr)
+                    try:
+                        (self.rstor_fn if rstor64 else self.rstor32_fn)(in_ptr)
+                        (self.save_fn if save64 else self.save32_fn)(out_ptr)
+                    finally:
+                        self.rstor_fn(self._save_ptr)
+                    raw = out_buf.raw[out_off:out_post]
+                    _ = in_buf
+                    got_fop = raw[6:8]
+                    got_fip = raw[8 : 8 + width]
+                    got_fdp = raw[16 : 16 + width]
+                    if got_fop not in (exp_fop, b"\x00\x00"):
+                        raise AssertionError(
+                            f"unexpected host FOP probe value for rstor64={rstor64}, save64={save64}, es={es}: {got_fop.hex()}"
+                        )
+                    if got_fip not in (exp_fip, b"\x00" * width):
+                        raise AssertionError(
+                            f"unexpected host FIP probe value for rstor64={rstor64}, save64={save64}, es={es}: {got_fip.hex()}"
+                        )
+                    if got_fdp not in (exp_fdp, b"\x00" * width):
+                        raise AssertionError(
+                            f"unexpected host FDP probe value for rstor64={rstor64}, save64={save64}, es={es}: {got_fdp.hex()}"
+                        )
+                    caps[(rstor64, save64, es)] = (got_fop == exp_fop, got_fip == exp_fip, got_fdp == exp_fdp)
+        return caps
 
 
 # --- Independent Python XSAVE/XRSTOR reference model ---
@@ -451,14 +545,38 @@ def check_guards_and_read(buf, pre_off: int, payload_off: int, post_off: int, la
     return raw[payload_off:post_off]
 
 
-def invoke_native(harness: NativeHarness, fn, a: bytes, b: bytes) -> bytes:
+def invoke_native(harness: NativeHarness, fn, a: bytes, b: bytes, entry_ptr: int | None = None) -> bytes:
     buf_a, ptr_a, a_pre, a_off, a_post = alloc_aligned_buffer(a)
     buf_b, ptr_b, b_pre, b_off, b_post = alloc_aligned_buffer(b)
     buf_out, ptr_out, o_pre, o_off, o_post = alloc_aligned_buffer(FILL)
-    harness.call_native(fn, ptr_a, ptr_b, ptr_out)
+    harness.call_native(fn, ptr_a, ptr_b, ptr_out, entry_ptr=entry_ptr)
     check_guards_and_read(buf_a, a_pre, a_off, a_post, "native input_a")
     check_guards_and_read(buf_b, b_pre, b_off, b_post, "native input_b")
     return check_guards_and_read(buf_out, o_pre, o_off, o_post, "native output")
+
+
+def expected_native_output(want: bytes, a: bytes, name: str, fp_caps: dict) -> bytes:
+    """Adapt reference FOP/FIP/FDP expectations strictly to observed host preservation."""
+    rstor64, save64, save_rfbm, off = EXPORT_MODES[name]
+    if (save_rfbm & 1) == 0:
+        return want
+    xstate_bv_in = struct.unpack_from("<Q", a, off + 512)[0]
+    if (xstate_bv_in & 1) == 0:
+        return want
+    fsw_in = struct.unpack_from("<H", a, off + 2)[0]
+    es = (fsw_in & 0x0080) != 0
+    preserves_fop, preserves_fip, preserves_fdp = fp_caps[(rstor64, save64, es)]
+    if preserves_fop and preserves_fip and preserves_fdp:
+        return want
+    width = 8 if save64 else 4
+    out = bytearray(want)
+    if not preserves_fop:
+        out[off + 6 : off + 8] = b"\x00\x00"
+    if not preserves_fip:
+        out[off + 8 : off + 8 + width] = b"\x00" * width
+    if not preserves_fdp:
+        out[off + 16 : off + 16 + width] = b"\x00" * width
+    return bytes(out)
 
 
 def invoke_lifted(fn, a: bytes, b: bytes) -> bytes:
@@ -518,13 +636,15 @@ def bind_exports(dll_path: Path, prefix: str = "", names=EXPORTS):
 
 # --- Runtime #GP / alignment / header / MXCSR / dead-read / host-state controls ---
 
-def check_fault_controls(harness: NativeHarness, native_fns, lifted_fns, mxcsr_mask: int) -> tuple[int, int]:
+def check_fault_controls(
+    harness: NativeHarness, native_fns, lifted_fns, canonical_fns, mxcsr_mask: int
+) -> tuple[int, int]:
     valid_a = make_xsave_image(mxcsr_mask, xstate_bv=7, fip=0x00007FFF11223344, fdp=0x00007FFF55667788, seed=99)
 
     misalign_checks = 0
     for off in (16, 8):
-        for name in ("op_xsave_only", "op_xsave64_only"):
-            for label, is_native, fn in (("native", True, native_fns[name]), ("lifted", False, lifted_fns[name])):
+        for name in CANONICAL_EXPORTS:
+            for label, is_native, fn in (("native", True, native_fns[name]), ("canonical-lifted", False, canonical_fns[name])):
                 buf_a, ptr_a, _, _, _ = alloc_aligned_buffer(valid_a)
                 buf_out, ptr_out, pre, p_off, post = alloc_aligned_buffer(FILL, offset=off)
                 try:
@@ -594,7 +714,12 @@ def check_fault_controls(harness: NativeHarness, native_fns, lifted_fns, mxcsr_m
 
 
 def check_discarded_read(
-    harness: NativeHarness, native_path: Path, lifted_path: Path, mxcsr_mask: int, deprecates_cs_ds: bool
+    harness: NativeHarness,
+    native_path: Path,
+    lifted_path: Path,
+    mxcsr_mask: int,
+    deprecates_cs_ds: bool,
+    fp_caps: dict,
 ) -> None:
     payload = make_xsave_image(mxcsr_mask, xstate_bv=7, fip=0x00007FFF12345678, fdp=0x00007FFF87654321, seed=77)
     bad_mxcsr = bytearray(payload)
@@ -610,6 +735,8 @@ def check_discarded_read(
     want_first = reference("op_xrstor64_xsave64", payload, payload, mxcsr_mask, deprecates_cs_ds)
     expected_ok = bytearray(want_first)
     expected_ok[832:864] = payload[576:608]
+    native_want_first = expected_native_output(want_first, payload, "op_xrstor64_xsave64", fp_caps)
+    native_expected_ok = expected_native_output(bytes(expected_ok), payload, "op_xrstor64_xsave64", fp_caps)
 
     for label, is_native, fn in (("native", True, n_fns["op_discarded_read"]), ("lifted", False, l_fns["op_discarded_read"])):
         buf_a, ptr_a, _, _, _ = alloc_aligned_buffer(payload)
@@ -624,8 +751,13 @@ def check_discarded_read(
             harness.call_native(fn, ptr_a, ptr_a, ptr_ok)
         else:
             fn(ptr_a, ptr_a, ptr_ok)
-        assert_equal_output(label, "op_discarded_read", "readable",
-                            check_guards_and_read(out_ok, pre, off, post, label), bytes(expected_ok))
+        assert_equal_output(
+            label,
+            "op_discarded_read",
+            "readable",
+            check_guards_and_read(out_ok, pre, off, post, label),
+            native_expected_ok if is_native else bytes(expected_ok),
+        )
 
         for mode, bad_ptr, is_gp in (
             ("unmapped", 0, False),
@@ -645,8 +777,13 @@ def check_discarded_read(
                 assert needle in str(exc).lower(), (label, mode, exc)
             else:
                 raise AssertionError(f"{label} op_discarded_read discarded {mode} fault")
-            assert_equal_output(label, "op_discarded_read", mode,
-                                check_guards_and_read(out_err, pre, off, post, label), want_first)
+            assert_equal_output(
+                label,
+                "op_discarded_read",
+                mode,
+                check_guards_and_read(out_err, pre, off, post, label),
+                native_want_first if is_native else want_first,
+            )
 
         _ = buf_a, buf_misalign, buf_mxcsr, buf_xcomp, buf_res
 
@@ -683,8 +820,96 @@ def check_lifted_preserves_host_state(harness: NativeHarness, lifted_fns, mxcsr_
     _ = buf_host, buf_guest, buf_out
 
 
-def check_differential(native_path: Path, lifted_path: Path, altered_path: Path) -> None:
-    lifted_lib, lifted = bind_exports(lifted_path, "lifted_")
+def check_entry_state_contracts(
+    harness: NativeHarness,
+    native_fns,
+    native_altered_fns,
+    lifted_lib,
+    lifted_fns,
+    altered_lib,
+    canonical_lib,
+    canonical_fns,
+    canonical_altered_lib,
+    canonical_altered_fns,
+    mxcsr_mask: int,
+    deprecates_cs_ds: bool,
+) -> None:
+    """Verify explicit entry-state contract metadata and non-default entry controls."""
+    for lib, expected_profile, expected_flag in (
+        (lifted_lib, b"defined", 0),
+        (altered_lib, b"defined", 0),
+        (canonical_lib, b"canonical", 1),
+        (canonical_altered_lib, b"canonical", 1),
+    ):
+        lib.lifted_entry_state_profile.restype = ctypes.c_char_p
+        lib.lifted_requires_canonical_entry.restype = ctypes.c_uint32
+        assert lib.lifted_entry_state_profile() == expected_profile
+        assert lib.lifted_requires_canonical_entry() == expected_flag
+
+    # 1) Non-default incoming SSE state on entry-only XSAVE/XSAVE64 exports:
+    #    SSE in use (XSTATE_BV=2), MXCSR=0x3F80, low XMM0 lane=0x3F800000.
+    nondefault_sse = bytearray(clean_entry_bytes(mxcsr_mask))
+    struct.pack_into("<Q", nondefault_sse, 512, 2)
+    struct.pack_into("<I", nondefault_sse, 24, 0x3F80 & mxcsr_mask)
+    struct.pack_into("<I", nondefault_sse, 160, 0x3F800000)
+    sse_buf, sse_ptr, _, _, _ = alloc_aligned_buffer(bytes(nondefault_sse), align=64)
+    dummy = b"\x00" * BUF_LEN
+    for name in CANONICAL_EXPORTS:
+        got_n = invoke_native(harness, native_fns[name], dummy, dummy, entry_ptr=sse_ptr)
+        got_l = invoke_lifted(canonical_fns[name], dummy, dummy)
+        assert struct.unpack_from("<I", got_n, 24)[0] == (0x3F80 & mxcsr_mask)
+        assert struct.unpack_from("<I", got_n, 160)[0] == 0x3F800000
+        assert (struct.unpack_from("<Q", got_n, 512)[0] & 2) == 2
+        assert struct.unpack_from("<I", got_l, 24)[0] == 0x1F80
+        assert struct.unpack_from("<I", got_l, 160)[0] == 0
+        assert (struct.unpack_from("<Q", got_l, 512)[0] & 7) == 0
+        assert got_n != got_l
+    _ = sse_buf
+
+    # 2) Non-default incoming x87+AVX state on partially initialized restore/save:
+    #    x87 in use (FCW=0x027F, ST0!=0) and AVX in use (YMM0_hi!=0), XSTATE_BV=1|4.
+    nondefault_partial = bytearray(clean_entry_bytes(mxcsr_mask))
+    struct.pack_into("<H", nondefault_partial, 0, 0x027F)
+    nondefault_partial[32] = 0x11
+    struct.pack_into("<I", nondefault_partial, 576, 0x11223344)
+    struct.pack_into("<Q", nondefault_partial, 512, 1 | 4)
+    part_buf, part_ptr, _, _, _ = alloc_aligned_buffer(bytes(nondefault_partial), align=64)
+
+    sse_in = make_xsave_image(mxcsr_mask, xstate_bv=2, mxcsr=0x5F80 & mxcsr_mask, seed=202)
+    # Defined profile (xrstor(2) -> xsave(2)) never observes incoming x87/AVX:
+    want_def = reference("op_xrstor64_mask_sse", sse_in, dummy, mxcsr_mask, deprecates_cs_ds)
+    got_n_def = invoke_native(harness, native_fns["op_xrstor64_mask_sse"], sse_in, dummy, entry_ptr=part_ptr)
+    got_l_def = invoke_lifted(lifted_fns["op_xrstor64_mask_sse"], sse_in, dummy)
+    assert_equal_output("native_nondefault_entry", "op_xrstor64_mask_sse", 0, got_n_def, want_def)
+    assert_equal_output("lifted_nondefault_entry", "op_xrstor64_mask_sse", 0, got_l_def, want_def)
+
+    # Altered partial path (xrstor(2) -> xsave(7)) observes incoming x87/AVX natively,
+    # while canonical-lifted documents and supplies canonical entry values:
+    got_n_alt = invoke_native(
+        harness, native_altered_fns["op_xrstor64_mask_sse"], sse_in, dummy, entry_ptr=part_ptr
+    )
+    got_l_alt = invoke_lifted(canonical_altered_fns["op_xrstor64_mask_sse"], sse_in, dummy)
+    assert struct.unpack_from("<H", got_n_alt, 0)[0] == 0x027F
+    assert got_n_alt[32] == 0x11
+    assert struct.unpack_from("<I", got_n_alt, 576)[0] == 0x11223344
+    assert (struct.unpack_from("<Q", got_n_alt, 512)[0] & 5) == 5
+    assert struct.unpack_from("<H", got_l_alt, 0)[0] == 0x037F
+    assert got_l_alt[32] == 0
+    assert struct.unpack_from("<I", got_l_alt, 576)[0] == 0
+    assert (struct.unpack_from("<Q", got_l_alt, 512)[0] & 5) == 0
+    assert got_n_alt != got_l_alt
+    _ = part_buf
+
+
+def check_differential(
+    native_path: Path,
+    lifted_path: Path,
+    altered_path: Path,
+    canonical_path: Path,
+    canonical_altered_path: Path,
+    native_altered_path: Path,
+) -> None:
+    lifted_lib, lifted = bind_exports(lifted_path, "lifted_", DEFINED_EXPORTS)
     lifted_lib.host_has_xsave.argtypes = []
     lifted_lib.host_has_xsave.restype = ctypes.c_uint32
     if not lifted_lib.host_has_xsave():
@@ -693,40 +918,72 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
 
     lifted_lib.host_deprecates_fpu_cs_ds.argtypes = []
     lifted_lib.host_deprecates_fpu_cs_ds.restype = ctypes.c_uint32
+    lifted_lib.host_fp_err_cpuid_info.argtypes = []
+    lifted_lib.host_fp_err_cpuid_info.restype = ctypes.c_uint32
     lifted_lib.host_mxcsr_mask.argtypes = []
     lifted_lib.host_mxcsr_mask.restype = ctypes.c_uint32
 
     deprecates_cs_ds = bool(lifted_lib.host_deprecates_fpu_cs_ds())
+    fp_cpuid = int(lifted_lib.host_fp_err_cpuid_info())
     mxcsr_mask = int(lifted_lib.host_mxcsr_mask())
 
     _, native = bind_exports(native_path)
-    _, altered = bind_exports(altered_path, "lifted_")
+    _, native_altered = bind_exports(native_altered_path, "", ALTERED_CANONICAL_EXPORTS)
+    altered_lib, altered = bind_exports(altered_path, "lifted_", ALTERED_DEFINED_EXPORTS)
+    canonical_lib, canonical = bind_exports(canonical_path, "lifted_", CANONICAL_EXPORTS)
+    canonical_altered_lib, canonical_altered = bind_exports(
+        canonical_altered_path, "lifted_", ALTERED_CANONICAL_EXPORTS
+    )
 
     harness = NativeHarness()
     try:
-        misalign_checks, hdr_mxcsr_checks = check_fault_controls(harness, native, lifted, mxcsr_mask)
-        check_discarded_read(harness, native_path, lifted_path, mxcsr_mask, deprecates_cs_ds)
+        fp_caps = harness.probe_xsave_err_ptrs(mxcsr_mask)
+        check_entry_state_contracts(
+            harness,
+            native,
+            native_altered,
+            lifted_lib,
+            lifted,
+            altered_lib,
+            canonical_lib,
+            canonical,
+            canonical_altered_lib,
+            canonical_altered,
+            mxcsr_mask,
+            deprecates_cs_ds,
+        )
+        misalign_checks, hdr_mxcsr_checks = check_fault_controls(
+            harness, native, lifted, canonical, mxcsr_mask
+        )
+        check_discarded_read(harness, native_path, lifted_path, mxcsr_mask, deprecates_cs_ds, fp_caps)
         check_lifted_preserves_host_state(harness, lifted, mxcsr_mask)
 
         total = 0
         for name in EXPORTS:
             pairs = disp_pairs(mxcsr_mask) if name == "op_xrstor64_disp" else xsave_pairs(mxcsr_mask)
+            lifted_fn = canonical[name] if name in CANONICAL_EXPORTS else lifted[name]
             for idx, (a, b) in enumerate(pairs):
                 want = reference(name, a, b, mxcsr_mask, deprecates_cs_ds)
+                want_native = (
+                    want
+                    if name in CANONICAL_EXPORTS
+                    else expected_native_output(want, a, name, fp_caps)
+                )
                 got_n = invoke_native(harness, native[name], a, b)
-                got_l = invoke_lifted(lifted[name], a, b)
-                assert_equal_output("native", name, idx, got_n, want)
+                got_l = invoke_lifted(lifted_fn, a, b)
+                assert_equal_output("native", name, idx, got_n, want_native)
                 assert_equal_output("lifted", name, idx, got_l, want)
                 total += 1
 
         diverged = {}
-        for name in ALTERED_EXPORTS:
+        for name in ALTERED_DEFINED_EXPORTS + ALTERED_CANONICAL_EXPORTS:
             pairs = disp_pairs(mxcsr_mask) if name == "op_xrstor64_disp" else xsave_pairs(mxcsr_mask)
+            alt_fn = canonical_altered[name] if name in ALTERED_CANONICAL_EXPORTS else altered[name]
             diffs = 0
             for idx, (a, b) in enumerate(pairs):
                 want_alt = reference(name, a, b, mxcsr_mask, deprecates_cs_ds, altered=True)
                 want_orig = reference(name, a, b, mxcsr_mask, deprecates_cs_ds)
-                got_alt = invoke_lifted(altered[name], a, b)
+                got_alt = invoke_lifted(alt_fn, a, b)
                 assert_equal_output("altered", name, idx, got_alt, want_alt)
                 if got_alt != want_orig:
                     diffs += 1
@@ -746,11 +1003,15 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
         else:
             raise AssertionError("mutated output was not caught by comparator")
 
+        es0_64 = fp_caps[(True, True, False)]
+        es1_64 = fp_caps[(True, True, True)]
         print(
             f"{total} native/lifted/reference XSAVE/XRSTOR cases across {len(EXPORTS)} exports matched bit-for-bit "
-            f"(mxcsr_mask={mxcsr_mask:#x}, deprecates_fpu_cs_ds={deprecates_cs_ds}); "
+            f"(mxcsr_mask={mxcsr_mask:#x}, deprecates_fpu_cs_ds={deprecates_cs_ds}, "
+            f"fp_cpuid={fp_cpuid:#x}, fp_es0={es0_64}, fp_es1={es1_64}); "
             f"ALTER_OP diverged on {diverged}; {misalign_checks} misalignment #GP checks, "
-            f"{hdr_mxcsr_checks} header/MXCSR #GP checks, dead-read, host-state, and output mutation controls passed"
+            f"{hdr_mxcsr_checks} header/MXCSR #GP checks, entry-state contract, non-default entry controls, "
+            f"dead-read, host-state, and output mutation controls passed"
         )
     finally:
         harness.close()
@@ -758,7 +1019,10 @@ def check_differential(native_path: Path, lifted_path: Path, altered_path: Path)
 
 # --- Alternate-encoding acceptance & rejection controls ---
 
-def check_alt_encodings_and_rejections(original_path: Path) -> None:
+def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) -> None:
+    mov_eax_1 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 1)
+    mov_eax_2 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 2)
+    mov_eax_3 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 3)
     mov_eax_7 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 7)
     xor_edx = Instruction.create_reg_reg(Code.XOR_R32_RM32, R.EDX, R.EDX)
     ret_ins = Instruction.create(Code.RETNQ)
@@ -769,6 +1033,14 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
             mov_eax_7,
             xor_edx,
             Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.R9)),
+            Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)),
+            ret_ins)),
+        ("xrstor3_vzeroupper_xsave7", (
+            mov_eax_3,
+            xor_edx,
+            Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+            Instruction.create(Code.VEX_VZEROUPPER),
+            mov_eax_7,
             Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)),
             ret_ins)),
         ("vmovdqa_ymm_roundtrip", (
@@ -788,6 +1060,7 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
     ]
     alt_expected = {
         "xrstor_r9_saved_rdx": "op_xrstor(state, r9, rax, rdx, true);",
+        "xrstor3_vzeroupper_xsave7": "op_vzeroupper(state);",
         "vmovdqa_ymm_roundtrip": "load256(rcx, true)",
         "movdqa_xmm_roundtrip": "store128(r8, get_xmm(state, 3), true);",
         "movq_mm_gpr_roundtrip": "op_emms(state);",
@@ -801,12 +1074,44 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
         if alt_expected[label] not in src:
             raise AssertionError(f"{label}: expected {alt_expected[label]!r} in generated C++")
 
+    canon_raw = _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins)
+    canon_src, canon_count = lift_code("canon_bare", 0x1000, canon_raw, entry_state="canonical")
+    assert canon_count == 4 and "Entry-state profile: canonical" in canon_src
+
     # Also verify runtime #GP for bounded mask contract (EDX != 0 / EAX & ~7 != 0)
     # and acceptance of invalid MXCSR when RFBM == 1 (RFBM & 6 == 0).
     seg_xsave = Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8))
     seg_xsave.segment_prefix = R.GS
 
     unit_cases = [
+        # Entry-state & partial-initialization rejections under default 'defined' profile
+        ("bare_xsave_default",
+         _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVE_MEM, MemoryOperand(R.R8)), ret_ins),
+         "requires explicit --entry-state canonical"),
+        ("bare_xsave64_default",
+         _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "requires explicit --entry-state canonical"),
+        ("partial_sse_to_all_xsave64",
+         _encode_seq(mov_eax_2, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+                     mov_eax_7, Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "uninitialized XSAVE component(s) (x87, avx)"),
+        ("partial_x87_to_x87_sse_xsave64",
+         _encode_seq(mov_eax_1, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+                     mov_eax_3, Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "uninitialized XSAVE component(s) (sse)"),
+        ("partial_x87_sse_to_all_xsave64",
+         _encode_seq(mov_eax_3, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+                     mov_eax_7, Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "uninitialized XSAVE component(s) (avx)"),
+        ("vmovdqa_ymm0_then_xsave64",
+         _encode_seq(Instruction.create_reg_mem(Code.VEX_VMOVDQA_YMM_YMMM256, R.YMM0, MemoryOperand(R.RCX)),
+                     mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "requires explicit --entry-state canonical"),
+        ("dynamic_mask_after_partial_xrstor",
+         _encode_seq(mov_eax_2, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+                     Instruction.create_reg_mem(Code.MOV_R64_RM64, R.RAX, MemoryOperand(R.RCX)),
+                     Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "requires explicit --entry-state canonical"),
         # Out-of-scope XSAVE-family & FXSAVE/FXRSTOR forms
         ("xsaveopt", _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEOPT_MEM, MemoryOperand(R.R8)), ret_ins),
          "unsupported XSAVE-family"),
@@ -938,6 +1243,24 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
             else:
                 raise AssertionError(f"{label}: PE translate accepted rejected patch")
 
+    for path, export_name in (
+        (original_path, "op_xsave_only"),
+        (original_path, "op_xsave64_only"),
+        (altered_path, "op_xrstor64_mask_sse"),
+    ):
+        try:
+            translate(path, [export_name])
+        except ValueError as exc:
+            if "requires explicit --entry-state canonical" not in str(exc):
+                raise AssertionError(f"{export_name}: unexpected error {exc!r}") from exc
+        else:
+            raise AssertionError(f"{export_name}: default profile unexpectedly accepted uninitialized entry save")
+
+    canon_pe_src, _ = translate(original_path, list(CANONICAL_EXPORTS), entry_state="canonical")
+    assert "Entry-state profile: canonical" in canon_pe_src
+    canon_alt_src, _ = translate(altered_path, ["op_xrstor64_mask_sse"], entry_state="canonical")
+    assert "Entry-state profile: canonical" in canon_alt_src
+
     print(
         f"{len(alt_accept)} alternate-encoding lift checks, {len(unit_cases)} unit rejection controls, "
         f"and {len(pe_patches)} PE-patched rejection controls passed"
@@ -945,6 +1268,6 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    orig, lifted, alt = (Path(p) for p in sys.argv[1:4])
-    check_alt_encodings_and_rejections(orig)
-    check_differential(orig, lifted, alt)
+    orig, lifted, alt, canonical, canonical_alt, native_alt = (Path(p) for p in sys.argv[1:7])
+    check_alt_encodings_and_rejections(orig, native_alt)
+    check_differential(orig, lifted, alt, canonical, canonical_alt, native_alt)

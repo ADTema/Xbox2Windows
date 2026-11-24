@@ -7,6 +7,17 @@ The translator models the bounded 832-byte x87|SSE|AVX standard-format XSAVE
 state (XCR0[2:0] = 7) in a local portable XState struct (leaving host XMM6..15,
 YMM6..15, x87/MMX and MXCSR untouched across lifted calls).
 
+Entry-state contract (`--entry-state`):
+  - defined (default): the three-pointer ABI carries no incoming x87/SSE/AVX
+    state; every xsave/xsave64 must only save components previously initialized
+    by a supported xrstor/xrstor64 (or vzeroupper for AVX). Entry-only xsave*
+    and partially initialized restore/save paths that observe uninitialized
+    components from entry are rejected.
+  - canonical (opt-in): permits xsave/xsave64 before full component definition
+    assuming the native caller establishes canonical architectural XSAVE state
+    on entry (FCW=0x037F, FSW=0, FTW=0, FOP=0, FIP=0, FCS=0, FDP=0, FDS=0,
+    MXCSR=0x1F80, ST0..7=0, XMM0..15=0, YMM_HI0..15=0, XINUSE=0).
+
 Supported XSAVE state instructions (4 forms from docs/coverage/x64_zen2.tsv
 group XSAVE):
   - xsave / xsave64:   require 64-byte-aligned [base + disp] and bounded mask
@@ -82,6 +93,8 @@ XRSTOR_CODES = {
     Code.XRSTOR_MEM: False,
     Code.XRSTOR64_MEM: True,
 }
+ENTRY_STATES = ("defined", "canonical")
+XCOMP_NAMES = ((1, "x87"), (2, "sse"), (4, "avx"))
 
 REJECT_XSAVE_FAMILY_CODES = {
     Code.XSAVEOPT_MEM,
@@ -177,6 +190,29 @@ extern "C" __declspec(dllexport) std::uint32_t host_deprecates_fpu_cs_ds() {
     int info7[4]{};
     __cpuidex(info7, 7, 0);
     return (info7[1] & (1 << 13)) != 0 ? 1u : 0u;
+}
+
+extern "C" __declspec(dllexport) std::uint32_t host_fp_err_cpuid_info() {
+    // Bit 0: CPUID.07H.0:EBX[6] FDP_EXCPTN_ONLY
+    // Bit 1: CPUID.07H.0:EBX[13] ZERO_FCS_FDS
+    // Bit 2: CPUID.80000008H:EBX[2] RstrFpErrPtrs
+    std::uint32_t flags = 0u;
+    int info0[4]{};
+    __cpuid(info0, 0);
+    if (info0[0] >= 7) {
+        int info7[4]{};
+        __cpuidex(info7, 7, 0);
+        if ((info7[1] & (1 << 6)) != 0) flags |= 1u;
+        if ((info7[1] & (1 << 13)) != 0) flags |= 2u;
+    }
+    int ext0[4]{};
+    __cpuid(ext0, static_cast<int>(0x80000000u));
+    if (static_cast<std::uint32_t>(ext0[0]) >= 0x80000008u) {
+        int ext8[4]{};
+        __cpuid(ext8, static_cast<int>(0x80000008u));
+        if ((ext8[1] & (1 << 2)) != 0) flags |= 4u;
+    }
+    return flags;
 }
 
 extern "C" __declspec(dllexport) std::uint32_t host_mxcsr_mask() {
@@ -596,8 +632,10 @@ def flat_address(ins, ptr_origins, *, expected_bytes=None, write=False):
     return f"({base_name} + {disp:#x}ull)" if disp else base_name
 
 
-def lift_code(name, start, raw):
+def lift_code(name, start, raw, *, entry_state="defined"):
     """Decode and lift one bounded straight-line XSAVE/XRSTOR leaf function."""
+    if entry_state not in ENTRY_STATES:
+        raise ValueError(f"unsupported entry-state profile {entry_state!r}")
     instructions = list(Decoder(64, raw, ip=start))
     if not instructions or instructions[-1].next_ip != start + len(raw):
         raise ValueError(f"truncated instruction stream in {name} at RVA {start:#x}")
@@ -611,6 +649,9 @@ def lift_code(name, start, raw):
     used_gpr = set()
     defined_gpr = {"rcx", "rdx", "r8"}
     ptr_origins = {"rcx": R.RCX, "rdx": R.RDX, "r8": R.R8}
+    const_gpr = {"rcx": None, "rdx": None, "r8": None, "rax": None, "r9": None, "r10": None, "r11": None}
+    defined_xcomp = 0
+    used_canonical_entry = False
     mmx_active = False
     statements = []
     returned = False
@@ -708,6 +749,21 @@ def lift_code(name, start, raw):
             is64 = XSAVE_CODES[ins.code]
             require_xsave_masks(ins)
             addr = flat_address(ins, ptr_origins, write=True)
+            rax_val = const_gpr.get("rax")
+            rdx_val = const_gpr.get("rdx")
+            if rdx_val == 0 and rax_val is not None and (rax_val & ~7) == 0:
+                needed_xcomp = rax_val & 7
+            else:
+                needed_xcomp = 7
+            missing = needed_xcomp & ~defined_xcomp
+            if missing != 0:
+                if entry_state != "canonical":
+                    missing_names = ", ".join(lbl for bit, lbl in XCOMP_NAMES if missing & bit)
+                    raise ValueError(
+                        f"xsave observes uninitialized XSAVE component(s) ({missing_names}) before definition; "
+                        f"requires explicit --entry-state canonical at RVA {ins.ip:#x}: {ins}"
+                    )
+                used_canonical_entry = True
             statements.append(f"op_xsave(state, {addr}, rax, rdx, {'true' if is64 else 'false'});")
 
         elif ins.code in XRSTOR_CODES:
@@ -715,12 +771,17 @@ def lift_code(name, start, raw):
             require_xsave_masks(ins)
             addr = flat_address(ins, ptr_origins, write=False)
             statements.append(f"op_xrstor(state, {addr}, rax, rdx, {'true' if is64 else 'false'});")
+            rax_val = const_gpr.get("rax")
+            rdx_val = const_gpr.get("rdx")
+            if rdx_val == 0 and rax_val is not None and (rax_val & ~7) == 0:
+                defined_xcomp |= rax_val & 7
             defined_xmm.update(range(6))
             defined_ymm.update(range(6))
             defined_mm.update(range(8))
 
         elif ins.code == Code.VEX_VZEROUPPER:
             statements.append("op_vzeroupper(state);")
+            defined_xcomp |= 4
             defined_ymm.update(defined_xmm)
 
         elif ins.code in VEX_LOAD_CODES:
@@ -805,6 +866,7 @@ def lift_code(name, start, raw):
                 src_mm = read_mm(1, ins)
                 dst_gpr = write_gpr(0, ins, scratch_only=True, expect_32=False)
                 clobber_gpr(dst_gpr)
+                const_gpr[dst_gpr] = None
                 used_gpr.add(dst_gpr)
                 statements.append(f"{dst_gpr} = get_mm(state, {src_mm});")
                 defined_gpr.add(dst_gpr)
@@ -816,6 +878,7 @@ def lift_code(name, start, raw):
                 src_gpr = read_gpr(1, ins, expect_32=False)
                 dst_gpr = write_gpr(0, ins, expect_32=False)
                 clobber_gpr(dst_gpr, copy_from=src_gpr)
+                const_gpr[dst_gpr] = const_gpr.get(src_gpr)
                 used_gpr.add(dst_gpr)
                 statements.append(f"{dst_gpr} = {src_gpr};")
                 defined_gpr.add(dst_gpr)
@@ -823,6 +886,7 @@ def lift_code(name, start, raw):
                 dst_gpr = write_gpr(0, ins, expect_32=False)
                 addr = flat_address(ins, ptr_origins, expected_bytes=8)
                 clobber_gpr(dst_gpr)
+                const_gpr[dst_gpr] = None
                 used_gpr.add(dst_gpr)
                 statements.append(f"{dst_gpr} = load64({addr});")
                 defined_gpr.add(dst_gpr)
@@ -838,6 +902,8 @@ def lift_code(name, start, raw):
                 src_gpr = read_gpr(1, ins, expect_32=True)
                 dst_gpr = write_gpr(0, ins, expect_32=True)
                 clobber_gpr(dst_gpr)
+                src_val = const_gpr.get(src_gpr)
+                const_gpr[dst_gpr] = (src_val & 0xFFFFFFFF) if src_val is not None else None
                 used_gpr.add(dst_gpr)
                 statements.append(f"{dst_gpr} = static_cast<std::uint32_t>({src_gpr});")
                 defined_gpr.add(dst_gpr)
@@ -849,6 +915,7 @@ def lift_code(name, start, raw):
             clobber_gpr(dst_gpr)
             used_gpr.add(dst_gpr)
             imm = ins.immediate32 & 0xFFFFFFFF
+            const_gpr[dst_gpr] = imm
             statements.append(f"{dst_gpr} = {imm:#x}ull;")
             defined_gpr.add(dst_gpr)
 
@@ -856,6 +923,7 @@ def lift_code(name, start, raw):
             if ins.op0_kind == OpKind.REGISTER and ins.op1_kind == OpKind.REGISTER and ins.op0_register == ins.op1_register:
                 dst_gpr = write_gpr(0, ins, expect_32=True)
                 clobber_gpr(dst_gpr)
+                const_gpr[dst_gpr] = 0
                 used_gpr.add(dst_gpr)
                 statements.append(f"{dst_gpr} = 0ull;")
                 defined_gpr.add(dst_gpr)
@@ -864,6 +932,13 @@ def lift_code(name, start, raw):
                 lhs = read_gpr(0, ins, expect_32=True)
                 rhs = read_gpr(1, ins, expect_32=True)
                 clobber_gpr(dst_gpr)
+                lhs_val = const_gpr.get(lhs)
+                rhs_val = const_gpr.get(rhs)
+                const_gpr[dst_gpr] = (
+                    ((lhs_val ^ rhs_val) & 0xFFFFFFFF)
+                    if lhs_val is not None and rhs_val is not None
+                    else None
+                )
                 used_gpr.add(dst_gpr)
                 statements.append(f"{dst_gpr} = static_cast<std::uint32_t>({lhs} ^ {rhs});")
                 defined_gpr.add(dst_gpr)
@@ -881,7 +956,16 @@ def lift_code(name, start, raw):
         if gpr in used_gpr:
             decls.append(f"    word {gpr} = 0ull;")
     body = [f"    {stmt}" for stmt in statements]
+    if used_canonical_entry:
+        contract = (
+            "// Entry-state profile: canonical (caller must establish FCW=0x037F, FSW=0, "
+            "FTW=0, FOP=0, FIP=0, FCS=0, FDP=0, FDS=0, MXCSR=0x1F80, ST0..7=0, "
+            "XMM0..15=0, YMM_HI0..15=0, XINUSE=0)."
+        )
+    else:
+        contract = f"// Entry-state profile: {entry_state} (all saved XSAVE components defined before xsave)."
     lines = [
+        contract,
         f'extern "C" __declspec(dllexport) void lifted_{name}(word rcx, word rdx, word r8) {{',
         "    (void)rcx; (void)rdx; (void)r8;",
         *decls,
@@ -891,25 +975,33 @@ def lift_code(name, start, raw):
     return "\n".join(lines), len(instructions)
 
 
-def lift(pe, name):
+def lift(pe, name, *, entry_state="defined"):
     entry = export_rva(pe, name)
     raw = bounded_code(pe, entry)
-    source, count = lift_code(name, entry, raw)
+    source, count = lift_code(name, entry, raw, entry_state=entry_state)
     return source, entry, count
 
 
-def translate_pe(pe, names):
+def translate_pe(pe, names, *, entry_state="defined"):
+    if entry_state not in ENTRY_STATES:
+        raise ValueError(f"unsupported entry-state profile {entry_state!r}")
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
-    lifted = [lift(pe, name) for name in names]
-    source = PRELUDE + "\n".join(f"\n{text}" for text, _, _ in lifted) + "\n"
+    lifted = [lift(pe, name, entry_state=entry_state) for name in names]
+    is_canonical = 1 if entry_state == "canonical" else 0
+    profile_block = (
+        f'\n// Entry-state profile: {entry_state}\n'
+        f'extern "C" __declspec(dllexport) const char* lifted_entry_state_profile() {{ return "{entry_state}"; }}\n'
+        f'extern "C" __declspec(dllexport) std::uint32_t lifted_requires_canonical_entry() {{ return {is_canonical}u; }}\n'
+    )
+    source = PRELUDE + profile_block + "\n".join(f"\n{text}" for text, _, _ in lifted) + "\n"
     meta = [(name, entry, count) for name, (_, entry, count) in zip(names, lifted)]
     return source, meta
 
 
-def translate(image, names):
+def translate(image, names, *, entry_state="defined"):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names)
+        return translate_pe(pe, names, entry_state=entry_state)
 
 
 if __name__ == "__main__":
@@ -917,11 +1009,17 @@ if __name__ == "__main__":
     parser.add_argument("image", type=Path)
     parser.add_argument("exports", help="comma-separated export names")
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--entry-state",
+        choices=ENTRY_STATES,
+        default="defined",
+        help="entry-state profile: defined (default, requires prior component definition before xsave) or canonical (opt-in caller-initialized canonical XSAVE state)",
+    )
     args = parser.parse_args()
     try:
-        source, meta = translate(args.image, args.exports.split(","))
+        source, meta = translate(args.image, args.exports.split(","), entry_state=args.entry_state)
         args.output.write_text(source, encoding="utf-8")
         for name, entry, count in meta:
-            print(f"{name} at RVA {entry:#x}: {count} instructions")
+            print(f"{name} at RVA {entry:#x} ({args.entry_state}): {count} instructions")
     except (ValueError, OSError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")
