@@ -3519,6 +3519,36 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertIn("s_nop 0", res.stdout)
         self.assertIn("s_endpgm", res.stdout)
 
+    def test_cli_hex_output_and_input_errors(self):
+        script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "listing.txt"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), "--hex", "000080bf", "--output", str(out)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("s_nop 0", out.read_text(encoding="utf-8"))
+
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), "--hex", "0000810"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 2)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertIn("--hex", res.stderr)
+
+            missing = Path(tmp) / "nonexist.bin"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), str(missing)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("not found", res.stderr)
+
     def test_llvm_comparison(self):
         llvm_lib_env = os.environ.get("LLVM_LIB")
         if not llvm_lib_env:

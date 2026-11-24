@@ -3205,17 +3205,22 @@ def main():
 
     args = parser.parse_args()
 
+    all_listings = []
+    missing = False
+
     # Hex decode mode
     if args.hex:
-        raw_bytes = bytes.fromhex(args.hex.replace(" ", ""))
+        try:
+            raw_bytes = bytes.fromhex(args.hex.replace(" ", ""))
+        except ValueError as exc:
+            parser.error(f"--hex: {exc}")
         insns = disassemble_binary(raw_bytes, "hex_input")
         print_disassembly("hex_input", insns)
-        return 0
-
-    if not args.targets:
+        all_listings.append(("hex_input", insns))
+        args.targets = []
+    elif not args.targets:
         parser.error("Specify targets or provide hex via --hex")
 
-    all_listings = []
     for target in args.targets:
         if target.is_file():
             data = target.read_bytes()
@@ -3230,6 +3235,9 @@ def main():
                 insns = disassemble_binary(data, f.name)
                 print_disassembly(f.name, insns)
                 all_listings.append((f.name, insns))
+        else:
+            print(f"error: {target}: not found", file=sys.stderr)
+            missing = True
 
     if args.output and all_listings:
         with args.output.open("w", encoding="utf-8") as out_f:
@@ -3240,7 +3248,7 @@ def main():
                 out_f.write("\n")
         print(f"[+] Disassembly saved to: {args.output}")
 
-    return 0
+    return 1 if missing else 0
 
 
 if __name__ == "__main__":
