@@ -742,10 +742,63 @@ x2w-input script mark <label> at <s> s (item <i>, present <n>|no presenter signa
 x2w-present picture signature: first sample published at present <n> in Local\x2w_present_signature_<pid> (every <k> presents)
 ```
 
-Times are seconds on the script's time base. The new rejection reasons are `bad wait option`,
+Times are seconds on the script's time base. The rejection reasons of waits and marks are `bad wait option`,
 `bad label`, `duration not allowed on wait or mark` and `time before the preceding wait`. A script
 without `wait`, `mark` or `@+` plays exactly as before. One exception: `@+<s>` used to be read as
 the absolute time `<s>`.
+
+#### Change sensitivity, regions and the fine grid
+
+Options after `;` on a wait (`wait=<settle>/<timeout>;<option>;...`, or `wait;<option>` with no
+settle or timeout) set what counts as a change for that wait only:
+
+| Option | Effect |
+|---|---|
+| `cells=<n>` | at least `n` cells must differ (default 16) |
+| `level=<n>` | a cell differs when its mean luma moves by more than `n` levels of 255 (default 12) |
+| `region=<x0>:<y0>:<x1>:<y1>` | watch only the cells whose centre lies in this rectangle, in fractions of the picture width and height (0:0 is the top left; default the whole picture) |
+| `fine` | compare the fine 64 x 72 grid instead of the 32 x 18 one |
+
+The default grid samples one row in the middle of each eighteenth of the picture, so anything less
+than about 5.6 % of the picture height can fall between two sampled rows. A list highlight is often
+that thin. The WARP check moves a 60 x 4 texel bar (30 % x 3.3 %, 1 % of a 200 x 120 picture) between
+two sampled rows: the default grid sees 0 changed cells, the fine grid 40. The fine grid samples 72
+rows (one every 1.4 % of the height) and 64 columns. The presenter copies its rows only once a script
+with a `fine` wait has asked for them: the GameInput stand-in sets a request field in the signature
+block and logs `x2w-input script: fine picture signature (64 x 72) requested`. Measured CPU-side cost
+of one sampled present at 3840 x 2160 on WARP (release build, every fourth present by default):
+0.16 ms with the default grid (18 rows, 270 KiB copied) and 0.56 ms with the fine grid (90 rows,
+1,350 KiB), against 32,400 KiB for the whole frame; the WARP check prints both.
+
+Rejected options log `bad wait option`, `bad region`, `empty region` (no cell centre inside) or
+`cells larger than the region`.
+
+#### Groups
+
+`group[=<label>]` and `end` bracket a run of items. When a wait inside the group times out, the
+rest of the group is skipped, and the script goes on after `end`, timed from the timeout: the script
+time jumps to that of `end`, so an item `@+<s>` after `end` starts `<s>` seconds after the timeout.
+Later groups run normally. A `/stop` wait inside a group still stops the whole script. Groups do not
+nest. The default label is `group<item index>`. The timeout line then ends in
+`; group <label> is skipped from here`, followed by
+
+```text
+x2w-input script group <label> (items <group>-<end>) failed at step item <i>: rest of the group skipped, the script goes on after item <end> from <s> s
+```
+
+Rejected group items log `nested group` (and its `end` logs `end of a rejected nested group`),
+`end without group`, `group not closed` (its items then run ungrouped), `group and end take no time`,
+`bad label`, and `time before the end of the preceding group` for an absolute time after `end` that
+is earlier than the group's last timed item.
+
+A two-entry list on the left of the screen, where each press must visibly move the highlight: wait
+for the screen; press down and check that the highlight moved; press up and check that it moved back;
+then accept. If a press shows no change within 2 s, the rest of the list steps is skipped and the
+script waits for the next screen:
+
+```text
+wait,group=list,80@+1,wait=0.5/2;fine;cells=4;level=8;region=0.05:0.3:0.45:0.6,40@+0.5,wait=0.5/2;fine;cells=4;level=8;region=0.05:0.3:0.45:0.6,4@+0.5,end,wait=1/30
+```
 
 The timeline is in `src/startup_stubs/input_script.h` and the sampler in
 `src/startup_stubs/present_signature_sampler.h`. The timeline cases run with a controllable clock

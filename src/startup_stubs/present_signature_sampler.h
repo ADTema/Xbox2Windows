@@ -2,8 +2,8 @@
 // (present_signature.h) from the console present of the D3D12 stand-in.
 //
 // Every `every` presents it copies the 18 sampled rows of the presented surface (one texel high
-// each, never the whole surface) into a small readback buffer on the presenting queue and signals
-// a fence. It never waits: a later call publishes the rows once the fence has passed, and no new
+// each, never the whole surface), and the 72 rows of the fine grid while a reader asks for it, into
+// a small readback buffer on the presenting queue and signals a fence. It never waits: a later call publishes the rows once the fence has passed, and no new
 // copy starts while one is in flight. The surface rests in COMMON before and after.
 #pragma once
 
@@ -42,14 +42,17 @@ public:
         if (in_flight_ && fence_->GetCompletedValue() >= fence_value_) {
             in_flight_ = false;
             void* mapped = nullptr;
-            const D3D12_RANGE range{0, static_cast<SIZE_T>(row_stride_ * cells_y)};
+            const D3D12_RANGE range{0, static_cast<SIZE_T>(row_stride_ * rows_)};
             if (SUCCEEDED(readback_->Map(0, &range, &mapped))) {
+                const auto* base = static_cast<const unsigned char*>(mapped);
                 std::uint8_t luma[cells];
-                for (int band = 0; band < cells_y; ++band)
-                    reduce_row(static_cast<const unsigned char*>(mapped) + row_stride_ * band, width_, layout_, luma + band * cells_x);
+                for (int band = 0; band < cells_y; ++band) reduce_row(base + row_stride_ * band, width_, layout_, luma + band * cells_x);
+                if (rows_ > cells_y)
+                    for (int band = 0; band < fine_y; ++band)
+                        reduce_row(base + row_stride_ * (cells_y + band), width_, layout_, fine_ + band * fine_x, fine_x);
                 const D3D12_RANGE none{0, 0};
                 readback_->Unmap(0, &none);
-                if (block) publish(block, luma, copied_present_);
+                if (block) publish(block, luma, copied_present_, rows_ > cells_y ? fine_ : nullptr);
                 published = true;
             }
         }
@@ -65,7 +68,8 @@ public:
         const auto width = static_cast<UINT>(desc.Width);
         const UINT64 pitch = (UINT64{width} * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~UINT64{D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1};
         const UINT64 stride = (pitch + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~UINT64{D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1};
-        if (!setup(device, stride * cells_y)) return published;
+        const int rows = cells_y + (block && block->fine_wanted ? fine_y : 0);
+        if (!setup(device, stride * rows)) return published;
         if (FAILED(allocator_->Reset()) || FAILED(list_->Reset(allocator_, nullptr))) {
             failed_ = true;
             return published;
@@ -74,12 +78,13 @@ public:
         D3D12_TEXTURE_COPY_LOCATION from{};
         from.pResource = surface;
         from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        for (int band = 0; band < cells_y; ++band) {
-            const UINT y = sampled_row(band, desc.Height);
+        for (int row = 0; row < rows; ++row) {
+            const int band = row < cells_y ? row : row - cells_y;
+            const UINT y = sampled_row(band, desc.Height, row < cells_y ? cells_y : fine_y);
             D3D12_TEXTURE_COPY_LOCATION to{};
             to.pResource = readback_;
             to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            to.PlacedFootprint.Offset = stride * band;
+            to.PlacedFootprint.Offset = stride * row;
             to.PlacedFootprint.Footprint = {desc.Format, width, 1, 1, static_cast<UINT>(pitch)};
             const D3D12_BOX box{0, y, 0, width, y + 1, 1};
             list_->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
@@ -99,6 +104,7 @@ public:
         layout_ = layout;
         width_ = width;
         row_stride_ = stride;
+        rows_ = rows;
         copied_present_ = present_number;
         return published;
     }
@@ -106,6 +112,7 @@ public:
     bool failed() const { return failed_; }
     DXGI_FORMAT unsupported_format() const { return unsupported_; }
     bool in_flight() const { return in_flight_; }
+    int rows_in_flight() const { return in_flight_ ? rows_ : 0; }
 
     ~Sampler()
     {
@@ -164,6 +171,8 @@ private:
     ID3D12Resource* readback_ = nullptr;
     UINT64 readback_bytes_ = 0, fence_value_ = 0, row_stride_ = 0;
     UINT width_ = 0;
+    int rows_ = cells_y;
+    std::uint8_t fine_[fine_cells] = {};
     Layout layout_ = Layout::rgba8;
     DXGI_FORMAT unsupported_ = DXGI_FORMAT_UNKNOWN;
     bool in_flight_ = false, failed_ = false;

@@ -164,6 +164,11 @@ const x2w_input_script::Script& input_script()
         if (!parsed.waits.empty() || !parsed.marks.empty())
             x2w_local::logf("x2w-input script: %zu waits, %zu marks; picture signal from Local\\x2w_present_signature_%lu",
                             parsed.waits.size(), parsed.marks.size(), static_cast<unsigned long>(GetCurrentProcessId()));
+        if (!parsed.groups.empty()) x2w_local::logf("x2w-input script: %zu groups", parsed.groups.size());
+        // A wait with ;fine reads the 64 x 72 grid; the presenter copies it only while asked.
+        if (parsed.wants_fine())
+            x2w_local::logf("x2w-input script: fine picture signature (64 x 72) %s",
+                            x2w_present_signature::request_fine(GetCurrentProcessId()) ? "requested" : "could not be requested");
         return parsed;
     }();
     return script;
@@ -185,7 +190,8 @@ double script_seconds(const x2w_input_script::Script& script)
 
 // The presenter's picture signature (src/startup_stubs/present_signature.h), opened by process id. While
 // no presenter has created it, opening is retried at most every 0.5 s.
-static_assert(x2w_input_script::signal_cells == x2w_present_signature::cells, "signature grid size");
+static_assert(x2w_input_script::signal_cells == x2w_present_signature::cells &&
+                  x2w_input_script::fine_cells == x2w_present_signature::fine_cells, "signature grid size");
 bool read_signal(x2w_input_script::Signal& out)
 {
     static const x2w_present_signature::Block* block;
@@ -205,6 +211,8 @@ bool read_signal(x2w_input_script::Signal& out)
     out.sequence = snapshot.sequence;
     out.present = snapshot.presents;
     std::memcpy(out.cells, snapshot.luma, sizeof(out.cells));
+    out.fine_available = snapshot.fine_valid;
+    if (snapshot.fine_valid) std::memcpy(out.fine, snapshot.fine, sizeof(out.fine));
     return true;
 }
 
@@ -222,8 +230,17 @@ void log_event(const x2w_input_script::Event& e)
         x2w_local::logf("x2w-input script wait item %zu done at %.3f s after %.3f s", e.item, e.at, e.elapsed);
         break;
     case Event::wait_timeout:
-        x2w_local::logf("x2w-input script wait item %zu timed out at %.3f s after %.3f s%s; the script %s", e.item, e.at, e.elapsed,
-                        e.signal ? "" : " (no presenter signal)", e.stopped ? "stops" : "goes on");
+        if (!e.label.empty())
+            x2w_local::logf("x2w-input script wait item %zu timed out at %.3f s after %.3f s%s; group %s is skipped from here", e.item, e.at,
+                            e.elapsed, e.signal ? "" : " (no presenter signal)", e.label.c_str());
+        else
+            x2w_local::logf("x2w-input script wait item %zu timed out at %.3f s after %.3f s%s; the script %s", e.item, e.at, e.elapsed,
+                            e.signal ? "" : " (no presenter signal)", e.stopped ? "stops" : "goes on");
+        break;
+    case Event::group_skipped:
+        x2w_local::logf("x2w-input script group %s (items %zu-%zu) failed at step item %zu: rest of the group skipped, "
+                        "the script goes on after item %zu from %.3f s",
+                        e.label.c_str(), e.group_item, e.end_item, e.item, e.end_item, e.at);
         break;
     case Event::mark:
         if (e.signal)

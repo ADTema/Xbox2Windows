@@ -1,7 +1,9 @@
 // Verifies the presented-picture signature (src/startup_stubs/present_signature_sampler.h) on WARP:
 // the sampler copies only the sampled rows of a presented surface, publishes a grid equal to the CPU
 // reduction of those rows, and the published signal changes once for two different pictures and
-// never for repeated identical pictures (negative control). Also checks the sampling interval.
+// never for repeated identical pictures (negative control). Also checks the sampling interval, that a
+// bar of about 1 % of the frame between two base rows is missed by the 32 x 18 grid and caught by the
+// fine 64 x 72 grid, and prints the CPU-side cost per sampled present at 3840 x 2160.
 //
 // usage: startup_present_signature   (exit 77 when no WARP adapter can be created)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -21,6 +23,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -70,13 +73,13 @@ struct Gpu {
     }
 };
 
-// A texture in COMMON holding `picture`.
-ID3D12Resource* surface(Gpu& gpu, DXGI_FORMAT format, const Picture& picture)
+// A texture in COMMON holding `picture` (w x h texels).
+ID3D12Resource* surface(Gpu& gpu, DXGI_FORMAT format, const Picture& picture, UINT w = width, UINT h = height)
 {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = width;
-    desc.Height = height;
+    desc.Width = w;
+    desc.Height = h;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.Format = format;
@@ -103,9 +106,9 @@ ID3D12Resource* surface(Gpu& gpu, DXGI_FORMAT format, const Picture& picture)
     gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload));
     void* mapped = nullptr;
     upload->Map(0, nullptr, &mapped);
-    for (UINT y = 0; y < height; ++y)
+    for (UINT y = 0; y < h; ++y)
         std::memcpy(static_cast<unsigned char*>(mapped) + footprint.Offset + std::size_t{y} * footprint.Footprint.RowPitch,
-                    &picture[std::size_t{y} * width * 4], std::size_t{width} * 4);
+                    &picture[std::size_t{y} * w * 4], std::size_t{w} * 4);
     upload->Unmap(0, nullptr);
     ID3D12CommandAllocator* allocator = nullptr;
     ID3D12GraphicsCommandList* list = nullptr;
@@ -261,6 +264,75 @@ int main()
         check(half && sampler.unsupported_format() == DXGI_FORMAT_R16G16B16A16_FLOAT && !sampler.in_flight(),
               "16-bit float surface refused without a copy");
         if (half) half->Release();
+    }
+    // Resolution: a bar 60 x 4 texels (30 % x 3.3 %, 1 % of the frame) at rows 11..14, between the base
+    // rows 10 and 16, switches from black to white. The base grid must not see it; the fine grid must,
+    // and its published cells must equal the CPU reduction of the 72 fine rows.
+    {
+        Picture off = gradient(false), on = off;
+        for (UINT y = 11; y < 15; ++y)
+            for (UINT x = 20; x < 80; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    off[(std::size_t{y} * width + x) * 4 + c] = 0;
+                    on[(std::size_t{y} * width + x) * 4 + c] = 255;
+                }
+        ID3D12Resource* s_off = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, off);
+        ID3D12Resource* s_on = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, on);
+        InterlockedExchange(&block->fine_wanted, 1);
+        const auto grids = present_all(gpu, block, {s_off, s_on});
+        InterlockedExchange(&block->fine_wanted, 0);
+        check(grids.size() == 2 && grids[0].fine_valid && grids[1].fine_valid, "fine grid published while asked for");
+        if (grids.size() == 2) {
+            x2w_input_script::Wait base_wait{}, fine_wait{};
+            base_wait.level = fine_wait.level = x2w_input_script::cell_tolerance;
+            fine_wait.fine = true;
+            const int base_cells = x2w_input_script::wait_distance(base_wait, grids[0].luma, grids[1].luma);
+            const int fine_cells = x2w_input_script::wait_distance(fine_wait, grids[0].fine, grids[1].fine);
+            std::printf("1 %% bar: base grid %d changed cells, fine grid %d changed cells\n", base_cells, fine_cells);
+            check(base_cells == 0, "the 32 x 18 grid misses a 1 % bar between its rows");
+            check(fine_cells >= x2w_input_script::changed_cells, "the 64 x 72 grid sees the 1 % bar in at least 16 cells");
+            std::uint8_t want[x2w_present_signature::fine_cells];
+            for (int band = 0; band < x2w_present_signature::fine_y; ++band)
+                x2w_present_signature::reduce_row(&on[std::size_t{x2w_present_signature::sampled_row(band, height, x2w_present_signature::fine_y)} * width * 4],
+                                                  width, x2w_present_signature::Layout::rgba8, want + band * x2w_present_signature::fine_x,
+                                                  x2w_present_signature::fine_x);
+            check(std::memcmp(grids[1].fine, want, sizeof(want)) == 0, "published fine cells equal the CPU reduction of the fine rows");
+        }
+        const auto plain = present_all(gpu, block, {s_off, s_on});
+        check(plain.size() == 2 && !plain[0].fine_valid && !plain[1].fine_valid, "no fine grid while nobody asks");
+        s_off->Release();
+        s_on->Release();
+    }
+    // Cost at 3840 x 2160: CPU time of the present() calls (record the row copies; map, reduce and
+    // publish the previous copy) with and without the fine grid. The GPU copies 18 or 90 rows.
+    {
+        constexpr UINT big_w = 3840, big_h = 2160;
+        Picture big(std::size_t{big_w} * big_h * 4, 128);
+        ID3D12Resource* s = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, big, big_w, big_h);
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        double ms[2] = {};
+        for (int fine = 0; fine < 2; ++fine) {
+            InterlockedExchange(&block->fine_wanted, fine);
+            x2w_present_signature::Sampler sampler(1);
+            constexpr int rounds = 24;
+            LONGLONG ticks = 0;
+            for (int i = 0; i < rounds + 2; ++i) {
+                LARGE_INTEGER a, b;
+                QueryPerformanceCounter(&a);
+                sampler.present(gpu.device, gpu.queue, s, i + 1, block);
+                QueryPerformanceCounter(&b);
+                if (i >= 2) ticks += b.QuadPart - a.QuadPart;  // the first two set up the buffers
+                gpu.idle();
+            }
+            ms[fine] = ticks * 1000.0 / frequency.QuadPart / rounds;
+        }
+        InterlockedExchange(&block->fine_wanted, 0);
+        const double row_kib = big_w * 4 / 1024.0;
+        std::printf("cost per sampled present at %ux%u (CPU side, WARP): base %.3f ms (18 rows, %.0f KiB), fine %.3f ms (90 rows, %.0f KiB); "
+                    "a full frame is %.0f KiB\n",
+                    big_w, big_h, ms[0], 18 * row_kib, ms[1], 90 * row_kib, big_h * row_kib);
+        s->Release();
     }
     std::printf("%s\n", failures ? "FAIL" : "pass");
     return failures ? 1 : 0;

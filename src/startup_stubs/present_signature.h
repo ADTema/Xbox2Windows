@@ -8,7 +8,11 @@
 //   +0x18 i64 present number of the published sample
 //   +0x20 i64 present number of the latest present (updated on every present)
 //   +0x28 u8 luma[18][32]: mean luma (2R + 5G + B) / 8 of each 1/32 of 18 evenly spaced rows
-// A reader copies the cells between two reads of an even, unchanged sequence.
+//   +0x268 i32 fine wanted: set to 1 by a reader (request_fine) to ask for the fine grid as well
+//   +0x26C u32 fine_x (64), u32 fine_y (72), i32 fine valid: the published sample has the fine grid
+//   +0x278 u8 fine[72][64]: the same reduction over 72 rows and 64 columns
+// A reader copies the cells between two reads of an even, unchanged sequence. The fine grid costs
+// 72 more one-texel rows per sample, so the presenter copies it only after a reader asked for it.
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -27,6 +31,7 @@
 namespace x2w_present_signature {
 
 constexpr int cells_x = 32, cells_y = 18, cells = cells_x * cells_y;
+constexpr int fine_x = 64, fine_y = 72, fine_cells = fine_x * fine_y;
 constexpr std::uint32_t block_magic = 0x47495358;  // "XSIG"
 
 struct Block {
@@ -35,13 +40,20 @@ struct Block {
     volatile LONG64 sample_present;
     volatile LONG64 presents;
     std::uint8_t luma[cells];
+    volatile LONG fine_wanted;
+    std::uint32_t fine_x, fine_y;
+    volatile LONG fine_valid;
+    std::uint8_t fine[fine_cells];
 };
-static_assert(offsetof(Block, luma) == 0x28, "signature block layout");
+static_assert(offsetof(Block, luma) == 0x28 && offsetof(Block, fine_wanted) == 0x268 && offsetof(Block, fine) == 0x278,
+              "signature block layout");
 
 struct Snapshot {
     std::uint64_t sequence;  // number of published samples (0 = none yet)
     std::uint64_t sample_present, presents;
     std::uint8_t luma[cells];
+    bool fine_valid;
+    std::uint8_t fine[fine_cells];
 };
 
 inline void block_name(wchar_t (&out)[64], DWORD process)
@@ -60,6 +72,8 @@ inline Block* create_block(DWORD process, std::uint32_t every)
     if (!block) return nullptr;
     block->cells_x = cells_x;
     block->cells_y = cells_y;
+    block->fine_x = fine_x;
+    block->fine_y = fine_y;
     block->every = every;
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->magic), static_cast<LONG>(block_magic));
     return block;
@@ -81,10 +95,27 @@ inline const Block* open_block(DWORD process)
     return block;
 }
 
-inline void publish(Block* block, const std::uint8_t (&luma)[cells], LONG64 present)
+// Reader side: asks the presenter of `process` for the fine grid. Creates the block if no presenter
+// has yet (the presenter's create_block then keeps the request). False if the block cannot be made.
+inline bool request_fine(DWORD process)
+{
+    wchar_t name[64];
+    block_name(name, process);
+    HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Block), name);
+    if (!mapping) return false;
+    auto* block = static_cast<Block*>(MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, sizeof(Block)));
+    if (!block) return false;
+    InterlockedExchange(&block->fine_wanted, 1);
+    return true;
+}
+
+// `fine` may be null: the sample then has no fine grid.
+inline void publish(Block* block, const std::uint8_t (&luma)[cells], LONG64 present, const std::uint8_t* fine = nullptr)
 {
     InterlockedIncrement64(&block->sequence);  // odd: writing
     std::memcpy(block->luma, luma, sizeof(luma));
+    if (fine) std::memcpy(block->fine, fine, sizeof(block->fine));
+    block->fine_valid = fine ? 1 : 0;
     InterlockedExchange64(&block->sample_present, present);
     InterlockedIncrement64(&block->sequence);  // even: stable
 }
@@ -99,6 +130,8 @@ inline bool read(const Block* block, Snapshot& out)
         MemoryBarrier();
         if (before & 1) continue;
         std::memcpy(out.luma, block->luma, sizeof(out.luma));
+        out.fine_valid = block->fine_valid != 0;
+        if (out.fine_valid) std::memcpy(out.fine, block->fine, sizeof(out.fine));
         out.sample_present = static_cast<std::uint64_t>(block->sample_present);
         MemoryBarrier();
         const LONG64 after = block->sequence;
@@ -114,12 +147,12 @@ enum class Layout { rgba8, bgra8, rgb10a2 };
 
 inline std::uint8_t luma(unsigned r, unsigned g, unsigned b) { return static_cast<std::uint8_t>((2 * r + 5 * g + b) / 8); }
 
-// One sampled row of `width` 4-byte texels into cells_x mean-luma cells.
-inline void reduce_row(const unsigned char* row, std::uint32_t width, Layout layout, std::uint8_t* out)
+// One sampled row of `width` 4-byte texels into `columns` mean-luma cells.
+inline void reduce_row(const unsigned char* row, std::uint32_t width, Layout layout, std::uint8_t* out, int columns = cells_x)
 {
-    for (int cell = 0; cell < cells_x; ++cell) {
-        std::uint32_t first = static_cast<std::uint32_t>(std::uint64_t{width} * cell / cells_x);
-        std::uint32_t end = static_cast<std::uint32_t>(std::uint64_t{width} * (cell + 1) / cells_x);
+    for (int cell = 0; cell < columns; ++cell) {
+        std::uint32_t first = static_cast<std::uint32_t>(std::uint64_t{width} * cell / columns);
+        std::uint32_t end = static_cast<std::uint32_t>(std::uint64_t{width} * (cell + 1) / columns);
         if (end <= first) end = first + 1 <= width ? first + 1 : width;
         if (first >= end) first = end ? end - 1 : 0;
         std::uint64_t sum = 0;
@@ -143,10 +176,10 @@ inline void reduce_row(const unsigned char* row, std::uint32_t width, Layout lay
     }
 }
 
-// The sampled rows: the middle row of each of cells_y equal bands.
-inline std::uint32_t sampled_row(int band, std::uint32_t height)
+// The sampled rows: the middle row of each of `bands` equal bands.
+inline std::uint32_t sampled_row(int band, std::uint32_t height, int bands = cells_y)
 {
-    return static_cast<std::uint32_t>((std::uint64_t{2} * band + 1) * height / (2 * cells_y));
+    return static_cast<std::uint32_t>((std::uint64_t{2} * band + 1) * height / (2 * bands));
 }
 
 }  // namespace x2w_present_signature

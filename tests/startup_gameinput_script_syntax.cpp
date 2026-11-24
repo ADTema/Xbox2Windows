@@ -434,6 +434,169 @@ void check_timeline()
     }
 }
 
+// A picture of `level` everywhere, with the w x h cells at (x, y) set to `patch` in the base grid,
+// or in the fine grid when `fine` (the fine grid is then present, and the base grid stays plain).
+tl::Signal patched(std::uint64_t sequence, std::uint8_t level, int x, int y, int w, int h, std::uint8_t patch, bool fine = false)
+{
+    tl::Signal s = picture(sequence, level);
+    s.fine_available = true;
+    std::memset(s.fine, level, sizeof(s.fine));
+    const int width = fine ? tl::fine_x : tl::grid_x;
+    std::uint8_t* cells = fine ? s.fine : s.cells;
+    for (int j = y; j < y + h; ++j)
+        for (int i = x; i < x + w; ++i) cells[j * width + i] = patch;
+    return s;
+}
+bool timed_out(const Run& run) { return find_event(run, tl::Event::wait_timeout) != nullptr; }
+bool done_at(const Run& run, double at)
+{
+    const tl::Event* done = find_event(run, tl::Event::wait_done);
+    return done && close_to(done->at, at);
+}
+
+void check_sensitivity_and_groups()
+{
+    // Sub-threshold change: 4 cells change by 40 levels at 1.0 s (a highlight moving).
+    const auto small = [](int ms) { return ms < 1000 ? picture(1 + ms / 100, 40) : patched(1 + ms / 100, 40, 3, 5, 4, 1, 80); };
+    {
+        const Run defaults = run_timeline("wait=0.5/4", 6000, small);
+        check(timed_out(defaults) && count_events(defaults, tl::Event::wait_changed) == 0, "default threshold ignores a 4-cell change");
+        const Run lowered = run_timeline("wait=0.5/4;cells=3", 6000, small);
+        check(done_at(lowered, 1.5) && !timed_out(lowered), "cells=3 detects the 4-cell change (done 1.5 s)");
+    }
+    // Small level change: 20 cells change by 10 levels; level=12 (default) ignores it, level=5 sees it.
+    {
+        const auto faint = [](int ms) { return ms < 1000 ? picture(1 + ms / 100, 40) : patched(1 + ms / 100, 40, 0, 0, 20, 1, 50); };
+        check(timed_out(run_timeline("wait=0.5/4", 6000, faint)), "default level ignores a 10-level change");
+        check(done_at(run_timeline("wait=0.5/4;level=5", 6000, faint), 1.5), "level=5 detects a 10-level change");
+    }
+    // Region: the change is in cells x 3..6, y 5 (centres x 0.11..0.20, y 0.31).
+    {
+        check(done_at(run_timeline("wait=0.5/4;cells=2;region=0:0.25:0.25:0.4", 6000, small), 1.5), "region around the change detects it");
+        check(timed_out(run_timeline("wait=0.5/4;cells=1;region=0.5:0.5:1:1", 6000, small)), "region away from the change ignores it");
+        // Changes outside the region (a moving background) do not delay a region wait's settle either.
+        const auto busy = [](int ms) {
+            tl::Signal s = ms < 1000 ? picture(1 + ms / 100, 40) : patched(1 + ms / 100, 40, 3, 5, 4, 1, 80);
+            for (int y = 15; y < 18; ++y)
+                for (int x = 0; x < 32; ++x) s.cells[y * 32 + x] = static_cast<std::uint8_t>((ms / 100) % 2 ? 0 : 200);
+            return s;
+        };
+        check(done_at(run_timeline("wait=0.5/4;cells=2;region=0:0:1:0.8", 6000, busy), 1.5), "region ignores a flickering band outside it");
+        check(timed_out(run_timeline("wait=0.5/4;cells=2", 6000, busy)), "the same flicker inside the default region never settles");
+    }
+    // Fine grid: a change seen only in the fine grid (2 fine cells), and a fine wait that begins before
+    // the presenter publishes fine samples.
+    {
+        const auto fine_only = [](int ms) {
+            return ms < 1000 ? patched(1 + ms / 100, 40, 0, 0, 0, 0, 0, true) : patched(1 + ms / 100, 40, 10, 20, 2, 1, 90, true);
+        };
+        check(timed_out(run_timeline("wait=0.5/4;cells=2", 6000, fine_only)), "base grid misses a change seen only in the fine grid");
+        check(done_at(run_timeline("wait=0.5/4;fine;cells=2", 6000, fine_only), 1.5), "fine wait detects it");
+        const auto late = [](int ms) {
+            tl::Signal s = ms < 3000 ? patched(1 + ms / 100, 40, 0, 0, 0, 0, 0, true) : patched(1 + ms / 100, 40, 10, 20, 2, 1, 90, true);
+            s.fine_available = ms >= 1000;
+            return s;
+        };
+        const Run run = run_timeline("wait=0.5/10;fine;cells=2", 6000, late);
+        const tl::Event* begun = find_event(run, tl::Event::wait_begun);
+        check(begun && !begun->signal && done_at(run, 3.5), "fine wait takes its reference once fine samples arrive");
+    }
+    // Groups: press, wait for a change, press, wait ...; the second press has no visible effect.
+    //   items: 1 group=menu, 2 80@+0, 3 wait, 4 40@+0.5, 5 wait, 6 4@+0.5, 7 end, 8 mark=next, 9 8@+0.5,
+    //          10 group=next, 11 2@+0.5, 12 end
+    {
+        const char* script = "group=menu,80@+0,wait=0.25/1,40@+0.5,wait=0.25/1,4@+0.5,end,mark=next@+0,8@+0.5,group=next,2@+0.5,end";
+        const Run run = run_timeline(script, 6000, [](int ms) { return picture(1 + ms / 50, ms < 250 ? 40 : 200); });
+        const tl::Event* timeout = find_event(run, tl::Event::wait_timeout);
+        const tl::Event* skipped = find_event(run, tl::Event::group_skipped);
+        const tl::Event* mark = find_event(run, tl::Event::mark);
+        check(done_at(run, 0.5), "group: first step's wait done at 0.5 s");
+        check(first_press(run, 0x80) == 0 && first_press(run, 0x40) == 1000, "group: steps before the failing wait played");
+        check(timeout && timeout->item == 5 && timeout->label == "menu" && close_to(timeout->at, 2.0), "group: step item 5 timed out at 2.0 s");
+        check(skipped && skipped->label == "menu" && skipped->item == 5 && skipped->group_item == 1 && skipped->end_item == 7 &&
+                  close_to(skipped->at, 2.0),
+              "group: skip event names the group, its items and the failing step");
+        check(first_press(run, 0x4) == -1, "group: the step after the failing wait is skipped");
+        check(mark && mark->label == "next" && close_to(mark->at, 2.0), "group: the item after end is timed from the timeout");
+        check(first_press(run, 0x8) == 2500, "group: later items continue 0.5 s after the timeout");
+        check(first_press(run, 0x2) == 3000, "group: a later group still runs");
+        check(count_events(run, tl::Event::group_skipped) == 1, "group: one skip event");
+    }
+    // A group whose waits all succeed plays every step; stop inside a group still stops the script.
+    {
+        const Run ok = run_timeline("group,80@+0,wait=0.25/1,4@+0.5,end,2@+0.5", 4000,
+                                    [](int ms) { return picture(1 + ms / 50, ms < 250 ? 40 : 200); });
+        check(first_press(ok, 0x80) == 0 && first_press(ok, 0x4) == 1000 && first_press(ok, 0x2) == 1500 &&
+                  count_events(ok, tl::Event::group_skipped) == 0,
+              "group without a timeout plays every step");
+        const Run stop = run_timeline("group,wait=0.25/1/stop,4@+0.5,end,2@+0.5", 4000, [](int ms) { return picture(1 + ms / 50, 40); });
+        check(first_press(stop, 0x6) == -1 && count_events(stop, tl::Event::group_skipped) == 0, "stop inside a group stops the script");
+    }
+    // Negative control for groups: without a group the same timeout only delays the later steps.
+    {
+        const Run run = run_timeline("80@+0,wait=0.25/1,40@+0.5,wait=0.25/1,4@+0.5", 6000,
+                                     [](int ms) { return picture(1 + ms / 50, ms < 250 ? 40 : 200); });
+        check(first_press(run, 0x4) == 2500, "ungrouped: the step after a timed-out wait still plays");
+    }
+    // Rejections of groups and wait options.
+    {
+        struct Case {
+            const char* script;
+            std::vector<std::pair<std::size_t, const char*>> want;
+            std::size_t entries;
+        };
+        const Case cases[] = {
+            {"group,group,end,end", {{2, "nested group"}, {3, "end of a rejected nested group"}}, 0},
+            {"end", {{1, "end without group"}}, 0},
+            {"group=a,4@1", {{1, "group not closed"}}, 1},
+            {"group@1,end", {{1, "group and end take no time"}, {2, "end without group"}}, 0},
+            {"group=bad label,end", {{1, "bad label"}, {2, "end without group"}}, 0},
+            {"group=,end", {{1, "bad label"}, {2, "end without group"}}, 0},
+            {"group=g,4@5,end,8@2", {{4, "time before the end of the preceding group"}}, 1},
+            {"wait;cells=0", {{1, "bad wait option"}}, 0},
+            {"wait;level=300", {{1, "bad wait option"}}, 0},
+            {"wait;region=0.5:0:0.2:1", {{1, "bad region"}}, 0},
+            {"wait;region=0:0:1", {{1, "bad region"}}, 0},
+            {"wait;region=0:0:0.01:0.01", {{1, "empty region"}}, 0},
+            {"wait;cells=600", {{1, "cells larger than the region"}}, 0},
+            {"wait;foo", {{1, "bad wait option"}}, 0},
+        };
+        for (const Case& c : cases) {
+            const tl::Script s = tl::parse(c.script);
+            bool ok = s.rejections.size() == c.want.size() && s.entries.size() == c.entries;
+            for (std::size_t i = 0; ok && i < c.want.size(); ++i)
+                ok = s.rejections[i].index == c.want[i].first && s.rejections[i].reason == c.want[i].second;
+            if (!ok) {
+                std::printf("FAIL: \"%s\": %zu rejected, %zu entries;", c.script, s.rejections.size(), s.entries.size());
+                for (const auto& r : s.rejections) std::printf(" [%zu %s]", r.index, r.reason.c_str());
+                std::printf("\n");
+                ++failures;
+            }
+        }
+        // The forms the Tester's current scripts use: base=start, <mask>@+<s>, wait=<settle>/<timeout> with
+        // ;fine;cells=;level=;region=, mark=, group/end. All must parse without a rejection.
+        const tl::Script forms = tl::parse(
+            "base=start,wait=1/60;fine;cells=4;level=8;region=0.05:0.3:0.45:0.6,mark=title@+0,group=menu,80@+1,"
+            "wait=0.5/2;fine;cells=4;level=8;region=0.05:0.3:0.45:0.6,40@+0.5,wait=0.5/2;cells=2;level=6,4@+0.5,end,"
+            "mark=after@+0,wait=1/30,200@+2+1.5");
+        check(forms.rejections.empty() && forms.from_process_start && forms.entries.size() == 4 && forms.waits.size() == 4 &&
+                  forms.marks.size() == 2 && forms.groups.size() == 1 && forms.groups[0].closed && forms.waits[1].fine &&
+                  forms.waits[1].cells == 4 && forms.waits[1].level == 8 && close_to(forms.waits[1].region.x1, 0.45) &&
+                  forms.waits[2].cells == 2 && !forms.waits[2].fine && forms.waits[1].group == 0 && forms.waits[3].group == -1 &&
+                  close_to(forms.entries[3].duration, 1.5),
+              "script forms in current use parse without a rejection");
+        const tl::Script unclosed = tl::parse("group=a,4@1,wait=1/2");
+        check(unclosed.entries.size() == 1 && unclosed.entries[0].group == -1 && unclosed.waits[0].group == -1,
+              "an unclosed group leaves its items ungrouped");
+        const tl::Script w = tl::parse("wait,wait=2/30/stop;cells=3;level=6;region=0.1:0.2:0.5:0.6;fine,wait;cells=4");
+        check(w.rejections.empty() && w.waits.size() == 3 && w.waits[0].cells == 16 && w.waits[0].level == 12 && !w.waits[0].fine &&
+                  w.waits[1].cells == 3 && w.waits[1].level == 6 && w.waits[1].fine && w.waits[1].stop && close_to(w.waits[1].region.x0, 0.1) &&
+                  close_to(w.waits[1].region.y1, 0.6) && close_to(w.waits[1].settle, 2) && w.waits[2].cells == 4 && close_to(w.waits[2].settle, 1) &&
+                  w.wants_fine(),
+              "wait options parsed, defaults kept");
+    }
+}
+
 // ---- playback through the stand-in, one child process per case --------------------------------------
 struct Child {
     IGameInput* input = nullptr;
@@ -733,6 +896,50 @@ int case_wait_without_presenter(const char* dll)
     return 0;
 }
 
+// A fine-grid wait and a group through the stand-in: the stand-in must ask for the fine grid, see a
+// 2-cell fine change, and skip the rest of the group when its second step shows no change.
+//   items: 1 wait, 2 group=list, 3 80@+0.5, 4 wait, 5 4@+0.5, 6 end, 7 2@+0.5
+int case_fine_group(const char* dll)
+{
+    x2w_present_signature::Block* block = x2w_present_signature::create_block(GetCurrentProcessId(), 4);
+    if (!block) {
+        std::printf("FAIL: create_block\n");
+        return 2;
+    }
+    std::uint8_t base[x2w_present_signature::cells], fine[x2w_present_signature::fine_cells];
+    std::memset(base, 40, sizeof(base));
+    std::memset(fine, 40, sizeof(fine));
+    x2w_present_signature::publish(block, base, 1, fine);
+    Child child;
+    if (!open_child(dll, "wait=0.5/3;fine;cells=2;level=8,group=list,80@+0.5,wait=0.5/1;fine;cells=2,4@+0.5,end,2@+0.5", child)) return 2;
+    check(block->fine_wanted == 1, "the stand-in asked for the fine grid");
+    const std::uint64_t z = 1000;
+    for (std::uint64_t ms = z; ms <= z + 5000; ms += 100) {
+        const std::uint64_t t = ms - z;
+        if (t == 1000) {
+            fine[20 * x2w_present_signature::fine_x + 10] = fine[20 * x2w_present_signature::fine_x + 11] = 60;  // 2 fine cells, +20
+            x2w_present_signature::publish(block, base, 2, fine);
+        }
+        const GamepadState s = child.at(ms);
+        // wait 1 done at 1.5 s; down at 2.0 s; wait 4 times out at 3.0 s; item 5 skipped; item 7 at 3.5 s.
+        const std::uint32_t want = t >= 2000 && t < 2300 ? 0x80 : t >= 3500 && t < 3800 ? 0x2 : 0;
+        if (s.buttons != want) {
+            std::printf("FAIL: fine group script at %.3f s: buttons 0x%x, want 0x%x\n", t / 1000.0, s.buttons, want);
+            ++failures;
+            break;
+        }
+    }
+    check(child.count("x2w-input script: 1 groups") == 1, "group count line");
+    check(child.count("x2w-input script: fine picture signature (64 x 72) requested") == 1, "fine request line");
+    check(child.count("x2w-input script wait item 1: picture changed at 1.000 s") == 1, "fine change seen");
+    check(child.count("x2w-input script wait item 4 timed out at 3.000 s after 1.000 s; group list is skipped from here") == 1,
+          "timeout line names the group");
+    check(child.count("x2w-input script group list (items 2-6) failed at step item 4: rest of the group skipped, "
+                      "the script goes on after item 6 from 3.000 s") == 1,
+          "group skip line");
+    return 0;
+}
+
 // Over 4,095 characters the value is ignored as a whole and logged; nothing is pressed.
 int case_too_long(const char* dll)
 {
@@ -774,6 +981,7 @@ const NamedCase cases[] = {
     {"base_poll", case_base_poll}, {"malformed", case_malformed},
     {"too_long", case_too_long}, {"over_limit", case_over_limit},
     {"wait", case_wait},         {"wait_without_presenter", case_wait_without_presenter},
+    {"fine_group", case_fine_group},
 };
 
 bool xinput_pad_connected()
@@ -831,6 +1039,7 @@ int main(int argc, char** argv)
     check_legacy_equivalence();
     check_rejections();
     check_timeline();
+    check_sensitivity_and_groups();
     std::printf("parser checks: %s\n", failures ? "FAIL" : "pass");
     if (xinput_pad_connected()) {
         std::printf("SKIP: XInput pad 0 is connected; its values merge into every reading, playback cases not run\n");
