@@ -1189,15 +1189,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                             raise ValueError("D16 buffer read expression is too large")
                     word = ("alu", field)
                 loading[reg] = word
-        elif m := re.fullmatch(r"image_(?P<kind>load|store)(?P<mip>_mip)?(?P<packed>_pck(?:_sgn)?)? "
+        elif m := re.fullmatch(r"image_(?P<kind>load|store|get_resinfo)(?P<mip>_mip)?(?P<packed>_pck(?:_sgn)?)? "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\] dmask:0x(?P<mask>[0-9a-f]+) "
                                r"dim:SQ_RSRC_IMG_2D(?: unorm)?(?P<a16> a16)?", line):
             # A16 packs x/y into one dword and takes the mip from the low half of the next dword.
             mip, a16 = bool(m["mip"]), bool(m["a16"])
             write = m["kind"] == "store"
+            resinfo = m["kind"] == "get_resinfo"
             vaddr = [int(n) for n in re.findall(r"\d+", m["addr"])]
-            address_words = (1 if a16 else 2) + int(mip)
+            address_words = 1 if resinfo else (1 if a16 else 2) + int(mip)
             base, high = int(m["base"]), int(m["high"])
             dmask = int(m["mask"], 16)
             # DMASK selects components in XYZW order and packs them into consecutive VGPRs.
@@ -1210,8 +1211,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     or vaddr[-1] > 255 or last != first + count - 1
                     or not 0 < dmask < (1 << IMAGE_FORMATS[image_format][1])
                     or any(first + index > 255 or first + index in loading for index in range(count))
-                    or (write and (m["packed"] == "_pck_sgn" or stores))):
+                    or (write and (m["packed"] == "_pck_sgn" or stores))
+                    or (resinfo and (mip or m["packed"] or dmask & 0x4))):
                 raise ValueError(f"Unsupported image {m['kind']} target")
+            if resinfo and image_format != "R32G32B32A32_UINT":
+                raise ValueError("Image get_resinfo requires an RGBA32 SRV")
             if bool(m["packed"]) != (image_format == "R8G8B8A8_UINT"):
                 raise ValueError(f"Image {m['kind']} opcode does not match the image format")
             if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
@@ -1222,11 +1226,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             coordinates = [vector.get(reg) for reg in range(vaddr[0], vaddr[-1] + 1)]
             if not all(is_word(value) for value in coordinates):
                 raise ValueError("Unverified image coordinates")
-            if a16:
-                packed = hlsl_word(coordinates[0])
-                x, y = f"{packed} & 0xffffu", f"{packed} >> 16u"
-            else:
-                x, y = map(hlsl_word, coordinates[:2])
+            if not resinfo:
+                if a16:
+                    packed = hlsl_word(coordinates[0])
+                    x, y = f"{packed} & 0xffffu", f"{packed} >> 16u"
+                else:
+                    x, y = map(hlsl_word, coordinates[:2])
             if write:
                 # A D3D12 Texture2D UAV names one mip. Verify native and desktop mip selection agree.
                 level = coordinates[-1] if mip else 0
@@ -1243,14 +1248,22 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 texel = ", ".join(selected.get(channel, "0u") for channel in "xyzw")
                 stores.append(f"    outputData[uint2({x}, {y})] = uint4({texel});")
                 continue
-            lod = "0"
-            if mip:
-                mip_word = hlsl_word(coordinates[-1])
-                lod = f"asint({mip_word}{' & 0xffffu' if a16 else ''})"
-            address = f"int3(asint({x}), asint({y}), {lod})"
-            name = f"image_load_{image_step_count}"
+            if resinfo:
+                name = f"image_resinfo_{image_step_count}"
+                level = hlsl_word(coordinates[0])
+                if a16:
+                    level = f"({level} & 0xffffu)"
+                staged_steps.append((None, f"    uint4 {name};\n"
+                                     f"    imageData.GetDimensions({level}, {name}.x, {name}.y, {name}.w);"))
+            else:
+                lod = "0"
+                if mip:
+                    mip_word = hlsl_word(coordinates[-1])
+                    lod = f"asint({mip_word}{' & 0xffffu' if a16 else ''})"
+                address = f"int3(asint({x}), asint({y}), {lod})"
+                name = f"image_load_{image_step_count}"
+                staged_steps.append((None, f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});"))
             image_step_count += 1
-            staged_steps.append((None, f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});"))
             if m["packed"] and m["packed"].endswith("_sgn"):
                 # The UINT SRV exposes raw bytes. Extend each byte from bit 7 to a full VGPR.
                 staged_steps.append((None, f"    {name} = asuint(asint({name} << 24u) >> 24u);"))

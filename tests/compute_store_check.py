@@ -3327,6 +3327,10 @@ def binary(directory, assembler, objcopy, library):
     ds_binary(directory, assembler, objcopy, library)
     mtbuf_load_controls()
     mimg_load_binary(directory, assembler, objcopy, library)
+    mimg_resinfo_controls()
+    gfx1030_binary(directory, assembler, objcopy, library,
+                   [(name, lines, MIMG_BINDING) for name, _, _, _, _, lines in mimg_resinfo_cases()],
+                   "image_get_resinfo", group=(8, 8, 1))
     mimg_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library,
                    [(name, lines, binding) for name, _, _, lines, binding in mimg_store_cases()],
@@ -4719,6 +4723,78 @@ def mimg_store_draw(directory, compiler, renderer, backend, *, packed=False):
     return 0
 
 
+def mimg_resinfo_cases():
+    for a16 in (False, True):
+        for mask, channels, groups, shift, lines in mimg_load_cases():
+            if mask & 0x4:
+                continue
+            # Use one mip operand, with nonzero upper padding for a16. v14 is also the first result.
+            levels = 1 if mask == 0x8 else 3
+            query = f"v_min_u32_e32 v14, {levels - 1}, v9"
+            if a16:
+                query += "\nv_or_b32_e32 v14, 0xabcd0000, v14"
+            image = next(line for line in lines if line.startswith("image_load "))
+            replacement = image.replace("image_load", "image_get_resinfo").replace("v[8:9]", "v14")
+            if a16:
+                replacement += " unorm a16"
+            name = f"mimg_resinfo{int(a16)}_{mask:x}"
+            yield name, channels, groups, shift, levels, variant(lines, (image, f"{query}\n{replacement}"))
+
+
+def mimg_resinfo_controls():
+    _, _, _, _, _, lines = next(mimg_resinfo_cases())
+    for diagnostic, change in (
+        ("Unresolved image descriptor", ("s_waitcnt lgkmcnt(0)", "")),
+        ("before s_waitcnt vmcnt(0)", ("s_waitcnt vmcnt(0)", "")),
+        ("Unverified image coordinates", ("v14, v14, s[24:31]", "v14, v15, s[24:31]")),
+        ("Unsupported image get_resinfo target", ("v14, v14, s[24:31]", "v14, v[14:15], s[24:31]")),
+        ("Unsupported image get_resinfo target", ("dmask:0x1", "dmask:0x4")),
+        ("Unsupported compute instruction", ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_3D")),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, change), (8, 8, 1), **MIMG_BINDING)
+    rejects("Image get_resinfo requires an RGBA32 SRV", aot.lower, lines, (8, 8, 1), **MIMG_PACKED_BINDING)
+
+
+def mimg_resinfo_draw(directory, compiler, renderer, backend):
+    mimg_resinfo_controls()
+    base_texture = [word for texel in TEXTURE_WORDS for word in texel]
+    for name, channels, groups, shift, levels, lines in mimg_resinfo_cases():
+        texture = base_texture if levels == 1 else base_texture + mimg_mip_texels()
+        payload = struct.pack(f"<{len(texture)}I", *texture)
+        src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        code = aot.lower(lines, (8, 8, 1), **MIMG_BINDING)
+        expected = [SENTINEL] * 320
+        for y in range(TEXTURE_HEIGHT):
+            width, height = ((32, 8), (16, 4), (8, 2))[min(y, levels - 1)]
+            components = {0: width, 1: height, 3: levels}
+            for x in range(groups * 8):
+                base = y * 32 + x * (1 << (shift - 2))
+                expected[base:base + len(channels)] = [components[channel] for channel in channels]
+        case.write_bytes(struct.pack("<321I", groups, *expected) + payload)
+        compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        run = [renderer, backend, "--compute-texture-case", cso, case]
+        src.write_text(code, encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        result = subprocess.run(run)
+        if result.returncode:
+            return result.returncode
+        if name == "mimg_resinfo1_b":
+            mutant = code.replace("imageData.GetDimensions((", "imageData.GetDimensions(0u * (")
+            assert mutant != code
+            src.write_text(mutant, encoding="ascii")
+            subprocess.run(compile_shader, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            mismatch = "word=32 expected=00000010 actual=00000020"
+            if bad.returncode != 1 or mismatch not in bad.stderr:
+                raise AssertionError(f"{name}: fixed mip escaped detection\n{bad.stderr}")
+            print(f"{name} fixed mip: {bad.stderr}", end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("image_get_resinfo\n", encoding="utf-8")
+    return 0
+
+
 def mimg_mip_draw(directory, compiler, renderer, backend):
     return mimg_load_draw(directory, compiler, renderer, backend, mip=True)
 
@@ -5393,6 +5469,7 @@ if __name__ == "__main__":
                  "draw-mtbuf-load": mtbuf_load_draw,
                  "draw-mimg-load": mimg_load_draw,
                  "draw-mimg-mip": mimg_mip_draw,
+                 "draw-mimg-resinfo": mimg_resinfo_draw,
                  "draw-mimg-packed": mimg_packed_draw,
                  "draw-mimg-store": mimg_store_draw,
                  "draw-mimg-packed-store": lambda d, *a: mimg_store_draw(d, *a, packed=True),

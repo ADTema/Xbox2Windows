@@ -3112,6 +3112,29 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_packed_(warp|hardware)$' -V
 ```
 
+### gfx1030 2D image resource queries
+
+`image_get_resinfo` lowers to `Texture2D<uint4>.GetDimensions` on the
+`R32G32B32A32_UINT` SRV at `t0`. Supply `--image-descriptor` and `--image-format`
+as for typed loads. The address is one VGPR holding an in-range mip index
+relative to the start of the view. `a16` takes the low 16 bits of that VGPR.
+DMASK selects width, height and view mip count in ascending bit order. This
+2D profile rejects the depth bit, unmodelled flags, and non-2D dimensions.
+The descriptor needs `s_waitcnt lgkmcnt(0)` and the results need
+`s_waitcnt vmcnt(0)`. The mip operand may alias a destination register.
+
+The 14 cases assemble and disassemble with LLVM 15, then pass through the
+synthetic-container CLI. The GPU fixture compares translated desktop DXIL
+against a CPU reference for mips 0, 1 and 2, one- and three-level views,
+both address widths, sparse masks and one, two or four groups. It compares all 320 output words per case,
+including padding. Forcing mip 0 first differs at word 32, where the expected
+width is `00000010` and the actual width is `00000020`.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_resinfo_(warp|hardware)$' -V
+```
+
 ### gfx1030 2D image stores
 
 `image_store`, `image_store_mip`, `image_store_pck` and `image_store_mip_pck`
