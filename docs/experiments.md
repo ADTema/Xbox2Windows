@@ -3504,7 +3504,7 @@ first at mip 0, word 33. The exchange fixture covers matched and unmatched
 compares at both group counts. Reversing the HLSL comparison and replacement
 arguments in the two-group control must fail first at
 `mip=0 word=32 expected=a5a51f3f actual=fffffff0`. Only a complete suite
-records coverage. Returning atomics, counters and float atomics are not lowered.
+records coverage. Returning atomics and float atomics are outside this profile.
 
 The LLVM 15 test assembles, disassembles and translates the cases through the
 synthetic-container CLI. The standalone compile modes check the generated
@@ -3525,6 +3525,42 @@ ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_(int
 
 ```bash
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+### gfx1030 2D image counters
+
+`image_atomic_inc` and `image_atomic_dec` extend the 2D integer image atomic
+profile with `R32_UINT`, `dmask:0x1` and `glc` clear. The data VGPR supplies
+an unsigned limit. The [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+defines increment as zero when the old value is at or above the limit and
+`old + 1` otherwise. Decrement writes the limit when the old value is zero
+or above the limit and `old - 1` otherwise.
+
+The `cs_6_0` lowering computes the candidate from an observed word and
+retries `InterlockedCompareExchange` until its comparison succeeds. The first
+attempt compares against zero. A failed comparison supplies the texel value
+for the retry. The fixture requires only the typed
+`UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE` support bit on `R32_UINT`.
+
+Eight cases cover limits of zero, three and `UINT_MAX`, and two lanes sharing
+a texel in each contended case. For one and two groups, each dispatch compares
+the complete 336-word readback across three mips, including untouched texels.
+Changing either comparison at the limit must fail first at mip 0, word 32.
+The increment control expects `00000000` and predicts `00000004` for the
+mutant. The decrement control expects `00000002` and predicts `00000003`.
+Removing the retry from either contended case must fail at the same word with
+`00000001` expected and `00000003` predicted. Coverage is recorded after the
+GPU fixture completes its positive cases and mutation controls. The LLVM
+suite above checks the synthetic-container CLI round trips. The standalone
+compile mode checks the generated HLSL and its mutations without dispatching.
+
+```powershell
+$Dxc = (Get-Command dxc -ErrorAction Stop).Source
+$env:TMP = (Resolve-Path out).Path
+$env:TEMP = $env:TMP
+python -B tests/compute_store_check.py compile-mimg-atomic-counter $Dxc
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_counter_(warp|hardware)$' -V
 ```
 
 ### Bounded gfx1030 DS lane routing

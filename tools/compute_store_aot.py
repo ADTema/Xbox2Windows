@@ -100,7 +100,7 @@ MUBUF_ATOMIC_METHODS = {
     "inc": "CompareExchange", "dec": "CompareExchange",
 }
 
-IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap"
+IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap|inc|dec"
 IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int"}
 
 
@@ -1261,7 +1261,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unverified image atomic data")
             destination = f"outputData[uint2({', '.join(map(hlsl_word, coords))})]"
             value = hlsl_word(sources[0])
-            if compare_swap:
+            if op in ("inc", "dec"):
+                condition = "expected >= limit" if op == "inc" else "expected == 0u || expected > limit"
+                wrap, step = ("0u", "+") if op == "inc" else ("limit", "-")
+                # A failed CAS supplies the observed value for the next attempt.
+                stores.extend((f"    uint limit = {value};", "    uint observed = 0u;", "    uint expected;",
+                               "    [allow_uav_condition] do {", "        expected = observed;",
+                               f"        uint next = ({condition}) ? {wrap} : expected {step} 1u;",
+                               f"        InterlockedCompareExchange({destination}, expected, next, observed);",
+                               "    } while (observed != expected);"))
+            elif compare_swap:
                 # RDNA stores VDATA on a match against VDATA+1; HLSL takes the comparison first.
                 stores.append(f"    InterlockedCompareStore({destination}, {hlsl_word(sources[1])}, {value});")
             else:
