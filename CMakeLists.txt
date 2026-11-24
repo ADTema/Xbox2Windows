@@ -625,6 +625,11 @@ add_executable(startup_packed_target_check tests/startup_packed_target_check.cpp
 target_include_directories(startup_packed_target_check PRIVATE src)
 target_compile_features(startup_packed_target_check PRIVATE cxx_std_17)
 add_test(NAME startup_packed_target COMMAND startup_packed_target_check)
+# Diagnostic line for a refused device slot 70 call (src/startup_stubs/memory_srv_report.h).
+add_executable(startup_memory_srv_report_check tests/startup_memory_srv_report_check.cpp)
+target_include_directories(startup_memory_srv_report_check PRIVATE src)
+target_compile_features(startup_memory_srv_report_check PRIVATE cxx_std_17)
+add_test(NAME startup_memory_srv_report COMMAND startup_memory_srv_report_check)
 # Console allocation sizes for depth-with-stencil and multisampled textures
 # (src/startup_stubs/console_plane_size.h); the mutated run is the negative control.
 add_executable(startup_plane_size_check tests/startup_plane_size_check.cpp)

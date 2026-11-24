@@ -78,7 +78,23 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     auto wrong_desc = desc;
     wrong_desc.Width = 1;
     publish(wrong_desc, ptr(planes[0].data())); draw(5);
-    publish(desc, ptr(planes[0].data()) + 1); draw(6); // Interior address, not the registered base.
+    publish(desc, ptr(planes[0].data()) + 1); // Interior address, not the registered base.
+    // Refusals that name their cause in the log; draw 6 shows each left the descriptor alone.
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = 256;
+    buffer_desc.Height = buffer_desc.DepthOrArraySize = buffer_desc.MipLevels = buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ViewAt buffer_view{};
+    buffer_view.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    buffer_view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    buffer_view.view.Buffer.NumElements = 64;
+    buffer_view.view.Buffer.StructureByteStride = 4;
+    buffer_view.address = ptr(planes[0].data());
+    invoke(guest, 70, ptr(&buffer_desc), ptr(&buffer_view), cpu);
+    v.address = ptr(planes[0].data());
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu + 1); // Not the start of a descriptor in the view heap.
+    draw(6);
     publish(desc, ptr(planes[0].data())); draw(7);
     return 0;
 }
