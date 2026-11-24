@@ -606,6 +606,19 @@ The rule covers a 2D texture with exactly one mip, dimensions within the D3D12 l
 description keeps the desktop answer. A desktop failure is kept for desktop formats; only the
 console-only formats 118-120, which desktop cannot answer, are answered over it.
 
+Covered formats: depth with stencil in the R32G8X24 family (formats 19-22), the R24G8 family
+(44-47, a 4-byte depth plane plus a 1-byte stencil plane) and the console 16-bit depth with
+stencil (118-120); multisampled colour in the R32G32B32A32 (1-4), R16G16B16A16 (9-14), R10G10B10A2,
+R11G11B10 and R8G8B8A8 (23-32), R16G16 (33-38), R32 (39-43), R16 (53-59), R8 and A8 (60-65) and
+B8G8R8A8/B8G8R8X8 (87-93) families. Both allocation-info entries (slots 25 and 108) give the same
+answer for them.
+
+Verification status: the device-independent reference sizes in `tests/startup_plane_size_check.cpp`
+(`startup_plane_size`) cover R24G8 and the added colour families. The R24G8 and added MSAA colour
+formats have not yet been verified through the Windows device wrapper
+(`startup_plane_size_device_`, reproduced with the second command below); only the fixture result
+is established for them.
+
 - `ctest --preset release --no-tests=error -R '^startup_plane_size(_packed_control)?$' -V` checks
   the rule without a device, including the shapes it refuses.
 - `ctest --preset release --no-tests=error -R '^startup_plane_size_device_' -V` goes through the
