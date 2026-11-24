@@ -6888,6 +6888,8 @@ Basic Render Driver, 10.0.26100.9711) and an NVIDIA GeForce RTX 4070
 the writer omitted. Both cases passed. The hardware case returns 77 if there is
 no physical D3D12 adapter. The guest path covers one rootless desktop Dispatch
 signature with no count buffer and a slot-133 buffer tracked from `COMMON`.
+If an earlier desktop producer changes the argument buffer outside the
+wrapper's state tracking, it must return it to `COMMON` before slot 61.
 Full compute binding, additional signature forms and title execution remain
 tracked in [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759) and
 [#1412](https://github.com/R0Y00/Xbox2Windows/issues/1412).
@@ -6896,9 +6898,47 @@ On Windows WARP with the debug layer enabled (Microsoft Basic Render Driver
 10.0.26100.33648), the guest fixture read back `0x31415f02` for `(4, 3, 2)`
 and `0x31415c08` for `(2, 3, 2)`. The omitted writer and all three refusals
 preserved `0x31415926`. Removing the slot-61 forwarding hook made the first
-case fail at the result word with that same sentinel. Physical adapter coverage
-for the guest path is pending.
+case fail at the result word with that same sentinel. The maintainer ran the
+exact merged candidate on WARP and an RTX 4060 Laptop. Both readbacks passed.
 [Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45473674036)
+· [Physical adapter report](https://github.com/R0Y00/Xbox2Windows/issues/1759#issuecomment-7142831918)
+
+#### GPU-written indirect indexed draw arguments
+
+List slot 61 also forwards one rootless desktop `DRAW_INDEXED` record without
+a count buffer. The graphics stream must contain desktop shader-model-5 VS
+and PS bytecode with no resource bindings or vertex input layout, an empty
+root signature, triangle topology, and one single-sample color target. The list must bind
+the matching root and target, viewport, scissor, and a placed index-buffer
+view. The wrapper translates the view to the desktop buffer's GPU address
+and transitions the index and argument buffers for GPU reads. The desktop
+backing must already contain the indices independently of the guest address. Desktop
+producers that bypass wrapper state tracking return both buffers to
+`COMMON` before calling slot 61.
+
+[`startup_indirect_draw_indexed.cpp`](../tests/startup_indirect_draw_indexed.cpp)
+uses a source-built desktop compute writer to select three indices from one
+of two triangles. Only the desktop backing of the placed index buffer contains
+the index bytes. The fenced readback checks both argument guards and all eight
+render-target pixels for a 16-bit left record, a 32-bit right record, an omitted writer, an
+unmapped index view, and a short argument range.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed
+ctest --preset release --no-tests=error -R '^startup_indirect_draw_indexed_(warp|hardware)$' -V
+```
+
+This fixture establishes the indexed command and resource bindings with
+source-built desktop shaders. Translating guest graphics state for indirect
+draws with resource bindings remains part of [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759).
+
+Windows WARP (Microsoft Basic Render Driver 10.0.26100.33648, debug layer
+enabled) painted the specified four pixels for each writer and left all pixels
+at the clear color in the three refusal and omitted-writer cases. Both argument
+guards survived every case. The upstream runtime and a build that dropped the
+index-buffer offset both left the first case at the clear color and failed the
+pixel comparison. Physical adapter coverage for the indexed path is pending.
+[Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45478647954)
 
 #### D3D12.X graphics command list (XCL-12)
 
