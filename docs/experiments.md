@@ -5799,6 +5799,15 @@ uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed 
 restored path keeps the source selection, the `dst_sel`/`dst_unused` write and the `U(...)` wrapper, and a
 conversion's output modifier inside an SDWA form is still refused rather than dropped.
 
+**The 64-bit vector shifts.** `v_lshlrev_b64`, `v_lshrrev_b64` and `v_ashrrev_i64` had no lowering - the
+census form `v_lshrrev_b64 v[10:11], 0, 0` was one of the refused shaders in the loading-screen cache (#870,
+issue #1817). A 64-bit value here is two 32-bit words, so the count must never reach 32 in a 32-bit shift and
+an in-place destination must keep both original words: the three helpers in the preamble take the low and
+high words by value, mask the count to six bits, and return the two result words packed as a `uint2`, which
+the handler writes back in one statement. VGPR pairs, SGPR pairs and the integer inline constants are
+sources; the low word is always shifted unsigned and only the arithmetic form signs the high word.
+Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_b64_shift$' -V`.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
