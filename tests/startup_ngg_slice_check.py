@@ -7,8 +7,9 @@ protocol: one lane of wave 0 writes the vertex and primitive counts to LDS, wait
 GS_ALLOC_REQ (s_sendmsg 9, m0 = primitives << 12 | vertices); the other waves of the group read the counts back
 after the barrier. Thread t = 64 * wave + lane exports vertex t (pos0, param0) when t < vertices and primitive t
 (export target 20) when t < primitives. The primitive word holds three 10-bit group vertex indices at bits 0, 10
-and 20, and bit 31 marks a null primitive; this is the gfx10 layout of Mesa's ac_nir_pack_ngg_prim_exp_arg
-(src/amd/common/ac_nir.c). Edge-flag bits are not used here.
+and 20, the layout tools/mesh_entry_aot.py already decodes (with the same m0 split). Bit 31 as the null-primitive
+flag is a modelling assumption of this fixture, not checked against hardware or a cited source here; only the
+'null' case depends on it. Edge-flag bits are not used.
 
 Every case is one program built from documented gfx1013 encodings, decoded with tools/disasm_rdna2.py (the
 decoded text must equal the source line) and executed by a small reference model of those semantics: wave64,
@@ -121,6 +122,23 @@ def exp(target, srcs, done=False):
 
 
 PRIM, POS0, PARAM0 = 20, 12, 32
+
+# Encoder outputs against the golden byte vectors of tests/rdna2_tools_check.py (written as bytes there and checked
+# against the decoder, not reassembled). VOP3 (v_mbcnt_*, v_lshl_or_b32), VOPC v_cmpx and export target 20 have no
+# vector there.
+GOLDEN = [
+    ('7e04b2be', sop1('s_mov_b64', 's50', 'exec')),
+    ('01028093', sop2('s_bfe_u32', 's0', 's1', 's2')),
+    ('030090bf', sopp('s_sendmsg', 3)),
+    ('000081bf', sopp('s_endpgm')),
+    ('010d007e', vop1('v_cvt_f32_u32_e32', 'v0', 'v1')),
+    ('0c05587e', vop1('v_readfirstlane_b32', 's44', 'v12')),
+    ('01050602', vop2('v_cndmask_b32_e32', 'v3', 'v1', 'v2')),
+    ('01050a16', vop2('v_mul_u32_u24_e32', 'v5', 'v1', 'v2')),
+    ('cf0000f804030201', exp(POS0, ['v4', 'v3', 'v2', 'v1'])),
+    ('800034d802080000', ds('ds_write_b32', 'v2', data='v8', offset=128)),
+    ('4000d8d802000018', ds('ds_read_b32', 'v2', dst='v24', offset=64)),
+]
 
 
 # ---------------------------------------------------------------- the cases
@@ -496,7 +514,8 @@ def evaluate(blob, case, mode='ngg', fault=None):
 
 
 def main():
-    failures = []
+    failures = ['encoder gives %s, pinned %s' % (struct.pack('<%dI' % len(w), *w).hex(), want)
+                for want, w in GOLDEN if struct.pack('<%dI' % len(w), *w).hex() != want]
     blobs = {case: check_decode(program(case)) for case in EXPECTED}
     bad = program(None)
     bad[11][1] = ds('ds_write_b32', 'v3', data='v2', offset=8)  # count word written one slot too far

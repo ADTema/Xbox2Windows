@@ -3261,8 +3261,10 @@ is one gfx1013 program in the NGG form: lane 0 of wave 0 writes the vertex and
 primitive counts to LDS, waits at `s_barrier` and sends `GS_ALLOC_REQ`
 (`m0 = primitives << 12 | vertices`); the other waves read the counts back after
 the barrier. Thread `t = 64 * wave + lane` exports vertex `t` when `t` is below
-the vertex count and primitive `t` (export target 20, three 10-bit indices, bit
-31 null) when `t` is below the primitive count. The programs are encoded from
+the vertex count and primitive `t` (export target 20, three 10-bit indices as
+`tools/mesh_entry_aot.py` decodes them) when `t` is below the primitive count.
+Bit 31 as the null-primitive flag is an assumption of the model; only the
+`null` case depends on it. The programs are encoded from
 the `disasm_rdna2` opcode tables, decoded again (the text must match the
 source), and run by a Python reference model and by two candidate
 interpretations: `pass` (lane-private LDS, counts and primitive exports ignored,
