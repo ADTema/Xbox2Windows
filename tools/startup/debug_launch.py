@@ -93,7 +93,7 @@ def main():
         import subprocess
         try:
             subprocess.Popen([sys.executable, "-B", os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_view.py"),
-                              logdir], creationflags=0x00000010)  # CREATE_NEW_CONSOLE
+                              logdir, cwd], creationflags=0x00000010)  # CREATE_NEW_CONSOLE
         except OSError as error:
             builtins.print(f"live console not started: {error}")
 
